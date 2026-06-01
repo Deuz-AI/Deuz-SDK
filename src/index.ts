@@ -6,13 +6,38 @@
 
 // Canonical free functions.
 export { streamChat, generateText, generateObject } from './generate';
+export { embed, embedMany } from './inference/embed';
 
 // Optional convenience client + dependency resolution.
 export { createClient, resolveDependencies } from './client';
 export type { DeuzClient } from './client';
 
-// Error taxonomy (base + Faz 0 stub; subclasses added in Faz 1.A, non-breaking).
-export { DeuzError, NotImplementedError } from './errors';
+// Error taxonomy (base + full Faz 1.A hierarchy).
+export {
+  DeuzError,
+  NotImplementedError,
+  APICallError,
+  RateLimitError,
+  OverloadedError,
+  AuthenticationError,
+  InvalidRequestError,
+  ModelNotFoundError,
+  ContextOverflowError,
+  TimeoutError,
+  AbortError,
+  NoObjectGeneratedError,
+  ToolExecutionError,
+  UnsupportedCapabilityError,
+} from './errors';
+export type { APICallErrorOptions } from './errors';
+
+// Optional cost estimation (token breakdown → USD). App injects via deps.priceProvider.
+export { createPriceProvider, priceUsage, PRICES_2026 } from './pricing';
+export type { ModelPrice, PriceTable, CreatePriceProviderOptions } from './pricing';
+
+// Optional model middleware (wrapModel + bundled logging/cache/redact/guard).
+export { wrapModel, logging, simpleCache, redactPII, promptInjectionGuard } from './middleware';
+export type { LanguageModelMiddleware, WrappedModel, MiddlewareContext } from './middleware';
 
 // All canonical types (Message/Part/Usage/LanguageModel/CommonCallOptions/…).
 export type * from './types';

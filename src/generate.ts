@@ -1,27 +1,8 @@
-import { NotImplementedError } from './errors';
-import type {
-  StreamChat,
-  GenerateText,
-  GenerateObject,
-  GenerateObjectOptions,
-  GenerateObjectResult,
-} from './types/methods';
-
 /**
- * Canonical free functions. Faz 0 ships honest stubs: the public surface is
- * locked, but calling any of them throws NotImplementedError until the
- * inference pipeline lands in Faz 1.
+ * Canonical free functions, now backed by the real inference pipeline (Faz 1).
+ * Each lives in its own module under `inference/` but shares the SAME pipeline
+ * in `core/inference.ts`.
  */
-export const streamChat: StreamChat = () => {
-  throw new NotImplementedError('streamChat');
-};
-
-export const generateText: GenerateText = () => {
-  throw new NotImplementedError('generateText');
-};
-
-export const generateObject: GenerateObject = <T = unknown>(
-  _options: GenerateObjectOptions<T>,
-): Promise<GenerateObjectResult<T>> => {
-  throw new NotImplementedError('generateObject');
-};
+export { streamChat } from './inference/stream-chat';
+export { generateText } from './inference/generate-text';
+export { generateObject } from './inference/generate-object';
