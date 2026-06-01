@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini).",
   "license": "MIT",
-  "author": "U-C4N",
+  "author": "Umutcan Edizaslan (U-C4N)",
   "type": "module",
   "sideEffects": false,
   "engines": {
@@ -71,6 +71,146 @@
         "default": "./dist/google.cjs"
       }
     },
+    "./google/extras": {
+      "import": {
+        "types": "./dist/google/extras.d.ts",
+        "default": "./dist/google/extras.js"
+      },
+      "require": {
+        "types": "./dist/google/extras.d.cts",
+        "default": "./dist/google/extras.cjs"
+      }
+    },
+    "./voyage": {
+      "import": {
+        "types": "./dist/voyage.d.ts",
+        "default": "./dist/voyage.js"
+      },
+      "require": {
+        "types": "./dist/voyage.d.cts",
+        "default": "./dist/voyage.cjs"
+      }
+    },
+    "./pricing": {
+      "import": {
+        "types": "./dist/pricing.d.ts",
+        "default": "./dist/pricing.js"
+      },
+      "require": {
+        "types": "./dist/pricing.d.cts",
+        "default": "./dist/pricing.cjs"
+      }
+    },
+    "./middleware": {
+      "import": {
+        "types": "./dist/middleware.d.ts",
+        "default": "./dist/middleware.js"
+      },
+      "require": {
+        "types": "./dist/middleware.d.cts",
+        "default": "./dist/middleware.cjs"
+      }
+    },
+    "./image": {
+      "import": {
+        "types": "./dist/image.d.ts",
+        "default": "./dist/image.js"
+      },
+      "require": {
+        "types": "./dist/image.d.cts",
+        "default": "./dist/image.cjs"
+      }
+    },
+    "./midjourney": {
+      "import": {
+        "types": "./dist/midjourney.d.ts",
+        "default": "./dist/midjourney.js"
+      },
+      "require": {
+        "types": "./dist/midjourney.d.cts",
+        "default": "./dist/midjourney.cjs"
+      }
+    },
+    "./yunwu": {
+      "import": {
+        "types": "./dist/yunwu.d.ts",
+        "default": "./dist/yunwu.js"
+      },
+      "require": {
+        "types": "./dist/yunwu.d.cts",
+        "default": "./dist/yunwu.cjs"
+      }
+    },
+    "./memory": {
+      "import": {
+        "types": "./dist/memory.d.ts",
+        "default": "./dist/memory.js"
+      },
+      "require": {
+        "types": "./dist/memory.d.cts",
+        "default": "./dist/memory.cjs"
+      }
+    },
+    "./memory/markdown": {
+      "import": {
+        "types": "./dist/memory/markdown.d.ts",
+        "default": "./dist/memory/markdown.js"
+      },
+      "require": {
+        "types": "./dist/memory/markdown.d.cts",
+        "default": "./dist/memory/markdown.cjs"
+      }
+    },
+    "./rag": {
+      "import": {
+        "types": "./dist/rag.d.ts",
+        "default": "./dist/rag.js"
+      },
+      "require": {
+        "types": "./dist/rag.d.cts",
+        "default": "./dist/rag.cjs"
+      }
+    },
+    "./rag/node": {
+      "import": {
+        "types": "./dist/rag/node.d.ts",
+        "default": "./dist/rag/node.js"
+      },
+      "require": {
+        "types": "./dist/rag/node.d.cts",
+        "default": "./dist/rag/node.cjs"
+      }
+    },
+    "./skills": {
+      "import": {
+        "types": "./dist/skills.d.ts",
+        "default": "./dist/skills.js"
+      },
+      "require": {
+        "types": "./dist/skills.d.cts",
+        "default": "./dist/skills.cjs"
+      }
+    },
+    "./skills/node": {
+      "import": {
+        "types": "./dist/skills/node.d.ts",
+        "default": "./dist/skills/node.js"
+      },
+      "require": {
+        "types": "./dist/skills/node.d.cts",
+        "default": "./dist/skills/node.cjs"
+      }
+    },
+    "./vertex": {
+      "import": {
+        "types": "./dist/vertex.d.ts",
+        "default": "./dist/vertex.js"
+      },
+      "require": {
+        "types": "./dist/vertex.d.cts",
+        "default": "./dist/vertex.cjs"
+      }
+    },
     "./mcp": {
       "import": {
         "types": "./dist/mcp/index.d.ts",
@@ -99,6 +239,16 @@
       "require": {
         "types": "./dist/edge.d.cts",
         "default": "./dist/edge.cjs"
+      }
+    },
+    "./ui": {
+      "import": {
+        "types": "./dist/ui.d.ts",
+        "default": "./dist/ui.js"
+      },
+      "require": {
+        "types": "./dist/ui.d.cts",
+        "default": "./dist/ui.cjs"
       }
     },
     "./react": {
@@ -146,8 +296,12 @@
     "tool-calling"
   ],
   "peerDependencies": {
-    "zod": "^3.23.0 || ^4.0.0",
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@standard-community/standard-json": "^0.2.0",
+    "mammoth": "^1.8.0",
+    "unpdf": "^0.12.0",
+    "xlsx": "^0.18.0",
+    "zod": "^3.23.0 || ^4.0.0"
   },
   "peerDependenciesMeta": {
     "zod": {
@@ -155,11 +309,24 @@
     },
     "@modelcontextprotocol/sdk": {
       "optional": true
+    },
+    "@standard-community/standard-json": {
+      "optional": true
+    },
+    "unpdf": {
+      "optional": true
+    },
+    "mammoth": {
+      "optional": true
+    },
+    "xlsx": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.0",
     "@changesets/cli": "~2.31.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/node": "^22.10.0",
     "eslint": "^9.18.0",
     "eslint-config-prettier": "^9.1.0",

@@ -23,7 +23,7 @@ const FORBIDDEN_NODE = [
 ];
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'node_modules/**', 'coverage/**'] },
+  { ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'examples/**'] },
   ...tseslint.configs.recommended,
   {
     // Allow underscore-prefixed unused params/vars (stub seams in Faz 0).
@@ -37,7 +37,13 @@ export default tseslint.config(
   {
     // Edge-safety rules apply to CORE src only.
     files: ['src/**/*.ts'],
-    ignores: ['src/mcp/stdio.ts', 'src/node/**'],
+    ignores: [
+      'src/mcp/stdio.ts',
+      'src/node/**',
+      'src/rag-node.ts',
+      'src/skills/node.ts',
+      'src/memory-markdown.ts',
+    ],
     rules: {
       'no-restricted-imports': [
         'error',
@@ -75,6 +81,18 @@ export default tseslint.config(
           message: 'Inject randomness via Dependencies — Math.random() breaks deterministic tests.',
         },
         {
+          selector:
+            "CallExpression[callee.object.name='crypto'][callee.property.name='randomUUID']",
+          message:
+            'Use deps.generateId() — crypto.randomUUID() is non-deterministic (defaultGenerateId excepted).',
+        },
+        {
+          selector:
+            "CallExpression[callee.object.name='crypto'][callee.property.name='getRandomValues']",
+          message:
+            'Inject randomness via Dependencies — crypto.getRandomValues() breaks deterministic tests.',
+        },
+        {
           selector: "MemberExpression[object.name='console']",
           message: 'Use deps.logger, not console, in edge-safe core.',
         },
@@ -83,7 +101,13 @@ export default tseslint.config(
   },
   {
     // Node-only surfaces may use node builtins.
-    files: ['src/mcp/stdio.ts', 'src/node/**/*.ts'],
+    files: [
+      'src/mcp/stdio.ts',
+      'src/node/**/*.ts',
+      'src/rag-node.ts',
+      'src/skills/node.ts',
+      'src/memory-markdown.ts',
+    ],
     rules: {
       'no-restricted-imports': 'off',
       'no-restricted-globals': 'off',

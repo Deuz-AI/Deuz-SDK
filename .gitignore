@@ -9,3 +9,10 @@ coverage/
 !.env.example
 *.tgz
 .vitest/
+.smoke-*
+examples/
+# GCP service-account keys — NEVER commit
+deuz-ai-*.json
+*-service-account*.json
+gcp-*.json
+scripts/
