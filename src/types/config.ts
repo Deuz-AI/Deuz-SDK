@@ -2,6 +2,7 @@ import type { LanguageModel } from './model';
 import type { Message } from './message';
 import type { Dependencies, UsageMeta, FinishMeta } from './deps';
 import type { Usage } from './usage';
+import type { ToolSet, ToolChoice, StopCondition, StepResult } from './tool';
 
 /** Opaque model id; capability-aware refinement arrives with the registry (Faz 1.A). */
 export type ModelId = string;
@@ -33,6 +34,17 @@ export interface CommonCallOptions {
   effort?: 'none' | 'low' | 'medium' | 'high';
   /** Free-form text vs. JSON mode (structured output uses generateObject). */
   responseFormat?: 'text' | 'json';
+
+  // --- Agentic tools (Faz 2; additive). Omitting `tools` = single-turn (today). ---
+  tools?: ToolSet;
+  toolChoice?: ToolChoice;
+  /** Max model turns in the agentic loop. Default 1 (single-turn). */
+  maxSteps?: number;
+  /** Stop predicate(s), OR-ed with `maxSteps`. */
+  stopWhen?: StopCondition | StopCondition[];
+  /** Max parallel tool executions per step. Default 5. */
+  maxToolConcurrency?: number;
+  onStepFinish?: (step: StepResult) => void;
 }
 
 /** Shared client configuration; pre-binds api keys + deps for the convenience client. */

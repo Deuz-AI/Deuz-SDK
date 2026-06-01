@@ -22,6 +22,8 @@ export interface ToolCallDeltaPart {
   name?: string;
   /** Raw argument JSON fragment — accumulate as string, parse once at block end. */
   argsTextDelta: string;
+  /** Provider round-trip data (e.g. Gemini thought_signature) to echo back. */
+  providerMetadata?: Record<string, unknown>;
 }
 
 export interface SourcePart {
@@ -42,10 +44,45 @@ export interface ErrorStreamPart {
   error: unknown;
 }
 
+// --- Agentic loop parts (Faz 2; additive to the open union) ---
+
+export interface StepStartPart {
+  type: 'step-start';
+  stepIndex: number;
+}
+
+export interface StepFinishPart {
+  type: 'step-finish';
+  stepIndex: number;
+  finishReason: FinishReason;
+  usage: Usage;
+}
+
+/** Final, parsed tool call (emitted after `tool-call-delta` fragments complete). */
+export interface ToolCallPart {
+  type: 'tool-call';
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+}
+
+/** Result of executing a `tool-call`, emitted after server-side execution. */
+export interface ToolResultStreamPart {
+  type: 'tool-result';
+  toolCallId: string;
+  toolName: string;
+  output: unknown;
+  isError?: boolean;
+}
+
 export type StreamPart =
   | TextDeltaPart
   | ReasoningDeltaPart
   | ToolCallDeltaPart
   | SourcePart
   | FinishStreamPart
-  | ErrorStreamPart;
+  | ErrorStreamPart
+  | StepStartPart
+  | StepFinishPart
+  | ToolCallPart
+  | ToolResultStreamPart;

@@ -20,6 +20,12 @@ export interface Dependencies {
   keyProvider?: KeyProvider;
   /** Token -> cost seam. Default: undefined (app computes cost). */
   priceProvider?: PriceProvider;
+  /**
+   * Randomness seam — request ids, tool-call fallback ids. Core never calls
+   * `crypto.randomUUID()` directly so fixtures can assert stable ids.
+   * Default: `() => crypto.randomUUID()`.
+   */
+  generateId?: () => string;
   /** Per-usage callback (metering). */
   onUsage?: (usage: Usage, meta: UsageMeta) => void;
   /** Final-result callback. */
@@ -65,7 +71,8 @@ export interface KeyProvider {
 }
 
 export interface PriceProvider {
-  priceUsage(model: string, usage: Usage): number | undefined;
+  /** May be async — real price tables (DB/remote) resolve a Promise. */
+  priceUsage(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
 }
 
 export interface UsageMeta {
@@ -81,4 +88,6 @@ export interface FinishMeta {
 
 /** Dependencies after defaults are applied (core-required fields non-optional). */
 export type ResolvedDependencies = Dependencies &
-  Required<Pick<Dependencies, 'fetch' | 'clock' | 'logger' | 'tracer' | 'breakerStore'>>;
+  Required<
+    Pick<Dependencies, 'fetch' | 'clock' | 'logger' | 'tracer' | 'breakerStore' | 'generateId'>
+  >;

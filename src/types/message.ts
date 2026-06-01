@@ -23,6 +23,12 @@ export interface ToolUsePart {
   id: string;
   name: string;
   input: unknown;
+  /**
+   * Opaque provider round-trip data that MUST be echoed back on the next turn
+   * (e.g. Gemini's `extra_content.google.thought_signature` — without it the
+   * follow-up request 400s). Set by the adapter, serialized back by it.
+   */
+  providerMetadata?: Record<string, unknown>;
 }
 
 export interface ToolResultPart {
