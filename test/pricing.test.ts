@@ -1,0 +1,97 @@
+import { describe, it, expect } from 'vitest';
+import { priceUsage, createPriceProvider, PRICES_2026 } from '../src/pricing';
+import type { Usage } from '../src/types/usage';
+
+function usage(over: Partial<Usage> = {}): Usage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    cachedReadTokens: 0,
+    cacheWriteTokens: 0,
+    cacheWrite1hTokens: 0,
+    totalTokens: 0,
+    ...over,
+  };
+}
+
+describe('priceUsage', () => {
+  it('computes input + output cost per 1M tokens', () => {
+    // gpt-5.2: input 1.25, output 10 (USD / 1M)
+    const cost = priceUsage('gpt-5.2', usage({ inputTokens: 1_000_000, outputTokens: 1_000_000 }));
+    expect(cost).toBeCloseTo(1.25 + 10, 6);
+  });
+
+  it('bills reasoning tokens at the output rate', () => {
+    const cost = priceUsage('gpt-5.2', usage({ reasoningTokens: 1_000_000 }));
+    expect(cost).toBeCloseTo(10, 6);
+  });
+
+  it('uses the dedicated cached-read rate (Anthropic)', () => {
+    // claude-opus: input 5, cachedRead 0.5
+    const cost = priceUsage('claude-opus-4-8', usage({ cachedReadTokens: 1_000_000 }));
+    expect(cost).toBeCloseTo(0.5, 6);
+  });
+
+  it('applies cache-write 5m and 1h rates', () => {
+    const c = priceUsage(
+      'claude-opus-4-8',
+      usage({ cacheWriteTokens: 1_000_000, cacheWrite1hTokens: 1_000_000 }),
+    );
+    // cacheWrite 6.25 + cacheWrite1h 10
+    expect(c).toBeCloseTo(6.25 + 10, 6);
+  });
+
+  it('falls back to 10% of input for cachedRead when not specified', () => {
+    // grok-4 has no explicit cachedRead → default = input * 0.1 = 0.3
+    const explicit = PRICES_2026['grok-4']!;
+    expect(explicit.cachedRead).toBe(0.75); // grok DOES specify it
+    // qwen3-max has none → default 0.1 * 1.2 = 0.12
+    const cost = priceUsage('qwen3-max', usage({ cachedReadTokens: 1_000_000 }));
+    expect(cost).toBeCloseTo(0.12, 6);
+  });
+
+  it('returns undefined for an unknown model', () => {
+    expect(priceUsage('totally-made-up-model', usage({ inputTokens: 1000 }))).toBeUndefined();
+  });
+
+  it('strips date stamps and vendor prefixes (tolerant lookup)', () => {
+    expect(priceUsage('gpt-5.2-2025-12-11', usage({ inputTokens: 1_000_000 }))).toBeCloseTo(
+      1.25,
+      6,
+    );
+    expect(priceUsage('google/gemini-2.5-flash', usage({ inputTokens: 1_000_000 }))).toBeCloseTo(
+      0.3,
+      6,
+    );
+    expect(priceUsage('doubao-seedream', usage())).toBeUndefined(); // genuinely unknown
+  });
+
+  it('prices embeddings as input-only', () => {
+    expect(priceUsage('text-embedding-3-small', usage({ inputTokens: 1_000_000 }))).toBeCloseTo(
+      0.02,
+      6,
+    );
+  });
+});
+
+describe('createPriceProvider', () => {
+  it('returns a PriceProvider usable as deps.priceProvider', () => {
+    const pp = createPriceProvider();
+    expect(pp.priceUsage('gpt-5.2', usage({ outputTokens: 1_000_000 }))).toBeCloseTo(10, 6);
+    expect(pp.priceUsage('unknown', usage({ inputTokens: 1 }))).toBeUndefined();
+  });
+
+  it('applies a margin multiplier', () => {
+    const pp = createPriceProvider({ margin: 1.3 });
+    const c = pp.priceUsage('gpt-5.2', usage({ outputTokens: 1_000_000 })) as number;
+    expect(c).toBeCloseTo(10 * 1.3, 5);
+  });
+
+  it('merges a custom table over the built-in one', () => {
+    const pp = createPriceProvider({ table: { 'my-model': { input: 2, output: 4 } } });
+    expect(pp.priceUsage('my-model', usage({ inputTokens: 1_000_000 }))).toBeCloseTo(2, 6);
+    // built-ins still resolve
+    expect(pp.priceUsage('gpt-5.2', usage({ inputTokens: 1_000_000 }))).toBeCloseTo(1.25, 6);
+  });
+});
