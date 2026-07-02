@@ -43,3 +43,7 @@ expectTypeOf(client.generateText).returns.resolves.toHaveProperty('text');
 // --- 0.2.0 additive: effort accepts xhigh/max (input-union widening). ---
 expectTypeOf<'xhigh'>().toExtend<NonNullable<CommonCallOptions['effort']>>();
 expectTypeOf<'max'>().toExtend<NonNullable<CommonCallOptions['effort']>>();
+
+// --- 0.2.0 additive: finish part carries optional providerMetadata. ---
+import type { StreamPart } from '../src/index';
+expectTypeOf<Extract<StreamPart, { type: 'finish' }>>().toHaveProperty('providerMetadata');

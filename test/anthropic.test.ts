@@ -388,3 +388,40 @@ describe('Anthropic usage extensions (0.2.0)', () => {
     expect(usage.totalTokens).toBe(45);
   });
 });
+
+describe('Anthropic refusal stop_details (0.2.0)', () => {
+  it('maps refusal → content_filter and carries stop_details on the finish part', async () => {
+    const stream = sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 0 } } },
+      },
+      {
+        event: 'message_delta',
+        data: {
+          type: 'message_delta',
+          delta: {
+            stop_reason: 'refusal',
+            stop_details: { type: 'refusal', category: 'cyber', explanation: 'blocked' },
+          },
+          usage: { output_tokens: 0 },
+        },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+    const { provider } = model([stream]);
+    const result = streamChat({
+      model: provider('claude-fable-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const parts: StreamPart[] = [];
+    for await (const p of result.fullStream) parts.push(p);
+    const finish = parts.find((p) => p.type === 'finish');
+    expect(finish && finish.type === 'finish' && finish.finishReason).toBe('content_filter');
+    const meta =
+      finish && finish.type === 'finish'
+        ? (finish.providerMetadata?.anthropic as { stop_details?: { category?: string } })
+        : undefined;
+    expect(meta?.stop_details?.category).toBe('cyber');
+  });
+});

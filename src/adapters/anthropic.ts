@@ -222,6 +222,7 @@ interface AnthropicEvent {
     signature?: string;
     partial_json?: string;
     stop_reason?: string;
+    stop_details?: { type?: string; category?: string | null; explanation?: string | null };
   };
   usage?: AnthropicUsage;
   error?: { type?: string; message?: string };
@@ -279,6 +280,7 @@ async function* parseStream(
   let inputUsage: AnthropicUsage = {};
   let outputTokens = 0;
   let stopReason: string | null = null;
+  let stopDetails: unknown;
   const toolIds = new Map<number, string>();
   let finishEmitted = false;
 
@@ -322,6 +324,7 @@ async function* parseStream(
       }
     } else if (type === 'message_delta') {
       if (data.delta?.stop_reason) stopReason = data.delta.stop_reason;
+      if (data.delta?.stop_details) stopDetails = data.delta.stop_details;
       if (data.usage) {
         if (data.usage.output_tokens !== undefined) outputTokens = data.usage.output_tokens;
         // The final message_delta carries output_tokens_details / iterations;
@@ -338,6 +341,7 @@ async function* parseStream(
         type: 'finish',
         usage: buildUsage(inputUsage, outputTokens),
         finishReason: mapStopReason(stopReason),
+        ...(stopDetails ? { providerMetadata: { anthropic: { stop_details: stopDetails } } } : {}),
       };
     } else if (type === 'error') {
       yield { type: 'error', error: mapError(200, data, new Headers()) };
@@ -350,6 +354,7 @@ async function* parseStream(
       type: 'finish',
       usage: buildUsage(inputUsage, outputTokens),
       finishReason: mapStopReason(stopReason),
+      ...(stopDetails ? { providerMetadata: { anthropic: { stop_details: stopDetails } } } : {}),
     };
   }
 }

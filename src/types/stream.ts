@@ -37,6 +37,8 @@ export interface FinishStreamPart {
   type: 'finish';
   usage: Usage;
   finishReason: FinishReason;
+  /** Provider-specific finish detail (e.g. `{ anthropic: { stop_details } }`). Additive, optional. */
+  providerMetadata?: Record<string, unknown>;
 }
 
 export interface ErrorStreamPart {
