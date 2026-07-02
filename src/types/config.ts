@@ -30,8 +30,10 @@ export interface CommonCallOptions {
   maxOutputTokens?: number;
   topP?: number;
   stopSequences?: string[];
-  /** Canonical reasoning effort; each adapter maps to its own unit. */
-  effort?: 'none' | 'low' | 'medium' | 'high';
+  /** Canonical reasoning effort; each adapter maps to its own unit.
+   *  'xhigh' (Anthropic 4.7+/OpenAI) and 'max' (Anthropic 5.x) clamp down
+   *  on wires that lack them. */
+  effort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   /** Free-form text vs. JSON mode (structured output uses generateObject). */
   responseFormat?: 'text' | 'json';
 

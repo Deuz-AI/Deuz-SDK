@@ -39,3 +39,7 @@ expectTypeOf(streamChat).returns.toEqualTypeOf<StreamChatResult>();
 
 const client = createClient();
 expectTypeOf(client.generateText).returns.resolves.toHaveProperty('text');
+
+// --- 0.2.0 additive: effort accepts xhigh/max (input-union widening). ---
+expectTypeOf<'xhigh'>().toExtend<NonNullable<CommonCallOptions['effort']>>();
+expectTypeOf<'max'>().toExtend<NonNullable<CommonCallOptions['effort']>>();
