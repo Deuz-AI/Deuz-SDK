@@ -229,3 +229,91 @@ describe('Anthropic generateObject (json mode)', () => {
     expect(body.output_config).toEqual({ format: { type: 'json_schema', schema } });
   });
 });
+
+// --- 0.2.0: effort wire, usage extensions, refusal stop_details ---
+
+function lastBody(calls: { url: string; init?: RequestInit }[]): Record<string, unknown> {
+  return JSON.parse(String(calls[calls.length - 1]!.init!.body)) as Record<string, unknown>;
+}
+
+const TEXT_STREAM_JSON = sseEvents([
+  {
+    event: 'message_start',
+    data: { type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 1 } } },
+  },
+  {
+    event: 'content_block_delta',
+    data: {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: '{"a":"x"}' },
+    },
+  },
+  {
+    event: 'message_delta',
+    data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 4 } },
+  },
+  { event: 'message_stop', data: { type: 'message_stop' } },
+]);
+
+describe('Anthropic effort wire (0.2.0)', () => {
+  it('fable-5: effort → output_config.effort, no thinking block, sampling stripped', async () => {
+    const { provider, calls } = model([TEXT_STREAM]);
+    const result = streamChat({
+      model: provider('claude-fable-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      effort: 'xhigh',
+      temperature: 0.2,
+      topP: 0.9,
+    });
+    await result.finishReason;
+    const body = lastBody(calls);
+    expect(body.output_config).toEqual({ effort: 'xhigh' });
+    expect(body.thinking).toBeUndefined();
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_p).toBeUndefined();
+    expect(body.max_tokens).toBe(128_000); // caps.maxOutput, no budget bump
+  });
+
+  it('fable-5 without effort sends neither thinking nor output_config', async () => {
+    const { provider, calls } = model([TEXT_STREAM]);
+    const result = streamChat({
+      model: provider('claude-fable-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    await result.finishReason;
+    const body = lastBody(calls);
+    expect(body.thinking).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
+  });
+
+  it('opus-4-6 keeps the legacy budget_tokens path; xhigh/max map to 48k', async () => {
+    const { provider, calls } = model([TEXT_STREAM]);
+    const result = streamChat({
+      model: provider('claude-opus-4-6'),
+      messages: [{ role: 'user', content: 'hi' }],
+      effort: 'max',
+    });
+    await result.finishReason;
+    const body = lastBody(calls);
+    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 48_000 });
+    expect(body.output_config).toBeUndefined();
+  });
+
+  it('output_config.effort merges with json structured-output format', async () => {
+    const { provider, calls } = model([TEXT_STREAM_JSON]);
+    await generateObject({
+      model: provider('claude-fable-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      effort: 'high',
+      schema: { type: 'object', properties: { a: { type: 'string' } } } as JSONSchema,
+    });
+    const body = lastBody(calls);
+    const oc = body.output_config as Record<string, unknown>;
+    expect(oc.effort).toBe('high');
+    expect(oc.format).toEqual({
+      type: 'json_schema',
+      schema: { type: 'object', properties: { a: { type: 'string' } } },
+    });
+  });
+});

@@ -67,10 +67,12 @@ function orderReasoningFirst(blocks: AnthropicBlock[]): AnthropicBlock[] {
   return [...thinking, ...rest];
 }
 
-const THINKING_BUDGET: Record<'low' | 'medium' | 'high', number> = {
+const THINKING_BUDGET: Record<'low' | 'medium' | 'high' | 'xhigh' | 'max', number> = {
   low: 4_000,
   medium: 10_000,
   high: 24_000,
+  xhigh: 48_000,
+  max: 48_000,
 };
 
 /** Map canonical tool choice → Anthropic. Forced choice is illegal with thinking → fall back to auto. */
@@ -98,13 +100,16 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     content: orderReasoningFirst(m.content.map(partToBlock)),
   }));
 
-  const thinkingOn = caps.reasoning && options.effort !== undefined && options.effort !== 'none';
+  const effortOn = caps.reasoning && options.effort !== undefined && options.effort !== 'none';
+  // Opus 4.7+/Sonnet 5/Fable 5: budget_tokens returns 400 — effort rides output_config.
+  const useOutputConfig = caps.effortWire === 'output_config';
+  const thinkingOn = effortOn && !useOutputConfig;
   const maxTokens = options.maxOutputTokens ?? caps.maxOutput;
 
   const body: Record<string, unknown> = {
     model: call.modelId,
     max_tokens: thinkingOn
-      ? Math.max(maxTokens, THINKING_BUDGET[options.effort as 'low' | 'medium' | 'high'] + 1_024)
+      ? Math.max(maxTokens, THINKING_BUDGET[options.effort as keyof typeof THINKING_BUDGET] + 1_024)
       : maxTokens,
     messages: wireMessages,
     stream: true,
@@ -113,10 +118,10 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   if (thinkingOn) {
     body.thinking = {
       type: 'enabled',
-      budget_tokens: THINKING_BUDGET[options.effort as 'low' | 'medium' | 'high'],
+      budget_tokens: THINKING_BUDGET[options.effort as keyof typeof THINKING_BUDGET],
     };
     // Anthropic requires temperature unset (=1) when thinking is enabled.
-  } else {
+  } else if (!caps.samplingRestrictions) {
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.topP !== undefined) body.top_p = options.topP;
   }
@@ -144,9 +149,18 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     }));
     body.tool_choice = mapAnthropicToolChoice(
       ctx.tools.toolChoice,
-      thinkingOn,
+      thinkingOn || (effortOn && useOutputConfig),
       ctx.tools.allowParallel,
     );
+  }
+
+  // Effort rides output_config on adaptive-thinking models; merge with the
+  // json-strategy `output_config.format` set above when both are present.
+  if (effortOn && useOutputConfig) {
+    body.output_config = {
+      ...(body.output_config as Record<string, unknown> | undefined),
+      effort: options.effort,
+    };
   }
 
   // Claude on Vertex AI: same Messages body, but model goes in the URL,

@@ -48,7 +48,11 @@ export const generateObject: GenerateObject = async <T = unknown>(
 
   // G3: Anthropic rejects forced tool_choice while extended thinking is enabled
   // (HTTP 400) → never pick the tool strategy in that case; use native json mode.
-  const thinkingOn = caps.reasoning && options.effort !== undefined && options.effort !== 'none';
+  // Adaptive-thinking models (effortWire 'output_config') can't disable thinking,
+  // so they always take the json strategy.
+  const thinkingOn =
+    caps.effortWire === 'output_config' ||
+    (caps.reasoning && options.effort !== undefined && options.effort !== 'none');
   if (strategy === 'tool' && options.model.provider === 'anthropic' && thinkingOn) {
     strategy = 'json';
   }
