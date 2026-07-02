@@ -1,0 +1,258 @@
+---
+title: Anthropic
+description: Claude models on the /v1/messages wire — vision, extended thinking, prompt caching, and tools.
+---
+
+The Anthropic provider speaks Claude's native `/v1/messages` API. Use it for Claude Opus/Sonnet/Haiku with vision, extended thinking (reasoning), prompt caching, and tool use. The same provider also drives Claude-on-Vertex — see [Vertex](/docs/providers/vertex).
+
+## Setup
+
+The factory lives at the `@deuz-sdk/core/anthropic` subpath. It returns a `Provider`: call it with a model id to get a `LanguageModel` descriptor.
+
+```ts title="model.ts"
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+// Read the key at the app layer — the SDK core never touches process.env.
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const model = anthropic('claude-opus-4-8');
+```
+
+A pre-built default provider is also exported for when the key is supplied at the call layer (via `deps.keyProvider` or a `createClient`):
+
+```ts
+import { anthropic } from '@deuz-sdk/core/anthropic';
+
+const model = anthropic('claude-opus-4-8');
+```
+
+### Factory options
+
+`createAnthropic(settings)` accepts:
+
+| Option | Type | Description |
+| --- | --- | --- |
+| `apiKey` | `string` | Sent as the `x-api-key` header. Optional here if resolved at the call layer. |
+| `baseURL` | `string` | Overrides the API base (proxy/gateway). The adapter appends `/v1/messages`. |
+| `fetch` | `typeof fetch` | Custom fetch implementation. Wins over `deps.fetch`. |
+| `headers` | `Record<string, string>` | Extra headers merged into every request. |
+
+Settings are stashed on the descriptor via a private Symbol, so they never widen the public `LanguageModel` type or leak through `JSON.stringify`/`Object.keys`.
+
+## Models and capabilities
+
+The descriptor `{ provider: 'anthropic', modelId, surface: 'anthropic' }` is resolved against the registry, which is the single source of truth for per-model behavior. Pinned Claude slugs:
+
+| Model | Vision | Tools | Thinking | Caching | Context | Max output |
+| --- | --- | --- | --- | --- | --- | --- |
+| `claude-fable-5` | yes | yes | yes (adaptive) | yes | 1,000,000 | 128,000 |
+| `claude-sonnet-5` | yes | yes | yes (adaptive) | yes | 1,000,000 | 128,000 |
+| `claude-opus-4-8` | yes | yes | yes | yes | 1,000,000 | 128,000 |
+| `claude-opus-4-7` | yes | yes | yes | yes | 1,000,000 | 128,000 |
+| `claude-opus-4-6` | yes | yes | yes | yes | 1,000,000 | 128,000 |
+| `claude-sonnet-4-6` | yes | yes | yes | yes | 1,000,000 | 64,000 |
+| `claude-haiku-4-5` | yes | yes | yes | yes | 200,000 | 64,000 |
+
+On Opus 4.7+, Sonnet 5 and Fable 5 the registry also flags `samplingRestrictions` — non-default `temperature`/`top_p`/`top_k` return HTTP 400 on those models, so the adapter never sends them.
+
+Unknown slugs do not throw. A future `claude-opus-4-9` falls back to conservative `anthropic`-surface defaults (tools/reasoning/structured-output off, `max_tokens` 4,096) and logs a warning via `deps.logger`, so new releases work without an SDK upgrade — pin a known slug to keep the full capability matrix.
+
+## Basic streaming
+
+`streamChat` returns synchronously and never throws — failures surface as an `error` part on `fullStream` and reject the `usage`/`finishReason` promises. See [streamChat](/docs/core/stream-chat).
+
+```ts title="basic.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Write a haiku about TypeScript.' }],
+});
+
+for await (const chunk of result.textStream) {
+  process.stdout.write(chunk);
+}
+
+const usage = await result.usage;
+console.log('\ntokens:', usage.totalTokens);
+```
+
+For a one-shot, buffered call use [generateText](/docs/core/generate-text) instead.
+
+## Extended thinking (reasoning)
+
+Set `effort` to control Claude's thinking depth. The wire depends on the model generation (`effortWire` in the registry):
+
+- **Opus 4.7+, Sonnet 5, Fable 5** (`effortWire: 'output_config'`): the adapter sends `output_config.effort` with your level verbatim (`'low' | 'medium' | 'high' | 'xhigh' | 'max'`). Manual `thinking.budget_tokens` returns HTTP 400 on these models, so the adapter never sends a `thinking` block. Adaptive thinking is always available; omitting `effort` leaves the model default.
+- **Opus 4.6 and older** (`effortWire: 'budget_tokens'`): the canonical level maps to a `thinking.budget_tokens` value:
+
+| `effort` | `budget_tokens` |
+| --- | --- |
+| `'none'` (or omitted) | thinking disabled |
+| `'low'` | 4,000 |
+| `'medium'` | 10,000 |
+| `'high'` | 24,000 |
+| `'xhigh'` / `'max'` | 48,000 |
+
+On the legacy wire, `max_tokens` is automatically raised to at least `budget_tokens + 1024`, and `temperature`/`topP` are **not** sent (Anthropic requires them unset with thinking enabled). Thinking text streams as `reasoning-delta` parts on `fullStream`; a trailing `reasoning-delta` carries the block `signature`. Thinking tokens bill inside `outputTokens`; since May 2026 the API also breaks them out, so `usage.reasoningTokens` reports the `output_tokens_details.thinking_tokens` count (0 on older models).
+
+```ts title="thinking.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Is 9007199254740993 prime? Reason it through.' }],
+  effort: 'high',
+});
+
+for await (const part of result.fullStream) {
+  if (part.type === 'reasoning-delta') {
+    if (part.text) process.stdout.write(`[think] ${part.text}`);
+    if (part.signature) console.log('\n[signature attached]');
+  } else if (part.type === 'text-delta') {
+    process.stdout.write(part.text);
+  }
+}
+```
+
+The `signature` round-trips automatically inside the agentic loop — preserve any `reasoning` part you persist, or follow-up tool turns will be rejected.
+
+## Vision
+
+Pass an `image` part. The value may be a base64 string, a data URL, an `http(s)` URL, or raw `Uint8Array` bytes; `mediaType` is forwarded as the source `media_type`.
+
+```ts title="vision.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const res = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is in this image?' },
+        {
+          type: 'image',
+          image: 'https://example.com/photo.jpg',
+          mediaType: 'image/jpeg',
+        },
+      ],
+    },
+  ],
+});
+
+console.log(res.text);
+```
+
+## Tools
+
+Tools are plain objects keyed by name in a `ToolSet`. Each has a `parameters` schema (a Standard Schema like Zod, or a raw JSON Schema) and an optional `execute`. Provide `maxSteps` to let the agentic loop run tools and feed results back. See [Tools](/docs/agents/tools).
+
+```ts title="tools.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import type { JSONSchema } from '@deuz-sdk/core';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const citySchema: JSONSchema = {
+  type: 'object',
+  properties: { city: { type: 'string' } },
+  required: ['city'],
+  additionalProperties: false,
+};
+
+const res = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'What is the weather in Paris?' }],
+  tools: {
+    getWeather: {
+      description: 'Look up the current weather for a city.',
+      parameters: citySchema,
+      execute: async ({ city }: { city: string }) => ({ city, tempC: 22 }),
+    },
+  },
+  maxSteps: 5,
+});
+
+console.log(res.text);
+console.log(res.steps?.length, 'steps');
+```
+
+`toolChoice` accepts `'auto'`, `'required'`, `'none'`, or `{ type: 'tool', toolName }`. Note that forced tool choice is illegal alongside extended thinking — when `effort` is set, the adapter downgrades a forced choice to `auto`.
+
+## Prompt caching
+
+All pinned Claude slugs have `caching: true`. The adapter reports cache token breakdowns on `usage`:
+
+| Field | Meaning |
+| --- | --- |
+| `cachedReadTokens` | Tokens served from a cache hit (`cache_read_input_tokens`). |
+| `cacheWriteTokens` | Standard (5-minute) cache-creation tokens. |
+| `cacheWrite1hTokens` | 1-hour cache-creation tokens (`ephemeral_1h_input_tokens`). |
+
+`totalTokens` includes input + cache reads + cache writes + output. Feed this breakdown into the [pricing helper](/docs/modules/pricing) for correct cost — cache reads are billed at a fraction of input price.
+
+## Structured output
+
+[generateObject](/docs/core/generate-object) selects a strategy from capabilities. On Anthropic it uses the native `output_config` JSON-schema mode by default. With extended thinking enabled it is forced into `json` mode, because Anthropic rejects a forced tool-choice when thinking is on.
+
+```ts title="object.ts"
+import { generateObject } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const { object } = await generateObject({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Capital of France?' }],
+  schema: z.object({ city: z.string() }),
+});
+
+console.log(object.city); // "Paris"
+```
+
+## The /v1/messages wire
+
+Requests go to `${baseURL}/v1/messages` with `x-api-key`, `anthropic-version: 2023-06-01`, and `content-type: application/json`. The adapter normalizes everything to the canonical delta stream — it never proxies raw provider bytes.
+
+Notable mappings:
+
+- System messages are hoisted into the top-level `system` field.
+- `tool` role messages are sent as `user` turns containing `tool_result` blocks.
+- `reasoning` parts are ordered first in each content array (Anthropic requires thinking blocks before other content) and serialized as `thinking` / `redacted_thinking` blocks.
+
+### Streaming tool-call accumulation
+
+Claude emits a `content_block_start` for each `tool_use` block (carrying the tool `id` and `name`), then a sequence of `input_json_delta` events whose `partial_json` fragments are the argument JSON. The adapter slots each fragment by block `index`, emits canonical `tool-call-delta` parts as strings, and parses the accumulated JSON once at block end. Text streams via `text_delta`, thinking via `thinking_delta`, and the block signature via `signature_delta`.
+
+### Claude on Vertex AI
+
+The same Messages body works against Vertex AI: the model id moves into the URL, `anthropic_version: vertex-2023-10-16` goes in the body, and auth becomes an OAuth `Bearer` token. This is wired through the [Vertex provider](/docs/providers/vertex) — you do not configure it on `createAnthropic` directly.
+
+## Error mapping
+
+Upstream errors are normalized to the typed error taxonomy from `@deuz-sdk/core`:
+
+| Anthropic `error.type` | Thrown error |
+| --- | --- |
+| `authentication_error` | `AuthenticationError` (401) |
+| `permission_error` | `AuthenticationError` (403) |
+| `not_found_error` | `ModelNotFoundError` (404) |
+| `rate_limit_error` | `RateLimitError` (429) |
+| `overloaded_error` | `OverloadedError` (529) |
+| `request_too_large` | `InvalidRequestError` (413) |
+| `invalid_request_error` | `InvalidRequestError` |
+| `api_error` | `APICallError` (retryable) |
+
+`Retry-After` is honored for pre-first-byte retries, and the upstream `request-id` is preserved on the error. Secrets are redacted from all logs and error payloads.

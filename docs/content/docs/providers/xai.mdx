@@ -1,0 +1,146 @@
+---
+title: xAI Grok
+description: Connect to xAI Grok models over the OpenAI-compatible Chat Completions wire.
+---
+
+xAI Grok runs on the OpenAI-compatible Chat Completions wire (`surface: 'chat_completions'`), so it reuses the same adapter as OpenAI Chat Completions with registry-driven quirk flags. Use it for fast, reasoning-capable, tool-using chat against `api.x.ai`.
+
+## createXai
+
+`createXai(settings?)` returns a `Provider` — a function you call with a model slug to get a `LanguageModel` descriptor. Settings are stashed on a non-enumerable Symbol, so they never leak through `Object.keys`/`JSON.stringify`.
+
+```ts
+import { createXai } from '@deuz-sdk/core/xai';
+
+const xai = createXai({ apiKey: process.env.XAI_API_KEY! });
+const model = xai('grok-4.3');
+```
+
+A pre-built default instance is also exported (no api key bound — supply one via [`createClient`](/docs/core/dependencies#createclient) `apiKeys` or `deps.keyProvider`):
+
+```ts
+import { xai } from '@deuz-sdk/core/xai';
+```
+
+### Settings
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | — | xAI API key. Read it from `process.env` at the app layer; core never reads env itself. |
+| `baseURL` | `string` | `https://api.x.ai/v1` | Override for a proxy/gateway. The `/v1` root is the OpenAI-style base; the adapter appends `/chat/completions`. |
+| `fetch` | `typeof fetch` | global `fetch` | Custom fetch (factory `fetch` wins over `deps.fetch`). |
+| `headers` | `Record<string, string>` | — | Extra request headers, merged under the adapter's auth headers. |
+
+Key resolution follows the standard precedence (the "G1" rule): `deps.keyProvider` > factory `apiKey` > `createClient` `apiKeys.xai` > otherwise an `AuthenticationError` is thrown. See [Key resolution](/docs/core/dependencies#key--baseurl-precedence-g1).
+
+## Models
+
+Grok slugs are pinned in the [registry](/docs/advanced/model-registry). Unknown slugs do **not** throw — they fall back to conservative `(xai, chat_completions)` defaults (tools/reasoning/structured-output off, `maxOutput` 4096) and log a warning, so a future Grok release works without an SDK change. To get full capabilities, use a pinned slug.
+
+| Slug | Vision | Tools | Reasoning | Context | Max output |
+| --- | --- | --- | --- | --- | --- |
+| `grok-4.3` | yes | yes | yes | 1,000,000 | 128,000 |
+
+Reasoning is on by default for Grok on this wire. Map it per call with the canonical `effort` option (`'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'`). List price for `grok-4.3` is $1.25 in / $2.50 out per 1M tokens (see the [pricing module](/docs/modules/pricing)).
+
+## Capabilities and quirks
+
+`grok-4.3` is a standard OpenAI-compatible Chat Completions model — none of the Gemini-compat quirks apply:
+
+- **`usagePerChunk: false`** — usage arrives once, in the trailing `include_usage` chunk. The adapter sends `stream_options: { include_usage: true }`.
+- **`toolIndexAllZero: false`** — streamed tool-call fragments are keyed by their `index` (name may arrive late), accumulated as strings and parsed as JSON once at block end.
+- **`samplingRestrictions: false`** — `temperature` / `topP` / `maxOutputTokens` are passed through normally.
+
+xAI is a chat-only provider here — there is no embedding model. Calling [`embed`](/docs/core/embeddings) with an `xai` model is rejected before any network call.
+
+## Example: streamChat
+
+`streamChat` returns synchronously and never throws; the network pump starts lazily on first access of any output. Failures surface as an `error` part on `fullStream` and rejected `usage`/`finishReason` promises. See [streamChat](/docs/core/stream-chat).
+
+```ts title="stream.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createXai } from '@deuz-sdk/core/xai';
+
+const xai = createXai({ apiKey: process.env.XAI_API_KEY! });
+
+const result = streamChat({
+  model: xai('grok-4.3'),
+  messages: [{ role: 'user', content: 'Explain reciprocal rank fusion in two sentences.' }],
+  effort: 'low',
+});
+
+for await (const delta of result.textStream) {
+  process.stdout.write(delta);
+}
+
+console.log('\nusage:', await result.usage);
+console.log('finishReason:', await result.finishReason);
+```
+
+## Example: tools
+
+Pass a `ToolSet` (a `Record<string, Tool>`). Each tool's `parameters` is any Standard Schema (zod/valibot) or a raw JSON Schema; provide `execute` for a server-run tool, or omit it for a client tool. Set `maxSteps > 1` to enable the agentic loop — the model can call a tool, receive the result, and continue. See [Tools](/docs/agents/tools) and the [agentic loop](/docs/agents/tool-loop).
+
+```ts title="tools.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createXai } from '@deuz-sdk/core/xai';
+import { z } from 'zod';
+
+const xai = createXai({ apiKey: process.env.XAI_API_KEY! });
+
+const result = await generateText({
+  model: xai('grok-4.3'),
+  messages: [{ role: 'user', content: 'What is the weather in Paris?' }],
+  tools: {
+    getWeather: {
+      description: 'Get the current weather for a city.',
+      parameters: z.object({ city: z.string() }),
+      execute: async ({ city }) => ({ city, tempC: 18, sky: 'clear' }),
+    },
+  },
+  maxSteps: 5,
+});
+
+console.log(result.text);
+```
+
+A raw JSON Schema works too — no schema library required:
+
+```ts title="tools-json-schema.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createXai } from '@deuz-sdk/core/xai';
+import type { JSONSchema } from '@deuz-sdk/core';
+
+const xai = createXai({ apiKey: process.env.XAI_API_KEY! });
+
+const params: JSONSchema = {
+  type: 'object',
+  properties: { city: { type: 'string' } },
+  required: ['city'],
+  additionalProperties: false,
+};
+
+const result = streamChat({
+  model: xai('grok-4.3'),
+  messages: [{ role: 'user', content: 'Weather in Paris?' }],
+  tools: {
+    getWeather: {
+      parameters: params,
+      execute: ({ city }: { city: string }) => ({ city, tempC: 18 }),
+    },
+  },
+  maxSteps: 5,
+});
+
+for await (const part of result.fullStream) {
+  if (part.type === 'text-delta') process.stdout.write(part.text);
+}
+```
+
+## See also
+
+- [streamChat](/docs/core/stream-chat) — the streaming entry point.
+- [generateText](/docs/core/generate-text) — buffered, single result.
+- [Tools and the agentic loop](/docs/agents/tools).
+- [OpenAI](/docs/providers/openai) — the sibling Chat Completions provider.
+- [Registry and capabilities](/docs/advanced/model-registry).

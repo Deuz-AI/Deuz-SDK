@@ -1,0 +1,231 @@
+---
+title: Embeddings
+description: Turn text into vectors with embed / embedMany across OpenAI, Gemini, and Voyage.
+---
+
+`embed` and `embedMany` convert text into dense vectors using a dedicated `EmbeddingModel`. Use them to build semantic search, retrieval, clustering, and the [RAG](/docs/modules/rag) pipeline. Both are plain `async` functions that return canonical `Usage` alongside the vectors.
+
+Embedding models are a **separate kind** from `LanguageModel`. An `EmbeddingModel` can never be passed to [generateText](/docs/core/generate-text) or [streamChat](/docs/core/stream-chat), and a chat model can never be passed to `embed` — the type system rejects both, so there is no casting between them.
+
+## embed
+
+Embed a single string. Returns `{ embedding, usage }`.
+
+```ts title="embed.ts"
+import { embed } from '@deuz-sdk/core';
+import { openaiEmbedding } from '@deuz-sdk/core/openai';
+
+const { embedding, usage } = await embed({
+  model: openaiEmbedding('text-embedding-3-small'),
+  value: 'The quick brown fox.',
+});
+
+console.log(embedding.length); // 1536
+console.log(usage.inputTokens);
+```
+
+The `openaiEmbedding` / `voyage` shorthands read no API key on their own — supply one through the factory (below), `createClient`, or a `deps.keyProvider`. For real apps, prefer the explicit factory so the key is passed in from your app layer.
+
+## embedMany
+
+Embed an array of strings. Returns `{ embeddings, usage }` where `embeddings[i]` corresponds to `values[i]` (order is always preserved). `embedMany` automatically splits large inputs into provider-sized sub-batches and runs them concurrently.
+
+```ts title="embed-many.ts"
+import { embedMany } from '@deuz-sdk/core';
+import { createOpenAIEmbedding } from '@deuz-sdk/core/openai';
+
+const openaiEmbedding = createOpenAIEmbedding({
+  apiKey: process.env.OPENAI_API_KEY!,
+});
+
+const { embeddings, usage } = await embedMany({
+  model: openaiEmbedding('text-embedding-3-large'),
+  values: ['first chunk', 'second chunk', 'third chunk'],
+});
+
+console.log(embeddings.length); // 3
+console.log(usage.inputTokens); // summed across all sub-batches
+```
+
+`embed` is implemented on top of `embedMany`, so everything below applies to both.
+
+## Providers
+
+Each provider ships behind its own subpath export so unused wires never bloat your bundle. Every factory accepts `{ apiKey?, baseURL?, fetch?, headers? }`; the no-argument singleton is exported alongside it.
+
+| Provider | Factory | Singleton | Import | Surface |
+| --- | --- | --- | --- | --- |
+| OpenAI | `createOpenAIEmbedding(settings)` | `openaiEmbedding` | `@deuz-sdk/core/openai` | `openai-embeddings` |
+| Google Gemini | `createGoogleEmbedding(settings)` | `googleEmbedding` | `@deuz-sdk/core/google` | `gemini-embeddings` |
+| Voyage AI | `createVoyage(settings)` | `voyage` | `@deuz-sdk/core/voyage` | `voyage-embeddings` |
+
+```ts title="providers.ts"
+import { createOpenAIEmbedding } from '@deuz-sdk/core/openai';
+import { createGoogleEmbedding } from '@deuz-sdk/core/google';
+import { createVoyage } from '@deuz-sdk/core/voyage';
+
+const openai = createOpenAIEmbedding({ apiKey: process.env.OPENAI_API_KEY! });
+const google = createGoogleEmbedding({ apiKey: process.env.GEMINI_API_KEY! });
+const voyage = createVoyage({ apiKey: process.env.VOYAGE_API_KEY! });
+
+openai('text-embedding-3-small'); // 1536 dims
+google('gemini-embedding-001'); //   3072 dims
+voyage('voyage-3.5'); //             1024 dims
+```
+
+A factory returns an `EmbeddingModel` descriptor `{ provider, modelId, surface }`; the settings (apiKey, baseURL, etc.) are stashed on a non-enumerable symbol and never leak through `Object.keys` or `JSON.stringify`.
+
+### Known models
+
+Unknown slugs do **not** throw — they fall back to conservative per-provider defaults and log a warning, so a freshly released model works without an SDK update. These slugs are pinned in the registry:
+
+| Model | Provider | Native dims | Max batch | Reports usage | taskType |
+| --- | --- | --- | --- | --- | --- |
+| `text-embedding-3-small` | OpenAI | 1536 | 2048 | yes | ignored |
+| `text-embedding-3-large` | OpenAI | 3072 | 2048 | yes | ignored |
+| `gemini-embedding-2` | Google | 3072 | 100 | no | no (instructions ride the prompt) |
+| `gemini-embedding-001` | Google | 3072 | 100 | no | yes |
+| `voyage-3.5` | Voyage | 1024 | 1000 | yes | yes |
+| `voyage-3.5-lite` | Voyage | 1024 | 1000 | yes | yes |
+
+## Options
+
+All options live on `EmbedOptions` / `EmbedManyOptions`.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `model` | `EmbeddingModel` | — | Required. From an embedding factory. |
+| `value` | `string` | — | `embed` only — the single input. |
+| `values` | `string[]` | — | `embedMany` only — the inputs. |
+| `taskType` | `EmbeddingTaskType` | — | Retrieval/usage hint; mapped per provider. |
+| `dimensions` | `number` | native | Matryoshka truncation. |
+| `title` | `string` | — | Gemini `RETRIEVAL_DOCUMENT` only; dropped elsewhere. |
+| `normalize` | `boolean` | `false` | L2-normalize returned vectors. |
+| `maxBatchSize` | `number` | model's max batch | `embedMany` — per-request sub-batch size. |
+| `maxConcurrency` | `number` | `5` | `embedMany` — max concurrent sub-batch requests. |
+| `maxRetries` | `number` | `2` | Pre-response retries per sub-batch. |
+| `signal` | `AbortSignal` | — | Cancels in-flight requests. |
+| `headers` | `Record<string, string>` | — | Extra request headers. |
+| `deps` | `Dependencies` | — | Inject `fetch`/`clock`/`keyProvider`/etc. |
+| `onUsage` | `(usage, meta) => void` | — | Fired once after the call completes. |
+
+### taskType
+
+`taskType` is a canonical hint that each provider maps to its own enum. **OpenAI ignores it.** The full enum:
+
+| `EmbeddingTaskType` | Gemini | Voyage `input_type` |
+| --- | --- | --- |
+| `search_query` | `RETRIEVAL_QUERY` | `query` |
+| `search_document` | `RETRIEVAL_DOCUMENT` | `document` |
+| `similarity` | `SEMANTIC_SIMILARITY` | — |
+| `classification` | `CLASSIFICATION` | — |
+| `clustering` | `CLUSTERING` | — |
+| `question_answering` | `QUESTION_ANSWERING` | — |
+| `fact_verification` | `FACT_VERIFICATION` | — |
+| `code_retrieval_query` | `CODE_RETRIEVAL_QUERY` | — |
+
+Voyage maps only `search_query` and `search_document`; any other value is omitted from the request. The classic retrieval pattern is to embed documents with `search_document` at index time and queries with `search_query` at search time.
+
+### dimensions
+
+`dimensions` requests Matryoshka truncation, mapped to each provider's own field — OpenAI `dimensions`, Gemini `outputDimensionality`, Voyage `output_dimension`. Pair it with `normalize: true`, since truncated vectors are no longer unit-length.
+
+### Batching and concurrency (embedMany)
+
+`embedMany` slices `values` into chunks of `maxBatchSize` (defaulting to the model's registry batch limit — e.g. 2048 for OpenAI, 100 for Gemini), then issues those sub-batch requests with a concurrency cap of `maxConcurrency` (default 5). Vectors are concatenated back in the original `values` order and token counts are summed across sub-batches. Each sub-batch retries independently on transient failures (408/409/429/5xx) with exponential backoff plus jitter, honoring `Retry-After`.
+
+```ts title="batching.ts"
+import { embedMany } from '@deuz-sdk/core';
+import { createGoogleEmbedding } from '@deuz-sdk/core/google';
+
+const google = createGoogleEmbedding({ apiKey: process.env.GEMINI_API_KEY! });
+
+// 1,000 inputs → Gemini caps each request at 100, so 10 sub-batches,
+// at most 3 in flight at once.
+const { embeddings } = await embedMany({
+  model: google('gemini-embedding-001'),
+  values: documents, // string[]
+  taskType: 'search_document',
+  maxConcurrency: 3,
+});
+```
+
+An empty `values` array makes no network request and returns `{ embeddings: [], usage }` with zero tokens — `onUsage` still fires exactly once.
+
+## Usage accounting
+
+Every call resolves a canonical `Usage` object. For embeddings, input tokens are recorded in both `inputTokens` and `totalTokens`; `outputTokens` is always `0`. Providers that do not report token counts (Gemini native embeddings) yield `0`.
+
+```ts title="usage.ts"
+import { embedMany } from '@deuz-sdk/core';
+import { createOpenAIEmbedding } from '@deuz-sdk/core/openai';
+
+const openai = createOpenAIEmbedding({ apiKey: process.env.OPENAI_API_KEY! });
+
+const { usage } = await embedMany({
+  model: openai('text-embedding-3-small'),
+  values: ['a', 'b', 'c'],
+  onUsage: (u, meta) => {
+    console.log(meta.model, u.inputTokens, u.totalTokens);
+  },
+});
+
+console.log(usage.totalTokens);
+```
+
+`onUsage` fires once per call (after all sub-batches finish), so it is safe to use as the single metering/credit hook.
+
+## Voyage with taskType
+
+Voyage is retrieval-tuned and benefits most from the query/document split. Combine it with `dimensions` to shrink the index.
+
+```ts title="voyage.ts"
+import { embed } from '@deuz-sdk/core';
+import { createVoyage } from '@deuz-sdk/core/voyage';
+
+const voyage = createVoyage({ apiKey: process.env.VOYAGE_API_KEY! });
+
+// Index time: embed documents.
+const doc = await embed({
+  model: voyage('voyage-3.5'),
+  value: 'Deuz is a web-first multi-provider AI SDK.',
+  taskType: 'search_document',
+  dimensions: 256,
+  normalize: true,
+});
+
+// Query time: embed the query with the matching hint.
+const query = await embed({
+  model: voyage('voyage-3.5'),
+  value: 'what is deuz?',
+  taskType: 'search_query',
+  dimensions: 256,
+  normalize: true,
+});
+```
+
+## Using embeddings with RAG
+
+The [RAG](/docs/modules/rag) module consumes an `Embedder` seam — `{ embed(texts: string[]): Promise<number[][]>; readonly dims: number }`. Wrap `embedMany` to plug any provider into the retrieval pipeline.
+
+```ts title="rag-embedder.ts"
+import { embedMany } from '@deuz-sdk/core';
+import { createOpenAIEmbedding } from '@deuz-sdk/core/openai';
+import type { Embedder } from '@deuz-sdk/core/rag';
+
+const openai = createOpenAIEmbedding({ apiKey: process.env.OPENAI_API_KEY! });
+
+const embedder: Embedder = {
+  dims: 1536,
+  async embed(texts) {
+    const { embeddings } = await embedMany({
+      model: openai('text-embedding-3-small'),
+      values: texts,
+      taskType: 'search_document',
+    });
+    return embeddings;
+  },
+};
+```
+
+Pass `embedder` to the RAG ingest/retrieve helpers; see [RAG](/docs/modules/rag) for the full pipeline.

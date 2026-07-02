@@ -1,0 +1,170 @@
+---
+title: Model Registry & Capabilities
+description: The single source of truth for per-model behavior — capability matrix, quirk flags, the four wire surfaces, and why unknown model slugs never throw.
+---
+
+A provider factory like `createAnthropic({ ... })('claude-opus-4-8')` returns a tiny `LanguageModel` descriptor — `{ provider, modelId, surface }` and nothing else. Everything the SDK needs to know about *how* to talk to that model (which params it accepts, whether it can reason, what `max_tokens` to default to, which streaming quirks to expect) lives in one place: the internal model registry (`src/core/registry.ts`). The orchestrator consults it on every call; you never wire capabilities by hand.
+
+The registry is deliberately forgiving. Models ship constantly, and an SDK that throws on an unrecognized slug would break the day a new `claude-opus-4-9` lands. Instead, unknown slugs fall back to a conservative, provider-and-surface-derived default row and log a warning — so new releases work immediately, no code change required.
+
+## The `LanguageModel` descriptor
+
+Factories return the locked 1.0 descriptor shape. It carries identity plus one field — `surface` — that selects the wire adapter:
+
+```ts
+export type ModelSurface = 'anthropic' | 'chat_completions' | 'responses' | 'native';
+
+export interface LanguageModel {
+  readonly provider: string;
+  readonly modelId: string;
+  readonly surface: ModelSurface;
+}
+```
+
+`provider` is a label (`'anthropic'`, `'openai'`, `'xai'`, `'google'`, `'vertex-anthropic'`, `'vertex-google'`); `modelId` is the slug you pass to the factory; `surface` is set by the factory you chose. The descriptor is intentionally minimal — capabilities are looked up from the slug, not stored on the object.
+
+`EmbeddingModel` is a deliberately separate kind (`{ provider, modelId, surface }` where `surface` is `'openai-embeddings' | 'gemini-embeddings' | 'voyage-embeddings'`). The type system prevents passing an embedding model to [streamChat](/docs/core/stream-chat) / [generateText](/docs/core/generate-text), and vice versa. See [Embeddings](/docs/core/embeddings).
+
+## The four wire surfaces
+
+`surface` is the only routing input. The orchestrator maps it to exactly one adapter through a single exhaustive switch — there is no per-provider branching anywhere else:
+
+| `surface` | Adapter | Covers |
+| --- | --- | --- |
+| `anthropic` | `anthropicAdapter` | Anthropic `/v1/messages` (including Claude-on-Vertex) |
+| `chat_completions` | `openaiCompatibleAdapter` | OpenAI Chat Completions, xAI Grok, Gemini OpenAI-compat |
+| `responses` | `openaiResponsesAdapter` | OpenAI Responses API (GPT-5.x reasoning + tools) |
+| `native` | `googleNativeAdapter` | Gemini `generateContent` (reasoning, `thoughtSignature`, caching, native PDF) |
+
+Which factory you call decides the surface:
+
+```ts title="surfaces.ts"
+import { createOpenAI, createOpenAIResponses } from '@deuz-sdk/core/openai';
+import { createGoogle, createGoogleNative } from '@deuz-sdk/core/google';
+import { createXai } from '@deuz-sdk/core/xai';
+
+createOpenAI({ apiKey: process.env.OPENAI_API_KEY! })('gpt-5.5');
+//                                                            → surface: 'chat_completions'
+createOpenAIResponses({ apiKey: process.env.OPENAI_API_KEY! })('gpt-5.4');
+//                                                            → surface: 'responses'
+createXai({ apiKey: process.env.XAI_API_KEY! })('grok-4.3');
+//                                                            → surface: 'chat_completions'
+createGoogle({ apiKey: process.env.GEMINI_API_KEY! })('gemini-2.5-pro');
+//                                                            → surface: 'chat_completions' (compat)
+createGoogleNative({ apiKey: process.env.GEMINI_API_KEY! })('gemini-2.5-pro');
+//                                                            → surface: 'native'
+```
+
+Note the last two: the **same Gemini slug** (`gemini-2.5-pro`) resolves to a *different* capability row depending on surface. The native wire unlocks reasoning, caching, and native PDF; the compat wire is a limited surface kept for drop-in interop. The registry keys native rows in a separate table so one slug can serve both wires.
+
+## The capability matrix
+
+Each known slug maps to a `ModelCapabilities` row. These booleans and numbers drive request building (which params to send), the structured-output strategy picker, and timeout/`max_tokens` defaults.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `provider` | `string` | Provider label for the row. |
+| `surface` | `ModelSurface` | Wire surface the row describes. |
+| `vision` | `boolean` | Accepts image inputs. |
+| `tools` | `boolean` | Supports tool / function calling. |
+| `reasoning` | `boolean` | Emits reasoning / thinking (`reasoning-delta` parts). |
+| `structuredOutput` | `boolean` | Native structured output (`json_schema` / output config). |
+| `caching` | `boolean` | Explicit prompt-cache breakpoints are controllable (Anthropic, Gemini native). |
+| `nativePdf` | `boolean` | Accepts PDF bytes natively (no client-side extraction). |
+| `audio` | `boolean` | Accepts audio inputs. |
+| `contextWindow` | `number` | Total context window in tokens. |
+| `maxOutput` | `number` | Default / max output tokens (feeds provider `max_tokens`). |
+| `usagePerChunk` | `boolean` | Provider repeats usage on every chunk → keep the *last* (Gemini-compat quirk). |
+| `toolIndexAllZero` | `boolean` | Streaming tool deltas all arrive with `index=0` → slot by position (Gemini-compat quirk). |
+| `samplingRestrictions` | `boolean` | Reasoning model rejects `temperature` / `topP` → strip them before sending. |
+| `effortWire` | `'budget_tokens' \| 'output_config'` | How `effort` reaches Anthropic: manual `thinking.budget_tokens` (pre-4.7) vs `output_config.effort` (Opus 4.7+, Sonnet 5, Fable 5 — where budget_tokens returns 400). |
+| `known` | `boolean` | `false` when the row is a fallback for an unknown slug. |
+
+A few representative pinned rows (2026-07 catalog):
+
+| Slug | Surface | vision | reasoning | caching | contextWindow | maxOutput |
+| --- | --- | --- | --- | --- | --- | --- |
+| `claude-fable-5` | `anthropic` | yes | yes | yes | 1,000,000 | 128,000 |
+| `claude-opus-4-8` | `anthropic` | yes | yes | yes | 1,000,000 | 128,000 |
+| `claude-haiku-4-5` | `anthropic` | yes | yes | yes | 200,000 | 64,000 |
+| `gpt-5.5` | `chat_completions` | yes | yes | no | 1,050,000 | 128,000 |
+| `gpt-5.4` | `responses` | yes | yes | no | 400,000 | 128,000 |
+| `gpt-5.4-nano` | `responses` | yes | yes | no | 400,000 | 128,000 |
+| `grok-4.3` | `chat_completions` | yes | yes | no | 1,000,000 | 128,000 |
+| `gemini-3.1-pro-preview` (native) | `native` | yes | yes | yes | 1,000,000 | 64,000 |
+| `gemini-2.5-pro` (compat) | `chat_completions` | yes | no | no | 1,000,000 | 64,000 |
+
+The numbers and slugs are pinned to the 2026-07 catalog and adjusted at release — treat them as defaults, not contractual guarantees.
+
+## Quirk flags — why they exist
+
+Three flags exist purely to paper over provider wire bugs. The adapters read them so consumers never see the rough edges; the canonical [stream](/docs/core/stream-chat) is uniform regardless of provider.
+
+- **`usagePerChunk`** — Gemini's OpenAI-compat wire re-emits a full usage block on *every* streamed chunk. The adapter keeps only the last one, so `usage` reflects the final totals rather than a duplicated sum.
+- **`toolIndexAllZero`** — on that same compat wire every streaming tool-call fragment arrives with `index=0`. The adapter slots fragments by arrival position instead of trusting the index, so parallel tool calls reconstruct correctly.
+- **`samplingRestrictions`** — OpenAI Responses reasoning models (`gpt-5.4`, `o4-mini`) reject `temperature` / `topP`. When set, the adapter omits those params before sending (`max_output_tokens` is still sent, defaulting to the row's `maxOutput`).
+
+There is also a behavioral guard that is *not* a registry flag: the agentic loop stops on accumulated `tool_use` count, not on `finishReason`, because Gemini can emit `finish: stop` while tool calls are still pending. See the [tool loop](/docs/agents/tools) for that invariant.
+
+## Unknown slugs never throw
+
+When a slug is not in the registry, the orchestrator builds a conservative fallback row and calls `logger.warn` (route a logger in through [dependencies](/docs/core/dependencies) to see it). The fallback differs by surface so the failure mode is always "degraded but working," never a crash:
+
+- **Generic fallback** (`anthropic` / `chat_completions` / `responses`): risky flags default OFF — `tools: false`, `reasoning: false`, `structuredOutput: false`, `contextWindow: 128_000`, `maxOutput: 4_096` (kept low so an unknown model can't 400 or truncate on an over-large `max_tokens`). For an unknown Gemini-compat slug, `usagePerChunk` and `toolIndexAllZero` are inferred from `(provider === 'google', surface === 'chat_completions')`.
+- **Native-Gemini fallback** (`surface: 'native'`): full capabilities ON (`vision`, `reasoning`, `caching`, `nativePdf`, `audio`, `contextWindow: 1_000_000`, `maxOutput: 64_000`), because the native wire is uniform across Gemini generations.
+
+So calling a brand-new model that the SDK has never heard of just works:
+
+```ts title="unknown-slug.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+// Not in the pinned catalog — resolves to the conservative anthropic fallback
+// (tools/reasoning OFF, max_tokens 4096) and logs a warning. Still runs.
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-9'),
+  messages: [{ role: 'user', content: 'Hello from a future model.' }],
+});
+```
+
+The `known: false` flag on the resolved row records that a fallback was used. If you need a new model to use its real (non-conservative) capabilities — tools, reasoning, the correct `max_tokens` — that requires adding its row to the pinned catalog.
+
+## Factory config lives on a hidden Symbol
+
+The settings you pass to a factory (`apiKey`, `baseURL`, `fetch`, `headers`, Vertex `project`/`location`) are *not* stored as enumerable fields on the descriptor. They are attached under a module-private, non-enumerable `Symbol`. Two consequences:
+
+1. The public `LanguageModel` type stays exactly `{ provider, modelId, surface }` — settings never widen it.
+2. Secrets never leak through `Object.keys`, `JSON.stringify`, or a test's `toEqual`.
+
+```ts title="no-leak.ts"
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const model = anthropic('claude-opus-4-8');
+
+console.log(Object.keys(model));
+// → ['provider', 'modelId', 'surface']   (apiKey is NOT here)
+
+console.log(JSON.stringify(model));
+// → {"provider":"anthropic","modelId":"claude-opus-4-8","surface":"anthropic"}
+//   the apiKey on the hidden Symbol is omitted
+```
+
+The inference layer reads the stashed config back internally to resolve the key/baseURL, following the documented precedence (`deps.keyProvider` > factory config > client-level keys, factory `fetch` wins over `deps.fetch`). See [Dependencies](/docs/core/dependencies) for the full resolution order. This also pairs with always-on secret redaction so keys never appear in any log, error, or span.
+
+## When to pin slugs
+
+The conservative fallback is great for forward-compatibility but useless for asserting behavior — an unknown slug reports `tools: false`, `reasoning: false`, etc., which is *not* what the real model does.
+
+- **Application code:** you usually don't care. Pass whatever slug you're using; if it's pinned you get its real capabilities, if not you get a safe degraded mode plus a warning.
+- **Tests that assert a quirk or capability:** pin a known slug. A test that checks the Gemini usage-per-chunk handling, the index-zero tool slotting, the Anthropic caching path, or a reasoning code path must use a slug that exists in the registry (e.g. `gemini-2.5-pro`, `claude-opus-4-8`, `gpt-5.4`) — otherwise it silently exercises the conservative fallback row and the assertion is meaningless.
+- **Production models you depend on:** if you need a new model's real tools / reasoning / `max_tokens` (not the conservative defaults), add its row to the pinned catalog rather than relying on the fallback.
+
+## Related
+
+- [Provider factories](/docs/providers/anthropic) — each factory's settings and the surface it selects.
+- [streamChat](/docs/core/stream-chat) — where capability resolution drives the request.
+- [generateObject](/docs/core/generate-object) — `structuredOutput` selects the json vs tool strategy.
+- [Dependencies](/docs/core/dependencies) — inject a `logger` to see unknown-slug warnings.

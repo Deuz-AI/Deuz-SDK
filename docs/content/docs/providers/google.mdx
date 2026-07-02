@@ -1,0 +1,215 @@
+---
+title: Google Gemini
+description: Two wires for Gemini on AI Studio — the native generateContent surface (reasoning, caching, native PDF) and the OpenAI-compat surface — plus explicit caching and the Files API.
+---
+
+Gemini is reachable through two factories from `@deuz-sdk/core/google`. `createGoogleNative` targets Google's native `generateContent` wire — reasoning + `thoughtSignature` round-trip, implicit caching, native PDF/audio, grounding citations, and structured output. `createGoogle` defaults to the OpenAI-compat endpoint (`…/v1beta/openai/`), a limited-capability surface kept for drop-in interop. **Use the native wire** unless you specifically need OpenAI-shaped wire compatibility.
+
+The factories return a `LanguageModel` descriptor you pass to [streamChat](/docs/core/stream-chat), [generateText](/docs/core/generate-text), and [generateObject](/docs/core/generate-object). For Gemini on Google Cloud (Vertex AI), see [Vertex AI](/docs/providers/vertex).
+
+## Two ways to call Gemini
+
+| Factory | `surface` | Endpoint | Capabilities |
+| --- | --- | --- | --- |
+| `createGoogleNative` | `native` | `…:streamGenerateContent` | reasoning, `thoughtSignature`, implicit + explicit caching, native PDF/audio, grounding, structured output |
+| `createGoogle` | `chat_completions` (default) | `…/v1beta/openai/` | text, tools, vision — no reasoning / explicit cache / native PDF; usage-per-chunk quirk |
+
+Both factories accept the same `GoogleSettings`:
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `apiKey` | `string` | AI Studio API key. Read from env at the app layer and pass it in. |
+| `baseURL` | `string` | Override the host. Native defaults to `https://generativelanguage.googleapis.com`. |
+| `fetch` | `typeof fetch` | Inject a custom `fetch` (wins over `deps.fetch`). |
+| `headers` | `Record<string, string>` | Extra headers merged into every request. |
+| `surface` | `'native' \| 'chat_completions'` | Defaults to `chat_completions`. `createGoogleNative` forces `native`. |
+
+```ts title="gemini.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createGoogleNative } from '@deuz-sdk/core/google';
+
+const google = createGoogleNative({ apiKey: process.env.GEMINI_API_KEY! });
+
+const result = streamChat({
+  model: google('gemini-2.5-flash'),
+  messages: [{ role: 'user', content: 'Explain RAG in two sentences.' }],
+});
+
+for await (const chunk of result.textStream) process.stdout.write(chunk);
+```
+
+`createGoogleNative(settings)` is exactly `createGoogle({ ...settings, surface: 'native' })`. Pre-built singletons `google`, `googleNative`, and `googleEmbedding` are also exported (no key baked in — supply one via `deps.keyProvider` or a client).
+
+## Reasoning — the `effort` option
+
+`effort` is the canonical reasoning knob on every call (`'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'`). The native adapter maps it to the right field per model family — it never sends both, which Gemini rejects with a 400:
+
+| Model family | Maps to | Values |
+| --- | --- | --- |
+| `gemini-3*` flash tier | `thinkingConfig.thinkingLevel` | low/medium/high pass through; xhigh/max → `'high'` |
+| `gemini-3*` pro tier | `thinkingConfig.thinkingLevel` | `'low'` or `'high'` only — medium collapses to `'low'` |
+| `gemini-2.5*` | `thinkingConfig.thinkingBudget` | low → `4096`, medium → `12288`, high → `24576`, xhigh/max → `32768` |
+
+`includeThoughts: true` is always set when reasoning is requested, so thought summaries stream back as `reasoning-delta` parts. `effort: 'none'` (or omitting it) sends no thinking config.
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createGoogleNative } from '@deuz-sdk/core/google';
+
+const google = createGoogleNative({ apiKey: process.env.GEMINI_API_KEY! });
+
+const result = streamChat({
+  model: google('gemini-2.5-pro'),
+  effort: 'high', // → thinkingBudget: 24576
+  messages: [{ role: 'user', content: 'Prove there are infinitely many primes.' }],
+});
+
+for await (const part of result.fullStream) {
+  if (part.type === 'reasoning-delta') process.stdout.write(`[think] ${part.text}`);
+  if (part.type === 'text-delta') process.stdout.write(part.text);
+}
+```
+
+Reasoning models emit a `thoughtSignature` on reasoning and tool-call parts. The adapter carries it through `providerMetadata.google.thoughtSignature` and replays it on the next turn, so the agentic [tool loop](/docs/agents/tool-loop) round-trips multi-step thinking correctly. Keep the message history immutable — the signature lives on the prior turn's parts.
+
+## Embeddings
+
+`createGoogleEmbedding` returns an `EmbeddingModel` for [embed / embedMany](/docs/core/embeddings). Models include `gemini-embedding-2` (no `taskType` — task instructions ride the prompt) and `gemini-embedding-001`. (`text-embedding-004` was shut down by Google on 2026-01-14.)
+
+```ts
+import { embed } from '@deuz-sdk/core';
+import { createGoogleEmbedding } from '@deuz-sdk/core/google';
+
+const embeddings = createGoogleEmbedding({ apiKey: process.env.GEMINI_API_KEY! });
+
+const { embedding } = await embed({
+  model: embeddings('gemini-embedding-001'),
+  value: 'The quick brown fox.',
+  taskType: 'search_document', // canonical hint → Gemini RETRIEVAL_DOCUMENT
+  dimensions: 768, // Matryoshka truncation → outputDimensionality
+  normalize: true, // L2-normalize after truncation
+});
+```
+
+`taskType` is a canonical hint (`search_query` / `search_document` / `similarity` / …) that maps to Gemini's native enum (`RETRIEVAL_QUERY` / `RETRIEVAL_DOCUMENT` / …); `title` is only sent when `taskType` is `search_document`, and `dimensions` maps to `outputDimensionality`. Other providers map or ignore them.
+
+## OpenAI-compat streaming quirks
+
+The default `chat_completions` surface streams through the OpenAI-compatible wire, which carries two Gemini-specific quirks the SDK already handles for you:
+
+- **Tool-call fragments all arrive with `index=0`** — they are slotted by position, not by index.
+- **Usage is re-emitted on every chunk** — the SDK keeps the last one.
+
+These are flagged in the capability registry and normalized before any consumer sees the canonical [stream](/docs/core/stream-chat). See the [model registry](/docs/advanced/model-registry) for the full quirk matrix. The native wire has its own usage handling (last-wins `usageMetadata`, no `[DONE]` sentinel) and is the recommended surface.
+
+## Explicit caching + Files API
+
+The native adapter passes through an opaque `cachedContent` name and `fileData.fileUri` parts, but it does not create them. The `@deuz-sdk/core/google/extras` subpath is the producer side: `createGeminiCache` mints a reusable cache, and `uploadFile` pushes large media through the Files API. Both are edge-safe (`fetch` + Web APIs only) and work against AI Studio (API key) or Vertex (OAuth2 Bearer + project/location).
+
+### Explicit caching
+
+Cache a large shared prefix (a long system prompt, a manual, a transcript) once, then reference it on every call at the cheap cached-read rate.
+
+```ts title="cache.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createGoogleNative } from '@deuz-sdk/core/google';
+import { createGeminiCache } from '@deuz-sdk/core/google/extras';
+
+const apiKey = process.env.GEMINI_API_KEY!;
+
+const cache = await createGeminiCache({
+  apiKey,
+  model: 'gemini-2.5-flash', // must match the model on the call
+  contents: [{ role: 'user', parts: [{ text: longManual }] }],
+  ttl: '3600s', // default 1h; mutually exclusive with expireTime
+  displayName: 'product-manual',
+});
+
+const google = createGoogleNative({ apiKey });
+
+const { text } = await generateText({
+  model: google('gemini-2.5-flash'),
+  messages: [{ role: 'user', content: 'Summarize section 4.' }],
+  // cachedContent is a Gemini-native passthrough option (not on the base type):
+  ...({ cachedContent: cache.name } as { cachedContent: string }),
+});
+```
+
+`createGeminiCache` options:
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `model` | `string` | Bound model; must match the generate call. Normalized to resource form. |
+| `contents` | `{ role?, parts }[]` | Cached prefix. `parts` are `text` / `inlineData` / `fileData`. |
+| `systemInstruction` | `{ parts: { text }[] }` | Optional cached system instruction. |
+| `ttl` | `string` | e.g. `'3600s'`. Defaults to `'3600s'`. |
+| `expireTime` | `string` | Absolute RFC-3339 expiry; overrides `ttl`. |
+| `displayName` | `string` | Human label. |
+| `apiKey` / `accessToken` + `vertex` | — | Credential: AI Studio key, or Vertex Bearer + `{ project, location }`. |
+
+The returned `CachedContent.name` is the opaque id you set on `cachedContent`. Companion helpers `getGeminiCache(name, cfg)`, `listGeminiCaches(cfg)`, and `deleteGeminiCache(name, cfg)` manage the cache lifecycle. Cached prompt tokens surface in `usage.cachedReadTokens`.
+
+### Files API (large media)
+
+For media too large to inline (over ~20 MB — PDFs, audio, video), `uploadFile` runs a resumable upload and returns a `fileUri` you reference as a Part. AI Studio only; on Vertex it throws (upload to GCS and pass a `gs://` URI instead).
+
+```ts title="upload.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createGoogleNative } from '@deuz-sdk/core/google';
+import { uploadFile, waitForFileActive } from '@deuz-sdk/core/google/extras';
+
+const apiKey = process.env.GEMINI_API_KEY!;
+
+const file = await uploadFile({
+  apiKey,
+  bytes: new Uint8Array(await pdf.arrayBuffer()),
+  mimeType: 'application/pdf',
+  displayName: 'report.pdf',
+});
+
+// Large media is processed async — wait until it is ACTIVE before referencing it.
+await waitForFileActive(file.name, { apiKey });
+
+const google = createGoogleNative({ apiKey });
+
+const { text } = await generateText({
+  model: google('gemini-2.5-flash'),
+  messages: [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Summarize this report.' },
+        { type: 'image', image: file.uri, mediaType: 'application/pdf' },
+      ],
+    },
+  ],
+});
+```
+
+A `fileData` Part is produced from an `image` Part whose `image` is a URL string — the adapter emits `{ fileData: { mimeType, fileUri } }`. `uploadFile` returns `{ name, uri, mimeType, sizeBytes?, state? }`; uploaded files auto-expire after about 48h. `waitForFileActive(name, cfg)` polls (default 2s interval, 120s timeout) until `state === 'ACTIVE'`, throwing on `FAILED` or timeout.
+
+## Structured output schema caveats
+
+`generateObject` on the native wire uses the JSON strategy: the adapter sets `responseMimeType: 'application/json'` and a converted schema (`responseSchema` for 2.5, the fuller `responseJsonSchema` for `gemini-3*`). The converter targets Gemini's restricted OpenAPI subset, so be aware:
+
+- Types are UPPERCASED (`STRING`, `INTEGER`, `OBJECT`, …).
+- `$ref`, `oneOf`, `anyOf`, `allOf`, and `additionalProperties` are **stripped** — flatten unions/recursive schemas before passing them.
+- `propertyOrdering` is injected from object key order so output is deterministic.
+- A nullable union like `['string', 'null']` becomes `{ type: 'STRING', nullable: true }`.
+- Enum values keep their declared JSON type; integer enums are not coerced to strings.
+
+```ts
+import { generateObject } from '@deuz-sdk/core';
+import { createGoogleNative } from '@deuz-sdk/core/google';
+import { z } from 'zod';
+
+const google = createGoogleNative({ apiKey: process.env.GEMINI_API_KEY! });
+
+const { object } = await generateObject({
+  model: google('gemini-2.5-flash'),
+  schema: z.object({ city: z.string(), population: z.number().int() }),
+  messages: [{ role: 'user', content: 'Capital of France and its population.' }],
+});
+```
+
+See [generateObject](/docs/core/generate-object) for the strategy picker and repair retry.

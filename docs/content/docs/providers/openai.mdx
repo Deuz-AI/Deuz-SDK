@@ -1,0 +1,195 @@
+---
+title: OpenAI
+description: Chat Completions and Responses API surfaces, embeddings, and OpenAI-compatible endpoints.
+---
+
+The OpenAI provider exposes two wire surfaces. `createOpenAI` targets **Chat Completions** (`/chat/completions`); `createOpenAIResponses` targets the **Responses API** (`/responses`), where GPT-5.x reasoning + tools live. Both return a `LanguageModel` descriptor that you pass to [`streamChat`](/docs/core/stream-chat), [`generateText`](/docs/core/generate-text), or [`generateObject`](/docs/core/generate-object). `createOpenAIEmbedding` produces an `EmbeddingModel` for [`embed`](/docs/core/embeddings) / `embedMany`.
+
+Factories are imported from the `@deuz-sdk/core/openai` subpath; the inference functions come from the package root.
+
+```ts
+import { streamChat, generateText, embed } from '@deuz-sdk/core';
+import { createOpenAI, createOpenAIResponses, createOpenAIEmbedding } from '@deuz-sdk/core/openai';
+```
+
+## Which surface to use
+
+| Surface | Factory | Endpoint | Use when |
+| --- | --- | --- | --- |
+| Chat Completions | `createOpenAI` | `/chat/completions` | General chat, tools, vision, structured output. No reasoning on this wire. |
+| Responses API | `createOpenAIResponses` | `/responses` | GPT-5.x and `o`-series reasoning models; typed `response.*` streaming events. |
+| Embeddings | `createOpenAIEmbedding` | `/embeddings` | `text-embedding-3-small` / `-large`. |
+
+Reasoning models (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.3-codex`, `o4-mini`) live on the **Responses** surface. Since GPT-5.4, `reasoning_effort` also ships on Chat Completions, so `gpt-5.5`/`gpt-5.5-pro` accept `effort` there too. `effort: 'none'` is sent verbatim (a real OpenAI value — gpt-5.5 defaults to `medium`, gpt-5.4 to `none`), and `'max'` clamps to `'xhigh'`. Unknown model slugs do not throw — they fall back to conservative defaults for the resolved `(provider, surface)` pair.
+
+## Factory options
+
+All three factories take the same `OpenAISettings`:
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `apiKey` | `string` | Sent as `Authorization: Bearer <key>`. Read it from env at the app layer. |
+| `baseURL` | `string` | Overrides the default. Chat/Responses default to `https://api.openai.com/v1`; embeddings to the same. Trailing slashes are trimmed. |
+| `headers` | `Record<string, string>` | Merged into every request's headers. |
+| `fetch` | `typeof fetch` | Custom fetch implementation (proxy, instrumentation, tests). |
+
+There is no dedicated `organization` option. To send the organization header, pass it via `headers`:
+
+```ts
+const openai = createOpenAI({
+  apiKey: process.env.OPENAI_API_KEY!,
+  headers: { 'OpenAI-Organization': process.env.OPENAI_ORG_ID! },
+});
+```
+
+Calling the factory with a model id returns the descriptor:
+
+```ts
+const model = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! })('gpt-5.5');
+// { provider: 'openai', modelId: 'gpt-5.5', surface: 'chat_completions' }
+```
+
+Factory settings are stashed on a non-enumerable Symbol, so they never appear in `Object.keys` or `JSON.stringify` of the descriptor.
+
+## Chat Completions: streaming
+
+`streamChat` returns synchronously and never throws; the network pump starts lazily on first access of any output. Iterate `textStream` for text, or `fullStream` for canonical [`StreamPart`](/docs/core/stream-chat#streampart-types) deltas.
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+const result = streamChat({
+  model: openai('gpt-5.5'),
+  messages: [{ role: 'user', content: 'Write a haiku about TypeScript.' }],
+});
+
+for await (const chunk of result.textStream) {
+  process.stdout.write(chunk);
+}
+
+console.log(await result.usage);
+console.log(await result.finishReason);
+```
+
+The adapter always sends `stream_options: { include_usage: true }` so the final usage chunk arrives. Usage is normalized to the canonical `Usage` shape: `inputTokens` excludes cached tokens, with `cachedReadTokens` reported separately when the provider returns `prompt_tokens_details.cached_tokens`.
+
+## Responses API: reasoning
+
+Use `createOpenAIResponses` for GPT-5.x reasoning models. System messages are hoisted to the request's `instructions` field; the remaining turns become the `input` array.
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+import { createOpenAIResponses } from '@deuz-sdk/core/openai';
+
+const openai = createOpenAIResponses({ apiKey: process.env.OPENAI_API_KEY! });
+
+const result = await generateText({
+  model: openai('gpt-5.4'),
+  effort: 'high',
+  messages: [
+    { role: 'system', content: 'You are a careful proof checker.' },
+    { role: 'user', content: 'Is every prime greater than 2 odd? Justify.' },
+  ],
+});
+
+console.log(result.text);
+console.log(result.usage.reasoningTokens);
+```
+
+### Reasoning effort
+
+The canonical `effort` option (`'none' | 'low' | 'medium' | 'high'`) is passed through to the Responses request as `reasoning: { effort }`, but only when the model is reasoning-capable and `effort` is not `'none'`:
+
+| `effort` value | Responses request |
+| --- | --- |
+| `'none'` | `reasoning` omitted (no reasoning block sent). |
+| `'low'` / `'medium'` / `'high'` | `reasoning: { effort: <value> }`. |
+
+Reasoning models on the Responses surface have `samplingRestrictions` set, so `temperature` and `topP` are dropped for those models. `maxOutputTokens` maps to `max_output_tokens` (falling back to the model's registry `maxOutput`).
+
+Reasoning tokens surface on `usage.reasoningTokens` (from the response's `output_tokens_details.reasoning_tokens`). On the streaming side, reasoning summary/text deltas arrive as `reasoning-delta` parts on `fullStream`.
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createOpenAIResponses } from '@deuz-sdk/core/openai';
+
+const openai = createOpenAIResponses({ apiKey: process.env.OPENAI_API_KEY! });
+
+const result = streamChat({
+  model: openai('gpt-5.4'),
+  effort: 'medium',
+  messages: [{ role: 'user', content: 'Plan a 3-step migration.' }],
+});
+
+for await (const part of result.fullStream) {
+  if (part.type === 'reasoning-delta') process.stdout.write(`[think] ${part.text}`);
+  if (part.type === 'text-delta') process.stdout.write(part.text);
+}
+```
+
+## Embeddings
+
+`createOpenAIEmbedding` builds an `EmbeddingModel`. Pass it to `embed` (single value) or `embedMany` (batched, concurrency-capped).
+
+```ts
+import { embed, embedMany } from '@deuz-sdk/core';
+import { createOpenAIEmbedding } from '@deuz-sdk/core/openai';
+
+const embeddings = createOpenAIEmbedding({ apiKey: process.env.OPENAI_API_KEY! });
+
+const single = await embed({
+  model: embeddings('text-embedding-3-small'),
+  value: 'The quick brown fox.',
+});
+console.log(single.embedding.length); // 1536
+
+const many = await embedMany({
+  model: embeddings('text-embedding-3-large'),
+  values: ['first chunk', 'second chunk', 'third chunk'],
+});
+console.log(many.embeddings.length); // 3
+```
+
+Useful embedding options:
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `dimensions` | `number` | Matryoshka truncation (sent as OpenAI `dimensions`). |
+| `normalize` | `boolean` | L2-normalize each returned vector (default `false`). Useful after truncation. |
+| `maxBatchSize` | `number` | Override the per-request batch size. OpenAI models default to 2048. |
+| `maxConcurrency` | `number` | Max concurrent sub-batch requests (default 5). `embedMany` only. |
+
+`taskType` is accepted on the canonical surface but is ignored by OpenAI embeddings. Note: `text-embedding-3-small` returns 1536-dim vectors and `-large` returns 3072-dim by default.
+
+## OpenAI-compatible servers
+
+Any server speaking the OpenAI Chat Completions wire works via `baseURL`. This includes local runtimes and gateways. The adapter sends a Bearer token; if your server needs none, pass any placeholder key.
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+
+// Example: a local OpenAI-compatible server.
+const local = createOpenAI({
+  apiKey: process.env.LOCAL_API_KEY ?? 'sk-no-key-required',
+  baseURL: 'http://localhost:11434/v1',
+});
+
+const result = streamChat({
+  model: local('your-local-model'),
+  messages: [{ role: 'user', content: 'ping' }],
+});
+
+for await (const chunk of result.textStream) process.stdout.write(chunk);
+```
+
+The request hits `<baseURL>/chat/completions`. Because unknown slugs fall back to conservative capabilities, third-party model ids work without a registry entry.
+
+> Google Gemini's OpenAI-compatible endpoint is wired through this same adapter but is exposed via its own [`createGoogle`](/docs/providers/google) factory, which handles the usage-per-chunk quirk. Use the Google factory rather than pointing `createOpenAI` at Gemini.
+
+## Tools and structured output
+
+Both surfaces support tools (function calling) and structured output. Pass `tools` to [`streamChat`](/docs/core/stream-chat) / [`generateText`](/docs/core/generate-text) for the agentic loop, or use [`generateObject`](/docs/core/generate-object) for schema-validated output. On Chat Completions, JSON mode emits a `json_schema` `response_format`; on Responses it emits `text.format`. The Responses surface keys streamed tool-call argument fragments by `item_id`, while Chat Completions keys them by `index` — both accumulate fragments as strings and parse the JSON once.

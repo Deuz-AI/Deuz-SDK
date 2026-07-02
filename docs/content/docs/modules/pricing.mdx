@@ -1,0 +1,290 @@
+---
+title: Pricing & Metering
+description: Optional USD cost accounting — the Usage breakdown, the onUsage callback, and the bundled 2026 price table behind createPriceProvider.
+---
+
+The core never bills. Every call returns a token *breakdown* (`Usage`); turning tokens into dollars is an app concern — margins, currency, and contract rates differ per deployment. The `@deuz-sdk/core/pricing` module is therefore fully optional: it ships a pinned 2026 USD price table plus a `PriceProvider` factory you inject via `deps.priceProvider`, but the core never imports it and never charges automatically. Pair it with the [`onUsage`](#metering-the-onusage-callback) callback to log or meter cost per request.
+
+## Usage anatomy
+
+Every result carries a canonical `Usage`. `streamChat` exposes it as `usage: Promise<Usage>` (resolves when the stream finishes); `generateText`, `generateObject`, `embed`, and `embedMany` return `usage: Usage` directly. The shape is locked at 1.0 — the credit system needs the full cache/reasoning breakdown to compute correct cost.
+
+```ts
+interface Usage {
+  inputTokens: number; // fresh (uncached) input
+  outputTokens: number; // visible output text
+  reasoningTokens: number; // hidden thinking; billed at the output rate
+  cachedReadTokens: number; // cache-hit reads (~10% of input price)
+  cacheWriteTokens: number; // 5-minute cache writes (Anthropic)
+  cacheWrite1hTokens: number; // 1-hour cache writes (Anthropic)
+  audioTokens?: number; // audio in/out, when billed separately
+  totalTokens: number;
+}
+```
+
+Reasoning tokens are real output tokens you don't see in the text, so cost code bills them at the output rate. Cache reads are far cheaper than fresh input; cache writes cost a premium. `priceUsage` handles all of this for you.
+
+## Metering: the `onUsage` callback
+
+`onUsage` fires exactly once per result with the `Usage` and a `UsageMeta`. It exists both as a top-level call option and as a `deps` field — the call-level option *overrides* `deps.onUsage`, so they never both fire (the G10 rule), and your credit system is never double-charged.
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Hi' }],
+  onUsage: (usage, meta) => {
+    // meta: { model, reason, ttftMs? }
+    console.log(meta.model, usage.totalTokens, meta.reason);
+  },
+});
+```
+
+`UsageMeta` is intentionally cost-free — the core reports tokens, not dollars:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `model` | `string` | The model id the call ran against. |
+| `reason` | `'finished' \| 'aborted' \| 'error'` | `'aborted'` carries partial usage; `'error'` carries what was counted before the failure. |
+| `ttftMs` | `number` (optional) | Time-to-first-token in milliseconds, when measured. |
+
+To attach cost, compute it inside your `onUsage` handler from the `Usage` — either with [`priceUsage`](#priceusage) directly or a [`PriceProvider`](#priceprovider-and-the-deps-seam).
+
+## `priceUsage`
+
+The one-shot estimator. Given a model id and a `Usage`, it returns the USD cost from a price table (the bundled 2026 table by default), or `undefined` when the model is unknown.
+
+```ts
+function priceUsage(
+  model: string,
+  usage: Usage,
+  table?: PriceTable, // defaults to PRICES_2026
+): number | undefined;
+```
+
+```ts
+import { priceUsage } from '@deuz-sdk/core/pricing';
+
+const cost = priceUsage('gpt-5.2', {
+  inputTokens: 1_000_000,
+  outputTokens: 1_000_000,
+  reasoningTokens: 0,
+  cachedReadTokens: 0,
+  cacheWriteTokens: 0,
+  cacheWrite1hTokens: 0,
+  totalTokens: 2_000_000,
+});
+// gpt-5.2: input 1.25 + output 10 (USD / 1M) → 11.25
+```
+
+How each bucket is priced (USD per 1,000,000 tokens):
+
+- `inputTokens` → `input` rate.
+- `outputTokens` **and** `reasoningTokens` → `output` rate.
+- `cachedReadTokens` → `cachedRead` rate (default: 10% of `input`).
+- `cacheWriteTokens` → `cacheWrite` rate (default: 1.25 × `input`).
+- `cacheWrite1hTokens` → `cacheWrite1h` rate (default: 2 × `input`).
+- `audioTokens` → `audio` rate (default: `input`).
+
+The result is clamped to be non-negative and rounded to micro-dollars (6 decimals) to avoid float dust.
+
+### Tolerant lookup
+
+Model lookup is forgiving so date-stamped or vendor-prefixed slugs still resolve. It tries the exact slug, then strips a trailing ISO/compact date stamp and a leading `vendor/` prefix, then falls back to the longest known prefix match.
+
+```ts
+priceUsage('gpt-5.2-2025-12-11', usage); // → priced as 'gpt-5.2'
+priceUsage('google/gemini-2.5-flash', usage); // → priced as 'gemini-2.5-flash'
+```
+
+### Unknown model: no cost, no throw
+
+A genuinely unknown model returns `undefined` — never a wrong charge, never an exception. Callers decide whether to fall back to a default rate, skip billing, or alert.
+
+```ts
+priceUsage('totally-made-up-model', usage); // → undefined
+```
+
+## `PRICES_2026` and `ModelPrice`
+
+`PRICES_2026` is a `PriceTable` (a `Record<string, ModelPrice>`) of pinned 2026 list prices. **It is not authoritative** — list prices drift and enterprise/Vertex/Bedrock rates differ. Treat it as a starting point and override per deployment.
+
+```ts
+interface ModelPrice {
+  input: number; // fresh input, USD / 1M
+  output: number; // output (and reasoning), USD / 1M
+  cachedRead?: number; // default: input * 0.1
+  cacheWrite?: number; // default: input * 1.25
+  cacheWrite1h?: number; // default: input * 2
+  audio?: number; // default: input
+}
+
+type PriceTable = Record<string, ModelPrice>;
+```
+
+A few rows from the bundled table:
+
+| Model | `input` | `output` | `cachedRead` | `cacheWrite` | `cacheWrite1h` |
+| --- | --- | --- | --- | --- | --- |
+| `gpt-5.5` | 5 | 30 | 0.5 | — | — |
+| `gpt-5.4-nano` | 0.2 | 1.25 | 0.02 | — | — |
+| `claude-fable-5` | 10 | 50 | 1 | 12.5 | 20 |
+| `claude-sonnet-5` | 3 | 15 | 0.3 | 3.75 | 6 |
+| `claude-opus-4-8` | 5 | 25 | 0.5 | 6.25 | 10 |
+| `gemini-3.5-flash` | 1.5 | 9 | 0.15 | — | — |
+| `grok-4.3` | 1.25 | 2.5 | 0.125 | — | — |
+| `text-embedding-3-small` | 0.02 | 0 | — | — | — |
+
+Embeddings are input-only — set `output: 0` and the output/cache buckets contribute nothing. Where a row omits `cachedRead`/`cacheWrite`/`cacheWrite1h`, the defaults above apply (e.g. `qwen3-max` has no explicit `cachedRead`, so it falls back to `0.1 × 1.2 = 0.12`).
+
+Long-context tiers: a row may carry `over200k: { input, output, cachedRead? }` — when `inputTokens + cachedReadTokens > 200_000` those rates apply instead (e.g. `gemini-3.1-pro-preview` bills $2/$12 up to 200k prompt tokens and $4/$18 beyond).
+
+## `PriceProvider` and the `deps` seam
+
+For injection, build a `PriceProvider` with `createPriceProvider` and pass it as `deps.priceProvider`. The seam lets you swap the bundled table for a DB- or remote-backed one (its `priceUsage` may be async).
+
+```ts
+function createPriceProvider(options?: CreatePriceProviderOptions): PriceProvider;
+
+interface CreatePriceProviderOptions {
+  table?: PriceTable; // merged shallow over PRICES_2026 (per-model)
+  margin?: number; // multiply every cost, e.g. 1.3 for a 30% markup. Default 1
+}
+
+interface PriceProvider {
+  priceUsage(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
+}
+```
+
+How cost surfaces: the core does **not** put dollars on `UsageMeta`. The provider you inject is *yours* to call — typically inside the same `onUsage` handler, since the app owns both. The `priceProvider` seam exists so app-wide wiring (price table, margin) lives in one place that your callback reads.
+
+```ts title="lib/deuz.ts"
+import { createClient } from '@deuz-sdk/core';
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const priceProvider = createPriceProvider({ margin: 1.3 }); // 30% markup
+
+export const deuz = createClient({
+  apiKeys: { anthropic: process.env.ANTHROPIC_API_KEY! },
+  deps: {
+    priceProvider,
+    onUsage: async (usage, meta) => {
+      const usd = await priceProvider.priceUsage(meta.model, usage);
+      // unknown model → usd is undefined; bill conservatively / skip
+      if (usd !== undefined) await chargeAccount(meta.model, usd, usage.totalTokens);
+    },
+  },
+});
+
+export const anthropic = createAnthropic();
+```
+
+`createPriceProvider` performs no I/O and reads no globals, so it is safe in any edge runtime. Unknown models still yield `undefined` after a margin is applied — a missing price never becomes a wrong charge.
+
+## Examples
+
+### Log cost per request
+
+Use `priceUsage` against the bundled table directly when you don't need app-wide injection.
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+import { priceUsage } from '@deuz-sdk/core/pricing';
+
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+const { text, usage } = await generateText({
+  model: openai('gpt-5.2'),
+  messages: [{ role: 'user', content: 'Summarize the SDK in one line.' }],
+});
+
+const usd = priceUsage('gpt-5.2', usage);
+console.log(text);
+console.log(`tokens: ${usage.totalTokens}  cost: ${usd === undefined ? 'n/a' : `$${usd}`}`);
+```
+
+### Streaming cost via `onUsage`
+
+`streamChat` is lazy and never throws; the usage callback fires once when the stream finishes (including `'aborted'` with partial usage).
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { priceUsage } from '@deuz-sdk/core/pricing';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Explain prompt caching.' }],
+  onUsage: (usage, meta) => {
+    const usd = priceUsage(meta.model, usage);
+    console.log(meta.reason, meta.ttftMs, usage.cachedReadTokens, usd);
+  },
+});
+
+for await (const chunk of result.textStream) process.stdout.write(chunk);
+```
+
+### `createClient` with a `priceProvider`
+
+Bind the price provider and metering once; every call routed through the client inherits them.
+
+```ts
+import { createClient } from '@deuz-sdk/core';
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const priceProvider = createPriceProvider();
+
+const deuz = createClient({
+  apiKeys: { anthropic: process.env.ANTHROPIC_API_KEY! },
+  deps: {
+    priceProvider,
+    onUsage: async (usage, meta) => {
+      const usd = await priceProvider.priceUsage(meta.model, usage);
+      console.log(meta.model, usd ?? 'unknown-price');
+    },
+  },
+});
+
+const anthropic = createAnthropic();
+const { text } = await deuz.generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Hi' }],
+});
+```
+
+### Custom price-table override
+
+Merge your own rates over the built-ins — useful for negotiated rates, a private model, or a margin. The custom table is shallow-merged per model, so built-in slugs still resolve.
+
+```ts
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+import type { PriceTable } from '@deuz-sdk/core';
+
+const myTable: PriceTable = {
+  'my-private-model': { input: 2, output: 4 },
+  'claude-opus-4-8': { input: 4.5, output: 22, cachedRead: 0.45 }, // negotiated rate
+};
+
+const priceProvider = createPriceProvider({ table: myTable, margin: 1.2 });
+
+priceProvider.priceUsage('my-private-model', usage); // uses your row
+priceProvider.priceUsage('gpt-5.2', usage); // still resolves from PRICES_2026
+```
+
+To override globally without a provider, pass your table as the third argument to `priceUsage(model, usage, myTable)`.
+
+## Related
+
+- [Dependencies & Clients](/docs/core/dependencies) — the full `deps` seam, `onUsage`/`onFinish` precedence (G10), and `createClient`.
+- [streamChat](/docs/core/stream-chat) — `usage: Promise<Usage>` and the never-throws contract.
+- [generateText](/docs/core/generate-text) and [generateObject](/docs/core/generate-object) — `usage: Usage` on every result.
+- [Embeddings](/docs/core/embeddings) — input-only `Usage` for `embed` / `embedMany`.
