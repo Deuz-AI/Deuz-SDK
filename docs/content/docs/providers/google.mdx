@@ -76,6 +76,8 @@ Reasoning models emit a `thoughtSignature` on reasoning and tool-call parts. The
 
 `googleSearch()` (root export) enables provider-executed Google Search grounding on the native wire — the entry rides `tools` next to your `functionDeclarations` as `{ google_search: {} }`, and grounding citations stream back as canonical `source` parts.
 
+> **Wire-shape note:** `{ google_search: {} }` is the **generateContent (native wire)** shape this SDK targets. Google's newer *Interactions API* declares the same tool as `tools: [{ type: "google_search" }]` — a different surface the SDK does not call. Don't copy Interactions examples into `providerOptions.google`.
+
 ```ts
 import { generateText, googleSearch } from '@deuz-sdk/core';
 

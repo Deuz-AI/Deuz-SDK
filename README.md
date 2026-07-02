@@ -16,7 +16,7 @@ _One canonical wire. Zero runtime dependencies. Runs anywhere `fetch` runs._
 
 `@deuz-sdk/core` is a from-scratch, **independent** AI SDK built for the **Deuz** platform and shared with everyone. It depends on no other AI SDK and ships its own streaming + UI protocol. It is **pure**: no Supabase, no credit logic, no env reading. Everything stateful — HTTP, clock, logging, metering, circuit-breaker, API keys, memory, vector stores — is injected through a single `Dependencies` seam, so the exact same core runs unchanged on **Node, Deno, Bun, Vercel/Cloudflare Edge**.
 
-> **Status — published (v1.1.1).** [`@deuz-sdk/core`](https://www.npmjs.com/package/@deuz-sdk/core) is live on npm. Chat across all four wires + Vertex, the agentic tool loop, vision, MCP, the UI wire, native Gemini, embeddings, memory, RAG, skills, image generation, middleware, pricing, hybrid RAG search, and Gemini explicit caching are all implemented and tested (**238 tests green**; `tsc` + `eslint` + `publint --strict` + `attw` + dual ESM/CJS/d.ts build all clean). v1.1.1 refreshes the model catalog to the 2026-07 state — **Claude 5 (Fable 5 / Sonnet 5)** with the new `output_config.effort` thinking wire, GPT-5.4/5.5 pricing corrections, the Gemini 3.1 line, `gemini-embedding-2`, and long-context pricing tiers. See the [Roadmap](#roadmap) for what's next.
+> **Status — published (v1.2.0).** [`@deuz-sdk/core`](https://www.npmjs.com/package/@deuz-sdk/core) is live on npm. Chat across all four wires + Vertex, the agentic tool loop, vision, MCP, the UI wire, native Gemini, embeddings, memory, RAG, skills, image generation, middleware, pricing, hybrid RAG search, and Gemini explicit caching are all implemented and tested (**257 tests green**; `tsc` + `eslint` + `publint --strict` + `attw` + dual ESM/CJS/d.ts build all clean). v1.2.0 adds **provider-executed web search on three wires** (`anthropicWebSearch` / `openaiWebSearch` / `googleSearch` with citations as `source` parts), the **`providerOptions`** escape hatch, one-flag **Anthropic prompt caching** (`promptCaching: 'auto'`), and correct **Responses API stateless round-trips** (encrypted reasoning + `phase`). v1.1.1 refreshed the model catalog to the 2026-07 state — **Claude 5 (Fable 5 / Sonnet 5)** with the `output_config.effort` thinking wire, GPT-5.4/5.5 pricing corrections, the Gemini 3.1 line, `gemini-embedding-2`, and long-context pricing tiers. See the [Roadmap](#roadmap) for what's next.
 
 ```bash
 npm install @deuz-sdk/core
@@ -291,7 +291,7 @@ Response: upstream SSE  →  robust parser  →  CANONICAL DELTA STREAM
 | **Faz 3** | Skills + memory + RAG + native Gemini + embeddings | ✅ |
 | **Faz 4** | Image generation (sync + Midjourney + Yunwu) | ✅ SDK side · ⏳ app-side `tasks` table |
 | **Faz 5** | Aggregator fallback, DeepSeek/Kimi, Batch API, rate-limiter impl | ⬜ optional |
-| **Faz 6** | `@deuz-sdk/core/react` hooks, CI provenance | 🔶 `1.1.1` on npm · docs ✅ · hooks ⏳ |
+| **Faz 6** | `@deuz-sdk/core/react` hooks, CI provenance | 🔶 `1.2.0` on npm · docs ✅ · hooks ⏳ |
 
 **Deliberately deferred** (seam exists, impl later): `streamObject`, pre-flight token counting (`tokens.ts`), budgeter, full token-bucket rate limiter, OpenTelemetry exporter, memory consolidation/decay + graph memory, cross-encoder rerank implementation (seam is in), video generation helper, React hooks (`@deuz-sdk/core/react`, Faz 6).
 
@@ -299,7 +299,7 @@ Response: upstream SSE  →  robust parser  →  CANONICAL DELTA STREAM
 
 ## Quality bar
 
-- **238 tests** (vitest golden-replay fixtures + deterministic mock models — no real network)
+- **257 tests** (vitest golden-replay fixtures + deterministic mock models — no real network)
 - `tsc` strict · `eslint` (edge-safety enforced) · `publint --strict` · `attw` · dual **ESM + CJS + .d.ts** build — all green
 - Type-contract lock: `test/surface.test-d.ts` pins the public 1.0 surface
 - ~10k lines across 70 source modules, zero runtime dependencies

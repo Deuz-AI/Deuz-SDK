@@ -325,3 +325,101 @@ describe('Responses round-trips (1.2.0)', () => {
     expect(assistant).toMatchObject({ phase: 'commentary' });
   });
 });
+
+describe('review fixes (1.2.0)', () => {
+  it('web_search_tool_result_error produces no source parts and does not break the stream', async () => {
+    const stream = sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 1 } } },
+      },
+      {
+        event: 'content_block_start',
+        data: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srv_e',
+            content: { type: 'web_search_tool_result_error', error_code: 'max_uses_exceeded' },
+          },
+        },
+      },
+      {
+        event: 'content_block_delta',
+        data: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'ok' } },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+    const { fetch } = mockFetch(() => sseResponse([stream]));
+    const res = await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-fable-5'),
+      messages: [{ role: 'user', content: 'search' }],
+      tools: { web_search: anthropicWebSearch() },
+    });
+    expect(res.text).toBe('ok');
+    expect(res.finishReason).toBe('stop');
+  });
+
+  it('phase is captured from provider output and replayed automatically in the loop', async () => {
+    const { mockFetchSequence } = await import('./fixtures/sse');
+    const STEP1 = sseEvents([
+      {
+        event: 'response.output_item.done',
+        data: {
+          type: 'response.output_item.done',
+          item: { type: 'message', id: 'msg_1', phase: 'commentary' },
+        },
+      },
+      {
+        event: 'response.output_text.delta',
+        data: { type: 'response.output_text.delta', delta: 'checking...' },
+      },
+      {
+        event: 'response.output_item.added',
+        data: {
+          type: 'response.output_item.added',
+          item: { type: 'function_call', id: 'it_1', call_id: 'call_1', name: 'echo' },
+        },
+      },
+      {
+        event: 'response.function_call_arguments.delta',
+        data: {
+          type: 'response.function_call_arguments.delta',
+          item_id: 'it_1',
+          delta: '{"v":"x"}',
+        },
+      },
+      {
+        event: 'response.completed',
+        data: { type: 'response.completed', response: { status: 'completed', usage: {} } },
+      },
+    ]);
+    const STEP2 = sseEvents([
+      {
+        event: 'response.output_text.delta',
+        data: { type: 'response.output_text.delta', delta: 'done' },
+      },
+      {
+        event: 'response.completed',
+        data: { type: 'response.completed', response: { status: 'completed', usage: {} } },
+      },
+    ]);
+    const { fetch, calls } = mockFetchSequence([
+      () => sseResponse([STEP1]),
+      () => sseResponse([STEP2]),
+    ]);
+    const res = await generateText({
+      model: createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.4'),
+      messages: [{ role: 'user', content: 'go' }],
+      tools: { echo: echoTool },
+      maxSteps: 3,
+    });
+    expect(res.text).toBe('done');
+    const second = JSON.parse(String(calls[1]!.init!.body)) as {
+      input: Array<Record<string, unknown>>;
+    };
+    const assistant = second.input.find((i) => i.role === 'assistant');
+    expect(assistant).toMatchObject({ phase: 'commentary' });
+  });
+});

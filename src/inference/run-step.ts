@@ -89,12 +89,17 @@ export async function runOneStep(
   let text = '';
   let reasoningText = '';
   let reasoningSignature: string | undefined;
+  let messagePhase: string | undefined;
   const encryptedReasoning: EncryptedReasoning = [];
   const toolArgs: ToolArgMap = new Map();
   const toolOrder: string[] = [];
 
   for await (const part of result.fullStream) {
     switch (part.type) {
+      case 'finish':
+        // Responses `phase` rides finish providerMetadata → onto the assistant message.
+        messagePhase = (part.providerMetadata?.openai as { phase?: string } | undefined)?.phase;
+        break;
       case 'text-delta':
         text += part.text;
         break;
@@ -136,6 +141,7 @@ export async function runOneStep(
     toolOrder,
     encryptedReasoning,
   );
+  if (messagePhase) assistantMessage.providerMetadata = { openai: { phase: messagePhase } };
 
   return {
     text,

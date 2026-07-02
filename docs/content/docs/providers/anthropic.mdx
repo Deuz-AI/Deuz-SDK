@@ -208,6 +208,8 @@ Since 1.2.0 you can also *write* to the cache with one flag: `promptCaching: 'au
 const result = streamChat({ model, messages, promptCaching: 'auto' });
 ```
 
+Edge cases (per Anthropic docs): if the last block already carries an explicit `cache_control` with the **same** TTL, automatic caching is a no-op; with a **different** TTL the API returns 400 — don't combine this flag with hand-written breakpoints via `providerOptions`. The flag is currently effective only on Anthropic; other providers cache implicitly and ignore it.
+
 ## Server-side web search
 
 `anthropicWebSearch()` (root export) adds Anthropic's provider-executed web search — the model decides to search, Anthropic runs it during the turn, and results stream back as canonical `source` parts. Searches are counted in `usage.serverToolUses` ($10 / 1,000 searches).

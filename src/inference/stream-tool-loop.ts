@@ -74,6 +74,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         const toolOrder: string[] = [];
         let stepUsage: Usage = EMPTY_USAGE;
         let stepFinish: FinishReason = 'stop';
+        let stepPhase: string | undefined;
 
         for await (const part of inner.fullStream) {
           switch (part.type) {
@@ -110,6 +111,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
             case 'finish':
               stepUsage = part.usage;
               stepFinish = part.finishReason;
+              stepPhase = (part.providerMetadata?.openai as { phase?: string } | undefined)?.phase;
               break; // re-framed as step-finish below
             case 'error':
               broadcaster.push(part);
@@ -139,6 +141,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
           toolOrder,
           encryptedReasoning,
         );
+        if (stepPhase) assistantMessage.providerMetadata = { openai: { phase: stepPhase } };
 
         if (options.signal?.aborted) {
           lastFinish = 'aborted';

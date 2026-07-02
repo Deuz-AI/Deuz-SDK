@@ -37,18 +37,28 @@ export interface CommonCallOptions {
   /** Free-form text vs. JSON mode (structured output uses generateObject). */
   responseFormat?: 'text' | 'json';
   /**
-   * Per-provider escape hatch, keyed by provider name (`anthropic`/`openai`/
-   * `xai`/`google`). Top-level request-body fields the SDK does not model
-   * (e.g. `{ openai: { service_tier: 'flex' } }`, `{ anthropic: { fallbacks: […] } }`).
+   * Per-provider escape hatch, keyed by the model's `provider` name. Top-level
+   * request-body fields the SDK does not model (e.g. `{ openai: { service_tier:
+   * 'flex' } }`, `{ anthropic: { fallbacks: […] } }`, `{ google: { cachedContent } }`).
+   * NOTE: the key is the PROVIDER, not the wire — `openai` covers both Chat
+   * Completions and Responses calls; Claude-on-Vertex still reads `anthropic`.
    * Canonical fields the adapter sets always win; shallow, top-level only.
    */
-  providerOptions?: Record<string, Record<string, unknown>>;
+  providerOptions?: {
+    anthropic?: Record<string, unknown>;
+    openai?: Record<string, unknown>;
+    google?: Record<string, unknown>;
+    xai?: Record<string, unknown>;
+  } & Record<string, Record<string, unknown>>;
   /**
-   * One-flag prompt caching. On Anthropic (models with `caching` capability)
-   * this sends the top-level automatic `cache_control` field — the API places
-   * the breakpoint on the last cacheable block and moves it forward as the
-   * conversation grows. `'auto-1h'` uses the 1-hour TTL. Other providers cache
-   * implicitly and ignore this.
+   * One-flag prompt caching. Currently effective ONLY on Anthropic (models with
+   * the `caching` capability): sends the top-level automatic `cache_control`
+   * field — the API places the breakpoint on the last cacheable block and moves
+   * it forward as the conversation grows. `'auto-1h'` uses the 1-hour TTL.
+   * Other providers cache implicitly and ignore this. Anthropic edge cases: if
+   * the last block already carries an explicit `cache_control` with the SAME
+   * TTL this is a no-op; with a DIFFERENT TTL the API returns 400 — don't mix
+   * this flag with hand-written breakpoints via `providerOptions`.
    */
   promptCaching?: 'auto' | 'auto-1h';
 

@@ -187,6 +187,7 @@ interface ResponsesEvent {
     call_id?: string;
     name?: string;
     encrypted_content?: string;
+    phase?: string;
   };
   annotation?: { type?: string; url?: string; title?: string };
   response?: {
@@ -220,6 +221,7 @@ async function* parseStream(
   let sawFunctionCall = false;
   let usage: Usage | undefined;
   let finishReason: FinishReason = 'stop';
+  let phase: string | undefined; // last assistant message item's phase — round-trips on replay
 
   for await (const ev of parseSSE(body)) {
     let data: ResponsesEvent;
@@ -257,6 +259,7 @@ async function* parseStream(
             encrypted: true,
           };
         }
+        if (data.item?.type === 'message' && data.item.phase) phase = data.item.phase;
         break;
       case 'response.function_call_arguments.delta': {
         const id = (data.item_id && toolByItem.get(data.item_id)) ?? data.item_id ?? '';
@@ -291,7 +294,12 @@ async function* parseStream(
     }
   }
 
-  yield { type: 'finish', usage: usage ?? mapResponsesUsage(undefined), finishReason };
+  yield {
+    type: 'finish',
+    usage: usage ?? mapResponsesUsage(undefined),
+    finishReason,
+    ...(phase ? { providerMetadata: { openai: { phase } } } : {}),
+  };
 }
 
 // Error envelope is identical to Chat Completions — reuse its mapping.
