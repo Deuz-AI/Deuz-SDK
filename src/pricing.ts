@@ -7,11 +7,12 @@
  * a pinned 2026 price table + a `PriceProvider` factory you can inject via
  * `deps.priceProvider`, but core never imports it and never bills automatically.
  *
- * Prices are USD per 1,000,000 tokens, sourced from public 2026 list prices.
+ * Prices are USD per 1,000,000 tokens, sourced from public list prices
+ * (verified 2026-07-02).
  * They WILL drift — verify against the provider's pricing page before you bill,
  * or pass your own table to `createPriceProvider(customTable)`.
  *
- *   import { createPriceProvider } from '@deuz/core/pricing';
+ *   import { createPriceProvider } from '@deuz-sdk/core/pricing';
  *   const deuz = createClient({ deps: { priceProvider: createPriceProvider() } });
  *   // …or price a single Usage directly:
  *   const usd = priceUsage('gpt-5.2', usage);
@@ -33,6 +34,8 @@ export interface ModelPrice {
   cacheWrite1h?: number;
   /** Audio input/output tokens, when billed separately. Default: `input`. */
   audio?: number;
+  /** Long-context tier applied when `inputTokens + cachedReadTokens > 200_000` (Gemini Pro). */
+  over200k?: { input: number; output: number; cachedRead?: number };
 }
 
 export type PriceTable = Record<string, ModelPrice>;
@@ -52,10 +55,20 @@ export const PRICES_2026: PriceTable = {
   'gpt-5-pro': { input: 15, output: 120, cachedRead: 1.5 },
   'gpt-5-mini': { input: 0.25, output: 2, cachedRead: 0.025 },
   'gpt-5-nano': { input: 0.05, output: 0.4, cachedRead: 0.005 },
-  'gpt-5.5': { input: 1.25, output: 10, cachedRead: 0.125 },
+  'gpt-5.5': { input: 5, output: 30, cachedRead: 0.5 },
+  'gpt-5.5-pro': { input: 30, output: 180 },
+  'gpt-5.4': { input: 2.5, output: 15, cachedRead: 0.25 },
+  'gpt-5.4-pro': { input: 30, output: 180 },
+  'gpt-5.4-mini': { input: 0.75, output: 4.5, cachedRead: 0.075 },
+  'gpt-5.4-nano': { input: 0.2, output: 1.25, cachedRead: 0.02 },
+  'gpt-5.3-codex': { input: 1.75, output: 14, cachedRead: 0.175 },
   'o4-mini': { input: 1.1, output: 4.4, cachedRead: 0.275 },
 
-  // ---- Anthropic (Claude 4 family) ----
+  // ---- Anthropic (Claude 5 + 4 families) ----
+  'claude-fable-5': { input: 10, output: 50, cachedRead: 1, cacheWrite: 12.5, cacheWrite1h: 20 },
+  // Sonnet 5 intro pricing ($2/$10) runs through 2026-08-31; standard rates are
+  // pinned so we never undercharge — nothing to flip on Sept 1.
+  'claude-sonnet-5': { input: 3, output: 15, cachedRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
   'claude-opus-4-8': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
   'claude-opus-4-7': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
   'claude-opus-4-6': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
@@ -65,13 +78,27 @@ export const PRICES_2026: PriceTable = {
   'claude-haiku-4-5': { input: 1, output: 5, cachedRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2 },
 
   // ---- Google Gemini (3.x / 2.5) ----
-  'gemini-3-pro-preview': { input: 2, output: 12, cachedRead: 0.2 },
+  'gemini-3.1-pro-preview': {
+    input: 2,
+    output: 12,
+    cachedRead: 0.2,
+    over200k: { input: 4, output: 18, cachedRead: 0.4 },
+  },
+  'gemini-3.1-pro': {
+    input: 2,
+    output: 12,
+    cachedRead: 0.2,
+    over200k: { input: 4, output: 18, cachedRead: 0.4 },
+  },
+  // gemini-3-pro was shut down 2026-03-09; the slug aliases gemini-3.1-pro-preview.
   'gemini-3-pro': { input: 2, output: 12, cachedRead: 0.2 },
-  'gemini-3.5-flash': { input: 0.3, output: 2.5, cachedRead: 0.03 },
+  'gemini-3.5-flash': { input: 1.5, output: 9, cachedRead: 0.15 },
+  'gemini-3.1-flash-lite': { input: 0.25, output: 1.5, cachedRead: 0.025 },
   'gemini-2.5-pro': { input: 1.25, output: 10, cachedRead: 0.125 },
   'gemini-2.5-flash': { input: 0.3, output: 2.5, cachedRead: 0.03 },
 
   // ---- xAI Grok ----
+  'grok-4.3': { input: 1.25, output: 2.5, cachedRead: 0.125 },
   'grok-4.2': { input: 3, output: 15, cachedRead: 0.75 },
   'grok-4.1': { input: 3, output: 15, cachedRead: 0.75 },
   'grok-4': { input: 3, output: 15, cachedRead: 0.75 },
@@ -90,8 +117,8 @@ export const PRICES_2026: PriceTable = {
   // ---- Embeddings (input-only; output/cache fields ignored) ----
   'text-embedding-3-small': { input: 0.02, output: 0 },
   'text-embedding-3-large': { input: 0.13, output: 0 },
+  'gemini-embedding-2': { input: 0.2, output: 0 },
   'gemini-embedding-001': { input: 0.15, output: 0 },
-  'text-embedding-004': { input: 0, output: 0 },
   'voyage-3.5': { input: 0.06, output: 0 },
   'voyage-3.5-lite': { input: 0.02, output: 0 },
 };
@@ -134,14 +161,18 @@ export function priceUsage(
   const p = lookup(table, model);
   if (!p) return undefined;
 
-  const cachedRead = p.cachedRead ?? p.input * 0.1;
-  const cacheWrite = p.cacheWrite ?? p.input * 1.25;
-  const cacheWrite1h = p.cacheWrite1h ?? p.input * 2;
-  const audioRate = p.audio ?? p.input;
+  // Long-context tier (Gemini Pro): different rates past 200k prompt tokens.
+  const longContext = p.over200k && usage.inputTokens + usage.cachedReadTokens > 200_000;
+  const rates = longContext ? { ...p, ...p.over200k } : p;
+
+  const cachedRead = rates.cachedRead ?? rates.input * 0.1;
+  const cacheWrite = rates.cacheWrite ?? rates.input * 1.25;
+  const cacheWrite1h = rates.cacheWrite1h ?? rates.input * 2;
+  const audioRate = rates.audio ?? rates.input;
 
   const cost =
-    (usage.inputTokens * p.input +
-      (usage.outputTokens + usage.reasoningTokens) * p.output +
+    (usage.inputTokens * rates.input +
+      (usage.outputTokens + usage.reasoningTokens) * rates.output +
       usage.cachedReadTokens * cachedRead +
       usage.cacheWriteTokens * cacheWrite +
       usage.cacheWrite1hTokens * cacheWrite1h +

@@ -95,3 +95,39 @@ describe('createPriceProvider', () => {
     expect(pp.priceUsage('gpt-5.2', usage({ inputTokens: 1_000_000 }))).toBeCloseTo(1.25, 6);
   });
 });
+
+describe('PRICES 2026-07 refresh', () => {
+  const oneM = { inputTokens: 1_000_000, outputTokens: 1_000_000, totalTokens: 2_000_000 };
+
+  it('gpt-5.5 bills 5/30', () => {
+    expect(priceUsage('gpt-5.5', usage(oneM))).toBe(35);
+  });
+  it('gpt-5.5-pro bills 30/180 (no more prefix leak to gpt-5.5)', () => {
+    expect(priceUsage('gpt-5.5-pro', usage(oneM))).toBe(210);
+  });
+  it('grok-4.3 bills 1.25/2.5 (no more grok-4 prefix leak)', () => {
+    expect(priceUsage('grok-4.3', usage(oneM))).toBe(3.75);
+  });
+  it('claude-fable-5 bills 10/50 with 1h cache write 20', () => {
+    expect(
+      priceUsage(
+        'claude-fable-5',
+        usage({ ...oneM, cacheWrite1hTokens: 1_000_000, totalTokens: 3_000_000 }),
+      ),
+    ).toBe(80);
+  });
+  it('claude-sonnet-5 bills standard 3/15', () => {
+    expect(priceUsage('claude-sonnet-5', usage(oneM))).toBe(18);
+  });
+  it('gemini-3.1-pro-preview uses over200k tier when input exceeds 200k', () => {
+    expect(
+      priceUsage('gemini-3.1-pro-preview', usage({ inputTokens: 100_000, totalTokens: 100_000 })),
+    ).toBe(0.2);
+    expect(
+      priceUsage('gemini-3.1-pro-preview', usage({ inputTokens: 300_000, totalTokens: 300_000 })),
+    ).toBe(1.2);
+  });
+  it('dead slugs are gone', () => {
+    expect(priceUsage('text-embedding-004', usage(oneM))).toBeUndefined();
+  });
+});
