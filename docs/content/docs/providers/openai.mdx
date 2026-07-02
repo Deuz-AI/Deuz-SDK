@@ -130,6 +130,24 @@ for await (const part of result.fullStream) {
 }
 ```
 
+Since 1.2.0, when a Responses call includes tools on a reasoning model, the adapter automatically requests `include: ["reasoning.encrypted_content"]` with `store: false`, and replays the encrypted reasoning items verbatim (ahead of their `function_call`) on later loop steps — stateless multi-step tool use stays coherent without server-side storage. `reasoning-delta` parts with `encrypted: true` carry the opaque payload; skip them when rendering. Replayed assistant messages preserve the `phase` field (`commentary`/`final_answer`) via `Message.providerMetadata.openai.phase`.
+
+## Hosted web search (Responses)
+
+`openaiWebSearch()` adds OpenAI's provider-executed web search; citations stream back as canonical `source` parts.
+
+```ts
+import { generateText, openaiWebSearch } from '@deuz-sdk/core';
+
+const res = await generateText({
+  model: responses('gpt-5.4'),
+  messages: [{ role: 'user', content: 'latest TypeScript release?' }],
+  tools: { web_search: openaiWebSearch({ search_context_size: 'low' }) },
+});
+```
+
+`providerOptions.openai` is the escape hatch for unmodeled body fields (e.g. `{ service_tier: 'flex' }`, `{ background: true }`); canonical fields always win. Hosted tools do not exist on Chat Completions — provider tools are dropped on that wire.
+
 ## Embeddings
 
 `createOpenAIEmbedding` builds an `EmbeddingModel`. Pass it to `embed` (single value) or `embedMany` (batched, concurrency-capped).

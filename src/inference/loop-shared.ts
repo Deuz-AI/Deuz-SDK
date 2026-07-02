@@ -85,7 +85,9 @@ export function toStepResult(
 /** True if any tool call targets a tool with no server-side `execute` (a client tool). */
 export function hasClientTool(toolCalls: ToolCall[], tools: ToolSet): boolean {
   // Provider-executed tools are run by the provider — never a client round-trip.
-  return toolCalls.some((c) => !tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider');
+  return toolCalls.some(
+    (c) => !tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider',
+  );
 }
 
 /** Execute the step's tool calls in parallel (capped); errors self-heal as is_error results. */

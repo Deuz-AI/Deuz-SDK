@@ -72,6 +72,22 @@ for await (const part of result.fullStream) {
 
 Reasoning models emit a `thoughtSignature` on reasoning and tool-call parts. The adapter carries it through `providerMetadata.google.thoughtSignature` and replays it on the next turn, so the agentic [tool loop](/docs/agents/tool-loop) round-trips multi-step thinking correctly. Keep the message history immutable — the signature lives on the prior turn's parts.
 
+## Google Search grounding
+
+`googleSearch()` (root export) enables provider-executed Google Search grounding on the native wire — the entry rides `tools` next to your `functionDeclarations` as `{ google_search: {} }`, and grounding citations stream back as canonical `source` parts.
+
+```ts
+import { generateText, googleSearch } from '@deuz-sdk/core';
+
+const res = await generateText({
+  model: googleNative('gemini-3.5-flash'),
+  messages: [{ role: 'user', content: 'What happened at I/O this year?' }],
+  tools: { google_search: googleSearch() },
+});
+```
+
+`providerOptions.google` is the escape hatch for unmodeled top-level body fields — `{ cachedContent: 'cachedContents/…' }` is the documented path for [explicit caching](#explicit-caching--files-api) (the old typed-cast passthrough still works).
+
 ## Embeddings
 
 `createGoogleEmbedding` returns an `EmbeddingModel` for [embed / embedMany](/docs/core/embeddings). Models include `gemini-embedding-2` (no `taskType` — task instructions ride the prompt) and `gemini-embedding-001`. (`text-embedding-004` was shut down by Google on 2026-01-14.)

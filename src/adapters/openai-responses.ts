@@ -181,7 +181,13 @@ interface ResponsesEvent {
   type?: string;
   delta?: string;
   item_id?: string;
-  item?: { type?: string; id?: string; call_id?: string; name?: string; encrypted_content?: string };
+  item?: {
+    type?: string;
+    id?: string;
+    call_id?: string;
+    name?: string;
+    encrypted_content?: string;
+  };
   annotation?: { type?: string; url?: string; title?: string };
   response?: {
     usage?: ResponsesUsage;

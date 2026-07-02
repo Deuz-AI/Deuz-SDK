@@ -202,6 +202,40 @@ All pinned Claude slugs have `caching: true`. The adapter reports cache token br
 
 `totalTokens` includes input + cache reads + cache writes + output. Feed this breakdown into the [pricing helper](/docs/modules/pricing) for correct cost — cache reads are billed at a fraction of input price.
 
+Since 1.2.0 you can also *write* to the cache with one flag: `promptCaching: 'auto'` sends Anthropic's top-level automatic `cache_control` field — the API places the breakpoint on the last cacheable block and moves it forward as the conversation grows. `'auto-1h'` uses the 1-hour TTL. Providers that cache implicitly (OpenAI, Gemini) ignore the flag.
+
+```ts
+const result = streamChat({ model, messages, promptCaching: 'auto' });
+```
+
+## Server-side web search
+
+`anthropicWebSearch()` (root export) adds Anthropic's provider-executed web search — the model decides to search, Anthropic runs it during the turn, and results stream back as canonical `source` parts. Searches are counted in `usage.serverToolUses` ($10 / 1,000 searches).
+
+```ts
+import { generateText, anthropicWebSearch } from '@deuz-sdk/core';
+
+const res = await generateText({
+  model: anthropic('claude-fable-5'),
+  messages: [{ role: 'user', content: 'What shipped in AI this week?' }],
+  tools: { web_search: anthropicWebSearch({ max_uses: 5 }) },
+});
+```
+
+Defaults to `web_search_20260318`. On `20260209+` versions `allowed_callers` defaults to code-execution (dynamic filtering); models without programmatic tool calling need `anthropicWebSearch({ allowed_callers: ['direct'] })` — the API 400s otherwise. Provider tools never run locally and never break the agentic loop as client tools.
+
+## providerOptions escape hatch
+
+Request-body fields the SDK does not model ride `providerOptions.anthropic` (top-level, shallow; canonical fields always win) — e.g. the server-side `fallbacks` beta:
+
+```ts
+streamChat({
+  model, messages,
+  headers: { 'anthropic-beta': 'server-side-fallback-2026-06-01' },
+  providerOptions: { anthropic: { fallbacks: [{ model: 'claude-opus-4-8' }] } },
+});
+```
+
 ## Structured output
 
 [generateObject](/docs/core/generate-object) selects a strategy from capabilities. On Anthropic it uses the native `output_config` JSON-schema mode by default. With extended thinking enabled it is forced into `json` mode, because Anthropic rejects a forced tool-choice when thinking is on.

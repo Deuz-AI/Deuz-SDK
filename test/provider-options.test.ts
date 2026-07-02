@@ -23,7 +23,10 @@ const CC_MINI = sseEvents([
 ]);
 
 const RESP_MINI = sseEvents([
-  { event: 'response.output_text.delta', data: { type: 'response.output_text.delta', delta: 'ok' } },
+  {
+    event: 'response.output_text.delta',
+    data: { type: 'response.output_text.delta', delta: 'ok' },
+  },
   {
     event: 'response.completed',
     data: { type: 'response.completed', response: { status: 'completed', usage: {} } },
