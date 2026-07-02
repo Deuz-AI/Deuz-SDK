@@ -251,7 +251,11 @@ const TEXT_STREAM_JSON = sseEvents([
   },
   {
     event: 'message_delta',
-    data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 4 } },
+    data: {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 4 },
+    },
   },
   { event: 'message_stop', data: { type: 'message_stop' } },
 ]);

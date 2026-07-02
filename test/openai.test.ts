@@ -205,7 +205,10 @@ describe('OpenAI effort semantics (0.2.0)', () => {
       event: 'response.completed',
       data: {
         type: 'response.completed',
-        response: { status: 'completed', usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 } },
+        response: {
+          status: 'completed',
+          usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+        },
       },
     },
   ]);

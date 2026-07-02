@@ -193,7 +193,10 @@ describe('Gemini thinking levels (0.2.0)', () => {
     },
   ]);
 
-  async function bodyFor(modelId: string, effort: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max') {
+  async function bodyFor(
+    modelId: string,
+    effort: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max',
+  ) {
     const { fetch, calls } = consume([MINI]);
     const result = streamChat({
       model: createGoogleNative({ apiKey: 'AIza-k', fetch })(modelId),
