@@ -50,3 +50,4 @@ expectTypeOf<Extract<StreamPart, { type: 'finish' }>>().toHaveProperty('provider
 
 // --- 1.2.0 additive: providerOptions escape hatch + promptCaching. ---
 expectTypeOf<CommonCallOptions>().toHaveProperty('providerOptions');
+expectTypeOf<CommonCallOptions>().toHaveProperty('promptCaching');

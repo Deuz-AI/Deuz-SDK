@@ -101,3 +101,38 @@ describe('providerOptions escape hatch (1.2.0)', () => {
     expect(body(calls).service_tier).toBeUndefined();
   });
 });
+
+describe('promptCaching auto (1.2.0)', () => {
+  it("anthropic 'auto' sends top-level ephemeral cache_control", async () => {
+    const { fetch, calls } = mockFetch(() => sseResponse([ANTHROPIC_MINI]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-fable-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      promptCaching: 'auto',
+    });
+    await result.finishReason;
+    expect(body(calls).cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it("'auto-1h' adds the ttl", async () => {
+    const { fetch, calls } = mockFetch(() => sseResponse([ANTHROPIC_MINI]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-fable-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      promptCaching: 'auto-1h',
+    });
+    await result.finishReason;
+    expect(body(calls).cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+  });
+
+  it('non-anthropic wires ignore promptCaching', async () => {
+    const { fetch, calls } = mockFetch(() => sseResponse([CC_MINI]));
+    const result = streamChat({
+      model: createOpenAI({ apiKey: 'k', fetch })('gpt-5.5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      promptCaching: 'auto',
+    });
+    await result.finishReason;
+    expect(body(calls).cache_control).toBeUndefined();
+  });
+});

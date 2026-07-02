@@ -127,6 +127,13 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     if (options.topP !== undefined) body.top_p = options.topP;
   }
   if (options.stopSequences) body.stop_sequences = options.stopSequences;
+  if (options.promptCaching && caps.caching) {
+    // Top-level automatic caching (Feb 2026): the API manages the breakpoint.
+    body.cache_control = {
+      type: 'ephemeral',
+      ...(options.promptCaching === 'auto-1h' ? { ttl: '1h' } : {}),
+    };
+  }
 
   if (ctx.object) {
     if (ctx.object.strategy === 'json') {

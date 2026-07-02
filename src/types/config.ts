@@ -43,6 +43,14 @@ export interface CommonCallOptions {
    * Canonical fields the adapter sets always win; shallow, top-level only.
    */
   providerOptions?: Record<string, Record<string, unknown>>;
+  /**
+   * One-flag prompt caching. On Anthropic (models with `caching` capability)
+   * this sends the top-level automatic `cache_control` field — the API places
+   * the breakpoint on the last cacheable block and moves it forward as the
+   * conversation grows. `'auto-1h'` uses the 1-hour TTL. Other providers cache
+   * implicitly and ignore this.
+   */
+  promptCaching?: 'auto' | 'auto-1h';
 
   // --- Agentic tools (Faz 2; additive). Omitting `tools` = single-turn (today). ---
   tools?: ToolSet;
