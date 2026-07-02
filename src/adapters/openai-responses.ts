@@ -111,12 +111,16 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       body.tool_choice = { type: 'function', name };
     }
   } else if (tools) {
-    body.tools = tools.tools.map((t) => ({
-      type: 'function',
-      name: t.name,
-      ...(t.description ? { description: t.description } : {}),
-      parameters: t.parameters,
-    }));
+    body.tools = tools.tools.map((t) =>
+      t.provider
+        ? t.provider // hosted tool (web_search, …) — raw native definition, verbatim
+        : {
+            type: 'function',
+            name: t.name,
+            ...(t.description ? { description: t.description } : {}),
+            parameters: t.parameters,
+          },
+    );
     const tc = mapResponsesToolChoice(tools.toolChoice);
     if (tc !== undefined) body.tool_choice = tc;
   } else if (options.responseFormat === 'json') {

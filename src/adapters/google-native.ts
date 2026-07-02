@@ -202,16 +202,21 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   if (systemInstruction) body.systemInstruction = systemInstruction;
 
   if (tools && !object) {
-    body.tools = [
-      {
-        functionDeclarations: tools.tools.map((t) => ({
+    const fns = tools.tools.filter((t) => !t.provider);
+    const providerTools = tools.tools.filter((t) => t.provider).map((t) => t.provider!);
+    const entries: unknown[] = [];
+    if (fns.length > 0) {
+      entries.push({
+        functionDeclarations: fns.map((t) => ({
           name: t.name,
           ...(t.description ? { description: t.description } : {}),
           parameters: toGeminiSchema(t.parameters),
         })),
-      },
-    ];
-    body.toolConfig = mapToolChoice(tools.toolChoice);
+      });
+    }
+    entries.push(...providerTools); // e.g. { google_search: {} } — separate array members
+    body.tools = entries;
+    if (fns.length > 0) body.toolConfig = mapToolChoice(tools.toolChoice);
   }
 
   // Opaque explicit-cache passthrough (the cacheStore seam creates it elsewhere).

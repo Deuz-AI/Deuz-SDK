@@ -22,6 +22,14 @@ export interface Tool<Args = unknown, Result = unknown> {
   parameters: StandardSchemaV1<unknown, Args> | JSONSchema;
   execute?: (args: Args, ctx: ToolExecuteContext) => Promise<Result> | Result;
   needsApproval?: boolean | ((args: Args, ctx: ToolExecuteContext) => boolean | Promise<boolean>);
+  /**
+   * 'provider' marks a provider-executed (server-side) tool: the provider runs
+   * it during the turn and streams results back — it is never executed locally
+   * and never breaks the loop as a client tool. Default: 'function'.
+   */
+  type?: 'function' | 'provider';
+  /** Raw native tool definition (already in the target wire's shape) for `type: 'provider'`. */
+  providerTool?: Record<string, unknown>;
 }
 
 export type ToolSet = Record<string, Tool>;

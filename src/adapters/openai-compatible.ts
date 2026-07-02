@@ -177,14 +177,17 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       body.tool_choice = { type: 'function', function: { name } };
     }
   } else if (tools) {
-    body.tools = tools.tools.map((t) => ({
-      type: 'function',
-      function: {
-        name: t.name,
-        ...(t.description ? { description: t.description } : {}),
-        parameters: t.parameters,
-      },
-    }));
+    // Chat Completions has no hosted tools — provider-executed entries are dropped.
+    body.tools = tools.tools
+      .filter((t) => !t.provider)
+      .map((t) => ({
+        type: 'function',
+        function: {
+          name: t.name,
+          ...(t.description ? { description: t.description } : {}),
+          parameters: t.parameters,
+        },
+      }));
     const tc = mapOpenAIToolChoice(tools.toolChoice);
     if (tc !== undefined) body.tool_choice = tc;
     if (tools.allowParallel === false) body.parallel_tool_calls = false;

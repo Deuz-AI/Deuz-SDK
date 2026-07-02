@@ -150,11 +150,15 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       body.tool_choice = { type: 'tool', name: toolName };
     }
   } else if (ctx.tools) {
-    body.tools = ctx.tools.tools.map((t) => ({
-      name: t.name,
-      ...(t.description ? { description: t.description } : {}),
-      input_schema: t.parameters,
-    }));
+    body.tools = ctx.tools.tools.map((t) =>
+      t.provider
+        ? t.provider // provider-executed tool — raw native definition, verbatim
+        : {
+            name: t.name,
+            ...(t.description ? { description: t.description } : {}),
+            input_schema: t.parameters,
+          },
+    );
     body.tool_choice = mapAnthropicToolChoice(
       ctx.tools.toolChoice,
       thinkingOn || (effortOn && useOutputConfig),

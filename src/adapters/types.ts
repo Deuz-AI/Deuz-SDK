@@ -21,6 +21,8 @@ export interface WireTool {
   name: string;
   description?: string;
   parameters: JSONSchema;
+  /** Raw native definition for a provider-executed tool — serialized verbatim by the adapter. */
+  provider?: Record<string, unknown>;
 }
 
 /** Tool request (set by the agentic loop), honored in buildRequest. */

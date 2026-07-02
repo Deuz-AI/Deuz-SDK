@@ -41,6 +41,11 @@ export async function buildWireTools(
 ): Promise<WireToolRequest> {
   const wire: WireTool[] = [];
   for (const [name, tool] of Object.entries(tools)) {
+    if (tool.type === 'provider') {
+      // Provider-executed: the raw native definition rides through verbatim.
+      wire.push({ name, parameters: {}, provider: tool.providerTool ?? {} });
+      continue;
+    }
     wire.push({
       name,
       ...(tool.description ? { description: tool.description } : {}),
@@ -77,7 +82,8 @@ export function toStepResult(
 
 /** True if any tool call targets a tool with no server-side `execute` (a client tool). */
 export function hasClientTool(toolCalls: ToolCall[], tools: ToolSet): boolean {
-  return toolCalls.some((c) => !tools[c.toolName]?.execute);
+  // Provider-executed tools are run by the provider — never a client round-trip.
+  return toolCalls.some((c) => !tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider');
 }
 
 /** Execute the step's tool calls in parallel (capped); errors self-heal as is_error results. */

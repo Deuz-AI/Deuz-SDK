@@ -35,6 +35,10 @@ export type { APICallErrorOptions } from './errors';
 export { createPriceProvider, priceUsage, PRICES_2026 } from './pricing';
 export type { ModelPrice, PriceTable, CreatePriceProviderOptions } from './pricing';
 
+// Provider-executed (server-side) tool factories — web search phase 1.
+export { anthropicWebSearch, openaiWebSearch, googleSearch } from './server-tools';
+export type { AnthropicWebSearchConfig, OpenAIWebSearchConfig } from './server-tools';
+
 // Optional model middleware (wrapModel + bundled logging/cache/redact/guard).
 export { wrapModel, logging, simpleCache, redactPII, promptInjectionGuard } from './middleware';
 export type { LanguageModelMiddleware, WrappedModel, MiddlewareContext } from './middleware';
