@@ -21,4 +21,4 @@ scripts/
 .firecrawl/
 
 # Local planning/spec artifacts — never publish
-docs/superpowers/
+superpowers/
