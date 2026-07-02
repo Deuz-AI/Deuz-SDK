@@ -12,6 +12,8 @@ export interface Usage {
   cacheWriteTokens: number;
   cacheWrite1hTokens: number;
   audioTokens?: number;
+  /** Provider-executed tool invocations this turn (e.g. web searches) — billed per call, not tokens. */
+  serverToolUses?: number;
   totalTokens: number;
 }
 

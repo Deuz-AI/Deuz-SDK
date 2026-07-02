@@ -21,6 +21,7 @@ export const MAX_SAME_TOOL_ERRORS = 3;
 
 export function sumUsage(a: Usage, b: Usage): Usage {
   const audio = (a.audioTokens ?? 0) + (b.audioTokens ?? 0);
+  const serverTools = (a.serverToolUses ?? 0) + (b.serverToolUses ?? 0);
   return {
     inputTokens: a.inputTokens + b.inputTokens,
     outputTokens: a.outputTokens + b.outputTokens,
@@ -29,6 +30,7 @@ export function sumUsage(a: Usage, b: Usage): Usage {
     cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
     cacheWrite1hTokens: a.cacheWrite1hTokens + b.cacheWrite1hTokens,
     ...(audio > 0 ? { audioTokens: audio } : {}),
+    ...(serverTools > 0 ? { serverToolUses: serverTools } : {}),
     totalTokens: a.totalTokens + b.totalTokens,
   };
 }

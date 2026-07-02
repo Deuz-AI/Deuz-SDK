@@ -220,6 +220,7 @@ interface AnthropicUsage {
   cache_creation_input_tokens?: number;
   cache_creation?: { ephemeral_1h_input_tokens?: number };
   output_tokens_details?: { thinking_tokens?: number };
+  server_tool_use?: { web_search_requests?: number; code_execution_requests?: number };
   /** Per-attempt usage from server-side fallbacks / compaction — sum for billing. */
   iterations?: AnthropicUsage[];
 }
@@ -228,7 +229,13 @@ interface AnthropicEvent {
   type?: string;
   index?: number;
   message?: { usage?: AnthropicUsage };
-  content_block?: { type?: string; id?: string; name?: string };
+  content_block?: {
+    type?: string;
+    id?: string;
+    name?: string;
+    tool_use_id?: string;
+    content?: unknown;
+  };
   delta?: {
     type?: string;
     text?: string;
@@ -275,6 +282,9 @@ function buildUsage(input: AnthropicUsage, outputTokens: number): Usage {
   const cacheWriteTotal = input.cache_creation_input_tokens ?? 0;
   const cacheWrite1h = input.cache_creation?.ephemeral_1h_input_tokens ?? 0;
   const inputTokens = input.input_tokens ?? 0;
+  const serverTools =
+    (input.server_tool_use?.web_search_requests ?? 0) +
+    (input.server_tool_use?.code_execution_requests ?? 0);
   return {
     inputTokens,
     outputTokens,
@@ -283,6 +293,7 @@ function buildUsage(input: AnthropicUsage, outputTokens: number): Usage {
     cachedReadTokens: cacheRead,
     cacheWriteTokens: Math.max(0, cacheWriteTotal - cacheWrite1h),
     cacheWrite1hTokens: cacheWrite1h,
+    ...(serverTools > 0 ? { serverToolUses: serverTools } : {}),
     totalTokens: inputTokens + cacheRead + cacheWriteTotal + outputTokens,
   };
 }
@@ -319,7 +330,21 @@ async function* parseStream(
       if (block?.type === 'tool_use' && block.id) {
         toolIds.set(idx, block.id);
         yield { type: 'tool-call-delta', id: block.id, name: block.name, argsTextDelta: '' };
+      } else if (block?.type === 'web_search_tool_result') {
+        // Provider-executed search results → canonical source parts (citations).
+        const results = Array.isArray(block.content) ? block.content : [];
+        let i = 0;
+        for (const r of results as { url?: string; title?: string }[]) {
+          if (!r.url) continue;
+          yield {
+            type: 'source',
+            id: `${block.tool_use_id ?? 'srv'}:${i++}`,
+            url: r.url,
+            ...(r.title ? { title: r.title } : {}),
+          };
+        }
       }
+      // server_tool_use blocks are provider-executed — never a local tool call.
     } else if (type === 'content_block_delta') {
       const idx = data.index ?? 0;
       const d = data.delta;
@@ -330,11 +355,12 @@ async function* parseStream(
       } else if (d?.type === 'signature_delta' && d.signature !== undefined) {
         yield { type: 'reasoning-delta', text: '', signature: d.signature };
       } else if (d?.type === 'input_json_delta') {
-        yield {
-          type: 'tool-call-delta',
-          id: toolIds.get(idx) ?? '',
-          argsTextDelta: d.partial_json ?? '',
-        };
+        // Only blocks registered as client tool_use stream tool-call deltas;
+        // server_tool_use argument deltas are skipped (provider executes them).
+        const id = toolIds.get(idx);
+        if (id !== undefined) {
+          yield { type: 'tool-call-delta', id, argsTextDelta: d.partial_json ?? '' };
+        }
       }
     } else if (type === 'message_delta') {
       if (data.delta?.stop_reason) stopReason = data.delta.stop_reason;

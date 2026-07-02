@@ -158,6 +158,7 @@ interface ResponsesEvent {
   delta?: string;
   item_id?: string;
   item?: { type?: string; id?: string; call_id?: string; name?: string };
+  annotation?: { type?: string; url?: string; title?: string };
   response?: {
     usage?: ResponsesUsage;
     status?: string;
@@ -183,7 +184,7 @@ function mapResponsesUsage(u: ResponsesUsage | undefined): Usage {
 
 async function* parseStream(
   body: ReadableStream<Uint8Array>,
-  _ctx: ParseContext,
+  ctx: ParseContext,
 ): AsyncGenerator<StreamPart> {
   const toolByItem = new Map<string, string>(); // item_id → call_id
   let sawFunctionCall = false;
@@ -220,6 +221,17 @@ async function* parseStream(
         yield { type: 'tool-call-delta', id, argsTextDelta: data.delta ?? '' };
         break;
       }
+      case 'response.output_text.annotation.added':
+        // Hosted web_search citations arrive as url_citation annotations.
+        if (data.annotation?.type === 'url_citation' && data.annotation.url) {
+          yield {
+            type: 'source',
+            id: ctx.generateId(),
+            url: data.annotation.url,
+            ...(data.annotation.title ? { title: data.annotation.title } : {}),
+          };
+        }
+        break;
       case 'response.completed':
       case 'response.incomplete':
         usage = mapResponsesUsage(data.response?.usage);
