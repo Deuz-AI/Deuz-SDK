@@ -6,6 +6,7 @@ import type { ToolChoice } from '../types/tool';
 import type { NormalizedMessage } from '../core/normalize';
 import type { DeuzError } from '../errors';
 import { extractSystem } from '../core/normalize';
+import { applyProviderOptions } from '../internal/provider-options';
 import { resolveImage, toOpenAIImageUrl } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { openaiCompatibleAdapter } from './openai-compatible';
@@ -121,6 +122,8 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   } else if (options.responseFormat === 'json') {
     body.text = { format: { type: 'json_object' } };
   }
+
+  applyProviderOptions(body, call.provider, options);
 
   return {
     url: `${call.baseURL}/responses`,

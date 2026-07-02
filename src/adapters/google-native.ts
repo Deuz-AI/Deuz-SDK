@@ -14,6 +14,7 @@ import {
   RateLimitError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
+import { applyProviderOptions } from '../internal/provider-options';
 import { resolveImage } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -216,6 +217,8 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   // Opaque explicit-cache passthrough (the cacheStore seam creates it elsewhere).
   const cached = (options as { cachedContent?: string }).cachedContent;
   if (cached) body.cachedContent = cached;
+
+  applyProviderOptions(body, call.provider, options);
 
   // Two transports share the SAME body + SSE parser; only URL + auth differ:
   //  - AI Studio: {baseURL}/v1beta/models/{model}:streamGenerateContent, x-goog-api-key

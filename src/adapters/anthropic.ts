@@ -13,6 +13,7 @@ import {
   RateLimitError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
+import { applyProviderOptions } from '../internal/provider-options';
 import { resolveImage } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -162,6 +163,8 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       effort: options.effort,
     };
   }
+
+  applyProviderOptions(body, call.provider, options);
 
   // Claude on Vertex AI: same Messages body, but model goes in the URL,
   // `anthropic_version` goes in the body, and auth is an OAuth Bearer token.

@@ -47,3 +47,6 @@ expectTypeOf<'max'>().toExtend<NonNullable<CommonCallOptions['effort']>>();
 // --- 0.2.0 additive: finish part carries optional providerMetadata. ---
 import type { StreamPart } from '../src/index';
 expectTypeOf<Extract<StreamPart, { type: 'finish' }>>().toHaveProperty('providerMetadata');
+
+// --- 1.2.0 additive: providerOptions escape hatch + promptCaching. ---
+expectTypeOf<CommonCallOptions>().toHaveProperty('providerOptions');

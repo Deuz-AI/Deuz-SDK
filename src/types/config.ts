@@ -36,6 +36,13 @@ export interface CommonCallOptions {
   effort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   /** Free-form text vs. JSON mode (structured output uses generateObject). */
   responseFormat?: 'text' | 'json';
+  /**
+   * Per-provider escape hatch, keyed by provider name (`anthropic`/`openai`/
+   * `xai`/`google`). Top-level request-body fields the SDK does not model
+   * (e.g. `{ openai: { service_tier: 'flex' } }`, `{ anthropic: { fallbacks: […] } }`).
+   * Canonical fields the adapter sets always win; shallow, top-level only.
+   */
+  providerOptions?: Record<string, Record<string, unknown>>;
 
   // --- Agentic tools (Faz 2; additive). Omitting `tools` = single-turn (today). ---
   tools?: ToolSet;

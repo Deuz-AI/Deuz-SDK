@@ -15,6 +15,7 @@ import {
   RateLimitError,
 } from '../errors';
 import { resolveImage, toOpenAIImageUrl } from '../internal/image';
+import { applyProviderOptions } from '../internal/provider-options';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
 
@@ -190,6 +191,8 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   } else if (options.responseFormat === 'json') {
     body.response_format = { type: 'json_object' };
   }
+
+  applyProviderOptions(body, call.provider, options);
 
   return {
     url: `${call.baseURL}/chat/completions`,
