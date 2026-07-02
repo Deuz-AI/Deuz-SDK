@@ -1,0 +1,254 @@
+---
+title: MCP
+description: Connect to Model Context Protocol servers and expose their tools to the agentic loop as a canonical ToolSet.
+---
+
+The MCP module connects to a [Model Context Protocol](https://modelcontextprotocol.io) server, lists its tools, and maps them into a canonical `ToolSet` you can hand straight to [generateText](/docs/core/generate-text) or [streamChat](/docs/core/stream-chat). Tool execution proxies transparently to the server — when the model calls an MCP tool, the SDK invokes it over the live connection and feeds the result back into the loop.
+
+`@modelcontextprotocol/sdk` is a **lazy optional peer**: it is imported with a dynamic `import()` only when you actually create a client, so the edge bundle never pulls it in unless you use MCP. Install it yourself:
+
+```bash
+npm i @modelcontextprotocol/sdk
+```
+
+If it is missing at runtime, `createMcpClient` / `createStdioMcpClient` reject with an `InvalidRequestError` telling you to install it.
+
+## Transports
+
+Two transports live behind two different subpath exports, split by where they can run:
+
+| Subpath | Function | Transport | Runtime |
+| --- | --- | --- | --- |
+| `@deuz-sdk/core/mcp` | `createMcpClient` | `http` (Streamable HTTP) or `sse` (legacy) | Edge-safe (fetch-only, no Node builtins) |
+| `@deuz-sdk/core/mcp/stdio` | `createStdioMcpClient` | stdio (spawns a child process) | Node-only |
+
+Use `http` for remote MCP servers reachable over the network — it is the current Streamable HTTP transport. `sse` is the legacy fallback some servers (e.g. Firecrawl's `/v2/sse`) still expose. The stdio transport spawns a local command (e.g. `npx -y firecrawl-mcp`) and talks to it over stdin/stdout, so it only works in a Node process and is kept on its own subpath to keep the edge core free of Node builtins.
+
+## createMcpClient
+
+```ts
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+
+const client = await createMcpClient(options);
+```
+
+`createMcpClient` is `async` and returns a `Promise<McpClient>`. It loads the SDK, builds the transport, and `connect`s before resolving.
+
+### Options
+
+```ts
+interface McpClientOptions {
+  transport: McpHttpTransport;
+  name?: string;
+  version?: string;
+}
+
+interface McpHttpTransport {
+  type: 'http' | 'sse';
+  url: string;
+  headers?: Record<string, string>;
+}
+```
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `transport.type` | `'http' \| 'sse'` | — | `http` = Streamable HTTP; `sse` = legacy SSE fallback. |
+| `transport.url` | `string` | — | The server endpoint. |
+| `transport.headers` | `Record<string, string>` | — | Extra request headers (e.g. `Authorization`). Sent on every request. |
+| `name` | `string` | `'deuz'` | Client name advertised to the server. |
+| `version` | `string` | `'0.0.0'` | Client version advertised to the server. |
+
+## createStdioMcpClient
+
+```ts
+import { createStdioMcpClient } from '@deuz-sdk/core/mcp/stdio';
+
+const client = await createStdioMcpClient(options);
+```
+
+### Options
+
+```ts
+interface McpStdioOptions {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  name?: string;
+  version?: string;
+}
+```
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `command` | `string` | — | Executable to spawn, e.g. `'npx'`. |
+| `args` | `string[]` | `[]` | Arguments, e.g. `['-y', 'firecrawl-mcp']`. |
+| `env` | `Record<string, string>` | — | Environment for the child process (e.g. API keys the server needs). |
+| `name` | `string` | `'deuz'` | Client name advertised to the server. |
+| `version` | `string` | `'0.0.0'` | Client version advertised to the server. |
+
+## The McpClient
+
+Both factories return the same transport-agnostic `McpClient`:
+
+```ts
+interface McpClient {
+  /** MCP tools mapped to a ToolSet ready for generateText({ tools }). */
+  listTools(namespace?: string): Promise<ToolSet>;
+  /** Call a tool directly (rarely needed; the loop uses execute). */
+  callTool(name: string, args: unknown): Promise<unknown>;
+  close(): Promise<void>;
+}
+```
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `listTools(namespace?)` | `Promise<ToolSet>` | Lists the server's tools and maps each into a canonical `Tool`. The optional `namespace` prefixes every tool name with `` `${namespace}_` `` so you can merge multiple servers without collisions. |
+| `callTool(name, args)` | `Promise<unknown>` | Invokes a tool directly. The loop never needs this — each mapped tool's `execute` calls it for you. |
+| `close()` | `Promise<void>` | Closes the connection / terminates the child process. Always call it when done. |
+
+### How tools map
+
+`listTools()` returns a `ToolSet` — a `Record<string, Tool>` — built from the server's tool definitions:
+
+- The MCP `inputSchema` **is** a JSON Schema, so it goes straight onto `Tool.parameters` (no conversion).
+- Each tool's `execute` proxies to the server via `callTool`.
+- The result's text content blocks are joined into a string and returned. If the server marks the result as an error (`isError`), `execute` **throws** — which the [tool loop](/docs/agents/tool-loop) catches and feeds back as an `is_error` tool result, so the model can self-heal rather than the call crashing.
+
+Because the mapped tools have an `execute`, the agentic loop runs them automatically; you do not write the round-trip yourself.
+
+## HTTP server in a tool loop
+
+Connect to a remote MCP server, list its tools, and let the model use them. Remember to `close()`.
+
+```ts title="mcp-http.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const mcp = await createMcpClient({
+  transport: {
+    type: 'http',
+    url: 'https://mcp.example.com/mcp',
+    headers: { Authorization: `Bearer ${process.env.MCP_TOKEN!}` },
+  },
+});
+
+try {
+  const tools = await mcp.listTools();
+
+  const { text, steps } = await generateText({
+    model: anthropic('claude-opus-4-8'),
+    messages: [{ role: 'user', content: 'Scrape example.com and summarize it.' }],
+    maxSteps: 5,
+    tools,
+  });
+
+  console.log(text);
+  console.log(steps?.length);
+} finally {
+  await mcp.close();
+}
+```
+
+## stdio local server (Node)
+
+Spawn a local MCP server as a child process. This only works in a Node runtime, so import from `@deuz-sdk/core/mcp/stdio`.
+
+```ts title="mcp-stdio.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createStdioMcpClient } from '@deuz-sdk/core/mcp/stdio';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const mcp = await createStdioMcpClient({
+  command: 'npx',
+  args: ['-y', 'firecrawl-mcp'],
+  env: { FIRECRAWL_API_KEY: process.env.FIRECRAWL_API_KEY! },
+});
+
+try {
+  const tools = await mcp.listTools();
+
+  const { text } = await generateText({
+    model: anthropic('claude-opus-4-8'),
+    messages: [{ role: 'user', content: 'Find the pricing page on example.com.' }],
+    maxSteps: 5,
+    tools,
+  });
+
+  console.log(text);
+} finally {
+  await mcp.close();
+}
+```
+
+## Combining MCP tools with local tools
+
+A `ToolSet` is just a record, so spread MCP tools alongside your own. Use a `namespace` per server to avoid name collisions when you connect to more than one.
+
+```ts title="mcp-combined.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const search = await createMcpClient({
+  transport: { type: 'http', url: 'https://search.example.com/mcp' },
+});
+const docs = await createMcpClient({
+  transport: { type: 'sse', url: 'https://docs.example.com/v2/sse' },
+});
+
+try {
+  const tools = {
+    // Namespaced MCP tools: e.g. `search_query`, `docs_fetch`.
+    ...(await search.listTools('search')),
+    ...(await docs.listTools('docs')),
+    // A local tool, defined inline with a Zod schema.
+    now: {
+      description: 'Return the current ISO timestamp.',
+      parameters: z.object({}),
+      execute: async () => ({ now: new Date().toISOString() }),
+    },
+  };
+
+  const { text } = await generateText({
+    model: anthropic('claude-opus-4-8'),
+    messages: [{ role: 'user', content: 'What time is it, and what does example.com sell?' }],
+    maxSteps: 6,
+    tools,
+  });
+
+  console.log(text);
+} finally {
+  await Promise.all([search.close(), docs.close()]);
+}
+```
+
+## Calling a tool directly
+
+You rarely need this — the loop runs `execute` for you — but `callTool` is there for ad-hoc invocation outside a model call:
+
+```ts
+const result = await mcp.callTool('scrape', { url: 'https://example.com' });
+console.log(result); // joined text content, or the raw blocks if there is no text
+```
+
+If the server returns an error result, `callTool` throws, mirroring the `execute` behavior.
+
+## Notes
+
+- **Always `close()`** the client when you are finished — for stdio this terminates the spawned child process.
+- **Namespacing only renames keys.** It prefixes tool names so multiple servers can coexist; it does not change the underlying tool the model calls.
+- **Edge vs Node:** `createMcpClient` (`/mcp`) is fetch-only and runs anywhere; `createStdioMcpClient` (`/mcp/stdio`) requires Node. Importing `/mcp/stdio` in an edge runtime will fail.
+
+## See also
+
+- [generateText](/docs/core/generate-text) — the buffered agentic loop these tools plug into.
+- [streamChat](/docs/core/stream-chat) — the streaming counterpart; pass the same `tools`.
+- [Tool loop](/docs/agents/tool-loop) — how tool calls, parallel execution, and self-healing work.

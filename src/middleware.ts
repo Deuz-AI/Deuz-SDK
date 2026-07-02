@@ -14,7 +14,7 @@
  * only use what you pass in or the injected `deps`. Cross-cutting needs stay out
  * of the core pipeline and become composable, removable layers.
  *
- *   import { wrapModel, logging, simpleCache } from '@deuz/core/middleware';
+ *   import { wrapModel, logging, simpleCache } from '@deuz-sdk/core/middleware';
  *   const m = wrapModel(anthropic('claude-opus-4-8'), [logging(), simpleCache()]);
  *   await m.generateText({ messages });
  *   for await (const c of m.streamChat({ messages }).textStream) …

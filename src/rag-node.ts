@@ -1,13 +1,13 @@
 /**
  * rag-node.ts — Node-leaning, optional-peer document parsers for RAG.
- * Exported as `@deuz/core/rag/node` (NOT bundled into the edge-safe core). Each
+ * Exported as `@deuz-sdk/core/rag/node` (NOT bundled into the edge-safe core). Each
  * parser lazily imports a heavy optional peer (unpdf / mammoth / xlsx) so the
  * core stays zero-dependency; importing this module on the edge only fails if a
  * parser is actually invoked.
  *
  * Register them into a `ParserRegistry` from core and pass it to `parse()`:
- *   import { createParserRegistry, parse } from '@deuz/core/rag';
- *   import { defaultNodeParserRegistry } from '@deuz/core/rag/node';
+ *   import { createParserRegistry, parse } from '@deuz-sdk/core/rag';
+ *   import { defaultNodeParserRegistry } from '@deuz-sdk/core/rag/node';
  *   const doc = await parse(bytes, defaultNodeParserRegistry(), { hint: { filename } });
  */
 import {

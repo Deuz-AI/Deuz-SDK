@@ -1,5 +1,5 @@
 /**
- * Deuz-native UI streaming wire. `@deuz/core` is its OWN AI SDK — this protocol
+ * Deuz-native UI streaming wire. `@deuz-sdk/core` is its OWN AI SDK — this protocol
  * is ours, not a copy of any other SDK's. The server serializes the canonical
  * `fullStream` to SSE (`x-deuz-stream: v1`); the client reads it back. A React
  * hook over `readDeuzStream` lands in Faz 6.

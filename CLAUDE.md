@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`@deuz/core` — a pure, web-first, multi-provider AI SDK (Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex, Yunwu). It depends on **no other AI SDK** and ships its own canonical streaming + UI protocol. Built for the Deuz platform (Next.js + Supabase, a separate repo) and published to npm. Node ≥ 22, ESM+CJS dual build, zero runtime dependencies.
+`@deuz-sdk/core` — a pure, web-first, multi-provider AI SDK (Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex, Yunwu). It depends on **no other AI SDK** and ships its own canonical streaming + UI protocol. Built for the Deuz platform (Next.js + Supabase, a separate repo) and published to npm. Node ≥ 22, ESM+CJS dual build, zero runtime dependencies.
 
 Planning docs are in Turkish: `yapilacak.md` is the authoritative action list / roadmap (Faz 0–6). The README is the public-facing API tour.
 

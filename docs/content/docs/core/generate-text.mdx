@@ -1,0 +1,248 @@
+---
+title: generateText
+description: Buffered, awaited text generation — single-turn, or the full agentic tool loop when you pass tools.
+---
+
+`generateText` runs a model to completion and resolves once. It is the buffered counterpart to [streamChat](/docs/core/stream-chat): same orchestration (retry, timeout, the canonical delta stream), but it accumulates every delta for you and returns a plain object. Reach for it when you want the final answer in one `await` and don't need to render tokens as they arrive. Pass `tools` and it becomes the agentic loop — model step, tool execution, feed results back, repeat.
+
+## Signature
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+
+const result = await generateText(options);
+```
+
+`generateText` is `async` and returns a `Promise<GenerateTextResult>`. Unlike `streamChat`, errors reject the promise — wrap the call in `try/catch`.
+
+## Options
+
+`generateText` takes the same `CommonCallOptions` as every other call. The most common:
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `model` | `LanguageModel` | — | From a provider factory, e.g. `createAnthropic(...)('claude-opus-4-8')`. |
+| `messages` | `Message[]` | — | Canonical message history. |
+| `temperature` | `number` | provider | Sampling temperature. |
+| `maxOutputTokens` | `number` | provider | Cap on generated tokens. |
+| `topP` | `number` | provider | Nucleus sampling. |
+| `stopSequences` | `string[]` | — | Hard stop strings. |
+| `effort` | `'none' \| 'low' \| 'medium' \| 'high'` | — | Canonical reasoning effort; each adapter maps it to its own unit. |
+| `signal` | `AbortSignal` | — | Cancellation; propagated to the underlying fetch and to tool `execute`. |
+| `maxRetries` | `number` | `2` | Pre-first-byte retries only. |
+| `headers` | `Record<string, string>` | — | Extra request headers. |
+| `onUsage` | `(usage, meta) => void` | — | Per-request usage callback. |
+| `onFinish` | `(meta) => void` | — | Fires when the call settles. |
+
+Agentic options (only meaningful with `tools`):
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `tools` | `ToolSet` | — | A `Record<string, Tool>`. Presence switches on the loop. |
+| `toolChoice` | `'auto' \| 'required' \| 'none' \| { type: 'tool'; toolName: string }` | `'auto'` | Forces / forbids tool use. |
+| `maxSteps` | `number` | `1` | Max model turns in the loop. |
+| `stopWhen` | `StopCondition \| StopCondition[]` | — | Extra stop predicate(s), OR-ed with `maxSteps`. |
+| `maxToolConcurrency` | `number` | `5` | Max parallel tool executions per step. |
+| `onStepFinish` | `(step: StepResult) => void` | — | Fires after each completed step. |
+
+## Result shape
+
+```ts
+interface GenerateTextResult {
+  text: string;
+  usage: Usage;
+  finishReason: FinishReason;
+  response: { messages: Message[] };
+  steps?: StepResult[];
+  toolCalls?: ToolCall[];
+  toolResults?: ToolResult[];
+}
+```
+
+| Field | Type | When | Notes |
+| --- | --- | --- | --- |
+| `text` | `string` | always | Final assistant text. With tools, this is the *last* step's text. |
+| `usage` | `Usage` | always | Token usage summed across all steps. |
+| `finishReason` | `FinishReason` | always | One of `'stop' \| 'length' \| 'tool_calls' \| 'content_filter' \| 'error' \| 'aborted'`. |
+| `response.messages` | `Message[]` | always | New messages to append to history (assistant + tool turns across all steps). |
+| `steps` | `StepResult[]` | with tools | Per-step breakdown. **`undefined` on a single-turn call** (no `tools`). |
+| `toolCalls` | `ToolCall[]` | with tools | Convenience: the last tool-calling step's calls. |
+| `toolResults` | `ToolResult[]` | with tools | Convenience: that step's results. |
+
+`response.messages` only contains the *new* turns this call produced — append them to your prior `messages` to continue the conversation.
+
+## Simple call
+
+A single buffered turn. With no `tools`, `steps`/`toolCalls`/`toolResults` are absent.
+
+```ts title="generate.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const { text, usage, finishReason } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Name three primary colors.' }],
+});
+
+console.log(text);
+console.log(finishReason); // 'stop'
+console.log(usage.totalTokens);
+```
+
+## With tools (the agentic loop)
+
+Add `tools` and `generateText` runs the loop: it calls the model, executes any tool calls in parallel (capped by `maxToolConcurrency`), feeds the results back as a new turn, and repeats until the model stops calling tools or a stop condition fires. `maxSteps` bounds the number of model turns — leave it at the default `1` and the loop runs a single turn, so for real tool use set it higher.
+
+Tools are defined with a `parameters` schema (any Standard Schema such as Zod, or a raw JSON Schema) and an `execute` function. A thrown `execute` is caught and fed back to the model as an error tool result — it never rejects the promise.
+
+```ts title="weather.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const { text, steps } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'What is the weather in Paris?' }],
+  maxSteps: 5,
+  tools: {
+    getWeather: {
+      description: 'Get the current weather for a city.',
+      parameters: z.object({ city: z.string() }),
+      execute: async ({ city }) => ({ city, tempC: 22, sky: 'sunny' }),
+    },
+  },
+});
+
+console.log(text);            // final natural-language answer
+console.log(steps?.length);   // e.g. 2: one tool turn + one final turn
+```
+
+You can also pass a raw JSON Schema instead of Zod — no extra dependency required:
+
+```ts
+const tools = {
+  getWeather: {
+    description: 'Get the current weather for a city.',
+    parameters: {
+      type: 'object',
+      properties: { city: { type: 'string' } },
+      required: ['city'],
+      additionalProperties: false,
+    },
+    execute: async (args: { city: string }) => ({ city: args.city, tempC: 22 }),
+  },
+} as const;
+```
+
+### Step array anatomy
+
+When `tools` are used, `result.steps` is a `StepResult[]` — one entry per model turn, in order. Each step:
+
+```ts
+interface StepResult {
+  stepType: 'initial' | 'tool-result';
+  text: string;
+  reasoningText?: string;
+  toolCalls: ToolCall[];
+  toolResults: ToolResult[];
+  finishReason: FinishReason;
+  usage: Usage;
+  response: { messages: Message[] };
+}
+```
+
+The first step is `'initial'`; subsequent steps (produced because the previous step's tool results were fed back) are `'tool-result'`. A step that called no tools has empty `toolCalls`/`toolResults` and is the loop's last step. `usage` on each step is that step alone; `result.usage` is the sum.
+
+### Reading steps
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Weather in Paris and Berlin?' }],
+  maxSteps: 5,
+  tools: {
+    getWeather: {
+      parameters: z.object({ city: z.string() }),
+      execute: async ({ city }) => ({ city, tempC: 22 }),
+    },
+  },
+  onStepFinish: (step) => {
+    console.log(`[${step.stepType}] ${step.toolCalls.length} tool call(s)`);
+  },
+});
+
+for (const step of result.steps ?? []) {
+  for (const call of step.toolCalls) {
+    console.log('called', call.toolName, 'with', call.args);
+  }
+  for (const r of step.toolResults) {
+    console.log('result', r.toolName, r.isError ? '(error)' : '', r.result);
+  }
+}
+```
+
+### Stopping early with `stopWhen`
+
+`stopWhen` adds predicate(s) that are OR-ed with `maxSteps`. A `StopCondition` is a function over the loop state; return `true` to stop after the current step.
+
+```ts
+import type { StopCondition } from '@deuz-sdk/core';
+
+// Stop as soon as a step has produced final text (no tool calls).
+const untilFinalText: StopCondition = ({ steps }) =>
+  (steps.at(-1)?.toolCalls.length ?? 0) === 0;
+
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Plan my trip.' }],
+  maxSteps: 8,
+  stopWhen: untilFinalText,
+  tools: { /* … */ },
+});
+```
+
+### Continuing a conversation
+
+`response.messages` holds only the new turns. Append them to keep the history immutable across calls:
+
+```ts
+import type { Message } from '@deuz-sdk/core';
+
+let messages: Message[] = [{ role: 'user', content: 'Weather in Paris?' }];
+
+const first = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages,
+  maxSteps: 5,
+  tools: { /* … */ },
+});
+
+messages = [...messages, ...first.response.messages];
+// next turn reuses the full, stable history (prompt-cache friendly)
+```
+
+## Loop guarantees
+
+The loop is self-healing and bounded. A few invariants worth knowing here:
+
+- **Client tools** (a `Tool` with no `execute`) cannot be auto-run — the loop stops and returns them in `toolCalls` so the caller owns the round-trip.
+- **Runaway guard:** the same tool failing on three consecutive steps hard-stops the loop.
+- **Stop on tool count, not `finishReason`:** the loop continues whenever the last step emitted tool calls, even if the provider reported `finish: stop` (a Gemini quirk).
+
+For the full set of agentic invariants — immutable history, parallel execution, the runaway guards, and the Gemini stop-bug guard — see [the tool loop reference](/docs/agents/tool-loop).
+
+## See also
+
+- [streamChat](/docs/core/stream-chat) — the streaming counterpart; same orchestration, token-by-token output.
+- [generateObject](/docs/core/generate-object) — buffered structured output validated against a schema.
+- [Tool loop](/docs/agents/tool-loop) — the agentic loop's invariants in depth.

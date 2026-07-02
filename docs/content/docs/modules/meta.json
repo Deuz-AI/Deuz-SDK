@@ -1,0 +1,13 @@
+{
+  "title": "Modules",
+  "pages": [
+    "memory",
+    "rag",
+    "skills",
+    "mcp",
+    "image-generation",
+    "ui-streaming",
+    "middleware",
+    "pricing"
+  ]
+}

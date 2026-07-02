@@ -1,0 +1,352 @@
+---
+title: RAG
+description: Edge-safe document parsing, token-aware chunking, and hybrid (dense + BM25) retrieval — every stateful stage an injected seam.
+---
+
+`@deuz-sdk/core/rag` is a zero-dependency, Web-API-only toolkit for Retrieval-Augmented Generation: magic-byte MIME sniffing, a pure CSV state machine, token-aware chunkers, an in-memory vector store, BM25 lexical search, and Reciprocal Rank Fusion. Every stateful stage — parser, embedder, vector store, reranker — is a seam you inject, so the core never imports a parser library or a vector DB.
+
+Heavy binary parsers (PDF / DOCX / XLSX) live in the separate Node subpath `@deuz-sdk/core/rag/node` and lazily import optional peers (`unpdf` / `mammoth` / `xlsx`). The edge-safe core handles `text/plain`, `text/markdown`, and `text/csv` on its own.
+
+The full document pipeline is: **parse** → **chunk** → **indexChunks** (embed + upsert) → **retrieve** (or **hybridRetrieve**) → **rerank**.
+
+## Parsing documents
+
+Detection is by magic bytes, never the file extension (a `.docx` that is really a PDF is rejected). `sniffMime` returns the detected MIME, a confidence level, and the container kind.
+
+```ts
+import { sniffMime } from '@deuz-sdk/core/rag';
+
+const sniff = sniffMime(bytes, { filename: 'report.pdf' });
+// { mime: 'application/pdf', confidence: 'magic', container: 'none' }
+```
+
+Core cannot tell DOCX from XLSX (both are ZIP containers) by bytes alone, so it returns `application/zip` and uses the filename hint to disambiguate.
+
+`parse` runs `sniffMime` then dispatches: text formats are decoded in core (BOM-stripped; CSV rendered tab/newline), and binary formats require a parser registered in a `ParserRegistry`. It throws a typed `RagError` for the cases below.
+
+```ts title="parse-text.ts"
+import { parse, createParserRegistry } from '@deuz-sdk/core/rag';
+
+// Empty registry is fine for pure-text formats.
+const registry = createParserRegistry();
+
+const doc = await parse(bytes, registry, {
+  hint: { filename: 'notes.md' },
+});
+console.log(doc.text);
+```
+
+`parse(bytes, registry, opts?)` accepts:
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `hint.filename` | `string` | Disambiguates ZIP→docx/xlsx and extension-less text. |
+| `hint.declaredMime` | `string` | Used only to break ties for text formats. |
+| `minTextChars` | `number` | Min characters for a non-empty text layer (default `1`). |
+
+It returns a `ParsedDocument`: `{ text, pages?, structure?, warnings? }`, where `structure` is an array of `DocBlock` (`heading` / `paragraph` / `list` / `table` / `code`).
+
+### Typed errors
+
+`RagError extends DeuzError` and carries a `code` plus the detected `mime`.
+
+| `code` | When |
+| --- | --- |
+| `rag_extension_mime_mismatch` | Declared/extension type contradicts the magic bytes. |
+| `rag_unsupported_legacy_doc` | Legacy `.doc` (OLE) — convert to `.docx` or PDF. |
+| `rag_unsupported_mime` | No supported type could be determined. |
+| `rag_parser_not_registered` | A binary MIME with no parser registered. |
+| `rag_empty_text_layer` | Parser returned (near-)empty text (e.g. a scanned PDF needing OCR). |
+
+### Binary parsers (Node)
+
+Register the optional-peer parsers from `@deuz-sdk/core/rag/node`. `defaultNodeParserRegistry()` returns a registry pre-populated with the PDF, DOCX, and XLSX parsers; you can also register them individually.
+
+```ts title="parse-pdf.ts"
+import { parse } from '@deuz-sdk/core/rag';
+import { defaultNodeParserRegistry } from '@deuz-sdk/core/rag/node';
+
+const registry = defaultNodeParserRegistry();
+const doc = await parse(bytes, registry, {
+  hint: { filename: 'whitepaper.pdf' },
+});
+console.log(doc.pages, doc.text.length);
+```
+
+| Parser | MIME | Optional peer |
+| --- | --- | --- |
+| `pdfParser` | `application/pdf` | `unpdf` (edge-friendly pdf.js) |
+| `docxParser` | OOXML `wordprocessingml.document` | `mammoth` (HTML → `DocBlock[]`) |
+| `xlsxParser` | OOXML `spreadsheetml.sheet` | `xlsx` (SheetJS; sheets → CSV/text) |
+
+The peers are only loaded when a parser actually runs, so importing `rag/node` on the edge stays harmless until invoked.
+
+## Chunking
+
+All three chunkers are pure and token-aware. They share `ChunkOptions`:
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `size` | `number` | `512` | Target chunk size, in the unit of `countTokens`. |
+| `overlap` | `number` | `64` | Overlap between consecutive chunks (same unit). |
+| `countTokens` | `(s: string) => number` | `approxCountTokens` | Inject a real tokenizer for accuracy. |
+
+`approxCountTokens` estimates `~len/4`. `DEFAULT_CHUNK_OPTIONS` exposes `{ size: 512, overlap: 64 }`.
+
+```ts title="chunk.ts"
+import { chunkFixed, chunkRecursive, chunkBlocks } from '@deuz-sdk/core/rag';
+
+// Fixed sliding window with overlap; records startOffset / endOffset.
+const a = chunkFixed(doc.text, { size: 400, overlap: 50 });
+
+// Structure-aware: only recurses into the separator hierarchy when a piece
+// exceeds the budget. Accepts an extra `separators` array.
+const b = chunkRecursive(doc.text, { size: 400, overlap: 50 });
+
+// Pre-parsed blocks: never packs across a heading boundary.
+const c = chunkBlocks(doc.structure ?? [], { size: 400 });
+```
+
+Each `Chunk` is `{ text, index, startOffset?, endOffset?, meta? }`. `chunkRecursive` walks `DEFAULT_SEPARATORS` (`'\n\n\n'`, `'\n\n'`, `'\n'`, `'. '`, `' '`, `''`) and falls back to `chunkFixed` for an oversized atomic piece. `chunkBlocks` flushes before every `heading`.
+
+> **`Chunk.index` is the identity key.** It must stay stable across the embedding store and the BM25 index, because RRF fuses rankings by `index`. Don't renumber chunks after indexing.
+
+## The embedder seam
+
+The RAG `Embedder` is a minimal seam — `embed(texts: string[]) => Promise<number[][]>` plus a `dims` field. It is intentionally **not** the same as the `EmbeddingModel` descriptor; wire a real model into the seam yourself with [embedMany](/docs/core/embeddings).
+
+```ts title="embedder.ts"
+import { embedMany } from '@deuz-sdk/core';
+import { createVoyage } from '@deuz-sdk/core/voyage';
+import type { Embedder } from '@deuz-sdk/core/rag';
+
+const model = createVoyage({ apiKey: process.env.VOYAGE_API_KEY! })('voyage-3.5');
+
+const embedder: Embedder = {
+  dims: 1024,
+  async embed(texts) {
+    const { embeddings } = await embedMany({ model, values: texts });
+    return embeddings;
+  },
+};
+```
+
+## Indexing and retrieval
+
+`createMemoryVectorStore()` is a pure in-memory cosine store — a reference impl for tests and small corpora. Swap in any `VectorStore` (`upsert` / `query`) backed by a real database for production.
+
+`indexChunks(chunks, { embedder, store })` embeds every chunk's text and upserts it. `retrieve(query, deps, opts?)` embeds the query, runs `store.query(topK)`, then reranks down to `topN`.
+
+```ts title="retrieve.ts"
+import {
+  chunkRecursive,
+  indexChunks,
+  retrieve,
+  createMemoryVectorStore,
+} from '@deuz-sdk/core/rag';
+
+const store = createMemoryVectorStore();
+const chunks = chunkRecursive(doc.text, { size: 400, overlap: 50 });
+
+await indexChunks(chunks, { embedder, store });
+
+const hits = await retrieve('how do refunds work?', { embedder, store }, {
+  topK: 8,
+  topN: 4,
+});
+// hits: ScoredChunk[] — Chunk + a `score`
+```
+
+| `RetrieveOptions` | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `topK` | `number` | `8` | Candidates pulled from the vector store. |
+| `topN` | `number` | `topK` | Results kept after reranking. |
+
+## Hybrid retrieval (dense + BM25)
+
+Dense embeddings catch paraphrase and semantic similarity; BM25 catches exact terms, IDs, and rare tokens a vector model blurs ("clause 17", a SKU, a name). `hybridRetrieve` runs both stages in parallel and fuses their **rankings** with Reciprocal Rank Fusion — raw scores live on incomparable scales, so only rank order is used.
+
+Build the lexical index once with `createBm25Index(chunks)`, then pass it alongside the embedder and store.
+
+```ts title="hybrid.ts"
+import {
+  indexChunks,
+  hybridRetrieve,
+  createBm25Index,
+  createMemoryVectorStore,
+} from '@deuz-sdk/core/rag';
+
+const store = createMemoryVectorStore();
+await indexChunks(chunks, { embedder, store });
+
+// Lexical index over the SAME chunk set (Chunk.index must match).
+const bm25 = createBm25Index(chunks);
+
+const hits = await hybridRetrieve(
+  'warm-loving animal and GDPR clause 17',
+  { embedder, store, bm25 },
+  { topK: 8, topN: 4 },
+);
+```
+
+`hybridRetrieve` extends `RetrieveOptions` with:
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `perStageK` | `number` | `topK` | Candidates pulled from EACH stage before fusion. |
+| `rrfK` | `number` | `60` | RRF damping constant. |
+
+If the vector stage is empty (nothing indexed yet), hybrid degrades to lexical-only rather than returning nothing.
+
+`createBm25Index(chunks, options?)` is Okapi BM25 and accepts `k1` (term-frequency saturation, default `1.5`), `b` (length normalization 0..1, default `0.75`), and a custom `tokenize`. The returned `Bm25Index` has `search(query, topK): ScoredChunk[]` and a `size`. For a large or persistent corpus, back the lexical stage with your own search engine and implement the same `search` shape.
+
+You can also call the primitives directly. `createBm25Index(...).search(...)` returns a ranking; `reciprocalRankFusion(rankings, opts?)` fuses several rankings by `Chunk.index`:
+
+```ts title="rrf.ts"
+import {
+  createBm25Index,
+  createMemoryVectorStore,
+  reciprocalRankFusion,
+  type Chunk,
+  type Embedder,
+} from '@deuz-sdk/core/rag';
+
+declare const chunks: Chunk[];
+declare const embedder: Embedder;
+declare const store: ReturnType<typeof createMemoryVectorStore>;
+
+const bm25 = createBm25Index(chunks);
+const lexical = bm25.search('clause 17 erasure', 10);
+
+const [queryVector] = await embedder.embed(['clause 17 erasure']);
+const dense = queryVector ? await store.query(queryVector, 10) : [];
+
+const fused = reciprocalRankFusion([dense, lexical], { k: 60, topN: 5 });
+```
+
+## The reranker seam
+
+`retrieve` and `hybridRetrieve` accept an optional `reranker`. The default is `identityReranker`, which sorts by score and truncates to `topN` (a real cross-encoder rerank is deferred). Plug in your own `Reranker` to call a cross-encoder model:
+
+```ts title="reranker.ts"
+import type { Reranker } from '@deuz-sdk/core/rag';
+
+const crossEncoder: Reranker = {
+  async rerank(query, candidates, topN) {
+    const scored = await scoreWithCrossEncoder(query, candidates); // your call
+    return scored.sort((a, b) => b.score - a.score).slice(0, topN);
+  },
+};
+
+const hits = await retrieve(query, { embedder, store, reranker: crossEncoder });
+```
+
+## Native document vs. chunk-and-embed
+
+When a model can ingest a document directly (e.g. native PDF), it is often cheaper and higher-fidelity to send the whole file rather than chunk and retrieve. RAG ships a small pure policy for that decision.
+
+```ts title="native-or-chunk.ts"
+import {
+  estimatePdfTokens,
+  modelSupportsDocuments,
+  shouldSendWhole,
+  toNativeDocumentPart,
+} from '@deuz-sdk/core/rag';
+
+const estTokens = estimatePdfTokens(pages); // ~700 tokens/page
+
+const sendWhole = shouldSendWhole({
+  estTokens,
+  modelSupportsDocuments: modelSupportsDocuments({ nativePdf: true }),
+  thresholdTokens: 6000, // default
+});
+
+if (sendWhole) {
+  const part = toNativeDocumentPart({ bytes, mime: 'application/pdf' });
+  // PDFs ride as an ImagePart with mediaType 'application/pdf'; text → TextPart.
+}
+```
+
+`shouldSendWhole` returns `true` only when the model supports documents, `estTokens` is under `thresholdTokens` (default `6000`), and (if `contextWindow` is given) the estimate fits. `estimateTokens(text, countTokens?)` and `estimatePdfTokens(pages)` produce the estimate; `modelSupportsDocuments(caps)` reads `caps.nativePdf`.
+
+## End to end: PDF → chunks → hybrid retrieve → prompt
+
+```ts title="rag-pipeline.ts"
+import { embedMany, generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createVoyage } from '@deuz-sdk/core/voyage';
+import {
+  parse,
+  chunkRecursive,
+  indexChunks,
+  hybridRetrieve,
+  createBm25Index,
+  createMemoryVectorStore,
+  type Embedder,
+} from '@deuz-sdk/core/rag';
+import { defaultNodeParserRegistry } from '@deuz-sdk/core/rag/node';
+
+// 1. Embedder seam over a real embedding model.
+const embedModel = createVoyage({ apiKey: process.env.VOYAGE_API_KEY! })('voyage-3.5');
+const embedder: Embedder = {
+  dims: 1024,
+  embed: async (texts) => (await embedMany({ model: embedModel, values: texts })).embeddings,
+};
+
+// 2. Parse the PDF (Node parsers) and chunk it.
+const doc = await parse(bytes, defaultNodeParserRegistry(), {
+  hint: { filename: 'handbook.pdf' },
+});
+const chunks = chunkRecursive(doc.text, { size: 400, overlap: 50 });
+
+// 3. Index dense + lexical over the SAME chunk set.
+const store = createMemoryVectorStore();
+await indexChunks(chunks, { embedder, store });
+const bm25 = createBm25Index(chunks);
+
+// 4. Retrieve and build a grounded prompt.
+const question = 'What is the refund window for clause 17 purchases?';
+const hits = await hybridRetrieve(question, { embedder, store, bm25 }, { topK: 8, topN: 4 });
+const context = hits.map((h) => h.text).join('\n\n---\n\n');
+
+const { text } = await generateText({
+  model: createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })('claude-opus-4-8'),
+  system: 'Answer using only the provided context. Cite nothing you cannot find there.',
+  prompt: `Context:\n${context}\n\nQuestion: ${question}`,
+});
+```
+
+## Pure-edge usage (core only)
+
+The entire retrieval layer runs on Web APIs only — no Node imports, no `rag/node`. As long as you parse text formats (or feed pre-extracted text) and supply an edge-safe `Embedder`, everything works on Cloudflare Workers, Vercel Edge, and Deno.
+
+```ts title="edge.ts"
+import {
+  parse,
+  createParserRegistry,
+  chunkRecursive,
+  indexChunks,
+  hybridRetrieve,
+  createBm25Index,
+  createMemoryVectorStore,
+  type Embedder,
+} from '@deuz-sdk/core/rag';
+
+export async function ragOnEdge(bytes: Uint8Array, question: string, embedder: Embedder) {
+  // Text/markdown/CSV parse purely in core — empty registry is enough.
+  const doc = await parse(bytes, createParserRegistry(), { hint: { filename: 'kb.md' } });
+  const chunks = chunkRecursive(doc.text, { size: 400, overlap: 50 });
+
+  const store = createMemoryVectorStore();
+  await indexChunks(chunks, { embedder, store });
+  const bm25 = createBm25Index(chunks);
+
+  return hybridRetrieve(question, { embedder, store, bm25 }, { topK: 6, topN: 3 });
+}
+```
+
+## See also
+
+- [Embeddings](/docs/core/embeddings) — `embed` / `embedMany` and the `EmbeddingModel` kind.
+- [Memory](/docs/modules/memory) — the long-term `MemoryStore` seam (shares the `Embedder` pattern).
+- [generateText](/docs/core/generate-text) — feed retrieved context into a grounded completion.

@@ -1,0 +1,222 @@
+---
+title: Yunwu (云雾) Relay
+description: One key, one base URL — chat, image, embeddings, and Midjourney across a 2026 multi-vendor catalog.
+---
+
+Yunwu (云雾) is an OpenAI-compatible aggregator: a single `apiKey` + `baseURL` fronts hundreds of upstream models from many vendors (OpenAI, Anthropic, Google, xAI, DeepSeek, Qwen, …). `createYunwu` is the **unified client** — you supply the host once and it derives the right surface per call: chat / image / embeddings under `/v1`, and the Midjourney proxy at the bare host root. Reach for a relay when you want a **single key**, **mainland-China access**, and **broad model variety** without wiring each provider separately.
+
+## createYunwu
+
+`createYunwu(settings?)` returns a `YunwuClient`. Give the base URL (and key) **once**; every surface is derived from it. Factory settings are stashed on a non-enumerable Symbol, so they never leak through `Object.keys`/`JSON.stringify`.
+
+```ts
+import { createYunwu } from '@deuz-sdk/core/yunwu';
+
+const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
+
+yunwu.baseURL; // 'https://yunwu.ai'  (no /v1)
+yunwu.chat('gpt-5.2'); //         → /v1/chat/completions
+yunwu.image('flux-2-pro'); //     → /v1/images/generations
+yunwu.embedding('text-embedding-3-large'); // → /v1/embeddings
+yunwu.mj(); //                    → bare host root (Midjourney proxy)
+```
+
+A pre-built singleton is also exported (no key bound — supply one via [`deps.keyProvider`](/docs/core/dependencies), keyed by the provider id `'yunwu'`):
+
+```ts
+import { yunwu } from '@deuz-sdk/core/yunwu';
+```
+
+### Settings
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | — | Yunwu relay key. Read it from `process.env` at the app layer; core never reads env itself. |
+| `baseURL` | `string` | `https://yunwu.ai` | Host root — **no** `/v1`, no trailing slash. A trailing `/v1` or slash is stripped and re-derived per surface (so `https://mirror/v1/` will not produce `/v1/v1`). |
+| `fetch` | `typeof fetch` | global `fetch` | Custom fetch (factory `fetch` wins over `deps.fetch`). |
+| `headers` | `Record<string, string>` | — | Extra request headers, merged under the adapter's auth headers. |
+
+`YUNWU_DEFAULT_BASE_URL` (`'https://yunwu.ai'`) is exported if you need the literal. Key resolution follows the standard precedence (the "G1" rule): `deps.keyProvider` (keyed by `'yunwu'`) > factory `apiKey` > otherwise an `AuthenticationError` is thrown. The `createClient` `apiKeys` table only covers the four first-party providers (`anthropic`/`openai`/`xai`/`google`), so a Yunwu key must come from the factory `apiKey` or a `keyProvider`.
+
+### Base-URL derivation
+
+`createYunwu` normalizes the host root once, then each surface appends its own path:
+
+| Surface | Method | Wire / path | `surface` tag |
+| --- | --- | --- | --- |
+| Chat / reasoning | `chat(modelId)` | `{root}/v1/chat/completions` | `chat_completions` |
+| Image (sync) | `image(modelId)` | `{root}/v1/images/generations` | `images` |
+| Embeddings | `embedding(modelId)` | `{root}/v1/embeddings` | `openai-embeddings` |
+| Midjourney (async) | `mj()` | `{root}/mj/...` (bare root, **not** `/v1`) | — |
+
+The "creative base URL" rule: point `baseURL` at any mirror or self-host and **all four** surfaces follow it.
+
+```ts
+const mirror = createYunwu({
+  apiKey: process.env.YUNWU_API_KEY!,
+  baseURL: 'https://my-mirror.example.com/v1/', // trailing /v1 is normalized away
+});
+
+mirror.baseURL; //               'https://my-mirror.example.com'
+mirror.image('flux-2-pro'); //   → https://my-mirror.example.com/v1/images/generations
+mirror.mj().baseURL; //          'https://my-mirror.example.com'
+```
+
+### Client members
+
+| Member | Type | Description |
+| --- | --- | --- |
+| `baseURL` | `string` | Resolved host root (no `/v1`). |
+| `models` | `typeof YUNWU_MODELS` | The pinned 2026 catalog. |
+| `chat(modelId)` | `LanguageModel` | For [`streamChat`](/docs/core/stream-chat) / [`generateText`](/docs/core/generate-text). |
+| `image(modelId)` | `ImageModel` | For [`generateImage`](/docs/modules/image-generation). |
+| `embedding(modelId)` | `EmbeddingModel` | For [`embed`](/docs/core/embeddings) / `embedMany`. |
+| `mj()` | partial `MidjourneyConfig` | Pre-bound config to spread into `imagine` / `submitImagine` / `waitForTask`. |
+
+## Standalone factories
+
+If you only need one surface, the per-surface factories skip the unified client. Each accepts the same `{ apiKey, baseURL, fetch, headers }` settings and defaults `baseURL` to `https://yunwu.ai`:
+
+```ts
+import {
+  createYunwuChat,
+  createYunwuImage,
+  createYunwuEmbedding,
+} from '@deuz-sdk/core/yunwu';
+
+const chat = createYunwuChat({ apiKey: process.env.YUNWU_API_KEY! }); // Provider
+const image = createYunwuImage({ apiKey: process.env.YUNWU_API_KEY! }); // ImageProvider
+const embed = createYunwuEmbedding({ apiKey: process.env.YUNWU_API_KEY! }); // EmbeddingProvider
+
+chat('claude-opus-4-5'); // LanguageModel  (surface: 'chat_completions')
+image('nano-banana'); //    ImageModel     (surface: 'images')
+embed('text-embedding-3-small'); // EmbeddingModel (surface: 'openai-embeddings')
+```
+
+## YUNWU_MODELS catalog
+
+`YUNWU_MODELS` is the pinned 2026 catalog (live-verified against Yunwu's `/v1/models`), grouped by modality. Slugs are pass-through to the relay, so any model Yunwu serves works — these lists are the curated newest generation. The chat surface uses the registry's `(yunwu, chat_completions)` fallback for unknown slugs, so a new release works without an SDK change.
+
+```ts
+import { YUNWU_MODELS, YUNWU_CHAT_MODELS, YUNWU_IMAGE_MODELS } from '@deuz-sdk/core/yunwu';
+
+YUNWU_MODELS.chat; //       chat / reasoning slugs
+YUNWU_MODELS.image; //      image slugs
+YUNWU_MODELS.video; //      async video slugs (run via chat / task proxy)
+YUNWU_MODELS.midjourney; // Midjourney action slugs
+```
+
+| Group | Export | Sample slugs |
+| --- | --- | --- |
+| Chat / reasoning | `YUNWU_CHAT_MODELS` | `gpt-5.2`, `claude-opus-4-5`, `gemini-3-pro-preview`, `grok-4.1`, `deepseek-v3.2`, `qwen3-max`, `kimi-k2-thinking` |
+| Image | `YUNWU_IMAGE_MODELS` | `gpt-image-2`, `flux-2-pro`, `flux.1-kontext-pro`, `nano-banana`, `grok-4.2-image` |
+| Video (async) | `YUNWU_VIDEO_MODELS` | `sora-2`, `veo3.1`, `kling-2.6`, `viduq3-pro` |
+| Midjourney | `YUNWU_MIDJOURNEY_MODELS` | `mj_imagine`, `mj_variation`, `mj_upscale`, `mj_blend`, `mj_describe` |
+
+The model-list types (`YunwuChatModel`, `YunwuImageModel`) accept any `string`, so `chat('some-new-slug')` type-checks while autocompleting the pinned catalog.
+
+## Example: chat via the relay
+
+`streamChat` returns synchronously and never throws; the network pump starts lazily on first access of any output. See [streamChat](/docs/core/stream-chat).
+
+```ts title="chat.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createYunwu } from '@deuz-sdk/core/yunwu';
+
+const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
+
+const result = streamChat({
+  model: yunwu.chat('claude-opus-4-5'),
+  messages: [{ role: 'user', content: 'Summarize reciprocal rank fusion in two sentences.' }],
+  effort: 'low',
+});
+
+for await (const delta of result.textStream) {
+  process.stdout.write(delta);
+}
+
+console.log('\nusage:', await result.usage);
+```
+
+`generateText` buffers the same call into a single result:
+
+```ts title="generate.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createYunwu } from '@deuz-sdk/core/yunwu';
+
+const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
+
+const { text } = await generateText({
+  model: yunwu.chat('gpt-5.2'),
+  messages: [{ role: 'user', content: 'One-line haiku about edge runtimes.' }],
+});
+
+console.log(text);
+```
+
+## Example: embeddings
+
+The relay exposes the OpenAI embeddings wire, so `yunwu.embedding(...)` plugs straight into [`embed`](/docs/core/embeddings) / `embedMany`:
+
+```ts title="embed.ts"
+import { embed } from '@deuz-sdk/core';
+import { createYunwu } from '@deuz-sdk/core/yunwu';
+
+const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
+
+const { embedding } = await embed({
+  model: yunwu.embedding('text-embedding-3-large'),
+  value: 'pure, web-first, multi-provider AI SDK',
+});
+
+console.log(embedding.length);
+```
+
+## Example: generateImage
+
+The image surface is **synchronous** — `POST /v1/images/generations`. Pass `yunwu.image(slug)` to [`generateImage`](/docs/modules/image-generation):
+
+```ts title="image.ts"
+import { generateImage } from '@deuz-sdk/core/image';
+import { createYunwu } from '@deuz-sdk/core/yunwu';
+
+const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
+
+const { images } = await generateImage({
+  model: yunwu.image('flux-2-pro'),
+  prompt: 'a tiny robot watering a bonsai, isometric',
+  size: '1024x1024',
+});
+
+console.log(images[0]?.url);
+```
+
+## Example: imagine (Midjourney) via the relay
+
+Midjourney is **async** (submit → poll → optional U/V actions) and lives at the bare host root, not under `/v1`. Spread `yunwu.mj()` into the Midjourney helpers from [`@deuz-sdk/core/midjourney`](/docs/modules/image-generation); `imagine` submits a task and polls it to a terminal status, returning a `MidjourneyTask` with the final `imageUrl`.
+
+```ts title="midjourney.ts"
+import { imagine } from '@deuz-sdk/core/midjourney';
+import { createYunwu } from '@deuz-sdk/core/yunwu';
+
+const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
+
+const task = await imagine({
+  ...yunwu.mj(), // apiKey + baseURL (bare root) + provider: 'yunwu'
+  prompt: 'a serene mountain lake at dawn --ar 16:9',
+  pollIntervalMs: 3000,
+  onProgress: (t) => console.log(t.status, t.progress),
+});
+
+console.log(task.status, task.imageUrl);
+```
+
+To run a follow-up upscale/variation, take a `customId` from the finished task's `buttons` and call `submitAction({ ...yunwu.mj(), taskId, customId })`. See [Image generation](/docs/modules/image-generation) for the full submit/poll/action flow.
+
+## See also
+
+- [Image generation](/docs/modules/image-generation) — synchronous `generateImage` and the async Midjourney proxy.
+- [streamChat](/docs/core/stream-chat) and [generateText](/docs/core/generate-text) — the chat entry points.
+- [Embeddings](/docs/core/embeddings) — `embed` / `embedMany`.
+- [OpenAI](/docs/providers/openai) — the sibling Chat Completions provider this relay reuses.
+- [Dependencies and the client](/docs/core/dependencies) — key resolution and `createClient` `apiKeys`.

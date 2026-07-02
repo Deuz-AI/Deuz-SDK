@@ -1,6 +1,6 @@
 {
-  "name": "@deuz/core",
-  "version": "0.0.0",
+  "name": "@deuz-sdk/core",
+  "version": "1.1.1",
   "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini).",
   "license": "MIT",
   "author": "Umutcan Edizaslan (U-C4N)",
@@ -14,8 +14,7 @@
     "dist"
   ],
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",

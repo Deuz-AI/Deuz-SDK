@@ -1,6 +1,6 @@
 /**
  * memory-markdown.ts — Node-only Obsidian-style markdown `MemoryStore` backend.
- * Exported as `@deuz/core/memory/markdown` (NOT bundled into edge-safe core).
+ * Exported as `@deuz-sdk/core/memory/markdown` (NOT bundled into edge-safe core).
  *
  * HYBRID design (the research-recommended sweet spot): the markdown files are the
  * human-readable, git-versionable source of truth — one `<id>.md` per record with
@@ -11,7 +11,7 @@
  * grep/full-text — so the SAME store works with or without an embedder.
  *
  * Reuses the pure helpers (`matchesScope` / `cosineSimilarity`) from
- * `@deuz/core/memory` so semantics match the in-memory reference store.
+ * `@deuz-sdk/core/memory` so semantics match the in-memory reference store.
  */
 import {
   cosineSimilarity,

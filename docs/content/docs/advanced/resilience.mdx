@@ -1,0 +1,266 @@
+---
+title: Resilience & Timeouts
+description: Pre-first-byte retry with jittered backoff, the three-layer timeout, abort vs. timeout semantics, and the circuit-breaker seam.
+---
+
+`@deuz-sdk/core` makes one network attempt resilient and keeps it deterministic. Before the first byte of a response stream arrives, a failed request can be retried with exponential backoff and full jitter; once streaming has started, any error is final. Timeouts come in three independent layers driven by the injected `clock`, and a user abort is treated as a clean finish rather than a failure. All of this is wired through the [`Dependencies`](/docs/core/dependencies) seam so it is reproducible in tests with no real clock and no real network.
+
+## Pre-first-byte retry only
+
+The inference pump retries **only before the first byte** of the response body. The moment the stream begins emitting deltas, a mid-stream error is propagated as-is and never retried.
+
+The reason is correctness, not laziness: a streaming response is stateful. Partial text, reasoning, and tool-call fragments have already been pushed to the consumer. A transparent retry would replay tokens the caller already saw, corrupting the stream and any UI bound to it. So the contract is: retry the *connection and the non-2xx handshake*, but never the *stream*.
+
+This also means [`streamChat`](/docs/core/stream-chat) keeps its never-throw guarantee. A pre-first-byte failure that exhausts the retry budget surfaces as an `error` part on `fullStream` and rejects the `usage` / `finishReason` promises — it is not a synchronous throw.
+
+## The retry policy
+
+| Aspect | Behavior |
+| --- | --- |
+| When | Pre-first-byte only (connect failure or non-2xx handshake) |
+| Budget | `maxRetries`, default `2` (per-call on `CommonCallOptions`) |
+| Backoff | Exponential with full jitter: `random() * min(cap, base * 2^attempt)` |
+| `base` / `cap` | `500ms` base, `30_000ms` cap |
+| `Retry-After` | If the provider sent one, it takes precedence over computed backoff (capped at `cap`) |
+| Which errors | Only those whose `isRetryable` is `true` |
+| Jitter source | Derived from `deps.generateId()` — never `Math.random()` |
+
+The defaults live in `DEFAULT_RETRY` inside `core/resilience.ts`:
+
+```ts
+// internal — shown for reference
+const DEFAULT_RETRY = { maxRetries: 2, baseMs: 500, capMs: 30_000 };
+```
+
+Override the budget per call with `maxRetries`:
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+  maxRetries: 4, // raise the pre-first-byte budget for this call
+});
+```
+
+### Which errors retry
+
+Retryability is decided by the `isRetryable` flag carried on `APICallError` and its subclasses — not by HTTP status guessing at the call site. Errors that are not HTTP-shaped (`TimeoutError`, `AbortError`, `NoObjectGeneratedError`, `UnsupportedCapabilityError`) carry no flag and are always final.
+
+| Error | Status | Retryable |
+| --- | --- | --- |
+| `RateLimitError` | 429 | yes |
+| `OverloadedError` | 529 | yes |
+| `APICallError` (generic 5xx) | `>= 500` | yes |
+| `AuthenticationError` | 401 / 403 | no |
+| `InvalidRequestError` | 400 / 422 | no |
+| `ModelNotFoundError` | 404 | no |
+| `ContextOverflowError` | 400 | no |
+
+The verdict is a one-liner you can reuse for your own fallback logic:
+
+```ts
+import { APICallError } from '@deuz-sdk/core';
+
+function isRetryable(err: unknown): boolean {
+  return err instanceof APICallError && err.isRetryable;
+}
+```
+
+See [Error Handling](/docs/core/errors) for the full taxonomy.
+
+### Backoff and jitter are deterministic
+
+The backoff formula is **full jitter**: `Math.floor(min(cap, base * 2^attempt) * random())`. The crucial detail is that `random` is not `Math.random()` — core never calls it. Instead the random unit comes from hashing `deps.generateId()` with FNV-1a into the `[0, 1)` range. Pin `generateId` and the retry delays become reproducible:
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const result = streamChat({
+  model: createAnthropic({ apiKey: 'k', fetch: mockFetch })('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+  // Same id every attempt → same jitter → same backoff in every test run.
+  deps: { generateId: () => 'fixed-id' },
+});
+```
+
+The wait between attempts is itself abortable: it is scheduled through `deps.clock.setTimeout`, and if the user `signal` aborts during the backoff, the delay rejects immediately rather than sleeping out the full interval.
+
+### `Retry-After` takes precedence
+
+When a provider returns a `Retry-After` header (integer seconds or an HTTP-date), it is parsed to milliseconds and used directly instead of the computed backoff — still capped at the `30s` ceiling. This is honored for the errors that carry it, notably `RateLimitError` (429) and `OverloadedError` (529).
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+// A mock that 429s once with Retry-After, then succeeds on the next attempt. The
+// pump waits the header's value (capped at 30s) before retrying — no guesswork.
+let attempt = 0;
+const fetch = (async () => {
+  if (attempt++ === 0) {
+    return new Response(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }), {
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '2' },
+    });
+  }
+  // Your canned success: a Response whose body is an SSE ReadableStream.
+  return okSseResponse();
+}) as typeof fetch;
+
+const result = streamChat({
+  model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+});
+```
+
+The parsed value lives on the error too, so you can read it from a rejected promise: `err.retryAfterMs` on any `APICallError`.
+
+## The three-layer timeout
+
+Timeouts are clock-driven (not `AbortSignal.timeout`, which is non-injectable and trips a Cloudflare Workers bug). There are three independent layers, merged into the fetch `signal` via `combineSignals`:
+
+| Layer | Default | Fires when | Cleared by |
+| --- | --- | --- | --- |
+| TTFT (time-to-first-token) | `60_000ms` | No content delta has arrived yet | The first `text-delta` / `reasoning-delta` |
+| Total | `300_000ms` | The whole request runs past the ceiling | Completion |
+| User `signal` | — | Your `AbortSignal` aborts | You |
+
+The defaults are `DEFAULT_TIMEOUTS` in `core/timeout.ts` (`ttftMs: 60_000`, `totalMs: 300_000`). The TTFT timer is armed at **pump start** — i.e. when output is first accessed, not at the synchronous `streamChat` return — and is cancelled the instant the first content delta lands, so a model that streams slowly after starting is bounded only by the total ceiling. The total timer covers the entire request including the streaming phase.
+
+A fired timer aborts the request with a `TimeoutError` whose `layer` is `'ttft'` or `'total'`. Because the user `signal` and both timers are combined into one signal handed to `fetch`, whichever trips first wins.
+
+### TimeoutError is a failure; a user abort is not
+
+This distinction is deliberate and load-bearing:
+
+- A **`TimeoutError`** is a genuine failure. It surfaces as an `error` part on `fullStream`, and `usage` / `finishReason` reject with it. A `ttft` timeout occurs before any content, so it participates in pre-first-byte retry; a `total` timeout is mid-stream and final.
+- A **user abort** (you called `controller.abort()`) is *not* an error. The pump resolves `finishReason` with `'aborted'` and resolves `usage` with the partial token counts gathered so far. No `error` part is emitted, and the abort is never retried.
+
+```ts
+import { streamChat, TimeoutError } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const controller = new AbortController();
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Write an essay.' }],
+  signal: controller.signal,
+});
+
+// Stop generation from elsewhere — resolves cleanly as 'aborted'.
+setTimeout(() => controller.abort(), 1_000);
+
+const finishReason = await result.finishReason; // 'aborted' on cancel
+if (finishReason === 'aborted') {
+  const usage = await result.usage; // partial counts, still resolves
+  console.log('cancelled after', usage.outputTokens, 'output tokens');
+}
+```
+
+### Controlling timeout durations
+
+There is **no per-call `timeout` option** on `CommonCallOptions`; the layer durations come from the internal `DEFAULT_TIMEOUTS`. What you *do* control is the `clock` that drives the timers — every timer is scheduled through `deps.clock.setTimeout`. In tests this lets you fire the short backoff timers eagerly while never firing the long ttft/total timers:
+
+```ts title="test/helpers.ts"
+import type { Clock } from '@deuz-sdk/core';
+
+// Fire short (backoff) timers immediately; never fire the long ttft/total timers.
+export function fastClock(): Clock {
+  return {
+    now: () => 0,
+    setTimeout: (fn, ms) => {
+      if (ms < 60_000) {
+        const id = setTimeout(fn, 0);
+        return () => clearTimeout(id);
+      }
+      return () => {}; // ttft/total never fire
+    },
+  };
+}
+```
+
+Pass it through `deps` to drive every timeout and backoff deterministically:
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { fastClock } from './test/helpers';
+
+const result = streamChat({
+  model: createAnthropic({ apiKey: 'k', fetch: mockFetch })('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+  deps: { clock: fastClock(), generateId: () => 'fixed-id' },
+});
+```
+
+To enforce a shorter wall-clock budget in production, wrap your own `AbortController` with a timer and pass its `signal` — your abort merges with the built-in layers, so the tightest bound wins:
+
+```ts
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), 10_000); // 10s budget
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+  signal: controller.signal,
+});
+
+// Note: this surfaces as 'aborted' (a clean finish), not a TimeoutError.
+result.finishReason.finally(() => clearTimeout(timer));
+```
+
+## The circuit-breaker seam
+
+`deps.breakerStore` is the seam for circuit-breaker state. It is a plain key-value store that the SDK resolves to an in-memory `Map` by default:
+
+```ts
+interface BreakerState {
+  failures: number;
+  openedAt?: number;
+  cooldownUntil?: number;
+}
+
+interface BreakerStore {
+  get(key: string): BreakerState | undefined | Promise<BreakerState | undefined>;
+  set(key: string, state: BreakerState): void | Promise<void>;
+}
+```
+
+The critical wiring rule is **per-client resolution (G11)**: when you use [`createClient`](/docs/core/dependencies#createclient), the breaker store is resolved **once** for the client and shared across every call. A fresh in-memory store per call could never accumulate failures and so would never trip. If you inject your own store, supply it once at the client level:
+
+```ts
+import { createClient } from '@deuz-sdk/core';
+import type { BreakerStore, BreakerState } from '@deuz-sdk/core';
+
+// A custom store backed by your own state (e.g. Redis/Durable Object). Shared
+// across calls so failures accumulate (G11).
+const states = new Map<string, BreakerState>();
+const breakerStore: BreakerStore = {
+  get: (key) => states.get(key),
+  set: (key, state) => {
+    states.set(key, state);
+  },
+};
+
+export const deuz = createClient({
+  apiKeys: { anthropic: process.env.ANTHROPIC_API_KEY! },
+  deps: { breakerStore },
+});
+```
+
+Both `get` and `set` may return a `Promise`, so the store can be backed by a remote/persistent service for a multi-instance deployment — share one breaker across your fleet by pointing every instance at the same backend.
+
+## Related
+
+- [streamChat](/docs/core/stream-chat) — the synchronous, never-throws streaming entry point and `StreamChatResult` shape.
+- [Error Handling](/docs/core/errors) — the `DeuzError` taxonomy, `isRetryable`, and `retryAfterMs`.
+- [Dependencies & Clients](/docs/core/dependencies) — the `Dependencies` seam, `clock`, `generateId`, and per-client breaker resolution.
+- [Edge runtimes](/docs/advanced/edge) — why the core stays pure and Web-APIs-only.

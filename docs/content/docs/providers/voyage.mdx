@@ -1,0 +1,157 @@
+---
+title: Voyage AI
+description: Retrieval-focused, embedding-only provider with a query/document input-type hint.
+---
+
+Voyage AI is an **embedding-only** provider tuned for retrieval. Its models speak the `voyage-embeddings` wire (`POST {baseURL}/embeddings`, Bearer auth) and accept an `input_type` hint that distinguishes documents from queries — the single most useful asymmetric-retrieval lever. Use it to build RAG indexes and embed search queries; it does **not** do chat, so a Voyage model can only be passed to [`embed` / `embedMany`](/docs/core/embeddings), never to `generateText`/`streamChat` (the `EmbeddingModel` type is distinct from `LanguageModel` and the two never cross at compile time).
+
+It ships behind its own subpath export (`@deuz-sdk/core/voyage`) so it never adds weight to the default bundle.
+
+## createVoyage
+
+`createVoyage(settings?)` returns an `EmbeddingProvider` — a function you call with a model slug to get an `EmbeddingModel` descriptor. Factory settings are stashed on a non-enumerable Symbol, so they never leak through `Object.keys`/`JSON.stringify`.
+
+```ts
+import { createVoyage } from '@deuz-sdk/core/voyage';
+
+const voyage = createVoyage({ apiKey: process.env.VOYAGE_API_KEY! });
+const model = voyage('voyage-3.5');
+```
+
+A pre-built default instance is also exported (no API key bound — supply one via a client `apiKeys` map or `deps.keyProvider`):
+
+```ts
+import { voyage } from '@deuz-sdk/core/voyage';
+
+const model = voyage('voyage-3.5');
+```
+
+### Settings
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | — | Voyage API key. Read it from `process.env` at the app layer; core never reads env itself. |
+| `baseURL` | `string` | `https://api.voyageai.com/v1` | Override for a proxy/gateway. The adapter appends `/embeddings`. |
+| `fetch` | `typeof fetch` | global `fetch` | Custom fetch (factory `fetch` wins over `deps.fetch`). |
+| `headers` | `Record<string, string>` | — | Extra headers merged into every request. |
+
+## Models
+
+Pinned slugs in the registry. Unknown slugs do **not** throw — they fall back to conservative defaults (1024 dims, batch 96, no base64) and log a warning, so a new Voyage release works without a code change.
+
+| Slug | Dimensions | Max batch | Task type | Usage reported |
+| --- | --- | --- | --- | --- |
+| `voyage-3.5` | 1024 | 1000 | yes | yes |
+| `voyage-3.5-lite` | 1024 | 1000 | yes | yes |
+
+`embedMany` splits inputs into sub-batches of the model's max batch size (override with `maxBatchSize`) and runs up to `maxConcurrency` (default 5) in parallel, concatenating results in original order.
+
+## Task types
+
+Voyage understands two `input_type` values. The canonical `taskType` option maps to them; any other canonical task type is **omitted** (Voyage uses no hint).
+
+| Canonical `taskType` | Voyage `input_type` |
+| --- | --- |
+| `search_document` | `document` |
+| `search_query` | `query` |
+| anything else / unset | _(omitted)_ |
+
+The rule of thumb for asymmetric retrieval: embed the corpus with `search_document` and embed the user's question with `search_query`. Both sides must use the same model.
+
+## Dimensions
+
+Pass `dimensions` to request Matryoshka truncation — it is sent as Voyage's `output_dimension`:
+
+```ts
+import { embed } from '@deuz-sdk/core';
+import { createVoyage } from '@deuz-sdk/core/voyage';
+
+const voyage = createVoyage({ apiKey: process.env.VOYAGE_API_KEY! });
+
+const { embedding } = await embed({
+  model: voyage('voyage-3.5'),
+  value: 'How do retries work?',
+  taskType: 'search_query',
+  dimensions: 256, // → output_dimension: 256
+  normalize: true, // L2-normalize the truncated vector
+});
+```
+
+`normalize: true` returns unit vectors — recommended after truncating dimensions so cosine similarity stays well-behaved.
+
+## Example: RAG indexing + query embedding
+
+Embed a corpus as `search_document`, persist the vectors, then embed the user's query as `search_query` with the same model. `embedMany` batches the corpus automatically; usage is summed across sub-batches.
+
+```ts title="rag-voyage.ts"
+import { embed, embedMany } from '@deuz-sdk/core';
+import { createVoyage } from '@deuz-sdk/core/voyage';
+
+const voyage = createVoyage({ apiKey: process.env.VOYAGE_API_KEY! });
+const model = voyage('voyage-3.5');
+
+// 1) Index the corpus — one vector per chunk, in input order.
+const chunks = [
+  'Pre-first-byte retries use exponential backoff with full jitter.',
+  'streamChat returns synchronously and never throws.',
+  'Every tool_use id must receive a matching tool_result.',
+];
+
+const { embeddings, usage } = await embedMany({
+  model,
+  values: chunks,
+  taskType: 'search_document',
+});
+
+const store = chunks.map((text, i) => ({ text, vector: embeddings[i]! }));
+console.log('indexed', store.length, 'chunks,', usage.inputTokens, 'tokens');
+
+// 2) Embed the query — SAME model, query input_type.
+const { embedding: query } = await embed({
+  model,
+  value: 'Does the stream throw if the network fails?',
+  taskType: 'search_query',
+});
+
+// 3) Rank by cosine similarity (vectors here are not pre-normalized).
+function cosine(a: number[], b: number[]): number {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i]! * b[i]!;
+    na += a[i]! * a[i]!;
+    nb += b[i]! * b[i]!;
+  }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
+}
+
+const ranked = store
+  .map((c) => ({ text: c.text, score: cosine(query, c.vector) }))
+  .sort((a, b) => b.score - a.score);
+
+console.log(ranked[0]?.text);
+```
+
+## API key resolution
+
+`createVoyage({ apiKey })` is the common path. If you omit it, the embedding call resolves a key in this precedence: `deps.keyProvider` (highest) → factory `apiKey` → client-level `apiKeys` (lowest). If none is found, the call throws an `AuthenticationError` before any network request.
+
+```ts
+import { embedMany } from '@deuz-sdk/core';
+import { voyage } from '@deuz-sdk/core/voyage';
+
+// No key on the factory — inject one via deps.keyProvider instead.
+await embedMany({
+  model: voyage('voyage-3.5'),
+  values: ['hello'],
+  deps: { keyProvider: { getKey: () => process.env.VOYAGE_API_KEY! } },
+});
+```
+
+## See also
+
+- [Embeddings](/docs/core/embeddings) — the full `embed` / `embedMany` API, batching, and usage metering.
+- [Dependencies](/docs/core/dependencies) — the `deps` seam (`fetch`, `clock`, `keyProvider`, `onUsage`).
+- [Google](/docs/providers/google) — Gemini native embeddings with the richer task-type enum.
+- [OpenAI](/docs/providers/openai) — `text-embedding-3-*` on the OpenAI embeddings wire.

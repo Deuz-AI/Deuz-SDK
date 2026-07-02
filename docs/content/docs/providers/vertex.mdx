@@ -1,0 +1,185 @@
+---
+title: Vertex AI
+description: Run Claude and Gemini through Google Vertex AI with OAuth2 Bearer auth, regional endpoints, and IAM.
+---
+
+Google Vertex AI hosts **both** Anthropic Claude and Google Gemini behind one regional, IAM-gated transport. Unlike AI Studio or the direct Anthropic API, Vertex authenticates with a short-lived **OAuth2 access token** (a `Bearer` token), not a static API key. Use it when your org standardizes on GCP IAM, data residency, or VPC-SC instead of per-vendor API keys.
+
+All factories live in the `@deuz-sdk/core/vertex` subpath. They return the same `LanguageModel` descriptor as every other provider, so [streamChat](/docs/core/stream-chat), [generateText](/docs/core/generate-text), and the [agentic tool loop](/docs/agents/tool-loop) work unchanged.
+
+## Factories
+
+| Factory | Hosts | Wire surface | Model id form |
+| --- | --- | --- | --- |
+| `createVertexAnthropic` | Claude on Vertex | `anthropic` (Messages) | `claude-sonnet-4-5` |
+| `createVertexGoogle` | Gemini, OpenAI-compatible | `chat_completions` | `google/gemini-2.5-flash` |
+| `createVertexGoogleNative` | Gemini, native | `native` (`generateContent`) | `gemini-2.5-flash` |
+
+Pick `createVertexGoogleNative` for full Gemini capabilities (reasoning + `thoughtSignature`, structured output, grounding, native PDF/audio). `createVertexGoogle` reuses the Chat Completions wire and is the simpler path when you only need text/tools parity with OpenAI.
+
+## Settings
+
+Every factory takes the same `VertexSettings` object:
+
+| Option | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `project` | `string` | yes | GCP project id. |
+| `location` | `string` | yes | Region (e.g. `us-east5`, `us-central1`) or `global`. |
+| `accessToken` | `string` | no | OAuth2 token (e.g. `gcloud auth print-access-token`). Short-lived — see auth below. |
+| `fetch` | `typeof fetch` | no | Custom transport. Wins over `deps.fetch`. |
+| `headers` | `Record<string, string>` | no | Extra request headers. |
+
+For the publisher-model wires (`createVertexAnthropic` and `createVertexGoogleNative`) the model id goes in the URL — Claude requests carry no `model` field in the body. The OpenAI-compatible wire (`createVertexGoogle`) is the exception: it posts to a fixed `.../chat/completions` URL and sends the model in the body instead. In every case the region drives the host:
+
+| `location` | Host |
+| --- | --- |
+| `global` | `https://aiplatform.googleapis.com` |
+| anything else | `https://<location>-aiplatform.googleapis.com` |
+
+## Authentication
+
+Vertex tokens expire roughly **hourly**, so the static `accessToken` field is a convenience for a single short-lived call. For anything long-running (a server, a streaming session, an agentic loop), prefer a refreshing `deps.keyProvider` — its `getKey()` is awaited on every request, so it can hand back a fresh token transparently.
+
+Mint and cache tokens at the **application layer** with `google-auth-library`; the SDK core never reads credentials from the environment or disk.
+
+```ts title="vertex-auth.ts"
+import { GoogleAuth } from 'google-auth-library';
+
+const auth = new GoogleAuth({
+  scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+});
+
+const client = await auth.getClient();
+
+/** Returns a valid OAuth2 access token, refreshing as needed. */
+export async function getFreshAccessToken(): Promise<string> {
+  const { token } = await client.getAccessToken();
+  if (!token) throw new Error('Failed to obtain a Vertex access token');
+  return token;
+}
+```
+
+`getAccessToken()` caches and auto-refreshes internally, so calling it per request is cheap and always yields a live token.
+
+### deps.keyProvider precedence
+
+`deps.keyProvider` is the highest-precedence key source (the "G1" rule). For Vertex it should return the OAuth2 token, which the adapter sends as `Authorization: Bearer <token>`. `getKey` receives the provider string (`vertex-anthropic` or `vertex-google`); you can ignore it if a single token covers your whole app.
+
+```ts
+const keyProvider = {
+  getKey: () => getFreshAccessToken(), // Promise<string>, awaited every request
+};
+```
+
+## Claude on Vertex
+
+Reuses the Anthropic Messages wire — same SSE parsing and error mapping as the direct [Anthropic provider](/docs/providers/anthropic); only the URL, the `Bearer` auth, and `anthropic_version: "vertex-2023-10-16"` placement differ. Pass the Vertex model id (e.g. `claude-sonnet-4-5`, `claude-opus-4-1`).
+
+```ts title="claude-on-vertex.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createVertexAnthropic } from '@deuz-sdk/core/vertex';
+import { getFreshAccessToken } from './vertex-auth';
+
+const vertexAnthropic = createVertexAnthropic({
+  project: process.env.GCP_PROJECT!,
+  location: 'us-east5',
+});
+
+const result = streamChat({
+  model: vertexAnthropic('claude-sonnet-4-5'),
+  messages: [{ role: 'user', content: 'Summarize Vertex AI in one sentence.' }],
+  deps: { keyProvider: { getKey: () => getFreshAccessToken() } },
+});
+
+for await (const chunk of result.textStream) process.stdout.write(chunk);
+```
+
+The request resolves to:
+
+```text
+POST https://us-east5-aiplatform.googleapis.com/v1/projects/<project>/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict
+Authorization: Bearer <token>
+```
+
+For a one-off script you can skip the keyProvider and pass a token directly:
+
+```ts
+const vertexAnthropic = createVertexAnthropic({
+  project: process.env.GCP_PROJECT!,
+  location: 'us-east5',
+  accessToken: process.env.VERTEX_ACCESS_TOKEN!, // e.g. `gcloud auth print-access-token`
+});
+```
+
+## Gemini on Vertex (native)
+
+`createVertexGoogleNative` speaks the native `generateContent` wire — the same adapter as the [Google provider](/docs/providers/google), but it builds the Vertex publisher-model URL and sends `Authorization: Bearer` instead of the `x-goog-api-key` header. Pass the **bare** model id (`gemini-2.5-flash`, `gemini-2.5-pro`).
+
+```ts title="gemini-native-on-vertex.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createVertexGoogleNative } from '@deuz-sdk/core/vertex';
+import { getFreshAccessToken } from './vertex-auth';
+
+const vertexGemini = createVertexGoogleNative({
+  project: process.env.GCP_PROJECT!,
+  location: 'us-central1',
+});
+
+const { text, usage, finishReason } = await generateText({
+  model: vertexGemini('gemini-2.5-flash'),
+  messages: [{ role: 'user', content: 'What region am I calling?' }],
+  deps: { keyProvider: { getKey: () => getFreshAccessToken() } },
+});
+
+console.log(text, usage, finishReason);
+```
+
+The request resolves to:
+
+```text
+POST https://us-central1-aiplatform.googleapis.com/v1/projects/<project>/locations/us-central1/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse
+Authorization: Bearer <token>
+```
+
+## Gemini on Vertex (OpenAI-compatible)
+
+`createVertexGoogle` routes Gemini through Vertex's OpenAI-compatible endpoint and reuses the Chat Completions wire. Pass the model in **prefixed** Vertex form (`google/gemini-2.5-flash`); unlike the native factory, the model id is also sent in the request body.
+
+```ts title="gemini-compat-on-vertex.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createVertexGoogle } from '@deuz-sdk/core/vertex';
+import { getFreshAccessToken } from './vertex-auth';
+
+const vertexGoogle = createVertexGoogle({
+  project: process.env.GCP_PROJECT!,
+  location: 'us-central1',
+});
+
+const result = streamChat({
+  model: vertexGoogle('google/gemini-2.5-flash'),
+  messages: [{ role: 'user', content: 'hi' }],
+  deps: { keyProvider: { getKey: () => getFreshAccessToken() } },
+});
+
+for await (const chunk of result.textStream) process.stdout.write(chunk);
+```
+
+The request resolves to a `.../endpoints/openapi/chat/completions` URL under the regional host.
+
+## Vertex vs AI Studio
+
+| | Vertex AI | AI Studio (`@deuz-sdk/core/google`) |
+| --- | --- | --- |
+| Auth | OAuth2 `Bearer` (IAM, short-lived) | static API key (`AIza…`) |
+| Credential source | `accessToken` / refreshing `deps.keyProvider` | `apiKey` factory field |
+| Endpoint | regional (`<location>-aiplatform…`) or `global` | single global host |
+| Model id | publisher form in URL (`gemini-2.5-flash`, `claude-sonnet-4-5`) | bare model id |
+| Claude support | yes (`createVertexAnthropic`) | no — use `@deuz-sdk/core/anthropic` |
+
+Because the token expires hourly, **always** wire a refreshing `deps.keyProvider` for any process that outlives a single call. The static `accessToken` is only safe for short-lived scripts.
+
+## See also
+
+- [Anthropic provider](/docs/providers/anthropic) — direct Claude API (API key).
+- [Google provider](/docs/providers/google) — Gemini via AI Studio (API key).
+- [Dependencies and seams](/docs/core/dependencies) — `deps.keyProvider` and the injection model.

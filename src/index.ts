@@ -1,5 +1,5 @@
 /**
- * `@deuz/core` — pure, web-first, multi-provider AI SDK.
+ * `@deuz-sdk/core` — pure, web-first, multi-provider AI SDK.
  * Public surface lock (1.0). Faz 0: types are final, methods are stubs that
  * throw NotImplementedError until Faz 1.
  */

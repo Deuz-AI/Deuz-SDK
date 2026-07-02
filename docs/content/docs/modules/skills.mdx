@@ -1,0 +1,307 @@
+---
+title: Skills
+description: Agent Skills (SKILL.md) with progressive disclosure — catalog, trigger, and bundled resources over a pluggable source seam.
+---
+
+Agent Skills package reusable instructions as `SKILL.md` files: YAML frontmatter (`name`, `description`, optional `allowed-tools`) plus a markdown body. The SDK loads them with **progressive disclosure** — only lightweight name+description pairs (the catalog) enter context until the model triggers a skill, then its body and bundled resources load on demand. Use this to give a model a large library of capabilities without paying the token cost of every instruction up front.
+
+Everything in `@deuz-sdk/core/skills` is **pure and edge-safe**: parsing, matching, and rendering touch no filesystem. The only IO touchpoint is the `SkillSource` seam. The Node filesystem loader lives in a separate subpath, `@deuz-sdk/core/skills/node`.
+
+## The three disclosure levels
+
+| Level | What loads | API |
+| --- | --- | --- |
+| 1 — Catalog | `id` + `name` + `description` only | `registry.catalog()` → render with `renderSkillCatalog` |
+| 2 — Trigger | The parsed `SKILL.md` body + frontmatter | `registry.trigger(id)` → `SkillManifest` |
+| 3 — Resource | A bundled file next to the skill | `registry.resource(id, relativePath)` |
+
+The model decides what to trigger. A `SkillMatcher` only **prunes** a large catalog before you render it — it is not a hidden router and never auto-triggers anything.
+
+## SKILL.md format
+
+A skill is a directory containing a `SKILL.md` file. The leading `---` fence is the frontmatter; everything after it is the body (the body may contain its own `---` rules and code fences — only the first fence is treated as frontmatter).
+
+```text title="skills/pdf-filler/SKILL.md"
+---
+name: pdf-filler
+description: Fill in PDF forms from structured data.
+license: MIT
+allowed-tools:
+  - Read
+  - Bash(python:*)
+---
+
+# PDF Filler
+
+Use this skill to fill PDF forms. Read the template, map fields, then run
+the fill script. See forms/w2.json for an example field map.
+```
+
+`parseSkill(raw)` returns `{ manifest, issues }` and never throws on content. `allowed-tools` is normalized to `manifest.allowedTools` (block list, flow list `[Read, Write]`, or comma scalar `Read, Bash(git:*)` all work). Unknown frontmatter keys survive untyped under `manifest.metadata`.
+
+| `SkillManifest` field | Type | Notes |
+| --- | --- | --- |
+| `name` | `string` | Validated against `^[a-z0-9-]{1,64}$`, no `anthropic`/`claude` substring |
+| `description` | `string` | Required, ≤ 1024 chars, no `<`/`>` |
+| `license` | `string \| undefined` | Optional |
+| `allowedTools` | `string[] \| undefined` | `undefined` means "no restriction" |
+| `metadata` | `Record<string, unknown>` | All frontmatter keys (host extensions survive here) |
+| `body` | `string` | Trimmed markdown after the frontmatter |
+| `raw` | `string` | The original file text |
+
+Validation issues are advisory — `parseSkill` collects them, it does not reject. Validate explicitly with `validateSkillName(name)` / `validateSkillDescription(description)`, each returning a `SkillValidationIssue[]` (empty = valid).
+
+## createSkillRegistry
+
+`createSkillRegistry` wires a `SkillSource` (and optional `matcher`) into a four-method registry that orchestrates the three levels.
+
+```ts title="registry.ts"
+import { createSkillRegistry, type SkillRegistry } from '@deuz-sdk/core/skills';
+import { nodeSkillSource } from '@deuz-sdk/core/skills/node';
+
+const registry: SkillRegistry = createSkillRegistry({
+  source: nodeSkillSource(['./skills']),
+});
+
+const catalog = await registry.catalog(); // Level 1 — SkillCandidate[]
+const manifest = await registry.trigger('pdf-filler'); // Level 2 — SkillManifest
+const bytes = await registry.resource('pdf-filler', 'forms/w2.json'); // Level 3
+```
+
+| Method | Returns | Level |
+| --- | --- | --- |
+| `catalog()` | `Promise<SkillCandidate[]>` (`{ id, name, description }`) | 1 |
+| `trigger(id)` | `Promise<SkillManifest>` | 2 |
+| `resource(id, rel)` | `Promise<Uint8Array \| string>` | 3 |
+| `match(query, opts?)` | `Promise<SkillMatch[]>` (prunes the catalog) | — |
+
+`createSkillRegistry` accepts `{ source, matcher?, parseYaml? }`. With no `matcher`, it defaults to the zero-dep `lexicalMatcher`. Pass `parseYaml` to swap in a full YAML parser instead of the built-in subset parser.
+
+## Example: catalog in the system prompt
+
+Render the Level-1 catalog into a system message so the model knows which skills exist. `renderSkillCatalog` emits an `<available_skills>` block (empty string when there are no candidates).
+
+```ts title="agent.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createSkillRegistry, renderSkillCatalog } from '@deuz-sdk/core/skills';
+import { nodeSkillSource } from '@deuz-sdk/core/skills/node';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const registry = createSkillRegistry({ source: nodeSkillSource(['./skills']) });
+
+const catalog = await registry.catalog();
+const skillsBlock = renderSkillCatalog(catalog);
+
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [
+    {
+      role: 'system',
+      content: `You can trigger skills on demand.\n${skillsBlock}`,
+    },
+    { role: 'user', content: 'Fill out my W-2 from this data...' },
+  ],
+});
+```
+
+There is no `system` option on the call — system instructions are a `role: 'system'` message (see [Messages](/docs/core/messages)).
+
+## Example: trigger on demand inside a tool
+
+Expose `trigger` and `resource` as tools so the model loads a skill's full instructions only when it chooses to. The model triggers; you do not.
+
+```ts title="skill-tools.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createSkillRegistry, renderSkillCatalog } from '@deuz-sdk/core/skills';
+import { nodeSkillSource } from '@deuz-sdk/core/skills/node';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const registry = createSkillRegistry({ source: nodeSkillSource(['./skills']) });
+const catalog = await registry.catalog();
+
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  maxSteps: 6,
+  messages: [
+    { role: 'system', content: renderSkillCatalog(catalog) },
+    { role: 'user', content: 'Use the pdf-filler skill to complete the form.' },
+  ],
+  tools: {
+    load_skill: {
+      description: 'Load the full instructions for a skill by id (Level 2).',
+      parameters: {
+        type: 'object',
+        properties: { id: { type: 'string' } },
+        required: ['id'],
+      },
+      async execute({ id }: { id: string }) {
+        const manifest = await registry.trigger(id);
+        return manifest.body;
+      },
+    },
+    read_skill_resource: {
+      description: 'Read a bundled file shipped with a skill (Level 3).',
+      parameters: {
+        type: 'object',
+        properties: { id: { type: 'string' }, path: { type: 'string' } },
+        required: ['id', 'path'],
+      },
+      async execute({ id, path }: { id: string; path: string }) {
+        const data = await registry.resource(id, path);
+        return typeof data === 'string' ? data : new TextDecoder().decode(data);
+      },
+    },
+  },
+});
+```
+
+`resource` runs every path through `normalizeResourcePath`, so a traversal attempt (`../secret`, `/etc/passwd`) throws an `InvalidRequestError` before any IO. See the [agentic tool loop](/docs/agents/tool-loop) for how `maxSteps` and tool execution work.
+
+## The SkillSource seam
+
+A `SkillSource` is the single IO boundary. Implement three methods (the third is optional):
+
+```ts
+interface SkillSource {
+  list(): Promise<SkillSourceEntry[]>; // Level 1: { id, name, description, path? }
+  read(id: string): Promise<string>; // Level 2: full SKILL.md text
+  readResource?(id: string, rel: string): Promise<Uint8Array | string>; // Level 3
+}
+```
+
+The SDK ships three implementations:
+
+| Source | Subpath | Use for |
+| --- | --- | --- |
+| `nodeSkillSource(dirs)` | `@deuz-sdk/core/skills/node` | Filesystem — walks `dirs` for `<id>/SKILL.md` folders |
+| `fetchSkillSource(baseUrl, fetch?)` | `@deuz-sdk/core/skills` | Edge — catalog from `${baseUrl}/index.json`, bodies/resources over `fetch` |
+| `staticSkillSource(map)` | `@deuz-sdk/core/skills` | In-memory literal map (tests, static catalogs) |
+
+`nodeSkillSource` lazily imports `node:fs/promises`; calling it in an edge runtime throws a clear error. On the edge, use `fetchSkillSource` and serve an `index.json` of `{ id, name, description }` entries.
+
+### Compose multiple sources
+
+`mergeSkillSources` layers project / user / remote sources. Each layer can take a `prefix` that namespaces its ids (`proj:shared`); earlier sources win on conflict unless you pass `{ override: true }`.
+
+```ts title="merge-sources.ts"
+import { mergeSkillSources, createSkillRegistry } from '@deuz-sdk/core/skills';
+import { nodeSkillSource } from '@deuz-sdk/core/skills/node';
+import { fetchSkillSource } from '@deuz-sdk/core/skills';
+
+const source = mergeSkillSources([
+  { source: nodeSkillSource(['./skills']), prefix: 'proj' },
+  { source: fetchSkillSource('https://cdn.example.com/skills'), prefix: 'shared' },
+]);
+
+const registry = createSkillRegistry({ source });
+```
+
+### Write your own source
+
+Any object satisfying `SkillSource` works — for example, a Supabase-backed catalog. Only `list` and `read` are required.
+
+```ts title="supabase-source.ts"
+import type { SkillSource } from '@deuz-sdk/core/skills';
+import { createClient } from '@supabase/supabase-js';
+
+export function supabaseSkillSource(): SkillSource {
+  const db = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_KEY!);
+  return {
+    async list() {
+      const { data } = await db.from('skills').select('id, name, description');
+      return data ?? [];
+    },
+    async read(id) {
+      const { data } = await db.from('skills').select('raw').eq('id', id).single();
+      if (!data) throw new Error(`Unknown skill '${id}'`);
+      return data.raw;
+    },
+  };
+}
+```
+
+## Pruning a large catalog (matchers)
+
+A `SkillMatcher` ranks catalog candidates by relevance to a query so you can render only the top few into the system prompt — useful when the full catalog would be too large. It only reorders and filters; the model still decides what to trigger.
+
+```ts title="prune.ts"
+import { createSkillRegistry, renderSkillCatalog } from '@deuz-sdk/core/skills';
+import { nodeSkillSource } from '@deuz-sdk/core/skills/node';
+
+const registry = createSkillRegistry({ source: nodeSkillSource(['./skills']) });
+
+// lexicalMatcher (default): top 5 by token overlap with the user's message.
+const top = await registry.match('fill out a pdf form', { topK: 5 });
+const catalog = await registry.catalog();
+const pruned = catalog.filter((c) => top.some((m) => m.id === c.id));
+
+const skillsBlock = renderSkillCatalog(pruned);
+```
+
+`match(query, opts?)` accepts `{ topK?, threshold? }` and returns `SkillMatch[]` (`{ id, score }`). Two matchers ship:
+
+| Matcher | Import | How it scores |
+| --- | --- | --- |
+| `lexicalMatcher` | named export (the default) | Token overlap over `name` + `description`, zero-dep |
+| `embeddingMatcher(embed)` | named export | Cosine over an injected `embed(texts) => Promise<number[][]>` |
+
+```ts title="embedding-matcher.ts"
+import { createSkillRegistry, embeddingMatcher } from '@deuz-sdk/core/skills';
+import { nodeSkillSource } from '@deuz-sdk/core/skills/node';
+import { embedMany } from '@deuz-sdk/core';
+import { createOpenAIEmbedding } from '@deuz-sdk/core/openai';
+
+const model = createOpenAIEmbedding({ apiKey: process.env.OPENAI_API_KEY! })(
+  'text-embedding-3-small',
+);
+
+const registry = createSkillRegistry({
+  source: nodeSkillSource(['./skills']),
+  matcher: embeddingMatcher(async (texts) => {
+    const { embeddings } = await embedMany({ model, values: texts });
+    return embeddings;
+  }),
+});
+```
+
+## Scoping tools to a triggered skill
+
+A skill's `allowed-tools` frontmatter can narrow which tools the model may use while that skill is active. `scopeToolsToSkill(tools, allowedTools)` intersects an active `ToolSet` by key — a scoped entry like `Bash(python:*)` matches the `Bash` key (the inner pattern is advisory metadata, not enforced by core). `undefined` means "no restriction" and passes the full set through.
+
+```ts title="scope-tools.ts"
+import { scopeToolsToSkill, type ToolSetLike } from '@deuz-sdk/core/skills';
+
+const allTools: ToolSetLike = { Read: readTool, Write: writeTool, Bash: bashTool };
+
+const manifest = await registry.trigger('pdf-filler');
+const scoped = scopeToolsToSkill(allTools, manifest.allowedTools);
+// => { Read, Bash } when allowedTools is ['Read', 'Bash(python:*)']
+```
+
+## Path safety
+
+`normalizeResourcePath(rel)` is the traversal guard behind every Level-3 read. It rewrites backslashes to `/`, strips a leading `./`, and **throws `InvalidRequestError`** on any `..` segment or leading `/`. Both `fetchSkillSource` and `nodeSkillSource` route resource paths through it, so bundled-file reads can never escape the skill directory.
+
+```ts
+normalizeResourcePath('forms\\w2.json'); // 'forms/w2.json'
+normalizeResourcePath('../secret'); // throws InvalidRequestError
+normalizeResourcePath('/abs'); // throws InvalidRequestError
+```
+
+## Low-level parsing exports
+
+When you need the parser without the registry, `@deuz-sdk/core/skills` exposes the building blocks directly:
+
+| Export | Signature | Purpose |
+| --- | --- | --- |
+| `parseSkill` | `(raw, opts?) => { manifest, issues }` | Parse a `SKILL.md` string; never throws |
+| `splitFrontmatter` | `(raw) => { frontmatter, body }` | Split the leading `---` fence only |
+| `validateSkillName` | `(name) => SkillValidationIssue[]` | Name constraint check |
+| `validateSkillDescription` | `(description) => SkillValidationIssue[]` | Description constraint check |
+| `renderSkillCatalog` | `(candidates) => string` | `<available_skills>` system-prompt block |
+| `normalizeResourcePath` | `(rel) => string` | Traversal guard |
+| `scopeToolsToSkill` | `(tools, allowedTools) => ToolSet` | Intersect a `ToolSet` by tool key |
+
+See also [generateText](/docs/core/generate-text), [Messages](/docs/core/messages), and [Errors](/docs/core/errors).

@@ -1,0 +1,204 @@
+---
+title: UI Streaming
+description: The Deuz UI wire — our own versioned SSE protocol for streaming a StreamChatResult from server to browser.
+---
+
+`@deuz-sdk/core` ships its own UI streaming protocol. The server serializes a [`streamChat`](/docs/core/stream-chat) result to Server-Sent Events with the `toDeuzStreamResponse` helper; the browser reads it back as typed parts with `readDeuzStream`. This is **our** wire — the canonical `fullStream` is reframed into stable, versioned UI parts, never a raw provider stream proxied through.
+
+Both helpers live in the `@deuz-sdk/core/ui` subpath and are edge-safe (Web APIs only, no Node imports), so the server side runs on Next.js Edge, Cloudflare Workers, or Deno.
+
+```ts title="why.ts"
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui'; // server
+import { readDeuzStream } from '@deuz-sdk/core/ui'; // client
+```
+
+## Server: `toDeuzStreamResponse`
+
+Takes a `StreamChatResult` (the synchronous return of `streamChat`) and returns a `Response` whose body is the Deuz SSE wire. It iterates `result.fullStream`, maps each canonical `StreamPart` to a UI part, and frames each as one `data: <json>\n\n` SSE event.
+
+```ts
+function toDeuzStreamResponse(
+  result: StreamChatResult,
+  options?: ToDeuzStreamOptions,
+): Response;
+```
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `messageId` | `string` | — | Id emitted in the leading `start` part. |
+| `generateId` | `() => string` | — | Used when `messageId` is omitted. Pass `deps.generateId` for a real id. |
+| `headers` | `Record<string, string>` | — | Extra response headers, merged after the protocol headers. |
+
+If neither `messageId` nor `generateId` is given, the id falls back to the literal `'deuz-msg'`.
+
+The response is fixed at `status: 200` with these headers (your `options.headers` are merged in last):
+
+| Header | Value |
+| --- | --- |
+| `content-type` | `text/event-stream; charset=utf-8` |
+| `cache-control` | `no-cache` |
+| `x-deuz-stream` | `v1` (the wire version) |
+
+The wire version is exported as the constant `DEUZ_STREAM_VERSION` (currently `'v1'`). The stream always ends with a literal `data: [DONE]\n\n` sentinel after the last part.
+
+## Client: `readDeuzStream`
+
+Takes the `Response` (e.g. from `fetch`) and returns an async generator of `DeuzUIPart`. It parses the SSE body, stops at the `[DONE]` sentinel, and silently skips any malformed JSON line.
+
+```ts
+function readDeuzStream(response: Response): AsyncGenerator<DeuzUIPart>;
+```
+
+If `response.body` is `null`, it yields nothing and returns immediately.
+
+## Wire part types
+
+`DeuzUIPart` is a discriminated union on `type`. Keep a `default` case when switching — the union is additive and may grow in future versions.
+
+| `type` | Fields | Emitted when |
+| --- | --- | --- |
+| `start` | `messageId: string` | First — always the leading part. |
+| `step-start` | `step: number` | An agentic loop step begins. |
+| `step-finish` | `step: number`, `finishReason: FinishReason`, `usage: Usage` | A loop step ends. |
+| `text-delta` | `text: string` | A chunk of assistant text. |
+| `reasoning-delta` | `text: string`, `signature?: string` | A chunk of reasoning / thinking text. |
+| `tool-input-delta` | `toolCallId: string`, `toolName?: string`, `delta: string` | A raw fragment of a tool call's argument JSON. |
+| `tool-call` | `toolCallId: string`, `toolName: string`, `input: unknown` | A fully parsed tool call. |
+| `tool-result` | `toolCallId: string`, `toolName: string`, `output: unknown`, `isError?: boolean` | A tool finished executing (`isError: true` on a failed/self-healed tool). |
+| `source` | `id: string`, `url?: string`, `title?: string` | A cited source. |
+| `finish` | `finishReason: FinishReason`, `usage: Usage` | Last meaningful part — the whole turn finished. |
+| `error` | `message: string` | A stream error occurred; `message` is redacted of secrets. |
+
+`Usage` and `FinishReason` are the canonical types from the core ([usage breakdown](/docs/core/stream-chat)). The `tool-input-delta` fragments accumulate into the `input` you receive on the matching `tool-call` — render the deltas for a live "typing the arguments" effect, then swap to the final `input`.
+
+## Backpressure and cancellation
+
+- **Backpressure** is the SSE `ReadableStream`'s own: the server pulls the next `fullStream` part only when the stream controller asks for it, so a slow client throttles upstream consumption naturally.
+- **Cancellation** flows through the SSE reader. If the consumer breaks out of the `for await` over `readDeuzStream` early, the underlying response reader is cancelled in a `finally` block, which closes the body. To cancel the upstream provider request itself, pass an `AbortSignal` into `streamChat` (see [Abort](/docs/core/stream-chat#abort)) — aborting it resolves the turn with `finishReason: 'aborted'`.
+
+## Error handling
+
+`toDeuzStreamResponse` never lets the stream throw at the consumer. Any error thrown while draining `fullStream` is caught and emitted as a single `error` part, after which the `[DONE]` sentinel still closes the stream cleanly. The `message` is passed through the core's secret redactor, so API keys and bearer tokens never reach the browser. Handle it on the client by matching `type: 'error'`.
+
+## Example: Next.js route handler
+
+Read keys from `process.env` at the app layer and pass them into the factory — the SDK core never reads env itself.
+
+```ts title="app/api/chat/route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+
+export const runtime = 'edge';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function POST(req: Request): Promise<Response> {
+  const { messages } = await req.json();
+  const result = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    messages,
+  });
+  return toDeuzStreamResponse(result, { messageId: crypto.randomUUID() });
+}
+```
+
+## Example: vanilla React consumer
+
+React hooks over this wire are planned for Faz 6. Until then, integrate manually with `useState` and `readDeuzStream`. This consumer accumulates text, renders tool calls live, and surfaces the error part.
+
+```tsx title="Chat.tsx"
+import { useState } from 'react';
+import { readDeuzStream } from '@deuz-sdk/core/ui';
+
+type ToolCall = { id: string; name: string; input: unknown };
+
+export function Chat() {
+  const [text, setText] = useState('');
+  const [tools, setTools] = useState<ToolCall[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  async function send(prompt: string) {
+    setText('');
+    setTools([]);
+    setError(null);
+
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: prompt }] }),
+    });
+
+    for await (const part of readDeuzStream(res)) {
+      switch (part.type) {
+        case 'text-delta':
+          setText((t) => t + part.text);
+          break;
+        case 'tool-call':
+          setTools((prev) => [
+            ...prev,
+            { id: part.toolCallId, name: part.toolName, input: part.input },
+          ]);
+          break;
+        case 'error':
+          setError(part.message);
+          break;
+        // additive union — ignore the rest (start, step-*, tool-result, finish, ...)
+        default:
+          break;
+      }
+    }
+  }
+
+  return (
+    <div>
+      {error ? <p role="alert">{error}</p> : null}
+      <pre>{text}</pre>
+      <ul>
+        {tools.map((t) => (
+          <li key={t.id}>
+            {t.name}: {JSON.stringify(t.input)}
+          </li>
+        ))}
+      </ul>
+      <button onClick={() => send('What is the weather in Paris?')}>Ask</button>
+    </div>
+  );
+}
+```
+
+## Rendering tool calls live
+
+For a "tool is being called" indicator before arguments finish, accumulate `tool-input-delta` fragments by `toolCallId`, then replace with the final `input` when the `tool-call` arrives and mark it done when the matching `tool-result` lands.
+
+```ts title="accumulate.ts"
+import { readDeuzStream } from '@deuz-sdk/core/ui';
+
+const pending = new Map<string, { name?: string; args: string }>();
+
+for await (const part of readDeuzStream(res)) {
+  switch (part.type) {
+    case 'tool-input-delta': {
+      const entry = pending.get(part.toolCallId) ?? { args: '' };
+      if (part.toolName) entry.name = part.toolName;
+      entry.args += part.delta;
+      pending.set(part.toolCallId, entry); // render entry.args as live JSON
+      break;
+    }
+    case 'tool-call':
+      // arguments complete and parsed — render part.input
+      break;
+    case 'tool-result':
+      pending.delete(part.toolCallId); // render part.output (part.isError flags failures)
+      break;
+    default:
+      break;
+  }
+}
+```
+
+## Related
+
+- [streamChat](/docs/core/stream-chat) — the source `StreamChatResult` and its canonical `fullStream`.
+- [Messages & Parts](/docs/core/messages) — the canonical message shape you send.
+- [Tool Loop](/docs/agents/tool-loop) — how `tool-call` / `tool-result` parts are produced.

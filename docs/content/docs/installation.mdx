@@ -1,0 +1,163 @@
+---
+title: Installation
+description: Install @deuz-sdk/core, check runtime requirements, and pick the optional peers and subpath exports you need.
+---
+
+`@deuz-sdk/core` is a single package with **zero runtime dependencies**. Install it, and the chat core, the agentic tool loop, streaming, and the canonical UI wire are all available out of the box. Heavier or stateful capabilities (schema-typed objects, MCP, document parsing) pull in optional peers only when you actually use them.
+
+## Install
+
+```bash title="npm"
+npm install @deuz-sdk/core
+```
+
+```bash title="pnpm"
+pnpm add @deuz-sdk/core
+```
+
+```bash title="yarn"
+yarn add @deuz-sdk/core
+```
+
+```bash title="bun"
+bun add @deuz-sdk/core
+```
+
+## Requirements
+
+The core is **pure and web-first**: it touches only Web APIs (`fetch`, Web Streams, `TextDecoder`, WebCrypto, `atob`/`btoa`). Anything stateful or non-deterministic — HTTP, clock, logging, metering, circuit-breaker, API keys, id generation — is injected through a single `Dependencies` seam, with no-op/in-memory defaults applied for you. As a result the same build runs unchanged on any runtime that has `fetch` plus Web Streams.
+
+| Runtime | Supported | Notes |
+| --- | --- | --- |
+| Node.js | ✅ `>= 22.0.0` | Enforced via `engines`. Native `fetch` + Web Streams. |
+| Deno | ✅ | Web APIs available by default. |
+| Bun | ✅ | Web APIs available by default. |
+| Cloudflare Workers | ✅ | Import [`@deuz-sdk/core/edge`](#edge-safe-subset) for the guaranteed-safe subset. |
+| Vercel Edge | ✅ | Same — use the `/edge` entry. |
+| Browsers | ⚠️ | Works for the canonical wire, but never ship provider API keys to the client. Use the [UI wire](/docs/modules/ui-streaming) and a server route instead. |
+
+Node-only capabilities (filesystem skill sources, document parsers, the markdown memory vault, MCP stdio transport) live behind dedicated `…/node` subpaths and never leak `node:*` imports into the edge-safe core.
+
+## Zero runtime dependencies
+
+The package ships nothing in `dependencies`. The chat core, resilience, metering, the four provider wires, the agentic loop, and the UI wire all run on Web APIs alone. The only things you may need to add are **optional peers**, and only for the specific features that use them.
+
+## Optional peer dependencies
+
+Install a peer only when you reach for the feature in its row. Each is declared `optional` in `peerDependenciesMeta`, so package managers will not nag you for the ones you skip.
+
+| Peer | Install when you use | For |
+| --- | --- | --- |
+| `zod` (or any [Standard Schema](https://standardschema.dev) lib) + `@standard-community/standard-json` | `generateObject` with a typed schema | Converts your schema to JSON Schema and infers the object's TypeScript type. You can also pass a raw JSON Schema and skip both. |
+| `@modelcontextprotocol/sdk` | [`@deuz-sdk/core/mcp`](/docs/modules/mcp) / `@deuz-sdk/core/mcp/stdio` | MCP client — discover and call tools over HTTP/SSE or stdio. Loaded lazily. |
+| `unpdf` | [`@deuz-sdk/core/rag/node`](/docs/modules/rag) | PDF document parsing for RAG. |
+| `mammoth` | `@deuz-sdk/core/rag/node` | DOCX document parsing for RAG. |
+| `xlsx` | `@deuz-sdk/core/rag/node` | XLSX spreadsheet parsing for RAG. |
+
+```bash title="schema-typed generateObject"
+npm install zod @standard-community/standard-json
+```
+
+```bash title="MCP client"
+npm install @modelcontextprotocol/sdk
+```
+
+```bash title="rag/node document parsers"
+npm install unpdf mammoth xlsx
+```
+
+The `rag/node` parsers are independent — install only the formats you need. The RAG core (MIME sniffing, chunkers, retrieve/rerank, BM25, RRF) is edge-safe and needs no peers; only the Node document parsers do.
+
+## Subpath exports
+
+The root export carries the free functions, the client, errors, and all canonical types. Everything else is a focused subpath so bundlers tree-shake what you don't import.
+
+| Import | Purpose |
+| --- | --- |
+| `@deuz-sdk/core` | Free functions (`streamChat`, `generateText`, `generateObject`, `embed`, `embedMany`), `createClient`, error taxonomy, pricing, middleware, all types |
+| `@deuz-sdk/core/anthropic` | Anthropic Messages provider (`createAnthropic`) |
+| `@deuz-sdk/core/openai` | OpenAI Chat Completions + Responses (`createOpenAI`, `createOpenAIResponses`) + `openaiEmbedding` |
+| `@deuz-sdk/core/xai` | xAI Grok, OpenAI-compatible (`createXai`) |
+| `@deuz-sdk/core/google` | Gemini — compat (`createGoogle`) + native `generateContent` (`createGoogleNative`) + `googleEmbedding` |
+| `@deuz-sdk/core/google/extras` | Gemini explicit caching + Files API (`createGeminiCache`, `uploadFile`) |
+| `@deuz-sdk/core/voyage` | Voyage AI embeddings (`createVoyage`) |
+| `@deuz-sdk/core/vertex` | Vertex AI — Claude (`createVertexAnthropic`) + Gemini compat (`createVertexGoogle`) and native (`createVertexGoogleNative`) |
+| `@deuz-sdk/core/pricing` | Optional USD cost table (2026) + `createPriceProvider` (token → $) |
+| `@deuz-sdk/core/middleware` | `wrapModel` + bundled `logging` / `simpleCache` / `redactPII` / `promptInjectionGuard` |
+| `@deuz-sdk/core/image` | Synchronous OpenAI-compatible image generation (`generateImage`) |
+| `@deuz-sdk/core/midjourney` | Async Midjourney (`imagine` — submit / poll / action / webhook) |
+| `@deuz-sdk/core/yunwu` | Yunwu unified relay — `createYunwu` + 2026 `YUNWU_MODELS` catalog |
+| `@deuz-sdk/core/memory` | Pure memory layer — extract / reconcile / recall + store seam |
+| `@deuz-sdk/core/memory/markdown` | Obsidian-style markdown `MemoryStore` (Node; hybrid `.md` + vector sidecar) |
+| `@deuz-sdk/core/rag` | RAG primitives — MIME sniff, chunkers, retrieve/rerank, BM25, RRF (edge-safe) |
+| `@deuz-sdk/core/rag/node` | Node document parsers — unpdf / mammoth / xlsx |
+| `@deuz-sdk/core/skills` | Agent Skills — SKILL.md parser, progressive-disclosure registry, matcher seam |
+| `@deuz-sdk/core/skills/node` | Node filesystem `SkillSource` (`nodeSkillSource`) |
+| `@deuz-sdk/core/mcp` | MCP client over HTTP/SSE (edge-safe) (`createMcpClient`) |
+| `@deuz-sdk/core/mcp/stdio` | MCP client over stdio (Node-only) (`createStdioMcpClient`) |
+| `@deuz-sdk/core/ui` | `toDeuzStreamResponse` (server) + `readDeuzStream` (client) — our own UI wire |
+| `@deuz-sdk/core/edge` | Guaranteed edge-safe subset (re-exports the Web-API-only surface) |
+| `@deuz-sdk/core/react` | React hooks (planned) |
+
+## Verify it works
+
+API keys are read from the environment **at your app layer** and passed into the provider factory — the SDK core never reads `process.env` itself.
+
+```ts title="verify.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+// streamChat returns synchronously; the request starts lazily on first access.
+const res = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Say hello in one word.' }],
+});
+
+for await (const chunk of res.textStream) process.stdout.write(chunk);
+
+const usage = await res.usage; // resolves when the stream finishes
+console.log(`\n${usage.inputTokens} in / ${usage.outputTokens} out`);
+```
+
+`res.textStream` is an `AsyncIterable<string>` and `res.usage` is a `Promise<Usage>` — both are explained in [streamChat](/docs/core/stream-chat).
+
+## Edge-safe subset
+
+When you target Cloudflare Workers or Vercel Edge and want a build that is provably free of any Node API, import from the `/edge` entry. It re-exports the same `streamChat` / `generateText` / `generateObject`, the client, the base errors, and all types.
+
+```ts title="app/api/chat/route.ts (Edge runtime)"
+import { streamChat } from '@deuz-sdk/core/edge';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+
+export const runtime = 'edge';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+  const res = streamChat({ model: anthropic('claude-opus-4-8'), messages });
+  return toDeuzStreamResponse(res); // versioned Deuz UI wire
+}
+```
+
+## ESM and CJS
+
+Every subpath ships both an **ESM** (`import`) and a **CommonJS** (`require`) build with matching `.d.ts` / `.d.cts` declarations, so the package resolves correctly under `"moduleResolution": "Bundler"`, `"Node16"`, or `"NodeNext"`. It is authored against TypeScript strict mode (including `noUncheckedIndexedAccess`), so the public types are strict-ready in your project with no extra configuration.
+
+```ts title="ESM (recommended)"
+import { generateText } from '@deuz-sdk/core';
+```
+
+```js title="CommonJS"
+const { generateText } = require('@deuz-sdk/core');
+```
+
+## Next steps
+
+- [streamChat](/docs/core/stream-chat) — the synchronous, never-throws streaming entry point.
+- [generateText](/docs/core/generate-text) — buffered text plus the agentic tool loop.
+- [generateObject](/docs/core/generate-object) — schema-typed structured output.
+- [Providers](/docs/providers/anthropic) — Anthropic, OpenAI, xAI, Gemini, Vertex, Yunwu, Voyage.

@@ -5,7 +5,7 @@
  * context until a skill is triggered, then its body (Level 2) and bundled
  * resources (Level 3) load on demand. The ONLY IO touchpoint is the
  * `SkillSource` seam — the edge default reads over the injected `fetch`; the
- * Node filesystem loader lives in `@deuz/core/skills/node`, so core stays
+ * Node filesystem loader lives in `@deuz-sdk/core/skills/node`, so core stays
  * edge-safe and zero-dependency. Triggering stays model-driven; the
  * `SkillMatcher` seam only prunes a large catalog, it is not a hidden router.
  */

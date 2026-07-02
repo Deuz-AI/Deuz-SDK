@@ -1,6 +1,6 @@
 /**
  * google-extras.ts — Gemini explicit context caching + the Files API
- * (`@deuz/core/google/extras`). The native `generateContent` adapter already
+ * (`@deuz-sdk/core/google/extras`). The native `generateContent` adapter already
  * *passes through* an opaque `cachedContent` name and `fileData.fileUri`; this
  * module is what *produces* them:
  *

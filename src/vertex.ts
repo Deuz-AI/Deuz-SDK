@@ -5,8 +5,8 @@ import { attachConfig } from './internal/config-symbol';
  * Google Vertex AI transports. Vertex hosts BOTH Anthropic Claude and Gemini,
  * but authenticates with a short-lived OAuth2 access token (not an API key) and
  * uses regional endpoints. So the same app can route Gemini through AI Studio
- * (`@deuz/core/google`) OR Vertex (`createVertexGoogle`), and Claude through the
- * direct Anthropic API (`@deuz/core/anthropic`) OR Vertex (`createVertexAnthropic`).
+ * (`@deuz-sdk/core/google`) OR Vertex (`createVertexGoogle`), and Claude through the
+ * direct Anthropic API (`@deuz-sdk/core/anthropic`) OR Vertex (`createVertexAnthropic`).
  *
  * Prefer a `deps.keyProvider` that refreshes the token (it expires ~hourly);
  * `accessToken` here is a convenience for a single short-lived call.

@@ -2,7 +2,7 @@ import type { Usage, FinishReason } from './usage';
 
 /**
  * The single injection seam. Everything stateful / side-effecting is injected
- * here so `@deuz/core` stays pure (no Supabase/credit/env coupling) and
+ * here so `@deuz-sdk/core` stays pure (no Supabase/credit/env coupling) and
  * deterministically testable. All fields have no-op / in-memory defaults.
  */
 export interface Dependencies {

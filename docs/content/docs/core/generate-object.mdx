@@ -1,0 +1,210 @@
+---
+title: generateObject
+description: Generate a typed, schema-validated object from a model using a zod/Standard Schema or raw JSON Schema.
+---
+
+`generateObject` coerces a model into returning a single structured object that satisfies a schema. Pass a zod schema, any [Standard Schema](https://standardschema.dev) instance, or a raw JSON Schema object; you get back a parsed, typed value plus usage. Use it when you need machine-readable output (extraction, classification, form filling) rather than free text — for prose, use [generateText](/docs/core/generate-text) or [streamChat](/docs/core/stream-chat).
+
+It is a thin orchestration over the canonical stream: it runs the request, collects the JSON payload (from native json mode or a forced tool call), parses it, validates it, and retries once on failure.
+
+## Signature
+
+```ts
+import { generateObject } from '@deuz-sdk/core';
+
+const result = await generateObject<T>(options);
+// result: { object: T; usage: Usage; finishReason: FinishReason }
+```
+
+`generateObject` is `async` and returns a `Promise<GenerateObjectResult<T>>`. The type parameter `T` is inferred from a Standard Schema's output type, or you can supply it explicitly when passing a raw JSON Schema.
+
+## Options
+
+`GenerateObjectOptions<T>` extends `CommonCallOptions` (same `model`, `messages`, `signal`, `temperature`, `maxOutputTokens`, `effort`, `headers`, `deps`, etc. as the rest of the core surface), and adds:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `schema` | `StandardSchemaV1<unknown, T>` \| `JSONSchema` | — | Required. A zod/Standard Schema instance, or a raw JSON Schema object. |
+| `schemaName` | `string` | — | Name sent to the provider (tool name in tool mode, schema name in json mode). |
+| `schemaDescription` | `string` | — | Human description of the schema, passed to the provider. |
+| `mode` | `'auto'` \| `'json'` \| `'tool'` | `'auto'` | Strategy override. `'auto'` picks json vs tool from model capabilities. |
+
+The two top-level fields of the result you will use most:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `object` | `T` | The parsed, validated object. |
+| `usage` | `Usage` | Token usage for the call. |
+| `finishReason` | `FinishReason` | Why the model stopped. |
+
+## Schema input
+
+There are three accepted shapes, resolved by `toJSONSchema` / `validateOutput` in `src/schema/bridge.ts`:
+
+- **Raw JSON Schema** — the first-class, zero-dependency path. A plain object is sent to the provider as-is. There is no built-in JSON Schema validator, so the parsed model output is accepted without an extra validation pass.
+- **zod** — `zod` v3.23+/v4 implements Standard Schema natively, so a zod schema works directly. Validation uses zod's own `~standard.validate`.
+- **Any Standard Schema** (valibot, arktype, …) — validated natively via the spec's `~standard.validate`.
+
+Converting a Standard Schema to the JSON Schema that goes on the wire needs the optional peer `@standard-community/standard-json`. It is lazily imported only when you pass a Standard Schema. If it is not installed, `generateObject` throws an `InvalidRequestError` telling you to install it (or pass a raw JSON Schema instead). Raw JSON Schema never triggers this peer.
+
+```bash title="optional peer for zod / Standard Schema"
+npm install @standard-community/standard-json
+```
+
+## Strategy selection: json vs tool
+
+Two ways exist to force structured output: a provider's native json mode (json_schema / `output_config` / `responseSchema`) or a forced tool call whose arguments are the object. `generateObject` chooses per call:
+
+| `mode` | Behavior |
+| --- | --- |
+| `'auto'` (default) | `json` if the model's registry capabilities report `structuredOutput: true`, else `tool`. |
+| `'json'` | Always native json mode. |
+| `'tool'` | Always a forced tool call, args parsed as the object. |
+
+In tool mode, the payload is collected from the **first** tool call's accumulated argument fragments; in json mode it is the streamed text. Both are then `JSON.parse`d.
+
+### Special case: Anthropic + extended thinking (the G3 rule)
+
+Anthropic rejects a forced `tool_choice` while extended thinking is enabled (HTTP 400). So when the model is Anthropic, reasoning is supported, and `effort` is set to anything other than `'none'`, `generateObject` overrides a would-be `tool` strategy to `json` automatically. You do not need to set `mode` yourself for this case.
+
+## Repair retry and failure
+
+`generateObject` makes at most **two attempts**: the initial call plus one repair retry. An attempt fails (and retries) when the collected payload does not `JSON.parse`, or when Standard Schema validation reports issues. If both attempts fail, it throws `NoObjectGeneratedError`.
+
+`NoObjectGeneratedError` (exported from the package root) carries:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `code` | `'no_object_generated'` | Stable discriminant on the `DeuzError` base. |
+| `message` | `string` | `"generateObject could not produce a valid object after 2 attempts."` |
+| `text` | `string \| undefined` | The raw model output from the last failed attempt (model text, not a secret). |
+| `cause` | `unknown` | The last parse/validation error. |
+
+A hard transport error (an `error` part on the underlying stream) is thrown immediately and is not wrapped in `NoObjectGeneratedError`.
+
+## Gemini schema conversion
+
+Gemini's native `generateContent` wire (`createGoogleNative`) does not accept full JSON Schema. `src/schema/gemini.ts` (`toGeminiSchema`) converts the JSON Schema into Gemini's restricted OpenAPI-subset dialect before it goes on the wire. Things to know:
+
+- Types are uppercased: `object` → `OBJECT`, `string` → `STRING`, `integer` → `INTEGER`, etc.
+- Unsupported keys are silently stripped: `$ref`, `oneOf`, `anyOf`, `allOf`, `additionalProperties`.
+- A nullable union `['string', 'null']` becomes the non-null type plus `nullable: true`.
+- `propertyOrdering` is injected from the declared key order so output is deterministic.
+- Enum values keep their declared JSON type — integer enums are not coerced to strings.
+
+This conversion is automatic; you still pass an ordinary zod/JSON Schema and the native adapter applies it. The OpenAI-compatible Gemini surface (`createGoogle`, default) uses standard json_schema instead.
+
+## Examples
+
+### zod schema (typed result)
+
+```ts title="extract.ts"
+import { z } from 'zod';
+import { generateObject } from '@deuz-sdk/core';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+const Recipe = z.object({
+  name: z.string(),
+  ingredients: z.array(z.string()),
+  steps: z.array(z.string()),
+  servings: z.number().int(),
+});
+
+const { object, usage } = await generateObject({
+  model: openai('gpt-5.5'),
+  schema: Recipe,
+  schemaName: 'recipe',
+  messages: [{ role: 'user', content: 'Give me a recipe for pancakes.' }],
+});
+
+// `object` is fully typed as the zod output:
+console.log(object.name, object.servings, object.ingredients.length);
+console.log(usage.outputTokens);
+```
+
+### Raw JSON Schema (no extra dependency)
+
+When you pass a raw JSON Schema, supply the type parameter yourself — the SDK cannot infer it.
+
+```ts title="json-schema.ts"
+import { generateObject } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import type { JSONSchema } from '@deuz-sdk/core';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const schema: JSONSchema = {
+  type: 'object',
+  properties: { city: { type: 'string' } },
+  required: ['city'],
+  additionalProperties: false,
+};
+
+type Location = { city: string };
+
+const { object } = await generateObject<Location>({
+  model: anthropic('claude-opus-4-8'),
+  schema,
+  messages: [{ role: 'user', content: 'What is the capital of France?' }],
+});
+
+console.log(object.city); // "Paris"
+```
+
+### Handling NoObjectGeneratedError
+
+```ts title="handle-error.ts"
+import { z } from 'zod';
+import { generateObject, NoObjectGeneratedError } from '@deuz-sdk/core';
+import { createGoogleNative } from '@deuz-sdk/core/google';
+
+const google = createGoogleNative({ apiKey: process.env.GOOGLE_API_KEY! });
+
+const Sentiment = z.object({
+  label: z.enum(['positive', 'neutral', 'negative']),
+  confidence: z.number().min(0).max(1),
+});
+
+try {
+  const { object } = await generateObject({
+    model: google('gemini-3-pro'),
+    schema: Sentiment,
+    messages: [{ role: 'user', content: 'Classify: "I love this!"' }],
+  });
+  console.log(object.label, object.confidence);
+} catch (err) {
+  if (err instanceof NoObjectGeneratedError) {
+    // The model never produced a valid object after the repair retry.
+    console.error('No valid object. Raw model text:', err.text);
+    console.error('Cause:', err.cause);
+  } else {
+    throw err; // transport / auth / rate-limit errors
+  }
+}
+```
+
+### Forcing a strategy
+
+```ts title="mode.ts"
+import { z } from 'zod';
+import { generateObject } from '@deuz-sdk/core';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+// Force tool-call coercion even when native json mode is available.
+const { object } = await generateObject({
+  model: openai('gpt-5.5'),
+  schema: z.object({ answer: z.string() }),
+  mode: 'tool',
+  messages: [{ role: 'user', content: 'Answer in one word: sky color?' }],
+});
+```
+
+## Notes
+
+- API keys are read from `process.env` at the application layer and passed into the provider factory. The SDK core never reads environment variables itself.
+- Reasoning controls (`effort`) and sampling params from `CommonCallOptions` apply here too. On Anthropic, setting `effort` other than `'none'` forces json mode (see the G3 rule above).
+- For streaming free-form text see [streamChat](/docs/core/stream-chat); for tool-using agentic loops see [generateText](/docs/core/generate-text).

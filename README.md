@@ -1,6 +1,6 @@
 <div align="center">
 
-# `@deuz/core`
+# `@deuz-sdk/core`
 
 ### Pure · Web-first · Multi-provider AI SDK for TypeScript
 
@@ -14,15 +14,17 @@ _One canonical wire. Zero runtime dependencies. Runs anywhere `fetch` runs._
 
 ---
 
-`@deuz/core` is a from-scratch, **independent** AI SDK built for the **Deuz** platform and shared with everyone. It depends on no other AI SDK and ships its own streaming + UI protocol. It is **pure**: no Supabase, no credit logic, no env reading. Everything stateful — HTTP, clock, logging, metering, circuit-breaker, API keys, memory, vector stores — is injected through a single `Dependencies` seam, so the exact same core runs unchanged on **Node, Deno, Bun, Vercel/Cloudflare Edge**.
+`@deuz-sdk/core` is a from-scratch, **independent** AI SDK built for the **Deuz** platform and shared with everyone. It depends on no other AI SDK and ships its own streaming + UI protocol. It is **pure**: no Supabase, no credit logic, no env reading. Everything stateful — HTTP, clock, logging, metering, circuit-breaker, API keys, memory, vector stores — is injected through a single `Dependencies` seam, so the exact same core runs unchanged on **Node, Deno, Bun, Vercel/Cloudflare Edge**.
 
-> **Status — Faz 4 (image generation).** Chat across all four wires + Vertex, the agentic tool loop, vision, MCP, the UI wire, native Gemini, embeddings, memory, RAG, skills, and image generation are all implemented and tested (**172 tests green**; `tsc` + `eslint` + `publint --strict` + dual ESM/CJS/d.ts build all clean). The remaining work is app-side wiring and the publish phase (see [Roadmap](#roadmap)).
+> **Status — published (v1.1.1).** [`@deuz-sdk/core`](https://www.npmjs.com/package/@deuz-sdk/core) is live on npm. Chat across all four wires + Vertex, the agentic tool loop, vision, MCP, the UI wire, native Gemini, embeddings, memory, RAG, skills, image generation, middleware, pricing, hybrid RAG search, and Gemini explicit caching are all implemented and tested (**238 tests green**; `tsc` + `eslint` + `publint --strict` + `attw` + dual ESM/CJS/d.ts build all clean). v1.1.1 refreshes the model catalog to the 2026-07 state — **Claude 5 (Fable 5 / Sonnet 5)** with the new `output_config.effort` thinking wire, GPT-5.4/5.5 pricing corrections, the Gemini 3.1 line, `gemini-embedding-2`, and long-context pricing tiers. See the [Roadmap](#roadmap) for what's next.
 
 ```bash
-npm install @deuz/core
+npm install @deuz-sdk/core
 ```
 
-Requires **Node ≥ 22**. **Zero runtime dependencies.** Optional peers, pulled in only if you use them: `zod` (or any Standard Schema lib) + `@standard-community/standard-json` for schema-typed `generateObject`; `@modelcontextprotocol/sdk` for MCP; `unpdf` / `mammoth` / `xlsx` for `@deuz/core/rag/node` document parsing.
+Requires **Node ≥ 22**. **Zero runtime dependencies.** Optional peers, pulled in only if you use them: `zod` (or any Standard Schema lib) + `@standard-community/standard-json` for schema-typed `generateObject`; `@modelcontextprotocol/sdk` for MCP; `unpdf` / `mammoth` / `xlsx` for `@deuz-sdk/core/rag/node` document parsing.
+
+📚 **Documentation** — the full docs site lives in [`docs/`](./docs) (Fumadocs; 32 pages covering every module, with `llms.txt` / `llms-full.txt` for AI agents). 🤖 **Claude Code skill** — [`skills/deuz-sdk/`](./skills/deuz-sdk) teaches AI coding agents to integrate the SDK correctly.
 
 ---
 
@@ -41,8 +43,8 @@ Requires **Node ≥ 22**. **Zero runtime dependencies.** Optional peers, pulled 
 ## Quickstart
 
 ```ts
-import { streamChat, generateText, generateObject } from '@deuz/core';
-import { createAnthropic } from '@deuz/core/anthropic';
+import { streamChat, generateText, generateObject } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
 
 // API keys are injected — core never reads process.env.
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -94,8 +96,8 @@ Parallel execution, self-healing on tool errors, immutable history (cache-safe),
 ### Embeddings
 
 ```ts
-import { embedMany } from '@deuz/core';
-import { openaiEmbedding } from '@deuz/core/openai';
+import { embedMany } from '@deuz-sdk/core';
+import { openaiEmbedding } from '@deuz-sdk/core/openai';
 
 const { embeddings, usage } = await embedMany({
   model: openaiEmbedding('text-embedding-3-small'),
@@ -107,8 +109,8 @@ const { embeddings, usage } = await embedMany({
 ### Native Gemini — AI Studio **or** Vertex
 
 ```ts
-import { createGoogleNative } from '@deuz/core/google';        // AI Studio (API key)
-import { createVertexGoogleNative } from '@deuz/core/vertex';  // Vertex AI (OAuth2)
+import { createGoogleNative } from '@deuz-sdk/core/google';        // AI Studio (API key)
+import { createVertexGoogleNative } from '@deuz-sdk/core/vertex';  // Vertex AI (OAuth2)
 
 // AI Studio
 streamChat({
@@ -127,13 +129,13 @@ streamChat({
 });
 ```
 
-### Gemini explicit caching + Files API (`@deuz/core/google/extras`)
+### Gemini explicit caching + Files API (`@deuz-sdk/core/google/extras`)
 
 Cache a large shared prefix (system prompt, manual, transcript) once, then reuse
 it across calls at the cheap **cached-read** rate. Works on AI Studio and Vertex.
 
 ```ts
-import { createGeminiCache, uploadFile } from '@deuz/core/google/extras';
+import { createGeminiCache, uploadFile } from '@deuz-sdk/core/google/extras';
 
 // 1) Cache a big prefix → reuse its name on generate calls
 const cache = await createGeminiCache({
@@ -156,8 +158,8 @@ const file = await uploadFile({ apiKey, bytes, mimeType: 'application/pdf' });
 ### Memory (mem0 pipeline + Obsidian-markdown store)
 
 ```ts
-import { remember, recall } from '@deuz/core/memory';
-import { createMarkdownMemoryStore } from '@deuz/core/memory/markdown'; // Node, hybrid
+import { remember, recall } from '@deuz-sdk/core/memory';
+import { createMarkdownMemoryStore } from '@deuz-sdk/core/memory/markdown'; // Node, hybrid
 
 const store = createMarkdownMemoryStore({ dir: './memory-vault' });
 // extract → reconcile (ADD/UPDATE/DELETE) → store, then semantic recall
@@ -170,8 +172,8 @@ const hits = await recall({ scope: { userId: 'u1' }, text: 'diet' }, seams);
 ### RAG
 
 ```ts
-import { parse, chunkRecursive, retrieve } from '@deuz/core/rag';
-import { defaultNodeParserRegistry } from '@deuz/core/rag/node'; // unpdf / mammoth / xlsx
+import { parse, chunkRecursive, retrieve } from '@deuz-sdk/core/rag';
+import { defaultNodeParserRegistry } from '@deuz-sdk/core/rag/node'; // unpdf / mammoth / xlsx
 
 const doc = await parse(bytes, defaultNodeParserRegistry(), { hint: { filename: 'report.pdf' } });
 const chunks = chunkRecursive(doc.text, { size: 512, overlap: 64 });
@@ -182,7 +184,7 @@ Fusion. Embeddings catch paraphrase; BM25 catches exact terms / IDs / rare token
 (`clause 17`, a SKU) the vector model blurs:
 
 ```ts
-import { createBm25Index, hybridRetrieve, createMemoryVectorStore, indexChunks } from '@deuz/core/rag';
+import { createBm25Index, hybridRetrieve, createMemoryVectorStore, indexChunks } from '@deuz-sdk/core/rag';
 
 await indexChunks(chunks, { embedder, store });   // dense
 const bm25 = createBm25Index(chunks);             // lexical (build once)
@@ -194,8 +196,8 @@ const hits = await hybridRetrieve('warm animal and GDPR clause 17', { embedder, 
 ### Skills (SKILL.md + progressive disclosure)
 
 ```ts
-import { createSkillRegistry, renderSkillCatalog } from '@deuz/core/skills';
-import { nodeSkillSource } from '@deuz/core/skills/node';
+import { createSkillRegistry, renderSkillCatalog } from '@deuz-sdk/core/skills';
+import { nodeSkillSource } from '@deuz-sdk/core/skills/node';
 
 const skills = createSkillRegistry({ source: nodeSkillSource(['.claude/skills']) });
 const block = renderSkillCatalog(await skills.catalog());   // Level 1 → system prompt
@@ -205,9 +207,9 @@ const manifest = await skills.trigger('pdf-filler');         // Level 2 → body
 ### Image generation
 
 ```ts
-import { generateImage } from '@deuz/core/image';        // sync (DALL·E / Flux / GPT-Image / SD)
-import { imagine } from '@deuz/core/midjourney';         // async (submit → poll → action)
-import { createYunwu, YUNWU_MODELS } from '@deuz/core/yunwu';
+import { generateImage } from '@deuz-sdk/core/image';        // sync (DALL·E / Flux / GPT-Image / SD)
+import { imagine } from '@deuz-sdk/core/midjourney';         // async (submit → poll → action)
+import { createYunwu, YUNWU_MODELS } from '@deuz-sdk/core/yunwu';
 
 // One base URL drives every surface — chat/image/embed at /v1, Midjourney at the root.
 const yunwu = createYunwu({ apiKey: process.env.YUNWU_KEY }); // or baseURL: 'https://mirror/v1'
@@ -217,18 +219,18 @@ const task = await imagine({ ...yunwu.mj(), prompt: 'a robot mascot --ar 1:1' })
 YUNWU_MODELS.chat;  // 2026 catalog: gpt-5.2, claude-opus-4-5, gemini-3-pro-preview, grok-4.1, …
 ```
 
-### UI streaming (`@deuz/core/ui`)
+### UI streaming (`@deuz-sdk/core/ui`)
 
 ```ts
 // server route
-import { toDeuzStreamResponse } from '@deuz/core/ui';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
 export async function POST(req: Request) {
   const { messages } = await req.json();
   return toDeuzStreamResponse(streamChat({ model: anthropic('claude-opus-4-8'), messages, tools }));
 }
 
 // client
-import { readDeuzStream } from '@deuz/core/ui';
+import { readDeuzStream } from '@deuz-sdk/core/ui';
 for await (const part of readDeuzStream(await fetch('/api/chat', { method: 'POST', body }))) {
   // { type: 'text-delta' | 'tool-call' | 'tool-result' | 'step-finish' | 'finish' | … }
 }
@@ -240,28 +242,28 @@ for await (const part of readDeuzStream(await fetch('/api/chat', { method: 'POST
 
 | Import | Purpose |
 | --- | --- |
-| `@deuz/core` | Free functions (`streamChat`, `generateText`, `generateObject`, `embed`), `createClient`, types, errors |
-| `@deuz/core/anthropic` | Anthropic Messages provider |
-| `@deuz/core/openai` | OpenAI (Chat Completions + Responses) + `openaiEmbedding` |
-| `@deuz/core/xai` | xAI Grok (OpenAI-compatible) |
-| `@deuz/core/google` | Gemini — compat (`createGoogle`) + native `generateContent` (`createGoogleNative`) + `googleEmbedding` |
-| `@deuz/core/voyage` | Voyage AI embeddings |
-| `@deuz/core/vertex` | Vertex AI — Claude + Gemini (compat **and** native `createVertexGoogleNative`) |
-| `@deuz/core/pricing` | Optional USD cost table (2026) + `createPriceProvider` (token → $) |
-| `@deuz/core/middleware` | `wrapModel` + `logging` / `simpleCache` / `redactPII` / `promptInjectionGuard` |
-| `@deuz/core/memory` | Pure memory layer — extract / reconcile / recall + store seam |
-| `@deuz/core/memory/markdown` | Obsidian-style markdown `MemoryStore` (Node; hybrid `.md` + vector sidecar) |
-| `@deuz/core/rag` | RAG primitives — MIME sniff, chunkers, retrieve→rerank seam (edge-safe) |
-| `@deuz/core/rag/node` | Node document parsers — unpdf / mammoth / xlsx |
-| `@deuz/core/skills` | Agent Skills — SKILL.md parser, progressive-disclosure registry, matcher seam |
-| `@deuz/core/skills/node` | Node filesystem `SkillSource` |
-| `@deuz/core/image` | Synchronous OpenAI-compatible image generation |
-| `@deuz/core/midjourney` | Async Midjourney (submit / poll / action / `imagine` + webhook) |
-| `@deuz/core/yunwu` | Yunwu (云雾) unified relay — `createYunwu` + 2026 `YUNWU_MODELS` catalog |
-| `@deuz/core/mcp` · `…/mcp/stdio` | MCP client (HTTP/SSE edge-safe; stdio Node-only) |
-| `@deuz/core/edge` | Guaranteed edge-safe subset |
-| `@deuz/core/ui` | `toDeuzStreamResponse` (server) + `readDeuzStream` (client) — our own UI wire |
-| `@deuz/core/react` | React hooks (planned, Faz 6) |
+| `@deuz-sdk/core` | Free functions (`streamChat`, `generateText`, `generateObject`, `embed`), `createClient`, types, errors |
+| `@deuz-sdk/core/anthropic` | Anthropic Messages provider |
+| `@deuz-sdk/core/openai` | OpenAI (Chat Completions + Responses) + `openaiEmbedding` |
+| `@deuz-sdk/core/xai` | xAI Grok (OpenAI-compatible) |
+| `@deuz-sdk/core/google` | Gemini — compat (`createGoogle`) + native `generateContent` (`createGoogleNative`) + `googleEmbedding` |
+| `@deuz-sdk/core/voyage` | Voyage AI embeddings |
+| `@deuz-sdk/core/vertex` | Vertex AI — Claude + Gemini (compat **and** native `createVertexGoogleNative`) |
+| `@deuz-sdk/core/pricing` | Optional USD cost table (2026) + `createPriceProvider` (token → $) |
+| `@deuz-sdk/core/middleware` | `wrapModel` + `logging` / `simpleCache` / `redactPII` / `promptInjectionGuard` |
+| `@deuz-sdk/core/memory` | Pure memory layer — extract / reconcile / recall + store seam |
+| `@deuz-sdk/core/memory/markdown` | Obsidian-style markdown `MemoryStore` (Node; hybrid `.md` + vector sidecar) |
+| `@deuz-sdk/core/rag` | RAG primitives — MIME sniff, chunkers, retrieve→rerank seam (edge-safe) |
+| `@deuz-sdk/core/rag/node` | Node document parsers — unpdf / mammoth / xlsx |
+| `@deuz-sdk/core/skills` | Agent Skills — SKILL.md parser, progressive-disclosure registry, matcher seam |
+| `@deuz-sdk/core/skills/node` | Node filesystem `SkillSource` |
+| `@deuz-sdk/core/image` | Synchronous OpenAI-compatible image generation |
+| `@deuz-sdk/core/midjourney` | Async Midjourney (submit / poll / action / `imagine` + webhook) |
+| `@deuz-sdk/core/yunwu` | Yunwu (云雾) unified relay — `createYunwu` + 2026 `YUNWU_MODELS` catalog |
+| `@deuz-sdk/core/mcp` · `…/mcp/stdio` | MCP client (HTTP/SSE edge-safe; stdio Node-only) |
+| `@deuz-sdk/core/edge` | Guaranteed edge-safe subset |
+| `@deuz-sdk/core/ui` | `toDeuzStreamResponse` (server) + `readDeuzStream` (client) — our own UI wire |
+| `@deuz-sdk/core/react` | React hooks (planned, Faz 6) |
 
 ---
 
@@ -289,17 +291,18 @@ Response: upstream SSE  →  robust parser  →  CANONICAL DELTA STREAM
 | **Faz 3** | Skills + memory + RAG + native Gemini + embeddings | ✅ |
 | **Faz 4** | Image generation (sync + Midjourney + Yunwu) | ✅ SDK side · ⏳ app-side `tasks` table |
 | **Faz 5** | Aggregator fallback, DeepSeek/Kimi, Batch API, rate-limiter impl | ⬜ optional |
-| **Faz 6** | `1.0.0` publish, `@deuz/react` hooks, docs, CI provenance | ⬜ |
+| **Faz 6** | `@deuz-sdk/core/react` hooks, CI provenance | 🔶 `1.1.1` on npm · docs ✅ · hooks ⏳ |
 
-**Deliberately deferred** (seam exists, impl later): `streamObject`, pre-flight token counting (`tokens.ts`), budgeter, pricing seam, `wrapModel` middleware, full token-bucket rate limiter, OpenTelemetry / PII / prompt-injection seams, memory consolidation/decay + graph memory, RAG hybrid search (BM25+RRF) + cross-encoder rerank, Gemini explicit caching + Files API, native Vertex Gemini, video generation helper.
+**Deliberately deferred** (seam exists, impl later): `streamObject`, pre-flight token counting (`tokens.ts`), budgeter, full token-bucket rate limiter, OpenTelemetry exporter, memory consolidation/decay + graph memory, cross-encoder rerank implementation (seam is in), video generation helper, React hooks (`@deuz-sdk/core/react`, Faz 6).
 
 ---
 
 ## Quality bar
 
-- **172 tests** (vitest + MSW golden-replay fixtures + deterministic mock models)
+- **238 tests** (vitest golden-replay fixtures + deterministic mock models — no real network)
 - `tsc` strict · `eslint` (edge-safety enforced) · `publint --strict` · `attw` · dual **ESM + CJS + .d.ts** build — all green
-- ~10k lines across 55 source modules, zero runtime dependencies
+- Type-contract lock: `test/surface.test-d.ts` pins the public 1.0 surface
+- ~10k lines across 70 source modules, zero runtime dependencies
 
 ---
 

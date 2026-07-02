@@ -16,3 +16,9 @@ deuz-ai-*.json
 *-service-account*.json
 gcp-*.json
 scripts/
+
+.doccheck/
+.firecrawl/
+
+# Local planning/spec artifacts — never publish
+docs/superpowers/

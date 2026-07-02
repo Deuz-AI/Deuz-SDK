@@ -1,0 +1,20 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "installation",
+    "quickstart",
+    "---Core---",
+    "core",
+    "---Providers---",
+    "providers",
+    "---Agents---",
+    "agents",
+    "---Modules---",
+    "modules",
+    "---Advanced---",
+    "advanced",
+    "---Migration---",
+    "migration"
+  ]
+}

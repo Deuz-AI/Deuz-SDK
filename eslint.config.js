@@ -23,7 +23,7 @@ const FORBIDDEN_NODE = [
 ];
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'examples/**'] },
+  { ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'examples/**', 'docs/**', 'skills/**'] },
   ...tseslint.configs.recommended,
   {
     // Allow underscore-prefixed unused params/vars (stub seams in Faz 0).

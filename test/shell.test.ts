@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { createClient, streamChat, generateText, DeuzError } from '../src/index';
 import { anthropic, createAnthropic } from '../src/anthropic';
 
-describe('@deuz/core shell (Faz 0)', () => {
+describe('@deuz-sdk/core shell (Faz 0)', () => {
   it('provider factory returns a LanguageModel descriptor', () => {
     const model = anthropic('claude-opus-4-8');
     expect(model).toEqual({

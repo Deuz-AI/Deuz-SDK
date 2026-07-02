@@ -1,0 +1,162 @@
+---
+title: Edge & Runtimes
+description: Why the core is Web-APIs-only, the guaranteed-safe /edge subpath, the Node-only subpaths, and per-runtime notes for Workers, Vercel Edge, Deno, and Bun.
+---
+
+`@deuz-sdk/core` runs on Web APIs only. There are no `node:*` imports, no `Buffer`, no `process`, and no ambient time or randomness in the core — so the same build ships to Node, Cloudflare Workers, Vercel Edge, Deno, Bun, and the browser. Use the `/edge` subpath when you want a compile-time guarantee that nothing Node-only sneaks into your edge bundle.
+
+## What "edge-safe" means here
+
+The core touches only APIs that exist in every modern JS runtime: `fetch`, Web Streams (`ReadableStream`/`TransformStream`), `TextEncoder`/`TextDecoder`, `WebCrypto`, and `atob`/`btoa`. Anything stateful or non-deterministic is injected through the single [`Dependencies`](/docs/core/dependencies) seam instead of being read from the ambient environment — including the HTTP transport (`fetch`), the clock, id generation, logging, tracing, and key resolution.
+
+The following are banned in the core by lint, and the build fails if they appear:
+
+| Banned | Use instead |
+| --- | --- |
+| `node:*` imports (`node:fs`, `node:crypto`, …) | Web APIs, or move the code to a `…/node` subpath |
+| `Buffer` | `Uint8Array` / `TextEncoder` |
+| `process` (incl. `process.env`) | inject config; read env at the app layer |
+| `__dirname` / `__filename` | not available at the edge |
+| `Date.now()` | `deps.clock.now()` |
+| `Math.random()` | inject randomness via `Dependencies` |
+| `crypto.randomUUID()` / `crypto.getRandomValues()` | `deps.generateId()` |
+| `console.*` | `deps.logger` |
+
+Because the core reads no environment variables, you read your API key at the app layer and pass it into the provider factory. The factory never calls `process.env` itself.
+
+```ts
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+// App layer reads env (or a Workers/Deno binding) and passes it in.
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+```
+
+## The `/edge` subpath
+
+`@deuz-sdk/core/edge` re-exports the guaranteed Web-APIs-only subset. Its mere existence is the build's edge smoke test — if anything Node-only leaked into the dependency graph of these exports, the build would not produce a clean `/edge` bundle.
+
+It exports exactly:
+
+| Export | Kind |
+| --- | --- |
+| `streamChat`, `generateText`, `generateObject` | functions |
+| `createClient`, `resolveDependencies` | functions |
+| `DeuzClient` | type |
+| `DeuzError`, `NotImplementedError` | error classes |
+| everything from the canonical types (`Message`, `Part`, `Usage`, `StreamPart`, `LanguageModel`, `CommonCallOptions`, …) | `export type *` |
+
+```ts title="edge bundle (guaranteed safe)"
+import { streamChat } from '@deuz-sdk/core/edge';
+import type { StreamPart, Message } from '@deuz-sdk/core/edge';
+```
+
+What `/edge` deliberately does **not** re-export: the provider factories (`createAnthropic`, …), `embed`/`embedMany`, the full error subclass hierarchy (`RateLimitError`, `TimeoutError`, …), `pricing`, and `middleware`. Those are not Node-only — they are just kept off the minimal `/edge` surface. The provider factories are themselves edge-safe, so import them from their own subpath alongside `/edge`:
+
+```ts
+import { streamChat } from '@deuz-sdk/core/edge';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+```
+
+The root entry (`@deuz-sdk/core`) is also edge-safe and exports a larger surface (the error hierarchy, pricing, middleware, `embed`). The difference is contractual, not technical: `/edge` is the narrow, locked promise. Use it when you want the bundler to fail loudly if a Node-only path is ever pulled in transitively.
+
+## Node-only subpaths
+
+A few feature surfaces genuinely need the filesystem, a child process, or a Node-only peer package. These live behind dedicated `…/node` subpaths that are exempt from the edge-safety lint and reach Node APIs through **lazy** `import()` so that importing the core never pulls them in. Do **not** import these from an edge runtime.
+
+| Subpath | Needs | Why it is Node-only |
+| --- | --- | --- |
+| `@deuz-sdk/core/rag/node` | lazy `unpdf` / `mammoth` / `xlsx` peers | PDF / DOCX / XLSX parsing (optional peer packages) |
+| `@deuz-sdk/core/skills/node` | lazy `node:fs/promises`, `node:path` | reads `SKILL.md` files from disk |
+| `@deuz-sdk/core/memory/markdown` | lazy `node:fs/promises`, `node:path` | Obsidian-style markdown vault on disk |
+| `@deuz-sdk/core/mcp/stdio` | lazy `@modelcontextprotocol/sdk` + child process | spawns a stdio MCP server |
+
+The edge-safe counterparts of these features stay on the Web-APIs-only path: `@deuz-sdk/core/rag` (text/markdown/CSV parsing in core), `@deuz-sdk/core/skills` (parse `SKILL.md` you already loaded), `@deuz-sdk/core/memory` (the cosine vector backend), and `@deuz-sdk/core/mcp` (HTTP/SSE transport). Use those at the edge and reserve the `…/node` subpaths for your Node server.
+
+## Per-runtime notes
+
+The core needs nothing injected to run anywhere that provides `fetch` and Web Streams — `streamChat({ model, messages })` works with zero `deps`. The notes below cover where you read the API key.
+
+| Runtime | Notes |
+| --- | --- |
+| **Cloudflare Workers** | `fetch`/Web Streams/WebCrypto are built in. There is no `process.env`; read the key from the `env` binding passed to your handler and pass it to the factory. Import from `/edge` for the bundle guarantee. |
+| **Vercel Edge** | Web APIs are available; `process.env` is populated at build/deploy time, so `process.env.ANTHROPIC_API_KEY!` works. Set `export const runtime = 'edge'` on the route. |
+| **Deno** | Native `fetch`/Web Streams. Read the key with `Deno.env.get('ANTHROPIC_API_KEY')` and pass it in. Import via `npm:@deuz-sdk/core` specifiers. |
+| **Bun** | `fetch`/Web Streams are built in and `process.env` works. The Node-only subpaths also work under Bun if you need them. |
+
+You normally do not need to inject `deps` at all. The injection seam exists for testing and for advanced needs (a custom `fetch`, a distributed `breakerStore`, a `keyProvider`, a `logger`). See [Dependencies](/docs/core/dependencies) for the full list.
+
+## Example: a Cloudflare Worker chat endpoint
+
+A streaming endpoint that reads the key from the Worker `env` binding and returns the canonical text stream as an SSE-friendly `Response`. `streamChat` returns synchronously and its body is a Web `ReadableStream`, so it maps straight onto the Workers `Response`.
+
+```ts title="worker.ts"
+import { streamChat } from '@deuz-sdk/core/edge';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+interface Env {
+  ANTHROPIC_API_KEY: string;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const { prompt } = (await request.json()) as { prompt: string };
+
+    const anthropic = createAnthropic({ apiKey: env.ANTHROPIC_API_KEY });
+
+    const result = streamChat({
+      model: anthropic('claude-opus-4-8'),
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    // Project the canonical text deltas into a Web ReadableStream.
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          for await (const chunk of result.textStream) {
+            controller.enqueue(encoder.encode(chunk));
+          }
+        } catch (err) {
+          controller.error(err);
+          return;
+        }
+        controller.close();
+      },
+    });
+
+    return new Response(body, {
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+    });
+  },
+};
+```
+
+### Returning the Deuz UI wire from the edge
+
+`toDeuzStreamResponse` (from `@deuz-sdk/core/ui`) is edge-safe and turns a `StreamChatResult` into the versioned Deuz-protocol SSE `Response` in one call — ideal for a Worker or Vercel Edge route feeding a Deuz UI client.
+
+```ts title="route.ts"
+import { streamChat } from '@deuz-sdk/core/edge';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+
+export async function POST(request: Request): Promise<Response> {
+  const { messages } = (await request.json()) as {
+    messages: { role: 'user' | 'assistant'; content: string }[];
+  };
+
+  const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+  const result = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    messages,
+  });
+
+  return toDeuzStreamResponse(result);
+}
+```
+
+## See also
+
+- [Dependencies & Clients](/docs/core/dependencies) — the single injection seam and `createClient`.
+- [streamChat](/docs/core/stream-chat) — the synchronous, never-throwing stream contract.

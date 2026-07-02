@@ -1,0 +1,243 @@
+---
+title: Defining Tools
+description: The Tool / ToolSet shape — parameters, execute, return values, errors, and Zod argument inference.
+---
+
+A **tool** is a function the model can call by name. You pass a `ToolSet` (a plain `Record<string, Tool>`) to [generateText](/docs/core/generate-text) or [streamChat](/docs/core/stream-chat); the presence of `tools` switches on the agentic loop. Each tool declares a `parameters` schema the model must satisfy and an optional `execute` you run server-side. Tools are defined inline — there is no `tool()` wrapper to import; you write the object literally.
+
+## The `Tool` shape
+
+```ts
+interface Tool<Args = unknown, Result = unknown> {
+  description?: string;
+  parameters: StandardSchemaV1<unknown, Args> | JSONSchema;
+  execute?: (args: Args, ctx: ToolExecuteContext) => Promise<Result> | Result;
+  needsApproval?:
+    | boolean
+    | ((args: Args, ctx: ToolExecuteContext) => boolean | Promise<boolean>);
+}
+
+type ToolSet = Record<string, Tool>;
+```
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `description` | `string` | no | What the tool does. The model uses this to decide when to call it — write it carefully. |
+| `parameters` | `StandardSchemaV1` or `JSONSchema` | yes | The argument schema. A Standard Schema (Zod, Valibot, …) or a raw JSON Schema. |
+| `execute` | `(args, ctx) => Result \| Promise<Result>` | no | Runs the tool server-side. Omit it for a **client tool** (see below). |
+| `needsApproval` | `boolean` or predicate | no | Reserved field — the approval round-trip is not wired yet, but the field is locked in the 1.0 surface. |
+
+The map **key** is the tool name the model calls — there is no `name` field on `Tool` itself.
+
+```ts
+const tools = {
+  getWeather: { description: 'Get weather', parameters: /* … */, execute: /* … */ },
+  search: { description: 'Search the web', parameters: /* … */, execute: /* … */ },
+};
+```
+
+## `parameters`: raw JSON Schema or Standard Schema
+
+`parameters` accepts either form. The SDK resolves whichever you give it to JSON Schema once (via `schema/bridge.ts`) before sending it on the wire, and — for Standard Schemas — validates the model's arguments against it before calling `execute`.
+
+### Raw JSON Schema (zero dependencies)
+
+The first-class, zero-dependency path. Type `args` yourself.
+
+```ts title="json-schema-tool.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'What is the weather in Paris?' }],
+  maxSteps: 5,
+  tools: {
+    getWeather: {
+      description: 'Get the current weather for a city.',
+      parameters: {
+        type: 'object',
+        properties: { city: { type: 'string' } },
+        required: ['city'],
+        additionalProperties: false,
+      },
+      execute: async (args: { city: string }) => ({ city: args.city, tempC: 22, sky: 'sunny' }),
+    },
+  },
+});
+
+console.log(text);
+```
+
+With a raw JSON Schema there is no zero-dep validator, so the SDK accepts the model's parsed arguments as-is and passes them straight to `execute` — annotate `args` yourself for type safety.
+
+### Standard Schema (Zod) with inferred args
+
+Pass any Standard Schema instance (Zod, Valibot, ArkType, …). The schema's output type flows into `execute`, so `args` is fully typed with no annotation:
+
+```ts title="zod-tool.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Weather in Paris in Celsius?' }],
+  maxSteps: 5,
+  tools: {
+    getWeather: {
+      description: 'Get the current weather for a city.',
+      parameters: z.object({
+        city: z.string().describe('City name, e.g. "Paris"'),
+        unit: z.enum(['c', 'f']).default('c'),
+      }),
+      // `args` is inferred as { city: string; unit: 'c' | 'f' } — no annotation.
+      execute: async (args) => ({ city: args.city, temp: 22, unit: args.unit }),
+    },
+  },
+});
+```
+
+With a Standard Schema the SDK validates the model's arguments before `execute` runs; on a validation failure it does **not** call `execute` — it feeds an `is_error` tool result back to the model so it can retry with corrected arguments.
+
+> **Optional peer.** Converting a Standard Schema to JSON Schema needs the optional peer `@standard-community/standard-json`. If it isn't installed, the call throws a clear, actionable `InvalidRequestError`. Install it, or pass a raw JSON Schema instead — core stays zero-runtime-dependency either way.
+
+## The `execute` context
+
+`execute` receives the validated `args` first, then a `ToolExecuteContext`:
+
+```ts
+interface ToolExecuteContext {
+  toolCallId: string;
+  /** Conversation-so-far (immutable snapshot) for context-aware tools. */
+  messages: Message[];
+  /** Propagated from the call — long-running tools should honor it. */
+  signal?: AbortSignal;
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `toolCallId` | `string` | The provider-assigned id for this specific call. Useful for logging/tracing. |
+| `messages` | `Message[]` | Immutable snapshot of the conversation so far — read it for context, do not mutate it. |
+| `signal` | `AbortSignal` (optional) | The call's `signal`, propagated through. Honor it in long-running tools. |
+
+### Honoring the abort signal
+
+The `signal` from the originating `generateText` / `streamChat` call is forwarded to every `execute`. Forward it into your own `fetch` (or any abortable I/O) so a cancelled request tears the tool down too:
+
+```ts title="abortable-tool.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const controller = new AbortController();
+
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Search for recent SDK news.' }],
+  maxSteps: 5,
+  signal: controller.signal,
+  tools: {
+    search: {
+      description: 'Search the web.',
+      parameters: z.object({ query: z.string() }),
+      execute: async ({ query }, { signal }) => {
+        // Forward the signal so an upstream abort cancels this fetch too.
+        const res = await fetch(`https://example.com/search?q=${encodeURIComponent(query)}`, {
+          signal,
+        });
+        return res.json();
+      },
+    },
+  },
+});
+```
+
+## Return values
+
+`execute` may return anything **JSON-serializable** (or a `Promise` of it). The return value becomes the `result` on a `tool_result` part and is sent back to the model verbatim, so prefer compact, structured objects over prose.
+
+```ts
+execute: async ({ city }) => ({ city, tempC: 22, sky: 'sunny' }), // becomes the tool_result
+```
+
+The result is wrapped into a canonical `tool_result` part keyed by the call's id, which the next model turn reads:
+
+```ts
+interface ToolResultPart {
+  type: 'tool_result';
+  toolUseId: string;
+  result: unknown;
+  isError?: boolean;
+}
+```
+
+## Thrown errors self-heal
+
+A tool that throws is **never** surfaced as a rejected promise. The loop catches the throw, wraps it as an `is_error` `tool_result`, and feeds it back to the model so it can recover or apologize. Two cases produce an error result automatically:
+
+- **`execute` throws** — the loop catches it (via `ToolExecutionError`) and sends `isError: true` with the error message as the result.
+- **A Standard Schema rejects the model's arguments** — `execute` is skipped and an `Invalid arguments: …` error result is sent instead.
+
+```ts
+tools: {
+  getWeather: {
+    parameters: z.object({ city: z.string() }),
+    execute: async ({ city }) => {
+      if (city === 'Atlantis') throw new Error('Unknown city');
+      // the throw is caught and returned to the model as an is_error tool_result
+      return { city, tempC: 22 };
+    },
+  },
+}
+```
+
+To guard against a model looping on a broken tool, the same tool failing on **three consecutive steps** hard-stops the loop. Every `tool_use` always gets exactly one `tool_result` (a hard provider requirement). See [the tool loop](/docs/agents/tool-loop) for the full self-healing and runaway-guard rules.
+
+## Client tools (no `execute`)
+
+Omit `execute` and the tool becomes a **client tool**: the model can request it, but the loop has no way to run it server-side. When a step calls a client tool, the loop stops early and returns the call in `result.toolCalls` — your application owns the round-trip and appends the matching `tool_result` itself.
+
+```ts
+tools: {
+  // No `execute`: the model can request it, but you fulfill it client-side.
+  openMap: {
+    description: 'Open the map UI centered on a location.',
+    parameters: z.object({ lat: z.number(), lng: z.number() }),
+  },
+}
+```
+
+## Controlling tool use with `toolChoice`
+
+`toolChoice` steers whether and which tool the model calls. Each adapter maps it to its wire form:
+
+| Value | Behavior |
+| --- | --- |
+| `'auto'` | Model decides (default). |
+| `'required'` | Model must call some tool. |
+| `'none'` | Model must not call a tool. |
+| `{ type: 'tool', toolName: 'getWeather' }` | Force a specific tool. |
+
+```ts
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Weather in Paris?' }],
+  maxSteps: 5,
+  toolChoice: { type: 'tool', toolName: 'getWeather' },
+  tools: { getWeather: { parameters: z.object({ city: z.string() }), execute: async ({ city }) => ({ city }) } },
+});
+```
+
+## See also
+
+- [generateText](/docs/core/generate-text) — buffered runs and the result/step shapes.
+- [streamChat](/docs/core/stream-chat) — stream tool calls and results as they happen.
+- [Tool loop](/docs/agents/tool-loop) — the agentic loop's invariants: immutable history, parallel execution, runaway guards, and the Gemini stop-bug guard.
+- [generateObject](/docs/core/generate-object) — structured output, which reuses the same schema bridge.

@@ -1,0 +1,236 @@
+---
+title: Error Handling
+description: The typed DeuzError taxonomy, the never-throw streaming contract, retry semantics, and the secret-redaction guarantee.
+---
+
+Every failure in `@deuz-sdk/core` is a typed `DeuzError` — never a raw `Error`, a `Response`, or a leaked provider payload. Each wire adapter normalizes its provider's error envelope into the same set of classes, so your retry, routing, and fallback logic can branch on `err.code` or `instanceof` regardless of which provider produced the failure. All error classes are exported from the package root.
+
+```ts
+import { DeuzError, RateLimitError, AuthenticationError } from '@deuz-sdk/core';
+```
+
+## The taxonomy
+
+`DeuzError` is the abstract base. Every error carries a stable string `code`; HTTP-shaped errors additionally extend `APICallError` and carry `statusCode` plus an `isRetryable` verdict.
+
+### `APICallError` and its subclasses
+
+`APICallError` represents a non-2xx response from a provider (or an in-stream error envelope). Adapters map each wire's error type onto one of the subclasses below.
+
+| Class | `code` | Default status | `isRetryable` | Notes |
+| --- | --- | --- | --- | --- |
+| `APICallError` | `api_call_error` | (mapped) | `statusCode >= 500` | Base class; used directly for generic 5xx |
+| `RateLimitError` | `rate_limit` | 429 | `true` | Honors `Retry-After` |
+| `OverloadedError` | `overloaded` | 529 | `true` | Provider overloaded; retried pre-first-byte |
+| `AuthenticationError` | `authentication` | 401 | `false` | Also 403 (permission) |
+| `InvalidRequestError` | `invalid_request` | 400 | `false` | Malformed request (400/422/413) |
+| `ModelNotFoundError` | `model_not_found` | 404 | `false` | Unknown model/route |
+| `ContextOverflowError` | `context_overflow` | 400 | `false` | Context window exceeded |
+
+Every `APICallError` exposes the same fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `statusCode` | `number` | Upstream HTTP status |
+| `isRetryable` | `boolean` | Whether a retry could plausibly succeed |
+| `retryAfterMs` | `number \| undefined` | Parsed `Retry-After`, in milliseconds |
+| `provider` | `string \| undefined` | Provider id (`anthropic`, `openai`, `xai`, `google`) |
+| `requestId` | `string \| undefined` | Upstream request id, for support tickets |
+| `upstreamType` | `string \| undefined` | Provider's raw error type/code, normalized for logging |
+
+### Non-HTTP errors
+
+These extend `DeuzError` directly (no `statusCode`/`isRetryable`):
+
+| Class | `code` | Extra fields | When |
+| --- | --- | --- | --- |
+| `TimeoutError` | `timeout` | `layer: 'connect' \| 'ttft' \| 'total'` | A timeout layer fired. Always a failure |
+| `AbortError` | `aborted` | — | Caller-initiated cancellation. Never retried, never falls back |
+| `NoObjectGeneratedError` | `no_object_generated` | `text?: string` | `generateObject` could not produce a valid object after one repair |
+| `UnsupportedCapabilityError` | `unsupported_capability` | `provider`, `capability`, `modelId?` | A model lacks a requested capability. Thrown **before** any network call |
+| `ToolExecutionError` | `tool_execution` | `toolName`, `toolCallId?` | A tool function threw during the agentic loop |
+| `NotImplementedError` | `not_implemented` | — | A feature is not yet implemented |
+
+`ToolExecutionError` is created internally but, in the agentic loop, it is **not thrown** — the error message is fed back to the model as an `is_error` tool result so the model can self-correct. See [The Tool Loop](/docs/agents/tool-loop).
+
+## The never-throw contract for `streamChat`
+
+`streamChat` returns a `StreamChatResult` **synchronously** and **never throws**. The network pump starts lazily on first access of any output. A failure surfaces in three coordinated ways:
+
+1. An `{ type: 'error', error }` part is pushed onto `fullStream`.
+2. The `usage` promise rejects with that error.
+3. The `finishReason` promise rejects with that error.
+
+Iterating `textStream` re-throws the error part, so a plain `for await` over text still lets you `try/catch`.
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Explain backpressure.' }],
+});
+
+try {
+  for await (const chunk of result.textStream) {
+    process.stdout.write(chunk);
+  }
+} catch (err) {
+  // textStream re-throws the error part as a typed DeuzError.
+  if (err instanceof DeuzError) console.error(err.code, err.message);
+}
+```
+
+### Reading error parts off `fullStream`
+
+If you consume `fullStream` directly, handle the `error` part yourself — it will not throw on its own. Keep a `default` case: `StreamPart` is an open union.
+
+```ts
+import { streamChat, DeuzError } from '@deuz-sdk/core';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+const result = streamChat({
+  model: openai('gpt-5.5'),
+  messages: [{ role: 'user', content: 'hi' }],
+});
+
+for await (const part of result.fullStream) {
+  switch (part.type) {
+    case 'text-delta':
+      process.stdout.write(part.text);
+      break;
+    case 'error':
+      if (part.error instanceof DeuzError) {
+        console.error(`[${part.error.code}]`, part.error.message);
+      }
+      break;
+    default:
+      break; // additive variants
+  }
+}
+```
+
+A caller-initiated abort is **not** an error: the pump resolves `finishReason` with `'aborted'` (the `'aborted'` value of the `FinishReason` union) and resolves `usage` with the partial token counts gathered so far. No `error` part is emitted. A `TimeoutError`, by contrast, is a genuine failure and surfaces as an `error` part.
+
+## `generateText` and `generateObject` reject
+
+The non-streaming entry points are `Promise`-returning, so failures reject the promise — wrap them in `try/catch` or `.catch()`.
+
+```ts
+import { generateObject, NoObjectGeneratedError } from '@deuz-sdk/core';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+import { z } from 'zod';
+
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+try {
+  const { object } = await generateObject({
+    model: openai('gpt-5.5'),
+    schema: z.object({ city: z.string(), population: z.number() }),
+    messages: [{ role: 'user', content: 'Largest city in Japan?' }],
+  });
+  console.log(object);
+} catch (err) {
+  if (err instanceof NoObjectGeneratedError) {
+    // The raw model text that failed to parse/validate is on `.text`.
+    console.error('No valid object. Raw output:', err.text);
+  }
+}
+```
+
+`generateObject` makes one repair retry on a parse/validation failure before throwing `NoObjectGeneratedError`. See [generateObject](/docs/core/generate-object).
+
+## Catching typed errors
+
+Branch on `instanceof` for class-specific fields, or on `code` for a flat switch. Because the same classes are used across every provider, this logic is provider-agnostic.
+
+```ts
+import {
+  generateText,
+  AuthenticationError,
+  RateLimitError,
+  ContextOverflowError,
+  APICallError,
+} from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+try {
+  await generateText({
+    model: anthropic('claude-opus-4-8'),
+    messages: [{ role: 'user', content: 'hello' }],
+  });
+} catch (err) {
+  if (err instanceof AuthenticationError) {
+    // 401/403 — bad or insufficient credentials. Do not retry.
+  } else if (err instanceof RateLimitError) {
+    console.log('retry after (ms):', err.retryAfterMs);
+  } else if (err instanceof ContextOverflowError) {
+    // Trim the prompt and try again.
+  } else if (err instanceof APICallError) {
+    console.error(err.provider, err.statusCode, err.requestId);
+  }
+}
+```
+
+### Checking retryability
+
+`isRetryable` lives on `APICallError` and its subclasses. Errors that are not HTTP-shaped (`TimeoutError`, `AbortError`, `NoObjectGeneratedError`, `UnsupportedCapabilityError`) do not carry the flag and are final.
+
+```ts
+import { APICallError } from '@deuz-sdk/core';
+
+function isRetryable(err: unknown): boolean {
+  return err instanceof APICallError && err.isRetryable;
+}
+```
+
+## Retry interplay
+
+The pump retries **only before the first byte** of the response stream. Once streaming begins, a mid-stream error is final — partial output has already been emitted, so a transparent retry would corrupt the stream.
+
+| Aspect | Behavior |
+| --- | --- |
+| When | Pre-first-byte only |
+| Budget | `maxRetries`, default `2` (per-call override on `CommonCallOptions`) |
+| Backoff | Exponential with full jitter (`base 500ms`, cap `30s`) |
+| `Retry-After` | Honored when the provider sends it (capped at `30s`); takes precedence over computed backoff |
+| Which errors | Those whose `isRetryable` is `true` — `RateLimitError` (429), `OverloadedError` (529), and `APICallError` with status `>= 500` |
+| Determinism | Jitter is derived from `deps.generateId()`, so it is reproducible in tests |
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+  maxRetries: 4, // raise the pre-first-byte budget for this call
+});
+```
+
+A `TimeoutError` is always a genuine failure and is **never** retried — whether it fires from the time-to-first-token (`ttft`) layer or the `total` layer, it is re-thrown immediately (during connect) or surfaces as an `error` part (during streaming). An `AbortError` is never retried either.
+
+## Secret redaction (P0)
+
+API keys must never appear in any log, error message, tracer attribute, or `cause` chain. This is a regression-tested invariant.
+
+- `DeuzError` deliberately carries **no raw request headers or body**, and never places a raw `Request`/`Headers` in `cause`.
+- Anything that flows into a logger, error, or span first passes through the redaction helpers in `internal/redact.ts`. Secret-looking header values (`authorization`, `x-api-key`, `x-goog-api-key`, `api-key`) and token shapes (`sk-`, `sk-ant-`, `AIza`, `Bearer …`) are masked to their **last four characters** — `****AB12`.
+
+You generally never call the redaction helpers directly; they run inside the SDK. The takeaway: it is safe to log a `DeuzError` (including its `provider`, `statusCode`, `requestId`, and `upstreamType`) without leaking credentials.
+
+## See also
+
+- [streamChat](/docs/core/stream-chat) — the streaming entry point and `StreamChatResult` shape.
+- [generateText](/docs/core/generate-text) — non-streaming generation.
+- [generateObject](/docs/core/generate-object) — structured output and repair.
+- [The Tool Loop](/docs/agents/tool-loop) — how `ToolExecutionError` self-heals in the agentic loop.

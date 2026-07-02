@@ -1,0 +1,273 @@
+---
+title: Migrating from Vercel AI SDK
+description: Map ai / @ai-sdk/* calls to @deuz-sdk/core — streamChat, generateText, generateObject, tools, and the UI wire.
+---
+
+If you know the Vercel AI SDK (`ai` + `@ai-sdk/*`), most of `@deuz-sdk/core` will feel familiar: free functions like `generateText` / `generateObject`, a Zod-typed structured-output call, and a streaming UI wire. The shapes are close enough that a port is mostly mechanical. The big differences are philosophical — `@deuz-sdk/core` reads **no environment variables** (you pass `apiKey` explicitly), has **zero runtime dependencies**, and `streamChat` returns **synchronously and never throws**. This page maps the API surface and flags what is not implemented yet.
+
+## API mapping
+
+| Vercel AI SDK | `@deuz-sdk/core` | Notes |
+| --- | --- | --- |
+| `streamText(...)` | [`streamChat(...)`](/docs/core/stream-chat) | Returns synchronously, never throws. Pump starts lazily. |
+| `generateText(...)` | [`generateText(...)`](/docs/core/generate-text) | `await`-ed buffered call. `result.steps` is present when tools run. |
+| `generateObject(...)` | [`generateObject(...)`](/docs/core/generate-object) | `schema` accepts a Zod schema (via Standard Schema) or a raw JSON Schema. |
+| `embed` / `embedMany` | [`embed` / `embedMany`](/docs/core/embeddings) | `value` / `values`; auto batched + concurrency-capped. |
+| `tool({ ... })` helper | plain object with `parameters` | No wrapper function — see [Tools](/docs/agents/tools). |
+| `createAnthropic` (`@ai-sdk/anthropic`) | `createAnthropic` (`@deuz-sdk/core/anthropic`) | Factory returns a `Provider`; call it with a model id for a descriptor. |
+| `createOpenAI`, `openai.embedding(...)` | `createOpenAI`, `openaiEmbedding` (`@deuz-sdk/core/openai`) | Embeddings are a separate factory. |
+| `toDataStreamResponse` / `toUIMessageStreamResponse` | [`toDeuzStreamResponse`](/docs/modules/ui-streaming) (`@deuz-sdk/core/ui`) | Our own versioned wire, not the AI SDK protocol. |
+| `useChat` (React hook) | `readDeuzStream` (manual) | Hooks are planned (Faz 6); read the stream yourself today. |
+| `streamObject` | — | Not implemented yet. |
+
+## Conceptual differences
+
+### No env auto-read — inject the key
+
+The AI SDK auto-reads `process.env.ANTHROPIC_API_KEY` (and friends) inside the provider. `@deuz-sdk/core` is a **pure core**: it never touches `process.env`, `Date.now()`, `Math.random()`, or `console`. Read the key at your app layer and pass it into the factory.
+
+```ts
+// Vercel AI SDK — key read implicitly from process.env
+import { anthropic } from '@ai-sdk/anthropic';
+const model = anthropic('claude-3-5-sonnet');
+```
+
+```ts
+// @deuz-sdk/core — key passed explicitly
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const model = anthropic('claude-opus-4-8');
+```
+
+Everything stateful or non-deterministic (fetch, clock, logger, id generation, API keys, metering) flows through one `Dependencies` seam. You can also resolve keys per call with `deps.keyProvider`. See [Dependencies](/docs/core/dependencies).
+
+### `streamChat` is synchronous and never throws
+
+In the AI SDK, `streamText` returns immediately and surfaces failures on the streams. `@deuz-sdk/core` formalizes this: `streamChat` returns a `StreamChatResult` synchronously, the network pump starts **lazily** on first access of any output, and the call itself does no I/O. A failure surfaces as an `error` part on `fullStream` and rejects the `usage` / `finishReason` promises — it is never a synchronous throw. So you do not wrap `streamChat(...)` in `try/catch`; you handle the `error` part or `await` the promise.
+
+Result fields map cleanly:
+
+| AI SDK `streamText` result | `@deuz-sdk/core` `StreamChatResult` |
+| --- | --- |
+| `textStream` | `textStream` (`AsyncIterable<string>`) |
+| `fullStream` | `fullStream` (`AsyncIterable<StreamPart>`) |
+| `usage` (Promise) | `usage` (`Promise<Usage>`) |
+| `finishReason` (Promise) | `finishReason` (`Promise<FinishReason>`) |
+
+### Canonical `StreamPart` names
+
+Both SDKs normalize provider SSE into a canonical delta union, but the part `type` strings differ. The `fullStream` uses these names:
+
+| AI SDK part type | `@deuz-sdk/core` `StreamPart` type |
+| --- | --- |
+| `text-delta` | `text-delta` |
+| `reasoning` / `reasoning-delta` | `reasoning-delta` |
+| `tool-call-streaming-start` / `tool-call-delta` | `tool-call-delta` |
+| `tool-call` | `tool-call` |
+| `tool-result` | `tool-result` |
+| `step-start` | `step-start` |
+| `step-finish` | `step-finish` |
+| `source` | `source` |
+| `finish` | `finish` |
+| `error` | `error` |
+
+The `StreamPart` union is **open** — keep a `default` case in your `switch`, since new variants are additive. The text payload field is always `text` (for both `text-delta` and `reasoning-delta`). The Deuz UI wire (`readDeuzStream`) reframes a few of these — most notably `tool-call-delta` becomes `tool-input-delta`, and the `error` part carries a `message` string instead of an `error` value — so match on the UI part names when reading the wire.
+
+### Loop control: `maxSteps` and `stopWhen`
+
+The agentic loop is bounded the same way as the AI SDK: `maxSteps` (default **1**, i.e. single-turn) plus an optional `stopWhen` predicate, OR-ed together. There are no exported `stepCountIs` / `hasToolCall` helpers — `stopWhen` is a plain callback you write inline, receiving `{ steps, stepCount }`.
+
+```ts
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages,
+  tools,
+  maxSteps: 8,
+  // OR-ed with maxSteps. Return true to stop after the current step.
+  stopWhen: ({ steps }) => steps.at(-1)?.toolCalls.some((c) => c.toolName === 'finalAnswer') ?? false,
+});
+```
+
+Per-step and usage callbacks exist as call options: `onStepFinish(step)`, `onUsage(usage, meta)`, and `onFinish(meta)`. There is no separate `experimental_` namespace — these are stable fields on the call options.
+
+## Code: basic stream
+
+```ts title="before-stream.ts"
+// Vercel AI SDK
+import { streamText } from 'ai';
+import { anthropic } from '@ai-sdk/anthropic';
+
+const result = streamText({
+  model: anthropic('claude-3-5-sonnet'),
+  messages: [{ role: 'user', content: 'Write a haiku about TypeScript.' }],
+});
+
+for await (const chunk of result.textStream) process.stdout.write(chunk);
+```
+
+```ts title="after-stream.ts"
+// @deuz-sdk/core
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Write a haiku about TypeScript.' }],
+});
+
+for await (const chunk of result.textStream) process.stdout.write(chunk);
+const usage = await result.usage; // resolves when the stream finishes
+```
+
+## Code: tools
+
+The AI SDK's `tool()` helper becomes a plain object keyed by tool name. `parameters` is any Standard Schema (Zod, Valibot) or a raw JSON Schema; `execute` is optional (omit it for a client tool).
+
+```ts title="before-tools.ts"
+// Vercel AI SDK
+import { generateText, tool } from 'ai';
+import { anthropic } from '@ai-sdk/anthropic';
+import { z } from 'zod';
+
+const { text } = await generateText({
+  model: anthropic('claude-3-5-sonnet'),
+  messages: [{ role: 'user', content: 'Weather in Paris?' }],
+  maxSteps: 5,
+  tools: {
+    getWeather: tool({
+      description: 'Get the weather for a city',
+      parameters: z.object({ city: z.string() }),
+      execute: async ({ city }) => ({ city, tempC: 22 }),
+    }),
+  },
+});
+```
+
+```ts title="after-tools.ts"
+// @deuz-sdk/core
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const { text, steps } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Weather in Paris?' }],
+  maxSteps: 5,
+  tools: {
+    getWeather: {
+      description: 'Get the weather for a city',
+      parameters: z.object({ city: z.string() }),
+      execute: async ({ city }) => ({ city, tempC: 22 }),
+    },
+  },
+});
+```
+
+Parallel execution (`maxToolConcurrency`, default 5), self-healing on thrown tools, immutable cache-safe history, and runaway guards are built in. See [Tools](/docs/agents/tools) and [The tool loop](/docs/agents/tool-loop).
+
+## Code: structured output
+
+Your Zod schema works unchanged via Standard Schema — no adapter needed. You can also pass a raw JSON Schema object. `mode` (`'auto' | 'json' | 'tool'`) replaces the AI SDK's `mode` / `output` knobs.
+
+```ts title="before-object.ts"
+// Vercel AI SDK
+import { generateObject } from 'ai';
+import { anthropic } from '@ai-sdk/anthropic';
+import { z } from 'zod';
+
+const { object } = await generateObject({
+  model: anthropic('claude-3-5-sonnet'),
+  messages: [{ role: 'user', content: 'Capital of France as JSON.' }],
+  schema: z.object({ city: z.string() }),
+});
+```
+
+```ts title="after-object.ts"
+// @deuz-sdk/core
+import { generateObject } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const { object } = await generateObject({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Capital of France as JSON.' }],
+  schema: z.object({ city: z.string() }),
+  // mode: 'auto', // 'json' | 'tool' to force a strategy
+});
+```
+
+On a parse/validation miss `@deuz-sdk/core` runs one repair retry, then throws `NoObjectGeneratedError`. Note: there is no `streamObject` yet (see below).
+
+## Code: UI route
+
+The AI SDK's `toDataStreamResponse()` / `toUIMessageStreamResponse()` becomes `toDeuzStreamResponse()`. This is **our own** versioned SSE wire (`x-deuz-stream: v1`), not the AI SDK protocol, so it is consumed by `readDeuzStream` rather than `useChat`.
+
+```ts title="before-route.ts"
+// Vercel AI SDK — app/api/chat/route.ts
+import { streamText } from 'ai';
+import { anthropic } from '@ai-sdk/anthropic';
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+  const result = streamText({ model: anthropic('claude-3-5-sonnet'), messages });
+  return result.toDataStreamResponse();
+}
+```
+
+```ts title="after-route.ts"
+// @deuz-sdk/core — app/api/chat/route.ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+  return toDeuzStreamResponse(
+    streamChat({ model: anthropic('claude-opus-4-8'), messages }),
+  );
+}
+```
+
+Until the React hooks ship, consume the stream on the client with `readDeuzStream`:
+
+```ts title="client.ts"
+import { readDeuzStream } from '@deuz-sdk/core/ui';
+
+const res = await fetch('/api/chat', {
+  method: 'POST',
+  body: JSON.stringify({ messages }),
+});
+
+for await (const part of readDeuzStream(res)) {
+  switch (part.type) {
+    case 'text-delta':
+      appendText(part.text);
+      break;
+    case 'tool-call':
+      showToolCall(part.toolName, part.input);
+      break;
+    case 'finish':
+      done(part.finishReason, part.usage);
+      break;
+    default:
+      break; // open union — keep a default case
+  }
+}
+```
+
+## Not implemented yet
+
+These exist in the AI SDK but are deliberately deferred in `@deuz-sdk/core`:
+
+- **`streamObject`** — only the buffered [`generateObject`](/docs/core/generate-object) is available. Stream the text and parse client-side if you need partial objects.
+- **React hooks** (`useChat`, `useCompletion`, `useObject`) — planned for Faz 6 (`@deuz-sdk/core/react`). For now, drive [`readDeuzStream`](/docs/modules/ui-streaming) yourself.
+
+Everything else in the chat, tools, embeddings, and UI surface has a direct equivalent above.

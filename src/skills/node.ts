@@ -1,6 +1,6 @@
 /**
  * skills/node.ts — Node-only filesystem `SkillSource` for Agent Skills.
- * Exported as `@deuz/core/skills/node` (NOT bundled into edge-safe core). Lazily
+ * Exported as `@deuz-sdk/core/skills/node` (NOT bundled into edge-safe core). Lazily
  * imports `node:fs/promises` / `node:path` exactly like `mcp/stdio.ts`, so core
  * stays edge-safe; calling these in an edge runtime throws a clear error.
  */

@@ -1,0 +1,202 @@
+---
+title: Quickstart
+description: Streaming chat in under five minutes — Node script, Next.js route handler, and a browser client.
+---
+
+`@deuz-sdk/core` is a pure, web-first, multi-provider AI SDK. A provider factory returns a tiny model descriptor; the free functions (`streamChat`, `generateText`, `generateObject`) take that descriptor plus canonical `messages` and do the rest. The core never reads `process.env` — you read your key at the app layer and pass it into the factory.
+
+```bash title="install"
+npm install @deuz-sdk/core
+```
+
+Requires Node >= 22. Zero runtime dependencies.
+
+## 1. Stream chat in a Node/TS script
+
+`streamChat` returns a `StreamChatResult` **synchronously** — the network request starts lazily on first access of any output (`textStream`, `fullStream`, `usage`, or `finishReason`). The synchronous call itself **never throws**: a failure surfaces as an `error` part on `fullStream` and as rejected `usage`/`finishReason` promises. (Iterating `textStream` rethrows that error mid-loop, so a `for await` over it should be wrapped in `try/catch`.)
+
+```ts title="chat.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+// Read the key at the app layer; the SDK core never touches process.env.
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Write a haiku about TypeScript.' }],
+});
+
+// Print tokens as they arrive.
+for await (const chunk of result.textStream) {
+  process.stdout.write(chunk);
+}
+
+// Resolves once the stream finishes.
+const usage = await result.usage;
+console.log('\n', usage.inputTokens, '->', usage.outputTokens);
+```
+
+`messages` is a canonical `Message[]`. `content` is either a `string` (shorthand for a single text part) or a `Part[]` for multimodal input. The roles are `'system' | 'user' | 'assistant' | 'tool'`.
+
+### Common call options
+
+These are shared by `streamChat`, `generateText`, and `generateObject`.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `model` | `LanguageModel` | — | From a provider factory, e.g. `anthropic('claude-opus-4-8')`. |
+| `messages` | `Message[]` | — | Canonical conversation. |
+| `signal` | `AbortSignal` | — | Cancels the request; resolves `finishReason: 'aborted'` with partial usage. |
+| `maxRetries` | `number` | `2` | Pre-first-byte retries only (exponential backoff + jitter, honors `Retry-After`). |
+| `temperature` | `number` | — | Sampling temperature. |
+| `maxOutputTokens` | `number` | — | Cap on generated tokens. |
+| `topP` | `number` | — | Nucleus sampling. |
+| `stopSequences` | `string[]` | — | Stop strings. |
+| `effort` | `'none' \| 'low' \| 'medium' \| 'high'` | — | Canonical reasoning effort; each adapter maps it to its own unit. |
+| `headers` | `Record<string, string>` | — | Extra request headers. |
+| `onUsage` | `(usage, meta) => void` | — | Fires when usage is known. |
+| `onFinish` | `(meta) => void` | — | Fires once the call completes. |
+| `tools` | `ToolSet` | — | Passing tools turns on the agentic loop (see [Tool calling](/docs/agents/tools)). |
+
+### Reading the full stream
+
+`fullStream` yields canonical `StreamPart` deltas — text, reasoning, tool calls, sources, per-step boundaries, usage, and a terminal `finish` (or `error`). The union is open, so always keep a `default` branch.
+
+```ts title="full-stream.ts"
+for await (const part of result.fullStream) {
+  switch (part.type) {
+    case 'text-delta':
+      process.stdout.write(part.text);
+      break;
+    case 'reasoning-delta':
+      // model's thinking tokens
+      break;
+    case 'finish':
+      console.log('\nfinish:', part.finishReason, part.usage.totalTokens);
+      break;
+    case 'error':
+      console.error('stream error:', part.error);
+      break;
+    default:
+      break; // additive variants — ignore unknown types
+  }
+}
+```
+
+## 2. Next.js App Router route handler
+
+On the server, pipe the canonical stream straight into `toDeuzStreamResponse`. It serializes `fullStream` to Server-Sent Events on **our** versioned UI wire (`x-deuz-stream: v1`) — it never proxies a provider's raw bytes. The function is edge-safe.
+
+```ts title="app/api/chat/route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function POST(req: Request): Promise<Response> {
+  const { messages } = await req.json();
+
+  const result = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    messages,
+  });
+
+  return toDeuzStreamResponse(result);
+}
+```
+
+`toDeuzStreamResponse(result, options?)` accepts an optional second argument:
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `messageId` | `string` | Id sent in the opening `start` part. Defaults to `generateId()` then `'deuz-msg'`. |
+| `generateId` | `() => string` | Source for the message id (e.g. `deps.generateId`). |
+| `headers` | `Record<string, string>` | Extra response headers merged onto the SSE response. |
+
+## 3. Read the stream in the browser
+
+On the client, pass the `fetch` `Response` to `readDeuzStream`. It yields typed `DeuzUIPart` objects until the stream closes — switch on `part.type`.
+
+```ts title="client.ts"
+import { readDeuzStream } from '@deuz-sdk/core/ui';
+
+const response = await fetch('/api/chat', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({
+    messages: [{ role: 'user', content: 'Hello!' }],
+  }),
+});
+
+let text = '';
+for await (const part of readDeuzStream(response)) {
+  switch (part.type) {
+    case 'start':
+      // { type: 'start', messageId }
+      break;
+    case 'text-delta':
+      text += part.text;
+      break;
+    case 'tool-call':
+      console.log('tool:', part.toolName, part.input);
+      break;
+    case 'tool-result':
+      console.log('result:', part.toolName, part.output);
+      break;
+    case 'step-finish':
+      // { step, finishReason, usage }
+      break;
+    case 'finish':
+      console.log('done:', part.finishReason, part.usage.totalTokens);
+      break;
+    case 'error':
+      console.error(part.message); // secrets are already redacted
+      break;
+    default:
+      break;
+  }
+}
+```
+
+The `DeuzUIPart` types you can receive: `start`, `step-start`, `step-finish`, `text-delta`, `reasoning-delta`, `tool-input-delta`, `tool-call`, `tool-result`, `source`, `finish`, `error`. See the [UI streaming wire](/docs/modules/ui-streaming) reference for the full shape of each.
+
+## 4. Buffered alternative — `generateText`
+
+When you do not need incremental tokens, `generateText` awaits the whole response and returns it at once.
+
+```ts title="generate.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const { text, usage, finishReason } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'One sentence on why pure cores test well.' }],
+});
+
+console.log(text, finishReason, usage.totalTokens);
+```
+
+`generateText` returns a `Promise<GenerateTextResult>`:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `text` | `string` | Final assistant text. |
+| `usage` | `Usage` | Totals summed across all agentic steps. |
+| `finishReason` | `FinishReason` | `'stop' \| 'length' \| 'tool_calls' \| 'content_filter' \| 'error' \| 'aborted'`. |
+| `response` | `{ messages: Message[] }` | Assistant (and tool) turns to append to history. |
+| `steps` | `StepResult[]` | Per-step breakdown — present when `tools` were used. |
+| `toolCalls` / `toolResults` | `ToolCall[]` / `ToolResult[]` | Last step's calls/results (convenience). |
+
+Add a `tools` map and a `maxSteps` greater than `1` to turn this into a multi-step agentic call.
+
+## Where to go next
+
+- [Providers](/docs/providers/anthropic) — Anthropic, OpenAI, xAI, Gemini (compat + native), Vertex, and Yunwu factories.
+- [Tool calling](/docs/agents/tools) — the agentic loop: parallel execution, self-healing, `maxSteps`, `stopWhen`.
+- [generateObject](/docs/core/generate-object) — schema-typed structured output with a Standard Schema or raw JSON Schema.
+- [streamChat](/docs/core/stream-chat) — the full streaming reference: resilience, timeouts, abort, and the canonical `StreamPart` union.
+- [UI streaming](/docs/modules/ui-streaming) — `toDeuzStreamResponse` and `readDeuzStream` in depth.

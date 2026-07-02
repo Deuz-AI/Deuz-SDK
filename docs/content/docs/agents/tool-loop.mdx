@@ -1,0 +1,276 @@
+---
+title: The Agentic Tool Loop
+description: How generateText and streamChat run multi-step tool loops — steps, stop conditions, and the invariants that keep the loop safe.
+---
+
+When you pass `tools`, both [generateText](/docs/core/generate-text) and [streamChat](/docs/core/stream-chat) stop being single-turn calls and become an agentic loop: run a model step, execute any tool calls in parallel, feed the results back as a new turn, repeat. The loop is self-healing (a thrown tool becomes an error result, not a crash) and bounded (`maxSteps`, `stopWhen`, and a runaway guard). This page documents the machinery and the guarantees it upholds.
+
+## When the loop runs
+
+The loop activates whenever `tools` is present and non-empty. Omit `tools` (or pass `{}`) and you get a single buffered turn — `generateText` resolves after one model call; `streamChat` streams one turn. There is no separate "agent" entry point; the loop is the same two functions with tools attached.
+
+```ts title="loop.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const { text, steps } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'What is the weather in Paris?' }],
+  maxSteps: 5, // without this the loop runs a single turn (default 1)
+  tools: {
+    getWeather: {
+      description: 'Get the current weather for a city.',
+      parameters: z.object({ city: z.string() }),
+      execute: async ({ city }) => ({ city, tempC: 22, sky: 'sunny' }),
+    },
+  },
+});
+
+console.log(text); // final natural-language answer
+console.log(steps?.length); // e.g. 2: one tool turn + one final turn
+```
+
+## Loop control options
+
+These options live on `CommonCallOptions`, so they work identically for `generateText` and `streamChat`.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `tools` | `ToolSet` | — | `Record<string, Tool>`. Presence switches on the loop. |
+| `toolChoice` | `'auto' \| 'required' \| 'none' \| { type: 'tool'; toolName: string }` | `'auto'` | Forces / forbids tool use on each step. |
+| `maxSteps` | `number` | `1` | Max model turns. The default `1` means single-turn — raise it for real tool use. |
+| `stopWhen` | `StopCondition \| StopCondition[]` | — | Extra stop predicate(s), OR-ed with `maxSteps`. |
+| `maxToolConcurrency` | `number` | `5` | Max parallel tool executions per step. |
+| `onStepFinish` | `(step: StepResult) => void` | — | Fires after each completed step. |
+
+`maxSteps` counts **model turns**, not tool calls. A step that executes three tools in parallel is one step.
+
+## maxSteps and stopWhen
+
+The loop stops when **any** stop condition returns `true`. Internally `maxSteps` is itself compiled into a stop condition (`stepCount >= maxSteps`) and OR-ed with whatever you pass in `stopWhen` — so `stopWhen` never *extends* the step budget, it only lets you stop **earlier** or on a custom signal.
+
+A `StopCondition` is a plain function over the loop state. The type is exported; write predicates inline:
+
+```ts
+export type StopCondition = (info: {
+  steps: StepResult[];
+  stepCount: number;
+}) => boolean | Promise<boolean>;
+```
+
+It is evaluated **after** a step that executed tools (so it never fires on the terminal text-only step, which already ends the loop on its own). It can be `async`.
+
+```ts title="stop-when.ts"
+import { generateText, type StopCondition } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+// Stop once a step has called the `finalize` tool.
+const afterFinalize: StopCondition = ({ steps }) =>
+  steps.at(-1)?.toolCalls.some((c) => c.toolName === 'finalize') ?? false;
+
+// Stop once we have run at least 3 steps (same idea as a lower maxSteps).
+const afterThreeSteps: StopCondition = ({ stepCount }) => stepCount >= 3;
+
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Research and summarize.' }],
+  maxSteps: 10,
+  stopWhen: [afterFinalize, afterThreeSteps], // OR-ed together (and with maxSteps)
+  tools: {
+    finalize: {
+      parameters: z.object({ summary: z.string() }),
+      execute: async ({ summary }) => ({ ok: true, summary }),
+    },
+  },
+});
+```
+
+> The `stepCountIs` / `hasToolCall` predicate factories exist internally but are **not** part of the public export surface. Write your `StopCondition` inline as shown above — the two examples reproduce exactly what those helpers do.
+
+## Step anatomy
+
+When tools are used, `result.steps` is a `StepResult[]` — one entry per model turn, in order.
+
+```ts
+interface StepResult {
+  stepType: 'initial' | 'tool-result';
+  text: string;
+  reasoningText?: string;
+  toolCalls: ToolCall[];
+  toolResults: ToolResult[];
+  finishReason: FinishReason;
+  usage: Usage;
+  /** Messages this step appended (assistant turn + the tool-result turn). */
+  response: { messages: Message[] };
+}
+```
+
+| Field | Notes |
+| --- | --- |
+| `stepType` | `'initial'` for the first step; `'tool-result'` for every step produced by feeding tool results back. |
+| `text` | That step's assistant text (often empty on tool-calling steps; populated on the final step). |
+| `reasoningText` | Present only when the model emitted reasoning that turn. |
+| `toolCalls` | Parsed tool calls this step made — empty on the terminal text-only step. |
+| `toolResults` | Execution results, aligned to `toolCalls`. Each carries `isError` when a tool threw or args failed validation. |
+| `usage` | This step alone. The top-level `result.usage` is the sum across all steps. |
+| `response.messages` | Just the turns this step appended: the assistant message, plus the tool-result message if tools ran. |
+
+Reading them back, with a per-step callback:
+
+```ts title="read-steps.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Weather in Paris and Berlin?' }],
+  maxSteps: 5,
+  tools: {
+    getWeather: {
+      parameters: z.object({ city: z.string() }),
+      execute: async ({ city }) => ({ city, tempC: 22 }),
+    },
+  },
+  onStepFinish: (step) => {
+    console.log(`[${step.stepType}] ${step.toolCalls.length} tool call(s)`);
+  },
+});
+
+for (const step of result.steps ?? []) {
+  for (const call of step.toolCalls) console.log('called', call.toolName, call.args);
+  for (const r of step.toolResults) {
+    console.log('result', r.toolName, r.isError ? '(error)' : '', r.result);
+  }
+}
+```
+
+## Streaming the loop
+
+`streamChat` runs the same loop but produces **one** canonical `fullStream` that spans every model call. Within a step the usual deltas pass through (`text-delta`, `reasoning-delta`, `tool-call-delta`); around each step the loop frames the boundaries with extra parts.
+
+| `fullStream` part | When | Payload |
+| --- | --- | --- |
+| `step-start` | Beginning of each model turn | `{ stepIndex }` |
+| `text-delta` / `reasoning-delta` | During the turn | streamed content |
+| `tool-call-delta` | During the turn | raw argument JSON fragments (forwarded for live input-streaming UIs) |
+| `step-finish` | End of each turn | `{ stepIndex, finishReason, usage }` (this step's usage) |
+| `tool-call` | After a turn's tool args finish parsing | `{ toolCallId, toolName, input }` |
+| `tool-result` | After server-side execution | `{ toolCallId, toolName, output, isError? }` |
+| `finish` | Once, at the very end | `{ usage, finishReason }` (usage summed across all steps) |
+
+The first part emitted is always `step-start`; the last is always `finish`. `textStream` is the text-only projection across all steps, so it yields only the model's natural-language tokens (tool-call fragments are excluded).
+
+```ts title="stream-loop.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Weather in Paris?' }],
+  maxSteps: 5,
+  tools: {
+    getWeather: {
+      parameters: z.object({ city: z.string() }),
+      execute: async ({ city }) => ({ city, tempC: 22 }),
+    },
+  },
+});
+
+for await (const part of result.fullStream) {
+  switch (part.type) {
+    case 'step-start':
+      console.log(`--- step ${part.stepIndex} ---`);
+      break;
+    case 'text-delta':
+      process.stdout.write(part.text);
+      break;
+    case 'tool-call':
+      console.log('\ncalling', part.toolName, part.input);
+      break;
+    case 'tool-result':
+      console.log('result', part.toolName, part.output);
+      break;
+    case 'step-finish':
+      console.log(`\nstep ${part.stepIndex} done (${part.finishReason})`);
+      break;
+    default:
+      break;
+  }
+}
+
+console.log('total tokens:', (await result.usage).totalTokens);
+```
+
+`streamChat` returns synchronously and never throws — a failure surfaces as an `error` part on `fullStream` and rejects the `usage` / `finishReason` promises. Keep a `default` case in your switch: `StreamPart` is an open union and new variants are additive.
+
+## Loop guarantees
+
+These invariants are enforced by the loop implementation and pinned by tests. Treat them as contracts.
+
+### Immutable message history per step
+
+Each step builds a **new** message array (`[...messages, assistantTurn, toolResultTurn]`); prior steps' arrays are never mutated. Stable history is what makes provider prompt-cache hits possible and keeps the loop safe to drive from React state. The assistant message is always appended **before** its tool-result message (OpenAI ordering).
+
+### Stop on tool-call count, not finishReason
+
+The loop decides whether to continue based on whether the last step produced any `tool_use` parts — **not** on the reported `finishReason`. Gemini can emit `finish: stop` while a tool call is still pending; reading `finishReason` would end the loop one tool short. As long as a step emitted tool calls, the loop runs another turn.
+
+### Parallel, capped tool execution
+
+A step's tool calls run concurrently, capped at `maxToolConcurrency` (default 5). Order of `toolResults` is preserved relative to `toolCalls`.
+
+### Self-healing tool errors
+
+A tool that throws does not reject the call. The thrown error is caught and converted into a `tool_result` with `isError: true`, then fed back to the model so it can recover or retry. The same happens when a tool's arguments fail schema validation. Crucially, **every** `tool_use` id always receives a matching `tool_result` — Anthropic returns a 400 if any tool call is left unanswered, so the loop guarantees completeness.
+
+### Runaway guard
+
+If the **same** tool returns an error on three consecutive steps (`MAX_SAME_TOOL_ERRORS = 3`), the loop hard-stops regardless of `maxSteps`. A single successful call resets that tool's counter. This prevents a persistently failing tool from burning the entire step budget.
+
+### Client tools break the loop early
+
+A `Tool` with no `execute` is a *client tool* — the SDK cannot run it. When the model calls one, the loop stops immediately and returns the pending call(s) in `result.toolCalls` (and as `tool-call` parts on `fullStream`). The caller owns the round-trip: execute it on the client, append a `tool_result`, and call again. See [client tools](/docs/agents/client-tools).
+
+## Continuing across calls
+
+`result.response.messages` (or, while streaming, the assistant + tool turns you reconstruct) contains only the **new** turns this call produced. Append them to your prior history to keep it immutable and prompt-cache friendly:
+
+```ts title="continue.ts"
+import { generateText, type Message } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+let messages: Message[] = [{ role: 'user', content: 'Weather in Paris?' }];
+
+const first = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages,
+  maxSteps: 5,
+  tools: {
+    /* … */
+  },
+});
+
+messages = [...messages, ...first.response.messages];
+// the next turn reuses the full, stable history
+```
+
+## See also
+
+- [generateText](/docs/core/generate-text) — buffered loop; awaits to completion.
+- [streamChat](/docs/core/stream-chat) — streaming loop; one `fullStream` across all steps.
+- [Defining tools](/docs/agents/tools) — `Tool` shape, schemas, and `execute`.
+- [Client tools](/docs/agents/client-tools) — tools the loop hands back to the caller.

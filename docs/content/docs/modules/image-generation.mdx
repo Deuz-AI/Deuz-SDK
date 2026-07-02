@@ -1,0 +1,248 @@
+---
+title: Image Generation
+description: Synchronous generateImage (OpenAI-compatible) and async Midjourney (submit + poll) image models.
+---
+
+The SDK ships two independent image surfaces. `generateImage` is a **synchronous** call against the OpenAI-compatible `POST /v1/images/generations` endpoint — it covers DALL·E, GPT-Image, Flux, Stable Diffusion, Recraft, Ideogram, and any OpenAI-compatible relay such as Yunwu. The **Midjourney** functions are **asynchronous**: you submit a task, then poll it to completion through the injected `clock`. Both are pure and edge-safe — HTTP goes through `deps.fetch` and the API key is resolved from the factory, `createClient`, or a `deps.keyProvider`, never from the environment.
+
+Image models are a **separate kind** from chat `LanguageModel` (`surface: 'images'`), and Midjourney descriptors are their own kind too (`surface: 'midjourney'`). Neither can be passed to [streamChat](/docs/core/stream-chat) or [generateText](/docs/core/generate-text).
+
+## generateImage
+
+Import `generateImage` from `@deuz-sdk/core/image`. It returns a `Promise<GenerateImageResult>` — there is no streaming. Build a model descriptor with `createImageProvider` (generic OpenAI-compatible) or `createYunwuImage` (relay), then pass it in.
+
+```ts title="generate-image.ts"
+import { generateImage, createImageProvider } from '@deuz-sdk/core/image';
+
+const openaiImage = createImageProvider({
+  apiKey: process.env.OPENAI_API_KEY!,
+});
+
+const { images, raw } = await generateImage({
+  model: openaiImage('dall-e-3'),
+  prompt: 'a tidy robot watering a fern, isometric, soft light',
+  size: '1024x1024',
+  quality: 'hd',
+});
+
+console.log(images[0]?.url);          // hosted URL (default responseFormat)
+console.log(images[0]?.revisedPrompt); // DALL·E 3 may revise the prompt
+console.log(raw);                      // the untouched provider JSON
+```
+
+### Options
+
+`generateImage(options)` takes a single `GenerateImageOptions` object.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `model` | `ImageModel` | — | From `createImageProvider` / `createYunwuImage`. Required. |
+| `prompt` | `string` | — | The text prompt. Required. |
+| `n` | `number` | `1` | Image count. Provider-dependent — DALL·E 3 only supports 1. |
+| `size` | `string` | unset | e.g. `'1024x1024'`, `'1792x1024'`. |
+| `quality` | `string` | unset | e.g. `'standard'` / `'hd'` (DALL·E 3). |
+| `style` | `string` | unset | e.g. `'vivid'` / `'natural'` (DALL·E 3). |
+| `responseFormat` | `'url' \| 'b64_json'` | provider default | Sent as `response_format`. Omit to use the provider default (`'url'`). |
+| `signal` | `AbortSignal` | unset | Aborts the underlying fetch. |
+| `headers` | `Record<string, string>` | unset | Per-call headers, merged over factory headers. |
+| `deps` | `Dependencies` | resolved defaults | Inject `fetch`, `keyProvider`, etc. |
+
+### Result shape
+
+```ts
+interface GenerateImageResult {
+  images: GeneratedImage[];
+  raw: unknown; // the raw provider response, for provider-specific extras
+}
+
+interface GeneratedImage {
+  url?: string;          // present when responseFormat is 'url'
+  b64Json?: string;      // present when responseFormat is 'b64_json'
+  revisedPrompt?: string; // provider-revised prompt, when returned (DALL·E 3)
+}
+```
+
+Request `b64_json` when you want the raw bytes back instead of a hosted URL:
+
+```ts title="b64.ts"
+const { images } = await generateImage({
+  model: openaiImage('gpt-image-1'),
+  prompt: 'a coffee cup logo',
+  responseFormat: 'b64_json',
+});
+
+const b64 = images[0]?.b64Json; // base64-encoded PNG bytes
+```
+
+### Creating image model descriptors
+
+`createImageProvider(settings)` returns an `ImageProvider` — a `(modelId: string) => ImageModel` function. The factory settings are carried on a private symbol, so the public `ImageModel` shape stays clean and the key never leaks via enumeration.
+
+| Setting | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | — | Resolved against `keyProvider` / `createClient` if omitted. |
+| `baseURL` | `string` | `https://api.openai.com/v1` | Point at any OpenAI-compatible relay. |
+| `fetch` | `typeof fetch` | `deps.fetch` | Factory `fetch` wins over `deps.fetch`. |
+| `headers` | `Record<string, string>` | — | Default headers for every call. |
+| `provider` | `string` | `'openai'` | Logical id used for key/baseURL resolution. |
+
+For the Yunwu relay, use `createYunwuImage` from `@deuz-sdk/core/yunwu` — it pins `provider: 'yunwu'` and derives `/v1/images/generations` from the relay root:
+
+```ts title="yunwu-image.ts"
+import { generateImage } from '@deuz-sdk/core/image';
+import { createYunwuImage } from '@deuz-sdk/core/yunwu';
+
+const yunwuImage = createYunwuImage({
+  apiKey: process.env.YUNWU_API_KEY!,
+});
+
+const { images } = await generateImage({
+  model: yunwuImage('flux-2-pro'),
+  prompt: 'a neon city skyline at dusk',
+});
+// POSTs to https://yunwu.ai/v1/images/generations
+```
+
+The unified `createYunwu({ apiKey, baseURL })` client also exposes `.image(modelId)` so one config drives every surface — see the [Yunwu provider](/docs/providers/yunwu) page.
+
+## Midjourney (async)
+
+Import the Midjourney functions from `@deuz-sdk/core/midjourney`. They speak the midjourney-proxy contract: **submit** a task → **poll** it by id → optionally run **U/V/reroll actions** on the returned buttons → receive a final `imageUrl`. Works against any mj-proxy-compatible relay (Yunwu by default, root `https://yunwu.ai`, with the proxy mounted at the bare `/mj` root — *not* under `/v1`).
+
+The poll delay uses `deps.clock.setTimeout`, so there are no ambient timers and the loop is fully deterministic in tests.
+
+### imagine — submit and poll in one call
+
+`imagine` is the convenience entry point: it calls `submitImagine` then `waitForTask`. It returns the finished `MidjourneyTask` (or rejects with a `TimeoutError` / `AbortError`).
+
+```ts title="imagine.ts"
+import { imagine } from '@deuz-sdk/core/midjourney';
+
+const task = await imagine({
+  apiKey: process.env.YUNWU_API_KEY!,
+  prompt: 'a deuz robot, --ar 1:1 --v 6',
+  pollIntervalMs: 3000,   // default 3000
+  timeoutMs: 300_000,     // default 300_000 (5 min)
+  onProgress: (t) => console.log(t.status, t.progress), // e.g. "IN_PROGRESS 50%"
+});
+
+console.log(task.status);   // 'SUCCESS'
+console.log(task.imageUrl); // the final 2x2 grid URL
+console.log(task.buttons);  // U1-4 / V1-4 / reroll action buttons
+```
+
+`onProgress` fires on every poll with the latest task snapshot, so you can surface percentage progress to the UI as the grid renders.
+
+### action — upscale / variation / reroll
+
+A finished imagine task carries a `buttons` array. Each `MidjourneyButton` has a `customId`. Feed that `customId` back through `submitAction` to run an upscale (U1-4), variation (V1-4), or reroll, then poll the child task with `waitForTask`.
+
+```ts title="upscale.ts"
+import { submitAction, waitForTask } from '@deuz-sdk/core/midjourney';
+
+const config = { apiKey: process.env.YUNWU_API_KEY! };
+
+// Pick the first upscale button from a finished task.
+const upscale = task.buttons?.find((b) => b.label === 'U1');
+
+const { taskId } = await submitAction({
+  ...config,
+  taskId: task.id,
+  customId: upscale!.customId,
+});
+
+const upscaled = await waitForTask(taskId, config);
+console.log(upscaled.imageUrl); // the upscaled single image
+```
+
+### The pieces
+
+Every Midjourney function takes the shared `MidjourneyConfig` (`apiKey`, `baseURL`, `provider`, `fetch`, `headers`, `signal`, `deps`) plus its own fields.
+
+| Function | Purpose | Returns |
+| --- | --- | --- |
+| `submitImagine(options)` | Submit an imagine task. | `Promise<SubmitResult>` |
+| `submitAction(options)` | Run a U/V/reroll via a button `customId`. | `Promise<SubmitResult>` |
+| `submitBlend(options)` | Blend 2-5 base64 images into one. | `Promise<SubmitResult>` |
+| `submitDescribe(options)` | Describe an image → prompt suggestions. | `Promise<SubmitResult>` |
+| `fetchTask(taskId, cfg)` | Fetch one task by id (`null` if unknown). | `Promise<MidjourneyTask \| null>` |
+| `waitForTask(taskId, options)` | Poll until a terminal status or timeout. | `Promise<MidjourneyTask>` |
+| `imagine(options)` | `submitImagine` + `waitForTask`. | `Promise<MidjourneyTask>` |
+
+`SubmitResult` is `{ taskId, code, description?, raw }`. If the relay returns no task id (e.g. a banned prompt with `code: 4`), the submit throws an `APICallError`.
+
+`waitForTask` polls `fetchTask` until the task reaches a terminal status — `SUCCESS`, `FAILURE`, or `CANCEL` — and otherwise keeps polling at `pollIntervalMs` until `timeoutMs` elapses (throwing a `TimeoutError`). An aborted `signal` rejects with an `AbortError`.
+
+### MidjourneyTask
+
+```ts
+type MidjourneyStatus =
+  | 'NOT_START' | 'SUBMITTED' | 'IN_PROGRESS'
+  | 'FAILURE' | 'SUCCESS' | 'MODAL' | 'CANCEL';
+
+interface MidjourneyTask {
+  id: string;
+  status: MidjourneyStatus;
+  imageUrl?: string;      // final (or in-progress preview) image URL
+  progress?: string;      // "0%" … "100%"
+  prompt?: string;
+  promptEn?: string;
+  failReason?: string;
+  buttons?: MidjourneyButton[]; // U/V/reroll actions on a finished task
+  // submitTime / startTime / finishTime / properties / …
+}
+```
+
+### imagine + blend reference images
+
+`submitImagine` (and therefore `imagine`) accepts `base64Array` — base64 data-URLs used as vary/blend seeds — plus an opaque `state` echoed back on the task.
+
+```ts title="imagine-with-refs.ts"
+import { imagine } from '@deuz-sdk/core/midjourney';
+
+const task = await imagine({
+  apiKey: process.env.YUNWU_API_KEY!,
+  prompt: 'in the style of the reference, a city park',
+  base64Array: ['data:image/png;base64,iVBORw0KGgo...'],
+  state: 'request-42',
+});
+```
+
+### Webhook mode
+
+Instead of polling, pass `notifyHook` (a webhook URL) to any submit call. The relay calls that URL when the task completes, and you persist the result from your webhook handler rather than holding the request open with `waitForTask`. `submitImagine`, `submitBlend`, and `submitDescribe` all accept `notifyHook`.
+
+```ts title="webhook.ts"
+import { submitImagine } from '@deuz-sdk/core/midjourney';
+
+const { taskId } = await submitImagine({
+  apiKey: process.env.YUNWU_API_KEY!,
+  prompt: 'a serene mountain lake',
+  notifyHook: 'https://your-app.example/webhooks/midjourney',
+});
+// Store taskId, return immediately. The relay POSTs the finished task to notifyHook.
+// In the handler you can still call fetchTask(taskId, config) to read the latest snapshot.
+```
+
+### Optional descriptor factory
+
+`createMidjourney(settings)` returns a `MidjourneyProvider` — `(modelId?: string) => { provider, modelId, surface: 'midjourney' }` — that parallels the other providers and carries config on the private symbol. It is optional; passing `MidjourneyConfig` fields directly to each function (as above) works just as well. For Yunwu, prefer the unified client's pre-bound config:
+
+```ts title="yunwu-mj.ts"
+import { imagine } from '@deuz-sdk/core/midjourney';
+import { createYunwu } from '@deuz-sdk/core/yunwu';
+
+const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
+
+const task = await imagine({ ...yunwu.mj(), prompt: 'a robot --ar 16:9' });
+```
+
+## Errors
+
+Both surfaces map HTTP status codes to the canonical [error classes](/docs/core/errors): `401`/`403` → `AuthenticationError`, `404` → `ModelNotFoundError`, `429` → `RateLimitError`, `529` → `OverloadedError`, other `4xx` → `InvalidRequestError`, `5xx` → a retryable `APICallError`. When no API key can be resolved, the call throws an `AuthenticationError` **before** any network request is made.
+
+## Related
+
+- [Yunwu provider](/docs/providers/yunwu) — one config for chat, image, embeddings, and Midjourney.
+- [Dependencies](/docs/core/dependencies) — the `fetch` / `clock` / `keyProvider` injection seam.
+- [Errors](/docs/core/errors) — the canonical error hierarchy.

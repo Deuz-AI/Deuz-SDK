@@ -1,0 +1,299 @@
+---
+title: Dependencies & Clients
+description: The single DI seam (Dependencies) and createClient — inject fetch, clock, keys, and metering into a pure, edge-portable core.
+---
+
+`@deuz-sdk/core` keeps its runtime pure: it touches no globals you can't override and reads no environment variables. Everything stateful or non-deterministic — the HTTP transport, the clock, id generation, logging, tracing, circuit-breaker state, key resolution, cost lookup, and metering callbacks — is injected through one object, `Dependencies`. Pass it per call via `deps`, or bind it once with [`createClient`](#createclient). This is what makes the core deterministically testable and portable to any Web-APIs-only runtime (edge, workers, browser).
+
+## The `Dependencies` seam
+
+Every field is optional. Unset fields get a no-op or in-memory default applied by `resolveDependencies`, so `streamChat({ model, messages })` works with zero `deps`. The defaults are the *only* place the core ever reaches an ambient `Date.now()` / `crypto.randomUUID()`.
+
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `fetch` | `typeof fetch` | bound `globalThis.fetch` | HTTP transport for every upstream request. |
+| `clock` | `Clock` | real `Date.now` + `setTimeout` | Time source for timeouts, retry backoff, TTFT measurement. |
+| `logger` | `Logger` | no-op | Structured `debug/info/warn/error`. |
+| `tracer` | `Tracer` | no-op | OpenTelemetry-shaped span seam. |
+| `breakerStore` | `BreakerStore` | in-memory `Map` (per client) | Circuit-breaker state store. |
+| `keyProvider` | `KeyProvider` | unset (falls back to config keys) | Highest-priority provider API-key resolver. |
+| `priceProvider` | `PriceProvider` | unset (app computes cost) | Token usage to USD cost seam. |
+| `generateId` | `() => string` | `() => crypto.randomUUID()` | Request ids and tool-call fallback ids. |
+| `onUsage` | `(usage, meta) => void` | unset | Per-result metering callback. |
+| `onFinish` | `(meta) => void` | unset | Final-result callback. |
+
+### Member shapes
+
+The interfaces are exported from the package root (`@deuz-sdk/core`) via `export type *`.
+
+```ts
+interface Clock {
+  now(): number;
+  // Schedules a callback; returns a canceller.
+  setTimeout(fn: () => void, ms: number): () => void;
+}
+
+interface Logger {
+  debug(message: string, fields?: Record<string, unknown>): void;
+  info(message: string, fields?: Record<string, unknown>): void;
+  warn(message: string, fields?: Record<string, unknown>): void;
+  error(message: string, fields?: Record<string, unknown>): void;
+}
+
+interface Tracer {
+  startSpan(name: string, attributes?: Record<string, unknown>): Span;
+}
+
+interface BreakerStore {
+  get(key: string): BreakerState | undefined | Promise<BreakerState | undefined>;
+  set(key: string, state: BreakerState): void | Promise<void>;
+}
+
+interface KeyProvider {
+  getKey(provider: string): string | undefined | Promise<string | undefined>;
+}
+
+interface PriceProvider {
+  priceUsage(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
+}
+```
+
+`UsageMeta` (passed to `onUsage`) carries `{ model, reason: 'finished' | 'aborted' | 'error', ttftMs? }`. `FinishMeta` (passed to `onFinish`) carries `{ model, finishReason }`.
+
+### Where `deps` lives
+
+`deps` is part of `CommonCallOptions`, so it rides on every call:
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Hi' }],
+  deps: {
+    logger: console, // matches the Logger shape
+    onUsage: (usage, meta) => {
+      console.log(meta.model, usage.totalTokens, meta.reason);
+    },
+  },
+});
+```
+
+`onUsage` / `onFinish` also exist as top-level call options. The call-level option, when present, *overrides* `deps.onUsage` / `deps.onFinish` — they never both fire (the G10 rule).
+
+## `resolveDependencies`
+
+Applies the defaults to a (possibly empty) bag, returning a `ResolvedDependencies` where the core-required fields (`fetch`, `clock`, `logger`, `tracer`, `breakerStore`, `generateId`) are non-optional. You rarely call this directly — the inference layer does — but it is exported for advanced wiring and tests.
+
+```ts
+import { resolveDependencies } from '@deuz-sdk/core';
+
+const deps = resolveDependencies({ generateId: () => 'fixed-id' });
+deps.fetch; // bound globalThis.fetch
+deps.generateId(); // 'fixed-id'
+```
+
+## `createClient`
+
+Optional convenience wrapper. The canonical API is the free functions ([`streamChat`](/docs/core/stream-chat), [`generateText`](/docs/core/generate-text), [`generateObject`](/docs/core/generate-object)); `createClient` pre-binds shared `deps`, `apiKeys`, and `baseUrls` so heavy callers don't repeat them on every call.
+
+```ts
+interface DeuzClient {
+  readonly config: Readonly<ClientConfig>;
+  streamChat: StreamChat;
+  generateText: GenerateText;
+  generateObject: GenerateObject;
+}
+
+function createClient(config?: ClientConfig): DeuzClient;
+```
+
+`ClientConfig`:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `apiKeys` | `Partial<Record<'anthropic' \| 'openai' \| 'xai' \| 'google', string>>` | Lowest-priority key source (see [precedence](#key--baseurl-precedence-g1)). |
+| `baseUrls` | `Partial<Record<string, string>>` | Per-provider base URL overrides. |
+| `deps` | `Dependencies` | Shared injection bag, merged into every call. |
+
+App-wide setup — bind keys and metering once, then call the methods anywhere:
+
+```ts title="lib/deuz.ts"
+import { createClient } from '@deuz-sdk/core';
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+export const deuz = createClient({
+  apiKeys: {
+    anthropic: process.env.ANTHROPIC_API_KEY!,
+    openai: process.env.OPENAI_API_KEY!,
+  },
+  deps: {
+    priceProvider: createPriceProvider(),
+    onUsage: (usage, meta) => track(meta.model, usage, meta.reason),
+  },
+});
+
+// elsewhere — no key/deps repetition; model factory needs no apiKey now.
+export const anthropic = createAnthropic();
+
+const result = deuz.streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Hi' }],
+});
+```
+
+Per-call `deps` are shallow-merged over the client's shared `deps`, so any single call can override a member (e.g. swap `logger` for one request). Note the breaker store: it is resolved **once per client** so the circuit breaker actually accumulates state across calls (the G11 rule) — a fresh in-memory store per call would never trip.
+
+`createClient` performs no I/O on construction. It is part of the edge-safe surface (`@deuz-sdk/core/edge`).
+
+## Key & baseURL precedence (G1)
+
+Provider credentials and base URLs come from several places; the resolver layers them in a fixed order. There is no env-reading inside the SDK — supply keys explicitly.
+
+**API key** — first non-empty wins, else `AuthenticationError`:
+
+1. `deps.keyProvider.getKey(provider)` — only if you actually supplied a `keyProvider`.
+2. Factory config — `createAnthropic({ apiKey })` etc.
+3. `createClient({ apiKeys })` table.
+4. Otherwise throw `AuthenticationError`.
+
+**baseURL** — first defined wins:
+
+1. Factory config — `createAnthropic({ baseURL })`.
+2. `createClient({ baseUrls })` table.
+3. Built-in wire default for the provider.
+
+**fetch** — factory `fetch` wins over `deps.fetch`. Caller `headers` (call-level) outrank factory `headers`.
+
+Client-level `apiKeys` are intentionally the *lowest* key source and are **not** wrapped into a `keyProvider` — doing so would invert the precedence above.
+
+```ts
+import { createClient } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import type { KeyProvider } from '@deuz-sdk/core';
+
+const keyProvider: KeyProvider = { getKey: async () => 'kp-key' };
+
+const client = createClient({
+  apiKeys: { anthropic: 'client-key' }, // lowest
+  deps: { keyProvider }, // highest — wins
+});
+
+// Factory key would sit in the middle:
+const anthropic = createAnthropic({ apiKey: 'factory-key' });
+// Resolved key for this call is 'kp-key' (keyProvider beats everything).
+client.streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Hi' }],
+});
+```
+
+## Recipes
+
+### Custom `fetch` (proxy, retries, instrumentation)
+
+Inject any `fetch`-compatible function — useful for an outbound proxy, request logging, or a regional gateway. Pass it on the factory (highest precedence) or via `deps.fetch`.
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const proxiedFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, headers: { ...init?.headers, 'x-proxy': 'edge-eu' } });
+
+const anthropic = createAnthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY!,
+  fetch: proxiedFetch, // factory fetch wins over deps.fetch
+});
+
+streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Hi' }],
+});
+```
+
+### Key rotation with a `KeyProvider`
+
+A `KeyProvider` is resolved on every call and may be async, so it can read from a secrets vault, rotate across a pool, or scope keys per tenant.
+
+```ts
+import { createClient } from '@deuz-sdk/core';
+import type { KeyProvider } from '@deuz-sdk/core';
+
+const pool = ['sk-ant-a', 'sk-ant-b', 'sk-ant-c'];
+let n = 0;
+
+const rotating: KeyProvider = {
+  async getKey(provider) {
+    if (provider !== 'anthropic') return undefined; // fall through to lower-priority sources
+    return pool[n++ % pool.length];
+  },
+};
+
+export const deuz = createClient({ deps: { keyProvider: rotating } });
+```
+
+Returning `undefined` from `getKey` lets resolution fall through to the factory config and then the `createClient` `apiKeys` table — so a partial provider can cover only the providers it knows.
+
+### Cost metering with a `PriceProvider`
+
+Combine the bundled price table with the metering callback. `createPriceProvider` (from `@deuz-sdk/core/pricing`) returns a `PriceProvider`; `onUsage` reports the usage breakdown per result.
+
+```ts
+import { createClient } from '@deuz-sdk/core';
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+
+export const deuz = createClient({
+  deps: {
+    priceProvider: createPriceProvider({ margin: 1.3 }), // 30% markup
+    onUsage: (usage, meta) => {
+      // meta.reason is 'finished' | 'aborted' | 'error'
+      console.log(meta.model, usage.totalTokens, meta.ttftMs);
+    },
+  },
+});
+```
+
+### Deterministic tests: fixed `clock` + `generateId`
+
+Injecting `clock` and `generateId` makes timeouts, retry backoff jitter, and ids fully deterministic — no fake timers, no real wall clock. Backoff jitter is derived from `generateId()`, so pinning it pins the retry delays too.
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import type { Clock } from '@deuz-sdk/core';
+
+// Fire short backoff timers immediately; never fire the long ttft/total timers.
+const testClock: Clock = {
+  now: () => 0,
+  setTimeout: (fn, ms) => {
+    if (ms < 60_000) {
+      const id = setTimeout(fn, 0);
+      return () => clearTimeout(id);
+    }
+    return () => {};
+  },
+};
+
+// A canned fetch standing in for the network (return your own SSE ReadableStream).
+const mockFetch: typeof fetch = async () => new Response(new ReadableStream());
+
+const result = streamChat({
+  model: createAnthropic({ apiKey: 'k', fetch: mockFetch })('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+  deps: { clock: testClock, generateId: () => 'fixed-id' },
+});
+```
+
+Pair this with an injected `deps.fetch` that returns a canned SSE `ReadableStream` and you have a hermetic, network-free test of the full streaming pipeline.
+
+## Related
+
+- [streamChat](/docs/core/stream-chat) — the synchronous, never-throws streaming entry point.
+- [generateText](/docs/core/generate-text) and [generateObject](/docs/core/generate-object).
+- [Pricing](/docs/modules/pricing) — the `PriceProvider` and 2026 price table.
+- [Errors](/docs/core/errors) — `AuthenticationError` and the rest of the taxonomy.

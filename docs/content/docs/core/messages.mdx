@@ -1,0 +1,238 @@
+---
+title: Messages & Parts
+description: The canonical Message/Part model every provider speaks — roles, text, vision, PDFs, and reasoning round-trips.
+---
+
+Every call into `@deuz-sdk/core` takes a `Message[]`. This is the SDK's single canonical conversation format: you build messages once, and each adapter serializes them to its own wire (Anthropic blocks, OpenAI `content` arrays, Gemini `parts`). You never hand-roll a provider's request shape.
+
+## Messages
+
+A `Message` has a `role` and `content`. `content` is either a plain `string` (shorthand for a single text part) or an array of `Part`s.
+
+```ts
+import type { Message } from '@deuz-sdk/core';
+
+const messages: Message[] = [
+  { role: 'system', content: 'You are concise.' },
+  { role: 'user', content: 'Hello' }, // string shorthand
+  {
+    role: 'user',
+    content: [{ type: 'text', text: 'Hello' }], // explicit Part[]
+  },
+];
+```
+
+Internally, string content is coerced to a single `TextPart` and author order is preserved. The two forms above are equivalent.
+
+### Roles
+
+| Role | Use |
+| --- | --- |
+| `system` | Instructions. All `system` messages are concatenated (joined by a blank line) and lifted to the provider's top-level system slot. |
+| `user` | Human input — text and media. |
+| `assistant` | Model output you replay back: text, `reasoning`, and `tool_use` parts. |
+| `tool` | Tool execution results (`tool_result` parts). The agentic loop emits these for you. |
+
+System handling is automatic: adapters that need a top-level system field (Anthropic, Gemini `systemInstruction`) extract it; OpenAI-style wires keep it inline. You just add `system` messages anywhere in the array.
+
+## Parts
+
+`Part` is a discriminated union on `type`. The full set is locked in the 1.0 surface:
+
+| `type` | Fields | Direction |
+| --- | --- | --- |
+| `text` | `text: string` | in / out |
+| `image` | `image: string \| Uint8Array`, `mediaType?: string` | in (also carries PDFs/files) |
+| `reasoning` | `text: string`, `signature?`, `encrypted?`, `redacted?` | out (replay back in) |
+| `tool_use` | `id`, `name`, `input: unknown`, `providerMetadata?` | out (replay back in) |
+| `tool_result` | `toolUseId: string`, `result: unknown`, `isError?` | in |
+
+There is no separate `file` part — non-image binary input (PDF, audio, video) rides on the `image` part via its `mediaType`. See [PDFs and other files](#pdfs-and-other-files).
+
+```ts
+import type {
+  Part,
+  TextPart,
+  ImagePart,
+  ReasoningPart,
+  ToolUsePart,
+  ToolResultPart,
+} from '@deuz-sdk/core';
+```
+
+## Vision inputs
+
+An `ImagePart`'s `image` field accepts four source forms. The SDK resolves each into the right wire shape per provider:
+
+| `image` value | Detected as | Notes |
+| --- | --- | --- |
+| `'https://…'` / `'http://…'` | URL | Sent as a URL reference where supported; `mediaType` inferred from the extension. |
+| `'data:image/png;base64,…'` | data URL | `mediaType` parsed from the prefix. |
+| `'iVBORw0KGgo…'` (bare string) | raw base64 | Pass `mediaType` (defaults to `image/jpeg`). |
+| `Uint8Array` | raw bytes | Base64-encoded for you (edge-safe, no `Buffer`). Pass `mediaType`. |
+
+```ts title="vision.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { readFile } from 'node:fs/promises';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const bytes = new Uint8Array(await readFile('./chart.png'));
+
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What does this chart show?' },
+        { type: 'image', image: bytes, mediaType: 'image/png' },
+      ],
+    },
+  ],
+});
+```
+
+A URL or data URL works the same way:
+
+```ts
+const message: Message = {
+  role: 'user',
+  content: [
+    { type: 'text', text: 'Describe this image.' },
+    { type: 'image', image: 'https://example.com/cat.jpg' },
+  ],
+};
+```
+
+### Provider support differences
+
+Vision availability comes from the capability registry (`vision` flag), not from the part itself. The part is portable; only the model decides whether it can read the pixels.
+
+| Wire | Image handling |
+| --- | --- |
+| Anthropic | URL form → `{ source: { type: 'url' } }`; bytes/base64/data URL → `{ source: { type: 'base64' } }`. |
+| OpenAI / xAI / Gemini-compat | All forms collapse to an `image_url` (a URL passes through; bytes become a `data:` URL). |
+| Gemini native | URL → `fileData.fileUri`; everything else → `inlineData`. |
+
+Older text-only models (e.g. some GPT/Grok base chat models) have `vision: false` in the registry; sending an image to them is a usage error, not an SDK feature. Check capabilities if you support arbitrary model ids.
+
+## PDFs and other files
+
+Native PDF understanding is a Gemini-native feature (`nativePdf: true` for `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-pro`, `gemini-3.5-flash`). Deliver a PDF as an `image` part with `mediaType: 'application/pdf'` — the native adapter maps it to an `inlineData` (or `fileData`) document block:
+
+```ts title="pdf-gemini.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createGoogleNative } from '@deuz-sdk/core/google';
+import { readFile } from 'node:fs/promises';
+
+const google = createGoogleNative({ apiKey: process.env.GEMINI_API_KEY! });
+
+const pdf = new Uint8Array(await readFile('./report.pdf'));
+
+const { text } = await generateText({
+  model: google('gemini-2.5-flash'),
+  messages: [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Summarize the key findings.' },
+        { type: 'image', image: pdf, mediaType: 'application/pdf' },
+      ],
+    },
+  ],
+});
+```
+
+For media too large to inline (roughly >20 MB), upload it through the Files API and reference the returned `uri` instead of raw bytes:
+
+```ts
+import { uploadFile } from '@deuz-sdk/core/google/extras';
+
+const file = await uploadFile({
+  apiKey: process.env.GEMINI_API_KEY!,
+  bytes: pdf,
+  mimeType: 'application/pdf',
+});
+// Then use { type: 'image', image: file.uri, mediaType: 'application/pdf' }.
+```
+
+The `uri` is an `https://` URL, so it resolves to the native `fileData` form automatically. See [Gemini extras](/docs/providers/google) for `uploadFile`, `waitForFileActive`, and explicit context caching.
+
+## Reasoning parts
+
+`ReasoningPart` carries a model's thinking output. It is produced on the way out (as `reasoning-delta` events on [`fullStream`](/docs/core/stream-chat), and as `reasoning` parts in `response.messages`) and **must be replayed back** in multi-step tool loops. Dropping it breaks the next turn:
+
+- **Anthropic** emits `thinking` blocks with a `signature` (or `redacted_thinking`); both must be returned, thinking-first.
+- **Gemini** carries a `thoughtSignature`; without it the follow-up request 400s.
+- **OpenAI Responses** uses encrypted reasoning.
+
+The agentic loop in [`generateText`](/docs/core/generate-text) and [`streamChat`](/docs/core/stream-chat) preserves these automatically — each step builds a new history array that includes the prior `reasoning` and `tool_use` parts, so you rarely construct a `ReasoningPart` by hand. The shape:
+
+```ts
+import type { ReasoningPart } from '@deuz-sdk/core';
+
+const reasoning: ReasoningPart = {
+  type: 'reasoning',
+  text: 'The user wants a summary…',
+  signature: 'opaque-provider-signature',
+};
+```
+
+### thoughtSignature round-trip on Gemini
+
+On Gemini native, a streamed tool call arrives with its `thoughtSignature` attached. The adapter stores it on the `ToolUsePart`'s `providerMetadata` so the next turn echoes it back verbatim:
+
+```ts
+// A tool_use part returned by Gemini native:
+{
+  type: 'tool_use',
+  id: 'call_1',
+  name: 'get_weather',
+  input: { city: 'Paris' },
+  providerMetadata: { google: { thoughtSignature: 'sig-123' } },
+}
+```
+
+When you replay this part, the adapter re-attaches `thoughtSignature` to the outgoing `functionCall`. Preserve `providerMetadata` untouched — it is opaque round-trip data, not something to inspect or rewrite.
+
+## Multi-turn with tools
+
+A complete conversation history mixes all part kinds. Roles map directly to provider turns; the `assistant` turn holds `tool_use`, and the `tool` turn holds the matching `tool_result` keyed by `toolUseId`:
+
+```ts title="multi-turn.ts"
+import type { Message } from '@deuz-sdk/core';
+
+const history: Message[] = [
+  { role: 'user', content: 'What is the weather in Paris?' },
+  {
+    role: 'assistant',
+    content: [
+      { type: 'text', text: 'Let me check.' },
+      { type: 'tool_use', id: 'call_1', name: 'get_weather', input: { city: 'Paris' } },
+    ],
+  },
+  {
+    role: 'tool',
+    content: [
+      { type: 'tool_result', toolUseId: 'call_1', result: { tempC: 18, sky: 'clear' } },
+    ],
+  },
+];
+```
+
+Every `tool_use` must be answered by a `tool_result` with a matching `toolUseId`, or Anthropic returns a 400. A failed tool is reported with `isError: true` rather than omitting the result. When you let the SDK run the [tool loop](/docs/agents/tool-loop), it enforces this for you and appends the assistant/tool turns to `response.messages`.
+
+## Normalization rules
+
+- String content → a single `TextPart`. Author order is never reordered (except Anthropic's thinking-first requirement, handled by the adapter).
+- All `system` messages are pulled out and concatenated with blank lines between them.
+- A `tool`-role message is folded into a `user` turn on wires (Anthropic, Gemini) that have no dedicated tool role.
+- Unknown future part kinds are additive — keep a `default` branch when you switch over `Part.type`.
+
+## See also
+
+- [streamChat](/docs/core/stream-chat) — streaming responses and `fullStream` parts.
+- [generateText](/docs/core/generate-text) — non-streaming, with `response.messages`.
+- [Tool loop](/docs/agents/tool-loop) — automatic multi-step `tool_use` / `tool_result` handling.

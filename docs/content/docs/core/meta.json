@@ -1,0 +1,13 @@
+{
+  "title": "Core",
+  "defaultOpen": true,
+  "pages": [
+    "stream-chat",
+    "generate-text",
+    "generate-object",
+    "embeddings",
+    "messages",
+    "errors",
+    "dependencies"
+  ]
+}

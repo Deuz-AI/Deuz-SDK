@@ -5,7 +5,7 @@
  * a CSV state machine, token-aware chunkers, the native-doc-vs-vector threshold
  * policy, and a retrieval pipeline whose every stateful stage (parser, embedder,
  * vector store, reranker) is an injected seam. The HEAVY binary parsers
- * (unpdf / mammoth / xlsx) live in `@deuz/core/rag/node` and are registered into
+ * (unpdf / mammoth / xlsx) live in `@deuz-sdk/core/rag/node` and are registered into
  * a `ParserRegistry` — core never imports a parser library.
  */
 import type { Part } from './types/message';
@@ -135,7 +135,7 @@ export function sniffMime(
 }
 
 // ===================================================================
-// Parser registry — heavy impls injected from @deuz/core/rag/node.
+// Parser registry — heavy impls injected from @deuz-sdk/core/rag/node.
 // ===================================================================
 
 export type DocBlockType = 'heading' | 'paragraph' | 'list' | 'table' | 'code';
@@ -246,7 +246,7 @@ export async function parse(
   if (!parser) {
     throw new RagError(
       'rag_parser_not_registered',
-      `No parser registered for '${mime}'. Import @deuz/core/rag/node and register one.`,
+      `No parser registered for '${mime}'. Import @deuz-sdk/core/rag/node and register one.`,
       { mime },
     );
   }

@@ -1,5 +1,5 @@
 /**
- * memory.ts — PURE, edge-safe agent-memory orchestration for @deuz/core (Faz 3).
+ * memory.ts — PURE, edge-safe agent-memory orchestration for @deuz-sdk/core (Faz 3).
  *
  * Derived from mem0's extract→reconcile→apply pipeline plus the Obsidian /
  * markdown-graph and Letta/Anthropic memory-tool patterns. Everything stateful

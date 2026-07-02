@@ -1,0 +1,231 @@
+---
+title: streamChat
+description: The primary streaming entry point — canonical delta stream, lazy pump, never throws synchronously.
+---
+
+`streamChat` is the canonical streaming call. You give it a model and messages; it returns a `StreamChatResult` **synchronously** with a `textStream`, a canonical `fullStream` of `StreamPart` deltas, and `usage` / `finishReason` promises. The network pump starts lazily on first access of any output, so the call itself does no I/O and never throws. Reach for it whenever you want token-by-token output; use [generateText](/docs/core/generate-text) for a single buffered result.
+
+```ts title="basic.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Write a haiku about TypeScript.' }],
+});
+
+for await (const chunk of result.textStream) {
+  process.stdout.write(chunk);
+}
+
+console.log('\n', await result.usage);
+```
+
+## Signature
+
+```ts
+function streamChat(options: StreamChatOptions): StreamChatResult;
+```
+
+`StreamChatOptions` is an alias of `CommonCallOptions` — the same option bag every call shares. With a non-empty `tools` map, `streamChat` runs the streaming agentic loop ([Tool Loop](/docs/agents/tool-loop)) and `fullStream` spans multiple steps; without tools it is a single-turn stream.
+
+## Options
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `model` | `LanguageModel` | — | Required. A descriptor from a provider factory, e.g. `createAnthropic(...)('claude-opus-4-8')`. |
+| `messages` | `Message[]` | — | Required. Canonical messages. A system prompt is a message with `role: 'system'` (there is no separate `system` option). |
+| `signal` | `AbortSignal` | — | Cancellation, propagated to the underlying fetch. See [Abort](#abort). |
+| `maxRetries` | `number` | `2` | Pre-first-byte retry budget. See [Retries](#retries). |
+| `headers` | `Record<string, string>` | — | Extra request headers, merged into the wire request. |
+| `deps` | `Dependencies` | in-memory defaults | Per-call infrastructure seam (`fetch`, `clock`, `logger`, `generateId`, …). |
+| `onUsage` | `(usage: Usage, meta: UsageMeta) => void` | — | Fired once with final usage. `meta.reason` is `'finished'`, `'aborted'`, or `'error'`; `meta.ttftMs` is time-to-first-token. |
+| `onFinish` | `(meta: FinishMeta) => void` | — | Fired on successful completion with `{ model, finishReason }`. |
+| `temperature` | `number` | — | Sampling temperature. |
+| `maxOutputTokens` | `number` | — | Cap on generated tokens. |
+| `topP` | `number` | — | Nucleus sampling. |
+| `stopSequences` | `string[]` | — | Stop strings. |
+| `effort` | `'none' \| 'low' \| 'medium' \| 'high'` | — | Canonical reasoning effort; each adapter maps it to its own unit. |
+| `responseFormat` | `'text' \| 'json'` | `'text'` | Free-form text vs. JSON mode. For schema-validated output use [generateObject](/docs/core/generate-object). |
+| `tools` | `ToolSet` | — | Enables the agentic loop. See [Tool Loop](/docs/agents/tool-loop). |
+| `toolChoice` | `ToolChoice` | — | Force / disable / pick a tool. |
+| `maxSteps` | `number` | `1` | Max model turns in the agentic loop. |
+| `stopWhen` | `StopCondition \| StopCondition[]` | — | Stop predicate(s), OR-ed with `maxSteps`. |
+| `maxToolConcurrency` | `number` | `5` | Max parallel tool executions per step. |
+| `onStepFinish` | `(step: StepResult) => void` | — | Per-step callback in the agentic loop. |
+
+The sampling and tool options come from `CommonCallOptions` and are shared with `generateText` and `generateObject`.
+
+## Return value
+
+`streamChat` returns a `StreamChatResult` object synchronously:
+
+```ts
+interface StreamChatResult {
+  textStream: AsyncIterable<string>;
+  fullStream: AsyncIterable<StreamPart>;
+  usage: Promise<Usage>;
+  finishReason: Promise<FinishReason>;
+}
+```
+
+- **`textStream`** — text-only projection. Yields `string` chunks (the `text-delta` parts). If the stream errors, iterating `textStream` **throws** the error.
+- **`fullStream`** — the full canonical delta stream of `StreamPart`. Errors surface as an `error` part, not a throw.
+- **`usage`** — resolves once with the final `Usage` breakdown (input / output / reasoning / cache tokens).
+- **`finishReason`** — resolves with `'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error' | 'aborted'`.
+
+### StreamPart types
+
+`fullStream` is an open discriminated union — always keep a `default` case, because new variants are additive. The current parts:
+
+| `type` | Shape | Emitted |
+| --- | --- | --- |
+| `text-delta` | `{ text }` | Assistant text fragment. |
+| `reasoning-delta` | `{ text, signature? }` | Extended-thinking / reasoning fragment. |
+| `tool-call-delta` | `{ id, name?, argsTextDelta, providerMetadata? }` | Raw tool-args JSON fragment — accumulate as string, parse once at block end. |
+| `source` | `{ id, url?, title? }` | Citation / grounding source. |
+| `finish` | `{ usage, finishReason }` | Terminal part of a single turn. |
+| `error` | `{ error }` | Failure; the stream ends after this. |
+| `step-start` | `{ stepIndex }` | Agentic loop: a step began. |
+| `step-finish` | `{ stepIndex, finishReason, usage }` | Agentic loop: a step ended. |
+| `tool-call` | `{ toolCallId, toolName, input }` | Final parsed tool call. |
+| `tool-result` | `{ toolCallId, toolName, output, isError? }` | Result of executing a tool call. |
+
+`step-*`, `tool-call`, and `tool-result` only appear when `tools` are provided.
+
+## G2: never throws synchronously
+
+`streamChat` returns synchronously and **never throws** — not even on a missing API key. There is no async work in the call body; the pump starts lazily on the first access of any output. Failures surface in two ways:
+
+- an `error` part appended to `fullStream` (after which the stream ends), and
+- a **rejected** `usage` and `finishReason` promise.
+
+```ts
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+  // missing/invalid key → no synchronous throw
+});
+
+for await (const part of result.fullStream) {
+  if (part.type === 'error') {
+    console.error('stream failed:', part.error);
+    break;
+  }
+}
+
+// the matching promise rejects — handle it
+const usage = await result.usage.catch((err) => {
+  console.error(err.code); // e.g. 'authentication'
+  return null;
+});
+```
+
+Because the pump is lazy, simply *constructing* a `StreamChatResult` does no network I/O — handy when pre-binding a [client](/docs/core/dependencies). The pump kicks off on the first `for await` over either stream, or the first `await` of `usage` / `finishReason`.
+
+## fullStream: switching over part types
+
+Use `fullStream` when you need reasoning, sources, tool events, or final usage in one pass.
+
+```ts title="full-stream.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Think, then answer: 2+2?' }],
+});
+
+for await (const part of result.fullStream) {
+  switch (part.type) {
+    case 'reasoning-delta':
+      process.stdout.write(`\x1b[2m${part.text}\x1b[0m`); // dim thinking
+      break;
+    case 'text-delta':
+      process.stdout.write(part.text);
+      break;
+    case 'finish':
+      console.log('\nreason:', part.finishReason, 'tokens:', part.usage.totalTokens);
+      break;
+    case 'error':
+      console.error('\nerror:', part.error);
+      break;
+    default:
+      break; // keep a default — the union is open
+  }
+}
+```
+
+## Abort
+
+Pass an `AbortSignal`; it is merged with the SDK's internal timeouts and propagated to the underlying fetch. A **user abort** is not an error — it resolves `finishReason` to `'aborted'` with whatever partial `usage` accumulated, and `onUsage` fires with `meta.reason === 'aborted'`.
+
+```ts title="abort.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const controller = new AbortController();
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Write a very long essay.' }],
+  signal: controller.signal,
+});
+
+setTimeout(() => controller.abort(), 1000);
+
+// A user abort is not an error: the stream ends cleanly (no `error` part,
+// no throw) and the promises resolve.
+for await (const chunk of result.textStream) process.stdout.write(chunk);
+
+console.log(await result.finishReason); // 'aborted'
+console.log(await result.usage); // partial usage
+```
+
+A timeout, by contrast, is a failure: it surfaces a `TimeoutError` (not `'aborted'`). Two timers guard every request — time-to-first-token (~60s, cleared when the first content delta arrives) and a total ceiling (~300s).
+
+## Retries
+
+Retries are **pre-first-byte only**. Before any content streams, a retryable upstream failure (e.g. 429 / 529 / network error) is retried up to `maxRetries` times (default `2`) with exponential backoff, full jitter, and `Retry-After` honored. Once the first delta is emitted, a mid-stream error is final — it is not retried.
+
+```ts
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+  maxRetries: 4,
+});
+```
+
+## Multiple consumers
+
+A `StreamChatResult` is internally fanned out by a broadcaster: `textStream`, `fullStream`, `usage`, and `finishReason` each draw from their own buffered branch. Subscriptions are registered **before** the lazy pump starts, so awaiting `usage` first and iterating the stream later loses nothing — the buffered parts are still delivered in order.
+
+```ts title="usage-then-stream.ts"
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+});
+
+// Awaiting usage first kicks off the pump...
+const usagePromise = result.usage;
+
+// ...but iterating later still yields every text chunk.
+let text = '';
+for await (const chunk of result.textStream) text += chunk;
+
+console.log(text, await usagePromise);
+```
+
+Note: each branch buffers independently, so a branch you never drain holds its queue in memory until the stream ends (bounded by the response size).
+
+## Related
+
+- [generateText](/docs/core/generate-text) — buffered, non-streaming variant.
+- [generateObject](/docs/core/generate-object) — schema-validated structured output.
+- [Tool Loop](/docs/agents/tool-loop) — the agentic loop enabled by `tools`.
+- [Dependencies & Clients](/docs/core/dependencies) — `createClient` pre-binds shared `deps`, keys, and base URLs.

@@ -1,0 +1,311 @@
+---
+title: Client-Side Tools
+description: Tools without an execute function — the loop stops and hands the pending tool call back to the caller for a UI confirmation, browser API, or human-in-the-loop round-trip.
+---
+
+A **client tool** is a `Tool` with no `execute` function. The model can still call it, but the SDK can't run it server-side — so the [agentic loop](/docs/agents/tool-loop) stops as soon as a client tool is called and returns the pending tool call to you. The caller owns the round-trip: collect a user confirmation, hit a browser-only API, or run a human-in-the-loop approval, then append a `tool_result` and call again. Use this whenever the work can't (or shouldn't) happen on the server inside the loop.
+
+## How it works
+
+Every tool in a `ToolSet` is either a **server tool** (has `execute`, the loop runs it) or a **client tool** (no `execute`). The distinction is purely the presence of `execute`:
+
+```ts
+import type { ToolSet } from '@deuz-sdk/core';
+import { z } from 'zod';
+
+const tools: ToolSet = {
+  // server tool — the loop runs this and feeds the result back automatically
+  getWeather: {
+    description: 'Get the current weather for a city.',
+    parameters: z.object({ city: z.string() }),
+    execute: async ({ city }) => ({ city, tempC: 22 }),
+  },
+  // client tool — no execute; the loop stops and returns the call to you
+  confirmPurchase: {
+    description: 'Ask the user to confirm a purchase before charging.',
+    parameters: z.object({ sku: z.string(), amount: z.number() }),
+  },
+};
+```
+
+When a step's tool calls include **any** client tool, the loop stops after appending the assistant turn — it does **not** execute the other tools in that step, and it does **not** add a `tool_result` turn. Control returns to you with the pending call(s). This holds in both [generateText](/docs/core/generate-text) and [streamChat](/docs/core/stream-chat).
+
+## Where the pending call surfaces
+
+### In a `generateText` result
+
+The loop stops and the pending call appears in both `steps` and the top-level convenience fields. The final step has `toolCalls` but **empty `toolResults`** (nothing ran):
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Buy SKU-42 for me.' }],
+  maxSteps: 5,
+  tools: {
+    confirmPurchase: {
+      description: 'Ask the user to confirm a purchase before charging.',
+      parameters: z.object({ sku: z.string(), amount: z.number() }),
+    },
+  },
+});
+
+const pending = result.toolCalls ?? [];
+for (const call of pending) {
+  // { toolCallId, toolName, args }
+  console.log(call.toolName, call.args);
+}
+
+// result.response.messages ends with the assistant turn (the tool_use),
+// and there is NO tool turn yet — that's yours to add.
+```
+
+Each pending call is a `ToolCall`:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `toolCallId` | `string` | Provider-assigned id. You **must** echo this back as the `tool_result`'s `toolUseId`. |
+| `toolName` | `string` | Which tool the model called. |
+| `args` | `unknown` | Parsed arguments (validated only when a server tool runs; validate client-tool args yourself). |
+
+### Over the UI wire
+
+In a streaming call, the canonical `tool-call` `StreamPart` is emitted before the loop stops. The [Deuz UI wire](/docs/modules/ui-streaming) re-frames it as a `tool-call` `DeuzUIPart` so the browser sees the pending call as it arrives:
+
+```ts
+{ type: 'tool-call', toolCallId: string, toolName: string, input: unknown }
+```
+
+You may also receive `tool-input-delta` parts (`{ toolCallId, toolName?, delta }`) as the argument JSON streams in. The step is then framed as a `step-finish`, followed by the final parsed `tool-call`. Because a client tool never executes, **no `tool-result` part follows** for that call — the stream ends with `finish`.
+
+## Continuing: append a `tool_result`, then call again
+
+Once you have the answer (the user confirmed, the browser API returned, etc.), build a `tool` message whose content carries a `tool_result` part for **every** pending `toolCallId`, append it after the assistant turn, and call the model again. The `tool_result` part shape (`src/types/message.ts`):
+
+```ts
+interface ToolResultPart {
+  type: 'tool_result';
+  toolUseId: string;   // === the pending call's toolCallId
+  result: unknown;     // your answer (string or JSON-serializable)
+  isError?: boolean;   // optional; set true to report a failure to the model
+}
+```
+
+A complete server-side continuation:
+
+```ts title="continue.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import type { Message } from '@deuz-sdk/core';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const tools = {
+  confirmPurchase: {
+    description: 'Ask the user to confirm a purchase before charging.',
+    parameters: z.object({ sku: z.string(), amount: z.number() }),
+  },
+};
+
+let messages: Message[] = [{ role: 'user', content: 'Buy SKU-42 for $30.' }];
+
+// 1) First call — stops at the client tool.
+const first = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages,
+  maxSteps: 5,
+  tools,
+});
+messages = [...messages, ...first.response.messages]; // includes the assistant tool_use turn
+
+// 2) Resolve the pending call however you like (here: a confirmation gate).
+const toolResults = (first.toolCalls ?? []).map((call) => {
+  const approved = userApproved(call.args); // your own logic
+  return {
+    type: 'tool_result' as const,
+    toolUseId: call.toolCallId,
+    result: approved ? { status: 'charged' } : { status: 'declined' },
+  };
+});
+
+// 3) Append ONE tool message answering every pending call, then call again.
+messages = [...messages, { role: 'tool', content: toolResults }];
+
+const second = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages,
+  maxSteps: 5,
+  tools,
+});
+
+console.log(second.text); // the model's reply now that it has the result
+
+function userApproved(_args: unknown): boolean {
+  return true;
+}
+```
+
+Every pending `toolCallId` must get a `tool_result` in the appended `tool` message — Anthropic rejects a follow-up request that leaves a `tool_use` unanswered.
+
+## Pattern: human-in-the-loop approval
+
+A client tool is the natural seam for an approval gate. Expose a tool with no `execute`, let the model call it, then decide in your own code (or with a real human) whether to proceed — replaying an approved call against a server-side executor or returning a denial as the `tool_result`.
+
+```ts
+const tools = {
+  // Model proposes the action; humans approve before anything runs.
+  proposeRefund: {
+    description: 'Propose a refund for an order. A human must approve it.',
+    parameters: z.object({ orderId: z.string(), amount: z.number() }),
+  },
+};
+
+// After the loop stops with a pending proposeRefund call:
+const call = (result.toolCalls ?? [])[0];
+const decision = await askHuman(call?.args); // { approved, note, hard }
+
+const toolResult = {
+  type: 'tool_result' as const,
+  toolUseId: call!.toolCallId,
+  result: decision.approved
+    ? await issueRefund(call!.args) // run the real side effect yourself
+    : { denied: true, reason: decision.note },
+  isError: !decision.approved && decision.hard,
+};
+```
+
+The `Tool` type also carries a `needsApproval` field (`boolean` or a predicate). It is reserved in the 1.0 surface; the streaming approval round-trip that consumes it is not wired yet, so drive approval with the client-tool pattern above for now.
+
+## Example: Next.js route + `readDeuzStream`
+
+Stream the first turn over the [Deuz UI wire](/docs/modules/ui-streaming). The browser detects the pending `tool-call`, resolves it (here a browser-only geolocation call), then re-POSTs the full history with a `tool_result` appended.
+
+```ts title="app/api/chat/route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import type { Message } from '@deuz-sdk/core';
+
+export const runtime = 'edge';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function POST(req: Request) {
+  const { messages } = (await req.json()) as { messages: Message[] };
+
+  const result = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    messages,
+    maxSteps: 5,
+    tools: {
+      // client tool: only the browser can read the user's location
+      getUserLocation: {
+        description: 'Get the user’s current coordinates (runs in the browser).',
+        parameters: {
+          type: 'object',
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    },
+  });
+
+  return toDeuzStreamResponse(result);
+}
+```
+
+```ts title="client.ts"
+import { readDeuzStream } from '@deuz-sdk/core/ui';
+import type { Message, ToolResultPart } from '@deuz-sdk/core';
+
+async function send(messages: Message[]): Promise<Message[]> {
+  const res = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ messages }),
+  });
+
+  let text = '';
+  const pending: { toolCallId: string; input: unknown }[] = [];
+
+  for await (const part of readDeuzStream(res)) {
+    switch (part.type) {
+      case 'text-delta':
+        text += part.text;
+        break;
+      case 'tool-call':
+        // a client tool was called — remember it; nothing runs server-side
+        pending.push({ toolCallId: part.toolCallId, input: part.input });
+        break;
+      case 'error':
+        throw new Error(part.message);
+      default:
+        break;
+    }
+  }
+
+  // No pending client-tool call: the assistant produced a final answer.
+  if (pending.length === 0) {
+    return [...messages, { role: 'assistant', content: text }];
+  }
+
+  // Reconstruct the assistant tool_use turn the server already emitted...
+  const assistant: Message = {
+    role: 'assistant',
+    content: pending.map((p) => ({
+      type: 'tool_use' as const,
+      id: p.toolCallId,
+      name: 'getUserLocation',
+      input: p.input,
+    })),
+  };
+
+  // ...resolve each call in the browser...
+  const toolParts: ToolResultPart[] = await Promise.all(
+    pending.map(async (p) => ({
+      type: 'tool_result' as const,
+      toolUseId: p.toolCallId,
+      result: await readGeolocation(),
+    })),
+  );
+
+  // ...then re-POST history with the assistant turn + tool_result turn appended.
+  const next: Message[] = [
+    ...messages,
+    assistant,
+    { role: 'tool', content: toolParts },
+  ];
+  return send(next); // recurse until no client tool is pending
+}
+
+function readGeolocation(): Promise<{ lat: number; lon: number }> {
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
+      reject,
+    );
+  });
+}
+```
+
+The browser owns the loop: read the stream, resolve any pending client-tool call locally, append the `tool_result`, and POST again. Each round-trip keeps the history **immutable** (always spread into a new array) so prompt-cache hits and React state stay stable across requests.
+
+## Notes
+
+- A step that calls a client tool stops the loop **before** running any sibling server tools in the same step — resolve the client call and continue; the model will re-issue the rest if it still needs them.
+- The loop validates and self-heals **server** tool args. Client-tool `args` are returned to you unvalidated against `parameters` — validate them yourself before acting.
+- Mixing tools is fine: a `ToolSet` can hold both server tools (auto-run) and client tools (returned to you). The first client tool encountered stops the loop.
+
+## See also
+
+- [Tool loop](/docs/agents/tool-loop) — the full set of agentic invariants (immutable history, parallel execution, runaway guards, the Gemini stop-bug guard).
+- [Tools](/docs/agents/tools) — defining tools, schemas, and `toolChoice`.
+- [generateText](/docs/core/generate-text) — buffered agentic loop and result shape.
+- [streamChat](/docs/core/stream-chat) — the streaming counterpart.
+- [UI wire](/docs/modules/ui-streaming) — `toDeuzStreamResponse` / `readDeuzStream` and the `DeuzUIPart` types.

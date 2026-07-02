@@ -1,0 +1,129 @@
+---
+title: Introduction
+description: A pure, web-first, multi-provider TypeScript AI SDK with zero runtime dependencies and one canonical streaming wire.
+---
+
+`@deuz-sdk/core` is a from-scratch TypeScript AI SDK that talks to Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex AI, and Yunwu through **one canonical streaming protocol**. It depends on no other AI SDK, ships **zero runtime dependencies**, and runs anywhere `fetch` runs — Node, Deno, Bun, and Vercel/Cloudflare Edge. Use it when you want full control over the wire, deterministic and replayable behavior, and no vendor lock-in at the streaming or UI layer.
+
+```bash
+npm install @deuz-sdk/core
+```
+
+Requires **Node >= 22**. The chat core has nothing in `dependencies`. Optional peers are pulled in only if you use them: `zod` (or any Standard Schema library) plus `@standard-community/standard-json` for schema-typed [generateObject](/docs/core/generate-object); `@modelcontextprotocol/sdk` for [MCP](/docs/modules/mcp); `unpdf` / `mammoth` / `xlsx` for Node document parsing in [RAG](/docs/modules/rag).
+
+## Why it exists
+
+Most AI SDKs read environment variables, reach for `Date.now()` / `Math.random()`, and proxy a provider's raw bytes straight to your client. That makes them impure (hard to test), bound to one runtime, and locked to whatever shape the upstream provider chose. `@deuz-sdk/core` inverts all of that.
+
+| Principle | What it means in practice |
+| --- | --- |
+| **Pure core** | No `Date.now()`, `Math.random()`, `process.env`, or `console` in `src/`. Everything stateful — clock, logging, metering, circuit breaker, API keys — is injected through one `Dependencies` seam, so tests are deterministic and replayable. |
+| **Edge-safe** | Only Web APIs (`fetch`, Web Streams, `TextDecoder`, WebCrypto, `atob`/`btoa`). `node:*` and `Buffer` are forbidden by lint; Node-only code lives in dedicated `…/node` subpaths. |
+| **Zero deps** | The chat core ships nothing in `dependencies`. Heavy or stateful things are optional peers or injected seams. |
+| **No vendor lock** | Our own canonical delta stream and our own versioned UI wire. The SDK never proxies a provider's raw SSE bytes to your client. |
+| **Secrets never leak** | API keys are masked in every log, error, and span path. This is a regression-tested invariant. |
+
+The SDK core itself never reads `process.env`. Read keys at the app layer and pass them into the provider factory:
+
+```ts
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+```
+
+## The canonical line
+
+Every request is normalized to a canonical `Message[]` / `Part[]` shape before it hits a wire, and every response is normalized to a canonical delta stream (`StreamPart`) **before** any orchestration or consumer sees it. Adapters never hand a provider's raw bytes to a caller.
+
+```text
+Request:  canonical Message[]/Part[]  ->  adapter (one of 4 wires)  ->  upstream fetch
+Response: upstream SSE  ->  robust parser  ->  CANONICAL DELTA STREAM
+          (text-delta | reasoning-delta | tool-call-delta | source | finish)
+          ->  inference orchestration (retry / timeout / tool-loop)
+          ->  (a) canonical stream to the consumer   (b) versioned Deuz UI wire
+```
+
+Without this normalization, abort, retry-after-first-byte, multi-wire merging, and typed UI events are all impossible. The canonical events are a discriminated union (`StreamPart`) — keep a `default` case when you switch over them, because new variants are added additively.
+
+## Your first call
+
+[streamChat](/docs/core/stream-chat) returns **synchronously** — the network request starts lazily on first access of any output, and it never throws synchronously. Failures surface as an `error` part on `fullStream` and as a rejected `usage` / `finishReason` promise.
+
+```ts title="stream.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const res = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Hello!' }],
+  maxRetries: 2,
+  onUsage: (u) => console.log(u.inputTokens, u.outputTokens),
+});
+
+for await (const chunk of res.textStream) process.stdout.write(chunk);
+const usage = await res.usage; // resolves when the stream finishes
+```
+
+[generateText](/docs/core/generate-text) and [generateObject](/docs/core/generate-object) are awaited, buffered calls:
+
+```ts title="object.ts"
+import { generateObject } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod'; // any Standard Schema works, or pass a raw JSON Schema
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const { object } = await generateObject({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Capital of France as JSON.' }],
+  schema: z.object({ city: z.string() }),
+});
+```
+
+## Feature overview
+
+| Area | What you get | Page |
+| --- | --- | --- |
+| Streaming chat | Lazy, never-throwing canonical stream with usage and finish-reason promises | [streamChat](/docs/core/stream-chat) |
+| Text generation | Buffered single-turn or multi-step text | [generateText](/docs/core/generate-text) |
+| Structured output | Schema-typed objects (Standard Schema or JSON Schema) with auto json/tool strategy | [generateObject](/docs/core/generate-object) |
+| Embeddings | `embed` / `embedMany` with auto-batching and concurrency caps | [Embeddings](/docs/core/embeddings) |
+| Agentic tools | Parallel, self-healing tool loop with runaway guards | [Tools](/docs/agents/tools) and [Tool loop](/docs/agents/tool-loop) |
+| Memory | mem0 extract/reconcile pipeline over a vector or Obsidian-markdown store | [Memory](/docs/modules/memory) |
+| RAG | MIME sniff, chunkers, dense + lexical (BM25) hybrid retrieval | [RAG](/docs/modules/rag) |
+| Skills | `SKILL.md` parser with progressive disclosure | [Skills](/docs/modules/skills) |
+| MCP | Model Context Protocol client (HTTP/SSE edge-safe; stdio Node-only) | [MCP](/docs/modules/mcp) |
+| Image generation | Sync OpenAI-compatible generation, async Midjourney, Yunwu relay | [Image generation](/docs/modules/image-generation) |
+| UI streaming | `toDeuzStreamResponse` (server) and `readDeuzStream` (client) | [UI streaming](/docs/modules/ui-streaming) |
+| Middleware | `wrapModel` with logging, caching, PII redaction, injection guard | [Middleware](/docs/modules/middleware) |
+| Pricing | Optional token-to-USD cost table | [Pricing](/docs/modules/pricing) |
+
+## Supported providers
+
+All providers normalize to the same canonical stream, so application code is provider-agnostic.
+
+| Provider | Subpath | Notes |
+| --- | --- | --- |
+| Anthropic | [`@deuz-sdk/core/anthropic`](/docs/providers/anthropic) | Messages API (`/v1/messages`) |
+| OpenAI | [`@deuz-sdk/core/openai`](/docs/providers/openai) | Chat Completions and Responses API + `openaiEmbedding` |
+| xAI Grok | [`@deuz-sdk/core/xai`](/docs/providers/xai) | OpenAI-compatible wire |
+| Google Gemini | [`@deuz-sdk/core/google`](/docs/providers/google) | Compat (`createGoogle`) and native `generateContent` (`createGoogleNative`) + `googleEmbedding` |
+| Vertex AI | [`@deuz-sdk/core/vertex`](/docs/providers/vertex) | Claude and Gemini on Vertex with OAuth2 Bearer auth |
+| Voyage AI | [`@deuz-sdk/core/voyage`](/docs/providers/voyage) | Embeddings |
+| Yunwu | [`@deuz-sdk/core/yunwu`](/docs/providers/yunwu) | Unified relay — chat, image, embed at `/v1`, Midjourney at the root |
+
+A provider factory returns a tiny `LanguageModel` descriptor; the [model registry](/docs/advanced/model-registry) is the single source of truth for per-model capabilities (vision, tools, reasoning, structured output, caching, native PDF, audio, context window). Unknown model slugs do not throw — they fall back to conservative defaults, so new model releases work without a code change.
+
+## Quality bar
+
+- **207 tests** across 26 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network)
+- `tsc` strict (`moduleResolution: "Bundler"`, `verbatimModuleSyntax`, `noUncheckedIndexedAccess`)
+- `eslint` with edge-safety enforced, `publint --strict`, and `attw` (Are The Types Wrong) all green
+- Dual **ESM + CJS** build with `.d.ts` for every subpath export
+
+## Next steps
+
+- [Installation](/docs/installation) — package, peers, and runtime requirements
+- [Quickstart](/docs/quickstart) — a complete working example end to end

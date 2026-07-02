@@ -1,0 +1,336 @@
+---
+title: Memory
+description: Long-term agent memory with a mem0-style extract → reconcile → apply pipeline, behind one swappable MemoryStore seam.
+---
+
+Give an agent durable, cross-session memory. `remember` runs a mem0-style pipeline — extract facts from a conversation, embed and search existing memories, reconcile contradictions (`ADD`/`UPDATE`/`DELETE`/`NOOP`), then apply the mutations to a store. `recall` does scoped semantic search. Everything stateful or non-deterministic (the store, embedding, the LLM, the clock, id generation) is injected through a `MemorySeams` object, so the core stays pure and edge-safe.
+
+Two interchangeable backends ship behind the same `MemoryStore` interface: an in-memory cosine vector store (`createInMemoryMemoryStore`, edge-safe) and an Obsidian-style markdown vault (`createMarkdownMemoryStore`, Node-only) where each record is a human-readable, git-versionable `.md` file.
+
+Import the core from `@deuz-sdk/core/memory`; the markdown backend from `@deuz-sdk/core/memory/markdown`.
+
+## Scope is mandatory
+
+Every memory belongs to a `MemoryScope`. At least one field must be set, or `assertScope` throws `InvalidRequestError` (the mem0 rule). Search, list, and reconcile are all exact-match filtered on the fields you provide.
+
+```ts
+interface MemoryScope {
+  userId?: string;
+  agentId?: string;
+  runId?: string;
+  actorId?: string;
+}
+```
+
+## The seams
+
+`remember` / `recall` / `planMemory` take a `MemorySeams` object. The store and an LLM callback are required; everything else has a pure default or is optional.
+
+| Seam | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `store` | `MemoryStore` | yes | The only stateful seam — vector store, markdown vault, or a DB. |
+| `llm` | `MemoryLLM` | yes | `(prompt: { system, user }) => Promise<string>`. Used for extraction + reconciliation. |
+| `clock` | `Clock` | yes | `{ now, setTimeout }`. Time source for timestamps / TTL. |
+| `generateId` | `() => string` | yes | New record ids. |
+| `embedder` | `Embedder` | no | Needed only when a vector store searches by embedding and the query has none. |
+| `hashFn` | `HashFn` | no | Content hash for dedupe. Default: WebCrypto SHA-256 hex (`defaultHashFn`). |
+| `logger` | `{ warn(...) }` | no | Optional warning sink. |
+
+`MemoryLLM` is a thin wrapper over [generateText](/docs/core/generate-text) — prompt in, raw text out. The fact and decision parsers tolerate ```` ```json ```` fences and surrounding prose.
+
+```ts
+import type { MemoryLLM } from '@deuz-sdk/core/memory';
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const llm: MemoryLLM = async ({ system, user }) => {
+  const { text } = await generateText({
+    model: anthropic('claude-opus-4-8'),
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+  });
+  return text;
+};
+```
+
+### The Embedder
+
+When you want semantic (cosine) recall, wire an `Embedder`. The seam is `embed(texts, action) => Promise<{ vectors, model }>` where `action` is `'add' | 'search' | 'update'` (mapped to the provider task type). `createEmbedder` builds one from any `EmbeddingModel`, delegating to [embedMany](/docs/core/embeddings).
+
+```ts
+import { createEmbedder } from '@deuz-sdk/core/memory';
+import { createGoogleEmbedding } from '@deuz-sdk/core/google';
+
+const google = createGoogleEmbedding({ apiKey: process.env.GOOGLE_API_KEY! });
+const embedder = createEmbedder(google('text-embedding-004'));
+```
+
+## The MemoryStore seam
+
+One interface backs every backend. `search` owns its own ranking (cosine, BM25, grep, or hybrid), so a full-text markdown store and a vector store are drop-in interchangeable.
+
+```ts
+interface MemoryStore {
+  upsert(records: MemoryRecord[]): Promise<void>;
+  get(id: string, scope?: MemoryScope): Promise<MemoryRecord | null>;
+  search(query: MemoryQuery): Promise<MemoryHit[]>;
+  list(
+    scope: MemoryScope,
+    opts?: { kind?: MemoryKind; limit?: number },
+  ): Promise<MemoryRecord[]>;
+  delete(ids: string[]): Promise<void>;
+  update?(id: string, patch: Partial<MemoryRecord>): Promise<void>;
+}
+```
+
+## remember
+
+`remember(messages, scope, seams, opts?)` returns the `MemoryMutation[]` it produced (and, by default, applies them to the store). The pipeline:
+
+1. `assertScope` — guard the scope.
+2. **Extract** — the LLM pulls standalone, durable facts (or `customExtract` replaces this step).
+3. **Embed + search** — embed each fact and gather the scoped top-K existing memories to reconcile against.
+4. **Reconcile** — existing memories are sent to the LLM with **temporary integer ids** (`'0'`, `'1'`, …) instead of real UUIDs. This keeps tokens low and stops the model hallucinating ids — any id it returns that isn't in the temp→real map is dropped. The model emits `ADD` / `UPDATE` / `DELETE` / `NOOP`.
+5. **Apply** — events reduce to concrete mutations and (unless `apply: false`) are written to the store.
+
+### Options
+
+| Option | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `infer` | `boolean` | `true` | `false` → store raw turns verbatim, **zero** LLM/embed calls (mem0 `infer=False`). |
+| `apply` | `boolean` | `true` | `false` → plan-only; return mutations without writing (host applies). |
+| `topK` | `number` | `5` | Existing-memory retrieval breadth for reconciliation. |
+| `supersede` | `'soft' \| 'hard'` | `'hard'` | `soft` → set `invalidAt` instead of deleting (bi-temporal history). |
+| `ttlMs` | `number` | — | Absolute expiry written as `expiresAt`. |
+| `kind` | `MemoryKind` | `'semantic'` | `'episodic' \| 'semantic' \| 'working' \| 'procedural'`. |
+| `customInstructions` | `string` | — | Appended to the extraction system prompt. |
+| `customExtract` | `(messages) => MemoryFact[]` | — | Replace the LLM extraction step entirely. |
+
+`planMemory(...)` is the plan-only alias (`apply: false`) for hosts that defer writes.
+
+### Full remember / recall cycle
+
+```ts title="memory-cycle.ts"
+import {
+  remember,
+  recall,
+  createInMemoryMemoryStore,
+  createEmbedder,
+  type MemoryLLM,
+  type MemorySeams,
+} from '@deuz-sdk/core/memory';
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createGoogleEmbedding } from '@deuz-sdk/core/google';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const google = createGoogleEmbedding({ apiKey: process.env.GOOGLE_API_KEY! });
+
+const llm: MemoryLLM = async ({ system, user }) => {
+  const { text } = await generateText({
+    model: anthropic('claude-opus-4-8'),
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+  });
+  return text;
+};
+
+const seams: MemorySeams = {
+  store: createInMemoryMemoryStore(),
+  embedder: createEmbedder(google('text-embedding-004')),
+  llm,
+  clock: { now: () => Date.now(), setTimeout: (fn, ms) => (setTimeout(fn, ms), () => {}) },
+  generateId: () => crypto.randomUUID(),
+};
+
+const scope = { userId: 'u_123' };
+
+// Write: extract facts → reconcile → apply.
+await remember(
+  [
+    { role: 'user', content: 'I just went vegetarian and I live in Berlin.' },
+    { role: 'assistant', content: 'Got it — noted.' },
+  ],
+  scope,
+  seams,
+);
+
+// Read: scoped semantic search.
+const hits = await recall({ scope, text: 'What does the user eat?' }, seams);
+for (const hit of hits) console.log(hit.score, hit.record.text);
+```
+
+The `clock` and `generateId` above read `Date.now()` / `crypto.randomUUID()` at your **app** layer — the SDK core never calls them itself.
+
+## recall
+
+`recall(query, seams, opts?)` embeds the query (if it has `text`, no `embedding`, and an `embedder` is wired), runs `store.search`, drops expired records, then optionally reranks.
+
+```ts
+interface MemoryQuery {
+  scope: MemoryScope; // required
+  text?: string;
+  embedding?: number[];
+  kind?: MemoryKind;
+  topK?: number; // default 5
+  asOf?: number; // bi-temporal point-in-time
+  filter?: Record<string, unknown>;
+}
+```
+
+| `opts` field | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `dropExpired` | `boolean` | `true` | Filter out records whose `expiresAt <= clock.now()`. |
+| `scorer` | `MemoryScorer` | — | Rerank by recency · importance · relevance (`defaultMemoryScorer` provided). |
+
+`formatMemoriesForPrompt(hits, opts?)` renders the hits into a bulleted block for splicing into a system prompt (empty string when there are no hits).
+
+## Injecting memory into a chat loop
+
+Recall before the model call, splice the memories into the system prompt, then `remember` the turn afterward. Use `planMemory` if you prefer to apply the write asynchronously.
+
+```ts title="chat-with-memory.ts"
+import { generateText, type Message } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { recall, remember, formatMemoriesForPrompt } from '@deuz-sdk/core/memory';
+// `seams` and `scope` from the cycle example above.
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+async function chat(userText: string): Promise<string> {
+  const turn: Message[] = [{ role: 'user', content: userText }];
+
+  const hits = await recall({ scope, text: userText }, seams);
+  const memoryBlock = formatMemoriesForPrompt(hits, { header: 'What you know about the user:' });
+
+  const { text } = await generateText({
+    model: anthropic('claude-opus-4-8'),
+    messages: [
+      ...(memoryBlock ? [{ role: 'system', content: memoryBlock } as Message] : []),
+      ...turn,
+    ],
+  });
+
+  // Persist anything durable from this exchange.
+  await remember([...turn, { role: 'assistant', content: text }], scope, seams);
+  return text;
+}
+```
+
+### Model-driven memory (tools)
+
+Alternatively, let the model manage memory itself. `createMemoryTools({ scope, seams })` returns a `ToolSet` — `memory_append`, `memory_search`, `memory_update`, `memory_delete`, `memory_view` — whose `execute` delegates to the store. Pass it as `tools` to [generateText](/docs/core/generate-text) or [streamChat](/docs/core/stream-chat).
+
+```ts
+import { createMemoryTools } from '@deuz-sdk/core/memory';
+
+const tools = createMemoryTools({ scope, seams });
+
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Remember that I prefer dark mode.' }],
+  tools,
+  maxSteps: 4,
+});
+```
+
+## Markdown vault backend (Node)
+
+`createMarkdownMemoryStore({ dir, vectors? })` writes one human-readable `<id>.md` file per record — YAML frontmatter (`id`, `kind`, scope, `tags`, `[[wikilinks]]`, timestamps) plus the fact as the body. It is git-versionable and editable by hand or in Obsidian.
+
+Embeddings never pollute the markdown: when a record carries one, it is stored in a hidden `.deuz-vectors.json` sidecar in the same directory. `search` does cosine ranking when a query embedding and stored vectors are available, and falls back to grep/full-text otherwise (`vectors: false` disables the sidecar for a pure grep store). The sidecar reloads across fresh store instances, so embeddings persist.
+
+This backend is Node-only (it lazy-imports `node:fs/promises`) and is **not** bundled into edge-safe core. It implements the same `MemoryStore` interface, so it drops straight into the `seams` above.
+
+```ts title="markdown-vault.ts"
+import {
+  remember,
+  recall,
+  createEmbedder,
+  type MemoryLLM,
+  type MemorySeams,
+} from '@deuz-sdk/core/memory';
+import { createMarkdownMemoryStore } from '@deuz-sdk/core/memory/markdown';
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createGoogleEmbedding } from '@deuz-sdk/core/google';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const google = createGoogleEmbedding({ apiKey: process.env.GOOGLE_API_KEY! });
+
+const llm: MemoryLLM = async ({ system, user }) => {
+  const { text } = await generateText({
+    model: anthropic('claude-opus-4-8'),
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+  });
+  return text;
+};
+
+const seams: MemorySeams = {
+  // The vault lives on disk; commit it to git for human-auditable memory.
+  store: createMarkdownMemoryStore({ dir: './data/memories' }),
+  embedder: createEmbedder(google('text-embedding-004')),
+  llm,
+  clock: { now: () => Date.now(), setTimeout: (fn, ms) => (setTimeout(fn, ms), () => {}) },
+  generateId: () => crypto.randomUUID(),
+};
+
+const scope = { agentId: 'support-bot' };
+
+await remember(
+  [{ role: 'user', content: 'Our SLA is 24 hours for tier-1 tickets.' }],
+  scope,
+  seams,
+);
+
+const hits = await recall({ scope, text: 'response time policy' }, seams);
+console.log(hits[0]?.record.text);
+```
+
+A resulting `<id>.md` looks like:
+
+```text
+---
+id: "f1c2…"
+hash: "…"
+kind: "semantic"
+agentId: "support-bot"
+createdAt: 1717286400000
+updatedAt: 1717286400000
+validAt: 1717286400000
+---
+
+Our SLA is 24 hours for tier-1 tickets.
+```
+
+## Pure helpers
+
+These are exported for testing and custom backends — all deterministic, no I/O:
+
+| Export | Purpose |
+| --- | --- |
+| `assertScope(scope)` | Throw `InvalidRequestError` if no scope field is set. |
+| `matchesScope(record, scope)` | Exact-match scope filter (reused by both backends). |
+| `isExpired(record, now)` | TTL predicate against `expiresAt`. |
+| `cosineSimilarity(a, b)` | Edge-safe cosine; `0` on length mismatch / zero vector. |
+| `defaultHashFn(text)` | WebCrypto SHA-256 hex content hash. |
+| `defaultMemoryScorer` | Generative-Agents recency · importance · relevance rerank. |
+| `buildExtractionPrompt` / `parseFacts` | Fact-extraction prompt + tolerant parser. |
+| `buildDecisionPrompt` / `parseDecision` | Reconciliation prompt (temp ids) + parser that drops hallucinated ids. |
+| `applyEvents(events, existing, ctx)` | Pure reducer: decision events → `MemoryMutation[]`. |
+
+## See also
+
+- [Embeddings](/docs/core/embeddings) — `embed` / `embedMany`, the engine behind `createEmbedder`.
+- [RAG](/docs/modules/rag) — document ingestion and retrieval over the same vector primitives.
+- [generateText](/docs/core/generate-text) — backs the `MemoryLLM` seam and the memory tools.
+- [Dependencies](/docs/core/dependencies) — the `Clock` / `generateId` injection model.
