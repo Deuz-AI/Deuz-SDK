@@ -182,3 +182,47 @@ describe('Gemini native generateContent wire', () => {
     expect(sources).toEqual([{ url: 'https://example.com', title: 'Example' }]);
   });
 });
+
+describe('Gemini thinking levels (0.2.0)', () => {
+  const MINI = sseEvents([
+    {
+      data: {
+        candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 1, totalTokenCount: 3 },
+      },
+    },
+  ]);
+
+  async function bodyFor(modelId: string, effort: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max') {
+    const { fetch, calls } = consume([MINI]);
+    const result = streamChat({
+      model: createGoogleNative({ apiKey: 'AIza-k', fetch })(modelId),
+      messages: [{ role: 'user', content: 'hi' }],
+      effort,
+    });
+    await result.finishReason;
+    return JSON.parse(String(calls[0]!.init!.body)) as {
+      generationConfig?: { thinkingConfig?: { thinkingLevel?: string; thinkingBudget?: number } };
+    };
+  }
+
+  it('gemini-3.5-flash keeps medium as medium', async () => {
+    const body = await bodyFor('gemini-3.5-flash', 'medium');
+    expect(body.generationConfig?.thinkingConfig?.thinkingLevel).toBe('medium');
+  });
+
+  it('gemini-3.1-pro-preview collapses medium to low (low/high only model)', async () => {
+    const body = await bodyFor('gemini-3.1-pro-preview', 'medium');
+    expect(body.generationConfig?.thinkingConfig?.thinkingLevel).toBe('low');
+  });
+
+  it('xhigh/max clamp to high on the level wire', async () => {
+    const body = await bodyFor('gemini-3.5-flash', 'max');
+    expect(body.generationConfig?.thinkingConfig?.thinkingLevel).toBe('high');
+  });
+
+  it('gemini-2.5-pro maps xhigh to a 32768 budget', async () => {
+    const body = await bodyFor('gemini-2.5-pro', 'xhigh');
+    expect(body.generationConfig?.thinkingConfig?.thinkingBudget).toBe(32_768);
+  });
+});

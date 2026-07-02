@@ -60,7 +60,31 @@ function usesJsonSchema(modelId: string): boolean {
   return /^gemini-3/.test(modelId);
 }
 
-const BUDGET_MAP: Record<string, number> = { low: 4096, medium: 12288, high: 24576 };
+const BUDGET_MAP: Record<string, number> = {
+  low: 4096,
+  medium: 12288,
+  high: 24576,
+  xhigh: 32768,
+  max: 32768,
+};
+
+/** Pro-tier Gemini 3 models accept only low/high thinking levels. */
+function levelOnlyLowHigh(modelId: string): boolean {
+  return /^gemini-3(\.\d+)?-pro/.test(modelId);
+}
+
+function thinkingLevelFor(modelId: string, effort: string): string {
+  const full: Record<string, string> = {
+    low: 'low',
+    medium: 'medium',
+    high: 'high',
+    xhigh: 'high',
+    max: 'high',
+  };
+  const level = full[effort] ?? 'low';
+  if (levelOnlyLowHigh(modelId)) return level === 'high' ? 'high' : 'low';
+  return level;
+}
 
 function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart | null {
   switch (part.type) {
@@ -151,7 +175,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     if (usesThinkingLevel(call.modelId)) {
       generationConfig.thinkingConfig = {
         includeThoughts: true,
-        thinkingLevel: options.effort === 'high' ? 'high' : 'low',
+        thinkingLevel: thinkingLevelFor(call.modelId, options.effort),
       };
     } else {
       generationConfig.thinkingConfig = {
