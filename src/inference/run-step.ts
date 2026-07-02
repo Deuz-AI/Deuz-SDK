@@ -11,6 +11,9 @@ export type ToolArgMap = Map<
   { name?: string; args: string; meta?: Record<string, unknown> }
 >;
 
+/** Opaque encrypted reasoning payloads (OpenAI Responses); signature carries the item id. */
+export type EncryptedReasoning = { text: string; signature?: string }[];
+
 /** Assemble the assistant turn (reasoning-first, then text, then tool_use) from accumulated state. */
 export function assembleAssistant(
   text: string,
@@ -18,8 +21,17 @@ export function assembleAssistant(
   reasoningSignature: string | undefined,
   toolArgs: ToolArgMap,
   toolOrder: string[],
+  encryptedReasoning?: EncryptedReasoning,
 ): { assistantMessage: Message; toolUseParts: ToolUsePart[] } {
   const content: Part[] = [];
+  for (const er of encryptedReasoning ?? []) {
+    content.push({
+      type: 'reasoning',
+      text: er.text,
+      encrypted: true,
+      ...(er.signature ? { signature: er.signature } : {}),
+    });
+  }
   if (reasoningText) {
     content.push({
       type: 'reasoning',
@@ -77,6 +89,7 @@ export async function runOneStep(
   let text = '';
   let reasoningText = '';
   let reasoningSignature: string | undefined;
+  const encryptedReasoning: EncryptedReasoning = [];
   const toolArgs: ToolArgMap = new Map();
   const toolOrder: string[] = [];
 
@@ -86,6 +99,11 @@ export async function runOneStep(
         text += part.text;
         break;
       case 'reasoning-delta':
+        if (part.encrypted) {
+          // Opaque payload — kept as its own part, never mixed into display text.
+          encryptedReasoning.push({ text: part.text, signature: part.signature });
+          break;
+        }
         reasoningText += part.text;
         if (part.signature) reasoningSignature = part.signature;
         break;
@@ -116,6 +134,7 @@ export async function runOneStep(
     reasoningSignature,
     toolArgs,
     toolOrder,
+    encryptedReasoning,
   );
 
   return {

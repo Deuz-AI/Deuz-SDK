@@ -8,10 +8,16 @@ import type { Message, Part, Role } from '../types/message';
 export interface NormalizedMessage {
   role: Role;
   content: Part[];
+  /** Message-level provider round-trip metadata (e.g. `{ openai: { phase } }`). */
+  providerMetadata?: Record<string, unknown>;
 }
 
 export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
-  return messages.map((m) => ({ role: m.role, content: normalizeContent(m.content) }));
+  return messages.map((m) => ({
+    role: m.role,
+    content: normalizeContent(m.content),
+    ...(m.providerMetadata ? { providerMetadata: m.providerMetadata } : {}),
+  }));
 }
 
 function normalizeContent(content: string | Part[]): Part[] {

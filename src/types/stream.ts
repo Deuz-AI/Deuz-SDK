@@ -14,6 +14,8 @@ export interface ReasoningDeltaPart {
   type: 'reasoning-delta';
   text: string;
   signature?: string;
+  /** True when `text` is an opaque encrypted reasoning payload (OpenAI Responses) — not display text. */
+  encrypted?: boolean;
 }
 
 export interface ToolCallDeltaPart {

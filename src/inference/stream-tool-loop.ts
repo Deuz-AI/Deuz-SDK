@@ -7,7 +7,7 @@ import type { ToolCall, StepResult } from '../types/tool';
 import { runStream } from '../core/inference';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
-import { assembleAssistant, type ToolArgMap } from './run-step';
+import { assembleAssistant, type ToolArgMap, type EncryptedReasoning } from './run-step';
 import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
 import {
   buildWireTools,
@@ -69,6 +69,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         let text = '';
         let reasoningText = '';
         let reasoningSignature: string | undefined;
+        const encryptedReasoning: EncryptedReasoning = [];
         const toolArgs: ToolArgMap = new Map();
         const toolOrder: string[] = [];
         let stepUsage: Usage = EMPTY_USAGE;
@@ -81,6 +82,11 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
               broadcaster.push(part);
               break;
             case 'reasoning-delta':
+              if (part.encrypted) {
+                encryptedReasoning.push({ text: part.text, signature: part.signature });
+                broadcaster.push(part);
+                break;
+              }
               reasoningText += part.text;
               if (part.signature) reasoningSignature = part.signature;
               broadcaster.push(part);
@@ -131,6 +137,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
           reasoningSignature,
           toolArgs,
           toolOrder,
+          encryptedReasoning,
         );
 
         if (options.signal?.aborted) {

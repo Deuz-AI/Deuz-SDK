@@ -56,4 +56,6 @@ export type Part = TextPart | ImagePart | ToolUsePart | ToolResultPart | Reasoni
 export interface Message {
   role: Role;
   content: string | Part[];
+  /** Provider round-trip metadata at the message level (e.g. `{ openai: { phase } }`). Additive, optional. */
+  providerMetadata?: Record<string, unknown>;
 }

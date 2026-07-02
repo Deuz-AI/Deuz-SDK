@@ -19,7 +19,16 @@ function toResponsesInput(messages: NormalizedMessage[]): InputItem[] {
   const items: InputItem[] = [];
   for (const m of messages) {
     for (const part of m.content) {
-      if (part.type === 'tool_use') {
+      if (part.type === 'reasoning' && part.encrypted) {
+        // Encrypted reasoning round-trip: replay the item verbatim BEFORE its
+        // function_call (signature carries the original item id).
+        items.push({
+          type: 'reasoning',
+          ...(part.signature ? { id: part.signature } : {}),
+          encrypted_content: part.text,
+          summary: [],
+        });
+      } else if (part.type === 'tool_use') {
         items.push({
           type: 'function_call',
           call_id: part.id,
@@ -33,7 +42,6 @@ function toResponsesInput(messages: NormalizedMessage[]): InputItem[] {
           output: typeof part.result === 'string' ? part.result : JSON.stringify(part.result),
         });
       }
-      // reasoning parts: encrypted round-trip is deferred past Faz 1.
     }
     const text = m.content
       .filter((p): p is Extract<Part, { type: 'text' }> => p.type === 'text')
@@ -43,15 +51,26 @@ function toResponsesInput(messages: NormalizedMessage[]): InputItem[] {
       (p): p is Extract<Part, { type: 'image' }> => p.type === 'image',
     );
 
+    // `phase` (commentary | final_answer) must be preserved on replayed
+    // assistant messages — dropping it degrades gpt-5.3-codex+ performance.
+    const phase = (m.providerMetadata?.openai as { phase?: string } | undefined)?.phase;
     if (images.length > 0) {
       const content: InputItem[] = [];
       if (text) content.push({ type: 'input_text', text });
       for (const img of images) {
         content.push({ type: 'input_image', image_url: toOpenAIImageUrl(resolveImage(img)) });
       }
-      items.push({ role: m.role === 'tool' ? 'user' : m.role, content });
+      items.push({
+        role: m.role === 'tool' ? 'user' : m.role,
+        content,
+        ...(phase ? { phase } : {}),
+      });
     } else if (text) {
-      items.push({ role: m.role === 'tool' ? 'user' : m.role, content: text });
+      items.push({
+        role: m.role === 'tool' ? 'user' : m.role,
+        content: text,
+        ...(phase ? { phase } : {}),
+      });
     }
   }
   return items;
@@ -82,6 +101,11 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   if (caps.reasoning && options.effort !== undefined) {
     // 'none' is a real OpenAI value (disables reasoning); 'max' clamps to xhigh.
     body.reasoning = { effort: options.effort === 'max' ? 'xhigh' : options.effort };
+  }
+  if (tools && caps.reasoning) {
+    // Stateless multi-step tool use: get encrypted reasoning back and replay it.
+    body.include = ['reasoning.encrypted_content'];
+    body.store = false;
   }
   if (!caps.samplingRestrictions) {
     if (options.temperature !== undefined) body.temperature = options.temperature;
@@ -157,7 +181,7 @@ interface ResponsesEvent {
   type?: string;
   delta?: string;
   item_id?: string;
-  item?: { type?: string; id?: string; call_id?: string; name?: string };
+  item?: { type?: string; id?: string; call_id?: string; name?: string; encrypted_content?: string };
   annotation?: { type?: string; url?: string; title?: string };
   response?: {
     usage?: ResponsesUsage;
@@ -214,6 +238,18 @@ async function* parseStream(
           const callId = data.item.call_id ?? data.item.id ?? '';
           if (data.item.id) toolByItem.set(data.item.id, callId);
           yield { type: 'tool-call-delta', id: callId, name: data.item.name, argsTextDelta: '' };
+        }
+        break;
+      case 'response.output_item.done':
+        // Encrypted reasoning payload (include: reasoning.encrypted_content) —
+        // an opaque blob keyed by the item id, replayed verbatim next turn.
+        if (data.item?.type === 'reasoning' && data.item.encrypted_content) {
+          yield {
+            type: 'reasoning-delta',
+            text: data.item.encrypted_content,
+            signature: data.item.id,
+            encrypted: true,
+          };
         }
         break;
       case 'response.function_call_arguments.delta': {

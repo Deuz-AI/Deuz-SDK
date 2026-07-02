@@ -226,3 +226,102 @@ describe('server-tool stream parsing (1.2.0)', () => {
     expect(parts.find((p) => p.type === 'source')).toMatchObject({ url: 'https://c.com' });
   });
 });
+
+describe('Responses round-trips (1.2.0)', () => {
+  it('encrypted reasoning replays verbatim on the next loop step', async () => {
+    const { mockFetchSequence } = await import('./fixtures/sse');
+    const STEP1 = sseEvents([
+      {
+        event: 'response.output_item.done',
+        data: {
+          type: 'response.output_item.done',
+          item: { type: 'reasoning', id: 'rs_1', encrypted_content: 'ENCBLOB' },
+        },
+      },
+      {
+        event: 'response.output_item.added',
+        data: {
+          type: 'response.output_item.added',
+          item: { type: 'function_call', id: 'it_1', call_id: 'call_1', name: 'echo' },
+        },
+      },
+      {
+        event: 'response.function_call_arguments.delta',
+        data: {
+          type: 'response.function_call_arguments.delta',
+          item_id: 'it_1',
+          delta: '{"v":"x"}',
+        },
+      },
+      {
+        event: 'response.completed',
+        data: { type: 'response.completed', response: { status: 'completed', usage: {} } },
+      },
+    ]);
+    const STEP2 = sseEvents([
+      {
+        event: 'response.output_text.delta',
+        data: { type: 'response.output_text.delta', delta: 'done' },
+      },
+      {
+        event: 'response.completed',
+        data: { type: 'response.completed', response: { status: 'completed', usage: {} } },
+      },
+    ]);
+    const { fetch, calls } = mockFetchSequence([
+      () => sseResponse([STEP1]),
+      () => sseResponse([STEP2]),
+    ]);
+    const res = await generateText({
+      model: createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.4'),
+      messages: [{ role: 'user', content: 'go' }],
+      tools: { echo: echoTool },
+      maxSteps: 3,
+    });
+    expect(res.text).toBe('done');
+    expect(calls).toHaveLength(2);
+
+    const first = JSON.parse(String(calls[0]!.init!.body)) as Record<string, unknown>;
+    expect(first.include).toEqual(['reasoning.encrypted_content']);
+    expect(first.store).toBe(false);
+
+    const second = JSON.parse(String(calls[1]!.init!.body)) as {
+      input: Array<Record<string, unknown>>;
+    };
+    const reasoningIdx = second.input.findIndex((i) => i.type === 'reasoning');
+    const callIdx = second.input.findIndex((i) => i.type === 'function_call');
+    expect(reasoningIdx).toBeGreaterThanOrEqual(0);
+    expect(second.input[reasoningIdx]).toEqual({
+      type: 'reasoning',
+      id: 'rs_1',
+      encrypted_content: 'ENCBLOB',
+      summary: [],
+    });
+    expect(reasoningIdx).toBeLessThan(callIdx); // reasoning precedes its function_call
+    const output = second.input.find((i) => i.type === 'function_call_output');
+    expect(output).toMatchObject({ call_id: 'call_1' });
+  });
+
+  it('assistant message phase is preserved on replay', async () => {
+    const { fetch, calls } = mockFetch(() => sseResponse([RESP_MINI]));
+    const { streamChat } = await import('../src/index');
+    const result = streamChat({
+      model: createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.4'),
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          content: 'working on it',
+          providerMetadata: { openai: { phase: 'commentary' } },
+        },
+        { role: 'user', content: 'continue' },
+      ],
+    });
+    await result.finishReason;
+    const b = JSON.parse(String(calls[0]!.init!.body)) as {
+      input: Array<Record<string, unknown>>;
+    };
+    const assistant = b.input.find((i) => i.role === 'assistant');
+    expect(assistant).toMatchObject({ phase: 'commentary' });
+  });
+});
