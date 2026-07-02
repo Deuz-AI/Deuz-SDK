@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { getCapabilities } from '../src/core/registry';
+import { getCapabilities, getEmbeddingCapabilities } from '../src/core/registry';
 
 const anthropic = (modelId: string) =>
   ({ provider: 'anthropic', modelId, surface: 'anthropic' }) as const;
@@ -94,5 +94,27 @@ describe('registry: 2026-07 Google catalog', () => {
       surface: 'native',
     });
     expect(caps.known).toBe(true);
+  });
+});
+
+describe('registry: 2026-07 embedding catalog', () => {
+  it('gemini-embedding-2 has no task_type (instructions go in the prompt)', () => {
+    const caps = getEmbeddingCapabilities({
+      provider: 'google',
+      modelId: 'gemini-embedding-2',
+      surface: 'gemini-embeddings',
+    });
+    expect(caps.known).toBe(true);
+    expect(caps.embeddingDimensions).toBe(3072);
+    expect(caps.embeddingMaxBatch).toBe(100);
+    expect(caps.supportsTaskType).toBe(false);
+  });
+  it('text-embedding-004 (shut down 2026-01-14) falls back unknown', () => {
+    const caps = getEmbeddingCapabilities({
+      provider: 'google',
+      modelId: 'text-embedding-004',
+      surface: 'gemini-embeddings',
+    });
+    expect(caps.known).toBe(false);
   });
 });

@@ -398,18 +398,19 @@ const EMBEDDING_REGISTRY: Record<string, EmbeddingRow> = {
   }),
 
   // --- Google Gemini (native embeddings) ---
+  'gemini-embedding-2': embRow('google', 'gemini-embeddings', {
+    embeddingDimensions: 3072, // MRL 128–3072 via outputDimensionality
+    embeddingMaxBatch: 100,
+    reportsUsage: false,
+    supportsTaskType: false, // gemini-embedding-2 dropped task_type — instructions ride the prompt
+  }),
   'gemini-embedding-001': embRow('google', 'gemini-embeddings', {
     embeddingDimensions: 3072,
     embeddingMaxBatch: 100,
     reportsUsage: false,
     supportsTaskType: true,
   }),
-  'text-embedding-004': embRow('google', 'gemini-embeddings', {
-    embeddingDimensions: 768,
-    embeddingMaxBatch: 100,
-    reportsUsage: false,
-    supportsTaskType: true,
-  }),
+  // text-embedding-004 was shut down 2026-01-14 — intentionally absent.
 
   // --- Voyage AI (optional catalog) ---
   'voyage-3.5': embRow('voyage', 'voyage-embeddings', {
