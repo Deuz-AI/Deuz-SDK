@@ -68,3 +68,31 @@ describe('registry: 2026-07 OpenAI catalog', () => {
     }
   });
 });
+
+describe('registry: 2026-07 Google catalog', () => {
+  it('gemini-3.1-pro-preview is known on both wires', () => {
+    const native = getCapabilities({
+      provider: 'google',
+      modelId: 'gemini-3.1-pro-preview',
+      surface: 'native',
+    });
+    expect(native.known).toBe(true);
+    expect(native.reasoning).toBe(true);
+    expect(native.nativePdf).toBe(true);
+    const compat = getCapabilities({
+      provider: 'google',
+      modelId: 'gemini-3.1-pro-preview',
+      surface: 'chat_completions',
+    });
+    expect(compat.known).toBe(true);
+    expect(compat.usagePerChunk).toBe(true);
+  });
+  it('gemini-3.1-flash-lite is a known native row', () => {
+    const caps = getCapabilities({
+      provider: 'google',
+      modelId: 'gemini-3.1-flash-lite',
+      surface: 'native',
+    });
+    expect(caps.known).toBe(true);
+  });
+});

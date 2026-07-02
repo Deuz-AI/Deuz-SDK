@@ -192,6 +192,13 @@ const REGISTRY: Record<string, Row> = {
     usagePerChunk: true,
     toolIndexAllZero: true,
   }),
+  'gemini-3.1-pro-preview': row('google', 'chat_completions', {
+    vision: true,
+    contextWindow: 1_000_000,
+    maxOutput: 64_000,
+    usagePerChunk: true,
+    toolIndexAllZero: true,
+  }),
   'gemini-3.5-flash': row('google', 'chat_completions', {
     vision: true,
     contextWindow: 1_000_000,
@@ -218,6 +225,26 @@ const REGISTRY: Record<string, Row> = {
 // --- Gemini NATIVE (generateContent) rows — surface:'native', keyed separately
 // from the compat rows so the SAME slug can be used on either wire. ---
 const NATIVE_REGISTRY: Record<string, Row> = {
+  'gemini-3.1-pro-preview': row('google', 'native', {
+    vision: true,
+    reasoning: true,
+    caching: true,
+    nativePdf: true,
+    audio: true,
+    contextWindow: 1_000_000,
+    maxOutput: 64_000,
+  }),
+  'gemini-3.1-flash-lite': row('google', 'native', {
+    vision: true,
+    reasoning: true,
+    caching: true,
+    nativePdf: true,
+    audio: true,
+    contextWindow: 1_000_000,
+    maxOutput: 64_000,
+  }),
+  // gemini-3-pro was shut down 2026-03-09 and now aliases gemini-3.1-pro-preview;
+  // the row stays so the alias keeps its pinned capabilities.
   'gemini-3-pro': row('google', 'native', {
     vision: true,
     reasoning: true,
