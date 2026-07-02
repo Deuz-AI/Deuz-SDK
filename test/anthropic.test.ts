@@ -317,3 +317,74 @@ describe('Anthropic effort wire (0.2.0)', () => {
     });
   });
 });
+
+describe('Anthropic usage extensions (0.2.0)', () => {
+  it('maps output_tokens_details.thinking_tokens to reasoningTokens', async () => {
+    const stream = sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 1 } } },
+      },
+      {
+        event: 'content_block_delta',
+        data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+      },
+      {
+        event: 'message_delta',
+        data: {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 20, output_tokens_details: { thinking_tokens: 7 } },
+        },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+    const { provider } = model([stream]);
+    const result = streamChat({
+      model: provider('claude-fable-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const usage = await result.usage;
+    expect(usage.reasoningTokens).toBe(7);
+    expect(usage.outputTokens).toBe(20); // thinking stays inside output_tokens (billing unchanged)
+    expect(usage.totalTokens).toBe(30);
+  });
+
+  it('sums usage.iterations when present (fallbacks/compaction)', async () => {
+    const stream = sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 1 } } },
+      },
+      {
+        event: 'content_block_delta',
+        data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+      },
+      {
+        event: 'message_delta',
+        data: {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: {
+            output_tokens: 20,
+            iterations: [
+              { type: 'message', input_tokens: 10, output_tokens: 3 },
+              { type: 'fallback_message', input_tokens: 12, output_tokens: 20 },
+            ],
+          },
+        },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+    const { provider } = model([stream]);
+    const result = streamChat({
+      model: provider('claude-fable-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const usage = await result.usage;
+    // Iterations replace the top-level attempt view: inputs and outputs sum across attempts.
+    expect(usage.inputTokens).toBe(22);
+    expect(usage.outputTokens).toBe(23);
+    expect(usage.totalTokens).toBe(45);
+  });
+});

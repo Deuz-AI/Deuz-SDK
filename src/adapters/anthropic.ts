@@ -205,6 +205,9 @@ interface AnthropicUsage {
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_creation?: { ephemeral_1h_input_tokens?: number };
+  output_tokens_details?: { thinking_tokens?: number };
+  /** Per-attempt usage from server-side fallbacks / compaction — sum for billing. */
+  iterations?: AnthropicUsage[];
 }
 
 interface AnthropicEvent {
@@ -238,6 +241,21 @@ function mapStopReason(reason: string | null): FinishReason {
 }
 
 function buildUsage(input: AnthropicUsage, outputTokens: number): Usage {
+  // Fallbacks/compaction report per-attempt usage in `iterations` while the
+  // top-level usage covers only the serving attempt — sum iterations instead.
+  if (input.iterations && input.iterations.length > 0) {
+    return input.iterations
+      .map((it) => buildUsage({ ...it, iterations: undefined }, it.output_tokens ?? 0))
+      .reduce((acc, u) => ({
+        inputTokens: acc.inputTokens + u.inputTokens,
+        outputTokens: acc.outputTokens + u.outputTokens,
+        reasoningTokens: acc.reasoningTokens + u.reasoningTokens,
+        cachedReadTokens: acc.cachedReadTokens + u.cachedReadTokens,
+        cacheWriteTokens: acc.cacheWriteTokens + u.cacheWriteTokens,
+        cacheWrite1hTokens: acc.cacheWrite1hTokens + u.cacheWrite1hTokens,
+        totalTokens: acc.totalTokens + u.totalTokens,
+      }));
+  }
   const cacheRead = input.cache_read_input_tokens ?? 0;
   const cacheWriteTotal = input.cache_creation_input_tokens ?? 0;
   const cacheWrite1h = input.cache_creation?.ephemeral_1h_input_tokens ?? 0;
@@ -245,7 +263,8 @@ function buildUsage(input: AnthropicUsage, outputTokens: number): Usage {
   return {
     inputTokens,
     outputTokens,
-    reasoningTokens: 0, // Anthropic folds thinking tokens into output_tokens
+    // Thinking tokens bill inside output_tokens; the detail field breaks them out.
+    reasoningTokens: input.output_tokens_details?.thinking_tokens ?? 0,
     cachedReadTokens: cacheRead,
     cacheWriteTokens: Math.max(0, cacheWriteTotal - cacheWrite1h),
     cacheWrite1hTokens: cacheWrite1h,
@@ -303,7 +322,16 @@ async function* parseStream(
       }
     } else if (type === 'message_delta') {
       if (data.delta?.stop_reason) stopReason = data.delta.stop_reason;
-      if (data.usage?.output_tokens !== undefined) outputTokens = data.usage.output_tokens;
+      if (data.usage) {
+        if (data.usage.output_tokens !== undefined) outputTokens = data.usage.output_tokens;
+        // The final message_delta carries output_tokens_details / iterations;
+        // merge but never clobber message_start's input_tokens with undefined.
+        inputUsage = {
+          ...inputUsage,
+          ...data.usage,
+          input_tokens: data.usage.input_tokens ?? inputUsage.input_tokens,
+        };
+      }
     } else if (type === 'message_stop') {
       finishEmitted = true;
       yield {
