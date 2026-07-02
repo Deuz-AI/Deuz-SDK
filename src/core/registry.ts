@@ -33,6 +33,10 @@ export interface ModelCapabilities {
   toolIndexAllZero: boolean;
   /** Reasoning models reject temperature/topP/max_tokens → strip them. */
   samplingRestrictions: boolean;
+  /** How reasoning depth is sent to Anthropic: manual `thinking.budget_tokens`
+   *  (pre-4.7) vs `output_config.effort` (Opus 4.7+, Sonnet 5, Fable 5 —
+   *  budget_tokens returns 400 there). Non-Anthropic wires ignore this. */
+  effortWire: 'budget_tokens' | 'output_config';
   /** False when this row is a fallback for an unknown slug. */
   known: boolean;
 }
@@ -55,6 +59,7 @@ function row(provider: string, surface: ModelSurface, over: Partial<Row>): Row {
     usagePerChunk: false,
     toolIndexAllZero: false,
     samplingRestrictions: false,
+    effortWire: 'budget_tokens',
     ...over,
   };
 }
@@ -62,12 +67,32 @@ function row(provider: string, surface: ModelSurface, over: Partial<Row>): Row {
 // 2026-current slugs (pinned; adjust at launch). See plan's wire reference.
 const REGISTRY: Record<string, Row> = {
   // --- Anthropic (surface 'anthropic') ---
+  'claude-fable-5': row('anthropic', 'anthropic', {
+    vision: true,
+    reasoning: true,
+    caching: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    effortWire: 'output_config',
+    samplingRestrictions: true, // temperature/top_p/top_k non-default → 400
+  }),
+  'claude-sonnet-5': row('anthropic', 'anthropic', {
+    vision: true,
+    reasoning: true,
+    caching: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    effortWire: 'output_config',
+    samplingRestrictions: true,
+  }),
   'claude-opus-4-8': row('anthropic', 'anthropic', {
     vision: true,
     reasoning: true,
     caching: true,
     contextWindow: 1_000_000,
     maxOutput: 128_000,
+    effortWire: 'output_config',
+    samplingRestrictions: true,
   }),
   'claude-opus-4-7': row('anthropic', 'anthropic', {
     vision: true,
@@ -75,6 +100,8 @@ const REGISTRY: Record<string, Row> = {
     caching: true,
     contextWindow: 1_000_000,
     maxOutput: 128_000,
+    effortWire: 'output_config',
+    samplingRestrictions: true,
   }),
   'claude-opus-4-6': row('anthropic', 'anthropic', {
     vision: true,
