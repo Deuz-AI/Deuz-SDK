@@ -78,8 +78,9 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     max_output_tokens: options.maxOutputTokens ?? caps.maxOutput,
   };
   if (system) body.instructions = system;
-  if (caps.reasoning && options.effort !== undefined && options.effort !== 'none') {
-    body.reasoning = { effort: options.effort };
+  if (caps.reasoning && options.effort !== undefined) {
+    // 'none' is a real OpenAI value (disables reasoning); 'max' clamps to xhigh.
+    body.reasoning = { effort: options.effort === 'max' ? 'xhigh' : options.effort };
   }
   if (!caps.samplingRestrictions) {
     if (options.temperature !== undefined) body.temperature = options.temperature;

@@ -145,7 +145,10 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     if (options.topP !== undefined) body.top_p = options.topP;
   }
   if (options.stopSequences) body.stop = options.stopSequences;
-  if (reasoning && options.effort !== undefined) body.reasoning_effort = options.effort;
+  if (reasoning && options.effort !== undefined) {
+    // OpenAI accepts 'none' as a real value; 'max' is Anthropic-only → clamp.
+    body.reasoning_effort = options.effort === 'max' ? 'xhigh' : options.effort;
+  }
 
   // Stream-usage opt-in. Despite docs claiming Gemini-compat emits usage on
   // every chunk regardless, in practice it stays silent without this flag — so

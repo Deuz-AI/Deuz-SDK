@@ -189,3 +189,48 @@ describe('OpenAI Responses API wire', () => {
     expect(body.max_output_tokens).toBeDefined();
   });
 });
+
+describe('OpenAI effort semantics (0.2.0)', () => {
+  const CC_MINI = sseEvents([
+    { data: { choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] } },
+    { data: { choices: [], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 } } },
+    { data: '[DONE]' },
+  ]);
+  const RESP_MINI = sseEvents([
+    {
+      event: 'response.output_text.delta',
+      data: { type: 'response.output_text.delta', delta: 'ok' },
+    },
+    {
+      event: 'response.completed',
+      data: {
+        type: 'response.completed',
+        response: { status: 'completed', usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 } },
+      },
+    },
+  ]);
+
+  it('chat completions clamps max → xhigh', async () => {
+    const { fetch, calls } = consume([CC_MINI]);
+    const result = streamChat({
+      model: createOpenAI({ apiKey: 'k', fetch })('gpt-5.5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      effort: 'max',
+    });
+    await result.finishReason;
+    const body = JSON.parse(String(calls[0]!.init!.body));
+    expect(body.reasoning_effort).toBe('xhigh');
+  });
+
+  it("responses wire sends effort 'none' explicitly (real OpenAI value)", async () => {
+    const { fetch, calls } = consume([RESP_MINI]);
+    const result = streamChat({
+      model: createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.4'),
+      messages: [{ role: 'user', content: 'hi' }],
+      effort: 'none',
+    });
+    await result.finishReason;
+    const body = JSON.parse(String(calls[0]!.init!.body));
+    expect(body.reasoning).toEqual({ effort: 'none' });
+  });
+});

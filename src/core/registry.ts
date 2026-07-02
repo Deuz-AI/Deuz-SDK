@@ -125,15 +125,17 @@ const REGISTRY: Record<string, Row> = {
     maxOutput: 64_000,
   }),
 
-  // --- OpenAI Chat Completions (no reasoning on this wire) ---
+  // --- OpenAI Chat Completions (GPT-5.4+ expose reasoning_effort here too) ---
   'gpt-5.5': row('openai', 'chat_completions', {
     vision: true,
-    contextWindow: 1_000_000,
+    reasoning: true,
+    contextWindow: 1_050_000,
     maxOutput: 128_000,
   }),
   'gpt-5.5-pro': row('openai', 'chat_completions', {
     vision: true,
-    contextWindow: 1_000_000,
+    reasoning: true,
+    contextWindow: 1_050_000,
     maxOutput: 128_000,
   }),
 
@@ -146,6 +148,20 @@ const REGISTRY: Record<string, Row> = {
     maxOutput: 128_000,
   }),
   'gpt-5.4-mini': row('openai', 'responses', {
+    vision: true,
+    reasoning: true,
+    samplingRestrictions: true,
+    contextWindow: 400_000,
+    maxOutput: 128_000,
+  }),
+  'gpt-5.4-nano': row('openai', 'responses', {
+    vision: true,
+    reasoning: true,
+    samplingRestrictions: true,
+    contextWindow: 400_000,
+    maxOutput: 128_000,
+  }),
+  'gpt-5.3-codex': row('openai', 'responses', {
     vision: true,
     reasoning: true,
     samplingRestrictions: true,

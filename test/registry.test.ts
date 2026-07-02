@@ -47,3 +47,24 @@ describe('registry: 2026-07 Anthropic catalog', () => {
     expect(caps.effortWire).toBe('budget_tokens');
   });
 });
+
+describe('registry: 2026-07 OpenAI catalog', () => {
+  it('gpt-5.5 exposes reasoning (effort ships on both OpenAI wires)', () => {
+    const caps = getCapabilities({
+      provider: 'openai',
+      modelId: 'gpt-5.5',
+      surface: 'chat_completions',
+    });
+    expect(caps.reasoning).toBe(true);
+    expect(caps.contextWindow).toBe(1_050_000);
+  });
+  it('gpt-5.4-nano and gpt-5.3-codex are known responses rows', () => {
+    for (const id of ['gpt-5.4-nano', 'gpt-5.3-codex']) {
+      const caps = getCapabilities({ provider: 'openai', modelId: id, surface: 'responses' });
+      expect(caps.known).toBe(true);
+      expect(caps.reasoning).toBe(true);
+      expect(caps.samplingRestrictions).toBe(true);
+      expect(caps.contextWindow).toBe(400_000);
+    }
+  });
+});
