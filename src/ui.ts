@@ -4,7 +4,7 @@
  * `fullStream` to SSE (`x-deuz-stream: v1`); the client reads it back. A React
  * hook over `readDeuzStream` lands in Faz 6.
  */
-import type { StreamChatResult } from './types/methods';
+import type { StreamChatResult, StreamObjectResult } from './types/methods';
 import type { StreamPart } from './types/stream';
 import type { Usage, FinishReason } from './types/usage';
 import { parseSSE } from './internal/sse';
@@ -42,6 +42,8 @@ export type DeuzUIPart =
    * never serialized by `toDeuzStreamResponse`. `useChat` consumes it (Faz 6).
    */
   | { type: 'tool-approval-response'; approvalId: string; approved: boolean; reason?: string }
+  /** `streamObject` partial — each delta REPLACES the previous partial wholesale. */
+  | { type: 'object-delta'; object: unknown }
   | { type: 'finish'; finishReason: FinishReason; usage: Usage }
   | { type: 'error'; message: string };
 
@@ -144,6 +146,54 @@ export function toDeuzStreamResponse(
           const ui = toUIPart(part);
           if (ui) send(ui);
         }
+      } catch (err) {
+        send({ type: 'error', message: errorMessage(err) });
+      }
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+
+  return new Response(body, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      'x-deuz-stream': DEUZ_STREAM_VERSION,
+      ...options.headers,
+    },
+  });
+}
+
+/**
+ * Serialize a `streamObject` result to a Deuz-protocol SSE `Response`
+ * (`object-delta` parts; `useObject` reads it back). Edge-safe. Failures —
+ * transport errors AND final-validation rejection — surface as a redacted
+ * `error` part; `usage`/`finishReason` ride the terminal `finish` part on
+ * success.
+ */
+export function toDeuzObjectStreamResponse(
+  result: StreamObjectResult<unknown>,
+  options: ToDeuzStreamOptions = {},
+): Response {
+  const encoder = new TextEncoder();
+  const messageId = options.messageId ?? options.generateId?.() ?? 'deuz-msg';
+
+  const body = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (part: DeuzUIPart): void => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(part)}\n\n`));
+      };
+      send({ type: 'start', messageId });
+      try {
+        for await (const partial of result.partialObjectStream) {
+          send({ type: 'object-delta', object: partial });
+        }
+        send({
+          type: 'finish',
+          finishReason: await result.finishReason,
+          usage: await result.usage,
+        });
       } catch (err) {
         send({ type: 'error', message: errorMessage(err) });
       }

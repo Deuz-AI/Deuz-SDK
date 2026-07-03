@@ -16,7 +16,7 @@ _One canonical wire. Zero runtime dependencies. Runs anywhere `fetch` runs._
 
 `@deuz-sdk/core` is a from-scratch, **independent** AI SDK built for the **Deuz** platform and shared with everyone. It depends on no other AI SDK and ships its own streaming + UI protocol. It is **pure**: no Supabase, no credit logic, no env reading. Everything stateful — HTTP, clock, logging, metering, circuit-breaker, API keys, memory, vector stores — is injected through a single `Dependencies` seam, so the exact same core runs unchanged on **Node, Deno, Bun, Vercel/Cloudflare Edge**.
 
-> **Status — published (v1.2.0).** [`@deuz-sdk/core`](https://www.npmjs.com/package/@deuz-sdk/core) is live on npm. Chat across all four wires + Vertex, the agentic tool loop, vision, MCP, the UI wire, native Gemini, embeddings, memory, RAG, skills, image generation, middleware, pricing, hybrid RAG search, and Gemini explicit caching are all implemented and tested (**257 tests green**; `tsc` + `eslint` + `publint --strict` + `attw` + dual ESM/CJS/d.ts build all clean). v1.2.0 adds **provider-executed web search on three wires** (`anthropicWebSearch` / `openaiWebSearch` / `googleSearch` with citations as `source` parts), the **`providerOptions`** escape hatch, one-flag **Anthropic prompt caching** (`promptCaching: 'auto'`), and correct **Responses API stateless round-trips** (encrypted reasoning + `phase`). v1.1.1 refreshed the model catalog to the 2026-07 state — **Claude 5 (Fable 5 / Sonnet 5)** with the `output_config.effort` thinking wire, GPT-5.4/5.5 pricing corrections, the Gemini 3.1 line, `gemini-embedding-2`, and long-context pricing tiers. See the [Roadmap](#roadmap) for what's next.
+> **Status — published (v1.3.0).** [`@deuz-sdk/core`](https://www.npmjs.com/package/@deuz-sdk/core) is live on npm. Chat across all four wires + Vertex, the agentic tool loop, vision, MCP, the UI wire, native Gemini, embeddings, memory, RAG, skills, image generation, middleware, pricing, hybrid RAG search, and Gemini explicit caching are all implemented and tested (**309 tests green**; `tsc` + `eslint` + `publint --strict` + `attw` + dual ESM/CJS/d.ts build all clean). v1.3.0 ships the **tool-approval flow** (`needsApproval` live: inline `approveToolCall` or a client round-trip via `tool-approval-request` parts + `approvalResponses`), **`streamObject`** (streaming structured output with a zero-dep tolerant partial-JSON parser), **MCP extensions** (resources, prompts, form+URL elicitation, `structuredContent`), and **React hooks** — `useChat` with automatic client-tool round-trips and approval pauses, plus `useObject` over the new `object-delta` wire part (React is an optional peer). v1.2.0 added provider-executed web search on three wires, `providerOptions`, one-flag Anthropic prompt caching, and correct Responses API stateless round-trips; v1.1.1 refreshed the model catalog to the 2026-07 state (Claude 5, GPT-5.4/5.5, Gemini 3.1, pricing tiers). See the [Roadmap](#roadmap) for what's next.
 
 ```bash
 npm install @deuz-sdk/core
@@ -80,6 +80,20 @@ const { object } = await generateObject({
 const result = streamObject({ model, messages, schema });
 for await (const partial of result.partialObjectStream) render(partial); // DeepPartial<T>
 const value = await result.object;
+```
+
+### React hooks
+
+`useChat` / `useObject` over the Deuz UI wire (React is an **optional peer** `^18 || ^19`):
+
+```ts
+import { useChat } from '@deuz-sdk/core/react';
+
+const { messages, sendMessage, pendingApprovals, addToolApprovalResponse } = useChat({
+  api: '/api/chat',
+  onToolCall: async (call) => runInBrowser(call), // client tools auto-round-trip
+});
+// Gated tools pause into pendingApprovals; verdicts resume the chat automatically.
 ```
 
 ### Tools (agentic loop)
@@ -271,7 +285,7 @@ for await (const part of readDeuzStream(await fetch('/api/chat', { method: 'POST
 | `@deuz-sdk/core/mcp` · `…/mcp/stdio` | MCP client (HTTP/SSE edge-safe; stdio Node-only) |
 | `@deuz-sdk/core/edge` | Guaranteed edge-safe subset |
 | `@deuz-sdk/core/ui` | `toDeuzStreamResponse` (server) + `readDeuzStream` (client) — our own UI wire |
-| `@deuz-sdk/core/react` | React hooks (planned, Faz 6) |
+| `@deuz-sdk/core/react` | React hooks — `useChat` (client tools + approvals) / `useObject` (React = optional peer) |
 
 ---
 
@@ -299,9 +313,9 @@ Response: upstream SSE  →  robust parser  →  CANONICAL DELTA STREAM
 | **Faz 3** | Skills + memory + RAG + native Gemini + embeddings | ✅ |
 | **Faz 4** | Image generation (sync + Midjourney + Yunwu) | ✅ SDK side · ⏳ app-side `tasks` table |
 | **Faz 5** | Aggregator fallback, DeepSeek/Kimi, Batch API, rate-limiter impl | ⬜ optional |
-| **Faz 6** | `@deuz-sdk/core/react` hooks, CI provenance | 🔶 `1.2.0` on npm · docs ✅ · hooks ⏳ |
+| **Faz 6** | `@deuz-sdk/core/react` hooks, CI provenance | 🔶 hooks ✅ · CI provenance ⏳ |
 
-**Deliberately deferred** (seam exists, impl later): pre-flight token counting (`tokens.ts`), budgeter, full token-bucket rate limiter, OpenTelemetry exporter, memory consolidation/decay + graph memory, cross-encoder rerank implementation (seam is in), video generation helper, React hooks (`@deuz-sdk/core/react`, Faz 6).
+**Deliberately deferred** (seam exists, impl later): pre-flight token counting (`tokens.ts`), budgeter, full token-bucket rate limiter, OpenTelemetry exporter, memory consolidation/decay + graph memory, cross-encoder rerank implementation (seam is in), video generation helper.
 
 ---
 

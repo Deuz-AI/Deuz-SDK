@@ -17,7 +17,8 @@ If you know the Vercel AI SDK (`ai` + `@ai-sdk/*`), most of `@deuz-sdk/core` wil
 | `createAnthropic` (`@ai-sdk/anthropic`) | `createAnthropic` (`@deuz-sdk/core/anthropic`) | Factory returns a `Provider`; call it with a model id for a descriptor. |
 | `createOpenAI`, `openai.embedding(...)` | `createOpenAI`, `openaiEmbedding` (`@deuz-sdk/core/openai`) | Embeddings are a separate factory. |
 | `toDataStreamResponse` / `toUIMessageStreamResponse` | [`toDeuzStreamResponse`](/docs/modules/ui-streaming) (`@deuz-sdk/core/ui`) | Our own versioned wire, not the AI SDK protocol. |
-| `useChat` (React hook) | `readDeuzStream` (manual) | Hooks are planned (Faz 6); read the stream yourself today. |
+| `useChat` (React hook) | [`useChat`](/docs/modules/react-hooks) (`@deuz-sdk/core/react`) | Client tools auto-round-trip via `onToolCall`; approvals pause into `pendingApprovals`. React is an optional peer. |
+| `useObject` (React hook) | [`useObject`](/docs/modules/react-hooks) (`@deuz-sdk/core/react`) | Streams `object-delta` parts from `toDeuzObjectStreamResponse`. |
 | `streamObject` | [`streamObject`](/docs/core/stream-object) | Same options as `generateObject`; `partialObjectStream` yields `DeepPartial<T>`. No repair retry (partials can't be un-streamed). |
 | `needsApproval` / tool approval | [`needsApproval` + `approveToolCall` / `approvalResponses`](/docs/agents/tools#tool-approval-needsapproval) | Server mode decides inline; client mode breaks the loop with `tool-approval-request` parts and resumes via `approvalResponses`. |
 
@@ -268,6 +269,7 @@ for await (const part of readDeuzStream(res)) {
 
 These exist in the AI SDK but are deliberately deferred in `@deuz-sdk/core`:
 
-- **React hooks** (`useChat`, `useCompletion`, `useObject`) — planned for Faz 6 (`@deuz-sdk/core/react`). For now, drive [`readDeuzStream`](/docs/modules/ui-streaming) yourself.
+- **`useCompletion`** — use [`useChat`](/docs/modules/react-hooks) with a single-turn route, or drive [`readDeuzStream`](/docs/modules/ui-streaming) directly.
+- **Svelte/Vue/Angular bindings** — the wire is framework-agnostic; only React hooks ship today.
 
-Everything else in the chat, tools (including approval), structured output (buffered and streaming), embeddings, MCP, and UI surface has a direct equivalent above.
+Everything else in the chat, tools (including approval), structured output (buffered and streaming), embeddings, MCP, React hooks, and UI surface has a direct equivalent above.

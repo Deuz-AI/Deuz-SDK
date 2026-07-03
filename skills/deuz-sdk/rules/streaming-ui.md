@@ -58,7 +58,21 @@ function toDeuzStreamResponse(result: StreamChatResult, options?: {
 async function* readDeuzStream(response: Response): AsyncGenerator<DeuzUIPart>
 ```
 
-`DeuzUIPart` mirrors `StreamPart` UI-framed: `start` (messageId), `text-delta`, `reasoning-delta`, `tool-input-delta` (`{ toolCallId, toolName?, delta }`), `tool-call`, `tool-result`, `tool-approval-request` (1.3.0+), `source`, `step-start`/`step-finish`, `finish`, `error` (`{ message }`, already secret-redacted). `tool-approval-response` is declared client→server only — the verdict rides the NEXT request body as `approvalResponses`, it is never serialized by the server.
+`DeuzUIPart` mirrors `StreamPart` UI-framed: `start` (messageId), `text-delta`, `reasoning-delta`, `tool-input-delta` (`{ toolCallId, toolName?, delta }`), `tool-call`, `tool-result`, `tool-approval-request` (1.3.0+), `object-delta` (1.3.0+, from `toDeuzObjectStreamResponse` — each REPLACES the previous partial), `source`, `step-start`/`step-finish`, `finish`, `error` (`{ message }`, already secret-redacted). `tool-approval-response` is declared client→server only — the verdict rides the NEXT request body as `approvalResponses`, it is never serialized by the server.
+
+## React hooks — `@deuz-sdk/core/react` (1.3.0+)
+
+React is an OPTIONAL peer `^18 || ^19`; hooks are plain .ts (no JSX), SSR-safe (network only in callbacks).
+
+```ts
+const { messages, status, error, sendMessage, regenerate, stop, pendingApprovals, addToolApprovalResponse } =
+  useChat({ api: '/api/chat', onToolCall?, onError?, headers?, body?, initialMessages?, fetch? });
+const { object, isLoading, error, submit, stop } = useObject<T>({ api: '/api/object', headers?, fetch? });
+```
+
+- `useChat` keeps TWO histories: render-friendly `UIMessage[]` state AND an internal canonical `Message[]` it POSTs (client-tools reconstruction). Client tools auto-execute via `onToolCall` and auto re-POST until none pending; a throwing `onToolCall` self-heals as is_error.
+- Approvals PAUSE the chat (`pendingApprovals` non-empty, no re-POST); `addToolApprovalResponse` resumes with `approvalResponses` once EVERY verdict arrived — the server settles gated calls, the client never fabricates their tool_results.
+- `useObject`: server route returns `toDeuzObjectStreamResponse(streamObject(...))`; each `object-delta` replaces `object` wholesale (`DeepPartial<T>`); `stop()` aborts without erroring.
 
 ```ts
 for await (const part of readDeuzStream(res)) {
