@@ -255,7 +255,7 @@ describe('agentic tool loop (generateText)', () => {
 describe('tool approval — server mode (approveToolCall)', () => {
   it('approved: the tool executes and the loop continues (2 steps)', async () => {
     const weather = vi.fn(async () => ({ temp: 22 }));
-    const approve = vi.fn(async () => true);
+    const approve = vi.fn(async (_call: unknown) => true);
     const { fetch } = mockFetchSequence([
       () => sseResponse([ANTHROPIC_TOOL_CALL]),
       () => sseResponse([ANTHROPIC_FINAL]),
@@ -330,7 +330,9 @@ describe('tool approval — server mode (approveToolCall)', () => {
 
   it('predicate form receives parsed args + ctx; a THROWING predicate requires approval', async () => {
     const weather = vi.fn(async () => ({ temp: 22 }));
-    const predicate = vi.fn((args: unknown) => (args as { city: string }).city === 'Paris');
+    const predicate = vi.fn(
+      (args: unknown, _ctx: unknown) => (args as { city: string }).city === 'Paris',
+    );
     const approve = vi.fn(async () => true);
     const { fetch } = mockFetchSequence([
       () => sseResponse([ANTHROPIC_TOOL_CALL]),
@@ -537,7 +539,7 @@ describe('tool approval — settle-on-resume (approvalResponses)', () => {
   ];
 
   it('approved: executes, appends a NEW tool message, and continues', async () => {
-    const weather = vi.fn(async () => ({ temp: 22 }));
+    const weather = vi.fn(async (_args: unknown) => ({ temp: 22 }));
     const { fetch, calls } = mockFetchSequence([() => sseResponse([ANTHROPIC_FINAL])]);
     const res = await generateText({
       model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),

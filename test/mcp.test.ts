@@ -83,3 +83,65 @@ describe('structuredContent + outputSchema (MCP 2025-11-25)', () => {
     expect('outputSchema' in bare.plain!).toBe(false);
   });
 });
+
+describe('resources + prompts', () => {
+  it('listResources auto-paginates (cursor forwarded, pages merged)', async () => {
+    const cursors: Array<string | undefined> = [];
+    const raw: RawMcpClient = {
+      ...fakeRaw,
+      listResources: async (params) => {
+        cursors.push(params?.cursor);
+        return params?.cursor === 'c1'
+          ? { resources: [{ uri: 'file://b', name: 'b' }] }
+          : { resources: [{ uri: 'file://a', name: 'a' }], nextCursor: 'c1' };
+      },
+    };
+    const resources = await wrapMcpClient(raw).listResources();
+    expect(resources.map((r) => r.uri)).toEqual(['file://a', 'file://b']);
+    expect(cursors).toEqual([undefined, 'c1']);
+  });
+
+  it('pagination stops at the safety cap on an endless cursor', async () => {
+    let pages = 0;
+    const raw: RawMcpClient = {
+      ...fakeRaw,
+      listPrompts: async () => {
+        pages++;
+        return { prompts: [{ name: `p${pages}` }], nextCursor: 'again' };
+      },
+    };
+    const prompts = await wrapMcpClient(raw).listPrompts();
+    expect(pages).toBe(100);
+    expect(prompts).toHaveLength(100);
+  });
+
+  it('readResource unwraps contents; getPrompt passes args verbatim', async () => {
+    const raw: RawMcpClient = {
+      ...fakeRaw,
+      readResource: async ({ uri }) => ({
+        contents: [{ uri, text: 'hello', mimeType: 'text/plain' }],
+      }),
+      getPrompt: async (params) => ({
+        description: 'greeting prompt',
+        messages: [
+          {
+            role: 'user',
+            content: { type: 'text', text: `hi ${params.arguments?.name ?? '?'}` },
+          },
+        ],
+      }),
+    };
+    const client = wrapMcpClient(raw);
+    expect(await client.readResource('file://x')).toEqual([
+      { uri: 'file://x', text: 'hello', mimeType: 'text/plain' },
+    ]);
+    const prompt = await client.getPrompt('greet', { name: 'umut' });
+    expect(prompt.description).toBe('greeting prompt');
+    expect(prompt.messages[0]).toMatchObject({ role: 'user' });
+  });
+
+  it('rejects with an actionable upgrade error when the SDK lacks a method', async () => {
+    await expect(wrapMcpClient(fakeRaw).listResources()).rejects.toThrow(/\^1\.29\.0/);
+    await expect(wrapMcpClient(fakeRaw).getPrompt('x')).rejects.toThrow(/\^1\.29\.0/);
+  });
+});
