@@ -212,7 +212,7 @@ await indexChunks(chunks, { embedder, store });   // dense
 const bm25 = createBm25Index(chunks);             // lexical (build once)
 
 const hits = await hybridRetrieve('warm animal and GDPR clause 17', { embedder, store, bm25 }, { topK: 8 });
-// semantic match AND the exact "clause 17" both surface — RRF-fused, then reranked.
+// semantic match AND the exact "clause 17" both surface — RRF-fused ranking.
 ```
 
 ### Skills (SKILL.md + progressive disclosure)
@@ -321,7 +321,7 @@ Response: upstream SSE  →  robust parser  →  CANONICAL DELTA STREAM
 
 ## Quality bar
 
-- **257 tests** (vitest golden-replay fixtures + deterministic mock models — no real network)
+- **309 tests** (vitest golden-replay fixtures + deterministic mock models — no real network)
 - `tsc` strict · `eslint` (edge-safety enforced) · `publint --strict` · `attw` · dual **ESM + CJS + .d.ts** build — all green
 - Type-contract lock: `test/surface.test-d.ts` pins the public 1.0 surface
 - ~10k lines across 70 source modules, zero runtime dependencies
