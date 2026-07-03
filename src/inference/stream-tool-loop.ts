@@ -19,6 +19,8 @@ import {
   normalizeStop,
   shouldStop,
   sumUsage,
+  findApprovalNeeded,
+  resolveServerApprovals,
 } from './loop-shared';
 
 async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<string> {
@@ -183,6 +185,13 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         }
         messages = [...messages, assistantMessage];
 
+        // Approval gate: server mode denies inline; without approveToolCall the
+        // gated calls break the loop like client tools (handled below).
+        const gated = await findApprovalNeeded(toolCalls, tools, options, messages);
+        const denied = options.approveToolCall
+          ? await resolveServerApprovals(gated, toolCalls, options, messages)
+          : new Map<string, string | undefined>();
+
         const stepData = {
           text,
           reasoningText,
@@ -198,7 +207,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
           break;
         }
 
-        const toolResults = await executeTools(toolCalls, tools, options, messages);
+        const toolResults = await executeTools(toolCalls, tools, options, messages, denied);
         for (const r of toolResults) {
           broadcaster.push({
             type: 'tool-result',
@@ -218,7 +227,14 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         steps.push(sr);
         options.onStepFinish?.(sr);
 
-        if (bumpErrorGuard(errorCounters, toolResults)) break;
+        // Denials are deliberate, not tool failures — exclude from the runaway guard.
+        if (
+          bumpErrorGuard(
+            errorCounters,
+            toolResults.filter((r) => !denied.has(r.toolCallId)),
+          )
+        )
+          break;
         if (await shouldStop(stopConditions, steps)) break;
         stepIndex++;
       }

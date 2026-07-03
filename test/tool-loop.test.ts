@@ -252,6 +252,150 @@ describe('agentic tool loop (generateText)', () => {
   });
 });
 
+describe('tool approval — server mode (approveToolCall)', () => {
+  it('approved: the tool executes and the loop continues (2 steps)', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const approve = vi.fn(async () => true);
+    const { fetch } = mockFetchSequence([
+      () => sseResponse([ANTHROPIC_TOOL_CALL]),
+      () => sseResponse([ANTHROPIC_FINAL]),
+    ]);
+    const res = await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+      },
+      approveToolCall: approve,
+      maxSteps: 5,
+    });
+    expect(approve).toHaveBeenCalledTimes(1);
+    expect(approve.mock.calls[0]![0]).toMatchObject({
+      toolCallId: 'toolu_1',
+      toolName: 'getWeather',
+    });
+    expect(weather).toHaveBeenCalledTimes(1);
+    expect(res.steps).toHaveLength(2);
+    expect(res.text).toBe('Sunny in Paris.');
+  });
+
+  it('denied: execute is NOT called, the model sees an is_error tool_result', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch, calls } = mockFetchSequence([
+      () => sseResponse([ANTHROPIC_TOOL_CALL]),
+      () => sseResponse([ANTHROPIC_FINAL]),
+    ]);
+    const res = await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+      },
+      approveToolCall: () => false,
+      maxSteps: 5,
+    });
+    expect(weather).not.toHaveBeenCalled();
+    expect(res.steps).toHaveLength(2); // loop CONTINUED after the denial
+    const body2 = String(calls[1]!.init!.body);
+    expect(body2).toContain('Tool call denied.');
+    expect(
+      JSON.parse(body2).messages.some(
+        (m: { content: unknown }) =>
+          Array.isArray(m.content) &&
+          m.content.some(
+            (b: { type?: string; is_error?: boolean }) =>
+              b.type === 'tool_result' && b.is_error === true,
+          ),
+      ),
+    ).toBe(true);
+  });
+
+  it('denials do NOT count toward the runaway error guard', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch, calls } = mockFetchSequence([() => sseResponse([ANTHROPIC_TOOL_CALL])]); // always a tool call
+    const res = await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'go' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+      },
+      approveToolCall: () => false,
+      maxSteps: 5,
+    });
+    // 5 denials, 5 steps — MAX_SAME_TOOL_ERRORS (3) must NOT have tripped.
+    expect(res.steps).toHaveLength(5);
+    expect(calls).toHaveLength(5);
+    expect(weather).not.toHaveBeenCalled();
+  });
+
+  it('predicate form receives parsed args + ctx; a THROWING predicate requires approval', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const predicate = vi.fn((args: unknown) => (args as { city: string }).city === 'Paris');
+    const approve = vi.fn(async () => true);
+    const { fetch } = mockFetchSequence([
+      () => sseResponse([ANTHROPIC_TOOL_CALL]),
+      () => sseResponse([ANTHROPIC_FINAL]),
+    ]);
+    await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: predicate },
+      },
+      approveToolCall: approve,
+      maxSteps: 5,
+    });
+    expect(predicate).toHaveBeenCalledTimes(1);
+    expect(predicate.mock.calls[0]![0]).toEqual({ city: 'Paris' });
+    expect(predicate.mock.calls[0]![1]).toMatchObject({ toolCallId: 'toolu_1' });
+    expect(approve).toHaveBeenCalledTimes(1); // predicate said yes → approver consulted
+
+    // Throwing predicate → safe side: approval required (approver consulted again).
+    const approve2 = vi.fn(async () => true);
+    const { fetch: fetch2 } = mockFetchSequence([
+      () => sseResponse([ANTHROPIC_TOOL_CALL]),
+      () => sseResponse([ANTHROPIC_FINAL]),
+    ]);
+    await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch: fetch2 })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: {
+          parameters: SCHEMA,
+          execute: weather,
+          needsApproval: () => {
+            throw new Error('predicate exploded');
+          },
+        },
+      },
+      approveToolCall: approve2,
+      maxSteps: 5,
+    });
+    expect(approve2).toHaveBeenCalledTimes(1);
+  });
+
+  it('a THROWING approveToolCall is a denial (safe side)', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch, calls } = mockFetchSequence([
+      () => sseResponse([ANTHROPIC_TOOL_CALL]),
+      () => sseResponse([ANTHROPIC_FINAL]),
+    ]);
+    await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+      },
+      approveToolCall: () => {
+        throw new Error('approver exploded');
+      },
+      maxSteps: 5,
+    });
+    expect(weather).not.toHaveBeenCalled();
+    expect(String(calls[1]!.init!.body)).toContain('Tool call denied.');
+  });
+});
+
 describe('agentic tool loop (streamChat)', () => {
   it('emits one fullStream across steps with step + tool parts', async () => {
     const weather = vi.fn(async () => ({ temp: 22 }));

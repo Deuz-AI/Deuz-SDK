@@ -19,6 +19,74 @@ import { ToolExecutionError } from '../errors';
 
 export const MAX_SAME_TOOL_ERRORS = 3;
 
+/** Denial message fed back to the model as an is_error tool_result. */
+export const TOOL_DENIED = 'Tool call denied.';
+
+/**
+ * Which of the step's calls require approval. `needsApproval` booleans are
+ * read directly; predicate forms are awaited with the parsed args + execute
+ * ctx. A THROWING predicate requires approval (safe side). Fast path: zero
+ * overhead when no called tool declares `needsApproval`.
+ */
+export async function findApprovalNeeded(
+  toolCalls: ToolCall[],
+  tools: ToolSet,
+  options: CommonCallOptions,
+  messages: Message[],
+): Promise<Set<string>> {
+  const needed = new Set<string>();
+  if (!toolCalls.some((c) => tools[c.toolName]?.needsApproval)) return needed;
+  await Promise.all(
+    toolCalls.map(async (call) => {
+      const na = tools[call.toolName]?.needsApproval;
+      if (na === undefined || na === false) return;
+      if (na === true) {
+        needed.add(call.toolCallId);
+        return;
+      }
+      try {
+        if (
+          await na(call.args, { toolCallId: call.toolCallId, messages, signal: options.signal })
+        ) {
+          needed.add(call.toolCallId);
+        }
+      } catch {
+        needed.add(call.toolCallId); // safe side: an exploding predicate gates the call
+      }
+    }),
+  );
+  return needed;
+}
+
+/**
+ * Server mode: ask `approveToolCall` for each gated call. Returns the denied
+ * ids (→ reason). A THROWING approver denies (safe side).
+ */
+export async function resolveServerApprovals(
+  gated: Set<string>,
+  toolCalls: ToolCall[],
+  options: CommonCallOptions,
+  messages: Message[],
+): Promise<Map<string, string | undefined>> {
+  const denied = new Map<string, string | undefined>();
+  const approve = options.approveToolCall;
+  if (!approve || gated.size === 0) return denied;
+  await Promise.all(
+    toolCalls
+      .filter((c) => gated.has(c.toolCallId))
+      .map(async (c) => {
+        let ok = false;
+        try {
+          ok = await approve(c, { messages });
+        } catch {
+          ok = false;
+        }
+        if (!ok) denied.set(c.toolCallId, undefined);
+      }),
+  );
+  return denied;
+}
+
 export function sumUsage(a: Usage, b: Usage): Usage {
   const audio = (a.audioTokens ?? 0) + (b.audioTokens ?? 0);
   const serverTools = (a.serverToolUses ?? 0) + (b.serverToolUses ?? 0);
@@ -90,15 +158,29 @@ export function hasClientTool(toolCalls: ToolCall[], tools: ToolSet): boolean {
   );
 }
 
-/** Execute the step's tool calls in parallel (capped); errors self-heal as is_error results. */
+/**
+ * Execute the step's tool calls in parallel (capped); errors self-heal as
+ * is_error results. Calls listed in `denied` short-circuit to an is_error
+ * denial BEFORE validation (a denied call must not leak a validation message).
+ */
 export async function executeTools(
   toolCalls: ToolCall[],
   tools: ToolSet,
   options: CommonCallOptions,
   messages: Message[],
+  denied?: Map<string, string | undefined>,
 ): Promise<ToolResult[]> {
   const cap = options.maxToolConcurrency ?? 5;
   return mapWithConcurrency(toolCalls, cap, async (call): Promise<ToolResult> => {
+    if (denied?.has(call.toolCallId)) {
+      const reason = denied.get(call.toolCallId);
+      return {
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        result: reason ? `${TOOL_DENIED} Reason: ${reason}` : TOOL_DENIED,
+        isError: true,
+      };
+    }
     const tool: Tool | undefined = tools[call.toolName];
     if (!tool?.execute) {
       return {

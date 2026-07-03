@@ -15,6 +15,8 @@ import {
   normalizeStop,
   shouldStop,
   sumUsage,
+  findApprovalNeeded,
+  resolveServerApprovals,
 } from './loop-shared';
 
 /**
@@ -52,6 +54,13 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     }));
     messages = [...messages, step.assistantMessage]; // assistant FIRST (OpenAI ordering)
 
+    // Approval gate: server mode denies inline; without approveToolCall the
+    // gated calls break the loop like client tools (handled below).
+    const gated = await findApprovalNeeded(toolCalls, tools, options, messages);
+    const denied = options.approveToolCall
+      ? await resolveServerApprovals(gated, toolCalls, options, messages)
+      : new Map<string, string | undefined>();
+
     // Client tools (no execute) can't be auto-continued — return for the caller.
     if (hasClientTool(toolCalls, tools)) {
       const sr = toStepResult(step, toolCalls, [], steps.length);
@@ -60,7 +69,7 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
       break;
     }
 
-    const toolResults = await executeTools(toolCalls, tools, options, messages);
+    const toolResults = await executeTools(toolCalls, tools, options, messages, denied);
     const toolResultMessage: Message = { role: 'tool', content: toolResults.map(toToolResultPart) };
     messages = [...messages, toolResultMessage]; // EVERY tool_use answered (Anthropic 400 guard)
 
@@ -68,7 +77,14 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     steps.push(sr);
     options.onStepFinish?.(sr);
 
-    if (bumpErrorGuard(errorCounters, toolResults)) break;
+    // Denials are deliberate, not tool failures — exclude from the runaway guard.
+    if (
+      bumpErrorGuard(
+        errorCounters,
+        toolResults.filter((r) => !denied.has(r.toolCallId)),
+      )
+    )
+      break;
     if (await shouldStop(stopConditions, steps)) break;
   }
 
