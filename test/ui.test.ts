@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { streamChat } from '../src/index';
-import { toDeuzStreamResponse, readDeuzStream } from '../src/ui';
+import { toDeuzStreamResponse, toDeuzObjectStreamResponse, readDeuzStream } from '../src/ui';
+import type { StreamObjectResult } from '../src/index';
 import { createAnthropic } from '../src/anthropic';
 import type { JSONSchema } from '../src/types/schema';
 import { sseResponse, sseEvents, mockFetch, mockFetchSequence } from './fixtures/sse';
@@ -169,6 +170,60 @@ describe('Deuz UI wire', () => {
     expect(passthrough).toEqual([
       { type: 'tool-approval-response', approvalId: 'toolu_1', approved: true },
     ]);
+  });
+
+  it('toDeuzObjectStreamResponse emits start/object-delta/finish and [DONE]', async () => {
+    async function* partials(): AsyncGenerator<{ city?: string }> {
+      yield { city: 'Par' };
+      yield { city: 'Paris' };
+    }
+    const fake: StreamObjectResult<{ city: string }> = {
+      partialObjectStream: partials(),
+      object: Promise.resolve({ city: 'Paris' }),
+      usage: Promise.resolve({
+        inputTokens: 8,
+        outputTokens: 4,
+        reasoningTokens: 0,
+        cachedReadTokens: 0,
+        cacheWriteTokens: 0,
+        cacheWrite1hTokens: 0,
+        totalTokens: 12,
+      }),
+      finishReason: Promise.resolve('stop'),
+    };
+    const res = toDeuzObjectStreamResponse(fake, { messageId: 'm1' });
+    expect(res.headers.get('x-deuz-stream')).toBe('v1');
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+
+    const parts = [];
+    for await (const p of readDeuzStream(res)) parts.push(p);
+    expect(parts[0]).toEqual({ type: 'start', messageId: 'm1' });
+    expect(
+      parts
+        .filter((p): p is Extract<typeof p, { type: 'object-delta' }> => p.type === 'object-delta')
+        .map((p) => p.object),
+    ).toEqual([{ city: 'Par' }, { city: 'Paris' }]);
+    expect(parts.at(-1)).toMatchObject({ type: 'finish', finishReason: 'stop' });
+  });
+
+  it('toDeuzObjectStreamResponse surfaces failures as a redacted error part', async () => {
+    async function* boom(): AsyncGenerator<unknown> {
+      throw new Error('bad sk-ant-SECRETxyz1234567');
+      yield undefined; // unreachable — keeps the generator shape
+    }
+    const rejected = Promise.reject(new Error('x'));
+    rejected.catch(() => {});
+    const fake = {
+      partialObjectStream: boom(),
+      object: rejected,
+      usage: rejected,
+      finishReason: rejected,
+    } as unknown as StreamObjectResult<unknown>;
+    const parts = [];
+    for await (const p of readDeuzStream(toDeuzObjectStreamResponse(fake))) parts.push(p);
+    const err = parts.find((p): p is Extract<typeof p, { type: 'error' }> => p.type === 'error');
+    expect(err).toBeDefined();
+    expect(err!.message).not.toContain('SECRETxyz');
   });
 
   it('redacts secrets in the error part', async () => {
