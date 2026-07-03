@@ -5,7 +5,9 @@ description: Connect to Model Context Protocol servers and expose their tools to
 
 The MCP module connects to a [Model Context Protocol](https://modelcontextprotocol.io) server, lists its tools, and maps them into a canonical `ToolSet` you can hand straight to [generateText](/docs/core/generate-text) or [streamChat](/docs/core/stream-chat). Tool execution proxies transparently to the server — when the model calls an MCP tool, the SDK invokes it over the live connection and feeds the result back into the loop.
 
-`@modelcontextprotocol/sdk` is a **lazy optional peer**: it is imported with a dynamic `import()` only when you actually create a client, so the edge bundle never pulls it in unless you use MCP. Install it yourself:
+Beyond tools, the client also exposes the server's **resources** and **prompts**, and can answer server-initiated **elicitation** requests (all per the 2025-11-25 MCP revision).
+
+`@modelcontextprotocol/sdk` is a **lazy optional peer** (`^1.29.0`): it is imported with a dynamic `import()` only when you actually create a client, so the edge bundle never pulls it in unless you use MCP. Install it yourself:
 
 ```bash
 npm i @modelcontextprotocol/sdk
@@ -41,6 +43,7 @@ interface McpClientOptions {
   transport: McpHttpTransport;
   name?: string;
   version?: string;
+  onElicitationRequest?: McpElicitationHandler;
 }
 
 interface McpHttpTransport {
@@ -57,6 +60,7 @@ interface McpHttpTransport {
 | `transport.headers` | `Record<string, string>` | — | Extra request headers (e.g. `Authorization`). Sent on every request. |
 | `name` | `string` | `'deuz'` | Client name advertised to the server. |
 | `version` | `string` | `'0.0.0'` | Client version advertised to the server. |
+| `onElicitationRequest` | `McpElicitationHandler` | — | Answer server-initiated user-input requests — see [Elicitation](#elicitation). Providing it declares the `elicitation` capability (form + url). |
 
 ## createStdioMcpClient
 
@@ -75,6 +79,7 @@ interface McpStdioOptions {
   env?: Record<string, string>;
   name?: string;
   version?: string;
+  onElicitationRequest?: McpElicitationHandler; // same semantics as the HTTP client
 }
 ```
 
@@ -96,6 +101,11 @@ interface McpClient {
   listTools(namespace?: string): Promise<ToolSet>;
   /** Call a tool directly (rarely needed; the loop uses execute). */
   callTool(name: string, args: unknown): Promise<unknown>;
+  /** All resources / prompts, auto-paginated (cursor handled for you). */
+  listResources(): Promise<McpResource[]>;
+  readResource(uri: string): Promise<McpResourceContent[]>;
+  listPrompts(): Promise<McpPrompt[]>;
+  getPrompt(name: string, args?: Record<string, string>): Promise<McpGetPromptResult>;
   close(): Promise<void>;
 }
 ```
@@ -104,17 +114,49 @@ interface McpClient {
 | --- | --- | --- |
 | `listTools(namespace?)` | `Promise<ToolSet>` | Lists the server's tools and maps each into a canonical `Tool`. The optional `namespace` prefixes every tool name with `` `${namespace}_` `` so you can merge multiple servers without collisions. |
 | `callTool(name, args)` | `Promise<unknown>` | Invokes a tool directly. The loop never needs this — each mapped tool's `execute` calls it for you. |
+| `listResources()` | `Promise<McpResource[]>` | All resources across pages — cursor pagination is handled internally (capped at 100 pages against endless cursors). |
+| `readResource(uri)` | `Promise<McpResourceContent[]>` | One resource's contents: entries carry `text` or base64 `blob` plus `mimeType`. |
+| `listPrompts()` | `Promise<McpPrompt[]>` | All prompt templates across pages (same pagination handling). |
+| `getPrompt(name, args?)` | `Promise<McpGetPromptResult>` | Renders a prompt with string arguments. Messages come back in **MCP's own shape** (`{ role, content }` blocks), not the canonical `Message` — map them yourself if you feed them to a model. |
 | `close()` | `Promise<void>` | Closes the connection / terminates the child process. Always call it when done. |
+
+The resource/prompt methods need SDK `^1.29.0` — on an older installed SDK they reject with an actionable upgrade error.
 
 ### How tools map
 
 `listTools()` returns a `ToolSet` — a `Record<string, Tool>` — built from the server's tool definitions:
 
-- The MCP `inputSchema` **is** a JSON Schema, so it goes straight onto `Tool.parameters` (no conversion).
+- The MCP `inputSchema` **is** a JSON Schema, so it goes straight onto `Tool.parameters` (no conversion). The server's `outputSchema`, when present, is carried onto `Tool.outputSchema` as metadata.
 - Each tool's `execute` proxies to the server via `callTool`.
-- The result's text content blocks are joined into a string and returned. If the server marks the result as an error (`isError`), `execute` **throws** — which the [tool loop](/docs/agents/tool-loop) catches and feeds back as an `is_error` tool result, so the model can self-heal rather than the call crashing.
+- **Structured results win:** when the server returns `structuredContent`, `execute` returns that object verbatim (per spec, the text blocks are just a redundant serialization). Otherwise the text content blocks are joined into a string. If the server marks the result as an error (`isError`), `execute` **throws** — which the [tool loop](/docs/agents/tool-loop) catches and feeds back as an `is_error` tool result, so the model can self-heal rather than the call crashing.
 
 Because the mapped tools have an `execute`, the agentic loop runs them automatically; you do not write the round-trip yourself.
+
+> **Behavior note:** before 1.3.0, `execute` always returned joined text. Servers that declare an `outputSchema` now yield the structured object instead — if your code string-matched those results, read the object.
+
+## Elicitation
+
+Servers can pause mid-operation and ask the **user** for input (`elicitation/create`). Pass `onElicitationRequest` to handle it; the request is a two-mode union:
+
+```ts
+const mcp = await createMcpClient({
+  transport: { type: 'http', url: 'https://mcp.example.com/mcp' },
+  onElicitationRequest: async (req) => {
+    if (req.mode === 'form') {
+      // req.requestedSchema: flat object, primitive props — render a form.
+      const content = await showForm(req.message, req.requestedSchema);
+      return content ? { action: 'accept', content } : { action: 'decline' };
+    }
+    // req.mode === 'url': show req.url to the user and ask for consent.
+    // NEVER auto-open or prefetch it (spec requirement). accept = consent
+    // only — the interaction completes out-of-band on the server's side.
+    const consented = await confirmOpenUrl(req.message, req.url);
+    return { action: consented ? 'accept' : 'decline' };
+  },
+});
+```
+
+Return `{ action: 'accept', content? }`, `{ action: 'decline' }`, or `{ action: 'cancel' }`. Form-mode `content` must match `requestedSchema`. URL mode exists for sensitive flows (OAuth, payment, API keys) that must not pass through the client — treat the URL as untrusted, display the full host, and let the user decide.
 
 ## HTTP server in a tool loop
 

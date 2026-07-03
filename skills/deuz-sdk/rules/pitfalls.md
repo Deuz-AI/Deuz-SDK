@@ -41,3 +41,9 @@ Everything normalizes to canonical `StreamPart` deltas first so abort/retry/mult
 
 ## 10. Adding a new subpath export = three files in lockstep
 `package.json` `exports` + `tsup.config.ts` `entry` + (if edge-safe) `src/edge.ts`. Run `npm run check` (the full gate: format + lint + typecheck + test + test:types + build + publint + attw) before claiming done.
+
+## 11. streamObject has NO repair retry
+`generateObject` retries once on a parse/validation miss; `streamObject` cannot (partials were already emitted). A bad final payload rejects `object` (NoObjectGeneratedError) AND the partial stream — but `usage`/`finishReason` still resolve. Handle the rejection; don't assume the generateObject retry saved you.
+
+## 12. Approval: no verdict = DENIED
+On an `approvalResponses` resume, a gated call with no matching response is denied by default (safe side) — it does NOT stay pending for another round. Send a verdict for every `approvalId` you received. Denials are excluded from the runaway error guard, and unknown approvalIds are silently ignored (replay-safe).

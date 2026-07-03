@@ -43,7 +43,7 @@ Requires **Node ≥ 22**. **Zero runtime dependencies.** Optional peers, pulled 
 ## Quickstart
 
 ```ts
-import { streamChat, generateText, generateObject } from '@deuz-sdk/core';
+import { streamChat, generateText, generateObject, streamObject } from '@deuz-sdk/core';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
 
 // API keys are injected — core never reads process.env.
@@ -74,6 +74,14 @@ const { object } = await generateObject({
 });
 ```
 
+`streamObject` streams the same thing progressively — partial objects on every meaningful delta, validated final value at the end (sync return, G2 semantics):
+
+```ts
+const result = streamObject({ model, messages, schema });
+for await (const partial of result.partialObjectStream) render(partial); // DeepPartial<T>
+const value = await result.object;
+```
+
 ### Tools (agentic loop)
 
 ```ts
@@ -91,7 +99,7 @@ const { text, steps } = await generateText({
 });
 ```
 
-Parallel execution, self-healing on tool errors, immutable history (cache-safe), and runaway guards are built in.
+Parallel execution, self-healing on tool errors, immutable history (cache-safe), and runaway guards are built in. **Tool approval** is wired end-to-end: gate a tool with `needsApproval`, then either decide inline (`approveToolCall`) or let the loop break with `pendingApprovals` / `tool-approval-request` parts and resume via `approvalResponses`.
 
 ### Embeddings
 
@@ -242,7 +250,7 @@ for await (const part of readDeuzStream(await fetch('/api/chat', { method: 'POST
 
 | Import | Purpose |
 | --- | --- |
-| `@deuz-sdk/core` | Free functions (`streamChat`, `generateText`, `generateObject`, `embed`), `createClient`, types, errors |
+| `@deuz-sdk/core` | Free functions (`streamChat`, `generateText`, `generateObject`, `streamObject`, `embed`), `createClient`, types, errors |
 | `@deuz-sdk/core/anthropic` | Anthropic Messages provider |
 | `@deuz-sdk/core/openai` | OpenAI (Chat Completions + Responses) + `openaiEmbedding` |
 | `@deuz-sdk/core/xai` | xAI Grok (OpenAI-compatible) |
@@ -293,7 +301,7 @@ Response: upstream SSE  →  robust parser  →  CANONICAL DELTA STREAM
 | **Faz 5** | Aggregator fallback, DeepSeek/Kimi, Batch API, rate-limiter impl | ⬜ optional |
 | **Faz 6** | `@deuz-sdk/core/react` hooks, CI provenance | 🔶 `1.2.0` on npm · docs ✅ · hooks ⏳ |
 
-**Deliberately deferred** (seam exists, impl later): `streamObject`, pre-flight token counting (`tokens.ts`), budgeter, full token-bucket rate limiter, OpenTelemetry exporter, memory consolidation/decay + graph memory, cross-encoder rerank implementation (seam is in), video generation helper, React hooks (`@deuz-sdk/core/react`, Faz 6).
+**Deliberately deferred** (seam exists, impl later): pre-flight token counting (`tokens.ts`), budgeter, full token-bucket rate limiter, OpenTelemetry exporter, memory consolidation/decay + graph memory, cross-encoder rerank implementation (seam is in), video generation helper, React hooks (`@deuz-sdk/core/react`, Faz 6).
 
 ---
 

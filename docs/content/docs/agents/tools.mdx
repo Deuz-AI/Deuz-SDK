@@ -15,6 +15,7 @@ interface Tool<Args = unknown, Result = unknown> {
   needsApproval?:
     | boolean
     | ((args: Args, ctx: ToolExecuteContext) => boolean | Promise<boolean>);
+  outputSchema?: JSONSchema; // carried metadata only (populated by MCP tools)
 }
 
 type ToolSet = Record<string, Tool>;
@@ -25,9 +26,41 @@ type ToolSet = Record<string, Tool>;
 | `description` | `string` | no | What the tool does. The model uses this to decide when to call it — write it carefully. |
 | `parameters` | `StandardSchemaV1` or `JSONSchema` | yes | The argument schema. A Standard Schema (Zod, Valibot, …) or a raw JSON Schema. |
 | `execute` | `(args, ctx) => Result \| Promise<Result>` | no | Runs the tool server-side. Omit it for a **client tool** (see below). |
-| `needsApproval` | `boolean` or predicate | no | Reserved field — the approval round-trip is not wired yet, but the field is locked in the 1.0 surface. |
+| `needsApproval` | `boolean` or predicate | no | Gates the call on approval. `true` always asks; a predicate gets the parsed args + ctx and is awaited (a **throwing** predicate counts as approval-required — safe side). See below. |
+| `outputSchema` | `JSONSchema` | no | Expected result shape — metadata only, never sent on chat wires and not validated by the loop. [MCP tools](/docs/modules/mcp) populate it from the server's `outputSchema`. |
 
 The map **key** is the tool name the model calls — there is no `name` field on `Tool` itself.
+
+## Tool approval (`needsApproval`)
+
+Two modes, chosen by whether you pass `approveToolCall`:
+
+**Server mode** — decide inline, the loop never pauses. Denials become an
+`is_error` tool_result (`'Tool call denied.'`) the model can react to; they do
+NOT count toward the runaway error guard. A throwing `approveToolCall` denies.
+
+```ts title="server-mode-approval.ts"
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages,
+  maxSteps: 5,
+  tools: {
+    deleteFile: {
+      description: 'Delete a file by path.',
+      parameters: deleteSchema,
+      needsApproval: (args) => (args as { path: string }).path.startsWith('/prod'),
+      execute: deleteFile,
+    },
+  },
+  approveToolCall: async (call, { messages }) => {
+    // call = { toolCallId, toolName, args } — decide however you like.
+    return await policyAllows(call);
+  },
+});
+```
+
+**Client mode** — omit `approveToolCall` and the loop breaks instead, handing
+the decision to your UI. See [the approval round-trip](/docs/agents/client-tools#tool-approval-round-trip).
 
 ```ts
 const tools = {

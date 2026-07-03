@@ -5,6 +5,7 @@
     "stream-chat",
     "generate-text",
     "generate-object",
+    "stream-object",
     "embeddings",
     "messages",
     "errors",
