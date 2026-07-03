@@ -186,11 +186,14 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         messages = [...messages, assistantMessage];
 
         // Approval gate: server mode denies inline; without approveToolCall the
-        // gated calls break the loop like client tools (handled below).
+        // gated calls break the loop like client tools (client mode).
         const gated = await findApprovalNeeded(toolCalls, tools, options, messages);
         const denied = options.approveToolCall
           ? await resolveServerApprovals(gated, toolCalls, options, messages)
           : new Map<string, string | undefined>();
+        const pendingApproval = options.approveToolCall
+          ? []
+          : toolCalls.filter((c) => gated.has(c.toolCallId));
 
         const stepData = {
           text,
@@ -200,7 +203,18 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
           finishReason: stepFinish,
           assistantMessage,
         };
-        if (hasClientTool(toolCalls, tools)) {
+        // Pending approvals and client tools break together: ONE break, nothing
+        // from the batch executes; the resume call settles the deferred rest.
+        if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
+          for (const c of pendingApproval) {
+            broadcaster.push({
+              type: 'tool-approval-request',
+              approvalId: c.toolCallId,
+              toolCallId: c.toolCallId,
+              toolName: c.toolName,
+              input: c.args,
+            });
+          }
           const sr = toStepResult(stepData, toolCalls, [], steps.length);
           steps.push(sr);
           options.onStepFinish?.(sr);

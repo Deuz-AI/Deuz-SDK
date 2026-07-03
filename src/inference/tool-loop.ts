@@ -2,7 +2,7 @@ import type { CommonCallOptions } from '../types/config';
 import type { GenerateTextResult } from '../types/methods';
 import type { Message } from '../types/message';
 import type { Usage } from '../types/usage';
-import type { ToolCall, StepResult } from '../types/tool';
+import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
 import { runOneStep, type OneStep } from './run-step';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
@@ -35,6 +35,7 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
   const errorCounters = new Map<string, number>();
   let totalUsage: Usage = EMPTY_USAGE;
   let lastStep: OneStep | undefined;
+  let pendingApprovals: ToolApprovalRequest[] | undefined;
 
   for (;;) {
     const step = await runOneStep({ ...options, messages }, { tools: wireTools });
@@ -55,14 +56,26 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     messages = [...messages, step.assistantMessage]; // assistant FIRST (OpenAI ordering)
 
     // Approval gate: server mode denies inline; without approveToolCall the
-    // gated calls break the loop like client tools (handled below).
+    // gated calls break the loop like client tools (client mode).
     const gated = await findApprovalNeeded(toolCalls, tools, options, messages);
     const denied = options.approveToolCall
       ? await resolveServerApprovals(gated, toolCalls, options, messages)
       : new Map<string, string | undefined>();
+    const pendingApproval = options.approveToolCall
+      ? []
+      : toolCalls.filter((c) => gated.has(c.toolCallId));
 
-    // Client tools (no execute) can't be auto-continued — return for the caller.
-    if (hasClientTool(toolCalls, tools)) {
+    // Pending approvals and client tools (no execute) can't be auto-continued —
+    // ONE break, executing nothing from the batch; the resume settles the rest.
+    if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
+      if (pendingApproval.length > 0) {
+        pendingApprovals = pendingApproval.map((c) => ({
+          approvalId: c.toolCallId,
+          toolCallId: c.toolCallId,
+          toolName: c.toolName,
+          input: c.args,
+        }));
+      }
       const sr = toStepResult(step, toolCalls, [], steps.length);
       steps.push(sr);
       options.onStepFinish?.(sr);
@@ -98,5 +111,6 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     ...(lastToolStep
       ? { toolCalls: lastToolStep.toolCalls, toolResults: lastToolStep.toolResults }
       : {}),
+    ...(pendingApprovals ? { pendingApprovals } : {}),
   };
 }

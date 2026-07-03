@@ -396,6 +396,135 @@ describe('tool approval — server mode (approveToolCall)', () => {
   });
 });
 
+// Two tool_use blocks in one turn: a gated server tool + a client tool.
+const ANTHROPIC_TWO_TOOLS = sseEvents([
+  {
+    event: 'message_start',
+    data: { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 1 } } },
+  },
+  {
+    event: 'content_block_start',
+    data: {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'getWeather' },
+    },
+  },
+  {
+    event: 'content_block_delta',
+    data: {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: '{"city":"Paris"}' },
+    },
+  },
+  { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
+  {
+    event: 'content_block_start',
+    data: {
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'tool_use', id: 'toolu_2', name: 'askUser' },
+    },
+  },
+  {
+    event: 'content_block_delta',
+    data: {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'input_json_delta', partial_json: '{"q":"ok?"}' },
+    },
+  },
+  { event: 'content_block_stop', data: { type: 'content_block_stop', index: 1 } },
+  {
+    event: 'message_delta',
+    data: {
+      type: 'message_delta',
+      delta: { stop_reason: 'tool_use' },
+      usage: { output_tokens: 5 },
+    },
+  },
+  { event: 'message_stop', data: { type: 'message_stop' } },
+]);
+
+describe('tool approval — client mode (no approveToolCall)', () => {
+  it('buffered: breaks the loop and returns pendingApprovals', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch, calls } = mockFetchSequence([
+      () => sseResponse([ANTHROPIC_TOOL_CALL]),
+      () => sseResponse([ANTHROPIC_FINAL]),
+    ]);
+    const res = await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+      },
+      maxSteps: 5,
+    });
+    expect(calls).toHaveLength(1); // broke after step 1
+    expect(weather).not.toHaveBeenCalled();
+    expect(res.pendingApprovals).toEqual([
+      {
+        approvalId: 'toolu_1',
+        toolCallId: 'toolu_1',
+        toolName: 'getWeather',
+        input: { city: 'Paris' },
+      },
+    ]);
+    expect(res.finishReason).toBe('tool_calls');
+    expect(res.toolResults).toEqual([]);
+  });
+
+  it('mixed batch: one break; pendingApprovals lists ONLY the gated call', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch, calls } = mockFetchSequence([() => sseResponse([ANTHROPIC_TWO_TOOLS])]);
+    const res = await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+        askUser: { parameters: { type: 'object' } }, // client tool: no execute
+      },
+      maxSteps: 5,
+    });
+    expect(calls).toHaveLength(1);
+    expect(weather).not.toHaveBeenCalled();
+    expect(res.pendingApprovals).toHaveLength(1);
+    expect(res.pendingApprovals![0]).toMatchObject({ toolCallId: 'toolu_1' });
+    expect(res.steps![0]!.toolCalls).toHaveLength(2); // both calls visible on the step
+  });
+
+  it('streaming: emits tool-approval-request parts, then finish; usage resolves', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch } = mockFetchSequence([() => sseResponse([ANTHROPIC_TOOL_CALL])]);
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+      },
+      maxSteps: 5,
+    });
+    const parts: StreamPart[] = [];
+    for await (const part of result.fullStream) parts.push(part);
+
+    const types = parts.map((p) => p.type);
+    expect(types).toContain('tool-call');
+    expect(types).toContain('tool-approval-request');
+    expect(types.at(-1)).toBe('finish');
+    const approval = parts.find((p) => p.type === 'tool-approval-request');
+    expect(approval).toMatchObject({
+      approvalId: 'toolu_1',
+      toolCallId: 'toolu_1',
+      toolName: 'getWeather',
+      input: { city: 'Paris' },
+    });
+    expect(weather).not.toHaveBeenCalled();
+    expect((await result.usage).totalTokens).toBeGreaterThan(0);
+  });
+});
+
 describe('agentic tool loop (streamChat)', () => {
   it('emits one fullStream across steps with step + tool parts', async () => {
     const weather = vi.fn(async () => ({ temp: 22 }));
