@@ -70,3 +70,7 @@ expectTypeOf<GenerateTextResult>().toHaveProperty('pendingApprovals');
 expectTypeOf<Extract<StreamPart, { type: 'tool-approval-request' }>>().toHaveProperty('approvalId');
 expectTypeOf<ToolApprovalRequest>().toHaveProperty('toolCallId');
 expectTypeOf<ToolApprovalResponse>().toHaveProperty('approved');
+
+// --- 1.3.0 additive: Tool.outputSchema metadata (MCP structured output). ---
+import type { Tool } from '../src/index';
+expectTypeOf<Tool>().toHaveProperty('outputSchema');

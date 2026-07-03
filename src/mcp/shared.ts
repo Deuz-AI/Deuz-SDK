@@ -13,6 +13,8 @@ export interface McpToolDef {
   name: string;
   description?: string;
   inputSchema?: JSONSchema;
+  /** MCP output schema — carried onto `Tool.outputSchema` as metadata (the SDK validates server-side). */
+  outputSchema?: JSONSchema;
 }
 
 export interface McpContentBlock {
@@ -23,6 +25,8 @@ export interface McpContentBlock {
 
 export interface McpCallResult {
   content?: McpContentBlock[];
+  /** Structured tool output (MCP 2025-11-25); preferred over the text blocks when present. */
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
 }
 
@@ -34,8 +38,14 @@ export function extractContent(result: McpCallResult): unknown {
     .map((b) => b.text)
     .join('\n');
   // Self-heal: an MCP error becomes a thrown error → the loop records an is_error
-  // tool_result so the model can recover.
-  if (result.isError) throw new Error(text || 'MCP tool returned an error.');
+  // tool_result so the model can recover. isError wins over structuredContent.
+  if (result.isError) {
+    const structured = result.structuredContent && JSON.stringify(result.structuredContent);
+    throw new Error(text || structured || 'MCP tool returned an error.');
+  }
+  // Per spec the text blocks are a redundant serialization — return the
+  // structured value verbatim when the server provides one.
+  if (result.structuredContent !== undefined) return result.structuredContent;
   return text !== '' ? text : blocks;
 }
 
@@ -56,6 +66,7 @@ export function mcpToolsToToolSet(
     const tool: Tool = {
       ...(def.description ? { description: def.description } : {}),
       parameters: def.inputSchema ?? { type: 'object', properties: {} },
+      ...(def.outputSchema ? { outputSchema: def.outputSchema } : {}),
       execute: async (args) =>
         extractContent(await client.callTool({ name: def.name, arguments: args })),
     };

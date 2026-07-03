@@ -30,6 +30,12 @@ export interface Tool<Args = unknown, Result = unknown> {
   type?: 'function' | 'provider';
   /** Raw native tool definition (already in the target wire's shape) for `type: 'provider'`. */
   providerTool?: Record<string, unknown>;
+  /**
+   * Expected result shape — carried METADATA only (never sent on chat wires;
+   * the loop does not validate results against it). MCP tools populate it from
+   * the server's outputSchema; the MCP SDK itself validates structured results.
+   */
+  outputSchema?: JSONSchema;
 }
 
 export type ToolSet = Record<string, Tool>;

@@ -49,3 +49,37 @@ describe('MCP → ToolSet mapping', () => {
     ).toThrow('boom');
   });
 });
+
+describe('structuredContent + outputSchema (MCP 2025-11-25)', () => {
+  it('prefers structuredContent verbatim over the text join', () => {
+    expect(
+      extractContent({
+        content: [{ type: 'text', text: '{"temp":22}' }], // redundant serialization per spec
+        structuredContent: { temp: 22 },
+      }),
+    ).toEqual({ temp: 22 });
+    expect(extractContent({ structuredContent: { a: 1 } })).toEqual({ a: 1 });
+  });
+
+  it('isError wins: throws even when structuredContent is present', () => {
+    expect(() =>
+      extractContent({
+        content: [{ type: 'text', text: 'bad input' }],
+        isError: true,
+        structuredContent: { code: 42 },
+      }),
+    ).toThrow('bad input');
+    // No text blocks → the error message falls back to the structured JSON.
+    expect(() => extractContent({ isError: true, structuredContent: { code: 42 } })).toThrow(
+      '{"code":42}',
+    );
+  });
+
+  it('copies outputSchema through to Tool.outputSchema (metadata only)', () => {
+    const out = { type: 'object', properties: { temp: { type: 'number' } } };
+    const tools = mcpToolsToToolSet(fakeRaw, [{ name: 'weather', outputSchema: out }]);
+    expect(tools.weather!.outputSchema).toEqual(out);
+    const bare = mcpToolsToToolSet(fakeRaw, [{ name: 'plain' }]);
+    expect('outputSchema' in bare.plain!).toBe(false);
+  });
+});
