@@ -17,6 +17,7 @@ import {
   sumUsage,
   findApprovalNeeded,
   resolveServerApprovals,
+  settlePendingApprovals,
 } from './loop-shared';
 
 /**
@@ -36,6 +37,18 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
   let totalUsage: Usage = EMPTY_USAGE;
   let lastStep: OneStep | undefined;
   let pendingApprovals: ToolApprovalRequest[] | undefined;
+
+  // Resume: settle the previous break's pending approvals BEFORE the first
+  // model call (baseLength is already captured — the new tool message flows
+  // into response.messages).
+  const settled = await settlePendingApprovals(messages, tools, options);
+  if (settled) {
+    messages = settled.messages;
+    bumpErrorGuard(
+      errorCounters,
+      settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
+    );
+  }
 
   for (;;) {
     const step = await runOneStep({ ...options, messages }, { tools: wireTools });

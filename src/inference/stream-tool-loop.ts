@@ -21,6 +21,7 @@ import {
   sumUsage,
   findApprovalNeeded,
   resolveServerApprovals,
+  settlePendingApprovals,
 } from './loop-shared';
 
 async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<string> {
@@ -63,6 +64,26 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
 
     try {
       const wireTools = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+
+      // Resume: settle the previous break's pending approvals BEFORE step 1 —
+      // their tool-result parts precede the first step-start.
+      const settled = await settlePendingApprovals(messages, tools, options);
+      if (settled) {
+        messages = settled.messages;
+        for (const r of settled.results) {
+          broadcaster.push({
+            type: 'tool-result',
+            toolCallId: r.toolCallId,
+            toolName: r.toolName,
+            output: r.result,
+            ...(r.isError ? { isError: true } : {}),
+          });
+        }
+        bumpErrorGuard(
+          errorCounters,
+          settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
+        );
+      }
 
       for (;;) {
         broadcaster.push({ type: 'step-start', stepIndex });

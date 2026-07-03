@@ -159,6 +159,75 @@ export function hasClientTool(toolCalls: ToolCall[], tools: ToolSet): boolean {
 }
 
 /**
+ * Settle the trailing assistant turn's un-answered tool_use ids on a resume
+ * call (`approvalResponses` provided). Verdicts: approved → execute; denied →
+ * is_error (+reason). No verdict: gated calls DENY by default (safe side),
+ * client tools get an is_error placeholder, deferred non-gated server tools
+ * execute. Results are appended as a NEW `{role:'tool'}` message — never
+ * merged into a caller-supplied one (the `baseLength` slice contract and
+ * immutable history both depend on it). Unknown approvalIds are ignored
+ * (replay-safe). Returns null when there is nothing to settle.
+ */
+export async function settlePendingApprovals(
+  messages: Message[],
+  tools: ToolSet,
+  options: CommonCallOptions,
+): Promise<{ messages: Message[]; results: ToolResult[]; deniedIds: Set<string> } | null> {
+  const responses = options.approvalResponses;
+  if (!responses || responses.length === 0) return null;
+
+  // Locate the last assistant turn; only tool messages may follow it.
+  let assistantIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const role = messages[i]!.role;
+    if (role === 'assistant') {
+      assistantIndex = i;
+      break;
+    }
+    if (role !== 'tool') return null;
+  }
+  if (assistantIndex < 0) return null;
+  const content = messages[assistantIndex]!.content;
+  if (!Array.isArray(content)) return null;
+
+  const answered = new Set<string>();
+  for (let i = assistantIndex + 1; i < messages.length; i++) {
+    const parts = messages[i]!.content;
+    if (!Array.isArray(parts)) continue;
+    for (const p of parts) if (p.type === 'tool_result') answered.add(p.toolUseId);
+  }
+  const unanswered = content.filter(
+    (p): p is Extract<Part, { type: 'tool_use' }> => p.type === 'tool_use' && !answered.has(p.id),
+  );
+  if (unanswered.length === 0) return null;
+
+  const calls: ToolCall[] = unanswered.map((p) => ({
+    toolCallId: p.id,
+    toolName: p.name,
+    args: p.input,
+  }));
+  const byId = new Map(responses.map((r) => [r.approvalId, r]));
+  const noVerdict = calls.filter((c) => !byId.has(c.toolCallId));
+  const gated = await findApprovalNeeded(noVerdict, tools, options, messages);
+
+  const denied = new Map<string, string | undefined>();
+  for (const c of calls) {
+    const verdict = byId.get(c.toolCallId);
+    if (verdict) {
+      if (!verdict.approved) denied.set(c.toolCallId, verdict.reason);
+    } else if (!tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider') {
+      denied.set(c.toolCallId, 'No result provided for this client tool.');
+    } else if (gated.has(c.toolCallId)) {
+      denied.set(c.toolCallId, 'No approval response.');
+    }
+  }
+
+  const results = await executeTools(calls, tools, options, messages, denied);
+  const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
+  return { messages: [...messages, toolMessage], results, deniedIds: new Set(denied.keys()) };
+}
+
+/**
  * Execute the step's tool calls in parallel (capped); errors self-heal as
  * is_error results. Calls listed in `denied` short-circuit to an is_error
  * denial BEFORE validation (a denied call must not leak a validation message).
