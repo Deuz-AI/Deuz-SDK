@@ -3,7 +3,7 @@ title: Migrating from Vercel AI SDK
 description: Map ai / @ai-sdk/* calls to @deuz-sdk/core — streamChat, generateText, generateObject, tools, and the UI wire.
 ---
 
-If you know the Vercel AI SDK (`ai` + `@ai-sdk/*`), most of `@deuz-sdk/core` will feel familiar: free functions like `generateText` / `generateObject`, a Zod-typed structured-output call, and a streaming UI wire. The shapes are close enough that a port is mostly mechanical. The big differences are philosophical — `@deuz-sdk/core` reads **no environment variables** (you pass `apiKey` explicitly), has **zero runtime dependencies**, and `streamChat` returns **synchronously and never throws**. This page maps the API surface and flags what is not implemented yet.
+If you know the Vercel AI SDK (`ai` + `@ai-sdk/*`), most of `@deuz-sdk/core` will feel familiar: free functions like `generateText` / `generateObject`, a Zod-typed structured-output call, and a streaming UI wire. The shapes are close enough that a port is mostly mechanical. The big differences are philosophical — `@deuz-sdk/core` reads **no environment variables** (you pass `apiKey` explicitly), has **zero runtime dependencies**, and `streamChat` returns **synchronously and never throws**. This page maps the API surface and flags the few remaining gaps.
 
 ## API mapping
 

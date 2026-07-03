@@ -1,8 +1,8 @@
 /**
  * Deuz-native UI streaming wire. `@deuz-sdk/core` is its OWN AI SDK — this protocol
  * is ours, not a copy of any other SDK's. The server serializes the canonical
- * `fullStream` to SSE (`x-deuz-stream: v1`); the client reads it back. A React
- * hook over `readDeuzStream` lands in Faz 6.
+ * `fullStream` to SSE (`x-deuz-stream: v1`); the client reads it back — directly
+ * via `readDeuzStream`, or through the `useChat`/`useObject` hooks (`./react`).
  */
 import type { StreamChatResult, StreamObjectResult } from './types/methods';
 import type { StreamPart } from './types/stream';
@@ -39,7 +39,7 @@ export type DeuzUIPart =
   /**
    * Client→server direction only (declared for wire symmetry): the verdict
    * travels in the next HTTP request's body as `approvalResponses` — it is
-   * never serialized by `toDeuzStreamResponse`. `useChat` consumes it (Faz 6).
+   * never serialized by `toDeuzStreamResponse`. `useChat` consumes it.
    */
   | { type: 'tool-approval-response'; approvalId: string; approved: boolean; reason?: string }
   /** `streamObject` partial — each delta REPLACES the previous partial wholesale. */

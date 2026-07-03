@@ -108,7 +108,7 @@ export async function POST(req: Request): Promise<Response> {
 
 ## Example: vanilla React consumer
 
-React hooks over this wire are planned for Faz 6. Until then, integrate manually with `useState` and `readDeuzStream`. This consumer accumulates text, renders tool calls live, and surfaces the error part.
+For most apps, use the ready-made [`useChat` / `useObject` hooks](/docs/modules/react-hooks) over this wire. The manual consumer below shows what they do under the hood — useful for custom integrations or non-React frameworks. It accumulates text, renders tool calls live, and surfaces the error part.
 
 ```tsx title="Chat.tsx"
 import { useState } from 'react';
