@@ -6,3 +6,4 @@
 export { streamChat } from './inference/stream-chat';
 export { generateText } from './inference/generate-text';
 export { generateObject } from './inference/generate-object';
+export { streamObject } from './inference/stream-object';

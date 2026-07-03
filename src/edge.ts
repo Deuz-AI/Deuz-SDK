@@ -3,9 +3,9 @@
  * Next.js Edge / Cloudflare Workers / Deno can import a guaranteed-safe build.
  * Existence of this entry is itself the edge smoke test for the build.
  */
-export { streamChat, generateText, generateObject } from './generate';
+export { streamChat, generateText, generateObject, streamObject } from './generate';
 export { anthropicWebSearch, openaiWebSearch, googleSearch } from './server-tools';
 export { createClient, resolveDependencies } from './client';
 export type { DeuzClient } from './client';
-export { DeuzError, NotImplementedError } from './errors';
+export { DeuzError, NotImplementedError, NoObjectGeneratedError } from './errors';
 export type * from './types';

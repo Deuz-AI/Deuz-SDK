@@ -5,7 +5,7 @@
  */
 
 // Canonical free functions.
-export { streamChat, generateText, generateObject } from './generate';
+export { streamChat, generateText, generateObject, streamObject } from './generate';
 export { embed, embedMany } from './inference/embed';
 
 // Optional convenience client + dependency resolution.

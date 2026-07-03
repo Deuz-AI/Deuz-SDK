@@ -51,3 +51,13 @@ expectTypeOf<Extract<StreamPart, { type: 'finish' }>>().toHaveProperty('provider
 // --- 1.2.0 additive: providerOptions escape hatch + promptCaching. ---
 expectTypeOf<CommonCallOptions>().toHaveProperty('providerOptions');
 expectTypeOf<CommonCallOptions>().toHaveProperty('promptCaching');
+
+// --- 1.3.0 additive: streamObject + DeepPartial. ---
+import { streamObject } from '../src/index';
+import type { DeepPartial, StreamObjectResult } from '../src/index';
+expectTypeOf(streamObject).toBeFunction();
+expectTypeOf<StreamObjectResult<{ a: string }>>().toHaveProperty('partialObjectStream');
+expectTypeOf<StreamObjectResult<{ a: string }>>().toHaveProperty('object');
+expectTypeOf<DeepPartial<{ a: { b: string }[] }>>().toEqualTypeOf<{
+  a?: Array<{ b?: string }>;
+}>();

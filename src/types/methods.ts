@@ -60,6 +60,44 @@ export type GenerateObject = <T = unknown>(
   options: GenerateObjectOptions<T>,
 ) => Promise<GenerateObjectResult<T>>;
 
+// --- streamObject (streaming structured output; additive) ---
+
+/**
+ * Recursive partial: every property optional at every depth. Array elements
+ * are themselves partial (a trailing element may still be streaming in).
+ * Non-object leaves (and `unknown`) pass through unchanged.
+ */
+export type DeepPartial<T> = T extends readonly (infer U)[]
+  ? Array<DeepPartial<U>>
+  : T extends object
+    ? { [K in keyof T]?: DeepPartial<T[K]> }
+    : T;
+
+export interface StreamObjectResult<T = unknown> {
+  /**
+   * Best-effort partial objects as JSON streams in (json strategy). Emits only
+   * when the parsed value changes. Tool-strategy models buffer and emit the
+   * final validated object once. Iteration rejects on transport errors and on
+   * final-validation failure (mirrors `textStream`'s throw-on-error).
+   */
+  partialObjectStream: AsyncIterable<DeepPartial<T>>;
+  /** The final, schema-validated object. Rejects with `NoObjectGeneratedError`. */
+  object: Promise<T>;
+  /** Resolve even when final validation fails (the tokens were still spent). */
+  usage: Promise<Usage>;
+  finishReason: Promise<FinishReason>;
+}
+
+/**
+ * Like `generateObject` but streaming. Returns synchronously (G2): the request
+ * starts lazily on first output access; failures surface as rejections, never
+ * a synchronous throw. Unlike `generateObject` there is NO repair retry —
+ * emitted partials cannot be un-streamed.
+ */
+export type StreamObject = <T = unknown>(
+  options: GenerateObjectOptions<T>,
+) => StreamObjectResult<T>;
+
 // --- embed / embedMany (Faz 3) ---
 
 /**
