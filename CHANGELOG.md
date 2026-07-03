@@ -1,6 +1,6 @@
 # @deuz-sdk/core
 
-## Unreleased
+## 1.3.0
 
 ### Minor Changes
 
