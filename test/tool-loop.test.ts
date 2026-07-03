@@ -527,6 +527,72 @@ describe('tool approval — client mode (no approveToolCall)', () => {
   });
 });
 
+describe('tool approval — parity + mixed-batch hardening', () => {
+  it('STREAMING server-mode denial: is_error tool-result on the stream, loop continues', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch, calls } = mockFetchSequence([
+      () => sseResponse([ANTHROPIC_TOOL_CALL]),
+      () => sseResponse([ANTHROPIC_FINAL]),
+    ]);
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+      },
+      approveToolCall: () => false,
+      maxSteps: 5,
+    });
+    const parts: StreamPart[] = [];
+    for await (const part of result.fullStream) parts.push(part);
+
+    expect(weather).not.toHaveBeenCalled();
+    const denial = parts.find((p) => p.type === 'tool-result');
+    expect(denial).toMatchObject({
+      toolCallId: 'toolu_1',
+      output: 'Tool call denied.',
+      isError: true,
+    });
+    // Loop CONTINUED past the denial: two steps, final text, clean finish.
+    expect(parts.filter((p) => p.type === 'step-start')).toHaveLength(2);
+    expect(parts.at(-1)?.type).toBe('finish');
+    expect(calls).toHaveLength(2);
+  });
+
+  it('mixed batch, server mode: approved call executes while denied call errors — same step', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const ask = vi.fn(async () => ({ answer: 'yes' }));
+    const { fetch, calls } = mockFetchSequence([
+      () => sseResponse([ANTHROPIC_TWO_TOOLS]),
+      () => sseResponse([ANTHROPIC_FINAL]),
+    ]);
+    const res = await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true }, // will be DENIED
+        askUser: { parameters: { type: 'object' }, execute: ask }, // ungated — must still run
+      },
+      approveToolCall: (call) => call.toolName !== 'getWeather',
+      maxSteps: 5,
+    });
+    expect(weather).not.toHaveBeenCalled();
+    expect(ask).toHaveBeenCalledTimes(1);
+    // Both tool_use ids answered in the follow-up body; only toolu_1 is_error.
+    const body2 = JSON.parse(String(calls[1]!.init!.body));
+    const results = new Map<string, boolean | undefined>();
+    for (const m of body2.messages) {
+      if (!Array.isArray(m.content)) continue;
+      for (const b of m.content)
+        if (b.type === 'tool_result') results.set(b.tool_use_id, b.is_error);
+    }
+    expect(results.get('toolu_1')).toBe(true);
+    expect(results.has('toolu_2')).toBe(true);
+    expect(results.get('toolu_2')).not.toBe(true);
+    expect(res.steps).toHaveLength(2);
+  });
+});
+
 describe('tool approval — settle-on-resume (approvalResponses)', () => {
   const PENDING_HISTORY = [
     { role: 'user' as const, content: 'weather in Paris?' },
@@ -635,6 +701,42 @@ describe('tool approval — settle-on-resume (approvalResponses)', () => {
       for (const b of m.content) if (b.type === 'tool_result') answered.add(b.tool_use_id);
     }
     expect(answered).toEqual(new Set(['toolu_1', 'toolu_2']));
+  });
+
+  it('deferred non-gated server tool auto-executes on resume (no verdict needed)', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const lookup = vi.fn(async () => ({ found: true }));
+    const { fetch, calls } = mockFetchSequence([() => sseResponse([ANTHROPIC_FINAL])]);
+    await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [
+        { role: 'user', content: 'weather?' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'toolu_1', name: 'getWeather', input: { city: 'Paris' } },
+            { type: 'tool_use', id: 'toolu_2', name: 'lookup', input: { q: 'x' } },
+          ],
+        },
+      ],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+        lookup: { parameters: { type: 'object' }, execute: lookup }, // deferred by the break, NOT gated
+      },
+      approvalResponses: [{ approvalId: 'toolu_1', approved: true }], // no verdict for toolu_2
+      maxSteps: 5,
+    });
+    expect(weather).toHaveBeenCalledTimes(1); // approved
+    expect(lookup).toHaveBeenCalledTimes(1); // auto-executed — no verdict required
+    const body1 = JSON.parse(String(calls[0]!.init!.body));
+    const errored: Record<string, boolean | undefined> = {};
+    for (const m of body1.messages) {
+      if (!Array.isArray(m.content)) continue;
+      for (const b of m.content) if (b.type === 'tool_result') errored[b.tool_use_id] = b.is_error;
+    }
+    expect(Object.keys(errored).sort()).toEqual(['toolu_1', 'toolu_2']);
+    expect(errored.toolu_1).not.toBe(true);
+    expect(errored.toolu_2).not.toBe(true);
   });
 
   it('streaming resume: settled tool-result parts arrive before the first step-start', async () => {
