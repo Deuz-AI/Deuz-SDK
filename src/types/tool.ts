@@ -52,6 +52,26 @@ export interface ToolResult {
   isError?: boolean;
 }
 
+/**
+ * A tool call awaiting user approval (client-mode approval break).
+ * `approvalId === toolCallId` today; kept as a distinct field so a future
+ * signed-approval scheme stays additive.
+ */
+export interface ToolApprovalRequest {
+  approvalId: string;
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+}
+
+/** The caller's verdict on a pending `ToolApprovalRequest` (resume call). */
+export interface ToolApprovalResponse {
+  approvalId: string;
+  approved: boolean;
+  /** Optional denial reason — fed back to the model inside the is_error tool_result. */
+  reason?: string;
+}
+
 /** One turn of the agentic loop. */
 export interface StepResult {
   stepType: 'initial' | 'tool-result';

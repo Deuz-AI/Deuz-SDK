@@ -2,7 +2,14 @@ import type { LanguageModel } from './model';
 import type { Message } from './message';
 import type { Dependencies, UsageMeta, FinishMeta } from './deps';
 import type { Usage } from './usage';
-import type { ToolSet, ToolChoice, StopCondition, StepResult } from './tool';
+import type {
+  ToolSet,
+  ToolChoice,
+  StopCondition,
+  StepResult,
+  ToolCall,
+  ToolApprovalResponse,
+} from './tool';
 
 /** Opaque model id; capability-aware refinement arrives with the registry (Faz 1.A). */
 export type ModelId = string;
@@ -72,6 +79,24 @@ export interface CommonCallOptions {
   /** Max parallel tool executions per step. Default 5. */
   maxToolConcurrency?: number;
   onStepFinish?: (step: StepResult) => void;
+  /**
+   * Server-mode approval: awaited for every call whose tool triggers
+   * `needsApproval`. Return false (or throw) to deny — the call becomes an
+   * is_error tool_result ('Tool call denied.') and the loop continues; denials
+   * do NOT count toward the runaway error guard. When OMITTED, calls needing
+   * approval break the loop instead (client mode): streaming emits a
+   * `tool-approval-request` part per pending call, `generateText` returns them
+   * in `pendingApprovals`.
+   */
+  approveToolCall?: (call: ToolCall, ctx: { messages: Message[] }) => boolean | Promise<boolean>;
+  /**
+   * Resume after a client-mode approval break: verdicts for the pending calls
+   * of the trailing assistant turn. Approved calls execute, denied ones become
+   * is_error results, and the loop continues. Pending calls with no matching
+   * response are DENIED by default (safe side); unknown `approvalId`s are
+   * ignored (replay-safe).
+   */
+  approvalResponses?: ToolApprovalResponse[];
 }
 
 /** Shared client configuration; pre-binds api keys + deps for the convenience client. */

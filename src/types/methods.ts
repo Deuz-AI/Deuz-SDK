@@ -3,7 +3,7 @@ import type { Usage, FinishReason } from './usage';
 import type { StreamPart } from './stream';
 import type { Message } from './message';
 import type { StandardSchemaV1, JSONSchema } from './schema';
-import type { StepResult, ToolCall, ToolResult } from './tool';
+import type { StepResult, ToolCall, ToolResult, ToolApprovalRequest } from './tool';
 import type { EmbeddingModel } from './model';
 import type { Dependencies, UsageMeta } from './deps';
 
@@ -37,6 +37,11 @@ export interface GenerateTextResult {
   /** Last step's tool calls / results (convenience). Additive. */
   toolCalls?: ToolCall[];
   toolResults?: ToolResult[];
+  /**
+   * Present when the loop broke on a client-mode approval: the calls awaiting
+   * a verdict. Resume by calling again with `approvalResponses`. Additive.
+   */
+  pendingApprovals?: ToolApprovalRequest[];
 }
 
 export type GenerateText = (options: GenerateTextOptions) => Promise<GenerateTextResult>;

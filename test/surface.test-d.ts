@@ -61,3 +61,12 @@ expectTypeOf<StreamObjectResult<{ a: string }>>().toHaveProperty('object');
 expectTypeOf<DeepPartial<{ a: { b: string }[] }>>().toEqualTypeOf<{
   a?: Array<{ b?: string }>;
 }>();
+
+// --- 1.3.0 additive: tool approval flow. ---
+import type { GenerateTextResult, ToolApprovalRequest, ToolApprovalResponse } from '../src/index';
+expectTypeOf<CommonCallOptions>().toHaveProperty('approveToolCall');
+expectTypeOf<CommonCallOptions>().toHaveProperty('approvalResponses');
+expectTypeOf<GenerateTextResult>().toHaveProperty('pendingApprovals');
+expectTypeOf<Extract<StreamPart, { type: 'tool-approval-request' }>>().toHaveProperty('approvalId');
+expectTypeOf<ToolApprovalRequest>().toHaveProperty('toolCallId');
+expectTypeOf<ToolApprovalResponse>().toHaveProperty('approved');
