@@ -7,6 +7,8 @@ description: Generate a typed, schema-validated object from a model using a zod/
 
 It is a thin orchestration over the canonical stream: it runs the request, collects the JSON payload (from native json mode or a forced tool call), parses it, validates it, and retries once on failure.
 
+Need the object to render progressively while it generates? Use [streamObject](/docs/core/stream-object) — same options, streaming partials. Note it has **no repair retry** (already-emitted partials can't be un-streamed); that's the one behavioral divergence.
+
 ## Signature
 
 ```ts

@@ -79,6 +79,20 @@ export interface ToolResultStreamPart {
   isError?: boolean;
 }
 
+/**
+ * A tool call that needs the user's approval before it may run (client-mode
+ * approval: `needsApproval` triggered and no `approveToolCall` was provided).
+ * The loop breaks after emitting these; resume with `approvalResponses`.
+ */
+export interface ToolApprovalRequestPart {
+  type: 'tool-approval-request';
+  /** Equals `toolCallId` today; distinct field for future signed approvals. */
+  approvalId: string;
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+}
+
 export type StreamPart =
   | TextDeltaPart
   | ReasoningDeltaPart
@@ -89,4 +103,5 @@ export type StreamPart =
   | StepStartPart
   | StepFinishPart
   | ToolCallPart
-  | ToolResultStreamPart;
+  | ToolResultStreamPart
+  | ToolApprovalRequestPart;

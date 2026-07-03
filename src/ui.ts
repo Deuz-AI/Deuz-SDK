@@ -29,6 +29,19 @@ export type DeuzUIPart =
       isError?: boolean;
     }
   | { type: 'source'; id: string; url?: string; title?: string }
+  | {
+      type: 'tool-approval-request';
+      approvalId: string;
+      toolCallId: string;
+      toolName: string;
+      input: unknown;
+    }
+  /**
+   * Client→server direction only (declared for wire symmetry): the verdict
+   * travels in the next HTTP request's body as `approvalResponses` — it is
+   * never serialized by `toDeuzStreamResponse`. `useChat` consumes it (Faz 6).
+   */
+  | { type: 'tool-approval-response'; approvalId: string; approved: boolean; reason?: string }
   | { type: 'finish'; finishReason: FinishReason; usage: Usage }
   | { type: 'error'; message: string };
 
@@ -76,6 +89,15 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         id: part.id,
         ...(part.url ? { url: part.url } : {}),
         ...(part.title ? { title: part.title } : {}),
+      };
+    case 'tool-approval-request':
+      // Explicit case required — the default drops unknown canonical parts.
+      return {
+        type: 'tool-approval-request',
+        approvalId: part.approvalId,
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        input: part.input,
       };
     case 'step-start':
       return { type: 'step-start', step: part.stepIndex };

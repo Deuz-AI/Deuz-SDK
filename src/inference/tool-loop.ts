@@ -2,7 +2,7 @@ import type { CommonCallOptions } from '../types/config';
 import type { GenerateTextResult } from '../types/methods';
 import type { Message } from '../types/message';
 import type { Usage } from '../types/usage';
-import type { ToolCall, StepResult } from '../types/tool';
+import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
 import { runOneStep, type OneStep } from './run-step';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
@@ -15,6 +15,9 @@ import {
   normalizeStop,
   shouldStop,
   sumUsage,
+  findApprovalNeeded,
+  resolveServerApprovals,
+  settlePendingApprovals,
 } from './loop-shared';
 
 /**
@@ -33,6 +36,19 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
   const errorCounters = new Map<string, number>();
   let totalUsage: Usage = EMPTY_USAGE;
   let lastStep: OneStep | undefined;
+  let pendingApprovals: ToolApprovalRequest[] | undefined;
+
+  // Resume: settle the previous break's pending approvals BEFORE the first
+  // model call (baseLength is already captured — the new tool message flows
+  // into response.messages).
+  const settled = await settlePendingApprovals(messages, tools, options);
+  if (settled) {
+    messages = settled.messages;
+    bumpErrorGuard(
+      errorCounters,
+      settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
+    );
+  }
 
   for (;;) {
     const step = await runOneStep({ ...options, messages }, { tools: wireTools });
@@ -52,15 +68,34 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     }));
     messages = [...messages, step.assistantMessage]; // assistant FIRST (OpenAI ordering)
 
-    // Client tools (no execute) can't be auto-continued — return for the caller.
-    if (hasClientTool(toolCalls, tools)) {
+    // Approval gate: server mode denies inline; without approveToolCall the
+    // gated calls break the loop like client tools (client mode).
+    const gated = await findApprovalNeeded(toolCalls, tools, options, messages);
+    const denied = options.approveToolCall
+      ? await resolveServerApprovals(gated, toolCalls, options, messages)
+      : new Map<string, string | undefined>();
+    const pendingApproval = options.approveToolCall
+      ? []
+      : toolCalls.filter((c) => gated.has(c.toolCallId));
+
+    // Pending approvals and client tools (no execute) can't be auto-continued —
+    // ONE break, executing nothing from the batch; the resume settles the rest.
+    if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
+      if (pendingApproval.length > 0) {
+        pendingApprovals = pendingApproval.map((c) => ({
+          approvalId: c.toolCallId,
+          toolCallId: c.toolCallId,
+          toolName: c.toolName,
+          input: c.args,
+        }));
+      }
       const sr = toStepResult(step, toolCalls, [], steps.length);
       steps.push(sr);
       options.onStepFinish?.(sr);
       break;
     }
 
-    const toolResults = await executeTools(toolCalls, tools, options, messages);
+    const toolResults = await executeTools(toolCalls, tools, options, messages, denied);
     const toolResultMessage: Message = { role: 'tool', content: toolResults.map(toToolResultPart) };
     messages = [...messages, toolResultMessage]; // EVERY tool_use answered (Anthropic 400 guard)
 
@@ -68,7 +103,14 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     steps.push(sr);
     options.onStepFinish?.(sr);
 
-    if (bumpErrorGuard(errorCounters, toolResults)) break;
+    // Denials are deliberate, not tool failures — exclude from the runaway guard.
+    if (
+      bumpErrorGuard(
+        errorCounters,
+        toolResults.filter((r) => !denied.has(r.toolCallId)),
+      )
+    )
+      break;
     if (await shouldStop(stopConditions, steps)) break;
   }
 
@@ -82,5 +124,6 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     ...(lastToolStep
       ? { toolCalls: lastToolStep.toolCalls, toolResults: lastToolStep.toolResults }
       : {}),
+    ...(pendingApprovals ? { pendingApprovals } : {}),
   };
 }

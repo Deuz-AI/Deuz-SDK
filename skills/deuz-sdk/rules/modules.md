@@ -69,14 +69,25 @@ Sources: `staticSkillSource(map)`, `fetchSkillSource(baseUrl, fetch?)` (edge), `
 
 ## MCP — `@deuz-sdk/core/mcp` (http/sse) / `@deuz-sdk/core/mcp/stdio` (Node)
 
-`@modelcontextprotocol/sdk` is a lazy optional peer.
+`@modelcontextprotocol/sdk` is a lazy optional peer (`^1.29.0` since 1.3.0).
 ```ts
 import { createMcpClient } from '@deuz-sdk/core/mcp';
-const mcp = await createMcpClient({ transport: { type: 'http', url: 'https://server/mcp' } });
+const mcp = await createMcpClient({
+  transport: { type: 'http', url: 'https://server/mcp' },
+  onElicitationRequest: async (req) =>            // optional (1.3.0+): form | url union
+    req.mode === 'form'
+      ? { action: 'accept', content: await showForm(req.message, req.requestedSchema) }
+      : { action: (await confirmOpenUrl(req.url)) ? 'accept' : 'decline' }, // NEVER auto-open req.url
+});
 const tools = await mcp.listTools();           // → ToolSet, ready for generateText({ tools })
+const resources = await mcp.listResources();   // 1.3.0+: auto-paginated (100-page cap)
+const contents = await mcp.readResource('file://x');
+const prompts = await mcp.listPrompts();
+const prompt = await mcp.getPrompt('greet', { name: 'u' }); // MCP's own message shape, NOT canonical Message
 await generateText({ model, messages, tools, maxSteps: 5 });
 await mcp.close();
 ```
+1.3.0 behavior change: tool results with `structuredContent` return that OBJECT verbatim (was: joined text). `outputSchema` rides `Tool.outputSchema` as metadata. Resource/prompt/elicitation methods need installed SDK ≥1.29 (older SDKs get an actionable error).
 
 ## Image — `@deuz-sdk/core/image` (sync) / `@deuz-sdk/core/midjourney` (async)
 

@@ -1,0 +1,70 @@
+---
+title: streamObject
+description: Stream a schema-validated object as it generates — partial objects on every meaningful delta, a typed final value at the end.
+---
+
+`streamObject` is [generateObject](/docs/core/generate-object)'s streaming sibling: same options, but instead of waiting for the full payload you iterate **partial objects** as the JSON streams in — ideal for progressively rendering extraction results, forms, or dashboards. The final value is still parsed and schema-validated.
+
+## Signature
+
+```ts
+import { streamObject } from '@deuz-sdk/core';
+
+const result = streamObject<T>(options); // NOT awaited — returns synchronously
+// result: {
+//   partialObjectStream: AsyncIterable<DeepPartial<T>>;
+//   object: Promise<T>;
+//   usage: Promise<Usage>;
+//   finishReason: Promise<FinishReason>;
+// }
+```
+
+Options are `GenerateObjectOptions<T>` — identical to `generateObject` (`schema`, `schemaName`, `schemaDescription`, `mode`, plus everything from `CommonCallOptions`).
+
+Like `streamChat`, `streamObject` **returns synchronously and never throws** (the G2 rule): the request starts lazily on first access of any output, and failures surface as rejections — an invalid key, a network error, a failed validation all arrive through the promises/stream, never as a synchronous throw.
+
+## Partial objects
+
+```ts
+const result = streamObject({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Extract: "Ada Lovelace, born 1815, London"' }],
+  schema: personSchema, // { name: string; born: number; city: string }
+});
+
+for await (const partial of result.partialObjectStream) {
+  render(partial); // {} → { name: 'Ada' } → { name: 'Ada Lovelace', born: 1815 } → …
+}
+const person = await result.object; // fully validated
+```
+
+Each element is a `DeepPartial<T>`: every property optional at every depth, so your renderer must tolerate missing fields. String values stream **truncated** (`'Ada Lo'` before `'Ada Lovelace'`); a new value is emitted only when the parsed object actually changes — deltas that only extend an unfinished key emit nothing.
+
+The parsing is a zero-dependency tolerant partial-JSON parser: unclosed objects/arrays are completed, dangling keys and incomplete literals dropped, numbers trimmed to their longest valid prefix. It never throws on any prefix.
+
+## json vs tool strategy
+
+Strategy selection is identical to `generateObject` (capability-driven `auto`, same Anthropic-thinking → json override). The difference:
+
+- **`json` strategy** (native structured output) streams partials as text deltas arrive.
+- **`tool` strategy** (function-call coercion) cannot stream argument fragments usefully, so it **buffers** and emits exactly one element — the final validated object — before `object` resolves.
+
+## Errors — and the missing repair retry
+
+`generateObject` retries once when parsing/validation fails. `streamObject` **does not**: partials have already been emitted to your UI and cannot be un-streamed. On a failed final parse or validation:
+
+- `object` rejects with `NoObjectGeneratedError` (its `.text` carries the raw payload),
+- iterating `partialObjectStream` rejects (mirroring `textStream`'s throw-on-error),
+- `usage` and `finishReason` still **resolve** — the tokens were spent either way.
+
+If you need the repair retry, use `generateObject`; if you need progressive rendering, use `streamObject` and handle the rejection.
+
+```ts
+try {
+  const value = await result.object;
+} catch (err) {
+  if (err instanceof NoObjectGeneratedError) console.error('raw payload:', err.text);
+}
+```
+
+Transport errors (bad key, HTTP 4xx/5xx, timeout) reject all three promises and the stream.

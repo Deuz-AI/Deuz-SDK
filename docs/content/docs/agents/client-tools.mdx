@@ -180,7 +180,65 @@ const toolResult = {
 };
 ```
 
-The `Tool` type also carries a `needsApproval` field (`boolean` or a predicate). It is reserved in the 1.0 surface; the streaming approval round-trip that consumes it is not wired yet, so drive approval with the client-tool pattern above for now.
+The pattern above stays useful when the *model itself* should propose an action with no executor at all. But for gating a REAL server-side tool on consent, use the built-in approval flow below — it handles the round-trip for you.
+
+## Tool approval round-trip
+
+`needsApproval` is wired end-to-end. Without an `approveToolCall` callback, a
+gated call breaks the loop exactly like a client tool — **one break, nothing
+from the batch executes** (a mixed batch of gated + client + plain server tools
+defers entirely; the resume settles all of it).
+
+What you get at the break:
+
+- **`generateText`** returns `pendingApprovals: ToolApprovalRequest[]` —
+  `{ approvalId, toolCallId, toolName, input }` per pending call
+  (`approvalId === toolCallId` today; the field is separate so signed approvals
+  can land additively). `finishReason` stays `'tool_calls'`.
+- **`streamChat` / the UI wire** emits one `tool-approval-request` part per
+  pending call after the `tool-call` parts.
+
+Resume by calling again with the extended history and `approvalResponses`:
+
+```ts title="approval-resume.ts"
+const first = await generateText({ model, messages, tools, maxSteps: 5 });
+
+if (first.pendingApprovals) {
+  const verdicts = await askUser(first.pendingApprovals); // your UI
+  const second = await generateText({
+    model,
+    messages: [...messages, ...first.response.messages],
+    tools,
+    maxSteps: 5,
+    approvalResponses: verdicts.map((v) => ({
+      approvalId: v.approvalId,
+      approved: v.approved,
+      reason: v.reason, // optional; denial reasons are fed back to the model
+    })),
+  });
+}
+```
+
+Settle rules on resume (run before the first model call):
+
+- approved → the tool executes; denied → `is_error` `'Tool call denied.'`
+  (+ your reason). Denials never trip the runaway error guard.
+- a gated call with **no matching response** is **denied by default** (safe side).
+- deferred non-gated server tools from a mixed batch execute automatically;
+  unanswered client tools self-heal as `is_error` — every `tool_use` id gets a
+  `tool_result` (the Anthropic 400 guard holds).
+- unknown `approvalId`s are ignored (replays are safe).
+- results are appended as a **new** `role: 'tool'` message, so they appear in
+  `response.messages`; streaming emits them as `tool-result` parts before the
+  first `step-start`.
+
+Over the [Deuz UI wire](/docs/modules/ui-streaming), the browser reconstructs
+the assistant turn from the streamed `tool-call` parts (exactly like the client
+tool recipe below) and sends the verdicts back in the next request's body as
+`approvalResponses`.
+
+Prefer server-side policy with no UI pause? Pass `approveToolCall` instead —
+see [server-mode approval](/docs/agents/tools#tool-approval-needsapproval).
 
 ## Example: Next.js route + `readDeuzStream`
 

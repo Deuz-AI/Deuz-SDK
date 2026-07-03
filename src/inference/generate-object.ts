@@ -9,6 +9,7 @@ import { runStream } from '../core/inference';
 import { getCapabilities } from '../core/registry';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { NoObjectGeneratedError } from '../errors';
+import { pickObjectStrategy } from './object-shared';
 
 /** Collect the object payload: JSON text (json mode) or first tool-call args. */
 async function collect(result: StreamChatResult, strategy: 'json' | 'tool'): Promise<string> {
@@ -36,26 +37,7 @@ export const generateObject: GenerateObject = async <T = unknown>(
   const schema = await toJSONSchema(options.schema);
   const caps = getCapabilities(options.model);
 
-  const requested = options.mode ?? 'auto';
-  let strategy: 'json' | 'tool' =
-    requested === 'json'
-      ? 'json'
-      : requested === 'tool'
-        ? 'tool'
-        : caps.structuredOutput
-          ? 'json'
-          : 'tool';
-
-  // G3: Anthropic rejects forced tool_choice while extended thinking is enabled
-  // (HTTP 400) → never pick the tool strategy in that case; use native json mode.
-  // Adaptive-thinking models (effortWire 'output_config') can't disable thinking,
-  // so they always take the json strategy.
-  const thinkingOn =
-    caps.effortWire === 'output_config' ||
-    (caps.reasoning && options.effort !== undefined && options.effort !== 'none');
-  if (strategy === 'tool' && options.model.provider === 'anthropic' && thinkingOn) {
-    strategy = 'json';
-  }
+  const strategy = pickObjectStrategy(options, caps);
 
   const object: ObjectRequest = {
     schema,

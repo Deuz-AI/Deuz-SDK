@@ -295,7 +295,7 @@
     "tool-calling"
   ],
   "peerDependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@standard-community/standard-json": "^0.2.0",
     "mammoth": "^1.8.0",
     "unpdf": "^0.12.0",

@@ -30,6 +30,12 @@ export interface Tool<Args = unknown, Result = unknown> {
   type?: 'function' | 'provider';
   /** Raw native tool definition (already in the target wire's shape) for `type: 'provider'`. */
   providerTool?: Record<string, unknown>;
+  /**
+   * Expected result shape — carried METADATA only (never sent on chat wires;
+   * the loop does not validate results against it). MCP tools populate it from
+   * the server's outputSchema; the MCP SDK itself validates structured results.
+   */
+  outputSchema?: JSONSchema;
 }
 
 export type ToolSet = Record<string, Tool>;
@@ -50,6 +56,26 @@ export interface ToolResult {
   toolName: string;
   result: unknown;
   isError?: boolean;
+}
+
+/**
+ * A tool call awaiting user approval (client-mode approval break).
+ * `approvalId === toolCallId` today; kept as a distinct field so a future
+ * signed-approval scheme stays additive.
+ */
+export interface ToolApprovalRequest {
+  approvalId: string;
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+}
+
+/** The caller's verdict on a pending `ToolApprovalRequest` (resume call). */
+export interface ToolApprovalResponse {
+  approvalId: string;
+  approved: boolean;
+  /** Optional denial reason — fed back to the model inside the is_error tool_result. */
+  reason?: string;
 }
 
 /** One turn of the agentic loop. */

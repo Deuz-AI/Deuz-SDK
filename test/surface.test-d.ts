@@ -51,3 +51,26 @@ expectTypeOf<Extract<StreamPart, { type: 'finish' }>>().toHaveProperty('provider
 // --- 1.2.0 additive: providerOptions escape hatch + promptCaching. ---
 expectTypeOf<CommonCallOptions>().toHaveProperty('providerOptions');
 expectTypeOf<CommonCallOptions>().toHaveProperty('promptCaching');
+
+// --- 1.3.0 additive: streamObject + DeepPartial. ---
+import { streamObject } from '../src/index';
+import type { DeepPartial, StreamObjectResult } from '../src/index';
+expectTypeOf(streamObject).toBeFunction();
+expectTypeOf<StreamObjectResult<{ a: string }>>().toHaveProperty('partialObjectStream');
+expectTypeOf<StreamObjectResult<{ a: string }>>().toHaveProperty('object');
+expectTypeOf<DeepPartial<{ a: { b: string }[] }>>().toEqualTypeOf<{
+  a?: Array<{ b?: string }>;
+}>();
+
+// --- 1.3.0 additive: tool approval flow. ---
+import type { GenerateTextResult, ToolApprovalRequest, ToolApprovalResponse } from '../src/index';
+expectTypeOf<CommonCallOptions>().toHaveProperty('approveToolCall');
+expectTypeOf<CommonCallOptions>().toHaveProperty('approvalResponses');
+expectTypeOf<GenerateTextResult>().toHaveProperty('pendingApprovals');
+expectTypeOf<Extract<StreamPart, { type: 'tool-approval-request' }>>().toHaveProperty('approvalId');
+expectTypeOf<ToolApprovalRequest>().toHaveProperty('toolCallId');
+expectTypeOf<ToolApprovalResponse>().toHaveProperty('approved');
+
+// --- 1.3.0 additive: Tool.outputSchema metadata (MCP structured output). ---
+import type { Tool } from '../src/index';
+expectTypeOf<Tool>().toHaveProperty('outputSchema');

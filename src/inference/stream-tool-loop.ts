@@ -19,6 +19,9 @@ import {
   normalizeStop,
   shouldStop,
   sumUsage,
+  findApprovalNeeded,
+  resolveServerApprovals,
+  settlePendingApprovals,
 } from './loop-shared';
 
 async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<string> {
@@ -61,6 +64,26 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
 
     try {
       const wireTools = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+
+      // Resume: settle the previous break's pending approvals BEFORE step 1 —
+      // their tool-result parts precede the first step-start.
+      const settled = await settlePendingApprovals(messages, tools, options);
+      if (settled) {
+        messages = settled.messages;
+        for (const r of settled.results) {
+          broadcaster.push({
+            type: 'tool-result',
+            toolCallId: r.toolCallId,
+            toolName: r.toolName,
+            output: r.result,
+            ...(r.isError ? { isError: true } : {}),
+          });
+        }
+        bumpErrorGuard(
+          errorCounters,
+          settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
+        );
+      }
 
       for (;;) {
         broadcaster.push({ type: 'step-start', stepIndex });
@@ -183,6 +206,16 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         }
         messages = [...messages, assistantMessage];
 
+        // Approval gate: server mode denies inline; without approveToolCall the
+        // gated calls break the loop like client tools (client mode).
+        const gated = await findApprovalNeeded(toolCalls, tools, options, messages);
+        const denied = options.approveToolCall
+          ? await resolveServerApprovals(gated, toolCalls, options, messages)
+          : new Map<string, string | undefined>();
+        const pendingApproval = options.approveToolCall
+          ? []
+          : toolCalls.filter((c) => gated.has(c.toolCallId));
+
         const stepData = {
           text,
           reasoningText,
@@ -191,14 +224,25 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
           finishReason: stepFinish,
           assistantMessage,
         };
-        if (hasClientTool(toolCalls, tools)) {
+        // Pending approvals and client tools break together: ONE break, nothing
+        // from the batch executes; the resume call settles the deferred rest.
+        if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
+          for (const c of pendingApproval) {
+            broadcaster.push({
+              type: 'tool-approval-request',
+              approvalId: c.toolCallId,
+              toolCallId: c.toolCallId,
+              toolName: c.toolName,
+              input: c.args,
+            });
+          }
           const sr = toStepResult(stepData, toolCalls, [], steps.length);
           steps.push(sr);
           options.onStepFinish?.(sr);
           break;
         }
 
-        const toolResults = await executeTools(toolCalls, tools, options, messages);
+        const toolResults = await executeTools(toolCalls, tools, options, messages, denied);
         for (const r of toolResults) {
           broadcaster.push({
             type: 'tool-result',
@@ -218,7 +262,14 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         steps.push(sr);
         options.onStepFinish?.(sr);
 
-        if (bumpErrorGuard(errorCounters, toolResults)) break;
+        // Denials are deliberate, not tool failures — exclude from the runaway guard.
+        if (
+          bumpErrorGuard(
+            errorCounters,
+            toolResults.filter((r) => !denied.has(r.toolCallId)),
+          )
+        )
+          break;
         if (await shouldStop(stopConditions, steps)) break;
         stepIndex++;
       }

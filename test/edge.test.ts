@@ -84,6 +84,8 @@ describe('edge entry', () => {
   it('re-exports the web-safe surface', () => {
     expect(typeof edgeEntry.streamChat).toBe('function');
     expect(typeof edgeEntry.generateText).toBe('function');
+    expect(typeof edgeEntry.streamObject).toBe('function');
+    expect(typeof edgeEntry.NoObjectGeneratedError).toBe('function');
     expect(typeof edgeEntry.createClient).toBe('function');
   });
 });

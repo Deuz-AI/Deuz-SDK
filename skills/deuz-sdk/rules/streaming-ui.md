@@ -41,6 +41,7 @@ Open discriminated union — keep a `default` case (variants are additive).
 | { type: 'step-finish'; stepIndex; finishReason; usage }
 | { type: 'tool-call'; toolCallId; toolName; input }                  // final parsed call
 | { type: 'tool-result'; toolCallId; toolName; output; isError? }
+| { type: 'tool-approval-request'; approvalId; toolCallId; toolName; input } // 1.3.0+: gated call awaits verdict
 ```
 
 ## Deuz UI wire — `@deuz-sdk/core/ui`
@@ -57,7 +58,7 @@ function toDeuzStreamResponse(result: StreamChatResult, options?: {
 async function* readDeuzStream(response: Response): AsyncGenerator<DeuzUIPart>
 ```
 
-`DeuzUIPart` mirrors `StreamPart` UI-framed: `start` (messageId), `text-delta`, `reasoning-delta`, `tool-input-delta` (`{ toolCallId, toolName?, delta }`), `tool-call`, `tool-result`, `source`, `step-start`/`step-finish`, `finish`, `error` (`{ message }`, already secret-redacted).
+`DeuzUIPart` mirrors `StreamPart` UI-framed: `start` (messageId), `text-delta`, `reasoning-delta`, `tool-input-delta` (`{ toolCallId, toolName?, delta }`), `tool-call`, `tool-result`, `tool-approval-request` (1.3.0+), `source`, `step-start`/`step-finish`, `finish`, `error` (`{ message }`, already secret-redacted). `tool-approval-response` is declared client→server only — the verdict rides the NEXT request body as `approvalResponses`, it is never serialized by the server.
 
 ```ts
 for await (const part of readDeuzStream(res)) {

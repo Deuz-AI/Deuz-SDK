@@ -65,6 +65,8 @@ If `response.body` is `null`, it yields nothing and returns immediately.
 | `tool-input-delta` | `toolCallId: string`, `toolName?: string`, `delta: string` | A raw fragment of a tool call's argument JSON. |
 | `tool-call` | `toolCallId: string`, `toolName: string`, `input: unknown` | A fully parsed tool call. |
 | `tool-result` | `toolCallId: string`, `toolName: string`, `output: unknown`, `isError?: boolean` | A tool finished executing (`isError: true` on a failed/self-healed tool). |
+| `tool-approval-request` | `approvalId: string`, `toolCallId: string`, `toolName: string`, `input: unknown` | A gated tool call awaits the user's verdict — the loop broke; resume with `approvalResponses`. See [the approval round-trip](/docs/agents/client-tools#tool-approval-round-trip). |
+| `tool-approval-response` | `approvalId: string`, `approved: boolean`, `reason?: string` | Client→server direction ONLY (declared for wire symmetry): the verdict travels in the next HTTP request body as `approvalResponses` — the server never serializes this part. |
 | `source` | `id: string`, `url?: string`, `title?: string` | A cited source. |
 | `finish` | `finishReason: FinishReason`, `usage: Usage` | Last meaningful part — the whole turn finished. |
 | `error` | `message: string` | A stream error occurred; `message` is redacted of secrets. |
