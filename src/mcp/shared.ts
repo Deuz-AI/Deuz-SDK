@@ -14,6 +14,11 @@ export interface RawMcpClient {
   callTool(req: { name: string; arguments: unknown }): Promise<McpCallResult>;
   listTools(): Promise<{ tools: McpToolDef[] }>;
   close(): Promise<void>;
+  /** SDK request-handler registration (used for elicitation/create). */
+  setRequestHandler?(
+    schema: unknown,
+    handler: (req: { params: Record<string, unknown> }) => unknown,
+  ): void;
   listResources?(params?: {
     cursor?: string;
   }): Promise<{ resources: McpResource[]; nextCursor?: string }>;
@@ -67,6 +72,68 @@ export interface McpGetPromptResult {
   description?: string;
   messages: McpPromptMessage[];
   [key: string]: unknown;
+}
+
+// --- Elicitation (MCP 2025-11-25: form + url modes) ---
+
+/** In-band structured data collection; the client renders a form. */
+export interface McpFormElicitationRequest {
+  mode: 'form';
+  message: string;
+  /** Restricted JSON Schema: flat object, primitive properties only. */
+  requestedSchema: JSONSchema;
+}
+
+/**
+ * Out-of-band interaction via URL (auth/payment/sensitive data). Returning
+ * `{ action: 'accept' }` means the USER CONSENTED to open the URL — the
+ * interaction itself completes outside MCP. NEVER auto-open or prefetch the
+ * URL; show it to the user first (spec requirement).
+ */
+export interface McpUrlElicitationRequest {
+  mode: 'url';
+  message: string;
+  url: string;
+  elicitationId: string;
+}
+
+export type McpElicitationRequest = McpFormElicitationRequest | McpUrlElicitationRequest;
+
+export interface McpElicitationResult {
+  action: 'accept' | 'decline' | 'cancel';
+  /** Form mode, accept only: the submitted data matching requestedSchema. */
+  content?: Record<string, unknown>;
+}
+
+export type McpElicitationHandler = (
+  req: McpElicitationRequest,
+) => McpElicitationResult | Promise<McpElicitationResult>;
+
+/**
+ * Adapt a user callback to the SDK's request-handler shape (shared by the
+ * http and stdio transports). Requests without a `mode` are form mode
+ * (spec back-compat).
+ */
+export function buildElicitationHandler(
+  cb: McpElicitationHandler,
+): (req: { params: Record<string, unknown> }) => Promise<McpElicitationResult> {
+  return async (req) => {
+    const p = req.params;
+    const request: McpElicitationRequest =
+      p.mode === 'url'
+        ? {
+            mode: 'url',
+            message: String(p.message ?? ''),
+            url: String(p.url ?? ''),
+            elicitationId: String(p.elicitationId ?? ''),
+          }
+        : {
+            mode: 'form',
+            message: String(p.message ?? ''),
+            requestedSchema: (p.requestedSchema ?? { type: 'object' }) as JSONSchema,
+          };
+    return cb(request);
+  };
 }
 
 /** Safety cap for cursor auto-pagination (bounds hostile/looping servers). */

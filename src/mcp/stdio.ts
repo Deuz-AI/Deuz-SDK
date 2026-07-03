@@ -1,5 +1,7 @@
 import { InvalidRequestError } from '../errors';
 import { wrapMcpClient, type McpClient, type RawMcpClient } from './shared';
+import { registerElicitation } from './index';
+import type { McpElicitationHandler } from './shared';
 
 export type { McpClient } from './shared';
 
@@ -15,6 +17,8 @@ export interface McpStdioOptions {
   env?: Record<string, string>;
   name?: string;
   version?: string;
+  /** See `McpClientOptions.onElicitationRequest` — same semantics over stdio. */
+  onElicitationRequest?: McpElicitationHandler;
 }
 
 async function loadSdk(): Promise<{
@@ -47,8 +51,9 @@ export async function createStdioMcpClient(options: McpStdioOptions): Promise<Mc
   });
   const client = new Client(
     { name: options.name ?? 'deuz', version: options.version ?? '0.0.0' },
-    { capabilities: {} },
+    { capabilities: options.onElicitationRequest ? { elicitation: { form: {}, url: {} } } : {} },
   );
+  if (options.onElicitationRequest) await registerElicitation(client, options.onElicitationRequest);
   await client.connect(transport);
   return wrapMcpClient(client);
 }

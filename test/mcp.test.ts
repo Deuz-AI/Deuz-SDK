@@ -3,7 +3,9 @@ import {
   wrapMcpClient,
   mcpToolsToToolSet,
   extractContent,
+  buildElicitationHandler,
   type RawMcpClient,
+  type McpElicitationRequest,
 } from '../src/mcp/shared';
 
 const fakeRaw: RawMcpClient = {
@@ -143,5 +145,48 @@ describe('resources + prompts', () => {
   it('rejects with an actionable upgrade error when the SDK lacks a method', async () => {
     await expect(wrapMcpClient(fakeRaw).listResources()).rejects.toThrow(/\^1\.29\.0/);
     await expect(wrapMcpClient(fakeRaw).getPrompt('x')).rejects.toThrow(/\^1\.29\.0/);
+  });
+});
+
+describe('elicitation (MCP 2025-11-25, form + url)', () => {
+  it('normalizes mode-less params to a form request; result passes verbatim', async () => {
+    const seen: McpElicitationRequest[] = [];
+    const handler = buildElicitationHandler(async (req) => {
+      seen.push(req);
+      return { action: 'accept', content: { name: 'octocat' } };
+    });
+    const result = await handler({
+      params: {
+        message: 'Your GitHub username?',
+        requestedSchema: { type: 'object', properties: { name: { type: 'string' } } },
+      },
+    });
+    expect(seen[0]).toEqual({
+      mode: 'form', // servers MAY omit mode for form (back-compat)
+      message: 'Your GitHub username?',
+      requestedSchema: { type: 'object', properties: { name: { type: 'string' } } },
+    });
+    expect(result).toEqual({ action: 'accept', content: { name: 'octocat' } });
+  });
+
+  it('passes url-mode requests through; decline result passes verbatim', async () => {
+    const handler = buildElicitationHandler((req) => {
+      expect(req).toEqual({
+        mode: 'url',
+        message: 'Authorize the connector.',
+        url: 'https://mcp.example.com/connect',
+        elicitationId: 'e-1',
+      });
+      return { action: 'decline' };
+    });
+    const result = await handler({
+      params: {
+        mode: 'url',
+        message: 'Authorize the connector.',
+        url: 'https://mcp.example.com/connect',
+        elicitationId: 'e-1',
+      },
+    });
+    expect(result).toEqual({ action: 'decline' });
   });
 });
