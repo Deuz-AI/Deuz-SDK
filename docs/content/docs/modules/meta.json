@@ -7,6 +7,7 @@
     "mcp",
     "image-generation",
     "ui-streaming",
+    "react-hooks",
     "middleware",
     "pricing"
   ]

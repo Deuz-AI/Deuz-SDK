@@ -82,6 +82,20 @@ for await (const partial of result.partialObjectStream) render(partial); // Deep
 const value = await result.object;
 ```
 
+### React hooks
+
+`useChat` / `useObject` over the Deuz UI wire (React is an **optional peer** `^18 || ^19`):
+
+```ts
+import { useChat } from '@deuz-sdk/core/react';
+
+const { messages, sendMessage, pendingApprovals, addToolApprovalResponse } = useChat({
+  api: '/api/chat',
+  onToolCall: async (call) => runInBrowser(call), // client tools auto-round-trip
+});
+// Gated tools pause into pendingApprovals; verdicts resume the chat automatically.
+```
+
 ### Tools (agentic loop)
 
 ```ts
@@ -271,7 +285,7 @@ for await (const part of readDeuzStream(await fetch('/api/chat', { method: 'POST
 | `@deuz-sdk/core/mcp` · `…/mcp/stdio` | MCP client (HTTP/SSE edge-safe; stdio Node-only) |
 | `@deuz-sdk/core/edge` | Guaranteed edge-safe subset |
 | `@deuz-sdk/core/ui` | `toDeuzStreamResponse` (server) + `readDeuzStream` (client) — our own UI wire |
-| `@deuz-sdk/core/react` | React hooks (planned, Faz 6) |
+| `@deuz-sdk/core/react` | React hooks — `useChat` (client tools + approvals) / `useObject` (React = optional peer) |
 
 ---
 
@@ -299,9 +313,9 @@ Response: upstream SSE  →  robust parser  →  CANONICAL DELTA STREAM
 | **Faz 3** | Skills + memory + RAG + native Gemini + embeddings | ✅ |
 | **Faz 4** | Image generation (sync + Midjourney + Yunwu) | ✅ SDK side · ⏳ app-side `tasks` table |
 | **Faz 5** | Aggregator fallback, DeepSeek/Kimi, Batch API, rate-limiter impl | ⬜ optional |
-| **Faz 6** | `@deuz-sdk/core/react` hooks, CI provenance | 🔶 `1.2.0` on npm · docs ✅ · hooks ⏳ |
+| **Faz 6** | `@deuz-sdk/core/react` hooks, CI provenance | 🔶 hooks ✅ · CI provenance ⏳ |
 
-**Deliberately deferred** (seam exists, impl later): pre-flight token counting (`tokens.ts`), budgeter, full token-bucket rate limiter, OpenTelemetry exporter, memory consolidation/decay + graph memory, cross-encoder rerank implementation (seam is in), video generation helper, React hooks (`@deuz-sdk/core/react`, Faz 6).
+**Deliberately deferred** (seam exists, impl later): pre-flight token counting (`tokens.ts`), budgeter, full token-bucket rate limiter, OpenTelemetry exporter, memory consolidation/decay + graph memory, cross-encoder rerank implementation (seam is in), video generation helper.
 
 ---
 

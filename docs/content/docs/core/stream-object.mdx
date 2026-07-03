@@ -68,3 +68,7 @@ try {
 ```
 
 Transport errors (bad key, HTTP 4xx/5xx, timeout) reject all three promises and the stream.
+
+## To the browser
+
+Serve the result over the Deuz wire with [`toDeuzObjectStreamResponse`](/docs/modules/ui-streaming) (emits `object-delta` parts) and consume it client-side with [`useObject`](/docs/modules/react-hooks).

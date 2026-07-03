@@ -1,0 +1,102 @@
+---
+title: React Hooks
+description: useChat and useObject — client-side hooks over the Deuz UI wire, with automatic client-tool round-trips and tool-approval pauses.
+---
+
+`@deuz-sdk/core/react` ships two hooks built on [`readDeuzStream`](/docs/modules/ui-streaming): `useChat` for conversational UIs and `useObject` for streaming structured output. They are plain TypeScript hooks (no JSX, no components) and work with any React framework.
+
+**React is an optional peer** (`^18 || ^19`) — install it yourself; nothing else in the SDK depends on it, and no other subpath pulls it in. The hooks are SSR-safe: network runs only inside user-triggered callbacks, never at render time.
+
+```bash
+npm i react
+```
+
+## useChat
+
+```ts
+import { useChat } from '@deuz-sdk/core/react';
+
+const {
+  messages,            // UIMessage[] — render-friendly
+  status,              // 'idle' | 'streaming' | 'error'
+  error,               // Error | undefined
+  sendMessage,         // (text: string) => Promise<void>
+  regenerate,          // rerun the last user turn
+  stop,                // abort the in-flight stream (not an error)
+  pendingApprovals,    // ToolApprovalRequest[] — chat is PAUSED while non-empty
+  addToolApprovalResponse, // ({ approvalId, approved, reason? }) => Promise<void>
+} = useChat({
+  api: '/api/chat',    // endpoint serving toDeuzStreamResponse
+  onToolCall: async (call) => runInBrowser(call), // client tools (optional)
+});
+```
+
+### Options
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `api` | `string` | Route that returns [`toDeuzStreamResponse`](/docs/modules/ui-streaming) output. |
+| `initialMessages` | `Message[]` | Seed the canonical history (e.g. restored from storage). |
+| `headers` / `body` | records | Merged into every request (body fields ride next to `messages`). |
+| `onToolCall` | `(call) => unknown \| Promise<unknown>` | Executor for **client tools** — see below. |
+| `onError` | `(error) => void` | Called when the stream fails (state also carries the error). |
+| `fetch` | `typeof fetch` | Injectable transport (tests, custom auth). |
+
+### What it renders vs what it sends
+
+The hook keeps **two** histories. `messages` is the render-friendly `UIMessage[]` (accumulated `content`, `reasoning`, and `toolCalls` with live `state`). Internally it maintains the canonical `Message[]` — reconstructing each assistant `tool_use` turn from the streamed `tool-call` parts exactly like the [manual browser recipe](/docs/agents/client-tools#example-nextjs-route--readdeuzstream) — and POSTs `{ messages, ...body }` on every round. History is immutable (new arrays every update).
+
+### Client tools — automatic round-trip
+
+When the server streams a `tool-call` it did not execute (a client tool), the hook calls your `onToolCall`, appends the `tool_result` to the canonical history, and **re-POSTs automatically** — looping until a round has no pending client calls. A throwing `onToolCall` self-heals as an `is_error` result, mirroring the server loop's behavior.
+
+### Tool approvals — pause and resume
+
+A `tool-approval-request` part **pauses** the chat: the request lands in `pendingApprovals`, the matching `toolCalls` entry flips to `state: 'approval-requested'`, and nothing is re-POSTed. Record verdicts with `addToolApprovalResponse`; once **every** pending approval has one, the hook resumes with `approvalResponses` in the request body — the [server settles the gated calls](/docs/agents/client-tools#tool-approval-round-trip), the client never fabricates gated tool_results.
+
+```tsx
+{pendingApprovals.map((req) => (
+  <ApprovalCard
+    key={req.approvalId}
+    request={req}
+    onDecision={(approved, reason) =>
+      addToolApprovalResponse({ approvalId: req.approvalId, approved, reason })
+    }
+  />
+))}
+```
+
+## useObject
+
+Streams [`streamObject`](/docs/core/stream-object) partials from a route that returns [`toDeuzObjectStreamResponse`](/docs/modules/ui-streaming):
+
+```ts
+import { useObject } from '@deuz-sdk/core/react';
+
+const { object, isLoading, error, submit, stop } = useObject<Recipe>({ api: '/api/recipe' });
+
+// submit POSTs { input } and streams object-delta parts into `object`:
+await submit({ dish: 'menemen' });
+// object: DeepPartial<Recipe> | undefined — every field optional at every depth
+```
+
+Each `object-delta` **replaces** `object` wholesale (no merging needed). String fields stream truncated (`'mene'` → `'menemen'`), so render defensively. Wire `error` parts and rejected fetches land in `error`; `stop()` aborts without erroring.
+
+Server side:
+
+```ts title="app/api/recipe/route.ts"
+import { streamObject } from '@deuz-sdk/core';
+import { toDeuzObjectStreamResponse } from '@deuz-sdk/core/ui';
+
+export async function POST(req: Request) {
+  const { input } = await req.json();
+  const result = streamObject({ model, schema: recipeSchema, messages: toMessages(input) });
+  return toDeuzObjectStreamResponse(result);
+}
+```
+
+## See also
+
+- [UI streaming wire](/docs/modules/ui-streaming) — the protocol both hooks consume.
+- [Client tools](/docs/agents/client-tools) — the manual recipe the hooks automate.
+- [streamObject](/docs/core/stream-object) — the server half of `useObject`.
