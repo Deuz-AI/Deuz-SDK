@@ -126,6 +126,51 @@ describe('Deuz UI wire', () => {
     expect(call).toMatchObject({ toolName: 'getWeather', input: { city: 'Paris' } });
   });
 
+  it('serializes tool-approval-request parts; unknown parts pass through the reader', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch } = mockFetchSequence([() => sseResponse([TOOL_CALL])]);
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+      },
+      maxSteps: 5,
+    });
+    const response = toDeuzStreamResponse(result);
+
+    const parts = [];
+    for await (const p of readDeuzStream(response)) parts.push(p);
+
+    const approval = parts.find(
+      (p): p is Extract<typeof p, { type: 'tool-approval-request' }> =>
+        p.type === 'tool-approval-request',
+    );
+    expect(approval).toEqual({
+      type: 'tool-approval-request',
+      approvalId: 'toolu_1',
+      toolCallId: 'toolu_1',
+      toolName: 'getWeather',
+      input: { city: 'Paris' },
+    });
+    expect(weather).not.toHaveBeenCalled();
+
+    // Open read side: a client→server tool-approval-response line (or any
+    // unknown part) passes through readDeuzStream untouched.
+    const sse = [
+      'data: {"type":"tool-approval-response","approvalId":"toolu_1","approved":true}\n\n',
+      'data: [DONE]\n\n',
+    ].join('');
+    const raw = new Response(new Blob([sse]).stream(), {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+    const passthrough = [];
+    for await (const p of readDeuzStream(raw)) passthrough.push(p);
+    expect(passthrough).toEqual([
+      { type: 'tool-approval-response', approvalId: 'toolu_1', approved: true },
+    ]);
+  });
+
   it('redacts secrets in the error part', async () => {
     const errStream = sseEvents([
       {
