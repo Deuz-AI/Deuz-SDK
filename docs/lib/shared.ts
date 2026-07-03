@@ -4,7 +4,7 @@ export const docsImageRoute = '/og/docs';
 export const docsContentRoute = '/llms.mdx/docs';
 
 export const gitConfig = {
-  user: 'U-C4N',
-  repo: 'deuz-sdk',
+  user: 'Deuz-AI',
+  repo: 'Deuz-SDK',
   branch: 'main',
 };
