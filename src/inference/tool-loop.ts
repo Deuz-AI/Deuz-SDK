@@ -5,8 +5,11 @@ import type { Usage } from '../types/usage';
 import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
 import { runOneStep, type OneStep } from './run-step';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
+import { resolveDependencies } from '../internal/resolve-deps';
 import {
   buildWireTools,
+  filterWireTools,
+  applyPrepareStep,
   executeTools,
   toToolResultPart,
   toStepResult,
@@ -28,9 +31,14 @@ import {
  */
 export async function runToolLoop(options: CommonCallOptions): Promise<GenerateTextResult> {
   const tools = options.tools!;
-  const wireTools = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
-  const baseLength = options.messages.length;
+  const deps = resolveDependencies(options.deps);
+  const fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+  const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
   let messages: Message[] = [...options.messages];
+  // Messages this call appends — returned as response.messages. Tracked as a
+  // list (not a base-length slice) so prepareStep/compaction history rewrites
+  // can never skew what the caller receives.
+  const appended: Message[] = [];
   const steps: StepResult[] = [];
   const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
   const errorCounters = new Map<string, number>();
@@ -39,11 +47,11 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
   let pendingApprovals: ToolApprovalRequest[] | undefined;
 
   // Resume: settle the previous break's pending approvals BEFORE the first
-  // model call (baseLength is already captured — the new tool message flows
-  // into response.messages).
+  // model call — the new tool message flows into response.messages.
   const settled = await settlePendingApprovals(messages, tools, options);
   if (settled) {
     messages = settled.messages;
+    appended.push(settled.messages.at(-1)!);
     bumpErrorGuard(
       errorCounters,
       settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
@@ -51,7 +59,15 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
   }
 
   for (;;) {
-    const step = await runOneStep({ ...options, messages }, { tools: wireTools });
+    const prepared = await applyPrepareStep(
+      options,
+      { stepIndex: steps.length, messages, usage: totalUsage },
+      fullWire,
+      staticWire,
+      deps.logger,
+    );
+    messages = prepared.messages;
+    const step = await runOneStep({ ...prepared.options, messages }, { tools: prepared.wire });
     lastStep = step;
     totalUsage = sumUsage(totalUsage, step.usage);
 
@@ -67,6 +83,7 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
       args: p.input,
     }));
     messages = [...messages, step.assistantMessage]; // assistant FIRST (OpenAI ordering)
+    appended.push(step.assistantMessage);
 
     // Approval gate: server mode denies inline; without approveToolCall the
     // gated calls break the loop like client tools (client mode).
@@ -98,6 +115,7 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     const toolResults = await executeTools(toolCalls, tools, options, messages, denied);
     const toolResultMessage: Message = { role: 'tool', content: toolResults.map(toToolResultPart) };
     messages = [...messages, toolResultMessage]; // EVERY tool_use answered (Anthropic 400 guard)
+    appended.push(toolResultMessage);
 
     const sr = toStepResult(step, toolCalls, toolResults, steps.length, toolResultMessage);
     steps.push(sr);
@@ -119,7 +137,7 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     text: lastStep?.text ?? '',
     usage: withTotal(totalUsage),
     finishReason: lastStep?.finishReason ?? 'stop',
-    response: { messages: messages.slice(baseLength) },
+    response: { messages: appended },
     steps,
     ...(lastToolStep
       ? { toolCalls: lastToolStep.toolCalls, toolResults: lastToolStep.toolResults }

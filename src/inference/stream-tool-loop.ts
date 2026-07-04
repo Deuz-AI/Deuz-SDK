@@ -11,6 +11,8 @@ import { assembleAssistant, type ToolArgMap, type EncryptedReasoning } from './r
 import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
 import {
   buildWireTools,
+  filterWireTools,
+  applyPrepareStep,
   executeTools,
   toToolResultPart,
   toStepResult,
@@ -63,7 +65,8 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
     let stepIndex = 0;
 
     try {
-      const wireTools = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+      const fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+      const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
 
       // Resume: settle the previous break's pending approvals BEFORE step 1 —
       // their tool-result parts precede the first step-start.
@@ -87,7 +90,15 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
 
       for (;;) {
         broadcaster.push({ type: 'step-start', stepIndex });
-        const inner = runStream({ ...options, messages }, { tools: wireTools });
+        const prepared = await applyPrepareStep(
+          options,
+          { stepIndex, messages, usage: totalUsage },
+          fullWire,
+          staticWire,
+          deps.logger,
+        );
+        messages = prepared.messages;
+        const inner = runStream({ ...prepared.options, messages }, { tools: prepared.wire });
 
         let text = '';
         let reasoningText = '';

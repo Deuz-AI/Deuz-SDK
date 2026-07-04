@@ -1,6 +1,7 @@
-import type { CommonCallOptions } from '../types/config';
+import type { CommonCallOptions, PrepareStepResult } from '../types/config';
 import type { Message, Part } from '../types/message';
 import type { Usage } from '../types/usage';
+import type { Logger } from '../types/deps';
 import type {
   Tool,
   ToolSet,
@@ -123,6 +124,59 @@ export async function buildWireTools(
     });
   }
   return { tools: wire, toolChoice, allowParallel: (maxConcurrency ?? 5) > 1 };
+}
+
+/**
+ * Restrict the wire tool list to `names`. Unknown names warn and are ignored;
+ * if NOTHING matches, fail OPEN (full list) — an empty tools array would
+ * silently cripple the step, which is worse than an over-wide one.
+ */
+export function filterWireTools(
+  wire: WireToolRequest,
+  names: string[] | undefined,
+  logger: Logger,
+): WireToolRequest {
+  if (!names) return wire;
+  const allowed = new Set(names);
+  const known = new Set(wire.tools.map((t) => t.name));
+  for (const n of names) {
+    if (!known.has(n)) logger.warn(`activeTools: unknown tool name '${n}' ignored`);
+  }
+  const tools = wire.tools.filter((t) => allowed.has(t.name));
+  if (tools.length === 0 && wire.tools.length > 0) {
+    logger.warn('activeTools: no known tool names matched — sending the full tool list');
+    return wire;
+  }
+  return { ...wire, tools };
+}
+
+/**
+ * Run the caller's `prepareStep` hook and resolve this step's effective
+ * options/messages/wire. A throw propagates — it is caller code, never
+ * swallowed. Per-step `activeTools` overrides the static filter (applies to
+ * the FULL tool set, not the statically filtered one); a returned `messages`
+ * array persists as the new base (the loop assigns it).
+ */
+export async function applyPrepareStep(
+  options: CommonCallOptions,
+  ctx: { stepIndex: number; messages: Message[]; usage: Usage },
+  fullWire: WireToolRequest,
+  staticWire: WireToolRequest,
+  logger: Logger,
+): Promise<{ options: CommonCallOptions; messages: Message[]; wire: WireToolRequest }> {
+  let stepOptions = options;
+  let messages = ctx.messages;
+  let wire = staticWire;
+  const ps: PrepareStepResult | undefined = options.prepareStep
+    ? await options.prepareStep(ctx)
+    : undefined;
+  if (ps) {
+    if (ps.messages) messages = ps.messages;
+    if (ps.model) stepOptions = { ...stepOptions, model: ps.model };
+    if (ps.activeTools) wire = filterWireTools(fullWire, ps.activeTools, logger);
+    if (ps.toolChoice) wire = { ...wire, toolChoice: ps.toolChoice };
+  }
+  return { options: stepOptions, messages, wire };
 }
 
 export function toToolResultPart(r: ToolResult): Part {
