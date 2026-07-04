@@ -15,6 +15,24 @@ import type {
 export type ModelId = string;
 
 /**
+ * Per-step overrides returned by `prepareStep`. Every field is optional —
+ * omit (or return `undefined`) to keep the current settings. `messages`
+ * becomes the base history for this and all FOLLOWING steps; system-prompt
+ * edits go through it too (rewrite the system-role message) — there is no
+ * separate system field on this surface.
+ */
+export interface PrepareStepResult {
+  /** Becomes the base history for this and all following steps. */
+  messages?: Message[];
+  /** Restrict which tools are sent to the model THIS step (names of `tools` keys). */
+  activeTools?: string[];
+  /** Override the tool choice for THIS step only. */
+  toolChoice?: ToolChoice;
+  /** Swap the model for THIS step only (per-step routing; return it every step to persist). */
+  model?: LanguageModel;
+}
+
+/**
  * Options common to every call. `signal` and `maxRetries` are locked NOW —
  * adding them later would be breaking even in 0.x. Sampling params are locked
  * too (full surface); adapters translate them to each wire in Faz 1.B.
@@ -79,6 +97,31 @@ export interface CommonCallOptions {
   /** Max parallel tool executions per step. Default 5. */
   maxToolConcurrency?: number;
   onStepFinish?: (step: StepResult) => void;
+  /**
+   * Pre-step hook: runs before EVERY model call of the loop (after automatic
+   * compaction, so it sees — and has the last word on — the compacted
+   * history). Return per-step overrides or `undefined` to keep settings.
+   * A thrown error fails the call (it is caller code — never swallowed).
+   */
+  prepareStep?: (ctx: {
+    stepIndex: number;
+    messages: Message[];
+    /** Cumulative REAL usage so far (all prior steps, sub-agents included). */
+    usage: Usage;
+  }) => PrepareStepResult | undefined | Promise<PrepareStepResult | undefined>;
+  /**
+   * Static tool filter: only these `tools` keys are sent to the model (all
+   * steps). Unknown names log a warning and are ignored. `prepareStep`'s
+   * `activeTools` overrides this per step. Execution/validation of results
+   * for already-issued calls is never affected.
+   */
+  activeTools?: string[];
+  /**
+   * Advanced: the sub-agent path of this loop (set by `agentTool`, e.g.
+   * `['researcher']`). Flows into every tool's `ToolExecuteContext.agentPath`
+   * and usage metering. Root loops omit it.
+   */
+  agentPath?: string[];
   /**
    * Server-mode approval: awaited for every call whose tool triggers
    * `needsApproval`. Return false (or throw) to deny — the call becomes an
