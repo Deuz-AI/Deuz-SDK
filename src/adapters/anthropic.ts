@@ -246,6 +246,8 @@ interface AnthropicEvent {
     stop_details?: { type?: string; category?: string | null; explanation?: string | null };
   };
   usage?: AnthropicUsage;
+  /** Server-side context editing report (`{ applied_edits: [...] }`) — opaque pass-through. */
+  context_management?: unknown;
   error?: { type?: string; message?: string };
 }
 
@@ -306,8 +308,18 @@ async function* parseStream(
   let outputTokens = 0;
   let stopReason: string | null = null;
   let stopDetails: unknown;
+  let contextManagement: unknown;
   const toolIds = new Map<number, string>();
   let finishEmitted = false;
+
+  /** Finish-part providerMetadata — only attached when there is something to carry. */
+  const finishMeta = (): { providerMetadata?: Record<string, unknown> } => {
+    const anthropic: Record<string, unknown> = {
+      ...(stopDetails ? { stop_details: stopDetails } : {}),
+      ...(contextManagement !== undefined ? { contextManagement } : {}),
+    };
+    return Object.keys(anthropic).length > 0 ? { providerMetadata: { anthropic } } : {};
+  };
 
   for await (const ev of parseSSE(body)) {
     if (ev.event === 'ping') continue;
@@ -365,6 +377,7 @@ async function* parseStream(
     } else if (type === 'message_delta') {
       if (data.delta?.stop_reason) stopReason = data.delta.stop_reason;
       if (data.delta?.stop_details) stopDetails = data.delta.stop_details;
+      if (data.context_management !== undefined) contextManagement = data.context_management;
       if (data.usage) {
         if (data.usage.output_tokens !== undefined) outputTokens = data.usage.output_tokens;
         // The final message_delta carries output_tokens_details / iterations;
@@ -381,7 +394,7 @@ async function* parseStream(
         type: 'finish',
         usage: buildUsage(inputUsage, outputTokens),
         finishReason: mapStopReason(stopReason),
-        ...(stopDetails ? { providerMetadata: { anthropic: { stop_details: stopDetails } } } : {}),
+        ...finishMeta(),
       };
     } else if (type === 'error') {
       yield { type: 'error', error: mapError(200, data, new Headers()) };
@@ -394,7 +407,7 @@ async function* parseStream(
       type: 'finish',
       usage: buildUsage(inputUsage, outputTokens),
       finishReason: mapStopReason(stopReason),
-      ...(stopDetails ? { providerMetadata: { anthropic: { stop_details: stopDetails } } } : {}),
+      ...finishMeta(),
     };
   }
 }

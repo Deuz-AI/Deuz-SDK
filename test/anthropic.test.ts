@@ -393,6 +393,75 @@ describe('Anthropic usage extensions (0.2.0)', () => {
   });
 });
 
+describe('Anthropic context management interop (1.4.0)', () => {
+  const CONTEXT_MANAGEMENT = { edits: [{ type: 'clear_tool_uses_20250919' }] };
+
+  it('passes providerOptions.anthropic.context_management to the request body verbatim', async () => {
+    const { provider, calls } = model([TEXT_STREAM]);
+    const result = streamChat({
+      model: provider('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      providerOptions: { anthropic: { context_management: CONTEXT_MANAGEMENT } },
+    });
+    await result.finishReason;
+    const body = lastBody(calls);
+    expect(body.context_management).toEqual(CONTEXT_MANAGEMENT);
+  });
+
+  it('surfaces message_delta context_management as providerMetadata.anthropic.contextManagement', async () => {
+    const appliedEdits = {
+      applied_edits: [
+        { type: 'clear_tool_uses_20250919', cleared_tool_uses: 3, cleared_input_tokens: 5_000 },
+      ],
+    };
+    const stream = sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 1 } } },
+      },
+      {
+        event: 'content_block_delta',
+        data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+      },
+      {
+        event: 'message_delta',
+        data: {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 4 },
+          context_management: appliedEdits,
+        },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+    const { provider } = model([stream]);
+    const result = streamChat({
+      model: provider('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const parts: StreamPart[] = [];
+    for await (const p of result.fullStream) parts.push(p);
+    const finish = parts.find((p) => p.type === 'finish');
+    const meta =
+      finish && finish.type === 'finish'
+        ? (finish.providerMetadata?.anthropic as { contextManagement?: unknown })
+        : undefined;
+    expect(meta?.contextManagement).toEqual(appliedEdits);
+  });
+
+  it('finish part carries no contextManagement (and no providerMetadata) on a normal stream', async () => {
+    const { provider } = model([TEXT_STREAM]);
+    const result = streamChat({
+      model: provider('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const parts: StreamPart[] = [];
+    for await (const p of result.fullStream) parts.push(p);
+    const finish = parts.find((p) => p.type === 'finish');
+    expect(finish && finish.type === 'finish' && finish.providerMetadata).toBeUndefined();
+  });
+});
+
 describe('Anthropic refusal stop_details (0.2.0)', () => {
   it('maps refusal → content_filter and carries stop_details on the finish part', async () => {
     const stream = sseEvents([
