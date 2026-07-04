@@ -5,9 +5,19 @@ description: Opt-in, layered compaction for the agentic loop — prune tool resu
 
 Long-running agentic loops eventually run out of context window: every tool result and every reasoning block stays in history forever unless something trims it. `compaction` is an opt-in call option that does this automatically, in three cheapest-first layers, without you writing a token counter or a pruning function yourself.
 
-## vs AI SDK
+## What's first-class here
 
-AI SDK's context management is 100% manual: you estimate tokens yourself (their cookbook uses `chars / 4`) and prune inside `prepareStep`. There is no built-in layering, no cache-awareness, and OpenAI's server-side compaction is still an open feature request on their tracker. `@deuz-sdk/core` ships one opt-in flag — `compaction: 'auto'` — with automatic, prefix-stable, layered behavior, and it composes with [`prepareStep`](/docs/agents/tools#preparestep-and-activetools) rather than replacing it: `prepareStep` runs *after* compaction each step, so it always sees the already-compacted history and gets the final word.
+Context management is often left to you: estimate tokens, then prune history inside a per-step hook. `compaction` makes that automatic and provides the pieces you'd otherwise hand-roll:
+
+| Capability | `compaction: 'auto'` | Hand-rolled (prune inside a step hook) |
+| --- | --- | --- |
+| Trigger | Automatic at a context-fill threshold | You estimate and branch yourself |
+| Layering | prune tool results → prune reasoning → summarize, cheapest-first | Whatever you write |
+| Token estimate | Calibrated heuristic that self-tightens against real usage | Usually a fixed `chars / N` |
+| Cache-awareness | Prefix-stable; untouched messages keep reference equality | Manual |
+| Composes with `prepareStep` | Yes — compaction runs **first**, `prepareStep` sees the result | n/a |
+
+It stays a manual escape hatch too: [`prepareStep`](/docs/agents/tools#preparestep-and-activetools) runs *after* compaction each step, so you can always rewrite the already-compacted history yourself and get the final word.
 
 ## Turning it on
 

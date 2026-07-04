@@ -283,24 +283,29 @@ interface PrepareStepResult {
 
 Return `undefined` (or omit fields) to keep the current settings. Because `messages` becomes the base for this step **and every step after it**, `prepareStep` doubles as a user-controlled compaction/rewrite hook — including system-prompt edits, which go through rewriting the `system`-role message in `messages` (there's no separate `system` field on this surface). A thrown `prepareStep` fails the call like any caller code: buffered calls reject, streaming calls get an `error` part plus rejected `usage`/`finishReason` — it is never silently swallowed.
 
-```ts title="prepare-step.ts"
+Step-based **model switch** — run cheap exploration steps on a small model, then switch to a strong model for the final synthesis step:
+
+```ts title="prepare-step-model-switch.ts"
 import { generateText, type PrepareStepResult } from '@deuz-sdk/core';
 
+const haiku = anthropic('claude-haiku-5'); // cheap, for the search/gather steps
+const opus = anthropic('claude-opus-4-8'); // strong, for the final report
+
 const result = await generateText({
-  model: anthropic('claude-opus-4-8'),
+  model: haiku, // the loop's default model
   messages: [{ role: 'user', content: 'Research, then write the final report.' }],
   maxSteps: 10,
   tools: { search, draft, finalize },
   prepareStep: ({ stepIndex, usage }): PrepareStepResult | undefined => {
-    // First few steps: only allow searching. Later: only allow drafting/finalizing.
-    if (stepIndex < 3) return { activeTools: ['search'] };
-    if (usage.totalTokens > 50_000) return { model: cheaperModel }; // route to save cost
-    return { activeTools: ['draft', 'finalize'] };
+    // Early steps: cheap model, search only. Once enough context is gathered,
+    // switch to the strong model and allow it to draft/finalize.
+    if (stepIndex < 3) return { model: haiku, activeTools: ['search'] };
+    return { model: opus, activeTools: ['draft', 'finalize'] };
   },
 });
 ```
 
-vs AI SDK: their `prepareStep` lives on the `ToolLoopAgent` class, and their context management is fully manual (`pruneMessages` called inside `prepareStep`). Here, `prepareStep` is a plain call option on the free functions, and it composes with [automatic compaction](/docs/core/compaction) — compaction runs first, `prepareStep` sees the result and can still rewrite `messages` itself.
+The returned `model` applies to that step; return it every step (as above) to keep it, or only on the steps you want to switch. `prepareStep` is a plain call option on the free functions — no agent class to instantiate — and it composes with [automatic compaction](/docs/core/compaction): compaction runs first each step, then `prepareStep` sees the already-compacted history and can still rewrite `messages` itself.
 
 ## Budget stop conditions
 
@@ -337,7 +342,7 @@ result.providerMetadata?.deuz.stoppedBy; // 'totalTokensExceed' | 'costExceeds' 
 
 `GenerateTextResult.providerMetadata` is itself a new additive field (`Record<string, Record<string, unknown>>`) — safe to ignore if you don't use budget stops.
 
-vs AI SDK: they ship `isStepCount` / `hasToolCall` / `isLoopFinished` only. Usage is reported back to you, but there is no built-in way to bound the loop by tokens or cost — you'd have to poll `usage` yourself inside a custom stop predicate and still couldn't distinguish "budget stop" from "model stopped naturally" afterward.
+Token- and cost-budget stops are first-class here: they're `StopCondition` factories like `stepCountIs`/`hasToolCall`, they read real provider-reported usage across every step and sub-agent, and the `stoppedBy` marker tells you afterward whether a budget bound (rather than the model) ended the loop — so you don't have to poll `usage` inside a hand-written predicate or guess why it stopped.
 
 ## Controlling tool use with `toolChoice`
 

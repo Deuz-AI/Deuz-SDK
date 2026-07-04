@@ -5,9 +5,18 @@ description: agentTool wraps a focused agentic loop as a callable Tool — with 
 
 `agentTool` turns a model + its own tools into a `Tool` the parent loop can call. The parent model delegates a sub-task ("research X", "write and test this function") to a nested agentic loop that runs to completion and returns its final text — the same [tool loop](/docs/agents/tool-loop) machinery, one level down, with no new runtime concept to learn.
 
-## vs AI SDK
+## What's first-class here
 
-AI SDK's equivalent is the documented "agent-as-tool" pattern: a tool whose `execute` calls another agent and returns its final text. It's a **black box** — you cannot see the sub-agent's internals stream through the canonical stream without hand-writing UI-writer plumbing yourself, and their docs have a dedicated section titled *"No Tool Approvals in Subagents"* because their subagents cannot use tool approval at all. `agentTool` closes both gaps: the sub-agent's entire canonical stream forwards **live** into the parent's `fullStream`, and the parent's approval gate is **inherited** to every nesting depth — with no new runtime, since `execute` just drives the same `streamChat` loop internally.
+The common way to compose agents is the "agent-as-tool" pattern: a tool whose `execute` calls another agent and returns its final text. `agentTool` is that pattern, but with three things provided out of the box instead of hand-wired:
+
+| Capability | `agentTool` | Hand-rolled agent-as-tool |
+| --- | --- | --- |
+| Sub-agent stream visible in the parent stream | **Live** — `agentPath`-tagged `sub-agent` parts on `fullStream` | You write your own UI-writer plumbing |
+| Tool approval **inside** the sub-agent | **Inherited** from the parent's `approveToolCall`, at every depth | Not part of the pattern — you build it |
+| Per-sub-agent usage attribution | `meta.agentPath` + folded into the parent total | Manual bookkeeping |
+| New runtime concept | None — the same `streamChat` loop, one level down | — |
+
+All three come for free because `execute` just drives the same [tool loop](/docs/agents/tool-loop) internally — there's no separate agent runtime to adopt.
 
 ## Defining a sub-agent
 
@@ -156,9 +165,60 @@ const result = await generateText({
 
 > **1.4 limitation.** Client-mode approval — omitting `approveToolCall` and breaking the loop into `pendingApprovals` — is **not supported inside a sub-agent yet**; it needs durable suspend/resume across a nested loop, which lands in 1.5. A gated sub-agent tool call with no inherited server-mode approver returns a clear `is_error` explaining this (the parent model can react to it), rather than hanging or silently allowing the call. Server-mode `approveToolCall` on the parent call works today at any depth.
 
+## Nesting sub-agents (orchestrator → worker)
+
+`agentTool` inside `agentTool` composes: an orchestrator delegates to a `researcher`, and the `researcher` can itself delegate to a `coder`. Each level is a normal tool inside the level above it; `agentPath` records the full chain (`['researcher', 'coder']`), approval and usage inherit straight down, and a streaming parent sees every level's parts live.
+
+```ts title="nested-agents.ts"
+import { generateText, agentTool } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { z } from 'zod';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const opus = anthropic('claude-opus-4-8');
+const haiku = anthropic('claude-haiku-5');
+
+// A leaf coding sub-agent with a gated shell tool.
+const coder = agentTool({
+  name: 'coder',
+  description: 'Writes and runs code changes to satisfy a spec.',
+  model: opus,
+  maxSteps: 8,
+  tools: {
+    runShellCommand: {
+      description: 'Run a shell command.',
+      parameters: z.object({ cmd: z.string() }),
+      needsApproval: true, // still gated when reached two levels deep
+      execute: async ({ cmd }) => runShell(cmd),
+    },
+  },
+});
+
+// A research sub-agent that can itself delegate coding to `coder`.
+const researcher = agentTool({
+  name: 'researcher',
+  description: 'Researches a task and delegates any code changes to the coder.',
+  model: haiku,
+  maxSteps: 6,
+  tools: { webSearch: /* … a Tool with execute … */, coder },
+});
+
+// The orchestrator only knows about `researcher`.
+const { text, usage } = await generateText({
+  model: opus,
+  messages: [{ role: 'user', content: 'Investigate the failing build and fix it.' }],
+  maxSteps: 5,
+  tools: { researcher },
+  // Inherited all the way down: coder.runShellCommand calls are decided here.
+  approveToolCall: async (call) => policyAllows(call),
+});
+
+// usage.totalTokens includes the orchestrator + researcher + coder.
+```
+
 ## The `maxDepth` guard
 
-`agentTool` inside `agentTool` is allowed — a `researcher` sub-agent can itself delegate to a `coder` sub-agent — but nesting is capped by `maxDepth` (default `2`) to stop runaway self-recursion. Each `agentTool` checks its **own** `maxDepth` against how deep its `agentPath` already is when it runs; exceeding it throws, which the loop's [self-healing](/docs/agents/tool-loop#self-healing-tool-errors) turns into an `is_error` tool result — the parent model can recover (e.g. try the task itself) instead of the whole call failing.
+Nesting is capped by `maxDepth` (default `2`) to stop runaway self-recursion. Each `agentTool` checks its **own** `maxDepth` against how deep its `agentPath` already is when it runs; exceeding it throws, which the loop's [self-healing](/docs/agents/tool-loop#self-healing-tool-errors) turns into an `is_error` tool result — the parent model can recover (e.g. try the task itself) instead of the whole call failing.
 
 ## Abort
 
