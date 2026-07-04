@@ -69,6 +69,13 @@ describe('normalizeCompaction', () => {
     });
   });
 
+  it('floors a fractional keepRecentSteps and defaults a non-finite one', () => {
+    expect(normalizeCompaction({ keepRecentSteps: 1.5 }).keepRecentSteps).toBe(1);
+    expect(normalizeCompaction({ keepRecentSteps: 0 }).keepRecentSteps).toBe(1);
+    expect(normalizeCompaction({ keepRecentSteps: NaN }).keepRecentSteps).toBe(4);
+    expect(normalizeCompaction({ keepRecentSteps: -3 }).keepRecentSteps).toBe(1);
+  });
+
   it('merges a partial policy and carries summarizeModel through', () => {
     const model: LanguageModel = {
       provider: 'openai',
@@ -201,7 +208,7 @@ describe('prune-reasoning layer', () => {
 });
 
 describe('summarize layer', () => {
-  it('replaces the oldest unprotected run with a single assistant summary', async () => {
+  it('replaces the oldest unprotected run with a single USER summary', async () => {
     const msgs = history(8);
     const summarize = vi.fn(async (_slice: Message[]) => 'THE SUMMARY');
     const res = await applyCompaction(
@@ -219,14 +226,64 @@ describe('summarize layer', () => {
     expect(res.messages).toHaveLength(11);
     expect(res.messages[0]).toBe(msgs[0]);
     expect(res.messages[1]).toBe(msgs[1]);
+    // User role, not assistant: an assistant summary spliced before the anchor
+    // assistant would merge on the wire and break Anthropic's thinking-first rule.
     expect(res.messages[2]).toEqual({
-      role: 'assistant',
+      role: 'user',
       content: [{ type: 'text', text: '[Earlier conversation summarized]\nTHE SUMMARY' }],
     });
     for (let i = 3; i < 11; i++) expect(res.messages[i]).toBe(msgs[i + 7]);
     expect(res.events).toHaveLength(1);
     expect(res.events[0]!.layer).toBe('summarize');
     expect(res.events[0]!.tokensBefore).toBeGreaterThan(res.events[0]!.tokensAfter);
+  });
+
+  it('never summarizes away the pending question when no assistant turn exists yet', async () => {
+    const msgs: Message[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: [{ type: 'text', text: 'context doc 1' }] },
+      { role: 'user', content: [{ type: 'text', text: 'context doc 2' }] },
+      { role: 'user', content: [{ type: 'text', text: 'context doc 3' }] },
+      { role: 'user', content: [{ type: 'text', text: 'THE REAL QUESTION' }] },
+    ];
+    const summarize = vi.fn(async () => 'SUMMARY');
+    const res = await applyCompaction(
+      msgs,
+      policy({ threshold: 0.5, layers: ['summarize'] }),
+      ctxOf(msgs, { summarize }),
+    );
+    // Oldest run [2,4) collapses; the first user (task) and the LAST user
+    // (the actual question) both survive, history still ends on the question.
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(res.messages[0]).toBe(msgs[0]);
+    expect(res.messages[1]).toBe(msgs[1]);
+    const last = res.messages.at(-1)!;
+    expect(last).toBe(msgs[4]);
+    expect(last.role).toBe('user');
+    expect(JSON.stringify(last)).toContain('THE REAL QUESTION');
+  });
+
+  it('never throws on a circular/BigInt tool result (prune-tool-results)', async () => {
+    const circular: Record<string, unknown> = { data: 'x'.repeat(200) };
+    circular.self = circular;
+    const msgs = history(8);
+    msgs[3] = {
+      role: 'tool',
+      content: [{ type: 'tool_result', toolUseId: 'call_1', result: circular }],
+    };
+    msgs[5] = {
+      role: 'tool',
+      content: [{ type: 'tool_result', toolUseId: 'call_2', result: BigInt(42) }],
+    };
+    // A message-count estimate (the real loop's estimator is circular-safe too;
+    // this test's default jsonEstimate helper is not, and must not mask the fix).
+    const countEstimate = (m: Message[]): number => m.length;
+    const res = await applyCompaction(msgs, policy({ threshold: 0.5, layers: ['prune-tool-results'] }), {
+      estimate: countEstimate,
+      contextWindow: 1,
+    });
+    expect(toolResult(res.messages[3]).result).toMatch(/^\[pruned \d+ chars\]$/);
+    expect(toolResult(res.messages[5]).result).toMatch(/^\[pruned \d+ chars\]$/);
   });
 
   it('does not summarize when fewer than 2 messages are unprotected', async () => {

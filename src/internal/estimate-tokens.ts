@@ -80,9 +80,24 @@ export function createTokenEstimator(): TokenEstimator {
       return Math.ceil(estimateBase(messages) * factor);
     },
     calibrate(actualInputTokens, estimatedAtCall) {
-      if (estimatedAtCall <= 0) return;
+      // Ignore degenerate samples: NaN/Infinity (a single one would poison the
+      // factor forever) and non-positive values (a provider omitting usage
+      // would drag the factor to the floor).
+      if (
+        !Number.isFinite(actualInputTokens) ||
+        !Number.isFinite(estimatedAtCall) ||
+        actualInputTokens <= 0 ||
+        estimatedAtCall <= 0
+      ) {
+        return;
+      }
+      // Blend in FACTOR space, not ratio space. `estimatedAtCall` is already
+      // calibrated (base * factor), so the correction we need is factor * ratio,
+      // not ratio. The recurrence factor·(0.7 + 0.3·ratio) reduces to
+      // 0.7·factor + 0.3·(actual/base) and converges to the true multiplier
+      // actual/base — ratio-space blending would converge to its square root.
       const ratio = actualInputTokens / estimatedAtCall;
-      const next = (1 - EMA_WEIGHT) * factor + EMA_WEIGHT * ratio;
+      const next = factor * (1 - EMA_WEIGHT + EMA_WEIGHT * ratio);
       factor = Math.min(FACTOR_MAX, Math.max(FACTOR_MIN, next));
     },
   };

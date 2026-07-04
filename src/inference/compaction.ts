@@ -55,12 +55,25 @@ const DEFAULT_LAYERS: CompactionLayer[] = ['prune-tool-results', 'prune-reasonin
 /** Expand `'auto'`/partial policies to a fully-defaulted one. */
 export function normalizeCompaction(option: CompactionOption): NormalizedCompaction {
   const policy = option === 'auto' ? {} : option;
+  const rawKeep = policy.keepRecentSteps;
   return {
     threshold: policy.threshold ?? 0.92,
-    keepRecentSteps: policy.keepRecentSteps ?? 4,
+    // Must be a positive integer — a fractional/NaN value would index
+    // `assistantIdx` off the end and silently unprotect the whole tail.
+    keepRecentSteps: Number.isFinite(rawKeep) ? Math.max(1, Math.floor(rawKeep as number)) : 4,
     layers: policy.layers ?? DEFAULT_LAYERS,
     ...(policy.summarizeModel ? { summarizeModel: policy.summarizeModel } : {}),
   };
+}
+
+/** Stringify arbitrary tool payloads without ever throwing (circular refs, BigInt). */
+function safeStringify(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value) ?? '';
+  } catch {
+    return '';
+  }
 }
 
 export interface ApplyCompactionCtx {
@@ -120,8 +133,9 @@ async function runLayer(
 
 /**
  * Indices that no layer may touch: system messages, the first user message,
- * and the tail from the `keepRecentSteps`-th-from-last assistant message to
- * the end (at minimum from the LAST assistant message, even at 0).
+ * the LAST message (the pending question / current turn — critical when no
+ * assistant turn exists yet), and the tail from the `keepRecentSteps`-th-from-
+ * last assistant message to the end.
  */
 function protectedIndices(messages: Message[], keepRecentSteps: number): Set<number> {
   const prot = new Set<number>();
@@ -134,7 +148,13 @@ function protectedIndices(messages: Message[], keepRecentSteps: number): Set<num
     else if (role === 'assistant') assistantIdx.push(i);
   }
   if (firstUser >= 0) prot.add(firstUser);
-  const anchor = assistantIdx[Math.max(assistantIdx.length - Math.max(keepRecentSteps, 1), 0)];
+  // Always protect the final message: with no assistant turn yet (e.g. several
+  // pasted user docs) it is the actual question — summarizing it away would
+  // delete the request and end the history on an assistant turn.
+  if (messages.length > 0) prot.add(messages.length - 1);
+  // Integer, ≥1 — belt-and-suspenders even if a raw policy skipped normalize.
+  const keep = Number.isFinite(keepRecentSteps) ? Math.max(1, Math.floor(keepRecentSteps)) : 1;
+  const anchor = assistantIdx[Math.max(assistantIdx.length - keep, 0)];
   if (anchor !== undefined) {
     for (let i = anchor; i < messages.length; i++) prot.add(i);
   }
@@ -152,9 +172,11 @@ function pruneToolResults(messages: Message[], prot: Set<number>): Message[] {
     const parts = m.content.map((p): Part => {
       if (p.type !== 'tool_result') return p;
       if (typeof p.result === 'string' && PRUNED_RE.test(p.result)) return p;
-      const raw = typeof p.result === 'string' ? p.result : JSON.stringify(p.result);
+      // safeStringify, not bare JSON.stringify: a circular/BigInt tool result
+      // would otherwise throw and violate the never-throws contract.
+      const raw = safeStringify(p.result);
       msgChanged = true;
-      return { ...p, result: `[pruned ${raw === undefined ? 0 : raw.length} chars]` };
+      return { ...p, result: `[pruned ${raw.length} chars]` };
     });
     if (!msgChanged) return m;
     changed = true;
@@ -180,9 +202,12 @@ function pruneReasoning(messages: Message[], prot: Set<number>): Message[] {
 }
 
 /**
- * Collapse the oldest contiguous run of unprotected messages into one
- * assistant summary. A throwing summarizer only skips the layer (`onSkip`) —
- * the loop must never die from compaction.
+ * Collapse the oldest contiguous run of unprotected messages into ONE user
+ * summary message. User role (not assistant) is deliberate: an assistant
+ * summary spliced right before the protected anchor assistant would merge into
+ * one turn on the wire, breaking Anthropic's "thinking block must lead the
+ * turn" rule when extended thinking + tool results follow (→ 400). A throwing
+ * summarizer only skips the layer (`onSkip`) — the loop never dies from it.
  */
 async function summarizeRun(
   messages: Message[],
@@ -194,11 +219,14 @@ async function summarizeRun(
   while (start < messages.length && prot.has(start)) start++;
   let end = start;
   while (end < messages.length && !prot.has(end)) end++;
-  if (end - start < 1) return messages;
+  // Require a run of ≥2 messages: a lone unprotected message (e.g. an assistant
+  // whose tool_result was split off by an injected protected message) saves
+  // little and risks orphaning a tool_use/tool_result pair.
+  if (end - start < 2) return messages;
   try {
     const summary = await ctx.summarize(messages.slice(start, end));
     const summaryMessage: Message = {
-      role: 'assistant',
+      role: 'user',
       content: [{ type: 'text', text: `[Earlier conversation summarized]\n${summary}` }],
     };
     return [...messages.slice(0, start), summaryMessage, ...messages.slice(end)];

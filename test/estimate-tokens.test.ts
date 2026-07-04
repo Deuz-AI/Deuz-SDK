@@ -83,16 +83,21 @@ describe('createTokenEstimator — base heuristic', () => {
 describe('createTokenEstimator — calibration', () => {
   const messages = [textMessage(3600)]; // base 1004
 
-  it('converges toward the actual/estimated ratio (clamped at 2.0)', () => {
+  it('learns the true multiplier under realistic feedback (calibrated estimate fed back)', () => {
+    // The loop feeds back the CURRENT calibrated estimate each step, and the
+    // provider's real count is a fixed multiple of the heuristic base. The
+    // factor must converge to that multiplier — blending in ratio space instead
+    // of factor space would converge to its square root (~1.41 for a 2x gap).
     const estimator = createTokenEstimator();
     const base = estimator.estimate(messages);
+    const trueTokens = base * 2;
 
-    for (let i = 0; i < 3; i++) estimator.calibrate(2000, 1000);
+    for (let i = 0; i < 3; i++) estimator.calibrate(trueTokens, estimator.estimate(messages));
     const afterThree = estimator.estimate(messages);
-    expect(afterThree).toBeGreaterThanOrEqual(Math.ceil(base * 1.6));
-    expect(afterThree).toBeLessThanOrEqual(Math.ceil(base * 1.7));
+    expect(afterThree).toBeGreaterThanOrEqual(Math.floor(base * 1.6));
+    expect(afterThree).toBeLessThanOrEqual(Math.ceil(base * 1.75));
 
-    for (let i = 0; i < 7; i++) estimator.calibrate(2000, 1000);
+    for (let i = 0; i < 12; i++) estimator.calibrate(trueTokens, estimator.estimate(messages));
     const converged = estimator.estimate(messages);
     expect(converged).toBeGreaterThanOrEqual(Math.floor(base * 1.95));
     expect(converged).toBeLessThanOrEqual(Math.ceil(base * 2));
@@ -118,6 +123,20 @@ describe('createTokenEstimator — calibration', () => {
     estimator.calibrate(500, 0);
     estimator.calibrate(500, -10);
     expect(estimator.estimate(messages)).toBe(base);
+  });
+
+  it('ignores non-finite or non-positive samples without poisoning the factor', () => {
+    const estimator = createTokenEstimator();
+    const base = estimator.estimate(messages);
+    estimator.calibrate(NaN, 1000);
+    estimator.calibrate(1000, NaN);
+    estimator.calibrate(Infinity, 1000);
+    estimator.calibrate(0, 1000); // provider omitted usage → Usage zero-fills
+    estimator.calibrate(-500, 1000);
+    expect(estimator.estimate(messages)).toBe(base); // factor still 1.0, finite
+    // A valid sample afterward still moves the (un-poisoned) factor.
+    estimator.calibrate(10_000, 1000);
+    expect(estimator.estimate(messages)).toBe(Math.ceil(base * 2));
   });
 
   it('keeps calibration local to each instance', () => {
