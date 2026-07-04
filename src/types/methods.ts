@@ -42,6 +42,12 @@ export interface GenerateTextResult {
    * a verdict. Resume by calling again with `approvalResponses`. Additive.
    */
   pendingApprovals?: ToolApprovalRequest[];
+  /**
+   * SDK-level metadata. `deuz.stoppedBy` names the user-provided `stopWhen`
+   * condition that ended the loop (e.g. 'totalTokensExceed') — absent when the
+   * loop ended naturally or on the implicit `maxSteps` bound. Additive (1.4).
+   */
+  providerMetadata?: Record<string, Record<string, unknown>>;
 }
 
 export type GenerateText = (options: GenerateTextOptions) => Promise<GenerateTextResult>;

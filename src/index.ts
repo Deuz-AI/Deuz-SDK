@@ -8,6 +8,9 @@
 export { streamChat, generateText, generateObject, streamObject } from './generate';
 export { embed, embedMany } from './inference/embed';
 
+// Loop stop conditions (1.4 additive; totalTokensExceed/costExceeds read REAL usage).
+export { stepCountIs, hasToolCall, totalTokensExceed, costExceeds } from './inference/stop';
+
 // Optional convenience client + dependency resolution.
 export { createClient, resolveDependencies } from './client';
 export type { DeuzClient } from './client';

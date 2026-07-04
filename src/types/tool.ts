@@ -95,4 +95,8 @@ export interface StepResult {
 export type StopCondition = (info: {
   steps: StepResult[];
   stepCount: number;
+  /** Cumulative REAL usage across all steps so far (sub-agents included). Additive (1.4). */
+  usage?: Usage;
+  /** Cumulative cost in USD — present only when `deps.priceProvider` is set AND a condition needs it. Additive (1.4). */
+  costUSD?: number;
 }) => boolean | Promise<boolean>;

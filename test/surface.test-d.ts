@@ -82,3 +82,10 @@ expectTypeOf<CommonCallOptions>().toHaveProperty('activeTools');
 expectTypeOf<CommonCallOptions>().toHaveProperty('agentPath');
 expectTypeOf<PrepareStepResult>().toHaveProperty('activeTools');
 expectTypeOf<PrepareStepResult>().toHaveProperty('model');
+
+// --- 1.4.0 additive: budget stop conditions + stoppedBy metadata. ---
+import { stepCountIs, totalTokensExceed, costExceeds } from '../src/index';
+expectTypeOf(stepCountIs).toBeFunction();
+expectTypeOf(totalTokensExceed).returns.toBeFunction();
+expectTypeOf(costExceeds).returns.toBeFunction();
+expectTypeOf<GenerateTextResult>().toHaveProperty('providerMetadata');

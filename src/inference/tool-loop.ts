@@ -16,6 +16,7 @@ import {
   hasClientTool,
   bumpErrorGuard,
   normalizeStop,
+  needsCost,
   shouldStop,
   sumUsage,
   findApprovalNeeded,
@@ -41,10 +42,15 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
   const appended: Message[] = [];
   const steps: StepResult[] = [];
   const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
+  const wantCost = needsCost(stopConditions);
+  if (wantCost && !deps.priceProvider) {
+    deps.logger.warn('costExceeds: no deps.priceProvider injected — the condition never fires');
+  }
   const errorCounters = new Map<string, number>();
   let totalUsage: Usage = EMPTY_USAGE;
   let lastStep: OneStep | undefined;
   let pendingApprovals: ToolApprovalRequest[] | undefined;
+  let stoppedBy: string | undefined;
 
   // Resume: settle the previous break's pending approvals BEFORE the first
   // model call — the new tool message flows into response.messages.
@@ -129,7 +135,15 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
       )
     )
       break;
-    if (await shouldStop(stopConditions, steps)) break;
+    const costUSD =
+      wantCost && deps.priceProvider
+        ? ((await deps.priceProvider.priceUsage(options.model.modelId, totalUsage)) ?? undefined)
+        : undefined;
+    const stop = await shouldStop(stopConditions, steps, { usage: totalUsage, costUSD });
+    if (stop.stop) {
+      stoppedBy = stop.stoppedBy;
+      break;
+    }
   }
 
   const lastToolStep = [...steps].reverse().find((s) => s.toolCalls.length > 0);
@@ -143,5 +157,6 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
       ? { toolCalls: lastToolStep.toolCalls, toolResults: lastToolStep.toolResults }
       : {}),
     ...(pendingApprovals ? { pendingApprovals } : {}),
+    ...(stoppedBy ? { providerMetadata: { deuz: { stoppedBy } } } : {}),
   };
 }

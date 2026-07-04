@@ -19,6 +19,7 @@ import {
   hasClientTool,
   bumpErrorGuard,
   normalizeStop,
+  needsCost,
   shouldStop,
   sumUsage,
   findApprovalNeeded,
@@ -59,9 +60,14 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
     let messages: Message[] = [...options.messages];
     const steps: StepResult[] = [];
     const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
+    const wantCost = needsCost(stopConditions);
+    if (wantCost && !deps.priceProvider) {
+      deps.logger.warn('costExceeds: no deps.priceProvider injected — the condition never fires');
+    }
     const errorCounters = new Map<string, number>();
     let totalUsage: Usage = EMPTY_USAGE;
     let lastFinish: FinishReason = 'stop';
+    let stoppedBy: string | undefined;
     let stepIndex = 0;
 
     try {
@@ -281,12 +287,26 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
           )
         )
           break;
-        if (await shouldStop(stopConditions, steps)) break;
+        const costUSD =
+          wantCost && deps.priceProvider
+            ? ((await deps.priceProvider.priceUsage(options.model.modelId, totalUsage)) ??
+              undefined)
+            : undefined;
+        const stop = await shouldStop(stopConditions, steps, { usage: totalUsage, costUSD });
+        if (stop.stop) {
+          stoppedBy = stop.stoppedBy;
+          break;
+        }
         stepIndex++;
       }
 
       const usage = withTotal(totalUsage);
-      broadcaster.push({ type: 'finish', usage, finishReason: lastFinish });
+      broadcaster.push({
+        type: 'finish',
+        usage,
+        finishReason: lastFinish,
+        ...(stoppedBy ? { providerMetadata: { deuz: { stoppedBy } } } : {}),
+      });
       usageDeferred.resolve(usage);
       finishDeferred.resolve(lastFinish);
       fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });

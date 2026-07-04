@@ -13,7 +13,7 @@ import type {
 } from '../types/tool';
 import type { WireTool, WireToolRequest } from '../adapters/types';
 import type { OneStep } from './run-step';
-import { stepCountIs } from './stop';
+import { stepCountIs, type NamedStopCondition } from './stop';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
 import { ToolExecutionError } from '../errors';
@@ -360,18 +360,31 @@ export function normalizeStop(
   stopWhen: CommonCallOptions['stopWhen'],
   maxSteps: number,
 ): StopCondition[] {
-  const conditions: StopCondition[] = [stepCountIs(maxSteps)];
+  // The maxSteps bound is the loop's own guard — flagged so it never surfaces
+  // as a `stoppedBy` marker (that would change every bounded run's output).
+  const implicit = Object.assign(stepCountIs(maxSteps), { implicitMaxSteps: true });
+  const conditions: StopCondition[] = [implicit];
   if (stopWhen) conditions.push(...(Array.isArray(stopWhen) ? stopWhen : [stopWhen]));
   return conditions;
+}
+
+/** True when any condition carries `requiresCost` (→ compute costUSD per step). */
+export function needsCost(conditions: StopCondition[]): boolean {
+  return conditions.some((c) => (c as NamedStopCondition).requiresCost === true);
 }
 
 export async function shouldStop(
   conditions: StopCondition[],
   steps: StepResult[],
-): Promise<boolean> {
-  const info = { steps, stepCount: steps.length };
+  extras?: { usage?: Usage; costUSD?: number },
+): Promise<{ stop: boolean; stoppedBy?: string }> {
+  const info = { steps, stepCount: steps.length, ...extras };
   for (const c of conditions) {
-    if (await c(info)) return true;
+    if (await c(info)) {
+      const meta = c as NamedStopCondition;
+      if (meta.implicitMaxSteps) return { stop: true };
+      return { stop: true, stoppedBy: meta.conditionName ?? 'custom' };
+    }
   }
-  return false;
+  return { stop: false };
 }
