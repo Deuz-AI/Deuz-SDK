@@ -24,7 +24,7 @@ npm install @deuz-sdk/core
 
 Requires **Node ≥ 22**. **Zero runtime dependencies.** Optional peers, pulled in only if you use them: `zod` (or any Standard Schema lib) + `@standard-community/standard-json` for schema-typed `generateObject`; `@modelcontextprotocol/sdk` for MCP; `unpdf` / `mammoth` / `xlsx` for `@deuz-sdk/core/rag/node` document parsing.
 
-📚 **Documentation** — the full docs site lives in [`docs/`](./docs) (Fumadocs; 34 pages covering every module, with `llms.txt` / `llms-full.txt` for AI agents). 🤖 **Claude Code skill** — [`skills/deuz-sdk/`](./skills/deuz-sdk) teaches AI coding agents to integrate the SDK correctly.
+📚 **Documentation** — the full docs site lives in [`docs/`](./docs) (Fumadocs; 37 pages covering every module, with `llms.txt` / `llms-full.txt` for AI agents). 🤖 **Claude Code skill** — [`skills/deuz-sdk/`](./skills/deuz-sdk) teaches AI coding agents to integrate the SDK correctly.
 
 ---
 

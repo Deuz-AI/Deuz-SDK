@@ -10,11 +10,15 @@
     "providers",
     "---Agents---",
     "agents",
+    "---Cookbooks---",
+    "cookbooks",
     "---Modules---",
     "modules",
     "---Advanced---",
     "advanced",
     "---Migration---",
-    "migration"
+    "migration",
+    "---Comparison---",
+    "comparison"
   ]
 }

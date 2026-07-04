@@ -9,6 +9,7 @@ A **tool** is a function the model can call by name. You pass a `ToolSet` (a pla
 
 ```ts
 interface Tool<Args = unknown, Result = unknown> {
+  type?: 'function' | 'provider'; // default 'function'; 'provider' = provider-executed
   description?: string;
   parameters: StandardSchemaV1<unknown, Args> | JSONSchema;
   execute?: (args: Args, ctx: ToolExecuteContext) => Promise<Result> | Result;
@@ -16,10 +17,22 @@ interface Tool<Args = unknown, Result = unknown> {
     | boolean
     | ((args: Args, ctx: ToolExecuteContext) => boolean | Promise<boolean>);
   outputSchema?: JSONSchema; // carried metadata only (populated by MCP tools)
+  providerTool?: Record<string, unknown>; // raw native definition for a 'provider' tool
 }
 
 type ToolSet = Record<string, Tool>;
 ```
+
+There are four kinds of tool, distinguished by these fields:
+
+| Tool kind | How it runs | Shape | Example |
+| --- | --- | --- | --- |
+| Server function tool | The SDK runs your `execute` | `execute` set, `type` omitted | `getWeather` |
+| Client tool | No `execute` — the loop breaks and the UI does a round-trip | `execute` omitted | `confirmPurchase` (see [Client tools](/docs/agents/client-tools)) |
+| Provider tool | The model provider runs it during the turn | `type: 'provider'` + `providerTool` | `anthropicWebSearch()`, `openaiWebSearch()`, `googleSearch()` (see [Provider-executed tools](/docs/agents/server-tools)) |
+| Sub-agent tool | A nested agentic loop runs | built by `agentTool(...)` | `agentTool({ name: 'researcher', … })` (see [Sub-agents](/docs/agents/subagents)) |
+
+You rarely set `type`/`providerTool` by hand — the `anthropicWebSearch()` / `openaiWebSearch()` / `googleSearch()` factories and `agentTool(...)` build those shapes for you.
 
 | Field | Type | Required | Notes |
 | --- | --- | --- | --- |

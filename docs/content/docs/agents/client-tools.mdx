@@ -240,6 +240,8 @@ tool recipe below) and sends the verdicts back in the next request's body as
 Prefer server-side policy with no UI pause? Pass `approveToolCall` instead —
 see [server-mode approval](/docs/agents/tools#tool-approval-needsapproval).
 
+> **Security — `approvalResponses` is a trust boundary.** A verdict arriving from the browser is untrusted input. On the server, before you accept one, validate it against the authenticated session: the user is allowed to approve **this** call, the `approvalId`/`toolCallId` matches a call *you* actually issued this run, the tool name and parsed input are the ones you streamed out, the run/conversation id matches, and the approval hasn't expired. Never execute a gated tool just because the client said "approved." For high-risk tools, keep the pending approvals server-side and hand the browser only an opaque id, or sign the approval payload server-side. (Cryptographically signed approvals are planned for the durable-runtime work in 1.5; until then, treat `approvalResponses` as an application-level trust boundary you enforce.)
+
 ## Example: Next.js route + `readDeuzStream`
 
 Stream the first turn over the [Deuz UI wire](/docs/modules/ui-streaming). The browser detects the pending `tool-call`, resolves it (here a browser-only geolocation call), then re-POSTs the full history with a `tool_result` appended.

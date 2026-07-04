@@ -63,11 +63,24 @@ These are shared by `streamChat`, `generateText`, and `generateObject`.
 | `maxOutputTokens` | `number` | — | Cap on generated tokens. |
 | `topP` | `number` | — | Nucleus sampling. |
 | `stopSequences` | `string[]` | — | Stop strings. |
-| `effort` | `'none' \| 'low' \| 'medium' \| 'high'` | — | Canonical reasoning effort; each adapter maps it to its own unit. |
+| `effort` | `'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'` | — | Canonical reasoning effort; each adapter maps or clamps it to its own unit (see note below). |
 | `headers` | `Record<string, string>` | — | Extra request headers. |
 | `onUsage` | `(usage, meta) => void` | — | Fires when usage is known. |
 | `onFinish` | `(meta) => void` | — | Fires once the call completes. |
 | `tools` | `ToolSet` | — | Passing tools turns on the agentic loop (see [Tool calling](/docs/agents/tools)). |
+
+This table is the **common base subset**. When you pass `tools`, the agentic loop unlocks more options — summarized here, each documented in full on [Tool calling](/docs/agents/tools):
+
+| Group | Options |
+| --- | --- |
+| Agent loop | `maxSteps`, `stopWhen`, `toolChoice`, `activeTools`, `prepareStep`, `maxToolConcurrency` |
+| Agent safety | `needsApproval` (per-tool), `approveToolCall`, `approvalResponses` |
+| Long context | `compaction` — automatic [layered compaction](/docs/core/compaction) |
+| Budget stops | `totalTokensExceed` / `costExceeds` in `stopWhen` |
+| Provider-native | `providerOptions`, `promptCaching` |
+| Hooks / deps | `deps`, `onUsage`, `onFinish` |
+
+> **`effort` mapping.** `xhigh` and `max` are canonical values; each adapter maps or clamps them to the closest provider-supported level. OpenAI clamps `max` → `xhigh`; Gemini maps both toward its high/native-budget setting; newer Anthropic models (Opus 4.7+, Sonnet 5, Fable 5) accept them directly on the `output_config` effort wire. See each [provider page](/docs/providers/anthropic) for the exact per-model behavior.
 
 ### Reading the full stream
 

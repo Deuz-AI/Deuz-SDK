@@ -1,0 +1,155 @@
+---
+title: Provider-Executed Tools
+description: Provider-native tools (Anthropic web search, OpenAI web search, Gemini Google Search) that run on the provider's own infrastructure and never touch your local execute.
+---
+
+A **provider-executed tool** runs on the provider's own infrastructure during the turn — the model decides to call it, the provider runs it server-side (a real web search, not a function you wrote), and the result streams back inside the same response. It is registered in `tools` exactly like any other tool, but the SDK never executes it locally, it never breaks the agentic loop as a client tool would, and its citations normalize into canonical `source` parts on `fullStream` — the same [canonical stream](/docs/agents/tool-loop#streaming-the-loop) every other part rides on.
+
+Three factories cover this today, exported from the package root and `/edge`:
+
+```ts
+import { anthropicWebSearch, openaiWebSearch, googleSearch } from '@deuz-sdk/core';
+```
+
+## Tool kinds
+
+Four shapes can live in the same `tools` map — pick per tool, mix freely:
+
+| Kind | Who runs it | Loop behavior | Example |
+| --- | --- | --- | --- |
+| Server function tool | The SDK, via your `execute` | Runs in-process, result feeds back automatically | `getWeather` (has `execute`) |
+| Client tool | Your UI, out of band | Loop stops early, hands the call back in `result.toolCalls` | `confirmPurchase` (no `execute`) |
+| Provider tool | The provider, server-side | Never local, never breaks the loop; results arrive as `source` parts | `anthropicWebSearch()`, `openaiWebSearch()`, `googleSearch()` |
+| Sub-agent tool | A nested `streamChat`/`generateText` loop | Runs a whole [tool loop](/docs/agents/tool-loop) one level down via `execute` | `agentTool({ ... })` — see [Sub-agents](/docs/agents/subagents) |
+
+See [Defining tools](/docs/agents/tools) for the first two, and [Client tools](/docs/agents/client-tools) for the round-trip a client tool requires.
+
+## The provider-tool shape
+
+A provider tool is a `Tool` with `type: 'provider'` and a `providerTool` field carrying the raw native definition for that provider's wire, verbatim:
+
+```ts
+interface Tool {
+  // ...
+  type?: 'function' | 'provider'; // default 'function'
+  providerTool?: Record<string, unknown>; // the raw native tool definition
+}
+```
+
+`parameters` is present but a placeholder (`{}`) — the provider's own native schema (embedded in `providerTool`) governs the call, so the SDK never validates or executes it locally. Each factory returns a ready-made `Tool`; register it under any key you like:
+
+```ts
+tools: {
+  web_search: anthropicWebSearch({ max_uses: 5 }),
+}
+```
+
+## Anthropic web search
+
+`anthropicWebSearch(config?: AnthropicWebSearchConfig)` runs on the Anthropic Messages wire (`/v1/messages`). Defaults to tool version `web_search_20260318`.
+
+```ts title="anthropic-web-search.ts"
+import { generateText, anthropicWebSearch } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const res = await generateText({
+  model: anthropic('claude-fable-5'),
+  messages: [{ role: 'user', content: 'What shipped in AI this week?' }],
+  tools: { web_search: anthropicWebSearch({ max_uses: 5 }) },
+});
+
+console.log(res.text);
+console.log(res.usage.serverToolUses); // billed searches this call ($10 / 1,000)
+```
+
+`AnthropicWebSearchConfig` fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `type` | `'web_search_20250305' \| 'web_search_20260209' \| 'web_search_20260318'` | Tool version. Default `'web_search_20260318'` (adds `response_inclusion`). |
+| `max_uses` | `number` | Caps searches per request — the API returns `max_uses_exceeded` beyond it. |
+| `allowed_domains` | `string[]` | Only include results from these domains. Mutually exclusive with `blocked_domains`. |
+| `blocked_domains` | `string[]` | Exclude results from these domains. |
+| `user_location` | `{ type: 'approximate'; city?; region?; country?; timezone? }` | Biases results geographically. |
+| `allowed_callers` | `string[]` | On `20260209+` this defaults to code-execution (dynamic filtering); models without programmatic tool calling need `['direct']` — the API 400s otherwise. |
+| `response_inclusion` | `'full' \| 'excluded'` | `20260318+` only: `'excluded'` drops consumed result blocks from the response. |
+
+## OpenAI web search
+
+`openaiWebSearch(config?: OpenAIWebSearchConfig)` is a **Responses-surface** hosted tool — build the model with `createOpenAIResponses`, not `createOpenAI`.
+
+```ts title="openai-web-search.ts"
+import { generateText, openaiWebSearch } from '@deuz-sdk/core';
+import { createOpenAIResponses } from '@deuz-sdk/core/openai';
+
+const responses = createOpenAIResponses({ apiKey: process.env.OPENAI_API_KEY! });
+
+const res = await generateText({
+  model: responses('gpt-5.4'),
+  messages: [{ role: 'user', content: 'Latest TypeScript release?' }],
+  tools: { web_search: openaiWebSearch({ search_context_size: 'low' }) },
+});
+
+console.log(res.text);
+console.log(res.usage.serverToolUses);
+```
+
+`OpenAIWebSearchConfig` fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `search_context_size` | `'low' \| 'medium' \| 'high'` | How much page content the search feeds back into context. |
+| `filters` | `{ allowed_domains?: string[]; blocked_domains?: string[] }` | Domain scoping. |
+| `user_location` | `Record<string, unknown>` | Passed through verbatim to the Responses `user_location` field. |
+| `return_token_budget` | `'default' \| 'unlimited'` | Longer research runs (2026 param). |
+
+The config also accepts arbitrary extra keys (`[key: string]: unknown`), passed through verbatim for fields the SDK hasn't modeled yet.
+
+## Gemini Google Search grounding
+
+`googleSearch()` takes no arguments and rides Gemini's **native** `generateContent` wire as `{ google_search: {} }` — build the model with `createGoogleNative`.
+
+```ts title="google-search.ts"
+import { generateText, googleSearch } from '@deuz-sdk/core';
+import { createGoogleNative } from '@deuz-sdk/core/google';
+
+const google = createGoogleNative({ apiKey: process.env.GEMINI_API_KEY! });
+
+const res = await generateText({
+  model: google('gemini-3.5-flash'),
+  messages: [{ role: 'user', content: 'What happened at I/O this year?' }],
+  tools: { google_search: googleSearch() },
+});
+
+console.log(res.text);
+```
+
+> **Wire-shape note:** `{ google_search: {} }` is the generateContent (native wire) shape this SDK targets. Google's newer *Interactions API* declares the same tool as `tools: [{ type: "google_search" }]` — a different surface the SDK does not call. Don't copy Interactions examples into `providerOptions.google`.
+
+## Dropped on Chat Completions
+
+Chat Completions has no concept of a hosted, provider-executed tool. Any `type: 'provider'` entry registered against a `chat_completions`-surface model (`createOpenAI`, xAI, or Gemini's OpenAI-compat `createGoogle`) is silently filtered out of the request — it is never sent and never errors. Use the native/Responses surface each factory targets (Anthropic Messages, OpenAI Responses, Gemini `generateContent`) to actually get provider-executed search.
+
+## Usage and citations
+
+Two canonical surfaces carry provider-tool activity, whichever factory you used:
+
+- **`usage.serverToolUses`** — billed provider-tool invocations, summed across every step of the [agentic loop](/docs/agents/tool-loop) (sub-agents included), same as every other `Usage` field.
+- **`source` parts on `fullStream`** — citations/grounding results stream back as canonical `SourcePart` (`{ type: 'source', id, url?, title? }`), not a provider-specific shape.
+
+```ts
+for await (const part of result.fullStream) {
+  if (part.type === 'source') console.log('cited', part.url ?? part.id);
+}
+```
+
+## See also
+
+- [Defining tools](/docs/agents/tools) — the `Tool` shape, schemas, `execute`, and client tools.
+- [The agentic tool loop](/docs/agents/tool-loop) — steps, `fullStream` parts, and the loop invariants provider tools never break.
+- [Sub-agents](/docs/agents/subagents) — `agentTool`, the fourth tool kind, for delegating to a nested loop.
+- [Anthropic](/docs/providers/anthropic) — `/v1/messages`, extended thinking, prompt caching.
+- [OpenAI](/docs/providers/openai) — Chat Completions vs. Responses, reasoning, embeddings.
+- [Google Gemini](/docs/providers/google) — native vs. OpenAI-compat wires, explicit caching, Files API.

@@ -101,12 +101,15 @@ console.log(result.usage.reasoningTokens);
 
 ### Reasoning effort
 
-The canonical `effort` option (`'none' | 'low' | 'medium' | 'high'`) is passed through to the Responses request as `reasoning: { effort }`, but only when the model is reasoning-capable and `effort` is not `'none'`:
+The canonical `effort` option is `'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'`. On the **Responses** surface it rides `reasoning: { effort }` for reasoning-capable models; `'max'` clamps to `'xhigh'`, and `'none'` omits the reasoning block entirely:
 
 | `effort` value | Responses request |
 | --- | --- |
 | `'none'` | `reasoning` omitted (no reasoning block sent). |
-| `'low'` / `'medium'` / `'high'` | `reasoning: { effort: <value> }`. |
+| `'low'` / `'medium'` / `'high'` / `'xhigh'` | `reasoning: { effort: <value> }`. |
+| `'max'` | clamped to `'xhigh'`. |
+
+On **Chat Completions** (GPT-5.4+ ships `reasoning_effort` there, so `gpt-5.5`/`gpt-5.5-pro` accept `effort` too), `'none'` is a real OpenAI value and is sent verbatim as `reasoning_effort: 'none'` — it is *not* omitted there. The two surfaces differ deliberately: Responses treats `'none'` as "no reasoning block", Chat Completions treats it as an explicit effort level.
 
 Reasoning models on the Responses surface have `samplingRestrictions` set, so `temperature` and `topP` are dropped for those models. `maxOutputTokens` maps to `max_output_tokens` (falling back to the model's registry `maxOutput`).
 
@@ -138,9 +141,12 @@ Since 1.2.0, when a Responses call includes tools on a reasoning model, the adap
 
 ```ts
 import { generateText, openaiWebSearch } from '@deuz-sdk/core';
+import { createOpenAIResponses } from '@deuz-sdk/core/openai';
+
+const responses = createOpenAIResponses({ apiKey: process.env.OPENAI_API_KEY! });
 
 const res = await generateText({
-  model: responses('gpt-5.4'),
+  model: responses('gpt-5.4'), // hosted web search is a Responses-surface tool
   messages: [{ role: 'user', content: 'latest TypeScript release?' }],
   tools: { web_search: openaiWebSearch({ search_context_size: 'low' }) },
 });

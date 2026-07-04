@@ -1,0 +1,61 @@
+---
+title: vs AI SDK 7
+description: An honest, capability-by-capability comparison of @deuz-sdk/core v1.4 and Vercel AI SDK 7 to help you choose.
+---
+
+Both `@deuz-sdk/core` and the Vercel AI SDK are serious, multi-provider TypeScript AI SDKs used to build chatbots and agents in production. They overlap heavily on the core surface — streaming text, structured output, tool calling — and diverge in a few deliberate, architectural ways. This page is an honest capability comparison, not a sales pitch: it's drawn from a verified, code-level benchmark of both SDKs (`docs/benchmark-ai-sdk.md` in this repo), comparing `@deuz-sdk/core` v1.4.0 against **AI SDK 7** (`ai@7.0.14`, GA 2026-06-25). Where AI SDK 7 is ahead, we say so plainly.
+
+## Capability comparison
+
+| Capability | `@deuz-sdk/core` v1.4 | AI SDK 7 | Notes |
+| --- | --- | --- | --- |
+| Provider-agnostic chat | First-class — 6 provider families (Anthropic, OpenAI, xAI, Google, Vertex, Yunwu) behind one canonical call | First-class — 24 first-party providers + ~30 community | AI SDK's provider roster is far larger; see [provider breadth](#where-ai-sdk-7-leads-today) below. |
+| Canonical stream owned by the SDK | First-class — every response normalizes to a `StreamPart` union before any consumer sees it, with a synchronous, never-throwing contract (`streamChat` returns immediately; failures surface as an `error` part) | First-class — `streamText` also normalizes provider SSE into its own delta stream, with an `onError` callback for failures | Both own their wire and never proxy raw provider bytes. The contracts differ: Deuz's is a strict sync-return/never-throw guarantee; AI SDK's is callback-based and somewhat looser. |
+| Agent loop shape | Free-function — `generateText`/`streamChat` gain an agentic loop the moment you pass `tools`, no agent object to construct | Class-based — `ToolLoopAgent` with `stopWhen`, `prepareStep`, `activeTools`, typed `runtimeContext`/`toolsContext`, lifecycle callbacks | Deuz keeps the loop a free function; AI SDK provides a dedicated agent class as its first-class abstraction. Both reach a similar end state. |
+| Sub-agent live stream forwarding | First-class — `agentTool` forwards a sub-agent's entire canonical stream into the parent's `fullStream` as `agentPath`-tagged `sub-agent` parts, at any nesting depth | AI SDK documents a subagent (agent-as-tool) pattern, but live-forwarding the sub-agent's internal stream into the parent isn't part of its documented subagent surface | See [Sub-agents](/docs/agents/subagents). |
+| Sub-agent tool approval | First-class in server mode — the parent's `approveToolCall` is inherited at every nesting depth, so a gated tool inside a sub-agent is decided by the same policy as the top-level loop | Not part of AI SDK's subagent tool surface — its own docs note that `toolApproval` doesn't compose with subagents today | Deuz's client-mode (`pendingApprovals`) approval inside a sub-agent is a known 1.4 limitation, planned for 1.5 alongside durable resume. |
+| Automatic layered compaction | First-class — `compaction: 'auto'` prunes tool results, then reasoning, then summarizes the oldest slice, triggered automatically at a context-fill threshold | AI SDK provides manual pruning via a `pruneMessages` helper inside `prepareStep`; automatic, threshold-triggered compaction isn't part of the core surface yet (server-side OpenAI compaction is an open AI SDK feature request) | See [Context compaction](/docs/core/compaction). |
+| Token/cost budget stop conditions | First-class — `totalTokensExceed(n)` / `costExceeds(usd)` are built-in `stopWhen` factories, OR-ed with `maxSteps` | AI SDK's `stopWhen` supports step-count and tool-call conditions; usage is tracked, but a built-in token- or cost-budget stop condition isn't documented | |
+| Per-step loop hooks (`prepareStep` / `activeTools`) | First-class — `CommonCallOptions.prepareStep` runs after compaction, every step; `activeTools` filters the wire-visible tool list | First-class — `ToolLoopAgent`'s `prepareStep`/`activeTools` are a core part of its design | Near parity in shape; Deuz composes it with automatic compaction, AI SDK composes it with its agent class. |
+| Durable / resumable execution | Planned for 1.5 — a `SessionStore` + checkpoint/resume design is drafted but not shipped in 1.4 | First-class — `WorkflowAgent` makes each tool call a durable step with automatic retry and `needsApproval` suspend/resume across restarts | **AI SDK advantage today.** It requires the Vercel Workflow DevKit runtime (`'use workflow'` directives, `stream()`-only, serializable context) — a real capability with a corresponding runtime dependency. |
+| Terminal UI | Not provided | First-class — `@ai-sdk/tui` | **AI SDK advantage.** |
+| Harness adapters | Not provided — Deuz aims to be an SDK a harness is built *on*, not a wrapper *around* existing harnesses | First-class — `HarnessAgent` wraps Claude Code / Codex / Pi-style harnesses | **AI SDK advantage** if you want to wrap an existing harness rather than build on the SDK directly. |
+| OpenTelemetry | A `tracer` seam exists in `Dependencies` for injecting your own tracer, but core spans aren't emitted yet in 1.4 | First-class — `@ai-sdk/otel` with GenAI semantic conventions, an `invoke_agent`/`chat`/`execute_tool` span hierarchy, and DevTools | **AI SDK advantage today.** |
+| Provider breadth | ~6 provider families, each with a pinned capability/quirk registry | 24 first-party + ~30 community providers (~48+), including speech vendors, plus a provider registry with string-based lookup | **AI SDK advantage.** |
+| UI framework breadth | React only (`useChat`/`useObject`) | React/Next, Vue/Nuxt, Svelte, Angular, Expo, TanStack Start | **AI SDK advantage.** |
+| Speech / transcription | Not provided | First-class — `generateSpeech`/`transcribe`, including experimental streaming STT | **AI SDK advantage.** |
+| Bundle size / zero deps | 0 runtime dependencies, ~2 MB installed, dual ESM+CJS, edge-safety enforced by lint | `zod` is a required peer, ESM-only (no CJS), typical install ~11–12 MB | **Deuz advantage.** |
+| Determinism / injected seams | Every ambient effect (clock, randomness, id generation, fetch, logging) flows through one injected `Dependencies` seam — golden-replay tests run with no real network | Time and randomness are ambient in some code paths | **Deuz advantage** for reproducible tests and audits. |
+| Cost tracking / pricing | Built-in — a token-to-USD pricing table plus `priceProvider`/`onUsage` seams in core | Cost tracking is pushed to the AI Gateway rather than the core SDK | **Deuz advantage** if you want cost visibility without adopting a gateway. |
+
+## Where Deuz-SDK leads today
+
+- **Free-function tool loop** — parallel tool execution, self-healing, and runaway guards without an agent class to construct.
+- **A provider-native canonical stream with a strict contract** — `streamChat` returns synchronously and never throws; failures are always an `error` part or a rejected promise.
+- **Sub-agent live stream forwarding and approval inheritance** — `agentTool`'s `sub-agent` parts and inherited `approveToolCall` compose in one loop body, at any depth.
+- **Automatic, layered context compaction** — prune-then-summarize, triggered by a context-fill threshold, with cache-stable history.
+- **Token and cost budget stop conditions** — `totalTokensExceed`/`costExceeds` built into `stopWhen`.
+- **Pure dependency injection** — clock, randomness, id generation, and fetch are all seamed, making agent behavior deterministic and replayable in tests.
+- **A zero-runtime-dependency, edge-safe-by-lint core** — dual ESM+CJS, runs anywhere `fetch` runs.
+
+## Where AI SDK 7 leads today
+
+- **`WorkflowAgent`** — durable, crash-resumable agent execution with automatic retry and suspend/resume, built on the Vercel Workflow DevKit runtime.
+- **`@ai-sdk/tui`** — a ready-made terminal UI for CLI agents.
+- **`HarnessAgent`** — wrappers for existing coding-agent harnesses (Claude Code, Codex, Pi-style tools).
+- **`@ai-sdk/otel`** — first-class OpenTelemetry export with GenAI semantic conventions and DevTools.
+- **Provider and UI-framework breadth** — far more first-party/community providers, and support for React, Vue, Svelte, Angular, and Expo, not just React.
+- **Speech and transcription** — `generateSpeech`/`transcribe` are built in, including experimental streaming STT.
+
+## Choosing
+
+Pick `@deuz-sdk/core` if you want a provider-native, deterministic, edge-safe foundation for agents or CLI tools where you want to own the loop, the stream, and the cost accounting directly, and you're comfortable with a narrower provider and UI-framework list today. Pick AI SDK 7 if you want the broadest provider and framework ecosystem, durable workflow execution out of the box, a terminal UI, or harness wrappers, and you're fine adopting its `zod` peer and (for `WorkflowAgent`) the Vercel Workflow DevKit runtime.
+
+Durable, checkpoint/resume execution is on the Deuz roadmap for **1.5** — a storage-seamed design (no required vendor runtime), not yet shipped. If durable execution is a hard requirement today, AI SDK 7's `WorkflowAgent` is the more mature option.
+
+## See also
+
+- [Sub-agents](/docs/agents/subagents) — `agentTool`, live stream forwarding, and approval inheritance.
+- [Context compaction](/docs/core/compaction) — the automatic, layered compaction policy.
+- [Tools](/docs/agents/tools) — `prepareStep`, `activeTools`, and budget stop conditions.
+- [Migrating from Vercel AI SDK](/docs/migration/from-vercel-ai-sdk) — API-level mapping between the two SDKs.

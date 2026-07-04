@@ -1,0 +1,246 @@
+---
+title: Build a Coding Agent
+description: An end-to-end, Codex/Claude-Code-style autonomous coding agent — an orchestrator that delegates to a coder sub-agent, with file/shell/test tools, budgets, and automatic compaction.
+---
+
+This cookbook wires together everything in the [agentic loop](/docs/agents/tool-loop), [tools](/docs/agents/tools), [sub-agents](/docs/agents/subagents), and [compaction](/docs/core/compaction) docs into one concrete build: an **orchestrator** model that plans and delegates real coding work to a **`coder` sub-agent**, which reads/writes files, applies patches, runs a test suite, and shells out — all under an approval gate, a token/cost budget, and automatic history compaction so the loop survives a long session.
+
+Nothing here is a new primitive. It's `agentTool` + `generateText`/`streamChat` + `stopWhen` + `compaction: 'auto'`, composed the way a real coding agent needs them.
+
+## 1. What we're building
+
+```
+orchestrator (generateText / streamChat)
+  └─ tools: { coder: agentTool(...) }
+       └─ coder sub-agent
+            └─ tools: { readFile, writeFile, applyPatch, runTests, runShellCommand }
+```
+
+The orchestrator talks to the user, breaks the task into sub-tasks, and hands each one to `coder` via the `coder` tool call. `coder` runs its own multi-step loop against the filesystem and shell, self-healing when a tool throws, and returns its final text back to the orchestrator as a normal `tool_result`. A shared `approveToolCall` policy gates every destructive call, at every depth, and `compaction: 'auto'` keeps the orchestrator's history bounded across a long multi-file session.
+
+## 2. The tools
+
+Five tools, defined the normal way — `parameters` + `execute`, no wrapper. `runShellCommand`, `writeFile`, and `applyPatch` are destructive, so each sets `needsApproval: true`.
+
+```ts title="coding-tools.ts"
+import { z } from 'zod';
+import type { ToolSet } from '@deuz-sdk/core';
+
+const codingTools: ToolSet = {
+  readFile: {
+    description: 'Read a UTF-8 text file from the workspace by relative path.',
+    parameters: z.object({ path: z.string() }),
+    execute: async ({ path }, ctx) => {
+      /* … resolve `path` inside the sandboxed workspace root, read it, return { path, content } … */
+    },
+  },
+
+  writeFile: {
+    description: 'Write (overwrite) a UTF-8 text file in the workspace.',
+    parameters: z.object({ path: z.string(), content: z.string() }),
+    needsApproval: true, // destructive
+    execute: async ({ path, content }, ctx) => {
+      /* … write inside the sandboxed workspace root only … */
+    },
+  },
+
+  applyPatch: {
+    description: 'Apply a unified diff to the workspace.',
+    parameters: z.object({ diff: z.string() }),
+    needsApproval: true, // destructive
+    execute: async ({ diff }, ctx) => {
+      /* … apply the diff inside the sandboxed workspace root, return { filesChanged } … */
+    },
+  },
+
+  runTests: {
+    description: 'Run the project test suite and return pass/fail plus captured output.',
+    parameters: z.object({ pattern: z.string().optional() }),
+    execute: async ({ pattern }, ctx) => {
+      /* … spawn the test runner with ctx.signal, capture stdout/stderr, cap size, return { passed, output } … */
+    },
+  },
+
+  runShellCommand: {
+    description: 'Run a shell command inside the workspace sandbox.',
+    parameters: z.object({ cmd: z.string(), cwd: z.string().optional() }),
+    needsApproval: true, // destructive
+    execute: async ({ cmd, cwd }, ctx) => {
+      /* … run against an allowlist, honor ctx.signal, capture stdout/stderr separately, cap output size … */
+    },
+  },
+};
+```
+
+`execute`'s second argument is the [`ToolExecuteContext`](/docs/agents/tools#the-execute-context) — `{ toolCallId, messages, signal }`. Every tool above should thread `ctx.signal` into whatever it spawns.
+
+## 3. Sandbox warning
+
+> **Approval is not sandboxing.** `needsApproval` gates *whether* a call runs against your own policy — it says nothing about *what the call can reach* once it's allowed. For `runShellCommand`, `writeFile`, `applyPatch`, and any other tool that touches the filesystem or a shell:
+>
+> - Run the tool inside an actual sandbox or a restricted workspace directory — never against the host filesystem or the process's own `cwd`.
+> - Enforce allow/deny lists on commands and paths; reject anything outside the workspace root (watch for `..` traversal).
+> - Pass `ctx.signal` into every long-running command so an orchestrator abort actually kills the child process.
+> - Capture stdout and stderr **separately** — don't interleave them into one blob you can't reason about.
+> - **Cap output size** before it goes back to the model as a `tool_result` — an unbounded `runTests` dump can blow the context window (and your bill) in one call.
+> - Never expose host secrets (env vars, credentials, tokens) or unrestricted filesystem access to a shell tool, even one gated by `needsApproval`.
+>
+> `needsApproval` and `approveToolCall` are a policy layer on *top of* a sandbox, not a replacement for one.
+
+## 4. The `coder` sub-agent
+
+Wrap the tools above as a `coder` [sub-agent](/docs/agents/subagents) via `agentTool`. Give it its own `maxSteps` — sub-agents are inherently multi-step, so budget more than the orchestrator's own default of `1`.
+
+```ts title="coder-agent.ts"
+import { agentTool } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const coderModel = anthropic('claude-opus-4-8');
+
+const coder = agentTool({
+  name: 'coder', // same string as the tools map key below
+  description:
+    'Writes and tests code changes in the workspace: reads/writes files, applies patches, runs the test suite, and runs shell commands.',
+  model: coderModel,
+  tools: codingTools,
+  system:
+    'You are a careful coding agent. Read before you write, run tests after every change, and keep diffs minimal.',
+  maxSteps: 20,
+});
+```
+
+## 5. The orchestrator call
+
+The orchestrator only knows about the `coder` tool — it never touches the filesystem directly. Everything else layers on as call options:
+
+- `approveToolCall` — a single server-mode policy that [inherits into `coder`](/docs/agents/subagents#approval-inheritance) at every depth, so `coder`'s `runShellCommand`/`writeFile`/`applyPatch` calls are gated by the exact same rule as the orchestrator's own calls.
+- `stopWhen: [totalTokensExceed(...), costExceeds(...)]` — a real spend budget, OR-ed with `maxSteps`. `costExceeds` needs `deps.priceProvider` to ever fire.
+- `compaction: 'auto'` — bounds the orchestrator's own history over a long multi-file session.
+- `onUsage` — a cost/token timeline, tagged by `meta.agentPath` so you can tell orchestrator usage from `coder` usage.
+
+```ts title="orchestrator.ts"
+import { generateText, totalTokensExceed, costExceeds, agentTool } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const orchestratorModel = anthropic('claude-opus-4-8');
+
+async function runCodingTask(task: string, controller: AbortController) {
+  const result = await generateText({
+    model: orchestratorModel,
+    messages: [{ role: 'user', content: task }],
+    system:
+      'You are an engineering orchestrator. Break the task into sub-tasks and delegate every file/shell/test action to the coder tool — you never touch the filesystem yourself.',
+    maxSteps: 30,
+    signal: controller.signal,
+    tools: { coder },
+    // Inherited into coder at every depth — see /docs/agents/subagents#approval-inheritance
+    approveToolCall: async (call) => policyAllows(call),
+    stopWhen: [totalTokensExceed(500_000), costExceeds(5.0)],
+    deps: { priceProvider: myPriceProvider }, // required for costExceeds to ever fire
+    compaction: 'auto',
+    onUsage: (usage, meta) => {
+      // meta.agentPath is ['coder'] for usage produced inside the sub-agent,
+      // undefined for the orchestrator's own steps.
+      logCostEvent({
+        agent: meta.agentPath?.join(' > ') ?? 'orchestrator',
+        model: meta.model,
+        totalTokens: usage.totalTokens,
+        at: Date.now(),
+      });
+    },
+  });
+
+  return result;
+}
+
+function policyAllows(call: { toolName: string; args: unknown }): boolean {
+  /* … your allow/deny policy, e.g. reject `rm -rf`, block paths outside the workspace … */
+  return true;
+}
+
+function logCostEvent(event: {
+  agent: string;
+  model: string;
+  totalTokens: number;
+  at: number;
+}) {
+  /* … append to a timeline you can render or export … */
+}
+```
+
+`result.usage.totalTokens` includes both the orchestrator's own steps and everything `coder` spent — budget stops see the same combined total, so `stopWhen` bounds the *whole* run, not just the orchestrator's half of it. `result.providerMetadata?.deuz.stoppedBy` tells you afterward whether `totalTokensExceed`/`costExceeds` (rather than the model) ended the run.
+
+### Streaming: rendering `coder`'s live output in a terminal
+
+Swap `generateText` for `streamChat` to watch `coder` work as it happens. Its entire canonical stream forwards into the orchestrator's `fullStream` as `sub-agent` parts tagged with `agentPath` — unwrap them to print a live, per-agent terminal view:
+
+```ts title="orchestrator-stream.ts"
+import { streamChat } from '@deuz-sdk/core';
+
+const result = streamChat({
+  model: orchestratorModel,
+  messages: [{ role: 'user', content: task }],
+  maxSteps: 30,
+  signal: controller.signal,
+  tools: { coder },
+  approveToolCall: async (call) => policyAllows(call),
+  stopWhen: [totalTokensExceed(500_000), costExceeds(5.0)],
+  deps: { priceProvider: myPriceProvider },
+  compaction: 'auto',
+});
+
+for await (const part of result.fullStream) {
+  if (part.type === 'sub-agent') {
+    const path = part.agentPath.join(' > '); // e.g. 'coder'
+    if (part.part.type === 'text-delta') {
+      process.stdout.write(`[${path}] ${part.part.text}`);
+    } else if (part.part.type === 'tool-call') {
+      console.log(`\n[${path}] calling ${part.part.toolName}`, part.part.input);
+    } else if (part.part.type === 'tool-result') {
+      console.log(`[${path}] result from ${part.part.toolName}`);
+    }
+    continue;
+  }
+  if (part.type === 'text-delta') {
+    process.stdout.write(part.text); // the orchestrator's own narration
+  } else if (part.type === 'compaction') {
+    console.log(`\n[orchestrator] compaction: ${part.layer} ${part.tokensBefore} → ${part.tokensAfter}`);
+  }
+}
+```
+
+## 6. Abort handling
+
+One `AbortController` covers the whole tree. Pass `signal: controller.signal` on the orchestrator's `generateText`/`streamChat` call — it propagates into every tool's `execute` (as `ctx.signal`) and into `coder`'s own nested loop [exactly the same way](/docs/agents/subagents#abort), all the way down. Calling `controller.abort()` tears down the orchestrator, `coder`, and any shell command that's honoring `ctx.signal`:
+
+```ts
+const controller = new AbortController();
+
+// e.g. wire this to a "Stop" button or a wall-clock timeout
+setTimeout(() => controller.abort(), 10 * 60_000);
+
+await runCodingTask('Fix the failing integration test in checkout.spec.ts', controller);
+```
+
+A user abort resolves the call with `finishReason: 'aborted'` and partial usage — it is not a thrown error.
+
+## 7. What is NOT durable yet
+
+If the process crashes mid-run — the orchestrator's Node process dies, the machine loses power — **the loop does not resume**. There is no checkpoint of in-flight steps; a crash loses whatever wasn't already captured in `result.response.messages` from a completed step. Durable checkpoint/resume across a process restart is planned for 1.5 and does not exist today.
+
+Until then:
+
+- Bound every run with `stopWhen` budgets and a sane `maxSteps` (as above) so a stuck loop fails cheap instead of running away.
+- Keep tools **idempotent** where you can — `applyPatch` and `writeFile` in particular should tolerate being re-applied to the same state, since a restarted run has no memory of exactly how far the last one got.
+- Persist your own task/sub-task bookkeeping outside the SDK if you need to resume a multi-hour job after a crash; the SDK gives you the loop, not a job queue.
+
+Do not build on the assumption that an in-flight tool-loop run survives a process restart.
+
+## See also
+
+- [Sub-agents](/docs/agents/subagents) — `agentTool`, `agentPath`, approval inheritance, and usage attribution in depth.
+- [Defining tools](/docs/agents/tools) — the full `Tool` shape, `needsApproval`, budget stop conditions.
+- [Context compaction](/docs/core/compaction) — the three-layer `compaction: 'auto'` policy this cookbook relies on for long runs.
+- [The agentic tool loop](/docs/agents/tool-loop) — the invariants (self-healing, immutable history, runaway guards) that both the orchestrator and `coder` run under.

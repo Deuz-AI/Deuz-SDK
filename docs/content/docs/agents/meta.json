@@ -1,4 +1,4 @@
 {
   "title": "Agents",
-  "pages": ["tools", "tool-loop", "client-tools", "subagents"]
+  "pages": ["tools", "tool-loop", "client-tools", "server-tools", "subagents"]
 }
