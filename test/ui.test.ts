@@ -196,6 +196,29 @@ describe('Deuz UI wire', () => {
     expect(compaction!.tokensBefore).toBeGreaterThan(compaction!.tokensAfter);
   });
 
+  it('recursively frames a sub-agent part through the wire', async () => {
+    // A raw canonical sub-agent part (as agentTool would emit) round-trips with
+    // its inner part re-framed, not dropped.
+    const canonical = [
+      'data: {"type":"start","messageId":"m"}\n\n',
+      'data: {"type":"sub-agent","agentPath":["researcher"],"part":{"type":"text-delta","text":"hi"}}\n\n',
+      'data: [DONE]\n\n',
+    ].join('');
+    const raw = new Response(new Blob([canonical]).stream(), {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+    const parts = [];
+    for await (const p of readDeuzStream(raw)) parts.push(p);
+    const sub = parts.find(
+      (p): p is Extract<typeof p, { type: 'sub-agent' }> => p.type === 'sub-agent',
+    );
+    expect(sub).toEqual({
+      type: 'sub-agent',
+      agentPath: ['researcher'],
+      part: { type: 'text-delta', text: 'hi' },
+    });
+  });
+
   it('toDeuzObjectStreamResponse emits start/object-delta/finish and [DONE]', async () => {
     async function* partials(): AsyncGenerator<{ city?: string }> {
       yield { city: 'Par' };

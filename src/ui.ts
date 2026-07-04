@@ -46,6 +46,8 @@ export type DeuzUIPart =
   | { type: 'object-delta'; object: unknown }
   /** Automatic compaction ran before a step (token counts are estimates). */
   | { type: 'compaction'; layer: string; tokensBefore: number; tokensAfter: number }
+  /** A sub-agent (`agentTool`) part, forwarded live with its path. */
+  | { type: 'sub-agent'; agentPath: string[]; part: DeuzUIPart }
   | { type: 'finish'; finishReason: FinishReason; usage: Usage }
   | { type: 'error'; message: string };
 
@@ -111,6 +113,11 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         tokensBefore: part.tokensBefore,
         tokensAfter: part.tokensAfter,
       };
+    case 'sub-agent': {
+      // Recursively frame the inner part; drop the wrapper if the inner drops.
+      const inner = toUIPart(part.part);
+      return inner ? { type: 'sub-agent', agentPath: part.agentPath, part: inner } : undefined;
+    }
     case 'step-start':
       return { type: 'step-start', step: part.stepIndex };
     case 'step-finish':
