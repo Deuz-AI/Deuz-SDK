@@ -11,9 +11,18 @@ npm install @deuz-sdk/core
 
 Requires **Node >= 22**. The chat core has nothing in `dependencies`. Optional peers are pulled in only if you use them: `zod` (or any Standard Schema library) plus `@standard-community/standard-json` for schema-typed [generateObject](/docs/core/generate-object); `@modelcontextprotocol/sdk` for [MCP](/docs/modules/mcp); `unpdf` / `mammoth` / `xlsx` for Node document parsing in [RAG](/docs/modules/rag).
 
+## Start by use case
+
+- **Build a chatbot** → [Quickstart](/docs/quickstart) + [UI streaming](/docs/modules/ui-streaming)
+- **Build a coding agent** → [Tools](/docs/agents/tools) + [Sub-agents](/docs/agents/subagents) + [Budget stops](/docs/agents/tool-loop)
+- **Build a long-running agent** → [Compaction](/docs/core/compaction) + [prepareStep](/docs/agents/tool-loop)
+- **Use provider-native search** → [Server tools](/docs/agents/tools)
+- **Add MCP** → [MCP guide](/docs/modules/mcp)
+- **Add memory/RAG** → [Memory](/docs/modules/memory) + [RAG](/docs/modules/rag)
+
 ## Why it exists
 
-Most AI SDKs read environment variables, reach for `Date.now()` / `Math.random()`, and proxy a provider's raw bytes straight to your client. That makes them impure (hard to test), bound to one runtime, and locked to whatever shape the upstream provider chose. `@deuz-sdk/core` inverts all of that.
+Many AI integrations become hard to test because runtime state, provider-specific stream shapes, and UI wires leak into app code. `@deuz-sdk/core` keeps those seams explicit: dependencies are injected, provider streams are normalized, and the UI wire is owned by the SDK.
 
 | Principle | What it means in practice |
 | --- | --- |
@@ -118,7 +127,7 @@ A provider factory returns a tiny `LanguageModel` descriptor; the [model registr
 
 ## Quality bar
 
-- **207 tests** across 26 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network)
+- **377 tests** across 38 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network)
 - `tsc` strict (`moduleResolution: "Bundler"`, `verbatimModuleSyntax`, `noUncheckedIndexedAccess`)
 - `eslint` with edge-safety enforced, `publint --strict`, and `attw` (Are The Types Wrong) all green
 - Dual **ESM + CJS** build with `.d.ts` for every subpath export

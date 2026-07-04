@@ -37,6 +37,16 @@ const usage = await result.usage;
 console.log('\n', usage.inputTokens, '->', usage.outputTokens);
 ```
 
+Full copy-paste setup, from an empty folder to a running stream:
+
+```bash title="terminal"
+npm init -y
+npm install @deuz-sdk/core
+npm install -D tsx typescript
+# paste the chat.ts above, then:
+ANTHROPIC_API_KEY=sk-ant-... npx tsx chat.ts
+```
+
 `messages` is a canonical `Message[]`. `content` is either a `string` (shorthand for a single text part) or a `Part[]` for multimodal input. The roles are `'system' | 'user' | 'assistant' | 'tool'`.
 
 ### Common call options
