@@ -134,7 +134,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       ];
       body.tool_choice = { type: 'function', name };
     }
-  } else if (tools) {
+  } else if (tools && tools.tools.length > 0) {
     body.tools = tools.tools.map((t) =>
       t.provider
         ? t.provider // hosted tool (web_search, …) — raw native definition, verbatim

@@ -74,3 +74,25 @@ expectTypeOf<ToolApprovalResponse>().toHaveProperty('approved');
 // --- 1.3.0 additive: Tool.outputSchema metadata (MCP structured output). ---
 import type { Tool } from '../src/index';
 expectTypeOf<Tool>().toHaveProperty('outputSchema');
+
+// --- 1.4.0 additive: loop hooks (prepareStep / activeTools / agentPath). ---
+import type { PrepareStepResult } from '../src/index';
+expectTypeOf<CommonCallOptions>().toHaveProperty('prepareStep');
+expectTypeOf<CommonCallOptions>().toHaveProperty('activeTools');
+expectTypeOf<CommonCallOptions>().toHaveProperty('agentPath');
+expectTypeOf<PrepareStepResult>().toHaveProperty('activeTools');
+expectTypeOf<PrepareStepResult>().toHaveProperty('model');
+
+// --- 1.4.0 additive: budget stop conditions + stoppedBy metadata. ---
+import { stepCountIs, totalTokensExceed, costExceeds } from '../src/index';
+expectTypeOf(stepCountIs).toBeFunction();
+expectTypeOf(totalTokensExceed).returns.toBeFunction();
+expectTypeOf(costExceeds).returns.toBeFunction();
+expectTypeOf<GenerateTextResult>().toHaveProperty('providerMetadata');
+
+// --- 1.4.0 additive: compaction option + StreamPart. ---
+import type { CompactionPolicy, CompactionOption } from '../src/index';
+expectTypeOf<CommonCallOptions>().toHaveProperty('compaction');
+expectTypeOf<CompactionPolicy>().toHaveProperty('threshold');
+expectTypeOf<CompactionOption>().toEqualTypeOf<'auto' | CompactionPolicy>();
+expectTypeOf<Extract<StreamPart, { type: 'compaction' }>>().toHaveProperty('layer');

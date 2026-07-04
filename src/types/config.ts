@@ -15,6 +15,46 @@ import type {
 export type ModelId = string;
 
 /**
+ * Per-step overrides returned by `prepareStep`. Every field is optional —
+ * omit (or return `undefined`) to keep the current settings. `messages`
+ * becomes the base history for this and all FOLLOWING steps; system-prompt
+ * edits go through it too (rewrite the system-role message) — there is no
+ * separate system field on this surface.
+ */
+export type CompactionLayer = 'prune-tool-results' | 'prune-reasoning' | 'summarize';
+
+/**
+ * Automatic layered context compaction policy for the agentic loop. Layers run
+ * cheapest-first when the estimated context fill crosses `threshold`; the
+ * summarize layer costs one extra model call. See `compaction` on
+ * {@link CommonCallOptions}.
+ */
+export interface CompactionPolicy {
+  /** Context-fill ratio (estimate/contextWindow) that triggers compaction. Default 0.92. */
+  threshold?: number;
+  /** Most-recent assistant turns that are untouchable. Default 4. */
+  keepRecentSteps?: number;
+  /** Layers to apply, in order. Default all three, cheapest first. */
+  layers?: CompactionLayer[];
+  /** Model used for the summarize layer. Default: the loop's own model. */
+  summarizeModel?: LanguageModel;
+}
+
+/** `'auto'` = all defaults. */
+export type CompactionOption = 'auto' | CompactionPolicy;
+
+export interface PrepareStepResult {
+  /** Becomes the base history for this and all following steps. */
+  messages?: Message[];
+  /** Restrict which tools are sent to the model THIS step (names of `tools` keys). */
+  activeTools?: string[];
+  /** Override the tool choice for THIS step only. */
+  toolChoice?: ToolChoice;
+  /** Swap the model for THIS step only (per-step routing; return it every step to persist). */
+  model?: LanguageModel;
+}
+
+/**
  * Options common to every call. `signal` and `maxRetries` are locked NOW —
  * adding them later would be breaking even in 0.x. Sampling params are locked
  * too (full surface); adapters translate them to each wire in Faz 1.B.
@@ -79,6 +119,41 @@ export interface CommonCallOptions {
   /** Max parallel tool executions per step. Default 5. */
   maxToolConcurrency?: number;
   onStepFinish?: (step: StepResult) => void;
+  /**
+   * Pre-step hook: runs before EVERY model call of the loop (after automatic
+   * compaction, so it sees — and has the last word on — the compacted
+   * history). Return per-step overrides or `undefined` to keep settings.
+   * A thrown error fails the call (it is caller code — never swallowed).
+   */
+  prepareStep?: (ctx: {
+    stepIndex: number;
+    messages: Message[];
+    /** Cumulative REAL usage so far (all prior steps, sub-agents included). */
+    usage: Usage;
+  }) => PrepareStepResult | undefined | Promise<PrepareStepResult | undefined>;
+  /**
+   * Static tool filter: only these `tools` keys are sent to the model (all
+   * steps). Unknown names log a warning and are ignored. `prepareStep`'s
+   * `activeTools` overrides this per step. Execution/validation of results
+   * for already-issued calls is never affected.
+   */
+  activeTools?: string[];
+  /**
+   * Advanced: the sub-agent path of this loop (set by `agentTool`, e.g.
+   * `['researcher']`). Flows into every tool's `ToolExecuteContext.agentPath`
+   * and usage metering. Root loops omit it.
+   */
+  agentPath?: string[];
+  /**
+   * Opt-in automatic context compaction for the agentic loop: `'auto'` for
+   * defaults (trigger at 92% fill; prune old tool results → prune old
+   * reasoning → summarize the oldest slice) or a {@link CompactionPolicy}.
+   * Pruning is free; summarize costs one extra model call (its usage counts
+   * toward the result and budget stops). History stays immutable — compaction
+   * builds new arrays and NEVER alters what `response.messages` returns.
+   * Off by default.
+   */
+  compaction?: CompactionOption;
   /**
    * Server-mode approval: awaited for every call whose tool triggers
    * `needsApproval`. Return false (or throw) to deny — the call becomes an

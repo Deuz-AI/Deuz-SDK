@@ -1,18 +1,30 @@
-import type { CommonCallOptions } from '../types/config';
+import type { CommonCallOptions, PrepareStepResult } from '../types/config';
 import type { Message, Part } from '../types/message';
 import type { Usage } from '../types/usage';
+import type { Logger, ResolvedDependencies } from '../types/deps';
 import type {
   Tool,
   ToolSet,
   ToolChoice,
   ToolCall,
   ToolResult,
+  ToolExecuteContext,
   StepResult,
   StopCondition,
 } from '../types/tool';
+import type { StreamPart } from '../types/stream';
 import type { WireTool, WireToolRequest } from '../adapters/types';
-import type { OneStep } from './run-step';
-import { stepCountIs } from './stop';
+import { runOneStep, type OneStep } from './run-step';
+import { stepCountIs, type NamedStopCondition } from './stop';
+import {
+  applyCompaction,
+  normalizeCompaction,
+  type ApplyCompactionCtx,
+  type NormalizedCompaction,
+  type CompactionEvent,
+} from './compaction';
+import { createTokenEstimator, type TokenEstimator } from '../internal/estimate-tokens';
+import { getCapabilities } from '../core/registry';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
 import { ToolExecutionError } from '../errors';
@@ -125,6 +137,174 @@ export async function buildWireTools(
   return { tools: wire, toolChoice, allowParallel: (maxConcurrency ?? 5) > 1 };
 }
 
+/**
+ * Restrict the wire tool list to `names`. Unknown names warn and are ignored;
+ * if NOTHING matches, fail OPEN (full list) — an empty tools array would
+ * silently cripple the step, which is worse than an over-wide one.
+ */
+export function filterWireTools(
+  wire: WireToolRequest,
+  names: string[] | undefined,
+  logger: Logger,
+): WireToolRequest {
+  if (!names) return wire;
+  const allowed = new Set(names);
+  const known = new Set(wire.tools.map((t) => t.name));
+  for (const n of names) {
+    if (!known.has(n)) logger.warn(`activeTools: unknown tool name '${n}' ignored`);
+  }
+  const tools = wire.tools.filter((t) => allowed.has(t.name));
+  if (tools.length === 0 && wire.tools.length > 0) {
+    logger.warn('activeTools: no known tool names matched — sending the full tool list');
+    return wire;
+  }
+  return { ...wire, tools };
+}
+
+/**
+ * Run the caller's `prepareStep` hook and resolve this step's effective
+ * options/messages/wire. A throw propagates — it is caller code, never
+ * swallowed. Per-step `activeTools` overrides the static filter (applies to
+ * the FULL tool set, not the statically filtered one); a returned `messages`
+ * array persists as the new base (the loop assigns it).
+ */
+export async function applyPrepareStep(
+  options: CommonCallOptions,
+  ctx: { stepIndex: number; messages: Message[]; usage: Usage },
+  fullWire: WireToolRequest,
+  staticWire: WireToolRequest,
+  logger: Logger,
+): Promise<{ options: CommonCallOptions; messages: Message[]; wire: WireToolRequest }> {
+  let stepOptions = options;
+  let messages = ctx.messages;
+  let wire = staticWire;
+  const ps: PrepareStepResult | undefined = options.prepareStep
+    ? await options.prepareStep(ctx)
+    : undefined;
+  if (ps) {
+    if (ps.messages) messages = ps.messages;
+    if (ps.model) stepOptions = { ...stepOptions, model: ps.model };
+    if (ps.activeTools) wire = filterWireTools(fullWire, ps.activeTools, logger);
+    if (ps.toolChoice) wire = { ...wire, toolChoice: ps.toolChoice };
+  }
+  return { options: stepOptions, messages, wire };
+}
+
+const SUMMARY_PROMPT =
+  'Summarize the conversation transcript above as concise notes: preserve key facts, decisions made, tool results that still matter, and any open task threads. Output only the summary.';
+
+/** Stringify without ever throwing (circular/BigInt). */
+function safeText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Flatten a slice of history into a plain-text transcript for the summarizer.
+ * The summarize side-call sends this as a SINGLE user message — never the raw
+ * turns, which could begin with an assistant role and 400 on Anthropic.
+ */
+function renderTranscript(messages: Message[]): string {
+  const lines: string[] = [];
+  for (const m of messages) {
+    const role = m.role.toUpperCase();
+    if (typeof m.content === 'string') {
+      lines.push(`${role}: ${m.content}`);
+      continue;
+    }
+    const parts: string[] = [];
+    for (const p of m.content) {
+      if (p.type === 'text') parts.push(p.text);
+      else if (p.type === 'reasoning') parts.push(`(thinking) ${p.text}`);
+      else if (p.type === 'tool_use') parts.push(`[calls ${p.name}(${safeText(p.input)})]`);
+      else if (p.type === 'tool_result') parts.push(`[tool result: ${safeText(p.result)}]`);
+      else if (p.type === 'image') parts.push('[image]');
+      else parts.push('[content]');
+    }
+    lines.push(`${role}: ${parts.join(' ')}`);
+  }
+  return lines.join('\n');
+}
+
+/** Per-loop compaction state: normalized policy + model context window + estimator. */
+export interface CompactionRunner {
+  policy: NormalizedCompaction;
+  contextWindow: number;
+  estimator: TokenEstimator;
+}
+
+/** Build a compaction runner when the caller opted in; otherwise undefined. */
+export function setupCompaction(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+): CompactionRunner | undefined {
+  if (!options.compaction) return undefined;
+  return {
+    policy: normalizeCompaction(options.compaction),
+    contextWindow: getCapabilities(options.model, deps.logger).contextWindow,
+    estimator: createTokenEstimator(),
+  };
+}
+
+/**
+ * Run compaction before a model step. `addUsage` folds the summarize call's
+ * usage into the loop total (so it counts toward budget stops); `onEvent`
+ * surfaces each layer (stream part / log line). Returns the (possibly
+ * compacted) history — same reference when nothing triggered.
+ */
+export async function runCompaction(
+  runner: CompactionRunner,
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  messages: Message[],
+  addUsage: (u: Usage) => void,
+  onEvent: (e: CompactionEvent) => void,
+): Promise<Message[]> {
+  const ctx: ApplyCompactionCtx = {
+    estimate: (m) => runner.estimator.estimate(m),
+    contextWindow: runner.contextWindow,
+    summarize: async (slice) => {
+      // Single-turn, tool-free, compaction-free side call — never recurses.
+      // The slice is rendered to a transcript inside ONE user message so the
+      // request is user-first (valid on every wire, incl. Anthropic).
+      const step = await runOneStep({
+        ...options,
+        model: runner.policy.summarizeModel ?? options.model,
+        messages: [{ role: 'user', content: `${renderTranscript(slice)}\n\n${SUMMARY_PROMPT}` }],
+        tools: undefined,
+        toolChoice: undefined,
+        maxSteps: undefined,
+        stopWhen: undefined,
+        compaction: undefined,
+        prepareStep: undefined,
+        activeTools: undefined,
+        onStepFinish: undefined,
+        approveToolCall: undefined,
+        approvalResponses: undefined,
+      });
+      addUsage(step.usage);
+      return step.text;
+    },
+    onSkip: (layer, reason) => deps.logger.warn(`compaction: ${layer} skipped — ${reason}`),
+  };
+  const { messages: compacted, events } = await applyCompaction(messages, runner.policy, ctx);
+  for (const e of events) onEvent(e);
+  return compacted;
+}
+
+/** Calibrate the runner's estimator against a step's real input-token usage. */
+export function calibrateCompaction(
+  runner: CompactionRunner | undefined,
+  estimatedAtCall: number,
+  usage: Usage,
+): void {
+  if (runner) runner.estimator.calibrate(usage.inputTokens, estimatedAtCall);
+}
+
 export function toToolResultPart(r: ToolResult): Part {
   return { type: 'tool_result', toolUseId: r.toolCallId, result: r.result, isError: r.isError };
 }
@@ -228,6 +408,17 @@ export async function settlePendingApprovals(
 }
 
 /**
+ * Extra per-step wiring for `execute`'s context: the sub-agent seam. `deps` and
+ * `reportUsage` let an `agentTool` reuse the parent transport and fold its usage
+ * into the loop total; `emitPart` (streaming parent only) forwards its stream.
+ */
+export interface ExecuteExtras {
+  deps?: ResolvedDependencies;
+  emitPart?: (part: StreamPart) => void;
+  reportUsage?: (usage: Usage) => void;
+}
+
+/**
  * Execute the step's tool calls in parallel (capped); errors self-heal as
  * is_error results. Calls listed in `denied` short-circuit to an is_error
  * denial BEFORE validation (a denied call must not leak a validation message).
@@ -238,6 +429,7 @@ export async function executeTools(
   options: CommonCallOptions,
   messages: Message[],
   denied?: Map<string, string | undefined>,
+  extras?: ExecuteExtras,
 ): Promise<ToolResult[]> {
   const cap = options.maxToolConcurrency ?? 5;
   return mapWithConcurrency(toolCalls, cap, async (call): Promise<ToolResult> => {
@@ -269,14 +461,27 @@ export async function executeTools(
       };
     }
     try {
-      const out = await tool.execute(validation.value, {
+      const ctx: ToolExecuteContext = {
         toolCallId: call.toolCallId,
         messages,
         signal: options.signal,
-      });
+        ...(options.agentPath ? { agentPath: options.agentPath } : {}),
+        ...(options.approveToolCall ? { approveToolCall: options.approveToolCall } : {}),
+        ...(extras?.deps ? { deps: extras.deps } : {}),
+        ...(extras?.emitPart ? { emitPart: extras.emitPart } : {}),
+        ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
+      };
+      const out = await tool.execute(validation.value, ctx);
       return { toolCallId: call.toolCallId, toolName: call.toolName, result: out };
     } catch (cause) {
-      const err = new ToolExecutionError(call.toolName, { toolCallId: call.toolCallId, cause });
+      // Surface the thrown message to the model (self-heal feedback): a tool
+      // that throws `new Error('File not found')` should tell the model that,
+      // not an opaque "threw during execution".
+      const err = new ToolExecutionError(call.toolName, {
+        toolCallId: call.toolCallId,
+        cause,
+        ...(cause instanceof Error && cause.message ? { message: cause.message } : {}),
+      });
       return {
         toolCallId: call.toolCallId,
         toolName: call.toolName,
@@ -306,18 +511,31 @@ export function normalizeStop(
   stopWhen: CommonCallOptions['stopWhen'],
   maxSteps: number,
 ): StopCondition[] {
-  const conditions: StopCondition[] = [stepCountIs(maxSteps)];
+  // The maxSteps bound is the loop's own guard — flagged so it never surfaces
+  // as a `stoppedBy` marker (that would change every bounded run's output).
+  const implicit = Object.assign(stepCountIs(maxSteps), { implicitMaxSteps: true });
+  const conditions: StopCondition[] = [implicit];
   if (stopWhen) conditions.push(...(Array.isArray(stopWhen) ? stopWhen : [stopWhen]));
   return conditions;
+}
+
+/** True when any condition carries `requiresCost` (→ compute costUSD per step). */
+export function needsCost(conditions: StopCondition[]): boolean {
+  return conditions.some((c) => (c as NamedStopCondition).requiresCost === true);
 }
 
 export async function shouldStop(
   conditions: StopCondition[],
   steps: StepResult[],
-): Promise<boolean> {
-  const info = { steps, stepCount: steps.length };
+  extras?: { usage?: Usage; costUSD?: number },
+): Promise<{ stop: boolean; stoppedBy?: string }> {
+  const info = { steps, stepCount: steps.length, ...extras };
   for (const c of conditions) {
-    if (await c(info)) return true;
+    if (await c(info)) {
+      const meta = c as NamedStopCondition;
+      if (meta.implicitMaxSteps) return { stop: true };
+      return { stop: true, stoppedBy: meta.conditionName ?? 'custom' };
+    }
   }
-  return false;
+  return { stop: false };
 }

@@ -176,7 +176,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       ];
       body.tool_choice = { type: 'function', function: { name } };
     }
-  } else if (tools) {
+  } else if (tools && tools.tools.length > 0) {
     // Chat Completions has no hosted tools — provider-executed entries are dropped.
     body.tools = tools.tools
       .filter((t) => !t.provider)

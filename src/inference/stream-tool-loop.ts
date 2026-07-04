@@ -11,12 +11,18 @@ import { assembleAssistant, type ToolArgMap, type EncryptedReasoning } from './r
 import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
 import {
   buildWireTools,
+  filterWireTools,
+  applyPrepareStep,
+  setupCompaction,
+  runCompaction,
+  calibrateCompaction,
   executeTools,
   toToolResultPart,
   toStepResult,
   hasClientTool,
   bumpErrorGuard,
   normalizeStop,
+  needsCost,
   shouldStop,
   sumUsage,
   findApprovalNeeded,
@@ -57,13 +63,20 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
     let messages: Message[] = [...options.messages];
     const steps: StepResult[] = [];
     const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
+    const wantCost = needsCost(stopConditions);
+    if (wantCost && !deps.priceProvider) {
+      deps.logger.warn('costExceeds: no deps.priceProvider injected — the condition never fires');
+    }
     const errorCounters = new Map<string, number>();
+    const compactionRunner = setupCompaction(options, deps);
     let totalUsage: Usage = EMPTY_USAGE;
     let lastFinish: FinishReason = 'stop';
+    let stoppedBy: string | undefined;
     let stepIndex = 0;
 
     try {
-      const wireTools = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+      const fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+      const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
 
       // Resume: settle the previous break's pending approvals BEFORE step 1 —
       // their tool-result parts precede the first step-start.
@@ -87,7 +100,36 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
 
       for (;;) {
         broadcaster.push({ type: 'step-start', stepIndex });
-        const inner = runStream({ ...options, messages }, { tools: wireTools });
+        // Compaction first — its parts precede the step's deltas; prepareStep
+        // then sees the compacted history.
+        if (compactionRunner) {
+          messages = await runCompaction(
+            compactionRunner,
+            options,
+            deps,
+            messages,
+            (u) => {
+              totalUsage = sumUsage(totalUsage, u);
+            },
+            (e) =>
+              broadcaster.push({
+                type: 'compaction',
+                layer: e.layer,
+                tokensBefore: e.tokensBefore,
+                tokensAfter: e.tokensAfter,
+              }),
+          );
+        }
+        const prepared = await applyPrepareStep(
+          options,
+          { stepIndex, messages, usage: totalUsage },
+          fullWire,
+          staticWire,
+          deps.logger,
+        );
+        messages = prepared.messages;
+        const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
+        const inner = runStream({ ...prepared.options, messages }, { tools: prepared.wire });
 
         let text = '';
         let reasoningText = '';
@@ -148,6 +190,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         }
 
         totalUsage = sumUsage(totalUsage, stepUsage);
+        calibrateCompaction(compactionRunner, estimatedAtCall, stepUsage);
         lastFinish = stepFinish;
         broadcaster.push({
           type: 'step-finish',
@@ -242,7 +285,16 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
           break;
         }
 
-        const toolResults = await executeTools(toolCalls, tools, options, messages, denied);
+        const toolResults = await executeTools(toolCalls, tools, options, messages, denied, {
+          // Effective onUsage (call-level wins, G10) so a sub-agent's usage
+          // reaches the same callback the caller set.
+          deps: { ...deps, onUsage: options.onUsage ?? deps.onUsage },
+          reportUsage: (u) => {
+            totalUsage = sumUsage(totalUsage, u);
+          },
+          // Live sink: an agentTool forwards its stream, already wrapped as sub-agent parts.
+          emitPart: (part) => broadcaster.push(part),
+        });
         for (const r of toolResults) {
           broadcaster.push({
             type: 'tool-result',
@@ -270,12 +322,26 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
           )
         )
           break;
-        if (await shouldStop(stopConditions, steps)) break;
+        const costUSD =
+          wantCost && deps.priceProvider
+            ? ((await deps.priceProvider.priceUsage(options.model.modelId, totalUsage)) ??
+              undefined)
+            : undefined;
+        const stop = await shouldStop(stopConditions, steps, { usage: totalUsage, costUSD });
+        if (stop.stop) {
+          stoppedBy = stop.stoppedBy;
+          break;
+        }
         stepIndex++;
       }
 
       const usage = withTotal(totalUsage);
-      broadcaster.push({ type: 'finish', usage, finishReason: lastFinish });
+      broadcaster.push({
+        type: 'finish',
+        usage,
+        finishReason: lastFinish,
+        ...(stoppedBy ? { providerMetadata: { deuz: { stoppedBy } } } : {}),
+      });
       usageDeferred.resolve(usage);
       finishDeferred.resolve(lastFinish);
       fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });

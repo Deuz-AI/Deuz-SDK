@@ -8,7 +8,7 @@
 
 _One canonical wire. Zero runtime dependencies. Runs anywhere `fetch` runs._
 
-<sub>Chat · Tools · Vision · Reasoning · Embeddings · Memory · RAG · Skills · Image generation · MCP · UI streaming</sub>
+<sub>Chat · Tools · Sub-agents · Vision · Reasoning · Embeddings · Memory · RAG · Skills · Image generation · MCP · UI streaming</sub>
 
 </div>
 
@@ -16,7 +16,7 @@ _One canonical wire. Zero runtime dependencies. Runs anywhere `fetch` runs._
 
 `@deuz-sdk/core` is a from-scratch, **independent** AI SDK built for the **Deuz** platform and shared with everyone. It depends on no other AI SDK and ships its own streaming + UI protocol. It is **pure**: no Supabase, no credit logic, no env reading. Everything stateful — HTTP, clock, logging, metering, circuit-breaker, API keys, memory, vector stores — is injected through a single `Dependencies` seam, so the exact same core runs unchanged on **Node, Deno, Bun, Vercel/Cloudflare Edge**.
 
-> **Status — published (v1.3.0).** [`@deuz-sdk/core`](https://www.npmjs.com/package/@deuz-sdk/core) is live on npm. Chat across all four wires + Vertex, the agentic tool loop, vision, MCP, the UI wire, native Gemini, embeddings, memory, RAG, skills, image generation, middleware, pricing, hybrid RAG search, and Gemini explicit caching are all implemented and tested (**309 tests green**; `tsc` + `eslint` + `publint --strict` + `attw` + dual ESM/CJS/d.ts build all clean). v1.3.0 ships the **tool-approval flow** (`needsApproval` live: inline `approveToolCall` or a client round-trip via `tool-approval-request` parts + `approvalResponses`), **`streamObject`** (streaming structured output with a zero-dep tolerant partial-JSON parser), **MCP extensions** (resources, prompts, form+URL elicitation, `structuredContent`), and **React hooks** — `useChat` with automatic client-tool round-trips and approval pauses, plus `useObject` over the new `object-delta` wire part (React is an optional peer). v1.2.0 added provider-executed web search on three wires, `providerOptions`, one-flag Anthropic prompt caching, and correct Responses API stateless round-trips; v1.1.1 refreshed the model catalog to the 2026-07 state (Claude 5, GPT-5.4/5.5, Gemini 3.1, pricing tiers). See the [Roadmap](#roadmap) for what's next.
+> **Status — published (v1.3.0).** [`@deuz-sdk/core`](https://www.npmjs.com/package/@deuz-sdk/core) is live on npm. Chat across all four wires + Vertex, the agentic tool loop, vision, MCP, the UI wire, native Gemini, embeddings, memory, RAG, skills, image generation, middleware, pricing, hybrid RAG search, and Gemini explicit caching are all implemented and tested (**377 tests green**; `tsc` + `eslint` + `publint --strict` + `attw` + dual ESM/CJS/d.ts build all clean). v1.4.0 adds **sub-agents** (`agentTool` — a nested agentic loop as a callable `Tool`, with its whole canonical stream forwarded live into the parent as `sub-agent` parts and the parent's tool-approval policy inherited to every nesting depth — AI SDK's subagents can do neither), **automatic layered context compaction** (opt-in `compaction: 'auto'` — prune old tool results, prune old reasoning, summarize the oldest slice, cache-safe and never-throws, vs. AI SDK's fully-manual `prepareStep` pruning), **token/cost budget stop conditions** (`totalTokensExceed` / `costExceeds`, OR-ed into `stopWhen`, reported back via `providerMetadata.deuz.stoppedBy`), and **per-step loop hooks** (`prepareStep` + `activeTools` — swap the model, restrict tools, or rewrite history mid-loop, on the free functions). v1.3.0 ships the **tool-approval flow** (`needsApproval` live: inline `approveToolCall` or a client round-trip via `tool-approval-request` parts + `approvalResponses`), **`streamObject`** (streaming structured output with a zero-dep tolerant partial-JSON parser), **MCP extensions** (resources, prompts, form+URL elicitation, `structuredContent`), and **React hooks** — `useChat` with automatic client-tool round-trips and approval pauses, plus `useObject` over the new `object-delta` wire part (React is an optional peer). v1.2.0 added provider-executed web search on three wires, `providerOptions`, one-flag Anthropic prompt caching, and correct Responses API stateless round-trips; v1.1.1 refreshed the model catalog to the 2026-07 state (Claude 5, GPT-5.4/5.5, Gemini 3.1, pricing tiers). See the [Roadmap](#roadmap) for what's next.
 
 ```bash
 npm install @deuz-sdk/core
@@ -24,7 +24,7 @@ npm install @deuz-sdk/core
 
 Requires **Node ≥ 22**. **Zero runtime dependencies.** Optional peers, pulled in only if you use them: `zod` (or any Standard Schema lib) + `@standard-community/standard-json` for schema-typed `generateObject`; `@modelcontextprotocol/sdk` for MCP; `unpdf` / `mammoth` / `xlsx` for `@deuz-sdk/core/rag/node` document parsing.
 
-📚 **Documentation** — the full docs site lives in [`docs/`](./docs) (Fumadocs; 32 pages covering every module, with `llms.txt` / `llms-full.txt` for AI agents). 🤖 **Claude Code skill** — [`skills/deuz-sdk/`](./skills/deuz-sdk) teaches AI coding agents to integrate the SDK correctly.
+📚 **Documentation** — the full docs site lives in [`docs/`](./docs) (Fumadocs; 34 pages covering every module, with `llms.txt` / `llms-full.txt` for AI agents). 🤖 **Claude Code skill** — [`skills/deuz-sdk/`](./skills/deuz-sdk) teaches AI coding agents to integrate the SDK correctly.
 
 ---
 
@@ -113,7 +113,29 @@ const { text, steps } = await generateText({
 });
 ```
 
-Parallel execution, self-healing on tool errors, immutable history (cache-safe), and runaway guards are built in. **Tool approval** is wired end-to-end: gate a tool with `needsApproval`, then either decide inline (`approveToolCall`) or let the loop break with `pendingApprovals` / `tool-approval-request` parts and resume via `approvalResponses`.
+Parallel execution, self-healing on tool errors, immutable history (cache-safe), and runaway guards are built in. **Tool approval** is wired end-to-end: gate a tool with `needsApproval`, then either decide inline (`approveToolCall`) or let the loop break with `pendingApprovals` / `tool-approval-request` parts and resume via `approvalResponses`. **Loop hooks** — `prepareStep` (per-step model/tools/history rewrite) and `activeTools` (static per-call tool filter) — give fine-grained control over long loops; **budget stop conditions** — `totalTokensExceed`, `costExceeds` — bound the loop by real spend, OR-ed into `stopWhen` alongside `stepCountIs`/`hasToolCall`; and opt-in **`compaction: 'auto'`** automatically prunes old tool results/reasoning and summarizes the oldest history once context fills up, immutable- and cache-safe.
+
+### Sub-agents (`agentTool`)
+
+```ts
+import { agentTool, generateText } from '@deuz-sdk/core';
+
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Research the latest release notes and summarize them.' }],
+  maxSteps: 5,
+  tools: {
+    researcher: agentTool({
+      name: 'researcher', // same string as the tools-map key
+      description: 'Delegate research tasks to a focused sub-agent.',
+      model: anthropic('claude-haiku-5'),
+      tools: { webSearch /* … */ },
+    }),
+  },
+});
+```
+
+A sub-agent is a nested agentic loop wrapped as an ordinary `Tool` — no new runtime. When the parent streams, the sub-agent's **entire canonical stream forwards live** into the parent's `fullStream` as `agentPath`-tagged `sub-agent` parts (not a black-box delegate that only returns final text), and the parent's server-mode `approveToolCall` is **inherited to every nesting depth**, so a sub-agent's own tool calls stay gated — AI SDK's documented subagent pattern can do neither. `maxDepth` guards against runaway nesting, usage folds into the parent total, and abort propagates down.
 
 ### Embeddings
 
@@ -321,7 +343,7 @@ Response: upstream SSE  →  robust parser  →  CANONICAL DELTA STREAM
 
 ## Quality bar
 
-- **309 tests** (vitest golden-replay fixtures + deterministic mock models — no real network)
+- **377 tests** (vitest golden-replay fixtures + deterministic mock models — no real network)
 - `tsc` strict · `eslint` (edge-safety enforced) · `publint --strict` · `attw` · dual **ESM + CJS + .d.ts** build — all green
 - Type-contract lock: `test/surface.test-d.ts` pins the public 1.0 surface
 - ~10k lines across 70 source modules, zero runtime dependencies

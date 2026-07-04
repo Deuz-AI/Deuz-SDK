@@ -35,13 +35,15 @@ Open discriminated union — keep a `default` case (variants are additive).
 | { type: 'reasoning-delta'; text; signature? }
 | { type: 'tool-call-delta'; id; name?; argsTextDelta; providerMetadata? }  // accumulate argsTextDelta as a string
 | { type: 'source'; id; url?; title? }
-| { type: 'finish'; usage; finishReason }
+| { type: 'finish'; usage; finishReason; providerMetadata? }          // providerMetadata.deuz.stoppedBy on a budget stop (1.4.0+)
 | { type: 'error'; error: unknown }
 | { type: 'step-start'; stepIndex }                                   // agentic loop
 | { type: 'step-finish'; stepIndex; finishReason; usage }
 | { type: 'tool-call'; toolCallId; toolName; input }                  // final parsed call
 | { type: 'tool-result'; toolCallId; toolName; output; isError? }
 | { type: 'tool-approval-request'; approvalId; toolCallId; toolName; input } // 1.3.0+: gated call awaits verdict
+| { type: 'compaction'; layer; tokensBefore; tokensAfter }            // 1.4.0+: automatic compaction ran before this step
+| { type: 'sub-agent'; agentPath: string[]; part: StreamPart }        // 1.4.0+: agentTool forwarding a nested loop's own StreamPart live (single-wrapped, not nested)
 ```
 
 ## Deuz UI wire — `@deuz-sdk/core/ui`
@@ -58,7 +60,7 @@ function toDeuzStreamResponse(result: StreamChatResult, options?: {
 async function* readDeuzStream(response: Response): AsyncGenerator<DeuzUIPart>
 ```
 
-`DeuzUIPart` mirrors `StreamPart` UI-framed: `start` (messageId), `text-delta`, `reasoning-delta`, `tool-input-delta` (`{ toolCallId, toolName?, delta }`), `tool-call`, `tool-result`, `tool-approval-request` (1.3.0+), `object-delta` (1.3.0+, from `toDeuzObjectStreamResponse` — each REPLACES the previous partial), `source`, `step-start`/`step-finish`, `finish`, `error` (`{ message }`, already secret-redacted). `tool-approval-response` is declared client→server only — the verdict rides the NEXT request body as `approvalResponses`, it is never serialized by the server.
+`DeuzUIPart` mirrors `StreamPart` UI-framed: `start` (messageId), `text-delta`, `reasoning-delta`, `tool-input-delta` (`{ toolCallId, toolName?, delta }`), `tool-call`, `tool-result`, `tool-approval-request` (1.3.0+), `object-delta` (1.3.0+, from `toDeuzObjectStreamResponse` — each REPLACES the previous partial), `source`, `step-start`/`step-finish`, `finish`, `error` (`{ message }`, already secret-redacted), `compaction` (1.4.0+, `{ layer, tokensBefore, tokensAfter }`), `sub-agent` (1.4.0+, `{ agentPath, part }` — `part` is the nested loop's own `DeuzUIPart`, wrapped the same one level regardless of depth). `tool-approval-response` is declared client→server only — the verdict rides the NEXT request body as `approvalResponses`, it is never serialized by the server.
 
 ## React hooks — `@deuz-sdk/core/react` (1.3.0+)
 

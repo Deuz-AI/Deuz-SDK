@@ -172,6 +172,65 @@ describe('Deuz UI wire', () => {
     ]);
   });
 
+  it('serializes a compaction part through the wire (explicit case, not dropped)', async () => {
+    const { fetch } = mockFetch(() => sseResponse([FINAL]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'task' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'r '.repeat(50) },
+            { type: 'text', text: 'a' },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'r '.repeat(50) },
+            { type: 'text', text: 'b' },
+          ],
+        },
+        { role: 'user', content: 'go' },
+      ],
+      tools: { getWeather: { parameters: SCHEMA, execute: vi.fn(async () => ({ temp: 1 })) } },
+      compaction: { threshold: 0, keepRecentSteps: 1, layers: ['prune-reasoning'] },
+    });
+    const response = toDeuzStreamResponse(result);
+    const parts = [];
+    for await (const p of readDeuzStream(response)) parts.push(p);
+    const compaction = parts.find(
+      (p): p is Extract<typeof p, { type: 'compaction' }> => p.type === 'compaction',
+    );
+    expect(compaction).toMatchObject({ type: 'compaction', layer: 'prune-reasoning' });
+    expect(compaction!.tokensBefore).toBeGreaterThan(compaction!.tokensAfter);
+  });
+
+  it('recursively frames a sub-agent part through the wire', async () => {
+    // A raw canonical sub-agent part (as agentTool would emit) round-trips with
+    // its inner part re-framed, not dropped.
+    const canonical = [
+      'data: {"type":"start","messageId":"m"}\n\n',
+      'data: {"type":"sub-agent","agentPath":["researcher"],"part":{"type":"text-delta","text":"hi"}}\n\n',
+      'data: [DONE]\n\n',
+    ].join('');
+    const raw = new Response(new Blob([canonical]).stream(), {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+    const parts = [];
+    for await (const p of readDeuzStream(raw)) parts.push(p);
+    const sub = parts.find(
+      (p): p is Extract<typeof p, { type: 'sub-agent' }> => p.type === 'sub-agent',
+    );
+    expect(sub).toEqual({
+      type: 'sub-agent',
+      agentPath: ['researcher'],
+      part: { type: 'text-delta', text: 'hi' },
+    });
+  });
+
   it('toDeuzObjectStreamResponse emits start/object-delta/finish and [DONE]', async () => {
     async function* partials(): AsyncGenerator<{ city?: string }> {
       yield { city: 'Par' };

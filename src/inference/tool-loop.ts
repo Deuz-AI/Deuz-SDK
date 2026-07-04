@@ -5,14 +5,21 @@ import type { Usage } from '../types/usage';
 import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
 import { runOneStep, type OneStep } from './run-step';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
+import { resolveDependencies } from '../internal/resolve-deps';
 import {
   buildWireTools,
+  filterWireTools,
+  applyPrepareStep,
+  setupCompaction,
+  runCompaction,
+  calibrateCompaction,
   executeTools,
   toToolResultPart,
   toStepResult,
   hasClientTool,
   bumpErrorGuard,
   normalizeStop,
+  needsCost,
   shouldStop,
   sumUsage,
   findApprovalNeeded,
@@ -28,22 +35,33 @@ import {
  */
 export async function runToolLoop(options: CommonCallOptions): Promise<GenerateTextResult> {
   const tools = options.tools!;
-  const wireTools = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
-  const baseLength = options.messages.length;
+  const deps = resolveDependencies(options.deps);
+  const fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+  const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
   let messages: Message[] = [...options.messages];
+  // Messages this call appends — returned as response.messages. Tracked as a
+  // list (not a base-length slice) so prepareStep/compaction history rewrites
+  // can never skew what the caller receives.
+  const appended: Message[] = [];
   const steps: StepResult[] = [];
   const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
+  const wantCost = needsCost(stopConditions);
+  if (wantCost && !deps.priceProvider) {
+    deps.logger.warn('costExceeds: no deps.priceProvider injected — the condition never fires');
+  }
   const errorCounters = new Map<string, number>();
+  const compactionRunner = setupCompaction(options, deps);
   let totalUsage: Usage = EMPTY_USAGE;
   let lastStep: OneStep | undefined;
   let pendingApprovals: ToolApprovalRequest[] | undefined;
+  let stoppedBy: string | undefined;
 
   // Resume: settle the previous break's pending approvals BEFORE the first
-  // model call (baseLength is already captured — the new tool message flows
-  // into response.messages).
+  // model call — the new tool message flows into response.messages.
   const settled = await settlePendingApprovals(messages, tools, options);
   if (settled) {
     messages = settled.messages;
+    appended.push(settled.messages.at(-1)!);
     bumpErrorGuard(
       errorCounters,
       settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
@@ -51,9 +69,33 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
   }
 
   for (;;) {
-    const step = await runOneStep({ ...options, messages }, { tools: wireTools });
+    // Compaction first, so prepareStep sees (and has the last word on) the
+    // compacted history.
+    if (compactionRunner) {
+      messages = await runCompaction(
+        compactionRunner,
+        options,
+        deps,
+        messages,
+        (u) => {
+          totalUsage = sumUsage(totalUsage, u);
+        },
+        (e) => deps.logger.info(`compaction: ${e.layer} ${e.tokensBefore}->${e.tokensAfter}`),
+      );
+    }
+    const prepared = await applyPrepareStep(
+      options,
+      { stepIndex: steps.length, messages, usage: totalUsage },
+      fullWire,
+      staticWire,
+      deps.logger,
+    );
+    messages = prepared.messages;
+    const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
+    const step = await runOneStep({ ...prepared.options, messages }, { tools: prepared.wire });
     lastStep = step;
     totalUsage = sumUsage(totalUsage, step.usage);
+    calibrateCompaction(compactionRunner, estimatedAtCall, step.usage);
 
     // *** GEMINI GUARD: continue on tool_use parts, NOT finishReason ***
     if (step.toolUseParts.length === 0) {
@@ -67,6 +109,7 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
       args: p.input,
     }));
     messages = [...messages, step.assistantMessage]; // assistant FIRST (OpenAI ordering)
+    appended.push(step.assistantMessage);
 
     // Approval gate: server mode denies inline; without approveToolCall the
     // gated calls break the loop like client tools (client mode).
@@ -95,9 +138,18 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
       break;
     }
 
-    const toolResults = await executeTools(toolCalls, tools, options, messages, denied);
+    const toolResults = await executeTools(toolCalls, tools, options, messages, denied, {
+      // Inject the EFFECTIVE onUsage (call-level wins over deps-level, G10) so a
+      // sub-agent can forward its usage to the same callback the caller set.
+      deps: { ...deps, onUsage: options.onUsage ?? deps.onUsage },
+      // Sub-agent usage counts toward the parent total (result + budget stops).
+      reportUsage: (u) => {
+        totalUsage = sumUsage(totalUsage, u);
+      },
+    });
     const toolResultMessage: Message = { role: 'tool', content: toolResults.map(toToolResultPart) };
     messages = [...messages, toolResultMessage]; // EVERY tool_use answered (Anthropic 400 guard)
+    appended.push(toolResultMessage);
 
     const sr = toStepResult(step, toolCalls, toolResults, steps.length, toolResultMessage);
     steps.push(sr);
@@ -111,7 +163,15 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
       )
     )
       break;
-    if (await shouldStop(stopConditions, steps)) break;
+    const costUSD =
+      wantCost && deps.priceProvider
+        ? ((await deps.priceProvider.priceUsage(options.model.modelId, totalUsage)) ?? undefined)
+        : undefined;
+    const stop = await shouldStop(stopConditions, steps, { usage: totalUsage, costUSD });
+    if (stop.stop) {
+      stoppedBy = stop.stoppedBy;
+      break;
+    }
   }
 
   const lastToolStep = [...steps].reverse().find((s) => s.toolCalls.length > 0);
@@ -119,11 +179,12 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     text: lastStep?.text ?? '',
     usage: withTotal(totalUsage),
     finishReason: lastStep?.finishReason ?? 'stop',
-    response: { messages: messages.slice(baseLength) },
+    response: { messages: appended },
     steps,
     ...(lastToolStep
       ? { toolCalls: lastToolStep.toolCalls, toolResults: lastToolStep.toolResults }
       : {}),
     ...(pendingApprovals ? { pendingApprovals } : {}),
+    ...(stoppedBy ? { providerMetadata: { deuz: { stoppedBy } } } : {}),
   };
 }

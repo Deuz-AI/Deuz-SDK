@@ -1,4 +1,5 @@
 import type { Usage, FinishReason } from './usage';
+import type { CompactionLayer } from './config';
 
 /**
  * Canonical streaming delta. Open discriminated union — consumers should keep a
@@ -93,6 +94,29 @@ export interface ToolApprovalRequestPart {
   input: unknown;
 }
 
+/**
+ * Automatic compaction ran before a step (1.4 additive): `layer` names what
+ * ran, token counts are ESTIMATES (the loop's calibrated heuristic).
+ */
+export interface CompactionPart {
+  type: 'compaction';
+  layer: CompactionLayer;
+  tokensBefore: number;
+  tokensAfter: number;
+}
+
+/**
+ * A sub-agent (`agentTool`) part, forwarded live into the parent stream (1.4
+ * additive). `agentPath` is the full path (`['researcher']`, `['researcher',
+ * 'coder']`); `part` is the sub-agent's own canonical part. Single-wrapped —
+ * a 2nd-level part rides `agentPath.length === 2`, never a nested `sub-agent`.
+ */
+export interface SubAgentPart {
+  type: 'sub-agent';
+  agentPath: string[];
+  part: StreamPart;
+}
+
 export type StreamPart =
   | TextDeltaPart
   | ReasoningDeltaPart
@@ -104,4 +128,6 @@ export type StreamPart =
   | StepFinishPart
   | ToolCallPart
   | ToolResultStreamPart
-  | ToolApprovalRequestPart;
+  | ToolApprovalRequestPart
+  | CompactionPart
+  | SubAgentPart;

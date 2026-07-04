@@ -1,6 +1,8 @@
 import type { StandardSchemaV1, JSONSchema } from './schema';
 import type { Usage, FinishReason } from './usage';
 import type { Message } from './message';
+import type { StreamPart } from './stream';
+import type { ResolvedDependencies } from './deps';
 
 /** Context handed to a tool's `execute`. */
 export interface ToolExecuteContext {
@@ -9,6 +11,18 @@ export interface ToolExecuteContext {
   messages: Message[];
   /** Propagated from the call — long-running tools should honor it. */
   signal?: AbortSignal;
+  // --- 1.4 additive: sub-agent orchestration seam (populated by the loop; a
+  // plain tool can ignore them, `agentTool` consumes them). ---
+  /** This loop's sub-agent path (`[]` at the root, `['researcher']` one level down). */
+  agentPath?: string[];
+  /** Live-part sink — present only in a STREAMING parent; a sub-agent forwards its stream through it. */
+  emitPart?: (part: StreamPart) => void;
+  /** The parent's server-mode approver, inherited so sub-agent tool calls stay gated. */
+  approveToolCall?: (call: ToolCall, ctx: { messages: Message[] }) => boolean | Promise<boolean>;
+  /** Resolved deps (fetch/clock/keyProvider/…) so a sub-agent reuses the parent's transport. */
+  deps?: ResolvedDependencies;
+  /** Fold a sub-agent's cumulative usage into the parent total (budget + result). */
+  reportUsage?: (usage: Usage) => void;
 }
 
 /**
@@ -95,4 +109,8 @@ export interface StepResult {
 export type StopCondition = (info: {
   steps: StepResult[];
   stepCount: number;
+  /** Cumulative REAL usage across all steps so far (sub-agents included). Additive (1.4). */
+  usage?: Usage;
+  /** Cumulative cost in USD — present only when `deps.priceProvider` is set AND a condition needs it. Additive (1.4). */
+  costUSD?: number;
 }) => boolean | Promise<boolean>;

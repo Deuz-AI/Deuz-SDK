@@ -201,7 +201,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   const body: Record<string, unknown> = { contents, generationConfig };
   if (systemInstruction) body.systemInstruction = systemInstruction;
 
-  if (tools && !object) {
+  if (tools && tools.tools.length > 0 && !object) {
     const fns = tools.tools.filter((t) => !t.provider);
     const providerTools = tools.tools.filter((t) => t.provider).map((t) => t.provider!);
     const entries: unknown[] = [];

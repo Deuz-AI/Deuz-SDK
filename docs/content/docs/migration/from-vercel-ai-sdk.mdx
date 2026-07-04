@@ -77,7 +77,7 @@ The `StreamPart` union is **open** — keep a `default` case in your `switch`, s
 
 ### Loop control: `maxSteps` and `stopWhen`
 
-The agentic loop is bounded the same way as the AI SDK: `maxSteps` (default **1**, i.e. single-turn) plus an optional `stopWhen` predicate, OR-ed together. There are no exported `stepCountIs` / `hasToolCall` helpers — `stopWhen` is a plain callback you write inline, receiving `{ steps, stepCount }`.
+The agentic loop is bounded the same way as the AI SDK: `maxSteps` (default **1**, i.e. single-turn) plus an optional `stopWhen` predicate, OR-ed together. Since **1.4** the `stepCountIs` / `hasToolCall` factories are exported (plus the usage-based `totalTokensExceed` / `costExceeds`, which the AI SDK has no equivalent of); `stopWhen` also accepts a plain callback you write inline, receiving `{ steps, stepCount, usage, costUSD }`.
 
 ```ts
 const result = await generateText({
