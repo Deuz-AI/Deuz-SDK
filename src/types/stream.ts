@@ -105,6 +105,18 @@ export interface CompactionPart {
   tokensAfter: number;
 }
 
+/**
+ * A sub-agent (`agentTool`) part, forwarded live into the parent stream (1.4
+ * additive). `agentPath` is the full path (`['researcher']`, `['researcher',
+ * 'coder']`); `part` is the sub-agent's own canonical part. Single-wrapped —
+ * a 2nd-level part rides `agentPath.length === 2`, never a nested `sub-agent`.
+ */
+export interface SubAgentPart {
+  type: 'sub-agent';
+  agentPath: string[];
+  part: StreamPart;
+}
+
 export type StreamPart =
   | TextDeltaPart
   | ReasoningDeltaPart
@@ -117,4 +129,5 @@ export type StreamPart =
   | ToolCallPart
   | ToolResultStreamPart
   | ToolApprovalRequestPart
-  | CompactionPart;
+  | CompactionPart
+  | SubAgentPart;

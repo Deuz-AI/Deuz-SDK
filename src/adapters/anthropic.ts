@@ -149,7 +149,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       ];
       body.tool_choice = { type: 'tool', name: toolName };
     }
-  } else if (ctx.tools) {
+  } else if (ctx.tools && ctx.tools.tools.length > 0) {
     body.tools = ctx.tools.tools.map((t) =>
       t.provider
         ? t.provider // provider-executed tool — raw native definition, verbatim

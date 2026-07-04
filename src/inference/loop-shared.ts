@@ -8,9 +8,11 @@ import type {
   ToolChoice,
   ToolCall,
   ToolResult,
+  ToolExecuteContext,
   StepResult,
   StopCondition,
 } from '../types/tool';
+import type { StreamPart } from '../types/stream';
 import type { WireTool, WireToolRequest } from '../adapters/types';
 import { runOneStep, type OneStep } from './run-step';
 import { stepCountIs, type NamedStopCondition } from './stop';
@@ -367,6 +369,17 @@ export async function settlePendingApprovals(
 }
 
 /**
+ * Extra per-step wiring for `execute`'s context: the sub-agent seam. `deps` and
+ * `reportUsage` let an `agentTool` reuse the parent transport and fold its usage
+ * into the loop total; `emitPart` (streaming parent only) forwards its stream.
+ */
+export interface ExecuteExtras {
+  deps?: ResolvedDependencies;
+  emitPart?: (part: StreamPart) => void;
+  reportUsage?: (usage: Usage) => void;
+}
+
+/**
  * Execute the step's tool calls in parallel (capped); errors self-heal as
  * is_error results. Calls listed in `denied` short-circuit to an is_error
  * denial BEFORE validation (a denied call must not leak a validation message).
@@ -377,6 +390,7 @@ export async function executeTools(
   options: CommonCallOptions,
   messages: Message[],
   denied?: Map<string, string | undefined>,
+  extras?: ExecuteExtras,
 ): Promise<ToolResult[]> {
   const cap = options.maxToolConcurrency ?? 5;
   return mapWithConcurrency(toolCalls, cap, async (call): Promise<ToolResult> => {
@@ -408,14 +422,27 @@ export async function executeTools(
       };
     }
     try {
-      const out = await tool.execute(validation.value, {
+      const ctx: ToolExecuteContext = {
         toolCallId: call.toolCallId,
         messages,
         signal: options.signal,
-      });
+        ...(options.agentPath ? { agentPath: options.agentPath } : {}),
+        ...(options.approveToolCall ? { approveToolCall: options.approveToolCall } : {}),
+        ...(extras?.deps ? { deps: extras.deps } : {}),
+        ...(extras?.emitPart ? { emitPart: extras.emitPart } : {}),
+        ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
+      };
+      const out = await tool.execute(validation.value, ctx);
       return { toolCallId: call.toolCallId, toolName: call.toolName, result: out };
     } catch (cause) {
-      const err = new ToolExecutionError(call.toolName, { toolCallId: call.toolCallId, cause });
+      // Surface the thrown message to the model (self-heal feedback): a tool
+      // that throws `new Error('File not found')` should tell the model that,
+      // not an opaque "threw during execution".
+      const err = new ToolExecutionError(call.toolName, {
+        toolCallId: call.toolCallId,
+        cause,
+        ...(cause instanceof Error && cause.message ? { message: cause.message } : {}),
+      });
       return {
         toolCallId: call.toolCallId,
         toolName: call.toolName,

@@ -5,6 +5,8 @@
  */
 export { streamChat, generateText, generateObject, streamObject } from './generate';
 export { stepCountIs, hasToolCall, totalTokensExceed, costExceeds } from './inference/stop';
+export { agentTool } from './inference/agent-tool';
+export type { AgentToolDef } from './inference/agent-tool';
 export { anthropicWebSearch, openaiWebSearch, googleSearch } from './server-tools';
 export { createClient, resolveDependencies } from './client';
 export type { DeuzClient } from './client';

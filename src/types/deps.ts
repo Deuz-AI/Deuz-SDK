@@ -79,6 +79,8 @@ export interface UsageMeta {
   model: string;
   reason: 'finished' | 'aborted' | 'error';
   ttftMs?: number;
+  /** Sub-agent path when this usage came from an `agentTool` loop (1.4 additive). */
+  agentPath?: string[];
 }
 
 export interface FinishMeta {
