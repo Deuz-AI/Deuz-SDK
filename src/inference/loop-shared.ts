@@ -191,7 +191,44 @@ export async function applyPrepareStep(
 }
 
 const SUMMARY_PROMPT =
-  'Summarize the conversation so far as concise notes: preserve key facts, decisions made, tool results that still matter, and any open task threads. Output only the summary.';
+  'Summarize the conversation transcript above as concise notes: preserve key facts, decisions made, tool results that still matter, and any open task threads. Output only the summary.';
+
+/** Stringify without ever throwing (circular/BigInt). */
+function safeText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Flatten a slice of history into a plain-text transcript for the summarizer.
+ * The summarize side-call sends this as a SINGLE user message — never the raw
+ * turns, which could begin with an assistant role and 400 on Anthropic.
+ */
+function renderTranscript(messages: Message[]): string {
+  const lines: string[] = [];
+  for (const m of messages) {
+    const role = m.role.toUpperCase();
+    if (typeof m.content === 'string') {
+      lines.push(`${role}: ${m.content}`);
+      continue;
+    }
+    const parts: string[] = [];
+    for (const p of m.content) {
+      if (p.type === 'text') parts.push(p.text);
+      else if (p.type === 'reasoning') parts.push(`(thinking) ${p.text}`);
+      else if (p.type === 'tool_use') parts.push(`[calls ${p.name}(${safeText(p.input)})]`);
+      else if (p.type === 'tool_result') parts.push(`[tool result: ${safeText(p.result)}]`);
+      else if (p.type === 'image') parts.push('[image]');
+      else parts.push('[content]');
+    }
+    lines.push(`${role}: ${parts.join(' ')}`);
+  }
+  return lines.join('\n');
+}
 
 /** Per-loop compaction state: normalized policy + model context window + estimator. */
 export interface CompactionRunner {
@@ -232,10 +269,12 @@ export async function runCompaction(
     contextWindow: runner.contextWindow,
     summarize: async (slice) => {
       // Single-turn, tool-free, compaction-free side call — never recurses.
+      // The slice is rendered to a transcript inside ONE user message so the
+      // request is user-first (valid on every wire, incl. Anthropic).
       const step = await runOneStep({
         ...options,
         model: runner.policy.summarizeModel ?? options.model,
-        messages: [...slice, { role: 'user', content: SUMMARY_PROMPT }],
+        messages: [{ role: 'user', content: `${renderTranscript(slice)}\n\n${SUMMARY_PROMPT}` }],
         tools: undefined,
         toolChoice: undefined,
         maxSteps: undefined,

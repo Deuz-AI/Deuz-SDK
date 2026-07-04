@@ -138,7 +138,15 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
       break;
     }
 
-    const toolResults = await executeTools(toolCalls, tools, options, messages, denied);
+    const toolResults = await executeTools(toolCalls, tools, options, messages, denied, {
+      // Inject the EFFECTIVE onUsage (call-level wins over deps-level, G10) so a
+      // sub-agent can forward its usage to the same callback the caller set.
+      deps: { ...deps, onUsage: options.onUsage ?? deps.onUsage },
+      // Sub-agent usage counts toward the parent total (result + budget stops).
+      reportUsage: (u) => {
+        totalUsage = sumUsage(totalUsage, u);
+      },
+    });
     const toolResultMessage: Message = { role: 'tool', content: toolResults.map(toToolResultPart) };
     messages = [...messages, toolResultMessage]; // EVERY tool_use answered (Anthropic 400 guard)
     appended.push(toolResultMessage);

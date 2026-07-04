@@ -257,6 +257,83 @@ describe('agentTool — approval', () => {
   });
 });
 
+describe('agentTool — result text robustness', () => {
+  it('returns the last text answer even when the sub-agent stops mid-tool (maxSteps)', async () => {
+    // Sub-agent step 0: text preamble + tool call; maxSteps 1 cuts it after the
+    // tool result, so the LAST step is a tool step with no fresh text. The tool
+    // preamble text must still surface (not an empty tool_result to the parent).
+    const preambleThenTool = sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 1 } } },
+      },
+      {
+        event: 'content_block_start',
+        data: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      },
+      {
+        event: 'content_block_delta',
+        data: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'Looking into it.' },
+        },
+      },
+      { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
+      {
+        event: 'content_block_start',
+        data: {
+          type: 'content_block_start',
+          index: 1,
+          content_block: { type: 'tool_use', id: 'call_s', name: 'search' },
+        },
+      },
+      {
+        event: 'content_block_delta',
+        data: {
+          type: 'content_block_delta',
+          index: 1,
+          delta: { type: 'input_json_delta', partial_json: '{"q":"x"}' },
+        },
+      },
+      { event: 'content_block_stop', data: { type: 'content_block_stop', index: 1 } },
+      {
+        event: 'message_delta',
+        data: {
+          type: 'message_delta',
+          delta: { stop_reason: 'tool_use' },
+          usage: { output_tokens: 5 },
+        },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+    const { fetch, calls } = mockFetchSequence([
+      () => sseResponse([toolCallSse('worker', 'call_w', '{"prompt":"go"}')]), // parent → worker
+      () => sseResponse([preambleThenTool]), // worker step 0: text + tool, then maxSteps 1 cuts it
+      () => sseResponse([textSse('final')]), // parent
+    ]);
+    const res = await generateText({
+      model: model(fetch),
+      messages: [{ role: 'user', content: 'go' }],
+      tools: {
+        worker: agentTool({
+          name: 'worker',
+          description: 'w',
+          model: model(fetch, 'claude-haiku-4-5'),
+          tools: { search: { parameters: SCHEMA, execute: vi.fn(async () => 'r') } },
+          maxSteps: 1, // cut after the single tool step
+        }),
+      },
+      maxSteps: 5,
+    });
+    expect(res.text).toBe('final');
+    // The worker's tool result carried back to the parent is its preamble text,
+    // NOT an empty string.
+    const workerResult = JSON.stringify(JSON.parse(String(calls[2]!.init!.body)).messages);
+    expect(workerResult).toContain('Looking into it.');
+  });
+});
+
 describe('agentTool — usage', () => {
   it('folds sub-agent usage into the parent total and tags onUsage with agentPath', async () => {
     const events: { total: number; agentPath?: string[] }[] = [];
@@ -283,6 +360,61 @@ describe('agentTool — usage', () => {
     expect(tagged.length).toBeGreaterThan(0);
     expect(tagged[0]!.agentPath).toEqual(['worker']);
     expect(events.some((e) => !e.agentPath)).toBe(true);
+  });
+
+  it('routes sub-agent usage to a CALL-level onUsage (not only deps-level)', async () => {
+    const tagged: string[][] = [];
+    const onUsage = (_u: Usage, m: UsageMeta) => {
+      if (m.agentPath) tagged.push(m.agentPath);
+    };
+    const { fetch } = mockFetchSequence([
+      () => sseResponse([toolCallSse('worker', 'call_w', '{"prompt":"go"}')]),
+      () => sseResponse([textSse('sub')]),
+      () => sseResponse([textSse('done')]),
+    ]);
+    await generateText({
+      model: model(fetch),
+      messages: [{ role: 'user', content: 'go' }],
+      tools: {
+        worker: agentTool({ name: 'worker', description: 'w', model: model(fetch, 'claude-haiku-4-5') }),
+      },
+      maxSteps: 5,
+      onUsage, // CALL-level, not deps.onUsage
+    });
+    expect(tagged).toContainEqual(['worker']);
+  });
+
+  it('tags nested sub-agent usage with the DEEP path (outer wrapper does not overwrite)', async () => {
+    const tagged: string[][] = [];
+    const onUsage = (_u: Usage, m: UsageMeta) => {
+      if (m.agentPath) tagged.push(m.agentPath);
+    };
+    const { fetch } = mockFetchSequence([
+      () => sseResponse([toolCallSse('outer', 'c1', '{"prompt":"go"}')]), // parent → outer
+      () => sseResponse([toolCallSse('inner', 'c2', '{"prompt":"deep"}')]), // outer → inner
+      () => sseResponse([textSse('inner done')]), // inner
+      () => sseResponse([textSse('outer done')]), // outer
+      () => sseResponse([textSse('final')]), // parent
+    ]);
+    const inner = agentTool({ name: 'inner', description: 'i', model: model(fetch, 'claude-haiku-4-5') });
+    const outer = agentTool({
+      name: 'outer',
+      description: 'o',
+      model: model(fetch, 'claude-haiku-4-5'),
+      tools: { inner },
+      maxSteps: 5,
+    });
+    await generateText({
+      model: model(fetch),
+      messages: [{ role: 'user', content: 'go' }],
+      tools: { outer },
+      maxSteps: 5,
+      onUsage,
+    });
+    // The deepest agent's usage carries the FULL path; the outer wrapper (which
+    // runs last) preserved it instead of overwriting with ['outer'].
+    expect(tagged).toContainEqual(['outer', 'inner']);
+    expect(tagged).toContainEqual(['outer']);
   });
 
   it('sub-agent usage counts toward a parent budget stop', async () => {

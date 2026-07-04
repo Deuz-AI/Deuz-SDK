@@ -64,13 +64,17 @@ export function agentTool(def: AgentToolDef): Tool {
       }
 
       // Reuse the parent transport; tag the sub-agent's usage with its path.
+      // `agentPath: m.agentPath ?? path` preserves a DEEPER path a nested
+      // wrapper already set — the outer wrapper (which runs last) must not
+      // overwrite it with its shallower path. (The loop injects the effective
+      // onUsage — call- or deps-level — into ctx.deps, so it is not lost here.)
       const parentDeps = ctx.deps;
       const innerDeps: Dependencies | undefined = parentDeps
         ? {
             ...parentDeps,
             ...(parentDeps.onUsage
               ? {
-                  onUsage: (u, m) => parentDeps.onUsage!(u, { ...m, agentPath: path }),
+                  onUsage: (u, m) => parentDeps.onUsage!(u, { ...m, agentPath: m.agentPath ?? path }),
                 }
               : {}),
           }
@@ -99,10 +103,16 @@ export function agentTool(def: AgentToolDef): Tool {
 
       const forward = Boolean(ctx.emitPart) && def.subAgentStream !== 'none';
       let stepText = '';
+      let lastNonEmpty = '';
       let sawPendingApproval = false;
       for await (const part of inner.fullStream) {
-        if (part.type === 'step-start') stepText = '';
-        else if (part.type === 'text-delta') stepText += part.text;
+        if (part.type === 'step-start') {
+          // Carry forward the last step that actually produced text, so a run
+          // cut mid-tool (maxSteps/stopWhen on a tool step) still returns the
+          // sub-agent's most recent answer instead of an empty string.
+          if (stepText.trim()) lastNonEmpty = stepText;
+          stepText = '';
+        } else if (part.type === 'text-delta') stepText += part.text;
         else if (part.type === 'tool-approval-request') sawPendingApproval = true;
         else if (part.type === 'error') throw part.error;
         if (forward) ctx.emitPart!({ type: 'sub-agent', agentPath: path, part });
@@ -118,7 +128,10 @@ export function agentTool(def: AgentToolDef): Tool {
             `parent call, or wait for 1.5 durable sessions.`,
         );
       }
-      return stepText;
+      // Prefer the final step's text; fall back to the last step that had any,
+      // then to an explicit note (never silently return '' after real work).
+      const answer = stepText.trim() ? stepText : lastNonEmpty;
+      return answer || '(the sub-agent finished without a text answer)';
     },
   };
 }

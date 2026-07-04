@@ -285,7 +285,16 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
           break;
         }
 
-        const toolResults = await executeTools(toolCalls, tools, options, messages, denied);
+        const toolResults = await executeTools(toolCalls, tools, options, messages, denied, {
+          // Effective onUsage (call-level wins, G10) so a sub-agent's usage
+          // reaches the same callback the caller set.
+          deps: { ...deps, onUsage: options.onUsage ?? deps.onUsage },
+          reportUsage: (u) => {
+            totalUsage = sumUsage(totalUsage, u);
+          },
+          // Live sink: an agentTool forwards its stream, already wrapped as sub-agent parts.
+          emitPart: (part) => broadcaster.push(part),
+        });
         for (const r of toolResults) {
           broadcaster.push({
             type: 'tool-result',

@@ -174,10 +174,11 @@ describe('compaction wired into the loop', () => {
     });
     expect(res.text).toBe('Done.');
     expect(calls).toHaveLength(2);
-    // Side-call 0 is the summarizer.
-    expect(JSON.stringify(JSON.parse(String(calls[0]!.init!.body)).messages)).toContain(
-      'Summarize the conversation',
-    );
+    // Side-call 0 is the summarizer — and it is USER-FIRST (a raw assistant-led
+    // slice would 400 on Anthropic). The transcript rides one user message.
+    const summaryMessages = JSON.parse(String(calls[0]!.init!.body)).messages;
+    expect(summaryMessages[0].role).toBe('user');
+    expect(JSON.stringify(summaryMessages)).toContain('Summarize the conversation');
     // Model call 1 got the summarized history + the surviving question.
     const modelWire = JSON.stringify(JSON.parse(String(calls[1]!.init!.body)).messages);
     expect(modelWire).toContain('Earlier conversation summarized');
