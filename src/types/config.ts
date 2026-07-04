@@ -21,6 +21,28 @@ export type ModelId = string;
  * edits go through it too (rewrite the system-role message) — there is no
  * separate system field on this surface.
  */
+export type CompactionLayer = 'prune-tool-results' | 'prune-reasoning' | 'summarize';
+
+/**
+ * Automatic layered context compaction policy for the agentic loop. Layers run
+ * cheapest-first when the estimated context fill crosses `threshold`; the
+ * summarize layer costs one extra model call. See `compaction` on
+ * {@link CommonCallOptions}.
+ */
+export interface CompactionPolicy {
+  /** Context-fill ratio (estimate/contextWindow) that triggers compaction. Default 0.92. */
+  threshold?: number;
+  /** Most-recent assistant turns that are untouchable. Default 4. */
+  keepRecentSteps?: number;
+  /** Layers to apply, in order. Default all three, cheapest first. */
+  layers?: CompactionLayer[];
+  /** Model used for the summarize layer. Default: the loop's own model. */
+  summarizeModel?: LanguageModel;
+}
+
+/** `'auto'` = all defaults. */
+export type CompactionOption = 'auto' | CompactionPolicy;
+
 export interface PrepareStepResult {
   /** Becomes the base history for this and all following steps. */
   messages?: Message[];
@@ -122,6 +144,16 @@ export interface CommonCallOptions {
    * and usage metering. Root loops omit it.
    */
   agentPath?: string[];
+  /**
+   * Opt-in automatic context compaction for the agentic loop: `'auto'` for
+   * defaults (trigger at 92% fill; prune old tool results → prune old
+   * reasoning → summarize the oldest slice) or a {@link CompactionPolicy}.
+   * Pruning is free; summarize costs one extra model call (its usage counts
+   * toward the result and budget stops). History stays immutable — compaction
+   * builds new arrays and NEVER alters what `response.messages` returns.
+   * Off by default.
+   */
+  compaction?: CompactionOption;
   /**
    * Server-mode approval: awaited for every call whose tool triggers
    * `needsApproval`. Return false (or throw) to deny — the call becomes an

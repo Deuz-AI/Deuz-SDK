@@ -10,6 +10,9 @@ import {
   buildWireTools,
   filterWireTools,
   applyPrepareStep,
+  setupCompaction,
+  runCompaction,
+  calibrateCompaction,
   executeTools,
   toToolResultPart,
   toStepResult,
@@ -47,6 +50,7 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
     deps.logger.warn('costExceeds: no deps.priceProvider injected — the condition never fires');
   }
   const errorCounters = new Map<string, number>();
+  const compactionRunner = setupCompaction(options, deps);
   let totalUsage: Usage = EMPTY_USAGE;
   let lastStep: OneStep | undefined;
   let pendingApprovals: ToolApprovalRequest[] | undefined;
@@ -65,6 +69,20 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
   }
 
   for (;;) {
+    // Compaction first, so prepareStep sees (and has the last word on) the
+    // compacted history.
+    if (compactionRunner) {
+      messages = await runCompaction(
+        compactionRunner,
+        options,
+        deps,
+        messages,
+        (u) => {
+          totalUsage = sumUsage(totalUsage, u);
+        },
+        (e) => deps.logger.info(`compaction: ${e.layer} ${e.tokensBefore}->${e.tokensAfter}`),
+      );
+    }
     const prepared = await applyPrepareStep(
       options,
       { stepIndex: steps.length, messages, usage: totalUsage },
@@ -73,9 +91,11 @@ export async function runToolLoop(options: CommonCallOptions): Promise<GenerateT
       deps.logger,
     );
     messages = prepared.messages;
+    const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
     const step = await runOneStep({ ...prepared.options, messages }, { tools: prepared.wire });
     lastStep = step;
     totalUsage = sumUsage(totalUsage, step.usage);
+    calibrateCompaction(compactionRunner, estimatedAtCall, step.usage);
 
     // *** GEMINI GUARD: continue on tool_use parts, NOT finishReason ***
     if (step.toolUseParts.length === 0) {

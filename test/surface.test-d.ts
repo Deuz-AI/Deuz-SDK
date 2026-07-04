@@ -89,3 +89,10 @@ expectTypeOf(stepCountIs).toBeFunction();
 expectTypeOf(totalTokensExceed).returns.toBeFunction();
 expectTypeOf(costExceeds).returns.toBeFunction();
 expectTypeOf<GenerateTextResult>().toHaveProperty('providerMetadata');
+
+// --- 1.4.0 additive: compaction option + StreamPart. ---
+import type { CompactionPolicy, CompactionOption } from '../src/index';
+expectTypeOf<CommonCallOptions>().toHaveProperty('compaction');
+expectTypeOf<CompactionPolicy>().toHaveProperty('threshold');
+expectTypeOf<CompactionOption>().toEqualTypeOf<'auto' | CompactionPolicy>();
+expectTypeOf<Extract<StreamPart, { type: 'compaction' }>>().toHaveProperty('layer');

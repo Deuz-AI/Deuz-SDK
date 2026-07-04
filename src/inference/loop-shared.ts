@@ -1,7 +1,7 @@
 import type { CommonCallOptions, PrepareStepResult } from '../types/config';
 import type { Message, Part } from '../types/message';
 import type { Usage } from '../types/usage';
-import type { Logger } from '../types/deps';
+import type { Logger, ResolvedDependencies } from '../types/deps';
 import type {
   Tool,
   ToolSet,
@@ -12,8 +12,17 @@ import type {
   StopCondition,
 } from '../types/tool';
 import type { WireTool, WireToolRequest } from '../adapters/types';
-import type { OneStep } from './run-step';
+import { runOneStep, type OneStep } from './run-step';
 import { stepCountIs, type NamedStopCondition } from './stop';
+import {
+  applyCompaction,
+  normalizeCompaction,
+  type ApplyCompactionCtx,
+  type NormalizedCompaction,
+  type CompactionEvent,
+} from './compaction';
+import { createTokenEstimator, type TokenEstimator } from '../internal/estimate-tokens';
+import { getCapabilities } from '../core/registry';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
 import { ToolExecutionError } from '../errors';
@@ -177,6 +186,82 @@ export async function applyPrepareStep(
     if (ps.toolChoice) wire = { ...wire, toolChoice: ps.toolChoice };
   }
   return { options: stepOptions, messages, wire };
+}
+
+const SUMMARY_PROMPT =
+  'Summarize the conversation so far as concise notes: preserve key facts, decisions made, tool results that still matter, and any open task threads. Output only the summary.';
+
+/** Per-loop compaction state: normalized policy + model context window + estimator. */
+export interface CompactionRunner {
+  policy: NormalizedCompaction;
+  contextWindow: number;
+  estimator: TokenEstimator;
+}
+
+/** Build a compaction runner when the caller opted in; otherwise undefined. */
+export function setupCompaction(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+): CompactionRunner | undefined {
+  if (!options.compaction) return undefined;
+  return {
+    policy: normalizeCompaction(options.compaction),
+    contextWindow: getCapabilities(options.model, deps.logger).contextWindow,
+    estimator: createTokenEstimator(),
+  };
+}
+
+/**
+ * Run compaction before a model step. `addUsage` folds the summarize call's
+ * usage into the loop total (so it counts toward budget stops); `onEvent`
+ * surfaces each layer (stream part / log line). Returns the (possibly
+ * compacted) history — same reference when nothing triggered.
+ */
+export async function runCompaction(
+  runner: CompactionRunner,
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  messages: Message[],
+  addUsage: (u: Usage) => void,
+  onEvent: (e: CompactionEvent) => void,
+): Promise<Message[]> {
+  const ctx: ApplyCompactionCtx = {
+    estimate: (m) => runner.estimator.estimate(m),
+    contextWindow: runner.contextWindow,
+    summarize: async (slice) => {
+      // Single-turn, tool-free, compaction-free side call — never recurses.
+      const step = await runOneStep({
+        ...options,
+        model: runner.policy.summarizeModel ?? options.model,
+        messages: [...slice, { role: 'user', content: SUMMARY_PROMPT }],
+        tools: undefined,
+        toolChoice: undefined,
+        maxSteps: undefined,
+        stopWhen: undefined,
+        compaction: undefined,
+        prepareStep: undefined,
+        activeTools: undefined,
+        onStepFinish: undefined,
+        approveToolCall: undefined,
+        approvalResponses: undefined,
+      });
+      addUsage(step.usage);
+      return step.text;
+    },
+    onSkip: (layer, reason) => deps.logger.warn(`compaction: ${layer} skipped — ${reason}`),
+  };
+  const { messages: compacted, events } = await applyCompaction(messages, runner.policy, ctx);
+  for (const e of events) onEvent(e);
+  return compacted;
+}
+
+/** Calibrate the runner's estimator against a step's real input-token usage. */
+export function calibrateCompaction(
+  runner: CompactionRunner | undefined,
+  estimatedAtCall: number,
+  usage: Usage,
+): void {
+  if (runner) runner.estimator.calibrate(usage.inputTokens, estimatedAtCall);
 }
 
 export function toToolResultPart(r: ToolResult): Part {

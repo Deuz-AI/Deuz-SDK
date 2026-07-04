@@ -44,6 +44,8 @@ export type DeuzUIPart =
   | { type: 'tool-approval-response'; approvalId: string; approved: boolean; reason?: string }
   /** `streamObject` partial — each delta REPLACES the previous partial wholesale. */
   | { type: 'object-delta'; object: unknown }
+  /** Automatic compaction ran before a step (token counts are estimates). */
+  | { type: 'compaction'; layer: string; tokensBefore: number; tokensAfter: number }
   | { type: 'finish'; finishReason: FinishReason; usage: Usage }
   | { type: 'error'; message: string };
 
@@ -100,6 +102,14 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         toolCallId: part.toolCallId,
         toolName: part.toolName,
         input: part.input,
+      };
+    case 'compaction':
+      // Explicit case required — the default drops unknown canonical parts.
+      return {
+        type: 'compaction',
+        layer: part.layer,
+        tokensBefore: part.tokensBefore,
+        tokensAfter: part.tokensAfter,
       };
     case 'step-start':
       return { type: 'step-start', step: part.stepIndex };

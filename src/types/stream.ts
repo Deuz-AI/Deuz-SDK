@@ -1,4 +1,5 @@
 import type { Usage, FinishReason } from './usage';
+import type { CompactionLayer } from './config';
 
 /**
  * Canonical streaming delta. Open discriminated union — consumers should keep a
@@ -93,6 +94,17 @@ export interface ToolApprovalRequestPart {
   input: unknown;
 }
 
+/**
+ * Automatic compaction ran before a step (1.4 additive): `layer` names what
+ * ran, token counts are ESTIMATES (the loop's calibrated heuristic).
+ */
+export interface CompactionPart {
+  type: 'compaction';
+  layer: CompactionLayer;
+  tokensBefore: number;
+  tokensAfter: number;
+}
+
 export type StreamPart =
   | TextDeltaPart
   | ReasoningDeltaPart
@@ -104,4 +116,5 @@ export type StreamPart =
   | StepFinishPart
   | ToolCallPart
   | ToolResultStreamPart
-  | ToolApprovalRequestPart;
+  | ToolApprovalRequestPart
+  | CompactionPart;

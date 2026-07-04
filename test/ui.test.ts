@@ -172,6 +172,30 @@ describe('Deuz UI wire', () => {
     ]);
   });
 
+  it('serializes a compaction part through the wire (explicit case, not dropped)', async () => {
+    const { fetch } = mockFetch(() => sseResponse([FINAL]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'task' },
+        { role: 'assistant', content: [{ type: 'reasoning', text: 'r '.repeat(50) }, { type: 'text', text: 'a' }] },
+        { role: 'assistant', content: [{ type: 'reasoning', text: 'r '.repeat(50) }, { type: 'text', text: 'b' }] },
+        { role: 'user', content: 'go' },
+      ],
+      tools: { getWeather: { parameters: SCHEMA, execute: vi.fn(async () => ({ temp: 1 })) } },
+      compaction: { threshold: 0, keepRecentSteps: 1, layers: ['prune-reasoning'] },
+    });
+    const response = toDeuzStreamResponse(result);
+    const parts = [];
+    for await (const p of readDeuzStream(response)) parts.push(p);
+    const compaction = parts.find(
+      (p): p is Extract<typeof p, { type: 'compaction' }> => p.type === 'compaction',
+    );
+    expect(compaction).toMatchObject({ type: 'compaction', layer: 'prune-reasoning' });
+    expect(compaction!.tokensBefore).toBeGreaterThan(compaction!.tokensAfter);
+  });
+
   it('toDeuzObjectStreamResponse emits start/object-delta/finish and [DONE]', async () => {
     async function* partials(): AsyncGenerator<{ city?: string }> {
       yield { city: 'Par' };

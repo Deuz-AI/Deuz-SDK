@@ -13,6 +13,9 @@ import {
   buildWireTools,
   filterWireTools,
   applyPrepareStep,
+  setupCompaction,
+  runCompaction,
+  calibrateCompaction,
   executeTools,
   toToolResultPart,
   toStepResult,
@@ -65,6 +68,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
       deps.logger.warn('costExceeds: no deps.priceProvider injected — the condition never fires');
     }
     const errorCounters = new Map<string, number>();
+    const compactionRunner = setupCompaction(options, deps);
     let totalUsage: Usage = EMPTY_USAGE;
     let lastFinish: FinishReason = 'stop';
     let stoppedBy: string | undefined;
@@ -96,6 +100,26 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
 
       for (;;) {
         broadcaster.push({ type: 'step-start', stepIndex });
+        // Compaction first — its parts precede the step's deltas; prepareStep
+        // then sees the compacted history.
+        if (compactionRunner) {
+          messages = await runCompaction(
+            compactionRunner,
+            options,
+            deps,
+            messages,
+            (u) => {
+              totalUsage = sumUsage(totalUsage, u);
+            },
+            (e) =>
+              broadcaster.push({
+                type: 'compaction',
+                layer: e.layer,
+                tokensBefore: e.tokensBefore,
+                tokensAfter: e.tokensAfter,
+              }),
+          );
+        }
         const prepared = await applyPrepareStep(
           options,
           { stepIndex, messages, usage: totalUsage },
@@ -104,6 +128,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
           deps.logger,
         );
         messages = prepared.messages;
+        const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
         const inner = runStream({ ...prepared.options, messages }, { tools: prepared.wire });
 
         let text = '';
@@ -165,6 +190,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         }
 
         totalUsage = sumUsage(totalUsage, stepUsage);
+        calibrateCompaction(compactionRunner, estimatedAtCall, stepUsage);
         lastFinish = stepFinish;
         broadcaster.push({
           type: 'step-finish',
