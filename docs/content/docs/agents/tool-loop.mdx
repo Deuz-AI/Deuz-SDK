@@ -91,7 +91,7 @@ const result = await generateText({
 });
 ```
 
-> The `stepCountIs` / `hasToolCall` predicate factories exist internally but are **not** part of the public export surface. Write your `StopCondition` inline as shown above — the two examples reproduce exactly what those helpers do.
+> Since **1.4** the `stepCountIs` / `hasToolCall` predicate factories are exported (alongside the usage-based `totalTokensExceed` / `costExceeds` — see [Budget stop conditions](/docs/agents/tools#budget-stop-conditions)). The inline predicates above reproduce exactly what `stepCountIs` / `hasToolCall` do, so either style works.
 
 ## Step anatomy
 

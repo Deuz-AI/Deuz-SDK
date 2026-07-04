@@ -1,0 +1,192 @@
+---
+title: Sub-Agents
+description: agentTool wraps a focused agentic loop as a callable Tool — with a live-forwarded stream and inherited tool approval, and no new runtime.
+---
+
+`agentTool` turns a model + its own tools into a `Tool` the parent loop can call. The parent model delegates a sub-task ("research X", "write and test this function") to a nested agentic loop that runs to completion and returns its final text — the same [tool loop](/docs/agents/tool-loop) machinery, one level down, with no new runtime concept to learn.
+
+## vs AI SDK
+
+AI SDK's equivalent is the documented "agent-as-tool" pattern: a tool whose `execute` calls another agent and returns its final text. It's a **black box** — you cannot see the sub-agent's internals stream through the canonical stream without hand-writing UI-writer plumbing yourself, and their docs have a dedicated section titled *"No Tool Approvals in Subagents"* because their subagents cannot use tool approval at all. `agentTool` closes both gaps: the sub-agent's entire canonical stream forwards **live** into the parent's `fullStream`, and the parent's approval gate is **inherited** to every nesting depth — with no new runtime, since `execute` just drives the same `streamChat` loop internally.
+
+## Defining a sub-agent
+
+```ts
+interface AgentToolDef {
+  /** Sub-agent identity — used in `agentPath`; use the same string as the tool key. */
+  name: string;
+  /** Shown to the parent model so it knows when to delegate. */
+  description: string;
+  model: LanguageModel;
+  tools?: ToolSet;
+  system?: string;
+  maxSteps?: number;                          // default 10
+  maxDepth?: number;                          // default 2
+  needsApproval?: Tool['needsApproval'];
+  compaction?: CompactionOption;
+  stopWhen?: StopCondition | StopCondition[];
+  subAgentStream?: 'full' | 'none';           // default 'full'
+}
+
+function agentTool(def: AgentToolDef): Tool;
+```
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `name` | `string` | — | Identity used in `agentPath`. Use the **same string** for the `tools` map key and `name` — they should always match. |
+| `description` | `string` | — | What the parent model reads to decide when to delegate. Write it like any tool description. |
+| `model` | `LanguageModel` | — | The sub-agent's own model — can differ from the parent's (e.g. a cheaper model for a research sub-agent). |
+| `tools` | `ToolSet` | — | The sub-agent's own tools. Omit for a tool-less sub-agent (a single focused turn). |
+| `system` | `string` | — | The sub-agent's system prompt. |
+| `maxSteps` | `number` | `10` | Max turns of the sub-agent's own loop — sub-agents are inherently multi-step, so the default is higher than the root loop's `1`. |
+| `maxDepth` | `number` | `2` | Nesting cap — see [maxDepth guard](#the-maxdepth-guard) below. |
+| `needsApproval` | `Tool['needsApproval']` | — | Gates the **sub-agent call itself** in the parent's own approval flow (independent of what happens inside the sub-agent). |
+| `compaction` | `CompactionOption` | — | The sub-agent's own [compaction](/docs/core/compaction) policy — useful for long-lived research agents. |
+| `stopWhen` | `StopCondition \| StopCondition[]` | — | The sub-agent's own stop condition(s), OR-ed with its `maxSteps`. |
+| `subAgentStream` | `'full' \| 'none'` | `'full'` | `'full'` forwards the sub-agent's live stream into the parent; `'none'` runs it silently. |
+
+`agentTool` returns a plain `Tool` — register it in `tools` exactly like any other tool. The tool's input schema is fixed to `{ prompt: string }`; the model passes the sub-task as `prompt`, and the tool's return value is the sub-agent's final text.
+
+```ts title="register-subagent.ts"
+import { generateText, agentTool } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const haiku = anthropic('claude-haiku-5');
+const opus = anthropic('claude-opus-4-8');
+
+const { text } = await generateText({
+  model: opus,
+  messages: [{ role: 'user', content: 'Research the latest Anthropic pricing and summarize it.' }],
+  maxSteps: 5,
+  tools: {
+    researcher: agentTool({
+      name: 'researcher', // same string as the map key
+      description: 'Delegate research tasks to a focused sub-agent with web search.',
+      model: haiku,
+      tools: { webSearch: /* … a Tool with execute … */ },
+      maxSteps: 6,
+    }),
+  },
+});
+
+console.log(text);
+```
+
+A buffered `generateText` parent always runs sub-agents silently — there's no stream to forward into — and just gets the returned text back as a normal `tool_result`.
+
+## Live visibility: `sub-agent` stream parts
+
+When the **parent is streaming**, the sub-agent's entire canonical stream — every `text-delta`, `tool-call`, `tool-result`, `step-start`, everything — forwards live into the parent's `fullStream`, wrapped as a `sub-agent` part tagged with the full nesting path:
+
+```ts
+interface SubAgentPart {
+  type: 'sub-agent';
+  agentPath: string[]; // ['researcher'], or ['researcher', 'coder'] one level deeper
+  part: StreamPart;    // the sub-agent's own canonical part, unwrapped
+}
+```
+
+A second-level sub-agent's parts ride `agentPath: ['researcher', 'coder']` — single-wrapped, never a `sub-agent` part nested inside another `sub-agent` part.
+
+```ts title="live-substream.ts"
+import { streamChat, agentTool } from '@deuz-sdk/core';
+
+const result = streamChat({
+  model: opus,
+  messages: [{ role: 'user', content: 'Research X and write me a summary.' }],
+  maxSteps: 5,
+  tools: {
+    researcher: agentTool({
+      name: 'researcher',
+      description: 'Delegate research tasks to a focused sub-agent.',
+      model: haiku,
+      tools: { webSearch: /* … */ },
+    }),
+  },
+});
+
+for await (const part of result.fullStream) {
+  if (part.type === 'sub-agent') {
+    const path = part.agentPath.join(' > ');
+    if (part.part.type === 'text-delta') {
+      process.stdout.write(`[${path}] ${part.part.text}`);
+    } else if (part.part.type === 'tool-call') {
+      console.log(`\n[${path}] calling ${part.part.toolName}`);
+    }
+    continue;
+  }
+  // the PARENT's own parts (text-delta, tool-call for `researcher` itself, …) arrive un-wrapped
+}
+```
+
+Pass `subAgentStream: 'none'` on the definition to run a sub-agent silently even from a streaming parent — the parent still gets the final text as a normal `tool-result`, it just skips forwarding the internals.
+
+## Approval inheritance
+
+The parent's server-mode `approveToolCall` is inherited to **every** nesting depth — a sub-agent's own tool calls stay gated by the exact same policy the parent uses, with no extra wiring:
+
+```ts title="approval-inheritance.ts"
+import { generateText, agentTool } from '@deuz-sdk/core';
+import { z } from 'zod';
+
+const result = await generateText({
+  model: opus,
+  messages: [{ role: 'user', content: 'Have the coder agent fix the failing test.' }],
+  maxSteps: 5,
+  tools: {
+    coder: agentTool({
+      name: 'coder',
+      description: 'Writes and runs code changes to fix a failing test.',
+      model: opus,
+      tools: {
+        runShellCommand: {
+          description: 'Run a shell command.',
+          parameters: z.object({ cmd: z.string() }),
+          needsApproval: true, // gated even though it's called from INSIDE the sub-agent
+          execute: async ({ cmd }) => runShell(cmd),
+        },
+      },
+    }),
+  },
+  // Inherited down: coder's runShellCommand calls are decided here too.
+  approveToolCall: async (call) => policyAllows(call),
+});
+```
+
+> **1.4 limitation.** Client-mode approval — omitting `approveToolCall` and breaking the loop into `pendingApprovals` — is **not supported inside a sub-agent yet**; it needs durable suspend/resume across a nested loop, which lands in 1.5. A gated sub-agent tool call with no inherited server-mode approver returns a clear `is_error` explaining this (the parent model can react to it), rather than hanging or silently allowing the call. Server-mode `approveToolCall` on the parent call works today at any depth.
+
+## The `maxDepth` guard
+
+`agentTool` inside `agentTool` is allowed — a `researcher` sub-agent can itself delegate to a `coder` sub-agent — but nesting is capped by `maxDepth` (default `2`) to stop runaway self-recursion. Each `agentTool` checks its **own** `maxDepth` against how deep its `agentPath` already is when it runs; exceeding it throws, which the loop's [self-healing](/docs/agents/tool-loop#self-healing-tool-errors) turns into an `is_error` tool result — the parent model can recover (e.g. try the task itself) instead of the whole call failing.
+
+## Abort
+
+The parent call's `signal` propagates down into every sub-agent's own loop, exactly like it propagates into a plain tool's `execute` — aborting the parent tears down sub-agents at any depth too.
+
+## Usage attribution
+
+A sub-agent's cumulative usage folds into the parent's total: `result.usage`, [budget stops](/docs/agents/tools#budget-stop-conditions) (`totalTokensExceed`/`costExceeds`), and cost calculations all include every sub-agent's tokens, at every depth. Per-call `onUsage` events from inside a sub-agent are additionally tagged with `meta.agentPath`, so you can attribute usage to a specific sub-agent if you need finer-grained accounting:
+
+```ts title="usage-attribution.ts"
+const result = await generateText({
+  model: opus,
+  messages,
+  maxSteps: 5,
+  tools: { researcher: agentTool({ name: 'researcher', description: '…', model: haiku, tools: {} }) },
+  onUsage: (usage, meta) => {
+    // meta.agentPath is ['researcher'] for usage produced inside that sub-agent,
+    // undefined for the parent's own steps.
+    console.log(meta.model, meta.agentPath?.join(' > ') ?? 'root', usage.totalTokens);
+  },
+});
+
+console.log(result.usage.totalTokens); // includes every sub-agent's tokens too
+```
+
+## See also
+
+- [Tool loop](/docs/agents/tool-loop) — the agentic loop `agentTool` runs one level down; every invariant (self-healing, immutable history, runaway guards) applies to sub-agents too.
+- [Tools](/docs/agents/tools) — `prepareStep`, `activeTools`, and budget stop conditions, all usable inside a sub-agent's own loop via its own call options.
+- [Context compaction](/docs/core/compaction) — a sub-agent accepts its own `compaction` policy, handy for long-lived research agents.
+- [Client-side tools](/docs/agents/client-tools) — the approval round-trip `approveToolCall` inherits into sub-agents.

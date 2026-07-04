@@ -1,0 +1,130 @@
+---
+title: Context Compaction
+description: Opt-in, layered compaction for the agentic loop — prune tool results, prune reasoning, summarize the oldest slice — with immutable, cache-safe history.
+---
+
+Long-running agentic loops eventually run out of context window: every tool result and every reasoning block stays in history forever unless something trims it. `compaction` is an opt-in call option that does this automatically, in three cheapest-first layers, without you writing a token counter or a pruning function yourself.
+
+## vs AI SDK
+
+AI SDK's context management is 100% manual: you estimate tokens yourself (their cookbook uses `chars / 4`) and prune inside `prepareStep`. There is no built-in layering, no cache-awareness, and OpenAI's server-side compaction is still an open feature request on their tracker. `@deuz-sdk/core` ships one opt-in flag — `compaction: 'auto'` — with automatic, prefix-stable, layered behavior, and it composes with [`prepareStep`](/docs/agents/tools#preparestep-and-activetools) rather than replacing it: `prepareStep` runs *after* compaction each step, so it always sees the already-compacted history and gets the final word.
+
+## Turning it on
+
+`compaction` lives on `CommonCallOptions`, so it works identically in `generateText` and `streamChat`. It only ever runs **inside the agentic loop** — a call with no `tools` (a single-turn call) never invokes it, regardless of the option.
+
+```ts
+compaction?: 'auto' | CompactionPolicy;
+
+interface CompactionPolicy {
+  threshold?: number;             // default 0.92 — context-fill ratio that triggers compaction
+  keepRecentSteps?: number;       // default 4 — most-recent assistant turns, always protected
+  layers?: CompactionLayer[];     // default ['prune-tool-results', 'prune-reasoning', 'summarize']
+  summarizeModel?: LanguageModel; // default: the loop's own model
+}
+
+type CompactionLayer = 'prune-tool-results' | 'prune-reasoning' | 'summarize';
+type CompactionOption = 'auto' | CompactionPolicy;
+```
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `threshold` | `number` | `0.92` | Estimated-tokens ÷ model context window. Crossing it triggers a compaction pass before the next step. |
+| `keepRecentSteps` | `number` | `4` | Positive integer (floored/clamped) — this many of the most recent assistant turns are never touched by any layer. |
+| `layers` | `CompactionLayer[]` | all three | Applied in array order, cheapest first, until estimated fill drops under `threshold * 0.8` or layers run out. |
+| `summarizeModel` | `LanguageModel` | the loop's model | Only used by the `summarize` layer's one extra call — pass a cheaper model to keep that call cheap too. |
+
+`'auto'` is shorthand for `{}` (every field defaulted). It's off by default — omit `compaction` and history grows unbounded, same as today.
+
+```ts title="compaction-auto.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: longRunningHistory,
+  maxSteps: 30,
+  tools: { /* … */ },
+  compaction: 'auto', // trigger at 92% fill: prune tool results → prune reasoning → summarize
+});
+```
+
+A tuned policy — skip the reasoning layer, summarize with a cheaper model:
+
+```ts title="compaction-policy.ts"
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: longRunningHistory,
+  maxSteps: 30,
+  tools: { /* … */ },
+  compaction: {
+    threshold: 0.85,
+    keepRecentSteps: 6,
+    layers: ['prune-tool-results', 'summarize'], // no prune-reasoning
+    summarizeModel: anthropic('claude-haiku-5'),
+  },
+});
+```
+
+## The three layers
+
+Layers run in policy order against messages the invariants below don't protect, re-estimating fill after each one, stopping as soon as fill drops under `threshold * 0.8`:
+
+1. **`prune-tool-results`** — old `tool_result` bodies become a `[pruned N chars]` stub. `toolUseId` and `isError` are kept untouched, so the Anthropic "every `tool_use` needs a `tool_result`" invariant still holds.
+2. **`prune-reasoning`** — old assistant `reasoning` parts are dropped. The **last** assistant turn is never touched by this layer, protecting the extended-thinking signature chain.
+3. **`summarize`** — the oldest unprotected contiguous run of messages collapses into **one** new `user`-role summary message. This costs one extra model call (using `summarizeModel`); that call's usage counts toward `result.usage` **and** toward budget stops (see below).
+
+### What's always protected
+
+Regardless of policy, no layer ever touches:
+
+- every `system` message,
+- the first `user` message,
+- the **last** message in history (the pending question — critical when no assistant turn exists yet),
+- the last `keepRecentSteps` assistant turns and everything after them.
+
+## Invariants
+
+- **Immutable, cache-stable history.** Compaction builds new arrays; it never mutates a prior message, and untouched messages keep reference equality so provider prompt-cache hits survive. `response.messages` — what the loop appended — is never affected by compaction; it only ever reflects what happened, not a compacted rewrite. The `summarize` layer does break the cache once (a new message replaces a run of old ones), but the history re-stabilizes from that point on.
+- **Never throws.** A failing `summarize` call (model error, bad output) logs a warning and skips just that layer — it does not fail the call or kill the loop. `prune-tool-results` and `prune-reasoning` cannot fail (they're pure string/array transforms).
+- **Token counts are a calibrated heuristic.** There is no tokenizer and no network call spent counting — fill is estimated, and a session-local EMA factor tightens the estimate against each step's real provider-reported usage as the loop runs. Treat `threshold` as approximate, not exact.
+
+## Streaming: the `compaction` part
+
+`streamChat` emits one `compaction` `StreamPart` (and Deuz UI wire part) per layer that ran and actually changed the history, right before the step it applies to:
+
+```ts
+interface CompactionPart {
+  type: 'compaction';
+  layer: 'prune-tool-results' | 'prune-reasoning' | 'summarize';
+  tokensBefore: number;
+  tokensAfter: number;
+}
+```
+
+```ts title="read-compaction.ts"
+for await (const part of result.fullStream) {
+  if (part.type === 'compaction') {
+    console.log(`compaction: ${part.layer} ${part.tokensBefore} → ${part.tokensAfter}`);
+  }
+}
+```
+
+`generateText` has no stream to emit on — it logs the same event via `deps.logger.info` instead, one line per layer that ran.
+
+## Budget stops see compacted-in summarize usage too
+
+`summarize`'s one extra model call is real, metered usage — it's included in `result.usage`, so it also counts toward [`totalTokensExceed` / `costExceeds`](/docs/agents/tools#budget-stop-conditions) if you've set one. A long research loop that leans hard on `compaction: 'auto'` should budget for the occasional summarize call.
+
+## Interop with Anthropic's native context editing
+
+Anthropic's server-side context editing (`providerOptions.anthropic.context_management`) is untouched by this feature and still works exactly as before — it's a completely separate mechanism (Anthropic edits the conversation on their side, not ours). Its `applied_edits` report comes back on the finish part's `providerMetadata.anthropic.contextManagement`. You can use either, or both: `compaction` acts on the canonical `Message[]` history at the SDK layer regardless of provider, while `context_management` is Anthropic-only and opaque to the SDK.
+
+## See also
+
+- [Tools](/docs/agents/tools) — `prepareStep` (compaction runs before it, every step) and budget stop conditions.
+- [Tool loop](/docs/agents/tool-loop) — the agentic loop this feature only activates inside.
+- [Sub-agents](/docs/agents/subagents) — `agentTool` accepts its own `compaction` policy for long-lived research agents.
+- [streamChat](/docs/core/stream-chat) — the `fullStream` this feature's `compaction` parts ride on.

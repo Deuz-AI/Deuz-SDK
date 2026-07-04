@@ -47,3 +47,15 @@ Everything normalizes to canonical `StreamPart` deltas first so abort/retry/mult
 
 ## 12. Approval: no verdict = DENIED
 On an `approvalResponses` resume, a gated call with no matching response is denied by default (safe side) — it does NOT stay pending for another round. Send a verdict for every `approvalId` you received. Denials are excluded from the runaway error guard, and unknown approvalIds are silently ignored (replay-safe).
+
+## 13. `compaction` only runs inside the agentic loop
+`compaction: 'auto' | CompactionPolicy` (1.4.0+) does nothing on a single-turn call — it only activates when `tools` is present, same gate as the agentic loop itself. Setting `compaction` with no `tools` is a silent no-op, not an error; if you need it, add at least an empty-ish tool set and `maxSteps > 1`.
+
+## 14. Budget stops don't change `finishReason` — read `providerMetadata.deuz.stoppedBy`
+`totalTokensExceed(n)` / `costExceeds(usd)` (1.4.0+) stopping the loop does NOT alter `finishReason` (the union stays whatever the model actually returned, typically `'tool_calls'`). Don't branch on `finishReason` to detect a budget stop — check `result.providerMetadata?.deuz?.stoppedBy` (or the `finish` stream part's `providerMetadata`) instead. Also remember `costExceeds` silently never fires without `deps.priceProvider` (one warning, then it's inert for the rest of the call).
+
+## 15. Client-mode approval does not work inside a sub-agent (1.4)
+`agentTool`'s sub-agent inherits the PARENT's server-mode `approveToolCall` to every depth — that part works today. But breaking into `pendingApprovals`/`tool-approval-request` (client mode, no `approveToolCall`) is NOT supported inside a sub-agent in 1.4; a gated sub-agent tool call with no inherited approver comes back as a clear self-healing is_error instead of pausing. Pass `approveToolCall` on the outermost call if any sub-agent tool needs `needsApproval`. Durable suspend/resume for client-mode sub-agent approval is deferred to 1.5.
+
+## 16. `agentTool`'s map key should match `def.name`
+`agentTool({ name, ... })` uses `name` to build `agentPath` (what shows up in `sub-agent` stream parts and `onUsage`'s `meta.agentPath`), but nothing enforces that it matches the `tools` map key the model actually calls. Always use the same string for both — a mismatch doesn't error, it just makes `agentPath` confusing to read.

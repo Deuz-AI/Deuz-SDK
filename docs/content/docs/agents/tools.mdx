@@ -247,6 +247,98 @@ tools: {
 }
 ```
 
+## `prepareStep` and `activeTools`
+
+Two options on `CommonCallOptions` give you per-step control over the loop — both work identically in `generateText` and `streamChat`, and both only matter when `tools` is present.
+
+`activeTools?: string[]` is a **static** filter: only these `tools` keys are sent to the model, on every step. An unknown name logs a warning and is ignored; if the whole list ends up matching nothing, it fails **open** (the full tool set is sent) rather than silently starving the model of tools.
+
+```ts
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages,
+  maxSteps: 5,
+  tools: { getWeather, search, deleteFile },
+  activeTools: ['getWeather', 'search'], // deleteFile is defined but never offered
+});
+```
+
+`prepareStep` is a **per-step hook**: it runs before *every* model call the loop makes, **after** automatic compaction has run — so it sees the already-compacted history and gets the final word on it.
+
+```ts
+prepareStep?: (ctx: {
+  stepIndex: number;
+  messages: Message[];
+  /** Cumulative REAL usage across all prior steps, sub-agents included. */
+  usage: Usage;
+}) => PrepareStepResult | undefined | Promise<PrepareStepResult | undefined>;
+
+interface PrepareStepResult {
+  messages?: Message[];       // becomes the base history for THIS and all FOLLOWING steps
+  activeTools?: string[];     // THIS step only — overrides the static activeTools, not intersects it
+  toolChoice?: ToolChoice;    // THIS step only
+  model?: LanguageModel;      // THIS step only (return it every step to persist a swap)
+}
+```
+
+Return `undefined` (or omit fields) to keep the current settings. Because `messages` becomes the base for this step **and every step after it**, `prepareStep` doubles as a user-controlled compaction/rewrite hook — including system-prompt edits, which go through rewriting the `system`-role message in `messages` (there's no separate `system` field on this surface). A thrown `prepareStep` fails the call like any caller code: buffered calls reject, streaming calls get an `error` part plus rejected `usage`/`finishReason` — it is never silently swallowed.
+
+```ts title="prepare-step.ts"
+import { generateText, type PrepareStepResult } from '@deuz-sdk/core';
+
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Research, then write the final report.' }],
+  maxSteps: 10,
+  tools: { search, draft, finalize },
+  prepareStep: ({ stepIndex, usage }): PrepareStepResult | undefined => {
+    // First few steps: only allow searching. Later: only allow drafting/finalizing.
+    if (stepIndex < 3) return { activeTools: ['search'] };
+    if (usage.totalTokens > 50_000) return { model: cheaperModel }; // route to save cost
+    return { activeTools: ['draft', 'finalize'] };
+  },
+});
+```
+
+vs AI SDK: their `prepareStep` lives on the `ToolLoopAgent` class, and their context management is fully manual (`pruneMessages` called inside `prepareStep`). Here, `prepareStep` is a plain call option on the free functions, and it composes with [automatic compaction](/docs/core/compaction) — compaction runs first, `prepareStep` sees the result and can still rewrite `messages` itself.
+
+## Budget stop conditions
+
+Alongside `stepCountIs`/`hasToolCall` (now also exported for convenience), two new `StopCondition` factories bound the loop by real spend instead of step count — exported from the root and `/edge`:
+
+```ts
+function totalTokensExceed(n: number): StopCondition;
+function costExceeds(usd: number): StopCondition;
+```
+
+- **`totalTokensExceed(n)`** stops the loop once cumulative **real** usage (`usage.totalTokens`, summed across all steps — sub-agents included) reaches `n`. It reads provider-reported usage, never an estimate.
+- **`costExceeds(usd)`** stops once cumulative cost reaches `usd`. It needs `deps.priceProvider` to compute cost; without one it logs a warning **once** and the condition simply never fires (the loop keeps running under its other stop conditions).
+
+Both OR into `stopWhen` exactly like a hand-written predicate, alongside the implicit `maxSteps` bound, and are evaluated at the **step boundary** — never mid-tool-batch (the same guard that keeps Anthropic from 400ing on an unanswered `tool_use`).
+
+```ts title="budget-stop.ts"
+import { generateText, totalTokensExceed, costExceeds } from '@deuz-sdk/core';
+
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Research this topic exhaustively.' }],
+  maxSteps: 50,
+  tools: { search, /* … */ },
+  stopWhen: [totalTokensExceed(100_000), costExceeds(2.0)], // whichever fires first
+  deps: { priceProvider: myPriceProvider }, // required for costExceeds to ever fire
+});
+```
+
+A budget stop does **not** change `finishReason` — the `FinishReason` union is locked, so it stays whatever the model actually returned (typically `'tool_calls'`). Instead, the result (and the streaming `finish` part) carries a new additive field naming what stopped it:
+
+```ts
+result.providerMetadata?.deuz.stoppedBy; // 'totalTokensExceed' | 'costExceeds' when a budget stop fired
+```
+
+`GenerateTextResult.providerMetadata` is itself a new additive field (`Record<string, Record<string, unknown>>`) — safe to ignore if you don't use budget stops.
+
+vs AI SDK: they ship `isStepCount` / `hasToolCall` / `isLoopFinished` only. Usage is reported back to you, but there is no built-in way to bound the loop by tokens or cost — you'd have to poll `usage` yourself inside a custom stop predicate and still couldn't distinguish "budget stop" from "model stopped naturally" afterward.
+
 ## Controlling tool use with `toolChoice`
 
 `toolChoice` steers whether and which tool the model calls. Each adapter maps it to its wire form:
@@ -274,3 +366,5 @@ const result = await generateText({
 - [streamChat](/docs/core/stream-chat) — stream tool calls and results as they happen.
 - [Tool loop](/docs/agents/tool-loop) — the agentic loop's invariants: immutable history, parallel execution, runaway guards, and the Gemini stop-bug guard.
 - [generateObject](/docs/core/generate-object) — structured output, which reuses the same schema bridge.
+- [Context compaction](/docs/core/compaction) — automatic layered history trimming; runs before `prepareStep` on every step.
+- [Sub-agents](/docs/agents/subagents) — `agentTool` wraps a whole nested loop (with its own `prepareStep`/`activeTools`/stop conditions) as a callable `Tool`.
