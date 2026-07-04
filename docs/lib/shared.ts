@@ -1,4 +1,5 @@
 export const appName = 'Deuz SDK';
+export const siteUrl = 'https://deuz-sdk.tech';
 export const docsRoute = '/docs';
 export const docsImageRoute = '/og/docs';
 export const docsContentRoute = '/llms.mdx/docs';
