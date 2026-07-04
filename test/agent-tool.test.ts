@@ -66,7 +66,11 @@ function textSse(text: string) {
     },
     {
       event: 'message_delta',
-      data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 6 } },
+      data: {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: { output_tokens: 6 },
+      },
     },
     { event: 'message_stop', data: { type: 'message_stop' } },
   ]);
@@ -112,7 +116,11 @@ describe('agentTool — orchestrator → worker', () => {
       model: model(fetch),
       messages: [{ role: 'user', content: 'go' }],
       tools: {
-        worker: agentTool({ name: 'worker', description: 'w', model: model(fetch, 'claude-haiku-4-5') }),
+        worker: agentTool({
+          name: 'worker',
+          description: 'w',
+          model: model(fetch, 'claude-haiku-4-5'),
+        }),
       },
       maxSteps: 5,
     });
@@ -191,9 +199,7 @@ describe('agentTool — orchestrator → worker', () => {
     expect(res.text).toBe('final');
     // The outer sub-agent's 2nd call (after the refused inner) shows the
     // is_error depth message fed back.
-    const bodies = calls.map((c) =>
-      JSON.stringify(JSON.parse(String(c.init!.body)).messages),
-    );
+    const bodies = calls.map((c) => JSON.stringify(JSON.parse(String(c.init!.body)).messages));
     expect(bodies.some((b) => b.includes('max agent depth'))).toBe(true);
   });
 });
@@ -348,7 +354,11 @@ describe('agentTool — usage', () => {
       model: model(fetch),
       messages: [{ role: 'user', content: 'go' }],
       tools: {
-        worker: agentTool({ name: 'worker', description: 'w', model: model(fetch, 'claude-haiku-4-5') }),
+        worker: agentTool({
+          name: 'worker',
+          description: 'w',
+          model: model(fetch, 'claude-haiku-4-5'),
+        }),
       },
       maxSteps: 5,
       deps: { onUsage },
@@ -376,7 +386,11 @@ describe('agentTool — usage', () => {
       model: model(fetch),
       messages: [{ role: 'user', content: 'go' }],
       tools: {
-        worker: agentTool({ name: 'worker', description: 'w', model: model(fetch, 'claude-haiku-4-5') }),
+        worker: agentTool({
+          name: 'worker',
+          description: 'w',
+          model: model(fetch, 'claude-haiku-4-5'),
+        }),
       },
       maxSteps: 5,
       onUsage, // CALL-level, not deps.onUsage
@@ -396,7 +410,11 @@ describe('agentTool — usage', () => {
       () => sseResponse([textSse('outer done')]), // outer
       () => sseResponse([textSse('final')]), // parent
     ]);
-    const inner = agentTool({ name: 'inner', description: 'i', model: model(fetch, 'claude-haiku-4-5') });
+    const inner = agentTool({
+      name: 'inner',
+      description: 'i',
+      model: model(fetch, 'claude-haiku-4-5'),
+    });
     const outer = agentTool({
       name: 'outer',
       description: 'o',
@@ -427,7 +445,11 @@ describe('agentTool — usage', () => {
       model: model(fetch),
       messages: [{ role: 'user', content: 'go' }],
       tools: {
-        worker: agentTool({ name: 'worker', description: 'w', model: model(fetch, 'claude-haiku-4-5') }),
+        worker: agentTool({
+          name: 'worker',
+          description: 'w',
+          model: model(fetch, 'claude-haiku-4-5'),
+        }),
       },
       maxSteps: 5,
       stopWhen: totalTokensExceed(40), // 15 alone < 40; +26 sub-agent = 41 ≥ 40 → stop after step 0

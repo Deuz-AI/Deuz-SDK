@@ -37,7 +37,11 @@ const TOOL_CALL = sseEvents([
   { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
   {
     event: 'message_delta',
-    data: { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } },
+    data: {
+      type: 'message_delta',
+      delta: { stop_reason: 'tool_use' },
+      usage: { output_tokens: 5 },
+    },
   },
   { event: 'message_stop', data: { type: 'message_stop' } },
 ]);
@@ -57,7 +61,11 @@ const FINAL = sseEvents([
   },
   {
     event: 'message_delta',
-    data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 6 } },
+    data: {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 6 },
+    },
   },
   { event: 'message_stop', data: { type: 'message_stop' } },
 ]);
@@ -82,7 +90,11 @@ const SUMMARY = sseEvents([
   },
   {
     event: 'message_delta',
-    data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 8 } },
+    data: {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 8 },
+    },
   },
   { event: 'message_stop', data: { type: 'message_stop' } },
 ]);
@@ -104,7 +116,10 @@ function bigHistory(turns: number): Message[] {
         { type: 'tool_use', id: `old_${i}`, name: 'search', input: { q: `old ${i}` } },
       ],
     });
-    msgs.push({ role: 'tool', content: [{ type: 'tool_result', toolUseId: `old_${i}`, result: 'z'.repeat(400) }] });
+    msgs.push({
+      role: 'tool',
+      content: [{ type: 'tool_result', toolUseId: `old_${i}`, result: 'z'.repeat(400) }],
+    });
   }
   msgs.push({ role: 'user', content: 'Current question.' });
   return msgs;
@@ -142,7 +157,11 @@ describe('compaction wired into the loop', () => {
       tools: TOOLS,
       maxSteps: 5,
       // Prune-only: no summarize side-call → deterministic 2 fetches.
-      compaction: { threshold: 0, keepRecentSteps: 1, layers: ['prune-tool-results', 'prune-reasoning'] },
+      compaction: {
+        threshold: 0,
+        keepRecentSteps: 1,
+        layers: ['prune-tool-results', 'prune-reasoning'],
+      },
     });
     expect(res.text).toBe('Done.');
     expect(calls).toHaveLength(2);

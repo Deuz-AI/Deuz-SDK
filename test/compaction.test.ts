@@ -278,10 +278,14 @@ describe('summarize layer', () => {
     // A message-count estimate (the real loop's estimator is circular-safe too;
     // this test's default jsonEstimate helper is not, and must not mask the fix).
     const countEstimate = (m: Message[]): number => m.length;
-    const res = await applyCompaction(msgs, policy({ threshold: 0.5, layers: ['prune-tool-results'] }), {
-      estimate: countEstimate,
-      contextWindow: 1,
-    });
+    const res = await applyCompaction(
+      msgs,
+      policy({ threshold: 0.5, layers: ['prune-tool-results'] }),
+      {
+        estimate: countEstimate,
+        contextWindow: 1,
+      },
+    );
     expect(toolResult(res.messages[3]).result).toMatch(/^\[pruned \d+ chars\]$/);
     expect(toolResult(res.messages[5]).result).toMatch(/^\[pruned \d+ chars\]$/);
   });
@@ -391,7 +395,9 @@ describe('layer order & early stop', () => {
       policy({ layers: ['prune-reasoning', 'prune-tool-results'] }),
       { estimate, contextWindow: 12500 },
     );
-    expect(res.events).toEqual([{ layer: 'prune-reasoning', tokensBefore: 12000, tokensAfter: 8000 }]);
+    expect(res.events).toEqual([
+      { layer: 'prune-reasoning', tokensBefore: 12000, tokensAfter: 8000 },
+    ]);
     for (const i of [3, 5, 7, 9]) expect(res.messages[i]).toBe(msgs[i]); // tool results kept
   });
 

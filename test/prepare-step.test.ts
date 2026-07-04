@@ -37,7 +37,11 @@ const TOOL_CALL = sseEvents([
   { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
   {
     event: 'message_delta',
-    data: { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } },
+    data: {
+      type: 'message_delta',
+      delta: { stop_reason: 'tool_use' },
+      usage: { output_tokens: 5 },
+    },
   },
   { event: 'message_stop', data: { type: 'message_stop' } },
 ]);
@@ -58,7 +62,11 @@ const FINAL = sseEvents([
   },
   {
     event: 'message_delta',
-    data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 6 } },
+    data: {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 6 },
+    },
   },
   { event: 'message_stop', data: { type: 'message_stop' } },
 ]);

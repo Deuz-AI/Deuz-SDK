@@ -74,7 +74,8 @@ export function agentTool(def: AgentToolDef): Tool {
             ...parentDeps,
             ...(parentDeps.onUsage
               ? {
-                  onUsage: (u, m) => parentDeps.onUsage!(u, { ...m, agentPath: m.agentPath ?? path }),
+                  onUsage: (u, m) =>
+                    parentDeps.onUsage!(u, { ...m, agentPath: m.agentPath ?? path }),
                 }
               : {}),
           }

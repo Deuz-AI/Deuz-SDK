@@ -22,7 +22,10 @@ export const stepCountIs = (n: number): StopCondition =>
 
 /** Stop once the latest step called a tool named `name`. */
 export const hasToolCall = (name: string): StopCondition =>
-  named('hasToolCall', ({ steps }) => steps.at(-1)?.toolCalls.some((c) => c.toolName === name) ?? false);
+  named(
+    'hasToolCall',
+    ({ steps }) => steps.at(-1)?.toolCalls.some((c) => c.toolName === name) ?? false,
+  );
 
 /**
  * Stop once cumulative REAL token usage (all steps, sub-agents included)

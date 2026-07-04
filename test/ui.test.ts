@@ -179,8 +179,20 @@ describe('Deuz UI wire', () => {
       messages: [
         { role: 'system', content: 'sys' },
         { role: 'user', content: 'task' },
-        { role: 'assistant', content: [{ type: 'reasoning', text: 'r '.repeat(50) }, { type: 'text', text: 'a' }] },
-        { role: 'assistant', content: [{ type: 'reasoning', text: 'r '.repeat(50) }, { type: 'text', text: 'b' }] },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'r '.repeat(50) },
+            { type: 'text', text: 'a' },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'r '.repeat(50) },
+            { type: 'text', text: 'b' },
+          ],
+        },
         { role: 'user', content: 'go' },
       ],
       tools: { getWeather: { parameters: SCHEMA, execute: vi.fn(async () => ({ temp: 1 })) } },
