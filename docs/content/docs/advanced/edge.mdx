@@ -39,10 +39,14 @@ It exports exactly:
 
 | Export | Kind |
 | --- | --- |
-| `streamChat`, `generateText`, `generateObject` | functions |
+| `streamChat`, `generateText`, `generateObject`, `streamObject` | functions |
+| `stepCountIs`, `hasToolCall`, `totalTokensExceed`, `costExceeds` | functions (stop conditions) |
 | `createClient`, `resolveDependencies` | functions |
+| `agentTool` | function |
+| `AgentToolDef` | type |
+| `anthropicWebSearch`, `openaiWebSearch`, `googleSearch` | functions (server tools) |
 | `DeuzClient` | type |
-| `DeuzError`, `NotImplementedError` | error classes |
+| `DeuzError`, `NotImplementedError`, `NoObjectGeneratedError` | error classes |
 | everything from the canonical types (`Message`, `Part`, `Usage`, `StreamPart`, `LanguageModel`, `CommonCallOptions`, …) | `export type *` |
 
 ```ts title="edge bundle (guaranteed safe)"

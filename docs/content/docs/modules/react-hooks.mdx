@@ -80,7 +80,7 @@ await submit({ dish: 'menemen' });
 // object: DeepPartial<Recipe> | undefined — every field optional at every depth
 ```
 
-Each `object-delta` **replaces** `object` wholesale (no merging needed). String fields stream truncated (`'mene'` → `'menemen'`), so render defensively. Wire `error` parts and rejected fetches land in `error`; `stop()` aborts without erroring.
+Each `object-delta` **replaces** `object` wholesale (no merging needed). String fields stream truncated (`'mene'` → `'menemen'`), so render defensively. Wire `error` parts and rejected fetches land in `error`; `stop()` aborts without erroring. Like `useChat`, `useObject` also accepts `headers` (merged into the POST request) and `fetch` (an injectable transport for tests or custom auth) — e.g. `useObject<Recipe>({ api: '/api/recipe', headers: { authorization }, fetch: myFetch })`.
 
 Server side:
 

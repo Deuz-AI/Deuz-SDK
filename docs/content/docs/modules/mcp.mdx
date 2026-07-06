@@ -158,6 +158,8 @@ const mcp = await createMcpClient({
 
 Return `{ action: 'accept', content? }`, `{ action: 'decline' }`, or `{ action: 'cancel' }`. Form-mode `content` must match `requestedSchema`. URL mode exists for sensitive flows (OAuth, payment, API keys) that must not pass through the client — treat the URL as untrusted, display the full host, and let the user decide.
 
+Passing `onElicitationRequest` at connect time is the normal path. The lower-level `registerElicitation(client, handler)` is also exported from `@deuz-sdk/core/mcp` to attach a handler to an already-connected raw MCP client (it throws if the peer is older than `^1.29.0`).
+
 ## HTTP server in a tool loop
 
 Connect to a remote MCP server, list its tools, and let the model use them. Remember to `close()`.

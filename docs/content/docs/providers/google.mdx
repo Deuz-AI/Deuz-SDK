@@ -80,6 +80,7 @@ Reasoning models emit a `thoughtSignature` on reasoning and tool-call parts. The
 
 ```ts
 import { generateText, googleSearch } from '@deuz-sdk/core';
+import { googleNative } from '@deuz-sdk/core/google';
 
 const res = await generateText({
   model: googleNative('gemini-3.5-flash'),
@@ -122,7 +123,7 @@ These are flagged in the capability registry and normalized before any consumer 
 
 ## Explicit caching + Files API
 
-The native adapter passes through an opaque `cachedContent` name and `fileData.fileUri` parts, but it does not create them. The `@deuz-sdk/core/google/extras` subpath is the producer side: `createGeminiCache` mints a reusable cache, and `uploadFile` pushes large media through the Files API. Both are edge-safe (`fetch` + Web APIs only) and work against AI Studio (API key) or Vertex (OAuth2 Bearer + project/location).
+The native adapter passes through an opaque `cachedContent` name and `fileData.fileUri` parts, but it does not create them. The `@deuz-sdk/core/google/extras` subpath is the producer side: `createGeminiCache` mints a reusable cache, and `uploadFile` pushes large media through the Files API. Both are edge-safe (`fetch` + Web APIs only). The cache helpers work against AI Studio (API key) or Vertex (OAuth2 Bearer + project/location); `uploadFile` (Files API) is AI Studio only — on Vertex it throws, so upload to Google Cloud Storage and pass a `gs://` fileUri instead.
 
 ### Explicit caching
 

@@ -1,6 +1,7 @@
 ---
 title: Installation
 description: Install @deuz-sdk/core, check runtime requirements, and pick the optional peers and subpath exports you need.
+icon: Download
 ---
 
 `@deuz-sdk/core` is a single package with **zero runtime dependencies**. Install it, and the chat core, the agentic tool loop, streaming, and the canonical UI wire are all available out of the box. Heavier or stateful capabilities (schema-typed objects, MCP, document parsing) pull in optional peers only when you actually use them.
@@ -74,7 +75,7 @@ The root export carries the free functions, the client, errors, and all canonica
 
 | Import | Purpose |
 | --- | --- |
-| `@deuz-sdk/core` | Free functions (`streamChat`, `generateText`, `generateObject`, `embed`, `embedMany`), `createClient`, error taxonomy, pricing, middleware, all types |
+| `@deuz-sdk/core` | Free functions (`streamChat`, `generateText`, `generateObject`, `streamObject`, `embed`, `embedMany`), `createClient`, error taxonomy, pricing, middleware, all types |
 | `@deuz-sdk/core/anthropic` | Anthropic Messages provider (`createAnthropic`) |
 | `@deuz-sdk/core/openai` | OpenAI Chat Completions + Responses (`createOpenAI`, `createOpenAIResponses`) + `openaiEmbedding` |
 | `@deuz-sdk/core/xai` | xAI Grok, OpenAI-compatible (`createXai`) |

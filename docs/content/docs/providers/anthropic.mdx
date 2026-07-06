@@ -125,7 +125,7 @@ The `signature` round-trips automatically inside the agentic loop — preserve a
 
 ## Vision
 
-Pass an `image` part. The value may be a base64 string, a data URL, an `http(s)` URL, or raw `Uint8Array` bytes; `mediaType` is forwarded as the source `media_type`.
+Pass an `image` part. The value may be a base64 string, a data URL, an `http(s)` URL, or raw `Uint8Array` bytes. For base64/data-URL/`Uint8Array` images `mediaType` is forwarded as the source `media_type`; for an `http(s)` URL the media type is inferred by Anthropic from the URL (the `url` source carries no `media_type`).
 
 ```ts title="vision.ts"
 import { generateText } from '@deuz-sdk/core';

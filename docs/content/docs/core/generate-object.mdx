@@ -67,7 +67,7 @@ In tool mode, the payload is collected from the **first** tool call's accumulate
 
 ### Special case: Anthropic + extended thinking (the G3 rule)
 
-Anthropic rejects a forced `tool_choice` while extended thinking is enabled (HTTP 400). So when the model is Anthropic, reasoning is supported, and `effort` is set to anything other than `'none'`, `generateObject` overrides a would-be `tool` strategy to `json` automatically. You do not need to set `mode` yourself for this case.
+Anthropic rejects a forced `tool_choice` while extended thinking is enabled (HTTP 400). So when the model is Anthropic and extended thinking is on, `generateObject` overrides a would-be `tool` strategy to `json` automatically. Thinking counts as on either when `effort` is set to anything other than `'none'`, **or** unconditionally for adaptive-thinking flagship models whose thinking can't be disabled (registry `effortWire: 'output_config'` — e.g. `claude-opus-4-8`, `claude-sonnet-5`, `claude-fable-5`, `claude-opus-4-7`). For those models the override fires even with `effort` unset or `'none'`. You do not need to set `mode` yourself for this case.
 
 ## Repair retry and failure
 
@@ -208,5 +208,5 @@ const { object } = await generateObject({
 ## Notes
 
 - API keys are read from `process.env` at the application layer and passed into the provider factory. The SDK core never reads environment variables itself.
-- Reasoning controls (`effort`) and sampling params from `CommonCallOptions` apply here too. On Anthropic, setting `effort` other than `'none'` forces json mode (see the G3 rule above).
+- Reasoning controls (`effort`) and sampling params from `CommonCallOptions` apply here too. On Anthropic, extended thinking forces json mode over a `tool` strategy — either when `effort` is set to something other than `'none'`, or unconditionally on adaptive-thinking flagship models (`effortWire: 'output_config'`, e.g. `claude-opus-4-8`) whose thinking can't be turned off (see the G3 rule above).
 - For streaming free-form text see [streamChat](/docs/core/stream-chat); for tool-using agentic loops see [generateText](/docs/core/generate-text).

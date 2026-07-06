@@ -18,6 +18,7 @@ interface Usage {
   cacheWriteTokens: number; // 5-minute cache writes (Anthropic)
   cacheWrite1hTokens: number; // 1-hour cache writes (Anthropic)
   audioTokens?: number; // audio in/out, when billed separately
+  serverToolUses?: number; // provider-executed tool calls (e.g. web searches), billed per call, not tokens
   totalTokens: number;
 }
 ```
@@ -51,6 +52,7 @@ const result = streamChat({
 | `model` | `string` | The model id the call ran against. |
 | `reason` | `'finished' \| 'aborted' \| 'error'` | `'aborted'` carries partial usage; `'error'` carries what was counted before the failure. |
 | `ttftMs` | `number` (optional) | Time-to-first-token in milliseconds, when measured. |
+| `agentPath` | `string[]` (optional) | Sub-agent path when the usage came from an `agentTool` loop; use it to attribute cost per sub-agent. |
 
 To attach cost, compute it inside your `onUsage` handler from the `Usage` — either with [`priceUsage`](#priceusage) directly or a [`PriceProvider`](#priceprovider-and-the-deps-seam).
 
@@ -89,6 +91,7 @@ How each bucket is priced (USD per 1,000,000 tokens):
 - `cacheWriteTokens` → `cacheWrite` rate (default: 1.25 × `input`).
 - `cacheWrite1hTokens` → `cacheWrite1h` rate (default: 2 × `input`).
 - `audioTokens` → `audio` rate (default: `input`).
+- `serverToolUses` → **not priced.** Provider-executed tool calls (e.g. web searches) are billed per call, not per token; `priceUsage`/`PRICES_2026` ignore this bucket, so add any server-tool cost separately in your app.
 
 The result is clamped to be non-negative and rounded to micro-dollars (6 decimals) to avoid float dust.
 

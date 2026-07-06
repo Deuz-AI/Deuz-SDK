@@ -66,7 +66,7 @@ import { createEmbedder } from '@deuz-sdk/core/memory';
 import { createGoogleEmbedding } from '@deuz-sdk/core/google';
 
 const google = createGoogleEmbedding({ apiKey: process.env.GOOGLE_API_KEY! });
-const embedder = createEmbedder(google('text-embedding-004'));
+const embedder = createEmbedder(google('gemini-embedding-001'));
 ```
 
 ## The MemoryStore seam
@@ -106,7 +106,7 @@ interface MemoryStore {
 | `topK` | `number` | `5` | Existing-memory retrieval breadth for reconciliation. |
 | `supersede` | `'soft' \| 'hard'` | `'hard'` | `soft` → set `invalidAt` instead of deleting (bi-temporal history). |
 | `ttlMs` | `number` | — | Absolute expiry written as `expiresAt`. |
-| `kind` | `MemoryKind` | `'semantic'` | `'episodic' \| 'semantic' \| 'working' \| 'procedural'`. |
+| `kind` | `MemoryKind` | `'semantic'` (`'episodic'` when `infer: false`) | `'episodic' \| 'semantic' \| 'working' \| 'procedural'`. |
 | `customInstructions` | `string` | — | Appended to the extraction system prompt. |
 | `customExtract` | `(messages) => MemoryFact[]` | — | Replace the LLM extraction step entirely. |
 
@@ -143,7 +143,7 @@ const llm: MemoryLLM = async ({ system, user }) => {
 
 const seams: MemorySeams = {
   store: createInMemoryMemoryStore(),
-  embedder: createEmbedder(google('text-embedding-004')),
+  embedder: createEmbedder(google('gemini-embedding-001')),
   llm,
   clock: { now: () => Date.now(), setTimeout: (fn, ms) => (setTimeout(fn, ms), () => {}) },
   generateId: () => crypto.randomUUID(),
@@ -189,7 +189,7 @@ interface MemoryQuery {
 | `dropExpired` | `boolean` | `true` | Filter out records whose `expiresAt <= clock.now()`. |
 | `scorer` | `MemoryScorer` | — | Rerank by recency · importance · relevance (`defaultMemoryScorer` provided). |
 
-`formatMemoriesForPrompt(hits, opts?)` renders the hits into a bulleted block for splicing into a system prompt (empty string when there are no hits).
+`formatMemoriesForPrompt(hits, opts?)` renders the hits into a bulleted block for splicing into a system prompt (empty string when there are no hits). `opts` accepts `header` (default `'Relevant memories:'`) and `maxChars` (hard-truncates the rendered block to bound prompt-token cost).
 
 ## Injecting memory into a chat loop
 
@@ -278,7 +278,7 @@ const llm: MemoryLLM = async ({ system, user }) => {
 const seams: MemorySeams = {
   // The vault lives on disk; commit it to git for human-auditable memory.
   store: createMarkdownMemoryStore({ dir: './data/memories' }),
-  embedder: createEmbedder(google('text-embedding-004')),
+  embedder: createEmbedder(google('gemini-embedding-001')),
   llm,
   clock: { now: () => Date.now(), setTimeout: (fn, ms) => (setTimeout(fn, ms), () => {}) },
   generateId: () => crypto.randomUUID(),

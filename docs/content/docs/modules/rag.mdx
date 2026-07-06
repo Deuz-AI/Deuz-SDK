@@ -81,6 +81,13 @@ console.log(doc.pages, doc.text.length);
 
 The peers are only loaded when a parser actually runs, so importing `rag/node` on the edge stays harmless until invoked.
 
+### Standalone parsing helpers
+
+The pieces the `parse` pipeline uses internally are also exported directly, for when you already have text or markup in hand:
+
+- `parseCsv(text, { delimiter? })` → `string[][]` and `csvToText(rows)` → tab/newline text (`@deuz-sdk/core/rag`) — the pure CSV state machine (RFC-style quoting), usable without going through `parse`.
+- `htmlToBlocks(html)` → `DocBlock[]` (`@deuz-sdk/core/rag/node`) — recover headings / paragraphs / list items from an HTML string.
+
 ## Chunking
 
 All three chunkers are pure and token-aware. They share `ChunkOptions`:
@@ -311,8 +318,10 @@ const context = hits.map((h) => h.text).join('\n\n---\n\n');
 
 const { text } = await generateText({
   model: createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })('claude-opus-4-8'),
-  system: 'Answer using only the provided context. Cite nothing you cannot find there.',
-  prompt: `Context:\n${context}\n\nQuestion: ${question}`,
+  messages: [
+    { role: 'system', content: 'Answer using only the provided context. Cite nothing you cannot find there.' },
+    { role: 'user', content: `Context:\n${context}\n\nQuestion: ${question}` },
+  ],
 });
 ```
 

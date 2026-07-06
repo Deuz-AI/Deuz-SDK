@@ -139,7 +139,7 @@ A fired timer aborts the request with a `TimeoutError` whose `layer` is `'ttft'`
 
 This distinction is deliberate and load-bearing:
 
-- A **`TimeoutError`** is a genuine failure. It surfaces as an `error` part on `fullStream`, and `usage` / `finishReason` reject with it. A `ttft` timeout occurs before any content, so it participates in pre-first-byte retry; a `total` timeout is mid-stream and final.
+- A **`TimeoutError`** is a genuine failure. It surfaces as an `error` part on `fullStream`, and `usage` / `finishReason` reject with it. Neither layer is retried. A fired timer aborts `fetch` with the `TimeoutError` as the abort reason, and the pump rethrows any `TimeoutError` straight out of the retry loop before the budget is even consulted (`inference.ts`: `if (err instanceof TimeoutError || isUserAbort(...)) throw err`). So both a `ttft` timeout (during the handshake or before the first content delta) and a `total` timeout are final failures — never retried.
 - A **user abort** (you called `controller.abort()`) is *not* an error. The pump resolves `finishReason` with `'aborted'` and resolves `usage` with the partial token counts gathered so far. No `error` part is emitted, and the abort is never retried.
 
 ```ts
@@ -234,14 +234,16 @@ interface BreakerStore {
 }
 ```
 
-The critical wiring rule is **per-client resolution (G11)**: when you use [`createClient`](/docs/core/dependencies#createclient), the breaker store is resolved **once** for the client and shared across every call. A fresh in-memory store per call could never accumulate failures and so would never trip. If you inject your own store, supply it once at the client level:
+Note: core does not currently read or write this store — it accumulates no failures and never opens or trips a breaker on its own. The seam exists so the `BreakerStore` type and its per-client wiring are locked now; today it is a hook for a caller-implemented breaker.
+
+The critical wiring rule is **per-client resolution (G11)**: when you use [`createClient`](/docs/core/dependencies#createclient), the breaker store is resolved **once** for the client and shared across every call. The per-client rule matters for any breaker you build on this seam: a fresh in-memory store per call could never accumulate state across calls. If you inject your own store, supply it once at the client level:
 
 ```ts
 import { createClient } from '@deuz-sdk/core';
 import type { BreakerStore, BreakerState } from '@deuz-sdk/core';
 
 // A custom store backed by your own state (e.g. Redis/Durable Object). Shared
-// across calls so failures accumulate (G11).
+// across calls so any state your own breaker records persists across calls (G11).
 const states = new Map<string, BreakerState>();
 const breakerStore: BreakerStore = {
   get: (key) => states.get(key),
@@ -256,7 +258,7 @@ export const deuz = createClient({
 });
 ```
 
-Both `get` and `set` may return a `Promise`, so the store can be backed by a remote/persistent service for a multi-instance deployment — share one breaker across your fleet by pointing every instance at the same backend.
+Both `get` and `set` may return a `Promise`, so the store can be backed by a remote/persistent service for a multi-instance deployment — share breaker state across your fleet by pointing every instance at the same backend.
 
 ## Related
 

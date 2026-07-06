@@ -92,6 +92,8 @@ const result = await generateText({
 
 Per-step and usage callbacks exist as call options: `onStepFinish(step)`, `onUsage(usage, meta)`, and `onFinish(meta)`. There is no separate `experimental_` namespace — these are stable fields on the call options.
 
+The AI SDK's `experimental_prepareStep` maps to the stable `prepareStep` hook. It runs before every model turn (after automatic compaction) and returns per-step overrides: `model` (per-step model routing), `activeTools` (restrict the wire-visible tools this step), `toolChoice`, and `messages`. A static, all-steps tool filter is also available as the top-level `activeTools` option.
+
 ## Code: basic stream
 
 ```ts title="before-stream.ts"
@@ -238,7 +240,7 @@ export async function POST(req: Request) {
 }
 ```
 
-Until the React hooks ship, consume the stream on the client with `readDeuzStream`:
+The [`useChat`](/docs/modules/react-hooks) / [`useObject`](/docs/modules/react-hooks) hooks (`@deuz-sdk/core/react`) consume this wire for you; to read it directly without React, use `readDeuzStream`:
 
 ```ts title="client.ts"
 import { readDeuzStream } from '@deuz-sdk/core/ui';

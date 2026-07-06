@@ -1,6 +1,7 @@
 ---
 title: Introduction
 description: A pure, web-first, multi-provider TypeScript AI SDK with zero runtime dependencies and one canonical streaming wire.
+icon: BookOpen
 ---
 
 `@deuz-sdk/core` is a from-scratch TypeScript AI SDK that talks to Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex AI, and Yunwu through **one canonical streaming protocol**. It depends on no other AI SDK, ships **zero runtime dependencies**, and runs anywhere `fetch` runs — Node, Deno, Bun, and Vercel/Cloudflare Edge. Use it when you want full control over the wire, deterministic and replayable behavior, and no vendor lock-in at the streaming or UI layer.
@@ -13,7 +14,7 @@ Requires **Node >= 22**. The chat core has nothing in `dependencies`. Optional p
 
 ## Start by use case
 
-- **Build a chatbot** → [Quickstart](/docs/quickstart) + [UI streaming](/docs/modules/ui-streaming)
+- **Build a chatbot** → [Quickstart](/docs/quickstart) + [React hooks](/docs/modules/react-hooks) + [UI streaming](/docs/modules/ui-streaming)
 - **Build a coding agent** → [Tools](/docs/agents/tools) + [Sub-agents](/docs/agents/subagents) + [Budget stops](/docs/agents/tool-loop)
 - **Build a long-running agent** → [Compaction](/docs/core/compaction) + [prepareStep](/docs/agents/tool-loop)
 - **Use provider-native search** → [Provider-executed tools](/docs/agents/server-tools)
@@ -91,6 +92,8 @@ const { object } = await generateObject({
 });
 ```
 
+For streaming structured output, [streamObject](/docs/core/stream-object) returns synchronously and emits `DeepPartial<T>` via `partialObjectStream`, with a validated final `object` promise.
+
 ## Feature overview
 
 | Area | What you get | Page |
@@ -98,6 +101,7 @@ const { object } = await generateObject({
 | Streaming chat | Lazy, never-throwing canonical stream with usage and finish-reason promises | [streamChat](/docs/core/stream-chat) |
 | Text generation | Buffered single-turn or multi-step text | [generateText](/docs/core/generate-text) |
 | Structured output | Schema-typed objects (Standard Schema or JSON Schema) with auto json/tool strategy | [generateObject](/docs/core/generate-object) |
+| Structured output (streaming) | Progressive `DeepPartial<T>` via `partialObjectStream` with a validated final `object` | [streamObject](/docs/core/stream-object) |
 | Embeddings | `embed` / `embedMany` with auto-batching and concurrency caps | [Embeddings](/docs/core/embeddings) |
 | Agentic tools | Parallel, self-healing tool loop with runaway guards | [Tools](/docs/agents/tools) and [Tool loop](/docs/agents/tool-loop) |
 | Memory | mem0 extract/reconcile pipeline over a vector or Obsidian-markdown store | [Memory](/docs/modules/memory) |
@@ -106,6 +110,7 @@ const { object } = await generateObject({
 | MCP | Model Context Protocol client (HTTP/SSE edge-safe; stdio Node-only) | [MCP](/docs/modules/mcp) |
 | Image generation | Sync OpenAI-compatible generation, async Midjourney, Yunwu relay | [Image generation](/docs/modules/image-generation) |
 | UI streaming | `toDeuzStreamResponse` (server) and `readDeuzStream` (client) | [UI streaming](/docs/modules/ui-streaming) |
+| React hooks | `useChat` (client-tool round-trips + approval pauses) and `useObject` over the Deuz UI wire; React is an optional peer | [React hooks](/docs/modules/react-hooks) |
 | Middleware | `wrapModel` with logging, caching, PII redaction, injection guard | [Middleware](/docs/modules/middleware) |
 | Pricing | Optional token-to-USD cost table | [Pricing](/docs/modules/pricing) |
 

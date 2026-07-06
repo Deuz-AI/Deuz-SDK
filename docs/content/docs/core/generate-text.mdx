@@ -27,7 +27,7 @@ const result = await generateText(options);
 | `maxOutputTokens` | `number` | provider | Cap on generated tokens. |
 | `topP` | `number` | provider | Nucleus sampling. |
 | `stopSequences` | `string[]` | — | Hard stop strings. |
-| `effort` | `'none' \| 'low' \| 'medium' \| 'high'` | — | Canonical reasoning effort; each adapter maps it to its own unit. |
+| `effort` | `'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'` | — | Canonical reasoning effort; each adapter maps it to its own unit (`'xhigh'`/`'max'` clamp down on wires that lack them). |
 | `signal` | `AbortSignal` | — | Cancellation; propagated to the underlying fetch and to tool `execute`. |
 | `maxRetries` | `number` | `2` | Pre-first-byte retries only. |
 | `headers` | `Record<string, string>` | — | Extra request headers. |
@@ -44,6 +44,11 @@ Agentic options (only meaningful with `tools`):
 | `stopWhen` | `StopCondition \| StopCondition[]` | — | Extra stop predicate(s), OR-ed with `maxSteps`. |
 | `maxToolConcurrency` | `number` | `5` | Max parallel tool executions per step. |
 | `onStepFinish` | `(step: StepResult) => void` | — | Fires after each completed step. |
+| `prepareStep` | `(ctx) => PrepareStepResult \| undefined \| Promise<…>` | — | Pre-step hook run before every model call (after compaction). Return per-step overrides to rewrite `messages`, swap the `model`, restrict `activeTools`, or override `toolChoice` for that step. |
+| `compaction` | `'auto' \| CompactionPolicy` | off | Opt-in automatic layered context compaction for the loop. Pruning is free; the summarize layer costs one extra model call whose usage counts toward the total. History stays immutable. |
+| `activeTools` | `string[]` | — | Static tool filter: only these `tools` keys are sent to the model across all steps; unknown names log a warning and are ignored. `prepareStep`'s `activeTools` overrides it per step. |
+| `approveToolCall` | `(call, ctx) => boolean \| Promise<boolean>` | — | Server-mode approval gate for `needsApproval` tools; return `false` (or throw) to deny — denials become an `is_error` tool result and the loop continues. |
+| `approvalResponses` | `ToolApprovalResponse[]` | — | Resume after a client-mode break: verdicts for the trailing assistant turn's pending calls. Unmatched pending calls are denied by default. |
 
 ## Result shape
 
@@ -56,6 +61,7 @@ interface GenerateTextResult {
   steps?: StepResult[];
   toolCalls?: ToolCall[];
   toolResults?: ToolResult[];
+  pendingApprovals?: ToolApprovalRequest[];
 }
 ```
 
@@ -68,6 +74,7 @@ interface GenerateTextResult {
 | `steps` | `StepResult[]` | with tools | Per-step breakdown. **`undefined` on a single-turn call** (no `tools`). |
 | `toolCalls` | `ToolCall[]` | with tools | Convenience: the last tool-calling step's calls. |
 | `toolResults` | `ToolResult[]` | with tools | Convenience: that step's results. |
+| `pendingApprovals` | `ToolApprovalRequest[]` | client-mode approval break | Calls awaiting a verdict when a `needsApproval` tool broke the loop; resume by calling again with `approvalResponses`. |
 
 `response.messages` only contains the *new* turns this call produced — append them to your prior `messages` to continue the conversation.
 
@@ -195,6 +202,22 @@ for (const step of result.steps ?? []) {
 
 `stopWhen` adds predicate(s) that are OR-ed with `maxSteps`. A `StopCondition` is a function over the loop state; return `true` to stop after the current step.
 
+The SDK also ships four ready-made stop conditions you can import from `@deuz-sdk/core` instead of writing your own: `stepCountIs(n)`, `hasToolCall(name)`, `totalTokensExceed(n)`, and `costExceeds(usd)`. The last two read the real provider-reported usage accumulated across all steps; `costExceeds` needs `deps.priceProvider` injected (without one it warns once and never fires).
+
+```ts
+import { stepCountIs, totalTokensExceed } from '@deuz-sdk/core';
+
+// Stop at 10 steps or once accumulated usage crosses 50k tokens.
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Plan my trip.' }],
+  stopWhen: [stepCountIs(10), totalTokensExceed(50_000)],
+  tools: { /* … */ },
+});
+```
+
+You can also write a custom `StopCondition`:
+
 ```ts
 import type { StopCondition } from '@deuz-sdk/core';
 
@@ -230,6 +253,13 @@ const first = await generateText({
 messages = [...messages, ...first.response.messages];
 // next turn reuses the full, stable history (prompt-cache friendly)
 ```
+
+### Approving tool calls
+
+A tool marked `needsApproval` is gated before it runs. There are two modes:
+
+- **Server mode** — pass `approveToolCall`. The loop calls it for each gated tool and runs the call only if it returns `true`; returning `false` (or throwing) denies it, and the denial is fed back as an `is_error` tool result so the loop continues.
+- **Client mode** — omit `approveToolCall`. A gated call breaks the loop and is returned in `result.pendingApprovals`. Collect verdicts from your user, then call `generateText` again with the same appended history plus `approvalResponses` to resume; any pending call without a matching response is denied by default.
 
 ## Loop guarantees
 

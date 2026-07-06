@@ -208,9 +208,13 @@ const task = await imagine({
 });
 ```
 
+### blend
+
+`submitBlend` requires `base64Array` — 2-5 base64 data-URLs to blend — and accepts an optional `dimensions` (a `string`; accepted values `'PORTRAIT'`, `'SQUARE'`, `'LANDSCAPE'`) that controls the output aspect ratio.
+
 ### Webhook mode
 
-Instead of polling, pass `notifyHook` (a webhook URL) to any submit call. The relay calls that URL when the task completes, and you persist the result from your webhook handler rather than holding the request open with `waitForTask`. `submitImagine`, `submitBlend`, and `submitDescribe` all accept `notifyHook`.
+Instead of polling, pass `notifyHook` (a webhook URL) to the `submitImagine`, `submitBlend`, or `submitDescribe` calls. The relay calls that URL when the task completes, and you persist the result from your webhook handler rather than holding the request open with `waitForTask`. `submitImagine`, `submitBlend`, and `submitDescribe` all accept `notifyHook`.
 
 ```ts title="webhook.ts"
 import { submitImagine } from '@deuz-sdk/core/midjourney';
