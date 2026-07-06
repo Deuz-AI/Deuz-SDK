@@ -44,6 +44,18 @@ interface Tracer {
   startSpan(name: string, attributes?: Record<string, unknown>): Span;
 }
 
+interface Span {
+  setAttribute(key: string, value: unknown): void;
+  recordException(error: unknown): void;
+  end(): void;
+}
+
+interface BreakerState {
+  failures: number;
+  openedAt?: number;
+  cooldownUntil?: number;
+}
+
 interface BreakerStore {
   get(key: string): BreakerState | undefined | Promise<BreakerState | undefined>;
   set(key: string, state: BreakerState): void | Promise<void>;
@@ -58,7 +70,7 @@ interface PriceProvider {
 }
 ```
 
-`UsageMeta` (passed to `onUsage`) carries `{ model, reason: 'finished' | 'aborted' | 'error', ttftMs? }`. `FinishMeta` (passed to `onFinish`) carries `{ model, finishReason }`.
+`UsageMeta` (passed to `onUsage`) carries `{ model, reason: 'finished' | 'aborted' | 'error', ttftMs?, agentPath? }` — `agentPath` (e.g. `['researcher']`) is set when the usage originates from an `agentTool` sub-agent loop, so metering can attribute cost per sub-agent. `FinishMeta` (passed to `onFinish`) carries `{ model, finishReason }`.
 
 ### Where `deps` lives
 

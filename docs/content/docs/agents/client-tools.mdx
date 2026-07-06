@@ -7,7 +7,7 @@ A **client tool** is a `Tool` with no `execute` function. The model can still ca
 
 ## How it works
 
-Every tool in a `ToolSet` is either a **server tool** (has `execute`, the loop runs it) or a **client tool** (no `execute`). The distinction is purely the presence of `execute`:
+Every tool in a `ToolSet` is either a **server tool** (has `execute`, the loop runs it) or a **client tool** (no `execute`). The distinction is the presence of `execute` — with one exception: a [provider-executed tool](/docs/agents/server-tools) (`type: 'provider'`) has no `execute` but is run by the provider, so it does **not** break the loop as a client tool:
 
 ```ts
 import type { ToolSet } from '@deuz-sdk/core';

@@ -69,6 +69,8 @@ If `response.body` is `null`, it yields nothing and returns immediately.
 | `tool-approval-response` | `approvalId: string`, `approved: boolean`, `reason?: string` | Client→server direction ONLY (declared for wire symmetry): the verdict travels in the next HTTP request body as `approvalResponses` — the server never serializes this part. |
 | `object-delta` | `object: unknown` | A `streamObject` partial (from `toDeuzObjectStreamResponse`) — each delta REPLACES the previous partial wholesale. [`useObject`](/docs/modules/react-hooks) consumes it. |
 | `source` | `id: string`, `url?: string`, `title?: string` | A cited source. |
+| `compaction` | `layer: string`, `tokensBefore: number`, `tokensAfter: number` | Automatic compaction ran before an agentic step (token counts are estimates). |
+| `sub-agent` | `agentPath: string[]`, `part: DeuzUIPart` | A sub-agent (`agentTool`) emitted a part, forwarded live into the parent stream with its path (`part` is the nested framed part). |
 | `finish` | `finishReason: FinishReason`, `usage: Usage` | Last meaningful part — the whole turn finished. |
 | `error` | `message: string` | A stream error occurred; `message` is redacted of secrets. |
 

@@ -129,9 +129,14 @@ const orchestratorModel = anthropic('claude-opus-4-8');
 async function runCodingTask(task: string, controller: AbortController) {
   const result = await generateText({
     model: orchestratorModel,
-    messages: [{ role: 'user', content: task }],
-    system:
-      'You are an engineering orchestrator. Break the task into sub-tasks and delegate every file/shell/test action to the coder tool — you never touch the filesystem yourself.',
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You are an engineering orchestrator. Break the task into sub-tasks and delegate every file/shell/test action to the coder tool — you never touch the filesystem yourself.',
+      },
+      { role: 'user', content: task },
+    ],
     maxSteps: 30,
     signal: controller.signal,
     tools: { coder },

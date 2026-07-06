@@ -12,11 +12,13 @@ import { streamChat, generateText, embed } from '@deuz-sdk/core';
 import { createOpenAI, createOpenAIResponses, createOpenAIEmbedding } from '@deuz-sdk/core/openai';
 ```
 
+The subpath also exports ready-made `openai`, `openaiResponses`, and `openaiEmbedding` singletons (each the corresponding `create*()` called with no settings) for use with client-level keys — set via `createClient({ apiKeys: … })` or a `deps.keyProvider` — since these carry no factory `apiKey` of their own.
+
 ## Which surface to use
 
 | Surface | Factory | Endpoint | Use when |
 | --- | --- | --- | --- |
-| Chat Completions | `createOpenAI` | `/chat/completions` | General chat, tools, vision, structured output. No reasoning on this wire. |
+| Chat Completions | `createOpenAI` | `/chat/completions` | General chat, tools, vision, structured output. `gpt-5.5`/`gpt-5.5-pro` also accept `reasoning_effort` here. |
 | Responses API | `createOpenAIResponses` | `/responses` | GPT-5.x and `o`-series reasoning models; typed `response.*` streaming events. |
 | Embeddings | `createOpenAIEmbedding` | `/embeddings` | `text-embedding-3-small` / `-large`. |
 
@@ -101,15 +103,15 @@ console.log(result.usage.reasoningTokens);
 
 ### Reasoning effort
 
-The canonical `effort` option is `'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'`. On the **Responses** surface it rides `reasoning: { effort }` for reasoning-capable models; `'max'` clamps to `'xhigh'`, and `'none'` omits the reasoning block entirely:
+The canonical `effort` option is `'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'`. On the **Responses** surface it rides `reasoning: { effort }` for reasoning-capable models; `'max'` clamps to `'xhigh'`, and `'none'` is sent verbatim as `reasoning: { effort: 'none' }` (a real OpenAI value that disables reasoning). The reasoning block is omitted only when `effort` is left undefined (or the model is not reasoning-capable):
 
 | `effort` value | Responses request |
 | --- | --- |
-| `'none'` | `reasoning` omitted (no reasoning block sent). |
+| `'none'` | `reasoning: { effort: 'none' }` (real OpenAI value; disables reasoning). |
 | `'low'` / `'medium'` / `'high'` / `'xhigh'` | `reasoning: { effort: <value> }`. |
 | `'max'` | clamped to `'xhigh'`. |
 
-On **Chat Completions** (GPT-5.4+ ships `reasoning_effort` there, so `gpt-5.5`/`gpt-5.5-pro` accept `effort` too), `'none'` is a real OpenAI value and is sent verbatim as `reasoning_effort: 'none'` — it is *not* omitted there. The two surfaces differ deliberately: Responses treats `'none'` as "no reasoning block", Chat Completions treats it as an explicit effort level.
+On **Chat Completions** (GPT-5.4+ ships `reasoning_effort` there, so `gpt-5.5`/`gpt-5.5-pro` accept `effort` too), `'none'` is likewise sent verbatim as `reasoning_effort: 'none'`. Both surfaces send `'none'` as an explicit effort value; the reasoning block/param is skipped only when `effort` is undefined.
 
 Reasoning models on the Responses surface have `samplingRestrictions` set, so `temperature` and `topP` are dropped for those models. `maxOutputTokens` maps to `max_output_tokens` (falling back to the model's registry `maxOutput`).
 

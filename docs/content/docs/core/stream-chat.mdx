@@ -47,8 +47,10 @@ function streamChat(options: StreamChatOptions): StreamChatResult;
 | `maxOutputTokens` | `number` | — | Cap on generated tokens. |
 | `topP` | `number` | — | Nucleus sampling. |
 | `stopSequences` | `string[]` | — | Stop strings. |
-| `effort` | `'none' \| 'low' \| 'medium' \| 'high'` | — | Canonical reasoning effort; each adapter maps it to its own unit. |
+| `effort` | `'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'` | — | Canonical reasoning effort; each adapter maps it to its own unit. `'xhigh'` (Anthropic 4.7+/OpenAI) and `'max'` (Anthropic 5.x) clamp down on wires that lack them. |
 | `responseFormat` | `'text' \| 'json'` | `'text'` | Free-form text vs. JSON mode. For schema-validated output use [generateObject](/docs/core/generate-object). |
+| `providerOptions` | `{ [provider]: Record<string, unknown> }` | — | Per-provider escape hatch, keyed by the model's provider name (e.g. `{ openai: { service_tier: 'flex' } }`, `{ google: { cachedContent } }`). Shallow top-level request-body fields merged into the wire; canonical fields the adapter sets always win. |
+| `promptCaching` | `'auto' \| 'auto-1h'` | — | One-flag prompt caching, effective only on Anthropic caching-capable models (other providers cache implicitly and ignore it). `'auto-1h'` uses the 1-hour TTL. |
 | `tools` | `ToolSet` | — | Enables the agentic loop. See [Tool Loop](/docs/agents/tool-loop). |
 | `toolChoice` | `ToolChoice` | — | Force / disable / pick a tool. |
 | `maxSteps` | `number` | `1` | Max model turns in the agentic loop. |
@@ -83,7 +85,7 @@ interface StreamChatResult {
 | `type` | Shape | Emitted |
 | --- | --- | --- |
 | `text-delta` | `{ text }` | Assistant text fragment. |
-| `reasoning-delta` | `{ text, signature? }` | Extended-thinking / reasoning fragment. |
+| `reasoning-delta` | `{ text, signature?, encrypted? }` | Extended-thinking / reasoning fragment. When `encrypted` is true, `text` is an opaque encrypted reasoning payload (OpenAI Responses) — do not render it as thinking text. |
 | `tool-call-delta` | `{ id, name?, argsTextDelta, providerMetadata? }` | Raw tool-args JSON fragment — accumulate as string, parse once at block end. |
 | `source` | `{ id, url?, title? }` | Citation / grounding source. |
 | `finish` | `{ usage, finishReason }` | Terminal part of a single turn. |
@@ -92,8 +94,11 @@ interface StreamChatResult {
 | `step-finish` | `{ stepIndex, finishReason, usage }` | Agentic loop: a step ended. |
 | `tool-call` | `{ toolCallId, toolName, input }` | Final parsed tool call. |
 | `tool-result` | `{ toolCallId, toolName, output, isError? }` | Result of executing a tool call. |
+| `tool-approval-request` | `{ approvalId, toolCallId, toolName, input }` | A tool call awaiting client-mode approval (`needsApproval` triggered, no `approveToolCall` supplied); the loop breaks after emitting these — resume via `approvalResponses`. |
+| `compaction` | `{ layer, tokensBefore, tokensAfter }` | Automatic context compaction ran before a step; token counts are estimates. Only when `compaction` is enabled in the agentic loop. |
+| `sub-agent` | `{ agentPath, part }` | A sub-agent's (`agentTool`) own canonical part forwarded live into the parent stream. |
 
-`step-*`, `tool-call`, and `tool-result` only appear when `tools` are provided.
+`step-*`, `tool-call`, `tool-result`, and `tool-approval-request` only appear when `tools` are provided.
 
 ## G2: never throws synchronously
 

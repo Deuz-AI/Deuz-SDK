@@ -102,7 +102,7 @@ Three flags exist purely to paper over provider wire bugs. The adapters read the
 
 - **`usagePerChunk`** — Gemini's OpenAI-compat wire re-emits a full usage block on *every* streamed chunk. The adapter keeps only the last one, so `usage` reflects the final totals rather than a duplicated sum.
 - **`toolIndexAllZero`** — on that same compat wire every streaming tool-call fragment arrives with `index=0`. The adapter slots fragments by arrival position instead of trusting the index, so parallel tool calls reconstruct correctly.
-- **`samplingRestrictions`** — OpenAI Responses reasoning models (`gpt-5.4`, `o4-mini`) reject `temperature` / `topP`. When set, the adapter omits those params before sending (`max_output_tokens` is still sent, defaulting to the row's `maxOutput`).
+- **`samplingRestrictions`** — some reasoning models reject `temperature` / `topP`, so the adapter omits those params before sending. It is set on the OpenAI Responses reasoning rows (`gpt-5.4`, `o4-mini` — there `max_output_tokens` is still sent, defaulting to the row's `maxOutput`) *and* on the Anthropic flagship reasoning rows (`claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-5`, `claude-fable-5`), where the Anthropic adapter likewise strips them (as it also does whenever extended thinking is enabled).
 
 There is also a behavioral guard that is *not* a registry flag: the agentic loop stops on accumulated `tool_use` count, not on `finishReason`, because Gemini can emit `finish: stop` while tool calls are still pending. See the [tool loop](/docs/agents/tools) for that invariant.
 

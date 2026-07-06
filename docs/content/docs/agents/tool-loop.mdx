@@ -44,7 +44,7 @@ These options live on `CommonCallOptions`, so they work identically for `generat
 | `maxSteps` | `number` | `1` | Max model turns. The default `1` means single-turn — raise it for real tool use. |
 | `stopWhen` | `StopCondition \| StopCondition[]` | — | Extra stop predicate(s), OR-ed with `maxSteps`. |
 | `maxToolConcurrency` | `number` | `5` | Max parallel tool executions per step. |
-| `onStepFinish` | `(step: StepResult) => void` | — | Fires after each completed step. |
+| `onStepFinish` | `(step: StepResult) => void` | — | Fires after each step that made tool calls (including approval / client-tool breaks). It does **not** fire for the terminal text-only step that produces the final answer — read that from `result.steps.at(-1)` or the resolved result. |
 
 `maxSteps` counts **model turns**, not tool calls. A step that executes three tools in parallel is one step.
 
@@ -58,6 +58,10 @@ A `StopCondition` is a plain function over the loop state. The type is exported;
 export type StopCondition = (info: {
   steps: StepResult[];
   stepCount: number;
+  /** Cumulative real usage across all steps (sub-agents included). */
+  usage?: Usage;
+  /** Cumulative cost in USD — only when `deps.priceProvider` is set and a condition needs it. */
+  costUSD?: number;
 }) => boolean | Promise<boolean>;
 ```
 

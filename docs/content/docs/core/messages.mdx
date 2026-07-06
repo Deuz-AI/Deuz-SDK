@@ -24,6 +24,8 @@ const messages: Message[] = [
 
 Internally, string content is coerced to a single `TextPart` and author order is preserved. The two forms above are equivalent.
 
+A `Message` may also carry an optional `providerMetadata?: Record<string, unknown>` — message-level provider round-trip data (e.g. OpenAI Responses' `{ openai: { phase } }`). It is additive and normally set and round-tripped by the SDK (it appears on the assistant messages in `response.messages`), not something you hand-author.
+
 ### Roles
 
 | Role | Use |
