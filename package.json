@@ -230,6 +230,16 @@
         "default": "./dist/mcp/stdio.cjs"
       }
     },
+    "./durable": {
+      "import": {
+        "types": "./dist/durable.d.ts",
+        "default": "./dist/durable.js"
+      },
+      "require": {
+        "types": "./dist/durable.d.cts",
+        "default": "./dist/durable.cjs"
+      }
+    },
     "./edge": {
       "import": {
         "types": "./dist/edge.d.ts",

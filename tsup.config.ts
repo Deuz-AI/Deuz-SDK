@@ -23,6 +23,7 @@ export default defineConfig({
     'skills/node': 'src/skills/node.ts',
     'mcp/index': 'src/mcp/index.ts',
     'mcp/stdio': 'src/mcp/stdio.ts',
+    durable: 'src/durable.ts',
     edge: 'src/edge.ts',
     react: 'src/react.ts',
     ui: 'src/ui.ts',

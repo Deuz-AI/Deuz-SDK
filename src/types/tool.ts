@@ -3,6 +3,7 @@ import type { Usage, FinishReason } from './usage';
 import type { Message } from './message';
 import type { StreamPart } from './stream';
 import type { ResolvedDependencies } from './deps';
+import type { SessionStore } from './session';
 
 /** Context handed to a tool's `execute`. */
 export interface ToolExecuteContext {
@@ -23,6 +24,12 @@ export interface ToolExecuteContext {
   deps?: ResolvedDependencies;
   /** Fold a sub-agent's cumulative usage into the parent total (budget + result). */
   reportUsage?: (usage: Usage) => void;
+  // --- 1.5 additive: durable execution seam (populated by the loop when the
+  // call carries `session`; `agentTool` consumes them for nested checkpoints). ---
+  /** The parent loop's durable session (store + runId) — lets a sub-agent persist child checkpoints. */
+  session?: { store: SessionStore; runId: string };
+  /** The resume call's approval verdicts, forwarded so a suspended sub-agent can settle its own pending calls. */
+  approvalResponses?: ToolApprovalResponse[];
 }
 
 /**
@@ -75,13 +82,20 @@ export interface ToolResult {
 /**
  * A tool call awaiting user approval (client-mode approval break).
  * `approvalId === toolCallId` today; kept as a distinct field so a future
- * signed-approval scheme stays additive.
+ * signed-approval scheme stays additive (1.5 ships `createApprovalSigner`
+ * for HMAC-signed round-trips — the id contract is unchanged).
  */
 export interface ToolApprovalRequest {
   approvalId: string;
   toolCallId: string;
   toolName: string;
   input: unknown;
+  /**
+   * Present when the pending call lives INSIDE a suspended sub-agent
+   * (`agentTool`): the sub-agent path it belongs to (1.5 additive). Resume
+   * with the same verdict ids — the loop routes them back down the tree.
+   */
+  agentPath?: string[];
 }
 
 /** The caller's verdict on a pending `ToolApprovalRequest` (resume call). */

@@ -1,0 +1,208 @@
+---
+title: Durable Runtime
+description: Checkpoint/resume for agentic runs on any storage backend — plus HMAC-signed approvals. No vendor runtime, no new loop concept.
+---
+
+Durable execution means an agentic run survives the process that started it: a crash, a deploy, or an approval that a human answers hours later. Since 1.5, both agentic loops (`generateText` and `streamChat`) checkpoint their state at every **step boundary** into a `SessionStore` you provide — and `resumeFromCheckpoint` continues the run exactly where it left off.
+
+There is no workflow runtime, no directive, no serialization framework to adopt. A `SessionStore` is two required methods over any backend — a Supabase table, Redis, S3, a JSONL file, or the in-memory reference store. The checkpoint is a plain JSON-serializable object.
+
+```ts title="durable-run.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createInMemorySessionStore, resumeFromCheckpoint } from '@deuz-sdk/core/durable';
+
+const store = createInMemorySessionStore(); // any SessionStore impl works
+
+const first = await generateText({
+  model,
+  messages: [{ role: 'user', content: 'Refactor the auth module.' }],
+  tools,
+  maxSteps: 12,
+  session: { store, runId: 'run-42' }, // ← opt-in durability
+});
+
+// …the process dies, or the run suspended on an approval…
+
+const resumed = await resumeFromCheckpoint(store, 'run-42', {
+  model,
+  tools,
+  maxSteps: 12,
+  approvalResponses: [{ approvalId: 'toolu_abc', approved: true }],
+});
+```
+
+## The `session` option
+
+Durability is opt-in per call, on `CommonCallOptions`:
+
+```ts
+interface DurableSessionOptions {
+  store: SessionStore;
+  /** Stable run identifier; default `deps.generateId()`. */
+  runId?: string;
+}
+```
+
+When present, the loop saves an `AgentCheckpoint` at every step boundary and the result carries `runId` — `GenerateTextResult.runId` on buffered calls, and synchronously on `StreamChatResult.runId` for streaming (available before the first part arrives). Only agentic calls (with `tools`) checkpoint; a single-turn call has no step boundaries and carries no `runId`.
+
+## `SessionStore` — the storage seam
+
+```ts
+interface SessionStore {
+  save(checkpoint: AgentCheckpoint): void | Promise<void>;
+  load(runId: string): AgentCheckpoint | undefined | Promise<AgentCheckpoint | undefined>;
+  /** Optional: remove a stored run (cleanup tooling — the loops never call it). */
+  delete?(runId: string): void | Promise<void>;
+  /** Optional: enumerate stored runIds (CLI `runs list`-style tooling). */
+  list?(): string[] | Promise<string[]>;
+}
+```
+
+`save` is called with the latest snapshot per boundary; the reference semantics are **latest save wins per `runId`** (what `createInMemorySessionStore` does). A store may keep every snapshot if it wants time-travel — the loop only ever `load`s the latest.
+
+**Persistence is best-effort by contract**: a throwing `save` is logged via `deps.logger.error` and the run continues. Durability must never be a run-killer.
+
+For persistent backends, serialize with the bundled codec — plain `JSON.stringify` would decay binary parts (raw `Uint8Array` images) into index-keyed objects the adapters cannot send back:
+
+```ts
+import { serializeCheckpoint, deserializeCheckpoint } from '@deuz-sdk/core/durable';
+
+const row = serializeCheckpoint(checkpoint);   // JSON string, Uint8Array-safe
+const back = deserializeCheckpoint(row);       // real Uint8Arrays restored
+```
+
+## `AgentCheckpoint` — what gets saved
+
+```ts
+interface AgentCheckpoint {
+  version: 1;                              // schema version (forward-compat gate)
+  runId: string;                           // stable across suspend/resume legs
+  stepId: string;                          // `${runId}#${stepIndex}`
+  stepIndex: number;                       // monotonic across ALL legs
+  status: 'running' | 'suspended' | 'completed';
+  messages: Message[];                     // full immutable history at the boundary
+  usage: Usage;                            // CUMULATIVE across the whole run
+  pendingApprovals?: ToolApprovalRequest[]; // set on a 'suspended' approval break
+  agentPath?: string[];                    // set on sub-agent checkpoints
+  createdAt: number;                       // deps.clock.now() at save time
+}
+```
+
+- `running` — a step completed and the loop was still going.
+- `suspended` — the loop broke on a client-mode approval or client tool; `pendingApprovals` carries any **gated** calls awaiting a verdict (a break caused only by client tools has none — see the client-tool note under [Resuming](#resuming)).
+- `completed` — the run finished (final text, stop condition, or runaway guard).
+
+Because message history is [immutable by contract](/docs/agents/tool-loop) — every step builds a new array, never mutating prior ones — a checkpoint's `messages` is a true snapshot: later legs never corrupt it, and prompt caching keeps working across resume legs since the prefix is byte-stable.
+
+**The honest recovery unit is one step.** A crash *between* steps loses nothing. A crash *mid-step* (mid-model-call or mid-tool-execution) resumes from the last completed boundary and re-runs that step — tool `execute` functions that are not idempotent should be written accordingly. An aborted call (`signal`) deliberately does **not** checkpoint the interrupted step either.
+
+## Resuming
+
+```ts
+function resumeFromCheckpoint(store, runId, options): Promise<GenerateTextResult>;
+function resumeStreamFromCheckpoint(store, runId, options): StreamChatResult;
+```
+
+`options` is everything a normal call takes except `messages` (the checkpoint's history *is* the messages) and `session` (derived from `store` + `runId`). You re-supply `model` and `tools` yourself — checkpoints store data, not closures; that is what keeps them portable across processes and backends.
+
+Semantics, both loops identical:
+
+- **Suspended on approvals** — the existing settle-on-resume mechanism answers the trailing pending `tool_use` ids from `approvalResponses`: approved → execute, denied → `is_error` + reason. Resuming **without** a verdict for a pending gated call **denies it by default** (safe side) — the run continues with a denial rather than resending an unanswered `tool_use` to the provider.
+- **Counters continue** — `stepIndex` and checkpoint `usage` are cumulative across legs; [budget stops](/docs/agents/tools#budget-stop-conditions) (`totalTokensExceed`/`costExceeds`) and `prepareStep` see the whole run's usage, not just the current leg. The *result* of each leg still reports that leg's own usage (what this call cost you).
+- **Unknown `runId`** — `resumeFromCheckpoint` rejects with `CheckpointNotFoundError`. The streaming twin keeps the sync-return contract: it surfaces the error as an `error` part and rejected `usage`/`finishReason` promises, never a synchronous throw.
+- **Client tools** — `ToolApprovalResponse` carries a verdict, not a result, so a resume cannot hand a **client tool** its real output; resuming feeds it the documented `is_error` placeholder (`"No result provided for this client tool."`) and the model reacts to that. If you need the real result across a restart, use the escape hatch: `load` the checkpoint yourself, append the `tool_result` message to its history, and call `generateText`/`streamChat` with those messages and the same `session` — the run continues durably. Approval-gated **server** tools (`needsApproval` + `execute`) don't have this limit and are the better durable-HITL shape.
+- **Parallel batches** — if a durable sub-agent suspends out of a *parallel* tool batch, sibling tool executions from that step are discarded and re-run on resume (no tool message is written for a suspended step). Keep such siblings idempotent, or run the batch sequentially with `maxToolConcurrency: 1`.
+
+```ts title="resume-streaming.ts"
+import { resumeStreamFromCheckpoint } from '@deuz-sdk/core/durable';
+
+const result = resumeStreamFromCheckpoint(store, 'run-42', {
+  model,
+  tools,
+  approvalResponses: [{ approvalId: 'toolu_abc', approved: true }],
+});
+// The settled approval's tool-result part streams BEFORE the first step-start
+// of the new leg; step indices continue from the checkpoint.
+for await (const part of result.fullStream) render(part);
+```
+
+## Client-mode approval inside sub-agents
+
+The 1.4 limitation is gone — with a durable session, [client-mode approval](/docs/agents/client-tools) works **inside** [`agentTool`](/docs/agents/subagents):
+
+1. A gated tool call inside a sub-agent (no server-mode `approveToolCall` to inherit) suspends the **child** loop, which checkpoints itself under a per-call key (`${parentRunId}::${agentName}#${toolCallId}`).
+2. The parent loop suspends too: its result/stream carries the pending approvals **tagged with `agentPath`** (`ToolApprovalRequest.agentPath`, and on the `tool-approval-request` stream part), so your UI can show *which* agent is asking.
+3. You resume the **parent** run with the verdicts, keyed by the same `approvalId`s. The parent re-executes the sub-agent call; the child finds its own suspended checkpoint, settles its pending calls from the forwarded verdicts, and continues where *it* left off — at any nesting depth.
+
+```ts title="subagent-approval.ts"
+const first = await generateText({
+  model: opus,
+  messages: [{ role: 'user', content: 'Have the coder fix the failing test.' }],
+  tools: { coder: agentTool({ name: 'coder', model: opus, tools: { runShell } /* gated */ }) },
+  maxSteps: 5,
+  session: { store, runId: 'run-7' },
+});
+
+first.pendingApprovals;
+// [{ approvalId: 'toolu_9', toolName: 'runShell', agentPath: ['coder'], … }]
+
+const done = await resumeFromCheckpoint(store, 'run-7', {
+  model: opus,
+  tools: { coder: agentTool({ /* same definition */ }) },
+  maxSteps: 5,
+  approvalResponses: [{ approvalId: 'toolu_9', approved: true }],
+});
+```
+
+Without a `session`, the 1.4 behavior is unchanged: a gated sub-agent call with no inherited approver returns a clear `is_error` the parent model can react to.
+
+> The child key includes the model-issued `toolCallId`, which is stable across resume legs because it lives in the parent's message history — so the resumed parent re-executes the *same* `tool_use` and lands on the same key, and two parallel calls to a same-named sub-agent never collide.
+
+## HMAC-signed approvals
+
+A verdict arriving from a browser is untrusted input. `createApprovalSigner` closes the loop that [client tools](/docs/agents/client-tools) documents as an application-level trust boundary: sign the pending approval server-side before showing it to the user, verify the returned token on resume, and a forged or replayed verdict cannot authorize a different call.
+
+```ts title="signed-approvals.ts"
+import { createApprovalSigner } from '@deuz-sdk/core/durable';
+
+const signer = createApprovalSigner({ secret: process.env.APPROVAL_SECRET! });
+
+// When the run suspends: sign each pending approval, send tokens to the client.
+const token = await signer.sign(pendingApproval, { runId: 'run-42' });
+
+// When the verdict comes back: verify BEFORE resuming.
+const payload = await signer.verify(token, { maxAgeMs: 60 * 60 * 1000 });
+if (!payload || payload.runId !== 'run-42') reject();
+// payload is the exact request you signed: approvalId, toolName, input, issuedAt…
+```
+
+- WebCrypto HMAC-SHA256 (`crypto.subtle`) — edge-safe, no Node dependency.
+- Token format `v1.<payload>.<mac>`; the payload is the full `ToolApprovalRequest` + optional `runId` binding + `issuedAt`.
+- `verify` returns the payload on a valid MAC, else `null` — a garbled, forged, or expired token is a verdict of `null`, never a thrown exception. A token whose age is ≥ `maxAgeMs` is expired; omit `maxAgeMs` for no expiry.
+- The clock is injectable (`clock`) for deterministic tests; the secret stays server-side.
+
+`approvalId` was kept distinct from `toolCallId` in the 1.3 type exactly so this scheme could stay additive — the id contract is unchanged.
+
+## Edge safety
+
+The whole module is Web-API-only (`crypto.subtle`, `btoa`/`atob`, JSON) and is re-exported from [`@deuz-sdk/core/edge`](/docs/advanced/edge). Node-specific reference stores (file/SQLite) are deliberately **not** in this module — they will live behind a `/node` subpath like `rag/node` and `skills/node` when the CLI ships.
+
+## vs. AI SDK's `WorkflowAgent`
+
+| | `@deuz-sdk/core/durable` | AI SDK 7 `WorkflowAgent` |
+| --- | --- | --- |
+| Runtime | None — a two-method storage seam | Vercel Workflow DevKit (`'use workflow'`) |
+| Storage | Any backend you can put JSON in | Managed by the workflow runtime |
+| Buffered + streaming | Both loops, identical semantics | `stream()` only |
+| Automatic step retry | No — resume is explicit (yours to schedule) | Yes — runtime-managed |
+| Approval across restarts | Yes — persisted `pendingApprovals` + signed verdicts | Yes — `needsApproval` suspend/resume |
+| Sub-agent client-mode approval | Yes — suspend/resume routes verdicts down the tree | Documented as not composing with subagents |
+
+The honest trade: AI SDK's runtime gives you automatic retry scheduling; Deuz gives you the primitive with no vendor lock and you own the retry policy (a cron, a queue worker, a CLI `resume` command — anything that can call `resumeFromCheckpoint`).
+
+## See also
+
+- [Tool loop](/docs/agents/tool-loop) — the loop being checkpointed; immutable history is what makes snapshots safe.
+- [Client-side tools](/docs/agents/client-tools) — the approval round-trip that suspend/resume extends across process restarts.
+- [Sub-agents](/docs/agents/subagents) — `agentTool`, whose client-mode approval limitation this page removes.
+- [Edge runtimes](/docs/advanced/edge) — everything here is importable from `@deuz-sdk/core/edge`.

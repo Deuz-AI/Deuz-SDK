@@ -9,13 +9,17 @@ import type {
   ToolCall,
   ToolResult,
   ToolExecuteContext,
+  ToolApprovalRequest,
+  ToolApprovalResponse,
   StepResult,
   StopCondition,
 } from '../types/tool';
+import type { AgentCheckpoint, CheckpointStatus, SessionStore } from '../types/session';
 import type { StreamPart } from '../types/stream';
 import type { WireTool, WireToolRequest } from '../adapters/types';
 import { runOneStep, type OneStep } from './run-step';
 import { stepCountIs, type NamedStopCondition } from './stop';
+import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
   applyCompaction,
   normalizeCompaction,
@@ -33,6 +37,108 @@ export const MAX_SAME_TOOL_ERRORS = 3;
 
 /** Denial message fed back to the model as an is_error tool_result. */
 export const TOOL_DENIED = 'Tool call denied.';
+
+/**
+ * Control-flow signal (1.5): a durable sub-agent (`agentTool`) hit a
+ * client-mode approval and checkpointed itself as suspended. Thrown from the
+ * tool's `execute`, re-thrown VERBATIM by `executeTools` (never self-healed
+ * into an is_error), and caught by both loops, which break with the carried
+ * `agentPath`-tagged approvals and a suspended checkpoint of their own.
+ */
+export class SubAgentSuspension extends Error {
+  readonly approvals: ToolApprovalRequest[];
+  constructor(approvals: ToolApprovalRequest[]) {
+    super('A durable sub-agent suspended on a client-mode approval.');
+    this.name = 'SubAgentSuspension';
+    this.approvals = approvals;
+  }
+}
+
+// --- Durable checkpoints (1.5): step-boundary saves shared by both loops. ---
+
+/** Per-run durable state: the store/runId plus cross-leg counters. */
+export interface DurableRunner {
+  store: SessionStore;
+  runId: string;
+  /** Cumulative usage from PRIOR legs (EMPTY on a fresh run). */
+  baseUsage: Usage;
+  /** Step boundaries saved so far across ALL legs (monotonic). */
+  stepIndex: number;
+}
+
+/**
+ * Build the durable runner when the call carries `session`; otherwise
+ * undefined (zero overhead). `resumeFrom` seeds the cross-leg counters on a
+ * `resumeFromCheckpoint` leg.
+ */
+export function setupDurable(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  resumeFrom?: { stepIndex: number; usage: Usage },
+): DurableRunner | undefined {
+  if (!options.session) return undefined;
+  return {
+    store: options.session.store,
+    runId: options.session.runId ?? deps.generateId(),
+    baseUsage: resumeFrom?.usage ?? EMPTY_USAGE,
+    stepIndex: resumeFrom?.stepIndex ?? 0,
+  };
+}
+
+/** Cumulative run usage (prior legs + this leg) for checkpoints and stop conditions. */
+export function durableUsage(runner: DurableRunner | undefined, legUsage: Usage): Usage {
+  if (!runner || runner.baseUsage === EMPTY_USAGE) return legUsage;
+  return sumUsage(runner.baseUsage, legUsage);
+}
+
+/**
+ * Save one step-boundary checkpoint. Best-effort durability: a throwing store
+ * logs `deps.logger.error` and the run continues — persistence must never be
+ * a run-killer.
+ */
+export async function saveCheckpoint(
+  runner: DurableRunner,
+  deps: ResolvedDependencies,
+  options: CommonCallOptions,
+  status: CheckpointStatus,
+  messages: Message[],
+  legUsage: Usage,
+  pendingApprovals?: ToolApprovalRequest[],
+): Promise<void> {
+  runner.stepIndex += 1;
+  const checkpoint: AgentCheckpoint = {
+    version: 1,
+    runId: runner.runId,
+    stepId: `${runner.runId}#${runner.stepIndex}`,
+    stepIndex: runner.stepIndex,
+    status,
+    messages,
+    usage: withTotal(durableUsage(runner, legUsage)),
+    ...(pendingApprovals && pendingApprovals.length > 0 ? { pendingApprovals } : {}),
+    ...(options.agentPath && options.agentPath.length > 0 ? { agentPath: options.agentPath } : {}),
+    createdAt: deps.clock.now(),
+  };
+  try {
+    await runner.store.save(checkpoint);
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    deps.logger.error(`durable: checkpoint save failed for '${checkpoint.stepId}' — ${detail}`);
+  }
+}
+
+/** Tag pending approvals with the loop's sub-agent path (root loops pass undefined). */
+export function toApprovalRequests(
+  calls: ToolCall[],
+  agentPath: string[] | undefined,
+): ToolApprovalRequest[] {
+  return calls.map((c) => ({
+    approvalId: c.toolCallId,
+    toolCallId: c.toolCallId,
+    toolName: c.toolName,
+    input: c.args,
+    ...(agentPath && agentPath.length > 0 ? { agentPath } : {}),
+  }));
+}
 
 /**
  * Which of the step's calls require approval. `needsApproval` booleans are
@@ -346,15 +452,21 @@ export function hasClientTool(toolCalls: ToolCall[], tools: ToolSet): boolean {
  * execute. Results are appended as a NEW `{role:'tool'}` message — never
  * merged into a caller-supplied one (the `baseLength` slice contract and
  * immutable history both depend on it). Unknown approvalIds are ignored
- * (replay-safe). Returns null when there is nothing to settle.
+ * (replay-safe — and exactly how verdicts for a SUSPENDED SUB-AGENT pass
+ * through the parent's settle untouched: the parent re-executes the sub-agent
+ * call, which resumes its own checkpoint and consumes them). Returns null
+ * when there is nothing to settle.
  */
 export async function settlePendingApprovals(
   messages: Message[],
   tools: ToolSet,
   options: CommonCallOptions,
+  extras?: ExecuteExtras,
 ): Promise<{ messages: Message[]; results: ToolResult[]; deniedIds: Set<string> } | null> {
+  // An EMPTY array still settles (default-deny the gated rest) — that is how a
+  // durable resume without verdicts answers pending calls on the safe side.
   const responses = options.approvalResponses;
-  if (!responses || responses.length === 0) return null;
+  if (!responses) return null;
 
   // Locate the last assistant turn; only tool messages may follow it.
   let assistantIndex = -1;
@@ -402,7 +514,7 @@ export async function settlePendingApprovals(
     }
   }
 
-  const results = await executeTools(calls, tools, options, messages, denied);
+  const results = await executeTools(calls, tools, options, messages, denied, extras);
   const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
   return { messages: [...messages, toolMessage], results, deniedIds: new Set(denied.keys()) };
 }
@@ -411,11 +523,15 @@ export async function settlePendingApprovals(
  * Extra per-step wiring for `execute`'s context: the sub-agent seam. `deps` and
  * `reportUsage` let an `agentTool` reuse the parent transport and fold its usage
  * into the loop total; `emitPart` (streaming parent only) forwards its stream.
+ * `session` + `approvalResponses` (1.5) let a durable sub-agent checkpoint
+ * itself and settle its own suspended approvals on a resume leg.
  */
 export interface ExecuteExtras {
   deps?: ResolvedDependencies;
   emitPart?: (part: StreamPart) => void;
   reportUsage?: (usage: Usage) => void;
+  session?: { store: SessionStore; runId: string };
+  approvalResponses?: ToolApprovalResponse[];
 }
 
 /**
@@ -470,10 +586,15 @@ export async function executeTools(
         ...(extras?.deps ? { deps: extras.deps } : {}),
         ...(extras?.emitPart ? { emitPart: extras.emitPart } : {}),
         ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
+        ...(extras?.session ? { session: extras.session } : {}),
+        ...(extras?.approvalResponses ? { approvalResponses: extras.approvalResponses } : {}),
       };
       const out = await tool.execute(validation.value, ctx);
       return { toolCallId: call.toolCallId, toolName: call.toolName, result: out };
     } catch (cause) {
+      // A durable sub-agent suspension is control flow, not a tool failure —
+      // it must reach the loop verbatim so the parent suspends too.
+      if (cause instanceof SubAgentSuspension) throw cause;
       // Surface the thrown message to the model (self-heal feedback): a tool
       // that throws `new Error('File not found')` should tell the model that,
       // not an opaque "threw during execution".

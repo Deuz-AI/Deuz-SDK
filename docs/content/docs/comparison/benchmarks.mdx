@@ -33,7 +33,7 @@ Status: ✅ shipped · 🟡 partial / with caveats · ❌ not provided · 🚧 i
 | Agent loop | ✅ free function — `tools` on any call | ✅ `ToolLoopAgent` class | ✅ workflow engine (`.then/.branch/.parallel`) | ✅ you build the graph | ✅ runner loop |
 | Sub-agents / delegation | ✅ `agentTool` with live stream forwarding, any depth | ✅ subagents (no live inner stream in docs) | ✅ supervisor pattern | ✅ nodes as agents | ✅ handoffs + agents-as-tools |
 | HITL tool approval | ✅ server + client mode, deny-by-default, **composes with sub-agents** | ✅ 4-state + HMAC secret; docs note it doesn't compose with subagents | ✅ suspend/resume steps | ✅ `interrupt()` + checkpointer | ✅ `needsApproval: true`, resumable run state |
-| Durable execution (crash → resume) | 🚧 v1.5 in progress — storage seam, no vendor runtime | ✅ `WorkflowAgent` (requires Vercel Workflow DevKit runtime) | ✅ storage-backed snapshots, survive restarts | ✅ checkpointers: memory/SQLite/Postgres/Redis/Mongo; `exit/async/sync` durability modes | 🟡 resumable approval state; durability not the focus |
+| Durable execution (crash → resume) | ✅ v1.5 — step-boundary checkpoints on a storage seam, buffered + streaming, no vendor runtime ([durable runtime](/docs/agents/durable-runtime)) | ✅ `WorkflowAgent` (requires Vercel Workflow DevKit runtime) | ✅ storage-backed snapshots, survive restarts | ✅ checkpointers: memory/SQLite/Postgres/Redis/Mongo; `exit/async/sync` durability modes | 🟡 resumable approval state; durability not the focus |
 | Automatic context compaction | ✅ layered, threshold-triggered (`compaction: 'auto'`) | 🟡 manual `pruneMessages` in `prepareStep` | 🟡 observational memory (conversation compression) | ❌ bring your own | ❌ |
 | Token/cost budget stops | ✅ `totalTokensExceed` / `costExceeds` built-in | 🟡 usage tracked, no budget stop documented | 🟡 evals/limits at framework level | ❌ | ❌ |
 | Built-in cost (token→USD) tracking | ✅ pricing table + `onUsage` in core | ❌ pushed to Gateway | 🟡 via observability integrations | ❌ | ❌ |
@@ -54,7 +54,7 @@ We publish weighted scenario scores **only** for the pair we code-verified; scor
 | Chatbot app | 72% | ~74% | 85% |
 | CLI autonomous agent | 58% | ~74% | 78% |
 
-What moved in v1.4: sub-agents, automatic compaction, budget stops and per-step loop hooks — the five heaviest CLI-agent zeros in v1.3 — all shipped. The remaining spread is durable execution (🚧 v1.5), OTel span emission (v1.6) and provider/UI breadth (v1.6+). The row-by-row version of this table is on [vs AI SDK 7](/docs/comparison/ai-sdk-7).
+What moved in v1.4: sub-agents, automatic compaction, budget stops and per-step loop hooks — the five heaviest CLI-agent zeros in v1.3 — all shipped. v1.5 closed the biggest remaining one: durable execution (checkpoint/resume + signed approvals, no vendor runtime). The remaining spread is OTel span emission (v1.6) and provider/UI breadth (v1.6+). The row-by-row version of this table is on [vs AI SDK 7](/docs/comparison/ai-sdk-7).
 
 ## Profiles — what we verified about each
 
@@ -72,7 +72,7 @@ Trade-off versus Deuz: you adopt Mastra's structure, storage and dependency tree
 
 `@langchain/langgraph` (MIT; used in production by Replit, Uber, LinkedIn, GitLab per its README). The strongest durable-execution story in the TypeScript ecosystem today: a checkpointer persists graph state at every super-step, with pluggable backends (in-memory, SQLite, Postgres, Redis, MongoDB) and three durability modes (`exit` / `async` / `sync`); `interrupt()` gives human-in-the-loop that survives restarts; `getStateHistory` enables time-travel debugging.
 
-Worth noting: LangGraph documents the same honest resume boundary Deuz's v1.5 design targets — on resume, a node re-runs from the start of its function, so side effects must be idempotent. Trade-off versus Deuz: LangGraph is a runtime with a vocabulary to learn (nodes, edges, reducers, threads) and an ecosystem-sized dependency tree; Deuz keeps the loop a free function and (from v1.5) attaches checkpoints to it via one storage seam.
+Worth noting: LangGraph documents the same honest resume boundary Deuz's v1.5 durable runtime ships — on resume, the interrupted unit re-runs from its start (a node there, a step here), so side effects must be idempotent. Trade-off versus Deuz: LangGraph is a runtime with a vocabulary to learn (nodes, edges, reducers, threads) and an ecosystem-sized dependency tree; Deuz keeps the loop a free function and (since v1.5) attaches checkpoints to it via one storage seam.
 
 ### OpenAI Agents SDK (JS) — Tier 2, docs-level
 

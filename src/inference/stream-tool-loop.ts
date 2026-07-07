@@ -3,7 +3,7 @@ import type { StreamChatResult } from '../types/methods';
 import type { StreamPart } from '../types/stream';
 import type { Message } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
-import type { ToolCall, StepResult } from '../types/tool';
+import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
 import { runStream } from '../core/inference';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
@@ -28,6 +28,12 @@ import {
   findApprovalNeeded,
   resolveServerApprovals,
   settlePendingApprovals,
+  saveCheckpoint,
+  durableUsage,
+  toApprovalRequests,
+  SubAgentSuspension,
+  type DurableRunner,
+  type ExecuteExtras,
 } from './loop-shared';
 
 async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<string> {
@@ -38,12 +44,35 @@ async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<s
 }
 
 /**
+ * Internal-only knobs (NOT public surface). `resumeFrom` seeds cross-leg
+ * counters when the history is already at hand (agentTool child resume);
+ * `resumeLoad` defers the checkpoint load into the lazy pump so
+ * `resumeStreamFromCheckpoint` keeps the G2 contract (an unknown runId is an
+ * `error` part, never a synchronous throw).
+ */
+export interface StreamToolLoopInternal {
+  resumeFrom?: { stepIndex: number; usage: Usage };
+  resumeLoad?: () => Promise<{
+    messages: Message[];
+    resumeFrom: { stepIndex: number; usage: Usage };
+  }>;
+}
+
+/**
  * Streaming agentic loop. Produces ONE canonical `fullStream` spanning N model
  * calls: each step's text/reasoning/tool deltas pass through, then `step-finish`,
  * `tool-call` (parsed), `tool-result` (after execution), then the next step —
- * until no tool calls (Gemini guard) or a stop/runaway condition fires.
+ * until no tool calls (Gemini guard) or a stop/runaway condition fires. With
+ * `session` it checkpoints every step boundary (1.5); `runId` is known
+ * synchronously on the result.
  */
-export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult {
+export function runStreamToolLoop(
+  options: CommonCallOptions,
+  internal?: StreamToolLoopInternal,
+): StreamChatResult {
+  const deps = resolveDependencies(options.deps);
+  // Durable identity is synchronous (result.runId) even though the pump is lazy.
+  const runId = options.session ? (options.session.runId ?? deps.generateId()) : undefined;
   const broadcaster = createBroadcaster<StreamPart>();
   const usageDeferred = createDeferred<Usage>();
   const finishDeferred = createDeferred<FinishReason>();
@@ -58,9 +87,31 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
   }
 
   async function pump(): Promise<void> {
-    const deps = resolveDependencies(options.deps);
-    const tools = options.tools!;
+    const tools = options.tools ?? {};
     let messages: Message[] = [...options.messages];
+    let resumeFrom = internal?.resumeFrom;
+    if (internal?.resumeLoad) {
+      try {
+        const loaded = await internal.resumeLoad();
+        messages = loaded.messages;
+        resumeFrom = loaded.resumeFrom;
+      } catch (err) {
+        broadcaster.push({ type: 'error', error: err });
+        usageDeferred.reject(err);
+        finishDeferred.reject(err);
+        broadcaster.close();
+        return;
+      }
+    }
+    const durable: DurableRunner | undefined =
+      options.session && runId !== undefined
+        ? {
+            store: options.session.store,
+            runId,
+            baseUsage: resumeFrom?.usage ?? EMPTY_USAGE,
+            stepIndex: resumeFrom?.stepIndex ?? 0,
+          }
+        : undefined;
     const steps: StepResult[] = [];
     const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
     const wantCost = needsCost(stopConditions);
@@ -72,30 +123,81 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
     let totalUsage: Usage = EMPTY_USAGE;
     let lastFinish: FinishReason = 'stop';
     let stoppedBy: string | undefined;
-    let stepIndex = 0;
+    let stepIndex = resumeFrom?.stepIndex ?? 0;
+
+    const extras: ExecuteExtras = {
+      // Effective onUsage (call-level wins, G10) so a sub-agent's usage
+      // reaches the same callback the caller set.
+      deps: { ...deps, onUsage: options.onUsage ?? deps.onUsage },
+      reportUsage: (u) => {
+        totalUsage = sumUsage(totalUsage, u);
+      },
+      // Live sink: an agentTool forwards its stream, already wrapped as sub-agent parts.
+      emitPart: (part) => broadcaster.push(part),
+      // Durable seam (1.5): child checkpoints + suspended-approval settlement.
+      ...(durable ? { session: { store: durable.store, runId: durable.runId } } : {}),
+      ...(options.approvalResponses ? { approvalResponses: options.approvalResponses } : {}),
+    };
+
+    const emitApprovalRequests = (requests: ToolApprovalRequest[]): void => {
+      for (const r of requests) {
+        broadcaster.push({
+          type: 'tool-approval-request',
+          approvalId: r.approvalId,
+          toolCallId: r.toolCallId,
+          toolName: r.toolName,
+          input: r.input,
+          ...(r.agentPath && r.agentPath.length > 0 ? { agentPath: r.agentPath } : {}),
+        });
+      }
+    };
 
     try {
       const fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
       const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
 
       // Resume: settle the previous break's pending approvals BEFORE step 1 —
-      // their tool-result parts precede the first step-start.
-      const settled = await settlePendingApprovals(messages, tools, options);
-      if (settled) {
-        messages = settled.messages;
-        for (const r of settled.results) {
-          broadcaster.push({
-            type: 'tool-result',
-            toolCallId: r.toolCallId,
-            toolName: r.toolName,
-            output: r.result,
-            ...(r.isError ? { isError: true } : {}),
-          });
+      // their tool-result parts precede the first step-start. A durable
+      // sub-agent that re-suspends here suspends THIS run again immediately.
+      try {
+        const settled = await settlePendingApprovals(messages, tools, options, extras);
+        if (settled) {
+          messages = settled.messages;
+          for (const r of settled.results) {
+            broadcaster.push({
+              type: 'tool-result',
+              toolCallId: r.toolCallId,
+              toolName: r.toolName,
+              output: r.result,
+              ...(r.isError ? { isError: true } : {}),
+            });
+          }
+          bumpErrorGuard(
+            errorCounters,
+            settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
+          );
         }
-        bumpErrorGuard(
-          errorCounters,
-          settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
-        );
+      } catch (err) {
+        if (!(err instanceof SubAgentSuspension)) throw err;
+        emitApprovalRequests(err.approvals);
+        if (durable) {
+          await saveCheckpoint(
+            durable,
+            deps,
+            options,
+            'suspended',
+            messages,
+            totalUsage,
+            err.approvals,
+          );
+        }
+        const usage = withTotal(totalUsage);
+        broadcaster.push({ type: 'finish', usage, finishReason: lastFinish });
+        usageDeferred.resolve(usage);
+        finishDeferred.resolve(lastFinish);
+        fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
+        broadcaster.close();
+        return;
       }
 
       for (;;) {
@@ -122,7 +224,7 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         }
         const prepared = await applyPrepareStep(
           options,
-          { stepIndex, messages, usage: totalUsage },
+          { stepIndex, messages, usage: durableUsage(durable, totalUsage) },
           fullWire,
           staticWire,
           deps.logger,
@@ -210,6 +312,8 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         if (stepPhase) assistantMessage.providerMetadata = { openai: { phase: stepPhase } };
 
         if (options.signal?.aborted) {
+          // No checkpoint here: the abort cut mid-step, and a checkpoint is
+          // only honest at a completed boundary.
           lastFinish = 'aborted';
           break;
         }
@@ -231,6 +335,16 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
               steps.length,
             ),
           );
+          if (durable) {
+            await saveCheckpoint(
+              durable,
+              deps,
+              options,
+              'completed',
+              [...messages, assistantMessage],
+              totalUsage,
+            );
+          }
           break;
         }
 
@@ -270,31 +384,49 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
         // Pending approvals and client tools break together: ONE break, nothing
         // from the batch executes; the resume call settles the deferred rest.
         if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
-          for (const c of pendingApproval) {
-            broadcaster.push({
-              type: 'tool-approval-request',
-              approvalId: c.toolCallId,
-              toolCallId: c.toolCallId,
-              toolName: c.toolName,
-              input: c.args,
-            });
-          }
+          const requests = toApprovalRequests(pendingApproval, options.agentPath);
+          emitApprovalRequests(requests);
           const sr = toStepResult(stepData, toolCalls, [], steps.length);
           steps.push(sr);
           options.onStepFinish?.(sr);
+          if (durable) {
+            await saveCheckpoint(
+              durable,
+              deps,
+              options,
+              'suspended',
+              messages,
+              totalUsage,
+              requests,
+            );
+          }
           break;
         }
 
-        const toolResults = await executeTools(toolCalls, tools, options, messages, denied, {
-          // Effective onUsage (call-level wins, G10) so a sub-agent's usage
-          // reaches the same callback the caller set.
-          deps: { ...deps, onUsage: options.onUsage ?? deps.onUsage },
-          reportUsage: (u) => {
-            totalUsage = sumUsage(totalUsage, u);
-          },
-          // Live sink: an agentTool forwards its stream, already wrapped as sub-agent parts.
-          emitPart: (part) => broadcaster.push(part),
-        });
+        let toolResults;
+        try {
+          toolResults = await executeTools(toolCalls, tools, options, messages, denied, extras);
+        } catch (err) {
+          if (!(err instanceof SubAgentSuspension)) throw err;
+          // A durable sub-agent suspended: its tool_use stays unanswered; the
+          // resume leg's settle re-executes it, which resumes the child.
+          emitApprovalRequests(err.approvals);
+          const sr = toStepResult(stepData, toolCalls, [], steps.length);
+          steps.push(sr);
+          options.onStepFinish?.(sr);
+          if (durable) {
+            await saveCheckpoint(
+              durable,
+              deps,
+              options,
+              'suspended',
+              messages,
+              totalUsage,
+              err.approvals,
+            );
+          }
+          break;
+        }
         for (const r of toolResults) {
           broadcaster.push({
             type: 'tool-result',
@@ -320,17 +452,27 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
             errorCounters,
             toolResults.filter((r) => !denied.has(r.toolCallId)),
           )
-        )
+        ) {
+          if (durable) {
+            await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+          }
           break;
+        }
+        const runUsage = durableUsage(durable, totalUsage);
         const costUSD =
           wantCost && deps.priceProvider
-            ? ((await deps.priceProvider.priceUsage(options.model.modelId, totalUsage)) ??
-              undefined)
+            ? ((await deps.priceProvider.priceUsage(options.model.modelId, runUsage)) ?? undefined)
             : undefined;
-        const stop = await shouldStop(stopConditions, steps, { usage: totalUsage, costUSD });
+        const stop = await shouldStop(stopConditions, steps, { usage: runUsage, costUSD });
         if (stop.stop) {
           stoppedBy = stop.stoppedBy;
+          if (durable) {
+            await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+          }
           break;
+        }
+        if (durable) {
+          await saveCheckpoint(durable, deps, options, 'running', messages, totalUsage);
         }
         stepIndex++;
       }
@@ -372,5 +514,6 @@ export function runStreamToolLoop(options: CommonCallOptions): StreamChatResult 
       ensureStarted();
       return finishDeferred.promise;
     },
+    ...(runId !== undefined ? { runId } : {}),
   };
 }

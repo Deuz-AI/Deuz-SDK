@@ -96,3 +96,32 @@ expectTypeOf<CommonCallOptions>().toHaveProperty('compaction');
 expectTypeOf<CompactionPolicy>().toHaveProperty('threshold');
 expectTypeOf<CompactionOption>().toEqualTypeOf<'auto' | CompactionPolicy>();
 expectTypeOf<Extract<StreamPart, { type: 'compaction' }>>().toHaveProperty('layer');
+
+// --- 1.5.0 additive: durable sessions (SessionStore/AgentCheckpoint/resume) + signed approvals. ---
+import type { AgentCheckpoint, SessionStore, DurableSessionOptions } from '../src/index';
+import {
+  createInMemorySessionStore,
+  resumeFromCheckpoint,
+  resumeStreamFromCheckpoint,
+  serializeCheckpoint,
+  deserializeCheckpoint,
+  createApprovalSigner,
+  CheckpointNotFoundError,
+} from '../src/durable';
+expectTypeOf<CommonCallOptions>().toHaveProperty('session');
+expectTypeOf<DurableSessionOptions>().toHaveProperty('store');
+expectTypeOf<SessionStore>().toHaveProperty('save');
+expectTypeOf<AgentCheckpoint>().toHaveProperty('runId');
+expectTypeOf<AgentCheckpoint>().toHaveProperty('stepIndex');
+expectTypeOf<AgentCheckpoint>().toHaveProperty('pendingApprovals');
+expectTypeOf<GenerateTextResult>().toHaveProperty('runId');
+expectTypeOf<StreamChatResult>().toHaveProperty('runId');
+expectTypeOf<ToolApprovalRequest>().toHaveProperty('agentPath');
+expectTypeOf<Extract<StreamPart, { type: 'tool-approval-request' }>>().toHaveProperty('agentPath');
+expectTypeOf(createInMemorySessionStore).returns.toHaveProperty('save');
+expectTypeOf(resumeFromCheckpoint).toBeFunction();
+expectTypeOf(resumeStreamFromCheckpoint).toBeFunction();
+expectTypeOf(serializeCheckpoint).returns.toBeString();
+expectTypeOf(deserializeCheckpoint).returns.toHaveProperty('messages');
+expectTypeOf(createApprovalSigner).returns.toHaveProperty('sign');
+expectTypeOf<CheckpointNotFoundError>().toHaveProperty('runId');

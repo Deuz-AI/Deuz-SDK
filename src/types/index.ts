@@ -7,3 +7,4 @@ export type * from './stream';
 export type * from './deps';
 export type * from './config';
 export type * from './methods';
+export type * from './session';

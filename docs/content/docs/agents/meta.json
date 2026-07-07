@@ -1,4 +1,6 @@
 {
   "title": "Agents",
-  "pages": ["tools", "tool-loop", "client-tools", "server-tools", "subagents"]
+  "icon": "Bot",
+  "defaultOpen": true,
+  "pages": ["tools", "tool-loop", "client-tools", "server-tools", "subagents", "durable-runtime"]
 }

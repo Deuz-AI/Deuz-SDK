@@ -1,0 +1,69 @@
+---
+title: Changelog
+description: Release history of @deuz-sdk/core — what shipped in each version.
+icon: History
+---
+
+All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
+
+## 1.5.0
+
+**Durable sessions — `session` + `SessionStore` + `AgentCheckpoint`.** Pass `session: { store, runId? }` on any agentic call and both loops checkpoint at every step boundary into a two-method storage seam — any backend, no vendor runtime. Checkpoints carry the full immutable history, cumulative cross-leg usage, and a `running`/`suspended`/`completed` status; the result carries `runId` (synchronously on streaming). A throwing store logs and never kills the run. `serializeCheckpoint`/`deserializeCheckpoint` round-trip binary parts safely for persistent stores. New subpath `@deuz-sdk/core/durable`, everything re-exported from `/edge`. See [Durable runtime](/docs/agents/durable-runtime).
+
+**`resumeFromCheckpoint` / `resumeStreamFromCheckpoint`.** Continue a crashed or suspended run: the stored history becomes the messages, settle-on-resume answers pending approvals from `approvalResponses`, and step indices + usage continue across legs (identically in both loops, including `prepareStep`'s `ctx.stepIndex`). Resuming without a verdict denies pending gated calls by default (safe side). A mid-step crash re-runs that step — the honest recovery unit is one step. Unknown `runId` rejects with `CheckpointNotFoundError` (buffered) or surfaces as an `error` part (streaming, sync-return contract preserved).
+
+**Client-mode approval inside sub-agents.** The 1.4 limitation is gone: with a durable `session`, a gated call inside an `agentTool` suspends the child into its own checkpoint and the parent suspends with `agentPath`-tagged pending approvals; resuming the parent routes verdicts back down the tree at any depth. Without `session`, the 1.4 is_error contract is unchanged. See [Durable runtime](/docs/agents/durable-runtime#client-mode-approval-inside-sub-agents).
+
+**HMAC-signed approvals — `createApprovalSigner`.** WebCrypto HMAC-SHA256 tokens over the full approval request + optional `runId` binding + `issuedAt`; `verify` returns the payload or `null` (forged/tampered/expired/malformed — never a throw), with optional `maxAgeMs` expiry, a strict three-segment token shape, and an injectable clock; large tool inputs sign safely (loop-based base64) and an empty secret throws at construction. Closes the `approvalResponses` trust boundary documented in [Client tools](/docs/agents/client-tools).
+
+## 1.4.0
+
+**Loop hooks — `prepareStep` + `activeTools`.** `prepareStep(ctx)` runs before every model step (after automatic compaction) and may return `{ messages, activeTools, toolChoice, model }` — `messages` rewrites the base history for this and all following steps, the rest apply to that step only. A thrown `prepareStep` fails the call; it is never swallowed. Static `activeTools` restricts which tools are sent on every step; `prepareStep`'s return overrides it. Works in both `generateText` and `streamChat` whenever `tools` is present. See [Tool loop](/docs/agents/tool-loop).
+
+**Budget stop conditions — `totalTokensExceed` / `costExceeds`.** Stop the loop once cumulative real usage or cost (all steps and sub-agents included) crosses a bound. OR-ed into `stopWhen` like any condition, evaluated at step boundaries. A budget stop never changes `finishReason` — it sets `providerMetadata.deuz.stoppedBy` instead. `costExceeds` requires `deps.priceProvider`, otherwise it warns once and never fires.
+
+**Automatic layered compaction.** Opt-in via `compaction: 'auto'` (or a `CompactionPolicy`), active inside the agentic loop. Three cheapest-first layers — prune old tool results, prune old reasoning, summarize the oldest unprotected slice — run before a step once estimated context fill crosses a threshold (default 92%). System messages, the first user message, the last message, and recent turns are always protected. Streaming emits a `compaction` part per layer that ran. See [Compaction](/docs/core/compaction).
+
+**Sub-agents — `agentTool`.** Wraps a `{ model, tools, system, maxSteps, maxDepth, ... }` definition into a `Tool` that runs a nested agentic loop and returns its final text. When the parent streams, the sub-agent's canonical stream forwards live as `agentPath`-tagged `sub-agent` parts. The parent's `approveToolCall` is inherited at every depth; usage folds into the parent total; `maxDepth` (default 2) guards runaway nesting. See [Sub-agents](/docs/agents/subagents).
+
+## 1.3.0
+
+**Tool approval flow.** `needsApproval` is wired end to end. Server mode: `approveToolCall(call, { messages })` decides inline; denials become an `is_error` result the model can react to. Client mode: gated calls break the loop — `generateText` returns `pendingApprovals`, streaming emits `tool-approval-request` parts — and the next call's `approvalResponses` settles them. New UI wire parts: `tool-approval-request` / `tool-approval-response`. See [Client tools](/docs/agents/client-tools).
+
+**`streamObject`.** Streaming structured output with `partialObjectStream: AsyncIterable<DeepPartial<T>>` plus a validated `object` promise. Same options as `generateObject`; synchronous return; zero-dep tolerant partial-JSON parser. No repair retry — `usage`/`finishReason` still resolve on validation failure. See [streamObject](/docs/core/stream-object).
+
+**React hooks.** `@deuz-sdk/core/react` (React becomes an optional peer `^18 || ^19`): `useChat` — streaming messages over the Deuz wire with automatic client-tool round-trips and tool-approval pauses — and `useObject` — streaming `DeepPartial<T>` from the new `object-delta` part. Plain hooks, no JSX, SSR-safe. See [React hooks](/docs/modules/react-hooks).
+
+**`toDeuzObjectStreamResponse`.** Serialize a `streamObject` result over the Deuz v1 wire as `object-delta` parts; failures become redacted `error` parts.
+
+**MCP extensions.** Peer `@modelcontextprotocol/sdk` floor raised to `^1.29.0`. `listResources` / `readResource` / `listPrompts` / `getPrompt` on `McpClient` (auto-paginated). Tool results with `structuredContent` now return that object verbatim. Server `outputSchema` is carried on the new `Tool.outputSchema` field. `onElicitationRequest` handles form and url elicitation. See [MCP](/docs/modules/mcp).
+
+## 1.2.0
+
+**`providerOptions` escape hatch.** Per-provider raw request-body fields on every call — `{ openai: { service_tier: 'flex' } }`, `{ anthropic: { fallbacks: [...] } }`, `{ google: { cachedContent } }`. Canonical fields always win; shallow, top-level only.
+
+**`promptCaching: 'auto' | 'auto-1h'`.** One flag turns on Anthropic's automatic prompt caching (top-level `cache_control`). No-op on providers that cache implicitly.
+
+**Provider-executed web search on 3 wires.** `anthropicWebSearch()`, `openaiWebSearch()` (Responses hosted tool), `googleSearch()` (grounding). Results and citations stream as canonical `source` parts; `usage.serverToolUses` counts billed invocations. See [Provider-executed tools](/docs/agents/server-tools).
+
+**Responses stateless round-trips fixed.** With tools + reasoning, the wire now sends `include: ["reasoning.encrypted_content"]` + `store: false` and replays encrypted reasoning items verbatim on later steps. `ReasoningDeltaPart.encrypted` marks opaque encrypted reasoning payloads on `fullStream`.
+
+## 1.1.1
+
+**Anthropic effort wire fix.** On Claude Opus 4.7+, Sonnet 5 and Fable 5, `effort` now rides `output_config.effort` — the previous `thinking.budget_tokens` path returns HTTP 400 on those models. Legacy models keep the budget mapping (plus new `xhigh`/`max` → 48k).
+
+**`effort` union widened.** New `'xhigh'` and `'max'` levels. OpenAI clamps `max` → `xhigh`; Gemini clamps both to `high` (level wire) or a 32,768 budget (2.5 wire); the Responses wire sends `'none'` verbatim.
+
+**`samplingRestrictions` on Anthropic rows.** Opus 4.7/4.8, Sonnet 5 and Fable 5 reject non-default `temperature`/`top_p` — the adapter no longer sends them there.
+
+**Catalog refresh (2026-07).** New registry rows: `claude-fable-5`, `claude-sonnet-5`, `gpt-5.4-nano`, `gpt-5.3-codex`, `gemini-3.1-pro-preview` (both wires), `gemini-3.1-flash-lite`, `gemini-embedding-2`. Pricing corrections for `gpt-5.5`, `gpt-5.5-pro`, `grok-4.3`, `gemini-3.5-flash`. Long-context pricing tiers via `ModelPrice.over200k`. Retired `text-embedding-004` and `gemini-3-pro-preview` removed.
+
+**Usage extensions.** Anthropic `usage.reasoningTokens` now populated from `output_tokens_details.thinking_tokens`; server-side fallback/compaction `usage.iterations[]` are summed. `FinishStreamPart.providerMetadata` surfaces Anthropic refusal `stop_details`.
+
+## 0.1.0
+
+Initial public release. Pure, web-first, multi-provider AI SDK (Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex, Yunwu) with zero runtime dependencies and an ESM+CJS dual build. Ships a canonical streaming + tool-loop core, structured output, memory, RAG, skills, MCP, media generation, middleware, and a versioned Deuz UI wire.
+
+## 0.0.0
+
+Scaffolding: tooling (tsup dual ESM/CJS + dts, vitest, ESLint edge-safety, Prettier, changesets), publish hygiene (subpath exports, publint/attw gate, MIT license), and the locked 1.0 public surface. Methods threw `NotImplementedError` until the first release.

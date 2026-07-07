@@ -10,6 +10,7 @@ import type {
   ToolCall,
   ToolApprovalResponse,
 } from './tool';
+import type { DurableSessionOptions } from './session';
 
 /** Opaque model id; capability-aware refinement arrives with the registry (Faz 1.A). */
 export type ModelId = string;
@@ -172,6 +173,14 @@ export interface CommonCallOptions {
    * ignored (replay-safe).
    */
   approvalResponses?: ToolApprovalResponse[];
+  /**
+   * Durable execution (1.5 additive): checkpoint the agentic loop at every
+   * step boundary into `session.store`, so a crashed / suspended run can be
+   * continued with `resumeFromCheckpoint`. Only agentic calls (with `tools`)
+   * checkpoint — a single-turn call has no step boundaries. Store failures
+   * log `deps.logger.error` and never kill the run.
+   */
+  session?: DurableSessionOptions;
 }
 
 /** Shared client configuration; pre-binds api keys + deps for the convenience client. */
