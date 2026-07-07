@@ -20,7 +20,6 @@ Requires **Node >= 22**. The chat core has nothing in `dependencies`. Optional p
 - **Use provider-native search** → [Provider-executed tools](/docs/agents/server-tools)
 - **Add MCP** → [MCP guide](/docs/modules/mcp)
 - **Add memory/RAG** → [Memory](/docs/modules/memory) + [RAG](/docs/modules/rag)
-- **Evaluate against alternatives** → [Deuz SDK vs Others](/docs/comparison/benchmarks) + [vs AI SDK 7](/docs/comparison/ai-sdk-7)
 
 ## Why it exists
 
@@ -133,7 +132,7 @@ A provider factory returns a tiny `LanguageModel` descriptor; the [model registr
 
 ## Quality bar
 
-- **377 tests** across 38 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network)
+- **411 tests** across 41 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network)
 - `tsc` strict (`moduleResolution: "Bundler"`, `verbatimModuleSyntax`, `noUncheckedIndexedAccess`)
 - `eslint` with edge-safety enforced, `publint --strict`, and `attw` (Are The Types Wrong) all green
 - Dual **ESM + CJS** build with `.d.ts` for every subpath export

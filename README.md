@@ -16,7 +16,16 @@ _One canonical wire. Zero runtime dependencies. Runs anywhere `fetch` runs._
 
 `@deuz-sdk/core` is a from-scratch, **independent** AI SDK built for the **Deuz** platform and shared with everyone. It depends on no other AI SDK and ships its own streaming + UI protocol. It is **pure**: no Supabase, no credit logic, no env reading. Everything stateful — HTTP, clock, logging, metering, circuit-breaker, API keys, memory, vector stores — is injected through a single `Dependencies` seam, so the exact same core runs unchanged on **Node, Deno, Bun, Vercel/Cloudflare Edge**.
 
-> **Status — v1.5.0 (latest release).** [`@deuz-sdk/core`](https://www.npmjs.com/package/@deuz-sdk/core) is published on npm. Chat across all four wires + Vertex, the agentic tool loop, vision, MCP, the UI wire, native Gemini, embeddings, memory, RAG, skills, image generation, middleware, pricing, hybrid RAG search, and Gemini explicit caching are all implemented and tested (**411 tests green**; `tsc` + `eslint` + `publint --strict` + `attw` + dual ESM/CJS/d.ts build all clean). The current release, **v1.5.0 "Durable"**, adds **durable sessions** (`session: { store, runId? }` — both agentic loops checkpoint at every step boundary into a two-method `SessionStore` seam over any backend, **no vendor runtime**), **checkpoint resume** (`resumeFromCheckpoint` / `resumeStreamFromCheckpoint` from the new `@deuz-sdk/core/durable` subpath — continue a crashed or suspended run with cumulative usage and step indices across legs; resuming without a verdict default-denies pending gated calls), **client-mode approval inside sub-agents** (the 1.4 limitation removed: a gated call inside `agentTool` suspends child + parent into checkpoints, `agentPath`-tagged approvals route verdicts back down the tree on resume), and **HMAC-signed approvals** (`createApprovalSigner` — WebCrypto HMAC-SHA256 tokens with `runId` binding and `maxAgeMs` expiry, closing the `approvalResponses` trust boundary). v1.4.0 "Agent Core" added **sub-agents** (`agentTool` — a nested agentic loop as a callable `Tool`, with its whole canonical stream forwarded live into the parent as `sub-agent` parts and the parent's tool-approval policy inherited to every nesting depth as first-class behavior), **automatic layered context compaction** (opt-in `compaction: 'auto'` — prune old tool results, prune old reasoning, summarize the oldest slice, cache-safe and never-throws, one flag instead of hand-rolled pruning), **token/cost budget stop conditions** (`totalTokensExceed` / `costExceeds`, OR-ed into `stopWhen`, reported back via `providerMetadata.deuz.stoppedBy`), and **per-step loop hooks** (`prepareStep` + `activeTools` — swap the model, restrict tools, or rewrite history mid-loop, on the free functions). v1.3.0 shipped the **tool-approval flow** (`needsApproval` live: inline `approveToolCall` or a client round-trip via `tool-approval-request` parts + `approvalResponses`), **`streamObject`** (streaming structured output with a zero-dep tolerant partial-JSON parser), **MCP extensions** (resources, prompts, form+URL elicitation, `structuredContent`), and **React hooks** — `useChat` with automatic client-tool round-trips and approval pauses, plus `useObject` over the new `object-delta` wire part (React is an optional peer). v1.2.0 added provider-executed web search on three wires, `providerOptions`, one-flag Anthropic prompt caching, and correct Responses API stateless round-trips; v1.1.1 refreshed the model catalog to the 2026-07 state (Claude 5, GPT-5.4/5.5, Gemini 3.1, pricing tiers). See the [Roadmap](#roadmap) for what's next.
+[`@deuz-sdk/core`](https://www.npmjs.com/package/@deuz-sdk/core) is published on npm. Chat across all four wires plus Vertex, the agentic tool loop, vision, MCP, the UI wire, native Gemini, embeddings, memory, RAG, skills, image generation, middleware, pricing, hybrid RAG search, and Gemini explicit caching are all implemented and tested — **411 tests green** across 41 files; `tsc` + `eslint` + `publint --strict` + `attw` + dual ESM/CJS/`.d.ts` build all clean.
+
+### Highlights (v1.5.0 "Durable")
+
+- **Durable sessions** — `session: { store, runId? }`; both agentic loops (top-level and sub-agent) checkpoint at every step boundary into a two-method `SessionStore` seam over any backend, no vendor runtime required.
+- **Checkpoint resume** — `resumeFromCheckpoint` / `resumeStreamFromCheckpoint` (from `@deuz-sdk/core/durable`) continue a crashed or suspended run with cumulative usage and step indices preserved across legs; resuming without a verdict default-denies pending gated calls.
+- **Client-mode approval inside sub-agents** — the 1.4 limitation is removed: a gated call inside `agentTool` suspends child and parent into checkpoints, and `agentPath`-tagged approvals route verdicts back down the tree on resume.
+- **HMAC-signed approvals** — `createApprovalSigner` issues WebCrypto HMAC-SHA256 tokens bound to `runId` with `maxAgeMs` expiry, closing the `approvalResponses` trust boundary.
+
+Full release history is in [`CHANGELOG.md`](./CHANGELOG.md). See the [Roadmap](#roadmap) for what's next.
 
 ```bash
 npm install @deuz-sdk/core
@@ -24,7 +33,7 @@ npm install @deuz-sdk/core
 
 Requires **Node ≥ 22**. **Zero runtime dependencies.** Optional peers, pulled in only if you use them: `zod` (or any Standard Schema lib) + `@standard-community/standard-json` for schema-typed `generateObject`; `@modelcontextprotocol/sdk` for MCP; `unpdf` / `mammoth` / `xlsx` for `@deuz-sdk/core/rag/node` document parsing.
 
-📚 **Documentation** — the full docs site lives in [`docs/`](./docs) (Fumadocs; 37 pages covering every module, with `llms.txt` / `llms-full.txt` for AI agents). 🤖 **Claude Code skill** — [`skills/deuz-sdk/`](./skills/deuz-sdk) teaches AI coding agents to integrate the SDK correctly.
+**Documentation** — the full docs site lives in [`docs/`](./docs) (Fumadocs; 40 pages covering every module, with `llms.txt` / `llms-full.txt` for AI agents). **Claude Code skill** — [`skills/deuz-sdk/`](./skills/deuz-sdk) teaches AI coding agents to integrate the SDK correctly.
 
 ---
 
@@ -32,11 +41,11 @@ Requires **Node ≥ 22**. **Zero runtime dependencies.** Optional peers, pulled 
 
 | Principle | What it means in practice |
 | --- | --- |
-| 🧊 **Pure core** | No `Date.now()` / `Math.random()` / `process.env` / `console` in `src/`. All of it injected via one `Dependencies` object → deterministic, replayable tests. |
-| 🌍 **Edge-safe** | Only Web APIs (`fetch`, Web Streams, `TextDecoder`, `WebCrypto`, `atob/btoa`). `node:*` / `Buffer` are **forbidden by lint** — Node-only bits live in separate `…/node` subpaths. |
-| 🔌 **Zero deps** | The chat core ships nothing in `dependencies`. Heavy or stateful things are optional peers or injected seams. |
-| 🔓 **No vendor lock** | Our own canonical delta stream + our own versioned UI wire. We never proxy a provider's raw bytes to your client. |
-| 🔒 **Secrets never leak** | API keys are masked in every log / error / span path, regression-tested. |
+| **Pure core** | No `Date.now()` / `Math.random()` / `process.env` / `console` in `src/`. All of it injected via one `Dependencies` object → deterministic, replayable tests. |
+| **Edge-safe** | Only Web APIs (`fetch`, Web Streams, `TextDecoder`, `WebCrypto`, `atob/btoa`). `node:*` / `Buffer` are **forbidden by lint** — Node-only bits live in separate `…/node` subpaths. |
+| **Zero deps** | The chat core ships nothing in `dependencies`. Heavy or stateful things are optional peers or injected seams. |
+| **No vendor lock** | Our own canonical delta stream + our own versioned UI wire. We never proxy a provider's raw bytes to your client. |
+| **Secrets never leak** | API keys are masked in every log / error / span path, regression-tested. |
 
 ---
 
@@ -53,7 +62,7 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // It never throws synchronously; errors surface via the stream + usage promise.
 const res = streamChat({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Selam!' }],
+  messages: [{ role: 'user', content: 'Hello!' }],
   maxRetries: 2,
   onUsage: (u) => console.log(u.inputTokens, u.outputTokens),
 });
@@ -263,6 +272,35 @@ const task = await imagine({ ...yunwu.mj(), prompt: 'a robot mascot --ar 1:1' })
 YUNWU_MODELS.chat;  // 2026 catalog: gpt-5.2, claude-opus-4-5, gemini-3-pro-preview, grok-4.1, …
 ```
 
+### Durable sessions (`@deuz-sdk/core/durable`)
+
+Checkpoint an agentic loop at every step boundary and resume it later — across a
+process restart, a suspended human-approval gate, or a crashed leg — without any
+vendor-specific runtime.
+
+```ts
+import { resumeFromCheckpoint, resumeStreamFromCheckpoint } from '@deuz-sdk/core/durable';
+
+// First leg: pass a session store + runId; the loop checkpoints after each step.
+const { text, steps } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Draft the release notes.' }],
+  tools: { publish: { /* … needsApproval: true */ } },
+  session: { store, runId: 'run-42' },
+});
+
+// If a step is pending approval (or the process died), resume the same run later.
+const resumed = await resumeFromCheckpoint({ store, runId: 'run-42' }, { model: anthropic, tools });
+
+// Streaming variant preserves cumulative usage and step indices across legs.
+const res = resumeStreamFromCheckpoint({ store, runId: 'run-42' }, { model: anthropic, tools });
+```
+
+Resuming a run with a pending gated call and no supplied verdict **default-denies**
+that call rather than silently proceeding. Approvals can be signed with
+`createApprovalSigner` (WebCrypto HMAC-SHA256, bound to `runId`, with `maxAgeMs`
+expiry) to close the trust boundary on `approvalResponses` coming back from a client.
+
 ### UI streaming (`@deuz-sdk/core/ui`)
 
 ```ts
@@ -291,20 +329,22 @@ for await (const part of readDeuzStream(await fetch('/api/chat', { method: 'POST
 | `@deuz-sdk/core/openai` | OpenAI (Chat Completions + Responses) + `openaiEmbedding` |
 | `@deuz-sdk/core/xai` | xAI Grok (OpenAI-compatible) |
 | `@deuz-sdk/core/google` | Gemini — compat (`createGoogle`) + native `generateContent` (`createGoogleNative`) + `googleEmbedding` |
+| `@deuz-sdk/core/google/extras` | Gemini explicit caching (`createGeminiCache`) + Files API (`uploadFile`) |
 | `@deuz-sdk/core/voyage` | Voyage AI embeddings |
-| `@deuz-sdk/core/vertex` | Vertex AI — Claude + Gemini (compat **and** native `createVertexGoogleNative`) |
 | `@deuz-sdk/core/pricing` | Optional USD cost table (2026) + `createPriceProvider` (token → $) |
 | `@deuz-sdk/core/middleware` | `wrapModel` + `logging` / `simpleCache` / `redactPII` / `promptInjectionGuard` |
+| `@deuz-sdk/core/image` | Synchronous OpenAI-compatible image generation |
+| `@deuz-sdk/core/midjourney` | Async Midjourney (submit / poll / action / `imagine` + webhook) |
+| `@deuz-sdk/core/yunwu` | Yunwu (云雾) unified relay — `createYunwu` + 2026 `YUNWU_MODELS` catalog |
 | `@deuz-sdk/core/memory` | Pure memory layer — extract / reconcile / recall + store seam |
 | `@deuz-sdk/core/memory/markdown` | Obsidian-style markdown `MemoryStore` (Node; hybrid `.md` + vector sidecar) |
 | `@deuz-sdk/core/rag` | RAG primitives — MIME sniff, chunkers, retrieve→rerank seam (edge-safe) |
 | `@deuz-sdk/core/rag/node` | Node document parsers — unpdf / mammoth / xlsx |
 | `@deuz-sdk/core/skills` | Agent Skills — SKILL.md parser, progressive-disclosure registry, matcher seam |
 | `@deuz-sdk/core/skills/node` | Node filesystem `SkillSource` |
-| `@deuz-sdk/core/image` | Synchronous OpenAI-compatible image generation |
-| `@deuz-sdk/core/midjourney` | Async Midjourney (submit / poll / action / `imagine` + webhook) |
-| `@deuz-sdk/core/yunwu` | Yunwu (云雾) unified relay — `createYunwu` + 2026 `YUNWU_MODELS` catalog |
+| `@deuz-sdk/core/vertex` | Vertex AI — Claude + Gemini (compat **and** native `createVertexGoogleNative`) |
 | `@deuz-sdk/core/mcp` · `…/mcp/stdio` | MCP client (HTTP/SSE edge-safe; stdio Node-only) |
+| `@deuz-sdk/core/durable` | Durable sessions — `resumeFromCheckpoint` / `resumeStreamFromCheckpoint` + `createApprovalSigner` |
 | `@deuz-sdk/core/edge` | Guaranteed edge-safe subset |
 | `@deuz-sdk/core/ui` | `toDeuzStreamResponse` (server) + `readDeuzStream` (client) — our own UI wire |
 | `@deuz-sdk/core/react` | React hooks — `useChat` (client tools + approvals) / `useObject` (React = optional peer) |
@@ -329,13 +369,13 @@ Response: upstream SSE  →  robust parser  →  CANONICAL DELTA STREAM
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| **Faz 0** | Scaffold, seam standard, publish hygiene | ✅ |
-| **Faz 1** | Chat core — 4 wires, errors, resilience, metering, registry | ✅ |
-| **Faz 2** | Tools + vision + MCP + UI wire | ✅ |
-| **Faz 3** | Skills + memory + RAG + native Gemini + embeddings | ✅ |
-| **Faz 4** | Image generation (sync + Midjourney + Yunwu) | ✅ SDK side · ⏳ app-side `tasks` table |
-| **Faz 5** | Aggregator fallback, DeepSeek/Kimi, Batch API, rate-limiter impl | ⬜ optional |
-| **Faz 6** | `@deuz-sdk/core/react` hooks, CI provenance | 🔶 hooks ✅ · CI provenance ⏳ |
+| **Faz 0** | Scaffold, seam standard, publish hygiene | done |
+| **Faz 1** | Chat core — 4 wires, errors, resilience, metering, registry | done |
+| **Faz 2** | Tools + vision + MCP + UI wire | done |
+| **Faz 3** | Skills + memory + RAG + native Gemini + embeddings | done |
+| **Faz 4** | Image generation (sync + Midjourney + Yunwu) | SDK side done · app-side `tasks` table pending |
+| **Faz 5** | Aggregator fallback, DeepSeek/Kimi, Batch API, rate-limiter impl | optional |
+| **Faz 6** | `@deuz-sdk/core/react` hooks, CI provenance | hooks done · CI provenance pending |
 
 **Deliberately deferred** (seam exists, impl later): pre-flight token counting (`tokens.ts`), budgeter, full token-bucket rate limiter, OpenTelemetry exporter, memory consolidation/decay + graph memory, cross-encoder rerank implementation (seam is in), video generation helper.
 
@@ -343,29 +383,21 @@ Response: upstream SSE  →  robust parser  →  CANONICAL DELTA STREAM
 
 ## Quality bar
 
-- **411 tests** (vitest golden-replay fixtures + deterministic mock models — no real network)
+- **411 tests** across 41 files (vitest golden-replay fixtures + deterministic mock models — no real network)
 - `tsc` strict · `eslint` (edge-safety enforced) · `publint --strict` · `attw` · dual **ESM + CJS + .d.ts** build — all green
 - Type-contract lock: `test/surface.test-d.ts` pins the public 1.0 surface
-- ~10k lines across 70 source modules, zero runtime dependencies
+- 13,971 lines across 81 source modules, zero runtime dependencies
 
 ---
 
-## Credits
+## Changelog
 
-<div align="center">
-
-**Founder — [Umutcan Edizaslan](https://github.com/U-C4N)**
-
-_Helping by_
-
-🤖 **Codex 5.5** · 🧠 **Claude Opus 4.8** · ⚡ **ultracode**
-
-<sub>Designed, researched, and built with a multi-agent workflow — adversarial review, live API verification, and deep web research at every phase.</sub>
-
-</div>
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full release history (v1.1.1 through v1.5.0).
 
 ---
 
-## License
+## Author & License
 
-[MIT](./LICENSE) © 2026 Umutcan Edizaslan
+Umutcan Edizaslan ([@U-C4N](https://github.com/U-C4N))
+
+[MIT](./LICENSE) © 2026

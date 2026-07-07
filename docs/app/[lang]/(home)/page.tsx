@@ -15,7 +15,7 @@ import { gitConfig } from '@/lib/shared';
 
 const copy = {
   en: {
-    badge: 'v1.4 — sub-agents, compaction & budget stops',
+    badge: 'v1.5 — durable sessions, checkpoint resume & signed approvals',
     titleA: 'One canonical wire for',
     titleB: 'every AI provider',
     lead: 'Pure · Web-first · Multi-provider AI SDK for TypeScript',
@@ -63,7 +63,7 @@ const copy = {
     footerChangelog: 'Changelog',
   },
   de: {
-    badge: 'v1.4 — Sub-Agenten, Kompaktierung & Budget-Stops',
+    badge: 'v1.5 — dauerhafte Sitzungen, Checkpoint-Wiederaufnahme & signierte Freigaben',
     titleA: 'Ein kanonisches Protokoll für',
     titleB: 'jeden KI-Provider',
     lead: 'Pures · Web-first · Multi-Provider AI SDK für TypeScript',
@@ -111,7 +111,7 @@ const copy = {
     footerChangelog: 'Changelog',
   },
   tr: {
-    badge: 'v1.4 — alt ajanlar, sıkıştırma ve bütçe durakları',
+    badge: "v1.5 — kalıcı oturumlar, checkpoint'ten devam ve imzalı onaylar",
     titleA: 'Tüm yapay zeka sağlayıcıları için',
     titleB: 'tek kanonik protokol',
     lead: 'Saf · Web öncelikli · Çok sağlayıcılı TypeScript AI SDK',
@@ -159,7 +159,7 @@ const copy = {
     footerChangelog: 'Sürüm notları',
   },
   fr: {
-    badge: 'v1.4 — sous-agents, compactage & arrêts budgétaires',
+    badge: 'v1.5 — sessions durables, reprise sur point de contrôle & approbations signées',
     titleA: 'Un protocole canonique pour',
     titleB: 'chaque fournisseur d’IA',
     lead: 'SDK IA TypeScript pur · web-first · multi-fournisseur',
@@ -207,7 +207,7 @@ const copy = {
     footerChangelog: 'Journal des modifications',
   },
   it: {
-    badge: 'v1.4 — sub-agenti, compattazione e stop di budget',
+    badge: 'v1.5 — sessioni persistenti, ripresa da checkpoint e approvazioni firmate',
     titleA: 'Un protocollo canonico per',
     titleB: 'ogni provider di IA',
     lead: 'SDK IA TypeScript puro · web-first · multi-provider',
@@ -255,7 +255,7 @@ const copy = {
     footerChangelog: 'Changelog',
   },
   es: {
-    badge: 'v1.4 — subagentes, compactación y paradas de presupuesto',
+    badge: 'v1.5 — sesiones duraderas, reanudación por checkpoints y aprobaciones firmadas',
     titleA: 'Un protocolo canónico para',
     titleB: 'cada proveedor de IA',
     lead: 'SDK de IA para TypeScript puro · web-first · multiproveedor',
@@ -303,7 +303,7 @@ const copy = {
     footerChangelog: 'Registro de cambios',
   },
   ru: {
-    badge: 'v1.4 — суб-агенты, компакция и бюджетные стопы',
+    badge: 'v1.5 — устойчивые сессии, возобновление с чекпоинтов и подписанные одобрения',
     titleA: 'Один канонический протокол для',
     titleB: 'каждого ИИ-провайдера',
     lead: 'Чистый · web-first · мультипровайдерный TypeScript AI SDK',
@@ -351,7 +351,7 @@ const copy = {
     footerChangelog: 'История изменений',
   },
   ja: {
-    badge: 'v1.4 — サブエージェント、コンパクション、予算ストップ',
+    badge: 'v1.5 — 永続セッション、チェックポイント再開、署名付き承認',
     titleA: 'すべての AI プロバイダーを',
     titleB: 'ひとつの正規プロトコルで',
     lead: 'ピュア · ウェブファースト · マルチプロバイダー TypeScript AI SDK',
@@ -399,7 +399,7 @@ const copy = {
     footerChangelog: '変更履歴',
   },
   ko: {
-    badge: 'v1.4 — 서브 에이전트, 컴팩션, 예산 스톱',
+    badge: 'v1.5 — 영속 세션, 체크포인트 재개, 서명 승인',
     titleA: '모든 AI 프로바이더를 위한',
     titleB: '단 하나의 정규 프로토콜',
     lead: '순수 · 웹 우선 · 멀티 프로바이더 TypeScript AI SDK',
@@ -447,7 +447,7 @@ const copy = {
     footerChangelog: '변경 이력',
   },
   zh: {
-    badge: 'v1.4 — 子代理、上下文压缩与预算停止',
+    badge: 'v1.5 — 持久化会话、检查点恢复与签名审批',
     titleA: '为每一个 AI 提供商',
     titleB: '提供同一条规范协议',
     lead: '纯净 · Web 优先 · 多提供商 TypeScript AI SDK',
