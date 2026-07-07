@@ -10,5 +10,22 @@ export type { AgentToolDef } from './inference/agent-tool';
 export { anthropicWebSearch, openaiWebSearch, googleSearch } from './server-tools';
 export { createClient, resolveDependencies } from './client';
 export type { DeuzClient } from './client';
+// Durable sessions (1.5 additive) — checkpoint/resume + HMAC-signed approvals,
+// WebCrypto only, edge-safe by construction.
+export {
+  createInMemorySessionStore,
+  resumeFromCheckpoint,
+  resumeStreamFromCheckpoint,
+  serializeCheckpoint,
+  deserializeCheckpoint,
+  createApprovalSigner,
+  CheckpointNotFoundError,
+} from './durable';
+export type {
+  ResumeOptions,
+  SignedApprovalPayload,
+  CreateApprovalSignerOptions,
+  ApprovalSigner,
+} from './durable';
 export { DeuzError, NotImplementedError, NoObjectGeneratedError } from './errors';
 export type * from './types';

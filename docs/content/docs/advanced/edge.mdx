@@ -47,7 +47,10 @@ It exports exactly:
 | `anthropicWebSearch`, `openaiWebSearch`, `googleSearch` | functions (server tools) |
 | `DeuzClient` | type |
 | `DeuzError`, `NotImplementedError`, `NoObjectGeneratedError` | error classes |
-| everything from the canonical types (`Message`, `Part`, `Usage`, `StreamPart`, `LanguageModel`, `CommonCallOptions`, …) | `export type *` |
+| `createInMemorySessionStore`, `resumeFromCheckpoint`, `resumeStreamFromCheckpoint`, `serializeCheckpoint`, `deserializeCheckpoint`, `createApprovalSigner` | functions ([durable runtime](/docs/agents/durable-runtime), 1.5) |
+| `CheckpointNotFoundError` | error class (1.5) |
+| `ResumeOptions`, `SignedApprovalPayload`, `CreateApprovalSignerOptions`, `ApprovalSigner` | types (1.5) |
+| everything from the canonical types (`Message`, `Part`, `Usage`, `StreamPart`, `LanguageModel`, `CommonCallOptions`, `AgentCheckpoint`, `SessionStore`, …) | `export type *` |
 
 ```ts title="edge bundle (guaranteed safe)"
 import { streamChat } from '@deuz-sdk/core/edge';

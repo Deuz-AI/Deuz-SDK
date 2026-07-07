@@ -6,13 +6,14 @@
  * server-mode `approveToolCall` (which AI SDK's subagents cannot do). No new
  * runtime: `execute` just drives the existing streaming loop one level down.
  */
-import type { Tool, ToolSet, StopCondition } from '../types/tool';
+import type { Tool, ToolSet, StopCondition, ToolApprovalRequest } from '../types/tool';
 import type { CompactionOption } from '../types/config';
 import type { LanguageModel } from '../types/model';
 import type { Message } from '../types/message';
 import type { Dependencies } from '../types/deps';
 import type { JSONSchema } from '../types/schema';
-import { runStreamToolLoop } from './stream-tool-loop';
+import { runStreamToolLoop, type StreamToolLoopInternal } from './stream-tool-loop';
+import { SubAgentSuspension } from './loop-shared';
 
 export interface AgentToolDef {
   /** Sub-agent identity — used in `agentPath`; use the same string as the tool key. */
@@ -81,31 +82,63 @@ export function agentTool(def: AgentToolDef): Tool {
           }
         : undefined;
 
-      const messages: Message[] = [
+      // Durable child session (1.5): when the parent loop carries `session`,
+      // the child checkpoints under a per-call key — and if THAT key holds
+      // a suspended checkpoint (an earlier leg broke on a client-mode
+      // approval inside this sub-agent), the child RESUMES it instead of
+      // starting over, settling its pending calls from the forwarded
+      // `approvalResponses`. The key includes `ctx.toolCallId` — the model-
+      // issued tool_use id, stable across resume legs because it lives in the
+      // parent history — so parallel same-name sub-agents never collide.
+      const childSession = ctx.session
+        ? {
+            store: ctx.session.store,
+            runId: `${ctx.session.runId}::${def.name}#${ctx.toolCallId}`,
+          }
+        : undefined;
+      let resume: StreamToolLoopInternal | undefined;
+      let childMessages: Message[] = [
         ...(def.system ? [{ role: 'system', content: def.system } as Message] : []),
         { role: 'user', content: prompt },
       ];
-      const inner = runStreamToolLoop({
-        model: def.model,
-        messages,
-        agentPath: path,
-        maxSteps: def.maxSteps ?? 10,
-        // Always an object — the loop assumes a present tool set. Empty is fine
-        // (a tool-less sub-agent is a single focused turn); adapters omit an
-        // empty tools array from the wire.
-        tools: def.tools ?? {},
-        ...(def.stopWhen ? { stopWhen: def.stopWhen } : {}),
-        ...(def.compaction ? { compaction: def.compaction } : {}),
-        ...(ctx.signal ? { signal: ctx.signal } : {}),
-        // Inherit the parent's server-mode approver so sub-agent calls stay gated.
-        ...(ctx.approveToolCall ? { approveToolCall: ctx.approveToolCall } : {}),
-        ...(innerDeps ? { deps: innerDeps } : {}),
-      });
+      if (childSession) {
+        const checkpoint = await childSession.store.load(childSession.runId);
+        if (checkpoint && checkpoint.status === 'suspended') {
+          childMessages = [...checkpoint.messages];
+          resume = {
+            resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+          };
+        }
+      }
+
+      const inner = runStreamToolLoop(
+        {
+          model: def.model,
+          messages: childMessages,
+          agentPath: path,
+          maxSteps: def.maxSteps ?? 10,
+          // Always an object — the loop assumes a present tool set. Empty is fine
+          // (a tool-less sub-agent is a single focused turn); adapters omit an
+          // empty tools array from the wire.
+          tools: def.tools ?? {},
+          ...(def.stopWhen ? { stopWhen: def.stopWhen } : {}),
+          ...(def.compaction ? { compaction: def.compaction } : {}),
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+          // Inherit the parent's server-mode approver so sub-agent calls stay gated.
+          ...(ctx.approveToolCall ? { approveToolCall: ctx.approveToolCall } : {}),
+          ...(innerDeps ? { deps: innerDeps } : {}),
+          ...(childSession ? { session: childSession } : {}),
+          // Forwarded verdicts settle a resumed child's pending calls; fresh
+          // child runs have nothing to settle, so they pass through harmlessly.
+          ...(ctx.approvalResponses ? { approvalResponses: ctx.approvalResponses } : {}),
+        },
+        resume,
+      );
 
       const forward = Boolean(ctx.emitPart) && def.subAgentStream !== 'none';
       let stepText = '';
       let lastNonEmpty = '';
-      let sawPendingApproval = false;
+      const pendingApprovals: ToolApprovalRequest[] = [];
       for await (const part of inner.fullStream) {
         if (part.type === 'step-start') {
           // Carry forward the last step that actually produced text, so a run
@@ -114,19 +147,37 @@ export function agentTool(def: AgentToolDef): Tool {
           if (stepText.trim()) lastNonEmpty = stepText;
           stepText = '';
         } else if (part.type === 'text-delta') stepText += part.text;
-        else if (part.type === 'tool-approval-request') sawPendingApproval = true;
-        else if (part.type === 'error') throw part.error;
+        else if (part.type === 'tool-approval-request') {
+          pendingApprovals.push({
+            approvalId: part.approvalId,
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            input: part.input,
+            // A deeper descendant's path survives; this loop's own breaks
+            // carry `path` from the child loop already, but keep the fallback.
+            agentPath: part.agentPath ?? path,
+          });
+        } else if (part.type === 'error') throw part.error;
         if (forward) ctx.emitPart!({ type: 'sub-agent', agentPath: path, part });
       }
 
       // Fold the sub-agent's cumulative usage into the parent (result + budget).
+      // On a suspension this runs BEFORE the signal below, so the suspended
+      // parent's checkpoint still counts the child's tokens.
       ctx.reportUsage?.(await inner.usage);
 
-      if (sawPendingApproval) {
+      if (pendingApprovals.length > 0) {
+        if (childSession) {
+          // The child checkpointed itself as suspended — suspend the parent
+          // too, carrying the approvals up (executeTools re-throws this).
+          throw new SubAgentSuspension(pendingApprovals);
+        }
+        // No durable session: keep the 1.4 self-healing contract.
         throw new Error(
           `agentTool '${def.name}': a sub-agent tool call needs approval. Client-mode approval ` +
-            `inside a sub-agent is not supported yet — pass a server-mode approveToolCall on the ` +
-            `parent call, or wait for 1.5 durable sessions.`,
+            `inside a sub-agent is not supported yet without a durable session — pass a ` +
+            `server-mode approveToolCall on the parent call, or add \`session\` (1.5 durable ` +
+            `sessions) so the run can suspend and resume.`,
         );
       }
       // Prefer the final step's text; fall back to the last step that had any,

@@ -18,6 +18,11 @@ export interface StreamChatResult {
   /** Resolves once the stream finishes. */
   usage: Promise<Usage>;
   finishReason: Promise<FinishReason>;
+  /**
+   * Durable run id — present only when the call carried `session` (or came
+   * from `resumeStreamFromCheckpoint`). Known synchronously. Additive (1.5).
+   */
+  runId?: string;
 }
 
 export type StreamChat = (options: StreamChatOptions) => StreamChatResult;
@@ -48,6 +53,12 @@ export interface GenerateTextResult {
    * loop ended naturally or on the implicit `maxSteps` bound. Additive (1.4).
    */
   providerMetadata?: Record<string, Record<string, unknown>>;
+  /**
+   * Durable run id — present only when the call carried `session` (or came
+   * from `resumeFromCheckpoint`). Pass it to `resumeFromCheckpoint` to
+   * continue a suspended/crashed run. Additive (1.5).
+   */
+  runId?: string;
 }
 
 export type GenerateText = (options: GenerateTextOptions) => Promise<GenerateTextResult>;

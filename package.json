@@ -1,6 +1,6 @@
 {
   "name": "@deuz-sdk/core",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini).",
   "license": "MIT",
   "author": "Umutcan Edizaslan (U-C4N)",
@@ -228,6 +228,16 @@
       "require": {
         "types": "./dist/mcp/stdio.d.cts",
         "default": "./dist/mcp/stdio.cjs"
+      }
+    },
+    "./durable": {
+      "import": {
+        "types": "./dist/durable.d.ts",
+        "default": "./dist/durable.js"
+      },
+      "require": {
+        "types": "./dist/durable.d.cts",
+        "default": "./dist/durable.cjs"
       }
     },
     "./edge": {

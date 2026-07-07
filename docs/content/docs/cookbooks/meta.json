@@ -1,4 +1,6 @@
 {
   "title": "Cookbooks",
+  "icon": "ChefHat",
+  "defaultOpen": true,
   "pages": ["coding-agent"]
 }

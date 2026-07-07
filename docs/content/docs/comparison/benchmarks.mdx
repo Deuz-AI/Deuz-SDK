@@ -1,0 +1,106 @@
+---
+title: Deuz SDK vs Others
+description: A researched, version-pinned comparison of @deuz-sdk/core against Vercel AI SDK 7, Mastra, LangGraph.js and the OpenAI Agents SDK — with the measured benchmark data behind it.
+---
+
+This page compares `@deuz-sdk/core` against the four TypeScript AI SDKs / agent frameworks you are most likely to shortlist in 2026. Every claim is either **code-level verified** (we scanned the codebase and ran the checks) or **docs-level verified** (official documentation, version-pinned, researched 2026-07-07) — each section says which. The scoring rubric is ours and the raw sheets live in this repository, so every cell can be re-derived or disputed.
+
+| Verification tier | Applies to |
+| --- | --- |
+| **Tier 1 — code-level** (codebase scanned, tests executed, claims grep-checked) | `@deuz-sdk/core` v1.4.0 · Vercel AI SDK 7 (`ai@7.0.14`, checked 2026-07-04) |
+| **Tier 2 — docs-level** (official docs + release pages, versions pinned, 2026-07-07) | Mastra `@mastra/core@1.46.0` · LangGraph.js `@langchain/langgraph` · OpenAI Agents SDK `@openai/agents@0.12.1` |
+
+## TL;DR — what each one is
+
+| SDK | In one sentence | Reach for it when |
+| --- | --- | --- |
+| **`@deuz-sdk/core`** | Zero-dependency, edge-safe SDK primitives with one canonical stream, a free-function agent loop, and deterministic-by-design testing | You want to own the wire, the loop and the cost accounting; edge/CLI targets; replayable tests |
+| **Vercel AI SDK 7** | The broadest ecosystem: primitives plus agent classes, ~48 providers, 5+ UI frameworks | You want maximum provider/framework coverage and Vercel-native durable workflows |
+| **Mastra** | Batteries-included TypeScript agent *framework* — workflows, memory, RAG, Studio in one package | A TS team wants a Rails-like, all-in-one agent backend with managed structure |
+| **LangGraph.js** | A low-level graph runtime — explicit nodes/edges with checkpoints at every super-step | Enterprise workflows needing durable graphs, audit trails and time-travel debugging |
+| **OpenAI Agents SDK (JS)** | A lightweight runner: agents, handoffs, guardrails, sessions, tracing | You are committed to OpenAI's stack and want the vendor's own minimal orchestration |
+
+These tools sit at different abstraction levels — Deuz and AI SDK are SDKs, Mastra is a full framework, LangGraph is a runtime, the Agents SDK is a thin runner — so a single ranked score would be misleading. The matrix below maps trade-offs; measured scores exist only for the pair we code-verified.
+
+## Capability matrix
+
+Status: ✅ shipped · 🟡 partial / with caveats · ❌ not provided · 🚧 in progress.
+
+| Capability | Deuz v1.4 | AI SDK 7 | Mastra | LangGraph.js | OpenAI Agents JS |
+| --- | --- | --- | --- | --- | --- |
+| Multi-provider chat | ✅ 6 families, quirk registry | ✅ ~48 providers | ✅ model router (very broad) | ✅ via LangChain models | 🟡 OpenAI-native; custom `Model` possible |
+| Canonical/owned stream contract | ✅ `StreamPart` union, sync-return, never-throws | ✅ own delta stream, callback-based errors | 🟡 framework streams | 🟡 graph events | 🟡 runner events |
+| Agent loop | ✅ free function — `tools` on any call | ✅ `ToolLoopAgent` class | ✅ workflow engine (`.then/.branch/.parallel`) | ✅ you build the graph | ✅ runner loop |
+| Sub-agents / delegation | ✅ `agentTool` with live stream forwarding, any depth | ✅ subagents (no live inner stream in docs) | ✅ supervisor pattern | ✅ nodes as agents | ✅ handoffs + agents-as-tools |
+| HITL tool approval | ✅ server + client mode, deny-by-default, **composes with sub-agents** | ✅ 4-state + HMAC secret; docs note it doesn't compose with subagents | ✅ suspend/resume steps | ✅ `interrupt()` + checkpointer | ✅ `needsApproval: true`, resumable run state |
+| Durable execution (crash → resume) | ✅ v1.5 — step-boundary checkpoints on a storage seam, buffered + streaming, no vendor runtime ([durable runtime](/docs/agents/durable-runtime)) | ✅ `WorkflowAgent` (requires Vercel Workflow DevKit runtime) | ✅ storage-backed snapshots, survive restarts | ✅ checkpointers: memory/SQLite/Postgres/Redis/Mongo; `exit/async/sync` durability modes | 🟡 resumable approval state; durability not the focus |
+| Automatic context compaction | ✅ layered, threshold-triggered (`compaction: 'auto'`) | 🟡 manual `pruneMessages` in `prepareStep` | 🟡 observational memory (conversation compression) | ❌ bring your own | ❌ |
+| Token/cost budget stops | ✅ `totalTokensExceed` / `costExceeds` built-in | 🟡 usage tracked, no budget stop documented | 🟡 evals/limits at framework level | ❌ | ❌ |
+| Built-in cost (token→USD) tracking | ✅ pricing table + `onUsage` in core | ❌ pushed to Gateway | 🟡 via observability integrations | ❌ | ❌ |
+| Telemetry | 🟡 tracer seam, spans land v1.6 | ✅ `@ai-sdk/otel`, GenAI semconv | ✅ OTel-compatible + experimental OTel bridge | ✅ LangSmith + ecosystem | ✅ built-in tracing → OpenAI dashboard |
+| Built-in memory / RAG / skills | ✅ in core (mem0-style, BM25+vector hybrid, SKILL.md) | ❌ patterns documented, not shipped | ✅ memory + RAG built in | 🟡 stores API; RAG via ecosystem | 🟡 sessions (history), no RAG |
+| Deterministic replay testing | ✅ golden-replay, injected clock/random/fetch, no real network | 🟡 ambient time/random in some paths | 🟡 evals tooling | 🟡 replay via checkpoints (determinism rules apply) | 🟡 traces, not seam-level determinism |
+| Runtime dependencies | ✅ **0** (~2 MB) | 🟡 `zod` peer, ESM-only (~11–12 MB typical) | ❌ full framework tree (140+ packages in the `@mastra/*` scope) | 🟡 LangChain ecosystem | 🟡 `zod` v4 required |
+| Module format / runtimes | ESM+CJS; Node ≥22, Deno, Bun, Vercel Edge, Cloudflare Workers (lint-enforced) | ESM-only | Node-first server framework | Node-first | ESM; Node ≥22, Deno, Bun |
+| UI layer | React hooks (`useChat`/`useObject`) | React, Vue, Svelte, Angular, Expo, TanStack | Studio + its own APIs | ❌ (pair with a UI lib) | ❌ (voice/realtime agents exist) |
+| License | MIT | Apache-2.0 | Apache-2.0 + source-available `ee/` dirs (enterprise license) | MIT | MIT |
+
+## Measured scores — Deuz vs AI SDK 7 only
+
+We publish weighted scenario scores **only** for the pair we code-verified; scoring Tier-2 tools from docs alone would be false precision. Method: per-scenario weights (**K**ritical=3, **O**ther=2, **D**etail=1), capability = 1 / partial = 0.5 / absent = 0. Full sheet: `docs/benchmark-ai-sdk.md`.
+
+| Scenario | Deuz v1.3 (measured 2026-07-04) | Deuz v1.4 (re-scored) | AI SDK 7 |
+| --- | --- | --- | --- |
+| Chatbot app | 72% | ~74% | 85% |
+| CLI autonomous agent | 58% | ~74% | 78% |
+
+What moved in v1.4: sub-agents, automatic compaction, budget stops and per-step loop hooks — the five heaviest CLI-agent zeros in v1.3 — all shipped. v1.5 closed the biggest remaining one: durable execution (checkpoint/resume + signed approvals, no vendor runtime). The remaining spread is OTel span emission (v1.6) and provider/UI breadth (v1.6+). The row-by-row version of this table is on [vs AI SDK 7](/docs/comparison/ai-sdk-7).
+
+## Profiles — what we verified about each
+
+### Vercel AI SDK 7 — Tier 1, code-level
+
+`ai@7.0.14` (GA 2026-06-25), verified 2026-07-04. Ahead of Deuz today on: durable `WorkflowAgent` (tied to the Vercel Workflow DevKit runtime — `'use workflow'` directives, serializable context), `@ai-sdk/otel`, `@ai-sdk/tui` terminal UI, `HarnessAgent` wrappers, ~48 providers, 5+ UI frameworks, speech/transcription. Behind Deuz on: zero-dep/dual-format packaging, seam-level determinism, built-in cost tracking, automatic compaction, budget stops, approval-composing sub-agents. Full breakdown: [vs AI SDK 7](/docs/comparison/ai-sdk-7).
+
+### Mastra — Tier 2, docs-level
+
+`@mastra/core@1.46.0` (2026-06-24); 1.0 stable January 2026; Apache-2.0 with source-available `ee/` directories under a commercial enterprise license. A *framework*, not an SDK: graph-based workflow engine with `suspend()`/`resume()` and storage-backed snapshots that survive restarts and deployments; observational memory (compresses old conversations); built-in RAG; a local debugging Studio; a model router advertising 4,000+ models; OTel-compatible observability with an experimental OTel bridge (March 2026).
+
+Trade-off versus Deuz: you adopt Mastra's structure, storage and dependency tree; Deuz gives you primitives you compose yourself with zero runtime dependencies. One relevant 2026 datapoint for that trade-off: in June 2026 the `@mastra/*` npm scope (140+ packages) was briefly republished with a malicious dependency after an organization-credential compromise — cleaned up quickly, but it illustrates the supply-chain surface that a large dependency tree carries. Deuz's core ships zero runtime dependencies precisely to keep that surface minimal.
+
+### LangGraph.js — Tier 2, docs-level
+
+`@langchain/langgraph` (MIT; used in production by Replit, Uber, LinkedIn, GitLab per its README). The strongest durable-execution story in the TypeScript ecosystem today: a checkpointer persists graph state at every super-step, with pluggable backends (in-memory, SQLite, Postgres, Redis, MongoDB) and three durability modes (`exit` / `async` / `sync`); `interrupt()` gives human-in-the-loop that survives restarts; `getStateHistory` enables time-travel debugging.
+
+Worth noting: LangGraph documents the same honest resume boundary Deuz's v1.5 durable runtime ships — on resume, the interrupted unit re-runs from its start (a node there, a step here), so side effects must be idempotent. Trade-off versus Deuz: LangGraph is a runtime with a vocabulary to learn (nodes, edges, reducers, threads) and an ecosystem-sized dependency tree; Deuz keeps the loop a free function and (since v1.5) attaches checkpoints to it via one storage seam.
+
+### OpenAI Agents SDK (JS) — Tier 2, docs-level
+
+`@openai/agents@0.12.1` (MIT; requires `zod` v4; Node ≥22, Deno, Bun). Small, well-designed primitive set: agents, handoffs / agents-as-tools, input+output guardrails, sessions (automatic history), MCP tools, built-in tracing to the OpenAI dashboard, human-in-the-loop via `needsApproval: true` with resumable run state, beta sandbox agents (filesystem workspace), and realtime voice agents. Provider-agnostic in principle (custom `Model` interface), OpenAI-native in practice — tracing and evals live in OpenAI's platform.
+
+Trade-off versus Deuz: the Agents SDK optimizes for minimal code on OpenAI's stack; Deuz optimizes for provider-neutrality, wire ownership and deterministic testing. If your bet is "OpenAI only, forever", their SDK rewards it; if you want to move when the price-performance frontier moves, a canonical multi-provider stream is the safer foundation.
+
+## Trajectory (2026 rubric, planned)
+
+Our 2026 rubric adds rows the legacy sheet lacks (structural security, verified generation, evolving memory) — that is why today's numbers read lower than the legacy table above. Targets are planned, not shipped; kept here so progress is checkable against `PLAN.md`:
+
+| Scenario | Today (v1.4, 1.5 in flight) | After v1.7 | After v1.9 | Target v2.0.0 | AI SDK 7 projected |
+| --- | --- | --- | --- | --- | --- |
+| Chatbot | ~62% | ~75% | ~84% | ~93% | ~72% |
+| CLI autonomous agent | ~64–80% | ~84% | ~89% | ~92% | ~76% |
+| Long-horizon autonomous | ~48–55% | ~62% | ~78% | ~86% | ~64% |
+
+## Sources & reproducing
+
+- **Deuz side:** this repository — `npm run check` runs the full suite with golden-replay fixtures, no API keys needed.
+- **AI SDK 7:** `docs/benchmark-ai-sdk.md` (full scoring sheet with per-row evidence) and `docs/rakip-analizi-2026.md` (landscape analysis) — both in Turkish, both in the repo.
+- **Mastra:** github.com/mastra-ai/mastra README + docs (workflows/suspend-and-resume, memory), release `@mastra/core@1.46.0`; supply-chain incident: StepSecurity & Orca Security advisories, June 2026. Accessed 2026-07-07.
+- **LangGraph.js:** docs.langchain.com (checkpointers, durable execution, graph API) + github.com/langchain-ai/langgraphjs README. Accessed 2026-07-07.
+- **OpenAI Agents SDK:** openai.github.io/openai-agents-js + npm `@openai/agents`. Accessed 2026-07-07.
+- Found a stale or wrong cell? Open an issue — this page only has value while it is honest. Tier-2 tools move fast; we re-verify when we cite them.
+
+## See also
+
+- [vs AI SDK 7](/docs/comparison/ai-sdk-7) — the deep, row-by-row Tier-1 comparison.
+- [Migrating from Vercel AI SDK](/docs/migration/from-vercel-ai-sdk) — API-level mapping.
+- [Changelog](/docs/changelog) — what shipped in each release.

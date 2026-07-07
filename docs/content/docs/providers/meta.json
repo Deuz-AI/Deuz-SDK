@@ -1,4 +1,6 @@
 {
   "title": "Providers",
+  "icon": "Plug",
+  "defaultOpen": true,
   "pages": ["anthropic", "openai", "xai", "google", "vertex", "voyage", "yunwu"]
 }

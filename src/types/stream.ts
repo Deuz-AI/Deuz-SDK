@@ -92,6 +92,12 @@ export interface ToolApprovalRequestPart {
   toolCallId: string;
   toolName: string;
   input: unknown;
+  /**
+   * Present when the pending call lives inside a suspended durable sub-agent
+   * (1.5 additive): the sub-agent path it belongs to. Answer with the same
+   * `approvalId` — the resume leg routes the verdict back down the tree.
+   */
+  agentPath?: string[];
 }
 
 /**
