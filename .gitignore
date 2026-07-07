@@ -22,3 +22,6 @@ scripts/
 
 # Local planning/spec artifacts — never publish
 superpowers/
+.superpowers/
+.tmp/
+.cursor/
