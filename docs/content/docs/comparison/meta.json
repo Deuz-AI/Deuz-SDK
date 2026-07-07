@@ -1,4 +1,6 @@
 {
   "title": "Comparison",
-  "pages": ["ai-sdk-7"]
+  "icon": "Scale",
+  "defaultOpen": true,
+  "pages": ["ai-sdk-7", "benchmarks"]
 }

@@ -1,4 +1,6 @@
 {
   "title": "Migration",
+  "icon": "ArrowRightLeft",
+  "defaultOpen": true,
   "pages": ["from-vercel-ai-sdk"]
 }

@@ -1,4 +1,6 @@
 {
   "title": "Advanced",
+  "icon": "Wrench",
+  "defaultOpen": true,
   "pages": ["edge", "resilience", "model-registry"]
 }

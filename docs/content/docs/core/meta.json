@@ -1,5 +1,6 @@
 {
   "title": "Core",
+  "icon": "Zap",
   "defaultOpen": true,
   "pages": [
     "stream-chat",

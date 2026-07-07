@@ -1,5 +1,7 @@
 {
   "title": "Modules",
+  "icon": "Blocks",
+  "defaultOpen": true,
   "pages": [
     "memory",
     "rag",
