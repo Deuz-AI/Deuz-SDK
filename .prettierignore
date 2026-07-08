@@ -4,5 +4,6 @@ node_modules/
 *.md
 pnpm-lock.yaml
 package-lock.json
+bench/results.json
 docs/
 skills/

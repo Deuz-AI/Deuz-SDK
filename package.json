@@ -4,6 +4,12 @@
   "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini).",
   "license": "MIT",
   "author": "Umutcan Edizaslan (U-C4N)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Deuz-AI/Deuz-SDK.git"
+  },
+  "homepage": "https://github.com/Deuz-AI/Deuz-SDK#readme",
+  "bugs": "https://github.com/Deuz-AI/Deuz-SDK/issues",
   "type": "module",
   "sideEffects": false,
   "engines": {
