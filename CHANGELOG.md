@@ -1,5 +1,16 @@
 # @deuz-sdk/core
 
+## 1.5.1
+
+### Patch Changes
+
+- **Foundation release gates:** added Linux/Windows + Node 22/24 CI, tag-to-version verification, npm provenance publishing, documentation builds, and a single `release:verify` command shared by local and CI releases.
+- **Package and API contracts:** every export target is checked inside the packed artifact and loaded through both ESM and CommonJS; publint/Are the Types Wrong remain mandatory; 26 subpaths and 141 root declarations are protected from accidental removal.
+- **Runtime and size regressions:** representative root, `/edge`, and provider consumers must bundle for the browser; consumer bundles have checked raw/gzip budgets with narrow headroom.
+- **Stream and provider conformance:** SSE parsing now covers LF, CRLF, bare CR, BOMs, arbitrary UTF-8 chunk boundaries, EOF tails, multiline data, and early cancellation. Anthropic, OpenAI Chat Completions, OpenAI Responses, and Google native share request/stream/usage/error contract tests.
+- **Standard errors:** OpenAI-compatible errors retain the actual provider id; exhausted transport failures normalize to `NetworkError`; `isDeuzError` and secret-safe `toJSON()` make cross-realm detection and logging stable.
+- **Documentation structure:** compatibility, stream protocol, provider conformance, and release guarantees now live in a dedicated Reference section.
+
 ## 1.5.0
 
 ### Minor Changes

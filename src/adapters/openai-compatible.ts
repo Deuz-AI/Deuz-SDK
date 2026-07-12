@@ -1,4 +1,4 @@
-import type { Adapter, AdapterRequest, BuildContext, ParseContext } from './types';
+import type { Adapter, AdapterRequest, BuildContext, ErrorContext, ParseContext } from './types';
 import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
 import type { Part } from '../types/message';
@@ -318,13 +318,19 @@ async function* parseStream(
 
 // --- error mapping ---
 
-function mapError(status: number, body: unknown, headers: Headers): DeuzError {
+function mapError(status: number, body: unknown, headers: Headers, ctx?: ErrorContext): DeuzError {
   const envelope = (body ?? {}) as { error?: { message?: string; type?: string; code?: string } };
   const err = envelope.error;
   const message = err?.message ?? `Provider request failed (HTTP ${status}).`;
   const requestId = headers.get('x-request-id') ?? undefined;
   const retryAfterMs = parseRetryAfterMs(headers.get('retry-after'));
-  const base = { message, requestId, upstreamType: err?.type ?? err?.code, retryAfterMs };
+  const base = {
+    message,
+    provider: ctx?.provider ?? 'openai',
+    requestId,
+    upstreamType: err?.type ?? err?.code,
+    retryAfterMs,
+  };
 
   if (err?.code === 'context_length_exceeded' || err?.type === 'context_length_exceeded') {
     return new ContextOverflowError({ ...base, statusCode: 400 });

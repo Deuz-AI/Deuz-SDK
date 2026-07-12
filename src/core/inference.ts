@@ -3,10 +3,12 @@ import type { StreamChatResult } from '../types/methods';
 import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
 import type { ModelSurface } from '../types/model';
+import type { Span } from '../types/deps';
 import type { Adapter, ObjectRequest, WireToolRequest } from '../adapters/types';
-import { APICallError, TimeoutError } from '../errors';
+import { APICallError, NetworkError, TimeoutError } from '../errors';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { resolveCall } from '../internal/resolve-call';
+import { openSpan, invokeAttributes, setUsageAttributes } from '../internal/trace';
 import { readClientContext } from '../internal/client-context';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
 import { normalizeMessages } from './normalize';
@@ -67,6 +69,14 @@ export interface InternalRunOptions {
   object?: ObjectRequest;
   /** Tool request, set by the agentic loop. */
   tools?: WireToolRequest;
+  /**
+   * Tracing (1.6): the enclosing loop's `step` span. When set, the loop owns
+   * the invoke/step hierarchy — the pump emits NO `invoke` span of its own and
+   * reports pre-first-byte retries onto this span as `deuz.retry.count`.
+   */
+  stepSpan?: Span;
+  /** Tracing (1.6): true for loop-internal side calls (compaction summarize) — no span at all. */
+  skipInvokeSpan?: boolean;
 }
 
 export function runStream(
@@ -91,6 +101,20 @@ export function runStream(
 
   async function pump(): Promise<void> {
     const deps = resolveDependencies(options.deps);
+    // Tracing (1.6): a bare public call (streamChat/generateText without tools,
+    // generateObject/streamObject) gets its single-shot `invoke` span HERE —
+    // lazily, when the pump starts (G2). Agentic loops pass `stepSpan` (they
+    // own the invoke/step hierarchy) and compaction side-calls pass
+    // `skipInvokeSpan`, so a model call is never double-wrapped. Attributes
+    // carry only ids/counts/enums — message content, headers, URLs and key
+    // material NEVER enter a span (semconv content capture off by design).
+    const invoke =
+      internal.stepSpan || internal.skipInvokeSpan
+        ? undefined
+        : openSpan(deps.tracer, 'invoke', invokeAttributes(options.model, options.agentPath));
+    // Where `deuz.retry.count` lands: the loop's step span, else our invoke.
+    const retryTarget: Span | undefined = internal.stepSpan ?? invoke?.span;
+    let retries = 0;
     let ttftMs: number | undefined;
     let finalUsage: Usage | undefined;
     let finalFinish: FinishReason | undefined;
@@ -125,6 +149,7 @@ export function runStream(
       let res!: Response;
       let timeout!: TimeoutHandle;
       for (let attempt = 0; ; attempt++) {
+        retries = attempt; // retries performed so far (attempt 0 = first try)
         timeout = createTimeout(deps.clock, DEFAULT_TIMEOUTS);
         const signal = combineSignals([options.signal, timeout.signal]);
         try {
@@ -136,11 +161,17 @@ export function runStream(
             await wait(deps.clock, backoffMs(attempt, undefined, random, retry), options.signal);
             continue;
           }
-          throw err;
+          throw new NetworkError({
+            message: `Network request to provider '${call.provider}' failed.`,
+            provider: call.provider,
+            upstreamType: err instanceof Error ? err.name : typeof err,
+          });
         }
         if (res.ok) break; // keep `timeout` armed for the streaming phase
         timeout.clear();
-        const mapped = adapter.mapError(res.status, await readBody(res), res.headers);
+        const mapped = adapter.mapError(res.status, await readBody(res), res.headers, {
+          provider: call.provider,
+        });
         if (shouldRetry(mapped, attempt, retry.maxRetries)) {
           const retryAfter = mapped instanceof APICallError ? mapped.retryAfterMs : undefined;
           await wait(deps.clock, backoffMs(attempt, retryAfter, random, retry), options.signal);
@@ -148,6 +179,7 @@ export function runStream(
         }
         throw mapped;
       }
+      if (retries > 0) retryTarget?.setAttribute('deuz.retry.count', retries);
 
       if (!res.body) {
         timeout.clear();
@@ -164,6 +196,7 @@ export function runStream(
         for await (const part of adapter.parseStream(res.body, {
           caps,
           generateId: deps.generateId,
+          provider: call.provider,
         })) {
           if (!firstContent && (part.type === 'text-delta' || part.type === 'reasoning-delta')) {
             firstContent = true;
@@ -174,6 +207,7 @@ export function runStream(
             broadcaster.push(part);
             usageDeferred.reject(part.error);
             finishDeferred.reject(part.error);
+            invoke?.fail(part.error); // mid-stream error is final — record + end
             broadcaster.close();
             return;
           }
@@ -193,8 +227,14 @@ export function runStream(
       finishDeferred.resolve(finishReason);
       fireUsage(options, deps, usage, { model: options.model.modelId, reason: 'finished', ttftMs });
       fireFinish(options, deps, { model: options.model.modelId, finishReason });
+      if (invoke) {
+        setUsageAttributes(invoke, usage, finishReason);
+        invoke.setAttribute('deuz.step.count', 1);
+        invoke.end();
+      }
       broadcaster.close();
     } catch (err) {
+      if (retries > 0) retryTarget?.setAttribute('deuz.retry.count', retries);
       if (isUserAbort(err, options.signal)) {
         const usage = withTotal(finalUsage ?? EMPTY_USAGE);
         usageDeferred.resolve(usage);
@@ -204,12 +244,19 @@ export function runStream(
           reason: 'aborted',
           ttftMs,
         });
+        if (invoke) {
+          // A user abort is a resolution, not a failure — no exception recorded.
+          setUsageAttributes(invoke, usage, 'aborted');
+          invoke.setAttribute('deuz.step.count', 1);
+          invoke.end();
+        }
         broadcaster.close();
         return;
       }
       broadcaster.push({ type: 'error', error: err });
       usageDeferred.reject(err);
       finishDeferred.reject(err);
+      invoke?.fail(err);
       broadcaster.close();
     }
   }

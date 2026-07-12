@@ -14,15 +14,19 @@ import { getEmbeddingAdapter } from '../adapters/embeddings';
 import { getEmbeddingCapabilities, type EmbeddingCapabilities } from '../core/registry';
 import { embeddingUsage, fireUsage } from '../core/metering';
 import { resolveDependencies } from '../internal/resolve-deps';
-import { readClientContext, type ClientContext } from '../internal/client-context';
+import {
+  attachClientContext,
+  readClientContext,
+  type ClientContext,
+} from '../internal/client-context';
 import { readConfig } from '../internal/config-symbol';
 import { mapWithConcurrency } from '../internal/p-limit';
 import { parseRetryAfterMs } from '../internal/http';
 import {
   AbortError,
-  APICallError,
   AuthenticationError,
   InvalidRequestError,
+  NetworkError,
   UnsupportedCapabilityError,
 } from '../errors';
 
@@ -121,12 +125,10 @@ async function fetchBatch(
     } catch (err) {
       if (signal?.aborted) throw new AbortError(undefined, { cause: err });
       if (attempt >= maxRetries) {
-        throw new APICallError({
-          message: `Embedding network error: ${err instanceof Error ? err.message : String(err)}`,
+        throw new NetworkError({
+          message: `Embedding network request to provider '${call.provider}' failed.`,
           provider: call.provider,
-          statusCode: 0,
-          isRetryable: true,
-          cause: err,
+          upstreamType: err instanceof Error ? err.name : typeof err,
         });
       }
       await delay(attempt, undefined, deps);
@@ -229,6 +231,12 @@ export const embedMany: EmbedMany = async (options: EmbedManyOptions): Promise<E
 
 export const embed: Embed = async (options: EmbedOptions): Promise<EmbedResult> => {
   const { value, ...rest } = options;
-  const { embeddings, usage } = await embedMany({ ...rest, values: [value] });
+  const manyOptions: EmbedManyOptions = { ...rest, values: [value] };
+  // Spread copies only enumerable props — the client-context Symbol is
+  // non-enumerable, so re-attach it or `client.embed` loses its client-level
+  // apiKeys/baseUrls (G1) on the way into embedMany.
+  const clientContext = readClientContext(options);
+  if (clientContext) attachClientContext(manyOptions, clientContext);
+  const { embeddings, usage } = await embedMany(manyOptions);
   return { embedding: embeddings[0] ?? [], usage };
 };

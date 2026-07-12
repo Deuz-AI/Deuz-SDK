@@ -4,6 +4,15 @@
  * `isRetryable`. Errors deliberately DO NOT carry raw request headers/bodies and
  * never put a raw `Request`/`Headers` in `cause` — that would leak the API key.
  */
+const DEUZ_ERROR_BRAND = Symbol.for('@deuz-sdk/core/DeuzError');
+
+export interface DeuzErrorJSON {
+  name: string;
+  code: string;
+  message: string;
+  details?: Record<string, string | number | boolean>;
+}
+
 export abstract class DeuzError extends Error {
   abstract readonly code: string;
 
@@ -12,7 +21,54 @@ export abstract class DeuzError extends Error {
     this.name = new.target.name;
     // Restore prototype chain for instanceof across transpile targets.
     Object.setPrototypeOf(this, new.target.prototype);
+    Object.defineProperty(this, DEUZ_ERROR_BRAND, { value: true });
   }
+
+  /** Secret-safe, stable shape for logs and JSON transports. `cause` is intentionally excluded. */
+  toJSON(): DeuzErrorJSON {
+    const details: Record<string, string | number | boolean> = {};
+    const safeFields = [
+      'statusCode',
+      'isRetryable',
+      'retryAfterMs',
+      'provider',
+      'requestId',
+      'upstreamType',
+      'layer',
+      'toolName',
+      'toolCallId',
+      'modelId',
+      'capability',
+      'runId',
+      'mime',
+    ] as const;
+    const self = this as unknown as Record<string, unknown>;
+    for (const field of safeFields) {
+      const value = self[field];
+      if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+        details[field] = value;
+      }
+    }
+    return {
+      name: this.name,
+      code: this.code,
+      message: this.message,
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+    };
+  }
+}
+
+/** Works across duplicate package copies/realms where `instanceof` is not reliable. */
+export function isDeuzError(value: unknown): value is DeuzError {
+  if (value instanceof DeuzError) return true;
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Record<PropertyKey, unknown>;
+  return (
+    candidate[DEUZ_ERROR_BRAND] === true &&
+    typeof candidate.name === 'string' &&
+    typeof candidate.message === 'string' &&
+    typeof candidate.code === 'string'
+  );
 }
 
 export class NotImplementedError extends DeuzError {
@@ -61,6 +117,14 @@ export class APICallError extends DeuzError {
     this.provider = options.provider;
     this.requestId = options.requestId;
     this.upstreamType = options.upstreamType;
+  }
+}
+
+/** A transport/DNS/TLS failure before an HTTP response exists. */
+export class NetworkError extends APICallError {
+  override readonly code = 'network_error';
+  constructor(options: Omit<APICallErrorOptions, 'statusCode' | 'isRetryable'>) {
+    super({ ...options, statusCode: 0, isRetryable: true });
   }
 }
 

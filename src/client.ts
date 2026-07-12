@@ -1,4 +1,5 @@
-import { streamChat, generateText, generateObject } from './generate';
+import { streamChat, generateText, generateObject, streamObject } from './generate';
+import { embed, embedMany } from './inference/embed';
 import { attachClientContext } from './internal/client-context';
 import { resolveDependencies, createInMemoryBreakerStore } from './internal/resolve-deps';
 import type { ClientConfig } from './types/config';
@@ -8,6 +9,9 @@ import type {
   GenerateText,
   GenerateObject,
   GenerateObjectOptions,
+  StreamObject,
+  Embed,
+  EmbedMany,
 } from './types/methods';
 
 export { resolveDependencies };
@@ -22,6 +26,11 @@ export interface DeuzClient {
   streamChat: StreamChat;
   generateText: GenerateText;
   generateObject: GenerateObject;
+  // --- 1.6 additive: full free-function parity. ---
+  /** Same synchronous-return contract (G2) as the free `streamObject`. */
+  streamObject: StreamObject;
+  embed: Embed;
+  embedMany: EmbedMany;
 }
 
 export function createClient(config: ClientConfig = {}): DeuzClient {
@@ -48,5 +57,9 @@ export function createClient(config: ClientConfig = {}): DeuzClient {
     generateText: (options) => generateText(withShared(options)),
     generateObject: <T = unknown>(options: GenerateObjectOptions<T>) =>
       generateObject(withShared(options)),
+    streamObject: <T = unknown>(options: GenerateObjectOptions<T>) =>
+      streamObject(withShared(options)),
+    embed: (options) => embed(withShared(options)),
+    embedMany: (options) => embedMany(withShared(options)),
   };
 }

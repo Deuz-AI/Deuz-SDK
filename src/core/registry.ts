@@ -220,6 +220,40 @@ const REGISTRY: Record<string, Row> = {
     usagePerChunk: true,
     toolIndexAllZero: true,
   }),
+
+  // --- OpenAI-compatible hosts (providers-compat.ts) — 2026 flagships only.
+  // structuredOutput stays OFF (json_schema support varies across these hosts;
+  // generateObject falls back to the tool strategy, which they all speak).
+  // Unknown slugs keep falling back to conservative (provider, surface) defaults. ---
+  'llama-4-maverick': row('groq', 'chat_completions', {
+    vision: true, // natively multimodal on Groq
+    structuredOutput: false,
+    contextWindow: 131_072,
+  }),
+  'deepseek-v3.2': row('deepseek', 'chat_completions', {
+    structuredOutput: false,
+  }),
+  'mistral-large-latest': row('mistral', 'chat_completions', {
+    vision: true, // Mistral Large 3 is multimodal-by-design
+    structuredOutput: false,
+    contextWindow: 256_000,
+  }),
+  'kimi-k2': row('moonshot', 'chat_completions', {
+    structuredOutput: false,
+    contextWindow: 131_072,
+  }),
+  'qwen3-max': row('qwen', 'chat_completions', {
+    structuredOutput: false,
+    contextWindow: 262_144,
+  }),
+  'glm-4.6': row('glm', 'chat_completions', {
+    structuredOutput: false,
+    contextWindow: 200_000,
+  }),
+  'minimax-m2': row('minimax', 'chat_completions', {
+    structuredOutput: false,
+    contextWindow: 200_000,
+  }),
 };
 
 // --- Gemini NATIVE (generateContent) rows — surface:'native', keyed separately

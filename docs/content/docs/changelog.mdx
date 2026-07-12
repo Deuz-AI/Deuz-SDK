@@ -6,6 +6,14 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## 1.5.1
+
+**Foundation hardening.** CI now covers Node 22/24 and Windows/Linux, validates documentation, and re-runs the full release gate before a tag-driven provenance publish. Packed exports are loaded through ESM and CommonJS, browser/edge consumer bundles are compiled, public declarations/subpaths are locked, and raw/gzip bundle budgets catch regressions.
+
+**Protocol and provider contracts.** The SSE parser covers all legal line endings, BOMs, arbitrary UTF-8 chunk boundaries, multiline data, EOF tails, and early cancellation. Anthropic, both OpenAI wires, and Google native run through one conformance suite for request, text, usage, finish, and typed-error semantics.
+
+**Standard errors.** OpenAI-compatible errors retain their real provider id; exhausted transport failures become `NetworkError`; `isDeuzError` works across package copies/realms; `DeuzError.toJSON()` emits a stable, secret-safe diagnostic shape.
+
 ## 1.5.0
 
 **Durable sessions — `session` + `SessionStore` + `AgentCheckpoint`.** Pass `session: { store, runId? }` on any agentic call and both loops checkpoint at every step boundary into a two-method storage seam — any backend, no vendor runtime. Checkpoints carry the full immutable history, cumulative cross-leg usage, and a `running`/`suspended`/`completed` status; the result carries `runId` (synchronously on streaming). A throwing store logs and never kills the run. `serializeCheckpoint`/`deserializeCheckpoint` round-trip binary parts safely for persistent stores. New subpath `@deuz-sdk/core/durable`, everything re-exported from `/edge`. See [Durable runtime](/docs/agents/durable-runtime).

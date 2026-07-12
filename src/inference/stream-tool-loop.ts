@@ -31,6 +31,7 @@ import {
   saveCheckpoint,
   durableUsage,
   toApprovalRequests,
+  preserveClientContext,
   SubAgentSuspension,
   type DurableRunner,
   type ExecuteExtras,
@@ -88,6 +89,9 @@ export function runStreamToolLoop(
 
   async function pump(): Promise<void> {
     const tools = options.tools ?? {};
+    // Loop start timestamp for `durationExceeds` — pump start, when work
+    // actually begins (the shell returns synchronously and lazily, G2).
+    const startedAt = deps.clock.now();
     let messages: Message[] = [...options.messages];
     let resumeFrom = internal?.resumeFrom;
     if (internal?.resumeLoad) {
@@ -231,7 +235,9 @@ export function runStreamToolLoop(
         );
         messages = prepared.messages;
         const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
-        const inner = runStream({ ...prepared.options, messages }, { tools: prepared.wire });
+        const inner = runStream(preserveClientContext(options, { ...prepared.options, messages }), {
+          tools: prepared.wire,
+        });
 
         let text = '';
         let reasoningText = '';
@@ -463,7 +469,11 @@ export function runStreamToolLoop(
           wantCost && deps.priceProvider
             ? ((await deps.priceProvider.priceUsage(options.model.modelId, runUsage)) ?? undefined)
             : undefined;
-        const stop = await shouldStop(stopConditions, steps, { usage: runUsage, costUSD });
+        const stop = await shouldStop(stopConditions, steps, {
+          usage: runUsage,
+          costUSD,
+          elapsedMs: deps.clock.now() - startedAt,
+        });
         if (stop.stop) {
           stoppedBy = stop.stoppedBy;
           if (durable) {

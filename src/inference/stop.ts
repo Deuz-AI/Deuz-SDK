@@ -42,3 +42,11 @@ export const costExceeds = (usd: number): StopCondition =>
   named('costExceeds', ({ costUSD }) => costUSD !== undefined && costUSD >= usd, {
     requiresCost: true,
   });
+
+/**
+ * Stop once the loop has been running for at least `ms` milliseconds. Time
+ * comes from the injected `deps.clock` (deterministic in tests). Evaluated at
+ * step boundaries only — an in-flight model step always finishes first.
+ */
+export const durationExceeds = (ms: number): StopCondition =>
+  named('durationExceeds', ({ elapsedMs }) => (elapsedMs ?? 0) >= ms);

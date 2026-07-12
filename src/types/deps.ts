@@ -51,8 +51,17 @@ export interface Span {
   end(): void;
 }
 
+/**
+ * Options for {@link Tracer.startSpan} (1.6 additive). `parent` carries the
+ * enclosing span so bridges (e.g. the OTel bridge) can build a REAL
+ * parent-child trace tree instead of a flat list.
+ */
+export interface SpanOptions {
+  parent?: Span;
+}
+
 export interface Tracer {
-  startSpan(name: string, attributes?: Record<string, unknown>): Span;
+  startSpan(name: string, attributes?: Record<string, unknown>, options?: SpanOptions): Span;
 }
 
 export interface BreakerState {

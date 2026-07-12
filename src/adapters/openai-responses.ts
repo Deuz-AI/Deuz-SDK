@@ -287,7 +287,10 @@ async function* parseStream(
         break;
       case 'error':
       case 'response.failed':
-        yield { type: 'error', error: mapError(200, { error: data.error }, new Headers()) };
+        yield {
+          type: 'error',
+          error: mapError(200, { error: data.error }, new Headers(), { provider: ctx.provider }),
+        };
         return;
       default:
         break;
@@ -303,7 +306,7 @@ async function* parseStream(
 }
 
 // Error envelope is identical to Chat Completions — reuse its mapping.
-const mapError: Adapter['mapError'] = (status, body, headers): DeuzError =>
-  openaiCompatibleAdapter.mapError(status, body, headers);
+const mapError: Adapter['mapError'] = (status, body, headers, ctx): DeuzError =>
+  openaiCompatibleAdapter.mapError(status, body, headers, ctx);
 
 export const openaiResponsesAdapter: Adapter = { buildRequest, parseStream, mapError };

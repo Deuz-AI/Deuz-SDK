@@ -3,10 +3,10 @@ title: Error Handling
 description: The typed DeuzError taxonomy, the never-throw streaming contract, retry semantics, and the secret-redaction guarantee.
 ---
 
-Every failure in `@deuz-sdk/core` is a typed `DeuzError` — never a raw `Error`, a `Response`, or a leaked provider payload. Each wire adapter normalizes its provider's error envelope into the same set of classes, so your retry, routing, and fallback logic can branch on `err.code` or `instanceof` regardless of which provider produced the failure. All error classes are exported from the package root.
+Provider, transport, and orchestration failures in `@deuz-sdk/core` use the typed `DeuzError` contract rather than exposing a raw `Response` or provider payload. Each wire adapter normalizes its provider's error envelope into the same set of classes, so retry, routing, and fallback logic can branch on `err.code` regardless of which provider produced the failure. All error classes are exported from the package root.
 
 ```ts
-import { DeuzError, RateLimitError, AuthenticationError } from '@deuz-sdk/core';
+import { DeuzError, isDeuzError, RateLimitError, AuthenticationError } from '@deuz-sdk/core';
 ```
 
 ## The taxonomy
@@ -20,6 +20,7 @@ import { DeuzError, RateLimitError, AuthenticationError } from '@deuz-sdk/core';
 | Class | `code` | Default status | `isRetryable` | Notes |
 | --- | --- | --- | --- | --- |
 | `APICallError` | `api_call_error` | (mapped) | `statusCode >= 500` | Base class; used directly for generic 5xx |
+| `NetworkError` | `network_error` | 0 | `true` | DNS/TLS/transport failure before an HTTP response |
 | `RateLimitError` | `rate_limit` | 429 | `true` | Honors `Retry-After` |
 | `OverloadedError` | `overloaded` | 529 | `true` | Provider overloaded; retried pre-first-byte |
 | `AuthenticationError` | `authentication` | 401 | `false` | Also 403 (permission) |
@@ -31,7 +32,7 @@ Every `APICallError` exposes the same fields:
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `statusCode` | `number` | Upstream HTTP status |
+| `statusCode` | `number` | Upstream HTTP status (`0` for `NetworkError`) |
 | `isRetryable` | `boolean` | Whether a retry could plausibly succeed |
 | `retryAfterMs` | `number \| undefined` | Parsed `Retry-After`, in milliseconds |
 | `provider` | `string \| undefined` | Provider id (`anthropic`, `openai`, `xai`, `google`) |
@@ -80,7 +81,7 @@ try {
   }
 } catch (err) {
   // textStream re-throws the error part as a typed DeuzError.
-  if (err instanceof DeuzError) console.error(err.code, err.message);
+  if (isDeuzError(err)) console.error(err.code, err.message);
 }
 ```
 
@@ -201,7 +202,7 @@ The pump retries **only before the first byte** of the response stream. Once str
 | Budget | `maxRetries`, default `2` (per-call override on `CommonCallOptions`) |
 | Backoff | Exponential with full jitter (`base 500ms`, cap `30s`) |
 | `Retry-After` | Honored when the provider sends it (capped at `30s`); takes precedence over computed backoff |
-| Which errors | Those whose `isRetryable` is `true` — `RateLimitError` (429), `OverloadedError` (529), and `APICallError` with status `>= 500` |
+| Which errors | Those whose `isRetryable` is `true` — `NetworkError`, `RateLimitError` (429), `OverloadedError` (529), and `APICallError` with status `>= 500` |
 | Determinism | Jitter is derived from `deps.generateId()`, so it is reproducible in tests |
 
 ```ts
@@ -224,6 +225,7 @@ A `TimeoutError` is always a genuine failure and is **never** retried — whethe
 API keys must never appear in any log, error message, tracer attribute, or `cause` chain. This is a regression-tested invariant.
 
 - `DeuzError` deliberately carries **no raw request headers or body**, and never places a raw `Request`/`Headers` in `cause`.
+- `error.toJSON()` returns only `name`, `code`, `message`, and an allowlist of scalar diagnostic fields; `cause` and model output are excluded. `isDeuzError(error)` remains reliable across duplicate package copies/realms where `instanceof` can fail.
 - Anything that flows into a logger, error, or span first passes through the redaction helpers in `internal/redact.ts`. Secret-looking header values (`authorization`, `x-api-key`, `x-goog-api-key`, `api-key`) and token shapes (`sk-`, `sk-ant-`, `AIza`, `Bearer …`) are masked to their **last four characters** — `****AB12`.
 
 You generally never call the redaction helpers directly; they run inside the SDK. The takeaway: it is safe to log a `DeuzError` (including its `provider`, `statusCode`, `requestId`, and `upstreamType`) without leaking credentials.

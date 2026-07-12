@@ -54,6 +54,13 @@ export interface AdapterRequest {
 export interface ParseContext {
   caps: ModelCapabilities;
   generateId: () => string;
+  /** Actual provider id from the model descriptor (important for compat wires). */
+  provider: string;
+}
+
+export interface ErrorContext {
+  /** Actual provider id from the model descriptor (important for compat wires). */
+  provider: string;
 }
 
 /**
@@ -68,5 +75,5 @@ export interface Adapter {
   /** Raw SSE body → canonical StreamPart iterable (the only stream consumers see). */
   parseStream(body: ReadableStream<Uint8Array>, ctx: ParseContext): AsyncIterable<StreamPart>;
   /** Map a non-2xx response (or in-stream error envelope) to a typed DeuzError. */
-  mapError(status: number, body: unknown, headers: Headers): DeuzError;
+  mapError(status: number, body: unknown, headers: Headers, ctx?: ErrorContext): DeuzError;
 }

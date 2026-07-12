@@ -1,0 +1,40 @@
+---
+title: Runtime & Package Compatibility
+description: Supported runtimes, package formats, browser/edge guarantees, and the automated compatibility gates.
+---
+
+`@deuz-sdk/core` supports Node.js 22 and newer and ships matching ESM, CommonJS, and declaration files for every public subpath. The core and `/edge` entries are also browser-bundleable: they depend on Web APIs (`fetch`, Web Streams, `TextEncoder`, `TextDecoder`, and WebCrypto), not Node built-ins.
+
+| Consumer | Release guarantee |
+| --- | --- |
+| Node.js 22 / 24 | Unit and integration suite runs in CI |
+| ESM (`import`) | Every exported JavaScript target is imported from the built package |
+| CommonJS (`require`) | Every exported CJS target is required from the built package |
+| TypeScript bundler / Node resolution | Checked by publint and Are the Types Wrong |
+| Browser / edge bundlers | Root, `/edge`, and provider consumers bundle with esbuild `platform: 'browser'` |
+| Windows / Linux | Runtime suite runs on both operating systems |
+
+## Custom provider base URLs
+
+The SDK never guesses a `/v1` prefix for a custom `baseURL`. An adapter appends only its wire route:
+
+```ts
+const gateway = createOpenAIResponses({
+  apiKey: process.env.GATEWAY_KEY!,
+  baseURL: 'https://gateway.example',
+});
+
+// POST https://gateway.example/responses
+await generateText({
+  model: gateway('gpt-5.5'),
+  messages: [{ role: 'user', content: 'hello' }],
+});
+```
+
+If your gateway exposes `https://gateway.example/v1/responses`, pass `baseURL: 'https://gateway.example/v1'`. Trailing slashes are normalized and the prefix is preserved exactly once.
+
+## Local gates
+
+Run `npm run verify:runtime` after `npm run build` to exercise browser/edge consumer bundles. `npm run verify:package` validates the packed file list, all export targets, both module formats, publint, and declaration resolution.
+
+See [Edge & Runtimes](/docs/advanced/edge) for deployment examples and Node-only subpaths.

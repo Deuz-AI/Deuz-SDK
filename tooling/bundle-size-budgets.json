@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "bundles": {
+    "core": {
+      "from": "@deuz-sdk/core",
+      "exports": ["streamChat", "generateText", "generateObject", "createClient"],
+      "maxRawBytes": 86000,
+      "maxGzipBytes": 27000
+    },
+    "edge": {
+      "from": "@deuz-sdk/core/edge",
+      "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
+      "maxRawBytes": 76000,
+      "maxGzipBytes": 24000
+    },
+    "openai-provider": {
+      "from": "@deuz-sdk/core/openai",
+      "exports": ["createOpenAI", "createOpenAIResponses"],
+      "maxRawBytes": 1000,
+      "maxGzipBytes": 600
+    }
+  }
+}

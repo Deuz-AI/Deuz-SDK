@@ -25,6 +25,18 @@ const DEFAULT_BASE_URL: Record<string, string> = {
   openai: 'https://api.openai.com/v1',
   xai: 'https://api.x.ai/v1',
   google: 'https://generativelanguage.googleapis.com/v1beta/openai',
+  // OpenAI-compatible hosts (providers-compat.ts) — all speak Chat Completions.
+  groq: 'https://api.groq.com/openai/v1',
+  mistral: 'https://api.mistral.ai/v1',
+  deepseek: 'https://api.deepseek.com/v1',
+  together: 'https://api.together.xyz/v1',
+  openrouter: 'https://openrouter.ai/api/v1',
+  cerebras: 'https://api.cerebras.ai/v1',
+  fireworks: 'https://api.fireworks.ai/inference/v1',
+  moonshot: 'https://api.moonshot.ai/v1',
+  qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  glm: 'https://open.bigmodel.cn/api/paas/v4',
+  minimax: 'https://api.minimax.io/v1',
 };
 
 export interface ResolveCallInput {

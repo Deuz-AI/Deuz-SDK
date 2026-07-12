@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish npm package
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Require tag to match package version
+        shell: bash
+        run: test "${GITHUB_REF_NAME}" = "v$(node -p "require('./package.json').version")"
+      - run: npm ci
+      - run: npm ci --prefix docs
+      - run: npm run release:verify
+      - name: Publish with provenance
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Create GitHub release
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

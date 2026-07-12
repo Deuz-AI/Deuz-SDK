@@ -28,12 +28,26 @@ import {
   type CompactionEvent,
 } from './compaction';
 import { createTokenEstimator, type TokenEstimator } from '../internal/estimate-tokens';
+import { attachClientContext, readClientContext } from '../internal/client-context';
 import { getCapabilities } from '../core/registry';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
+import { openSpan, type ExecTrace } from '../internal/trace';
 import { ToolExecutionError } from '../errors';
 
 export const MAX_SAME_TOOL_ERRORS = 3;
+
+/**
+ * Object spread copies only ENUMERABLE props, so the hidden `createClient`
+ * context Symbol (the G1 lowest-precedence apiKeys/baseUrls source) silently
+ * drops off every per-step `{ ...options }` re-spread. Re-attach it from the
+ * loop's root options so client-level keys survive the agentic loop.
+ */
+export function preserveClientContext<O extends object>(source: object, cloned: O): O {
+  const ctx = readClientContext(source);
+  if (ctx) attachClientContext(cloned, ctx);
+  return cloned;
+}
 
 /** Denial message fed back to the model as an is_error tool_result. */
 export const TOOL_DENIED = 'Tool call denied.';
@@ -377,21 +391,26 @@ export async function runCompaction(
       // Single-turn, tool-free, compaction-free side call — never recurses.
       // The slice is rendered to a transcript inside ONE user message so the
       // request is user-first (valid on every wire, incl. Anthropic).
-      const step = await runOneStep({
-        ...options,
-        model: runner.policy.summarizeModel ?? options.model,
-        messages: [{ role: 'user', content: `${renderTranscript(slice)}\n\n${SUMMARY_PROMPT}` }],
-        tools: undefined,
-        toolChoice: undefined,
-        maxSteps: undefined,
-        stopWhen: undefined,
-        compaction: undefined,
-        prepareStep: undefined,
-        activeTools: undefined,
-        onStepFinish: undefined,
-        approveToolCall: undefined,
-        approvalResponses: undefined,
-      });
+      const step = await runOneStep(
+        preserveClientContext(options, {
+          ...options,
+          model: runner.policy.summarizeModel ?? options.model,
+          messages: [{ role: 'user', content: `${renderTranscript(slice)}\n\n${SUMMARY_PROMPT}` }],
+          tools: undefined,
+          toolChoice: undefined,
+          maxSteps: undefined,
+          stopWhen: undefined,
+          compaction: undefined,
+          prepareStep: undefined,
+          activeTools: undefined,
+          onStepFinish: undefined,
+          approveToolCall: undefined,
+          approvalResponses: undefined,
+        }),
+        // Loop-internal side call: no `invoke` span of its own — its usage is
+        // already folded into the enclosing loop's invoke span via addUsage.
+        { skipInvokeSpan: true },
+      );
       addUsage(step.usage);
       return step.text;
     },
@@ -462,6 +481,7 @@ export async function settlePendingApprovals(
   tools: ToolSet,
   options: CommonCallOptions,
   extras?: ExecuteExtras,
+  trace?: ExecTrace,
 ): Promise<{ messages: Message[]; results: ToolResult[]; deniedIds: Set<string> } | null> {
   // An EMPTY array still settles (default-deny the gated rest) — that is how a
   // durable resume without verdicts answers pending calls on the safe side.
@@ -514,7 +534,7 @@ export async function settlePendingApprovals(
     }
   }
 
-  const results = await executeTools(calls, tools, options, messages, denied, extras);
+  const results = await executeTools(calls, tools, options, messages, denied, extras, trace);
   const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
   return { messages: [...messages, toolMessage], results, deniedIds: new Set(denied.keys()) };
 }
@@ -538,6 +558,9 @@ export interface ExecuteExtras {
  * Execute the step's tool calls in parallel (capped); errors self-heal as
  * is_error results. Calls listed in `denied` short-circuit to an is_error
  * denial BEFORE validation (a denied call must not leak a validation message).
+ * With `trace`, each call gets its own `execute_tool` span (parallel calls
+ * included) carrying tool NAME and CALL ID only — never arguments or results
+ * (content capture off by design; redaction P0).
  */
 export async function executeTools(
   toolCalls: ToolCall[],
@@ -546,69 +569,94 @@ export async function executeTools(
   messages: Message[],
   denied?: Map<string, string | undefined>,
   extras?: ExecuteExtras,
+  trace?: ExecTrace,
 ): Promise<ToolResult[]> {
   const cap = options.maxToolConcurrency ?? 5;
   return mapWithConcurrency(toolCalls, cap, async (call): Promise<ToolResult> => {
-    if (denied?.has(call.toolCallId)) {
-      const reason = denied.get(call.toolCallId);
-      return {
-        toolCallId: call.toolCallId,
-        toolName: call.toolName,
-        result: reason ? `${TOOL_DENIED} Reason: ${reason}` : TOOL_DENIED,
-        isError: true,
-      };
-    }
-    const tool: Tool | undefined = tools[call.toolName];
-    if (!tool?.execute) {
-      return {
-        toolCallId: call.toolCallId,
-        toolName: call.toolName,
-        result: 'No server-side executor.',
-        isError: true,
-      };
-    }
-    const validation = await validateOutput(tool.parameters, call.args);
-    if (!validation.ok) {
-      return {
-        toolCallId: call.toolCallId,
-        toolName: call.toolName,
-        result: `Invalid arguments: ${validation.issues}`,
-        isError: true,
-      };
-    }
+    const span = trace
+      ? openSpan(
+          trace.tracer,
+          'execute_tool',
+          { 'gen_ai.tool.name': call.toolName, 'gen_ai.tool.call.id': call.toolCallId },
+          trace.parent,
+        )
+      : undefined;
+    const settle = (result: ToolResult): ToolResult => {
+      span?.setAttribute('deuz.tool.is_error', result.isError === true);
+      span?.end();
+      return result;
+    };
     try {
-      const ctx: ToolExecuteContext = {
-        toolCallId: call.toolCallId,
-        messages,
-        signal: options.signal,
-        ...(options.agentPath ? { agentPath: options.agentPath } : {}),
-        ...(options.approveToolCall ? { approveToolCall: options.approveToolCall } : {}),
-        ...(extras?.deps ? { deps: extras.deps } : {}),
-        ...(extras?.emitPart ? { emitPart: extras.emitPart } : {}),
-        ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
-        ...(extras?.session ? { session: extras.session } : {}),
-        ...(extras?.approvalResponses ? { approvalResponses: extras.approvalResponses } : {}),
-      };
-      const out = await tool.execute(validation.value, ctx);
-      return { toolCallId: call.toolCallId, toolName: call.toolName, result: out };
+      if (denied?.has(call.toolCallId)) {
+        const reason = denied.get(call.toolCallId);
+        return settle({
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          result: reason ? `${TOOL_DENIED} Reason: ${reason}` : TOOL_DENIED,
+          isError: true,
+        });
+      }
+      const tool: Tool | undefined = tools[call.toolName];
+      if (!tool?.execute) {
+        return settle({
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          result: 'No server-side executor.',
+          isError: true,
+        });
+      }
+      const validation = await validateOutput(tool.parameters, call.args);
+      if (!validation.ok) {
+        return settle({
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          result: `Invalid arguments: ${validation.issues}`,
+          isError: true,
+        });
+      }
+      try {
+        const ctx: ToolExecuteContext = {
+          toolCallId: call.toolCallId,
+          messages,
+          signal: options.signal,
+          ...(options.agentPath ? { agentPath: options.agentPath } : {}),
+          ...(options.approveToolCall ? { approveToolCall: options.approveToolCall } : {}),
+          ...(extras?.deps ? { deps: extras.deps } : {}),
+          ...(extras?.emitPart ? { emitPart: extras.emitPart } : {}),
+          ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
+          ...(extras?.session ? { session: extras.session } : {}),
+          ...(extras?.approvalResponses ? { approvalResponses: extras.approvalResponses } : {}),
+        };
+        const out = await tool.execute(validation.value, ctx);
+        return settle({ toolCallId: call.toolCallId, toolName: call.toolName, result: out });
+      } catch (cause) {
+        // A durable sub-agent suspension is control flow, not a tool failure —
+        // it must reach the loop verbatim so the parent suspends too.
+        if (cause instanceof SubAgentSuspension) throw cause;
+        // The span records the ORIGINAL throw; the loop still self-heals below.
+        span?.recordException(cause);
+        // Surface the thrown message to the model (self-heal feedback): a tool
+        // that throws `new Error('File not found')` should tell the model that,
+        // not an opaque "threw during execution".
+        const err = new ToolExecutionError(call.toolName, {
+          toolCallId: call.toolCallId,
+          cause,
+          ...(cause instanceof Error && cause.message ? { message: cause.message } : {}),
+        });
+        return settle({
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          result: err.message,
+          isError: true,
+        });
+      }
     } catch (cause) {
-      // A durable sub-agent suspension is control flow, not a tool failure —
-      // it must reach the loop verbatim so the parent suspends too.
-      if (cause instanceof SubAgentSuspension) throw cause;
-      // Surface the thrown message to the model (self-heal feedback): a tool
-      // that throws `new Error('File not found')` should tell the model that,
-      // not an opaque "threw during execution".
-      const err = new ToolExecutionError(call.toolName, {
-        toolCallId: call.toolCallId,
-        cause,
-        ...(cause instanceof Error && cause.message ? { message: cause.message } : {}),
-      });
-      return {
-        toolCallId: call.toolCallId,
-        toolName: call.toolName,
-        result: err.message,
-        isError: true,
-      };
+      // Only control flow (SubAgentSuspension) or unexpected plumbing errors
+      // reach here — the span must still end exactly once. A suspension is not
+      // a tool failure (no exception, no is_error); anything else records first.
+      if (cause instanceof SubAgentSuspension) span?.end();
+      else span?.fail(cause);
+      throw cause;
     }
   });
 }
@@ -648,7 +696,7 @@ export function needsCost(conditions: StopCondition[]): boolean {
 export async function shouldStop(
   conditions: StopCondition[],
   steps: StepResult[],
-  extras?: { usage?: Usage; costUSD?: number },
+  extras?: { usage?: Usage; costUSD?: number; elapsedMs?: number },
 ): Promise<{ stop: boolean; stoppedBy?: string }> {
   const info = { steps, stepCount: steps.length, ...extras };
   for (const c of conditions) {

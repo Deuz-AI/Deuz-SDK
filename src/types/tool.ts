@@ -127,4 +127,6 @@ export type StopCondition = (info: {
   usage?: Usage;
   /** Cumulative cost in USD — present only when `deps.priceProvider` is set AND a condition needs it. Additive (1.4). */
   costUSD?: number;
+  /** Milliseconds since the loop started, from the injected `clock` (deterministic in tests). Additive (1.6). */
+  elapsedMs?: number;
 }) => boolean | Promise<boolean>;

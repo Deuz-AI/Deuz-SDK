@@ -108,6 +108,14 @@ export const PRICES_2026: PriceTable = {
   'deepseek-v3.2': { input: 0.28, output: 0.42, cachedRead: 0.028 },
   'deepseek-r1': { input: 0.55, output: 2.19, cachedRead: 0.14 },
 
+  // ---- OpenAI-compatible hosts (providers-compat) ----
+  // mistral-large-latest → Mistral Large 3 list price (verified 2026-07).
+  'mistral-large': { input: 0.5, output: 1.5 },
+  // Moonshot list prices (verified 2026-07). kimi-k2 covers the legacy K2 family;
+  // kimi-k2.6 is pinned explicitly so the prefix lookup can't undercharge it.
+  'kimi-k2': { input: 0.6, output: 2.5, cachedRead: 0.15 },
+  'kimi-k2.6': { input: 0.95, output: 4, cachedRead: 0.16 },
+
   // ---- Others on the Yunwu catalog ----
   'qwen3-max': { input: 1.2, output: 6 },
   'glm-4.6': { input: 0.6, output: 2.2 },

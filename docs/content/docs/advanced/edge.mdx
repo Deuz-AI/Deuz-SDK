@@ -33,7 +33,7 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 ## The `/edge` subpath
 
-`@deuz-sdk/core/edge` re-exports the guaranteed Web-APIs-only subset. Its mere existence is the build's edge smoke test — if anything Node-only leaked into the dependency graph of these exports, the build would not produce a clean `/edge` bundle.
+`@deuz-sdk/core/edge` re-exports the guaranteed Web-APIs-only subset. Every release bundles representative root, `/edge`, and provider consumers with esbuild's browser platform and fails if the graph reaches a Node-only module. The browser/jsdom suite then exercises the Responses stream with Web Streams and a custom base URL.
 
 It exports exactly:
 

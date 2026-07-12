@@ -1,0 +1,24 @@
+---
+title: Provider Conformance
+description: The shared request, stream, usage, finish, and error behavior every provider adapter must satisfy.
+---
+
+Provider adapters may have different HTTP shapes, but they share one observable contract. The conformance suite currently exercises Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and Google native streaming through the public SDK entry points.
+
+Each provider case verifies:
+
+1. the expected route, POST method, authentication header, and streaming mode;
+2. canonical text deltas, usage totals, and exactly one finish part;
+3. a non-retryable 401 maps to `AuthenticationError`;
+4. the error retains the actual model provider, including OpenAI-compatible hosts;
+5. `fullStream`, `usage`, and `finishReason` expose the same normalized error.
+
+Wire differences remain explicit. Anthropic, Chat Completions, and Responses enable streaming in the body; Google native uses `alt=sse` on the URL. Conformance requires equivalent semantics, not identical JSON.
+
+When adding an adapter, add a case to `test/provider-conformance.test.ts` before wiring it into the public surface. Run it with:
+
+```bash
+npm run test:conformance
+```
+
+Error classes and retry behavior are documented in [Error Handling](/docs/core/errors).

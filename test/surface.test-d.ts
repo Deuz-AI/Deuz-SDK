@@ -125,3 +125,19 @@ expectTypeOf(serializeCheckpoint).returns.toBeString();
 expectTypeOf(deserializeCheckpoint).returns.toHaveProperty('messages');
 expectTypeOf(createApprovalSigner).returns.toHaveProperty('sign');
 expectTypeOf<CheckpointNotFoundError>().toHaveProperty('runId');
+
+// --- 1.6.0 additive: createClient parity (streamObject/embed/embedMany). ---
+expectTypeOf(client.streamObject).toBeFunction();
+expectTypeOf(client.streamObject<{ a: string }>).returns.toEqualTypeOf<
+  StreamObjectResult<{ a: string }>
+>();
+expectTypeOf(client.embed).returns.resolves.toHaveProperty('embedding');
+expectTypeOf(client.embedMany).returns.resolves.toHaveProperty('embeddings');
+
+// --- 1.6.0 additive: durationExceeds stop condition + elapsedMs context. ---
+// NOTE: imported from its module until the root export lands in src/index.ts
+// (index/edge wiring is owned by the release integration).
+import { durationExceeds } from '../src/inference/stop';
+import type { StopCondition } from '../src/index';
+expectTypeOf(durationExceeds).returns.toBeFunction();
+expectTypeOf<Parameters<StopCondition>[0]>().toHaveProperty('elapsedMs');

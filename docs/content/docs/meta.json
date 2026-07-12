@@ -4,13 +4,14 @@
     "index",
     "installation",
     "quickstart",
-    "changelog",
     "core",
     "providers",
     "agents",
     "cookbooks",
     "modules",
+    "reference",
     "advanced",
-    "migration"
+    "migration",
+    "changelog"
   ]
 }

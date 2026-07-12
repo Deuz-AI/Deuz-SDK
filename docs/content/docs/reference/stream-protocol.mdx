@@ -1,0 +1,36 @@
+---
+title: Stream Protocol Contract
+description: The canonical StreamPart contract and the provider SSE invariants locked by tests.
+---
+
+Provider bytes are never exposed directly. Each adapter parses its wire stream and emits the same additive `StreamPart` union. Consumers can therefore switch providers without changing text, reasoning, tool-call, source, usage, or finish handling.
+
+The SSE parser is regression-tested for:
+
+- UTF-8 code points split across arbitrary byte boundaries;
+- LF, CRLF, and bare CR line endings, including a CRLF pair split across chunks;
+- UTF-8 BOMs, comments/keep-alives, named events, and multi-line `data:` fields;
+- a final event without a trailing blank line;
+- cancellation of the underlying reader when a consumer stops early.
+
+Every successful provider stream must produce exactly one `finish` part. Provider usage shapes are normalized into `Usage`; provider finish values are normalized into the locked `FinishReason` union. A provider error event produces one typed `error` part and rejects `usage` and `finishReason` with the same error object.
+
+## Compatibility rule
+
+`StreamPart` is additive. Applications should handle the variants they need and retain a `default` branch so a new non-breaking part does not break an older consumer.
+
+```ts
+for await (const part of result.fullStream) {
+  switch (part.type) {
+    case 'text-delta':
+      process.stdout.write(part.text);
+      break;
+    case 'error':
+      throw part.error;
+    default:
+      break;
+  }
+}
+```
+
+Run the focused protocol suite with `npm run test:protocol`.

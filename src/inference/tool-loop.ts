@@ -29,6 +29,7 @@ import {
   saveCheckpoint,
   durableUsage,
   toApprovalRequests,
+  preserveClientContext,
   SubAgentSuspension,
   type ExecuteExtras,
 } from './loop-shared';
@@ -55,6 +56,8 @@ export async function runToolLoop(
 ): Promise<GenerateTextResult> {
   const tools = options.tools ?? {};
   const deps = resolveDependencies(options.deps);
+  // Loop start timestamp for `durationExceeds` (injected clock — never Date.now).
+  const startedAt = deps.clock.now();
   const durable = setupDurable(options, deps, internal?.resumeFrom);
   // Cross-leg step offset: prepareStep must see the same continuing indices
   // the streaming loop reports on a resume leg (loop-symmetry invariant).
@@ -164,7 +167,10 @@ export async function runToolLoop(
     );
     messages = prepared.messages;
     const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
-    const step = await runOneStep({ ...prepared.options, messages }, { tools: prepared.wire });
+    const step = await runOneStep(
+      preserveClientContext(options, { ...prepared.options, messages }),
+      { tools: prepared.wire },
+    );
     lastStep = step;
     totalUsage = sumUsage(totalUsage, step.usage);
     calibrateCompaction(compactionRunner, estimatedAtCall, step.usage);
@@ -278,7 +284,11 @@ export async function runToolLoop(
       wantCost && deps.priceProvider
         ? ((await deps.priceProvider.priceUsage(options.model.modelId, runUsage)) ?? undefined)
         : undefined;
-    const stop = await shouldStop(stopConditions, steps, { usage: runUsage, costUSD });
+    const stop = await shouldStop(stopConditions, steps, {
+      usage: runUsage,
+      costUSD,
+      elapsedMs: deps.clock.now() - startedAt,
+    });
     if (stop.stop) {
       stoppedBy = stop.stoppedBy;
       if (durable) {

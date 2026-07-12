@@ -22,8 +22,10 @@ export type { DeuzClient } from './client';
 // Error taxonomy (base + full Faz 1.A hierarchy).
 export {
   DeuzError,
+  isDeuzError,
   NotImplementedError,
   APICallError,
+  NetworkError,
   RateLimitError,
   OverloadedError,
   AuthenticationError,
@@ -36,7 +38,7 @@ export {
   ToolExecutionError,
   UnsupportedCapabilityError,
 } from './errors';
-export type { APICallErrorOptions } from './errors';
+export type { APICallErrorOptions, DeuzErrorJSON } from './errors';
 
 // Optional cost estimation (token breakdown → USD). App injects via deps.priceProvider.
 export { createPriceProvider, priceUsage, PRICES_2026 } from './pricing';

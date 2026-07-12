@@ -27,5 +27,6 @@ export type {
   CreateApprovalSignerOptions,
   ApprovalSigner,
 } from './durable';
-export { DeuzError, NotImplementedError, NoObjectGeneratedError } from './errors';
+export { DeuzError, isDeuzError, NotImplementedError, NoObjectGeneratedError } from './errors';
+export type { DeuzErrorJSON } from './errors';
 export type * from './types';
