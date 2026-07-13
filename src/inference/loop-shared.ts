@@ -38,6 +38,7 @@ import {
   createObservationRuntime,
   observeCost,
   counterFields,
+  attachInheritedObserve,
   type ObservationRuntime,
 } from '../internal/observe-runtime';
 import { toObservedError } from '../internal/observe-error';
@@ -437,10 +438,12 @@ export async function runCompaction(
   messages: Message[],
   addUsage: (u: Usage) => void,
   onEvent: (e: CompactionEvent) => void,
+  ob?: ExecuteExtras['observe'],
 ): Promise<Message[]> {
   const ctx: ApplyCompactionCtx = {
     estimate: (m) => runner.estimator.estimate(m),
     contextWindow: runner.contextWindow,
+    ...(ob ? { now: () => deps.clock.now() } : {}),
     summarize: async (slice) => {
       // Single-turn, tool-free, compaction-free side call — never recurses.
       // The slice is rendered to a transcript inside ONE user message so the
@@ -463,15 +466,58 @@ export async function runCompaction(
         }),
         // Loop-internal side call: no `invoke` span of its own — its usage is
         // already folded into the enclosing loop's invoke span via addUsage.
-        { skipInvokeSpan: true },
+        // Observation: a tagged model call under the step ('compaction-summary'),
+        // never a second run.
+        {
+          skipInvokeSpan: true,
+          ...(ob
+            ? {
+                observe: {
+                  runtime: ob.rt,
+                  parentSpanId: ob.parentSpanId,
+                  stepIndex: ob.stepIndex,
+                  purpose: 'compaction-summary' as const,
+                },
+              }
+            : {}),
+        },
       );
       addUsage(step.usage);
       return step.text;
     },
-    onSkip: (layer, reason) => deps.logger.warn(`compaction: ${layer} skipped — ${reason}`),
+    onSkip: (layer, reason) => {
+      deps.logger.warn(`compaction: ${layer} skipped — ${reason}`);
+      ob?.rt.emit({
+        type: 'compaction.skipped',
+        spanId: ob.rt.startSpan().spanId,
+        parentSpanId: ob.parentSpanId,
+        stepIndex: ob.stepIndex,
+        agentPath: options.agentPath,
+        layer,
+        reason,
+      });
+    },
   };
   const { messages: compacted, events } = await applyCompaction(messages, runner.policy, ctx);
-  for (const e of events) onEvent(e);
+  for (const e of events) {
+    onEvent(e);
+    ob?.rt.emit({
+      type: 'compaction',
+      spanId: ob.rt.startSpan().spanId,
+      parentSpanId: ob.parentSpanId,
+      stepIndex: ob.stepIndex,
+      agentPath: options.agentPath,
+      layer: e.layer,
+      trigger: 'threshold',
+      threshold: runner.policy.threshold,
+      contextWindow: runner.contextWindow,
+      tokensBefore: e.tokensBefore,
+      tokensAfter: e.tokensAfter,
+      messageCountBefore: e.messagesBefore,
+      messageCountAfter: e.messagesAfter,
+      durationMs: e.durationMs,
+    });
+  }
   return compacted;
 }
 
@@ -819,13 +865,22 @@ export async function executeTools(
         });
       }
       try {
+        // Sub-agent inheritance: a per-call deps clone carries the runtime +
+        // this tool call's span via a non-enumerable symbol (parallel-safe).
+        const ctxDeps =
+          extras?.deps && ob
+            ? attachInheritedObserve(
+                { ...extras.deps },
+                { runtime: ob.rt, parentSpanId: obSpan!.spanId },
+              )
+            : extras?.deps;
         const ctx: ToolExecuteContext = {
           toolCallId: call.toolCallId,
           messages,
           signal: options.signal,
           ...(options.agentPath ? { agentPath: options.agentPath } : {}),
           ...(options.approveToolCall ? { approveToolCall: options.approveToolCall } : {}),
-          ...(extras?.deps ? { deps: extras.deps } : {}),
+          ...(ctxDeps ? { deps: ctxDeps } : {}),
           ...(extras?.emitPart ? { emitPart: extras.emitPart } : {}),
           ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
           ...(extras?.session ? { session: extras.session } : {}),

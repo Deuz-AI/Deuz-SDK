@@ -218,6 +218,11 @@ export async function runToolLoop(
     for (;;) {
       const stepIndex = stepBase + steps.length;
       const stepSpan = lo?.rt.startSpan();
+      if (observeCtx && stepSpan) {
+        // Compaction + tool events of THIS iteration parent under the step span.
+        observeCtx.parentSpanId = stepSpan.spanId;
+        observeCtx.stepIndex = stepIndex;
+      }
       // Compaction first, so prepareStep sees (and has the last word on) the
       // compacted history.
       if (compactionRunner) {
@@ -230,6 +235,7 @@ export async function runToolLoop(
             totalUsage = sumUsage(totalUsage, u);
           },
           (e) => deps.logger.info(`compaction: ${e.layer} ${e.tokensBefore}->${e.tokensAfter}`),
+          observeCtx,
         );
       }
       const prepared = await applyPrepareStep(
@@ -242,8 +248,6 @@ export async function runToolLoop(
       messages = prepared.messages;
       const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
       if (lo && stepSpan) {
-        observeCtx!.parentSpanId = stepSpan.spanId;
-        observeCtx!.stepIndex = stepIndex;
         emitStepStarted(
           lo,
           options,

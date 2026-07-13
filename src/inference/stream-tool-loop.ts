@@ -75,6 +75,8 @@ export interface StreamToolLoopInternal {
   }>;
   /** Observation (1.6): resume-leg correlation for run.started. */
   observeResume?: { stepId: string; stepIndex: number; checkpointAgeMs?: number };
+  /** Observation (1.6): sub-agent — share the parent runtime, emit no run.* events. */
+  observeInherited?: { runtime: ObservationRuntime; parentSpanId?: string };
 }
 
 /**
@@ -164,6 +166,7 @@ export function runStreamToolLoop(
       resumeFromStepId: observeResume?.stepId,
       resumeFromStepIndex: observeResume?.stepIndex,
       runtime: preRt,
+      inherited: internal?.observeInherited,
     });
     if (durable && lo) durable.observe = { rt: lo.rt, runSpanId: lo.runSpanId };
     const steps: StepResult[] = [];
@@ -302,6 +305,11 @@ export function runStreamToolLoop(
       for (;;) {
         broadcaster.push({ type: 'step-start', stepIndex });
         const stepSpan = lo?.rt.startSpan();
+        if (observeCtx && stepSpan) {
+          // Compaction + tool events of THIS iteration parent under the step span.
+          observeCtx.parentSpanId = stepSpan.spanId;
+          observeCtx.stepIndex = stepIndex;
+        }
         // Compaction first — its parts precede the step's deltas; prepareStep
         // then sees the compacted history.
         if (compactionRunner) {
@@ -320,6 +328,7 @@ export function runStreamToolLoop(
                 tokensBefore: e.tokensBefore,
                 tokensAfter: e.tokensAfter,
               }),
+            observeCtx,
           );
         }
         const prepared = await applyPrepareStep(
@@ -332,8 +341,6 @@ export function runStreamToolLoop(
         messages = prepared.messages;
         const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
         if (lo && stepSpan) {
-          observeCtx!.parentSpanId = stepSpan.spanId;
-          observeCtx!.stepIndex = stepIndex;
           emitStepStarted(
             lo,
             options,

@@ -228,6 +228,33 @@ function toMinimalRunFailed(event: RunFailedEvent): RunFailedEvent {
   };
 }
 
+// --- Sub-agent inheritance (1.6): the parent loop attaches its runtime to the
+// per-call ctx.deps clone via a NON-ENUMERABLE symbol; agentTool reads it and
+// threads it into the child loop so child events share the parent's
+// runId/executionId/sequence. Spreads drop it by design — it never leaks.
+const INHERITED_OBSERVE = Symbol('deuz.observe.inherited');
+
+export interface InheritedObserveContext {
+  runtime: ObservationRuntime;
+  /** The parent tool call's span — subagent.started parents under it. */
+  parentSpanId?: string;
+}
+
+export function attachInheritedObserve<T extends object>(
+  target: T,
+  ctx: InheritedObserveContext,
+): T {
+  Object.defineProperty(target, INHERITED_OBSERVE, { value: ctx, enumerable: false });
+  return target;
+}
+
+export function readInheritedObserve(
+  target: object | undefined,
+): InheritedObserveContext | undefined {
+  if (!target) return undefined;
+  return (target as Record<symbol, InheritedObserveContext | undefined>)[INHERITED_OBSERVE];
+}
+
 /** rt.counters → the run.completed counter field names (shared by every terminal emitter). */
 export function counterFields(rt: ObservationRuntime): {
   modelCallCount: number;

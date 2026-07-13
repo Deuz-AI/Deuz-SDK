@@ -364,7 +364,7 @@ describe('layer order & early stop', () => {
       contextWindow: 9000,
       summarize,
     });
-    expect(res.events).toEqual([
+    expect(res.events).toMatchObject([
       { layer: 'prune-tool-results', tokensBefore: 8800, tokensAfter: 4800 },
     ]);
     for (const i of [2, 4, 6, 8]) expect(res.messages[i]).toBe(msgs[i]); // reasoning kept
@@ -395,7 +395,7 @@ describe('layer order & early stop', () => {
       policy({ layers: ['prune-reasoning', 'prune-tool-results'] }),
       { estimate, contextWindow: 12500 },
     );
-    expect(res.events).toEqual([
+    expect(res.events).toMatchObject([
       { layer: 'prune-reasoning', tokensBefore: 12000, tokensAfter: 8000 },
     ]);
     for (const i of [3, 5, 7, 9]) expect(res.messages[i]).toBe(msgs[i]); // tool results kept

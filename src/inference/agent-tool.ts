@@ -14,6 +14,8 @@ import type { Dependencies } from '../types/deps';
 import type { JSONSchema } from '../types/schema';
 import { runStreamToolLoop, type StreamToolLoopInternal } from './stream-tool-loop';
 import { SubAgentSuspension } from './loop-shared';
+import { readInheritedObserve } from '../internal/observe-runtime';
+import { toObservedError } from '../internal/observe-error';
 
 export interface AgentToolDef {
   /** Sub-agent identity — used in `agentPath`; use the same string as the tool key. */
@@ -111,6 +113,28 @@ export function agentTool(def: AgentToolDef): Tool {
         }
       }
 
+      // Observation (1.6): the parent's runtime rides on ctx.deps (symbol);
+      // sub-agent events share the parent runId/executionId and parent under
+      // this tool call's span. The child loop inherits the runtime and emits
+      // no run.* events of its own.
+      const observe = readInheritedObserve(ctx.deps);
+      const subSpan = observe?.runtime.startSpan();
+      let childStepCount = 0;
+      if (observe && subSpan) {
+        observe.runtime.emit({
+          type: 'subagent.started',
+          spanId: subSpan.spanId,
+          parentSpanId: observe.parentSpanId,
+          agentPath: path,
+          agentName: def.name,
+          depth: path.length,
+          parentToolCallId: ctx.toolCallId,
+          model: def.model.modelId,
+          durable: childSession !== undefined,
+          ...(childSession ? { childRunId: childSession.runId } : {}),
+        });
+      }
+
       const inner = runStreamToolLoop(
         {
           model: def.model,
@@ -132,58 +156,109 @@ export function agentTool(def: AgentToolDef): Tool {
           // child runs have nothing to settle, so they pass through harmlessly.
           ...(ctx.approvalResponses ? { approvalResponses: ctx.approvalResponses } : {}),
         },
-        resume,
+        {
+          ...resume,
+          ...(observe && subSpan
+            ? { observeInherited: { runtime: observe.runtime, parentSpanId: subSpan.spanId } }
+            : {}),
+        },
       );
 
       const forward = Boolean(ctx.emitPart) && def.subAgentStream !== 'none';
       let stepText = '';
       let lastNonEmpty = '';
       const pendingApprovals: ToolApprovalRequest[] = [];
-      for await (const part of inner.fullStream) {
-        if (part.type === 'step-start') {
-          // Carry forward the last step that actually produced text, so a run
-          // cut mid-tool (maxSteps/stopWhen on a tool step) still returns the
-          // sub-agent's most recent answer instead of an empty string.
-          if (stepText.trim()) lastNonEmpty = stepText;
-          stepText = '';
-        } else if (part.type === 'text-delta') stepText += part.text;
-        else if (part.type === 'tool-approval-request') {
-          pendingApprovals.push({
-            approvalId: part.approvalId,
-            toolCallId: part.toolCallId,
-            toolName: part.toolName,
-            input: part.input,
-            // A deeper descendant's path survives; this loop's own breaks
-            // carry `path` from the child loop already, but keep the fallback.
-            agentPath: part.agentPath ?? path,
-          });
-        } else if (part.type === 'error') throw part.error;
-        if (forward) ctx.emitPart!({ type: 'sub-agent', agentPath: path, part });
-      }
-
-      // Fold the sub-agent's cumulative usage into the parent (result + budget).
-      // On a suspension this runs BEFORE the signal below, so the suspended
-      // parent's checkpoint still counts the child's tokens.
-      ctx.reportUsage?.(await inner.usage);
-
-      if (pendingApprovals.length > 0) {
-        if (childSession) {
-          // The child checkpointed itself as suspended — suspend the parent
-          // too, carrying the approvals up (executeTools re-throws this).
-          throw new SubAgentSuspension(pendingApprovals);
+      try {
+        for await (const part of inner.fullStream) {
+          if (part.type === 'step-finish') childStepCount += 1;
+          if (part.type === 'step-start') {
+            // Carry forward the last step that actually produced text, so a run
+            // cut mid-tool (maxSteps/stopWhen on a tool step) still returns the
+            // sub-agent's most recent answer instead of an empty string.
+            if (stepText.trim()) lastNonEmpty = stepText;
+            stepText = '';
+          } else if (part.type === 'text-delta') stepText += part.text;
+          else if (part.type === 'tool-approval-request') {
+            pendingApprovals.push({
+              approvalId: part.approvalId,
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              input: part.input,
+              // A deeper descendant's path survives; this loop's own breaks
+              // carry `path` from the child loop already, but keep the fallback.
+              agentPath: part.agentPath ?? path,
+            });
+          } else if (part.type === 'error') throw part.error;
+          if (forward) ctx.emitPart!({ type: 'sub-agent', agentPath: path, part });
         }
-        // No durable session: keep the 1.4 self-healing contract.
-        throw new Error(
-          `agentTool '${def.name}': a sub-agent tool call needs approval. Client-mode approval ` +
-            `inside a sub-agent is not supported yet without a durable session — pass a ` +
-            `server-mode approveToolCall on the parent call, or add \`session\` (1.5 durable ` +
-            `sessions) so the run can suspend and resume.`,
-        );
+
+        // Fold the sub-agent's cumulative usage into the parent (result + budget).
+        // On a suspension this runs BEFORE the signal below, so the suspended
+        // parent's checkpoint still counts the child's tokens.
+        ctx.reportUsage?.(await inner.usage);
+
+        if (pendingApprovals.length > 0) {
+          if (childSession) {
+            // The child checkpointed itself as suspended — suspend the parent
+            // too, carrying the approvals up (executeTools re-throws this).
+            if (observe && subSpan) {
+              observe.runtime.emit({
+                type: 'subagent.suspended',
+                spanId: subSpan.spanId,
+                parentSpanId: observe.parentSpanId,
+                agentPath: path,
+                agentName: def.name,
+                depth: path.length,
+                durationMs: observe.runtime.durationSince(subSpan.startedAt),
+                pendingApprovalCount: pendingApprovals.length,
+              });
+            }
+            throw new SubAgentSuspension(pendingApprovals);
+          }
+          // No durable session: keep the 1.4 self-healing contract.
+          throw new Error(
+            `agentTool '${def.name}': a sub-agent tool call needs approval. Client-mode approval ` +
+              `inside a sub-agent is not supported yet without a durable session — pass a ` +
+              `server-mode approveToolCall on the parent call, or add \`session\` (1.5 durable ` +
+              `sessions) so the run can suspend and resume.`,
+          );
+        }
+        if (observe && subSpan) {
+          observe.runtime.emit({
+            type: 'subagent.completed',
+            spanId: subSpan.spanId,
+            parentSpanId: observe.parentSpanId,
+            agentPath: path,
+            agentName: def.name,
+            depth: path.length,
+            durationMs: observe.runtime.durationSince(subSpan.startedAt),
+            stepCount: childStepCount,
+            // Already folded into the parent totals via reportUsage — consumers
+            // must never sum it twice.
+            usage: await inner.usage,
+          });
+        }
+        // Prefer the final step's text; fall back to the last step that had any,
+        // then to an explicit note (never silently return '' after real work).
+        const answer = stepText.trim() ? stepText : lastNonEmpty;
+        return answer || '(the sub-agent finished without a text answer)';
+      } catch (err) {
+        // Suspension is control flow (subagent.suspended already fired);
+        // everything else is a sub-agent failure that will self-heal above.
+        if (observe && subSpan && !(err instanceof SubAgentSuspension)) {
+          observe.runtime.emit({
+            type: 'subagent.failed',
+            spanId: subSpan.spanId,
+            parentSpanId: observe.parentSpanId,
+            agentPath: path,
+            agentName: def.name,
+            depth: path.length,
+            durationMs: observe.runtime.durationSince(subSpan.startedAt),
+            error: toObservedError(err, observe.runtime.capture.errorMessages),
+          });
+        }
+        throw err;
       }
-      // Prefer the final step's text; fall back to the last step that had any,
-      // then to an explicit note (never silently return '' after real work).
-      const answer = stepText.trim() ? stepText : lastNonEmpty;
-      return answer || '(the sub-agent finished without a text answer)';
     },
   };
 }

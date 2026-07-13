@@ -44,6 +44,11 @@ export interface CompactionEvent {
   layer: CompactionLayer;
   tokensBefore: number;
   tokensAfter: number;
+  /** Layer wall time (0 when no `ctx.now` is injected). Observation-only (1.6) — not on the stream part. */
+  durationMs: number;
+  /** Message counts around this layer. Observation-only (1.6) — not on the stream part. */
+  messagesBefore: number;
+  messagesAfter: number;
 }
 
 export type NormalizedCompaction = Required<
@@ -84,6 +89,8 @@ export interface ApplyCompactionCtx {
   summarize?: (messagesToSummarize: Message[]) => Promise<string>;
   /** Wired to `logger.warn` by the loop; fired when a layer is skipped. */
   onSkip?: (layer: CompactionLayer, reason: string) => void;
+  /** Injected clock (observation timing) — pure module, never Date.now here. */
+  now?: () => number;
 }
 
 /**
@@ -104,10 +111,19 @@ export async function applyCompaction(
   let current = messages;
   for (const layer of policy.layers) {
     const tokensBefore = ctx.estimate(current);
+    const messagesBefore = current.length;
+    const layerStart = ctx.now?.() ?? 0;
     const next = await runLayer(layer, current, policy.keepRecentSteps, ctx);
     if (next !== current) {
       current = next;
-      events.push({ layer, tokensBefore, tokensAfter: ctx.estimate(current) });
+      events.push({
+        layer,
+        tokensBefore,
+        tokensAfter: ctx.estimate(current),
+        durationMs: ctx.now ? Math.max(0, ctx.now() - layerStart) : 0,
+        messagesBefore,
+        messagesAfter: current.length,
+      });
     }
     if (ctx.estimate(current) / ctx.contextWindow <= target) break;
   }
