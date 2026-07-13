@@ -19,7 +19,7 @@ _One canonical wire. Zero runtime dependencies. Runs anywhere `fetch` runs._
 
 ---
 
-`@deuz-sdk/core` is a from-scratch, independent AI SDK: chat, agentic tool loops, sub-agents, durable sessions, structured output, embeddings, memory, RAG, skills, MCP, and image generation — in **one package with zero runtime dependencies**. The core is **pure by construction, enforced by lint**: no `Date.now()`, no `Math.random()`, no `process.env`, no `console` anywhere in `src/`; everything stateful is injected through a single `Dependencies` seam, so the same code runs unchanged on Node, Deno, Bun, and edge runtimes — and every test is a deterministic replay. Since v1.5.0, agent loops **checkpoint into a two-method `SessionStore` and resume** after a crash or a human-approval pause — durable execution over any backend, with no vendor workflow runtime.
+`@deuz-sdk/core` is a from-scratch, independent AI SDK: chat, agentic tool loops, sub-agents, durable sessions, structured output, embeddings, memory, RAG, skills, MCP, and image generation — in **one package with zero runtime dependencies**. The core is **pure by construction, enforced by lint**: no `Date.now()`, no `Math.random()`, no `process.env`, no `console` anywhere in `src/`; everything stateful is injected through a single `Dependencies` seam, so the same code runs unchanged on Node, Deno, Bun, and edge runtimes — and every test is a deterministic replay. Since v1.5.0, agent loops **checkpoint into a two-method `SessionStore` and resume** after a crash or a human-approval pause — durable execution over any backend, with no vendor workflow runtime. And since v1.6.0, every run is **observable locally**: a versioned event protocol covering model calls, retries, tools, approvals, checkpoints and sub-agents — no hosted service, nothing recorded by default.
 
 ## Install
 
@@ -182,7 +182,7 @@ const { messages, sendMessage, pendingApprovals, addToolApprovalResponse } = use
 
 Verified against each project's official docs and the npm registry on **2026-07-08** (versions: `ai@7.0.17`, `@mastra/core@1.50.1`, `langchain@1.5.2`, `llamaindex@0.12.1`, `@openai/agents@0.13.0`). ✅ yes · 🟡 partial/with caveats · ❌ no.
 
-| | Deuz 1.5 | ai 7 | Mastra | LangChain | LlamaIndex.TS | OpenAI Agents |
+| | Deuz 1.6 | ai 7 | Mastra | LangChain | LlamaIndex.TS | OpenAI Agents |
 | --- | --- | --- | --- | --- | --- | --- |
 | Zero runtime dependencies | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | ESM + CJS dual build | ✅ | ❌ ESM-only | ✅ | ✅ | ✅ | ✅ |

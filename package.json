@@ -1,6 +1,6 @@
 {
   "name": "@deuz-sdk/core",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini).",
   "license": "MIT",
   "author": "Umutcan Edizaslan (U-C4N)",

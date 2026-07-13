@@ -6,6 +6,20 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## 1.6.0
+
+**Observable Runtime — the versioned observation event protocol.** Every run can emit `ObserveEvent`s (`schemaVersion: 1`) through the new `Dependencies.observer` seam: run/model lifecycle with TTFT and per-retry reason + backoff, agent steps with per-step duration and cumulative usage, per-tool timings with real parallel completion order, approval requests and resolutions (server / client-response / default-deny), durable checkpoint saves/loads with resume correlation (one `runId` across legs, fresh `executionId` per leg, `checkpoint.loaded` before `run.started { resumed: true }`), per-layer compaction events with the summarize side-call visible as a tagged model call, sub-agent trees keyed by `agentPath`, and sync/async cost via the existing `priceProvider`. Local-first: no API key, no account, no data leaves the process. See [Observability](/docs/modules/observability) and the [event catalog](/docs/reference/observe-events).
+
+**Built-in observers — `@deuz-sdk/core/observe` + `/observe/node`.** `createMemoryObserver` (capped ring buffer), `createCallbackObserver`, `composeObservers` (a throwing child never blocks siblings), `filterObserver`, and the pure `summarizeRun` aggregator. Node-side, `createJsonlObserver` persists one valid JSON line per event through a bounded queue (a slow or failing disk can never affect the run) with binary-safe `$deuzBytes` round-trips via `readJsonlEvents`.
+
+**Privacy-first by default.** Events carry only counts, ids, names, durations and enums; prompt/tool/reasoning/error content is opt-in per field and always passes a `[REDACTED]` redaction profile (API keys, `Bearer`/JWT/PEM patterns, secret-looking keys) plus structural limits — regression-tested against planted secrets in every channel. Deterministic per-run sampling (`sampleRate`) hashes the existing `runId`, so a run is all-in or all-out and test fixtures stay stable.
+
+**Tracer bridge — the span hierarchy, completed.** An injected `Dependencies.tracer` now receives the documented `invoke → step → execute_tool` hierarchy driven by the same events (1.5 emitted only flat per-model-call `invoke` spans). Span names and attribute keys are unchanged; a user abort still ends the span without an exception. Agentic loops now produce one `invoke` with children instead of N flat invokes.
+
+**Behavior fix.** A tool-call-first response now clears the TTFT timer (previously only text/reasoning deltas did — a tool-first stream could falsely trip the 60-second ttft timeout) and reports `contentType: 'tool-call'` in `model.first-content`.
+
+**Guarantees.** Observers are isolated and never awaited — a throwing, slow, or closed observer cannot affect a run; with no observer the hot path pays a single boolean branch and draws no ids. `streamChat` stays synchronous and lazy (G2). Exactly one terminal event per execution leg.
+
 ## 1.5.1
 
 **Foundation hardening.** CI now covers Node 22/24 and Windows/Linux, validates documentation, and re-runs the full release gate before a tag-driven provenance publish. Packed exports are loaded through ESM and CommonJS, browser/edge consumer bundles are compiled, public declarations/subpaths are locked, and raw/gzip bundle budgets catch regressions.
