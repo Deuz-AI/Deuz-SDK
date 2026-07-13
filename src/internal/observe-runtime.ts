@@ -99,17 +99,24 @@ const DEFAULT_CAPTURE: Required<ObservationCaptureOptions> = {
   providerMetadata: false,
 };
 
-/** Captured-payload keys and the redactor `field` name each maps to. */
-const CAPTURE_FIELDS: Record<
+/**
+ * Captured-payload keys → the redactor `field` name + the capture flag that
+ * gates them. Single source of truth shared with `composeObservers`' per-sink
+ * projection (src/observe.ts) — never duplicate this table.
+ */
+export const CAPTURE_FIELDS: Record<
   string,
-  Parameters<NonNullable<ObservationOptions['redact']>>[1]['field']
+  {
+    field: Parameters<NonNullable<ObservationOptions['redact']>>[1]['field'];
+    flag: keyof ObservationCaptureOptions;
+  }
 > = {
-  capturedMessages: 'messages',
-  capturedInput: 'tool-input',
-  capturedOutput: 'tool-output',
-  capturedOutputText: 'output',
-  capturedReasoning: 'reasoning',
-  capturedProviderMetadata: 'provider-metadata',
+  capturedMessages: { field: 'messages', flag: 'messages' },
+  capturedInput: { field: 'tool-input', flag: 'toolInputs' },
+  capturedOutput: { field: 'tool-output', flag: 'toolOutputs' },
+  capturedOutputText: { field: 'output', flag: 'outputText' },
+  capturedReasoning: { field: 'reasoning', flag: 'reasoning' },
+  capturedProviderMetadata: { field: 'provider-metadata', flag: 'providerMetadata' },
 };
 
 const TRUNCATED = '[Truncated]';
@@ -431,7 +438,7 @@ export function createObservationRuntime(
     // FINAL BARRIER (a buggy or malicious custom redactor that reintroduces a
     // secret still hits the sweep) → re-bound (custom output may exceed
     // limits; the extra passes run only when a redactor is configured).
-    for (const [key, field] of Object.entries(CAPTURE_FIELDS)) {
+    for (const [key, { field }] of Object.entries(CAPTURE_FIELDS)) {
       if (event[key] === undefined) continue;
       let value = snapshot(redactForObservation(event[key]), state, 0);
       if (options.redact) {
