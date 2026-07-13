@@ -1,0 +1,44 @@
+<svg width="1200" height="300" viewBox="0 0 1200 300" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Deuz SDK — the zero-dependency AI SDK for TypeScript">
+  <defs>
+    <linearGradient id="brand" x1="380" y1="120" x2="820" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="0.5" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="600" cy="0" r="700" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3b82f6" stop-opacity="0.10"/>
+      <stop offset="0.6" stop-color="#3b82f6" stop-opacity="0.03"/>
+      <stop offset="1" stop-color="#3b82f6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1200" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2563eb" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#3b82f6" stop-opacity="0.7"/>
+      <stop offset="1" stop-color="#7c3aed" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="grid" width="36" height="36" patternUnits="userSpaceOnUse">
+      <path d="M36 0H0V36" stroke="#0f172a" stroke-opacity="0.045" fill="none"/>
+    </pattern>
+  </defs>
+
+  <rect x="1" y="1" width="1198" height="298" rx="20" fill="#fbfcfe"/>
+  <rect x="1" y="1" width="1198" height="298" rx="20" fill="url(#grid)"/>
+  <rect x="1" y="1" width="1198" height="298" rx="20" fill="url(#glow)"/>
+  <rect x="1" y="1" width="1198" height="298" rx="20" stroke="#dfe4ec" stroke-width="1.5"/>
+
+  <rect x="80" y="60" width="2.5" height="180" rx="1.25" fill="url(#brand)" opacity="0.9"/>
+
+  <text x="120" y="152" font-family="ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="88" font-weight="800" letter-spacing="-3" fill="#0b1220">Deuz<tspan fill="url(#brand)"> SDK</tspan></text>
+
+  <text x="122" y="204" font-family="ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="27" font-weight="500" letter-spacing="0.2" fill="#5b6472">The zero-dependency AI SDK for TypeScript</text>
+
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="16" font-weight="500">
+    <rect x="812" y="96" width="308" height="34" rx="17" fill="#f2f5fa" stroke="#dfe4ec"/>
+    <text x="966" y="118" text-anchor="middle" fill="#2563eb">npm i @deuz-sdk/core</text>
+    <rect x="812" y="142" width="308" height="34" rx="17" fill="#f2f5fa" stroke="#dfe4ec"/>
+    <text x="966" y="164" text-anchor="middle" fill="#5b6472">0 deps · 2.4 MB · ~50 ms import</text>
+  </g>
+
+  <text x="120" y="253" font-family="ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="16.5" font-weight="500" fill="#7d8694" letter-spacing="0.3">Anthropic&#160;&#160;·&#160;&#160;OpenAI&#160;&#160;·&#160;&#160;Gemini&#160;&#160;·&#160;&#160;Grok&#160;&#160;·&#160;&#160;Vertex&#160;&#160;·&#160;&#160;Yunwu</text>
+
+  <rect x="80" y="276" width="1040" height="1.5" fill="url(#line)" opacity="0.55"/>
+</svg>
