@@ -246,6 +246,16 @@
         "default": "./dist/durable.cjs"
       }
     },
+    "./observe": {
+      "import": {
+        "types": "./dist/observe.d.ts",
+        "default": "./dist/observe.js"
+      },
+      "require": {
+        "types": "./dist/observe.d.cts",
+        "default": "./dist/observe.cjs"
+      }
+    },
     "./edge": {
       "import": {
         "types": "./dist/edge.d.ts",

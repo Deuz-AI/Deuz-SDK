@@ -29,4 +29,14 @@ export type {
 } from './durable';
 export { DeuzError, isDeuzError, NotImplementedError, NoObjectGeneratedError } from './errors';
 export type { DeuzErrorJSON } from './errors';
+// Observation (1.6 additive) — local-first observers, pure aggregation,
+// no ambient time/id/console: edge-safe by construction.
+export {
+  createCallbackObserver,
+  createMemoryObserver,
+  composeObservers,
+  filterObserver,
+  summarizeRun,
+} from './observe';
+export type { MemoryObserver, RunSummary } from './observe';
 export type * from './types';

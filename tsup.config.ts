@@ -24,6 +24,7 @@ export default defineConfig({
     'mcp/index': 'src/mcp/index.ts',
     'mcp/stdio': 'src/mcp/stdio.ts',
     durable: 'src/durable.ts',
+    observe: 'src/observe.ts',
     edge: 'src/edge.ts',
     react: 'src/react.ts',
     ui: 'src/ui.ts',
