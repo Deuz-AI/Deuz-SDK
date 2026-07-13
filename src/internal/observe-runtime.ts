@@ -469,7 +469,10 @@ export function createObservationRuntime(
     }
     const full = {
       schemaVersion: 1,
-      eventId: deps.generateId(),
+      // Derived, not drawn (1.6.1): executionId is already unique per leg, so
+      // `${executionId}:${sequence}` is globally unique, deterministic, and
+      // saves one generateId() per event.
+      eventId: `${executionId}:${sequence}`,
       sequence: sequence++,
       timestamp: deps.clock.now(),
       runId,
