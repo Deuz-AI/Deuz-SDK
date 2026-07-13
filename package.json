@@ -256,6 +256,16 @@
         "default": "./dist/observe.cjs"
       }
     },
+    "./observe/node": {
+      "import": {
+        "types": "./dist/observe/node.d.ts",
+        "default": "./dist/observe/node.js"
+      },
+      "require": {
+        "types": "./dist/observe/node.d.cts",
+        "default": "./dist/observe/node.cjs"
+      }
+    },
     "./edge": {
       "import": {
         "types": "./dist/edge.d.ts",

@@ -15,6 +15,7 @@
     "./middleware",
     "./midjourney",
     "./observe",
+    "./observe/node",
     "./openai",
     "./package.json",
     "./pricing",
