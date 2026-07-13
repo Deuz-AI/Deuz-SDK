@@ -1,4 +1,5 @@
 import type { Usage, FinishReason } from './usage';
+import type { Observer } from './observe';
 
 /**
  * The single injection seam. Everything stateful / side-effecting is injected
@@ -30,6 +31,13 @@ export interface Dependencies {
   onUsage?: (usage: Usage, meta: UsageMeta) => void;
   /** Final-result callback. */
   onFinish?: (meta: FinishMeta) => void;
+  /**
+   * Observation event sink (1.6 additive). When absent (and no tracer is
+   * injected) the observation fast path is fully off: no event objects, no
+   * extra `generateId()` draws. Deliberately NOT in ResolvedDependencies'
+   * Required set — absence IS the fast-path signal.
+   */
+  observer?: Observer;
 }
 
 export interface Clock {

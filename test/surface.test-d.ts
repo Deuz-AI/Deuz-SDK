@@ -141,3 +141,18 @@ import { durationExceeds } from '../src/inference/stop';
 import type { StopCondition } from '../src/index';
 expectTypeOf(durationExceeds).returns.toBeFunction();
 expectTypeOf<Parameters<StopCondition>[0]>().toHaveProperty('elapsedMs');
+
+// --- 1.6.0 additive: observation seam (Observer on Dependencies + event types on root). ---
+// Full protocol pins live in test/observe-surface.test-d.ts; this block locks
+// the root-surface facts: the seam exists, is optional, and stays OUT of the
+// ResolvedDependencies Required set (absence = fast-path-off signal).
+import type { Dependencies, ResolvedDependencies, Observer, ObserveEvent } from '../src/index';
+expectTypeOf<Dependencies>().toHaveProperty('observer');
+expectTypeOf<Dependencies['observer']>().toEqualTypeOf<Observer | undefined>();
+expectTypeOf<ResolvedDependencies['observer']>().toEqualTypeOf<Observer | undefined>();
+expectTypeOf<ObserveEvent['schemaVersion']>().toEqualTypeOf<1>();
+// Tracer surface unchanged (api-contract lock — the 1.6 bridge must not touch it).
+import type { Tracer, Span, SpanOptions } from '../src/index';
+expectTypeOf<Tracer['startSpan']>().toBeFunction();
+expectTypeOf<Span>().toHaveProperty('recordException');
+expectTypeOf<SpanOptions>().toHaveProperty('parent');

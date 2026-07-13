@@ -8,3 +8,4 @@ export type * from './deps';
 export type * from './config';
 export type * from './methods';
 export type * from './session';
+export type * from './observe';
