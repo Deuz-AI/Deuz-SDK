@@ -30,8 +30,14 @@ import {
   durableUsage,
   toApprovalRequests,
   preserveClientContext,
+  beginLoopObserve,
+  endLoopObserve,
+  emitStepStarted,
+  emitStepCompleted,
   SubAgentSuspension,
+  type Denial,
   type ExecuteExtras,
+  type LoopOutcome,
 } from './loop-shared';
 
 /**
@@ -40,6 +46,8 @@ import {
  */
 export interface ToolLoopInternal {
   resumeFrom?: { stepIndex: number; usage: Usage };
+  /** Observation (1.6): resume-leg correlation for run.started. */
+  observeResume?: { stepId: string; stepIndex: number };
 }
 
 /**
@@ -59,11 +67,18 @@ export async function runToolLoop(
   // Loop start timestamp for `durationExceeds` (injected clock — never Date.now).
   const startedAt = deps.clock.now();
   const durable = setupDurable(options, deps, internal?.resumeFrom);
+  // Observation (1.6): the loop owns the run — inner runStream calls emit only
+  // model.* events. `lo` is undefined without an observer (fast path).
+  const lo = beginLoopObserve(deps, options, {
+    operation: 'generate-text',
+    runId: durable?.runId,
+    resumed: internal?.resumeFrom !== undefined,
+    resumeFromStepId: internal?.observeResume?.stepId,
+    resumeFromStepIndex: internal?.observeResume?.stepIndex,
+  });
   // Cross-leg step offset: prepareStep must see the same continuing indices
   // the streaming loop reports on a resume leg (loop-symmetry invariant).
   const stepBase = internal?.resumeFrom?.stepIndex ?? 0;
-  const fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
-  const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
   let messages: Message[] = [...options.messages];
   // Messages this call appends — returned as response.messages. Tracked as a
   // list (not a base-length slice) so prepareStep/compaction history rewrites
@@ -81,6 +96,19 @@ export async function runToolLoop(
   let lastStep: OneStep | undefined;
   let pendingApprovals: ToolApprovalRequest[] | undefined;
   let stoppedBy: string | undefined;
+  let endReason: LoopOutcome['endReason'] = 'natural';
+  let suspend: LoopOutcome['suspend'] | undefined;
+
+  // Mutated per iteration so tool events parent under the current step span;
+  // settle-phase executions run step-less under the run span.
+  const observeCtx = lo
+    ? {
+        rt: lo.rt,
+        parentSpanId: lo.runSpanId as string | undefined,
+        stepIndex: undefined as number | undefined,
+        counters: errorCounters,
+      }
+    : undefined;
 
   const extras: ExecuteExtras = {
     // Inject the EFFECTIVE onUsage (call-level wins over deps-level, G10) so a
@@ -94,6 +122,7 @@ export async function runToolLoop(
     // its suspended approvals on a resume leg.
     ...(durable ? { session: { store: durable.store, runId: durable.runId } } : {}),
     ...(options.approvalResponses ? { approvalResponses: options.approvalResponses } : {}),
+    ...(observeCtx ? { observe: observeCtx } : {}),
   };
 
   const finish = (): GenerateTextResult => {
@@ -113,139 +142,51 @@ export async function runToolLoop(
     };
   };
 
-  // Resume: settle the previous break's pending approvals BEFORE the first
-  // model call — the new tool message flows into response.messages. A durable
-  // sub-agent that re-suspends here suspends THIS run again immediately.
-  try {
-    const settled = await settlePendingApprovals(messages, tools, options, extras);
-    if (settled) {
-      messages = settled.messages;
-      appended.push(settled.messages.at(-1)!);
-      bumpErrorGuard(
-        errorCounters,
-        settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
-      );
-    }
-  } catch (err) {
-    if (!(err instanceof SubAgentSuspension)) throw err;
-    pendingApprovals = err.approvals;
-    if (durable) {
-      await saveCheckpoint(
-        durable,
-        deps,
-        options,
-        'suspended',
-        messages,
-        totalUsage,
-        err.approvals,
-      );
+  /** Terminal observe event + result — the single exit for every path. */
+  const done = (): GenerateTextResult => {
+    if (lo) {
+      endLoopObserve(lo, deps, options, {
+        finishReason: lastStep?.finishReason ?? 'stop',
+        endReason,
+        stoppedBy,
+        stepCount: steps.length,
+        usage: withTotal(totalUsage),
+        ...(durable ? { cumulativeUsage: withTotal(durableUsage(durable, totalUsage)) } : {}),
+        suspend,
+      });
     }
     return finish();
-  }
+  };
 
-  for (;;) {
-    // Compaction first, so prepareStep sees (and has the last word on) the
-    // compacted history.
-    if (compactionRunner) {
-      messages = await runCompaction(
-        compactionRunner,
-        options,
-        deps,
-        messages,
-        (u) => {
-          totalUsage = sumUsage(totalUsage, u);
-        },
-        (e) => deps.logger.info(`compaction: ${e.layer} ${e.tokensBefore}->${e.tokensAfter}`),
-      );
-    }
-    const prepared = await applyPrepareStep(
-      options,
-      { stepIndex: stepBase + steps.length, messages, usage: durableUsage(durable, totalUsage) },
-      fullWire,
-      staticWire,
-      deps.logger,
-    );
-    messages = prepared.messages;
-    const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
-    const step = await runOneStep(
-      preserveClientContext(options, { ...prepared.options, messages }),
-      { tools: prepared.wire },
-    );
-    lastStep = step;
-    totalUsage = sumUsage(totalUsage, step.usage);
-    calibrateCompaction(compactionRunner, estimatedAtCall, step.usage);
+  /** Checkpoint correlation for run.suspended (stepIndex bumped inside saveCheckpoint). */
+  const checkpointRef = (): { checkpointStepId?: string; checkpointStepIndex?: number } =>
+    durable
+      ? {
+          checkpointStepId: `${durable.runId}#${durable.stepIndex}`,
+          checkpointStepIndex: durable.stepIndex,
+        }
+      : {};
 
-    // *** GEMINI GUARD: continue on tool_use parts, NOT finishReason ***
-    if (step.toolUseParts.length === 0) {
-      steps.push(toStepResult(step, [], [], steps.length));
-      if (durable) {
-        // The final assistant turn belongs in the completed snapshot even
-        // though the loop never rebased `messages` on it.
-        await saveCheckpoint(
-          durable,
-          deps,
-          options,
-          'completed',
-          [...messages, step.assistantMessage],
-          totalUsage,
-        );
-      }
-      break;
-    }
+  try {
+    const fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+    const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
 
-    const toolCalls: ToolCall[] = step.toolUseParts.map((p) => ({
-      toolCallId: p.id,
-      toolName: p.name,
-      args: p.input,
-    }));
-    messages = [...messages, step.assistantMessage]; // assistant FIRST (OpenAI ordering)
-    appended.push(step.assistantMessage);
-
-    // Approval gate: server mode denies inline; without approveToolCall the
-    // gated calls break the loop like client tools (client mode).
-    const gated = await findApprovalNeeded(toolCalls, tools, options, messages);
-    const denied = options.approveToolCall
-      ? await resolveServerApprovals(gated, toolCalls, options, messages)
-      : new Map<string, string | undefined>();
-    const pendingApproval = options.approveToolCall
-      ? []
-      : toolCalls.filter((c) => gated.has(c.toolCallId));
-
-    // Pending approvals and client tools (no execute) can't be auto-continued —
-    // ONE break, executing nothing from the batch; the resume settles the rest.
-    if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
-      if (pendingApproval.length > 0) {
-        pendingApprovals = toApprovalRequests(pendingApproval, options.agentPath);
-      }
-      const sr = toStepResult(step, toolCalls, [], steps.length);
-      steps.push(sr);
-      options.onStepFinish?.(sr);
-      if (durable) {
-        await saveCheckpoint(
-          durable,
-          deps,
-          options,
-          'suspended',
-          messages,
-          totalUsage,
-          pendingApprovals,
-        );
-      }
-      break;
-    }
-
-    let toolResults;
+    // Resume: settle the previous break's pending approvals BEFORE the first
+    // model call — the new tool message flows into response.messages. A durable
+    // sub-agent that re-suspends here suspends THIS run again immediately.
     try {
-      toolResults = await executeTools(toolCalls, tools, options, messages, denied, extras);
+      const settled = await settlePendingApprovals(messages, tools, options, extras);
+      if (settled) {
+        messages = settled.messages;
+        appended.push(settled.messages.at(-1)!);
+        bumpErrorGuard(
+          errorCounters,
+          settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
+        );
+      }
     } catch (err) {
       if (!(err instanceof SubAgentSuspension)) throw err;
-      // A durable sub-agent suspended: no tool message is appended — its
-      // tool_use stays unanswered and the resume leg's settle re-executes it,
-      // which resumes the child checkpoint.
       pendingApprovals = err.approvals;
-      const sr = toStepResult(step, toolCalls, [], steps.length);
-      steps.push(sr);
-      options.onStepFinish?.(sr);
       if (durable) {
         await saveCheckpoint(
           durable,
@@ -257,49 +198,270 @@ export async function runToolLoop(
           err.approvals,
         );
       }
-      break;
+      suspend = {
+        reason: 'sub-agent-approval',
+        pendingApprovalCount: err.approvals.length,
+        pendingToolCount: 0,
+        ...checkpointRef(),
+      };
+      return done();
     }
-    const toolResultMessage: Message = { role: 'tool', content: toolResults.map(toToolResultPart) };
-    messages = [...messages, toolResultMessage]; // EVERY tool_use answered (Anthropic 400 guard)
-    appended.push(toolResultMessage);
 
-    const sr = toStepResult(step, toolCalls, toolResults, steps.length, toolResultMessage);
-    steps.push(sr);
-    options.onStepFinish?.(sr);
+    for (;;) {
+      const stepIndex = stepBase + steps.length;
+      const stepSpan = lo?.rt.startSpan();
+      // Compaction first, so prepareStep sees (and has the last word on) the
+      // compacted history.
+      if (compactionRunner) {
+        messages = await runCompaction(
+          compactionRunner,
+          options,
+          deps,
+          messages,
+          (u) => {
+            totalUsage = sumUsage(totalUsage, u);
+          },
+          (e) => deps.logger.info(`compaction: ${e.layer} ${e.tokensBefore}->${e.tokensAfter}`),
+        );
+      }
+      const prepared = await applyPrepareStep(
+        options,
+        { stepIndex, messages, usage: durableUsage(durable, totalUsage) },
+        fullWire,
+        staticWire,
+        deps.logger,
+      );
+      messages = prepared.messages;
+      const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
+      if (lo && stepSpan) {
+        observeCtx!.parentSpanId = stepSpan.spanId;
+        observeCtx!.stepIndex = stepIndex;
+        emitStepStarted(
+          lo,
+          options,
+          stepSpan,
+          stepIndex,
+          prepared.options.model.modelId,
+          messages.length,
+          compactionRunner ? estimatedAtCall : undefined,
+          prepared.wire.tools.length,
+          durableUsage(durable, totalUsage),
+        );
+      }
+      const step = await runOneStep(
+        preserveClientContext(options, { ...prepared.options, messages }),
+        {
+          tools: prepared.wire,
+          ...(lo && stepSpan
+            ? { observe: { runtime: lo.rt, parentSpanId: stepSpan.spanId, stepIndex } }
+            : {}),
+        },
+      );
+      lastStep = step;
+      totalUsage = sumUsage(totalUsage, step.usage);
+      calibrateCompaction(compactionRunner, estimatedAtCall, step.usage);
 
-    // Denials are deliberate, not tool failures — exclude from the runaway guard.
-    if (
-      bumpErrorGuard(
-        errorCounters,
-        toolResults.filter((r) => !denied.has(r.toolCallId)),
-      )
-    ) {
-      if (durable) {
-        await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+      // *** GEMINI GUARD: continue on tool_use parts, NOT finishReason ***
+      if (step.toolUseParts.length === 0) {
+        const sr = toStepResult(step, [], [], steps.length);
+        steps.push(sr);
+        if (lo && stepSpan) {
+          emitStepCompleted(
+            lo,
+            options,
+            stepSpan,
+            stepIndex,
+            sr,
+            undefined,
+            durableUsage(durable, totalUsage),
+          );
+        }
+        if (durable) {
+          // The final assistant turn belongs in the completed snapshot even
+          // though the loop never rebased `messages` on it.
+          await saveCheckpoint(
+            durable,
+            deps,
+            options,
+            'completed',
+            [...messages, step.assistantMessage],
+            totalUsage,
+          );
+        }
+        break;
       }
-      break;
-    }
-    const runUsage = durableUsage(durable, totalUsage);
-    const costUSD =
-      wantCost && deps.priceProvider
-        ? ((await deps.priceProvider.priceUsage(options.model.modelId, runUsage)) ?? undefined)
-        : undefined;
-    const stop = await shouldStop(stopConditions, steps, {
-      usage: runUsage,
-      costUSD,
-      elapsedMs: deps.clock.now() - startedAt,
-    });
-    if (stop.stop) {
-      stoppedBy = stop.stoppedBy;
-      if (durable) {
-        await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+
+      const toolCalls: ToolCall[] = step.toolUseParts.map((p) => ({
+        toolCallId: p.id,
+        toolName: p.name,
+        args: p.input,
+      }));
+      messages = [...messages, step.assistantMessage]; // assistant FIRST (OpenAI ordering)
+      appended.push(step.assistantMessage);
+
+      // Approval gate: server mode denies inline; without approveToolCall the
+      // gated calls break the loop like client tools (client mode).
+      const gated = await findApprovalNeeded(toolCalls, tools, options, messages);
+      const denied = options.approveToolCall
+        ? await resolveServerApprovals(gated, toolCalls, options, messages)
+        : new Map<string, Denial>();
+      const pendingApproval = options.approveToolCall
+        ? []
+        : toolCalls.filter((c) => gated.has(c.toolCallId));
+
+      // Pending approvals and client tools (no execute) can't be auto-continued —
+      // ONE break, executing nothing from the batch; the resume settles the rest.
+      if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
+        if (pendingApproval.length > 0) {
+          pendingApprovals = toApprovalRequests(pendingApproval, options.agentPath);
+        }
+        const sr = toStepResult(step, toolCalls, [], steps.length);
+        steps.push(sr);
+        options.onStepFinish?.(sr);
+        if (lo && stepSpan) {
+          emitStepCompleted(
+            lo,
+            options,
+            stepSpan,
+            stepIndex,
+            sr,
+            denied,
+            durableUsage(durable, totalUsage),
+          );
+        }
+        if (durable) {
+          await saveCheckpoint(
+            durable,
+            deps,
+            options,
+            'suspended',
+            messages,
+            totalUsage,
+            pendingApprovals,
+          );
+        }
+        suspend = {
+          reason: pendingApproval.length > 0 ? 'approval' : 'client-tool',
+          pendingApprovalCount: pendingApprovals?.length ?? 0,
+          pendingToolCount: toolCalls.filter(
+            (c) => !tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider',
+          ).length,
+          ...checkpointRef(),
+        };
+        break;
       }
-      break;
+
+      let toolResults;
+      try {
+        toolResults = await executeTools(toolCalls, tools, options, messages, denied, extras);
+      } catch (err) {
+        if (!(err instanceof SubAgentSuspension)) throw err;
+        // A durable sub-agent suspended: no tool message is appended — its
+        // tool_use stays unanswered and the resume leg's settle re-executes it,
+        // which resumes the child checkpoint.
+        pendingApprovals = err.approvals;
+        const sr = toStepResult(step, toolCalls, [], steps.length);
+        steps.push(sr);
+        options.onStepFinish?.(sr);
+        if (lo && stepSpan) {
+          emitStepCompleted(
+            lo,
+            options,
+            stepSpan,
+            stepIndex,
+            sr,
+            denied,
+            durableUsage(durable, totalUsage),
+          );
+        }
+        if (durable) {
+          await saveCheckpoint(
+            durable,
+            deps,
+            options,
+            'suspended',
+            messages,
+            totalUsage,
+            err.approvals,
+          );
+        }
+        suspend = {
+          reason: 'sub-agent-approval',
+          pendingApprovalCount: err.approvals.length,
+          pendingToolCount: 0,
+          ...checkpointRef(),
+        };
+        break;
+      }
+      const toolResultMessage: Message = {
+        role: 'tool',
+        content: toolResults.map(toToolResultPart),
+      };
+      messages = [...messages, toolResultMessage]; // EVERY tool_use answered (Anthropic 400 guard)
+      appended.push(toolResultMessage);
+
+      const sr = toStepResult(step, toolCalls, toolResults, steps.length, toolResultMessage);
+      steps.push(sr);
+      options.onStepFinish?.(sr);
+      if (lo && stepSpan) {
+        emitStepCompleted(
+          lo,
+          options,
+          stepSpan,
+          stepIndex,
+          sr,
+          denied,
+          durableUsage(durable, totalUsage),
+        );
+      }
+
+      // Denials are deliberate, not tool failures — exclude from the runaway guard.
+      if (
+        bumpErrorGuard(
+          errorCounters,
+          toolResults.filter((r) => !denied.has(r.toolCallId)),
+        )
+      ) {
+        endReason = 'runaway-tool-errors';
+        if (durable) {
+          await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+        }
+        break;
+      }
+      const runUsage = durableUsage(durable, totalUsage);
+      const costUSD =
+        wantCost && deps.priceProvider
+          ? ((await deps.priceProvider.priceUsage(options.model.modelId, runUsage)) ?? undefined)
+          : undefined;
+      const stop = await shouldStop(stopConditions, steps, {
+        usage: runUsage,
+        costUSD,
+        elapsedMs: deps.clock.now() - startedAt,
+      });
+      if (stop.stop) {
+        stoppedBy = stop.stoppedBy;
+        endReason = stop.stoppedBy !== undefined ? 'stop-condition' : 'max-steps';
+        if (durable) {
+          await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+        }
+        break;
+      }
+      if (durable) {
+        await saveCheckpoint(durable, deps, options, 'running', messages, totalUsage);
+      }
     }
-    if (durable) {
-      await saveCheckpoint(durable, deps, options, 'running', messages, totalUsage);
+
+    return done();
+  } catch (err) {
+    if (lo) {
+      endLoopObserve(lo, deps, options, {
+        finishReason: 'error',
+        endReason,
+        stepCount: steps.length,
+        usage: withTotal(totalUsage),
+        error: err,
+      });
     }
+    throw err;
   }
-
-  return finish();
 }

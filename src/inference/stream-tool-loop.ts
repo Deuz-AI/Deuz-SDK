@@ -32,9 +32,15 @@ import {
   durableUsage,
   toApprovalRequests,
   preserveClientContext,
+  beginLoopObserve,
+  endLoopObserve,
+  emitStepStarted,
+  emitStepCompleted,
   SubAgentSuspension,
+  type Denial,
   type DurableRunner,
   type ExecuteExtras,
+  type LoopOutcome,
 } from './loop-shared';
 
 async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<string> {
@@ -57,6 +63,8 @@ export interface StreamToolLoopInternal {
     messages: Message[];
     resumeFrom: { stepIndex: number; usage: Usage };
   }>;
+  /** Observation (1.6): resume-leg correlation for run.started. */
+  observeResume?: { stepId: string; stepIndex: number };
 }
 
 /**
@@ -116,6 +124,16 @@ export function runStreamToolLoop(
             stepIndex: resumeFrom?.stepIndex ?? 0,
           }
         : undefined;
+    // Observation (1.6): the loop owns the run — inner runStream calls emit
+    // only model.* events. Emitted AFTER resumeLoad (checkpoint.loaded first
+    // on resume legs); undefined without an observer (fast path).
+    const lo = beginLoopObserve(deps, options, {
+      operation: 'stream-chat',
+      runId,
+      resumed: internal?.resumeFrom !== undefined || internal?.resumeLoad !== undefined,
+      resumeFromStepId: internal?.observeResume?.stepId,
+      resumeFromStepIndex: internal?.observeResume?.stepIndex,
+    });
     const steps: StepResult[] = [];
     const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
     const wantCost = needsCost(stopConditions);
@@ -128,6 +146,42 @@ export function runStreamToolLoop(
     let lastFinish: FinishReason = 'stop';
     let stoppedBy: string | undefined;
     let stepIndex = resumeFrom?.stepIndex ?? 0;
+    let endReason: LoopOutcome['endReason'] = 'natural';
+    let suspend: LoopOutcome['suspend'] | undefined;
+
+    // Mutated per iteration so tool events parent under the current step span;
+    // settle-phase executions run step-less under the run span.
+    const observeCtx = lo
+      ? {
+          rt: lo.rt,
+          parentSpanId: lo.runSpanId as string | undefined,
+          stepIndex: undefined as number | undefined,
+          counters: errorCounters,
+        }
+      : undefined;
+
+    /** Checkpoint correlation for run.suspended (stepIndex bumped inside saveCheckpoint). */
+    const checkpointRef = (): { checkpointStepId?: string; checkpointStepIndex?: number } =>
+      durable
+        ? {
+            checkpointStepId: `${durable.runId}#${durable.stepIndex}`,
+            checkpointStepIndex: durable.stepIndex,
+          }
+        : {};
+
+    /** Terminal observe event — exactly one per leg (guarded by the runtime too). */
+    const observeEnd = (): void => {
+      if (!lo) return;
+      endLoopObserve(lo, deps, options, {
+        finishReason: lastFinish,
+        endReason,
+        stoppedBy,
+        stepCount: steps.length,
+        usage: withTotal(totalUsage),
+        ...(durable ? { cumulativeUsage: withTotal(durableUsage(durable, totalUsage)) } : {}),
+        suspend,
+      });
+    };
 
     const extras: ExecuteExtras = {
       // Effective onUsage (call-level wins, G10) so a sub-agent's usage
@@ -141,6 +195,7 @@ export function runStreamToolLoop(
       // Durable seam (1.5): child checkpoints + suspended-approval settlement.
       ...(durable ? { session: { store: durable.store, runId: durable.runId } } : {}),
       ...(options.approvalResponses ? { approvalResponses: options.approvalResponses } : {}),
+      ...(observeCtx ? { observe: observeCtx } : {}),
     };
 
     const emitApprovalRequests = (requests: ToolApprovalRequest[]): void => {
@@ -195,17 +250,25 @@ export function runStreamToolLoop(
             err.approvals,
           );
         }
+        suspend = {
+          reason: 'sub-agent-approval',
+          pendingApprovalCount: err.approvals.length,
+          pendingToolCount: 0,
+          ...checkpointRef(),
+        };
         const usage = withTotal(totalUsage);
         broadcaster.push({ type: 'finish', usage, finishReason: lastFinish });
         usageDeferred.resolve(usage);
         finishDeferred.resolve(lastFinish);
         fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
+        observeEnd();
         broadcaster.close();
         return;
       }
 
       for (;;) {
         broadcaster.push({ type: 'step-start', stepIndex });
+        const stepSpan = lo?.rt.startSpan();
         // Compaction first — its parts precede the step's deltas; prepareStep
         // then sees the compacted history.
         if (compactionRunner) {
@@ -235,8 +298,26 @@ export function runStreamToolLoop(
         );
         messages = prepared.messages;
         const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
+        if (lo && stepSpan) {
+          observeCtx!.parentSpanId = stepSpan.spanId;
+          observeCtx!.stepIndex = stepIndex;
+          emitStepStarted(
+            lo,
+            options,
+            stepSpan,
+            stepIndex,
+            prepared.options.model.modelId,
+            messages.length,
+            compactionRunner ? estimatedAtCall : undefined,
+            prepared.wire.tools.length,
+            durableUsage(durable, totalUsage),
+          );
+        }
         const inner = runStream(preserveClientContext(options, { ...prepared.options, messages }), {
           tools: prepared.wire,
+          ...(lo && stepSpan
+            ? { observe: { runtime: lo.rt, parentSpanId: stepSpan.spanId, stepIndex } }
+            : {}),
         });
 
         let text = '';
@@ -287,9 +368,20 @@ export function runStreamToolLoop(
               stepPhase = (part.providerMetadata?.openai as { phase?: string } | undefined)?.phase;
               break; // re-framed as step-finish below
             case 'error':
+              // The inner pump already emitted model.failed — the loop reports
+              // the run failure exactly once here.
               broadcaster.push(part);
               usageDeferred.reject(part.error);
               finishDeferred.reject(part.error);
+              if (lo) {
+                endLoopObserve(lo, deps, options, {
+                  finishReason: 'error',
+                  endReason,
+                  stepCount: steps.length,
+                  usage: withTotal(totalUsage),
+                  error: part.error,
+                });
+              }
               broadcaster.close();
               return;
             default:
@@ -317,30 +409,50 @@ export function runStreamToolLoop(
         );
         if (stepPhase) assistantMessage.providerMetadata = { openai: { phase: stepPhase } };
 
+        const stepData = {
+          text,
+          reasoningText,
+          toolUseParts,
+          usage: stepUsage,
+          finishReason: stepFinish,
+          assistantMessage,
+        };
+
         if (options.signal?.aborted) {
           // No checkpoint here: the abort cut mid-step, and a checkpoint is
-          // only honest at a completed boundary.
+          // only honest at a completed boundary. The cut step still gets a
+          // step.completed (finishReason 'aborted') — unlike onStepFinish,
+          // observation covers every step.
           lastFinish = 'aborted';
+          if (lo && stepSpan) {
+            emitStepCompleted(
+              lo,
+              options,
+              stepSpan,
+              stepIndex,
+              toStepResult({ ...stepData, finishReason: 'aborted' }, [], [], steps.length),
+              undefined,
+              durableUsage(durable, totalUsage),
+            );
+          }
           break;
         }
 
         // *** GEMINI GUARD: continue on tool_use parts, NOT finishReason ***
         if (toolUseParts.length === 0) {
-          steps.push(
-            toStepResult(
-              {
-                text,
-                reasoningText,
-                toolUseParts,
-                usage: stepUsage,
-                finishReason: stepFinish,
-                assistantMessage,
-              },
-              [],
-              [],
-              steps.length,
-            ),
-          );
+          const sr = toStepResult(stepData, [], [], steps.length);
+          steps.push(sr);
+          if (lo && stepSpan) {
+            emitStepCompleted(
+              lo,
+              options,
+              stepSpan,
+              stepIndex,
+              sr,
+              undefined,
+              durableUsage(durable, totalUsage),
+            );
+          }
           if (durable) {
             await saveCheckpoint(
               durable,
@@ -374,19 +486,11 @@ export function runStreamToolLoop(
         const gated = await findApprovalNeeded(toolCalls, tools, options, messages);
         const denied = options.approveToolCall
           ? await resolveServerApprovals(gated, toolCalls, options, messages)
-          : new Map<string, string | undefined>();
+          : new Map<string, Denial>();
         const pendingApproval = options.approveToolCall
           ? []
           : toolCalls.filter((c) => gated.has(c.toolCallId));
 
-        const stepData = {
-          text,
-          reasoningText,
-          toolUseParts,
-          usage: stepUsage,
-          finishReason: stepFinish,
-          assistantMessage,
-        };
         // Pending approvals and client tools break together: ONE break, nothing
         // from the batch executes; the resume call settles the deferred rest.
         if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
@@ -395,6 +499,17 @@ export function runStreamToolLoop(
           const sr = toStepResult(stepData, toolCalls, [], steps.length);
           steps.push(sr);
           options.onStepFinish?.(sr);
+          if (lo && stepSpan) {
+            emitStepCompleted(
+              lo,
+              options,
+              stepSpan,
+              stepIndex,
+              sr,
+              denied,
+              durableUsage(durable, totalUsage),
+            );
+          }
           if (durable) {
             await saveCheckpoint(
               durable,
@@ -406,6 +521,14 @@ export function runStreamToolLoop(
               requests,
             );
           }
+          suspend = {
+            reason: pendingApproval.length > 0 ? 'approval' : 'client-tool',
+            pendingApprovalCount: requests.length,
+            pendingToolCount: toolCalls.filter(
+              (c) => !tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider',
+            ).length,
+            ...checkpointRef(),
+          };
           break;
         }
 
@@ -420,6 +543,17 @@ export function runStreamToolLoop(
           const sr = toStepResult(stepData, toolCalls, [], steps.length);
           steps.push(sr);
           options.onStepFinish?.(sr);
+          if (lo && stepSpan) {
+            emitStepCompleted(
+              lo,
+              options,
+              stepSpan,
+              stepIndex,
+              sr,
+              denied,
+              durableUsage(durable, totalUsage),
+            );
+          }
           if (durable) {
             await saveCheckpoint(
               durable,
@@ -431,6 +565,12 @@ export function runStreamToolLoop(
               err.approvals,
             );
           }
+          suspend = {
+            reason: 'sub-agent-approval',
+            pendingApprovalCount: err.approvals.length,
+            pendingToolCount: 0,
+            ...checkpointRef(),
+          };
           break;
         }
         for (const r of toolResults) {
@@ -451,6 +591,17 @@ export function runStreamToolLoop(
         const sr = toStepResult(stepData, toolCalls, toolResults, steps.length, toolResultMessage);
         steps.push(sr);
         options.onStepFinish?.(sr);
+        if (lo && stepSpan) {
+          emitStepCompleted(
+            lo,
+            options,
+            stepSpan,
+            stepIndex,
+            sr,
+            denied,
+            durableUsage(durable, totalUsage),
+          );
+        }
 
         // Denials are deliberate, not tool failures — exclude from the runaway guard.
         if (
@@ -459,6 +610,7 @@ export function runStreamToolLoop(
             toolResults.filter((r) => !denied.has(r.toolCallId)),
           )
         ) {
+          endReason = 'runaway-tool-errors';
           if (durable) {
             await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
           }
@@ -476,6 +628,7 @@ export function runStreamToolLoop(
         });
         if (stop.stop) {
           stoppedBy = stop.stoppedBy;
+          endReason = stop.stoppedBy !== undefined ? 'stop-condition' : 'max-steps';
           if (durable) {
             await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
           }
@@ -497,11 +650,21 @@ export function runStreamToolLoop(
       usageDeferred.resolve(usage);
       finishDeferred.resolve(lastFinish);
       fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
+      observeEnd();
       broadcaster.close();
     } catch (err) {
       broadcaster.push({ type: 'error', error: err });
       usageDeferred.reject(err);
       finishDeferred.reject(err);
+      if (lo) {
+        endLoopObserve(lo, deps, options, {
+          finishReason: 'error',
+          endReason,
+          stepCount: steps.length,
+          usage: withTotal(totalUsage),
+          error: err,
+        });
+      }
       broadcaster.close();
     }
   }

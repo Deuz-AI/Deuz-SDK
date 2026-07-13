@@ -34,6 +34,14 @@ import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
 import { openSpan, type ExecTrace } from '../internal/trace';
 import { ToolExecutionError } from '../errors';
+import {
+  createObservationRuntime,
+  observeCost,
+  counterFields,
+  type ObservationRuntime,
+} from '../internal/observe-runtime';
+import { toObservedError } from '../internal/observe-error';
+import type { ToolCompletedEvent, ToolDeniedEvent } from '../types/observe';
 
 export const MAX_SAME_TOOL_ERRORS = 3;
 
@@ -51,6 +59,17 @@ export function preserveClientContext<O extends object>(source: object, cloned: 
 
 /** Denial message fed back to the model as an is_error tool_result. */
 export const TOOL_DENIED = 'Tool call denied.';
+
+/**
+ * A denial verdict for one tool call. `reason` is the free-text fed back to
+ * the model (unchanged strings); `cause` is the machine-readable origin for
+ * tool.denied observe events — it cannot be parsed from the strings.
+ */
+export interface Denial {
+  cause: ToolDeniedEvent['cause'];
+  reason?: string;
+}
+export type DenialMap = Map<string, Denial>;
 
 /**
  * Control-flow signal (1.5): a durable sub-agent (`agentTool`) hit a
@@ -199,8 +218,8 @@ export async function resolveServerApprovals(
   toolCalls: ToolCall[],
   options: CommonCallOptions,
   messages: Message[],
-): Promise<Map<string, string | undefined>> {
-  const denied = new Map<string, string | undefined>();
+): Promise<DenialMap> {
+  const denied: DenialMap = new Map();
   const approve = options.approveToolCall;
   if (!approve || gated.size === 0) return denied;
   await Promise.all(
@@ -213,7 +232,7 @@ export async function resolveServerApprovals(
         } catch {
           ok = false;
         }
-        if (!ok) denied.set(c.toolCallId, undefined);
+        if (!ok) denied.set(c.toolCallId, { cause: 'server-denied' });
       }),
   );
   return denied;
@@ -522,15 +541,20 @@ export async function settlePendingApprovals(
   const noVerdict = calls.filter((c) => !byId.has(c.toolCallId));
   const gated = await findApprovalNeeded(noVerdict, tools, options, messages);
 
-  const denied = new Map<string, string | undefined>();
+  const denied: DenialMap = new Map();
   for (const c of calls) {
     const verdict = byId.get(c.toolCallId);
     if (verdict) {
-      if (!verdict.approved) denied.set(c.toolCallId, verdict.reason);
+      if (!verdict.approved) {
+        denied.set(c.toolCallId, { cause: 'response-denied', reason: verdict.reason });
+      }
     } else if (!tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider') {
-      denied.set(c.toolCallId, 'No result provided for this client tool.');
+      denied.set(c.toolCallId, {
+        cause: 'client-tool-no-result',
+        reason: 'No result provided for this client tool.',
+      });
     } else if (gated.has(c.toolCallId)) {
-      denied.set(c.toolCallId, 'No approval response.');
+      denied.set(c.toolCallId, { cause: 'no-response', reason: 'No approval response.' });
     }
   }
 
@@ -552,6 +576,29 @@ export interface ExecuteExtras {
   reportUsage?: (usage: Usage) => void;
   session?: { store: SessionStore; runId: string };
   approvalResponses?: ToolApprovalResponse[];
+  /**
+   * Observation (1.6): loop-owned correlation for tool events. The loop
+   * MUTATES parentSpanId/stepIndex per iteration (settle-phase executions run
+   * step-less under the run span). `counters` is the loop's same-tool error
+   * map — read for consecutiveFailureCount (approximate within one parallel
+   * batch; exact across steps).
+   */
+  observe?: {
+    rt: ObservationRuntime;
+    parentSpanId?: string;
+    stepIndex?: number;
+    counters?: Map<string, number>;
+  };
+}
+
+/** JSON-ish runtime type label for tool.completed. */
+function outputTypeOf(value: unknown): ToolCompletedEvent['outputType'] {
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
+  if (Array.isArray(value)) return 'array';
+  const t = typeof value;
+  if (t === 'string' || t === 'number' || t === 'boolean') return t;
+  return 'object';
 }
 
 /**
@@ -567,11 +614,12 @@ export async function executeTools(
   tools: ToolSet,
   options: CommonCallOptions,
   messages: Message[],
-  denied?: Map<string, string | undefined>,
+  denied?: DenialMap,
   extras?: ExecuteExtras,
   trace?: ExecTrace,
 ): Promise<ToolResult[]> {
   const cap = options.maxToolConcurrency ?? 5;
+  const parallel = toolCalls.length > 1;
   return mapWithConcurrency(toolCalls, cap, async (call): Promise<ToolResult> => {
     const span = trace
       ? openSpan(
@@ -581,6 +629,46 @@ export async function executeTools(
           trace.parent,
         )
       : undefined;
+    const tool: Tool | undefined = tools[call.toolName];
+
+    // Observation (1.6): one tool span per call, emitted INSIDE the worker so
+    // parallel events interleave in real completion order. Provider tools
+    // never reach here — they emit no tool events by design.
+    const ob = extras?.observe;
+    const obSpan = ob?.rt.startSpan();
+    const obBase = ob
+      ? {
+          spanId: obSpan!.spanId,
+          parentSpanId: ob.parentSpanId,
+          stepIndex: ob.stepIndex,
+          agentPath: options.agentPath,
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+        }
+      : undefined;
+    if (ob) {
+      ob.rt.emit({
+        type: 'tool.started',
+        ...obBase!,
+        needsApproval: tool?.needsApproval !== undefined && tool.needsApproval !== false,
+        executionMode: tool?.execute ? 'server' : 'client',
+        parallel,
+        ...(ob.rt.capture.toolInputs ? { capturedInput: call.args } : {}),
+      });
+    }
+    /** tool.failed with the ORIGINAL cause — nothing downstream retains it. */
+    const emitToolFailed = (cause: unknown, selfHealed: boolean): void => {
+      if (!ob) return;
+      ob.rt.emit({
+        type: 'tool.failed',
+        ...obBase!,
+        durationMs: ob.rt.durationSince(obSpan!.startedAt),
+        selfHealed,
+        consecutiveFailureCount: (ob.counters?.get(call.toolName) ?? 0) + 1,
+        error: toObservedError(cause, ob.rt.capture.errorMessages),
+      });
+    };
+
     const settle = (result: ToolResult): ToolResult => {
       span?.setAttribute('deuz.tool.is_error', result.isError === true);
       span?.end();
@@ -588,16 +676,24 @@ export async function executeTools(
     };
     try {
       if (denied?.has(call.toolCallId)) {
-        const reason = denied.get(call.toolCallId);
+        const denial = denied.get(call.toolCallId)!;
+        if (ob) {
+          ob.rt.emit({
+            type: 'tool.denied',
+            ...obBase!,
+            cause: denial.cause,
+            ...(denial.reason ? { reason: denial.reason } : {}),
+          });
+        }
         return settle({
           toolCallId: call.toolCallId,
           toolName: call.toolName,
-          result: reason ? `${TOOL_DENIED} Reason: ${reason}` : TOOL_DENIED,
+          result: denial.reason ? `${TOOL_DENIED} Reason: ${denial.reason}` : TOOL_DENIED,
           isError: true,
         });
       }
-      const tool: Tool | undefined = tools[call.toolName];
       if (!tool?.execute) {
+        emitToolFailed(new Error('No server-side executor.'), true);
         return settle({
           toolCallId: call.toolCallId,
           toolName: call.toolName,
@@ -607,6 +703,7 @@ export async function executeTools(
       }
       const validation = await validateOutput(tool.parameters, call.args);
       if (!validation.ok) {
+        emitToolFailed(new Error(`Invalid arguments: ${validation.issues}`), true);
         return settle({
           toolCallId: call.toolCallId,
           toolName: call.toolName,
@@ -628,6 +725,16 @@ export async function executeTools(
           ...(extras?.approvalResponses ? { approvalResponses: extras.approvalResponses } : {}),
         };
         const out = await tool.execute(validation.value, ctx);
+        if (ob) {
+          ob.rt.emit({
+            type: 'tool.completed',
+            ...obBase!,
+            durationMs: ob.rt.durationSince(obSpan!.startedAt),
+            outputType: outputTypeOf(out),
+            ...(typeof out === 'string' ? { outputSize: out.length } : {}),
+            ...(ob.rt.capture.toolOutputs ? { capturedOutput: out } : {}),
+          });
+        }
         return settle({ toolCallId: call.toolCallId, toolName: call.toolName, result: out });
       } catch (cause) {
         // A durable sub-agent suspension is control flow, not a tool failure —
@@ -635,6 +742,7 @@ export async function executeTools(
         if (cause instanceof SubAgentSuspension) throw cause;
         // The span records the ORIGINAL throw; the loop still self-heals below.
         span?.recordException(cause);
+        emitToolFailed(cause, true);
         // Surface the thrown message to the model (self-heal feedback): a tool
         // that throws `new Error('File not found')` should tell the model that,
         // not an opaque "threw during execution".
@@ -653,11 +761,227 @@ export async function executeTools(
     } catch (cause) {
       // Only control flow (SubAgentSuspension) or unexpected plumbing errors
       // reach here — the span must still end exactly once. A suspension is not
-      // a tool failure (no exception, no is_error); anything else records first.
+      // a tool failure (no exception, no is_error, no tool event); anything
+      // else records first.
       if (cause instanceof SubAgentSuspension) span?.end();
-      else span?.fail(cause);
+      else {
+        span?.fail(cause);
+        emitToolFailed(cause, false);
+      }
       throw cause;
     }
+  });
+}
+
+// --- Loop-level observation (1.6): shared by the buffered + streaming loops ---
+
+/** Per-loop observation state. `root: false` = a sub-agent sharing the parent runtime. */
+export interface LoopObserve {
+  rt: ObservationRuntime;
+  runSpanId: string;
+  runStartedAt: number;
+  root: boolean;
+}
+
+export interface LoopObserveInit {
+  operation: 'generate-text' | 'stream-chat';
+  /** Durable session runId — observation adopts it for correlation. */
+  runId?: string;
+  /** True on resumeFromCheckpoint legs. */
+  resumed?: boolean;
+  resumeFromStepId?: string;
+  resumeFromStepIndex?: number;
+  /** Sub-agent: share the parent's runtime; the loop emits no run.* events. */
+  inherited?: { runtime: ObservationRuntime; parentSpanId?: string };
+}
+
+/**
+ * Create the loop's observation state and emit run.started (root loops only).
+ * Returns undefined when observation is off — every emit site guards with one
+ * branch and no ids are drawn (fast path).
+ */
+export function beginLoopObserve(
+  deps: ResolvedDependencies,
+  options: CommonCallOptions,
+  init: LoopObserveInit,
+): LoopObserve | undefined {
+  if (init.inherited) {
+    const rt = init.inherited.runtime;
+    return {
+      rt,
+      runSpanId: init.inherited.parentSpanId ?? '',
+      runStartedAt: rt.now(),
+      root: false,
+    };
+  }
+  const rt = createObservationRuntime(deps, { runId: init.runId });
+  if (!rt) return undefined;
+  const span = rt.startSpan();
+  rt.emit({
+    type: 'run.started',
+    spanId: span.spanId,
+    agentPath: options.agentPath,
+    operation: init.operation,
+    provider: options.model.provider,
+    model: options.model.modelId,
+    surface: options.model.surface,
+    durable: options.session !== undefined,
+    resumed: init.resumed === true,
+    ...(init.resumeFromStepId !== undefined ? { resumeFromStepId: init.resumeFromStepId } : {}),
+    ...(init.resumeFromStepIndex !== undefined
+      ? { resumeFromStepIndex: init.resumeFromStepIndex }
+      : {}),
+    messageCount: options.messages.length,
+    toolCount: Object.keys(options.tools ?? {}).length,
+    ...(rt.capture.messages ? { capturedMessages: options.messages } : {}),
+  });
+  return { rt, runSpanId: span.spanId, runStartedAt: span.startedAt, root: true };
+}
+
+/** The loop's exit shape — endLoopObserve maps it onto exactly one terminal event. */
+export interface LoopOutcome {
+  finishReason: string;
+  endReason: 'natural' | 'stop-condition' | 'max-steps' | 'runaway-tool-errors';
+  stoppedBy?: string;
+  stepCount: number;
+  /** THIS leg's usage (result semantics). */
+  usage: Usage;
+  /** Durable: cumulative across legs (checkpoint semantics). */
+  cumulativeUsage?: Usage;
+  suspend?: {
+    reason: 'approval' | 'client-tool' | 'sub-agent-approval';
+    pendingApprovalCount: number;
+    pendingToolCount: number;
+    checkpointStepId?: string;
+    checkpointStepIndex?: number;
+  };
+  error?: unknown;
+}
+
+/** Emit the run's terminal event (root loops only; the terminal guard drops any second). */
+export function endLoopObserve(
+  lo: LoopObserve,
+  deps: ResolvedDependencies,
+  options: CommonCallOptions,
+  outcome: LoopOutcome,
+): void {
+  if (!lo.root) return;
+  const rt = lo.rt;
+  const durationMs = rt.durationSince(lo.runStartedAt);
+  const base = { spanId: lo.runSpanId, agentPath: options.agentPath, durationMs };
+  if (outcome.error !== undefined) {
+    rt.emit({
+      type: 'run.failed',
+      ...base,
+      status: 'failed',
+      error: toObservedError(outcome.error, rt.capture.errorMessages),
+      stepCount: outcome.stepCount,
+      ...counterFields(rt),
+      partialUsage: outcome.usage,
+    });
+    return;
+  }
+  if (outcome.suspend) {
+    rt.emit({
+      type: 'run.suspended',
+      ...base,
+      status: 'suspended',
+      reason: outcome.suspend.reason,
+      pendingApprovalCount: outcome.suspend.pendingApprovalCount,
+      pendingToolCount: outcome.suspend.pendingToolCount,
+      ...(outcome.suspend.checkpointStepId !== undefined
+        ? { checkpointStepId: outcome.suspend.checkpointStepId }
+        : {}),
+      ...(outcome.suspend.checkpointStepIndex !== undefined
+        ? { checkpointStepIndex: outcome.suspend.checkpointStepIndex }
+        : {}),
+      usage: outcome.usage,
+    });
+    return;
+  }
+  if (outcome.finishReason === 'aborted') {
+    rt.emit({ type: 'run.aborted', ...base, status: 'aborted', usage: outcome.usage });
+    return;
+  }
+  const costUsd = observeCost(
+    rt,
+    deps.priceProvider,
+    'run',
+    options.model.provider,
+    options.model.modelId,
+    outcome.usage,
+    lo.runSpanId,
+  );
+  rt.emit({
+    type: 'run.completed',
+    ...base,
+    status: 'completed',
+    finishReason: outcome.finishReason,
+    endReason: outcome.endReason,
+    ...(outcome.stoppedBy !== undefined ? { stoppedBy: outcome.stoppedBy } : {}),
+    stepCount: outcome.stepCount,
+    ...counterFields(rt),
+    usage: outcome.usage,
+    ...(outcome.cumulativeUsage !== undefined ? { cumulativeUsage: outcome.cumulativeUsage } : {}),
+    ...(costUsd !== undefined ? { costUsd } : {}),
+  });
+}
+
+/** step.started — after applyPrepareStep so the EFFECTIVE model/tools are reported. */
+export function emitStepStarted(
+  lo: LoopObserve,
+  options: CommonCallOptions,
+  span: { spanId: string },
+  stepIndex: number,
+  effectiveModel: string,
+  messageCount: number,
+  estimatedInputTokens: number | undefined,
+  activeToolCount: number,
+  cumulativeUsage: Usage,
+): void {
+  lo.rt.emit({
+    type: 'step.started',
+    spanId: span.spanId,
+    parentSpanId: lo.runSpanId,
+    agentPath: options.agentPath,
+    stepIndex,
+    model: effectiveModel,
+    messageCount,
+    ...(estimatedInputTokens !== undefined && estimatedInputTokens > 0
+      ? { estimatedInputTokens }
+      : {}),
+    activeToolCount,
+    cumulativeUsage,
+  });
+}
+
+/** step.completed — every step gets one, including break/abort steps. */
+export function emitStepCompleted(
+  lo: LoopObserve,
+  options: CommonCallOptions,
+  span: { spanId: string; startedAt: number },
+  stepIndex: number,
+  sr: StepResult,
+  denied: DenialMap | undefined,
+  cumulativeUsage: Usage,
+  stoppedBy?: string,
+): void {
+  const deniedCount = denied ? sr.toolResults.filter((r) => denied.has(r.toolCallId)).length : 0;
+  lo.rt.emit({
+    type: 'step.completed',
+    spanId: span.spanId,
+    parentSpanId: lo.runSpanId,
+    agentPath: options.agentPath,
+    stepIndex,
+    durationMs: lo.rt.durationSince(span.startedAt),
+    finishReason: sr.finishReason,
+    toolCallCount: sr.toolCalls.length,
+    toolResultCount: sr.toolResults.length,
+    toolErrorCount: sr.toolResults.filter((r) => r.isError && !denied?.has(r.toolCallId)).length,
+    deniedToolCount: deniedCount,
+    usage: sr.usage,
+    cumulativeUsage,
+    ...(stoppedBy !== undefined ? { stoppedBy } : {}),
   });
 }
 
