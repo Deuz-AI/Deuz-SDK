@@ -65,6 +65,14 @@ export interface ObservationRuntime {
   /** New timeline node id (deps.generateId()). */
   startSpan(): { spanId: string; startedAt: number };
   emit(event: PendingObserveEvent): void;
+  /**
+   * Register an async enrichment (e.g. a pending priceProvider cost) so
+   * `settled()` can await it. The promise's failure is swallowed here — the
+   * enrichment site owns its own error handling.
+   */
+  trackPending(promise: Promise<unknown>): void;
+  /** Resolves once every registered enrichment has settled (1.6.1). */
+  settled(): Promise<void>;
 }
 
 export interface ObservationRuntimeInit {
@@ -359,13 +367,17 @@ export function observeCost(
     const result = priceProvider.priceUsage(model, usage);
     if (typeof result === 'number') return result;
     if (result && typeof (result as Promise<number | undefined>).then === 'function') {
-      void (result as Promise<number | undefined>).then(
-        (costUsd) => {
-          if (typeof costUsd === 'number') {
-            rt.emit({ type: 'cost.calculated', spanId, target, provider, model, usage, costUsd });
-          }
-        },
-        () => undefined,
+      // Tracked (1.6.1): `result.observation.settled` awaits this, so a user
+      // can drain the cost event before closing a JSONL observer.
+      rt.trackPending(
+        (result as Promise<number | undefined>).then(
+          (costUsd) => {
+            if (typeof costUsd === 'number') {
+              rt.emit({ type: 'cost.calculated', spanId, target, provider, model, usage, costUsd });
+            }
+          },
+          () => undefined,
+        ),
       );
     }
   } catch {
@@ -407,6 +419,7 @@ export function createObservationRuntime(
 
   let sequence = 0;
   let terminalSeen = false;
+  const pendingEnrichments = new Set<Promise<unknown>>();
   const counters: RunCounters = {
     modelCalls: 0,
     toolCalls: 0,
@@ -495,6 +508,20 @@ export function createObservationRuntime(
     now: () => deps.clock.now(),
     durationSince: (startedAt: number) => Math.max(0, deps.clock.now() - startedAt),
     startSpan: () => ({ spanId: deps.generateId(), startedAt: deps.clock.now() }),
+    trackPending(promise: Promise<unknown>): void {
+      pendingEnrichments.add(promise);
+      void promise
+        .catch(() => undefined)
+        .finally(() => {
+          pendingEnrichments.delete(promise);
+        });
+    },
+    async settled(): Promise<void> {
+      // Loop: an awaited enrichment may register a follow-up.
+      while (pendingEnrichments.size > 0) {
+        await Promise.allSettled([...pendingEnrichments]);
+      }
+    },
     emit(pending: PendingObserveEvent): void {
       const isTerminal = TERMINAL_TYPES.has(pending.type);
       if (isTerminal) {

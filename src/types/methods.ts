@@ -23,6 +23,13 @@ export interface StreamChatResult {
    * from `resumeStreamFromCheckpoint`). Known synchronously. Additive (1.5).
    */
   runId?: string;
+  /**
+   * Observation settlement (1.6.1 additive) — present only when an observer
+   * (or tracer) was active. Resolves once every observation enrichment for
+   * this call has been emitted (e.g. an async priceProvider cost event).
+   * Await it BEFORE closing observers: `await res.observation?.settled`.
+   */
+  observation?: { settled: Promise<void> };
 }
 
 export type StreamChat = (options: StreamChatOptions) => StreamChatResult;
@@ -59,6 +66,13 @@ export interface GenerateTextResult {
    * continue a suspended/crashed run. Additive (1.5).
    */
   runId?: string;
+  /**
+   * Observation settlement (1.6.1 additive) — present only when an observer
+   * (or tracer) was active. Resolves once every observation enrichment for
+   * this call has been emitted (e.g. an async priceProvider cost event).
+   * Await it BEFORE closing observers: `await res.observation?.settled`.
+   */
+  observation?: { settled: Promise<void> };
 }
 
 export type GenerateText = (options: GenerateTextOptions) => Promise<GenerateTextResult>;
@@ -156,6 +170,13 @@ export interface EmbedOptions {
 export interface EmbedResult {
   embedding: number[];
   usage: Usage;
+  /**
+   * Observation settlement (1.6.1 additive) — present only when an observer
+   * (or tracer) was active. Resolves once every observation enrichment for
+   * this call has been emitted (e.g. an async priceProvider cost event).
+   * Await it BEFORE closing observers: `await res.observation?.settled`.
+   */
+  observation?: { settled: Promise<void> };
 }
 
 export type Embed = (options: EmbedOptions) => Promise<EmbedResult>;
@@ -171,6 +192,13 @@ export interface EmbedManyOptions extends Omit<EmbedOptions, 'value'> {
 export interface EmbedManyResult {
   embeddings: number[][];
   usage: Usage;
+  /**
+   * Observation settlement (1.6.1 additive) — present only when an observer
+   * (or tracer) was active. Resolves once every observation enrichment for
+   * this call has been emitted (e.g. an async priceProvider cost event).
+   * Await it BEFORE closing observers: `await res.observation?.settled`.
+   */
+  observation?: { settled: Promise<void> };
 }
 
 export type EmbedMany = (options: EmbedManyOptions) => Promise<EmbedManyResult>;

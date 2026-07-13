@@ -73,6 +73,8 @@ export interface OneStep {
   finishReason: FinishReason;
   /** assistant turn in canonical order (reasoning, text, tool_use…). */
   assistantMessage: Message;
+  /** Observation settlement passthrough (1.6.1) — root single-turn calls only. */
+  observation?: { settled: Promise<void> };
 }
 
 /**
@@ -151,5 +153,6 @@ export async function runOneStep(
     usage,
     finishReason,
     assistantMessage,
+    ...(result.observation ? { observation: result.observation } : {}),
   };
 }

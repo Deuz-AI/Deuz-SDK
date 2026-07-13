@@ -18,5 +18,6 @@ export const generateText: GenerateText = async (options): Promise<GenerateTextR
     usage: step.usage,
     finishReason: step.finishReason,
     response: { messages: [step.assistantMessage] },
+    ...(step.observation ? { observation: step.observation } : {}),
   };
 };

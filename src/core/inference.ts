@@ -110,10 +110,24 @@ export function runStream(
   const textSub = broadcaster.subscribe();
 
   let started = false;
+  // Observation settlement (1.6.1): resolves after the pump finishes AND all
+  // async enrichments (e.g. priceProvider cost) have been emitted.
+  const observationDeferred = createDeferred<void>();
+  let observationHandle: { settled: Promise<void> } | undefined;
+  let rtRef: ObservationRuntime | undefined;
   function ensureStarted(): void {
     if (started) return;
     started = true;
-    void pump();
+    void pump().finally(() => {
+      void (async () => {
+        try {
+          await rtRef?.settled();
+        } catch {
+          // settlement must never throw
+        }
+        observationDeferred.resolve();
+      })();
+    });
   }
 
   async function pump(): Promise<void> {
@@ -132,6 +146,10 @@ export function runStream(
     // emission below is a single `if (rt)` branch and no ids are drawn.
     const rt = internal.observe?.runtime ?? createObservationRuntime(deps);
     const observeRoot = rt !== undefined && internal.observe === undefined;
+    if (rt) {
+      rtRef = rt;
+      observationHandle = { settled: observationDeferred.promise };
+    }
     const provider = options.model.provider;
     const modelId = options.model.modelId;
     let runSpanId: string | undefined;
@@ -503,6 +521,10 @@ export function runStream(
     get finishReason() {
       ensureStarted();
       return finishDeferred.promise;
+    },
+    get observation() {
+      ensureStarted();
+      return observationHandle;
     },
   };
 }
