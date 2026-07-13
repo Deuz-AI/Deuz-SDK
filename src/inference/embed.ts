@@ -15,6 +15,13 @@ import { getEmbeddingCapabilities, type EmbeddingCapabilities } from '../core/re
 import { embeddingUsage, fireUsage } from '../core/metering';
 import { resolveDependencies } from '../internal/resolve-deps';
 import {
+  createObservationRuntime,
+  observeCost,
+  counterFields,
+  type ObservationRuntime,
+} from '../internal/observe-runtime';
+import { toObservedError } from '../internal/observe-error';
+import {
   attachClientContext,
   readClientContext,
   type ClientContext,
@@ -96,10 +103,28 @@ async function resolveEmbeddingCall(
 
 const RETRYABLE = new Set([408, 409, 429, 500, 502, 503, 504, 529]);
 
+/**
+ * Observation (1.6): `embed()` delegates to `embedMany()` — mark the wrapped
+ * options so exactly ONE run is emitted, labeled with the original operation.
+ * Module-local symbol: never enumerable, never public.
+ */
+const EMBED_OPERATION = Symbol('deuz.observe.embedOperation');
+
+function readEmbedOperation(options: EmbedManyOptions): 'embed' | 'embed-many' {
+  const marked = (options as unknown as Record<PropertyKey, unknown>)[EMBED_OPERATION];
+  return marked === 'embed' ? 'embed' : 'embed-many';
+}
+
 function hashToUnit(id: string): number {
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
   return Math.abs(h % 1000) / 1000;
+}
+
+/** Retry correlation for embed batches (observation is optional — fast path passes undefined). */
+interface EmbedObserve {
+  rt: ObservationRuntime;
+  spanId: string;
 }
 
 /** One sub-batch request with pre-response retry (exp backoff + full jitter, Retry-After honored). */
@@ -112,10 +137,31 @@ async function fetchBatch(
   caps: EmbeddingCapabilities,
   deps: ResolvedDependencies,
   signal: AbortSignal | undefined,
+  observe: EmbedObserve | undefined,
 ): Promise<{ vectors: number[][]; tokens?: number }> {
   const built = adapter.buildRequest({ call, values, opts, caps });
   const maxRetries = opts.maxRetries ?? 2;
   let attempt = 0;
+
+  const emitRetry = (
+    delayMs: number,
+    reason: 'network' | 'rate-limit' | 'overloaded' | 'server-error',
+    statusCode?: number,
+    retryAfterMs?: number,
+  ): void => {
+    observe?.rt.emit({
+      type: 'model.retry',
+      spanId: observe.spanId,
+      provider: call.provider,
+      model: call.modelId,
+      failedAttempt: attempt,
+      nextAttempt: attempt + 1,
+      delayMs,
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      reason,
+      ...(statusCode !== undefined ? { statusCode } : {}),
+    });
+  };
 
   for (;;) {
     if (signal?.aborted) throw new AbortError();
@@ -131,7 +177,9 @@ async function fetchBatch(
           upstreamType: err instanceof Error ? err.name : typeof err,
         });
       }
-      await delay(attempt, undefined, deps);
+      const ms = retryDelayMs(attempt, undefined, deps);
+      emitRetry(ms, 'network');
+      await sleep(ms, deps);
       attempt++;
       continue;
     }
@@ -146,18 +194,32 @@ async function fetchBatch(
       throw adapter.mapError(response.status, body, response.headers);
     }
     const retryAfter = parseRetryAfterMs(response.headers.get('retry-after'), deps.clock.now());
-    await delay(attempt, retryAfter, deps);
+    const ms = retryDelayMs(attempt, retryAfter, deps);
+    emitRetry(
+      ms,
+      response.status === 429
+        ? 'rate-limit'
+        : response.status === 529
+          ? 'overloaded'
+          : 'server-error',
+      response.status,
+      retryAfter,
+    );
+    await sleep(ms, deps);
     attempt++;
   }
 }
 
-function delay(
+function retryDelayMs(
   attempt: number,
   retryAfterMs: number | undefined,
   deps: ResolvedDependencies,
-): Promise<void> {
+): number {
   const exp = Math.min(30_000, 500 * 2 ** attempt);
-  const ms = retryAfterMs ?? Math.floor(exp * hashToUnit(deps.generateId()));
+  return retryAfterMs ?? Math.floor(exp * hashToUnit(deps.generateId()));
+}
+
+function sleep(ms: number, deps: ResolvedDependencies): Promise<void> {
   return new Promise((resolve) => deps.clock.setTimeout(() => resolve(), ms));
 }
 
@@ -172,6 +234,87 @@ function l2normalize(vec: number[]): number[] {
 
 export const embedMany: EmbedMany = async (options: EmbedManyOptions): Promise<EmbedManyResult> => {
   const deps = resolveDependencies(options.deps);
+
+  // Observation (1.6): every top-level embed/embedMany call is a run of its
+  // own (no model.* lifecycle — embeddings have no canonical stream; retries
+  // still surface as model.retry). Fast path: rt is undefined without an
+  // observer.
+  const rt = createObservationRuntime(deps);
+  let runSpanId = '';
+  let runStartedAt = 0;
+  if (rt) {
+    const span = rt.startSpan();
+    runSpanId = span.spanId;
+    runStartedAt = span.startedAt;
+    rt.emit({
+      type: 'run.started',
+      spanId: runSpanId,
+      operation: readEmbedOperation(options),
+      provider: options.model.provider,
+      model: options.model.modelId,
+      surface: options.model.surface,
+      durable: false,
+      resumed: false,
+    });
+  }
+
+  try {
+    const result = await embedManyCore(options, deps, rt ? { rt, spanId: runSpanId } : undefined);
+    if (rt) {
+      const costUsd = observeCost(
+        rt,
+        deps.priceProvider,
+        'run',
+        options.model.provider,
+        options.model.modelId,
+        result.usage,
+        runSpanId,
+      );
+      rt.emit({
+        type: 'run.completed',
+        spanId: runSpanId,
+        status: 'completed',
+        durationMs: rt.durationSince(runStartedAt),
+        finishReason: 'stop',
+        endReason: 'natural',
+        stepCount: 0,
+        ...counterFields(rt),
+        usage: result.usage,
+        ...(costUsd !== undefined ? { costUsd } : {}),
+      });
+    }
+    return result;
+  } catch (err) {
+    if (rt) {
+      if (err instanceof AbortError || options.signal?.aborted) {
+        rt.emit({
+          type: 'run.aborted',
+          spanId: runSpanId,
+          status: 'aborted',
+          durationMs: rt.durationSince(runStartedAt),
+          usage: embeddingUsage(undefined),
+        });
+      } else {
+        rt.emit({
+          type: 'run.failed',
+          spanId: runSpanId,
+          status: 'failed',
+          durationMs: rt.durationSince(runStartedAt),
+          error: toObservedError(err, rt.capture.errorMessages),
+          stepCount: 0,
+          ...counterFields(rt),
+        });
+      }
+    }
+    throw err;
+  }
+};
+
+async function embedManyCore(
+  options: EmbedManyOptions,
+  deps: ResolvedDependencies,
+  observe: EmbedObserve | undefined,
+): Promise<EmbedManyResult> {
   const clientContext = readClientContext(options);
   const caps = getEmbeddingCapabilities(options.model, deps.logger);
 
@@ -208,7 +351,7 @@ export const embedMany: EmbedMany = async (options: EmbedManyOptions): Promise<E
   }
 
   const results = await mapWithConcurrency(batches, options.maxConcurrency ?? 5, (batch) =>
-    fetchBatch(adapter, call, fetchImpl, batch, options, caps, deps, options.signal),
+    fetchBatch(adapter, call, fetchImpl, batch, options, caps, deps, options.signal, observe),
   );
 
   // Concatenate in original order; sum tokens across sub-batches.
@@ -227,7 +370,7 @@ export const embedMany: EmbedMany = async (options: EmbedManyOptions): Promise<E
   fireUsage(options as never, deps, usage, { model: options.model.modelId, reason: 'finished' });
 
   return { embeddings, usage };
-};
+}
 
 export const embed: Embed = async (options: EmbedOptions): Promise<EmbedResult> => {
   const { value, ...rest } = options;
@@ -237,6 +380,8 @@ export const embed: Embed = async (options: EmbedOptions): Promise<EmbedResult> 
   // apiKeys/baseUrls (G1) on the way into embedMany.
   const clientContext = readClientContext(options);
   if (clientContext) attachClientContext(manyOptions, clientContext);
+  // Observation: one run, labeled 'embed' — embedMany must not emit a second.
+  Object.defineProperty(manyOptions, EMBED_OPERATION, { value: 'embed', enumerable: false });
   const { embeddings, usage } = await embedMany(manyOptions);
   return { embedding: embeddings[0] ?? [], usage };
 };

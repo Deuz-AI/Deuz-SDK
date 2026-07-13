@@ -51,7 +51,8 @@ export const generateObject: GenerateObject = async <T = unknown>(
   let lastError: unknown;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const result = runStream(options, { object });
+    // Observation: each repair attempt is its own run (rare; honest timeline).
+    const result = runStream(options, { object, operation: 'generate-object' });
     const raw = await collect(result, strategy); // throws on hard transport error
     const usage = await result.usage;
     const finishReason = await result.finishReason;

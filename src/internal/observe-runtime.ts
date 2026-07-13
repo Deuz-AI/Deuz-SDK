@@ -12,7 +12,8 @@
  * Edge-safe by construction: time via deps.clock.now(), ids via
  * deps.generateId(), sampling via unitFromId(runId) — no ambient calls.
  */
-import type { ResolvedDependencies } from '../types/deps';
+import type { ResolvedDependencies, PriceProvider } from '../types/deps';
+import type { Usage } from '../types/usage';
 import type {
   ObserveEvent,
   Observer,
@@ -225,6 +226,66 @@ function toMinimalRunFailed(event: RunFailedEvent): RunFailedEvent {
     toolCallCount: 0,
     retryCount: 0,
   };
+}
+
+/** rt.counters → the run.completed counter field names (shared by every terminal emitter). */
+export function counterFields(rt: ObservationRuntime): {
+  modelCallCount: number;
+  toolCallCount: number;
+  toolErrorCount: number;
+  deniedToolCount: number;
+  retryCount: number;
+  approvalCount: number;
+  checkpointCount: number;
+  subAgentCount: number;
+} {
+  const c = rt.counters;
+  return {
+    modelCallCount: c.modelCalls,
+    toolCallCount: c.toolCalls,
+    toolErrorCount: c.toolErrors,
+    deniedToolCount: c.denials,
+    retryCount: c.retries,
+    approvalCount: c.approvals,
+    checkpointCount: c.checkpoints,
+    subAgentCount: c.subAgents,
+  };
+}
+
+/**
+ * Cost enrichment (§25): a sync priceProvider result is returned so callers
+ * can inline `costUsd` into the terminal event; an async one resolves into a
+ * fire-and-forget `cost.calculated` event (tolerated after the terminal).
+ * Provider throws/rejections never affect the run — cost simply stays
+ * undefined.
+ */
+export function observeCost(
+  rt: ObservationRuntime,
+  priceProvider: PriceProvider | undefined,
+  target: 'model' | 'run',
+  provider: string,
+  model: string,
+  usage: Usage,
+  spanId: string,
+): number | undefined {
+  if (!priceProvider) return undefined;
+  try {
+    const result = priceProvider.priceUsage(model, usage);
+    if (typeof result === 'number') return result;
+    if (result && typeof (result as Promise<number | undefined>).then === 'function') {
+      void (result as Promise<number | undefined>).then(
+        (costUsd) => {
+          if (typeof costUsd === 'number') {
+            rt.emit({ type: 'cost.calculated', spanId, target, provider, model, usage, costUsd });
+          }
+        },
+        () => undefined,
+      );
+    }
+  } catch {
+    // price provider failures never affect the run
+  }
+  return undefined;
 }
 
 /**

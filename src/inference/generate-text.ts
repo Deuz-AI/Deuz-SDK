@@ -12,7 +12,7 @@ export const generateText: GenerateText = async (options): Promise<GenerateTextR
     return runToolLoop(options);
   }
 
-  const step = await runOneStep(options);
+  const step = await runOneStep(options, { operation: 'generate-text' });
   return {
     text: step.text,
     usage: step.usage,

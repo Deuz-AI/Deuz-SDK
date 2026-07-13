@@ -52,7 +52,7 @@ export const streamObject: StreamObject = <T = unknown>(
         description: options.schemaDescription,
         strategy,
       };
-      const inner = runStream(options, { object });
+      const inner = runStream(options, { object, operation: 'stream-object' });
 
       let buf = '';
       let lastJson: string | undefined;

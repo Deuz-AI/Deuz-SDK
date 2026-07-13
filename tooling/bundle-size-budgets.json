@@ -4,14 +4,14 @@
     "core": {
       "from": "@deuz-sdk/core",
       "exports": ["streamChat", "generateText", "generateObject", "createClient"],
-      "maxRawBytes": 86000,
-      "maxGzipBytes": 27000
+      "maxRawBytes": 100000,
+      "maxGzipBytes": 31000
     },
     "edge": {
       "from": "@deuz-sdk/core/edge",
       "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
-      "maxRawBytes": 76000,
-      "maxGzipBytes": 24000
+      "maxRawBytes": 90000,
+      "maxGzipBytes": 28000
     },
     "openai-provider": {
       "from": "@deuz-sdk/core/openai",
