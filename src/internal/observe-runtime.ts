@@ -425,18 +425,24 @@ export function createObservationRuntime(
   const finalize = (pending: PendingObserveEvent): ObserveEvent => {
     const state: SnapshotState = { limits, truncated: false, seen: new WeakSet() };
     const event = pending as unknown as Record<string, unknown>;
-    // Captured payloads: default redaction → custom redactor → structural limits.
+    // Captured payloads: default secret redaction FIRST (so truncation can
+    // never split a secret into a surviving decodable prefix) → bounded
+    // snapshot → custom redactor → default secret redaction AGAIN as the
+    // FINAL BARRIER (a buggy or malicious custom redactor that reintroduces a
+    // secret still hits the sweep) → re-bound (custom output may exceed
+    // limits; the extra passes run only when a redactor is configured).
     for (const [key, field] of Object.entries(CAPTURE_FIELDS)) {
       if (event[key] === undefined) continue;
-      let value = redactForObservation(event[key]);
+      let value = snapshot(redactForObservation(event[key]), state, 0);
       if (options.redact) {
         try {
           value = options.redact(value, { eventType: pending.type, field });
         } catch {
           value = '[RedactionError]';
         }
+        value = snapshot(redactForObservation(value), state, 0);
       }
-      event[key] = snapshot(value, state, 0);
+      event[key] = value;
     }
     if (typeof event.reason === 'string') {
       event.reason = redactObservationString(event.reason as string);

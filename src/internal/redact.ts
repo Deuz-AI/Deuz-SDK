@@ -75,8 +75,10 @@ const OBSERVE_SECRET_KEYS = new Set([
 
 const OBSERVE_SECRET_PATTERNS: RegExp[] = [
   ...SECRET_PATTERNS,
-  // JWT: three base64url segments — the eyJ prefix pins a JSON header.
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b/g,
+  // JWT: three base64url segments — the eyJ prefix pins a JSON header. No
+  // LEADING \b: a token embedded flush against alphanumerics (…xxxeyJ…) must
+  // still redact — over-matching is the safe side for an observation profile.
+  /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b/g,
   // PEM private-key blocks (multi-line).
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
 ];
