@@ -20,14 +20,15 @@
 ```ts
 import { streamChat } from '@deuz-sdk/core';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
-// or: createOpenAI, createGoogle, createXai, createVertex — same call, same stream
+// or: createOpenAI, createGoogle, createXai, createVertex — same call
 
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// Returns synchronously and never throws — failures arrive as typed parts.
 const res = streamChat({
   model: anthropic('claude-opus-4-8'),
   messages: [{ role: 'user', content: 'Hello!' }],
-}); // returns synchronously, never throws — failures arrive as typed stream parts
+});
 
 for await (const chunk of res.textStream) process.stdout.write(chunk);
 const usage = await res.usage; // tokens — and USD, if you plug in /pricing
@@ -265,14 +266,13 @@ Tree-shakable subpaths — no `@deuz-sdk/anthropic`, `@deuz-sdk/react`, … to v
 ## Architecture — the canonical line
 
 ```mermaid
-flowchart LR
-    A["canonical<br>Message[] / Part[]"] --> B["adapter<br>(1 of 4 wires)"]
-    B --> C["provider<br>SSE"]
-    C --> D["robust<br>parser"]
-    D --> E["CANONICAL DELTA STREAM<br>StreamPart"]
-    E --> F["orchestration<br>retry · timeout · tool loop"]
-    F --> G["your code<br>textStream / fullStream"]
-    F --> H["Deuz UI wire<br>toDeuzStreamResponse"]
+flowchart TB
+    A["canonical Message[] / Part[]"] --> B["adapter — 1 of 4 wires"]
+    B --> C["provider SSE → robust parser"]
+    C --> D["CANONICAL DELTA STREAM · StreamPart"]
+    D --> E["orchestration — retry · timeout · tool loop"]
+    E --> F["your code<br>textStream / fullStream"]
+    E --> G["Deuz UI wire<br>toDeuzStreamResponse"]
 ```
 
 Adapters never proxy a provider's raw SSE to your code. Everything is normalized to one canonical delta stream first — that single decision is what makes abort, retry, multi-provider merging, sub-agent stream forwarding, and typed UI events possible. Reliability is layered on top: pre-first-byte retry with deterministic jitter, `Retry-After` honored, TTFT + total timeouts on an injected clock, and API keys masked in every log, error, and span path (regression-tested).
