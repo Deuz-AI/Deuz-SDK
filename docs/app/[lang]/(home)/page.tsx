@@ -15,7 +15,7 @@ import { gitConfig } from '@/lib/shared';
 
 const copy = {
   en: {
-    badge: 'v1.5 — durable sessions, checkpoint resume & signed approvals',
+    badge: 'v1.6.1 — Observable Runtime, tracer bridge & built-in observers',
     titleA: 'One canonical wire for',
     titleB: 'every AI provider',
     lead: 'Pure · Web-first · Multi-provider AI SDK for TypeScript',
@@ -63,7 +63,7 @@ const copy = {
     footerChangelog: 'Changelog',
   },
   de: {
-    badge: 'v1.5 — dauerhafte Sitzungen, Checkpoint-Wiederaufnahme & signierte Freigaben',
+    badge: 'v1.6.1 — Observable Runtime, Tracer-Bridge & integrierte Observer',
     titleA: 'Ein kanonisches Protokoll für',
     titleB: 'jeden KI-Provider',
     lead: 'Pures · Web-first · Multi-Provider AI SDK für TypeScript',
@@ -111,7 +111,7 @@ const copy = {
     footerChangelog: 'Changelog',
   },
   tr: {
-    badge: "v1.5 — kalıcı oturumlar, checkpoint'ten devam ve imzalı onaylar",
+    badge: "v1.6.1 — Observable Runtime, tracer köprüsü ve yerleşik gözlemciler",
     titleA: 'Tüm yapay zeka sağlayıcıları için',
     titleB: 'tek kanonik protokol',
     lead: 'Saf · Web öncelikli · Çok sağlayıcılı TypeScript AI SDK',
@@ -159,7 +159,7 @@ const copy = {
     footerChangelog: 'Sürüm notları',
   },
   fr: {
-    badge: 'v1.5 — sessions durables, reprise sur point de contrôle & approbations signées',
+    badge: 'v1.6.1 — Observable Runtime, pont de traçage & observateurs intégrés',
     titleA: 'Un protocole canonique pour',
     titleB: 'chaque fournisseur d’IA',
     lead: 'SDK IA TypeScript pur · web-first · multi-fournisseur',
@@ -207,7 +207,7 @@ const copy = {
     footerChangelog: 'Journal des modifications',
   },
   it: {
-    badge: 'v1.5 — sessioni persistenti, ripresa da checkpoint e approvazioni firmate',
+    badge: 'v1.6.1 — Observable Runtime, bridge del tracer e observer integrati',
     titleA: 'Un protocollo canonico per',
     titleB: 'ogni provider di IA',
     lead: 'SDK IA TypeScript puro · web-first · multi-provider',
@@ -255,7 +255,7 @@ const copy = {
     footerChangelog: 'Changelog',
   },
   es: {
-    badge: 'v1.5 — sesiones duraderas, reanudación por checkpoints y aprobaciones firmadas',
+    badge: 'v1.6.1 — Observable Runtime, puente de trazas y observadores integrados',
     titleA: 'Un protocolo canónico para',
     titleB: 'cada proveedor de IA',
     lead: 'SDK de IA para TypeScript puro · web-first · multiproveedor',
@@ -303,7 +303,7 @@ const copy = {
     footerChangelog: 'Registro de cambios',
   },
   ru: {
-    badge: 'v1.5 — устойчивые сессии, возобновление с чекпоинтов и подписанные одобрения',
+    badge: 'v1.6.1 — Observable Runtime, мост трассировки и встроенные наблюдатели',
     titleA: 'Один канонический протокол для',
     titleB: 'каждого ИИ-провайдера',
     lead: 'Чистый · web-first · мультипровайдерный TypeScript AI SDK',
@@ -351,7 +351,7 @@ const copy = {
     footerChangelog: 'История изменений',
   },
   ja: {
-    badge: 'v1.5 — 永続セッション、チェックポイント再開、署名付き承認',
+    badge: 'v1.6.1 — Observable Runtime、トレーサーブリッジ、組み込みオブザーバー',
     titleA: 'すべての AI プロバイダーを',
     titleB: 'ひとつの正規プロトコルで',
     lead: 'ピュア · ウェブファースト · マルチプロバイダー TypeScript AI SDK',
@@ -399,7 +399,7 @@ const copy = {
     footerChangelog: '変更履歴',
   },
   ko: {
-    badge: 'v1.5 — 영속 세션, 체크포인트 재개, 서명 승인',
+    badge: 'v1.6.1 — Observable Runtime, 트레이서 브리지, 내장 옵저버',
     titleA: '모든 AI 프로바이더를 위한',
     titleB: '단 하나의 정규 프로토콜',
     lead: '순수 · 웹 우선 · 멀티 프로바이더 TypeScript AI SDK',
@@ -447,7 +447,7 @@ const copy = {
     footerChangelog: '변경 이력',
   },
   zh: {
-    badge: 'v1.5 — 持久化会话、检查点恢复与签名审批',
+    badge: 'v1.6.1 — Observable Runtime、追踪桥接与内置观察者',
     titleA: '为每一个 AI 提供商',
     titleB: '提供同一条规范协议',
     lead: '纯净 · Web 优先 · 多提供商 TypeScript AI SDK',
