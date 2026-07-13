@@ -6,6 +6,7 @@ import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
 import { runOneStep, type OneStep } from './run-step';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import { resolveDependencies } from '../internal/resolve-deps';
+import type { ObservationRuntime } from '../internal/observe-runtime';
 import {
   buildWireTools,
   filterWireTools,
@@ -34,6 +35,8 @@ import {
   endLoopObserve,
   emitStepStarted,
   emitStepCompleted,
+  observeApprovalRequests,
+  observeServerResolutions,
   SubAgentSuspension,
   type Denial,
   type ExecuteExtras,
@@ -47,7 +50,9 @@ import {
 export interface ToolLoopInternal {
   resumeFrom?: { stepIndex: number; usage: Usage };
   /** Observation (1.6): resume-leg correlation for run.started. */
-  observeResume?: { stepId: string; stepIndex: number };
+  observeResume?: { stepId: string; stepIndex: number; checkpointAgeMs?: number };
+  /** Observation (1.6): pre-created runtime (checkpoint.loaded precedes run.started). */
+  observeRuntime?: ObservationRuntime;
 }
 
 /**
@@ -75,7 +80,9 @@ export async function runToolLoop(
     resumed: internal?.resumeFrom !== undefined,
     resumeFromStepId: internal?.observeResume?.stepId,
     resumeFromStepIndex: internal?.observeResume?.stepIndex,
+    runtime: internal?.observeRuntime,
   });
+  if (durable && lo) durable.observe = { rt: lo.rt, runSpanId: lo.runSpanId };
   // Cross-leg step offset: prepareStep must see the same continuing indices
   // the streaming loop reports on a resume leg (loop-symmetry invariant).
   const stepBase = internal?.resumeFrom?.stepIndex ?? 0;
@@ -107,6 +114,7 @@ export async function runToolLoop(
         parentSpanId: lo.runSpanId as string | undefined,
         stepIndex: undefined as number | undefined,
         counters: errorCounters,
+        approvalWaitMs: internal?.observeResume?.checkpointAgeMs,
       }
     : undefined;
 
@@ -308,6 +316,18 @@ export async function runToolLoop(
       const pendingApproval = options.approveToolCall
         ? []
         : toolCalls.filter((c) => gated.has(c.toolCallId));
+      if (observeCtx && gated.size > 0) {
+        const gatedCalls = toolCalls.filter((c) => gated.has(c.toolCallId));
+        observeApprovalRequests(
+          observeCtx,
+          options,
+          gatedCalls,
+          options.approveToolCall ? 'server' : 'client',
+        );
+        if (options.approveToolCall) {
+          observeServerResolutions(observeCtx, options, gatedCalls, denied);
+        }
+      }
 
       // Pending approvals and client tools (no execute) can't be auto-continued —
       // ONE break, executing nothing from the batch; the resume settles the rest.

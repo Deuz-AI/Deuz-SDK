@@ -15,6 +15,13 @@ import type { Clock } from './types/deps';
 import { DeuzError } from './errors';
 import { runToolLoop } from './inference/tool-loop';
 import { runStreamToolLoop } from './inference/stream-tool-loop';
+import { resolveDependencies } from './internal/resolve-deps';
+import {
+  createObservationRuntime,
+  counterFields,
+  type ObservationRuntime,
+} from './internal/observe-runtime';
+import { toObservedError } from './internal/observe-error';
 
 export type { AgentCheckpoint, SessionStore, CheckpointStatus } from './types/session';
 
@@ -120,6 +127,69 @@ async function loadCheckpoint(store: SessionStore, runId: string): Promise<Agent
   return checkpoint;
 }
 
+/**
+ * Observation (1.6): load a checkpoint with checkpoint.loaded/failed events.
+ * This is the ONLY place the checkpoint object is visible — the loops never
+ * see status/stepId/createdAt (toResumeCall drops them). Returns the
+ * correlation the loop's run.started needs.
+ */
+async function observedLoad(
+  store: SessionStore,
+  runId: string,
+  rt: ObservationRuntime | undefined,
+): Promise<{
+  checkpoint: AgentCheckpoint;
+  observeResume?: { stepId: string; stepIndex: number; checkpointAgeMs?: number };
+}> {
+  const span = rt?.startSpan();
+  let checkpoint: AgentCheckpoint;
+  try {
+    checkpoint = await loadCheckpoint(store, runId);
+  } catch (err) {
+    if (rt && span) {
+      rt.emit({
+        type: 'checkpoint.failed',
+        spanId: span.spanId,
+        operation: 'load',
+        checkpointRunId: runId,
+        durationMs: rt.durationSince(span.startedAt),
+        error: toObservedError(err, rt.capture.errorMessages),
+        runContinued: false,
+      });
+    }
+    throw err;
+  }
+  if (rt && span) {
+    rt.emit({
+      type: 'checkpoint.loaded',
+      spanId: span.spanId,
+      checkpointRunId: checkpoint.runId,
+      stepId: checkpoint.stepId,
+      checkpointStepIndex: checkpoint.stepIndex,
+      checkpointStatus: checkpoint.status,
+      durationMs: rt.durationSince(span.startedAt),
+      messageCount: checkpoint.messages.length,
+      pendingApprovalCount: checkpoint.pendingApprovals?.length ?? 0,
+      checkpointAgeMs: Math.max(0, rt.now() - checkpoint.createdAt),
+    });
+  }
+  return {
+    checkpoint,
+    ...(rt
+      ? {
+          observeResume: {
+            stepId: checkpoint.stepId,
+            stepIndex: checkpoint.stepIndex,
+            checkpointAgeMs: Math.max(
+              0,
+              (rt?.now() ?? checkpoint.createdAt) - checkpoint.createdAt,
+            ),
+          },
+        }
+      : {}),
+  };
+}
+
 function toResumeCall(checkpoint: AgentCheckpoint, store: SessionStore, options: ResumeOptions) {
   return {
     ...options,
@@ -147,9 +217,32 @@ export async function resumeFromCheckpoint(
   runId: string,
   options: ResumeOptions,
 ): Promise<GenerateTextResult> {
-  const checkpoint = await loadCheckpoint(store, runId);
+  // Observation (1.6): the runtime is created HERE so checkpoint.loaded
+  // precedes run.started on the same leg; the loop adopts it (still root).
+  const rt = createObservationRuntime(resolveDependencies(options.deps), { runId });
+  let loaded: Awaited<ReturnType<typeof observedLoad>>;
+  try {
+    loaded = await observedLoad(store, runId, rt);
+  } catch (err) {
+    if (rt) {
+      const span = rt.startSpan();
+      rt.emit({
+        type: 'run.failed',
+        spanId: span.spanId,
+        status: 'failed',
+        durationMs: 0,
+        error: toObservedError(err, rt.capture.errorMessages),
+        stepCount: 0,
+        ...counterFields(rt),
+      });
+    }
+    throw err;
+  }
+  const { checkpoint, observeResume } = loaded;
   return runToolLoop(toResumeCall(checkpoint, store, options), {
     resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+    ...(rt ? { observeRuntime: rt } : {}),
+    ...(observeResume ? { observeResume } : {}),
   });
 }
 
@@ -173,11 +266,12 @@ export function resumeStreamFromCheckpoint(
       approvalResponses: options.approvalResponses ?? [],
     },
     {
-      resumeLoad: async () => {
-        const checkpoint = await loadCheckpoint(store, runId);
+      resumeLoad: async (rt) => {
+        const { checkpoint, observeResume } = await observedLoad(store, runId, rt);
         return {
           messages: [...checkpoint.messages] as Message[],
           resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+          ...(observeResume ? { observeResume } : {}),
         };
       },
     },

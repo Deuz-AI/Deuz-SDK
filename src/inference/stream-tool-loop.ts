@@ -6,6 +6,12 @@ import type { Usage, FinishReason } from '../types/usage';
 import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
 import { runStream } from '../core/inference';
 import { resolveDependencies } from '../internal/resolve-deps';
+import {
+  createObservationRuntime,
+  counterFields,
+  type ObservationRuntime,
+} from '../internal/observe-runtime';
+import { toObservedError } from '../internal/observe-error';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
 import { assembleAssistant, type ToolArgMap, type EncryptedReasoning } from './run-step';
 import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
@@ -36,6 +42,8 @@ import {
   endLoopObserve,
   emitStepStarted,
   emitStepCompleted,
+  observeApprovalRequests,
+  observeServerResolutions,
   SubAgentSuspension,
   type Denial,
   type DurableRunner,
@@ -59,12 +67,14 @@ async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<s
  */
 export interface StreamToolLoopInternal {
   resumeFrom?: { stepIndex: number; usage: Usage };
-  resumeLoad?: () => Promise<{
+  resumeLoad?: (rt?: ObservationRuntime) => Promise<{
     messages: Message[];
     resumeFrom: { stepIndex: number; usage: Usage };
+    /** Observation (1.6): checkpoint correlation for run.started. */
+    observeResume?: { stepId: string; stepIndex: number; checkpointAgeMs?: number };
   }>;
   /** Observation (1.6): resume-leg correlation for run.started. */
-  observeResume?: { stepId: string; stepIndex: number };
+  observeResume?: { stepId: string; stepIndex: number; checkpointAgeMs?: number };
 }
 
 /**
@@ -102,15 +112,35 @@ export function runStreamToolLoop(
     const startedAt = deps.clock.now();
     let messages: Message[] = [...options.messages];
     let resumeFrom = internal?.resumeFrom;
+    let observeResume = internal?.observeResume;
+    // Resume legs pre-create the ROOT runtime so the closure's
+    // checkpoint.loaded/failed events share the leg's sequence and precede
+    // run.started (§26). Non-resume runs create it in beginLoopObserve.
+    const preRt = internal?.resumeLoad ? createObservationRuntime(deps, { runId }) : undefined;
     if (internal?.resumeLoad) {
       try {
-        const loaded = await internal.resumeLoad();
+        const loaded = await internal.resumeLoad(preRt);
         messages = loaded.messages;
         resumeFrom = loaded.resumeFrom;
+        observeResume = loaded.observeResume ?? observeResume;
       } catch (err) {
         broadcaster.push({ type: 'error', error: err });
         usageDeferred.reject(err);
         finishDeferred.reject(err);
+        if (preRt) {
+          // run.started never fired — the leg dies at load (checkpoint.failed
+          // was emitted by the closure); report the run failure once.
+          const span = preRt.startSpan();
+          preRt.emit({
+            type: 'run.failed',
+            spanId: span.spanId,
+            status: 'failed',
+            durationMs: 0,
+            error: toObservedError(err, preRt.capture.errorMessages),
+            stepCount: 0,
+            ...counterFields(preRt),
+          });
+        }
         broadcaster.close();
         return;
       }
@@ -131,9 +161,11 @@ export function runStreamToolLoop(
       operation: 'stream-chat',
       runId,
       resumed: internal?.resumeFrom !== undefined || internal?.resumeLoad !== undefined,
-      resumeFromStepId: internal?.observeResume?.stepId,
-      resumeFromStepIndex: internal?.observeResume?.stepIndex,
+      resumeFromStepId: observeResume?.stepId,
+      resumeFromStepIndex: observeResume?.stepIndex,
+      runtime: preRt,
     });
+    if (durable && lo) durable.observe = { rt: lo.rt, runSpanId: lo.runSpanId };
     const steps: StepResult[] = [];
     const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
     const wantCost = needsCost(stopConditions);
@@ -157,6 +189,7 @@ export function runStreamToolLoop(
           parentSpanId: lo.runSpanId as string | undefined,
           stepIndex: undefined as number | undefined,
           counters: errorCounters,
+          approvalWaitMs: observeResume?.checkpointAgeMs,
         }
       : undefined;
 
@@ -490,6 +523,18 @@ export function runStreamToolLoop(
         const pendingApproval = options.approveToolCall
           ? []
           : toolCalls.filter((c) => gated.has(c.toolCallId));
+        if (observeCtx && gated.size > 0) {
+          const gatedCalls = toolCalls.filter((c) => gated.has(c.toolCallId));
+          observeApprovalRequests(
+            observeCtx,
+            options,
+            gatedCalls,
+            options.approveToolCall ? 'server' : 'client',
+          );
+          if (options.approveToolCall) {
+            observeServerResolutions(observeCtx, options, gatedCalls, denied);
+          }
+        }
 
         // Pending approvals and client tools break together: ONE break, nothing
         // from the batch executes; the resume call settles the deferred rest.

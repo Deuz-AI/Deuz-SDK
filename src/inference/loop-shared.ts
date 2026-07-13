@@ -97,6 +97,8 @@ export interface DurableRunner {
   baseUsage: Usage;
   /** Step boundaries saved so far across ALL legs (monotonic). */
   stepIndex: number;
+  /** Observation (1.6): set by the loop so saveCheckpoint can emit checkpoint events. */
+  observe?: { rt: ObservationRuntime; runSpanId: string };
 }
 
 /**
@@ -151,11 +153,44 @@ export async function saveCheckpoint(
     ...(options.agentPath && options.agentPath.length > 0 ? { agentPath: options.agentPath } : {}),
     createdAt: deps.clock.now(),
   };
+  const ob = runner.observe;
+  const span = ob?.rt.startSpan();
   try {
     await runner.store.save(checkpoint);
+    if (ob && span) {
+      ob.rt.emit({
+        type: 'checkpoint.saved',
+        spanId: span.spanId,
+        parentSpanId: ob.runSpanId,
+        agentPath: options.agentPath,
+        checkpointRunId: checkpoint.runId,
+        stepId: checkpoint.stepId,
+        checkpointStepIndex: checkpoint.stepIndex,
+        checkpointStatus: status,
+        durationMs: ob.rt.durationSince(span.startedAt),
+        messageCount: checkpoint.messages.length,
+        pendingApprovalCount: checkpoint.pendingApprovals?.length ?? 0,
+        usage: checkpoint.usage,
+      });
+    }
   } catch (cause) {
     const detail = cause instanceof Error ? cause.message : String(cause);
     deps.logger.error(`durable: checkpoint save failed for '${checkpoint.stepId}' — ${detail}`);
+    if (ob && span) {
+      // Best-effort durability: the event mirrors the never-fatal contract.
+      ob.rt.emit({
+        type: 'checkpoint.failed',
+        spanId: span.spanId,
+        parentSpanId: ob.runSpanId,
+        agentPath: options.agentPath,
+        operation: 'save',
+        checkpointRunId: checkpoint.runId,
+        stepId: checkpoint.stepId,
+        durationMs: ob.rt.durationSince(span.startedAt),
+        error: toObservedError(cause, ob.rt.capture.errorMessages),
+        runContinued: true,
+      });
+    }
   }
 }
 
@@ -558,6 +593,30 @@ export async function settlePendingApprovals(
     }
   }
 
+  // Observation (1.6): resume-leg approval resolutions. Explicit verdicts
+  // resolve as 'client-response'; verdict-less gated calls as 'default-deny'.
+  // Client tools without a result are not approvals (tool.denied covers them).
+  const ob = extras?.observe;
+  if (ob) {
+    for (const c of calls) {
+      const verdict = byId.get(c.toolCallId);
+      const defaultDenied = !verdict && gated.has(c.toolCallId);
+      if (!verdict && !defaultDenied) continue;
+      ob.rt.emit({
+        type: 'approval.resolved',
+        spanId: ob.rt.startSpan().spanId,
+        parentSpanId: ob.parentSpanId,
+        agentPath: options.agentPath,
+        approvalId: c.toolCallId,
+        toolCallId: c.toolCallId,
+        toolName: c.toolName,
+        approved: verdict?.approved === true,
+        source: verdict ? 'client-response' : 'default-deny',
+        ...(ob.approvalWaitMs !== undefined ? { waitDurationMs: ob.approvalWaitMs } : {}),
+      });
+    }
+  }
+
   const results = await executeTools(calls, tools, options, messages, denied, extras, trace);
   const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
   return { messages: [...messages, toolMessage], results, deniedIds: new Set(denied.keys()) };
@@ -588,7 +647,55 @@ export interface ExecuteExtras {
     parentSpanId?: string;
     stepIndex?: number;
     counters?: Map<string, number>;
+    /** Resume legs: clock.now() - checkpoint.createdAt (≈ approval wait). */
+    approvalWaitMs?: number;
   };
+}
+
+/** approval.requested for every gated call of a step (both modes). */
+export function observeApprovalRequests(
+  ob: NonNullable<ExecuteExtras['observe']>,
+  options: CommonCallOptions,
+  gatedCalls: ToolCall[],
+  mode: 'server' | 'client',
+): void {
+  for (const call of gatedCalls) {
+    ob.rt.emit({
+      type: 'approval.requested',
+      spanId: ob.rt.startSpan().spanId,
+      parentSpanId: ob.parentSpanId,
+      stepIndex: ob.stepIndex,
+      agentPath: options.agentPath,
+      approvalId: call.toolCallId, // === toolCallId today (toApprovalRequests contract)
+      toolCallId: call.toolCallId,
+      toolName: call.toolName,
+      mode,
+      ...(ob.rt.capture.toolInputs ? { capturedInput: call.args } : {}),
+    });
+  }
+}
+
+/** approval.resolved for server-mode verdicts (throwing approvers already denied). */
+export function observeServerResolutions(
+  ob: NonNullable<ExecuteExtras['observe']>,
+  options: CommonCallOptions,
+  gatedCalls: ToolCall[],
+  denied: DenialMap,
+): void {
+  for (const call of gatedCalls) {
+    ob.rt.emit({
+      type: 'approval.resolved',
+      spanId: ob.rt.startSpan().spanId,
+      parentSpanId: ob.parentSpanId,
+      stepIndex: ob.stepIndex,
+      agentPath: options.agentPath,
+      approvalId: call.toolCallId,
+      toolCallId: call.toolCallId,
+      toolName: call.toolName,
+      approved: !denied.has(call.toolCallId),
+      source: 'server',
+    });
+  }
 }
 
 /** JSON-ish runtime type label for tool.completed. */
@@ -791,6 +898,11 @@ export interface LoopObserveInit {
   resumed?: boolean;
   resumeFromStepId?: string;
   resumeFromStepIndex?: number;
+  /**
+   * Pre-created ROOT runtime (resume entry points create it early so
+   * checkpoint.loaded precedes run.started on the same sequence).
+   */
+  runtime?: ObservationRuntime;
   /** Sub-agent: share the parent's runtime; the loop emits no run.* events. */
   inherited?: { runtime: ObservationRuntime; parentSpanId?: string };
 }
@@ -814,7 +926,7 @@ export function beginLoopObserve(
       root: false,
     };
   }
-  const rt = createObservationRuntime(deps, { runId: init.runId });
+  const rt = init.runtime ?? createObservationRuntime(deps, { runId: init.runId });
   if (!rt) return undefined;
   const span = rt.startSpan();
   rt.emit({
