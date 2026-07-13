@@ -340,3 +340,92 @@ describe('tracer bridge — alongside an observer', () => {
     expect(tool.ended).toBe(1);
   });
 });
+
+describe('tracer bridge — tracerMode: legacy (1.6.1)', () => {
+  it('agentic loop reproduces the 1.5 shape: N flat invokes, no children, step.count 1', async () => {
+    const { tracer, spans } = recordingTracer();
+    const { fetch } = mockFetchSequence([
+      () => sseResponse([TOOL_CALL_STREAM]),
+      () => sseResponse([FINAL_STREAM]),
+    ]);
+    await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: { getWeather: { parameters: SCHEMA, execute: async () => ({ temp: 22 }) } },
+      maxSteps: 5,
+      deps: { tracer, tracerMode: 'legacy', clock: fastClock() },
+    });
+    const invokes = spans.filter((s) => s.name === 'invoke');
+    expect(invokes).toHaveLength(2); // one per model call — the 1.5 topology
+    expect(spans.filter((s) => s.name === 'step')).toHaveLength(0);
+    expect(spans.filter((s) => s.name === 'execute_tool')).toHaveLength(0);
+    for (const invoke of invokes) {
+      expect(invoke.parent).toBeUndefined(); // FLAT
+      expect(invoke.attributes['deuz.step.count']).toBe(1);
+      expect(invoke.attributes['gen_ai.request.model']).toBe('claude-opus-4-8');
+      expect(invoke.ended).toBe(1);
+    }
+    expect(invokes[0]!.attributes['gen_ai.response.finish_reasons']).toEqual(['tool_calls']);
+    expect(invokes[1]!.attributes['gen_ai.response.finish_reasons']).toEqual(['stop']);
+  });
+
+  it("legacy retry lands on the model call's own invoke", async () => {
+    const { tracer, spans } = recordingTracer();
+    const { fetch } = mockFetchSequence([
+      () =>
+        new Response(JSON.stringify({ type: 'error', error: { type: 'overloaded_error' } }), {
+          status: 529,
+          headers: { 'content-type': 'application/json' },
+        }),
+      () => sseResponse([FINAL_STREAM]),
+    ]);
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      deps: { tracer, tracerMode: 'legacy', clock: fastClock(), generateId: () => 'fixed' },
+    });
+    await result.usage;
+    const invoke = spans.find((s) => s.name === 'invoke')!;
+    expect(invoke.attributes['deuz.retry.count']).toBe(1);
+    expect(invoke.ended).toBe(1);
+  });
+
+  it('legacy abort: clean end, no exception', async () => {
+    const { tracer, spans } = recordingTracer();
+    const controller = new AbortController();
+    controller.abort();
+    const abortingFetch = ((_url: unknown, init?: RequestInit) =>
+      Promise.reject(
+        (init?.signal as AbortSignal | undefined)?.reason ??
+          Object.assign(new Error('aborted'), { name: 'AbortError' }),
+      )) as typeof fetch;
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch: abortingFetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      signal: controller.signal,
+      deps: { tracer, tracerMode: 'legacy', clock: fastClock() },
+    });
+    await expect(result.finishReason).resolves.toBe('aborted');
+    const invoke = spans.find((s) => s.name === 'invoke')!;
+    expect(invoke.attributes['gen_ai.response.finish_reasons']).toEqual(['aborted']);
+    expect(invoke.exceptions).toHaveLength(0);
+    expect(invoke.ended).toBe(1);
+  });
+
+  it('default stays hierarchical — legacy is opt-in only', async () => {
+    const { tracer, spans } = recordingTracer();
+    const { fetch } = mockFetchSequence([
+      () => sseResponse([TOOL_CALL_STREAM]),
+      () => sseResponse([FINAL_STREAM]),
+    ]);
+    await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: { getWeather: { parameters: SCHEMA, execute: async () => 'r' } },
+      maxSteps: 5,
+      deps: { tracer, clock: fastClock() },
+    });
+    expect(spans.filter((s) => s.name === 'invoke')).toHaveLength(1);
+    expect(spans.filter((s) => s.name === 'step')).toHaveLength(2);
+  });
+});

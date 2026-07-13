@@ -401,7 +401,7 @@ export function createObservationRuntime(
   // invoke→step→execute_tool hierarchy driven by these events — the single
   // span source. Independent of the observer (either alone activates).
   if (deps.tracer !== undefined && deps.tracer !== noopTracer) {
-    sinks.push(createTracerBridge(deps.tracer));
+    sinks.push(createTracerBridge(deps.tracer, deps.tracerMode ?? 'hierarchical'));
   }
   if (init.extraSinks) sinks.push(...init.extraSinks);
   if (sinks.length === 0) return undefined;

@@ -23,7 +23,11 @@ import type { FinishReason } from '../types/usage';
 import type { Observer, ObserveEvent } from '../types/observe';
 import { openSpan, stepAttributes, setUsageAttributes, type SpanHandle } from './trace';
 
-export function createTracerBridge(tracer: Tracer): Observer {
+export function createTracerBridge(
+  tracer: Tracer,
+  mode: 'hierarchical' | 'legacy' = 'hierarchical',
+): Observer {
+  if (mode === 'legacy') return createLegacyBridge(tracer);
   // Open spans keyed by the event spanId that created them. One bridge exists
   // per observation runtime (= per execution leg), so state stays run-local.
   const spans = new Map<string, SpanHandle>();
@@ -169,6 +173,83 @@ export function createTracerBridge(tracer: Tracer): Observer {
         default:
           // model/checkpoint/compaction/subagent/approval/cost events carry no
           // span of their own in the legacy hierarchy.
+          break;
+      }
+    },
+  };
+}
+
+/**
+ * `tracerMode: 'legacy'` (1.6.1): reproduces the exact 1.5 span shape for
+ * consumers whose dashboards/tests pinned it — one FLAT `invoke` span per
+ * model call (agentic loops emit N of them), `deuz.step.count` always 1,
+ * retries as `deuz.retry.count` on the model's own invoke, no `step`/
+ * `execute_tool` children. Compaction summarize side-calls stay span-less
+ * (the 1.5 `skipInvokeSpan` behavior — detected via `purpose`). A user abort
+ * still ends without an exception.
+ */
+function createLegacyBridge(tracer: Tracer): Observer {
+  const spans = new Map<string, SpanHandle>();
+  const retryCounts = new Map<string, number>();
+
+  return {
+    emit(event: ObserveEvent): void {
+      switch (event.type) {
+        case 'model.started': {
+          if (event.purpose !== undefined) break; // 1.5: skipInvokeSpan side-calls
+          spans.set(
+            event.spanId,
+            openSpan(tracer, 'invoke', {
+              'gen_ai.provider.name': event.provider,
+              'gen_ai.request.model': event.model,
+              ...(event.agentPath && event.agentPath.length > 0
+                ? { 'deuz.agent.path': event.agentPath.join('/') }
+                : {}),
+            }),
+          );
+          break;
+        }
+        case 'model.retry': {
+          const span = spans.get(event.spanId);
+          if (span) {
+            const count = (retryCounts.get(event.spanId) ?? 0) + 1;
+            retryCounts.set(event.spanId, count);
+            span.setAttribute('deuz.retry.count', count);
+          }
+          break;
+        }
+        case 'model.completed': {
+          const span = spans.get(event.spanId);
+          if (span) {
+            // 1.5 abort contract: usage attrs + clean end, never an exception.
+            setUsageAttributes(span, event.usage, event.finishReason as FinishReason);
+            span.setAttribute('deuz.step.count', 1);
+            span.end();
+            spans.delete(event.spanId);
+            retryCounts.delete(event.spanId);
+          }
+          break;
+        }
+        case 'model.failed': {
+          const span = spans.get(event.spanId);
+          if (span) {
+            span.fail(event.error);
+            spans.delete(event.spanId);
+            retryCounts.delete(event.spanId);
+          }
+          break;
+        }
+        case 'run.completed':
+        case 'run.suspended':
+        case 'run.aborted':
+        case 'run.failed': {
+          // Safety net for exotic exit paths: settle anything still open.
+          for (const span of spans.values()) span.end();
+          spans.clear();
+          retryCounts.clear();
+          break;
+        }
+        default:
           break;
       }
     },

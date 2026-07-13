@@ -164,3 +164,5 @@ expectTypeOf<GenerateTextResult['observation']>().toEqualTypeOf<
 expectTypeOf<StreamChatResult['observation']>().toEqualTypeOf<
   { settled: Promise<void> } | undefined
 >();
+
+expectTypeOf<Dependencies['tracerMode']>().toEqualTypeOf<'hierarchical' | 'legacy' | undefined>();
