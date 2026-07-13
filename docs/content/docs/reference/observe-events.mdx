@@ -8,7 +8,7 @@ Every event extends `ObserveEventBase`:
 | Field | Meaning |
 | --- | --- |
 | `schemaVersion` | Always `1` |
-| `eventId` / `sequence` / `timestamp` | Unique id · 0-based monotonic counter per execution leg · `deps.clock.now()` |
+| `eventId` / `sequence` / `timestamp` | Unique id (since 1.6.1 derived as `` `${executionId}:${sequence}` `` — the format is not part of the contract) · 0-based monotonic counter per execution leg · `deps.clock.now()` |
 | `runId` | Logical run. Durable runs adopt the session `runId`; sub-agents inherit the parent's |
 | `executionId` | One execution leg — a resume keeps `runId` but gets a fresh `executionId` |
 | `spanId` / `parentSpanId` | Timeline node: run → step → (model \| tool \| compaction) → sub-agent |

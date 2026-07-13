@@ -48,11 +48,13 @@ One event per line, every line valid JSON, `Uint8Array` payloads round-trip via 
 
 | Factory | What it does |
 | --- | --- |
-| `createMemoryObserver({ maxEvents?, overflow? })` | Capped in-memory ring buffer with `events()` / `eventsForRun(runId)` / `latestRun()` |
+| `createMemoryObserver({ maxEvents?, maxBytes?, overflow? })` | Capped in-memory ring buffer with `events()` / `eventsForRun(runId)` / `latestRun()` |
 | `createCallbackObserver(fn, options?)` | Wraps a plain callback; a throwing callback is swallowed |
-| `composeObservers(...observers)` | Fan-out; one throwing child never blocks its siblings; options merge (capture = OR, sampleRate = max, limits = min) |
+| `composeObservers(...observers)` | Fan-out with **per-sink capture projection**; one throwing child never blocks its siblings |
 | `filterObserver(observer, predicate)` | Forward only matching events |
 | `createJsonlObserver({ file, … })` | Node-only JSONL file sink (`@deuz-sdk/core/observe/node`) |
+
+`createMemoryObserver` accepts a total byte budget alongside the event cap (1.6.1): `maxBytes` measures each stored event's approximate JSON size and evicts by the shared `overflow` strategy (`'drop-oldest'` default / `'drop-newest'`), counting evictions in `droppedCount`. `maxEvents` and `maxBytes` compose — whichever budget is exceeded first wins.
 
 ## Privacy defaults and capture
 
@@ -68,7 +70,30 @@ const observer = createMemoryObserver({
 });
 ```
 
-Captured payloads always pass the observation redaction profile first (API keys, `Bearer`/JWT/PEM patterns, `password`/`cookie`/`token`-style keys → `[REDACTED]`), then your optional custom `redact` hook, then structural limits (string/array/depth caps with `[Truncated]` markers). This is regression-tested: planted secrets in prompts, tool outputs, headers and factory keys never reach an event or a JSONL line.
+Captured payloads always pass the observation redaction profile (API keys, `Bearer`/JWT/PEM patterns, `password`/`cookie`/`token`-style keys → `[REDACTED]`) plus structural limits (string/array/depth caps with `[Truncated]` markers). Since 1.6.1 the built-in profile also runs **after** your optional custom `redact` hook — a buggy or malicious redactor cannot reintroduce a secret, and truncation can never split a secret into a decodable prefix. This is regression-tested: planted secrets in prompts, tool outputs, headers and factory keys never reach an event or a JSONL line.
+
+### Composite observers see only what they opted into (1.6.1)
+
+`composeObservers` still merges options for event *production* (capture = OR, sampleRate = max, limits = min), but each child now receives a **projection** of every event: `captured*` fields its own `capture` options don't allow are stripped, `error.message` is dropped unless it set `capture.errorMessages`, and a child `redact` hook only ever runs on that child's view. A composed sink with no options behaves exactly like a standalone observer with defaults — it gets no captured content.
+
+```ts
+const observer = composeObservers(
+  createMemoryObserver({ observation: { capture: { messages: true } } }), // sees prompts
+  remoteSink, // no capture options — receives counts/ids/durations only
+);
+```
+
+## Draining async events: `observation.settled`
+
+`cost.calculated` can resolve asynchronously (an async `priceProvider`). Results expose an optional `observation.settled` promise — await it before closing a file-backed observer so late events aren't dropped:
+
+```ts
+const res = await generateText({ model, messages, deps: { observer } });
+await res.observation?.settled; // all pending observe enrichments flushed
+await observer.close();
+```
+
+The field exists only when a run was actually observed; nothing about the run itself ever waits on it (G2 holds).
 
 ## Guarantees
 
@@ -79,7 +104,7 @@ Captured payloads always pass the observation redaction profile first (API keys,
 - **Durable correlation.** A durable run keeps one `runId` across suspend/resume legs; each leg gets a fresh `executionId`, and `checkpoint.loaded` precedes `run.started { resumed: true }`.
 - **Sub-agents** share the parent's `runId` and are identified by `agentPath`; their usage is folded into the parent exactly once.
 
-## Legacy tracer bridge
+## Tracer bridge
 
 An injected `Dependencies.tracer` now receives the full documented span hierarchy, driven by the same events:
 
@@ -90,5 +115,7 @@ invoke (one per run)
 ```
 
 Span names and attribute keys are unchanged from 1.5 (`gen_ai.*` semconv + `deuz.*`); the behavioral difference is that agentic loops now produce one `invoke` with children instead of N flat invokes. A user abort still ends the span without an exception. An OTel exporter plugs into this seam.
+
+Dashboards built against the 1.5 flat topology can opt back into it with `deps: { tracerMode: 'legacy' }` (1.6.1): every model call becomes its own parent-less `invoke` span with `deuz.step.count: 1`, no `step`/`execute_tool` children, retries landing on that call's span. The default remains `'hierarchical'`.
 
 See the full event catalog in [Observation events](/docs/reference/observe-events).
