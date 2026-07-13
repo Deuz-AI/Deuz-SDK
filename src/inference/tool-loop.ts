@@ -163,7 +163,11 @@ export async function runToolLoop(
         suspend,
       });
     }
-    return finish();
+    const result = finish();
+    // Settlement (1.6.1): the cost enrichment was registered synchronously
+    // inside endLoopObserve above — settled() drains it.
+    if (lo) result.observation = { settled: lo.rt.settled() };
+    return result;
   };
 
   /** Checkpoint correlation for run.suspended (stepIndex bumped inside saveCheckpoint). */

@@ -156,3 +156,13 @@ import type { Tracer, Span, SpanOptions } from '../src/index';
 expectTypeOf<Tracer['startSpan']>().toBeFunction();
 expectTypeOf<Span>().toHaveProperty('recordException');
 expectTypeOf<SpanOptions>().toHaveProperty('parent');
+
+// --- 1.6.1 additive: observation settlement on results. ---
+expectTypeOf<GenerateTextResult['observation']>().toEqualTypeOf<
+  { settled: Promise<void> } | undefined
+>();
+expectTypeOf<StreamChatResult['observation']>().toEqualTypeOf<
+  { settled: Promise<void> } | undefined
+>();
+
+expectTypeOf<Dependencies['tracerMode']>().toEqualTypeOf<'hierarchical' | 'legacy' | undefined>();

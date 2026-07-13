@@ -283,7 +283,8 @@ export const embedMany: EmbedMany = async (options: EmbedManyOptions): Promise<E
         ...(costUsd !== undefined ? { costUsd } : {}),
       });
     }
-    return result;
+    // Settlement (1.6.1): cost enrichment registered above; settled() drains it.
+    return rt ? { ...result, observation: { settled: rt.settled() } } : result;
   } catch (err) {
     if (rt) {
       if (err instanceof AbortError || options.signal?.aborted) {
@@ -382,6 +383,6 @@ export const embed: Embed = async (options: EmbedOptions): Promise<EmbedResult> 
   if (clientContext) attachClientContext(manyOptions, clientContext);
   // Observation: one run, labeled 'embed' — embedMany must not emit a second.
   Object.defineProperty(manyOptions, EMBED_OPERATION, { value: 'embed', enumerable: false });
-  const { embeddings, usage } = await embedMany(manyOptions);
-  return { embedding: embeddings[0] ?? [], usage };
+  const { embeddings, usage, observation } = await embedMany(manyOptions);
+  return { embedding: embeddings[0] ?? [], usage, ...(observation ? { observation } : {}) };
 };

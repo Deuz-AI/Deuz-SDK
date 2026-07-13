@@ -65,6 +65,14 @@ export interface ObservationRuntime {
   /** New timeline node id (deps.generateId()). */
   startSpan(): { spanId: string; startedAt: number };
   emit(event: PendingObserveEvent): void;
+  /**
+   * Register an async enrichment (e.g. a pending priceProvider cost) so
+   * `settled()` can await it. The promise's failure is swallowed here — the
+   * enrichment site owns its own error handling.
+   */
+  trackPending(promise: Promise<unknown>): void;
+  /** Resolves once every registered enrichment has settled (1.6.1). */
+  settled(): Promise<void>;
 }
 
 export interface ObservationRuntimeInit {
@@ -99,17 +107,24 @@ const DEFAULT_CAPTURE: Required<ObservationCaptureOptions> = {
   providerMetadata: false,
 };
 
-/** Captured-payload keys and the redactor `field` name each maps to. */
-const CAPTURE_FIELDS: Record<
+/**
+ * Captured-payload keys → the redactor `field` name + the capture flag that
+ * gates them. Single source of truth shared with `composeObservers`' per-sink
+ * projection (src/observe.ts) — never duplicate this table.
+ */
+export const CAPTURE_FIELDS: Record<
   string,
-  Parameters<NonNullable<ObservationOptions['redact']>>[1]['field']
+  {
+    field: Parameters<NonNullable<ObservationOptions['redact']>>[1]['field'];
+    flag: keyof ObservationCaptureOptions;
+  }
 > = {
-  capturedMessages: 'messages',
-  capturedInput: 'tool-input',
-  capturedOutput: 'tool-output',
-  capturedOutputText: 'output',
-  capturedReasoning: 'reasoning',
-  capturedProviderMetadata: 'provider-metadata',
+  capturedMessages: { field: 'messages', flag: 'messages' },
+  capturedInput: { field: 'tool-input', flag: 'toolInputs' },
+  capturedOutput: { field: 'tool-output', flag: 'toolOutputs' },
+  capturedOutputText: { field: 'output', flag: 'outputText' },
+  capturedReasoning: { field: 'reasoning', flag: 'reasoning' },
+  capturedProviderMetadata: { field: 'provider-metadata', flag: 'providerMetadata' },
 };
 
 const TRUNCATED = '[Truncated]';
@@ -352,13 +367,17 @@ export function observeCost(
     const result = priceProvider.priceUsage(model, usage);
     if (typeof result === 'number') return result;
     if (result && typeof (result as Promise<number | undefined>).then === 'function') {
-      void (result as Promise<number | undefined>).then(
-        (costUsd) => {
-          if (typeof costUsd === 'number') {
-            rt.emit({ type: 'cost.calculated', spanId, target, provider, model, usage, costUsd });
-          }
-        },
-        () => undefined,
+      // Tracked (1.6.1): `result.observation.settled` awaits this, so a user
+      // can drain the cost event before closing a JSONL observer.
+      rt.trackPending(
+        (result as Promise<number | undefined>).then(
+          (costUsd) => {
+            if (typeof costUsd === 'number') {
+              rt.emit({ type: 'cost.calculated', spanId, target, provider, model, usage, costUsd });
+            }
+          },
+          () => undefined,
+        ),
       );
     }
   } catch {
@@ -382,7 +401,7 @@ export function createObservationRuntime(
   // invoke→step→execute_tool hierarchy driven by these events — the single
   // span source. Independent of the observer (either alone activates).
   if (deps.tracer !== undefined && deps.tracer !== noopTracer) {
-    sinks.push(createTracerBridge(deps.tracer));
+    sinks.push(createTracerBridge(deps.tracer, deps.tracerMode ?? 'hierarchical'));
   }
   if (init.extraSinks) sinks.push(...init.extraSinks);
   if (sinks.length === 0) return undefined;
@@ -400,6 +419,7 @@ export function createObservationRuntime(
 
   let sequence = 0;
   let terminalSeen = false;
+  const pendingEnrichments = new Set<Promise<unknown>>();
   const counters: RunCounters = {
     modelCalls: 0,
     toolCalls: 0,
@@ -425,25 +445,34 @@ export function createObservationRuntime(
   const finalize = (pending: PendingObserveEvent): ObserveEvent => {
     const state: SnapshotState = { limits, truncated: false, seen: new WeakSet() };
     const event = pending as unknown as Record<string, unknown>;
-    // Captured payloads: default redaction → custom redactor → structural limits.
-    for (const [key, field] of Object.entries(CAPTURE_FIELDS)) {
+    // Captured payloads: default secret redaction FIRST (so truncation can
+    // never split a secret into a surviving decodable prefix) → bounded
+    // snapshot → custom redactor → default secret redaction AGAIN as the
+    // FINAL BARRIER (a buggy or malicious custom redactor that reintroduces a
+    // secret still hits the sweep) → re-bound (custom output may exceed
+    // limits; the extra passes run only when a redactor is configured).
+    for (const [key, { field }] of Object.entries(CAPTURE_FIELDS)) {
       if (event[key] === undefined) continue;
-      let value = redactForObservation(event[key]);
+      let value = snapshot(redactForObservation(event[key]), state, 0);
       if (options.redact) {
         try {
           value = options.redact(value, { eventType: pending.type, field });
         } catch {
           value = '[RedactionError]';
         }
+        value = snapshot(redactForObservation(value), state, 0);
       }
-      event[key] = snapshot(value, state, 0);
+      event[key] = value;
     }
     if (typeof event.reason === 'string') {
       event.reason = redactObservationString(event.reason as string);
     }
     const full = {
       schemaVersion: 1,
-      eventId: deps.generateId(),
+      // Derived, not drawn (1.6.1): executionId is already unique per leg, so
+      // `${executionId}:${sequence}` is globally unique, deterministic, and
+      // saves one generateId() per event.
+      eventId: `${executionId}:${sequence}`,
       sequence: sequence++,
       timestamp: deps.clock.now(),
       runId,
@@ -482,6 +511,20 @@ export function createObservationRuntime(
     now: () => deps.clock.now(),
     durationSince: (startedAt: number) => Math.max(0, deps.clock.now() - startedAt),
     startSpan: () => ({ spanId: deps.generateId(), startedAt: deps.clock.now() }),
+    trackPending(promise: Promise<unknown>): void {
+      pendingEnrichments.add(promise);
+      void promise
+        .catch(() => undefined)
+        .finally(() => {
+          pendingEnrichments.delete(promise);
+        });
+    },
+    async settled(): Promise<void> {
+      // Loop: an awaited enrichment may register a follow-up.
+      while (pendingEnrichments.size > 0) {
+        await Promise.allSettled([...pendingEnrichments]);
+      }
+    },
     emit(pending: PendingObserveEvent): void {
       const isTerminal = TERMINAL_TYPES.has(pending.type);
       if (isTerminal) {

@@ -106,8 +106,9 @@ describe('observation runtime — stamping', () => {
     expect(completed.sequence).toBe(1);
     expect(started.runId).toBe(completed.runId);
     expect(started.executionId).toBe(completed.executionId);
-    // ids come from the injected generateId — deterministic
-    expect(started.eventId).toMatch(/^id-\d+$/);
+    // eventId is DERIVED (1.6.1): executionId:sequence — no per-event id draw
+    expect(started.eventId).toBe(`${started.executionId}:0`);
+    expect(completed.eventId).toBe(`${completed.executionId}:1`);
     // timestamps come from the injected clock
     expect(typeof started.timestamp).toBe('number');
     expect(completed.timestamp).toBeGreaterThan(started.timestamp);

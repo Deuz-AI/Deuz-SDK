@@ -85,6 +85,49 @@ describe('createMemoryObserver', () => {
     expect(mem.events().map((e) => e.sequence)).toEqual([0]);
   });
 
+  it('maxBytes bounds total memory even with big captured payloads (drop-oldest)', () => {
+    const mem = createMemoryObserver({ maxBytes: 2000 });
+    for (let i = 0; i < 10; i++) {
+      mem.emit(
+        stamped({
+          type: 'tool.completed',
+          sequence: i,
+          toolCallId: `c${i}`,
+          toolName: 't',
+          durationMs: 1,
+          outputType: 'string',
+          capturedOutput: 'x'.repeat(400),
+        } as Partial<ObserveEvent> & { type: 'tool.completed' }),
+      );
+    }
+    expect(mem.droppedCount).toBeGreaterThan(0);
+    const kept = mem.events();
+    expect(kept.length).toBeLessThan(10);
+    // newest survive under drop-oldest
+    expect(kept.at(-1)!.sequence).toBe(9);
+    const totalKept = kept.reduce((n, e) => n + JSON.stringify(e).length, 0);
+    expect(totalKept).toBeLessThanOrEqual(2000);
+  });
+
+  it('maxBytes with drop-newest keeps the oldest events', () => {
+    const mem = createMemoryObserver({ maxBytes: 700, overflow: 'drop-newest' });
+    for (let i = 0; i < 5; i++) {
+      mem.emit(
+        stamped({
+          type: 'tool.completed',
+          sequence: i,
+          toolCallId: `c${i}`,
+          toolName: 't',
+          durationMs: 1,
+          outputType: 'string',
+          capturedOutput: 'x'.repeat(300),
+        } as Partial<ObserveEvent> & { type: 'tool.completed' }),
+      );
+    }
+    expect(mem.droppedCount).toBeGreaterThan(0);
+    expect(mem.events()[0]!.sequence).toBe(0);
+  });
+
   it('clear() resets buffer, droppedCount and latestRun', () => {
     const mem = createMemoryObserver({ maxEvents: 1 });
     mem.emit(stamped({ type: 'run.started' }));
@@ -170,6 +213,128 @@ describe('composeObservers', () => {
     await expect(Promise.resolve(composite.flush?.())).resolves.toBeUndefined();
     await expect(Promise.resolve(composite.close?.())).resolves.toBeUndefined();
     expect(calls).toEqual(['flaky.flush', 'solid.flush', 'flaky.close', 'solid.close']);
+  });
+});
+
+describe('composeObservers — per-sink capture projection (1.6.1)', () => {
+  function capturedEvent(): ObserveEvent {
+    return stamped({
+      type: 'tool.completed',
+      toolCallId: 'c1',
+      toolName: 't',
+      durationMs: 1,
+      outputType: 'object',
+      capturedOutput: { result: 'raw tool output' },
+    } as Partial<ObserveEvent> & { type: 'tool.completed' });
+  }
+
+  function startedEvent(): ObserveEvent {
+    return stamped({
+      type: 'tool.started',
+      toolCallId: 'c1',
+      toolName: 't',
+      needsApproval: false,
+      executionMode: 'server',
+      parallel: false,
+      capturedInput: { q: 'raw tool input' },
+    } as Partial<ObserveEvent> & { type: 'tool.started' });
+  }
+
+  it('a capture-off sink composed with a capture-on one never sees captured content', () => {
+    const localSeen: ObserveEvent[] = [];
+    const remoteSeen: ObserveEvent[] = [];
+    const local: import('../src/index').Observer = {
+      options: { capture: { toolOutputs: true, toolInputs: true } },
+      emit: (e) => localSeen.push(e),
+    };
+    const remote: import('../src/index').Observer = { emit: (e) => remoteSeen.push(e) }; // bare: defaults = everything off
+    const composite = composeObservers(local, remote);
+    composite.emit(capturedEvent());
+    composite.emit(startedEvent());
+
+    const localDone = localSeen[0] as Extract<ObserveEvent, { type: 'tool.completed' }>;
+    const remoteDone = remoteSeen[0] as Extract<ObserveEvent, { type: 'tool.completed' }>;
+    expect(localDone.capturedOutput).toEqual({ result: 'raw tool output' });
+    expect(remoteDone.capturedOutput).toBeUndefined();
+    const localStart = localSeen[1] as Extract<ObserveEvent, { type: 'tool.started' }>;
+    const remoteStart = remoteSeen[1] as Extract<ObserveEvent, { type: 'tool.started' }>;
+    expect(localStart.capturedInput).toEqual({ q: 'raw tool input' });
+    expect(remoteStart.capturedInput).toBeUndefined();
+    // non-captured fields are untouched by the projection
+    expect(remoteDone.durationMs).toBe(1);
+  });
+
+  it('partial capture: only the enabled field survives per sink', () => {
+    const seen: ObserveEvent[] = [];
+    const inputsOnly = composeObservers(
+      { options: { capture: { toolOutputs: true } }, emit: () => {} },
+      { options: { capture: { toolInputs: true } }, emit: (e) => seen.push(e) },
+    );
+    inputsOnly.emit(capturedEvent());
+    inputsOnly.emit(startedEvent());
+    const done = seen[0] as Extract<ObserveEvent, { type: 'tool.completed' }>;
+    const start = seen[1] as Extract<ObserveEvent, { type: 'tool.started' }>;
+    expect(done.capturedOutput).toBeUndefined(); // outputs not enabled on THIS sink
+    expect(start.capturedInput).toEqual({ q: 'raw tool input' });
+  });
+
+  it('error.message is gated per sink too', () => {
+    const withMsg: ObserveEvent[] = [];
+    const withoutMsg: ObserveEvent[] = [];
+    const failed = stamped({
+      type: 'run.failed',
+      status: 'failed',
+      durationMs: 1,
+      error: { name: 'E', category: 'unknown', message: 'sensitive detail' },
+      stepCount: 0,
+      modelCallCount: 0,
+      toolCallCount: 0,
+      retryCount: 0,
+    } as Partial<ObserveEvent> & { type: 'run.failed' });
+    composeObservers(
+      { options: { capture: { errorMessages: true } }, emit: (e) => withMsg.push(e) },
+      { emit: (e) => withoutMsg.push(e) },
+    ).emit(failed);
+    expect((withMsg[0] as Extract<ObserveEvent, { type: 'run.failed' }>).error.message).toBe(
+      'sensitive detail',
+    );
+    expect(
+      (withoutMsg[0] as Extract<ObserveEvent, { type: 'run.failed' }>).error.message,
+    ).toBeUndefined();
+    expect((withoutMsg[0] as Extract<ObserveEvent, { type: 'run.failed' }>).error.name).toBe('E');
+  });
+
+  it("a child's redactor applies ONLY to its own view, and the final barrier still runs after it", () => {
+    const aSeen: ObserveEvent[] = [];
+    const bSeen: ObserveEvent[] = [];
+    composeObservers(
+      {
+        options: {
+          capture: { toolOutputs: true, toolInputs: true },
+          // hostile: tries to reintroduce a secret into its own view
+          redact: () => 'leak sk-ant-reintroduced-by-child-redactor00',
+        },
+        emit: (e) => aSeen.push(e),
+      },
+      {
+        options: { capture: { toolOutputs: true, toolInputs: true } },
+        emit: (e) => bSeen.push(e),
+      },
+    ).emit(capturedEvent());
+    const a = aSeen[0] as Extract<ObserveEvent, { type: 'tool.completed' }>;
+    const b = bSeen[0] as Extract<ObserveEvent, { type: 'tool.completed' }>;
+    // A's redactor output passed through the default sweep — no secret survives
+    expect(JSON.stringify(a)).not.toContain('sk-ant-reintroduced');
+    expect(a.capturedOutput).toContain('[REDACTED]');
+    // B's view is untouched by A's redactor
+    expect(b.capturedOutput).toEqual({ result: 'raw tool output' });
+  });
+
+  it('fast path: no captured fields → children receive the SAME event reference', () => {
+    const seen: ObserveEvent[] = [];
+    const event = stamped({ type: 'run.started' });
+    composeObservers({ emit: (e) => seen.push(e) }).emit(event);
+    expect(seen[0]).toBe(event);
   });
 });
 

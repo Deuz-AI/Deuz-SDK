@@ -19,8 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version-file: .node-version
           cache: npm
@@ -31,11 +31,30 @@ jobs:
       - run: npm ci
       - run: npm ci --prefix docs
       - run: npm run release:verify
+      # Trusted publishing (OIDC) needs a recent npm on the runner.
+      - name: Update npm (trusted publishing requires >= 11.5)
+        run: npm install -g npm@latest
       - name: Publish with provenance
-        run: npm publish --access public --provenance
+        shell: bash
+        # Two auth paths, in preference order:
+        #  1. npm trusted publishing (OIDC) — configure the Trusted Publisher on
+        #     npmjs.com for this repo + workflow; no secret needed (id-token: write
+        #     above). The empty authToken line setup-node wrote must be removed or
+        #     npm sends an empty token instead of minting OIDC credentials.
+        #  2. NPM_TOKEN secret in the `npm` environment — classic token auth.
+        run: |
+          if [ -n "${NODE_AUTH_TOKEN}" ]; then
+            npm publish --access public --provenance
+          else
+            npm config delete //registry.npmjs.org/:_authToken || true
+            npm publish --access public --provenance
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Create GitHub release
-        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag
+      - name: Create GitHub release (skip when it already exists)
+        shell: bash
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}

@@ -10,10 +10,11 @@ import type {
   ObservationOptions,
   ObservationCaptureOptions,
   ObservationLimits,
-  ObservationRedactor,
   ObservedError,
 } from './types/observe';
 import type { Usage } from './types/usage';
+import { CAPTURE_FIELDS } from './internal/observe-runtime';
+import { redactForObservation } from './internal/redact';
 
 // ---------------------------------------------------------------------------
 // Callback observer
@@ -50,18 +51,43 @@ export interface MemoryObserver extends Observer {
   clear(): void;
 }
 
+/** Approximate in-memory size of an event; measured only when `maxBytes` is set. */
+function approxEventBytes(event: ObserveEvent): number {
+  try {
+    // Safe here: events already passed the runtime's cycle-free snapshot, and
+    // this runs inside the observer — never on the core hot path.
+    return JSON.stringify(event).length;
+  } catch {
+    return 1024; // pathological payload — charge a conservative flat size
+  }
+}
+
 export function createMemoryObserver(options?: {
   /** Hard cap — memory never grows unbounded. Default 10_000. */
   maxEvents?: number;
-  /** What to do at the cap. Default 'drop-oldest'. */
+  /**
+   * Approximate total byte budget across the buffer (1.6.1 additive) —
+   * bounds memory even when raw content capture is on. Unset = no byte cap.
+   */
+  maxBytes?: number;
+  /** What to do at the caps. Default 'drop-oldest'. */
   overflow?: 'drop-oldest' | 'drop-newest';
   observation?: ObservationOptions;
 }): MemoryObserver {
   const maxEvents = Math.max(1, options?.maxEvents ?? 10_000);
+  const maxBytes = options?.maxBytes !== undefined ? Math.max(1, options.maxBytes) : undefined;
   const overflow = options?.overflow ?? 'drop-oldest';
   let buffer: ObserveEvent[] = [];
+  let sizes: number[] = [];
+  let totalBytes = 0;
   let dropped = 0;
   let lastRunId: string | undefined;
+
+  const evictOldest = (): void => {
+    buffer.shift();
+    if (maxBytes !== undefined) totalBytes -= sizes.shift() ?? 0;
+    dropped += 1;
+  };
 
   return {
     options: options?.observation,
@@ -70,12 +96,22 @@ export function createMemoryObserver(options?: {
     },
     emit(event) {
       lastRunId = event.runId;
-      if (buffer.length >= maxEvents) {
+      const size = maxBytes !== undefined ? approxEventBytes(event) : 0;
+      const overCount = buffer.length >= maxEvents;
+      const overBytes = maxBytes !== undefined && totalBytes + size > maxBytes;
+      if ((overCount || overBytes) && overflow === 'drop-newest') {
         dropped += 1;
-        if (overflow === 'drop-newest') return;
-        buffer.shift();
+        return;
+      }
+      if (overCount) evictOldest();
+      if (maxBytes !== undefined) {
+        while (buffer.length > 0 && totalBytes + size > maxBytes) evictOldest();
       }
       buffer.push(event);
+      if (maxBytes !== undefined) {
+        sizes.push(size);
+        totalBytes += size;
+      }
     },
     events() {
       return buffer.slice();
@@ -89,6 +125,8 @@ export function createMemoryObserver(options?: {
     },
     clear() {
       buffer = [];
+      sizes = [];
+      totalBytes = 0;
       dropped = 0;
       lastRunId = undefined;
     },
@@ -131,35 +169,62 @@ function mergeLimits(
   return out as ObservationLimits;
 }
 
-function chainRedactors(
-  a: ObservationRedactor | undefined,
-  b: ObservationRedactor | undefined,
-): ObservationRedactor | undefined {
-  if (!a) return b;
-  if (!b) return a;
-  return (value, context) => {
-    let out = value;
-    try {
-      out = a(out, context);
-    } catch {
-      // a failing link keeps the previous value; the chain continues
+/**
+ * Per-sink privacy projection (1.6.1): the runtime produces ONE event at the
+ * UNION of all children's capture flags, and each child then receives only
+ * what ITS OWN capture opted into — captured payload fields the child did not
+ * enable are stripped, `error.message` included. A child's custom `redact`
+ * applies only to its own view (never to siblings'), and the default secret
+ * redaction runs once more after it (the same final-barrier rule as the
+ * runtime). Children without options behave like a standalone observer with
+ * defaults: no captured content at all.
+ */
+function projectForChild(
+  event: ObserveEvent,
+  options: ObservationOptions | undefined,
+): ObserveEvent {
+  const capture = options?.capture;
+  const redact = options?.redact;
+  const source = event as unknown as Record<string, unknown>;
+  let clone: Record<string, unknown> | undefined;
+  const ensure = (): Record<string, unknown> => (clone ??= { ...source });
+
+  for (const [key, meta] of Object.entries(CAPTURE_FIELDS)) {
+    if (source[key] === undefined) continue;
+    if (capture?.[meta.flag] !== true) {
+      delete ensure()[key];
+      continue;
     }
-    try {
-      out = b(out, context);
-    } catch {
-      // ditto
+    if (redact) {
+      let value: unknown;
+      try {
+        value = redact(source[key], { eventType: event.type, field: meta.field });
+      } catch {
+        value = '[RedactionError]';
+      }
+      ensure()[key] = redactForObservation(value);
     }
-    return out;
-  };
+  }
+
+  // error.message is captured content too — gate it per child.
+  const error = source.error as ObservedError | undefined;
+  if (error?.message !== undefined && capture?.errorMessages !== true) {
+    const { message: _message, ...rest } = error;
+    ensure().error = rest;
+  }
+
+  return (clone ?? event) as ObserveEvent;
 }
 
 /**
  * Fan one event stream out to many observers. Merge rules (resolved once):
- * enabled = any child enabled; sampleRate = max; capture = field-wise OR;
- * limits = field-wise min; metadata = shallow merge (later wins); redact =
- * chain in order. The composite produces ONE event set at the most permissive
- * capture — restrictive children should wrap themselves with `filterObserver`
- * or their own redaction. A throwing child never blocks its siblings.
+ * enabled = any child enabled; sampleRate = max; capture = field-wise OR
+ * (so the runtime produces the payloads at all); limits = field-wise min;
+ * metadata = shallow merge (later wins). Each child then receives a PER-SINK
+ * projection of the event: only the captured content its own options enabled,
+ * with its own redactor applied to its own view — a capture-off sink composed
+ * next to a capture-on one never sees raw content (1.6.1 privacy fix).
+ * A throwing child never blocks its siblings.
  */
 export function composeObservers(...observers: readonly Observer[]): Observer {
   const merged: ObservationOptions = {};
@@ -175,7 +240,8 @@ export function composeObservers(...observers: readonly Observer[]): Observer {
     merged.capture = mergeCapture(merged.capture, o.capture);
     merged.limits = mergeLimits(merged.limits, o.limits);
     if (o.metadata) merged.metadata = { ...merged.metadata, ...o.metadata };
-    merged.redact = chainRedactors(merged.redact, o.redact);
+    // NOTE: child `redact`s are deliberately NOT merged into the runtime
+    // options — each applies only inside its own projection below.
   }
   if (!anyEnabled) merged.enabled = false;
   if (sampleRate !== undefined) merged.sampleRate = sampleRate;
@@ -186,7 +252,7 @@ export function composeObservers(...observers: readonly Observer[]): Observer {
       for (const obs of observers) {
         if (obs.options?.enabled === false) continue;
         try {
-          obs.emit(event);
+          obs.emit(projectForChild(event, obs.options));
         } catch {
           // one child's failure never blocks the others
         }

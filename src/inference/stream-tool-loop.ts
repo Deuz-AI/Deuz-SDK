@@ -101,10 +101,23 @@ export function runStreamToolLoop(
   const textSub = broadcaster.subscribe();
 
   let started = false;
+  // Observation settlement (1.6.1) — see runStream's twin.
+  const observationDeferred = createDeferred<void>();
+  let observationHandle: { settled: Promise<void> } | undefined;
+  let rtRef: ObservationRuntime | undefined;
   function ensureStarted(): void {
     if (started) return;
     started = true;
-    void pump();
+    void pump().finally(() => {
+      void (async () => {
+        try {
+          await rtRef?.settled();
+        } catch {
+          // settlement must never throw
+        }
+        observationDeferred.resolve();
+      })();
+    });
   }
 
   async function pump(): Promise<void> {
@@ -169,6 +182,10 @@ export function runStreamToolLoop(
       inherited: internal?.observeInherited,
     });
     if (durable && lo) durable.observe = { rt: lo.rt, runSpanId: lo.runSpanId };
+    if (lo) {
+      rtRef = lo.rt;
+      observationHandle = { settled: observationDeferred.promise };
+    }
     const steps: StepResult[] = [];
     const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
     const wantCost = needsCost(stopConditions);
@@ -738,6 +755,10 @@ export function runStreamToolLoop(
     get finishReason() {
       ensureStarted();
       return finishDeferred.promise;
+    },
+    get observation() {
+      ensureStarted();
+      return observationHandle;
     },
     ...(runId !== undefined ? { runId } : {}),
   };

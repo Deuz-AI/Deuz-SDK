@@ -15,6 +15,14 @@ export interface Dependencies {
   logger?: Logger;
   /** OpenTelemetry-shaped tracer seam. Default: no-op. */
   tracer?: Tracer;
+  /**
+   * Span topology for the injected tracer (1.6.1 additive).
+   * 'hierarchical' (default, 1.6 behavior): one `invoke` per run with
+   * `step`/`execute_tool` children. 'legacy': the 1.5 shape — one flat
+   * `invoke` span per model call, no children (for consumers whose
+   * dashboards/tests pinned the old topology).
+   */
+  tracerMode?: 'hierarchical' | 'legacy';
   /** Circuit-breaker state store. Default: in-memory Map (per client). */
   breakerStore?: BreakerStore;
   /** Provider API-key resolver. Default: reads from client config keys. */

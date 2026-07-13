@@ -470,3 +470,91 @@ describe('instrumented embed runs (E2E)', () => {
     expect(retry.reason).toBe('rate-limit');
   });
 });
+
+describe('observation.settled (1.6.1)', () => {
+  it('async priceProvider: settled drains the cost event BEFORE a JSONL close', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { readFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createJsonlObserver } = await import('../src/node/observe');
+
+    const file = join(mkdtempSync(join(tmpdir(), 'deuz-settled-')), 'runs.jsonl');
+    const jsonl = createJsonlObserver({ file });
+    const res = await generateText({
+      model: createAnthropic({
+        apiKey: 'k',
+        fetch: sequenceFetch([() => sseResponse([TEXT_STREAM])]),
+      })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      deps: {
+        observer: jsonl,
+        clock: fastClock(),
+        // resolves on a later tick — the exact scenario that used to lose the event
+        priceProvider: { priceUsage: () => new Promise((r) => setTimeout(() => r(0.03), 10)) },
+      },
+    });
+    expect(res.observation).toBeDefined();
+    await res.observation!.settled;
+    await jsonl.close();
+    const lines = (await readFile(file, 'utf8')).trim().split('\n');
+    const types = lines.map((l) => (JSON.parse(l) as { type: string }).type);
+    expect(types).toContain('cost.calculated');
+    expect(jsonl.droppedCount).toBe(0);
+  });
+
+  it('streaming shell exposes settled; sync provider settles immediately', async () => {
+    const mem = createMemoryObserver();
+    const result = streamChat({
+      model: createAnthropic({
+        apiKey: 'k',
+        fetch: sequenceFetch([() => sseResponse([TEXT_STREAM])]),
+      })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      deps: { observer: mem, clock: fastClock(), priceProvider: { priceUsage: () => 0.01 } },
+    });
+    await result.usage;
+    expect(result.observation).toBeDefined();
+    await expect(result.observation!.settled).resolves.toBeUndefined();
+    const completed = mem.events().find((e) => e.type === 'run.completed') as Ev<'run.completed'>;
+    expect(completed.costUsd).toBe(0.01);
+  });
+
+  it('no observer → no observation field (fast path unchanged)', async () => {
+    const res = await generateText({
+      model: createAnthropic({
+        apiKey: 'k',
+        fetch: sequenceFetch([() => sseResponse([TEXT_STREAM])]),
+      })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      deps: { clock: fastClock() },
+    });
+    expect(res.observation).toBeUndefined();
+  });
+
+  it('embed results carry settled too (async cost drained)', async () => {
+    const mem = createMemoryObserver();
+    const okEmbedding = (): Response =>
+      new Response(
+        JSON.stringify({
+          data: [{ index: 0, embedding: [0.1, 0.2] }],
+          usage: { prompt_tokens: 4, total_tokens: 4 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    const res = await embed({
+      model: createOpenAIEmbedding({ apiKey: 'sk-test', fetch: sequenceFetch([okEmbedding]) })(
+        'text-embedding-3-small',
+      ),
+      value: 'hello',
+      deps: {
+        observer: mem,
+        clock: fastClock(),
+        priceProvider: { priceUsage: () => Promise.resolve(0.0001) },
+      },
+    });
+    expect(res.observation).toBeDefined();
+    await res.observation!.settled;
+    expect(mem.events().some((e) => e.type === 'cost.calculated')).toBe(true);
+  });
+});

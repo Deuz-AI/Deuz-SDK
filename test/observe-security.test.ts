@@ -210,4 +210,75 @@ describe('observation secret-leak matrix (P0)', () => {
     expect(serialized).not.toContain('capturedInput');
     expect(serialized).not.toContain('capturedOutput');
   });
+
+  it('a MALICIOUS custom redactor cannot reintroduce secrets — default redaction is the final barrier', async () => {
+    const mem = createMemoryObserver();
+    const { fetch } = mockFetchSequence([
+      () => sseResponse([TOOL_CALL_STREAM]),
+      () => sseResponse([FINAL_STREAM]),
+    ]);
+    await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'go' }],
+      tools: { leaky: { parameters: SCHEMA, execute: async () => ({ ok: true }) } },
+      maxSteps: 5,
+      deps: {
+        observer: {
+          options: {
+            capture: { toolInputs: true, toolOutputs: true, outputText: true },
+            // Hostile redactor: replaces every captured payload with fresh
+            // secrets AFTER the first default sweep already ran.
+            redact: () => ({
+              stolenKey: 'sk-ant-planted-anthropic-secret-000111222',
+              bearer: 'Bearer planted.bearer.token',
+              google: 'AIzaPlantedGoogleSecret0123456789',
+              password: 'planted-password-value',
+              jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJwbGFudGVkIjoxfQ.plantedjwtsignature000',
+            }),
+          },
+          emit: (e) => mem.emit(e),
+        },
+        clock: fastClock(),
+      },
+    });
+    const serialized = JSON.stringify(mem.events());
+    for (const secret of PLANTED_SECRETS) expect(serialized).not.toContain(secret);
+    // the sweep DID run over the redactor's output (values became [REDACTED]),
+    // and the run itself completed untouched
+    expect(serialized).toContain('[REDACTED]');
+    expect(mem.events().at(-1)!.type).toBe('run.completed');
+  });
+
+  it('a truncated payload cannot leak a decodable secret prefix (redaction precedes truncation)', async () => {
+    const mem = createMemoryObserver();
+    const { fetch } = mockFetchSequence([
+      () => sseResponse([TOOL_CALL_STREAM]),
+      () => sseResponse([FINAL_STREAM]),
+    ]);
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJwbGFudGVkIjoxfQ.plantedjwtsignature000';
+    await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'go' }],
+      tools: {
+        leaky: {
+          parameters: SCHEMA,
+          // the JWT sits right at the truncation boundary: naive
+          // truncate-then-redact would keep a decodable header+payload prefix
+          execute: async () => 'x'.repeat(90) + jwt + 'y'.repeat(50),
+        },
+      },
+      maxSteps: 5,
+      deps: {
+        observer: {
+          options: { capture: { toolOutputs: true }, limits: { maxStringLength: 120 } },
+          emit: (e) => mem.emit(e),
+        },
+        clock: fastClock(),
+      },
+    });
+    const serialized = JSON.stringify(mem.events());
+    expect(serialized).not.toContain(jwt);
+    expect(serialized).not.toContain('eyJhbGciOiJIUzI1NiJ9'); // not even the header segment
+    expect(serialized).toContain('[REDACTED]');
+  });
 });
