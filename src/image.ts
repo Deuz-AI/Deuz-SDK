@@ -13,6 +13,7 @@ import type { Dependencies, ResolvedDependencies } from './types/deps';
 import { attachConfig, readConfig } from './internal/config-symbol';
 import { readClientContext, type ClientContext } from './internal/client-context';
 import { resolveDependencies } from './internal/resolve-deps';
+import { observeOperation } from './internal/observe-runtime';
 import { parseRetryAfterMs } from './internal/http';
 import {
   APICallError,
@@ -173,6 +174,20 @@ interface OpenAIImageResponse {
 /** Generate one or more images via the OpenAI-compatible images endpoint. */
 export async function generateImage(options: GenerateImageOptions): Promise<GenerateImageResult> {
   const deps = resolveDependencies(options.deps);
+  // Observation (1.6): operation.* events (no run — media calls are aux ops).
+  return observeOperation(
+    deps,
+    'image',
+    'image.generate',
+    { itemCount: options.n ?? 1, resultCount: (r) => r.images.length },
+    () => generateImageCore(options, deps),
+  );
+}
+
+async function generateImageCore(
+  options: GenerateImageOptions,
+  deps: ReturnType<typeof resolveDependencies>,
+): Promise<GenerateImageResult> {
   const clientContext = readClientContext(options);
   const {
     apiKey,

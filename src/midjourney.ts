@@ -13,6 +13,7 @@ import type { Dependencies, ResolvedDependencies } from './types/deps';
 import { attachConfig } from './internal/config-symbol';
 import { readClientContext, type ClientContext } from './internal/client-context';
 import { resolveDependencies } from './internal/resolve-deps';
+import { observeOperation } from './internal/observe-runtime';
 import { parseRetryAfterMs } from './internal/http';
 import {
   APICallError,
@@ -208,11 +209,13 @@ export interface SubmitImagineOptions extends MidjourneyConfig {
 /** Submit an imagine task → returns the task id to poll. */
 export async function submitImagine(options: SubmitImagineOptions): Promise<SubmitResult> {
   const r = await resolveMj(options);
-  const body: Record<string, unknown> = { prompt: options.prompt };
-  if (options.base64Array?.length) body.base64Array = options.base64Array;
-  if (options.notifyHook) body.notifyHook = options.notifyHook;
-  if (options.state) body.state = options.state;
-  return toSubmitResult(await mjPost('/mj/submit/imagine', body, r));
+  return observeOperation(r.deps, 'midjourney', 'midjourney.submit-imagine', {}, async () => {
+    const body: Record<string, unknown> = { prompt: options.prompt };
+    if (options.base64Array?.length) body.base64Array = options.base64Array;
+    if (options.notifyHook) body.notifyHook = options.notifyHook;
+    if (options.state) body.state = options.state;
+    return toSubmitResult(await mjPost('/mj/submit/imagine', body, r));
+  });
 }
 
 export interface SubmitActionOptions extends MidjourneyConfig {
@@ -224,8 +227,10 @@ export interface SubmitActionOptions extends MidjourneyConfig {
 /** Run a U/V/reroll action via a button `customId` from a finished task. */
 export async function submitAction(options: SubmitActionOptions): Promise<SubmitResult> {
   const r = await resolveMj(options);
-  return toSubmitResult(
-    await mjPost('/mj/submit/action', { taskId: options.taskId, customId: options.customId }, r),
+  return observeOperation(r.deps, 'midjourney', 'midjourney.submit-action', {}, async () =>
+    toSubmitResult(
+      await mjPost('/mj/submit/action', { taskId: options.taskId, customId: options.customId }, r),
+    ),
   );
 }
 
@@ -239,10 +244,18 @@ export interface SubmitBlendOptions extends MidjourneyConfig {
 /** Blend 2-5 images into one. */
 export async function submitBlend(options: SubmitBlendOptions): Promise<SubmitResult> {
   const r = await resolveMj(options);
-  const body: Record<string, unknown> = { base64Array: options.base64Array };
-  if (options.dimensions) body.dimensions = options.dimensions;
-  if (options.notifyHook) body.notifyHook = options.notifyHook;
-  return toSubmitResult(await mjPost('/mj/submit/blend', body, r));
+  return observeOperation(
+    r.deps,
+    'midjourney',
+    'midjourney.submit-blend',
+    { itemCount: options.base64Array.length },
+    async () => {
+      const body: Record<string, unknown> = { base64Array: options.base64Array };
+      if (options.dimensions) body.dimensions = options.dimensions;
+      if (options.notifyHook) body.notifyHook = options.notifyHook;
+      return toSubmitResult(await mjPost('/mj/submit/blend', body, r));
+    },
+  );
 }
 
 export interface SubmitDescribeOptions extends MidjourneyConfig {
@@ -254,9 +267,11 @@ export interface SubmitDescribeOptions extends MidjourneyConfig {
 /** Describe an image → prompt suggestions (the result text is on the finished task). */
 export async function submitDescribe(options: SubmitDescribeOptions): Promise<SubmitResult> {
   const r = await resolveMj(options);
-  const body: Record<string, unknown> = { base64: options.base64 };
-  if (options.notifyHook) body.notifyHook = options.notifyHook;
-  return toSubmitResult(await mjPost('/mj/submit/describe', body, r));
+  return observeOperation(r.deps, 'midjourney', 'midjourney.submit-describe', {}, async () => {
+    const body: Record<string, unknown> = { base64: options.base64 };
+    if (options.notifyHook) body.notifyHook = options.notifyHook;
+    return toSubmitResult(await mjPost('/mj/submit/describe', body, r));
+  });
 }
 
 // --- fetch + poll ---
@@ -298,6 +313,18 @@ export async function waitForTask(
   options: WaitForTaskOptions = {},
 ): Promise<MidjourneyTask> {
   const r = await resolveMj(options);
+  // Observation (1.6): one operation spanning the whole poll (per-tick
+  // signals stay on the existing onProgress hook — no event spam).
+  return observeOperation(r.deps, 'midjourney', 'midjourney.wait', {}, () =>
+    waitForTaskCore(taskId, options, r),
+  );
+}
+
+async function waitForTaskCore(
+  taskId: string,
+  options: WaitForTaskOptions,
+  r: Awaited<ReturnType<typeof resolveMj>>,
+): Promise<MidjourneyTask> {
   const interval = options.pollIntervalMs ?? 3000;
   const timeout = options.timeoutMs ?? 300_000;
   const start = r.deps.clock.now();

@@ -23,8 +23,10 @@ import type {
   ObserveAttributes,
   ObserveAttributeValue,
   ObservePrimitive,
+  ObservedSubsystem,
   RunFailedEvent,
 } from '../types/observe';
+import { toObservedError } from './observe-error';
 import { unitFromId } from '../core/resilience';
 import { redactForObservation, redactObservationString } from './redact';
 import { noopTracer } from './resolve-deps';
@@ -279,6 +281,54 @@ export function counterFields(rt: ObservationRuntime): {
     checkpointCount: c.checkpoints,
     subAgentCount: c.subAgents,
   };
+}
+
+/**
+ * Wrap an auxiliary subsystem call in operation.started/completed/failed
+ * events (image, midjourney, …). Fast path: without an observer the function
+ * runs bare — no runtime, no ids, no events.
+ */
+export async function observeOperation<T>(
+  deps: ResolvedDependencies,
+  subsystem: ObservedSubsystem,
+  operation: string,
+  info: { itemCount?: number; resultCount?: (result: T) => number | undefined },
+  fn: () => Promise<T>,
+): Promise<T> {
+  const rt = createObservationRuntime(deps);
+  if (!rt) return fn();
+  const span = rt.startSpan();
+  rt.emit({
+    type: 'operation.started',
+    spanId: span.spanId,
+    subsystem,
+    operation,
+    ...(info.itemCount !== undefined ? { itemCount: info.itemCount } : {}),
+  });
+  try {
+    const result = await fn();
+    const resultCount = info.resultCount?.(result);
+    rt.emit({
+      type: 'operation.completed',
+      spanId: span.spanId,
+      subsystem,
+      operation,
+      durationMs: rt.durationSince(span.startedAt),
+      ...(info.itemCount !== undefined ? { itemCount: info.itemCount } : {}),
+      ...(resultCount !== undefined ? { resultCount } : {}),
+    });
+    return result;
+  } catch (err) {
+    rt.emit({
+      type: 'operation.failed',
+      spanId: span.spanId,
+      subsystem,
+      operation,
+      durationMs: rt.durationSince(span.startedAt),
+      error: toObservedError(err, rt.capture.errorMessages),
+    });
+    throw err;
+  }
 }
 
 /**
