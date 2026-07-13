@@ -6,6 +6,20 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## 1.6.1
+
+**Redaction final barrier (security fix).** The built-in observation redaction profile now also runs _after_ a custom `redact` hook and after structural truncation — a buggy or malicious redactor can no longer reintroduce a secret into an event, and truncation can never split a secret into a decodable prefix. The JWT pattern additionally catches tokens embedded mid-string.
+
+**Per-sink capture projection in composites (security fix).** `composeObservers` children now each receive only what their _own_ `capture` options allow: disallowed `captured*` fields are stripped, `error.message` is gated per child, and a child `redact` hook applies only to that child's view. Behavior change: a composed observer with no options no longer receives captured content from its siblings' opt-ins — it now matches a standalone observer's privacy defaults.
+
+**`observation.settled`.** `generateText` / `streamChat` / `embed` / `embedMany` results expose an optional `observation.settled` promise — await it before `observer.close()` so async `cost.calculated` enrichments aren't dropped. Nothing about the run itself ever waits on it.
+
+**`createMemoryObserver({ maxBytes })`.** A total byte budget alongside `maxEvents`, evicting by the existing `overflow` strategy and counting into `droppedCount`.
+
+**`deps.tracerMode: 'legacy'`.** Opt back into the 1.5 flat span topology — one parent-less `invoke` per model call with `deuz.step.count: 1` — for dashboards built against it. The default remains `'hierarchical'`.
+
+**Notes.** `eventId` is now derived as `` `${executionId}:${sequence}` `` (one fewer id draw per event; the format is not part of the contract). The release workflow supports npm trusted publishing (OIDC) alongside `NPM_TOKEN` and moved to `actions/*@v5`.
+
 ## 1.6.0
 
 **Observable Runtime — the versioned observation event protocol.** Every run can emit `ObserveEvent`s (`schemaVersion: 1`) through the new `Dependencies.observer` seam: run/model lifecycle with TTFT and per-retry reason + backoff, agent steps with per-step duration and cumulative usage, per-tool timings with real parallel completion order, approval requests and resolutions (server / client-response / default-deny), durable checkpoint saves/loads with resume correlation (one `runId` across legs, fresh `executionId` per leg, `checkpoint.loaded` before `run.started { resumed: true }`), per-layer compaction events with the summarize side-call visible as a tagged model call, sub-agent trees keyed by `agentPath`, and sync/async cost via the existing `priceProvider`. Local-first: no API key, no account, no data leaves the process. See [Observability](/docs/modules/observability) and the [event catalog](/docs/reference/observe-events).
