@@ -1,6 +1,6 @@
 ---
 title: Release Process
-description: The v1.5.1 release gates, versioning flow, and tag-driven npm publish pipeline.
+description: The v1.6.1 release gates, versioning flow, and tag-driven npm publish pipeline.
 ---
 
 A release is publishable only when the same `npm run release:verify` command passes locally and in CI. The gate includes formatting, lint, TypeScript, runtime tests, type-surface tests, the dual build, package/export verification, browser/edge bundling, bundle-size budgets, and the locked public API contract.
@@ -14,12 +14,12 @@ A release is publishable only when the same `npm run release:verify` command pas
 
 ## Publishing
 
-The release workflow runs only for a `v*` tag. It first requires the tag (for example `v1.5.1`) to match `package.json`, runs every release gate again, then publishes to npm with provenance and creates the GitHub release. A normal push to `main` cannot publish.
+The release workflow runs only for a `v*` tag. It first requires the tag (for example `v1.6.1`) to match `package.json`, runs every release gate again, then publishes to npm with provenance and creates the GitHub release. A normal push to `main` cannot publish.
 
 ```bash
 npm run release:verify
-git tag v1.5.1
-git push origin v1.5.1
+git tag v1.6.1
+git push origin v1.6.1
 ```
 
 Changesets remain the version/changelog mechanism for later releases. Bundle thresholds live in `tooling/bundle-size-budgets.json`; public subpaths and root declarations are locked in `tooling/api-contract.json`. Changing either contract should be an explicit review decision, not an incidental build result.
