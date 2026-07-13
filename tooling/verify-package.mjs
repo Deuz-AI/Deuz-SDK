@@ -13,6 +13,31 @@ function fail(message) {
   failures.push(message);
 }
 
+function parsePackReport(output) {
+  const cleaned = output.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '').trim();
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (initialError) {
+    const starts = [...cleaned.matchAll(/^\[/gm)].map((match) => match.index ?? 0).reverse();
+    for (const start of starts) {
+      for (
+        let end = cleaned.lastIndexOf(']');
+        end > start;
+        end = cleaned.lastIndexOf(']', end - 1)
+      ) {
+        try {
+          const report = JSON.parse(cleaned.slice(start, end + 1));
+          if (Array.isArray(report) && Array.isArray(report[0]?.files)) return report;
+        } catch {
+          // Lifecycle output may surround npm's JSON report; keep looking for the report boundary.
+        }
+      }
+    }
+    throw initialError;
+  }
+}
+
 function leaves(value) {
   if (typeof value === 'string') return [value];
   if (!value || typeof value !== 'object') return [];
@@ -60,7 +85,13 @@ const args = [
 const packed = spawnSync(command, args, {
   cwd: root,
   encoding: 'utf8',
-  env: { ...process.env, npm_config_cache: resolve(root, '.tmp/npm-cache') },
+  env: {
+    ...process.env,
+    FORCE_COLOR: '0',
+    npm_config_cache: resolve(root, '.tmp/npm-cache'),
+    npm_config_color: 'false',
+    npm_config_ignore_scripts: 'true',
+  },
   windowsHide: true,
 });
 if (packed.status !== 0) {
@@ -68,7 +99,7 @@ if (packed.status !== 0) {
   fail(`npm pack --dry-run failed: ${String(detail).trim()}`);
 } else {
   try {
-    const report = JSON.parse(packed.stdout);
+    const report = parsePackReport(packed.stdout);
     const files = new Set((report[0]?.files ?? []).map((file) => file.path.replaceAll('\\', '/')));
     const forbidden = [...files].filter(
       (file) =>
