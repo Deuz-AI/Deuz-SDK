@@ -1,8 +1,8 @@
 /**
- * Span plumbing for the orchestration layer (1.6): a lifecycle guard plus the
- * attribute builders shared by the pump (`core/inference.ts`) and the agentic
- * loops. Three span names exist: `invoke` (one per orchestrated call), `step`
- * (one per model round-trip, parent = invoke) and `execute_tool` (one per tool
+ * Span plumbing (1.6): a lifecycle guard plus the attribute builders used by
+ * the tracer bridge (`internal/tracer-bridge.ts`) — the single span source.
+ * Three span names exist: `invoke` (one per orchestrated call), `step` (one
+ * per model round-trip, parent = invoke) and `execute_tool` (one per tool
  * execution, parent = its step).
  *
  * Attribute policy (redaction P0): span attributes carry ONLY token counts,
@@ -12,7 +12,6 @@
  * `internal/redact.ts` for the invariant this protects).
  */
 import type { Span, Tracer } from '../types/deps';
-import type { LanguageModel } from '../types/model';
 import type { Usage, FinishReason } from '../types/usage';
 
 /**
@@ -61,18 +60,6 @@ export function openSpan(
   };
 }
 
-/** `invoke` start attributes: provider + model identity (+ sub-agent path). */
-export function invokeAttributes(
-  model: LanguageModel,
-  agentPath?: string[],
-): Record<string, unknown> {
-  return {
-    'gen_ai.provider.name': model.provider,
-    'gen_ai.request.model': model.modelId,
-    ...(agentPath && agentPath.length > 0 ? { 'deuz.agent.path': agentPath.join('/') } : {}),
-  };
-}
-
 /** `step` start attributes: 0-based index + the step's (possibly prepareStep-switched) model. */
 export function stepAttributes(index: number, modelId: string): Record<string, unknown> {
   return { 'deuz.step.index': index, 'gen_ai.request.model': modelId };
@@ -88,10 +75,4 @@ export function setUsageAttributes(
   span.setAttribute('gen_ai.usage.output_tokens', usage.outputTokens);
   // Semconv defines finish_reasons as an array; ours always has one element.
   span.setAttribute('gen_ai.response.finish_reasons', [finishReason]);
-}
-
-/** Tracer + parent threaded into `executeTools` for per-tool `execute_tool` spans. */
-export interface ExecTrace {
-  tracer: Tracer;
-  parent?: Span;
 }

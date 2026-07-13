@@ -34,7 +34,12 @@ const noopLogger: Logger = {
   error: () => {},
 };
 
-const noopTracer: Tracer = {
+/**
+ * Exported for identity checks (1.6): the observation runtime activates the
+ * legacy tracer bridge only when a REAL tracer was injected — comparing
+ * against this instance is the "was a tracer provided" signal.
+ */
+export const noopTracer: Tracer = {
   startSpan: () => ({ setAttribute: () => {}, recordException: () => {}, end: () => {} }),
 };
 

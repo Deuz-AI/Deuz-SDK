@@ -3,12 +3,10 @@ import type { StreamChatResult } from '../types/methods';
 import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
 import type { ModelSurface } from '../types/model';
-import type { Span } from '../types/deps';
 import type { Adapter, ObjectRequest, WireToolRequest } from '../adapters/types';
 import { APICallError, NetworkError, TimeoutError } from '../errors';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { resolveCall } from '../internal/resolve-call';
-import { openSpan, invokeAttributes, setUsageAttributes } from '../internal/trace';
 import {
   createObservationRuntime,
   observeCost,
@@ -78,14 +76,6 @@ export interface InternalRunOptions {
   /** Tool request, set by the agentic loop. */
   tools?: WireToolRequest;
   /**
-   * Tracing (1.6): the enclosing loop's `step` span. When set, the loop owns
-   * the invoke/step hierarchy — the pump emits NO `invoke` span of its own and
-   * reports pre-first-byte retries onto this span as `deuz.retry.count`.
-   */
-  stepSpan?: Span;
-  /** Tracing (1.6): true for loop-internal side calls (compaction summarize) — no span at all. */
-  skipInvokeSpan?: boolean;
-  /**
    * Observation (1.6): the enclosing loop's runtime + correlation. When set,
    * the loop owns the run — this pump emits ONLY model.* events (never a
    * second run.started). When absent AND deps carry an observer, the pump is
@@ -128,19 +118,9 @@ export function runStream(
 
   async function pump(): Promise<void> {
     const deps = resolveDependencies(options.deps);
-    // Tracing (1.6): a bare public call (streamChat/generateText without tools,
-    // generateObject/streamObject) gets its single-shot `invoke` span HERE —
-    // lazily, when the pump starts (G2). Agentic loops pass `stepSpan` (they
-    // own the invoke/step hierarchy) and compaction side-calls pass
-    // `skipInvokeSpan`, so a model call is never double-wrapped. Attributes
-    // carry only ids/counts/enums — message content, headers, URLs and key
-    // material NEVER enter a span (semconv content capture off by design).
-    const invoke =
-      internal.stepSpan || internal.skipInvokeSpan
-        ? undefined
-        : openSpan(deps.tracer, 'invoke', invokeAttributes(options.model, options.agentPath));
-    // Where `deuz.retry.count` lands: the loop's step span, else our invoke.
-    const retryTarget: Span | undefined = internal.stepSpan ?? invoke?.span;
+    // Tracing (1.6): spans are no longer opened here — the tracer bridge (a
+    // runtime sink) derives the invoke→step→execute_tool hierarchy from the
+    // observation events below, so a model call can never be double-spanned.
     let retries = 0;
     let ttftMs: number | undefined;
     let finalUsage: Usage | undefined;
@@ -337,8 +317,6 @@ export function runStream(
         }
         throw mapped;
       }
-      if (retries > 0) retryTarget?.setAttribute('deuz.retry.count', retries);
-
       if (!res.body) {
         timeout.clear();
         throw new APICallError({
@@ -398,7 +376,7 @@ export function runStream(
             broadcaster.push(part);
             usageDeferred.reject(part.error);
             finishDeferred.reject(part.error);
-            invoke?.fail(part.error); // mid-stream error is final — record + end
+            // mid-stream error is final — the bridge fails the invoke span
             emitFailure(part.error);
             broadcaster.close();
             return;
@@ -419,11 +397,6 @@ export function runStream(
       finishDeferred.resolve(finishReason);
       fireUsage(options, deps, usage, { model: options.model.modelId, reason: 'finished', ttftMs });
       fireFinish(options, deps, { model: options.model.modelId, finishReason });
-      if (invoke) {
-        setUsageAttributes(invoke, usage, finishReason);
-        invoke.setAttribute('deuz.step.count', 1);
-        invoke.end();
-      }
       if (rt) {
         rt.emit({
           type: 'model.completed',
@@ -466,7 +439,6 @@ export function runStream(
       }
       broadcaster.close();
     } catch (err) {
-      if (retries > 0) retryTarget?.setAttribute('deuz.retry.count', retries);
       if (isUserAbort(err, options.signal)) {
         const usage = withTotal(finalUsage ?? EMPTY_USAGE);
         usageDeferred.resolve(usage);
@@ -476,12 +448,6 @@ export function runStream(
           reason: 'aborted',
           ttftMs,
         });
-        if (invoke) {
-          // A user abort is a resolution, not a failure — no exception recorded.
-          setUsageAttributes(invoke, usage, 'aborted');
-          invoke.setAttribute('deuz.step.count', 1);
-          invoke.end();
-        }
         if (rt) {
           // Same rule for events: the model call COMPLETED with 'aborted'
           // (never model.failed), then the run aborts. Usage is honest —
@@ -515,7 +481,6 @@ export function runStream(
       broadcaster.push({ type: 'error', error: err });
       usageDeferred.reject(err);
       finishDeferred.reject(err);
-      invoke?.fail(err);
       emitFailure(err);
       broadcaster.close();
     }

@@ -32,7 +32,6 @@ import { attachClientContext, readClientContext } from '../internal/client-conte
 import { getCapabilities } from '../core/registry';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
-import { openSpan, type ExecTrace } from '../internal/trace';
 import { ToolExecutionError } from '../errors';
 import {
   createObservationRuntime,
@@ -464,12 +463,11 @@ export async function runCompaction(
           approveToolCall: undefined,
           approvalResponses: undefined,
         }),
-        // Loop-internal side call: no `invoke` span of its own — its usage is
-        // already folded into the enclosing loop's invoke span via addUsage.
-        // Observation: a tagged model call under the step ('compaction-summary'),
-        // never a second run.
+        // Loop-internal side call: its usage is already folded into the loop
+        // total via addUsage. Observation: a tagged model call under the step
+        // ('compaction-summary'), never a second run — and no span of its own
+        // (the bridge only spans run/step/tool events).
         {
-          skipInvokeSpan: true,
           ...(ob
             ? {
                 observe: {
@@ -581,7 +579,6 @@ export async function settlePendingApprovals(
   tools: ToolSet,
   options: CommonCallOptions,
   extras?: ExecuteExtras,
-  trace?: ExecTrace,
 ): Promise<{ messages: Message[]; results: ToolResult[]; deniedIds: Set<string> } | null> {
   // An EMPTY array still settles (default-deny the gated rest) — that is how a
   // durable resume without verdicts answers pending calls on the safe side.
@@ -663,7 +660,7 @@ export async function settlePendingApprovals(
     }
   }
 
-  const results = await executeTools(calls, tools, options, messages, denied, extras, trace);
+  const results = await executeTools(calls, tools, options, messages, denied, extras);
   const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
   return { messages: [...messages, toolMessage], results, deniedIds: new Set(denied.keys()) };
 }
@@ -769,19 +766,10 @@ export async function executeTools(
   messages: Message[],
   denied?: DenialMap,
   extras?: ExecuteExtras,
-  trace?: ExecTrace,
 ): Promise<ToolResult[]> {
   const cap = options.maxToolConcurrency ?? 5;
   const parallel = toolCalls.length > 1;
   return mapWithConcurrency(toolCalls, cap, async (call): Promise<ToolResult> => {
-    const span = trace
-      ? openSpan(
-          trace.tracer,
-          'execute_tool',
-          { 'gen_ai.tool.name': call.toolName, 'gen_ai.tool.call.id': call.toolCallId },
-          trace.parent,
-        )
-      : undefined;
     const tool: Tool | undefined = tools[call.toolName];
 
     // Observation (1.6): one tool span per call, emitted INSIDE the worker so
@@ -822,11 +810,8 @@ export async function executeTools(
       });
     };
 
-    const settle = (result: ToolResult): ToolResult => {
-      span?.setAttribute('deuz.tool.is_error', result.isError === true);
-      span?.end();
-      return result;
-    };
+    // Spans settle in the tracer bridge (tool.completed/failed/denied events).
+    const settle = (result: ToolResult): ToolResult => result;
     try {
       if (denied?.has(call.toolCallId)) {
         const denial = denied.get(call.toolCallId)!;
@@ -902,8 +887,6 @@ export async function executeTools(
         // A durable sub-agent suspension is control flow, not a tool failure —
         // it must reach the loop verbatim so the parent suspends too.
         if (cause instanceof SubAgentSuspension) throw cause;
-        // The span records the ORIGINAL throw; the loop still self-heals below.
-        span?.recordException(cause);
         emitToolFailed(cause, true);
         // Surface the thrown message to the model (self-heal feedback): a tool
         // that throws `new Error('File not found')` should tell the model that,
@@ -922,14 +905,9 @@ export async function executeTools(
       }
     } catch (cause) {
       // Only control flow (SubAgentSuspension) or unexpected plumbing errors
-      // reach here — the span must still end exactly once. A suspension is not
-      // a tool failure (no exception, no is_error, no tool event); anything
-      // else records first.
-      if (cause instanceof SubAgentSuspension) span?.end();
-      else {
-        span?.fail(cause);
-        emitToolFailed(cause, false);
-      }
+      // reach here. A suspension is not a tool failure (no tool event);
+      // anything else reports before propagating.
+      if (!(cause instanceof SubAgentSuspension)) emitToolFailed(cause, false);
       throw cause;
     }
   });

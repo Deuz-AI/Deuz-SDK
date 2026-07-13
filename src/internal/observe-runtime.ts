@@ -27,6 +27,8 @@ import type {
 } from '../types/observe';
 import { unitFromId } from '../core/resilience';
 import { redactForObservation, redactObservationString } from './redact';
+import { noopTracer } from './resolve-deps';
+import { createTracerBridge } from './tracer-bridge';
 
 /** Distributes Omit over the event union so payload types stay discriminated. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
@@ -324,14 +326,18 @@ export function createObservationRuntime(
   init: ObservationRuntimeInit = {},
 ): ObservationRuntime | undefined {
   const sinks: Observer[] = [];
-  if (deps.observer) sinks.push(deps.observer);
+  const observerEnabled = deps.observer !== undefined && deps.observer.options?.enabled !== false;
+  if (observerEnabled) sinks.push(deps.observer!);
+  // Legacy tracer bridge (1.6): a REAL injected tracer receives the
+  // invoke→step→execute_tool hierarchy driven by these events — the single
+  // span source. Independent of the observer (either alone activates).
+  if (deps.tracer !== undefined && deps.tracer !== noopTracer) {
+    sinks.push(createTracerBridge(deps.tracer));
+  }
   if (init.extraSinks) sinks.push(...init.extraSinks);
   if (sinks.length === 0) return undefined;
 
-  const options: ObservationOptions = deps.observer?.options ?? {};
-  if (options.enabled === false && (!init.extraSinks || init.extraSinks.length === 0)) {
-    return undefined;
-  }
+  const options: ObservationOptions = observerEnabled ? (deps.observer?.options ?? {}) : {};
 
   const limits: Required<ObservationLimits> = { ...DEFAULT_LIMITS, ...options.limits };
   const capture: Required<ObservationCaptureOptions> = { ...DEFAULT_CAPTURE, ...options.capture };
