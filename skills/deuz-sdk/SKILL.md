@@ -125,6 +125,10 @@ Key precedence (highest wins): `deps.keyProvider` > factory `apiKey` > `createCl
 | `@deuz-sdk/core/skills/node` | filesystem skill source (Node) |
 | `@deuz-sdk/core/mcp` | `createMcpClient` (http/sse, edge-safe) |
 | `@deuz-sdk/core/mcp/stdio` | stdio MCP transport (Node) |
+| `@deuz-sdk/core/durable` | `resumeFromCheckpoint`, `resumeStreamFromCheckpoint`, `createApprovalSigner`, `createInMemorySessionStore`, checkpoint codec |
+| `@deuz-sdk/core/react` | `useChat`, `useObject` React hooks |
+| `@deuz-sdk/core/observe` | observation events: `createMemoryObserver`, `createCallbackObserver`, `composeObservers`, `filterObserver`, `summarizeRun` (edge-safe; inject via `deps.observer`) |
+| `@deuz-sdk/core/observe/node` | `createJsonlObserver`, `readJsonlEvents` (Node JSONL persistence) |
 | `@deuz-sdk/core/edge` | edge-safe re-export subset |
 
 ## Detail rules (read on demand)

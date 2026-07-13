@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `@deuz-sdk/core` — a pure, web-first, multi-provider AI SDK (Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex, Yunwu). It depends on **no other AI SDK** and ships its own canonical streaming + UI protocol. Built for the Deuz platform (Next.js + Supabase, a separate repo) and published to npm. Node ≥ 22, ESM+CJS dual build, zero runtime dependencies.
 
-Planning docs are in Turkish: `yapilacak.md` is the authoritative action list / roadmap (Faz 0–6). The README is the public-facing API tour.
+Planning docs are in Turkish: the current release's code-verified design spec lives at the repo root (e.g. `1.6.0.md`); release history is in `CHANGELOG.md` (changesets-generated — add entries via `npm run changeset`, never by hand). The README is the public-facing API tour.
 
 ## Commands
 
@@ -19,7 +19,9 @@ npm run test:types     # vitest run --typecheck.only → runs test/*.test-d.ts (
 npm run lint           # eslint . (enforces edge-safety — see below)
 npm run typecheck      # tsc --noEmit
 npm run format         # prettier --write .
-npm run check          # the full gate: format:check + lint + typecheck + test + test:types + build + publint --strict + attw
+npm run check          # the full gate: format:check + lint + typecheck + test + test:types + build
+                       #   + verify:package (publint --strict + attw) + verify:runtime (browser bundle,
+                       #   no node: leaks) + verify:size (byte budgets) + verify:api (contract ratchet)
 ```
 
 Run a **single test file or test**:
@@ -30,7 +32,7 @@ npm test -- -t "maps overloaded to 529"     # tests matching a name (across all 
 npx vitest run test/tool-loop.test.ts -t "parallel"
 ```
 
-Before claiming a change is done, run `npm run check` — it's the same gate CI/publish uses. Adding a new subpath export means updating **three** places in lockstep: `package.json` `exports`, `tsup.config.ts` `entry`, and (if edge-safe) `src/edge.ts`.
+Before claiming a change is done, run `npm run check` — it's the same gate CI/publish uses. Adding a new subpath export means updating **six** places in lockstep: `package.json` `exports` (import/require blocks, `types` key FIRST — enforced), `tsup.config.ts` `entry`, (if edge-safe) `src/edge.ts`, `tooling/api-contract.json` (regenerate — `npm run build && node tooling/check-api-contract.mjs --print > tooling/api-contract.json`, never hand-edit), and for Node-only files: the `eslint.config.js` twin exemption lists (or place the file under `src/node/**`, pre-exempted) plus the node-only regex in `tooling/check-runtime-compat.mjs`.
 
 ## The two non-negotiable invariants
 
@@ -38,7 +40,7 @@ These are enforced by lint and tests; violating them is the most common way to b
 
 ### 1. Edge-safe purity (enforced by `eslint.config.js`)
 
-Core `src/**` must run on Web APIs only. **Banned in core** (lint errors): `node:*`/`Buffer`/`process` imports, `Date.now()`, `Math.random()`, `crypto.randomUUID()`/`getRandomValues()`, and `console.*`. Everything stateful or non-deterministic is injected through the **single `Dependencies` seam** (`src/types/deps.ts`): `fetch`, `clock`, `logger`, `tracer`, `breakerStore`, `keyProvider`, `priceProvider`, `generateId`, `onUsage`, `onFinish`. Resolve them via `resolveDependencies()` (`src/internal/resolve-deps.ts`), which applies no-op/in-memory defaults — that file holds the *only* two sanctioned ambient calls (`Date.now`, `crypto.randomUUID`), each with an explicit eslint-disable.
+Core `src/**` must run on Web APIs only. **Banned in core** (lint errors): `node:*`/`Buffer`/`process` imports, `Date.now()`, `Math.random()`, `crypto.randomUUID()`/`getRandomValues()`, and `console.*`. Everything stateful or non-deterministic is injected through the **single `Dependencies` seam** (`src/types/deps.ts`): `fetch`, `clock`, `logger`, `tracer`, `breakerStore`, `keyProvider`, `priceProvider`, `generateId`, `onUsage`, `onFinish`, `observer` (1.6). Resolve them via `resolveDependencies()` (`src/internal/resolve-deps.ts`), which applies no-op/in-memory defaults — that file holds the *only* two sanctioned ambient calls (`Date.now`, `crypto.randomUUID`), each with an explicit eslint-disable.
 
 Node-only code lives in dedicated files that the lint config exempts and that ship as separate subpaths: `src/mcp/stdio.ts`, `src/rag-node.ts`, `src/skills/node.ts`, `src/memory-markdown.ts`, `src/node/**`. They reach Node APIs via lazy `import('node:fs/promises')` so tsup's `.d.ts` resolution stays clean. **Never** add a `node:` import to a core file — move the logic to a `…/node` surface instead.
 
@@ -117,6 +119,7 @@ Adapters accumulate tool-call argument fragments as **strings**, parsing JSON on
 - **MCP** (`mcp/index.ts` http/sse edge-safe; `mcp/stdio.ts` Node-only): `@modelcontextprotocol/sdk` is a lazy optional peer; `listTools()` returns a canonical `ToolSet`.
 - **UI wire** (`ui.ts`): `toDeuzStreamResponse` (server, canonical → versioned SSE) + `readDeuzStream` (client). This is *our* wire, not a provider's.
 - **Middleware** (`middleware.ts`): `wrapModel(model, [...])` with `transformParams`/`wrapGenerate`/`wrapStream`; bundled `logging`/`simpleCache`/`redactPII`/`promptInjectionGuard`. Array order: first element is outermost.
+- **Observation** (1.6): `deps.observer` receives the versioned `ObserveEvent` protocol (`src/types/observe.ts`). The runtime (`internal/observe-runtime.ts`) owns ids/sequence/sampling/redaction/limits/terminal-guard; loops thread context to inner `runStream` calls via `InternalRunOptions.observe` (an inner call NEVER opens a second run) and to sub-agents via a symbol on the per-call ctx.deps clone. Fast path: no observer + noop tracer → `createObservationRuntime` returns `undefined`, zero event objects, zero extra `generateId()` draws (scripted-id fixtures depend on this). The tracer bridge (`internal/tracer-bridge.ts`) is the SINGLE span source — never open spans directly in orchestration code. Built-in observers: `src/observe.ts` (edge) + `src/node/observe.ts` (JSONL). Content capture is opt-in and always passes `redactForObservation` (a `[REDACTED]` profile ADDED to redact.ts — `maskSecret`'s last-4 output is pinned by P0 tests, never change it).
 - **Secret redaction** (`internal/redact.ts`): masks `Authorization`/`x-api-key`/`x-goog-api-key` headers and `sk-`/`sk-ant-`/`AIza`/`Bearer` token patterns (last 4 chars only). This is a **P0 regression-tested invariant** — keys must never appear in any log/error/span. `DeuzError` carries no raw request body/headers by default.
 
 ## Testing

@@ -1,0 +1,94 @@
+---
+title: Observability
+description: Local-first observation events for every run — model calls, retries, tools, approvals, checkpoints, compaction and sub-agents. No hosted service, no OTel dependency, privacy-first by default.
+---
+
+Every Deuz run can emit a versioned event protocol (`ObserveEvent`, `schemaVersion: 1`) describing its full lifecycle: run start/end, model calls with TTFT and retries, agent steps, per-tool timings, approval decisions, durable checkpoints, compaction passes, sub-agent trees and cost. Everything stays in your process — **no API key, no account, no data leaves your machine.**
+
+## Quick start
+
+Inject an observer through the `Dependencies` seam:
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+import { createMemoryObserver, summarizeRun } from '@deuz-sdk/core/observe';
+
+const observer = createMemoryObserver();
+
+await generateText({
+  model,
+  messages: [{ role: 'user', content: 'Prepare the release notes.' }],
+  tools,
+  maxSteps: 5,
+  deps: { observer },
+});
+
+const summary = summarizeRun(observer.latestRun() ?? []);
+// { status: 'completed', stepCount, modelCallCount, toolCallCount,
+//   retryCount, approvalCount, checkpointCount, usage, costUsd?, errors }
+```
+
+A client-level observer (`createClient({ deps: { observer } })`) flows into every call; a per-call `deps.observer` overrides it.
+
+## JSONL persistence (Node)
+
+```ts
+import { createJsonlObserver, readJsonlEvents } from '@deuz-sdk/core/observe/node';
+
+const observer = createJsonlObserver({ file: '.deuz/runs.jsonl' });
+await generateText({ model, messages, tools, deps: { observer } });
+await observer.close(); // flushes the internal queue
+
+const events = await readJsonlEvents('.deuz/runs.jsonl');
+```
+
+One event per line, every line valid JSON, `Uint8Array` payloads round-trip via the durable `$deuzBytes` codec. `emit()` is synchronous — writes flow through a bounded internal queue (`maxQueueSize`, default 10 000; overflow drops and counts in `droppedCount`), so a slow or failing disk can never affect the run. **You own the file's security** — treat it like a log that may contain whatever you opted into capturing.
+
+## Built-in observers
+
+| Factory | What it does |
+| --- | --- |
+| `createMemoryObserver({ maxEvents?, overflow? })` | Capped in-memory ring buffer with `events()` / `eventsForRun(runId)` / `latestRun()` |
+| `createCallbackObserver(fn, options?)` | Wraps a plain callback; a throwing callback is swallowed |
+| `composeObservers(...observers)` | Fan-out; one throwing child never blocks its siblings; options merge (capture = OR, sampleRate = max, limits = min) |
+| `filterObserver(observer, predicate)` | Forward only matching events |
+| `createJsonlObserver({ file, … })` | Node-only JSONL file sink (`@deuz-sdk/core/observe/node`) |
+
+## Privacy defaults and capture
+
+By default events carry **only** counts, ids, names, durations and small enums — never prompts, tool inputs/outputs, reasoning or error message text. Raw content capture is opt-in per field:
+
+```ts
+const observer = createMemoryObserver({
+  observation: {
+    capture: { outputText: true, toolInputs: true }, // everything defaults to false
+    sampleRate: 0.25,     // deterministic per runId — a run is all-in or all-out
+    metadata: { app: 'deuz-console' }, // flat primitives, merged into every event
+  },
+});
+```
+
+Captured payloads always pass the observation redaction profile first (API keys, `Bearer`/JWT/PEM patterns, `password`/`cookie`/`token`-style keys → `[REDACTED]`), then your optional custom `redact` hook, then structural limits (string/array/depth caps with `[Truncated]` markers). This is regression-tested: planted secrets in prompts, tool outputs, headers and factory keys never reach an event or a JSONL line.
+
+## Guarantees
+
+- **Observers can never break a run.** A throwing, slow or closed observer is isolated; `usage`/`finishReason` promises and stream parts are untouched.
+- **Fast path.** With no observer (and no tracer) the hot path pays one boolean branch: no event objects, no extra `generateId()` draws — scripted-id test fixtures stay stable.
+- **`streamChat` stays lazy (G2).** `run.started` fires when the pump actually starts, never at call time.
+- **One terminal event per execution leg** (`run.completed` / `run.suspended` / `run.aborted` / `run.failed`); an async `cost.calculated` may follow it.
+- **Durable correlation.** A durable run keeps one `runId` across suspend/resume legs; each leg gets a fresh `executionId`, and `checkpoint.loaded` precedes `run.started { resumed: true }`.
+- **Sub-agents** share the parent's `runId` and are identified by `agentPath`; their usage is folded into the parent exactly once.
+
+## Legacy tracer bridge
+
+An injected `Dependencies.tracer` now receives the full documented span hierarchy, driven by the same events:
+
+```
+invoke (one per run)
+└── step (one per model round-trip; deuz.step.index, gen_ai.request.model)
+    └── execute_tool (one per tool call; gen_ai.tool.name, deuz.tool.is_error)
+```
+
+Span names and attribute keys are unchanged from 1.5 (`gen_ai.*` semconv + `deuz.*`); the behavioral difference is that agentic loops now produce one `invoke` with children instead of N flat invokes. A user abort still ends the span without an exception. An OTel exporter plugs into this seam.
+
+See the full event catalog in [Observation events](/docs/reference/observe-events).

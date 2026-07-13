@@ -109,7 +109,36 @@ const { text } = await generateText({
 });
 ```
 
-The loop underneath is production-hardened: parallel tool execution, self-healing tool errors, runaway guards, immutable history (prompt-cache-safe), budget stops (`totalTokensExceed`, `costExceeds`), per-step hooks (`prepareStep`, `activeTools`), and opt-in `compaction: 'auto'` when context fills up.
+The loop underneath is production-hardened: parallel tool execution, self-healing tool errors, runaway guards, immutable history (prompt-cache-safe), budget stops (`totalTokensExceed`, `costExceeds`, `durationExceeds`), per-step hooks (`prepareStep`, `activeTools`), and opt-in `compaction: 'auto'` when context fills up.
+
+## Observable runtime — the v1.6 flagship
+
+Every run emits a versioned event protocol — model calls, TTFT, retries (with reason and backoff), agent steps, tool timings, approvals, checkpoints, compaction, sub-agent trees, cost. No API key, no account, no data leaves your process, and **no prompt or tool content is recorded by default** (content capture is opt-in and always redacted):
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+import { createMemoryObserver, summarizeRun } from '@deuz-sdk/core/observe';
+
+const observer = createMemoryObserver();
+
+await generateText({ model, messages, tools, maxSteps: 5, deps: { observer } });
+
+console.log(summarizeRun(observer.latestRun() ?? []));
+// { status: 'completed', stepCount: 3, modelCallCount: 3, toolCallCount: 2,
+//   retryCount: 1, usage: {…}, costUsd: 0.042, durationMs: 8210, … }
+```
+
+Persist runs locally as JSONL (one valid JSON line per event, binary-safe):
+
+```ts
+import { createJsonlObserver } from '@deuz-sdk/core/observe/node';
+
+const observer = createJsonlObserver({ file: '.deuz/runs.jsonl' });
+await generateText({ model, messages, tools, deps: { observer } });
+await observer.close();
+```
+
+Observers can never break a run — a throwing, slow, or closed observer is isolated, and with no observer the hot path pays a single boolean branch. An injected `Dependencies.tracer` now receives the full `invoke → step → execute_tool` span hierarchy driven by the same events (an OTel exporter plugs into that seam). Durable runs keep one `runId` across suspend/resume legs, so a paused approval and its resume correlate in the same timeline.
 
 ## Structured output
 
@@ -166,9 +195,10 @@ Verified against each project's official docs and the npm registry on **2026-07-
 | Multi-provider in the core package | ✅ 6 families | ❌ per-provider packages or hosted gateway | ✅ router (AI SDK machinery underneath) | ❌ per-provider packages | ❌ per-provider packages | ❌ OpenAI-first |
 | Token→USD cost metering in the library | ✅ | ❌ pushed to hosted gateway | 🟡 observability package + OLAP store | ❌ LangSmith feature | ❌ | ❌ |
 | First-class prompt-caching control | ✅ top-level `promptCaching` | 🟡 per-part `providerOptions` | 🟡 passthrough | 🟡 passthrough | 🟡 Anthropic-only | 🟡 one retention knob |
-| OpenTelemetry | ❌ seam only — wired in 1.6 | ✅ `@ai-sdk/otel` | ✅ built-in | ❌ LangSmith-only | 🟡 workflow plugin | 🟡 own traces platform |
+| Local-first observability (no hosted service, no extra deps) | ✅ event protocol + JSONL + tracer bridge | ❌ OTel/gateway-centric | 🟡 platform-centric | ❌ LangSmith-only | 🟡 workflow plugin | 🟡 own traces platform |
+| OpenTelemetry exporter | 🟡 tracer seam + full span hierarchy; exporter planned | ✅ `@ai-sdk/otel` | ✅ built-in | ❌ LangSmith-only | 🟡 workflow plugin | 🟡 own traces platform |
 
-**Where they beat us, today:** the AI SDK ships 24+ first-party providers plus stable speech/transcription, reranking, realtime, and a mature OTel integration; Mastra bundles a 600+-model router and a full observability platform; LlamaIndex.TS remains the deepest RAG toolbox; OpenAI Agents has the tightest hosted-OpenAI integration. Deuz's answer is narrower on purpose: six quirk-locked provider families, and every ambient concern behind an injectable seam — OpenTelemetry lands on that seam in 1.6.
+**Where they beat us, today:** the AI SDK ships 24+ first-party providers plus stable speech/transcription, reranking, realtime, and a mature OTel integration; Mastra bundles a 600+-model router and a full observability platform; LlamaIndex.TS remains the deepest RAG toolbox; OpenAI Agents has the tightest hosted-OpenAI integration. Deuz's answer is narrower on purpose: six quirk-locked provider families, and every ambient concern behind an injectable seam — 1.6's observation events drive that seam locally, and an OTel exporter plugs into the same protocol next.
 
 > **What about Hermes?** Nous Research's [`hermes-agent`](https://github.com/NousResearch/hermes-agent) is a Python autonomous-agent *product* (CLI, desktop, messaging gateways, a self-improving skill loop) — a different category, not an embeddable TypeScript library (the `hermes-agent` npm package is an unofficial launcher bridge). Deuz is the kind of SDK you'd use to build a Hermes-style agent in TypeScript — the two even share the open `SKILL.md` skills format.
 
@@ -200,6 +230,7 @@ One package, tree-shakable subpaths — no `@deuz-sdk/anthropic`, `@deuz-sdk/rea
 | `…/mcp` · `…/mcp/stdio` | MCP client (edge-safe HTTP/SSE; Node stdio) |
 | `…/image` · `…/midjourney` · `…/yunwu` | Image generation surfaces |
 | `…/ui` · `…/react` | Deuz UI wire (server + client) + React hooks |
+| `…/observe` · `…/observe/node` | Observation event protocol: memory/callback/composite observers + `summarizeRun` · JSONL persistence (Node) |
 | `…/middleware` · `…/pricing` · `…/edge` | Model wrappers · cost tables · guaranteed edge-safe subset |
 
 ## Architecture — the canonical line
@@ -216,14 +247,14 @@ Adapters never proxy a provider's raw SSE to your code. Everything is normalized
 
 ## Docs
 
-The full documentation site lives in [`docs/`](./docs) — 40 pages covering every module, with [`llms.txt`](./docs) for AI agents. A [Claude Code skill](./skills/deuz-sdk) teaches coding agents to integrate the SDK correctly, and [`CHANGELOG.md`](./CHANGELOG.md) + [`PLAN.md`](./PLAN.md) hold release history and the road to 2.0.
+The full documentation site lives in [`docs/`](./docs) — 40+ pages covering every module, with [`llms.txt`](./docs) for AI agents. A [Claude Code skill](./skills/deuz-sdk) teaches coding agents to integrate the SDK correctly, [`CHANGELOG.md`](./CHANGELOG.md) holds release history, and [`1.6.0.md`](./1.6.0.md) is the current release's code-verified design spec.
 
 ## Contributing
 
 ```bash
 git clone https://github.com/Deuz-AI/Deuz-SDK.git && cd Deuz-SDK
 npm install
-npm run check   # format + lint (edge-safety) + typecheck + 411 tests + types lock + build + publint + attw
+npm run check   # format + lint (edge-safety) + typecheck + 558 tests + types lock + build + publint + attw + runtime/size/api gates
 ```
 
 ## Credits

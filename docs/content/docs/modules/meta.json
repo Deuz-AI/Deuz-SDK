@@ -3,6 +3,7 @@
   "icon": "Blocks",
   "defaultOpen": true,
   "pages": [
+    "observability",
     "memory",
     "rag",
     "skills",

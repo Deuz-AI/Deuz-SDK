@@ -1,0 +1,63 @@
+---
+title: Observation events
+description: The versioned ObserveEvent protocol — every event type, its identity fields, and the canonical orderings.
+---
+
+Every event extends `ObserveEventBase`:
+
+| Field | Meaning |
+| --- | --- |
+| `schemaVersion` | Always `1` |
+| `eventId` / `sequence` / `timestamp` | Unique id · 0-based monotonic counter per execution leg · `deps.clock.now()` |
+| `runId` | Logical run. Durable runs adopt the session `runId`; sub-agents inherit the parent's |
+| `executionId` | One execution leg — a resume keeps `runId` but gets a fresh `executionId` |
+| `spanId` / `parentSpanId` | Timeline node: run → step → (model \| tool \| compaction) → sub-agent |
+| `agentPath?` / `stepIndex?` | Sub-agent chain · loop step counter (continues across durable legs) |
+| `metadata?` / `truncated?` | App metadata from `ObservationOptions` · set when limits truncated a payload |
+
+## Event catalog
+
+| Event | Key fields |
+| --- | --- |
+| `run.started` | `operation` (`stream-chat`/`generate-text`/`generate-object`/`stream-object`/`embed`/`embed-many`), `provider`, `model`, `surface`, `durable`, `resumed`, `resumeFromStepId?` |
+| `run.completed` | `finishReason`, `endReason` (`natural`/`stop-condition`/`max-steps`/`runaway-tool-errors`), `stoppedBy?`, step/model/tool/retry/approval/checkpoint/sub-agent counters, `usage` (this leg), `cumulativeUsage?` (durable), `costUsd?` |
+| `run.suspended` | `reason` (`approval`/`client-tool`/`sub-agent-approval`), `pendingApprovalCount` (0 is legal for pure client-tool breaks), `pendingToolCount`, `checkpointStepId?` |
+| `run.aborted` | User abort is a resolution, never a failure; usage is honest (often zeros mid-stream) |
+| `run.failed` | `error: ObservedError`, counters, `partialUsage?` |
+| `model.started` | Effective per-step `model` (post-`prepareStep`), `purpose?: 'compaction-summary'`, `maxRetries`, `responseFormat?`, `promptCaching?` |
+| `model.first-content` | `contentType` (`text`/`reasoning`/`tool-call`), `ttftMs` — tool-call-first responses clear TTFT as of 1.6 |
+| `model.retry` | `failedAttempt`, `nextAttempt`, `delayMs`, `retryAfterMs?`, `reason` (`network`/`rate-limit`/`overloaded`/`server-error` — timeouts never retry), `statusCode?` |
+| `model.completed` | `durationMs`, `ttftMs?`, `retryCount`, `finishReason`, `usage`, output/reasoning lengths, `toolCallCount` |
+| `model.failed` | `error` — emitted once; the run terminal reports the same failure once more at run level |
+| `step.started` / `step.completed` | Effective model, message count, `estimatedInputTokens?` (compaction estimate), per-step `durationMs` + `usage` + `cumulativeUsage`, tool counters, `stoppedBy?` |
+| `tool.started` | `toolCallId`, `toolName`, `needsApproval`, derived `executionMode` (`server`/`client` — provider-executed tools emit no tool events), `parallel` |
+| `tool.completed` | `durationMs`, `outputType`, `outputSize?` |
+| `tool.failed` | The ORIGINAL thrown error (normalized), `selfHealed`, `consecutiveFailureCount` |
+| `tool.denied` | `cause` (`server-denied`/`response-denied`/`no-response`/`client-tool-no-result`), `reason?` |
+| `approval.requested` | `approvalId` (= `toolCallId` today), `mode` (`server`/`client`) |
+| `approval.resolved` | `approved: boolean`, `source` (`server`/`client-response`/`default-deny`), `waitDurationMs?` (resume legs, from checkpoint age) |
+| `checkpoint.saved` | `stepId`, `checkpointStepIndex` (1-based boundary counter), `checkpointStatus`, save `durationMs`, cumulative `usage` |
+| `checkpoint.loaded` | Emitted by the resume entry points BEFORE `run.started`; `checkpointAgeMs?` |
+| `checkpoint.failed` | `operation` (`save`/`load`), `runContinued` (save failures never kill the run) |
+| `compaction` | One per APPLIED layer: `layer`, `threshold`, `contextWindow`, `tokensBefore/After` (calibrated ESTIMATES), `messageCountBefore/After`, `durationMs` |
+| `compaction.skipped` | `layer`, `reason` (e.g. a throwing summarizer — never fails the run) |
+| `subagent.started/completed/suspended/failed` | `agentName`, `depth`, `parentToolCallId`, `childRunId?` (durable store key), child `usage` (already folded into the parent — never sum twice) |
+| `cost.calculated` | Async `priceProvider` resolution; may arrive after the terminal event |
+| `operation.started/completed/failed` | Aux subsystems (`image`, `midjourney`); `operation` strings like `image.generate` |
+
+## ObservedError
+
+`{ name, category, code?, statusCode?, retryable?, provider?, message? }` — `category` derives from stable `DeuzError.code` strings (`authentication`/`authorization` split on 401/403, `rate-limit`, `overloaded`, `timeout`, `network`, `provider`, `validation`, `tool`, `checkpoint`, `aborted`, `unknown`). `message` exists only when `capture.errorMessages` is on, and always passes redaction.
+
+## Canonical orderings
+
+```text
+Single call:   run.started → model.started → model.first-content → model.completed → run.completed
+With retries:  … model.started → model.retry × N → model.first-content → …   (one model.started per call)
+Tool loop:     run.started → (step.started → model.* → tool.started → tool.completed → step.completed) × N → run.completed
+Suspension:    … approval.requested → step.completed → checkpoint.saved{suspended} → run.suspended
+Resume:        checkpoint.loaded → run.started{resumed} → approval.resolved → tool.* (step-less settle) → step.started → …
+Abort:         … model.completed{finishReason:'aborted'} → run.aborted   (never model.failed / run.failed)
+```
+
+Parallel tools emit `tool.started` in batch order and `tool.completed` in REAL completion order, each with its own `spanId` under the shared step span.

@@ -2,5 +2,11 @@
   "title": "Reference",
   "icon": "BookOpenCheck",
   "defaultOpen": true,
-  "pages": ["compatibility", "stream-protocol", "provider-conformance", "release-process"]
+  "pages": [
+    "compatibility",
+    "stream-protocol",
+    "provider-conformance",
+    "release-process",
+    "observe-events"
+  ]
 }
