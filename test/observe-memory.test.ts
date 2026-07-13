@@ -85,6 +85,49 @@ describe('createMemoryObserver', () => {
     expect(mem.events().map((e) => e.sequence)).toEqual([0]);
   });
 
+  it('maxBytes bounds total memory even with big captured payloads (drop-oldest)', () => {
+    const mem = createMemoryObserver({ maxBytes: 2000 });
+    for (let i = 0; i < 10; i++) {
+      mem.emit(
+        stamped({
+          type: 'tool.completed',
+          sequence: i,
+          toolCallId: `c${i}`,
+          toolName: 't',
+          durationMs: 1,
+          outputType: 'string',
+          capturedOutput: 'x'.repeat(400),
+        } as Partial<ObserveEvent> & { type: 'tool.completed' }),
+      );
+    }
+    expect(mem.droppedCount).toBeGreaterThan(0);
+    const kept = mem.events();
+    expect(kept.length).toBeLessThan(10);
+    // newest survive under drop-oldest
+    expect(kept.at(-1)!.sequence).toBe(9);
+    const totalKept = kept.reduce((n, e) => n + JSON.stringify(e).length, 0);
+    expect(totalKept).toBeLessThanOrEqual(2000);
+  });
+
+  it('maxBytes with drop-newest keeps the oldest events', () => {
+    const mem = createMemoryObserver({ maxBytes: 700, overflow: 'drop-newest' });
+    for (let i = 0; i < 5; i++) {
+      mem.emit(
+        stamped({
+          type: 'tool.completed',
+          sequence: i,
+          toolCallId: `c${i}`,
+          toolName: 't',
+          durationMs: 1,
+          outputType: 'string',
+          capturedOutput: 'x'.repeat(300),
+        } as Partial<ObserveEvent> & { type: 'tool.completed' }),
+      );
+    }
+    expect(mem.droppedCount).toBeGreaterThan(0);
+    expect(mem.events()[0]!.sequence).toBe(0);
+  });
+
   it('clear() resets buffer, droppedCount and latestRun', () => {
     const mem = createMemoryObserver({ maxEvents: 1 });
     mem.emit(stamped({ type: 'run.started' }));

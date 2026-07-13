@@ -51,18 +51,43 @@ export interface MemoryObserver extends Observer {
   clear(): void;
 }
 
+/** Approximate in-memory size of an event; measured only when `maxBytes` is set. */
+function approxEventBytes(event: ObserveEvent): number {
+  try {
+    // Safe here: events already passed the runtime's cycle-free snapshot, and
+    // this runs inside the observer — never on the core hot path.
+    return JSON.stringify(event).length;
+  } catch {
+    return 1024; // pathological payload — charge a conservative flat size
+  }
+}
+
 export function createMemoryObserver(options?: {
   /** Hard cap — memory never grows unbounded. Default 10_000. */
   maxEvents?: number;
-  /** What to do at the cap. Default 'drop-oldest'. */
+  /**
+   * Approximate total byte budget across the buffer (1.6.1 additive) —
+   * bounds memory even when raw content capture is on. Unset = no byte cap.
+   */
+  maxBytes?: number;
+  /** What to do at the caps. Default 'drop-oldest'. */
   overflow?: 'drop-oldest' | 'drop-newest';
   observation?: ObservationOptions;
 }): MemoryObserver {
   const maxEvents = Math.max(1, options?.maxEvents ?? 10_000);
+  const maxBytes = options?.maxBytes !== undefined ? Math.max(1, options.maxBytes) : undefined;
   const overflow = options?.overflow ?? 'drop-oldest';
   let buffer: ObserveEvent[] = [];
+  let sizes: number[] = [];
+  let totalBytes = 0;
   let dropped = 0;
   let lastRunId: string | undefined;
+
+  const evictOldest = (): void => {
+    buffer.shift();
+    if (maxBytes !== undefined) totalBytes -= sizes.shift() ?? 0;
+    dropped += 1;
+  };
 
   return {
     options: options?.observation,
@@ -71,12 +96,22 @@ export function createMemoryObserver(options?: {
     },
     emit(event) {
       lastRunId = event.runId;
-      if (buffer.length >= maxEvents) {
+      const size = maxBytes !== undefined ? approxEventBytes(event) : 0;
+      const overCount = buffer.length >= maxEvents;
+      const overBytes = maxBytes !== undefined && totalBytes + size > maxBytes;
+      if ((overCount || overBytes) && overflow === 'drop-newest') {
         dropped += 1;
-        if (overflow === 'drop-newest') return;
-        buffer.shift();
+        return;
+      }
+      if (overCount) evictOldest();
+      if (maxBytes !== undefined) {
+        while (buffer.length > 0 && totalBytes + size > maxBytes) evictOldest();
       }
       buffer.push(event);
+      if (maxBytes !== undefined) {
+        sizes.push(size);
+        totalBytes += size;
+      }
     },
     events() {
       return buffer.slice();
@@ -90,6 +125,8 @@ export function createMemoryObserver(options?: {
     },
     clear() {
       buffer = [];
+      sizes = [];
+      totalBytes = 0;
       dropped = 0;
       lastRunId = undefined;
     },
