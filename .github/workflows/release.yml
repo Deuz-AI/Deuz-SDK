@@ -27,7 +27,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Require tag to match package version
         shell: bash
-        run: test "${GITHUB_REF_NAME}" = "v$(node -p "require('./package.json').version")"
+        run: test "${GITHUB_REF_NAME}" = "v$(node -p "require('./packages/core/package.json').version")"
       - run: npm ci
       - run: npm ci --prefix docs
       - run: npm run release:verify
@@ -38,21 +38,23 @@ jobs:
         run: npm install -g npm@11
       - name: Publish with provenance
         shell: bash
+        # Publishes every workspace package whose version is not on npm yet
+        # (@deuz-sdk/core + @deuz-sdk/react, fixed version group).
         # Two auth paths, in preference order:
         #  1. npm trusted publishing (OIDC) — configure the Trusted Publisher on
-        #     npmjs.com for this repo + workflow; no secret needed (id-token: write
-        #     above). The empty authToken line setup-node wrote must be removed or
-        #     npm sends an empty token instead of minting OIDC credentials.
+        #     npmjs.com for BOTH packages + this workflow; no secret needed
+        #     (id-token: write above). The empty authToken line setup-node wrote
+        #     must be removed or npm sends an empty token instead of minting
+        #     OIDC credentials.
         #  2. NPM_TOKEN secret in the `npm` environment — classic token auth.
         run: |
-          if [ -n "${NODE_AUTH_TOKEN}" ]; then
-            npm publish --access public --provenance
-          else
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
             npm config delete //registry.npmjs.org/:_authToken || true
-            npm publish --access public --provenance
           fi
+          npx changeset publish --no-git-tag
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: 'true'
       - name: Create GitHub release (skip when it already exists)
         shell: bash
         run: |

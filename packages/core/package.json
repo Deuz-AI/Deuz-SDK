@@ -1,0 +1,386 @@
+{
+  "name": "@deuz-sdk/core",
+  "version": "1.6.1",
+  "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini).",
+  "license": "MIT",
+  "author": "Umutcan Edizaslan (U-C4N)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Deuz-AI/Deuz-SDK.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/Deuz-AI/Deuz-SDK#readme",
+  "bugs": "https://github.com/Deuz-AI/Deuz-SDK/issues",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./anthropic": {
+      "import": {
+        "types": "./dist/anthropic.d.ts",
+        "default": "./dist/anthropic.js"
+      },
+      "require": {
+        "types": "./dist/anthropic.d.cts",
+        "default": "./dist/anthropic.cjs"
+      }
+    },
+    "./openai": {
+      "import": {
+        "types": "./dist/openai.d.ts",
+        "default": "./dist/openai.js"
+      },
+      "require": {
+        "types": "./dist/openai.d.cts",
+        "default": "./dist/openai.cjs"
+      }
+    },
+    "./xai": {
+      "import": {
+        "types": "./dist/xai.d.ts",
+        "default": "./dist/xai.js"
+      },
+      "require": {
+        "types": "./dist/xai.d.cts",
+        "default": "./dist/xai.cjs"
+      }
+    },
+    "./google": {
+      "import": {
+        "types": "./dist/google.d.ts",
+        "default": "./dist/google.js"
+      },
+      "require": {
+        "types": "./dist/google.d.cts",
+        "default": "./dist/google.cjs"
+      }
+    },
+    "./google/extras": {
+      "import": {
+        "types": "./dist/google/extras.d.ts",
+        "default": "./dist/google/extras.js"
+      },
+      "require": {
+        "types": "./dist/google/extras.d.cts",
+        "default": "./dist/google/extras.cjs"
+      }
+    },
+    "./voyage": {
+      "import": {
+        "types": "./dist/voyage.d.ts",
+        "default": "./dist/voyage.js"
+      },
+      "require": {
+        "types": "./dist/voyage.d.cts",
+        "default": "./dist/voyage.cjs"
+      }
+    },
+    "./pricing": {
+      "import": {
+        "types": "./dist/pricing.d.ts",
+        "default": "./dist/pricing.js"
+      },
+      "require": {
+        "types": "./dist/pricing.d.cts",
+        "default": "./dist/pricing.cjs"
+      }
+    },
+    "./middleware": {
+      "import": {
+        "types": "./dist/middleware.d.ts",
+        "default": "./dist/middleware.js"
+      },
+      "require": {
+        "types": "./dist/middleware.d.cts",
+        "default": "./dist/middleware.cjs"
+      }
+    },
+    "./image": {
+      "import": {
+        "types": "./dist/image.d.ts",
+        "default": "./dist/image.js"
+      },
+      "require": {
+        "types": "./dist/image.d.cts",
+        "default": "./dist/image.cjs"
+      }
+    },
+    "./midjourney": {
+      "import": {
+        "types": "./dist/midjourney.d.ts",
+        "default": "./dist/midjourney.js"
+      },
+      "require": {
+        "types": "./dist/midjourney.d.cts",
+        "default": "./dist/midjourney.cjs"
+      }
+    },
+    "./yunwu": {
+      "import": {
+        "types": "./dist/yunwu.d.ts",
+        "default": "./dist/yunwu.js"
+      },
+      "require": {
+        "types": "./dist/yunwu.d.cts",
+        "default": "./dist/yunwu.cjs"
+      }
+    },
+    "./memory": {
+      "import": {
+        "types": "./dist/memory.d.ts",
+        "default": "./dist/memory.js"
+      },
+      "require": {
+        "types": "./dist/memory.d.cts",
+        "default": "./dist/memory.cjs"
+      }
+    },
+    "./memory/markdown": {
+      "import": {
+        "types": "./dist/memory/markdown.d.ts",
+        "default": "./dist/memory/markdown.js"
+      },
+      "require": {
+        "types": "./dist/memory/markdown.d.cts",
+        "default": "./dist/memory/markdown.cjs"
+      }
+    },
+    "./rag": {
+      "import": {
+        "types": "./dist/rag.d.ts",
+        "default": "./dist/rag.js"
+      },
+      "require": {
+        "types": "./dist/rag.d.cts",
+        "default": "./dist/rag.cjs"
+      }
+    },
+    "./rag/node": {
+      "import": {
+        "types": "./dist/rag/node.d.ts",
+        "default": "./dist/rag/node.js"
+      },
+      "require": {
+        "types": "./dist/rag/node.d.cts",
+        "default": "./dist/rag/node.cjs"
+      }
+    },
+    "./skills": {
+      "import": {
+        "types": "./dist/skills.d.ts",
+        "default": "./dist/skills.js"
+      },
+      "require": {
+        "types": "./dist/skills.d.cts",
+        "default": "./dist/skills.cjs"
+      }
+    },
+    "./skills/node": {
+      "import": {
+        "types": "./dist/skills/node.d.ts",
+        "default": "./dist/skills/node.js"
+      },
+      "require": {
+        "types": "./dist/skills/node.d.cts",
+        "default": "./dist/skills/node.cjs"
+      }
+    },
+    "./vertex": {
+      "import": {
+        "types": "./dist/vertex.d.ts",
+        "default": "./dist/vertex.js"
+      },
+      "require": {
+        "types": "./dist/vertex.d.cts",
+        "default": "./dist/vertex.cjs"
+      }
+    },
+    "./mcp": {
+      "import": {
+        "types": "./dist/mcp/index.d.ts",
+        "default": "./dist/mcp/index.js"
+      },
+      "require": {
+        "types": "./dist/mcp/index.d.cts",
+        "default": "./dist/mcp/index.cjs"
+      }
+    },
+    "./mcp/stdio": {
+      "import": {
+        "types": "./dist/mcp/stdio.d.ts",
+        "default": "./dist/mcp/stdio.js"
+      },
+      "require": {
+        "types": "./dist/mcp/stdio.d.cts",
+        "default": "./dist/mcp/stdio.cjs"
+      }
+    },
+    "./durable": {
+      "import": {
+        "types": "./dist/durable.d.ts",
+        "default": "./dist/durable.js"
+      },
+      "require": {
+        "types": "./dist/durable.d.cts",
+        "default": "./dist/durable.cjs"
+      }
+    },
+    "./observe": {
+      "import": {
+        "types": "./dist/observe.d.ts",
+        "default": "./dist/observe.js"
+      },
+      "require": {
+        "types": "./dist/observe.d.cts",
+        "default": "./dist/observe.cjs"
+      }
+    },
+    "./observe/node": {
+      "import": {
+        "types": "./dist/observe/node.d.ts",
+        "default": "./dist/observe/node.js"
+      },
+      "require": {
+        "types": "./dist/observe/node.d.cts",
+        "default": "./dist/observe/node.cjs"
+      }
+    },
+    "./edge": {
+      "import": {
+        "types": "./dist/edge.d.ts",
+        "default": "./dist/edge.js"
+      },
+      "require": {
+        "types": "./dist/edge.d.cts",
+        "default": "./dist/edge.cjs"
+      }
+    },
+    "./ui": {
+      "import": {
+        "types": "./dist/ui.d.ts",
+        "default": "./dist/ui.js"
+      },
+      "require": {
+        "types": "./dist/ui.d.cts",
+        "default": "./dist/ui.cjs"
+      }
+    },
+    "./react": {
+      "import": {
+        "types": "./dist/react.d.ts",
+        "default": "./dist/react.js"
+      },
+      "require": {
+        "types": "./dist/react.d.cts",
+        "default": "./dist/react.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:protocol": "vitest run test/stream-protocol.test.ts",
+    "test:conformance": "vitest run test/provider-conformance.test.ts",
+    "test:browser": "vitest run test/browser-compat.test.ts",
+    "test:watch": "vitest",
+    "test:types": "vitest run --typecheck.only",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "verify:package": "node tooling/verify-package.mjs && node tooling/run-package-lints.mjs",
+    "verify:runtime": "node tooling/check-runtime-compat.mjs",
+    "verify:size": "node tooling/check-bundle-size.mjs",
+    "verify:api": "node tooling/check-api-contract.mjs",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run test:types && npm run build && npm run verify:package && npm run verify:runtime && npm run verify:size && npm run verify:api",
+    "prepare": "tsup",
+    "prepublishOnly": "npm run check"
+  },
+  "keywords": [
+    "ai",
+    "llm",
+    "sdk",
+    "anthropic",
+    "claude",
+    "openai",
+    "gemini",
+    "xai",
+    "grok",
+    "streaming",
+    "edge",
+    "agent",
+    "tool-calling"
+  ],
+  "peerDependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@standard-community/standard-json": "^0.2.0",
+    "mammoth": "^1.8.0",
+    "react": "^18.0.0 || ^19.0.0",
+    "unpdf": "^0.12.0",
+    "xlsx": "^0.18.0",
+    "zod": "^3.23.0 || ^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "zod": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "@modelcontextprotocol/sdk": {
+      "optional": true
+    },
+    "@standard-community/standard-json": {
+      "optional": true
+    },
+    "unpdf": {
+      "optional": true
+    },
+    "mammoth": {
+      "optional": true
+    },
+    "xlsx": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.17",
+    "eslint": "^9.18.0",
+    "eslint-config-prettier": "^9.1.0",
+    "esbuild": "0.27.7",
+    "jsdom": "^29.1.1",
+    "msw": "^2.7.0",
+    "publint": "^0.3.0",
+    "react": "^19.2.7",
+    "tsup": "^8.5.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.20.0",
+    "vitest": "^4.0.0",
+    "zod": "^3.23.0"
+  }
+}

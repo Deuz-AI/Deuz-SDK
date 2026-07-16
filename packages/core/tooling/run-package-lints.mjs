@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -8,6 +8,18 @@ const temp = resolve(root, '.tmp/package-lints');
 const cache = resolve(root, '.tmp/npm-cache');
 mkdirSync(temp, { recursive: true });
 mkdirSync(cache, { recursive: true });
+
+// Dev tools may live in the package's own node_modules or hoisted at the
+// workspace root — probe both.
+function findCli(rel, name) {
+  const candidates = [resolve(root, 'node_modules', rel), resolve(root, '../../node_modules', rel)];
+  const found = candidates.find((p) => existsSync(p));
+  if (!found) {
+    console.error(`${name} CLI not found; looked in:\n  ${candidates.join('\n  ')}`);
+    process.exit(1);
+  }
+  return found;
+}
 
 const env = {
   ...process.env,
@@ -19,12 +31,12 @@ const env = {
 const commands = [
   {
     name: 'publint',
-    cli: resolve(root, 'node_modules/publint/src/cli.js'),
+    cli: findCli('publint/src/cli.js', 'publint'),
     args: ['--strict'],
   },
   {
     name: 'attw',
-    cli: resolve(root, 'node_modules/@arethetypeswrong/cli/dist/index.js'),
+    cli: findCli('@arethetypeswrong/cli/dist/index.js', 'attw'),
     args: ['--pack', '--profile', 'node16'],
   },
 ];

@@ -4,35 +4,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`@deuz-sdk/core` — a pure, web-first, multi-provider AI SDK (Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex, Yunwu). It depends on **no other AI SDK** and ships its own canonical streaming + UI protocol. Built for the Deuz platform (Next.js + Supabase, a separate repo) and published to npm. Node ≥ 22, ESM+CJS dual build, zero runtime dependencies.
+An npm-workspaces **monorepo** (root is private) with two published packages in a fixed version group:
+
+- **`packages/core`** → `@deuz-sdk/core` — a pure, web-first, multi-provider AI SDK (Anthropic, OpenAI, xAI Grok, Google Gemini, Vertex, Yunwu). It depends on **no other AI SDK** and ships its own canonical streaming + UI protocol. Node ≥ 22, ESM+CJS dual build, zero runtime dependencies.
+- **`packages/react`** → `@deuz-sdk/react` — thin optional React adapter (hooks + minimal headless components) binding core's chat/wire APIs to React state. No business logic lives here.
+
+Built for the Deuz platform (Next.js + Supabase, a separate repo) and published to npm. **All `src/`, `test/`, `tooling/` paths in this file are relative to `packages/core/`** unless stated otherwise. Root-level scripts delegate into the workspaces — run commands from the repo root.
 
 Planning docs are in Turkish: the current release's code-verified design spec lives at the repo root (e.g. `1.6.0.md`); release history is in `CHANGELOG.md` (changesets-generated — add entries via `npm run changeset`, never by hand). The README is the public-facing API tour.
 
 ## Commands
 
+All from the repo root (they fan out over the workspaces):
+
 ```bash
-npm run build          # tsup → dist/ (ESM + CJS + .d.ts for every subpath export)
-npm run dev            # tsup --watch
-npm test               # vitest run (all test/**/*.test.ts)
-npm run test:watch     # vitest in watch mode
-npm run test:types     # vitest run --typecheck.only → runs test/*.test-d.ts (the 1.0 surface lock)
-npm run lint           # eslint . (enforces edge-safety — see below)
-npm run typecheck      # tsc --noEmit
-npm run format         # prettier --write .
+npm run build          # core then react: tsup → dist/ (ESM + CJS + .d.ts per subpath export)
+npm run dev            # core tsup --watch
+npm test               # vitest run in every workspace
+npm run test:watch     # core vitest in watch mode
+npm run test:types     # vitest run --typecheck.only → test/*.test-d.ts (the 1.0 surface lock)
+npm run lint           # eslint per workspace (core config enforces edge-safety — see below)
+npm run typecheck      # tsc --noEmit per workspace
+npm run format         # prettier --write . (root-owned; packages don't carry prettier)
 npm run check          # the full gate: format:check + lint + typecheck + test + test:types + build
                        #   + verify:package (publint --strict + attw) + verify:runtime (browser bundle,
                        #   no node: leaks) + verify:size (byte budgets) + verify:api (contract ratchet)
 ```
 
-Run a **single test file or test**:
+Target one workspace with `-w`: `npm run build -w @deuz-sdk/core`, `npm test -w @deuz-sdk/react`.
+
+Run a **single test file or test** (from the repo root):
 
 ```bash
-npm test -- test/anthropic.test.ts          # one file
-npm test -- -t "maps overloaded to 529"     # tests matching a name (across all files)
-npx vitest run test/tool-loop.test.ts -t "parallel"
+npm test -w @deuz-sdk/core -- test/anthropic.test.ts   # one file
+npm test -w @deuz-sdk/core -- -t "maps overloaded to 529"
+npx vitest run test/tool-loop.test.ts -t "parallel"    # from packages/core/
 ```
 
-Before claiming a change is done, run `npm run check` — it's the same gate CI/publish uses. Adding a new subpath export means updating **six** places in lockstep: `package.json` `exports` (import/require blocks, `types` key FIRST — enforced), `tsup.config.ts` `entry`, (if edge-safe) `src/edge.ts`, `tooling/api-contract.json` (regenerate — `npm run build && node tooling/check-api-contract.mjs --print > tooling/api-contract.json`, never hand-edit), and for Node-only files: the `eslint.config.js` twin exemption lists (or place the file under `src/node/**`, pre-exempted) plus the node-only regex in `tooling/check-runtime-compat.mjs`.
+Before claiming a change is done, run `npm run check` — it's the same gate CI/publish uses. Adding a new core subpath export means updating **six** places in lockstep (all under `packages/core/`): `package.json` `exports` (import/require blocks, `types` key FIRST — enforced), `tsup.config.ts` `entry`, (if edge-safe) `src/edge.ts`, `tooling/api-contract.json` (regenerate — from `packages/core/`: `npm run build && node tooling/check-api-contract.mjs --print > tooling/api-contract.json`, never hand-edit), and for Node-only files: the `eslint.config.js` twin exemption lists (or place the file under `src/node/**`, pre-exempted) plus the node-only regex in `tooling/check-runtime-compat.mjs`.
 
 ## The two non-negotiable invariants
 
