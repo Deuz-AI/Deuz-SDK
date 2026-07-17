@@ -36,6 +36,26 @@ describe('SSE protocol contract', () => {
     ]);
   });
 
+  it('surfaces id: lines with spec-correct stickiness (wire v2 resume cursor)', async () => {
+    const wire =
+      'data: before-any-id\n\n' +
+      'id: 0\ndata: zero\n\n' +
+      'data: sticky-still-zero\n\n' +
+      'id: 7\ndata: seven\n\n' +
+      'id: bad\0null\ndata: null-id-ignored\n\n';
+
+    const events = [];
+    for await (const event of parseSSE(byteStream(wire))) events.push(event);
+
+    expect(events).toEqual([
+      { event: undefined, data: 'before-any-id' },
+      { event: undefined, data: 'zero', id: '0' },
+      { event: undefined, data: 'sticky-still-zero', id: '0' },
+      { event: undefined, data: 'seven', id: '7' },
+      { event: undefined, data: 'null-id-ignored', id: '7' }, // NULL id ignored per spec
+    ]);
+  });
+
   it('is invariant to arbitrary transport chunk boundaries', async () => {
     const wire = 'event: message\r\ndata: {"text":"déjà"}\r\n\r\n';
     const partitions = [[1], [2, 3, 5, 7], [wire.length]];

@@ -166,3 +166,30 @@ expectTypeOf<StreamChatResult['observation']>().toEqualTypeOf<
 >();
 
 expectTypeOf<Dependencies['tracerMode']>().toEqualTypeOf<'hierarchical' | 'legacy' | undefined>();
+
+// --- 1.7.0 additive: resumable UI wire v2 (./ui subpath surface). ---
+import {
+  DEUZ_STREAM_VERSION,
+  negotiateDeuzStreamVersion,
+  toDeuzStreamResponse,
+  resumeDeuzStreamResponse,
+  connectDeuzStream,
+  createInMemoryStreamStateStore,
+  type DeuzWireVersion,
+  type StreamStateStore,
+  type StreamStateRecord,
+  type DeuzUIPart,
+} from '../src/ui';
+expectTypeOf<typeof DEUZ_STREAM_VERSION>().toEqualTypeOf<'v2'>();
+expectTypeOf<DeuzWireVersion>().toEqualTypeOf<'v1' | 'v2'>();
+expectTypeOf(negotiateDeuzStreamVersion).returns.toEqualTypeOf<DeuzWireVersion>();
+expectTypeOf(toDeuzStreamResponse).returns.toEqualTypeOf<Response>();
+expectTypeOf(resumeDeuzStreamResponse).returns.toEqualTypeOf<Response>();
+expectTypeOf(connectDeuzStream).returns.toEqualTypeOf<AsyncGenerator<DeuzUIPart>>();
+// The two-method seam stays two-method: append/read required, the rest optional.
+expectTypeOf<StreamStateStore['append']>().toBeFunction();
+expectTypeOf<StreamStateStore['read']>().returns.toEqualTypeOf<AsyncIterable<StreamStateRecord>>();
+expectTypeOf<StreamStateStore['lastSeq']>().toEqualTypeOf<
+  ((streamId: string) => number | undefined | Promise<number | undefined>) | undefined
+>();
+expectTypeOf(createInMemoryStreamStateStore).returns.toEqualTypeOf<Required<StreamStateStore>>();

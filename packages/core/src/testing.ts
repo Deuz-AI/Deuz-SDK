@@ -30,12 +30,15 @@ export function sseResponse(chunks: string[], init: ResponseInit = {}): Response
   });
 }
 
-/** Format `event:`/`data:` blocks into a single SSE wire string. */
-export function sseEvents(events: { event?: string; data: unknown }[]): string {
+/** Format `event:`/`id:`/`data:` blocks into a single SSE wire string. */
+export function sseEvents(
+  events: { event?: string; data: unknown; id?: string | number }[],
+): string {
   return events
     .map((e) => {
       const data = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
-      return `${e.event ? `event: ${e.event}\n` : ''}data: ${data}\n\n`;
+      const id = e.id !== undefined ? `id: ${e.id}\n` : '';
+      return `${e.event ? `event: ${e.event}\n` : ''}${id}data: ${data}\n\n`;
     })
     .join('');
 }

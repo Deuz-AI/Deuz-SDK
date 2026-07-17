@@ -4,10 +4,15 @@
  * (`decode(..., { stream: true })`), `\n`, `\r\n`, and bare `\r` line endings, multi-line
  * `data:` fields, and comment/keep-alive lines (`:` prefix). `[DONE]` is left
  * for the adapter to interpret. Cancels the underlying reader on early break.
+ *
+ * `id:` lines follow the SSE spec: the last seen id is sticky and stamped on
+ * every subsequent event (the Deuz wire v2 resume cursor). `retry:` is ignored.
  */
 export interface SSEEvent {
   event?: string;
   data: string;
+  /** Last seen `id:` value (sticky per the SSE spec). Absent before any id line. */
+  id?: string;
 }
 
 export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<SSEEvent> {
@@ -16,6 +21,7 @@ export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerato
   let buffer = '';
   let eventName: string | undefined;
   let dataLines: string[] = [];
+  let lastId: string | undefined;
   let firstLine = true;
 
   function takeEvent(): SSEEvent | undefined {
@@ -23,7 +29,11 @@ export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerato
       eventName = undefined;
       return undefined;
     }
-    const ev: SSEEvent = { event: eventName, data: dataLines.join('\n') };
+    const ev: SSEEvent = {
+      event: eventName,
+      data: dataLines.join('\n'),
+      ...(lastId !== undefined ? { id: lastId } : {}),
+    };
     eventName = undefined;
     dataLines = [];
     return ev;
@@ -39,7 +49,8 @@ export async function* parseSSE(body: ReadableStream<Uint8Array>): AsyncGenerato
     if (value.startsWith(' ')) value = value.slice(1);
     if (field === 'event') eventName = value;
     else if (field === 'data') dataLines.push(value);
-    // `id` / `retry` fields are ignored.
+    // Per spec an id containing NULL is ignored; `retry:` stays ignored.
+    else if (field === 'id' && !value.includes('\0')) lastId = value;
   }
 
   /**
