@@ -10,6 +10,6 @@ import { runStreamToolLoop } from './stream-tool-loop';
  * terminal boundaries (step parts appear on the stream — documented).
  */
 export const streamChat: StreamChat = (options) =>
-  (options.tools && Object.keys(options.tools).length > 0) || options.chat
+  (options.tools && Object.keys(options.tools).length > 0) || options.chat || options.memory
     ? runStreamToolLoop(options)
     : runStream(options);

@@ -19,6 +19,9 @@ import type { StreamPart } from '../types/stream';
 import type { WireTool, WireToolRequest } from '../adapters/types';
 import { runOneStep, type OneStep } from './run-step';
 import { stepCountIs, budgetConditions, type NamedStopCondition } from './stop';
+// Static NAMED imports on purpose: tree-shaking keeps only the three pipeline
+// functions in the bundle (a dynamic import would drag the whole module in).
+import { recall, remember, formatMemoriesForPrompt, type MemoryMutation } from '../memory';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
   applyCompaction,
@@ -1143,6 +1146,74 @@ export function bumpErrorGuard(counters: Map<string, number>, results: ToolResul
     }
   }
   return hardStop;
+}
+
+/** Text projection of a message's content (recall query / extraction input). */
+function contentText(content: Message['content']): string {
+  if (typeof content === 'string') return content;
+  return content
+    .filter((p): p is Extract<Part, { type: 'text' }> => p.type === 'text')
+    .map((p) => p.text)
+    .join('');
+}
+
+/**
+ * Memory recall (1.7, D1): fetch relevant memories for the LAST user message
+ * and splice them into the system context — a NEW array, never a mutation.
+ * Best-effort: a failing store/embedder logs and the call proceeds bare.
+ */
+export async function recallIntoMessages(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  messages: Message[],
+): Promise<Message[]> {
+  const memory = options.memory;
+  if (!memory || memory.recall === false) return messages;
+  try {
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+    const text = lastUser ? contentText(lastUser.content) : '';
+    if (!text) return messages;
+    const recallOpts = memory.recall === undefined ? {} : memory.recall;
+    const hits = await recall(
+      { scope: memory.scope, text, topK: recallOpts.topK ?? 5 },
+      memory.seams,
+    );
+    if (hits.length === 0) return messages;
+    const block = formatMemoriesForPrompt(
+      hits,
+      recallOpts.header ? { header: recallOpts.header } : undefined,
+    );
+    const [first, ...rest] = messages;
+    if (first && first.role === 'system' && typeof first.content === 'string') {
+      return [{ role: 'system', content: `${first.content}\n\n${block}` }, ...rest];
+    }
+    return [{ role: 'system', content: block }, ...messages];
+  } catch (error) {
+    deps.logger.error('memory recall failed', { error });
+    return messages;
+  }
+}
+
+/**
+ * Memory extraction (1.7, D1): kick the mem0 extract→reconcile pass over this
+ * call's new turns WITHOUT blocking the run. Returns a promise that NEVER
+ * rejects (failures log and resolve `[]`) — exposed as `result.memory`.
+ */
+export function startMemoryExtract(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  newTurns: Message[],
+): Promise<MemoryMutation[]> | undefined {
+  const memory = options.memory;
+  if (!memory || memory.extract === false) return undefined;
+  const infer = memory.extract === undefined ? true : (memory.extract.infer ?? true);
+  const lastUser = [...options.messages].reverse().find((m) => m.role === 'user');
+  const turns = lastUser ? [lastUser, ...newTurns] : newTurns;
+  if (turns.length === 0) return Promise.resolve([]);
+  return remember(turns, memory.scope, memory.seams, { infer }).catch((error) => {
+    deps.logger.error('memory extract failed', { error });
+    return [] as MemoryMutation[];
+  });
 }
 
 /**

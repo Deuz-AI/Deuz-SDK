@@ -6,6 +6,7 @@ import type { StandardSchemaV1, JSONSchema } from './schema';
 import type { StepResult, ToolCall, ToolResult, ToolApprovalRequest } from './tool';
 import type { EmbeddingModel } from './model';
 import type { Dependencies, UsageMeta } from './deps';
+import type { MemoryMutation } from '../memory';
 
 // --- streamChat ---
 export type StreamChatOptions = CommonCallOptions;
@@ -30,6 +31,13 @@ export interface StreamChatResult {
    * Await it BEFORE closing observers: `await res.observation?.settled`.
    */
   observation?: { settled: Promise<void> };
+  /**
+   * Memory extraction settlement (1.7 additive, D1) — present only when the
+   * call carried `memory` with extraction on. Resolves with the applied
+   * mutations once the post-run extract→reconcile pass finishes (empty on
+   * suspension/error). Never rejects. Await it on serverless runtimes.
+   */
+  memory?: Promise<MemoryMutation[]>;
 }
 
 export type StreamChat = (options: StreamChatOptions) => StreamChatResult;
@@ -73,6 +81,13 @@ export interface GenerateTextResult {
    * Await it BEFORE closing observers: `await res.observation?.settled`.
    */
   observation?: { settled: Promise<void> };
+  /**
+   * Memory extraction settlement (1.7 additive, D1) — present only when the
+   * call carried `memory` with extraction on. Resolves with the applied
+   * mutations once the post-run extract→reconcile pass finishes (empty on
+   * suspension). Never rejects. Await it on serverless runtimes.
+   */
+  memory?: Promise<MemoryMutation[]>;
 }
 
 export type GenerateText = (options: GenerateTextOptions) => Promise<GenerateTextResult>;

@@ -160,6 +160,26 @@ export interface MemorySeams {
   logger?: { warn(m: string, f?: Record<string, unknown>): void };
 }
 
+/**
+ * Built-in chat memory (1.7, D1): set `memory` on any call and the loop
+ * RECALLS relevant memories into the system context before the first model
+ * call, then EXTRACTS new facts after the run completes (mem0 pipeline:
+ * extract → reconcile → apply) — WITHOUT blocking the response. The extract
+ * promise rides the result as `result.memory`; await it on serverless
+ * runtimes that freeze after the response. Both halves are best-effort: a
+ * failing store/LLM logs and never breaks the chat. Absent option = zero
+ * extra work.
+ */
+export interface MemoryCallOptions {
+  seams: MemorySeams;
+  /** Mandatory ownership (mem0 rule) — e.g. `{ userId, chatId }`. */
+  scope: MemoryScope;
+  /** Recall before the first model call (default on, topK 5). `false` disables. */
+  recall?: { topK?: number; header?: string } | false;
+  /** Extract after the run (default on, LLM-inferred). `false` disables. */
+  extract?: { infer?: boolean } | false;
+}
+
 // ===================================================================
 // Pure helpers (no I/O; deterministic).
 // ===================================================================

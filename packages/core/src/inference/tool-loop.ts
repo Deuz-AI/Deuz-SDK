@@ -29,6 +29,8 @@ import {
   setupDurable,
   saveCheckpoint,
   persistChat,
+  recallIntoMessages,
+  startMemoryExtract,
   durableUsage,
   toApprovalRequests,
   preserveClientContext,
@@ -166,6 +168,15 @@ export async function runToolLoop(
     }
     await persistChat(options, deps, messages);
     const result = finish();
+    // Memory extraction (1.7, D1): non-blocking; suspended runs skip it
+    // (the turn is incomplete until the resume leg finishes it). The final
+    // no-tool assistant turn is not in `appended` — include it explicitly.
+    const extractionTurns = [...appended];
+    if (lastStep && lastStep.toolUseParts.length === 0) {
+      extractionTurns.push(lastStep.assistantMessage);
+    }
+    const memoryPromise = suspend ? undefined : startMemoryExtract(options, deps, extractionTurns);
+    if (memoryPromise) result.memory = memoryPromise;
     // Settlement (1.6.1): the cost enrichment was registered synchronously
     // inside endLoopObserve above — settled() drains it.
     if (lo) result.observation = { settled: lo.rt.settled() };
@@ -220,6 +231,9 @@ export async function runToolLoop(
       };
       return done();
     }
+
+    // Memory recall (1.7, D1): once per call, before the first model step.
+    messages = await recallIntoMessages(options, deps, messages);
 
     for (;;) {
       const stepIndex = stepBase + steps.length;

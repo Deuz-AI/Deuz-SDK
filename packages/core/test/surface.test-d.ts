@@ -250,3 +250,9 @@ expectTypeOf<CommonCallOptions['chat']>().toEqualTypeOf<ChatPersistOptions | und
 // MemoryScope gained chatId (additive).
 import type { MemoryScope as ChatMemoryScope } from '../src/chat';
 expectTypeOf<ChatMemoryScope['chatId']>().toEqualTypeOf<string | undefined>();
+
+// --- 1.7.0 additive: built-in chat memory (D1). ---
+import type { MemoryCallOptions, MemoryMutation } from '../src/memory';
+expectTypeOf<CommonCallOptions['memory']>().toEqualTypeOf<MemoryCallOptions | undefined>();
+expectTypeOf<GenerateTextResult['memory']>().toEqualTypeOf<Promise<MemoryMutation[]> | undefined>();
+expectTypeOf<StreamChatResult['memory']>().toEqualTypeOf<Promise<MemoryMutation[]> | undefined>();

@@ -13,6 +13,7 @@ import {
 } from '../internal/observe-runtime';
 import { toObservedError } from '../internal/observe-error';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
+import type { MemoryMutation } from '../memory';
 import { assembleAssistant, type ToolArgMap, type EncryptedReasoning } from './run-step';
 import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
 import {
@@ -36,6 +37,8 @@ import {
   settlePendingApprovals,
   saveCheckpoint,
   persistChat,
+  recallIntoMessages,
+  startMemoryExtract,
   durableUsage,
   toApprovalRequests,
   preserveClientContext,
@@ -100,6 +103,12 @@ export function runStreamToolLoop(
   const finishDeferred = createDeferred<FinishReason>();
   const fullSub = broadcaster.subscribe();
   const textSub = broadcaster.subscribe();
+  // Memory extraction settlement (1.7, D1) — synchronous field, resolved by
+  // the pump at the terminal boundary (empty on suspension/error).
+  const memoryDeferred =
+    options.memory && options.memory.extract !== false
+      ? createDeferred<MemoryMutation[]>()
+      : undefined;
 
   let started = false;
   // Observation settlement (1.6.1) — see runStream's twin.
@@ -127,6 +136,17 @@ export function runStreamToolLoop(
     // actually begins (the shell returns synchronously and lazily, G2).
     const startedAt = deps.clock.now();
     let messages: Message[] = [...options.messages];
+    // Turns THIS call appends (memory extraction input) — tracked as a list so
+    // prepareStep/compaction history rewrites can never skew it.
+    const appended: Message[] = [];
+    // Memory extraction settlement (1.7, D1): resolve the shell's deferred
+    // exactly once at every pump exit. `extract=false` on incomplete turns.
+    const settleMemory = (extract: boolean): void => {
+      if (!memoryDeferred) return;
+      const extraction = extract ? startMemoryExtract(options, deps, appended) : undefined;
+      if (extraction) void extraction.then((mutations) => memoryDeferred.resolve(mutations));
+      else memoryDeferred.resolve([]);
+    };
     let resumeFrom = internal?.resumeFrom;
     let observeResume = internal?.observeResume;
     // Resume legs pre-create the ROOT runtime so the closure's
@@ -157,6 +177,7 @@ export function runStreamToolLoop(
             ...counterFields(preRt),
           });
         }
+        settleMemory(false);
         broadcaster.close();
         return;
       }
@@ -290,6 +311,7 @@ export function runStreamToolLoop(
       try {
         const settled = await settlePendingApprovals(messages, tools, options, extras);
         if (settled) {
+          appended.push(...settled.messages.slice(messages.length));
           messages = settled.messages;
           for (const r of settled.results) {
             broadcaster.push({
@@ -334,9 +356,13 @@ export function runStreamToolLoop(
         broadcaster.close();
         // Post-terminal bookkeeping: consumers are already unblocked; the pump
         // (and observation.settled) still awaits the best-effort persist.
+        settleMemory(false); // suspended — the turn is incomplete
         await persistChat(options, deps, messages);
         return;
       }
+
+      // Memory recall (1.7, D1): once per call, before the first model step.
+      messages = await recallIntoMessages(options, deps, messages);
 
       for (;;) {
         broadcaster.push({ type: 'step-start', stepIndex });
@@ -557,6 +583,7 @@ export function runStreamToolLoop(
           // Rebase on the final assistant turn so BOTH the completed
           // checkpoint and the chat persist see the full history.
           messages = [...messages, assistantMessage];
+          appended.push(assistantMessage);
           if (durable) {
             await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
           }
@@ -578,6 +605,7 @@ export function runStreamToolLoop(
           toolState(c.toolCallId, c.toolName, 'input-complete');
         }
         messages = [...messages, assistantMessage];
+        appended.push(assistantMessage);
 
         // Approval gate: server mode denies inline; without approveToolCall the
         // gated calls break the loop like client tools (client mode).
@@ -703,6 +731,7 @@ export function runStreamToolLoop(
           content: toolResults.map(toToolResultPart),
         };
         messages = [...messages, toolResultMessage];
+        appended.push(toolResultMessage);
 
         const sr = toStepResult(stepData, toolCalls, toolResults, steps.length, toolResultMessage);
         steps.push(sr);
@@ -780,6 +809,7 @@ export function runStreamToolLoop(
       observeEnd();
       broadcaster.close();
       // Post-terminal bookkeeping — see the suspension path note above.
+      settleMemory(suspend === undefined); // extract only for COMPLETED turns
       await persistChat(options, deps, messages);
     } catch (err) {
       broadcaster.push({ type: 'error', error: err });
@@ -795,6 +825,7 @@ export function runStreamToolLoop(
         });
       }
       broadcaster.close();
+      settleMemory(false);
       // Completed turns up to the failure still persist (best-effort).
       await persistChat(options, deps, messages);
     }
@@ -822,6 +853,14 @@ export function runStreamToolLoop(
       ensureStarted();
       return observationHandle;
     },
+    ...(memoryDeferred
+      ? {
+          get memory() {
+            ensureStarted();
+            return memoryDeferred.promise;
+          },
+        }
+      : {}),
     ...(runId !== undefined ? { runId } : {}),
   };
 }

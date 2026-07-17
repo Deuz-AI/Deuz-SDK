@@ -12,6 +12,7 @@ import type {
 } from './tool';
 import type { DurableSessionOptions } from './session';
 import type { ChatPersistOptions } from '../chat';
+import type { MemoryCallOptions } from '../memory';
 
 /** Opaque model id; capability-aware refinement arrives with the registry (Faz 1.A). */
 export type ModelId = string;
@@ -200,6 +201,13 @@ export interface CommonCallOptions {
    * (step parts appear on the stream) so every chat shape persists uniformly.
    */
   chat?: ChatPersistOptions;
+  /**
+   * Built-in chat memory (1.7 additive, D1): recall before the first model
+   * call, extract after the run (non-blocking; `result.memory` resolves with
+   * the mutations). Setting this routes even tool-less calls through the loop.
+   * See {@link MemoryCallOptions}.
+   */
+  memory?: MemoryCallOptions;
 }
 
 /** Shared client configuration; pre-binds api keys + deps for the convenience client. */
