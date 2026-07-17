@@ -28,6 +28,11 @@ import type {
 } from './types/methods';
 import type { Logger } from './types/deps';
 import { streamChat as baseStreamChat, generateText as baseGenerateText } from './generate';
+import {
+  runGenerateWithFallback,
+  runStreamWithFallback,
+  type FallbackHooks,
+} from './internal/fallback';
 import { redactValue } from './internal/redact';
 
 /**
@@ -264,3 +269,34 @@ export function promptInjectionGuard(opts: { policy?: string } = {}): LanguageMo
     },
   };
 }
+
+/**
+ * Cross-provider fail-over (1.7, D6): try the wrapped model first, then each
+ * fallback in order. Buffered calls hop on any fallback-worthy rejection;
+ * streaming calls hop ONLY pre-first-content (after content, mid-stream
+ * errors stay final). The canonical history makes the hop lossless — the next
+ * provider receives the identical request. The winner carries
+ * `providerMetadata.deuz.failedOver = { from, to, reason }`.
+ *
+ *   const m = wrapModel(anthropic('claude-opus-4-8'), [
+ *     withFallback([openai('gpt-5.2'), google('gemini-3-pro')]),
+ *   ]);
+ *
+ * Sugar without wrapModel: the `fallbackModels` call option on
+ * `streamChat`/`generateText` does the same in-line. Works with the per-model
+ * circuit breaker: an OPEN breaker fails fast and hops immediately.
+ */
+export function withFallback(
+  models: LanguageModel[],
+  options: FallbackHooks = {},
+): LanguageModelMiddleware {
+  return {
+    name: 'withFallback',
+    wrapGenerate: (next, callOptions) =>
+      runGenerateWithFallback((o) => next(o), callOptions, models, options),
+    wrapStream: (next, callOptions) =>
+      runStreamWithFallback((o) => next(o), callOptions, models, options),
+  };
+}
+
+export type { FallbackHooks } from './internal/fallback';

@@ -71,6 +71,27 @@ export function isDeuzError(value: unknown): value is DeuzError {
   );
 }
 
+/**
+ * The per-model circuit breaker is OPEN (1.7, D6): recent pre-first-byte
+ * failures crossed the threshold, so the call fails fast without a request.
+ * `withFallback`/`fallbackModels` treat it as an immediate fail-over signal.
+ */
+export class BreakerOpenError extends DeuzError {
+  readonly code = 'breaker_open';
+  readonly provider: string;
+  readonly modelId: string;
+  /** `deps.clock.now()` timestamp when the breaker half-opens again. */
+  readonly cooldownUntil: number;
+  constructor(options: { provider: string; modelId: string; cooldownUntil: number }) {
+    super(
+      `Circuit breaker open for '${options.provider}:${options.modelId}' — failing fast until ${options.cooldownUntil}.`,
+    );
+    this.provider = options.provider;
+    this.modelId = options.modelId;
+    this.cooldownUntil = options.cooldownUntil;
+  }
+}
+
 export class NotImplementedError extends DeuzError {
   readonly code = 'not_implemented';
 

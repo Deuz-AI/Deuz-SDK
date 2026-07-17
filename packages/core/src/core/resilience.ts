@@ -1,5 +1,12 @@
 import type { Clock } from '../types/deps';
-import { APICallError, AbortError, type DeuzError } from '../errors';
+import {
+  APICallError,
+  AbortError,
+  BreakerOpenError,
+  NetworkError,
+  TimeoutError,
+  type DeuzError,
+} from '../errors';
 
 export interface RetryOptions {
   maxRetries: number;
@@ -71,4 +78,26 @@ export function wait(clock: Clock, ms: number, signal?: AbortSignal): Promise<vo
 /** Retry verdict consumed by the inference pump (pre-first-byte only). */
 export function shouldRetry(err: DeuzError, attempt: number, maxRetries: number): boolean {
   return isRetryable(err) && attempt < maxRetries;
+}
+
+// --- Circuit breaker (1.7, D6) ----------------------------------------------
+
+/** Consecutive countable pre-first-byte failures before the breaker opens. */
+export const BREAKER_THRESHOLD = 5;
+/** How long an open breaker fails fast before allowing a probe call (ms). */
+export const BREAKER_COOLDOWN_MS = 30_000;
+
+/**
+ * Which final failures count toward opening the breaker: provider-health
+ * signals only (network, timeout, 5xx/overload/retryable). Client errors
+ * (4xx auth/validation) say nothing about provider health; `BreakerOpenError`
+ * itself is a fast-fail read, never a new signal.
+ */
+export function isBreakerCountable(err: unknown): boolean {
+  if (err instanceof BreakerOpenError) return false;
+  if (err instanceof TimeoutError || err instanceof NetworkError) return true;
+  if (err instanceof APICallError) {
+    return err.isRetryable || (err.statusCode !== undefined && err.statusCode >= 500);
+  }
+  return false;
 }

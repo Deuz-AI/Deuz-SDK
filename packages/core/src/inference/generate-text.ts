@@ -1,14 +1,24 @@
-import type { GenerateText, GenerateTextResult } from '../types/methods';
+import type { GenerateText, GenerateTextOptions, GenerateTextResult } from '../types/methods';
 import { runOneStep } from './run-step';
 import { runToolLoop } from './tool-loop';
+import { runGenerateWithFallback } from '../internal/fallback';
 
 /**
  * Non-streaming text generation. With `tools` it runs the agentic loop; without
  * tools it is a single buffered turn (identical to Faz 1). Both paths share the
  * same per-step accumulation (`runOneStep`). `chat` persistence (1.7) also
  * routes through the loop so every chat shape persists at the same boundaries.
+ * `fallbackModels` (1.7, D6) wraps the call in fail-over.
  */
 export const generateText: GenerateText = async (options): Promise<GenerateTextResult> => {
+  if (options.fallbackModels && options.fallbackModels.length > 0) {
+    const { fallbackModels, ...rest } = options;
+    return runGenerateWithFallback(
+      (o: GenerateTextOptions) => generateText(o),
+      rest,
+      fallbackModels,
+    );
+  }
   if ((options.tools && Object.keys(options.tools).length > 0) || options.chat || options.memory) {
     return runToolLoop(options);
   }

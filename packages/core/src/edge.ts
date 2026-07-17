@@ -35,7 +35,13 @@ export type {
   CreateApprovalSignerOptions,
   ApprovalSigner,
 } from './durable';
-export { DeuzError, isDeuzError, NotImplementedError, NoObjectGeneratedError } from './errors';
+export {
+  DeuzError,
+  isDeuzError,
+  NotImplementedError,
+  NoObjectGeneratedError,
+  BreakerOpenError,
+} from './errors';
 export type { DeuzErrorJSON } from './errors';
 // Chat engine (1.7 additive, P2+P6) — pure reducers + ChatStore seam,
 // zero runtime imports: edge-safe by construction.

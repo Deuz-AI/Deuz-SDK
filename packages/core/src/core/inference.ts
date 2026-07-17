@@ -4,7 +4,7 @@ import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
 import type { ModelSurface } from '../types/model';
 import type { Adapter, ObjectRequest, WireToolRequest } from '../adapters/types';
-import { APICallError, NetworkError, TimeoutError } from '../errors';
+import { APICallError, BreakerOpenError, NetworkError, TimeoutError } from '../errors';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { resolveCall } from '../internal/resolve-call';
 import {
@@ -21,7 +21,16 @@ import { normalizeMessages } from './normalize';
 import { getCapabilities } from './registry';
 import { EMPTY_USAGE, withTotal, fireUsage, fireFinish } from './metering';
 import { combineSignals, createTimeout, DEFAULT_TIMEOUTS, type TimeoutHandle } from './timeout';
-import { DEFAULT_RETRY, backoffMs, shouldRetry, unitFromId, wait } from './resilience';
+import {
+  DEFAULT_RETRY,
+  BREAKER_THRESHOLD,
+  BREAKER_COOLDOWN_MS,
+  backoffMs,
+  isBreakerCountable,
+  shouldRetry,
+  unitFromId,
+  wait,
+} from './resilience';
 import { anthropicAdapter } from '../adapters/anthropic';
 import { openaiCompatibleAdapter } from '../adapters/openai-compatible';
 import { openaiResponsesAdapter } from '../adapters/openai-responses';
@@ -240,6 +249,9 @@ export function runStream(
         });
       }
     };
+    // Circuit breaker (1.7, D6): keyed per provider:model, resolved per client
+    // (G11). Set after resolveCall; consulted before the first attempt.
+    let breakerKey: string | undefined;
     try {
       const clientContext = readClientContext(options);
       const call = await resolveCall({
@@ -248,6 +260,23 @@ export function runStream(
         headers: options.headers,
         clientContext,
       });
+      breakerKey = `${call.provider}:${modelId}`;
+      let breakerState: import('../types/deps').BreakerState | undefined;
+      try {
+        breakerState = await deps.breakerStore.get(breakerKey);
+      } catch {
+        /* a failing breaker store never blocks calls */
+      }
+      if (
+        breakerState?.cooldownUntil !== undefined &&
+        breakerState.cooldownUntil > deps.clock.now()
+      ) {
+        throw new BreakerOpenError({
+          provider: call.provider,
+          modelId,
+          cooldownUntil: breakerState.cooldownUntil,
+        });
+      }
       const messages = normalizeMessages(options.messages);
       const caps = getCapabilities(options.model, deps.logger);
       const adapter = getAdapter(options.model.surface);
@@ -343,6 +372,11 @@ export function runStream(
           isRetryable: false,
           provider: call.provider,
         });
+      }
+      // First byte arrived — the provider is healthy again: reset the breaker
+      // (best-effort, only when there was something to clear).
+      if (breakerState && breakerState.failures > 0) {
+        void Promise.resolve(deps.breakerStore.set(breakerKey, { failures: 0 })).catch(() => {});
       }
 
       let firstContent = false;
@@ -517,6 +551,29 @@ export function runStream(
         }
         broadcaster.close();
         return;
+      }
+      // Breaker bookkeeping (1.7, D6): count provider-health failures only —
+      // a threshold of consecutive ones opens the breaker for a cooldown.
+      if (breakerKey !== undefined && isBreakerCountable(err)) {
+        try {
+          const failures = ((await deps.breakerStore.get(breakerKey))?.failures ?? 0) + 1;
+          const now = deps.clock.now();
+          await deps.breakerStore.set(
+            breakerKey,
+            failures >= BREAKER_THRESHOLD
+              ? { failures, openedAt: now, cooldownUntil: now + BREAKER_COOLDOWN_MS }
+              : { failures },
+          );
+          if (failures >= BREAKER_THRESHOLD) {
+            deps.logger.warn('circuit breaker opened', {
+              key: breakerKey,
+              failures,
+              cooldownMs: BREAKER_COOLDOWN_MS,
+            });
+          }
+        } catch {
+          /* best-effort — a failing store never changes call behavior */
+        }
       }
       broadcaster.push({ type: 'error', error: err });
       usageDeferred.reject(err);

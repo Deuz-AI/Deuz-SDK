@@ -40,6 +40,7 @@ export {
   ContextOverflowError,
   TimeoutError,
   AbortError,
+  BreakerOpenError,
   NoObjectGeneratedError,
   ToolExecutionError,
   UnsupportedCapabilityError,
@@ -55,8 +56,16 @@ export { anthropicWebSearch, openaiWebSearch, googleSearch } from './server-tool
 export type { AnthropicWebSearchConfig, OpenAIWebSearchConfig } from './server-tools';
 
 // Optional model middleware (wrapModel + bundled logging/cache/redact/guard).
-export { wrapModel, logging, simpleCache, redactPII, promptInjectionGuard } from './middleware';
+export {
+  wrapModel,
+  logging,
+  simpleCache,
+  redactPII,
+  promptInjectionGuard,
+  withFallback,
+} from './middleware';
 export type { LanguageModelMiddleware, WrappedModel, MiddlewareContext } from './middleware';
+export type { FallbackHooks } from './internal/fallback';
 
 // All canonical types (Message/Part/Usage/LanguageModel/CommonCallOptions/…).
 export type * from './types';

@@ -262,3 +262,12 @@ import { resumeDeuzChatResponse, type ResumeDeuzChatOptions } from '../src/durab
 expectTypeOf(resumeDeuzChatResponse).returns.toEqualTypeOf<Response>();
 expectTypeOf<ResumeDeuzChatOptions['streamStateStore']>().not.toBeNever();
 expectTypeOf<ResumeDeuzChatOptions['call']>().not.toBeNever();
+
+// --- 1.7.0 additive: cross-provider fail-over + circuit breaker (D6). ---
+import { withFallback, BreakerOpenError as BreakerOpenErrorRoot } from '../src/index';
+import type { FallbackHooks } from '../src/index';
+expectTypeOf(withFallback).parameters.toMatchTypeOf<
+  [LanguageModel[], (FallbackHooks | undefined)?]
+>();
+expectTypeOf<CommonCallOptions['fallbackModels']>().toEqualTypeOf<LanguageModel[] | undefined>();
+expectTypeOf<InstanceType<typeof BreakerOpenErrorRoot>['cooldownUntil']>().toEqualTypeOf<number>();

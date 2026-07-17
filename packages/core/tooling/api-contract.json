@@ -42,6 +42,7 @@
     "ApprovalRequestedEvent",
     "ApprovalResolvedEvent",
     "AuthenticationError",
+    "BreakerOpenError",
     "BreakerState",
     "BreakerStore",
     "BudgetExceededPart",
@@ -81,6 +82,7 @@
     "EmbeddingProvider",
     "EmbeddingTaskType",
     "ErrorStreamPart",
+    "FallbackHooks",
     "FinishMeta",
     "FinishReason",
     "FinishStreamPart",
@@ -223,6 +225,7 @@
     "streamChat",
     "streamObject",
     "totalTokensExceed",
+    "withFallback",
     "wrapModel"
   ]
 }

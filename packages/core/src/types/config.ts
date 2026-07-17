@@ -208,6 +208,15 @@ export interface CommonCallOptions {
    * See {@link MemoryCallOptions}.
    */
   memory?: MemoryCallOptions;
+  /**
+   * Cross-provider fail-over (1.7 additive, D6): when the primary model fails
+   * before its first content byte (network/5xx/timeout after retries, or an
+   * OPEN circuit breaker), the call hops to the next model with the IDENTICAL
+   * canonical history. The winner marks
+   * `providerMetadata.deuz.failedOver = { from, to, reason }`. Sugar over the
+   * `withFallback` middleware (`./middleware`) — same semantics.
+   */
+  fallbackModels?: LanguageModel[];
 }
 
 /** Shared client configuration; pre-binds api keys + deps for the convenience client. */
