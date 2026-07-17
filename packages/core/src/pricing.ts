@@ -191,6 +191,27 @@ export function priceUsage(
   return Math.max(0, Math.round(cost * 1e6) / 1e6);
 }
 
+/**
+ * USD SAVED by prompt-cache reads (1.7): what the `cachedReadTokens` would
+ * have cost at the full input rate minus what they actually cost at the
+ * cached-read rate. Cache WRITES are the investment side and are not netted
+ * here. Returns `undefined` for unknown models, `0` when nothing was cached.
+ */
+export function cacheSavings(
+  model: string,
+  usage: Usage,
+  table: PriceTable = PRICES_2026,
+): number | undefined {
+  const p = lookup(table, model);
+  if (!p) return undefined;
+  if (usage.cachedReadTokens <= 0) return 0;
+  const longContext = p.over200k && usage.inputTokens + usage.cachedReadTokens > 200_000;
+  const rates = longContext ? { ...p, ...p.over200k } : p;
+  const cachedRead = rates.cachedRead ?? rates.input * 0.1;
+  const saved = (usage.cachedReadTokens * (rates.input - cachedRead)) / M;
+  return Math.max(0, Math.round(saved * 1e6) / 1e6);
+}
+
 export interface CreatePriceProviderOptions {
   /** Override / extend the built-in 2026 table (merged shallow per-model). */
   table?: PriceTable;
@@ -201,7 +222,9 @@ export interface CreatePriceProviderOptions {
 /**
  * Build a `PriceProvider` to inject via `deps.priceProvider`. The 2026 table is
  * the default; pass `{ table }` to override prices and `{ margin }` to apply a
- * markup. Unknown models yield `undefined` (never a wrong charge).
+ * markup. Unknown models yield `undefined` (never a wrong charge). Implements
+ * the optional `cacheSavings` seam, so the live `cost` stream part carries
+ * `cacheSavingsUsd` out of the box.
  */
 export function createPriceProvider(options: CreatePriceProviderOptions = {}): PriceProvider {
   const table = options.table ? { ...PRICES_2026, ...options.table } : PRICES_2026;
@@ -209,6 +232,10 @@ export function createPriceProvider(options: CreatePriceProviderOptions = {}): P
   return {
     priceUsage(model: string, usage: Usage): number | undefined {
       const base = priceUsage(model, usage, table);
+      return base === undefined ? undefined : Math.round(base * margin * 1e6) / 1e6;
+    },
+    cacheSavings(model: string, usage: Usage): number | undefined {
+      const base = cacheSavings(model, usage, table);
       return base === undefined ? undefined : Math.round(base * margin * 1e6) / 1e6;
     },
   };

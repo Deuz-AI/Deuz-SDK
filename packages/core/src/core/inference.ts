@@ -402,6 +402,28 @@ export function runStream(
           if (part.type === 'finish') {
             finalUsage = part.usage;
             finalFinish = part.finishReason;
+            // Live cost (1.7, D2): single-turn calls price the finish usage
+            // inline; loop-driven calls (internal.tools set) leave it to the
+            // loop's cumulative per-step part.
+            if (!internal.tools && deps.priceProvider) {
+              try {
+                const priced = withTotal(part.usage);
+                const costUsd = await deps.priceProvider.priceUsage(modelId, priced);
+                if (typeof costUsd === 'number') {
+                  const savings = await deps.priceProvider.cacheSavings?.(modelId, priced);
+                  broadcaster.push({
+                    type: 'cost',
+                    costUsd,
+                    deltaUsd: costUsd,
+                    ...(typeof savings === 'number' && savings > 0
+                      ? { cacheSavingsUsd: savings }
+                      : {}),
+                  });
+                }
+              } catch {
+                deps.logger.warn('cost part skipped — priceProvider threw');
+              }
+            }
           }
           broadcaster.push(part);
         }

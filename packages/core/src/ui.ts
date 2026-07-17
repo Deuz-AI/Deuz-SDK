@@ -96,6 +96,16 @@ export type DeuzUIPart =
     }
   /** Tool lifecycle transition (v2 wire): render live tool status directly. */
   | { type: 'tool-state'; toolCallId: string; toolName?: string; state: ToolRunState }
+  /** Live cumulative USD cost (v2 wire) — feed a CostBadge directly. */
+  | {
+      type: 'cost';
+      costUsd: number;
+      deltaUsd?: number;
+      cacheSavingsUsd?: number;
+      stepIndex?: number;
+    }
+  /** Budget guardrail tripped (v2 wire) — precedes the terminal finish. */
+  | { type: 'budget-exceeded'; kind: 'usd' | 'tokens'; limit: number; value: number }
   | { type: 'finish'; finishReason: FinishReason; usage: Usage }
   | { type: 'error'; message: string };
 
@@ -318,6 +328,21 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         ...(part.toolName ? { toolName: part.toolName } : {}),
         state: part.state,
       };
+    case 'cost':
+      return {
+        type: 'cost',
+        costUsd: part.costUsd,
+        ...(part.deltaUsd !== undefined ? { deltaUsd: part.deltaUsd } : {}),
+        ...(part.cacheSavingsUsd !== undefined ? { cacheSavingsUsd: part.cacheSavingsUsd } : {}),
+        ...(part.stepIndex !== undefined ? { stepIndex: part.stepIndex } : {}),
+      };
+    case 'budget-exceeded':
+      return {
+        type: 'budget-exceeded',
+        kind: part.kind,
+        limit: part.limit,
+        value: part.value,
+      };
     case 'finish':
       return { type: 'finish', finishReason: part.finishReason, usage: part.usage };
     case 'error':
@@ -329,7 +354,13 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
 
 /** Part types that exist only on wire v2 — never serialized to a negotiated-v1 client. */
 function isV2OnlyPart(type: string): boolean {
-  return type === 'citation' || type === 'tool-state' || type.startsWith('data-');
+  return (
+    type === 'citation' ||
+    type === 'tool-state' ||
+    type === 'cost' ||
+    type === 'budget-exceeded' ||
+    type.startsWith('data-')
+  );
 }
 
 export interface ToDeuzStreamOptions {

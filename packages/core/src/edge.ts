@@ -4,7 +4,13 @@
  * Existence of this entry is itself the edge smoke test for the build.
  */
 export { streamChat, generateText, generateObject, streamObject } from './generate';
-export { stepCountIs, hasToolCall, totalTokensExceed, costExceeds } from './inference/stop';
+export {
+  stepCountIs,
+  hasToolCall,
+  totalTokensExceed,
+  costExceeds,
+  durationExceeds,
+} from './inference/stop';
 export { agentTool } from './inference/agent-tool';
 export type { AgentToolDef } from './inference/agent-tool';
 export { anthropicWebSearch, openaiWebSearch, googleSearch } from './server-tools';

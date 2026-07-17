@@ -117,6 +117,15 @@ export interface CommonCallOptions {
   maxSteps?: number;
   /** Stop predicate(s), OR-ed with `maxSteps`. */
   stopWhen?: StopCondition | StopCondition[];
+  /**
+   * Conversation budget guardrail (1.7 additive): hard-stop the agentic loop
+   * once cumulative cost reaches `usd` (needs `deps.priceProvider`) or real
+   * token usage reaches `tokens`. Sugar over `costExceeds`/`totalTokensExceed`
+   * with `stoppedBy` markers `budget.usd`/`budget.tokens`; the streaming loop
+   * additionally emits a typed `budget-exceeded` part before `finish`.
+   * Evaluated at step boundaries — an in-flight step always completes first.
+   */
+  budget?: { usd?: number; tokens?: number };
   /** Max parallel tool executions per step. Default 5. */
   maxToolConcurrency?: number;
   onStepFinish?: (step: StepResult) => void;

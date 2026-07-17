@@ -151,6 +151,33 @@ export interface CitationPart {
   score?: number;
 }
 
+/**
+ * Live cumulative USD cost (1.7 additive, D2): emitted after every step (and
+ * on single-turn finish) whenever `deps.priceProvider` is injected. `costUsd`
+ * is cumulative for the run (cross-leg on durable resumes); `deltaUsd` is this
+ * step's increment; `cacheSavingsUsd` is what prompt-cache reads saved vs
+ * full-price input tokens (needs `PriceProvider.cacheSavings`).
+ */
+export interface CostPart {
+  type: 'cost';
+  costUsd: number;
+  deltaUsd?: number;
+  cacheSavingsUsd?: number;
+  stepIndex?: number;
+}
+
+/**
+ * A `budget: { usd, tokens }` guardrail tripped (1.7 additive, D3). Emitted
+ * right before the terminal `finish` part; `providerMetadata.deuz.stoppedBy`
+ * carries the matching `budget.usd` / `budget.tokens` marker.
+ */
+export interface BudgetExceededPart {
+  type: 'budget-exceeded';
+  kind: 'usd' | 'tokens';
+  limit: number;
+  value: number;
+}
+
 /** Tool-call lifecycle states surfaced by the streaming loop (1.7 additive). */
 export type ToolRunState =
   | 'input-streaming'
@@ -188,4 +215,6 @@ export type StreamPart =
   | SubAgentPart
   | DataPart
   | CitationPart
-  | ToolStatePart;
+  | ToolStatePart
+  | CostPart
+  | BudgetExceededPart;

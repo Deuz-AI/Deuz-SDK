@@ -50,3 +50,26 @@ export const costExceeds = (usd: number): StopCondition =>
  */
 export const durationExceeds = (ms: number): StopCondition =>
   named('durationExceeds', ({ elapsedMs }) => (elapsedMs ?? 0) >= ms);
+
+/**
+ * Normalize the `budget: { usd?, tokens? }` guardrail (1.7, D3) into named
+ * stop conditions. Same semantics as `costExceeds`/`totalTokensExceed`, but
+ * with `budget.usd`/`budget.tokens` `stoppedBy` markers so callers (and the
+ * `budget-exceeded` stream part) can tell a budget trip from a manual stop.
+ */
+export function budgetConditions(budget: { usd?: number; tokens?: number }): StopCondition[] {
+  const conditions: StopCondition[] = [];
+  if (budget.usd !== undefined) {
+    const limit = budget.usd;
+    conditions.push(
+      named('budget.usd', ({ costUSD }) => costUSD !== undefined && costUSD >= limit, {
+        requiresCost: true,
+      }),
+    );
+  }
+  if (budget.tokens !== undefined) {
+    const limit = budget.tokens;
+    conditions.push(named('budget.tokens', ({ usage }) => (usage?.totalTokens ?? 0) >= limit));
+  }
+  return conditions;
+}

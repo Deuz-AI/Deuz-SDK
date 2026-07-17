@@ -18,7 +18,7 @@ import type { AgentCheckpoint, CheckpointStatus, SessionStore } from '../types/s
 import type { StreamPart } from '../types/stream';
 import type { WireTool, WireToolRequest } from '../adapters/types';
 import { runOneStep, type OneStep } from './run-step';
-import { stepCountIs, type NamedStopCondition } from './stop';
+import { stepCountIs, budgetConditions, type NamedStopCondition } from './stop';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
   applyCompaction,
@@ -1148,11 +1148,13 @@ export function bumpErrorGuard(counters: Map<string, number>, results: ToolResul
 export function normalizeStop(
   stopWhen: CommonCallOptions['stopWhen'],
   maxSteps: number,
+  budget?: CommonCallOptions['budget'],
 ): StopCondition[] {
   // The maxSteps bound is the loop's own guard — flagged so it never surfaces
   // as a `stoppedBy` marker (that would change every bounded run's output).
   const implicit = Object.assign(stepCountIs(maxSteps), { implicitMaxSteps: true });
   const conditions: StopCondition[] = [implicit];
+  if (budget) conditions.push(...budgetConditions(budget));
   if (stopWhen) conditions.push(...(Array.isArray(stopWhen) ? stopWhen : [stopWhen]));
   return conditions;
 }

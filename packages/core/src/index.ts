@@ -9,7 +9,13 @@ export { streamChat, generateText, generateObject, streamObject } from './genera
 export { embed, embedMany } from './inference/embed';
 
 // Loop stop conditions (1.4 additive; totalTokensExceed/costExceeds read REAL usage).
-export { stepCountIs, hasToolCall, totalTokensExceed, costExceeds } from './inference/stop';
+export {
+  stepCountIs,
+  hasToolCall,
+  totalTokensExceed,
+  costExceeds,
+  durationExceeds,
+} from './inference/stop';
 
 // Sub-agents (1.4 additive) — an agent as a tool, with live stream + approval inheritance.
 export { agentTool } from './inference/agent-tool';

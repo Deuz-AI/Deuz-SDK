@@ -210,3 +210,18 @@ expectTypeOf<DeuzStreamWriter['writeData']>().toBeFunction();
 expectTypeOf<
   Extract<import('../src/ui').DeuzUIPart, { payload: unknown }>['type']
 >().toEqualTypeOf<`data-${string}`>();
+
+// --- 1.7.0 additive: live cost part + budget guardrail (D2/D3). ---
+import type { CostPart, BudgetExceededPart } from '../src/index';
+import { durationExceeds as durationExceedsRoot } from '../src/index';
+expectTypeOf<CostPart>().toMatchTypeOf<{ type: 'cost'; costUsd: number }>();
+expectTypeOf<BudgetExceededPart['kind']>().toEqualTypeOf<'usd' | 'tokens'>();
+expectTypeOf<CommonCallOptions['budget']>().toEqualTypeOf<
+  { usd?: number; tokens?: number } | undefined
+>();
+expectTypeOf(durationExceedsRoot).returns.toBeFunction();
+// PriceProvider.cacheSavings stays OPTIONAL (additive seam extension).
+expectTypeOf<Dependencies['priceProvider']>().not.toBeNever();
+expectTypeOf<
+  NonNullable<NonNullable<Dependencies['priceProvider']>['cacheSavings']>
+>().toBeFunction();

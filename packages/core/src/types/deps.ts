@@ -98,6 +98,12 @@ export interface KeyProvider {
 export interface PriceProvider {
   /** May be async — real price tables (DB/remote) resolve a Promise. */
   priceUsage(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
+  /**
+   * Optional (1.7 additive): USD SAVED by prompt-cache reads vs paying the
+   * full input rate for those tokens. Feeds `cacheSavingsUsd` on the live
+   * `cost` stream part. `createPriceProvider` implements it from the table.
+   */
+  cacheSavings?(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
 }
 
 export interface UsageMeta {

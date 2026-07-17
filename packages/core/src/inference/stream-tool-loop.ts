@@ -187,7 +187,7 @@ export function runStreamToolLoop(
       observationHandle = { settled: observationDeferred.promise };
     }
     const steps: StepResult[] = [];
-    const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
+    const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1, options.budget);
     const wantCost = needsCost(stopConditions);
     if (wantCost && !deps.priceProvider) {
       deps.logger.warn('costExceeds: no deps.priceProvider injected — the condition never fires');
@@ -197,6 +197,7 @@ export function runStreamToolLoop(
     let totalUsage: Usage = EMPTY_USAGE;
     let lastFinish: FinishReason = 'stop';
     let stoppedBy: string | undefined;
+    let prevCostUsd = 0;
     let stepIndex = resumeFrom?.stepIndex ?? 0;
     let endReason: LoopOutcome['endReason'] = 'natural';
     let suspend: LoopOutcome['suspend'] | undefined;
@@ -470,6 +471,30 @@ export function runStreamToolLoop(
           finishReason: stepFinish,
           usage: stepUsage,
         });
+        // Live cumulative cost (1.7, D2): one part per step whenever a
+        // priceProvider is injected — cross-leg cumulative on durable resumes.
+        if (deps.priceProvider) {
+          const costUsage = durableUsage(durable, totalUsage);
+          try {
+            const costUsd = await deps.priceProvider.priceUsage(options.model.modelId, costUsage);
+            if (typeof costUsd === 'number') {
+              const savings = await deps.priceProvider.cacheSavings?.(
+                options.model.modelId,
+                costUsage,
+              );
+              broadcaster.push({
+                type: 'cost',
+                costUsd,
+                deltaUsd: Math.max(0, Math.round((costUsd - prevCostUsd) * 1e6) / 1e6),
+                ...(typeof savings === 'number' && savings > 0 ? { cacheSavingsUsd: savings } : {}),
+                stepIndex,
+              });
+              prevCostUsd = costUsd;
+            }
+          } catch {
+            deps.logger.warn('cost part skipped — priceProvider threw');
+          }
+        }
 
         const { assistantMessage, toolUseParts } = assembleAssistant(
           text,
@@ -720,6 +745,17 @@ export function runStreamToolLoop(
         if (stop.stop) {
           stoppedBy = stop.stoppedBy;
           endReason = stop.stoppedBy !== undefined ? 'stop-condition' : 'max-steps';
+          // Budget guardrail (1.7, D3): a typed part precedes the finish so
+          // UIs can render a continue-confirmation without parsing metadata.
+          if (stop.stoppedBy === 'budget.usd' || stop.stoppedBy === 'budget.tokens') {
+            const kind = stop.stoppedBy === 'budget.usd' ? ('usd' as const) : ('tokens' as const);
+            broadcaster.push({
+              type: 'budget-exceeded',
+              kind,
+              limit: (kind === 'usd' ? options.budget?.usd : options.budget?.tokens) ?? 0,
+              value: kind === 'usd' ? (costUSD ?? 0) : runUsage.totalTokens,
+            });
+          }
           if (durable) {
             await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
           }

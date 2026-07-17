@@ -131,3 +131,26 @@ describe('PRICES 2026-07 refresh', () => {
     expect(priceUsage('text-embedding-004', usage(oneM))).toBeUndefined();
   });
 });
+
+describe('cacheSavings (1.7, D2)', () => {
+  it('computes USD saved by cache reads vs full input rate', async () => {
+    const { cacheSavings, createPriceProvider } = await import('../src/pricing');
+    const usage = {
+      inputTokens: 1000,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cachedReadTokens: 1_000_000,
+      cacheWriteTokens: 0,
+      cacheWrite1hTokens: 0,
+      totalTokens: 1_001_000,
+    };
+    // claude-opus-4-8 style: cachedRead defaults to 10% of input when unset.
+    const table = { 'model-x': { input: 10, output: 20 } };
+    expect(cacheSavings('model-x', usage, table)).toBe(9); // (10 - 1) * 1M/1M
+    expect(cacheSavings('unknown-model', usage, table)).toBeUndefined();
+    expect(cacheSavings('model-x', { ...usage, cachedReadTokens: 0 }, table)).toBe(0);
+    // createPriceProvider wires the seam (margin applies to savings too).
+    const provider = createPriceProvider({ table, margin: 2 });
+    expect(provider.cacheSavings!('model-x', usage)).toBe(18);
+  });
+});

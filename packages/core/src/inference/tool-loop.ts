@@ -92,7 +92,7 @@ export async function runToolLoop(
   // can never skew what the caller receives.
   const appended: Message[] = [];
   const steps: StepResult[] = [];
-  const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1);
+  const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1, options.budget);
   const wantCost = needsCost(stopConditions);
   if (wantCost && !deps.priceProvider) {
     deps.logger.warn('costExceeds: no deps.priceProvider injected — the condition never fires');
