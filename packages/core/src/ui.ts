@@ -68,13 +68,22 @@ export type DeuzUIPart =
       toolCallId: string;
       toolName: string;
       input: unknown;
+      /** HMAC-signed approval token (D4) — echo it back on the verdict. */
+      token?: string;
     }
   /**
    * Client→server direction only (declared for wire symmetry): the verdict
    * travels in the next HTTP request's body as `approvalResponses` — it is
    * never serialized by `toDeuzStreamResponse`. `useChat` consumes it.
    */
-  | { type: 'tool-approval-response'; approvalId: string; approved: boolean; reason?: string }
+  | {
+      type: 'tool-approval-response';
+      approvalId: string;
+      approved: boolean;
+      reason?: string;
+      /** The request's signed token, echoed back (required to APPROVE under `approvalSigner`). */
+      token?: string;
+    }
   /** `streamObject` partial — each delta REPLACES the previous partial wholesale. */
   | { type: 'object-delta'; object: unknown }
   /** Automatic compaction ran before a step (token counts are estimates). */
@@ -284,6 +293,7 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         toolCallId: part.toolCallId,
         toolName: part.toolName,
         input: part.input,
+        ...(part.token ? { token: part.token } : {}),
       };
     case 'compaction':
       // Explicit case required — the default drops unknown canonical parts.

@@ -42,6 +42,7 @@ import {
   startMemoryExtract,
   durableUsage,
   toApprovalRequests,
+  signApprovalRequests,
   preserveClientContext,
   beginLoopObserve,
   endLoopObserve,
@@ -284,6 +285,7 @@ export function runStreamToolLoop(
           toolName: r.toolName,
           input: r.input,
           ...(r.agentPath && r.agentPath.length > 0 ? { agentPath: r.agentPath } : {}),
+          ...(r.token ? { token: r.token } : {}),
         });
       }
     };
@@ -661,7 +663,12 @@ export function runStreamToolLoop(
         // Pending approvals and client tools break together: ONE break, nothing
         // from the batch executes; the resume call settles the deferred rest.
         if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
-          const requests = toApprovalRequests(pendingApproval, options.agentPath);
+          const requests = await signApprovalRequests(
+            toApprovalRequests(pendingApproval, options.agentPath),
+            options,
+            deps,
+            durable?.runId,
+          );
           for (const c of pendingApproval) toolState(c.toolCallId, c.toolName, 'awaiting-approval');
           emitApprovalRequests(requests);
           const sr = toStepResult(stepData, toolCalls, [], steps.length);

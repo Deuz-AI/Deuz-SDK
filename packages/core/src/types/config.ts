@@ -13,6 +13,7 @@ import type {
 import type { DurableSessionOptions } from './session';
 import type { ChatPersistOptions } from '../chat';
 import type { MemoryCallOptions } from '../memory';
+import type { ApprovalSigner } from '../durable';
 
 /** Opaque model id; capability-aware refinement arrives with the registry (Faz 1.A). */
 export type ModelId = string;
@@ -217,6 +218,18 @@ export interface CommonCallOptions {
    * `withFallback` middleware (`./middleware`) — same semantics.
    */
   fallbackModels?: LanguageModel[];
+  /**
+   * Cryptographic approval trail (1.7 additive, D4): when set, every
+   * client-mode `tool-approval-request` (streaming part, `pendingApprovals`,
+   * and durable checkpoints) carries an HMAC-signed `token` bound to the
+   * request (+ `runId` on durable calls). On resume, an APPROVED verdict must
+   * echo a verifying token — forged/missing/mismatched tokens are DENIED.
+   * Build with `createApprovalSigner` (`./durable`); the secret never leaves
+   * the server.
+   */
+  approvalSigner?: ApprovalSigner;
+  /** Max accepted age for approval tokens on resume (ms; default: unlimited). */
+  approvalMaxAgeMs?: number;
 }
 
 /** Shared client configuration; pre-binds api keys + deps for the convenience client. */

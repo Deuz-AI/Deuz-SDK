@@ -96,6 +96,12 @@ export interface ToolApprovalRequest {
    * with the same verdict ids — the loop routes them back down the tree.
    */
   agentPath?: string[];
+  /**
+   * HMAC-signed approval token (1.7 additive, D4): present when the call
+   * carried `approvalSigner`. Echo it back on the verdict — an approval
+   * without a verifying token is DENIED on resume.
+   */
+  token?: string;
 }
 
 /** The caller's verdict on a pending `ToolApprovalRequest` (resume call). */
@@ -104,6 +110,8 @@ export interface ToolApprovalResponse {
   approved: boolean;
   /** Optional denial reason — fed back to the model inside the is_error tool_result. */
   reason?: string;
+  /** The request's signed token, echoed back (required to APPROVE under `approvalSigner`). */
+  token?: string;
 }
 
 /** One turn of the agentic loop. */

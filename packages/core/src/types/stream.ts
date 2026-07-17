@@ -98,6 +98,8 @@ export interface ToolApprovalRequestPart {
    * `approvalId` — the resume leg routes the verdict back down the tree.
    */
   agentPath?: string[];
+  /** HMAC-signed approval token (1.7 additive, D4) — echo it back on the verdict. */
+  token?: string;
 }
 
 /**

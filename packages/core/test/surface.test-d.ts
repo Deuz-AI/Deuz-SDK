@@ -271,3 +271,10 @@ expectTypeOf(withFallback).parameters.toMatchTypeOf<
 >();
 expectTypeOf<CommonCallOptions['fallbackModels']>().toEqualTypeOf<LanguageModel[] | undefined>();
 expectTypeOf<InstanceType<typeof BreakerOpenErrorRoot>['cooldownUntil']>().toEqualTypeOf<number>();
+
+// --- 1.7.0 additive: signed approvals end-to-end (D4). ---
+
+expectTypeOf<ToolApprovalRequest['token']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<ToolApprovalResponse['token']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<CommonCallOptions['approvalSigner']>().not.toBeNever();
+expectTypeOf<CommonCallOptions['approvalMaxAgeMs']>().toEqualTypeOf<number | undefined>();

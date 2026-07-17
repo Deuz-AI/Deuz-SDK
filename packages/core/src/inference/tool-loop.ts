@@ -34,6 +34,7 @@ import {
   startMemoryExtract,
   durableUsage,
   toApprovalRequests,
+  signApprovalRequests,
   preserveClientContext,
   beginLoopObserve,
   endLoopObserve,
@@ -356,7 +357,12 @@ export async function runToolLoop(
       // ONE break, executing nothing from the batch; the resume settles the rest.
       if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
         if (pendingApproval.length > 0) {
-          pendingApprovals = toApprovalRequests(pendingApproval, options.agentPath);
+          pendingApprovals = await signApprovalRequests(
+            toApprovalRequests(pendingApproval, options.agentPath),
+            options,
+            deps,
+            durable?.runId,
+          );
         }
         const sr = toStepResult(step, toolCalls, [], steps.length);
         steps.push(sr);

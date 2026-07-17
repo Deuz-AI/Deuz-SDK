@@ -212,6 +212,33 @@ export function toApprovalRequests(
 }
 
 /**
+ * Cryptographic approval trail (1.7, D4): attach an HMAC token to every
+ * pending approval when the call carries `approvalSigner`. Best-effort — a
+ * throwing signer logs and the requests go out unsigned (verification on
+ * resume will then default-deny approvals, the safe side).
+ */
+export async function signApprovalRequests(
+  requests: ToolApprovalRequest[],
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  runId: string | undefined,
+): Promise<ToolApprovalRequest[]> {
+  const signer = options.approvalSigner;
+  if (!signer || requests.length === 0) return requests;
+  try {
+    return await Promise.all(
+      requests.map(async (request) => ({
+        ...request,
+        token: await signer.sign(request, runId !== undefined ? { runId } : undefined),
+      })),
+    );
+  } catch (error) {
+    deps.logger.error('approval signing failed — requests go out unsigned', { error });
+    return requests;
+  }
+}
+
+/**
  * Which of the step's calls require approval. `needsApproval` booleans are
  * read directly; predicate forms are awaited with the parsed args + execute
  * ctx. A THROWING predicate requires approval (safe side). Fast path: zero
@@ -623,11 +650,37 @@ export async function settlePendingApprovals(
   const gated = await findApprovalNeeded(noVerdict, tools, options, messages);
 
   const denied: DenialMap = new Map();
+  const signer = options.approvalSigner;
+  const expectedRunId = options.session?.runId;
   for (const c of calls) {
     const verdict = byId.get(c.toolCallId);
     if (verdict) {
       if (!verdict.approved) {
         denied.set(c.toolCallId, { cause: 'response-denied', reason: verdict.reason });
+      } else if (signer) {
+        // Signed-approval enforcement (1.7, D4): an APPROVAL must echo a token
+        // that verifies, matches this approvalId, and — on durable runs —
+        // binds to this runId. Anything else is a forgery/mismatch: DENY.
+        const payload = verdict.token
+          ? await signer.verify(
+              verdict.token,
+              options.approvalMaxAgeMs !== undefined
+                ? { maxAgeMs: options.approvalMaxAgeMs }
+                : undefined,
+            )
+          : null;
+        const valid =
+          payload !== null &&
+          payload.approvalId === c.toolCallId &&
+          (expectedRunId === undefined ||
+            payload.runId === undefined ||
+            payload.runId === expectedRunId);
+        if (!valid) {
+          denied.set(c.toolCallId, {
+            cause: 'response-denied',
+            reason: 'Approval token missing, invalid, expired, or bound to another run.',
+          });
+        }
       }
     } else if (!tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider') {
       denied.set(c.toolCallId, {
