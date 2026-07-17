@@ -256,3 +256,9 @@ import type { MemoryCallOptions, MemoryMutation } from '../src/memory';
 expectTypeOf<CommonCallOptions['memory']>().toEqualTypeOf<MemoryCallOptions | undefined>();
 expectTypeOf<GenerateTextResult['memory']>().toEqualTypeOf<Promise<MemoryMutation[]> | undefined>();
 expectTypeOf<StreamChatResult['memory']>().toEqualTypeOf<Promise<MemoryMutation[]> | undefined>();
+
+// --- 1.7.0 additive: durable × resumable endpoint (D5). ---
+import { resumeDeuzChatResponse, type ResumeDeuzChatOptions } from '../src/durable';
+expectTypeOf(resumeDeuzChatResponse).returns.toEqualTypeOf<Response>();
+expectTypeOf<ResumeDeuzChatOptions['streamStateStore']>().not.toBeNever();
+expectTypeOf<ResumeDeuzChatOptions['call']>().not.toBeNever();

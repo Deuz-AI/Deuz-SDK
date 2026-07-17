@@ -22,6 +22,7 @@ export {
   createInMemorySessionStore,
   resumeFromCheckpoint,
   resumeStreamFromCheckpoint,
+  resumeDeuzChatResponse,
   serializeCheckpoint,
   deserializeCheckpoint,
   createApprovalSigner,
@@ -29,6 +30,7 @@ export {
 } from './durable';
 export type {
   ResumeOptions,
+  ResumeDeuzChatOptions,
   SignedApprovalPayload,
   CreateApprovalSignerOptions,
   ApprovalSigner,

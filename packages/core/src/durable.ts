@@ -22,6 +22,13 @@ import {
   type ObservationRuntime,
 } from './internal/observe-runtime';
 import { toObservedError } from './internal/observe-error';
+import { redactString } from './internal/redact';
+import {
+  toDeuzStreamResponse,
+  type StreamStateStore,
+  type StreamStateRecord,
+  type DeuzWireVersion,
+} from './ui';
 
 export type { AgentCheckpoint, SessionStore, CheckpointStatus } from './types/session';
 
@@ -277,6 +284,187 @@ export function resumeStreamFromCheckpoint(
     },
   );
   return result;
+}
+
+// --- Durable × resumable — the "unbreakable chatbot" endpoint (1.7, D5) ------
+
+export interface ResumeDeuzChatOptions {
+  sessionStore: SessionStore;
+  streamStateStore: StreamStateStore;
+  /** Durable run identity (checkpoint continuation). */
+  runId: string;
+  /** Wire-log identity (`Last-Event-ID` replay). Often equal to `runId`. */
+  streamId: string;
+  /** The reconnecting client's `Last-Event-ID` (header value, verbatim). */
+  lastEventId?: string | number | null;
+  /** Model/tools/deps for a continuation leg (same shape as other resume calls). */
+  call: ResumeOptions;
+  /**
+   * How long the live-producer probe tolerates SILENCE before declaring the
+   * run dead and re-driving it from the checkpoint (ms, default 1500). A
+   * refreshed tab whose original producer is still draining server-side just
+   * tails; only a killed process triggers a continuation leg. Run at-most-one
+   * resumer per runId (app-level lock) — two continuation legs would double
+   * the model call and interleave seqs.
+   */
+  liveProbeMs?: number;
+  /** Poll cadence during replay/tail (ms, default 150). */
+  pollIntervalMs?: number;
+  wireVersion?: DeuzWireVersion;
+  headers?: Record<string, string>;
+  /** Timer seam (deterministic tests). Default: global setTimeout. */
+  clock?: Pick<Clock, 'setTimeout'>;
+  onStoreError?: (error: unknown) => void;
+}
+
+/**
+ * ONE endpoint for the whole "kopmaz chatbot" story: replay the stored wire
+ * log from the client's `Last-Event-ID`, keep tailing while the original
+ * producer is alive, and — if the process died mid-run — CONTINUE the run
+ * itself from its last durable checkpoint, piping the new leg through the
+ * same wire log (seq numbering continues; the leg writes its own terminal
+ * sentinel). Page refreshes, network drops, and server crashes all converge
+ * on the same client behavior: `connectDeuzStream` sees one gapless stream.
+ */
+export function resumeDeuzChatResponse(options: ResumeDeuzChatOptions): Response {
+  const encoder = new TextEncoder();
+  const version: DeuzWireVersion = options.wireVersion ?? 'v2';
+  const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 150);
+  const liveProbeMs = Math.max(0, options.liveProbeMs ?? 1500);
+  const timer: Pick<Clock, 'setTimeout'> = options.clock ?? {
+    setTimeout: (fn, ms) => {
+      const id = globalThis.setTimeout(fn, ms);
+      return () => globalThis.clearTimeout(id);
+    },
+  };
+  const sleep = (ms: number): Promise<void> =>
+    new Promise((resolve) => timer.setTimeout(resolve, ms));
+  const raw =
+    typeof options.lastEventId === 'string' ? options.lastEventId.trim() : options.lastEventId;
+  const fromSeq =
+    typeof raw === 'number' && Number.isInteger(raw) && raw >= 0
+      ? raw
+      : typeof raw === 'string' && /^\d+$/.test(raw)
+        ? Number(raw)
+        : -1;
+
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const enqueue = (text: string): void => {
+        if (cancelled) return;
+        try {
+          controller.enqueue(encoder.encode(text));
+        } catch {
+          cancelled = true;
+        }
+      };
+      const finishBody = (): void => {
+        if (cancelled) return;
+        try {
+          controller.close();
+        } catch {
+          /* cancelled concurrently */
+        }
+      };
+      const emitRecord = (record: StreamStateRecord): void => {
+        enqueue(
+          `${version === 'v2' ? `id: ${record.seq}\n` : ''}data: ${JSON.stringify(record.part)}\n\n`,
+        );
+      };
+      const emitDone = (seq: number): void => {
+        enqueue(`${version === 'v2' ? `id: ${seq}\n` : ''}data: [DONE]\n\n`);
+      };
+      try {
+        // Phase 1 — replay + live tail. A `done` sentinel with nothing after
+        // it means the stream COMPLETED (even a failed turn writes one — only
+        // a killed process leaves the log open); silence past `liveProbeMs`
+        // means the producer is gone.
+        let cursor = fromSeq;
+        let pendingDone: number | undefined;
+        let idleMs = 0;
+        for (;;) {
+          if (cancelled) return;
+          let progressed = false;
+          for await (const record of options.streamStateStore.read(options.streamId, cursor)) {
+            if (cancelled) return;
+            cursor = record.seq;
+            progressed = true;
+            if (record.part.type === 'done') {
+              pendingDone = record.seq;
+            } else {
+              pendingDone = undefined; // leg boundary — sail through
+              emitRecord(record);
+            }
+          }
+          if (progressed) {
+            idleMs = 0;
+            continue;
+          }
+          if (pendingDone !== undefined) {
+            emitDone(pendingDone);
+            finishBody();
+            return;
+          }
+          if (idleMs >= liveProbeMs) break; // silent, no sentinel → dead
+          await sleep(pollIntervalMs);
+          idleMs += pollIntervalMs;
+        }
+        // Phase 2 — continue the RUN from its last checkpoint; the new leg
+        // rides the same wire log (seq continues, sentinel written by the leg).
+        const result = resumeStreamFromCheckpoint(
+          options.sessionStore,
+          options.runId,
+          options.call,
+        );
+        const continuation = toDeuzStreamResponse(result, {
+          store: options.streamStateStore,
+          streamId: options.streamId,
+          wireVersion: version,
+          ...(options.onStoreError ? { onStoreError: options.onStoreError } : {}),
+        });
+        const reader = continuation.body!.getReader();
+        for (;;) {
+          if (cancelled) {
+            await reader.cancel(); // the leg keeps journaling server-side
+            return;
+          }
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && !cancelled) {
+            try {
+              controller.enqueue(value); // raw bytes — already wire-framed
+            } catch {
+              cancelled = true;
+            }
+          }
+        }
+      } catch (error) {
+        // Store failures land here (checkpoint problems surface as error
+        // parts through the continuation body per G2). Redacted, no [DONE].
+        enqueue(
+          `data: ${JSON.stringify({
+            type: 'error',
+            message: redactString(error instanceof Error ? error.message : 'resume failed'),
+          })}\n\n`,
+        );
+      }
+      finishBody();
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+
+  return new Response(body, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      'x-deuz-stream': version,
+      ...options.headers,
+    },
+  });
 }
 
 // --- HMAC-signed approvals (WebCrypto, edge-safe) -----------------------------
