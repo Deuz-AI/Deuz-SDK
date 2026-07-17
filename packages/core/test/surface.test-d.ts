@@ -193,3 +193,20 @@ expectTypeOf<StreamStateStore['lastSeq']>().toEqualTypeOf<
   ((streamId: string) => number | undefined | Promise<number | undefined>) | undefined
 >();
 expectTypeOf(createInMemoryStreamStateStore).returns.toEqualTypeOf<Required<StreamStateStore>>();
+
+// --- 1.7.0 additive: typed data parts + tool state machine + citations (P3). ---
+import type { DataPart, CitationPart, ToolStatePart, ToolRunState } from '../src/index';
+import { createDeuzStream, type DeuzStreamWriter } from '../src/ui';
+expectTypeOf<DataPart>().toMatchTypeOf<{ type: 'data'; name: string; payload: unknown }>();
+expectTypeOf<CitationPart['type']>().toEqualTypeOf<'citation'>();
+expectTypeOf<CitationPart['chunkIndex']>().toEqualTypeOf<number | undefined>();
+expectTypeOf<ToolStatePart['state']>().toEqualTypeOf<ToolRunState>();
+expectTypeOf<ToolRunState>().toEqualTypeOf<
+  'input-streaming' | 'input-complete' | 'awaiting-approval' | 'executing' | 'complete' | 'error'
+>();
+expectTypeOf(createDeuzStream).returns.toEqualTypeOf<DeuzStreamWriter>();
+expectTypeOf<DeuzStreamWriter['writeData']>().toBeFunction();
+// data-{name} rides the wire as a template-literal typed part.
+expectTypeOf<
+  Extract<import('../src/ui').DeuzUIPart, { payload: unknown }>['type']
+>().toEqualTypeOf<`data-${string}`>();

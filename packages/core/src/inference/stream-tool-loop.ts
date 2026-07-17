@@ -1,6 +1,6 @@
 import type { CommonCallOptions } from '../types/config';
 import type { StreamChatResult } from '../types/methods';
-import type { StreamPart } from '../types/stream';
+import type { StreamPart, ToolRunState } from '../types/stream';
 import type { Message } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
 import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
@@ -264,6 +264,20 @@ export function runStreamToolLoop(
       }
     };
 
+    // Tool state machine (1.7): one part per lifecycle transition.
+    const toolState = (
+      toolCallId: string,
+      toolName: string | undefined,
+      state: ToolRunState,
+    ): void => {
+      broadcaster.push({
+        type: 'tool-state',
+        toolCallId,
+        ...(toolName ? { toolName } : {}),
+        state,
+      });
+    };
+
     try {
       const fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
       const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
@@ -409,6 +423,7 @@ export function runStreamToolLoop(
                 entry = { name: part.name, args: '' };
                 toolArgs.set(part.id, entry);
                 toolOrder.push(part.id);
+                toolState(part.id, part.name, 'input-streaming');
               }
               if (part.name && !entry.name) entry.name = part.name;
               if (part.providerMetadata) entry.meta = part.providerMetadata;
@@ -535,6 +550,7 @@ export function runStreamToolLoop(
             toolName: c.toolName,
             input: c.args,
           });
+          toolState(c.toolCallId, c.toolName, 'input-complete');
         }
         messages = [...messages, assistantMessage];
 
@@ -564,6 +580,7 @@ export function runStreamToolLoop(
         // from the batch executes; the resume call settles the deferred rest.
         if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
           const requests = toApprovalRequests(pendingApproval, options.agentPath);
+          for (const c of pendingApproval) toolState(c.toolCallId, c.toolName, 'awaiting-approval');
           emitApprovalRequests(requests);
           const sr = toStepResult(stepData, toolCalls, [], steps.length);
           steps.push(sr);
@@ -601,6 +618,10 @@ export function runStreamToolLoop(
           break;
         }
 
+        for (const c of toolCalls) {
+          // Denied calls never execute — they surface straight as error results.
+          if (!denied.has(c.toolCallId)) toolState(c.toolCallId, c.toolName, 'executing');
+        }
         let toolResults;
         try {
           toolResults = await executeTools(toolCalls, tools, options, messages, denied, extras);
@@ -650,6 +671,7 @@ export function runStreamToolLoop(
             output: r.result,
             ...(r.isError ? { isError: true } : {}),
           });
+          toolState(r.toolCallId, r.toolName, r.isError ? 'error' : 'complete');
         }
         const toolResultMessage: Message = {
           role: 'tool',

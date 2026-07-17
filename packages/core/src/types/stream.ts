@@ -123,6 +123,55 @@ export interface SubAgentPart {
   part: StreamPart;
 }
 
+/**
+ * App-defined typed data part (1.7 additive): the server writes it via
+ * `createDeuzStream(...).writeData(name, payload)` and the UI wire frames it
+ * as `data-{name}` (optionally validated against a Standard Schema while
+ * streaming — see `dataSchemas`).
+ */
+export interface DataPart {
+  type: 'data';
+  name: string;
+  payload: unknown;
+}
+
+/**
+ * Built-in RAG citation part (1.7 additive): provenance for retrieved chunks.
+ * Build from retrieve/rerank hits with `citationsFromHits` (`./rag`).
+ */
+export interface CitationPart {
+  type: 'citation';
+  id: string;
+  sourceId?: string;
+  url?: string;
+  title?: string;
+  snippet?: string;
+  /** `Chunk.index` of the cited chunk (stable across BM25 indexing and RRF fusion). */
+  chunkIndex?: number;
+  score?: number;
+}
+
+/** Tool-call lifecycle states surfaced by the streaming loop (1.7 additive). */
+export type ToolRunState =
+  | 'input-streaming'
+  | 'input-complete'
+  | 'awaiting-approval'
+  | 'executing'
+  | 'complete'
+  | 'error';
+
+/**
+ * Tool state machine (1.7 additive): the streaming loop emits one of these at
+ * every lifecycle transition of a tool call, so UIs render status ("running
+ * getWeather…") without re-deriving it from part ordering.
+ */
+export interface ToolStatePart {
+  type: 'tool-state';
+  toolCallId: string;
+  toolName?: string;
+  state: ToolRunState;
+}
+
 export type StreamPart =
   | TextDeltaPart
   | ReasoningDeltaPart
@@ -136,4 +185,7 @@ export type StreamPart =
   | ToolResultStreamPart
   | ToolApprovalRequestPart
   | CompactionPart
-  | SubAgentPart;
+  | SubAgentPart
+  | DataPart
+  | CitationPart
+  | ToolStatePart;

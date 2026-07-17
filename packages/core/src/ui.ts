@@ -14,9 +14,10 @@
  * when negotiated via {@link negotiateDeuzStreamVersion} / `wireVersion`.
  */
 import type { StreamChatResult, StreamObjectResult } from './types/methods';
-import type { StreamPart } from './types/stream';
+import type { StreamPart, ToolRunState } from './types/stream';
 import type { Usage, FinishReason } from './types/usage';
 import type { Clock } from './types/deps';
+import type { StandardSchemaV1 } from './types/schema';
 import { parseSSE } from './internal/sse';
 import { redactString } from './internal/redact';
 import { resolveDependencies } from './internal/resolve-deps';
@@ -80,6 +81,21 @@ export type DeuzUIPart =
   | { type: 'compaction'; layer: string; tokensBefore: number; tokensAfter: number }
   /** A sub-agent (`agentTool`) part, forwarded live with its path. */
   | { type: 'sub-agent'; agentPath: string[]; part: DeuzUIPart }
+  /** App-defined typed data (v2 wire): `writeData('chart', …)` → `data-chart`. */
+  | { type: `data-${string}`; payload: unknown }
+  /** RAG citation (v2 wire): provenance for a retrieved chunk. */
+  | {
+      type: 'citation';
+      id: string;
+      sourceId?: string;
+      url?: string;
+      title?: string;
+      snippet?: string;
+      chunkIndex?: number;
+      score?: number;
+    }
+  /** Tool lifecycle transition (v2 wire): render live tool status directly. */
+  | { type: 'tool-state'; toolCallId: string; toolName?: string; state: ToolRunState }
   | { type: 'finish'; finishReason: FinishReason; usage: Usage }
   | { type: 'error'; message: string };
 
@@ -281,6 +297,27 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         finishReason: part.finishReason,
         usage: part.usage,
       };
+    case 'data':
+      // Vercel-style DX on the wire: the part name rides the type itself.
+      return { type: `data-${part.name}`, payload: part.payload };
+    case 'citation':
+      return {
+        type: 'citation',
+        id: part.id,
+        ...(part.sourceId ? { sourceId: part.sourceId } : {}),
+        ...(part.url ? { url: part.url } : {}),
+        ...(part.title ? { title: part.title } : {}),
+        ...(part.snippet ? { snippet: part.snippet } : {}),
+        ...(part.chunkIndex !== undefined ? { chunkIndex: part.chunkIndex } : {}),
+        ...(part.score !== undefined ? { score: part.score } : {}),
+      };
+    case 'tool-state':
+      return {
+        type: 'tool-state',
+        toolCallId: part.toolCallId,
+        ...(part.toolName ? { toolName: part.toolName } : {}),
+        state: part.state,
+      };
     case 'finish':
       return { type: 'finish', finishReason: part.finishReason, usage: part.usage };
     case 'error':
@@ -288,6 +325,11 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
     default:
       return undefined;
   }
+}
+
+/** Part types that exist only on wire v2 — never serialized to a negotiated-v1 client. */
+function isV2OnlyPart(type: string): boolean {
+  return type === 'citation' || type === 'tool-state' || type.startsWith('data-');
 }
 
 export interface ToDeuzStreamOptions {
@@ -366,6 +408,9 @@ function deuzSSEResponse(
         }
       }
       const send = (part: DeuzUIPart): void => {
+        // v2-only parts are dropped entirely for a negotiated-v1 client (the
+        // store must mirror the wire seq-for-seq, so they skip both).
+        if (version === 'v1' && isV2OnlyPart(part.type)) return;
         // Store BEFORE wire: a part in flight during a disconnect must still
         // land in the log even though its enqueue never happens.
         writer?.append(seq, part);
@@ -451,6 +496,112 @@ export function toDeuzObjectStreamResponse(
       send({ type: 'error', message: errorMessage(err) });
     }
   });
+}
+
+// ===================================================================
+// createDeuzStream — model stream + app data parts on one wire (v2)
+// ===================================================================
+
+export interface CreateDeuzStreamOptions extends ToDeuzStreamOptions {
+  /**
+   * Opt-in streaming validation: a Standard Schema per data-part name.
+   * `writeData('chart', payload)` validates against `dataSchemas.chart`
+   * BEFORE serialization — an invalid payload is dropped and a redacted
+   * `error` part is emitted instead (the stream itself keeps going).
+   */
+  dataSchemas?: Record<string, StandardSchemaV1>;
+}
+
+export interface DeuzStreamWriter {
+  response: Response;
+  /**
+   * Queue a typed `data-{name}` part into the live stream. Safe to call from
+   * anywhere while the model stream runs (tool `execute`, RAG pipeline, …);
+   * writes after the stream ended are dropped.
+   */
+  writeData(name: string, payload: unknown): void;
+  /** End the data channel early (it auto-closes when the model stream completes). */
+  close(): void;
+}
+
+/**
+ * Like `toDeuzStreamResponse`, but returns a writer so the server can inject
+ * typed `data-{name}` parts (chart payloads, RAG citations, progress markers)
+ * into the SAME SSE response the model streams over — ordered, seq-numbered,
+ * journaled to the `store`, and replayable like every other part.
+ */
+export function createDeuzStream(
+  result: StreamChatResult,
+  options: CreateDeuzStreamOptions = {},
+): DeuzStreamWriter {
+  interface DataItem {
+    name: string;
+    payload: unknown;
+  }
+  const queue: DataItem[] = [];
+  let notify: (() => void) | undefined;
+  let closed = false;
+  const wake = (): void => {
+    const n = notify;
+    notify = undefined;
+    n?.();
+  };
+
+  const response = deuzSSEResponse('createDeuzStream', options, async (send) => {
+    const sendData = async (item: DataItem): Promise<void> => {
+      const schema = options.dataSchemas?.[item.name];
+      if (schema) {
+        try {
+          const checked = await schema['~standard'].validate(item.payload);
+          if (checked.issues) {
+            send({ type: 'error', message: `data part '${item.name}' failed validation.` });
+            return;
+          }
+          send({ type: `data-${item.name}`, payload: checked.value });
+          return;
+        } catch {
+          send({ type: 'error', message: `data part '${item.name}' failed validation.` });
+          return;
+        }
+      }
+      send({ type: `data-${item.name}`, payload: item.payload });
+    };
+
+    const model = (async () => {
+      try {
+        for await (const part of result.fullStream) {
+          const ui = toUIPart(part);
+          if (ui) send(ui);
+        }
+      } catch (err) {
+        send({ type: 'error', message: errorMessage(err) });
+      }
+    })();
+    const data = (async () => {
+      for (;;) {
+        while (queue.length > 0) await sendData(queue.shift()!);
+        if (closed) return;
+        await new Promise<void>((resolve) => (notify = resolve));
+      }
+    })();
+    await model;
+    closed = true; // model stream ended — drain what's queued, then stop
+    wake();
+    await data;
+  });
+
+  return {
+    response,
+    writeData(name, payload) {
+      if (closed) return;
+      queue.push({ name, payload });
+      wake();
+    },
+    close() {
+      closed = true;
+      wake();
+    },
+  };
 }
 
 // ===================================================================

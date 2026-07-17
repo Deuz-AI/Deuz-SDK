@@ -9,6 +9,7 @@
  * a `ParserRegistry` — core never imports a parser library.
  */
 import type { Part } from './types/message';
+import type { CitationPart } from './types/stream';
 import type { ModelCapabilities } from './core/registry';
 import { DeuzError } from './errors';
 
@@ -571,6 +572,49 @@ export const identityReranker: Reranker = {
   rerank: async (_query, candidates, topN) =>
     [...candidates].sort((a, b) => b.score - a.score).slice(0, topN),
 };
+
+export interface CitationOptions {
+  /** Max snippet characters carried on the part (default 200; 0 = no snippet). */
+  snippetLength?: number;
+}
+
+/**
+ * Built-in RAG citations (1.7): map retrieve/rerank hits to canonical
+ * `citation` stream parts — send them alongside the answer via
+ * `createDeuzStream(...).writeData` or emit through your own pipeline.
+ * `Chunk.index` rides `chunkIndex` (stable across BM25 indexing and RRF
+ * fusion, so citations stay aligned with `hybridRetrieve` results);
+ * `meta.id`/`meta.sourceId`/`meta.url`/`meta.title` are picked up when
+ * present.
+ */
+export function citationsFromHits(
+  hits: ReadonlyArray<Chunk | ScoredChunk>,
+  options: CitationOptions = {},
+): CitationPart[] {
+  const snippetLength = options.snippetLength ?? 200;
+  const metaString = (chunk: Chunk, key: string): string | undefined => {
+    const value = chunk.meta?.[key];
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+  };
+  return hits.map((chunk) => {
+    const snippet =
+      snippetLength > 0
+        ? chunk.text.length > snippetLength
+          ? `${chunk.text.slice(0, snippetLength)}…`
+          : chunk.text
+        : undefined;
+    return {
+      type: 'citation' as const,
+      id: metaString(chunk, 'id') ?? `chunk-${chunk.index}`,
+      ...(metaString(chunk, 'sourceId') ? { sourceId: metaString(chunk, 'sourceId') } : {}),
+      ...(metaString(chunk, 'url') ? { url: metaString(chunk, 'url') } : {}),
+      ...(metaString(chunk, 'title') ? { title: metaString(chunk, 'title') } : {}),
+      ...(snippet ? { snippet } : {}),
+      chunkIndex: chunk.index,
+      ...('score' in chunk ? { score: chunk.score } : {}),
+    };
+  });
+}
 
 /** Pure cosine similarity (edge-safe). 0 on mismatch / zero vector. */
 export function cosineSimilarity(a: number[], b: number[]): number {

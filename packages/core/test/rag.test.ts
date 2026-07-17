@@ -234,3 +234,41 @@ describe('RagError is a DeuzError', () => {
     expect(e.mime).toBe('unknown');
   });
 });
+
+describe('citationsFromHits (1.7 built-in citations)', () => {
+  it('maps chunks and scored hits to canonical citation parts', async () => {
+    const { citationsFromHits } = await import('../src/rag');
+    const hits = [
+      {
+        text: 'Retrieval-augmented generation grounds answers in sources. '.repeat(8),
+        index: 3,
+        score: 0.92,
+        meta: { id: 'doc1#3', sourceId: 'doc1', url: 'https://ex.com/d1', title: 'RAG intro' },
+      },
+      { text: 'short chunk', index: 7 },
+    ];
+    const citations = citationsFromHits(hits);
+    expect(citations[0]).toMatchObject({
+      type: 'citation',
+      id: 'doc1#3',
+      sourceId: 'doc1',
+      url: 'https://ex.com/d1',
+      title: 'RAG intro',
+      chunkIndex: 3,
+      score: 0.92,
+    });
+    expect(citations[0]!.snippet!.length).toBeLessThanOrEqual(201); // 200 + ellipsis
+    expect(citations[1]).toEqual({
+      type: 'citation',
+      id: 'chunk-7',
+      snippet: 'short chunk',
+      chunkIndex: 7,
+    });
+    // Chunk.index stability contract: chunkIndex mirrors the input index untouched.
+    expect(citationsFromHits(hits, { snippetLength: 0 })[1]).toEqual({
+      type: 'citation',
+      id: 'chunk-7',
+      chunkIndex: 7,
+    });
+  });
+});

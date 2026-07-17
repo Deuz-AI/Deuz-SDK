@@ -8,11 +8,13 @@ import {
   resumeDeuzStreamResponse,
   negotiateDeuzStreamVersion,
   createInMemoryStreamStateStore,
+  createDeuzStream,
   DEUZ_STREAM_VERSION,
   type DeuzUIPart,
 } from '../src/ui';
 import type { StreamObjectResult, StreamChatResult } from '../src/index';
 import type { StreamPart } from '../src/types/stream';
+import type { StandardSchemaV1 } from '../src/types/schema';
 import { createAnthropic } from '../src/anthropic';
 import type { JSONSchema } from '../src/types/schema';
 import { sseResponse, sseEvents, mockFetch, mockFetchSequence } from './fixtures/sse';
@@ -835,5 +837,134 @@ describe('Deuz UI wire v2 (resumable)', () => {
     expect(await store.lastSeq('a')).toBe(1);
     expect(await store.lastSeq('b')).toBeUndefined();
     expect(await store.lastSeq('c')).toBe(0);
+  });
+});
+
+describe('Deuz UI wire — typed data parts, tool state, citations (P3)', () => {
+  const numberSchema: StandardSchemaV1<unknown, { a: number }> = {
+    '~standard': {
+      version: 1,
+      vendor: 'test',
+      validate: (value) =>
+        typeof value === 'object' &&
+        value !== null &&
+        typeof (value as { a?: unknown }).a === 'number'
+          ? { value: value as { a: number } }
+          : { issues: [{ message: 'a must be a number' }] },
+    },
+  };
+
+  it('writeData injects data-{name} parts into the live stream (journaled + replayable)', async () => {
+    const store = createInMemoryStreamStateStore();
+    const manual = manualResult();
+    const writer = createDeuzStream(manual.result, { store, streamId: 's1', messageId: 'm1' });
+
+    manual.push({ type: 'text-delta', text: 'Hel' });
+    writer.writeData('chart', { series: [1, 2, 3] });
+    manual.push({ type: 'text-delta', text: 'lo' });
+    manual.end();
+
+    const parts: DeuzUIPart[] = [];
+    for await (const p of readDeuzStream(writer.response)) parts.push(p);
+    const chart = parts.find((p) => p.type === 'data-chart');
+    expect(chart).toEqual({ type: 'data-chart', payload: { series: [1, 2, 3] } });
+    expect(parts.map((p) => p.type)).toContain('text-delta');
+
+    // Journaled with its seq → replays like every other part.
+    const replay = await resumeDeuzStreamResponse(store, 's1', {
+      pollIntervalMs: 1,
+      idleTimeoutMs: 100,
+      clock: instantClock,
+    }).text();
+    expect(replay).toContain('"type":"data-chart"');
+  });
+
+  it('validates data parts against dataSchemas while streaming (opt-in)', async () => {
+    const manual = manualResult();
+    const writer = createDeuzStream(manual.result, {
+      messageId: 'm1',
+      dataSchemas: { metric: numberSchema },
+    });
+    writer.writeData('metric', { a: 42 }); // valid
+    writer.writeData('metric', { a: 'NaN' }); // invalid → dropped + error part
+    writer.writeData('free', { anything: true }); // no schema → passthrough
+    manual.end();
+
+    const parts: DeuzUIPart[] = [];
+    for await (const p of readDeuzStream(writer.response)) parts.push(p);
+    expect(parts.filter((p) => p.type === 'data-metric')).toEqual([
+      { type: 'data-metric', payload: { a: 42 } },
+    ]);
+    expect(parts.find((p) => p.type === 'data-free')).toBeDefined();
+    const err = parts.find((p): p is Extract<DeuzUIPart, { type: 'error' }> => p.type === 'error');
+    expect(err?.message).toContain("data part 'metric' failed validation");
+  });
+
+  it('drops v2-only parts for a negotiated-v1 client (data/tool-state/citation)', async () => {
+    const manual = manualResult();
+    const writer = createDeuzStream(manual.result, { messageId: 'm1', wireVersion: 'v1' });
+    writer.writeData('chart', { x: 1 });
+    manual.push({ type: 'citation', id: 'c1', snippet: 'quoted' });
+    manual.push({ type: 'tool-state', toolCallId: 't1', state: 'executing' });
+    manual.push({ type: 'text-delta', text: 'kept' });
+    manual.end();
+
+    const raw = await writer.response.text();
+    expect(raw).not.toContain('data-chart');
+    expect(raw).not.toContain('citation');
+    expect(raw).not.toContain('tool-state');
+    expect(raw).toContain('"kept"');
+    expect(raw).not.toContain('id: '); // still byte-shaped like v1
+  });
+
+  it('emits the tool state machine across an executed tool call', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch } = mockFetchSequence([
+      () => sseResponse([TOOL_CALL]),
+      () => sseResponse([FINAL]),
+    ]);
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: { getWeather: { parameters: SCHEMA, execute: weather } },
+      maxSteps: 5,
+    });
+    const parts: DeuzUIPart[] = [];
+    for await (const p of readDeuzStream(toDeuzStreamResponse(result))) parts.push(p);
+
+    const states = parts
+      .filter((p): p is Extract<DeuzUIPart, { type: 'tool-state' }> => p.type === 'tool-state')
+      .map((p) => p.state);
+    expect(states).toEqual(['input-streaming', 'input-complete', 'executing', 'complete']);
+    // Transitions bracket the actual tool parts in order.
+    const ordered = parts.map((p) => (p.type === 'tool-state' ? `state:${p.state}` : p.type));
+    expect(ordered.indexOf('state:input-complete')).toBeGreaterThan(
+      ordered.indexOf('tool-call') - 2,
+    );
+    expect(ordered.indexOf('state:complete')).toBeGreaterThan(ordered.indexOf('tool-result'));
+  });
+
+  it('emits awaiting-approval for gated calls (client-mode approval)', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch } = mockFetchSequence([() => sseResponse([TOOL_CALL])]);
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools: { getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true } },
+      maxSteps: 5,
+    });
+    const parts: DeuzUIPart[] = [];
+    for await (const p of readDeuzStream(toDeuzStreamResponse(result))) parts.push(p);
+
+    const states = parts
+      .filter((p): p is Extract<DeuzUIPart, { type: 'tool-state' }> => p.type === 'tool-state')
+      .map((p) => p.state);
+    expect(states).toEqual(['input-streaming', 'input-complete', 'awaiting-approval']);
+    expect(weather).not.toHaveBeenCalled();
+    // The approval request itself still follows the state transition.
+    const ordered = parts.map((p) => (p.type === 'tool-state' ? `state:${p.state}` : p.type));
+    expect(ordered.indexOf('tool-approval-request')).toBeGreaterThan(
+      ordered.indexOf('state:awaiting-approval'),
+    );
   });
 });
