@@ -352,14 +352,19 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
   }
 }
 
-/** Part types that exist only on wire v2 — never serialized to a negotiated-v1 client. */
-function isV2OnlyPart(type: string): boolean {
+/**
+ * Parts that exist only on wire v2 — never serialized to a negotiated-v1
+ * client. Recursive: a v2-only part wrapped in `sub-agent` frames (agentTool
+ * forwards child parts live) is just as invisible to v1.
+ */
+function isV2OnlyPart(part: DeuzUIPart): boolean {
+  if (part.type === 'sub-agent') return isV2OnlyPart(part.part);
   return (
-    type === 'citation' ||
-    type === 'tool-state' ||
-    type === 'cost' ||
-    type === 'budget-exceeded' ||
-    type.startsWith('data-')
+    part.type === 'citation' ||
+    part.type === 'tool-state' ||
+    part.type === 'cost' ||
+    part.type === 'budget-exceeded' ||
+    part.type.startsWith('data-')
   );
 }
 
@@ -441,7 +446,7 @@ function deuzSSEResponse(
       const send = (part: DeuzUIPart): void => {
         // v2-only parts are dropped entirely for a negotiated-v1 client (the
         // store must mirror the wire seq-for-seq, so they skip both).
-        if (version === 'v1' && isV2OnlyPart(part.type)) return;
+        if (version === 'v1' && isV2OnlyPart(part)) return;
         // Store BEFORE wire: a part in flight during a disconnect must still
         // land in the log even though its enqueue never happens.
         writer?.append(seq, part);

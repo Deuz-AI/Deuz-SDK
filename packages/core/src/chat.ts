@@ -107,6 +107,16 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
         message: { ...turn.message, reasoning: (turn.message.reasoning ?? '') + part.text },
       };
     case 'tool-call': {
+      // A `tool-state: input-streaming` may have created a placeholder for
+      // this id already — complete it in place instead of duplicating.
+      if ((turn.message.toolCalls ?? []).some((c) => c.toolCallId === part.toolCallId)) {
+        return withToolCall(turn, part.toolCallId, (c) => ({
+          ...c,
+          toolName: part.toolName,
+          input: part.input,
+          state: 'call',
+        }));
+      }
       const call: UIToolCall = {
         toolCallId: part.toolCallId,
         toolName: part.toolName,
@@ -145,8 +155,24 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
         ],
       };
     }
-    case 'tool-state':
+    case 'tool-state': {
+      // `input-streaming` arrives BEFORE the assembled tool-call part — open a
+      // placeholder so the lifecycle is visible from the first fragment.
+      if (!(turn.message.toolCalls ?? []).some((c) => c.toolCallId === part.toolCallId)) {
+        const placeholder: UIToolCall = {
+          toolCallId: part.toolCallId,
+          toolName: part.toolName ?? '',
+          input: undefined,
+          state: 'call',
+          runState: part.state,
+        };
+        return {
+          ...turn,
+          message: { ...turn.message, toolCalls: [...(turn.message.toolCalls ?? []), placeholder] },
+        };
+      }
       return withToolCall(turn, part.toolCallId, (c) => ({ ...c, runState: part.state }));
+    }
     case 'cost':
       return {
         ...turn,
@@ -426,7 +452,14 @@ export function deserializeChatRecord(json: string): ChatRecord {
       Object.keys(value).length === 1 &&
       typeof (value as Record<string, unknown>)[BYTES_TAG] === 'string'
     ) {
-      return fromBase64((value as Record<string, string>)[BYTES_TAG]!);
+      // Only the codec's own encoding converts. Tool results / user text are
+      // arbitrary — a payload that merely LOOKS like the tag but is not valid
+      // base64 must stay plain data, never corrupt or kill the load.
+      try {
+        return fromBase64((value as Record<string, string>)[BYTES_TAG]!);
+      } catch {
+        return value;
+      }
     }
     return value;
   }) as ChatRecord;

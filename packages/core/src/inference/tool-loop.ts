@@ -29,7 +29,8 @@ import {
   setupDurable,
   saveCheckpoint,
   persistChat,
-  recallIntoMessages,
+  computeRecallBlock,
+  withSystemBlock,
   startMemoryExtract,
   durableUsage,
   toApprovalRequests,
@@ -232,8 +233,9 @@ export async function runToolLoop(
       return done();
     }
 
-    // Memory recall (1.7, D1): once per call, before the first model step.
-    messages = await recallIntoMessages(options, deps, messages);
+    // Memory recall (1.7, D1): computed once, spliced in at the model-call
+    // site only — canonical history/checkpoints/persistence stay recall-free.
+    const recallBlock = await computeRecallBlock(options, deps, messages);
 
     for (;;) {
       const stepIndex = stepBase + steps.length;
@@ -281,7 +283,10 @@ export async function runToolLoop(
         );
       }
       const step = await runOneStep(
-        preserveClientContext(options, { ...prepared.options, messages }),
+        preserveClientContext(options, {
+          ...prepared.options,
+          messages: withSystemBlock(messages, recallBlock),
+        }),
         {
           tools: prepared.wire,
           ...(lo && stepSpan

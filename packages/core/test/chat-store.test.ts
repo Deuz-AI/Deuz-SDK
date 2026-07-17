@@ -400,3 +400,49 @@ describe('JSONL node store (./chat/node)', () => {
     expect(await store.loadChat('c/1')).toBeUndefined();
   });
 });
+
+describe('review fixes (T2-T5 adversarial pass)', () => {
+  it('a tag-shaped tool payload with invalid base64 stays plain data (no throw, no loss)', () => {
+    const record: ChatRecord = {
+      chatId: 'c1',
+      scope: { chatId: 'c1' },
+      messages: [
+        {
+          role: 'tool',
+          // A tool legitimately returned this exact shape — NOT our encoding.
+          content: [{ type: 'tool_result', toolUseId: 't1', result: { $deuzBytes: 'status:ok' } }],
+        },
+      ],
+      updatedAt: 1,
+    };
+    const back = deserializeChatRecord(serializeChatRecord(record));
+    const part = (back.messages[0]!.content as Array<{ result: unknown }>)[0]!;
+    expect(part.result).toEqual({ $deuzBytes: 'status:ok' }); // survived verbatim
+  });
+});
+
+describe('review fixes — reducer placeholder (adversarial pass 2)', () => {
+  it('an early tool-state (input-streaming) opens a placeholder that tool-call completes', () => {
+    let turn = createAssistantTurn('m1');
+    turn = applyUIPart(turn, {
+      type: 'tool-state',
+      toolCallId: 't1',
+      toolName: 'search',
+      state: 'input-streaming',
+    });
+    expect(turn.message.toolCalls).toHaveLength(1);
+    expect(turn.message.toolCalls![0]).toMatchObject({
+      toolCallId: 't1',
+      toolName: 'search',
+      runState: 'input-streaming',
+    });
+    turn = applyUIPart(turn, {
+      type: 'tool-call',
+      toolCallId: 't1',
+      toolName: 'search',
+      input: { q: 1 },
+    });
+    expect(turn.message.toolCalls).toHaveLength(1); // completed in place, no duplicate
+    expect(turn.message.toolCalls![0]).toMatchObject({ input: { q: 1 }, state: 'call' });
+  });
+});

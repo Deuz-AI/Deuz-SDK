@@ -1159,39 +1159,47 @@ function contentText(content: Message['content']): string {
 
 /**
  * Memory recall (1.7, D1): fetch relevant memories for the LAST user message
- * and splice them into the system context — a NEW array, never a mutation.
+ * and format them as a system-context block. Returns `undefined` when there is
+ * nothing to inject. The block is spliced in AT THE MODEL-CALL SITE only
+ * (`withSystemBlock`) — never into the canonical history, so checkpoints and
+ * chat persistence stay recall-free and resume legs cannot double-inject.
  * Best-effort: a failing store/embedder logs and the call proceeds bare.
  */
-export async function recallIntoMessages(
+export async function computeRecallBlock(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
   messages: Message[],
-): Promise<Message[]> {
+): Promise<string | undefined> {
   const memory = options.memory;
-  if (!memory || memory.recall === false) return messages;
+  if (!memory || memory.recall === false) return undefined;
   try {
     const lastUser = [...messages].reverse().find((m) => m.role === 'user');
     const text = lastUser ? contentText(lastUser.content) : '';
-    if (!text) return messages;
+    if (!text) return undefined;
     const recallOpts = memory.recall === undefined ? {} : memory.recall;
     const hits = await recall(
       { scope: memory.scope, text, topK: recallOpts.topK ?? 5 },
       memory.seams,
     );
-    if (hits.length === 0) return messages;
-    const block = formatMemoriesForPrompt(
+    if (hits.length === 0) return undefined;
+    return formatMemoriesForPrompt(
       hits,
       recallOpts.header ? { header: recallOpts.header } : undefined,
     );
-    const [first, ...rest] = messages;
-    if (first && first.role === 'system' && typeof first.content === 'string') {
-      return [{ role: 'system', content: `${first.content}\n\n${block}` }, ...rest];
-    }
-    return [{ role: 'system', content: block }, ...messages];
   } catch (error) {
     deps.logger.error('memory recall failed', { error });
-    return messages;
+    return undefined;
   }
+}
+
+/** Splice a system-context block into a NEW message array (no-op without one). */
+export function withSystemBlock(messages: Message[], block: string | undefined): Message[] {
+  if (!block) return messages;
+  const [first, ...rest] = messages;
+  if (first && first.role === 'system' && typeof first.content === 'string') {
+    return [{ role: 'system', content: `${first.content}\n\n${block}` }, ...rest];
+  }
+  return [{ role: 'system', content: block }, ...messages];
 }
 
 /**

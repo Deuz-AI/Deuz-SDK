@@ -171,3 +171,74 @@ describe('useChat-grade memory × loop (D1)', () => {
     expect(body.system).toBeUndefined();
   });
 });
+
+describe('review fixes (adversarial pass 2)', () => {
+  it('streamChat({ memory }) stays LAZY — no network until an output is consumed (G2)', async () => {
+    const shared = seams();
+    const { fetch, calls } = mockFetch(() => sseResponse([finalTurn('lazy')]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      memory: { seams: shared, scope: { userId: 'u1' } },
+      deps: { clock: fixedClock },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toHaveLength(0); // constructing the result must not start the pump
+    for await (const _ of result.fullStream) void _;
+    expect(calls).toHaveLength(1);
+  });
+
+  it('a mid-stream provider error still settles result.memory (never hangs)', async () => {
+    const shared = seams();
+    const errStream = sseEvents([
+      {
+        event: 'error',
+        data: { type: 'error', error: { type: 'api_error', message: 'boom' } },
+      },
+    ]);
+    const { fetch } = mockFetch(() => sseResponse([errStream]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      memory: { seams: shared, scope: { userId: 'u1' } },
+      deps: { clock: fixedClock },
+    });
+    const parts: Array<{ type: string }> = [];
+    for await (const p of result.fullStream) parts.push(p);
+    expect(parts.at(-1)?.type).toBe('error');
+    expect(await result.memory!).toEqual([]); // settled, not hung
+  });
+
+  it('the recall block reaches the MODEL but never the persisted history', async () => {
+    const { createInMemoryChatStore } = await import('../src/chat');
+    const shared = seams();
+    await shared.store.upsert([
+      {
+        id: 'm-0',
+        text: 'User prefers dark roast coffee',
+        hash: 'h:coffee',
+        kind: 'semantic',
+        scope: { userId: 'u1' },
+        createdAt: 1,
+        updatedAt: 1,
+        validAt: 1,
+      },
+    ]);
+    const chatStore = createInMemoryChatStore();
+    const { fetch, calls } = mockFetch(() => sseResponse([finalTurn('Dark roast!')]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'Order me a coffee.' }],
+      memory: { seams: shared, scope: { userId: 'u1' } },
+      chat: { store: chatStore, chatId: 'c1', scope: { userId: 'u1', chatId: 'c1' } },
+      deps: { clock: fixedClock },
+    });
+    for await (const _ of result.fullStream) void _;
+
+    const body = JSON.parse(String(calls[0]!.init!.body)) as { system?: unknown };
+    expect(JSON.stringify(body.system ?? '')).toContain('dark roast'); // model saw it
+    const saved = (await chatStore.loadChat('c1'))!;
+    expect(JSON.stringify(saved.messages)).not.toContain('Relevant memories'); // history clean
+    expect(saved.messages.some((m) => m.role === 'system')).toBe(false);
+  });
+});

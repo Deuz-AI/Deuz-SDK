@@ -330,3 +330,66 @@ describe('live cost part (1.7, D2)', () => {
     expect(logger.warn).toHaveBeenCalled();
   });
 });
+
+describe('review fixes (adversarial pass 2)', () => {
+  it('resume-leg cost parts seed prevCostUsd from prior legs (deltaUsd = this step only)', async () => {
+    const { createInMemorySessionStore, resumeStreamFromCheckpoint } =
+      await import('../src/durable');
+    const priceProvider = {
+      priceUsage: (_m: string, usage: Usage) => Math.round(usage.totalTokens * 0.02 * 1e6) / 1e6,
+    };
+    const sessionStore = createInMemorySessionStore();
+
+    // Leg 1: gated tool call -> suspension after step 1 (15 tokens, $0.30).
+    const leg1 = mockFetchSequence([() => sseResponse([TOOL_CALL])]);
+    const result1 = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch: leg1.fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'go' }],
+      tools: { search: { ...TOOLS.search, needsApproval: true } },
+      maxSteps: 5,
+      session: { store: sessionStore, runId: 'run-cost' },
+      deps: { priceProvider },
+    });
+    for await (const _ of result1.fullStream) void _;
+
+    // Resume leg: approve -> tool executes, final answer streams (26 tokens).
+    const FINAL_STREAM = sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 20, output_tokens: 1 } } },
+      },
+      {
+        event: 'content_block_start',
+        data: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      },
+      {
+        event: 'content_block_delta',
+        data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+      },
+      {
+        event: 'message_delta',
+        data: {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 5 },
+        },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+    const leg2 = mockFetchSequence([() => sseResponse([FINAL_STREAM])]);
+    const result2 = resumeStreamFromCheckpoint(sessionStore, 'run-cost', {
+      model: createAnthropic({ apiKey: 'k', fetch: leg2.fetch })('claude-opus-4-8'),
+      tools: TOOLS,
+      approvalResponses: [{ approvalId: 'toolu_1', approved: true }],
+      deps: { priceProvider },
+    });
+    const parts: StreamPart[] = [];
+    for await (const p of result2.fullStream) parts.push(p);
+
+    const cost = parts.find((p): p is Extract<StreamPart, { type: 'cost' }> => p.type === 'cost');
+    expect(cost).toBeDefined();
+    // Cumulative: leg1 ($0.30) + this step; delta must be THIS step only.
+    expect(cost!.costUsd).toBeGreaterThan(0.3);
+    expect(cost!.deltaUsd).toBeCloseTo(cost!.costUsd - 0.3, 6);
+  });
+});

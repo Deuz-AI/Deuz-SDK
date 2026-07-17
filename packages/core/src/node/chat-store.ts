@@ -20,6 +20,7 @@ interface NodeFs {
   readFile(path: string, encoding: string): Promise<string>;
   unlink(path: string): Promise<void>;
   readdir(path: string): Promise<string[]>;
+  rename(from: string, to: string): Promise<void>;
 }
 
 function fileNameFor(chatId: string): string {
@@ -36,7 +37,12 @@ export function createJsonlChatStore(options: JsonlChatStoreOptions): Required<C
     async saveChat(record: ChatRecord): Promise<void> {
       const fs = await fsp();
       await fs.mkdir(options.dir, { recursive: true });
-      await fs.writeFile(path(fileNameFor(record.chatId)), serializeChatRecord(record), 'utf8');
+      // Atomic-enough on one filesystem: write a temp file, then rename over
+      // the target — a crash mid-write can never tear an existing chat.
+      const target = path(fileNameFor(record.chatId));
+      const temp = `${target}.tmp`;
+      await fs.writeFile(temp, serializeChatRecord(record), 'utf8');
+      await fs.rename(temp, target);
     },
     async loadChat(chatId: string): Promise<ChatRecord | undefined> {
       const fs = await fsp();

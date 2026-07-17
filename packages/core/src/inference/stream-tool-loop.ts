@@ -37,7 +37,8 @@ import {
   settlePendingApprovals,
   saveCheckpoint,
   persistChat,
-  recallIntoMessages,
+  computeRecallBlock,
+  withSystemBlock,
   startMemoryExtract,
   durableUsage,
   toApprovalRequests,
@@ -361,8 +362,26 @@ export function runStreamToolLoop(
         return;
       }
 
-      // Memory recall (1.7, D1): once per call, before the first model step.
-      messages = await recallIntoMessages(options, deps, messages);
+      // Memory recall (1.7, D1): computed once per call and spliced into the
+      // system context AT THE CALL SITE only — the canonical history (and so
+      // checkpoints + chat persistence) never bakes the recall block in, and
+      // resume legs cannot double-inject it.
+      const recallBlock = await computeRecallBlock(options, deps, messages);
+
+      // Cost continuity (1.7, D2): resume legs seed prevCostUsd with the prior
+      // legs' cost so the first cost part's deltaUsd reports THIS step's
+      // increment, not the whole run's cumulative.
+      if (deps.priceProvider && durable && withTotal(durable.baseUsage).totalTokens > 0) {
+        try {
+          const base = await deps.priceProvider.priceUsage(
+            options.model.modelId,
+            withTotal(durable.baseUsage),
+          );
+          if (typeof base === 'number') prevCostUsd = base;
+        } catch {
+          /* deltaUsd degrades to cumulative on this leg; costUsd stays correct */
+        }
+      }
 
       for (;;) {
         broadcaster.push({ type: 'step-start', stepIndex });
@@ -415,12 +434,18 @@ export function runStreamToolLoop(
             durableUsage(durable, totalUsage),
           );
         }
-        const inner = runStream(preserveClientContext(options, { ...prepared.options, messages }), {
-          tools: prepared.wire,
-          ...(lo && stepSpan
-            ? { observe: { runtime: lo.rt, parentSpanId: stepSpan.spanId, stepIndex } }
-            : {}),
-        });
+        const inner = runStream(
+          preserveClientContext(options, {
+            ...prepared.options,
+            messages: withSystemBlock(messages, recallBlock),
+          }),
+          {
+            tools: prepared.wire,
+            ...(lo && stepSpan
+              ? { observe: { runtime: lo.rt, parentSpanId: stepSpan.spanId, stepIndex } }
+              : {}),
+          },
+        );
 
         let text = '';
         let reasoningText = '';
@@ -486,6 +511,10 @@ export function runStreamToolLoop(
                 });
               }
               broadcaster.close();
+              // Same post-terminal bookkeeping as every other exit: the
+              // memory promise must settle and completed turns still persist.
+              settleMemory(false);
+              await persistChat(options, deps, messages);
               return;
             default:
               break;
@@ -853,14 +882,14 @@ export function runStreamToolLoop(
       ensureStarted();
       return observationHandle;
     },
-    ...(memoryDeferred
-      ? {
-          get memory() {
-            ensureStarted();
-            return memoryDeferred.promise;
-          },
-        }
-      : {}),
+    // A DIRECT getter, never a spread-in one: object spread [[Get]]s the
+    // source's properties, which would fire ensureStarted() at construction
+    // and break the lazy-start contract (G2).
+    get memory() {
+      if (!memoryDeferred) return undefined;
+      ensureStarted();
+      return memoryDeferred.promise;
+    },
     ...(runId !== undefined ? { runId } : {}),
   };
 }

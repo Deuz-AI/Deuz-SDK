@@ -968,3 +968,24 @@ describe('Deuz UI wire — typed data parts, tool state, citations (P3)', () => 
     );
   });
 });
+
+describe('review fixes (T2-T5 adversarial pass)', () => {
+  it('v1 filter drops v2-only parts nested inside sub-agent frames too', async () => {
+    const manual = manualResult();
+    const res = toDeuzStreamResponse(manual.result, { messageId: 'm1', wireVersion: 'v1' });
+    manual.push({
+      type: 'sub-agent',
+      agentPath: ['researcher'],
+      part: { type: 'tool-state', toolCallId: 't1', state: 'executing' },
+    });
+    manual.push({
+      type: 'sub-agent',
+      agentPath: ['researcher'],
+      part: { type: 'text-delta', text: 'kept sub-agent text' },
+    });
+    manual.end();
+    const raw = await res.text();
+    expect(raw).not.toContain('tool-state'); // nested v2-only dropped
+    expect(raw).toContain('kept sub-agent text'); // plain sub-agent parts intact
+  });
+});
