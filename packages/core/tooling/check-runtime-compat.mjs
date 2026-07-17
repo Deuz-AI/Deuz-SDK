@@ -48,7 +48,9 @@ for (const consumer of consumers) {
       failures.push(`${consumer.name}: bundled output references a node: builtin`);
     }
     const nodeOnlyInput = Object.keys(result.metafile?.inputs ?? {}).find((input) =>
-      /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/]stdio|node[\\/]observe)/.test(input),
+      /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/]stdio|node[\\/]observe|node[\\/]chat-store)/.test(
+        input,
+      ),
     );
     if (nodeOnlyInput) failures.push(`${consumer.name}: reached node-only input ${nodeOnlyInput}`);
   } catch (error) {

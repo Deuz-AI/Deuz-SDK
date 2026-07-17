@@ -35,6 +35,29 @@ export type {
 } from './durable';
 export { DeuzError, isDeuzError, NotImplementedError, NoObjectGeneratedError } from './errors';
 export type { DeuzErrorJSON } from './errors';
+// Chat engine (1.7 additive, P2+P6) — pure reducers + ChatStore seam,
+// zero runtime imports: edge-safe by construction.
+export {
+  createAssistantTurn,
+  applyUIPart,
+  assistantMessageFromTurn,
+  clientToolResultMessage,
+  uiFromMessages,
+  dropTrailingAssistant,
+  branchBeforeUserMessage,
+  createInMemoryChatStore,
+  serializeChatRecord,
+  deserializeChatRecord,
+} from './chat';
+export type {
+  UIMessage,
+  UIToolCall,
+  AssistantTurnState,
+  ChatHistory,
+  ChatRecord,
+  ChatStore,
+  ChatPersistOptions,
+} from './chat';
 // Observation (1.6 additive) — local-first observers, pure aggregation,
 // no ambient time/id/console: edge-safe by construction.
 export {

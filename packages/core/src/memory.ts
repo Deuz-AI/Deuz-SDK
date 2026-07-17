@@ -33,6 +33,8 @@ export interface MemoryScope {
   agentId?: string;
   runId?: string;
   actorId?: string;
+  /** Chat/conversation identity (1.7 additive) — aligns memory with `ChatStore` records. */
+  chatId?: string;
 }
 
 export interface MemoryRecord {
@@ -174,10 +176,10 @@ export const defaultHashFn: HashFn = async (text: string): Promise<string> => {
 
 /** Throw if no scope field is set (mirrors mem0 — at least one of user/agent/run/actor). */
 export function assertScope(scope: MemoryScope): void {
-  if (!scope.userId && !scope.agentId && !scope.runId && !scope.actorId) {
+  if (!scope.userId && !scope.agentId && !scope.runId && !scope.actorId && !scope.chatId) {
     throw new InvalidRequestError({
       message:
-        'MemoryScope requires at least one of userId / agentId / runId / actorId (mem0 rule).',
+        'MemoryScope requires at least one of userId / agentId / runId / actorId / chatId (mem0 rule).',
     });
   }
 }

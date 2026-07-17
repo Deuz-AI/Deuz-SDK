@@ -35,6 +35,7 @@ import {
   resolveServerApprovals,
   settlePendingApprovals,
   saveCheckpoint,
+  persistChat,
   durableUsage,
   toApprovalRequests,
   preserveClientContext,
@@ -331,6 +332,9 @@ export function runStreamToolLoop(
         fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
         observeEnd();
         broadcaster.close();
+        // Post-terminal bookkeeping: consumers are already unblocked; the pump
+        // (and observation.settled) still awaits the best-effort persist.
+        await persistChat(options, deps, messages);
         return;
       }
 
@@ -550,15 +554,11 @@ export function runStreamToolLoop(
               durableUsage(durable, totalUsage),
             );
           }
+          // Rebase on the final assistant turn so BOTH the completed
+          // checkpoint and the chat persist see the full history.
+          messages = [...messages, assistantMessage];
           if (durable) {
-            await saveCheckpoint(
-              durable,
-              deps,
-              options,
-              'completed',
-              [...messages, assistantMessage],
-              totalUsage,
-            );
+            await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
           }
           break;
         }
@@ -779,6 +779,8 @@ export function runStreamToolLoop(
       fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
       observeEnd();
       broadcaster.close();
+      // Post-terminal bookkeeping — see the suspension path note above.
+      await persistChat(options, deps, messages);
     } catch (err) {
       broadcaster.push({ type: 'error', error: err });
       usageDeferred.reject(err);
@@ -793,6 +795,8 @@ export function runStreamToolLoop(
         });
       }
       broadcaster.close();
+      // Completed turns up to the failure still persist (best-effort).
+      await persistChat(options, deps, messages);
     }
   }
 

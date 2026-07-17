@@ -28,6 +28,7 @@ import {
   settlePendingApprovals,
   setupDurable,
   saveCheckpoint,
+  persistChat,
   durableUsage,
   toApprovalRequests,
   preserveClientContext,
@@ -150,8 +151,8 @@ export async function runToolLoop(
     };
   };
 
-  /** Terminal observe event + result — the single exit for every path. */
-  const done = (): GenerateTextResult => {
+  /** Terminal observe event + chat persist + result — the single exit for every path. */
+  const done = async (): Promise<GenerateTextResult> => {
     if (lo) {
       endLoopObserve(lo, deps, options, {
         finishReason: lastStep?.finishReason ?? 'stop',
@@ -163,6 +164,7 @@ export async function runToolLoop(
         suspend,
       });
     }
+    await persistChat(options, deps, messages);
     const result = finish();
     // Settlement (1.6.1): the cost enrichment was registered synchronously
     // inside endLoopObserve above — settled() drains it.
@@ -292,17 +294,11 @@ export async function runToolLoop(
             durableUsage(durable, totalUsage),
           );
         }
+        // Rebase on the final assistant turn so BOTH the completed checkpoint
+        // and the chat persist see the full history.
+        messages = [...messages, step.assistantMessage];
         if (durable) {
-          // The final assistant turn belongs in the completed snapshot even
-          // though the loop never rebased `messages` on it.
-          await saveCheckpoint(
-            durable,
-            deps,
-            options,
-            'completed',
-            [...messages, step.assistantMessage],
-            totalUsage,
-          );
+          await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
         }
         break;
       }

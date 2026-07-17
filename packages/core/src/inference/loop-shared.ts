@@ -1145,6 +1145,31 @@ export function bumpErrorGuard(counters: Map<string, number>, results: ToolResul
   return hardStop;
 }
 
+/**
+ * Best-effort chat persistence (1.7, P2): save the FULL immutable history at
+ * a terminal boundary when `options.chat` is set. A throwing store logs via
+ * `deps.logger.error` and never kills the run (SessionStore rule).
+ */
+export async function persistChat(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  messages: Message[],
+): Promise<void> {
+  const chat = options.chat;
+  if (!chat) return;
+  try {
+    await chat.store.saveChat({
+      chatId: chat.chatId,
+      scope: chat.scope,
+      messages,
+      ...(chat.parentId ? { parentId: chat.parentId } : {}),
+      updatedAt: deps.clock.now(),
+    });
+  } catch (error) {
+    deps.logger.error('chat store save failed', { chatId: chat.chatId, error });
+  }
+}
+
 export function normalizeStop(
   stopWhen: CommonCallOptions['stopWhen'],
   maxSteps: number,

@@ -3,6 +3,8 @@
   "requiredSubpaths": [
     ".",
     "./anthropic",
+    "./chat",
+    "./chat/node",
     "./durable",
     "./edge",
     "./google",

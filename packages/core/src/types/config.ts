@@ -11,6 +11,7 @@ import type {
   ToolApprovalResponse,
 } from './tool';
 import type { DurableSessionOptions } from './session';
+import type { ChatPersistOptions } from '../chat';
 
 /** Opaque model id; capability-aware refinement arrives with the registry (Faz 1.A). */
 export type ModelId = string;
@@ -190,6 +191,15 @@ export interface CommonCallOptions {
    * log `deps.logger.error` and never kill the run.
    */
   session?: DurableSessionOptions;
+  /**
+   * Chat persistence (1.7 additive, P2): when set, the call auto-persists the
+   * FULL immutable history into `chat.store` at terminal boundaries
+   * (completion, suspension, and mid-stream error) under `chat.chatId` +
+   * mandatory `chat.scope`. Store failures log `deps.logger.error` and never
+   * kill the run. Setting this routes even tool-less calls through the loop
+   * (step parts appear on the stream) so every chat shape persists uniformly.
+   */
+  chat?: ChatPersistOptions;
 }
 
 /** Shared client configuration; pre-binds api keys + deps for the convenience client. */

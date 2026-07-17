@@ -29,6 +29,8 @@ export default defineConfig({
     edge: 'src/edge.ts',
     react: 'src/react.ts',
     ui: 'src/ui.ts',
+    chat: 'src/chat.ts',
+    'chat/node': 'src/node/chat-store.ts',
   },
   format: ['esm', 'cjs'],
   dts: true,

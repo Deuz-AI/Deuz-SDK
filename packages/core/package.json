@@ -296,6 +296,26 @@
         "default": "./dist/react.cjs"
       }
     },
+    "./chat": {
+      "import": {
+        "types": "./dist/chat.d.ts",
+        "default": "./dist/chat.js"
+      },
+      "require": {
+        "types": "./dist/chat.d.cts",
+        "default": "./dist/chat.cjs"
+      }
+    },
+    "./chat/node": {
+      "import": {
+        "types": "./dist/chat/node.d.ts",
+        "default": "./dist/chat/node.js"
+      },
+      "require": {
+        "types": "./dist/chat/node.d.cts",
+        "default": "./dist/chat/node.cjs"
+      }
+    },
     "./package.json": "./package.json"
   },
   "scripts": {

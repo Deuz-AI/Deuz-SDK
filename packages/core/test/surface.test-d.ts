@@ -225,3 +225,28 @@ expectTypeOf<Dependencies['priceProvider']>().not.toBeNever();
 expectTypeOf<
   NonNullable<NonNullable<Dependencies['priceProvider']>['cacheSavings']>
 >().toBeFunction();
+
+// --- 1.7.0 additive: chat engine + ChatStore (./chat subpath, P2+P6). ---
+import {
+  applyUIPart as chatApplyUIPart,
+  branchBeforeUserMessage,
+  createInMemoryChatStore,
+  type AssistantTurnState,
+  type ChatHistory,
+  type ChatRecord,
+  type ChatStore,
+  type ChatPersistOptions,
+  type UIMessage as ChatUIMessage,
+} from '../src/chat';
+expectTypeOf(chatApplyUIPart).returns.toEqualTypeOf<AssistantTurnState>();
+expectTypeOf(branchBeforeUserMessage).returns.toEqualTypeOf<ChatHistory | undefined>();
+expectTypeOf(createInMemoryChatStore).returns.toEqualTypeOf<Required<ChatStore>>();
+// The seam stays two-method: saveChat/loadChat required, the rest optional.
+expectTypeOf<ChatStore['saveChat']>().toBeFunction();
+expectTypeOf<ChatStore['loadChat']>().toBeFunction();
+expectTypeOf<ChatRecord['scope']>().not.toBeNever();
+expectTypeOf<ChatUIMessage['role']>().toEqualTypeOf<'user' | 'assistant'>();
+expectTypeOf<CommonCallOptions['chat']>().toEqualTypeOf<ChatPersistOptions | undefined>();
+// MemoryScope gained chatId (additive).
+import type { MemoryScope as ChatMemoryScope } from '../src/chat';
+expectTypeOf<ChatMemoryScope['chatId']>().toEqualTypeOf<string | undefined>();
