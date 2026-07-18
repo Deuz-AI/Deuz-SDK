@@ -1,20 +1,46 @@
 ---
 title: UI Streaming
-description: The Deuz UI wire — our own versioned SSE protocol for streaming a StreamChatResult from server to browser.
+description: The Deuz UI wire — our versioned SSE protocol, now resumable (wire v2) with a two-method StreamStateStore seam, server-side data parts, and an auto-reconnecting client reader.
 ---
 
-`@deuz-sdk/core` ships its own UI streaming protocol. The server serializes a [`streamChat`](/docs/core/stream-chat) result to Server-Sent Events with the `toDeuzStreamResponse` helper; the browser reads it back as typed parts with `readDeuzStream`. This is **our** wire — the canonical `fullStream` is reframed into stable, versioned UI parts, never a raw provider stream proxied through.
+`@deuz-sdk/core` ships its own UI streaming protocol. The server serializes a [`streamChat`](/docs/core/stream-chat) result to Server-Sent Events with `toDeuzStreamResponse`; the browser reads it back as typed parts with `readDeuzStream` (or the fault-tolerant `connectDeuzStream`). This is **our** wire — the canonical `fullStream` is reframed into stable, versioned UI parts, never a raw provider stream proxied through.
 
-Both helpers live in the `@deuz-sdk/core/ui` subpath and are edge-safe (Web APIs only, no Node imports), so the server side runs on Next.js Edge, Cloudflare Workers, or Deno.
+**Wire v2 (1.7) is additive over v1**: every SSE event now carries an `id: <seq>` line — a monotonic per-stream sequence — which makes the stream *resumable* (`Last-Event-ID` replay via `resumeDeuzStreamResponse`) and lets any number of clients follow the same stream live through a `StreamStateStore`. v1 clients keep working untouched: `id:` lines are invisible to an SSE parser that ignores them, and unknown part types are skipped (the open-union rule).
 
-```ts title="why.ts"
-import { toDeuzStreamResponse } from '@deuz-sdk/core/ui'; // server
-import { readDeuzStream } from '@deuz-sdk/core/ui'; // client
+Everything here lives in the `@deuz-sdk/core/ui` subpath and is edge-safe (Web APIs only), so the server side runs on Next.js Edge, Cloudflare Workers, or Deno.
+
+```ts title="the surface"
+import {
+  toDeuzStreamResponse, // server: StreamChatResult → SSE Response
+  createDeuzStream, // server: same + writeData() for app data parts
+  resumeDeuzStreamResponse, // server: replay + live tail from a store
+  readDeuzStream, // client: Response → DeuzUIPart iterable
+  connectDeuzStream, // client: readDeuzStream + auto-reconnect + dedup
+  negotiateDeuzStreamVersion, // pick v1/v2 from the request
+  createInMemoryStreamStateStore, // reference StreamStateStore
+} from '@deuz-sdk/core/ui';
 ```
+
+## Wire versions
+
+The version an SSE response speaks is stamped in its `x-deuz-stream` response header. `DEUZ_STREAM_VERSION` is `'v2'` (the default emitted); `DEUZ_STREAM_VERSIONS` is `['v1', 'v2']`.
+
+- **v2** frames each event as `id: <seq>\ndata: <json>\n\n` and may carry the v2-only part types (`data-{name}`, `citation`, `tool-state`, `cost`, `budget-exceeded`).
+- **v1** output is **byte-identical to pre-1.7 releases**: no `id:` lines, and v2-only parts are dropped entirely (recursively — a v2-only part inside a `sub-agent` frame is just as invisible).
+
+`negotiateDeuzStreamVersion(source)` picks the version from the client's `x-deuz-stream` *request* header: only an explicit `v1` downgrades — anything else, including no header at all, gets v2 (v1 clients never sent the header, and v2's additions are invisible to them). It accepts a `Request`, `Headers`, the raw header string, or `null`.
+
+```ts
+return toDeuzStreamResponse(result, {
+  wireVersion: negotiateDeuzStreamVersion(request), // honor an explicit v1 client
+});
+```
+
+The stream always ends with a literal `data: [DONE]\n\n` sentinel after the last part.
 
 ## Server: `toDeuzStreamResponse`
 
-Takes a `StreamChatResult` (the synchronous return of `streamChat`) and returns a `Response` whose body is the Deuz SSE wire. It iterates `result.fullStream`, maps each canonical `StreamPart` to a UI part, and frames each as one `data: <json>\n\n` SSE event.
+Takes a `StreamChatResult` (the synchronous return of `streamChat`) and returns a `Response` whose body is the Deuz SSE wire. It iterates `result.fullStream` and maps each canonical `StreamPart` to a UI part.
 
 ```ts
 function toDeuzStreamResponse(
@@ -28,36 +54,245 @@ function toDeuzStreamResponse(
 | `messageId` | `string` | — | Id emitted in the leading `start` part. |
 | `generateId` | `() => string` | — | Used when `messageId` is omitted. Pass `deps.generateId` for a real id. |
 | `headers` | `Record<string, string>` | — | Extra response headers, merged after the protocol headers. |
+| `wireVersion` | `'v1' \| 'v2'` | `'v2'` | Pass `negotiateDeuzStreamVersion(request)` to honor v1 clients. |
+| `store` | `StreamStateStore` | — | Journal every emitted event under `streamId` (resumability). |
+| `streamId` | `string` | — | Stream identity in `store`. **Required when `store` is set** (throws otherwise). |
+| `onStoreError` | `(error: unknown) => void` | silently dropped | Store append failures land here — appends are best-effort. |
 
-If neither `messageId` nor `generateId` is given, the id falls back to the literal `'deuz-msg'`.
+If neither `messageId` nor `generateId` is given, the id falls back to the literal `'deuz-msg'`. The response is fixed at `status: 200` with `content-type: text/event-stream; charset=utf-8`, `cache-control: no-cache`, and `x-deuz-stream: <version>`.
 
-The response is fixed at `status: 200` with these headers (your `options.headers` are merged in last):
+### Journaling semantics (when `store` is set)
 
-| Header | Value |
-| --- | --- |
-| `content-type` | `text/event-stream; charset=utf-8` |
-| `cache-control` | `no-cache` |
-| `x-deuz-stream` | `v1` (the wire version) |
+- **Store before wire.** Each part is appended to the store *before* it is enqueued on the response body, so a part in flight during a disconnect still lands in the log.
+- **The client can vanish; the store keeps recording.** A refresh, tab close, or network drop kills the response body — the serializer flips a flag and keeps draining the model stream into the store. Resumability exists precisely for that moment.
+- **Leg-end sentinel.** When the source ends — complete, errored, *or* suspended on an approval — a terminal `done` record is appended (never serialized as a data line). Replay treats it as terminal only when nothing was appended after it, so a continued run stays reachable.
+- **Leg continuation.** If the store already holds records for `streamId` (a continued run — see [the unbreakable chatbot](/docs/agents/unbreakable-chatbot)), seq numbering continues after the last stored seq and the synthetic `start` part is *not* re-emitted.
+- **Pending appends flush before close** (`settled()` inside), so replay never misses the tail on serverless runtimes that freeze after the response ends.
+- The store mirrors the wire seq-for-seq: on a negotiated-v1 response, v2-only parts skip both.
 
-The wire version is exported as the constant `DEUZ_STREAM_VERSION` (currently `'v1'`). The stream always ends with a literal `data: [DONE]\n\n` sentinel after the last part.
+## `StreamStateStore` — the resumability seam
+
+Two required methods over any backend, in the `SessionStore` pattern (pass it explicitly where you serialize):
+
+```ts
+interface StreamStateRecord {
+  seq: number;
+  part: DeuzUIPart | { type: 'done' };
+}
+
+interface StreamStateStore {
+  append(streamId: string, seq: number, part: StreamStateRecord['part']): void | Promise<void>;
+  read(streamId: string, fromSeq?: number): AsyncIterable<StreamStateRecord>;
+  /** Optional fast path for seq continuation; absent → the serializer scans `read`. */
+  lastSeq?(streamId: string): number | undefined | Promise<number | undefined>;
+  /** Optional cleanup (TTL/eviction tooling — the serializers never call it). */
+  delete?(streamId: string): void | Promise<void>;
+}
+```
+
+`append` is called once per emitted event with a monotonic `seq`. `read` returns what exists **now** with `seq > fromSeq`, in order — live tailing is the caller's poll loop, so a plain KV/table adapter stays trivial. Failures must not kill the response: the serializer catches and reports via `onStoreError`. Appends are pipelined in order and bounded by the response length; adapters should put their own timeout on writes.
+
+### `createInMemoryStreamStateStore`
+
+The reference store for a single runtime (dev, tests, one long-lived server). Pass `maxStreams` to evict the least-recently-appended stream once more than that many are held — the default is unlimited, and records are retained forever otherwise, so long-lived servers should set it (or use a TTL-capable adapter: Redis `EXPIRE`, a Supabase cron).
+
+```ts
+const store = createInMemoryStreamStateStore({ maxStreams: 1000 });
+```
+
+### Redis adapter in ~15 lines
+
+A sorted set per stream, scored by seq:
+
+```ts title="redis-stream-store.ts"
+import type { StreamStateStore, StreamStateRecord } from '@deuz-sdk/core/ui';
+import { Redis } from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+export const redisStreamStore: StreamStateStore = {
+  async append(streamId, seq, part) {
+    await redis.zadd(`stream:${streamId}`, seq, JSON.stringify({ seq, part }));
+    await redis.expire(`stream:${streamId}`, 3600); // TTL is your eviction policy
+  },
+  async *read(streamId, fromSeq = -1) {
+    const rows = await redis.zrangebyscore(`stream:${streamId}`, `(${fromSeq}`, '+inf');
+    for (const row of rows) yield JSON.parse(row) as StreamStateRecord;
+  },
+};
+```
+
+### Supabase adapter
+
+append = `INSERT`, read = `SELECT … WHERE seq > $1 ORDER BY seq`:
+
+```sql
+create table stream_events (
+  stream_id text not null,
+  seq       int  not null,
+  part      jsonb not null,
+  primary key (stream_id, seq)
+);
+```
+
+```ts title="supabase-stream-store.ts"
+import type { StreamStateStore } from '@deuz-sdk/core/ui';
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_KEY!);
+
+export const supabaseStreamStore: StreamStateStore = {
+  async append(streamId, seq, part) {
+    const { error } = await supabase
+      .from('stream_events')
+      .insert({ stream_id: streamId, seq, part });
+    if (error) throw error; // routed to onStoreError, never kills the stream
+  },
+  async *read(streamId, fromSeq = -1) {
+    const { data, error } = await supabase
+      .from('stream_events')
+      .select('seq, part')
+      .eq('stream_id', streamId)
+      .gt('seq', fromSeq)
+      .order('seq', { ascending: true });
+    if (error) throw error;
+    for (const row of data ?? []) yield { seq: row.seq, part: row.part };
+  },
+};
+```
+
+## Server: `resumeDeuzStreamResponse`
+
+Replay a stored stream from the client's `Last-Event-ID` and keep tailing it live until its terminal sentinel — any number of clients can follow the same stream. This serves *both* the refresh/reconnect case and the "second tab watches along" case.
+
+```ts
+function resumeDeuzStreamResponse(
+  store: StreamStateStore,
+  streamId: string,
+  options?: ResumeDeuzStreamOptions,
+): Response;
+```
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `lastEventId` | `string \| number \| null` | replay from start | The client's `Last-Event-ID`, accepted verbatim from the header. Replay starts *after* it. |
+| `wireVersion` | `'v1' \| 'v2'` | `'v2'` | Serve v2 here — `connectDeuzStream` needs the ids. |
+| `pollIntervalMs` | `number` | `250` | Poll cadence while tailing a still-live stream. |
+| `idleTimeoutMs` | `number` | `30_000` | Give up after this long with no new records and no sentinel. The response closes **without** `[DONE]`, so a reconnecting client treats it as another drop and may retry. |
+| `clock` | `Pick<Clock, 'setTimeout'>` | global `setTimeout` | Timer seam for deterministic tests. |
+| `headers` | `Record<string, string>` | — | Extra response headers. |
+
+Cursor parsing is strict: only a plain non-negative integer counts — an empty or garbled `Last-Event-ID` means "no cursor", never seq 0. A `done` record is terminal only when nothing follows it: continued runs (durable resume, approval legs) append past their previous leg's sentinel, and replay sails through those boundaries. A caught-up client whose cursor already sits at a terminal sentinel gets an immediate `[DONE]` instead of an idle hang. A store failure surfaces as a redacted `error` part and the response closes without `[DONE]`.
+
+The route shape is a GET endpoint keyed by your streamId:
+
+```ts title="app/api/stream/[id]/route.ts"
+import { resumeDeuzStreamResponse } from '@deuz-sdk/core/ui';
+import { streamStore } from '@/lib/stores';
+
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  return resumeDeuzStreamResponse(streamStore, id, {
+    lastEventId: req.headers.get('last-event-id'),
+  });
+}
+```
 
 ## Client: `readDeuzStream`
 
-Takes the `Response` (e.g. from `fetch`) and returns an async generator of `DeuzUIPart`. It parses the SSE body, stops at the `[DONE]` sentinel, and silently skips any malformed JSON line.
+Takes the `Response` (e.g. from `fetch`) and returns an async generator of `DeuzUIPart`. It parses the SSE body, stops at the `[DONE]` sentinel, and silently skips any malformed JSON line. If `response.body` is `null`, it yields nothing and returns immediately.
 
 ```ts
 function readDeuzStream(response: Response): AsyncGenerator<DeuzUIPart>;
 ```
 
-If `response.body` is `null`, it yields nothing and returns immediately.
+## Client: `connectDeuzStream`
+
+The fault-tolerant reader (wire v2): reads a Deuz stream and, when the connection drops before `[DONE]`, reconnects with the `Last-Event-ID` header and deduplicates by seq — the consumer sees **one gapless part sequence**. Point it at a resume endpoint (`resumeDeuzStreamResponse` or [`resumeDeuzChatResponse`](/docs/agents/unbreakable-chatbot)); do **not** point it at the generating POST route, which would re-run the model.
+
+```ts
+function connectDeuzStream(
+  source: string | URL | ((ctx: { lastEventId?: string }) => Response | Promise<Response>),
+  options?: ConnectDeuzStreamOptions,
+): AsyncGenerator<DeuzUIPart>;
+```
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `fetch` | `typeof fetch` | global fetch | Transport for string/URL sources. |
+| `headers` | `Record<string, string>` | — | Extra request headers (string/URL sources). |
+| `lastEventId` | `string` | — | Resume cursor to start from (e.g. persisted across a page refresh). |
+| `maxReconnects` | `number` | `5` | Reconnect budget after a drop. Resets whenever an event actually arrives — only *consecutive dead* reconnects exhaust it. |
+| `signal` | `AbortSignal` | — | Aborts the current connection and the reconnect loop. |
+| `onCursor` | `(lastEventId: string) => void` | — | Fired whenever the cursor advances (a part fully delivered). Persist it (e.g. `sessionStorage`) and pass it back as `lastEventId` to survive a full page reload — reconnects within one call already resume automatically. |
+| `clock` | timer seam | global `setTimeout` | Backoff timer for deterministic tests. |
+| `generateId` | `() => string` | crypto-random | Jitter source — a fresh draw per retry, so a fleet of clients dropped at the same seq does not reconnect in lockstep. |
+
+Details that matter:
+
+- **Dedup.** On reconnect, every replayed event with `seq <= ` the resume cursor is skipped. The cursor is committed only for *fully delivered* parts — a truncated frame (clean EOF mid-JSON) does not advance it, so the reconnect replays that seq.
+- **Backoff.** Exponential with full jitter, the SDK's standard `DEFAULT_RETRY` curve (500ms base, 30s cap).
+- **The v1 duplication guard.** If a server delivered events *without* ids (wire v1), a blind reconnect would replay from the start and duplicate every delivered part. Silent duplication is worse than a hard failure, so `connectDeuzStream` throws instead: *"Deuz stream carries no event ids (wire v1) — reconnecting would duplicate parts. Serve wire v2 from the resume endpoint."*
+- A source that ends without `[DONE]` is treated as a drop and retried.
+
+```ts title="resilient-consumer.ts"
+import { connectDeuzStream } from '@deuz-sdk/core/ui';
+
+const cursorKey = `deuz-cursor:${streamId}`;
+for await (const part of connectDeuzStream(`/api/stream/${streamId}`, {
+  lastEventId: sessionStorage.getItem(cursorKey) ?? undefined,
+  onCursor: (id) => sessionStorage.setItem(cursorKey, id),
+})) {
+  render(part); // one gapless sequence across drops, refreshes, and reconnects
+}
+```
+
+## Server: `createDeuzStream` and typed data parts
+
+Like `toDeuzStreamResponse`, but returns a writer so the server can inject typed `data-{name}` parts (chart payloads, RAG citations, progress markers) into the **same** SSE response the model streams over — ordered, seq-numbered, journaled to the `store`, and replayable like every other part.
+
+```ts
+function createDeuzStream(
+  result: StreamChatResult,
+  options?: CreateDeuzStreamOptions, // ToDeuzStreamOptions + dataSchemas
+): DeuzStreamWriter;
+
+interface DeuzStreamWriter {
+  response: Response;
+  /** Queue a `data-{name}` part into the live stream. Writes after the stream ended are dropped. */
+  writeData(name: string, payload: unknown): void;
+  /** End the data channel early (auto-closes when the model stream completes). */
+  close(): void;
+}
+```
+
+`writeData` is safe to call from anywhere while the model stream runs — a tool `execute`, a RAG pipeline, a background progress reporter.
+
+```ts title="app/api/chat/route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createDeuzStream } from '@deuz-sdk/core/ui';
+import { z } from 'zod';
+
+export async function POST(req: Request): Promise<Response> {
+  const { messages } = await req.json();
+  const result = streamChat({ model, messages });
+  const stream = createDeuzStream(result, {
+    dataSchemas: { chart: z.object({ points: z.array(z.number()) }) },
+  });
+  void buildChart().then((chart) => stream.writeData('chart', chart));
+  return stream.response; // model deltas + your data parts, one wire
+}
+```
+
+**Streaming validation** is opt-in via `dataSchemas` — a [Standard Schema](https://standardschema.dev) per data-part name. `writeData('chart', payload)` validates against `dataSchemas.chart` *before* serialization; an invalid payload is dropped and a redacted `error` part (`"data part 'chart' failed validation."`) is emitted instead — the stream itself keeps going. Names without a schema pass through unvalidated.
 
 ## Wire part types
 
-`DeuzUIPart` is a discriminated union on `type`. Keep a `default` case when switching — the union is additive and may grow in future versions.
+`DeuzUIPart` is a discriminated union on `type`. Keep a `default` case when switching — the union is additive and may grow. Parts marked **v2** are dropped for a negotiated-v1 client.
 
 | `type` | Fields | Emitted when |
 | --- | --- | --- |
-| `start` | `messageId: string` | First — always the leading part. |
+| `start` | `messageId: string` | First — always the leading part (not re-emitted on a continued leg). |
 | `step-start` | `step: number` | An agentic loop step begins. |
 | `step-finish` | `step: number`, `finishReason: FinishReason`, `usage: Usage` | A loop step ends. |
 | `text-delta` | `text: string` | A chunk of assistant text. |
@@ -65,12 +300,17 @@ If `response.body` is `null`, it yields nothing and returns immediately.
 | `tool-input-delta` | `toolCallId: string`, `toolName?: string`, `delta: string` | A raw fragment of a tool call's argument JSON. |
 | `tool-call` | `toolCallId: string`, `toolName: string`, `input: unknown` | A fully parsed tool call. |
 | `tool-result` | `toolCallId: string`, `toolName: string`, `output: unknown`, `isError?: boolean` | A tool finished executing (`isError: true` on a failed/self-healed tool). |
-| `tool-approval-request` | `approvalId: string`, `toolCallId: string`, `toolName: string`, `input: unknown` | A gated tool call awaits the user's verdict — the loop broke; resume with `approvalResponses`. See [the approval round-trip](/docs/agents/client-tools#tool-approval-round-trip). |
-| `tool-approval-response` | `approvalId: string`, `approved: boolean`, `reason?: string` | Client→server direction ONLY (declared for wire symmetry): the verdict travels in the next HTTP request body as `approvalResponses` — the server never serializes this part. |
-| `object-delta` | `object: unknown` | A `streamObject` partial (from `toDeuzObjectStreamResponse`) — each delta REPLACES the previous partial wholesale. [`useObject`](/docs/modules/react-hooks) consumes it. |
-| `source` | `id: string`, `url?: string`, `title?: string` | A cited source. |
+| `tool-approval-request` | `approvalId`, `toolCallId`, `toolName`, `input`, `token?: string` | A gated tool call awaits the user's verdict — the loop broke; resume with `approvalResponses`. `token` is the HMAC-signed approval token when the call carried [`approvalSigner`](/docs/agents/durable-runtime#cryptographic-approval-trail-17) — echo it back on the verdict. |
+| `tool-approval-response` | `approvalId`, `approved: boolean`, `reason?`, `token?` | Client→server direction ONLY (declared for wire symmetry): the verdict travels in the next HTTP request body as `approvalResponses` — the server never serializes this part. `token` echoes the request's signed token (required to APPROVE under `approvalSigner`). |
+| `object-delta` | `object: unknown` | A `streamObject` partial (from `toDeuzObjectStreamResponse`) — each delta REPLACES the previous partial wholesale. |
+| `source` | `id: string`, `url?`, `title?` | A cited source (provider-reported). |
 | `compaction` | `layer: string`, `tokensBefore: number`, `tokensAfter: number` | Automatic compaction ran before an agentic step (token counts are estimates). |
-| `sub-agent` | `agentPath: string[]`, `part: DeuzUIPart` | A sub-agent (`agentTool`) emitted a part, forwarded live into the parent stream with its path (`part` is the nested framed part). |
+| `sub-agent` | `agentPath: string[]`, `part: DeuzUIPart` | A sub-agent (`agentTool`) emitted a part, forwarded live with its path. |
+| `data-{name}` **(v2)** | `payload: unknown` | App-defined typed data from `writeData(name, payload)`. |
+| `citation` **(v2)** | `id`, `sourceId?`, `url?`, `title?`, `snippet?`, `chunkIndex?`, `score?` | RAG provenance for a retrieved chunk. Build from retrieve/rerank hits with `citationsFromHits` (`@deuz-sdk/core/rag`) and send via `writeData` or your own pipeline. |
+| `tool-state` **(v2)** | `toolCallId`, `toolName?`, `state: ToolRunState` | Tool lifecycle transition — render live status without re-deriving it from part ordering. States: `input-streaming`, `input-complete`, `awaiting-approval`, `executing`, `complete`, `error`. |
+| `cost` **(v2)** | `costUsd`, `deltaUsd?`, `cacheSavingsUsd?`, `stepIndex?` | Live cumulative USD cost, one per step when `deps.priceProvider` is injected. See [Pricing](/docs/modules/pricing#live-cost-stream-17). |
+| `budget-exceeded` **(v2)** | `kind: 'usd' \| 'tokens'`, `limit: number`, `value: number` | The `budget` guardrail tripped — precedes the terminal `finish`. |
 | `finish` | `finishReason: FinishReason`, `usage: Usage` | Last meaningful part — the whole turn finished. |
 | `error` | `message: string` | A stream error occurred; `message` is redacted of secrets. |
 
@@ -78,39 +318,44 @@ If `response.body` is `null`, it yields nothing and returns immediately.
 
 ## Backpressure and cancellation
 
-- **Backpressure** is the SSE `ReadableStream`'s own: the server pulls the next `fullStream` part only when the stream controller asks for it, so a slow client throttles upstream consumption naturally.
-- **Cancellation** flows through the SSE reader. If the consumer breaks out of the `for await` over `readDeuzStream` early, the underlying response reader is cancelled in a `finally` block, which closes the body. To cancel the upstream provider request itself, pass an `AbortSignal` into `streamChat` (see [Abort](/docs/core/stream-chat#abort)) — aborting it resolves the turn with `finishReason: 'aborted'`.
+- **Backpressure** is the SSE `ReadableStream`'s own: the server pulls the next `fullStream` part only when the stream controller asks for it, so a slow client throttles upstream consumption naturally. (With a `store`, a vanished client no longer throttles anything — the serializer drains the source into the store at full speed.)
+- **Cancellation** flows through the SSE reader. If the consumer breaks out of the `for await` early, the underlying response reader is cancelled, which closes the body. To cancel the upstream provider request itself, pass an `AbortSignal` into `streamChat` (see [Abort](/docs/core/stream-chat#abort)) — aborting it resolves the turn with `finishReason: 'aborted'`.
 
 ## Error handling
 
 `toDeuzStreamResponse` never lets the stream throw at the consumer. Any error thrown while draining `fullStream` is caught and emitted as a single `error` part, after which the `[DONE]` sentinel still closes the stream cleanly. The `message` is passed through the core's secret redactor, so API keys and bearer tokens never reach the browser. Handle it on the client by matching `type: 'error'`.
 
-## Example: Next.js route handler
+## Example: resumable Next.js route pair
 
 Read keys from `process.env` at the app layer and pass them into the factory — the SDK core never reads env itself.
 
 ```ts title="app/api/chat/route.ts"
 import { streamChat } from '@deuz-sdk/core';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
-import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+import { toDeuzStreamResponse, negotiateDeuzStreamVersion } from '@deuz-sdk/core/ui';
+import { streamStore } from '@/lib/stores'; // in-memory, Redis, or Supabase
 
 export const runtime = 'edge';
 
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 export async function POST(req: Request): Promise<Response> {
-  const { messages } = await req.json();
-  const result = streamChat({
-    model: anthropic('claude-opus-4-8'),
-    messages,
+  const { messages, streamId } = await req.json();
+  const result = streamChat({ model: anthropic('claude-opus-4-8'), messages });
+  return toDeuzStreamResponse(result, {
+    messageId: crypto.randomUUID(),
+    wireVersion: negotiateDeuzStreamVersion(req),
+    store: streamStore,
+    streamId, // journaled — the GET route below can replay/tail it
   });
-  return toDeuzStreamResponse(result, { messageId: crypto.randomUUID() });
 }
 ```
 
+The matching GET resume route is the `resumeDeuzStreamResponse` example above; a client that wants drop-tolerance uses `connectDeuzStream` against it. To also survive a *server* crash mid-run (not just a dropped connection), combine the wire log with durable checkpoints — that is the [unbreakable chatbot](/docs/agents/unbreakable-chatbot) page.
+
 ## Example: vanilla React consumer
 
-For most apps, use the ready-made [`useChat` / `useObject` hooks](/docs/modules/react-hooks) over this wire. The manual consumer below shows what they do under the hood — useful for custom integrations or non-React frameworks. It accumulates text, renders tool calls live, and surfaces the error part.
+For most apps, use the ready-made [`useChat` / `useObject` hooks](/docs/modules/react-hooks) over this wire. The manual consumer below shows what they do under the hood — useful for custom integrations or non-React frameworks.
 
 ```tsx title="Chat.tsx"
 import { useState } from 'react';
@@ -172,38 +417,12 @@ export function Chat() {
 }
 ```
 
-## Rendering tool calls live
-
-For a "tool is being called" indicator before arguments finish, accumulate `tool-input-delta` fragments by `toolCallId`, then replace with the final `input` when the `tool-call` arrives and mark it done when the matching `tool-result` lands.
-
-```ts title="accumulate.ts"
-import { readDeuzStream } from '@deuz-sdk/core/ui';
-
-const pending = new Map<string, { name?: string; args: string }>();
-
-for await (const part of readDeuzStream(res)) {
-  switch (part.type) {
-    case 'tool-input-delta': {
-      const entry = pending.get(part.toolCallId) ?? { args: '' };
-      if (part.toolName) entry.name = part.toolName;
-      entry.args += part.delta;
-      pending.set(part.toolCallId, entry); // render entry.args as live JSON
-      break;
-    }
-    case 'tool-call':
-      // arguments complete and parsed — render part.input
-      break;
-    case 'tool-result':
-      pending.delete(part.toolCallId); // render part.output (part.isError flags failures)
-      break;
-    default:
-      break;
-  }
-}
-```
+Tip: instead of accumulating `tool-input-delta` fragments and inferring status from part ordering, wire v2 lets you render tool lifecycle directly from `tool-state` parts — and the pure reducer `applyUIPart` (`@deuz-sdk/core/chat`) folds *all* of these parts, including `data-{name}`, `citation`, `cost`, and `budget-exceeded`, into one immutable turn state for you. See [Chat persistence & state](/docs/modules/chat-persistence).
 
 ## Related
 
+- [The unbreakable chatbot](/docs/agents/unbreakable-chatbot) — durable checkpoints × this wire log, one resume endpoint.
+- [Chat persistence & state](/docs/modules/chat-persistence) — `applyUIPart`, the `ChatStore` seam, and branching.
 - [streamChat](/docs/core/stream-chat) — the source `StreamChatResult` and its canonical `fullStream`.
-- [Messages & Parts](/docs/core/messages) — the canonical message shape you send.
+- [Pricing & Metering](/docs/modules/pricing) — the `cost` part and the `budget` guardrail.
 - [Tool Loop](/docs/agents/tool-loop) — how `tool-call` / `tool-result` parts are produced.

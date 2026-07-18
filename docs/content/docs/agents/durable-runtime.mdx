@@ -183,6 +183,52 @@ if (!payload || payload.runId !== 'run-42') reject();
 
 `approvalId` was kept distinct from `toolCallId` in the 1.3 type exactly so this scheme could stay additive — the id contract is unchanged.
 
+## Cryptographic approval trail (1.7)
+
+Since 1.7 the signer is wired into the loops as a first-class call option — the sign/verify plumbing above happens inside the loop, end to end:
+
+```ts title="signed-chat.ts"
+import { createApprovalSigner } from '@deuz-sdk/core/durable';
+
+const signer = createApprovalSigner({ secret: process.env.APPROVAL_SECRET! });
+
+const first = await generateText({
+  model,
+  messages,
+  tools, // some gated via needsApproval, no approveToolCall → client mode
+  maxSteps: 8,
+  session: { store, runId: 'run-42' },
+  approvalSigner: signer,
+  approvalMaxAgeMs: 60 * 60 * 1000, // optional; default: unlimited
+});
+```
+
+**Signing (suspend side).** Every client-mode approval request the call produces carries an HMAC token — on the streaming `tool-approval-request` part, on `pendingApprovals`, and inside the durable checkpoint's `pendingApprovals` — so the token survives a process restart along with the request it signs. On a durable call the token additionally binds the `runId`. Signing is best-effort: a throwing signer logs via `deps.logger.error` and the requests go out *unsigned* — verification on resume will then default-deny them, the safe side.
+
+**The client's only job is to echo.** Show the request, and when the user approves, send the verdict with the token you received:
+
+```ts
+approvalResponses: [{ approvalId, approved: true, token }];
+```
+
+(On the [UI wire](/docs/modules/ui-streaming#wire-part-types), that's the `token` field of `tool-approval-request` echoed back on `tool-approval-response`.)
+
+**Verification (resume side).** When the resuming call carries `approvalSigner`, an APPROVED verdict is honored only if its token passes all of:
+
+1. the HMAC verifies (not forged, not garbled),
+2. the token's `approvalId` matches the call being approved (a valid token cannot authorize a *different* call),
+3. when `approvalMaxAgeMs` is set: the token is younger than it,
+4. run binding: when both the call's `session.runId` and the token's `runId` are present, they must match (a token minted for run A cannot approve run B).
+
+Anything else — **forged, missing, expired, or bound to another run** — flips the verdict to a denial with the reason `'Approval token missing, invalid, expired, or bound to another run.'`; the tool becomes an `is_error` result and the loop continues (never a throw). Denials need no token — deny is already the default for unanswered calls. Verification applies wherever `approvalResponses` are settled: `resumeFromCheckpoint`, its streaming twin, and a plain same-process call that passes verdicts — `session` is not required to get the checking, only for the runId binding.
+
+### Trust boundary — read before shipping
+
+- **The secret lives only on the server.** Construct the signer where you handle the route; never send the secret to a browser, never embed it in client bundles. The client sees only opaque tokens and echoes them back.
+- **What signing protects against:** a tampered or hand-crafted verdict authorizing a *different* tool call than the one you showed the user (the token pins the full `ToolApprovalRequest` — id, tool name, input); a verdict from one run replayed against another (runId binding); an old approval replayed after its window (`approvalMaxAgeMs`).
+- **What it does *not* protect against:** it does not authenticate *who* clicked approve — the token is a bearer credential for that one call, so your normal session/auth layer still decides which user may talk to the resume endpoint at all. The token payload is base64url-encoded, **not encrypted** — the client can decode the request it already saw; don't put fresh secrets in tool inputs. And it cannot defend against a compromised server: whoever holds the secret can mint tokens.
+- Inject a `clock` into `createApprovalSigner` for deterministic expiry tests; the default is the wall clock.
+
 ## Edge safety
 
 The whole module is Web-API-only (`crypto.subtle`, `btoa`/`atob`, JSON) and is re-exported from [`@deuz-sdk/core/edge`](/docs/advanced/edge). Node-specific reference stores (file/SQLite) are deliberately **not** in this module — they will live behind a `/node` subpath like `rag/node` and `skills/node` when the CLI ships.
@@ -202,6 +248,7 @@ The honest trade: AI SDK's runtime gives you automatic retry scheduling; Deuz gi
 
 ## See also
 
+- [The unbreakable chatbot](/docs/agents/unbreakable-chatbot) — durable checkpoints × the resumable UI wire, one endpoint (1.7).
 - [Tool loop](/docs/agents/tool-loop) — the loop being checkpointed; immutable history is what makes snapshots safe.
 - [Client-side tools](/docs/agents/client-tools) — the approval round-trip that suspend/resume extends across process restarts.
 - [Sub-agents](/docs/agents/subagents) — `agentTool`, whose client-mode approval limitation this page removes.

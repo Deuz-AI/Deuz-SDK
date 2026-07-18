@@ -1,0 +1,163 @@
+---
+title: The Unbreakable Chatbot
+description: Durable × resumable in one endpoint — resumeDeuzChatResponse replays the wire log, tails a live run, and continues a crashed run from its checkpoint. No vendor runtime, no Redis requirement.
+---
+
+A chat turn can die three ways: the *connection* drops (network blip), the *tab* goes away (refresh, F5 mid-tool-loop), or the *server process* dies (deploy, crash, serverless freeze). 1.7 makes all three converge on the same client behavior — `connectDeuzStream` sees one gapless part sequence — by combining two seams that already exist:
+
+- **Durable**: the agentic loop checkpoints at every step boundary into a [`SessionStore`](/docs/agents/durable-runtime) (`session: { store, runId }`).
+- **Resumable**: the UI wire journals every emitted event into a [`StreamStateStore`](/docs/modules/ui-streaming#streamstatestore--the-resumability-seam) (`toDeuzStreamResponse({ store, streamId })`).
+
+One server endpoint stitches them together:
+
+```ts
+import { resumeDeuzChatResponse } from '@deuz-sdk/core/durable';
+
+function resumeDeuzChatResponse(options: ResumeDeuzChatOptions): Response;
+```
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `sessionStore` | `SessionStore` | required | Where the checkpoints live. |
+| `streamStateStore` | `StreamStateStore` | required | Where the wire log lives. |
+| `runId` | `string` | required | Durable run identity (checkpoint continuation). |
+| `streamId` | `string` | required | Wire-log identity (`Last-Event-ID` replay). Often equal to `runId`. |
+| `lastEventId` | `string \| number \| null` | replay from start | The reconnecting client's `Last-Event-ID` header value, verbatim. |
+| `call` | `ResumeOptions` | required | Model/tools/deps for a continuation leg — same shape as the other resume calls (everything but `messages` and `session`). |
+| `liveProbeMs` | `number` | `1500` | How long the live-producer probe tolerates *silence* before declaring the run dead and re-driving it from the checkpoint. |
+| `pollIntervalMs` | `number` | `150` | Poll cadence during replay/tail. |
+| `wireVersion` | `'v1' \| 'v2'` | `'v2'` | Serve v2 — the client needs event ids to resume. |
+| `clock` | timer seam | global `setTimeout` | Deterministic tests. |
+| `onStoreError` | `(error: unknown) => void` | — | Wire-log append failures on the continuation leg. |
+
+## How the two phases work
+
+**Phase 1 — replay + live tail.** The endpoint replays the stored wire log from the client's cursor and keeps polling. A terminal `done` sentinel with nothing after it means the stream *completed* (even a failed turn writes one — only a killed process leaves the log open): emit `[DONE]`, close. New records keep arriving? The original producer is still alive server-side — just tail it.
+
+**Phase 2 — continue the run.** Silence past `liveProbeMs` with no sentinel means the producer is gone: the endpoint calls `resumeStreamFromCheckpoint(sessionStore, runId, call)` and pipes the new leg **through the same wire log** — seq numbering continues after the last stored record, the synthetic `start` part is not re-emitted, and the leg writes its own terminal sentinel. The client cannot tell the difference between "same process kept streaming" and "a new process picked up from the checkpoint".
+
+This is why the F5-mid-tool-loop story works end to end:
+
+- **Refresh while the server is fine** → the original response body dies, but the serializer keeps draining the model stream into the store ([the client-gone rule](/docs/modules/ui-streaming#journaling-semantics-when-store-is-set)). The new tab hits the resume endpoint, replays what it missed, and tails the still-live producer. No model call is repeated.
+- **Server crash mid-run** → the log went silent without a sentinel. The resume endpoint re-drives the run from the last step-boundary checkpoint; the recovery unit is one step ([the honest contract](/docs/agents/durable-runtime#agentcheckpoint--what-gets-saved)) — the interrupted step re-runs, completed steps are never repeated. The continuation leg's parts append to the same log with gapless seqs.
+- **Second tab watching along** → phase 1 never ends for it; it tails the same log any number of clients can follow.
+
+## At-most-one resumer
+
+Run **at most one continuation resumer per `runId`**. Two clients hitting the resume endpoint after a crash would both pass the liveness probe and start two continuation legs — doubling the model call and interleaving seqs in the log. Guard it with an app-level lock (a Redis `SET NX`, a Postgres advisory lock, a row-level claim) around the resume route, or route resumes for a given `runId` to one worker. Tailing clients (phase 1) are unlimited — the lock is only needed for the leg that *continues the run*. A refreshed tab whose original producer is still draining server-side never triggers a continuation; only a killed process does.
+
+## The complete Next.js route pair
+
+One store module, one POST route that starts a durable+journaled run, one GET route that resumes anything.
+
+```ts title="lib/stores.ts"
+import { createInMemorySessionStore } from '@deuz-sdk/core/durable';
+import { createInMemoryStreamStateStore } from '@deuz-sdk/core/ui';
+
+// Swap for Supabase/Redis-backed stores in production — both seams are
+// two required methods (see the adapter sketches on the UI Streaming page).
+export const sessionStore = createInMemorySessionStore();
+export const streamStateStore = createInMemoryStreamStateStore({ maxStreams: 1000 });
+```
+
+```ts title="app/api/chat/route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+import { sessionStore, streamStateStore } from '@/lib/stores';
+import { tools } from '@/lib/tools';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function POST(req: Request): Promise<Response> {
+  const { messages, runId } = await req.json(); // client mints runId per turn
+
+  const result = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    messages,
+    tools,
+    maxSteps: 12,
+    session: { store: sessionStore, runId }, // durable: checkpoint every step
+  });
+
+  return toDeuzStreamResponse(result, {
+    store: streamStateStore, // resumable: journal every wire event
+    streamId: runId, // one identity for both is the simplest wiring
+  });
+}
+```
+
+```ts title="app/api/chat/[runId]/resume/route.ts"
+import { resumeDeuzChatResponse } from '@deuz-sdk/core/durable';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { sessionStore, streamStateStore } from '@/lib/stores';
+import { tools } from '@/lib/tools';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function GET(
+  req: Request,
+  { params }: { params: Promise<{ runId: string }> },
+): Promise<Response> {
+  const { runId } = await params;
+  return resumeDeuzChatResponse({
+    sessionStore,
+    streamStateStore,
+    runId,
+    streamId: runId,
+    lastEventId: req.headers.get('last-event-id'),
+    // Checkpoints store data, not closures — re-supply model + tools for a
+    // continuation leg, exactly like resumeFromCheckpoint.
+    call: { model: anthropic('claude-opus-4-8'), tools, maxSteps: 12 },
+  });
+}
+```
+
+## The client side
+
+`connectDeuzStream` pointed at the resume route does the rest: auto-reconnect with `Last-Event-ID`, seq dedup, and — via `onCursor` — a cursor you persist so a full page reload picks up exactly where the render stopped.
+
+```ts title="chat-client.ts"
+import { connectDeuzStream } from '@deuz-sdk/core/ui';
+import type { Message } from '@deuz-sdk/core';
+
+async function runTurn(messages: Message[]) {
+  const runId = crypto.randomUUID();
+  sessionStorage.setItem('active-run', runId);
+
+  // Fire the generating POST; do NOT read its body if you want one code path —
+  // the resume endpoint replays from seq 0 and tails the live producer.
+  void fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ messages, runId }),
+  });
+
+  for await (const part of follow(runId)) render(part);
+}
+
+// Also called on page load when sessionStorage still holds an active run:
+// the F5 case is the same function.
+async function* follow(runId: string) {
+  const cursorKey = `cursor:${runId}`;
+  yield* connectDeuzStream(`/api/chat/${runId}/resume`, {
+    lastEventId: sessionStorage.getItem(cursorKey) ?? undefined,
+    onCursor: (id) => sessionStorage.setItem(cursorKey, id),
+  });
+  sessionStorage.removeItem('active-run'); // [DONE] reached — turn complete
+}
+```
+
+Reconnects *within* one `connectDeuzStream` call resume automatically; the persisted cursor covers the full-reload case. Never point `connectDeuzStream` at the POST route — reconnecting there would re-run the model.
+
+## Failure semantics
+
+- An unknown `runId` on a continuation leg surfaces per G2: the continuation body carries an `error` part (`CheckpointNotFoundError`), never a thrown exception out of the route.
+- A `streamStateStore` failure inside the resume endpoint emits a redacted `error` part and closes **without** `[DONE]` — the client reads it as a drop and may retry.
+- Approval suspensions compose: a leg that breaks on a [client-mode approval](/docs/agents/client-tools) writes its sentinel, the resume-with-verdicts leg appends past it, and replay sails through the boundary. With [`approvalSigner`](/docs/agents/durable-runtime#cryptographic-approval-trail-17), the `tool-approval-request` parts in the log carry their signed tokens.
+
+## Related
+
+- [UI Streaming](/docs/modules/ui-streaming) — wire v2, `StreamStateStore`, `resumeDeuzStreamResponse` (log-only resume, no checkpoint continuation), `connectDeuzStream`.
+- [Durable Runtime](/docs/agents/durable-runtime) — `SessionStore`, `AgentCheckpoint`, the one-step recovery contract.
+- [Chat persistence](/docs/modules/chat-persistence) — persisting the *conversation* (vs. this page, which persists the *stream*).

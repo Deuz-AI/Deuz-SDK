@@ -15,7 +15,7 @@ import { gitConfig } from '@/lib/shared';
 
 const copy = {
   en: {
-    badge: 'v1.6.1 — Observable Runtime, tracer bridge & built-in observers',
+    badge: 'v1.7.0 — Built-in chat memory, live USD cost & the unbreakable chatbot',
     titleA: 'One canonical wire for',
     titleB: 'every AI provider',
     lead: 'Pure · Web-first · Multi-provider AI SDK for TypeScript',
@@ -63,7 +63,7 @@ const copy = {
     footerChangelog: 'Changelog',
   },
   de: {
-    badge: 'v1.6.1 — Observable Runtime, Tracer-Bridge & integrierte Observer',
+    badge: 'v1.7.0 — Eingebautes Chat-Gedächtnis, Live-USD-Kosten & unterbrechungsfester Chatbot',
     titleA: 'Ein kanonisches Protokoll für',
     titleB: 'jeden KI-Provider',
     lead: 'Pures · Web-first · Multi-Provider AI SDK für TypeScript',
@@ -111,7 +111,7 @@ const copy = {
     footerChangelog: 'Changelog',
   },
   tr: {
-    badge: "v1.6.1 — Observable Runtime, tracer köprüsü ve yerleşik gözlemciler",
+    badge: "v1.7.0 — Yerleşik sohbet hafızası, canlı USD maliyet ve kopmaz chatbot",
     titleA: 'Tüm yapay zeka sağlayıcıları için',
     titleB: 'tek kanonik protokol',
     lead: 'Saf · Web öncelikli · Çok sağlayıcılı TypeScript AI SDK',
@@ -159,7 +159,7 @@ const copy = {
     footerChangelog: 'Sürüm notları',
   },
   fr: {
-    badge: 'v1.6.1 — Observable Runtime, pont de traçage & observateurs intégrés',
+    badge: 'v1.7.0 — Mémoire de chat intégrée, coût USD en direct & chatbot incassable',
     titleA: 'Un protocole canonique pour',
     titleB: 'chaque fournisseur d’IA',
     lead: 'SDK IA TypeScript pur · web-first · multi-fournisseur',
@@ -207,7 +207,7 @@ const copy = {
     footerChangelog: 'Journal des modifications',
   },
   it: {
-    badge: 'v1.6.1 — Observable Runtime, bridge del tracer e observer integrati',
+    badge: 'v1.7.0 — Memoria di chat integrata, costo USD live e chatbot indistruttibile',
     titleA: 'Un protocollo canonico per',
     titleB: 'ogni provider di IA',
     lead: 'SDK IA TypeScript puro · web-first · multi-provider',
@@ -255,7 +255,7 @@ const copy = {
     footerChangelog: 'Changelog',
   },
   es: {
-    badge: 'v1.6.1 — Observable Runtime, puente de trazas y observadores integrados',
+    badge: 'v1.7.0 — Memoria de chat integrada, coste USD en vivo y chatbot irrompible',
     titleA: 'Un protocolo canónico para',
     titleB: 'cada proveedor de IA',
     lead: 'SDK de IA para TypeScript puro · web-first · multiproveedor',
@@ -303,7 +303,7 @@ const copy = {
     footerChangelog: 'Registro de cambios',
   },
   ru: {
-    badge: 'v1.6.1 — Observable Runtime, мост трассировки и встроенные наблюдатели',
+    badge: 'v1.7.0 — Встроенная память чата, живая стоимость в USD и неубиваемый чат-бот',
     titleA: 'Один канонический протокол для',
     titleB: 'каждого ИИ-провайдера',
     lead: 'Чистый · web-first · мультипровайдерный TypeScript AI SDK',
@@ -351,7 +351,7 @@ const copy = {
     footerChangelog: 'История изменений',
   },
   ja: {
-    badge: 'v1.6.1 — Observable Runtime、トレーサーブリッジ、組み込みオブザーバー',
+    badge: 'v1.7.0 — 組み込みチャットメモリ、ライブUSDコスト、切れないチャットボット',
     titleA: 'すべての AI プロバイダーを',
     titleB: 'ひとつの正規プロトコルで',
     lead: 'ピュア · ウェブファースト · マルチプロバイダー TypeScript AI SDK',
@@ -399,7 +399,7 @@ const copy = {
     footerChangelog: '変更履歴',
   },
   ko: {
-    badge: 'v1.6.1 — Observable Runtime, 트레이서 브리지, 내장 옵저버',
+    badge: 'v1.7.0 — 내장 채팅 메모리, 실시간 USD 비용, 끊기지 않는 챗봇',
     titleA: '모든 AI 프로바이더를 위한',
     titleB: '단 하나의 정규 프로토콜',
     lead: '순수 · 웹 우선 · 멀티 프로바이더 TypeScript AI SDK',
@@ -447,7 +447,7 @@ const copy = {
     footerChangelog: '변경 이력',
   },
   zh: {
-    badge: 'v1.6.1 — Observable Runtime、追踪桥接与内置观察者',
+    badge: 'v1.7.0 — 内置聊天记忆、实时 USD 成本与不断线的聊天机器人',
     titleA: '为每一个 AI 提供商',
     titleB: '提供同一条规范协议',
     lead: '纯净 · Web 优先 · 多提供商 TypeScript AI SDK',

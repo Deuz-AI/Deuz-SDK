@@ -1,0 +1,232 @@
+---
+title: Chat Persistence & State
+description: The ChatStore seam, auto-persist via the chat call option, the pure chat state engine (applyUIPart), and branching for regenerate / edit-and-resend.
+---
+
+`@deuz-sdk/core/chat` is the framework-agnostic chat layer (1.7): a two-method **`ChatStore`** persistence seam the agentic loops auto-save into, plus a **pure chat state engine** — the render-friendly `UIMessage` shape, the reducer that folds [Deuz UI wire](/docs/modules/ui-streaming) parts into it, canonical-history reconstruction, and the branch helpers behind regenerate / edit-and-resend. `@deuz-sdk/react`'s hooks bind this module to React state — no business logic lives there.
+
+Everything in `@deuz-sdk/core/chat` is edge-safe pure functions over immutable data. The file-backed reference store ships separately at `@deuz-sdk/core/chat/node`.
+
+## `ChatStore` — the persistence seam
+
+The `SessionStore` pattern again: implement two methods against any backend — a Supabase table, Redis, the filesystem, or the in-memory reference store.
+
+```ts
+interface ChatRecord {
+  chatId: string;
+  /** Ownership/tenancy — REQUIRED, aligned with the memory scope model. */
+  scope: MemoryScope;
+  /** Full immutable history (the loops never mutate prior arrays). */
+  messages: Message[];
+  /** Branch lineage (edit-and-resend can fork a chat; optional). */
+  parentId?: string;
+  /** `deps.clock.now()` at save time. */
+  updatedAt: number;
+}
+
+interface ChatStore {
+  saveChat(record: ChatRecord): void | Promise<void>;
+  loadChat(chatId: string): ChatRecord | undefined | Promise<ChatRecord | undefined>;
+  /** Optional cleanup (the loops never call it). */
+  deleteChat?(chatId: string): void | Promise<void>;
+  /** Optional enumeration for pickers/tooling. */
+  listChats?(scope?: MemoryScope): string[] | Promise<string[]>;
+}
+```
+
+Scope is mandatory and reuses [`MemoryScope`](/docs/modules/memory#scope-is-mandatory) — which gained a `chatId` field in 1.7 precisely so chat records, memory records, and durable runs share one ownership model. `listChats(scope)` filters by exact match on the scope fields you provide.
+
+## Auto-persist: the `chat` call option
+
+Set `chat` on any `generateText` / `streamChat` call and the loop persists the **full immutable history** into the store at terminal boundaries — completion, suspension (approval break), and mid-stream error (completed turns up to the failure still persist):
+
+```ts
+interface ChatPersistOptions {
+  store: ChatStore;
+  chatId: string;
+  scope: MemoryScope; // mandatory ownership
+  parentId?: string; // fork lineage recorded on the saved record
+}
+```
+
+```ts title="auto-persist.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createInMemoryChatStore } from '@deuz-sdk/core/chat';
+
+const store = createInMemoryChatStore();
+
+const result = streamChat({
+  model,
+  messages,
+  tools,
+  maxSteps: 8,
+  chat: { store, chatId: 'chat-42', scope: { userId: 'u_1' } },
+});
+```
+
+Two contracts to know:
+
+- **Best-effort by design.** A throwing `saveChat` logs via `deps.logger.error` and never kills the run (the `SessionStore` rule).
+- **Tool-less calls route through the loop.** Setting `chat` (or `memory`) routes even a call without `tools` through the agentic loop, so every chat shape persists at the same terminal boundaries. The visible consequence: `step-start` / `step-finish` parts appear on the stream for calls that previously had none — keep the `default` case in your part switch.
+
+There is no diff machinery to configure: history is [immutable by contract](/docs/agents/tool-loop), so each save is a superset of the last and `saveChat` simply receives the full array.
+
+## Reference stores
+
+### `createInMemoryChatStore` (edge-safe)
+
+A `Map` keyed by `chatId`; `saveChat` copies the message array. Implements all four methods. Single runtime only — dev, tests, one long-lived server.
+
+### `createJsonlChatStore` (Node)
+
+`@deuz-sdk/core/chat/node` — one JSON file per chat under `dir` (created on first save), zero dependencies, lazy `node:fs/promises`. Writes are atomic-enough on one filesystem: the record is written to a `.tmp` file, then `rename`d over the target — a crash mid-write can never tear an existing chat. Binary message parts survive via the `$deuzBytes` codec (below). `loadChat` returns `undefined` for missing/corrupt files rather than throwing.
+
+```ts
+import { createJsonlChatStore } from '@deuz-sdk/core/chat/node';
+
+const store = createJsonlChatStore({ dir: './data/chats' });
+```
+
+### The `serializeChatRecord` codec
+
+For persistent backends with text/JSON columns, serialize with the bundled codec — plain `JSON.stringify` would decay binary parts (raw `Uint8Array` images) into index-keyed objects the adapters cannot send back. It uses the same `{ "$deuzBytes": "<base64>" }` tag as the [durable checkpoint codec](/docs/agents/durable-runtime#sessionstore--the-storage-seam); on load, only the codec's own exact shape converts back to bytes — payloads that merely look like the tag stay plain data.
+
+```ts
+import { serializeChatRecord, deserializeChatRecord } from '@deuz-sdk/core/chat';
+
+const row = serializeChatRecord(record); // JSON string, Uint8Array-safe
+const back = deserializeChatRecord(row); // real Uint8Arrays restored
+```
+
+### Supabase table adapter
+
+```sql
+create table chats (
+  chat_id    text primary key,
+  scope      jsonb not null,
+  record     text  not null, -- serializeChatRecord output
+  updated_at bigint not null
+);
+```
+
+```ts title="supabase-chat-store.ts"
+import type { ChatStore } from '@deuz-sdk/core/chat';
+import { serializeChatRecord, deserializeChatRecord } from '@deuz-sdk/core/chat';
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_KEY!);
+
+export const chatStore: ChatStore = {
+  async saveChat(record) {
+    const { error } = await supabase.from('chats').upsert({
+      chat_id: record.chatId,
+      scope: record.scope, // queryable copy for listChats-style filters
+      record: serializeChatRecord(record), // binary-safe source of truth
+      updated_at: record.updatedAt,
+    });
+    if (error) throw error; // logged by the loop, never kills the run
+  },
+  async loadChat(chatId) {
+    const { data } = await supabase.from('chats').select('record').eq('chat_id', chatId).single();
+    return data ? deserializeChatRecord(data.record) : undefined;
+  },
+};
+```
+
+## The pure chat engine
+
+The engine is the part a UI binding needs regardless of storage. All functions are pure and total: new objects out, inputs untouched, unknown wire parts ignored (the open-union rule), errors recorded rather than thrown.
+
+### `UIMessage` and the per-turn reducer
+
+```ts
+interface UIToolCall {
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+  output?: unknown;
+  isError?: boolean;
+  state: 'call' | 'result' | 'approval-requested';
+  /** Fine-grained lifecycle from `tool-state` parts (1.7 additive). */
+  runState?: ToolRunState;
+}
+
+interface UIMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  reasoning?: string;
+  toolCalls?: UIToolCall[];
+}
+```
+
+One streamed assistant turn accumulates into an `AssistantTurnState`: the `UIMessage` plus `approvals` (gated calls awaiting verdicts), `serverResults` (which toolCallIds the server already executed — the rest are client tools), and the 1.7 wire additions: `costUsd` / `cacheSavingsUsd` (live `cost` parts), `budgetExceeded`, `dataParts` (app-defined `data-{name}` parts in arrival order), `citations`, and `error` (the redacted server error message, recorded — not thrown).
+
+`applyUIPart(turn, part)` folds **one** wire part into the turn and returns a new state:
+
+```ts title="reduce-a-turn.ts"
+import { createAssistantTurn, applyUIPart } from '@deuz-sdk/core/chat';
+import { connectDeuzStream } from '@deuz-sdk/core/ui';
+
+let turn = createAssistantTurn(crypto.randomUUID());
+for await (const part of connectDeuzStream(resumeUrl)) {
+  turn = applyUIPart(turn, part); // pure — hand it straight to setState
+  render(turn);
+}
+```
+
+Reducer details worth knowing: a `tool-state: input-streaming` part opens a placeholder tool call *before* the assembled `tool-call` part arrives, so the lifecycle is visible from the first fragment (the later `tool-call` completes it in place, no duplicates); `start` adopts the server's `messageId`; `tool-result` moves the call to `state: 'result'` and records it in `serverResults`.
+
+### Back to canonical history
+
+- `assistantMessageFromTurn(turn)` — the canonical assistant `Message` for the request history: text plus `tool_use` parts, exactly as the wire streamed them (the client-tools reconstruction).
+- `clientToolResultMessage(results)` — the canonical `role: 'tool'` message for client-executed tool results.
+- `uiFromMessages(messages, generateId)` — the reverse projection: a canonical history (e.g. a chat loaded from a `ChatStore`) into render-friendly `UIMessage`s. `tool` messages merge their results into the preceding assistant turn; `system` messages are not rendered; `generateId` supplies stable ids (inject `deps.generateId`, or scripted ids in tests).
+
+```ts title="load-a-chat.ts"
+import { uiFromMessages } from '@deuz-sdk/core/chat';
+
+const record = await store.loadChat('chat-42');
+const ui = record ? uiFromMessages(record.messages, () => crypto.randomUUID()) : [];
+```
+
+## Branching: regenerate and edit-and-resend
+
+A chat binding maintains two views of the same conversation — `ChatHistory` is the pair:
+
+```ts
+interface ChatHistory {
+  ui: UIMessage[];
+  canonical: Message[];
+}
+```
+
+Because history is immutable, a **branch is just a prefix**: a new array cut before the point you re-run. Two helpers do the cutting on both views at once:
+
+- `dropTrailingAssistant(history)` — **regenerate**: drop the trailing assistant/tool turns from both views so the last user turn runs again. No-op when nothing trails.
+- `branchBeforeUserMessage(history, messageId)` — **edit-and-resend**: cut both views to just *before* the user turn holding `messageId`. The canonical cut uses the user-turn ordinal (not array index), so assistant/tool interleaving can never skew the pairing. Returns `undefined` when `messageId` is not a user message.
+
+```ts title="edit-and-resend.ts"
+import { branchBeforeUserMessage } from '@deuz-sdk/core/chat';
+
+const branched = branchBeforeUserMessage(history, editedMessageId);
+if (branched) {
+  const messages = [...branched.canonical, { role: 'user' as const, content: editedText }];
+  // Persist the fork as a NEW chat, keeping lineage via parentId:
+  streamChat({
+    model,
+    messages,
+    chat: { store, chatId: newChatId, scope, parentId: originalChatId },
+  });
+}
+```
+
+`parentId` on the saved `ChatRecord` is how forks stay traceable — a linear chat never sets it; every edit-and-resend fork points at the chat it branched from.
+
+## Related
+
+- [UI Streaming](/docs/modules/ui-streaming) — the wire parts `applyUIPart` consumes, including the 1.7 additions.
+- [Memory](/docs/modules/memory) — the shared `MemoryScope` model, and the `memory` call option for cross-session facts (persistence stores *transcripts*; memory stores *knowledge*).
+- [The unbreakable chatbot](/docs/agents/unbreakable-chatbot) — persisting the live *stream*; this page persists the *conversation*.
+- [Durable Runtime](/docs/agents/durable-runtime) — the `$deuzBytes` codec convention and the SessionStore pattern this seam follows.
+- [React hooks](/docs/modules/react-hooks) — `useChat`, the binding built on this engine.

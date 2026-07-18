@@ -54,9 +54,22 @@ That is the whole dependency tree.
 > npx skills add Deuz-AI/Deuz-SDK
 > ```
 
+## Six things even the Vercel AI SDK doesn't have
+
+Every claim below was verified against AI SDK 7's official docs and issue tracker (2026-07); the links are the receipts. All six live **inside the library** — no gateway, no hosted runtime, no Redis requirement.
+
+| # | Deuz 1.7 | Where Vercel stands |
+|---|---|---|
+| 1 | **Built-in cross-session memory** — `memory: { seams, scope }` on any call: recall before the first token, mem0-style extract→reconcile after the turn, without blocking the response | No built-in; docs point to Mem0/Letta or "build your own" ([docs](https://ai-sdk.dev/docs/agents/memory); `@ai-sdk/memory` [does not exist](https://registry.npmjs.org/@ai-sdk/memory)) |
+| 2 | **Live USD cost on the wire** — a cumulative `cost` stream part per step from a verified in-library price catalog, with prompt-cache savings as its own field | Closed **wontfix** ([vercel/ai#3932](https://github.com/vercel/ai/issues/3932)); USD only in the hosted AI Gateway |
+| 3 | **Conversation budget guardrail** — `budget: { usd, tokens }` hard-stops the loop with a typed `budget-exceeded` part | No built-in budget stop; docs show hand-rolling a custom condition with hardcoded prices ([loop control](https://ai-sdk.dev/docs/agents/loop-control)) |
+| 4 | **Cryptographic approval trail in chat** — HMAC-signed, runId-bound, expiring approval tokens flow through the UI wire and are verified on resume | `experimental_toolApprovalSecret` is [incompatible with WorkflowAgent](https://ai-sdk.dev/docs/agents/tool-approvals#signing-approvals-with-experimental_toolapprovalsecret) |
+| 5 | **Durable × resumable, vendor-free** — F5 mid-tool-loop: the run continues from its checkpoint AND the stream reconnects gaplessly, over two 2-method seams you back with anything | Durable = hosted Vercel Workflow runtime; resume = Redis (`resumable-stream`) ([resume docs](https://ai-sdk.dev/docs/ai-sdk-ui/chatbot-resume-streams)) |
+| 6 | **Mid-conversation cross-provider failover** — `fallbackModels` hops Anthropic→OpenAI→Gemini with the identical canonical history + a live circuit breaker | Open feature request ([vercel/ai#9950](https://github.com/vercel/ai/issues/9950)); automatic failover only in the hosted Gateway |
+
 ## Why Deuz
 
-- **Zero runtime dependencies** — `npm ls --all` prints one line; [`package.json`](./package.json) is the receipt.
+- **Zero runtime dependencies** — `npm ls --all` prints one line; [`package.json`](./packages/core/package.json) is the receipt.
 - **2.4 MB installed, ~50 ms to import** — 5–47× less disk and 5–20× faster cold-start than the other TypeScript AI SDKs ([measured](#the-cost-of-the-box), reproducible).
 - **Edge-safe by lint, not by promise** — banned ambient APIs are a CI failure, and a [browser-bundle gate](./tooling) proves no `node:` import leaks into core.
 - **Durable agents over any backend** — checkpoint/resume through a two-method `SessionStore`; no vendor workflow runtime ([tour](#durable-agents)).
@@ -212,7 +225,7 @@ const { messages, sendMessage, pendingApprovals, addToolApprovalResponse } = use
 
 Verified against each project's official docs and the npm registry on **2026-07-08** (versions: `ai@7.0.17`, `@mastra/core@1.50.1`, `langchain@1.5.2`, `llamaindex@0.12.1`, `@openai/agents@0.13.0`). ✅ yes · 🟡 partial/with caveats · ❌ no.
 
-|                                                          | Deuz 1.6                               | ai 7                                        | Mastra                                | LangChain                              | LlamaIndex.TS                     | OpenAI Agents             |
+|                                                          | Deuz 1.7                               | ai 7                                        | Mastra                                | LangChain                              | LlamaIndex.TS                     | OpenAI Agents             |
 | -------------------------------------------------------- | -------------------------------------- | ------------------------------------------- | ------------------------------------- | -------------------------------------- | --------------------------------- | ------------------------- |
 | Zero runtime dependencies                                 | ✅                                      | ❌                                           | ❌                                     | ❌                                      | ❌                                 | ❌                         |
 | ESM + CJS dual build                                      | ✅                                      | ❌ ESM-only                                  | ✅                                     | ✅                                      | ✅                                 | ✅                         |
@@ -244,7 +257,7 @@ Verified against each project's official docs and the npm registry on **2026-07-
 
 </details>
 
-## One package, 28 subpaths
+## One core package, 30 subpaths (+ `@deuz-sdk/react`)
 
 Tree-shakable subpaths — no `@deuz-sdk/anthropic`, `@deuz-sdk/react`, … to version-match:
 
@@ -253,13 +266,14 @@ Tree-shakable subpaths — no `@deuz-sdk/anthropic`, `@deuz-sdk/react`, … to v
 | `@deuz-sdk/core`                                                             | `streamChat` · `generateText` · `generateObject` · `streamObject` · `embed` · `agentTool` · `createClient` · types · errors      |
 | `…/anthropic` · `…/openai` · `…/xai` · `…/google` · `…/vertex` · `…/voyage`  | Provider factories (Messages, Chat Completions + Responses, Gemini compat + native, Claude-on-Vertex, embeddings)                |
 | `…/google/extras`                                                            | Gemini explicit caching + Files API                                                                                              |
-| `…/durable`                                                                  | `resumeFromCheckpoint` · `resumeStreamFromCheckpoint` · `createApprovalSigner` · `createInMemorySessionStore`                    |
+| `…/durable`                                                                  | `resumeFromCheckpoint` · `resumeStreamFromCheckpoint` · `resumeDeuzChatResponse` (1.7) · `createApprovalSigner` · `createInMemorySessionStore` |
+| `…/chat` · `…/chat/node` (1.7)                                               | `ChatStore` persistence · pure chat engine (`applyUIPart`, branching) · JSONL file store (Node)                                  |
 | `…/memory` · `…/memory/markdown`                                             | Memory pipeline + vector or markdown-vault stores                                                                                |
 | `…/rag` · `…/rag/node`                                                       | Chunkers, retrieval, hybrid search + Node document parsers                                                                       |
 | `…/skills` · `…/skills/node`                                                 | SKILL.md registry + filesystem source                                                                                            |
 | `…/mcp` · `…/mcp/stdio`                                                      | MCP client (edge-safe HTTP/SSE; Node stdio)                                                                                      |
 | `…/image` · `…/midjourney` · `…/yunwu`                                       | Image generation surfaces                                                                                                        |
-| `…/ui` · `…/react`                                                           | Deuz UI wire (server + client) + React hooks                                                                                     |
+| `…/ui` · `…/react`                                                           | Deuz UI wire v2 (resumable seq ids, `StreamStateStore`, `connectDeuzStream`) + frozen legacy hooks (new home: `@deuz-sdk/react`) |
 | `…/observe` · `…/observe/node`                                               | Observation event protocol: memory/callback/composite observers + `summarizeRun` · JSONL persistence (Node)                      |
 | `…/middleware` · `…/pricing` · `…/edge`                                      | Model wrappers · cost tables · guaranteed edge-safe subset                                                                       |
 

@@ -3,6 +3,8 @@ title: React Hooks
 description: useChat and useObject — client-side hooks over the Deuz UI wire, with automatic client-tool round-trips and tool-approval pauses.
 ---
 
+> **1.7:** the React surface moved to its own package, **`@deuz-sdk/react`** — `useChat` v2 (chatId, rendered `initialMessages`, live `cost`/`budgetExceeded` state, `regenerate`/`editAndResend`, signed-approval token flow, `reconnect()` over `connectDeuzStream`) plus headless `ToolApprovalCard` and `CostBadge` components. Everything below — the `@deuz-sdk/core/react` subpath — keeps working but is **frozen**; new features land in `@deuz-sdk/react`, whose hooks bind the pure chat engine at [`@deuz-sdk/core/chat`](/docs/modules/chat-persistence).
+
 `@deuz-sdk/core/react` ships two hooks built on [`readDeuzStream`](/docs/modules/ui-streaming): `useChat` for conversational UIs and `useObject` for streaming structured output. They are plain TypeScript hooks (no JSX, no components) and work with any React framework.
 
 **React is an optional peer** (`^18 || ^19`) — install it yourself; nothing else in the SDK depends on it, and no other subpath pulls it in. The hooks are SSR-safe: network runs only inside user-triggered callbacks, never at render time.

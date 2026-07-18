@@ -1,9 +1,11 @@
 ---
 title: Pricing & Metering
-description: Optional USD cost accounting — the Usage breakdown, the onUsage callback, and the bundled 2026 price table behind createPriceProvider.
+description: Optional USD cost accounting — the Usage breakdown, onUsage, the bundled 2026 price table, the live cost stream part, and the budget guardrail.
 ---
 
 The core never bills. Every call returns a token *breakdown* (`Usage`); turning tokens into dollars is an app concern — margins, currency, and contract rates differ per deployment. The `@deuz-sdk/core/pricing` module is therefore fully optional: it ships a pinned 2026 USD price table plus a `PriceProvider` factory you inject via `deps.priceProvider`, but the core never imports it and never charges automatically. Pair it with the [`onUsage`](#metering-the-onusage-callback) callback to log or meter cost per request.
+
+Since 1.7, injecting a `priceProvider` also unlocks two features inside the loop itself: a [live `cost` stream part](#live-cost-stream-17) and the [`budget` guardrail](#the-budget-guardrail-17).
 
 ## Usage anatomy
 
@@ -160,10 +162,12 @@ interface CreatePriceProviderOptions {
 
 interface PriceProvider {
   priceUsage(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
+  /** Optional (1.7): USD saved by prompt-cache reads — feeds `cacheSavingsUsd` on the cost part. */
+  cacheSavings?(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
 }
 ```
 
-How cost surfaces: the core does **not** put dollars on `UsageMeta`. The provider you inject is *yours* to call — typically inside the same `onUsage` handler, since the app owns both. The `priceProvider` seam exists so app-wide wiring (price table, margin) lives in one place that your callback reads.
+How cost surfaces: the core does **not** put dollars on `UsageMeta`. The provider you inject is *yours* to call — typically inside the same `onUsage` handler, since the app owns both. The `priceProvider` seam exists so app-wide wiring (price table, margin) lives in one place that your callback reads. (Since 1.7 the streaming loop *additionally* reads the seam itself to emit [`cost` parts](#live-cost-stream-17) and evaluate [`budget.usd`](#the-budget-guardrail-17) — still estimation for display and guardrails, never billing.)
 
 ```ts title="lib/deuz.ts"
 import { createClient } from '@deuz-sdk/core';
@@ -187,7 +191,82 @@ export const deuz = createClient({
 export const anthropic = createAnthropic();
 ```
 
-`createPriceProvider` performs no I/O and reads no globals, so it is safe in any edge runtime. Unknown models still yield `undefined` after a margin is applied — a missing price never becomes a wrong charge.
+`createPriceProvider` performs no I/O and reads no globals, so it is safe in any edge runtime. Unknown models still yield `undefined` after a margin is applied — a missing price never becomes a wrong charge. Providers built with `createPriceProvider` implement the optional `cacheSavings` seam out of the box (with the same `margin` applied), so the live `cost` part carries `cacheSavingsUsd` without extra wiring.
+
+## Live cost stream (1.7)
+
+When `deps.priceProvider` is injected, streaming calls emit a canonical `cost` part — the agentic loop pushes one **after every step**, and a single-turn stream pushes one before its finish. It rides the [UI wire v2](/docs/modules/ui-streaming#wire-part-types) unchanged, so a browser can render a live cost badge with zero server code:
+
+```ts
+interface CostPart {
+  type: 'cost';
+  costUsd: number; // CUMULATIVE for the run — cross-leg on durable resumes
+  deltaUsd?: number; // this step's increment
+  cacheSavingsUsd?: number; // what cache reads saved vs full-price input (needs cacheSavings)
+  stepIndex?: number;
+}
+```
+
+- `costUsd` is cumulative across the whole run. On a [durable resume](/docs/agents/durable-runtime) leg, the prior legs' cost seeds the baseline, so the first `cost` part's `deltaUsd` reports *this step's* increment, not the whole run's total.
+- `cacheSavingsUsd` appears only when the provider implements the optional `cacheSavings` seam and the savings are positive. The standalone helper is exported too: `cacheSavings(model, usage, table?)` returns what the `cachedReadTokens` would have cost at the full input rate minus what they cost at the cached-read rate — cache *writes* are the investment side and are not netted.
+- No `priceProvider`, or an unknown model (`priceUsage` → `undefined`) → no `cost` parts, no errors. A throwing provider logs a warning and the part is skipped.
+
+```ts title="cost-badge.ts"
+for await (const part of readDeuzStream(res)) {
+  if (part.type === 'cost') {
+    badge.textContent = `$${part.costUsd.toFixed(4)}`; // live, per step
+    if (part.cacheSavingsUsd) savings.textContent = `saved $${part.cacheSavingsUsd.toFixed(4)}`;
+  }
+}
+```
+
+## The budget guardrail (1.7)
+
+`budget` on `CommonCallOptions` hard-stops the agentic loop once cumulative cost or real token usage crosses a limit:
+
+```ts
+const result = streamChat({
+  model,
+  messages,
+  tools,
+  maxSteps: 20,
+  budget: { usd: 0.5, tokens: 200_000 }, // either field alone works too
+});
+```
+
+Semantics:
+
+- Sugar over the `costExceeds` / `totalTokensExceed` [stop conditions](/docs/agents/tools#budget-stop-conditions), with distinct `stoppedBy` markers: `providerMetadata.deuz.stoppedBy` is `'budget.usd'` or `'budget.tokens'`, so callers can tell a budget trip from a manual `stopWhen`.
+- **Evaluated at step boundaries** — an in-flight step always completes first (the loop never truncates a model response mid-stream).
+- `budget.usd` needs `deps.priceProvider`; without one the loop warns once and the condition never fires. `budget.tokens` reads provider-reported cumulative usage — no estimation.
+- The streaming loop emits a typed `budget-exceeded` part **right before** the terminal `finish`, so UIs can react without parsing metadata: `{ type: 'budget-exceeded', kind: 'usd' | 'tokens', limit, value }`.
+- On a [durable](/docs/agents/durable-runtime) run, budget checks see the *whole run's* cumulative usage across legs — a resume leg cannot reset the meter.
+
+### Continue-confirmation UI pattern
+
+A budget stop is not an error — the turn finishes cleanly with partial work and full history. The natural UX is a confirmation that re-runs the same conversation with a raised budget:
+
+```tsx title="BudgetGate.tsx"
+// Reducing the stream with applyUIPart (see Chat Persistence) fills
+// turn.budgetExceeded when the guardrail trips.
+{turn.budgetExceeded && (
+  <div role="alert">
+    Stopped at {turn.budgetExceeded.kind === 'usd'
+      ? `$${turn.budgetExceeded.value.toFixed(2)} (limit $${turn.budgetExceeded.limit})`
+      : `${turn.budgetExceeded.value.toLocaleString()} tokens`}.
+    <button
+      onClick={() =>
+        // Raised ceiling, same conversation: include the stopped turn's
+        // assistant/tool messages in `messages` and the model picks up
+        // where the budget cut it off.
+        send(messages, { budget: { usd: turn.budgetExceeded!.limit * 2 } })
+      }
+    >
+      Continue anyway
+    </button>
+  </div>
+)}
+```
 
 ## Examples
 
@@ -288,6 +367,7 @@ To override globally without a provider, pass your table as the third argument t
 ## Related
 
 - [Dependencies & Clients](/docs/core/dependencies) — the full `deps` seam, `onUsage`/`onFinish` precedence (G10), and `createClient`.
+- [UI Streaming](/docs/modules/ui-streaming) — how the `cost` and `budget-exceeded` parts ride the wire to the browser.
 - [streamChat](/docs/core/stream-chat) — `usage: Promise<Usage>` and the never-throws contract.
 - [generateText](/docs/core/generate-text) and [generateObject](/docs/core/generate-object) — `usage: Usage` on every result.
 - [Embeddings](/docs/core/embeddings) — input-only `Usage` for `embed` / `embedMany`.

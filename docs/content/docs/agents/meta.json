@@ -2,5 +2,13 @@
   "title": "Agents",
   "icon": "Bot",
   "defaultOpen": true,
-  "pages": ["tools", "tool-loop", "client-tools", "server-tools", "subagents", "durable-runtime"]
+  "pages": [
+    "tools",
+    "tool-loop",
+    "client-tools",
+    "server-tools",
+    "subagents",
+    "durable-runtime",
+    "unbreakable-chatbot"
+  ]
 }

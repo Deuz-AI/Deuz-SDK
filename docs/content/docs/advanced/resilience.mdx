@@ -1,6 +1,6 @@
 ---
 title: Resilience & Timeouts
-description: Pre-first-byte retry with jittered backoff, the three-layer timeout, abort vs. timeout semantics, and the circuit-breaker seam.
+description: Pre-first-byte retry with jittered backoff, the three-layer timeout, abort vs. timeout semantics, the live per-model circuit breaker, and cross-provider failover.
 ---
 
 `@deuz-sdk/core` makes one network attempt resilient and keeps it deterministic. Before the first byte of a response stream arrives, a failed request can be retried with exponential backoff and full jitter; once streaming has started, any error is final. Timeouts come in three independent layers driven by the injected `clock`, and a user abort is treated as a clean finish rather than a failure. All of this is wired through the [`Dependencies`](/docs/core/dependencies) seam so it is reproducible in tests with no real clock and no real network.
@@ -217,9 +217,21 @@ const result = streamChat({
 result.finishReason.finally(() => clearTimeout(timer));
 ```
 
-## The circuit-breaker seam
+## The circuit breaker (live since 1.7)
 
-`deps.breakerStore` is the seam for circuit-breaker state. It is a plain key-value store that the SDK resolves to an in-memory `Map` by default:
+The inference pump runs a per-model circuit breaker: a model that keeps failing at the transport level stops receiving requests for a cooldown window and fails fast instead — which is exactly the signal [cross-provider failover](#cross-provider-failover-17) hops on.
+
+How it works, all in `core/inference.ts` + `core/resilience.ts`:
+
+- **Keyed per `provider:model`** (e.g. `anthropic:claude-opus-4-8`), state in `deps.breakerStore`. One sick model never blocks its siblings.
+- **What counts**: only *provider-health* failures that end a call — network errors, timeouts, and 5xx/overload/retryable API errors (`isBreakerCountable`). Client errors (4xx auth/validation) say nothing about provider health and never count; a `BreakerOpenError` itself is a fast-fail read, never a new signal. Failures the retry budget absorbs don't count either — only the final error of a call does.
+- **Opening**: `BREAKER_THRESHOLD` (5) consecutive countable failures open the breaker for `BREAKER_COOLDOWN_MS` (30s). Opening logs a `deps.logger.warn('circuit breaker opened', …)`.
+- **While open**: a call to that model fails immediately — before any network request — with a `BreakerOpenError` (`code: 'breaker_open'`, carrying `provider`, `modelId`, and `cooldownUntil`). Per G2, on `streamChat` this surfaces as an `error` part and rejected promises, never a synchronous throw.
+- **Half-open probe**: once `cooldownUntil` passes, the next call goes through as a probe.
+- **Reset on first byte**: the moment a response body's first byte arrives, the provider is proven healthy again and the failure count resets to 0. Consecutive means consecutive.
+- **Best-effort store**: a throwing `breakerStore` never blocks or changes a call — reads and writes are wrapped, failures ignored.
+
+The state shape and seam:
 
 ```ts
 interface BreakerState {
@@ -234,16 +246,13 @@ interface BreakerStore {
 }
 ```
 
-Note: core does not currently read or write this store — it accumulates no failures and never opens or trips a breaker on its own. The seam exists so the `BreakerStore` type and its per-client wiring are locked now; today it is a hook for a caller-implemented breaker.
-
-The critical wiring rule is **per-client resolution (G11)**: when you use [`createClient`](/docs/core/dependencies#createclient), the breaker store is resolved **once** for the client and shared across every call. The per-client rule matters for any breaker you build on this seam: a fresh in-memory store per call could never accumulate state across calls. If you inject your own store, supply it once at the client level:
+The critical wiring rule is **per-client resolution (G11)**: with [`createClient`](/docs/core/dependencies#createclient), the breaker store is resolved **once** for the client and shared across every call — a fresh in-memory store per call could never accumulate the consecutive-failure state. The default is an in-memory `Map` per client. Both methods may return a `Promise`, so a multi-instance deployment can share breaker state across the fleet by pointing every instance at the same backend:
 
 ```ts
 import { createClient } from '@deuz-sdk/core';
 import type { BreakerStore, BreakerState } from '@deuz-sdk/core';
 
-// A custom store backed by your own state (e.g. Redis/Durable Object). Shared
-// across calls so any state your own breaker records persists across calls (G11).
+// e.g. Redis / Durable Object-backed; shared across calls and instances (G11).
 const states = new Map<string, BreakerState>();
 const breakerStore: BreakerStore = {
   get: (key) => states.get(key),
@@ -258,11 +267,43 @@ export const deuz = createClient({
 });
 ```
 
-Both `get` and `set` may return a `Promise`, so the store can be backed by a remote/persistent service for a multi-instance deployment — share breaker state across your fleet by pointing every instance at the same backend.
+## Cross-provider failover (1.7)
+
+Because the *whole* conversation is canonical (`Message[]`/`Part[]`), a chat can hop providers mid-conversation: the next candidate receives the identical request the failed one got — history, tools, and all. Two equivalent surfaces:
+
+```ts
+// 1. The call option — inline sugar:
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages,
+  fallbackModels: [openai('gpt-5.2'), google('gemini-3-pro')],
+  // onFallback is available on the middleware form below
+});
+
+// 2. The middleware — reusable wiring:
+import { wrapModel, withFallback } from '@deuz-sdk/core/middleware';
+
+const resilient = wrapModel(anthropic('claude-opus-4-8'), [
+  withFallback([openai('gpt-5.2'), google('gemini-3-pro')], {
+    onFallback: ({ from, to, error }) => log('failover', from.modelId, '→', to.modelId),
+  }),
+]);
+```
+
+The rules:
+
+- **Pre-first-content only.** A streaming attempt is buffered until its first *content* part (`text-delta`, `reasoning-delta`, `tool-call-delta`, `tool-call`); a failure before that hops to the next candidate. Once content has arrived, a mid-stream error is **final** — the existing no-replay rule, for the same reason mid-stream retries are forbidden. Buffered (`generateText`) calls hop on any fallback-worthy rejection.
+- **What hops** (`defaultShouldFallback`): `BreakerOpenError` (an open breaker fails fast, so the hop is immediate — this is the breaker/failover synergy), `NetworkError`, `TimeoutError`, and retryable / 5xx `APICallError`s. Client errors (bad request, auth) never hop — they would fail identically everywhere. Override with the `shouldFallback` hook on the middleware.
+- **Retries come first.** Each candidate still gets its own pre-first-byte retry budget; failover engages only after a candidate's final failure.
+- **The audit trail**: the winning result carries `providerMetadata.deuz.failedOver = { from, to, reason }` (keys are `provider:model` strings, `reason` is the failing error's code). On streaming it rides the terminal `finish` part's `providerMetadata`. The `onFallback` hook fires once per hop.
+- **G2 holds**: the streaming form returns synchronously; an exhausted candidate list surfaces as an `error` part + rejected promises. On streaming, durable identity is stable too — a missing `session.runId` is minted once before the first attempt (and exposed synchronously on the result), so every candidate checkpoints under the same run.
+
+Honest caveats: provider capabilities differ, so pick fallbacks whose capability profile covers your call (a tool-heavy call falling back to a model without tool support will fail on the fallback too — the registry's conservative defaults apply). Cost differs per model too — the loop (and the [`cost` part](/docs/modules/pricing#live-cost-stream-17)) prices against the model that actually ran, not the primary you asked for.
 
 ## Related
 
 - [streamChat](/docs/core/stream-chat) — the synchronous, never-throws streaming entry point and `StreamChatResult` shape.
 - [Error Handling](/docs/core/errors) — the `DeuzError` taxonomy, `isRetryable`, and `retryAfterMs`.
 - [Dependencies & Clients](/docs/core/dependencies) — the `Dependencies` seam, `clock`, `generateId`, and per-client breaker resolution.
+- [Middleware](/docs/modules/middleware) — `wrapModel` and the `withFallback` ordering rules.
 - [Edge runtimes](/docs/advanced/edge) — why the core stays pure and Web-APIs-only.

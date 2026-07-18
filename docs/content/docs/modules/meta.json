@@ -5,6 +5,7 @@
   "pages": [
     "observability",
     "memory",
+    "chat-persistence",
     "rag",
     "skills",
     "mcp",

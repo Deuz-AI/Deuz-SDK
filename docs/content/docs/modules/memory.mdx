@@ -9,6 +9,47 @@ Two interchangeable backends ship behind the same `MemoryStore` interface: an in
 
 Import the core from `@deuz-sdk/core/memory`; the markdown backend from `@deuz-sdk/core/memory/markdown`.
 
+Since 1.7 you rarely wire the pipeline by hand for a chatbot: the [`memory` call option](#built-in-chat-memory-17) runs recall + extract around any `generateText` / `streamChat` call.
+
+## Built-in chat memory (1.7)
+
+Set `memory` on any call and the loop does the whole cycle for you: **recall** relevant memories into the system context before the first model call, then **extract** new facts after the run (the mem0 extract → reconcile → apply pass) — without blocking the response.
+
+```ts
+interface MemoryCallOptions {
+  seams: MemorySeams;
+  /** Mandatory ownership (mem0 rule) — e.g. `{ userId, chatId }`. */
+  scope: MemoryScope;
+  /** Recall before the first model call (default on, topK 5). `false` disables. */
+  recall?: { topK?: number; header?: string } | false;
+  /** Extract after the run (default on, LLM-inferred). `false` disables. */
+  extract?: { infer?: boolean } | false;
+}
+```
+
+```ts title="chat-with-built-in-memory.ts"
+import { streamChat } from '@deuz-sdk/core';
+
+const result = streamChat({
+  model,
+  messages,
+  memory: { seams, scope: { userId: 'u_123', chatId: 'chat-42' } },
+});
+// The extract promise rides the result — await it on serverless runtimes
+// that freeze after the response ends:
+const mutations = await result.memory; // MemoryMutation[] — never rejects
+```
+
+The contracts:
+
+- **Recall is a call-site splice, never history.** The recall block is computed once per call (queried from the *last user message*, `topK` 5 by default) and spliced into the system context **at the model-call site only** — the canonical history never bakes it in. Consequently [checkpoints](/docs/agents/durable-runtime) and [chat persistence](/docs/modules/chat-persistence) stay recall-free, and resume legs cannot double-inject it. `recall.header` overrides the `'Relevant memories:'` heading.
+- **Extract is non-blocking.** The extract → reconcile → apply pass starts after the run completes and does not delay the response. `result.memory` (on both `GenerateTextResult` and `StreamChatResult`, present only when the call carried `memory` with extraction on) resolves with the applied `MemoryMutation[]` — empty on suspension or error, and it **never rejects**. Suspended runs (approval breaks) skip extraction: the turn is incomplete until the resume leg finishes it. The extraction input is the last user message plus the run's new assistant turns.
+- **Best-effort on both halves.** A failing store/embedder/LLM logs via `deps.logger.error` and the chat proceeds — recall failure means the call runs bare; extract failure resolves `[]`.
+- **Zero cost when absent.** No `memory` option → no recall query, no extract pass, no extra promises.
+- **Loop routing.** Like `chat`, setting `memory` routes even a tool-less call through the agentic loop, so `step-start` / `step-finish` parts appear on the stream.
+
+The sections below document the underlying pipeline — what the option automates, and the surface you use directly for non-chat shapes (batch ingestion, custom recall placement, model-driven memory tools).
+
 ## Scope is mandatory
 
 Every memory belongs to a `MemoryScope`. At least one field must be set, or `assertScope` throws `InvalidRequestError` (the mem0 rule). Search, list, and reconcile are all exact-match filtered on the fields you provide.
@@ -19,6 +60,8 @@ interface MemoryScope {
   agentId?: string;
   runId?: string;
   actorId?: string;
+  /** Chat/conversation identity (1.7 additive) — aligns memory with ChatStore records. */
+  chatId?: string;
 }
 ```
 
@@ -191,9 +234,9 @@ interface MemoryQuery {
 
 `formatMemoriesForPrompt(hits, opts?)` renders the hits into a bulleted block for splicing into a system prompt (empty string when there are no hits). `opts` accepts `header` (default `'Relevant memories:'`) and `maxChars` (hard-truncates the rendered block to bound prompt-token cost).
 
-## Injecting memory into a chat loop
+## Injecting memory into a chat loop (manual)
 
-Recall before the model call, splice the memories into the system prompt, then `remember` the turn afterward. Use `planMemory` if you prefer to apply the write asynchronously.
+This is what the [`memory` call option](#built-in-chat-memory-17) automates — do it by hand when you need custom recall placement or synchronous writes. Recall before the model call, splice the memories into the system prompt, then `remember` the turn afterward. Use `planMemory` if you prefer to apply the write asynchronously.
 
 ```ts title="chat-with-memory.ts"
 import { generateText, type Message } from '@deuz-sdk/core';
