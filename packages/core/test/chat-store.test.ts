@@ -137,6 +137,7 @@ describe('applyUIPart — the pure turn reducer (P6 core)', () => {
       toolCallId: 't1',
       toolName: 'pay',
       input: {},
+      token: 'v1.signed.token',
     });
     turn = applyUIPart(turn, { type: 'cost', costUsd: 0.42, cacheSavingsUsd: 0.1 });
     turn = applyUIPart(turn, { type: 'budget-exceeded', kind: 'usd', limit: 0.4, value: 0.42 });
@@ -152,7 +153,7 @@ describe('applyUIPart — the pure turn reducer (P6 core)', () => {
     });
 
     expect(turn.approvals).toEqual([
-      { approvalId: 'a1', toolCallId: 't1', toolName: 'pay', input: {} },
+      { approvalId: 'a1', toolCallId: 't1', toolName: 'pay', input: {}, token: 'v1.signed.token' },
     ]);
     expect(turn.message.toolCalls![0]!.state).toBe('approval-requested');
     expect(turn.costUsd).toBe(0.42);

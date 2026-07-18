@@ -151,6 +151,10 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
             toolCallId: part.toolCallId,
             toolName: part.toolName,
             input: part.input,
+            ...('token' in part && part.token ? { token: part.token } : {}),
+            ...('agentPath' in part && Array.isArray(part.agentPath)
+              ? { agentPath: part.agentPath as string[] }
+              : {}),
           },
         ],
       };
