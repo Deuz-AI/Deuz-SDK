@@ -66,20 +66,6 @@ Most SDK readmes open with a benchmark they win. This one opens with the one we 
 
 The honest read of the chart: **the gap to the top is community and breadth, not architecture.** The scenario 1.7 targeted — chatbot — already ties for 5th (76, with LlamaIndex). The score moved 67.6 → 69.6 while the rank went 13/15 → 14/16 only because Mastra entered the panel at 73.0. The CLI column (68) is what 1.8 is for.
 
-## The cost of the box
-
-The chart we _don't_ trail anyone on:
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Deuz-AI/Deuz-SDK/main/assets/footprint-dark.png?v=1.7.0">
-  <img alt="Measured install footprint on a log scale: installed size and cold-import time for @deuz-sdk/core (3.53 MB, 26.7 ms) vs ai, @mastra/core, langchain, llamaindex, and @openai/agents (up to 116 MB, 769 ms)" src="https://raw.githubusercontent.com/Deuz-AI/Deuz-SDK/main/assets/footprint.png?v=1.7.0">
-</picture>
-
-**3.53 MB installed. 1 package. 26.7 ms to import** — 3.8–33× less disk and 3.8–29× faster cold-import than the other TypeScript AI SDKs, measured on the same machine with the same procedure ([`bench/results.json`](./bench/results.json)). 1.7 grew the bundle 2.4 → 3.5 MB — the whole chatbot stack (persistence, wire v2, failover) costs a megabyte — and cold import still got _faster_ (50 → 27 ms). Regenerate everything: `python bench/measure.py && python bench/chart.py` ([methodology](./bench)).
-
-> [!NOTE]
-> These are _bare-package_ installs, which favors the frameworks — `ai` and `langchain` still need separate provider packages to reach the six provider families this package ships built in. And footprint is not a quality score: it measures what you pay before your first token. The [comparison table](#how-it-compares) covers what each framework can do.
-
 ## Six things even the Vercel AI SDK doesn't have
 
 The benchmark dings us on community and breadth. It doesn't measure what the architecture buys — six capabilities that live **inside this library**, each verified against AI SDK 7's official docs and issue tracker (2026-07); the links are the receipts. No gateway, no hosted runtime, no Redis requirement.
@@ -351,7 +337,7 @@ Feature cells verified against each project's official docs and the npm registry
 
 **Nothing recorded by default.** Content capture is opt-in per field, always redacted, and regression-tested against planted secrets.
 
-**Nothing inflated by default.** The benchmark above scores us 14th of 16 with a published rubric; the footprint chart is measured, not estimated. Receipts over adjectives.
+**Nothing inflated by default.** The benchmark above scores us 14th of 16 with a published rubric — measured, not estimated. Receipts over adjectives.
 
 ## One core package, 29 subpaths (+ `@deuz-sdk/react`)
 
