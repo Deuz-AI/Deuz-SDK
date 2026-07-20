@@ -62,7 +62,7 @@ Most SDK readmes open with a benchmark they win. This one opens with the one we 
   <img alt="Self-assessed 100-point benchmark of 16 AI SDKs across 5 scenarios (chatbot, CLI, coding agent, ASI, AGI): Vercel AI SDK leads at 85.2; Deuz SDK ranks 14th of 16 at 69.6 overall and ties for 5th in the chatbot scenario at 76" src="https://raw.githubusercontent.com/Deuz-AI/Deuz-SDK/main/assets/benchmark.png?v=1.7.0">
 </picture>
 
-**69.6 / 100 — 14th of 16, scored by us, with the same rubric as everyone else.** 16 SDKs × 5 scenarios (chatbot, CLI, coding agent, ASI, AGI) × 6 weighted criteria (features 25% · DX 20% · performance 15% · community 15% · flexibility 15% · price 10%). The community criterion is log-scale and merciless: at 336 npm downloads/week and 2 stars, Deuz takes a flat 22 in every scenario — no mercy, on purpose. And every cell is re-derivable: the rubric, the per-criterion breakdowns, the live community numbers and the sources are all published in [`bench/`](./bench).
+**69.6 / 100 — 14th of 16, scored by us, with the same rubric as everyone else.** 16 SDKs × 5 scenarios (chatbot, CLI, coding agent, ASI, AGI) × 6 weighted criteria (features 25% · DX 20% · performance 15% · community 15% · flexibility 15% · price 10%). The community criterion is log-scale and merciless: at 336 npm downloads/week and 2 stars, Deuz takes a flat 22 in every scenario — no mercy, on purpose.
 
 The honest read of the chart: **the gap to the top is community and breadth, not architecture.** The scenario 1.7 targeted — chatbot — already ties for 5th (76, with LlamaIndex). The score moved 67.6 → 69.6 while the rank went 13/15 → 14/16 only because Mastra entered the panel at 73.0. The CLI column (68) is what 1.8 is for.
 
@@ -376,7 +376,7 @@ Adapters never proxy a provider's raw SSE to your code. Everything is normalized
 
 ## Docs
 
-The full documentation site lives in [`docs/`](./docs) — 48 pages covering every module; 1.7 adds [The Unbreakable Chatbot](./docs/content/docs/agents/unbreakable-chatbot.mdx) and [Chat Persistence & State](./docs/content/docs/modules/chat-persistence.mdx). A [Claude Code skill](./skills/deuz-sdk) teaches coding agents to integrate the SDK correctly, per-package changelogs hold release history ([core](./packages/core/CHANGELOG.md) · [react](./packages/react/CHANGELOG.md)), and [`bench/`](./bench) publishes both benchmarks end-to-end — rubric, data, scripts.
+The full documentation site lives in [`docs/`](./docs) — 48 pages covering every module; 1.7 adds [The Unbreakable Chatbot](./docs/content/docs/agents/unbreakable-chatbot.mdx) and [Chat Persistence & State](./docs/content/docs/modules/chat-persistence.mdx). A [Claude Code skill](./skills/deuz-sdk) teaches coding agents to integrate the SDK correctly, and per-package changelogs hold release history ([core](./packages/core/CHANGELOG.md) · [react](./packages/react/CHANGELOG.md)).
 
 ## Contributing
 
