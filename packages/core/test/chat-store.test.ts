@@ -13,6 +13,11 @@ import {
   type ChatRecord,
 } from '../src/chat';
 import { generateText, streamChat } from '../src/index';
+import {
+  createInMemorySessionStore,
+  resumeFromCheckpoint,
+  resumeStreamFromCheckpoint,
+} from '../src/durable';
 import { createAnthropic } from '../src/anthropic';
 import type { Message } from '../src/types/message';
 import type { JSONSchema } from '../src/types/schema';
@@ -369,6 +374,245 @@ describe('ChatStore + auto-persist (P2)', () => {
     expect(result.text).toBe('Done.');
     expect(logger.error).toHaveBeenCalledWith('chat store save failed', expect.anything());
   });
+
+  it('buffered prepareStep rewrites model/checkpoint history but preserves raw ChatStore history', async () => {
+    const chatStore = createInMemoryChatStore();
+    const sessionStore = createInMemorySessionStore();
+    const { fetch, calls } = mockFetchSequence([() => sseResponse([FINAL])]);
+    await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [
+        { role: 'user', content: 'raw history marker' },
+        { role: 'user', content: 'current question' },
+      ],
+      tools: { search: { parameters: SCHEMA, execute: async () => 'unused' } },
+      prepareStep: ({ messages }) => ({ messages: messages.slice(1) }),
+      session: { store: sessionStore, runId: 'prepared-run' },
+      chat: { store: chatStore, chatId: 'prepared-chat', scope: { userId: 'u1' } },
+      deps: { clock: fixedClock },
+    });
+
+    expect(String(calls[0]!.init!.body)).not.toContain('raw history marker');
+    expect(JSON.stringify((await sessionStore.load('prepared-run'))!.messages)).not.toContain(
+      'raw history marker',
+    );
+    expect(JSON.stringify((await chatStore.loadChat('prepared-chat'))!.messages)).toContain(
+      'raw history marker',
+    );
+  });
+
+  it('streaming compaction stays effective for model/checkpoint but raw in ChatStore', async () => {
+    const chatStore = createInMemoryChatStore();
+    const sessionStore = createInMemorySessionStore();
+    const history: Message[] = [
+      { role: 'user', content: 'first question' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'old-tool', name: 'search', input: { q: 'old' } }],
+      },
+      {
+        role: 'tool',
+        content: [
+          { type: 'tool_result', toolUseId: 'old-tool', result: 'raw-secret-result'.repeat(40) },
+        ],
+      },
+      { role: 'user', content: 'follow-up' },
+      { role: 'assistant', content: 'previous answer' },
+      { role: 'user', content: 'current question' },
+    ];
+    const { fetch, calls } = mockFetchSequence([() => sseResponse([FINAL])]);
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: history,
+      tools: { search: { parameters: SCHEMA, execute: async () => 'unused' } },
+      compaction: { threshold: 0, keepRecentSteps: 1, layers: ['prune-tool-results'] },
+      session: { store: sessionStore, runId: 'compact-run' },
+      chat: { store: chatStore, chatId: 'compact-chat', scope: { userId: 'u1' } },
+      deps: { clock: fixedClock },
+    });
+    for await (const _ of result.fullStream) void _;
+
+    expect(String(calls[0]!.init!.body)).not.toContain('raw-secret-result');
+    expect(JSON.stringify((await sessionStore.load('compact-run'))!.messages)).not.toContain(
+      'raw-secret-result',
+    );
+    expect(JSON.stringify((await chatStore.loadChat('compact-chat'))!.messages)).toContain(
+      'raw-secret-result',
+    );
+  });
+
+  it.each(['buffered', 'streaming'] as const)(
+    'durable %s resume loads matching raw history once without loss or duplication',
+    async (surface) => {
+      const sessionStore = createInMemorySessionStore();
+      const innerChat = createInMemoryChatStore();
+      const chatStore = {
+        saveChat: vi.fn((record: ChatRecord) => innerChat.saveChat(record)),
+        loadChat: vi.fn((chatId: string) => innerChat.loadChat(chatId)),
+      };
+      const chat = { store: chatStore, chatId: 'resume-chat', scope: { userId: 'u1' } };
+      const first = mockFetchSequence([() => sseResponse([TOOL_CALL])]);
+      await generateText({
+        model: createAnthropic({ apiKey: 'k', fetch: first.fetch })('claude-opus-4-8'),
+        messages: [
+          { role: 'user', content: 'raw history marker' },
+          { role: 'user', content: 'go' },
+        ],
+        tools: {
+          search: { parameters: SCHEMA, execute: async () => 'found', needsApproval: true },
+        },
+        prepareStep: ({ messages }) => ({ messages: messages.slice(1) }),
+        maxSteps: 5,
+        session: { store: sessionStore, runId: `resume-${surface}` },
+        chat,
+        deps: { clock: fixedClock },
+      });
+      expect(chatStore.loadChat).not.toHaveBeenCalled();
+      expect(
+        JSON.stringify((await sessionStore.load(`resume-${surface}`))!.messages),
+      ).not.toContain('raw history marker');
+
+      const second = mockFetchSequence([() => sseResponse([FINAL])]);
+      const resumeOptions = {
+        model: createAnthropic({ apiKey: 'k', fetch: second.fetch })('claude-opus-4-8'),
+        tools: {
+          search: { parameters: SCHEMA, execute: async () => 'found', needsApproval: true },
+        },
+        approvalResponses: [{ approvalId: 'toolu_1', approved: true }],
+        maxSteps: 5,
+        chat,
+        deps: { clock: fixedClock },
+      };
+      if (surface === 'buffered') {
+        await resumeFromCheckpoint(sessionStore, `resume-${surface}`, resumeOptions);
+      } else {
+        const resumed = resumeStreamFromCheckpoint(
+          sessionStore,
+          `resume-${surface}`,
+          resumeOptions,
+        );
+        for await (const _ of resumed.fullStream) void _;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+
+      expect(chatStore.loadChat).toHaveBeenCalledTimes(1);
+      const saved = (await innerChat.loadChat('resume-chat'))!;
+      expect(saved.messages.map((message) => message.role)).toEqual([
+        'user',
+        'user',
+        'assistant',
+        'tool',
+        'assistant',
+      ]);
+      expect(JSON.stringify(saved.messages).match(/raw history marker/g)).toHaveLength(1);
+    },
+  );
+
+  it('durable resume falls back to checkpoint history when ChatStore has no record', async () => {
+    const sessionStore = createInMemorySessionStore();
+    await sessionStore.save({
+      version: 1,
+      runId: 'missing-chat',
+      stepId: 'missing-chat#1',
+      stepIndex: 1,
+      status: 'suspended',
+      messages: [
+        { role: 'user', content: 'checkpoint-only history' },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'toolu_1', name: 'search', input: { q: 'x' } }],
+        },
+      ],
+      usage: {
+        inputTokens: 1,
+        outputTokens: 1,
+        reasoningTokens: 0,
+        cachedReadTokens: 0,
+        cacheWriteTokens: 0,
+        cacheWrite1hTokens: 0,
+        totalTokens: 2,
+      },
+      createdAt: 1,
+    });
+    const chatStore = createInMemoryChatStore();
+    const loadChat = vi.spyOn(chatStore, 'loadChat');
+    const { fetch } = mockFetchSequence([() => sseResponse([FINAL])]);
+    await resumeFromCheckpoint(sessionStore, 'missing-chat', {
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      tools: {
+        search: { parameters: SCHEMA, execute: async () => 'found', needsApproval: true },
+      },
+      approvalResponses: [{ approvalId: 'toolu_1', approved: true }],
+      chat: { store: chatStore, chatId: 'missing-chat', scope: { userId: 'u1' } },
+      deps: { clock: fixedClock },
+    });
+
+    expect(loadChat).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify((await chatStore.loadChat('missing-chat'))!.messages)).toContain(
+      'checkpoint-only history',
+    );
+  });
+
+  it.each(['scope mismatch', 'load failure'] as const)(
+    'durable resume continues after %s without unsafe ChatStore overwrite',
+    async (failure) => {
+      const sessionStore = createInMemorySessionStore();
+      await sessionStore.save({
+        version: 1,
+        runId: `unsafe-${failure}`,
+        stepId: `unsafe-${failure}#1`,
+        stepIndex: 1,
+        status: 'suspended',
+        messages: [
+          { role: 'user', content: 'resume me' },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'toolu_1', name: 'search', input: { q: 'x' } }],
+          },
+        ],
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          reasoningTokens: 0,
+          cachedReadTokens: 0,
+          cacheWriteTokens: 0,
+          cacheWrite1hTokens: 0,
+          totalTokens: 2,
+        },
+        createdAt: 1,
+      });
+      const saveChat = vi.fn();
+      const loadChat = vi.fn(() => {
+        if (failure === 'load failure') throw new Error('database unavailable');
+        return {
+          chatId: 'unsafe-chat',
+          scope: { userId: 'another-user' },
+          messages: [{ role: 'user' as const, content: 'do not overwrite' }],
+          updatedAt: 1,
+        };
+      });
+      const { fetch } = mockFetchSequence([() => sseResponse([FINAL])]);
+      const logger = makeLogger();
+      const result = await resumeFromCheckpoint(sessionStore, `unsafe-${failure}`, {
+        model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+        tools: {
+          search: { parameters: SCHEMA, execute: async () => 'found', needsApproval: true },
+        },
+        approvalResponses: [{ approvalId: 'toolu_1', approved: true }],
+        chat: {
+          store: { saveChat, loadChat },
+          chatId: 'unsafe-chat',
+          scope: { userId: 'u1' },
+        },
+        deps: { clock: fixedClock, logger },
+      });
+
+      expect(result.text).toBe('Done.');
+      expect(loadChat).toHaveBeenCalledTimes(1);
+      expect(saveChat).not.toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalled();
+    },
+  );
 });
 
 describe('JSONL node store (./chat/node)', () => {

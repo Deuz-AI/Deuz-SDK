@@ -209,7 +209,7 @@ const hits = await recall({ scope, text: 'What does the user eat?' }, seams);
 for (const hit of hits) console.log(hit.score, hit.record.text);
 ```
 
-The `clock` and `generateId` above read `Date.now()` / `crypto.randomUUID()` at your **app** layer — the SDK core never calls them itself.
+The `clock` and `generateId` above make those sources explicit at your **app** layer. If you omit them, `resolveDependencies` supplies equivalent host-clock and WebCrypto defaults; inference code still consumes only the resolved seams.
 
 ## recall
 

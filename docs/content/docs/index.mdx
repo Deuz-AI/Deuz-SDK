@@ -27,7 +27,7 @@ Many AI integrations become hard to test because runtime state, provider-specifi
 
 | Principle | What it means in practice |
 | --- | --- |
-| **Pure core** | No `Date.now()`, `Math.random()`, `process.env`, or `console` in `src/`. Everything stateful — clock, logging, metering, circuit breaker, API keys — is injected through one `Dependencies` seam, so tests are deterministic and replayable. |
+| **Pure core** | No environment-variable or console coupling; inference consumes replaceable seams for clock, ids, logging, metering, circuit breaker, and keys. Documented host defaults remain injectable, so tests are deterministic and replayable. |
 | **Edge-safe** | Only Web APIs (`fetch`, Web Streams, `TextDecoder`, WebCrypto, `atob`/`btoa`). `node:*` and `Buffer` are forbidden by lint; Node-only code lives in dedicated `…/node` subpaths. |
 | **Zero deps** | The chat core ships nothing in `dependencies`. Heavy or stateful things are optional peers or injected seams. |
 | **No vendor lock** | Our own canonical delta stream and our own versioned UI wire. The SDK never proxies a provider's raw SSE bytes to your client. |

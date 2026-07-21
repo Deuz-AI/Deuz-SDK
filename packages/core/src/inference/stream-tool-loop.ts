@@ -36,6 +36,7 @@ import {
   resolveServerApprovals,
   settlePendingApprovals,
   saveCheckpoint,
+  prepareChatPersistence,
   persistChat,
   computeRecallBlock,
   withSystemBlock,
@@ -184,6 +185,13 @@ export function runStreamToolLoop(
         return;
       }
     }
+    const chatPersistence = await prepareChatPersistence(
+      options,
+      deps,
+      messages,
+      internal?.resumeFrom !== undefined || internal?.resumeLoad !== undefined,
+    );
+    let chatMessages = chatPersistence.messages;
     const durable: DurableRunner | undefined =
       options.session && runId !== undefined
         ? {
@@ -312,9 +320,19 @@ export function runStreamToolLoop(
       // their tool-result parts precede the first step-start. A durable
       // sub-agent that re-suspends here suspends THIS run again immediately.
       try {
-        const settled = await settlePendingApprovals(messages, tools, options, extras);
+        const settled = await settlePendingApprovals(messages, tools, options, extras, {
+          beforeExecute: (calls, deniedIds) => {
+            for (const call of calls) {
+              if (!deniedIds.has(call.toolCallId)) {
+                toolState(call.toolCallId, call.toolName, 'executing');
+              }
+            }
+          },
+        });
         if (settled) {
-          appended.push(...settled.messages.slice(messages.length));
+          const settledMessages = settled.messages.slice(messages.length);
+          appended.push(...settledMessages);
+          chatMessages = [...chatMessages, ...settledMessages];
           messages = settled.messages;
           for (const r of settled.results) {
             broadcaster.push({
@@ -324,6 +342,7 @@ export function runStreamToolLoop(
               output: r.result,
               ...(r.isError ? { isError: true } : {}),
             });
+            toolState(r.toolCallId, r.toolName, r.isError ? 'error' : 'complete');
           }
           bumpErrorGuard(
             errorCounters,
@@ -360,7 +379,7 @@ export function runStreamToolLoop(
         // Post-terminal bookkeeping: consumers are already unblocked; the pump
         // (and observation.settled) still awaits the best-effort persist.
         settleMemory(false); // suspended — the turn is incomplete
-        await persistChat(options, deps, messages);
+        await persistChat(options, deps, chatMessages, chatPersistence.writable);
         return;
       }
 
@@ -516,7 +535,7 @@ export function runStreamToolLoop(
               // Same post-terminal bookkeeping as every other exit: the
               // memory promise must settle and completed turns still persist.
               settleMemory(false);
-              await persistChat(options, deps, messages);
+              await persistChat(options, deps, chatMessages, chatPersistence.writable);
               return;
             default:
               break;
@@ -611,10 +630,11 @@ export function runStreamToolLoop(
               durableUsage(durable, totalUsage),
             );
           }
-          // Rebase on the final assistant turn so BOTH the completed
-          // checkpoint and the chat persist see the full history.
+          // Rebase effective model history for the completed checkpoint; the
+          // raw ChatStore history is tracked separately.
           messages = [...messages, assistantMessage];
           appended.push(assistantMessage);
+          chatMessages = [...chatMessages, assistantMessage];
           if (durable) {
             await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
           }
@@ -637,6 +657,7 @@ export function runStreamToolLoop(
         }
         messages = [...messages, assistantMessage];
         appended.push(assistantMessage);
+        chatMessages = [...chatMessages, assistantMessage];
 
         // Approval gate: server mode denies inline; without approveToolCall the
         // gated calls break the loop like client tools (client mode).
@@ -768,6 +789,7 @@ export function runStreamToolLoop(
         };
         messages = [...messages, toolResultMessage];
         appended.push(toolResultMessage);
+        chatMessages = [...chatMessages, toolResultMessage];
 
         const sr = toStepResult(stepData, toolCalls, toolResults, steps.length, toolResultMessage);
         steps.push(sr);
@@ -846,7 +868,7 @@ export function runStreamToolLoop(
       broadcaster.close();
       // Post-terminal bookkeeping — see the suspension path note above.
       settleMemory(suspend === undefined); // extract only for COMPLETED turns
-      await persistChat(options, deps, messages);
+      await persistChat(options, deps, chatMessages, chatPersistence.writable);
     } catch (err) {
       broadcaster.push({ type: 'error', error: err });
       usageDeferred.reject(err);
@@ -863,7 +885,7 @@ export function runStreamToolLoop(
       broadcaster.close();
       settleMemory(false);
       // Completed turns up to the failure still persist (best-effort).
-      await persistChat(options, deps, messages);
+      await persistChat(options, deps, chatMessages, chatPersistence.writable);
     }
   }
 

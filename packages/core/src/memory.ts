@@ -210,6 +210,7 @@ export function matchesScope(rec: MemoryRecord, scope: MemoryScope): boolean {
   if (scope.agentId !== undefined && rec.scope.agentId !== scope.agentId) return false;
   if (scope.runId !== undefined && rec.scope.runId !== scope.runId) return false;
   if (scope.actorId !== undefined && rec.scope.actorId !== scope.actorId) return false;
+  if (scope.chatId !== undefined && rec.scope.chatId !== scope.chatId) return false;
   return true;
 }
 

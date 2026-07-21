@@ -195,7 +195,7 @@ export interface CommonCallOptions {
   session?: DurableSessionOptions;
   /**
    * Chat persistence (1.7 additive, P2): when set, the call auto-persists the
-   * FULL immutable history into `chat.store` at terminal boundaries
+   * FULL raw immutable history into `chat.store` at terminal boundaries
    * (completion, suspension, and mid-stream error) under `chat.chatId` +
    * mandatory `chat.scope`. Store failures log `deps.logger.error` and never
    * kill the run. Setting this routes even tool-less calls through the loop

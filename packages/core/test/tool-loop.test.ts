@@ -760,6 +760,102 @@ describe('tool approval — settle-on-resume (approvalResponses)', () => {
     expect(settledResult).toBeLessThan(firstStepStart); // settle precedes step 1
     expect(types.at(-1)).toBe('finish');
   });
+
+  it('streaming resume emits approved settlement lifecycle in execution order', async () => {
+    const weather = vi.fn(async () => ({ temp: 22 }));
+    const { fetch } = mockFetchSequence([() => sseResponse([ANTHROPIC_FINAL])]);
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: PENDING_HISTORY,
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+      },
+      approvalResponses: [{ approvalId: 'toolu_1', approved: true }],
+      maxSteps: 5,
+    });
+    const lifecycle: string[] = [];
+    for await (const part of result.fullStream) {
+      if (part.type === 'tool-state') lifecycle.push(`state:${part.state}`);
+      if (part.type === 'tool-result') {
+        lifecycle.push(part.isError ? 'result:error' : 'result:ok');
+      }
+    }
+    expect(lifecycle).toEqual(['state:executing', 'result:ok', 'state:complete']);
+  });
+
+  it('streaming resume emits execution failures after executing and before error', async () => {
+    const weather = vi.fn(async () => {
+      throw new Error('weather backend down');
+    });
+    const { fetch } = mockFetchSequence([() => sseResponse([ANTHROPIC_FINAL])]);
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: PENDING_HISTORY,
+      tools: {
+        getWeather: { parameters: SCHEMA, execute: weather, needsApproval: true },
+      },
+      approvalResponses: [{ approvalId: 'toolu_1', approved: true }],
+      maxSteps: 5,
+    });
+    const lifecycle: string[] = [];
+    for await (const part of result.fullStream) {
+      if (part.type === 'tool-state') lifecycle.push(`state:${part.state}`);
+      if (part.type === 'tool-result') {
+        lifecycle.push(part.isError ? 'result:error' : 'result:ok');
+      }
+    }
+    expect(lifecycle).toEqual(['state:executing', 'result:error', 'state:error']);
+  });
+
+  it.each([
+    {
+      name: 'explicit denial',
+      tools: {
+        getWeather: {
+          parameters: SCHEMA,
+          execute: vi.fn(async () => ({ temp: 22 })),
+          needsApproval: true,
+        },
+      },
+      approvalResponses: [{ approvalId: 'toolu_1', approved: false as const }],
+    },
+    {
+      name: 'default denial',
+      tools: {
+        getWeather: {
+          parameters: SCHEMA,
+          execute: vi.fn(async () => ({ temp: 22 })),
+          needsApproval: true,
+        },
+      },
+      approvalResponses: [],
+    },
+    {
+      name: 'missing client result',
+      tools: { getWeather: { parameters: SCHEMA } },
+      approvalResponses: [],
+    },
+  ])(
+    'streaming resume emits $name without an executing state',
+    async ({ tools, approvalResponses }) => {
+      const { fetch } = mockFetchSequence([() => sseResponse([ANTHROPIC_FINAL])]);
+      const result = streamChat({
+        model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+        messages: PENDING_HISTORY,
+        tools,
+        approvalResponses,
+        maxSteps: 5,
+      });
+      const lifecycle: string[] = [];
+      for await (const part of result.fullStream) {
+        if (part.type === 'tool-state') lifecycle.push(`state:${part.state}`);
+        if (part.type === 'tool-result') {
+          lifecycle.push(part.isError ? 'result:error' : 'result:ok');
+        }
+      }
+      expect(lifecycle).toEqual(['result:error', 'state:error']);
+    },
+  );
 });
 
 describe('agentic tool loop (streamChat)', () => {

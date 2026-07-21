@@ -26,7 +26,7 @@ If you know the Vercel AI SDK (`ai` + `@ai-sdk/*`), most of `@deuz-sdk/core` wil
 
 ### No env auto-read — inject the key
 
-The AI SDK auto-reads `process.env.ANTHROPIC_API_KEY` (and friends) inside the provider. `@deuz-sdk/core` is a **pure core**: it never touches `process.env`, `Date.now()`, `Math.random()`, or `console`. Read the key at your app layer and pass it into the factory.
+The AI SDK auto-reads `process.env.ANTHROPIC_API_KEY` (and friends) inside the provider. `@deuz-sdk/core` never reads `process.env` or logs through `console`; it takes keys, logging, clock, and id sources through replaceable seams (with documented host clock/id defaults). Read the key at your app layer and pass it into the factory.
 
 ```ts
 // Vercel AI SDK — key read implicitly from process.env

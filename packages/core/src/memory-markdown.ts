@@ -76,6 +76,7 @@ function serializeRecord(rec: MemoryRecord): string {
     agentId: rec.scope.agentId,
     runId: rec.scope.runId,
     actorId: rec.scope.actorId,
+    chatId: rec.scope.chatId,
     importance: rec.importance,
     embeddingModelId: rec.embeddingModelId,
     createdAt: rec.createdAt,
@@ -129,6 +130,7 @@ const TYPED_KEYS = new Set([
   'agentId',
   'runId',
   'actorId',
+  'chatId',
   'importance',
   'embeddingModelId',
   'createdAt',
@@ -153,6 +155,7 @@ function deserializeRecord(text: string): MemoryRecord | null {
   if (fm.agentId !== undefined) scope.agentId = String(fm.agentId);
   if (fm.runId !== undefined) scope.runId = String(fm.runId);
   if (fm.actorId !== undefined) scope.actorId = String(fm.actorId);
+  if (fm.chatId !== undefined) scope.chatId = String(fm.chatId);
 
   const metadata: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(fm)) if (!TYPED_KEYS.has(k)) metadata[k] = v;

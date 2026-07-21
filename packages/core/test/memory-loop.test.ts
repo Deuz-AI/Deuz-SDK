@@ -36,6 +36,40 @@ function finalTurn(text: string): string {
   ]);
 }
 
+/** Assistant turn that suspends on a client-mode approval. */
+const approvalTurn = sseEvents([
+  {
+    event: 'message_start',
+    data: { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 1 } } },
+  },
+  {
+    event: 'content_block_start',
+    data: {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'rememberSecret' },
+    },
+  },
+  {
+    event: 'content_block_delta',
+    data: {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: '{}' },
+    },
+  },
+  { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
+  {
+    event: 'message_delta',
+    data: {
+      type: 'message_delta',
+      delta: { stop_reason: 'tool_use' },
+      usage: { output_tokens: 5 },
+    },
+  },
+  { event: 'message_stop', data: { type: 'message_stop' } },
+]);
+
 /**
  * Scripted mem0 LLM: the EXTRACTION prompt yields one durable fact; the
  * RECONCILE prompt ADDs every new fact (no id → ADD, mem0 protocol).
@@ -103,6 +137,11 @@ describe('useChat-grade memory × loop (D1)', () => {
 
   it('buffered generateText exposes result.memory the same way', async () => {
     const shared = seams();
+    const memoryLlm = vi.fn(async ({ system }: { system: string; user: string }) =>
+      system.includes('extract durable')
+        ? '{"facts":["User is allergic to peanuts"]}'
+        : '{"memory":[{"text":"User is allergic to peanuts","event":"ADD"}]}',
+    );
     const { fetch } = mockFetch(() => sseResponse([finalTurn('Got it.')]));
     const result = await generateText({
       model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
@@ -110,18 +149,55 @@ describe('useChat-grade memory × loop (D1)', () => {
       memory: {
         seams: {
           ...shared,
-          llm: async ({ system }) =>
-            system.includes('extract durable')
-              ? '{"facts":["User is allergic to peanuts"]}'
-              : '{"memory":[{"text":"User is allergic to peanuts","event":"ADD"}]}',
+          llm: memoryLlm,
         },
         scope: { userId: 'u1' },
       },
       deps: { clock: fixedClock },
     });
     expect(result.text).toBe('Got it.');
+    expect(result.response.messages).toHaveLength(1);
+    expect(result.response.messages[0]).toMatchObject({ role: 'assistant' });
     const mutations = await result.memory!;
     expect(mutations[0]).toMatchObject({ op: 'upsert', event: 'ADD' });
+    const extraction = memoryLlm.mock.calls.find(([prompt]) =>
+      prompt.system.includes('extract durable'),
+    )![0];
+    expect(extraction.user.match(/Got it\./g)).toHaveLength(1);
+  });
+
+  it('buffered suspension exposes a settled empty memory promise unless extraction is disabled', async () => {
+    const shared = seams();
+    const execute = vi.fn(async () => 'done');
+    const { fetch } = mockFetch(() => sseResponse([approvalTurn]));
+    const common = {
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user' as const, content: 'save this' }],
+      tools: {
+        rememberSecret: {
+          parameters: { type: 'object' as const, additionalProperties: false },
+          execute,
+          needsApproval: true,
+        },
+      },
+      deps: { clock: fixedClock },
+    };
+
+    const suspended = await generateText({
+      ...common,
+      memory: { seams: shared, scope: { userId: 'u1' } },
+    });
+    expect(suspended.pendingApprovals).toHaveLength(1);
+    expect(suspended.memory).toBeInstanceOf(Promise);
+    expect(await suspended.memory).toEqual([]);
+    expect(execute).not.toHaveBeenCalled();
+
+    const disabled = await generateText({
+      ...common,
+      memory: { seams: shared, scope: { userId: 'u1' }, extract: false },
+    });
+    expect(disabled.pendingApprovals).toHaveLength(1);
+    expect(disabled.memory).toBeUndefined();
   });
 
   it('recall failure degrades to a bare call; extraction failure resolves []', async () => {

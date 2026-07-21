@@ -22,9 +22,9 @@ import type { AssistantTurnState, UIMessage } from '@deuz-sdk/core/chat';
 import { connectDeuzStream, readDeuzStream } from '@deuz-sdk/core/ui';
 
 /**
- * Fold one wire part via the core reducer. Trivial glue on top: core 1.7.0's
- * `applyUIPart` drops the `token` field of a `tool-approval-request` when it
- * builds the approval entry — re-attach it so verdicts can echo it (D4).
+ * Fold one wire part via the core reducer. Current core versions preserve the
+ * approval token; the defensive re-attach keeps the adapter compatible with
+ * early 1.7.0 builds that dropped it while constructing the approval entry.
  */
 function foldPart(
   turn: AssistantTurnState,

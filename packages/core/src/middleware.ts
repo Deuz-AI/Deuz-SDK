@@ -9,10 +9,10 @@
  *
  * `wrapModel` returns a thin client `{ streamChat, generateText }` whose calls
  * flow through the middleware chain (first listed = outermost) and then into the
- * real free functions. PURE: no globals, no I/O of its own — the bundled
- * middleware (`logging`, `simpleCache`, `redactPII`, `promptInjectionGuard`)
- * only use what you pass in or the injected `deps`. Cross-cutting needs stay out
- * of the core pipeline and become composable, removable layers.
+ * real free functions. It performs no I/O of its own; bundled middleware uses
+ * what you pass in or the injected `deps`, except `simpleCache`'s documented,
+ * injectable host-clock default. Cross-cutting needs stay out of the core
+ * pipeline and become composable, removable layers.
  *
  *   import { wrapModel, logging, simpleCache } from '@deuz-sdk/core/middleware';
  *   const m = wrapModel(anthropic('claude-opus-4-8'), [logging(), simpleCache()]);
@@ -36,9 +36,8 @@ import {
 import { redactValue } from './internal/redact';
 
 /**
- * Default wall-clock for `simpleCache` TTL. This is the SOLE ambient time read
- * in this module (mirrors the `defaultClock` exception in resolve-deps.ts);
- * inject `{ now }` for deterministic tests or edge runtimes that ban it.
+ * API-local wall-clock default for `simpleCache` TTL. Inject `{ now }` for
+ * deterministic tests or runtimes that disallow ambient clock reads.
  */
 // eslint-disable-next-line no-restricted-syntax -- opt-in default clock; injectable via { now }
 const defaultNow = (): number => Date.now();

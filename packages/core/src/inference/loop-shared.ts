@@ -609,6 +609,10 @@ export async function settlePendingApprovals(
   tools: ToolSet,
   options: CommonCallOptions,
   extras?: ExecuteExtras,
+  lifecycle?: {
+    /** Called after denials are known but before approved/server calls execute. */
+    beforeExecute?: (calls: ToolCall[], deniedIds: ReadonlySet<string>) => void;
+  },
 ): Promise<{ messages: Message[]; results: ToolResult[]; deniedIds: Set<string> } | null> {
   // An EMPTY array still settles (default-deny the gated rest) — that is how a
   // durable resume without verdicts answers pending calls on the safe side.
@@ -716,9 +720,11 @@ export async function settlePendingApprovals(
     }
   }
 
+  const deniedIds = new Set(denied.keys());
+  lifecycle?.beforeExecute?.(calls, deniedIds);
   const results = await executeTools(calls, tools, options, messages, denied, extras);
   const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
-  return { messages: [...messages, toolMessage], results, deniedIds: new Set(denied.keys()) };
+  return { messages: [...messages, toolMessage], results, deniedIds };
 }
 
 /**
@@ -1278,7 +1284,48 @@ export function startMemoryExtract(
 }
 
 /**
- * Best-effort chat persistence (1.7, P2): save the FULL immutable history at
+ * ChatStore history must remain the caller's raw transcript even when the
+ * model/checkpoint history is compacted or replaced by `prepareStep`. On a
+ * durable resume, prefer the matching full ChatRecord because the checkpoint
+ * intentionally carries only the effective model history.
+ */
+export async function prepareChatPersistence(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  fallbackMessages: Message[],
+  resumed: boolean,
+): Promise<{ messages: Message[]; writable: boolean }> {
+  const fallback = (): { messages: Message[]; writable: boolean } => ({
+    messages: [...fallbackMessages],
+    writable: true,
+  });
+  const chat = options.chat;
+  if (!chat || !resumed) return fallback();
+
+  try {
+    const record = await chat.store.loadChat(chat.chatId);
+    if (!record) return fallback();
+
+    const scopeKeys = ['userId', 'agentId', 'runId', 'actorId', 'chatId'] as const;
+    const scopeMatches = scopeKeys.every((key) => record.scope[key] === chat.scope[key]);
+    if (record.chatId !== chat.chatId || !scopeMatches) {
+      deps.logger.error('chat store scope mismatch; save skipped', {
+        chatId: chat.chatId,
+      });
+      return { messages: [...fallbackMessages], writable: false };
+    }
+
+    return { messages: [...record.messages], writable: true };
+  } catch (error) {
+    // Loading is best-effort, but saving after an unverifiable load could
+    // overwrite another tenant's history. Continue the run without writing.
+    deps.logger.error('chat store load failed; save skipped', { chatId: chat.chatId, error });
+    return { messages: [...fallbackMessages], writable: false };
+  }
+}
+
+/**
+ * Best-effort chat persistence (1.7, P2): save the FULL raw history at
  * a terminal boundary when `options.chat` is set. A throwing store logs via
  * `deps.logger.error` and never kills the run (SessionStore rule).
  */
@@ -1286,9 +1333,10 @@ export async function persistChat(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
   messages: Message[],
+  writable = true,
 ): Promise<void> {
   const chat = options.chat;
-  if (!chat) return;
+  if (!chat || !writable) return;
   try {
     await chat.store.saveChat({
       chatId: chat.chatId,

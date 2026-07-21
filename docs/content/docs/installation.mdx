@@ -96,7 +96,12 @@ The root export carries the free functions, the client, errors, and all canonica
 | `@deuz-sdk/core/skills/node` | Node filesystem `SkillSource` (`nodeSkillSource`) |
 | `@deuz-sdk/core/mcp` | MCP client over HTTP/SSE (edge-safe) (`createMcpClient`) |
 | `@deuz-sdk/core/mcp/stdio` | MCP client over stdio (Node-only) (`createStdioMcpClient`) |
-| `@deuz-sdk/core/ui` | `toDeuzStreamResponse` (server) + `readDeuzStream` (client) — our own UI wire |
+| `@deuz-sdk/core/chat` | Framework-neutral chat state/reducers, branching helpers, and the scoped `ChatStore` seam |
+| `@deuz-sdk/core/chat/node` | Node JSONL `ChatStore` plus binary-safe chat record codecs |
+| `@deuz-sdk/core/durable` | Checkpoint/resume stores, signed approvals, and durable × resumable chat helpers |
+| `@deuz-sdk/core/observe` | Local observers, composition/filtering, and pure run summaries for the versioned observation protocol |
+| `@deuz-sdk/core/observe/node` | Bounded JSONL observation sink and event reader (Node-only) |
+| `@deuz-sdk/core/ui` | Versioned/resumable Deuz UI wire, stream journaling, reconnect reader, and typed app-data injection |
 | `@deuz-sdk/core/edge` | Guaranteed edge-safe subset (re-exports the Web-API-only surface) |
 | `@deuz-sdk/core/react` | React hooks — `useChat` / `useObject` (React = optional peer `^18 \|\| ^19`) |
 

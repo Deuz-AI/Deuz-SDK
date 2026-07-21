@@ -15,7 +15,7 @@ import type {
 const defaultFetch: typeof fetch = (input, init) => globalThis.fetch(input, init);
 
 const defaultClock: Clock = {
-  // eslint-disable-next-line no-restricted-syntax -- the single allowed Date.now() in core
+  // eslint-disable-next-line no-restricted-syntax -- injectable inference/runtime default clock
   now: () => Date.now(),
   setTimeout: (fn, ms) => {
     const id = globalThis.setTimeout(fn, ms);

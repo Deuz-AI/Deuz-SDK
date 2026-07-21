@@ -1,6 +1,6 @@
 ---
 title: Release Process
-description: The v1.6.1 release gates, versioning flow, and tag-driven npm publish pipeline.
+description: Version-neutral release gates, the Changesets flow, and tag-driven npm publishing with provenance.
 ---
 
 A release is publishable only when the same `npm run release:verify` command passes locally and in CI. The gate includes formatting, lint, TypeScript, runtime tests, type-surface tests, the dual build, package/export verification, browser/edge bundling, bundle-size budgets, and the locked public API contract.
@@ -12,16 +12,35 @@ A release is publishable only when the same `npm run release:verify` command pas
 - **Packed artifact:** build, ESM/CJS imports, tarball hygiene, publint, Are the Types Wrong, browser/edge bundles, size budgets, and API contract.
 - **Documentation:** MDX/type generation and the production Next.js build.
 
-## Publishing
+## Versioning with Changesets
 
-The release workflow runs only for a `v*` tag. It first requires the tag (for example `v1.6.1`) to match `package.json`, runs every release gate again, then publishes to npm with provenance and creates the GitHub release. A normal push to `main` cannot publish.
+Every user-visible change lands with a Changeset. The core and React packages are a fixed version group, so versioning either package keeps both package versions aligned.
+
+1. Add and review a patch/minor Changeset with `npm run changeset`.
+2. When the release is ready, run `npm run version` once, then `npm install --package-lock-only` to synchronize the workspace lockfile. Review the package versions, generated package changelogs, and lockfile together.
+3. Run `npm ci`, `npm ci --prefix docs`, and `npm run release:verify` from the versioned tree.
+4. Commit the generated release files and let the `main` CI pass.
+5. Create and push a `v<package-version>` tag. Do not hand-edit generated package changelogs or run `changeset version` again for the same release.
+
+Bundle thresholds live in `packages/core/tooling/bundle-size-budgets.json`; public subpaths and root declarations are locked in `packages/core/tooling/api-contract.json`. Changing either contract should be an explicit review decision, not an incidental build result.
+
+## Tag-driven publishing
+
+The release workflow runs only for a `v*` tag. It requires the tag to match the core package version, installs the repository's pinned npm version, re-runs every release gate, publishes all unpublished workspace packages with provenance, and creates the GitHub release. A normal push to `main` cannot publish.
 
 ```bash
-npm run release:verify
-git tag v1.6.1
-git push origin v1.6.1
+# Replace <version> with the version already written by Changesets.
+git tag v<version>
+git push origin v<version>
 ```
 
-Changesets remain the version/changelog mechanism for later releases. Bundle thresholds live in `tooling/bundle-size-budgets.json`; public subpaths and root declarations are locked in `tooling/api-contract.json`. Changing either contract should be an explicit review decision, not an incidental build result.
+Trusted publishing (OIDC) is the primary authentication path. Keep all of these values aligned:
+
+- The job runs on a GitHub-hosted runner with Node `>=22.14.0`, npm `11.18.0`, and `permissions.id-token: write`.
+- npm Trusted Publisher is configured separately for both `@deuz-sdk/core` and `@deuz-sdk/react`.
+- Each npm publisher record uses organization/user `Deuz-AI`, repository `Deuz-SDK`, workflow filename `release.yml`, and environment `npm`.
+- The GitHub `npm` environment may hold `NPM_TOKEN` as a fallback. When that secret is absent, the workflow removes setup-node's empty auth-token entry so npm can mint OIDC credentials.
+
+Repository, workflow, and environment names are exact-match inputs to npm's trust policy; renaming one requires updating both sides before the next tag.
 
 API keys and custom gateway URLs are never stored in fixtures or release configuration. Live smoke tests receive them only through process environment variables and must clean temporary state afterward.

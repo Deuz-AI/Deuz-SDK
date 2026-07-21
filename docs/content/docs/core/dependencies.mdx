@@ -7,7 +7,7 @@ description: The single DI seam (Dependencies) and createClient — inject fetch
 
 ## The `Dependencies` seam
 
-Every field is optional. Unset fields get a no-op or in-memory default applied by `resolveDependencies`, so `streamChat({ model, messages })` works with zero `deps`. The defaults are the *only* place the core ever reaches an ambient `Date.now()` / `crypto.randomUUID()`.
+Every field is optional. Unset fields get a no-op or in-memory default applied by `resolveDependencies`, so `streamChat({ model, messages })` works with zero `deps`. Inference and runtime orchestration read time and ids only through these resolved seams. A few opt-in helpers have similarly explicit local defaults — for example `simpleCache({ now })` and `createApprovalSigner({ clock })` — and let you replace the host clock for deterministic tests.
 
 | Field | Type | Default | Purpose |
 | --- | --- | --- | --- |

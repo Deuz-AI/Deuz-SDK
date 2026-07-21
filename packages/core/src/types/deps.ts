@@ -9,7 +9,7 @@ import type { Observer } from './observe';
 export interface Dependencies {
   /** HTTP transport. Default: globalThis.fetch (bound). */
   fetch?: typeof fetch;
-  /** Time source — core never calls Date.now() directly. */
+  /** Time source for inference/runtime work. Default: host `Date.now` + timers. */
   clock?: Clock;
   /** Structured logger. Default: no-op. */
   logger?: Logger;

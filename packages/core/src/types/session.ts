@@ -20,9 +20,10 @@ export type CheckpointStatus = 'running' | 'suspended' | 'completed';
 
 /**
  * A serializable snapshot of an agentic run at a step boundary. `messages` is
- * the full immutable history — the loop never mutates prior arrays, so a
- * stored reference stays valid; persistent stores serialize it (see
- * `serializeCheckpoint` for the binary-part-safe JSON codec).
+ * the effective model history after compaction / `prepareStep`; the loop never
+ * mutates prior arrays, so a stored reference stays valid. ChatStore separately
+ * retains the full raw transcript. Persistent stores serialize checkpoints via
+ * `serializeCheckpoint` for the binary-part-safe JSON codec.
  */
 export interface AgentCheckpoint {
   /** Checkpoint schema version (forward-compat gate for stores). */
@@ -34,7 +35,7 @@ export interface AgentCheckpoint {
   /** Checkpoint boundaries saved so far across ALL legs (monotonic; a suspension boundary counts too). */
   stepIndex: number;
   status: CheckpointStatus;
-  /** Full message history at the boundary (immutable snapshot). */
+  /** Effective model history at the boundary (immutable snapshot). */
   messages: Message[];
   /** CUMULATIVE usage across the whole run (all legs), not just the current call. */
   usage: Usage;

@@ -48,10 +48,18 @@ describe('pure helpers', () => {
   });
 
   it('matchesScope is exact-match on present fields', () => {
-    const rec = { scope: { userId: 'u1', agentId: 'a1' } } as MemoryRecord;
+    const rec = { scope: { userId: 'u1', agentId: 'a1', chatId: 'c1' } } as MemoryRecord;
     expect(matchesScope(rec, { userId: 'u1' })).toBe(true);
     expect(matchesScope(rec, { userId: 'u2' })).toBe(false);
     expect(matchesScope(rec, { runId: 'r1' })).toBe(false);
+    expect(matchesScope(rec, { userId: 'u1', chatId: 'c1' })).toBe(true);
+    expect(matchesScope(rec, { userId: 'u1', chatId: 'c2' })).toBe(false);
+    expect(
+      matchesScope({ scope: { userId: 'u1' } } as MemoryRecord, {
+        userId: 'u1',
+        chatId: 'c1',
+      }),
+    ).toBe(false);
   });
 
   it('isExpired honors expiresAt vs now', () => {
@@ -76,6 +84,47 @@ describe('pure helpers', () => {
     const rec = { updatedAt: 1_000_000, importance: 0.5 } as MemoryRecord;
     const s = defaultMemoryScorer.score(rec, { now: 1_000_000, relevance: 1 });
     expect(s).toBeCloseTo(1 + 0.5 + 1, 5); // recency≈1 (0h), importance 0.5, relevance 1
+  });
+});
+
+describe('createInMemoryMemoryStore scope isolation', () => {
+  it('isolates get/search/list by chatId while broad scopes include legacy records', async () => {
+    const store = createInMemoryMemoryStore();
+    const record = (id: string, scope: MemoryRecord['scope']): MemoryRecord => ({
+      id,
+      text: 'shared fact',
+      hash: `h:${id}`,
+      kind: 'semantic',
+      scope,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    await store.upsert([
+      record('chat-a', { userId: 'u1', chatId: 'a' }),
+      record('chat-b', { userId: 'u1', chatId: 'b' }),
+      record('legacy', { userId: 'u1' }),
+    ]);
+
+    expect(await store.get('chat-a', { userId: 'u1', chatId: 'b' })).toBeNull();
+    expect(await store.get('legacy', { userId: 'u1', chatId: 'a' })).toBeNull();
+    expect((await store.get('chat-a', { userId: 'u1', chatId: 'a' }))?.id).toBe('chat-a');
+
+    const chatSearch = await store.search({
+      scope: { userId: 'u1', chatId: 'a' },
+      text: 'shared',
+    });
+    expect(chatSearch.map((hit) => hit.record.id)).toEqual(['chat-a']);
+    expect((await store.list({ userId: 'u1', chatId: 'a' })).map((item) => item.id)).toEqual([
+      'chat-a',
+    ]);
+
+    const broadSearch = await store.search({ scope: { userId: 'u1' }, text: 'shared' });
+    expect(broadSearch.map((hit) => hit.record.id)).toEqual(['chat-a', 'chat-b', 'legacy']);
+    expect((await store.list({ userId: 'u1' })).map((item) => item.id)).toEqual([
+      'chat-a',
+      'chat-b',
+      'legacy',
+    ]);
   });
 });
 

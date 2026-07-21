@@ -209,9 +209,10 @@ describe('prepareStep', () => {
     expect(body2.messages).toHaveLength(3); // trimmed base + assistant + tool_result
     expect(JSON.stringify(body2.messages[0])).not.toContain('old noise');
     // response.messages still returns exactly what the loop appended
-    expect(res.response.messages).toHaveLength(2);
+    expect(res.response.messages).toHaveLength(3);
     expect(res.response.messages[0]!.role).toBe('assistant');
     expect(res.response.messages[1]!.role).toBe('tool');
+    expect(res.response.messages[2]).toMatchObject({ role: 'assistant' });
   });
 
   it('toolChoice override applies to that step', async () => {

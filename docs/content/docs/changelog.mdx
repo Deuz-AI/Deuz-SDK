@@ -6,6 +6,26 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## 1.7.1
+
+**Memory isolation and settlement.** Chat-scoped memory queries now match `chatId` exactly in both the in-memory and Markdown stores, and Markdown records preserve that field through frontmatter round-trips. A buffered run suspended for approval or a client tool now exposes `result.memory` and settles it to an empty mutation list instead of omitting the field.
+
+**Complete resume lifecycle.** Settled approval and client-tool paths emit the same v2 `tool-state` transitions as the initial execution path, including explicit `complete` and `error` terminals. Negotiated v1 streams continue to omit v2-only state parts.
+
+**Conversation-safe persistence.** `ChatStore` saves the caller's original conversation plus real assistant/tool additions rather than compaction summaries or `prepareStep` prompt rewrites. Durable resume uses a matching stored chat when available and avoids overwriting a record after a load failure or scope mismatch.
+
+**Complete buffered additions.** `result.response.messages` now includes the final text-only assistant turn. Memory extraction consumes that same additions list exactly once. This patch adds no public exports, subpaths, or types.
+
+## 1.7.0
+
+**Persistent, resumable chat.** The new `@deuz-sdk/core/chat` and `/chat/node` surfaces provide a framework-neutral chat reducer, branching helpers, a scoped `ChatStore` seam, and a binary-safe JSONL implementation. Durable checkpoints now combine with the resumable v2 UI wire so a client can replay from `Last-Event-ID`, tail a live producer, or continue a dead run from its last completed boundary.
+
+**Built-in cross-session memory.** Add `memory: { seams, scope }` to recall relevant memories before the first model step and run extract/reconcile/apply after completion. The pipeline is best-effort, non-blocking, scoped, and uses the existing in-library memory seams rather than a hosted service.
+
+**Richer agent UI and controls.** Wire v2 adds monotonic event ids, `StreamStateStore`, typed data parts with optional validation, tool lifecycle state, RAG citations, live USD cost/cache-savings parts, and typed budget-exceeded events. `fallbackModels` and `withFallback` add pre-first-content cross-provider failover backed by the circuit breaker.
+
+**React package.** `@deuz-sdk/react` is the thin React home for the core chat engine, with v2 `useChat`, `useObject`, reconnect/branching flows, signed approval handling, live cost and budget state, plus headless `ToolApprovalCard` and `CostBadge` components. The legacy `@deuz-sdk/core/react` subpath remains available but frozen.
+
 ## 1.6.1
 
 **Redaction final barrier (security fix).** The built-in observation redaction profile now also runs _after_ a custom `redact` hook and after structural truncation — a buggy or malicious redactor can no longer reintroduce a secret into an event, and truncation can never split a secret into a decodable prefix. The JWT pattern additionally catches tokens embedded mid-string.

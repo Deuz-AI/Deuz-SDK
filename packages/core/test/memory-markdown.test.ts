@@ -31,6 +31,7 @@ describe('createMarkdownMemoryStore — Obsidian-style backend', () => {
       rec({
         id: 'a1',
         text: 'The user is vegetarian.',
+        scope: { userId: 'u1', chatId: 'chat-1' },
         metadata: { tags: ['diet'], links: ['[[food]]'] },
       }),
     ]);
@@ -41,19 +42,28 @@ describe('createMarkdownMemoryStore — Obsidian-style backend', () => {
     expect(raw).toContain('id: "a1"');
     expect(raw).toContain('kind: "semantic"');
     expect(raw).toContain('userId: "u1"');
+    expect(raw).toContain('chatId: "chat-1"');
     expect(raw).toContain('tags: ["diet"]');
     expect(raw).toContain('The user is vegetarian.'); // body stays readable
   });
 
   it('round-trips a record through get()', async () => {
     const store = createMarkdownMemoryStore({ dir });
-    await store.upsert([rec({ id: 'a1', text: 'hi', importance: 0.5, metadata: { tags: ['x'] } })]);
+    await store.upsert([
+      rec({
+        id: 'a1',
+        text: 'hi',
+        scope: { userId: 'u1', chatId: 'chat-1' },
+        importance: 0.5,
+        metadata: { tags: ['x'] },
+      }),
+    ]);
     const got = await store.get('a1');
     expect(got).toMatchObject({
       id: 'a1',
       text: 'hi',
       kind: 'semantic',
-      scope: { userId: 'u1' },
+      scope: { userId: 'u1', chatId: 'chat-1' },
       importance: 0.5,
       metadata: { tags: ['x'] },
     });
@@ -64,6 +74,36 @@ describe('createMarkdownMemoryStore — Obsidian-style backend', () => {
     await store.upsert([rec({ id: 'a1', text: 'hi', scope: { userId: 'u1' } })]);
     expect(await store.get('a1', { userId: 'u2' })).toBeNull();
     expect(await store.get('a1', { userId: 'u1' })).not.toBeNull();
+  });
+
+  it('isolates get/search/list by chatId while broad scopes include legacy records', async () => {
+    const store = createMarkdownMemoryStore({ dir, vectors: false });
+    await store.upsert([
+      rec({ id: 'chat-a', text: 'shared fact', scope: { userId: 'u1', chatId: 'a' } }),
+      rec({ id: 'chat-b', text: 'shared fact', scope: { userId: 'u1', chatId: 'b' } }),
+      rec({ id: 'legacy', text: 'shared fact', scope: { userId: 'u1' } }),
+    ]);
+
+    expect(await store.get('chat-a', { userId: 'u1', chatId: 'b' })).toBeNull();
+    expect(await store.get('legacy', { userId: 'u1', chatId: 'a' })).toBeNull();
+    expect((await store.get('chat-a', { userId: 'u1', chatId: 'a' }))?.id).toBe('chat-a');
+
+    const chatSearch = await store.search({
+      scope: { userId: 'u1', chatId: 'a' },
+      text: 'shared',
+    });
+    expect(chatSearch.map((hit) => hit.record.id)).toEqual(['chat-a']);
+    expect((await store.list({ userId: 'u1', chatId: 'a' })).map((item) => item.id)).toEqual([
+      'chat-a',
+    ]);
+
+    const broadSearch = await store.search({ scope: { userId: 'u1' }, text: 'shared' });
+    expect(broadSearch.map((hit) => hit.record.id).sort()).toEqual(['chat-a', 'chat-b', 'legacy']);
+    expect((await store.list({ userId: 'u1' })).map((item) => item.id).sort()).toEqual([
+      'chat-a',
+      'chat-b',
+      'legacy',
+    ]);
   });
 
   it('grep search() ranks substring matches, scoped', async () => {

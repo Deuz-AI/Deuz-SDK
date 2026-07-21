@@ -3,13 +3,13 @@ title: Edge & Runtimes
 description: Why the core is Web-APIs-only, the guaranteed-safe /edge subpath, the Node-only subpaths, and per-runtime notes for Workers, Vercel Edge, Deno, and Bun.
 ---
 
-`@deuz-sdk/core` runs on Web APIs only. There are no `node:*` imports, no `Buffer`, no `process`, and no ambient time or randomness in the core — so the same build ships to Node, Cloudflare Workers, Vercel Edge, Deno, Bun, and the browser. Use the `/edge` subpath when you want a compile-time guarantee that nothing Node-only sneaks into your edge bundle.
+`@deuz-sdk/core` runs on Web APIs only. There are no `node:*` imports, no `Buffer`, and no `process`; clock and id sources are replaceable seams with documented Web-API host defaults. The same build therefore ships to Node, Cloudflare Workers, Vercel Edge, Deno, Bun, and the browser. Use the `/edge` subpath when you want a compile-time guarantee that nothing Node-only sneaks into your edge bundle.
 
 ## What "edge-safe" means here
 
-The core touches only APIs that exist in every modern JS runtime: `fetch`, Web Streams (`ReadableStream`/`TransformStream`), `TextEncoder`/`TextDecoder`, `WebCrypto`, and `atob`/`btoa`. Anything stateful or non-deterministic is injected through the single [`Dependencies`](/docs/core/dependencies) seam instead of being read from the ambient environment — including the HTTP transport (`fetch`), the clock, id generation, logging, tracing, and key resolution.
+The core touches only APIs that exist in every modern JS runtime: `fetch`, Web Streams (`ReadableStream`/`TransformStream`), `TextEncoder`/`TextDecoder`, WebCrypto, timers, and `atob`/`btoa`. Anything stateful or non-deterministic used by inference is replaceable through the single [`Dependencies`](/docs/core/dependencies) seam — including the HTTP transport, clock, id generation, logging, tracing, and key resolution. When omitted, the clock and id seams use the host's `Date.now()` and `crypto.randomUUID()`.
 
-The following are banned in the core by lint, and the build fails if they appear:
+The following are banned in ordinary core code by lint, and the build fails if they appear without a narrowly documented default:
 
 | Banned | Use instead |
 | --- | --- |
@@ -17,7 +17,7 @@ The following are banned in the core by lint, and the build fails if they appear
 | `Buffer` | `Uint8Array` / `TextEncoder` |
 | `process` (incl. `process.env`) | inject config; read env at the app layer |
 | `__dirname` / `__filename` | not available at the edge |
-| `Date.now()` | `deps.clock.now()` |
+| `Date.now()` | `deps.clock.now()` (or an explicitly injectable helper default) |
 | `Math.random()` | inject randomness via `Dependencies` |
 | `crypto.randomUUID()` / `crypto.getRandomValues()` | `deps.generateId()` |
 | `console.*` | `deps.logger` |

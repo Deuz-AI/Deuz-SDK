@@ -1,5 +1,13 @@
 # @deuz-sdk/core
 
+## 1.7.1
+
+### Patch Changes
+
+- Harden chat and memory correctness without changing the public API. Chat-scoped memories are now isolated consistently across in-memory and Markdown stores, suspended buffered runs settle their memory result, and resumed tool calls emit complete lifecycle state.
+
+  Chat persistence now preserves the caller's unmodified conversation instead of compaction or `prepareStep` rewrites, while buffered `response.messages` includes the final text-only assistant turn exactly once.
+
 ## 1.7.0
 
 ### Minor Changes

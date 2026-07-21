@@ -231,21 +231,47 @@ await runCodingTask('Fix the failing integration test in checkout.spec.ts', cont
 
 A user abort resolves the call with `finishReason: 'aborted'` and partial usage — it is not a thrown error.
 
-## 7. What is NOT durable yet
+## 7. Durable restarts
 
-If the process crashes mid-run — the orchestrator's Node process dies, the machine loses power — **the loop does not resume**. There is no checkpoint of in-flight steps; a crash loses whatever wasn't already captured in `result.response.messages` from a completed step. Durable checkpoint/resume across a process restart is planned for 1.5 and does not exist today.
+Durable checkpoint/resume has shipped since 1.5. Pass `session: { store, runId }` to either agentic entry point and the loop saves an `AgentCheckpoint` after every completed step boundary. Back `SessionStore` with durable storage (Redis, a database, a Durable Object, and so on) if the checkpoint must survive a process restart; `createInMemorySessionStore()` is only a single-process reference implementation.
 
-Until then:
+```ts title="durable-coding-agent.ts"
+import { generateText } from '@deuz-sdk/core';
+import { resumeFromCheckpoint } from '@deuz-sdk/core/durable';
 
-- Bound every run with `stopWhen` budgets and a sane `maxSteps` (as above) so a stuck loop fails cheap instead of running away.
-- Keep tools **idempotent** where you can — `applyPatch` and `writeFile` in particular should tolerate being re-applied to the same state, since a restarted run has no memory of exactly how far the last one got.
-- Persist your own task/sub-task bookkeeping outside the SDK if you need to resume a multi-hour job after a crash; the SDK gives you the loop, not a job queue.
+// Persist this application-level id with the task/job record.
+const runId = 'coding:issue-4821';
 
-Do not build on the assumption that an in-flight tool-loop run survives a process restart.
+const firstLeg = await generateText({
+  model: orchestratorModel,
+  messages: [{ role: 'user', content: task }],
+  tools: { coder },
+  maxSteps: 30,
+  stopWhen: [totalTokensExceed(500_000), costExceeds(5.0)],
+  deps: { priceProvider: myPriceProvider },
+  compaction: 'auto',
+  session: { store: sessionStore, runId },
+});
+
+// In a later process, after loading the same persistent SessionStore:
+const resumed = await resumeFromCheckpoint(sessionStore, runId, {
+  model: orchestratorModel,
+  tools: { coder },
+  maxSteps: 30,
+  stopWhen: [totalTokensExceed(500_000), costExceeds(5.0)],
+  deps: { priceProvider: myPriceProvider },
+  compaction: 'auto',
+});
+```
+
+A checkpoint is intentionally a **completed-step** recovery unit, not an in-flight transaction. If the process dies while a tool is running, resume re-drives that step, so filesystem and shell tools should still be idempotent or carry their own operation ids. A suspended approval can be continued through `approvalResponses`; with no verdict, pending gated calls default to deny.
+
+Use [`ChatStore`](/docs/modules/chat-persistence) alongside `SessionStore` when you also need a user-facing, unmodified conversation record. Checkpoints preserve the effective execution history needed to continue the model; chat persistence preserves the original conversation plus actual assistant/tool additions.
 
 ## See also
 
 - [Sub-agents](/docs/agents/subagents) — `agentTool`, `agentPath`, approval inheritance, and usage attribution in depth.
 - [Defining tools](/docs/agents/tools) — the full `Tool` shape, `needsApproval`, budget stop conditions.
 - [Context compaction](/docs/core/compaction) — the three-layer `compaction: 'auto'` policy this cookbook relies on for long runs.
+- [Durable runtime](/docs/agents/durable-runtime) — persistent checkpoints, resume semantics, and signed approvals.
 - [The agentic tool loop](/docs/agents/tool-loop) — the invariants (self-healing, immutable history, runaway guards) that both the orchestrator and `coder` run under.

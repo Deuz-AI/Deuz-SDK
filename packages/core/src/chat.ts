@@ -358,7 +358,7 @@ export interface ChatRecord {
   chatId: string;
   /** Ownership/tenancy — REQUIRED, aligned with the memory scope model. */
   scope: MemoryScope;
-  /** Full immutable history (the loops never mutate prior arrays). */
+  /** Full raw chat history, before model-only compaction / prepareStep rewrites. */
   messages: Message[];
   /** Branch lineage (edit-and-resend can fork a chat; optional). */
   parentId?: string;
@@ -370,9 +370,10 @@ export interface ChatRecord {
  * Chat persistence seam (SessionStore pattern: implement against any backend
  * — Supabase table, Redis, fs). The loops call `saveChat` at terminal
  * boundaries when `options.chat` is set; a throwing store logs via
- * `deps.logger.error` and never kills the run. `appendMessages` is an
- * OPTIONAL diff-append fast path — when absent, `saveChat` receives the full
- * history every time.
+ * `deps.logger.error` and never kills the run. `saveChat` receives a complete
+ * record containing the caller's original history plus this call's persisted
+ * assistant/tool additions. On durable resume, the loops may call `loadChat`
+ * once and use a scope-matching record as the persistence base.
  */
 export interface ChatStore {
   saveChat(record: ChatRecord): void | Promise<void>;

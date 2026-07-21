@@ -28,6 +28,7 @@ import {
   settlePendingApprovals,
   setupDurable,
   saveCheckpoint,
+  prepareChatPersistence,
   persistChat,
   computeRecallBlock,
   withSystemBlock,
@@ -92,6 +93,13 @@ export async function runToolLoop(
   // the streaming loop reports on a resume leg (loop-symmetry invariant).
   const stepBase = internal?.resumeFrom?.stepIndex ?? 0;
   let messages: Message[] = [...options.messages];
+  const chatPersistence = await prepareChatPersistence(
+    options,
+    deps,
+    messages,
+    internal?.resumeFrom !== undefined,
+  );
+  let chatMessages = chatPersistence.messages;
   // Messages this call appends — returned as response.messages. Tracked as a
   // list (not a base-length slice) so prepareStep/compaction history rewrites
   // can never skew what the caller receives.
@@ -168,16 +176,15 @@ export async function runToolLoop(
         suspend,
       });
     }
-    await persistChat(options, deps, messages);
+    await persistChat(options, deps, chatMessages, chatPersistence.writable);
     const result = finish();
-    // Memory extraction (1.7, D1): non-blocking; suspended runs skip it
-    // (the turn is incomplete until the resume leg finishes it). The final
-    // no-tool assistant turn is not in `appended` — include it explicitly.
-    const extractionTurns = [...appended];
-    if (lastStep && lastStep.toolUseParts.length === 0) {
-      extractionTurns.push(lastStep.assistantMessage);
-    }
-    const memoryPromise = suspend ? undefined : startMemoryExtract(options, deps, extractionTurns);
+    // Memory extraction (1.7, D1): non-blocking. Suspended runs skip the
+    // incomplete turn but retain a settled empty promise for stream parity.
+    const memoryPromise = suspend
+      ? options.memory && options.memory.extract !== false
+        ? Promise.resolve([])
+        : undefined
+      : startMemoryExtract(options, deps, appended);
     if (memoryPromise) result.memory = memoryPromise;
     // Settlement (1.6.1): the cost enrichment was registered synchronously
     // inside endLoopObserve above — settled() drains it.
@@ -205,7 +212,9 @@ export async function runToolLoop(
       const settled = await settlePendingApprovals(messages, tools, options, extras);
       if (settled) {
         messages = settled.messages;
-        appended.push(settled.messages.at(-1)!);
+        const toolMessage = settled.messages.at(-1)!;
+        appended.push(toolMessage);
+        chatMessages = [...chatMessages, toolMessage];
         bumpErrorGuard(
           errorCounters,
           settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
@@ -314,9 +323,11 @@ export async function runToolLoop(
             durableUsage(durable, totalUsage),
           );
         }
-        // Rebase on the final assistant turn so BOTH the completed checkpoint
-        // and the chat persist see the full history.
+        // Rebase effective model history for the completed checkpoint; the
+        // raw ChatStore history and response delta are tracked separately.
         messages = [...messages, step.assistantMessage];
+        appended.push(step.assistantMessage);
+        chatMessages = [...chatMessages, step.assistantMessage];
         if (durable) {
           await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
         }
@@ -330,6 +341,7 @@ export async function runToolLoop(
       }));
       messages = [...messages, step.assistantMessage]; // assistant FIRST (OpenAI ordering)
       appended.push(step.assistantMessage);
+      chatMessages = [...chatMessages, step.assistantMessage];
 
       // Approval gate: server mode denies inline; without approveToolCall the
       // gated calls break the loop like client tools (client mode).
@@ -448,6 +460,7 @@ export async function runToolLoop(
       };
       messages = [...messages, toolResultMessage]; // EVERY tool_use answered (Anthropic 400 guard)
       appended.push(toolResultMessage);
+      chatMessages = [...chatMessages, toolResultMessage];
 
       const sr = toStepResult(step, toolCalls, toolResults, steps.length, toolResultMessage);
       steps.push(sr);

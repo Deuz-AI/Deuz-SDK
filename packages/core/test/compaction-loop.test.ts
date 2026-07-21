@@ -138,12 +138,12 @@ describe('compaction wired into the loop', () => {
       maxSteps: 5,
     });
     expect(res.text).toBe('Done.');
-    // Pre-existing loop contract: response.messages carries the appended
-    // assistant tool turn + tool result; the final text-only assistant rides
-    // res.text/res.steps, not response.messages.
-    expect(res.response.messages).toHaveLength(2);
+    // response.messages carries every turn appended by this call, including
+    // the terminal text-only assistant message.
+    expect(res.response.messages).toHaveLength(3);
     expect(res.response.messages[0]!.role).toBe('assistant');
     expect(res.response.messages[1]!.role).toBe('tool');
+    expect(res.response.messages[2]).toMatchObject({ role: 'assistant' });
   });
 
   it('prune layers compact the prior history before each step; question survives; response.messages stays correct', async () => {
@@ -173,10 +173,11 @@ describe('compaction wired into the loop', () => {
     expect(body0).toContain('Current question.');
 
     // response.messages is unaffected by the history rewrite — only what this
-    // call appended (assistant tool turn + tool result).
-    expect(res.response.messages).toHaveLength(2);
+    // call appended (assistant tool turn + tool result + final assistant).
+    expect(res.response.messages).toHaveLength(3);
     expect(res.response.messages[0]!.role).toBe('assistant');
     expect(res.response.messages[1]!.role).toBe('tool');
+    expect(res.response.messages[2]).toMatchObject({ role: 'assistant' });
   });
 
   it('summarize side-call folds its usage into the total and compacts the wire', async () => {
