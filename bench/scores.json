@@ -3,14 +3,20 @@
   "date": "2026-07-22",
   "deuzVersion": "1.8.0-pre (code-verified; package.json still 1.7.1 pending release)",
   "methodology": {
-    "scenarios": ["Chatbot", "CLI", "Coding Agent", "ASI (long-horizon autonomous)", "AGI (general flexibility)"],
+    "scenarios": [
+      "Chatbot",
+      "CLI",
+      "Coding Agent",
+      "ASI (long-horizon autonomous)",
+      "AGI (general flexibility)"
+    ],
     "criteria": {
       "features": 0.25,
-      "dx": 0.20,
+      "dx": 0.2,
       "performance": 0.15,
       "community": 0.15,
       "flexibility": 0.15,
-      "price": 0.10
+      "price": 0.1
     },
     "anchors": "90-100 market leader · 70-89 strong/production-ready · 50-69 usable but gappy · 30-49 weak/indirect · 0-29 unsupported. Community is log-scale (~16M npm/week → 95; 100k → 70; 1k → 35; <500 → 15-25). CLI scenario favors installable tools; libraries are scored on suitability for building one. Unmeasured performance scores are architecture-based estimates.",
     "provenance": "Competitor criterion scores carried from 2026-07-20 panel unless material product change (Vercel AI SDK harnesses/sandbox/WorkflowAgent; Mastra Workspace + AgentBrowser + CodeMode + E2B). Deuz re-scored from scratch against local 1.8.0 autonomy surface (workspace, compute/CodeAct, planTasks/verifyStep, runtime, browser, ./providers, ./testing, azure/bedrock). Community numbers re-fetched live 2026-07-22 (npm downloads API + GitHub API)."
@@ -49,11 +55,51 @@
         "asi": "F88 D86 P78 C95 E88 $72 — WorkflowAgent durable steps + needsApproval; OPA policy package; ecosystem gravity"
       }
     },
-    { "name": "OpenAI SDK + Agents", "chatbot": 84, "cli": 84, "coding": 78, "asi": 83, "agi": 85, "average": 82.8 },
-    { "name": "Anthropic SDK + Agent SDK", "chatbot": 79, "cli": 85, "coding": 84, "asi": 83, "agi": 81, "average": 82.4 },
-    { "name": "LangChain + LangGraph", "chatbot": 81, "cli": 79, "coding": 72, "asi": 88, "agi": 83, "average": 80.6 },
-    { "name": "Claude Code", "chatbot": 53, "cli": 90, "coding": 88, "asi": 82, "agi": 77, "average": 78.0 },
-    { "name": "OpenAI Codex CLI", "chatbot": 52, "cli": 89, "coding": 88, "asi": 80, "agi": 79, "average": 77.6 },
+    {
+      "name": "OpenAI SDK + Agents",
+      "chatbot": 84,
+      "cli": 84,
+      "coding": 78,
+      "asi": 83,
+      "agi": 85,
+      "average": 82.8
+    },
+    {
+      "name": "Anthropic SDK + Agent SDK",
+      "chatbot": 79,
+      "cli": 85,
+      "coding": 84,
+      "asi": 83,
+      "agi": 81,
+      "average": 82.4
+    },
+    {
+      "name": "LangChain + LangGraph",
+      "chatbot": 81,
+      "cli": 79,
+      "coding": 72,
+      "asi": 88,
+      "agi": 83,
+      "average": 80.6
+    },
+    {
+      "name": "Claude Code",
+      "chatbot": 53,
+      "cli": 90,
+      "coding": 88,
+      "asi": 82,
+      "agi": 77,
+      "average": 78.0
+    },
+    {
+      "name": "OpenAI Codex CLI",
+      "chatbot": 52,
+      "cli": 89,
+      "coding": 88,
+      "asi": 80,
+      "agi": 79,
+      "average": 77.6
+    },
     {
       "name": "Mastra",
       "chatbot": 75,
@@ -71,7 +117,15 @@
         "agi": "F78 D74 P58 C80 E86 $80 — 600+ model router; memory/RAG packages; browser + sandbox breadth"
       }
     },
-    { "name": "Google Gemini CLI", "chatbot": 51, "cli": 85, "coding": 85, "asi": 77, "agi": 75, "average": 74.6 },
+    {
+      "name": "Google Gemini CLI",
+      "chatbot": 51,
+      "cli": 85,
+      "coding": 85,
+      "asi": 77,
+      "agi": 75,
+      "average": 74.6
+    },
     {
       "name": "Deuz SDK",
       "chatbot": 77,
@@ -91,13 +145,69 @@
       "previousAverage": 69.6,
       "delta": "+4.4 vs 2026-07-20 (1.7.0): chatbot 76→77, CLI 68→72, coding 61→71, ASI 74→77, AGI 69→73 · rank 14→9"
     },
-    { "name": "Google Gemini SDK", "chatbot": 75, "cli": 76, "coding": 63, "asi": 66, "agi": 80, "average": 72.0 },
-    { "name": "LlamaIndex", "chatbot": 76, "cli": 72, "coding": 61, "asi": 75, "agi": 75, "average": 71.8 },
-    { "name": "Moonshot Kimi", "chatbot": 60, "cli": 79, "coding": 77, "asi": 71, "agi": 66, "average": 70.6 },
-    { "name": "CrewAI", "chatbot": 65, "cli": 76, "coding": 64, "asi": 75, "agi": 72, "average": 70.4 },
-    { "name": "Alibaba Qwen", "chatbot": 64, "cli": 77, "coding": 74, "asi": 65, "agi": 69, "average": 69.8 },
-    { "name": "DeepSeek API/SDK", "chatbot": 59, "cli": 62, "coding": 55, "asi": 56, "agi": 59, "average": 58.2 },
-    { "name": "Zhipu GLM SDK", "chatbot": 57, "cli": 61, "coding": 53, "asi": 51, "agi": 62, "average": 56.8 }
+    {
+      "name": "Google Gemini SDK",
+      "chatbot": 75,
+      "cli": 76,
+      "coding": 63,
+      "asi": 66,
+      "agi": 80,
+      "average": 72.0
+    },
+    {
+      "name": "LlamaIndex",
+      "chatbot": 76,
+      "cli": 72,
+      "coding": 61,
+      "asi": 75,
+      "agi": 75,
+      "average": 71.8
+    },
+    {
+      "name": "Moonshot Kimi",
+      "chatbot": 60,
+      "cli": 79,
+      "coding": 77,
+      "asi": 71,
+      "agi": 66,
+      "average": 70.6
+    },
+    {
+      "name": "CrewAI",
+      "chatbot": 65,
+      "cli": 76,
+      "coding": 64,
+      "asi": 75,
+      "agi": 72,
+      "average": 70.4
+    },
+    {
+      "name": "Alibaba Qwen",
+      "chatbot": 64,
+      "cli": 77,
+      "coding": 74,
+      "asi": 65,
+      "agi": 69,
+      "average": 69.8
+    },
+    {
+      "name": "DeepSeek API/SDK",
+      "chatbot": 59,
+      "cli": 62,
+      "coding": 55,
+      "asi": 56,
+      "agi": 59,
+      "average": 58.2
+    },
+    {
+      "name": "Zhipu GLM SDK",
+      "chatbot": 57,
+      "cli": 61,
+      "coding": 53,
+      "asi": 51,
+      "agi": 62,
+      "average": 56.8
+    }
   ],
   "notes": [
     "Self-assessed by the Deuz maintainers — rubric, criterion breakdowns and sources published for scrutiny; re-derive any score from the anchors.",
