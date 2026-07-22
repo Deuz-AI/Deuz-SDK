@@ -1,0 +1,62 @@
+{
+  "benchmark": "install-footprint",
+  "date": "2026-07-22",
+  "machine": "nt-py3.14-nodev24.14.1",
+  "procedure": "npm install <pkg> into a clean temp dir; node_modules size/pkg/file counts; cold ESM import median of 5 (1 warmup). @deuz-sdk/core measured from local npm pack (DEUZ_TARBALL) of the 1.8.0 autonomy tree; competitors from registry.",
+  "results": [
+    {
+      "name": "@deuz-sdk/core",
+      "version": "1.7.1+local1.8",
+      "installMB": 4.09,
+      "packageCount": 1,
+      "fileCount": 386,
+      "importMsMedian": 40.3,
+      "installSeconds": 13.9
+    },
+    {
+      "name": "ai",
+      "version": "7.0.34",
+      "installMB": 13.31,
+      "packageCount": 10,
+      "fileCount": 1849,
+      "importMsMedian": 132.1,
+      "installSeconds": 9.1
+    },
+    {
+      "name": "@mastra/core",
+      "version": "1.51.0",
+      "installMB": 116.37,
+      "packageCount": 228,
+      "fileCount": 10950,
+      "importMsMedian": 678.3,
+      "installSeconds": 53.6
+    },
+    {
+      "name": "langchain",
+      "version": "1.5.3",
+      "installMB": 51.14,
+      "packageCount": 21,
+      "fileCount": 5538,
+      "importMsMedian": 765.2,
+      "installSeconds": 37.2
+    },
+    {
+      "name": "llamaindex",
+      "version": "0.12.1",
+      "installMB": 43.86,
+      "packageCount": 42,
+      "fileCount": 4042,
+      "importMsMedian": 546.3,
+      "installSeconds": 27.6
+    },
+    {
+      "name": "@openai/agents",
+      "version": "0.13.5",
+      "installMB": 45.74,
+      "packageCount": 101,
+      "fileCount": 7575,
+      "importMsMedian": 447.1,
+      "installSeconds": 27.7
+    }
+  ]
+}

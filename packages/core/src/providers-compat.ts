@@ -79,6 +79,15 @@ export function createMoonshot(settings: CompatSettings = {}): Provider {
 }
 export const moonshot: Provider = createMoonshot();
 
+/**
+ * Alias for {@link createMoonshot} — same host, provider id `moonshot`
+ * (registry slugs like `kimi-k2`). Prefer this name when branding as Kimi.
+ */
+export function createKimi(settings: CompatSettings = {}): Provider {
+  return createMoonshot(settings);
+}
+export const kimi: Provider = createKimi();
+
 /** Alibaba Qwen via DashScope compatible-mode — OpenAI Chat Completions-compatible wire. */
 export function createQwen(settings: CompatSettings = {}): Provider {
   return createCompat('qwen', settings);

@@ -45,6 +45,8 @@ These options live on `CommonCallOptions`, so they work identically for `generat
 | `stopWhen` | `StopCondition \| StopCondition[]` | — | Extra stop predicate(s), OR-ed with `maxSteps`. |
 | `maxToolConcurrency` | `number` | `5` | Max parallel tool executions per step. |
 | `onStepFinish` | `(step: StepResult) => void` | — | Fires after each step that made tool calls (including approval / client-tool breaks). It does **not** fire for the terminal text-only step that produces the final answer — read that from `result.steps.at(-1)` or the resolved result. |
+| `verifyStep` | `(ctx) => VerifyStepResult \| Promise<…>` | — | **1.8.** Post-completion verifier. A rejection feeds `feedback` back as a user turn and re-drives (separate budget: `maxVerifyAttempts`, default `3`). See [Autonomy](/docs/modules/autonomy). |
+| `maxVerifyAttempts` | `number` | `3` | Cap on verifier re-drives — does not consume `maxSteps`. |
 
 `maxSteps` counts **model turns**, not tool calls. A step that executes three tools in parallel is one step.
 

@@ -43,6 +43,8 @@ import {
   emitStepCompleted,
   observeApprovalRequests,
   observeServerResolutions,
+  evaluateVerifyStep,
+  verifyFeedbackMessage,
   SubAgentSuspension,
   type Denial,
   type ExecuteExtras,
@@ -118,6 +120,9 @@ export async function runToolLoop(
   let stoppedBy: string | undefined;
   let endReason: LoopOutcome['endReason'] = 'natural';
   let suspend: LoopOutcome['suspend'] | undefined;
+  // Verified generation (1.8): attempt counter + final verdict for metadata.
+  let verifyAttempts = 0;
+  let verified: boolean | undefined;
 
   // Mutated per iteration so tool events parent under the current step span;
   // settle-phase executions run step-less under the run span.
@@ -158,9 +163,17 @@ export async function runToolLoop(
         ? { toolCalls: lastToolStep.toolCalls, toolResults: lastToolStep.toolResults }
         : {}),
       ...(pendingApprovals ? { pendingApprovals } : {}),
-      ...(stoppedBy ? { providerMetadata: { deuz: { stoppedBy } } } : {}),
+      ...(deuzMetadata() ? { providerMetadata: { deuz: deuzMetadata()! } } : {}),
       ...(durable ? { runId: durable.runId } : {}),
     };
+  };
+
+  /** SDK-level metadata (`stoppedBy`, `verified`) — undefined when empty. */
+  const deuzMetadata = (): Record<string, unknown> | undefined => {
+    const meta: Record<string, unknown> = {};
+    if (stoppedBy) meta.stoppedBy = stoppedBy;
+    if (verified !== undefined) meta.verified = verified;
+    return Object.keys(meta).length > 0 ? meta : undefined;
   };
 
   /** Terminal observe event + chat persist + result — the single exit for every path. */
@@ -328,6 +341,30 @@ export async function runToolLoop(
         messages = [...messages, step.assistantMessage];
         appended.push(step.assistantMessage);
         chatMessages = [...chatMessages, step.assistantMessage];
+
+        // Verified generation (1.8): a rejected verdict feeds feedback back as
+        // a user turn and re-drives the loop (bounded by maxVerifyAttempts).
+        const verification = await evaluateVerifyStep(options, {
+          stepIndex,
+          attempt: verifyAttempts,
+          text: step.text,
+          messages,
+          usage: durableUsage(durable, totalUsage),
+        });
+        if (verification) {
+          verified = verification.verdict.ok;
+          if (verification.retry) {
+            verifyAttempts += 1;
+            const feedback = verifyFeedbackMessage(verification.verdict);
+            messages = [...messages, feedback];
+            appended.push(feedback);
+            chatMessages = [...chatMessages, feedback];
+            if (durable) {
+              await saveCheckpoint(durable, deps, options, 'running', messages, totalUsage);
+            }
+            continue;
+          }
+        }
         if (durable) {
           await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
         }

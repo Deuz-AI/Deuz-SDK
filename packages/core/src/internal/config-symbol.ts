@@ -23,6 +23,16 @@ export interface ProviderConfig {
   headers?: Record<string, string>;
   /** Present for Vertex AI transports — adapters build Vertex URLs/bodies. */
   vertex?: VertexConfig;
+  /**
+   * Extra query params appended to the wire URL (e.g. Azure OpenAI
+   * `api-version`). Adapters merge these onto the final request URL.
+   */
+  query?: Record<string, string>;
+  /**
+   * Auth header style for OpenAI-compatible wires. Default `'bearer'`
+   * (`Authorization: Bearer <key>`). Azure OpenAI uses `'api-key'`.
+   */
+  authHeader?: 'bearer' | 'api-key';
 }
 
 const CONFIG = Symbol('deuz.providerConfig');

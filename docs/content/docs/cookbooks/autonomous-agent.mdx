@@ -1,0 +1,116 @@
+---
+title: Build your own Manus
+description: A fully autonomous, self-verifying agent — planner → executor → verifier, acting by writing and running code in a sandbox, with externalized workspace memory, durable checkpoints, and a live plan/activity feed. Composed entirely from published Deuz 1.8 primitives.
+---
+
+This cookbook composes the [autonomy primitives](/docs/modules/autonomy) into one concrete build: an agent that takes a goal, **plans** it into sub-tasks, **executes** each by writing and running code against a sandbox and a workspace, **verifies** its own output, and keeps a durable checkpoint so it survives a crash — a Manus-style loop, on the edge-safe core.
+
+Nothing here is a new runtime. It is `planTasks` + `agentTool` + `codeActTool` + a `Workspace` + `verifyStep` + `compaction`/`budget`/`session`, composed the way an autonomous agent needs them. Copy the snippets below into your app (or a script under `packages/core/examples/`) and wire your own model + stores.
+
+## The shape
+
+```
+orchestrator (generateText, verifyStep)
+  └─ tools: { executor: agentTool(...) }
+       └─ executor sub-agent
+            └─ tools: workspace (read/write/list) + codeAct + shell  → ComputeSandbox
+plan.json + artifacts live in the Workspace · checkpoints in the SessionStore · status in the RunStore
+```
+
+## 1. Seams (swap for Docker/E2B + S3 in production)
+
+```ts
+import { createFileWorkspace } from '@deuz-sdk/core/workspace/node';
+import { createNodeSandbox } from '@deuz-sdk/core/compute/node';
+
+const workspace = createFileWorkspace({ root: './.agent-workspace' });
+const sandbox = createNodeSandbox({ allowedLanguages: ['python', 'bash', 'javascript'] });
+```
+
+> **Sandbox, not isolation.** `createNodeSandbox` runs code as a child process of the host — a reference. For untrusted work, back `ComputeSandbox` with Docker/E2B/a microVM (same two methods). See the [autonomy module](/docs/modules/autonomy).
+
+## 2. Plan
+
+```ts
+import { planTasks } from '@deuz-sdk/core/autonomy';
+
+let plan = await planTasks(goal, { model });
+await workspace.write('plan.json', JSON.stringify(plan, null, 2)); // survives restarts
+```
+
+## 3. Executor sub-agent (CodeAct)
+
+```ts
+import { agentTool } from '@deuz-sdk/core';
+import { createWorkspaceTools } from '@deuz-sdk/core/workspace';
+import { codeActTool, shellTool, codeActSystemPrompt } from '@deuz-sdk/core/compute';
+
+const executor = agentTool({
+  name: 'executor',
+  description: 'Executes one sub-task by writing files and running code, then reports what it did.',
+  model,
+  system: codeActSystemPrompt(),
+  tools: {
+    ...createWorkspaceTools(workspace),
+    ...codeActTool(sandbox, { languages: ['python', 'bash', 'javascript'] }),
+    ...shellTool(sandbox),
+  },
+  maxSteps: 12,
+});
+```
+
+## 4. The loop, with a verifier
+
+Drive one task at a time; `verifyStep` re-drives the orchestrator until the sub-task is verifiably complete, and `compaction`/`stopWhen` keep a long run bounded. `session` checkpoints every step so a crash resumes from the last boundary.
+
+```ts
+import { generateText, totalTokensExceed, costExceeds } from '@deuz-sdk/core';
+import { nextPendingTask, setTaskStatus } from '@deuz-sdk/core/autonomy';
+
+for (let task = nextPendingTask(plan); task; task = nextPendingTask(plan)) {
+  plan = setTaskStatus(plan, task.id, 'in_progress');
+
+  const result = await generateText({
+    model,
+    messages: [
+      { role: 'system', content: 'Delegate the current sub-task to the executor tool and confirm completion.' },
+      { role: 'user', content: `Goal: ${goal}\nCurrent sub-task: ${task.title}` },
+    ],
+    tools: { executor },
+    maxSteps: 8,
+    compaction: 'auto',
+    stopWhen: [totalTokensExceed(1_000_000), costExceeds(10)],
+    deps: { priceProvider },
+    session: { store: sessionStore, runId },
+    verifyStep: ({ text, attempt }) =>
+      /\b(done|complete|wrote)\b/i.test(text)
+        ? { ok: true }
+        : { ok: false, feedback: `"${task!.title}" is not verifiably complete — actually perform it and confirm.`, retry: attempt < 2 },
+  });
+
+  const ok = result.providerMetadata?.deuz?.verified !== false;
+  plan = setTaskStatus(plan, task.id, ok ? 'done' : 'failed');
+  await workspace.write('plan.json', JSON.stringify(plan, null, 2));
+}
+```
+
+## 5. Background + live view
+
+Register the run so a dashboard can list it and a worker can continue it if the process dies, and stream a live plan/activity feed to the UI:
+
+```ts
+import { createRunManager, createInMemoryRunStore, emitPlanUpdate, emitActivity } from '@deuz-sdk/core/runtime';
+
+const runs = createRunManager({ store: createInMemoryRunStore() });
+await runs.startRun({ runId, goal });
+// inside a streaming tool: emitPlanUpdate(ctx.emitPart, plan); emitActivity(ctx.emitPart, 'ran tests');
+await runs.setStatus(runId, 'completed');
+```
+
+`useChat` surfaces `plan` and `activity` for a to-do panel and a "Computer" activity feed; `pollStaleRuns` (`@deuz-sdk/core/runtime/node`) + `resumeFromCheckpoint` let a worker continue crashed runs.
+
+## See also
+
+- [Autonomy primitives](/docs/modules/autonomy) — every seam in depth.
+- [Coding agent](/docs/cookbooks/coding-agent) — the orchestrator/sub-agent pattern with an approval gate.
+- [Durable runtime](/docs/agents/durable-runtime) — checkpoint/resume, the backbone of a background run.

@@ -1,0 +1,61 @@
+---
+title: OpenAI-compat hosts
+description: Groq, Mistral, DeepSeek, Kimi, Qwen, and other Chat Completions hosts plus createProviderRegistry.
+---
+
+Every factory below speaks the OpenAI **Chat Completions** wire (`surface: 'chat_completions'`). Import from [`@deuz-sdk/core/providers`](/docs/installation#subpath-exports) (or the dedicated [`azure`](/docs/providers/azure) / [`bedrock`](/docs/providers/bedrock) subpaths).
+
+## Factories at a glance
+
+| Factory | Provider id | Default base URL | Notes |
+| --- | --- | --- | --- |
+| `createGroq` | `groq` | `https://api.groq.com/openai/v1` | LPU cloud |
+| `createMistral` | `mistral` | `https://api.mistral.ai/v1` | La Plateforme |
+| `createDeepSeek` | `deepseek` | `https://api.deepseek.com/v1` | V3 / R1 |
+| `createTogether` | `together` | `https://api.together.xyz/v1` | Open models |
+| `createOpenRouter` | `openrouter` | `https://openrouter.ai/api/v1` | Multi-provider router |
+| `createCerebras` | `cerebras` | `https://api.cerebras.ai/v1` | Wafer-scale |
+| `createFireworks` | `fireworks` | `https://api.fireworks.ai/inference/v1` | Open models |
+| `createMoonshot` / **`createKimi`** | `moonshot` | `https://api.moonshot.ai/v1` | Kimi K2 family (`createKimi` is an alias) |
+| `createQwen` | `qwen` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | DashScope compatible-mode |
+| `createGLM` | `glm` | `https://open.bigmodel.cn/api/paas/v4` | Zhipu BigModel |
+| `createMiniMax` | `minimax` | `https://api.minimax.io/v1` | M2 family |
+| `createAzure` | `azure` | deployment-scoped | See [Azure OpenAI](/docs/providers/azure) — `api-key` + `api-version` |
+| `createBedrock` | `bedrock` | Mantle `…/openai/v1` | See [Amazon Bedrock](/docs/providers/bedrock) — Bearer API key |
+
+Lowercase singletons (`mistral`, `deepseek`, `kimi`, `qwen`, …) are exported unbound — prefer the `create*` factories with an explicit `apiKey` in apps.
+
+## Examples
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import {
+  createMistral,
+  createDeepSeek,
+  createQwen,
+  createKimi,
+  createProviderRegistry,
+} from '@deuz-sdk/core/providers';
+
+const mistral = createMistral({ apiKey: process.env.MISTRAL_API_KEY! });
+const deepseek = createDeepSeek({ apiKey: process.env.DEEPSEEK_API_KEY! });
+const qwen = createQwen({ apiKey: process.env.DASHSCOPE_API_KEY! });
+const kimi = createKimi({ apiKey: process.env.MOONSHOT_API_KEY! }); // same as createMoonshot
+
+const registry = createProviderRegistry({
+  mistral,
+  deepseek,
+  qwen,
+  moonshot: kimi,
+});
+
+const model = registry.model('mistral:mistral-large-latest');
+// or: deepseek:deepseek-v3.2 · qwen:qwen3-max · moonshot:kimi-k2
+
+const result = streamChat({
+  model,
+  messages: [{ role: 'user', content: 'ping' }],
+});
+```
+
+Pinned flagship slugs (tools / context) live in the [model registry](/docs/advanced/model-registry): e.g. `mistral-large-latest`, `deepseek-v3.2`, `qwen3-max`, `kimi-k2`.

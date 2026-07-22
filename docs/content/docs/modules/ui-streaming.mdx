@@ -25,7 +25,7 @@ import {
 
 The version an SSE response speaks is stamped in its `x-deuz-stream` response header. `DEUZ_STREAM_VERSION` is `'v2'` (the default emitted); `DEUZ_STREAM_VERSIONS` is `['v1', 'v2']`.
 
-- **v2** frames each event as `id: <seq>\ndata: <json>\n\n` and may carry the v2-only part types (`data-{name}`, `citation`, `tool-state`, `cost`, `budget-exceeded`).
+- **v2** frames each event as `id: <seq>\ndata: <json>\n\n` and may carry the v2-only part types (`data-{name}`, `citation`, `tool-state`, `cost`, `budget-exceeded`, `plan-update`, `activity`).
 - **v1** output is **byte-identical to pre-1.7 releases**: no `id:` lines, and v2-only parts are dropped entirely (recursively — a v2-only part inside a `sub-agent` frame is just as invisible).
 
 `negotiateDeuzStreamVersion(source)` picks the version from the client's `x-deuz-stream` *request* header: only an explicit `v1` downgrades — anything else, including no header at all, gets v2 (v1 clients never sent the header, and v2's additions are invisible to them). It accepts a `Request`, `Headers`, the raw header string, or `null`.
@@ -311,6 +311,8 @@ export async function POST(req: Request): Promise<Response> {
 | `tool-state` **(v2)** | `toolCallId`, `toolName?`, `state: ToolRunState` | Tool lifecycle transition — render live status without re-deriving it from part ordering. States: `input-streaming`, `input-complete`, `awaiting-approval`, `executing`, `complete`, `error`. |
 | `cost` **(v2)** | `costUsd`, `deltaUsd?`, `cacheSavingsUsd?`, `stepIndex?` | Live cumulative USD cost, one per step when `deps.priceProvider` is injected. See [Pricing](/docs/modules/pricing#live-cost-stream-17). |
 | `budget-exceeded` **(v2)** | `kind: 'usd' \| 'tokens'`, `limit: number`, `value: number` | The `budget` guardrail tripped — precedes the terminal `finish`. |
+| `plan-update` **(v2, 1.8)** | `goal?`, `tasks: { id, title, status, notes? }[]` | Live plan snapshot from `emitPlanUpdate` — render a to-do panel. See [Autonomy](/docs/modules/autonomy). |
+| `activity` **(v2, 1.8)** | `message`, `level?`, `data?`, `agentPath?` | Live "Computer" feed line from `emitActivity`. |
 | `finish` | `finishReason: FinishReason`, `usage: Usage` | Last meaningful part — the whole turn finished. |
 | `error` | `message: string` | A stream error occurred; `message` is redacted of secrets. |
 
@@ -417,7 +419,7 @@ export function Chat() {
 }
 ```
 
-Tip: instead of accumulating `tool-input-delta` fragments and inferring status from part ordering, wire v2 lets you render tool lifecycle directly from `tool-state` parts — and the pure reducer `applyUIPart` (`@deuz-sdk/core/chat`) folds *all* of these parts, including `data-{name}`, `citation`, `cost`, and `budget-exceeded`, into one immutable turn state for you. See [Chat persistence & state](/docs/modules/chat-persistence).
+Tip: instead of accumulating `tool-input-delta` fragments and inferring status from part ordering, wire v2 lets you render tool lifecycle directly from `tool-state` parts — and the pure reducer `applyUIPart` (`@deuz-sdk/core/chat`) folds *all* of these parts, including `data-{name}`, `citation`, `cost`, `budget-exceeded`, `plan-update`, and `activity`, into one immutable turn state for you. See [Chat persistence & state](/docs/modules/chat-persistence).
 
 ## Related
 

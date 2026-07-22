@@ -1,0 +1,59 @@
+---
+title: Azure OpenAI
+description: Azure OpenAI and Azure AI Foundry over the Chat Completions wire with api-key or Entra auth.
+---
+
+Azure OpenAI (and Azure AI Foundry OpenAI-compatible endpoints) use the Chat Completions wire (`surface: 'chat_completions'`). Classic Azure URLs are **deployment-scoped** and require an `api-version` query param. Auth defaults to the `api-key` header — not Bearer.
+
+## createAzure
+
+```ts
+import { createAzure } from '@deuz-sdk/core/azure';
+import { streamChat } from '@deuz-sdk/core';
+
+const azure = createAzure({
+  apiKey: process.env.AZURE_OPENAI_API_KEY!,
+  resourceName: 'my-resource',
+  // apiVersion: '2024-12-01-preview', // default
+});
+
+const result = streamChat({
+  model: azure('gpt-4o'), // deployment name
+  messages: [{ role: 'user', content: 'Hello from Azure.' }],
+});
+
+for await (const delta of result.textStream) {
+  process.stdout.write(delta);
+}
+```
+
+Also re-exported from [`@deuz-sdk/core/providers`](/docs/providers/compat) for `createProviderRegistry`.
+
+### Settings
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | — | Azure OpenAI key, or Entra access token when `auth: 'bearer'`. |
+| `resourceName` | `string` | — | Builds `https://{resource}.openai.azure.com/openai/deployments/{deployment}`. Required unless `baseURL` is set. |
+| `apiVersion` | `string` | `2024-12-01-preview` | Appended as `?api-version=…` on every request. |
+| `baseURL` | `string` | — | Foundry / proxy root (adapter still appends `/chat/completions`). |
+| `auth` | `'api-key' \| 'bearer'` | `'api-key'` | Entra ID → `'bearer'`. |
+| `fetch` | `typeof fetch` | global | Factory `fetch` wins over `deps.fetch`. |
+| `headers` | `Record<string, string>` | — | Merged under adapter auth. |
+
+The argument to the returned `Provider` is the **deployment name**. Key precedence is the usual G1 rule (`deps.keyProvider` → factory → `createClient` `apiKeys.azure`).
+
+## Foundry / custom gateway
+
+```ts
+const azure = createAzure({
+  apiKey: process.env.AZURE_OPENAI_API_KEY!,
+  baseURL: 'https://<foundry-host>/openai/v1',
+});
+```
+
+## Notes
+
+- This is **not** the Azure AI Agents / Assistants REST surface — Chat Completions only.
+- Unknown deployment slugs do not throw at the registry; capabilities fall back conservatively.
+- Zero AWS/Azure SDKs — pure `fetch` + Web headers.

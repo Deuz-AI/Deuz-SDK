@@ -197,18 +197,38 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
 
   applyProviderOptions(body, call.provider, options);
 
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    ...call.headers,
+  };
+  // Azure OpenAI documents `api-key`; everyone else on this wire uses Bearer.
+  // Caller/factory headers win when they already set the chosen auth header.
+  if (call.authHeader === 'api-key') {
+    if (headers['api-key'] === undefined && headers['Api-Key'] === undefined) {
+      headers['api-key'] = call.apiKey;
+    }
+  } else if (headers.authorization === undefined && headers.Authorization === undefined) {
+    headers.authorization = `Bearer ${call.apiKey}`;
+  }
+
   return {
-    url: `${call.baseURL}/chat/completions`,
+    url: withQuery(`${call.baseURL}/chat/completions`, call.query),
     init: {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${call.apiKey}`,
-        ...call.headers,
-      },
+      headers,
       body: JSON.stringify(body),
     },
   };
+}
+
+/** Append factory query params (Azure `api-version`) without clobbering existing search. */
+function withQuery(url: string, query?: Record<string, string>): string {
+  if (!query) return url;
+  const entries = Object.entries(query).filter(([, v]) => v !== undefined && v !== '');
+  if (entries.length === 0) return url;
+  const u = new URL(url);
+  for (const [k, v] of entries) u.searchParams.set(k, v);
+  return u.toString();
 }
 
 // --- stream parsing ---

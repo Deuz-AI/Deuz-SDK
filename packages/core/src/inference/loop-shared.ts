@@ -1,4 +1,4 @@
-import type { CommonCallOptions, PrepareStepResult } from '../types/config';
+import type { CommonCallOptions, PrepareStepResult, VerifyStepResult } from '../types/config';
 import type { Message, Part } from '../types/message';
 import type { Usage } from '../types/usage';
 import type { Logger, ResolvedDependencies } from '../types/deps';
@@ -392,6 +392,38 @@ export async function applyPrepareStep(
     if (ps.toolChoice) wire = { ...wire, toolChoice: ps.toolChoice };
   }
   return { options: stepOptions, messages, wire };
+}
+
+/** Default cap for `verifyStep` attempts (initial + retries). */
+export const DEFAULT_MAX_VERIFY_ATTEMPTS = 3;
+
+/**
+ * Evaluate the caller's `verifyStep` hook at a natural completion (1.8). Shared
+ * by both loops. Returns `undefined` when there is no hook or it passed
+ * silently; otherwise the verdict plus whether the loop should RETRY (reject +
+ * `retry !== false` + attempt budget remaining). A retry injects the feedback
+ * as a user turn and re-drives the loop; the attempt budget is `maxVerifyAttempts`.
+ */
+export async function evaluateVerifyStep(
+  options: CommonCallOptions,
+  ctx: { stepIndex: number; attempt: number; text: string; messages: Message[]; usage: Usage },
+): Promise<{ verdict: VerifyStepResult; retry: boolean } | undefined> {
+  if (!options.verifyStep) return undefined;
+  const verdict = await options.verifyStep(ctx);
+  if (!verdict) return undefined;
+  const cap = options.maxVerifyAttempts ?? DEFAULT_MAX_VERIFY_ATTEMPTS;
+  const retry = !verdict.ok && verdict.retry !== false && ctx.attempt + 1 < cap;
+  return { verdict, retry };
+}
+
+/** The user turn injected when a `verifyStep` rejection re-drives the loop. */
+export function verifyFeedbackMessage(verdict: VerifyStepResult): Message {
+  return {
+    role: 'user',
+    content:
+      verdict.feedback ??
+      'The previous answer did not pass verification. Review it and produce a corrected answer.',
+  };
 }
 
 const SUMMARY_PROMPT =

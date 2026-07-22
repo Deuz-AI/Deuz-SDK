@@ -180,6 +180,55 @@ export interface BudgetExceededPart {
   value: number;
 }
 
+/**
+ * A `verifyStep` verdict (1.8 additive): emitted on the streaming loop at every
+ * natural-completion verification. `willRetry` is true when the loop will
+ * re-drive with `feedback` (bounded by `maxVerifyAttempts`).
+ */
+export interface VerifyPart {
+  type: 'verify';
+  stepIndex: number;
+  attempt: number;
+  ok: boolean;
+  willRetry: boolean;
+  feedback?: string;
+}
+
+/** One task in a plan snapshot (structural — mirrors `Task` in `./plan`). */
+export interface PlanTaskSnapshot {
+  id: string;
+  title: string;
+  /** 'pending' | 'in_progress' | 'done' | 'failed' — kept loose for the wire. */
+  status: string;
+  notes?: string;
+}
+
+/**
+ * A live plan snapshot (1.8 additive): an autonomous run pushes its `TaskList`
+ * as it changes so a UI can render a to-do panel. Emit via `emitPlanUpdate`
+ * (`@deuz-sdk/core/runtime`) from a tool's `ctx.emitPart`.
+ */
+export interface PlanUpdatePart {
+  type: 'plan-update';
+  goal?: string;
+  tasks: PlanTaskSnapshot[];
+}
+
+/**
+ * A live activity log line (1.8 additive): the "Computer" feed of what an
+ * autonomous agent is doing (opened a page, ran code, wrote a file). Emit via
+ * `emitActivity` (`@deuz-sdk/core/runtime`).
+ */
+export interface ActivityPart {
+  type: 'activity';
+  message: string;
+  level?: 'info' | 'warn' | 'error';
+  /** Optional structured payload (a url, a file path, a command, …). */
+  data?: unknown;
+  /** Sub-agent path this activity came from, when inside an `agentTool`. */
+  agentPath?: string[];
+}
+
 /** Tool-call lifecycle states surfaced by the streaming loop (1.7 additive). */
 export type ToolRunState =
   | 'input-streaming'
@@ -219,4 +268,7 @@ export type StreamPart =
   | CitationPart
   | ToolStatePart
   | CostPart
-  | BudgetExceededPart;
+  | BudgetExceededPart
+  | VerifyPart
+  | PlanUpdatePart
+  | ActivityPart;

@@ -4,7 +4,10 @@ import { runStreamToolLoop } from './stream-tool-loop';
 import { runStreamWithFallback } from '../internal/fallback';
 
 const dispatch = (options: StreamChatOptions): StreamChatResult =>
-  (options.tools && Object.keys(options.tools).length > 0) || options.chat || options.memory
+  (options.tools && Object.keys(options.tools).length > 0) ||
+  options.chat ||
+  options.memory ||
+  options.verifyStep
     ? runStreamToolLoop(options)
     : runStream(options);
 

@@ -3,7 +3,7 @@ title: React Hooks
 description: useChat and useObject — client-side hooks over the Deuz UI wire, with automatic client-tool round-trips and tool-approval pauses.
 ---
 
-> **1.7:** the React surface moved to its own package, **`@deuz-sdk/react`** — `useChat` v2 (chatId, rendered `initialMessages`, live `cost`/`budgetExceeded` state, `regenerate`/`editAndResend`, signed-approval token flow, `reconnect()` over `connectDeuzStream`) plus headless `ToolApprovalCard` and `CostBadge` components. Everything below — the `@deuz-sdk/core/react` subpath — keeps working but is **frozen**; new features land in `@deuz-sdk/react`, whose hooks bind the pure chat engine at [`@deuz-sdk/core/chat`](/docs/modules/chat-persistence).
+> **1.7+:** the React surface lives in **`@deuz-sdk/react`** — `useChat` v2 (chatId, rendered `initialMessages`, live `cost`/`budgetExceeded` state, `regenerate`/`editAndResend`, signed-approval token flow, `reconnect()` over `connectDeuzStream`) plus headless `ToolApprovalCard` and `CostBadge` components. **1.8** adds live `plan` and `activity` from the UI wire's `plan-update` / `activity` parts (autonomous runs). Everything below that still imports `@deuz-sdk/core/react` keeps working but is **frozen**; new features land in `@deuz-sdk/react`, whose hooks bind the pure chat engine at [`@deuz-sdk/core/chat`](/docs/modules/chat-persistence).
 
 `@deuz-sdk/core/react` ships two hooks built on [`readDeuzStream`](/docs/modules/ui-streaming): `useChat` for conversational UIs and `useObject` for streaming structured output. They are plain TypeScript hooks (no JSX, no components) and work with any React framework.
 
@@ -16,7 +16,7 @@ npm i react
 ## useChat
 
 ```ts
-import { useChat } from '@deuz-sdk/core/react';
+import { useChat } from '@deuz-sdk/react'; // preferred; @deuz-sdk/core/react is frozen
 
 const {
   messages,            // UIMessage[] — render-friendly
@@ -27,11 +27,17 @@ const {
   stop,                // abort the in-flight stream (not an error)
   pendingApprovals,    // ToolApprovalRequest[] — chat is PAUSED while non-empty
   addToolApprovalResponse, // ({ approvalId, approved, reason? }) => Promise<void>
+  plan,                // latest plan-update snapshot (1.8 autonomous runs)
+  activity,            // activity feed lines this turn (1.8 "Computer" view)
 } = useChat({
   api: '/api/chat',    // endpoint serving toDeuzStreamResponse
   onToolCall: async (call) => runInBrowser(call), // client tools (optional)
 });
 ```
+
+### Live plan + activity (1.8)
+
+When the server emits `plan-update` / `activity` parts (via `emitPlanUpdate` / `emitActivity` from [`@deuz-sdk/core/runtime`](/docs/modules/autonomy#background-runs--live-view)), `@deuz-sdk/react`'s `useChat` surfaces them as `plan` (latest snapshot) and `activity` (append-only feed for the current turn). Use them for a to-do panel and a "Computer" activity log — no custom `data-*` plumbing required.
 
 ### Options
 

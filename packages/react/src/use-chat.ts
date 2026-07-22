@@ -115,6 +115,10 @@ export interface UseChatResult {
   dataParts: Array<{ name: string; payload: unknown }>;
   /** This turn's RAG citations. */
   citations: AssistantTurnState['citations'];
+  /** Latest live plan snapshot for this turn (autonomous runs, 1.8). */
+  plan?: AssistantTurnState['plan'];
+  /** This turn's live activity feed ("Computer" view, 1.8). */
+  activity: AssistantTurnState['activity'];
   sendMessage: (text: string) => Promise<void>;
   /** Abort the in-flight stream (not an error). */
   stop: () => void;
@@ -149,6 +153,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
   );
   const [dataParts, setDataParts] = useState<Array<{ name: string; payload: unknown }>>([]);
   const [citations, setCitations] = useState<AssistantTurnState['citations']>([]);
+  const [plan, setPlan] = useState<AssistantTurnState['plan']>(undefined);
+  const [activity, setActivity] = useState<AssistantTurnState['activity']>([]);
 
   const uiRef = useRef<UIMessage[]>(messages);
   const canonicalRef = useRef<Message[]>(
@@ -179,6 +185,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
     setBudgetExceeded(turn.budgetExceeded);
     setDataParts(turn.dataParts);
     setCitations(turn.citations);
+    setPlan(turn.plan);
+    setActivity(turn.activity);
   }, []);
 
   const stop = useCallback((): void => {
@@ -429,6 +437,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
     ...(budgetExceeded !== undefined ? { budgetExceeded } : {}),
     dataParts,
     citations,
+    ...(plan !== undefined ? { plan } : {}),
+    activity,
     sendMessage,
     stop,
     regenerate,

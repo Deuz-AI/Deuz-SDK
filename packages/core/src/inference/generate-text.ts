@@ -19,7 +19,12 @@ export const generateText: GenerateText = async (options): Promise<GenerateTextR
       fallbackModels,
     );
   }
-  if ((options.tools && Object.keys(options.tools).length > 0) || options.chat || options.memory) {
+  if (
+    (options.tools && Object.keys(options.tools).length > 0) ||
+    options.chat ||
+    options.memory ||
+    options.verifyStep
+  ) {
     return runToolLoop(options);
   }
 

@@ -51,6 +51,8 @@ import {
   emitStepCompleted,
   observeApprovalRequests,
   observeServerResolutions,
+  evaluateVerifyStep,
+  verifyFeedbackMessage,
   SubAgentSuspension,
   type Denial,
   type DurableRunner,
@@ -233,6 +235,9 @@ export function runStreamToolLoop(
     let stepIndex = resumeFrom?.stepIndex ?? 0;
     let endReason: LoopOutcome['endReason'] = 'natural';
     let suspend: LoopOutcome['suspend'] | undefined;
+    // Verified generation (1.8): attempt counter + final verdict for metadata.
+    let verifyAttempts = 0;
+    let verified: boolean | undefined;
 
     // Mutated per iteration so tool events parent under the current step span;
     // settle-phase executions run step-less under the run span.
@@ -635,6 +640,39 @@ export function runStreamToolLoop(
           messages = [...messages, assistantMessage];
           appended.push(assistantMessage);
           chatMessages = [...chatMessages, assistantMessage];
+
+          // Verified generation (1.8): emit a verify part; on a rejected
+          // verdict, feed feedback back as a user turn and re-drive the loop.
+          const verification = await evaluateVerifyStep(options, {
+            stepIndex,
+            attempt: verifyAttempts,
+            text,
+            messages,
+            usage: durableUsage(durable, totalUsage),
+          });
+          if (verification) {
+            verified = verification.verdict.ok;
+            broadcaster.push({
+              type: 'verify',
+              stepIndex,
+              attempt: verifyAttempts,
+              ok: verification.verdict.ok,
+              willRetry: verification.retry,
+              ...(verification.verdict.feedback ? { feedback: verification.verdict.feedback } : {}),
+            });
+            if (verification.retry) {
+              verifyAttempts += 1;
+              const feedback = verifyFeedbackMessage(verification.verdict);
+              messages = [...messages, feedback];
+              appended.push(feedback);
+              chatMessages = [...chatMessages, feedback];
+              if (durable) {
+                await saveCheckpoint(durable, deps, options, 'running', messages, totalUsage);
+              }
+              stepIndex++;
+              continue;
+            }
+          }
           if (durable) {
             await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
           }
@@ -855,11 +893,14 @@ export function runStreamToolLoop(
       }
 
       const usage = withTotal(totalUsage);
+      const deuzMeta: Record<string, unknown> = {};
+      if (stoppedBy) deuzMeta.stoppedBy = stoppedBy;
+      if (verified !== undefined) deuzMeta.verified = verified;
       broadcaster.push({
         type: 'finish',
         usage,
         finishReason: lastFinish,
-        ...(stoppedBy ? { providerMetadata: { deuz: { stoppedBy } } } : {}),
+        ...(Object.keys(deuzMeta).length > 0 ? { providerMetadata: { deuz: deuzMeta } } : {}),
       });
       usageDeferred.resolve(usage);
       finishDeferred.resolve(lastFinish);

@@ -2,5 +2,5 @@
   "title": "Cookbooks",
   "icon": "ChefHat",
   "defaultOpen": true,
-  "pages": ["coding-agent"]
+  "pages": ["coding-agent", "autonomous-agent"]
 }

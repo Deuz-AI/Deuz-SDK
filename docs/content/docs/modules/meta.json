@@ -4,6 +4,7 @@
   "defaultOpen": true,
   "pages": [
     "observability",
+    "autonomy",
     "memory",
     "chat-persistence",
     "rag",

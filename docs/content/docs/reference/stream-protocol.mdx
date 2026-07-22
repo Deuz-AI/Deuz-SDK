@@ -33,4 +33,12 @@ for await (const part of result.fullStream) {
 }
 ```
 
+### Additive parts since 1.8
+
+| `type` | When | Notes |
+| --- | --- | --- |
+| `verify` | `verifyStep` evaluated on a natural completion | `ok`, `attempt`, `willRetry`, optional `feedback`. Canonical stream only (not mapped onto the UI wire). |
+| `plan-update` | Emitted via `emitPlanUpdate` from a tool | Live `TaskList` snapshot for a to-do panel. Also a UI v2 part. |
+| `activity` | Emitted via `emitActivity` from a tool | "Computer" feed line (`message`, optional `level` / `data` / `agentPath`). Also a UI v2 part. |
+
 Run the focused protocol suite with `npm run test:protocol`.

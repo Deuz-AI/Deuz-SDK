@@ -115,6 +115,20 @@ export type DeuzUIPart =
     }
   /** Budget guardrail tripped (v2 wire) — precedes the terminal finish. */
   | { type: 'budget-exceeded'; kind: 'usd' | 'tokens'; limit: number; value: number }
+  /** Live plan snapshot (v2 wire) — render an autonomous run's to-do panel. */
+  | {
+      type: 'plan-update';
+      goal?: string;
+      tasks: Array<{ id: string; title: string; status: string; notes?: string }>;
+    }
+  /** Live activity feed line (v2 wire) — the "Computer" view of agent actions. */
+  | {
+      type: 'activity';
+      message: string;
+      level?: 'info' | 'warn' | 'error';
+      data?: unknown;
+      agentPath?: string[];
+    }
   | { type: 'finish'; finishReason: FinishReason; usage: Usage }
   | { type: 'error'; message: string };
 
@@ -353,6 +367,25 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         limit: part.limit,
         value: part.value,
       };
+    case 'plan-update':
+      return {
+        type: 'plan-update',
+        ...(part.goal !== undefined ? { goal: part.goal } : {}),
+        tasks: part.tasks.map((t) => ({
+          id: t.id,
+          title: t.title,
+          status: t.status,
+          ...(t.notes !== undefined ? { notes: t.notes } : {}),
+        })),
+      };
+    case 'activity':
+      return {
+        type: 'activity',
+        message: part.message,
+        ...(part.level !== undefined ? { level: part.level } : {}),
+        ...(part.data !== undefined ? { data: part.data } : {}),
+        ...(part.agentPath !== undefined ? { agentPath: part.agentPath } : {}),
+      };
     case 'finish':
       return { type: 'finish', finishReason: part.finishReason, usage: part.usage };
     case 'error':
@@ -374,6 +407,8 @@ function isV2OnlyPart(part: DeuzUIPart): boolean {
     part.type === 'tool-state' ||
     part.type === 'cost' ||
     part.type === 'budget-exceeded' ||
+    part.type === 'plan-update' ||
+    part.type === 'activity' ||
     part.type.startsWith('data-')
   );
 }

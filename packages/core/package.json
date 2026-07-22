@@ -1,7 +1,7 @@
 {
   "name": "@deuz-sdk/core",
   "version": "1.7.1",
-  "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini).",
+  "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini, Azure, Bedrock, …).",
   "license": "MIT",
   "author": "Umutcan Edizaslan (U-C4N)",
   "repository": {
@@ -94,6 +94,136 @@
       "require": {
         "types": "./dist/voyage.d.cts",
         "default": "./dist/voyage.cjs"
+      }
+    },
+    "./azure": {
+      "import": {
+        "types": "./dist/azure.d.ts",
+        "default": "./dist/azure.js"
+      },
+      "require": {
+        "types": "./dist/azure.d.cts",
+        "default": "./dist/azure.cjs"
+      }
+    },
+    "./bedrock": {
+      "import": {
+        "types": "./dist/bedrock.d.ts",
+        "default": "./dist/bedrock.js"
+      },
+      "require": {
+        "types": "./dist/bedrock.d.cts",
+        "default": "./dist/bedrock.cjs"
+      }
+    },
+    "./providers": {
+      "import": {
+        "types": "./dist/providers.d.ts",
+        "default": "./dist/providers.js"
+      },
+      "require": {
+        "types": "./dist/providers.d.cts",
+        "default": "./dist/providers.cjs"
+      }
+    },
+    "./testing": {
+      "import": {
+        "types": "./dist/testing.d.ts",
+        "default": "./dist/testing.js"
+      },
+      "require": {
+        "types": "./dist/testing.d.cts",
+        "default": "./dist/testing.cjs"
+      }
+    },
+    "./workspace": {
+      "import": {
+        "types": "./dist/workspace.d.ts",
+        "default": "./dist/workspace.js"
+      },
+      "require": {
+        "types": "./dist/workspace.d.cts",
+        "default": "./dist/workspace.cjs"
+      }
+    },
+    "./workspace/node": {
+      "import": {
+        "types": "./dist/workspace/node.d.ts",
+        "default": "./dist/workspace/node.js"
+      },
+      "require": {
+        "types": "./dist/workspace/node.d.cts",
+        "default": "./dist/workspace/node.cjs"
+      }
+    },
+    "./compute": {
+      "import": {
+        "types": "./dist/compute.d.ts",
+        "default": "./dist/compute.js"
+      },
+      "require": {
+        "types": "./dist/compute.d.cts",
+        "default": "./dist/compute.cjs"
+      }
+    },
+    "./compute/node": {
+      "import": {
+        "types": "./dist/compute/node.d.ts",
+        "default": "./dist/compute/node.js"
+      },
+      "require": {
+        "types": "./dist/compute/node.d.cts",
+        "default": "./dist/compute/node.cjs"
+      }
+    },
+    "./autonomy": {
+      "import": {
+        "types": "./dist/autonomy.d.ts",
+        "default": "./dist/autonomy.js"
+      },
+      "require": {
+        "types": "./dist/autonomy.d.cts",
+        "default": "./dist/autonomy.cjs"
+      }
+    },
+    "./runtime": {
+      "import": {
+        "types": "./dist/runtime.d.ts",
+        "default": "./dist/runtime.js"
+      },
+      "require": {
+        "types": "./dist/runtime.d.cts",
+        "default": "./dist/runtime.cjs"
+      }
+    },
+    "./runtime/node": {
+      "import": {
+        "types": "./dist/runtime/node.d.ts",
+        "default": "./dist/runtime/node.js"
+      },
+      "require": {
+        "types": "./dist/runtime/node.d.cts",
+        "default": "./dist/runtime/node.cjs"
+      }
+    },
+    "./browser": {
+      "import": {
+        "types": "./dist/browser.d.ts",
+        "default": "./dist/browser.js"
+      },
+      "require": {
+        "types": "./dist/browser.d.cts",
+        "default": "./dist/browser.cjs"
+      }
+    },
+    "./browser/node": {
+      "import": {
+        "types": "./dist/browser/node.d.ts",
+        "default": "./dist/browser/node.js"
+      },
+      "require": {
+        "types": "./dist/browser/node.d.cts",
+        "default": "./dist/browser/node.cjs"
       }
     },
     "./pricing": {
@@ -356,6 +486,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@standard-community/standard-json": "^0.2.0",
     "mammoth": "^1.8.0",
+    "playwright": "^1.40.0",
     "react": "^18.0.0 || ^19.0.0",
     "unpdf": "^0.12.0",
     "xlsx": "^0.18.0",
@@ -381,6 +512,9 @@
       "optional": true
     },
     "xlsx": {
+      "optional": true
+    },
+    "playwright": {
       "optional": true
     }
   },

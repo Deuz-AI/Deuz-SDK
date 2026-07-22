@@ -16,7 +16,8 @@ Requires **Node >= 22**. The chat core has nothing in `dependencies`. Optional p
 
 - **Build a chatbot** → [Quickstart](/docs/quickstart) + [React hooks](/docs/modules/react-hooks) + [UI streaming](/docs/modules/ui-streaming)
 - **Build a coding agent** → [Tools](/docs/agents/tools) + [Sub-agents](/docs/agents/subagents) + [Budget stops](/docs/agents/tool-loop)
-- **Build a long-running agent** → [Compaction](/docs/core/compaction) + [prepareStep](/docs/agents/tool-loop)
+- **Build an autonomous agent (1.8)** → [Autonomy](/docs/modules/autonomy) + [Build your own Manus](/docs/cookbooks/autonomous-agent)
+- **Build a long-running agent** → [Compaction](/docs/core/compaction) + [Durable runtime](/docs/agents/durable-runtime) + [prepareStep](/docs/agents/tool-loop)
 - **Use provider-native search** → [Provider-executed tools](/docs/agents/server-tools)
 - **Add MCP** → [MCP guide](/docs/modules/mcp)
 - **Add memory/RAG** → [Memory](/docs/modules/memory) + [RAG](/docs/modules/rag)
@@ -108,9 +109,10 @@ For streaming structured output, [streamObject](/docs/core/stream-object) return
 | RAG | MIME sniff, chunkers, dense + lexical (BM25) hybrid retrieval | [RAG](/docs/modules/rag) |
 | Skills | `SKILL.md` parser with progressive disclosure | [Skills](/docs/modules/skills) |
 | MCP | Model Context Protocol client (HTTP/SSE edge-safe; stdio Node-only) | [MCP](/docs/modules/mcp) |
+| Autonomy (1.8) | Workspace memory, CodeAct sandbox, planner/verifier, browser tools, background runs, live plan/activity feed | [Autonomy](/docs/modules/autonomy) |
 | Image generation | Sync OpenAI-compatible generation, async Midjourney, Yunwu relay | [Image generation](/docs/modules/image-generation) |
 | UI streaming | `toDeuzStreamResponse` (server) and `readDeuzStream` (client) | [UI streaming](/docs/modules/ui-streaming) |
-| React hooks | `useChat` (client-tool round-trips + approval pauses) and `useObject` over the Deuz UI wire; React is an optional peer | [React hooks](/docs/modules/react-hooks) |
+| React hooks | `useChat` (client-tool round-trips + approval pauses + live `plan`/`activity`) and `useObject` over the Deuz UI wire | [React hooks](/docs/modules/react-hooks) |
 | Middleware | `wrapModel` with logging, caching, PII redaction, injection guard | [Middleware](/docs/modules/middleware) |
 | Pricing | Optional token-to-USD cost table | [Pricing](/docs/modules/pricing) |
 
@@ -122,11 +124,14 @@ All providers normalize to the same canonical stream, so application code is pro
 | --- | --- | --- |
 | Anthropic | [`@deuz-sdk/core/anthropic`](/docs/providers/anthropic) | Messages API (`/v1/messages`) |
 | OpenAI | [`@deuz-sdk/core/openai`](/docs/providers/openai) | Chat Completions and Responses API + `openaiEmbedding` |
+| **Azure OpenAI** | [`@deuz-sdk/core/azure`](/docs/providers/azure) | Deployment URL + `api-key` / Entra Bearer |
+| **Amazon Bedrock** | [`@deuz-sdk/core/bedrock`](/docs/providers/bedrock) | Mantle OpenAI-compat (Bearer API key; no SigV4 SDK) |
 | xAI Grok | [`@deuz-sdk/core/xai`](/docs/providers/xai) | OpenAI-compatible wire |
 | Google Gemini | [`@deuz-sdk/core/google`](/docs/providers/google) | Compat (`createGoogle`) and native `generateContent` (`createGoogleNative`) + `googleEmbedding` |
 | Vertex AI | [`@deuz-sdk/core/vertex`](/docs/providers/vertex) | Claude and Gemini on Vertex with OAuth2 Bearer auth |
 | Voyage AI | [`@deuz-sdk/core/voyage`](/docs/providers/voyage) | Embeddings |
 | Yunwu | [`@deuz-sdk/core/yunwu`](/docs/providers/yunwu) | Unified relay — chat, image, embed at `/v1`, Midjourney at the root |
+| OpenAI-compat hosts | [`@deuz-sdk/core/providers`](/docs/providers/compat) | **Mistral, DeepSeek, Qwen, Kimi** (`createKimi` / Moonshot), Groq, Together, OpenRouter, Cerebras, Fireworks, GLM, MiniMax + Azure/Bedrock re-exports + `createProviderRegistry` |
 
 A provider factory returns a tiny `LanguageModel` descriptor; the [model registry](/docs/advanced/model-registry) is the single source of truth for per-model capabilities (vision, tools, reasoning, structured output, caching, native PDF, audio, context window). Unknown model slugs do not throw — they fall back to conservative defaults, so new model releases work without a code change.
 

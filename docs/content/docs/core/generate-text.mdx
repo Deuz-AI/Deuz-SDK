@@ -49,6 +49,8 @@ Agentic options (only meaningful with `tools`):
 | `activeTools` | `string[]` | — | Static tool filter: only these `tools` keys are sent to the model across all steps; unknown names log a warning and are ignored. `prepareStep`'s `activeTools` overrides it per step. |
 | `approveToolCall` | `(call, ctx) => boolean \| Promise<boolean>` | — | Server-mode approval gate for `needsApproval` tools; return `false` (or throw) to deny — denials become an `is_error` tool result and the loop continues. |
 | `approvalResponses` | `ToolApprovalResponse[]` | — | Resume after a client-mode break: verdicts for the trailing assistant turn's pending calls. Unmatched pending calls are denied by default. |
+| `verifyStep` | `(ctx) => VerifyStepResult \| Promise<…>` | — | **1.8.** Runs at every natural completion. Return `{ ok: true }` or `{ ok: false, feedback, retry? }` — a rejection feeds `feedback` back as a user turn and re-drives the loop (bounded by `maxVerifyAttempts`). Sets `providerMetadata.deuz.verified`. See [Autonomy](/docs/modules/autonomy#planner--executor--verifier). |
+| `maxVerifyAttempts` | `number` | `3` | Cap on `verifyStep` re-drives (separate budget from `maxSteps`). |
 
 ## Result shape
 

@@ -59,6 +59,46 @@ export interface PrepareStepResult {
 }
 
 /**
+ * Context passed to `verifyStep` (1.8) when the agentic loop reaches a NATURAL
+ * completion (the model produced final text with no pending tool calls).
+ */
+export interface VerifyStepContext {
+  /** Index of the step that just completed. */
+  stepIndex: number;
+  /** 0-based verification attempt for this run (increments on each retry). */
+  attempt: number;
+  /** The model's final text for the completed step. */
+  text: string;
+  /** Effective model history at the completion boundary. */
+  messages: Message[];
+  /** Cumulative REAL usage so far (all steps, sub-agents included). */
+  usage: Usage;
+}
+
+/**
+ * A `verifyStep` verdict. `ok: true` accepts the answer; `ok: false` with
+ * `retry !== false` feeds `feedback` back as a user turn and re-runs the loop
+ * (bounded by `maxVerifyAttempts`). `retry: false` accepts an unverified answer
+ * as-is (`providerMetadata.deuz.verified` is then `false`).
+ */
+export interface VerifyStepResult {
+  ok: boolean;
+  /** Fed back to the model as a user turn when the answer is rejected and a retry happens. */
+  feedback?: string;
+  /** Allow another attempt when `ok` is false. Default true (until `maxVerifyAttempts`). */
+  retry?: boolean;
+}
+
+/**
+ * Verifier hook (1.8): runs at every NATURAL completion of the agentic loop.
+ * Return `undefined` to pass silently; a `VerifyStepResult` to accept or reject.
+ * Rejections re-drive the loop with the feedback until `maxVerifyAttempts`.
+ */
+export type VerifyStep = (
+  ctx: VerifyStepContext,
+) => VerifyStepResult | undefined | Promise<VerifyStepResult | undefined>;
+
+/**
  * Options common to every call. `signal` and `maxRetries` are locked NOW —
  * adding them later would be breaking even in 0.x. Sampling params are locked
  * too (full surface); adapters translate them to each wire in Faz 1.B.
@@ -152,6 +192,18 @@ export interface CommonCallOptions {
    */
   activeTools?: string[];
   /**
+   * Verifier hook (1.8 additive): runs when the loop reaches a NATURAL
+   * completion (final text, no pending tool calls). A rejection (`ok: false`)
+   * injects `feedback` as a user turn and re-drives the loop — self-correcting
+   * "verified generation" without an agent class. Streaming emits a `verify`
+   * part per evaluation. Retries are bounded by `maxVerifyAttempts` (they are a
+   * SEPARATE budget from `maxSteps`); the loop's `stopWhen`/`budget` still
+   * apply. `providerMetadata.deuz.verified` records the final verdict.
+   */
+  verifyStep?: VerifyStep;
+  /** Max verification attempts (initial + retries) before accepting as-is. Default 3. */
+  maxVerifyAttempts?: number;
+  /**
    * Advanced: the sub-agent path of this loop (set by `agentTool`, e.g.
    * `['researcher']`). Flows into every tool's `ToolExecuteContext.agentPath`
    * and usage metering. Root loops omit it.
@@ -234,7 +286,9 @@ export interface CommonCallOptions {
 
 /** Shared client configuration; pre-binds api keys + deps for the convenience client. */
 export interface ClientConfig {
-  apiKeys?: Partial<Record<'anthropic' | 'openai' | 'xai' | 'google', string>>;
+  apiKeys?: Partial<
+    Record<'anthropic' | 'openai' | 'xai' | 'google' | 'azure' | 'bedrock', string>
+  >;
   baseUrls?: Partial<Record<string, string>>;
   deps?: Dependencies;
 }

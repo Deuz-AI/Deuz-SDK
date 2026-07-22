@@ -1,0 +1,49 @@
+---
+title: Amazon Bedrock
+description: Amazon Bedrock Mantle OpenAI-compatible Chat Completions with Bedrock API keys (Bearer) — no SigV4 SDK.
+---
+
+Amazon Bedrock’s **Mantle** endpoint speaks OpenAI-compatible Chat Completions. Deuz targets that wire with a Bedrock API key / short-term bearer token — **no AWS SDK, no SigV4, edge-safe**.
+
+Default root: `https://bedrock-mantle.{region}.api.aws/openai/v1` (adapter appends `/chat/completions`).
+
+This is **not** the Bedrock Runtime `Converse` API. For Converse, put a gateway in front or wait for a dedicated surface.
+
+## createBedrock
+
+```ts
+import { createBedrock } from '@deuz-sdk/core/bedrock';
+import { streamChat } from '@deuz-sdk/core';
+
+const bedrock = createBedrock({
+  apiKey: process.env.AWS_BEARER_TOKEN_BEDROCK!,
+  region: 'us-west-2',
+});
+
+const result = streamChat({
+  model: bedrock('openai.gpt-oss-120b'),
+  messages: [{ role: 'user', content: 'Hello from Bedrock Mantle.' }],
+});
+
+for await (const delta of result.textStream) {
+  process.stdout.write(delta);
+}
+```
+
+Also re-exported from [`@deuz-sdk/core/providers`](/docs/providers/compat).
+
+### Settings
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | — | Bedrock API key or short-term bearer. Core never reads env. |
+| `region` | `string` | `us-east-1` | Mantle regional host. |
+| `baseURL` | `string` | Mantle `…/openai/v1` | Override if your region documents `/v1` without `/openai`. |
+| `fetch` | `typeof fetch` | global | Factory wins over `deps.fetch`. |
+| `headers` | `Record<string, string>` | — | Extra headers. |
+
+Auth is `Authorization: Bearer <apiKey>` — same as other OpenAI-compat hosts. Key precedence: G1 (`apiKeys.bedrock` on `createClient` works).
+
+## Model ids
+
+Use the Bedrock / Mantle model id your account exposes (e.g. `openai.gpt-oss-120b`, `xai.grok-4.3`). Unknown slugs fall back to conservative registry defaults.

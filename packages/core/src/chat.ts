@@ -65,6 +65,10 @@ export interface AssistantTurnState {
   dataParts: Array<{ name: string; payload: unknown }>;
   /** RAG citations streamed with the answer (1.7). */
   citations: Array<Extract<DeuzUIPart, { type: 'citation' }>>;
+  /** Latest live plan snapshot from `plan-update` parts (1.8, autonomous runs). */
+  plan?: Extract<DeuzUIPart, { type: 'plan-update' }>;
+  /** Live activity feed from `activity` parts, in arrival order (1.8). */
+  activity: Array<Extract<DeuzUIPart, { type: 'activity' }>>;
   /** Redacted server error message, when the stream ended in an error part. */
   error?: string;
 }
@@ -76,6 +80,7 @@ export function createAssistantTurn(id: string): AssistantTurnState {
     serverResults: [],
     dataParts: [],
     citations: [],
+    activity: [],
   };
 }
 
@@ -190,6 +195,10 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
       };
     case 'citation':
       return { ...turn, citations: [...turn.citations, part] };
+    case 'plan-update':
+      return { ...turn, plan: part };
+    case 'activity':
+      return { ...turn, activity: [...turn.activity, part] };
     case 'error':
       return { ...turn, error: part.message };
     default: {

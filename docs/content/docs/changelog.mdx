@@ -6,6 +6,27 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## Unreleased
+
+- **`@deuz-sdk/core/azure`** — `createAzure` for Azure OpenAI / Foundry (deployment URL, `api-version` query, `api-key` or Entra Bearer).
+- **`@deuz-sdk/core/bedrock`** — `createBedrock` for Amazon Bedrock Mantle OpenAI-compat (Bearer API key; no SigV4 SDK).
+- **`createKimi`** — alias of `createMoonshot` on `@deuz-sdk/core/providers`.
+- Docs: [Azure](/docs/providers/azure), [Bedrock](/docs/providers/bedrock), [OpenAI-compat hosts](/docs/providers/compat) (Mistral, DeepSeek, Qwen, Kimi called out).
+
+## 1.8.0
+
+**Autonomous Agent Runtime.** The primitives to build a Manus-style, fully autonomous system on the edge-safe core — every heavy capability is a seam with a Node-only reference adapter. See [Autonomy](/docs/modules/autonomy) and the [Build your own Manus](/docs/cookbooks/autonomous-agent) cookbook.
+
+- **Workspace** (`@deuz-sdk/core/workspace`, `/workspace/node`) — path-addressed externalized memory (`Workspace`), in-memory + sandboxed-directory backends, and `createWorkspaceTools`. Persist `plan.json`, notes, and artifacts across compaction, checkpoints, and restarts.
+- **Compute / CodeAct** (`/compute`, `/compute/node`) — `ComputeSandbox` (`runCode` / `runShell`), `codeActTool` / `shellTool`, and a `node:child_process` reference sandbox. Thrown runs self-heal into `is_error` results. Swap the backend for Docker/E2B/Daytona without changing call sites.
+- **Planner → Executor → Verifier** (`/autonomy`, `verifyStep`) — `planTasks` + pure `TaskList` reducers; `verifyStep` on both loops (rejection re-drives with feedback, bounded by `maxVerifyAttempts`, records `providerMetadata.deuz.verified`, streaming emits a `verify` part); plus `bestOfN`, `selfConsistency`, and `parallelAgents`.
+- **Background runs** (`/runtime`, `/runtime/node`) — `RunStore` / `createRunManager`, `pollStaleRuns`, live `plan-update` / `activity` stream parts (UI wire + `useChat`), and `createSteeringController` for mid-run user messages.
+- **Browser control** (`/browser`, `/browser/node`) — `BrowserController` + `createBrowserTools`; Playwright reference adapter as an optional peer.
+- **Providers + model router** (`/providers`) — published OpenAI-compatible factories (Groq, Mistral, DeepSeek, Together, OpenRouter, Cerebras, Fireworks, Moonshot/Kimi, Qwen, GLM, MiniMax) and `createProviderRegistry` for `'groq:…'`-style lookup with zero network.
+- **Testing** (`/testing`) — published `createMockModel`, `runEval`, and golden-replay fixtures for deterministic agent tests.
+
+All additive: heavy code stays under `*/node` subpaths; the canonical stream/UI wire gains open-union parts (v1 clients unaffected).
+
 ## 1.7.1
 
 **Memory isolation and settlement.** Chat-scoped memory queries now match `chatId` exactly in both the in-memory and Markdown stores, and Markdown records preserve that field through frontmatter round-trips. A buffered run suspended for approval or a client tool now exposes `result.memory` and settles it to an empty mutation list instead of omitting the field.

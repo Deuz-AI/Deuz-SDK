@@ -1,0 +1,154 @@
+---
+title: Autonomy
+description: The 1.8 primitives for fully autonomous, self-verifying agents — workspace memory, CodeAct code execution, planner/executor/verifier loops, parallel fan-out, browser control, and background runs. Edge-safe core, Node-only reference adapters.
+---
+
+Deuz 1.8 adds the primitives to build a **Manus-style autonomous system** — a run that plans, acts by writing and executing code, verifies itself, and keeps working across restarts — without giving up the zero-dependency, lint-guaranteed edge-safe core. Every heavy capability is a **seam** with a Node-only reference adapter, so you plug in Docker/E2B/Playwright and the core stays pure. There is no agent class: you compose free functions.
+
+## Workspace — externalized memory
+
+An autonomous run needs a place to keep `plan.json`, notes, and artifacts so progress survives compaction, a durable checkpoint, or a full restart. That is the `Workspace` seam.
+
+```ts
+import { createInMemoryWorkspace, createWorkspaceTools } from '@deuz-sdk/core/workspace';
+import { createFileWorkspace } from '@deuz-sdk/core/workspace/node'; // sandboxed directory
+
+const workspace = createFileWorkspace({ root: './.agent-workspace' });
+await workspace.write('plan.json', '{}');
+
+// Expose it to the model as tools (readFile / writeFile / listFiles / deleteFile).
+const tools = createWorkspaceTools(workspace, { approveWrites: true });
+```
+
+Paths are normalized and traversal (`..`, absolute paths) is rejected before the backend ever sees them. Back the seam with any KV/object store (S3, R2, a DB table) in a few lines.
+
+## Compute / CodeAct — action as executable code
+
+The reliable way to make an agent *act* (instead of describing what it would do) is to let it write code and run it. `ComputeSandbox` is the seam; `codeActTool`/`shellTool` wrap it as tools.
+
+```ts
+import { codeActTool, shellTool, codeActSystemPrompt } from '@deuz-sdk/core/compute';
+import { createNodeSandbox } from '@deuz-sdk/core/compute/node';
+
+const sandbox = createNodeSandbox({ allowedLanguages: ['python', 'bash', 'javascript'] });
+
+const tools = {
+  ...codeActTool(sandbox, { languages: ['python', 'bash'] }),
+  ...shellTool(sandbox),
+};
+```
+
+A thrown run becomes a self-healing `is_error` result the loop feeds back, so the model can switch strategy (Python fails → shell) — the CodeAct self-correction loop.
+
+> **`createNodeSandbox` is a reference, not a security sandbox** — it runs code as a child process of the host. For untrusted input or production, back `ComputeSandbox` with real isolation (Docker, E2B, Daytona, Fly Machines, a microVM). The seam is identical; only the backend changes. Approval gates *whether* a call runs, not *what it can reach*.
+
+## Planner → Executor → Verifier
+
+`planTasks` decomposes a goal into an ordered `TaskList` you drive with pure reducers and persist as `plan.json`:
+
+```ts
+import { planTasks, nextPendingTask, setTaskStatus, taskListProgress } from '@deuz-sdk/core/autonomy';
+
+let plan = await planTasks('Build and test a CLI', { model });
+for (let task = nextPendingTask(plan); task; task = nextPendingTask(plan)) {
+  // …delegate task.title to an executor sub-agent…
+  plan = setTaskStatus(plan, task.id, 'done');
+}
+```
+
+The **verifier** is the `verifyStep` hook on any agentic call (both `generateText` and `streamChat`). It runs at every natural completion; a rejection feeds `feedback` back as a user turn and re-drives the loop, bounded by `maxVerifyAttempts`:
+
+```ts
+const result = await generateText({
+  model,
+  messages,
+  verifyStep: ({ text, attempt }) =>
+    text.includes('PASS') ? { ok: true } : { ok: false, feedback: 'Run the tests and paste the result.', retry: attempt < 2 },
+});
+result.providerMetadata?.deuz?.verified; // true | false
+```
+
+Streaming emits a `verify` part per evaluation. Verify retries are a **separate budget** from `maxSteps`; `stopWhen`/`budget` still bound the whole run.
+
+### Verified + parallel generation
+
+```ts
+import { bestOfN, selfConsistency, parallelAgents } from '@deuz-sdk/core/autonomy';
+
+// Generate N candidates, score each, keep the best.
+const { best } = await bestOfN({ n: 5, generate: () => draft(), score: (d) => rate(d) });
+
+// Majority-vote N samples.
+const { answer } = await selfConsistency({ n: 5, generate: () => solve() });
+
+// "Wide Research": run many independent agents concurrently.
+const { results } = await parallelAgents({ model, tasks: urls.map((u) => `Summarize ${u}`), concurrency: 10 });
+```
+
+## Browser control
+
+```ts
+import { createBrowserTools } from '@deuz-sdk/core/browser';
+import { createPlaywrightBrowser } from '@deuz-sdk/core/browser/node'; // optional peer: playwright
+
+const browser = createPlaywrightBrowser({ headless: true });
+const tools = createBrowserTools(browser, { workspace, needsApproval: true });
+// navigate / click / type / readText / screenshot (screenshots save to the workspace)
+```
+
+## Background runs + live view
+
+`RunStore` tracks run metadata (status, plan snapshot) alongside the durable `SessionStore` checkpoints, so a dashboard can list runs and a worker can continue the ones whose process died.
+
+```ts
+import { createRunManager, createInMemoryRunStore, emitActivity, emitPlanUpdate } from '@deuz-sdk/core/runtime';
+import { createFileRunStore, pollStaleRuns } from '@deuz-sdk/core/runtime/node';
+
+const runs = createRunManager({ store: createFileRunStore({ dir: './.runs' }) });
+await runs.startRun({ runId, goal });
+// …drive the model with session: { store: sessionStore, runId } …
+await runs.setStatus(runId, 'completed');
+
+// A worker/cron continues crashed runs:
+for (const stale of await pollStaleRuns(store, { staleMs: 60_000 })) {
+  // resumeFromCheckpoint(sessionStore, stale.runId, { model, tools, … })
+}
+```
+
+From inside a tool (streaming parent), feed the UI's to-do panel and "Computer" activity feed:
+
+```ts
+emitPlanUpdate(ctx.emitPart, plan);           // → plan-update part
+emitActivity(ctx.emitPart, 'opened pricing page', { level: 'info' }); // → activity part
+```
+
+Both parts flow through the UI wire, the chat engine, and `useChat` (`plan` / `activity`). Use `createSteeringController` + `prepareStep` to inject a mid-run user message ("actually, focus on X") at the next step boundary.
+
+## Providers + model router
+
+Published OpenAI-compatible factories and a zero-network string router live at `@deuz-sdk/core/providers`:
+
+```ts
+import { createProviderRegistry, createGroq } from '@deuz-sdk/core/providers';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+
+const registry = createProviderRegistry({
+  groq: createGroq({ apiKey: process.env.GROQ_API_KEY! }),
+  openai: createOpenAI({ apiKey: process.env.OPENAI_API_KEY! }),
+});
+
+const model = registry.model('groq:llama-4-maverick');
+```
+
+Also exported: `createMistral`, `createDeepSeek`, `createQwen`, `createKimi` (alias of `createMoonshot`), `createTogether`, `createOpenRouter`, `createCerebras`, `createFireworks`, `createGLM`, `createMiniMax`, plus `createAzure` / `createBedrock` (also dedicated `@deuz-sdk/core/azure` and `/bedrock`). Full table: [OpenAI-compat hosts](/docs/providers/compat).
+
+## Testing
+
+Deterministic agent tests use the published `@deuz-sdk/core/testing` subpath (`createMockModel`, `runEval`, golden-replay fixtures) — no real network required.
+
+## See also
+
+- [Build your own Manus](/docs/cookbooks/autonomous-agent) — all of the above composed into one autonomous agent.
+- [Durable runtime](/docs/agents/durable-runtime) — the checkpoint/resume layer background runs build on.
+- [Sub-agents](/docs/agents/subagents) — `agentTool`, the executor in the loop.
+- [Installation — subpaths](/docs/installation#subpath-exports) — full export table including autonomy surfaces.

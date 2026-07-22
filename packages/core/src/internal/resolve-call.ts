@@ -17,6 +17,10 @@ export interface ResolvedCall {
   headers: Record<string, string>;
   /** Set for Vertex AI transports — adapters build Vertex URLs/bodies + Bearer auth. */
   vertex?: VertexConfig;
+  /** Extra query params for the final wire URL (Azure `api-version`, …). */
+  query?: Record<string, string>;
+  /** OpenAI-compatible auth style; default bearer when omitted. */
+  authHeader?: 'bearer' | 'api-key';
 }
 
 /** Wire root URLs. Anthropic appends `/v1/messages`; OpenAI-style already includes `/v1`. */
@@ -100,5 +104,7 @@ export async function resolveCall(input: ResolveCallInput): Promise<ResolvedCall
     fetch: fetchImpl,
     headers: mergedHeaders,
     ...(config?.vertex ? { vertex: config.vertex } : {}),
+    ...(config?.query ? { query: config.query } : {}),
+    ...(config?.authHeader ? { authHeader: config.authHeader } : {}),
   };
 }

@@ -37,7 +37,7 @@ The core is **pure and web-first**: it touches only Web APIs (`fetch`, Web Strea
 | Vercel Edge | ✅ | Same — use the `/edge` entry. |
 | Browsers | ⚠️ | Works for the canonical wire, but never ship provider API keys to the client. Use the [UI wire](/docs/modules/ui-streaming) and a server route instead. |
 
-Node-only capabilities (filesystem skill sources, document parsers, the markdown memory vault, MCP stdio transport) live behind dedicated `…/node` subpaths and never leak `node:*` imports into the edge-safe core.
+Node-only capabilities (filesystem skill sources, document parsers, the markdown memory vault, MCP stdio transport, file workspace, compute sandbox, Playwright browser, JSONL run store) live behind dedicated `…/node` subpaths and never leak `node:*` imports into the edge-safe core.
 
 ## Zero runtime dependencies
 
@@ -54,6 +54,7 @@ Install a peer only when you reach for the feature in its row. Each is declared 
 | `unpdf` | [`@deuz-sdk/core/rag/node`](/docs/modules/rag) | PDF document parsing for RAG. |
 | `mammoth` | `@deuz-sdk/core/rag/node` | DOCX document parsing for RAG. |
 | `xlsx` | `@deuz-sdk/core/rag/node` | XLSX spreadsheet parsing for RAG. |
+| `playwright` | [`@deuz-sdk/core/browser/node`](/docs/modules/autonomy#browser-control) | Playwright reference adapter for browser control (1.8). Loaded lazily. |
 
 ```bash title="schema-typed generateObject"
 npm install zod @standard-community/standard-json
@@ -65,6 +66,10 @@ npm install @modelcontextprotocol/sdk
 
 ```bash title="rag/node document parsers"
 npm install unpdf mammoth xlsx
+```
+
+```bash title="browser/node (Playwright)"
+npm install playwright
 ```
 
 The `rag/node` parsers are independent — install only the formats you need. The RAG core (MIME sniffing, chunkers, retrieve/rerank, BM25, RRF) is edge-safe and needs no peers; only the Node document parsers do.
@@ -101,9 +106,22 @@ The root export carries the free functions, the client, errors, and all canonica
 | `@deuz-sdk/core/durable` | Checkpoint/resume stores, signed approvals, and durable × resumable chat helpers |
 | `@deuz-sdk/core/observe` | Local observers, composition/filtering, and pure run summaries for the versioned observation protocol |
 | `@deuz-sdk/core/observe/node` | Bounded JSONL observation sink and event reader (Node-only) |
+| `@deuz-sdk/core/azure` | Azure OpenAI / Foundry — `createAzure` (deployment URL, `api-key` or Entra) |
+| `@deuz-sdk/core/bedrock` | Amazon Bedrock Mantle — `createBedrock` (Bearer API key, no SigV4 SDK) |
+| `@deuz-sdk/core/providers` | OpenAI-compat: **Mistral, DeepSeek, Qwen, Kimi**, Groq, Together, OpenRouter, Cerebras, Fireworks, GLM, MiniMax + Azure/Bedrock re-exports + `createProviderRegistry` |
+| `@deuz-sdk/core/workspace` | Externalized path-addressed memory seam + `createWorkspaceTools` (1.8) |
+| `@deuz-sdk/core/workspace/node` | Sandboxed directory `Workspace` (`createFileWorkspace`) |
+| `@deuz-sdk/core/compute` | `ComputeSandbox` seam + `codeActTool` / `shellTool` (1.8) |
+| `@deuz-sdk/core/compute/node` | `node:child_process` reference sandbox (`createNodeSandbox`) |
+| `@deuz-sdk/core/autonomy` | `planTasks`, `bestOfN`, `selfConsistency`, `parallelAgents`, TaskList reducers (1.8) |
+| `@deuz-sdk/core/runtime` | `RunStore` / `createRunManager`, `emitPlanUpdate` / `emitActivity`, steering (1.8) |
+| `@deuz-sdk/core/runtime/node` | JSONL run store + `pollStaleRuns` |
+| `@deuz-sdk/core/browser` | `BrowserController` seam + `createBrowserTools` (1.8) |
+| `@deuz-sdk/core/browser/node` | Playwright reference adapter (`createPlaywrightBrowser`) |
+| `@deuz-sdk/core/testing` | Published `createMockModel`, `runEval`, golden-replay fixtures (1.8) |
 | `@deuz-sdk/core/ui` | Versioned/resumable Deuz UI wire, stream journaling, reconnect reader, and typed app-data injection |
 | `@deuz-sdk/core/edge` | Guaranteed edge-safe subset (re-exports the Web-API-only surface) |
-| `@deuz-sdk/core/react` | React hooks — `useChat` / `useObject` (React = optional peer `^18 \|\| ^19`) |
+| `@deuz-sdk/core/react` | Frozen legacy React hooks — prefer `@deuz-sdk/react` for new work |
 
 ## Verify it works
 
