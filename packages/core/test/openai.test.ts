@@ -1,8 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { streamChat, generateText } from '../src/index';
 import { createOpenAI, createOpenAIResponses } from '../src/openai';
 import { createGoogle } from '../src/google';
+import { openaiWebSearch } from '../src/server-tools';
 import { sseResponse, sseEvents, mockFetch } from './fixtures/sse';
+import type { JSONSchema } from '../src/types/schema';
+import type { Logger } from '../src/types/deps';
 
 function consume(chunks: string[]) {
   return mockFetch(() => sseResponse(chunks));
@@ -235,5 +238,90 @@ describe('OpenAI effort semantics (0.2.0)', () => {
     await result.finishReason;
     const body = JSON.parse(String(calls[0]!.init!.body));
     expect(body.reasoning).toEqual({ effort: 'none' });
+  });
+});
+
+describe('Chat Completions hosted-tool drop is loud (1.9.0)', () => {
+  const CC_MINI = sseEvents([
+    { data: { choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] } },
+    { data: { choices: [], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 } } },
+    { data: '[DONE]' },
+  ]);
+
+  function makeLogger(): Logger {
+    return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  }
+
+  const echoTool = {
+    description: 'Echo',
+    parameters: { type: 'object', properties: { v: { type: 'string' } } } as JSONSchema,
+    execute: async (args: unknown) => args,
+  };
+
+  it('drops the provider-executed tool, keeps the function tool, and warns exactly once', async () => {
+    const logger = makeLogger();
+    const { fetch, calls } = consume([CC_MINI]);
+    await generateText({
+      model: createOpenAI({ apiKey: 'k', fetch })('gpt-5.5'),
+      messages: [{ role: 'user', content: 'search then echo' }],
+      tools: { echo: echoTool, web_search: openaiWebSearch({ search_context_size: 'low' }) },
+      deps: { logger },
+    });
+
+    const body = JSON.parse(String(calls[0]!.init!.body));
+    const tools = body.tools as Array<{ function: { name: string } }>;
+    expect(tools.map((t) => t.function.name)).toEqual(['echo']);
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    const [message, fields] = (logger.warn as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0]! as [string, Record<string, unknown>];
+    expect(message).toContain('web_search');
+    expect(message).toContain('provider-executed');
+    expect(message).toContain('gpt-5.5');
+    expect(fields).toMatchObject({
+      provider: 'openai',
+      modelId: 'gpt-5.5',
+      droppedTools: ['web_search'],
+    });
+  });
+
+  it('does not warn when every tool is a function tool', async () => {
+    const logger = makeLogger();
+    const { fetch } = consume([CC_MINI]);
+    await generateText({
+      model: createOpenAI({ apiKey: 'k', fetch })('gpt-5.5'),
+      messages: [{ role: 'user', content: 'echo' }],
+      tools: { echo: echoTool },
+      deps: { logger },
+    });
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('the request body is otherwise unchanged (the warn is the ONLY new behaviour)', async () => {
+    const { fetch, calls } = consume([CC_MINI]);
+    await generateText({
+      model: createOpenAI({ apiKey: 'k', fetch })('gpt-5.5'),
+      messages: [{ role: 'user', content: 'search then echo' }],
+      tools: { echo: echoTool, web_search: openaiWebSearch({ search_context_size: 'low' }) },
+    });
+    // Pinned byte-for-byte against 1.8.0 output: dropping stays a drop, the
+    // hosted definition is NOT smuggled into the wire, nothing else moved.
+    expect(JSON.parse(String(calls[0]!.init!.body))).toEqual({
+      model: 'gpt-5.5',
+      messages: [{ role: 'user', content: 'search then echo' }],
+      stream: true,
+      max_tokens: 128000,
+      stream_options: { include_usage: true },
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'echo',
+            description: 'Echo',
+            parameters: { type: 'object', properties: { v: { type: 'string' } } },
+          },
+        },
+      ],
+    });
   });
 });

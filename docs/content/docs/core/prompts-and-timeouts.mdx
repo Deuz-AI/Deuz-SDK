@@ -1,0 +1,162 @@
+---
+title: Prompts, instructions & timeouts
+description: The 1.9 call-shape ergonomics — prompt, instructions, the four timeout layers, abortSignal, and per-call capability overrides.
+---
+
+Four additions in 1.9 remove the boilerplate that used to sit between you and a correct call. All are optional; every 1.8 call still compiles and behaves identically.
+
+## `prompt` — one user turn
+
+Before 1.9, `messages` was the only way in, so the smallest possible call was a nested array literal.
+
+```ts title="prompt.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const res = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  prompt: 'Explain SSE in one sentence.',
+});
+```
+
+`prompt` is shorthand for exactly one user turn — `messages: [{ role: 'user', content: prompt }]` — and is **mutually exclusive** with `messages`. It is available on `streamChat`, `generateText`, `generateObject` and `streamObject`.
+
+Both are resolved into a canonical `Message[]` at the call boundary, so everything downstream (both loops, checkpoints, chat persistence, `response.messages`, observation) sees a plain `messages` array. Nothing else in the SDK knows the shorthand exists.
+
+<Callout type="warn" title="Passing both, or neither, is an error">
+`generateText` / `generateObject` **reject** with an `InvalidRequestError` before any network request. `streamChat` / `streamObject` keep their never-throw contract (G2): the error arrives as one `error` part on `fullStream`, `textStream` throws, `partialObjectStream` rejects, and `usage` / `finishReason` reject.
+
+One deliberate asymmetry: `messages: []` combined with `prompt` is *not* "both given" — an empty collection asks for nothing, so `prompt` wins. That keeps generic wrappers which always spread a full options bag working.
+</Callout>
+
+## `instructions` — the system prompt
+
+```ts title="instructions.ts"
+const res = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  instructions: 'You are terse. Answer in one sentence.',
+  prompt: 'Explain SSE.',
+});
+```
+
+`instructions` combines with either input shape and is placed **first**. A `system`-role message already in `messages` is **preserved after it** — the option arrives on its own structural field while history may be a replayed or user-supplied transcript, so history content cannot reorder or drop your framing.
+
+The fold is **idempotent**: if the first turn is already a system message whose content is exactly `instructions`, no second copy is prepended. That is what makes persisting the folded history and passing the same `instructions` on the next turn safe — system prompts cannot stack.
+
+```ts
+// messages: [{ role: 'system', content: 'You are terse.' }, { role: 'user', … }]
+// + instructions: 'You are terse.'   → unchanged, no duplicate.
+```
+
+There is no `system` option name. Adapters place `instructions` on their wire's dedicated system channel.
+
+## `timeout`
+
+There was no per-call timeout before 1.9 — only module constants (60s to first byte, 300s total), which is a meaningless ceiling inside a serverless function with a 25-second budget.
+
+```ts title="timeout.ts"
+await generateText({
+  model: anthropic('claude-opus-4-8'),
+  prompt: 'Summarise this repo.',
+  timeout: { ttftMs: 10_000, totalMs: 20_000, stepMs: 30_000, toolMs: 5_000 },
+});
+
+// A bare number is shorthand for { totalMs }:
+await generateText({ model, prompt: '…', timeout: 20_000 });
+```
+
+| Layer | Scope | Default when unset |
+| --- | --- | --- |
+| `ttftMs` | One model call: time to the **first content byte**. Cleared once content arrives, so a slow-but-alive stream is fine. | `60_000` |
+| `totalMs` | One model call: hard ceiling on that whole response. | `300_000` |
+| `stepMs` | One agentic step end-to-end — the model call **plus** the tool executions it triggered. | unbounded |
+| `toolMs` | One tool `execute`. | unbounded |
+
+- Only the layers you set are overridden; the others keep the table's defaults.
+- An explicit **`0` disables** that layer. That is how you opt out of the 300s total ceiling: `timeout: { totalMs: 0 }`.
+- Every timer is scheduled through `deps.clock` — never an ambient host timer — so tests stay deterministic.
+
+<Callout title="An expiry is a failure, not a cancellation">
+A timeout produces a `TimeoutError`: an `error` part plus rejected `usage` / `finishReason`. It never resolves `finishReason: 'aborted'` — that is reserved for a *user* abort, which still resolves with partial usage.
+
+Since 1.9 an expiry whose abort reason was discarded by the transport is recovered to the `TimeoutError` that was armed, rather than being misclassified as a user abort.
+</Callout>
+
+<Callout type="warn" title="`stepMs` is streaming-only today">
+`stepMs` is enforced in the **streaming** loop (`streamChat`). The buffered `generateText` loop honours `ttftMs` / `totalMs` / `toolMs` but not `stepMs` yet.
+</Callout>
+
+### `Tool.timeoutMs`
+
+Cap one slow tool without loosening the budget for every other one.
+
+```ts
+tools: {
+  runBuild: {
+    description: 'Run the project build.',
+    parameters: buildSchema,
+    timeoutMs: 120_000, // overrides timeout.toolMs for this tool only
+    execute: runBuild,
+  },
+}
+```
+
+Expiry is **self-healing**: the execution is abandoned and the model receives an `is_error` `tool_result` — `Tool 'runBuild' timed out after 120000ms and was abandoned.` — so every `tool_use_id` still gets a result and the run continues. Nothing throws out of the call.
+
+Tool timeouts **count toward the runaway-tool guard**, so a tool that hangs three times running hard-stops the loop instead of burning the full budget repeatedly. One success resets the counter. (Approval denials still do not count — a policy verdict is not something the model can fix.)
+
+## `abortSignal`
+
+A deprecated alias for `signal`, accepted purely for migration ergonomics.
+
+An AI SDK port copies `abortSignal` into an options object, and because excess-property checks only fire on literals it type-checked silently inside a spread: the user pressed stop and nothing happened.
+
+```ts
+const res = streamChat({ model, prompt, abortSignal: controller.signal }); // honoured
+```
+
+`abortSignal` is now honoured everywhere `signal` is. If both are set, **`signal` wins**. Prefer `signal`; the alias is `@deprecated` and exists for migrations.
+
+## `capabilities`
+
+Override what the SDK believes about a model it does not know yet.
+
+An unknown model slug does not throw; it falls back to a conservative registry row whose `maxOutput` is `4096`. So a brand-new Together / Groq / OpenRouter slug was **silently truncated** at 4096 output tokens, `reasoning: false` dropped `effort`, and `structuredOutput: false` pushed `generateObject` onto the tool strategy.
+
+```ts title="capabilities.ts"
+await generateText({
+  model: ollama('some-brand-new-model'),
+  prompt: '…',
+  capabilities: { maxOutput: 32_000, reasoning: true, structuredOutput: true },
+});
+```
+
+Shallow-merged over the resolved row — set only what you know. Also settable per factory via [`createOpenAICompatible({ capabilities })`](/docs/providers/compat#createopenaicompatible), with the per-call value winning.
+
+<Callout type="warn" title="This changes belief, not behaviour">
+`capabilities` overrides what the SDK *believes*; it cannot change what the provider does. In particular `capabilities.tools` is read by **no adapter**, so setting it neither enables nor disables tool calling.
+</Callout>
+
+A call that passes `capabilities` runs against a per-call clone of the model descriptor, so descriptor object *identity* differs for that call. Key and base-URL resolution are unchanged (G1 still resolves in one place).
+
+### `getModelCapabilities(model)`
+
+```ts title="gate-on-capabilities.ts"
+import { getModelCapabilities } from '@deuz-sdk/core';
+
+const caps = getModelCapabilities(model);
+if (caps.vision) showImageUpload();
+if (!caps.known) showNewModelHint(); // served from the conservative fallback row
+```
+
+Returns the effective matrix — registry row plus any factory-level override — as a **frozen copy**. It never throws, and because no `logger` is threaded through it, a read never emits a warning either. Use it instead of hard-coding slug lists in your UI.
+
+## See also
+
+- [streamChat](/docs/core/stream-chat) — the streaming entry point, `consume()`, and the `StreamPart` union.
+- [generateText](/docs/core/generate-text) — the buffered call and its step shapes.
+- [Files & PDFs](/docs/core/files) — `filePart()` and how non-image media maps per wire.
+- [Model registry](/docs/advanced/model-registry) — where the capability rows come from.
+- [Migrating from the Vercel AI SDK](/docs/migration/from-vercel-ai-sdk) — the option-by-option mapping.

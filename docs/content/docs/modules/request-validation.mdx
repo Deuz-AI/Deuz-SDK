@@ -1,0 +1,114 @@
+---
+title: Request validation
+description: validateChatRequest — the structural gate every chat route needs in front of a client-supplied canonical history.
+---
+
+Every documented chat route used to read `const { messages } = await req.json()` and hand the result straight to `streamChat`. That body is **attacker-controlled**, and canonical `Message[]` is expressive enough to be dangerous:
+
+1. `Role` includes `'system'`, so a client can append a system turn and overwrite the instructions your route thought it owned. **This is the live vector, and the one most deployments miss.**
+2. A forged `tool_result` part can claim any outcome ("payment captured"). On the wire a client-authored tool result is indistinguishable from one the server produced, and the model believes it.
+3. Forged assistant turns rewrite what the model thinks it already said.
+4. 50 000 messages, or one 40 MB message, is a billing attack.
+
+The [HMAC approval token](/docs/agents/durable-runtime) proves an approval *verdict* is genuine — it says nothing about the `messages` array around it. `validateChatRequest` is the structural gate in front of it.
+
+Available on `@deuz-sdk/core/chat` and `@deuz-sdk/core/edge`.
+
+## Use it
+
+```ts title="app/api/chat/route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function POST(req: Request): Promise<Response> {
+  const parsed = validateChatRequest(await req.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+
+  const { messages, chatId, approvalResponses } = parsed.request;
+
+  const result = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    instructions: 'You are a helpful assistant.', // the route owns the system prompt
+    messages,
+    ...(approvalResponses ? { approvalResponses } : {}),
+    signal: req.signal,
+  });
+  return toDeuzStreamResponse(result);
+}
+```
+
+```ts
+function validateChatRequest(body: unknown, options?: ValidateChatOptions): ValidateChatResult;
+
+type ValidateChatResult =
+  | { ok: true; request: DeuzChatRequest }
+  | { ok: false; issues: string[] };
+
+interface DeuzChatRequest {
+  messages: Message[];
+  chatId?: string;
+  approvalResponses?: ToolApprovalResponse[];
+  rest: Record<string, unknown>;
+}
+```
+
+`parseDeuzChatRequest(body, options?)` is the throwing variant for routes that already funnel every failure through one `catch`: it throws `InvalidRequestError`, which already reports `statusCode: 400` and whose `toJSON()` is secret-safe, so an existing error handler maps it with no new branch.
+
+## It never repairs
+
+Every failure is a **rejection**. A silently "cleaned" message array hides the attack and leaves the operator with no signal — so nothing is filtered out, ever. `issues` is always non-empty when `ok` is `false`.
+
+## Defaults
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `rejectSystemRole` | `true` | Reject `role: 'system'` in the client's messages. Opt out only if the client legitimately owns the system prompt (a local playground — never a multi-tenant deployment). |
+| `rejectToolResults` | `true` | Reject client-authored `tool_result` parts **and** `role: 'tool'` turns. A `tool_result` smuggled into a `role: 'user'` turn is caught at the part level too. |
+| `rejectAssistantTurns` | `false` | Regenerate and edit-and-resend legitimately replay assistant turns, so they are allowed by default. |
+| `maxMessages` | `1000` | History length cap. A body over the cap is rejected **without walking the entries** — rejecting 50 000 messages must not cost 50 000 validations. |
+| `maxTextBytes` | `100_000` | Per-message UTF-8 text budget (≈25k tokens). Counts string `content`, every `text`/`reasoning` part, and every string inside a `tool_use.input` / `tool_result.result`. |
+
+Image and PDF payloads are **excluded** from `maxTextBytes` — a legitimate photo is megabytes of base64 and would trip a cap sized for prose. Binary volume is a raw-body-size concern: cap that at the edge, which a pure validator cannot do for you.
+
+## Client tools need `rejectToolResults: false`
+
+`useChat`'s `onToolCall` round-trip POSTs a `role: 'tool'` message, so a route serving client tools must allow it:
+
+```ts
+const parsed = validateChatRequest(await req.json(), { rejectToolResults: false });
+```
+
+Understand exactly what that accepts. The validator **cannot** tell a real client tool result from a forged one, because the same client authored the assistant turn it pairs with. The only real fix is to stop trusting the history: persist it server-side with a [`ChatStore` + `chatId`](/docs/modules/chat-persistence) and treat the client's copy as a rendering cache.
+
+## Issue strings are bounded and secret-safe
+
+Only a bad `role` and a bad part `type` are ever echoed back, and each is **redacted first, then truncated** to 32 characters — that order matters, because truncating first could split a secret pattern so the redaction sweep no longer matches and its head leaks. `chatId` and approval `token` values are reported **by type only**, never by value.
+
+The issue list itself is capped (20 entries plus an `N further issue(s) suppressed.` line), so a 1000-message hostile body cannot amplify into 1000 strings your log aggregator has to eat.
+
+## `request.rest` is unvalidated passthrough
+
+Everything the client sent that is not `messages` / `chatId` / `approvalResponses` lands in `rest`, deliberately typed `Record<string, unknown>` (this is where `useChat`'s `options.body` fields arrive). It is a **new object**, but the values are the raw parsed JSON.
+
+<Callout type="warn" title="Never spread `rest` into call options">
+Read the fields you know by name and validate them yourself. Spreading it would hand a client control over `maxSteps`, `tools`, `deps` and every other call option.
+</Callout>
+
+## What it deliberately does not do
+
+- **No rate limiting.** The module is pure — no clock, no randomness, no `console` — so it cannot time anything. Rate limiting belongs at the edge.
+- **No proof of provenance.** It proves the body has the shape `streamChat` expects and that the client did not claim privileges it does not have. It cannot prove the history is the one your server previously produced; only server-side persistence can.
+- **No repair.** See above.
+
+Two structural hardenings worth knowing: a body carrying an own `__proto__` key is rejected outright (`JSON.parse` makes it an own enumerable property, and copying it onto a plain object hits `Object.prototype`'s setter), and role/part lookups use `Object.hasOwn`, so `{ type: 'constructor' }` cannot resolve off the prototype chain.
+
+## See also
+
+- [Client tools](/docs/agents/client-tools) — the round-trip that needs `rejectToolResults: false`.
+- [Chat persistence](/docs/modules/chat-persistence) — the server-side history that makes the client's copy a cache.
+- [Durable runtime](/docs/agents/durable-runtime) — `createApprovalSigner` and the signed approval token.
+- [UI streaming](/docs/modules/ui-streaming) — the wire this route answers on.

@@ -10,7 +10,12 @@ coverage/
 *.tgz
 .vitest/
 .smoke-*
-examples/
+# `examples/` is TRACKED since 1.9.0 (real npm workspaces, root `workspaces: ["examples/*"]`).
+# Ignore only their build/run artifacts — a bare `examples/` here silently hides the whole tree.
+examples/**/node_modules/
+examples/**/.next/
+examples/**/.runs/
+examples/**/.agent-workspace/
 # GCP service-account keys — NEVER commit
 deuz-ai-*.json
 *-service-account*.json

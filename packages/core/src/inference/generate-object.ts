@@ -7,9 +7,11 @@ import type {
 import type { ObjectRequest } from '../adapters/types';
 import { runStream } from '../core/inference';
 import { getCapabilities } from '../core/registry';
+import { createWarningSink } from '../internal/warnings';
+import { resolveDependencies } from '../internal/resolve-deps';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { NoObjectGeneratedError } from '../errors';
-import { pickObjectStrategy } from './object-shared';
+import { assertNoLoopOptions, loopOptionsError, pickObjectStrategy } from './object-shared';
 
 /** Collect the object payload: JSON text (json mode) or first tool-call args. */
 async function collect(result: StreamChatResult, strategy: 'json' | 'tool'): Promise<string> {
@@ -34,8 +36,17 @@ async function collect(result: StreamChatResult, strategy: 'json' | 'tool'): Pro
 export const generateObject: GenerateObject = async <T = unknown>(
   options: GenerateObjectOptions<T>,
 ): Promise<GenerateObjectResult<T>> => {
+  // 1.9: fail LOUD on loop options this call cannot honour — they used to be
+  // dropped in silence (the tools never reached the wire). `generateObject` is
+  // async, so a throw here is a rejected promise, before any network work.
+  const ignored = assertNoLoopOptions(options, 'generateObject');
+  if (ignored.length > 0) throw loopOptionsError(ignored, 'generateObject');
+
   const schema = await toJSONSchema(options.schema);
-  const caps = getCapabilities(options.model);
+  // ONE sink across every repair attempt (1.9): a repair is a second run of the
+  // SAME call, so the caller should see one set of notices, not one per attempt.
+  const warnings = createWarningSink(resolveDependencies(options.deps).logger);
+  const caps = getCapabilities(options.model, undefined, undefined, warnings);
 
   const strategy = pickObjectStrategy(options, caps);
 
@@ -52,7 +63,7 @@ export const generateObject: GenerateObject = async <T = unknown>(
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // Observation: each repair attempt is its own run (rare; honest timeline).
-    const result = runStream(options, { object, operation: 'generate-object' });
+    const result = runStream(options, { object, operation: 'generate-object', warnings });
     const raw = await collect(result, strategy); // throws on hard transport error
     const usage = await result.usage;
     const finishReason = await result.finishReason;
@@ -67,7 +78,12 @@ export const generateObject: GenerateObject = async <T = unknown>(
     }
     const validation = await validateOutput<T>(options.schema, parsed);
     if (validation.ok) {
-      return { object: validation.value, usage, finishReason };
+      return {
+        object: validation.value,
+        usage,
+        finishReason,
+        ...(warnings.list().length ? { warnings: warnings.list() } : {}),
+      };
     }
     lastError = new Error(validation.issues);
   }

@@ -61,7 +61,9 @@ export const streamStateStore = createInMemoryStreamStateStore({ maxStreams: 100
 ```
 
 ```ts title="app/api/chat/route.ts"
+import { after } from 'next/server';
 import { streamChat } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
 import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
 import { sessionStore, streamStateStore } from '@/lib/stores';
@@ -70,22 +72,42 @@ import { tools } from '@/lib/tools';
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 export async function POST(req: Request): Promise<Response> {
-  const { messages, runId } = await req.json(); // client mints runId per turn
+  const parsed = validateChatRequest(await req.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+
+  // `runId` is client-minted per turn and is NOT a validated field — read it off
+  // `rest` and check it yourself (it becomes a store key).
+  const raw = parsed.request.rest.runId;
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 200) {
+    return Response.json({ error: 'runId required' }, { status: 400 });
+  }
+  const runId = raw;
 
   const result = streamChat({
     model: anthropic('claude-opus-4-8'),
-    messages,
+    messages: parsed.request.messages,
     tools,
     maxSteps: 12,
     session: { store: sessionStore, runId }, // durable: checkpoint every step
   });
 
-  return toDeuzStreamResponse(result, {
+  const response = toDeuzStreamResponse(result, {
     store: streamStateStore, // resumable: journal every wire event
     streamId: runId, // one identity for both is the simplest wiring
   });
+
+  // The pump is lazy (G2): if the client disconnects and nothing pulls it, the run
+  // never reaches a step boundary — so nothing checkpoints. Drain it explicitly.
+  after(() => result.consume?.()); // `after` from 'next/server'
+  return response;
 }
 ```
+
+<Callout title="Why the explicit drain matters here">
+`toDeuzStreamResponse` is pulled by the *client*. When the client vanishes, the serializer keeps draining into the store — but on a runtime that freezes once the response ends, nothing is pulling at all, so the loop stops advancing and the next checkpoint is never written.
+
+[`consume()`](/docs/core/stream-chat#consume) takes its own subscription, never rejects, and is memoized, so it is safe alongside the serializer. Use whatever your platform calls the post-response hook: `after()` from `next/server`, or `ctx.waitUntil(...)` inside a Cloudflare Worker `fetch(req, env, ctx)`.
+</Callout>
 
 ```ts title="app/api/chat/[runId]/resume/route.ts"
 import { resumeDeuzChatResponse } from '@deuz-sdk/core/durable';

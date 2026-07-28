@@ -224,12 +224,27 @@ export class ContextOverflowError extends APICallError {
   }
 }
 
-/** A timeout (connect / ttft / total layer). Pre-first-byte timeouts may retry. */
+/**
+ * A timeout. `layer` says WHICH budget ran out, so a caller can react
+ * differently to "the provider never answered" and "my own agent ran long":
+ *
+ * - `connect` / `ttft` / `total` — ONE model call (`timeout.ttftMs`/`totalMs`).
+ *   Pre-first-byte timeouts may retry.
+ * - `step` (1.9) — one AGENTIC STEP end-to-end, the model call plus its tool
+ *   executions (`timeout.stepMs`). Enforced by both loops; never retried.
+ * - `tool` (1.9) — one tool `execute` (`timeout.toolMs` / `Tool.timeoutMs`).
+ *   Self-healing: it reaches the model as an is_error tool_result, so this
+ *   instance normally surfaces only on an observation event.
+ *
+ * `step`/`tool` are ADDITIVE members (1.9): the two deadlines existed already
+ * but had to report as `'total'`, which was indistinguishable from a real
+ * per-call ceiling.
+ */
 export class TimeoutError extends DeuzError {
   readonly code = 'timeout';
-  readonly layer: 'connect' | 'ttft' | 'total';
+  readonly layer: 'connect' | 'ttft' | 'total' | 'step' | 'tool';
   constructor(
-    layer: 'connect' | 'ttft' | 'total',
+    layer: 'connect' | 'ttft' | 'total' | 'step' | 'tool',
     message?: string,
     options?: { cause?: unknown },
   ) {

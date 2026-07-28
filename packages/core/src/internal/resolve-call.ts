@@ -53,6 +53,24 @@ export interface ResolveCallInput {
 }
 
 /**
+ * The ONE place the two cancellation aliases collapse (1.9). `signal` WINS when
+ * both are set; `abortSignal` is the deprecated AI SDK migration alias, added
+ * because a copy-pasted `abortSignal` inside a SPREAD object type-checks
+ * silently (excess-property checks only fire on literals) — so a user pressing
+ * stop appeared to do nothing.
+ *
+ * Resolving here — next to the other precedence rule (G1) rather than at each
+ * use site — is what keeps `core/timeout.ts`'s `combineSignals` (and every
+ * adapter) unaware that there are two names.
+ */
+export function resolveSignal(options: {
+  signal?: AbortSignal;
+  abortSignal?: AbortSignal;
+}): AbortSignal | undefined {
+  return options.signal ?? options.abortSignal;
+}
+
+/**
  * Merge factory settings (symbol), deps, and client config into a `ResolvedCall`.
  * Async because `keyProvider.getKey` may be async. Key precedence (G1):
  *   deps.keyProvider (if the user actually supplied one) >

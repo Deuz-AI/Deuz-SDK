@@ -1,10 +1,12 @@
 import type { StreamPart } from '../types/stream';
+import type { WarningSink } from '../internal/warnings';
 import type { CommonCallOptions } from '../types/config';
 import type { JSONSchema } from '../types/schema';
 import type { ToolChoice } from '../types/tool';
 import type { NormalizedMessage } from '../core/normalize';
 import type { ModelCapabilities } from '../core/registry';
 import type { ResolvedCall } from '../internal/resolve-call';
+import type { Logger } from '../types/deps';
 import type { DeuzError } from '../errors';
 
 /** Structured-output request (set by generateObject), honored in buildRequest. */
@@ -44,6 +46,19 @@ export interface BuildContext {
   object?: ObjectRequest;
   /** Present when the call provides tools (agentic loop). */
   tools?: WireToolRequest;
+  /**
+   * Per-call warning sink (1.9). A wire reports a lossy mapping as a TYPED
+   * warning on the result, not only as a log line the default no-op logger
+   * throws away. Pass `{ mirror: false }` at a site that already logs.
+   */
+  warnings?: WarningSink;
+  /**
+   * Injected logger, so a wire can make a lossy mapping VISIBLE instead of
+   * silently discarding request material (e.g. Chat Completions has no hosted
+   * tools). Optional on purpose — `buildRequest` stays pure and callable
+   * without it; `console.*` is banned in core, so this seam is the only way.
+   */
+  logger?: Logger;
 }
 
 export interface AdapterRequest {

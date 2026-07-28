@@ -57,6 +57,19 @@ export interface Tool<Args = unknown, Result = unknown> {
    * the server's outputSchema; the MCP SDK itself validates structured results.
    */
   outputSchema?: JSONSchema;
+  /**
+   * Per-execution cap for THIS tool in ms (1.9 additive), overriding the call's
+   * `timeout.toolMs`. Use it for the one tool that legitimately runs long (a
+   * browser session, a build) without loosening the budget for every other one.
+   *
+   * Expiry is SELF-HEALING, not fatal: the execution is abandoned and the loop
+   * feeds an `is_error` `tool_result` back to the model (every `tool_use_id`
+   * must still get a result — Anthropic 400s otherwise), so the run continues
+   * and the model can react. It never throws out of the call. The timer comes
+   * from the injected `deps.clock`, never an ambient host timer, so tests stay
+   * deterministic (edge-safe purity invariant).
+   */
+  timeoutMs?: number;
 }
 
 export type ToolSet = Record<string, Tool>;

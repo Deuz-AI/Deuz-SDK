@@ -10,11 +10,24 @@ icon: BookOpen
 npm install @deuz-sdk/core
 ```
 
-Requires **Node >= 22**. The chat core has nothing in `dependencies`. Optional peers are pulled in only if you use them: `zod` (or any Standard Schema library) plus `@standard-community/standard-json` for schema-typed [generateObject](/docs/core/generate-object); `@modelcontextprotocol/sdk` for [MCP](/docs/modules/mcp); `unpdf` / `mammoth` / `xlsx` for Node document parsing in [RAG](/docs/modules/rag).
+Requires **Node >= 22**. The chat core has nothing in `dependencies`. Optional peers are pulled in only if you use them: `zod` (or any Standard Schema library) plus `@standard-community/standard-json` for schema-typed [generateObject](/docs/core/generate-object); `@modelcontextprotocol/sdk` for [MCP](/docs/modules/mcp); `unpdf` / `mammoth` / `xlsx` for Node document parsing in [RAG](/docs/modules/rag); `playwright` for browser tools; `@opentelemetry/api` for the OTel bridge on `@deuz-sdk/core/otel`.
+
+## New in 1.9
+
+Everything below is additive — no existing type gained a required field, and every 1.8 call still compiles and behaves identically.
+
+- **`prompt` / `instructions`**, and a four-layer `timeout: { ttftMs, totalMs, stepMs, toolMs }` → [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts)
+- **`createAgent`** — a reusable agent as a frozen value on `@deuz-sdk/core/agent`, not a class → [createAgent](/docs/agents/create-agent)
+- **`validateChatRequest`** — a chat route that validates its own body before it reaches a model → [Request validation](/docs/modules/request-validation)
+- **`filePart()` and PDFs on all four wires** → [Files & PDFs](/docs/core/files)
+- **Ordered `UIMessage.parts`**, so a multi-step turn renders in the interleave it actually had → [Chat persistence & state](/docs/modules/chat-persistence#ordered-parts-19) and [React hooks](/docs/modules/react-hooks#rendering-ordered-parts)
+
+Three 1.9 surfaces first shipped as **types and plumbing only** — `warnings`, tool-approval **denial** fields, and `sub-agent` parts in `useChat` — and all three now have real producers. One residual gap is stated wherever it appears: `warnings` is live on `streamChat` but **`undefined` on `generateText` / `generateObject` / `streamObject`**, and a loop-routed call reports only its own `activeTools` notices. The whole surface, with its limitations, is on one page: [What is new in 1.9](/docs/reference/whats-new-1-9).
 
 ## Start by use case
 
 - **Build a chatbot** → [Quickstart](/docs/quickstart) + [React hooks](/docs/modules/react-hooks) + [UI streaming](/docs/modules/ui-streaming)
+- **Build a reusable agent (1.9)** → [createAgent](/docs/agents/create-agent) + [Tools](/docs/agents/tools)
 - **Build a coding agent** → [Tools](/docs/agents/tools) + [Sub-agents](/docs/agents/subagents) + [Budget stops](/docs/agents/tool-loop)
 - **Build an autonomous agent (1.8)** → [Autonomy](/docs/modules/autonomy) + [Build your own Manus](/docs/cookbooks/autonomous-agent)
 - **Build a long-running agent** → [Compaction](/docs/core/compaction) + [Durable runtime](/docs/agents/durable-runtime) + [prepareStep](/docs/agents/tool-loop)
@@ -137,7 +150,7 @@ A provider factory returns a tiny `LanguageModel` descriptor; the [model registr
 
 ## Quality bar
 
-- **575 tests** across 63 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network)
+- **Over 1,000 tests** across 89 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network), plus a separate type-contract lock run with `--typecheck`
 - `tsc` strict (`moduleResolution: "Bundler"`, `verbatimModuleSyntax`, `noUncheckedIndexedAccess`)
 - `eslint` with edge-safety enforced, `publint --strict`, and `attw` (Are The Types Wrong) all green
 - Dual **ESM + CJS** build with `.d.ts` for every subpath export

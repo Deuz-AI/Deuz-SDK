@@ -5,6 +5,8 @@ import type {
   EmbeddingModelSurface,
 } from '../types/model';
 import type { Logger } from '../types/deps';
+import type { WarningSink } from '../internal/warnings';
+import { readConfig } from '../internal/config-symbol';
 
 /**
  * Single source of truth for per-model behavior. Everything capability-aware
@@ -344,31 +346,123 @@ function defaultNativeRow(): Row {
   });
 }
 
-/** Resolve capabilities for a model descriptor; warns (once-ish) on unknown slugs. */
-export function getCapabilities(model: LanguageModel, logger?: Logger): ModelCapabilities {
+/**
+ * Apply the capability OVERRIDES and freeze (1.9). This is the SINGLE merge site
+ * for the whole SDK — precedence, lowest to highest:
+ *
+ *   registry row  <  factory `capabilities` (config Symbol)  <  per-call override
+ *
+ * Both override channels arrive here as ONE already-merged blob on the config
+ * Symbol (`internal/config-symbol.ts` merges per-call over factory when it builds
+ * the per-call descriptor clone), so no call path can ever observe a different
+ * matrix than any other.
+ *
+ * NOTHING is validated: a garbage value rides through untouched and the "unknown
+ * slugs never throw" policy stays intact — an override is a claim about the
+ * model, not a request the SDK can check. Only `undefined` values are skipped,
+ * so a generic wrapper forwarding `{ maxOutput: undefined }` cannot blank a field
+ * (which would send `max_tokens: undefined` and 400 on Anthropic).
+ *
+ * The result is a FROZEN COPY. Returning the live `REGISTRY` row would let one
+ * caller mutate a module-level singleton and poison every later call in the
+ * process.
+ */
+function finalize(
+  row: Row,
+  known: boolean,
+  model: LanguageModel,
+  overrides?: Partial<ModelCapabilities>,
+): ModelCapabilities {
+  const caps: ModelCapabilities = { ...row, known };
+  // Factory blob first, explicit argument last — per-call always outranks factory.
+  apply(caps, readConfig(model)?.capabilities);
+  apply(caps, overrides);
+  return Object.freeze(caps);
+}
+
+/** Shallow-assign the DEFINED keys of one override layer. No validation, ever. */
+function apply(caps: ModelCapabilities, overrides: Partial<ModelCapabilities> | undefined): void {
+  if (!overrides) return;
+  const defined: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value !== undefined) defined[key] = value;
+  }
+  Object.assign(caps, defined);
+}
+
+/**
+ * Resolve capabilities for a model descriptor; warns (once-ish) on unknown slugs.
+ * The warning fires on the ROW, before any override is applied: an override says
+ * the caller knows better, not that the registry knows the slug.
+ *
+ * `overrides` is for call sites that hold the options object; sites that only
+ * hold a descriptor (the pump, both object entry points) get the caller's
+ * per-call override through the config Symbol of the per-call descriptor clone
+ * built at the call boundary (`internal/config-symbol.ts:withCapabilityOverride`).
+ * Either route lands in {@link finalize}, so the matrix is identical.
+ *
+ * `warnings` (1.9) is the per-call sink that turns the fallback from a log line
+ * into a typed `{ type: 'unknown-model' }` the caller can read off the result.
+ * It is recorded QUIETLY — the `logger?.warn` above it is the pre-1.9 line, in
+ * the pre-1.9 shape (provider/modelId/surface fields), and the whole point is
+ * that a log-based workflow sees EXACTLY what it saw before, once. A KNOWN slug
+ * returns before either channel: a false `unknown-model` would fire on every
+ * call of every user, so both exits are behind the same early return.
+ */
+export function getCapabilities(
+  model: LanguageModel,
+  logger?: Logger,
+  overrides?: Partial<ModelCapabilities>,
+  warnings?: WarningSink,
+): ModelCapabilities {
   // Native surface is keyed in its own table so a slug can serve both wires.
   if (model.surface === 'native') {
     const nrow = NATIVE_REGISTRY[model.modelId];
-    if (nrow) return { ...nrow, known: true };
-    logger?.warn(`Unknown native model '${model.modelId}' — using Gemini-native defaults.`, {
+    if (nrow) return finalize(nrow, true, model, overrides);
+    const message = `Unknown native model '${model.modelId}' — using Gemini-native defaults.`;
+    logger?.warn(message, {
       provider: model.provider,
       modelId: model.modelId,
       surface: model.surface,
     });
-    return { ...defaultNativeRow(), known: false };
+    // Already logged by the line above — record only (see WarningSink.add).
+    warnings?.add({ type: 'unknown-model', message }, { mirror: false });
+    return finalize(defaultNativeRow(), false, model, overrides);
   }
 
   const known = REGISTRY[model.modelId];
-  if (known) return { ...known, known: true };
-  logger?.warn(
-    `Unknown model '${model.modelId}' — using conservative ${model.provider}/${model.surface} defaults.`,
-    {
-      provider: model.provider,
-      modelId: model.modelId,
-      surface: model.surface,
-    },
-  );
-  return { ...defaultRow(model.provider, model.surface), known: false };
+  if (known) return finalize(known, true, model, overrides);
+  const message = `Unknown model '${model.modelId}' — using conservative ${model.provider}/${model.surface} defaults.`;
+  logger?.warn(message, {
+    provider: model.provider,
+    modelId: model.modelId,
+    surface: model.surface,
+  });
+  // Already logged by the line above — record only (see WarningSink.add).
+  warnings?.add({ type: 'unknown-model', message }, { mirror: false });
+  return finalize(defaultRow(model.provider, model.surface), false, model, overrides);
+}
+
+/**
+ * Public read accessor for a model's effective capability matrix (1.9) —
+ * registry row plus any factory-level `capabilities` override carried by the
+ * descriptor. Gate your own UI on it instead of hard-coding a slug list:
+ *
+ * ```ts
+ * const caps = getModelCapabilities(model);
+ * if (caps.vision) showImageUpload();
+ * if (!caps.known) showNewModelHint(); // conservative fallback row
+ * ```
+ *
+ * A frozen COPY: mutating the result is a no-op (and never touches the registry),
+ * so the next call sees the same matrix. Unknown slugs never throw and, since no
+ * `logger` is threaded here, a read never emits a warning either.
+ *
+ * NOTE: it reports what the SDK BELIEVES. `tools` in particular is read by no
+ * adapter (verified) — it neither enables nor disables tool calling.
+ */
+export function getModelCapabilities(model: LanguageModel): Readonly<ModelCapabilities> {
+  return getCapabilities(model);
 }
 
 // ===================================================================

@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/02-tool-loop",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Agentic tool loop with a cost budget and a self-healing tool error.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

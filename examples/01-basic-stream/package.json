@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/01-basic-stream",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Stream one answer and read the real token usage.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

@@ -3,7 +3,10 @@
  * provider factories PLUS a tiny string-lookup model router.
  *
  * The factories (Groq, Mistral, DeepSeek, Together, OpenRouter, Cerebras,
- * Fireworks, Moonshot/Kimi, Qwen, GLM, MiniMax) live in `providers-compat.ts`.
+ * Fireworks, Moonshot/Kimi, Qwen, GLM, MiniMax) live in `providers-compat.ts`,
+ * together with the generic `createOpenAICompatible({ id, … })` (1.9) for any
+ * unlisted OpenAI-shaped host — Ollama, vLLM, LM Studio, an internal gateway —
+ * which carries YOUR provider id instead of borrowing an unrelated factory's.
  * Dedicated Azure OpenAI + Amazon Bedrock (Mantle) factories live in
  * `./azure` and `./bedrock` and are re-exported here for the registry.
  * This module also adds `createProviderRegistry`, so a caller can resolve
@@ -16,8 +19,9 @@
 import type { LanguageModel, Provider } from './types/model';
 import { InvalidRequestError, ModelNotFoundError } from './errors';
 
-export type { CompatSettings } from './providers-compat';
+export type { CompatSettings, OpenAICompatibleSettings } from './providers-compat';
 export {
+  createOpenAICompatible,
   createGroq,
   groq,
   createMistral,

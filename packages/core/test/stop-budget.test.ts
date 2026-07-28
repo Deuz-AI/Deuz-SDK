@@ -3,7 +3,9 @@ import { generateText, streamChat } from '../src/index';
 import type { StreamPart } from '../src/types/stream';
 import { totalTokensExceed, costExceeds } from '../src/inference/stop';
 import { createAnthropic } from '../src/anthropic';
+import { createMockModel } from '../src/testing';
 import type { JSONSchema } from '../src/types/schema';
+import type { StreamChatOptions } from '../src/types/methods';
 import type { Usage } from '../src/types/usage';
 import { sseResponse, sseEvents, mockFetchSequence } from './fixtures/sse';
 
@@ -328,6 +330,82 @@ describe('live cost part (1.7, D2)', () => {
     expect(parts.at(-1)?.type).toBe('finish');
     expect(parts.some((p) => p.type === 'cost')).toBe(false);
     expect(logger.warn).toHaveBeenCalled();
+  });
+});
+
+describe('false-finish guard budget (1.9, N2)', () => {
+  /** Collect a streaming run's parts and its terminal `deuz` metadata. */
+  async function run(
+    // NOT `Parameters<typeof streamChat>[0]`: the public entry point is
+    // overloaded, so that resolves to the `prompt` shorthand variant.
+    options: Omit<StreamChatOptions, 'messages'>,
+  ): Promise<{ parts: StreamPart[]; deuz?: Record<string, unknown>; modelCalls: number }> {
+    const result = streamChat({ messages: [{ role: 'user', content: 'go' }], ...options });
+    const parts: StreamPart[] = [];
+    for await (const part of result.fullStream) parts.push(part);
+    const finish = parts.find(
+      (p): p is Extract<StreamPart, { type: 'finish' }> => p.type === 'finish',
+    );
+    return {
+      parts,
+      deuz: finish?.providerMetadata?.deuz as Record<string, unknown> | undefined,
+      modelCalls: parts.filter((p) => p.type === 'step-start').length,
+    };
+  }
+
+  it('re-drives past maxSteps (a SEPARATE budget) and marks stoppedBy on exhaustion', async () => {
+    // maxSteps 1 would bound the loop to a single model call; the guard's own
+    // budget is what governs the re-drives, exactly like maxVerifyAttempts.
+    const { modelCalls, parts, deuz } = await run({
+      model: createMockModel({ responses: [{ text: 'not really done' }] }),
+      tools: TOOLS,
+      maxSteps: 1,
+      doneWhen: () => false,
+      falseFinishGuard: { maxRetries: 1 },
+    });
+    expect(modelCalls).toBe(2); // 1 + one re-drive
+    expect(parts.filter((p) => p.type === 'false-finish')).toEqual([
+      { type: 'false-finish', stepIndex: 0, attempt: 0, willRetry: true },
+      { type: 'false-finish', stepIndex: 1, attempt: 1, willRetry: false },
+    ]);
+    // Same metadata channel as the budget.* markers.
+    expect(deuz).toEqual({ stoppedBy: 'false-finish' });
+  });
+
+  it('a tripped stopWhen still ends the run first — doneWhen is never consulted', async () => {
+    const { fetch, calls } = mockFetchSequence([() => sseResponse([TOOL_CALL])]);
+    const doneWhen = vi.fn(() => false);
+    const { deuz } = await run({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      tools: TOOLS,
+      maxSteps: 10,
+      stopWhen: totalTokensExceed(20), // trips at step 2, before any final text
+      doneWhen,
+    });
+    expect(calls).toHaveLength(2);
+    // The loop never reached a natural completion, so the guard never ran and
+    // the stop condition owns the marker.
+    expect(doneWhen).not.toHaveBeenCalled();
+    expect(deuz).toEqual({ stoppedBy: 'totalTokensExceed' });
+  });
+
+  it('falseFinishGuard without doneWhen: warns ONCE per run, guard stays inert', async () => {
+    // Same shape as the inert-costExceeds test above: an option that cannot
+    // fire must not do so silently. Two steps prove the warning is per RUN.
+    const logger = makeLogger();
+    const { fetch, calls } = mockFetchSequence([() => sseResponse([TOOL_CALL])]);
+    const { parts, deuz } = await run({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      tools: TOOLS,
+      maxSteps: 2,
+      falseFinishGuard: { maxRetries: 5 },
+      deps: { logger },
+    });
+    expect(calls).toHaveLength(2);
+    expect(parts.some((p) => p.type === 'false-finish')).toBe(false);
+    expect(deuz).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('no doneWhen provided'));
   });
 });
 

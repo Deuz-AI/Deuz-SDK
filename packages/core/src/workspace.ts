@@ -19,13 +19,37 @@ export type { Workspace, WorkspaceEntry } from './types/workspace';
  * Normalize a workspace-relative path and reject traversal. Backslashes fold to
  * `/`, a leading `./` is stripped, and any `..` segment or absolute path throws
  * `InvalidRequestError` — a workspace backend never sees an escaping path.
+ *
+ * This guard is the ONLY one every backend shares (the in-memory store, a KV or
+ * object-store adapter, and `createFileWorkspace`), so it has to be complete on
+ * its own rather than leaning on the filesystem to catch what it misses:
+ *
+ * - A **Windows drive-letter** path (`D:/x`, `d:x`) does not start with `/`, so
+ *   the leading-slash test never saw it. On the Node backend that walked
+ *   straight out of the sandbox: `path.relative` returns an ABSOLUTE path when
+ *   the two sides live on different devices, so the backend's own `'..'` check
+ *   passed too and the model only had to emit a foreign drive letter.
+ * - A **UNC / device path** (`//server/share`, `\\?\C:\…`) folds to `//…` and is
+ *   caught by the leading-slash test — pinned by a test so it stays that way.
+ * - A **NUL byte** used to pass every string check and was stopped only by
+ *   `node:fs` (`ERR_INVALID_ARG_VALUE`). A backend that happily stores the key
+ *   verbatim — any KV — would have inherited the hole.
  */
 export function normalizeWorkspacePath(rel: string): string {
   const norm = rel.replace(/\\/g, '/').replace(/^\.\//, '');
   if (norm.length === 0) {
     throw new InvalidRequestError({ message: 'Empty workspace path.' });
   }
-  if (norm.startsWith('/') || norm.split('/').some((seg) => seg === '..')) {
+  if (norm.includes('\0')) {
+    throw new InvalidRequestError({
+      message: `Illegal workspace path (contains a NUL byte).`,
+    });
+  }
+  if (
+    norm.startsWith('/') ||
+    /^[a-zA-Z]:/.test(norm) ||
+    norm.split('/').some((seg) => seg === '..')
+  ) {
     throw new InvalidRequestError({
       message: `Illegal workspace path '${rel}' (absolute paths and '..' traversal are not allowed).`,
     });

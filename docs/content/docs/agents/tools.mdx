@@ -3,7 +3,7 @@ title: Defining Tools
 description: The Tool / ToolSet shape — parameters, execute, return values, errors, and Zod argument inference.
 ---
 
-A **tool** is a function the model can call by name. You pass a `ToolSet` (a plain `Record<string, Tool>`) to [generateText](/docs/core/generate-text) or [streamChat](/docs/core/stream-chat); the presence of `tools` switches on the agentic loop. Each tool declares a `parameters` schema the model must satisfy and an optional `execute` you run server-side. Tools are defined inline — there is no `tool()` wrapper to import; you write the object literally.
+A **tool** is a function the model can call by name. You pass a `ToolSet` (a plain `Record<string, Tool>`) to [generateText](/docs/core/generate-text) or [streamChat](/docs/core/stream-chat); the presence of `tools` switches on the agentic loop. Each tool declares a `parameters` schema the model must satisfy and an optional `execute` you run server-side. A plain object literal is always valid; since 1.9 there is also an optional [`tool()`](#the-tool-helper) helper whose only job is to type `execute`'s arguments.
 
 ## The `Tool` shape
 
@@ -18,6 +18,7 @@ interface Tool<Args = unknown, Result = unknown> {
     | ((args: Args, ctx: ToolExecuteContext) => boolean | Promise<boolean>);
   outputSchema?: JSONSchema; // carried metadata only (populated by MCP tools)
   providerTool?: Record<string, unknown>; // raw native definition for a 'provider' tool
+  timeoutMs?: number; // 1.9: per-execution cap for THIS tool, overrides timeout.toolMs
 }
 
 type ToolSet = Record<string, Tool>;
@@ -28,7 +29,7 @@ There are four kinds of tool, distinguished by these fields:
 | Tool kind | How it runs | Shape | Example |
 | --- | --- | --- | --- |
 | Server function tool | The SDK runs your `execute` | `execute` set, `type` omitted | `getWeather` |
-| Client tool | No `execute` — the loop breaks and the UI does a round-trip | `execute` omitted | `confirmPurchase` (see [Client tools](/docs/agents/client-tools)) |
+| Client tool | A **key present in `tools`** with no `execute` — the loop breaks and the UI does a round-trip | `execute` omitted | `confirmPurchase` (see [Client tools](/docs/agents/client-tools)) |
 | Provider tool | The model provider runs it during the turn | `type: 'provider'` + `providerTool` | `anthropicWebSearch()`, `openaiWebSearch()`, `googleSearch()` (see [Provider-executed tools](/docs/agents/server-tools)) |
 | Sub-agent tool | A nested agentic loop runs | built by `agentTool(...)` | `agentTool({ name: 'researcher', … })` (see [Sub-agents](/docs/agents/subagents)) |
 
@@ -41,8 +42,43 @@ You rarely set `type`/`providerTool` by hand — the `anthropicWebSearch()` / `o
 | `execute` | `(args, ctx) => Result \| Promise<Result>` | no | Runs the tool server-side. Omit it for a **client tool** (see below). |
 | `needsApproval` | `boolean` or predicate | no | Gates the call on approval. `true` always asks; a predicate gets the parsed args + ctx and is awaited (a **throwing** predicate counts as approval-required — safe side). See below. |
 | `outputSchema` | `JSONSchema` | no | Expected result shape — metadata only, never sent on chat wires and not validated by the loop. [MCP tools](/docs/modules/mcp) populate it from the server's `outputSchema`. |
+| `timeoutMs` | `number` | no | 1.9. Per-execution cap for this tool, overriding the call's `timeout.toolMs`. Expiry is self-healing: the execution is abandoned and the model gets an `is_error` `tool_result`. See [Timeouts](/docs/core/prompts-and-timeouts#tooltimeoutms). |
 
 The map **key** is the tool name the model calls — there is no `name` field on `Tool` itself.
+
+## The `tool()` helper
+
+`ToolSet` is `Record<string, Tool>`, which erases `Tool<Args, Result>`. A hand-written tool literal therefore gets `args: unknown` inside `execute`, and editing the schema produces **no compile error** in the handler — the mismatch shows up as a runtime failure instead.
+
+```ts title="tool-helper.ts"
+import { generateText, tool } from '@deuz-sdk/core';
+import { z } from 'zod';
+
+const getWeather = tool({
+  description: 'Current weather for a city',
+  parameters: z.object({ city: z.string() }),
+  execute: async (args) => fetchWeather(args.city), // args: { city: string }
+});
+
+await generateText({ model, prompt: 'weather in Paris?', maxSteps: 5, tools: { getWeather } });
+```
+
+`tool()` is a **pure identity function** — `tool(def) === def`. It imports no validator (zod stays an optional peer), introspects nothing and adds zero runtime behaviour; its entire job is inference. A tool can still be frozen, shared across calls or compared by identity.
+
+A raw JSON Schema has no type-level payload, so it degrades to `unknown` (deliberately **not** `any`): the handler must still narrow, exactly as a hand-written tool does. Two type helpers come with it:
+
+```ts
+import type { InferToolInput, InferToolOutput } from '@deuz-sdk/core';
+
+type Args = InferToolInput<typeof getWeather>;  // { city: string }
+type Out = InferToolOutput<typeof getWeather>;  // awaited return type
+```
+
+Both work on `tool()` results and on plain `Tool<Args, Result>` values; `InferToolOutput` is awaited, so a sync and an async tool report the same type.
+
+<Callout title="One sharp edge">
+Calling `myTool.execute(args, ctx)` **directly** checks `args` as `unknown`. `Tool` is invariant in `Args` (the argument sits in a contravariant position), so `tool()`'s return type is an intersection in order to stay assignable to plain `ToolSet` — which is where tools are actually used. The return type is still correct, and authoring inference and the loop are unaffected.
+</Callout>
 
 ## Tool approval (`needsApproval`)
 
@@ -246,19 +282,31 @@ tools: {
 
 To guard against a model looping on a broken tool, the same tool failing on **three consecutive steps** hard-stops the loop. Every `tool_use` always gets exactly one `tool_result` (a hard provider requirement). See [the tool loop](/docs/agents/tool-loop) for the full self-healing and runaway-guard rules.
 
-## Client tools (no `execute`)
+## Client tools (a registered key with no `execute`)
 
-Omit `execute` and the tool becomes a **client tool**: the model can request it, but the loop has no way to run it server-side. When a step calls a client tool, the loop stops early and returns the call in `result.toolCalls` — your application owns the round-trip and appends the matching `tool_result` itself.
+A **client tool** is a key **present in `tools`** whose value has no `execute`: the model can request it, but the loop has no way to run it server-side. When a step calls one, the loop stops early and returns the call in `result.toolCalls` — your application owns the round-trip and appends the matching `tool_result` itself.
 
 ```ts
 tools: {
-  // No `execute`: the model can request it, but you fulfill it client-side.
+  // Registered, but no `execute`: the model can request it, you fulfill it client-side.
   openMap: {
     description: 'Open the map UI centered on a location.',
     parameters: z.object({ lat: z.number(), lng: z.number() }),
   },
 }
 ```
+
+<Callout type="warn" title="An unregistered name is NOT a client tool (changed in 1.9)">
+Before 1.9 a tool call naming something absent from `tools` satisfied the same "no `execute`" test, so a **hallucinated** name broke the loop as if it were a client hand-off — leaving a dangling `tool_use`, no error, and a server waiting forever for a `tool_result` nobody could produce.
+
+An unregistered name is now recognized as unregistered and fed back to the model as an `is_error` `tool_result` in the same turn, and the loop **continues**:
+
+```
+No such tool: "search_web". Available tools: getWeather, search.
+```
+
+The model usually corrects itself. Unknown-tool errors count toward the runaway guard, so a model looping on the same invented name hard-stops after 3 consecutive failures. A name that collides with an `Object.prototype` member (`toString`, `constructor`) is classified as unknown too — own keys only.
+</Callout>
 
 ## `prepareStep` and `activeTools`
 
@@ -383,6 +431,8 @@ const result = await generateText({
 - [generateText](/docs/core/generate-text) — buffered runs and the result/step shapes.
 - [streamChat](/docs/core/stream-chat) — stream tool calls and results as they happen.
 - [Tool loop](/docs/agents/tool-loop) — the agentic loop's invariants: immutable history, parallel execution, runaway guards, and the Gemini stop-bug guard.
+- [createAgent](/docs/agents/create-agent) — bind a tool set to a model once, as a reusable value.
+- [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts) — `timeout.toolMs` and `Tool.timeoutMs`.
 - [generateObject](/docs/core/generate-object) — structured output, which reuses the same schema bridge.
 - [Context compaction](/docs/core/compaction) — automatic layered history trimming; runs before `prepareStep` on every step.
 - [Sub-agents](/docs/agents/subagents) — `agentTool` wraps a whole nested loop (with its own `prepareStep`/`activeTools`/stop conditions) as a callable `Tool`.

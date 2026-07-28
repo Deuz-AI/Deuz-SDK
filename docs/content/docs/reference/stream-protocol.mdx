@@ -37,8 +37,19 @@ for await (const part of result.fullStream) {
 
 | `type` | When | Notes |
 | --- | --- | --- |
-| `verify` | `verifyStep` evaluated on a natural completion | `ok`, `attempt`, `willRetry`, optional `feedback`. Canonical stream only (not mapped onto the UI wire). |
+| `verify` | `verifyStep` evaluated on a natural completion | `stepIndex`, `attempt`, `ok`, `willRetry`, optional `feedback`. **Since 1.9 it is also serialized onto the UI wire** (v2 only), journaled to the `StreamStateStore` and replayed on resume — before that it was dropped by `toDeuzStreamResponse`, so a verified run looked identical to an unverified one client-side. |
 | `plan-update` | Emitted via `emitPlanUpdate` from a tool | Live `TaskList` snapshot for a to-do panel. Also a UI v2 part. |
 | `activity` | Emitted via `emitActivity` from a tool | "Computer" feed line (`message`, optional `level` / `data` / `agentPath`). Also a UI v2 part. |
+
+### Additive parts and fields in 1.9
+
+| `type` / field | When | Notes |
+| --- | --- | --- |
+| `warning` | A lossy mapping was applied (a stripped sampling param, an unknown-slug capability fallback, a tool or document the wire could not carry) | `{ warning: CallWarning }`. Emitted as it is discovered — always before the model's own output, because every warning site runs during capability resolution and request building. **Also serialized onto the UI wire** (v2 only, message re-redacted), journaled to the `StreamStateStore` and replayed on resume; folds into `AssistantTurnState.warnings`. The same set resolves in bulk on `StreamChatResult.warnings`. `CallWarning['type']` is an **open** union — keep a `default`. |
+| `false-finish` | The `doneWhen` guard rejected a natural completion | `{ stepIndex, attempt, willRetry }`. One part per rejection, always before the terminal `finish`; `willRetry: false` is the rejection that spent the `falseFinishGuard` budget, after which `finish` carries `providerMetadata.deuz.stoppedBy = 'false-finish'`. Streaming loop only. **On the UI wire** (v2 only), journaled and replayed, and folded into `AssistantTurnState.falseFinishes` — the same treatment `verify` got. |
+| `tool-state.denied` / `.deniedReason` | An approval **refused** a gated call | Optional fields qualifying a terminal `state: 'error'` whose cause was a verdict, not a thrown tool. Set by the streaming loop at both terminal sites; `deniedReason` is the denier's own words (absent for a server-mode `approveToolCall`, whose verdict is a bare boolean). `ToolRunState` deliberately gains no 7th member, so exhaustive switches keep compiling. |
+| `data.id` | `writeData(name, payload, { id })` | Reconciliation key. The wire stays strictly append-only; last-write-wins is the client's job. |
+
+**Wire v1 output is unchanged in every byte.** The `tool-state` fields and the data-part `id` ride carriers a v1 client already drops wholesale, and the two brand-new part types are v2-only — including when they sit inside a `sub-agent` frame, which is filtered recursively.
 
 Run the focused protocol suite with `npm run test:protocol`.

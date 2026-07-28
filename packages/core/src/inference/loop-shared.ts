@@ -1,7 +1,7 @@
 import type { CommonCallOptions, PrepareStepResult, VerifyStepResult } from '../types/config';
 import type { Message, Part } from '../types/message';
 import type { Usage } from '../types/usage';
-import type { Logger, ResolvedDependencies } from '../types/deps';
+import type { Clock, Logger, ResolvedDependencies } from '../types/deps';
 import type {
   Tool,
   ToolSet,
@@ -32,10 +32,17 @@ import {
 } from './compaction';
 import { createTokenEstimator, type TokenEstimator } from '../internal/estimate-tokens';
 import { attachClientContext, readClientContext } from '../internal/client-context';
+// Type-only: the sink itself is created by the loop (or not at all), so nothing
+// from internal/warnings.ts is pulled into a bundle that never collects one.
+import type { WarningSink } from '../internal/warnings';
 import { getCapabilities } from '../core/registry';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
-import { ToolExecutionError } from '../errors';
+// `resolveTimeouts` is the SINGLE resolution point for every timeout layer
+// (core/timeout.ts); this module is the documented CONSUMER of `toolMs` — it is
+// the only place tools actually run.
+import { combineSignals, resolveTimeouts } from '../core/timeout';
+import { TimeoutError, ToolExecutionError } from '../errors';
 import {
   createObservationRuntime,
   observeCost,
@@ -46,6 +53,12 @@ import {
 import { toObservedError } from '../internal/observe-error';
 import type { ToolCompletedEvent, ToolDeniedEvent } from '../types/observe';
 
+/**
+ * Runaway guard: N consecutive is_error results for the SAME tool name hard-stop
+ * the loop. Approval denials are excluded (deliberate verdicts, not failures);
+ * unknown-tool errors and per-execution TIMEOUTS are NOT excluded — see the
+ * rationale at both sites in `executeTools`.
+ */
 export const MAX_SAME_TOOL_ERRORS = 3;
 
 /**
@@ -345,21 +358,34 @@ export async function buildWireTools(
  * Restrict the wire tool list to `names`. Unknown names warn and are ignored;
  * if NOTHING matches, fail OPEN (full list) — an empty tools array would
  * silently cripple the step, which is worse than an over-wide one.
+ *
+ * Both notices also reach `warnings` (1.9) when a sink is threaded in. That is
+ * the whole point: the DEFAULT logger is a no-op, so a single typo'd name used
+ * to send every tool with nothing visible anywhere. FAIL-OPEN is unchanged — a
+ * warning never drops a tool.
  */
 export function filterWireTools(
   wire: WireToolRequest,
   names: string[] | undefined,
   logger: Logger,
+  warnings?: WarningSink,
 ): WireToolRequest {
   if (!names) return wire;
   const allowed = new Set(names);
   const known = new Set(wire.tools.map((t) => t.name));
+  // The sink ALWAYS mirrors to the same logger (internal/warnings.ts), so it
+  // REPLACES the direct log line instead of adding a second one — a log-only
+  // caller (no sink) keeps exactly the pre-1.9 output.
+  const warn = (message: string): void => {
+    if (warnings) warnings.add({ type: 'unsupported-tool', setting: 'activeTools', message });
+    else logger.warn(message);
+  };
   for (const n of names) {
-    if (!known.has(n)) logger.warn(`activeTools: unknown tool name '${n}' ignored`);
+    if (!known.has(n)) warn(`activeTools: unknown tool name '${n}' ignored`);
   }
   const tools = wire.tools.filter((t) => allowed.has(t.name));
   if (tools.length === 0 && wire.tools.length > 0) {
-    logger.warn('activeTools: no known tool names matched — sending the full tool list');
+    warn('activeTools: no known tool names matched — sending the full tool list');
     return wire;
   }
   return { ...wire, tools };
@@ -378,6 +404,7 @@ export async function applyPrepareStep(
   fullWire: WireToolRequest,
   staticWire: WireToolRequest,
   logger: Logger,
+  warnings?: WarningSink,
 ): Promise<{ options: CommonCallOptions; messages: Message[]; wire: WireToolRequest }> {
   let stepOptions = options;
   let messages = ctx.messages;
@@ -388,7 +415,9 @@ export async function applyPrepareStep(
   if (ps) {
     if (ps.messages) messages = ps.messages;
     if (ps.model) stepOptions = { ...stepOptions, model: ps.model };
-    if (ps.activeTools) wire = filterWireTools(fullWire, ps.activeTools, logger);
+    // A per-step typo warns like the static list does — deduped by the sink, so
+    // a hook that returns the same bad name every step reports it once.
+    if (ps.activeTools) wire = filterWireTools(fullWire, ps.activeTools, logger, warnings);
     if (ps.toolChoice) wire = { ...wire, toolChoice: ps.toolChoice };
   }
   return { options: stepOptions, messages, wire };
@@ -424,6 +453,91 @@ export function verifyFeedbackMessage(verdict: VerifyStepResult): Message {
       verdict.feedback ??
       'The previous answer did not pass verification. Review it and produce a corrected answer.',
   };
+}
+
+/**
+ * Default re-drive budget for the false-finish guard (1.9, N2): at most TWO
+ * re-drives, i.e. three answers per run. Matched to `verifyStep`'s effective
+ * budget (`DEFAULT_MAX_VERIFY_ATTEMPTS` = 3 attempts = 2 retries) — the two hooks
+ * sit on the SAME boundary and should not cost wildly different amounts by
+ * default — and deliberately small: every re-drive is a full extra model call,
+ * and a predicate that never accepts would otherwise burn the caller's budget on
+ * nudges. Note the unit difference: `maxVerifyAttempts` counts ATTEMPTS,
+ * `falseFinishGuard.maxRetries` counts RETRIES.
+ */
+export const DEFAULT_FALSE_FINISH_RETRIES = 2;
+
+/**
+ * `providerMetadata.deuz.stoppedBy` marker recorded when the guard runs out of
+ * re-drives and the loop accepts a finish `doneWhen` rejected. Kebab-case like
+ * the `budget.*` markers, and deliberately NOT a `conditionName`: no `stopWhen`
+ * condition fired — the loop ended naturally, over an objection.
+ */
+export const FALSE_FINISH_STOPPED_BY = 'false-finish';
+
+/** Resolve the guard's re-drive budget (`false` / `{ maxRetries: 0 }` = observation-only). */
+export function resolveFalseFinishRetries(guard: CommonCallOptions['falseFinishGuard']): number {
+  if (guard === false) return 0;
+  if (guard === undefined || guard === true) return DEFAULT_FALSE_FINISH_RETRIES;
+  const max = guard.maxRetries;
+  // A non-finite budget would make every `attempt < max` comparison false, i.e.
+  // silently disable the guard — fall back to the documented default instead.
+  if (max === undefined || !Number.isFinite(max)) return DEFAULT_FALSE_FINISH_RETRIES;
+  return Math.max(0, Math.floor(max));
+}
+
+/**
+ * Evaluate `doneWhen` at a natural completion (1.9, N2) — the TWIN of
+ * `evaluateVerifyStep`: same seam, same boundary, same shape (`undefined` with no
+ * hook, otherwise the verdict plus whether the loop should RETRY: rejected and
+ * budget remaining). `attempt` is the number of re-drives ALREADY spent, so the
+ * first rejection is attempt 0 and `maxRetries` is a retry count.
+ *
+ * Callers consult this FIRST and skip verification when it asks for a retry (see
+ * `doneWhen` in types/config.ts): it is the cheaper, narrower question, and
+ * verifying an answer the caller already called incomplete buys nothing but a
+ * model call. A THROW PROPAGATES — caller code, like `prepareStep`/`verifyStep`.
+ */
+export async function evaluateDoneWhen(
+  options: CommonCallOptions,
+  ctx: { stepIndex: number; attempt: number; text: string; messages: Message[]; usage: Usage },
+): Promise<{ done: boolean; retry: boolean } | undefined> {
+  if (!options.doneWhen) return undefined;
+  const done = await options.doneWhen({
+    text: ctx.text,
+    messages: ctx.messages,
+    usage: ctx.usage,
+    stepIndex: ctx.stepIndex,
+  });
+  if (done) return { done: true, retry: false };
+  return { done: false, retry: ctx.attempt < resolveFalseFinishRetries(options.falseFinishGuard) };
+}
+
+/**
+ * The user turn injected when the false-finish guard re-drives the loop. Kept
+ * short and task-agnostic: `doneWhen` returns a boolean, so there is no
+ * caller-supplied feedback to relay (that is `verifyStep`'s job) — this only has
+ * to stop the model from re-emitting the same premature "done".
+ */
+export function falseFinishMessage(): Message {
+  return {
+    role: 'user',
+    content:
+      'That is not finished yet. Do not stop here: keep working on the parts of the request that are still incomplete, and give a final answer only once everything asked for is actually done.',
+  };
+}
+
+/**
+ * Config sanity (1.9): `falseFinishGuard` on its own does nothing — the guard is
+ * ARMED by `doneWhen`. Warn once per loop rather than fail: an inert option is
+ * not worth killing a run over, but it must not be silent either, because the
+ * name reads like a guard the SDK could arm by itself. It cannot — only the
+ * caller knows what "done" means for the task.
+ */
+export function warnFalseFinishConfig(options: CommonCallOptions, logger: Logger): void {
+  if (options.falseFinishGuard !== undefined && !options.doneWhen) {
+    logger.warn('falseFinishGuard: no doneWhen provided — the false-finish guard never fires');
+  }
 }
 
 const SUMMARY_PROMPT =
@@ -481,7 +595,12 @@ export function setupCompaction(
   if (!options.compaction) return undefined;
   return {
     policy: normalizeCompaction(options.compaction),
-    contextWindow: getCapabilities(options.model, deps.logger).contextWindow,
+    // 1.9: the per-call `capabilities` override is threaded EXPLICITLY here (this
+    // site holds the options object). Idempotent with the descriptor-clone route
+    // the call boundary uses — same merge site, same precedence — but it means a
+    // caller who corrects `contextWindow` for an unknown slug gets the right
+    // compaction threshold even on a path that never went through `generate.ts`.
+    contextWindow: getCapabilities(options.model, deps.logger, options.capabilities).contextWindow,
     estimator: createTokenEstimator(),
   };
 }
@@ -615,12 +734,52 @@ export function toStepResult(
   };
 }
 
-/** True if any tool call targets a tool with no server-side `execute` (a client tool). */
+/**
+ * Look a called name up in the tool set. OWN keys only: a hallucinated name
+ * like `toString`/`constructor` resolves on `Object.prototype`, and treating
+ * that inherited function as a registered tool is exactly the misclassification
+ * this trio exists to prevent.
+ */
+function lookupTool(tools: ToolSet, name: string): Tool | undefined {
+  return Object.prototype.hasOwnProperty.call(tools, name) ? tools[name] : undefined;
+}
+
+/**
+ * A LEGITIMATE client tool: a key PRESENT in `tools` with no server-side
+ * `execute`. The caller owns its round-trip, so it breaks the loop.
+ * Provider-executed tools run upstream — never a client round-trip.
+ */
+export function isClientTool(tools: ToolSet, name: string): boolean {
+  const tool = lookupTool(tools, name);
+  return tool !== undefined && !tool.execute && tool.type !== 'provider';
+}
+
+/** True when the model invented a name that is not in the tool set at all. */
+export function isUnknownTool(tools: ToolSet, name: string): boolean {
+  return lookupTool(tools, name) === undefined;
+}
+
+/**
+ * Self-heal feedback for a hallucinated tool name. Listing the real names is
+ * what makes it actionable — the model's next turn can pick a valid one.
+ */
+export function unknownToolMessage(tools: ToolSet, name: string): string {
+  const available = Object.keys(tools);
+  return available.length > 0
+    ? `No such tool: "${name}". Available tools: ${available.join(', ')}.`
+    : `No such tool: "${name}". No tools are available.`;
+}
+
+/**
+ * True if any tool call targets a real client tool (a key present in `tools`
+ * with no `execute`). An UNKNOWN name is deliberately NOT a client tool (1.9):
+ * it used to satisfy the old `!tools[name]?.execute` test, so a hallucinated
+ * name broke the loop and the caller waited forever for a tool_result nobody
+ * could produce. Unknown names now fall through to `executeTools`, which
+ * self-heals them into an is_error tool_result in the SAME turn.
+ */
 export function hasClientTool(toolCalls: ToolCall[], tools: ToolSet): boolean {
-  // Provider-executed tools are run by the provider — never a client round-trip.
-  return toolCalls.some(
-    (c) => !tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider',
-  );
+  return toolCalls.some((c) => isClientTool(tools, c.toolName));
 }
 
 /**
@@ -635,6 +794,11 @@ export function hasClientTool(toolCalls: ToolCall[], tools: ToolSet): boolean {
  * through the parent's settle untouched: the parent re-executes the sub-agent
  * call, which resumes its own checkpoint and consumes them). Returns null
  * when there is nothing to settle.
+ *
+ * The verdict map rides out alongside `deniedIds` (1.9): the ids alone are
+ * enough to keep denials out of the runaway guard, but not to tell a UI WHY a
+ * call ended — the client-supplied `reason` lives on the map, and dropping it
+ * here is what made `ToolStatePart.denied`/`deniedReason` unreachable.
  */
 export async function settlePendingApprovals(
   messages: Message[],
@@ -645,7 +809,12 @@ export async function settlePendingApprovals(
     /** Called after denials are known but before approved/server calls execute. */
     beforeExecute?: (calls: ToolCall[], deniedIds: ReadonlySet<string>) => void;
   },
-): Promise<{ messages: Message[]; results: ToolResult[]; deniedIds: Set<string> } | null> {
+): Promise<{
+  messages: Message[];
+  results: ToolResult[];
+  deniedIds: Set<string>;
+  denied: DenialMap;
+} | null> {
   // An EMPTY array still settles (default-deny the gated rest) — that is how a
   // durable resume without verdicts answers pending calls on the safe side.
   const responses = options.approvalResponses;
@@ -718,11 +887,13 @@ export async function settlePendingApprovals(
           });
         }
       }
-    } else if (!tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider') {
+    } else if (isClientTool(tools, c.toolName)) {
       denied.set(c.toolCallId, {
         cause: 'client-tool-no-result',
         reason: 'No result provided for this client tool.',
       });
+      // A HALLUCINATED name is not a client tool (1.9): no denial is recorded so
+      // it reaches executeTools and gets the actionable unknown-tool is_error.
     } else if (gated.has(c.toolCallId)) {
       denied.set(c.toolCallId, { cause: 'no-response', reason: 'No approval response.' });
     }
@@ -756,7 +927,7 @@ export async function settlePendingApprovals(
   lifecycle?.beforeExecute?.(calls, deniedIds);
   const results = await executeTools(calls, tools, options, messages, denied, extras);
   const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
-  return { messages: [...messages, toolMessage], results, deniedIds };
+  return { messages: [...messages, toolMessage], results, deniedIds, denied };
 }
 
 /**
@@ -835,6 +1006,47 @@ export function observeServerResolutions(
   }
 }
 
+/** Outcome of one per-execution-capped tool run. */
+type ToolExecOutcome = { timedOut: true } | { timedOut: false; value: unknown };
+
+/**
+ * Race one tool execution against its per-execution cap (1.9). The timer comes
+ * from the injected `deps.clock` — never `setTimeout`/`AbortSignal.timeout` —
+ * so fake-clock tests are deterministic (edge-safe purity invariant), and it is
+ * cleared on EVERY exit path (resolve, reject, expiry) so a long agentic run
+ * cannot accumulate armed timers.
+ *
+ * On expiry the execution is ABANDONED, not killed — JS cannot kill a running
+ * promise. Two things happen instead: the tool's own signal is aborted (a
+ * well-behaved tool passing it to `fetch` / an MCP client / a sandbox stops
+ * working), and the orphaned promise gets a no-op catch, because nobody awaits it
+ * anymore and an unhandled rejection would take a Node process down.
+ */
+async function runWithToolTimeout(
+  clock: Clock,
+  ms: number,
+  expiry: AbortController,
+  invoke: () => Promise<unknown>,
+): Promise<ToolExecOutcome> {
+  let cancelTimer: (() => void) | undefined;
+  const deadline = new Promise<ToolExecOutcome>((resolve) => {
+    cancelTimer = clock.setTimeout(() => resolve({ timedOut: true }), ms);
+  });
+  // A tool that throws SYNCHRONOUSLY still becomes a rejected promise here, so
+  // the caller's catch self-heals it exactly as it did before 1.9.
+  const work = invoke().then((value): ToolExecOutcome => ({ timedOut: false, value }));
+  try {
+    const outcome = await Promise.race([work, deadline]);
+    if (outcome.timedOut) {
+      expiry.abort(new TimeoutError('total', `Tool execution exceeded ${ms}ms.`));
+      void work.catch(() => {});
+    }
+    return outcome;
+  } finally {
+    cancelTimer?.();
+  }
+}
+
 /** JSON-ish runtime type label for tool.completed. */
 function outputTypeOf(value: unknown): ToolCompletedEvent['outputType'] {
   if (value === null) return 'null';
@@ -863,8 +1075,14 @@ export async function executeTools(
 ): Promise<ToolResult[]> {
   const cap = options.maxToolConcurrency ?? 5;
   const parallel = toolCalls.length > 1;
+  // Call-level per-tool cap (1.9), resolved ONCE per step. The `undefined` guard
+  // keeps the pre-1.9 path allocation-free: no `timeout` → no object, no timer.
+  const callToolMs =
+    options.timeout === undefined ? undefined : resolveTimeouts(options.timeout).toolMs;
   return mapWithConcurrency(toolCalls, cap, async (call): Promise<ToolResult> => {
-    const tool: Tool | undefined = tools[call.toolName];
+    // OWN-key lookup (see lookupTool): an inherited `Object.prototype` member
+    // must classify as UNKNOWN, not as an executor-less client tool.
+    const tool: Tool | undefined = lookupTool(tools, call.toolName);
 
     // Observation (1.6): one tool span per call, emitted INSIDE the worker so
     // parallel events interleave in real completion order. Provider tools
@@ -886,6 +1104,9 @@ export async function executeTools(
         type: 'tool.started',
         ...obBase!,
         needsApproval: tool?.needsApproval !== undefined && tool.needsApproval !== false,
+        // An UNKNOWN name has no mode; it reports 'client' rather than widening
+        // this locked union (append-only surface) — the tool.failed event that
+        // follows immediately carries the real story.
         executionMode: tool?.execute ? 'server' : 'client',
         parallel,
         ...(ob.rt.capture.toolInputs ? { capturedInput: call.args } : {}),
@@ -924,7 +1145,27 @@ export async function executeTools(
           isError: true,
         });
       }
-      if (!tool?.execute) {
+      if (!tool) {
+        // Hallucinated tool name (1.9): self-heal like every other tool failure —
+        // an is_error tool_result naming the REAL tools, produced in this same
+        // turn so every tool_use_id stays answered (Anthropic 400 guard). It
+        // deliberately DOES count toward MAX_SAME_TOOL_ERRORS: unlike an
+        // approval denial (a human/policy verdict the model cannot fix, hence
+        // excluded), an invented name is a model-side defect it is expected to
+        // correct from this feedback — and a model re-calling the SAME invented
+        // name forever is precisely the runaway the guard exists for. The
+        // counter keys on toolName, so the invented name gets its own budget
+        // and never poisons a real tool's.
+        const message = unknownToolMessage(tools, call.toolName);
+        emitToolFailed(new Error(message), true);
+        return settle({
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          result: message,
+          isError: true,
+        });
+      }
+      if (!tool.execute) {
         emitToolFailed(new Error('No server-side executor.'), true);
         return settle({
           toolCallId: call.toolCallId,
@@ -943,6 +1184,17 @@ export async function executeTools(
           isError: true,
         });
       }
+      // Per-execution cap (1.9): the tool's OWN `timeoutMs` outranks the call's
+      // `timeout.toolMs`; neither set = no cap, i.e. the pre-1.9 behaviour where a
+      // hung MCP server or a selector-less browser click held the agent forever.
+      // A cap needs the injected clock to schedule it — with no `extras.deps`
+      // (only reachable from a direct `executeTools` call, never from a loop)
+      // there is nothing to schedule on, so the call stays uncapped rather than
+      // reaching for an ambient timer.
+      const capMs = tool.timeoutMs ?? callToolMs;
+      const clock: Clock | undefined = extras?.deps?.clock;
+      const timed = capMs !== undefined && capMs > 0 && clock !== undefined;
+      const expiry = timed ? new AbortController() : undefined;
       try {
         // Sub-agent inheritance: a per-call deps clone carries the runtime +
         // this tool call's span via a non-enumerable symbol (parallel-safe).
@@ -956,7 +1208,9 @@ export async function executeTools(
         const ctx: ToolExecuteContext = {
           toolCallId: call.toolCallId,
           messages,
-          signal: options.signal,
+          // The expiry signal is MERGED with the caller's, never replacing it: a
+          // user abort and a tool timeout must both reach the tool.
+          signal: expiry ? combineSignals([options.signal, expiry.signal]) : options.signal,
           ...(options.agentPath ? { agentPath: options.agentPath } : {}),
           ...(options.approveToolCall ? { approveToolCall: options.approveToolCall } : {}),
           ...(ctxDeps ? { deps: ctxDeps } : {}),
@@ -965,7 +1219,35 @@ export async function executeTools(
           ...(extras?.session ? { session: extras.session } : {}),
           ...(extras?.approvalResponses ? { approvalResponses: extras.approvalResponses } : {}),
         };
-        const out = await tool.execute(validation.value, ctx);
+        const invoke = (): Promise<unknown> =>
+          Promise.resolve(tool.execute!(validation.value, ctx));
+        const outcome: ToolExecOutcome = timed
+          ? await runWithToolTimeout(clock, capMs, expiry!, invoke)
+          : { timedOut: false, value: await invoke() };
+        if (outcome.timedOut) {
+          // SELF-HEALING, never fatal: the abandoned call still gets a
+          // tool_result, so every tool_use_id stays answered (Anthropic 400
+          // guard) and the model can react — retry with a narrower input, or
+          // pick another tool.
+          //
+          // It DOES count toward MAX_SAME_TOOL_ERRORS. An approval denial is
+          // excluded because it is a human/policy verdict the model cannot fix,
+          // and re-asking is the correct behaviour; a timeout is the opposite —
+          // a tool that hangs three times in a row is precisely the runaway the
+          // guard exists for, and each repetition costs the FULL cap in wall
+          // clock (3 × 30s on a serverless budget of 25s). If the model recovers,
+          // one success resets the counter (`bumpErrorGuard`), so a flaky-but-
+          // usable tool is never permanently disqualified.
+          const message = `Tool '${call.toolName}' timed out after ${capMs}ms and was abandoned.`;
+          emitToolFailed(new TimeoutError('total', message), true);
+          return settle({
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            result: message,
+            isError: true,
+          });
+        }
+        const out = outcome.value;
         if (ob) {
           ob.rt.emit({
             type: 'tool.completed',

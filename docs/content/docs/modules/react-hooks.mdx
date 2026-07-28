@@ -1,13 +1,11 @@
 ---
 title: React Hooks
-description: useChat and useObject — client-side hooks over the Deuz UI wire, with automatic client-tool round-trips and tool-approval pauses.
+description: useChat and useObject from @deuz-sdk/react — ordered part rendering, writable state, multimodal input, client-tool round-trips and approval pauses.
 ---
 
-> **1.7+:** the React surface lives in **`@deuz-sdk/react`** — `useChat` v2 (chatId, rendered `initialMessages`, live `cost`/`budgetExceeded` state, `regenerate`/`editAndResend`, signed-approval token flow, `reconnect()` over `connectDeuzStream`) plus headless `ToolApprovalCard` and `CostBadge` components. **1.8** adds live `plan` and `activity` from the UI wire's `plan-update` / `activity` parts (autonomous runs). Everything below that still imports `@deuz-sdk/core/react` keeps working but is **frozen**; new features land in `@deuz-sdk/react`, whose hooks bind the pure chat engine at [`@deuz-sdk/core/chat`](/docs/modules/chat-persistence).
+> **Import from `@deuz-sdk/react`.** The frozen `@deuz-sdk/core/react` subpath still works, but every feature since 1.7 lands in the package. The hooks bind the pure chat engine at [`@deuz-sdk/core/chat`](/docs/modules/chat-persistence) to React state; no business logic lives in them.
 
-`@deuz-sdk/core/react` ships two hooks built on [`readDeuzStream`](/docs/modules/ui-streaming): `useChat` for conversational UIs and `useObject` for streaming structured output. They are plain TypeScript hooks (no JSX, no components) and work with any React framework.
-
-**React is an optional peer** (`^18 || ^19`) — install it yourself; nothing else in the SDK depends on it, and no other subpath pulls it in. The hooks are SSR-safe: network runs only inside user-triggered callbacks, never at render time.
+**React is an optional peer** (`^18 || ^19`) — install it yourself; nothing else in the SDK depends on it. The hooks are plain TypeScript (no JSX) and SSR-safe: network runs only inside user-triggered callbacks, never at render time.
 
 ```bash
 npm i react
@@ -15,52 +13,242 @@ npm i react
 
 ## useChat
 
-```ts
-import { useChat } from '@deuz-sdk/react'; // preferred; @deuz-sdk/core/react is frozen
+```tsx
+import { useChat } from '@deuz-sdk/react';
 
 const {
-  messages,            // UIMessage[] — render-friendly
-  status,              // 'idle' | 'streaming' | 'error'
-  error,               // Error | undefined
-  sendMessage,         // (text: string) => Promise<void>
-  regenerate,          // rerun the last user turn
-  stop,                // abort the in-flight stream (not an error)
-  pendingApprovals,    // ToolApprovalRequest[] — chat is PAUSED while non-empty
-  addToolApprovalResponse, // ({ approvalId, approved, reason? }) => Promise<void>
-  plan,                // latest plan-update snapshot (1.8 autonomous runs)
-  activity,            // activity feed lines this turn (1.8 "Computer" view)
-} = useChat({
-  api: '/api/chat',    // endpoint serving toDeuzStreamResponse
-  onToolCall: async (call) => runInBrowser(call), // client tools (optional)
-});
+  messages, // UIMessage[] — the render view, each with ordered `parts`
+  history, // { ui, canonical } — both views in one object
+  status, // 'idle' | 'streaming' | 'error'
+  error,
+  sendMessage, // (input: ChatInput) => Promise<void>
+  regenerate,
+  editAndResend,
+  stop,
+  setHistory, // replace BOTH views
+  setMessages, // replace the UI view; re-derives canonical (lossy)
+  addToolResult, // answer a parked client tool call
+  clearError,
+  pendingApprovals, // chat is PAUSED while non-empty
+  pendingToolCalls, // parked client tool calls (no onToolCall executor)
+  addToolApprovalResponse,
+  reconnect,
+  usage, // this turn's terminal token usage (1.9)
+  finishReason, // 'length' means the answer was truncated (1.9)
+  steps, // per-step usage/finish (1.9)
+  verifications, // verifyStep verdicts (1.9)
+  warnings, // CallWarning[] from `warning` parts (1.9)
+  falseFinishes, // doneWhen rejections (1.9)
+  subAgents, // one frame per delegated agentTool run (1.9)
+  cost,
+  budgetExceeded,
+  dataParts,
+  citations,
+  plan,
+  activity,
+} = useChat({ api: '/api/chat' });
 ```
-
-### Live plan + activity (1.8)
-
-When the server emits `plan-update` / `activity` parts (via `emitPlanUpdate` / `emitActivity` from [`@deuz-sdk/core/runtime`](/docs/modules/autonomy#background-runs--live-view)), `@deuz-sdk/react`'s `useChat` surfaces them as `plan` (latest snapshot) and `activity` (append-only feed for the current turn). Use them for a to-do panel and a "Computer" activity log — no custom `data-*` plumbing required.
 
 ### Options
 
 | Option | Type | Notes |
 | --- | --- | --- |
-| `api` | `string` | Route that returns [`toDeuzStreamResponse`](/docs/modules/ui-streaming) output. |
-| `initialMessages` | `Message[]` | Seed the canonical history (e.g. restored from storage). |
-| `headers` / `body` | records | Merged into every request (body fields ride next to `messages`). |
-| `onToolCall` | `(call) => unknown \| Promise<unknown>` | Executor for **client tools** — see below. |
-| `onError` | `(error) => void` | Called when the stream fails (state also carries the error). |
+| `api` | `string` | Route returning [`toDeuzStreamResponse`](/docs/modules/ui-streaming) output. |
+| `initialMessages` | `Message[]` | Seed canonical history. **Read once at mount** — see the note below. |
+| `headers` / `body` | records | Merged into every request; `body` fields ride next to `messages`. |
+| `chatId` | `string` | Merged into every request body (server-side `ChatStore` persistence). |
+| `resume` | `UseChatResumeOptions` | `{ endpoint, auto?, lastEventId?, cursor? }` — see [Resuming](#resuming). |
+| `generateId` | `() => string` | Id source for UI messages/turns. Defaults to `crypto.randomUUID` with a fallback. |
+| `throttleMs` | `number` | Default `0` (1.8 behaviour). Coalesce React commits — see [throttleMs](#throttlems). |
+| `onToolCall` | `(call) => unknown \| Promise<unknown>` | Client-tool executor. **Omit it** to park instead — see [Client tools](#client-tools). |
+| `onData` | `(data: { name, id?, payload }) => void` | Fires once per `data-{name}` frame, with the **raw** frame, before reconciliation. A throw is swallowed. |
+| `onError` | `(error: Error) => void` | Called when the stream fails (state also carries the error). |
+| `onHttpError` | `'error-part' \| 'ignore'` | Default `'error-part'`: a non-2xx from `api` becomes `status: 'error'` instead of an empty bubble. Forwarded verbatim to `readDeuzStream`. |
 | `fetch` | `typeof fetch` | Injectable transport (tests, custom auth). |
 
-### What it renders vs what it sends
+<Callout title="`initialMessages` is read once, deliberately">
+It is not re-adopted when the prop changes: apps pass an inline array literal, so a new identity arrives on **every** render, and adopting it would reset the transcript continuously — mid-stream it would clobber the turn being folded. Switching chats or hydrating later is an explicit action: call `setHistory`. Same rule and remedy as React's own `useState`.
+</Callout>
 
-The hook keeps **two** histories. `messages` is the render-friendly `UIMessage[]` (accumulated `content`, `reasoning`, and `toolCalls` with live `state`). Internally it maintains the canonical `Message[]` — reconstructing each assistant `tool_use` turn from the streamed `tool-call` parts exactly like the [manual browser recipe](/docs/agents/client-tools#example-nextjs-route--readdeuzstream) — and POSTs `{ messages, ...body }` on every round. History is immutable (new arrays every update).
+### Two histories, one commit
 
-### Client tools — automatic round-trip
+The hook keeps **two** views of the conversation and publishes them in a **single** state commit, so no render can ever see one a frame behind the other:
 
-When the server streams a `tool-call` it did not execute (a client tool), the hook calls your `onToolCall`, appends the `tool_result` to the canonical history, and **re-POSTs automatically** — looping until a round has no pending client calls. A throwing `onToolCall` self-heals as an `is_error` result, mirroring the server loop's behavior.
+- `messages` — the render-friendly `UIMessage[]` (accumulated `content`, `reasoning`, `toolCalls` with live `state`, and ordered `parts`).
+- `history.canonical` — the canonical `Message[]` it POSTs, reconstructing each assistant `tool_use` turn from the streamed `tool-call` parts.
 
-### Tool approvals — pause and resume
+`history` exposes the pair the hook already holds, so **persisting a chat should persist `history.canonical`** rather than round-tripping through the lossy `canonicalFromUI`. Its identity is stable until a view changes. History is immutable — new arrays on every update.
 
-A `tool-approval-request` part **pauses** the chat: the request lands in `pendingApprovals`, the matching `toolCalls` entry flips to `state: 'approval-requested'`, and nothing is re-POSTed. Record verdicts with `addToolApprovalResponse`; once **every** pending approval has one, the hook resumes with `approvalResponses` in the request body — the [server settles the gated calls](/docs/agents/client-tools#tool-approval-round-trip), the client never fabricates gated tool_results.
+## Rendering ordered parts
+
+`content` / `reasoning` / `toolCalls` are **buckets**. A multi-step run — think → search → "I found 3 papers" → fetch → "here is the summary" — flattens into one reasoning blob, one text blob and a detached list of tool cards, so a UI cannot place a tool card between the two sentences it belongs between.
+
+Since 1.9 each message also carries `parts?: UIMessagePart[]` in **arrival order**. No wire change was needed: the canonical stream is already strictly ordered, so arrival order *is* the interleave.
+
+```tsx title="Turn.tsx"
+import type { UIMessage, UIToolCall } from '@deuz-sdk/react';
+
+function byId(calls: UIToolCall[] | undefined, id: string) {
+  return calls?.find((c) => c.toolCallId === id);
+}
+
+export function Turn({ message }: { message: UIMessage }) {
+  // No `parts` (a pre-1.9 message, or one restored from old storage)? Render the buckets.
+  if (!message.parts) return <Prose text={message.content} />;
+
+  return (
+    <>
+      {message.parts.map((part, i) => {
+        switch (part.type) {
+          case 'step-start':
+            // A real streamed turn's parts[0] is normally one of these.
+            return <StepDivider key={i} step={part.step} />;
+          case 'text':
+            return <Prose key={i} text={part.text} streaming={part.state === 'streaming'} />;
+          case 'reasoning':
+            // `encrypted` text is an opaque provider payload, not thinking text.
+            return part.encrypted ? null : <Thinking key={i} text={part.text} />;
+          case 'tool': {
+            const call = byId(message.toolCalls, part.toolCallId);
+            return call ? <ToolCard key={i} call={call} /> : null;
+          }
+          case 'file':
+            return <Attachment key={i} mediaType={part.mediaType} data={part.data} url={part.url} />;
+          case 'citation':
+            return <Source key={i} part={part} />;
+          case 'data':
+            return <Widget key={i} name={part.name} payload={part.payload} />;
+          default:
+            return null; // open union — keep a default
+        }
+      })}
+    </>
+  );
+}
+```
+
+Rules that are easy to get wrong:
+
+- **`parts` is optional and absent until the first element exists.** `createAssistantTurn`'s shape is public surface, and a `UIMessage` restored from pre-1.9 storage legitimately has none. Render `parts` when present, the buckets otherwise.
+- **`step-start` is normally `parts[0]`** of a real streamed turn, because the streaming loop pushes one at the top of every iteration. A renderer without a case for it will hit its `default` on the very first element.
+- **Skip `reasoning` parts flagged `encrypted`** — the text is an opaque encrypted provider payload (OpenAI Responses), not display text. `redacted` marks a provider-redacted thinking block. Neither flag can appear on a *streamed* turn (the wire's `reasoning-delta` carries no such field); they arrive on history projected by `uiFromMessages`.
+- **A `tool` element carries only `{ type, toolCallId }`** — a reference into `toolCalls`, not a copy, because a call's state mutates over the turn's life and two copies would drift.
+- **A `file` element carries the canonical value verbatim.** `url` is set only when `data` is already a renderable `data:` / `http(s):` src; for bytes, build one yourself. See [Files](/docs/core/files).
+- **A `citation` element is the same object** already pushed into `turn.citations` — one object, no drift.
+
+The buckets are **not** deprecated and keep their exact 1.8 semantics: `content` is still the turn's full text, byte-identical.
+
+### Rendering a sub-agent run
+
+A delegated run — `agentTool()` or `agent.asTool()` — is **not** in the parent's `parts`. It lands in a channel of its own, `subAgents`, one frame per `agentPath`:
+
+```tsx
+const { subAgents } = useChat({ api: '/api/chat' });
+
+// frame: { agentPath: string[]; afterPart: number; turn: AssistantTurnState }
+{subAgents?.map((frame) => (
+  <section
+    key={frame.agentPath.join('/')}
+    style={{ marginLeft: frame.agentPath.length * 16 }}
+  >
+    <Badge>{frame.agentPath.join(' › ')}</Badge>
+    <Turn message={frame.turn.message} />
+  </section>
+))}
+```
+
+`frame.turn` is a full `AssistantTurnState` folded by the **same** reducer re-entering itself, so the child's text, reasoning, ordered `parts`, tool cards, citations and activity are as complete as the parent's — `<Turn>` above is the very same component from the previous section, `step-start` case and encrypted-reasoning skip included. `frame.turn.message.toolCalls` holds the child's own calls, so a `tool` element inside it resolves against the child, not the parent.
+
+- **`afterPart`** is how many of the *parent's* ordered elements existed when the frame opened — normally right after the `tool` card for the delegating call. Splice the block in there to reproduce the real interleave; indent or badge by `agentPath.length`.
+- **A 2nd-level sub-agent is a sibling frame** with a two-segment `agentPath`, not a nested one (the wire is single-wrapped), so a renderer never needs recursion of its own.
+- **Nothing is misattributed.** The child's prose never enters the parent's `content` / `reasoning` / `toolCalls` or its `parts`, and the child's `tool_use` never enters the canonical history — a `tool_use` with no matching `tool_result` is exactly what 400s the next request.
+- Frames are **sealed** at every terminal boundary (`finish`, `error`, `sealAssistantTurn`), so no caret keeps blinking inside a finished child block.
+
+### Three more turn readouts
+
+`useChat` also surfaces the other channels the reducer folds. All three are optional and stay **absent** until the first entry arrives, rather than becoming an empty array:
+
+```tsx
+const { warnings, falseFinishes } = useChat({ api: '/api/chat' });
+
+{warnings?.map((w, i) => <Notice key={i}>{w.message}</Notice>)}
+{falseFinishes?.at(-1)?.willRetry === false && <Notice>Gave up before finishing.</Notice>}
+```
+
+- **`warnings`** — `CallWarning[]`, the same payload [`StreamChatResult.warnings`](/docs/core/stream-chat#warnings) resolves. Turn-scoped.
+- **`falseFinishes`** — the `doneWhen` guard's rejections. A trailing `willRetry: false` means the guard's budget was spent and the run stopped anyway, which is what lets a UI say "gave up after 3 tries" instead of pretending the answer is final.
+- **`subAgents`** — as above.
+
+All of them commit in the **same single React commit** as everything else, so none of them costs an extra render.
+
+## Writable state
+
+Four methods over the single `{ ui, canonical }` state cell, so the two views can never drift. Replacement is always wholesale into new arrays; nothing is spliced.
+
+```tsx
+const { setHistory, setMessages, addToolResult, clearError } = useChat({ api });
+
+setMessages((prev) => prev.filter((m) => m.id !== id)); // delete a turn; the next POST reflects it
+setHistory({ ui: [], canonical: [{ role: 'system', content: SYS }] }); // switch chats
+```
+
+- **`setHistory(update)`** replaces both views in one commit — the honest primitive, because only the canonical one is POSTable. Use it to switch chats, hydrate after mount, or edit a rendered message while keeping a system prompt and provider round-trip data the UI view cannot carry.
+- **`setMessages(update)`** is sugar over it: the canonical view is re-derived with `canonicalFromUI`, which is **lossy** — `system` messages, `Message.providerMetadata` and UI-only state do not survive, and a message without ordered `parts` loses its attachments entirely. Drive `setHistory` directly when your history has any of those.
+- **Both drop pending approvals and parked tool calls** — they were anchored to the transcript you just replaced. They do **not** reset the turn readouts (cost, citations, …); the next turn does, exactly as `sendMessage` already did.
+- **`clearError()`** dismisses the error (`status: 'error'` → `'idle'`) and leaves a live stream alone.
+
+The streaming turn is located in `ui` **by id** rather than by overwriting the trailing element, so a mid-stream `setMessages` can no longer have its result clobbered.
+
+## Multimodal input
+
+`sendMessage` accepts `ChatInput = string | { text?: string; parts?: Part[] }`:
+
+```tsx
+import { partsFromFiles } from '@deuz-sdk/react';
+
+<input
+  type="file"
+  multiple
+  onChange={async (e) => {
+    const parts = await partsFromFiles(e.target.files);
+    await sendMessage({ text: 'what is in these?', parts }); // media FIRST, then the question
+  }}
+/>;
+```
+
+A bare string stays a **plain string** `content`, byte-identical to 1.8, so a prompt-cache prefix does not move when you upgrade. `partsFromFiles` is a null-tolerant wrapper over core's `filesToImageParts`, which uses Web APIs only (`await blob.arrayBuffer()`) — no `FileReader`, no `Buffer` — so it behaves identically in a browser and on the edge. Images and PDFs both ride this call; see [Files](/docs/core/files).
+
+`editAndResend(messageId, input)` takes the same `ChatInput`.
+
+## Client tools
+
+When the server streams a `tool-call` it did not execute (a client tool — a **registered key with no `execute`**), the hook has two modes:
+
+**With `onToolCall`** — the executor runs, the result is appended to the canonical history, and the hook **re-POSTs automatically**, looping until a round has no pending client calls. A throwing `onToolCall` self-heals as an `is_error` result, mirroring the server loop.
+
+**Without `onToolCall`** — the round-trip **parks**: the calls appear in `pendingToolCalls`, `status` goes idle, and nothing is re-POSTed. Answer each from outside the hook:
+
+```tsx
+{pendingToolCalls.map((call) => (
+  <ConfirmCard
+    key={call.toolCallId}
+    call={call}
+    onDone={(output) => addToolResult({ toolCallId: call.toolCallId, output })}
+  />
+))}
+```
+
+`addToolResult` feeds the exact path `onToolCall`'s return value takes, so the chat auto-continues once **every** parked call is answered. A result for an id that is not parked is a **no-op** — an orphan `tool_result` would 400 the next request.
+
+Parking is new in 1.9. Before it, a turn producing client tool calls with no executor abandoned the round-trip and left a `tool_use` with no `tool_result`.
+
+<Callout type="warn" title="A client-tool route needs `rejectToolResults: false`">
+The round-trip POSTs a `role: 'tool'` message, which [`validateChatRequest`](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false) rejects by default. Pass `{ rejectToolResults: false }` — and read what that accepts.
+</Callout>
+
+## Tool approvals
+
+A `tool-approval-request` part **pauses** the chat: the request lands in `pendingApprovals`, the matching `toolCalls` entry flips to `state: 'approval-requested'`, and nothing is re-POSTed. Record verdicts with `addToolApprovalResponse`; once **every** pending approval has one, the hook resumes with `approvalResponses` in the request body — the [server settles the gated calls](/docs/agents/client-tools#tool-approval-round-trip), the client never fabricates a gated `tool_result`. The request's signed `token` is auto-preserved.
 
 ```tsx
 {pendingApprovals.map((req) => (
@@ -74,37 +262,123 @@ A `tool-approval-request` part **pauses** the chat: the request lands in `pendin
 ))}
 ```
 
+A refused call carries `denied` on the `UIToolCall`, so it stops rendering as "getWeather failed":
+
+```tsx
+{message.toolCalls?.map((call) =>
+  call.denied ? (
+    <Declined key={call.toolCallId} name={call.toolName} why={call.deniedReason} />
+  ) : (
+    <ToolCard key={call.toolCallId} call={call} />
+  ),
+)}
+```
+
+The built-in loop sets it for every refusal it settles: a server-mode `approveToolCall` returning `false` (`denied: true`, no reason — the hook's verdict is a bare boolean), an `approvalResponses` verdict (its own `reason`, verbatim), a gated call left unanswered, an unanswered client tool, and a token `approvalSigner` rejected. A tool that **threw** gains no denial fields at all, which is the whole point. `deniedReason` arrives already secret-redacted.
+
+`state` is unchanged — still exactly `'call' | 'result' | 'approval-requested'`, because these are optional fields, not a fourth state.
+
+## throttleMs
+
+`syncTurn` used to publish up to **seven** `setState` calls per folded wire part; it now builds one snapshot and publishes it once. On top of that, `throttleMs` (default `0` = 1.8 behaviour) coalesces commits on the trailing edge:
+
+```tsx
+useChat({ api: '/api/chat', throttleMs: 50 });
+```
+
+A fast model emits hundreds of text deltas per second; with markdown rendering over a long transcript that visibly janks. The terminal frame is **always flushed** — stream end, error, abort, or an external tool result — so the final text can never be lost to a throttle window.
+
+Values are unchanged by the collapse, including the non-obvious one: `cost` stays **cumulative across turns** while `dataParts` / `citations` / `plan` / `activity` / `verifications` / `warnings` / `falseFinishes` / `subAgents` / `steps` / `usage` / `finishReason` stay **turn-scoped**.
+
+## Resuming
+
+```tsx
+useChat({
+  api: '/api/chat',
+  resume: {
+    endpoint: `/api/stream/${streamId}`, // resumeDeuzStreamResponse — NOT the POST route
+    auto: true,
+    cursor: {
+      load: () => sessionStorage.getItem('deuz-cursor') ?? undefined,
+      save: (id) => sessionStorage.setItem('deuz-cursor', id),
+    },
+  },
+});
+```
+
+- **`auto`** fires `reconnect()` **once per mounted hook** — the canonical scenario resumability exists for (the user refreshes mid-generation) with zero app wiring. A ref guard survives React 18/19 StrictMode's deliberate mount → unmount → mount double-invoke.
+- **A failing automatic attempt is silent**: no `error`, no `status: 'error'`, no `onError`. The user did not ask for it, and every cold load of an app whose resume endpoint answers 404 would otherwise paint a permanent error. `reconnect()` called by hand keeps 1.8's exact error semantics.
+- **A caught-up endpoint is a no-op.** A resume that folds zero parts (an immediate `[DONE]`) changes nothing at all; 1.8 pre-pushed the assistant bubble before reading and left a permanently empty one on screen.
+- **`cursor` is an injectable adapter** — no `localStorage` is hardcoded (that would break SSR and React Native), and a throwing adapter cannot kill a live stream.
+
+## Truncated turns
+
+A tail text/reasoning part stays `state: 'streaming'` until something ends it. `applyUIPart` seals on the wire's terminal parts (`finish`, `error`), and `stop()` or a stream that ends without `finish` now calls `sealAssistantTurn`, so a truncated turn stops rendering as still-streaming.
+
+A stream that dies with neither `finish` nor `error` and is never sealed deliberately leaves the tail `'streaming'` — that is the truth about a truncated turn. Read `finishReason === 'length'` to tell "the answer was cut off by the output limit" from "the answer was complete".
+
 ## useObject
 
-Streams [`streamObject`](/docs/core/stream-object) partials from a route that returns [`toDeuzObjectStreamResponse`](/docs/modules/ui-streaming):
+Streams [`streamObject`](/docs/core/stream-object) partials from a route that returns `toDeuzObjectStreamResponse`:
 
-```ts
-import { useObject } from '@deuz-sdk/core/react';
+```tsx
+import { useObject } from '@deuz-sdk/react';
 
-const { object, isLoading, error, submit, stop } = useObject<Recipe>({ api: '/api/recipe' });
+const { object, isLoading, error, submit, stop } = useObject<Recipe>({
+  api: '/api/recipe',
+  throttleMs: 50, // 1.9, default 0
+  onHttpError: 'error-part', // 1.9, forwarded verbatim to readDeuzStream
+});
 
-// submit POSTs { input } and streams object-delta parts into `object`:
-await submit({ dish: 'menemen' });
+await submit({ dish: 'menemen' }); // POSTs { input } and streams object-delta parts
 // object: DeepPartial<Recipe> | undefined — every field optional at every depth
 ```
 
-Each `object-delta` **replaces** `object` wholesale (no merging needed). String fields stream truncated (`'mene'` → `'menemen'`), so render defensively. Wire `error` parts and rejected fetches land in `error`; `stop()` aborts without erroring. Like `useChat`, `useObject` also accepts `headers` (merged into the POST request) and `fetch` (an injectable transport for tests or custom auth) — e.g. `useObject<Recipe>({ api: '/api/recipe', headers: { authorization }, fetch: myFetch })`.
-
-Server side:
+Each `object-delta` **replaces** `object` wholesale (no merging needed). String fields stream truncated (`'mene'` → `'menemen'`), so render defensively. Wire `error` parts and rejected fetches land in `error`; `stop()` aborts without erroring. `submit` clears the previous object **immediately** — that is never coalesced by `throttleMs`. It also accepts `headers` and `fetch`.
 
 ```ts title="app/api/recipe/route.ts"
 import { streamObject } from '@deuz-sdk/core';
 import { toDeuzObjectStreamResponse } from '@deuz-sdk/core/ui';
 
-export async function POST(req: Request) {
+export async function POST(req: Request): Promise<Response> {
   const { input } = await req.json();
-  const result = streamObject({ model, schema: recipeSchema, messages: toMessages(input) });
+  const result = streamObject({ model, schema: recipeSchema, prompt: describe(input) });
   return toDeuzObjectStreamResponse(result);
+}
+```
+
+## The server route
+
+```ts title="app/api/chat/route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function POST(req: Request): Promise<Response> {
+  const parsed = validateChatRequest(await req.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+
+  const result = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    instructions: 'You are a helpful assistant.',
+    messages: parsed.request.messages,
+    ...(parsed.request.approvalResponses
+      ? { approvalResponses: parsed.request.approvalResponses }
+      : {}),
+    signal: req.signal,
+  });
+  return toDeuzStreamResponse(result);
 }
 ```
 
 ## See also
 
 - [UI streaming wire](/docs/modules/ui-streaming) — the protocol both hooks consume.
-- [Client tools](/docs/agents/client-tools) — the manual recipe the hooks automate.
+- [Request validation](/docs/modules/request-validation) — the gate the route above needs.
+- [Files, PDFs & images](/docs/core/files) — what `partsFromFiles` produces and how to render it back.
+- [Client tools](/docs/agents/client-tools) — the round-trip the hooks automate.
+- [Chat persistence & state](/docs/modules/chat-persistence) — `applyUIPart`, `canonicalFromUI` and the `ChatStore` seam.
 - [streamObject](/docs/core/stream-object) — the server half of `useObject`.

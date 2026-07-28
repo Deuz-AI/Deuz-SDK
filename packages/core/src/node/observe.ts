@@ -5,8 +5,12 @@
  * (overflow drops + counts — a slow disk can never affect the run), Node
  * built-ins load lazily (`await import('node:fs/promises')`) so this file
  * passes verify-package's plain import/require of every dist target.
+ *
+ * Also hosts `writeRunReport` (1.9): a thin wrapper that pipes those events
+ * (or a JSONL file) through the pure `renderRunReport` and writes the HTML.
  */
 import type { ObserveEvent, ObservationOptions, Observer } from '../types/observe';
+import { renderRunReport, type RunReportOptions } from '../observe';
 
 export interface JsonlObserver extends Observer {
   /** Events dropped by the queue cap or after close(). */
@@ -170,6 +174,36 @@ export function createJsonlObserver(options: CreateJsonlObserverOptions): JsonlO
       await drain();
     },
   };
+}
+
+export interface WriteRunReportOptions extends RunReportOptions {
+  /** Events to render. Wins over `from` when both are given. */
+  events?: readonly ObserveEvent[];
+  /** JSONL file to read the events from (same format `createJsonlObserver` writes). */
+  from?: string;
+  /** Destination `.html` path; missing parent directories are created. */
+  to: string;
+}
+
+/**
+ * Thin Node wrapper over the pure `renderRunReport`: read events (or take
+ * them), render, write ONE self-contained HTML file. Nothing is written until
+ * the caller asks for it — there is no default output path and no background
+ * writer.
+ */
+export async function writeRunReport(options: WriteRunReportOptions): Promise<void> {
+  const { events, from, to, ...render } = options;
+  if (!to) throw new Error("writeRunReport requires a 'to' path for the HTML file.");
+  const source = events ?? (from !== undefined ? await readJsonlEvents(from) : undefined);
+  if (!source) {
+    throw new Error("writeRunReport requires 'events' or 'from' (a JSONL file of observe events).");
+  }
+  const html = renderRunReport(source, render);
+  const fs = await loadFs();
+  const path = await loadPath();
+  const dir = path.dirname(to);
+  if (dir && dir !== '.') await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(to, html);
 }
 
 /** Read a JSONL file back into events (restores `$deuzBytes` values). */

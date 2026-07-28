@@ -215,3 +215,90 @@ describe('createClient parity (1.6): streamObject / embed / embedMany', () => {
     expect(seen[1]).toBe(seen[0]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 1.9: `client.streamChat({ prompt })` worked at RUNTIME (every client method
+// forwards into `src/generate.ts`, which owns the fold) but did NOT typecheck —
+// `DeuzClient` was typed against the `StreamChat`/`GenerateText`/… aliases, which
+// require `messages`. The prompt-shorthand overloads now mirror the free
+// functions'. The compile-time half is `npm run typecheck` (vitest transpiles
+// without checking); the runtime half is below.
+// ---------------------------------------------------------------------------
+
+describe('createClient — the prompt shorthand (1.9)', () => {
+  it('streamChat({ prompt, instructions }) compiles, folds, and keeps the client key (G1)', async () => {
+    const { fetch, calls } = mockFetch(() => sseResponse([ANTHROPIC_FINAL]));
+    const client = createClient({ apiKeys: { anthropic: 'sk-client-table' }, deps: { fetch } });
+
+    const res = client.streamChat({
+      model: anthropic('claude-opus-4-8'),
+      prompt: 'weather in Paris?',
+      instructions: 'You are terse.',
+    });
+    expect(calls).toHaveLength(0); // synchronous return, lazy pump (G2)
+    let text = '';
+    for await (const chunk of res.textStream) text += chunk;
+    expect(text).toBe('Sunny in Paris.');
+
+    const body = JSON.parse(String(calls[0]!.init!.body));
+    expect(body.system).toBe('You are terse.');
+    expect(body.messages).toEqual([
+      { role: 'user', content: [{ type: 'text', text: 'weather in Paris?' }] },
+    ]);
+    // The client-level apiKey survived the fold's options rebuild (client context
+    // rides a non-enumerable Symbol, so a re-spread is where it would be lost).
+    const headers = calls[0]!.init!.headers as Record<string, string>;
+    expect(headers['x-api-key']).toBe('sk-client-table');
+  });
+
+  it('generateText({ prompt }) compiles and returns the text', async () => {
+    const { fetch, calls } = mockFetch(() => sseResponse([ANTHROPIC_FINAL]));
+    const client = createClient({ apiKeys: { anthropic: 'k' }, deps: { fetch } });
+    const res = await client.generateText({
+      model: anthropic('claude-opus-4-8'),
+      prompt: 'weather in Paris?',
+    });
+    expect(res.text).toBe('Sunny in Paris.');
+    expect((calls[0]!.init!.headers as Record<string, string>)['x-api-key']).toBe('k');
+  });
+
+  it('generateObject({ prompt, schema }) compiles and stays typed in T', async () => {
+    const { fetch } = mockFetch(() => sseResponse([anthropicJsonStream(['{"city":"Paris"}'])]));
+    const client = createClient({ apiKeys: { anthropic: 'k' }, deps: { fetch } });
+    const res = await client.generateObject<{ city: string }>({
+      model: anthropic('claude-opus-4-8'),
+      prompt: 'capital of France?',
+      schema: SCHEMA,
+    });
+    expect(res.object.city).toBe('Paris');
+  });
+
+  it('streamObject({ prompt, schema }) compiles and streams partials', async () => {
+    const { fetch } = mockFetch(() => sseResponse([anthropicJsonStream(['{"city":', '"Paris"}'])]));
+    const client = createClient({ apiKeys: { anthropic: 'k' }, deps: { fetch } });
+    const res = client.streamObject<{ city: string }>({
+      model: anthropic('claude-opus-4-8'),
+      prompt: 'capital of France?',
+      schema: SCHEMA,
+    });
+    const partials: unknown[] = [];
+    for await (const p of res.partialObjectStream) partials.push(p);
+    expect(partials).toEqual([{}, { city: 'Paris' }]);
+    expect(await res.object).toEqual({ city: 'Paris' });
+  });
+
+  it('an invalid shape (prompt AND messages) is reported, not dialed', async () => {
+    const { fetch, calls } = mockFetch(() => sseResponse([ANTHROPIC_FINAL]));
+    const client = createClient({ apiKeys: { anthropic: 'k' }, deps: { fetch } });
+    // The overloads reject this at compile time; the runtime guard is exercised
+    // through a widened value (an app spreading a request body hits exactly this).
+    await expect(
+      client.generateText({
+        model: anthropic('claude-opus-4-8'),
+        prompt: 'hi',
+        messages: [{ role: 'user', content: 'hi' }],
+      } as unknown as Parameters<typeof client.generateText>[0]),
+    ).rejects.toMatchObject({ code: 'invalid_request' });
+    expect(calls).toHaveLength(0);
+  });
+});

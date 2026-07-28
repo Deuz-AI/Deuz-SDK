@@ -21,6 +21,22 @@ export {
 export { agentTool } from './inference/agent-tool';
 export type { AgentToolDef } from './inference/agent-tool';
 
+// Typed tool authoring (1.9 additive) — `tool()` is a pure identity function
+// (`tool(def) === def`); it exists only to flow the `parameters` schema's type
+// into `execute(args)`, which `ToolSet = Record<string, Tool>` otherwise erases.
+export { tool } from './tool';
+export type { InferToolInput, InferToolOutput } from './tool';
+
+// Content-part constructors (1.9 additive). `ImagePart` is the carrier for ALL
+// binary media until the `file` Part kind lands in 2.0, so a PDF is an image
+// part with `mediaType: 'application/pdf'` — correct but undiscoverable.
+export { filePart, imagePart } from './parts';
+
+// Capability matrix read accessor (1.9 additive) — gate UI on capabilities
+// instead of hard-coding slug lists. Returns a frozen copy; never throws.
+export { getModelCapabilities } from './core/registry';
+export type { ModelCapabilities } from './core/registry';
+
 // Optional convenience client + dependency resolution.
 export { createClient, resolveDependencies } from './client';
 export type { DeuzClient } from './client';

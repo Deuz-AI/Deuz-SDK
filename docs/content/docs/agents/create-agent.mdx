@@ -1,0 +1,138 @@
+---
+title: createAgent
+description: A reusable agent as a frozen value — not a class. One options template, four methods, one merge rule.
+---
+
+`createAgent` (1.9, `@deuz-sdk/core/agent`) lets you define an agent **once, as a value**. Before it, every call site re-spread `{ model, instructions, tools, maxSteps, stopWhen, verifyStep, approveToolCall, compaction, memory, … }` by hand — and they drifted.
+
+It is a **free-function factory returning a frozen plain object of closures**. There is no class, no `new`, no prototype, no inheritance — and no new runtime. Every method is a one-line forward to the same free function you would have called yourself: `agent.streamChat(o)` **is** `streamChat({ ...def, ...o })`.
+
+```ts title="agent.ts"
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const support = createAgent({
+  name: 'support',
+  model: anthropic('claude-opus-4-8'),
+  instructions: 'You are a terse support agent.',
+  tools: { lookupOrder },
+  maxSteps: 8,
+});
+
+const { text } = await support.generateText({ prompt: 'where is order 12?' });
+const res = support.streamChat({ prompt: 'where is order 12?' }); // SYNCHRONOUS (G2)
+const strict = support.with({ temperature: 0 });                  // a new agent
+const asSubAgent = support.asTool();                              // via agentTool
+```
+
+Also re-exported from `@deuz-sdk/core/edge`.
+
+## The surface
+
+```ts
+interface AgentDef extends Omit<CommonCallOptions, 'model' | 'messages' | 'prompt'> {
+  /** Label for observation/logging, and the `agentPath` segment used by `asTool()`. */
+  readonly name?: string;
+  model: LanguageModel;
+}
+
+interface DeuzAgent {
+  readonly def: Readonly<AgentDef>;
+  generateText(options?: AgentCallOptions): Promise<GenerateTextResult>;
+  streamChat(options?: AgentCallOptions): StreamChatResult;          // sync, never throws
+  generateObject<T>(options: AgentObjectCallOptions<T>): Promise<GenerateObjectResult<T>>;
+  streamObject<T>(options: AgentObjectCallOptions<T>): StreamObjectResult<T>;
+  asTool(options?: { name?: string; description?: string }): Tool;
+  with(overrides: Partial<AgentDef>): DeuzAgent;
+}
+
+type AgentCallOptions = Partial<CommonCallOptions>;
+```
+
+The method names are the free functions' names, because that is exactly what they forward to. `messages` and `prompt` are omitted from the def on purpose: an agent is a **template**, not a conversation, so the input arrives per call — which is also what makes `def` safe to share across concurrent calls.
+
+`name` never reaches a wire. It is stripped from the forwarded options; its one functional use is `asTool()`, where it becomes the sub-agent's `agentPath` segment.
+
+## The merge rule — one rule, no exceptions
+
+`{ ...def, ...options }`: a shallow, **top-level** spread. A key present in the per-call options **replaces** the def's value whole — including the four where you might hope for something cleverer: `tools`, `providerOptions`, `deps` and `stopWhen` arrays.
+
+An explicitly-`undefined` per-call value counts as present and therefore **unsets** the def's field:
+
+```ts
+// One tool-less call from an otherwise agentic agent:
+await support.generateText({ prompt: 'just chat', tools: undefined });
+```
+
+Replace, rather than a per-field deep merge, because replace is strictly **more expressive**: `def` is public and frozen, so you can opt *into* a merge whenever you want one —
+
+```ts
+const res = support.streamChat({ deps: { ...support.def.deps, observer } });
+```
+
+— while a built-in merge can never be opted *out* of (you could not drop the def's `fetch` for a single call). It is also the only rule that fits in one sentence, and a rule you have to look up per field is not "predictable".
+
+<Callout title="Why this differs from createClient">
+`createClient` merges `deps` one level because it pre-binds **infrastructure** — a shared circuit-breaker store must survive a per-call `deps` (the G11 invariant). An agent def is a **call template**, not infrastructure, so it takes the plain spread.
+</Callout>
+
+`with(overrides)` applies the same rule at definition time and returns a **new** frozen agent. The original is untouched; nothing here mutates.
+
+## Every invariant is inherited, not re-implemented
+
+Nothing is orchestrated in this module, so:
+
+- **G2** — `streamChat` / `streamObject` return **synchronously** and never throw. Neither method is `async` and there is no `await` on the way in or out; failures (including an invalid input shape) arrive as an `error` part with rejected `usage` / `finishReason`.
+- **G1** — keys and base URLs still resolve only in one place. The def carries plain `CommonCallOptions` fields and does no key handling of its own.
+- The `prompt` XOR `messages` guard, the `instructions` fold and the per-call `capabilities` override all live at the **call boundary**, so an agent call is canonicalized byte-for-byte like a hand-written one — `agent.generateText({ prompt: 'hi' })` works with no help from this module.
+
+The def is **copied before freezing**, so your object stays mutable and mutating it afterwards cannot change the agent's behaviour. `Object.freeze` is shallow (matching `createClient`): `def.tools` and `def.deps` are your own objects, not deep-frozen clones.
+
+## Sharp edge: `generateObject` on an agentic agent
+
+A structured-output call never enters the tool loop, so since 1.9 it **refuses** the loop-only options instead of ignoring them in silence (`tools`, `maxSteps > 1`, `stopWhen`, `verifyStep`, `memory`, `session`, …). An agentic def therefore fails here **by design** — and the merge rule is also the fix:
+
+```ts
+await support.generateObject({ schema, prompt, tools: undefined, maxSteps: undefined });
+
+// …or once, up front:
+const extractor = support.with({ tools: undefined, maxSteps: undefined });
+await extractor.generateObject({ schema, prompt });
+```
+
+Special-casing it inside `createAgent` would mean silently dropping def fields on one method only — a second merge rule, and exactly the silence 1.9 removed elsewhere. See [generateObject](/docs/core/generate-object).
+
+## `asTool()` — the agent as a sub-agent
+
+```ts
+const orchestrator = createAgent({
+  model: anthropic('claude-opus-4-8'),
+  instructions: 'Delegate research, then write the answer.',
+  tools: { support: support.asTool({ description: 'Answer an order question.' }) },
+  maxSteps: 10,
+});
+```
+
+Built by the existing [`agentTool`](/docs/agents/subagents), which stays the single implementation of sub-agent delegation. Only the def fields `AgentToolDef` can express cross the boundary:
+
+| Forwarded | Not forwarded |
+| --- | --- |
+| `model`, `tools`, `instructions` (→ `system`), `maxSteps`, `stopWhen`, `compaction`, `name` | sampling params, `verifyStep`, `deps`, `timeout`, `memory`, everything else |
+
+That is deliberate: the sub-agent reuses the **parent's** transport and approval flow. Omitted fields keep `agentTool`'s own defaults (`maxSteps` 10, `maxDepth` 2). The tool's input is `{ prompt: string }` and it returns the sub-agent's final text.
+
+An `asTool()` run **is** visible in a `useChat` UI: `applyUIPart` folds each `sub-agent` frame into `turn.subAgents` (one entry per `agentPath`, carrying the child's own full `AssistantTurnState`), and `useChat` surfaces them as `subAgents`. It is a channel of its own rather than part of the parent's bubble, so nothing the sub-agent says is attributed to the parent. See [rendering a sub-agent run](/docs/modules/react-hooks#rendering-a-sub-agent-run).
+
+## Edge-safe
+
+Pure composition: no ambient clock, randomness or logging, and no state on the object beyond the frozen def. `deps` come from the def or the call, exactly as they do today.
+
+## See also
+
+- [Tools](/docs/agents/tools) — the `Tool` / `ToolSet` shape and `tool()`.
+- [Tool loop](/docs/agents/tool-loop) — the loop every agent method drives.
+- [Sub-agents](/docs/agents/subagents) — `agentTool` and the sub-agent stream.
+- [Autonomy](/docs/modules/autonomy) — the higher-level autonomous runtime, which builds on the same loop.
+- [Migrating from the Vercel AI SDK](/docs/migration/from-vercel-ai-sdk) — `ToolLoopAgent` → `createAgent`.

@@ -16,12 +16,24 @@ const result = streamObject<T>(options); // NOT awaited — returns synchronousl
 //   object: Promise<T>;
 //   usage: Promise<Usage>;
 //   finishReason: Promise<FinishReason>;
+//   consume?: (options?: { onError?: (e: unknown) => void }) => Promise<void>; // 1.9
+//   warnings?: Promise<CallWarning[]>;   // 1.9 — declared, never resolves here
 // }
 ```
 
-Options are `GenerateObjectOptions<T>` — identical to `generateObject` (`schema`, `schemaName`, `schemaDescription`, `mode`, plus everything from `CommonCallOptions`).
+Options are `GenerateObjectOptions<T>` — identical to `generateObject` (`schema`, `schemaName`, `schemaDescription`, `mode`, plus everything from `CommonCallOptions`, including 1.9's `prompt` / `instructions` / `timeout` / `capabilities`).
 
 Like `streamChat`, `streamObject` **returns synchronously and never throws** (the G2 rule): the request starts lazily on first access of any output, and failures surface as rejections — an invalid key, a network error, a failed validation all arrive through the promises/stream, never as a synchronous throw.
+
+`consume()` (1.9) drains the stream so terminal effects run when nobody iterates — same contract as [`StreamChatResult.consume`](/docs/core/stream-chat#consume): memoized, never rejects, failures go to `onError`.
+
+<Callout type="warn" title="`warnings` is absent on `streamObject`">
+`CallWarning` has real producers as of 1.9 and [`streamChat`'s `warnings`](/docs/core/stream-chat#warnings) is live — but `streamObject` threads no warning sink, so nothing is collected and the field is never set: `result.warnings` is `undefined`, and `await result.warnings` gives you `undefined`, not an array. Read `deps.logger.warn` on this path. The object wire cannot carry a `warning` part to a `useObject` client either. See [Declared but inert](/docs/reference/whats-new-1-9#declared-but-inert).
+</Callout>
+
+<Callout type="warn" title="Loop options are refused (1.9)">
+Structured output is single-turn. Passing `tools`, `maxSteps > 1`, `stopWhen`, `verifyStep`, `memory`, `session`, … used to be accepted and then ignored; it now fails. `streamObject` reports it through its never-throw shape — one `error` part, rejecting `partialObjectStream`, and rejected `object` / `usage` / `finishReason`. See [generateObject](/docs/core/generate-object#loop-options-are-refused).
+</Callout>
 
 ## Partial objects
 

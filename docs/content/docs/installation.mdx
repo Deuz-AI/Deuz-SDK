@@ -152,7 +152,7 @@ console.log(`\n${usage.inputTokens} in / ${usage.outputTokens} out`);
 When you target Cloudflare Workers or Vercel Edge and want a build that is provably free of any Node API, import from the `/edge` entry. It re-exports the same `streamChat` / `generateText` / `generateObject`, the client, the base errors, and all types.
 
 ```ts title="app/api/chat/route.ts (Edge runtime)"
-import { streamChat } from '@deuz-sdk/core/edge';
+import { streamChat, validateChatRequest } from '@deuz-sdk/core/edge';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
 import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
 
@@ -160,9 +160,11 @@ export const runtime = 'edge';
 
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
-export async function POST(req: Request) {
-  const { messages } = await req.json();
-  const res = streamChat({ model: anthropic('claude-opus-4-8'), messages });
+export async function POST(req: Request): Promise<Response> {
+  const parsed = validateChatRequest(await req.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+
+  const res = streamChat({ model: anthropic('claude-opus-4-8'), messages: parsed.request.messages });
   return toDeuzStreamResponse(res); // versioned Deuz UI wire
 }
 ```

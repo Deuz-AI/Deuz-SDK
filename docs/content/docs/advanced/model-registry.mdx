@@ -108,7 +108,7 @@ There is also a behavioral guard that is *not* a registry flag: the agentic loop
 
 ## Unknown slugs never throw
 
-When a slug is not in the registry, the orchestrator builds a conservative fallback row and calls `logger.warn` (route a logger in through [dependencies](/docs/core/dependencies) to see it). The fallback differs by surface so the failure mode is always "degraded but working," never a crash:
+When a slug is not in the registry, the orchestrator builds a conservative fallback row and calls `logger.warn` (route a logger in through [dependencies](/docs/core/dependencies) to see it). Since 1.9 it also records a typed `{ type: 'unknown-model' }` [`CallWarning`](/docs/core/stream-chat#warnings) — readable on a tool-less `streamChat`'s `warnings` and as a `warning` part on `fullStream`, still exactly one log line. The fallback differs by surface so the failure mode is always "degraded but working," never a crash:
 
 - **Generic fallback** (`anthropic` / `chat_completions` / `responses`): risky flags default OFF — `tools: false`, `reasoning: false`, `structuredOutput: false`, `contextWindow: 128_000`, `maxOutput: 4_096` (kept low so an unknown model can't 400 or truncate on an over-large `max_tokens`). For an unknown Gemini-compat slug, `usagePerChunk` and `toolIndexAllZero` are inferred from `(provider === 'google', surface === 'chat_completions')`.
 - **Native-Gemini fallback** (`surface: 'native'`): full capabilities ON (`vision`, `reasoning`, `caching`, `nativePdf`, `audio`, `contextWindow: 1_000_000`, `maxOutput: 64_000`), because the native wire is uniform across Gemini generations.
@@ -129,7 +129,44 @@ const { text } = await generateText({
 });
 ```
 
-The `known: false` flag on the resolved row records that a fallback was used. If you need a new model to use its real (non-conservative) capabilities — tools, reasoning, the correct `max_tokens` — that requires adding its row to the pinned catalog.
+The `known: false` flag on the resolved row records that a fallback was used.
+
+## Overriding the row: `capabilities` (1.9)
+
+A conservative row is safe but wrong for a model that is genuinely capable: `maxOutput: 4096` **silently truncates** a brand-new Together / Groq / OpenRouter slug, `reasoning: false` drops the canonical `effort`, and `structuredOutput: false` pushes `generateObject` onto the tool strategy. Before 1.9 the only fix was a registry release.
+
+```ts title="capabilities-override.ts"
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-9'),
+  prompt: 'Hello from a future model.',
+  capabilities: { maxOutput: 128_000, reasoning: true, structuredOutput: true },
+});
+```
+
+Shallow-merged over the resolved row — set only the fields you know. Also settable per factory via [`createOpenAICompatible({ capabilities })`](/docs/providers/compat#createopenaicompatible), with the per-call value winning.
+
+<Callout type="warn" title="It overrides belief, not behaviour">
+`capabilities` changes what the SDK *believes* about a model; it cannot change what the provider does. In particular `capabilities.tools` is read by **no adapter** — setting it neither enables nor disables tool calling.
+</Callout>
+
+A call that passes `capabilities` runs against a per-call **clone** of the model descriptor (the override rides the same hidden Symbol described below), so descriptor object *identity* differs for that call. Key and base-URL resolution are unchanged.
+
+### Reading the effective matrix
+
+```ts title="get-capabilities.ts"
+import { getModelCapabilities } from '@deuz-sdk/core';
+
+const caps = getModelCapabilities(model);
+if (caps.vision) showImageUpload();
+if (caps.nativePdf || caps.vision) allowPdfAttachments();
+if (!caps.known) showNewModelHint(); // served from the conservative fallback row
+```
+
+`getModelCapabilities` returns the registry row plus any factory-level override, as a **frozen copy** — mutating the result is a no-op and never touches the registry. It never throws, and because no `logger` is threaded through it, a read never emits an unknown-slug warning either. Use it instead of hard-coding slug lists in a UI.
+
+`getCapabilities()` (the internal resolver the orchestrator uses) also returns a frozen object as of 1.9, so mutating a resolved matrix throws in strict mode instead of silently poisoning later calls in the same process.
+
+If you need a new model's real capabilities permanently rather than per call, add its row to the pinned catalog.
 
 ## Factory config lives on a hidden Symbol
 
@@ -158,7 +195,7 @@ The inference layer reads the stashed config back internally to resolve the key/
 
 The conservative fallback is great for forward-compatibility but useless for asserting behavior — an unknown slug reports `tools: false`, `reasoning: false`, etc., which is *not* what the real model does.
 
-- **Application code:** you usually don't care. Pass whatever slug you're using; if it's pinned you get its real capabilities, if not you get a safe degraded mode plus a warning.
+- **Application code:** you usually don't care. Pass whatever slug you're using; if it's pinned you get its real capabilities, if not you get a safe degraded mode plus a warning — and a per-call `capabilities` override if the degraded mode is in your way.
 - **Tests that assert a quirk or capability:** pin a known slug. A test that checks the Gemini usage-per-chunk handling, the index-zero tool slotting, the Anthropic caching path, or a reasoning code path must use a slug that exists in the registry (e.g. `gemini-2.5-pro`, `claude-opus-4-8`, `gpt-5.4`) — otherwise it silently exercises the conservative fallback row and the assertion is meaningless.
 - **Production models you depend on:** if you need a new model's real tools / reasoning / `max_tokens` (not the conservative defaults), add its row to the pinned catalog rather than relying on the fallback.
 

@@ -1,37 +1,34 @@
 ---
-title: Migrating from Vercel AI SDK
-description: Map ai / @ai-sdk/* calls to @deuz-sdk/core — streamChat, generateText, generateObject, tools, and the UI wire.
+title: Migrating from the Vercel AI SDK
+description: A verified mapping from ai / @ai-sdk/* to @deuz-sdk/core — plus the parts that have no equivalent.
 ---
 
-If you know the Vercel AI SDK (`ai` + `@ai-sdk/*`), most of `@deuz-sdk/core` will feel familiar: free functions like `generateText` / `generateObject`, a Zod-typed structured-output call, and a streaming UI wire. The shapes are close enough that a port is mostly mechanical. The big differences are philosophical — `@deuz-sdk/core` reads **no environment variables** (you pass `apiKey` explicitly), has **zero runtime dependencies**, and `streamChat` returns **synchronously and never throws**. This page maps the API surface and flags the few remaining gaps.
+This page maps the Vercel AI SDK (`ai` + `@ai-sdk/*`) onto `@deuz-sdk/core`. Both are TypeScript AI SDKs with free functions, a canonical delta stream, Zod-typed structured output and a streaming UI protocol, so most of a port is mechanical. The differences that are *not* mechanical are listed before the tables, and the things Deuz simply does not have are listed at the end — read that section before you commit to a port.
 
-## API mapping
+<Callout title="Verification status">
+Every Deuz name on this page is verified against the source in this repository. Every AI SDK name is verified against the live docs at `ai-sdk.dev` on **2026-07-28**, against **`ai@7.0.40`** (AI SDK 7 was published 2026-06-25). That project renames aggressively across majors — a name in the left column may have moved again by the time you read this. Re-check the [AI SDK 7 migration guide](https://ai-sdk.dev/docs/migration-guides/migration-guide-7-0) before you trust a left-hand cell, and treat this page as a map of *concepts*, not a compiler. Where a left-hand cell could not be verified it says so; nothing is guessed.
+</Callout>
 
-| Vercel AI SDK | `@deuz-sdk/core` | Notes |
-| --- | --- | --- |
-| `streamText(...)` | [`streamChat(...)`](/docs/core/stream-chat) | Returns synchronously, never throws. Pump starts lazily. |
-| `generateText(...)` | [`generateText(...)`](/docs/core/generate-text) | `await`-ed buffered call. `result.steps` is present when tools run. |
-| `generateObject(...)` | [`generateObject(...)`](/docs/core/generate-object) | `schema` accepts a Zod schema (via Standard Schema) or a raw JSON Schema. |
-| `embed` / `embedMany` | [`embed` / `embedMany`](/docs/core/embeddings) | `value` / `values`; auto batched + concurrency-capped. |
-| `tool({ ... })` helper | plain object with `parameters` | No wrapper function — see [Tools](/docs/agents/tools). |
-| `createAnthropic` (`@ai-sdk/anthropic`) | `createAnthropic` (`@deuz-sdk/core/anthropic`) | Factory returns a `Provider`; call it with a model id for a descriptor. |
-| `createOpenAI`, `openai.embedding(...)` | `createOpenAI`, `openaiEmbedding` (`@deuz-sdk/core/openai`) | Embeddings are a separate factory. |
-| `toDataStreamResponse` / `toUIMessageStreamResponse` | [`toDeuzStreamResponse`](/docs/modules/ui-streaming) (`@deuz-sdk/core/ui`) | Our own versioned wire, not the AI SDK protocol. |
-| `useChat` (React hook) | [`useChat`](/docs/modules/react-hooks) (`@deuz-sdk/core/react`) | Client tools auto-round-trip via `onToolCall`; approvals pause into `pendingApprovals`. React is an optional peer. |
-| `useObject` (React hook) | [`useObject`](/docs/modules/react-hooks) (`@deuz-sdk/core/react`) | Streams `object-delta` parts from `toDeuzObjectStreamResponse`. |
-| `streamObject` | [`streamObject`](/docs/core/stream-object) | Same options as `generateObject`; `partialObjectStream` yields `DeepPartial<T>`. No repair retry (partials can't be un-streamed). |
-| `needsApproval` / tool approval | [`needsApproval` + `approveToolCall` / `approvalResponses`](/docs/agents/tools#tool-approval-needsapproval) | Server mode decides inline; client mode breaks the loop with `tool-approval-request` parts and resumes via `approvalResponses`. |
+## Prefer to port with an agent?
 
-## Conceptual differences
+This repo ships a skill for it. Point a coding agent at your app and it will do the mechanical part — imports, route handlers, tool literals, hook call sites — while flagging the cases that need a decision:
 
-### No env auto-read — inject the key
+```bash
+npx skills add Deuz-AI/Deuz-SDK   # installs `deuz-sdk` and `migrate-from-ai-sdk`
+```
 
-The AI SDK auto-reads `process.env.ANTHROPIC_API_KEY` (and friends) inside the provider. `@deuz-sdk/core` never reads `process.env` or logs through `console`; it takes keys, logging, clock, and id sources through replaceable seams (with documented host clock/id defaults). Read the key at your app layer and pass it into the factory.
+Then ask: *"migrate this app from the AI SDK to @deuz-sdk/core"*. The skill's rule files cover imports, streaming, tools, UI, telemetry and providers.
+
+## Five differences that are not renames
+
+### 1. No environment variables, ever
+
+The AI SDK's providers read `process.env.ANTHROPIC_API_KEY` (and friends) for you, and its gateway accepts a plain string model id like `'anthropic/claude-...'`. `@deuz-sdk/core` reads **no** environment variable and has **no** hosted gateway: it must run unchanged on Cloudflare Workers, where `process.env` does not exist. You read the key at your app layer and hand it to a factory.
 
 ```ts
-// Vercel AI SDK — key read implicitly from process.env
+// AI SDK — key read implicitly
 import { anthropic } from '@ai-sdk/anthropic';
-const model = anthropic('claude-3-5-sonnet');
+const model = anthropic('claude-sonnet-4-5');
 ```
 
 ```ts
@@ -41,58 +38,132 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const model = anthropic('claude-opus-4-8');
 ```
 
-Everything stateful or non-deterministic (fetch, clock, logger, id generation, API keys, metering) flows through one `Dependencies` seam. You can also resolve keys per call with `deps.keyProvider`. See [Dependencies](/docs/core/dependencies).
+Everything ambient goes through one `Dependencies` seam — `fetch`, `clock`, `logger`, `tracer`, `keyProvider`, `priceProvider`, `generateId`, `observer`. There is no `console.*`, no `Date.now()` and no `Math.random()` anywhere in core. See [Dependencies](/docs/core/dependencies).
 
-### `streamChat` is synchronous and never throws
+### 2. `streamChat` returns synchronously and never throws
 
-In the AI SDK, `streamText` returns immediately and surfaces failures on the streams. `@deuz-sdk/core` formalizes this: `streamChat` returns a `StreamChatResult` synchronously, the network pump starts **lazily** on first access of any output, and the call itself does no I/O. A failure surfaces as an `error` part on `fullStream` and rejects the `usage` / `finishReason` promises — it is never a synchronous throw. So you do not wrap `streamChat(...)` in `try/catch`; you handle the `error` part or `await` the promise.
+`streamText` returns immediately too, but Deuz makes it a hard contract (the "G2" rule): `streamChat` does **no I/O** at call time, the pump starts lazily on first access of an output, and a failure is **never** a synchronous throw. It arrives as an `error` part on `fullStream`, with rejected `usage` / `finishReason` promises. So there is no `try/catch` around the call — put it around the `for await`, or `await` the promise.
 
-Result fields map cleanly:
+The corollary bites in serverless: if nobody reads the stream, the run never reaches its terminal boundary, so `onFinish`, chat persistence and durable checkpoints never fire. That is what [`consume()`](/docs/core/stream-chat#consume) is for — the counterpart of the AI SDK's `result.consumeStream()`.
 
-| AI SDK `streamText` result | `@deuz-sdk/core` `StreamChatResult` |
+### 3. The UI wire is ours, and it is versioned
+
+Deuz does not speak the AI SDK's UI message protocol. `toDeuzStreamResponse` emits SSE stamped `x-deuz-stream: v2`, read back by `readDeuzStream` / `connectDeuzStream` or by `useChat` from `@deuz-sdk/react`. It is additive-versioned (v1 output stays byte-identical) and **resumable**: every event carries an `id: <seq>` line, so a client can reconnect with `Last-Event-ID` and get one gapless sequence. See [UI streaming](/docs/modules/ui-streaming).
+
+You cannot point the AI SDK's `useChat` at a Deuz route, or Deuz's `useChat` at an AI SDK route. Both halves of a chat feature move together.
+
+### 4. An agent is a value, not a class
+
+AI SDK 7's headline abstraction is a class — `ToolLoopAgent`, plus `WorkflowAgent` and `HarnessAgent`. Deuz has no class and no `new`: the loop is a call option (`tools` + `maxSteps`), a reusable agent is [`createAgent(...)`](/docs/agents/create-agent) — a frozen plain object of closures over one options template — and an agent-as-a-tool is [`agentTool()`](/docs/agents/subagents) or `agent.asTool()`, which nests the same loop one level down with approval inheritance and live sub-agent stream forwarding. There is no separate runtime behind any of them: `agent.streamChat(o)` **is** `streamChat({ ...def, ...o })`.
+
+### 5. Dual ESM + CJS, still
+
+AI SDK 7 is **ESM-only** — its announcement states that `require()` is not supported. `@deuz-sdk/core` still ships both ESM and CJS builds per subpath, with `types` resolved per condition (checked by `publint --strict` and `attw` in CI). Both require Node ≥ 22.
+
+## Mapping: core calls
+
+| Vercel AI SDK (7.x) | `@deuz-sdk/core` | Notes |
+| --- | --- | --- |
+| `streamText(...)` | [`streamChat(...)`](/docs/core/stream-chat) | Sync return, never throws, lazy pump. |
+| `generateText(...)` | [`generateText(...)`](/docs/core/generate-text) | Awaited buffered call. `result.steps` present when tools ran. |
+| `generateText({ output: Output.object({ schema }) })` | [`generateObject({ schema })`](/docs/core/generate-object) | `generateObject` / `streamObject` are **absent** from the AI SDK 7 Core reference; `Output` replaced them. Deuz keeps them as separate functions. |
+| `streamText({ output: ... })` | [`streamObject({ schema })`](/docs/core/stream-object) → `partialObjectStream` | Deuz has no `Output.array()` / `elementStream` equivalent. |
+| `result.stream` (`fullStream` before 7.0) | `result.fullStream` | Deuz's name never changed; the canonical part union is `StreamPart`. |
+| `result.textStream` | `result.textStream` | Same. |
+| `result.consumeStream()` | [`result.consume?.()`](/docs/core/stream-chat#consume) | Since 1.9. Optional on the type — two paths do not provide it yet. |
+| `result.usage` / `result.totalUsage` | `result.usage` | One field: totals summed across every step and sub-agent. |
+| `result.finishReason` | `result.finishReason` | `'stop' \| 'length' \| 'tool_calls' \| 'content_filter' \| 'error' \| 'aborted'`. |
+| `result.finalStep` | `result.steps?.at(-1)` | Deuz keeps per-step data only in `steps`. |
+| `result.warnings` | `result.warnings` | Live on `streamChat` (`Promise<CallWarning[]>`, settles with `usage`, never rejects) — but **`undefined` on `generateText` / `generateObject` / `streamObject`**, and a `streamChat` carrying `tools` reports only its own `activeTools` notices. See [Partly inert](#partly-inert--check-before-you-port-onto-these). |
+| `instructions` (`system` before 7.0) | `instructions` | Same name, same meaning, since 1.9. Placed first; a system message already in `messages` is preserved after it. |
+| `prompt` | `prompt` | Since 1.9. Shorthand for one user turn, mutually exclusive with `messages`. |
+| `messages` (`ModelMessage[]`) | `messages` (`Message[]`) | Deuz has no `convertToModelMessages` step — see the UI table. |
+| `abortSignal` | `signal` (`abortSignal` accepted, deprecated) | Both work; `signal` wins if both are set. |
+| `timeout` | `timeout` | Both accept a number or an object. The AI SDK's object is `{ totalMs, stepMs, toolMs, tools }`; Deuz's is `{ ttftMs, totalMs, stepMs, toolMs }` — no per-tool map (that is `Tool.timeoutMs`), plus a time-to-first-byte layer the AI SDK has no counterpart for. See [Timeouts](/docs/core/prompts-and-timeouts#timeout). |
+| `maxRetries` | `maxRetries` | Deuz retries **pre-first-byte only**; a mid-stream error is final. |
+| `maxOutputTokens`, `temperature`, `topP`, `stopSequences` | same names | Locked surface. |
+| `embed` / `embedMany` | [`embed` / `embedMany`](/docs/core/embeddings) | `value` / `values`. Auto-batched and concurrency-capped. |
+| the provider's embedding-model accessor | `createOpenAIEmbedding(...)`, `createGoogleEmbedding(...)`, `createVoyage(...)` | `EmbeddingModel` is a distinct kind from `LanguageModel` — never cast between them. |
+| `generateImage` (`experimental_generateImage` before 7.0) | [`generateImage`](/docs/modules/image-generation) (`@deuz-sdk/core/image`) | Plus async Midjourney at `@deuz-sdk/core/midjourney`. |
+| `MockLanguageModelV4` (`ai/test`) | `createMockModel` (`@deuz-sdk/core/testing`) | Scripted turns; `mockFetch` / `sseResponse` / `mockFetchSequence` for golden-replay fixtures. |
+
+## Mapping: tools and the agentic loop
+
+| Vercel AI SDK (7.x) | `@deuz-sdk/core` | Notes |
+| --- | --- | --- |
+| `tool({ inputSchema, execute })` | [`tool({ parameters, execute })`](/docs/agents/tools#the-tool-helper) | Deuz kept `parameters`. Deuz's `tool()` is a pure identity function — inference only, zero runtime. |
+| `stopWhen: isStepCount(n)` (`stepCountIs` before 7.0) | `maxSteps: n` — or `stopWhen: stepCountIs(n)` | Deuz's `maxSteps` **defaults to 1** (single turn). This is the single most common porting bug. |
+| `stopWhen` (array, OR-ed) | `stopWhen` (single or array, OR-ed with `maxSteps`) | Deuz also ships `hasToolCall`, `totalTokensExceed`, `costExceeds`, `durationExceeds`. |
+| `activeTools` (`experimental_activeTools` before 7.0) | `activeTools` | Same meaning. Matching nothing fails **open** in Deuz (the full set is sent). |
+| `prepareStep` (`experimental_prepareStep` before 7.0) | `prepareStep` | Returns `{ messages?, activeTools?, toolChoice?, model? }`. Runs after automatic compaction. |
+| `onStepEnd` (`onStepFinish` before 7.0) | `onStepFinish` | Deuz kept the older name. |
+| `onEnd` (`onFinish` before 7.0) | `onFinish` | Deuz kept the older name. `onUsage` is separate. |
+| `toolChoice` | `toolChoice` | `'auto' \| 'required' \| 'none' \| { type: 'tool', toolName }`. |
+| `toolApproval` (`needsApproval` before 7.0) | `needsApproval` (per tool) + `approveToolCall` / `approvalResponses` | Deuz kept `needsApproval` on the tool. Server mode decides inline; client mode breaks the loop into `pendingApprovals` / `tool-approval-request` parts. HMAC-signed tokens via `createApprovalSigner`. |
+| `toolCall.input` / `toolResult.output` | `ToolCall.args` / `ToolResult.result` | Deuz's canonical parts are `tool_use` (`input`) and `tool_result` (`result`). The **UI wire** uses `input` / `output`. |
+| `ToolExecutionOptions` (`ToolCallOptions` before 7.0) | `ToolExecuteContext` | `{ toolCallId, messages, signal? }` plus `agentPath` inside a sub-agent. |
+| `contextSchema` / `toolsContext` / `runtimeContext` | — | No equivalent. Close over what a tool needs, or read it from `ctx.messages`. |
+| `ToolLoopAgent` | [`createAgent({ ... })`](/docs/agents/create-agent) | A frozen value, not a class. `agent.asTool()` for nesting. |
+| `WorkflowAgent` (durable) | `session: { store, runId }` + `resumeFromCheckpoint` | [Durable runtime](/docs/agents/durable-runtime) — checkpoints go in *your* store; there is no workflow vendor. |
+| provider-executed tools | `anthropicWebSearch()`, `openaiWebSearch()`, `googleSearch()` | [Provider-executed tools](/docs/agents/server-tools). Passing one to a `chat_completions`-surface model drops it and logs a warning. |
+| `createMCPClient` | `createMcpClient` (`@deuz-sdk/core/mcp`, `/mcp/stdio`) | `@modelcontextprotocol/sdk` is a lazy optional peer. `listTools()` returns a canonical `ToolSet`. |
+
+## Mapping: UI, React and the wire
+
+| Vercel AI SDK (7.x) | `@deuz-sdk/core` | Notes |
+| --- | --- | --- |
+| `result.toUIMessageStreamResponse()` | [`toDeuzStreamResponse(result)`](/docs/modules/ui-streaming) (`@deuz-sdk/core/ui`) | Different protocol, not a drop-in. |
+| `result.toTextStreamResponse()` | [`toDeuzTextStreamResponse(result)`](/docs/modules/ui-streaming#plain-text-todeuztextstreamresponse) | Since 1.9. `text/plain`, no framing. A mid-stream failure truncates the body — it never injects error text. |
+| `createUIMessageStream` / `createUIMessageStreamResponse` + a `data-*` write | [`createDeuzStream(result)`](/docs/modules/ui-streaming#server-createdeuzstream-and-typed-data-parts) → `writeData(name, payload, { id?, transient? })` | Since 1.9 a data part can be addressable (`id`, reconciled client-side) or `transient` (on the wire, off the journal). |
+| `useChat` (`@ai-sdk/react`) | [`useChat`](/docs/modules/react-hooks) (`@deuz-sdk/react`) | Both hooks, very different surfaces — see below. |
+| `transport: new DefaultChatTransport({ api })` | `useChat({ api })` | Deuz has no transport abstraction; `fetch` is injectable. |
+| `messages` (option) / `setMessages` | `initialMessages` (read once at mount) / `setMessages` / `setHistory` | Deuz keeps **two** views. `setMessages` re-derives canonical via the lossy `canonicalFromUI`; `setHistory({ ui, canonical })` replaces both. |
+| `UIMessage.parts` | `UIMessage.parts` (`UIMessagePart[]`) | Since 1.9, and **optional** — absent until the first element exists. Different member set; see [rendering ordered parts](/docs/modules/react-hooks#rendering-ordered-parts). |
+| `addToolResult` | `addToolResult({ toolCallId, output, isError? })` | Since 1.9. Answers a *parked* client tool call. |
+| `resumeStream` | `resume: { endpoint, auto?, cursor? }` + `reconnect()` | `auto` fires once per mounted hook and fails silently by design. |
+| `regenerate` / `stop` / `clearError` | `regenerate` / `stop` / `clearError` | Same names. Deuz also has `editAndResend(messageId, input)`. |
+| `onToolCall` / `onData` / `onError` | same names | Deuz's `onData` receives the **raw** frame, before reconciliation. |
+| `convertToModelMessages(messages)` | `canonicalFromUI(ui)` — or don't | Deuz's `useChat` already holds the canonical history and POSTs it, so a route normally reads `Message[]` directly. `canonicalFromUI` is the lossy inverse for apps that own the UI array. |
+| — (no equivalent) | [`validateChatRequest(body)`](/docs/modules/request-validation) | Deuz's route receives a canonical `Message[]`, which includes `role: 'system'` — so it ships a structural validator. Use it. |
+| `useObject` | [`useObject`](/docs/modules/react-hooks#useobject) | Reads `object-delta` parts from `toDeuzObjectStreamResponse`. |
+| `useCompletion` | — | Not implemented. Use `useChat` against a single-turn route. |
+| Svelte / Vue / Angular bindings | — | Not implemented. The wire is framework-agnostic; only React ships. |
+
+## Mapping: providers
+
+Deuz's provider modules are dedicated subpaths of the one package, not separate packages — there is nothing to add to `package.json` per provider.
+
+| Vercel AI SDK | `@deuz-sdk/core` |
 | --- | --- |
-| `textStream` | `textStream` (`AsyncIterable<string>`) |
-| `fullStream` | `fullStream` (`AsyncIterable<StreamPart>`) |
-| `usage` (Promise) | `usage` (`Promise<Usage>`) |
-| `finishReason` (Promise) | `finishReason` (`Promise<FinishReason>`) |
+| `@ai-sdk/anthropic` → `createAnthropic` | `@deuz-sdk/core/anthropic` → `createAnthropic`, `anthropic` |
+| `@ai-sdk/openai` → `createOpenAI` | `@deuz-sdk/core/openai` → `createOpenAI` (Chat Completions), `createOpenAIResponses` (Responses API), `createOpenAIEmbedding` |
+| `@ai-sdk/google` | `@deuz-sdk/core/google` → `createGoogle` (compat) / `createGoogleNative` (full wire: reasoning, cache, native PDF) |
+| `@ai-sdk/google-vertex` | `@deuz-sdk/core/vertex` → `createVertexAnthropic`, `createVertexGoogle`, `createVertexGoogleNative` |
+| `@ai-sdk/xai` | `@deuz-sdk/core/xai` → `createXai` |
+| `@ai-sdk/azure` | `@deuz-sdk/core/azure` → `createAzure` |
+| `@ai-sdk/amazon-bedrock` | `@deuz-sdk/core/bedrock` → `createBedrock` |
+| `@ai-sdk/openai-compatible` → `createOpenAICompatible` | `@deuz-sdk/core/providers` → [`createOpenAICompatible({ id, baseURL })`](/docs/providers/compat#createopenaicompatible) |
+| `@ai-sdk/groq`, `@ai-sdk/mistral`, `@ai-sdk/deepseek`, … | `@deuz-sdk/core/providers` → `createGroq`, `createMistral`, `createDeepSeek`, `createTogether`, `createOpenRouter`, `createCerebras`, `createFireworks`, `createMoonshot` / `createKimi`, `createQwen`, `createGLM`, `createMiniMax` |
+| `customProvider` (`experimental_customProvider` before 7.0) / gateway string ids | `createProviderRegistry({ ... })` → `registry.model('groq:llama-4-maverick')` | Pure local lookup over factories you wire up. Zero network, no hosted gateway. |
+| `wrapLanguageModel` + middleware | `wrapModel(model, [...])` (`@deuz-sdk/core/middleware`) | Bundled `logging`, `simpleCache`, `redactPII`, `promptInjectionGuard`, `withFallback`. First array element is outermost. |
 
-### Canonical `StreamPart` names
+## Canonical part names
 
-Both SDKs normalize provider SSE into a canonical delta union, but the part `type` strings differ. The `fullStream` uses these names:
+Both SDKs normalize provider SSE into a delta union first, but the strings differ. Deuz's `fullStream` yields `StreamPart`:
 
-| AI SDK part type | `@deuz-sdk/core` `StreamPart` type |
+| AI SDK part type | Deuz `StreamPart` type |
 | --- | --- |
-| `text-delta` | `text-delta` |
-| `reasoning` / `reasoning-delta` | `reasoning-delta` |
-| `tool-call-streaming-start` / `tool-call-delta` | `tool-call-delta` |
-| `tool-call` | `tool-call` |
-| `tool-result` | `tool-result` |
-| `step-start` | `step-start` |
-| `step-finish` | `step-finish` |
+| `text-delta` | `text-delta` (payload field: `text`) |
+| `reasoning-delta` | `reasoning-delta` (payload field: `text`) |
+| `tool-input-delta` | `tool-call-delta` (`{ id, name?, argsTextDelta }`) |
+| `tool-call` | `tool-call` (`{ toolCallId, toolName, input }`) |
+| `tool-result` | `tool-result` (`{ toolCallId, toolName, output, isError? }`) |
+| `start-step` / `finish-step` | `step-start` / `step-finish` |
 | `source` | `source` |
-| `finish` | `finish` |
-| `error` | `error` |
+| `finish` | `finish` (`{ usage, finishReason, providerMetadata? }`) |
+| `error` | `error` (`{ error: unknown }` — the UI wire reframes this to `{ message: string }`) |
 
-The `StreamPart` union is **open** — keep a `default` case in your `switch`, since new variants are additive. The text payload field is always `text` (for both `text-delta` and `reasoning-delta`). The Deuz UI wire (`readDeuzStream`) reframes a few of these — most notably `tool-call-delta` becomes `tool-input-delta`, and the `error` part carries a `message` string instead of an `error` value — so match on the UI part names when reading the wire.
-
-### Loop control: `maxSteps` and `stopWhen`
-
-The agentic loop is bounded the same way as the AI SDK: `maxSteps` (default **1**, i.e. single-turn) plus an optional `stopWhen` predicate, OR-ed together. Since **1.4** the `stepCountIs` / `hasToolCall` factories are exported (plus the usage-based `totalTokensExceed` / `costExceeds`, which the AI SDK has no equivalent of); `stopWhen` also accepts a plain callback you write inline, receiving `{ steps, stepCount, usage, costUSD }`.
-
-```ts
-const result = await generateText({
-  model: anthropic('claude-opus-4-8'),
-  messages,
-  tools,
-  maxSteps: 8,
-  // OR-ed with maxSteps. Return true to stop after the current step.
-  stopWhen: ({ steps }) => steps.at(-1)?.toolCalls.some((c) => c.toolName === 'finalAnswer') ?? false,
-});
-```
-
-Per-step and usage callbacks exist as call options: `onStepFinish(step)`, `onUsage(usage, meta)`, and `onFinish(meta)`. There is no separate `experimental_` namespace — these are stable fields on the call options.
-
-The AI SDK's `experimental_prepareStep` maps to the stable `prepareStep` hook. It runs before every model turn (after automatic compaction) and returns per-step overrides: `model` (per-step model routing), `activeTools` (restrict the wire-visible tools this step), `toolChoice`, and `messages`. A static, all-steps tool filter is also available as the top-level `activeTools` option.
+Deuz adds members the AI SDK has no counterpart for: `compaction`, `sub-agent`, `citation`, `cost`, `budget-exceeded`, `verify`, `plan-update`, `activity`, `tool-state`, `tool-approval-request`. The union is documented as **open** — keep a `default` case.
 
 ## Code: basic stream
 
@@ -102,8 +173,9 @@ import { streamText } from 'ai';
 import { anthropic } from '@ai-sdk/anthropic';
 
 const result = streamText({
-  model: anthropic('claude-3-5-sonnet'),
-  messages: [{ role: 'user', content: 'Write a haiku about TypeScript.' }],
+  model: anthropic('claude-sonnet-4-5'),
+  instructions: 'You are terse.',
+  prompt: 'Write a haiku about TypeScript.',
 });
 
 for await (const chunk of result.textStream) process.stdout.write(chunk);
@@ -118,31 +190,36 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const result = streamChat({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Write a haiku about TypeScript.' }],
+  instructions: 'You are terse.',
+  prompt: 'Write a haiku about TypeScript.',
 });
 
-for await (const chunk of result.textStream) process.stdout.write(chunk);
-const usage = await result.usage; // resolves when the stream finishes
+try {
+  for await (const chunk of result.textStream) process.stdout.write(chunk);
+} catch {
+  // Mid-stream failure. The `streamChat(...)` call itself never throws.
+}
+const usage = await result.usage;
 ```
 
 ## Code: tools
 
-The AI SDK's `tool()` helper becomes a plain object keyed by tool name. `parameters` is any Standard Schema (Zod, Valibot) or a raw JSON Schema; `execute` is optional (omit it for a client tool).
+Deuz kept `parameters`; the AI SDK calls it `inputSchema`. Everything else lines up.
 
 ```ts title="before-tools.ts"
 // Vercel AI SDK
-import { generateText, tool } from 'ai';
+import { generateText, tool, isStepCount } from 'ai';
 import { anthropic } from '@ai-sdk/anthropic';
 import { z } from 'zod';
 
 const { text } = await generateText({
-  model: anthropic('claude-3-5-sonnet'),
-  messages: [{ role: 'user', content: 'Weather in Paris?' }],
-  maxSteps: 5,
+  model: anthropic('claude-sonnet-4-5'),
+  prompt: 'Weather in Paris?',
+  stopWhen: isStepCount(5),
   tools: {
     getWeather: tool({
       description: 'Get the weather for a city',
-      parameters: z.object({ city: z.string() }),
+      inputSchema: z.object({ city: z.string() }),
       execute: async ({ city }) => ({ city, tempC: 22 }),
     }),
   },
@@ -151,7 +228,7 @@ const { text } = await generateText({
 
 ```ts title="after-tools.ts"
 // @deuz-sdk/core
-import { generateText } from '@deuz-sdk/core';
+import { generateText, tool } from '@deuz-sdk/core';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
 import { z } from 'zod';
 
@@ -159,34 +236,71 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const { text, steps } = await generateText({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Weather in Paris?' }],
-  maxSteps: 5,
+  prompt: 'Weather in Paris?',
+  maxSteps: 5, // REQUIRED — the default is 1, i.e. a single turn
   tools: {
-    getWeather: {
+    getWeather: tool({
       description: 'Get the weather for a city',
       parameters: z.object({ city: z.string() }),
-      execute: async ({ city }) => ({ city, tempC: 22 }),
-    },
+      execute: async (args) => ({ city: args.city, tempC: 22 }), // args: { city: string }
+    }),
   },
 });
 ```
 
-Parallel execution (`maxToolConcurrency`, default 5), self-healing on thrown tools, immutable cache-safe history, and runaway guards are built in. See [Tools](/docs/agents/tools) and [The tool loop](/docs/agents/tool-loop).
+`tool()` is optional — a plain object literal still works, it just types `args` as `unknown`. Parallel execution (`maxToolConcurrency`, default 5), self-healing on a thrown tool, immutable cache-safe history and runaway guards are built in. See [Tools](/docs/agents/tools) and [the tool loop](/docs/agents/tool-loop).
+
+## Code: a reusable agent
+
+```ts title="before-agent.ts"
+// Vercel AI SDK
+import { ToolLoopAgent } from 'ai';
+import { anthropic } from '@ai-sdk/anthropic';
+
+const support = new ToolLoopAgent({
+  model: anthropic('claude-sonnet-4-5'),
+  instructions: 'You are a terse support agent.',
+  tools: { lookupOrder },
+});
+
+const { text } = await support.generate({ prompt: 'where is order 12?' });
+```
+
+```ts title="after-agent.ts"
+// @deuz-sdk/core — a frozen value, no `new`
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const support = createAgent({
+  name: 'support',
+  model: anthropic('claude-opus-4-8'),
+  instructions: 'You are a terse support agent.',
+  tools: { lookupOrder },
+  maxSteps: 8,
+});
+
+const { text } = await support.generateText({ prompt: 'where is order 12?' });
+const res = support.streamChat({ prompt: 'where is order 12?' }); // sync (G2)
+```
+
+The method names are the free functions' names — `generateText`, `streamChat`, `generateObject`, `streamObject` — because that is exactly what they forward to. See [createAgent](/docs/agents/create-agent) for the merge rule and its one sharp edge.
 
 ## Code: structured output
 
-Your Zod schema works unchanged via Standard Schema — no adapter needed. You can also pass a raw JSON Schema object. `mode` (`'auto' | 'json' | 'tool'`) replaces the AI SDK's `mode` / `output` knobs.
+`generateObject` / `streamObject` are absent from AI SDK 7's Core reference; Deuz keeps them as their own functions with their own strategy picker.
 
 ```ts title="before-object.ts"
 // Vercel AI SDK
-import { generateObject } from 'ai';
+import { generateText, Output } from 'ai';
 import { anthropic } from '@ai-sdk/anthropic';
 import { z } from 'zod';
 
-const { object } = await generateObject({
-  model: anthropic('claude-3-5-sonnet'),
-  messages: [{ role: 'user', content: 'Capital of France as JSON.' }],
-  schema: z.object({ city: z.string() }),
+const { output } = await generateText({
+  model: anthropic('claude-sonnet-4-5'),
+  prompt: 'Capital of France as JSON.',
+  output: Output.object({ schema: z.object({ city: z.string() }) }),
 });
 ```
 
@@ -200,53 +314,67 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const { object } = await generateObject({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Capital of France as JSON.' }],
+  prompt: 'Capital of France as JSON.',
   schema: z.object({ city: z.string() }),
-  // mode: 'auto', // 'json' | 'tool' to force a strategy
+  // mode: 'auto' — 'json' | 'tool' to force a strategy
 });
 ```
 
-On a parse/validation miss `@deuz-sdk/core` runs one repair retry, then throws `NoObjectGeneratedError`. For streaming partials, use [`streamObject`](/docs/core/stream-object) — same options, no repair retry.
+`mode: 'auto'` picks the JSON strategy when the model's registry row reports native structured output, else tool-call coercion. On a parse/validation miss Deuz runs **one repair retry**, then throws `NoObjectGeneratedError`. `streamObject` has no repair retry (partials cannot be un-streamed).
 
-## Code: UI route
+Structured output in Deuz is **single-turn**: since 1.9, passing loop options (`tools`, `maxSteps > 1`, `stopWhen`, `verifyStep`, `memory`, …) to `generateObject` / `streamObject` raises an `InvalidRequestError` before any network call instead of silently ignoring them. If you are porting an `Output.object` call that also passed `tools`, that is the one place the port will *fail loudly* — which is the point.
 
-The AI SDK's `toDataStreamResponse()` / `toUIMessageStreamResponse()` becomes `toDeuzStreamResponse()`. This is **our own** versioned SSE wire (`x-deuz-stream: v1`), not the AI SDK protocol, so it is consumed by `readDeuzStream` rather than `useChat`.
+## Code: chat route
 
 ```ts title="before-route.ts"
 // Vercel AI SDK — app/api/chat/route.ts
-import { streamText } from 'ai';
+import { streamText, convertToModelMessages, type UIMessage } from 'ai';
 import { anthropic } from '@ai-sdk/anthropic';
 
 export async function POST(req: Request) {
-  const { messages } = await req.json();
-  const result = streamText({ model: anthropic('claude-3-5-sonnet'), messages });
-  return result.toDataStreamResponse();
+  const { messages }: { messages: UIMessage[] } = await req.json();
+  const result = streamText({
+    model: anthropic('claude-sonnet-4-5'),
+    messages: convertToModelMessages(messages),
+  });
+  return result.toUIMessageStreamResponse();
 }
 ```
 
 ```ts title="after-route.ts"
 // @deuz-sdk/core — app/api/chat/route.ts
 import { streamChat } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
 import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
 
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
-export async function POST(req: Request) {
-  const { messages } = await req.json();
-  return toDeuzStreamResponse(
-    streamChat({ model: anthropic('claude-opus-4-8'), messages }),
-  );
+export async function POST(req: Request): Promise<Response> {
+  // The body is attacker-controlled and canonical Message[] includes role:'system'.
+  const parsed = validateChatRequest(await req.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+
+  const result = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    instructions: 'You are a helpful assistant.',
+    messages: parsed.request.messages,
+    signal: req.signal,
+  });
+  return toDeuzStreamResponse(result);
 }
 ```
 
-The [`useChat`](/docs/modules/react-hooks) / [`useObject`](/docs/modules/react-hooks) hooks (`@deuz-sdk/core/react`) consume this wire for you; to read it directly without React, use `readDeuzStream`:
+There is no `convertToModelMessages` step: `useChat` from `@deuz-sdk/react` already keeps the canonical `Message[]` alongside the render view and POSTs that. If your route serves client tools (a `useChat` with `onToolCall`), the browser POSTs a `role: 'tool'` message, so pass `validateChatRequest(body, { rejectToolResults: false })` — and read [what that accepts](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false).
+
+## Code: reading the stream without React
 
 ```ts title="client.ts"
 import { readDeuzStream } from '@deuz-sdk/core/ui';
 
 const res = await fetch('/api/chat', {
   method: 'POST',
+  headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ messages }),
 });
 
@@ -261,17 +389,98 @@ for await (const part of readDeuzStream(res)) {
     case 'finish':
       done(part.finishReason, part.usage);
       break;
+    case 'error':
+      showError(part.message); // already secret-redacted
+      break;
     default:
       break; // open union — keep a default case
   }
 }
 ```
 
-## Not implemented yet
+Since 1.9 a non-2xx response yields exactly one `error` part instead of ending silently, so a failed route no longer renders as an empty assistant bubble. Opt out with `readDeuzStream(res, { onHttpError: 'ignore' })`.
 
-These exist in the AI SDK but are deliberately deferred in `@deuz-sdk/core`:
+## Not implemented, or deliberately different
 
-- **`useCompletion`** — use [`useChat`](/docs/modules/react-hooks) with a single-turn route, or drive [`readDeuzStream`](/docs/modules/ui-streaming) directly.
-- **Svelte/Vue/Angular bindings** — the wire is framework-agnostic; only React hooks ship today.
+The previous version of this page ended with "everything else has a direct equivalent above". That was false. Here is the real list.
 
-Everything else in the chat, tools (including approval), structured output (buffered and streaming), embeddings, MCP, React hooks, and UI surface has a direct equivalent above.
+### Not implemented — no equivalent today
+
+| AI SDK feature | Status in Deuz |
+| --- | --- |
+| `transcribe`, `generateSpeech` (audio in/out) | **Absent.** No transcription or speech function exists. Some models report an `audio` capability in the registry (audio *tokens* are metered), but there is no audio entry point. |
+| Video generation (`experimental_generateVideo`) | **Absent** as a function. `@deuz-sdk/core/yunwu` carries a pinned `YUNWU_VIDEO_MODELS` catalog only. |
+| `useCompletion` | **Absent.** Use `useChat` against a single-turn route, or drive `readDeuzStream` yourself. |
+| Svelte / Vue / Angular bindings | **Absent.** Only `@deuz-sdk/react` ships. The wire is plain SSE, so a binding is writable in an afternoon. |
+| DevTools (`@ai-sdk/devtools`, a local web UI on a port) | **No server, but there is a viewer.** `renderRunReport(events)` (`@deuz-sdk/core/observe`) turns the same `ObserveEvent` protocol into one self-contained HTML document — inline CSS/JS, no external fetch, opens from `file://` — and `writeRunReport({ from: 'runs.jsonl', to: 'run.html' })` (`@deuz-sdk/core/observe/node`) does it straight from a `createJsonlObserver` file. Nothing listens on a port and nothing records by default. |
+| OpenTelemetry integration (`@ai-sdk/otel`, `registerTelemetry()`) | **`@deuz-sdk/core/otel`** — `createOtelTracer()` / `createOtelObserver()`, with `@opentelemetry/api` as an OPTIONAL peer resolved lazily (no dependency, no bundled shim). Span names and `gen_ai.*` attributes follow the GenAI semantic conventions, so prebuilt dashboards work. Two differences on purpose: there is **no global registration** — you pass it through `createClient({ deps: { tracer } })`, so nothing is ambient and tests stay deterministic — and **content capture is opt-in** (`captureContent`) and always double-redacted, rather than on by default. See [Observability](/docs/modules/observability). |
+| `Output.array()` / element streaming | **Absent.** `streamObject` streams growing partials of one object; there is no per-element stream. |
+| `contextSchema` / `toolsContext` / `runtimeContext` | **Absent.** A tool closes over what it needs; `ToolExecuteContext` carries `toolCallId`, `messages`, `signal` and (inside a sub-agent) `agentPath`. |
+| Codemods (`@ai-sdk/codemod`) | **Absent.** Deuz ships the `migrate-from-ai-sdk` agent skill instead. |
+| Hosted model gateway / plain string model ids | **Deliberately absent.** `createProviderRegistry` is a local descriptor lookup with zero network. |
+
+### Deliberately different
+
+- **`maxSteps` defaults to 1.** A tool-using call that forgets `maxSteps` gets one turn, `finishReason: 'tool_calls'` and no answer. Port every loop with an explicit bound.
+- **`parameters`, not `inputSchema`.** Deuz's `Tool` shape predates the rename and is part of a locked 1.0 surface.
+- **Retry is pre-first-byte only.** Once bytes stream, a mid-stream error is final — there is no mid-stream resume of a provider call. (Resuming the *UI stream* is a separate, supported thing: wire v2 + `StreamStateStore`.)
+- **A canonical `Part` union with five members** (`text`, `image`, `tool_use`, `tool_result`, `reasoning`) and no `file` kind until 2.0. A PDF is an `image` part with `mediaType: 'application/pdf'`; use [`filePart()`](/docs/core/files) so you never have to know that.
+- **No `system` option name.** Deuz calls it `instructions` (as AI SDK 7 now does too) and a `system`-role message in `messages` is preserved rather than rejected.
+- **Approvals are a loop primitive, not a UI state.** A gated call either resolves inline (`approveToolCall`) or breaks the loop; `needsApproval` stays on the tool.
+
+### Partly inert — check before you port onto these
+
+`warnings` is the one place where Deuz's coverage is narrower than the AI SDK's, and it will not announce itself at runtime.
+
+The AI SDK's `result.warnings` reports dropped settings on every result. Deuz's is **live on `streamChat` only**:
+
+```ts
+const result = streamChat({ model, prompt, temperature: 0.7 });
+for (const w of (await result.warnings) ?? []) console.warn(w.type, w.setting, w.message);
+```
+
+What does not carry over:
+
+- **`generateText`, `generateObject` and `streamObject` never populate it.** `result.warnings` is `undefined` there. If the ported code reads `warnings` off a buffered result, it loses information silently — port it to `deps.logger.warn` instead.
+- **A `streamChat` with `tools` (or `chat` / `memory` / `verifyStep` / `doneWhen`) reports only its own `activeTools` notices.** A model-level warning — unknown slug, a stripped sampling param, a hosted tool the Chat Completions wire dropped, a dropped document — is raised inside the per-step pump and reaches the log, not the field.
+
+So during a port, wire a logger regardless:
+
+```ts
+deps: {
+  logger: {
+    debug() {}, info() {},
+    warn: (msg, meta) => console.warn('[deuz]', msg, meta),
+    error: (msg, meta) => console.error('[deuz]', msg, meta),
+  },
+}
+```
+
+The full residual list is on [Declared but inert](/docs/reference/whats-new-1-9#declared-but-inert).
+
+### Two things that no longer need a workaround
+
+Both were plumbing-only when 1.9 first landed and now have producers, so a port should use them directly:
+
+- **Tool approval *denial*.** The streaming loop sets `denied` / `deniedReason` on its `tool-state` parts, so `UIToolCall.denied` is real: a refused call renders as declined instead of "getWeather failed", and a tool that *threw* gains no denial fields. The AI SDK has no equivalent. See [rendering a denial](/docs/modules/ui-streaming#rendering-a-denial-not-a-failure).
+- **`sub-agent` parts in `useChat`.** `applyUIPart` folds each frame into `turn.subAgents` (one per `agentPath`, carrying the child's own full `AssistantTurnState`) and `useChat` exposes `subAgents`. You no longer need to read the wire by hand with `readDeuzStream` to render a nested agent. See [rendering a sub-agent run](/docs/modules/react-hooks#rendering-a-sub-agent-run).
+
+## What Deuz has that the AI SDK does not
+
+Not a competition — just the parts of a port where you get to *delete* code:
+
+- **Durable runs without a workflow vendor.** Step checkpoints in your own store, `resumeFromCheckpoint`, and a resumable UI wire, so a refresh, a network blip and a server crash all look the same to the client. See [the unbreakable chatbot](/docs/agents/unbreakable-chatbot).
+- **Automatic layered compaction** (`compaction: 'auto'`) — prune tool results, prune reasoning, summarize — inside the loop, prefix-stable so prompt-cache hits survive.
+- **Budget guardrails** — `budget: { usd, tokens }`, `costExceeds`, `totalTokensExceed`, all reading real provider-reported usage, with a live `cost` part on the wire.
+- **`verifyStep`** — a verifier hook at every natural completion that can reject an answer and re-drive the loop with feedback.
+- **Memory and RAG in the box** — mem0-style extract/reconcile over a vector store or a markdown vault; hybrid dense + BM25 retrieval with RRF fusion.
+- **A structural request validator** (`validateChatRequest`) for the exact body a chat route receives.
+- **Zero runtime dependencies**, an edge-safety lint gate, and injected clock/randomness — so tests are deterministic and the same build runs on Workers.
+
+## See also
+
+- [Quickstart](/docs/quickstart) — the shortest path to a running stream.
+- [Prompts, instructions and timeouts](/docs/core/prompts-and-timeouts) — the 1.9 call-shape ergonomics.
+- [createAgent](/docs/agents/create-agent) — the reusable-agent value.
+- [Request validation](/docs/modules/request-validation) — the gate every ported route needs.
+- [What is new in 1.9](/docs/reference/whats-new-1-9) — the full 1.9 surface with its honest limitations.

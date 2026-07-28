@@ -1,0 +1,228 @@
+---
+title: What is new in 1.9
+description: The full 1.9 surface — parity hardening, ergonomics, the chat UI layer and createAgent — with the limitations stated plainly.
+---
+
+1.9 is four things: **silent failures made loud**, **ergonomics** that remove the first hour of reading the source, a **chat UI layer** that makes a streamed turn renderable in the order it happened, and `createAgent`. Everything is additive — no existing type gained a required field, no literal union gained a member, and every 1.8 call still compiles and behaves identically.
+
+Three surfaces first landed as **types and plumbing only** — `warnings`, tool-approval **denial**, and `sub-agent` parts in `useChat`. All three now have real producers; [The wiring pass](#the-wiring-pass) shows what each one emits. What is genuinely still missing is a shorter list, and it is still at the bottom: [Declared but inert](#declared-but-inert).
+
+## 1. Silent failures made loud
+
+| Was silent | Now |
+| --- | --- |
+| A non-2xx chat response carried no `data:` lines, so `readDeuzStream` ended immediately and the UI settled into a *successful* empty assistant bubble. | Exactly one `error` part: `Deuz stream request failed (status 500 Internal Server Error).` Opt out with `readDeuzStream(res, { onHttpError: 'ignore' })` or `useChat({ onHttpError: 'ignore' })`. |
+| `verifyStep` produced a canonical `verify` part that `toDeuzStreamResponse` dropped, so a verified run looked identical to an unverified one client-side. | `verify` is serialized to the wire (v2 only), journaled, and replayed on resume. v1 output stays byte-identical. |
+| `applyUIPart` dropped `finish`, `step-finish` and `verify`, so a UI on the chat reducer could not show token usage and could not tell "complete" from "hit the output limit". | All three fold into the turn: `AssistantTurnState.usage` / `.finishReason` / `.steps` / `.verifications`, surfaced on `useChat` too. |
+| Passing a provider-executed (hosted) tool to a `chat_completions`-surface model removed it from the request with no signal. | Still dropped (the wire has no hosted-tool support), but the drop now reports twice: one `logger.warn` naming the dropped tools, the provider and the model id, plus a typed `{ type: 'unsupported-tool' }` `CallWarning`. The request body is unchanged byte for byte. One caveat — a hosted tool needs `tools`, which routes the call through the loop, and the loop does not merge a step's model-level warnings yet: see [Declared but inert](#declared-but-inert). |
+
+The HTTP-error path deliberately does **not** read or echo the response body — an error page is unbounded markup you do not control. Only `statusText` is included, truncated and passed through the standard secret redaction.
+
+Wire payloads folded by the reducer are **normalized on the way in**, so those fields are trustworthy even from an older or partial server: missing or non-finite counts read as `0`, `totalTokens` falls back to input+output, and a non-string `finishReason` is ignored rather than written.
+
+### Two intentional behaviour changes
+
+**`generateObject` / `streamObject` reject loop options.** Structured output is single-turn; passing loop options to it was accepted and then ignored, so `generateObject({ tools, maxSteps: 10 })` ran one plain turn with no tools called, no error and no warning. These calls now fail fast with an `InvalidRequestError` naming every offending option: `tools`, `toolChoice`, `maxSteps`, `stopWhen`, `budget`, `maxToolConcurrency`, `onStepFinish`, `prepareStep`, `activeTools`, `verifyStep`, `maxVerifyAttempts`, `compaction`, `approveToolCall`, `approvalResponses`, `session`, `chat`, `memory`, `fallbackModels`, `approvalSigner`, `approvalMaxAgeMs`.
+
+There are no false positives by construction — an option counts only when it carries a real value. Empty collections (`stopWhen: []`, `activeTools: []`, `tools: {}`) and `maxSteps: 1` (which *is* single-turn behaviour) pass the guard, so wrappers that always spread a full options bag keep working. `generateObject` rejects; `streamObject` reports it through its never-throw shape.
+
+**A hallucinated tool name self-heals instead of ending the run.** A tool call naming a tool not in your `tools` used to be indistinguishable from a *client* tool, so the loop treated it as a client hand-off and exited — returning a turn with a dangling `tool_use` and no error, leaving a server waiting forever for a `tool_result`. It is now recognized as unregistered and fed back as an `is_error` `tool_result` in the same turn, and the loop **continues**:
+
+```
+No such tool: "search_web". Available tools: getWeather, search.
+```
+
+<Callout type="warn" title="This changes the definition of a client tool">
+A client tool is a **key present in `tools` with no `execute`** — not "any tool without `execute`". An unregistered name is no longer a client hand-off. A name colliding with an `Object.prototype` member (`toString`, `constructor`) is now correctly classified as unknown too.
+</Callout>
+
+Two guards on the new path: unknown-tool errors count toward the runaway limit, so a model looping on the same invented name hard-stops after 3 consecutive failures with `endReason: 'runaway-tool-errors'`; and in streaming no `executing` tool-state is emitted, because nothing executes. Real client tools are unchanged.
+
+## 2. Ergonomics
+
+| Addition | Where |
+| --- | --- |
+| `prompt` — shorthand for one user turn, mutually exclusive with `messages` | [Prompts & timeouts](/docs/core/prompts-and-timeouts) |
+| `instructions` — the system prompt, placed first, idempotent fold | [Prompts & timeouts](/docs/core/prompts-and-timeouts) |
+| `timeout: { ttftMs, totalMs, stepMs, toolMs }` (or a bare number = `totalMs`) | [Timeouts](/docs/core/prompts-and-timeouts#timeout) |
+| `Tool.timeoutMs` — cap one slow tool; expiry self-heals | [Timeouts](/docs/core/prompts-and-timeouts#tooltimeoutms) |
+| `tool()` — a pure identity function that types `execute(args)` | [Tools](/docs/agents/tools#the-tool-helper) |
+| `filePart()` / `imagePart()`, and PDFs that work on all four wires | [Files & PDFs](/docs/core/files) |
+| `createOpenAICompatible({ id, baseURL })` — a real provider id for an OpenAI-shaped host | [Compatible providers](/docs/providers/compat#createopenaicompatible) |
+| `capabilities` per call + `getModelCapabilities(model)` | [Prompts & timeouts](/docs/core/prompts-and-timeouts#capabilities) |
+| `consume()` — make terminal effects run when nobody reads the stream | [streamChat](/docs/core/stream-chat#consume) |
+| `toDeuzTextStreamResponse()` — plain-text streaming | [UI streaming](/docs/modules/ui-streaming#plain-text-todeuztextstreamresponse) |
+| `abortSignal` accepted as a deprecated alias for `signal` | [Prompts & timeouts](/docs/core/prompts-and-timeouts#abortsignal) |
+
+`tool()` is worth one extra note: it returns the **same object** (`tool(def) === def`), imports no validator and adds zero runtime behaviour — its entire job is inference. It also ships `InferToolInput<T>` / `InferToolOutput<T>`, which work on `tool()` results and on plain `Tool<Args, Result>` values.
+
+### Also in this group
+
+**`generateObject({ schema: z.object(...) })` now typechecks.** A real zod schema was never structurally assignable to core's inlined `StandardSchemaV1`, so the headline typed-structured-output path did not compile — despite being what the README and docs advertise. `StandardSchemaIssue.path` was typed `ReadonlyArray<PropertyKey>`, but Standard Schema (and zod ≥ 3.24, and valibot) also allow an object segment `{ key: PropertyKey }`. `path` is a type-only widening — nothing in core reads it — and the surface test now pins a real zod schema.
+
+**Four more intentional behaviour changes:**
+
+1. **Non-image media is a document block**, and is refused loudly when the model cannot take one — the part is dropped and `logger.warn` names the model and media type. A message may now carry fewer blocks than parts. See [Files](/docs/core/files).
+2. **A timeout expiry that lost its reason** is reported as a `TimeoutError` instead of being misclassified as a user abort.
+3. **Tool timeouts count toward the runaway-tool guard**, so a tool that hangs three times running hard-stops the loop. One success resets the counter.
+4. **`wrapModel(...).streamChat()` stops dropping result fields** — `runId`, `observation` and `memory` were lost through the wrapper. All three are forwarded again, plus `warnings` and `consume`. A wrapped call with `session` set but no `runId` now generates the id up front, so `result.runId` is known synchronously.
+
+`getCapabilities()` also returns a **frozen** object now, so mutating the resolved matrix throws in strict mode instead of silently poisoning later calls.
+
+## 3. The chat UI layer
+
+### Ordered part projection
+
+`content` / `reasoning` / `toolCalls` are *buckets*. A multi-step run — think → search → "I found 3 papers" → fetch → "here is the summary" — flattens into one reasoning blob, one text blob and a detached list of tool cards, so a UI cannot place a tool card between the two sentences it belongs between.
+
+`applyUIPart` and `uiFromMessages` now also record arrival order in an optional `parts: UIMessagePart[]`. No wire change was needed: the canonical `StreamPart` stream is already strictly ordered, so **arrival order is the interleave**. See [rendering ordered parts](/docs/modules/react-hooks#rendering-ordered-parts) for the renderer, including the two cases people miss (`step-start` is normally `parts[0]`; `encrypted` reasoning must not be rendered).
+
+The buckets keep their exact 1.8 semantics and are **not** deprecated — `content` is still the turn's full text, byte-identical.
+
+### The rest
+
+| Addition | Notes |
+| --- | --- |
+| `sealAssistantTurn(turn)` | Closes a tail `state: 'streaming'` part at a boundary only the binding knows about (user abort, dropped connection, restored turn). Idempotent; returns the **same object** when there is nothing to seal. |
+| `canonicalFromUI(ui)` | The inverse projection, with its lossiness documented rather than hidden. |
+| `ChatInput = string \| { text?, parts? }`, `userMessageFromInput`, `filesToImageParts`, `partsFromFiles` | Multimodal input. A bare string stays a plain string `content`, byte-identical to 1.8, so a prompt-cache prefix does not move. |
+| `writeData(name, payload, { id?, transient? })` | `id` makes an entry addressable (reconciled in place client-side); `transient` emits on the wire but stays off the journal and off-seq. |
+| `useChat`: `setHistory`, `setMessages`, `addToolResult`, `clearError`, `pendingToolCalls`, `throttleMs`, `resume.auto`, `onData`, `onHttpError` | See [React hooks](/docs/modules/react-hooks). |
+| `validateChatRequest` / `parseDeuzChatRequest` | See [Request validation](/docs/modules/request-validation). |
+
+`canonicalFromUI` **survives** (when `parts` is present): interleave order, attachments with their media type, reasoning `signature`/`encrypted`/`redacted`, `tool_use.providerMetadata` (Gemini's `thoughtSignature`, without which the next request 400s), and executed tool calls re-emitted as the following `role: 'tool'` message.
+
+It **does not survive**: `system` messages (`uiFromMessages` never renders one — re-prepend your own), `Message.providerMetadata`, consecutive text parts (they merge into one block, which is what makes the text-only round-trip exact), UI-only state (`runState`, denial, pending approvals, `data-*`, citations, step boundaries), and a call still awaiting its result, which stays a bare `tool_use`. Without `parts` it is materially worse: bucket order, and attachments are gone entirely because `UIMessage.content` is a string.
+
+### `useChat` behaviour changes worth knowing
+
+- **One React commit per wire part.** `syncTurn` published up to seven `setState` calls per folded part; it now builds one snapshot and publishes it once. Values are unchanged, including the non-obvious one: `cost` stays cumulative across turns while `dataParts` / `citations` / `plan` / `activity` / `verifications` / `warnings` / `falseFinishes` / `subAgents` / `steps` / `usage` / `finishReason` stay turn-scoped.
+- **A turn producing client tool calls with no `onToolCall` now parks** — `pendingToolCalls` fills and `status` goes idle — instead of abandoning the round-trip and leaving a `tool_use` with no `tool_result`. `addToolResult({ toolCallId, output })` answers it.
+- **The streaming turn is located in `ui` by id** rather than by overwriting the trailing element, so a mid-stream `setMessages` can no longer have its result clobbered.
+- **`setHistory` / `setMessages` drop pending approvals and parked tool calls** — they were anchored to the transcript that was just replaced. They do not reset the turn readouts.
+- **A failing `resume.auto` attempt is silent**: no `error`, no `status: 'error'`, no `onError`. The user did not ask for it, and every cold load of an app whose resume endpoint answers 404 would otherwise paint a permanent error. `reconnect()` by hand keeps 1.8's exact error semantics.
+- **A resume that folds zero parts changes nothing.** 1.8 pre-pushed the assistant bubble before reading and left a permanently empty one on screen.
+- **`stop()` and a stream that ends without `finish` call `sealAssistantTurn`**, so a truncated turn stops rendering as still-streaming. A stream that dies with neither `finish` nor `error` and is never sealed deliberately leaves the tail `'streaming'` — that is the truth about a truncated turn.
+- `initialMessages` is still read **once at mount** and deliberately not re-adopted when the prop changes (apps pass an inline array literal, so a new identity arrives every render). `setHistory` is the escape hatch — the same rule and remedy as React's own `useState`.
+
+The wire's **v1 output is unchanged in every byte**. The two new `tool-state` fields and the data-part `id` ride carriers v1 already drops wholesale; the two brand-new part types (`warning`, `false-finish`) are v2-only, so a negotiated-v1 stream never emits them at all — including when they sit inside a `sub-agent` frame.
+
+## 4. `createAgent`
+
+A reusable agent as a frozen value, not a class. See [createAgent](/docs/agents/create-agent).
+
+## The wiring pass
+
+Three surfaces shipped first as types, plumbing and nothing else. They were given producers before publish, so the shapes below are live rather than reserved. Each subsection says exactly which producer, because the coverage is not uniform.
+
+### `warnings` — live on `streamChat`
+
+`StreamChatResult.warnings` resolves a real `CallWarning[]`, and each notice also arrives on `fullStream` as a `warning` part as it is discovered:
+
+```ts title="warnings.ts"
+import { streamChat } from '@deuz-sdk/core';
+
+const result = streamChat({ model, prompt: 'summarise this', temperature: 0.7 });
+
+for await (const part of result.fullStream) {
+  if (part.type === 'warning') {
+    console.warn(part.warning.type, part.warning.setting, part.warning.message);
+  }
+}
+
+// Same set in bulk. Settles with `usage`/`finishReason`; NEVER rejects — a failed
+// run resolves with whatever was collected before the failure.
+for (const w of (await result.warnings) ?? []) console.warn(w.type, w.message);
+```
+
+What actually emits today:
+
+| `type` | `setting` | Raised when |
+| --- | --- | --- |
+| `unknown-model` | — | The slug is not in the registry, so the conservative fallback capability row was used (`maxOutput: 4096`, no reasoning, no structured output). |
+| `unsupported-setting` | `temperature` / `topP` | The model's row has `samplingRestrictions` (a reasoning model rejects sampling params) and the `anthropic` / `chat_completions` / `responses` wire stripped the value **you actually passed**. |
+| `unsupported-setting` | `effort` | The registry reports no `reasoning` capability, so `effort` was dropped. `effort: 'none'` is silent — asking for no reasoning and getting none lost nothing. |
+| `unsupported-tool` | — | A provider-executed (hosted) tool was removed on the Chat Completions wire. Reaching this needs `tools`, so in practice it lands in the log rather than the field — see [Declared but inert](#declared-but-inert). |
+| `unsupported-tool` | `activeTools` | An `activeTools` name matched no tool, or none of them did (the filter fails open and sends the full list). Streaming loop only. |
+| `other` | — | A document was dropped on a model whose capability row cannot accept one. Chat Completions wire only — see [Declared but inert](#declared-but-inert). |
+
+The sink behind it is per call: it **dedupes** by `(type, setting, message)` — the loop re-derives capabilities every step, and one cause must not become N notices — caps at 50 and appends an `N further warning(s) omitted` entry rather than truncating silently. Every warning is also **exactly one** `deps.logger.warn` line, so a log-based workflow sees precisely what it saw before 1.9 and nothing double-logs.
+
+Warnings are discovered during capability resolution and request building, i.e. before the first byte, so the `warning` parts arrive **ahead of** the model's own output.
+
+`wrapModel` and `fallbackModels` forward the underlying result's set. `warning` also crosses the Deuz UI wire (v2 only, message passed through the secret redactor), folds into `AssistantTurnState.warnings`, and surfaces as `useChat().warnings`.
+
+### Tool approval denial
+
+`ToolStatePart.denied` / `deniedReason` now have a producer: the streaming loop's own `tool-state` emitter, at both terminal sites (inline server-mode settlement and the resume/settle leg). A refused call is finally distinguishable from a crashed one:
+
+```ts title="denial.ts"
+import { streamChat } from '@deuz-sdk/core';
+
+const result = streamChat({
+  model,
+  prompt,
+  tools,
+  approveToolCall: async (call) => call.toolName !== 'deleteRepo',
+});
+
+for await (const part of result.fullStream) {
+  if (part.type === 'tool-state' && part.state === 'error') {
+    if (part.denied) console.log('refused:', part.toolCallId, part.deniedReason);
+    else console.log('failed:', part.toolCallId);
+  }
+}
+```
+
+`deniedReason` is the denier's own words and is never invented:
+
+| Path | `deniedReason` |
+| --- | --- |
+| `approveToolCall` returned `false` (or threw) | **absent** — the hook returns a boolean, so there is no reason to relay. `denied: true` alone separates "refused" from "failed". |
+| `approvalResponses: [{ approved: false, reason }]` | that `reason`, verbatim. |
+| A gated call left without a verdict | `No approval response.` |
+| A client tool that was never answered | `No result provided for this client tool.` |
+| `approvalSigner` rejected the echoed token | `Approval token missing, invalid, expired, or bound to another run.` |
+
+Model-facing behaviour is deliberately **unchanged**: the denied call still gets its `is_error` `tool_result` (`Tool call denied.`, plus ` Reason: …` when there is one), denials still do not count toward the runaway-tool guard, and no `executing` state is ever claimed for a call that never ran.
+
+They stay **optional fields, not a new state**: `UIToolCall.state` is still exactly `'call' | 'result' | 'approval-requested'` and `ToolRunState` still has six members, because consumers switch on both exhaustively. `deniedReason` is redacted on the way out (it can be echoed from the client's own verdict string).
+
+### `sub-agent` parts in `useChat`
+
+`applyUIPart` has a `sub-agent` case, so a delegated `agentTool()` / `agent.asTool()` run is visible in React chat state. Each frame lands in its **own** channel, one per `agentPath`:
+
+```ts
+turn.subAgents?.[0];
+// { agentPath: ['researcher'], afterPart: 3, turn: AssistantTurnState }
+```
+
+`turn` is a full `AssistantTurnState` folded by the same reducer re-entering itself, so a sub-agent's text, reasoning, ordered `parts`, tool cards, citations and activity are as complete as the parent's. `afterPart` is how many of the **parent's** ordered elements existed when the frame opened — normally right after the `tool` card for the delegating call — so a renderer splices the block back in at the handoff point and indents by `agentPath.length`. A 2nd-level sub-agent is a **sibling** frame with a two-segment path, not a nested one, because the wire is single-wrapped.
+
+It is deliberately **not** folded into the parent's `content` / `reasoning` / `toolCalls` buckets or its ordered `parts`: that would attribute a sub-agent's words to the main agent, and it would put the child's `tool_use` into `assistantMessageFromTurn`'s output with no matching `tool_result` — the exact payload that 400s the next request.
+
+Frames are sealed alongside the parent at every terminal boundary (`finish`, `error`, `sealAssistantTurn`), so no caret keeps blinking inside a finished child block. `useChat` exposes them as `subAgents`, committed in the same single React commit as everything else — as are the other two channels the same pass gave producers, `warnings` and `falseFinishes`. See [rendering a sub-agent run](/docs/modules/react-hooks#rendering-a-sub-agent-run).
+
+## Declared but inert
+
+What is left. These are still declared surface with **no producer**, or a producer that does not reach the readout you would naturally read. Do not build on them.
+
+- **`GenerateTextResult.warnings` is `undefined` on every real call.** Warnings *are* produced and logged on the buffered path — the per-step pump raises them exactly as it does for streaming — but nothing puts them on the returned object. `generateText` callers must read `deps.logger.warn`.
+- **`GenerateObjectResult.warnings` and `StreamObjectResult.warnings` are never populated either.** `generateObject` / `streamObject` do not thread a sink at all, so no notice is even collected there. Both fields stay absent — `await result.warnings` on a `streamObject` gives you `undefined`, not an array.
+- **A loop-routed `streamChat` reports only its own warnings.** With `tools`, `chat`, `memory`, `verifyStep` or `doneWhen` the call runs the streaming loop, and the loop's set contains the `activeTools` notices only: a model-level warning (`unknown-model`, `unsupported-setting`, the hosted-tool drop, a dropped document) is raised inside the per-step pump and does not merge into the loop's result or cross the loop boundary as a part. It still reaches `deps.logger.warn`. This is why a dropped **hosted tool** — which needs `tools` — is log-only in practice.
+- **A dropped document reports a typed warning on the Chat Completions wire only.** On the `anthropic` and `responses` wires the drop is still a `deps.logger.warn` line and nothing else. (`native` accepts PDFs, so it never drops one.)
+- **`clamped-setting` has no producer.** That member of `CallWarning['type']` ships unused. The obvious candidate is the unknown-slug `maxOutput: 4096` truncation, but the clamp happens per adapter, not centrally.
+- **`useObject` can never see a warning.** `toDeuzObjectStreamResponse` iterates `partialObjectStream`, and `StreamObjectResult` exposes no canonical part stream, so there is nothing to serialize a `warning` from.
+
+## Two more partial surfaces
+
+Not inert, but not complete either — stated here so you do not discover them at runtime:
+
+- **`consume()` is optional on the type.** `streamChat({ fallbackModels })` and the `withFallback` middleware return `consume: undefined`, where `res.consume?.()` is a silent no-op. Every other path provides it.
+- **`timeout.stepMs` is enforced in the streaming loop only.** The buffered `generateText` loop honours `ttftMs` / `totalMs` / `toolMs` but not `stepMs` yet.
+
+## See also
+
+- [Migrating from the Vercel AI SDK](/docs/migration/from-vercel-ai-sdk) — the mapping, and the same honest gap list.
+- [Changelog](/docs/changelog) — release history.
+- [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts) · [Files](/docs/core/files) · [Request validation](/docs/modules/request-validation) · [createAgent](/docs/agents/create-agent)

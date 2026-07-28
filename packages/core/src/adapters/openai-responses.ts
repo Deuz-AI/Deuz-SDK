@@ -7,7 +7,14 @@ import type { NormalizedMessage } from '../core/normalize';
 import type { DeuzError } from '../errors';
 import { extractSystem } from '../core/normalize';
 import { applyProviderOptions } from '../internal/provider-options';
-import { resolveImage, toOpenAIImageUrl } from '../internal/image';
+import {
+  acceptsDocuments,
+  documentFilename,
+  resolveMedia,
+  toDataUrl,
+  toOpenAIImageUrl,
+  warnDroppedDocument,
+} from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { openaiCompatibleAdapter } from './openai-compatible';
 
@@ -15,7 +22,17 @@ import { openaiCompatibleAdapter } from './openai-compatible';
 
 type InputItem = Record<string, unknown>;
 
-function toResponsesInput(messages: NormalizedMessage[]): InputItem[] {
+/** What the input mapper needs to decide whether a document can ride this wire. */
+interface MediaContext {
+  caps: BuildContext['caps'];
+  provider: string;
+  modelId: string;
+  logger: BuildContext['logger'];
+  /** Per-call warning sink (1.9): a dropped document is reported, not just logged. */
+  warnings: BuildContext['warnings'];
+}
+
+function toResponsesInput(messages: NormalizedMessage[], media: MediaContext): InputItem[] {
   const items: InputItem[] = [];
   for (const m of messages) {
     for (const part of m.content) {
@@ -47,19 +64,52 @@ function toResponsesInput(messages: NormalizedMessage[]): InputItem[] {
       .filter((p): p is Extract<Part, { type: 'text' }> => p.type === 'text')
       .map((p) => p.text)
       .join('');
-    const images = m.content.filter(
+    // `ImagePart` is the carrier for documents too (the Part union is locked
+    // until 2.0) — classify each one instead of assuming an image.
+    const mediaParts = m.content.filter(
       (p): p is Extract<Part, { type: 'image' }> => p.type === 'image',
     );
 
     // `phase` (commentary | final_answer) must be preserved on replayed
     // assistant messages — dropping it degrades gpt-5.3-codex+ performance.
     const phase = (m.providerMetadata?.openai as { phase?: string } | undefined)?.phase;
-    if (images.length > 0) {
+    const mediaBlocks: InputItem[] = [];
+    for (const part of mediaParts) {
+      const resolved = resolveMedia(part);
+      if (resolved.isImage) {
+        mediaBlocks.push({ type: 'input_image', image_url: toOpenAIImageUrl(resolved) });
+        continue;
+      }
+      if (!acceptsDocuments(media.caps)) {
+        warnDroppedDocument(
+          media.logger,
+          {
+            provider: media.provider,
+            modelId: media.modelId,
+            mediaType: resolved.mediaType,
+            reason: 'this model has no document/vision capability in the registry',
+          },
+          media.warnings,
+        );
+        continue;
+      }
+      // Responses takes a document as `input_file`: either a hosted `file_url`
+      // or an inline `file_data` data: URL + filename.
+      mediaBlocks.push(
+        resolved.kind === 'url'
+          ? { type: 'input_file', file_url: resolved.data }
+          : {
+              type: 'input_file',
+              filename: documentFilename(resolved.mediaType),
+              file_data: toDataUrl(resolved),
+            },
+      );
+    }
+
+    if (mediaBlocks.length > 0) {
       const content: InputItem[] = [];
       if (text) content.push({ type: 'input_text', text });
-      for (const img of images) {
-        content.push({ type: 'input_image', image_url: toOpenAIImageUrl(resolveImage(img)) });
-      }
+      content.push(...mediaBlocks);
       items.push({
         role: m.role === 'tool' ? 'user' : m.role,
         content,
@@ -93,7 +143,13 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
 
   const body: Record<string, unknown> = {
     model: call.modelId,
-    input: toResponsesInput(rest),
+    input: toResponsesInput(rest, {
+      caps,
+      provider: call.provider,
+      modelId: call.modelId,
+      logger: ctx.logger,
+      warnings: ctx.warnings,
+    }),
     stream: true,
     max_output_tokens: options.maxOutputTokens ?? caps.maxOutput,
   };

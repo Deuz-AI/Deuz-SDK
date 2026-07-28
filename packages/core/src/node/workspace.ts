@@ -15,6 +15,7 @@ interface NodeFs {
   writeFile(path: string, data: Uint8Array | string): Promise<void>;
   readFile(path: string): Promise<Uint8Array>;
   unlink(path: string): Promise<void>;
+  realpath(path: string): Promise<string>;
   stat(path: string): Promise<{ isDirectory(): boolean; size: number; mtimeMs: number }>;
   readdir(
     path: string,
@@ -26,6 +27,7 @@ interface NodePath {
   dirname(p: string): string;
   resolve(...parts: string[]): string;
   relative(from: string, to: string): string;
+  isAbsolute(p: string): boolean;
   sep: string;
 }
 
@@ -53,15 +55,64 @@ export interface FileWorkspaceOptions {
  * `write` creates parent directories; `delete` of a missing path is a no-op.
  */
 export function createFileWorkspace(options: FileWorkspaceOptions): Workspace {
-  // Resolve a normalized relative path to an absolute path under the root, and
-  // assert it cannot escape (defense in depth on top of normalizeWorkspacePath).
-  const resolveInside = (path: NodePath, root: string, rel: string): string => {
+  // Layer 2: lexical containment, defense in depth over normalizeWorkspacePath.
+  //
+  // `path.isAbsolute(relToRoot)` is load-bearing and not redundant: when the two
+  // sides live on DIFFERENT DEVICES (a Windows drive letter, a UNC share)
+  // `path.relative` returns an absolute path rather than a '..'-prefixed one, so
+  // the '..' test alone accepted `D:/x` from a root on `C:`. The primary fix is
+  // in normalizeWorkspacePath (every backend shares it); this keeps the file
+  // backend self-sufficient.
+  const lexicalInside = (path: NodePath, root: string, rel: string): string => {
     const abs = path.resolve(root, normalizeWorkspacePath(rel));
     const relToRoot = path.relative(root, abs);
-    if (relToRoot.startsWith('..') || path.resolve(root, relToRoot) !== abs) {
+    if (
+      relToRoot.startsWith('..') ||
+      path.isAbsolute(relToRoot) ||
+      path.resolve(root, relToRoot) !== abs
+    ) {
       throw new Error(`Workspace path '${rel}' escapes the sandbox root.`);
     }
     return abs;
+  };
+
+  // Layer 3: the real path. Layers 1-2 are pure string math and CANNOT see a
+  // symlink or an NTFS junction, so `<root>/link -> /outside` passed every check
+  // and reads/writes landed outside the sandbox. Only the filesystem can resolve
+  // a link, so re-verify the deepest EXISTING ancestor of the target: anything
+  // below it does not exist yet and therefore cannot be a link. The walk stops
+  // at `root` — above it there is nothing left to escape from.
+  const realpathOr = async (fs: NodeFs, p: string): Promise<string | undefined> => {
+    try {
+      return await fs.realpath(p);
+    } catch {
+      return undefined; // does not exist yet (a fresh write) — nothing to follow
+    }
+  };
+
+  const resolveInside = async (
+    fs: NodeFs,
+    path: NodePath,
+    root: string,
+    rel: string,
+  ): Promise<string> => {
+    const abs = lexicalInside(path, root, rel);
+    const realRoot = (await realpathOr(fs, root)) ?? path.resolve(root);
+    let probe = abs;
+    for (;;) {
+      const real = await realpathOr(fs, probe);
+      if (real !== undefined) {
+        const relReal = path.relative(realRoot, real);
+        if (relReal !== '' && (relReal.startsWith('..') || path.isAbsolute(relReal))) {
+          throw new Error(`Workspace path '${rel}' escapes the sandbox root (via a link).`);
+        }
+        return abs;
+      }
+      if (probe === root || path.resolve(probe) === realRoot) return abs;
+      const parent = path.dirname(probe);
+      if (parent === probe) return abs; // filesystem root; nothing exists below it
+      probe = parent;
+    }
   };
 
   const walk = async (
@@ -96,29 +147,29 @@ export function createFileWorkspace(options: FileWorkspaceOptions): Workspace {
   return {
     async read(rel: string): Promise<string> {
       const { fs, path } = await load();
-      const bytes = await fs.readFile(resolveInside(path, options.root, rel));
+      const bytes = await fs.readFile(await resolveInside(fs, path, options.root, rel));
       return new TextDecoder().decode(bytes);
     },
     async readBytes(rel: string): Promise<Uint8Array> {
       const { fs, path } = await load();
-      return fs.readFile(resolveInside(path, options.root, rel));
+      return fs.readFile(await resolveInside(fs, path, options.root, rel));
     },
     async write(rel: string, content: string): Promise<void> {
       const { fs, path } = await load();
-      const abs = resolveInside(path, options.root, rel);
+      const abs = await resolveInside(fs, path, options.root, rel);
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.writeFile(abs, new TextEncoder().encode(content));
     },
     async writeBytes(rel: string, content: Uint8Array): Promise<void> {
       const { fs, path } = await load();
-      const abs = resolveInside(path, options.root, rel);
+      const abs = await resolveInside(fs, path, options.root, rel);
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.writeFile(abs, content);
     },
     async exists(rel: string): Promise<boolean> {
       const { fs, path } = await load();
       try {
-        await fs.stat(resolveInside(path, options.root, rel));
+        await fs.stat(await resolveInside(fs, path, options.root, rel));
         return true;
       } catch {
         return false;
@@ -137,7 +188,7 @@ export function createFileWorkspace(options: FileWorkspaceOptions): Workspace {
     async delete(rel: string): Promise<void> {
       const { fs, path } = await load();
       try {
-        await fs.unlink(resolveInside(path, options.root, rel));
+        await fs.unlink(await resolveInside(fs, path, options.root, rel));
       } catch {
         /* already gone */
       }

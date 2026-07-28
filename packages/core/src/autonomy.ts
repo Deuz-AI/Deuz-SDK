@@ -5,8 +5,9 @@
  * you already have.
  *
  * - Planner: `planTasks` + the pure `TaskList` reducers (re-exported from `./plan`).
- * - Verified generation: `bestOfN`, `selfConsistency` (the `verifyStep` loop
- *   hook lives on `CommonCallOptions`; its types are re-exported here).
+ * - Verified generation: `bestOfN`, `selfConsistency`, and `createVerifier`
+ *   (re-exported from `./verify`) — the default implementation of the
+ *   `verifyStep` loop hook, whose types are re-exported here too.
  * - Parallel fan-out: `parallelAgents` runs N independent agents concurrently.
  *
  * Edge-safe (pure Web APIs).
@@ -15,12 +16,14 @@ import type { LanguageModel } from './types/model';
 import type { Dependencies, UsageMeta } from './types/deps';
 import type { Usage, FinishReason } from './types/usage';
 import type { ToolSet } from './types/tool';
+import type { Verifier } from './verify';
 import { generateText } from './inference/generate-text';
 import { mapWithConcurrency } from './internal/p-limit';
 import { EMPTY_USAGE, withTotal } from './core/metering';
 import { sumUsage } from './inference/loop-shared';
 
 export * from './plan';
+export * from './verify';
 export type { VerifyStep, VerifyStepContext, VerifyStepResult } from './types/config';
 
 // ===================================================================
@@ -47,26 +50,65 @@ export interface BestOfNOptions<T> {
   n: number;
   /** Produce one candidate (called with its 0-based index). */
   generate: (index: number) => Promise<T> | T;
-  /** Score a candidate — HIGHER is better. */
-  score: (candidate: T, index: number) => number | Promise<number>;
+  /**
+   * Score a candidate — HIGHER is better. Omit it to score with `verifier` +
+   * `goal` instead; supplying both keeps `score` (it is the more specific seam).
+   */
+  score?: (candidate: T, index: number) => number | Promise<number>;
+  /**
+   * N1 wiring: use a {@link Verifier} as the selector (needs `goal`). Its
+   * `score()` is the share of sub-checks the candidate passed, so ranking runs
+   * on a DENSE signal instead of a yes/no — the reason `createVerifier` derives
+   * `confidence` from its checks at all. Duck-typed, so any `{ score }` object
+   * works. One verifier model call PER CANDIDATE: budget `n` of them.
+   */
+  verifier?: Pick<Verifier, 'score'>;
+  /** What the candidates are judged against. Required by `verifier`. */
+  goal?: string;
   /** Max concurrent generations. Default `n`. */
   concurrency?: number;
+}
+
+/** Non-string candidates are JSON-rendered for the verifier's text-in contract. */
+function candidateText(candidate: unknown): string {
+  if (typeof candidate === 'string') return candidate;
+  try {
+    return JSON.stringify(candidate) ?? String(candidate);
+  } catch {
+    return String(candidate);
+  }
+}
+
+/** `score` wins; else `verifier` + `goal`; else this is a caller error. */
+function resolveScorer<T>(
+  options: BestOfNOptions<T>,
+): (candidate: T, index: number) => number | Promise<number> {
+  if (options.score) return options.score;
+  const verifier = options.verifier;
+  const goal = options.goal;
+  if (verifier && goal !== undefined) {
+    return (candidate) => verifier.score(candidateText(candidate), goal);
+  }
+  throw new Error('bestOfN requires either `score` or `verifier` + `goal`.');
 }
 
 /**
  * Generate `n` candidates in parallel (capped), score each, and return the best
  * (first-highest on a tie — deterministic). A verifier-scored best-of-N: the
- * quality lever SDKs rarely ship as a primitive.
+ * quality lever SDKs rarely ship as a primitive. Score with your own `score`
+ * function or hand it a `verifier` + `goal`.
  */
 export async function bestOfN<T>(options: BestOfNOptions<T>): Promise<BestOfNResult<T>> {
+  // Resolved BEFORE generating: a missing scorer is a caller error, and there is
+  // no reason to pay for `n` generations only to find that out afterwards.
+  const score = resolveScorer(options);
   const indices = Array.from({ length: Math.max(0, options.n) }, (_, i) => i);
   const candidates = await mapWithConcurrency(
     indices,
     options.concurrency ?? options.n,
     async (i): Promise<Candidate<T>> => {
       const value = await options.generate(i);
-      const score = await options.score(value, i);
-      return { value, score, index: i };
+      return { value, score: await score(value, i), index: i };
     },
   );
   if (candidates.length === 0) {

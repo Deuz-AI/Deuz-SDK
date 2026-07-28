@@ -7,7 +7,11 @@ const dispatch = (options: StreamChatOptions): StreamChatResult =>
   (options.tools && Object.keys(options.tools).length > 0) ||
   options.chat ||
   options.memory ||
-  options.verifyStep
+  options.verifyStep ||
+  // `doneWhen` (1.9, N2) fires at the natural-completion boundary, which only
+  // the loop has — routing a tool-less call here is what keeps the option from
+  // being silently ignored.
+  options.doneWhen
     ? runStreamToolLoop(options)
     : runStream(options);
 

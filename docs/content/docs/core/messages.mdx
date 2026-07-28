@@ -49,7 +49,7 @@ System handling is automatic: adapters that need a top-level system field (Anthr
 | `tool_use` | `id`, `name`, `input: unknown`, `providerMetadata?` | out (replay back in) |
 | `tool_result` | `toolUseId: string`, `result: unknown`, `isError?` | in |
 
-There is no separate `file` part — non-image binary input (PDF, audio, video) rides on the `image` part via its `mediaType`. See [PDFs and other files](#pdfs-and-other-files).
+There is no separate `file` part — non-image binary input (PDF, audio, video) rides on the `image` part via its `mediaType`. Since 1.9 there are constructors for it, so you never have to know that: [`filePart()` / `imagePart()`](/docs/core/files). See also [PDFs and other files](#pdfs-and-other-files).
 
 ```ts
 import type {
@@ -122,7 +122,15 @@ Older text-only models (e.g. some GPT/Grok base chat models) have `vision: false
 
 ## PDFs and other files
 
-Native PDF understanding is a Gemini-native feature (`nativePdf: true` for `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-pro`, `gemini-3.5-flash`). Deliver a PDF as an `image` part with `mediaType: 'application/pdf'` — the native adapter maps it to an `inlineData` (or `fileData`) document block:
+Deliver a document as an `image` part with a non-`image/*` `mediaType` — or, more discoverably, build it with [`filePart({ data, mediaType })`](/docs/core/files).
+
+<Callout title="Documents work on all four wires since 1.9">
+Before 1.9 a non-image media part was sent as an *image* block, which 400d on three of the four wires — so this section was Gemini-native advice. Each adapter now maps it to that wire's document block: Anthropic `document`, OpenAI Responses `input_file`, Chat Completions `file`, Gemini `inlineData` / `fileData`.
+
+Documents are gated on the model's capability row (`nativePdf || vision`); a model that fails the gate has the part **dropped** with a `deps.logger.warn` naming the model and media type. Chat Completions also drops an `https:`-URL document — that wire has no URL form on its `file` block. See [Files, PDFs & images](/docs/core/files).
+</Callout>
+
+Gemini native is still the richest path (`nativePdf: true` for `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-pro`, `gemini-3.5-flash`):
 
 ```ts title="pdf-gemini.ts"
 import { generateText } from '@deuz-sdk/core';

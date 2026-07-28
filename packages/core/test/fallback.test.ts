@@ -1,7 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { streamChat, wrapModel, withFallback, BreakerOpenError } from '../src/index';
+import { streamChat, wrapModel, withFallback, BreakerOpenError, TimeoutError } from '../src/index';
+import { defaultShouldFallback } from '../src/internal/fallback';
 import { createAnthropic } from '../src/anthropic';
 import { createOpenAI } from '../src/openai';
+import { createInMemoryChatStore } from '../src/chat';
+import { createInMemorySessionStore } from '../src/durable';
 import { BREAKER_THRESHOLD, BREAKER_COOLDOWN_MS } from '../src/core/resilience';
 import type { StreamPart } from '../src/types/stream';
 import type { BreakerState } from '../src/types/deps';
@@ -186,6 +189,199 @@ describe('fallbackModels — cross-provider fail-over (D6)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// 1.9: the fail-over shell (`src/internal/fallback.ts`) built its own PARTIAL
+// StreamChatResult, so `consume()`, `warnings` and `observation` were missing on
+// exactly the paths they exist for — `res.consume?.()` was a silent no-op and a
+// serverless handler that returned the response without iterating never reached
+// its terminal boundary (no chat persistence, no checkpoint, no onFinish).
+// ---------------------------------------------------------------------------
+
+describe('fail-over result shape (1.9): consume / warnings / observation', () => {
+  it('consume() runs the terminal effects after a hop with NOTHING iterating', async () => {
+    const chats = createInMemoryChatStore();
+    const sessions = createInMemorySessionStore();
+    const onFinish = vi.fn();
+    const a = mockFetch(overloaded);
+    const b = mockFetch(() => sseResponse([OPENAI_OK]));
+
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'ka', fetch: a.fetch })('claude-opus-4-8'),
+      fallbackModels: [createOpenAI({ apiKey: 'kb', fetch: b.fetch })('gpt-5.2')],
+      messages: [{ role: 'user', content: 'hop and still persist' }],
+      // `chat` + `session` route the call through the agentic loop, whose
+      // terminal effects run AFTER the stream closes — the exact bookkeeping a
+      // drain has to await.
+      chat: { store: chats, chatId: 'fo-1', scope: { userId: 'u1' } },
+      session: { store: sessions },
+      onFinish,
+      maxRetries: 0,
+    });
+
+    // Durable identity is known synchronously even on the fail-over path (G2).
+    expect(result.runId).toBeDefined();
+    expect(typeof result.consume).toBe('function');
+    expect(onFinish).not.toHaveBeenCalled(); // lazy: nothing accessed yet
+
+    await expect(result.consume?.()).resolves.toBeUndefined();
+
+    expect(a.calls).toHaveLength(1);
+    expect(b.calls).toHaveLength(1);
+    // The WINNER's terminal effects ran, without a single iteration.
+    const record = await chats.loadChat('fo-1');
+    expect(JSON.stringify(record?.messages)).toContain('Answer from provider B.');
+    const checkpoint = await sessions.load(result.runId!);
+    expect(checkpoint?.status).toBe('completed');
+    expect(onFinish).toHaveBeenCalledTimes(1);
+    expect(await result.finishReason).toBe('stop');
+  });
+
+  it('consume() twice is safe — the terminal effects fire once', async () => {
+    const chats = createInMemoryChatStore();
+    const saveChat = vi.fn(chats.saveChat);
+    const onFinish = vi.fn();
+    const a = mockFetch(overloaded);
+    const b = mockFetch(() => sseResponse([OPENAI_OK]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'ka', fetch: a.fetch })('claude-opus-4-8'),
+      fallbackModels: [createOpenAI({ apiKey: 'kb', fetch: b.fetch })('gpt-5.2')],
+      messages: [{ role: 'user', content: 'go' }],
+      chat: { store: { ...chats, saveChat }, chatId: 'fo-2', scope: { userId: 'u1' } },
+      onFinish,
+      maxRetries: 0,
+    });
+
+    await Promise.all([result.consume?.(), result.consume?.()]);
+    await result.consume?.(); // and again, sequentially
+
+    expect(b.calls).toHaveLength(1);
+    expect(onFinish).toHaveBeenCalledTimes(1);
+    // The failed attempt persists its own (user-only) history on the way out, so
+    // the drain being memoized is asserted on the callback + request counts.
+    expect(saveChat.mock.calls.length).toBeLessThanOrEqual(2);
+  });
+
+  it('consume() and a fullStream iteration BOTH see every part', async () => {
+    const a = mockFetch(overloaded);
+    const b = mockFetch(() => sseResponse([OPENAI_OK]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'ka', fetch: a.fetch })('claude-opus-4-8'),
+      fallbackModels: [createOpenAI({ apiKey: 'kb', fetch: b.fetch })('gpt-5.2')],
+      messages: [{ role: 'user', content: 'go' }],
+      maxRetries: 0,
+    });
+    const drained = result.consume?.();
+    const parts: StreamPart[] = [];
+    for await (const part of result.fullStream) parts.push(part);
+    await expect(drained).resolves.toBeUndefined();
+    const text = parts
+      .filter((p): p is Extract<StreamPart, { type: 'text-delta' }> => p.type === 'text-delta')
+      .map((p) => p.text)
+      .join('');
+    expect(text).toBe('Answer from provider B.');
+  });
+
+  it('never rejects when EVERY candidate fails — the error reaches onError', async () => {
+    const a = mockFetch(overloaded);
+    const b = mockFetch(overloaded);
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'ka', fetch: a.fetch })('claude-opus-4-8'),
+      fallbackModels: [createAnthropic({ apiKey: 'kb', fetch: b.fetch })('claude-sonnet-5')],
+      messages: [{ role: 'user', content: 'go' }],
+      maxRetries: 0,
+    });
+    const onError = vi.fn();
+    await expect(result.consume?.({ onError })).resolves.toBeUndefined();
+    expect(onError).toHaveBeenCalledTimes(1);
+    await expect(result.usage).rejects.toBeDefined();
+  });
+
+  it('forwards warnings (always) and observation (only when an observer is active)', async () => {
+    const a = mockFetch(overloaded);
+    const b = mockFetch(() => sseResponse([OPENAI_OK]));
+    const bare = streamChat({
+      model: createAnthropic({ apiKey: 'ka', fetch: a.fetch })('claude-opus-4-8'),
+      fallbackModels: [createOpenAI({ apiKey: 'kb', fetch: b.fetch })('gpt-5.2')],
+      messages: [{ role: 'user', content: 'go' }],
+      maxRetries: 0,
+    });
+    expect(bare.observation).toBeUndefined(); // no observer, no tracer
+    await bare.consume?.();
+    // The winning candidate is the UNKNOWN slug `gpt-5.2`, so the fail-over shell
+    // forwards a real warning now that emitters exist (1.9). Before, this was []
+    // only because nothing ever produced one.
+    expect((await bare.warnings)?.map((w) => w.type)).toEqual(['unknown-model']);
+
+    const events: string[] = [];
+    const a2 = mockFetch(overloaded);
+    const b2 = mockFetch(() => sseResponse([OPENAI_OK]));
+    const observed = streamChat({
+      model: createAnthropic({ apiKey: 'ka', fetch: a2.fetch })('claude-opus-4-8'),
+      fallbackModels: [createOpenAI({ apiKey: 'kb', fetch: b2.fetch })('gpt-5.2')],
+      messages: [{ role: 'user', content: 'go' }],
+      maxRetries: 0,
+      deps: { observer: { emit: (event) => void events.push(event.type) } },
+    });
+    expect(observed.observation).toBeDefined();
+    await observed.consume?.();
+    await expect(observed.observation!.settled).resolves.toBeUndefined();
+    // Both attempts' runs are covered by the shell's settlement.
+    expect(events.filter((e) => e === 'run.started')).toHaveLength(2);
+  });
+
+  it('settles observation for a LOOP-routed fail-over (the handle appears MID-pump)', async () => {
+    // The streaming loop assigns its observation handle INSIDE the pump (after the
+    // chat-store await), so a shell that reads `attempt.observation` at
+    // construction still sees `undefined` and would resolve its own `settled` too
+    // early. The async priceProvider below emits `cost.calculated` a macrotask
+    // AFTER the loop's pump finishes, which is what makes this a real pin.
+    const events: string[] = [];
+    const a = mockFetch(overloaded);
+    const b = mockFetch(() => sseResponse([ANTHROPIC_OK]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'ka', fetch: a.fetch })('claude-opus-4-8'),
+      fallbackModels: [createAnthropic({ apiKey: 'kb', fetch: b.fetch })('claude-sonnet-5')],
+      messages: [{ role: 'user', content: 'go' }],
+      chat: { store: createInMemoryChatStore(), chatId: 'fo-4', scope: { userId: 'u1' } },
+      maxRetries: 0,
+      deps: {
+        observer: { emit: (event) => void events.push(event.type) },
+        priceProvider: {
+          priceUsage: () => new Promise<number>((r) => setTimeout(() => r(0.42), 5)),
+        },
+      },
+    });
+    await result.consume?.();
+    await expect(result.observation!.settled).resolves.toBeUndefined();
+    expect(events.filter((e) => e === 'run.started')).toHaveLength(2);
+    expect(events).toContain('run.completed');
+    expect(events).toContain('run.failed');
+    // Only reachable if the WINNER's own settlement was awaited by the shell.
+    expect(events).toContain('cost.calculated');
+  });
+
+  it('the withFallback middleware forwards consume() too', async () => {
+    const chats = createInMemoryChatStore();
+    const onFinish = vi.fn();
+    const a = mockFetch(overloaded);
+    const b = mockFetch(() => sseResponse([ANTHROPIC_OK]));
+    const m = wrapModel(createAnthropic({ apiKey: 'ka', fetch: a.fetch })('claude-opus-4-8'), [
+      withFallback([createAnthropic({ apiKey: 'kb', fetch: b.fetch })('claude-sonnet-5')]),
+    ]);
+    const result = m.streamChat({
+      messages: [{ role: 'user', content: 'go' }],
+      chat: { store: chats, chatId: 'fo-3', scope: { userId: 'u1' } },
+      onFinish,
+      maxRetries: 0,
+    });
+    await expect(result.consume?.()).resolves.toBeUndefined();
+    expect(onFinish).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify((await chats.loadChat('fo-3'))?.messages)).toContain(
+      'Answer from provider B.',
+    );
+  });
+});
+
 describe('circuit breaker wiring (D6)', () => {
   it('opens after the threshold of countable failures, fails fast, and resets on success', async () => {
     const { store, states } = makeMemoryBreakerStore();
@@ -264,5 +460,18 @@ describe('circuit breaker wiring (D6)', () => {
     expect(finish.providerMetadata?.deuz).toMatchObject({
       failedOver: { reason: 'breaker_open' },
     });
+  });
+});
+
+describe('defaultShouldFallback — timeout layers (1.9)', () => {
+  it('hops on a transport timeout but NOT on a caller-imposed step/tool budget', () => {
+    // A step/tool deadline is the caller's budget, not a provider failure: another
+    // model cannot make it fit, and re-running the loop would repeat the side
+    // effects of tools that already executed in this step.
+    expect(defaultShouldFallback(new TimeoutError('connect', 'x'))).toBe(true);
+    expect(defaultShouldFallback(new TimeoutError('ttft', 'x'))).toBe(true);
+    expect(defaultShouldFallback(new TimeoutError('total', 'x'))).toBe(true);
+    expect(defaultShouldFallback(new TimeoutError('step', 'x'))).toBe(false);
+    expect(defaultShouldFallback(new TimeoutError('tool', 'x'))).toBe(false);
   });
 });

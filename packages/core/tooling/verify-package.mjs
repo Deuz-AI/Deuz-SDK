@@ -105,6 +105,10 @@ if (packed.status !== 0) {
       (file) =>
         file.startsWith('src/') ||
         file.startsWith('test/') ||
+        // The runnable apps live in the repo-root `examples/` workspace tree and
+        // must never ride along in a published tarball (they carry devDeps,
+        // Next.js config, and local .runs/.agent-workspace scratch dirs).
+        file.startsWith('examples/') ||
         file.startsWith('.env') ||
         file.startsWith('.smoke') ||
         file.endsWith('.tsbuildinfo'),

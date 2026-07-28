@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/05-durable-resume",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Checkpoint an agentic run to disk, kill the process, and continue it.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

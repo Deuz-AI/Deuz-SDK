@@ -3,6 +3,7 @@
   "icon": "BookOpenCheck",
   "defaultOpen": true,
   "pages": [
+    "whats-new-1-9",
     "compatibility",
     "stream-protocol",
     "provider-conformance",

@@ -1,6 +1,6 @@
 {
   "name": "@deuz-sdk/core",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini, Azure, Bedrock, …).",
   "license": "MIT",
   "author": "Umutcan Edizaslan (U-C4N)",
@@ -176,6 +176,16 @@
         "default": "./dist/compute/node.cjs"
       }
     },
+    "./agent": {
+      "import": {
+        "types": "./dist/agent.d.ts",
+        "default": "./dist/agent.js"
+      },
+      "require": {
+        "types": "./dist/agent.d.cts",
+        "default": "./dist/agent.cjs"
+      }
+    },
     "./autonomy": {
       "import": {
         "types": "./dist/autonomy.d.ts",
@@ -346,6 +356,16 @@
         "default": "./dist/vertex.cjs"
       }
     },
+    "./vertex/node": {
+      "import": {
+        "types": "./dist/vertex/node.d.ts",
+        "default": "./dist/vertex/node.js"
+      },
+      "require": {
+        "types": "./dist/vertex/node.d.cts",
+        "default": "./dist/vertex/node.cjs"
+      }
+    },
     "./mcp": {
       "import": {
         "types": "./dist/mcp/index.d.ts",
@@ -374,6 +394,16 @@
       "require": {
         "types": "./dist/durable.d.cts",
         "default": "./dist/durable.cjs"
+      }
+    },
+    "./otel": {
+      "import": {
+        "types": "./dist/otel.d.ts",
+        "default": "./dist/otel.js"
+      },
+      "require": {
+        "types": "./dist/otel.d.cts",
+        "default": "./dist/otel.cjs"
       }
     },
     "./observe": {
@@ -483,6 +513,7 @@
     "tool-calling"
   ],
   "peerDependencies": {
+    "@opentelemetry/api": "^1.9.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@standard-community/standard-json": "^0.2.0",
     "mammoth": "^1.8.0",
@@ -493,6 +524,9 @@
     "zod": "^3.23.0 || ^4.0.0"
   },
   "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    },
     "zod": {
       "optional": true
     },

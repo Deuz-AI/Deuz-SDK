@@ -1,17 +1,101 @@
 {
   "schemaVersion": 1,
+  "note": [
+    "Budgets are a RATCHET against ACCIDENTAL bloat, not a hard product limit. Raise them",
+    "deliberately when a release adds real user-facing surface; never raise them to make a red",
+    "gate go away. check-bundle-size.mjs reads only `bundles[*].from/exports/maxRawBytes/",
+    "maxGzipBytes`, so this `note` key is inert (JSON carries no comments).",
+    "",
+    "RAISED FOR 1.9.0 SPRINT 2 (ergonomics + parity). Measured, minified, tree-shaken:",
+    "  core  126275 B raw / 39362 B gzip   (was: limits 120000 / 37000; Sprint 1 measured 36880 gzip)",
+    "  edge  114981 B raw / 36049 B gzip   (was: limits 110000 / 34000; Sprint 1 measured 33722 gzip)",
+    "Overshoot vs the old limits: core +5.2% raw / +6.4% gzip, edge +4.5% raw / +6.0% gzip —",
+    "proportionate to the features, with no single module dominating.",
+    "",
+    "What grew (all of it reachable from the measured entry points, which pull only",
+    "streamChat/generateText/generateObject/createClient — `tool()`, `filePart()` and",
+    "`getModelCapabilities` are tree-shaken OUT of these numbers, so the growth is orchestration):",
+    "  - timeout layers: resolveTimeouts + createStepTimeout + withAbortReason (core/timeout.ts),",
+    "    threaded through core/inference.ts and inference/stream-tool-loop.ts",
+    "  - StreamChatResult.consume() / StreamObjectResult.consume() drain paths (3 sites)",
+    "  - prompt/instructions canonicalization + the G2 failed-result shells (generate.ts,",
+    "    core/normalize.ts) and the input-shape XOR guard",
+    "  - per-call capability overrides: the finalize/apply merge site (core/registry.ts) and the",
+    "    per-call descriptor clone (internal/config-symbol.ts)",
+    "  - per-tool timeouts in inference/loop-shared.ts",
+    "  - document (PDF) input mapping across all four wires (internal/image.ts + 4 adapters)",
+    "  - Sprint 1 parity work also lands in this build (readDeuzStream HTTP-error part, the",
+    "    verify wire part, unknown-tool self-healing, the object-shared loop-option guard)",
+    "",
+    "New limits carry ~10% forward headroom so the ratchet still trips on unintended growth:",
+    "  core  139000 raw (+10.1%) / 43300 gzip (+10.0%)",
+    "  edge  127000 raw (+10.5%) / 39700 gzip (+10.1%)",
+    "openai-provider is untouched (596 B raw / 303 B gzip against 1000 / 600) — the provider",
+    "factories must stay near-zero, and that budget is the assertion that they do.",
+    "",
+    "ADDED FOR 1.9.0 SPRINT 3 (UI layer): the `chat` and `ui` bundles. Sprint 3 landed ~10 KB raw",
+    "of new reachable code (ordered UIMessagePart projection, canonicalFromUI, ChatInput +",
+    "filesToImageParts, validateChatRequest, writeData id/transient) and the gate measured ZERO",
+    "growth — because every one of those lives on the ./chat and ./ui subpaths, which the core and",
+    "edge entries do not reach, so all of it tree-shook away. The whole release could have doubled",
+    "these two surfaces without tripping anything. Measured now, same pipeline:",
+    "  chat  15364 B raw / 5009 B gzip   ->  limits 17000 / 5500  (+10.6% / +9.8% headroom)",
+    "  ui     9593 B raw / 3949 B gzip   ->  limits 10600 / 4350  (+10.5% / +10.2% headroom)",
+    "(These are the numbers check-bundle-size.mjs reports for the export sets below; an earlier",
+    "hand measurement over a wider export list read ~25% higher, which would have left the",
+    "ratchet ~37% of slack — enough to hide a real regression. Always take the pipeline's number.)",
+    "",
+    "ADDED FOR 1.9.0 SPRINT 4: the `otel` and `observe` bundles. `./otel` is a new subpath, and",
+    "`./observe` just gained renderRunReport — ~18.6 KB raw / 6.9 KB gzip of INLINE HTML/CSS/JS",
+    "template that minifies badly (template strings do not compress like code). Neither surface was",
+    "measured before, and Sprint 3 already showed what that costs: it shipped ~10 KB with ZERO ratchet",
+    "coverage. Both measured through this same pipeline:",
+    "  otel     18907 B raw / 5839 B gzip  ->  limits 21000 / 6500   (+11.1% / +11.3% headroom)",
+    "  observe  25269 B raw / 9433 B gzip  ->  limits 27800 / 10400  (+10.0% / +10.2% headroom)",
+    "core and edge are UNAFFECTED (+0 B): renderRunReport is not re-exported from src/edge.ts, and the",
+    "otel re-export that IS there tree-shakes out of the measured export set — verified byte-identical."
+  ],
   "bundles": {
     "core": {
       "from": "@deuz-sdk/core",
       "exports": ["streamChat", "generateText", "generateObject", "createClient"],
-      "maxRawBytes": 120000,
-      "maxGzipBytes": 37000
+      "maxRawBytes": 139000,
+      "maxGzipBytes": 43300
     },
     "edge": {
       "from": "@deuz-sdk/core/edge",
       "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
-      "maxRawBytes": 110000,
-      "maxGzipBytes": 34000
+      "maxRawBytes": 127000,
+      "maxGzipBytes": 39700
+    },
+    "chat": {
+      "from": "@deuz-sdk/core/chat",
+      "exports": ["applyUIPart", "uiFromMessages", "canonicalFromUI", "validateChatRequest"],
+      "maxRawBytes": 17000,
+      "maxGzipBytes": 5500
+    },
+    "ui": {
+      "from": "@deuz-sdk/core/ui",
+      "exports": [
+        "toDeuzStreamResponse",
+        "readDeuzStream",
+        "createDeuzStream",
+        "connectDeuzStream"
+      ],
+      "maxRawBytes": 10600,
+      "maxGzipBytes": 4350
+    },
+    "otel": {
+      "from": "@deuz-sdk/core/otel",
+      "exports": ["createOtelTracer", "createOtelObserver"],
+      "maxRawBytes": 21000,
+      "maxGzipBytes": 6500
+    },
+    "observe": {
+      "from": "@deuz-sdk/core/observe",
+      "exports": ["summarizeRun", "renderRunReport", "createMemoryObserver", "composeObservers"],
+      "maxRawBytes": 27800,
+      "maxGzipBytes": 10400
     },
     "openai-provider": {
       "from": "@deuz-sdk/core/openai",

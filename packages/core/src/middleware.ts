@@ -25,10 +25,20 @@ import type {
   GenerateTextResult,
   StreamChatOptions,
   GenerateTextOptions,
+  CallWarning,
 } from './types/methods';
+import type { StreamPart } from './types/stream';
 import type { Logger } from './types/deps';
-import { streamChat as baseStreamChat, generateText as baseGenerateText } from './generate';
+import type { MemoryMutation } from './memory';
 import {
+  streamChat as baseStreamChat,
+  generateText as baseGenerateText,
+  foldCallInput,
+  type PromptShorthand,
+} from './generate';
+import { resolveDependencies } from './internal/resolve-deps';
+import {
+  observationActive,
   runGenerateWithFallback,
   runStreamWithFallback,
   type FallbackHooks,
@@ -75,11 +85,25 @@ export interface LanguageModelMiddleware {
   ) => StreamChatResult;
 }
 
-/** The thin client `wrapModel` returns — same shape as the free functions, model pre-bound. */
+/** Options a `WrappedModel` method takes: the free-function shape minus the pre-bound model. */
+type WrappedOptions<O> = Omit<O, 'model'>;
+
+/**
+ * The thin client `wrapModel` returns — same shape as the free functions, model
+ * pre-bound. Each method carries the SAME `prompt`/`messages` XOR overload pair as
+ * its free-function twin (1.9): `wrapModel(m).generateText({ prompt: 'hi' })` used
+ * to work at runtime (it forwards into `src/generate.ts`) but not typecheck, which
+ * made Sprint 2's headline ergonomic win invisible on one of the two surfaces app
+ * code reaches for. See {@link PromptShorthand}.
+ */
 export interface WrappedModel {
   readonly model: LanguageModel;
-  streamChat(options: Omit<StreamChatOptions, 'model'>): StreamChatResult;
-  generateText(options: Omit<GenerateTextOptions, 'model'>): Promise<GenerateTextResult>;
+  streamChat(options: WrappedOptions<StreamChatOptions>): StreamChatResult;
+  streamChat(options: PromptShorthand<WrappedOptions<StreamChatOptions>>): StreamChatResult;
+  generateText(options: WrappedOptions<GenerateTextOptions>): Promise<GenerateTextResult>;
+  generateText(
+    options: PromptShorthand<WrappedOptions<GenerateTextOptions>>,
+  ): Promise<GenerateTextResult>;
 }
 
 /**
@@ -104,7 +128,11 @@ export function wrapModel(
 
   return {
     model,
-    streamChat(options) {
+    streamChat(
+      options:
+        | WrappedOptions<StreamChatOptions>
+        | PromptShorthand<WrappedOptions<StreamChatOptions>>,
+    ): StreamChatResult {
       const ctx: MiddlewareContext = { operation: 'stream', model };
       // Build the innermost call: transforms run, then the base streamChat.
       // transformParams is async but streamChat is sync-returning, so we defer
@@ -120,15 +148,51 @@ export function wrapModel(
         chain = (opts) => m.wrapStream!(inner, opts, ctx);
       }
 
+      // Durable identity must be known SYNCHRONOUSLY (`result.runId`) even
+      // though the transforms are async, so stabilize it here before the chain —
+      // exactly what `internal/fallback.ts` does across fail-over attempts.
+      // Without this, one logging middleware silently broke durable sessions.
+      let callOptions = options;
+      if (callOptions.session && callOptions.session.runId === undefined) {
+        const runId = resolveDependencies(callOptions.deps).generateId();
+        callOptions = { ...callOptions, session: { ...callOptions.session, runId } };
+      }
+
       // transformParams must resolve before the call; bridge async→sync via a
       // deferred stream that awaits the transformed options on first pull.
-      const full = { ...options, model } as MiddlewareCallOptions;
+      //
+      // `prompt`/`instructions` (and a per-call `capabilities` override) are folded
+      // BEFORE the chain (1.9): a middleware sees the options first and
+      // `MiddlewareCallOptions` promises a canonical `messages` array — `redactPII`
+      // and `promptInjectionGuard` read it directly — so a `{ prompt }` call would
+      // otherwise die inside the chain instead of reaching the base function's
+      // fold. Idempotent: the base folds again on the untouched fast path, and an
+      // INVALID shape passes through so the base still reports it as an `error`
+      // part (G2).
+      const full = foldCallInput({ ...callOptions, model } as MiddlewareCallOptions, 'streamChat');
       const transformed = applyTransforms(full, ctx);
-      return deferStream(transformed.then((o) => chain(o as StreamChatOptions)));
+      return deferStream(
+        transformed.then((o) => chain(o as StreamChatOptions)),
+        {
+          runId: callOptions.session?.runId,
+          // Mirrors the inner presence rules EXACTLY (stream-tool-loop /
+          // observe-runtime), decided from the pre-transform options because the
+          // real result does not exist yet. A middleware that ADDS `session` /
+          // `memory` / an observer inside transformParams is the documented
+          // exception — its lazily-created field cannot be surfaced synchronously.
+          memory: callOptions.memory !== undefined && callOptions.memory.extract !== false,
+          observation: observationActive(callOptions.deps),
+        },
+      );
     },
-    async generateText(options) {
+    async generateText(
+      options:
+        | WrappedOptions<GenerateTextOptions>
+        | PromptShorthand<WrappedOptions<GenerateTextOptions>>,
+    ): Promise<GenerateTextResult> {
       const ctx: MiddlewareContext = { operation: 'generate', model };
-      const full = { ...options, model } as MiddlewareCallOptions;
+      // Same pre-chain fold as `streamChat` above — see the comment there.
+      const full = foldCallInput({ ...options, model } as MiddlewareCallOptions, 'generateText');
       const opts = (await applyTransforms(full, ctx)) as GenerateTextOptions;
 
       let chain: (o: GenerateTextOptions) => Promise<GenerateTextResult> = baseGenerateText;
@@ -143,19 +207,99 @@ export function wrapModel(
   };
 }
 
-/** Bridge an async-resolved `StreamChatResult` into a synchronously-returned one. */
-function deferStream(p: Promise<StreamChatResult>): StreamChatResult {
+/** Fields `deferStream` can only know from the call site, not from the pending result. */
+interface DeferredKnown {
+  runId?: string;
+  memory: boolean;
+  observation: boolean;
+}
+
+/**
+ * Bridge an async-resolved `StreamChatResult` into a synchronously-returned one.
+ *
+ * It must forward the WHOLE shape: before 1.9 it built only
+ * `{ textStream, fullStream, usage, finishReason }`, so enabling a single
+ * middleware silently dropped `runId` (breaking durable sessions), `observation`
+ * and `memory`. Fields whose PRESENCE is conditional come from `known` (decided
+ * at the call site); the unconditional 1.9 additions (`warnings`, `consume`) are
+ * always forwarded.
+ */
+function deferStream(p: Promise<StreamChatResult>, known: DeferredKnown): StreamChatResult {
   async function* text(): AsyncGenerator<string> {
     yield* (await p).textStream;
   }
-  async function* full(): AsyncGenerator<unknown> {
+  async function* full(): AsyncGenerator<StreamPart> {
     yield* (await p).fullStream;
   }
+  /** Report through `onError` without ever throwing (the consume() contract). */
+  const report = (
+    consumeOptions: { onError?: (error: unknown) => void } | undefined,
+    error: unknown,
+  ): void => {
+    try {
+      consumeOptions?.onError?.(error);
+    } catch {
+      // an onError that throws must not break the never-reject contract
+    }
+  };
+  /**
+   * The same guard `createDeferred` documents (`internal/async-iter.ts`): a no-op
+   * rejection handler is pre-attached to each DERIVED promise, so awaiting only
+   * one of `usage`/`finishReason` — or neither — cannot raise an
+   * `unhandledRejection`. The inner deferreds carry that catch, but `p.then(…)`
+   * creates NEW promises that adopt the rejection without one, which took a whole
+   * Node process down whenever a wrapped call failed.
+   */
+  const silence = <T>(promise: Promise<T>): Promise<T> => {
+    promise.catch(() => {});
+    return promise;
+  };
   return {
     textStream: text(),
-    fullStream: full() as StreamChatResult['fullStream'],
-    usage: p.then((r) => r.usage),
-    finishReason: p.then((r) => r.finishReason),
+    fullStream: full(),
+    usage: silence(p.then((r) => r.usage)),
+    finishReason: silence(p.then((r) => r.finishReason)),
+    // Never rejects (the declared contract): a call that produced no warnings —
+    // or never got as far as producing any — reports an empty set.
+    warnings: p.then((r) => r.warnings ?? []).catch((): CallWarning[] => []),
+    async consume(consumeOptions) {
+      try {
+        const inner = await p;
+        // Prefer the inner's own consume(): it drains a DEDICATED broadcaster
+        // subscription, so the caller can iterate this deferred stream too.
+        if (inner.consume) {
+          await inner.consume(consumeOptions);
+          return;
+        }
+        // `consume` is OPTIONAL on the type, so a result that does not implement
+        // it is drained directly — that shares its single fullStream
+        // subscription, so don't also iterate the wrapped stream in that case.
+        // (Every shell core builds now forwards it; this is the type's floor,
+        // not a known path.)
+        for await (const part of inner.fullStream) {
+          if (part.type === 'error') {
+            report(consumeOptions, part.error);
+            return;
+          }
+        }
+      } catch (error) {
+        report(consumeOptions, error);
+      }
+    },
+    ...(known.runId !== undefined ? { runId: known.runId } : {}),
+    ...(known.memory
+      ? { memory: p.then((r) => r.memory ?? []).catch((): MemoryMutation[] => []) }
+      : {}),
+    ...(known.observation
+      ? {
+          observation: {
+            settled: p
+              .then((r) => r.observation?.settled)
+              .then(() => {})
+              .catch(() => {}),
+          },
+        }
+      : {}),
   };
 }
 

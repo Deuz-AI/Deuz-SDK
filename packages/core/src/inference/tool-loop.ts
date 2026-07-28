@@ -1,4 +1,5 @@
 import type { CommonCallOptions } from '../types/config';
+import { createWarningSink } from '../internal/warnings';
 import type { GenerateTextResult } from '../types/methods';
 import type { Message } from '../types/message';
 import type { Usage } from '../types/usage';
@@ -6,6 +7,7 @@ import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
 import { runOneStep, type OneStep } from './run-step';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import { resolveDependencies } from '../internal/resolve-deps';
+import { createStepTimeout, resolveTimeouts, type StepTimeoutHandle } from '../core/timeout';
 import type { ObservationRuntime } from '../internal/observe-runtime';
 import {
   buildWireTools,
@@ -18,6 +20,7 @@ import {
   toToolResultPart,
   toStepResult,
   hasClientTool,
+  isClientTool,
   bumpErrorGuard,
   normalizeStop,
   needsCost,
@@ -44,6 +47,10 @@ import {
   observeApprovalRequests,
   observeServerResolutions,
   evaluateVerifyStep,
+  evaluateDoneWhen,
+  falseFinishMessage,
+  warnFalseFinishConfig,
+  FALSE_FINISH_STOPPED_BY,
   verifyFeedbackMessage,
   SubAgentSuspension,
   type Denial,
@@ -79,6 +86,23 @@ export async function runToolLoop(
   const deps = resolveDependencies(options.deps);
   // Loop start timestamp for `durationExceeds` (injected clock — never Date.now).
   const startedAt = deps.clock.now();
+  // 1.9: the timeout layers resolve ONCE, exactly as the streaming twin does —
+  // the same `timeout` input must mean the same thing in both loops. Only
+  // `stepMs` is the loop's business: ttft/total belong to each model call (the
+  // inner runStream resolves them from the same `options.timeout`), `toolMs` to
+  // loop-shared's executeTools.
+  const timeouts = resolveTimeouts(options.timeout);
+  /** The CURRENT step's deadline — undefined (zero cost) when stepMs is unset. */
+  let stepTimeout: StepTimeoutHandle | undefined;
+  /**
+   * A deadline that fires while the step's TOOLS run cannot abort them (that is
+   * `timeout.toolMs` / `Tool.timeoutMs`, in loop-shared), so the loop checks it
+   * at its own step boundaries. An expiry is a FAILURE — the throw rejects this
+   * call with a `TimeoutError`, never a 'aborted' finish (the G2 distinction).
+   */
+  const assertStepDeadline = (): void => {
+    if (stepTimeout?.expired()) throw stepTimeout.error;
+  };
   const durable = setupDurable(options, deps, internal?.resumeFrom);
   // Observation (1.6): the loop owns the run — inner runStream calls emit only
   // model.* events. `lo` is undefined without an observer (fast path).
@@ -112,6 +136,7 @@ export async function runToolLoop(
   if (wantCost && !deps.priceProvider) {
     deps.logger.warn('costExceeds: no deps.priceProvider injected — the condition never fires');
   }
+  warnFalseFinishConfig(options, deps.logger);
   const errorCounters = new Map<string, number>();
   const compactionRunner = setupCompaction(options, deps);
   let totalUsage: Usage = EMPTY_USAGE;
@@ -123,6 +148,12 @@ export async function runToolLoop(
   // Verified generation (1.8): attempt counter + final verdict for metadata.
   let verifyAttempts = 0;
   let verified: boolean | undefined;
+  // ONE sink per RUN (1.9): the loop re-derives capabilities every step, so a
+  // per-step sink would report a single stripped setting once per step. The
+  // sink's own dedupe only works if every step shares it.
+  const warnings = createWarningSink(deps.logger);
+  let falseFinishRetries = 0;
+  let falseFinishAccepted = false;
 
   // Mutated per iteration so tool events parent under the current step span;
   // settle-phase executions run step-less under the run span.
@@ -159,6 +190,7 @@ export async function runToolLoop(
       finishReason: lastStep?.finishReason ?? 'stop',
       response: { messages: appended },
       steps,
+      ...(warnings.list().length ? { warnings: warnings.list() } : {}),
       ...(lastToolStep
         ? { toolCalls: lastToolStep.toolCalls, toolResults: lastToolStep.toolResults }
         : {}),
@@ -261,6 +293,10 @@ export async function runToolLoop(
     const recallBlock = await computeRecallBlock(options, deps, messages);
 
     for (;;) {
+      // Previous step overran its budget? Fail before starting another one.
+      assertStepDeadline();
+      stepTimeout?.clear();
+      stepTimeout = createStepTimeout(deps.clock, timeouts.stepMs);
       const stepIndex = stepBase + steps.length;
       const stepSpan = lo?.rt.startSpan();
       if (observeCtx && stepSpan) {
@@ -312,6 +348,11 @@ export async function runToolLoop(
         }),
         {
           tools: prepared.wire,
+          warnings,
+          // stepMs rides in as a FAILURE signal, never as the user's cancel
+          // signal: the inner pump reports a TimeoutError instead of resolving
+          // 'aborted' (see InternalRunOptions.failSignal).
+          ...(stepTimeout ? { failSignal: stepTimeout.signal } : {}),
           ...(lo && stepSpan
             ? { observe: { runtime: lo.rt, parentSpanId: stepSpan.spanId, stepIndex } }
             : {}),
@@ -342,6 +383,43 @@ export async function runToolLoop(
         appended.push(step.assistantMessage);
         chatMessages = [...chatMessages, step.assistantMessage];
 
+        // False-finish guard (1.9, N2): consulted BEFORE verifyStep at this same
+        // natural-completion boundary — the cheaper, narrower question — and a
+        // rejection that re-drives SHORT-CIRCUITS verification for this round
+        // (nothing worth verifying in an answer the caller calls incomplete).
+        // The two retry budgets never mix. Mirrors the streaming loop exactly;
+        // the buffered path has no stream, so there is no `false-finish` part.
+        const completion = await evaluateDoneWhen(options, {
+          stepIndex,
+          attempt: falseFinishRetries,
+          text: step.text,
+          messages,
+          usage: durableUsage(durable, totalUsage),
+        });
+        if (completion) {
+          if (completion.done) {
+            // A later round genuinely finished: an earlier give-up must not mark
+            // THIS answer as accepted-over-an-objection.
+            falseFinishAccepted = false;
+          } else if (completion.retry) {
+            falseFinishRetries += 1;
+            const nudge = falseFinishMessage();
+            messages = [...messages, nudge];
+            appended.push(nudge);
+            chatMessages = [...chatMessages, nudge];
+            if (durable) {
+              await saveCheckpoint(durable, deps, options, 'running', messages, totalUsage);
+            }
+            // No stepIndex bump: unlike the streaming loop's mutable counter,
+            // here `stepIndex` derives from `steps.length` each iteration, so a
+            // re-drive advances it exactly the way the verify retry does.
+            continue;
+          } else {
+            // Budget spent: the answer stands as final, but the run records WHY.
+            falseFinishAccepted = true;
+          }
+        }
+
         // Verified generation (1.8): a rejected verdict feeds feedback back as
         // a user turn and re-drives the loop (bounded by maxVerifyAttempts).
         const verification = await evaluateVerifyStep(options, {
@@ -365,6 +443,7 @@ export async function runToolLoop(
             continue;
           }
         }
+        if (falseFinishAccepted) stoppedBy = FALSE_FINISH_STOPPED_BY;
         if (durable) {
           await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
         }
@@ -441,9 +520,9 @@ export async function runToolLoop(
         suspend = {
           reason: pendingApproval.length > 0 ? 'approval' : 'client-tool',
           pendingApprovalCount: pendingApprovals?.length ?? 0,
-          pendingToolCount: toolCalls.filter(
-            (c) => !tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider',
-          ).length,
+          // Only REAL client tools are pending on the caller (1.9) — a
+          // hallucinated name self-healed inside the step instead.
+          pendingToolCount: toolCalls.filter((c) => isClientTool(tools, c.toolName)).length,
           ...checkpointRef(),
         };
         break;
@@ -491,6 +570,10 @@ export async function runToolLoop(
         };
         break;
       }
+      // The step's own budget covers its tool executions (1.9): if it expired
+      // while they ran, the step is over — fail here rather than feeding results
+      // back into a model call that can no longer be paid for.
+      assertStepDeadline();
       const toolResultMessage: Message = {
         role: 'tool',
         content: toolResults.map(toToolResultPart),
@@ -562,5 +645,9 @@ export async function runToolLoop(
       });
     }
     throw err;
+  } finally {
+    // Release the step deadline on EVERY exit (break, return, throw): an
+    // un-cancelled host timer keeps a Node process (and a test run) alive.
+    stepTimeout?.clear();
   }
 }

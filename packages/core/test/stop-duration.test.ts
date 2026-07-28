@@ -108,6 +108,46 @@ describe('durationExceeds (generateText)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// 1.9 (finishing pass): the buffered loop now arms a `timeout.stepMs` deadline
+// per step. An armed deadline that never expires must be INERT — it may not
+// perturb the stop conditions, the step count, or `stoppedBy`.
+// ---------------------------------------------------------------------------
+
+describe('timeout.stepMs is inert until it expires (generateText)', () => {
+  const run = async (timeout?: { stepMs: number }) => {
+    const { clock, advance } = manualClock();
+    const search = vi.fn(async () => {
+      advance(6000);
+      return 'result';
+    });
+    const { fetch, calls } = mockFetchSequence([() => sseResponse([TOOL_CALL])]);
+    const res = await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'go' }],
+      tools: { search: { description: 'Search', parameters: SCHEMA, execute: search } },
+      maxSteps: 10,
+      stopWhen: durationExceeds(5000),
+      ...(timeout ? { timeout } : {}),
+      deps: { clock },
+    });
+    return {
+      calls: calls.length,
+      steps: res.steps?.length,
+      finishReason: res.finishReason,
+      usage: res.usage,
+      deuz: res.providerMetadata?.deuz,
+    };
+  };
+
+  it('a generous stepMs leaves the durationExceeds outcome byte-for-byte unchanged', async () => {
+    // The manual clock never FIRES a timer, so the deadline is armed and inert —
+    // which is exactly the pre-1.9 shape this must reproduce.
+    expect(await run({ stepMs: 600_000 })).toEqual(await run());
+    expect((await run()).deuz).toMatchObject({ stoppedBy: 'durationExceeds' });
+  });
+});
+
 describe('durationExceeds (streamChat parity)', () => {
   it('finish part carries providerMetadata.deuz.stoppedBy === "durationExceeds"', async () => {
     const { clock, advance } = manualClock();

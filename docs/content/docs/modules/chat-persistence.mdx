@@ -1,11 +1,11 @@
 ---
 title: Chat Persistence & State
-description: The ChatStore seam, auto-persist via the chat call option, the pure chat state engine (applyUIPart), and branching for regenerate / edit-and-resend.
+description: The ChatStore seam, auto-persist via the chat call option, the pure chat state engine (applyUIPart and the ordered parts projection), and branching for regenerate / edit-and-resend.
 ---
 
-`@deuz-sdk/core/chat` is the framework-agnostic chat layer (1.7): a two-method **`ChatStore`** persistence seam the agentic loops auto-save into, plus a **pure chat state engine** — the render-friendly `UIMessage` shape, the reducer that folds [Deuz UI wire](/docs/modules/ui-streaming) parts into it, canonical-history reconstruction, and the branch helpers behind regenerate / edit-and-resend. `@deuz-sdk/react`'s hooks bind this module to React state — no business logic lives there.
+`@deuz-sdk/core/chat` is the framework-agnostic chat layer (1.7, extended in 1.9): a two-method **`ChatStore`** persistence seam the agentic loops auto-save into, plus a **pure chat state engine** — the render-friendly `UIMessage` shape, the reducer that folds [Deuz UI wire](/docs/modules/ui-streaming) parts into it, the ordered `parts` projection, canonical-history reconstruction in both directions, and the branch helpers behind regenerate / edit-and-resend. `@deuz-sdk/react`'s hooks bind this module to React state — no business logic lives there.
 
-Everything in `@deuz-sdk/core/chat` is edge-safe pure functions over immutable data. The file-backed reference store ships separately at `@deuz-sdk/core/chat/node`.
+Everything in `@deuz-sdk/core/chat` is edge-safe pure functions over immutable data. The file-backed reference store ships separately at `@deuz-sdk/core/chat/node`; the request validator that guards a chat route ([`validateChatRequest`](/docs/modules/request-validation)) is re-exported from this same subpath.
 
 ## `ChatStore` — the persistence seam
 
@@ -157,10 +157,12 @@ interface UIMessage {
   content: string;
   reasoning?: string;
   toolCalls?: UIToolCall[];
+  /** Ordered projection (1.9, additive) — absent until the turn has its first element. */
+  parts?: UIMessagePart[];
 }
 ```
 
-One streamed assistant turn accumulates into an `AssistantTurnState`: the `UIMessage` plus `approvals` (gated calls awaiting verdicts), `serverResults` (which toolCallIds the server already executed — the rest are client tools), and the 1.7 wire additions: `costUsd` / `cacheSavingsUsd` (live `cost` parts), `budgetExceeded`, `dataParts` (app-defined `data-{name}` parts in arrival order), `citations`, and `error` (the redacted server error message, recorded — not thrown).
+One streamed assistant turn accumulates into an `AssistantTurnState`: the `UIMessage` plus `approvals` (gated calls awaiting verdicts), `serverResults` (which toolCallIds the server already executed — the rest are client tools), and the 1.7 wire additions: `costUsd` / `cacheSavingsUsd` (live `cost` parts), `budgetExceeded`, `dataParts` (app-defined `data-{name}` parts in arrival order), `citations`, and `error` (the redacted server error message, recorded — not thrown). 1.8 added `plan` (the latest `plan-update` snapshot) and `activity`; 1.9 added the terminal readouts `usage` / `finishReason` (from the wire's `finish` part), `steps` (per-step usage and finish reason, in arrival order) and `verifications` (`verifyStep` verdicts). All four stay **absent** until the matching part arrives — as do `plan`, `costUsd` and `budgetExceeded` before them, because `createAssistantTurn`'s initial shape is public surface and never invents a key.
 
 `applyUIPart(turn, part)` folds **one** wire part into the turn and returns a new state:
 
@@ -175,13 +177,108 @@ for await (const part of connectDeuzStream(resumeUrl)) {
 }
 ```
 
-Reducer details worth knowing: a `tool-state: input-streaming` part opens a placeholder tool call *before* the assembled `tool-call` part arrives, so the lifecycle is visible from the first fragment (the later `tool-call` completes it in place, no duplicates); `start` adopts the server's `messageId`; `tool-result` moves the call to `state: 'result'` and records it in `serverResults`.
+Reducer details worth knowing:
+
+- A `tool-state: input-streaming` part opens a placeholder tool call *before* the assembled `tool-call` part arrives, so the lifecycle is visible from the first fragment (the later `tool-call` completes it in place, no duplicates); `start` adopts the server's `messageId`; `tool-result` moves the call to `state: 'result'` and records it in `serverResults`.
+- **Addressable data parts (1.9).** A `data-{name}` part carrying an `id` **replaces** the earlier entry with the same name and id *in place* — in `dataParts` and in the ordered `parts` — instead of appending, so a live status widget stays one entry rather than three. A write without an id appends, exactly as in 1.7/1.8. Only a *string* id addresses an entry; anything else reads as absent and keeps the append-only path, because the value crossed a network boundary. See [`writeData`](/docs/modules/ui-streaming#addressable-and-transient-data-parts-19) for the server side.
+- **Denial fields (1.9).** `tool-state` carries optional `denied` / `deniedReason`, which the reducer folds onto `UIToolCall` so a declined call stops rendering as "getWeather failed". The streaming loop's `tool-state` emitter sets them at both of its terminal sites, so every refusal the built-in approval flow settles arrives marked: a server-mode `approveToolCall` returning `false` (`denied: true`, no reason — the hook's verdict is a bare boolean), an `approvalResponses` verdict (its own `reason`, verbatim), a gated call left unanswered, an unanswered client tool, and a token `approvalSigner` rejected. A tool that **threw** gains no denial fields, which is the distinction the fields exist for.
+- **Three more channels (1.9).** `warning` parts fold into `turn.warnings` (`CallWarning[]`, the same payload `StreamChatResult.warnings` resolves), `false-finish` parts into `turn.falseFinishes`, and `sub-agent` parts into `turn.subAgents` (below). All three are **optional and absent** until the first entry arrives — `createAssistantTurn`'s literal is public surface and stays unchanged.
+
+### Sub-agent frames (1.9)
+
+`applyUIPart` folds a `sub-agent` part into its **own** channel, one frame per `agentPath`:
+
+```ts
+turn.subAgents?.[0];
+// { agentPath: ['researcher'], afterPart: 3, turn: AssistantTurnState }
+```
+
+`turn` is a full `AssistantTurnState` folded by this reducer re-entering itself, so the child's text, reasoning, ordered `parts`, tool cards, citations and activity are all as complete as the parent's — one implementation, not a parallel one. `afterPart` is the count of the parent's ordered elements when the frame opened (normally just after the `tool` card for the delegating call), so a renderer splices the block back in at the handoff point. A 2nd-level sub-agent is a **sibling** frame with a two-segment path, because the wire is single-wrapped.
+
+It is deliberately **not** folded into the parent's buckets or its ordered `parts`: that would attribute the child's prose to the main agent, and it would put the child's `tool_use` into `assistantMessageFromTurn`'s output with no matching `tool_result` — the payload that 400s the next request. Frames are sealed alongside the parent at `finish`, `error` and `sealAssistantTurn`. `useChat` exposes them as `subAgents` — see [React hooks](/docs/modules/react-hooks#rendering-a-sub-agent-run).
+
+### Ordered parts (1.9)
+
+`content` / `reasoning` / `toolCalls` are **buckets**. A multi-step turn — think → search → "I found 3 papers" → fetch → "here is the summary" — flattens into one reasoning blob, one text blob and a detached list of tool cards, so a renderer cannot place a tool card between the two sentences it belongs between.
+
+Since 1.9 the reducer *also* records arrival order in `UIMessage.parts`. No wire change was needed: the canonical stream is strictly ordered and `toDeuzStreamResponse` preserves that order, so **arrival order is the interleave**. The buckets are **not** deprecated and keep their exact 1.8 semantics — `content` is still the turn's full text, byte-identical, and the same `part.text` lands in both views, so the two can never disagree.
+
+```ts
+type UIMessagePart =
+  | { type: 'text'; text: string; state: 'streaming' | 'done' }
+  | {
+      type: 'reasoning';
+      text: string;
+      signature?: string;
+      encrypted?: boolean; // opaque provider payload — do NOT render
+      redacted?: boolean;
+      state: 'streaming' | 'done';
+    }
+  | { type: 'tool'; toolCallId: string } // a REFERENCE into UIMessage.toolCalls
+  | { type: 'data'; name: string; id?: string; payload: unknown }
+  | Extract<DeuzUIPart, { type: 'citation' }> // the wire object verbatim
+  | { type: 'step-start'; step: number }
+  | { type: 'file'; mediaType: string; data: string | Uint8Array; url?: string };
+```
+
+A framework-agnostic walk — `@deuz-sdk/react` exposes the same array, see [rendering ordered parts](/docs/modules/react-hooks#rendering-ordered-parts) for the JSX version:
+
+```ts title="render-parts.ts"
+// No `parts` (pre-1.9, hand-built, or restored from old storage)? Render the buckets.
+for (const part of message.parts ?? []) {
+  switch (part.type) {
+    case 'step-start':
+      // A real streamed turn's parts[0] is normally one of these.
+      drawStepDivider(part.step);
+      break;
+    case 'text':
+      drawProse(part.text, part.state === 'streaming');
+      break;
+    case 'reasoning':
+      // `encrypted` text is an opaque provider payload, not thinking text.
+      if (!part.encrypted) drawThinking(part.text);
+      break;
+    case 'tool': {
+      const call = message.toolCalls?.find((c) => c.toolCallId === part.toolCallId);
+      if (call) drawToolCard(call);
+      break;
+    }
+    case 'file':
+      drawAttachment(part.mediaType, part.data, part.url);
+      break;
+    default:
+      break; // open union — always keep a default
+  }
+}
+```
+
+What the union encodes, in the order people get it wrong:
+
+- **`parts` is optional and absent until the first element exists.** `createAssistantTurn`'s shape is public surface, so the key is never invented; render `parts` when present, the buckets otherwise.
+- **`step-start` is normally `parts[0]`** of a real streamed turn, because the streaming loop pushes one at the top of every iteration. A renderer without a case for it hits its `default` on the very first element.
+- **Skip `reasoning` parts flagged `encrypted`** — the text is an opaque encrypted provider payload (OpenAI Responses), not display text; `redacted` marks a provider-redacted thinking block. Neither flag can appear on a *streamed* turn (the wire's `reasoning-delta` carries no such field) — they arrive on history projected by `uiFromMessages`.
+- **A text/reasoning element is `'streaming'` only while it is the newest thing in the turn.** Opening anything else seals it, which is what makes a text delta arriving *after* a tool call a new paragraph instead of silently re-opening the one the tool interrupted.
+- **A `tool` element is a reference, not a copy** — a call's state (input → approval → result → denial) changes over the turn's life, and two copies of it would drift.
+- **A `file` element carries the canonical `ImagePart.image` value verbatim** (bytes stay bytes). `url` is set only when the value is already a renderable `data:` / `http(s):` src; for bytes, build one yourself. See [Files & PDFs](/docs/core/files).
+
+### `sealAssistantTurn`
+
+`applyUIPart` seals the tail on the wire's terminal parts (`finish`, `error`). `sealAssistantTurn(turn)` covers the boundaries only the *binding* knows about — a user abort, a reader that walked away, a turn restored from storage:
+
+```ts
+import { sealAssistantTurn } from '@deuz-sdk/core/chat';
+
+turn = sealAssistantTurn(turn); // every 'streaming' text/reasoning element becomes 'done'
+```
+
+It is idempotent and returns the **same object** when there is nothing to seal (unlike `applyUIPart`, which always returns a new one), so a React binding can call it unconditionally without forcing a re-render. A stream that dies with neither `finish` nor `error` and is never sealed deliberately leaves the tail `'streaming'` — that is the truth about a truncated turn.
 
 ### Back to canonical history
 
 - `assistantMessageFromTurn(turn)` — the canonical assistant `Message` for the request history: text plus `tool_use` parts, exactly as the wire streamed them (the client-tools reconstruction).
 - `clientToolResultMessage(results)` — the canonical `role: 'tool'` message for client-executed tool results.
-- `uiFromMessages(messages, generateId)` — the reverse projection: a canonical history (e.g. a chat loaded from a `ChatStore`) into render-friendly `UIMessage`s. `tool` messages merge their results into the preceding assistant turn; `system` messages are not rendered; `generateId` supplies stable ids (inject `deps.generateId`, or scripted ids in tests).
+- `uiFromMessages(messages, generateId)` — the reverse projection: a canonical history (e.g. a chat loaded from a `ChatStore`) into render-friendly `UIMessage`s. `tool` messages merge their results into the preceding assistant turn; `system` messages are not rendered; `generateId` supplies stable ids (inject `deps.generateId`, or scripted ids in tests). Since 1.9 each message also carries the ordered `parts` projection, in canonical array order — which is what makes attachments visible instead of rendering as an empty bubble.
+- `canonicalFromUI(ui)` — the inverse of `uiFromMessages` (1.9), for a binding that lets the app **replace** history (`setMessages`): the two views must stay coherent, and only the canonical one is POSTable.
 
 ```ts title="load-a-chat.ts"
 import { uiFromMessages } from '@deuz-sdk/core/chat';
@@ -189,6 +286,14 @@ import { uiFromMessages } from '@deuz-sdk/core/chat';
 const record = await store.loadChat('chat-42');
 const ui = record ? uiFromMessages(record.messages, () => crypto.randomUUID()) : [];
 ```
+
+`canonicalFromUI` prefers the ordered `parts` over the buckets, and it is **lossy on purpose** — where it loses matters:
+
+- **Survives** (with `parts` present): the interleave, `ImagePart` attachments with their media type (carrier verbatim), reasoning `signature` / `encrypted` / `redacted`, `tool_use.providerMetadata` (Gemini's `thoughtSignature` — a dropped one 400s the next request), and executed tool calls re-emitted as the `role: 'tool'` message that follows the turn, because [every `tool_use` must get a `tool_result`](/docs/agents/tool-loop).
+- **Does not survive:** `system` messages (`uiFromMessages` never rendered them, so nothing here can bring them back — re-prepend your own), message-level `providerMetadata`, consecutive text parts (they merge into one block, which is what makes a text-only history round-trip exactly), UI-only bookkeeping (`runState`, denial, pending approvals, `data-*` parts, citations, step boundaries), and a call still awaiting its result, which stays a bare `tool_use`.
+- **Without `parts`** — a hand-built turn, or one restored from a pre-1.9 store — it collapses to bucket order (one reasoning block, then one text block, then every `tool_use`) and attachments are gone entirely, because `UIMessage.content` is a plain string. That result is a *plausible* history, not the original one.
+
+So when you hold the real thing, persist it: a binding that keeps `{ ui, canonical }` (as [`useChat`](/docs/modules/react-hooks) does) should save `history.canonical` rather than round-tripping through `canonicalFromUI`.
 
 ## Branching: regenerate and edit-and-resend
 
@@ -225,7 +330,8 @@ if (branched) {
 
 ## Related
 
-- [UI Streaming](/docs/modules/ui-streaming) — the wire parts `applyUIPart` consumes, including the 1.7 additions.
+- [UI Streaming](/docs/modules/ui-streaming) — the wire parts `applyUIPart` consumes, including the 1.7 and 1.9 additions.
+- [Request validation](/docs/modules/request-validation) — `validateChatRequest`, re-exported from this same subpath, for the route that receives the history.
 - [Memory](/docs/modules/memory) — the shared `MemoryScope` model, and the `memory` call option for cross-session facts (persistence stores *transcripts*; memory stores *knowledge*).
 - [The unbreakable chatbot](/docs/agents/unbreakable-chatbot) — persisting the live *stream*; this page persists the *conversation*.
 - [Durable Runtime](/docs/agents/durable-runtime) — the `$deuzBytes` codec convention and the SessionStore pattern this seam follows.

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { generateText, streamChat, stepCountIs } from '../src/index';
-import { createMockModel, runEval } from '../src/testing';
+import { createMockModel, runEval, runGradedEval } from '../src/testing';
 import type { JSONSchema } from '../src/types/schema';
 import { sseResponse } from './fixtures/sse';
 
@@ -112,6 +112,137 @@ describe('runEval', () => {
   it('returns score 0 for an empty case list (no division by zero)', async () => {
     const report = await runEval([], async (x: string) => x);
     expect(report).toEqual({ score: 0, total: 0, passed: 0, results: [] });
+  });
+});
+
+describe('runGradedEval (partial credit)', () => {
+  it('gives 2/3 for 3 subtasks with 2 passing, and names the failure', async () => {
+    const report = await runGradedEval(
+      [
+        {
+          name: 'summary',
+          input: 'abc',
+          subtasks: [
+            { name: 'is upper', check: (out) => out === 'ABC' },
+            { check: (out) => typeof out === 'string' }, // default label
+            { name: 'has a digit', check: (out) => /\d/.test(String(out)) },
+          ],
+        },
+      ],
+      async (input: string) => input.toUpperCase(),
+    );
+
+    expect(report.results[0]).toEqual({
+      name: 'summary',
+      score: 2 / 3,
+      passed: 2,
+      total: 3,
+      failures: ['has a digit'],
+    });
+    expect(report.score).toBeCloseTo(2 / 3);
+  });
+
+  it('honours weights, and coerces a 0/negative/NaN weight to 1', async () => {
+    const report = await runGradedEval(
+      [
+        {
+          name: 'weighted',
+          input: 1,
+          subtasks: [
+            { name: 'big', check: () => true, weight: 3 },
+            { name: 'small', check: () => false, weight: 1 },
+          ],
+        },
+        {
+          name: 'bad-weights',
+          input: 1,
+          subtasks: [
+            { name: 'zero', check: () => true, weight: 0 },
+            { name: 'nan', check: () => false, weight: Number.NaN },
+            { name: 'negative', check: () => false, weight: -5 },
+          ],
+        },
+      ],
+      async () => 'out',
+    );
+
+    expect(report.results[0]!.score).toBe(0.75); // 3 of 4 weight
+    expect(report.results[0]!.passed).toBe(1); // count stays unweighted
+    expect(report.results[1]!.score).toBeCloseTo(1 / 3); // all three fell back to weight 1
+    expect(report.score).toBeCloseTo((0.75 + 1 / 3) / 2); // mean over cases
+  });
+
+  it('reports a throwing subtask as a failure instead of crashing the run', async () => {
+    const report = await runGradedEval(
+      [
+        {
+          name: 'boom',
+          input: 1,
+          subtasks: [
+            { name: 'ok', check: () => true },
+            {
+              name: 'explodes',
+              check: () => {
+                throw new Error('kaput');
+              },
+            },
+          ],
+        },
+      ],
+      async () => 'out',
+    );
+
+    expect(report.results[0]).toEqual({
+      name: 'boom',
+      score: 0.5,
+      passed: 1,
+      total: 2,
+      failures: ['explodes: kaput'],
+    });
+  });
+
+  it('scores a throwing run 0 with the message on `error` (subtasks never run)', async () => {
+    const check = vi.fn(() => true);
+    const report = await runGradedEval(
+      [{ name: 'dead', input: 'boom', subtasks: [{ check }, { check }] }],
+      async (input: string) => {
+        if (input === 'boom') throw new Error('exploded');
+        return input;
+      },
+    );
+
+    expect(report.results[0]).toEqual({
+      name: 'dead',
+      score: 0,
+      passed: 0,
+      total: 2,
+      failures: [],
+      error: 'exploded',
+    });
+    expect(check).not.toHaveBeenCalled();
+    expect(report.score).toBe(0);
+  });
+
+  it('scores a case with NO subtasks 0 and never invokes `run` (explicit choice)', async () => {
+    const run = vi.fn(async () => 'out');
+    const report = await runGradedEval([{ name: 'empty', input: 1, subtasks: [] }], run);
+
+    // 0, not 1: an empty case asserts nothing, and a vacuous pass would let a
+    // typo'd fixture silently inflate the suite.
+    expect(report.results[0]).toEqual({
+      name: 'empty',
+      score: 0,
+      passed: 0,
+      total: 0,
+      failures: [],
+      error: 'no subtasks',
+    });
+    expect(report.score).toBe(0);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('returns score 0 for an empty case list, like runEval', async () => {
+    expect(await runGradedEval([], async (x: string) => x)).toEqual({ score: 0, results: [] });
   });
 });
 

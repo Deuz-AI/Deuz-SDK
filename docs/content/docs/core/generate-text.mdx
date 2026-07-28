@@ -22,14 +22,18 @@ const result = await generateText(options);
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `model` | `LanguageModel` | — | From a provider factory, e.g. `createAnthropic(...)('claude-opus-4-8')`. |
-| `messages` | `Message[]` | — | Canonical message history. |
+| `messages` | `Message[]` | — | Canonical message history. Required unless you pass `prompt` — the two are mutually exclusive, and passing both (or neither) rejects with an `InvalidRequestError`. |
+| `prompt` | `string` | — | **1.9.** Shorthand for exactly one user turn. See [Prompts](/docs/core/prompts-and-timeouts). |
+| `instructions` | `string` | — | **1.9.** The system prompt, placed first; a `system` message already in `messages` is preserved after it. |
 | `temperature` | `number` | provider | Sampling temperature. |
 | `maxOutputTokens` | `number` | provider | Cap on generated tokens. |
 | `topP` | `number` | provider | Nucleus sampling. |
 | `stopSequences` | `string[]` | — | Hard stop strings. |
 | `effort` | `'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'` | — | Canonical reasoning effort; each adapter maps it to its own unit (`'xhigh'`/`'max'` clamp down on wires that lack them). |
-| `signal` | `AbortSignal` | — | Cancellation; propagated to the underlying fetch and to tool `execute`. |
+| `signal` | `AbortSignal` | — | Cancellation; propagated to the underlying fetch and to tool `execute`. `abortSignal` is a deprecated 1.9 alias. |
 | `maxRetries` | `number` | `2` | Pre-first-byte retries only. |
+| `timeout` | `number \| { ttftMs?, totalMs?, stepMs?, toolMs? }` | ttft 60s / total 300s | **1.9.** A bare number is `{ totalMs }`; `0` disables a layer. Note `stepMs` is enforced in the **streaming** loop only — this buffered loop honours `ttftMs`/`totalMs`/`toolMs`. See [Timeouts](/docs/core/prompts-and-timeouts#timeout). |
+| `capabilities` | `Partial<ModelCapabilities>` | — | **1.9.** Shallow-merged over the model's registry row. See [capabilities](/docs/core/prompts-and-timeouts#capabilities). |
 | `headers` | `Record<string, string>` | — | Extra request headers. |
 | `onUsage` | `(usage, meta) => void` | — | Per-request usage callback. |
 | `onFinish` | `(meta) => void` | — | Fires when the call settles. |
@@ -77,6 +81,7 @@ interface GenerateTextResult {
 | `toolCalls` | `ToolCall[]` | with tools | Convenience: the last tool-calling step's calls. |
 | `toolResults` | `ToolResult[]` | with tools | Convenience: that step's results. |
 | `pendingApprovals` | `ToolApprovalRequest[]` | client-mode approval break | Calls awaiting a verdict when a `needsApproval` tool broke the loop; resume by calling again with `approvalResponses`. |
+| `warnings` | `CallWarning[]` | **never (1.9)** | `CallWarning` has real producers, but **not on this result**: a buffered call raises and logs its notices and then discards them — no step or loop code puts them on the returned object, so `result.warnings` is `undefined` on every real `generateText`. Read `deps.logger.warn`, or use [`streamChat`](/docs/core/stream-chat#warnings), where the field is live. See [Declared but inert](/docs/reference/whats-new-1-9#declared-but-inert). |
 
 `response.messages` only contains the *new* turns this call produced — append them to your prior `messages` to continue the conversation.
 
@@ -267,8 +272,9 @@ A tool marked `needsApproval` is gated before it runs. There are two modes:
 
 The loop is self-healing and bounded. A few invariants worth knowing here:
 
-- **Client tools** (a `Tool` with no `execute`) cannot be auto-run — the loop stops and returns them in `toolCalls` so the caller owns the round-trip.
-- **Runaway guard:** the same tool failing on three consecutive steps hard-stops the loop.
+- **Client tools** (a key **present in `tools`** with no `execute`) cannot be auto-run — the loop stops and returns them in `toolCalls` so the caller owns the round-trip.
+- **An unregistered tool name is not a client tool** (1.9): a hallucinated name self-heals into an `is_error` `tool_result` and the loop **continues**, instead of breaking out with a dangling `tool_use`.
+- **Runaway guard:** the same tool failing on three consecutive steps hard-stops the loop. Unknown-tool errors and tool timeouts count toward it; approval denials do not.
 - **Stop on tool count, not `finishReason`:** the loop continues whenever the last step emitted tool calls, even if the provider reported `finish: stop` (a Gemini quirk).
 
 For the full set of agentic invariants — immutable history, parallel execution, the runaway guards, and the Gemini stop-bug guard — see [the tool loop reference](/docs/agents/tool-loop).

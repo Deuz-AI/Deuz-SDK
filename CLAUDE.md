@@ -11,25 +11,30 @@ An npm-workspaces **monorepo** (root is private) with two published packages in 
 
 Built for the Deuz platform (Next.js + Supabase, a separate repo) and published to npm. **All `src/`, `test/`, `tooling/` paths in this file are relative to `packages/core/`** unless stated otherwise. Root-level scripts delegate into the workspaces — run commands from the repo root.
 
-Planning docs are in Turkish: the current release's code-verified design spec lives at the repo root (e.g. `1.6.0.md`); release history is in `CHANGELOG.md` (changesets-generated — add entries via `npm run changeset`, never by hand). The README is the public-facing API tour.
+Planning docs are in Turkish: the current release's code-verified design spec lives at the repo root. For 1.9.0 there are **two** — `1.9.0-parity.md` (the parity + hardening plan this release actually executes) and `1.9.0.md` (the research-differentiation plan it front-runs); the parity doc says outright that it comes *before* the other, not instead of it. Release history is in `CHANGELOG.md` (changesets-generated — add entries via `npm run changeset`, never by hand). The README is the public-facing API tour.
 
 ## Commands
 
 All from the repo root (they fan out over the workspaces):
 
 ```bash
-npm run build          # core then react: tsup → dist/ (ESM + CJS + .d.ts per subpath export)
-npm run dev            # core tsup --watch
-npm test               # vitest run in every workspace
-npm run test:watch     # core vitest in watch mode
-npm run test:types     # vitest run --typecheck.only → test/*.test-d.ts (the 1.0 surface lock)
-npm run lint           # eslint per workspace (core config enforces edge-safety — see below)
-npm run typecheck      # tsc --noEmit per workspace
-npm run format         # prettier --write . (root-owned; packages don't carry prettier)
-npm run check          # the full gate: format:check + lint + typecheck + test + test:types + build
-                       #   + verify:package (publint --strict + attw) + verify:runtime (browser bundle,
-                       #   no node: leaks) + verify:size (byte budgets) + verify:api (contract ratchet)
+npm run build            # core then react: tsup → dist/ (ESM + CJS + .d.ts per subpath export)
+npm run dev              # core tsup --watch
+npm test                 # vitest run in every workspace
+npm run test:watch       # core vitest in watch mode
+npm run test:types       # vitest run --typecheck.only → test/*.test-d.ts (the surface locks)
+npm run lint             # eslint per workspace (core config enforces edge-safety — see below)
+npm run typecheck        # tsc --noEmit per workspace
+npm run format           # prettier --write . (root-owned; packages don't carry prettier)
+npm run verify:docs-refs # static lint over docs/ + skills/ + README.md (see below)
+npm run verify:docs      # verify:docs-refs, then the REAL docs site build (typegen + next build)
+npm run check            # the full gate: format:check + verify:docs-refs + lint + typecheck + test
+                         #   + test:types + build + verify:package (publint --strict + attw)
+                         #   + verify:runtime (browser bundle, no node: leaks) + verify:size (byte
+                         #   budgets) + verify:api (contract ratchet)
 ```
+
+`verify:docs-refs` (`packages/core/tooling/verify-docs.mjs`, zero deps, sub-second) is the cheap guard over prose, which no other gate step reads: **leaked tool-call debris** (a raw tool tag in a written file broke two separate release passes and was only caught by `next build` minutes later), hallucinated `@deuz-sdk` import symbols — resolved against a real symbol table built from `tsup.config.ts`'s `entry` plus `package.json`'s `exports`, following `export *` — dead internal `/docs/…` links and `#anchors`, `meta.json` drift in both directions, and unclosed fences/`<Callout>`s. It is a text linter, not a type checker; `verify:docs` stays the authority on whether the site compiles.
 
 Target one workspace with `-w`: `npm run build -w @deuz-sdk/core`, `npm test -w @deuz-sdk/react`.
 
@@ -41,7 +46,35 @@ npm test -w @deuz-sdk/core -- -t "maps overloaded to 529"
 npx vitest run test/tool-loop.test.ts -t "parallel"    # from packages/core/
 ```
 
-Before claiming a change is done, run `npm run check` — it's the same gate CI/publish uses. Adding a new core subpath export means updating **six** places in lockstep (all under `packages/core/`): `package.json` `exports` (import/require blocks, `types` key FIRST — enforced), `tsup.config.ts` `entry`, (if edge-safe) `src/edge.ts`, `tooling/api-contract.json` (regenerate — from `packages/core/`: `npm run build && node tooling/check-api-contract.mjs --print > tooling/api-contract.json`, never hand-edit), and for Node-only files: the `eslint.config.js` twin exemption lists (or place the file under `src/node/**`, pre-exempted) plus the node-only regex in `tooling/check-runtime-compat.mjs`.
+Before claiming a change is done, run `npm run check` — it's the same gate CI/publish uses.
+
+**Gate-ordering hazard — build core before you trust a red.** `check` runs `typecheck` and `test` *before* `build`, and `packages/react` resolves `@deuz-sdk/core` exactly the way a published consumer does: through the workspace symlink to `packages/core`, whose `exports` point at `dist/`. There is no path alias and no project reference in `packages/react/tsconfig.json` or `vitest.config.ts`. So if you edit core `src/` and run the gate without rebuilding, react's `tsc --noEmit` **and** its vitest run both read the *previous* `dist/` — a false red (or, worse, a false green) that has nothing to do with your change. Run `npm run build -w @deuz-sdk/core` first, then the gate.
+
+Adding a new core subpath export touches **seven** places (all under `packages/core/`); the first four always apply:
+
+1. `package.json` `exports` — import/require blocks with the `types` key FIRST (enforced by `verify:package`).
+2. `tsup.config.ts` `entry` — dist name → src file. `verify:docs-refs` cross-checks this list against `exports` and reports any subpath with no entry.
+3. `src/edge.ts` — only if the module is edge-safe.
+4. `tooling/api-contract.json` — regenerate (see below), never hand-edit.
+5. `tooling/bundle-size-budgets.json` — optional, but the ratchet is opt-in: `check-bundle-size.mjs` walks only the `bundles` it is given, so an unlisted subpath ships unmeasured (Sprint 3 shipped ~10 KB of new surface that way).
+6. `eslint.config.js` — the twin exemption lists, for Node-only files (or place the file under `src/node/**`, which is pre-exempted).
+7. `tooling/check-runtime-compat.mjs` — the node-only regex, again only for Node-only files.
+
+**Regenerating `api-contract.json` — the redirect that eats its own input.** `tooling/check-api-contract.mjs` reads `tooling/api-contract.json` at line 9, *before* it ever looks at `--print`. The shell truncates a `>` target before node starts, so the obvious one-liner destroys the file it is about to read and dies with `SyntaxError: Unexpected end of JSON input`. This has bitten two separate agents. Write to a temp file, then move it into place:
+
+```bash
+cd packages/core
+npm run build                                   # the contract is read off dist/index.d.ts
+node tooling/check-api-contract.mjs --print > tooling/api-contract.next.json
+mv tooling/api-contract.next.json tooling/api-contract.json
+node tooling/check-api-contract.mjs             # confirm it parses and passes
+```
+
+In **Windows PowerShell** `>` additionally writes a UTF-8 BOM, which `JSON.parse` rejects — the next `verify:api` then dies with `SyntaxError: Unexpected token`. Either run the lines above in Git Bash, or write the bytes yourself:
+
+```powershell
+[IO.File]::WriteAllText("$PWD/tooling/api-contract.json", ((node tooling/check-api-contract.mjs --print) -join "`n") + "`n")
+```
 
 ## The two non-negotiable invariants
 
@@ -74,7 +107,10 @@ Everything is normalized to canonical `StreamPart` deltas (`src/types/stream.ts`
 - **`inference/`** — entry-point orchestrators: `stream-chat.ts`, `generate-text.ts`, `generate-object.ts`, `embed.ts`, and the agentic loop (`tool-loop.ts`, `stream-tool-loop.ts`, `run-step.ts`, `loop-shared.ts`, `stop.ts`).
 - **`internal/`** — plumbing: `resolve-deps`, `resolve-call`, `config-symbol`, `client-context`, `sse`, `async-iter`, `p-limit`, `redact`, `image`, `http`.
 - **`schema/`** — Standard Schema / JSON Schema bridging for structured output (`bridge.ts`, `gemini.ts`).
-- Flat **provider factories** (`anthropic.ts`, `openai.ts`, `xai.ts`, `google.ts`, `vertex.ts`, `voyage.ts`, `google-extras.ts`) and **feature modules** (`memory*.ts`, `rag*.ts`, `skills*.ts`, `image.ts`, `midjourney.ts`, `yunwu.ts`, `ui.ts`, `middleware.ts`, `pricing.ts`, `mcp/`).
+- Flat **provider factories** — `anthropic.ts`, `openai.ts`, `xai.ts`, `google.ts` (+ `google-extras.ts`), `vertex.ts`, `voyage.ts`, `azure.ts`, `bedrock.ts`, and `providers.ts` → `providers-compat.ts` (the OpenAI-compatible host catalog, `createOpenAICompatible` for any unlisted OpenAI-shaped host, and `createProviderRegistry`'s pure `'groq:llama-4-maverick'` string lookup).
+- **Feature modules**, one per subpath — `memory*.ts`, `rag*.ts`, `skills*.ts`, `image.ts`, `midjourney.ts`, `yunwu.ts`, `ui.ts`, `chat.ts`, `middleware.ts`, `pricing.ts`, `mcp/`, `observe.ts`, `testing.ts`, `durable.ts`, `autonomy.ts` (which re-exports `plan.ts` and `verify.ts`), `runtime.ts`, `workspace.ts`, `compute.ts`, `browser.ts`, and 1.9's `agent.ts` + `otel.ts`.
+- **Modules with no subpath of their own** — easy to miss when you grep for a file and find no `exports` entry. `tool.ts` (`tool()`) and `parts.ts` (`filePart()`/`imagePart()`) ship from the root `.`; `chat-request.ts` (`validateChatRequest`/`parseDeuzChatRequest`) from `./chat` *and* `./edge`; `verify.ts` (`createVerifier`) from `./autonomy`; `server-tools.ts` from `.` and `./edge`. New subpaths in 1.9: `./agent` (`src/agent.ts`), `./otel` (`src/otel.ts`), `./vertex/node` (`src/node/vertex-auth.ts`).
+- `packages/core/package.json` `exports` is the **authority** on the surface — currently 46 keys (the root `.`, 44 deep subpaths, and `./package.json`), all 46 locked by name in `tooling/api-contract.json`. Count from the file, never from a prose list like the one above.
 
 ### Model dispatch & the registry
 
@@ -129,11 +165,15 @@ Adapters accumulate tool-call argument fragments as **strings**, parsing JSON on
 - **UI wire** (`ui.ts`): `toDeuzStreamResponse` (server, canonical → versioned SSE) + `readDeuzStream` (client). This is *our* wire, not a provider's.
 - **Middleware** (`middleware.ts`): `wrapModel(model, [...])` with `transformParams`/`wrapGenerate`/`wrapStream`; bundled `logging`/`simpleCache`/`redactPII`/`promptInjectionGuard`. Array order: first element is outermost.
 - **Observation** (1.6): `deps.observer` receives the versioned `ObserveEvent` protocol (`src/types/observe.ts`). The runtime (`internal/observe-runtime.ts`) owns ids/sequence/sampling/redaction/limits/terminal-guard; loops thread context to inner `runStream` calls via `InternalRunOptions.observe` (an inner call NEVER opens a second run) and to sub-agents via a symbol on the per-call ctx.deps clone. Fast path: no observer + noop tracer → `createObservationRuntime` returns `undefined`, zero event objects, zero extra `generateId()` draws (scripted-id fixtures depend on this). The tracer bridge (`internal/tracer-bridge.ts`) is the SINGLE span source — never open spans directly in orchestration code. Built-in observers: `src/observe.ts` (edge) + `src/node/observe.ts` (JSONL). Content capture is opt-in and always passes `redactForObservation` (a `[REDACTED]` profile ADDED to redact.ts — `maskSecret`'s last-4 output is pinned by P0 tests, never change it).
+- **Agents as values** (1.9, `agent.ts` → `./agent`): `createAgent(def)` returns a **frozen plain object of closures** in the `createClient` idiom — no class, no `new`, no prototype, no new runtime. Every method is a one-line forward to the same free function, so `streamChat`/`streamObject` stay synchronous (G2). The def is copied before freezing (the caller's object stays mutable, and `Object.freeze` is shallow); `.with(overrides)` returns a *new* frozen agent; `.asTool()` delegates to the existing `inference/agent-tool.ts`, which stays the single implementation of sub-agent delegation. `generateObject`/`streamObject` inherit the free functions' loop-option refusal — an agentic def fails there by design, and an explicitly-`undefined` per-call value is how you unset a def field.
+- **OTel bridge** (1.9, `otel.ts` → `./otel`): `createOtelTracer()` fills the existing `deps.tracer` seam (`internal/tracer-bridge.ts` remains the SINGLE span source — this adds no new span site) and `createOtelObserver()` fills `deps.observer`. `@opentelemetry/api` is a lazy optional peer; `otelReady(target)` awaits that import when a test needs to observe the first span.
+- **Vertex auth** (`vertex.ts` edge-safe; `node/vertex-auth.ts` → `./vertex/node`, 1.9): both only *return* a `KeyProvider`, i.e. the top link of the G1 chain that `internal/resolve-call.ts` owns. `createAdcKeyProvider()` is the one documented env-var/filesystem exception in the whole package — ADC is *defined* in terms of `GOOGLE_APPLICATION_CREDENTIALS` and the metadata server — and it reaches Node built-ins through a lazy `await import` so the browser bundle never resolves them.
+- **Request validation** (1.9, `chat-request.ts` → `./chat` + `./edge`): `validateChatRequest`/`parseDeuzChatRequest` gate an attacker-controlled POST body before it reaches the loop — client-injected `system` turns, forged `tool_result`/assistant turns, and message/byte floods. Pure (no clock, no randomness, no `console`) and it **never repairs**: every failure is a rejection with `issues`, because a silently cleaned array hides the attack.
 - **Secret redaction** (`internal/redact.ts`): masks `Authorization`/`x-api-key`/`x-goog-api-key` headers and `sk-`/`sk-ant-`/`AIza`/`Bearer` token patterns (last 4 chars only). This is a **P0 regression-tested invariant** — keys must never appear in any log/error/span. `DeuzError` carries no raw request body/headers by default.
 
 ## Testing
 
-Tests use **golden-replay**: inject `deps.fetch` (helpers in `test/fixtures/sse.ts`: `sseResponse`, `sseEvents`, `mockFetch`, `mockFetchSequence`) to return a deterministic SSE `ReadableStream` — no real network, no MSW interception needed for most cases (MSW is available as a devDep). Tool-loop tests use a deterministic mock model (no LLM). There is one test file per module under `test/` (~26 `*.test.ts`) plus `test/surface.test-d.ts` (the type-contract lock, run via `npm run test:types`, *not* in the default `npm test`).
+Tests use **golden-replay**: inject `deps.fetch` (helpers in `test/fixtures/sse.ts`: `sseResponse`, `sseEvents`, `mockFetch`, `mockFetchSequence` — that file is a thin re-export of `src/testing.ts`, so the same helpers ship publicly on the `./testing` subpath) to return a deterministic SSE `ReadableStream` — no real network, no MSW interception needed for most cases (MSW is available as a devDep). Tool-loop tests use a deterministic mock model (no LLM). The shape is roughly one `*.test.ts` per module under `test/`, so the file count tracks the module count — read it off the directory rather than trusting a number written here. Beside them sit the **type-level locks**, `test/surface.test-d.ts` and `test/observe-surface.test-d.ts`: `vitest.config.ts` sets `typecheck.enabled: false`, so they run only via `npm run test:types` and are *not* in the default `npm test`.
 
 `vitest.config.ts` runs in the `node` environment (undici provides `fetch`/Web Streams). **Never combine `vi.useFakeTimers()` with MSW** — v2's microtask queue breaks. `tsconfig.json` is strict with `moduleResolution: "Bundler"`, `verbatimModuleSyntax`, and `noUncheckedIndexedAccess` — expect `!`/explicit guards on indexed access.
 

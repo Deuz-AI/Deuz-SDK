@@ -22,7 +22,7 @@ const result = await generateObject<T>(options);
 
 ## Options
 
-`GenerateObjectOptions<T>` extends `CommonCallOptions` (same `model`, `messages`, `signal`, `temperature`, `maxOutputTokens`, `effort`, `headers`, `deps`, etc. as the rest of the core surface), and adds:
+`GenerateObjectOptions<T>` extends `CommonCallOptions` (same `model`, `messages`, `prompt`, `instructions`, `signal`, `timeout`, `capabilities`, `temperature`, `maxOutputTokens`, `effort`, `headers`, `deps`, etc. as the rest of the core surface), and adds:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -205,8 +205,32 @@ const { object } = await generateObject({
 });
 ```
 
+## Loop options are refused
+
+Structured output is single-turn: `generateObject` and `streamObject` do **not** run the agentic loop. Passing loop options to them used to be accepted and then **ignored**, so `generateObject({ tools, maxSteps: 10 })` ran one plain turn and returned an object with no tools ever called, no error and no warning.
+
+Those calls now **fail fast**, before any network request, with an `InvalidRequestError` that names every offending option and says what to do instead. `generateObject` rejects; `streamObject` reports it through its existing never-throw shape (the stream and the `object` / `usage` / `finishReason` promises all reject).
+
+Detected: `tools`, `toolChoice`, `maxSteps`, `stopWhen`, `budget`, `maxToolConcurrency`, `onStepFinish`, `prepareStep`, `activeTools`, `verifyStep`, `maxVerifyAttempts`, `compaction`, `approveToolCall`, `approvalResponses`, `session`, `chat`, `memory`, `fallbackModels`, `approvalSigner`, `approvalMaxAgeMs`.
+
+There are **no false positives by construction** — an option counts only when it carries a real value. Empty collections (`stopWhen: []`, `activeTools: []`, `tools: {}`) and `maxSteps: 1` (which *is* single-turn behaviour) pass the guard, so wrappers that always spread a full options bag keep working. No public type changed; this is a runtime check.
+
+Options that are genuinely honoured are unaffected: `signal`, `maxRetries`, `timeout`, `capabilities`, `headers`, `deps`, `onUsage`, `onFinish`, `temperature`, `maxOutputTokens`, `topP`, `stopSequences`, `effort`, `responseFormat`, `providerOptions`, `promptCaching`, `agentPath`.
+
+```ts
+// Before 1.9: silently single-turn. Now: InvalidRequestError before any request.
+await generateObject({ model, prompt, schema, tools, maxSteps: 10 }); // ✗
+
+// Extract with tools by running the loop first, then structuring the result:
+const { text } = await generateText({ model, prompt, tools, maxSteps: 10 });
+const { object } = await generateObject({ model, schema, prompt: `Structure this:\n${text}` });
+```
+
+If you use [`createAgent`](/docs/agents/create-agent) with an agentic def, `agent.generateObject(...)` hits this guard by design — unset the loop fields per call (`{ tools: undefined, maxSteps: undefined }`) or once via `agent.with(...)`.
+
 ## Notes
 
 - API keys are read from `process.env` at the application layer and passed into the provider factory. The SDK core never reads environment variables itself.
+- `schema: z.object(...)` **now typechecks.** Before 1.9 a real zod schema was not structurally assignable to core's inlined `StandardSchemaV1`, because `StandardSchemaIssue.path` was typed `ReadonlyArray<PropertyKey>` while Standard Schema (and zod ≥ 3.24, and valibot) also allow an object segment `{ key: PropertyKey }`. That is fixed as a type-only widening — nothing in core reads `path`.
 - Reasoning controls (`effort`) and sampling params from `CommonCallOptions` apply here too. On Anthropic, extended thinking forces json mode over a `tool` strategy — either when `effort` is set to something other than `'none'`, or unconditionally on adaptive-thinking flagship models (`effortWire: 'output_config'`, e.g. `claude-opus-4-8`) whose thinking can't be turned off (see the G3 rule above).
 - For streaming free-form text see [streamChat](/docs/core/stream-chat); for tool-using agentic loops see [generateText](/docs/core/generate-text).

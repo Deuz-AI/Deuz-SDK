@@ -1,0 +1,18 @@
+{
+  "name": "@deuz-examples/04-structured-output",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "generateObject and streamObject against one zod schema.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "*",
+    "@standard-community/standard-json": "^0.2.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

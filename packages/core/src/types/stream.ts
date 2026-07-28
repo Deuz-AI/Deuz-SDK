@@ -1,5 +1,6 @@
 import type { Usage, FinishReason } from './usage';
 import type { CompactionLayer } from './config';
+import type { CallWarning } from './methods';
 
 /**
  * Canonical streaming delta. Open discriminated union — consumers should keep a
@@ -194,6 +195,28 @@ export interface VerifyPart {
   feedback?: string;
 }
 
+/**
+ * The false-finish guard rejected a natural completion (1.9 additive, N2):
+ * `doneWhen` reported that the work is not actually done. ONE part per
+ * REJECTION, always before the terminal `finish`. `willRetry` is true when the
+ * loop re-drives with a "keep working" turn; the rejection that spends the last
+ * of `falseFinishGuard` carries `willRetry: false`, and the run's `finish` then
+ * reports `providerMetadata.deuz.stoppedBy = 'false-finish'`.
+ *
+ * Adding it to `StreamPart` is legal precisely because the union is documented
+ * as OPEN (see the header of this file): consumers are required to keep a
+ * `default` case, so a new member cannot break an exhaustive switch.
+ */
+export interface FalseFinishPart {
+  type: 'false-finish';
+  /** Index of the step whose completion was rejected. */
+  stepIndex: number;
+  /** Re-drives already spent when this rejection was raised (0 on the first). */
+  attempt: number;
+  /** True when the loop re-drives; false when the guard's budget is spent. */
+  willRetry: boolean;
+}
+
 /** One task in a plan snapshot (structural — mirrors `Task` in `./plan`). */
 export interface PlanTaskSnapshot {
   id: string;
@@ -248,6 +271,32 @@ export interface ToolStatePart {
   toolCallId: string;
   toolName?: string;
   state: ToolRunState;
+  /**
+   * Set together with `state: 'error'` when the terminal cause was an APPROVAL
+   * DENIAL, not a thrown tool (1.9 additive). Without it a denied call renders
+   * as "getWeather failed" — the wrong last frame for the approval flow, which
+   * is one of this SDK's strongest features. `ToolRunState` deliberately does
+   * NOT gain a 7th member: it is a root export pinned in the api contract, and
+   * a new member would break any consumer with an exhaustive switch.
+   */
+  denied?: boolean;
+  deniedReason?: string;
+}
+
+/**
+ * A non-fatal execution notice, emitted live as it is discovered (1.9 additive)
+ * — a dropped sampling param, a clamped `maxOutputTokens`, an unknown slug on
+ * the fallback capability row. Purely informational: it NEVER ends the stream
+ * (that is `error`) and it never replaces a delta. The same set resolves in
+ * bulk on `StreamChatResult.warnings`.
+ *
+ * Adding it to `StreamPart` is legal precisely because the union is documented
+ * as OPEN (see the header of this file): consumers are required to keep a
+ * `default` case, so a new member cannot break an exhaustive switch.
+ */
+export interface WarningPart {
+  type: 'warning';
+  warning: CallWarning;
 }
 
 export type StreamPart =
@@ -270,5 +319,7 @@ export type StreamPart =
   | CostPart
   | BudgetExceededPart
   | VerifyPart
+  | FalseFinishPart
   | PlanUpdatePart
-  | ActivityPart;
+  | ActivityPart
+  | WarningPart;

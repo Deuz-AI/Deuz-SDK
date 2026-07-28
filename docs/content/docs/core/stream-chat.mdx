@@ -36,9 +36,14 @@ function streamChat(options: StreamChatOptions): StreamChatResult;
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `model` | `LanguageModel` | — | Required. A descriptor from a provider factory, e.g. `createAnthropic(...)('claude-opus-4-8')`. |
-| `messages` | `Message[]` | — | Required. Canonical messages. A system prompt is a message with `role: 'system'` (there is no separate `system` option). |
+| `messages` | `Message[]` | — | Canonical messages. Required unless you pass `prompt` instead — the two are mutually exclusive. |
+| `prompt` | `string` | — | 1.9. Shorthand for exactly one user turn. See [Prompts](/docs/core/prompts-and-timeouts). |
+| `instructions` | `string` | — | 1.9. The system prompt, placed first; a `system` message already in `messages` is preserved after it. |
 | `signal` | `AbortSignal` | — | Cancellation, propagated to the underlying fetch. See [Abort](#abort). |
+| `abortSignal` | `AbortSignal` | — | 1.9, **deprecated** alias for `signal` (migration ergonomics). `signal` wins if both are set. |
 | `maxRetries` | `number` | `2` | Pre-first-byte retry budget. See [Retries](#retries). |
+| `timeout` | `number \| { ttftMs?, totalMs?, stepMs?, toolMs? }` | ttft 60s / total 300s | 1.9. A bare number is `{ totalMs }`; an explicit `0` disables a layer. See [Timeouts](/docs/core/prompts-and-timeouts#timeout). |
+| `capabilities` | `Partial<ModelCapabilities>` | — | 1.9. Shallow-merged over the model's registry row. See [capabilities](/docs/core/prompts-and-timeouts#capabilities). |
 | `headers` | `Record<string, string>` | — | Extra request headers, merged into the wire request. |
 | `deps` | `Dependencies` | in-memory defaults | Per-call infrastructure seam (`fetch`, `clock`, `logger`, `generateId`, …). |
 | `onUsage` | `(usage: Usage, meta: UsageMeta) => void` | — | Fired once with final usage. `meta.reason` is `'finished'`, `'aborted'`, or `'error'`; `meta.ttftMs` is time-to-first-token. |
@@ -70,6 +75,11 @@ interface StreamChatResult {
   fullStream: AsyncIterable<StreamPart>;
   usage: Promise<Usage>;
   finishReason: Promise<FinishReason>;
+  /** 1.9 — drain the stream so terminal effects run. Optional; see below. */
+  consume?: (options?: { onError?: (error: unknown) => void }) => Promise<void>;
+  /** 1.9 — non-fatal notices. Settles with `usage`; never rejects. See below. */
+  warnings?: Promise<CallWarning[]>;
+  // plus the pre-existing optional fields: runId, observation, memory, response, …
 }
 ```
 
@@ -77,6 +87,58 @@ interface StreamChatResult {
 - **`fullStream`** — the full canonical delta stream of `StreamPart`. Errors surface as an `error` part, not a throw.
 - **`usage`** — resolves once with the final `Usage` breakdown (input / output / reasoning / cache tokens).
 - **`finishReason`** — resolves with `'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error' | 'aborted'`.
+
+### `warnings`
+
+Deuz never throws on something it can degrade: an unknown slug falls back to a conservative capability row, a sampling parameter a reasoning model rejects is stripped, a tool a wire cannot carry is removed. Every one of those decisions used to go only to `deps.logger.warn` — and the **default logger is a no-op**, so by default it went nowhere. `warnings` is the readable channel for them.
+
+```ts title="warnings.ts"
+const result = streamChat({ model, prompt: 'summarise this', temperature: 0.7 });
+
+// Live, as each notice is discovered:
+for await (const part of result.fullStream) {
+  if (part.type === 'warning') {
+    console.warn(part.warning.type, part.warning.setting, part.warning.message);
+  }
+}
+
+// The same set in bulk:
+for (const w of (await result.warnings) ?? []) console.warn(w.type, w.message);
+```
+
+- **`warnings` settles with `usage` / `finishReason` and never rejects.** A failed run resolves with whatever was collected before the failure; a clean run resolves `[]`. Reading it starts the lazy pump, exactly like `usage`.
+- **The parts come first.** Every warning site runs during capability resolution and request building — before the first byte — so `warning` parts land ahead of the model's own output.
+- **Deduped per call**, by `(type, setting, message)`, so one cause is one notice even across a multi-step loop. Capped at 50, with a trailing `N further warning(s) omitted` entry rather than a silent truncation.
+- **Still exactly one log line each.** Nothing double-logs, so a workflow that parses `deps.logger.warn` output is unchanged.
+- A `CallWarning` never contains secrets, and the message is passed through the redactor again on its way to the UI wire.
+
+`CallWarning.type` is `'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other'`. Treat it as an **open** union — `'other'` is the escape hatch — rather than switching exhaustively. The producers that exist today, and the ones that do not, are listed in [What is new in 1.9](/docs/reference/whats-new-1-9#the-wiring-pass).
+
+<Callout type="warn" title="Three readouts are still empty">
+`GenerateTextResult.warnings`, `GenerateObjectResult.warnings` and `StreamObjectResult.warnings` are **not** populated — the notices are produced and logged on those paths but never reach the result object. And a `streamChat` that routes through the loop (`tools`, `chat`, `memory`, `verifyStep`, `doneWhen`) reports only its own `activeTools` notices; a model-level warning raised inside a step stays in the log. See [Declared but inert](/docs/reference/whats-new-1-9#declared-but-inert).
+</Callout>
+
+## `consume()`
+
+The pump is lazy, which is deliberate — but it means a caller who never iterates gets **nothing**: no chat persistence, no durable checkpoint, no `onFinish`, no memory extraction. Returning the response and walking away silently dropped all of it. That is the classic serverless shape: the client disconnects, and nothing is left pulling the stream.
+
+```ts title="consume.ts"
+const res = streamChat({ model, prompt, chat: { store, chatId, scope } });
+const response = toDeuzStreamResponse(res);
+ctx.waitUntil(res.consume?.()); // drain so persistence / onFinish actually run
+return response;
+```
+
+- It takes its **own subscription**, so `consume()` and a normal `fullStream` iteration both see every part.
+- It awaits the **post-terminal bookkeeping** rather than resolving mid-write.
+- It is **memoized** (safe to call twice; terminal effects fire once) and **never rejects** — failures go to `consume({ onError })` and remain on `fullStream` as an `error` part.
+- Reading `result.consume` does **not** start the pump; it is a plain method, not a getter.
+
+<Callout type="warn" title="Optional on the type for a reason">
+Two paths do not provide it yet: `streamChat({ fallbackModels })` and the `withFallback` middleware return `consume: undefined`, where `res.consume?.()` is a silent no-op. Write `res.consume?.()`, not `res.consume!()`.
+</Callout>
+
+`StreamObjectResult.consume` has the identical contract.
 
 ### StreamPart types
 
@@ -97,6 +159,15 @@ interface StreamChatResult {
 | `tool-approval-request` | `{ approvalId, toolCallId, toolName, input }` | A tool call awaiting client-mode approval (`needsApproval` triggered, no `approveToolCall` supplied); the loop breaks after emitting these — resume via `approvalResponses`. |
 | `compaction` | `{ layer, tokensBefore, tokensAfter }` | Automatic context compaction ran before a step; token counts are estimates. Only when `compaction` is enabled in the agentic loop. |
 | `sub-agent` | `{ agentPath, part }` | A sub-agent's (`agentTool`) own canonical part forwarded live into the parent stream. |
+| `tool-state` | `{ toolCallId, toolName?, state, denied?, deniedReason? }` | Tool lifecycle transition. `denied: true` (1.9) qualifies a terminal `state: 'error'` whose cause was an approval **refusal** rather than a thrown tool; `deniedReason` is the denier's own words when there are any. Set by the streaming loop — see [approval denial](/docs/reference/whats-new-1-9#tool-approval-denial). |
+| `data` | `{ name, id?, payload }` | App-defined typed data. |
+| `citation` | `{ id, sourceId?, url?, title?, snippet?, chunkIndex?, score? }` | RAG provenance for a retrieved chunk. |
+| `cost` | `{ costUsd, deltaUsd?, cacheSavingsUsd?, stepIndex? }` | Live cumulative USD cost (needs `deps.priceProvider`). |
+| `budget-exceeded` | `{ kind, limit, value }` | The `budget` guardrail tripped; precedes the terminal `finish`. |
+| `verify` | `{ stepIndex, attempt, ok, willRetry, feedback? }` | A `verifyStep` verdict. |
+| `plan-update` / `activity` | see [Autonomy](/docs/modules/autonomy) | Live plan snapshot / "Computer" feed line. |
+| `false-finish` | `{ stepIndex, attempt, willRetry }` | 1.9. The `doneWhen` guard rejected a natural completion — one part per rejection, always before the terminal `finish`. `willRetry: false` is the rejection that spent the `falseFinishGuard` budget. Streaming loop only. |
+| `warning` | `{ warning: CallWarning }` | 1.9. A non-fatal execution notice, emitted as it is discovered — see [`warnings`](#warnings). Purely informational: it never ends the stream and never replaces a delta. |
 
 `step-*`, `tool-call`, `tool-result`, and `tool-approval-request` only appear when `tools` are provided.
 
@@ -192,7 +263,9 @@ console.log(await result.finishReason); // 'aborted'
 console.log(await result.usage); // partial usage
 ```
 
-A timeout, by contrast, is a failure: it surfaces a `TimeoutError` (not `'aborted'`). Two timers guard every request — time-to-first-token (~60s, cleared when the first content delta arrives) and a total ceiling (~300s).
+`abortSignal` is accepted as a deprecated alias since 1.9, for AI SDK migrations; `signal` wins if both are set.
+
+A timeout, by contrast, is a **failure**: it surfaces a `TimeoutError`, never `'aborted'`. Two timers guard every model call by default — time-to-first-token (60s, cleared when the first content delta arrives) and a total ceiling (300s) — and since 1.9 all four layers are settable per call with [`timeout`](/docs/core/prompts-and-timeouts#timeout).
 
 ## Retries
 
@@ -231,6 +304,7 @@ Note: each branch buffers independently, so a branch you never drain holds its q
 ## Related
 
 - [generateText](/docs/core/generate-text) — buffered, non-streaming variant.
+- [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts) — the 1.9 call-shape options in full.
 - [generateObject](/docs/core/generate-object) — schema-validated structured output.
 - [Tool Loop](/docs/agents/tool-loop) — the agentic loop enabled by `tools`.
 - [Dependencies & Clients](/docs/core/dependencies) — `createClient` pre-binds shared `deps`, keys, and base URLs.

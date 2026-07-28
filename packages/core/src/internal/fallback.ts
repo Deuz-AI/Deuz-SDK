@@ -11,6 +11,7 @@
  */
 import type { LanguageModel } from '../types/model';
 import type {
+  CallWarning,
   GenerateTextOptions,
   GenerateTextResult,
   StreamChatOptions,
@@ -18,9 +19,10 @@ import type {
 } from '../types/methods';
 import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
+import type { Dependencies } from '../types/deps';
 import type { MemoryMutation } from '../memory';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from './async-iter';
-import { resolveDependencies } from './resolve-deps';
+import { resolveDependencies, noopTracer } from './resolve-deps';
 import { APICallError, BreakerOpenError, NetworkError, TimeoutError } from '../errors';
 
 export interface FallbackHooks {
@@ -35,7 +37,12 @@ export interface FallbackHooks {
 
 export function defaultShouldFallback(error: unknown): boolean {
   if (error instanceof BreakerOpenError) return true;
-  if (error instanceof TimeoutError || error instanceof NetworkError) return true;
+  // A `step` / `tool` deadline (1.9) is a CALLER-IMPOSED BUDGET, not a provider
+  // failure: hopping to another model cannot make the budget fit, and re-running
+  // the loop would repeat the side effects of tools that already executed. Only
+  // the transport-level layers ('connect'/'ttft'/'total') justify a fail-over.
+  if (error instanceof TimeoutError) return error.layer !== 'step' && error.layer !== 'tool';
+  if (error instanceof NetworkError) return true;
   if (error instanceof APICallError) {
     return error.isRetryable || (error.statusCode !== undefined && error.statusCode >= 500);
   }
@@ -91,6 +98,25 @@ export async function runGenerateWithFallback(
   throw lastError;
 }
 
+/**
+ * Would an inner call build an observation runtime? `StreamChatResult.observation`
+ * is documented as present ONLY when an observer (or a real tracer) is active, and
+ * a shell that builds its own result has to decide that SYNCHRONOUSLY — before any
+ * inner result exists. So this mirrors `createObservationRuntime`'s activation rule
+ * (`internal/observe-runtime.ts`): an enabled observer OR an injected non-noop
+ * tracer. `noopTracer` is exported for exactly this identity check.
+ *
+ * It lives in this leaf module because BOTH shells need it (`runStreamWithFallback`
+ * below and `deferStream` in `src/middleware.ts`, which imports it from here) and
+ * because this module deliberately imports no orchestrator — duplicating the rule
+ * is how the two shells would drift apart.
+ */
+export function observationActive(deps: Dependencies | undefined): boolean {
+  if (!deps) return false;
+  if (deps.observer !== undefined && deps.observer.options?.enabled !== false) return true;
+  return deps.tracer !== undefined && deps.tracer !== noopTracer;
+}
+
 /** Parts that count as FIRST CONTENT — after one of these, errors are final. */
 function isContentPart(part: StreamPart): boolean {
   return (
@@ -107,6 +133,11 @@ function isContentPart(part: StreamPart): boolean {
  * an `error` part) hops to the next candidate, the failed attempt's promises
  * are silenced, and the winner's parts flow through with a
  * `providerMetadata.deuz.failedOver` marker on the terminal finish.
+ *
+ * The shell forwards the WHOLE `StreamChatResult` shape (1.9): `runId` and
+ * `memory` as before, plus `warnings`, `observation` and `consume()` — see the
+ * comments at each site for why a shell has to decide some of them from the CALL
+ * rather than from the (not yet existing) inner result.
  */
 export function runStreamWithFallback(
   run: (options: StreamChatOptions) => StreamChatResult,
@@ -131,12 +162,46 @@ export function runStreamWithFallback(
     callOptions.memory && callOptions.memory.extract !== false
       ? createDeferred<MemoryMutation[]>()
       : undefined;
+  // 1.9: the shell used to build a PARTIAL StreamChatResult — no `warnings`, no
+  // `observation`, no `consume()` — so enabling fail-over silently dropped all
+  // three. `warnings` and `consume` are unconditional (they forward the winner's,
+  // exactly like `deferStream` in src/middleware.ts); `observation` keeps its
+  // documented conditional presence, decided from the call's deps.
+  const warningsDeferred = createDeferred<CallWarning[]>();
+  const observationDeferred = createDeferred<void>();
+  const observationHandle = observationActive(callOptions.deps)
+    ? { settled: observationDeferred.promise }
+    : undefined;
+  /** Every attempt's observation settlement — a failed hop still emitted events. */
+  const settlements: Promise<void>[] = [];
+  /** The attempt whose parts flow through, once one produced content. */
+  let winner: StreamChatResult | undefined;
 
   let started = false;
+  /**
+   * 1.9 (consume): the pump promise, so a drain can await the POST-terminal
+   * bookkeeping instead of just the last part.
+   */
+  let pumpDone: Promise<void> | undefined;
   const ensureStarted = (): void => {
     if (started) return;
     started = true;
-    void pump();
+    pumpDone = pump()
+      // pump() catches everything internally; belt-and-braces so awaiting this in
+      // consume() can never reject (G2 never-throw).
+      .catch(() => {})
+      .finally(() => {
+        void (async () => {
+          try {
+            warningsDeferred.resolve(await (winner?.warnings ?? []));
+          } catch {
+            // `warnings` never rejects by contract — resolve empty regardless.
+            warningsDeferred.resolve([]);
+          }
+          await Promise.allSettled(settlements);
+          observationDeferred.resolve();
+        })();
+      });
   };
 
   async function pump(): Promise<void> {
@@ -179,6 +244,14 @@ export function runStreamWithFallback(
           }
         }
 
+        // Collect this attempt's observation settlement HERE, not at construction:
+        // the streaming loop assigns its handle inside the pump (after the
+        // checkpoint/chat-store awaits), so a read before the first part would
+        // still see `undefined`. By now the attempt has produced a part, ended, or
+        // failed, so its handle exists if observation is on at all.
+        const settled = attempt.observation?.settled;
+        if (settled) settlements.push(settled);
+
         if (sawFailure && !content) {
           // Pre-first-content failure — this attempt may fail over.
           attempt.usage.catch(() => {});
@@ -201,6 +274,7 @@ export function runStreamWithFallback(
 
         // WINNER: re-emit the buffer, then pipe the rest through (patching the
         // terminal finish with the failedOver marker when we hopped).
+        winner = attempt;
         const failedOver = i > 0 ? failedOverOf(candidates[0]!, model, lastError) : undefined;
         const patch = (part: StreamPart): StreamPart => {
           if (!failedOver || part.type !== 'finish') return part;
@@ -269,6 +343,79 @@ export function runStreamWithFallback(
   const fullStream = lazyAsyncIterable<StreamPart>(() => fullSub, ensureStarted);
   const textStream = lazyAsyncIterable<string>(() => projectText(textSub), ensureStarted);
 
+  /**
+   * `consume()` (1.9) — the fail-over twin of the drains in `core/inference.ts`
+   * and `inference/stream-tool-loop.ts`. Sprint 2 shipped `consume()` on the
+   * normal paths only, so `streamChat({ fallbackModels })` and the `withFallback`
+   * middleware returned `undefined` here and `res.consume?.()` was a silent no-op
+   * on exactly the shape it exists for (chat persistence / durable checkpoints /
+   * `onFinish` / memory extraction never ran when nobody iterated).
+   *
+   * Drains through its OWN broadcaster subscription, so consume() plus a normal
+   * iteration both see every part; awaits the shell's pump AND the winning
+   * attempt's own memoized drain (an agentic loop persists chat and saves its
+   * last checkpoint AFTER its stream closed, so stopping at the last part would
+   * return too early). Memoized — a second call awaits the SAME drain, so
+   * terminal effects can never fire twice. NEVER rejects: a failure is reported
+   * through `onError` and stays on `fullStream` as the `error` part.
+   */
+  let drain: Promise<{ error: unknown } | undefined> | undefined;
+  function consume(consumeOptions?: { onError?: (error: unknown) => void }): Promise<void> {
+    drain ??= (async () => {
+      // Subscribe BEFORE the lazy start, exactly like fullSub/textSub — a
+      // subscription taken after the broadcaster closed sees nothing at all,
+      // hence the `usage` fallback below for a late consume().
+      const sub = broadcaster.subscribe();
+      ensureStarted();
+      let failure: { error: unknown } | undefined;
+      try {
+        for await (const part of sub) {
+          // A mid-stream failure is an error PART here (the pump closes the
+          // broadcaster, it never fails it) — never a thrown iteration.
+          if (part.type === 'error') failure ??= { error: part.error };
+        }
+      } catch (err) {
+        failure ??= { error: err };
+      }
+      try {
+        await pumpDone;
+      } catch {
+        // unreachable (pump never rejects) — the contract holds regardless
+      }
+      try {
+        // The winner owns its own post-terminal bookkeeping; hand off to its
+        // memoized drain rather than re-implementing it. A hopped-away attempt is
+        // abandoned by design (its promises were silenced) and is not drained.
+        await winner?.consume?.();
+      } catch {
+        // consume() never rejects either — defensive
+      }
+      if (memoryDeferred) {
+        try {
+          await memoryDeferred.promise;
+        } catch {
+          /* never rejects — defensive */
+        }
+      }
+      if (!failure) {
+        try {
+          await usageDeferred.promise;
+        } catch (err) {
+          failure = { error: err };
+        }
+      }
+      return failure;
+    })();
+    return drain.then((failure) => {
+      if (!failure) return;
+      try {
+        consumeOptions?.onError?.(failure.error);
+      } catch {
+        // an onError that throws must not break the never-reject contract
+      }
+    });
+  }
+
   return {
     get textStream() {
       return textStream;
@@ -284,11 +431,23 @@ export function runStreamWithFallback(
       ensureStarted();
       return finishDeferred.promise;
     },
+    get warnings() {
+      ensureStarted();
+      return warningsDeferred.promise;
+    },
     get memory() {
       if (!memoryDeferred) return undefined;
       ensureStarted();
       return memoryDeferred.promise;
     },
+    get observation() {
+      if (!observationHandle) return undefined;
+      ensureStarted();
+      return observationHandle;
+    },
+    // A plain method, never a getter: reading `result.consume` must NOT start the
+    // pump (G2 lazy start).
+    consume,
     ...(runId !== undefined ? { runId } : {}),
   };
 }

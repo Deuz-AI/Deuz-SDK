@@ -131,6 +131,8 @@ for await (const part of result.fullStream) {
 
 Pass `subAgentStream: 'none'` on the definition to run a sub-agent silently even from a streaming parent — the parent still gets the final text as a normal `tool-result`, it just skips forwarding the internals.
 
+`sub-agent` parts also cross the [Deuz UI wire](/docs/modules/ui-streaming) and, since 1.9, `applyUIPart` folds each one into `turn.subAgents` (one frame per `agentPath`, each carrying the child's own full `AssistantTurnState`) — so a delegated run is renderable in a `useChat` UI without reading the wire by hand. See [rendering a sub-agent run](/docs/modules/react-hooks#rendering-a-sub-agent-run).
+
 ## Approval inheritance
 
 The parent's server-mode `approveToolCall` is inherited to **every** nesting depth — a sub-agent's own tool calls stay gated by the exact same policy the parent uses, with no extra wiring:

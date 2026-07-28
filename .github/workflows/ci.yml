@@ -13,23 +13,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  quality:
-    name: Quality and API types
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version-file: .node-version
-          cache: npm
-      - run: npm ci
-      - run: npm run format:check
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm run test:types
-
-  runtime:
-    name: Runtime (${{ matrix.os }}, Node ${{ matrix.node }})
+  check:
+    # `npm run check` is the full gate: format:check + verify:docs-refs + lint
+    # + typecheck + test + test:types + build + verify:package + verify:runtime
+    # + verify:size + verify:api. It is the same gate release:verify (and
+    # therefore release.yml) runs, so this job needs no extra steps: anything
+    # added to the root `check` script is picked up here automatically.
+    #
+    # verify:docs-refs (packages/core/tooling/verify-docs.mjs) is the cheap
+    # static lint over docs/ + skills/ + README.md — leaked tool-call debris,
+    # hallucinated @deuz-sdk imports, dead /docs/ links, meta.json drift. It
+    # runs early on purpose: it is sub-second and it catches the class of
+    # breakage that used to reach the `docs` job below minutes later.
+    name: Check (${{ matrix.os }}, Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -39,6 +35,9 @@ jobs:
             node: 22
           - os: ubuntu-latest
             node: 24
+          # Windows is a first-class dev platform here: src/node/workspace.ts
+          # (path guards) and src/node/compute.ts (cmd.exe vs bash) have
+          # platform-specific behaviour Linux legs cannot catch.
           - os: windows-latest
             node: 22
     steps:
@@ -48,23 +47,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
-      - run: npm test
-
-  release-gate:
-    name: Packed artifact and runtime gates
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version-file: .node-version
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: npm run verify:package
-      - run: npm run verify:runtime
-      - run: npm run verify:size
-      - run: npm run verify:api
+      - run: npm run check
 
   docs:
     name: Documentation build
@@ -76,7 +59,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: docs/package-lock.json
       - run: npm ci

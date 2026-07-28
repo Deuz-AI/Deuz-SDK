@@ -5,6 +5,7 @@
   "pages": [
     "tools",
     "tool-loop",
+    "create-agent",
     "client-tools",
     "server-tools",
     "subagents",

@@ -1,0 +1,24 @@
+{
+  "name": "@deuz-examples/03-next-chat",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Next.js App Router chat: a toDeuzStreamResponse route + useChat + an approval card.",
+  "scripts": {
+    "dev": "next dev",
+    "build:app": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "*",
+    "@deuz-sdk/react": "*",
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}

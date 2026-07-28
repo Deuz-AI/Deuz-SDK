@@ -1,0 +1,136 @@
+---
+title: Files, PDFs & images
+description: filePart() and imagePart() — attaching binary media to a message, and how each wire carries a document.
+---
+
+The canonical `Part` union has **five** members (`text`, `image`, `tool_use`, `tool_result`, `reasoning`) and no `file` kind — adding a sixth is a breaking change queued for 2.0. Until then `ImagePart` is the carrier for **all** binary media: a PDF is `{ type: 'image', image: bytes, mediaType: 'application/pdf' }`.
+
+That convention is correct but undiscoverable — nobody guesses "attach a PDF as an image". Since 1.9 there are two constructors that turn it into an API, and the convention actually **works on all four wires**.
+
+## `filePart()`
+
+```ts title="pdf.ts"
+import { generateText, filePart } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const bytes = new Uint8Array(await file.arrayBuffer());
+
+const { text } = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  messages: [
+    {
+      role: 'user',
+      content: [
+        filePart({ data: bytes, mediaType: 'application/pdf' }),
+        { type: 'text', text: 'Summarise this.' },
+      ],
+    },
+  ],
+});
+```
+
+```ts
+function filePart(input: { data: string | Uint8Array; mediaType: string }): ImagePart;
+function imagePart(input: { data: string | Uint8Array; mediaType?: string }): ImagePart;
+```
+
+Both are exported from the package root (`@deuz-sdk/core`) and from `@deuz-sdk/core/edge`.
+
+- `data` may be raw bytes, a base64 string, a `data:` URL, or an `https:` URL — passed through on the wires that can fetch one.
+- `mediaType` is **required** on `filePart`: unlike an image there is no sane default, and it is what the adapters classify on.
+- On `imagePart` it is optional — an unlabelled image resolves to `image/jpeg`, or is derived from a `data:` prefix or a URL extension.
+- Put media **first** and the question after it. That is the order every provider's own docs recommend.
+
+When the `file` part kind lands in 2.0 these functions keep their signatures and just return the new part, so callers written today do not change.
+
+## How each wire carries a document
+
+A media part whose `mediaType` is **not** `image/*` is mapped to that wire's document block instead of an image block. Before 1.9 it was sent as an image block, which 400d on three of the four wires.
+
+| Surface | Adapter | Document block |
+| --- | --- | --- |
+| `anthropic` | `anthropicAdapter` | `{ type: 'document', source: … }` (base64 or `url`) |
+| `responses` | `openaiResponsesAdapter` | `{ type: 'input_file', … }` (`file_url` or inline `file_data`) |
+| `chat_completions` | `openaiCompatibleAdapter` | `{ type: 'file', file: { filename, file_data } }` |
+| `native` | `googleNativeAdapter` | `inlineData` / `fileData` |
+
+Ordinary image parts are unchanged, byte for byte, on all four wires.
+
+## Documents are gated on the model's capability row
+
+A model that cannot accept a document no longer receives a bogus block: the part is **dropped** and `deps.logger.warn` names the model and the media type.
+
+The gate is `nativePdf || vision` on the resolved capability row. On Anthropic, OpenAI Responses and Chat Completions document ingestion rides the multimodal path, so a vision-capable row can carry one; a text-only slug would 400.
+
+Consequences worth designing for:
+
+- A message may now carry **fewer blocks than parts**. Check the warning log if a document seems to have been ignored.
+- An **unknown slug** gets the conservative fallback row, which is not vision-capable — so its documents are refused. Fix it with a per-call [`capabilities`](/docs/core/prompts-and-timeouts#capabilities) override.
+- **Chat Completions drops an `https:`-URL document**: that wire has no URL form on its `file` block, and the SDK does not fetch bytes on your behalf. Pass bytes or base64 there.
+- A URL ending `.pdf` now resolves to `application/pdf` instead of the old `image/jpeg` default.
+
+### Reading the drop
+
+The drop always produces a `deps.logger.warn` line, and the **default logger is a no-op** — so wire one if you want to see it at all:
+
+```ts
+deps: { logger: { debug() {}, info() {}, warn: (m, meta) => console.warn(m, meta), error() {} } }
+```
+
+Since 1.9 the same drop can also arrive as a typed `CallWarning` on [`streamChat`'s `warnings`](/docs/core/stream-chat#warnings) and as a `warning` part on `fullStream`:
+
+```ts
+const result = streamChat({ model, messages }); // messages carry a filePart()
+for (const w of (await result.warnings) ?? []) console.warn(w.type, w.message);
+// → 'other'  Dropped a 'application/pdf' document: <reason>, so <provider>/<model>
+//            will answer without it.
+```
+
+It is `type: 'other'` because `CallWarning['type']` has no content-specific member and that union is locked.
+
+<Callout type="warn" title="The typed warning covers one wire and one call shape">
+Only the **Chat Completions** wire threads the warning sink today: on the `anthropic` and `responses` wires a dropped document is still a log line and nothing else. And because a loop-routed call (`tools`, `chat`, `memory`, `verifyStep`, `doneWhen`) does not merge a step's model-level warnings, the typed entry appears on a **tool-less** `streamChat` only. `generateText` never carries it either. See [Declared but inert](/docs/reference/whats-new-1-9#declared-but-inert).
+</Callout>
+
+## From a file picker
+
+`filesToImageParts` (core) and `partsFromFiles` (React) turn picked files into canonical parts using **Web APIs only** — `await blob.arrayBuffer()`, no `FileReader`, no `Buffer` — so they behave identically in a browser and on the edge.
+
+```tsx title="upload.tsx"
+import { partsFromFiles } from '@deuz-sdk/react';
+
+<input
+  type="file"
+  multiple
+  onChange={async (e) => {
+    const parts = await partsFromFiles(e.target.files); // images AND PDFs
+    await sendMessage({ text: 'what is in these?', parts });
+  }}
+/>;
+```
+
+`partsFromFiles` is the null-tolerant wrapper (it accepts a nullable `FileList`); `filesToImageParts` from `@deuz-sdk/core/chat` is the core function it delegates to. Every blob is fully buffered in memory, so cap the size where the user picks them.
+
+## Rendering an attachment back
+
+`uiFromMessages` used to **drop** `ImagePart`s, so a restored turn with an attachment rendered as an empty bubble. Since 1.9 each one becomes a `file` element in the message's ordered [`parts`](/docs/modules/react-hooks#rendering-ordered-parts):
+
+```tsx
+case 'file':
+  return part.url
+    ? <img key={i} src={part.url} alt="" />
+    : <Attachment key={i} mediaType={part.mediaType} data={part.data} />;
+```
+
+`data` is the canonical `ImagePart.image` value **verbatim** (bytes stay bytes) plus a resolved `mediaType`. `url` is set **only** when the data is already a renderable `data:` / `http(s):` src — the reducer will not base64-encode a buffer on a render path. For bytes, build one yourself: `URL.createObjectURL(new Blob([part.data], { type: part.mediaType }))`.
+
+`UIMessage.content` is unchanged: still text only.
+
+## See also
+
+- [Messages & parts](/docs/core/messages) — the canonical `Part` union.
+- [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts) — the rest of the 1.9 call-shape additions.
+- [React hooks](/docs/modules/react-hooks) — `sendMessage({ text, parts })` and ordered-part rendering.
+- [RAG](/docs/modules/rag) — for extracting text from a document yourself instead of sending it to the model.

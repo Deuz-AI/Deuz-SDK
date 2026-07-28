@@ -21,7 +21,16 @@ export interface StandardSchemaProps<Input = unknown, Output = Input> {
 
 export interface StandardSchemaIssue {
   readonly message: string;
-  readonly path?: ReadonlyArray<PropertyKey> | undefined;
+  /**
+   * Standard Schema allows a segment to be a bare key OR an object carrying one
+   * (zod >= 3.24 and valibot emit the latter). Typing this as `PropertyKey` only
+   * made the FAILURE branch of `StandardSchemaResult` incompatible, so no real
+   * zod schema was structurally assignable to {@link StandardSchemaV1} and
+   * `generateObject({ schema: z.object(…) })` did not typecheck at all — the
+   * advertised typed path. Nothing in core reads `path`, so this widening is
+   * type-only. Pinned by `test/surface.test-d.ts`.
+   */
+  readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> | undefined;
 }
 
 export type StandardSchemaResult<Output> =

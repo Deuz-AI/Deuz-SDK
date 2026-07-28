@@ -8,6 +8,24 @@ import type { EmbeddingModel } from './model';
 import type { Dependencies, UsageMeta } from './deps';
 import type { MemoryMutation } from '../memory';
 
+/**
+ * A non-fatal notice about how the call was actually executed (1.9 additive).
+ * Warnings NEVER fail a run — they report the silent degradations that used to
+ * be invisible: a sampling param the wire cannot express, a value clamped to the
+ * model's ceiling, an unknown slug served from the conservative fallback row, a
+ * tool the surface cannot carry.
+ *
+ * `type` is an OPEN string union in spirit — 'other' is the escape hatch, so
+ * treat unknown members defensively rather than switching exhaustively.
+ */
+export interface CallWarning {
+  type: 'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other';
+  /** The option that triggered it, when there is one (e.g. 'topP', 'effort'). */
+  setting?: string;
+  /** Human-readable explanation. Never contains secrets (P0 redaction). */
+  message: string;
+}
+
 // --- streamChat ---
 export type StreamChatOptions = CommonCallOptions;
 
@@ -38,6 +56,38 @@ export interface StreamChatResult {
    * suspension/error). Never rejects. Await it on serverless runtimes.
    */
   memory?: Promise<MemoryMutation[]>;
+  /**
+   * Non-fatal execution notices (1.9 additive). Resolves together with `usage`
+   * and `finishReason` — the full set is only known once the run is over. Never
+   * rejects; a failed run resolves with whatever was collected. See
+   * {@link CallWarning}. Live warnings also arrive on `fullStream` as a
+   * `warning` part.
+   */
+  warnings?: Promise<CallWarning[]>;
+  /**
+   * Drain the stream to completion, discarding output (1.9 additive).
+   *
+   * Why this exists (G2): the pump is LAZY — it starts on first access of an
+   * output and only advances while someone pulls. When NOBODY iterates (the
+   * classic case: a client disconnects from a serverless handler, or the result
+   * object is returned and never read), the run never reaches its terminal
+   * boundary, so chat persistence, durable checkpoints, `onFinish` and memory
+   * extraction NEVER RUN. `consume()` drains the stream so those terminal
+   * effects complete:
+   *
+   *   const res = streamChat({ … });
+   *   ctx.waitUntil(res.consume?.());
+   *
+   * It MUST NEVER reject — mid-stream failures go to `onError` (and remain on
+   * `fullStream` as an `error` part), consistent with the never-throw contract.
+   * Calling it alongside a normal iteration is safe: the broadcaster fans the
+   * single pump out to every consumer.
+   *
+   * Optional ONLY because `deferStream` in `src/middleware.ts` builds a PARTIAL
+   * `StreamChatResult`; once that forwards the full shape it can be tightened
+   * to required.
+   */
+  consume?: (options?: { onError?: (error: unknown) => void }) => Promise<void>;
 }
 
 export type StreamChat = (options: StreamChatOptions) => StreamChatResult;
@@ -88,6 +138,12 @@ export interface GenerateTextResult {
    * suspension). Never rejects. Await it on serverless runtimes.
    */
   memory?: Promise<MemoryMutation[]>;
+  /**
+   * Non-fatal execution notices collected across every step (1.9 additive) —
+   * clamped/unsupported settings, unknown-model fallbacks, tools the wire could
+   * not carry. See {@link CallWarning}.
+   */
+  warnings?: CallWarning[];
 }
 
 export type GenerateText = (options: GenerateTextOptions) => Promise<GenerateTextResult>;
@@ -105,6 +161,12 @@ export interface GenerateObjectResult<T = unknown> {
   object: T;
   usage: Usage;
   finishReason: FinishReason;
+  /**
+   * Non-fatal execution notices (1.9 additive) — e.g. an unknown slug forcing
+   * the 'tool' strategy because the fallback row reports no native structured
+   * output. See {@link CallWarning}.
+   */
+  warnings?: CallWarning[];
 }
 
 export type GenerateObject = <T = unknown>(
@@ -137,6 +199,22 @@ export interface StreamObjectResult<T = unknown> {
   /** Resolve even when final validation fails (the tokens were still spent). */
   usage: Promise<Usage>;
   finishReason: Promise<FinishReason>;
+  /**
+   * Non-fatal execution notices (1.9 additive). Resolves together with `usage`
+   * and `finishReason`; never rejects. See {@link CallWarning}.
+   */
+  warnings?: Promise<CallWarning[]>;
+  /**
+   * Drain the stream to completion, discarding output (1.9 additive) — same
+   * contract as {@link StreamChatResult.consume}: the pump is LAZY (G2), so
+   * without a consumer the terminal effects (`onFinish`, chat persistence,
+   * durable checkpoints, memory extraction) never run. MUST NEVER reject;
+   * failures are reported through `onError`.
+   *
+   * Optional for the same reason as on `StreamChatResult` — partial result
+   * objects built by `src/middleware.ts` do not forward it yet.
+   */
+  consume?: (options?: { onError?: (error: unknown) => void }) => Promise<void>;
 }
 
 /**

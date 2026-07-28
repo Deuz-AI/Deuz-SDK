@@ -7,9 +7,11 @@
     "generate-text",
     "generate-object",
     "stream-object",
+    "prompts-and-timeouts",
+    "messages",
+    "files",
     "compaction",
     "embeddings",
-    "messages",
     "errors",
     "dependencies"
   ]

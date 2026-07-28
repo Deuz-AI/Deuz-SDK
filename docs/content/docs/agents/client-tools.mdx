@@ -3,11 +3,14 @@ title: Client-Side Tools
 description: Tools without an execute function — the loop stops and hands the pending tool call back to the caller for a UI confirmation, browser API, or human-in-the-loop round-trip.
 ---
 
-A **client tool** is a `Tool` with no `execute` function. The model can still call it, but the SDK can't run it server-side — so the [agentic loop](/docs/agents/tool-loop) stops as soon as a client tool is called and returns the pending tool call to you. The caller owns the round-trip: collect a user confirmation, hit a browser-only API, or run a human-in-the-loop approval, then append a `tool_result` and call again. Use this whenever the work can't (or shouldn't) happen on the server inside the loop.
+A **client tool** is a key **present in your `tools` map** whose value has no `execute` function. The model can still call it, but the SDK can't run it server-side — so the [agentic loop](/docs/agents/tool-loop) stops as soon as a client tool is called and returns the pending tool call to you. The caller owns the round-trip: collect a user confirmation, hit a browser-only API, or run a human-in-the-loop approval, then append a `tool_result` and call again. Use this whenever the work can't (or shouldn't) happen on the server inside the loop.
 
 ## How it works
 
-Every tool in a `ToolSet` is either a **server tool** (has `execute`, the loop runs it) or a **client tool** (no `execute`). The distinction is the presence of `execute` — with one exception: a [provider-executed tool](/docs/agents/server-tools) (`type: 'provider'`) has no `execute` but is run by the provider, so it does **not** break the loop as a client tool:
+Every tool in a `ToolSet` is either a **server tool** (has `execute`, the loop runs it) or a **client tool** (registered, no `execute`). Two things that look similar but are not client tools:
+
+- A [provider-executed tool](/docs/agents/server-tools) (`type: 'provider'`) has no `execute` but is run by the provider, so it does **not** break the loop.
+- An **unregistered** name — one the model invented — is not a client tool either. Since 1.9 it self-heals into an `is_error` `tool_result` and the loop continues. See the callout below.
 
 ```ts
 import type { ToolSet } from '@deuz-sdk/core';
@@ -29,6 +32,12 @@ const tools: ToolSet = {
 ```
 
 When a step's tool calls include **any** client tool, the loop stops after appending the assistant turn — it does **not** execute the other tools in that step, and it does **not** add a `tool_result` turn. Control returns to you with the pending call(s). This holds in both [generateText](/docs/core/generate-text) and [streamChat](/docs/core/stream-chat).
+
+<Callout type="warn" title="A hallucinated name is no longer a client hand-off (1.9)">
+Before 1.9 the test was effectively `!tools[name]?.execute`, so a tool call naming something **absent** from `tools` looked exactly like a client tool: the loop exited, returned a turn with a dangling `tool_use` and no error, and a server waiting to send that `tool_result` back waited forever.
+
+An unregistered name is now classified as unknown and fed back as an `is_error` `tool_result` in the same turn — `No such tool: "search_web". Available tools: getWeather, search.` — and the loop **continues**, so the model can correct itself. Own keys only, so `toString` / `constructor` are unknown too. Real client tools are unchanged: a registered key with no `execute` still breaks the loop with no fabricated result.
+</Callout>
 
 ## Where the pending call surfaces
 
@@ -248,20 +257,23 @@ Stream the first turn over the [Deuz UI wire](/docs/modules/ui-streaming). The b
 
 ```ts title="app/api/chat/route.ts"
 import { streamChat } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
 import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
-import type { Message } from '@deuz-sdk/core';
 
 export const runtime = 'edge';
 
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
-export async function POST(req: Request) {
-  const { messages } = (await req.json()) as { messages: Message[] };
+export async function POST(req: Request): Promise<Response> {
+  // A client-tool route MUST allow `role: 'tool'` turns — that is the round-trip.
+  // Read what that accepts: /docs/modules/request-validation#client-tools-need-rejecttoolresults-false
+  const parsed = validateChatRequest(await req.json(), { rejectToolResults: false });
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
 
   const result = streamChat({
     model: anthropic('claude-opus-4-8'),
-    messages,
+    messages: parsed.request.messages,
     maxSteps: 5,
     tools: {
       // client tool: only the browser can read the user's location

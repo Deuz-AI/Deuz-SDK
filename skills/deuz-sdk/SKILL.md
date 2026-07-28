@@ -39,34 +39,46 @@ const usage = await result.usage; // resolves at end; errors surface on fullStre
 ```ts
 // app/api/chat/route.ts (Edge or Node)
 import { streamChat } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
 import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
 import { createOpenAI } from '@deuz-sdk/core/openai';
 
-export async function POST(req: Request) {
-  const { messages } = await req.json();
-  const result = streamChat({ model: createOpenAI({ apiKey: process.env.OPENAI_KEY })('gpt-5.2'), messages });
-  return toDeuzStreamResponse(result); // SSE, header x-deuz-stream: v1
+export async function POST(req: Request): Promise<Response> {
+  // The body is attacker-controlled and canonical Message[] includes role:'system'.
+  const parsed = validateChatRequest(await req.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+
+  const result = streamChat({
+    model: createOpenAI({ apiKey: process.env.OPENAI_KEY })('gpt-5.2'),
+    instructions: 'You are a helpful assistant.',
+    messages: parsed.request.messages,
+    signal: req.signal,
+  });
+  return toDeuzStreamResponse(result); // SSE, header x-deuz-stream: v2 (v1 on request)
 }
 ```
-Client: `readDeuzStream(response)` yields `DeuzUIPart`s. See `rules/streaming-ui.md`.
+A route serving CLIENT TOOLS must pass `validateChatRequest(body, { rejectToolResults: false })` — `useChat`'s `onToolCall` round-trip POSTs a `role: 'tool'` message. Client: `readDeuzStream(response)` yields `DeuzUIPart`s. See `rules/streaming-ui.md`.
 
 ### 3. Agentic tool loop (set maxSteps > 1!)
 ```ts
-import { generateText } from '@deuz-sdk/core';
+import { generateText, tool } from '@deuz-sdk/core';
+import { z } from 'zod';
+
 const res = await generateText({
   model: createAnthropic({ apiKey: KEY })('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'weather in Paris?' }],
+  prompt: 'weather in Paris?',            // 1.9: shorthand for one user turn
   tools: {
-    getWeather: {
+    // `tool()` is a pure identity function — inference only, zero runtime.
+    getWeather: tool({
       description: 'Get weather',
-      parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
-      execute: async ({ city }: { city: string }) => ({ city, temp: 22 }),
-    },
+      parameters: z.object({ city: z.string() }),
+      execute: async (args) => ({ city: args.city, temp: 22 }), // args: { city: string }
+    }),
   },
   maxSteps: 5, // DEFAULT 1 = single turn, tools won't loop
 });
 ```
-See `rules/tools-agents.md`.
+A raw JSON Schema works too (no peer dep) — then annotate `args` yourself. See `rules/tools-agents.md`.
 
 ### 4. generateObject (structured output)
 ```ts
@@ -103,7 +115,12 @@ Key precedence (highest wins): `deps.keyProvider` > factory `apiKey` > `createCl
 
 | Import | Provides |
 | --- | --- |
-| `@deuz-sdk/core` | `streamChat`, `generateText`, `generateObject`, `embed`, `embedMany`, `createClient`, errors, all types |
+| `@deuz-sdk/core` | `streamChat`, `generateText`, `generateObject`, `streamObject`, `embed`, `embedMany`, `tool`, `filePart`, `imagePart`, `getModelCapabilities`, `agentTool`, stop conditions, `wrapModel`, `createClient`, errors, all types |
+| `@deuz-sdk/core/agent` | `createAgent` — a reusable agent as a frozen VALUE (no class, no `new`) |
+| `@deuz-sdk/core/chat` | pure chat engine: `applyUIPart`, `uiFromMessages`, `canonicalFromUI`, `sealAssistantTurn`, `userMessageFromInput`, `filesToImageParts`, `ChatStore`, `validateChatRequest` |
+| `@deuz-sdk/core/providers` | compat factories + `createOpenAICompatible({ id, baseURL })` + `createProviderRegistry` |
+| `@deuz-sdk/core/testing` | `createMockModel`, `sseResponse`, `sseEvents`, `mockFetch`, `mockFetchSequence` |
+| `@deuz-sdk/react` | `useChat`, `useObject`, `partsFromFiles`, `ToolApprovalCard`, `CostBadge` (supersedes `@deuz-sdk/core/react`) |
 | `@deuz-sdk/core/anthropic` | `createAnthropic`, `anthropic` |
 | `@deuz-sdk/core/openai` | `createOpenAI`, `createOpenAIResponses`, `createOpenAIEmbedding`, `openai`, `openaiResponses`, `openaiEmbedding` |
 | `@deuz-sdk/core/xai` | `createXai`, `xai` |
@@ -112,7 +129,7 @@ Key precedence (highest wins): `deps.keyProvider` > factory `apiKey` > `createCl
 | `@deuz-sdk/core/vertex` | `createVertexAnthropic`, `createVertexGoogle`, `createVertexGoogleNative` |
 | `@deuz-sdk/core/voyage` | `createVoyage`, `voyage` (embeddings) |
 | `@deuz-sdk/core/yunwu` | `createYunwu` unified relay (chat/image/embed/MJ) |
-| `@deuz-sdk/core/ui` | `toDeuzStreamResponse`, `readDeuzStream` |
+| `@deuz-sdk/core/ui` | `toDeuzStreamResponse`, `toDeuzTextStreamResponse`, `toDeuzObjectStreamResponse`, `createDeuzStream`, `resumeDeuzStreamResponse`, `readDeuzStream`, `connectDeuzStream` |
 | `@deuz-sdk/core/middleware` | `wrapModel`, `logging`, `simpleCache`, `redactPII`, `promptInjectionGuard` |
 | `@deuz-sdk/core/pricing` | `createPriceProvider`, `priceUsage`, `PRICES_2026` |
 | `@deuz-sdk/core/image` | `createImageProvider`, `generateImage` (sync) |
@@ -131,10 +148,28 @@ Key precedence (highest wins): `deps.keyProvider` > factory `apiKey` > `createCl
 | `@deuz-sdk/core/observe/node` | `createJsonlObserver`, `readJsonlEvents` (Node JSONL persistence) |
 | `@deuz-sdk/core/edge` | edge-safe re-export subset |
 
+## 1.9 additions worth knowing up front
+
+- **Call shape:** `prompt` (one user turn, mutually exclusive with `messages`), `instructions` (system prompt, placed first, idempotent fold), `timeout: { ttftMs, totalMs, stepMs, toolMs }` (bare number = `totalMs`; `0` disables a layer), `capabilities` (override the registry row), `abortSignal` (deprecated alias for `signal`).
+- **`tool()`** — a pure identity function that types `execute(args)`. Plus `InferToolInput` / `InferToolOutput`, and `Tool.timeoutMs`.
+- **`filePart()` / `imagePart()`** — `ImagePart` is the carrier for ALL binary media; a non-`image/*` `mediaType` now maps to each wire's document block (Anthropic `document`, Responses `input_file`, Chat Completions `file`, Gemini `inlineData`) instead of 400ing on three of four.
+- **`consume()`** on `StreamChatResult` / `StreamObjectResult` — drain the lazy pump so `onFinish` / chat persistence / checkpoints run when nobody iterates. Optional on the type (`fallbackModels` and `withFallback` return `undefined`).
+- **`createAgent`** (`/agent`) and **`validateChatRequest`** (`/chat`, `/edge`).
+- **`createOpenAICompatible({ id, baseURL })`** (`/providers`) for Ollama / vLLM / an internal gateway.
+- **UI:** ordered `UIMessage.parts`, `useChat`'s `setHistory` / `setMessages` / `addToolResult` / `clearError` / `pendingToolCalls` / `throttleMs` / `resume.auto` / `onHttpError`, `sendMessage({ text, parts })`, `writeData(name, payload, { id?, transient? })`, `toDeuzTextStreamResponse`.
+
+**1.9 wired up three surfaces that first shipped inert:** `streamChat().warnings` resolves a real `CallWarning[]` and `warning` parts ride `fullStream`; the streaming loop sets `tool-state.denied` / `deniedReason`, so a REFUSED tool call is distinguishable from a crashed one all the way to `UIToolCall.denied`; `applyUIPart` folds `sub-agent` frames into `turn.subAgents` (+ `turn.warnings`, `turn.falseFinishes`), all three surfaced by `useChat`.
+
+**The ONE remaining trap:** `warnings` is populated on `streamChat` ONLY. It is `undefined` on `GenerateTextResult` / `GenerateObjectResult` / `StreamObjectResult`, and a `streamChat` carrying `tools` (or `chat`/`memory`/`verifyStep`/`doneWhen`) reports only its own `activeTools` notices — a model-level warning raised inside a step reaches `deps.logger.warn`, not the field. See `rules/pitfalls.md` #16.
+
 ## Detail rules (read on demand)
 
 - `rules/providers.md` — every factory signature + which surface to pick.
 - `rules/streaming-ui.md` — streamChat semantics, `fullStream` parts, UI wire, Next.js/Worker recipes.
-- `rules/tools-agents.md` — ToolSet shape, loop invariants, generateObject strategies.
+- `rules/tools-agents.md` — ToolSet shape, loop invariants, `createAgent`, generateObject strategies.
 - `rules/modules.md` — memory, RAG, skills, MCP, image, middleware, pricing recipes.
 - `rules/pitfalls.md` — the sharp edges (read this before debugging weirdness).
+
+## Porting from another SDK?
+
+If the task is moving an existing app off the Vercel AI SDK (`ai`, `@ai-sdk/*`), use the companion skill **`migrate-from-ai-sdk`** (installed by the same `npx skills add Deuz-AI/Deuz-SDK`). It carries the verified name-by-name mapping, the porting order, and the list of AI SDK features that have no Deuz equivalent. This skill stays the reference for the target API itself.

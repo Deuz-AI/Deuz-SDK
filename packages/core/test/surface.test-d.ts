@@ -278,3 +278,325 @@ expectTypeOf<ToolApprovalRequest['token']>().toEqualTypeOf<string | undefined>()
 expectTypeOf<ToolApprovalResponse['token']>().toEqualTypeOf<string | undefined>();
 expectTypeOf<CommonCallOptions['approvalSigner']>().not.toBeNever();
 expectTypeOf<CommonCallOptions['approvalMaxAgeMs']>().toEqualTypeOf<number | undefined>();
+
+// --- 1.9.0 additive: verify part on the wire + readDeuzStream HTTP-error option. ---
+import { readDeuzStream, type ReadDeuzStreamOptions } from '../src/ui';
+// The `verify` verdict is a first-class wire part (v2-only at runtime).
+expectTypeOf<Extract<DeuzUIPart, { type: 'verify' }>>().toEqualTypeOf<{
+  type: 'verify';
+  stepIndex: number;
+  attempt: number;
+  ok: boolean;
+  willRetry: boolean;
+  feedback?: string;
+}>();
+// The options bag is OPTIONAL — a 1-arg call stays valid (no breaking change).
+expectTypeOf(readDeuzStream).parameters.toMatchTypeOf<
+  [Response, (ReadDeuzStreamOptions | undefined)?]
+>();
+expectTypeOf<ReadDeuzStreamOptions['onHttpError']>().toEqualTypeOf<
+  'error-part' | 'ignore' | undefined
+>();
+expectTypeOf(readDeuzStream).returns.toEqualTypeOf<AsyncGenerator<DeuzUIPart>>();
+
+// --- 1.9.0 additive: finish/step-finish/verify fold into the chat turn. ---
+// All four are OPTIONAL: `createAssistantTurn`'s object literal is unchanged.
+expectTypeOf<AssistantTurnState['verifications']>().toEqualTypeOf<
+  Array<Extract<DeuzUIPart, { type: 'verify' }>> | undefined
+>();
+expectTypeOf<AssistantTurnState['usage']>().toEqualTypeOf<Usage | undefined>();
+expectTypeOf<AssistantTurnState['finishReason']>().toEqualTypeOf<FinishReason | undefined>();
+expectTypeOf<AssistantTurnState['steps']>().toEqualTypeOf<
+  Array<{ step: number; usage: Usage; finishReason: FinishReason }> | undefined
+>();
+
+// ===================================================================
+// 1.9.0 Sprint 2 — ergonomics surface. ALL ADDITIVE: every pin below is a NEW
+// member or a NEW export, so nothing above is weakened. The point of pinning
+// them now is that they are the first-hour API (`prompt`, `instructions`,
+// `tool()`, `timeout`) — silently changing their shape later would break the
+// migration path this release exists to open.
+// ===================================================================
+import { tool, filePart, imagePart, getModelCapabilities, generateText } from '../src/index';
+// `Tool` and `GenerateTextResult` are already imported above — reuse them.
+import type {
+  CallWarning,
+  ModelCapabilities,
+  ImagePart,
+  InferToolInput,
+  InferToolOutput,
+} from '../src/index';
+
+// --- Input shape: `prompt` / `instructions` are optional STRINGS, and
+// `messages` stays REQUIRED on the interface (the either/or lives in the call
+// functions' overloads — see below). ---
+expectTypeOf<CommonCallOptions['prompt']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<CommonCallOptions['instructions']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<CommonCallOptions['messages']>().toEqualTypeOf<Message[]>();
+
+// The `prompt` overload really accepts a call with NO `messages` key at all,
+// on every one of the four entry points. This is the pin that would catch the
+// overloads being dropped back to a single signature.
+expectTypeOf(streamChat).toBeCallableWith({ model: {} as LanguageModel, prompt: 'hi' });
+expectTypeOf(generateText).toBeCallableWith({ model: {} as LanguageModel, prompt: 'hi' });
+expectTypeOf(streamChat).toBeCallableWith({
+  model: {} as LanguageModel,
+  prompt: 'hi',
+  instructions: 'be terse',
+});
+
+// --- Cancellation alias: same type as `signal` (deprecated, `signal` wins). ---
+expectTypeOf<CommonCallOptions['abortSignal']>().toEqualTypeOf<AbortSignal | undefined>();
+
+// --- Timeout layers. The object form is INLINE on the interface (deliberately
+// not a named export), so it is pinned structurally. ---
+expectTypeOf<CommonCallOptions['timeout']>().toEqualTypeOf<
+  number | { totalMs?: number; ttftMs?: number; stepMs?: number; toolMs?: number } | undefined
+>();
+
+// --- Per-call capability override + the public read accessor. ---
+expectTypeOf<CommonCallOptions['capabilities']>().toEqualTypeOf<
+  Partial<ModelCapabilities> | undefined
+>();
+expectTypeOf(getModelCapabilities).toBeCallableWith({} as LanguageModel);
+expectTypeOf(getModelCapabilities).returns.toEqualTypeOf<Readonly<ModelCapabilities>>();
+expectTypeOf<ModelCapabilities>().toHaveProperty('maxOutput');
+expectTypeOf<ModelCapabilities>().toHaveProperty('contextWindow');
+expectTypeOf<ModelCapabilities>().toHaveProperty('known');
+
+// --- `tool()` is an IDENTITY helper whose result must still slot into a plain
+// `ToolSet`. That assignability is the whole reason its return type is an
+// intersection; if it regresses, `tools: { t }` stops compiling. ---
+const pinnedTool = tool({
+  description: 'pin',
+  parameters: { type: 'object', properties: { q: { type: 'string' } } },
+  execute: async () => 42,
+});
+expectTypeOf(pinnedTool).toExtend<Tool>();
+expectTypeOf<{ t: typeof pinnedTool }>().toExtend<Record<string, Tool>>();
+// A raw JSON Schema carries no type-level payload: args degrade to `unknown`,
+// NEVER `any` (an `any` here would silently disable checking in every handler).
+expectTypeOf<InferToolInput<typeof pinnedTool>>().toEqualTypeOf<unknown>();
+// `Awaited`, so a sync and an async tool report the SAME output type.
+expectTypeOf<InferToolOutput<typeof pinnedTool>>().toEqualTypeOf<number>();
+// Non-tools degrade instead of erroring.
+expectTypeOf<InferToolInput<string>>().toEqualTypeOf<unknown>();
+expectTypeOf<InferToolOutput<{ description: string }>>().toEqualTypeOf<unknown>();
+
+// --- Per-tool execution cap. ---
+expectTypeOf<Tool['timeoutMs']>().toEqualTypeOf<number | undefined>();
+
+// --- Content-part constructors. `filePart` REQUIRES `mediaType` (there is no
+// sane default for a document); `imagePart` does not. Both return the LOCKED
+// `ImagePart` carrier — not a new Part kind (that is 2.0). ---
+expectTypeOf(filePart).returns.toEqualTypeOf<ImagePart>();
+expectTypeOf(imagePart).returns.toEqualTypeOf<ImagePart>();
+expectTypeOf(filePart).toBeCallableWith({ data: 'x', mediaType: 'application/pdf' });
+expectTypeOf(imagePart).toBeCallableWith({ data: new Uint8Array() });
+
+// --- `consume()`: drains the lazy G2 pump so terminal effects run. Returns
+// Promise<void> and is contractually NON-REJECTING (failures go to onError). ---
+expectTypeOf<StreamChatResult['consume']>().toEqualTypeOf<
+  ((options?: { onError?: (error: unknown) => void }) => Promise<void>) | undefined
+>();
+expectTypeOf<StreamObjectResult<{ a: string }>['consume']>().toEqualTypeOf<
+  ((options?: { onError?: (error: unknown) => void }) => Promise<void>) | undefined
+>();
+
+// --- Warnings channel. The TYPES are locked here even though no collector
+// populates them yet (Sprint 2 shipped the channel, not the emitters), so the
+// shape cannot drift before the producers land. ---
+expectTypeOf<CallWarning['type']>().toEqualTypeOf<
+  'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other'
+>();
+expectTypeOf<CallWarning['message']>().toEqualTypeOf<string>();
+expectTypeOf<CallWarning['setting']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<GenerateTextResult['warnings']>().toEqualTypeOf<CallWarning[] | undefined>();
+expectTypeOf<StreamChatResult['warnings']>().toEqualTypeOf<Promise<CallWarning[]> | undefined>();
+// `warning` is a member of the OPEN StreamPart union.
+expectTypeOf<Extract<StreamPart, { type: 'warning' }>>().toEqualTypeOf<{
+  type: 'warning';
+  warning: CallWarning;
+}>();
+
+import { z } from 'zod';
+import { generateObject } from '../src/index';
+import type { StandardSchemaV1, InferSchemaOutput } from '../src/index';
+
+// --- Standard Schema: a REAL zod schema must be structurally assignable. ---
+// Regression pin. `StandardSchemaIssue.path` was `ReadonlyArray<PropertyKey>`,
+// which made zod's FailureResult incompatible, so `generateObject({ schema:
+// z.object(…) })` — the advertised typed path — did not typecheck at all.
+// Nothing in core reads `path`; the fix is a type-only widening.
+const zodObject = z.object({ city: z.string(), n: z.number().optional() });
+expectTypeOf(zodObject).toMatchTypeOf<StandardSchemaV1<unknown, { city: string; n?: number }>>();
+expectTypeOf<InferSchemaOutput<typeof zodObject>>().toMatchTypeOf<{ city: string }>();
+// …and it is accepted by the structured-output entry points, not just the type.
+expectTypeOf(generateObject<{ city: string; n?: number }>).toBeCallableWith({
+  model: {} as LanguageModel,
+  messages: [],
+  schema: zodObject,
+});
+
+// ===================================================================
+// 1.9.0 Sprint 3 — chat UI surface. ALL ADDITIVE. Two pins here are NEGATIVE
+// (they assert a union did NOT gain a member) because the whole design of 3.7a
+// rests on `UIToolCall.state` staying three literals: every consumer switches on
+// it exhaustively, so denial had to arrive as optional FIELDS. A future edit that
+// "tidies" denial into a 4th state must go red here, not in someone's app.
+// ===================================================================
+import {
+  canonicalFromUI,
+  sealAssistantTurn,
+  userMessageFromInput,
+  filesToImageParts,
+  uiFromMessages,
+  type UIMessagePart,
+  type UIToolCall,
+  type ChatInput,
+} from '../src/chat';
+
+// --- 3.1 ordered part projection. `parts` is OPTIONAL and absent until the
+// first element exists, so `createAssistantTurn`'s literal is unchanged and a
+// pre-1.9 / hand-built UIMessage stays assignable. ---
+expectTypeOf<ChatUIMessage['parts']>().toEqualTypeOf<UIMessagePart[] | undefined>();
+expectTypeOf<UIMessagePart['type']>().toEqualTypeOf<
+  'text' | 'reasoning' | 'tool' | 'data' | 'citation' | 'step-start' | 'file'
+>();
+// A tool element is a REFERENCE into `toolCalls`, never a copy — two copies of a
+// call whose state mutates over the turn would drift. Exact shape, so adding a
+// denormalized field here goes red.
+expectTypeOf<Extract<UIMessagePart, { type: 'tool' }>>().toEqualTypeOf<{
+  type: 'tool';
+  toolCallId: string;
+}>();
+expectTypeOf<Extract<UIMessagePart, { type: 'text' }>['state']>().toEqualTypeOf<
+  'streaming' | 'done'
+>();
+expectTypeOf<Extract<UIMessagePart, { type: 'step-start' }>>().toEqualTypeOf<{
+  type: 'step-start';
+  step: number;
+}>();
+// `file` carries the canonical ImagePart.image VERBATIM (bytes stay bytes — the
+// reducer must not base64-encode a buffer on a render path), plus a resolved
+// mediaType and a `url` only when `data` is already a renderable src.
+expectTypeOf<Extract<UIMessagePart, { type: 'file' }>['data']>().toEqualTypeOf<
+  string | Uint8Array
+>();
+expectTypeOf<Extract<UIMessagePart, { type: 'file' }>['mediaType']>().toEqualTypeOf<string>();
+expectTypeOf<Extract<UIMessagePart, { type: 'file' }>['url']>().toEqualTypeOf<string | undefined>();
+
+// --- 3.7a denial, WITHOUT a 4th state literal. ---
+expectTypeOf<UIToolCall['state']>().toEqualTypeOf<'call' | 'result' | 'approval-requested'>();
+expectTypeOf<UIToolCall['denied']>().toEqualTypeOf<boolean | undefined>();
+expectTypeOf<UIToolCall['deniedReason']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<UIToolCall['providerMetadata']>().toEqualTypeOf<Record<string, unknown> | undefined>();
+// The sibling refusal in the same release: `ToolRunState` keeps SIX members.
+expectTypeOf<ToolRunState>().not.toEqualTypeOf<
+  | 'input-streaming'
+  | 'input-complete'
+  | 'awaiting-approval'
+  | 'executing'
+  | 'complete'
+  | 'error'
+  | 'denied'
+>();
+// Data-part entries gained an OPTIONAL id — `dataParts` is still a defaulted
+// array, and an id-less write still typechecks.
+expectTypeOf<AssistantTurnState['dataParts']>().toEqualTypeOf<
+  Array<{ name: string; id?: string; payload: unknown }>
+>();
+expectTypeOf<Extract<UIMessagePart, { type: 'data' }>['id']>().toEqualTypeOf<string | undefined>();
+
+// --- 3.2a inverse projection + the tail seal. ---
+expectTypeOf(canonicalFromUI).parameters.toEqualTypeOf<[ChatUIMessage[]]>();
+expectTypeOf(canonicalFromUI).returns.toEqualTypeOf<Message[]>();
+expectTypeOf(sealAssistantTurn).returns.toEqualTypeOf<AssistantTurnState>();
+// Round-trippable in the type system too: uiFromMessages ∘ canonicalFromUI.
+expectTypeOf(uiFromMessages).returns.toEqualTypeOf<ChatUIMessage[]>();
+expectTypeOf(canonicalFromUI).toBeCallableWith(uiFromMessages([], () => 'id'));
+
+// --- 3.3a multimodal input primitives. `ChatInput` must keep accepting a bare
+// string: `sendMessage(text)` is the 1.8 call every app already makes. ---
+expectTypeOf<ChatInput>().toEqualTypeOf<string | { text?: string; parts?: Part[] }>();
+expectTypeOf<string>().toExtend<ChatInput>();
+expectTypeOf(userMessageFromInput).toBeCallableWith('hi');
+expectTypeOf(userMessageFromInput).toBeCallableWith({ text: 'hi', parts: [] });
+expectTypeOf(userMessageFromInput).returns.toEqualTypeOf<Message>();
+expectTypeOf(filesToImageParts).returns.resolves.toEqualTypeOf<ImagePart[]>();
+
+// --- 3.7b addressable + transient data parts on the wire. The options bag is
+// the THIRD parameter and OPTIONAL, so every existing 2-arg writeData call
+// stays valid — that is the non-breaking half of the change. ---
+import type { WriteDataOptions } from '../src/ui';
+expectTypeOf<WriteDataOptions>().toEqualTypeOf<{ id?: string; transient?: boolean }>();
+expectTypeOf<DeuzStreamWriter['writeData']>().toEqualTypeOf<
+  (name: string, payload: unknown, options?: WriteDataOptions) => void
+>();
+expectTypeOf<DeuzStreamWriter['writeData']>().toBeCallableWith('status', { n: 1 });
+expectTypeOf<DeuzStreamWriter['writeData']>().toBeCallableWith('status', { n: 1 }, { id: 'a' });
+// `data-{name}` now really produces the pre-seeded `id`.
+expectTypeOf<Extract<DeuzUIPart, { type: `data-${string}` }>['id']>().toEqualTypeOf<
+  string | undefined
+>();
+// Denial crosses the wire on the tool-state part, canonical AND UI side.
+expectTypeOf<Extract<DeuzUIPart, { type: 'tool-state' }>>().toEqualTypeOf<{
+  type: 'tool-state';
+  toolCallId: string;
+  toolName?: string;
+  state: ToolRunState;
+  denied?: boolean;
+  deniedReason?: string;
+}>();
+expectTypeOf<ToolStatePart['denied']>().toEqualTypeOf<boolean | undefined>();
+expectTypeOf<ToolStatePart['deniedReason']>().toEqualTypeOf<string | undefined>();
+
+// --- Request validation (./chat subpath). A discriminated result, never a
+// throw, and the options bag is optional so a 1-arg call is the happy path. ---
+import {
+  validateChatRequest,
+  parseDeuzChatRequest,
+  type DeuzChatRequest,
+  type ValidateChatOptions,
+  type ValidateChatResult,
+} from '../src/chat';
+expectTypeOf<ValidateChatResult>().toEqualTypeOf<
+  { ok: true; request: DeuzChatRequest } | { ok: false; issues: string[] }
+>();
+expectTypeOf(validateChatRequest).toBeCallableWith({});
+expectTypeOf(validateChatRequest).returns.toEqualTypeOf<ValidateChatResult>();
+expectTypeOf(parseDeuzChatRequest).returns.toEqualTypeOf<DeuzChatRequest>();
+expectTypeOf<DeuzChatRequest['messages']>().toEqualTypeOf<Message[]>();
+// `rest` is deliberately `Record<string, unknown>` — UNVALIDATED passthrough, so
+// the type refuses to let a caller spread it into typed call options.
+expectTypeOf<DeuzChatRequest['rest']>().toEqualTypeOf<Record<string, unknown>>();
+expectTypeOf<ValidateChatOptions>().toEqualTypeOf<{
+  maxMessages?: number;
+  maxTextBytes?: number;
+  rejectSystemRole?: boolean;
+  rejectToolResults?: boolean;
+  rejectAssistantTurns?: boolean;
+}>();
+
+// --- The BARREL wiring, not just the modules. These pins exist because the
+// re-export lines in `src/edge.ts` are the one part of this release with no
+// other test: a dropped line breaks every edge consumer and nothing else fails.
+// The api contract only locks ROOT exports, so it would not catch it either. ---
+import {
+  canonicalFromUI as edgeCanonicalFromUI,
+  sealAssistantTurn as edgeSealAssistantTurn,
+  userMessageFromInput as edgeUserMessageFromInput,
+  filesToImageParts as edgeFilesToImageParts,
+  validateChatRequest as edgeValidateChatRequest,
+  parseDeuzChatRequest as edgeParseDeuzChatRequest,
+  type UIMessagePart as EdgeUIMessagePart,
+  type ChatInput as EdgeChatInput,
+} from '../src/edge';
+expectTypeOf(edgeCanonicalFromUI).toEqualTypeOf<typeof canonicalFromUI>();
+expectTypeOf(edgeSealAssistantTurn).toEqualTypeOf<typeof sealAssistantTurn>();
+expectTypeOf(edgeUserMessageFromInput).toEqualTypeOf<typeof userMessageFromInput>();
+expectTypeOf(edgeFilesToImageParts).toEqualTypeOf<typeof filesToImageParts>();
+expectTypeOf(edgeValidateChatRequest).toEqualTypeOf<typeof validateChatRequest>();
+expectTypeOf(edgeParseDeuzChatRequest).toEqualTypeOf<typeof parseDeuzChatRequest>();
+expectTypeOf<EdgeUIMessagePart>().toEqualTypeOf<UIMessagePart>();
+expectTypeOf<EdgeChatInput>().toEqualTypeOf<ChatInput>();

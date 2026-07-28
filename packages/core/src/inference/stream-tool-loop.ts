@@ -1,11 +1,13 @@
 import type { CommonCallOptions } from '../types/config';
-import type { StreamChatResult } from '../types/methods';
+import type { CallWarning, StreamChatResult } from '../types/methods';
 import type { StreamPart, ToolRunState } from '../types/stream';
 import type { Message } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
 import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
 import { runStream } from '../core/inference';
 import { resolveDependencies } from '../internal/resolve-deps';
+import { resolveSignal } from '../internal/resolve-call';
+import { createStepTimeout, resolveTimeouts, type StepTimeoutHandle } from '../core/timeout';
 import {
   createObservationRuntime,
   counterFields,
@@ -13,6 +15,7 @@ import {
 } from '../internal/observe-runtime';
 import { toObservedError } from '../internal/observe-error';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
+import { createWarningSink } from '../internal/warnings';
 import type { MemoryMutation } from '../memory';
 import { assembleAssistant, type ToolArgMap, type EncryptedReasoning } from './run-step';
 import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
@@ -27,6 +30,8 @@ import {
   toToolResultPart,
   toStepResult,
   hasClientTool,
+  isClientTool,
+  isUnknownTool,
   bumpErrorGuard,
   normalizeStop,
   needsCost,
@@ -53,6 +58,10 @@ import {
   observeServerResolutions,
   evaluateVerifyStep,
   verifyFeedbackMessage,
+  evaluateDoneWhen,
+  falseFinishMessage,
+  warnFalseFinishConfig,
+  FALSE_FINISH_STOPPED_BY,
   SubAgentSuspension,
   type Denial,
   type DurableRunner,
@@ -114,25 +123,44 @@ export function runStreamToolLoop(
     options.memory && options.memory.extract !== false
       ? createDeferred<MemoryMutation[]>()
       : undefined;
+  // Warnings (1.9): ONE sink for the whole run, so a per-step decision repeated
+  // every iteration is reported once. It ALWAYS mirrors to `deps.logger.warn`
+  // (internal/warnings.ts), which is why log-only callers see no change — the
+  // readout is additive. Unconditional, like `fallback.ts`'s twin: `warnings` is
+  // a declared always-present readout, never an opt-in.
+  const warningSink = createWarningSink(deps.logger);
+  const warningsDeferred = createDeferred<CallWarning[]>();
 
   let started = false;
   // Observation settlement (1.6.1) — see runStream's twin.
   const observationDeferred = createDeferred<void>();
   let observationHandle: { settled: Promise<void> } | undefined;
   let rtRef: ObservationRuntime | undefined;
+  // 1.9 (consume): the pump promise. The loop's terminal bookkeeping (chat
+  // persistence, the last checkpoint) is awaited INSIDE pump AFTER the stream
+  // closes, so a drain that stops at the last part would return too early.
+  let pumpDone: Promise<void> | undefined;
   function ensureStarted(): void {
     if (started) return;
     started = true;
-    void pump().finally(() => {
-      void (async () => {
-        try {
-          await rtRef?.settled();
-        } catch {
-          // settlement must never throw
-        }
-        observationDeferred.resolve();
-      })();
-    });
+    pumpDone = pump()
+      // pump() catches everything internally; belt-and-braces so awaiting this
+      // in consume() can never reject (G2 never-throw).
+      .catch(() => {})
+      .finally(() => {
+        // ONE settlement site for every exit the pump has (finish, suspension,
+        // mid-stream error, resume-load failure): `warnings` NEVER rejects and a
+        // failed run still resolves with whatever was collected.
+        warningsDeferred.resolve(warningSink.list());
+        void (async () => {
+          try {
+            await rtRef?.settled();
+          } catch {
+            // settlement must never throw
+          }
+          observationDeferred.resolve();
+        })();
+      });
   }
 
   async function pump(): Promise<void> {
@@ -140,6 +168,24 @@ export function runStreamToolLoop(
     // Loop start timestamp for `durationExceeds` — pump start, when work
     // actually begins (the shell returns synchronously and lazily, G2).
     const startedAt = deps.clock.now();
+    // 1.9: the two cancellation aliases collapse once (`signal` wins), and the
+    // timeout layers resolve once. Only `stepMs` is the loop's business —
+    // ttft/total belong to each model call (the inner runStream resolves them
+    // from the same `options.timeout`), `toolMs` to loop-shared's executeTools.
+    const userSignal = resolveSignal(options);
+    const timeouts = resolveTimeouts(options.timeout);
+    /** The CURRENT step's deadline — undefined (zero cost) when stepMs is unset. */
+    let stepTimeout: StepTimeoutHandle | undefined;
+    /**
+     * A deadline that fires while the step's TOOLS run cannot abort them (that
+     * is `timeout.toolMs` / `Tool.timeoutMs`, in loop-shared), so the loop
+     * checks it at its own step boundaries. An expiry is a FAILURE — the throw
+     * lands in the pump's catch as an `error` part with rejected promises,
+     * never a 'aborted' finish (G2).
+     */
+    const assertStepDeadline = (): void => {
+      if (stepTimeout?.expired()) throw stepTimeout.error;
+    };
     let messages: Message[] = [...options.messages];
     // Turns THIS call appends (memory extraction input) — tracked as a list so
     // prepareStep/compaction history rewrites can never skew it.
@@ -226,6 +272,7 @@ export function runStreamToolLoop(
     if (wantCost && !deps.priceProvider) {
       deps.logger.warn('costExceeds: no deps.priceProvider injected — the condition never fires');
     }
+    warnFalseFinishConfig(options, deps.logger);
     const errorCounters = new Map<string, number>();
     const compactionRunner = setupCompaction(options, deps);
     let totalUsage: Usage = EMPTY_USAGE;
@@ -238,6 +285,12 @@ export function runStreamToolLoop(
     // Verified generation (1.8): attempt counter + final verdict for metadata.
     let verifyAttempts = 0;
     let verified: boolean | undefined;
+    // False-finish guard (1.9, N2): its OWN re-drive counter — never shared with
+    // verifyAttempts, the two budgets are independent — plus whether the loop is
+    // about to accept a finish `doneWhen` rejected (folded into `stoppedBy` at
+    // the terminal break, never before it).
+    let falseFinishRetries = 0;
+    let falseFinishAccepted = false;
 
     // Mutated per iteration so tool events parent under the current step span;
     // settle-phase executions run step-less under the run span.
@@ -289,6 +342,21 @@ export function runStreamToolLoop(
       ...(observeCtx ? { observe: observeCtx } : {}),
     };
 
+    /**
+     * Push whatever the sink recorded since the last flush as live `warning`
+     * parts (1.9). Driven off `list()` rather than `add`'s return so the sink
+     * stays the single owner of dedup and of the 50-entry cap: an entry it
+     * dropped or collapsed never reaches the stream twice.
+     */
+    let warningsEmitted = 0;
+    const flushWarnings = (): void => {
+      const all = warningSink.list();
+      for (let i = warningsEmitted; i < all.length; i++) {
+        broadcaster.push({ type: 'warning', warning: all[i]! });
+      }
+      warningsEmitted = all.length;
+    };
+
     const emitApprovalRequests = (requests: ToolApprovalRequest[]): void => {
       for (const r of requests) {
         broadcaster.push({
@@ -304,22 +372,34 @@ export function runStreamToolLoop(
     };
 
     // Tool state machine (1.7): one part per lifecycle transition.
+    //
+    // `denial` (1.9) qualifies a TERMINAL 'error' whose cause was an approval
+    // verdict rather than a thrown tool: without it the last frame of the
+    // approval flow reads "getWeather failed", which is the wrong story for a
+    // call a human refused. It changes ONLY what the UI is told — the model
+    // still receives the same is_error tool_result it always did, and the
+    // reason is the one the denier supplied (never invented here).
     const toolState = (
       toolCallId: string,
       toolName: string | undefined,
       state: ToolRunState,
+      denial?: Denial,
     ): void => {
       broadcaster.push({
         type: 'tool-state',
         toolCallId,
         ...(toolName ? { toolName } : {}),
         state,
+        ...(denial
+          ? { denied: true, ...(denial.reason ? { deniedReason: denial.reason } : {}) }
+          : {}),
       });
     };
 
     try {
       const fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
-      const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
+      const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
+      flushWarnings();
 
       // Resume: settle the previous break's pending approvals BEFORE step 1 —
       // their tool-result parts precede the first step-start. A durable
@@ -328,7 +408,8 @@ export function runStreamToolLoop(
         const settled = await settlePendingApprovals(messages, tools, options, extras, {
           beforeExecute: (calls, deniedIds) => {
             for (const call of calls) {
-              if (!deniedIds.has(call.toolCallId)) {
+              // Unknown names never execute either (1.9) — no 'executing' state.
+              if (!deniedIds.has(call.toolCallId) && !isUnknownTool(tools, call.toolName)) {
                 toolState(call.toolCallId, call.toolName, 'executing');
               }
             }
@@ -347,7 +428,16 @@ export function runStreamToolLoop(
               output: r.result,
               ...(r.isError ? { isError: true } : {}),
             });
-            toolState(r.toolCallId, r.toolName, r.isError ? 'error' : 'complete');
+            // The resume leg's verdicts (explicit `approvalResponses` denial,
+            // default-deny, an unverifiable signed approval, a client tool the
+            // caller never answered) carry the reason the CLIENT supplied — it
+            // reaches the UI here or nowhere.
+            toolState(
+              r.toolCallId,
+              r.toolName,
+              r.isError ? 'error' : 'complete',
+              settled.denied.get(r.toolCallId),
+            );
           }
           bumpErrorGuard(
             errorCounters,
@@ -410,6 +500,10 @@ export function runStreamToolLoop(
       }
 
       for (;;) {
+        // Previous step overran its budget? Fail before starting another one.
+        assertStepDeadline();
+        stepTimeout?.clear();
+        stepTimeout = createStepTimeout(deps.clock, timeouts.stepMs);
         broadcaster.push({ type: 'step-start', stepIndex });
         const stepSpan = lo?.rt.startSpan();
         if (observeCtx && stepSpan) {
@@ -444,7 +538,9 @@ export function runStreamToolLoop(
           fullWire,
           staticWire,
           deps.logger,
+          warningSink,
         );
+        flushWarnings();
         messages = prepared.messages;
         const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
         if (lo && stepSpan) {
@@ -467,6 +563,11 @@ export function runStreamToolLoop(
           }),
           {
             tools: prepared.wire,
+            warnings: warningSink,
+            // stepMs rides in as a FAILURE signal, never as the user's cancel
+            // signal: the inner pump reports a TimeoutError instead of
+            // resolving 'aborted' (see InternalRunOptions.failSignal).
+            ...(stepTimeout ? { failSignal: stepTimeout.signal } : {}),
             ...(lo && stepSpan
               ? { observe: { runtime: lo.rt, parentSpanId: stepSpan.spanId, stepIndex } }
               : {}),
@@ -542,6 +643,13 @@ export function runStreamToolLoop(
               settleMemory(false);
               await persistChat(options, deps, chatMessages, chatPersistence.writable);
               return;
+            // Forward the inner pump's non-fatal notices (1.9). Without this
+            // case they die at the loop boundary and only the bulk `warnings`
+            // promise ever sees them — the exact silent gap Sprint 1 had to fix
+            // for `verify`.
+            case 'warning':
+              broadcaster.push(part);
+              break;
             default:
               break;
           }
@@ -600,7 +708,7 @@ export function runStreamToolLoop(
           assistantMessage,
         };
 
-        if (options.signal?.aborted) {
+        if (userSignal?.aborted) {
           // No checkpoint here: the abort cut mid-step, and a checkpoint is
           // only honest at a completed boundary. The cut step still gets a
           // step.completed (finishReason 'aborted') — unlike onStepFinish,
@@ -641,6 +749,48 @@ export function runStreamToolLoop(
           appended.push(assistantMessage);
           chatMessages = [...chatMessages, assistantMessage];
 
+          // False-finish guard (1.9, N2): consulted BEFORE verifyStep at this
+          // same natural-completion boundary — it is the cheaper, narrower
+          // question, and a rejection that re-drives SHORT-CIRCUITS verification
+          // for this round (nothing worth verifying in an answer the caller
+          // already calls incomplete). The two retry budgets never mix.
+          const completion = await evaluateDoneWhen(options, {
+            stepIndex,
+            attempt: falseFinishRetries,
+            text,
+            messages,
+            usage: durableUsage(durable, totalUsage),
+          });
+          if (completion) {
+            if (completion.done) {
+              // A later round genuinely finished: an earlier give-up must not
+              // mark THIS answer as accepted-over-an-objection.
+              falseFinishAccepted = false;
+            } else {
+              broadcaster.push({
+                type: 'false-finish',
+                stepIndex,
+                attempt: falseFinishRetries,
+                willRetry: completion.retry,
+              });
+              if (completion.retry) {
+                falseFinishRetries += 1;
+                const nudge = falseFinishMessage();
+                messages = [...messages, nudge];
+                appended.push(nudge);
+                chatMessages = [...chatMessages, nudge];
+                if (durable) {
+                  await saveCheckpoint(durable, deps, options, 'running', messages, totalUsage);
+                }
+                stepIndex++;
+                continue;
+              }
+              // Budget spent: the answer is accepted as final, but the run
+              // records WHY it stands (folded into stoppedBy at the break).
+              falseFinishAccepted = true;
+            }
+          }
+
           // Verified generation (1.8): emit a verify part; on a rejected
           // verdict, feed feedback back as a user turn and re-drive the loop.
           const verification = await evaluateVerifyStep(options, {
@@ -673,6 +823,9 @@ export function runStreamToolLoop(
               continue;
             }
           }
+          // Recorded only on the path that actually terminates: a verify retry
+          // above `continue`s, and every other break carries its own reason.
+          if (falseFinishAccepted) stoppedBy = FALSE_FINISH_STOPPED_BY;
           if (durable) {
             await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
           }
@@ -758,9 +911,9 @@ export function runStreamToolLoop(
           suspend = {
             reason: pendingApproval.length > 0 ? 'approval' : 'client-tool',
             pendingApprovalCount: requests.length,
-            pendingToolCount: toolCalls.filter(
-              (c) => !tools[c.toolName]?.execute && tools[c.toolName]?.type !== 'provider',
-            ).length,
+            // Only REAL client tools are pending on the caller (1.9) — a
+            // hallucinated name self-healed inside the step instead.
+            pendingToolCount: toolCalls.filter((c) => isClientTool(tools, c.toolName)).length,
             ...checkpointRef(),
           };
           break;
@@ -768,7 +921,12 @@ export function runStreamToolLoop(
 
         for (const c of toolCalls) {
           // Denied calls never execute — they surface straight as error results.
-          if (!denied.has(c.toolCallId)) toolState(c.toolCallId, c.toolName, 'executing');
+          // Same for a hallucinated name (1.9): nothing runs, so the sequence
+          // goes input-complete → error with no 'executing' in between (the
+          // resume-settle path reports missing/denied results the same way).
+          if (!denied.has(c.toolCallId) && !isUnknownTool(tools, c.toolName)) {
+            toolState(c.toolCallId, c.toolName, 'executing');
+          }
         }
         let toolResults;
         try {
@@ -811,6 +969,10 @@ export function runStreamToolLoop(
           };
           break;
         }
+        // The step's own budget covers its tool executions (1.9): if it expired
+        // while they ran, the step is over — fail here rather than feeding
+        // results back into a model call that can no longer be paid for.
+        assertStepDeadline();
         for (const r of toolResults) {
           broadcaster.push({
             type: 'tool-result',
@@ -819,7 +981,15 @@ export function runStreamToolLoop(
             output: r.result,
             ...(r.isError ? { isError: true } : {}),
           });
-          toolState(r.toolCallId, r.toolName, r.isError ? 'error' : 'complete');
+          // Server mode: `approveToolCall` said no (or threw). The verdict is a
+          // boolean, so there is no reason string to relay — `denied: true`
+          // alone is what separates "refused" from "failed".
+          toolState(
+            r.toolCallId,
+            r.toolName,
+            r.isError ? 'error' : 'complete',
+            denied.get(r.toolCallId),
+          );
         }
         const toolResultMessage: Message = {
           role: 'tool',
@@ -927,11 +1097,74 @@ export function runStreamToolLoop(
       settleMemory(false);
       // Completed turns up to the failure still persist (best-effort).
       await persistChat(options, deps, chatMessages, chatPersistence.writable);
+    } finally {
+      // Release the step deadline on EVERY exit (break, return, throw): an
+      // un-cancelled host timer keeps a Node process (and a test run) alive.
+      stepTimeout?.clear();
     }
   }
 
   const fullStream = lazyAsyncIterable<StreamPart>(() => fullSub, ensureStarted);
   const textStream = lazyAsyncIterable<string>(() => projectText(textSub), ensureStarted);
+
+  /**
+   * `consume()` (1.9) — see the twin in `core/inference.ts`. It matters MOST
+   * here: without a consumer the lazy pump (G2) never reaches a step boundary,
+   * so chat persistence, durable checkpoints, `onFinish` and memory extraction
+   * never run. Drains through its OWN broadcaster subscription (iteration by
+   * the caller loses nothing), awaits the pump's post-terminal bookkeeping and
+   * the memory extraction, is memoized (terminal effects fire once) and NEVER
+   * rejects — failures go to `onError`.
+   */
+  let drain: Promise<{ error: unknown } | undefined> | undefined;
+  function consume(consumeOptions?: { onError?: (error: unknown) => void }): Promise<void> {
+    drain ??= (async () => {
+      const sub = broadcaster.subscribe();
+      ensureStarted();
+      let failure: { error: unknown } | undefined;
+      try {
+        for await (const part of sub) {
+          // Mid-stream failures are error PARTS here, never thrown iterations.
+          if (part.type === 'error') failure ??= { error: part.error };
+        }
+      } catch (err) {
+        failure ??= { error: err };
+      }
+      try {
+        await pumpDone;
+      } catch {
+        // unreachable (pump never rejects) — the contract holds regardless
+      }
+      // Memory extraction is STARTED inside the pump but settles later; a
+      // serverless `waitUntil(res.consume())` must cover it too. It never
+      // rejects (startMemoryExtract swallows) and always settles.
+      if (memoryDeferred) {
+        try {
+          await memoryDeferred.promise;
+        } catch {
+          /* never rejects — defensive */
+        }
+      }
+      if (!failure) {
+        // A late consume() subscribes after the broadcaster closed and sees no
+        // parts; the terminal failure is still on `usage`.
+        try {
+          await usageDeferred.promise;
+        } catch (err) {
+          failure = { error: err };
+        }
+      }
+      return failure;
+    })();
+    return drain.then((failure) => {
+      if (!failure) return;
+      try {
+        consumeOptions?.onError?.(failure.error);
+      } catch {
+        // an onError that throws must not break the never-reject contract
+      }
+    });
+  }
 
   return {
     get textStream() {
@@ -948,6 +1181,13 @@ export function runStreamToolLoop(
       ensureStarted();
       return finishDeferred.promise;
     },
+    // Unconditional (1.9), like `usage`/`finishReason`: the readout is declared
+    // as always present on a full StreamChatResult, and it resolves with the
+    // run's collected notices — empty when the run had none.
+    get warnings() {
+      ensureStarted();
+      return warningsDeferred.promise;
+    },
     get observation() {
       ensureStarted();
       return observationHandle;
@@ -960,6 +1200,9 @@ export function runStreamToolLoop(
       ensureStarted();
       return memoryDeferred.promise;
     },
+    // A plain method, never a getter (see the `memory` note above): reading
+    // `result.consume` must not start the pump.
+    consume,
     ...(runId !== undefined ? { runId } : {}),
   };
 }

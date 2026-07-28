@@ -12,6 +12,8 @@ Everything here lives in the `@deuz-sdk/core/ui` subpath and is edge-safe (Web A
 ```ts title="the surface"
 import {
   toDeuzStreamResponse, // server: StreamChatResult → SSE Response
+  toDeuzTextStreamResponse, // server: StreamChatResult → text/plain, no framing (1.9)
+  toDeuzObjectStreamResponse, // server: StreamObjectResult → object-delta SSE
   createDeuzStream, // server: same + writeData() for app data parts
   resumeDeuzStreamResponse, // server: replay + live tail from a store
   readDeuzStream, // client: Response → DeuzUIPart iterable
@@ -69,6 +71,49 @@ If neither `messageId` nor `generateId` is given, the id falls back to the liter
 - **Leg continuation.** If the store already holds records for `streamId` (a continued run — see [the unbreakable chatbot](/docs/agents/unbreakable-chatbot)), seq numbering continues after the last stored seq and the synthetic `start` part is *not* re-emitted.
 - **Pending appends flush before close** (`settled()` inside), so replay never misses the tail on serverless runtimes that freeze after the response ends.
 - The store mirrors the wire seq-for-seq: on a negotiated-v1 response, v2-only parts skip both.
+
+### `consume()` — when nobody reads the response
+
+`toDeuzStreamResponse` returns a `Response` whose body is pulled by the *client*. On a serverless runtime the client can disconnect before the run ends, and then nothing pulls the pump — so `onFinish`, chat persistence, durable checkpoints and memory extraction never run. Drain it explicitly:
+
+```ts
+const result = streamChat({ model, messages, chat: { store, chatId, scope } });
+const response = toDeuzStreamResponse(result);
+ctx.waitUntil(result.consume?.()); // terminal effects complete even if the client leaves
+return response;
+```
+
+`consume()` (1.9) takes its own subscription, so it and the serializer both see every part; it is memoized and **never rejects**. See [streamChat](/docs/core/stream-chat#consume).
+
+## Plain text: `toDeuzTextStreamResponse`
+
+For a consumer that cannot parse SSE — `curl`, a shell pipeline, a non-JS edge function, a widget that appends bytes to a `<pre>`:
+
+```ts title="app/api/text/route.ts"
+import { toDeuzTextStreamResponse } from '@deuz-sdk/core/ui';
+
+export async function POST(req: Request): Promise<Response> {
+  const result = streamChat({ model, prompt: await req.text() });
+  return toDeuzTextStreamResponse(result); // text/plain; charset=utf-8, no framing
+}
+```
+
+```ts
+function toDeuzTextStreamResponse(
+  result: StreamChatResult,
+  options?: { headers?: Record<string, string>; includeReasoning?: boolean },
+): Response;
+```
+
+Body bytes equal the concatenation of `result.textStream`. It projects the **canonical** `fullStream` (never provider bytes), so the canonical line is intact. `includeReasoning: true` interleaves reasoning deltas — `encrypted` reasoning is always skipped, because it is an opaque provider payload, not display text.
+
+<Callout type="warn" title="A mid-stream failure writes nothing — the response just truncates">
+A frameless format has nowhere to put an error, and any string written into the body would be indistinguishable from model output: it would land in the user's transcript and be persisted as if the model said it. So an `error` part (or a throwing source) simply **closes the body**. HTTP truncation without a terminal frame is the only signal, exactly as it is for a dropped connection.
+
+Use `toDeuzStreamResponse` — or check `result.finishReason` — when you need to tell "finished" from "died".
+</Callout>
+
+Like the SSE serializer, it keeps draining through a client disconnect so terminal effects still complete.
 
 ## `StreamStateStore` — the resumability seam
 
@@ -203,8 +248,25 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
 Takes the `Response` (e.g. from `fetch`) and returns an async generator of `DeuzUIPart`. It parses the SSE body, stops at the `[DONE]` sentinel, and silently skips any malformed JSON line. If `response.body` is `null`, it yields nothing and returns immediately.
 
 ```ts
-function readDeuzStream(response: Response): AsyncGenerator<DeuzUIPart>;
+function readDeuzStream(
+  response: Response,
+  options?: { onHttpError?: 'error-part' | 'ignore' },
+): AsyncGenerator<DeuzUIPart>;
 ```
+
+### A failed request is an `error` part, not silence (1.9)
+
+`readDeuzStream` only ever looked at the response *body*. A non-2xx response — a 500 from your route handler, a 401 from a bad key, a 429 — carries no `data:` lines, so the generator ended immediately and the UI settled into a **successful empty assistant turn** at status `idle`. The request had failed and nothing on screen said so.
+
+It now yields exactly one `error` part and returns:
+
+```
+Deuz stream request failed (status 500 Internal Server Error).
+```
+
+Every consumer inherits the fix with no code change: `useChat` goes to `status: 'error'` with `error` set and fires `onError`, and `useObject` sets `error`.
+
+The response body is deliberately **not** read or echoed — an error page is unbounded markup you do not control. Only `statusText` is included, truncated to 200 characters and passed through the standard secret redaction (P0). Opt back into the pre-1.9 silence with `readDeuzStream(res, { onHttpError: 'ignore' })`, or `useChat({ onHttpError: 'ignore' })`.
 
 ## Client: `connectDeuzStream`
 
@@ -260,9 +322,16 @@ function createDeuzStream(
 interface DeuzStreamWriter {
   response: Response;
   /** Queue a `data-{name}` part into the live stream. Writes after the stream ended are dropped. */
-  writeData(name: string, payload: unknown): void;
+  writeData(name: string, payload: unknown, options?: WriteDataOptions): void;
   /** End the data channel early (auto-closes when the model stream completes). */
   close(): void;
+}
+
+interface WriteDataOptions {
+  /** Reconciliation key — every write of the same (name, id) addresses one logical entry. */
+  id?: string;
+  /** Emit on the wire but do NOT journal to the `store`, and stay off-seq. */
+  transient?: boolean;
 }
 ```
 
@@ -270,12 +339,15 @@ interface DeuzStreamWriter {
 
 ```ts title="app/api/chat/route.ts"
 import { streamChat } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
 import { createDeuzStream } from '@deuz-sdk/core/ui';
 import { z } from 'zod';
 
 export async function POST(req: Request): Promise<Response> {
-  const { messages } = await req.json();
-  const result = streamChat({ model, messages });
+  const parsed = validateChatRequest(await req.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+
+  const result = streamChat({ model, messages: parsed.request.messages });
   const stream = createDeuzStream(result, {
     dataSchemas: { chart: z.object({ points: z.array(z.number()) }) },
   });
@@ -283,6 +355,26 @@ export async function POST(req: Request): Promise<Response> {
   return stream.response; // model deltas + your data parts, one wire
 }
 ```
+
+### Addressable and transient data parts (1.9)
+
+```ts
+stream.writeData('status', 'searching…', { id: 'search' }); // one entry, reconciled
+stream.writeData('status', 'found 12 results', { id: 'search' }); // replaces it, in place
+stream.writeData('progress', 0.4, { transient: true }); // never journaled
+```
+
+- **`id`** makes an entry addressable: a re-write of the same `(name, id)` replaces it **at its original position** in `dataParts` and in the message's ordered `parts`, so a live status widget is one entry instead of three and does not jump to the bottom on every update.
+
+  The **wire stays strictly append-only** — every write is its own frame carrying the id, and last-write-wins is the client's job (`applyUIPart`). Collapsing server-side would break the seq↔journal 1:1 the resume cursor rides on (a replaced record would have to change under a seq a client may already hold) and would hide intermediate states from a live client that is past them. Omit `id` for the exact 1.7/1.8 append-only behaviour, byte for byte.
+
+- **`transient`** emits on the wire but does not journal to the `store`, and is **off-seq**: it carries no SSE `id:` line, so it can never move a resume cursor past an event that was never stored.
+
+  <Callout type="warn" title="A reconnecting client does not receive the transient frames it missed">
+  Only write state you are happy to lose. The durable snapshot must be a normal (journaled) write.
+  </Callout>
+
+`useChat`'s `onData` fires once per `data-{name}` frame and receives the **raw** frame, so a caller still observes every intermediate write even where `dataParts` reconciles them down to one entry.
 
 **Streaming validation** is opt-in via `dataSchemas` — a [Standard Schema](https://standardschema.dev) per data-part name. `writeData('chart', payload)` validates against `dataSchemas.chart` *before* serialization; an invalid payload is dropped and a redacted `error` part (`"data part 'chart' failed validation."`) is emitted instead — the stream itself keeps going. Names without a schema pass through unvalidated.
 
@@ -306,17 +398,40 @@ export async function POST(req: Request): Promise<Response> {
 | `source` | `id: string`, `url?`, `title?` | A cited source (provider-reported). |
 | `compaction` | `layer: string`, `tokensBefore: number`, `tokensAfter: number` | Automatic compaction ran before an agentic step (token counts are estimates). |
 | `sub-agent` | `agentPath: string[]`, `part: DeuzUIPart` | A sub-agent (`agentTool`) emitted a part, forwarded live with its path. |
-| `data-{name}` **(v2)** | `payload: unknown` | App-defined typed data from `writeData(name, payload)`. |
+| `data-{name}` **(v2)** | `payload: unknown`, `id?: string` **(1.9)** | App-defined typed data from `writeData(name, payload, { id?, transient? })`. With an `id`, the client reconciles repeat writes of the same `(name, id)` in place. |
 | `citation` **(v2)** | `id`, `sourceId?`, `url?`, `title?`, `snippet?`, `chunkIndex?`, `score?` | RAG provenance for a retrieved chunk. Build from retrieve/rerank hits with `citationsFromHits` (`@deuz-sdk/core/rag`) and send via `writeData` or your own pipeline. |
-| `tool-state` **(v2)** | `toolCallId`, `toolName?`, `state: ToolRunState` | Tool lifecycle transition — render live status without re-deriving it from part ordering. States: `input-streaming`, `input-complete`, `awaiting-approval`, `executing`, `complete`, `error`. |
+| `tool-state` **(v2)** | `toolCallId`, `toolName?`, `state: ToolRunState`, `denied?: boolean` **(1.9)**, `deniedReason?: string` **(1.9)** | Tool lifecycle transition — render live status without re-deriving it from part ordering. States: `input-streaming`, `input-complete`, `awaiting-approval`, `executing`, `complete`, `error`. `denied: true` qualifies a terminal `error` whose cause was an approval **refusal** rather than a thrown tool (see below). |
 | `cost` **(v2)** | `costUsd`, `deltaUsd?`, `cacheSavingsUsd?`, `stepIndex?` | Live cumulative USD cost, one per step when `deps.priceProvider` is injected. See [Pricing](/docs/modules/pricing#live-cost-stream-17). |
 | `budget-exceeded` **(v2)** | `kind: 'usd' \| 'tokens'`, `limit: number`, `value: number` | The `budget` guardrail tripped — precedes the terminal `finish`. |
 | `plan-update` **(v2, 1.8)** | `goal?`, `tasks: { id, title, status, notes? }[]` | Live plan snapshot from `emitPlanUpdate` — render a to-do panel. See [Autonomy](/docs/modules/autonomy). |
 | `activity` **(v2, 1.8)** | `message`, `level?`, `data?`, `agentPath?` | Live "Computer" feed line from `emitActivity`. |
+| `verify` **(v2, 1.9)** | `stepIndex`, `attempt`, `ok`, `willRetry`, `feedback?` | A [`verifyStep`](/docs/agents/tool-loop) verdict — render "checking…" / "retrying". Field names mirror the canonical `VerifyPart` exactly. Journaled and replayed on resume like any other part. |
+| `warning` **(v2, 1.9)** | `warning: { type, setting?, message }` | A non-fatal execution notice — a stripped sampling param, an unknown-slug capability fallback, a tool or document the wire could not carry. The payload **is** the canonical `CallWarning`, so the live view and `StreamChatResult.warnings` are one shape. `message` is passed through the secret redactor on the way out. Purely informational: it never ends the stream (that is `error`). `type` is an **open** union — treat an unknown value as `'other'`. |
+| `false-finish` **(v2, 1.9)** | `stepIndex`, `attempt`, `willRetry` | The `doneWhen` guard rejected a natural completion — render "not done yet, continuing". One part per rejection, always before the terminal `finish`; `willRetry: false` spent the `falseFinishGuard` budget, so the run stops anyway. Field names mirror the canonical `FalseFinishPart` exactly. Journaled and replayed like `verify`. |
 | `finish` | `finishReason: FinishReason`, `usage: Usage` | Last meaningful part — the whole turn finished. |
 | `error` | `message: string` | A stream error occurred; `message` is redacted of secrets. |
 
 `Usage` and `FinishReason` are the canonical types from the core ([usage breakdown](/docs/core/stream-chat)). The `tool-input-delta` fragments accumulate into the `input` you receive on the matching `tool-call` — render the deltas for a live "typing the arguments" effect, then swap to the final `input`.
+
+Note that the wire's `reasoning-delta` carries **no** `encrypted` flag — that field exists only on canonical `ReasoningPart`s and on `UIMessagePart`s projected from history by `uiFromMessages`.
+
+### Rendering a denial, not a failure
+
+The streaming loop sets `denied` at both of its terminal `tool-state` sites, so a refused call and a crashed one are distinguishable client-side:
+
+```tsx
+for await (const part of readDeuzStream(res)) {
+  if (part.type === 'tool-state' && part.state === 'error') {
+    part.denied
+      ? show(`Declined${part.deniedReason ? `: ${part.deniedReason}` : ''}`)
+      : show('Tool failed');
+  }
+}
+```
+
+`deniedReason` is whatever the denier supplied and is never invented: a client verdict's own `reason` verbatim, `No approval response.` for a gated call left unanswered, `No result provided for this client tool.`, or `Approval token missing, invalid, expired, or bound to another run.` under [`approvalSigner`](/docs/agents/durable-runtime#cryptographic-approval-trail-17). A **server-mode** `approveToolCall` returns a bare boolean, so a refusal there carries `denied: true` with **no** reason.
+
+The model side is unchanged: the denied call still receives its `is_error` `tool_result`, so the transcript stays valid. These are optional fields rather than a 7th `ToolRunState` member precisely so consumers can keep switching exhaustively.
 
 ## Backpressure and cancellation
 
@@ -333,6 +448,7 @@ Read keys from `process.env` at the app layer and pass them into the factory —
 
 ```ts title="app/api/chat/route.ts"
 import { streamChat } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
 import { toDeuzStreamResponse, negotiateDeuzStreamVersion } from '@deuz-sdk/core/ui';
 import { streamStore } from '@/lib/stores'; // in-memory, Redis, or Supabase
@@ -342,8 +458,18 @@ export const runtime = 'edge';
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 export async function POST(req: Request): Promise<Response> {
-  const { messages, streamId } = await req.json();
-  const result = streamChat({ model: anthropic('claude-opus-4-8'), messages });
+  const parsed = validateChatRequest(await req.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+
+  // `streamId` is not a validated field — read it off `rest` and check it yourself.
+  const streamId = typeof parsed.request.rest.streamId === 'string'
+    ? parsed.request.rest.streamId
+    : crypto.randomUUID();
+
+  const result = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    messages: parsed.request.messages,
+  });
   return toDeuzStreamResponse(result, {
     messageId: crypto.randomUUID(),
     wireVersion: negotiateDeuzStreamVersion(req),
@@ -423,6 +549,7 @@ Tip: instead of accumulating `tool-input-delta` fragments and inferring status f
 
 ## Related
 
+- [Request validation](/docs/modules/request-validation) — the gate in front of every route on this page.
 - [The unbreakable chatbot](/docs/agents/unbreakable-chatbot) — durable checkpoints × this wire log, one resume endpoint.
 - [Chat persistence & state](/docs/modules/chat-persistence) — `applyUIPart`, the `ChatStore` seam, and branching.
 - [streamChat](/docs/core/stream-chat) — the source `StreamChatResult` and its canonical `fullStream`.

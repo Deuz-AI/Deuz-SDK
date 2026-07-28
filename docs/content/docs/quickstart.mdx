@@ -114,22 +114,29 @@ On the server, pipe the canonical stream straight into `toDeuzStreamResponse`. I
 
 ```ts title="app/api/chat/route.ts"
 import { streamChat } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
 import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
 
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 export async function POST(req: Request): Promise<Response> {
-  const { messages } = await req.json();
+  // The body is attacker-controlled, and canonical Message[] includes role:'system'.
+  const parsed = validateChatRequest(await req.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
 
   const result = streamChat({
     model: anthropic('claude-opus-4-8'),
-    messages,
+    instructions: 'You are a helpful assistant.',
+    messages: parsed.request.messages,
+    signal: req.signal,
   });
 
   return toDeuzStreamResponse(result);
 }
 ```
+
+[`validateChatRequest`](/docs/modules/request-validation) is a pure structural gate: it never repairs, and it rejects an injected `role: 'system'` turn, a forged `tool_result`, and an oversized history. A route serving **client tools** must pass `{ rejectToolResults: false }`, because the browser legitimately POSTs a `role: 'tool'` message.
 
 `toDeuzStreamResponse(result, options?)` accepts an optional second argument:
 

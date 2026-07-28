@@ -23,7 +23,11 @@ export const generateText: GenerateText = async (options): Promise<GenerateTextR
     (options.tools && Object.keys(options.tools).length > 0) ||
     options.chat ||
     options.memory ||
-    options.verifyStep
+    options.verifyStep ||
+    // `doneWhen` (1.9, N2): the natural-completion boundary exists only inside
+    // the loop, so a tool-less call has to be routed through it or the option
+    // would be accepted and silently ignored.
+    options.doneWhen
   ) {
     return runToolLoop(options);
   }
@@ -33,6 +37,9 @@ export const generateText: GenerateText = async (options): Promise<GenerateTextR
     text: step.text,
     usage: step.usage,
     finishReason: step.finishReason,
+    // Non-fatal notices (1.9): omitted entirely when there are none, so a clean
+    // call's result shape is byte-identical to 1.8.
+    ...(step.warnings?.length ? { warnings: step.warnings } : {}),
     response: { messages: [step.assistantMessage] },
     ...(step.observation ? { observation: step.observation } : {}),
   };

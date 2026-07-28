@@ -8,9 +8,12 @@ import type { Usage, FinishReason } from '../types/usage';
 import type { ObjectRequest } from '../adapters/types';
 import { runStream } from '../core/inference';
 import { getCapabilities } from '../core/registry';
+import { createWarningSink } from '../internal/warnings';
+import { resolveDependencies } from '../internal/resolve-deps';
+import type { CallWarning } from '../types/methods';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { NoObjectGeneratedError } from '../errors';
-import { pickObjectStrategy } from './object-shared';
+import { assertNoLoopOptions, loopOptionsError, pickObjectStrategy } from './object-shared';
 import { parsePartialJson } from '../internal/partial-json';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
 
@@ -31,28 +34,49 @@ export const streamObject: StreamObject = <T = unknown>(
   const objectDeferred = createDeferred<T>();
   const usageDeferred = createDeferred<Usage>();
   const finishDeferred = createDeferred<FinishReason>();
+  const warningsDeferred = createDeferred<CallWarning[]>();
+  const warningSink = createWarningSink(resolveDependencies(options.deps).logger);
   // Eager subscription BEFORE the lazy start so no part can be missed (G2).
   const sub = broadcaster.subscribe();
 
   let started = false;
+  // 1.9 (consume): the pump promise, so a drain can await the terminal work
+  // that follows the last partial (usage/finishReason settlement, validation).
+  let pumpDone: Promise<void> | undefined;
   const ensureStarted = (): void => {
     if (started) return;
     started = true;
-    void pump();
+    // pump() catches everything internally; the extra catch keeps consume()'s
+    // await unrejectable (G2 never-throw).
+    pumpDone = pump().catch(() => {});
   };
 
   async function pump(): Promise<void> {
     try {
+      // 1.9: loop options this call cannot honour used to be dropped in silence.
+      // The check lives INSIDE the pump so the failure travels the existing G2
+      // path (error part on the partial stream + rejected object/usage/finish) —
+      // `streamObject` itself must never throw synchronously.
+      const ignored = assertNoLoopOptions(options, 'streamObject');
+      if (ignored.length > 0) throw loopOptionsError(ignored, 'streamObject');
+
       // All async work (schema conversion included) stays inside the pump.
       const schema = await toJSONSchema(options.schema);
-      const strategy = pickObjectStrategy(options, getCapabilities(options.model));
+      const strategy = pickObjectStrategy(
+        options,
+        getCapabilities(options.model, undefined, undefined, warningSink),
+      );
       const object: ObjectRequest = {
         schema,
         name: options.schemaName,
         description: options.schemaDescription,
         strategy,
       };
-      const inner = runStream(options, { object, operation: 'stream-object' });
+      const inner = runStream(options, {
+        object,
+        operation: 'stream-object',
+        warnings: warningSink,
+      });
 
       let buf = '';
       let lastJson: string | undefined;
@@ -86,6 +110,7 @@ export const streamObject: StreamObject = <T = unknown>(
       // so usage/finishReason survive a NoObjectGeneratedError.
       usageDeferred.resolve(await inner.usage);
       finishDeferred.resolve(await inner.finishReason);
+      warningsDeferred.resolve(warningSink.list());
 
       let parsed: unknown;
       try {
@@ -122,6 +147,45 @@ export const streamObject: StreamObject = <T = unknown>(
     }
   }
 
+  /**
+   * `consume()` (1.9) — same contract as `StreamChatResult.consume`: the pump is
+   * lazy (G2), so a result nobody pulls never reaches its terminal boundary
+   * (`onUsage`/`onFinish` never fire). Drains through its OWN subscription so a
+   * caller iterating `partialObjectStream` loses nothing, is memoized, and NEVER
+   * rejects — failures (transport AND final-validation) go to `onError`.
+   *
+   * Unlike the chat pumps this broadcaster is `fail()`ed rather than closed, so
+   * even a subscription taken after the failure re-raises it — no deferred
+   * fallback needed here.
+   */
+  let drain: Promise<{ error: unknown } | undefined> | undefined;
+  const consume = (consumeOptions?: { onError?: (error: unknown) => void }): Promise<void> => {
+    drain ??= (async () => {
+      const own = broadcaster.subscribe();
+      ensureStarted();
+      let failure: { error: unknown } | undefined;
+      try {
+        for await (const value of own) void value;
+      } catch (err) {
+        failure = { error: err };
+      }
+      try {
+        await pumpDone;
+      } catch {
+        // unreachable (pump never rejects) — the contract holds regardless
+      }
+      return failure;
+    })();
+    return drain.then((failure) => {
+      if (!failure) return;
+      try {
+        consumeOptions?.onError?.(failure.error);
+      } catch {
+        // an onError that throws must not break the never-reject contract
+      }
+    });
+  };
+
   return {
     partialObjectStream: lazyAsyncIterable(() => sub, ensureStarted),
     get object() {
@@ -136,5 +200,11 @@ export const streamObject: StreamObject = <T = unknown>(
       ensureStarted();
       return finishDeferred.promise;
     },
+    get warnings() {
+      ensureStarted();
+      return warningsDeferred.promise;
+    },
+    // A plain method, never a getter: reading it must not start the pump (G2).
+    consume,
   };
 };

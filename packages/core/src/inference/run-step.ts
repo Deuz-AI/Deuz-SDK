@@ -1,4 +1,5 @@
 import type { CommonCallOptions } from '../types/config';
+import type { CallWarning } from '../types/methods';
 import type { Message, Part } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
 import { runStream, type InternalRunOptions } from '../core/inference';
@@ -75,6 +76,13 @@ export interface OneStep {
   assistantMessage: Message;
   /** Observation settlement passthrough (1.6.1) — root single-turn calls only. */
   observation?: { settled: Promise<void> };
+  /**
+   * Non-fatal notices this turn's pump collected (1.9). The buffered path reads
+   * the awaited promise rather than the `warning` StreamPart: the switch below
+   * has a `default: break`, and a promise that never rejects is the simpler
+   * contract for a caller that is already awaiting the whole turn.
+   */
+  warnings?: CallWarning[];
 }
 
 /**
@@ -154,5 +162,8 @@ export async function runOneStep(
     finishReason,
     assistantMessage,
     ...(result.observation ? { observation: result.observation } : {}),
+    // `warnings` never rejects by contract (core/inference.ts resolves it from
+    // the pump's `finally`), so awaiting it here cannot fail the step.
+    ...(result.warnings ? { warnings: await result.warnings } : {}),
   };
 }

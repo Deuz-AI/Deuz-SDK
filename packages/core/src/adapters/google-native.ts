@@ -15,7 +15,7 @@ import {
 } from '../errors';
 import { extractSystem } from '../core/normalize';
 import { applyProviderOptions } from '../internal/provider-options';
-import { resolveImage } from '../internal/image';
+import { resolveMedia } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
 import { toGeminiSchema } from '../schema/gemini';
@@ -92,7 +92,12 @@ function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart
     case 'text':
       return { text: part.text };
     case 'image': {
-      const img = resolveImage(part);
+      // This wire already carries documents correctly: inlineData/fileData pass
+      // the mimeType straight through, so an `ImagePart` holding a PDF (the
+      // locked-union carrier) needs NO special block — only the right mimeType.
+      // `resolveMedia` (not `resolveImage`) is what stops a `…/report.pdf` URL
+      // from being labelled `image/jpeg` by the extension fallback.
+      const img = resolveMedia(part);
       if (img.kind === 'url') return { fileData: { mimeType: img.mediaType, fileUri: img.url! } };
       return { inlineData: { mimeType: img.mediaType, data: img.data } };
     }

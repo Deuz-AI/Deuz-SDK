@@ -4,6 +4,7 @@ import type { Usage, FinishReason } from '../types/usage';
 import type { Part } from '../types/message';
 import type { ToolChoice } from '../types/tool';
 import type { NormalizedMessage } from '../core/normalize';
+import type { WarningSink } from '../internal/warnings';
 import type { DeuzError } from '../errors';
 import {
   APICallError,
@@ -14,7 +15,14 @@ import {
   OverloadedError,
   RateLimitError,
 } from '../errors';
-import { resolveImage, toOpenAIImageUrl } from '../internal/image';
+import {
+  acceptsDocuments,
+  documentFilename,
+  resolveMedia,
+  toDataUrl,
+  toOpenAIImageUrl,
+  warnDroppedDocument,
+} from '../internal/image';
 import { applyProviderOptions } from '../internal/provider-options';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -31,7 +39,10 @@ interface OpenAIToolCall {
 
 type OpenAIContentBlock =
   | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string } };
+  | { type: 'image_url'; image_url: { url: string } }
+  // Documents (PDF, …) ride the Chat Completions `file` block — an `image_url`
+  // with a non-image data: URL 400s.
+  | { type: 'file'; file: { filename: string; file_data: string } };
 
 interface OpenAIMessage {
   role: string;
@@ -40,9 +51,28 @@ interface OpenAIMessage {
   tool_call_id?: string;
 }
 
+/**
+ * `BuildContext` plus the per-call warning sink (1.9).
+ *
+ * Declared here rather than on the shared `BuildContext` because this is the one
+ * wire that reports through it today; it is OPTIONAL, so a direct
+ * `buildRequest(ctx)` (every adapter unit test) still type-checks and simply
+ * degrades to the pre-1.9 log-only behaviour. Widening `adapters/types.ts` is the
+ * follow-up that lets the other three wires report too.
+ */
+/** What the message mapper needs to decide whether a document can ride this wire. */
+interface MediaContext {
+  caps: BuildContext['caps'];
+  provider: string;
+  modelId: string;
+  logger: BuildContext['logger'];
+  warnings?: WarningSink;
+}
+
 function toOpenAIMessages(
   messages: NormalizedMessage[],
   useDeveloperRole: boolean,
+  media: MediaContext,
 ): OpenAIMessage[] {
   const out: OpenAIMessage[] = [];
   for (const m of messages) {
@@ -92,19 +122,61 @@ function toOpenAIMessages(
         })),
       });
     } else {
-      const imageParts = m.content.filter(
+      // `ImagePart` is the carrier for documents too (the Part union is locked
+      // until 2.0) — classify each one instead of assuming an image.
+      const mediaParts = m.content.filter(
         (p): p is Extract<Part, { type: 'image' }> => p.type === 'image',
       );
-      if (imageParts.length > 0) {
+      if (mediaParts.length > 0) {
         const blocks: OpenAIContentBlock[] = [];
         if (text) blocks.push({ type: 'text', text });
-        for (const img of imageParts) {
+        for (const part of mediaParts) {
+          const resolved = resolveMedia(part);
+          if (resolved.isImage) {
+            blocks.push({ type: 'image_url', image_url: { url: toOpenAIImageUrl(resolved) } });
+            continue;
+          }
+          if (!acceptsDocuments(media.caps)) {
+            warnDroppedDocument(
+              media.logger,
+              {
+                provider: media.provider,
+                modelId: media.modelId,
+                mediaType: resolved.mediaType,
+                reason: 'this model has no document/vision capability in the registry',
+              },
+              media.warnings,
+            );
+            continue;
+          }
+          if (resolved.kind === 'url') {
+            // The `file` block takes `file_id` or inline `file_data` only —
+            // there is no URL form, and core never fetches bytes for the caller.
+            warnDroppedDocument(
+              media.logger,
+              {
+                provider: media.provider,
+                modelId: media.modelId,
+                mediaType: resolved.mediaType,
+                reason:
+                  'the Chat Completions `file` block cannot reference a URL (inline the bytes)',
+              },
+              media.warnings,
+            );
+            continue;
+          }
           blocks.push({
-            type: 'image_url',
-            image_url: { url: toOpenAIImageUrl(resolveImage(img)) },
+            type: 'file',
+            file: {
+              filename: documentFilename(resolved.mediaType),
+              file_data: toDataUrl(resolved),
+            },
           });
         }
-        out.push({ role, content: blocks });
+        // Every media part may have been dropped — fall back to plain text
+        // rather than emitting a content array holding a lone text block.
+        if (blocks.some((b) => b.type !== 'text')) out.push({ role, content: blocks });
+        else out.push({ role, content: text });
       } else {
         // Reasoning parts have no Chat Completions round-trip — dropped here.
         out.push({ role, content: text });
@@ -126,13 +198,19 @@ function mapOpenAIToolChoice(choice: ToolChoice | undefined): string | object | 
 }
 
 function buildRequest(ctx: BuildContext): AdapterRequest {
-  const { call, messages, caps, options, object, tools } = ctx;
+  const { call, messages, caps, options, object, tools, logger, warnings } = ctx;
   const reasoning = caps.reasoning;
   const restricted = caps.samplingRestrictions;
 
   const body: Record<string, unknown> = {
     model: call.modelId,
-    messages: toOpenAIMessages(messages, restricted),
+    messages: toOpenAIMessages(messages, restricted, {
+      caps,
+      provider: call.provider,
+      modelId: call.modelId,
+      logger,
+      warnings,
+    }),
     stream: true,
   };
 
@@ -177,7 +255,30 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       body.tool_choice = { type: 'function', function: { name } };
     }
   } else if (tools && tools.tools.length > 0) {
-    // Chat Completions has no hosted tools — provider-executed entries are dropped.
+    // Chat Completions has no hosted tools — provider-executed entries are
+    // dropped. The drop MUST be loud: ~15 provider ids ride this wire, and a
+    // silently removed `openaiWebSearch()` looks exactly like a model that
+    // chose not to search. One warn per request, naming every dropped tool.
+    const dropped = tools.tools.filter((t) => t.provider);
+    if (dropped.length > 0) {
+      const message =
+        `Dropped ${dropped.length} provider-executed tool(s) (${dropped
+          .map((t) => t.name)
+          .join(', ')}): the Chat Completions wire has no hosted-tool support, ` +
+        `so ${call.provider}/${call.modelId} will answer without them.`;
+      // The log line is unchanged (same message, same fields) — 1.9 ADDS the
+      // typed channel next to it: `warnings` on the result plus a `warning` part
+      // on `fullStream`. The sink records quietly, so a drop is still exactly
+      // ONE log line for anyone parsing logs.
+      logger?.warn(message, {
+        provider: call.provider,
+        modelId: call.modelId,
+        droppedTools: dropped.map((t) => t.name),
+      });
+      // `mirror: false` — this site already logged the same message above; 1.9 adds
+      // the typed channel, it does not double the log line (pinned by a test).
+      warnings?.add({ type: 'unsupported-tool', message }, { mirror: false });
+    }
     body.tools = tools.tools
       .filter((t) => !t.provider)
       .map((t) => ({

@@ -13,7 +13,7 @@
  * types are skipped (open-union rule). Serializers emit v1 byte-identically
  * when negotiated via {@link negotiateDeuzStreamVersion} / `wireVersion`.
  */
-import type { StreamChatResult, StreamObjectResult } from './types/methods';
+import type { CallWarning, StreamChatResult, StreamObjectResult } from './types/methods';
 import type { StreamPart, ToolRunState } from './types/stream';
 import type { Usage, FinishReason } from './types/usage';
 import type { Clock } from './types/deps';
@@ -91,7 +91,14 @@ export type DeuzUIPart =
   /** A sub-agent (`agentTool`) part, forwarded live with its path. */
   | { type: 'sub-agent'; agentPath: string[]; part: DeuzUIPart }
   /** App-defined typed data (v2 wire): `writeData('chart', …)` → `data-chart`. */
-  | { type: `data-${string}`; payload: unknown }
+  /**
+   * `id` (1.9 additive) makes a data part RECONCILABLE: re-writing the same
+   * `(name, id)` REPLACES the earlier entry instead of appending, so a live
+   * status widget ('searching…' → 'found 12' → 'ranking…') is one entry, not
+   * three. Absent `id` keeps 1.7/1.8 append-only semantics exactly, so a 1.8
+   * client reading a 1.9 stream is unaffected.
+   */
+  | { type: `data-${string}`; id?: string; payload: unknown }
   /** RAG citation (v2 wire): provenance for a retrieved chunk. */
   | {
       type: 'citation';
@@ -103,8 +110,25 @@ export type DeuzUIPart =
       chunkIndex?: number;
       score?: number;
     }
-  /** Tool lifecycle transition (v2 wire): render live tool status directly. */
-  | { type: 'tool-state'; toolCallId: string; toolName?: string; state: ToolRunState }
+  /**
+   * Tool lifecycle transition (v2 wire): render live tool status directly.
+   *
+   * `denied`/`deniedReason` (1.9 additive) qualify a terminal `state: 'error'`
+   * whose cause was an APPROVAL DENIAL rather than a thrown tool — otherwise
+   * the last frame of the approval flow reads "getWeather failed", which is the
+   * wrong story for a call a human refused. Both are OPTIONAL and
+   * `ToolRunState` deliberately gains no 7th member (it is a pinned root export
+   * and a new member would break any exhaustive switch), so a 1.8 client keeps
+   * rendering exactly the error state it always did.
+   */
+  | {
+      type: 'tool-state';
+      toolCallId: string;
+      toolName?: string;
+      state: ToolRunState;
+      denied?: boolean;
+      deniedReason?: string;
+    }
   /** Live cumulative USD cost (v2 wire) — feed a CostBadge directly. */
   | {
       type: 'cost';
@@ -115,6 +139,36 @@ export type DeuzUIPart =
     }
   /** Budget guardrail tripped (v2 wire) — precedes the terminal finish. */
   | { type: 'budget-exceeded'; kind: 'usd' | 'tokens'; limit: number; value: number }
+  /**
+   * A `verifyStep` verdict (v2 wire) — render "checking…"/"retrying" state.
+   * Field names mirror the canonical `VerifyPart` exactly.
+   */
+  | {
+      type: 'verify';
+      stepIndex: number;
+      attempt: number;
+      ok: boolean;
+      willRetry: boolean;
+      feedback?: string;
+    }
+  /**
+   * A non-fatal execution notice (v2 wire, 1.9) — a sampling param the wire
+   * could not carry, a clamped ceiling, an unknown slug served from the
+   * conservative fallback row. Purely informational: it never ends the stream
+   * (that is `error`) and never replaces a delta.
+   *
+   * The payload IS the canonical {@link CallWarning}, not a re-flattened copy,
+   * so the live view and the bulk one (`StreamChatResult.warnings`) are the same
+   * shape and a client never has to translate between them.
+   */
+  | { type: 'warning'; warning: CallWarning }
+  /**
+   * The false-finish guard rejected a natural completion (v2 wire, 1.9) —
+   * render "not done yet, continuing". Field names mirror the canonical
+   * `FalseFinishPart` exactly. `willRetry: false` is the rejection that spent
+   * the guard's budget, so the terminal `finish` follows immediately.
+   */
+  | { type: 'false-finish'; stepIndex: number; attempt: number; willRetry: boolean }
   /** Live plan snapshot (v2 wire) — render an autonomous run's to-do panel. */
   | {
       type: 'plan-update';
@@ -351,6 +405,16 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         toolCallId: part.toolCallId,
         ...(part.toolName ? { toolName: part.toolName } : {}),
         state: part.state,
+        // 1.9: forward the denial qualifier — without it an approval DENIAL is
+        // indistinguishable from a thrown tool at the wire, so denial died here
+        // and the UI drew "failed". `deniedReason` is free text that may be
+        // echoed from the CLIENT's own verdict (`tool-approval-response.reason`)
+        // or from a server policy string, so it passes `redactString` like every
+        // other server-supplied string on this wire (P0).
+        ...(part.denied ? { denied: true } : {}),
+        ...(part.deniedReason !== undefined
+          ? { deniedReason: redactString(part.deniedReason) }
+          : {}),
       };
     case 'cost':
       return {
@@ -366,6 +430,41 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         kind: part.kind,
         limit: part.limit,
         value: part.value,
+      };
+    case 'verify':
+      // Explicit case required — the default drops unknown canonical parts.
+      return {
+        type: 'verify',
+        stepIndex: part.stepIndex,
+        attempt: part.attempt,
+        ok: part.ok,
+        willRetry: part.willRetry,
+        ...(part.feedback !== undefined ? { feedback: part.feedback } : {}),
+      };
+    case 'warning': {
+      // Explicit case required — the default drops unknown canonical parts, and
+      // that is exactly where `warning` died before 1.9's wiring pass.
+      const warning = (part.warning ?? {}) as Partial<CallWarning>;
+      return {
+        type: 'warning',
+        warning: {
+          type: warning.type ?? 'other',
+          ...(warning.setting !== undefined ? { setting: warning.setting } : {}),
+          // A warning message is BUILT from user input (an option name, a model
+          // slug, an activeTools entry), so it goes through `redactString` like
+          // every other string this wire emits (P0) — belt and braces over
+          // `CallWarning`'s own no-secrets contract.
+          message: typeof warning.message === 'string' ? redactString(warning.message) : '',
+        },
+      };
+    }
+    case 'false-finish':
+      // Explicit case required — same gap `verify` had before Sprint 1.
+      return {
+        type: 'false-finish',
+        stepIndex: part.stepIndex,
+        attempt: part.attempt,
+        willRetry: part.willRetry,
       };
     case 'plan-update':
       return {
@@ -399,6 +498,18 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
  * Parts that exist only on wire v2 — never serialized to a negotiated-v1
  * client. Recursive: a v2-only part wrapped in `sub-agent` frames (agentTool
  * forwards child parts live) is just as invisible to v1.
+ *
+ * Granularity is the whole PART, never a field — and 1.9's additions need no
+ * per-field rule: `data-*.id` and `tool-state.denied`/`deniedReason` ride parts
+ * that are ALREADY wholly v2-only here, so v1 loses them with their carrier.
+ * Both are optional, so a 1.8 client on wire v2 simply ignores the extra keys —
+ * which is why they need no version of their own either.
+ *
+ * 1.9's two NEW parts (`warning`, `false-finish`) join the set for the same
+ * reason every other one is in it: a negotiated-v1 response must stay
+ * byte-identical to what pre-1.7 emitted, and `readDeuzStream`'s open-union rule
+ * means a v1 client would skip them anyway. The information is not lost — it
+ * also resolves in bulk on `StreamChatResult.warnings`.
  */
 function isV2OnlyPart(part: DeuzUIPart): boolean {
   if (part.type === 'sub-agent') return isV2OnlyPart(part.part);
@@ -407,6 +518,9 @@ function isV2OnlyPart(part: DeuzUIPart): boolean {
     part.type === 'tool-state' ||
     part.type === 'cost' ||
     part.type === 'budget-exceeded' ||
+    part.type === 'verify' ||
+    part.type === 'warning' ||
+    part.type === 'false-finish' ||
     part.type === 'plan-update' ||
     part.type === 'activity' ||
     part.type.startsWith('data-')
@@ -438,11 +552,17 @@ export interface ToDeuzStreamOptions {
   onStoreError?: (error: unknown) => void;
 }
 
+/** Per-`send` framing options (internal; surfaced as {@link WriteDataOptions}). */
+interface SendOptions {
+  /** Emit on the wire but never journal it — see the note inside `send`. */
+  transient?: boolean;
+}
+
 /** The shared SSE shell of both serializers. */
 function deuzSSEResponse(
   label: string,
   options: ToDeuzStreamOptions,
-  produce: (send: (part: DeuzUIPart) => void) => Promise<void>,
+  produce: (send: (part: DeuzUIPart, sendOptions?: SendOptions) => void) => Promise<void>,
 ): Response {
   const encoder = new TextEncoder();
   const version: DeuzWireVersion = options.wireVersion ?? 'v2';
@@ -488,10 +608,37 @@ function deuzSSEResponse(
           }
         }
       }
-      const send = (part: DeuzUIPart): void => {
+      const send = (part: DeuzUIPart, sendOptions?: SendOptions): void => {
         // v2-only parts are dropped entirely for a negotiated-v1 client (the
         // store must mirror the wire seq-for-seq, so they skip both).
         if (version === 'v1' && isV2OnlyPart(part)) return;
+        // A TRANSIENT part is off-journal AND off-seq (1.9). `seq` is the
+        // JOURNAL's coordinate system — the resume cursor is a seq and replay
+        // means "every record with seq > cursor" — so an event that is never
+        // stored must never own a coordinate in it. It rides the wire with NO
+        // `id:` line, which is legal SSE and exactly the semantics wanted: an
+        // id-less event leaves `Last-Event-ID` untouched, so a progress ping can
+        // never become a resume cursor and a reconnecting client just does not
+        // see the pings it missed.
+        //
+        // Consuming a seq instead (emitting `id: n` and skipping only the
+        // append) would punch a permanent hole in the log, and a CONTINUED leg —
+        // which numbers from `lastStoredSeq + 1` — could then REUSE a seq the
+        // client had already committed from a transient frame. Its first real
+        // part would be deduplicated away as a "replay" by `connectDeuzStream`,
+        // and `read(streamId, cursor)` would skip it too: silent data loss on
+        // resume. Off-seq keeps the wire's id space gapless and 1:1 with the
+        // journal, so nothing downstream has to know transients exist.
+        //
+        // It composes with the reader end too: `parseSSE`'s `id` is STICKY (SSE
+        // spec), so a transient frame reports the PREVIOUS event's id and
+        // `connectDeuzStream` re-commits the cursor it already had — it cannot
+        // move forward over an unjournaled event. Do not "fix" that stickiness
+        // and do not start stamping `id:` on transients.
+        if (sendOptions?.transient) {
+          enqueue(`data: ${JSON.stringify(part)}\n\n`);
+          return;
+        }
         // Store BEFORE wire: a part in flight during a disconnect must still
         // land in the log even though its enqueue never happens.
         writer?.append(seq, part);
@@ -580,6 +727,112 @@ export function toDeuzObjectStreamResponse(
 }
 
 // ===================================================================
+// Plain-text streaming — the frameless projection (1.9)
+// ===================================================================
+
+export interface ToDeuzTextStreamOptions {
+  /** Extra response headers (override the defaults set here). */
+  headers?: Record<string, string>;
+  /** Default false. When true, reasoning deltas are interleaved into the text. */
+  includeReasoning?: boolean;
+}
+
+/**
+ * Serialize a `StreamChatResult` to a PLAIN-TEXT streaming `Response`
+ * (`text/plain; charset=utf-8`, UTF-8 bytes, **no framing at all**) — the
+ * frameless counterpart to {@link toDeuzStreamResponse}, for consumers that
+ * cannot parse SSE: `curl`, a shell pipeline, a non-JS edge function, a widget
+ * that just appends bytes to a `<pre>`.
+ *
+ * Canonical line: this projects the CANONICAL `fullStream` (`text-delta`, plus
+ * `reasoning-delta` under `includeReasoning`) — never provider bytes. The
+ * result is byte-identical to concatenating `result.textStream`; `fullStream`
+ * is the single source read here because it is the one projection that reports
+ * failures as a part instead of throwing (see below), and reasoning only exists
+ * on it.
+ *
+ * ERROR SEMANTICS — the deliberate trade-off. A frameless format has nowhere to
+ * put an error: any string written into the body is INDISTINGUISHABLE from
+ * model output. Injecting one would be a correctness bug (the text lands in the
+ * user's transcript / gets persisted as an assistant message) and a safety
+ * problem (an attacker-influenced upstream message rendered as the model's own
+ * words). So a mid-stream failure — an `error` part OR a throwing source —
+ * simply CLOSES the body: HTTP truncation without a terminal frame is the
+ * signal, exactly as it is for a dropped connection. Callers that need to tell
+ * "finished" from "died" must use {@link toDeuzStreamResponse} (or check
+ * `result.finishReason`). Nothing is logged here: `ui.ts` carries no
+ * `Dependencies` seam, and `console.*` is banned in core — the error stays
+ * available on `result.fullStream`/`result.finishReason` for whoever owns the
+ * run. (`errorMessage`/`redactString` is what any future log line must go
+ * through — P0: nothing unredacted reaches a wire or log surface.)
+ *
+ * G2: returns synchronously and never throws. Client disconnects are handled
+ * exactly like {@link deuzSSEResponse}'s — a failed enqueue flips `clientGone`
+ * and the source keeps draining, so the run still reaches its terminal
+ * boundary (`onFinish`, chat persistence, checkpoints) after the reader leaves.
+ *
+ * Edge-safe.
+ */
+export function toDeuzTextStreamResponse(
+  result: StreamChatResult,
+  options: ToDeuzTextStreamOptions = {},
+): Response {
+  const encoder = new TextEncoder();
+  const includeReasoning = options.includeReasoning ?? false;
+
+  // Same discipline as `deuzSSEResponse`: the client can vanish mid-stream, and
+  // the enqueue that fails must not abort the drain of the source.
+  let clientGone = false;
+  const body = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const enqueue = (text: string): void => {
+        if (clientGone || text === '') return;
+        try {
+          controller.enqueue(encoder.encode(text));
+        } catch {
+          clientGone = true;
+        }
+      };
+      try {
+        for await (const part of result.fullStream) {
+          if (part.type === 'text-delta') {
+            enqueue(part.text);
+          } else if (includeReasoning && part.type === 'reasoning-delta' && !part.encrypted) {
+            // `encrypted` reasoning is an opaque provider payload (OpenAI
+            // Responses), not display text — never write it to a text body.
+            enqueue(part.text);
+          }
+          // Everything else — tool calls, steps, citations, and notably the
+          // `error` part — has no representation in a frameless format and is
+          // dropped. See the error-semantics note above.
+        }
+      } catch {
+        /* Throwing source: truncation is the only signal we may give. */
+      }
+      if (!clientGone) {
+        try {
+          controller.close();
+        } catch {
+          /* cancelled between the last enqueue and here */
+        }
+      }
+    },
+    cancel() {
+      clientGone = true;
+    },
+  });
+
+  return new Response(body, {
+    status: 200,
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-cache',
+      ...options.headers,
+    },
+  });
+}
+
+// ===================================================================
 // createDeuzStream — model stream + app data parts on one wire (v2)
 // ===================================================================
 
@@ -593,14 +846,46 @@ export interface CreateDeuzStreamOptions extends ToDeuzStreamOptions {
   dataSchemas?: Record<string, StandardSchemaV1>;
 }
 
+/** Options for one {@link DeuzStreamWriter.writeData} call (1.9 additive). */
+export interface WriteDataOptions {
+  /**
+   * Reconciliation key: every write of the same `(name, id)` addresses the SAME
+   * logical entry, so a live status widget ('searching…' → 'found 12 results' →
+   * 'ranking…') is ONE entry in the UI instead of three appended ones — and
+   * consumers stop inventing a private last-wins convention per name.
+   *
+   * The WIRE stays strictly append-only: each write is its own frame carrying
+   * the id, and last-write-wins is the CLIENT's job (`applyUIPart`). Collapsing
+   * frames server-side would break the seq↔journal 1:1 the resume cursor rides
+   * on (a replaced record would have to change under a seq a client may already
+   * hold) and would hide intermediate states from a live client that is past
+   * them. Omit `id` for the 1.7/1.8 append-only semantics, byte-for-byte.
+   */
+  id?: string;
+  /**
+   * Emit on the wire but do NOT journal to the `store` (default false), so a
+   * progress ping neither bloats a replayed stream nor lands in a persisted
+   * record. Transient parts are off-seq as well: they carry no SSE `id:` line
+   * and therefore never move a client's resume cursor (see `send`).
+   *
+   * Consequence to design for: a client that reconnects does not receive the
+   * transient parts it missed. Only write state you are happy to lose — the
+   * durable snapshot must be a normal (journaled) write.
+   */
+  transient?: boolean;
+}
+
 export interface DeuzStreamWriter {
   response: Response;
   /**
    * Queue a typed `data-{name}` part into the live stream. Safe to call from
    * anywhere while the model stream runs (tool `execute`, RAG pipeline, …);
    * writes after the stream ended are dropped.
+   *
+   * `options.id` makes the part addressable (client-side last-wins) and
+   * `options.transient` keeps it off the journal — see {@link WriteDataOptions}.
    */
-  writeData(name: string, payload: unknown): void;
+  writeData(name: string, payload: unknown, options?: WriteDataOptions): void;
   /** End the data channel early (it auto-closes when the model stream completes). */
   close(): void;
 }
@@ -609,7 +894,8 @@ export interface DeuzStreamWriter {
  * Like `toDeuzStreamResponse`, but returns a writer so the server can inject
  * typed `data-{name}` parts (chart payloads, RAG citations, progress markers)
  * into the SAME SSE response the model streams over — ordered, seq-numbered,
- * journaled to the `store`, and replayable like every other part.
+ * journaled to the `store`, and replayable like every other part (unless the
+ * write opts out with `{ transient: true }`).
  */
 export function createDeuzStream(
   result: StreamChatResult,
@@ -618,6 +904,8 @@ export function createDeuzStream(
   interface DataItem {
     name: string;
     payload: unknown;
+    id?: string;
+    transient?: boolean;
   }
   const queue: DataItem[] = [];
   let notify: (() => void) | undefined;
@@ -630,22 +918,38 @@ export function createDeuzStream(
 
   const response = deuzSSEResponse('createDeuzStream', options, async (send) => {
     const sendData = async (item: DataItem): Promise<void> => {
+      // One frame shape for both the validated and the raw path, so an
+      // addressable part keeps its `id` when `dataSchemas` is in play too. Key
+      // order matches the `data-${string}` variant's declaration (type, id,
+      // payload) — the wire is a JSON golden in several tests.
+      const frame = (payload: unknown): DeuzUIPart => ({
+        type: `data-${item.name}`,
+        ...(item.id !== undefined ? { id: item.id } : {}),
+        payload,
+      });
+      // A validation failure is a real diagnostic, not a ping: it is journaled
+      // even when the write that produced it was transient, so a replay (or a
+      // persisted record) still shows that a part was dropped.
+      const invalid = (): void => {
+        send({ type: 'error', message: `data part '${item.name}' failed validation.` });
+      };
+      const sendOptions: SendOptions | undefined = item.transient ? { transient: true } : undefined;
       const schema = options.dataSchemas?.[item.name];
       if (schema) {
         try {
           const checked = await schema['~standard'].validate(item.payload);
           if (checked.issues) {
-            send({ type: 'error', message: `data part '${item.name}' failed validation.` });
+            invalid();
             return;
           }
-          send({ type: `data-${item.name}`, payload: checked.value });
+          send(frame(checked.value), sendOptions);
           return;
         } catch {
-          send({ type: 'error', message: `data part '${item.name}' failed validation.` });
+          invalid();
           return;
         }
       }
-      send({ type: `data-${item.name}`, payload: item.payload });
+      send(frame(item.payload), sendOptions);
     };
 
     const model = (async () => {
@@ -673,9 +977,14 @@ export function createDeuzStream(
 
   return {
     response,
-    writeData(name, payload) {
+    writeData(name, payload, writeOptions) {
       if (closed) return;
-      queue.push({ name, payload });
+      queue.push({
+        name,
+        payload,
+        ...(writeOptions?.id !== undefined ? { id: writeOptions.id } : {}),
+        ...(writeOptions?.transient ? { transient: true } : {}),
+      });
       wake();
     },
     close() {
@@ -856,8 +1165,42 @@ export function resumeDeuzStreamResponse(
   });
 }
 
-/** Client-side reader: a Deuz-protocol SSE `Response` → `DeuzUIPart` async-iterable. */
-export async function* readDeuzStream(response: Response): AsyncGenerator<DeuzUIPart> {
+export interface ReadDeuzStreamOptions {
+  /**
+   * What to do with a NON-2xx response (default `'error-part'`): a failing
+   * route (500 + an HTML error page, 401, 429) carries no `data:` lines, so
+   * before 1.9 the generator ended silently and the UI rendered an EMPTY
+   * assistant bubble. `'ignore'` restores that pre-1.9 silence.
+   */
+  onHttpError?: 'error-part' | 'ignore';
+}
+
+/**
+ * Client-side reader: a Deuz-protocol SSE `Response` → `DeuzUIPart`
+ * async-iterable.
+ *
+ * G2-shaped: a failed response yields exactly ONE `error` part and returns —
+ * never a throw (`applyUIPart` records it into `turn.error`, which is what
+ * `useChat` turns into `status: 'error'`). The body is deliberately NOT read:
+ * an error page is arbitrary attacker-or-proxy-controlled markup of unbounded
+ * size, and the status line is what a UI can act on. `statusText` is the one
+ * server-supplied string echoed, bounded and passed through `redactString`
+ * (P0 — nothing unredacted reaches a UI/log surface).
+ */
+export async function* readDeuzStream(
+  response: Response,
+  options: ReadDeuzStreamOptions = {},
+): AsyncGenerator<DeuzUIPart> {
+  if (!response.ok && (options.onHttpError ?? 'error-part') === 'error-part') {
+    const statusText = redactString(response.statusText ?? '').slice(0, 200);
+    yield {
+      type: 'error',
+      message: `Deuz stream request failed (status ${response.status}${
+        statusText ? ` ${statusText}` : ''
+      }).`,
+    };
+    return;
+  }
   if (!response.body) return;
   for await (const ev of parseSSE(response.body)) {
     if (ev.data === '[DONE]') return;

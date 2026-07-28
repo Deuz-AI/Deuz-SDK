@@ -13,6 +13,7 @@
     "image-generation",
     "ui-streaming",
     "react-hooks",
+    "request-validation",
     "middleware",
     "pricing"
   ]

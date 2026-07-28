@@ -59,3 +59,57 @@ const result = streamChat({
 ```
 
 Pinned flagship slugs (tools / context) live in the [model registry](/docs/advanced/model-registry): e.g. `mistral-large-latest`, `deepseek-v3.2`, `qwen3-max`, `kimi-k2`.
+
+## `createOpenAICompatible()`
+
+For any host that speaks the OpenAI wire but has **no named factory** above — Ollama, vLLM, LM Studio, Perplexity, an internal company gateway. Before 1.9 the workaround was to point an unrelated factory somewhere else (`createGroq({ baseURL: 'http://localhost:11434/v1' })`), which then resolved keys, pricing, registry rows and every log line under the wrong provider id.
+
+```ts title="ollama.ts"
+import { createOpenAICompatible } from '@deuz-sdk/core/providers';
+
+const ollama = createOpenAICompatible({ id: 'ollama', baseURL: 'http://localhost:11434/v1' });
+const model = ollama('qwen3');
+// → { provider: 'ollama', modelId: 'qwen3', surface: 'chat_completions' }
+```
+
+```ts
+interface OpenAICompatibleSettings extends CompatSettings {
+  /** Provider id used for key/baseURL lookup, the registry, pricing and every log line. Required. */
+  id: string;
+  /** Wire dialect. Default 'chat_completions'. */
+  surface?: 'chat_completions' | 'responses';
+  /** Auth header style. Default 'bearer'. */
+  authHeader?: 'bearer' | 'api-key';
+  /** Capability overrides for this host's slugs. */
+  capabilities?: Partial<ModelCapabilities>;
+  // plus CompatSettings: apiKey, baseURL, fetch, headers
+}
+
+function createOpenAICompatible(settings: OpenAICompatibleSettings): Provider;
+```
+
+Key and base-URL resolution use the **same precedence chain** as every named factory — `deps.keyProvider` > factory `apiKey` > `createClient({ apiKeys: { [id]: … } })` > `AuthenticationError`. `id` creates no bypass.
+
+Two eager errors instead of a confusing 401 later:
+
+- an empty `id`, and
+- `surface: 'responses'` combined with `authHeader: 'api-key'` — the Responses adapter always sends `Authorization: Bearer`. Use `surface: 'chat_completions'`, or pass the header yourself via `headers: { 'api-key': … }`.
+
+<Callout type="warn" title="A custom `id` has no default base URL">
+Core never reads env vars, so there is no `OPENAI_BASE_URL`-style fallback. Pass `baseURL` here or via `createClient({ baseUrls: { [id]: … } })`, otherwise the call fails with an `InvalidRequestError` — `baseURL` is effectively required.
+</Callout>
+
+### `capabilities` for a host the registry does not know
+
+An unknown slug does not throw; it falls back to a conservative row whose `maxOutput` is `4096`, `reasoning` is `false` and `structuredOutput` is `false`. Set what you know, per factory or per call:
+
+```ts
+const gateway = createOpenAICompatible({
+  id: 'internal-gateway',
+  baseURL: 'https://llm.internal/v1',
+  apiKey: process.env.GATEWAY_KEY!,
+  capabilities: { maxOutput: 32_000, reasoning: true, structuredOutput: true },
+});
+```
+
+The per-call `capabilities` option wins over the factory value. See [capabilities](/docs/core/prompts-and-timeouts#capabilities) for what it can and cannot change.

@@ -5,10 +5,14 @@
 ```ts
 type ToolSet = Record<string, Tool>;
 interface Tool<Args = unknown, Result = unknown> {
+  type?: 'function' | 'provider';                          // 'provider' = provider-executed
   description?: string;
   parameters: StandardSchemaV1<unknown, Args> | JSONSchema; // zod/valibot OR raw JSON Schema
   execute?: (args: Args, ctx: ToolExecuteContext) => Promise<Result> | Result; // omit → client tool
   needsApproval?: boolean | ((args, ctx) => boolean | Promise<boolean>);
+  outputSchema?: JSONSchema;                               // metadata only, never sent on chat wires
+  providerTool?: Record<string, unknown>;                  // raw native def for a 'provider' tool
+  timeoutMs?: number;                                      // 1.9 — per-execution cap for THIS tool
 }
 interface ToolExecuteContext { toolCallId: string; messages: Message[]; signal?: AbortSignal; }
 type ToolChoice = 'auto' | 'required' | 'none' | { type: 'tool'; toolName: string };
@@ -26,6 +30,26 @@ const tools = {
 } satisfies ToolSet;
 ```
 
+## `tool()` — typed args (1.9)
+
+`ToolSet = Record<string, Tool>` ERASES `Tool<Args, Result>`, so a hand-written literal gets `args: unknown` and editing the schema produces no compile error in the handler. `tool()` (root export) fixes only that:
+
+```ts
+import { tool, type InferToolInput, type InferToolOutput } from '@deuz-sdk/core';
+import { z } from 'zod';
+
+const getWeather = tool({
+  description: 'Current weather for a city',
+  parameters: z.object({ city: z.string() }),
+  execute: async (args) => fetchWeather(args.city),   // args: { city: string }
+});
+await generateText({ model, prompt: 'weather?', maxSteps: 5, tools: { getWeather } });
+```
+
+It is a PURE IDENTITY FUNCTION (`tool(def) === def`), imports no validator and adds zero runtime behaviour. A raw JSON Schema degrades to `unknown` (never `any`) — narrow it yourself. One sharp edge: calling `myTool.execute(args, ctx)` DIRECTLY checks `args` as `unknown` (`Tool` is invariant in `Args`, so the return type is an intersection that stays assignable to plain `ToolSet`). Authoring inference and the loop are unaffected.
+
+`Tool.timeoutMs` overrides the call's `timeout.toolMs` for one tool. Expiry is SELF-HEALING — the execution is abandoned and the model gets `Tool 'x' timed out after Nms and was abandoned.` as an `is_error` result — and it COUNTS toward the runaway guard.
+
 ## The agentic loop
 
 Set on `generateText` / `streamChat` options: `tools`, `toolChoice?`, `maxSteps?`, `stopWhen?`, `maxToolConcurrency?`, `onStepFinish?`.
@@ -38,16 +62,17 @@ const res = await generateText({ model, messages, tools, maxSteps: 5 });
 ### Invariants you must respect
 
 - **`maxSteps` DEFAULT IS 1** = single turn. With tools but `maxSteps` left at 1, the model can request a tool but the loop will NOT feed the result back. Set `maxSteps > 1` to actually loop. (This is the #1 mistake.)
-- **`stopWhen`** is OR-ed with `maxSteps`. It's a predicate `(info: { steps; stepCount }) => boolean | Promise<boolean>`. `stepCountIs`/`hasToolCall` exist in source but are NOT part of the public surface (not re-exported from any subpath) — write your own inline predicate:
+- **`stopWhen`** is OR-ed with `maxSteps`. It's a predicate `(info: { steps; stepCount }) => boolean | Promise<boolean>`. `stepCountIs`, `hasToolCall`, `totalTokensExceed`, `costExceeds` and `durationExceeds` ARE exported from the root and `/edge`; a hand-written inline predicate works too:
   ```ts
   stopWhen: ({ steps }) => steps.at(-1)?.toolCalls.some(c => c.toolName === 'final') ?? false,
   ```
 - **Stop is decided on accumulated `tool_use` count, not `finishReason`** — the Gemini stop-bug guard. Don't add your own finishReason check.
 - **Immutable history.** Each step builds a new `[...messages, turn]` array (prompt-cache + React state depend on it). Never mutate prior arrays.
 - **Self-healing.** A thrown `execute` becomes an `is_error` tool_result fed back to the model — never a throw out of the loop. Every `tool_use_id` always gets a matching `tool_result` (Anthropic 400s otherwise).
-- **Runaway guards.** The same tool failing 3 times consecutively hard-stops. Approval DENIALS are excluded from this counter (deliberate, not failures).
+- **Runaway guards.** The same tool failing 3 times consecutively hard-stops (`endReason: 'runaway-tool-errors'`). Unknown-tool errors and tool timeouts COUNT toward it; approval DENIALS are excluded (a policy verdict is not something the model can fix).
 - **Parallel tools**, concurrency-capped by `maxToolConcurrency` (default 5).
-- **Client tools** (no `execute`) break the loop early; the caller owns the round-trip and must append the `tool_result` message itself.
+- **Client tools** — a key PRESENT in `tools` with no `execute` — break the loop early; the caller owns the round-trip and must append the `tool_result` message itself.
+- **An UNREGISTERED name is NOT a client tool** (changed in 1.9). Before 1.9 both satisfied `!tools[name]?.execute`, so a hallucinated name broke the loop and left a dangling `tool_use` nobody could answer. Now it self-heals — `No such tool: "x". Available tools: a, b.` as an `is_error` result — and the loop CONTINUES. Own keys only, so `toString` / `constructor` are unknown too. A `type: 'provider'` tool also has no `execute` but never breaks the loop.
 
 ### Streaming the loop
 
@@ -90,6 +115,32 @@ ALWAYS protected: every system message, the first user message, the LAST message
 - **Server mode** — pass `approveToolCall: (call, { messages }) => boolean | Promise<boolean>` on the options. Awaited per gated call; `false`/throw → `is_error` `'Tool call denied.'` tool_result, loop continues (denials never trip the runaway guard).
 - **Client mode** — omit `approveToolCall`: gated calls break the loop like client tools (ONE break, nothing in that batch executes). `generateText` returns `pendingApprovals: [{ approvalId, toolCallId, toolName, input }]` (`approvalId === toolCallId`); streaming emits `tool-approval-request` parts. Resume with `approvalResponses: [{ approvalId, approved, reason? }]` — approved execute, denied become is_error, **no-verdict gated calls DENY by default**, deferred plain server tools auto-execute, every tool_use id gets answered. Settled results append as a NEW `role:'tool'` message (in `response.messages`) and stream as `tool-result` parts before the first `step-start`.
 
+## createAgent — a reusable agent as a VALUE (1.9)
+
+`@deuz-sdk/core/agent` (also on `/edge`). NOT a class: a free-function factory returning a FROZEN plain object of closures, in the `createClient` idiom. No `new`, no prototype, no new runtime — `agent.streamChat(o)` IS `streamChat({ ...def, ...o })`.
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+
+const support = createAgent({
+  name: 'support',                 // observation label + asTool()'s agentPath segment; never on a wire
+  model: anthropic('claude-opus-4-8'),
+  instructions: 'You are a terse support agent.',
+  tools: { lookupOrder },
+  maxSteps: 8,                     // remember: the default is 1
+});
+
+await support.generateText({ prompt: 'where is order 12?' });
+const res = support.streamChat({ prompt: '…' });   // SYNCHRONOUS (G2), never throws
+const strict = support.with({ temperature: 0 });   // a NEW frozen agent; the original is untouched
+const sub = support.asTool();                      // built by the existing agentTool
+```
+
+- **Merge rule, one sentence:** shallow TOP-LEVEL spread. A per-call key REPLACES the def's value whole — including `tools`, `deps`, `providerOptions` and `stopWhen` arrays. An explicit `undefined` UNSETS it. Opt into merging yourself: `{ deps: { ...support.def.deps, observer } }`.
+- **`generateObject` on an agentic def FAILS by design** (structured output refuses loop options). Pass `{ tools: undefined, maxSteps: undefined }` per call, or bake it with `with(...)`.
+- **`asTool()` forwards only** `model`, `tools`, `instructions` (→ `system`), `maxSteps`, `stopWhen`, `compaction`, `name`. Sampling params, `verifyStep`, `deps`, `timeout`, `memory` do NOT cross — the sub-agent reuses the PARENT's transport and approval flow. Omitted fields keep `agentTool`'s defaults (maxSteps 10, maxDepth 2).
+- `def` is a shallow-frozen COPY, so mutating your original object afterwards changes nothing.
+
 ## Structured output — streamObject (1.3.0+)
 
 `streamObject(options)` = same options as `generateObject`, returns SYNCHRONOUSLY (G2): `{ partialObjectStream: AsyncIterable<DeepPartial<T>>, object: Promise<T>, usage, finishReason }`. json strategy streams growing partials (emit only on change; string values arrive truncated); tool strategy buffers ONE final emission. **NO repair retry** (divergence from generateObject — partials can't be un-streamed): failed final parse/validation rejects `object` (NoObjectGeneratedError) AND the stream, but `usage`/`finishReason` still resolve.
@@ -108,6 +159,7 @@ const { object, usage, finishReason } = await generateObject({
 - **`auto`** picks `json` when the model's registry capabilities include `structuredOutput`, else `tool` (function-calling coercion).
 - One **repair retry** on parse/validation failure; then `NoObjectGeneratedError`.
 - **Anthropic + extended thinking** (`effort` set and not `'none'`) forces `json` mode — forced tool-choice is rejected by the API with thinking on. `auto` handles this for you; don't pass `mode: 'tool'` there.
+- **LOOP OPTIONS ARE REFUSED (1.9).** Structured output is single-turn, so `tools`, `toolChoice`, `maxSteps > 1`, `stopWhen`, `budget`, `maxToolConcurrency`, `onStepFinish`, `prepareStep`, `activeTools`, `verifyStep`, `maxVerifyAttempts`, `compaction`, `approveToolCall`, `approvalResponses`, `session`, `chat`, `memory`, `fallbackModels`, `approvalSigner` and `approvalMaxAgeMs` now raise an `InvalidRequestError` BEFORE any network request (they used to be silently ignored). `generateObject` rejects; `streamObject` reports it through its never-throw shape. Empty collections (`tools: {}`, `stopWhen: []`) and `maxSteps: 1` pass the guard. To combine tools with structure: run the loop with `generateText`, then structure its `text` with `generateObject`.
 
 ```ts
 import { z } from 'zod';

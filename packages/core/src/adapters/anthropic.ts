@@ -14,7 +14,7 @@ import {
 } from '../errors';
 import { extractSystem } from '../core/normalize';
 import { applyProviderOptions } from '../internal/provider-options';
-import { resolveImage } from '../internal/image';
+import { acceptsDocuments, resolveMedia, warnDroppedDocument } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
 
@@ -27,7 +27,18 @@ interface AnthropicBlock {
   [key: string]: unknown;
 }
 
-function partToBlock(part: Part): AnthropicBlock {
+/** What `partToBlock` needs to decide whether a document can ride this wire. */
+interface MediaContext {
+  caps: BuildContext['caps'];
+  provider: string;
+  modelId: string;
+  logger: BuildContext['logger'];
+  /** Per-call warning sink (1.9): a dropped document is reported, not just logged. */
+  warnings: BuildContext['warnings'];
+}
+
+/** Returns null when the part cannot be carried and was dropped (warned). */
+function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
   switch (part.type) {
     case 'text':
       return { type: 'text', text: part.text };
@@ -49,7 +60,32 @@ function partToBlock(part: Part): AnthropicBlock {
             ...(part.signature ? { signature: part.signature } : {}),
           };
     case 'image': {
-      const img = resolveImage(part);
+      // `ImagePart` carries documents too (the Part union is locked until 2.0)
+      // — a PDF must become a `document` block, never an `image` one: /v1/messages
+      // 400s on `image` with a non-image media_type.
+      const img = resolveMedia(part);
+      if (!img.isImage) {
+        if (!acceptsDocuments(media.caps)) {
+          warnDroppedDocument(
+            media.logger,
+            {
+              provider: media.provider,
+              modelId: media.modelId,
+              mediaType: img.mediaType,
+              reason: 'this model has no document/vision capability in the registry',
+            },
+            media.warnings,
+          );
+          return null;
+        }
+        if (img.kind === 'url') {
+          return { type: 'document', source: { type: 'url', url: img.data } };
+        }
+        return {
+          type: 'document',
+          source: { type: 'base64', media_type: img.mediaType, data: img.data },
+        };
+      }
       if (img.kind === 'url') {
         return { type: 'image', source: { type: 'url', url: img.data } };
       }
@@ -96,9 +132,18 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options } = ctx;
   const { system, rest } = extractSystem(messages);
 
+  const media: MediaContext = {
+    caps,
+    provider: call.provider,
+    modelId: call.modelId,
+    logger: ctx.logger,
+    warnings: ctx.warnings,
+  };
   const wireMessages = rest.map((m) => ({
     role: m.role === 'tool' ? 'user' : m.role,
-    content: orderReasoningFirst(m.content.map(partToBlock)),
+    content: orderReasoningFirst(
+      m.content.map((p) => partToBlock(p, media)).filter((b): b is AnthropicBlock => b !== null),
+    ),
   }));
 
   const effortOn = caps.reasoning && options.effort !== undefined && options.effort !== 'none';
