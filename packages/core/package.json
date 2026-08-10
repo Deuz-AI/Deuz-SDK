@@ -575,7 +575,8 @@
     "verify:api": "node tooling/check-api-contract.mjs",
     "check": "npm run lint && npm run typecheck && npm run test && npm run test:types && npm run build && npm run verify:package && npm run verify:runtime && npm run verify:size && npm run verify:api",
     "prepare": "tsup",
-    "prepublishOnly": "npm run check"
+    "prepublishOnly": "npm run check",
+    "test:live": "vitest run --config vitest.live.config.ts"
   },
   "keywords": [
     "ai",

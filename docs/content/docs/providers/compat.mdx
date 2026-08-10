@@ -11,7 +11,7 @@ Every factory below speaks the OpenAI **Chat Completions** wire (`surface: 'chat
 | --- | --- | --- | --- |
 | `createGroq` | `groq` | `https://api.groq.com/openai/v1` | LPU cloud |
 | `createMistral` | `mistral` | `https://api.mistral.ai/v1` | La Plateforme |
-| `createDeepSeek` | `deepseek` | `https://api.deepseek.com/v1` | V3 / R1 |
+| `createDeepSeek` | `deepseek` | `https://api.deepseek.com/v1` | V3 / R1 / V4 — see the [V4 note](#deepseek-v4-always-thinks) |
 | `createTogether` | `together` | `https://api.together.xyz/v1` | Open models |
 | `createOpenRouter` | `openrouter` | `https://openrouter.ai/api/v1` | Multi-provider router |
 | `createCerebras` | `cerebras` | `https://api.cerebras.ai/v1` | Wafer-scale |
@@ -32,6 +32,40 @@ Every factory below speaks the OpenAI **Chat Completions** wire (`surface: 'chat
 | `createBedrock` | `bedrock` | Mantle `…/openai/v1` | See [Amazon Bedrock](/docs/providers/bedrock) — Bearer API key |
 
 Lowercase singletons (`mistral`, `deepseek`, `kimi`, `qwen`, `perplexity`, `ollama`, …) are exported unbound — prefer the `create*` factories with an explicit `apiKey` in apps.
+
+### DeepSeek V4 always thinks
+
+`deepseek-v4-flash` and `deepseek-v4-pro` reason on every call — there is no switch — and that has two consequences worth knowing before you debug something that is not a bug. Both were confirmed against the live API; the assertions live in `test/live/deepseek.live.test.ts`.
+
+**Reasoning shares the output budget.** `reasoning_content` is billed and counted as output, so a `maxOutputTokens` sized for the visible reply returns an **empty string** rather than an error — the thinking pass consumed the allowance. Give it room:
+
+```ts
+const result = await generateText({
+  model: deepseek('deepseek-v4-flash'),
+  prompt: 'Reply with the single word: pong',
+  maxOutputTokens: 512, // 16 would come back empty
+});
+// result.usage.reasoningTokens tells you what the thinking cost
+```
+
+Reasoning arrives as `reasoning-delta` parts, never spliced into `textStream` — the two channels stay apart.
+
+<Callout type="warn">
+  **`generateObject` does not work on V4.** It has two strategies and V4 rejects both: `json` sends `response_format: json_schema`, which V4 answers with *"This response_format type is unavailable now"*, and `tool` forces `tool_choice`, which it answers with *"Thinking mode does not support this tool_choice"*.
+
+  Ordinary (unforced) tool calling is unaffected, so the agentic loop works normally — only the forced-coercion path is closed. Until a `json_object` strategy exists, ask for the shape in the prompt:
+
+  ```ts
+  const { text } = await generateText({
+    model: deepseek('deepseek-v4-flash'),
+    prompt: 'Return ONLY JSON matching {"capital": string} for the capital of Turkey.',
+    maxOutputTokens: 512,
+  });
+  const parsed = JSON.parse(text);
+  ```
+</Callout>
+
+The wire accepts `max_tokens` up to 65,536, but the registry keeps the default at 8,192: one runaway thinking pass at the ceiling is a real bill. Raise it per call when an answer needs the room.
 
 Every factory takes the same `CompatSettings`: `apiKey`, `baseURL`, `fetch`, `headers`, and (2.0) `capabilities` — capability overrides applied to every slug that factory mints, for a host whose slugs the [registry](/docs/advanced/model-registry) does not pin.
 

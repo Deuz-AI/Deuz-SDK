@@ -235,6 +235,26 @@ const REGISTRY: Record<string, Row> = {
   'deepseek-v3.2': row('deepseek', 'chat_completions', {
     structuredOutput: false,
   }),
+  // DeepSeek v4 always reasons — there is no switch, and `reasoning_content`
+  // comes back on every call. Two consequences verified against the live API
+  // (test/live/deepseek.live.test.ts):
+  //   - reasoning tokens are drawn from the SAME budget as the answer, so a
+  //     `maxOutputTokens` sized for the reply alone yields an empty string;
+  //   - it rejects `response_format: json_schema` ("unavailable now") AND forced
+  //     `tool_choice` ("Thinking mode does not support this tool_choice"), which
+  //     is both of `generateObject`'s strategies. Use `generateText` with the
+  //     shape in the prompt until a `json_object` strategy exists.
+  // maxOutput stays at the 8_192 default: the wire accepts up to 65_536, but a
+  // default that high turns one runaway thinking pass into a real bill. Raise it
+  // per call when a long answer needs the room.
+  'deepseek-v4-flash': row('deepseek', 'chat_completions', {
+    reasoning: true,
+    structuredOutput: false,
+  }),
+  'deepseek-v4-pro': row('deepseek', 'chat_completions', {
+    reasoning: true,
+    structuredOutput: false,
+  }),
   'mistral-large-latest': row('mistral', 'chat_completions', {
     vision: true, // Mistral Large 3 is multimodal-by-design
     structuredOutput: false,
