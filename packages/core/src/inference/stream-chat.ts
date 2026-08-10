@@ -11,7 +11,15 @@ const dispatch = (options: StreamChatOptions): StreamChatResult =>
   // `doneWhen` (1.9, N2) fires at the natural-completion boundary, which only
   // the loop has — routing a tool-less call here is what keeps the option from
   // being silently ignored.
-  options.doneWhen
+  options.doneWhen ||
+  // Guardrails (2.0) hang off loop boundaries the single-turn stream does not
+  // have (the pre-run input hook, the natural-completion output hook), so a
+  // tool-less guarded call routes here — an accepted-but-inert safety control is
+  // the worst possible outcome for this option.
+  options.guardrails ||
+  // Zero-config MCP (2.0): the servers' tools ARE the tool set, so a call whose
+  // only tools are remote still belongs in the loop.
+  (options.mcp?.length ?? 0) > 0
     ? runStreamToolLoop(options)
     : runStream(options);
 

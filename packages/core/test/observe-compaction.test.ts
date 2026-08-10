@@ -4,11 +4,11 @@
  * once), no-trigger silence, skip events, never-fails-the-run.
  */
 import { describe, it, expect } from 'vitest';
-import { generateText } from '../src/index';
+import { generateText, streamChat } from '../src/index';
 import { createAnthropic } from '../src/anthropic';
 import { createMemoryObserver } from '../src/observe';
 import { sseResponse, sseEvents, mockFetchSequence } from './fixtures/sse';
-import type { Clock, Message, ObserveEvent, JSONSchema } from '../src/index';
+import type { Clock, Message, ObserveEvent, JSONSchema, StreamPart } from '../src/index';
 
 type Ev<T extends ObserveEvent['type']> = Extract<ObserveEvent, { type: T }>;
 
@@ -189,6 +189,66 @@ describe('compaction observation', () => {
     const compaction = mem.events().find((e) => e.type === 'compaction') as Ev<'compaction'>;
     expect(compaction.layer).toBe('summarize');
     expect(compaction.messageCountAfter).toBeLessThan(compaction.messageCountBefore);
+  });
+
+  it("every threshold-driven layer reports trigger: 'threshold' — on the event AND the stream part", async () => {
+    const mem = createMemoryObserver();
+    const { fetch } = mockFetchSequence([() => sseResponse([FINAL])]);
+    const res = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: bigHistory(6),
+      tools: TOOLS,
+      compaction: {
+        threshold: 0,
+        keepRecentSteps: 1,
+        layers: ['prune-tool-results', 'prune-reasoning'],
+      },
+      deps: { observer: mem, clock: fastClock() },
+    });
+    const parts: StreamPart[] = [];
+    for await (const p of res.fullStream) parts.push(p);
+
+    const partTriggers = parts
+      .filter((p): p is Extract<StreamPart, { type: 'compaction' }> => p.type === 'compaction')
+      .map((p) => p.trigger);
+    expect(partTriggers.length).toBeGreaterThan(0);
+    expect(new Set(partTriggers)).toEqual(new Set(['threshold']));
+
+    const events = mem.events().filter((e) => e.type === 'compaction') as Ev<'compaction'>[];
+    expect(events.length).toBe(partTriggers.length);
+    for (const e of events) expect(e.trigger).toBe('threshold');
+  });
+
+  it('policy.countTokens replaces the heuristic BASE count the threshold reads', async () => {
+    const run = async (
+      countTokens?: (messages: Message[]) => number,
+    ): Promise<Ev<'compaction'>[]> => {
+      const mem = createMemoryObserver();
+      const { fetch } = mockFetchSequence([() => sseResponse([FINAL])]);
+      await generateText({
+        model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+        messages: bigHistory(6),
+        tools: TOOLS,
+        compaction: {
+          keepRecentSteps: 1,
+          layers: ['prune-tool-results'],
+          ...(countTokens ? { countTokens } : {}),
+        },
+        deps: { observer: mem, clock: fastClock() },
+      });
+      return mem.events().filter((e) => e.type === 'compaction') as Ev<'compaction'>[];
+    };
+
+    // The char heuristic puts this history nowhere near the 0.92 default.
+    expect(await run()).toHaveLength(0);
+    // A (deliberately absurd) real tokenizer says otherwise — and its number is
+    // what the event reports, so the substitution is visible, not just implied.
+    // The slug's window is 1M, so the counter has to clear 920k to trip it.
+    const forced = await run(() => 2_000_000);
+    expect(forced).toHaveLength(1);
+    expect(forced[0]!.tokensBefore).toBe(2_000_000);
+    expect(forced[0]!.contextWindow).toBe(1_000_000);
+    expect(forced[0]!.trigger).toBe('threshold');
   });
 
   it('a THROWING summarizer: compaction.skipped, run continues (never run.failed)', async () => {

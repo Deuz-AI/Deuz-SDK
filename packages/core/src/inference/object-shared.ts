@@ -76,6 +76,15 @@ const IGNORED_OBJECT_OPTIONS = [
   'fallbackModels',
   'approvalSigner',
   'approvalMaxAgeMs',
+  // Zero-config MCP (2.0): connecting servers only to drop their tools would be
+  // the exact silent-ignore this guard exists for — and it would pay a full
+  // handshake for nothing.
+  'mcp',
+  // Guardrails (2.0): all three hooks hang off loop boundaries a single-turn
+  // object call does not have. Accepting them would leave the caller believing a
+  // safety control is armed while it is inert — the one failure mode
+  // `types/guardrails.ts` is written to prevent.
+  'guardrails',
 ] as const satisfies readonly (keyof CommonCallOptions)[];
 
 /** Keys whose EMPTY value asks for nothing (a generic wrapper spreading `tools: {}` is not a bug). */

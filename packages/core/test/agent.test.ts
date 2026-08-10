@@ -9,9 +9,41 @@ import type { JSONSchema } from '../src/types/schema';
 import type { Message } from '../src/types/message';
 import type { Usage } from '../src/types/usage';
 import type { UsageMeta } from '../src/types/deps';
-import type { ToolExecuteContext } from '../src/types/tool';
+import type { ToolExecuteContext, ToolSet } from '../src/types/tool';
+import type { McpClient } from '../src/mcp/shared';
 
 const PING_SCHEMA: JSONSchema = { type: 'object', properties: {}, additionalProperties: false };
+
+/**
+ * A hand-written `McpClient` — no server, no SDK. `createAgent` has NO MCP code
+ * of its own (the def field rides the same `{ ...def, ...options }` spread as
+ * every other option), so what these tests pin is that the spread reaches the
+ * loop's `options.mcp`, not the transport.
+ */
+function fakeMcpClient(record: string[]): McpClient {
+  const unsupported = (): Promise<never> => Promise.reject(new Error('not supported'));
+  return {
+    listTools: (namespace) =>
+      Promise.resolve({
+        [namespace ? `${namespace}_remoteEcho` : 'remoteEcho']: {
+          description: 'Echo, from an MCP server.',
+          parameters: { type: 'object', properties: { value: { type: 'string' } } },
+          execute: (args) => {
+            record.push('remoteEcho');
+            return Promise.resolve(`remote:${(args as { value: string }).value}`);
+          },
+        },
+      } satisfies ToolSet),
+    callTool: () => Promise.resolve('remote'),
+    listResources: unsupported,
+    readResource: unsupported,
+    listPrompts: unsupported,
+    getPrompt: unsupported,
+    status: () => 'connected',
+    onToolListChanged: () => () => {},
+    close: () => Promise.resolve(),
+  };
+}
 
 const CITY_SCHEMA: JSONSchema = {
   type: 'object',
@@ -342,6 +374,49 @@ describe('createAgent — def fields reach the loop', () => {
     expect(res.steps).toHaveLength(2);
     expect(ping).toHaveBeenCalledTimes(2);
     expect(res.providerMetadata?.deuz).toMatchObject({ stoppedBy: 'stepCountIs' });
+  });
+
+  it('def `mcp` contributes its tools to the loop (2.0, no agent.ts code involved)', async () => {
+    const record: string[] = [];
+    const agent = createAgent({
+      model: createMockModel({
+        responses: [
+          { toolCalls: [{ toolName: 'remoteEcho', args: { value: 'hi' } }] },
+          { text: 'echoed' },
+        ],
+      }),
+      // A def with NO `tools` of its own: the MCP server's catalog is the tool
+      // set, and the call still has to route through the agentic loop.
+      mcp: [fakeMcpClient(record)],
+      maxSteps: 4,
+    });
+
+    const res = await agent.generateText({ prompt: 'go' });
+
+    expect(record).toEqual(['remoteEcho']);
+    expect(res.steps![0]!.toolResults[0]!.result).toBe('remote:hi');
+    expect(res.text).toBe('echoed');
+    // The def is public and frozen — the field is carried, not consumed.
+    expect(agent.def.mcp).toHaveLength(1);
+  });
+
+  it('def `mcp` makes an object call refuse, and `mcp: undefined` is the documented fix', async () => {
+    const agent = createAgent({
+      model: createMockModel({ responses: [{ text: '{"city":"Paris"}' }] }),
+      mcp: [fakeMcpClient([])],
+    });
+
+    await expect(
+      agent.generateObject({ schema: CITY_SCHEMA, mode: 'json', prompt: 'capital of France?' }),
+    ).rejects.toMatchObject({ code: 'invalid_request' });
+
+    const res = await agent.generateObject<{ city: string }>({
+      schema: CITY_SCHEMA,
+      mode: 'json',
+      prompt: 'capital of France?',
+      mcp: undefined,
+    });
+    expect(res.object).toEqual({ city: 'Paris' });
   });
 
   it('def `verifyStep` re-drives the loop and marks the verdict', async () => {

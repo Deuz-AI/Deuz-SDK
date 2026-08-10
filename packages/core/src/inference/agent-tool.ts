@@ -148,6 +148,12 @@ export function agentTool(def: AgentToolDef): Tool {
           ...(def.stopWhen ? { stopWhen: def.stopWhen } : {}),
           ...(def.compaction ? { compaction: def.compaction } : {}),
           ...(ctx.signal ? { signal: ctx.signal } : {}),
+          // Request-scoped context (2.0) is INHERITED: the tenant / signed-in
+          // user / DB handle that reached this tool is the same one the
+          // sub-agent's own tools need, and a sub-agent that had to be handed it
+          // through a closure would defeat the point of the option. Omitted (not
+          // `undefined`) when the parent call carried none.
+          ...(ctx.runtimeContext !== undefined ? { runtimeContext: ctx.runtimeContext } : {}),
           // Inherit the parent's server-mode approver so sub-agent calls stay gated.
           ...(ctx.approveToolCall ? { approveToolCall: ctx.approveToolCall } : {}),
           ...(innerDeps ? { deps: innerDeps } : {}),

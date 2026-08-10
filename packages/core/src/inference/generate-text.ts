@@ -27,7 +27,15 @@ export const generateText: GenerateText = async (options): Promise<GenerateTextR
     // `doneWhen` (1.9, N2): the natural-completion boundary exists only inside
     // the loop, so a tool-less call has to be routed through it or the option
     // would be accepted and silently ignored.
-    options.doneWhen
+    options.doneWhen ||
+    // Guardrails (2.0) hang off loop boundaries the single-turn path does not
+    // have (the pre-run input hook, the natural-completion output hook), so a
+    // tool-less guarded call routes here — an accepted-but-inert safety control
+    // is the worst possible outcome for this option.
+    options.guardrails ||
+    // Zero-config MCP (2.0): the servers' tools ARE the tool set, so a call
+    // whose only tools are remote still belongs in the loop.
+    (options.mcp?.length ?? 0) > 0
   ) {
     return runToolLoop(options);
   }

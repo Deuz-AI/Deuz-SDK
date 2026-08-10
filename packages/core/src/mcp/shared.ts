@@ -483,11 +483,22 @@ export async function createManagedConnection(
     const transport = await options.makeTransport();
     // Registered BEFORE connect so a handshake that dies immediately is still seen.
     const seen: { error?: unknown } = {};
+    // `onerror` is registered before connecting so a handshake that dies
+    // immediately still records why. `onclose` only arms recovery once the
+    // session is actually live: a `connect()` that throws unwinds through its
+    // caller, which already owns the retry. The SDK closes its own client when
+    // initialize fails, so an eagerly-armed handler would ALSO start a recovery
+    // loop — one failed attempt forked into two, each restarting the attempt
+    // counter at 1, and `maxAttempts` stopped bounding anything.
+    let live = false;
     next.onerror = (error) => {
       seen.error = error;
     };
-    next.onclose = () => onDrop(gen, seen.error);
+    next.onclose = () => {
+      if (live) onDrop(gen, seen.error);
+    };
     await next.connect(transport);
+    live = true;
     client = next;
     // Raced with close(): the caller already gave up, so hang up the new session.
     if (closed) void safeClose(next);
@@ -590,6 +601,14 @@ export interface McpClient {
   /** Current connection state; always `'connected'` for an unmanaged client. */
   status(): McpConnectionStatus;
   /**
+   * The server's `Implementation` block from the handshake (2.0), or `undefined`
+   * when the SDK/transport did not expose one. Zero-config MCP derives its
+   * default tool-name prefix from `name`, which is why it is on the client at
+   * all — and OPTIONAL so a hand-written `McpClient` (test fake, custom
+   * transport) stays valid, falling back to the positional `mcp{N}` prefix.
+   */
+  serverInfo?(): { name: string; version?: string } | undefined;
+  /**
    * Fires when the server's tool list is invalidated (`tools/list_changed`, or a
    * reconnect landing on a possibly-different server). The next `listTools()`
    * refetches; returns an unsubscribe.
@@ -662,6 +681,14 @@ export function wrapMcpClient(raw: RawMcpClient, managed?: ManagedMcp): McpClien
       return fn({ name, ...(args ? { arguments: args } : {}) });
     },
     status: () => managed?.status() ?? 'connected',
+    // Read through `current()`: a reconnect can land on a redeployed server, and
+    // a cached name would then describe the previous one.
+    serverInfo() {
+      const info = current().getServerVersion?.();
+      return info?.name !== undefined
+        ? { name: info.name, ...(info.version !== undefined ? { version: info.version } : {}) }
+        : undefined;
+    },
     onToolListChanged: (cb) => managed?.onToolListChanged(cb) ?? (() => {}),
     close: () => (managed ? managed.close() : raw.close()),
   };

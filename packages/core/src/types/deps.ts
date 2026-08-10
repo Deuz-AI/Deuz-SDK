@@ -1,5 +1,10 @@
 import type { Usage, FinishReason } from './usage';
 import type { Observer } from './observe';
+// TYPE-ONLY (the `McpClient` precedent in types/config.ts): `mcp/resolve.ts` has
+// a real runtime body, but `import type` is erased under `verbatimModuleSyntax`,
+// so declaring the pool seam here costs the core/edge bundle nothing. The loop
+// still reaches the module through its dynamic import.
+import type { McpConnectionPool } from '../mcp/resolve';
 
 /**
  * The single injection seam. Everything stateful / side-effecting is injected
@@ -46,6 +51,15 @@ export interface Dependencies {
    * Required set — absence IS the fast-path signal.
    */
   observer?: Observer;
+  /**
+   * Cross-call MCP connection cache (2.0 additive). Without it, every call that
+   * passes `mcp: [{ url }]` connects and then closes; with it, the config-based
+   * entries come from the pool and SURVIVE the run — the connection belongs to
+   * the pool, so `closeOwned()` leaves it alone and only `pool.close()` (a
+   * process-shutdown concern) ever tears it down. Build one with `createMcpPool()`
+   * from `@deuz-sdk/core/mcp`.
+   */
+  mcpPool?: McpConnectionPool;
 }
 
 export interface Clock {

@@ -248,6 +248,11 @@ export async function resumeFromCheckpoint(
   const { checkpoint, observeResume } = loaded;
   return runToolLoop(toResumeCall(checkpoint, store, options), {
     resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+    // Handoff (2.0): a run suspended INSIDE a transferred-to agent continues as
+    // that agent — the loop re-applies the model/tool overlay before its first
+    // step. The target's system prompt needs nothing: it is already part of the
+    // checkpointed history this call resumes from.
+    ...(checkpoint.handoff ? { resumeHandoff: checkpoint.handoff } : {}),
     ...(rt ? { observeRuntime: rt } : {}),
     ...(observeResume ? { observeResume } : {}),
   });
@@ -278,6 +283,9 @@ export function resumeStreamFromCheckpoint(
         return {
           messages: [...checkpoint.messages] as Message[],
           resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+          // Handoff (2.0): carried out of the deferred load (G2 — the load
+          // happens inside the pump), where the loop re-applies the overlay.
+          ...(checkpoint.handoff ? { handoff: checkpoint.handoff } : {}),
           ...(observeResume ? { observeResume } : {}),
         };
       },

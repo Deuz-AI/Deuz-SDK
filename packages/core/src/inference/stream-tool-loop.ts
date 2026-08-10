@@ -1,9 +1,10 @@
 import type { CommonCallOptions } from '../types/config';
 import type { CallWarning, StreamChatResult } from '../types/methods';
-import type { StreamPart, ToolRunState } from '../types/stream';
+import type { GuardrailPart, StreamPart, ToolRunState } from '../types/stream';
 import type { Message } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
-import type { ToolCall, StepResult, ToolApprovalRequest } from '../types/tool';
+import type { ToolCall, ToolSet, StepResult, ToolApprovalRequest } from '../types/tool';
+import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import { runStream } from '../core/inference';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { resolveSignal } from '../internal/resolve-call';
@@ -23,9 +24,15 @@ import {
   buildWireTools,
   filterWireTools,
   applyPrepareStep,
+  setupMcp,
+  mergeMcpTools,
+  refreshMcpTools,
+  closeMcp,
   setupCompaction,
   runCompaction,
   calibrateCompaction,
+  recoverFromOverflow,
+  isContextOverflow,
   executeTools,
   toToolResultPart,
   toStepResult,
@@ -62,12 +69,31 @@ import {
   falseFinishMessage,
   warnFalseFinishConfig,
   FALSE_FINISH_STOPPED_BY,
+  evaluateInputGuardrails,
+  evaluateOutputGuardrails,
+  applyToolCallGuardrails,
+  logGuardrailParts,
+  rewriteAssistantText,
+  GUARDRAIL_INPUT_STOPPED_BY,
+  GUARDRAIL_OUTPUT_STOPPED_BY,
+  collectHandoffTools,
+  hasHandoffTools,
+  splitHandoffCalls,
+  decideHandoff,
+  mergeResultsInCallOrder,
+  applyHandoffSwap,
+  resumeHandoffState,
   SubAgentSuspension,
+  type ActiveAgentState,
+  type CompactionTrigger,
   type Denial,
   type DurableRunner,
   type ExecuteExtras,
+  type GuardrailLogEntry,
+  type HandoffLogEntry,
   type LoopOutcome,
 } from './loop-shared';
+import type { CompactionEvent } from './compaction';
 
 async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<string> {
   for await (const part of source) {
@@ -85,9 +111,18 @@ async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<s
  */
 export interface StreamToolLoopInternal {
   resumeFrom?: { stepIndex: number; usage: Usage };
+  /**
+   * Handoff (2.0): the checkpoint's active agent, re-applied before the first
+   * step of a resume leg. Set directly when the history is already at hand; the
+   * deferred `resumeLoad` path returns it instead (G2 — the load lives inside
+   * the pump).
+   */
+  resumeHandoff?: { to: string; count: number };
   resumeLoad?: (rt?: ObservationRuntime) => Promise<{
     messages: Message[];
     resumeFrom: { stepIndex: number; usage: Usage };
+    /** Handoff (2.0): `AgentCheckpoint.handoff`, when the checkpoint carried one. */
+    handoff?: { to: string; count: number };
     /** Observation (1.6): checkpoint correlation for run.started. */
     observeResume?: { stepId: string; stepIndex: number; checkpointAgeMs?: number };
   }>;
@@ -164,7 +199,23 @@ export function runStreamToolLoop(
   }
 
   async function pump(): Promise<void> {
-    const tools = options.tools ?? {};
+    // `let`, because zero-config MCP (2.0) merges the connected servers' tools
+    // in before the first step and can REPLACE the set mid-run on a
+    // `tools/list_changed` notification.
+    let tools: ToolSet = options.tools ?? {};
+    /**
+     * The LOCAL half of `tools` (everything that is not an MCP catalog): the
+     * caller's `tools` until a handoff (2.0) swaps in the active agent's set.
+     * Every later merge re-derives `tools` from THIS, so an MCP hot-refresh
+     * cannot undo a transfer.
+     */
+    let ownTools: ToolSet = options.tools ?? {};
+    /**
+     * The run's MCP connections (2.0). Resolved INSIDE the try below — a
+     * connect failure has to become an `error` part, never a throw out of the
+     * pump (G2) — and closed in the `finally`, which every exit passes through.
+     */
+    let mcp: ResolvedMcpRuntime | undefined;
     // Loop start timestamp for `durationExceeds` — pump start, when work
     // actually begins (the shell returns synchronously and lazily, G2).
     const startedAt = deps.clock.now();
@@ -192,13 +243,24 @@ export function runStreamToolLoop(
     const appended: Message[] = [];
     // Memory extraction settlement (1.7, D1): resolve the shell's deferred
     // exactly once at every pump exit. `extract=false` on incomplete turns.
+    /**
+     * Memory observation context (2.0). Assigned once `beginLoopObserve` has
+     * run — memory operations parent under the RUN span, not a step's, because
+     * the extraction covers the whole turn and outlives every step boundary.
+     * Stays undefined on the resume-load failure path, which settles memory
+     * before the run span exists.
+     */
+    let memoryObserve: ExecuteExtras['observe'] | undefined;
     const settleMemory = (extract: boolean): void => {
       if (!memoryDeferred) return;
-      const extraction = extract ? startMemoryExtract(options, deps, appended) : undefined;
+      const extraction = extract
+        ? startMemoryExtract(options, deps, appended, memoryObserve)
+        : undefined;
       if (extraction) void extraction.then((mutations) => memoryDeferred.resolve(mutations));
       else memoryDeferred.resolve([]);
     };
     let resumeFrom = internal?.resumeFrom;
+    let resumeHandoff = internal?.resumeHandoff;
     let observeResume = internal?.observeResume;
     // Resume legs pre-create the ROOT runtime so the closure's
     // checkpoint.loaded/failed events share the leg's sequence and precede
@@ -209,6 +271,7 @@ export function runStreamToolLoop(
         const loaded = await internal.resumeLoad(preRt);
         messages = loaded.messages;
         resumeFrom = loaded.resumeFrom;
+        resumeHandoff = loaded.handoff ?? resumeHandoff;
         observeResume = loaded.observeResume ?? observeResume;
       } catch (err) {
         broadcaster.push({ type: 'error', error: err });
@@ -265,6 +328,7 @@ export function runStreamToolLoop(
     if (lo) {
       rtRef = lo.rt;
       observationHandle = { settled: observationDeferred.promise };
+      memoryObserve = { rt: lo.rt, parentSpanId: lo.runSpanId };
     }
     const steps: StepResult[] = [];
     const stopConditions = normalizeStop(options.stopWhen, options.maxSteps ?? 1, options.budget);
@@ -291,6 +355,30 @@ export function runStreamToolLoop(
     // the terminal break, never before it).
     let falseFinishRetries = 0;
     let falseFinishAccepted = false;
+    // Guardrails (2.0): the same bulk readout the buffered loop exposes on
+    // `providerMetadata.deuz.guardrails`, carried here on the `finish` part — the
+    // live `guardrail` parts below are ADDITIONAL, not a replacement, so a
+    // consumer that only reads the finish metadata sees the identical list.
+    const guardrailLog: GuardrailLogEntry[] = [];
+    /** Record a hook's verdicts in the bulk log, then publish one live part each. */
+    const emitGuardrails = (parts: GuardrailPart[]): void => {
+      logGuardrailParts(guardrailLog, parts);
+      for (const part of parts) broadcaster.push(part);
+    };
+    /** Set by an `onOutput` rewrite/block — rewrites the appended assistant turn. */
+    let guardrailText: string | undefined;
+    // Handoff (2.0): `undefined` = the ROOT agent is driving. Every accepted
+    // transfer REPLACES this snapshot (model + local tools + budget counter);
+    // the buffered twin keeps the identical state under the same name.
+    let active: ActiveAgentState | undefined;
+    /** Every `transfer_to_*` tool of the run, captured once from the ROOT set. */
+    let handoffTools: ToolSet = {};
+    /**
+     * One entry per accepted transfer. It rides on the `finish` part's
+     * `deuz.handoffs` — the live `handoff` parts below are ADDITIONAL, so a
+     * consumer that only reads the finish metadata sees the identical list.
+     */
+    const handoffLog: HandoffLogEntry[] = [];
 
     // Mutated per iteration so tool events parent under the current step span;
     // settle-phase executions run step-less under the run span.
@@ -325,6 +413,47 @@ export function runStreamToolLoop(
         ...(durable ? { cumulativeUsage: withTotal(durableUsage(durable, totalUsage)) } : {}),
         suspend,
       });
+    };
+
+    /**
+     * SDK-level metadata for the `finish` part (`stoppedBy`, `verified`,
+     * `guardrails`, `handoffs`) — the streaming twin of the buffered loop's
+     * `deuzMetadata()`. ONE builder for every terminal path, so a run that ends
+     * early (an input guardrail refusing it) reports the same shape as one that
+     * ran to the end.
+     */
+    const finishMeta = (): Record<string, unknown> | undefined => {
+      const meta: Record<string, unknown> = {};
+      if (stoppedBy) meta.stoppedBy = stoppedBy;
+      if (verified !== undefined) meta.verified = verified;
+      if (guardrailLog.length > 0) meta.guardrails = guardrailLog;
+      if (handoffLog.length > 0) meta.handoffs = handoffLog;
+      return Object.keys(meta).length > 0 ? meta : undefined;
+    };
+
+    /**
+     * The pump's terminal FAILURE path, in ONE place: error part, rejected
+     * promises, run.failed, close, then the post-terminal bookkeeping every
+     * other exit also performs. Both the inner-stream error case and the pump's
+     * outer catch route through it so the two can never drift apart.
+     */
+    const failRun = async (error: unknown): Promise<void> => {
+      broadcaster.push({ type: 'error', error });
+      usageDeferred.reject(error);
+      finishDeferred.reject(error);
+      if (lo) {
+        endLoopObserve(lo, deps, options, {
+          finishReason: 'error',
+          endReason,
+          stepCount: steps.length,
+          usage: withTotal(totalUsage),
+          error,
+        });
+      }
+      broadcaster.close();
+      settleMemory(false);
+      // Completed turns up to the failure still persist (best-effort).
+      await persistChat(options, deps, chatMessages, chatPersistence.writable);
     };
 
     const extras: ExecuteExtras = {
@@ -397,8 +526,35 @@ export function runStreamToolLoop(
     };
 
     try {
-      const fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
-      const staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
+      // Zero-config MCP (2.0): connect BEFORE the wire is built so the servers'
+      // tools ride the very first model call. Inside the try on purpose — an
+      // unreachable server rejects here, and the pump's catch turns that into an
+      // `error` part with rejected promises, which is what keeps G2 intact.
+      mcp = await setupMcp(options, deps);
+      tools = mergeMcpTools(mcp, ownTools);
+      // Handoff (2.0): the transfer catalog is read from the ROOT set, ONCE — an
+      // agent's own set never carries a transfer to itself, so re-deriving it
+      // later would lose targets one by one.
+      handoffTools = collectHandoffTools(tools);
+      // A resume leg re-applies the checkpoint's overlay BEFORE the wires are
+      // built and before the pending approvals settle: those settled calls
+      // belong to the agent that issued them, and it is no longer the root one.
+      // The system message needs nothing — it rode in with the checkpointed
+      // history.
+      if (resumeHandoff) {
+        active = resumeHandoffState(
+          resumeHandoff,
+          ownTools,
+          handoffTools,
+          options.model,
+          deps.logger,
+        );
+        ownTools = active.tools;
+        tools = mergeMcpTools(mcp, ownTools);
+        if (durable) durable.handoff = resumeHandoff;
+      }
+      let fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+      let staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
       flushWarnings();
 
       // Resume: settle the previous break's pending approvals BEFORE step 1 —
@@ -482,7 +638,53 @@ export function runStreamToolLoop(
       // system context AT THE CALL SITE only — the canonical history (and so
       // checkpoints + chat persistence) never bakes the recall block in, and
       // resume legs cannot double-inject it.
-      const recallBlock = await computeRecallBlock(options, deps, messages);
+      // Its observation parents under the RUN span (no step is open yet).
+      const recallBlock = await computeRecallBlock(options, deps, messages, observeCtx);
+      // Recall overhead (2.0): the block never enters `messages`, but the
+      // provider counts it. Both the compaction threshold and the EMA
+      // calibration have to see the same total.
+      const recallOverheadTokens =
+        recallBlock && compactionRunner
+          ? compactionRunner.estimator.estimate([{ role: 'system', content: recallBlock }])
+          : 0;
+
+      // Input guardrails (2.0): ONCE per run leg — after the resume settle and
+      // the recall computation, before the first model call. A BLOCK is a
+      // graceful stop, never an `error` part: the guardrail parts go out first,
+      // then a normal `finish`, so a UI can render the refusal and close the
+      // turn exactly as it closes any other completed one.
+      {
+        const guarded = await evaluateInputGuardrails(options, messages);
+        emitGuardrails(guarded.parts);
+        if (guarded.outcome === 'block') {
+          stoppedBy = GUARDRAIL_INPUT_STOPPED_BY;
+          endReason = 'stop-condition';
+          if (durable) {
+            // 'completed', not 'suspended': nothing is pending and there is
+            // nothing to resume — the run reached a deliberate end.
+            await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+          }
+          const usage = withTotal(totalUsage);
+          const deuzMeta = finishMeta();
+          broadcaster.push({
+            type: 'finish',
+            usage,
+            finishReason: lastFinish,
+            ...(deuzMeta ? { providerMetadata: { deuz: deuzMeta } } : {}),
+          });
+          usageDeferred.resolve(usage);
+          finishDeferred.resolve(lastFinish);
+          fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
+          observeEnd();
+          broadcaster.close();
+          // The refused turn is NOT written to long-term memory — that is the
+          // one thing the guardrail was installed to prevent.
+          settleMemory(false);
+          await persistChat(options, deps, chatMessages, chatPersistence.writable);
+          return;
+        }
+        messages = guarded.messages;
+      }
 
       // Cost continuity (1.7, D2): resume legs seed prevCostUsd with the prior
       // legs' cost so the first cost part's deltaUsd reports THIS step's
@@ -511,6 +713,18 @@ export function runStreamToolLoop(
           observeCtx.parentSpanId = stepSpan.spanId;
           observeCtx.stepIndex = stepIndex;
         }
+        const addCompactionUsage = (u: Usage): void => {
+          totalUsage = sumUsage(totalUsage, u);
+        };
+        const emitCompaction = (e: CompactionEvent, trigger: CompactionTrigger): void => {
+          broadcaster.push({
+            type: 'compaction',
+            layer: e.layer,
+            tokensBefore: e.tokensBefore,
+            tokensAfter: e.tokensAfter,
+            trigger,
+          });
+        };
         // Compaction first — its parts precede the step's deltas; prepareStep
         // then sees the compacted history.
         if (compactionRunner) {
@@ -519,21 +733,30 @@ export function runStreamToolLoop(
             options,
             deps,
             messages,
-            (u) => {
-              totalUsage = sumUsage(totalUsage, u);
-            },
-            (e) =>
-              broadcaster.push({
-                type: 'compaction',
-                layer: e.layer,
-                tokensBefore: e.tokensBefore,
-                tokensAfter: e.tokensAfter,
-              }),
+            addCompactionUsage,
+            emitCompaction,
             observeCtx,
+            recallOverheadTokens,
           );
         }
+        // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
+        // the last step is re-read HERE, so the new catalog is on the wire from
+        // the very next call. Both wires are rebuilt so `activeTools` still
+        // applies to the refreshed set; `prepareStep` below keeps the last word.
+        if (mcp?.changed()) {
+          // `ownTools`, not `options.tools`: after a handoff the local half of
+          // the set belongs to the ACTIVE agent, and re-merging the caller's
+          // would silently undo the transfer.
+          tools = await refreshMcpTools(mcp, ownTools, deps);
+          fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+          staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
+          flushWarnings();
+        }
         const prepared = await applyPrepareStep(
-          options,
+          // Handoff (2.0): the active agent's model drives every step after the
+          // transfer — and `prepareStep` still has the LAST word, because it
+          // runs inside this call and overrides whatever it is handed.
+          active ? { ...options, model: active.model } : options,
           { stepIndex, messages, usage: durableUsage(durable, totalUsage) },
           fullWire,
           staticWire,
@@ -542,7 +765,9 @@ export function runStreamToolLoop(
         );
         flushWarnings();
         messages = prepared.messages;
-        const estimatedAtCall = compactionRunner?.estimator.estimate(messages) ?? 0;
+        const estimateAtCall = (): number =>
+          (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;
+        let estimatedAtCall = estimateAtCall();
         if (lo && stepSpan) {
           emitStepStarted(
             lo,
@@ -556,103 +781,136 @@ export function runStreamToolLoop(
             durableUsage(durable, totalUsage),
           );
         }
-        const inner = runStream(
-          preserveClientContext(options, {
-            ...prepared.options,
-            messages: withSystemBlock(messages, recallBlock),
-          }),
-          {
-            tools: prepared.wire,
-            warnings: warningSink,
-            // stepMs rides in as a FAILURE signal, never as the user's cancel
-            // signal: the inner pump reports a TimeoutError instead of
-            // resolving 'aborted' (see InternalRunOptions.failSignal).
-            ...(stepTimeout ? { failSignal: stepTimeout.signal } : {}),
-            ...(lo && stepSpan
-              ? { observe: { runtime: lo.rt, parentSpanId: stepSpan.spanId, stepIndex } }
-              : {}),
-          },
-        );
-
         let text = '';
         let reasoningText = '';
         let reasoningSignature: string | undefined;
-        const encryptedReasoning: EncryptedReasoning = [];
-        const toolArgs: ToolArgMap = new Map();
-        const toolOrder: string[] = [];
+        let encryptedReasoning: EncryptedReasoning = [];
+        let toolArgs: ToolArgMap = new Map();
+        let toolOrder: string[] = [];
         let stepUsage: Usage = EMPTY_USAGE;
         let stepFinish: FinishReason = 'stop';
         let stepPhase: string | undefined;
+        // Overflow auto-recovery (2.0): ONE retry per step. G2 turns the
+        // provider's rejection into an `error` PART, not a throw, so the retry
+        // gate lives inside the consumption loop rather than around a try.
+        // A ContextOverflowError is always pre-first-byte, so nothing of this
+        // step has reached the consumer yet and the attempt restarts cleanly.
+        let overflowRetried = false;
 
-        for await (const part of inner.fullStream) {
-          switch (part.type) {
-            case 'text-delta':
-              text += part.text;
-              broadcaster.push(part);
-              break;
-            case 'reasoning-delta':
-              if (part.encrypted) {
-                encryptedReasoning.push({ text: part.text, signature: part.signature });
+        attempts: for (;;) {
+          const inner = runStream(
+            preserveClientContext(options, {
+              ...prepared.options,
+              messages: withSystemBlock(messages, recallBlock),
+            }),
+            {
+              tools: prepared.wire,
+              warnings: warningSink,
+              // stepMs rides in as a FAILURE signal, never as the user's cancel
+              // signal: the inner pump reports a TimeoutError instead of
+              // resolving 'aborted' (see InternalRunOptions.failSignal).
+              ...(stepTimeout ? { failSignal: stepTimeout.signal } : {}),
+              ...(lo && stepSpan
+                ? { observe: { runtime: lo.rt, parentSpanId: stepSpan.spanId, stepIndex } }
+                : {}),
+            },
+          );
+          text = '';
+          reasoningText = '';
+          reasoningSignature = undefined;
+          encryptedReasoning = [];
+          toolArgs = new Map();
+          toolOrder = [];
+          stepUsage = EMPTY_USAGE;
+          stepFinish = 'stop';
+          stepPhase = undefined;
+          /** Set instead of failing when the rejection is a recoverable overflow. */
+          let overflow: unknown;
+
+          for await (const part of inner.fullStream) {
+            switch (part.type) {
+              case 'text-delta':
+                text += part.text;
                 broadcaster.push(part);
                 break;
+              case 'reasoning-delta':
+                if (part.encrypted) {
+                  encryptedReasoning.push({ text: part.text, signature: part.signature });
+                  broadcaster.push(part);
+                  break;
+                }
+                reasoningText += part.text;
+                if (part.signature) reasoningSignature = part.signature;
+                broadcaster.push(part);
+                break;
+              case 'tool-call-delta': {
+                let entry = toolArgs.get(part.id);
+                if (!entry) {
+                  entry = { name: part.name, args: '' };
+                  toolArgs.set(part.id, entry);
+                  toolOrder.push(part.id);
+                  toolState(part.id, part.name, 'input-streaming');
+                }
+                if (part.name && !entry.name) entry.name = part.name;
+                if (part.providerMetadata) entry.meta = part.providerMetadata;
+                entry.args += part.argsTextDelta;
+                broadcaster.push(part); // forward raw for live UI input-streaming
+                break;
               }
-              reasoningText += part.text;
-              if (part.signature) reasoningSignature = part.signature;
-              broadcaster.push(part);
-              break;
-            case 'tool-call-delta': {
-              let entry = toolArgs.get(part.id);
-              if (!entry) {
-                entry = { name: part.name, args: '' };
-                toolArgs.set(part.id, entry);
-                toolOrder.push(part.id);
-                toolState(part.id, part.name, 'input-streaming');
-              }
-              if (part.name && !entry.name) entry.name = part.name;
-              if (part.providerMetadata) entry.meta = part.providerMetadata;
-              entry.args += part.argsTextDelta;
-              broadcaster.push(part); // forward raw for live UI input-streaming
-              break;
+              case 'source':
+                broadcaster.push(part);
+                break;
+              case 'finish':
+                stepUsage = part.usage;
+                stepFinish = part.finishReason;
+                stepPhase = (part.providerMetadata?.openai as { phase?: string } | undefined)
+                  ?.phase;
+                break; // re-framed as step-finish below
+              case 'error':
+                // Recoverable overflow: hold the error instead of publishing it —
+                // the decision needs the compaction pass, which cannot run inside
+                // the iteration. Nothing is pushed, so a successful retry leaves
+                // no trace of the rejected attempt on the stream.
+                if (!overflowRetried && isContextOverflow(part.error)) {
+                  overflow = part.error;
+                  break;
+                }
+                // The inner pump already emitted model.failed — the loop reports
+                // the run failure exactly once here.
+                await failRun(part.error);
+                return;
+              // Forward the inner pump's non-fatal notices (1.9). Without this
+              // case they die at the loop boundary and only the bulk `warnings`
+              // promise ever sees them — the exact silent gap Sprint 1 had to fix
+              // for `verify`.
+              case 'warning':
+                broadcaster.push(part);
+                break;
+              default:
+                break;
             }
-            case 'source':
-              broadcaster.push(part);
-              break;
-            case 'finish':
-              stepUsage = part.usage;
-              stepFinish = part.finishReason;
-              stepPhase = (part.providerMetadata?.openai as { phase?: string } | undefined)?.phase;
-              break; // re-framed as step-finish below
-            case 'error':
-              // The inner pump already emitted model.failed — the loop reports
-              // the run failure exactly once here.
-              broadcaster.push(part);
-              usageDeferred.reject(part.error);
-              finishDeferred.reject(part.error);
-              if (lo) {
-                endLoopObserve(lo, deps, options, {
-                  finishReason: 'error',
-                  endReason,
-                  stepCount: steps.length,
-                  usage: withTotal(totalUsage),
-                  error: part.error,
-                });
-              }
-              broadcaster.close();
-              // Same post-terminal bookkeeping as every other exit: the
-              // memory promise must settle and completed turns still persist.
-              settleMemory(false);
-              await persistChat(options, deps, chatMessages, chatPersistence.writable);
-              return;
-            // Forward the inner pump's non-fatal notices (1.9). Without this
-            // case they die at the loop boundary and only the bulk `warnings`
-            // promise ever sees them — the exact silent gap Sprint 1 had to fix
-            // for `verify`.
-            case 'warning':
-              broadcaster.push(part);
-              break;
-            default:
-              break;
           }
+
+          if (overflow === undefined) break attempts;
+          overflowRetried = true;
+          const recovered = await recoverFromOverflow(
+            compactionRunner,
+            options,
+            deps,
+            messages,
+            addCompactionUsage,
+            emitCompaction,
+            observeCtx,
+          );
+          if (!recovered) {
+            // Nothing could be shrunk — the original rejection stands.
+            await failRun(overflow);
+            return;
+          }
+          messages = recovered;
+          // Re-measure: calibrating the EMA against the PRE-compaction estimate
+          // would teach it that the history is far bigger than what was sent.
+          estimatedAtCall = estimateAtCall();
         }
 
         totalUsage = sumUsage(totalUsage, stepUsage);
@@ -826,17 +1084,47 @@ export function runStreamToolLoop(
           // Recorded only on the path that actually terminates: a verify retry
           // above `continue`s, and every other break carries its own reason.
           if (falseFinishAccepted) stoppedBy = FALSE_FINISH_STOPPED_BY;
+
+          // Output guardrails (2.0): the LAST word at a natural completion, run
+          // only once `doneWhen` AND `verifyStep` have accepted. The text deltas
+          // are already out on the wire — that is what the live `guardrail` part
+          // is FOR — but the appended assistant turn, the checkpoint below and
+          // the chat record all carry the verdict's text, so nothing that is
+          // read back later disagrees with the rule.
+          const outputVerdict = await evaluateOutputGuardrails(options, {
+            text,
+            messages,
+            stepIndex,
+          });
+          emitGuardrails(outputVerdict.parts);
+          if (outputVerdict.outcome === 'block') {
+            guardrailText = outputVerdict.replacement ?? '';
+            stoppedBy = GUARDRAIL_OUTPUT_STOPPED_BY;
+          } else if (outputVerdict.text !== text) {
+            guardrailText = outputVerdict.text;
+          }
+          if (guardrailText !== undefined) {
+            const rewritten = rewriteAssistantText(assistantMessage, guardrailText);
+            messages = [...messages.slice(0, -1), rewritten];
+            appended[appended.length - 1] = rewritten;
+            chatMessages = [...chatMessages.slice(0, -1), rewritten];
+          }
+
           if (durable) {
             await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
           }
           break;
         }
 
-        const toolCalls: ToolCall[] = toolUseParts.map((p) => ({
+        let toolCalls: ToolCall[] = toolUseParts.map((p) => ({
           toolCallId: p.id,
           toolName: p.name,
           args: p.input,
         }));
+        // `tool-call` parts carry the MODEL's arguments: a guardrail rewrite is
+        // an execution-side substitution, and it announces itself with its own
+        // `guardrail` part a moment later rather than by silently editing the
+        // call a UI already rendered.
         for (const c of toolCalls) {
           broadcaster.push({
             type: 'tool-call',
@@ -850,15 +1138,58 @@ export function runStreamToolLoop(
         appended.push(assistantMessage);
         chatMessages = [...chatMessages, assistantMessage];
 
+        // Handoff (2.0): the DETERMINISTIC interception — before guardrails, the
+        // approval gate and `executeTools`. A transfer is decided by looking at
+        // the call, never by an exception thrown out of an `execute`. Everything
+        // ELSE in the batch runs completely normally: a model that calls
+        // `search` and `transfer_to_billing` in one step gets both honored.
+        const { handoffCalls, normalCalls } = hasHandoffTools(handoffTools)
+          ? splitHandoffCalls(toolCalls, tools)
+          : { handoffCalls: [], normalCalls: toolCalls };
+
+        // Tool-call guardrails (2.0): evaluated IMMEDIATELY before the approval
+        // gate, so a rewrite reaches the `needsApproval` predicate, the approval
+        // request a human sees, and `execute` — while the assistant turn
+        // appended just above keeps the arguments the MODEL issued.
+        const guardedCalls = await applyToolCallGuardrails(
+          options,
+          normalCalls,
+          messages,
+          stepIndex,
+        );
+        emitGuardrails(guardedCalls.parts);
+        /** What actually reaches the gate + `executeTools` (transfers excluded). */
+        const execCalls = guardedCalls.calls;
+        // The REPORTED calls stay in the model's own order and include the
+        // transfers, so `StepResult.toolCalls` describes the step the model
+        // took — with any guardrail rewrite applied, exactly as before.
+        toolCalls =
+          handoffCalls.length === 0
+            ? execCalls
+            : (() => {
+                const rewritten = new Map(execCalls.map((c) => [c.toolCallId, c]));
+                return toolCalls.map((c) => rewritten.get(c.toolCallId) ?? c);
+              })();
+        // A blocked call never reaches the approval gate: it already has a
+        // verdict, and gating it would suspend the run on a call that is not
+        // going to run either way.
+        const gateCandidates =
+          guardedCalls.blocked.size > 0
+            ? execCalls.filter((c) => !guardedCalls.blocked.has(c.toolCallId))
+            : execCalls;
+
         // Approval gate: server mode denies inline; without approveToolCall the
         // gated calls break the loop like client tools (client mode).
-        const gated = await findApprovalNeeded(toolCalls, tools, options, messages);
+        const gated = await findApprovalNeeded(gateCandidates, tools, options, messages);
         const denied = options.approveToolCall
-          ? await resolveServerApprovals(gated, toolCalls, options, messages)
+          ? await resolveServerApprovals(gated, gateCandidates, options, messages)
           : new Map<string, Denial>();
+        // Guardrail blocks JOIN the approval flow's denial map — one machinery
+        // for every "this call does not run" verdict.
+        for (const [id, denial] of guardedCalls.blocked) denied.set(id, denial);
         const pendingApproval = options.approveToolCall
           ? []
-          : toolCalls.filter((c) => gated.has(c.toolCallId));
+          : gateCandidates.filter((c) => gated.has(c.toolCallId));
         if (observeCtx && gated.size > 0) {
           const gatedCalls = toolCalls.filter((c) => gated.has(c.toolCallId));
           observeApprovalRequests(
@@ -919,18 +1250,19 @@ export function runStreamToolLoop(
           break;
         }
 
-        for (const c of toolCalls) {
+        for (const c of execCalls) {
           // Denied calls never execute — they surface straight as error results.
           // Same for a hallucinated name (1.9): nothing runs, so the sequence
           // goes input-complete → error with no 'executing' in between (the
           // resume-settle path reports missing/denied results the same way).
+          // A TRANSFER never executes either — it is not in `execCalls` at all.
           if (!denied.has(c.toolCallId) && !isUnknownTool(tools, c.toolName)) {
             toolState(c.toolCallId, c.toolName, 'executing');
           }
         }
         let toolResults;
         try {
-          toolResults = await executeTools(toolCalls, tools, options, messages, denied, extras);
+          toolResults = await executeTools(execCalls, tools, options, messages, denied, extras);
         } catch (err) {
           if (!(err instanceof SubAgentSuspension)) throw err;
           // A durable sub-agent suspended: its tool_use stays unanswered; the
@@ -973,6 +1305,17 @@ export function runStreamToolLoop(
         // while they ran, the step is over — fail here rather than feeding
         // results back into a model call that can no longer be paid for.
         assertStepDeadline();
+        // Handoff (2.0): every transfer `tool_use_id` is answered HERE — the
+        // first with the transfer confirmation, its siblings (and everything,
+        // once the budget is spent) with a self-healing is_error. Merged back
+        // into the model's own call order so the turn reads the way it was
+        // issued, and emitted as ordinary `tool-result`/`tool-state` parts: a UI
+        // renders a transfer exactly like any other completed call.
+        const handoffDecision =
+          handoffCalls.length > 0 ? decideHandoff(handoffCalls, active) : undefined;
+        if (handoffDecision) {
+          toolResults = mergeResultsInCallOrder(toolCalls, toolResults, handoffDecision.results);
+        }
         for (const r of toolResults) {
           broadcaster.push({
             type: 'tool-result',
@@ -999,6 +1342,31 @@ export function runStreamToolLoop(
         appended.push(toolResultMessage);
         chatMessages = [...chatMessages, toolResultMessage];
 
+        // The SWAP, once the turn is complete: from here the run is a different
+        // agent. `messages` is REWRITTEN (new system turn) rather than appended
+        // to — `appended`/`chatMessages` must not grow a turn the caller never
+        // sent — and both wires are rebuilt so the next call carries the new
+        // catalog. The `handoff` part goes out before the next `step-start`.
+        if (handoffDecision?.accepted) {
+          const swap = applyHandoffSwap(
+            handoffDecision.accepted,
+            active,
+            handoffTools,
+            messages,
+            stepIndex,
+          );
+          active = swap.active;
+          messages = swap.messages;
+          handoffLog.push(swap.entry);
+          broadcaster.push({ type: 'handoff', ...swap.entry });
+          ownTools = active.tools;
+          tools = mergeMcpTools(mcp, ownTools);
+          fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+          staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
+          flushWarnings();
+          if (durable) durable.handoff = { to: active.name!, count: active.handoffCount };
+        }
+
         const sr = toStepResult(stepData, toolCalls, toolResults, steps.length, toolResultMessage);
         steps.push(sr);
         options.onStepFinish?.(sr);
@@ -1014,11 +1382,16 @@ export function runStreamToolLoop(
           );
         }
 
-        // Denials are deliberate, not tool failures — exclude from the runaway guard.
+        // Denials are deliberate, not tool failures — exclude from the runaway
+        // guard. A refused HANDOFF (budget spent, or a sibling transfer in the
+        // same batch) is the same kind of verdict, so it is excluded too: the
+        // model is being told to carry on, not failing at anything.
+        const handoffIds =
+          handoffCalls.length > 0 ? new Set(handoffCalls.map((h) => h.call.toolCallId)) : undefined;
         if (
           bumpErrorGuard(
             errorCounters,
-            toolResults.filter((r) => !denied.has(r.toolCallId)),
+            toolResults.filter((r) => !denied.has(r.toolCallId) && !handoffIds?.has(r.toolCallId)),
           )
         ) {
           endReason = 'runaway-tool-errors';
@@ -1063,14 +1436,12 @@ export function runStreamToolLoop(
       }
 
       const usage = withTotal(totalUsage);
-      const deuzMeta: Record<string, unknown> = {};
-      if (stoppedBy) deuzMeta.stoppedBy = stoppedBy;
-      if (verified !== undefined) deuzMeta.verified = verified;
+      const deuzMeta = finishMeta();
       broadcaster.push({
         type: 'finish',
         usage,
         finishReason: lastFinish,
-        ...(Object.keys(deuzMeta).length > 0 ? { providerMetadata: { deuz: deuzMeta } } : {}),
+        ...(deuzMeta ? { providerMetadata: { deuz: deuzMeta } } : {}),
       });
       usageDeferred.resolve(usage);
       finishDeferred.resolve(lastFinish);
@@ -1081,26 +1452,17 @@ export function runStreamToolLoop(
       settleMemory(suspend === undefined); // extract only for COMPLETED turns
       await persistChat(options, deps, chatMessages, chatPersistence.writable);
     } catch (err) {
-      broadcaster.push({ type: 'error', error: err });
-      usageDeferred.reject(err);
-      finishDeferred.reject(err);
-      if (lo) {
-        endLoopObserve(lo, deps, options, {
-          finishReason: 'error',
-          endReason,
-          stepCount: steps.length,
-          usage: withTotal(totalUsage),
-          error: err,
-        });
-      }
-      broadcaster.close();
-      settleMemory(false);
-      // Completed turns up to the failure still persist (best-effort).
-      await persistChat(options, deps, chatMessages, chatPersistence.writable);
+      await failRun(err);
     } finally {
       // Release the step deadline on EVERY exit (break, return, throw): an
       // un-cancelled host timer keeps a Node process (and a test run) alive.
       stepTimeout?.clear();
+      // Same discipline for the run's MCP connections (2.0). This is the ONE
+      // site that covers every pump exit — the finish path, the suspension
+      // `return`s, the mid-stream `failRun` return and the outer catch — so it
+      // lands right after the same post-terminal bookkeeping (settleMemory /
+      // persistChat) each of those paths already performed. Never throws.
+      await closeMcp(mcp, deps);
     }
   }
 

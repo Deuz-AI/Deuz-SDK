@@ -207,6 +207,42 @@ describe('compaction wired into the loop', () => {
     expect(res.usage.totalTokens).toBe(64);
   });
 
+  it('the SECOND summarize pass FOLDS into the running summary instead of restarting', async () => {
+    const { fetch, calls } = mockFetchSequence([
+      () => sseResponse([SUMMARY]), // pass 1 — no previous summary yet
+      () => sseResponse([TOOL_CALL]), // step 0
+      () => sseResponse([SUMMARY]), // pass 2 — the history now carries a summary
+      () => sseResponse([FINAL]), // step 1
+    ]);
+    const res = await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: bigHistory(6),
+      tools: TOOLS,
+      maxSteps: 3,
+      compaction: { threshold: 0, keepRecentSteps: 1, layers: ['summarize'] },
+    });
+    expect(res.text).toBe('Done.');
+    expect(calls).toHaveLength(4);
+
+    const first = String(calls[0]!.init!.body);
+    expect(first).toContain('Summarize the conversation');
+    expect(first).not.toContain('RUNNING SUMMARY OF EARLIER CONVERSATION');
+
+    // The fold call hands the previous summary over as TEXT and asks for an
+    // update — it never re-summarizes a summary.
+    const second = String(calls[2]!.init!.body);
+    expect(second).toContain('RUNNING SUMMARY OF EARLIER CONVERSATION');
+    expect(second).toContain('CONDENSED.');
+    expect(second).toContain('NEW TRANSCRIPT');
+    expect(second).toContain('Update the running summary');
+    expect(second).not.toContain('Summarize the conversation transcript above');
+
+    // INVARIANT: one summary message survives, never a chain of them.
+    const finalWire = JSON.parse(String(calls[3]!.init!.body)).messages as Array<unknown>;
+    const summaries = JSON.stringify(finalWire).match(/Earlier conversation summarized/g) ?? [];
+    expect(summaries).toHaveLength(1);
+  });
+
   it('streaming: emits a compaction part after step-start, before finish', async () => {
     const { fetch } = mockFetchSequence([() => sseResponse([FINAL])]);
     const res = streamChat({

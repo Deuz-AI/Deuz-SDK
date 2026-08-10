@@ -14,14 +14,39 @@ import type {
   StepResult,
   StopCondition,
 } from '../types/tool';
+import type { LanguageModel } from '../types/model';
 import type { AgentCheckpoint, CheckpointStatus, SessionStore } from '../types/session';
-import type { StreamPart } from '../types/stream';
+import type { GuardrailPart, HandoffPart, StreamPart } from '../types/stream';
+import type {
+  InputGuardrail,
+  InputGuardrailContext,
+  OutputGuardrail,
+  ToolCallGuardrail,
+} from '../types/guardrails';
 import type { WireTool, WireToolRequest } from '../adapters/types';
 import { runOneStep, type OneStep } from './run-step';
 import { stepCountIs, budgetConditions, type NamedStopCondition } from './stop';
-// Static NAMED imports on purpose: tree-shaking keeps only the three pipeline
+// Static import: the handoff marker + its reader are a handful of bytes with no
+// module graph of their own, and BOTH loops have to be able to recognize a
+// transfer tool. A dynamic import would make the recognition asynchronous inside
+// the hot per-step path for no bundle saving worth having.
+import {
+  readHandoffTarget,
+  handoffToolName,
+  DEFAULT_MAX_HANDOFFS,
+  type HandoffTargetMeta,
+} from './handoff';
+// Static NAMED imports on purpose: tree-shaking keeps only the pipeline
 // functions in the bundle (a dynamic import would drag the whole module in).
-import { recall, remember, formatMemoriesForPrompt, type MemoryMutation } from '../memory';
+import {
+  recall,
+  remember,
+  sweepExpired,
+  formatMemoriesForPrompt,
+  defaultMemoryScorer,
+  type MemoryMutation,
+  type MemoryScorer,
+} from '../memory';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
   applyCompaction,
@@ -35,6 +60,10 @@ import { attachClientContext, readClientContext } from '../internal/client-conte
 // Type-only: the sink itself is created by the loop (or not at all), so nothing
 // from internal/warnings.ts is pulled into a bundle that never collects one.
 import type { WarningSink } from '../internal/warnings';
+// Type-only for the same reason as `mcp/shared` in types/config.ts: the MCP
+// runtime is reached through a LITERAL dynamic import in `setupMcp` below, so a
+// call without `options.mcp` pulls none of that module graph into the bundle.
+import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import { getCapabilities } from '../core/registry';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
@@ -42,7 +71,7 @@ import { mapWithConcurrency } from '../internal/p-limit';
 // (core/timeout.ts); this module is the documented CONSUMER of `toolMs` — it is
 // the only place tools actually run.
 import { combineSignals, resolveTimeouts } from '../core/timeout';
-import { TimeoutError, ToolExecutionError } from '../errors';
+import { ContextOverflowError, TimeoutError, ToolExecutionError } from '../errors';
 import {
   createObservationRuntime,
   observeCost,
@@ -113,6 +142,14 @@ export interface DurableRunner {
   baseUsage: Usage;
   /** Step boundaries saved so far across ALL legs (monotonic). */
   stepIndex: number;
+  /**
+   * Active-agent transfer state (2.0), set by the loop the moment a handoff is
+   * accepted and carried onto EVERY later checkpoint. Held here rather than
+   * threaded through `saveCheckpoint`'s argument list because the two loops save
+   * at seventeen sites between them: one assignment at the swap cannot drift,
+   * seventeen extra arguments would.
+   */
+  handoff?: { to: string; count: number };
   /** Observation (1.6): set by the loop so saveCheckpoint can emit checkpoint events. */
   observe?: { rt: ObservationRuntime; runSpanId: string };
 }
@@ -166,6 +203,9 @@ export async function saveCheckpoint(
     messages,
     usage: withTotal(durableUsage(runner, legUsage)),
     ...(pendingApprovals && pendingApprovals.length > 0 ? { pendingApprovals } : {}),
+    // Handoff (2.0): absent until a transfer happens, then on every checkpoint
+    // of the run — the resume leg re-applies the overlay from it.
+    ...(runner.handoff ? { handoff: runner.handoff } : {}),
     ...(options.agentPath && options.agentPath.length > 0 ? { agentPath: options.agentPath } : {}),
     createdAt: deps.clock.now(),
   };
@@ -391,12 +431,122 @@ export function filterWireTools(
   return { ...wire, tools };
 }
 
+// --- Zero-config MCP (2.0): `CommonCallOptions.mcp` -------------------------
+
+/**
+ * Connect the call's `mcp` entries and hand back the run's MCP runtime —
+ * `undefined` when the call asked for none, which is the zero-cost path.
+ *
+ * The specifier is a LITERAL on purpose: that is what lets the bundler give
+ * `mcp/resolve` its own chunk. The MCP surface (the SDK wrapper, the OAuth
+ * adaptor, the sampling bridge) must never land in the measured core/edge bundle
+ * merely because the loop is ABLE to use it. A computed specifier would defeat
+ * the split and silently re-inline all of it.
+ *
+ * It REJECTS when a server cannot be reached (fail fast — see
+ * `resolveMcpForLoop`). The buffered loop lets that become the call's rejection;
+ * the streaming loop calls this INSIDE the pump, where a rejection becomes an
+ * `error` part instead of a synchronous throw (G2).
+ */
+export async function setupMcp(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+): Promise<ResolvedMcpRuntime | undefined> {
+  const entries = options.mcp;
+  if (!entries || entries.length === 0) return undefined;
+  const { resolveMcpForLoop } = await import('../mcp/resolve');
+  return resolveMcpForLoop(entries, {
+    logger: deps.logger,
+    // Reconnect backoff and keepalive run on the INJECTED clock (edge-safety):
+    // an MCP connection opened by the loop must not schedule ambient timers.
+    clock: deps.clock,
+    ...(deps.mcpPool ? { mcpPool: deps.mcpPool } : {}),
+  });
+}
+
+/**
+ * The run's effective tool set: MCP tools first, the caller's `tools` LAST.
+ * Explicit tools always win a name collision — they were written by hand at the
+ * call site, and a remote server must never be able to shadow a local tool by
+ * exporting the same name.
+ */
+export function mergeMcpTools(
+  mcp: ResolvedMcpRuntime | undefined,
+  tools: ToolSet | undefined,
+): ToolSet {
+  const own = tools ?? {};
+  return mcp ? { ...mcp.tools, ...own } : own;
+}
+
+/**
+ * Re-read the catalogs of servers that announced `tools/list_changed`, and
+ * return the run's effective tool set.
+ *
+ * `own` is the LOOP's current local tool set — `options.tools` normally, but the
+ * ACTIVE AGENT's set once a handoff (2.0) has swapped it. Reading `options.tools`
+ * here instead would silently undo a transfer the moment any MCP server
+ * announced a catalog change.
+ *
+ * A FAILED refresh is deliberately NOT fatal — unlike a failed SETUP, which
+ * rejects the call. By this point the run has a working catalog and a task in
+ * flight, so one transient `tools/list` is answered the way the rest of the loop
+ * answers transient trouble (`filterWireTools`, chat persistence, memory recall):
+ * warn, keep the last good value, carry on. The runtime re-arms its dirty flag
+ * on failure, so the next step boundary tries again by itself.
+ */
+export async function refreshMcpTools(
+  mcp: ResolvedMcpRuntime,
+  own: ToolSet,
+  deps: ResolvedDependencies,
+): Promise<ToolSet> {
+  try {
+    await mcp.refresh();
+  } catch (error) {
+    deps.logger.warn('mcp: tool-list refresh failed — keeping the previous catalog', { error });
+  }
+  return mergeMcpTools(mcp, own);
+}
+
+/**
+ * Release the run's MCP connections at a terminal boundary. NEVER throws:
+ * teardown failing must not turn a finished run into a failed one (the
+ * `persistChat`/checkpoint discipline), so the detail goes to
+ * `deps.logger.error` and the exit continues. Borrowed and pooled clients are
+ * untouched — `closeOwned` decides that, not this helper.
+ */
+export async function closeMcp(
+  mcp: ResolvedMcpRuntime | undefined,
+  deps: ResolvedDependencies,
+): Promise<void> {
+  if (!mcp) return;
+  try {
+    await mcp.closeOwned();
+  } catch (error) {
+    deps.logger.error('mcp: closing run-owned connections failed', { error });
+  }
+}
+
+/**
+ * Spread-in for the `runtimeContext` (2.0) every loop hook receives. It is
+ * OMITTED, not set to `undefined`, when the call carries none: a hook that
+ * checks `'runtimeContext' in ctx` must be able to tell "not supplied" from
+ * "supplied as undefined", and an absent key keeps the pre-2.0 ctx shape
+ * byte-identical for snapshot-style assertions.
+ */
+function runtimeContextOf(options: CommonCallOptions): { runtimeContext?: unknown } {
+  return options.runtimeContext !== undefined ? { runtimeContext: options.runtimeContext } : {};
+}
+
 /**
  * Run the caller's `prepareStep` hook and resolve this step's effective
  * options/messages/wire. A throw propagates — it is caller code, never
  * swallowed. Per-step `activeTools` overrides the static filter (applies to
  * the FULL tool set, not the statically filtered one); a returned `messages`
  * array persists as the new base (the loop assigns it).
+ *
+ * The call's `runtimeContext` (2.0) is folded into the hook ctx HERE rather
+ * than at the two call sites, so the buffered and streaming loops cannot drift
+ * apart on what a hook sees (the loop-symmetry invariant).
  */
 export async function applyPrepareStep(
   options: CommonCallOptions,
@@ -410,7 +560,7 @@ export async function applyPrepareStep(
   let messages = ctx.messages;
   let wire = staticWire;
   const ps: PrepareStepResult | undefined = options.prepareStep
-    ? await options.prepareStep(ctx)
+    ? await options.prepareStep({ ...ctx, ...runtimeContextOf(options) })
     : undefined;
   if (ps) {
     if (ps.messages) messages = ps.messages;
@@ -438,7 +588,7 @@ export async function evaluateVerifyStep(
   ctx: { stepIndex: number; attempt: number; text: string; messages: Message[]; usage: Usage },
 ): Promise<{ verdict: VerifyStepResult; retry: boolean } | undefined> {
   if (!options.verifyStep) return undefined;
-  const verdict = await options.verifyStep(ctx);
+  const verdict = await options.verifyStep({ ...ctx, ...runtimeContextOf(options) });
   if (!verdict) return undefined;
   const cap = options.maxVerifyAttempts ?? DEFAULT_MAX_VERIFY_ATTEMPTS;
   const retry = !verdict.ok && verdict.retry !== false && ctx.attempt + 1 < cap;
@@ -508,6 +658,7 @@ export async function evaluateDoneWhen(
     messages: ctx.messages,
     usage: ctx.usage,
     stepIndex: ctx.stepIndex,
+    ...runtimeContextOf(options),
   });
   if (done) return { done: true, retry: false };
   return { done: false, retry: ctx.attempt < resolveFalseFinishRetries(options.falseFinishGuard) };
@@ -540,8 +691,630 @@ export function warnFalseFinishConfig(options: CommonCallOptions, logger: Logger
   }
 }
 
+// --- Guardrails (2.0): the three hooks, shared by both loops ---------------
+
+/**
+ * `providerMetadata.deuz.guardrails` entry — a `GuardrailPart` minus its `type`
+ * discriminant, so the buffered readout and the streaming part can never
+ * describe the same verdict differently (both are produced from ONE part).
+ */
+export type GuardrailLogEntry = Omit<GuardrailPart, 'type'>;
+
+/** Append the parts a hook produced to the run's `deuz.guardrails` log. */
+export function logGuardrailParts(log: GuardrailLogEntry[], parts: GuardrailPart[]): void {
+  for (const p of parts) {
+    log.push({
+      hook: p.hook,
+      action: p.action,
+      ...(p.name !== undefined ? { name: p.name } : {}),
+      ...(p.reason !== undefined ? { reason: p.reason } : {}),
+      ...(p.toolCallId !== undefined ? { toolCallId: p.toolCallId } : {}),
+      ...(p.stepIndex !== undefined ? { stepIndex: p.stepIndex } : {}),
+    });
+  }
+}
+
+/** `stoppedBy` marker for a run the INPUT hook refused (no model call happened). */
+export const GUARDRAIL_INPUT_STOPPED_BY = 'guardrail:input';
+/** `stoppedBy` marker for a final answer the OUTPUT hook refused. */
+export const GUARDRAIL_OUTPUT_STOPPED_BY = 'guardrail:output';
+
+/** Normalize a hook's `one | many | undefined` form into an ordered array. */
+function guardrailList<T>(entry: T | T[] | undefined): T[] {
+  if (entry === undefined) return [];
+  return Array.isArray(entry) ? entry : [entry];
+}
+
+/**
+ * A guardrail's reportable name. Deliberately read off the FUNCTION (the type is
+ * `{ name?: string } & fn`), so the common shapes label themselves for free via
+ * JS name inference: `const noSecrets: InputGuardrail = …` reports
+ * `'noSecrets'`, an arrow written straight into `{ onOutput: … }` reports
+ * `'onOutput'`, and an element of an ARRAY literal gets no inferred name and so
+ * reports nothing. Set one explicitly with `Object.defineProperty(fn, 'name', …)`
+ * — a plain `fn.name = …` throws in strict mode (see `src/guardrails.ts`).
+ */
+function guardrailName(guard: { name?: string }): string | undefined {
+  return guard.name ? guard.name : undefined;
+}
+
+function guardrailPart(
+  hook: GuardrailPart['hook'],
+  action: GuardrailPart['action'],
+  guard: { name?: string },
+  extra: { reason?: string; toolCallId?: string; stepIndex?: number },
+): GuardrailPart {
+  const name = guardrailName(guard);
+  return {
+    type: 'guardrail',
+    hook,
+    action,
+    ...(name !== undefined ? { name } : {}),
+    ...(extra.reason !== undefined ? { reason: extra.reason } : {}),
+    ...(extra.toolCallId !== undefined ? { toolCallId: extra.toolCallId } : {}),
+    ...(extra.stepIndex !== undefined ? { stepIndex: extra.stepIndex } : {}),
+  };
+}
+
+/** Base ctx every hook receives (runtimeContext + agentPath, both optional). */
+function guardrailBase(options: CommonCallOptions): {
+  runtimeContext?: unknown;
+  agentPath?: string[];
+} {
+  return {
+    ...runtimeContextOf(options),
+    ...(options.agentPath && options.agentPath.length > 0 ? { agentPath: options.agentPath } : {}),
+  };
+}
+
+/** Verdict of the pre-run INPUT hook. */
+export type InputGuardrailOutcome =
+  | { outcome: 'pass'; messages: Message[]; parts: GuardrailPart[] }
+  | { outcome: 'block'; reason?: string; parts: GuardrailPart[] };
+
+/**
+ * Evaluate `guardrails.onInput` ONCE per run leg, before the first model call.
+ *
+ * Ordering rules (identical for all three hooks): the array runs IN ORDER,
+ * `rewrite`s CHAIN (the next guardrail sees what the previous one wrote), the
+ * first `block` short-circuits the rest, and `undefined` / `{ action: 'pass' }`
+ * is SILENT — no part, no metadata entry. A THROW propagates: like
+ * `prepareStep`/`verifyStep`/`doneWhen` this is caller code, and swallowing it
+ * would leave the caller believing a defense is armed while it is inert.
+ *
+ * A block is a GRACEFUL stop, never a throw — the loop returns an empty answer
+ * with `stoppedBy: 'guardrail:input'` (see {@link GUARDRAIL_INPUT_STOPPED_BY}).
+ */
+export async function evaluateInputGuardrails(
+  options: CommonCallOptions,
+  messages: Message[],
+): Promise<InputGuardrailOutcome> {
+  const list: InputGuardrail[] = guardrailList(options.guardrails?.onInput);
+  if (list.length === 0) return { outcome: 'pass', messages, parts: [] };
+  const parts: GuardrailPart[] = [];
+  let current = messages;
+  for (const guard of list) {
+    const ctx: InputGuardrailContext = { messages: current, ...guardrailBase(options) };
+    const verdict = await guard(ctx);
+    if (!verdict || verdict.action === 'pass') continue;
+    if (verdict.action === 'block') {
+      parts.push(guardrailPart('input', 'block', guard, { reason: verdict.reason }));
+      return {
+        outcome: 'block',
+        ...(verdict.reason !== undefined ? { reason: verdict.reason } : {}),
+        parts,
+      };
+    }
+    current = verdict.messages;
+    parts.push(guardrailPart('input', 'rewrite', guard, {}));
+  }
+  return { outcome: 'pass', messages: current, parts };
+}
+
+/** Verdict of the natural-completion OUTPUT hook. */
+export type OutputGuardrailOutcome =
+  | { outcome: 'pass'; text: string; parts: GuardrailPart[] }
+  | { outcome: 'block'; reason?: string; replacement?: string; parts: GuardrailPart[] };
+
+/**
+ * Evaluate `guardrails.onOutput` at a natural completion — AFTER `doneWhen` and
+ * `verifyStep` have both accepted the answer, so the text that reaches a
+ * guardrail is the one the run is actually about to return (a re-driven round
+ * never reaches here). Same ordering rules as {@link evaluateInputGuardrails}.
+ *
+ * The caller is responsible for making the REST of the run agree with the
+ * verdict: a rewrite (or a block's `replacement ?? ''`) also rewrites the
+ * appended assistant message in `messages`/`appended`/`chatMessages` (see
+ * {@link rewriteAssistantText}), so the checkpoint and the chat record never
+ * disagree with what the caller was handed.
+ */
+export async function evaluateOutputGuardrails(
+  options: CommonCallOptions,
+  ctx: { text: string; messages: Message[]; stepIndex: number },
+): Promise<OutputGuardrailOutcome> {
+  const list: OutputGuardrail[] = guardrailList(options.guardrails?.onOutput);
+  if (list.length === 0) return { outcome: 'pass', text: ctx.text, parts: [] };
+  const parts: GuardrailPart[] = [];
+  let text = ctx.text;
+  for (const guard of list) {
+    const verdict = await guard({
+      text,
+      messages: ctx.messages,
+      stepIndex: ctx.stepIndex,
+      ...guardrailBase(options),
+    });
+    if (!verdict || verdict.action === 'pass') continue;
+    if (verdict.action === 'block') {
+      parts.push(
+        guardrailPart('output', 'block', guard, {
+          reason: verdict.reason,
+          stepIndex: ctx.stepIndex,
+        }),
+      );
+      return {
+        outcome: 'block',
+        ...(verdict.reason !== undefined ? { reason: verdict.reason } : {}),
+        ...(verdict.replacement !== undefined ? { replacement: verdict.replacement } : {}),
+        parts,
+      };
+    }
+    text = verdict.text;
+    parts.push(guardrailPart('output', 'rewrite', guard, { stepIndex: ctx.stepIndex }));
+  }
+  return { outcome: 'pass', text, parts };
+}
+
+/**
+ * The denial reason a blocked tool call feeds back to the model. Deliberately
+ * says WHICH rule refused: the model's next turn can only route around a block
+ * it can read.
+ */
+export function guardrailDenialReason(
+  name: string | undefined,
+  reason: string | undefined,
+): string {
+  const who = name ? ` '${name}'` : '';
+  return reason ? `Blocked by guardrail${who}: ${reason}` : `Blocked by guardrail${who}.`;
+}
+
+/**
+ * Evaluate `guardrails.onToolCall` for every call of a step, IMMEDIATELY before
+ * the approval gate. Same ordering rules as {@link evaluateInputGuardrails},
+ * applied per call (one call's block never short-circuits another's).
+ *
+ * `rewrite` is an EXECUTION-SIDE substitution: the returned `calls` carry the
+ * new `args`, so the approval gate (`needsApproval` predicates, the approval
+ * request a human sees) and `execute` all work on them — but the assistant
+ * message already in the history keeps the arguments the MODEL issued. That
+ * asymmetry is deliberate: rewriting history would make the transcript lie
+ * about what the model asked for (and would break prompt-cache reuse), while a
+ * model that is told it called `rm -rf /` when the loop ran `rm -rf ./tmp`
+ * cannot reason about the next step.
+ *
+ * `block` joins the loop's EXISTING denial machinery — the returned map merges
+ * into the step's `DenialMap`, which already produces an `is_error` tool_result,
+ * a `denied` tool-state part, and (crucially) EXCLUSION from the runaway-error
+ * guard. The run CONTINUES: a blocked call is a verdict, never a run-killer.
+ */
+export async function applyToolCallGuardrails(
+  options: CommonCallOptions,
+  toolCalls: ToolCall[],
+  messages: Message[],
+  stepIndex?: number,
+): Promise<{ calls: ToolCall[]; blocked: DenialMap; parts: GuardrailPart[] }> {
+  const list: ToolCallGuardrail[] = guardrailList(options.guardrails?.onToolCall);
+  const blocked: DenialMap = new Map();
+  if (list.length === 0) return { calls: toolCalls, blocked, parts: [] };
+  const parts: GuardrailPart[] = [];
+  const base = guardrailBase(options);
+  const calls: ToolCall[] = [];
+  for (const original of toolCalls) {
+    let call = original;
+    let denied = false;
+    for (const guard of list) {
+      const verdict = await guard({
+        toolCall: call,
+        messages,
+        ...(stepIndex !== undefined ? { stepIndex } : {}),
+        ...base,
+      });
+      if (!verdict || verdict.action === 'pass') continue;
+      if (verdict.action === 'block') {
+        parts.push(
+          guardrailPart('tool-call', 'block', guard, {
+            reason: verdict.reason,
+            toolCallId: call.toolCallId,
+            ...(stepIndex !== undefined ? { stepIndex } : {}),
+          }),
+        );
+        blocked.set(call.toolCallId, {
+          // The observe union (`ToolDeniedEvent.cause`) is a locked 1.6 surface
+          // with no 'guardrail' member; a guardrail IS a server-side verdict, so
+          // it reports as 'server-denied' and the reason string carries the rest.
+          cause: 'server-denied',
+          reason: guardrailDenialReason(guardrailName(guard), verdict.reason),
+        });
+        denied = true;
+        break;
+      }
+      call = { ...call, args: verdict.args };
+      parts.push(
+        guardrailPart('tool-call', 'rewrite', guard, {
+          toolCallId: call.toolCallId,
+          ...(stepIndex !== undefined ? { stepIndex } : {}),
+        }),
+      );
+    }
+    // A blocked call still rides through the batch: every `tool_use_id` MUST be
+    // answered (the Anthropic 400 guard), and `executeTools` is what turns the
+    // denial into that answer.
+    calls.push(denied ? original : call);
+  }
+  return { calls, blocked, parts };
+}
+
+/**
+ * Return a COPY of an assistant turn whose text is `text` — the shape
+ * `assembleAssistant` would have produced had the model said that. Reasoning and
+ * `tool_use` parts survive untouched and stay in canonical order; an EMPTY
+ * `text` removes the text part entirely, exactly as `assembleAssistant` omits
+ * one for an empty answer.
+ *
+ * Never mutates: the immutable-history invariant means the loop replaces the
+ * last element of each array with this copy rather than editing in place.
+ */
+export function rewriteAssistantText(message: Message, text: string): Message {
+  if (typeof message.content === 'string') return { ...message, content: text };
+  const content: Part[] = [];
+  let placed = false;
+  for (const part of message.content) {
+    if (part.type === 'text') {
+      if (!placed && text) {
+        content.push({ type: 'text', text });
+        placed = true;
+      }
+      continue; // the model's original text never survives a rewrite
+    }
+    if (!placed && text && part.type === 'tool_use') {
+      content.push({ type: 'text', text });
+      placed = true;
+    }
+    content.push(part);
+  }
+  if (!placed && text) content.push({ type: 'text', text });
+  return { ...message, content };
+}
+
+// --- Handoff (2.0): the shared half of agent-to-agent transfer --------------
+//
+// `inference/handoff.ts` mints the `transfer_to_<name>` tools; everything below
+// is what the two loops DO with one. It lives here for the same reason the
+// guardrail helpers do: a transfer must mean the identical thing buffered and
+// streaming, and the only way to guarantee that is one implementation.
+
+/**
+ * Who is driving the run right now. `undefined` in the loops means "the ROOT
+ * agent" — the caller's own `model`/`tools`/system message, untouched. Every
+ * field is re-derived at the swap, never patched in place: the loops treat this
+ * as an immutable snapshot they replace wholesale.
+ */
+export interface ActiveAgentState {
+  /** The target's record key; absent only for the root agent. */
+  name?: string;
+  /** Drives every step from now on (a `prepareStep` `model` still outranks it). */
+  model: LanguageModel;
+  /** The agent's LOCAL tool set (before MCP tools are merged in). */
+  tools: ToolSet;
+  /** Transfers accepted so far in this RUN — checked against `maxHandoffs`. */
+  handoffCount: number;
+}
+
+/**
+ * `providerMetadata.deuz.handoffs` entry — a {@link HandoffPart} minus its
+ * `type` discriminant, so the buffered readout and the streaming part can never
+ * describe the same transfer differently (both are built from ONE object).
+ */
+export type HandoffLogEntry = Omit<HandoffPart, 'type'>;
+
+/** A tool call the loop resolved to a transfer tool, with the target it names. */
+export interface HandoffCall {
+  call: ToolCall;
+  meta: HandoffTargetMeta;
+}
+
+const NO_HANDOFF_CALLS: HandoffCall[] = [];
+
+/**
+ * Every transfer tool in a set, captured ONCE from the run's ROOT tool set.
+ *
+ * It has to be the root set, not the currently active one: after A → B the
+ * active set no longer contains `transfer_to_B` (an agent never gets a tool that
+ * transfers to itself), so deriving the list from it again would make B → C the
+ * step where "back to B" quietly stops existing.
+ */
+export function collectHandoffTools(tools: ToolSet): ToolSet {
+  const found: ToolSet = {};
+  for (const [name, tool] of Object.entries(tools)) {
+    if (readHandoffTarget(tool)) found[name] = tool;
+  }
+  return found;
+}
+
+/** True when the run has any transfer tool at all (the zero-overhead gate). */
+export function hasHandoffTools(handoffTools: ToolSet): boolean {
+  return Object.keys(handoffTools).length > 0;
+}
+
+/**
+ * Split a step's calls into transfers and everything else — the DETERMINISTIC
+ * interception, performed before guardrails, the approval gate and
+ * `executeTools`. A transfer is not an exception thrown out of an `execute`; it
+ * is a decision the loop makes by looking at the call.
+ *
+ * Fast path: with no transfer among the calls the ORIGINAL array rides through
+ * by reference, so a run without handoffs allocates nothing.
+ */
+export function splitHandoffCalls(
+  toolCalls: ToolCall[],
+  tools: ToolSet,
+): { handoffCalls: HandoffCall[]; normalCalls: ToolCall[] } {
+  let handoffCalls: HandoffCall[] | undefined;
+  for (const call of toolCalls) {
+    const tool = lookupTool(tools, call.toolName);
+    const meta = tool ? readHandoffTarget(tool) : undefined;
+    if (meta) (handoffCalls ??= []).push({ call, meta });
+  }
+  if (!handoffCalls) return { handoffCalls: NO_HANDOFF_CALLS, normalCalls: toolCalls };
+  const transferred = new Set(handoffCalls.map((h) => h.call.toolCallId));
+  return { handoffCalls, normalCalls: toolCalls.filter((c) => !transferred.has(c.toolCallId)) };
+}
+
+/** The accepted transfer of a step, if any, plus the results answering EVERY transfer id. */
+export interface HandoffDecision {
+  /** One `tool_result` per transfer call — the Anthropic 400 guard has no exceptions. */
+  results: ToolResult[];
+  /** Absent when the budget refused the transfer (self-healed, run unchanged). */
+  accepted?: { meta: HandoffTargetMeta; toolCallId: string; reason?: string };
+}
+
+/** The model's stated `reason`, when it supplied a usable one. */
+function handoffReason(args: unknown): string | undefined {
+  if (typeof args !== 'object' || args === null) return undefined;
+  const reason = (args as { reason?: unknown }).reason;
+  return typeof reason === 'string' && reason.trim() !== '' ? reason : undefined;
+}
+
+/**
+ * Decide what a step's transfer calls do. Pure — the caller performs the swap.
+ *
+ * - ONE transfer per step: the FIRST call in the model's own emission order
+ *   wins, and any sibling transfer is answered with an `is_error` saying so.
+ *   Applying two would mean the second agent never saw the first exist.
+ * - Over `maxHandoffs`: NOTHING is transferred and every transfer call comes
+ *   back as an `is_error` telling the model to continue itself. Self-healing by
+ *   design, and — like an approval denial — excluded from the runaway-error
+ *   guard by the loops, because it is a policy verdict, not a tool failure.
+ */
+export function decideHandoff(
+  handoffCalls: HandoffCall[],
+  active: ActiveAgentState | undefined,
+): HandoffDecision {
+  const first = handoffCalls[0]!;
+  const max = first.meta.options.maxHandoffs ?? DEFAULT_MAX_HANDOFFS;
+  const results: ToolResult[] = [];
+  if ((active?.handoffCount ?? 0) + 1 > max) {
+    for (const { call } of handoffCalls) {
+      results.push({
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        result: `Handoff limit (${max}) reached; continue yourself.`,
+        isError: true,
+      });
+    }
+    return { results };
+  }
+  const reason = handoffReason(first.call.args);
+  const to = first.meta.name;
+  results.push({
+    toolCallId: first.call.toolCallId,
+    toolName: first.call.toolName,
+    result: reason ? `Transferred to '${to}'. ${reason}` : `Transferred to '${to}'.`,
+  });
+  for (let i = 1; i < handoffCalls.length; i++) {
+    const { call } = handoffCalls[i]!;
+    results.push({
+      toolCallId: call.toolCallId,
+      toolName: call.toolName,
+      result: `Ignored: already transferred to '${to}' this step.`,
+      isError: true,
+    });
+  }
+  return {
+    results,
+    accepted: {
+      meta: first.meta,
+      toolCallId: first.call.toolCallId,
+      ...(reason ? { reason } : {}),
+    },
+  };
+}
+
+/**
+ * Re-order a step's results to the MODEL's call order, merging the executed
+ * results with the synthesized transfer ones. Nothing is dropped: a result whose
+ * id is not in `calls` (impossible today) still rides along at the end, because
+ * an unanswered `tool_use_id` is a 400 and a duplicated one is not.
+ */
+export function mergeResultsInCallOrder(
+  calls: ToolCall[],
+  executed: ToolResult[],
+  synthesized: ToolResult[],
+): ToolResult[] {
+  const byId = new Map<string, ToolResult>();
+  for (const r of executed) byId.set(r.toolCallId, r);
+  for (const r of synthesized) byId.set(r.toolCallId, r);
+  const ordered: ToolResult[] = [];
+  for (const call of calls) {
+    const result = byId.get(call.toolCallId);
+    if (result) {
+      ordered.push(result);
+      byId.delete(call.toolCallId);
+    }
+  }
+  for (const leftover of byId.values()) ordered.push(leftover);
+  return ordered;
+}
+
+/**
+ * The target's effective LOCAL tool set: its own tools plus every transfer tool
+ * EXCEPT its own (an agent that can transfer to itself is a loop with extra
+ * steps). The outgoing agent's non-transfer tools are deliberately gone — that
+ * is the difference between a handoff and a delegation.
+ *
+ * The target's own tools are applied LAST, so an agent that deliberately defines
+ * a name colliding with a transfer tool wins on its own turf.
+ */
+export function agentToolSet(handoffTools: ToolSet, target: HandoffTargetMeta): ToolSet {
+  const next: ToolSet = {};
+  for (const [name, tool] of Object.entries(handoffTools)) {
+    if (readHandoffTarget(tool)?.name === target.name) continue;
+    next[name] = tool;
+  }
+  return { ...next, ...(target.def.tools ?? {}) };
+}
+
+/**
+ * Replace the run's leading system turn with the incoming agent's instructions
+ * (inserting one when the history had none, removing it when the target
+ * declares none).
+ *
+ * A REWRITE, never an append — the same discipline compaction follows: the new
+ * turn must not enter `appended`/`chatMessages`, or the caller's response delta
+ * and the chat transcript would grow a system message they never sent. It lives
+ * in the effective model history (and therefore in checkpoints), which is
+ * exactly where a resume leg needs to find it.
+ */
+export function withAgentInstructions(
+  messages: Message[],
+  instructions: string | undefined,
+): Message[] {
+  const first = messages[0];
+  const hasSystem = first !== undefined && first.role === 'system';
+  if (instructions === undefined) return hasSystem ? messages.slice(1) : messages;
+  const system: Message = { role: 'system', content: instructions };
+  return hasSystem ? [system, ...messages.slice(1)] : [system, ...messages];
+}
+
+/** Find a target by NAME among the run's transfer tools (resume + lookup path). */
+export function findHandoffTarget(
+  handoffTools: ToolSet,
+  name: string,
+): HandoffTargetMeta | undefined {
+  const conventional = lookupTool(handoffTools, handoffToolName(name));
+  const direct = conventional ? readHandoffTarget(conventional) : undefined;
+  if (direct) return direct;
+  // A caller may have re-keyed the tool; the marker is the authority, not the key.
+  for (const tool of Object.values(handoffTools)) {
+    const meta = readHandoffTarget(tool);
+    if (meta?.name === name) return meta;
+  }
+  return undefined;
+}
+
+/** What a swap produces: the new active agent, the rewritten history, the log entry. */
+export interface HandoffSwap {
+  active: ActiveAgentState;
+  messages: Message[];
+  entry: HandoffLogEntry;
+}
+
+/**
+ * Perform an accepted transfer: derive the new active agent, rewrite the system
+ * turn, build the metadata/stream entry, and notify `onHandoff`.
+ *
+ * The caller still owns what only it can do — rebuilding the wire tool lists,
+ * emitting the part / recording the entry, and stamping the durable runner —
+ * but every DECISION is made here so the two loops cannot diverge.
+ */
+export function applyHandoffSwap(
+  accepted: NonNullable<HandoffDecision['accepted']>,
+  previous: ActiveAgentState | undefined,
+  handoffTools: ToolSet,
+  messages: Message[],
+  stepIndex: number,
+): HandoffSwap {
+  const { meta } = accepted;
+  const from = previous?.name;
+  const active: ActiveAgentState = {
+    name: meta.name,
+    model: meta.def.model,
+    tools: agentToolSet(handoffTools, meta),
+    handoffCount: (previous?.handoffCount ?? 0) + 1,
+  };
+  const entry: HandoffLogEntry = {
+    ...(from !== undefined ? { from } : {}),
+    to: meta.name,
+    toolCallId: accepted.toolCallId,
+    ...(accepted.reason !== undefined ? { reason: accepted.reason } : {}),
+    stepIndex,
+  };
+  // Caller code, so a throw PROPAGATES — the `onStepFinish`/`prepareStep`
+  // contract. A notification that silently swallowed its own failure would let a
+  // routing audit log go missing without a trace.
+  meta.options.onHandoff?.({
+    ...(from !== undefined ? { from } : {}),
+    to: meta.name,
+    ...(accepted.reason !== undefined ? { reason: accepted.reason } : {}),
+  });
+  return { active, messages: withAgentInstructions(messages, meta.def.instructions), entry };
+}
+
+/**
+ * Re-apply a checkpointed handoff at the start of a RESUME leg. The system
+ * message needs nothing — it already lives in the restored history — but the
+ * model and the tool set do, or the run would silently snap back to the root
+ * agent while still carrying the target's system prompt.
+ *
+ * A missing transfer tool (the resume call passed different `tools`) is DEGRADED,
+ * not fatal: warn, keep the identity and the spent budget so `maxHandoffs` still
+ * bounds the run, and continue with the root model/tools. Refusing to resume
+ * would strand a durable run over a call-site detail.
+ */
+export function resumeHandoffState(
+  saved: { to: string; count: number },
+  rootTools: ToolSet,
+  handoffTools: ToolSet,
+  rootModel: LanguageModel,
+  logger: Logger,
+): ActiveAgentState {
+  const meta = findHandoffTarget(handoffTools, saved.to);
+  if (!meta) {
+    logger.warn(
+      `handoff: the checkpoint was handed off to '${saved.to}', but this call registers no ` +
+        `transfer tool for it — continuing with the root agent's model and tools.`,
+    );
+    return { name: saved.to, model: rootModel, tools: rootTools, handoffCount: saved.count };
+  }
+  return {
+    name: meta.name,
+    model: meta.def.model,
+    tools: agentToolSet(handoffTools, meta),
+    handoffCount: saved.count,
+  };
+}
+
 const SUMMARY_PROMPT =
   'Summarize the conversation transcript above as concise notes: preserve key facts, decisions made, tool results that still matter, and any open task threads. Output only the summary.';
+
+/**
+ * The ROLLING half of the summarizer (2.0). Used instead of {@link SUMMARY_PROMPT}
+ * whenever the history already carries a summary: the side call is asked to FOLD
+ * the new slice into the existing notes rather than to summarize a summary,
+ * which is how a long run keeps one bounded summary instead of a lossy chain of
+ * summaries-of-summaries.
+ */
+const FOLD_PROMPT =
+  'Update the running summary with the new transcript: merge new facts and decisions in, keep still-relevant earlier notes, drop threads now resolved or superseded. Output only the updated summary.';
 
 /** Stringify without ever throwing (circular/BigInt). */
 function safeText(value: unknown): string {
@@ -593,23 +1366,43 @@ export function setupCompaction(
   deps: ResolvedDependencies,
 ): CompactionRunner | undefined {
   if (!options.compaction) return undefined;
+  const policy = normalizeCompaction(options.compaction);
   return {
-    policy: normalizeCompaction(options.compaction),
+    policy,
     // 1.9: the per-call `capabilities` override is threaded EXPLICITLY here (this
     // site holds the options object). Idempotent with the descriptor-clone route
     // the call boundary uses — same merge site, same precedence — but it means a
     // caller who corrects `contextWindow` for an unknown slug gets the right
     // compaction threshold even on a path that never went through `generate.ts`.
     contextWindow: getCapabilities(options.model, deps.logger, options.capabilities).contextWindow,
-    estimator: createTokenEstimator(),
+    // 2.0: a REAL tokenizer (`policy.countTokens`) replaces the char heuristic as
+    // the BASE count; the EMA calibration keeps running on top of it, because no
+    // tokenizer knows the provider's request framing (see estimate-tokens.ts).
+    estimator: createTokenEstimator(
+      policy.countTokens ? { countTokens: policy.countTokens } : undefined,
+    ),
   };
 }
+
+/** What a compaction pass carries into its events (stream part + observation). */
+export type CompactionTrigger = 'threshold' | 'overflow';
 
 /**
  * Run compaction before a model step. `addUsage` folds the summarize call's
  * usage into the loop total (so it counts toward budget stops); `onEvent`
- * surfaces each layer (stream part / log line). Returns the (possibly
- * compacted) history — same reference when nothing triggered.
+ * surfaces each layer (stream part / log line) together with the `trigger` that
+ * asked for the pass. Returns the (possibly compacted) history — same reference
+ * when nothing triggered.
+ *
+ * `overheadTokens` is added to EVERY estimate (2.0): the memory recall block is
+ * spliced in at the model-call site only, so it is invisible to `messages` yet
+ * very much visible to the provider. Counting it here is what keeps the
+ * threshold honest — and adding the same number to `estimatedAtCall` is what
+ * keeps the EMA calibration comparing like with like.
+ *
+ * `mode: 'force'` skips the fill gate entirely and `trigger: 'overflow'` labels
+ * the events: that is the overflow-recovery pass (see {@link recoverFromOverflow}),
+ * where the provider has already answered the fill question with a rejection.
  */
 export async function runCompaction(
   runner: CompactionRunner,
@@ -617,22 +1410,34 @@ export async function runCompaction(
   deps: ResolvedDependencies,
   messages: Message[],
   addUsage: (u: Usage) => void,
-  onEvent: (e: CompactionEvent) => void,
+  onEvent: (e: CompactionEvent, trigger: CompactionTrigger) => void,
   ob?: ExecuteExtras['observe'],
+  overheadTokens = 0,
+  mode: 'threshold' | 'force' = 'threshold',
+  trigger: CompactionTrigger = 'threshold',
 ): Promise<Message[]> {
   const ctx: ApplyCompactionCtx = {
-    estimate: (m) => runner.estimator.estimate(m),
+    estimate: (m) => runner.estimator.estimate(m) + overheadTokens,
     contextWindow: runner.contextWindow,
+    mode,
     ...(ob ? { now: () => deps.clock.now() } : {}),
-    summarize: async (slice) => {
+    summarize: async (slice, previousSummary) => {
       // Single-turn, tool-free, compaction-free side call — never recurses.
       // The slice is rendered to a transcript inside ONE user message so the
-      // request is user-first (valid on every wire, incl. Anthropic).
+      // request is user-first (valid on every wire, incl. Anthropic). With a
+      // previous summary in hand the call FOLDS instead of re-summarizing.
       const step = await runOneStep(
         preserveClientContext(options, {
           ...options,
           model: runner.policy.summarizeModel ?? options.model,
-          messages: [{ role: 'user', content: `${renderTranscript(slice)}\n\n${SUMMARY_PROMPT}` }],
+          messages: [
+            {
+              role: 'user',
+              content: previousSummary
+                ? `RUNNING SUMMARY OF EARLIER CONVERSATION:\n${previousSummary}\n\nNEW TRANSCRIPT:\n${renderTranscript(slice)}\n\n${FOLD_PROMPT}`
+                : `${renderTranscript(slice)}\n\n${SUMMARY_PROMPT}`,
+            },
+          ],
           tools: undefined,
           toolChoice: undefined,
           maxSteps: undefined,
@@ -679,7 +1484,7 @@ export async function runCompaction(
   };
   const { messages: compacted, events } = await applyCompaction(messages, runner.policy, ctx);
   for (const e of events) {
-    onEvent(e);
+    onEvent(e, trigger);
     ob?.rt.emit({
       type: 'compaction',
       spanId: ob.rt.startSpan().spanId,
@@ -687,7 +1492,7 @@ export async function runCompaction(
       stepIndex: ob.stepIndex,
       agentPath: options.agentPath,
       layer: e.layer,
-      trigger: 'threshold',
+      trigger,
       threshold: runner.policy.threshold,
       contextWindow: runner.contextWindow,
       tokensBefore: e.tokensBefore,
@@ -707,6 +1512,58 @@ export function calibrateCompaction(
   usage: Usage,
 ): void {
   if (runner) runner.estimator.calibrate(usage.inputTokens, estimatedAtCall);
+}
+
+/**
+ * True for the one error class an agentic step can recover from by itself: the
+ * provider said the request no longer fits. Both loops test with this so the
+ * two paths can never drift apart.
+ */
+export function isContextOverflow(error: unknown): boolean {
+  return error instanceof ContextOverflowError;
+}
+
+/**
+ * Overflow auto-recovery (2.0): the step's request was rejected as too long, so
+ * FORCE a compaction pass and hand the shrunk history back for one retry.
+ *
+ * Works even when the caller never opted into compaction — that is the point.
+ * A run with no `compaction` option would otherwise die on the first overflow,
+ * so a throwaway `'auto'` runner is built for this single pass (it is NOT
+ * retained: nothing else in the run starts compacting behind the caller's back).
+ *
+ * Returns `undefined` when nothing could be recovered — no runner could be
+ * built, or the forced pass returned the input array by REFERENCE, i.e. every
+ * layer declined. The caller must then rethrow the original error: retrying an
+ * identical request would only earn an identical rejection.
+ */
+export async function recoverFromOverflow(
+  runner: CompactionRunner | undefined,
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  messages: Message[],
+  addUsage: (u: Usage) => void,
+  onEvent: (e: CompactionEvent, trigger: CompactionTrigger) => void,
+  ob?: ExecuteExtras['observe'],
+): Promise<Message[] | undefined> {
+  const effective = runner ?? setupCompaction({ ...options, compaction: 'auto' }, deps);
+  if (!effective) return undefined;
+  const compacted = await runCompaction(
+    effective,
+    options,
+    deps,
+    messages,
+    addUsage,
+    onEvent,
+    ob,
+    // The recall block's overhead is deliberately NOT added here: force mode has
+    // no threshold to clear, and the recovery target is measured against the
+    // history the loop actually owns.
+    0,
+    'force',
+    'overflow',
+  );
+  return compacted === messages ? undefined : compacted;
 }
 
 export function toToolResultPart(r: ToolResult): Part {
@@ -1211,6 +2068,11 @@ export async function executeTools(
           // The expiry signal is MERGED with the caller's, never replacing it: a
           // user abort and a tool timeout must both reach the tool.
           signal: expiry ? combineSignals([options.signal, expiry.signal]) : options.signal,
+          // Request-scoped context (2.0), forwarded UNTOUCHED — the same value
+          // prepareStep/verifyStep/doneWhen and the guardrails see. Omitted (not
+          // `undefined`) when the call carries none. This is also the settle
+          // path's route: `settlePendingApprovals` executes through here.
+          ...runtimeContextOf(options),
           ...(options.agentPath ? { agentPath: options.agentPath } : {}),
           ...(options.approveToolCall ? { approveToolCall: options.approveToolCall } : {}),
           ...(ctxDeps ? { deps: ctxDeps } : {}),
@@ -1542,25 +2404,77 @@ export async function computeRecallBlock(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
   messages: Message[],
+  ob?: ExecuteExtras['observe'],
 ): Promise<string | undefined> {
   const memory = options.memory;
   if (!memory || memory.recall === false) return undefined;
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+  const text = lastUser ? contentText(lastUser.content) : '';
+  // Nothing to query with: no retrieval happened, so no operation is reported
+  // either — an operation.started with no matching terminal would be a lie.
+  if (!text) return undefined;
+  const recallOpts = memory.recall === undefined ? {} : memory.recall;
+  // `'default'` selects the built-in Generative-Agents scorer without making the
+  // caller import it; anything else is used verbatim. Omitted = raw store
+  // ranking, the pre-2.0 behavior.
+  const scorer: MemoryScorer | undefined =
+    recallOpts.scorer === 'default' ? defaultMemoryScorer : recallOpts.scorer;
+  // Observation (2.0): one operation span per recall. Guarded so the observer-less
+  // fast path allocates no event and draws no extra id (scripted-id fixtures).
+  const span = ob?.rt.startSpan();
+  if (ob && span) {
+    ob.rt.emit({
+      type: 'operation.started',
+      spanId: span.spanId,
+      parentSpanId: ob.parentSpanId,
+      agentPath: options.agentPath,
+      subsystem: 'memory',
+      operation: 'memory.recall',
+    });
+  }
   try {
-    const lastUser = [...messages].reverse().find((m) => m.role === 'user');
-    const text = lastUser ? contentText(lastUser.content) : '';
-    if (!text) return undefined;
-    const recallOpts = memory.recall === undefined ? {} : memory.recall;
     const hits = await recall(
       { scope: memory.scope, text, topK: recallOpts.topK ?? 5 },
       memory.seams,
+      {
+        ...(scorer ? { scorer } : {}),
+        ...(recallOpts.expandLinks !== undefined ? { expandLinks: recallOpts.expandLinks } : {}),
+      },
     );
+    if (ob && span) {
+      ob.rt.emit({
+        type: 'operation.completed',
+        spanId: span.spanId,
+        parentSpanId: ob.parentSpanId,
+        agentPath: options.agentPath,
+        subsystem: 'memory',
+        operation: 'memory.recall',
+        durationMs: ob.rt.durationSince(span.startedAt),
+        resultCount: hits.length,
+      });
+    }
     if (hits.length === 0) return undefined;
-    return formatMemoriesForPrompt(
-      hits,
-      recallOpts.header ? { header: recallOpts.header } : undefined,
-    );
+    // `maxChars` is the recall block's token budget (2.0). Before it, the block
+    // was unbounded: a chatty store could eat the very window compaction had
+    // just cleared.
+    const format: { header?: string; maxChars?: number } = {};
+    if (recallOpts.header !== undefined) format.header = recallOpts.header;
+    if (recallOpts.maxChars !== undefined) format.maxChars = recallOpts.maxChars;
+    return formatMemoriesForPrompt(hits, format);
   } catch (error) {
     deps.logger.error('memory recall failed', { error });
+    if (ob && span) {
+      ob.rt.emit({
+        type: 'operation.failed',
+        spanId: span.spanId,
+        parentSpanId: ob.parentSpanId,
+        agentPath: options.agentPath,
+        subsystem: 'memory',
+        operation: 'memory.recall',
+        durationMs: ob.rt.durationSince(span.startedAt),
+        error: toObservedError(error, ob.rt.capture.errorMessages),
+      });
+    }
     return undefined;
   }
 }
@@ -1579,22 +2493,91 @@ export function withSystemBlock(messages: Message[], block: string | undefined):
  * Memory extraction (1.7, D1): kick the mem0 extract→reconcile pass over this
  * call's new turns WITHOUT blocking the run. Returns a promise that NEVER
  * rejects (failures log and resolve `[]`) — exposed as `result.memory`.
+ *
+ * WRITE POLICY (2.0): `'session-end'` and `'manual'` both return `undefined`
+ * here — at LOOP level they are the same instruction, "do not write on this
+ * turn". They differ only in what the HOST is expected to do afterwards (call
+ * `remember()` when the session closes vs. whenever it decides to), and the SDK
+ * cannot observe either moment, so it must not guess at one. `'each-turn'`
+ * (and an unset policy) keeps the pre-2.0 behavior.
+ *
+ * SWEEP (2.0): with `sweep: 'on-extract'` a TTL garbage-collection pass is
+ * chained AFTER the extraction settles — fire-and-forget, failures logged, and
+ * deliberately off the returned promise: `result.memory` reports the mutations
+ * this turn wrote, never how much housekeeping happened to follow.
  */
 export function startMemoryExtract(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
   newTurns: Message[],
+  ob?: ExecuteExtras['observe'],
 ): Promise<MemoryMutation[]> | undefined {
   const memory = options.memory;
   if (!memory || memory.extract === false) return undefined;
+  if (memory.writePolicy === 'session-end' || memory.writePolicy === 'manual') return undefined;
   const infer = memory.extract === undefined ? true : (memory.extract.infer ?? true);
   const lastUser = [...options.messages].reverse().find((m) => m.role === 'user');
   const turns = lastUser ? [lastUser, ...newTurns] : newTurns;
   if (turns.length === 0) return Promise.resolve([]);
-  return remember(turns, memory.scope, memory.seams, { infer }).catch((error) => {
-    deps.logger.error('memory extract failed', { error });
-    return [] as MemoryMutation[];
-  });
+
+  // Observation (2.0): started fires SYNCHRONOUSLY (the write is in flight from
+  // here), completed/failed land whenever the pass settles — after the run's
+  // terminal event, which the runtime tolerates for non-terminal types (the
+  // `cost.calculated` precedent).
+  const span = ob?.rt.startSpan();
+  if (ob && span) {
+    ob.rt.emit({
+      type: 'operation.started',
+      spanId: span.spanId,
+      parentSpanId: ob.parentSpanId,
+      agentPath: options.agentPath,
+      subsystem: 'memory',
+      operation: 'memory.extract',
+    });
+  }
+  const settled = remember(turns, memory.scope, memory.seams, { infer }).then(
+    (mutations) => {
+      if (ob && span) {
+        ob.rt.emit({
+          type: 'operation.completed',
+          spanId: span.spanId,
+          parentSpanId: ob.parentSpanId,
+          agentPath: options.agentPath,
+          subsystem: 'memory',
+          operation: 'memory.extract',
+          durationMs: ob.rt.durationSince(span.startedAt),
+          resultCount: mutations.length,
+        });
+      }
+      return mutations;
+    },
+    (error: unknown) => {
+      deps.logger.error('memory extract failed', { error });
+      if (ob && span) {
+        ob.rt.emit({
+          type: 'operation.failed',
+          spanId: span.spanId,
+          parentSpanId: ob.parentSpanId,
+          agentPath: options.agentPath,
+          subsystem: 'memory',
+          operation: 'memory.extract',
+          durationMs: ob.rt.durationSince(span.startedAt),
+          error: toObservedError(error, ob.rt.capture.errorMessages),
+        });
+      }
+      return [] as MemoryMutation[];
+    },
+  );
+  if (memory.sweep === 'on-extract') {
+    void settled.then(async () => {
+      try {
+        await sweepExpired(memory.seams.store, memory.scope, deps.clock);
+      } catch (error) {
+        deps.logger.error('memory sweep failed', { error });
+      }
+    });
+  }
+  return settled;
 }
 
 /**
