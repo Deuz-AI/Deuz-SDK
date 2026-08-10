@@ -1,6 +1,6 @@
 # @deuz-sdk/core
 
-Pure, web-first, multi-provider TypeScript AI SDK — 29 built-in provider ids across four chat wires — with **zero runtime dependencies** and a canonical streaming protocol of its own.
+Pure, web-first, multi-provider TypeScript AI SDK — 28 chat provider ids across four wires, plus embeddings, images, speech, transcription and video — with **zero runtime dependencies** and a canonical streaming protocol of its own.
 
 ```bash
 npm i @deuz-sdk/core
@@ -32,13 +32,15 @@ for await (const text of result.textStream) process.stdout.write(text);
 
 ## Providers
 
-**29 built-in provider ids**, four chat wires, one call shape. A *provider id* is the string a descriptor carries and the key that resolves an API key and a base URL; a *factory* is the function that mints descriptors for it. The two do not count the same — `createOpenAI` and `createOpenAIResponses` are two factories over the one id `openai`, and `createKimi` is an alias of `createMoonshot`. A model descriptor is a plain `{ provider, modelId, surface }` value — factory settings ride a non-enumerable symbol, so keys never leak through `Object.keys` or `JSON.stringify`.
+**28 chat provider ids**, four wires, one call shape. A *provider id* is the string a descriptor carries and the key that resolves an API key and a base URL; a *factory* is the function that mints descriptors for it. The two do not count the same — `createOpenAI` and `createOpenAIResponses` are two factories over the one id `openai`, and `createKimi` is an alias of `createMoonshot`. A model descriptor is a plain `{ provider, modelId, surface }` value — factory settings ride a non-enumerable symbol, so keys never leak through `Object.keys` or `JSON.stringify`.
 
 | Group | Provider ids | Subpath |
 | --- | --- | --- |
-| Dedicated (10 ids) | `anthropic`, `openai`, `xai`, `google`, `vertex-anthropic`, `vertex-google`, `azure`, `bedrock`, `voyage`, `yunwu` | `/anthropic`, `/openai`, `/xai`, `/google`, `/vertex`, `/azure`, `/bedrock`, `/voyage`, `/yunwu` |
+| Dedicated (9 ids) | `anthropic`, `openai`, `xai`, `google`, `vertex-anthropic`, `vertex-google`, `azure`, `bedrock`, `yunwu` | `/anthropic`, `/openai`, `/xai`, `/google`, `/vertex`, `/azure`, `/bedrock`, `/yunwu` |
 | OpenAI-compat cloud hosts (17 ids) | `groq`, `mistral`, `deepseek`, `together`, `openrouter`, `cerebras`, `fireworks`, `moonshot` (a.k.a. Kimi), `qwen`, `glm`, `minimax`, `perplexity`, `cohere`, `deepinfra`, `nvidia`, `sambanova`, `hyperbolic` | `/providers` |
 | Keyless local hosts (2 ids) | `ollama`, `lmstudio` | `/providers` |
+
+`voyage` is deliberately absent: it is an embeddings provider, so it speaks none of the four chat wires and cannot be handed to `streamChat`.
 
 Which of the four chat wires each one speaks — the exhaustive `ModelSurface` → adapter switch:
 
@@ -53,7 +55,7 @@ Embeddings, images, speech, transcription and video are **separate model kinds**
 
 Ollama and LM Studio need **no API key** — they dial `localhost` and set the keyless escape for you. Any other OpenAI-shaped host gets a real provider id through `createOpenAICompatible({ id, baseURL })`, and `createProviderRegistry` resolves `'groq:llama-4-maverick'` strings.
 
-Unknown model slugs never throw: they fall back to a conservative capability row and report an `unknown-model` warning, so a model released this morning works without an SDK release. Correct the row per factory or per call with `capabilities`.
+Unknown model slugs never throw: they fall back to a conservative capability row and report an `unknown-model` warning, so a model released this morning works without an SDK release. Correct the row per factory or per call with `capabilities`. This path is verified against live APIs, not only in theory — `grok-4.5` and `gemini-3.6-flash` both postdate the pinned rows and both run end to end, tool loop included.
 
 ## Where it fits
 
