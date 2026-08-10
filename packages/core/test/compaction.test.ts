@@ -415,3 +415,85 @@ describe('layer order & early stop', () => {
     expect(e2!.tokensBefore).toBe(e1!.tokensAfter);
   });
 });
+
+describe("mode: 'force'", () => {
+  /** Reasoning 100 / un-pruned tool_result 1000 → history(8) starts at 8800. */
+  const layeredEstimate = (m: Message[]): number => {
+    let t = 0;
+    for (const msg of m) {
+      if (!Array.isArray(msg.content)) continue;
+      for (const p of msg.content) {
+        if (p.type === 'reasoning') t += 100;
+        else if (
+          p.type === 'tool_result' &&
+          !(typeof p.result === 'string' && p.result.startsWith('[pruned'))
+        ) {
+          t += 1000;
+        }
+      }
+    }
+    return t;
+  };
+
+  it('skips the trigger gate that threshold mode returns on', async () => {
+    const msgs = history(8);
+    const ctx = { estimate: jsonEstimate, contextWindow: 10_000_000 };
+
+    const gated = await applyCompaction(msgs, policy(), ctx);
+    expect(gated.messages).toBe(msgs);
+    expect(gated.events).toEqual([]);
+
+    // Same input, same (very roomy) window — force compacts anyway. It still
+    // honours the finite window afterwards, so ONE layer is enough here.
+    const forced = await applyCompaction(msgs, policy(), { ...ctx, mode: 'force' });
+    expect(forced.events.map((e) => e.layer)).toEqual(['prune-tool-results']);
+    expect(forced.messages).not.toBe(msgs);
+  });
+
+  it('aims at threshold*0.5 instead of threshold*0.8', async () => {
+    const msgs = history(8);
+    const summarize = vi.fn(async () => 'SUMMARY');
+    const ctx = { estimate: layeredEstimate, contextWindow: 9000, summarize };
+
+    // 8800/9000 → prune-tool-results → 4800/9000 = 0.53 ≤ 0.736 → stop.
+    const gated = await applyCompaction(msgs, policy(), ctx);
+    expect(gated.events.map((e) => e.layer)).toEqual(['prune-tool-results']);
+    expect(summarize).not.toHaveBeenCalled();
+
+    // Force wants 0.46: 0.53 is not good enough, so the next layers run too.
+    const forced = await applyCompaction(msgs, policy(), { ...ctx, mode: 'force' });
+    expect(forced.events.map((e) => e.layer)).toEqual([
+      'prune-tool-results',
+      'prune-reasoning',
+      'summarize',
+    ]);
+    expect(summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs every layer exactly once when the window is not finite', async () => {
+    const msgs = history(8);
+    const summarize = vi.fn(async () => 'SUMMARY');
+    const res = await applyCompaction(msgs, policy(), {
+      estimate: jsonEstimate,
+      contextWindow: Number.POSITIVE_INFINITY,
+      mode: 'force',
+      summarize,
+    });
+    // A ratio of 0 would have stopped after the first layer if it were tested.
+    expect(res.events.map((e) => e.layer)).toEqual([
+      'prune-tool-results',
+      'prune-reasoning',
+      'summarize',
+    ]);
+    expect(res.messages).toHaveLength(11);
+  });
+
+  it("is opt-in — an explicit 'threshold' behaves exactly like omitting it", async () => {
+    const msgs = history(8);
+    const ctx = { estimate: layeredEstimate, contextWindow: 9000 };
+    const implicit = await applyCompaction(msgs, policy(), ctx);
+    const explicit = await applyCompaction(msgs, policy(), { ...ctx, mode: 'threshold' as const });
+    expect(explicit.events).toEqual(implicit.events);
+    expect(explicit.messages).toEqual(implicit.messages);
+  });
+});

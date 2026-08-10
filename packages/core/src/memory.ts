@@ -17,8 +17,12 @@ import type { Clock } from './types/deps';
 import type { Tool, ToolSet } from './types/tool';
 import type { EmbedManyOptions } from './types/methods';
 import type { EmbeddingModel } from './types/model';
+// TYPE-ONLY on purpose: the bridge below adapts rag.ts's Embedder shape without
+// pulling a byte of `./rag` into the `./memory` bundle.
+import type { Embedder as RagEmbedder } from './rag';
 import { InvalidRequestError } from './errors';
 import { embedMany } from './inference/embed';
+import { cosineSimilarity } from './internal/vector';
 
 // ===================================================================
 // Canonical record (superset of mem0 + Letta + Graphiti + Obsidian; the extra
@@ -89,12 +93,20 @@ export interface MemoryHit {
 export interface MemoryFact {
   text: string;
   kind?: MemoryKind;
+  /** 0..1, clamped by {@link parseFacts}; how durable/consequential the model judged the fact. */
   importance?: number;
+  /**
+   * Related entities/facts the model named (2.0, opt-in via
+   * `buildExtractionPrompt(…, { links: true })`). Stored as `metadata.links`,
+   * which is the same shape the markdown backend writes for `[[wikilinks]]` —
+   * see {@link extractLinks}.
+   */
+  links?: string[];
 }
 
 /** Decision events (mem0 contradiction resolution). `id`s are real record ids (mapped back from temp handles). */
 export type MemoryEvent =
-  | { type: 'ADD'; text: string; kind?: MemoryKind }
+  | { type: 'ADD'; text: string; kind?: MemoryKind; importance?: number; links?: string[] }
   | { type: 'UPDATE'; id: string; text: string; oldText: string }
   | { type: 'DELETE'; id: string }
   | { type: 'NOOP'; id: string };
@@ -120,6 +132,23 @@ export interface MemoryStore {
   list(scope: MemoryScope, opts?: { kind?: MemoryKind; limit?: number }): Promise<MemoryRecord[]>;
   delete(ids: string[]): Promise<void>;
   update?(id: string, patch: Partial<MemoryRecord>): Promise<void>;
+  /**
+   * OPTIONAL fast path for write-time dedup (2.0): resolve content hashes to
+   * the records that already carry them, in one indexed round-trip. Without it
+   * the pipeline falls back to `list(scope)` + an in-memory hash scan, which is
+   * correct but O(all records) — fine for the in-memory/markdown backends,
+   * wrong for a SQL table with a `hash` index. Omitting it keeps a pre-2.0
+   * store valid.
+   */
+  findByHash?(hashes: string[], scope: MemoryScope): Promise<MemoryRecord[]>;
+  /**
+   * OPTIONAL fast path for the TTL sweep (2.0): hard-delete every record whose
+   * `expiresAt` is at or before `now`, optionally narrowed to a scope, and
+   * return HOW MANY were removed. Same rationale as `findByHash` — the fallback
+   * is a full `list` + filter + `delete`, which a real database can do in one
+   * statement. Omitting it keeps a pre-2.0 store valid.
+   */
+  deleteExpired?(now: number, scope?: MemoryScope): Promise<number>;
 }
 
 /** Delegates to embed.ts. `action` lets Gemini/OpenAI pick a task type. */
@@ -175,9 +204,51 @@ export interface MemoryCallOptions {
   /** Mandatory ownership (mem0 rule) — e.g. `{ userId, chatId }`. */
   scope: MemoryScope;
   /** Recall before the first model call (default on, topK 5). `false` disables. */
-  recall?: { topK?: number; header?: string } | false;
+  recall?:
+    | {
+        /** Retrieval breadth handed to `store.search` (default 5). */
+        topK?: number;
+        /** First line of the spliced block (default `'Relevant memories:'`). */
+        header?: string;
+        /**
+         * Rerank the hits before they are rendered. A {@link MemoryScorer}
+         * instance is used as-is; the string `'default'` selects
+         * {@link defaultMemoryScorer} (recency·importance·relevance) without
+         * making the caller import it. Omitted = raw store ranking, i.e. the
+         * pre-2.0 behavior.
+         */
+        scorer?: MemoryScorer | 'default';
+        /**
+         * Hard character budget for the RENDERED block (see
+         * {@link formatMemoriesForPrompt}). Omitted = unbounded, the pre-2.0
+         * behavior; set it to keep recall from eating the context window.
+         */
+        maxChars?: number;
+        /**
+         * Graph hops to follow out of the primary hits (default 0 = off). See
+         * {@link recall} — linked records are appended AFTER the primaries with
+         * a decayed score, so the head of the block never changes.
+         */
+        expandLinks?: number;
+      }
+    | false;
   /** Extract after the run (default on, LLM-inferred). `false` disables. */
   extract?: { infer?: boolean } | false;
+  /**
+   * WHEN the extraction pass may run (default `'each-turn'` — the pre-2.0
+   * behavior). `'session-end'` and `'manual'` suppress the loop's automatic
+   * extract entirely: the SDK cannot know when a session ends, so the host owns
+   * the write and calls {@link remember} itself. `extract: false` still wins.
+   */
+  writePolicy?: WritePolicy;
+  /**
+   * TTL housekeeping (default `'never'`). `'on-extract'` chains
+   * {@link sweepExpired} onto the (non-blocking) extraction pass, so a store
+   * with TTL'd records is garbage-collected on write traffic instead of needing
+   * a cron. Best-effort like the rest of the memory hooks — a failing sweep logs
+   * and never breaks the chat.
+   */
+  sweep?: 'on-extract' | 'never';
 }
 
 // ===================================================================
@@ -219,20 +290,13 @@ export function isExpired(rec: MemoryRecord, now: number): boolean {
   return rec.expiresAt !== undefined && rec.expiresAt <= now;
 }
 
-/** Pure cosine similarity (edge-safe Float math). Returns 0 on length mismatch / zero vector. */
-export function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length || a.length === 0) return 0;
-  let dot = 0;
-  let na = 0;
-  let nb = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i]! * b[i]!;
-    na += a[i]! * a[i]!;
-    nb += b[i]! * b[i]!;
-  }
-  if (na === 0 || nb === 0) return 0;
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
-}
+/**
+ * Pure cosine similarity (edge-safe Float math). Returns 0 on length mismatch /
+ * zero vector. Re-exported from `internal/vector.ts` (2.0): `rag.ts` shipped a
+ * byte-identical copy, so the two now share ONE implementation — this subpath's
+ * public surface is unchanged.
+ */
+export { cosineSimilarity } from './internal/vector';
 
 /** Default Generative-Agents scorer: w_r·decay + w_i·importance + w_rel·relevance. */
 export const defaultMemoryScorer: MemoryScorer = {
@@ -282,14 +346,34 @@ function conversationText(messages: Message[]): string {
     .join('\n');
 }
 
-/** Build the fact-extraction prompt from a conversation window. */
+/**
+ * Build the fact-extraction prompt from a conversation window.
+ *
+ * 2.0 asks for OBJECT facts — `{text, importance, kind}` — because the pre-2.0
+ * bare-string shape left `defaultMemoryScorer`'s importance term permanently 0
+ * and every record pinned to a single caller-supplied `kind`. `opts.links`
+ * additionally asks for the entities each fact connects to, which is what
+ * {@link recall}'s `expandLinks` traverses. {@link parseFacts} still accepts
+ * bare strings, so a custom prompt (or a model that ignores the shape) keeps
+ * working.
+ */
 export function buildExtractionPrompt(
   messages: Message[],
-  opts?: { customInstructions?: string },
+  opts?: { customInstructions?: string; links?: boolean },
 ): { system: string; user: string } {
+  const shape = opts?.links
+    ? '{"facts":[{"text":"…","importance":<0..1>,"kind":"semantic|episodic|procedural|working",' +
+      '"links":["related entity or fact"]}]}'
+    : '{"facts":[{"text":"…","importance":<0..1>,"kind":"semantic|episodic|procedural|working"}]}';
   const system =
     'You extract durable, standalone facts about the user/agent from a conversation. ' +
-    'Return ONLY JSON of the form {"facts": ["fact 1", "fact 2"]}. ' +
+    `Return ONLY JSON of the form ${shape}. ` +
+    '"importance" is how durable/consequential the fact is (0 = throwaway, 1 = defining). ' +
+    '"kind" is semantic (a stable truth), episodic (one specific event), procedural (how the ' +
+    'user wants things done) or working (short-lived context). ' +
+    (opts?.links
+      ? '"links" names the entities or other facts this one connects to (omit it when there are none). '
+      : '') +
     'Each fact must be self-contained (no pronouns referring outside it), atomic, and worth ' +
     'remembering long-term (preferences, identity, goals, constraints, decisions). ' +
     'If there is nothing worth remembering, return {"facts": []}.' +
@@ -298,7 +382,40 @@ export function buildExtractionPrompt(
   return { system, user };
 }
 
-/** Tolerant fact parser: strips fences, validates shape, returns [] on garbage (never throws). */
+const MEMORY_KINDS: readonly string[] = ['episodic', 'semantic', 'working', 'procedural'];
+
+/** Accept only the four literals — a hallucinated kind must not widen `MemoryKind`. */
+function parseKind(value: unknown): MemoryKind | undefined {
+  return typeof value === 'string' && MEMORY_KINDS.includes(value)
+    ? (value as MemoryKind)
+    : undefined;
+}
+
+/** Clamp to [0,1]; drop anything non-finite (a string "high", NaN, Infinity). */
+function parseImportance(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  return Math.min(1, Math.max(0, value));
+}
+
+/** Keep the non-empty strings; drop the array entirely when nothing survives. */
+function parseLinks(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const link = item.trim();
+    if (link) out.push(link);
+  }
+  return out.length ? out : undefined;
+}
+
+/**
+ * Tolerant fact parser: strips fences, validates shape, returns [] on garbage
+ * (never throws). Bare strings stay valid (pre-2.0 prompts); object facts get
+ * `importance` clamped to [0,1], `kind` checked against the four literals, and
+ * `links` filtered to non-empty strings — a field that fails validation is
+ * DROPPED, never the fact.
+ */
 export function parseFacts(llmText: string): MemoryFact[] {
   try {
     const parsed = JSON.parse(stripFences(llmText)) as unknown;
@@ -308,9 +425,18 @@ export function parseFacts(llmText: string): MemoryFact[] {
     for (const item of arr) {
       if (typeof item === 'string' && item.trim()) out.push({ text: item.trim() });
       else if (item && typeof item === 'object' && typeof (item as MemoryFact).text === 'string') {
-        const f = item as MemoryFact;
-        if (f.text.trim())
-          out.push({ text: f.text.trim(), kind: f.kind, importance: f.importance });
+        const raw = item as Record<string, unknown>;
+        const text = (raw.text as string).trim();
+        if (!text) continue;
+        const kind = parseKind(raw.kind);
+        const importance = parseImportance(raw.importance);
+        const links = parseLinks(raw.links);
+        out.push({
+          text,
+          ...(kind ? { kind } : {}),
+          ...(importance !== undefined ? { importance } : {}),
+          ...(links ? { links } : {}),
+        });
       }
     }
     return out;
@@ -399,6 +525,8 @@ export interface ApplyContext {
   /** Pre-computed embeddings keyed by fact text (for ADD/UPDATE records). */
   embeddings?: Map<string, number[]>;
   embeddingModelId?: string;
+  /** Base metadata every written record inherits (tags, source, …); event links merge ON TOP. */
+  metadata?: Record<string, unknown>;
 }
 
 /** PURE reducer: turn decision events into concrete store mutations. */
@@ -419,12 +547,21 @@ export async function applyEvents(
       continue;
     }
     if (ev.type === 'ADD') {
+      // Extraction-time enrichment (2.0): the event carries the importance and
+      // the graph links the fact was extracted with; `metadata.links` is the
+      // same key `extractLinks` reads back, and ctx.metadata stays underneath.
+      const metadata =
+        ev.links?.length || ctx.metadata
+          ? { ...ctx.metadata, ...(ev.links?.length ? { links: ev.links } : {}) }
+          : undefined;
       const record: MemoryRecord = {
         id: ctx.generateId(),
         text: ev.text,
         hash: await ctx.hashFn(ev.text),
         kind: ev.kind ?? ctx.kind ?? 'semantic',
         scope: ctx.scope,
+        ...(metadata ? { metadata } : {}),
+        ...(ev.importance !== undefined ? { importance: ev.importance } : {}),
         createdAt: now,
         updatedAt: now,
         validAt: now,
@@ -443,7 +580,7 @@ export async function applyEvents(
       hash: await ctx.hashFn(ev.text),
       kind: prev?.kind ?? ctx.kind ?? 'semantic',
       scope: prev?.scope ?? ctx.scope,
-      metadata: { ...prev?.metadata, prevText: ev.oldText || prev?.text },
+      metadata: { ...ctx.metadata, ...prev?.metadata, prevText: ev.oldText || prev?.text },
       ...(prev?.importance !== undefined ? { importance: prev.importance } : {}),
       createdAt: prev?.createdAt ?? now,
       updatedAt: now,
@@ -475,10 +612,93 @@ export interface RememberOptions {
   topK?: number;
   kind?: MemoryKind;
   customInstructions?: string;
+  /**
+   * Ask the extraction pass for per-fact graph links (default false). Costs a
+   * few prompt tokens and lands as `metadata.links`, which {@link recall}'s
+   * `expandLinks` traverses.
+   */
+  links?: boolean;
   /** Default true → applies mutations to the store. false → plan-only (host applies). */
   apply?: boolean;
   /** Swap the LLM extraction step entirely. */
   customExtract?: (messages: Message[]) => Promise<MemoryFact[]> | MemoryFact[];
+}
+
+/**
+ * Which of `hashes` the store ALREADY holds in this scope — the write-time
+ * dedup gate (2.0). One `findByHash` round-trip when the backend indexes hashes;
+ * an empty set (i.e. "write it") when it does not, because scanning every record
+ * of every scope on every turn would cost more than the duplicate row it saves.
+ * A store that wants dedup implements the optional method.
+ */
+async function knownHashes(
+  store: MemoryStore,
+  hashes: string[],
+  scope: MemoryScope,
+): Promise<Set<string>> {
+  if (!store.findByHash || hashes.length === 0) return new Set();
+  const found = await store.findByHash(hashes, scope);
+  return new Set(found.map((r) => r.hash));
+}
+
+/**
+ * Copy the extraction metadata (kind/importance/links) onto the ADD events the
+ * reconciler produced, matching on the EXACT fact text. Deliberately not fuzzy:
+ * when the decision pass rewrote the wording, the numbers no longer describe
+ * that string, and a wrong importance is worse than none.
+ */
+function enrichAddEvents(events: MemoryEvent[], facts: Map<string, MemoryFact>): MemoryEvent[] {
+  if (facts.size === 0) return events;
+  return events.map((ev) => {
+    if (ev.type !== 'ADD') return ev;
+    const fact = facts.get(ev.text);
+    if (!fact) return ev;
+    return {
+      ...ev,
+      ...(ev.kind === undefined && fact.kind ? { kind: fact.kind } : {}),
+      ...(fact.importance !== undefined ? { importance: fact.importance } : {}),
+      ...(fact.links?.length ? { links: fact.links } : {}),
+    };
+  });
+}
+
+/**
+ * Drop ADD events whose content hash is already spoken for — within this very
+ * batch, among the records the reconciliation pass retrieved, or (fast path) in
+ * the store. A dropped ADD leaves NO trace: emitting a NOOP would tell the
+ * caller a record was inspected when none was. UPDATE/DELETE/NOOP pass through
+ * untouched — an UPDATE is addressed by id, so its hash colliding is not a
+ * duplicate but a convergence.
+ */
+async function dedupeAddEvents(
+  events: MemoryEvent[],
+  existing: MemoryRecord[],
+  ctx: { store: MemoryStore; scope: MemoryScope; hashFn: HashFn },
+): Promise<MemoryEvent[]> {
+  const adds = events.filter(
+    (ev): ev is Extract<MemoryEvent, { type: 'ADD' }> => ev.type === 'ADD',
+  );
+  if (adds.length === 0) return events;
+
+  const existingHashes = new Set(existing.map((r) => r.hash));
+  const batch = new Set<string>();
+  const dropped = new Set<MemoryEvent>();
+  const pending = new Map<MemoryEvent, string>();
+  for (const ev of adds) {
+    const hash = await ctx.hashFn(ev.text);
+    if (batch.has(hash) || existingHashes.has(hash)) {
+      dropped.add(ev);
+      continue;
+    }
+    batch.add(hash);
+    pending.set(ev, hash);
+  }
+
+  const stored = await knownHashes(ctx.store, [...pending.values()], ctx.scope);
+  if (stored.size) {
+    for (const [ev, hash] of pending) if (stored.has(hash)) dropped.add(ev);
+  }
+  return dropped.size ? events.filter((ev) => !dropped.has(ev)) : events;
 }
 
 async function applyMutations(store: MemoryStore, mutations: MemoryMutation[]): Promise<void> {
@@ -518,28 +738,44 @@ export async function remember(
   // --- infer=false short-circuit: store raw turns, ZERO llm/embed (cost escape hatch) ---
   if (!infer) {
     const now = seams.clock.now();
-    const records: MemoryRecord[] = [];
+    // Hash FIRST, mint ids second: the dedup gate must not burn a generateId()
+    // on a turn it is about to drop (scripted-id fixtures pin the sequence).
+    const batch = new Set<string>();
+    const pending: Array<{ text: string; hash: string }> = [];
     for (const m of messages) {
-      const text =
+      const raw =
         typeof m.content === 'string' ? m.content : conversationText([m]).replace(/^[^:]+:\s*/, '');
-      if (!text.trim()) continue;
-      records.push({
-        id: seams.generateId(),
-        text: text.trim(),
-        hash: await hashFn(text.trim()),
-        kind: opts.kind ?? 'episodic',
-        scope,
-        createdAt: now,
-        updatedAt: now,
-        validAt: now,
-        ...(opts.ttlMs ? { expiresAt: now + opts.ttlMs } : {}),
+      const text = raw.trim();
+      if (!text) continue;
+      const hash = await hashFn(text);
+      if (batch.has(hash)) continue; // the same turn twice in one window
+      batch.add(hash);
+      pending.push({ text, hash });
+    }
+    const stored = await knownHashes(
+      seams.store,
+      pending.map((p) => p.hash),
+      scope,
+    );
+    const mutations: MemoryMutation[] = [];
+    for (const p of pending) {
+      if (stored.has(p.hash)) continue; // already remembered verbatim
+      mutations.push({
+        op: 'upsert',
+        event: 'ADD',
+        record: {
+          id: seams.generateId(),
+          text: p.text,
+          hash: p.hash,
+          kind: opts.kind ?? 'episodic',
+          scope,
+          createdAt: now,
+          updatedAt: now,
+          validAt: now,
+          ...(opts.ttlMs ? { expiresAt: now + opts.ttlMs } : {}),
+        },
       });
     }
-    const mutations: MemoryMutation[] = records.map((record) => ({
-      op: 'upsert',
-      record,
-      event: 'ADD',
-    }));
     if (apply && mutations.length) await applyMutations(seams.store, mutations);
     return mutations;
   }
@@ -550,11 +786,18 @@ export async function remember(
     facts = await opts.customExtract(messages);
   } else {
     const text = await seams.llm(
-      buildExtractionPrompt(messages, { customInstructions: opts.customInstructions }),
+      buildExtractionPrompt(messages, {
+        customInstructions: opts.customInstructions,
+        links: opts.links,
+      }),
     );
     facts = parseFacts(text);
   }
   if (facts.length === 0) return [];
+
+  // Keep the extraction metadata addressable by exact text — the reconciler
+  // speaks in fact strings, so this is the only join key that exists.
+  const factByText = new Map(facts.map((f) => [f.text, f]));
 
   // Embed facts (for ADD records + reconciliation search), if an embedder is wired.
   const embeddings = new Map<string, number[]>();
@@ -590,7 +833,12 @@ export async function remember(
     system: decisionPrompt.system,
     user: decisionPrompt.user,
   });
-  const events = parseDecision(decisionText, decisionPrompt.idMap);
+  const decided = parseDecision(decisionText, decisionPrompt.idMap);
+  const events = await dedupeAddEvents(enrichAddEvents(decided, factByText), existing, {
+    store: seams.store,
+    scope,
+    hashFn,
+  });
   const mutations = await applyEvents(events, existing, {
     clock: seams.clock,
     generateId: seams.generateId,
@@ -607,6 +855,30 @@ export async function remember(
   return mutations;
 }
 
+/**
+ * TTL garbage collection (2.0): hard-delete every record in `scope` whose
+ * `expiresAt` has passed and return HOW MANY went. `isExpired` only HIDES an
+ * expired record at read time, so without a sweep a TTL'd store grows forever.
+ *
+ * Fast path when the backend implements `deleteExpired` (one DELETE statement);
+ * otherwise `list` + filter + `delete`, which is correct everywhere and cheap
+ * for the in-memory/markdown backends. Deliberately hard-deletes even under a
+ * `supersede: 'soft'` policy — an expiry is a lifetime ending, not a fact being
+ * contradicted.
+ */
+export async function sweepExpired(
+  store: MemoryStore,
+  scope: MemoryScope,
+  clock: Clock,
+): Promise<number> {
+  const now = clock.now();
+  if (store.deleteExpired) return store.deleteExpired(now, scope);
+  const records = await store.list(scope);
+  const expired = records.filter((r) => isExpired(r, now));
+  if (expired.length) await store.delete(expired.map((r) => r.id));
+  return expired.length;
+}
+
 /** Plan-only alias (apply:false). Host owns sync-vs-defer scheduling. */
 export function planMemory(
   messages: Message[],
@@ -617,11 +889,71 @@ export function planMemory(
   return remember(messages, scope, seams, { ...opts, apply: false });
 }
 
-/** Retrieval glue: embed query (if text & embedder) → store.search → drop-expired → optional rerank. */
+// ===================================================================
+// Graph traversal (Obsidian / Graphiti): the links were always WRITTEN — 2.0
+// finally READS them.
+// ===================================================================
+
+const WIKILINK_RE = /\[\[([^\][]+)\]\]/g;
+
+/** How many link targets a single hop may chase (a fan-out fuse, not a budget). */
+const MAX_LINKS_PER_HOP = 8;
+
+/**
+ * The outgoing edges of a record: its `metadata.links` array plus every
+ * `[[wikilink]]` in the body, deduped in that order.
+ *
+ * Surrounding brackets are STRIPPED from `metadata.links` entries, because both
+ * spellings mean the same node — the markdown backend round-trips a frontmatter
+ * `links: ["[[project]]"]` while an LLM-extracted fact writes `"project"` — and
+ * without normalization the same neighbour would be visited twice.
+ */
+export function extractLinks(record: MemoryRecord): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string): void => {
+    const link = raw.trim().replace(/^\[\[/, '').replace(/\]\]$/, '').trim();
+    if (!link || seen.has(link)) return;
+    seen.add(link);
+    out.push(link);
+  };
+  const meta = record.metadata?.links;
+  if (Array.isArray(meta)) for (const l of meta) if (typeof l === 'string') push(l);
+  for (const m of record.text.matchAll(WIKILINK_RE)) push(m[1]!);
+  return out;
+}
+
+/** Resolve one link target: an id first (`store.get`), then a title/text search. */
+async function resolveLink(
+  link: string,
+  scope: MemoryScope,
+  store: MemoryStore,
+): Promise<MemoryRecord | null> {
+  const byId = await store.get(link, scope);
+  if (byId) return byId;
+  const hits = await store.search({ scope, text: link, topK: 1 });
+  const first = hits[0];
+  return first && first.score > 0 ? first.record : null;
+}
+
+/**
+ * Retrieval glue: embed query (if text & embedder) → store.search →
+ * drop-expired → optional rerank → optional link expansion.
+ *
+ * `expandLinks: n` walks up to `n` hops out of the primary hits (2.0). Linked
+ * records are APPENDED, never interleaved: the primaries keep the head of the
+ * list exactly as scoring left them, so turning expansion on can only add
+ * context, never displace it. Each hop multiplies its parent hit's score by
+ * `0.5 ** hop`, so a neighbour never outranks what pulled it in. A `seen` set of
+ * record ids makes an A↔B cycle terminate, the fan-out is capped at
+ * {@link MAX_LINKS_PER_HOP} targets per hop and the whole expansion at
+ * `2 × topK` extra records. Expansion is BEST-EFFORT — a store that throws
+ * mid-walk logs and yields the primaries plus whatever was already resolved.
+ */
 export async function recall(
   query: MemoryQuery,
   seams: MemorySeams,
-  opts: { scorer?: MemoryScorer; dropExpired?: boolean } = {},
+  opts: { scorer?: MemoryScorer; dropExpired?: boolean; expandLinks?: number } = {},
 ): Promise<MemoryHit[]> {
   assertScope(query.scope);
   let q = query;
@@ -646,7 +978,46 @@ export async function recall(
       }))
       .sort((a, b) => b.score - a.score);
   }
-  return hits;
+
+  const hops = opts.expandLinks ?? 0;
+  if (hops <= 0 || hits.length === 0) return hits;
+
+  const now = seams.clock.now();
+  const cap = 2 * (query.topK ?? 5);
+  const seen = new Set(hits.map((h) => h.record.id));
+  const extra: MemoryHit[] = [];
+  let frontier = hits;
+  try {
+    for (let hop = 1; hop <= hops && frontier.length && extra.length < cap; hop++) {
+      const targets: Array<{ link: string; parent: MemoryHit }> = [];
+      const visited = new Set<string>();
+      for (const parent of frontier) {
+        for (const link of extractLinks(parent.record)) {
+          if (visited.has(link)) continue;
+          visited.add(link);
+          targets.push({ link, parent });
+          if (targets.length >= MAX_LINKS_PER_HOP) break;
+        }
+        if (targets.length >= MAX_LINKS_PER_HOP) break;
+      }
+
+      const next: MemoryHit[] = [];
+      for (const { link, parent } of targets) {
+        const record = await resolveLink(link, query.scope, seams.store);
+        if (!record || seen.has(record.id)) continue;
+        if (record.invalidAt != null || isExpired(record, now)) continue;
+        seen.add(record.id);
+        const hit: MemoryHit = { record, score: parent.score * Math.pow(0.5, hop) };
+        extra.push(hit);
+        next.push(hit);
+        if (extra.length >= cap) break;
+      }
+      frontier = next;
+    }
+  } catch (error) {
+    seams.logger?.warn('memory link expansion failed', { error });
+  }
+  return [...hits, ...extra];
 }
 
 /** Render hits into a system-prompt string (RAG-style splice). Pure formatting. */
@@ -829,6 +1200,40 @@ export function createInMemoryMemoryStore(): MemoryStore {
     async update(id, patch) {
       const r = records.get(id);
       if (r) records.set(id, { ...r, ...patch });
+    },
+    async findByHash(hashes, scope) {
+      // Soft-deleted records are invisible here for the same reason they are in
+      // search()/list(): a fact the host invalidated must not silently block the
+      // model from learning it again.
+      const wanted = new Set(hashes);
+      return [...records.values()].filter(
+        (r) => wanted.has(r.hash) && matchesScope(r, scope) && r.invalidAt == null,
+      );
+    },
+    async deleteExpired(now, scope) {
+      const doomed = [...records.values()].filter(
+        (r) => isExpired(r, now) && (scope ? matchesScope(r, scope) : true),
+      );
+      for (const r of doomed) records.delete(r.id);
+      return doomed.length;
+    },
+  };
+}
+
+/**
+ * Bridge a RAG `Embedder` (`./rag`) into a memory `Embedder` (2.0).
+ *
+ * The two subsystems grew incompatible seams: RAG's takes only texts and
+ * advertises `dims`, memory's takes a task `action` and reports the model id it
+ * used. Rather than break either public type, this adapter lets ONE embedder
+ * back both — the memory side simply has no task type to pass on. Supply
+ * `modelId` when you care about the `embeddingModelId` dimension-drift guard on
+ * written records; without it the records are pinned to `'unknown'`.
+ */
+export function memoryEmbedderFromRag(e: RagEmbedder, opts?: { modelId?: string }): Embedder {
+  return {
+    async embed(texts) {
+      return { vectors: await e.embed(texts), model: opts?.modelId ?? 'unknown' };
     },
   };
 }

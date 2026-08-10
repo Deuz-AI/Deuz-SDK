@@ -3,7 +3,7 @@
  *
  * One `createYunwu({ apiKey, baseURL })` config drives EVERY surface off a single
  * base URL — that is the "creative base URL": you give the host once and the
- * client derives the right path per call (chat/image/embeddings at `/v1`,
+ * client derives the right path per call (chat/image/embeddings/video at `/v1`,
  * Midjourney at the bare `/mj` root). Models below are the 2026 catalog actually
  * served by Yunwu's `/v1/models` (live-verified 2026-05-31). The API key is
  * injected (config / deps / ClientConfig) — never hardcoded.
@@ -13,11 +13,13 @@
  *   streamChat({ model: yunwu.chat('gpt-5.2'), messages });
  *   generateImage({ model: yunwu.image('flux-2-pro'), prompt });
  *   embed({ model: yunwu.embedding('text-embedding-3-large'), value });
+ *   generateVideo({ model: yunwu.video('sora-2'), prompt });
  *   imagine({ ...yunwu.mj(), prompt });
  */
 import type { LanguageModel, Provider, EmbeddingModel, EmbeddingProvider } from './types/model';
 import { attachConfig } from './internal/config-symbol';
 import { createImageProvider, type ImageProvider, type ImageProviderSettings } from './image';
+import { createVideoProvider, type VideoModel, type VideoProviderSettings } from './video';
 import type { MidjourneyConfig } from './midjourney';
 
 /** Default Yunwu host (no `/v1`, no trailing slash). Override for self-host / mirror. */
@@ -74,7 +76,11 @@ export const YUNWU_IMAGE_MODELS = [
   'grok-4.2-image',
 ] as const;
 
-/** Newest-generation video models on Yunwu (2026) — async, run via the Midjourney/task proxy or chat surface. */
+/**
+ * Newest-generation video models on Yunwu (2026) — async: submit a job at
+ * `/v1/videos`, poll it, download the clip. Drive them with `createYunwuVideo` /
+ * `yunwu.video(slug)` and `generateVideo` (`@deuz-sdk/core/video`).
+ */
 export const YUNWU_VIDEO_MODELS = [
   'sora-2',
   'veo3.1',
@@ -109,6 +115,7 @@ export const YUNWU_MODELS = {
 
 export type YunwuChatModel = (typeof YUNWU_CHAT_MODELS)[number] | (string & {});
 export type YunwuImageModel = (typeof YUNWU_IMAGE_MODELS)[number] | (string & {});
+export type YunwuVideoModel = (typeof YUNWU_VIDEO_MODELS)[number] | (string & {});
 
 // ===================================================================
 // Factories (each bound to a base URL + injected key)
@@ -135,6 +142,23 @@ export function createYunwuImage(
   settings: Omit<ImageProviderSettings, 'provider'> = {},
 ): ImageProvider {
   return createImageProvider({
+    provider: 'yunwu',
+    baseURL: `${normalizeRoot(settings.baseURL ?? YUNWU_DEFAULT_BASE_URL)}/v1`,
+    apiKey: settings.apiKey,
+    fetch: settings.fetch,
+    headers: settings.headers,
+  });
+}
+
+/**
+ * Yunwu asynchronous video provider (OpenAI-Videos-shaped `/v1/videos`).
+ * Pass the descriptor to `generateVideo` / `submitVideo` from
+ * `@deuz-sdk/core/video`; the relay path can be retargeted with `baseURL`.
+ */
+export function createYunwuVideo(
+  settings: Omit<VideoProviderSettings, 'provider'> = {},
+): (modelId: YunwuVideoModel) => VideoModel {
+  return createVideoProvider({
     provider: 'yunwu',
     baseURL: `${normalizeRoot(settings.baseURL ?? YUNWU_DEFAULT_BASE_URL)}/v1`,
     apiKey: settings.apiKey,
@@ -172,6 +196,8 @@ export interface YunwuClient {
   chat(modelId: YunwuChatModel): LanguageModel;
   /** Image model descriptor (for `generateImage`). */
   image(modelId: YunwuImageModel): ReturnType<ImageProvider>;
+  /** Video model descriptor (for `generateVideo` / `submitVideo`). */
+  video(modelId: YunwuVideoModel): VideoModel;
   /** Embedding model descriptor (for `embed` / `embedMany`). */
   embedding(modelId: string): EmbeddingModel;
   /** Pre-bound Midjourney config (spread into `imagine`/`submitImagine`/…). */
@@ -186,6 +212,7 @@ export function createYunwu(settings: YunwuSettings = {}): YunwuClient {
   const root = normalizeRoot(settings.baseURL ?? YUNWU_DEFAULT_BASE_URL);
   const chat = createYunwuChat({ ...settings, baseURL: root });
   const image = createYunwuImage({ ...settings, baseURL: root });
+  const video = createYunwuVideo({ ...settings, baseURL: root });
   const embedding = createYunwuEmbedding({ ...settings, baseURL: root });
 
   return {
@@ -193,6 +220,7 @@ export function createYunwu(settings: YunwuSettings = {}): YunwuClient {
     models: YUNWU_MODELS,
     chat,
     image,
+    video,
     embedding,
     mj: () => ({
       provider: 'yunwu',

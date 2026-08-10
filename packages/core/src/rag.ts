@@ -12,6 +12,7 @@ import type { Part } from './types/message';
 import type { CitationPart } from './types/stream';
 import type { ModelCapabilities } from './core/registry';
 import { DeuzError } from './errors';
+import { cosineSimilarity } from './internal/vector';
 
 // ===================================================================
 // Typed errors
@@ -616,20 +617,13 @@ export function citationsFromHits(
   });
 }
 
-/** Pure cosine similarity (edge-safe). 0 on mismatch / zero vector. */
-export function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length || a.length === 0) return 0;
-  let dot = 0;
-  let na = 0;
-  let nb = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i]! * b[i]!;
-    na += a[i]! * a[i]!;
-    nb += b[i]! * b[i]!;
-  }
-  if (na === 0 || nb === 0) return 0;
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
-}
+/**
+ * Pure cosine similarity (edge-safe). 0 on mismatch / zero vector. Re-exported
+ * from `internal/vector.ts` (2.0): `memory.ts` shipped a byte-identical copy, so
+ * the two now share ONE implementation — this subpath's public surface is
+ * unchanged.
+ */
+export { cosineSimilarity } from './internal/vector';
 
 /** Pure in-memory cosine vector store — reference impl for tests/examples ONLY. */
 export function createMemoryVectorStore(): VectorStore {

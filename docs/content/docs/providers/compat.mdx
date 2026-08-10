@@ -1,6 +1,6 @@
 ---
 title: OpenAI-compat hosts
-description: Groq, Mistral, DeepSeek, Kimi, Qwen, and other Chat Completions hosts plus createProviderRegistry.
+description: Groq, Mistral, DeepSeek, Perplexity, Cohere, Ollama and the other Chat Completions hosts, plus createProviderRegistry.
 ---
 
 Every factory below speaks the OpenAI **Chat Completions** wire (`surface: 'chat_completions'`). Import from [`@deuz-sdk/core/providers`](/docs/installation#subpath-exports) (or the dedicated [`azure`](/docs/providers/azure) / [`bedrock`](/docs/providers/bedrock) subpaths).
@@ -20,10 +20,24 @@ Every factory below speaks the OpenAI **Chat Completions** wire (`surface: 'chat
 | `createQwen` | `qwen` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | DashScope compatible-mode |
 | `createGLM` | `glm` | `https://open.bigmodel.cn/api/paas/v4` | Zhipu BigModel |
 | `createMiniMax` | `minimax` | `https://api.minimax.io/v1` | M2 family |
+| `createPerplexity` | `perplexity` | `https://api.perplexity.ai` | Sonar — search-grounded. **No `/v1`**, and no client tool calling |
+| `createCohere` | `cohere` | `https://api.cohere.ai/compatibility/v1` | Command via the OpenAI **compatibility** endpoint |
+| `createDeepInfra` | `deepinfra` | `https://api.deepinfra.com/v1/openai` | Open models (`org/Model` slugs) |
+| `createNvidia` | `nvidia` | `https://integrate.api.nvidia.com/v1` | NVIDIA NIM |
+| `createSambaNova` | `sambanova` | `https://api.sambanova.ai/v1` | RDU inference |
+| `createHyperbolic` | `hyperbolic` | `https://api.hyperbolic.xyz/v1` | Open models |
+| `createOllama` | `ollama` | `http://localhost:11434/v1` | **Keyless** — see [Local models](/docs/providers/local) |
+| `createLMStudio` | `lmstudio` | `http://localhost:1234/v1` | **Keyless** — see [Local models](/docs/providers/local) |
 | `createAzure` | `azure` | deployment-scoped | See [Azure OpenAI](/docs/providers/azure) — `api-key` + `api-version` |
 | `createBedrock` | `bedrock` | Mantle `…/openai/v1` | See [Amazon Bedrock](/docs/providers/bedrock) — Bearer API key |
 
-Lowercase singletons (`mistral`, `deepseek`, `kimi`, `qwen`, …) are exported unbound — prefer the `create*` factories with an explicit `apiKey` in apps.
+Lowercase singletons (`mistral`, `deepseek`, `kimi`, `qwen`, `perplexity`, `ollama`, …) are exported unbound — prefer the `create*` factories with an explicit `apiKey` in apps.
+
+Every factory takes the same `CompatSettings`: `apiKey`, `baseURL`, `fetch`, `headers`, and (2.0) `capabilities` — capability overrides applied to every slug that factory mints, for a host whose slugs the [registry](/docs/advanced/model-registry) does not pin.
+
+<Callout title="Perplexity does no client tool calling">
+Sonar's search runs **server-side**; the API has no `tools` array, so the registry rows pin `tools: false` and `structuredOutput: false`, and a tool loop against `sonar*` will not call anything. Perplexity's `citations` array is a top-level response field that the Chat Completions wire has no slot for, so it is not surfaced as a canonical part. Its base URL is also the one exception with no `/v1` segment — the wire path is `https://api.perplexity.ai/chat/completions`.
+</Callout>
 
 ## Examples
 
@@ -58,18 +72,18 @@ const result = streamChat({
 });
 ```
 
-Pinned flagship slugs (tools / context) live in the [model registry](/docs/advanced/model-registry): e.g. `mistral-large-latest`, `deepseek-v3.2`, `qwen3-max`, `kimi-k2`.
+Pinned flagship slugs (tools / context) live in the [model registry](/docs/advanced/model-registry): e.g. `mistral-large-latest`, `deepseek-v3.2`, `qwen3-max`, `kimi-k2`, and 2.0's `sonar` / `sonar-pro` / `sonar-reasoning-pro` and `command-a-03-2025`. Slugs on DeepInfra, NVIDIA NIM, SambaNova and Hyperbolic rename often, so only one or two representative rows are pinned per host — everything else takes the conservative fallback, which `capabilities` (below) corrects.
 
 ## `createOpenAICompatible()`
 
-For any host that speaks the OpenAI wire but has **no named factory** above — Ollama, vLLM, LM Studio, Perplexity, an internal company gateway. Before 1.9 the workaround was to point an unrelated factory somewhere else (`createGroq({ baseURL: 'http://localhost:11434/v1' })`), which then resolved keys, pricing, registry rows and every log line under the wrong provider id.
+For any host that speaks the OpenAI wire but has **no named factory** above — a self-hosted vLLM or llama.cpp, an internal company gateway. Before 1.9 the workaround was to point an unrelated factory somewhere else (`createGroq({ baseURL: 'https://llm.internal/v1' })`), which then resolved keys, pricing, registry rows and every log line under the wrong provider id.
 
-```ts title="ollama.ts"
+```ts title="gateway.ts"
 import { createOpenAICompatible } from '@deuz-sdk/core/providers';
 
-const ollama = createOpenAICompatible({ id: 'ollama', baseURL: 'http://localhost:11434/v1' });
-const model = ollama('qwen3');
-// → { provider: 'ollama', modelId: 'qwen3', surface: 'chat_completions' }
+const gateway = createOpenAICompatible({ id: 'vllm', baseURL: 'http://gpu-box:8000/v1' });
+const model = gateway('gpt-oss-120b');
+// → { provider: 'vllm', modelId: 'gpt-oss-120b', surface: 'chat_completions' }
 ```
 
 ```ts
@@ -80,15 +94,17 @@ interface OpenAICompatibleSettings extends CompatSettings {
   surface?: 'chat_completions' | 'responses';
   /** Auth header style. Default 'bearer'. */
   authHeader?: 'bearer' | 'api-key';
-  /** Capability overrides for this host's slugs. */
-  capabilities?: Partial<ModelCapabilities>;
-  // plus CompatSettings: apiKey, baseURL, fetch, headers
+  /** Keyless host: substitute a placeholder instead of throwing when no key is found (2.0). */
+  apiKeyOptional?: boolean;
+  // plus CompatSettings: apiKey, baseURL, fetch, headers, capabilities
 }
 
 function createOpenAICompatible(settings: OpenAICompatibleSettings): Provider;
 ```
 
 Key and base-URL resolution use the **same precedence chain** as every named factory — `deps.keyProvider` > factory `apiKey` > `createClient({ apiKeys: { [id]: … } })` > `AuthenticationError`. `id` creates no bypass.
+
+`apiKeyOptional` (2.0) changes only the last step: when every link came up empty, a placeholder bearer token is sent instead of throwing. A real key from any link still wins. Use it for an unauthenticated server on your own network — [Local models](/docs/providers/local) covers the whole story, including `createOllama` / `createLMStudio`, which set it for you.
 
 Two eager errors instead of a confusing 401 later:
 
@@ -101,7 +117,7 @@ Core never reads env vars, so there is no `OPENAI_BASE_URL`-style fallback. Pass
 
 ### `capabilities` for a host the registry does not know
 
-An unknown slug does not throw; it falls back to a conservative row whose `maxOutput` is `4096`, `reasoning` is `false` and `structuredOutput` is `false`. Set what you know, per factory or per call:
+An unknown slug does not throw; it falls back to a conservative row whose `maxOutput` is `4096`, `reasoning` is `false` and `structuredOutput` is `false`. Set what you know, per factory (this option is on `CompatSettings`, so every named factory takes it too) or per call:
 
 ```ts
 const gateway = createOpenAICompatible({

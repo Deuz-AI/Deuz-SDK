@@ -1,0 +1,197 @@
+---
+title: Speech (TTS)
+description: generateSpeech — one call, finished audio bytes, over the OpenAI and ElevenLabs text-to-speech wires.
+---
+
+`generateSpeech` is the audio sibling of [generateImage](/docs/modules/image-generation): one request, one answer, **no streaming**. A text-to-speech endpoint returns a finished audio file rather than a token sequence, so there is no canonical delta stream to speak of — you get the bytes, their media type, and the character count you were billed for.
+
+Two wires ship in 2.0 and both sit behind the same adapter seam:
+
+| Provider | Factory | Wire |
+| --- | --- | --- |
+| OpenAI (and OpenAI-compatible relays) | `createOpenAISpeech` | `POST {baseURL}/audio/speech`, `Authorization: Bearer` |
+| ElevenLabs | `createElevenLabs` | `POST {baseURL}/text-to-speech/{voice}?output_format=…`, `xi-api-key` |
+
+Speech models are a **separate kind** from chat `LanguageModel` (`surface: 'openai-speech' | 'elevenlabs-speech'`) — they cannot be passed to [streamChat](/docs/core/stream-chat) or [generateText](/docs/core/generate-text). Like every other module, this one is pure and edge-safe: HTTP goes through `deps.fetch` and the API key is resolved from the factory, `createClient`, or a `deps.keyProvider`, never from the environment.
+
+<Callout type="info" title="Audio input is a file part, not an audio part">
+Audio you want a **chat** model to *hear* travels as `filePart({ mediaType: 'audio/…' })` — the same way PDFs and images do. No `AudioPart` was added to the `Part` union: it stays at five members, so nothing about the canonical message shape changed in 2.0. This page is about the other direction, text → audio.
+</Callout>
+
+## generateSpeech
+
+Import `generateSpeech` from `@deuz-sdk/core/speech`. Build a model descriptor with a factory, then pass it in.
+
+```ts title="speak.ts"
+import { generateSpeech, createOpenAISpeech } from '@deuz-sdk/core/speech';
+import { writeFile } from 'node:fs/promises';
+
+const openaiSpeech = createOpenAISpeech({
+  apiKey: process.env.OPENAI_API_KEY!,
+});
+
+const { audio, mediaType, format, usage } = await generateSpeech({
+  model: openaiSpeech('gpt-4o-mini-tts'),
+  text: 'The fern has been watered. Everything is tidy.',
+  voice: 'nova',
+  format: 'mp3',
+  instructions: 'Speak like a calm librarian.',
+});
+
+console.log(mediaType);          // 'audio/mpeg'
+console.log(usage.characters);   // 45 — TTS is billed per character
+await writeFile(`out.${format}`, audio);
+```
+
+### Options
+
+`generateSpeech(options)` takes a single `GenerateSpeechOptions` object.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `model` | `SpeechModel` | — | From `createOpenAISpeech` / `createElevenLabs`. Required. |
+| `text` | `string` | — | The text to speak. Required. Its length becomes `usage.characters`. |
+| `voice` | `string` | `'alloy'` on OpenAI | Provider voice id/name. **Required on ElevenLabs** — see below. |
+| `format` | `SpeechAudioFormat` | `'mp3'` | `'mp3' \| 'opus' \| 'aac' \| 'flac' \| 'wav' \| 'pcm'`. |
+| `speed` | `number` | unset | Playback rate where supported (OpenAI: `0.25`–`4.0`). |
+| `instructions` | `string` | unset | Delivery/tone steering (OpenAI `gpt-4o-mini-tts`). |
+| `providerOptions` | `Record<string, unknown>` | unset | Raw wire escape hatch — see [providerOptions](#provideroptions). |
+| `signal` | `AbortSignal` | unset | Aborts the underlying fetch. |
+| `headers` | `Record<string, string>` | unset | Per-call headers, merged over factory headers. |
+| `deps` | `Dependencies` | resolved defaults | Inject `fetch`, `keyProvider`, `observer`, … |
+
+### Result shape
+
+```ts
+interface GenerateSpeechResult {
+  audio: Uint8Array;          // the generated audio bytes
+  mediaType: string;          // from the response content-type, else a per-format default
+  format: SpeechAudioFormat;  // echoed back, so you can pick a file extension
+  usage: { characters: number };
+}
+```
+
+`mediaType` comes from the response's `content-type` header — that header is the authority on what the bytes actually are — with any parameters (`; charset=…`) stripped. When a provider omits it, the adapter's per-format default fills in:
+
+| `format` | Default media type |
+| --- | --- |
+| `mp3` | `audio/mpeg` |
+| `opus` | `audio/opus` |
+| `aac` | `audio/aac` |
+| `flac` | `audio/flac` |
+| `wav` | `audio/wav` |
+| `pcm` | `audio/pcm` |
+
+`usage.characters` is the **input** length. No TTS provider reports a count back, and characters — not tokens — are what they meter, so this is the number your invoice tracks.
+
+## Creating speech model descriptors
+
+Both factories return a `SpeechProvider` — a `(modelId: string) => SpeechModel` function. Factory settings are carried on a private symbol, so the public `SpeechModel` shape stays clean and the key never leaks via enumeration.
+
+| Setting | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | — | Resolved against `keyProvider` / `createClient` if omitted. |
+| `baseURL` | `string` | per-wire (below) | Point at any compatible relay. |
+| `fetch` | `typeof fetch` | `deps.fetch` | Factory `fetch` wins over `deps.fetch`. |
+| `headers` | `Record<string, string>` | — | Default headers for every call. |
+| `provider` | `string` | `'openai'` / `'elevenlabs'` | Logical id used for key/baseURL resolution. |
+
+| Factory | Default `baseURL` | Typical models |
+| --- | --- | --- |
+| `createOpenAISpeech` | `https://api.openai.com/v1` | `tts-1`, `tts-1-hd`, `gpt-4o-mini-tts` |
+| `createElevenLabs` | `https://api.elevenlabs.io/v1` | `eleven_multilingual_v2`, `eleven_turbo_v2_5`, `eleven_flash_v2_5` |
+
+## ElevenLabs
+
+ElevenLabs puts the **voice in the URL path** and the **format in the query string**, and authenticates with `xi-api-key` rather than a bearer token. Three consequences:
+
+```ts title="elevenlabs.ts"
+import { generateSpeech, createElevenLabs } from '@deuz-sdk/core/speech';
+
+const elevenLabs = createElevenLabs({
+  apiKey: process.env.ELEVENLABS_API_KEY!,
+});
+
+const { audio } = await generateSpeech({
+  model: elevenLabs('eleven_multilingual_v2'),
+  text: 'Merhaba dünya.',
+  voice: '21m00Tcm4TlvDq8ikWAM', // required — it is part of the URL
+  format: 'mp3',
+});
+// POSTs to /v1/text-to-speech/21m00Tcm4TlvDq8ikWAM?output_format=mp3_44100_128
+```
+
+**1. `voice` is required.** There is nothing to default to when the voice is the route itself, so a call without one throws an `InvalidRequestError` **before** any network request. Voice ids come from the ElevenLabs voice library or `GET /v1/voices`.
+
+**2. Only three of the six canonical formats exist.** ElevenLabs names the container, sample rate, and bitrate in a single `output_format` token, and the canonical format maps onto the sensible default tier for each codec:
+
+| `format` | ElevenLabs `output_format` |
+| --- | --- |
+| `mp3` | `mp3_44100_128` |
+| `opus` | `opus_48000_128` |
+| `pcm` | `pcm_44100` |
+| `aac` / `flac` / `wav` | **not supported** → `UnsupportedCapabilityError` (thrown before the request) |
+
+Any other tier — `mp3_22050_32`, `pcm_24000`, `ulaw_8000` — is reachable by passing the exact codec string as `providerOptions.output_format`, which bypasses the mapping entirely (including the unsupported-format check).
+
+**3. `speed` and `instructions` are OpenAI-shaped controls with no top-level ElevenLabs equivalent.** They are ignored on this wire rather than guessed at; ElevenLabs exposes the equivalent knobs under `voice_settings`, which you reach through `providerOptions`:
+
+```ts title="voice-settings.ts"
+const { audio } = await generateSpeech({
+  model: elevenLabs('eleven_turbo_v2_5'),
+  text: 'Steady on.',
+  voice: '21m00Tcm4TlvDq8ikWAM',
+  providerOptions: {
+    voice_settings: { stability: 0.4, similarity_boost: 0.8, speed: 1.1 },
+    output_format: 'mp3_22050_32',
+  },
+});
+```
+
+## providerOptions
+
+`providerOptions` is a flat, shallow escape hatch for wire fields the SDK does not model. On the OpenAI wire it is merged **first** and every canonical field overwrites it — the hatch may *add* fields, but it may not silently redefine what you set through the typed options:
+
+```ts
+await generateSpeech({
+  model: openaiSpeech('tts-1-hd'),
+  text: 'hi',
+  format: 'opus',
+  providerOptions: { stream_format: 'audio', response_format: 'flac' },
+});
+// body → { stream_format: 'audio', model: 'tts-1-hd', input: 'hi',
+//          voice: 'alloy', response_format: 'opus' }   ← `format` won
+```
+
+On the ElevenLabs wire the remaining keys are spread into the request body, with `output_format` lifted into the query string instead (it is a query parameter there, so it is never echoed into the body).
+
+## Key resolution
+
+Identical to every other module — the G1 precedence chain: `deps.keyProvider` (highest) → factory `apiKey` → `createClient`'s `apiKeys[provider]` (lowest). When none of them produce a key, the call throws an `AuthenticationError` **before** any network request is made.
+
+```ts title="createClient.ts"
+import { createClient } from '@deuz-sdk/core';
+
+const client = createClient({
+  apiKeys: { openai: process.env.OPENAI_API_KEY!, elevenlabs: process.env.ELEVENLABS_API_KEY! },
+});
+```
+
+`baseUrls[provider]` works the same way for the base URL, sitting between the factory setting and the per-wire default.
+
+## Observability
+
+A speech call emits the auxiliary `operation.started` / `operation.completed` / `operation.failed` events under the `'speech'` subsystem with `operation: 'speech.generate'` — the same shape `image` and `embedding` use. `itemCount` is the input character count and `resultCount` the returned byte count. Without an observer the fast path applies: no events are built at all. See [Observability](/docs/modules/observability).
+
+## Errors
+
+The canonical status→class table, shared with every other media module: `401`/`403` → `AuthenticationError`, `404` → `ModelNotFoundError`, `429` → `RateLimitError` (with `Retry-After` parsed into `retryAfterMs`), `529` → `OverloadedError`, other `4xx` → `InvalidRequestError`, `5xx` → a retryable `APICallError`. ElevenLabs wraps its messages in a `detail` envelope (`{ detail: { status, message } }` or a bare `{ detail: 'message' }`) instead of OpenAI's `error` envelope; both are unwrapped before mapping, so the resulting error message reads the same either way.
+
+Two failures happen **before** the request is ever sent, so they cost nothing: a missing ElevenLabs `voice` (`InvalidRequestError`) and a format ElevenLabs cannot produce (`UnsupportedCapabilityError`).
+
+## Related
+
+- [Image generation](/docs/modules/image-generation) — the synchronous `generateImage` sibling.
+- [Dependencies](/docs/core/dependencies) — the `fetch` / `clock` / `keyProvider` injection seam.
+- [Errors](/docs/core/errors) — the canonical error hierarchy.
+- [Observability](/docs/modules/observability) — the `operation.*` event protocol.

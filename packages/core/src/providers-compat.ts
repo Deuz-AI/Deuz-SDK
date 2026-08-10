@@ -15,44 +15,49 @@ import { InvalidRequestError } from './errors';
  * private closure, so an unlisted OpenAI-shaped host (Ollama, vLLM, LM Studio,
  * an internal gateway) can carry its OWN provider id instead of borrowing an
  * unrelated factory's — see the doc comment on that function.
+ *
+ * 2.0 adds eight more named hosts — six cloud (Perplexity, Cohere, DeepInfra,
+ * NVIDIA NIM, SambaNova, Hyperbolic) and two KEYLESS local ones (Ollama, LM
+ * Studio), which pin `apiKeyOptional` so an unauthenticated localhost server
+ * needs no ceremonial fake key. See `providers/local.mdx`.
  */
 export interface CompatSettings {
   apiKey?: string;
   baseURL?: string;
   fetch?: typeof fetch;
   headers?: Record<string, string>;
+  /**
+   * Capability overrides for every slug this factory mints (public in 2.0).
+   * The registry pins flagship cloud slugs, but a LOCAL host serves whatever
+   * you pulled — `ollama('my-finetune:latest')` can never be a known row, so
+   * it falls back to the conservative default (`tools: false`, `maxOutput:
+   * 4096`). Say what you know here once instead of on every call:
+   * `createOllama({ capabilities: { tools: true, maxOutput: 32_000 } })`.
+   * A per-call `CommonCallOptions.capabilities` still wins over it.
+   */
+  capabilities?: Partial<ModelCapabilities>;
 }
 
 /**
  * Settings the shared closure understands. The named factories only ever pass
  * the `CompatSettings` subset; `createOpenAICompatible` also passes the wire
- * dialect / auth style / capability overrides. Keeping ONE implementation is
- * the point — the named factories must stay byte-identical, which is why every
- * 1.9 field below is spread CONDITIONALLY into the config blob.
+ * dialect / auth style, and the two local factories pin `apiKeyOptional`.
+ * Keeping ONE implementation is the point — the named factories must stay
+ * byte-identical, which is why every post-1.8 field below is spread
+ * CONDITIONALLY into the config blob.
  */
 interface CompatInternalSettings extends CompatSettings {
   surface?: Extract<ModelSurface, 'chat_completions' | 'responses'>;
   authHeader?: 'bearer' | 'api-key';
-  capabilities?: Partial<ModelCapabilities>;
-}
-
-/**
- * The blob stashed under the non-enumerable config Symbol. `ProviderConfig`
- * (internal/config-symbol.ts) has no `capabilities` field yet and that file is
- * owned elsewhere this release, so we widen LOCALLY: the stored object is
- * structurally wider than the declared type, which is safe because every reader
- * narrows by key. Nothing reads it yet — the merge site is `getCapabilities`
- * (`core/registry.ts`), see the follow-up note in the 1.9 changeset.
- */
-interface CompatProviderConfig extends ProviderConfig {
-  capabilities?: Partial<ModelCapabilities>;
+  /** Keyless local host — see `ProviderConfig.apiKeyOptional`. */
+  apiKeyOptional?: boolean;
 }
 
 /** Bind a provider id to the shared factory shape (same pattern as createXai). */
 function createCompat(provider: string, settings: CompatInternalSettings): Provider {
   const surface: ModelSurface = settings.surface ?? 'chat_completions';
   return (modelId: string): LanguageModel => {
-    const config: CompatProviderConfig = {
+    const config: ProviderConfig = {
       provider,
       apiKey: settings.apiKey,
       baseURL: settings.baseURL,
@@ -62,6 +67,7 @@ function createCompat(provider: string, settings: CompatInternalSettings): Provi
       // before 1.9 (resolveCall also only forwards `authHeader` when truthy).
       ...(settings.authHeader ? { authHeader: settings.authHeader } : {}),
       ...(settings.capabilities ? { capabilities: settings.capabilities } : {}),
+      ...(settings.apiKeyOptional ? { apiKeyOptional: true } : {}),
     };
     return attachConfig({ provider, modelId, surface }, config);
   };
@@ -82,8 +88,15 @@ export interface OpenAICompatibleSettings extends CompatSettings {
   surface?: Extract<ModelSurface, 'chat_completions' | 'responses'>;
   /** Auth header style. Default `'bearer'`. */
   authHeader?: 'bearer' | 'api-key';
-  /** Capability overrides for this host's slugs (see `CommonCallOptions.capabilities`). */
-  capabilities?: Partial<ModelCapabilities>;
+  /**
+   * Opt into the KEYLESS escape (2.0) for a host that authenticates nothing —
+   * a self-hosted vLLM / llama.cpp / TGI, or Ollama behind a custom id. When
+   * the whole G1 chain comes up empty the resolver substitutes a placeholder
+   * bearer token instead of throwing `AuthenticationError`; a real key from
+   * any link still wins. Leave it off for anything reachable from the public
+   * internet — the throw is what tells you a key went missing.
+   */
+  apiKeyOptional?: boolean;
 }
 
 /**
@@ -101,7 +114,8 @@ export interface OpenAICompatibleSettings extends CompatSettings {
  * G1 is untouched: `id` is stored as the descriptor's `provider`, so the key
  * still resolves through `internal/resolve-call.ts` in the documented order
  * (`deps.keyProvider` > factory `apiKey` > `ClientConfig.apiKeys[id]` > throw
- * `AuthenticationError`) — `id` creates no bypass. Core NEVER reads env vars,
+ * `AuthenticationError`, or a placeholder when `apiKeyOptional` is set for a
+ * keyless local host) — `id` creates no bypass. Core NEVER reads env vars,
  * so there is no `OPENAI_BASE_URL`-style fallback: pass `baseURL` here or via
  * `createClient({ baseUrls: { [id]: … } })`, otherwise the call fails with an
  * `InvalidRequestError` (no default exists for a custom id).
@@ -132,6 +146,7 @@ export function createOpenAICompatible(settings: OpenAICompatibleSettings): Prov
     ...(settings.surface ? { surface: settings.surface } : {}),
     ...(settings.authHeader ? { authHeader: settings.authHeader } : {}),
     ...(settings.capabilities ? { capabilities: settings.capabilities } : {}),
+    ...(settings.apiKeyOptional ? { apiKeyOptional: true } : {}),
   });
 }
 
@@ -209,3 +224,86 @@ export function createMiniMax(settings: CompatSettings = {}): Provider {
   return createCompat('minimax', settings);
 }
 export const minimax: Provider = createMiniMax();
+
+/**
+ * Perplexity Sonar (search-grounded answers) — OpenAI Chat Completions-compatible wire.
+ *
+ * Two things differ from every other host here. Its root has NO `/v1` segment
+ * (`https://api.perplexity.ai/chat/completions`), and the Sonar models do not
+ * do client tool calling — the search is Perplexity's own, server-side, so the
+ * registry rows pin `tools: false` and `structuredOutput: false`. The answer
+ * text arrives on the canonical stream like any other; Perplexity's `citations`
+ * array is a top-level response field the Chat Completions wire has no slot
+ * for, so it is not surfaced as a canonical part.
+ */
+export function createPerplexity(settings: CompatSettings = {}): Provider {
+  return createCompat('perplexity', settings);
+}
+export const perplexity: Provider = createPerplexity();
+
+/** Cohere Command via its OpenAI **compatibility** endpoint (`/compatibility/v1`). */
+export function createCohere(settings: CompatSettings = {}): Provider {
+  return createCompat('cohere', settings);
+}
+export const cohere: Provider = createCohere();
+
+/** DeepInfra open-model host (`org/Model` slugs) — OpenAI Chat Completions-compatible wire. */
+export function createDeepInfra(settings: CompatSettings = {}): Provider {
+  return createCompat('deepinfra', settings);
+}
+export const deepinfra: Provider = createDeepInfra();
+
+/** NVIDIA NIM / `integrate.api.nvidia.com` — OpenAI Chat Completions-compatible wire. */
+export function createNvidia(settings: CompatSettings = {}): Provider {
+  return createCompat('nvidia', settings);
+}
+export const nvidia: Provider = createNvidia();
+
+/** SambaNova Cloud (RDU inference) — OpenAI Chat Completions-compatible wire. */
+export function createSambaNova(settings: CompatSettings = {}): Provider {
+  return createCompat('sambanova', settings);
+}
+export const sambanova: Provider = createSambaNova();
+
+/** Hyperbolic open-model host — OpenAI Chat Completions-compatible wire. */
+export function createHyperbolic(settings: CompatSettings = {}): Provider {
+  return createCompat('hyperbolic', settings);
+}
+export const hyperbolic: Provider = createHyperbolic();
+
+// --- Keyless local hosts (2.0) -------------------------------------------------
+// Both pin `apiKeyOptional`, so a plain `ollama('qwen3')` against a default
+// localhost install just works: when the G1 chain finds no key, resolve-call
+// substitutes a placeholder bearer token rather than throwing. `settings` is
+// spread FIRST so a user-supplied `apiKey` (a reverse proxy in front of the
+// server, say) still travels the normal chain and wins — the flag only ever
+// decides what happens when the chain came up EMPTY.
+
+/**
+ * Ollama's OpenAI-compatible endpoint (`http://localhost:11434/v1`) — no API
+ * key required.
+ *
+ * Slugs are whatever you have pulled, so they are deliberately absent from the
+ * registry and fall back to the conservative row (`tools: false`,
+ * `maxOutput: 4096`, one `unknown-model` warning). Teach it the truth once via
+ * `capabilities` — see `providers/local.mdx`:
+ *
+ * ```ts
+ * const ollama = createOllama({ capabilities: { tools: true, maxOutput: 32_000 } });
+ * const model = ollama('qwen3');
+ * ```
+ */
+export function createOllama(settings: CompatSettings = {}): Provider {
+  return createCompat('ollama', { ...settings, apiKeyOptional: true });
+}
+export const ollama: Provider = createOllama();
+
+/**
+ * LM Studio's local server (`http://localhost:1234/v1`) — no API key required.
+ * Same unknown-slug story as {@link createOllama}: pass `capabilities` for the
+ * model you actually loaded.
+ */
+export function createLMStudio(settings: CompatSettings = {}): Provider {
+  return createCompat('lmstudio', { ...settings, apiKeyOptional: true });
+}
+export const lmstudio: Provider = createLMStudio();

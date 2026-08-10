@@ -30,6 +30,16 @@ export interface ToolExecuteContext {
   session?: { store: SessionStore; runId: string };
   /** The resume call's approval verdicts, forwarded so a suspended sub-agent can settle its own pending calls. */
   approvalResponses?: ToolApprovalResponse[];
+  // --- 2.0 additive: request-scoped context seam. ---
+  /**
+   * The call's `runtimeContext`, forwarded UNTOUCHED — the tenant, the signed-in
+   * user, a DB handle, a trace id. It is what lets one `ToolSet` be defined once
+   * at module scope and still serve per-request state, instead of being rebuilt
+   * inside a closure on every request. Opaque by design: the SDK never reads,
+   * copies or serializes it, so it never reaches a checkpoint, a chat record or
+   * an observation event. Sub-agents inherit it.
+   */
+  runtimeContext?: unknown;
 }
 
 /**

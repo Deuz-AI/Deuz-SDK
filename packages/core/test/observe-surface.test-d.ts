@@ -146,7 +146,9 @@ expectTypeOf<CheckpointSavedEvent['checkpointStatus']>().toEqualTypeOf<
 // Compaction layers stay assignable to the public CompactionLayer union
 // (observe.ts inlines the literals to avoid a type-import cycle).
 expectTypeOf<CompactionObserveEvent['layer']>().toEqualTypeOf<CompactionLayer>();
-expectTypeOf<CompactionObserveEvent['trigger']>().toEqualTypeOf<'threshold'>();
+expectTypeOf<CompactionObserveEvent['trigger']>().toEqualTypeOf<
+  'threshold' | 'manual' | 'overflow'
+>();
 
 // Sub-agents: parent correlation, durable child key optional.
 expectTypeOf<SubAgentStartedEvent>().toHaveProperty('parentToolCallId');
@@ -182,5 +184,14 @@ expectTypeOf<ObservationCaptureOptions['toolInputs']>().toEqualTypeOf<boolean | 
 expectTypeOf<ObservationLimits>().toHaveProperty('maxEventBytes');
 expectTypeOf<ObservationRedactor>().toBeFunction();
 expectTypeOf<ObservedSubsystem>().toEqualTypeOf<
-  'embedding' | 'image' | 'midjourney' | 'rag' | 'memory' | 'mcp' | 'skills'
+  | 'embedding'
+  | 'image'
+  | 'midjourney'
+  | 'rag'
+  | 'memory'
+  | 'mcp'
+  | 'skills'
+  | 'speech'
+  | 'transcription'
+  | 'video'
 >();

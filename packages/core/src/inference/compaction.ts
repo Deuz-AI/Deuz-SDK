@@ -10,8 +10,10 @@
  *
  * 1. `prune-tool-results` — old tool outputs become `[pruned N chars]` stubs.
  * 2. `prune-reasoning`    — old assistant reasoning parts are dropped.
- * 3. `summarize`          — the oldest unprotected run collapses into one
- *                           assistant summary message (injected summarizer).
+ * 3. `summarize`          — the oldest unprotected run collapses into ONE
+ *                           rolling summary message (injected summarizer): the
+ *                           previous summary is handed back so pass N folds
+ *                           into it instead of restarting from scratch.
  *
  * PROTECTED (never modified or removed): every system message, the first user
  * message, the last assistant message and everything after it, and the tail
@@ -34,6 +36,13 @@ export interface CompactionPolicy {
   layers?: CompactionLayer[];
   /** Model the LOOP uses to wire the `summarize` function. Carried through normalize. */
   summarizeModel?: LanguageModel;
+  /**
+   * REAL tokenizer hook (2.0). Mirrors `CompactionPolicy.countTokens` in
+   * `types/config.ts` — this interface is the loop-internal twin of the public
+   * one and the two must stay field-for-field identical. Carried through
+   * normalize so the caller of `applyCompaction` can build its estimator from it.
+   */
+  countTokens?: (messages: Message[]) => number;
 }
 
 /** `'auto'` = all defaults. */
@@ -53,7 +62,7 @@ export interface CompactionEvent {
 
 export type NormalizedCompaction = Required<
   Pick<CompactionPolicy, 'threshold' | 'keepRecentSteps' | 'layers'>
-> & { summarizeModel?: LanguageModel };
+> & { summarizeModel?: LanguageModel; countTokens?: (messages: Message[]) => number };
 
 const DEFAULT_LAYERS: CompactionLayer[] = ['prune-tool-results', 'prune-reasoning', 'summarize'];
 
@@ -68,7 +77,33 @@ export function normalizeCompaction(option: CompactionOption): NormalizedCompact
     keepRecentSteps: Number.isFinite(rawKeep) ? Math.max(1, Math.floor(rawKeep as number)) : 4,
     layers: policy.layers ?? DEFAULT_LAYERS,
     ...(policy.summarizeModel ? { summarizeModel: policy.summarizeModel } : {}),
+    ...(policy.countTokens ? { countTokens: policy.countTokens } : {}),
   };
+}
+
+/**
+ * Prefix every summary message carries. It is the ONLY marker a later pass has
+ * to recognize its own output by — the history it reads back may have crossed a
+ * store, a wire, or a React state round-trip, so nothing but the text survives.
+ */
+export const SUMMARY_SENTINEL = '[Earlier conversation summarized]';
+
+/**
+ * True for a message the summarize layer produced. Deliberately narrow (user
+ * role, exactly one text part, sentinel prefix) so an ordinary user message
+ * that merely quotes the sentinel is not folded away.
+ */
+export function isSummaryMessage(m: Message): boolean {
+  if (m.role !== 'user' || !Array.isArray(m.content) || m.content.length !== 1) return false;
+  const part = m.content[0]!;
+  return part.type === 'text' && part.text.startsWith(SUMMARY_SENTINEL);
+}
+
+/** The summary body of a summary message, sentinel (and its newline) stripped. */
+function summaryBody(m: Message): string {
+  const part = Array.isArray(m.content) ? m.content[0] : undefined;
+  const text = part?.type === 'text' ? part.text : '';
+  return text.slice(SUMMARY_SENTINEL.length).replace(/^\n/, '');
 }
 
 /** Stringify arbitrary tool payloads without ever throwing (circular refs, BigInt). */
@@ -85,28 +120,48 @@ export interface ApplyCompactionCtx {
   /** Token estimate for a message array (injected; never a network call here). */
   estimate(messages: Message[]): number;
   contextWindow: number;
-  /** Injected by the loop; resolves to the summary text. May throw — compaction survives. */
-  summarize?: (messagesToSummarize: Message[]) => Promise<string>;
+  /**
+   * Injected by the loop; resolves to the summary text. May throw — compaction
+   * survives. `previousSummary` is the rolling summary already in the history
+   * (sentinel stripped) on every pass after the first, so the summarizer folds
+   * the new slice INTO it instead of summarizing a summary.
+   */
+  summarize?: (messagesToSummarize: Message[], previousSummary?: string) => Promise<string>;
   /** Wired to `logger.warn` by the loop; fired when a layer is skipped. */
   onSkip?: (layer: CompactionLayer, reason: string) => void;
   /** Injected clock (observation timing) — pure module, never Date.now here. */
   now?: () => number;
+  /**
+   * `'threshold'` (default) only compacts once estimated fill crosses the
+   * policy threshold. `'force'` skips that gate entirely — it is what an
+   * overflow recovery (a provider that already rejected the request) and the
+   * manual `compactMessages()` API run in, where the fill question is settled.
+   */
+  mode?: 'threshold' | 'force';
 }
 
 /**
  * Run the policy's layers until fill drops to `threshold * 0.8` or layers run
  * out. Below the trigger threshold the input array is returned unchanged
  * (same reference, no events). Never throws.
+ *
+ * In `mode: 'force'` the trigger gate is skipped and the target tightens to
+ * `threshold * 0.5`: a forced run means the window ALREADY overflowed, and
+ * stopping just under the trigger buys one more round-trip before the next
+ * rejection. With no finite `contextWindow` there is no ratio to test at all,
+ * so every layer runs exactly once — no early stop.
  */
 export async function applyCompaction(
   messages: Message[],
   policy: NormalizedCompaction,
   ctx: ApplyCompactionCtx,
 ): Promise<{ messages: Message[]; events: CompactionEvent[] }> {
-  if (ctx.estimate(messages) / ctx.contextWindow <= policy.threshold) {
+  const force = ctx.mode === 'force';
+  const windowed = !force || (Number.isFinite(ctx.contextWindow) && ctx.contextWindow > 0);
+  if (!force && ctx.estimate(messages) / ctx.contextWindow <= policy.threshold) {
     return { messages, events: [] };
   }
-  const target = policy.threshold * 0.8;
+  const target = policy.threshold * (force ? 0.5 : 0.8);
   const events: CompactionEvent[] = [];
   let current = messages;
   for (const layer of policy.layers) {
@@ -125,7 +180,7 @@ export async function applyCompaction(
         messagesAfter: current.length,
       });
     }
-    if (ctx.estimate(current) / ctx.contextWindow <= target) break;
+    if (windowed && ctx.estimate(current) / ctx.contextWindow <= target) break;
   }
   return { messages: current, events };
 }
@@ -224,6 +279,15 @@ function pruneReasoning(messages: Message[], prot: Set<number>): Message[] {
  * one turn on the wire, breaking Anthropic's "thinking block must lead the
  * turn" rule when extended thinking + tool results follow (→ 400). A throwing
  * summarizer only skips the layer (`onSkip`) — the loop never dies from it.
+ *
+ * ROLLING: on a later pass the run already starts with the previous summary.
+ * It is pulled out, handed to the summarizer as `previousSummary`, and only the
+ * genuinely new messages are summarized — then BOTH are replaced by the single
+ * folded result. INVARIANT: however many passes run, at most one summary
+ * message ever sits at the head of the unprotected region. Collecting *every*
+ * summary in the run (not just a leading one) is defensive: a shifted protected
+ * boundary or a hand-edited history can strand more than one, and losing them
+ * would silently drop the oldest context.
  */
 async function summarizeRun(
   messages: Message[],
@@ -239,11 +303,18 @@ async function summarizeRun(
   // whose tool_result was split off by an injected protected message) saves
   // little and risks orphaning a tool_use/tool_result pair.
   if (end - start < 2) return messages;
+  const run = messages.slice(start, end);
+  const newSlice = run.filter((m) => !isSummaryMessage(m));
+  // Nothing but summaries in the run: re-summarizing a summary spends a model
+  // call to lose detail. Leave the history exactly as it is.
+  if (newSlice.length === 0) return messages;
+  const prior = run.filter(isSummaryMessage);
+  const previousSummary = prior.length > 0 ? prior.map(summaryBody).join('\n') : undefined;
   try {
-    const summary = await ctx.summarize(messages.slice(start, end));
+    const summary = await ctx.summarize(newSlice, previousSummary);
     const summaryMessage: Message = {
       role: 'user',
-      content: [{ type: 'text', text: `[Earlier conversation summarized]\n${summary}` }],
+      content: [{ type: 'text', text: `${SUMMARY_SENTINEL}\n${summary}` }],
     };
     return [...messages.slice(0, start), summaryMessage, ...messages.slice(end)];
   } catch (err) {

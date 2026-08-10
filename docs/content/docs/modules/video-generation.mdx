@@ -1,0 +1,265 @@
+---
+title: Video Generation
+description: Async video jobs — submitVideo, waitForVideo, downloadVideo, and the generateVideo convenience over Sora, Veo, Kling, and Hailuo.
+---
+
+Video generation is **asynchronous by nature**: a clip takes tens of seconds to minutes, so there is no synchronous counterpart to [`generateImage`](/docs/modules/image-generation). The shape is **submit → poll → download**, the same state machine the Midjourney proxy runs — you create a job, poll it through the injected `clock` until it reaches a terminal status, and then either use the result URL or pull the bytes.
+
+The wire is the **OpenAI Videos** shape, which the relays that actually serve Sora / Veo / Kling / Hailuo mirror:
+
+```
+POST {baseURL}/videos              → create a job   → { id, status }
+GET  {baseURL}/videos/{id}         → poll the job   → { id, status, progress, url, … }
+GET  {baseURL}/videos/{id}/content → download bytes → video/mp4
+```
+
+Everything is pure and edge-safe: HTTP goes through `deps.fetch`, the poll delay through `deps.clock.setTimeout` (no ambient timers), and the API key is resolved from the factory, `createClient`, or a `deps.keyProvider` — never from the environment.
+
+Video models are a **separate kind** from chat `LanguageModel` (`surface: 'video'`), like `ImageModel`. They cannot be passed to [streamChat](/docs/core/stream-chat) or [generateText](/docs/core/generate-text).
+
+## generateVideo
+
+`generateVideo` is the one-call entry point: it submits the job, polls it to a terminal status, and — with `download: true` — fetches the finished clip's bytes.
+
+```ts title="generate-video.ts"
+import { generateVideo } from '@deuz-sdk/core/video';
+import { createYunwu } from '@deuz-sdk/core/yunwu';
+
+const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
+
+const { task } = await generateVideo({
+  model: yunwu.video('sora-2'),
+  prompt: 'a tidy robot watering a fern on a windowsill, slow dolly in',
+  size: '1280x720',
+  seconds: 8,
+  pollIntervalMs: 5000,  // default 5000
+  timeoutMs: 600_000,    // default 600_000 (10 min)
+  onProgress: (t) => console.log(t.status, t.progress), // e.g. "in_progress 50"
+});
+
+console.log(task.status); // 'completed'
+console.log(task.url);    // the finished clip's URL
+```
+
+Ask for the bytes when you want to persist the clip yourself instead of handing a relay URL to the browser:
+
+```ts title="download.ts"
+const { task, video, mediaType } = await generateVideo({
+  model: yunwu.video('veo3.1'),
+  prompt: 'a neon city skyline at dusk, aerial',
+  download: true,
+});
+
+if (task.status === 'completed') {
+  console.log(mediaType);        // 'video/mp4'
+  console.log(video!.byteLength); // Uint8Array
+}
+```
+
+`video`/`mediaType` are present **only** when `download: true` **and** the job completed — a failed job never triggers a download.
+
+### A failed job is returned, not thrown
+
+A job the model refuses or botches resolves with `status: 'failed'` and a `failReason`. It is **not** an exception: the failure is the model's, not the transport's, and `failReason` is the useful part. (This is the same contract `waitForTask` has for Midjourney.) Only transport failures, a timeout, or an abort reject.
+
+```ts
+const { task } = await generateVideo({ model, prompt: '…' });
+
+if (task.status === 'failed') {
+  console.error('rejected:', task.failReason); // e.g. 'content policy'
+}
+```
+
+### Options
+
+`generateVideo(options)` takes one object: the `submitVideo` fields, the poll fields, and `download`.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `model` | `VideoModel` | — | From `createVideoProvider` / `createYunwuVideo` / `yunwu.video()`. Required. |
+| `prompt` | `string` | — | The text prompt. Required. |
+| `size` | `string` | unset | e.g. `'1280x720'`, `'720x1280'`. Provider-dependent. |
+| `seconds` | `number \| string` | unset | Clip length; coerced to a **string** on the wire (the OpenAI shape). |
+| `inputReference` | `VideoInputReference` | unset | A reference image/clip — switches the request to `multipart/form-data`. |
+| `providerOptions` | `Record<string, unknown>` | unset | Extra wire fields (`seed`, `aspect_ratio`, …). Canonical fields always win. |
+| `download` | `boolean` | `false` | Also fetch the clip's bytes. |
+| `pollIntervalMs` | `number` | `5000` | Poll cadence, via `deps.clock.setTimeout`. |
+| `timeoutMs` | `number` | `600_000` | Overall deadline; exceeding it throws a `TimeoutError`. |
+| `onProgress` | `(task: VideoTask) => void` | unset | Called on every poll with the latest snapshot. |
+| `signal` | `AbortSignal` | unset | Aborting rejects the poll with an `AbortError`. |
+| `headers` | `Record<string, string>` | unset | Per-call headers, merged over factory headers. |
+| `deps` | `Dependencies` | resolved defaults | Inject `fetch`, `clock`, `keyProvider`, … |
+
+## The pieces
+
+Use the individual functions when you want to own the job's lifetime — submit in a request handler, store the id, and poll from a worker instead of holding a connection open for ten minutes.
+
+| Function | Purpose | Returns |
+| --- | --- | --- |
+| `submitVideo(options)` | Create a job. | `Promise<VideoTask>` |
+| `fetchVideoTask(taskId, cfg)` | Read one job (`null` if unknown). | `Promise<VideoTask \| null>` |
+| `waitForVideo(taskId, options)` | Poll until terminal or timeout. | `Promise<VideoTask>` |
+| `downloadVideo(taskId, cfg)` | Fetch the finished clip's bytes. | `Promise<{ video: Uint8Array; mediaType: string }>` |
+| `generateVideo(options)` | submit + wait + optional download. | `Promise<GenerateVideoResult>` |
+
+```ts title="submit-then-poll.ts"
+import { submitVideo, fetchVideoTask, downloadVideo } from '@deuz-sdk/core/video';
+import { createYunwu } from '@deuz-sdk/core/yunwu';
+
+const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
+const model = yunwu.video('kling-2.6');
+
+// 1. In the request handler — return immediately.
+const job = await submitVideo({ model, prompt: 'a paper boat in a storm drain' });
+await db.save(job.id);
+
+// 2. Later, from a worker — the model descriptor addresses the same relay.
+const task = await fetchVideoTask(job.id, { model });
+if (task?.status === 'completed') {
+  const { video, mediaType } = await downloadVideo(task.id, { model });
+  await storage.put(`${task.id}.mp4`, video, mediaType);
+}
+```
+
+`fetchVideoTask` returns `null` — not an error — when the relay says the job does not exist (a `404`, or an envelope with neither an id nor a status). Every other failing status maps to a typed error.
+
+`waitForVideo` stops at `completed` or `failed`, otherwise polls at `pollIntervalMs` until `timeoutMs` elapses (throwing a `TimeoutError`). An aborted `signal` rejects with an `AbortError`.
+
+### VideoTask
+
+```ts
+type VideoTaskStatus = 'queued' | 'in_progress' | 'completed' | 'failed' | (string & {});
+
+interface VideoTask {
+  id: string;
+  status: VideoTaskStatus;
+  progress?: number;   // 0-100
+  model?: string;
+  seconds?: string;    // clip length as the relay reports it
+  size?: string;       // e.g. '1280x720'
+  url?: string;        // result URL on a completed job
+  failReason?: string; // why a failed job failed
+  raw: unknown;        // the untouched relay JSON
+}
+```
+
+### Normalization — the tolerant half
+
+Relays disagree about spelling, so the task response is normalized before it reaches you. `raw` always holds the untouched JSON if you need a field this table drops.
+
+| Relay says | You get |
+| --- | --- |
+| `succeeded`, `success`, `complete`, `done` | `completed` |
+| `processing`, `running`, `in-progress`, `generating` | `in_progress` |
+| `pending`, `queuing`, `waiting` | `queued` |
+| `failure`, `error`, `cancelled`, `canceled` | `failed` |
+| anything else | passed through verbatim |
+
+`cancelled` maps to `failed` deliberately — it is terminal, and leaving it unmapped would make `waitForVideo` poll a dead job until `timeoutMs`. An unrecognized status is **not** rewritten (that is what the open `(string & {})` arm of `VideoTaskStatus` is for), but it is also not terminal, so a relay with a status this table misses will poll to its timeout.
+
+Three more fields are normalized the same way:
+
+- **`progress`** — a number stays a number; a `'42%'` (or `'42'`) string becomes `42`; anything unparseable is dropped.
+- **`url`** — read from `url`, then `video_url`, then `output.url`, then `data[0].url`.
+- **`failReason`** — read from `error.message` (or a bare `error` string), then `fail_reason`.
+
+## Image-to-video
+
+Pass `inputReference` to seed the clip with a still or an earlier clip. The request switches from JSON to `multipart/form-data` and the reference is sent as the `input_reference` part. A bare `Blob`/`File` is sent as-is; raw bytes need a `mediaType` so the relay can tell a PNG from an MP4.
+
+```ts title="image-to-video.ts"
+import { generateVideo } from '@deuz-sdk/core/video';
+
+const { task } = await generateVideo({
+  model: yunwu.video('sora-2'),
+  prompt: 'the photo comes alive, leaves rustling in the wind',
+  seconds: 4,
+  inputReference: {
+    data: pngBytes,           // Uint8Array | ArrayBuffer | Blob
+    mediaType: 'image/png',
+    filename: 'still.png',    // optional; derived from mediaType otherwise
+  },
+});
+```
+
+The SDK never sets a `content-type` header on the multipart request — `fetch` writes the boundary itself, and overriding it produces a body the relay cannot parse.
+
+## providerOptions
+
+Video relays expose vendor-specific knobs (`seed`, `aspect_ratio`, `resolution`, `camera_fixed`, …) that no cross-provider option could name honestly. `providerOptions` is merged into the request body verbatim, and the canonical fields (`model`, `prompt`, `size`, `seconds`) **always win** — so a stray key can never silently retarget the model or the prompt.
+
+```ts
+await generateVideo({
+  model: yunwu.video('seedance-1-5-pro-250928'),
+  prompt: 'a lighthouse in fog',
+  providerOptions: { seed: 42, aspect_ratio: '21:9', camera_fixed: true },
+});
+```
+
+## Creating video model descriptors
+
+`createVideoProvider(settings)` returns a `VideoProvider` — a `(modelId: string) => VideoModel` function. The factory settings ride on a private symbol, so the public `VideoModel` shape stays `{ provider, modelId, surface }` and the key never leaks via `Object.keys`/`JSON.stringify`.
+
+| Setting | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | — | Resolved against `keyProvider` / `createClient` if omitted. |
+| `baseURL` | `string` | `https://yunwu.ai/v1` | Relay root **including** the API version segment. |
+| `fetch` | `typeof fetch` | `deps.fetch` | Factory `fetch` wins over `deps.fetch`. |
+| `headers` | `Record<string, string>` | — | Default headers for every call. |
+| `provider` | `string` | `'yunwu'` | Logical id used for key/baseURL resolution. |
+
+The relay path is a **setting, not a constant**. `/videos` under a versioned root is the OpenAI Videos convention and what the aggregators mirror today, but a given host may mount its video jobs elsewhere or version them differently — point `baseURL` at whatever root makes `{baseURL}/videos` correct for your provider:
+
+```ts title="custom-relay.ts"
+import { createVideoProvider } from '@deuz-sdk/core/video';
+
+const relay = createVideoProvider({
+  provider: 'my-relay',
+  apiKey: process.env.RELAY_KEY!,
+  baseURL: 'https://relay.example.com/api/v2', // → POST https://relay.example.com/api/v2/videos
+});
+
+const model = relay('some-video-model');
+```
+
+For Yunwu, prefer `createYunwuVideo` or the unified client's `.video(modelId)` — both pin `provider: 'yunwu'` and derive `/v1/videos` from the relay root. See the [Yunwu provider](/docs/providers/yunwu) page.
+
+```ts title="yunwu-video.ts"
+import { generateVideo } from '@deuz-sdk/core/video';
+import { createYunwuVideo } from '@deuz-sdk/core/yunwu';
+
+const yunwuVideo = createYunwuVideo({ apiKey: process.env.YUNWU_API_KEY! });
+
+const { task } = await generateVideo({
+  model: yunwuVideo('MiniMax-Hailuo-2.3'),
+  prompt: 'a hot air balloon over terraced fields at sunrise',
+});
+```
+
+### Addressing a job without the model
+
+Every function accepts the shared `VideoConfig` — `model`, `apiKey`, `baseURL`, `provider`, `fetch`, `headers`, `signal`, `deps`. Passing `model` is the easy path (it carries the factory settings), but a worker that only stored a job id can address the relay directly:
+
+```ts
+const task = await fetchVideoTask(jobId, {
+  apiKey: process.env.YUNWU_API_KEY!,
+  baseURL: 'https://yunwu.ai/v1',
+});
+```
+
+## Observation
+
+Video calls emit `operation.*` events on the `'video'` subsystem (they are auxiliary operations, not runs — same as `image` and `embedding`), with one operation per step: `video.submit`, `video.wait` (the whole poll, not one event per tick), and `video.download`. See [Observability](/docs/modules/observability).
+
+## Errors
+
+HTTP failures map to the canonical [error classes](/docs/core/errors): `401`/`403` → `AuthenticationError`, `404` → `ModelNotFoundError`, `429` → `RateLimitError` (with `Retry-After`), `529` → `OverloadedError`, other `4xx` → `InvalidRequestError`, `5xx` → a retryable `APICallError`. When no API key can be resolved, the call throws an `AuthenticationError` **before** any network request is made, and a relay that accepts a job but names no id throws an `APICallError`.
+
+`fetchVideoTask` is the one exception: a `404` there means "unknown job" and yields `null`.
+
+## Related
+
+- [Image generation](/docs/modules/image-generation) — the synchronous `generateImage` and the async Midjourney proxy.
+- [Yunwu provider](/docs/providers/yunwu) — one config for chat, image, video, embeddings, and Midjourney.
+- [Dependencies](/docs/core/dependencies) — the `fetch` / `clock` / `keyProvider` injection seam.
+- [Errors](/docs/core/errors) — the canonical error hierarchy.

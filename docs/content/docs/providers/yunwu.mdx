@@ -1,9 +1,9 @@
 ---
 title: Yunwu (云雾) Relay
-description: One key, one base URL — chat, image, embeddings, and Midjourney across a 2026 multi-vendor catalog.
+description: One key, one base URL — chat, image, video, embeddings, and Midjourney across a 2026 multi-vendor catalog.
 ---
 
-Yunwu (云雾) is an OpenAI-compatible aggregator: a single `apiKey` + `baseURL` fronts hundreds of upstream models from many vendors (OpenAI, Anthropic, Google, xAI, DeepSeek, Qwen, …). `createYunwu` is the **unified client** — you supply the host once and it derives the right surface per call: chat / image / embeddings under `/v1`, and the Midjourney proxy at the bare host root. Reach for a relay when you want a **single key**, **mainland-China access**, and **broad model variety** without wiring each provider separately.
+Yunwu (云雾) is an OpenAI-compatible aggregator: a single `apiKey` + `baseURL` fronts hundreds of upstream models from many vendors (OpenAI, Anthropic, Google, xAI, DeepSeek, Qwen, …). `createYunwu` is the **unified client** — you supply the host once and it derives the right surface per call: chat / image / video / embeddings under `/v1`, and the Midjourney proxy at the bare host root. Reach for a relay when you want a **single key**, **mainland-China access**, and **broad model variety** without wiring each provider separately.
 
 ## createYunwu
 
@@ -17,6 +17,7 @@ const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
 yunwu.baseURL; // 'https://yunwu.ai'  (no /v1)
 yunwu.chat('gpt-5.2'); //         → /v1/chat/completions
 yunwu.image('flux-2-pro'); //     → /v1/images/generations
+yunwu.video('sora-2'); //         → /v1/videos
 yunwu.embedding('text-embedding-3-large'); // → /v1/embeddings
 yunwu.mj(); //                    → bare host root (Midjourney proxy)
 ```
@@ -46,10 +47,11 @@ import { yunwu } from '@deuz-sdk/core/yunwu';
 | --- | --- | --- | --- |
 | Chat / reasoning | `chat(modelId)` | `{root}/v1/chat/completions` | `chat_completions` |
 | Image (sync) | `image(modelId)` | `{root}/v1/images/generations` | `images` |
+| Video (async) | `video(modelId)` | `{root}/v1/videos` | `video` |
 | Embeddings | `embedding(modelId)` | `{root}/v1/embeddings` | `openai-embeddings` |
 | Midjourney (async) | `mj()` | `{root}/mj/...` (bare root, **not** `/v1`) | — |
 
-The "creative base URL" rule: point `baseURL` at any mirror or self-host and **all four** surfaces follow it.
+The "creative base URL" rule: point `baseURL` at any mirror or self-host and **all five** surfaces follow it.
 
 ```ts
 const mirror = createYunwu({
@@ -59,6 +61,7 @@ const mirror = createYunwu({
 
 mirror.baseURL; //               'https://my-mirror.example.com'
 mirror.image('flux-2-pro'); //   → https://my-mirror.example.com/v1/images/generations
+mirror.video('sora-2'); //       → https://my-mirror.example.com/v1/videos
 mirror.mj().baseURL; //          'https://my-mirror.example.com'
 ```
 
@@ -70,6 +73,7 @@ mirror.mj().baseURL; //          'https://my-mirror.example.com'
 | `models` | `typeof YUNWU_MODELS` | The pinned 2026 catalog. |
 | `chat(modelId)` | `LanguageModel` | For [`streamChat`](/docs/core/stream-chat) / [`generateText`](/docs/core/generate-text). |
 | `image(modelId)` | `ImageModel` | For [`generateImage`](/docs/modules/image-generation). |
+| `video(modelId)` | `VideoModel` | For [`generateVideo`](/docs/modules/video-generation) / `submitVideo`. |
 | `embedding(modelId)` | `EmbeddingModel` | For [`embed`](/docs/core/embeddings) / `embedMany`. |
 | `mj()` | partial `MidjourneyConfig` | Pre-bound config to spread into `imagine` / `submitImagine` / `waitForTask`. |
 
@@ -81,15 +85,18 @@ If you only need one surface, the per-surface factories skip the unified client.
 import {
   createYunwuChat,
   createYunwuImage,
+  createYunwuVideo,
   createYunwuEmbedding,
 } from '@deuz-sdk/core/yunwu';
 
 const chat = createYunwuChat({ apiKey: process.env.YUNWU_API_KEY! }); // Provider
 const image = createYunwuImage({ apiKey: process.env.YUNWU_API_KEY! }); // ImageProvider
+const video = createYunwuVideo({ apiKey: process.env.YUNWU_API_KEY! }); // VideoProvider
 const embed = createYunwuEmbedding({ apiKey: process.env.YUNWU_API_KEY! }); // EmbeddingProvider
 
 chat('claude-opus-4-5'); // LanguageModel  (surface: 'chat_completions')
 image('nano-banana'); //    ImageModel     (surface: 'images')
+video('veo3.1'); //         VideoModel     (surface: 'video')
 embed('text-embedding-3-small'); // EmbeddingModel (surface: 'openai-embeddings')
 ```
 
@@ -98,11 +105,16 @@ embed('text-embedding-3-small'); // EmbeddingModel (surface: 'openai-embeddings'
 `YUNWU_MODELS` is the pinned 2026 catalog (live-verified against Yunwu's `/v1/models`), grouped by modality. Slugs are pass-through to the relay, so any model Yunwu serves works — these lists are the curated newest generation. The chat surface uses the registry's `(yunwu, chat_completions)` fallback for unknown slugs, so a new release works without an SDK change.
 
 ```ts
-import { YUNWU_MODELS, YUNWU_CHAT_MODELS, YUNWU_IMAGE_MODELS } from '@deuz-sdk/core/yunwu';
+import {
+  YUNWU_MODELS,
+  YUNWU_CHAT_MODELS,
+  YUNWU_IMAGE_MODELS,
+  YUNWU_VIDEO_MODELS,
+} from '@deuz-sdk/core/yunwu';
 
 YUNWU_MODELS.chat; //       chat / reasoning slugs
 YUNWU_MODELS.image; //      image slugs
-YUNWU_MODELS.video; //      async video slugs (run via chat / task proxy)
+YUNWU_MODELS.video; //      async video slugs (submit → poll → download)
 YUNWU_MODELS.midjourney; // Midjourney action slugs
 ```
 
@@ -110,10 +122,10 @@ YUNWU_MODELS.midjourney; // Midjourney action slugs
 | --- | --- | --- |
 | Chat / reasoning | `YUNWU_CHAT_MODELS` | `gpt-5.2`, `claude-opus-4-5`, `gemini-3-pro-preview`, `grok-4.1`, `deepseek-v3.2`, `qwen3-max`, `kimi-k2-thinking` |
 | Image | `YUNWU_IMAGE_MODELS` | `gpt-image-2`, `flux-2-pro`, `flux.1-kontext-pro`, `nano-banana`, `grok-4.2-image` |
-| Video (async) | `YUNWU_VIDEO_MODELS` | `sora-2`, `veo3.1`, `kling-2.6`, `viduq3-pro` |
+| Video (async) | `YUNWU_VIDEO_MODELS` | `sora-2`, `veo3.1`, `kling-2.6`, `viduq3-pro`, `MiniMax-Hailuo-2.3` |
 | Midjourney | `YUNWU_MIDJOURNEY_MODELS` | `mj_imagine`, `mj_variation`, `mj_upscale`, `mj_blend`, `mj_describe` |
 
-The model-list types (`YunwuChatModel`, `YunwuImageModel`) accept any `string`, so `chat('some-new-slug')` type-checks while autocompleting the pinned catalog.
+The model-list types (`YunwuChatModel`, `YunwuImageModel`, `YunwuVideoModel`) accept any `string`, so `chat('some-new-slug')` type-checks while autocompleting the pinned catalog.
 
 ## Example: chat via the relay
 
@@ -191,6 +203,29 @@ const { images } = await generateImage({
 console.log(images[0]?.url);
 ```
 
+## Example: generateVideo
+
+The video surface is **async** — `POST /v1/videos` creates a job, the SDK polls it, and `download: true` pulls the finished clip's bytes from `/v1/videos/{id}/content`. Pass `yunwu.video(slug)` to [`generateVideo`](/docs/modules/video-generation):
+
+```ts title="video.ts"
+import { generateVideo } from '@deuz-sdk/core/video';
+import { createYunwu } from '@deuz-sdk/core/yunwu';
+
+const yunwu = createYunwu({ apiKey: process.env.YUNWU_API_KEY! });
+
+const { task } = await generateVideo({
+  model: yunwu.video('sora-2'),
+  prompt: 'a tiny robot watering a bonsai, slow dolly in',
+  size: '1280x720',
+  seconds: 8,
+  onProgress: (t) => console.log(t.status, t.progress),
+});
+
+console.log(task.status, task.url); // 'completed' https://…/clip.mp4
+```
+
+A job the model refuses resolves with `status: 'failed'` and a `failReason` — it does **not** throw. The relay path is a setting, not a constant: if a host mounts its video jobs somewhere other than `{root}/v1/videos`, build the descriptor with `createVideoProvider({ baseURL })` instead (see [Video generation](/docs/modules/video-generation)).
+
 ## Example: imagine (Midjourney) via the relay
 
 Midjourney is **async** (submit → poll → optional U/V actions) and lives at the bare host root, not under `/v1`. Spread `yunwu.mj()` into the Midjourney helpers from [`@deuz-sdk/core/midjourney`](/docs/modules/image-generation); `imagine` submits a task and polls it to a terminal status, returning a `MidjourneyTask` with the final `imageUrl`.
@@ -216,6 +251,7 @@ To run a follow-up upscale/variation, take a `customId` from the finished task's
 ## See also
 
 - [Image generation](/docs/modules/image-generation) — synchronous `generateImage` and the async Midjourney proxy.
+- [Video generation](/docs/modules/video-generation) — the async submit → poll → download job surface.
 - [streamChat](/docs/core/stream-chat) and [generateText](/docs/core/generate-text) — the chat entry points.
 - [Embeddings](/docs/core/embeddings) — `embed` / `embedMany`.
 - [OpenAI](/docs/providers/openai) — the sibling Chat Completions provider this relay reuses.

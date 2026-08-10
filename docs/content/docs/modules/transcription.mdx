@@ -1,0 +1,257 @@
+---
+title: Transcription (STT)
+description: transcribe — audio in, text (and timings) out, over the OpenAI and Deepgram speech-to-text wires.
+---
+
+`transcribe` is the other half of [generateSpeech](/docs/modules/speech): audio goes in, text comes out. Like every media module it is one request and one answer — **no streaming**, no loop.
+
+Two wires ship in 2.0, and they are far less alike than the two TTS wires:
+
+| Provider | Factory | Wire |
+| --- | --- | --- |
+| OpenAI (and OpenAI-compatible relays) | `createOpenAITranscription` | `POST {baseURL}/audio/transcriptions`, `multipart/form-data`, `Authorization: Bearer` |
+| Deepgram | `createDeepgram` | `POST {baseURL}/listen?model=…`, **raw audio as the body**, `Authorization: Token` |
+
+Transcription models are a **separate kind** from chat `LanguageModel` (`surface: 'openai-transcription' | 'deepgram-transcription'`) — they cannot be passed to [streamChat](/docs/core/stream-chat) or [generateText](/docs/core/generate-text). The module is pure and edge-safe: HTTP goes through `deps.fetch` and the API key is resolved from the factory, `createClient`, or a `deps.keyProvider`, never from the environment.
+
+<Callout type="info" title="Audio input to a chat model is a file part">
+This page is about a dedicated STT endpoint. Audio you want a **chat** model to hear travels as `filePart({ mediaType: 'audio/…' })`, exactly like a PDF or an image — the `Part` union stayed at five members in 2.0.
+</Callout>
+
+## transcribe
+
+Import `transcribe` from `@deuz-sdk/core/transcription`. Build a model descriptor with a factory, hand it the audio bytes, and pass the `mediaType` along with them.
+
+```ts title="transcribe.ts"
+import { transcribe, createOpenAITranscription } from '@deuz-sdk/core/transcription';
+import { readFile } from 'node:fs/promises';
+
+const openaiStt = createOpenAITranscription({
+  apiKey: process.env.OPENAI_API_KEY!,
+});
+
+const { text, usage } = await transcribe({
+  model: openaiStt('gpt-4o-transcribe'),
+  audio: await readFile('meeting.mp3'),
+  mediaType: 'audio/mpeg',
+  language: 'tr',
+});
+
+console.log(text);              // 'Merhaba dünya.'
+console.log(usage.inputTokens); // token-billed on this model
+```
+
+### Options
+
+`transcribe(options)` takes a single `TranscribeOptions` object.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `model` | `TranscriptionModel` | — | From `createOpenAITranscription` / `createDeepgram`. Required. |
+| `audio` | `Uint8Array \| ArrayBuffer \| Blob \| { url }` | — | Required. `{ url }` is **Deepgram-only** — see below. |
+| `mediaType` | `string` | from a `Blob`'s own `type` | e.g. `'audio/mpeg'`. Strongly recommended — see [Media types and filenames](#media-types-and-filenames). |
+| `filename` | `string` | derived from `mediaType` | Overrides the multipart filename (OpenAI only). |
+| `language` | `string` | provider auto-detect | ISO-639-1 hint, e.g. `'tr'`. |
+| `prompt` | `string` | unset | Vocabulary/style hint (OpenAI only). |
+| `timestamps` | `boolean` | `false` | Ask for `segments` + `words` — see [Timestamps](#timestamps). |
+| `providerOptions` | `{ openai?, deepgram? }` | unset | Extra form fields / query params. Canonical fields always win. |
+| `signal` | `AbortSignal` | unset | Aborts the underlying fetch. |
+| `headers` | `Record<string, string>` | unset | Per-call headers, merged over factory headers. |
+| `deps` | `Dependencies` | resolved defaults | Inject `fetch`, `keyProvider`, `observer`, … |
+
+### Result shape
+
+```ts
+interface TranscribeResult {
+  text: string;
+  language?: string;        // detected or echoed, when the provider reports one
+  durationSeconds?: number; // audio length, when the provider reports one
+  segments?: TranscriptionSegment[]; // { start, end, text }
+  words?: TranscriptionWord[];       // { word, start, end, confidence? }
+  usage: TranscriptionUsage;
+  raw: unknown;             // the untouched provider JSON
+}
+```
+
+Every optional field is **absent, not `undefined`**, when the wire did not produce it — a plain `json` OpenAI response yields exactly `{ text, usage, raw }`. `raw` always carries the provider's own JSON, so a field this module does not model is never lost.
+
+## Timestamps
+
+`timestamps: true` asks for per-sentence `segments` and per-word `words`. What that costs — and whether it is even legal — depends entirely on the wire.
+
+| Model | `response_format` sent | Timings returned |
+| --- | --- | --- |
+| `whisper-1` (OpenAI), `timestamps: true` | `verbose_json` + `timestamp_granularities[]` = `segment`, `word` | `segments` **and** `words` |
+| `whisper-1` (OpenAI), `timestamps` unset | `json` | none |
+| `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` | `json` — **always** | none |
+| Deepgram (any model) | n/a | `words` always; `segments` whenever `smart_format` is on |
+
+<Callout type="warn" title="verbose_json is whisper-only">
+`verbose_json` is the only OpenAI response format that carries timings, and the `gpt-4o-transcribe` family **rejects it with a 400**. So `timestamps: true` is gated on the model slug: it upgrades the format only for `whisper-*`, and silently stays on `json` for a 4o model rather than failing the call. If you need word timings from OpenAI, use `whisper-1`.
+</Callout>
+
+```ts title="timestamps.ts"
+const { segments, words } = await transcribe({
+  model: openaiStt('whisper-1'),
+  audio: bytes,
+  mediaType: 'audio/mpeg',
+  timestamps: true,
+});
+
+segments?.[0]; // { start: 0, end: 4.2, text: ' Merhaba dünya.' }
+words?.[0];    // { word: 'Merhaba', start: 0, end: 0.8 }
+```
+
+## Media types and filenames
+
+OpenAI does **not** read the multipart part's `Content-Type` — it dispatches on the **file extension**. So the upload filename is load-bearing, and this module derives it from `mediaType`:
+
+| `mediaType` | Filename sent |
+| --- | --- |
+| `audio/mpeg`, `audio/mp3`, `audio/mpga` | `audio.mp3` |
+| `audio/wav`, `audio/x-wav`, `audio/wave` | `audio.wav` |
+| `audio/mp4` / `audio/m4a`, `audio/x-m4a` | `audio.mp4` / `audio.m4a` |
+| `audio/webm`, `audio/ogg`, `audio/flac`, `audio/aac` | `audio.webm`, `audio.ogg`, `audio.flac`, `audio.aac` |
+| anything else, or omitted | `audio.bin` — OpenAI will reject it |
+
+Parameters are ignored (`audio/wav; codecs=1` is still `audio.wav`), a `Blob`'s own `type` fills in when `mediaType` is omitted, and `filename` overrides the derivation outright. On the Deepgram wire the same value is sent as the request `Content-Type` instead, falling back to `application/octet-stream`.
+
+<Callout type="warn" title="Never set content-type yourself on the OpenAI wire">
+The multipart request deliberately carries **no** `content-type` header from this SDK: `fetch` writes `multipart/form-data; boundary=…` when it sees a `FormData` body, and a hand-written header would omit the boundary and 400 every request. Per-call `headers` are still merged, so do not add one there either.
+</Callout>
+
+## Deepgram
+
+Deepgram is not OpenAI-shaped. Three differences are worth internalizing.
+
+**1. `Authorization: Token`, not `Bearer`.** Deepgram uses its own scheme; a bearer token is a 401. The adapter writes it for you:
+
+```ts title="deepgram.ts"
+import { transcribe, createDeepgram } from '@deuz-sdk/core/transcription';
+
+const deepgram = createDeepgram({ apiKey: process.env.DEEPGRAM_API_KEY! });
+
+const { text, words, durationSeconds } = await transcribe({
+  model: deepgram('nova-3'),
+  audio: bytes,
+  mediaType: 'audio/mpeg',
+  language: 'en',
+});
+// POST https://api.deepgram.com/v1/listen?model=nova-3&language=en&smart_format=true
+// Authorization: Token <key>          ← not Bearer
+// Content-Type: audio/mpeg            ← the audio IS the body
+```
+
+**2. The audio is the request body, and a URL works too.** Bytes are POSTed raw — no multipart wrapper. Deepgram can also fetch the audio itself, which is the cheapest path for anything already sitting in object storage:
+
+```ts title="deepgram-url.ts"
+const { text } = await transcribe({
+  model: deepgram('nova-3'),
+  audio: { url: 'https://cdn.example/talk.mp3' },
+});
+// body → {"url":"https://cdn.example/talk.mp3"}, content-type: application/json
+```
+
+Passing `{ url }` to an **OpenAI** model throws an `InvalidRequestError` before any request is made — that wire uploads bytes, full stop.
+
+**3. `smart_format` is on by default.** It adds punctuation and casing, and it is what produces the `paragraphs` block that this module maps into `segments`. Turn it off through `providerOptions` if you want the raw token stream:
+
+```ts
+providerOptions: { deepgram: { smart_format: false } } // → the param is simply omitted
+```
+
+Word entries prefer Deepgram's `punctuated_word` over the raw `word` when smart formatting produced one, and carry Deepgram's per-word `confidence`. `language` comes from `results.channels[0].detected_language`, `durationSeconds` from `metadata.duration`.
+
+## usage — two meters, one shape
+
+Providers do not agree on what they charge for, so `TranscriptionUsage` carries every field optionally and fills in only what the response actually reported:
+
+```ts
+interface TranscriptionUsage {
+  seconds?: number;      // audio duration billing
+  inputTokens?: number;
+  outputTokens?: number;
+  audioTokens?: number;  // the audio-derived slice of inputTokens
+  totalTokens?: number;
+}
+```
+
+| Wire / model | `usage` you get |
+| --- | --- |
+| `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` | `{ inputTokens, outputTokens, audioTokens, totalTokens }` |
+| `whisper-1` with `verbose_json` | `{ seconds }` — taken from the response `duration` |
+| `whisper-1` with a `{ type: 'duration' }` usage block | `{ seconds }` |
+| Deepgram | `{ seconds }` — from `metadata.duration` |
+
+Read `usage.seconds ?? usage.totalTokens` if you need one number for a meter, and branch on which one is present if you are pricing the call.
+
+## providerOptions
+
+`providerOptions` is keyed by provider name and is a shallow escape hatch for wire fields the SDK does not model. **Canonical fields always win** — the hatch may add, never redefine:
+
+```ts
+await transcribe({
+  model: openaiStt('whisper-1'),
+  audio: bytes,
+  mediaType: 'audio/mpeg',
+  language: 'tr',
+  providerOptions: {
+    openai: { temperature: 0, chunking_strategy: 'auto', language: 'de' },
+  },
+});
+// form fields → file, model, language=tr (NOT 'de'), response_format=json,
+//               temperature=0, chunking_strategy=auto
+```
+
+Values are coerced with `String(value)`; `undefined` / `null` entries are dropped. On the OpenAI wire the entries become extra **multipart fields**; on Deepgram they become extra **query parameters** (`diarize`, `utterances`, `detect_language`, `keyterm`, …), with `smart_format` special-cased as described above.
+
+## Creating transcription model descriptors
+
+Both factories return a `TranscriptionProvider` — a `(modelId: string) => TranscriptionModel` function. Factory settings are carried on a private symbol, so the public `TranscriptionModel` shape stays clean and the key never leaks via enumeration.
+
+| Setting | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | — | Resolved against `keyProvider` / `createClient` if omitted. |
+| `baseURL` | `string` | per-wire (below) | Point at any compatible relay. |
+| `fetch` | `typeof fetch` | `deps.fetch` | Factory `fetch` wins over `deps.fetch`. |
+| `headers` | `Record<string, string>` | — | Default headers for every call. |
+| `provider` | `string` | `'openai'` / `'deepgram'` | Logical id used for key/baseURL resolution. |
+
+| Factory | Default `baseURL` | Typical models |
+| --- | --- | --- |
+| `createOpenAITranscription` | `https://api.openai.com/v1` | `whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` |
+| `createDeepgram` | `https://api.deepgram.com/v1` | `nova-3`, `nova-2`, `whisper-large` |
+
+## Key resolution
+
+The same G1 precedence chain as every other module: `deps.keyProvider` (highest) → factory `apiKey` → `createClient`'s `apiKeys[provider]` (lowest). When none of them produce a key, the call throws an `AuthenticationError` **before** any network request is made.
+
+```ts title="createClient.ts"
+import { createClient } from '@deuz-sdk/core';
+
+const client = createClient({
+  apiKeys: { openai: process.env.OPENAI_API_KEY!, deepgram: process.env.DEEPGRAM_API_KEY! },
+});
+```
+
+`baseUrls[provider]` works the same way for the base URL, sitting between the factory setting and the per-wire default.
+
+## Observability
+
+A transcription call emits the auxiliary `operation.started` / `operation.completed` / `operation.failed` events under the `'transcription'` subsystem with `operation: 'transcription.transcribe'` — the same shape `image`, `speech`, and `embedding` use. Without an observer the fast path applies: no events are built at all. See [Observability](/docs/modules/observability).
+
+## Errors
+
+The canonical status→class table, shared with every media module: `401`/`403` → `AuthenticationError`, `404` → `ModelNotFoundError`, `429` → `RateLimitError` (with `Retry-After` parsed into `retryAfterMs`), `529` → `OverloadedError`, other `4xx` → `InvalidRequestError`, `5xx` → a retryable `APICallError`.
+
+Deepgram wraps its failures in `{ err_code, err_msg }` instead of OpenAI's `{ error: { message } }`; the envelope is normalized before mapping, so `err_msg` lands on `error.message` and `err_code` on `error.upstreamType`.
+
+Two failures happen **before** the request is ever sent: an unsupported `audio` shape, and `{ url }` on the OpenAI wire — both `InvalidRequestError`.
+
+## Related
+
+- [Speech (TTS)](/docs/modules/speech) — the text → audio direction.
+- [Image generation](/docs/modules/image-generation) — the other synchronous media module.
+- [Dependencies](/docs/core/dependencies) — the `fetch` / `clock` / `keyProvider` injection seam.
+- [Errors](/docs/core/errors) — the canonical error hierarchy.
+- [Observability](/docs/modules/observability) — the `operation.*` event protocol.

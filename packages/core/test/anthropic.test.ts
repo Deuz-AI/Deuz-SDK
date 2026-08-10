@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { streamChat, generateText, generateObject } from '../src/index';
+import { ContextOverflowError, InvalidRequestError } from '../src/errors';
 import { createAnthropic } from '../src/anthropic';
 import type { StreamPart } from '../src/types/stream';
 import type { JSONSchema } from '../src/types/schema';
@@ -496,5 +497,63 @@ describe('Anthropic refusal stop_details (0.2.0)', () => {
         ? (finish.providerMetadata?.anthropic as { stop_details?: { category?: string } })
         : undefined;
     expect(meta?.stop_details?.category).toBe('cyber');
+  });
+});
+
+describe('Anthropic context overflow mapping (2.0)', () => {
+  /** Drive one failing call and hand back the mapped error part. */
+  async function errorFrom(status: number, error: { type: string; message: string }) {
+    const fetch = (async () =>
+      new Response(JSON.stringify({ type: 'error', error }), {
+        status,
+        headers: { 'content-type': 'application/json' },
+      })) as typeof globalThis.fetch;
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'test', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      maxRetries: 0,
+    });
+    const usage = result.usage.catch((e: unknown) => e);
+    const finish = result.finishReason.catch((e: unknown) => e);
+    const errors: unknown[] = [];
+    for await (const part of result.fullStream) {
+      if (part.type === 'error') errors.push(part.error);
+    }
+    await Promise.all([usage, finish]);
+    return errors[0];
+  }
+
+  it('maps a 400 "prompt is too long" to ContextOverflowError', async () => {
+    // Anthropic ships no code for this — the message is the ONLY signal, and
+    // the loop's overflow recovery keys on the error class.
+    const error = await errorFrom(400, {
+      type: 'invalid_request_error',
+      message: 'prompt is too long: 210000 tokens > 200000 maximum',
+    });
+    expect(error).toBeInstanceOf(ContextOverflowError);
+    expect(error).toMatchObject({
+      code: 'context_overflow',
+      provider: 'anthropic',
+      statusCode: 400,
+      isRetryable: false,
+    });
+  });
+
+  it('maps a 413 request_too_large to ContextOverflowError', async () => {
+    const error = await errorFrom(413, {
+      type: 'request_too_large',
+      message: 'Request body too large',
+    });
+    expect(error).toBeInstanceOf(ContextOverflowError);
+    expect(error).toMatchObject({ statusCode: 413, isRetryable: false });
+  });
+
+  it('leaves ordinary invalid requests as InvalidRequestError', async () => {
+    const error = await errorFrom(400, {
+      type: 'invalid_request_error',
+      message: 'messages: at least one message is required',
+    });
+    expect(error).toBeInstanceOf(InvalidRequestError);
+    expect(error).not.toBeInstanceOf(ContextOverflowError);
   });
 });

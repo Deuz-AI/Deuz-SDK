@@ -1,0 +1,122 @@
+---
+title: Local models
+description: Ollama and LM Studio with no API key, plus the capabilities recipe for vLLM, llama.cpp and any other self-hosted OpenAI-shaped server.
+---
+
+Ollama and LM Studio both serve the OpenAI **Chat Completions** wire on `localhost`, and neither authenticates anything. Since 2.0 they have named factories that know both facts:
+
+```ts title="local.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createOllama } from '@deuz-sdk/core/providers';
+
+const ollama = createOllama(); // no apiKey, no baseURL
+
+const result = streamChat({
+  model: ollama('qwen3'),
+  messages: [{ role: 'user', content: 'Hello from my laptop.' }],
+});
+
+for await (const delta of result.textStream) {
+  process.stdout.write(delta);
+}
+```
+
+| Factory | Provider id | Default base URL |
+| --- | --- | --- |
+| `createOllama` / `ollama` | `ollama` | `http://localhost:11434/v1` |
+| `createLMStudio` / `lmstudio` | `lmstudio` | `http://localhost:1234/v1` |
+
+Both are re-exported from [`@deuz-sdk/core/providers`](/docs/installation#subpath-exports) alongside the [cloud compat hosts](/docs/providers/compat), so they drop into `createProviderRegistry` like any other factory.
+
+## No API key required
+
+Every other provider ends the key-precedence chain with an `AuthenticationError`. That is exactly right for a cloud host — a missing key is a bug you want to hear about at the call site, not a 401 three layers down. For a server running on your own machine it is pure friction.
+
+The two local factories set `apiKeyOptional`, which changes **one** thing: when the whole chain comes up empty, the resolver substitutes a placeholder bearer token instead of throwing. The chain itself is untouched:
+
+```
+deps.keyProvider  >  factory apiKey  >  createClient({ apiKeys })  >  placeholder
+```
+
+A real key from *any* of those three still wins, so the escape can never shadow a key you actually supplied — useful when Ollama sits behind an authenticating reverse proxy:
+
+```ts
+const ollama = createOllama({ apiKey: process.env.OLLAMA_PROXY_TOKEN! });
+// …or, unchanged from every other provider:
+const deuz = createClient({ apiKeys: { ollama: process.env.OLLAMA_PROXY_TOKEN! } });
+```
+
+<Callout type="warn" title="Cloud factories do not inherit the escape">
+`apiKeyOptional` is set by `createOllama` and `createLMStudio` only. `createPerplexity()` with no key still throws `AuthenticationError`, and so does every other named host. Opt in deliberately (below) or not at all.
+</Callout>
+
+## A different port, or another machine
+
+Core never reads env vars, so `OLLAMA_HOST` is not consulted. Pass `baseURL` — the whole URL up to (but not including) `/chat/completions`:
+
+```ts
+const ollama = createOllama({ baseURL: 'http://gpu-box.lan:11434/v1' });
+// or, per client:
+const deuz = createClient({ baseUrls: { ollama: 'http://gpu-box.lan:11434/v1' } });
+```
+
+## The unknown-model warning is expected here
+
+The [model registry](/docs/advanced/model-registry) pins capabilities for flagship *cloud* slugs. Local slugs are whatever you pulled — `qwen3`, `llama3.2:3b`, `my-finetune:latest`, a GGUF filename — so **no useful list could exist**, and Ollama/LM Studio deliberately have no registry rows at all. Every local model therefore takes the documented unknown-slug path:
+
+- one `unknown-model` warning (a `logger.warn` line plus a typed entry in `result.warnings`), and
+- the conservative fallback row: `tools: false`, `reasoning: false`, `structuredOutput: false`, `maxOutput: 4096`.
+
+Nothing throws, and the call works. But `maxOutput: 4096` becomes the request's `max_tokens`, so a long answer gets silently truncated.
+
+### The cure: `capabilities`
+
+`CompatSettings.capabilities` is public in 2.0 precisely for this. State what your model can do once, at the factory, and it is merged over the fallback row for every slug that factory mints:
+
+```ts title="ollama.ts"
+export const ollama = createOllama({
+  capabilities: {
+    tools: true,
+    structuredOutput: false, // Ollama speaks tools; json_schema support varies by model
+    contextWindow: 128_000,
+    maxOutput: 32_000,
+  },
+});
+```
+
+| Field | Why you would set it |
+| --- | --- |
+| `maxOutput` | Stops the 4096-token truncation. The single most valuable one. |
+| `tools` | Reported by `getModelCapabilities` for your own UI gating. No adapter reads it — tool calling works either way. |
+| `contextWindow` | Feeds compaction sizing, so the history is summarized at the right threshold. |
+| `vision` / `reasoning` / `structuredOutput` | Whatever the model you loaded actually supports. |
+
+Nothing is validated: an override is a claim about your model, not a request the SDK can check. A per-call `capabilities` still wins over the factory value — see [capabilities](/docs/core/prompts-and-timeouts#capabilities).
+
+If you run several models with different limits, mint a factory per model:
+
+```ts
+const big = createOllama({ capabilities: { maxOutput: 32_000, contextWindow: 128_000 } });
+const small = createOllama({ capabilities: { maxOutput: 4_096, contextWindow: 8_192 } });
+
+const model = needsRoom ? big('qwen3') : small('llama3.2:3b');
+```
+
+## vLLM, llama.cpp, TGI, and friends
+
+Anything else that serves the OpenAI wire without auth gets the same treatment through the generic factory — pass your own `id` and opt into the keyless escape explicitly:
+
+```ts
+import { createOpenAICompatible } from '@deuz-sdk/core/providers';
+
+const vllm = createOpenAICompatible({
+  id: 'vllm', // your provider id: used for key lookup, pricing, logs, observation
+  baseURL: 'http://gpu-box.internal:8000/v1',
+  apiKeyOptional: true, // no key required — same escape as createOllama
+  capabilities: { tools: true, maxOutput: 32_000 },
+});
+
+const model = vllm('gpt-oss-120b');
+```
+
+Drop `apiKeyOptional` and the same host demands a key again, which is what you want the moment that box is reachable from anywhere but your LAN. See [`createOpenAICompatible()`](/docs/providers/compat#createopenaicompatible) for the rest of its settings, including `surface: 'responses'` for hosts that speak the Responses wire.

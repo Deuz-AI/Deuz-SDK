@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createTokenEstimator } from '../src/internal/estimate-tokens';
 import type { Message, Part } from '../src/types/message';
 
@@ -147,5 +147,54 @@ describe('createTokenEstimator — calibration', () => {
     calibrated.calibrate(10_000, 1000);
     expect(calibrated.estimate(messages)).toBe(Math.ceil(base * 2));
     expect(untouched.estimate(messages)).toBe(base);
+  });
+});
+
+describe('createTokenEstimator — real tokenizer seam (2.0)', () => {
+  const messages = [textMessage(3600)];
+
+  it('uses countTokens as the base count instead of the char heuristic', () => {
+    const countTokens = vi.fn((_messages: Message[]) => 1234);
+    const estimator = createTokenEstimator({ countTokens });
+
+    expect(estimator.estimate(messages)).toBe(1234);
+    expect(countTokens).toHaveBeenCalledTimes(1);
+    expect(countTokens.mock.calls[0]![0]).toBe(messages);
+    // The heuristic is a different number entirely — proof it was replaced.
+    expect(createTokenEstimator().estimate(messages)).not.toBe(1234);
+  });
+
+  it('keeps calibrating ON TOP of a real tokenizer', () => {
+    // A tokenizer counts the MESSAGES; the provider also bills its own request
+    // framing (system scaffolding, tool schemas), so a constant gap remains —
+    // exactly what the EMA is for. It must converge on 1.5x here, not stop at 1x.
+    const estimator = createTokenEstimator({ countTokens: () => 1000 });
+    expect(estimator.estimate(messages)).toBe(1000);
+
+    for (let i = 0; i < 15; i++) estimator.calibrate(1500, estimator.estimate(messages));
+    expect(estimator.estimate(messages)).toBeGreaterThanOrEqual(1490);
+    expect(estimator.estimate(messages)).toBeLessThanOrEqual(1500);
+  });
+
+  it('still clamps the correction factor around a real tokenizer', () => {
+    const estimator = createTokenEstimator({ countTokens: () => 1000 });
+    estimator.calibrate(10_000, 1000); // ratio 10 → clamped to 2.0
+    expect(estimator.estimate(messages)).toBe(2000);
+  });
+
+  it('degrades to the heuristic when the tokenizer throws or returns nonsense', () => {
+    const heuristic = createTokenEstimator().estimate(messages);
+    const throwing = createTokenEstimator({
+      countTokens: () => {
+        throw new Error('wasm encoder not loaded');
+      },
+    });
+
+    expect(throwing.estimate(messages)).toBe(heuristic);
+    expect(createTokenEstimator({ countTokens: () => NaN }).estimate(messages)).toBe(heuristic);
+    expect(createTokenEstimator({ countTokens: () => Infinity }).estimate(messages)).toBe(
+      heuristic,
+    );
+    expect(createTokenEstimator({ countTokens: () => -1 }).estimate(messages)).toBe(heuristic);
   });
 });

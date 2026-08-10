@@ -256,6 +256,96 @@ const REGISTRY: Record<string, Row> = {
     structuredOutput: false,
     contextWindow: 200_000,
   }),
+
+  // --- 2.0 hosts. Every slug below is pinned from a public catalog and marked
+  // `verify slug at publish`: these vendors rename far more often than the
+  // flagships above, and a stale key here costs nothing (unknown → conservative
+  // fallback) but a WRONG key would hand out capabilities the model lacks. ---
+
+  // Perplexity Sonar — search-grounded. `tools: false` is the load-bearing flag:
+  // the search runs server-side and the API rejects a `tools` array, so no
+  // client tool loop and no tool-strategy structured output.
+  sonar: row('perplexity', 'chat_completions', {
+    tools: false,
+    structuredOutput: false,
+    contextWindow: 128_000,
+  }), // verify slug at publish
+  'sonar-pro': row('perplexity', 'chat_completions', {
+    tools: false,
+    structuredOutput: false,
+    contextWindow: 200_000,
+  }), // verify slug at publish
+  'sonar-reasoning-pro': row('perplexity', 'chat_completions', {
+    reasoning: true,
+    tools: false,
+    structuredOutput: false,
+    contextWindow: 128_000,
+  }), // verify slug at publish
+
+  // Cohere via the OpenAI compatibility endpoint.
+  'command-a-03-2025': row('cohere', 'chat_completions', {
+    structuredOutput: false,
+    contextWindow: 256_000,
+  }), // verify slug at publish
+
+  // DeepInfra (org/Model slugs).
+  'meta-llama/Llama-4-Maverick-17B-128E-Instruct': row('deepinfra', 'chat_completions', {
+    vision: true,
+    structuredOutput: false,
+    contextWindow: 131_072,
+  }), // verify slug at publish
+  'deepseek-ai/DeepSeek-V3.2': row('deepinfra', 'chat_completions', {
+    structuredOutput: false,
+    contextWindow: 163_840,
+  }), // verify slug at publish
+
+  // NVIDIA NIM (vendor/model slugs, lowercased).
+  'meta/llama-4-maverick-17b-128e-instruct': row('nvidia', 'chat_completions', {
+    vision: true,
+    structuredOutput: false,
+    contextWindow: 131_072,
+  }), // verify slug at publish
+  'nvidia/llama-3.3-nemotron-super-49b-v1.5': row('nvidia', 'chat_completions', {
+    reasoning: true,
+    structuredOutput: false,
+    contextWindow: 131_072,
+  }), // verify slug at publish
+
+  // SambaNova Cloud (bare CamelCase slugs).
+  'Llama-4-Maverick-17B-128E-Instruct': row('sambanova', 'chat_completions', {
+    vision: true,
+    structuredOutput: false,
+    contextWindow: 131_072,
+  }), // verify slug at publish
+  'Meta-Llama-3.3-70B-Instruct': row('sambanova', 'chat_completions', {
+    structuredOutput: false,
+    contextWindow: 131_072,
+  }), // verify slug at publish
+
+  // Hyperbolic (org/Model slugs).
+  'Qwen/Qwen3-235B-A22B-Instruct': row('hyperbolic', 'chat_completions', {
+    structuredOutput: false,
+    contextWindow: 262_144,
+  }), // verify slug at publish
+  'moonshotai/Kimi-K2-Instruct': row('hyperbolic', 'chat_completions', {
+    structuredOutput: false,
+    contextWindow: 131_072,
+  }), // verify slug at publish
+
+  // --- Ollama and LM Studio (2.0) have NO rows here, on purpose. ---
+  // Their slugs are whatever the USER pulled — `qwen3`, `llama3.2:3b`,
+  // `my-finetune:latest`, a GGUF filename — so any pinned list would be wrong
+  // for almost everyone and would go stale the moment a new tag lands. They
+  // take the documented unknown-slug path instead: `defaultRow(provider,
+  // 'chat_completions')` (tools OFF, maxOutput 4096) plus one `unknown-model`
+  // warning, and the user states the truth once through the factory-level
+  // `capabilities` override, which `finalize()` merges over the row:
+  //
+  //   createOllama({ capabilities: { tools: true, maxOutput: 32_000 } })
+  //
+  // That override channel is exactly why `CompatSettings.capabilities` is
+  // public in 2.0. Same reasoning applies to any self-hosted vLLM/llama.cpp
+  // reached through `createOpenAICompatible`.
 };
 
 // --- Gemini NATIVE (generateContent) rows — surface:'native', keyed separately

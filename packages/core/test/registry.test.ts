@@ -6,10 +6,21 @@ import {
   type ModelCapabilities,
 } from '../src/core/registry';
 import { generateText } from '../src/generate';
-import { createOpenAICompatible } from '../src/providers-compat';
+import {
+  createOpenAICompatible,
+  createOllama,
+  createLMStudio,
+  perplexity,
+  cohere,
+  deepinfra,
+  nvidia,
+  sambanova,
+  hyperbolic,
+} from '../src/providers-compat';
 import { readConfig, withCapabilityOverride } from '../src/internal/config-symbol';
 import { mockFetch, sseEvents, sseResponse } from './fixtures/sse';
 import type { Logger } from '../src/types/deps';
+import type { Provider } from '../src/types/model';
 
 const anthropic = (modelId: string) =>
   ({ provider: 'anthropic', modelId, surface: 'anthropic' }) as const;
@@ -104,6 +115,72 @@ describe('registry: 2026-07 Google catalog', () => {
       surface: 'native',
     });
     expect(caps.known).toBe(true);
+  });
+});
+
+// ===================================================================
+// 2.0 — the eight new OpenAI-compatible hosts
+// ===================================================================
+
+describe('registry: 2.0 OpenAI-compatible hosts', () => {
+  it('pins a row per new cloud host, each attributed to its own provider', () => {
+    const PINNED: [Provider, string, string][] = [
+      [perplexity, 'sonar', 'perplexity'],
+      [perplexity, 'sonar-pro', 'perplexity'],
+      [perplexity, 'sonar-reasoning-pro', 'perplexity'],
+      [cohere, 'command-a-03-2025', 'cohere'],
+      [deepinfra, 'meta-llama/Llama-4-Maverick-17B-128E-Instruct', 'deepinfra'],
+      [deepinfra, 'deepseek-ai/DeepSeek-V3.2', 'deepinfra'],
+      [nvidia, 'meta/llama-4-maverick-17b-128e-instruct', 'nvidia'],
+      [nvidia, 'nvidia/llama-3.3-nemotron-super-49b-v1.5', 'nvidia'],
+      [sambanova, 'Llama-4-Maverick-17B-128E-Instruct', 'sambanova'],
+      [sambanova, 'Meta-Llama-3.3-70B-Instruct', 'sambanova'],
+      [hyperbolic, 'Qwen/Qwen3-235B-A22B-Instruct', 'hyperbolic'],
+      [hyperbolic, 'moonshotai/Kimi-K2-Instruct', 'hyperbolic'],
+    ];
+    for (const [factory, slug, provider] of PINNED) {
+      const caps = getCapabilities(factory(slug));
+      expect(caps.known, slug).toBe(true);
+      expect(caps.provider, slug).toBe(provider);
+      expect(caps.surface, slug).toBe('chat_completions');
+    }
+  });
+
+  it('Perplexity Sonar disables client tools (the search is server-side)', () => {
+    for (const slug of ['sonar', 'sonar-pro', 'sonar-reasoning-pro']) {
+      expect(getCapabilities(perplexity(slug)).tools, slug).toBe(false);
+    }
+    expect(getCapabilities(perplexity('sonar-reasoning-pro')).reasoning).toBe(true);
+  });
+
+  it('Ollama / LM Studio slugs are user-defined, so they are DELIBERATELY unknown', () => {
+    const logger: Logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    for (const [model, provider] of [
+      [createOllama()('anything'), 'ollama'],
+      [createOllama()('llama3.2:3b'), 'ollama'],
+      [createLMStudio()('some-gguf'), 'lmstudio'],
+    ] as const) {
+      const caps = getCapabilities(model, logger);
+      expect(caps.known).toBe(false);
+      expect(caps.provider).toBe(provider);
+      expect(caps.tools).toBe(false); // conservative fallback
+      expect(caps.maxOutput).toBe(4_096);
+    }
+    expect(logger.warn).toHaveBeenCalledTimes(3);
+  });
+
+  it('CompatSettings.capabilities is the documented cure — it flows into getCapabilities', () => {
+    const model = createOllama({
+      capabilities: { tools: true, maxOutput: 32_000, structuredOutput: true },
+    })('qwen3');
+    const caps = getCapabilities(model);
+    expect(caps.tools).toBe(true);
+    expect(caps.maxOutput).toBe(32_000);
+    expect(caps.structuredOutput).toBe(true);
+    expect(caps.contextWindow).toBe(128_000); // untouched fallback value
+    expect(caps.known).toBe(false); // an override is a claim, not knowledge
+    // …and a per-call override still outranks the factory one.
+    expect(getCapabilities(model, undefined, { maxOutput: 8_000 }).maxOutput).toBe(8_000);
   });
 });
 

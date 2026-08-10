@@ -116,6 +116,19 @@ export const PRICES_2026: PriceTable = {
   'kimi-k2': { input: 0.6, output: 2.5, cachedRead: 0.15 },
   'kimi-k2.6': { input: 0.95, output: 4, cachedRead: 0.16 },
 
+  // ---- Perplexity Sonar (2.0; approximate — verify at publish) ----
+  // INCOMPLETE BY CONSTRUCTION: Perplexity also bills PER REQUEST for the
+  // search itself (a few dollars per 1,000 requests, tiered by search mode).
+  // That dimension has no token equivalent, so `priceUsage` returns the token
+  // floor, never the invoice. Add the request fee in your own accounting.
+  // `sonar-reasoning-pro` has no row of its own — the prefix lookup resolves it
+  // to `sonar`, which under-counts; pass a custom table if you bill on it.
+  sonar: { input: 1, output: 1 },
+  'sonar-pro': { input: 3, output: 15 },
+
+  // ---- Cohere (OpenAI compatibility endpoint; approximate) ----
+  'command-a-03-2025': { input: 2.5, output: 10 },
+
   // ---- Others on the Yunwu catalog ----
   'qwen3-max': { input: 1.2, output: 6 },
   'glm-4.6': { input: 0.6, output: 2.2 },

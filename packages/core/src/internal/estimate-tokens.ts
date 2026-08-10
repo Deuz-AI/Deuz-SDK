@@ -3,6 +3,11 @@
  * budget stops — those read real usage). Char-count heuristic (~3.6 chars per
  * token) corrected by a session-local EMA factor fed from actual usage; all
  * state lives inside the created instance so estimates stay deterministic.
+ *
+ * A real tokenizer can replace the heuristic (`countTokens`), but NOT the
+ * calibration: no tokenizer knows the provider's request framing (system
+ * scaffolding, tool schemas, image blocks), so the EMA still has a residual
+ * constant to converge on — it just starts far closer.
  */
 import type { Message, Part } from '../types/message';
 
@@ -11,6 +16,16 @@ export interface TokenEstimator {
   estimate(messages: Message[]): number;
   /** Feed real input-token usage after a step to tighten future estimates. */
   calibrate(actualInputTokens: number, estimatedAtCall: number): void;
+}
+
+export interface TokenEstimatorOptions {
+  /**
+   * Real tokenizer (`gpt-tokenizer`, `tiktoken`, `@anthropic-ai/tokenizer`, a
+   * provider `countTokens` wrapper). Becomes the BASE count in place of the
+   * char heuristic; the EMA correction factor still multiplies it. Synchronous
+   * on purpose — this runs once per step on the loop's hot path.
+   */
+  countTokens?: (messages: Message[]) => number;
 }
 
 const CHARS_PER_TOKEN = 3.6;
@@ -71,13 +86,35 @@ function estimateBase(messages: Message[]): number {
   return total;
 }
 
+/**
+ * A caller-supplied tokenizer sits on the hot path of a module that must never
+ * throw and whose output divides a context window. One that throws (an unloaded
+ * WASM encoder) or returns nonsense degrades to the built-in heuristic instead
+ * of poisoning every threshold decision for the rest of the run.
+ */
+function baseCounter(
+  countTokens?: (messages: Message[]) => number,
+): (messages: Message[]) => number {
+  if (!countTokens) return estimateBase;
+  return (messages) => {
+    let counted: number;
+    try {
+      counted = countTokens(messages);
+    } catch {
+      return estimateBase(messages);
+    }
+    return Number.isFinite(counted) && counted >= 0 ? counted : estimateBase(messages);
+  };
+}
+
 /** Create an estimator with its own EMA correction factor (starts at 1.0). */
-export function createTokenEstimator(): TokenEstimator {
+export function createTokenEstimator(options?: TokenEstimatorOptions): TokenEstimator {
   let factor = 1.0;
+  const base = baseCounter(options?.countTokens);
 
   return {
     estimate(messages) {
-      return Math.ceil(estimateBase(messages) * factor);
+      return Math.ceil(base(messages) * factor);
     },
     calibrate(actualInputTokens, estimatedAtCall) {
       // Ignore degenerate samples: NaN/Infinity (a single one would poison the

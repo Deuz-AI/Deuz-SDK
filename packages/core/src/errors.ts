@@ -41,6 +41,7 @@ export abstract class DeuzError extends Error {
       'capability',
       'runId',
       'mime',
+      'serverUrl',
     ] as const;
     const self = this as unknown as Record<string, unknown>;
     for (const field of safeFields) {
@@ -297,6 +298,48 @@ export class UnsupportedCapabilityError extends DeuzError {
     this.provider = options.provider;
     this.capability = options.capability;
     this.modelId = options.modelId;
+  }
+}
+
+/**
+ * An MCP server demands OAuth and no usable tokens exist yet (2.0). Thrown
+ * instead of the SDK's bare `UnauthorizedError`, because a 401 from an MCP
+ * server is not a dead end — it is step one of a two-step flow:
+ *
+ * 1. `createMcpClient({ transport, auth })` rejects with THIS error, whose
+ *    `authorizationUrl` the user must visit (the SDK has already run discovery,
+ *    dynamic client registration and PKCE by then).
+ * 2. `createMcpClient({ transport, auth, authorizationCode })` finishes the
+ *    exchange with the `?code=` from the redirect and connects.
+ *
+ * `authorizationUrl` is a STRING, not a `URL`: this error crosses process and
+ * transport boundaries (a CLI prints it, a server hands it to a browser), so it
+ * must survive `JSON.stringify`. It is deliberately absent from `toJSON()`'s
+ * details — a live authorization request carries `state` and `code_challenge`
+ * and does not belong in every log line; read it off the instance.
+ */
+export class McpAuthorizationRequiredError extends DeuzError {
+  readonly code = 'mcp_authorization_required';
+  /** Where to send the user to consent. Absent when no OAuth provider was configured. */
+  readonly authorizationUrl?: string;
+  /** The MCP server that answered 401. */
+  readonly serverUrl: string;
+  constructor(options: {
+    serverUrl: string;
+    authorizationUrl?: string;
+    message?: string;
+    cause?: unknown;
+  }) {
+    super(
+      options.message ??
+        `The MCP server '${options.serverUrl}' requires authorization. ` +
+          (options.authorizationUrl
+            ? 'Send the user to `authorizationUrl`, then reconnect with `authorizationCode` set to the `?code=` you get back.'
+            : 'Pass `auth` (see `createOAuthProvider`) so the SDK can run the OAuth flow, or supply a valid bearer token via `transport.headers`.'),
+      { cause: options.cause },
+    );
+    this.authorizationUrl = options.authorizationUrl;
+    this.serverUrl = options.serverUrl;
   }
 }
 

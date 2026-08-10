@@ -1,12 +1,18 @@
 /**
- * `@deuz-sdk/core/providers` (1.8.0) — the OpenAI-Chat-Completions-compatible
+ * `@deuz-sdk/core/providers` (2.0) — the OpenAI-Chat-Completions-compatible
  * provider factories PLUS a tiny string-lookup model router.
  *
- * The factories (Groq, Mistral, DeepSeek, Together, OpenRouter, Cerebras,
- * Fireworks, Moonshot/Kimi, Qwen, GLM, MiniMax) live in `providers-compat.ts`,
- * together with the generic `createOpenAICompatible({ id, … })` (1.9) for any
- * unlisted OpenAI-shaped host — Ollama, vLLM, LM Studio, an internal gateway —
- * which carries YOUR provider id instead of borrowing an unrelated factory's.
+ * The factories live in `providers-compat.ts`, in three groups:
+ *
+ * - **cloud hosts** — Groq, Mistral, DeepSeek, Together, OpenRouter, Cerebras,
+ *   Fireworks, Moonshot/Kimi, Qwen, GLM, MiniMax, and 2.0's Perplexity, Cohere,
+ *   DeepInfra, NVIDIA NIM, SambaNova, Hyperbolic;
+ * - **keyless local hosts** (2.0) — Ollama and LM Studio, which dial
+ *   `localhost` and need no API key at all (see `providers/local.mdx`);
+ * - the generic `createOpenAICompatible({ id, … })` (1.9) for any host with no
+ *   named factory — a self-hosted vLLM, an internal gateway — which carries
+ *   YOUR provider id instead of borrowing an unrelated factory's.
+ *
  * Dedicated Azure OpenAI + Amazon Bedrock (Mantle) factories live in
  * `./azure` and `./bedrock` and are re-exported here for the registry.
  * This module also adds `createProviderRegistry`, so a caller can resolve
@@ -47,6 +53,25 @@ export {
   createMiniMax,
   minimax,
 } from './providers-compat';
+// 2.0 — six more cloud hosts. (Kept in its own statement, not folded into the
+// list above: `tooling/verify-docs.mjs` builds the public symbol table by
+// regex, and a comment INSIDE the braces swallows the name that follows it.)
+export {
+  createPerplexity,
+  perplexity,
+  createCohere,
+  cohere,
+  createDeepInfra,
+  deepinfra,
+  createNvidia,
+  nvidia,
+  createSambaNova,
+  sambanova,
+  createHyperbolic,
+  hyperbolic,
+} from './providers-compat';
+// 2.0 — keyless local hosts (see `providers/local.mdx`).
+export { createOllama, ollama, createLMStudio, lmstudio } from './providers-compat';
 export { createAzure, azure, type AzureSettings } from './azure';
 export { createBedrock, bedrock, type BedrockSettings } from './bedrock';
 

@@ -3,13 +3,16 @@ import {
   createYunwu,
   createYunwuChat,
   createYunwuImage,
+  createYunwuVideo,
   createYunwuEmbedding,
   YUNWU_MODELS,
   YUNWU_CHAT_MODELS,
   YUNWU_IMAGE_MODELS,
+  YUNWU_VIDEO_MODELS,
   YUNWU_DEFAULT_BASE_URL,
 } from '../src/yunwu';
 import { generateImage } from '../src/image';
+import { submitVideo } from '../src/video';
 
 /** Records the URL a model/factory resolves to by intercepting the fetch. */
 function urlSpy(body: unknown) {
@@ -30,6 +33,8 @@ describe('Yunwu 2026 catalog', () => {
     expect(YUNWU_IMAGE_MODELS).toContain('gpt-image-2');
     expect(YUNWU_MODELS.video).toContain('sora-2');
     expect(YUNWU_MODELS.video).toContain('veo3.1');
+    // the video list is no longer a dead constant — it has a producer (2.0)
+    expect(YUNWU_VIDEO_MODELS).toBe(YUNWU_MODELS.video);
   });
 });
 
@@ -47,10 +52,22 @@ describe('createYunwu unified client — one base URL, every surface', () => {
       modelId: 'flux-2-pro',
       surface: 'images',
     });
+    expect(y.video('sora-2')).toMatchObject({
+      provider: 'yunwu',
+      modelId: 'sora-2',
+      surface: 'video',
+    });
     expect(y.embedding('text-embedding-3-large')).toMatchObject({
       provider: 'yunwu',
       surface: 'openai-embeddings',
     });
+  });
+
+  it('video surface hits {root}/v1/videos', async () => {
+    const { fetch, calls } = urlSpy({ id: 'vid_1', status: 'queued' });
+    const y = createYunwu({ apiKey: 'sk-y', fetch });
+    await submitVideo({ model: y.video('sora-2'), prompt: 'a robot', seconds: 8 });
+    expect(calls[0]).toBe('https://yunwu.ai/v1/videos');
   });
 
   it('image surface hits {root}/v1/images/generations', async () => {
@@ -78,6 +95,13 @@ describe('createYunwu unified client — one base URL, every surface', () => {
     expect(calls[0]).toBe('https://my-mirror.example.com/v1/images/generations'); // no /v1/v1
     expect(y.mj().baseURL).toBe('https://my-mirror.example.com');
   });
+
+  it('CREATIVE base URL also drives the video surface', async () => {
+    const { fetch, calls } = urlSpy({ id: 'vid_1', status: 'queued' });
+    const y = createYunwu({ apiKey: 'sk-y', baseURL: 'https://my-mirror.example.com/v1/', fetch });
+    await submitVideo({ model: y.video('kling-2.6'), prompt: 'x' });
+    expect(calls[0]).toBe('https://my-mirror.example.com/v1/videos');
+  });
 });
 
 describe('standalone Yunwu factories', () => {
@@ -92,6 +116,14 @@ describe('standalone Yunwu factories', () => {
       prompt: 'x',
     });
     expect(calls[0]).toBe('https://yunwu.ai/v1/images/generations');
+  });
+  it('createYunwuVideo default base URL → /v1/videos', async () => {
+    const { fetch, calls } = urlSpy({ id: 'vid_1', status: 'queued' });
+    await submitVideo({
+      model: createYunwuVideo({ apiKey: 'k', fetch })('veo3.1'),
+      prompt: 'x',
+    });
+    expect(calls[0]).toBe('https://yunwu.ai/v1/videos');
   });
   it('createYunwuEmbedding → openai-embeddings surface', () => {
     const m = createYunwuEmbedding({ apiKey: 'k' })('text-embedding-3-small');

@@ -47,6 +47,20 @@ export interface ProviderConfig {
    * (`{ provider, modelId, surface }`) stays locked.
    */
   capabilities?: Partial<ModelCapabilities>;
+  /**
+   * KEYLESS local hosts (2.0): Ollama / LM Studio / vLLM speak the OpenAI wire
+   * but authenticate nothing, so the G1 chain's terminal `AuthenticationError`
+   * — correct for every cloud provider — is pure friction there.
+   *
+   * Set by `createOllama`/`createLMStudio` (and opt-in on
+   * `createOpenAICompatible`), it changes ONE thing in `resolve-call.ts`: when
+   * every link of the precedence chain came up empty, the resolver substitutes
+   * a placeholder key instead of throwing. The chain itself is untouched —
+   * `deps.keyProvider` → factory config → `ClientConfig.apiKeys` still resolve
+   * in exactly that order, and a real key from any of them still wins. The
+   * sentinel only ever fills a hole that would otherwise have ended the call.
+   */
+  apiKeyOptional?: boolean;
 }
 
 const CONFIG = Symbol('deuz.providerConfig');

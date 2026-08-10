@@ -43,6 +43,19 @@ export interface AgentCheckpoint {
   pendingApprovals?: ToolApprovalRequest[];
   /** Sub-agent path of the checkpointed loop (absent at the root). */
   agentPath?: string[];
+  /**
+   * Active-agent transfer state (2.0 additive), present only once a `handoff()`
+   * tool has fired: `to` is the agent currently driving the run and `count` is
+   * how many transfers it took to get there (the `maxHandoffs` budget). The
+   * resume leg RE-APPLIES the overlay — target instructions, tool set, model —
+   * before the first step, so a run continues as the agent it was suspended in
+   * rather than snapping back to the root.
+   *
+   * Absent on every checkpoint written before 2.0 and on every run that never
+   * handed off; `serializeCheckpoint`/`deserializeCheckpoint` carry it through
+   * untouched, so old checkpoints load unchanged.
+   */
+  handoff?: { to: string; count: number };
   /** `deps.clock.now()` at save time. */
   createdAt: number;
 }

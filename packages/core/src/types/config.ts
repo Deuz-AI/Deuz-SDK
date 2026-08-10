@@ -11,9 +11,16 @@ import type {
   ToolApprovalResponse,
 } from './tool';
 import type { DurableSessionOptions } from './session';
+import type { Guardrails } from './guardrails';
 import type { ChatPersistOptions } from '../chat';
 import type { MemoryCallOptions } from '../memory';
 import type { ApprovalSigner } from '../durable';
+// TYPE-ONLY (see the note below on the registry import): `mcp/shared.ts` has a
+// real runtime body — the SDK wrapper — but `import type` is erased under
+// `verbatimModuleSyntax`, so `CommonCallOptions.mcp` accepting a live
+// `McpClient` costs the core bundle NOTHING. The loop reaches the MCP code
+// through a dynamic import; this seam is types only.
+import type { McpClient, McpElicitationHandler } from '../mcp/shared';
 // TYPE-ONLY, and deliberately outward: `types/` already reaches into `../chat`,
 // `../memory` and `../durable` above, so importing the capability row from the
 // registry is consistent with the existing shape. `import type` is fully erased
@@ -48,6 +55,22 @@ export interface CompactionPolicy {
   layers?: CompactionLayer[];
   /** Model used for the summarize layer. Default: the loop's own model. */
   summarizeModel?: LanguageModel;
+  /**
+   * REAL tokenizer hook (2.0 additive). Without it the loop sizes history with
+   * a character heuristic that self-calibrates against provider-reported usage
+   * (an EMA over `inputTokens / chars`) — good enough to trigger at 92% fill,
+   * but it is still a guess on the FIRST call of a run, and it is worst exactly
+   * where it matters: code, CJK, and base64-ish tool output.
+   *
+   * Supply a counter (`gpt-tokenizer`, `tiktoken`, `@anthropic-ai/tokenizer`, a
+   * provider `countTokens` endpoint wrapper) and it becomes the BASE estimate
+   * instead. The EMA calibration keeps running ON TOP of it — a tokenizer for
+   * the wrong model family is still off by a constant factor, and correcting
+   * that is exactly what the EMA is for. Kept synchronous on purpose: it runs
+   * once per step inside the compaction check, and an async hook there would
+   * put a network round-trip on the hot path of every step.
+   */
+  countTokens?: (messages: Message[]) => number;
 }
 
 /** `'auto'` = all defaults. */
@@ -79,6 +102,8 @@ export interface VerifyStepContext {
   messages: Message[];
   /** Cumulative REAL usage so far (all steps, sub-agents included). */
   usage: Usage;
+  /** The call's opaque `runtimeContext` (2.0 additive), forwarded untouched. */
+  runtimeContext?: unknown;
 }
 
 /**
@@ -120,6 +145,8 @@ export interface DoneWhenContext {
   usage: Usage;
   /** Index of the step that just completed. */
   stepIndex: number;
+  /** The call's opaque `runtimeContext` (2.0 additive), forwarded untouched. */
+  runtimeContext?: unknown;
 }
 
 /**
@@ -128,6 +155,135 @@ export interface DoneWhenContext {
  * See `doneWhen` on {@link CommonCallOptions} for the full contract.
  */
 export type DoneWhen = (ctx: DoneWhenContext) => boolean | Promise<boolean>;
+
+// ===================================================================
+// MCP OAuth (2.0) — the seam types live HERE, not in `../mcp/auth`
+// ===================================================================
+
+/**
+ * Where OAuth tokens are persisted between runs. Deliberately the smallest
+ * possible surface (a scoped key/value map) so a `Map`, `localStorage`, a
+ * Supabase row, or `createFileTokenStore` (`./mcp/node`) all satisfy it without
+ * an adapter. Every method may be sync or async.
+ *
+ * SECURITY: the values are live refresh tokens. A file-backed store must create
+ * the file `0600`; a browser-backed one is only appropriate for a server the
+ * user alone controls.
+ */
+export interface TokenStore {
+  get(key: string): Promise<string | undefined> | string | undefined;
+  set(key: string, value: string): Promise<void> | void;
+  delete(key: string): Promise<void> | void;
+}
+
+/**
+ * Options for `createOAuthProvider` (`./mcp`) — the thin adaptor over the MCP
+ * SDK's own OAuth machinery (PKCE S256, RFC 8414 discovery, RFC 7591 dynamic
+ * client registration, refresh). Defined on THIS module rather than
+ * `../mcp/auth` so `types/config.ts` can type `McpHttpLoopConfig.auth` without
+ * importing the implementation module — `mcp/auth.ts` imports these back from
+ * here, which keeps the dependency one-directional.
+ */
+export interface McpOAuthOptions {
+  /** Where the authorization server sends the user back. Must match the registered client. */
+  redirectUri: string;
+  /** Pre-registered client id. Omit to let dynamic client registration (RFC 7591) mint one. */
+  clientId?: string;
+  /** Confidential-client secret. Omit for public clients (the PKCE case). */
+  clientSecret?: string;
+  /** Space-separated scopes to request. */
+  scope?: string;
+  /** Extra fields for the dynamic-registration request body. */
+  clientMetadata?: Record<string, unknown>;
+  /** Token persistence. Default: an in-memory store (tokens die with the process). */
+  store?: TokenStore;
+  /** Called with the authorization URL instead of throwing — open a browser, print it, … */
+  onRedirect?: (url: URL) => void | Promise<void>;
+}
+
+/**
+ * The object `createOAuthProvider` returns. `provider` is the raw SDK
+ * `OAuthClientProvider` the transport consumes — typed `unknown` so core never
+ * depends on the optional peer's types; pass it through, do not inspect it.
+ *
+ * Flow: a first connect without tokens throws `McpAuthorizationRequiredError`
+ * carrying `authorizationUrl()`; after the user consents, hand the code to
+ * `createMcpClient({ ..., authorizationCode })` (or call `completeAuth`).
+ */
+export interface DeuzOAuthProvider {
+  /** The SDK-side `OAuthClientProvider` instance. Opaque — hand it to the transport. */
+  readonly provider: unknown;
+  /** The URL to send the user to, once discovery/registration has produced one. */
+  authorizationUrl(): URL | undefined;
+  /** Exchange the authorization code for tokens and persist them. */
+  completeAuth(code: string): Promise<void>;
+  /** Current tokens, if any (refreshed on demand by the SDK). */
+  tokens(): Promise<Record<string, unknown> | undefined>;
+  /** Drop the stored tokens — forces a fresh authorization on the next connect. */
+  invalidate(): Promise<void>;
+}
+
+// ===================================================================
+// Zero-config MCP (2.0) — what `CommonCallOptions.mcp` accepts
+// ===================================================================
+
+/** An MCP server reachable over HTTP (streamable-HTTP, or legacy SSE via `type`). */
+export interface McpHttpLoopConfig {
+  url: string;
+  /** Transport flavor. Default `'http'` (streamable-HTTP); `'sse'` for legacy servers. */
+  type?: 'http' | 'sse';
+  /** Static headers for every request (a bearer token, a tenant id, …). */
+  headers?: Record<string, string>;
+  /**
+   * OAuth. Pass {@link McpOAuthOptions} to have the loop build a provider, or a
+   * {@link DeuzOAuthProvider} you already created and shared across servers.
+   */
+  auth?: McpOAuthOptions | DeuzOAuthProvider;
+  /**
+   * Tool-name prefix (`${namespace}_${tool}`). Default: no prefix for a single
+   * entry, else the server's sanitized `serverInfo.name`, else `mcp{N}`.
+   */
+  namespace?: string;
+  /** Handle server-initiated `elicitation/create` requests — see `McpClientOptions`. */
+  onElicitationRequest?: McpElicitationHandler;
+}
+
+/** An MCP server launched as a child process (Node only — `./mcp/stdio`). */
+export interface McpStdioLoopConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  /** Tool-name prefix — see {@link McpHttpLoopConfig.namespace}. */
+  namespace?: string;
+}
+
+/** An ALREADY-CONNECTED client, with an explicit namespace. Never closed by the loop. */
+export interface McpClientLoopEntry {
+  client: McpClient;
+  namespace?: string;
+}
+
+/**
+ * One entry of `CommonCallOptions.mcp`. A config object is connected (and
+ * CLOSED) by the run; a live {@link McpClient} — bare or wrapped in
+ * {@link McpClientLoopEntry} — is borrowed and NEVER closed, because the caller
+ * owns its lifetime.
+ */
+export type McpLoopEntry = McpHttpLoopConfig | McpStdioLoopConfig | McpClientLoopEntry | McpClient;
+
+export type {
+  Guardrails,
+  GuardrailBaseContext,
+  InputGuardrailContext,
+  OutputGuardrailContext,
+  ToolCallGuardrailContext,
+  InputGuardrailResult,
+  OutputGuardrailResult,
+  ToolCallGuardrailResult,
+  InputGuardrail,
+  OutputGuardrail,
+  ToolCallGuardrail,
+} from './guardrails';
 
 /**
  * Options common to every call. `signal` and `maxRetries` are locked NOW —
@@ -278,6 +434,8 @@ export interface CommonCallOptions {
     messages: Message[];
     /** Cumulative REAL usage so far (all prior steps, sub-agents included). */
     usage: Usage;
+    /** The call's opaque `runtimeContext` (2.0 additive), forwarded untouched. */
+    runtimeContext?: unknown;
   }) => PrepareStepResult | undefined | Promise<PrepareStepResult | undefined>;
   /**
    * Static tool filter: only these `tools` keys are sent to the model (all
@@ -426,13 +584,62 @@ export interface CommonCallOptions {
   approvalSigner?: ApprovalSigner;
   /** Max accepted age for approval tokens on resume (ms; default: unlimited). */
   approvalMaxAgeMs?: number;
+  /**
+   * Zero-config MCP (2.0 additive): name the servers and the loop does the rest
+   * — connect, `listTools()`, namespace the names, merge them into `tools`,
+   * hot-refresh on a `tools/list_changed` notification, and close whatever IT
+   * opened when the run ends. A live {@link McpClient} you pass in is borrowed,
+   * never closed. Explicit `tools` ALWAYS win a name collision.
+   *
+   * The MCP code is reached through a dynamic import, so a call without this
+   * option pulls none of it into the bundle. `generateObject`/`streamObject`
+   * REJECT it (they are single-shot by design); a call that sets only `mcp`,
+   * with no `tools` of its own, still routes through the agentic loop.
+   */
+  mcp?: McpLoopEntry[];
+  /**
+   * Opaque per-call context (2.0 additive) threaded, UNTOUCHED, into every hook
+   * that can act on it: `ToolExecuteContext.runtimeContext`, `prepareStep`,
+   * `verifyStep`, `doneWhen`, and all three guardrail hooks. Sub-agents
+   * (`agentTool`) inherit it.
+   *
+   * It exists so the request-scoped facts a tool needs — the tenant, the signed-
+   * in user, a DB handle, a trace id — travel with the CALL instead of being
+   * captured in a closure, which is what forces callers to rebuild their whole
+   * `ToolSet` per request today. The SDK never reads, copies, or serializes it:
+   * it does NOT reach checkpoints, chat records, or observation events, so a
+   * live connection or a secret is safe to put here.
+   */
+  runtimeContext?: unknown;
+  /**
+   * Guardrails (2.0 additive): pass/block/rewrite hooks on the run's input, on
+   * each tool call, and on the final output. See {@link Guardrails} for the
+   * ordering, chaining and short-circuit rules. Built-ins ship on
+   * `@deuz-sdk/core/guardrails`.
+   */
+  guardrails?: Guardrails;
 }
 
 /** Shared client configuration; pre-binds api keys + deps for the convenience client. */
 export interface ClientConfig {
+  /**
+   * Keys by provider id, the LOWEST link of the G1 precedence chain
+   * (`deps.keyProvider` → factory config → here).
+   *
+   * The six named providers are kept as a closed `Partial<Record<…>>` purely
+   * for autocomplete and typo-catching on the ones that existed at 1.0; the
+   * index signature (2.0 additive) opens it to everything that came after —
+   * the 2.0 provider factories (`ollama`, `perplexity`, `cohere`, `deepinfra`,
+   * `nvidia`, `sambanova`, `hyperbolic`, `lmstudio`, any
+   * `createOpenAICompatible` id) and the modality providers
+   * (`elevenlabs`, `deepgram`, …), which resolve their key through the SAME
+   * chain and were previously unreachable from a `createClient` config.
+   */
   apiKeys?: Partial<
     Record<'anthropic' | 'openai' | 'xai' | 'google' | 'azure' | 'bedrock', string>
-  >;
+  > & {
+    [provider: string]: string | undefined;
+  };
   baseUrls?: Partial<Record<string, string>>;
   deps?: Dependencies;
 }

@@ -112,6 +112,14 @@ export interface CompactionPart {
   layer: CompactionLayer;
   tokensBefore: number;
   tokensAfter: number;
+  /**
+   * What asked for this compaction (2.0 additive; absent = `'threshold'`, the
+   * only trigger before 2.0): `'threshold'` — the estimated fill crossed the
+   * policy's ratio; `'manual'` — an explicit `compactMessages` call;
+   * `'overflow'` — the provider rejected the request as too long and the loop
+   * force-compacted to recover.
+   */
+  trigger?: 'threshold' | 'manual' | 'overflow';
 }
 
 /**
@@ -299,6 +307,57 @@ export interface WarningPart {
   warning: CallWarning;
 }
 
+/**
+ * Control passed from one agent to another (2.0 additive): the model called a
+ * `transfer_to_<name>` tool and the loop swapped the active agent — system
+ * prompt, tool set and model become the target's for every following step.
+ * Emitted once per accepted handoff, before the next `step-start`.
+ *
+ * Adding it to `StreamPart` is legal precisely because the union is documented
+ * as OPEN (see the header of this file): consumers are required to keep a
+ * `default` case, so a new member cannot break an exhaustive switch.
+ */
+export interface HandoffPart {
+  type: 'handoff';
+  /** The agent handing over. Absent on the first handoff out of the root agent. */
+  from?: string;
+  /** The agent taking over. */
+  to: string;
+  /** The `transfer_to_*` call that triggered it — its `tool_result` is still emitted. */
+  toolCallId: string;
+  /** The model's stated reason, when the transfer tool asked for one. */
+  reason?: string;
+  /** Index of the step whose tool batch contained the transfer. */
+  stepIndex: number;
+}
+
+/**
+ * A guardrail fired (2.0 additive): one part per NON-PASS verdict, so a UI can
+ * show that a rule blocked or rewrote something instead of silently receiving
+ * different content than the model produced. Passes emit nothing.
+ *
+ * The same verdicts resolve in bulk on `providerMetadata.deuz.guardrails`.
+ *
+ * Adding it to `StreamPart` is legal precisely because the union is documented
+ * as OPEN (see the header of this file): consumers are required to keep a
+ * `default` case, so a new member cannot break an exhaustive switch.
+ */
+export interface GuardrailPart {
+  type: 'guardrail';
+  /** Which hook produced the verdict. */
+  hook: 'input' | 'output' | 'tool-call';
+  /** Passes are not emitted, so only the two acting verdicts appear here. */
+  action: 'block' | 'rewrite';
+  /** The guardrail's `name`, when it declared one. */
+  name?: string;
+  /** The verdict's stated reason, when given. */
+  reason?: string;
+  /** Set on `hook: 'tool-call'` — the call that was blocked or rewritten. */
+  toolCallId?: string;
+  /** Index of the step being evaluated (absent on the pre-run input hook). */
+  stepIndex?: number;
+}
+
 export type StreamPart =
   | TextDeltaPart
   | ReasoningDeltaPart
@@ -322,4 +381,6 @@ export type StreamPart =
   | FalseFinishPart
   | PlanUpdatePart
   | ActivityPart
-  | WarningPart;
+  | WarningPart
+  | HandoffPart
+  | GuardrailPart;

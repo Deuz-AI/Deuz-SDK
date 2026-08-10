@@ -580,8 +580,14 @@ export interface CheckpointFailedEvent extends ObserveEventBase {
 export interface CompactionObserveEvent extends ObserveEventBase {
   type: 'compaction';
   layer: 'prune-tool-results' | 'prune-reasoning' | 'summarize';
-  /** The only trigger — there is no manual compaction API. */
-  trigger: 'threshold';
+  /**
+   * What asked for this compaction. `'threshold'` — the estimated context fill
+   * crossed the policy's ratio (the only trigger before 2.0). `'manual'` — an
+   * explicit `compactMessages` call (2.0 added the API). `'overflow'` — the
+   * provider rejected the request as too long and the loop force-compacted to
+   * recover the step.
+   */
+  trigger: 'threshold' | 'manual' | 'overflow';
   threshold: number;
   /** Frozen at loop setup from the registry (not re-read per step). */
   contextWindow: number;
@@ -667,7 +673,11 @@ export type ObservedSubsystem =
   | 'rag'
   | 'memory'
   | 'mcp'
-  | 'skills';
+  | 'skills'
+  // 2.0 modalities — same `operation.*` shape as `image`/`embedding`.
+  | 'speech'
+  | 'transcription'
+  | 'video';
 
 export interface OperationStartedEvent extends ObserveEventBase {
   type: 'operation.started';

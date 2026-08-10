@@ -41,7 +41,35 @@ const DEFAULT_BASE_URL: Record<string, string> = {
   qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   glm: 'https://open.bigmodel.cn/api/paas/v4',
   minimax: 'https://api.minimax.io/v1',
+  // 2.0 additions. Perplexity is the odd one out: its root has NO `/v1`
+  // segment — the wire path is `https://api.perplexity.ai/chat/completions`
+  // and the adapter appends `/chat/completions`, so adding `/v1` here would
+  // 404 every call.
+  perplexity: 'https://api.perplexity.ai',
+  cohere: 'https://api.cohere.ai/compatibility/v1',
+  deepinfra: 'https://api.deepinfra.com/v1/openai',
+  nvidia: 'https://integrate.api.nvidia.com/v1',
+  sambanova: 'https://api.sambanova.ai/v1',
+  hyperbolic: 'https://api.hyperbolic.xyz/v1',
+  // Keyless local hosts (see `apiKeyOptional` below). The ports are the
+  // upstream defaults; a user on a custom port passes `baseURL`.
+  ollama: 'http://localhost:11434/v1',
+  lmstudio: 'http://localhost:1234/v1',
 };
+
+/**
+ * Placeholder sent as the bearer token for KEYLESS local hosts (2.0). Ollama,
+ * LM Studio and a default vLLM serve the OpenAI wire with no authentication at
+ * all, yet the wire still carries an `Authorization` header — so *something*
+ * has to go in it.
+ *
+ * This is NOT a hole in G1. It is substituted at exactly one point: after the
+ * whole precedence chain (`deps.keyProvider` → factory `apiKey` →
+ * `ClientConfig.apiKeys`) came up empty, and only when the factory opted in via
+ * `apiKeyOptional`. A real key from ANY link still wins, and a cloud provider
+ * — which never sets the flag — still gets the `AuthenticationError`.
+ */
+const NO_KEY_SENTINEL = 'sk-no-key';
 
 export interface ResolveCallInput {
   model: LanguageModel;
@@ -74,7 +102,8 @@ export function resolveSignal(options: {
  * Merge factory settings (symbol), deps, and client config into a `ResolvedCall`.
  * Async because `keyProvider.getKey` may be async. Key precedence (G1):
  *   deps.keyProvider (if the user actually supplied one) >
- *   factory `apiKey` > ClientConfig.apiKeys[provider] > throw.
+ *   factory `apiKey` > ClientConfig.apiKeys[provider] > throw
+ *   (or, for an `apiKeyOptional` factory, {@link NO_KEY_SENTINEL}).
  */
 export async function resolveCall(input: ResolveCallInput): Promise<ResolvedCall> {
   const { model, deps, headers, clientContext } = input;
@@ -90,10 +119,17 @@ export async function resolveCall(input: ResolveCallInput): Promise<ResolvedCall
   if (!apiKey)
     apiKey = clientContext?.apiKeys?.[provider as keyof NonNullable<ClientContext['apiKeys']>];
   if (!apiKey) {
-    throw new AuthenticationError({
-      message: `No API key for provider '${provider}'. Pass it to the factory (e.g. create${provider}({ apiKey })), via ClientConfig.apiKeys, or a deps.keyProvider.`,
-      provider,
-    });
+    // Keyless local host (2.0): fill the hole the chain left instead of ending
+    // the call. Reached ONLY when every link above returned nothing, so this
+    // can never shadow a user-supplied key.
+    if (config?.apiKeyOptional) {
+      apiKey = NO_KEY_SENTINEL;
+    } else {
+      throw new AuthenticationError({
+        message: `No API key for provider '${provider}'. Pass it to the factory (e.g. create${provider}({ apiKey })), via ClientConfig.apiKeys, or a deps.keyProvider.`,
+        provider,
+      });
+    }
   }
 
   // --- baseURL (precedence: factory > ClientConfig.baseUrls > wire default) ---

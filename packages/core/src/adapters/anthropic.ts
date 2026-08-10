@@ -7,6 +7,7 @@ import type { DeuzError } from '../errors';
 import {
   APICallError,
   AuthenticationError,
+  ContextOverflowError,
   InvalidRequestError,
   ModelNotFoundError,
   OverloadedError,
@@ -459,6 +460,18 @@ async function* parseStream(
 
 // --- error mapping ---
 
+/**
+ * Anthropic has no machine-readable code for "the history no longer fits": an
+ * over-long prompt comes back as a plain 400 `invalid_request_error` whose
+ * MESSAGE is the only signal ("prompt is too long: 210000 tokens > 200000
+ * maximum"), and an oversized body as a 413 `request_too_large`. Both mean the
+ * same thing to a caller, and mapping them to `ContextOverflowError` (2.0) is
+ * what lets the loop's overflow recovery force a compaction and retry instead
+ * of failing the run — the OpenAI-compatible wire has had that since it ships
+ * `context_length_exceeded` as a code.
+ */
+const CONTEXT_OVERFLOW_RE = /prompt is too long|exceed.*context|input length.*maximum/i;
+
 function mapError(status: number, body: unknown, headers: Headers): DeuzError {
   const envelope = (body ?? {}) as {
     error?: { type?: string; message?: string };
@@ -469,6 +482,12 @@ function mapError(status: number, body: unknown, headers: Headers): DeuzError {
   const requestId = headers.get('request-id') ?? envelope.request_id ?? undefined;
   const retryAfterMs = parseRetryAfterMs(headers.get('retry-after'));
   const base = { message, provider: 'anthropic', requestId, upstreamType: errType, retryAfterMs };
+
+  // Ahead of the `errType` switch: both shapes below would otherwise land on
+  // `request_too_large`/`invalid_request_error` and lose the overflow signal.
+  if (status === 413 || (status === 400 && CONTEXT_OVERFLOW_RE.test(message))) {
+    return new ContextOverflowError({ ...base, statusCode: status });
+  }
 
   switch (errType) {
     case 'authentication_error':

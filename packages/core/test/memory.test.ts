@@ -17,11 +17,13 @@ import {
   formatMemoriesForPrompt,
   createMemoryTools,
   createInMemoryMemoryStore,
+  memoryEmbedderFromRag,
   type MemorySeams,
   type MemoryLLM,
   type MemoryRecord,
   type Embedder,
 } from '../src/memory';
+import type { Embedder as RagEmbedder } from '../src/rag';
 import { InvalidRequestError } from '../src/errors';
 
 // --- deterministic seam doubles ---
@@ -366,6 +368,37 @@ describe('createMemoryTools (model-driven write path)', () => {
 
     await tools.memory_delete!.execute!({ id: appended.id }, ctx);
     expect(await s.store.list({ userId: 'u1' })).toHaveLength(0);
+  });
+});
+
+describe('memoryEmbedderFromRag (the rag ↔ memory seam bridge)', () => {
+  const ragEmbedder: RagEmbedder = {
+    dims: 2,
+    embed: async (texts) => texts.map((_, i) => [i, 1 - i]),
+  };
+
+  it('adapts the shape and pins the model id (falling back to "unknown")', async () => {
+    const named = memoryEmbedderFromRag(ragEmbedder, { modelId: 'text-embedding-3-small' });
+    expect(await named.embed(['a', 'b'], 'add')).toEqual({
+      vectors: [
+        [0, 1],
+        [1, 0],
+      ],
+      model: 'text-embedding-3-small',
+    });
+    expect((await memoryEmbedderFromRag(ragEmbedder).embed(['a'], 'search')).model).toBe('unknown');
+  });
+
+  it('drives remember() end-to-end — one embedder now backs RAG and memory', async () => {
+    const llm: MemoryLLM = async ({ system }) =>
+      system.includes('extract durable')
+        ? '{"facts":["likes hiking"]}'
+        : '{"memory":[{"event":"ADD","text":"likes hiking"}]}';
+    const s = seams({ llm, embedder: memoryEmbedderFromRag(ragEmbedder, { modelId: 'rag-emb' }) });
+    const muts = await remember([{ role: 'user', content: 'I love hiking' }], { userId: 'u1' }, s);
+    const rec = (muts[0] as { record: MemoryRecord }).record;
+    expect(rec.embedding).toEqual([0, 1]);
+    expect(rec.embeddingModelId).toBe('rag-emb');
   });
 });
 

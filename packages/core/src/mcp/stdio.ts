@@ -1,9 +1,32 @@
 import { InvalidRequestError } from '../errors';
-import { wrapMcpClient, type McpClient, type RawMcpClient } from './shared';
-import { registerElicitation } from './index';
-import type { McpElicitationHandler } from './shared';
+import {
+  createManagedConnection,
+  createRootsBox,
+  wrapMcpClient,
+  attachRoots,
+  type RawMcpClient,
+} from './shared';
+import { registerElicitation, registerSamplingAndRoots, registerToolListChanged } from './index';
+import type {
+  McpClientHooks,
+  McpElicitationHandler,
+  McpLifecycleOptions,
+  McpRootsBox,
+  McpRootsClient,
+  McpRootsOption,
+  McpSamplingOptions,
+} from './shared';
 
-export type { McpClient } from './shared';
+export type {
+  McpClient,
+  McpConnectionStatus,
+  McpLifecycleOptions,
+  McpReconnectPolicy,
+  McpRootsClient,
+  McpRootsOption,
+  McpSamplingOptions,
+  McpStatusInfo,
+} from './shared';
 
 /**
  * Node-only stdio MCP transport (spawns a child process, e.g. `npx -y
@@ -11,7 +34,7 @@ export type { McpClient } from './shared';
  * the edge core never pulls in node builtins. `@modelcontextprotocol/sdk` is an
  * optional peer, imported lazily.
  */
-export interface McpStdioOptions {
+export interface McpStdioOptions extends McpLifecycleOptions {
   command: string;
   args?: string[];
   env?: Record<string, string>;
@@ -19,6 +42,10 @@ export interface McpStdioOptions {
   version?: string;
   /** See `McpClientOptions.onElicitationRequest` — same semantics over stdio. */
   onElicitationRequest?: McpElicitationHandler;
+  /** See `McpClientOptions.sampling` — same semantics over stdio. */
+  sampling?: McpSamplingOptions;
+  /** See `McpClientOptions.roots` — same semantics over stdio. */
+  roots?: McpRootsOption;
 }
 
 async function loadSdk(): Promise<{
@@ -42,18 +69,56 @@ async function loadSdk(): Promise<{
   }
 }
 
-export async function createStdioMcpClient(options: McpStdioOptions): Promise<McpClient> {
-  const { Client, StdioClientTransport } = await loadSdk();
-  const transport = new StdioClientTransport({
-    command: options.command,
-    args: options.args ?? [],
-    ...(options.env ? { env: options.env } : {}),
-  });
+/** Read a roots box through its function form — see {@link makeStdioClient}. */
+function readRootsBox(box: McpRootsBox): string[] | Promise<string[]> {
+  return typeof box.value === 'function' ? box.value() : box.value;
+}
+
+/**
+ * Build ONE fresh, unconnected `Client` with every handler already registered —
+ * the stdio twin of `mcp/index.ts`'s factory, and for the same reason: a
+ * reconnect calls it again, so every handler comes back with the new session.
+ */
+async function makeStdioClient(
+  options: McpStdioOptions,
+  hooks: McpClientHooks,
+  rootsBox: McpRootsBox | undefined,
+): Promise<RawMcpClient> {
+  const { Client } = await loadSdk();
   const client = new Client(
     { name: options.name ?? 'deuz', version: options.version ?? '0.0.0' },
-    { capabilities: options.onElicitationRequest ? { elicitation: { form: {}, url: {} } } : {} },
+    {
+      capabilities: {
+        ...(options.onElicitationRequest ? { elicitation: { form: {}, url: {} } } : {}),
+        ...(options.sampling ? { sampling: {} } : {}),
+        ...(options.roots ? { roots: { listChanged: true } } : {}),
+      },
+    },
   );
   if (options.onElicitationRequest) await registerElicitation(client, options.onElicitationRequest);
-  await client.connect(transport);
-  return wrapMcpClient(client);
+  await registerSamplingAndRoots(client, {
+    ...(options.sampling ? { sampling: options.sampling } : {}),
+    // One box for the life of the client so `setRoots()` survives a reconnect.
+    ...(rootsBox ? { roots: () => readRootsBox(rootsBox) } : {}),
+  });
+  await registerToolListChanged(client, hooks.toolListChanged);
+  return client;
+}
+
+export async function createStdioMcpClient(options: McpStdioOptions): Promise<McpRootsClient> {
+  const rootsBox = options.roots !== undefined ? createRootsBox(options.roots) : undefined;
+  const managed = await createManagedConnection({
+    makeClient: (hooks) => makeStdioClient(options, hooks, rootsBox),
+    // A reconnect RESPAWNS the child process: the old one died with the pipe.
+    makeTransport: async () => {
+      const { StdioClientTransport } = await loadSdk();
+      return new StdioClientTransport({
+        command: options.command,
+        args: options.args ?? [],
+        ...(options.env ? { env: options.env } : {}),
+      });
+    },
+    lifecycle: options,
+  });
+  return attachRoots(wrapMcpClient(managed.raw(), managed), managed.raw(), rootsBox, managed);
 }
