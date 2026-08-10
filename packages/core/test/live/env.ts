@@ -43,3 +43,31 @@ export function key(name: string): string | undefined {
 export function fingerprint(secret: string): string {
   return `…${secret.slice(-4)}`;
 }
+
+/**
+ * Run `fn`, but treat a provider quota as a skip rather than a failure.
+ *
+ * A 429 says the account ran out of allowance, which is a fact about the key and
+ * not evidence the SDK is wrong — free tiers hand them out readily, and several
+ * suites sharing one key will trip them. Anything else propagates: an auth
+ * error, a malformed request or a bad mapping still has to fail loudly, because
+ * those are exactly what these tests exist to catch.
+ */
+export async function skipOnQuota(
+  ctx: { skip: () => void },
+  fn: () => Promise<void>,
+): Promise<void> {
+  try {
+    await fn();
+  } catch (error) {
+    const code = (error as { code?: string } | undefined)?.code;
+    const status = (error as { statusCode?: number } | undefined)?.statusCode;
+    if (code === 'rate_limit' || status === 429) {
+      // eslint-disable-next-line no-console
+      console.warn('[live] skipped: provider returned 429 (quota), not an SDK failure');
+      ctx.skip();
+      return;
+    }
+    throw error;
+  }
+}
