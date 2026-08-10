@@ -50,7 +50,6 @@ These extend `DeuzError` directly (no `statusCode`/`isRetryable`):
 | `NoObjectGeneratedError` | `no_object_generated` | `text?: string` | `generateObject` could not produce a valid object after one repair |
 | `UnsupportedCapabilityError` | `unsupported_capability` | `provider`, `capability`, `modelId?` | A model lacks a requested capability. Thrown **before** any network call |
 | `ToolExecutionError` | `tool_execution` | `toolName`, `toolCallId?` | A tool function threw during the agentic loop |
-| `NotImplementedError` | `not_implemented` | — | A feature is not yet implemented |
 
 `ToolExecutionError` is created internally but, in the agentic loop, it is **not thrown** — the error message is fed back to the model as an `is_error` tool result so the model can self-correct. See [The Tool Loop](/docs/agents/tool-loop).
 

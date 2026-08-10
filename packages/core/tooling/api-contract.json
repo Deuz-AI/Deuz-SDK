@@ -164,7 +164,6 @@
     "ModelSurface",
     "NetworkError",
     "NoObjectGeneratedError",
-    "NotImplementedError",
     "ObservationCaptureOptions",
     "ObservationLimits",
     "ObservationOptions",

@@ -1,5 +1,31 @@
 # @deuz-sdk/core
 
+## 2.0.0
+
+### Major Changes
+
+- Memory, compaction, and MCP become first-class; 8 more providers; speech, transcription, and video.
+
+  **Memory that survives the session.** Facts are deduplicated by hash at write time, scored for importance by the model that extracted them, swept when they expire, and reachable through `[[wikilink]]` graph expansion. `recall` finally honors `scorer`, `maxChars`, and `expandLinks` — `maxChars` was never passed before, so the recall block was unbounded and uncounted against the context budget. `writePolicy` decides when the loop writes; `memoryEmbedderFromRag` bridges the two embedder seams.
+
+  **Compaction that folds instead of stacking.** Repeated summaries merge into one running block. `compactMessages()` exposes the layers to callers who own their history. `countTokens` accepts a real tokenizer. And a provider that rejects a request as too long now triggers one forced pass and a retry, instead of failing the run.
+
+  **Production stores.** SQLite (`node:sqlite`, or any better-sqlite3-compatible handle you inject), Redis, and Postgres — each implementing the memory, chat, session, and run stores against one shared conformance suite, so a divergence between backends is a test failure rather than a surprise in production.
+
+  **MCP you can rely on.** OAuth 2.0 with PKCE, discovery, dynamic registration, and refresh, behind a `TokenStore` seam with file and loopback helpers for Node. Connections reconnect with backoff, report status, and invalidate their tool cache on `tools/list_changed`. Servers can drive sampling through your own model behind an approval gate, and read roots. `options.mcp` connects servers for a call, namespaces their tools, and closes only what it opened.
+
+  **Agent controls.** `handoff()` transfers the conversation to another agent — system prompt, tools, and model swap for the rest of the run, and a checkpoint replays it. `guardrails` can pass, block, or rewrite on input, tool calls, and output; a blocked tool call self-heals through the existing denial path instead of ending the run. `runtimeContext` threads a typed value to tools, hooks, and sub-agents.
+
+  **Providers and modalities.** Ollama, LM Studio, Perplexity, Cohere, DeepInfra, Nvidia NIM, SambaNova, and Hyperbolic. The two local hosts need no API key, without weakening the key-precedence chain. `generateSpeech`, `transcribe`, and `generateVideo` are new, the last giving the Yunwu video model list a producer at last.
+
+  ### Breaking changes
+  - **`NotImplementedError` is removed.** It was never thrown — a leftover from the pre-1.0 scaffolding. Delete the import; nothing else changes.
+  - **`ObservedSubsystem` and the compaction `trigger` union gained members** (`speech`/`transcription`/`video`, and `manual`/`overflow`). An exhaustive `switch` over either needs a new case.
+  - **The streaming `compaction` part always carries `trigger`**, where it used to be absent.
+  - **`generateObject` / `streamObject` now reject `mcp`, `guardrails`, and `doneWhen`** instead of silently ignoring them, the same way 1.9 made the other loop options loud.
+
+  The `Part` union stays at five members: audio and documents ride `filePart()` with a media type, and a sixth kind would break every exhaustive switch for a wire none of the providers offer.
+
 ## 1.9.0
 
 ### Minor Changes

@@ -51,13 +51,7 @@ export type {
   CreateApprovalSignerOptions,
   ApprovalSigner,
 } from './durable';
-export {
-  DeuzError,
-  isDeuzError,
-  NotImplementedError,
-  NoObjectGeneratedError,
-  BreakerOpenError,
-} from './errors';
+export { DeuzError, isDeuzError, NoObjectGeneratedError, BreakerOpenError } from './errors';
 export type { DeuzErrorJSON } from './errors';
 // Chat engine (1.7 additive, P2+P6) — pure reducers + ChatStore seam.
 // 1.9 adds the inverse projection (canonicalFromUI), the tail seal, and the

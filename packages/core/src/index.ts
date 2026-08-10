@@ -1,7 +1,9 @@
 /**
  * `@deuz-sdk/core` — pure, web-first, multi-provider AI SDK.
- * Public surface lock (1.0). Faz 0: types are final, methods are stubs that
- * throw NotImplementedError until Faz 1.
+ *
+ * This file IS the public surface: `tooling/api-contract.json` locks every name
+ * exported here, so an accidental removal fails the release gate instead of a
+ * consumer's build.
  */
 
 // Canonical free functions.
@@ -42,8 +44,10 @@ export { tool } from './tool';
 export type { InferToolInput, InferToolOutput } from './tool';
 
 // Content-part constructors (1.9 additive). `ImagePart` is the carrier for ALL
-// binary media until the `file` Part kind lands in 2.0, so a PDF is an image
-// part with `mediaType: 'application/pdf'` — correct but undiscoverable.
+// binary media, so a PDF is an image part with `mediaType: 'application/pdf'` —
+// correct but undiscoverable, which is what these two names are for. 2.0 kept
+// the Part union at five members deliberately: no wire we speak needs a sixth,
+// and adding one breaks every exhaustive switch a consumer wrote.
 export { filePart, imagePart } from './parts';
 
 // Capability matrix read accessor (1.9 additive) — gate UI on capabilities
@@ -59,7 +63,6 @@ export type { DeuzClient } from './client';
 export {
   DeuzError,
   isDeuzError,
-  NotImplementedError,
   APICallError,
   NetworkError,
   RateLimitError,

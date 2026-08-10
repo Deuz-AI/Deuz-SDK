@@ -93,14 +93,6 @@ export class BreakerOpenError extends DeuzError {
   }
 }
 
-export class NotImplementedError extends DeuzError {
-  readonly code = 'not_implemented';
-
-  constructor(feature: string) {
-    super(`'${feature}' is not implemented yet.`);
-  }
-}
-
 export interface APICallErrorOptions {
   message: string;
   /** HTTP status code from the upstream provider. */
