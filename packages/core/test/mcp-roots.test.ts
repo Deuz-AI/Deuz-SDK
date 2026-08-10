@@ -18,9 +18,10 @@
  *   handler (installed once, before connect) now reads the new list.
  *
  * Note for anyone extending this: MCP's `RootSchema` requires every `uri` to
- * start with `file://`, so a live server rejects an `https://` root during
- * result validation. Pass-through of non-file schemes is a `normalizeRootUri`
- * property and is pinned in the unit suite instead.
+ * start with `file://`, and `roots/list` is validated as a WHOLE array — so one
+ * `https://` root would make a live server discard all of them. That is why
+ * `createMcpClient`/`setRoots` refuse a non-file scheme up front, which the last
+ * describe pins against the real server (nothing is sent, nothing is lost).
  *
  * Every server and client is torn down in `afterEach`; the fetch swap too.
  */
@@ -273,5 +274,54 @@ describe('setRoots over a real MCP server', () => {
     await expect(client.setRoots(['/x'])).rejects.toThrow(InvalidRequestError);
 
     expect(sentMethods(bodies)).not.toContain('notifications/roots/list_changed');
+  });
+});
+
+// ===================================================================
+// Non-file schemes — refused HERE, because the server refuses ALL of them
+// ===================================================================
+
+describe('non-file roots are refused at the call, not on the wire', () => {
+  it('createMcpClient rejects a non-file scheme with an actionable error', async () => {
+    const server = await startServer();
+
+    const failure = await createMcpClient({
+      transport: { type: 'http', url: server.url },
+      roots: ['/srv/app', 'https://example.com/repo'],
+    }).catch((err: unknown) => err);
+
+    expect(failure).toBeInstanceOf(InvalidRequestError);
+    // Which value, why, and what to pass instead.
+    expect((failure as Error).message).toMatch(/https:\/\/example\.com\/repo/);
+    expect((failure as Error).message).toMatch(/file:\/\/ roots only/);
+    expect((failure as Error).message).toMatch(/pass a filesystem path/);
+  });
+
+  it('is what a live server would have done to the WHOLE list anyway', async () => {
+    const server = await startServer();
+    // Prove the premise rather than assert it: a handler that answers with an
+    // https root fails MCP's result validation, and the good root beside it dies
+    // with it. That total loss is what the eager rejection replaces.
+    await connect(server, { roots: () => ['/srv/app', 'https://example.com/repo'] });
+
+    await expect(server.listClientRoots()).rejects.toThrow();
+    // The reachable roots are still reachable once the bad one is gone.
+    const clean = await startServer();
+    await connect(clean, { roots: ['/srv/app'] });
+    expect(await clean.listClientRoots()).toEqual({ roots: [{ uri: 'file:///srv/app' }] });
+  });
+
+  it('setRoots rejects, sends nothing, and leaves the server on the old list', async () => {
+    const bodies = recordHttp();
+    const server = await startServer();
+    const client = await connect(server, { roots: ['/one'] });
+
+    await expect(client.setRoots(['/two', 'https://example.com/repo'])).rejects.toThrow(
+      InvalidRequestError,
+    );
+
+    expect(sentMethods(bodies)).not.toContain('notifications/roots/list_changed');
+    // Refused BEFORE the swap — `/two` never became visible either.
+    expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///one' }] });
   });
 });

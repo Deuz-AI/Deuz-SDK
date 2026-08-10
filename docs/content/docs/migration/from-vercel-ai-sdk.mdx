@@ -441,8 +441,9 @@ for (const w of (await result.warnings) ?? []) console.warn(w.type, w.setting, w
 
 What does not carry over:
 
-- **`generateText`, `generateObject` and `streamObject` never populate it.** `result.warnings` is `undefined` there. If the ported code reads `warnings` off a buffered result, it loses information silently — port it to `deps.logger.warn` instead.
-- **A `streamChat` with `tools` (or `chat` / `memory` / `verifyStep` / `doneWhen`) reports only its own `activeTools` notices.** A model-level warning — unknown slug, a stripped sampling param, a hosted tool the Chat Completions wire dropped, a dropped document — is raised inside the per-step pump and reaches the log, not the field.
+- **The field is omitted, not empty, when there is nothing to report.** `result.warnings` is `undefined` on a clean call rather than `[]`, so read `(result.warnings ?? [])`.
+- **`useObject` cannot receive one.** The object wire carries no canonical part stream, so a `warning` never crosses it. Read `warnings` server-side on a `streamObject` result.
+- **`clamped-setting` has no producer.** That member of the union ships unused; the unknown-slug `maxOutput` clamp happens per adapter, not centrally.
 
 So during a port, wire a logger regardless:
 

@@ -86,6 +86,15 @@ import type {
 import type { Tool } from './types/tool';
 
 /**
+ * Handoff ships from here as well as from the root barrel: a `handoff()` group is
+ * built out of `createAgent` values, so the two are always reached for together.
+ * `inference/handoff.ts` imports `DeuzAgent` TYPE-ONLY, so this re-export closes
+ * no runtime cycle.
+ */
+export { handoff } from './inference/handoff';
+export type { HandoffAgentDef, HandoffOptions } from './inference/handoff';
+
+/**
  * A reusable agent definition: every `CommonCallOptions` field EXCEPT the three
  * that belong to a call rather than to an agent.
  *

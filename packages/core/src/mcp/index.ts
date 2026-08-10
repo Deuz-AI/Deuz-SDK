@@ -21,6 +21,24 @@ import {
 
 export { createManagedConnection } from './shared';
 
+// OAuth 2.0 (2.0) — build a provider up front to share one token store across
+// servers, or to hand the same provider to a `mcp: [{ url, auth }]` loop entry.
+export { createOAuthProvider, inMemoryTokenStore } from './auth';
+export type { TokenStore, McpOAuthOptions, DeuzOAuthProvider } from '../types/config';
+
+/**
+ * The cross-call connection pool behind `deps.mcpPool` (2.0). It ships from this
+ * barrel because the dep is public: a server process builds one at startup, and
+ * `ResolvedMcpRuntime` is what the loop holds for the life of a run.
+ */
+export { createMcpPool } from './resolve';
+export type {
+  McpConnectableConfig,
+  McpConnectionPool,
+  McpPoolOptions,
+  ResolvedMcpRuntime,
+} from './resolve';
+
 export type {
   McpClient,
   McpClientHooks,
@@ -92,10 +110,12 @@ export interface McpClientOptions extends McpLifecycleOptions {
    */
   sampling?: McpSamplingOptions;
   /**
-   * Directories/URIs the server may operate on (`roots/list`, 2.0). Providing
-   * them declares the roots capability with `listChanged`; swap the list later
+   * Directories the server may operate on (`roots/list`, 2.0). Providing them
+   * declares the roots capability with `listChanged` — including for `[]`, which
+   * is an explicit "no roots" rather than an absent option; swap the list later
    * with `client.setRoots()`. A function form is re-read on every request. A
-   * plain path is promoted to `file://`.
+   * plain path is promoted to `file://`; MCP accepts no other scheme, so
+   * anything else is rejected here rather than by the server.
    */
   roots?: McpRootsOption;
 }
@@ -159,12 +179,16 @@ export async function registerElicitation(
  * constructor, so this MUST run before connect. Returns the mutable roots box
  * `setRoots` swaps — `undefined` when no roots were configured, which is what
  * makes `setRoots` a hard error rather than a silent no-op.
+ *
+ * Presence is tested with `!== undefined` here, in the capability block and at
+ * every other gate: `roots: []` is a VALUE ("no roots"), and one predicate that
+ * reads it as absence would declare a capability whose handler is missing.
  */
 export async function registerSamplingAndRoots(
   client: RawMcpClient,
   options: { sampling?: McpSamplingOptions; roots?: McpRootsOption },
 ): Promise<McpRootsBox | undefined> {
-  if (!options.sampling && !options.roots) return undefined;
+  if (options.sampling === undefined && options.roots === undefined) return undefined;
   if (!client.setRequestHandler) {
     throw new InvalidRequestError({
       message:
@@ -176,10 +200,10 @@ export async function registerSamplingAndRoots(
     CreateMessageRequestSchema: unknown;
     ListRootsRequestSchema: unknown;
   };
-  if (options.sampling) {
+  if (options.sampling !== undefined) {
     client.setRequestHandler(CreateMessageRequestSchema, buildSamplingHandler(options.sampling));
   }
-  if (!options.roots) return undefined;
+  if (options.roots === undefined) return undefined;
   const box = createRootsBox(options.roots);
   client.setRequestHandler(ListRootsRequestSchema, buildRootsHandler(box));
   return box;
@@ -226,22 +250,28 @@ async function makeHttpClient(
   const { Client } = await loadSdk();
   const client = new Client(
     { name: options.name ?? 'deuz', version: options.version ?? '0.0.0' },
-    // Declaring a capability without a handler would lie to servers — gate each on its option.
+    // Declaring a capability without a handler would lie to servers — gate each
+    // on its option, all three on `!== undefined` so an empty-but-present value
+    // (`roots: []`) declares the capability its handler is registered for.
     {
       capabilities: {
-        ...(options.onElicitationRequest ? { elicitation: { form: {}, url: {} } } : {}),
-        ...(options.sampling ? { sampling: {} } : {}),
-        ...(options.roots ? { roots: { listChanged: true } } : {}),
+        ...(options.onElicitationRequest !== undefined
+          ? { elicitation: { form: {}, url: {} } }
+          : {}),
+        ...(options.sampling !== undefined ? { sampling: {} } : {}),
+        ...(options.roots !== undefined ? { roots: { listChanged: true } } : {}),
       },
     },
   );
-  if (options.onElicitationRequest) await registerElicitation(client, options.onElicitationRequest);
+  if (options.onElicitationRequest !== undefined) {
+    await registerElicitation(client, options.onElicitationRequest);
+  }
   await registerSamplingAndRoots(client, {
-    ...(options.sampling ? { sampling: options.sampling } : {}),
+    ...(options.sampling !== undefined ? { sampling: options.sampling } : {}),
     // The roots box is created ONCE per client, outside this factory: a
     // `setRoots()` mutation has to survive a reconnect, so each attempt's
     // handler reads through to that one box instead of snapshotting it.
-    ...(rootsBox ? { roots: () => readRootsBox(rootsBox) } : {}),
+    ...(rootsBox !== undefined ? { roots: () => readRootsBox(rootsBox) } : {}),
   });
   await registerToolListChanged(client, hooks.toolListChanged);
   return client;

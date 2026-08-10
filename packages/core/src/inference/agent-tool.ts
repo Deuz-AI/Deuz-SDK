@@ -109,6 +109,13 @@ export function agentTool(def: AgentToolDef): Tool {
           childMessages = [...checkpoint.messages];
           resume = {
             resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+            // Handoff (2.0): the CHILD's checkpoint carries the child's own
+            // active agent, so a sub-agent that transferred and then suspended
+            // must resume as that agent — exactly what `resumeFromCheckpoint`
+            // does for a root run. Without this the child silently snaps back to
+            // `def.model`/`def.tools` while still carrying the target's system
+            // prompt in the restored history.
+            ...(checkpoint.handoff ? { resumeHandoff: checkpoint.handoff } : {}),
           };
         }
       }

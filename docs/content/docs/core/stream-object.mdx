@@ -27,9 +27,7 @@ Like `streamChat`, `streamObject` **returns synchronously and never throws** (th
 
 `consume()` (1.9) drains the stream so terminal effects run when nobody iterates — same contract as [`StreamChatResult.consume`](/docs/core/stream-chat#consume): memoized, never rejects, failures go to `onError`.
 
-<Callout type="warn" title="`warnings` is absent on `streamObject`">
-`CallWarning` has real producers as of 1.9 and [`streamChat`'s `warnings`](/docs/core/stream-chat#warnings) is live — but `streamObject` threads no warning sink, so nothing is collected and the field is never set: `result.warnings` is `undefined`, and `await result.warnings` gives you `undefined`, not an array. Read `deps.logger.warn` on this path. The object wire cannot carry a `warning` part to a `useObject` client either. See [Declared but inert](/docs/reference/whats-new-1-9#declared-but-inert).
-</Callout>
+`warnings` is a promise resolved from a per-call sink at the terminal boundary — the same shape [`streamChat`'s `warnings`](/docs/core/stream-chat#warnings) has, and it never rejects. What it cannot do is reach a `useObject` client: `toDeuzObjectStreamResponse` iterates `partialObjectStream`, and `StreamObjectResult` exposes no canonical part stream, so there is nothing to serialize a `warning` part from. Read it server-side.
 
 <Callout type="warn" title="Loop options are refused (1.9)">
 Structured output is single-turn. Passing `tools`, `maxSteps > 1`, `stopWhen`, `verifyStep`, `memory`, `session`, … used to be accepted and then ignored; it now fails. `streamObject` reports it through its never-throw shape — one `error` part, rejecting `partialObjectStream`, and rejected `object` / `usage` / `finishReason`. See [generateObject](/docs/core/generate-object#loop-options-are-refused).

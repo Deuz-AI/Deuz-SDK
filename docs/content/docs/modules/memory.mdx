@@ -5,7 +5,7 @@ description: Long-term agent memory with a mem0-style extract → reconcile → 
 
 Give an agent durable, cross-session memory. `remember` runs a mem0-style pipeline — extract facts from a conversation, embed and search existing memories, reconcile contradictions (`ADD`/`UPDATE`/`DELETE`/`NOOP`), then apply the mutations to a store. `recall` does scoped semantic search. Everything stateful or non-deterministic (the store, embedding, the LLM, the clock, id generation) is injected through a `MemorySeams` object, so the core stays pure and edge-safe.
 
-Two interchangeable backends ship behind the same `MemoryStore` interface: an in-memory cosine vector store (`createInMemoryMemoryStore`, edge-safe) and an Obsidian-style markdown vault (`createMarkdownMemoryStore`, Node-only) where each record is a human-readable, git-versionable `.md` file.
+Two reference backends ship behind the same `MemoryStore` interface: an in-memory cosine vector store (`createInMemoryMemoryStore`, edge-safe) and an Obsidian-style markdown vault (`createMarkdownMemoryStore`, Node-only) where each record is a human-readable, git-versionable `.md` file. For production, 2.0 adds SQLite / Redis / Postgres packs — see [Persistent stores](/docs/modules/stores).
 
 Import the core from `@deuz-sdk/core/memory`; the markdown backend from `@deuz-sdk/core/memory/markdown`.
 
@@ -21,9 +21,21 @@ interface MemoryCallOptions {
   /** Mandatory ownership (mem0 rule) — e.g. `{ userId, chatId }`. */
   scope: MemoryScope;
   /** Recall before the first model call (default on, topK 5). `false` disables. */
-  recall?: { topK?: number; header?: string } | false;
+  recall?:
+    | {
+        topK?: number;
+        header?: string;
+        scorer?: MemoryScorer | 'default';   // 2.0
+        maxChars?: number;                   // 2.0
+        expandLinks?: number;                // 2.0
+      }
+    | false;
   /** Extract after the run (default on, LLM-inferred). `false` disables. */
   extract?: { infer?: boolean } | false;
+  /** WHEN the extraction pass may run (2.0). Default `'each-turn'`. */
+  writePolicy?: 'each-turn' | 'session-end' | 'manual';
+  /** TTL housekeeping (2.0). Default `'never'`. */
+  sweep?: 'on-extract' | 'never';
 }
 ```
 
@@ -47,6 +59,99 @@ The contracts:
 - **Best-effort on both halves.** A failing store/embedder/LLM logs via `deps.logger.error` and the chat proceeds — recall failure means the call runs bare; extract failure resolves `[]`.
 - **Zero cost when absent.** No `memory` option → no recall query, no extract pass, no extra promises.
 - **Loop routing.** Like `chat`, setting `memory` routes even a tool-less call through the agentic loop, so `step-start` / `step-finish` parts appear on the stream.
+
+### Recall options (2.0)
+
+| Field | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `topK` | `number` | `5` | Retrieval breadth handed to `store.search`. |
+| `header` | `string` | `'Relevant memories:'` | First line of the spliced block. |
+| `scorer` | `MemoryScorer \| 'default'` | — (raw store ranking) | Rerank the hits before rendering. `'default'` selects `defaultMemoryScorer` (recency · importance · relevance) without making you import it. |
+| `maxChars` | `number` | — (unbounded) | Hard character budget on the **rendered** block. Before 2.0 it was unbounded: a chatty store could eat the very window compaction had just cleared. |
+| `expandLinks` | `number` | `0` (off) | Graph hops to follow out of the primary hits — see [Graph link expansion](#graph-link-expansion). |
+
+```ts
+memory: {
+  seams,
+  scope: { userId, chatId },
+  recall: { topK: 8, scorer: 'default', maxChars: 1200, expandLinks: 1 },
+  writePolicy: 'each-turn',
+  sweep: 'on-extract',
+}
+```
+
+The recall block's estimated size is also **added to the compaction fill estimate**. It is spliced in at the model-call site only, so it is invisible to `messages` yet very much visible to the provider — counting it is what keeps the [compaction threshold](/docs/modules/compaction) honest.
+
+### Write policy (2.0)
+
+`writePolicy` says **when** the automatic extraction pass may run.
+
+| Value | The loop | You |
+| --- | --- | --- |
+| `'each-turn'` (default) | Runs the extract pass after every completed run. The pre-2.0 behaviour. | Nothing. |
+| `'session-end'` | **Does nothing.** | Call `remember()` when the session closes. |
+| `'manual'` | **Does nothing.** | Call `remember()` whenever you decide. |
+
+<Callout type="warn" title="'session-end' and 'manual' are identical at loop level">
+Both return no extract promise at all. They differ only in what the **host** is expected to do afterwards, and the SDK cannot observe either moment — it has no idea when a session ends. Choosing `'session-end'` does not schedule anything; it means *you* own the write. Say so out loud in your own code, because the two values look like they do different things and they do not.
+</Callout>
+
+`extract: false` still wins over any policy: it disables extraction outright.
+
+### Sweep and TTL
+
+`MemoryRecord.expiresAt` only **hides** a record at read time (`isExpired`), so without a sweep a TTL'd store grows forever.
+
+`sweep: 'on-extract'` chains `sweepExpired()` after the (non-blocking) extraction pass — garbage collection on write traffic instead of a cron. It is fire-and-forget and deliberately **off** the returned promise: `result.memory` reports the mutations this turn wrote, never how much housekeeping happened to follow. Failures log and never break the chat.
+
+```ts
+import { sweepExpired } from '@deuz-sdk/core/memory';
+
+// or run it yourself, from a cron
+const removed = await sweepExpired(store, { userId: 'u_1' }, clock);
+```
+
+`sweepExpired` hard-deletes even under a `supersede: 'soft'` policy — an expiry is a lifetime ending, not a fact being contradicted. A backend that implements the optional `deleteExpired` does it in one statement; otherwise it is `list` + filter + `delete`, which is correct everywhere and cheap for the reference backends. The [store packs](/docs/modules/stores) expose the unscoped `sweepExpiredMemories()` for the same job across every scope.
+
+### Write-time hash dedup (2.0)
+
+An `ADD` whose content hash is already spoken for is **dropped before it is written** — within the same batch, among the records the reconciliation pass retrieved, or (fast path) in the store via the optional `findByHash`.
+
+A dropped `ADD` leaves **no trace**: emitting a `NOOP` would tell you a record was inspected when none was. `UPDATE` / `DELETE` / `NOOP` pass through untouched — an `UPDATE` is addressed by id, so its hash colliding is convergence, not duplication.
+
+Without `findByHash` the store-level check is skipped entirely rather than scanning every record of every scope on every turn, which would cost more than the duplicate row it saves. A backend that wants dedup implements the method; SQLite and Postgres do.
+
+### Importance and links (2.0)
+
+The extraction pass can now attach two things to each fact:
+
+- **`importance`** — a number the `defaultMemoryScorer` weighs alongside recency and relevance.
+- **`links`** — graph edges, requested with `RememberOptions.links: true`. They land on `metadata.links`, which is the same shape the markdown backend writes for `[[wikilinks]]`.
+
+Both are copied onto the `ADD` events by **exact fact-text match**. Deliberately not fuzzy: when the reconciliation pass rewrote the wording, the numbers no longer describe that string, and a wrong importance is worse than none.
+
+### Graph link expansion
+
+`recall.expandLinks: n` (or `recall(query, seams, { expandLinks: n })`) walks up to `n` hops out of the primary hits, following each record's `metadata.links` plus every `[[wikilink]]` in its body.
+
+- **Linked records are appended, never interleaved.** The primaries keep the head of the list exactly as scoring left them, so turning expansion on can only add context, never displace it.
+- **Score decays per hop:** a neighbour scores `parent.score × 0.5 ** hop`, so it can never outrank what pulled it in.
+- **Three caps:** a `seen` set of record ids terminates an A↔B cycle, fan-out is capped at 8 targets per hop, and the whole expansion at `2 × topK` extra records.
+- **A link resolves as an id first** (`store.get`), then as a title/text search — so `[[project-atlas]]` finds a record whether that is its id or its subject.
+- **Best-effort:** a store that throws mid-walk logs and yields the primaries plus whatever was already resolved.
+
+Surrounding brackets are stripped when reading `metadata.links`, because both spellings mean the same node (the markdown backend round-trips `links: ["[[project]]"]` while an LLM-extracted fact writes `"project"`) and without normalization the same neighbour would be visited twice.
+
+### Observation
+
+A call with `memory` emits the auxiliary `operation.*` events under the `'memory'` subsystem:
+
+| Operation | When |
+| --- | --- |
+| `memory.recall` | One span per recall, with `resultCount` = hits. Nothing is emitted when there is no query text — an `operation.started` with no terminal would be a lie. |
+| `memory.extract` | `started` fires synchronously (the write is in flight from there); `completed` / `failed` land whenever the pass settles, which is **after** the run's terminal event. |
+
+Without an observer the fast path applies: no event objects are built and no extra ids are drawn. See [Observability](/docs/modules/observability).
 
 The sections below document the underlying pipeline — what the option automates, and the surface you use directly for non-chat shapes (batch ingestion, custom recall placement, model-driven memory tools).
 
@@ -127,8 +232,18 @@ interface MemoryStore {
   ): Promise<MemoryRecord[]>;
   delete(ids: string[]): Promise<void>;
   update?(id: string, patch: Partial<MemoryRecord>): Promise<void>;
+  /** 2.0 fast path: resolve content hashes to existing records in ONE indexed round-trip. */
+  findByHash?(hashes: string[], scope: MemoryScope): Promise<MemoryRecord[]>;
+  /** 2.0 fast path: hard-delete every record whose `expiresAt <= now`; returns how many went. */
+  deleteExpired?(now: number, scope?: MemoryScope): Promise<number>;
 }
 ```
+
+The two 2.0 methods are **optional on purpose**: their fallbacks (`list` + an in-memory hash scan, `list` + filter + `delete`) are correct everywhere and cheap for the in-memory and markdown backends, but wrong for a SQL table with a `hash` index. Omitting them keeps a pre-2.0 store valid; implementing them turns an O(all records) scan into one statement. The [SQLite and Postgres packs](/docs/modules/stores) implement both.
+
+### Production backends
+
+The reference stores are exactly that. For a real deployment use a [store pack](/docs/modules/stores): `createSqliteStores` (FTS5 + vector hybrid, zero dependencies), `createRedisStores` (client-side ranking, narrow scopes) or `createPostgresStores` (pgvector HNSW). Each returns a `MemoryStore` that drops straight into `seams.store`, alongside the matching `ChatStore` / `SessionStore` on the same connection.
 
 ## remember
 
@@ -152,6 +267,7 @@ interface MemoryStore {
 | `kind` | `MemoryKind` | `'semantic'` (`'episodic'` when `infer: false`) | `'episodic' \| 'semantic' \| 'working' \| 'procedural'`. |
 | `customInstructions` | `string` | — | Appended to the extraction system prompt. |
 | `customExtract` | `(messages) => MemoryFact[]` | — | Replace the LLM extraction step entirely. |
+| `links` | `boolean` | `false` | Ask the extraction pass for per-fact graph links (2.0). Costs a few prompt tokens; lands on `metadata.links`, which `recall`'s `expandLinks` traverses. |
 
 `planMemory(...)` is the plan-only alias (`apply: false`) for hosts that defer writes.
 
@@ -231,6 +347,7 @@ interface MemoryQuery {
 | --- | --- | --- | --- |
 | `dropExpired` | `boolean` | `true` | Filter out records whose `expiresAt <= clock.now()`. |
 | `scorer` | `MemoryScorer` | — | Rerank by recency · importance · relevance (`defaultMemoryScorer` provided). |
+| `expandLinks` | `number` | `0` | Follow graph links out of the primary hits (2.0) — see [Graph link expansion](#graph-link-expansion). |
 
 `formatMemoriesForPrompt(hits, opts?)` renders the hits into a bulleted block for splicing into a system prompt (empty string when there are no hits). `opts` accepts `header` (default `'Relevant memories:'`) and `maxChars` (hard-truncates the rendered block to bound prompt-token cost).
 
@@ -370,10 +487,30 @@ These are exported for testing and custom backends — all deterministic, no I/O
 | `buildExtractionPrompt` / `parseFacts` | Fact-extraction prompt + tolerant parser. |
 | `buildDecisionPrompt` / `parseDecision` | Reconciliation prompt (temp ids) + parser that drops hallucinated ids. |
 | `applyEvents(events, existing, ctx)` | Pure reducer: decision events → `MemoryMutation[]`. |
+| `extractLinks(record)` | The record's outgoing edges: `metadata.links` plus every `[[wikilink]]` in the body, deduped and bracket-normalized (2.0). |
+| `sweepExpired(store, scope, clock)` | TTL garbage collection; returns how many records were removed (2.0). |
+
+### Reusing a RAG embedder
+
+`memoryEmbedderFromRag(ragEmbedder, opts?)` adapts a [RAG](/docs/modules/rag) `Embedder` — `embed(texts) => number[][]` — to the memory seam, which additionally takes an `action` (`'add' | 'search' | 'update'`) and reports a model id. One embedding setup, both subsystems:
+
+```ts
+import { memoryEmbedderFromRag } from '@deuz-sdk/core/memory';
+
+const seams = {
+  store,
+  embedder: memoryEmbedderFromRag(ragEmbedder, { modelId: 'text-embedding-3-small' }),
+  llm,
+  clock,
+  generateId,
+};
+```
 
 ## See also
 
+- [Persistent stores](/docs/modules/stores) — SQLite / Redis / Postgres `MemoryStore` implementations.
 - [Embeddings](/docs/core/embeddings) — `embed` / `embedMany`, the engine behind `createEmbedder`.
 - [RAG](/docs/modules/rag) — document ingestion and retrieval over the same vector primitives.
+- [Compaction](/docs/modules/compaction) — the recall block counts toward the context-fill estimate.
 - [generateText](/docs/core/generate-text) — backs the `MemoryLLM` seam and the memory tools.
 - [Dependencies](/docs/core/dependencies) — the `Clock` / `generateId` injection model.

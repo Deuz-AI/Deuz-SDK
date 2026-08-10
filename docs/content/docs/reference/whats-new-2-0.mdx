@@ -1,0 +1,177 @@
+---
+title: What is new in 2.0
+description: The full 2.0 surface — persistent stores, guardrails, handoffs, zero-config MCP with OAuth, three new modalities — and the limits stated plainly.
+---
+
+2.0 is the release where the things you had to build yourself became things you configure. Nine new subpaths, three new modalities, real databases behind the four storage seams, guardrails and handoffs in the loop, and MCP that connects itself.
+
+Everything is **additive**. No existing type gained a required field, every 1.9 call still compiles, and every stored checkpoint still loads. The two behaviours that changed are stated in [Behaviour changes](#behaviour-changes) — both make a previously-dead run recover instead.
+
+What is **not** in the box is at the bottom, and it is a real list: [Known limits](#known-limits).
+
+## The new subpaths
+
+| Subpath | What |
+| --- | --- |
+| `@deuz-sdk/core/guardrails` | `promptInjectionGuardrail`, `maxOutputLength` — built-in values for the `guardrails` call option. |
+| `@deuz-sdk/core/speech` | `generateSpeech` + `createOpenAISpeech` / `createElevenLabs`. |
+| `@deuz-sdk/core/transcription` | `transcribe` + `createOpenAITranscription` / `createDeepgram`. |
+| `@deuz-sdk/core/video` | `submitVideo` / `waitForVideo` / `downloadVideo` / `generateVideo`. |
+| `@deuz-sdk/core/stores/sqlite` | `createSqliteStores` — four seams on one `node:sqlite` file, zero dependencies. |
+| `@deuz-sdk/core/stores/redis` | `createRedisStores` — three seams on a structural Redis client seam. |
+| `@deuz-sdk/core/stores/postgres` | `createPostgresStores` — four seams, optional pgvector. |
+| `@deuz-sdk/core/mcp/node` | `createFileTokenStore`, `createLoopbackRedirect` — the Node half of an MCP OAuth flow. |
+
+Plus new root exports: `handoff`, `compactMessages`, `promptInjectionGuardrail`, `maxOutputLength`, `McpAuthorizationRequiredError`, `ContextOverflowError`.
+
+## 1. Persistence you can point at a database
+
+Until 2.0 the four storage seams — `MemoryStore`, `ChatStore`, `SessionStore`, `RunStore` — shipped with in-memory and file-backed reference implementations only. Everyone wrote the same adapter. Now:
+
+```ts
+import { createPostgresStores } from '@deuz-sdk/core/stores/postgres';
+
+const stores = createPostgresStores({ connectionString: process.env.DATABASE_URL! });
+
+await streamChat({
+  model, messages, tools, maxSteps: 8,
+  chat:    { store: stores.chats,    chatId, scope: { userId } },
+  session: { store: stores.sessions, runId },
+  memory:  { seams: { store: stores.memory, embedder, llm, clock, generateId }, scope: { userId } },
+});
+```
+
+Each pack is a **synchronous** factory that opens lazily and closes only what it opened itself. SQLite gets real FTS5 + vector hybrid search fused with RRF; Postgres gets pgvector HNSW when the extension is installed and an `embedding_json` + JS-cosine fallback when it is not, with a one-statement upgrade path between them. Full schemas, the `node:sqlite` version matrix, the better-sqlite3 escape hatch and the ioredis wrapper recipe: [Persistent stores](/docs/modules/stores).
+
+Two optional `MemoryStore` methods came with them — `findByHash` (write-time dedup in one indexed round-trip) and `deleteExpired` (a TTL sweep in one statement). Omitting them keeps a pre-2.0 store valid; the pipeline falls back to `list` + filter.
+
+## 2. Guardrails
+
+Three hooks around the loop — `onInput`, `onToolCall`, `onOutput` — each returning `pass`, `block` or `rewrite`.
+
+```ts
+import { promptInjectionGuardrail, maxOutputLength } from '@deuz-sdk/core/guardrails';
+
+guardrails: {
+  onInput: promptInjectionGuardrail(),
+  onToolCall: (ctx) => (ctx.toolCall.toolName === 'shell' ? { action: 'block', reason: 'disabled' } : undefined),
+  onOutput: maxOutputLength(4000),
+}
+```
+
+A blocked tool call joins the **existing denial machinery**: an `is_error` `tool_result` the model can route around, a `denied` tool-state part, and — crucially — **exclusion from the runaway-error guard**, because a policy verdict is not a tool failure. A blocked input or output is a graceful stop with `stoppedBy: 'guardrail:input'` / `'guardrail:output'`, never a throw. A throw *from* a guardrail propagates, deliberately: a silently swallowed safety control is worse than none. [Guardrails](/docs/agents/guardrails).
+
+## 3. Handoffs
+
+`handoff()` mints `transfer_to_<name>` tools. When one fires, the run **changes hands**: system prompt, tool set and model become the target's, and the whole history travels with it.
+
+```ts
+import { handoff } from '@deuz-sdk/core';
+
+tools: { ...handoff({ billing, support }, { maxHandoffs: 3 }), search }
+```
+
+The counterpart to `agentTool`, which delegates and comes back. The interception is deterministic — the loop reads a hidden marker on the tool *before* anything executes, so a transfer is a decision, not a control-flow exception. `maxHandoffs` (default 5) bounds ping-pong and self-heals into an `is_error` when it trips. Durable resume re-applies the active agent before the first step. [Handoffs](/docs/agents/handoffs).
+
+## 4. Zero-config MCP
+
+`options.mcp` names servers; the loop connects them, lists their tools, namespaces the names, merges them into `tools`, hot-refreshes on `tools/list_changed`, and closes whatever **it** opened when the run ends.
+
+```ts
+await generateText({
+  model, messages, maxSteps: 6,
+  mcp: [{ url: 'https://mcp.example.com/mcp' }],
+});
+```
+
+With it came the rest of the MCP surface: **OAuth 2.0** (a two-step flow around `McpAuthorizationRequiredError`, with a `TokenStore` seam and Node helpers on `/mcp/node`), **sampling** (the server writes a prompt, your model answers it, behind an `approve` gate), **roots**, **reconnect with a `ping()`-verified drop test**, `status()`, `keepAliveMs`, `serverInfo()`, and `deps.mcpPool` for server processes. [MCP](/docs/modules/mcp).
+
+## 5. Compaction grew three halves
+
+- **`compactMessages()`** — the loop's layers as a plain function over a `Message[]` you own. Pure by default: with no `summarize` dep it makes no network call at all.
+- **A rolling summary** — pass N folds into pass N−1's summary instead of restarting, so at most **one** summary block ever sits in the history.
+- **Overflow auto-recovery** — a provider rejection mapped to `ContextOverflowError` forces one compaction pass and retries the step, *even when you never opted into compaction*.
+- **`countTokens`** — swap the character heuristic for a real tokenizer; the EMA calibration keeps running on top of it.
+
+[Compaction & context recovery](/docs/modules/compaction).
+
+## 6. Three new modalities
+
+| Module | Providers | Shape |
+| --- | --- | --- |
+| [Speech (TTS)](/docs/modules/speech) | OpenAI, ElevenLabs | one request, finished audio bytes |
+| [Transcription (STT)](/docs/modules/transcription) | OpenAI, Deepgram | one request, text (+ optional word/segment timings) |
+| [Video](/docs/modules/video-generation) | any OpenAI-Videos-shaped relay (Sora, Veo, Kling, Hailuo) | submit → poll → download |
+
+Each is a separate model kind with its own `surface`, so a speech model cannot be handed to `streamChat` by accident. All three emit `operation.*` observation events under their own subsystem.
+
+## 7. Memory, sharpened
+
+Everything the recall path was missing:
+
+| Addition | Effect |
+| --- | --- |
+| `recall.scorer` | `'default'` selects the Generative-Agents recency · importance · relevance rerank without importing it. |
+| `recall.maxChars` | Hard budget on the rendered recall block — it used to be unbounded. |
+| `recall.expandLinks` | Follow `[[wikilinks]]` / `metadata.links` out of the primary hits, appended with a `0.5 ** hop` decay. |
+| `writePolicy` | `'each-turn'` (default, pre-2.0 behaviour), `'session-end'`, `'manual'`. |
+| `sweep: 'on-extract'` | Chain the TTL garbage collection onto write traffic instead of a cron. |
+| Write-time hash dedup | An `ADD` whose content hash is already stored is dropped, not written. |
+| Per-fact `importance` and `links` | Extracted and carried onto the record. |
+| `memoryEmbedderFromRag` | Reuse a RAG `Embedder` as a memory one. |
+| `memory.recall` / `memory.extract` observation | `operation.*` events under the `'memory'` subsystem. |
+
+[Memory](/docs/modules/memory).
+
+## 8. Eight more providers, two of them keyless
+
+`@deuz-sdk/core/providers` gained **Perplexity, Cohere, DeepInfra, NVIDIA NIM, SambaNova, Hyperbolic** (cloud) and **Ollama, LM Studio** (local, keyless). That is 29 provider factories in total.
+
+The keyless pair set `apiKeyOptional`, which changes exactly one thing: when the whole key-precedence chain comes up empty, the resolver substitutes a placeholder bearer token instead of throwing. A real key from any link still wins, so the escape can never shadow a key you supplied. Opt in for your own self-hosted host with `createOpenAICompatible({ id, baseURL, apiKeyOptional: true })`.
+
+`CompatSettings.capabilities` is public in 2.0 for the same reason: a local slug can never be a known registry row, so `maxOutput: 4096` would silently truncate long answers. State what your model can do once, at the factory. [Local models](/docs/providers/local).
+
+Registry rows for the new cloud hosts are pinned from public catalogs and marked *verify at publish*. Perplexity's `tools: false` is load-bearing — Sonar runs its search server-side and the API rejects a `tools` array.
+
+## 9. `runtimeContext`
+
+An opaque per-call value threaded, untouched, into every hook that can act on it: `ToolExecuteContext.runtimeContext`, `prepareStep`, `verifyStep`, `doneWhen`, and all three guardrail hooks. Sub-agents inherit it.
+
+```ts
+await generateText({ model, messages, tools, runtimeContext: { tenantId, db } });
+```
+
+It exists so request-scoped facts travel with the **call** instead of being captured in a closure, which is what forces callers to rebuild their whole `ToolSet` per request. The SDK never reads, copies or serializes it — it does not reach checkpoints, chat records or observation events, so a live connection or a secret is safe to put there.
+
+## Behaviour changes
+
+Two, and both turn a previously-dead run into a recovering one.
+
+**1. A context-overflow rejection is recovered, not fatal.** On the `anthropic` and `chat_completions` wires an over-long request now maps to `ContextOverflowError`, and the loop force-compacts and retries the step once — even with no `compaction` option set. Before 2.0 it ended the run. If you were catching a generic `InvalidRequestError` around that case, you will now see the run succeed instead.
+
+**2. An HTTP MCP session that dies is now noticed.** `StreamableHTTPClientTransport` never calls `onclose` when its socket dies; it reports through `onerror` and quietly retries its own event stream. So before 2.0 a dead HTTP session kept reporting `connected`, and `reconnect: true` did nothing unless `keepAliveMs` was also set. Now a transport error on a live session triggers **one `ping()`**, and only a failed ping counts as a drop — an unparseable SSE frame or one failed event-stream retry does not tear a healthy connection down.
+
+New stream parts: `handoff` and `guardrail`. `StreamPart` is an open union by contract, so keep a `default` case and they are a no-op for old code. `CompactionPart` gained an optional `trigger` (`'threshold' | 'manual' | 'overflow'`; absent means `'threshold'`, the pre-2.0 shape).
+
+## Known limits
+
+Stated here so you do not discover them at runtime.
+
+- **Overflow recovery only fires on two wires.** `ContextOverflowError` is mapped by the `anthropic` adapter (HTTP 413, or a 400 whose *message* matches — Anthropic ships no machine-readable code) and by the `chat_completions` adapter (`context_length_exceeded`). On the **`responses`** and **`native` (Gemini)** wires an over-long request is still a generic error and the run ends. Set `compaction` explicitly there; the threshold path does not depend on error mapping.
+- **The Redis pack has no `MULTI`.** A write is a sequence of independent commands, so a crash mid-write can leave an id in an index whose record does not exist. Every reader is built to tolerate exactly that (a `null` row is skipped, `delete` and the sweeper clear leftovers as they pass), so an orphan costs a wasted scan slot and never a wrong answer — but it is not a transaction, and pipelining it is a 2.x item.
+- **The Redis pack has no `RunStore`.** `list({ status })` is a scan, and a scan is what this key layout is worst at. Use SQLite or Postgres for a run dashboard.
+- **Redis memory search is client-side.** It narrows by scope index, pulls the scope with one `mGet` and ranks in your process — O(records in scope), moved over the wire. Keep scopes narrow; reach for Postgres past a few thousand records per scope.
+- **Token counting is still not a real tokenizer by default.** The compaction estimate is a character heuristic with an EMA correction fed from provider-reported usage. It is good enough to trigger at 92% fill and worst on code, CJK and base64-ish tool output. `compaction.countTokens` is the hook — nothing ships a tokenizer, and `gpt-tokenizer` is a recipe, not a peer dependency.
+- **`rerank` is still `identityReranker`.** The RAG rerank seam exists and is honoured, but the default implementation just sorts the candidates by their existing score and slices. There is no cross-encoder and no provider rerank endpoint in the box — wire your own `Reranker` if you need real reranking.
+- **MCP has no WebSocket transport.** Three transports ship: Streamable HTTP, legacy SSE, and stdio (Node). A WebSocket server needs a custom `McpClient`.
+- **The `Part` union has no `AudioPart`.** It stays at five members: `text`, `image`, `tool_use`, `tool_result`, `reasoning`. Audio you want a **chat** model to hear travels as `filePart({ mediaType: 'audio/…' })`, exactly like a PDF. The new speech/transcription modules are dedicated endpoints, not a sixth part kind.
+- **MCP roots are `file://` only.** MCP's own `RootSchema` pins `uri` to a `file://` prefix and validates `roots/list` as a whole array, so one `https://` entry makes the server discard *every* root you sent — as a Zod error on the far side of the wire, where nothing can act on it. The SDK rejects a non-`file://` root where you supplied it instead. A bare filesystem path is promoted for you.
+- **Sub-agents do not inherit `guardrails`.** `agentTool` forwards `runtimeContext`, the approver and the abort signal, but not the guardrail hooks, and `AgentToolDef` has no `guardrails` field — so a sub-agent runs unguarded. The guardrail contexts carry an `agentPath` for it, which in 2.0 is therefore effectively always absent. A [handoff](/docs/agents/handoffs) *does* keep them, because it changes the active agent, not the run.
+- **A guardrail rewrite of tool arguments does not rewrite history.** The assistant turn keeps the arguments the model issued; only the approval gate and `execute` see the rewritten ones. That is deliberate (a lying transcript breaks both prompt caching and the model's next step), but it does mean the transcript and the execution can differ — the `guardrail` part is how you tell.
+- **Compaction summaries and pricing use the root model after a handoff.** The active agent drives the steps; the summarize side call still uses `summarizeModel ?? options.model`, and cumulative cost is priced against `options.model.modelId`.
+
+## See also
+
+- [What is new in 1.9](/docs/reference/whats-new-1-9) — the previous release, with its own limits list.
+- [Persistent stores](/docs/modules/stores) · [Guardrails](/docs/agents/guardrails) · [Handoffs](/docs/agents/handoffs) · [MCP](/docs/modules/mcp) · [Compaction](/docs/modules/compaction)
+- [Changelog](/docs/changelog) — the full release history.

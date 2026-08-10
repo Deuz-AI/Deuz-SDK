@@ -73,6 +73,19 @@ There is no diff machinery to configure: history is [immutable by contract](/doc
 
 ## Reference stores
 
+<Callout type="info" title="For production, use a store pack">
+The two stores below are references: a `Map` and one JSON file per chat. 2.0 ships real backends — [`createSqliteStores`](/docs/modules/stores#sqlite), [`createRedisStores`](/docs/modules/stores#redis) and [`createPostgresStores`](/docs/modules/stores#postgres) — each returning a `ChatStore` alongside the matching `SessionStore` / `MemoryStore` on the same connection, with the binary-safe record codec already wired.
+
+```ts
+import { createPostgresStores } from '@deuz-sdk/core/stores/postgres';
+
+const stores = createPostgresStores({ connectionString: process.env.DATABASE_URL! });
+chat: { store: stores.chats, chatId, scope: { userId } }
+```
+
+The hand-rolled Supabase adapter further down still works and is still the template for any backend the packs do not cover.
+</Callout>
+
 ### `createInMemoryChatStore` (edge-safe)
 
 A `Map` keyed by `chatId`; `saveChat` copies the message array. Implements all four methods. Single runtime only — dev, tests, one long-lived server.

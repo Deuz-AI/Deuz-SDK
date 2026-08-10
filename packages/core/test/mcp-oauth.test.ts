@@ -350,6 +350,68 @@ describe('refresh', () => {
     expect(as.authorizations).toHaveLength(1);
     expect(as.registrations).toHaveLength(1);
   }, 20_000);
+
+  it('a rejected refresh token falls back to a fresh authorization', async () => {
+    const { as, mcp, transport } = await startFixture();
+    const store = recordingStore();
+    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
+
+    // Authorize once for real, so the store holds the registration and the
+    // server binding that a later process would read back off disk.
+    const first = await expectAuthorizationRequired({ transport, auth: provider });
+    const before = await connect({
+      transport,
+      auth: provider,
+      authorizationCode: as.simulateUserAuthorization(first.authorizationUrl!),
+    });
+    await before.close();
+
+    // What a revoked session leaves behind: an access token the resource server
+    // rejects, next to a refresh token the AS has never heard of. `/token`
+    // answers `400 invalid_grant`, which is the ONLY thing the SDK retries.
+    store.entries.set(
+      keyFor('tokens', mcp.url),
+      JSON.stringify({
+        access_token: 'at-revoked',
+        token_type: 'Bearer',
+        expires_in: 1,
+        refresh_token: 'rt-dead',
+      }),
+    );
+
+    const err = await expectAuthorizationRequired({ transport, auth: provider });
+
+    // The dead grant is presented ONCE. Without `invalidateCredentials` the
+    // SDK's invalid_grant retry re-reads the same stored pair and sends it a
+    // second time, which can only fail again — and the raw `InvalidGrantError`
+    // escapes instead of the actionable error above.
+    const refreshes = as.tokenRequests.filter((r) => r.grantType === 'refresh_token');
+    expect(refreshes.map((r) => r.params.refresh_token)).toEqual(['rt-dead']);
+    expect(refreshes[0]!.status).toBe(400);
+    expect(refreshes[0]!.error).toBe('invalid_grant');
+
+    // A REDIRECT, not a dead end: the retry reached a fresh authorization.
+    expect(err.authorizationUrl).toBeDefined();
+    expect(err.authorizationUrl).not.toBe(first.authorizationUrl);
+    expect(new URL(err.authorizationUrl!).searchParams.get('client_id')).toBe('client-1');
+
+    // The dead pair is gone from the store, so nothing has to be cleared by
+    // hand before the next attempt. The registration is not what the server
+    // rejected, so it survives and no second client was minted.
+    expect(await provider.tokens()).toBeUndefined();
+    expect(store.entries.has(keyFor('tokens', mcp.url))).toBe(false);
+    expect(store.entries.has(keyFor('client-info', mcp.url))).toBe(true);
+    expect(as.registrations).toHaveLength(1);
+
+    // And the offered URL really works — the lockout is over, not just quieter.
+    const after = await connect({
+      transport,
+      auth: provider,
+      authorizationCode: as.simulateUserAuthorization(err.authorizationUrl!),
+    });
+    expect(await after.callTool('echo', { value: 'recovered' })).toBe('echo:recovered');
+    expect(await provider.tokens()).toMatchObject({ access_token: 'at-2' });
+  }, 20_000);
 });
 
 describe('pre-provisioned clients', () => {

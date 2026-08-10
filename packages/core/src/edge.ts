@@ -13,6 +13,12 @@ export {
 } from './inference/stop';
 export { agentTool } from './inference/agent-tool';
 export type { AgentToolDef } from './inference/agent-tool';
+// Agent handoff + the built-in guardrails (2.0 additive). Both modules are pure
+// construction — type-only imports, object/function literals, no ambient clock,
+// randomness or Node API — so they are edge-safe by construction.
+export { handoff } from './inference/handoff';
+export type { HandoffAgentDef, HandoffOptions } from './inference/handoff';
+export { promptInjectionGuardrail, maxOutputLength } from './guardrails';
 // Typed tool authoring + content-part constructors (1.9 additive). Both modules
 // are pure: type-only imports and a plain object literal, no ambient clock,
 // randomness or Node API — edge-safe by construction.

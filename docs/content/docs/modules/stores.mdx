@@ -1,0 +1,436 @@
+---
+title: Persistent Stores
+description: SQLite, Redis and Postgres packs — one factory each for the MemoryStore, ChatStore, SessionStore and RunStore seams, with real schemas and no runtime dependencies.
+---
+
+Deuz ships four persistence seams — [`MemoryStore`](/docs/modules/memory#the-memorystore-seam), [`ChatStore`](/docs/modules/chat-persistence), [`SessionStore`](/docs/agents/durable-runtime) and [`RunStore`](/docs/modules/autonomy#background-runs--live-view) — and, until 2.0, only in-memory and file-backed reference implementations of them. 2.0 adds three **store packs**: one factory per backend that returns every seam that backend can serve, sharing one connection and one namespace.
+
+```ts
+import { createSqliteStores } from '@deuz-sdk/core/stores/sqlite';
+
+const stores = createSqliteStores({ path: './agent.db' });
+
+const result = streamChat({
+  model,
+  messages,
+  chat: { store: stores.chats, chatId, scope: { userId } },
+  session: { store: stores.sessions, runId },
+});
+```
+
+## Why a pack and not one object
+
+A single object cannot implement `MemoryStore` and `SessionStore` at the same time: `MemoryStore.delete(ids: string[])` and `SessionStore.delete(runId: string)` are the same method name with incompatible signatures, and `list()` collides the same way. So every factory hands back named seams — `{ memory, chats, sessions, runs }` — plus the two operations that belong to the pack rather than to any one seam.
+
+## Choosing one
+
+| | `stores/sqlite` | `stores/redis` | `stores/postgres` |
+| --- | --- | --- | --- |
+| Subpath | `@deuz-sdk/core/stores/sqlite` | `@deuz-sdk/core/stores/redis` | `@deuz-sdk/core/stores/postgres` |
+| Factory | `createSqliteStores` | `createRedisStores` | `createPostgresStores` |
+| Runtime dependency | **none** (`node:sqlite`) | none — inject a client, or the optional `redis` peer | none — inject a client, or the optional `pg` peer |
+| `memory` | yes — FTS5 + vector **hybrid** (RRF) | yes — client-side cosine / substring | yes — pgvector HNSW, or JS cosine fallback |
+| `chats` | yes | yes | yes |
+| `sessions` | yes | yes | yes |
+| `runs` | yes | **no** | yes |
+| Vector search | in-process cosine over a bounded prefetch | in-process cosine over the scope | in-database (`vector_cosine_ops`) when pgvector is installed |
+| Lexical search | FTS5 `bm25()`, LIKE fallback | substring | `ILIKE` |
+| Scales to | one process / one machine | a shared cache, narrow scopes | production, wide scopes |
+| Transactions | yes (`BEGIN`/`COMMIT`) | **no MULTI in v1** — see below | yes (the migration batch) |
+
+Rules of thumb: **SQLite** for a single-process agent, a CLI, or a desktop app — it is the only one with zero setup. **Redis** when you already run one and your scopes are narrow (a `chatId`, a `userId`). **Postgres** for anything multi-tenant or long-lived, because it is the only pack whose vector search happens in the database.
+
+## What every pack shares
+
+- **The factory is synchronous.** It is the `createClient` idiom: nothing connects, no optional peer is imported, and no file is opened until the first store call. Building a pack at module scope in a serverless handler costs nothing and cannot throw.
+- **The connection opens once, lazily, and is memoized.** An unsupported runtime or a bad DSN surfaces as a rejected *store call* carrying an actionable message, never as a throw out of module evaluation. A failed open is not cached — the next call retries.
+- **`close()` follows ownership — with one deliberate exception.** The Redis and Postgres packs close only the connection they opened themselves (`{ url }` / `{ connectionString }`); an injected `{ client }` is left alone, because it is yours and something else in your process may still be using it. **SQLite is different**: `{ database }` hands the handle *over* — the pack owns it from that point and `close()` closes it. A SQLite handle is a file, not a pool, and sharing one across owners is not a thing you want silently allowed.
+- **`sweepExpiredMemories(now?)`** is the TTL garbage collector. `MemoryRecord.expiresAt` only *hides* a record at read time, so without a sweep a TTL'd store grows forever. Call it from a cron, or let [`memory.sweep: 'on-extract'`](/docs/modules/memory#sweep-and-ttl) chain it onto write traffic. `now` defaults to the host clock — pass `deps.clock.now()` for a deterministic sweep.
+- **A corrupt row is skipped, never thrown.** A hand-edited record, an unparseable JSON column, a half-written value: readers drop it and carry on. One bad row must not take a chat down.
+- **Scope is a filter over the fields you set.** `{ userId }` matches every record of that user regardless of `chatId`; an unset field is *no test at all*, not a `NULL` test — exactly what `matchesScope` does in memory.
+
+---
+
+## SQLite
+
+```ts title="sqlite.ts"
+import { createSqliteStores } from '@deuz-sdk/core/stores/sqlite';
+
+const stores = createSqliteStores({ path: './agent.db' });
+// stores.memory · stores.chats · stores.sessions · stores.runs
+// stores.sweepExpiredMemories() · stores.close()
+```
+
+Zero runtime dependencies, because modern Node carries `node:sqlite` in the box.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `path` | `string` | — | Database file, or `':memory:'` for an ephemeral one. Required. |
+| `database` | `SqliteDatabaseLike` | — | Use **this** handle instead of opening `node:sqlite`. The pack owns it from here on: `close()` closes it. |
+| `wal` | `boolean` | `true` | `PRAGMA journal_mode = WAL` for file databases. Ignored for `':memory:'`. |
+| `fts` | `boolean` | `true` | Build the FTS5 index for lexical search. Falls back to `LIKE` automatically when fts5 is missing. |
+
+### Node version matrix
+
+`node:sqlite` is what makes this pack dependency-free, and it landed in stages:
+
+| Node | `node:sqlite` | What to do |
+| --- | --- | --- |
+| **22.13+**, **23.4+**, 24+ | shipped **unflagged** | Nothing. `createSqliteStores({ path })` just works. |
+| 22.5 – 22.12 | present but flagged | Run node with `--experimental-sqlite`. |
+| below 22.5 | absent | Pass `options.database` (below). There is no other way. |
+
+When the module cannot be reached, the first store call rejects with exactly that matrix as its message — the error is the documentation.
+
+### The better-sqlite3 escape hatch
+
+`SqliteDatabaseLike` is a **structural** seam of four members that both `node:sqlite`'s `DatabaseSync` and better-sqlite3's `Database` satisfy:
+
+```ts
+interface SqliteStatementLike {
+  run(...params: unknown[]): unknown;
+  get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
+}
+
+interface SqliteDatabaseLike {
+  prepare(sql: string): SqliteStatementLike;
+  exec(sql: string): void;
+  close(): void;
+}
+```
+
+It is deliberately that small: anything richer (transaction helpers, `pragma()`, `iterate()`) differs between the two drivers, and depending on it would turn a zero-peer injection story into a compatibility matrix.
+
+```ts title="better-sqlite3.ts"
+import Database from 'better-sqlite3';
+import { createSqliteStores } from '@deuz-sdk/core/stores/sqlite';
+
+// `node:sqlite` is never imported on this path — no flag, no version floor.
+const stores = createSqliteStores({
+  path: './agent.db',
+  database: new Database('./agent.db'),
+});
+```
+
+better-sqlite3 is **not** a peer dependency and nothing installs it for you. The same hatch takes a pooled connection wrapper or a test double.
+
+### Schema v1
+
+Created on first use and versioned with `PRAGMA user_version`; a database already at the current version is left alone.
+
+```sql
+CREATE TABLE deuz_memory (
+  id TEXT PRIMARY KEY, text TEXT NOT NULL, hash TEXT NOT NULL, kind TEXT NOT NULL,
+  user_id TEXT, agent_id TEXT, run_id TEXT, actor_id TEXT, chat_id TEXT,
+  importance REAL, metadata TEXT,
+  embedding BLOB, embedding_model_id TEXT,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  last_accessed_at INTEGER, expires_at INTEGER, valid_at INTEGER, invalid_at INTEGER
+);
+CREATE INDEX deuz_memory_scope_idx  ON deuz_memory (user_id, agent_id, chat_id);
+CREATE INDEX deuz_memory_hash_idx   ON deuz_memory (hash);
+CREATE INDEX deuz_memory_expiry_idx ON deuz_memory (expires_at) WHERE expires_at IS NOT NULL;
+
+CREATE TABLE deuz_chats (
+  chat_id TEXT PRIMARY KEY,
+  user_id TEXT, agent_id TEXT, run_id TEXT, actor_id TEXT, scope_chat_id TEXT,
+  parent_id TEXT, record TEXT NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX deuz_chats_scope_idx ON deuz_chats (user_id, agent_id, scope_chat_id);
+
+CREATE TABLE deuz_sessions (
+  run_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+  step_index INTEGER NOT NULL, checkpoint TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+
+CREATE TABLE deuz_runs (
+  run_id TEXT PRIMARY KEY, status TEXT NOT NULL, record TEXT NOT NULL,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX deuz_runs_status_idx ON deuz_runs (status);
+```
+
+Plus, when fts5 is available, an external-content index over `deuz_memory.text` with the three sync triggers. `deuz_chats.chat_id` is the chat's own identity, so the *scope's* `chatId` gets its own `scope_chat_id` column — they are different things.
+
+`record` / `checkpoint` columns hold `serializeChatRecord` / `serializeCheckpoint` output, so binary message parts survive the round-trip (see the [`$deuzBytes` codec](/docs/modules/chat-persistence#the-serializechatrecord-codec)).
+
+### Search
+
+`memory.search()` picks a strategy from what the query carries:
+
+| Query | Strategy |
+| --- | --- |
+| `embedding` only | Bounded prefetch (`max(1000, topK × 50)` freshest rows), decode the Float32 blobs, cosine in JS. |
+| `text` only | FTS5 `bm25()`, normalized against the best hit so scores compare across queries. `LIKE` when fts5 is off or the phrase will not parse. |
+| both | **Hybrid**: cosine and bm25 ranks fused with RRF (k = 60) — the same merge [`hybridRetrieve`](/docs/modules/rag) uses. |
+| neither | The freshest rows in the scope, `score: 0`. |
+
+Two honest caveats. Embeddings round-trip through a **Float32** codec, so a stored `0.6` reads back as `0.6000000238418579` — the store is a float32 index exactly like pgvector, and the difference is far below any embedding model's noise floor. And the vector prefetch is bounded: on a scope with hundreds of thousands of rows the cosine ranking is an approximation over the freshest slice, which is the point at which you want the Postgres pack.
+
+---
+
+## Redis
+
+```ts title="redis.ts"
+import { createClient } from 'redis';
+import { createRedisStores } from '@deuz-sdk/core/stores/redis';
+
+const client = createClient({ url: process.env.REDIS_URL! });
+await client.connect();
+
+const stores = createRedisStores({ client }); // { memory, chats, sessions }
+```
+
+There is **no hard dependency on any Redis package**: the pack talks to `RedisClientLike`, an eleven-command structural seam spelled exactly the way node-redis spells it, so a connected `RedisClientType` (v4 **or** v5) is assignable with no wrapper and no `as`.
+
+```ts
+interface RedisClientLike {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<unknown>;
+  del(keys: string | string[]): Promise<unknown>;
+  sAdd(key: string, members: string | string[]): Promise<unknown>;
+  sRem(key: string, members: string | string[]): Promise<unknown>;
+  sMembers(key: string): Promise<string[]>;
+  sInter(keys: string | string[]): Promise<string[]>;
+  mGet(keys: string[]): Promise<Array<string | null>>;
+  zAdd(key: string, members: RedisZMember | RedisZMember[]): Promise<unknown>;
+  zRem(key: string, members: string | string[]): Promise<unknown>;
+  zRangeByScore(key: string, min: number | string, max: number | string): Promise<string[]>;
+}
+```
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `client` | `RedisClientLike` | — | An **already connected** client. The production path: your app owns pool size, TLS, retries and shutdown order, and `close()` never quits it. |
+| `url` | `string` | — | The convenience path. Lazily `import('redis')`s the **optional** peer (`^4.6.0 \|\| ^5.0.0`) and connects on the first command; `close()` quits exactly this client, because the pack opened it. |
+| `prefix` | `string` | `'deuz'` | Key namespace. Not escaped — it is yours, not a user's. |
+
+`client` and `url` are mutually exclusive arms of a union: pass one.
+
+### ioredis (and anything else) in ten lines
+
+ioredis spells its commands in lowercase and is in upstream maintenance mode, which is why node-redis is the documented client. It still fits through a plain object — no class, no adapter package:
+
+```ts title="ioredis-adapter.ts"
+import Redis from 'ioredis';
+import { createRedisStores, type RedisClientLike } from '@deuz-sdk/core/stores/redis';
+
+const io = new Redis(process.env.REDIS_URL!);
+
+const client: RedisClientLike = {
+  get: (k) => io.get(k),
+  set: (k, v) => io.set(k, v),
+  del: (k) => io.del(...(Array.isArray(k) ? k : [k])),
+  sAdd: (k, m) => io.sadd(k, ...(Array.isArray(m) ? m : [m])),
+  sRem: (k, m) => io.srem(k, ...(Array.isArray(m) ? m : [m])),
+  sMembers: (k) => io.smembers(k),
+  sInter: (k) => io.sinter(...(Array.isArray(k) ? k : [k])),
+  mGet: (keys) => io.mget(...keys),
+  zAdd: (k, m) =>
+    io.zadd(k, ...(Array.isArray(m) ? m : [m]).flatMap((e) => [e.score, e.value])),
+  zRem: (k, m) => io.zrem(k, ...(Array.isArray(m) ? m : [m])),
+  zRangeByScore: (k, min, max) => io.zrangebyscore(k, min, max),
+};
+
+const stores = createRedisStores({ client });
+```
+
+The same shape covers a cluster proxy, a Upstash HTTP client, or a test double.
+
+### Key schema
+
+Prefix `P` (default `deuz`). Every user-sourced segment — record id, scope value, hash, `chatId`, `runId` — is `encodeURIComponent`d, so a `:` inside an id can never forge a key boundary and two distinct ids can never collide.
+
+```
+P:mem:rec:<id>        STRING  JSON MemoryRecord (embedding inline as number[])
+P:mem:ix:user:<v>     SET     record ids — one index per scope FIELD
+P:mem:ix:agent:<v>    SET       (…:run:, …:actor:, …:chat: likewise)
+P:mem:ix:all          SET     every record id (the unscoped fallback)
+P:mem:hash:<hash>     SET     record ids carrying that content hash
+P:mem:expiry          ZSET    score = expiresAt, member = id
+P:chat:rec:<chatId>   STRING  serializeChatRecord (binary-safe)
+P:chat:ix             SET     chat ids
+P:sess:rec:<runId>    STRING  serializeCheckpoint (binary-safe)
+P:sess:ix             SET     run ids
+```
+
+`sweepExpiredMemories` reads the `P:mem:expiry` ZSET, so its cost is O(expired), not O(stored).
+
+<Callout type="warn" title="No MULTI in v1 — and the readers are built for it">
+A write is a **sequence** of independent commands (index sets first, the record string last), not a transaction. A crash in the middle can therefore leave an id in an index whose record does not exist.
+
+Every reader tolerates exactly that: ids are resolved with one `mGet` and a `null` row is skipped, so an orphan costs a wasted slot in a scan and **never a wrong answer**. `delete` and an unscoped `sweepExpiredMemories` clear the id-keyed leftovers whenever they pass over them. The sweeper is written to survive orphans rather than to assume they cannot exist.
+
+Wrapping the sequence in `MULTI` (or pipelining it) is a 2.x optimization, not a correctness fix — which is why it is stated here instead of quietly deferred.
+</Callout>
+
+### Search is client-side
+
+That is the honest trade of a v1 Redis backend. `search()` narrows by the scope indexes (`sInter` over the fields the query pins), pulls those records with **one** `mGet`, and ranks them in your process — cosine when the query carries an embedding, substring otherwise.
+
+So a query costs O(records in the scope), not O(matching records), and it moves the scope's rows over the wire. Keep scopes narrow (`chatId`, `userId`); reach for the Postgres pack once a single scope grows past a few thousand records. A server-side vector index would mean Redis Stack, a schema and a migration — out of scope for a drop-in adapter.
+
+This pack serves `memory`, `chats` and `sessions`. It has **no `runs`**: [`RunStore.list({ status })`](/docs/modules/autonomy) is a scan, and a scan is the one thing this key layout is worst at. Use SQLite or Postgres for the run dashboard.
+
+---
+
+## Postgres
+
+```ts title="postgres.ts"
+import { Pool } from 'pg';
+import { createPostgresStores } from '@deuz-sdk/core/stores/postgres';
+
+const stores = createPostgresStores({ client: new Pool({ connectionString: process.env.DATABASE_URL }) });
+await stores.migrate(); // optional: fail fast at boot instead of on the first write
+```
+
+The only thing this pack needs from a driver is `query(sql, params) → { rows }`, so `PgClientLike` is that method and nothing else — `pg.Pool`, `pg.Client`, `@neondatabase/serverless`, a Supabase pooler wrapper or a hand-rolled proxy all satisfy it structurally.
+
+```ts
+interface PgClientLike {
+  query(sql: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
+}
+```
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `client` | `PgClientLike` | — | Inject your own driver. Never closed by `close()`. |
+| `connectionString` | `string` | — | Convenience path: lazily `import('pg')`s the **optional** peer and opens a pool the pack owns. |
+| `schema` | `string` | `'public'` | Must already exist — `CREATE SCHEMA` is a deliberate DBA action. Validated against `/^[a-z_][a-z0-9_]*$/`. |
+| `pgvector` | `'auto' \| 'require' \| 'off'` | `'auto'` | See below. |
+| `dimensions` | `number` | `1536` | Width of the `vector(D)` column (OpenAI `text-embedding-3-small`). 1–16000. |
+
+`migrate()` is idempotent and memoized: every store method awaits it first, so calling it yourself is optional — do it at boot when you would rather fail fast. A failed attempt is **not** cached; the next call retries.
+
+### Schema v1
+
+```sql
+CREATE TABLE deuz_memory (
+  id TEXT PRIMARY KEY, text TEXT NOT NULL, hash TEXT NOT NULL, kind TEXT NOT NULL,
+  user_id TEXT, agent_id TEXT, run_id TEXT, actor_id TEXT, chat_id TEXT,
+  importance DOUBLE PRECISION, metadata JSONB,
+  embedding_json DOUBLE PRECISION[], embedding_model_id TEXT,
+  created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
+  last_accessed_at BIGINT, expires_at BIGINT, valid_at BIGINT, invalid_at BIGINT
+);
+CREATE INDEX deuz_memory_scope_idx   ON deuz_memory (user_id, agent_id, chat_id);
+CREATE INDEX deuz_memory_hash_idx    ON deuz_memory (hash);
+CREATE INDEX deuz_memory_expires_idx ON deuz_memory (expires_at) WHERE expires_at IS NOT NULL;
+
+-- only when pgvector is present:
+ALTER TABLE deuz_memory ADD COLUMN embedding vector(1536);
+CREATE INDEX deuz_memory_embedding_idx ON deuz_memory USING hnsw (embedding vector_cosine_ops);
+
+CREATE TABLE deuz_chats (
+  chat_id TEXT PRIMARY KEY,
+  user_id TEXT, agent_id TEXT, run_id TEXT, actor_id TEXT, scope_chat_id TEXT,
+  parent_id TEXT, record TEXT NOT NULL, updated_at BIGINT NOT NULL
+);
+CREATE TABLE deuz_sessions (
+  run_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+  step_index INT NOT NULL, checkpoint TEXT NOT NULL, created_at BIGINT NOT NULL
+);
+CREATE TABLE deuz_runs (
+  run_id TEXT PRIMARY KEY, status TEXT NOT NULL, record JSONB NOT NULL,
+  created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL
+);
+CREATE INDEX deuz_runs_status_idx ON deuz_runs (status);
+
+CREATE TABLE deuz_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); -- schema_version
+```
+
+Three implementation facts worth knowing, because they show up if you read the SQL log:
+
+- **The schema name is the one identifier that cannot be a bind parameter**, so it is validated against the unquoted-identifier pattern and rejected with an `InvalidRequestError` otherwise. Every other value in every statement is a `$n` placeholder.
+- **The migration is one multi-statement simple query wrapped in `BEGIN … COMMIT`.** `pool.query('BEGIN')` followed by a separate `query(ddl)` can land on *different* pooled connections, which would silently defeat the transaction. One query is one connection.
+- **`BIGINT` comes back from `pg` as a string** (int8 overflows a JS number), so every timestamp is coerced on read.
+
+### pgvector
+
+Two embedding columns, on purpose. `embedding_json DOUBLE PRECISION[]` is written on **every** upsert and is the source of truth. When pgvector is present, a second `embedding vector(D)` column is written alongside it and search runs on the HNSW index.
+
+| `pgvector` | Behavior |
+| --- | --- |
+| `'auto'` (default) | Probe `pg_extension`. Use pgvector if it is there, otherwise `embedding_json` + JS cosine over the 1000 freshest candidates. |
+| `'require'` | Refuse to migrate when the extension is missing (or when the connection cannot read `pg_extension`). |
+| `'off'` | Never probe, never create the `vector` column. |
+
+`CREATE EXTENSION` is **never** issued: it needs superuser-ish rights on most managed hosts, so it stays a deliberate DBA action — the same reasoning as `CREATE SCHEMA`.
+
+Nothing is lost by starting without the extension. Rows written in fallback mode are upgraded in one statement once a DBA installs it:
+
+```sql
+CREATE EXTENSION vector;           -- DBA, once
+
+UPDATE deuz_memory
+   SET embedding = embedding_json::vector
+ WHERE embedding IS NULL AND embedding_json IS NOT NULL;
+```
+
+The next `migrate()` adds the column and the HNSW index for you, so the order is: install the extension, restart (or call `migrate()`), then run the backfill.
+
+<Callout type="info" title="A loaded record carries no embedding">
+The read column set is the write set **minus** `embedding_json`: a 1536-dim array is ~20 KB of text on the wire, so it is fetched only by the fallback search that has to score it. `get`/`list`/`search` therefore return a `MemoryRecord` with no `embedding` field — unlike the in-memory store, which keeps it inline. Re-embed rather than reading it back.
+</Callout>
+
+### Search
+
+| Query | Strategy |
+| --- | --- |
+| `embedding`, pgvector on | `ORDER BY embedding <=> $vector`, `score = 1 - cosine_distance`. The index ranks. |
+| `embedding`, pgvector off | 1000 freshest candidates with `embedding_json`, cosine in JS, top-K. |
+| `text` | `ILIKE`, `score: 1`. |
+| `filter` | `metadata @> $json::jsonb` — combines with any of the above. |
+| neither | Freshest rows in the scope, `score: 0`. |
+
+`MemoryQuery.asOf` turns every branch into a point-in-time query (`valid_at <= asOf AND (invalid_at IS NULL OR invalid_at > asOf)`); without it the store shows the present, so soft-deleted rows are invisible — exactly what the in-memory reference store does.
+
+---
+
+## Wiring a pack into a run
+
+The seams are ordinary values, so they go wherever their seam is accepted. Nothing about the call options changes.
+
+```ts title="wired.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createPostgresStores } from '@deuz-sdk/core/stores/postgres';
+import { createEmbedder } from '@deuz-sdk/core/memory';
+
+const stores = createPostgresStores({ connectionString: process.env.DATABASE_URL! });
+
+const result = streamChat({
+  model,
+  messages,
+  tools,
+  maxSteps: 8,
+  // chat transcript
+  chat: { store: stores.chats, chatId: 'chat-42', scope: { userId: 'u_1' } },
+  // durable checkpoints
+  session: { store: stores.sessions, runId: 'run-7' },
+  // long-term memory, swept on write traffic
+  memory: {
+    seams: { store: stores.memory, embedder, llm, clock, generateId },
+    scope: { userId: 'u_1', chatId: 'chat-42' },
+    sweep: 'on-extract',
+  },
+});
+```
+
+`stores.runs` is the [`RunStore`](/docs/modules/autonomy#background-runs--live-view) a background-run dashboard reads — pass it to `createRunManager`.
+
+### Shutdown
+
+```ts
+process.on('SIGTERM', async () => {
+  await stores.close(); // Redis/Postgres: a no-op for an injected client — that one is yours
+});
+```
+
+## See also
+
+- [Memory](/docs/modules/memory) — the pipeline these stores back, plus `findByHash` / `deleteExpired` fast paths.
+- [Chat persistence](/docs/modules/chat-persistence) — the `ChatStore` seam and the binary-safe record codec.
+- [Durable runtime](/docs/agents/durable-runtime) — checkpoints, `resumeFromCheckpoint`, and the `SessionStore` contract.
+- [Autonomy](/docs/modules/autonomy) — `RunStore` and background runs.
+- [RAG](/docs/modules/rag) — the RRF fusion the SQLite hybrid search reuses.

@@ -44,7 +44,7 @@ export interface McpStdioOptions extends McpLifecycleOptions {
   onElicitationRequest?: McpElicitationHandler;
   /** See `McpClientOptions.sampling` — same semantics over stdio. */
   sampling?: McpSamplingOptions;
-  /** See `McpClientOptions.roots` — same semantics over stdio. */
+  /** See `McpClientOptions.roots` — same semantics over stdio (file:// only). */
   roots?: McpRootsOption;
 }
 
@@ -87,19 +87,24 @@ async function makeStdioClient(
   const { Client } = await loadSdk();
   const client = new Client(
     { name: options.name ?? 'deuz', version: options.version ?? '0.0.0' },
+    // `!== undefined` throughout, as in `mcp/index.ts`: `roots: []` is a value.
     {
       capabilities: {
-        ...(options.onElicitationRequest ? { elicitation: { form: {}, url: {} } } : {}),
-        ...(options.sampling ? { sampling: {} } : {}),
-        ...(options.roots ? { roots: { listChanged: true } } : {}),
+        ...(options.onElicitationRequest !== undefined
+          ? { elicitation: { form: {}, url: {} } }
+          : {}),
+        ...(options.sampling !== undefined ? { sampling: {} } : {}),
+        ...(options.roots !== undefined ? { roots: { listChanged: true } } : {}),
       },
     },
   );
-  if (options.onElicitationRequest) await registerElicitation(client, options.onElicitationRequest);
+  if (options.onElicitationRequest !== undefined) {
+    await registerElicitation(client, options.onElicitationRequest);
+  }
   await registerSamplingAndRoots(client, {
-    ...(options.sampling ? { sampling: options.sampling } : {}),
+    ...(options.sampling !== undefined ? { sampling: options.sampling } : {}),
     // One box for the life of the client so `setRoots()` survives a reconnect.
-    ...(rootsBox ? { roots: () => readRootsBox(rootsBox) } : {}),
+    ...(rootsBox !== undefined ? { roots: () => readRootsBox(rootsBox) } : {}),
   });
   await registerToolListChanged(client, hooks.toolListChanged);
   return client;

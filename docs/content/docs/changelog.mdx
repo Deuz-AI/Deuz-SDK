@@ -6,6 +6,32 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## 2.0.0
+
+**The things you used to build yourself.** Nine new subpaths, three new modalities, real databases behind the four storage seams, guardrails and handoffs in the loop, and MCP that connects itself. Everything additive: no existing type gained a required field, every 1.9 call still compiles, every stored checkpoint still loads. Full surface **and its limits**: [What is new in 2.0](/docs/reference/whats-new-2-0).
+
+- **Persistent stores** (`/stores/sqlite`, `/stores/redis`, `/stores/postgres`) — one factory per backend returning `MemoryStore` / `ChatStore` / `SessionStore` / `RunStore` on one connection. SQLite: FTS5 + vector hybrid over `node:sqlite`, zero dependencies. Postgres: pgvector HNSW with an `embedding_json` fallback and a one-statement upgrade. Redis: a structural client seam, no package dependency. → [Persistent stores](/docs/modules/stores)
+- **Guardrails** (`/guardrails`, `guardrails` call option) — `onInput` / `onToolCall` / `onOutput`, each pass / block / rewrite. A blocked tool call joins the existing denial machinery and does not count toward the runaway guard; a blocked input or output is a graceful `stoppedBy` stop. → [Guardrails](/docs/agents/guardrails)
+- **Handoffs** (`handoff()`) — transfer the run to another agent: system prompt, tools and model change, history travels. Deterministic interception, `maxHandoffs` loop guard, `handoff` stream part, durable resume. → [Handoffs](/docs/agents/handoffs)
+- **Zero-config MCP** (`mcp` call option) plus **OAuth 2.0** (`TokenStore`, `createOAuthProvider`, `/mcp/node` file store + loopback listener), **sampling**, **roots**, `ping()`-verified reconnect, `status()`, `keepAliveMs`, and `deps.mcpPool`. → [MCP](/docs/modules/mcp)
+- **Compaction** — public `compactMessages()`, a rolling summary that folds instead of stacking, automatic recovery from a provider context-overflow rejection, and `countTokens` for a real tokenizer. → [Compaction](/docs/modules/compaction)
+- **Speech, transcription, video** (`/speech`, `/transcription`, `/video`) — OpenAI + ElevenLabs TTS, OpenAI + Deepgram STT, and async video jobs over the OpenAI Videos shape.
+- **Memory** — `recall.scorer` / `maxChars` / `expandLinks`, `writePolicy`, `sweep: 'on-extract'`, write-time hash dedup, per-fact importance and links, and the optional `findByHash` / `deleteExpired` store fast paths. → [Memory](/docs/modules/memory)
+- **Eight more providers** — Perplexity, Cohere, DeepInfra, NVIDIA NIM, SambaNova, Hyperbolic, plus keyless **Ollama** and **LM Studio**; `CompatSettings.capabilities` and `apiKeyOptional` are public. → [Local models](/docs/providers/local)
+- **`runtimeContext`** — an opaque per-call value threaded into tools, `prepareStep`, `verifyStep`, `doneWhen` and every guardrail hook. Never serialized, never checkpointed.
+
+## 1.9.0
+
+**Parity, hardening, and no dead API.** Three surfaces that shipped as types with no producer now actually produce; the rest is ergonomics and a chat UI layer. → [What is new in 1.9](/docs/reference/whats-new-1-9)
+
+- **Producers for declared surface** — `warnings` (`CallWarning[]` on every result, plus `warning` parts on `fullStream`), `ToolStatePart.denied` / `deniedReason`, and `sub-agent` frames folded into `turn.subAgents`.
+- **Ergonomics** — `prompt` / `instructions`, a four-layer `timeout: { ttftMs, totalMs, stepMs, toolMs }`, `Tool.timeoutMs`, the `tool()` identity helper, `filePart()` / `imagePart()` with PDFs on all four wires, `consume()`, per-call `capabilities`, and `createOpenAICompatible({ id, baseURL })`.
+- **`createAgent`** (`/agent`) — a reusable agent as a frozen value of closures, not a class.
+- **OpenTelemetry bridge** (`/otel`) — `createOtelTracer()` / `createOtelObserver()` over the existing `deps.tracer` / `deps.observer` seams.
+- **Vertex ADC** (`/vertex/node`) — `createAdcKeyProvider()`, the Node twin of the edge-safe service-account key provider.
+- **Request validation** (`validateChatRequest` on `/chat` and `/edge`) — gate an attacker-controlled POST body before it reaches the loop. It never repairs; every failure is a rejection with `issues`.
+- **Two intentional behaviour changes** — `generateObject` / `streamObject` now reject loop options instead of ignoring them, and a hallucinated tool name self-heals into an `is_error` result instead of ending the run as a client hand-off.
+
 ## 1.8.0
 
 **Autonomous Agent Runtime.** The primitives to build a Manus-style, fully autonomous system on the edge-safe core — every heavy capability is a seam with a Node-only reference adapter. See [Autonomy](/docs/modules/autonomy) and the [Build your own Manus](/docs/cookbooks/autonomous-agent) cookbook.

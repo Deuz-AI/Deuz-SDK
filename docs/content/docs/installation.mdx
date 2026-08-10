@@ -88,10 +88,17 @@ The root export carries the free functions, the client, errors, and all canonica
 | `@deuz-sdk/core/google/extras` | Gemini explicit caching + Files API (`createGeminiCache`, `uploadFile`) |
 | `@deuz-sdk/core/voyage` | Voyage AI embeddings (`createVoyage`) |
 | `@deuz-sdk/core/vertex` | Vertex AI — Claude (`createVertexAnthropic`) + Gemini compat (`createVertexGoogle`) and native (`createVertexGoogleNative`) |
+| `@deuz-sdk/core/vertex/node` | Application Default Credentials for Vertex (`createAdcKeyProvider`) (1.9) |
+| `@deuz-sdk/core/agent` | `createAgent` — a reusable agent as a frozen value (1.9) |
+| `@deuz-sdk/core/otel` | OpenTelemetry bridge — `createOtelTracer` / `createOtelObserver` (1.9) |
 | `@deuz-sdk/core/pricing` | Optional USD cost table (2026) + `createPriceProvider` (token → $) |
 | `@deuz-sdk/core/middleware` | `wrapModel` + bundled `logging` / `simpleCache` / `redactPII` / `promptInjectionGuard` |
+| `@deuz-sdk/core/guardrails` | Built-in guardrails — `promptInjectionGuardrail`, `maxOutputLength` (2.0) |
 | `@deuz-sdk/core/image` | Synchronous OpenAI-compatible image generation (`generateImage`) |
 | `@deuz-sdk/core/midjourney` | Async Midjourney (`imagine` — submit / poll / action / webhook) |
+| `@deuz-sdk/core/speech` | Text-to-speech (`generateSpeech`, `createOpenAISpeech`, `createElevenLabs`) (2.0) |
+| `@deuz-sdk/core/transcription` | Speech-to-text (`transcribe`, `createOpenAITranscription`, `createDeepgram`) (2.0) |
+| `@deuz-sdk/core/video` | Async video jobs (`submitVideo` / `waitForVideo` / `downloadVideo` / `generateVideo`) (2.0) |
 | `@deuz-sdk/core/yunwu` | Yunwu unified relay — `createYunwu` + 2026 `YUNWU_MODELS` catalog |
 | `@deuz-sdk/core/memory` | Pure memory layer — extract / reconcile / recall + store seam |
 | `@deuz-sdk/core/memory/markdown` | Obsidian-style markdown `MemoryStore` (Node; hybrid `.md` + vector sidecar) |
@@ -101,14 +108,18 @@ The root export carries the free functions, the client, errors, and all canonica
 | `@deuz-sdk/core/skills/node` | Node filesystem `SkillSource` (`nodeSkillSource`) |
 | `@deuz-sdk/core/mcp` | MCP client over HTTP/SSE (edge-safe) (`createMcpClient`) |
 | `@deuz-sdk/core/mcp/stdio` | MCP client over stdio (Node-only) (`createStdioMcpClient`) |
+| `@deuz-sdk/core/mcp/node` | MCP OAuth helpers for Node — `createFileTokenStore`, `createLoopbackRedirect` (2.0) |
 | `@deuz-sdk/core/chat` | Framework-neutral chat state/reducers, branching helpers, and the scoped `ChatStore` seam |
 | `@deuz-sdk/core/chat/node` | Node JSONL `ChatStore` plus binary-safe chat record codecs |
+| `@deuz-sdk/core/stores/sqlite` | `createSqliteStores` — memory / chats / sessions / runs on one `node:sqlite` file (2.0) |
+| `@deuz-sdk/core/stores/redis` | `createRedisStores` — memory / chats / sessions over a structural Redis client seam (2.0) |
+| `@deuz-sdk/core/stores/postgres` | `createPostgresStores` — four seams, optional pgvector (2.0) |
 | `@deuz-sdk/core/durable` | Checkpoint/resume stores, signed approvals, and durable × resumable chat helpers |
 | `@deuz-sdk/core/observe` | Local observers, composition/filtering, and pure run summaries for the versioned observation protocol |
 | `@deuz-sdk/core/observe/node` | Bounded JSONL observation sink and event reader (Node-only) |
 | `@deuz-sdk/core/azure` | Azure OpenAI / Foundry — `createAzure` (deployment URL, `api-key` or Entra) |
 | `@deuz-sdk/core/bedrock` | Amazon Bedrock Mantle — `createBedrock` (Bearer API key, no SigV4 SDK) |
-| `@deuz-sdk/core/providers` | OpenAI-compat: **Mistral, DeepSeek, Qwen, Kimi**, Groq, Together, OpenRouter, Cerebras, Fireworks, GLM, MiniMax + Azure/Bedrock re-exports + `createProviderRegistry` |
+| `@deuz-sdk/core/providers` | 20 OpenAI-compat factories — Mistral, DeepSeek, Qwen, Kimi, Groq, Together, OpenRouter, Cerebras, Fireworks, GLM, MiniMax + 2.0's Perplexity, Cohere, DeepInfra, NVIDIA, SambaNova, Hyperbolic and the keyless Ollama / LM Studio — plus `createOpenAICompatible`, Azure/Bedrock re-exports and `createProviderRegistry` |
 | `@deuz-sdk/core/workspace` | Externalized path-addressed memory seam + `createWorkspaceTools` (1.8) |
 | `@deuz-sdk/core/workspace/node` | Sandboxed directory `Workspace` (`createFileWorkspace`) |
 | `@deuz-sdk/core/compute` | `ComputeSandbox` seam + `codeActTool` / `shellTool` (1.8) |

@@ -335,11 +335,12 @@ describe('createMcpClient over HTTP — reconnect', () => {
 
     await server.restart();
 
-    // NOTE: the drop is discovered by the PING, not by an onclose. The SDK's
-    // StreamableHTTPClientTransport answers a dead socket with `onerror` plus its
-    // own GET-stream retries and never closes the client, so `keepAliveMs` is the
-    // only session-level drop detector the HTTP transport has (see the
-    // characterization test below).
+    // NOTE: the drop is discovered by a failed PING, never by an onclose — the
+    // SDK's StreamableHTTPClientTransport answers a dead socket with `onerror`
+    // and its own GET-stream retries, and closes nothing. Two detectors can
+    // reach for that ping here (this heartbeat, and the `onerror` probe of the
+    // test below); whichever rejects first reports the drop, and the loser is
+    // swallowed by the one-drop-per-session latch — hence exactly ONE backoff.
     clock.fire();
     await waitFor(() => client.status() === 'reconnecting', 'the failed ping to report a drop');
     expect(clock.delays).toEqual([30_000, 100]);
@@ -441,7 +442,7 @@ describe('createMcpClient over HTTP — reconnect', () => {
     expect(server.sessionCount()).toBe(1);
   }, 20_000);
 
-  it('CHARACTERIZATION: without keepAliveMs a dead HTTP session still reports connected', async () => {
+  it('notices a dead session WITHOUT keepAliveMs, via the onerror liveness probe', async () => {
     const clock = makeFakeClock();
     const { seen, onStatusChange } = trackStatus();
     const server = await startServer();
@@ -451,25 +452,68 @@ describe('createMcpClient over HTTP — reconnect', () => {
       reconnect: { jitter: 0, initialDelayMs: 100 },
     });
     expect(Object.keys(await client.listTools())).toEqual(['echo', 'add', 'boom']);
+    // No heartbeat is configured, so nothing at all is armed on the clock. That
+    // is the whole point: before 2.0 it meant nothing could ever notice a drop.
+    expect(clock.pending()).toBe(0);
+    // The standalone GET stream is the socket the restart kills — wait for it,
+    // or the restart lands before there is anything to notice.
+    await server.waitForClientStream();
 
     await server.restart();
 
-    // Nothing schedules and nothing transitions: the SDK's HTTP transport reports
-    // a dropped socket through `onerror` only, and `createManagedConnection`
-    // reconnects off `onclose`. So the session is dead, the status is a lie, and
-    // the tool cache happily serves the list it captured before the restart …
-    expect(clock.delays).toEqual([]);
-    expect(clock.pending()).toBe(0);
+    // The transport reports the dead socket through `onerror` and never closes,
+    // so `onclose` recovery cannot see this. The probe behind `onerror` asks the
+    // server one `ping()`; the restarted listener 404s the stale session id, and
+    // THAT is the drop — no heartbeat, no clock, no help from the caller.
+    await waitFor(() => client.status() === 'reconnecting', 'the dead session to be noticed');
+    expect(clock.delays).toEqual([100]); // the first backoff, and nothing before it
+
+    clock.fire();
+    await waitFor(() => client.status() === 'connected', 'the reconnect to land');
     expect(seen).toEqual([
       ['connecting', undefined],
       ['connected', undefined],
+      ['reconnecting', 1],
+      ['connected', undefined],
     ]);
-    expect(client.status()).toBe('connected');
+
+    // A real, usable session on the restarted listener — and the tool cache was
+    // dropped with it, so the list is refetched rather than served from before.
+    expect(server.sessionCount()).toBe(1);
     expect(Object.keys(await client.listTools())).toEqual(['echo', 'add', 'boom']);
-    // … while anything that actually touches the wire fails, because the session
-    // id the transport still carries is 404 on the restarted listener.
-    await expect(client.callTool('echo', { value: 'ghost' })).rejects.toThrow();
-    expect(client.status()).toBe('connected');
-    // Configure `keepAliveMs` and the same restart recovers — see the test above.
+    expect(await client.callTool('echo', { value: 'alive again' })).toBe('echo:alive again');
+    // Recovery is over: no keepalive was configured, so nothing stays armed.
+    expect(clock.pending()).toBe(0);
+  }, 20_000);
+
+  it('a first connect that never lands leaves no reconnect loop behind it', async () => {
+    const clock = makeFakeClock();
+    const { seen, onStatusChange } = trackStatus();
+    // A port nobody is listening on: take one, then give it back.
+    const gone = await startServer();
+    const url = gone.url;
+    await gone.close();
+
+    await expect(
+      createMcpClient({
+        transport: { type: 'http', url },
+        clock,
+        onStatusChange,
+        reconnect: { jitter: 0, initialDelayMs: 100 },
+      }),
+    ).rejects.toThrow();
+
+    // The SDK closes its own client when the handshake fails, firing `onclose`.
+    // Read as a drop that would start a reconnect loop nobody holds a handle to
+    // (`createManagedConnection` never returned), so nothing could ever close it
+    // — a background reconnect storm against an unreachable URL. Recovery is
+    // armed only once a session is live, so the rejection is the end of it.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(seen).toEqual([
+      ['connecting', undefined],
+      ['error', undefined],
+    ]);
+    expect(clock.pending()).toBe(0);
+    expect(clock.delays).toEqual([]);
   }, 20_000);
 });

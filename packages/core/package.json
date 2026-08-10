@@ -256,6 +256,16 @@
         "default": "./dist/middleware.cjs"
       }
     },
+    "./guardrails": {
+      "import": {
+        "types": "./dist/guardrails.d.ts",
+        "default": "./dist/guardrails.js"
+      },
+      "require": {
+        "types": "./dist/guardrails.d.cts",
+        "default": "./dist/guardrails.cjs"
+      }
+    },
     "./image": {
       "import": {
         "types": "./dist/image.d.ts",
@@ -264,6 +274,36 @@
       "require": {
         "types": "./dist/image.d.cts",
         "default": "./dist/image.cjs"
+      }
+    },
+    "./speech": {
+      "import": {
+        "types": "./dist/speech.d.ts",
+        "default": "./dist/speech.js"
+      },
+      "require": {
+        "types": "./dist/speech.d.cts",
+        "default": "./dist/speech.cjs"
+      }
+    },
+    "./transcription": {
+      "import": {
+        "types": "./dist/transcription.d.ts",
+        "default": "./dist/transcription.js"
+      },
+      "require": {
+        "types": "./dist/transcription.d.cts",
+        "default": "./dist/transcription.cjs"
+      }
+    },
+    "./video": {
+      "import": {
+        "types": "./dist/video.d.ts",
+        "default": "./dist/video.js"
+      },
+      "require": {
+        "types": "./dist/video.d.cts",
+        "default": "./dist/video.cjs"
       }
     },
     "./midjourney": {
@@ -384,6 +424,46 @@
       "require": {
         "types": "./dist/mcp/stdio.d.cts",
         "default": "./dist/mcp/stdio.cjs"
+      }
+    },
+    "./mcp/node": {
+      "import": {
+        "types": "./dist/mcp/node.d.ts",
+        "default": "./dist/mcp/node.js"
+      },
+      "require": {
+        "types": "./dist/mcp/node.d.cts",
+        "default": "./dist/mcp/node.cjs"
+      }
+    },
+    "./stores/sqlite": {
+      "import": {
+        "types": "./dist/stores/sqlite.d.ts",
+        "default": "./dist/stores/sqlite.js"
+      },
+      "require": {
+        "types": "./dist/stores/sqlite.d.cts",
+        "default": "./dist/stores/sqlite.cjs"
+      }
+    },
+    "./stores/redis": {
+      "import": {
+        "types": "./dist/stores/redis.d.ts",
+        "default": "./dist/stores/redis.js"
+      },
+      "require": {
+        "types": "./dist/stores/redis.d.cts",
+        "default": "./dist/stores/redis.cjs"
+      }
+    },
+    "./stores/postgres": {
+      "import": {
+        "types": "./dist/stores/postgres.d.ts",
+        "default": "./dist/stores/postgres.js"
+      },
+      "require": {
+        "types": "./dist/stores/postgres.d.cts",
+        "default": "./dist/stores/postgres.cjs"
       }
     },
     "./durable": {
@@ -517,8 +597,10 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@standard-community/standard-json": "^0.2.0",
     "mammoth": "^1.8.0",
+    "pg": "^8.11.0",
     "playwright": "^1.40.0",
     "react": "^18.0.0 || ^19.0.0",
+    "redis": "^4.6.0 || ^5.0.0",
     "unpdf": "^0.12.0",
     "xlsx": "^0.18.0",
     "zod": "^3.23.0 || ^4.0.0"
@@ -549,6 +631,12 @@
       "optional": true
     },
     "playwright": {
+      "optional": true
+    },
+    "redis": {
+      "optional": true
+    },
+    "pg": {
       "optional": true
     }
   },

@@ -134,8 +134,8 @@ return response;
 - It is **memoized** (safe to call twice; terminal effects fire once) and **never rejects** — failures go to `consume({ onError })` and remain on `fullStream` as an `error` part.
 - Reading `result.consume` does **not** start the pump; it is a plain method, not a getter.
 
-<Callout type="warn" title="Optional on the type for a reason">
-Two paths do not provide it yet: `streamChat({ fallbackModels })` and the `withFallback` middleware return `consume: undefined`, where `res.consume?.()` is a silent no-op. Write `res.consume?.()`, not `res.consume!()`.
+<Callout type="info" title="Optional on the type, provided on every path">
+Every path the SDK produces — including `streamChat({ fallbackModels })` and the `withFallback` middleware, which forward the winner's drain through their own subscription — provides `consume()`. It stays **optional on the type** so a hand-written `StreamChatResult` (a test double, a custom wrapper) remains valid. Write `res.consume?.()`, not `res.consume!()`, on any value you did not create yourself.
 </Callout>
 
 `StreamObjectResult.consume` has the identical contract.

@@ -11,6 +11,7 @@ import {
   type McpSamplingRequest,
   type RawMcpClient,
 } from '../src/mcp/shared';
+import { InvalidRequestError } from '../src/errors';
 import { createOpenAI } from '../src/openai';
 import { sseEvents, sseResponse, mockFetch } from './fixtures/sse';
 
@@ -256,20 +257,44 @@ describe('mcpStopReason', () => {
 // ===================================================================
 
 describe('root URI normalization', () => {
-  it('promotes plain paths to file:// and passes existing URIs through', () => {
+  it('promotes plain paths to file:// and passes a file:// URI through', () => {
     expect(normalizeRootUri('/home/umut/project')).toBe('file:///home/umut/project');
     expect(normalizeRootUri('C:\\Users\\umut\\project')).toBe('file://C:/Users/umut/project');
     expect(normalizeRootUri('file:///already/a/uri')).toBe('file:///already/a/uri');
-    expect(normalizeRootUri('https://example.com/repo')).toBe('https://example.com/repo');
+    // A single-letter "scheme" is a Windows drive, never a URI — the promotion
+    // above is what proves the scheme test does not swallow `C:`.
+    expect(normalizeRootUri('D:\\data')).toBe('file://D:/data');
+  });
+
+  it('refuses every other scheme — MCP RootSchema is `startsWith("file://")`', () => {
+    for (const bad of ['https://example.com/repo', 'http://x.dev', 'ftp://f/x', 'mailto:a@b.c']) {
+      expect(() => normalizeRootUri(bad)).toThrow(InvalidRequestError);
+      expect(() => normalizeRootUri(bad)).toThrow(/file:\/\//);
+    }
+    // The message names the value, so the offender in a long list is obvious.
+    expect(() => normalizeRootUri('https://example.com/repo')).toThrow(/example\.com/);
+    // `file:` with ONE slash fails the SDK's literal prefix check too.
+    expect(() => normalizeRootUri('file:/single/slash')).toThrow(InvalidRequestError);
   });
 });
 
 describe('buildRootsHandler', () => {
   it('answers roots/list from a fixed list, normalized', async () => {
-    const handler = buildRootsHandler(createRootsBox(['/srv/app', 'C:\\work', 'https://x.dev/r']));
+    const handler = buildRootsHandler(createRootsBox(['/srv/app', 'C:\\work', 'file:///lit']));
     expect(await handler()).toEqual({
-      roots: [{ uri: 'file:///srv/app' }, { uri: 'file://C:/work' }, { uri: 'https://x.dev/r' }],
+      roots: [{ uri: 'file:///srv/app' }, { uri: 'file://C:/work' }, { uri: 'file:///lit' }],
     });
+  });
+
+  it('rejects a fixed list carrying a non-file scheme at construction', () => {
+    // One bad root would make the SERVER reject the whole result, so the box
+    // never accepts it: the failure lands where the list was supplied.
+    expect(() => createRootsBox(['/ok', 'https://example.com/repo'])).toThrow(InvalidRequestError);
+  });
+
+  it('rejects a FUNCTION form when it is read, since it cannot be checked earlier', async () => {
+    const handler = buildRootsHandler(createRootsBox(() => ['https://example.com/repo']));
+    await expect(handler()).rejects.toThrow(InvalidRequestError);
   });
 
   it('re-reads a function form on every request (sync and async)', async () => {
@@ -310,5 +335,20 @@ describe('setRoots', () => {
   it('rejects with an actionable upgrade error when the SDK cannot notify', async () => {
     const client = attachRoots(wrapMcpClient(fakeRaw), fakeRaw, createRootsBox(['/one']));
     await expect(client.setRoots(['/x'])).rejects.toThrow(/\^1\.29\.0/);
+  });
+
+  it('refuses a non-file root without swapping the box or notifying', async () => {
+    const sendRootsListChanged = vi.fn(async () => {});
+    const raw: RawMcpClient = { ...fakeRaw, sendRootsListChanged };
+    const box = createRootsBox(['/one']);
+    const client = attachRoots(wrapMcpClient(raw), raw, box);
+
+    await expect(client.setRoots(['/two', 'https://example.com/repo'])).rejects.toThrow(
+      InvalidRequestError,
+    );
+    // Validated before the swap: the server's view of our roots is untouched,
+    // and it was never told to re-read them.
+    expect(box.value).toEqual(['/one']);
+    expect(sendRootsListChanged).not.toHaveBeenCalled();
   });
 });

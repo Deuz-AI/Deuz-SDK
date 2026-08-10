@@ -90,9 +90,9 @@ for (const w of (await result.warnings) ?? []) console.warn(w.type, w.message);
 
 It is `type: 'other'` because `CallWarning['type']` has no content-specific member and that union is locked.
 
-<Callout type="warn" title="The typed warning covers one wire and one call shape">
-Only the **Chat Completions** wire threads the warning sink today: on the `anthropic` and `responses` wires a dropped document is still a log line and nothing else. And because a loop-routed call (`tools`, `chat`, `memory`, `verifyStep`, `doneWhen`) does not merge a step's model-level warnings, the typed entry appears on a **tool-less** `streamChat` only. `generateText` never carries it either. See [Declared but inert](/docs/reference/whats-new-1-9#declared-but-inert).
-</Callout>
+All three wires that can drop a document thread the warning sink — `chat_completions`, `anthropic` and `responses` all report through one shared helper, so the typed entry lands on `result.warnings` and (streaming) on `fullStream` as a `warning` part. The `native` Gemini wire accepts PDFs, so it never drops one.
+
+The pre-1.9 `deps.logger.warn` line is unchanged in shape, and the sink records quietly on top of it: one drop still produces exactly **one** log line for a log-based workflow.
 
 ## From a file picker
 

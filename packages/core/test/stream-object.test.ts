@@ -299,6 +299,8 @@ const EVERY_IGNORED_OPTION = {
   activeTools: ['weather'],
   verifyStep: () => undefined,
   maxVerifyAttempts: 2,
+  doneWhen: () => true,
+  falseFinishGuard: { maxRetries: 1 },
   compaction: 'auto',
   approveToolCall: () => true,
   approvalResponses: [{ approvalId: 'a1', approved: true }],
@@ -308,6 +310,8 @@ const EVERY_IGNORED_OPTION = {
   fallbackModels: [createAnthropic({ apiKey: 'k' })('claude-opus-4-8')],
   approvalSigner: { sign: async () => 't', verify: async () => null },
   approvalMaxAgeMs: 5_000,
+  mcp: [{ url: 'https://mcp.invalid/mcp' }],
+  guardrails: { input: [{ name: 'block-all', execute: () => ({ action: 'block' as const }) }] },
 } as unknown as Partial<CommonCallOptions>;
 
 /** Declaration order of `CommonCallOptions` — the guard's list is stable. */
@@ -323,6 +327,8 @@ const EVERY_IGNORED_KEY = [
   'activeTools',
   'verifyStep',
   'maxVerifyAttempts',
+  'doneWhen',
+  'falseFinishGuard',
   'compaction',
   'approveToolCall',
   'approvalResponses',
@@ -332,6 +338,8 @@ const EVERY_IGNORED_KEY = [
   'fallbackModels',
   'approvalSigner',
   'approvalMaxAgeMs',
+  'mcp',
+  'guardrails',
 ];
 
 /** The keys the error message actually listed. */
@@ -370,6 +378,58 @@ describe('object calls reject silently-ignored loop options (1.9)', () => {
     );
     expect(err).toBeInstanceOf(InvalidRequestError);
     expect(listedKeys(err!.message)).toEqual(EVERY_IGNORED_KEY);
+  });
+
+  // The 1.9 guard shipped without the false-finish pair, so `doneWhen` kept the
+  // exact bug the guard exists for: accepted, never consulted, silently inert.
+  it('rejects doneWhen — the guard is never consulted on a single-turn call', async () => {
+    const doneWhen = vi.fn(() => true);
+    const { fetch, calls } = mockFetch(() =>
+      sseResponse([anthropicJsonStream(['{"city":"Paris"}'])]),
+    );
+    const promise = generateObject({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      schema: SCHEMA,
+      doneWhen,
+    });
+    await expect(promise).rejects.toBeInstanceOf(InvalidRequestError);
+    await expect(promise).rejects.toThrow(/doneWhen/);
+    expect(doneWhen).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('rejects falseFinishGuard on its own (inert in the loop, impossible here)', async () => {
+    const { fetch, calls } = mockFetch(() =>
+      sseResponse([anthropicJsonStream(['{"city":"Paris"}'])]),
+    );
+    const promise = generateObject({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      schema: SCHEMA,
+      falseFinishGuard: false,
+    });
+    await expect(promise).rejects.toThrow(/falseFinishGuard/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('streamObject rejects doneWhen too, on the stream (G2: no sync throw)', async () => {
+    const doneWhen = vi.fn(() => true);
+    const { fetch, calls } = mockFetch(() =>
+      sseResponse([anthropicJsonStream(['{"city":"Paris"}'])]),
+    );
+    let result!: ReturnType<typeof streamObject>;
+    expect(() => {
+      result = streamObject({
+        model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+        messages: [{ role: 'user', content: 'hi' }],
+        schema: SCHEMA,
+        doneWhen,
+      });
+    }).not.toThrow();
+    await expect(result.object).rejects.toThrow(/doneWhen/);
+    expect(doneWhen).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
   });
 
   it('streamObject surfaces the failure on the stream and rejects object (G2: no sync throw)', async () => {
@@ -435,6 +495,10 @@ describe('object calls reject silently-ignored loop options (1.9)', () => {
       providerOptions: { anthropic: { foo: 'bar' } },
       promptCaching: 'auto',
       agentPath: ['planner'],
+      // Inert here, but deliberately NOT flagged: request-scoped context is data
+      // a wrapper threads through EVERY call, not a control the caller could
+      // believe is armed.
+      runtimeContext: { tenant: 't1' },
       // Empty/default-valued loop options ask for NOTHING — a generic wrapper
       // that always spreads them behaves identically today, so they must pass.
       tools: {},

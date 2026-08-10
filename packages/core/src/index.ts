@@ -21,6 +21,20 @@ export {
 export { agentTool } from './inference/agent-tool';
 export type { AgentToolDef } from './inference/agent-tool';
 
+// Agent HANDOFF (2.0 additive) — transfer the run to another agent, history and
+// all. The counterpart to `agentTool`, which delegates and comes back.
+export { handoff } from './inference/handoff';
+export type { HandoffAgentDef, HandoffOptions } from './inference/handoff';
+
+// Built-in guardrails (2.0 additive) — ready-made values for the `guardrails`
+// call option; the contract types ride the `./types` re-export below.
+export { promptInjectionGuardrail, maxOutputLength } from './guardrails';
+
+// Manual context compaction (2.0 additive) — the loop's layers over a plain
+// array, for callers who own the history. Pure unless given a `summarize`.
+export { compactMessages } from './compaction';
+export type { CompactMessagesDeps, CompactMessagesResult, CompactionEvent } from './compaction';
+
 // Typed tool authoring (1.9 additive) — `tool()` is a pure identity function
 // (`tool(def) === def`); it exists only to flow the `parameters` schema's type
 // into `execute(args)`, which `ToolSet = Record<string, Tool>` otherwise erases.
@@ -60,6 +74,7 @@ export {
   NoObjectGeneratedError,
   ToolExecutionError,
   UnsupportedCapabilityError,
+  McpAuthorizationRequiredError,
 } from './errors';
 export type { APICallErrorOptions, DeuzErrorJSON } from './errors';
 

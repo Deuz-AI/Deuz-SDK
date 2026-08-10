@@ -259,8 +259,11 @@ interface FakeMcp {
   listToolsCalls: number;
   closeCalls: number;
   pingRejects: boolean;
-  /** What the SDK does when a session dies under us. */
+  pingCalls: number;
+  /** What a stdio transport does when the child dies: it closes the client. */
   drop(): void;
+  /** What the HTTP transport does instead: it reports and closes NOTHING. */
+  transportError(message?: string): void;
   /** What a server's `notifications/tools/list_changed` does. */
   notifyToolListChanged(): void;
 }
@@ -272,7 +275,10 @@ function makeFakeMcp(tools: McpToolDef[] = [{ name: 'a' }]): FakeMcp {
     listToolsCalls: 0,
     closeCalls: 0,
     pingRejects: false,
+    pingCalls: 0,
     drop: () => fake.client.onclose?.(),
+    transportError: (message = 'SSE stream disconnected') =>
+      fake.client.onerror?.(new Error(message)),
     notifyToolListChanged: () => onNotify?.(),
     client: {
       connect: async () => {},
@@ -289,6 +295,7 @@ function makeFakeMcp(tools: McpToolDef[] = [{ name: 'a' }]): FakeMcp {
         onNotify = () => handler({});
       },
       ping: async () => {
+        fake.pingCalls++;
         if (fake.pingRejects) throw new Error('ping timed out');
         return {};
       },
@@ -575,6 +582,167 @@ describe('managed connection — reconnect', () => {
     fakes[0]!.drop();
     await clock.fire();
     expect(managed.status()).toBe('connected');
+  });
+});
+
+// The HTTP transport never calls `onclose`: a dead socket arrives as `onerror`
+// and its own event-stream retries. These pin the verdict rule that turns that
+// signal into a drop — the integration proof is in `mcp-http.test.ts`.
+describe('managed connection — a transport error is a QUESTION, not a drop', () => {
+  it('drops when the verification ping rejects', async () => {
+    const clock = makeFakeClock();
+    const fakes = [makeFakeMcp(), makeFakeMcp()];
+    const managed = await createManagedConnection({
+      ...factories(fakes),
+      // No keepAliveMs: `onerror` is the only thing that can notice this.
+      lifecycle: { clock, reconnect: { jitter: 0, initialDelayMs: 500 } },
+    });
+    fakes[0]!.pingRejects = true;
+
+    fakes[0]!.transportError();
+    await settle();
+    expect(fakes[0]!.pingCalls).toBe(1);
+    expect(managed.status()).toBe('reconnecting');
+    expect(clock.delays).toEqual([500]);
+
+    await clock.fire();
+    expect(managed.status()).toBe('connected');
+    expect(managed.raw()).toBe(fakes[1]!.client);
+  });
+
+  it('keeps the session when the ping still answers (a transient error)', async () => {
+    const clock = makeFakeClock();
+    const fake = makeFakeMcp();
+    const managed = await createManagedConnection({
+      ...factories([fake]),
+      lifecycle: { clock, reconnect: { jitter: 0 } },
+    });
+
+    // A malformed SSE frame or one failed stream retry lands here too — tearing
+    // the connection down over those would be worse than the bug it fixes.
+    fake.transportError('could not parse message');
+    await settle();
+    expect(fake.pingCalls).toBe(1);
+    expect(managed.status()).toBe('connected');
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('asks once, however many errors the transport reports', async () => {
+    const clock = makeFakeClock();
+    const fakes = [makeFakeMcp(), makeFakeMcp()];
+    const managed = await createManagedConnection({
+      ...factories(fakes),
+      lifecycle: { clock, reconnect: { jitter: 0, initialDelayMs: 500 } },
+    });
+    fakes[0]!.pingRejects = true;
+
+    // The SDK reports the disconnect, then every failed retry, then "maximum
+    // reconnection attempts exceeded" — one drop, one backoff ladder.
+    fakes[0]!.transportError();
+    fakes[0]!.transportError();
+    fakes[0]!.transportError();
+    await settle();
+
+    expect(fakes[0]!.pingCalls).toBe(1);
+    expect(clock.delays).toEqual([500]);
+    expect(managed.status()).toBe('reconnecting');
+  });
+
+  it('never probes a session that is not live yet', async () => {
+    const clock = makeFakeClock();
+    const fake = makeFakeMcp();
+    fake.client.connect = async () => {
+      // What a failing handshake looks like: the error, then the SDK closing
+      // its own client. Neither may arm recovery — the caller owns the retry.
+      fake.client.onerror?.(new Error('connection refused'));
+      fake.client.onclose?.();
+      throw new Error('connection refused');
+    };
+
+    await expect(
+      createManagedConnection({
+        ...factories([fake]),
+        lifecycle: { clock, reconnect: { jitter: 0 } },
+      }),
+    ).rejects.toThrow('connection refused');
+
+    await settle();
+    expect(fake.pingCalls).toBe(0);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('stays quiet on an SDK with no ping() to ask', async () => {
+    const clock = makeFakeClock();
+    const fake = makeFakeMcp();
+    delete fake.client.ping;
+    const managed = await createManagedConnection({
+      ...factories([fake]),
+      lifecycle: { clock, reconnect: { jitter: 0 } },
+    });
+
+    // Nothing cheap to verify with, so the 1.x behavior stands rather than a
+    // guess that could kill a live session.
+    fake.transportError();
+    await settle();
+    expect(managed.status()).toBe('connected');
+    expect(clock.pending()).toBe(0);
+  });
+
+  it('reports the ORIGINAL transport error, not the ping failure', async () => {
+    const clock = makeFakeClock();
+    let seenError: unknown;
+    const fake = makeFakeMcp();
+    fake.pingRejects = true;
+    await createManagedConnection({
+      ...factories([fake]),
+      lifecycle: {
+        clock,
+        reconnect: { jitter: 0, maxAttempts: 1 },
+        onStatusChange: (status, info) => {
+          if (status === 'reconnecting') seenError = info?.error;
+        },
+      },
+    });
+
+    fake.transportError('SSE stream disconnected: ECONNRESET');
+    await settle();
+    // The ping only answered "yes it is dead"; the first error says why.
+    expect((seenError as Error).message).toBe('SSE stream disconnected: ECONNRESET');
+  });
+
+  it('reports ONE drop when a heartbeat and a transport error race', async () => {
+    const clock = makeFakeClock();
+    const { seen, onStatusChange } = trackStatus();
+    const fakes = [makeFakeMcp(), makeFakeMcp()];
+    const managed = await createManagedConnection({
+      ...factories(fakes),
+      lifecycle: {
+        clock,
+        onStatusChange,
+        keepAliveMs: 1000,
+        reconnect: { jitter: 0, initialDelayMs: 500 },
+      },
+    });
+    fakes[0]!.pingRejects = true;
+
+    // Both detectors reach for the same dead session. Generation alone would not
+    // stop the second: it only moves once an ATTEMPT runs, so both would pass
+    // the check during the backoff and start their own ladder.
+    fakes[0]!.transportError();
+    await clock.fire(); // the keepalive beat, on the session already being dropped
+    await settle();
+
+    expect(seen).toEqual([
+      ['connecting', undefined],
+      ['connected', undefined],
+      ['reconnecting', 1],
+    ]);
+    expect(clock.delays).toEqual([1000, 500]);
+    expect(clock.pending()).toBe(1); // exactly one backoff sleep
+
+    await clock.fire();
+    expect(managed.status()).toBe('connected');
+    expect(managed.raw()).toBe(fakes[1]!.client);
   });
 });
 

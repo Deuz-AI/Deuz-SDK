@@ -24,6 +24,14 @@ import type { TokenStore, McpOAuthOptions, DeuzOAuthProvider } from '../types/co
 export type { TokenStore, McpOAuthOptions, DeuzOAuthProvider } from '../types/config';
 
 /**
+ * What the SDK asks us to forget, mirrored from `OAuthClientProvider`. The SDK
+ * derives the scope from the error the authorization server returned:
+ * `invalid_grant` (a dead code or refresh token) → `'tokens'`, `invalid_client`
+ * / `unauthorized_client` (a dead registration) → `'all'`.
+ */
+type SdkInvalidationScope = 'all' | 'client' | 'tokens' | 'verifier' | 'discovery';
+
+/**
  * The SDK's `OAuthClientProvider`, mirrored STRUCTURALLY (the optional peer's
  * types must never leak into our public `.d.ts`). Only the members the SDK
  * actually calls are declared; the optional hooks we do not implement
@@ -40,6 +48,7 @@ interface SdkOAuthClientProvider {
   redirectToAuthorization(authorizationUrl: URL): Promise<void>;
   saveCodeVerifier(codeVerifier: string): Promise<void>;
   codeVerifier(): Promise<string>;
+  invalidateCredentials(scope: SdkInvalidationScope): Promise<void>;
 }
 
 /** The slice of `@modelcontextprotocol/sdk/client/auth.js` we drive. */
@@ -257,6 +266,27 @@ export function createOAuthProvider(options: McpOAuthOptions): DeuzOAuthProvider
       }
       return verifier;
     },
+
+    /**
+     * Drop what the authorization server just rejected. The SDK's `auth()`
+     * wrapper calls this and then re-runs the WHOLE flow, so a provider that
+     * no-ops here replays the identical dead credential — the second attempt
+     * fails the same way, the SDK's raw `InvalidGrantError` escapes instead of
+     * our `McpAuthorizationRequiredError`, and the dead pair stays in the store:
+     * a permanent lockout until someone calls `invalidate()` by hand. Deleting
+     * lets the re-run fall through to a fresh authorization instead.
+     *
+     * `server-url` survives every scope: it is a binding, not a credential, and
+     * the process that carries the `?code=` back needs it to know which
+     * exchange it is completing.
+     */
+    async invalidateCredentials(scope) {
+      if (scope === 'all' || scope === 'tokens') await store.delete(key('tokens'));
+      if (scope === 'all' || scope === 'verifier') await store.delete(key('code-verifier'));
+      if (scope === 'all' || scope === 'client') await store.delete(key('client-info'));
+      // 'discovery' has nothing to drop: we implement no `saveDiscoveryState`,
+      // so the SDK re-discovers on every `auth()` and caches none of it here.
+    },
   };
 
   const deuzProvider: DeuzOAuthProvider = {
@@ -278,9 +308,10 @@ export function createOAuthProvider(options: McpOAuthOptions): DeuzOAuthProvider
     async invalidate() {
       // Client registration deliberately SURVIVES: it is not a credential the
       // server rejected, and re-registering on every expiry would litter the
-      // authorization server with dead clients.
-      await store.delete(key('tokens'));
-      await store.delete(key('code-verifier'));
+      // authorization server with dead clients. Same two scopes the SDK asks
+      // for on `invalid_grant`, so the manual and automatic paths cannot drift.
+      await provider.invalidateCredentials('tokens');
+      await provider.invalidateCredentials('verifier');
     },
   };
 

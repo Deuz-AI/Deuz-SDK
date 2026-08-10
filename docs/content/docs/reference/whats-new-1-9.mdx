@@ -14,7 +14,7 @@ Three surfaces first landed as **types and plumbing only** — `warnings`, tool-
 | A non-2xx chat response carried no `data:` lines, so `readDeuzStream` ended immediately and the UI settled into a *successful* empty assistant bubble. | Exactly one `error` part: `Deuz stream request failed (status 500 Internal Server Error).` Opt out with `readDeuzStream(res, { onHttpError: 'ignore' })` or `useChat({ onHttpError: 'ignore' })`. |
 | `verifyStep` produced a canonical `verify` part that `toDeuzStreamResponse` dropped, so a verified run looked identical to an unverified one client-side. | `verify` is serialized to the wire (v2 only), journaled, and replayed on resume. v1 output stays byte-identical. |
 | `applyUIPart` dropped `finish`, `step-finish` and `verify`, so a UI on the chat reducer could not show token usage and could not tell "complete" from "hit the output limit". | All three fold into the turn: `AssistantTurnState.usage` / `.finishReason` / `.steps` / `.verifications`, surfaced on `useChat` too. |
-| Passing a provider-executed (hosted) tool to a `chat_completions`-surface model removed it from the request with no signal. | Still dropped (the wire has no hosted-tool support), but the drop now reports twice: one `logger.warn` naming the dropped tools, the provider and the model id, plus a typed `{ type: 'unsupported-tool' }` `CallWarning`. The request body is unchanged byte for byte. One caveat — a hosted tool needs `tools`, which routes the call through the loop, and the loop does not merge a step's model-level warnings yet: see [Declared but inert](#declared-but-inert). |
+| Passing a provider-executed (hosted) tool to a `chat_completions`-surface model removed it from the request with no signal. | Still dropped (the wire has no hosted-tool support), but the drop now reports twice: one `logger.warn` naming the dropped tools, the provider and the model id, plus a typed `{ type: 'unsupported-tool' }` `CallWarning`. The request body is unchanged byte for byte. The loop's sink is written by the per-step pump, so the notice reaches `result.warnings` on an agentic call too. |
 
 The HTTP-error path deliberately does **not** read or echo the response body — an error page is unbounded markup you do not control. Only `statusText` is included, truncated and passed through the standard secret redaction.
 
@@ -207,19 +207,34 @@ Frames are sealed alongside the parent at every terminal boundary (`finish`, `er
 
 What is left. These are still declared surface with **no producer**, or a producer that does not reach the readout you would naturally read. Do not build on them.
 
-- **`GenerateTextResult.warnings` is `undefined` on every real call.** Warnings *are* produced and logged on the buffered path — the per-step pump raises them exactly as it does for streaming — but nothing puts them on the returned object. `generateText` callers must read `deps.logger.warn`.
-- **`GenerateObjectResult.warnings` and `StreamObjectResult.warnings` are never populated either.** `generateObject` / `streamObject` do not thread a sink at all, so no notice is even collected there. Both fields stay absent — `await result.warnings` on a `streamObject` gives you `undefined`, not an array.
-- **A loop-routed `streamChat` reports only its own warnings.** With `tools`, `chat`, `memory`, `verifyStep` or `doneWhen` the call runs the streaming loop, and the loop's set contains the `activeTools` notices only: a model-level warning (`unknown-model`, `unsupported-setting`, the hosted-tool drop, a dropped document) is raised inside the per-step pump and does not merge into the loop's result or cross the loop boundary as a part. It still reaches `deps.logger.warn`. This is why a dropped **hosted tool** — which needs `tools` — is log-only in practice.
-- **A dropped document reports a typed warning on the Chat Completions wire only.** On the `anthropic` and `responses` wires the drop is still a `deps.logger.warn` line and nothing else. (`native` accepts PDFs, so it never drops one.)
+<Callout type="warn" title="Five claims in this section were wrong and have been corrected">
+This page originally listed `result.warnings` on `generateText` / `generateObject` / `streamObject`, the loop's warning merge, the non-Chat-Completions document drop, `consume()` on the fail-over path, and `timeout.stepMs` as gaps. **All five were already wired in 1.9.0** — the list was written against an earlier draft and never re-checked against the shipped code. It is corrected below (and in the root README). Verified against `src/` while writing the 2.0 docs; the three genuine gaps that remain are the ones listed here.
+</Callout>
+
 - **`clamped-setting` has no producer.** That member of `CallWarning['type']` ships unused. The obvious candidate is the unknown-slug `maxOutput: 4096` truncation, but the clamp happens per adapter, not centrally.
-- **`useObject` can never see a warning.** `toDeuzObjectStreamResponse` iterates `partialObjectStream`, and `StreamObjectResult` exposes no canonical part stream, so there is nothing to serialize a `warning` from.
+- **`useObject` can never see a warning.** `toDeuzObjectStreamResponse` iterates `partialObjectStream`, and `StreamObjectResult` exposes no canonical part stream, so there is nothing to serialize a `warning` from. `await result.warnings` on the server side does resolve — it just cannot cross this wire.
+- **A hosted tool passed to a `chat_completions` model is still dropped.** The wire has no hosted-tool support, so the drop itself is not a bug — and it now reports twice (a `logger.warn` plus a typed `unsupported-tool` warning on the result). Nothing makes the tool work.
 
-## Two more partial surfaces
+### Corrected: what `warnings` actually does
 
-Not inert, but not complete either — stated here so you do not discover them at runtime:
+`warnings` is populated on **every** entry point, not just `streamChat`:
 
-- **`consume()` is optional on the type.** `streamChat({ fallbackModels })` and the `withFallback` middleware return `consume: undefined`, where `res.consume?.()` is a silent no-op. Every other path provides it.
-- **`timeout.stepMs` is enforced in the streaming loop only.** The buffered `generateText` loop honours `ttftMs` / `totalMs` / `toolMs` but not `stepMs` yet.
+| Result | `warnings` |
+| --- | --- |
+| `GenerateTextResult` (single turn) | The step's warnings, omitted entirely when there are none. |
+| `GenerateTextResult` (agentic loop) | The loop's sink — which **the per-step pump writes into**, so `unknown-model`, `unsupported-setting`, the hosted-tool drop and a dropped document all merge in alongside the `activeTools` notices. |
+| `GenerateObjectResult` | A per-call sink threaded through `getCapabilities` and the inner `runStream`. |
+| `StreamObjectResult` | A promise resolved from the same sink at the terminal boundary. |
+| `StreamChatResult` | A promise, plus live `warning` parts on `fullStream`. |
+
+The sink deduplicates by `(type, setting, message)` — the loop re-derives capabilities every step, so one stripped `temperature` reports once, not once per step — and caps at 50 entries, appending an `other` warning that says how many were withheld rather than truncating in silence.
+
+A dropped document reports a typed `{ type: 'other' }` warning on **all three** wires that can drop one (`chat_completions`, `anthropic`, `responses`), through one shared helper; `native` accepts PDFs, so it never drops one. The pre-1.9 `logger.warn` line is unchanged in shape and the sink records quietly on top of it, so a log-based workflow still sees exactly one line per drop.
+
+### Corrected: `consume()` and `timeout.stepMs`
+
+- **`consume()` is provided on every path**, including `streamChat({ fallbackModels })` and the `withFallback` middleware — both forward the winner's drain through their own broadcaster subscription. It stays **optional on the type** so a hand-written `StreamChatResult` remains valid, which is why `res.consume?.()` is still the right way to call it on a value you did not create.
+- **`timeout.stepMs` is enforced in both loops.** `createStepTimeout` is armed at the top of every step in the buffered `tool-loop` *and* the streaming `stream-tool-loop`, and rides into the model call as a **failure** signal — so an overrun reports a `TimeoutError` instead of resolving `'aborted'`.
 
 ## See also
 

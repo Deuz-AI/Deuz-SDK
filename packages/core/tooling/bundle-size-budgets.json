@@ -86,7 +86,30 @@
     "",
     "`chat` is deliberately NOT raised. It measured 16787 / 5468 against 17000 / 5500 — 1.3% of",
     "headroom left, because applyUIPart now folds the `handoff` and `guardrail` parts. That is a",
-    "true reading and the ratchet SHOULD trip on the next UI part; whoever adds it makes the call."
+    "true reading and the ratchet SHOULD trip on the next UI part; whoever adds it makes the call.",
+    "",
+    "2.0.0 — THE NEW SUBPATHS GET BUDGETS BEFORE THEY SHIP. Sprint 3 is the precedent: ~10 KB of",
+    "new surface went out unmeasured because nothing listed it here, and an unlisted subpath is",
+    "invisible to this ratchet. Measured through the same pipeline, ~10% headroom each:",
+    "  speech         17356 B raw / 6357 B gzip  ->  limits 19100 / 7000   (+10.1% / +10.1%)",
+    "  transcription  20222 B raw / 7149 B gzip  ->  limits 22250 / 7870   (+10.0% / +10.1%)",
+    "  video          18828 B raw / 6713 B gzip  ->  limits 20720 / 7390   (+10.1% / +10.1%)",
+    "  guardrails       813 B raw /  493 B gzip  ->  limits   900 /  550   (+10.7% / +11.6%)",
+    "`guardrails` is two closures over type-only imports, and that near-zero number is the point:",
+    "it is the assertion that a built-in guardrail stays a value, not a subsystem.",
+    "",
+    "NOT BUDGETED, and it is not an oversight: `./mcp/node`, `./stores/sqlite`, `./stores/redis`",
+    "and `./stores/postgres`. This checker builds with `platform: 'browser'` and the browser export",
+    "condition, so a Node-only subpath does not merely measure large — esbuild cannot resolve it at",
+    "all and the whole run THROWS (`Could not resolve \"fs/promises\"` / `\"http\"` for ./mcp/node).",
+    "Adding one here takes the gate red for every bundle, including the ones it was protecting.",
+    "Their edge-safety guard is `tooling/check-runtime-compat.mjs` instead, whose node-only input",
+    "regex names all four: it fails if a browser/edge consumer can so much as REACH them.",
+    "",
+    "core/edge/lazy are untouched by the 2.0 publication surface. The new barrel exports (handoff,",
+    "the built-in guardrails, compactMessages on the root; handoff + guardrails on edge) tree-shake",
+    "out of the measured export sets — verified by bundling the previous barrels side by side with",
+    "the new ones: core came back byte-identical."
   ],
   "bundles": {
     "core": {
@@ -133,6 +156,30 @@
       "exports": ["summarizeRun", "renderRunReport", "createMemoryObserver", "composeObservers"],
       "maxRawBytes": 27800,
       "maxGzipBytes": 10400
+    },
+    "speech": {
+      "from": "@deuz-sdk/core/speech",
+      "exports": ["generateSpeech", "createOpenAISpeech", "createElevenLabs"],
+      "maxRawBytes": 19100,
+      "maxGzipBytes": 7000
+    },
+    "transcription": {
+      "from": "@deuz-sdk/core/transcription",
+      "exports": ["transcribe", "createOpenAITranscription", "createDeepgram"],
+      "maxRawBytes": 22250,
+      "maxGzipBytes": 7870
+    },
+    "video": {
+      "from": "@deuz-sdk/core/video",
+      "exports": ["generateVideo", "submitVideo", "waitForVideo"],
+      "maxRawBytes": 20720,
+      "maxGzipBytes": 7390
+    },
+    "guardrails": {
+      "from": "@deuz-sdk/core/guardrails",
+      "exports": ["promptInjectionGuardrail", "maxOutputLength"],
+      "maxRawBytes": 900,
+      "maxGzipBytes": 550
     },
     "openai-provider": {
       "from": "@deuz-sdk/core/openai",

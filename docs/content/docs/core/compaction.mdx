@@ -31,6 +31,7 @@ interface CompactionPolicy {
   keepRecentSteps?: number;       // default 4 — most-recent assistant turns, always protected
   layers?: CompactionLayer[];     // default ['prune-tool-results', 'prune-reasoning', 'summarize']
   summarizeModel?: LanguageModel; // default: the loop's own model
+  countTokens?: (messages: Message[]) => number; // 2.0 — a real tokenizer
 }
 
 type CompactionLayer = 'prune-tool-results' | 'prune-reasoning' | 'summarize';
@@ -43,6 +44,7 @@ type CompactionOption = 'auto' | CompactionPolicy;
 | `keepRecentSteps` | `number` | `4` | Positive integer (floored/clamped) — this many of the most recent assistant turns are never touched by any layer. |
 | `layers` | `CompactionLayer[]` | all three | Applied in array order, cheapest first, until estimated fill drops under `threshold * 0.8` or layers run out. |
 | `summarizeModel` | `LanguageModel` | the loop's model | Only used by the `summarize` layer's one extra call — pass a cheaper model to keep that call cheap too. |
+| `countTokens` | `(messages) => number` | — (char heuristic) | 2.0. A real tokenizer, used as the BASE count; the EMA calibration still runs on top of it. Must be synchronous. See [the recipe](/docs/modules/compaction#a-real-tokenizer-via-counttokens). |
 
 `'auto'` is shorthand for `{}` (every field defaulted). It's off by default — omit `compaction` and history grows unbounded, same as today.
 
@@ -111,6 +113,8 @@ interface CompactionPart {
   layer: 'prune-tool-results' | 'prune-reasoning' | 'summarize';
   tokensBefore: number;
   tokensAfter: number;
+  /** 2.0 additive; absent = 'threshold', the only trigger before 2.0. */
+  trigger?: 'threshold' | 'manual' | 'overflow';
 }
 ```
 
@@ -132,8 +136,17 @@ for await (const part of result.fullStream) {
 
 Anthropic's server-side context editing (`providerOptions.anthropic.context_management`) is untouched by this feature and still works exactly as before — it's a completely separate mechanism (Anthropic edits the conversation on their side, not ours). Its `applied_edits` report comes back on the finish part's `providerMetadata.anthropic.contextManagement`. You can use either, or both: `compaction` acts on the canonical `Message[]` history at the SDK layer regardless of provider, while `context_management` is Anthropic-only and opaque to the SDK.
 
+## Beyond the automatic policy
+
+2.0 adds three things this page does not cover, all on [Compaction & context recovery](/docs/modules/compaction):
+
+- **`compactMessages()`** — the same layers as a plain function over a `Message[]` you own. Pure by default: with no summarizer it makes no network call at all.
+- **The rolling summary** — pass N folds into pass N−1's summary instead of restarting, so at most one summary block ever sits in the history.
+- **Overflow auto-recovery** — a provider that rejects a request as too long triggers a forced compaction pass and one retry, even when `compaction` was never set. It fires on the `anthropic` and `chat_completions` wires only.
+
 ## See also
 
+- [Compaction & context recovery](/docs/modules/compaction) — `compactMessages`, the rolling summary, overflow recovery, `countTokens`.
 - [Tools](/docs/agents/tools) — `prepareStep` (compaction runs before it, every step) and budget stop conditions.
 - [Tool loop](/docs/agents/tool-loop) — the agentic loop this feature only activates inside.
 - [Sub-agents](/docs/agents/subagents) — `agentTool` accepts its own `compaction` policy for long-lived research agents.

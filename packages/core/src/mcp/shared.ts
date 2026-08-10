@@ -40,7 +40,11 @@ export interface RawMcpClient {
   getServerVersion?(): { name?: string; version?: string } | undefined;
   /** Fired when the session ends — expected after `close()`, a DROP otherwise. */
   onclose?: (() => void) | undefined;
-  /** Fired on a transport-level error; the SDK follows with `onclose` when fatal. */
+  /**
+   * Fired on a transport-level error. NOT necessarily fatal and NOT reliably
+   * followed by `onclose`: the Streamable HTTP transport reports a dead socket
+   * this way and never closes the client. See `createManagedConnection`.
+   */
   onerror?: ((error: Error) => void) | undefined;
   listResources?(params?: {
     cursor?: string;
@@ -303,6 +307,16 @@ export interface McpLifecycleOptions {
    * Recover from a dropped session: `true` for the default policy, an object to
    * tune it, absent/`false` for 1.x (a drop is terminal).
    *
+   * Recovery can only start once the drop is NOTICED, and how that happens is a
+   * transport detail. stdio closes the client when the child process dies.
+   * Streamable HTTP never closes anything: it reports a dead socket through
+   * `onerror` and quietly retries its own event stream, so before 2.0 an HTTP
+   * session that died with the server kept reporting `connected` and this option
+   * did nothing unless {@link McpLifecycleOptions.keepAliveMs} was also set. A
+   * transport error on a live session is now VERIFIED with one `ping()` (see
+   * `createManagedConnection`), so reconnect stands on its own; `keepAliveMs`
+   * remains the way to catch a session that dies SILENTLY, with no error at all.
+   *
    * This is SESSION-level recovery — every attempt builds a NEW transport AND a
    * NEW client through the same factory, so every handler is re-registered and
    * nothing is silently lost. It is distinct from, and composes with,
@@ -412,6 +426,10 @@ export async function createManagedConnection(
   let generation = 0;
   let closed = false;
   let cancelKeepAlive: (() => void) | undefined;
+  /** Generation whose liveness probe is in flight — one verdict at a time. */
+  let probingGeneration: number | undefined;
+  /** Generation already reported as dropped — see {@link onDrop}. */
+  let droppedGeneration: number | undefined;
 
   const setStatus = (next: McpConnectionStatus, info?: McpStatusInfo): void => {
     status = next;
@@ -477,6 +495,46 @@ export async function createManagedConnection(
       wakes.add(wake);
     });
 
+  /**
+   * Turn a transport error into a drop VERDICT.
+   *
+   * `StreamableHTTPClientTransport` never calls `onclose` when the socket dies:
+   * it reports through `onerror` and keeps retrying its own GET event stream.
+   * The `onclose` recovery path below therefore never saw a dead HTTP session,
+   * and `status()` answered `connected` until — and only if — a `keepAliveMs`
+   * heartbeat was configured to notice.
+   *
+   * Wiring `onerror` straight into `onDrop` would over-correct. The SAME
+   * callback fires for an unparseable SSE frame, one failed event-stream retry
+   * and a message the transport could not decode, none of which end the session;
+   * tearing a healthy connection down over those would be a worse bug than the
+   * one it fixes. So a transport error only TRIGGERS the question and a single
+   * `ping()` answers it — the identical rule the heartbeat already applies, just
+   * reached by a different road. A server that answers keeps the session.
+   *
+   * Without `ping()` (a pre-1.29 SDK, a hand-written client) there is nothing
+   * cheap to verify with, so the 1.x behavior stands: stay quiet rather than
+   * kill a live session on a transient error.
+   */
+  const probeAfterError = async (
+    gen: number,
+    target: RawMcpClient,
+    error: unknown,
+  ): Promise<void> => {
+    const ping = target.ping;
+    if (!ping || closed || gen !== generation || probingGeneration === gen) return;
+    probingGeneration = gen;
+    try {
+      await ping.call(target);
+    } catch {
+      // The session is gone. Report the ORIGINAL transport error, not the ping's
+      // — the first one says what actually happened.
+      onDrop(gen, error);
+    } finally {
+      if (probingGeneration === gen) probingGeneration = undefined;
+    }
+  };
+
   async function connectOnce(): Promise<void> {
     const gen = ++generation;
     const next = await options.makeClient({ toolListChanged: markToolsDirty });
@@ -484,7 +542,7 @@ export async function createManagedConnection(
     // Registered BEFORE connect so a handshake that dies immediately is still seen.
     const seen: { error?: unknown } = {};
     // `onerror` is registered before connecting so a handshake that dies
-    // immediately still records why. `onclose` only arms recovery once the
+    // immediately still records why. Neither handler arms recovery until the
     // session is actually live: a `connect()` that throws unwinds through its
     // caller, which already owns the retry. The SDK closes its own client when
     // initialize fails, so an eagerly-armed handler would ALSO start a recovery
@@ -493,6 +551,7 @@ export async function createManagedConnection(
     let live = false;
     next.onerror = (error) => {
       seen.error = error;
+      if (live) void probeAfterError(gen, next, error);
     };
     next.onclose = () => {
       if (live) onDrop(gen, seen.error);
@@ -512,8 +571,17 @@ export async function createManagedConnection(
     }
   }
 
+  /**
+   * One session, one drop. The generation counter alone is not enough: it only
+   * moves when a reconnect ATTEMPT runs, so two detectors that fire during the
+   * same backoff window (a heartbeat ping and an `onerror` probe both in flight
+   * when the server goes down) would each pass the `gen` check and each start
+   * their own `reconnectLoop` — two ladders racing, `maxAttempts` bounding
+   * neither. The latch never needs clearing: every generation number is new.
+   */
   function onDrop(gen: number, error: unknown): void {
-    if (closed || gen !== generation) return;
+    if (closed || gen !== generation || droppedGeneration === gen) return;
+    droppedGeneration = gen;
     stopKeepAlive();
     if (!policy) {
       // 1.x: no recovery. The client stays reachable via raw() and its calls reject.
@@ -869,16 +937,44 @@ export interface McpRootsBox {
 }
 
 export function createRootsBox(roots: McpRootsOption): McpRootsBox {
+  // A fixed list is checked at construction so `createMcpClient()` rejects; a
+  // function form can only be checked when it is read, i.e. per `roots/list`.
+  if (typeof roots !== 'function') assertRootUris(roots);
   return { value: roots };
 }
 
 /**
- * A root as MCP wants it: a URI. Anything already carrying a scheme (`://`)
- * passes VERBATIM; a plain filesystem path is promoted to `file://` with its
- * backslashes normalized, because a Windows path is not a URI at all.
+ * A URI scheme (RFC 3986) of at least TWO characters. The length floor is the
+ * point: `C:\work` is a Windows path, not a `c:` URI.
+ */
+const URI_SCHEME = /^[a-zA-Z][a-zA-Z0-9+.-]+:/;
+
+/**
+ * A root as MCP wants it: a `file://` URI.
+ *
+ * MCP's `RootSchema` pins `uri` to `z.string().startsWith('file://')` and
+ * `roots/list` answers with an ARRAY the server validates as a whole — so ONE
+ * `https://` entry makes it discard every root we sent, and the failure lands
+ * as a Zod error on the far side of the wire where nothing can act on it.
+ * Refusing the value here converts that silent, total rejection into one
+ * error naming the offender, raised where the roots were supplied.
+ *
+ * A filesystem path is not a URI at all, so it is promoted: backslashes flipped
+ * (a Windows path is not a URI even after prefixing) and `file://` prepended.
  */
 export function normalizeRootUri(root: string): string {
-  return root.includes('://') ? root : `file://${root.replace(/\\/g, '/')}`;
+  if (root.startsWith('file://')) return root;
+  if (URI_SCHEME.test(root)) {
+    throw new InvalidRequestError({
+      message: `MCP root ${JSON.stringify(root)} is not a file:// URI. MCP accepts file:// roots only, and one bad entry makes the server reject the whole roots/list response — pass a filesystem path ("/srv/app", "C:\\work") or a file:// URI instead.`,
+    });
+  }
+  return `file://${root.replace(/\\/g, '/')}`;
+}
+
+/** Reject the whole list before anything is stored or announced. */
+function assertRootUris(roots: string[]): void {
+  for (const root of roots) normalizeRootUri(root);
 }
 
 /**
@@ -901,7 +997,9 @@ export interface McpRootsClient extends McpClient {
    * Replace the roots and tell the server (`notifications/roots/list_changed`).
    * Available only on a client created WITH a `roots` option: the capability is
    * declared at construction, and announcing a change to something we never
-   * advertised would lie to the server.
+   * advertised would lie to the server. Rejects — without notifying, and without
+   * touching the current roots — on anything that is not a `file://` URI or a
+   * filesystem path.
    */
   setRoots(roots: string[]): Promise<void>;
 }
@@ -927,6 +1025,9 @@ export function attachRoots(
             'setRoots() needs a `roots` option at client creation — the roots capability is declared only when one is configured.',
         });
       }
+      // Validated BEFORE the swap: a refused call must leave the roots the
+      // server already knows about exactly as they were.
+      assertRootUris(roots);
       box.value = roots;
       const c = managed?.raw() ?? raw;
       await requireMethod(c.sendRootsListChanged, 'sendRootsListChanged').call(c);

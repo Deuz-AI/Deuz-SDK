@@ -81,7 +81,7 @@ interface GenerateTextResult {
 | `toolCalls` | `ToolCall[]` | with tools | Convenience: the last tool-calling step's calls. |
 | `toolResults` | `ToolResult[]` | with tools | Convenience: that step's results. |
 | `pendingApprovals` | `ToolApprovalRequest[]` | client-mode approval break | Calls awaiting a verdict when a `needsApproval` tool broke the loop; resume by calling again with `approvalResponses`. |
-| `warnings` | `CallWarning[]` | **never (1.9)** | `CallWarning` has real producers, but **not on this result**: a buffered call raises and logs its notices and then discards them — no step or loop code puts them on the returned object, so `result.warnings` is `undefined` on every real `generateText`. Read `deps.logger.warn`, or use [`streamChat`](/docs/core/stream-chat#warnings), where the field is live. See [Declared but inert](/docs/reference/whats-new-1-9#declared-but-inert). |
+| `warnings` | `CallWarning[]` | when the call produced any | Non-fatal notices — an unknown model slug, a stripped sampling parameter, a dropped document, a hosted tool the wire cannot carry, an `activeTools` name that matches nothing. **Omitted entirely** when there are none, so a clean result's shape is unchanged. On an agentic call the per-step pump writes into the loop's sink, so model-level notices merge in too. Deduplicated by `(type, setting, message)` and capped at 50. |
 
 `response.messages` only contains the *new* turns this call produced — append them to your prior `messages` to continue the conversation.
 

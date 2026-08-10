@@ -76,8 +76,16 @@ A few feature surfaces genuinely need the filesystem, a child process, or a Node
 | `@deuz-sdk/core/skills/node` | lazy `node:fs/promises`, `node:path` | reads `SKILL.md` files from disk |
 | `@deuz-sdk/core/memory/markdown` | lazy `node:fs/promises`, `node:path` | Obsidian-style markdown vault on disk |
 | `@deuz-sdk/core/mcp/stdio` | lazy `@modelcontextprotocol/sdk` + child process | spawns a stdio MCP server |
+| `@deuz-sdk/core/mcp/node` | lazy `node:fs/promises`, `node:http` | 0600 token file + a loopback OAuth redirect listener |
+| `@deuz-sdk/core/stores/sqlite` | lazy `node:sqlite` (or an injected handle) | a database file |
+| `@deuz-sdk/core/stores/redis` | lazy `redis` peer (or an injected client) | a TCP client |
+| `@deuz-sdk/core/stores/postgres` | lazy `pg` peer (or an injected client) | a TCP client |
 
 The edge-safe counterparts of these features stay on the Web-APIs-only path: `@deuz-sdk/core/rag` (text/markdown/CSV parsing in core), `@deuz-sdk/core/skills` (parse `SKILL.md` you already loaded), `@deuz-sdk/core/memory` (the cosine vector backend), and `@deuz-sdk/core/mcp` (HTTP/SSE transport). Use those at the edge and reserve the `…/node` subpaths for your Node server.
+
+The two store packs that take an **injected client** (`stores/redis`, `stores/postgres`) still import a Node-only module path, so they stay on this list — but the seam itself (`RedisClientLike`, `PgClientLike`) is a plain object, which is how an HTTP-driver-backed store reaches an edge runtime: implement the seam against your driver and keep it in your own module.
+
+2.0's edge-safe additions: `handoff()` plus `promptInjectionGuardrail` / `maxOutputLength` are re-exported from `@deuz-sdk/core/edge` (all three are pure construction — no clock, no randomness, no I/O), and the `@deuz-sdk/core/guardrails` subpath itself imports types only. `@deuz-sdk/core/speech`, `/transcription` and `/video` are edge-safe too: they are `deps.fetch` and nothing else. `compactMessages` ships from the root entry rather than `/edge`, and is pure unless you hand it a summarizer.
 
 ## Per-runtime notes
 

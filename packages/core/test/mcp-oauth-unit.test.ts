@@ -27,6 +27,9 @@ interface SdkProvider {
   redirectToAuthorization(url: URL): Promise<void>;
   saveCodeVerifier(verifier: string): Promise<void>;
   codeVerifier(): Promise<string>;
+  invalidateCredentials(
+    scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery',
+  ): Promise<void>;
 }
 
 const sdk = (provider: DeuzOAuthProvider): SdkProvider => provider.provider as SdkProvider;
@@ -269,6 +272,72 @@ describe('server binding + invalidate', () => {
     const provider = createOAuthProvider({ redirectUri: 'https://app.example.com/cb', store });
     await sdk(provider).saveTokens({ access_token: 'at' });
     expect([...store.entries.keys()]).toEqual(['tokens:default']);
+  });
+});
+
+describe('invalidateCredentials (what the SDK drops after a rejection)', () => {
+  /** All three per-server secrets present, so each scope's blast radius shows. */
+  async function seeded(): Promise<{
+    store: ReturnType<typeof spyStore>;
+    provider: DeuzOAuthProvider;
+  }> {
+    const store = spyStore();
+    const provider = createOAuthProvider({ redirectUri: 'https://app.example.com/cb', store });
+    await bindOAuthServer(provider, SERVER);
+    await sdk(provider).saveClientInformation({ client_id: 'dcr-9' });
+    await sdk(provider).saveCodeVerifier('v');
+    await sdk(provider).saveTokens({ access_token: 'at', refresh_token: 'rt' });
+    return { store, provider };
+  }
+
+  /** Everything but the binding record, which no scope is allowed to touch. */
+  const secrets = (store: ReturnType<typeof spyStore>): string[] =>
+    [...store.entries.keys()].filter((k) => k !== 'server-url').sort();
+
+  it("'tokens' drops the pair only — the SDK retries the whole flow with it gone", async () => {
+    const { store, provider } = await seeded();
+    await sdk(provider).invalidateCredentials('tokens');
+    expect(secrets(store)).toEqual([`client-info:${SERVER}`, `code-verifier:${SERVER}`]);
+    expect(await provider.tokens()).toBeUndefined();
+  });
+
+  it("'verifier' drops the in-flight PKCE verifier only", async () => {
+    const { store, provider } = await seeded();
+    await sdk(provider).invalidateCredentials('verifier');
+    expect(secrets(store)).toEqual([`client-info:${SERVER}`, `tokens:${SERVER}`]);
+  });
+
+  it("'client' drops the dynamic registration only", async () => {
+    const { store, provider } = await seeded();
+    await sdk(provider).invalidateCredentials('client');
+    expect(secrets(store)).toEqual([`code-verifier:${SERVER}`, `tokens:${SERVER}`]);
+    expect(await sdk(provider).clientInformation()).toBeUndefined();
+  });
+
+  it("'discovery' is a no-op — this provider caches no discovery state", async () => {
+    const { store, provider } = await seeded();
+    await sdk(provider).invalidateCredentials('discovery');
+    expect(secrets(store)).toEqual([
+      `client-info:${SERVER}`,
+      `code-verifier:${SERVER}`,
+      `tokens:${SERVER}`,
+    ]);
+  });
+
+  it("'all' clears this server's three keys, leaving other servers and the binding", async () => {
+    const other = 'https://other.example.com/mcp';
+    const { store, provider } = await seeded();
+    await bindOAuthServer(provider, other);
+    await sdk(provider).saveTokens({ access_token: 'other-at' });
+    await bindOAuthServer(provider, SERVER);
+
+    await sdk(provider).invalidateCredentials('all');
+
+    // One store backs many servers; a rejection at one must not log the rest out.
+    expect(secrets(store)).toEqual([`tokens:${other}`]);
+    // The binding is bookkeeping, not a credential: a second process needs it
+    // to know which exchange `completeAuth` is finishing.
+    expect(store.entries.get('server-url')).toBe(SERVER);
   });
 });
 

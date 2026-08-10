@@ -1,7 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { generateText, streamChat, agentTool } from '../src/index';
 import { createInMemorySessionStore, resumeFromCheckpoint } from '../src/durable';
+import { handoff } from '../src/inference/handoff';
+import { createMockModel, type MockResponse } from '../src/testing';
+import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import type { SessionStore } from '../src/types/session';
+import type { LanguageModel } from '../src/types/model';
 import type { StreamPart } from '../src/types/stream';
 import type { ToolSet } from '../src/types/tool';
 import { createAnthropic } from '../src/anthropic';
@@ -334,5 +338,155 @@ describe('durable sub-agent client-mode approval — resume', () => {
     expect((await store.load('run-sub'))?.status).toBe('completed');
     // All legs: 15+15 (leg1) + 15 (child d2 step) + 26+26 (leg3) = 97.
     expect((await store.load('run-sub'))?.usage.totalTokens).toBe(97);
+  });
+});
+
+// ===================================================================
+// Sub-agent × handoff × resume (2.0)
+// ===================================================================
+
+interface WireBody {
+  messages: { role: string; content: unknown }[];
+  tools?: { function: { name: string } }[];
+}
+
+/**
+ * One ordered log across several {@link createMockModel} instances, each with its
+ * own model id. The loop reports no model per step, so the recorded REQUEST is
+ * the only evidence of which agent actually drove a step — which is exactly what
+ * a lost handoff overlay changes.
+ */
+function recorder(): {
+  models: () => string[];
+  calls: WireBody[];
+  model: (modelId: string, responses: MockResponse[]) => LanguageModel;
+} {
+  const entries: { model: string; body: WireBody }[] = [];
+  return {
+    models: () => entries.map((e) => e.model),
+    get calls() {
+      return entries.map((e) => e.body);
+    },
+    model(modelId, responses) {
+      const base = createMockModel({ responses });
+      const config = readConfig(base)!;
+      const inner = config.fetch!;
+      const fetchImpl = ((input: RequestInfo | URL, init?: RequestInit) => {
+        entries.push({ model: modelId, body: JSON.parse(String(init!.body)) as WireBody });
+        return inner(input, init);
+      }) as typeof fetch;
+      return attachConfig(
+        { provider: 'mock', modelId, surface: 'chat_completions' },
+        { ...config, fetch: fetchImpl },
+      );
+    },
+  };
+}
+
+const systemOf = (body: WireBody): string => {
+  const first = body.messages[0];
+  if (!first || (first.role !== 'system' && first.role !== 'developer')) return '';
+  return String(first.content);
+};
+
+const toolNamesOf = (body: WireBody): string[] =>
+  (body.tools ?? []).map((t) => t.function.name).sort();
+
+describe('durable sub-agent × handoff — resume', () => {
+  /** The `worker` sub-agent, able to transfer to `specialist` (whose tool is gated). */
+  function parentTools(
+    workerModel: LanguageModel,
+    specialistModel: LanguageModel,
+    danger: () => unknown,
+  ): ToolSet {
+    return {
+      worker: agentTool({
+        name: 'worker',
+        description: 'delegates',
+        model: workerModel,
+        tools: handoff({
+          specialist: {
+            model: specialistModel,
+            instructions: 'Specialist rules.',
+            tools: { danger: { parameters: SCHEMA, execute: danger, needsApproval: true } },
+          },
+        }),
+        maxSteps: 5,
+      }),
+    };
+  }
+
+  /** Leg 1: parent → worker → transfer to specialist → gated tool → suspend. */
+  async function suspendInsideSpecialist(store: SessionStore) {
+    const rec = recorder();
+    const root = rec.model('root-1', [
+      { toolCalls: [{ toolName: 'worker', args: { prompt: 'go' }, id: 'call_w' }] },
+    ]);
+    const worker = rec.model('worker-1', [
+      { toolCalls: [{ toolName: 'transfer_to_specialist', args: {}, id: 'call_t' }] },
+    ]);
+    const specialist = rec.model('specialist-1', [
+      { toolCalls: [{ toolName: 'danger', args: { q: 'x' }, id: 'call_d' }] },
+    ]);
+    const res = await generateText({
+      model: root,
+      messages: [{ role: 'user', content: 'go' }],
+      tools: parentTools(
+        worker,
+        specialist,
+        vi.fn(() => 'never in leg 1'),
+      ),
+      maxSteps: 5,
+      session: { store, runId: 'run-ho' },
+    });
+    expect(rec.models()).toEqual(['root-1', 'worker-1', 'specialist-1']);
+    expect(res.pendingApprovals).toHaveLength(1);
+    return { approvalId: res.pendingApprovals![0]!.approvalId };
+  }
+
+  it('checkpoints the CHILD run under its own active agent', async () => {
+    const store = createInMemorySessionStore();
+    await suspendInsideSpecialist(store);
+
+    const child = await store.load('run-ho::worker#call_w');
+    expect(child?.status).toBe('suspended');
+    expect(child?.handoff).toEqual({ to: 'specialist', count: 1 });
+    // The target's system prompt rode in with the child's history — which is why
+    // only the model + tools have to be re-applied on the resume leg.
+    expect(child?.messages[0]).toEqual({ role: 'system', content: 'Specialist rules.' });
+  });
+
+  it('resumes the child AS the specialist, not as the root sub-agent', async () => {
+    const store = createInMemorySessionStore();
+    const { approvalId } = await suspendInsideSpecialist(store);
+
+    const rec = recorder();
+    const root = rec.model('root-2', [{ text: 'parent done' }]);
+    const worker = rec.model('worker-2', [{ text: 'worker must not answer' }]);
+    const specialist = rec.model('specialist-2', [{ text: 'specialist done' }]);
+    const danger = vi.fn(() => 'dangerous result');
+
+    const res = await resumeFromCheckpoint(store, 'run-ho', {
+      model: root,
+      tools: parentTools(worker, specialist, danger),
+      approvalResponses: [{ approvalId, approved: true }],
+      maxSteps: 5,
+    });
+
+    // The child's leg ran on the specialist's model, system prompt and tools;
+    // only then does the parent take its final turn.
+    expect(rec.models()).toEqual(['specialist-2', 'root-2']);
+    expect(systemOf(rec.calls[0]!)).toBe('Specialist rules.');
+    expect(toolNamesOf(rec.calls[0]!)).toEqual(['danger']);
+    // `danger` belongs to the specialist — the worker's own set never had it, so
+    // executing it at all proves the overlay survived the leg boundary.
+    expect(danger).toHaveBeenCalledTimes(1);
+    expect(res.text).toBe('parent done');
+    expect(String(JSON.stringify(rec.calls[1]!.messages))).toContain('specialist done');
+    // The transfer budget survives too, so `maxHandoffs` still bounds the run.
+    expect((await store.load('run-ho::worker#call_w'))?.handoff).toEqual({
+      to: 'specialist',
+      count: 1,
+    });
   });
 });

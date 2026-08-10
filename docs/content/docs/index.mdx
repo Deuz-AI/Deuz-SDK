@@ -12,17 +12,20 @@ npm install @deuz-sdk/core
 
 Requires **Node >= 22**. The chat core has nothing in `dependencies`. Optional peers are pulled in only if you use them: `zod` (or any Standard Schema library) plus `@standard-community/standard-json` for schema-typed [generateObject](/docs/core/generate-object); `@modelcontextprotocol/sdk` for [MCP](/docs/modules/mcp); `unpdf` / `mammoth` / `xlsx` for Node document parsing in [RAG](/docs/modules/rag); `playwright` for browser tools; `@opentelemetry/api` for the OTel bridge on `@deuz-sdk/core/otel`.
 
-## New in 1.9
+## New in 2.0
 
-Everything below is additive — no existing type gained a required field, and every 1.8 call still compiles and behaves identically.
+Everything below is additive — no existing type gained a required field, every 1.9 call still compiles, and every stored checkpoint still loads.
 
-- **`prompt` / `instructions`**, and a four-layer `timeout: { ttftMs, totalMs, stepMs, toolMs }` → [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts)
-- **`createAgent`** — a reusable agent as a frozen value on `@deuz-sdk/core/agent`, not a class → [createAgent](/docs/agents/create-agent)
-- **`validateChatRequest`** — a chat route that validates its own body before it reaches a model → [Request validation](/docs/modules/request-validation)
-- **`filePart()` and PDFs on all four wires** → [Files & PDFs](/docs/core/files)
-- **Ordered `UIMessage.parts`**, so a multi-step turn renders in the interleave it actually had → [Chat persistence & state](/docs/modules/chat-persistence#ordered-parts-19) and [React hooks](/docs/modules/react-hooks#rendering-ordered-parts)
+- **Persistent stores** — SQLite, Redis and Postgres packs behind the memory / chat / session / run seams → [Persistent stores](/docs/modules/stores)
+- **Guardrails** — pass / block / rewrite on the run's input, each tool call, and the final answer → [Guardrails](/docs/agents/guardrails)
+- **Handoffs** — `handoff()` transfers the whole run to another agent, history and all → [Handoffs](/docs/agents/handoffs)
+- **Zero-config MCP**, plus OAuth 2.0, sampling, roots, reconnect and a connection pool → [MCP](/docs/modules/mcp)
+- **`compactMessages()`**, a rolling summary, and automatic context-overflow recovery → [Compaction](/docs/modules/compaction)
+- **Speech, transcription and video** → [Speech](/docs/modules/speech) · [Transcription](/docs/modules/transcription) · [Video](/docs/modules/video-generation)
+- **Eight more providers**, two of them keyless → [Local models](/docs/providers/local) · [OpenAI-compat hosts](/docs/providers/compat)
+- **`runtimeContext`** — request-scoped facts travel with the call instead of a closure per request
 
-Three 1.9 surfaces first shipped as **types and plumbing only** — `warnings`, tool-approval **denial** fields, and `sub-agent` parts in `useChat` — and all three now have real producers. One residual gap is stated wherever it appears: `warnings` is live on `streamChat` but **`undefined` on `generateText` / `generateObject` / `streamObject`**, and a loop-routed call reports only its own `activeTools` notices. The whole surface, with its limitations, is on one page: [What is new in 1.9](/docs/reference/whats-new-1-9).
+The whole surface, **including what is still missing**, is on one page: [What is new in 2.0](/docs/reference/whats-new-2-0). The previous release's page is still there too: [What is new in 1.9](/docs/reference/whats-new-1-9).
 
 ## Start by use case
 
@@ -31,6 +34,9 @@ Three 1.9 surfaces first shipped as **types and plumbing only** — `warnings`, 
 - **Build a coding agent** → [Tools](/docs/agents/tools) + [Sub-agents](/docs/agents/subagents) + [Budget stops](/docs/agents/tool-loop)
 - **Build an autonomous agent (1.8)** → [Autonomy](/docs/modules/autonomy) + [Build your own Manus](/docs/cookbooks/autonomous-agent)
 - **Build a long-running agent** → [Compaction](/docs/core/compaction) + [Durable runtime](/docs/agents/durable-runtime) + [prepareStep](/docs/agents/tool-loop)
+- **Put state in your own database** → [Persistent stores](/docs/modules/stores) + [Chat persistence](/docs/modules/chat-persistence)
+- **Route between specialist agents** → [Handoffs](/docs/agents/handoffs) + [Sub-agents](/docs/agents/subagents)
+- **Constrain what a run may do** → [Guardrails](/docs/agents/guardrails) + [Request validation](/docs/modules/request-validation)
 - **Use provider-native search** → [Provider-executed tools](/docs/agents/server-tools)
 - **Add MCP** → [MCP guide](/docs/modules/mcp)
 - **Add memory/RAG** → [Memory](/docs/modules/memory) + [RAG](/docs/modules/rag)
@@ -121,9 +127,14 @@ For streaming structured output, [streamObject](/docs/core/stream-object) return
 | Memory | mem0 extract/reconcile pipeline over a vector or Obsidian-markdown store | [Memory](/docs/modules/memory) |
 | RAG | MIME sniff, chunkers, dense + lexical (BM25) hybrid retrieval | [RAG](/docs/modules/rag) |
 | Skills | `SKILL.md` parser with progressive disclosure | [Skills](/docs/modules/skills) |
-| MCP | Model Context Protocol client (HTTP/SSE edge-safe; stdio Node-only) | [MCP](/docs/modules/mcp) |
+| MCP | Zero-config servers in the loop, OAuth 2.0, sampling, roots (HTTP/SSE edge-safe; stdio Node-only) | [MCP](/docs/modules/mcp) |
+| Guardrails (2.0) | `onInput` / `onToolCall` / `onOutput` — pass, block or rewrite, reported on the stream | [Guardrails](/docs/agents/guardrails) |
+| Handoffs (2.0) | Transfer the run to another agent, history and all | [Handoffs](/docs/agents/handoffs) |
+| Persistent stores (2.0) | SQLite / Redis / Postgres behind the four storage seams | [Persistent stores](/docs/modules/stores) |
 | Autonomy (1.8) | Workspace memory, CodeAct sandbox, planner/verifier, browser tools, background runs, live plan/activity feed | [Autonomy](/docs/modules/autonomy) |
 | Image generation | Sync OpenAI-compatible generation, async Midjourney, Yunwu relay | [Image generation](/docs/modules/image-generation) |
+| Speech / transcription (2.0) | `generateSpeech` (OpenAI, ElevenLabs) and `transcribe` (OpenAI, Deepgram) | [Speech](/docs/modules/speech) · [Transcription](/docs/modules/transcription) |
+| Video (2.0) | Async submit → poll → download over the OpenAI Videos shape | [Video](/docs/modules/video-generation) |
 | UI streaming | `toDeuzStreamResponse` (server) and `readDeuzStream` (client) | [UI streaming](/docs/modules/ui-streaming) |
 | React hooks | `useChat` (client-tool round-trips + approval pauses + live `plan`/`activity`) and `useObject` over the Deuz UI wire | [React hooks](/docs/modules/react-hooks) |
 | Middleware | `wrapModel` with logging, caching, PII redaction, injection guard | [Middleware](/docs/modules/middleware) |
@@ -144,13 +155,14 @@ All providers normalize to the same canonical stream, so application code is pro
 | Vertex AI | [`@deuz-sdk/core/vertex`](/docs/providers/vertex) | Claude and Gemini on Vertex with OAuth2 Bearer auth |
 | Voyage AI | [`@deuz-sdk/core/voyage`](/docs/providers/voyage) | Embeddings |
 | Yunwu | [`@deuz-sdk/core/yunwu`](/docs/providers/yunwu) | Unified relay — chat, image, embed at `/v1`, Midjourney at the root |
-| OpenAI-compat hosts | [`@deuz-sdk/core/providers`](/docs/providers/compat) | **Mistral, DeepSeek, Qwen, Kimi** (`createKimi` / Moonshot), Groq, Together, OpenRouter, Cerebras, Fireworks, GLM, MiniMax + Azure/Bedrock re-exports + `createProviderRegistry` |
+| OpenAI-compat hosts | [`@deuz-sdk/core/providers`](/docs/providers/compat) | **Mistral, DeepSeek, Qwen, Kimi** (`createKimi` / Moonshot), Groq, Together, OpenRouter, Cerebras, Fireworks, GLM, MiniMax + 2.0's Perplexity, Cohere, DeepInfra, NVIDIA NIM, SambaNova, Hyperbolic + Azure/Bedrock re-exports + `createProviderRegistry` |
+| Local models (2.0) | [`@deuz-sdk/core/providers`](/docs/providers/local) | **Ollama** and **LM Studio** — keyless, `localhost` by default |
 
-A provider factory returns a tiny `LanguageModel` descriptor; the [model registry](/docs/advanced/model-registry) is the single source of truth for per-model capabilities (vision, tools, reasoning, structured output, caching, native PDF, audio, context window). Unknown model slugs do not throw — they fall back to conservative defaults, so new model releases work without a code change.
+That is **29 built-in provider ids** across four chat wires. A provider factory returns a tiny `LanguageModel` descriptor; the [model registry](/docs/advanced/model-registry) is the single source of truth for per-model capabilities (vision, tools, reasoning, structured output, caching, native PDF, audio, context window). Unknown model slugs do not throw — they fall back to conservative defaults, so new model releases work without a code change.
 
 ## Quality bar
 
-- **Over 1,000 tests** across 89 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network), plus a separate type-contract lock run with `--typecheck`
+- **Over 1,800 tests** across 113 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network), plus a separate type-contract lock run with `--typecheck`
 - `tsc` strict (`moduleResolution: "Bundler"`, `verbatimModuleSyntax`, `noUncheckedIndexedAccess`)
 - `eslint` with edge-safety enforced, `publint --strict`, and `attw` (Are The Types Wrong) all green
 - Dual **ESM + CJS** build with `.d.ts` for every subpath export

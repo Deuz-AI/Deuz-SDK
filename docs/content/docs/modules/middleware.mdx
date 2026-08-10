@@ -185,6 +185,21 @@ await m.generateText({ messages: [{ role: 'user', content: 'my key is sk-ant-...
 
 ### promptInjectionGuard
 
+<Callout type="warn" title="Deprecated in 2.0 — prefer promptInjectionGuardrail()">
+`promptInjectionGuard()` is **not removed and still works**, byte for byte. But [`promptInjectionGuardrail()`](/docs/agents/guardrails#promptinjectionguardrail) on `@deuz-sdk/core/guardrails` is the one to reach for now: it prepends the **identical** policy text, so moving a call between them changes *where* the instruction is applied, never *what* the model is told.
+
+The difference is the wrapping scope, and it cuts both ways:
+
+| | `promptInjectionGuard()` (middleware) | `promptInjectionGuardrail()` (guardrail) |
+| --- | --- | --- |
+| Wraps | the **model** | the **run** |
+| Applies | on **every** model call made through that descriptor — every loop step, and side calls such as compaction summaries and sub-agent turns | **once**, before the first model call of the run |
+| Reports itself | not at all (it is transparent) | a `guardrail` part + `providerMetadata.deuz.guardrails` |
+| Needs | nothing — works on a single-turn call | routes the call through the agentic loop |
+
+Prefer the guardrail for a run-level policy you want to see in the transcript. Keep the middleware when you genuinely want the instruction on literally every request that descriptor makes — including the ones the SDK issues on your behalf.
+</Callout>
+
 Prepends a system message that tells the model to treat user content and tool outputs as untrusted **data**, never as instructions — a lightweight spotlighting defense against prompt injection.
 
 ```ts
@@ -293,3 +308,9 @@ const observeFinish: LanguageModelMiddleware = {
 - `wrapModel` is a thin client, not a `LanguageModel`. Pass the wrapped model's methods around, not the object itself, where a raw descriptor is expected.
 - `logging` and `simpleCache` only hook `wrapGenerate` — they do not affect streaming. Use a custom `wrapStream` layer (or `deps.logger`) to instrument streams.
 - The SDK already redacts secrets at the transport/log layer (headers, error bodies, spans) — that protection is always on and independent of middleware. `redactPII` is the opt-in message-content counterpart, applied per wrapped model.
+- A middleware wraps the **model**; a [guardrail](/docs/agents/guardrails) wraps the **run**. They compose — a wrapped model inside a guarded call is fine — and neither replaces the other. Only a guardrail can refuse a tool call or end a run.
+
+## See also
+
+- [Guardrails](/docs/agents/guardrails) — run-level pass / block / rewrite hooks, and the guardrail twin of `promptInjectionGuard`.
+- [Request validation](/docs/modules/request-validation) — reject a hostile POST body before it reaches a model at all.

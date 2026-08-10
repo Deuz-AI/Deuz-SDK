@@ -9,6 +9,8 @@
     "client-tools",
     "server-tools",
     "subagents",
+    "handoffs",
+    "guardrails",
     "durable-runtime",
     "unbreakable-chatbot"
   ]

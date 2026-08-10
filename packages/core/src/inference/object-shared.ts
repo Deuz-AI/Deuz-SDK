@@ -54,6 +54,12 @@ export function pickObjectStrategy(
  * `responseFormat`, `providerOptions`, `promptCaching`, and `agentPath`
  * (observation correlation + usage metering). A false positive here would break
  * working code — worse than the bug this guard fixes.
+ *
+ * `runtimeContext` is absent for a DIFFERENT reason: an object call cannot honour
+ * it either (it only ever reaches loop hooks), but it is inert DATA rather than a
+ * control the caller could believe is armed, and threading it through every call
+ * from a request-scoped wrapper is exactly the usage its own doc prescribes —
+ * rejecting it would break that pattern for no safety gain.
  */
 const IGNORED_OBJECT_OPTIONS = [
   'tools',
@@ -67,6 +73,12 @@ const IGNORED_OBJECT_OPTIONS = [
   'activeTools',
   'verifyStep',
   'maxVerifyAttempts',
+  // False-finish guard (1.9, N2) — the pair `verifyStep`/`maxVerifyAttempts`
+  // above got right and this one was missed: both hooks hang off the loop's
+  // NATURAL-COMPLETION boundary, and a single-turn object call has no such
+  // boundary to consult them at, let alone a way to re-drive on a rejection.
+  'doneWhen',
+  'falseFinishGuard',
   'compaction',
   'approveToolCall',
   'approvalResponses',

@@ -8,7 +8,7 @@
 [![runtime deps](https://img.shields.io/badge/runtime%20deps-0-3b82f6?style=flat-square)](./packages/core/package.json)
 [![license](https://img.shields.io/npm/l/%40deuz-sdk%2Fcore?style=flat-square)](./LICENSE)
 
-**[Docs](./docs)** · **[What's new in 1.9](./docs/content/docs/reference/whats-new-1-9.mdx)** · **[Migrating from the Vercel AI SDK](./docs/content/docs/migration/from-vercel-ai-sdk.mdx)** · **[Changelog](./packages/core/CHANGELOG.md)**
+**[Docs](./docs)** · **[What's new in 2.0](./docs/content/docs/reference/whats-new-2-0.mdx)** · **[Migrating from the Vercel AI SDK](./docs/content/docs/migration/from-vercel-ai-sdk.mdx)** · **[Changelog](./packages/core/CHANGELOG.md)**
 
 </div>
 
@@ -29,10 +29,13 @@ Providers normalize to one canonical stream. Failures are typed parts on that st
 | Plan → act → verify | `planTasks`, CodeAct sandboxes, `verifyStep`, workspace files, browser tools, background runs ([1.8](./docs/content/docs/modules/autonomy.mdx)) |
 | Durable runs | Step checkpoints in *your* DB; `resumeFromCheckpoint` later — no workflow vendor |
 | Human approval | `needsApproval` at any depth; HMAC-signed, expiring tokens; missing verdict = deny |
-| Many models, one call shape | Anthropic, OpenAI, Azure, Bedrock, Gemini, xAI, Vertex, plus Mistral / DeepSeek / Qwen / Kimi / Groq / … via `./providers` and `createProviderRegistry` |
+| Many models, one call shape | 29 built-in provider ids over four wires — Anthropic, OpenAI, Azure, Bedrock, Gemini, xAI, Vertex, Yunwu, Voyage, plus Mistral / DeepSeek / Qwen / Kimi / Groq / Perplexity / Cohere / … and keyless Ollama / LM Studio via `./providers` and `createProviderRegistry` |
 | Resumable UI | Refresh, network blip, and server crash look the same to the client |
 | An agent you can reuse | `createAgent` — a frozen value with `generateText` / `streamChat` / `generateObject` / `streamObject` / `asTool` / `with`, no `new` and no second runtime ([1.9](./docs/content/docs/agents/create-agent.mdx)) |
 | Traces without an account | Versioned observe events, a JSONL observer, an HTML run report, and an OpenTelemetry bridge — content capture opt-in and always redacted |
+| State in *your* database | SQLite / Redis / Postgres packs behind the memory, chat, session and run seams — real schemas, no ORM ([2.0](./docs/content/docs/modules/stores.mdx)) |
+| Rules the run must obey | Guardrails on input, each tool call, and the final answer: pass / block / rewrite, reported on the stream ([2.0](./docs/content/docs/agents/guardrails.mdx)) |
+| More than text | Speech, transcription and video alongside chat and images ([2.0](./docs/content/docs/reference/whats-new-2-0.mdx)) |
 
 Published on npm, covered by golden-replay tests, documented under [`docs/`](./docs).
 
@@ -92,7 +95,38 @@ Three new subpaths ship with it:
 
 `/observe` and `/observe/node` also gained a run report: the pure `renderRunReport(events)` turns one run's observation events into a standalone HTML document, and `writeRunReport({ from, to })` reads a JSONL journal and writes that file.
 
-Three 1.9 surfaces first shipped as **declared but inert** and all three now have producers: `streamChat().warnings` resolves a real `CallWarning[]` (and `warning` parts ride `fullStream`), the built-in approval loop sets `tool-state.denied` / `deniedReason` so a refused call no longer renders as "getWeather failed", and `applyUIPart` folds `sub-agent` frames into `turn.subAgents`, which `useChat` exposes. One gap remains and we say so on every page that mentions it: `result.warnings` is **`undefined` on `generateText` / `generateObject` / `streamObject`**, and a `streamChat` carrying `tools` reports only its own `activeTools` notices — read `deps.logger.warn` there. [The full list, with the limitations](./docs/content/docs/reference/whats-new-1-9.mdx).
+Three 1.9 surfaces first shipped as **declared but inert** and all three now have producers: `warnings` resolves a real `CallWarning[]` on every entry point (and `warning` parts ride `fullStream`), the built-in approval loop sets `tool-state.denied` / `deniedReason` so a refused call no longer renders as "getWeather failed", and `applyUIPart` folds `sub-agent` frames into `turn.subAgents`, which `useChat` exposes. Two documented gaps remain — `clamped-setting` has no producer, and a `warning` cannot cross the object wire to `useObject`. [The full list, with the limitations](./docs/content/docs/reference/whats-new-1-9.mdx).
+
+## 2.0 — the things you used to build yourself
+
+```ts
+import { generateText, handoff } from '@deuz-sdk/core';
+import { promptInjectionGuardrail, maxOutputLength } from '@deuz-sdk/core/guardrails';
+import { createPostgresStores } from '@deuz-sdk/core/stores/postgres';
+
+const stores = createPostgresStores({ connectionString: process.env.DATABASE_URL });
+
+await generateText({
+  model: triage,
+  messages,
+  maxSteps: 8,
+  // the run can hand itself to another agent — history, tools and model all move
+  tools: { ...handoff({ billing, support }), search },
+  // rules the run must obey, reported on the stream instead of applied invisibly
+  guardrails: { onInput: promptInjectionGuardrail(), onOutput: maxOutputLength(4000) },
+  // servers the loop connects, namespaces, hot-refreshes and closes by itself
+  mcp: [{ url: 'https://mcp.example.com/mcp' }],
+  // transcript + checkpoints in your database, on one connection
+  chat: { store: stores.chats, chatId, scope: { userId } },
+  session: { store: stores.sessions, runId },
+  // request-scoped facts travel with the CALL, not with a closure per request
+  runtimeContext: { tenantId, db },
+});
+```
+
+Also: `compactMessages()` and automatic recovery from a provider's context-overflow rejection; MCP **OAuth 2.0**, sampling, roots, reconnect and a connection pool; memory graph-link expansion, write policies and TTL sweeps; **speech, transcription and video**; eight more providers, two of them keyless.
+
+What is **not** in the box is on the same page as what is — overflow recovery fires on two wires only, the Redis pack has no `MULTI`, token counting is still a calibrated heuristic unless you plug in a tokenizer, `rerank` is still the identity reranker, MCP has no WebSocket transport, and the `Part` union has no `AudioPart`. [What is new in 2.0](./docs/content/docs/reference/whats-new-2-0.mdx).
 
 ## Install
 
@@ -190,17 +224,22 @@ Both charts are generated from the 1.8.0 data in [`bench/`](./bench) and have no
 
 ```
 @deuz-sdk/core         streamChat · generateText · generateObject · streamObject · embed
-                       tool · filePart · imagePart · agentTool · getModelCapabilities
+                       tool · filePart · imagePart · agentTool · handoff · compactMessages
+                       getModelCapabilities
   providers            /anthropic  /openai  /azure  /bedrock  /google  /google/extras  /xai  /voyage
                        /vertex  /vertex/node   (service-account JWT on the edge; ADC on Node)
-                       /providers   (Mistral, DeepSeek, Qwen, Kimi, Groq, OpenRouter, createOpenAICompatible,
-                                     createProviderRegistry)
+                       /providers   (Mistral, DeepSeek, Qwen, Kimi, Groq, Perplexity, Cohere, DeepInfra,
+                                     NVIDIA, SambaNova, Hyperbolic, keyless Ollama / LM Studio,
+                                     createOpenAICompatible, createProviderRegistry)
   agents               /agent       (createAgent — a reusable agent as a frozen value)
+                       /guardrails  (promptInjectionGuardrail, maxOutputLength)
   chat & wire          /chat  /chat/node  /ui  /durable
+  state & storage      /stores/sqlite  /stores/redis  /stores/postgres
   memory & knowledge   /memory  /memory/markdown  /rag  /rag/node  /skills  /skills/node
   autonomy             /workspace  /workspace/node  /compute  /compute/node
                        /autonomy  /runtime  /runtime/node  /browser  /browser/node
-  connect & media      /mcp  /mcp/stdio  /image  /midjourney  /yunwu
+  connect & media      /mcp  /mcp/stdio  /mcp/node
+                       /image  /midjourney  /speech  /transcription  /video  /yunwu
   ops                  /observe  /observe/node  /otel  /middleware  /pricing  /testing  /edge
 
 @deuz-sdk/react        useChat · useObject · ToolApprovalCard · CostBadge

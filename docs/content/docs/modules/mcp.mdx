@@ -1,30 +1,137 @@
 ---
 title: MCP
-description: Connect to Model Context Protocol servers and expose their tools to the agentic loop as a canonical ToolSet.
+description: Model Context Protocol — zero-config servers in the loop, OAuth 2.0, sampling, roots, reconnect, and a connection pool.
 ---
 
-The MCP module connects to a [Model Context Protocol](https://modelcontextprotocol.io) server, lists its tools, and maps them into a canonical `ToolSet` you can hand straight to [generateText](/docs/core/generate-text) or [streamChat](/docs/core/stream-chat). Tool execution proxies transparently to the server — when the model calls an MCP tool, the SDK invokes it over the live connection and feeds the result back into the loop.
+The MCP module connects to a [Model Context Protocol](https://modelcontextprotocol.io) server, lists its tools, and maps them into a canonical `ToolSet`. Tool execution proxies transparently to the server — when the model calls an MCP tool, the SDK invokes it over the live connection and feeds the result back into the loop.
 
-Beyond tools, the client also exposes the server's **resources** and **prompts**, and can answer server-initiated **elicitation** requests (all per the 2025-11-25 MCP revision).
+In 2.0 you usually do not build a client at all:
 
-`@modelcontextprotocol/sdk` is a **lazy optional peer** (`^1.29.0`): it is imported with a dynamic `import()` only when you actually create a client, so the edge bundle never pulls it in unless you use MCP. Install it yourself:
+```ts title="zero-config.ts"
+import { generateText } from '@deuz-sdk/core';
+
+const { text } = await generateText({
+  model,
+  messages,
+  maxSteps: 6,
+  mcp: [{ url: 'https://mcp.example.com/mcp' }],
+});
+```
+
+The loop connects, lists the tools, merges them into `tools`, hot-refreshes on a `tools/list_changed` notification, and closes what it opened when the run ends.
+
+Beyond tools, a client exposes the server's **resources** and **prompts**, answers server-initiated **elicitation** and **sampling** requests, and advertises **roots** (all per the 2025-11-25 MCP revision).
+
+`@modelcontextprotocol/sdk` is a **lazy optional peer** (`^1.29.0`): imported with a dynamic `import()` only when you actually connect, so the edge bundle never pulls it in unless you use MCP. Install it yourself:
 
 ```bash
 npm i @modelcontextprotocol/sdk
 ```
 
-If it is missing at runtime, `createMcpClient` / `createStdioMcpClient` reject with an `InvalidRequestError` telling you to install it.
+If it is missing at runtime, the call rejects with an `InvalidRequestError` telling you to install it.
 
 ## Transports
-
-Two transports live behind two different subpath exports, split by where they can run:
 
 | Subpath | Function | Transport | Runtime |
 | --- | --- | --- | --- |
 | `@deuz-sdk/core/mcp` | `createMcpClient` | `http` (Streamable HTTP) or `sse` (legacy) | Edge-safe (fetch-only, no Node builtins) |
 | `@deuz-sdk/core/mcp/stdio` | `createStdioMcpClient` | stdio (spawns a child process) | Node-only |
+| `@deuz-sdk/core/mcp/node` | `createFileTokenStore`, `createLoopbackRedirect` | — (OAuth helpers) | Node-only |
 
-Use `http` for remote MCP servers reachable over the network — it is the current Streamable HTTP transport. `sse` is the legacy fallback some servers (e.g. Firecrawl's `/v2/sse`) still expose. The stdio transport spawns a local command (e.g. `npx -y firecrawl-mcp`) and talks to it over stdin/stdout, so it only works in a Node process and is kept on its own subpath to keep the edge core free of Node builtins.
+Use `http` for remote servers — it is the current Streamable HTTP transport. `sse` is the legacy fallback some servers (e.g. Firecrawl's `/v2/sse`) still expose. The stdio transport spawns a local command (`npx -y firecrawl-mcp`) and talks over stdin/stdout, so it only works in Node and lives on its own subpath to keep the edge core free of Node builtins.
+
+There is **no WebSocket transport**. A WebSocket server needs a custom `McpClient` implementation.
+
+---
+
+## Zero-config MCP
+
+`CommonCallOptions.mcp` takes an array of entries. The MCP code is reached through a dynamic import, so a call without this option pulls none of it into the bundle.
+
+### Entry kinds
+
+```ts
+type McpLoopEntry =
+  | McpHttpLoopConfig     // { url, type?, headers?, auth?, namespace?, onElicitationRequest? }
+  | McpStdioLoopConfig    // { command, args?, env?, namespace? }
+  | McpClientLoopEntry    // { client, namespace? }
+  | McpClient;            // a bare, already-connected client
+```
+
+```ts title="mixed-entries.ts"
+await generateText({
+  model, messages, maxSteps: 8,
+  mcp: [
+    { url: 'https://search.example.com/mcp', headers: { Authorization: `Bearer ${token}` } },
+    { command: 'npx', args: ['-y', 'firecrawl-mcp'], env: { FIRECRAWL_API_KEY: key } },
+    { client: longLivedClient, namespace: 'internal' },
+  ],
+  tools: { now },   // your own tools ALWAYS win a name collision
+});
+```
+
+### Namespacing
+
+Tool names travel to providers that accept `[A-Za-z0-9_-]` only, so a prefix has to be sanitized. The rule, in order:
+
+1. **an explicit `namespace`** always wins;
+2. **a single entry gets no prefix at all** — `mcp: [{ url }]` should read like `tools: {…}`;
+3. otherwise the server's own handshake name (`serverInfo().name`), with runs of anything else collapsed to `_` and leading/trailing `_` trimmed;
+4. and `mcp{index}` when the server sent no name, or when its name sanitizes to nothing.
+
+Prefixed names are `` `${namespace}_${tool}` ``. Two servers exporting the same final name is not fatal: the later entry wins and the collision is logged — failing a run over a name clash would be worse than an over-specific tool.
+
+### Ownership: who closes what
+
+| Entry | Opened by | Closed by |
+| --- | --- | --- |
+| `{ url }` / `{ command }` config | the run | **the run**, at every exit |
+| `{ url }` / `{ command }` with `deps.mcpPool` | the pool | **the pool** — never the run |
+| a live `McpClient` (bare or `{ client }`) | you | **you** |
+
+Closing a long-lived connector because one request finished is the bug this rule exists to prevent.
+
+### Fail fast
+
+A server that cannot be reached **rejects the whole call** rather than quietly running with a smaller tool set — a half-connected agent produces confidently wrong answers, which is worse than an actionable error. Whatever the call already opened is closed before the rejection propagates, so a failure leaks no connections.
+
+`generateText` surfaces that as the call's rejection; `streamChat` resolves it **inside the pump**, so it becomes an `error` part and the never-throw contract is preserved.
+
+### Hot refresh
+
+Every client — borrowed ones included — is subscribed to `tools/list_changed`. At the next step boundary the loop re-reads the catalogs and rebuilds the wire tool lists. A failed `tools/list` re-arms the dirty flag and keeps the previous catalog: one failed refresh must not end a healthy run.
+
+Config-based connections default to `reconnect: true`, because an agentic run outlives a single request and a dropped session in the middle of step 4 would otherwise fail every remaining tool call. A client **you** built keeps whatever lifecycle you chose.
+
+### Refusals
+
+`generateObject` / `streamObject` **reject** `mcp`: they are single-shot by design, and connecting servers only to drop their tools would pay a full handshake for nothing. A call that sets only `mcp`, with no `tools` of its own, still routes through the agentic loop.
+
+### `deps.mcpPool` — for server processes
+
+Without a pool, every request that passes `mcp: [{ url }]` pays a fresh handshake and then closes it. `createMcpPool()` is a process-lifetime cache:
+
+```ts title="pool.ts"
+import { createMcpPool } from '@deuz-sdk/core/mcp';
+
+const mcpPool = createMcpPool();               // once, at startup
+
+export async function handler(req: Request) {
+  return generateText({
+    model, messages, maxSteps: 6,
+    mcp: [{ url: 'https://mcp.example.com/mcp' }],
+    deps: { mcpPool },
+  });
+}
+
+process.on('SIGTERM', () => mcpPool.close());  // the pool's owner closes it
+```
+
+Keyed by the config's **structure**, so the same `{ url }` handed to a hundred requests handshakes once. `namespace` is deliberately excluded from the key — it is a presentation choice about tool names, not a property of the connection — while functions and class instances (an elicitation handler, a `DeuzOAuthProvider`, a token store) get identity-based keys, because two configs identical except for their handler are *not* the same connection.
+
+The in-flight **promise** is what is cached, so concurrent requests for a cold server share one connect instead of racing several. A failed connect is evicted (the next call retries rather than replaying a dead rejection), and so is an entry whose session has since gone `closed` / `error` — a pool that hands back a corpse is worse than no pool.
+
+---
 
 ## createMcpClient
 
@@ -34,109 +141,366 @@ import { createMcpClient } from '@deuz-sdk/core/mcp';
 const client = await createMcpClient(options);
 ```
 
-`createMcpClient` is `async` and returns a `Promise<McpClient>`. It loads the SDK, builds the transport, and `connect`s before resolving.
-
-### Options
-
-```ts
-interface McpClientOptions {
-  transport: McpHttpTransport;
-  name?: string;
-  version?: string;
-  onElicitationRequest?: McpElicitationHandler;
-}
-
-interface McpHttpTransport {
-  type: 'http' | 'sse';
-  url: string;
-  headers?: Record<string, string>;
-}
-```
+`async`: it loads the SDK, builds the transport and connects before resolving.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `transport.type` | `'http' \| 'sse'` | — | `http` = Streamable HTTP; `sse` = legacy SSE fallback. |
+| `transport.type` | `'http' \| 'sse'` | — | `http` = Streamable HTTP; `sse` = legacy fallback. |
 | `transport.url` | `string` | — | The server endpoint. |
-| `transport.headers` | `Record<string, string>` | — | Extra request headers (e.g. `Authorization`). Sent on every request. |
-| `name` | `string` | `'deuz'` | Client name advertised to the server. |
-| `version` | `string` | `'0.0.0'` | Client version advertised to the server. |
-| `onElicitationRequest` | `McpElicitationHandler` | — | Answer server-initiated user-input requests — see [Elicitation](#elicitation). Providing it declares the `elicitation` capability (form + url). |
+| `transport.headers` | `Record<string, string>` | — | Sent on every request. |
+| `name` / `version` | `string` | `'deuz'` / `'0.0.0'` | Advertised to the server in the handshake. |
+| `onElicitationRequest` | `McpElicitationHandler` | — | [Elicitation](#elicitation). Declares the capability. |
+| `auth` | `McpOAuthOptions \| DeuzOAuthProvider` | — | [OAuth 2.0](#oauth-20). |
+| `authorizationCode` | `string` | — | The `?code=` from the redirect — exchanged **before** connecting. Requires `auth`. |
+| `sampling` | `McpSamplingOptions` | — | [Sampling](#sampling). Declares the capability. |
+| `roots` | `McpRootsOption` | — | [Roots](#roots). Declares the capability. |
+| `reconnect` | `boolean \| McpReconnectPolicy` | off | [Reconnect](#reconnect-status-and-keepalive). |
+| `onStatusChange` | `(status, info?) => void` | — | Observe every transition. A throwing callback is swallowed. |
+| `keepAliveMs` | `number` | off | Chained `ping()` heartbeat. A rejected ping counts as a drop. |
+| `clock` | `Clock` | host clock | Time source for backoff + keepalive (edge-safety: never ambient). |
 
-## createStdioMcpClient
+`createStdioMcpClient` (`@deuz-sdk/core/mcp/stdio`) takes the same lifecycle options plus `command` / `args` / `env`, and supports `onElicitationRequest`, `sampling` and `roots` identically. A reconnect **respawns the child process** — the old one died with the pipe.
 
-```ts
-import { createStdioMcpClient } from '@deuz-sdk/core/mcp/stdio';
+<Callout type="warn" title="Capabilities are declared at construction, so handlers register before connect">
+`onElicitationRequest`, `sampling` and `roots` each declare a client capability in the constructor and register their handler before `connect()`. Declaring a capability without a handler would lie to servers, so there is no way to attach one afterwards on a managed connection — a reconnect builds a **new** client, and only what the factory registers comes back with it.
 
-const client = await createStdioMcpClient(options);
-```
-
-### Options
-
-```ts
-interface McpStdioOptions {
-  command: string;
-  args?: string[];
-  env?: Record<string, string>;
-  name?: string;
-  version?: string;
-  onElicitationRequest?: McpElicitationHandler; // same semantics as the HTTP client
-}
-```
-
-| Option | Type | Default | Notes |
-| --- | --- | --- | --- |
-| `command` | `string` | — | Executable to spawn, e.g. `'npx'`. |
-| `args` | `string[]` | `[]` | Arguments, e.g. `['-y', 'firecrawl-mcp']`. |
-| `env` | `Record<string, string>` | — | Environment for the child process (e.g. API keys the server needs). |
-| `name` | `string` | `'deuz'` | Client name advertised to the server. |
-| `version` | `string` | `'0.0.0'` | Client version advertised to the server. |
+Presence is tested with `!== undefined` everywhere: `roots: []` is a **value** ("no roots"), not an absent option.
+</Callout>
 
 ## The McpClient
 
-Both factories return the same transport-agnostic `McpClient`:
-
 ```ts
 interface McpClient {
-  /** MCP tools mapped to a ToolSet ready for generateText({ tools }). */
   listTools(namespace?: string): Promise<ToolSet>;
-  /** Call a tool directly (rarely needed; the loop uses execute). */
   callTool(name: string, args: unknown): Promise<unknown>;
-  /** All resources / prompts, auto-paginated (cursor handled for you). */
   listResources(): Promise<McpResource[]>;
   readResource(uri: string): Promise<McpResourceContent[]>;
   listPrompts(): Promise<McpPrompt[]>;
   getPrompt(name: string, args?: Record<string, string>): Promise<McpGetPromptResult>;
+  status(): McpConnectionStatus;
+  serverInfo?(): { name: string; version?: string } | undefined;
+  onToolListChanged(cb: () => void): () => void;
   close(): Promise<void>;
 }
 ```
 
-| Method | Returns | Notes |
-| --- | --- | --- |
-| `listTools(namespace?)` | `Promise<ToolSet>` | Lists the server's tools and maps each into a canonical `Tool`. The optional `namespace` prefixes every tool name with `` `${namespace}_` `` so you can merge multiple servers without collisions. |
-| `callTool(name, args)` | `Promise<unknown>` | Invokes a tool directly. The loop never needs this — each mapped tool's `execute` calls it for you. |
-| `listResources()` | `Promise<McpResource[]>` | All resources across pages — cursor pagination is handled internally (capped at 100 pages against endless cursors). |
-| `readResource(uri)` | `Promise<McpResourceContent[]>` | One resource's contents: entries carry `text` or base64 `blob` plus `mimeType`. |
-| `listPrompts()` | `Promise<McpPrompt[]>` | All prompt templates across pages (same pagination handling). |
-| `getPrompt(name, args?)` | `Promise<McpGetPromptResult>` | Renders a prompt with string arguments. Messages come back in **MCP's own shape** (`{ role, content }` blocks), not the canonical `Message` — map them yourself if you feed them to a model. |
-| `close()` | `Promise<void>` | Closes the connection / terminates the child process. Always call it when done. |
+Both factories return `McpRootsClient` — the above plus `setRoots(roots: string[])`.
 
-The resource/prompt methods need SDK `^1.29.0` — on an older installed SDK they reject with an actionable upgrade error.
+| Method | Notes |
+| --- | --- |
+| `listTools(namespace?)` | Maps the server's tools into canonical `Tool`s. Served from a cache that only invalidation clears. |
+| `callTool(name, args)` | Direct invocation. The loop never needs it — each mapped tool's `execute` calls it. |
+| `listResources()` / `listPrompts()` | Auto-paginated (cursor handled for you, capped at 100 pages against endless cursors). |
+| `readResource(uri)` | Contents array: entries carry `text` or base64 `blob` plus `mimeType`. |
+| `getPrompt(name, args?)` | Messages come back in **MCP's own shape**, not canonical `Message` — map them yourself. |
+| `status()` | `'connecting' \| 'connected' \| 'reconnecting' \| 'closed' \| 'error'`. Always `'connected'` for an unmanaged client. |
+| `serverInfo?()` | The handshake `Implementation` block. Read through the *current* session, so a reconnect onto a redeployed server reports the new name. Optional, so a hand-written client stays valid. |
+| `onToolListChanged(cb)` | Fires on `tools/list_changed` **or** a reconnect landing on a possibly-different server. Returns an unsubscribe. |
+| `close()` | Closes the connection / terminates the child process. Always call it when you own the client. |
+
+The resource/prompt methods need SDK `^1.29.0` — an older installed SDK rejects with an actionable upgrade error.
 
 ### How tools map
 
-`listTools()` returns a `ToolSet` — a `Record<string, Tool>` — built from the server's tool definitions:
+- The MCP `inputSchema` **is** a JSON Schema, so it goes straight onto `Tool.parameters`. An `outputSchema`, when present, is carried onto `Tool.outputSchema` as metadata.
+- Each tool's `execute` proxies to the server via `callTool`. With a managed connection the call always targets the **current** client, so tools built before a reconnect keep working after it.
+- **Structured results win:** when the server returns `structuredContent`, `execute` returns that object verbatim (per spec, the text blocks are a redundant serialization). Otherwise the text blocks are joined into a string.
+- If the server marks the result as an error (`isError`), `execute` **throws** — which the [tool loop](/docs/agents/tool-loop) catches and feeds back as an `is_error` tool result, so the model can self-heal rather than the call crashing.
 
-- The MCP `inputSchema` **is** a JSON Schema, so it goes straight onto `Tool.parameters` (no conversion). The server's `outputSchema`, when present, is carried onto `Tool.outputSchema` as metadata.
-- Each tool's `execute` proxies to the server via `callTool`.
-- **Structured results win:** when the server returns `structuredContent`, `execute` returns that object verbatim (per spec, the text blocks are just a redundant serialization). Otherwise the text content blocks are joined into a string. If the server marks the result as an error (`isError`), `execute` **throws** — which the [tool loop](/docs/agents/tool-loop) catches and feeds back as an `is_error` tool result, so the model can self-heal rather than the call crashing.
+---
 
-Because the mapped tools have an `execute`, the agentic loop runs them automatically; you do not write the round-trip yourself.
+## OAuth 2.0
 
-> **Behavior note:** before 1.3.0, `execute` always returned joined text. Servers that declare an `outputSchema` now yield the structured object instead — if your code string-matched those results, read the object.
+An MCP server that wants OAuth answers the first connect with a 401. The SDK implements the whole protocol — RFC 8414 metadata discovery, RFC 7591 dynamic client registration, PKCE (S256) and refresh — behind one seam whose only jobs are to say where the user comes back to and to **persist** four things. So this module writes a provider, never a flow: there is no token-endpoint call, no code-challenge derivation and no refresh timer in it.
+
+### The two-step flow
+
+```ts title="oauth-two-step.ts"
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+import { McpAuthorizationRequiredError } from '@deuz-sdk/core';
+
+const transport = { type: 'http', url: 'https://mcp.example.com/mcp' } as const;
+const auth = { redirectUri: 'https://app.example.com/oauth/callback', store };
+
+let client;
+try {
+  // 1st attempt — tokens already in the store? straight through.
+  client = await createMcpClient({ transport, auth });
+} catch (err) {
+  if (!(err instanceof McpAuthorizationRequiredError)) throw err;
+
+  // The SDK already ran discovery + registration, so the URL exists.
+  redirect(err.authorizationUrl!);            // your host decides HOW
+  const authorizationCode = await waitForCallbackCode();
+
+  // 2nd attempt — the code is exchanged BEFORE connecting.
+  client = await createMcpClient({ transport, auth, authorizationCode });
+}
+```
+
+`McpAuthorizationRequiredError` (from `@deuz-sdk/core`) carries `serverUrl` and, when a provider was configured, `authorizationUrl`. It is a plain serializable error, which matters: the process that shows the URL to a user is often not the process that connects.
+
+The authorization code is **single-use**, so it is spent on the first attempt only. A reconnect re-reads whatever tokens it bought.
+
+### Or: `completeAuth(code)`
+
+When you build the provider yourself you can finish the exchange without re-entering `createMcpClient`:
+
+```ts title="complete-auth.ts"
+import { createOAuthProvider, createMcpClient } from '@deuz-sdk/core/mcp';
+
+const provider = createOAuthProvider({
+  redirectUri: 'https://app.example.com/oauth/callback',
+  store,
+  onRedirect: (url) => sendToUser(url),   // called INSTEAD of throwing
+});
+
+try {
+  client = await createMcpClient({ transport, auth: provider });
+} catch {
+  const code = await waitForCallbackCode();
+  await provider.completeAuth(code);      // exchange + persist
+  client = await createMcpClient({ transport, auth: provider });
+}
+```
+
+One provider can serve **many** servers: every stored key is namespaced by server URL, so sharing a provider across `mcp: [{ url: a, auth }, { url: b, auth }]` never crosses tokens.
+
+```ts
+interface DeuzOAuthProvider {
+  readonly provider: unknown;              // the SDK-side OAuthClientProvider — pass it through, do not inspect it
+  authorizationUrl(): URL | undefined;
+  completeAuth(code: string): Promise<void>;
+  tokens(): Promise<Record<string, unknown> | undefined>;
+  invalidate(): Promise<void>;             // drop tokens → next connect re-authorizes
+}
+```
+
+`redirectToAuthorization` **never opens a browser**: it records the URL and calls `onRedirect`. Deciding how a user sees that URL — a CLI printing it, a web app 302-ing to it, a desktop shell launching one — is the host's call, and a library that spawns a browser on a server is a bug.
+
+### `createOAuthProvider` options
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `redirectUri` | `string` | Required. Must match the registered client. |
+| `clientId` | `string` | Pre-registered client. Omit to let dynamic registration (RFC 7591) mint one — a configured `clientId` short-circuits registration entirely. |
+| `clientSecret` | `string` | Confidential clients. Omit for public (PKCE) clients. |
+| `scope` | `string` | Space-separated scopes. |
+| `clientMetadata` | `Record<string, unknown>` | Extra fields for the registration body; your fields win over the defaults. |
+| `store` | `TokenStore` | Default: `inMemoryTokenStore()` — tokens die with the process. |
+| `onRedirect` | `(url: URL) => void \| Promise<void>` | Called with the authorization URL instead of throwing. |
+
+### The `TokenStore` seam
+
+Deliberately the smallest possible surface — a scoped key/value map — so a `Map`, `localStorage`, a Supabase row or a KV namespace all satisfy it without an adapter. Every method may be sync or async.
+
+```ts
+interface TokenStore {
+  get(key: string): Promise<string | undefined> | string | undefined;
+  set(key: string, value: string): Promise<void> | void;
+  delete(key: string): Promise<void> | void;
+}
+```
+
+Four namespaced keys per server, so one store backs many:
+
+```
+tokens:<serverUrl>         the access/refresh token pair (SECRET)
+client-info:<serverUrl>    what dynamic registration minted
+code-verifier:<serverUrl>  the in-flight PKCE verifier (short-lived)
+server-url                 the server the last authorization was started for
+```
+
+`server-url` survives every invalidation: it is a binding, not a credential, and the process that carries the `?code=` back needs it to know which exchange it is completing.
+
+<Callout type="warn" title="These values are live refresh tokens">
+A file-backed store must create the file `0600`. A browser-storage-backed one is only appropriate for a server the user alone controls. `inMemoryTokenStore()` is the safe default precisely because it forgets everything on exit.
+</Callout>
+
+#### Node: a file store and a loopback listener
+
+`@deuz-sdk/core/mcp/node` ships the two things a CLI or desktop flow needs and a browser-safe runtime cannot provide.
+
+```ts title="cli-oauth.ts"
+import { homedir } from 'node:os';
+import { createFileTokenStore, createLoopbackRedirect } from '@deuz-sdk/core/mcp/node';
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+import { McpAuthorizationRequiredError } from '@deuz-sdk/core';
+
+const loopback = await createLoopbackRedirect();          // 127.0.0.1:<free port>/callback
+const transport = { type: 'http', url } as const;
+const auth = {
+  redirectUri: loopback.redirectUri,
+  store: createFileTokenStore({ path: `${homedir()}/.deuz/mcp-tokens.json` }),
+};
+
+let client;
+try {
+  client = await createMcpClient({ transport, auth });
+} catch (err) {
+  if (!(err instanceof McpAuthorizationRequiredError)) throw err;
+  console.log('Open this URL to authorize:\n' + err.authorizationUrl);
+  const authorizationCode = await loopback.waitForCode();
+  client = await createMcpClient({ transport, auth, authorizationCode });
+} finally {
+  await loopback.close();
+}
+```
+
+`createFileTokenStore` writes one JSON file, created `0600`, through a temp file and a rename — a crash mid-write can never tear the existing tokens. Every operation is chained onto the previous one, because `set` is a read-modify-write and the SDK's token save and verifier save race routinely. A file that is missing, unreadable or invalid JSON reads as **empty** rather than throwing: re-authorizing is recoverable, crashing a run on a half-written file is not.
+
+`createLoopbackRedirect({ port?, path?, timeoutMs? })` is a **single-shot** listener on `127.0.0.1` (not `localhost` — the name can resolve to `::1` first, and an authorization server that registered the IPv4 literal would then redirect somewhere nothing is listening). It answers exactly one authorization result and stops. The timer starts at **creation**, not at `waitForCode()`, because the redirect URI is live the moment it resolves. `close()` is idempotent and safe in a `finally`.
+
+#### Edge: a KV-backed store
+
+On an edge runtime the same seam is three lines over whatever KV you have:
+
+```ts title="kv-token-store.ts"
+import type { TokenStore } from '@deuz-sdk/core/mcp';
+
+// Cloudflare KV, Vercel KV, Upstash, a Supabase table — anything with get/put/delete.
+export const kvTokenStore = (kv: KVNamespace, userId: string): TokenStore => ({
+  get: (key) => kv.get(`mcp:${userId}:${key}`).then((v) => v ?? undefined),
+  set: (key, value) => kv.put(`mcp:${userId}:${key}`, value),
+  delete: (key) => kv.delete(`mcp:${userId}:${key}`),
+});
+```
+
+Scoping the namespace by user is the whole trick: the provider already namespaces by server, so one KV holds every user × every server without collisions. Encrypt at rest if your KV does not.
+
+### In a zero-config entry
+
+`McpHttpLoopConfig.auth` takes the same union, so the loop can run the flow for you:
+
+```ts
+mcp: [{ url: 'https://mcp.example.com/mcp', auth: { redirectUri, store, onRedirect } }]
+```
+
+A first run with no stored tokens rejects the call with `McpAuthorizationRequiredError`. Sharing one `DeuzOAuthProvider` across several entries shares its store and its registration.
+
+---
+
+## Reconnect, status and keepalive
+
+All of it is additive and **off by default**: leaving these options unset reproduces the 1.x connect-once behaviour exactly, where a dropped session stays dropped.
+
+```ts
+const client = await createMcpClient({
+  transport: { type: 'http', url },
+  reconnect: { maxAttempts: 5, initialDelayMs: 500, maxDelayMs: 30_000, factor: 2, jitter: 0.25 },
+  keepAliveMs: 30_000,
+  onStatusChange: (status, info) => log(status, info?.attempt, info?.error),
+});
+```
+
+| Status | Meaning |
+| --- | --- |
+| `connecting` | The first handshake. Emitted even though it is the initial value, so a listener sees the whole trace. |
+| `connected` | Live. |
+| `reconnecting` | A backoff window after an unexpected drop; `info.attempt` is 1-based. |
+| `error` | A drop whose attempts are exhausted. |
+| `closed` | An explicit `close()` — or any drop when reconnect is off. |
+
+`reconnect: true` takes the defaults above. The **initial** connect is never retried: a server that is wrong or unreachable right now should reject `createMcpClient()` the way it always did. Reconnect covers the other half — a session that *was* healthy and died under you.
+
+This is **session-level** recovery: every attempt builds a new transport *and* a new client through the same factory, so every handler is re-registered and nothing is silently lost. It composes with `StreamableHTTPClientTransport`'s own `reconnectionOptions`, which resume the GET event stream *inside* a session that is still alive — that never fires this state machine, because the session never actually died.
+
+Backoff is `min(maxDelayMs, initialDelayMs × factor ** (attempt − 1))` spread by ±`jitter`. The spread is derived from the injected clock (FNV-1a), so core never reaches for `Math.random()` and a fake clock keeps delays reproducible; `jitter: 0` makes them exact.
+
+### How a dead HTTP session is detected
+
+This is the part that changed in 2.0, and it is worth reading before you tune anything.
+
+`StreamableHTTPClientTransport` **never calls `onclose`** when its socket dies. It reports through `onerror` and quietly keeps retrying its own GET event stream. So the `onclose` recovery path never saw a dead HTTP session: `status()` answered `connected` and `reconnect` did nothing — unless a `keepAliveMs` heartbeat happened to be configured to notice.
+
+Wiring `onerror` straight into the drop path would over-correct. The **same** callback fires for an unparseable SSE frame, one failed event-stream retry, and a message the transport could not decode — none of which end the session, and tearing a healthy connection down over those would be a worse bug than the one it fixes.
+
+So a transport error only **asks the question**, and a single `ping()` answers it:
+
+| Event | Verdict |
+| --- | --- |
+| `onerror` on a live session, `ping()` succeeds | Not a drop. The session is kept. |
+| `onerror` on a live session, `ping()` fails | A drop. Recovery starts, reporting the **original** transport error (it says what actually happened, not what the ping found). |
+| `onerror`, but the SDK/client has no `ping()` | The 1.x behaviour stands: stay quiet rather than kill a live session on a transient error. |
+| `keepAliveMs` heartbeat rejects | A drop. The same path. |
+| `onclose` (stdio: the child process died) | A drop. |
+
+Two latches keep that honest: one probe in flight per generation, and **one drop per session** — the generation counter alone is not enough, because a heartbeat ping and an `onerror` probe both in flight when the server goes down would otherwise each start their own reconnect ladder, and `maxAttempts` would bound neither.
+
+**So:** `reconnect` now stands on its own over HTTP. `keepAliveMs` remains the way to catch a session that dies **silently**, with no error at all — a load balancer dropping an idle connection, a server restarting between requests. The heartbeat is chained, not periodic, so a slow server can never stack pings.
+
+A successful reconnect marks the tool list dirty: the server you came back to may not be the one you left.
+
+---
+
+## Sampling
+
+The server writes a prompt; **your** model answers it and you pay for the tokens. Treat it as capability delegation, not a callback.
+
+```ts title="sampling.ts"
+const client = await createMcpClient({
+  transport: { type: 'http', url },
+  sampling: {
+    model: anthropic('claude-haiku-5'),
+    maxTokens: 2048,                    // a CEILING — a request can only lower it
+    approve: async (req) => {
+      // req.messages are already canonical, so this reviews exactly what the model will receive
+      return ui.confirm(req.systemPrompt, req.messages);
+    },
+  },
+});
+```
+
+```ts
+interface McpSamplingRequest {
+  messages: Message[];        // canonical, already mapped from the MCP wire shape
+  systemPrompt?: string;
+  maxTokens: number;          // the server's ask, clamped by your ceiling
+  temperature?: number;
+  stopSequences?: string[];
+  modelPreferences?: Record<string, unknown>;  // MCP's hints, forwarded unread
+}
+```
+
+Facts worth pinning:
+
+- **The capability is declared only when you configure `sampling`.** A server cannot ask a client that never advertised it.
+- **`approve` is the HITL gate and it runs first**, so a refused request never reaches the provider. Returning `false` — or throwing — refuses it; the SDK turns either into a JSON-RPC error back to the server, so a refusal costs nothing and is visible upstream. A throw propagates verbatim, because its message is more useful to the server than one we would invent.
+- **The request is reviewed in canonical shape.** An approval gate that had to re-parse the MCP wire shape would be one more place to get the mapping wrong.
+- **Your model always wins.** `modelPreferences` is forwarded into the request object for your `approve` to read; it never selects a model.
+- **`maxTokens` is a clamp, never a raise.** A server that omits it gets a 1024-token default — never sample unbounded.
+- It runs through **our `generateText`**, so `deps`, keys, middleware, retries and observation all behave exactly as they do everywhere else.
+- The answer goes back as MCP's single text block with a mapped `stopReason` (`length` → `maxTokens`, `stop_sequence` → `stopSequence`, everything else → `endTurn`, the honest floor since MCP has no vocabulary for tool calls or content filters).
+
+## Roots
+
+Directories the server may operate on (`roots/list`).
+
+```ts
+const client = await createMcpClient({
+  transport: { type: 'http', url },
+  roots: ['/srv/app', 'file:///var/data'],   // or a function, re-read on every request
+});
+
+await client.setRoots(['/srv/app/v2']);      // swaps the list AND notifies the server
+```
+
+<Callout type="warn" title="file:// only — and one bad entry poisons the whole list">
+MCP's `RootSchema` pins `uri` to `z.string().startsWith('file://')`, and `roots/list` answers with an **array the server validates as a whole**. So a single `https://` entry makes the server discard *every* root you sent — and the failure lands as a Zod error on the far side of the wire, where nothing can act on it.
+
+The SDK therefore refuses a non-`file://` URI **where you supplied it**, with an error naming the offender. A bare filesystem path is not a URI at all, so it is promoted for you: backslashes flipped, `file://` prepended (`C:\work` → `file://C:/work`). A scheme of at least two characters is what distinguishes a URI from a Windows drive letter.
+</Callout>
+
+Notes:
+
+- `roots: []` is a **value** — an explicit "no roots" — and declares the capability. Absence does not.
+- A **function** form is re-read on every `roots/list` request, so a dynamic list needs no re-registration.
+- `setRoots()` throws when the client was created **without** a `roots` option: the capability is declared at construction, and announcing a change to something never advertised would lie to the server. It validates before swapping, so a refused call leaves the server's view untouched.
+- With a managed connection, `setRoots` notifies the **current** session, so it survives a reconnect.
 
 ## Elicitation
 
-Servers can pause mid-operation and ask the **user** for input (`elicitation/create`). Pass `onElicitationRequest` to handle it; the request is a two-mode union:
+Servers can pause mid-operation and ask the **user** for input (`elicitation/create`). The request is a two-mode union:
 
 ```ts
 const mcp = await createMcpClient({
@@ -158,18 +522,17 @@ const mcp = await createMcpClient({
 
 Return `{ action: 'accept', content? }`, `{ action: 'decline' }`, or `{ action: 'cancel' }`. Form-mode `content` must match `requestedSchema`. URL mode exists for sensitive flows (OAuth, payment, API keys) that must not pass through the client — treat the URL as untrusted, display the full host, and let the user decide.
 
-Passing `onElicitationRequest` at connect time is the normal path. The lower-level `registerElicitation(client, handler)` is also exported from `@deuz-sdk/core/mcp` to attach a handler to an already-connected raw MCP client (it throws if the peer is older than `^1.29.0`).
+Requests without a `mode` are form mode (spec back-compat). The lower-level `registerElicitation(client, handler)` is exported for attaching a handler to an already-connected raw MCP client; it throws on a peer older than `^1.29.0`.
 
-## HTTP server in a tool loop
+---
 
-Connect to a remote MCP server, list its tools, and let the model use them. Remember to `close()`.
+## Building a client by hand
+
+Still supported, and the right choice when one connection serves many requests.
 
 ```ts title="mcp-http.ts"
 import { generateText } from '@deuz-sdk/core';
-import { createAnthropic } from '@deuz-sdk/core/anthropic';
 import { createMcpClient } from '@deuz-sdk/core/mcp';
-
-const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const mcp = await createMcpClient({
   transport: {
@@ -177,122 +540,94 @@ const mcp = await createMcpClient({
     url: 'https://mcp.example.com/mcp',
     headers: { Authorization: `Bearer ${process.env.MCP_TOKEN!}` },
   },
+  reconnect: true,
+  keepAliveMs: 30_000,
 });
 
 try {
   const tools = await mcp.listTools();
 
   const { text, steps } = await generateText({
-    model: anthropic('claude-opus-4-8'),
+    model,
     messages: [{ role: 'user', content: 'Scrape example.com and summarize it.' }],
     maxSteps: 5,
     tools,
   });
 
-  console.log(text);
-  console.log(steps?.length);
+  console.log(text, steps?.length);
 } finally {
   await mcp.close();
 }
 ```
 
-## stdio local server (Node)
-
-Spawn a local MCP server as a child process. This only works in a Node runtime, so import from `@deuz-sdk/core/mcp/stdio`.
+### stdio (Node)
 
 ```ts title="mcp-stdio.ts"
-import { generateText } from '@deuz-sdk/core';
-import { createAnthropic } from '@deuz-sdk/core/anthropic';
 import { createStdioMcpClient } from '@deuz-sdk/core/mcp/stdio';
-
-const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const mcp = await createStdioMcpClient({
   command: 'npx',
   args: ['-y', 'firecrawl-mcp'],
   env: { FIRECRAWL_API_KEY: process.env.FIRECRAWL_API_KEY! },
+  reconnect: true,   // a reconnect RESPAWNS the child process
 });
-
-try {
-  const tools = await mcp.listTools();
-
-  const { text } = await generateText({
-    model: anthropic('claude-opus-4-8'),
-    messages: [{ role: 'user', content: 'Find the pricing page on example.com.' }],
-    maxSteps: 5,
-    tools,
-  });
-
-  console.log(text);
-} finally {
-  await mcp.close();
-}
 ```
 
-## Combining MCP tools with local tools
+### Mixing MCP tools with your own
 
-A `ToolSet` is just a record, so spread MCP tools alongside your own. Use a `namespace` per server to avoid name collisions when you connect to more than one.
+A `ToolSet` is a record, so spread them. Use a `namespace` per server when you connect to more than one.
 
 ```ts title="mcp-combined.ts"
-import { generateText } from '@deuz-sdk/core';
-import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { generateText, tool } from '@deuz-sdk/core';
 import { createMcpClient } from '@deuz-sdk/core/mcp';
 import { z } from 'zod';
 
-const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
-
-const search = await createMcpClient({
-  transport: { type: 'http', url: 'https://search.example.com/mcp' },
-});
-const docs = await createMcpClient({
-  transport: { type: 'sse', url: 'https://docs.example.com/v2/sse' },
-});
+const search = await createMcpClient({ transport: { type: 'http', url: 'https://search.example.com/mcp' } });
+const docs = await createMcpClient({ transport: { type: 'sse', url: 'https://docs.example.com/v2/sse' } });
 
 try {
   const tools = {
-    // Namespaced MCP tools: e.g. `search_query`, `docs_fetch`.
-    ...(await search.listTools('search')),
-    ...(await docs.listTools('docs')),
-    // A local tool, defined inline with a Zod schema.
-    now: {
+    ...(await search.listTools('search')),   // search_query, …
+    ...(await docs.listTools('docs')),       // docs_fetch, …
+    now: tool({
       description: 'Return the current ISO timestamp.',
       parameters: z.object({}),
       execute: async () => ({ now: new Date().toISOString() }),
-    },
+    }),
   };
 
   const { text } = await generateText({
-    model: anthropic('claude-opus-4-8'),
+    model,
     messages: [{ role: 'user', content: 'What time is it, and what does example.com sell?' }],
     maxSteps: 6,
     tools,
   });
-
-  console.log(text);
 } finally {
   await Promise.all([search.close(), docs.close()]);
 }
 ```
 
-## Calling a tool directly
+Or hand the live clients to the loop and let it namespace them: `mcp: [{ client: search, namespace: 'search' }, { client: docs, namespace: 'docs' }]` — they are borrowed, so `close()` stays yours.
 
-You rarely need this — the loop runs `execute` for you — but `callTool` is there for ad-hoc invocation outside a model call:
+### Calling a tool directly
 
 ```ts
 const result = await mcp.callTool('scrape', { url: 'https://example.com' });
-console.log(result); // joined text content, or the raw blocks if there is no text
 ```
 
-If the server returns an error result, `callTool` throws, mirroring the `execute` behavior.
+If the server returns an error result, `callTool` throws — mirroring `execute`.
 
 ## Notes
 
-- **Always `close()`** the client when you are finished — for stdio this terminates the spawned child process.
-- **Namespacing only renames keys.** It prefixes tool names so multiple servers can coexist; it does not change the underlying tool the model calls.
-- **Edge vs Node:** `createMcpClient` (`/mcp`) is fetch-only and runs anywhere; `createStdioMcpClient` (`/mcp/stdio`) requires Node. Importing `/mcp/stdio` in an edge runtime will fail.
+- **Always `close()`** a client you built. For stdio this terminates the spawned child process. `close()` is idempotent and raises the closed flag *first*, silencing reconnect and keepalive before anything awaits.
+- **Namespacing only renames keys.** It does not change the underlying tool the model calls.
+- **Edge vs Node:** `/mcp` is fetch-only and runs anywhere; `/mcp/stdio` and `/mcp/node` require Node. Importing them in an edge runtime will fail.
+- **A raw client identity changes across a reconnect.** Never cache the SDK client object; the `McpClient` wrapper follows the session for you.
 
 ## See also
 
-- [generateText](/docs/core/generate-text) — the buffered agentic loop these tools plug into.
-- [streamChat](/docs/core/stream-chat) — the streaming counterpart; pass the same `tools`.
-- [Tool loop](/docs/agents/tool-loop) — how tool calls, parallel execution, and self-healing work.
+- [generateText](/docs/core/generate-text) · [streamChat](/docs/core/stream-chat) — the loops these tools plug into.
+- [Tool loop](/docs/agents/tool-loop) — parallel execution, self-healing, and the runaway guard.
+- [Dependencies](/docs/core/dependencies) — `deps.mcpPool` and the injection seam.
+- [Errors](/docs/core/errors) — `McpAuthorizationRequiredError` and the taxonomy.
+- [What is new in 2.0](/docs/reference/whats-new-2-0) — the release these additions landed in.
