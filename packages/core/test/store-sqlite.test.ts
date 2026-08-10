@@ -42,6 +42,29 @@ try {
 }
 const hasSqlite = DatabaseSync !== undefined;
 
+/**
+ * `node:sqlite` existing does NOT mean fts5 is in the build. Node 22.14 ships
+ * the module without it (`no such module: fts5`) while 24.x has it, so a suite
+ * that assumes lexical search is a suite that fails on half the matrix.
+ *
+ * The store already handles this — `setupFts` rolls back and serves LIKE
+ * instead, which the `fts: false` tests below cover on every runtime. What
+ * cannot be asserted without the module is fts5's OWN behaviour: phrase
+ * semantics, quote escaping and bm25 ranking. Those skip; nothing else does.
+ */
+let hasFts = false;
+if (DatabaseSync) {
+  const probe = new DatabaseSync(':memory:');
+  try {
+    probe.exec('CREATE VIRTUAL TABLE fts_probe USING fts5(x)');
+    hasFts = true;
+  } catch {
+    /* build without fts5 — the LIKE fallback is what runs here */
+  } finally {
+    probe.close();
+  }
+}
+
 const T0 = 1_700_000_000_000;
 const SCOPE: MemoryScope = { userId: 'user-a', chatId: 'chat-1' };
 
@@ -263,7 +286,11 @@ describe.skipIf(!hasSqlite)('sqlite store pack — vector search', () => {
 // Lexical search: FTS5, phrase escaping, LIKE fallback, hybrid
 // ===================================================================
 
-describe.skipIf(!hasSqlite)('sqlite store pack — lexical search', () => {
+// fts5's OWN behaviour — phrase semantics, quote escaping, bm25 ranking and the
+// external-content index. None of it can be asserted on a build without the
+// module, and asserting it against the LIKE fallback would either fail or, worse,
+// pass vacuously. The fallback has its own describe below, which always runs.
+describe.skipIf(!hasSqlite || !hasFts)('sqlite store pack — lexical search (fts5)', () => {
   it('treats the query as ONE phrase, so FTS operators are literal text', async () => {
     const pack = createSqliteStores({ path: ':memory:' });
     await pack.memory.upsert([
@@ -310,6 +337,30 @@ describe.skipIf(!hasSqlite)('sqlite store pack — lexical search', () => {
     await pack.close();
   });
 
+  it('keeps the FTS index consistent across INSERT OR REPLACE upserts', async () => {
+    const inner = new DatabaseSync!(':memory:');
+    const { db } = recordingDatabase(inner);
+    const pack = createSqliteStores({ path: ':memory:', database: db });
+    await pack.memory.upsert([rec('m1', 'the user lives in Istanbul')]);
+    await pack.memory.upsert([rec('m1', 'the user lives in Ankara')]);
+
+    expect((await pack.memory.search({ scope: SCOPE, text: 'Istanbul', topK: 5 })).length).toBe(0);
+    expect(
+      (await pack.memory.search({ scope: SCOPE, text: 'Ankara', topK: 5 })).map((h) => h.record.id),
+    ).toEqual(['m1']);
+    // The external-content index must still agree with the content table: with
+    // recursive triggers off, REPLACE would have orphaned the old rowid here.
+    expect(() =>
+      db.exec("INSERT INTO deuz_memory_fts(deuz_memory_fts, rank) VALUES('integrity-check', 1)"),
+    ).not.toThrow();
+    await pack.close();
+  });
+});
+
+// Runs on EVERY build, with or without fts5 — which is the point: a runtime
+// without the module lands here silently, so this is the coverage that proves
+// the degraded path is a working search and not just an absence of errors.
+describe.skipIf(!hasSqlite)('sqlite store pack — lexical search (LIKE fallback)', () => {
   it('falls back to LIKE with fts: false, escaping the LIKE wildcards', async () => {
     const pack = createSqliteStores({ path: ':memory:', fts: false });
     await pack.memory.upsert([
@@ -356,25 +407,6 @@ describe.skipIf(!hasSqlite)('sqlite store pack — lexical search', () => {
     expect(order.indexOf('lex-only')).toBeLessThan(
       order.indexOf('vec-only') === -1 ? Number.MAX_SAFE_INTEGER : order.indexOf('vec-only'),
     );
-    await pack.close();
-  });
-
-  it('keeps the FTS index consistent across INSERT OR REPLACE upserts', async () => {
-    const inner = new DatabaseSync!(':memory:');
-    const { db } = recordingDatabase(inner);
-    const pack = createSqliteStores({ path: ':memory:', database: db });
-    await pack.memory.upsert([rec('m1', 'the user lives in Istanbul')]);
-    await pack.memory.upsert([rec('m1', 'the user lives in Ankara')]);
-
-    expect((await pack.memory.search({ scope: SCOPE, text: 'Istanbul', topK: 5 })).length).toBe(0);
-    expect(
-      (await pack.memory.search({ scope: SCOPE, text: 'Ankara', topK: 5 })).map((h) => h.record.id),
-    ).toEqual(['m1']);
-    // The external-content index must still agree with the content table: with
-    // recursive triggers off, REPLACE would have orphaned the old rowid here.
-    expect(() =>
-      db.exec("INSERT INTO deuz_memory_fts(deuz_memory_fts, rank) VALUES('integrity-check', 1)"),
-    ).not.toThrow();
     await pack.close();
   });
 });

@@ -82,6 +82,19 @@ Zero runtime dependencies, because modern Node carries `node:sqlite` in the box.
 
 When the module cannot be reached, the first store call rejects with exactly that matrix as its message — the error is the documentation.
 
+<Callout>
+  **The module shipping does not mean fts5 shipped with it.** Node 22.14 answers
+  `CREATE VIRTUAL TABLE … USING fts5` with *"no such module: fts5"*, while 24.x
+  has it compiled in. Nothing breaks: the index build runs in its own
+  transaction, rolls back on failure, and lexical search serves `LIKE` instead —
+  substring matching rather than a tokenizer, so no `bm25()` ranking and no
+  phrase semantics, but the same API and the same results shape.
+
+  Vector search, hybrid fusion and every other seam are unaffected. If ranking
+  quality matters on a runtime without the module, inject a `better-sqlite3`
+  handle (below) — that build has fts5.
+</Callout>
+
 ### The better-sqlite3 escape hatch
 
 `SqliteDatabaseLike` is a **structural** seam of four members that both `node:sqlite`'s `DatabaseSync` and better-sqlite3's `Database` satisfy:

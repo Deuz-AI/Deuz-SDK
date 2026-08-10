@@ -450,6 +450,11 @@ function migrate(handle: SqliteHandle): void {
  * Build the lexical index, in its OWN transaction and its own try/catch: a
  * SQLite build without fts5 must degrade to LIKE search, never take the whole
  * store down. A rollback on failure guarantees no half-built index survives.
+ *
+ * This is not a hypothetical branch. `node:sqlite` shipping does NOT imply fts5
+ * shipped with it — Node 22.14 answers `USING fts5` with "no such module: fts5"
+ * while 24.x has it — so the same code takes both paths across a normal support
+ * matrix, and the triggers must never outlive a failed table.
  */
 function setupFts(handle: SqliteHandle): boolean {
   try {
