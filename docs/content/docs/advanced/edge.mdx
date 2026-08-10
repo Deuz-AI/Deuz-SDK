@@ -85,7 +85,7 @@ The edge-safe counterparts of these features stay on the Web-APIs-only path: `@d
 
 The two store packs that take an **injected client** (`stores/redis`, `stores/postgres`) still import a Node-only module path, so they stay on this list — but the seam itself (`RedisClientLike`, `PgClientLike`) is a plain object, which is how an HTTP-driver-backed store reaches an edge runtime: implement the seam against your driver and keep it in your own module.
 
-2.0's edge-safe additions: `handoff()` plus `promptInjectionGuardrail` / `maxOutputLength` are re-exported from `@deuz-sdk/core/edge` (all three are pure construction — no clock, no randomness, no I/O), and the `@deuz-sdk/core/guardrails` subpath itself imports types only. `@deuz-sdk/core/speech`, `/transcription` and `/video` are edge-safe too: they are `deps.fetch` and nothing else. `compactMessages` ships from the root entry rather than `/edge`, and is pure unless you hand it a summarizer.
+2.0's edge-safe additions: `handoff()` plus `promptInjectionGuardrail` / `maxOutputLength` are re-exported from `@deuz-sdk/core/edge` (all three are pure construction — no clock, no randomness, no I/O), and the `@deuz-sdk/core/guardrails` subpath itself imports types only. `@deuz-sdk/core/speech`, `/transcription` and `/video` are edge-safe too: `/speech` and `/transcription` are `deps.fetch` and nothing else, and `/video` adds only `deps.clock.setTimeout` for its poll — never an ambient timer. `compactMessages` ships from the root entry rather than `/edge`, and is pure unless you hand it a summarizer.
 
 ## Per-runtime notes
 

@@ -142,7 +142,7 @@ Anthropic's server-side context editing (`providerOptions.anthropic.context_mana
 
 - **`compactMessages()`** — the same layers as a plain function over a `Message[]` you own. Pure by default: with no summarizer it makes no network call at all.
 - **The rolling summary** — pass N folds into pass N−1's summary instead of restarting, so at most one summary block ever sits in the history.
-- **Overflow auto-recovery** — a provider that rejects a request as too long triggers a forced compaction pass and one retry, even when `compaction` was never set. It fires on the `anthropic` and `chat_completions` wires only.
+- **Overflow auto-recovery** — a provider that rejects a request as too long triggers a forced compaction pass and one retry, even when `compaction` was never set. It fires on every chat wire whose adapter recognizes the rejection: `anthropic`, `chat_completions`, and `responses` (which reuses the `chat_completions` error mapping). The Gemini `native` wire does not map it.
 
 ## See also
 

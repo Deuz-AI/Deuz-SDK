@@ -23,10 +23,11 @@ import {
   type RedisZMember,
 } from '../src/node/store-redis';
 import type { ChatRecord } from '../src/chat';
-import type { MemoryRecord } from '../src/memory';
+import type { MemoryRecord, MemoryStore } from '../src/memory';
 import type { AgentCheckpoint } from '../src/types/session';
 import {
   assertMemoryStoreContract,
+  assertPersistentMemoryStoreContract,
   assertChatStoreContract,
   assertSessionStoreContract,
 } from './fixtures/store-conformance';
@@ -462,10 +463,38 @@ describe('createRedisStores — index maintenance', () => {
 
     expect(client.sets.has('deuz:mem:hash:h1')).toBe(false);
     expect([...client.sets.get('deuz:mem:hash:h2')!]).toEqual(['m1']);
-    expect(await stores.memory.findByHash!(['h1'], { userId: 'user-a' })).toEqual([]);
-    expect(
-      (await stores.memory.findByHash!(['h2'], { userId: 'user-a' })).map((r) => r.id),
-    ).toEqual(['m1']);
+    expect(await stores.memory.findByHash(['h1'], { userId: 'user-a' })).toEqual([]);
+    expect((await stores.memory.findByHash(['h2'], { userId: 'user-a' })).map((r) => r.id)).toEqual(
+      ['m1'],
+    );
+  });
+
+  it('findByHash rejects a record the hash index points at but that no longer carries the hash', async () => {
+    const { client, stores } = pack();
+    await stores.memory.upsert([memoryRecord('m1', { hash: 'h1' })]);
+    // A membership no writer would create today, but a crashed 1.x write, a
+    // restored RDB snapshot or a manual FLUSH-and-reload can leave behind:
+    // the SET says `m1` has hash `h2`, the record says otherwise.
+    await client.sAdd('deuz:mem:hash:h2', 'm1');
+
+    expect(await stores.memory.findByHash(['h2'], { userId: 'user-a' })).toEqual([]);
+    // Returning it would let a dedup pass decide a NEW fact is already stored.
+    expect(client.sets.has('deuz:mem:hash:h2')).toBe(false); // …and the lie is swept
+    // The record itself, and its real membership, are untouched.
+    expect((await stores.memory.findByHash(['h1'], { userId: 'user-a' })).map((r) => r.id)).toEqual(
+      ['m1'],
+    );
+  });
+
+  it('findByHash leaves an in-flight write alone (index first, record last)', async () => {
+    const { client, stores } = pack();
+    // The documented crash window: the id is in the hash index, the record
+    // string has not landed yet. Removing that membership would corrupt a write
+    // that is merely one command from finishing.
+    await client.sAdd('deuz:mem:hash:h9', 'pending');
+
+    expect(await stores.memory.findByHash(['h9'], {})).toEqual([]);
+    expect([...client.sets.get('deuz:mem:hash:h9')!]).toEqual(['pending']);
   });
 
   it('drops the ZSET entry when a TTL is removed, leaving other records alone', async () => {
@@ -484,12 +513,27 @@ describe('createRedisStores — index maintenance', () => {
     const { client, stores } = pack();
     await stores.memory.upsert([memoryRecord('m1', { hash: 'h1' })]);
 
-    await stores.memory.update!('m1', { hash: 'h2', expiresAt: T0 + 10 });
+    await stores.memory.update('m1', { hash: 'h2', expiresAt: T0 + 10 });
 
     expect(client.sets.has('deuz:mem:hash:h1')).toBe(false);
     expect([...client.sets.get('deuz:mem:hash:h2')!]).toEqual(['m1']);
     expect(client.zsets.get('deuz:mem:expiry')!.get('m1')).toBe(T0 + 10);
     expect((await stores.memory.get('m1'))!.text).toBe('fact m1'); // patch, not replace
+  });
+
+  it('advertises the implemented 2.0 fast paths as REQUIRED, so no `!` is needed', async () => {
+    const { stores } = pack();
+    // A COMPILE-TIME assertion, exactly as in the SQLite pack: `RedisStores`
+    // implements update/findByHash/deleteExpired, so the type must say so.
+    const memory: Required<MemoryStore> = stores.memory;
+
+    await memory.upsert([memoryRecord('m1', { hash: 'h1' })]);
+    expect((await memory.findByHash(['h1'], { userId: 'user-a' })).map((r) => r.id)).toEqual([
+      'm1',
+    ]);
+    await memory.update('m1', { text: 'revised' });
+    expect((await memory.get('m1'))!.text).toBe('revised');
+    expect(await memory.deleteExpired(T0, { userId: 'user-a' })).toBe(0);
   });
 
   it('delete clears every membership, the hash set, the ZSET entry and the record', async () => {
@@ -768,6 +812,29 @@ describe('createRedisStores — connection lifecycle', () => {
     await expect(stores.close()).resolves.toBeUndefined();
   });
 
+  it('refuses to silently re-connect after close() on the { url } path', async () => {
+    const client = createFakeRedis();
+    const create = await withPeer(() => ({ createClient: () => client }));
+    const stores = create({ url: 'redis://localhost:6379' });
+
+    await stores.memory.upsert([memoryRecord('m1')]);
+    expect(client.stats.connect).toBe(1);
+    await stores.close();
+    expect(client.stats.quit).toBe(1);
+
+    // Silently opening a SECOND connection that nobody will ever quit is how a
+    // serverless handler runs out of Redis connections.
+    await expect(stores.memory.list({ userId: 'user-a' })).rejects.toThrow(
+      /closed.*createRedisStores/s,
+    );
+    await expect(stores.chats.loadChat('c1')).rejects.toThrow(/closed/);
+    await expect(stores.sessions.list()).rejects.toThrow(/closed/);
+    expect(client.stats.connect).toBe(1);
+    // close() stays idempotent — a second call is not a second quit.
+    await expect(stores.close()).resolves.toBeUndefined();
+    expect(client.stats.quit).toBe(1);
+  });
+
   it('retries the connection after a failed connect instead of replaying it', async () => {
     const client = createFakeRedis();
     client.failConnect(1);
@@ -787,6 +854,11 @@ describe('createRedisStores — connection lifecycle', () => {
 // ===================================================================
 
 assertMemoryStoreContract('redis (fake client)', async () => {
+  const stores = createRedisStores({ client: createFakeRedis() });
+  return { store: stores.memory, cleanup: () => stores.close() };
+});
+
+assertPersistentMemoryStoreContract('redis (fake client)', async () => {
   const stores = createRedisStores({ client: createFakeRedis() });
   return { store: stores.memory, cleanup: () => stores.close() };
 });

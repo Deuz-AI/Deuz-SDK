@@ -1192,7 +1192,11 @@ export function createInMemoryMemoryStore(): MemoryStore {
           (opts?.kind ? r.kind === opts.kind : true) &&
           r.invalidAt == null,
       );
-      return opts?.limit ? out.slice(0, opts.limit) : out;
+      // `limit: 0` means none, the way slice reads it — not "unlimited". The
+      // persistent packs push it into SQL/Redis, so a truthiness check here
+      // would make the same call return everything on one backend and nothing
+      // on the others.
+      return opts?.limit === undefined ? out : out.slice(0, opts.limit);
     },
     async delete(ids) {
       for (const id of ids) records.delete(id);

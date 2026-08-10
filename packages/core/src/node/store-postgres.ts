@@ -47,7 +47,7 @@
  *   number), so every timestamp is coerced on read — never trust `row.created_at`
  *   to already be a number.
  */
-import type { MemoryQuery, MemoryRecord, MemoryScope, MemoryStore } from '../memory';
+import type { MemoryHit, MemoryQuery, MemoryRecord, MemoryScope, MemoryStore } from '../memory';
 import type { ChatStore } from '../chat';
 import { serializeChatRecord, deserializeChatRecord } from '../chat';
 import type { AgentCheckpoint, SessionStore } from '../types/session';
@@ -461,8 +461,43 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     return false;
   };
 
+  /**
+   * The declared width of an EXISTING `deuz_memory.embedding` column, or
+   * `undefined` when there is none. `atttypmod` is where pgvector keeps a
+   * `vector(D)`'s D; `to_regclass` answers NULL (so: no rows) for a table that
+   * has not been created yet, which is the normal first-migration case.
+   */
+  const currentVectorDimensions = async (): Promise<number | undefined> => {
+    const rows = await exec(
+      `SELECT atttypmod FROM pg_attribute WHERE attrelid = to_regclass($1) ` +
+        `AND attname = 'embedding' AND NOT attisdropped`,
+      [`${schema}.deuz_memory`],
+    );
+    const declared = toOptionalNumber(rows[0]?.['atttypmod']);
+    return declared !== undefined && declared > 0 ? declared : undefined;
+  };
+
   const runMigration = async (): Promise<void> => {
     vectorEnabled = await detectVector();
+
+    if (vectorEnabled) {
+      // `ADD COLUMN IF NOT EXISTS` is a NO-OP against a column that already
+      // exists at another width, so a mismatch would migrate "successfully" and
+      // then fail every single write. Fail here instead, before any DDL runs.
+      const existing = await currentVectorDimensions();
+      if (existing !== undefined && existing !== dimensions) {
+        throw new InvalidRequestError({
+          message:
+            `Schema '${schema}' already stores deuz_memory.embedding as vector(${existing}), but ` +
+            `this pack was built with dimensions: ${dimensions}. ADD COLUMN IF NOT EXISTS cannot ` +
+            `change a column's width, so every write would be rejected by Postgres. Either pass ` +
+            `createPostgresStores({ dimensions: ${existing} }) to match the table, or widen it ` +
+            `yourself first: ALTER TABLE ${schema}.deuz_memory ALTER COLUMN embedding TYPE ` +
+            `vector(${dimensions}) — which re-embeds nothing, so the stored vectors must already ` +
+            'have that width.',
+        });
+      }
+    }
 
     // deuz_meta first and on its own: the version gate has to READ before the
     // rest of the DDL batch runs.
@@ -564,6 +599,25 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
 
   // --- MemoryStore ----------------------------------------------------------
 
+  /**
+   * Guard the ONE write Postgres cannot absorb. A `vector(D)` column rejects any
+   * other width outright, and an adapter that lets that error surface as a raw
+   * driver message (or worse, swallows it) turns "the agent stopped learning"
+   * into a condition with no diagnosis. Only meaningful when the vector column
+   * exists — `embedding_json DOUBLE PRECISION[]` has no declared width.
+   */
+  const assertVectorWidth = (embedding: number[], id: string): void => {
+    if (!vectorEnabled || embedding.length === dimensions) return;
+    throw new InvalidRequestError({
+      message:
+        `Memory '${id}' carries a ${embedding.length}-dimension embedding, but ` +
+        `${schema}.deuz_memory.embedding is vector(${dimensions}), so Postgres would reject the ` +
+        `row. Build the pack with createPostgresStores({ dimensions: ${embedding.length} }) (and ` +
+        `migrate the column to match), or embed with a model that produces ${dimensions} ` +
+        'dimensions. Mixing widths in one table is not possible — pgvector fixes it per column.',
+    });
+  };
+
   const upsertMemory = async (records: MemoryRecord[]): Promise<void> => {
     if (records.length === 0) return;
     await ready();
@@ -581,6 +635,12 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
       `INSERT INTO ${table('deuz_memory')} (${columns.join(', ')}) ` +
       `VALUES (${placeholders.join(', ')}) ` +
       `ON CONFLICT (id) DO UPDATE SET ${assignments}`;
+
+    // Width first, for EVERY record: a rejected batch must not have written
+    // half of itself before the mismatch surfaced.
+    for (const record of records) {
+      if (record.embedding) assertVectorWidth(record.embedding, record.id);
+    }
 
     // Per-row statements: each is atomic on its own, and a batch spanning a
     // pool cannot be wrapped in a transaction (see the header note).
@@ -607,6 +667,25 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
       return out;
     };
 
+    /**
+     * The rows a vector query would otherwise never see. Every other backend
+     * (in-memory reference, SQLite, Redis) SCORES an embedding-less record 0 and
+     * still returns it; restricting the candidate set to rows that happen to
+     * carry a vector makes the same query answer differently per backend and
+     * loses every text-only memory written before an embedder was wired up.
+     */
+    const unembedded = async (column: string, take: number): Promise<MemoryHit[]> => {
+      if (take <= 0) return [];
+      const bind = binder();
+      const where = [...conditions(bind), `${column} IS NULL`];
+      const rows = await exec(
+        `SELECT ${MEMORY_READ_COLUMNS} FROM ${table('deuz_memory')}${whereClause(where)} ` +
+          `ORDER BY updated_at DESC LIMIT ${bind.add(take)}`,
+        bind.params,
+      );
+      return rows.map((row) => ({ record: rowToMemory(row), score: 0 }));
+    };
+
     // 1. pgvector: the index does the ranking.
     if (query.embedding && vectorEnabled) {
       const bind = binder();
@@ -619,24 +698,37 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
           `ORDER BY embedding <=> ${vector}::vector LIMIT ${bind.add(topK)}`,
         bind.params,
       );
-      return rows.map((row) => ({ record: rowToMemory(row), score: toNumber(row['score']) }));
+      const hits = rows.map((row) => ({
+        record: rowToMemory(row),
+        score: toNumber(row['score']),
+      }));
+      // A score-0 row can only ever outrank a NEGATIVE cosine, so a full page
+      // whose worst hit is >= 0 is already the answer — which keeps the
+      // flagship HNSW path at ONE round-trip for real (non-negative) embeddings.
+      const worst = hits[hits.length - 1]?.score ?? 0;
+      if (hits.length >= topK && worst >= 0) return hits;
+      return [...hits, ...(await unembedded('embedding', topK))]
+        .sort((a, b) => b.score - a.score)
+        .slice(0, topK);
     }
 
     // 2. No pgvector: pull the freshest candidates and rank them here.
     if (query.embedding) {
       const bind = binder();
       const where = conditions(bind);
-      where.push('embedding_json IS NOT NULL');
       const rows = await exec(
         `SELECT ${MEMORY_READ_COLUMNS}, embedding_json FROM ${table('deuz_memory')}` +
           `${whereClause(where)} ORDER BY updated_at DESC LIMIT ${FALLBACK_CANDIDATE_LIMIT}`,
         bind.params,
       );
       return rows
-        .map((row) => ({
-          record: rowToMemory(row),
-          score: cosineSimilarity(query.embedding!, toFloatArray(row['embedding_json']) ?? []),
-        }))
+        .map((row) => {
+          const vector = toFloatArray(row['embedding_json']);
+          return {
+            record: rowToMemory(row),
+            score: vector && vector.length > 0 ? cosineSimilarity(query.embedding!, vector) : 0,
+          };
+        })
         .sort((a, b) => b.score - a.score)
         .slice(0, topK);
     }
@@ -719,6 +811,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
         }
       }
       if (patch.embedding !== undefined) {
+        assertVectorWidth(patch.embedding, id);
         sets.push(`embedding_json = ${bind.add(patch.embedding)}`);
         if (vectorEnabled) {
           sets.push(`embedding = ${bind.add(toVectorLiteral(patch.embedding))}::vector`);
@@ -938,6 +1031,12 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
       return memory.deleteExpired(now ?? Date.now());
     },
     async close() {
+      // A pool opened from `connectionString` is created ASYNCHRONOUSLY (the
+      // lazy `import('pg')`), so `ownedPool` is still unset while that is in
+      // flight. Closing on the old `ownedPool?.end()` alone therefore released
+      // nothing and let the pool land AFTER close — a live connection nobody
+      // owns, holding the event loop open. Settle the creation first.
+      if (clientPromise) await clientPromise.catch(() => undefined);
       if (ownedPool?.end) await ownedPool.end();
     },
   };

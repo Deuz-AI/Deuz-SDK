@@ -375,7 +375,15 @@ export async function resolveMcpForLoop(
 let identitySeq = 0;
 const identities = new WeakMap<object, string>();
 
+/**
+ * Raised whenever a key falls back to identity. Read (and reset) around the
+ * SYNCHRONOUS `mcpConnectionKey` call in `acquire`, which is what makes a single
+ * module-level flag safe here: nothing can interleave between the two.
+ */
+let usedIdentity = false;
+
 function identityOf(value: object): string {
+  usedIdentity = true;
   let id = identities.get(value);
   if (id === undefined) {
     identitySeq += 1;
@@ -413,9 +421,24 @@ function stableKey(value: unknown): string {
 }
 
 /**
- * The pool key. `namespace` is deliberately EXCLUDED: it is a presentation
- * choice about tool names, not a property of the connection, so two calls that
- * prefix the same server differently still share one session.
+ * The pool key.
+ *
+ * `namespace` is deliberately EXCLUDED: it is a presentation choice about tool
+ * names, not a property of the connection, so two calls that prefix the same
+ * server differently still share one session. Everything else is IN, by
+ * EXCLUSION rather than by an allowlist of `url`/`type`/`headers`/`command`/
+ * `args`/`env`: a field this function does not know about is far more likely to
+ * be a new way of reaching the server than a new label for it, and the two
+ * mistakes do not cost the same — an unknown field that splits the cache costs a
+ * handshake, one dropped from the key hands request B the connection request A
+ * authenticated.
+ *
+ * That is also why `auth` and `onElicitationRequest` stay in the key even though
+ * they can only be compared by IDENTITY: an OAuth provider is per-user and an
+ * elicitation handler answers back to one request's UI, so merging two of them
+ * into one session would be a credential/consent leak, not an optimization. The
+ * cost is that such a config, rebuilt per request, never hits — which the pool
+ * reports through {@link McpPoolOptions.logger} and bounds with `maxSize`.
  */
 export function mcpConnectionKey(config: McpConnectableConfig): string {
   const connection: Record<string, unknown> = {};
@@ -425,9 +448,38 @@ export function mcpConnectionKey(config: McpConnectableConfig): string {
   return stableKey(connection);
 }
 
+/**
+ * Live connections one pool holds before it starts evicting. High enough that a
+ * server process talking to a handful of MCP servers never reaches it, low
+ * enough that a config the key cannot merge (see {@link mcpConnectionKey})
+ * cannot exhaust the host's sockets or child processes.
+ */
+const DEFAULT_MCP_POOL_SIZE = 32;
+
 export interface McpPoolOptions {
   /** Backoff/keepalive timers for pooled connections. Default: the host clock. */
   clock?: Clock;
+  /**
+   * Ceiling on live pooled connections. Default 32; values below 1 are clamped.
+   *
+   * Reaching it EVICTS the least-recently-acquired entry and CLOSES it. That is
+   * a deliberate choice over refusing the acquire: the pool is a cache, and a
+   * cache that fails a legitimate request to protect its own bookkeeping is
+   * worse than one that forgets. The trade is real, though — the pool cannot see
+   * which clients a run is still using, so a session evicted mid-run takes that
+   * run's remaining MCP tool calls down with it. Keep the limit comfortably
+   * above the number of DISTINCT servers you have in flight.
+   */
+  maxSize?: number;
+  /**
+   * Where the pool reports a config it cannot pool — one whose `auth` provider or
+   * `onElicitationRequest` handler forces an IDENTITY key (see
+   * {@link mcpConnectionKey}), so a per-request copy of it opens a connection
+   * per request instead of reusing one. Hoisting that value to module scope, or
+   * keeping it off the pooled config, is what turns the misses back into hits.
+   * Default: silent.
+   */
+  logger?: Logger;
 }
 
 /**
@@ -439,43 +491,93 @@ export interface McpPoolOptions {
  * instead of racing several. A connect that fails is evicted (the next call
  * retries rather than replaying a dead rejection), and so is an entry whose
  * session has since gone `closed`/`error` — a pool that hands back a corpse is
- * worse than no pool.
+ * worse than no pool, and a dead entry is CLOSED on its way out rather than just
+ * forgotten.
+ *
+ * It is BOUNDED: {@link McpPoolOptions.maxSize} connections, least-recently-
+ * acquired evicted (and closed) beyond that. A process-lifetime cache with no
+ * ceiling is a leak with extra steps — one config the key cannot merge (see
+ * {@link mcpConnectionKey}) would otherwise add a connection per request forever.
  */
 export function createMcpPool(options: McpPoolOptions = {}): McpConnectionPool {
+  // Clamped: at 0 the ceiling would evict the entry the current acquire just
+  // added, i.e. close the connection it is about to hand back.
+  const maxSize = Math.max(1, options.maxSize ?? DEFAULT_MCP_POOL_SIZE);
+  /** Insertion order IS the LRU order: a hit re-inserts, eviction takes the front. */
   const entries = new Map<string, Promise<McpClient>>();
+  /** The identity warning is worth saying once per pool, not once per request. */
+  let warned = false;
+
+  /** Close one entry whatever state it is in. Never rejects, never blocks a caller. */
+  const closeEntry = async (pending: Promise<McpClient>): Promise<void> => {
+    try {
+      await (await pending).close();
+    } catch {
+      // A connect that failed has nothing to close, and one wedged server must
+      // not block the rest of the teardown.
+    }
+  };
 
   return {
     async acquire(config) {
+      usedIdentity = false;
       const key = mcpConnectionKey(config);
-      const existing = entries.get(key);
-      if (existing) {
-        const client = await existing;
-        const status = client.status();
-        if (status !== 'closed' && status !== 'error') return client;
-        // Dead session: drop it and fall through to a fresh connect.
-        if (entries.get(key) === existing) entries.delete(key);
+      if (usedIdentity && !warned) {
+        warned = true;
+        options.logger?.warn(
+          'mcp pool: identity-keyed (function/instance) config — a per-request copy opens its own connection.',
+        );
       }
-      const pending = connectConfig(config, options.clock);
-      entries.set(key, pending);
-      try {
-        return await pending;
-      } catch (error) {
-        if (entries.get(key) === pending) entries.delete(key);
-        throw error;
+      // Every round either returns, throws, or consumes an entry that was in the
+      // map when the round began — a caller that finds the entry replaced under
+      // it re-reads instead of opening a second connection nobody would close.
+      for (;;) {
+        const existing = entries.get(key);
+        if (existing === undefined) {
+          // The in-flight PROMISE is what is cached, so concurrent acquires of a
+          // cold server share one connect. Both statements are synchronous, so
+          // no second caller can slip between them.
+          const pending = connectConfig(config, options.clock);
+          entries.set(key, pending);
+          // At most one entry can be over the line, since this is the only place
+          // one is added. The victim is CLOSED — forgetting it would leak exactly
+          // the connection the ceiling exists to stop — and silently, because the
+          // eviction is the documented contract of `maxSize`, not a surprise: an
+          // evicted client reports `status() === 'closed'` to anyone still holding
+          // it, which is a better signal than a log line nobody reads.
+          if (entries.size > maxSize) {
+            for (const [oldest, victim] of entries) {
+              entries.delete(oldest);
+              void closeEntry(victim);
+              break;
+            }
+          }
+          try {
+            return await pending;
+          } catch (error) {
+            if (entries.get(key) === pending) entries.delete(key);
+            throw error;
+          }
+        }
+        const client = await existing;
+        if (entries.get(key) !== existing) continue; // replaced while we waited
+        const status = client.status();
+        if (status !== 'closed' && status !== 'error') {
+          entries.delete(key);
+          entries.set(key, existing); // most-recently-used
+          return client;
+        }
+        // A dead session is dropped AND closed — an `error` one exhausted its
+        // reconnects with the transport still open, so evicting alone would leak
+        // it. The next round connects, exactly once, for everyone waiting here.
+        entries.delete(key);
+        void closeEntry(existing);
       }
     },
     async close() {
       const pending = [...entries.values()];
       entries.clear();
-      await Promise.all(
-        pending.map(async (p) => {
-          try {
-            await (await p).close();
-          } catch {
-            // Best-effort teardown: one wedged server must not block the rest.
-          }
-        }),
-      );
+      await Promise.all(pending.map(closeEntry));
     },
   };
 }

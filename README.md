@@ -126,7 +126,7 @@ await generateText({
 
 Also: `compactMessages()` and automatic recovery from a provider's context-overflow rejection; MCP **OAuth 2.0**, sampling, roots, reconnect and a connection pool; memory graph-link expansion, write policies and TTL sweeps; **speech, transcription and video**; eight more providers, two of them keyless.
 
-What is **not** in the box is on the same page as what is — overflow recovery fires on two wires only, the Redis pack has no `MULTI`, token counting is still a calibrated heuristic unless you plug in a tokenizer, `rerank` is still the identity reranker, MCP has no WebSocket transport, and the `Part` union has no `AudioPart`. [What is new in 2.0](./docs/content/docs/reference/whats-new-2-0.mdx).
+What is **not** in the box is on the same page as what is — overflow recovery does not reach the Gemini native wire, the Redis pack has no `MULTI`, token counting is still a calibrated heuristic unless you plug in a tokenizer, `rerank` is still the identity reranker, MCP has no WebSocket transport, and the `Part` union has no `AudioPart`. [What is new in 2.0](./docs/content/docs/reference/whats-new-2-0.mdx).
 
 ## Install
 

@@ -47,6 +47,46 @@ function fakeClock(step = 1000) {
   };
 }
 
+/**
+ * A real `AbortSignal` whose add/removeEventListener calls are counted, so a
+ * test can assert that a long poll leaves no listener behind on the signal the
+ * CALLER owns (`live` is the balance, `added` the total ever registered).
+ */
+function countingSignal(): {
+  signal: AbortSignal;
+  abort: () => void;
+  readonly added: number;
+  readonly live: number;
+} {
+  const controller = new AbortController();
+  const inner = controller.signal;
+  let added = 0;
+  let removed = 0;
+  const signal = {
+    get aborted() {
+      return inner.aborted;
+    },
+    addEventListener: (...args: Parameters<AbortSignal['addEventListener']>) => {
+      added += 1;
+      inner.addEventListener(...args);
+    },
+    removeEventListener: (...args: Parameters<AbortSignal['removeEventListener']>) => {
+      removed += 1;
+      inner.removeEventListener(...args);
+    },
+  } as unknown as AbortSignal;
+  return {
+    signal,
+    abort: () => controller.abort(),
+    get added() {
+      return added;
+    },
+    get live() {
+      return added - removed;
+    },
+  };
+}
+
 const QUEUED = { id: 'vid_1', status: 'queued', model: 'sora-2' };
 const RUNNING = { id: 'vid_1', status: 'in_progress', progress: 50 };
 const DONE = {
@@ -300,6 +340,30 @@ describe('waitForVideo', () => {
     ).rejects.toBeInstanceOf(AbortError);
     // aborted after the first poll — no further requests went out
     expect(calls.length).toBe(1);
+  });
+
+  it('does not accumulate an abort listener on the caller signal per poll turn', async () => {
+    // 4 in-progress turns + a terminal one = 4 poll gaps, i.e. 4 listener adds.
+    const { fetch } = mockFetchSequence([
+      json(RUNNING),
+      json(RUNNING),
+      json(RUNNING),
+      json(RUNNING),
+      json(DONE),
+    ]);
+    const model = createVideoProvider({ apiKey: 'k', fetch })('sora-2');
+    const counted = countingSignal();
+
+    const task = await waitForVideo('vid_1', {
+      model,
+      signal: counted.signal,
+      deps: { clock: fakeClock() },
+    });
+
+    expect(task.status).toBe('completed');
+    // The listener count must be a constant, not a function of the poll count.
+    expect(counted.added).toBe(4);
+    expect(counted.live).toBe(0);
   });
 });
 

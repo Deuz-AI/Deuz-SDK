@@ -1335,9 +1335,15 @@ function fromBase64(b64: string): Uint8Array {
  * codec uses. Store adapters that persist to text columns should use these.
  */
 export function serializeChatRecord(record: ChatRecord): string {
-  return JSON.stringify(record, (_key, value) =>
-    value instanceof Uint8Array ? { [BYTES_TAG]: toBase64(value) } : value,
-  );
+  return JSON.stringify(record, function (this: unknown, key: string, value: unknown) {
+    // Read the PRE-toJSON value off the holder, exactly as `serializeCheckpoint`
+    // does: Node's Buffer is a Uint8Array SUBCLASS carrying its own `toJSON`,
+    // which JSON.stringify calls BEFORE any replacer, so testing `value` alone
+    // sees `{ type: 'Buffer', data: [...] }` and silently corrupts the part.
+    const raw = (this as Record<string, unknown>)[key];
+    if (raw instanceof Uint8Array) return { [BYTES_TAG]: toBase64(raw) };
+    return value;
+  });
 }
 
 export function deserializeChatRecord(json: string): ChatRecord {

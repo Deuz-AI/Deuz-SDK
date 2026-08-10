@@ -558,9 +558,15 @@ export async function createManagedConnection(
     };
     await next.connect(transport);
     live = true;
+    const previous = client;
     client = next;
+    // The generation this one replaces is now unreachable — `raw()` answers with
+    // the new client and every mapped tool follows it. `onDrop` already retires
+    // eagerly when reconnect is armed; this covers any other path that swaps the
+    // client, so a replaced generation is never left holding a transport.
+    void retire(previous);
     // Raced with close(): the caller already gave up, so hang up the new session.
-    if (closed) void safeClose(next);
+    if (closed) void retire(next);
   }
 
   async function safeClose(target: RawMcpClient): Promise<void> {
@@ -569,6 +575,24 @@ export async function createManagedConnection(
     } catch {
       // Closing a transport that is already gone is not a failure worth surfacing.
     }
+  }
+
+  /** Sessions already hung up — a client is retired exactly once. */
+  const retired = new WeakSet<RawMcpClient>();
+
+  /**
+   * Close a client nothing will reach again.
+   *
+   * A reconnect builds a brand-new client AND a brand-new transport per attempt,
+   * so without this every drop left the old transport open — on stdio, a live
+   * CHILD PROCESS for the rest of the host process's life. Both roads to a stale
+   * generation (the drop verdict, and a later attempt replacing it) end here, and
+   * the WeakSet is what keeps that from closing the same client twice.
+   */
+  async function retire(target: RawMcpClient | undefined): Promise<void> {
+    if (!target || retired.has(target)) return;
+    retired.add(target);
+    await safeClose(target);
   }
 
   /**
@@ -584,10 +608,16 @@ export async function createManagedConnection(
     droppedGeneration = gen;
     stopKeepAlive();
     if (!policy) {
-      // 1.x: no recovery. The client stays reachable via raw() and its calls reject.
+      // 1.x: no recovery. The client stays reachable via raw() — and OPEN, so
+      // `close()` still means something to the caller, who holds the only handle
+      // to a session that is not being replaced by anything.
       setStatus('closed', error === undefined ? undefined : { error });
       return;
     }
+    // Recovery replaces this client outright, so hang it up NOW rather than at the
+    // end of the backoff ladder. A transport that reported the drop through
+    // `onerror` (the HTTP case) never closed anything on its own.
+    void retire(client);
     void reconnectLoop(error);
   }
 
@@ -646,8 +676,7 @@ export async function createManagedConnection(
       stopKeepAlive();
       for (const wake of [...wakes]) wake();
       setStatus('closed');
-      const target = client;
-      if (target) await safeClose(target);
+      await retire(client);
     },
   };
 }

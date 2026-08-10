@@ -19,11 +19,12 @@ import {
   type SqliteDatabaseLike,
   type SqliteStatementLike,
 } from '../src/node/store-sqlite';
-import type { MemoryRecord, MemoryScope } from '../src/memory';
+import type { MemoryRecord, MemoryScope, MemoryStore } from '../src/memory';
 import type { AgentCheckpoint } from '../src/types/session';
 import type { RunRecord } from '../src/types/runtime';
 import {
   assertMemoryStoreContract,
+  assertPersistentMemoryStoreContract,
   assertChatStoreContract,
   assertSessionStoreContract,
 } from './fixtures/store-conformance';
@@ -117,6 +118,11 @@ function recordingDatabase(inner: SqliteDatabaseLike): {
 
 describe.skipIf(!hasSqlite)('sqlite store pack — conformance', () => {
   assertMemoryStoreContract('sqlite', async () => {
+    const pack = createSqliteStores({ path: ':memory:' });
+    return { store: pack.memory, cleanup: () => pack.close() };
+  });
+
+  assertPersistentMemoryStoreContract('sqlite', async () => {
     const pack = createSqliteStores({ path: ':memory:' });
     return { store: pack.memory, cleanup: () => pack.close() };
   });
@@ -408,9 +414,9 @@ describe.skipIf(!hasSqlite)('sqlite store pack — bi-temporal + dedup + TTL', (
       rec('b1', 'dedupe me elsewhere', { hash: 'h-shared' }, { userId: 'user-b' }),
     ]);
 
-    const found = await pack.memory.findByHash!(['h-shared', 'h-missing'], SCOPE);
+    const found = await pack.memory.findByHash(['h-shared', 'h-missing'], SCOPE);
     expect(found.map((r) => r.id)).toEqual(['m1']);
-    expect(await pack.memory.findByHash!([], SCOPE)).toEqual([]);
+    expect(await pack.memory.findByHash([], SCOPE)).toEqual([]);
     await pack.close();
   });
 
@@ -422,9 +428,24 @@ describe.skipIf(!hasSqlite)('sqlite store pack — bi-temporal + dedup + TTL', (
     await pack.memory.upsert(records);
 
     const hashes = records.map((r) => r.hash);
-    const found = await pack.memory.findByHash!(hashes, SCOPE);
+    const found = await pack.memory.findByHash(hashes, SCOPE);
     expect(found).toHaveLength(120);
     expect(new Set(found.map((r) => r.id)).size).toBe(120);
+    await pack.close();
+  });
+
+  it('advertises the implemented 2.0 fast paths as REQUIRED, so no `!` is needed', async () => {
+    const pack = createSqliteStores({ path: ':memory:' });
+    // A COMPILE-TIME assertion: `SqliteStores.memory` typed as a plain
+    // `MemoryStore` makes this assignment an error, which is what forced every
+    // caller of an implemented method to write `store.findByHash!(…)`.
+    const memory: Required<MemoryStore> = pack.memory;
+
+    await memory.upsert([rec('m1', 'a fact')]);
+    expect((await memory.findByHash(['hash-m1'], SCOPE)).map((r) => r.id)).toEqual(['m1']);
+    await memory.update('m1', { text: 'a revised fact' });
+    expect((await memory.get('m1'))!.text).toBe('a revised fact');
+    expect(await memory.deleteExpired(T0, SCOPE)).toBe(0);
     await pack.close();
   });
 

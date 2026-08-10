@@ -985,6 +985,21 @@ export function rewriteAssistantText(message: Message, text: string): Message {
   return { ...message, content };
 }
 
+/**
+ * True for a turn whose content array came out EMPTY — the one shape no wire
+ * accepts (Anthropic rejects a zero-length content list outright, and every
+ * other provider drops it silently). It is reachable exactly once: an `onOutput`
+ * BLOCK with no `replacement` on an answer that carried nothing but text.
+ *
+ * The loops treat it as "there is no turn to record" rather than writing an
+ * unsendable message into `response.messages`, the checkpoint and the chat
+ * store. Fabricating a placeholder text was the alternative and is worse: it
+ * would put words the model never said into a transcript that is replayed.
+ */
+export function isEmptyTurn(message: Message): boolean {
+  return Array.isArray(message.content) && message.content.length === 0;
+}
+
 // --- Handoff (2.0): the shared half of agent-to-agent transfer --------------
 //
 // `inference/handoff.ts` mints the `transfer_to_<name>` tools; everything below
@@ -1303,6 +1318,12 @@ export function resumeHandoffState(
   };
 }
 
+/**
+ * Shadows a caller's `onFinish` (and the `deps.onFinish` fallback behind it) on
+ * a loop-internal side call. One shared instance: it is stateless.
+ */
+const NO_FINISH = (): void => {};
+
 const SUMMARY_PROMPT =
   'Summarize the conversation transcript above as concise notes: preserve key facts, decisions made, tool results that still matter, and any open task threads. Output only the summary.';
 
@@ -1356,25 +1377,38 @@ function renderTranscript(messages: Message[]): string {
 /** Per-loop compaction state: normalized policy + model context window + estimator. */
 export interface CompactionRunner {
   policy: NormalizedCompaction;
+  /**
+   * The model compaction is measured against and (absent an explicit
+   * `summarizeModel`) summarizes with. MUTABLE, because a handoff (2.0) changes
+   * who is driving: the outgoing agent's context window is not the incoming
+   * one's, so a run that kept the ROOT model here would compact at the wrong
+   * threshold — and pay for the summary on a model that left the run.
+   */
+  model: LanguageModel;
   contextWindow: number;
   estimator: TokenEstimator;
 }
 
-/** Build a compaction runner when the caller opted in; otherwise undefined. */
+/**
+ * Build a compaction runner when the caller opted in; otherwise undefined.
+ * `model` defaults to the call's own — a handoff passes the ACTIVE agent's.
+ */
 export function setupCompaction(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
+  model: LanguageModel = options.model,
 ): CompactionRunner | undefined {
   if (!options.compaction) return undefined;
   const policy = normalizeCompaction(options.compaction);
   return {
     policy,
+    model,
     // 1.9: the per-call `capabilities` override is threaded EXPLICITLY here (this
     // site holds the options object). Idempotent with the descriptor-clone route
     // the call boundary uses — same merge site, same precedence — but it means a
     // caller who corrects `contextWindow` for an unknown slug gets the right
     // compaction threshold even on a path that never went through `generate.ts`.
-    contextWindow: getCapabilities(options.model, deps.logger, options.capabilities).contextWindow,
+    contextWindow: getCapabilities(model, deps.logger, options.capabilities).contextWindow,
     // 2.0: a REAL tokenizer (`policy.countTokens`) replaces the char heuristic as
     // the BASE count; the EMA calibration keeps running on top of it, because no
     // tokenizer knows the provider's request framing (see estimate-tokens.ts).
@@ -1382,6 +1416,23 @@ export function setupCompaction(
       policy.countTokens ? { countTokens: policy.countTokens } : undefined,
     ),
   };
+}
+
+/**
+ * Point an existing runner at the agent that is driving now (2.0 handoff). The
+ * estimator is deliberately KEPT: its EMA calibration measures the provider's
+ * request framing, which the transfer did not change, and throwing it away
+ * would restart the loop's only feedback signal at every swap.
+ */
+export function retargetCompaction(
+  runner: CompactionRunner | undefined,
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  model: LanguageModel,
+): void {
+  if (!runner) return;
+  runner.model = model;
+  runner.contextWindow = getCapabilities(model, deps.logger, options.capabilities).contextWindow;
 }
 
 /** What a compaction pass carries into its events (stream part + observation). */
@@ -1429,7 +1480,9 @@ export async function runCompaction(
       const step = await runOneStep(
         preserveClientContext(options, {
           ...options,
-          model: runner.policy.summarizeModel ?? options.model,
+          // The ACTIVE agent's model after a handoff (2.0) — `runner.model`, not
+          // `options.model`, which is whoever STARTED the run.
+          model: runner.policy.summarizeModel ?? runner.model,
           messages: [
             {
               role: 'user',
@@ -1448,6 +1501,16 @@ export async function runCompaction(
           onStepFinish: undefined,
           approveToolCall: undefined,
           approvalResponses: undefined,
+          // G12: `onFinish` belongs to the RUN, and this is a loop-INTERNAL side
+          // call the caller never made. The pump only stays silent for calls it
+          // can see are loop-driven (`internal.tools`), and a summarize clone is
+          // deliberately tool-free — so the suppression has to happen here. It is
+          // a no-op rather than `undefined` because `fireFinish` falls back to
+          // `deps.onFinish`, which `undefined` would NOT shadow.
+          onFinish: NO_FINISH,
+          // `onUsage` is deliberately left alone: it is per-MODEL-CALL by
+          // contract (see the G12 note in core/metering.ts) and the summary
+          // really does spend tokens, so a credit system must still see them.
         }),
         // Loop-internal side call: its usage is already folded into the loop
         // total via addUsage. Observation: a tagged model call under the step
@@ -1545,8 +1608,10 @@ export async function recoverFromOverflow(
   addUsage: (u: Usage) => void,
   onEvent: (e: CompactionEvent, trigger: CompactionTrigger) => void,
   ob?: ExecuteExtras['observe'],
+  /** The ACTIVE agent's model after a handoff (2.0); defaults to the call's. */
+  model: LanguageModel = options.model,
 ): Promise<Message[] | undefined> {
-  const effective = runner ?? setupCompaction({ ...options, compaction: 'auto' }, deps);
+  const effective = runner ?? setupCompaction({ ...options, compaction: 'auto' }, deps, model);
   if (!effective) return undefined;
   const compacted = await runCompaction(
     effective,
@@ -1628,15 +1693,28 @@ export function unknownToolMessage(tools: ToolSet, name: string): string {
 }
 
 /**
- * True if any tool call targets a real client tool (a key present in `tools`
- * with no `execute`). An UNKNOWN name is deliberately NOT a client tool (1.9):
- * it used to satisfy the old `!tools[name]?.execute` test, so a hallucinated
- * name broke the loop and the caller waited forever for a tool_result nobody
- * could produce. Unknown names now fall through to `executeTools`, which
- * self-heals them into an is_error tool_result in the SAME turn.
+ * The calls of a step that are genuinely PENDING ON THE CALLER — real client
+ * tools (a key present in `tools` with no `execute`) that nothing has already
+ * ruled on. Non-empty means the loop must break and hand the round-trip over.
+ *
+ * Two exclusions, both learned the hard way:
+ *
+ * - An UNKNOWN name is not a client tool (1.9). It used to satisfy the old
+ *   `!tools[name]?.execute` test, so a hallucinated name broke the loop and the
+ *   caller waited forever for a tool_result nobody could produce. Unknown names
+ *   fall through to `executeTools`, which self-heals them in the SAME turn.
+ * - A call an `onToolCall` guardrail BLOCKED (2.0) is not pending either: the
+ *   verdict is already made, and handing the caller a round-trip for a refused
+ *   call is how "do not run this tool" turned into "run it on the client".
+ *   Blocked calls also fall through to `executeTools`, whose denial machinery
+ *   turns them into the is_error tool_result the model sees.
  */
-export function hasClientTool(toolCalls: ToolCall[], tools: ToolSet): boolean {
-  return toolCalls.some((c) => isClientTool(tools, c.toolName));
+export function pendingClientCalls(
+  toolCalls: ToolCall[],
+  tools: ToolSet,
+  blocked?: ReadonlyMap<string, Denial>,
+): ToolCall[] {
+  return toolCalls.filter((c) => isClientTool(tools, c.toolName) && !blocked?.has(c.toolCallId));
 }
 
 /**
@@ -1656,6 +1734,17 @@ export function hasClientTool(toolCalls: ToolCall[], tools: ToolSet): boolean {
  * enough to keep denials out of the runaway guard, but not to tell a UI WHY a
  * call ended — the client-supplied `reason` lives on the map, and dropping it
  * here is what made `ToolStatePart.denied`/`deniedReason` unreachable.
+ *
+ * `onToolCall` guardrails are RE-EVALUATED here (2.0), before anything runs.
+ * They are the run's execution-side defense, and the calls being settled are the
+ * MODEL's original arguments read back out of the history — a suspension must
+ * not be a way to launder a call a guardrail blocked or rewrote. Guardrails are
+ * assumed pure/deterministic: the same call, the same history, the same verdict.
+ *
+ * `handoff` (2.0) lets the settle recognize a TRANSFER among the unanswered ids.
+ * A transfer is a decision, never an execution (`handoff.ts`'s `execute` throws
+ * on purpose), so it is answered from {@link decideHandoff} and the accepted
+ * swap is handed back for the caller to apply.
  */
 export async function settlePendingApprovals(
   messages: Message[],
@@ -1666,11 +1755,16 @@ export async function settlePendingApprovals(
     /** Called after denials are known but before approved/server calls execute. */
     beforeExecute?: (calls: ToolCall[], deniedIds: ReadonlySet<string>) => void;
   },
+  handoff?: { active?: ActiveAgentState; tools: ToolSet },
 ): Promise<{
   messages: Message[];
   results: ToolResult[];
   deniedIds: Set<string>;
   denied: DenialMap;
+  /** Verdicts the re-evaluated `onToolCall` hooks produced on this leg. */
+  guardrails: GuardrailPart[];
+  /** Present when a transfer was among the unanswered ids. */
+  handoff?: HandoffDecision;
 } | null> {
   // An EMPTY array still settles (default-deny the gated rest) — that is how a
   // durable resume without verdicts answers pending calls on the safe side.
@@ -1702,11 +1796,28 @@ export async function settlePendingApprovals(
   );
   if (unanswered.length === 0) return null;
 
-  const calls: ToolCall[] = unanswered.map((p) => ({
+  const issued: ToolCall[] = unanswered.map((p) => ({
     toolCallId: p.id,
     toolName: p.name,
     args: p.input,
   }));
+  // Transfers are resolved by DECISION, never by executing them. The lookup
+  // spans the run's whole transfer catalog, not just the active agent's set: an
+  // agent never carries a transfer to itself, so the tool that produced the
+  // pending id may well be missing from `tools` on this leg.
+  const catalog = handoff?.tools;
+  const { handoffCalls, normalCalls } =
+    catalog && hasHandoffTools(catalog)
+      ? splitHandoffCalls(issued, { ...tools, ...catalog })
+      : { handoffCalls: NO_HANDOFF_CALLS, normalCalls: issued };
+  const decision =
+    handoffCalls.length > 0 ? decideHandoff(handoffCalls, handoff?.active) : undefined;
+
+  // The run's own execution-side defense, re-derived on this leg (see the note
+  // above). It runs BEFORE the approval gate so a rewrite reaches
+  // `needsApproval` exactly as it did on the leg that suspended.
+  const guarded = await applyToolCallGuardrails(options, normalCalls, messages);
+  const calls = guarded.calls;
   const byId = new Map(responses.map((r) => [r.approvalId, r]));
   const noVerdict = calls.filter((c) => !byId.has(c.toolCallId));
   const gated = await findApprovalNeeded(noVerdict, tools, options, messages);
@@ -1755,6 +1866,9 @@ export async function settlePendingApprovals(
       denied.set(c.toolCallId, { cause: 'no-response', reason: 'No approval response.' });
     }
   }
+  // LAST, so a guardrail block outranks every other verdict: an approved call a
+  // rule refuses must report the rule, not the approval.
+  for (const [id, denial] of guarded.blocked) denied.set(id, denial);
 
   // Observation (1.6): resume-leg approval resolutions. Explicit verdicts
   // resolve as 'client-response'; verdict-less gated calls as 'default-deny'.
@@ -1782,9 +1896,19 @@ export async function settlePendingApprovals(
 
   const deniedIds = new Set(denied.keys());
   lifecycle?.beforeExecute?.(calls, deniedIds);
-  const results = await executeTools(calls, tools, options, messages, denied, extras);
+  const executed = await executeTools(calls, tools, options, messages, denied, extras);
+  // Back into the order the MODEL issued them, transfers included — the turn
+  // has to read the way it was written.
+  const results = decision ? mergeResultsInCallOrder(issued, executed, decision.results) : executed;
   const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
-  return { messages: [...messages, toolMessage], results, deniedIds, denied };
+  return {
+    messages: [...messages, toolMessage],
+    results,
+    deniedIds,
+    denied,
+    guardrails: guarded.parts,
+    ...(decision ? { handoff: decision } : {}),
+  };
 }
 
 /**

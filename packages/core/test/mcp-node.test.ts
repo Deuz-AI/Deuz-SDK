@@ -1,17 +1,25 @@
 /**
  * `./mcp/node` — the file-backed token store (round-trip, atomic write, 0600,
  * corrupt-file tolerance) and the loopback redirect listener (real local HTTP:
- * a code resolves, an `?error=` rejects, a lapsed deadline rejects).
+ * a code resolves, an `?error=` rejects, a lapsed deadline rejects, and a
+ * redirect that does not echo the listener's `state` is refused).
  */
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync, statSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createFileTokenStore, createLoopbackRedirect } from '../src/node/mcp';
+import type { LoopbackRedirect } from '../src/node/mcp';
 
 function tempPath(name: string): string {
   return join(mkdtempSync(join(tmpdir(), 'deuz-mcp-')), name);
+}
+
+/** The URL a compliant authorization server would redirect to — state echoed. */
+function callback(loopback: LoopbackRedirect, query: string): string {
+  const state = loopback.state === undefined ? '' : `&state=${encodeURIComponent(loopback.state)}`;
+  return `${loopback.redirectUri}?${query}${state}`;
 }
 
 // chmod on Windows only toggles the read-only bit, so the POSIX-mode assertion
@@ -91,7 +99,7 @@ describe('createLoopbackRedirect', () => {
     try {
       expect(loopback.redirectUri).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/callback$/);
 
-      const response = await fetch(`${loopback.redirectUri}?code=auth-code-1&state=xyz`);
+      const response = await fetch(callback(loopback, 'code=auth-code-1'));
       const body = await response.text();
 
       expect(response.status).toBe(200);
@@ -115,7 +123,7 @@ describe('createLoopbackRedirect', () => {
       expect(stray.status).toBe(404);
       await stray.text();
 
-      await fetch(`${loopback.redirectUri}?code=deep-path`);
+      await fetch(callback(loopback, 'code=deep-path'));
       expect(await loopback.waitForCode()).toBe('deep-path');
     } finally {
       await loopback.close();
@@ -126,7 +134,7 @@ describe('createLoopbackRedirect', () => {
     const loopback = await createLoopbackRedirect();
     try {
       const response = await fetch(
-        `${loopback.redirectUri}?error=access_denied&error_description=User%20said%20no`,
+        callback(loopback, 'error=access_denied&error_description=User%20said%20no'),
       );
       expect(response.status).toBe(400);
       await response.text();
@@ -139,7 +147,7 @@ describe('createLoopbackRedirect', () => {
   it('rejects a redirect that carries neither code nor error', async () => {
     const loopback = await createLoopbackRedirect();
     try {
-      await (await fetch(loopback.redirectUri)).text();
+      await (await fetch(callback(loopback, ''))).text();
       await expect(loopback.waitForCode()).rejects.toThrow(/neither `code` nor `error`/);
     } finally {
       await loopback.close();
@@ -160,5 +168,86 @@ describe('createLoopbackRedirect', () => {
     const pending = loopback.waitForCode();
     await loopback.close();
     await expect(pending).rejects.toThrow(/closed before an authorization code arrived/);
+  });
+
+  it('accepts an injected authorization code that does not echo the state', async () => {
+    const loopback = await createLoopbackRedirect();
+    try {
+      // Anything on this machine can reach a loopback port: another local
+      // process, or any page open in the user's browser. Without the state echo
+      // it can hand the listener an authorization code of its own choosing.
+      const noState = await fetch(`${loopback.redirectUri}?code=attacker-code`);
+      expect(noState.status).toBe(400);
+      await noState.text();
+
+      const wrongState = await fetch(`${loopback.redirectUri}?code=attacker-code&state=guessed`);
+      expect(wrongState.status).toBe(400);
+      await wrongState.text();
+
+      // Neither forgery ended the wait — the real redirect still wins.
+      await (await fetch(callback(loopback, 'code=real-code'))).text();
+      expect(await loopback.waitForCode()).toBe('real-code');
+    } finally {
+      await loopback.close();
+    }
+  });
+
+  it('mints a fresh unguessable state for every listener', async () => {
+    const a = await createLoopbackRedirect();
+    const b = await createLoopbackRedirect();
+    try {
+      // 32 random bytes, base64url → 43 chars, URL-safe.
+      expect(a.state).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(b.state).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(a.state).not.toBe(b.state);
+    } finally {
+      await a.close();
+      await b.close();
+    }
+  });
+
+  it('honours a caller-supplied state, and `state: false` turns the check off', async () => {
+    const pinned = await createLoopbackRedirect({ state: 'state-from-the-host' });
+    try {
+      expect(pinned.state).toBe('state-from-the-host');
+      const wrong = await fetch(`${pinned.redirectUri}?code=c0&state=state-from-the-hosT`);
+      expect(wrong.status).toBe(400);
+      await wrong.text();
+      await (await fetch(`${pinned.redirectUri}?code=c1&state=state-from-the-host`)).text();
+      expect(await pinned.waitForCode()).toBe('c1');
+    } finally {
+      await pinned.close();
+    }
+
+    const unguarded = await createLoopbackRedirect({ state: false });
+    try {
+      expect(unguarded.state).toBeUndefined();
+      await (await fetch(`${unguarded.redirectUri}?code=c2`)).text();
+      expect(await unguarded.waitForCode()).toBe('c2');
+    } finally {
+      await unguarded.close();
+    }
+  });
+
+  it('binds 127.0.0.1 only, so no other host on the network can reach the callback', async () => {
+    const external = Object.values(networkInterfaces())
+      .flat()
+      .find((nic) => nic !== undefined && nic.family === 'IPv4' && !nic.internal)?.address;
+    const loopback = await createLoopbackRedirect();
+    try {
+      expect(loopback.redirectUri.startsWith('http://127.0.0.1:')).toBe(true);
+      // Nothing to prove against on a runner with no non-loopback interface.
+      if (external === undefined) return;
+      // A wildcard (0.0.0.0) bind ANSWERS here; 127.0.0.1 refuses the connection.
+      // A host firewall can also drop it, which reads the same way — the point
+      // is only that no reply carrying an authorization code ever comes back.
+      await expect(
+        fetch(callback(loopback, 'code=from-the-lan').replace('127.0.0.1', external), {
+          signal: AbortSignal.timeout(1000),
+        }),
+      ).rejects.toBeTruthy();
+    } finally {
+      await loopback.close();
+    }
   });
 });

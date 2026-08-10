@@ -119,7 +119,7 @@ The root export carries the free functions, the client, errors, and all canonica
 | `@deuz-sdk/core/observe/node` | Bounded JSONL observation sink and event reader (Node-only) |
 | `@deuz-sdk/core/azure` | Azure OpenAI / Foundry — `createAzure` (deployment URL, `api-key` or Entra) |
 | `@deuz-sdk/core/bedrock` | Amazon Bedrock Mantle — `createBedrock` (Bearer API key, no SigV4 SDK) |
-| `@deuz-sdk/core/providers` | 20 OpenAI-compat factories — Mistral, DeepSeek, Qwen, Kimi, Groq, Together, OpenRouter, Cerebras, Fireworks, GLM, MiniMax + 2.0's Perplexity, Cohere, DeepInfra, NVIDIA, SambaNova, Hyperbolic and the keyless Ollama / LM Studio — plus `createOpenAICompatible`, Azure/Bedrock re-exports and `createProviderRegistry` |
+| `@deuz-sdk/core/providers` | 19 named OpenAI-compat hosts — Mistral, DeepSeek, Qwen, Moonshot (`createKimi` is an alias), Groq, Together, OpenRouter, Cerebras, Fireworks, GLM, MiniMax + 2.0's Perplexity, Cohere, DeepInfra, NVIDIA, SambaNova, Hyperbolic and the keyless Ollama / LM Studio — plus `createOpenAICompatible`, Azure/Bedrock re-exports and `createProviderRegistry` |
 | `@deuz-sdk/core/workspace` | Externalized path-addressed memory seam + `createWorkspaceTools` (1.8) |
 | `@deuz-sdk/core/workspace/node` | Sandboxed directory `Workspace` (`createFileWorkspace`) |
 | `@deuz-sdk/core/compute` | `ComputeSandbox` seam + `codeActTool` / `shellTool` (1.8) |

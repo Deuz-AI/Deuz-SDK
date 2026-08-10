@@ -147,17 +147,17 @@ if (part.type === 'compaction') {
 
 ### Which providers trigger it
 
-Recovery needs the adapter to recognize the rejection as an overflow rather than as a generic bad request. Only two wires do that today:
+Recovery needs the adapter to recognize the rejection as an overflow rather than as a generic bad request. Three of the four chat wires do:
 
 | Adapter | Surface | Overflow signal |
 | --- | --- | --- |
 | Anthropic | `anthropic` | HTTP `413`, or a `400` whose message matches "prompt is too long" / "exceed…context" / "input length…maximum". Anthropic ships no machine-readable code, so the message **is** the signal. |
 | OpenAI-compatible | `chat_completions` | `error.code` / `error.type` = `context_length_exceeded`. |
-| OpenAI Responses | `responses` | **Not mapped.** An over-long request surfaces as a generic `InvalidRequestError`. |
-| Google native | `native` | **Not mapped.** Same — a generic error. |
+| OpenAI Responses | `responses` | The same signal. This adapter's `mapError` **delegates** to the OpenAI-compatible one — the error envelope is identical — so a `context_length_exceeded` code/type maps to `ContextOverflowError` here too, including on a mid-stream `error` / `response.failed` event. |
+| Google native | `native` | **Not mapped.** Gemini's envelope carries no overflow code and this adapter has no message heuristic, so an over-long request surfaces as a generic `InvalidRequestError`. |
 
-<Callout type="warn" title="Recovery is not universal in 2.0">
-On the `responses` and `native` wires an overflow is an ordinary failure: the run ends and you handle it. Set `compaction` explicitly there — the threshold path does not depend on error mapping at all, and it is what keeps those wires from reaching the wall in the first place.
+<Callout type="warn" title="The Gemini native wire is the gap">
+On the `native` wire an overflow is an ordinary failure: the run ends and you handle it. Set `compaction` explicitly there — the threshold path does not depend on error mapping at all, and it is what keeps that wire from reaching the wall in the first place.
 </Callout>
 
 ## A real tokenizer via `countTokens`

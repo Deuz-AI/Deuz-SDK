@@ -26,7 +26,7 @@
  * `createVideoProvider({ baseURL })` — not a constant.
  */
 import type { LanguageModel } from './types/model';
-import type { Dependencies, ResolvedDependencies } from './types/deps';
+import type { Clock, Dependencies, ResolvedDependencies } from './types/deps';
 import { attachConfig, readConfig } from './internal/config-symbol';
 import { readClientContext, type ClientContext } from './internal/client-context';
 import { resolveDependencies } from './internal/resolve-deps';
@@ -473,18 +473,30 @@ async function waitForVideoCore(
     if (r.deps.clock.now() - start >= timeout) {
       throw new TimeoutError('total', `Video task '${taskId}' did not finish within ${timeout}ms.`);
     }
-    await new Promise<void>((resolve, reject) => {
-      const cancel = r.deps.clock.setTimeout(() => resolve(), interval);
-      options.signal?.addEventListener(
-        'abort',
-        () => {
-          cancel();
-          reject(new AbortError());
-        },
-        { once: true },
-      );
-    });
+    await sleepOrAbort(interval, r.deps.clock, options.signal);
   }
+}
+
+/**
+ * One poll gap. The abort listener is registered AND removed around this single
+ * wait: the loop runs for the whole `timeoutMs` (10 minutes by default, one turn
+ * every 5s), and a listener left behind per turn accumulates on the CALLER's
+ * signal — a leak the caller cannot see, which Node reports as a
+ * MaxListenersExceededWarning long before a long job finishes.
+ */
+function sleepOrAbort(ms: number, clock: Clock, signal: AbortSignal | undefined): Promise<void> {
+  let onAbort: (() => void) | undefined;
+  return new Promise<void>((resolve, reject) => {
+    const cancel = clock.setTimeout(() => resolve(), ms);
+    if (!signal) return;
+    onAbort = (): void => {
+      cancel();
+      reject(new AbortError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  }).finally(() => {
+    if (onAbort) signal?.removeEventListener('abort', onAbort);
+  });
 }
 
 export interface DownloadedVideo {

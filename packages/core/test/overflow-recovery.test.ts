@@ -15,6 +15,10 @@ import { generateText, streamChat } from '../src/index';
 import { createAnthropic } from '../src/anthropic';
 import { createMemoryObserver } from '../src/observe';
 import { ContextOverflowError } from '../src/errors';
+import { openaiCompatibleAdapter } from '../src/adapters/openai-compatible';
+import { openaiResponsesAdapter } from '../src/adapters/openai-responses';
+import { anthropicAdapter } from '../src/adapters/anthropic';
+import { googleNativeAdapter } from '../src/adapters/google-native';
 import { sseResponse, sseEvents, mockFetchSequence } from './fixtures/sse';
 import type { Clock, JSONSchema, Message, ObserveEvent, StreamPart } from '../src/index';
 
@@ -277,5 +281,61 @@ describe('overflow auto-recovery — streaming loop', () => {
     expect(parts.at(-1)?.type).toBe('error');
     expect(parts.some((p) => p.type === 'compaction')).toBe(false);
     expect(calls).toHaveLength(1);
+  });
+});
+
+/**
+ * Recovery can only fire where an adapter recognises the rejection, so WHICH
+ * wires map it is a user-facing promise the docs make. These pin that promise to
+ * the code: three wires in, one out.
+ */
+describe('overflow recovery — the wires that can trigger it', () => {
+  const headers = (): Headers => new Headers();
+  const ctx = { provider: 'test' };
+
+  it('maps the OpenAI-compatible over-length code', () => {
+    expect(
+      openaiCompatibleAdapter.mapError(
+        400,
+        { error: { code: 'context_length_exceeded', message: 'too long' } },
+        headers(),
+        ctx,
+      ),
+    ).toBeInstanceOf(ContextOverflowError);
+  });
+
+  it('maps it on the Responses wire too — mapError is delegated, not reimplemented', () => {
+    expect(
+      openaiResponsesAdapter.mapError(
+        400,
+        { error: { code: 'context_length_exceeded', message: 'too long' } },
+        headers(),
+        ctx,
+      ),
+    ).toBeInstanceOf(ContextOverflowError);
+  });
+
+  it('maps the Anthropic shape, where the message is the only signal', () => {
+    expect(
+      anthropicAdapter.mapError(
+        400,
+        { error: { type: 'invalid_request_error', message: 'prompt is too long: 210000 tokens' } },
+        headers(),
+        ctx,
+      ),
+    ).toBeInstanceOf(ContextOverflowError);
+  });
+
+  it('does NOT map on the Gemini native wire — the documented gap', () => {
+    // Not a bug to fix here: Gemini reports over-length in a shape we have no
+    // fixture for. The docs say recovery skips this wire; this keeps them honest.
+    expect(
+      googleNativeAdapter.mapError(
+        400,
+        { error: { code: 400, message: 'The input token count exceeds the maximum' } },
+        headers(),
+        ctx,
+      ),
+    ).not.toBeInstanceOf(ContextOverflowError);
   });
 });

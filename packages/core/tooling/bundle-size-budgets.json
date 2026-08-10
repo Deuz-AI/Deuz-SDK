@@ -79,7 +79,12 @@
     "Measured through this same pipeline:",
     "  core  142211 B raw / 44715 B gzip  ->  limits 156500 / 49200  (+10.0% / +10.0% headroom)",
     "  edge  130721 B raw / 41255 B gzip  ->  limits 143800 / 45400  (+10.0% / +10.0% headroom)",
-    "  lazy   15507 B raw /  5852 B gzip  ->  limits  17100 /  6450  (+10.3% / +10.2%, both entries)",
+    "  lazy   16788 B raw /  6405 B gzip  ->  limits  18500 /  7050  (+10.2% / +10.1%, both entries)",
+    "The lazy figure is the MCP resolver, and it grew again during the pre-release review: the pool",
+    "gained a size cap with LRU eviction, and the reconnect path now closes the client it supersedes",
+    "(each drop used to leak a transport, and a live child process over stdio). Re-measured after",
+    "those fixes rather than left at the earlier reading, which had burned all but 0.7% of the",
+    "headroom and would have tripped on the next small MCP addition for no real reason.",
     "Overshoot vs the 1.9 limits: core +2.3% raw / +3.3% gzip, edge +2.9% / +3.9% — small next to",
     "what landed, because the heavy new surface (stores, speech, transcription, video, mcp/node)",
     "lives on subpaths these two entries never reach.",
@@ -117,16 +122,16 @@
       "exports": ["streamChat", "generateText", "generateObject", "createClient"],
       "maxRawBytes": 156500,
       "maxGzipBytes": 49200,
-      "maxLazyRawBytes": 17100,
-      "maxLazyGzipBytes": 6450
+      "maxLazyRawBytes": 18500,
+      "maxLazyGzipBytes": 7050
     },
     "edge": {
       "from": "@deuz-sdk/core/edge",
       "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
       "maxRawBytes": 143800,
       "maxGzipBytes": 45400,
-      "maxLazyRawBytes": 17100,
-      "maxLazyGzipBytes": 6450
+      "maxLazyRawBytes": 18500,
+      "maxLazyGzipBytes": 7050
     },
     "chat": {
       "from": "@deuz-sdk/core/chat",

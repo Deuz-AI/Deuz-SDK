@@ -66,7 +66,8 @@ export interface SqliteStoreOptions {
 
 /** The four stores plus the two lifecycle helpers that belong to the pack, not to any one seam. */
 export interface SqliteStores {
-  memory: MemoryStore;
+  /** Full `MemoryStore`, including the 2.0 `findByHash` / `deleteExpired` fast paths. */
+  memory: Required<MemoryStore>;
   chats: Required<ChatStore>;
   sessions: Required<SessionStore>;
   runs: Required<RunStore>;
@@ -343,6 +344,31 @@ function hydrateMemory(row: Record<string, unknown>): MemoryRecord {
   return record;
 }
 
+/**
+ * `MemoryQuery.filter` as a client-side predicate — the twin of Postgres'
+ * `metadata @> $n::jsonb`. SQLite stores `metadata` as opaque JSON TEXT, so the
+ * containment test cannot be pushed into the scope index; ignoring the filter
+ * instead (which is what this store used to do) silently widens a query the
+ * caller believes is narrow.
+ */
+function matchesMetadataFilter(
+  record: MemoryRecord,
+  filter: Record<string, unknown> | undefined,
+): boolean {
+  if (!filter) return true;
+  const metadata = record.metadata ?? {};
+  return Object.entries(filter).every(
+    ([key, value]) => JSON.stringify(metadata[key]) === JSON.stringify(value),
+  );
+}
+
+/** Rows a filtered query scans before the client-side predicate narrows them. */
+const FILTER_SCAN_LIMIT = 1000;
+
+/** Post-SQL row predicate; `KEEP_ANY` is the unfiltered identity. */
+type MemoryKeep = (record: MemoryRecord) => boolean;
+const KEEP_ANY: MemoryKeep = () => true;
+
 /** Wrap a user query as ONE FTS5 phrase — `"` is the only metacharacter left, and it doubles. */
 function toFtsPhrase(text: string): string {
   return `"${text.replace(/"/g, '""')}"`;
@@ -555,8 +581,12 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
       params.push(kind);
     }
     if (asOf !== undefined) {
+      // COALESCE, not `valid_at IS NULL OR …`: an absent `validAt` defaults to
+      // `createdAt` (the documented field default, and what the Postgres and
+      // Redis backends do), NOT to "valid since the beginning of time" — which
+      // would make a point-in-time query invent facts that did not exist yet.
       sql +=
-        ' AND (m.valid_at IS NULL OR m.valid_at <= ?) AND (m.invalid_at IS NULL OR m.invalid_at > ?)';
+        ' AND COALESCE(m.valid_at, m.created_at) <= ? AND (m.invalid_at IS NULL OR m.invalid_at > ?)';
       params.push(asOf, asOf);
     } else {
       sql += ' AND m.invalid_at IS NULL';
@@ -574,6 +604,7 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
     embedding: number[],
     where: { sql: string; params: SqlValue[] },
     topK: number,
+    keep: MemoryKeep = KEEP_ANY,
   ): Promise<MemoryHit[]> => {
     const h = await handle();
     const rows = h.all(
@@ -588,24 +619,35 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
           score: record.embedding ? cosineSimilarity(embedding, record.embedding) : 0,
         };
       })
+      .filter((hit) => keep(hit.record))
       .sort((a, b) => b.score - a.score)
       .slice(0, topK);
   };
 
-  /** Substring recall — the fallback when fts5 is off or the phrase will not parse. */
+  /**
+   * Substring recall — the fallback when fts5 is off or the phrase will not
+   * parse. `scan` is the SQL `LIMIT`, which is wider than `topK` only when a
+   * client-side `keep` still has to narrow the rows: applying `LIMIT topK`
+   * before the predicate would under-return.
+   */
   const likeSearch = async (
     text: string,
     where: { sql: string; params: SqlValue[] },
     topK: number,
+    keep: MemoryKeep = KEEP_ANY,
+    scan: number = topK,
   ): Promise<MemoryHit[]> => {
     const h = await handle();
     const rows = h.all(
       `SELECT ${MEMORY_SELECT} FROM deuz_memory m WHERE ${where.sql} AND m.text LIKE ? ESCAPE '\\' ` +
         'ORDER BY m.updated_at DESC, m.id ASC LIMIT ?',
-      [...where.params, `%${escapeLike(text)}%`, topK],
+      [...where.params, `%${escapeLike(text)}%`, scan],
     );
     // Substring matching has no gradations: a hit is a hit.
-    return rows.map((row) => ({ record: hydrateMemory(row), score: 1 }));
+    return rows
+      .map((row) => ({ record: hydrateMemory(row), score: 1 }))
+      .filter((hit) => keep(hit.record))
+      .slice(0, topK);
   };
 
   /**
@@ -618,32 +660,39 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
     text: string,
     where: { sql: string; params: SqlValue[] },
     topK: number,
+    keep: MemoryKeep = KEEP_ANY,
+    scan: number = topK,
   ): Promise<MemoryHit[]> => {
     const h = await handle();
-    if (!h.fts) return likeSearch(text, where, topK);
+    if (!h.fts) return likeSearch(text, where, topK, keep, scan);
     let rows: Record<string, unknown>[];
     try {
       rows = h.all(
         `SELECT ${MEMORY_SELECT}, bm25(deuz_memory_fts) AS deuz_bm25 FROM deuz_memory_fts ` +
           'JOIN deuz_memory m ON m.rowid = deuz_memory_fts.rowid ' +
           `WHERE deuz_memory_fts MATCH ? AND ${where.sql} ORDER BY deuz_bm25 LIMIT ?`,
-        [toFtsPhrase(text), ...where.params, topK],
+        [toFtsPhrase(text), ...where.params, scan],
       );
     } catch {
       // An unparseable phrase (or a corrupted index) is a query-level problem,
       // not a store-level one — answer it with LIKE instead of throwing.
-      return likeSearch(text, where, topK);
+      return likeSearch(text, where, topK, keep, scan);
     }
-    const raw = rows.map((row) => ({
-      record: hydrateMemory(row),
-      score: -(numberOf(row.deuz_bm25) ?? 0),
-    }));
+    // Normalized against the best SURVIVING hit, so a filtered query still tops
+    // out at 1 — a raw bm25 magnitude is meaningless across queries anyway.
+    const raw = rows
+      .map((row) => ({
+        record: hydrateMemory(row),
+        score: -(numberOf(row.deuz_bm25) ?? 0),
+      }))
+      .filter((hit) => keep(hit.record))
+      .slice(0, topK);
     const best = raw[0]?.score ?? 0;
     if (best <= 0) return raw.map((hit) => ({ record: hit.record, score: 1 }));
     return raw.map((hit) => ({ record: hit.record, score: hit.score / best }));
   };
 
-  const memory: MemoryStore = {
+  const memory: Required<MemoryStore> = {
     async upsert(records) {
       if (records.length === 0) return;
       const h = await handle();
@@ -669,22 +718,33 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
       const where = memoryWhere(query.scope, query.kind, query.asOf);
       const embedding = query.embedding?.length ? query.embedding : undefined;
       const text = query.text?.trim() ? query.text : undefined;
+      const filter =
+        query.filter && Object.keys(query.filter).length > 0 ? query.filter : undefined;
+      const keep: MemoryKeep = filter
+        ? (record) => matchesMetadataFilter(record, filter)
+        : KEEP_ANY;
+      /** SQL `LIMIT`: widened whenever `keep` still has to remove rows after it. */
+      const scanFor = (take: number): number => (filter ? Math.max(FILTER_SCAN_LIMIT, take) : take);
 
       if (!embedding && !text) {
         const rows = h.all(
           `SELECT ${MEMORY_SELECT} FROM deuz_memory m WHERE ${where.sql} ORDER BY m.updated_at DESC, m.id ASC LIMIT ?`,
-          [...where.params, topK],
+          [...where.params, scanFor(topK)],
         );
-        return rows.map((row) => ({ record: hydrateMemory(row), score: 0 }));
+        return rows
+          .map((row) => ({ record: hydrateMemory(row), score: 0 }))
+          .filter((hit) => keep(hit.record))
+          .slice(0, topK);
       }
-      if (embedding && !text) return vectorSearch(embedding, where, topK);
-      if (text && !embedding) return (await lexicalSearch(text, where, topK)).slice(0, topK);
+      if (embedding && !text) return vectorSearch(embedding, where, topK, keep);
+      if (text && !embedding) return lexicalSearch(text, where, topK, keep, scanFor(topK));
 
       // Hybrid: cosine and bm25 live on incomparable scales, so only their
       // RANKS are fused (RRF, k = 60) — the same merge `hybridRetrieve` uses.
+      const window = Math.max(topK, 20);
       const [dense, lexical] = await Promise.all([
-        vectorSearch(embedding!, where, Math.max(topK, 20)),
-        lexicalSearch(text!, where, Math.max(topK, 20)),
+        vectorSearch(embedding!, where, window, keep),
+        lexicalSearch(text!, where, window, keep, scanFor(window)),
       ]);
       const byId = new Map<string, MemoryRecord>();
       for (const hit of [...dense, ...lexical]) byId.set(hit.record.id, hit.record);
@@ -918,7 +978,7 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
     runs,
 
     async sweepExpiredMemories(now?: number) {
-      return memory.deleteExpired!(now ?? Date.now());
+      return memory.deleteExpired(now ?? Date.now());
     },
 
     async close() {

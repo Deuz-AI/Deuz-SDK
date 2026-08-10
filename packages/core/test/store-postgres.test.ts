@@ -17,7 +17,7 @@
  * Everything the fake cannot judge — that `<=>` really is cosine distance, that
  * HNSW really indexes it — is asserted on the SQL TEXT instead.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createPostgresStores, type PgClientLike } from '../src/node/store-postgres';
 import { InvalidRequestError } from '../src/errors';
 import { cosineSimilarity } from '../src/internal/vector';
@@ -25,6 +25,7 @@ import type { MemoryRecord, MemoryScope } from '../src/memory';
 import type { RunRecord } from '../src/types/runtime';
 import {
   assertMemoryStoreContract,
+  assertPersistentMemoryStoreContract,
   assertChatStoreContract,
   assertSessionStoreContract,
 } from './fixtures/store-conformance';
@@ -125,7 +126,13 @@ function numeric(value: unknown): number {
   return typeof value === 'number' ? value : Number(value);
 }
 
-export function createFakePg(options: { vectorExtension?: boolean } = {}): FakePgClient {
+export function createFakePg(
+  options: {
+    vectorExtension?: boolean;
+    /** Width of an ALREADY-EXISTING `deuz_memory.embedding` column, if any. */
+    existingVectorDimensions?: number;
+  } = {},
+): FakePgClient {
   const tables = new Map<string, Map<string, Row>>();
   const calls: { sql: string; params: unknown[] }[] = [];
   let pendingFailure: Error | undefined;
@@ -392,6 +399,15 @@ export function createFakePg(options: { vectorExtension?: boolean } = {}): FakeP
   };
 
   const runStatement = (sql: string, params: unknown[]): Row[] => {
+    // The ONE catalog query a row-store cannot model: `pg_attribute.atttypmod`
+    // carries a vector column's declared width, and `to_regclass` answers NULL
+    // (no rows) for a table that does not exist yet. Answered from the fake's
+    // configuration rather than by pretending to hold the catalog.
+    if (sql.startsWith('SELECT atttypmod FROM pg_attribute')) {
+      return options.existingVectorDimensions === undefined
+        ? []
+        : [{ atttypmod: options.existingVectorDimensions }];
+    }
     if (sql.startsWith('SELECT ')) return runSelect(sql, params);
     if (sql.startsWith('INSERT INTO ')) return runInsert(sql, params);
     if (sql.startsWith('UPDATE ')) return runUpdate(sql, params);
@@ -664,6 +680,79 @@ describe('pgvector detection', () => {
 });
 
 // ===================================================================
+// pgvector dimension agreement
+// ===================================================================
+
+describe('pgvector dimensions', () => {
+  it('refuses to migrate onto an existing vector column of a different width', async () => {
+    const client = createFakePg({ vectorExtension: true, existingVectorDimensions: 1536 });
+    const stores = createPostgresStores({ client, dimensions: 768 });
+
+    await expect(stores.migrate()).rejects.toThrow(InvalidRequestError);
+    await expect(stores.migrate()).rejects.toThrow(/vector\(1536\)/);
+    await expect(stores.migrate()).rejects.toThrow(/dimensions: 768/);
+    // `ADD COLUMN IF NOT EXISTS` cannot widen a column, so it would have been a
+    // silent no-op followed by a runtime failure on every single write.
+    expect(client.texts().some((s) => s.includes('ADD COLUMN IF NOT EXISTS embedding'))).toBe(
+      false,
+    );
+    expect(
+      client.texts().some((s) => s.includes('CREATE TABLE IF NOT EXISTS public.deuz_memory')),
+    ).toBe(false);
+  });
+
+  it('migrates happily onto an existing column of the SAME width', async () => {
+    const client = createFakePg({ vectorExtension: true, existingVectorDimensions: 3 });
+    const stores = createPostgresStores({ client, dimensions: 3 });
+
+    await expect(stores.migrate()).resolves.toBeUndefined();
+    expect(client.ddl()).toContain(
+      'ALTER TABLE public.deuz_memory ADD COLUMN IF NOT EXISTS embedding vector(3)',
+    );
+  });
+
+  it('never probes the column width when pgvector is off', async () => {
+    const client = createFakePg({ existingVectorDimensions: 1536 });
+    await createPostgresStores({ client, pgvector: 'off', dimensions: 3 }).migrate();
+
+    expect(client.texts().some((s) => s.includes('pg_attribute'))).toBe(false);
+  });
+
+  it('rejects a write whose embedding width contradicts the vector column', async () => {
+    const client = createFakePg({ vectorExtension: true });
+    const stores = createPostgresStores({ client, dimensions: 3 });
+
+    // Postgres itself would reject the row; swallowing that turns "the agent
+    // stopped learning" into a silent condition with no error anywhere.
+    await expect(
+      stores.memory.upsert([record('m1', 'x', { embedding: [0.1, 0.2] })]),
+    ).rejects.toThrow(InvalidRequestError);
+    await expect(
+      stores.memory.upsert([record('m1', 'x', { embedding: [0.1, 0.2] })]),
+    ).rejects.toThrow(/2-dimension embedding.*vector\(3\)/s);
+    expect(client.rows('deuz_memory')).toEqual([]);
+
+    // …and the same guard on the targeted-UPDATE path.
+    await stores.memory.upsert([record('m1', 'x', { embedding: [1, 0, 0] })]);
+    await expect(stores.memory.update('m1', { embedding: [1, 0] })).rejects.toThrow(
+      /2-dimension embedding/,
+    );
+    expect(client.rows('deuz_memory')[0]!['embedding']).toBe('[1,0,0]');
+  });
+
+  it('does not police widths when there is no vector column to disagree with', async () => {
+    const client = createFakePg(); // no extension → embedding_json only
+    const stores = createPostgresStores({ client, dimensions: 3 });
+
+    // `DOUBLE PRECISION[]` has no declared width, so nothing is lost or wrong.
+    await expect(
+      stores.memory.upsert([record('m1', 'x', { embedding: [0.1, 0.2] })]),
+    ).resolves.toBeUndefined();
+    expect(client.rows('deuz_memory')[0]!['embedding_json']).toEqual([0.1, 0.2]);
+  });
+});
+
+// ===================================================================
 // Writes
 // ===================================================================
 
@@ -786,15 +875,57 @@ describe('memory search', () => {
     ]);
 
     const hits = await stores.memory.search({ scope: SCOPE, embedding: [1, 0, 0], topK: 2 });
-    const { sql } = find(client, 'embedding_json IS NOT NULL');
+    const { sql } = find(client, 'embedding_json FROM');
 
     expect(sql).toContain('ORDER BY updated_at DESC LIMIT 1000');
     expect(sql).not.toContain('<=>');
+    // The candidate set is the SCOPE, not "the scope that happens to have a
+    // vector" — a row with no embedding scores 0 and still competes.
+    expect(sql).not.toContain('embedding_json IS NOT NULL');
     expect(hits.map((h) => h.record.id)).toEqual(['stale-but-close', 'fresh-but-far']);
     expect(hits[0]!.score).toBeCloseTo(1, 6);
     expect(hits[1]!.score).toBeCloseTo(0, 6);
     // A DB-backed record never carries its vector back into the record.
     expect(hits[0]!.record.embedding).toBeUndefined();
+  });
+
+  it('tops up a vector page with unembedded rows only when the index page cannot be final', async () => {
+    const client = createFakePg({ vectorExtension: true });
+    const stores = createPostgresStores({ client, dimensions: 3 });
+    await stores.memory.upsert([
+      record('near', 'a', { embedding: [1, 0, 0] }),
+      record('orthogonal', 'b', { embedding: [0, 1, 0] }),
+      record('novec', 'c'),
+    ]);
+    const topUps = (): number =>
+      client.calls.filter((c) => c.sql.includes('embedding IS NULL')).length;
+
+    // A FULL page whose worst score is >= 0 is already the answer: a score-0
+    // row can only TIE it, so the HNSW path stays at ONE round-trip.
+    client.calls.length = 0;
+    const full = await stores.memory.search({ scope: SCOPE, embedding: [1, 0, 0], topK: 2 });
+    expect(full.map((h) => h.record.id)).toEqual(['near', 'orthogonal']);
+    expect(topUps()).toBe(0);
+
+    // A SHORT page has to reach for the rows the vector index cannot answer for.
+    client.calls.length = 0;
+    const short = await stores.memory.search({ scope: SCOPE, embedding: [1, 0, 0], topK: 5 });
+    expect(short.map((h) => h.record.id)).toEqual(['near', 'orthogonal', 'novec']);
+    expect(topUps()).toBe(1);
+  });
+
+  it('ranks an unembedded row ABOVE a negative cosine, as the reference store does', async () => {
+    const client = createFakePg({ vectorExtension: true });
+    const stores = createPostgresStores({ client, dimensions: 3 });
+    await stores.memory.upsert([
+      record('near', 'a', { embedding: [1, 0, 0] }),
+      record('opposite', 'b', { embedding: [-1, 0, 0] }),
+      record('novec', 'c'),
+    ]);
+
+    // A full page is NOT final when it ends below zero — score 0 beats -1.
+    const hits = await stores.memory.search({ scope: SCOPE, embedding: [1, 0, 0], topK: 2 });
+    expect(hits.map((h) => h.record.id)).toEqual(['near', 'novec']);
   });
 
   it('escapes LIKE metacharacters in a text query', async () => {
@@ -970,6 +1101,11 @@ describe('RunStore', () => {
 // ===================================================================
 
 describe('lifecycle', () => {
+  afterEach(() => {
+    vi.doUnmock('pg');
+    vi.resetModules();
+  });
+
   it('never closes an injected client', async () => {
     const client = createFakePg();
     const stores = createPostgresStores({ client, pgvector: 'off' });
@@ -977,6 +1113,46 @@ describe('lifecycle', () => {
     await expect(stores.close()).resolves.toBeUndefined();
     // Still usable — the caller owns the connection, so we left it alone.
     await expect(stores.memory.list(SCOPE)).resolves.toEqual([]);
+  });
+
+  it('close() awaits a pool creation that is still in flight, then ends it', async () => {
+    let ended = 0;
+    let markImportStarted!: () => void;
+    const importStarted = new Promise<void>((resolve) => (markImportStarted = resolve));
+    let releaseImport!: () => void;
+    const heldImport = new Promise<void>((resolve) => (releaseImport = resolve));
+
+    // An ASYNC module factory keeps `await import('pg')` pending, which is
+    // exactly the window `close()` used to fall through: `ownedPool` is not
+    // assigned yet, so the pool is created AFTER close and leaks — holding the
+    // event loop (and a real connection) open for the life of the process.
+    vi.doMock('pg', async () => {
+      markImportStarted();
+      await heldImport;
+      return {
+        Pool: class {
+          async query(): Promise<{ rows: Record<string, unknown>[] }> {
+            return { rows: [] };
+          }
+          async end(): Promise<void> {
+            ended++;
+          }
+        },
+      };
+    });
+    vi.resetModules();
+    const { createPostgresStores: create } = await import('../src/node/store-postgres');
+
+    const stores = create({ connectionString: 'postgres://localhost/deuz', pgvector: 'off' });
+    const migrating = stores.migrate();
+    await importStarted;
+
+    const closing = stores.close();
+    releaseImport();
+    await closing;
+    await migrating;
+
+    expect(ended).toBe(1);
   });
 
   it('explains the optional peer when the connectionString path cannot load pg', async (ctx) => {
@@ -1007,6 +1183,19 @@ assertMemoryStoreContract('postgres (pgvector)', async () => {
 });
 
 assertMemoryStoreContract('postgres (embedding_json fallback)', async () => {
+  const stores = createPostgresStores({ client: createFakePg(), pgvector: 'off' });
+  return { store: stores.memory, cleanup: () => stores.close() };
+});
+
+assertPersistentMemoryStoreContract('postgres (pgvector)', async () => {
+  const stores = createPostgresStores({
+    client: createFakePg({ vectorExtension: true }),
+    dimensions: 3,
+  });
+  return { store: stores.memory, cleanup: () => stores.close() };
+});
+
+assertPersistentMemoryStoreContract('postgres (embedding_json fallback)', async () => {
   const stores = createPostgresStores({ client: createFakePg(), pgvector: 'off' });
   return { store: stores.memory, cleanup: () => stores.close() };
 });

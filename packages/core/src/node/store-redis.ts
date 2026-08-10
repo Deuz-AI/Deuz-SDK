@@ -122,7 +122,8 @@ export type RedisStoreOptions =
 
 /** The three seams plus the two operations that belong to the pack, not to a seam. */
 export interface RedisStores {
-  memory: MemoryStore;
+  /** Full `MemoryStore`, including the 2.0 `findByHash` / `deleteExpired` fast paths. */
+  memory: Required<MemoryStore>;
   chats: Required<ChatStore>;
   sessions: Required<SessionStore>;
   /**
@@ -141,6 +142,11 @@ export interface RedisStores {
    * Release the connection this pack opened ITSELF (the `{ url }` path). An
    * INJECTED client is left untouched — closing a connection the caller owns,
    * and may still be using elsewhere, is not this store's decision.
+   *
+   * FINAL on the `{ url }` path: a store call made after `close()` REJECTS
+   * rather than silently opening a second connection that nothing will ever
+   * quit. A pack over an injected client keeps working, because closing it
+   * released nothing in the first place.
    */
   close(): Promise<void>;
 }
@@ -237,6 +243,23 @@ function isLiveAt(record: MemoryRecord, asOf?: number): boolean {
   return record.invalidAt == null || record.invalidAt > asOf;
 }
 
+/**
+ * `MemoryQuery.filter` as a client-side predicate — the twin of Postgres'
+ * `metadata @> $n::jsonb`. Search here is client-side anyway, so this costs
+ * nothing extra; ignoring the filter instead (which is what this store used to
+ * do) silently widens a query the caller believes is narrow.
+ */
+function matchesMetadataFilter(
+  record: MemoryRecord,
+  filter: Record<string, unknown> | undefined,
+): boolean {
+  if (!filter) return true;
+  const metadata = record.metadata ?? {};
+  return Object.entries(filter).every(
+    ([key, value]) => JSON.stringify(metadata[key]) === JSON.stringify(value),
+  );
+}
+
 async function openClient(url: string): Promise<ManagedRedisClient> {
   let mod: RedisModule;
   try {
@@ -277,10 +300,20 @@ async function openClient(url: string): Promise<ManagedRedisClient> {
 export function createRedisStores(options: RedisStoreOptions): RedisStores {
   const k = keyspace(options.prefix ?? DEFAULT_PREFIX);
   let opened: Promise<ManagedRedisClient> | undefined;
+  let closed = false;
 
   /** The client for the next command (injected as-is, or lazily opened ONCE). */
   const use = async (): Promise<RedisClientLike> => {
     if ('client' in options) return options.client;
+    if (closed) {
+      throw new Error(
+        'createRedisStores({ url }): this store pack is closed. close() quit the connection it ' +
+          'opened, and a closed pack does not reconnect — silently opening a second connection ' +
+          'nobody will ever quit is how a long-lived process runs out of them. Build a new pack ' +
+          'with createRedisStores({ url }), or inject a client whose lifecycle you own: ' +
+          'createRedisStores({ client }).',
+      );
+    }
     const pending = opened ?? openClient(options.url);
     if (pending !== opened) {
       opened = pending;
@@ -403,7 +436,7 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
     return matched.length;
   };
 
-  const memory: MemoryStore = {
+  const memory: Required<MemoryStore> = {
     upsert: upsertRecords,
 
     async get(id, scope) {
@@ -415,6 +448,8 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
 
     async search(query) {
       const topK = query.topK ?? 5;
+      const filter =
+        query.filter && Object.keys(query.filter).length > 0 ? query.filter : undefined;
       const records = await readRecords(await candidateIds(query.scope));
       const candidates = records.filter(
         (record) =>
@@ -422,6 +457,7 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
           // crash-orphaned membership must not leak another tenant's row.
           matchesScope(record, query.scope) &&
           (query.kind ? record.kind === query.kind : true) &&
+          matchesMetadataFilter(record, filter) &&
           isLiveAt(record, query.asOf),
       );
       let scored: MemoryHit[];
@@ -455,7 +491,10 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
           (opts?.kind ? record.kind === opts.kind : true) &&
           record.invalidAt == null,
       );
-      return opts?.limit ? out.slice(0, opts.limit) : out;
+      // `=== undefined`, not truthiness: `limit: 0` means "none", exactly as
+      // `slice(0, 0)` and a SQL `LIMIT 0` do. Reading 0 as "unlimited" turns a
+      // computed page size of zero into a full-scope scan on this backend only.
+      return opts?.limit === undefined ? out : out.slice(0, opts.limit);
     },
 
     delete: deleteRecords,
@@ -471,16 +510,39 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
     async findByHash(hashes, scope) {
       if (hashes.length === 0) return [];
       const client = await use();
+      const wanted = new Set(hashes);
+      const members = new Map<string, string[]>();
       const ids = new Set<string>();
       for (const hash of hashes) {
-        for (const id of await client.sMembers(k.memHash(hash))) ids.add(id);
+        const found = await client.sMembers(k.memHash(hash));
+        members.set(hash, found);
+        for (const id of found) ids.add(id);
       }
       const records = await readRecords([...ids]);
-      // Scoped in process: the hash index is global, so the same fact written by
-      // two users shares one set — and dedup must never reach across tenants.
+      const byId = new Map(records.map((record) => [record.id, record]));
+
+      // Repair a membership the record itself contradicts. Only when the record
+      // EXISTS and carries another hash: an id with no record yet is the
+      // documented crash window of an in-flight write (indexes first, record
+      // last), and removing that membership would corrupt a live write.
+      for (const [hash, found] of members) {
+        for (const id of found) {
+          const record = byId.get(id);
+          if (record && record.hash !== hash) await client.sRem(k.memHash(hash), id);
+        }
+      }
+
+      // The record's OWN hash decides, never the index membership that led here:
+      // a stale set would otherwise let a dedup pass conclude that a brand-new
+      // fact is already stored, and the agent would stop learning it.
+      // Scoped in process too: the hash index is global, so the same fact
+      // written by two users shares one set and dedup must not cross tenants.
       // Soft-deleted rows are excluded to match the `list()`-based fallback this
       // method replaces (`MemoryStore.findByHash`).
-      return records.filter((record) => matchesScope(record, scope) && record.invalidAt == null);
+      return records.filter(
+        (record) =>
+          wanted.has(record.hash) && matchesScope(record, scope) && record.invalidAt == null,
+      );
     },
 
     deleteExpired: deleteExpiredRecords,
@@ -566,6 +628,9 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
     sessions,
     sweepExpiredMemories: (now = Date.now()) => deleteExpiredRecords(now),
     async close() {
+      // Marked before the await: `use()` reads this flag, so a call racing the
+      // quit must not slip through and re-open behind it.
+      closed = true;
       const pending = opened;
       opened = undefined;
       if (!pending) return; // injected client, or never connected — not ours

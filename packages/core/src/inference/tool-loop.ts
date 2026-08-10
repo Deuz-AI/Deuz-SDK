@@ -20,14 +20,14 @@ import {
   closeMcp,
   setupCompaction,
   runCompaction,
+  retargetCompaction,
   calibrateCompaction,
   recoverFromOverflow,
   isContextOverflow,
   executeTools,
   toToolResultPart,
   toStepResult,
-  hasClientTool,
-  isClientTool,
+  pendingClientCalls,
   bumpErrorGuard,
   normalizeStop,
   needsCost,
@@ -64,6 +64,7 @@ import {
   applyToolCallGuardrails,
   logGuardrailParts,
   rewriteAssistantText,
+  isEmptyTurn,
   GUARDRAIL_INPUT_STOPPED_BY,
   GUARDRAIL_OUTPUT_STOPPED_BY,
   collectHandoffTools,
@@ -358,15 +359,53 @@ export async function runToolLoop(
     // model call — the new tool message flows into response.messages. A durable
     // sub-agent that re-suspends here suspends THIS run again immediately.
     try {
-      const settled = await settlePendingApprovals(messages, tools, options, extras);
+      const settled = await settlePendingApprovals(
+        messages,
+        // The pending calls were issued BEFORE the transfer, by an agent whose
+        // tools the overlay above has already replaced. Settling them against
+        // the active set alone would report a human-APPROVED call as a
+        // hallucinated name, so the settle — and only the settle — also sees the
+        // set the call came in with.
+        active ? mergeMcpTools(mcp, { ...(options.tools ?? {}), ...active.tools }) : tools,
+        options,
+        extras,
+        undefined,
+        { ...(active ? { active } : {}), tools: handoffTools },
+      );
       if (settled) {
         messages = settled.messages;
         const toolMessage = settled.messages.at(-1)!;
         appended.push(toolMessage);
         chatMessages = [...chatMessages, toolMessage];
+        logGuardrailParts(guardrailLog, settled.guardrails);
+        // A transfer that was left unanswered by an earlier leg is applied HERE:
+        // from this point the resume leg is the target agent.
+        if (settled.handoff?.accepted) {
+          const swap = applyHandoffSwap(
+            settled.handoff.accepted,
+            active,
+            handoffTools,
+            messages,
+            stepBase,
+          );
+          active = swap.active;
+          messages = swap.messages;
+          handoffLog.push(swap.entry);
+          ownTools = active.tools;
+          tools = mergeMcpTools(mcp, ownTools);
+          fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+          staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
+          retargetCompaction(compactionRunner, options, deps, active.model);
+          if (durable) durable.handoff = { to: active.name!, count: active.handoffCount };
+        }
+        // A synthesized transfer answer is a verdict, not a tool failure — the
+        // same exclusion the in-step path applies.
+        const handoffIds = new Set(settled.handoff?.results.map((r) => r.toolCallId) ?? []);
         bumpErrorGuard(
           errorCounters,
-          settled.results.filter((r) => !settled.deniedIds.has(r.toolCallId)),
+          settled.results.filter(
+            (r) => !settled.deniedIds.has(r.toolCallId) && !handoffIds.has(r.toolCallId),
+          ),
         );
       }
     } catch (err) {
@@ -537,6 +576,7 @@ export async function runToolLoop(
             addCompactionUsage,
             logCompaction,
             observeCtx,
+            active?.model ?? options.model,
           );
           if (!recovered) throw err;
           messages = recovered;
@@ -652,9 +692,23 @@ export async function runToolLoop(
         }
         if (guardrailText !== undefined) {
           const rewritten = rewriteAssistantText(step.assistantMessage, guardrailText);
-          messages = [...messages.slice(0, -1), rewritten];
-          appended[appended.length - 1] = rewritten;
-          chatMessages = [...chatMessages.slice(0, -1), rewritten];
+          // A block with nothing left to say empties the turn, and an empty
+          // content array is not a message any wire accepts (see isEmptyTurn) —
+          // so the turn is DROPPED rather than persisted in an unsendable shape.
+          const drop = isEmptyTurn(rewritten);
+          messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
+          chatMessages = drop
+            ? chatMessages.slice(0, -1)
+            : [...chatMessages.slice(0, -1), rewritten];
+          if (drop) appended.pop();
+          else appended[appended.length - 1] = rewritten;
+          // The SAME step must agree: a consumer auditing `steps[]` would
+          // otherwise still read the text the guardrail removed.
+          steps[steps.length - 1] = {
+            ...sr,
+            text: guardrailText,
+            response: { messages: drop ? [] : [rewritten] },
+          };
         }
 
         if (durable) {
@@ -707,6 +761,47 @@ export async function runToolLoop(
           ? execCalls.filter((c) => !guardedCalls.blocked.has(c.toolCallId))
           : execCalls;
 
+      // The transfer verdict is computed HERE — before the approval gate and
+      // before `executeTools`, both of which can leave the step early. A break
+      // that left a transfer's `tool_use` id unanswered would hand the provider
+      // an unanswerable turn on the next request AND silently drop the routing
+      // decision, so the decision is made once and committed on every exit.
+      const handoffDecision =
+        handoffCalls.length > 0 ? decideHandoff(handoffCalls, active) : undefined;
+      /**
+       * Apply the transfer on a path that executes NOTHING else. Returns the
+       * `{role:'tool'}` turn that answers the transfer ids so the caller can
+       * report it on the step; no wire rebuild, because the loop is leaving.
+       */
+      const commitHandoffOnBreak = (): Message | undefined => {
+        if (!handoffDecision) return undefined;
+        const message: Message = {
+          role: 'tool',
+          content: handoffDecision.results.map(toToolResultPart),
+        };
+        messages = [...messages, message];
+        appended.push(message);
+        chatMessages = [...chatMessages, message];
+        if (handoffDecision.accepted) {
+          const swap = applyHandoffSwap(
+            handoffDecision.accepted,
+            active,
+            handoffTools,
+            messages,
+            stepIndex,
+          );
+          active = swap.active;
+          // The rewritten system turn has to be in `messages` BEFORE the
+          // checkpoint below, or the resume leg would carry on as the target
+          // agent while still reading the outgoing agent's instructions.
+          messages = swap.messages;
+          handoffLog.push(swap.entry);
+          ownTools = active.tools;
+          if (durable) durable.handoff = { to: active.name!, count: active.handoffCount };
+        }
+        return message;
+      };
+
       // Approval gate: server mode denies inline; without approveToolCall the
       // gated calls break the loop like client tools (client mode).
       const gated = await findApprovalNeeded(gateCandidates, tools, options, messages);
@@ -732,9 +827,13 @@ export async function runToolLoop(
         }
       }
 
+      // Client tools a guardrail BLOCKED are not pending on anyone (see
+      // pendingClientCalls) — they fall through to `executeTools` instead.
+      const clientCalls = pendingClientCalls(toolCalls, tools, guardedCalls.blocked);
+
       // Pending approvals and client tools (no execute) can't be auto-continued —
       // ONE break, executing nothing from the batch; the resume settles the rest.
-      if (pendingApproval.length > 0 || hasClientTool(toolCalls, tools)) {
+      if (pendingApproval.length > 0 || clientCalls.length > 0) {
         if (pendingApproval.length > 0) {
           pendingApprovals = await signApprovalRequests(
             toApprovalRequests(pendingApproval, options.agentPath),
@@ -743,7 +842,14 @@ export async function runToolLoop(
             durable?.runId,
           );
         }
-        const sr = toStepResult(step, toolCalls, [], steps.length);
+        const handoffMessage = commitHandoffOnBreak();
+        const sr = toStepResult(
+          step,
+          toolCalls,
+          handoffDecision?.results ?? [],
+          steps.length,
+          handoffMessage,
+        );
         steps.push(sr);
         options.onStepFinish?.(sr);
         if (lo && stepSpan) {
@@ -772,8 +878,9 @@ export async function runToolLoop(
           reason: pendingApproval.length > 0 ? 'approval' : 'client-tool',
           pendingApprovalCount: pendingApprovals?.length ?? 0,
           // Only REAL client tools are pending on the caller (1.9) — a
-          // hallucinated name self-healed inside the step instead.
-          pendingToolCount: toolCalls.filter((c) => isClientTool(tools, c.toolName)).length,
+          // hallucinated name self-healed inside the step instead, and a blocked
+          // one never became the caller's problem (2.0).
+          pendingToolCount: clientCalls.length,
           ...checkpointRef(),
         };
         break;
@@ -784,11 +891,21 @@ export async function runToolLoop(
         toolResults = await executeTools(execCalls, tools, options, messages, denied, extras);
       } catch (err) {
         if (!(err instanceof SubAgentSuspension)) throw err;
-        // A durable sub-agent suspended: no tool message is appended — its
-        // tool_use stays unanswered and the resume leg's settle re-executes it,
-        // which resumes the child checkpoint.
+        // A durable sub-agent suspended: no tool message is appended for the
+        // EXECUTED calls — their tool_use stays unanswered and the resume leg's
+        // settle re-executes them, which resumes the child checkpoint. The
+        // transfer is not one of them: it never executes, so its answer (and the
+        // swap) is committed here rather than deferred to a leg that would find
+        // no producer for it.
         pendingApprovals = err.approvals;
-        const sr = toStepResult(step, toolCalls, [], steps.length);
+        const handoffMessage = commitHandoffOnBreak();
+        const sr = toStepResult(
+          step,
+          toolCalls,
+          handoffDecision?.results ?? [],
+          steps.length,
+          handoffMessage,
+        );
         steps.push(sr);
         options.onStepFinish?.(sr);
         if (lo && stepSpan) {
@@ -825,12 +942,11 @@ export async function runToolLoop(
       // while they ran, the step is over — fail here rather than feeding results
       // back into a model call that can no longer be paid for.
       assertStepDeadline();
-      // Handoff (2.0): every transfer `tool_use_id` is answered HERE — the first
-      // with the transfer confirmation, its siblings (and everything, once the
-      // budget is spent) with a self-healing is_error. Merged back into the
-      // model's own call order so the turn reads the way it was issued.
-      const handoffDecision =
-        handoffCalls.length > 0 ? decideHandoff(handoffCalls, active) : undefined;
+      // Handoff (2.0): every transfer `tool_use_id` is answered from the decision
+      // taken above — the first with the transfer confirmation, its siblings (and
+      // everything, once the budget is spent) with a self-healing is_error.
+      // Merged back into the model's own call order so the turn reads the way it
+      // was issued.
       if (handoffDecision) {
         toolResults = mergeResultsInCallOrder(toolCalls, toolResults, handoffDecision.results);
       }
@@ -861,6 +977,9 @@ export async function runToolLoop(
         tools = mergeMcpTools(mcp, ownTools);
         fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
         staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
+        // Compaction is measured against — and summarized by — whoever is
+        // driving: the target's context window is not the outgoing agent's.
+        retargetCompaction(compactionRunner, options, deps, active.model);
         if (durable) durable.handoff = { to: active.name!, count: active.handoffCount };
       }
 

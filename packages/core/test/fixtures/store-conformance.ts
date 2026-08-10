@@ -25,6 +25,14 @@
  * `deleteExpired`, `deleteChat`, `listChats`, `SessionStore.delete`/`list`) skip
  * when absent instead of failing — a pre-2.0 store stays valid — but are held to
  * the full contract when present.
+ *
+ * {@link assertPersistentMemoryStoreContract} is the SECOND memory suite, for
+ * the query dimensions only the 2.0 persistent backends implement
+ * (`MemoryQuery.asOf`, `MemoryQuery.filter`) plus the `limit` edge the reference
+ * store answers differently. It is a separate entry point rather than more `it`s
+ * in the first suite because `createInMemoryMemoryStore` is a REFERENCE, not a
+ * backend: it ignores `asOf`/`filter` outright, so folding these in would make
+ * the reference file red for a gap it has never claimed to close.
  */
 import { describe, it, expect } from 'vitest';
 import type { Message, Part, ImagePart } from '../../src/types/message';
@@ -83,6 +91,16 @@ function emptyUsage(): Usage {
 
 /** Bytes chosen to break a naive latin1/utf8 round-trip if one is attempted. */
 const BINARY = new Uint8Array([0, 1, 2, 127, 128, 253, 254, 255]);
+
+/**
+ * The SAME bytes as a Node `Buffer`. A Buffer is a `Uint8Array` SUBCLASS that
+ * carries its own `toJSON`, and `JSON.stringify` calls `toJSON` BEFORE it calls
+ * a replacer — so a codec that tests the replacer's `value` (rather than the
+ * pre-`toJSON` value on the holder) silently rewrites it as
+ * `{ type: 'Buffer', data: [...] }`. Every store that reaches Node reaches
+ * Buffers: `fs.readFile`, `req.body`, and every image an SDK hands back.
+ */
+const BINARY_BUFFER = Buffer.from(BINARY);
 
 function firstPart(messages: Message[], index: number): Part {
   const content = messages[index]?.content;
@@ -217,6 +235,36 @@ export function assertMemoryStoreContract(
       });
     });
 
+    it('search with an embedding still returns records that carry NO embedding', async () => {
+      await withStore(async (store) => {
+        await store.upsert([
+          memoryRecord('vec', 'written after an embedder ran', SCOPE_A, { embedding: [1, 0, 0] }),
+          // Written by a pipeline with no embedder, or before one was wired up.
+          memoryRecord('novec', 'written with no embedder at all', SCOPE_A),
+        ]);
+
+        const hits = await store.search({ scope: SCOPE_A, embedding: [1, 0, 0], topK: 5 });
+        // A vector query RANKS by cosine; it does not RESTRICT the candidate set
+        // to rows that happen to have a vector. Dropping them makes the same
+        // query answer differently per backend and loses text-only memories.
+        expect(ids(hits)).toEqual(['vec', 'novec']);
+        expect(hits[1]!.score).toBe(0);
+      });
+    });
+
+    it('search matches on text for a record that has no embedding', async () => {
+      await withStore(async (store) => {
+        await store.upsert([
+          memoryRecord('novec', 'the user lives in Istanbul', SCOPE_A),
+          memoryRecord('vec', 'unrelated fact', SCOPE_A, { embedding: [1, 0, 0] }),
+        ]);
+
+        const hits = await store.search({ scope: SCOPE_A, text: 'Istanbul', topK: 5 });
+        expect(hits[0]!.record.id).toBe('novec');
+        expect(hits[0]!.score).toBeGreaterThan(0);
+      });
+    });
+
     it('search matches on text when the query carries no embedding', async () => {
       await withStore(async (store) => {
         await store.upsert([
@@ -260,6 +308,10 @@ export function assertMemoryStoreContract(
         expect((await store.list(SCOPE_A)).map((r) => r.id).sort()).toEqual(['e1', 's1', 's2']);
         expect((await store.list(SCOPE_A, { kind: 'episodic' })).map((r) => r.id)).toEqual(['e1']);
         expect(await store.list(SCOPE_A, { limit: 2 })).toHaveLength(2);
+        // `limit: 0` means none, the way slice reads it. The alternative — "0 is
+        // unlimited" — turns a computed page size of 0 into a full scan, and only
+        // on the backends that read it that way.
+        expect(await store.list(SCOPE_A, { limit: 0 })).toEqual([]);
         expect((await store.list(SCOPE_B)).map((r) => r.id)).toEqual(['other']);
         expect(await store.list({ userId: 'nobody' })).toEqual([]);
       });
@@ -320,6 +372,122 @@ export function assertMemoryStoreContract(
         expect(await store.deleteExpired(T0)).toBe(1);
         expect(await store.get('dead-b')).toBeNull();
         expect(await store.deleteExpired(T0)).toBe(0);
+      });
+    });
+  });
+}
+
+/**
+ * The contract the three PERSISTENT backends (SQLite / Redis / Postgres) owe on
+ * top of {@link assertMemoryStoreContract}: the two `MemoryQuery` dimensions
+ * that only they implement, and the one `list` edge where "backend-defined" is
+ * not an acceptable answer.
+ *
+ * Kept apart from the main suite on purpose — see the module header. Everything
+ * here is asserted identically for all three, so a divergence is a bug in the
+ * backend, never a licensed difference.
+ */
+export function assertPersistentMemoryStoreContract(
+  name: string,
+  make: () => Promise<StoreHarness<MemoryStore>>,
+): void {
+  const withStore = async (fn: (store: MemoryStore) => Promise<void>): Promise<void> => {
+    const { store, cleanup } = await make();
+    try {
+      await fn(store);
+    } finally {
+      await cleanup?.();
+    }
+  };
+
+  describe(`MemoryStore contract (persistent): ${name}`, () => {
+    it('asOf treats a record with no validAt as valid from its createdAt, not from -infinity', async () => {
+      await withStore(async (store) => {
+        await store.upsert([
+          memoryRecord('early', 'known from the start', SCOPE_A),
+          // No `validAt`: the documented default is `createdAt`, so this fact
+          // did not exist yet at T0 + 500 and a point-in-time query must not
+          // invent it.
+          memoryRecord('late', 'learned later', SCOPE_A, {
+            createdAt: T0 + 1_000,
+            updatedAt: T0 + 1_000,
+          }),
+        ]);
+
+        const then = await store.search({ scope: SCOPE_A, asOf: T0 + 500, topK: 10 });
+        expect(ids(then)).toEqual(['early']);
+
+        const later = await store.search({ scope: SCOPE_A, asOf: T0 + 2_000, topK: 10 });
+        expect(ids(later).sort()).toEqual(['early', 'late']);
+      });
+    });
+
+    it('asOf sees a fact that has since been superseded, while the present does not', async () => {
+      await withStore(async (store) => {
+        await store.upsert([
+          memoryRecord('was', 'the user lives in Istanbul', SCOPE_A, {
+            validAt: T0,
+            invalidAt: T0 + 1_000,
+          }),
+          memoryRecord('is', 'the user lives in Ankara', SCOPE_A, { validAt: T0 + 1_000 }),
+        ]);
+
+        expect(ids(await store.search({ scope: SCOPE_A, topK: 10 }))).toEqual(['is']);
+        expect(ids(await store.search({ scope: SCOPE_A, asOf: T0 + 500, topK: 10 }))).toEqual([
+          'was',
+        ]);
+      });
+    });
+
+    it('search honors MemoryQuery.filter as metadata containment, in every ranking mode', async () => {
+      await withStore(async (store) => {
+        await store.upsert([
+          memoryRecord('chat', 'learned from a chat', SCOPE_A, {
+            metadata: { source: 'chat', lang: 'tr' },
+            embedding: [1, 0, 0],
+          }),
+          memoryRecord('docs', 'learned from the docs', SCOPE_A, {
+            metadata: { source: 'docs' },
+            embedding: [1, 0, 0],
+          }),
+          memoryRecord('bare', 'learned from nowhere', SCOPE_A),
+        ]);
+        const filter = { source: 'chat' };
+
+        // Plain scope listing, cosine ranking and lexical ranking must all apply
+        // it — a filter honored in only one mode is a filter you cannot trust.
+        expect(ids(await store.search({ scope: SCOPE_A, filter, topK: 10 }))).toEqual(['chat']);
+        expect(
+          ids(await store.search({ scope: SCOPE_A, embedding: [1, 0, 0], filter, topK: 10 })),
+        ).toEqual(['chat']);
+        expect(
+          ids(await store.search({ scope: SCOPE_A, text: 'learned', filter, topK: 10 })),
+        ).toEqual(['chat']);
+
+        // EVERY key has to match, and an empty filter filters nothing.
+        expect(
+          await store.search({ scope: SCOPE_A, filter: { source: 'chat', lang: 'en' }, topK: 10 }),
+        ).toEqual([]);
+        expect(ids(await store.search({ scope: SCOPE_A, filter: {}, topK: 10 })).sort()).toEqual([
+          'bare',
+          'chat',
+          'docs',
+        ]);
+      });
+    });
+
+    it('list with limit 0 returns nothing, like every other slice in JS', async () => {
+      await withStore(async (store) => {
+        await store.upsert([
+          memoryRecord('m1', 'one', SCOPE_A),
+          memoryRecord('m2', 'two', SCOPE_A),
+        ]);
+
+        // The alternative reading — "0 means unlimited" — turns a computed page
+        // size of 0 into a full table scan, silently, on some backends only.
+        expect(await store.list(SCOPE_A, { limit: 0 })).toEqual([]);
+        expect(await store.list(SCOPE_A, { limit: 1 })).toHaveLength(1);
+        expect(await store.list(SCOPE_A)).toHaveLength(2);
       });
     });
   });
@@ -424,6 +592,41 @@ export function assertChatStoreContract(
         expect(image.image).toBeInstanceOf(Uint8Array);
         expect([...(image.image as Uint8Array)]).toEqual([...BINARY]);
         expect(image.mediaType).toBe('image/png');
+
+        const toolResult = firstPart(loaded!.messages, 1) as {
+          type: 'tool_result';
+          result: { nested: { blob: Uint8Array } };
+        };
+        expect(toolResult.result.nested.blob).toBeInstanceOf(Uint8Array);
+        expect([...toolResult.result.nested.blob]).toEqual([...BINARY]);
+      });
+    });
+
+    it('round-trips a Node Buffer as bytes, not as { type: "Buffer", data: [...] }', async () => {
+      await withStore(async (store) => {
+        await store.saveChat(
+          chatRecord('c1', SCOPE_A, [
+            {
+              role: 'user',
+              content: [{ type: 'image', image: BINARY_BUFFER, mediaType: 'image/png' }],
+            },
+            {
+              role: 'tool',
+              content: [
+                {
+                  type: 'tool_result',
+                  toolUseId: 't1',
+                  result: { nested: { blob: BINARY_BUFFER } },
+                },
+              ],
+            },
+          ]),
+        );
+
+        const loaded = await store.loadChat('c1');
+        const image = firstPart(loaded!.messages, 0) as ImagePart;
+        expect(image.image).toBeInstanceOf(Uint8Array);
+        expect([...(image.image as Uint8Array)]).toEqual([...BINARY]);
 
         const toolResult = firstPart(loaded!.messages, 1) as {
           type: 'tool_result';
@@ -577,6 +780,26 @@ export function assertSessionStoreContract(
           checkpoint('run-1', {
             messages: [
               { role: 'user', content: [{ type: 'image', image: BINARY, mediaType: 'image/png' }] },
+            ],
+          }),
+        );
+
+        const loaded = await store.load('run-1');
+        const image = firstPart(loaded!.messages, 0) as ImagePart;
+        expect(image.image).toBeInstanceOf(Uint8Array);
+        expect([...(image.image as Uint8Array)]).toEqual([...BINARY]);
+      });
+    });
+
+    it('round-trips a Node Buffer as bytes, not as { type: "Buffer", data: [...] }', async () => {
+      await withStore(async (store) => {
+        await store.save(
+          checkpoint('run-1', {
+            messages: [
+              {
+                role: 'user',
+                content: [{ type: 'image', image: BINARY_BUFFER, mediaType: 'image/png' }],
+              },
             ],
           }),
         );

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { generateText, streamChat } from '../src/index';
 import { createMockModel, type MockResponse } from '../src/testing';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
-import { createInMemorySessionStore } from '../src/durable';
+import { createInMemorySessionStore, resumeFromCheckpoint } from '../src/durable';
 import { createInMemoryChatStore } from '../src/chat';
 import {
   promptInjectionGuardrail,
@@ -382,6 +382,164 @@ describe('guardrails: onToolCall', () => {
     expect(res.text).toBe('done');
   });
 
+  it('a BLOCKED client tool is never handed to the caller — it is denied like any other block', async () => {
+    const model = createMockModel({
+      responses: [
+        { toolCalls: [{ toolName: 'askUser', args: { path: '/etc' } }] },
+        { text: 'continued without asking' },
+      ],
+    });
+    const res = await generateText({
+      model,
+      messages: USER,
+      // No `execute` — a CLIENT tool, whose round-trip the caller owns.
+      tools: { askUser: { description: 'asks the user', parameters: PATH_SCHEMA } },
+      maxSteps: 5,
+      guardrails: { onToolCall: () => ({ action: 'block', reason: 'not allowed' }) },
+    });
+
+    // The loop did NOT break: a call the guardrail refused must never reach the
+    // caller as a pending round-trip.
+    expect(res.text).toBe('continued without asking');
+    expect(res.steps).toHaveLength(2);
+    const denied = res.steps![0]!.toolResults[0]!;
+    expect(denied).toMatchObject({ toolName: 'askUser', isError: true });
+    expect(String(denied.result)).toContain('Blocked by guardrail');
+  });
+
+  it('still breaks for the client tools a guardrail did NOT block', async () => {
+    const model = createMockModel({
+      responses: [
+        {
+          toolCalls: [
+            { toolName: 'askUser', args: { path: '/a' }, id: 'blocked' },
+            { toolName: 'pickFile', args: { path: '/b' }, id: 'pending' },
+          ],
+        },
+      ],
+    });
+    const res = await generateText({
+      model,
+      messages: USER,
+      tools: {
+        askUser: { description: 'asks the user', parameters: PATH_SCHEMA },
+        pickFile: { description: 'picks a file', parameters: PATH_SCHEMA },
+      },
+      maxSteps: 5,
+      guardrails: {
+        onToolCall: (ctx) =>
+          ctx.toolCall.toolName === 'askUser' ? { action: 'block', reason: 'no' } : undefined,
+      },
+    });
+    expect(res.steps).toHaveLength(1);
+    expect(res.steps![0]!.toolResults).toEqual([]);
+  });
+
+  it('re-applies a BLOCK on the resume leg (a suspension must not launder a blocked call)', async () => {
+    const store = createInMemorySessionStore();
+    const ran: string[] = [];
+    const tools = () => ({
+      danger: {
+        description: 'deletes a path',
+        parameters: PATH_SCHEMA,
+        execute: async (args: unknown): Promise<string> => {
+          ran.push(`danger:${(args as { path: string }).path}`);
+          return 'deleted';
+        },
+      },
+      wire: {
+        description: 'wires money',
+        parameters: PATH_SCHEMA,
+        needsApproval: true,
+        execute: async (args: unknown): Promise<string> => {
+          ran.push(`wire:${(args as { path: string }).path}`);
+          return 'sent';
+        },
+      },
+    });
+    const noDelete: ToolCallGuardrail = (ctx) =>
+      ctx.toolCall.toolName === 'danger' ? { action: 'block', reason: 'destructive' } : undefined;
+
+    const first = await generateText({
+      model: createMockModel({
+        responses: [
+          {
+            toolCalls: [
+              { toolName: 'danger', args: { path: '/etc' }, id: 't_danger' },
+              { toolName: 'wire', args: { path: '/tmp' }, id: 't_wire' },
+            ],
+          },
+        ],
+      }),
+      messages: USER,
+      tools: tools(),
+      maxSteps: 5,
+      session: { store },
+      guardrails: { onToolCall: noDelete },
+    });
+    // The gated call suspended the batch, so NOTHING ran — including the call
+    // the guardrail had already refused.
+    expect(first.pendingApprovals?.map((a) => a.approvalId)).toEqual(['t_wire']);
+    expect(ran).toEqual([]);
+
+    const resumed = await resumeFromCheckpoint(store, first.runId!, {
+      model: createMockModel({ responses: [{ text: 'moved on' }] }),
+      tools: tools(),
+      maxSteps: 5,
+      approvalResponses: [{ approvalId: 't_wire', approved: true }],
+      guardrails: { onToolCall: noDelete },
+    });
+
+    // The blocked call must NOT execute just because the run went through a
+    // suspension — the settle re-runs the guardrails before anything executes.
+    expect(ran).toEqual(['wire:/tmp']);
+    expect(resumed.text).toBe('moved on');
+  });
+
+  it('re-applies a REWRITE on the resume leg (the model’s original args never execute)', async () => {
+    const store = createInMemorySessionStore();
+    const ran: unknown[] = [];
+    const tools = () => ({
+      danger: {
+        description: 'deletes a path',
+        parameters: PATH_SCHEMA,
+        needsApproval: true,
+        execute: async (args: unknown): Promise<string> => {
+          ran.push(args);
+          return 'deleted';
+        },
+      },
+    });
+    const confine: ToolCallGuardrail = (ctx) => ({
+      action: 'rewrite',
+      args: { path: `.${(ctx.toolCall.args as { path: string }).path}` },
+    });
+
+    const first = await generateText({
+      model: createMockModel({
+        responses: [{ toolCalls: [{ toolName: 'danger', args: { path: '/etc' }, id: 't1' }] }],
+      }),
+      messages: USER,
+      tools: tools(),
+      maxSteps: 5,
+      session: { store },
+      guardrails: { onToolCall: confine },
+    });
+    expect(first.pendingApprovals?.[0]!.input).toEqual({ path: './etc' });
+
+    await resumeFromCheckpoint(store, first.runId!, {
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      tools: tools(),
+      maxSteps: 5,
+      approvalResponses: [{ approvalId: 't1', approved: true }],
+      guardrails: { onToolCall: confine },
+    });
+
+    // The history keeps the MODEL's args; the substitution has to be re-derived
+    // on the resume leg or the approved call runs unconfined.
+    expect(ran).toEqual([{ path: './etc' }]);
+  });
+
   it('a throwing tool-call guardrail propagates', async () => {
     const model = createMockModel({
       responses: [{ toolCalls: [{ toolName: 'danger', args: { path: '/etc' } }] }],
@@ -491,8 +649,55 @@ describe('guardrails: onOutput', () => {
       guardrails: { onOutput: () => ({ action: 'block' }) },
     });
     expect(bare.text).toBe('');
-    // Mirrors `assembleAssistant`: an empty answer carries no text part at all.
-    expect(bare.response.messages.at(-1)!.content).toEqual([]);
+    // An assistant turn with an EMPTY content array is not a valid message on
+    // any wire (Anthropic rejects it on replay), so a block that leaves nothing
+    // to say records no assistant turn at all.
+    expect(bare.response.messages).toEqual([]);
+  });
+
+  it('a block with no replacement leaves NO empty-content turn anywhere', async () => {
+    const chat = createInMemoryChatStore();
+    const store = createInMemorySessionStore();
+    const res = await generateText({
+      model: createMockModel({ responses: [{ text: 'unsafe answer' }] }),
+      messages: USER,
+      chat: { store: chat, chatId: 'c3', scope: { userId: 'u1', chatId: 'c3' } },
+      session: { store, runId: 'blocked-output' },
+      guardrails: { onOutput: () => ({ action: 'block' }) },
+    });
+
+    const empty = (m: Message): boolean => Array.isArray(m.content) && m.content.length === 0;
+    expect(res.response.messages.some(empty)).toBe(false);
+    expect((await chat.loadChat('c3'))!.messages.some(empty)).toBe(false);
+    expect((await store.load('blocked-output'))!.messages.some(empty)).toBe(false);
+    // The step still reports the run honestly: an answer that was refused.
+    expect(res.steps![0]!.text).toBe('');
+    expect(res.steps![0]!.response.messages).toEqual([]);
+  });
+
+  it('a block WITH a replacement keeps the reasoning parts of the turn', async () => {
+    const res = await generateText({
+      model: createMockModel({ responses: [{ text: 'unsafe answer' }] }),
+      messages: USER,
+      guardrails: { onOutput: () => ({ action: 'block', replacement: 'I cannot help.' }) },
+    });
+    expect(res.response.messages).toHaveLength(1);
+    expect(textOf(res.response.messages[0]!)).toBe('I cannot help.');
+  });
+
+  it('an onOutput verdict updates the SAME step’s StepResult', async () => {
+    const res = await generateText({
+      model: createMockModel({ responses: [{ text: 'my key is sk-live-42' }] }),
+      messages: USER,
+      guardrails: {
+        onOutput: (ctx) => ({ action: 'rewrite', text: ctx.text.replace(/sk-\S+/, '[redacted]') }),
+      },
+    });
+    expect(res.text).toBe('my key is [redacted]');
+    // An audit that walks `steps[]` must not see the text the guardrail removed.
+    expect(res.steps![0]!.text).toBe('my key is [redacted]');
+    expect(textOf(res.steps![0]!.response.messages[0]!)).toBe('my key is [redacted]');
+    expect(JSON.stringify(res.steps)).not.toContain('sk-live-42');
   });
 
   it('a later block short-circuits the guardrails after it', async () => {

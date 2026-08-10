@@ -585,6 +585,90 @@ describe('managed connection — reconnect', () => {
   });
 });
 
+// Every reconnect attempt builds a NEW client on a NEW transport, so the one it
+// replaces is unreachable the moment it lands. Nothing but this closes it, and a
+// transport is an OS resource: a socket on HTTP, a live CHILD PROCESS on stdio.
+describe('managed connection — a retired generation is closed', () => {
+  it('closes the client that dropped, instead of leaking its transport', async () => {
+    const clock = makeFakeClock();
+    const fakes = [makeFakeMcp(), makeFakeMcp()];
+    const managed = await createManagedConnection({
+      ...factories(fakes),
+      lifecycle: { clock, reconnect: { jitter: 0 } },
+    });
+
+    fakes[0]!.drop();
+    // Hung up on the drop VERDICT, not at the end of the backoff ladder: the
+    // resource is dead weight for the whole reconnect window otherwise.
+    expect(fakes[0]!.closeCalls).toBe(1);
+
+    await clock.fire();
+    expect(managed.raw()).toBe(fakes[1]!.client);
+    expect(fakes[0]!.closeCalls).toBe(1); // retired once, not once per road to it
+    expect(fakes[1]!.closeCalls).toBe(0);
+  });
+
+  it('closes a session the liveness probe declared dead — `onerror` closes nothing', async () => {
+    const clock = makeFakeClock();
+    const fakes = [makeFakeMcp(), makeFakeMcp()];
+    const managed = await createManagedConnection({
+      ...factories(fakes),
+      lifecycle: { clock, reconnect: { jitter: 0, initialDelayMs: 500 } },
+    });
+    fakes[0]!.pingRejects = true;
+
+    // The HTTP shape: the transport reports a dead socket and keeps its client
+    // open, so the old session survives the reconnect unless we close it.
+    fakes[0]!.transportError();
+    await settle();
+    expect(managed.status()).toBe('reconnecting');
+    expect(fakes[0]!.closeCalls).toBe(1);
+
+    await clock.fire();
+    expect(managed.raw()).toBe(fakes[1]!.client);
+    expect(fakes[1]!.closeCalls).toBe(0);
+  });
+
+  it('closes every generation exactly once across repeated drops', async () => {
+    const clock = makeFakeClock();
+    const fakes = [makeFakeMcp(), makeFakeMcp(), makeFakeMcp()];
+    const managed = await createManagedConnection({
+      ...factories(fakes),
+      lifecycle: { clock, reconnect: { jitter: 0 } },
+    });
+
+    fakes[0]!.drop();
+    await clock.fire();
+    fakes[1]!.drop();
+    await clock.fire();
+    expect(managed.raw()).toBe(fakes[2]!.client);
+    expect(fakes.map((f) => f.closeCalls)).toEqual([1, 1, 0]);
+
+    // close() covers the LIVE generation and re-closes none of the retired ones.
+    await managed.close();
+    expect(fakes.map((f) => f.closeCalls)).toEqual([1, 1, 1]);
+  });
+
+  it('leaves the client open on a drop with reconnect OFF — the caller still owns it', async () => {
+    const clock = makeFakeClock();
+    const fake = makeFakeMcp();
+    const managed = await createManagedConnection({
+      ...factories([fake]),
+      lifecycle: { clock },
+    });
+
+    fake.drop();
+    await settle();
+    expect(managed.status()).toBe('closed');
+    // Nothing replaces this session, so `raw()` and `close()` are still the
+    // caller's to use — retiring it here would take that away (1.x behavior).
+    expect(fake.closeCalls).toBe(0);
+
+    await managed.close();
+    expect(fake.closeCalls).toBe(1);
+  });
+});
+
 // The HTTP transport never calls `onclose`: a dead socket arrives as `onerror`
 // and its own event-stream retries. These pin the verdict rule that turns that
 // signal into a drop — the integration proof is in `mcp-http.test.ts`.

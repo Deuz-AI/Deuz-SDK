@@ -1,6 +1,6 @@
 # @deuz-sdk/core
 
-Pure, web-first, multi-provider TypeScript AI SDK — 29 provider factories across five wires — with **zero runtime dependencies** and a canonical streaming protocol of its own.
+Pure, web-first, multi-provider TypeScript AI SDK — 29 built-in provider ids across four chat wires — with **zero runtime dependencies** and a canonical streaming protocol of its own.
 
 ```bash
 npm i @deuz-sdk/core
@@ -32,24 +32,24 @@ for await (const text of result.textStream) process.stdout.write(text);
 
 ## Providers
 
-**29 built-in provider ids**, four chat wires, one call shape. A model descriptor is a plain `{ provider, modelId, surface }` value — factory settings ride a non-enumerable symbol, so keys never leak through `Object.keys` or `JSON.stringify`.
+**29 built-in provider ids**, four chat wires, one call shape. A *provider id* is the string a descriptor carries and the key that resolves an API key and a base URL; a *factory* is the function that mints descriptors for it. The two do not count the same — `createOpenAI` and `createOpenAIResponses` are two factories over the one id `openai`, and `createKimi` is an alias of `createMoonshot`. A model descriptor is a plain `{ provider, modelId, surface }` value — factory settings ride a non-enumerable symbol, so keys never leak through `Object.keys` or `JSON.stringify`.
 
 | Group | Provider ids | Subpath |
 | --- | --- | --- |
-| Dedicated factories (10) | `anthropic`, `openai`, `xai`, `google`, `vertex-anthropic`, `vertex-google`, `azure`, `bedrock`, `voyage`, `yunwu` | `/anthropic`, `/openai`, `/xai`, `/google`, `/vertex`, `/azure`, `/bedrock`, `/voyage`, `/yunwu` |
-| OpenAI-compat cloud hosts (17) | `groq`, `mistral`, `deepseek`, `together`, `openrouter`, `cerebras`, `fireworks`, `moonshot` (a.k.a. Kimi), `qwen`, `glm`, `minimax`, `perplexity`, `cohere`, `deepinfra`, `nvidia`, `sambanova`, `hyperbolic` | `/providers` |
-| Keyless local hosts (2) | `ollama`, `lmstudio` | `/providers` |
+| Dedicated (10 ids) | `anthropic`, `openai`, `xai`, `google`, `vertex-anthropic`, `vertex-google`, `azure`, `bedrock`, `voyage`, `yunwu` | `/anthropic`, `/openai`, `/xai`, `/google`, `/vertex`, `/azure`, `/bedrock`, `/voyage`, `/yunwu` |
+| OpenAI-compat cloud hosts (17 ids) | `groq`, `mistral`, `deepseek`, `together`, `openrouter`, `cerebras`, `fireworks`, `moonshot` (a.k.a. Kimi), `qwen`, `glm`, `minimax`, `perplexity`, `cohere`, `deepinfra`, `nvidia`, `sambanova`, `hyperbolic` | `/providers` |
+| Keyless local hosts (2 ids) | `ollama`, `lmstudio` | `/providers` |
 
-Which adapter each one uses:
+Which of the four chat wires each one speaks — the exhaustive `ModelSurface` → adapter switch:
 
-| Wire | Covers |
+| Wire (`surface`) | Covers |
 | --- | --- |
-| **Anthropic Messages** | Anthropic, Claude on Vertex |
-| **OpenAI Responses** | OpenAI (GPT-5.x reasoning + tools) |
-| **Gemini native** (`generateContent`) | Google Gemini, Gemini on Vertex — reasoning, thought signatures, caching, native PDF |
-| **OpenAI Chat Completions** | everything else, including Gemini-compat and Azure / Bedrock |
+| **Anthropic Messages** (`anthropic`) | Anthropic, Claude on Vertex |
+| **OpenAI Responses** (`responses`) | OpenAI (GPT-5.x reasoning + tools) |
+| **Gemini native** (`native`, `generateContent`) | Google Gemini, Gemini on Vertex — reasoning, thought signatures, caching, native PDF |
+| **OpenAI Chat Completions** (`chat_completions`) | everything else, including Gemini-compat and Azure / Bedrock |
 
-Embeddings ship for OpenAI, Google, Voyage and Yunwu; speech adds `openai` / `elevenlabs`, transcription adds `openai` / `deepgram`, each with its own model kind so a TTS model cannot reach `streamChat` by accident.
+Embeddings, images, speech, transcription and video are **separate model kinds** with their own surfaces and their own adapters — not chat wires, and none of them can be handed to `streamChat` by accident. Embeddings ship for OpenAI, Google, Voyage and Yunwu; speech adds `openai` / `elevenlabs`, transcription adds `openai` / `deepgram`, video any OpenAI-Videos-shaped relay.
 
 Ollama and LM Studio need **no API key** — they dial `localhost` and set the keyless escape for you. Any other OpenAI-shaped host gets a real provider id through `createOpenAICompatible({ id, baseURL })`, and `createProviderRegistry` resolves `'groq:llama-4-maverick'` strings.
 

@@ -634,6 +634,12 @@ export interface ClientConfig {
    * `createOpenAICompatible` id) and the modality providers
    * (`elevenlabs`, `deepgram`, …), which resolve their key through the SAME
    * chain and were previously unreachable from a `createClient` config.
+   *
+   * Chat/embedding calls pick these up through the client's own methods. The
+   * modality entry points are free functions on their own subpaths with no
+   * method here (a method would put their code in every `createClient`
+   * consumer's bundle), so they receive the table through `DeuzClient.bind`:
+   * `generateSpeech(client.bind({ model, text }))`.
    */
   apiKeys?: Partial<
     Record<'anthropic' | 'openai' | 'xai' | 'google' | 'azure' | 'bedrock', string>

@@ -56,6 +56,25 @@ export interface DeuzClient {
   ): StreamObjectResult<T>;
   embed: Embed;
   embedMany: EmbedMany;
+  /**
+   * Thread this client's `apiKeys`/`baseUrls`/`deps` onto the options of a free
+   * function this client has no method for — `generateSpeech`, `transcribe`,
+   * `generateVideo`, `generateImage`, `submitTask`, … Returns a COPY; the object
+   * you pass in is untouched.
+   *
+   * ```ts
+   * const client = createClient({ apiKeys: { elevenlabs: process.env.ELEVENLABS_API_KEY! } });
+   * await generateSpeech(client.bind({ model: elevenlabs('eleven_turbo_v2_5'), text, voice }));
+   * ```
+   *
+   * Those modules ALREADY read client-level keys as the lowest link of the G1
+   * chain — what they had no way to receive was the client context itself, which
+   * rides on a private Symbol that only this function attaches. They are not
+   * methods here on purpose: every one of them lives on its own subpath, and a
+   * method would pull the speech/transcription/video/image code into the bundle
+   * of everyone who imports `createClient`.
+   */
+  bind<O extends object>(options: O): O;
 }
 
 export function createClient(config: ClientConfig = {}): DeuzClient {
@@ -97,5 +116,6 @@ export function createClient(config: ClientConfig = {}): DeuzClient {
     ) => streamObject(withShared(options as GenerateObjectOptions<T>)),
     embed: (options) => embed(withShared(options)),
     embedMany: (options) => embedMany(withShared(options)),
+    bind: <O extends object>(options: O): O => withShared(options as O & { deps?: Dependencies }),
   };
 }

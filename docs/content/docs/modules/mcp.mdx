@@ -131,6 +131,12 @@ Keyed by the config's **structure**, so the same `{ url }` handed to a hundred r
 
 The in-flight **promise** is what is cached, so concurrent requests for a cold server share one connect instead of racing several. A failed connect is evicted (the next call retries rather than replaying a dead rejection), and so is an entry whose session has since gone `closed` / `error` — a pool that hands back a corpse is worse than no pool.
 
+<Callout type="warn">
+  Identity-based keys are why a **new object per request** is a leak: build the value once, at module scope. A config carrying a fresh elicitation handler on every call mints a fresh connection every call.
+
+  The pool bounds that rather than trusting it: `createMcpPool({ maxSize })` defaults to **32** entries and evicts the least recently used one, closing it. Pass a `logger` to hear about an eviction — a pool that churns is telling you a key varies per request.
+</Callout>
+
 ---
 
 ## createMcpClient

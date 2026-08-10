@@ -728,6 +728,247 @@ describe('handoff × durable resume', () => {
 });
 
 // ===================================================================
+// A transfer and a SUSPENSION issued in the same batch
+//
+// `decideHandoff` is the only producer of a transfer's tool_result. Both loops
+// can leave the step early (approval / client-tool break, sub-agent suspension),
+// and every one of those exits used to happen BEFORE the decision was made — so
+// the transfer's `tool_use` id went out unanswered and the routing decision was
+// silently dropped.
+// ===================================================================
+
+describe('handoff × a suspension in the SAME batch', () => {
+  const clientTool = (): Tool => ({ description: 'Ask the user.', parameters: NOTE_SCHEMA });
+
+  it('answers the transfer id and records the transfer when an approval suspends the batch', async () => {
+    const rec = recorder();
+    const triage = rec.model('triage-model', [
+      {
+        toolCalls: [
+          { toolName: 'transfer_to_billing', args: { reason: 'refund' }, id: 'h1' },
+          { toolName: 'deleteAccount', args: { note: 'bye' }, id: 'd1' },
+        ],
+      },
+    ]);
+    const billingModel = rec.model('billing-model', [{ text: 'unused on this leg' }]);
+    const store = createInMemorySessionStore();
+    const del = vi.fn(() => 'deleted');
+
+    const res = await generateText({
+      model: triage,
+      instructions: 'Root.',
+      messages: [{ role: 'user', content: 'go' }],
+      tools: {
+        ...handoff({ billing: { model: billingModel, instructions: 'Billing rules.' } }),
+        deleteAccount: { ...noteTool(del), needsApproval: true },
+      },
+      maxSteps: 5,
+      session: { store },
+    });
+
+    // The gated call is what the caller must answer — the transfer is not.
+    expect(res.pendingApprovals?.map((a) => a.toolCallId)).toEqual(['d1']);
+    expect(del).not.toHaveBeenCalled();
+    // The transfer's tool_use id IS answered, even though the batch suspended.
+    expect(calledIds(res.response.messages)).toEqual(['h1', 'd1']);
+    expect(answeredIds(res.response.messages)).toEqual(['h1']);
+    expect(toolResultText(res.response.messages, 'h1')).toBe("Transferred to 'billing'. refund");
+    expect(deuz(res.providerMetadata).handoffs).toEqual([
+      { to: 'billing', toolCallId: 'h1', reason: 'refund', stepIndex: 0 },
+    ]);
+
+    // The checkpoint carries the transfer: the answered id, the target's system
+    // turn, and the active-agent overlay a resume leg re-applies.
+    const checkpoint = (await store.load(res.runId!))!;
+    expect(checkpoint.status).toBe('suspended');
+    expect(checkpoint.handoff).toEqual({ to: 'billing', count: 1 });
+    expect(answeredIds(checkpoint.messages)).toEqual(['h1']);
+    expect(checkpoint.messages[0]).toEqual({ role: 'system', content: 'Billing rules.' });
+
+    // The resume leg runs as BILLING and still honours the human's verdict on
+    // the call the ROOT agent issued.
+    const rec2 = recorder();
+    const rootModel = rec2.model('triage-model-2', [{ text: 'root must not answer' }]);
+    const billing2 = rec2.model('billing-model-2', [{ text: 'Billing finished it.' }]);
+    const resumed = await resumeFromCheckpoint(store, res.runId!, {
+      model: rootModel,
+      tools: {
+        ...handoff({ billing: { model: billing2, instructions: 'Billing rules.' } }),
+        deleteAccount: { ...noteTool(del), needsApproval: true },
+      },
+      maxSteps: 5,
+      approvalResponses: [{ approvalId: 'd1', approved: true }],
+    });
+
+    expect(del).toHaveBeenCalledTimes(1);
+    expect(rec2.models()).toEqual(['billing-model-2']);
+    expect(systemOf(rec2.calls[0]!.body)).toBe('Billing rules.');
+    expect(resumed.text).toBe('Billing finished it.');
+  });
+
+  it('answers the transfer id when a CLIENT tool in the same batch breaks the loop', async () => {
+    const rec = recorder();
+    const triage = rec.model('triage-model', [
+      {
+        toolCalls: [
+          { toolName: 'transfer_to_billing', args: {}, id: 'h1' },
+          { toolName: 'askUser', args: { note: 'which invoice?' }, id: 'c1' },
+        ],
+      },
+    ]);
+    const billingModel = rec.model('billing-model', [{ text: 'unused' }]);
+
+    const res = await generateText({
+      model: triage,
+      messages: [{ role: 'user', content: 'go' }],
+      tools: {
+        ...handoff({ billing: { model: billingModel, instructions: 'Billing rules.' } }),
+        askUser: clientTool(),
+      },
+      maxSteps: 5,
+    });
+
+    // The caller owns `askUser`; the loop stopped after one model call.
+    expect(rec.models()).toEqual(['triage-model']);
+    expect(calledIds(res.response.messages)).toEqual(['h1', 'c1']);
+    // Without this the caller's next request carries an unanswered tool_use id
+    // (an Anthropic 400) and the routing decision is gone.
+    expect(answeredIds(res.response.messages)).toEqual(['h1']);
+    expect(toolResultText(res.response.messages, 'h1')).toBe("Transferred to 'billing'.");
+    expect(deuz(res.providerMetadata).handoffs).toEqual([
+      { to: 'billing', toolCallId: 'h1', stepIndex: 0 },
+    ]);
+  });
+
+  it('streaming: emits the transfer result + handoff part before suspending on an approval', async () => {
+    const rec = recorder();
+    const triage = rec.model('triage-model', [
+      {
+        toolCalls: [
+          { toolName: 'transfer_to_billing', args: { reason: 'refund' }, id: 'h1' },
+          { toolName: 'deleteAccount', args: { note: 'bye' }, id: 'd1' },
+        ],
+      },
+    ]);
+    const billingModel = rec.model('billing-model', [{ text: 'unused' }]);
+
+    const result = streamChat({
+      model: triage,
+      messages: [{ role: 'user', content: 'go' }],
+      tools: {
+        ...handoff({ billing: { model: billingModel, instructions: 'Billing rules.' } }),
+        deleteAccount: { ...noteTool(() => 'deleted'), needsApproval: true },
+      },
+      maxSteps: 5,
+    });
+    const parts = await collect(result.fullStream);
+
+    const results = parts.filter(
+      (p): p is Extract<StreamPart, { type: 'tool-result' }> => p.type === 'tool-result',
+    );
+    expect(results.map((r) => [r.toolCallId, r.output])).toEqual([
+      ['h1', "Transferred to 'billing'. refund"],
+    ]);
+    const types = parts.map((p) => p.type);
+    // The transfer is announced before the run parks on the approval request.
+    expect(types.indexOf('handoff')).toBeGreaterThan(-1);
+    expect(types.indexOf('handoff')).toBeLessThan(types.indexOf('tool-approval-request'));
+    const finish = parts.find(
+      (p): p is Extract<StreamPart, { type: 'finish' }> => p.type === 'finish',
+    )!;
+    expect(deuz(finish.providerMetadata).handoffs).toEqual([
+      { to: 'billing', toolCallId: 'h1', reason: 'refund', stepIndex: 0 },
+    ]);
+  });
+
+  it('recovers a checkpoint whose transfer was left unanswered (settle-side belt)', async () => {
+    // A history produced OUTSIDE the loop (or by a build that broke the batch
+    // before the transfer was decided): the transfer id has no tool_result.
+    const rec = recorder();
+    const billingModel = rec.model('billing-model', [{ text: 'Billing took over.' }]);
+    const rootModel = rec.model('triage-model', [{ text: 'root must not answer' }]);
+    const wire = vi.fn(() => 'sent');
+
+    const res = await generateText({
+      model: rootModel,
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'h1',
+              name: 'transfer_to_billing',
+              input: { reason: 'refund' },
+            },
+            { type: 'tool_use', id: 'w1', name: 'wire', input: { note: '1000' } },
+          ],
+        },
+      ],
+      tools: {
+        ...handoff({ billing: { model: billingModel, instructions: 'Billing rules.' } }),
+        wire: { ...noteTool(wire), needsApproval: true },
+      },
+      maxSteps: 5,
+      approvalResponses: [{ approvalId: 'w1', approved: true }],
+    });
+
+    expect(wire).toHaveBeenCalledTimes(1);
+    // The transfer was NOT executed (its `execute` throws by design) — it was
+    // decided, answered, and applied.
+    expect(toolResultText(res.response.messages, 'h1')).toBe("Transferred to 'billing'. refund");
+    expect(rec.models()).toEqual(['billing-model']);
+    expect(systemOf(rec.calls[0]!.body)).toBe('Billing rules.');
+    expect(deuz(res.providerMetadata).handoffs).toEqual([
+      { to: 'billing', toolCallId: 'h1', reason: 'refund', stepIndex: 0 },
+    ]);
+  });
+});
+
+// ===================================================================
+// Compaction follows the ACTIVE agent
+// ===================================================================
+
+describe('handoff × compaction', () => {
+  it('runs the summary side-call on the ACTIVE agent model after a transfer', async () => {
+    const rec = recorder();
+    const triage = rec.model('triage-model', [
+      { toolCalls: [{ toolName: 'transfer_to_alpha', args: {} }] },
+    ]);
+    // Two scripted turns: the compaction SUMMARY, then alpha's answer.
+    const alphaModel = rec.model('alpha-model', [{ text: 'notes' }, { text: 'Alpha done.' }]);
+
+    const history: Message[] = [
+      { role: 'user', content: 'Original task.' },
+      { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(400) }] },
+      { role: 'user', content: 'y'.repeat(400) },
+      { role: 'user', content: 'Current question.' },
+    ];
+
+    const res = await generateText({
+      model: triage,
+      messages: history,
+      tools: handoff({ alpha: { model: alphaModel, instructions: 'Alpha.' } }),
+      // Threshold 1 never trips on its own; only the step-2 pass below matters,
+      // so the run compacts exactly once — after the transfer.
+      compaction: { threshold: 0.000_001, layers: ['summarize'], keepRecentSteps: 1 },
+      maxSteps: 4,
+    });
+
+    expect(res.text).toBe('Alpha done.');
+    // Nothing is unprotected before the transfer, so the first pass compacts
+    // nothing. The pass before step 2 does — and it summarizes on ALPHA's model,
+    // because the summarizer is whoever is DRIVING, not whoever started the run.
+    expect(rec.models()).toEqual([
+      'triage-model', // step 1 — the transfer
+      'alpha-model', // compaction summary, ACTIVE agent
+      'alpha-model', // step 2
+    ]);
+  });
+});
+
+// ===================================================================
 // Composition risk flagged by the plan: handoff × memory recall
 // ===================================================================
 

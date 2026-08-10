@@ -19,7 +19,11 @@
  *   client = await createMcpClient({ transport, auth });   // tokens on disk? straight through
  * } catch (err) {
  *   if (!(err instanceof McpAuthorizationRequiredError)) throw err;
- *   showTheUser(err.authorizationUrl);                     // the HOST decides how
+ *   // The listener only accepts a redirect that echoes ITS state back, so the
+ *   // authorization request has to carry it. The host owns the final URL.
+ *   const authorize = new URL(err.authorizationUrl);
+ *   if (loopback.state) authorize.searchParams.set('state', loopback.state);
+ *   showTheUser(authorize.toString());                     // the HOST decides how
  *   const authorizationCode = await loopback.waitForCode();
  *   client = await createMcpClient({ transport, auth, authorizationCode });
  * } finally {
@@ -62,6 +66,16 @@ interface NodeHttpServer {
 }
 interface NodeHttp {
   createServer(handler: (req: NodeHttpRequest, res: NodeHttpResponse) => void): NodeHttpServer;
+}
+
+interface NodeHash {
+  update(data: string, encoding: string): NodeHash;
+  digest(): Uint8Array;
+}
+interface NodeCrypto {
+  randomBytes(size: number): { toString(encoding: string): string };
+  createHash(algorithm: string): NodeHash;
+  timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean;
 }
 
 async function loadFs(): Promise<NodeFs> {
@@ -179,11 +193,29 @@ export interface LoopbackRedirectOptions {
   path?: string;
   /** How long to wait for the redirect. Default 300_000 (5 minutes). */
   timeoutMs?: number;
+  /**
+   * The OAuth `state` this listener demands back. Default: a fresh 256-bit
+   * random value — put it in the authorization request (see the module example)
+   * and only that request's redirect is accepted.
+   *
+   * Pass a string to reuse a value you already minted. Pass `false` ONLY when
+   * the authorization request genuinely cannot carry `state`: without the echo
+   * the listener answers ANY caller, and a local process — or any page open in
+   * the user's browser — can then hand it an authorization code of its own
+   * (RFC 6819 §4.4.1.5 code injection).
+   */
+  state?: string | false;
 }
 
 export interface LoopbackRedirect {
   /** Pass this as `McpOAuthOptions.redirectUri`. */
   readonly redirectUri: string;
+  /**
+   * The `state` a redirect must echo for this listener to accept it — put it in
+   * the authorization request. `undefined` only when checking was turned off
+   * with `state: false`.
+   */
+  readonly state: string | undefined;
   /** The `?code=` from the redirect. Rejects on `?error=`, or when the wait times out. */
   waitForCode(): Promise<string>;
   /** Stop listening. Idempotent; safe to call from a `finally`. */
@@ -201,8 +233,16 @@ const REDIRECT_PAGE = (heading: string, detail: string): string =>
  *
  * 127.0.0.1 rather than `localhost`: the name can resolve to `::1` first, and an
  * authorization server that registered the IPv4 literal would then redirect
- * somewhere nothing is listening. The timer starts at CREATION, not at
- * `waitForCode()`, because the redirect URI is live the moment this resolves.
+ * somewhere nothing is listening. It is also the BIND address, never 0.0.0.0 —
+ * a listener on the wildcard would take an authorization code off the LAN.
+ * The timer starts at CREATION, not at `waitForCode()`, because the redirect
+ * URI is live the moment this resolves.
+ *
+ * Anything on this machine can reach a loopback port, so the port alone proves
+ * nothing about who is calling: the redirect must ALSO echo the `state` minted
+ * here, compared in constant time. A request that does not is answered 400 and
+ * otherwise IGNORED — it must not be able to end the wait a real redirect is
+ * still coming for.
  */
 export async function createLoopbackRedirect(
   options: LoopbackRedirectOptions = {},
@@ -210,6 +250,22 @@ export async function createLoopbackRedirect(
   const path = options.path ?? '/callback';
   const timeoutMs = options.timeoutMs ?? 300_000;
   const http = (await import('node:http' as string)) as unknown as NodeHttp;
+  const nodeCrypto = (await import('node:crypto' as string)) as unknown as NodeCrypto;
+
+  // 256 bits, base64url so it survives a query string untouched.
+  const expectedState =
+    options.state === false
+      ? undefined
+      : (options.state ?? nodeCrypto.randomBytes(32).toString('base64url'));
+  // Hash both sides first: `timingSafeEqual` throws on a length mismatch, and
+  // the digest makes every comparison the same fixed width.
+  const stateMatches = (received: string | null): boolean => {
+    if (expectedState === undefined) return true;
+    if (received === null) return false;
+    const digest = (value: string): Uint8Array =>
+      nodeCrypto.createHash('sha256').update(value, 'utf8').digest();
+    return nodeCrypto.timingSafeEqual(digest(received), digest(expectedState));
+  };
 
   let settle: ((code: string) => void) | undefined;
   let fail: ((err: Error) => void) | undefined;
@@ -227,6 +283,18 @@ export async function createLoopbackRedirect(
     if (url.pathname !== path) {
       res.writeHead(404, { 'content-type': 'text/plain', connection: 'close' });
       res.end('Not found');
+      return;
+    }
+    // Wrong/absent state → refuse the REQUEST, not the flow: a forged call must
+    // not be able to fail the wait the real redirect is still on its way to.
+    if (!stateMatches(url.searchParams.get('state'))) {
+      res.writeHead(400, { 'content-type': 'text/html; charset=utf-8', connection: 'close' });
+      res.end(
+        REDIRECT_PAGE(
+          'Authorization rejected',
+          'This redirect did not come from the request that started here. You can close this window.',
+        ),
+      );
       return;
     }
     const received = url.searchParams.get('code');
@@ -309,6 +377,7 @@ export async function createLoopbackRedirect(
 
   return {
     redirectUri,
+    state: expectedState,
     waitForCode: () => code,
     close() {
       // An explicit close is a HARD stop — nothing is waiting on that page any

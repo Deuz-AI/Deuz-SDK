@@ -3,7 +3,7 @@ title: What is new in 2.0
 description: The full 2.0 surface — persistent stores, guardrails, handoffs, zero-config MCP with OAuth, three new modalities — and the limits stated plainly.
 ---
 
-2.0 is the release where the things you had to build yourself became things you configure. Nine new subpaths, three new modalities, real databases behind the four storage seams, guardrails and handoffs in the loop, and MCP that connects itself.
+2.0 is the release where the things you had to build yourself became things you configure. Eight new subpaths, three new modalities, real databases behind the four storage seams, guardrails and handoffs in the loop, and MCP that connects itself.
 
 Everything is **additive**. No existing type gained a required field, every 1.9 call still compiles, and every stored checkpoint still loads. The two behaviours that changed are stated in [Behaviour changes](#behaviour-changes) — both make a previously-dead run recover instead.
 
@@ -22,7 +22,9 @@ What is **not** in the box is at the bottom, and it is a real list: [Known limit
 | `@deuz-sdk/core/stores/postgres` | `createPostgresStores` — four seams, optional pgvector. |
 | `@deuz-sdk/core/mcp/node` | `createFileTokenStore`, `createLoopbackRedirect` — the Node half of an MCP OAuth flow. |
 
-Plus new root exports: `handoff`, `compactMessages`, `promptInjectionGuardrail`, `maxOutputLength`, `McpAuthorizationRequiredError`, `ContextOverflowError`.
+That is eight — count them off `package.json`'s `exports`, which goes from 46 keys in 1.9 to 54 in 2.0 (the root `.`, 52 deep subpaths, and `./package.json`).
+
+Plus new root exports: `handoff`, `compactMessages`, `promptInjectionGuardrail`, `maxOutputLength`, `McpAuthorizationRequiredError`. `ContextOverflowError` is **not** among them — it has shipped from the root since 1.9, together with the `chat_completions` mapping that produces it. What 2.0 adds is the `anthropic` mapping and the loop's recovery from the error; see [Behaviour changes](#behaviour-changes).
 
 ## 1. Persistence you can point at a database
 
@@ -125,7 +127,7 @@ Everything the recall path was missing:
 
 ## 8. Eight more providers, two of them keyless
 
-`@deuz-sdk/core/providers` gained **Perplexity, Cohere, DeepInfra, NVIDIA NIM, SambaNova, Hyperbolic** (cloud) and **Ollama, LM Studio** (local, keyless). That is 29 provider factories in total.
+`@deuz-sdk/core/providers` gained **Perplexity, Cohere, DeepInfra, NVIDIA NIM, SambaNova, Hyperbolic** (cloud) and **Ollama, LM Studio** (local, keyless). That takes the package from 21 to **29 built-in provider ids** — 10 with a dedicated factory subpath, 19 on `/providers`. (Ids, not factory functions: `createOpenAI` / `createOpenAIResponses` are two factories over the one id `openai`, and `createKimi` aliases `createMoonshot`.)
 
 The keyless pair set `apiKeyOptional`, which changes exactly one thing: when the whole key-precedence chain comes up empty, the resolver substitutes a placeholder bearer token instead of throwing. A real key from any link still wins, so the escape can never shadow a key you supplied. Opt in for your own self-hosted host with `createOpenAICompatible({ id, baseURL, apiKeyOptional: true })`.
 
@@ -147,7 +149,7 @@ It exists so request-scoped facts travel with the **call** instead of being capt
 
 Two, and both turn a previously-dead run into a recovering one.
 
-**1. A context-overflow rejection is recovered, not fatal.** On the `anthropic` and `chat_completions` wires an over-long request now maps to `ContextOverflowError`, and the loop force-compacts and retries the step once — even with no `compaction` option set. Before 2.0 it ended the run. If you were catching a generic `InvalidRequestError` around that case, you will now see the run succeed instead.
+**1. A context-overflow rejection is recovered, not fatal.** `ContextOverflowError` and the `chat_completions` mapping that produces it both shipped in 1.9; what changed is that the **loop now acts on it**, force-compacting and retrying the step once — even with no `compaction` option set. Before 2.0 the error ended the run. 2.0 also teaches the `anthropic` adapter the same signal (HTTP `413`, or a `400` whose *message* matches). If you were catching a generic `InvalidRequestError` around that case, you will now see the run succeed instead.
 
 **2. An HTTP MCP session that dies is now noticed.** `StreamableHTTPClientTransport` never calls `onclose` when its socket dies; it reports through `onerror` and quietly retries its own event stream. So before 2.0 a dead HTTP session kept reporting `connected`, and `reconnect: true` did nothing unless `keepAliveMs` was also set. Now a transport error on a live session triggers **one `ping()`**, and only a failed ping counts as a drop — an unparseable SSE frame or one failed event-stream retry does not tear a healthy connection down.
 
@@ -157,7 +159,7 @@ New stream parts: `handoff` and `guardrail`. `StreamPart` is an open union by co
 
 Stated here so you do not discover them at runtime.
 
-- **Overflow recovery only fires on two wires.** `ContextOverflowError` is mapped by the `anthropic` adapter (HTTP 413, or a 400 whose *message* matches — Anthropic ships no machine-readable code) and by the `chat_completions` adapter (`context_length_exceeded`). On the **`responses`** and **`native` (Gemini)** wires an over-long request is still a generic error and the run ends. Set `compaction` explicitly there; the threshold path does not depend on error mapping.
+- **Overflow recovery does not reach the Gemini native wire.** `ContextOverflowError` is mapped by the `anthropic` adapter (HTTP 413, or a 400 whose *message* matches — Anthropic ships no machine-readable code), by the `chat_completions` adapter (`context_length_exceeded`), and by the `responses` adapter, whose `mapError` delegates to the `chat_completions` one. On the **`native` (Gemini)** wire an over-long request is still a generic error and the run ends. Set `compaction` explicitly there; the threshold path does not depend on error mapping.
 - **The Redis pack has no `MULTI`.** A write is a sequence of independent commands, so a crash mid-write can leave an id in an index whose record does not exist. Every reader is built to tolerate exactly that (a `null` row is skipped, `delete` and the sweeper clear leftovers as they pass), so an orphan costs a wasted scan slot and never a wrong answer — but it is not a transaction, and pipelining it is a 2.x item.
 - **The Redis pack has no `RunStore`.** `list({ status })` is a scan, and a scan is what this key layout is worst at. Use SQLite or Postgres for a run dashboard.
 - **Redis memory search is client-side.** It narrows by scope index, pulls the scope with one `mGet` and ranks in your process — O(records in scope), moved over the wire. Keep scopes narrow; reach for Postgres past a few thousand records per scope.

@@ -24,7 +24,12 @@ import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
 import { generateText, streamChat, generateObject } from '../src/index';
 import { createAnthropic } from '../src/anthropic';
 import { createMcpClient } from '../src/mcp/index';
-import { createMcpPool, resolveMcpForLoop, type McpConnectionPool } from '../src/mcp/resolve';
+import {
+  createMcpPool,
+  resolveMcpForLoop,
+  type McpConnectionPool,
+  type McpPoolOptions,
+} from '../src/mcp/resolve';
 import type { McpClient } from '../src/mcp/shared';
 import type { Logger } from '../src/types/deps';
 import type { JSONSchema } from '../src/types/schema';
@@ -84,8 +89,8 @@ async function connect(url: string): Promise<McpClient> {
   return client;
 }
 
-function pooled(): McpConnectionPool {
-  const pool = createMcpPool();
+function pooled(options: McpPoolOptions = {}): McpConnectionPool {
+  const pool = createMcpPool(options);
   pools.push(pool);
   return pool;
 }
@@ -734,6 +739,104 @@ describe('deps.mcpPool', () => {
     await pool.close();
     expect(a.status()).toBe('closed');
   }, 30_000);
+
+  // `sessionCount()` is the handshake ledger: the SDK client's close() aborts its
+  // sockets without sending the DELETE that would retire the session id, so a
+  // session the pool abandoned still shows up. That is exactly what makes it able
+  // to see a connection nobody holds a handle to any more.
+
+  it('shares ONE connect between concurrent acquires of a cold server', async () => {
+    const server = await startServer();
+    const pool = pooled();
+
+    const [a, b] = await Promise.all([
+      pool.acquire({ url: server.url }),
+      pool.acquire({ url: server.url }),
+    ]);
+
+    expect(b).toBe(a);
+    expect(server.sessionCount()).toBe(1);
+  }, 20_000);
+
+  it('two acquires racing on a DEAD entry open ONE replacement, not one each', async () => {
+    const server = await startServer();
+    const pool = pooled();
+
+    const dead = await pool.acquire({ url: server.url });
+    await dead.close();
+    expect(dead.status()).toBe('closed');
+
+    const [a, b] = await Promise.all([
+      pool.acquire({ url: server.url }),
+      pool.acquire({ url: server.url }),
+    ]);
+
+    expect(a).toBe(b);
+    expect(a.status()).toBe('connected');
+    // The corpse plus ONE replacement. Both callers used to evict the same dead
+    // entry and connect their own: the loser's client was overwritten in the map
+    // milliseconds later, leaving a live session with no handle to close it.
+    expect(server.sessionCount()).toBe(2);
+  }, 20_000);
+
+  it('keys on the connection: a different namespace shares, a different url does not', async () => {
+    const one = await startServer();
+    const two = await startServer();
+    const pool = pooled();
+
+    const a = await pool.acquire({ url: one.url, namespace: 'a' });
+    const b = await pool.acquire({ url: one.url, namespace: 'b' });
+    const c = await pool.acquire({ url: two.url });
+
+    expect(b).toBe(a);
+    expect(c).not.toBe(a);
+    expect(one.sessionCount()).toBe(1);
+    expect(two.sessionCount()).toBe(1);
+  }, 20_000);
+
+  it('evicts and CLOSES the least recently used connection at maxSize', async () => {
+    const one = await startServer();
+    const two = await startServer();
+    const three = await startServer();
+    const pool = pooled({ maxSize: 2 });
+
+    const a = await pool.acquire({ url: one.url });
+    const b = await pool.acquire({ url: two.url });
+    await pool.acquire({ url: one.url }); // touched again → `two` is now the oldest
+    const c = await pool.acquire({ url: three.url });
+
+    // Evicted AND closed: dropping the entry alone would leak the session, which
+    // is the whole failure an unbounded pool was made of. `status()` is how a
+    // holder of the evicted client finds out, so it is what this asserts.
+    await waitFor(() => b.status() === 'closed', 'the evicted connection to be closed');
+    expect(a.status()).toBe('connected');
+    expect(c.status()).toBe('connected');
+    expect(await pool.acquire({ url: one.url })).toBe(a); // survived, and still pooled
+    expect(one.sessionCount()).toBe(1);
+  }, 30_000);
+
+  it('warns that a per-request handler cannot be pooled, and bounds what it costs', async () => {
+    const server = await startServer();
+    const { logger, warns } = captureLogger();
+    const pool = pooled({ maxSize: 1, logger });
+
+    // A closure rebuilt per request can only be keyed by its identity, so it
+    // MISSES every time — the shape that used to add a live connection per
+    // request, forever, with nothing left holding a reference to close it.
+    const first = await pool.acquire({
+      url: server.url,
+      onElicitationRequest: () => ({ action: 'decline' }),
+    });
+    const second = await pool.acquire({
+      url: server.url,
+      onElicitationRequest: () => ({ action: 'decline' }),
+    });
+
+    expect(second).not.toBe(first);
+    expect(warns.some((w) => w.includes('identity-keyed'))).toBe(true);
+    await waitFor(() => first.status() === 'closed', 'the overflowing connection to be closed');
+    expect(second.status()).toBe('connected');
+  }, 20_000);
 });
 
 describe('structured output refuses options.mcp', () => {
