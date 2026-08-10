@@ -91,6 +91,16 @@ async function connect(
   const client = new Client({ name: 'harness-selftest', version: '0.0.0' }, { capabilities });
   clients.push(client);
 
+  // A transport error here is EXPECTED, not a failure: `restart()` kills the
+  // listener under a live client, and the standalone GET stream it opened dies
+  // with it (undici reports `UND_ERR_SOCKET`). Without a handler that rejection
+  // is unhandled, and vitest charges it to whichever test happens to be running
+  // — which is how this file went red on CI while passing locally, since the
+  // timing of the dying stream decides whether it lands inside the test or after
+  // it. Our own `createMcpClient` already registers one; only this raw SDK
+  // client did not.
+  client.onerror = () => {};
+
   const toolListChanges: number[] = [];
   client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
     toolListChanges.push(toolListChanges.length + 1);
@@ -232,6 +242,10 @@ describe('startTestMcpServer — a real streamable-HTTP MCP server', () => {
     // The old session id is gone: the server answers 404, which is the client's
     // cue to re-initialize rather than retry blindly.
     await expect(before.client.listTools()).rejects.toThrow();
+    // Hang the corpse up here rather than in afterEach: its GET stream is
+    // already broken, and leaving it open lets the socket error surface during
+    // the NEXT test instead of this one.
+    await before.client.close().catch(() => {});
 
     const after = await connect(server.url);
     expect((await after.client.listTools()).tools.map((t) => t.name)).toEqual([
