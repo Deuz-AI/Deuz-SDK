@@ -401,7 +401,15 @@ export async function startTestMcpServer(
     httpServer.on('connection', (socket: Socket) => {
       sockets.add(socket);
       socket.on('close', () => sockets.delete(socket));
+      // A socket dying under this harness is ORDINARY: `restart()` destroys them
+      // on purpose, and a client that aborts an in-flight SSE stream resets its
+      // end. Without a listener, that ECONNRESET is an uncaught exception, and
+      // Node charges it to whatever is running — which made an unrelated test go
+      // red on Linux while passing on Windows, purely on timing.
+      socket.on('error', () => {});
     });
+    // Same reasoning for a request that never becomes a well-formed one.
+    httpServer.on('clientError', (_error, socket: Socket) => socket.destroy());
     await new Promise<void>((resolve, reject) => {
       httpServer.once('error', reject);
       httpServer.listen(desiredPort, '127.0.0.1', () => {

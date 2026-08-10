@@ -83,7 +83,11 @@ interface ConnectOptions {
 async function connect(
   url: string,
   opts: ConnectOptions = {},
-): Promise<{ client: Client; toolListChanges: number[] }> {
+): Promise<{
+  client: Client;
+  toolListChanges: number[];
+  transport: StreamableHTTPClientTransport;
+}> {
   const capabilities: Record<string, unknown> = {};
   if (opts.roots) capabilities.roots = {};
   if (opts.onSampling) capabilities.sampling = {};
@@ -91,14 +95,10 @@ async function connect(
   const client = new Client({ name: 'harness-selftest', version: '0.0.0' }, { capabilities });
   clients.push(client);
 
-  // A transport error here is EXPECTED, not a failure: `restart()` kills the
-  // listener under a live client, and the standalone GET stream it opened dies
-  // with it (undici reports `UND_ERR_SOCKET`). Without a handler that rejection
-  // is unhandled, and vitest charges it to whichever test happens to be running
-  // — which is how this file went red on CI while passing locally, since the
-  // timing of the dying stream decides whether it lands inside the test or after
-  // it. Our own `createMcpClient` already registers one; only this raw SDK
-  // client did not.
+  // The SDK rethrows transport errors AND routes them here. A test that kills a
+  // server under a live client produces them by design, so swallow them rather
+  // than let one escape as an unhandled rejection. Our own `createMcpClient`
+  // registers the same handler for the same reason.
   client.onerror = () => {};
 
   const toolListChanges: number[] = [];
@@ -130,7 +130,26 @@ async function connect(
     opts.headers ? { requestInit: { headers: opts.headers } } : undefined,
   );
   await client.connect(transport);
-  return { client, toolListChanges };
+  return { client, toolListChanges, transport };
+}
+
+/**
+ * `fetch`, retried once on a socket-level failure.
+ *
+ * `restart()` listens again on the SAME origin, and undici pools connections per
+ * origin. The entry from before the bounce points at a socket the server has
+ * destroyed, and undici only learns that by trying it — so the first request
+ * after a restart can fail with ECONNRESET before a single byte is written. The
+ * retry dials a fresh socket, which is what any real client does. Failing here
+ * would be asserting that undici notices a dead peer before using it, which it
+ * does not promise and which has nothing to do with the harness.
+ */
+async function fetchAfterBounce(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch {
+    return await fetch(url, init);
+  }
 }
 
 /** Poll until `pred` holds; fixtures push over SSE, so there is nothing to await. */
@@ -231,6 +250,17 @@ describe('startTestMcpServer — a real streamable-HTTP MCP server', () => {
     const before = await connect(server.url);
     await before.client.listTools();
     expect(server.sessionCount()).toBe(1);
+    const staleSession = before.transport.sessionId;
+    expect(staleSession).toBeTruthy();
+
+    // Close the client BEFORE the bounce. Leaving a live one across `restart()`
+    // does not test anything extra: the transport auto-reconnects its standalone
+    // SSE stream on a schedule of its own, and when the listener dies under it
+    // that retry rejects from inside the SDK, with no caller to receive it. It
+    // reaches vitest as an unhandled rejection charged to whichever test is
+    // running — which is exactly how this test failed on Linux while passing on
+    // Windows, where the retry landed after the run instead of during it.
+    await before.client.close();
 
     const port = server.port;
     const url = server.url;
@@ -239,13 +269,22 @@ describe('startTestMcpServer — a real streamable-HTTP MCP server', () => {
     expect(server.port).toBe(port);
     expect(server.url).toBe(url);
     expect(server.sessionCount()).toBe(0);
-    // The old session id is gone: the server answers 404, which is the client's
-    // cue to re-initialize rather than retry blindly.
-    await expect(before.client.listTools()).rejects.toThrow();
-    // Hang the corpse up here rather than in afterEach: its GET stream is
-    // already broken, and leaving it open lets the socket error surface during
-    // the NEXT test instead of this one.
-    await before.client.close().catch(() => {});
+
+    // The claim "sessions are forgotten" is asserted directly, with a bare fetch
+    // carrying the dead id — no transport, no retry timer, nothing that can fail
+    // later and blame another test. 404 is what tells a real client to
+    // re-initialize instead of retrying blindly.
+    const stale = await fetchAfterBounce(server.url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-session-id': staleSession!,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    expect(stale.status).toBe(404);
+    await stale.body?.cancel();
 
     const after = await connect(server.url);
     expect((await after.client.listTools()).tools.map((t) => t.name)).toEqual([
