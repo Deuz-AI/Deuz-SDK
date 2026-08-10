@@ -3,7 +3,7 @@ title: streamChat
 description: The primary streaming entry point — canonical delta stream, lazy pump, never throws synchronously.
 ---
 
-`streamChat` is the canonical streaming call. You give it a model and messages; it returns a `StreamChatResult` **synchronously** with a `textStream`, a canonical `fullStream` of `StreamPart` deltas, and `usage` / `finishReason` promises. The network pump starts lazily on first access of any output, so the call itself does no I/O and never throws. Reach for it whenever you want token-by-token output; use [generateText](/docs/core/generate-text) for a single buffered result.
+`streamChat` is the canonical streaming call. You give it a model and messages; it hands you a `StreamChatResult` **synchronously**, with a `textStream`, a canonical `fullStream` of `StreamPart` deltas, and `usage` / `finishReason` promises. The network pump starts lazily on first access of any output, so the call itself does no I/O and never throws.
 
 ```ts title="basic.ts"
 import { streamChat } from '@deuz-sdk/core';
@@ -23,6 +23,15 @@ for await (const chunk of result.textStream) {
 console.log('\n', await result.usage);
 ```
 
+## When to use it
+
+Use `streamChat` whenever a human is waiting for the answer, or whenever you want to observe the run as it happens — tool calls, reasoning, cost, approvals, guardrail verdicts. Use [`generateText`](/docs/core/generate-text) when nothing is watching and you just want the final object in one `await`.
+
+Two things are genuinely easier here than in the buffered call, and they are the reason to prefer it in a web app:
+
+- **Partial output survives failure.** Everything already emitted stays emitted; the failure arrives as one more part.
+- **You can start writing bytes to the client immediately**, which is what keeps a serverless response inside its budget.
+
 ## Signature
 
 ```ts
@@ -31,43 +40,45 @@ function streamChat(options: StreamChatOptions): StreamChatResult;
 
 `StreamChatOptions` is an alias of `CommonCallOptions` — the same option bag every call shares. With a non-empty `tools` map, `streamChat` runs the streaming agentic loop ([Tool Loop](/docs/agents/tool-loop)) and `fullStream` spans multiple steps; without tools it is a single-turn stream.
 
+<Callout type="warn" title="`maxSteps` defaults to 1">
+Adding `tools` is not enough to get a multi-step agent. The step budget defaults to `1`, so the model calls a tool, the loop runs it, and the stream ends before the model ever writes an answer. Set `maxSteps` above 1 for real tool use. The default is conservative on purpose — a step budget is a spend budget.
+</Callout>
+
 ## Options
 
-| Option | Type | Default | Notes |
+| Option | Type | Default | When you want it |
 | --- | --- | --- | --- |
-| `model` | `LanguageModel` | — | Required. A descriptor from a provider factory, e.g. `createAnthropic(...)('claude-opus-4-8')`. |
-| `messages` | `Message[]` | — | Canonical messages. Required unless you pass `prompt` instead — the two are mutually exclusive. |
-| `prompt` | `string` | — | 1.9. Shorthand for exactly one user turn. See [Prompts](/docs/core/prompts-and-timeouts). |
-| `instructions` | `string` | — | 1.9. The system prompt, placed first; a `system` message already in `messages` is preserved after it. |
-| `signal` | `AbortSignal` | — | Cancellation, propagated to the underlying fetch. See [Abort](#abort). |
+| `model` | `LanguageModel` | — | Always. A descriptor from a provider factory, e.g. `createAnthropic(...)('claude-opus-4-8')`. |
+| `messages` | `Message[]` | — | Canonical messages. Required unless you pass `prompt` — the two are mutually exclusive. |
+| `prompt` | `string` | — | 1.9. One-shot calls. Shorthand for exactly one user turn. See [Prompts](/docs/core/prompts-and-timeouts). |
+| `instructions` | `string` | — | 1.9. The system prompt, placed first and kept structurally apart from history — a `system` message already in `messages` is preserved after it, so untrusted history cannot overwrite your framing. |
+| `signal` | `AbortSignal` | — | The user can cancel. Propagated to the underlying fetch and to tool `execute`. See [Abort](#abort). |
 | `abortSignal` | `AbortSignal` | — | 1.9, **deprecated** alias for `signal` (migration ergonomics). `signal` wins if both are set. |
-| `maxRetries` | `number` | `2` | Pre-first-byte retry budget. See [Retries](#retries). |
-| `timeout` | `number \| { ttftMs?, totalMs?, stepMs?, toolMs? }` | ttft 60s / total 300s | 1.9. A bare number is `{ totalMs }`; an explicit `0` disables a layer. See [Timeouts](/docs/core/prompts-and-timeouts#timeout). |
-| `capabilities` | `Partial<ModelCapabilities>` | — | 1.9. Shallow-merged over the model's registry row. See [capabilities](/docs/core/prompts-and-timeouts#capabilities). |
-| `headers` | `Record<string, string>` | — | Extra request headers, merged into the wire request. |
-| `deps` | `Dependencies` | in-memory defaults | Per-call infrastructure seam (`fetch`, `clock`, `logger`, `generateId`, …). |
-| `onUsage` | `(usage: Usage, meta: UsageMeta) => void` | — | Fired once with final usage. `meta.reason` is `'finished'`, `'aborted'`, or `'error'`; `meta.ttftMs` is time-to-first-token. |
-| `onFinish` | `(meta: FinishMeta) => void` | — | Fired on successful completion with `{ model, finishReason }`. |
-| `temperature` | `number` | — | Sampling temperature. |
-| `maxOutputTokens` | `number` | — | Cap on generated tokens. |
-| `topP` | `number` | — | Nucleus sampling. |
-| `stopSequences` | `string[]` | — | Stop strings. |
-| `effort` | `'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'` | — | Canonical reasoning effort; each adapter maps it to its own unit. `'xhigh'` (Anthropic 4.7+/OpenAI) and `'max'` (Anthropic 5.x) clamp down on wires that lack them. |
-| `responseFormat` | `'text' \| 'json'` | `'text'` | Free-form text vs. JSON mode. For schema-validated output use [generateObject](/docs/core/generate-object). |
-| `providerOptions` | `{ [provider]: Record<string, unknown> }` | — | Per-provider escape hatch, keyed by the model's provider name (e.g. `{ openai: { service_tier: 'flex' } }`, `{ google: { cachedContent } }`). Shallow top-level request-body fields merged into the wire; canonical fields the adapter sets always win. |
-| `promptCaching` | `'auto' \| 'auto-1h'` | — | One-flag prompt caching, effective only on Anthropic caching-capable models (other providers cache implicitly and ignore it). `'auto-1h'` uses the 1-hour TTL. |
+| `maxRetries` | `number` | `2` | Flaky upstream. Pre-first-byte only. See [Retries](#retries). |
+| `timeout` | `number \| { ttftMs?, totalMs?, stepMs?, toolMs? }` | ttft 60s / total 300s | Your platform budget is tighter than the SDK defaults. A bare number is `{ totalMs }`; an explicit `0` disables a layer. See [Timeouts](/docs/core/prompts-and-timeouts#timeout). |
+| `capabilities` | `Partial<ModelCapabilities>` | — | 1.9. The registry does not know your slug yet and its conservative fallback (notably `maxOutput: 4096`) is truncating you. |
+| `headers` | `Record<string, string>` | — | A gateway needs a custom header. |
+| `deps` | `Dependencies` | in-memory defaults | Tests, custom `fetch`, tracing, pricing, a shared circuit breaker. See [Dependencies](/docs/core/dependencies). |
+| `onUsage` | `(usage: Usage, meta: UsageMeta) => void` | — | Per-model-call metering. `meta.reason` is `'finished'`, `'aborted'`, or `'error'`; `meta.ttftMs` is time-to-first-token. |
+| `onFinish` | `(meta: FinishMeta) => void` | — | Once per run, on success, with `{ model, finishReason }`. |
+| `temperature` / `topP` | `number` | — | Sampling. Both are **dropped with a `warning`** on reasoning models that reject them. |
+| `maxOutputTokens` | `number` | — | Hard cap on generated tokens. Watch for `finishReason: 'length'`. |
+| `stopSequences` | `string[]` | — | Hard stop strings. |
+| `effort` | `'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'` | — | Reasoning models. Canonical across wires; `'xhigh'` (Anthropic 4.7+/OpenAI) and `'max'` (Anthropic 5.x) clamp down where the wire lacks them. |
+| `responseFormat` | `'text' \| 'json'` | `'text'` | You want JSON-shaped text. It is **not** validated — for that use [generateObject](/docs/core/generate-object). |
+| `providerOptions` | `{ [provider]: Record<string, unknown> }` | — | A provider-specific body field the canonical surface has no name for (e.g. `{ openai: { service_tier: 'flex' } }`). Canonical fields the adapter sets always win. |
+| `promptCaching` | `'auto' \| 'auto-1h'` | — | Long stable prefixes on Anthropic caching-capable models. Other providers cache implicitly and ignore it. |
 | `tools` | `ToolSet` | — | Enables the agentic loop. See [Tool Loop](/docs/agents/tool-loop). |
-| `toolChoice` | `ToolChoice` | — | Force / disable / pick a tool. |
-| `maxSteps` | `number` | `1` | Max model turns in the agentic loop. |
-| `stopWhen` | `StopCondition \| StopCondition[]` | — | Stop predicate(s), OR-ed with `maxSteps`. |
-| `maxToolConcurrency` | `number` | `5` | Max parallel tool executions per step. |
-| `onStepFinish` | `(step: StepResult) => void` | — | Per-step callback in the agentic loop. |
+| `toolChoice` | `ToolChoice` | `'auto'` | Force / forbid / pin a tool. |
+| `maxSteps` | `number` | `1` | **Always, for real tool use.** Counts model turns. |
+| `stopWhen` | `StopCondition \| StopCondition[]` | — | Stop on a signal rather than a count. OR-ed with `maxSteps` — it can only stop earlier. |
+| `budget` | `{ usd?: number; tokens?: number }` | — | A hard spend ceiling. Emits a typed `budget-exceeded` part before the terminal `finish`. |
+| `maxToolConcurrency` | `number` | `5` | Your tools hit a rate-limited API, or they are cheap and you want more parallelism. |
+| `onStepFinish` | `(step: StepResult) => void` | — | Per-step callback. Fires for tool-calling steps, not the terminal text-only one. |
 
-The sampling and tool options come from `CommonCallOptions` and are shared with `generateText` and `generateObject`.
+The sampling and tool options come from `CommonCallOptions` and behave identically on `generateText` and `generateObject`.
 
 ## Return value
-
-`streamChat` returns a `StreamChatResult` object synchronously:
 
 ```ts
 interface StreamChatResult {
@@ -77,18 +88,179 @@ interface StreamChatResult {
   finishReason: Promise<FinishReason>;
   /** 1.9 — drain the stream so terminal effects run. Optional; see below. */
   consume?: (options?: { onError?: (error: unknown) => void }) => Promise<void>;
-  /** 1.9 — non-fatal notices. Settles with `usage`; never rejects. See below. */
+  /** 1.9 — non-fatal notices. Settles with `usage`; never rejects. */
   warnings?: Promise<CallWarning[]>;
-  // plus the pre-existing optional fields: runId, observation, memory, response, …
+  /** Present only when the call carried `session`. Known synchronously. */
+  runId?: string;
+  /** Present only with an observer/tracer. Await before closing observers. */
+  observation?: { settled: Promise<void> };
+  /** Present only with `memory` extraction on. Never rejects. */
+  memory?: Promise<MemoryMutation[]>;
 }
 ```
 
 - **`textStream`** — text-only projection. Yields `string` chunks (the `text-delta` parts). If the stream errors, iterating `textStream` **throws** the error.
 - **`fullStream`** — the full canonical delta stream of `StreamPart`. Errors surface as an `error` part, not a throw.
-- **`usage`** — resolves once with the final `Usage` breakdown (input / output / reasoning / cache tokens).
+- **`usage`** — resolves once with the final `Usage` breakdown (input / output / reasoning / cache tokens). `totalTokens` is the provider's own total where one exists, not `input + output` — on a thinking model those differ substantially.
 - **`finishReason`** — resolves with `'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error' | 'aborted'`.
 
-### `warnings`
+There is no `response.messages` on a streaming result. If you need the canonical turns to append to history, either reconstruct them from the stream or use the [chat](/docs/modules/chat-persistence) layer, which does it for you.
+
+## G2: synchronous, and it never throws
+
+This is the single rule that shapes the whole streaming API, so it is worth understanding rather than memorizing.
+
+`streamChat` does **no async work in the call body**. It resolves no key, opens no socket, reads no clock. It builds a result object and returns. Everything real happens later, on the first pull.
+
+Two consequences follow, and both are load-bearing:
+
+**1. There is nothing to throw, so it never throws.** Not on a missing API key, not on an invalid `prompt`/`messages` pair, not on an unreachable host. If it *could* throw synchronously, every caller would need a `try/catch` around the construction **and** a failure path around the iteration — two error channels for one operation. Instead there is exactly one failure surface:
+
+- an `error` part appended to `fullStream` (after which the stream ends),
+- a **throwing** `textStream` (it re-throws the error part),
+- and **rejected** `usage` and `finishReason` promises.
+
+```ts title="error-handling.ts"
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'hi' }],
+  // missing/invalid key → still no synchronous throw
+});
+
+// Option A — iterate fullStream and branch on the error part:
+for await (const part of result.fullStream) {
+  if (part.type === 'error') {
+    console.error('stream failed:', part.error);
+    break;
+  }
+}
+
+// Option B — iterate textStream inside try/catch (it re-throws):
+try {
+  for await (const chunk of result.textStream) process.stdout.write(chunk);
+} catch (err) {
+  console.error('stream failed:', err);
+}
+
+// Either way, the matching promise rejects — handle it or you get an
+// unhandled rejection.
+const usage = await result.usage.catch((err) => {
+  console.error(err.code); // e.g. 'authentication'
+  return null;
+});
+```
+
+**2. Constructing a result is free.** You can build one, hand it to a wrapper, store it, and decide later whether to read it — no request has been sent. That is what makes [`createClient`](/docs/core/dependencies) pre-binding, middleware chains and fail-over wrappers composable without hidden I/O.
+
+The pump kicks off on the first `for await` over either stream, or the first `await` of `usage` / `finishReason` / `warnings`. Reading `result.consume` does **not** start it — it is a plain method, not a getter.
+
+<Callout type="warn" title="The mirror image: nobody reads, nothing happens">
+Because the pump is lazy and only advances while someone pulls, a result nobody iterates does nothing at all. No request, no `onUsage`, no `onFinish`, no chat persistence, no durable checkpoint, no memory extraction. That is what [`consume()`](#consume) exists for.
+</Callout>
+
+## `consume()`
+
+The classic shape of the bug: a serverless handler returns a streamed `Response` and the platform tears the isolate down as soon as the client disconnects — or the client never connects at all. Nothing is left pulling the stream, so the run never reaches its terminal boundary and every terminal effect is silently skipped.
+
+```ts title="consume.ts"
+const res = streamChat({ model, prompt, chat: { store, chatId, scope } });
+const response = toDeuzStreamResponse(res);
+ctx.waitUntil(res.consume?.()); // drain so persistence / onFinish actually run
+return response;
+```
+
+- It takes its **own subscription**, so `consume()` and a normal `fullStream` iteration both see every part. Calling it does not steal your output.
+- It awaits the **post-terminal bookkeeping** rather than resolving mid-write, so `waitUntil` covers the persistence and not merely the last byte.
+- It is **memoized** — safe to call twice; terminal effects fire exactly once.
+- It **never rejects.** Failures go to `consume({ onError })` and remain on `fullStream` as an `error` part.
+
+<Callout type="info" title="Optional on the type, provided on every path">
+Every path the SDK produces — including `streamChat({ fallbackModels })` and the `withFallback` middleware, which forward the winner's drain through their own subscription — provides `consume()`. It stays **optional on the type** so a hand-written `StreamChatResult` (a test double, a custom wrapper) remains valid. Write `res.consume?.()`, not `res.consume!()`, on any value you did not create yourself.
+</Callout>
+
+`StreamObjectResult.consume` has the identical contract.
+
+## `textStream` vs `fullStream`
+
+They are two projections of **one** pump, not two requests. Pick by what you need to render.
+
+| | `textStream` | `fullStream` |
+| --- | --- | --- |
+| Yields | `string` | `StreamPart` (discriminated union) |
+| Reasoning tokens | excluded | `reasoning-delta` |
+| Tool events | excluded | `tool-call-delta`, `tool-call`, `tool-result`, `tool-state` |
+| Step boundaries | invisible | `step-start` / `step-finish` |
+| Final usage | via `await result.usage` | also as the `finish` part |
+| On failure | **throws** | yields an `error` part, then ends |
+| Good for | a plain chat bubble | a real agent UI, logging, cost meters |
+
+Both may be consumed at the same time — see [Multiple consumers](#multiple-consumers).
+
+### StreamPart types
+
+`fullStream` is an **open** discriminated union. Always keep a `default` case: new variants are added additively and a future release must not break your switch.
+
+| `type` | Shape | Emitted |
+| --- | --- | --- |
+| `text-delta` | `{ text }` | Assistant text fragment. |
+| `reasoning-delta` | `{ text, signature?, encrypted? }` | Extended-thinking / reasoning fragment. When `encrypted` is true, `text` is an opaque payload (OpenAI Responses) — do **not** render it as thinking text. |
+| `tool-call-delta` | `{ id, name?, argsTextDelta, providerMetadata? }` | Raw tool-args JSON fragment — accumulate as a string, parse once at block end. For live "the agent is typing arguments" UIs. |
+| `source` | `{ id, url?, title? }` | Citation / grounding source from a provider-executed search. |
+| `finish` | `{ usage, finishReason }` | Terminal part. In a loop, usage is summed across all steps. |
+| `error` | `{ error }` | Failure; the stream ends after this. |
+| `step-start` | `{ stepIndex }` | Agentic loop: a step began. Always the first part of a loop run. |
+| `step-finish` | `{ stepIndex, finishReason, usage }` | Agentic loop: a step ended. `usage` is that step alone. |
+| `tool-call` | `{ toolCallId, toolName, input }` | Final parsed tool call (after `tool-call-delta` fragments finish). |
+| `tool-result` | `{ toolCallId, toolName, output, isError? }` | Result of executing a tool call. |
+| `tool-state` | `{ toolCallId, toolName?, state, denied?, deniedReason? }` | Tool lifecycle transition. `denied: true` qualifies a terminal `state: 'error'` whose cause was an approval **refusal** rather than a thrown tool. |
+| `tool-approval-request` | `{ approvalId, toolCallId, toolName, input }` | A call awaiting client-mode approval; the loop breaks after emitting these — resume via `approvalResponses`. |
+| `compaction` | `{ layer, tokensBefore, tokensAfter }` | Automatic context compaction ran before a step. Token counts are estimates. |
+| `sub-agent` | `{ agentPath, part }` | A sub-agent's own canonical part, forwarded live into the parent stream. |
+| `handoff` | `{ from?, to, toolCallId, reason?, stepIndex }` | 2.0. The run transferred to another agent. |
+| `guardrail` | `{ hook, action, name?, reason?, toolCallId?, stepIndex? }` | 2.0. One part per **non-pass** verdict (`block` / `rewrite`); passes emit nothing. |
+| `data` | `{ name, id?, payload }` | App-defined typed data you injected. |
+| `citation` | `{ id, sourceId?, url?, title?, snippet?, chunkIndex?, score? }` | RAG provenance for a retrieved chunk. |
+| `cost` | `{ costUsd, deltaUsd?, cacheSavingsUsd?, stepIndex? }` | Live cumulative USD cost. Needs `deps.priceProvider`. |
+| `budget-exceeded` | `{ kind, limit, value }` | The `budget` guardrail tripped; precedes the terminal `finish`. |
+| `verify` | `{ stepIndex, attempt, ok, willRetry, feedback? }` | A `verifyStep` verdict. |
+| `false-finish` | `{ stepIndex, attempt, willRetry }` | The `doneWhen` guard rejected a natural completion. Streaming loop only. |
+| `plan-update` / `activity` | see [Autonomy](/docs/modules/autonomy) | Live plan snapshot / "Computer" feed line. |
+| `warning` | `{ warning: CallWarning }` | A non-fatal execution notice. Purely informational — it never ends the stream and never replaces a delta. |
+
+`step-*`, `tool-call`, `tool-result` and `tool-approval-request` only appear when `tools` are provided.
+
+```ts title="full-stream.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Think, then answer: 2+2?' }],
+});
+
+for await (const part of result.fullStream) {
+  switch (part.type) {
+    case 'reasoning-delta':
+      if (!part.encrypted) process.stdout.write(`\x1b[2m${part.text}\x1b[0m`); // dim thinking
+      break;
+    case 'text-delta':
+      process.stdout.write(part.text);
+      break;
+    case 'finish':
+      console.log('\nreason:', part.finishReason, 'tokens:', part.usage.totalTokens);
+      break;
+    case 'error':
+      console.error('\nerror:', part.error);
+      break;
+    default:
+      break; // keep a default — the union is open
+  }
+}
+```
+
+## `warnings`
 
 Deuz never throws on something it can degrade: an unknown slug falls back to a conservative capability row, a sampling parameter a reasoning model rejects is stripped, a tool a wire cannot carry is removed. Every one of those decisions used to go only to `deps.logger.warn` — and the **default logger is a no-op**, so by default it went nowhere. `warnings` is the readable channel for them.
 
@@ -108,137 +280,17 @@ for (const w of (await result.warnings) ?? []) console.warn(w.type, w.message);
 
 - **`warnings` settles with `usage` / `finishReason` and never rejects.** A failed run resolves with whatever was collected before the failure; a clean run resolves `[]`. Reading it starts the lazy pump, exactly like `usage`.
 - **The parts come first.** Every warning site runs during capability resolution and request building — before the first byte — so `warning` parts land ahead of the model's own output.
-- **Deduped per call**, by `(type, setting, message)`, so one cause is one notice even across a multi-step loop. Capped at 50, with a trailing `N further warning(s) omitted` entry rather than a silent truncation.
+- **Deduped per call**, by `(type, setting, message)`, so one cause is one notice even across a multi-step loop where every step re-derives the same capabilities. Capped at 50, with a trailing `N further warning(s) omitted` entry rather than a silent truncation.
 - **Still exactly one log line each.** Nothing double-logs, so a workflow that parses `deps.logger.warn` output is unchanged.
 - A `CallWarning` never contains secrets, and the message is passed through the redactor again on its way to the UI wire.
 
-`CallWarning.type` is `'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other'`. Treat it as an **open** union — `'other'` is the escape hatch — rather than switching exhaustively. The producers that exist today, and the ones that do not, are listed in [What is new in 1.9](/docs/reference/whats-new-1-9#the-wiring-pass).
+`CallWarning.type` is `'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other'`. Treat it as an **open** union — `'other'` is the escape hatch — rather than switching exhaustively.
 
-<Callout type="warn" title="Three readouts are still empty">
-`GenerateTextResult.warnings`, `GenerateObjectResult.warnings` and `StreamObjectResult.warnings` are **not** populated — the notices are produced and logged on those paths but never reach the result object. And a `streamChat` that routes through the loop (`tools`, `chat`, `memory`, `verifyStep`, `doneWhen`) reports only its own `activeTools` notices; a model-level warning raised inside a step stays in the log. See [Declared but inert](/docs/reference/whats-new-1-9#declared-but-inert).
-</Callout>
-
-## `consume()`
-
-The pump is lazy, which is deliberate — but it means a caller who never iterates gets **nothing**: no chat persistence, no durable checkpoint, no `onFinish`, no memory extraction. Returning the response and walking away silently dropped all of it. That is the classic serverless shape: the client disconnects, and nothing is left pulling the stream.
-
-```ts title="consume.ts"
-const res = streamChat({ model, prompt, chat: { store, chatId, scope } });
-const response = toDeuzStreamResponse(res);
-ctx.waitUntil(res.consume?.()); // drain so persistence / onFinish actually run
-return response;
-```
-
-- It takes its **own subscription**, so `consume()` and a normal `fullStream` iteration both see every part.
-- It awaits the **post-terminal bookkeeping** rather than resolving mid-write.
-- It is **memoized** (safe to call twice; terminal effects fire once) and **never rejects** — failures go to `consume({ onError })` and remain on `fullStream` as an `error` part.
-- Reading `result.consume` does **not** start the pump; it is a plain method, not a getter.
-
-<Callout type="info" title="Optional on the type, provided on every path">
-Every path the SDK produces — including `streamChat({ fallbackModels })` and the `withFallback` middleware, which forward the winner's drain through their own subscription — provides `consume()`. It stays **optional on the type** so a hand-written `StreamChatResult` (a test double, a custom wrapper) remains valid. Write `res.consume?.()`, not `res.consume!()`, on any value you did not create yourself.
-</Callout>
-
-`StreamObjectResult.consume` has the identical contract.
-
-### StreamPart types
-
-`fullStream` is an open discriminated union — always keep a `default` case, because new variants are additive. The current parts:
-
-| `type` | Shape | Emitted |
-| --- | --- | --- |
-| `text-delta` | `{ text }` | Assistant text fragment. |
-| `reasoning-delta` | `{ text, signature?, encrypted? }` | Extended-thinking / reasoning fragment. When `encrypted` is true, `text` is an opaque encrypted reasoning payload (OpenAI Responses) — do not render it as thinking text. |
-| `tool-call-delta` | `{ id, name?, argsTextDelta, providerMetadata? }` | Raw tool-args JSON fragment — accumulate as string, parse once at block end. |
-| `source` | `{ id, url?, title? }` | Citation / grounding source. |
-| `finish` | `{ usage, finishReason }` | Terminal part of a single turn. |
-| `error` | `{ error }` | Failure; the stream ends after this. |
-| `step-start` | `{ stepIndex }` | Agentic loop: a step began. |
-| `step-finish` | `{ stepIndex, finishReason, usage }` | Agentic loop: a step ended. |
-| `tool-call` | `{ toolCallId, toolName, input }` | Final parsed tool call. |
-| `tool-result` | `{ toolCallId, toolName, output, isError? }` | Result of executing a tool call. |
-| `tool-approval-request` | `{ approvalId, toolCallId, toolName, input }` | A tool call awaiting client-mode approval (`needsApproval` triggered, no `approveToolCall` supplied); the loop breaks after emitting these — resume via `approvalResponses`. |
-| `compaction` | `{ layer, tokensBefore, tokensAfter }` | Automatic context compaction ran before a step; token counts are estimates. Only when `compaction` is enabled in the agentic loop. |
-| `sub-agent` | `{ agentPath, part }` | A sub-agent's (`agentTool`) own canonical part forwarded live into the parent stream. |
-| `tool-state` | `{ toolCallId, toolName?, state, denied?, deniedReason? }` | Tool lifecycle transition. `denied: true` (1.9) qualifies a terminal `state: 'error'` whose cause was an approval **refusal** rather than a thrown tool; `deniedReason` is the denier's own words when there are any. Set by the streaming loop — see [approval denial](/docs/reference/whats-new-1-9#tool-approval-denial). |
-| `data` | `{ name, id?, payload }` | App-defined typed data. |
-| `citation` | `{ id, sourceId?, url?, title?, snippet?, chunkIndex?, score? }` | RAG provenance for a retrieved chunk. |
-| `cost` | `{ costUsd, deltaUsd?, cacheSavingsUsd?, stepIndex? }` | Live cumulative USD cost (needs `deps.priceProvider`). |
-| `budget-exceeded` | `{ kind, limit, value }` | The `budget` guardrail tripped; precedes the terminal `finish`. |
-| `verify` | `{ stepIndex, attempt, ok, willRetry, feedback? }` | A `verifyStep` verdict. |
-| `plan-update` / `activity` | see [Autonomy](/docs/modules/autonomy) | Live plan snapshot / "Computer" feed line. |
-| `false-finish` | `{ stepIndex, attempt, willRetry }` | 1.9. The `doneWhen` guard rejected a natural completion — one part per rejection, always before the terminal `finish`. `willRetry: false` is the rejection that spent the `falseFinishGuard` budget. Streaming loop only. |
-| `warning` | `{ warning: CallWarning }` | 1.9. A non-fatal execution notice, emitted as it is discovered — see [`warnings`](#warnings). Purely informational: it never ends the stream and never replaces a delta. |
-
-`step-*`, `tool-call`, `tool-result`, and `tool-approval-request` only appear when `tools` are provided.
-
-## G2: never throws synchronously
-
-`streamChat` returns synchronously and **never throws** — not even on a missing API key. There is no async work in the call body; the pump starts lazily on the first access of any output. Failures surface in two ways:
-
-- an `error` part appended to `fullStream` (after which the stream ends), and
-- a **rejected** `usage` and `finishReason` promise.
-
-```ts
-const result = streamChat({
-  model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'hi' }],
-  // missing/invalid key → no synchronous throw
-});
-
-for await (const part of result.fullStream) {
-  if (part.type === 'error') {
-    console.error('stream failed:', part.error);
-    break;
-  }
-}
-
-// the matching promise rejects — handle it
-const usage = await result.usage.catch((err) => {
-  console.error(err.code); // e.g. 'authentication'
-  return null;
-});
-```
-
-Because the pump is lazy, simply *constructing* a `StreamChatResult` does no network I/O — handy when pre-binding a [client](/docs/core/dependencies). The pump kicks off on the first `for await` over either stream, or the first `await` of `usage` / `finishReason`.
-
-## fullStream: switching over part types
-
-Use `fullStream` when you need reasoning, sources, tool events, or final usage in one pass.
-
-```ts title="full-stream.ts"
-import { streamChat } from '@deuz-sdk/core';
-import { createAnthropic } from '@deuz-sdk/core/anthropic';
-
-const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
-
-const result = streamChat({
-  model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Think, then answer: 2+2?' }],
-});
-
-for await (const part of result.fullStream) {
-  switch (part.type) {
-    case 'reasoning-delta':
-      process.stdout.write(`\x1b[2m${part.text}\x1b[0m`); // dim thinking
-      break;
-    case 'text-delta':
-      process.stdout.write(part.text);
-      break;
-    case 'finish':
-      console.log('\nreason:', part.finishReason, 'tokens:', part.usage.totalTokens);
-      break;
-    case 'error':
-      console.error('\nerror:', part.error);
-      break;
-    default:
-      break; // keep a default — the union is open
-  }
-}
-```
+The buffered readouts carry the same set: `GenerateTextResult.warnings`, `GenerateObjectResult.warnings` and `StreamObjectResult.warnings` are populated too, and are **omitted entirely** when a call produced none, so a clean result's shape is unchanged.
 
 ## Abort
 
-Pass an `AbortSignal`; it is merged with the SDK's internal timeouts and propagated to the underlying fetch. A **user abort** is not an error — it resolves `finishReason` to `'aborted'` with whatever partial `usage` accumulated, and `onUsage` fires with `meta.reason === 'aborted'`.
+Pass an `AbortSignal`; it is merged with the SDK's internal timeouts and propagated to the underlying fetch and to tool `execute`. A **user abort is not an error** — it resolves `finishReason` to `'aborted'` with whatever partial `usage` accumulated, and `onUsage` fires with `meta.reason === 'aborted'`.
 
 ```ts title="abort.ts"
 import { streamChat } from '@deuz-sdk/core';
@@ -256,20 +308,22 @@ const result = streamChat({
 setTimeout(() => controller.abort(), 1000);
 
 // A user abort is not an error: the stream ends cleanly (no `error` part,
-// no throw) and the promises resolve.
+// no throw) and the promises RESOLVE.
 for await (const chunk of result.textStream) process.stdout.write(chunk);
 
 console.log(await result.finishReason); // 'aborted'
 console.log(await result.usage); // partial usage
 ```
 
-`abortSignal` is accepted as a deprecated alias since 1.9, for AI SDK migrations; `signal` wins if both are set.
+A **timeout is the opposite**: it is a failure, surfacing a `TimeoutError` on the `error` part with rejected promises, never `'aborted'`. The distinction is deliberate — "the user changed their mind" and "the provider never answered" call for different handling, and collapsing them into one signal loses that. Two timers guard every model call by default (time-to-first-token 60s, cleared on the first content delta; total 300s) and all four layers are settable per call with [`timeout`](/docs/core/prompts-and-timeouts#timeout).
 
-A timeout, by contrast, is a **failure**: it surfaces a `TimeoutError`, never `'aborted'`. Two timers guard every model call by default — time-to-first-token (60s, cleared when the first content delta arrives) and a total ceiling (300s) — and since 1.9 all four layers are settable per call with [`timeout`](/docs/core/prompts-and-timeouts#timeout).
+`abortSignal` is accepted as a deprecated alias since 1.9 for AI SDK migrations; `signal` wins if both are set.
 
 ## Retries
 
-Retries are **pre-first-byte only**. Before any content streams, a retryable upstream failure (e.g. 429 / 529 / network error) is retried up to `maxRetries` times (default `2`) with exponential backoff, full jitter, and `Retry-After` honored. Once the first delta is emitted, a mid-stream error is final — it is not retried.
+Retries are **pre-first-byte only**. Before any content streams, a retryable upstream failure (429 / 529 / 5xx / network) is retried up to `maxRetries` times (default `2`) with exponential backoff, full jitter, and `Retry-After` honoured. Once the first delta is emitted, a mid-stream error is final.
+
+The rule is not a limitation — it is the only correct choice. Your consumer has already seen tokens; a transparent retry would either duplicate them or splice a second, unrelated completion into the middle of the first.
 
 ```ts
 const result = streamChat({
@@ -279,9 +333,11 @@ const result = streamChat({
 });
 ```
 
+Jitter is derived from `deps.generateId()` rather than `Math.random()`, so retry timing is reproducible in tests. Full detail — including the per-model circuit breaker — is on [Error handling](/docs/core/errors#retry-interplay) and [Resilience](/docs/advanced/resilience).
+
 ## Multiple consumers
 
-A `StreamChatResult` is internally fanned out by a broadcaster: `textStream`, `fullStream`, `usage`, and `finishReason` each draw from their own buffered branch. Subscriptions are registered **before** the lazy pump starts, so awaiting `usage` first and iterating the stream later loses nothing — the buffered parts are still delivered in order.
+A `StreamChatResult` is internally fanned out by a broadcaster: `textStream`, `fullStream`, `usage`, `finishReason` and `consume()` each draw from their own buffered branch. Subscriptions are registered **before** the lazy pump starts, so awaiting `usage` first and iterating the stream later loses nothing.
 
 ```ts title="usage-then-stream.ts"
 const result = streamChat({
@@ -299,12 +355,22 @@ for await (const chunk of result.textStream) text += chunk;
 console.log(text, await usagePromise);
 ```
 
-Note: each branch buffers independently, so a branch you never drain holds its queue in memory until the stream ends (bounded by the response size).
+<Callout type="warn" title="An undrained branch buffers in memory">
+Each branch buffers independently. A branch you never drain holds its queue until the stream ends — bounded by the response size, but real. If you only need text, iterate `textStream` and leave `fullStream` alone; do not open both "just in case".
+</Callout>
+
+## What `streamChat` does not do
+
+- **It does not retry mid-stream.** Once a byte is out, a failure is final. Cross-model fail-over (`fallbackModels`, `withFallback`) is also pre-first-byte only.
+- **It does not give you `response.messages`.** The buffered call does; here you reconstruct the turns or let the [chat layer](/docs/modules/chat-persistence) do it.
+- **It does not validate JSON.** `responseFormat: 'json'` only asks the provider for JSON. Use [streamObject](/docs/core/stream-object) for a schema-validated result.
+- **It does not start on its own.** No consumer, no run. See [`consume()`](#consume).
 
 ## Related
 
 - [generateText](/docs/core/generate-text) — buffered, non-streaming variant.
-- [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts) — the 1.9 call-shape options in full.
+- [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts) — the call-shape options in full.
 - [generateObject](/docs/core/generate-object) — schema-validated structured output.
 - [Tool Loop](/docs/agents/tool-loop) — the agentic loop enabled by `tools`.
+- [Error handling](/docs/core/errors) — the taxonomy behind the `error` part.
 - [Dependencies & Clients](/docs/core/dependencies) — `createClient` pre-binds shared `deps`, keys, and base URLs.

@@ -14,9 +14,54 @@ description: compactMessages — the loop's layered compaction as a plain functi
 | [Overflow recovery](#automatic-overflow-recovery) | The provider said "too long"; the loop force-compacts and retries once, even if you never asked for compaction. |
 | [`countTokens`](#a-real-tokenizer-via-counttokens) | Replace the character heuristic with a real tokenizer. |
 
-## The automatic half, in one paragraph
+## How the automatic half decides
 
-`compaction: 'auto'` (or a `CompactionPolicy`) runs three layers cheapest-first once estimated fill crosses `threshold` (default 0.92): **prune tool results** → **prune reasoning** → **summarize the oldest unprotected run**. System messages, the first user message, the last message, and the last `keepRecentSteps` (default 4) assistant turns are never touched. History stays immutable, untouched messages keep reference equality, and nothing ever throws. The [Context compaction](/docs/core/compaction) page is the full reference for the policy, the layers and the `compaction` stream part; everything below assumes it.
+`compaction: 'auto'` (or a `CompactionPolicy`) runs a pass **at the top of every step**, including the first — so a history that is already too big is shrunk before the first request goes out, not after it fails.
+
+The pass is a small state machine, and the whole of it is worth holding in your head:
+
+1. Estimate the current fill: `estimate(messages) / contextWindow`. The estimate includes the [memory recall block](/docs/modules/memory#recall-options-20) even though that block is not in `messages` — it is spliced in at the model-call site and the provider counts it, so the threshold has to as well.
+2. If fill is **at or under** `threshold` (default `0.92`), stop. The input array is returned by reference and no event is emitted.
+3. Otherwise run the policy's layers in order. After each layer, re-estimate; as soon as fill drops to **`threshold × 0.8`** (the *target*, ~0.736 by default) stop early.
+4. Emit one `CompactionEvent` per layer that actually **changed** the history. A layer that ran and changed nothing is silent, and the loop moves to the next one.
+
+The gap between the trigger (0.92) and the target (0.736) is deliberate hysteresis: compacting back to exactly the trigger would make the very next step compact again, and the summarize layer costs a model call each time.
+
+### Why the layers are in that order
+
+The default order is `['prune-tool-results', 'prune-reasoning', 'summarize']`, and it is sorted by **price**, not by how much it saves.
+
+| Layer | Cost | Typical saving | What is lost |
+| --- | --- | --- | --- |
+| `prune-tool-results` | A pure array map. No I/O, no tokens. | Usually the largest single win in a tool-heavy run — raw API payloads dominate history. | The tool's output body; `toolUseId` and `isError` survive, so the wire stays valid. |
+| `prune-reasoning` | A pure array map. No I/O, no tokens. | Meaningful with extended thinking on, nothing without it. | Old chains of thought. The model's *conclusions* are in its text, which is untouched. |
+| `summarize` | **One model call**, metered, on your bill. | The only layer that can compress the conversation itself. | Detail. A summary is lossy by definition. |
+
+So the loop spends free operations first and reaches for the paid one only when the free ones did not get it under target. Reordering `layers` is legal and occasionally right — a run whose tool outputs are the *answer* might use `['prune-reasoning', 'summarize']` — but putting `summarize` first means paying for a model call on every trigger.
+
+`prune-tool-results` is idempotent: an already-stubbed result matches `[pruned N chars]` and is skipped, so a second pass over the same history changes nothing and emits nothing. `prune-reasoning` refuses to empty a message: an assistant turn made *only* of reasoning parts is left intact, because providers reject an empty content array and a fabricated blank text part would corrupt the turn.
+
+### What is never touched, and why
+
+Four sets of messages are protected from every layer, in every mode, including forced overflow recovery:
+
+| Protected | Why |
+| --- | --- |
+| Every `system` message | It is the instruction set. Losing it changes the agent, not the context. |
+| The **first** `user` message | The original task. Everything after it is elaboration; summarizing away the request is how an agent forgets what it is doing. |
+| The **last** message | The pending turn. With no assistant reply yet — several pasted documents, say — the last message *is* the question, and removing it would end the history on an assistant turn. |
+| From the `keepRecentSteps`-th-from-last **assistant** message to the end | The working set. This is what "recent" means here. |
+
+That last one is worth reading twice: `keepRecentSteps` (default 4) counts **assistant messages**, not loop steps, and it protects a *contiguous tail* — everything from that anchor index onward, tool results included. With fewer than `keepRecentSteps` assistant messages in the history, the anchor is the first one and effectively the whole conversation after it is protected. The value is normalized to a positive integer (`Math.max(1, Math.floor(…))`, falling back to 4 on a non-finite input) because a fractional index would slide off the array and silently unprotect the tail.
+
+The `summarize` layer needs a bit more than that to act: at least two unprotected messages overall, **and** a contiguous unprotected run of at least two. A single stranded message — an assistant turn whose tool results got split off by a protected boundary — is left alone rather than risk orphaning a `tool_use`/`tool_result` pair.
+
+### What compaction does not do
+
+- **It does not run outside the agentic loop.** `compaction` is not one of the options that routes a tool-less call through the loop, so `compaction: 'auto'` on a plain `generateText` with no `tools` / `chat` / `memory` / `guardrails` is accepted and inert. That is what [`compactMessages`](#compactmessages--the-manual-api) is for.
+- **It does not know your real token count.** See [token honesty](#a-real-tokenizer-via-counttokens) below. Treat `threshold` as approximate.
+- **It does not touch `response.messages`.** What the loop reports as appended is always what actually happened, never a compacted rewrite. Compaction acts on the *effective model history* only.
+- **It does not rewrite provider-side state.** Anthropic's server-side `context_management` is a separate mechanism; see [the interop note](/docs/core/compaction#interop-with-anthropics-native-context-editing).
 
 ## `compactMessages` — the manual API
 
@@ -60,9 +105,11 @@ interface CompactMessagesResult {
 | Dep | Effect |
 | --- | --- |
 | `summarize` | Enables the `summarize` layer. Typically a `generateText` call. `previousSummary` carries the rolling summary already in the history on every pass after the first — fold into it, do not summarize it again. |
-| `estimateTokens` | Replaces the **whole** estimate. (A `countTokens` on the *policy* replaces only the heuristic's base count and keeps the EMA calibration; this replaces the lot.) |
+| `estimateTokens` | Replaces the **whole** estimate, including the calibration multiplier. |
 | `contextWindow` | Decides the gate — see below. |
 | `onSkip` | Fired when a layer is skipped, which in practice means a throwing summarizer. |
+
+Two things about `CompactionEvent` here specifically: `durationMs` is always `0` (the manual API injects no clock — this is an edge-safe module and it will not read one ambiently), and the EMA calibration never runs, because there is no provider usage to calibrate against. A `countTokens` on the **policy** is therefore the entire estimate in a manual call, multiplied by a factor that stays pinned at `1.0`.
 
 ### The `contextWindow` gate
 
@@ -72,6 +119,8 @@ This is the one behavioral fork, and it is worth internalizing:
 | --- | --- | --- | --- |
 | supplied | threshold | Loop semantics: nothing runs unless estimated fill crosses `policy.threshold`; layers stop once fill drops under `threshold × 0.8`. | `'threshold'` |
 | omitted | force | There is no ratio to compare, so the gate is skipped and **every layer runs exactly once** — the "just make it smaller" mode. | `'manual'` |
+
+Force mode is not "compact harder"; it is "compact blind". With no window there is also no early stop, so all three layers run even if the first one already freed plenty — including the paid `summarize` layer, if you supplied one. Pass a `contextWindow` whenever you know it.
 
 ```ts title="trim-a-stored-chat.ts"
 import { compactMessages, generateText } from '@deuz-sdk/core';
@@ -97,9 +146,44 @@ for (const e of events) {
 }
 ```
 
+### A run that manages its own history
+
+The other shape this API is really for: an application that keeps the conversation itself and calls the SDK one turn at a time. There is no loop to opt into, so there is no automatic compaction and no overflow recovery — you own both.
+
+```ts title="own-your-history.ts"
+import { compactMessages, generateText, ContextOverflowError, type Message } from '@deuz-sdk/core';
+
+let history: Message[] = load();
+
+async function turn(userText: string): Promise<string> {
+  history = [...history, { role: 'user', content: userText }];
+
+  // Cheap, local, no model call: keep the history under control BEFORE asking.
+  const pre = await compactMessages(history, 'auto', { contextWindow: 200_000 });
+  history = pre.messages;
+
+  try {
+    const { text } = await generateText({ model, messages: history });
+    history = [...history, { role: 'assistant', content: text }];
+    return text;
+  } catch (err) {
+    if (!(err instanceof ContextOverflowError)) throw err;
+    // The estimate was wrong. Force mode + a summarizer, then one retry.
+    const forced = await compactMessages(history, 'auto', { summarize });
+    if (forced.messages === history) throw err; // nothing left to give
+    history = forced.messages;
+    const { text } = await generateText({ model, messages: history });
+    history = [...history, { role: 'assistant', content: text }];
+    return text;
+  }
+}
+```
+
+The `forced.messages === history` check is the same guard the loop uses internally: when every layer declines, retrying an identical request only earns an identical rejection.
+
 ### Guarantees
 
-- **Never throws.** A failing summarizer skips its layer (`onSkip`) and everything the earlier layers already did is kept.
+- **Never throws.** A failing summarizer skips its layer (`onSkip`) and everything the earlier layers already did is kept. The two pruning layers cannot fail — they are pure transforms, and even a circular or `BigInt` tool result is stringified defensively rather than thrown on.
 - **Immutable and reference-stable.** Untouched messages keep reference equality, so a React state or a prompt cache built on the input survives the round-trip. When nothing runs, `result.messages` **is** the input array.
 - **Same protection rules as the loop.** No layer touches a system message, the first user message, the last message, or the recent-assistant tail.
 - **`events` only reports change.** A layer that ran and changed nothing emits nothing.
@@ -107,8 +191,6 @@ for (const e of events) {
 ## The rolling summary
 
 The summarize layer collapses the oldest unprotected contiguous run into **one** `user`-role message prefixed `[Earlier conversation summarized]`.
-
-User role, not assistant, is deliberate: an assistant summary spliced right before the protected anchor assistant turn would merge into one turn on the wire, breaking Anthropic's "thinking block must lead the turn" rule when extended thinking and tool results follow — a 400.
 
 On a later pass, the unprotected run already **starts with the previous summary**. It is pulled out, handed to the summarizer as `previousSummary`, and only the genuinely new messages are summarized — then both are replaced by the single folded result.
 
@@ -119,7 +201,25 @@ pass 2   [S₂ = fold(S₁, D E)]           |protected|      ← not [S₁][S₂
 
 **The invariant: however many passes run, at most one summary message ever sits at the head of the unprotected region.** Summaries do not stack, and a summary is never re-summarized (a run that contains nothing but summaries is left exactly as it is — spending a model call to lose detail is not an improvement).
 
-Recognition is by the sentinel prefix alone, deliberately narrow: user role, exactly one text part, prefix match. An ordinary user message that merely quotes the sentinel is not folded away. The prefix is the *only* marker a later pass has, because the history it reads back may have crossed a store, a wire, or a React state round-trip — nothing but the text survives that.
+Folding rather than stacking is what keeps a 200-step research run from degrading into a summary of a summary of a summary. Inside the loop the two cases use different instructions: the first pass asks the model to *summarize* a transcript, and every pass after it asks the model to **update a running summary** — merge new facts and decisions in, keep still-relevant earlier notes, drop threads that are now resolved or superseded. That second prompt is why the summary stays roughly constant in size instead of growing with each fold.
+
+The slice handed to the summarizer is flattened to a plain-text transcript inside a **single user message** — `ROLE: text`, with `(thinking) …`, `[calls toolName({…})]`, `[tool result: …]` and `[image]` markers for non-text parts. Never the raw turns: a slice can begin with an assistant message, which is a 400 on Anthropic. The side call is stripped of tools, `toolChoice`, `maxSteps`, `stopWhen`, `prepareStep`, `activeTools`, approval hooks and compaction itself, so it can never recurse or fire your run-level `onFinish`. Your `onUsage` **is** still called — the summary really does spend tokens and a credit system must see them.
+
+If you supply your own `summarize` through `compactMessages`, honor the same contract: fold when `previousSummary` is present, and return text that will read sensibly with the sentinel prefixed to it.
+
+### Why the summary is a `user` message
+
+An assistant-role summary would be the natural choice, and it is wrong.
+
+The summary is spliced in immediately before the protected region, whose first message is (by construction) an **assistant** turn. Two adjacent assistant messages merge into one turn on the wire. When extended thinking is on and tool results follow, Anthropic requires the thinking block to lead the turn — and a summary block spliced in front of it breaks that rule, producing a 400 that is extremely hard to trace back to compaction.
+
+A `user`-role summary sits cleanly between turns on every wire. The cost is a small amount of strangeness in the transcript ("the user said this?"), which the sentinel prefix makes obvious to the model.
+
+### Recognition is by prefix alone
+
+The recognition test is deliberately narrow: **user role, exactly one text part, prefix match** on `[Earlier conversation summarized]`. An ordinary user message that merely quotes the sentinel inside a longer array of parts is not folded away.
+
+The prefix is the *only* marker a later pass has, because the history it reads back may have crossed a store, a wire, or a React state round-trip — nothing but the text survives that. There is no hidden field, no symbol, no metadata. So a summary you edit by hand keeps folding correctly, and a summary you *construct* by hand will too — but the sentinel string and the predicate are internal, not exported, so hard-coding the literal is a bet on an implementation detail rather than on the public surface.
 
 ## Automatic overflow recovery
 
@@ -131,16 +231,22 @@ import { ContextOverflowError } from '@deuz-sdk/core';
 
 When a step's request is rejected as too long, the loop **forces** a compaction pass (gate skipped, target tightened to `threshold × 0.5`) and re-runs the same step against the shrunk history. One retry per step: a second overflow in the same step propagates verbatim, because compaction already gave what it could and looping on it would only burn summarize calls.
 
-Two details that matter:
+Details that matter in production:
 
-- **It works even when you never opted into compaction.** A run with no `compaction` option would otherwise die on the first overflow, so a throwaway `'auto'` policy is built for that single pass. It is **not** retained — nothing else in the run starts compacting behind your back.
+- **It works even when you never opted into compaction.** A run with no `compaction` option would otherwise die on the first overflow, so a throwaway `'auto'` policy is built for that single pass. It is **not** retained — nothing else in the run starts compacting behind your back, and the next step goes back to measuring nothing.
 - **If nothing could be shrunk, the original error is rethrown.** When the forced pass returns the input array by reference (every layer declined), retrying an identical request would only earn an identical rejection.
+- **The target is halfway, not just under.** `threshold × 0.5` instead of `× 0.8`: the window has already overflowed once, so stopping just under the trigger buys exactly one more round-trip before the next rejection.
+- **The recall block's overhead is not added to this estimate.** Force mode has no threshold to clear, and the recovery target is measured against the history the loop actually owns.
+- **The retry re-measures before calibrating.** Feeding the EMA the pre-compaction estimate would teach it the history is far bigger than what was actually sent.
+- **It is a loop feature.** A single-turn `generateText` (no tools, no `chat`, no `memory`) has no step to retry, so a `ContextOverflowError` there is final. Catch it and call [`compactMessages`](#compactmessages--the-manual-api) yourself, as in the example above.
 
 The events this pass emits are labeled `trigger: 'overflow'` on both the `compaction` stream part and the observation event, so a UI can tell "we planned for this" from "we were caught out".
 
 ```ts
 if (part.type === 'compaction') {
-  // trigger: 'threshold' | 'manual' | 'overflow'   (absent = 'threshold', pre-2.0 shape)
+  // On the stream, trigger is 'threshold' or 'overflow' (absent = 'threshold',
+  // the pre-2.0 shape). 'manual' is what compactMessages reports in its own
+  // result — the loop never emits it.
   console.log(part.trigger, part.layer, part.tokensBefore, '→', part.tokensAfter);
 }
 ```
@@ -156,13 +262,45 @@ Recovery needs the adapter to recognize the rejection as an overflow rather than
 | OpenAI Responses | `responses` | The same signal. This adapter's `mapError` **delegates** to the OpenAI-compatible one — the error envelope is identical — so a `context_length_exceeded` code/type maps to `ContextOverflowError` here too, including on a mid-stream `error` / `response.failed` event. |
 | Google native | `native` | **Not mapped.** Gemini's envelope carries no overflow code and this adapter has no message heuristic, so an over-long request surfaces as a generic `InvalidRequestError`. |
 
+Because the Anthropic path is a message regex, a provider that proxies Anthropic and rewrites error strings can fall out of it. The `chat_completions` path is a code match and does not have that fragility — but an OpenAI-compatible host that omits the code has the same gap as Gemini.
+
 <Callout type="warn" title="The Gemini native wire is the gap">
 On the `native` wire an overflow is an ordinary failure: the run ends and you handle it. Set `compaction` explicitly there — the threshold path does not depend on error mapping at all, and it is what keeps that wire from reaching the wall in the first place.
 </Callout>
 
 ## A real tokenizer via `countTokens`
 
-Without one, the loop sizes history with a **character heuristic** (~3.6 chars/token, plus per-part constants) that self-calibrates against provider-reported usage via an EMA over `inputTokens / estimate`. That is good enough to trigger at 92% fill — but it is still a guess on the **first** call of a run, and it is worst exactly where it matters: code, CJK, and base64-ish tool output.
+Without one, the loop sizes history with a **character heuristic** that self-calibrates against provider-reported usage. It is good enough to trigger at 92% fill — but it is still a guess on the **first** call of a run, and it is worst exactly where it matters: code, CJK, and base64-ish tool output.
+
+### What the built-in estimate actually is
+
+The base count, per message, is roughly:
+
+| Content | Charged as |
+| --- | --- |
+| Any message | +4 tokens of framing |
+| `text` / `reasoning` part, or a string `content` | `length / 3.6` |
+| `image` part | 1600 tokens, flat |
+| `tool_use` / `tool_result` part | `JSON.stringify(payload).length / 3.6` + 10 |
+| A document/file-shaped part | its data length `/ 3.6`, or 1000 flat when the data is not a string |
+| Anything unrecognized | 8 tokens |
+
+Those constants are current implementation, not a stability contract — the *shape* (a cheap linear character model) is the part to rely on.
+
+On top of the base sits a single **EMA correction factor**, one per run, starting at `1.0`:
+
+- After every step, the loop feeds it the real `inputTokens` and the estimate it made at call time.
+- The update is `factor ← factor × (0.7 + 0.3 × actual/estimated)`, clamped to `[0.5, 2.0]`.
+- The blend happens in **factor space**, not ratio space, because the estimate it is comparing against was itself already calibrated. Blending ratios would converge to the square root of the true multiplier instead of the multiplier.
+- Degenerate samples — non-finite, zero, negative — are ignored outright. A single `NaN` would otherwise poison the factor for the rest of the run, and a provider that omits usage would drag it to the floor.
+
+So the first step of a run is uncalibrated and every step after it is progressively less wrong. That is exactly the window where an over-large first request slips through — which is what [overflow recovery](#automatic-overflow-recovery) exists to catch.
+
+<Callout type="warn" title="An unknown model slug defaults to a 128k window">
+The threshold divides by the registry's `contextWindow` for the model. An unrecognized slug falls back to conservative defaults — **128 000** tokens on the `anthropic`, `chat_completions` and `responses` surfaces (the Gemini `native` surface falls back to 1 000 000 instead) — so a 1M-context model the registry has not heard of will compact roughly eight times too early. Pass `capabilities: { contextWindow: 1_000_000 }` on the call to correct it without waiting for a registry release; the loop threads that override straight into the compaction runner.
+</Callout>
+
+### Plugging in a real tokenizer
 
 `CompactionPolicy.countTokens` replaces the base count:
 
@@ -193,21 +331,47 @@ await generateText({
 Four rules for a counter:
 
 1. **It must be synchronous.** It runs once per step inside the compaction check; an async hook there would put a network round-trip on the hot path of every step. Wrap a provider `countTokens` endpoint only if you cache it aggressively — or do not.
-2. **The EMA keeps running on top of it.** No tokenizer knows the provider's request framing (system scaffolding, tool schemas, image blocks), so there is still a residual constant to converge on. A tokenizer for the wrong model family is off by a constant factor, and correcting that is precisely what the EMA is for. Your counter starts the estimate far closer; it does not replace calibration.
-3. **Throwing is safe.** A counter that throws (an unloaded WASM encoder) or returns a non-finite / negative number degrades to the built-in heuristic for that call instead of poisoning every threshold decision for the rest of the run.
+2. **The EMA keeps running on top of it.** No tokenizer knows the provider's request framing (system scaffolding, tool schemas, image blocks), so there is still a residual constant to converge on. A tokenizer for the wrong model family is off by a constant factor, and correcting that is precisely what the EMA is for. Your counter starts the estimate far closer; it does not replace calibration. (In `compactMessages` there is nothing to calibrate against, so the factor stays `1.0` — see above.)
+3. **Throwing is safe.** A counter that throws (an unloaded WASM encoder) or returns a non-finite / negative number degrades to the built-in heuristic for that call instead of poisoning every threshold decision for the rest of the run. Nothing is logged when that happens — if you want to know, guard inside your own function.
 4. **`gpt-tokenizer` is a recipe, not a dependency.** Nothing in `@deuz-sdk/core` imports it. `tiktoken`, `@anthropic-ai/tokenizer`, or your own table work identically — the seam is a function.
 
-`compactMessages` accepts the same policy field, and its `deps.estimateTokens` is the bigger hammer: it replaces the whole estimate, calibration included.
+`compactMessages` accepts the same policy field, and its `deps.estimateTokens` is the bigger hammer: it replaces the whole estimate, calibration multiplier included.
 
 ## Budget accounting
 
 The summarize layer's extra model call is real, metered usage. Inside the loop it is folded into `result.usage` and therefore counts toward [`totalTokensExceed` / `costExceeds`](/docs/agents/tools#budget-stop-conditions). A long research loop that leans on `compaction: 'auto'` should budget for it. In `compactMessages` the call is yours — meter it where you make it.
 
-Note that the summarize side call always uses `policy.summarizeModel ?? the run's root model`. After an [agent handoff](/docs/agents/handoffs) the active agent's model drives the steps, but a compaction summary still uses the **root** model unless you pinned `summarizeModel`.
+`policy.summarizeModel` is the lever: the summary is a mechanical "compress this transcript" task with no tools and no reasoning requirement, so a small fast model is usually the right choice even when the run itself uses a frontier one.
+
+```ts
+compaction: {
+  threshold: 0.85,
+  summarizeModel: anthropic('claude-haiku-5'), // the summary does not need the big model
+}
+```
+
+Without `summarizeModel` the summary uses the run's **active** model. After an [agent handoff](/docs/agents/handoffs) that means the agent driving *now*, not the one that started the run — the compaction runner is re-pointed at the target on every transfer, so both its `contextWindow` and its summarize model follow the active agent. The token estimator is deliberately kept across a transfer: its calibration measures the provider's request framing, which the handoff did not change.
+
+## Pitfalls, collected
+
+| Surprise | Why | What to do |
+| --- | --- | --- |
+| `compaction: 'auto'` did nothing | It only runs inside the agentic loop; a tool-less call never enters it | Add tools, or use `compactMessages` |
+| Compaction fires immediately on a big-window model | An unknown slug defaults to a 128k window | `capabilities: { contextWindow: … }` |
+| A `ContextOverflowError` escaped anyway | Second overflow in the same step, or every layer declined, or the wire is Gemini `native` | Set `compaction` explicitly; lower `threshold` |
+| Overflow was never recognized on Gemini | The `native` adapter maps no overflow code | Rely on the threshold path, not on recovery |
+| `compactMessages` summarized more than expected | No `contextWindow` → force mode, every layer runs once | Pass `contextWindow` |
+| `events` is empty but the history shrank | Impossible — events track change | Check you are reading `result.messages`, not the input |
+| `durationMs` is always 0 | `compactMessages` injects no clock | Time it yourself |
+| Prompt cache hit rate collapsed after a summarize | The summary replaces a prefix, so the cache prefix moves once | Expected; it re-stabilizes from that point |
+| A 400 about thinking blocks after compaction | Almost certainly not this — the `user`-role summary exists to prevent exactly that | Check `prepareStep` and your own history edits |
+| Usage jumped without a visible extra step | The summarize side call is metered into the run total | Pin `summarizeModel` to a cheap model |
 
 ## See also
 
 - [Context compaction](/docs/core/compaction) — the automatic policy, the three layers, the protection rules, and the `compaction` stream part.
 - [Tool loop](/docs/agents/tool-loop) — the loop compaction runs inside.
+- [Memory](/docs/modules/memory) — the recall block that counts toward the same fill estimate.
+- [Handoffs](/docs/agents/handoffs) — why the summarize model follows the active agent.
 - [Errors](/docs/core/errors) — `ContextOverflowError` and the rest of the taxonomy.
 - [Observability](/docs/modules/observability) — `compaction` / `compaction.skipped` events, with `trigger` and layer timings.

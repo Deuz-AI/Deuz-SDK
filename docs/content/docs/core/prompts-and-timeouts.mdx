@@ -84,9 +84,6 @@ A timeout produces a `TimeoutError`: an `error` part plus rejected `usage` / `fi
 Since 1.9 an expiry whose abort reason was discarded by the transport is recovered to the `TimeoutError` that was armed, rather than being misclassified as a user abort.
 </Callout>
 
-<Callout type="warn" title="`stepMs` is streaming-only today">
-`stepMs` is enforced in the **streaming** loop (`streamChat`). The buffered `generateText` loop honours `ttftMs` / `totalMs` / `toolMs` but not `stepMs` yet.
-</Callout>
 
 ### `Tool.timeoutMs`
 

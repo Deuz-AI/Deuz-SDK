@@ -11,6 +11,186 @@ Import the core from `@deuz-sdk/core/memory`; the markdown backend from `@deuz-s
 
 Since 1.7 you rarely wire the pipeline by hand for a chatbot: the [`memory` call option](#built-in-chat-memory-17) runs recall + extract around any `generateText` / `streamChat` call.
 
+## The mental model
+
+Memory is not a longer message history. They answer different questions and live in different places.
+
+| | Message history (`messages`) | Memory (`MemoryStore`) |
+| --- | --- | --- |
+| Holds | Everything said, verbatim, in order | Standalone facts, deduplicated, unordered |
+| Lifetime | One conversation | Across conversations, users, deployments |
+| Growth | Linear — every turn is appended | Bounded by reconciliation: a contradicting fact **replaces** the old one |
+| Retrieval | All of it, every call | Top-K by relevance for *this* question |
+| Cost | Every token, every turn | One recall query per run + one write pass per turn |
+| Failure mode | Context overflow → see [compaction](/docs/modules/compaction) | Stale or wrong facts, injected confidently |
+
+Compaction and memory are complements, not alternatives: compaction decides what to *forget* from a running conversation; memory decides what to *keep* from it forever. A long-lived assistant usually wants both.
+
+The write path and the read path are separate and can be used independently:
+
+```
+WRITE   conversation ──▶ extract facts ──▶ embed + search ──▶ reconcile ──▶ apply
+                          (LLM call)        (embed call)      (LLM call)    (store)
+
+READ    question ──▶ embed ──▶ store.search ──▶ drop expired ──▶ rerank ──▶ expand links
+                    (embed call)                                (pure)      (store reads)
+```
+
+### The four kinds
+
+`MemoryKind` is a label on the record, not a separate store. It exists so that recall can be narrowed (`MemoryQuery.kind`) and so a host can apply different retention rules per kind. Nothing in the SDK treats one kind differently from another.
+
+| Kind | What belongs in it | Typical lifetime | Who sets it |
+| --- | --- | --- | --- |
+| `semantic` | Stable truths: "prefers TypeScript", "works at Acme", "is allergic to peanuts" | Indefinite | Default for `remember` with `infer: true` |
+| `episodic` | One specific event: "asked about billing on 2026-03-04" | Weeks — pair with `ttlMs` | Default for `infer: false` (raw turn storage) |
+| `procedural` | How the user wants things done: "always answer in bullet points" | Indefinite | Extraction pass, when the model classifies it so |
+| `working` | Short-lived context for a task in flight | Hours — pair with `ttlMs` and a [sweep](#sweep-and-ttl) | Extraction pass, or explicitly via `RememberOptions.kind` |
+
+The extraction prompt asks the model to classify each fact into one of these four, and `parseFacts` accepts **only** those four literals — a hallucinated `"important"` is dropped and the record falls back to `opts.kind ?? 'semantic'`.
+
+<Callout type="info" title="There is no separate working-memory buffer">
+Some frameworks call the in-flight message array "working memory". Here it is just `messages`, owned by you and shrunk by [compaction](/docs/modules/compaction). `kind: 'working'` is a retention label on a stored record, nothing more.
+</Callout>
+
+## When to use it — and when not
+
+Reach for memory when **the same subject comes back across conversations** and you cannot afford to re-ask: a personal assistant, a support agent that must remember an account's history, a coding agent that should not relearn your conventions every session.
+
+Do not reach for it when:
+
+- **The facts belong to documents, not to a person.** Use [RAG](/docs/modules/rag). Memory's write path spends two LLM calls per turn deciding what is worth keeping; for a corpus you already have, that is pure overhead.
+- **One conversation is the whole scope.** `messages` plus compaction is cheaper, exact, and has no hallucination surface.
+- **You need auditable, schema'd state** (an order status, a subscription tier). Put it in your database and inject it into the system prompt directly. An LLM-reconciled store is the wrong place for anything a `DELETE` decision must never touch.
+- **Latency is critical on every turn and you have no place to put the write.** The extract pass is non-blocking but still runs; on a serverless runtime you must await it before the function freezes.
+
+## The mem0 pipeline, step by step
+
+`remember(messages, scope, seams, opts?)` with `infer: true` (the default) runs five stages. Understanding them explains every option on the page.
+
+1. **`assertScope`** — throws `InvalidRequestError` if the scope is empty. Nothing is written to an unowned scope, ever.
+2. **Extract** — one `MemoryLLM` call with `buildExtractionPrompt`. It asks for `{"facts":[{"text","importance","kind"}]}` (plus `links` when `opts.links` is on). `parseFacts` tolerates ```` ```json ```` fences and surrounding prose, validates each field independently, and returns `[]` rather than throwing on garbage. **If zero facts come back, `remember` returns immediately** — no embed, no search, no decision call.
+3. **Embed + search** — all fact texts go to `Embedder.embed(texts, 'add')` in **one** batch. Then one `store.search` **per fact** gathers the scoped top-K existing memories, deduplicated by record id into a single candidate set.
+4. **Reconcile** — one `MemoryLLM` call with `buildDecisionPrompt`. The candidate records are handed to the model with **temporary integer ids** (`'0'`, `'1'`, …) and their text — never the real UUIDs. The model returns `ADD` / `UPDATE` / `DELETE` / `NOOP` per entry.
+5. **Apply** — the events are enriched (importance/links copied from the extraction), deduplicated by content hash, reduced by `applyEvents` into `MemoryMutation[]`, and (unless `apply: false`) written to the store.
+
+### Why temporary integer ids
+
+This is the single most consequential design decision in the pipeline, and it looks odd until you have watched it fail the other way.
+
+If you hand a model a list of `f1c2a7e0-3b4d-…` UUIDs and ask it to return the ones to update, it will sometimes return a UUID that is *plausible but not in the list* — one digit different, or a blend of two. There is no way to tell a hallucinated UUID from a real one by inspection, so a naive implementation happily issues `DELETE f1c2a7e0-3b4d-…` against a record that does not exist, or worse, against one that does.
+
+Integer handles make hallucination **detectable and harmless**:
+
+- The prompt only ever contains `'0'`…`'n'`, so a returned id is either in the temp→real map or it is not. `parseDecision` looks it up and **drops the event** when it is not — no throw, no guess.
+- Ten records cost ten tokens of ids instead of ~360.
+- `ADD` events carry no id at all, so a model that invents one cannot accidentally address an existing record.
+
+The map is built fresh per call inside `buildDecisionPrompt` and never leaves it, so temp ids cannot leak into a store.
+
+### Cost and latency, exactly
+
+Per `remember` call with `infer: true` (`F` = number of extracted facts):
+
+| Stage | Model calls | Embed calls | Store round-trips |
+| --- | --- | --- | --- |
+| Extract | 1 (0 with `customExtract`) | 0 | 0 |
+| — if `F === 0`, everything below is skipped — | | | |
+| Embed + search | 0 | 1 (batched, only if `embedder` wired) | `F` × `search` |
+| Reconcile | 1 | 0 | 0 |
+| Dedup | 0 | 0 | ≤1 `findByHash` (only if the backend implements it) |
+| Apply | 0 | 0 | ≤1 `upsert`, ≤1 `delete`, 1 `update` per soft-invalidate |
+
+Per `recall` call: **≤1 embed call** (only when the query has `text`, no `embedding`, and an `embedder` is wired) and **1 `store.search`**. Link expansion adds up to 8 `store.get` calls per hop, each falling back to a `store.search` on a miss.
+
+Two escape hatches when that is too much:
+
+- **`infer: false`** — store the raw turns verbatim. **Zero** LLM calls, **zero** embed calls; just a hash per message, an optional `findByHash`, and one `upsert`. Records land as `kind: 'episodic'`. This is the right mode for an audit trail or for ingesting a backlog you will reconcile later.
+- **`recall: false` / `extract: false`** on the [chat option](#built-in-chat-memory-17) — turn off one half without turning off the other. Recall-only is a common shape: a nightly job writes memories, the chat only reads them.
+
+## A working setup, from zero
+
+Everything below compiles against the real signatures. Start with the seams — one object, wired once at app startup and reused.
+
+```ts title="memory-seams.ts"
+import {
+  createEmbedder,
+  type MemoryLLM,
+  type MemorySeams,
+} from '@deuz-sdk/core/memory';
+import { createSqliteStores } from '@deuz-sdk/core/stores/sqlite';
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createGoogleEmbedding } from '@deuz-sdk/core/google';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const google = createGoogleEmbedding({ apiKey: process.env.GOOGLE_API_KEY! });
+
+// A real store: SQLite implements findByHash + deleteExpired, so dedup and the
+// TTL sweep are single statements instead of full scans.
+export const stores = createSqliteStores({ path: './agent.db' });
+
+// The extraction/reconciliation LLM. Use a CHEAP model — both prompts are
+// short, structured, and JSON-only. This is not where quality comes from.
+const llm: MemoryLLM = async ({ system, user }) => {
+  const { text } = await generateText({
+    model: anthropic('claude-haiku-5'),
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+  });
+  return text;
+};
+
+export const seams: MemorySeams = {
+  store: stores.memory,
+  embedder: createEmbedder(google('gemini-embedding-001')),
+  llm,
+  clock: { now: () => Date.now(), setTimeout: (fn, ms) => (setTimeout(fn, ms), () => {}) },
+  generateId: () => crypto.randomUUID(),
+};
+```
+
+Then a chat route. The `memory` option does recall before the first model call and extraction after the run; you write no pipeline code at all.
+
+```ts title="app/api/chat/route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { seams } from '@/lib/memory-seams';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function POST(req: Request): Promise<Response> {
+  const { messages, chatId, userId } = await req.json();
+
+  const result = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    messages,
+    memory: {
+      seams,
+      scope: { userId, chatId },
+      recall: { topK: 8, scorer: 'default', maxChars: 1200 },
+      writePolicy: 'each-turn',
+      sweep: 'on-extract',
+    },
+  });
+
+  // Serverless: the extract pass runs AFTER the response body ends, so the
+  // runtime can freeze the function out from under it. Hand the promise to
+  // your platform's keep-alive primitive — `after()` on Next.js,
+  // `ctx.waitUntil()` on Cloudflare Workers. `result.memory` never rejects.
+  keepAlive(result.memory);
+
+  return toDeuzStreamResponse(result);
+}
+```
+
+<Callout type="warn" title="On serverless, keep `result.memory` alive">
+Extraction is deliberately non-blocking — it starts when the run completes and does not delay a single token. On a long-lived Node server that is free. On Vercel/Cloudflare-style runtimes the function can be frozen the moment the response body ends, silently killing the write. Hand `result.memory` to whatever keeps work alive past the response on your platform; in a plain script or a non-streaming handler, `await result.memory` directly. It never rejects, so awaiting it is safe anywhere.
+</Callout>
+
 ## Built-in chat memory (1.7)
 
 Set `memory` on any call and the loop does the whole cycle for you: **recall** relevant memories into the system context before the first model call, then **extract** new facts after the run (the mem0 extract → reconcile → apply pass) — without blocking the response.
@@ -54,8 +234,10 @@ const mutations = await result.memory; // MemoryMutation[] — never rejects
 
 The contracts:
 
-- **Recall is a call-site splice, never history.** The recall block is computed once per call (queried from the *last user message*, `topK` 5 by default) and spliced into the system context **at the model-call site only** — the canonical history never bakes it in. Consequently [checkpoints](/docs/agents/durable-runtime) and [chat persistence](/docs/modules/chat-persistence) stay recall-free, and resume legs cannot double-inject it. `recall.header` overrides the `'Relevant memories:'` heading.
-- **Extract is non-blocking.** The extract → reconcile → apply pass starts after the run completes and does not delay the response. `result.memory` (on both `GenerateTextResult` and `StreamChatResult`, present only when the call carried `memory` with extraction on) resolves with the applied `MemoryMutation[]` — empty on suspension or error, and it **never rejects**. Suspended runs (approval breaks) skip extraction: the turn is incomplete until the resume leg finishes it. The extraction input is the last user message plus the run's new assistant turns.
+- **Recall is a call-site splice, never history.** The recall block is computed **once per run** (not per step) from the *last user message*, `topK` 5 by default, and spliced into the system context **at the model-call site only** — the canonical history never bakes it in. Consequently [checkpoints](/docs/agents/durable-runtime) and [chat persistence](/docs/modules/chat-persistence) stay recall-free, and resume legs cannot double-inject it. `recall.header` overrides the `'Relevant memories:'` heading. If the history has no user message with text, no query happens and no observation event is emitted.
+- **Where the block lands.** It is appended to the history's leading `system` message when that message has plain string content (separated by a blank line), and otherwise prepended as a **new** `system` message — including when the leading system message carries array content. Your instructions always come first; the memories follow them.
+- **Extract is non-blocking.** The extract → reconcile → apply pass starts after the run completes and does not delay the response. `result.memory` resolves with the applied `MemoryMutation[]` — empty on suspension or error, and it **never rejects**. Suspended runs (approval breaks) and runs an input guardrail blocked skip extraction: the turn is incomplete, and writing a refused turn to long-term memory is precisely what the guardrail was installed to prevent.
+- **What gets extracted.** The last user message from `options.messages` plus the assistant/tool turns this run appended — not the whole history. Re-running a long conversation does not re-extract it.
 - **Best-effort on both halves.** A failing store/embedder/LLM logs via `deps.logger.error` and the chat proceeds — recall failure means the call runs bare; extract failure resolves `[]`.
 - **Zero cost when absent.** No `memory` option → no recall query, no extract pass, no extra promises.
 - **Loop routing.** Like `chat`, setting `memory` routes even a tool-less call through the agentic loop, so `step-start` / `step-finish` parts appear on the stream.
@@ -70,6 +252,13 @@ The contracts:
 | `maxChars` | `number` | — (unbounded) | Hard character budget on the **rendered** block. Before 2.0 it was unbounded: a chatty store could eat the very window compaction had just cleared. |
 | `expandLinks` | `number` | `0` (off) | Graph hops to follow out of the primary hits — see [Graph link expansion](#graph-link-expansion). |
 
+What actually changes when you turn each knob:
+
+- **`topK`** is handed straight to the store and also fixes the expansion budget (`2 × topK` extra records). Raising it costs prompt tokens linearly and, on a store whose `search` returns non-matches with score `0` (both reference backends do, in their text-query path), it pulls in *irrelevant* records rather than *more relevant* ones. Raise `topK` when hits are genuinely being cut off; do not raise it hoping for better ranking.
+- **`maxChars`** is a `slice(0, maxChars)` on the rendered string, applied **after** the header and all bullets are joined. It is a hard cut, not a smart trim: the block can end mid-word, and the final bullet can be halved. Budget it above your longest expected fact — a 400-char cap with 300-char facts truncates the second one every time. This is a **context-budget** control, not a relevance control; it silently drops the lowest-ranked hits.
+- **`scorer: 'default'`** replaces the store's ranking with `w_r·0.995^hoursSince + w_i·importance + w_rel·storeScore`, with all three weights fixed at `1`. Two consequences: a 6-day-old memory has lost half its recency term (`0.995^138 ≈ 0.5`), and a record with **no** `importance` contributes `0` to that term — so a freshly-written unimportant memory can outrank an old, highly relevant one. Recency reads `lastAccessedAt ?? updatedAt`, and **nothing in the SDK ever writes `lastAccessedAt`**, so in practice it is `updatedAt`.
+- **`expandLinks`** only does anything when your records actually carry links — see the caveat under [Importance and links](#importance-and-links-20).
+
 ```ts
 memory: {
   seams,
@@ -80,7 +269,11 @@ memory: {
 }
 ```
 
-The recall block's estimated size is also **added to the compaction fill estimate**. It is spliced in at the model-call site only, so it is invisible to `messages` yet very much visible to the provider — counting it is what keeps the [compaction threshold](/docs/modules/compaction) honest.
+The recall block's estimated size is also **added to the compaction fill estimate**. It is spliced in at the model-call site only, so it is invisible to `messages` yet very much visible to the provider — counting it is what keeps the [compaction threshold](/docs/modules/compaction) honest. The same number is added to the value the token estimator calibrates against, so the EMA compares like with like.
+
+<Callout type="warn" title="The scorer's weights are not configurable from here">
+`MemoryScorer.score` receives an optional `ctx.weights`, but neither `recall` nor the chat option ever passes one — `defaultMemoryScorer` always runs at `{ recency: 1, importance: 1, relevance: 1 }`. To weight differently, write your own `MemoryScorer` (it is a one-method interface) and pass the instance instead of `'default'`.
+</Callout>
 
 ### Write policy (2.0)
 
@@ -93,8 +286,29 @@ The recall block's estimated size is also **added to the compaction fill estimat
 | `'manual'` | **Does nothing.** | Call `remember()` whenever you decide. |
 
 <Callout type="warn" title="'session-end' and 'manual' are identical at loop level">
-Both return no extract promise at all. They differ only in what the **host** is expected to do afterwards, and the SDK cannot observe either moment — it has no idea when a session ends. Choosing `'session-end'` does not schedule anything; it means *you* own the write. Say so out loud in your own code, because the two values look like they do different things and they do not.
+Both suppress the extract pass entirely. They differ only in what the **host** is expected to do afterwards, and the SDK cannot observe either moment — it has no idea when a session ends. Choosing `'session-end'` does not schedule anything; it means *you* own the write. Say so out loud in your own code, because the two values look like they do different things and they do not.
 </Callout>
+
+They also differ in one observable way between the two entry points: with a suppressing policy `streamChat`'s `result.memory` is still present and resolves `[]` (the field is created from the `memory` + `extract !== false` test alone), while `generateText`'s `result.memory` is **absent** (it is only attached when a pass actually started). Do not use the presence of `result.memory` to detect whether a write happened — read the array.
+
+Doing the write yourself at session end is three lines. Recall stays on the whole time; only the write moves:
+
+```ts title="session-end-write.ts"
+import { remember } from '@deuz-sdk/core/memory';
+
+// …during the session: recall on, writes suppressed
+const result = streamChat({
+  model,
+  messages,
+  memory: { seams, scope, writePolicy: 'session-end' },
+});
+
+// …when the user closes the chat / the websocket drops / a cron sweeps
+// idle sessions: one pass over the whole transcript.
+await remember(fullTranscript, scope, seams, { links: true });
+```
+
+That single closing call is strictly cheaper than one pass per turn (two LLM calls total instead of two per turn) and reconciles against a complete conversation, which usually produces better facts. The trade is durability: a session that never "ends" — a crashed tab, a killed worker — is never written at all.
 
 `extract: false` still wins over any policy: it disables extraction outright.
 
@@ -113,6 +327,8 @@ const removed = await sweepExpired(store, { userId: 'u_1' }, clock);
 
 `sweepExpired` hard-deletes even under a `supersede: 'soft'` policy — an expiry is a lifetime ending, not a fact being contradicted. A backend that implements the optional `deleteExpired` does it in one statement; otherwise it is `list` + filter + `delete`, which is correct everywhere and cheap for the reference backends. The [store packs](/docs/modules/stores) expose the unscoped `sweepExpiredMemories()` for the same job across every scope.
 
+Two things the sweep does not do: it runs **only in the scope of the call that triggered it**, so `sweep: 'on-extract'` never collects another user's expired rows; and it is chained after *every* extraction, so on a backend without `deleteExpired` (the markdown vault, for one) it is a full `list` of the scope on every turn. On the reference backends that is cheap; on a large scope with no `deleteExpired`, prefer a cron.
+
 ### Write-time hash dedup (2.0)
 
 An `ADD` whose content hash is already spoken for is **dropped before it is written** — within the same batch, among the records the reconciliation pass retrieved, or (fast path) in the store via the optional `findByHash`.
@@ -121,26 +337,37 @@ A dropped `ADD` leaves **no trace**: emitting a `NOOP` would tell you a record w
 
 Without `findByHash` the store-level check is skipped entirely rather than scanning every record of every scope on every turn, which would cost more than the duplicate row it saves. A backend that wants dedup implements the method; SQLite and Postgres do.
 
+<Callout type="warn" title="Hash dedup is byte-exact, and that is all it is">
+`defaultHashFn` is SHA-256 over the fact string. "User lives in Berlin." and "User lives in Berlin" are two different hashes and two different records. Deduplicating *paraphrases* is the reconciliation pass's job — and it can only see the top-K records it retrieved, so a near-duplicate outside that window survives. If your store is filling with restatements, raise `RememberOptions.topK` before you blame the hash.
+</Callout>
+
 ### Importance and links (2.0)
 
-The extraction pass can now attach two things to each fact:
+The extraction pass can attach two things to each fact:
 
-- **`importance`** — a number the `defaultMemoryScorer` weighs alongside recency and relevance.
+- **`importance`** — a `0..1` number the `defaultMemoryScorer` weighs alongside recency and relevance. `parseFacts` clamps it into range and drops anything non-finite.
 - **`links`** — graph edges, requested with `RememberOptions.links: true`. They land on `metadata.links`, which is the same shape the markdown backend writes for `[[wikilinks]]`.
 
-Both are copied onto the `ADD` events by **exact fact-text match**. Deliberately not fuzzy: when the reconciliation pass rewrote the wording, the numbers no longer describe that string, and a wrong importance is worse than none.
+Both are copied onto the `ADD` events by **exact fact-text match**. Deliberately not fuzzy: when the reconciliation pass rewrote the wording, the numbers no longer describe that string, and a wrong importance is worse than none. In practice this means an `UPDATE` never inherits a fresh importance — it keeps the previous record's — and an `ADD` whose text the reconciler rephrased gets none.
+
+<Callout type="warn" title="The chat option never asks for links">
+The loop's automatic extract calls `remember(turns, scope, seams, { infer })` and nothing else. It does **not** pass `links: true`, `kind`, `ttlMs`, `topK` or `supersede` — those are `remember`-level options only. So `recall.expandLinks` on the chat option has nothing to traverse unless the links got there another way: a manual `remember(..., { links: true })`, hand-authored `[[wikilinks]]` in a markdown vault, or your own writes to `metadata.links`. Turning `expandLinks` on with an all-automatic write path is a no-op that still costs the `store.get` round-trips.
+</Callout>
 
 ### Graph link expansion
 
 `recall.expandLinks: n` (or `recall(query, seams, { expandLinks: n })`) walks up to `n` hops out of the primary hits, following each record's `metadata.links` plus every `[[wikilink]]` in its body.
 
 - **Linked records are appended, never interleaved.** The primaries keep the head of the list exactly as scoring left them, so turning expansion on can only add context, never displace it.
-- **Score decays per hop:** a neighbour scores `parent.score × 0.5 ** hop`, so it can never outrank what pulled it in.
-- **Three caps:** a `seen` set of record ids terminates an A↔B cycle, fan-out is capped at 8 targets per hop, and the whole expansion at `2 × topK` extra records.
-- **A link resolves as an id first** (`store.get`), then as a title/text search — so `[[project-atlas]]` finds a record whether that is its id or its subject.
-- **Best-effort:** a store that throws mid-walk logs and yields the primaries plus whatever was already resolved.
+- **Score decays per hop:** a neighbour scores `parent.score × 0.5 ** hop`, so a 1-hop neighbour is worth at most half its parent and can never outrank what pulled it in. This is what makes appending safe when a scorer runs — the decayed scores are still comparable numbers, not sentinels.
+- **Three caps, all of them fuses rather than budgets:** a `seen` set of record ids terminates an A↔B cycle, fan-out stops at **8 targets per hop** (counted across the whole frontier, not per record), and the entire expansion at **`2 × topK`** extra records.
+- **A link resolves as an id first** (`store.get`), then as a title/text search with `topK: 1` — so `[[project-atlas]]` finds a record whether that is its id or its subject. A text hit with score `0` is rejected, which is what keeps a grep-style store from resolving every link to an arbitrary record.
+- **Soft-deleted and expired records are skipped** during the walk (`invalidAt != null` or `expiresAt` passed), even though the primaries were only filtered for expiry.
+- **Best-effort:** a store that throws mid-walk logs via `seams.logger?.warn` and yields the primaries plus whatever was already resolved.
 
 Surrounding brackets are stripped when reading `metadata.links`, because both spellings mean the same node (the markdown backend round-trips `links: ["[[project]]"]` while an LLM-extracted fact writes `"project"`) and without normalization the same neighbour would be visited twice.
+
+The cost is real: one hop with a full frontier is up to 8 `store.get` calls plus up to 8 `store.search` calls, sequentially. Start at `expandLinks: 1` and measure before going deeper.
 
 ### Observation
 
@@ -151,7 +378,7 @@ A call with `memory` emits the auxiliary `operation.*` events under the `'memory
 | `memory.recall` | One span per recall, with `resultCount` = hits. Nothing is emitted when there is no query text — an `operation.started` with no terminal would be a lie. |
 | `memory.extract` | `started` fires synchronously (the write is in flight from there); `completed` / `failed` land whenever the pass settles, which is **after** the run's terminal event. |
 
-Without an observer the fast path applies: no event objects are built and no extra ids are drawn. See [Observability](/docs/modules/observability).
+Both parent under the **run** span, not a step's: the extraction covers the whole turn and outlives every step boundary. Without an observer the fast path applies: no event objects are built and no extra ids are drawn. See [Observability](/docs/modules/observability).
 
 The sections below document the underlying pipeline — what the option automates, and the surface you use directly for non-chat shapes (batch ingestion, custom recall placement, model-driven memory tools).
 
@@ -170,6 +397,12 @@ interface MemoryScope {
 }
 ```
 
+Matching is **exact**, and only over the fields the *query* sets. `matchesScope` ignores a scope field the query left `undefined`, so a `{ userId }` query matches every record whose `userId` agrees, whatever else that record carries; a `{ userId, chatId }` query matches only records written in that chat. Scope is a filter, not a namespace — there is no hierarchy and no wildcard.
+
+The rule that follows: **write with the narrowest scope you might ever want to filter on, and read with the widest you want to see.** Writing `{ userId, chatId }` and recalling with `{ userId }` gives you cross-conversation memory that can still be pruned per conversation. Writing with `{ userId }` alone throws that option away permanently, because nothing records which chat the fact came from.
+
+Note that the reconciliation pass is scoped too: facts extracted in one scope are only ever compared against existing records in that same scope. Two scopes can therefore hold contradicting facts indefinitely, and nothing will notice.
+
 ## The seams
 
 `remember` / `recall` / `planMemory` take a `MemorySeams` object. The store and an LLM callback are required; everything else has a pure default or is optional.
@@ -182,7 +415,9 @@ interface MemoryScope {
 | `generateId` | `() => string` | yes | New record ids. |
 | `embedder` | `Embedder` | no | Needed only when a vector store searches by embedding and the query has none. |
 | `hashFn` | `HashFn` | no | Content hash for dedupe. Default: WebCrypto SHA-256 hex (`defaultHashFn`). |
-| `logger` | `{ warn(...) }` | no | Optional warning sink. |
+| `logger` | `{ warn(...) }` | no | Optional warning sink — currently used by link expansion. |
+
+`llm` is required by the type even when you never infer. A recall-only or `infer: false` deployment can pass a stub that throws; nothing will call it.
 
 `MemoryLLM` is a thin wrapper over [generateText](/docs/core/generate-text) — prompt in, raw text out. The fact and decision parsers tolerate ```` ```json ```` fences and surrounding prose.
 
@@ -217,6 +452,12 @@ const google = createGoogleEmbedding({ apiKey: process.env.GOOGLE_API_KEY! });
 const embedder = createEmbedder(google('gemini-embedding-001'));
 ```
 
+<Callout type="warn" title="Without an embedder, recall is substring matching">
+Both reference stores fall back to a case-insensitive `includes()` when the query has no embedding. The in-memory store scores non-matches `0` and **still returns them** up to `topK` — so `recall` can hand you completely unrelated memories with score `0`, and `formatMemoriesForPrompt` will happily render them into the system prompt. The markdown store drops zero-score grep hits, so it behaves differently on the same data. If you rely on the no-embedder path, set a `scorer` or filter `hit.score > 0` yourself.
+</Callout>
+
+Changing embedding models later is a silent break: `cosineSimilarity` returns `0` on a length mismatch, so records written at 768 dimensions simply stop surfacing once queries are 1536-dimensional — no error, no warning. `MemoryRecord.embeddingModelId` records which model wrote each vector (that is what it is for), but **nothing validates it**. Re-embed on a model change, or scope the change to new records only.
+
 ## The MemoryStore seam
 
 One interface backs every backend. `search` owns its own ranking (cosine, BM25, grep, or hybrid), so a full-text markdown store and a vector store are drop-in interchangeable.
@@ -239,7 +480,16 @@ interface MemoryStore {
 }
 ```
 
+Writing your own backend is mostly about honoring four unwritten rules the reference implementations follow, because the pipeline depends on them:
+
+1. **`search` and `list` must exclude soft-deleted records** (`invalidAt != null`). A `supersede: 'soft'` DELETE is meant to disappear from retrieval while staying in history.
+2. **`search` must respect `query.topK`** (default 5) and return hits sorted by descending score. `recall` does not re-sort unless a `scorer` is given.
+3. **`get(id, scope)` must return `null` when the record exists but the scope does not match** — link resolution relies on it as an ownership check.
+4. **`findByHash` must apply the same soft-delete filter.** Otherwise an invalidated fact permanently blocks the model from learning it again.
+
 The two 2.0 methods are **optional on purpose**: their fallbacks (`list` + an in-memory hash scan, `list` + filter + `delete`) are correct everywhere and cheap for the in-memory and markdown backends, but wrong for a SQL table with a `hash` index. Omitting them keeps a pre-2.0 store valid; implementing them turns an O(all records) scan into one statement. The [SQLite and Postgres packs](/docs/modules/stores) implement both.
+
+`update` is optional too, and its absence changes behavior rather than failing: a `supersede: 'soft'` invalidate falls back to a **hard delete**, and `memory_update` falls back to a read-modify-`upsert`.
 
 ### Production backends
 
@@ -247,13 +497,7 @@ The reference stores are exactly that. For a real deployment use a [store pack](
 
 ## remember
 
-`remember(messages, scope, seams, opts?)` returns the `MemoryMutation[]` it produced (and, by default, applies them to the store). The pipeline:
-
-1. `assertScope` — guard the scope.
-2. **Extract** — the LLM pulls standalone, durable facts (or `customExtract` replaces this step).
-3. **Embed + search** — embed each fact and gather the scoped top-K existing memories to reconcile against.
-4. **Reconcile** — existing memories are sent to the LLM with **temporary integer ids** (`'0'`, `'1'`, …) instead of real UUIDs. This keeps tokens low and stops the model hallucinating ids — any id it returns that isn't in the temp→real map is dropped. The model emits `ADD` / `UPDATE` / `DELETE` / `NOOP`.
-5. **Apply** — events reduce to concrete mutations and (unless `apply: false`) are written to the store.
+`remember(messages, scope, seams, opts?)` runs [the pipeline above](#the-mem0-pipeline-step-by-step) and returns the `MemoryMutation[]` it produced (and, by default, applies them to the store). It never mutates `messages`, and every timestamp comes from `seams.clock` — the same call with the same clock and the same scripted LLM output produces byte-identical records, which is what makes it testable.
 
 ### Options
 
@@ -261,15 +505,15 @@ The reference stores are exactly that. For a real deployment use a [store pack](
 | --- | --- | --- | --- |
 | `infer` | `boolean` | `true` | `false` → store raw turns verbatim, **zero** LLM/embed calls (mem0 `infer=False`). |
 | `apply` | `boolean` | `true` | `false` → plan-only; return mutations without writing (host applies). |
-| `topK` | `number` | `5` | Existing-memory retrieval breadth for reconciliation. |
-| `supersede` | `'soft' \| 'hard'` | `'hard'` | `soft` → set `invalidAt` instead of deleting (bi-temporal history). |
-| `ttlMs` | `number` | — | Absolute expiry written as `expiresAt`. |
-| `kind` | `MemoryKind` | `'semantic'` (`'episodic'` when `infer: false`) | `'episodic' \| 'semantic' \| 'working' \| 'procedural'`. |
+| `topK` | `number` | `5` | Existing-memory retrieval breadth for reconciliation — per fact, then deduped by id. |
+| `supersede` | `'soft' \| 'hard'` | `'hard'` | `soft` → set `invalidAt` instead of deleting (bi-temporal history). Falls back to a hard delete on a store with no `update`. |
+| `ttlMs` | `number` | — | Absolute expiry written as `expiresAt`. An `UPDATE` keeps the previous record's `expiresAt` if it had one. |
+| `kind` | `MemoryKind` | `'semantic'` (`'episodic'` when `infer: false`) | Fallback only — a `kind` the extraction pass produced wins. |
 | `customInstructions` | `string` | — | Appended to the extraction system prompt. |
-| `customExtract` | `(messages) => MemoryFact[]` | — | Replace the LLM extraction step entirely. |
+| `customExtract` | `(messages) => MemoryFact[]` | — | Replace the LLM extraction step entirely (sync or async). Skips the extraction call; everything downstream still runs. |
 | `links` | `boolean` | `false` | Ask the extraction pass for per-fact graph links (2.0). Costs a few prompt tokens; lands on `metadata.links`, which `recall`'s `expandLinks` traverses. |
 
-`planMemory(...)` is the plan-only alias (`apply: false`) for hosts that defer writes.
+`planMemory(...)` is the plan-only alias (`apply: false`) for hosts that defer writes. It is the right shape when the write must join a transaction you own, or when a human approves memory changes before they land.
 
 ### Full remember / recall cycle
 
@@ -327,9 +571,27 @@ for (const hit of hits) console.log(hit.score, hit.record.text);
 
 The `clock` and `generateId` above make those sources explicit at your **app** layer. If you omit them, `resolveDependencies` supplies equivalent host-clock and WebCrypto defaults; inference code still consumes only the resolved seams.
 
+Watching the reconciliation work is the fastest way to build intuition. Feed it a contradiction:
+
+```ts
+// Turn 1 → ADD "The user is vegetarian."
+await remember([{ role: 'user', content: 'I went vegetarian.' }], scope, seams);
+
+// Turn 2 → the decision pass sees the existing fact under temp id '0' and
+// returns { id: '0', event: 'UPDATE', text: 'The user eats fish but no meat.' }
+const mutations = await remember(
+  [{ role: 'user', content: 'Actually I eat fish now, just no meat.' }],
+  scope,
+  seams,
+);
+// [{ op: 'upsert', event: 'UPDATE', record: { id: <same id>, … } }]
+```
+
+The record id is preserved, `createdAt` is preserved, `updatedAt` moves, and the old text is kept at `metadata.prevText`. Nothing accumulates.
+
 ## recall
 
-`recall(query, seams, opts?)` embeds the query (if it has `text`, no `embedding`, and an `embedder` is wired), runs `store.search`, drops expired records, then optionally reranks.
+`recall(query, seams, opts?)` embeds the query (if it has `text`, no `embedding`, and an `embedder` is wired), runs `store.search`, drops expired records, then optionally reranks and expands links.
 
 ```ts
 interface MemoryQuery {
@@ -349,11 +611,13 @@ interface MemoryQuery {
 | `scorer` | `MemoryScorer` | — | Rerank by recency · importance · relevance (`defaultMemoryScorer` provided). |
 | `expandLinks` | `number` | `0` | Follow graph links out of the primary hits (2.0) — see [Graph link expansion](#graph-link-expansion). |
 
-`formatMemoriesForPrompt(hits, opts?)` renders the hits into a bulleted block for splicing into a system prompt (empty string when there are no hits). `opts` accepts `header` (default `'Relevant memories:'`) and `maxChars` (hard-truncates the rendered block to bound prompt-token cost).
+`asOf` and `filter` are passed through to `store.search` untouched — `recall` gives them no meaning. The reference backends ignore both; a backend that wants bi-temporal queries or metadata filtering implements them itself.
+
+`formatMemoriesForPrompt(hits, opts?)` renders the hits into a bulleted block for splicing into a system prompt (empty string when there are no hits). `opts` accepts `header` (default `'Relevant memories:'`) and `maxChars` (hard-truncates the rendered block to bound prompt-token cost). Scores are **not** rendered — the model sees facts, not confidence numbers.
 
 ## Injecting memory into a chat loop (manual)
 
-This is what the [`memory` call option](#built-in-chat-memory-17) automates — do it by hand when you need custom recall placement or synchronous writes. Recall before the model call, splice the memories into the system prompt, then `remember` the turn afterward. Use `planMemory` if you prefer to apply the write asynchronously.
+This is what the [`memory` call option](#built-in-chat-memory-17) automates — do it by hand when you need custom recall placement (mid-prompt, or as a tool result rather than a system block), synchronous writes, or a different query than "the last user message".
 
 ```ts title="chat-with-memory.ts"
 import { generateText, type Message } from '@deuz-sdk/core';
@@ -383,6 +647,8 @@ async function chat(userText: string): Promise<string> {
 }
 ```
 
+Note what you give up by doing it manually: the recall block now lives in the array you pass, so if you persist that array it is baked into your history, and compaction will count it as ordinary messages rather than as call-site overhead. The built-in option exists precisely to keep the block out of the canonical history.
+
 ### Model-driven memory (tools)
 
 Alternatively, let the model manage memory itself. `createMemoryTools({ scope, seams })` returns a `ToolSet` — `memory_append`, `memory_search`, `memory_update`, `memory_delete`, `memory_view` — whose `execute` delegates to the store. Pass it as `tools` to [generateText](/docs/core/generate-text) or [streamChat](/docs/core/stream-chat).
@@ -400,13 +666,40 @@ const { text } = await generateText({
 });
 ```
 
+<Callout type="warn" title="The tools bypass the pipeline — including embedding">
+`memory_append` writes the record the model dictated: no extraction, no reconciliation, no hash dedup, and **no embedding**. On a vector-ranked store those records score `0` against every embedded query and effectively never surface through `memory_search` or `recall`. `memory_update` has the same gap in reverse: it rewrites `text` and `hash` but leaves the old vector in place, so the record is now findable by the wrong meaning.
+
+Use the tools when the model should *curate* memory in a store you search lexically (a markdown vault), or alongside `remember` rather than instead of it. If you need embedded records from the tool path, wrap `memory_append` yourself and embed before `upsert`.
+</Callout>
+
+The tools are also unbounded: nothing rate-limits how much a model may append, and `memory_delete` takes an id with no confirmation step. The returned `ToolSet` is a plain object, so narrow it or harden it before handing it over — `needsApproval` routes the call through the [approval gate](/docs/agents/client-tools) instead of executing it:
+
+```ts
+const memoryTools = createMemoryTools({ scope, seams });
+
+// Read-only: the model consults memory; only `remember` ever writes it.
+const tools = {
+  memory_search: memoryTools.memory_search,
+  memory_view: memoryTools.memory_view,
+};
+```
+
+To keep the write path instead, set `needsApproval: true` on the `memory_delete` / `memory_update` entries before passing the set along.
+
 ## Markdown vault backend (Node)
 
-`createMarkdownMemoryStore({ dir, vectors? })` writes one human-readable `<id>.md` file per record — YAML frontmatter (`id`, `kind`, scope, `tags`, `[[wikilinks]]`, timestamps) plus the fact as the body. It is git-versionable and editable by hand or in Obsidian.
+`createMarkdownMemoryStore({ dir, vectors? })` writes one human-readable `<id>.md` file per record — YAML frontmatter (`id`, `hash`, `kind`, scope fields, `importance`, timestamps, plus every `metadata` key that serializes as a scalar or string array) and the fact as the body. It is git-versionable and editable by hand or in Obsidian.
 
 Embeddings never pollute the markdown: when a record carries one, it is stored in a hidden `.deuz-vectors.json` sidecar in the same directory. `search` does cosine ranking when a query embedding and stored vectors are available, and falls back to grep/full-text otherwise (`vectors: false` disables the sidecar for a pure grep store). The sidecar reloads across fresh store instances, so embeddings persist.
 
 This backend is Node-only (it lazy-imports `node:fs/promises`) and is **not** bundled into edge-safe core. It implements the same `MemoryStore` interface, so it drops straight into the `seams` above.
+
+Know its limits before you put a real workload on it:
+
+- **Every `search` and `list` reads the whole directory** — parse every `.md` on every call. Fine for hundreds of records and a human-auditable vault; not a database.
+- **It implements neither `findByHash` nor `deleteExpired`**, so write-time store-level dedup is skipped entirely and `sweepExpired` falls back to `list` + `delete`.
+- **The frontmatter parser is a focused subset**, not YAML: one `key: value` per line, scalars and flat string/number arrays. Nested objects in `metadata` are dropped on write.
+- **No locking.** Two processes writing the same vault will race on the sidecar file.
 
 ```ts title="markdown-vault.ts"
 import {
@@ -472,6 +765,23 @@ validAt: 1717286400000
 Our SLA is 24 hours for tier-1 tickets.
 ```
 
+Because the vault is plain markdown, `[[wikilinks]]` you write by hand in the body are read back by `extractLinks` exactly like model-produced `metadata.links` — which makes this backend the easiest place to try [link expansion](#graph-link-expansion) without changing your write path.
+
+## Pitfalls, collected
+
+| Surprise | Why | What to do |
+| --- | --- | --- |
+| Recall injects unrelated memories | No embedder → substring match; the in-memory store returns score-`0` non-matches up to `topK` | Wire an `Embedder`, or filter `hit.score > 0` |
+| `expandLinks` does nothing | The chat option's extract never passes `links: true` | Write links via `remember(..., { links: true })`, a markdown vault, or your own `metadata.links` |
+| The store keeps growing despite `ttlMs` | `expiresAt` only hides a record at read time | `sweep: 'on-extract'`, or `sweepExpired` from a cron |
+| Near-duplicate facts pile up | Hash dedup is byte-exact; the reconciler only sees the top-K it retrieved | Raise `RememberOptions.topK` |
+| Old memories stopped surfacing after a model swap | `cosineSimilarity` returns `0` on dimension mismatch — silently | Re-embed, or version your scope |
+| `defaultMemoryScorer` ranks a trivial new fact first | `importance` defaults to `0` and recency is weighted equally with relevance | Write a custom `MemoryScorer` with your own weights |
+| The recall block ends mid-sentence | `maxChars` is a hard `slice`, applied after rendering | Raise the budget above your longest fact |
+| Memories written by `memory_append` are never found | The tools do not embed | Embed in your own wrapper, or use a lexical store |
+| Nothing was written on a serverless deploy | The extract pass runs after the response ends | `await result.memory` before returning |
+| `result.memory` is missing on `generateText` | A suppressing `writePolicy` means no pass started | Read the resolved array, not the field's presence |
+
 ## Pure helpers
 
 These are exported for testing and custom backends — all deterministic, no I/O:
@@ -490,6 +800,8 @@ These are exported for testing and custom backends — all deterministic, no I/O
 | `extractLinks(record)` | The record's outgoing edges: `metadata.links` plus every `[[wikilink]]` in the body, deduped and bracket-normalized (2.0). |
 | `sweepExpired(store, scope, clock)` | TTL garbage collection; returns how many records were removed (2.0). |
 
+The prompt builders and parsers being public is deliberate: they let you unit-test your reconciliation behavior against recorded LLM output with no network, and they let you swap one half of the pipeline (`customExtract` + `buildDecisionPrompt`) without reimplementing the other.
+
 ### Reusing a RAG embedder
 
 `memoryEmbedderFromRag(ragEmbedder, opts?)` adapts a [RAG](/docs/modules/rag) `Embedder` — `embed(texts) => number[][]` — to the memory seam, which additionally takes an `action` (`'add' | 'search' | 'update'`) and reports a model id. One embedding setup, both subsystems:
@@ -505,6 +817,8 @@ const seams = {
   generateId,
 };
 ```
+
+The `action` is dropped — a RAG embedder has no task-type parameter to pass it to. If your provider distinguishes query embeddings from document embeddings (Gemini does), prefer `createEmbedder`, which maps `'search'` to `search_query` and everything else to `search_document`. Pass `modelId` if you want the dimension-drift marker on written records; without it they are pinned to `'unknown'`.
 
 ## See also
 

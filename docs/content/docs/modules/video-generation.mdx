@@ -17,6 +17,29 @@ Everything is pure and edge-safe: HTTP goes through `deps.fetch`, the poll delay
 
 Video models are a **separate kind** from chat `LanguageModel` (`surface: 'video'`), like `ImageModel`. They cannot be passed to [streamChat](/docs/core/stream-chat) or [generateText](/docs/core/generate-text).
 
+<Callout type="warn" title="Verified against mocks, and the wire shape is a best guess">
+Two separate caveats, and the second is the bigger one.
+
+**No live test.** Everything here is pinned by unit tests (`test/video.test.ts`) that drive the module through an injected `deps.fetch` — the URLs, the multipart switch, the status normalization, the abort-listener hygiene, the poll cadence. That proves the SDK behaves as described. It does not prove a relay accepts it: this module has no live-API test, and `test/live/` covers DeepSeek, Google, and xAI only.
+
+**The relay wire is less standardized than the chat wire.** There is no cross-vendor "Videos API" the way there is for Chat Completions. `POST /videos` → `GET /videos/{id}` → `GET /videos/{id}/content` is the OpenAI shape, and Yunwu and the other aggregators mirror it *today* — but path, envelope, and field names all vary between hosts, and Yunwu's exact response body in particular is not something this SDK has verified end to end.
+
+That is precisely why this module is built the way it is: [statuses are normalized](#normalization--the-tolerant-half) from a dozen spellings, the result URL is read from four different keys, `raw` always carries the untouched JSON, and the relay root is a **setting** — [`createVideoProvider({ baseURL })`](#creating-video-model-descriptors) — rather than a constant. If your host mounts jobs elsewhere or names a field differently, point `baseURL` at the right root and read `task.raw`; you should not need an SDK release.
+</Callout>
+
+## When to use it
+
+Reach for this when a clip is a **deliverable**, not part of a conversation: a marketing asset, a product shot, a background loop, a storyboard frame brought to life. The whole design assumes minutes, not seconds — you submit, you go away, you come back.
+
+Do **not** reach for it when:
+
+| Situation | Why not |
+| --- | --- |
+| You want a video inside a chat turn | A job takes minutes. Nothing here is a tool a model can usefully `await` inside a loop; hand back a job id and let the UI poll. |
+| You want to hold an HTTP request open until it finishes | The default deadline is 10 minutes. Use [submit-then-poll](#the-pieces) with a queue. |
+| You want frame-level control, editing, or concatenation | Not modeled. One prompt in, one clip out. |
+| You want to know the price before committing | Nothing here reports cost — see [what this costs](#what-it-costs-and-how-long-it-takes). |
+
 ## generateVideo
 
 `generateVideo` is the one-call entry point: it submits the job, polls it to a terminal status, and — with `download: true` — fetches the finished clip's bytes.
@@ -124,6 +147,57 @@ if (task?.status === 'completed') {
 `fetchVideoTask` returns `null` — not an error — when the relay says the job does not exist (a `404`, or an envelope with neither an id nor a status). Every other failing status maps to a typed error.
 
 `waitForVideo` stops at `completed` or `failed`, otherwise polls at `pollIntervalMs` until `timeoutMs` elapses (throwing a `TimeoutError`). An aborted `signal` rejects with an `AbortError`.
+
+### Four things the poll loop will do that may surprise you
+
+<Callout type="warn" title="A job id the relay does not know polls to the timeout">
+`waitForVideo` treats a `null` from `fetchVideoTask` as "not ready yet", not as "gone" — the two are indistinguishable on a relay that returns `404` for a few seconds after accepting a job. So a **typo'd or expired id waits the full `timeoutMs`** (ten minutes by default) and then throws a `TimeoutError`.
+
+If you poll ids that may not exist, call `fetchVideoTask` yourself and decide what `null` means in your system, rather than handing the id to `waitForVideo`.
+</Callout>
+
+- **An unrecognized status is not terminal.** The [alias table](#normalization--the-tolerant-half) covers the spellings the aggregators use; anything else passes through verbatim and keeps polling. A relay that finishes with, say, `finished` — a word not in the table — polls to the timeout even though the job is done. `onProgress` is where you would notice; `task.raw` is where you would confirm it.
+- **`timeoutMs` is a floor, not a ceiling.** The elapsed check runs *after* each poll, so the real deadline is `timeoutMs` plus one poll interval plus one request. With the defaults that is up to ~10:05, not 10:00.
+- **`onProgress` fires per poll, not per change.** It gets a snapshot every `pollIntervalMs` whether or not anything moved, and it is skipped entirely when the poll came back `null`. Deduplicate on `task.progress` yourself if you are pushing to a UI.
+- **A five-second cadence is a choice, not a law.** `pollIntervalMs` costs you one HTTP request per tick against a relay that may rate-limit. Ten minutes at the default is ~120 requests per job; raise the interval for long models and lower it only for jobs you know are quick.
+
+### The production shape: submit here, poll there
+
+Holding a connection open for ten minutes is the failure mode this API is designed to let you avoid. The state that matters is one string — the job id.
+
+```ts title="worker.ts"
+import { submitVideo, fetchVideoTask, downloadVideo } from '@deuz-sdk/core/video';
+import { createYunwuVideo } from '@deuz-sdk/core/yunwu';
+
+const video = createYunwuVideo({ apiKey: process.env.YUNWU_API_KEY! });
+
+/** HTTP handler: returns in one round-trip. */
+export async function enqueue(prompt: string): Promise<string> {
+  const job = await submitVideo({ model: video('sora-2'), prompt, size: '1280x720' });
+  await jobs.insert({ id: job.id, status: job.status, prompt });
+  return job.id; // the client polls YOUR endpoint, not the relay
+}
+
+/** Cron/queue worker: one tick per job, no long-lived poll loop at all. */
+export async function tick(jobId: string): Promise<void> {
+  const task = await fetchVideoTask(jobId, { model: video('sora-2') });
+  if (!task) return; // unknown yet — the relay may still be registering it
+
+  await jobs.update(jobId, { status: task.status, progress: task.progress });
+
+  if (task.status === 'completed') {
+    const { video: bytes, mediaType } = await downloadVideo(task.id, { model: video('sora-2') });
+    await storage.put(`${task.id}.mp4`, bytes, mediaType);
+  }
+  if (task.status === 'failed') {
+    await jobs.update(jobId, { error: task.failReason ?? 'unknown' });
+  }
+}
+```
+
+Two details that make this work: the model descriptor is **just settings** (key, baseURL, headers on a private symbol), so re-minting it in the worker addresses the same relay without any shared state; and `fetchVideoTask` is the one function here that emits **no** observation event, so a tight polling worker does not flood your observer — only `video.submit`, `video.wait`, and `video.download` do.
+
+Give the worker its own idea of "too old". `waitForVideo`'s timeout only exists inside one process; a job row that has been `in_progress` for an hour is your database's problem to notice.
 
 ### VideoTask
 
@@ -246,6 +320,25 @@ const task = await fetchVideoTask(jobId, {
   baseURL: 'https://yunwu.ai/v1',
 });
 ```
+
+## What it costs, and how long it takes
+
+The honest answer to both is: the SDK does not know, and does not pretend to.
+
+- **No usage, no cost.** `VideoTask` has no usage field, `deps.priceProvider` is never consulted, [`PRICES_2026`](/docs/modules/pricing) has no video rows, and no cost event reaches the observation stream. What you *do* get is `task.seconds` and `task.size` as the relay reports them — the two inputs every vendor prices on — plus `raw` if the relay put a cost in its envelope. Meter on your side, per job.
+- **Duration is unbounded in practice.** The defaults (`pollIntervalMs: 5000`, `timeoutMs: 600_000`) encode the assumption that a clip takes minutes. A long or busy model can exceed ten minutes; that is a `TimeoutError`, not a failure of the job, and the job may well finish afterwards — which is another reason to store the id rather than rely on the poll.
+- **Every knob that costs money is provider-specific.** `size` and `seconds` are the only canonical ones, and both are pass-through strings the SDK never validates. Resolution tiers, frame rates, and quality presets live in [`providerOptions`](#provideroptions), spelled the way your relay spells them.
+
+A `failed` job may still have cost you — the relay decides that, not this SDK. Log `task.id` and `task.failReason` on every failure; they are what a support ticket needs.
+
+## What `generateVideo` does not do
+
+- **No streaming and no partial output.** There is no progressive preview; `progress` is a number the relay reports, nothing more.
+- **No retries, no breaker.** Like every media module this is a plain `fetch` per step. A `429` on submit is an immediate `RateLimitError` carrying `retryAfterMs`; retrying is yours. (The *poll* naturally retries, because polling is what it does — but a poll that throws, throws.)
+- **No cancellation of the remote job.** Aborting the `signal` stops *your* polling and rejects with `AbortError`. There is no `DELETE /videos/{id}` here, so the relay may keep generating — and billing.
+- **No resume across processes.** `waitForVideo` holds no state; it is a loop over `fetchVideoTask`. That is a feature (any process holding the id can take over), but it means nothing recovers a lost id.
+- **No capability matrix, no model catalog.** `VideoModel` is not a `LanguageModel`, so [`getModelCapabilities`](/docs/advanced/model-registry) does not apply and there is no per-slug registry. [`YUNWU_VIDEO_MODELS`](/docs/providers/yunwu) is a pinned list of what that one relay served when it was checked, not a validated enum — any string reaches the wire.
+- **No input validation.** `size`, `seconds`, and every `providerOptions` key go to the relay untouched. A bad `size` is a `4xx` from the host, not a local error.
 
 ## Observation
 

@@ -5,7 +5,9 @@
  *
  * ```ts
  * import { createFileTokenStore, createLoopbackRedirect } from '@deuz-sdk/core/mcp/node';
- * import { createMcpClient, McpAuthorizationRequiredError } from '@deuz-sdk/core/mcp';
+ * import { createMcpClient } from '@deuz-sdk/core/mcp';
+ * // The error class is part of the taxonomy, so it ships from the root entry.
+ * import { McpAuthorizationRequiredError } from '@deuz-sdk/core';
  *
  * const loopback = await createLoopbackRedirect();
  * const transport = { type: 'http', url } as const;

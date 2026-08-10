@@ -18,6 +18,29 @@ Speech models are a **separate kind** from chat `LanguageModel` (`surface: 'open
 Audio you want a **chat** model to *hear* travels as `filePart({ mediaType: 'audio/…' })` — the same way PDFs and images do. No `AudioPart` was added to the `Part` union: it stays at five members, so nothing about the canonical message shape changed in 2.0. This page is about the other direction, text → audio.
 </Callout>
 
+<Callout type="warn" title="Verified against mocks, not yet against a live API">
+Everything on this page is pinned by unit tests (`test/speech.test.ts`) that drive the adapter through an injected `deps.fetch` and assert the exact URL, headers, and JSON body. That proves the SDK **sends what this page says it sends**. It does not prove OpenAI and ElevenLabs are happy to receive it: unlike the chat wires, this module has no live-API test — `test/live/` covers DeepSeek, Google, and xAI only.
+
+So the wire details here are read from the providers' documentation, not from a green light. Make one real call before you ship a voice feature, and if a field turns out to be wrong, [`providerOptions`](#provideroptions) lets you correct it without waiting for an SDK release.
+</Callout>
+
+## When to use it
+
+`generateSpeech` is the right tool when **you already have the final text** and want audio bytes back:
+
+- reading an assistant reply out loud in a voice UI (the last leg of the [voice turn](#a-complete-voice-turn) below);
+- narrating generated content — a summary, a daily digest, an alert — into a file you store or attach;
+- an accessibility path where the same text is served as both a transcript and audio.
+
+It is the wrong tool when:
+
+| Situation | Use instead |
+| --- | --- |
+| You want audio to start playing before the sentence is finished | Nothing here — this module returns one finished file. See [what it does not do](#what-generatespeech-does-not-do). |
+| You want the *model* to speak natively (speech-to-speech, realtime) | Not in 2.0. This is a plain TTS endpoint in front of your text. |
+| You want a chat model to *listen* to audio | [`filePart({ mediaType: 'audio/…' })`](/docs/core/messages) on a model whose registry row sets `audio: true`, or [`transcribe`](/docs/modules/transcription) first. |
+| You want word-level timing to animate a mouth or highlight text | Not produced here. [`transcribe`](/docs/modules/transcription#timestamps) on the generated audio is the (slow, paid twice) workaround. |
+
 ## generateSpeech
 
 Import `generateSpeech` from `@deuz-sdk/core/speech`. Build a model descriptor with a factory, then pass it in.
@@ -83,6 +106,74 @@ interface GenerateSpeechResult {
 | `pcm` | `audio/pcm` |
 
 `usage.characters` is the **input** length. No TTS provider reports a count back, and characters — not tokens — are what they meter, so this is the number your invoice tracks.
+
+## Choosing a format
+
+The default is `mp3` because it plays everywhere. The choice that actually matters is *where the bytes are going*:
+
+| Going to | Pick | Why |
+| --- | --- | --- |
+| A browser `<audio>` tag or a file you keep | `mp3` | Universally decodable, small, and the ElevenLabs mapping (`mp3_44100_128`) is the sane default tier. |
+| A low-latency web/WebRTC playback path | `opus` | The smallest of the six at speech bitrates. Note ElevenLabs answers with `opus_48000_128` in an Ogg container, not raw Opus frames. |
+| A telephony pipeline or your own DSP | `pcm` | Uncompressed; you own the framing. Only `pcm` and the two above exist on ElevenLabs. |
+| Archival where re-encoding would hurt | `flac` / `wav` | OpenAI only — ElevenLabs throws `UnsupportedCapabilityError` before the request. |
+
+`aac` is accepted on the OpenAI wire and rejected on ElevenLabs, which is the whole reason the [format table](#elevenlabs) below exists. Nothing in the SDK transcodes: the format you ask for is the format the provider is asked for, and `result.format` echoes it back so you can pick a file extension without a second variable.
+
+Model choice is a straight cost/quality trade the SDK does not make for you, and no registry row pins these slugs — a speech model is not a `LanguageModel`, so `getModelCapabilities` does not apply. On OpenAI, `tts-1` is the cheap fast one, `tts-1-hd` the higher-fidelity one, and `gpt-4o-mini-tts` the only one that reads [`instructions`](#options) (tone/delivery steering); on ElevenLabs the `flash` and `turbo` families trade fidelity for latency. Point `baseURL` at a relay and the same call reaches whatever that relay serves.
+
+## A complete voice turn
+
+The three modules compose without knowing about each other: [`transcribe`](/docs/modules/transcription) turns the microphone clip into text, an ordinary [`generateText`](/docs/core/generate-text) call answers it, and `generateSpeech` speaks the answer. Nothing in the middle step is audio-aware.
+
+```ts title="voice-turn.ts"
+import { generateText, type Message } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { transcribe, createOpenAITranscription } from '@deuz-sdk/core/transcription';
+import { generateSpeech, createOpenAISpeech } from '@deuz-sdk/core/speech';
+
+const stt = createOpenAITranscription({ apiKey: process.env.OPENAI_API_KEY! });
+const tts = createOpenAISpeech({ apiKey: process.env.OPENAI_API_KEY! });
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function voiceTurn(clip: Blob, history: Message[]) {
+  // 1. Ears. A Blob carries its own `type`, so `mediaType` is already known.
+  const { text: heard } = await transcribe({
+    model: stt('gpt-4o-mini-transcribe'),
+    audio: clip,
+  });
+
+  // 2. Brain. A completely ordinary chat call — the only audio-specific thing
+  //    here is telling the model it is being SPOKEN, not read.
+  const { text: reply, usage } = await generateText({
+    model: anthropic('claude-haiku-4-5'),
+    instructions:
+      'You are a voice assistant. Answer in one or two spoken sentences. ' +
+      'Never use lists, markdown, or URLs — they cannot be heard.',
+    messages: [...history, { role: 'user', content: heard }],
+    maxOutputTokens: 300,
+  });
+
+  // 3. Mouth.
+  const { audio, mediaType } = await generateSpeech({
+    model: tts('gpt-4o-mini-tts'),
+    text: reply,
+    voice: 'nova',
+    format: 'opus',
+    instructions: 'Warm, unhurried, conversational.',
+  });
+
+  return { heard, reply, audio, mediaType, usage };
+}
+```
+
+Three things about that shape are worth stating plainly, because they are the difference between a demo and a product:
+
+- **Latency is the sum of three round-trips.** None of the three steps streams, so the user hears nothing until the last byte of the last call. `maxOutputTokens: 300` is not a cost control here, it is a latency control — the TTS call cannot start until the text is complete, and a long reply is a long silence.
+- **The system prompt is doing real work.** A model that writes `1. First,` or a bare URL produces audio nobody can follow. Constraining the *shape* of the answer is more effective than post-processing it.
+- **Each leg fails independently and none of them retries.** A 429 on the TTS call leaves you holding a perfectly good `reply` — catch per step and decide whether to show the text, not whether to fail the turn. See [errors](#errors).
+
+For a UI that shows the reply while the audio renders, run step 3 in parallel with rendering the text: `generateText` has already resolved, so nothing is blocked on the audio except playback.
 
 ## Creating speech model descriptors
 
@@ -179,6 +270,26 @@ const client = createClient({
 
 `baseUrls[provider]` works the same way for the base URL, sitting between the factory setting and the per-wire default.
 
+## What it costs, and what the SDK counts
+
+TTS is metered in **characters of input**, which is why `usage.characters` is `text.length` and not something read off the response — no provider reports a count back. Two consequences:
+
+- **The number is known before the call.** You can budget, cap, or bill a request without waiting for it: `text.length` *is* the meter. A 4,000-character article is a 4,000-character charge whether the audio is 3 minutes or 4.
+- **The [pricing module](/docs/modules/pricing) does not cover this.** `PRICES_2026` is a table of chat/embedding token prices, and `deps.priceProvider` is never consulted by `generateSpeech` — there is no cost event on the observation stream for a speech call. If you need dollars, multiply `usage.characters` by your provider's rate yourself, in the `operation.completed` handler or at the call site.
+
+`usage.characters` counts what you *asked for*, not what came back, so a call that fails after the request was accepted still cost you. It is also unaffected by `format` — audio size varies wildly between `pcm` and `opus`, the bill does not.
+
+## What `generateSpeech` does not do
+
+Stated up front so you do not discover it mid-integration:
+
+- **No streaming.** The function resolves once, with the whole file. There is no chunked/`stream_format` path even though OpenAI's wire has one — you can ask for it via `providerOptions: { stream_format: 'audio' }`, but the SDK still buffers the response into a single `Uint8Array`, so it buys you nothing.
+- **No retries, no breaker, no timeout.** Unlike [`streamChat`](/docs/core/stream-chat), media calls are one plain `fetch`. `maxRetries` does not exist here; a `429` or a `503` surfaces immediately. The error carries `retryAfterMs` and `isRetryable` — acting on them is yours. Pass `signal` if you want a deadline.
+- **No voice discovery.** There is no `listVoices()`. Voice ids come from your provider's console or its own REST endpoint (`GET /v1/voices` on ElevenLabs), and nothing validates the string you pass.
+- **No transcoding, no concatenation, no SSML.** One text in, one file out. Splitting a long document across calls, joining the results, and inserting pauses are all yours.
+- **No per-model capability matrix.** `SpeechModel` is not a `LanguageModel`, so [`getModelCapabilities`](/docs/advanced/model-registry) does not apply and an unknown slug produces no warning — an unsupported model is simply a `404` → `ModelNotFoundError` from the provider.
+- **No provider beyond these two wires.** A third TTS vendor needs a new `SpeechAdapter`; the only extension point available today is pointing `baseURL` at a relay that mimics one of them.
+
 ## Observability
 
 A speech call emits the auxiliary `operation.started` / `operation.completed` / `operation.failed` events under the `'speech'` subsystem with `operation: 'speech.generate'` — the same shape `image` and `embedding` use. `itemCount` is the input character count and `resultCount` the returned byte count. Without an observer the fast path applies: no events are built at all. See [Observability](/docs/modules/observability).
@@ -187,7 +298,28 @@ A speech call emits the auxiliary `operation.started` / `operation.completed` / 
 
 The canonical status→class table, shared with every other media module: `401`/`403` → `AuthenticationError`, `404` → `ModelNotFoundError`, `429` → `RateLimitError` (with `Retry-After` parsed into `retryAfterMs`), `529` → `OverloadedError`, other `4xx` → `InvalidRequestError`, `5xx` → a retryable `APICallError`. ElevenLabs wraps its messages in a `detail` envelope (`{ detail: { status, message } }` or a bare `{ detail: 'message' }`) instead of OpenAI's `error` envelope; both are unwrapped before mapping, so the resulting error message reads the same either way.
 
-Two failures happen **before** the request is ever sent, so they cost nothing: a missing ElevenLabs `voice` (`InvalidRequestError`) and a format ElevenLabs cannot produce (`UnsupportedCapabilityError`).
+The failed response's body is read once and parsed as JSON when it can be — a relay's HTML 502 page becomes the message rather than an exception on top of an exception — and an `x-request-id` response header is carried onto `error.requestId`, which is the thing provider support will ask for.
+
+```ts
+import { APICallError, RateLimitError } from '@deuz-sdk/core';
+
+try {
+  const { audio } = await generateSpeech({ model, text, voice: 'nova' });
+  return audio;
+} catch (err) {
+  if (err instanceof RateLimitError) {
+    // Nothing retried this for you — `retryAfterMs` is the provider's own advice.
+    scheduleRetry(err.retryAfterMs ?? 1000);
+    return null;
+  }
+  // Every HTTP-shaped failure is an APICallError subclass; that is where
+  // `requestId`, `statusCode`, and `isRetryable` live.
+  if (err instanceof APICallError) log.warn(err.message, { requestId: err.requestId });
+  throw err;
+}
+```
+
+Two failures happen **before** the request is ever sent, so they cost nothing: a missing ElevenLabs `voice` (`InvalidRequestError`) and a format ElevenLabs cannot produce (`UnsupportedCapabilityError`). A missing API key is the third — the G1 chain throws `AuthenticationError` without touching the network.
 
 ## Related
 

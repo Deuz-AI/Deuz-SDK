@@ -42,8 +42,81 @@ This is the whole point, and it is not a nuance. [`agentTool`](/docs/agents/suba
 | Coming back | Only by transferring again (targets keep each other's transfer tools, including one back). | Automatic — the sub-agent finishes and the parent continues. |
 | Stream signal | `handoff` part | `sub-agent` parts (the child's live stream, forwarded) |
 | Metadata | `providerMetadata.deuz.handoffs` | usage attribution per `agentPath` |
+| Guardrails | **Kept** — they are run-level, and the run did not change. | **Not inherited** by the sub-agent loop. |
+| Token cost of the switch | Zero extra calls; the next step just uses a different model. | One nested run per call, with its own steps and usage. |
 
 Pick a **handoff** when the *conversation* should change hands — triage → specialist, sales → support. Pick a **sub-agent** when a *task* should be farmed out and answered — research this, summarize that.
+
+Two heuristics that resolve most real cases:
+
+- **Does the user keep talking to the new agent?** Yes → handoff. If the answer has to come back *to the first agent* for it to continue reasoning, that is delegation.
+- **Would you want the specialist to see the whole transcript?** A billing agent usually must (the user already explained the problem). A "summarize this PDF" worker usually must not — a fresh context is cheaper and less confusing.
+
+## A worked example: support triage
+
+A cheap router reads the first message and hands off; each specialist keeps a way back to the router, so a mis-routed conversation self-corrects.
+
+```ts title="support-triage.ts"
+import { generateText, handoff, tool } from '@deuz-sdk/core';
+import { z } from 'zod';
+
+const lookupOrder = tool({
+  description: 'Fetch an order by id.',
+  parameters: z.object({ orderId: z.string() }),
+  execute: async ({ orderId }) => db.orders.find(orderId),
+});
+
+const refund = tool({
+  description: 'Refund an order. Requires a human OK.',
+  parameters: z.object({ orderId: z.string(), amountUsd: z.number() }),
+  needsApproval: true,
+  execute: async (args) => payments.refund(args),
+});
+
+const agents = handoff(
+  {
+    // The router itself is a target, so a specialist can hand the user back.
+    triage: {
+      model: haiku,
+      instructions: 'You route customers. Ask at most one clarifying question, then transfer.',
+    },
+    billing: {
+      model: sonnet,
+      instructions: 'You handle billing and refunds. Confirm the order before refunding.',
+      tools: { lookupOrder, refund },
+    },
+    shipping: {
+      model: haiku,
+      instructions: 'You handle delivery status and address changes.',
+      tools: { lookupOrder },
+    },
+  },
+  {
+    maxHandoffs: 4,
+    describe: (name) => `Transfer when the customer's problem is clearly about ${name}.`,
+    onHandoff: ({ from, to, reason }) => analytics.track('handoff', { from, to, reason }),
+  },
+);
+
+const { text, providerMetadata } = await generateText({
+  model: haiku,                                   // the ROOT agent — the router
+  instructions: 'You route customers. Ask at most one clarifying question, then transfer.',
+  messages,
+  tools: agents,                                  // the router has nothing but transfers
+  maxSteps: 10,
+  approveToolCall: async (call) => ui.confirm(call),   // survives every transfer
+});
+
+for (const hop of providerMetadata?.deuz?.handoffs ?? []) {
+  console.log(`${hop.from ?? 'triage'} → ${hop.to}: ${hop.reason ?? '(no reason given)'}`);
+}
+```
+
+Three things this example is doing on purpose:
+
+- **The root agent is duplicated as a `triage` target.** `handoff()` has no concept of "the agent that started the run", so the only way back to the router is to list it like any other target. The root's own identity is `undefined` — that is why `HandoffPart.from` is absent on the first transfer.
+- **`describe` replaces the default sentence** (the target's `instructions`), which is usually written for the target, not for the router deciding where to send someone.
+- **`approveToolCall` is not in the `handoff()` call** — it belongs to the run, so `refund` stays gated no matter which agent is driving.
 
 ## Defining targets
 
@@ -81,6 +154,8 @@ const supportAgent = createAgent({
 const agents = handoff({ support: supportAgent });
 ```
 
+`handoff()` validates eagerly: an empty record key or a target with no `model` throws a `TypeError` at construction, not on the step where the model happens to call it.
+
 ### Options
 
 ```ts
@@ -92,6 +167,8 @@ interface HandoffOptions {
 ```
 
 `describe` writes the sentence appended to each transfer tool's description — the model's only clue about *when* to transfer. `onHandoff` fires once per **accepted** transfer; it is caller code, so a throw propagates (the `onStepFinish` contract — a routing audit log that silently swallowed its own failure would go missing without a trace).
+
+Options are shared by the whole group: they are read off the transfer tool the model actually called, so two `handoff()` groups spread into one run can carry different `maxHandoffs` budgets. Mixing them is rarely what you want — the counter is per run, and whichever group's tool triggers the check supplies the limit.
 
 ## What the model sees
 
@@ -108,7 +185,7 @@ Each transfer tool is an ordinary tool with one optional parameter:
 }
 ```
 
-`reason` is **not required**. A model that transfers without explaining itself must still produce a valid call — failing argument validation would turn a routing decision into an error turn.
+`reason` is **not required**. A model that transfers without explaining itself must still produce a valid call — failing argument validation would turn a routing decision into an error turn. An empty or whitespace-only `reason` is read as "none given" and simply omitted from the part and the metadata.
 
 ## The interception is deterministic
 
@@ -120,14 +197,34 @@ Consequences worth stating:
 
 - **One transfer per step.** If the model emits two, the **first in its own emission order** wins; every sibling transfer is answered with an `is_error` saying so. Applying two would mean the second agent never saw the first exist.
 - **Every transfer call still gets a `tool_result`.** The accepted one gets `Transferred to 'billing'. <reason>`; the ignored ones get an `is_error`. No exceptions — an unanswered `tool_use_id` is a 400.
+- **The rest of the batch runs normally.** A model that calls `search` and `transfer_to_billing` in one step gets both honored: `search` executes, the transfer is answered, and the results are re-ordered back into the model's own call order.
 - **The swap happens after the turn is complete**, so the tool-result message is written first and the history stays valid.
 - **`activeTools` filtering applies normally.** Transfer tools are ordinary entries in `tools`; filter them like anything else.
+- **`prepareStep` still has the last word.** It runs after the active agent's model is applied, so a `prepareStep` that returns a `model` overrides the target's for that step.
+- **The transfer tool's `execute` throws on purpose.** It is unreachable inside a handoff-aware loop; if you ever see that error, the tool reached a loop (or a bare `executeTools`) that does not intercept transfers.
+
+## Transfers and suspension
+
+A step can end early for reasons that have nothing to do with the transfer: a tool needs human approval, a client tool has to round-trip, a durable sub-agent suspended. **The transfer is still committed on every one of those exits** (2.0 — an earlier build dropped it).
+
+Concretely, when the step breaks:
+
+1. every transfer `tool_use_id` is answered and the `{ role: 'tool' }` turn is appended, so the provider never sees an unanswerable history on resume;
+2. the swap is applied — active model, tool set, and the rewritten system turn — **before** the checkpoint is written;
+3. `AgentCheckpoint.handoff` records `{ to, count }`, so the resume leg comes back as the target agent, not the root one;
+4. the streaming loop publishes the same `tool-result` / `tool-state` / `handoff` parts the completed path would, so a UI cannot tell the two apart.
+
+The one asymmetry: the *executed* tools of that batch are **not** answered on a sub-agent suspension. Their `tool_use` ids stay open and the resume leg's settle re-runs them (which is what resumes the child's checkpoint). The transfer is not one of them — it never executes, so deferring it would leave a `tool_use` no producer could ever answer.
+
+On the resume leg the order is: restore the checkpointed agent → settle pending approvals → *then* the first model call. A transfer that was left unanswered by the previous leg is applied during that settle, and from that point the leg is the target agent.
 
 ## The `maxHandoffs` loop guard
 
 Two agents that keep transferring to each other would otherwise burn the whole `maxSteps` budget on nothing but transfers. `maxHandoffs` (default **5**) bounds transfers **per run**.
 
-Reaching it is **self-healing, never a throw**: every transfer call in that step comes back as an `is_error` — `Handoff limit (5) reached; continue yourself.` — and the current agent carries on. Like an approval denial, a refused transfer is a policy verdict, not a tool failure, so it is **excluded from the runaway-error guard**.
+Reaching it is **self-healing, never a throw**: every transfer call in that step comes back as an `is_error` — `Handoff limit (5) reached; continue yourself.` — and the current agent carries on with its own tools. Like an approval denial, a refused transfer is a policy verdict, not a tool failure, so it is **excluded from the runaway-error guard**: a model that keeps trying to transfer will not trip the three-consecutive-errors hard stop, it will just keep being told no until `maxSteps` runs out.
+
+The count is stored on the checkpoint and restored on resume, so the budget bounds the whole durable run rather than each leg.
 
 ## The target's tool set
 
@@ -137,11 +234,17 @@ The transfer catalog is captured **once, from the run's root tool set**. It has 
 
 The target's own tools are applied **last**, so an agent that deliberately defines a name colliding with a transfer tool wins on its own turf.
 
+<Callout type="info" title="MCP tools are re-merged, not lost">
+Zero-config `mcp:` tools are merged on top of whichever agent is active, and the wire lists are rebuilt at the swap. A transfer therefore keeps the run's MCP tools while replacing the *local* half of the set.
+</Callout>
+
 ## The system prompt is rewritten, not appended
 
 `instructions` **replaces** the run's leading system turn (one is inserted when the history had none, and removed when the target declares none).
 
 A rewrite, not an append — the same discipline compaction follows. The new turn must not enter `response.messages` / `appended` / the chat record, or your response delta and the transcript would grow a system message you never sent. It lives in the effective model history, and therefore in checkpoints, which is exactly where a resume leg needs to find it.
+
+The consequence to plan for: a target with **no** `instructions` strips the run's system prompt entirely for every following step. If you want a specialist to inherit the run's framing, restate it in that target's `instructions`.
 
 ## `HandoffPart` on the stream
 
@@ -178,18 +281,24 @@ A handoff is checkpointed as `{ to, count }` on `AgentCheckpoint.handoff`, and t
 
 The spent budget is restored too, so `maxHandoffs` still bounds the run across legs.
 
-Degradation is deliberate. If the resume call registers **no transfer tool** for the checkpointed target (you passed different `tools`), the loop **warns and continues with the root model and tools**, keeping the identity and the spent count. Refusing to resume would strand a durable run over a call-site detail.
+Degradation is deliberate. If the resume call registers **no transfer tool** for the checkpointed target (you passed different `tools`), the loop **warns and continues with the root model and tools**, keeping the identity and the spent count. Refusing to resume would strand a durable run over a call-site detail. The practical rule: pass the *same* `handoff({…})` group on every leg, exactly as you pass the same `tools`.
 
 The field is absent on every checkpoint written before 2.0 and on every run that never handed off, and the checkpoint codecs carry it through untouched — old checkpoints load unchanged.
 
 ## What still belongs to the root
 
-Two things surprise people, so they are stated plainly:
+Two things surprise people, and one of them used to be three:
 
-- **Pricing uses the root model.** Cumulative cost for budget stop conditions is priced against `options.model.modelId` for the whole run, not against whichever agent is currently driving. A transfer to a more expensive model does not re-price the run.
-- **Compaction summaries use the root model.** The [summarize layer](/docs/modules/compaction#the-rolling-summary) calls `policy.summarizeModel ?? options.model` — the root one. Pin `summarizeModel` if you want that call on a specific (usually cheaper) model regardless of who is driving.
+- **Pricing uses the root model.** Cumulative cost for `costExceeds` / `budget.usd` stop conditions is priced against `options.model.modelId` for the whole run, and so is the `costUsd` on the terminal observation event. A transfer to a more expensive model does not re-price the run. If cost control matters and your targets differ wildly in price, bound the run with `budget.tokens` (which is model-agnostic) as well.
+- **Observation reports the root model on `run.started` / `run.completed`.** Per-step events carry the effective model, so `step.started` is where you see who actually drove.
 
-Both are consequences of the same rule the option table states: a handoff carries four fields, and run-level concerns stay run-level.
+**Compaction, by contrast, follows the active agent** (2.0). At the swap the compaction runner is re-pointed at the target: its `contextWindow` becomes the target's, and the summarize side call uses `policy.summarizeModel ?? the active model` — not the root one. The token estimator is kept across the swap on purpose, because its calibration measures the provider's request framing, which the transfer did not change.
+
+<Callout type="warn" title="Known limit: a resume leg does not re-point compaction">
+Restoring a checkpointed handoff at the start of a resume leg rebuilds the active model and tool set, but it does **not** re-run the compaction retarget. So a durable run that suspended inside agent B and resumes there measures compaction against the **root** model's `contextWindow`, and summarizes with the root model, until the next transfer happens on that leg.
+
+Pin `compaction.summarizeModel` (and, if the two models' windows differ a lot, `capabilities.contextWindow`) when you combine handoffs with durable resume and compaction.
+</Callout>
 
 ## See also
 
@@ -198,3 +307,4 @@ Both are consequences of the same rule the option table states: a handoff carrie
 - [Guardrails](/docs/agents/guardrails) — the hooks a transfer is deliberately intercepted *before*.
 - [Tool loop](/docs/agents/tool-loop) — step boundaries, the runaway guard, and denial handling.
 - [Durable runtime](/docs/agents/durable-runtime) — checkpoints and `resumeFromCheckpoint`.
+- [Compaction](/docs/modules/compaction) — the summarize layer a transfer re-points.

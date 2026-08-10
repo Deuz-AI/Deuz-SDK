@@ -28,6 +28,79 @@ for await (const delta of result.textStream) {
 
 Both are re-exported from [`@deuz-sdk/core/providers`](/docs/installation#subpath-exports) alongside the [cloud compat hosts](/docs/providers/compat), so they drop into `createProviderRegistry` like any other factory.
 
+## From zero to a working call
+
+The SDK half is one import. The part that actually goes wrong is the server, so here is the whole path — and a way to prove the server is fine before you suspect the SDK.
+
+### Ollama
+
+```bash
+# 1. Pull a model. This is the slug you will pass to ollama('…').
+ollama pull qwen3
+
+# 2. The server usually runs already (installed as a background service).
+#    Start it by hand if not:
+ollama serve
+
+# 3. Prove the OpenAI-compatible surface answers, with no key at all.
+curl http://localhost:11434/v1/models
+```
+
+If step 3 lists your model, the SDK will reach it:
+
+```ts title="ollama.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createOllama } from '@deuz-sdk/core/providers';
+
+const ollama = createOllama({
+  // Ollama serves tools and a large window; the registry cannot know that
+  // for a slug you pulled yourself. See "the unknown-model warning" below.
+  capabilities: { tools: true, contextWindow: 32_768, maxOutput: 8_192 },
+});
+
+const { text } = await generateText({
+  model: ollama('qwen3'),
+  prompt: 'In one sentence: what is a vector database?',
+});
+console.log(text);
+```
+
+Two Ollama-specific facts worth internalizing. The **tag is part of the slug**: `llama3.2` and `llama3.2:3b` are different models, and the string you pass is sent verbatim — the SDK never normalizes it. And the **first call after a pull is slow**, because Ollama loads the weights on demand. The default time-to-first-token budget is 60 s ([`timeout.ttftMs`](/docs/core/prompts-and-timeouts)); a large model on a cold cache can exceed it and fail with a `TimeoutError` that looks like a hang but is really a load:
+
+```ts
+await generateText({
+  model: ollama('qwen3:32b'),
+  prompt: 'ping',
+  timeout: { ttftMs: 300_000 }, // first token only; the total budget is separate
+});
+```
+
+### LM Studio
+
+LM Studio is a desktop app, so the equivalent steps are in the UI:
+
+1. Search for and download a model in the **Discover** tab.
+2. Open the **Developer** (local server) tab, load that model, and start the server. The default port is **1234**, which is what `createLMStudio()` assumes. (`lms server start` does the same from the CLI.)
+3. Prove it: `curl http://localhost:1234/v1/models`.
+
+The `id` LM Studio reports in that response is the slug to pass — it is usually the repo path of the GGUF you loaded, not the friendly name shown in the UI.
+
+```ts title="lmstudio.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createLMStudio } from '@deuz-sdk/core/providers';
+
+const lmstudio = createLMStudio({ capabilities: { maxOutput: 4_096 } });
+
+const result = streamChat({
+  model: lmstudio('qwen/qwen3-8b'), // whatever /v1/models reported
+  messages: [{ role: 'user', content: 'Hello from my laptop.' }],
+});
+
+for await (const delta of result.textStream) process.stdout.write(delta);
+```
+
+LM Studio serves **one loaded model at a time** by default. Asking for a slug it does not currently hold is a `404` from the server → `ModelNotFoundError`, not a load request.
+
 ## No API key required
 
 Every other provider ends the key-precedence chain with an `AuthenticationError`. That is exactly right for a cloud host — a missing key is a bug you want to hear about at the call site, not a 401 three layers down. For a server running on your own machine it is pure friction.
@@ -38,7 +111,13 @@ The two local factories set `apiKeyOptional`, which changes **one** thing: when 
 deps.keyProvider  >  factory apiKey  >  createClient({ apiKeys })  >  placeholder
 ```
 
-A real key from *any* of those three still wins, so the escape can never shadow a key you actually supplied — useful when Ollama sits behind an authenticating reverse proxy:
+That is the whole mechanism, and its narrowness is the point:
+
+- The substitution happens at **one line** in `internal/resolve-call.ts`, *after* all three links returned nothing. It is not a branch earlier in the chain, so it cannot reorder or shadow anything.
+- It is opt-in per **factory**, carried on the same private config symbol as `apiKey`/`baseURL`. `createOllama` and `createLMStudio` set it; `createOpenAICompatible` exposes it as [`apiKeyOptional`](/docs/providers/compat#createopenaicompatible); nothing else can turn it on.
+- The wire still needs *something* in the header, so a placeholder bearer token goes out. If you put a proxy in front of Ollama and see `Authorization: Bearer sk-no-key` in its access log, that is this — a literal, not a leaked credential.
+
+A real key from *any* of those three links still wins, so the escape can never shadow a key you actually supplied — useful when Ollama sits behind an authenticating reverse proxy:
 
 ```ts
 const ollama = createOllama({ apiKey: process.env.OLLAMA_PROXY_TOKEN! });
@@ -93,7 +172,9 @@ export const ollama = createOllama({
 
 Nothing is validated: an override is a claim about your model, not a request the SDK can check. A per-call `capabilities` still wins over the factory value — see [capabilities](/docs/core/prompts-and-timeouts#capabilities).
 
-If you run several models with different limits, mint a factory per model:
+**Where to get the real numbers.** `ollama show qwen3` prints the model's architecture block, including its context length; LM Studio shows the same in the model's panel and in `/v1/models` metadata. Two rules of thumb once you have it: set `contextWindow` to whatever the *server* is actually configured to allow (a 128k-capable model loaded with a 8k context is an 8k model, and the server truncates silently), and keep `maxOutput` well under it, since output and history share that budget.
+
+If you run several models with different limits, mint a factory per model — the factory is a closure over settings, so this costs nothing:
 
 ```ts
 const big = createOllama({ capabilities: { maxOutput: 32_000, contextWindow: 128_000 } });
@@ -102,9 +183,45 @@ const small = createOllama({ capabilities: { maxOutput: 4_096, contextWindow: 8_
 const model = needsRoom ? big('qwen3') : small('llama3.2:3b');
 ```
 
+<Callout type="warn" title="`structuredOutput: true` is the one override to be careful with">
+Claiming it switches [`generateObject`](/docs/core/generate-object) from the tool strategy to `response_format: { type: 'json_schema' }`. Ollama and LM Studio both accept that field, but whether the *model* honours a strict schema varies a lot by size and fine-tune — a small local model will happily return prose. Leave it `false` (the fallback default) and let the tool strategy carry the shape; turn it on only after you have watched a real model obey it.
+</Callout>
+
+## Embeddings against a local server
+
+`createOllama` mints chat descriptors only — `EmbeddingModel` is a [deliberately distinct kind](/docs/core/embeddings), and there is no keyless embedding factory. Point the OpenAI embedding factory at the local server instead, and give it *any* non-empty string as the key: the embedding path has no `apiKeyOptional` escape, so an empty chain throws `AuthenticationError` before the request.
+
+```ts title="local-embeddings.ts"
+import { embed } from '@deuz-sdk/core';
+import { createOpenAIEmbedding } from '@deuz-sdk/core/openai';
+
+const localEmbedding = createOpenAIEmbedding({
+  baseURL: 'http://localhost:11434/v1',
+  apiKey: 'ollama', // ignored by the server; required by the resolver
+});
+
+const { embedding } = await embed({
+  model: localEmbedding('nomic-embed-text'),
+  value: 'the fern has been watered',
+});
+```
+
+Note the trade this makes: the descriptor's provider id stays `'openai'`, so `createClient({ apiKeys })`, pricing, and every log line will attribute these calls to OpenAI. The dimensions also fall back to a conservative row (an unknown embedding slug warns the same way an unknown chat slug does), which matters when you size a [pgvector column](/docs/modules/stores#pgvector) — read the length off one real vector rather than trusting a default.
+
 ## vLLM, llama.cpp, TGI, and friends
 
 Anything else that serves the OpenAI wire without auth gets the same treatment through the generic factory — pass your own `id` and opt into the keyless escape explicitly:
+
+```bash
+# vLLM: serves the OpenAI wire at /v1 on the port you give it.
+vllm serve Qwen/Qwen3-8B --port 8000
+
+# llama.cpp: same wire, from a single GGUF file.
+llama-server -m ./qwen3-8b-q4_k_m.gguf --port 8080
+
+# Same proof as before, whichever you ran:
+curl http://localhost:8000/v1/models
+```
 
 ```ts
 import { createOpenAICompatible } from '@deuz-sdk/core/providers';
@@ -116,7 +233,31 @@ const vllm = createOpenAICompatible({
   capabilities: { tools: true, maxOutput: 32_000 },
 });
 
-const model = vllm('gpt-oss-120b');
+const model = vllm('gpt-oss-120b'); // the id from /v1/models
 ```
 
-Drop `apiKeyOptional` and the same host demands a key again, which is what you want the moment that box is reachable from anywhere but your LAN. See [`createOpenAICompatible()`](/docs/providers/compat#createopenaicompatible) for the rest of its settings, including `surface: 'responses'` for hosts that speak the Responses wire.
+Three things this generic path gets you that pointing an unrelated cloud factory at localhost does not: keys resolve under **your** id (`createClient({ apiKeys: { vllm: … } })` works, and no OpenAI key is ever consulted), pricing and every observation event are attributed to `vllm`, and the [registry](/docs/advanced/model-registry) lookup happens under your provider rather than someone else's.
+
+`baseURL` is effectively **required** here: core reads no environment variables, so a custom `id` has no default and the call fails with `InvalidRequestError` without one. And drop `apiKeyOptional` the moment that box is reachable from anywhere but your LAN — the `AuthenticationError` is what tells you a key went missing. See [`createOpenAICompatible()`](/docs/providers/compat#createopenaicompatible) for the rest of its settings, including `surface: 'responses'` for hosts that speak the Responses wire.
+
+## When the call fails, in the order to check
+
+| Symptom | Almost always |
+| --- | --- |
+| `TypeError: fetch failed` / `ECONNREFUSED` | The server is not running, or is on another port. `curl {baseURL}/models` first — the SDK adds no networking of its own. |
+| `ModelNotFoundError` (404) | The slug is not loaded. Ollama: the tag is part of the name (`llama3.2` ≠ `llama3.2:3b`). LM Studio: only the currently-loaded model exists. |
+| `AuthenticationError` from a *local* host | You used `createOpenAICompatible` without `apiKeyOptional`, or a factory that never had it. `createOllama`/`createLMStudio` cannot produce this without a proxy in front. |
+| Answer stops mid-sentence | `maxOutput: 4096` from the fallback row became `max_tokens`. Set [`capabilities.maxOutput`](#the-cure-capabilities). |
+| `TimeoutError` on the very first call | Weights loading. Raise `timeout.ttftMs` (default 60 s). |
+| Tools are never called | Not the SDK — `caps.tools` is read by no adapter, so the tool array is sent regardless. The model simply is not tool-trained, or the server's template drops the tool block. |
+| Streaming arrives in one lump at the end | A proxy buffering SSE. Check the reverse proxy, not the SDK. |
+| `unknown-model` warning on every call | Expected here, and [documented above](#the-unknown-model-warning-is-expected-here). Silence it by knowing what it means, not by hiding it. |
+
+## What running locally does not change
+
+The SDK treats a local host as just another Chat Completions host, which cuts both ways:
+
+- **Everything orchestration-level still works** — the [tool loop](/docs/agents/tool-loop), [retries](/docs/advanced/resilience), timeouts, [observation](/docs/modules/observability), [memory](/docs/modules/memory), [middleware](/docs/modules/middleware). None of it is provider-specific.
+- **Everything wire-level that the model does not implement still fails.** Vision needs a multimodal model; reasoning deltas need a model that emits them; `json_schema` needs server *and* model support. The registry override lets you *claim* a capability, not create one.
+- **Prompt caching is not available.** `promptCaching` is an Anthropic-wire feature; it is ignored here.
+- **Cost is zero and so is the accounting.** [`priceUsage`](/docs/modules/pricing) has no row for your provider id, so a cost of `undefined` is correct rather than broken. Token counts still arrive from the server's `usage` block when it sends one.

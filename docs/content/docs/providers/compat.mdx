@@ -33,6 +33,71 @@ Every factory below speaks the OpenAI **Chat Completions** wire (`surface: 'chat
 
 Lowercase singletons (`mistral`, `deepseek`, `kimi`, `qwen`, `perplexity`, `ollama`, …) are exported unbound — prefer the `create*` factories with an explicit `apiKey` in apps.
 
+Every factory takes the same `CompatSettings`: `apiKey`, `baseURL`, `fetch`, `headers`, and (2.0) `capabilities` — capability overrides applied to every slug that factory mints, for a host whose slugs the [registry](/docs/advanced/model-registry) does not pin.
+
+## Which model slugs work
+
+**Any slug the host serves.** A factory is a two-line descriptor builder: `createGroq({...})('whatever')` produces `{ provider: 'groq', modelId: 'whatever', surface: 'chat_completions' }` and the string goes to the wire verbatim. There is no allow-list, nothing throws locally, and a slug the host does not have comes back as that host's own `404` → `ModelNotFoundError`.
+
+What the slug *does* change is which row of the [capability registry](/docs/advanced/model-registry) the call picks up. These are the slugs pinned in 2.0 — the flagship of each host, chosen so that the numbers that reach the wire (`max_tokens`, the reasoning switch, the structured-output strategy) are right without configuration:
+
+| Provider id | Pinned slugs | Notes on the row |
+| --- | --- | --- |
+| `groq` | `llama-4-maverick` | `vision: true`, 131k context |
+| `deepseek` | `deepseek-v3.2`, `deepseek-v4-flash`, `deepseek-v4-pro` | V4 rows set `reasoning: true` — [see below](#deepseek-v4-always-thinks) |
+| `mistral` | `mistral-large-latest` | `vision: true`, 256k context |
+| `moonshot` | `kimi-k2` | 131k context |
+| `qwen` | `qwen3-max` | 262k context |
+| `glm` | `glm-4.6` | 200k context |
+| `minimax` | `minimax-m2` | 200k context |
+| `perplexity` | `sonar`, `sonar-pro`, `sonar-reasoning-pro` | `tools: false` — [see below](#perplexity-sonar-does-no-client-tool-calling) |
+| `cohere` | `command-a-03-2025` | 256k context |
+| `deepinfra` | `meta-llama/Llama-4-Maverick-17B-128E-Instruct`, `deepseek-ai/DeepSeek-V3.2` | `org/Model` casing is part of the slug |
+| `nvidia` | `meta/llama-4-maverick-17b-128e-instruct`, `nvidia/llama-3.3-nemotron-super-49b-v1.5` | NIM slugs are lower-cased `vendor/model` |
+| `sambanova` | `Llama-4-Maverick-17B-128E-Instruct`, `Meta-Llama-3.3-70B-Instruct` | bare CamelCase, no vendor prefix |
+| `hyperbolic` | `Qwen/Qwen3-235B-A22B-Instruct`, `moonshotai/Kimi-K2-Instruct` | `org/Model` |
+| `together`, `openrouter`, `cerebras`, `fireworks` | **none** | Router/aggregator catalogs turn over too fast to pin honestly |
+| `ollama`, `lmstudio` | **none, deliberately** | The slug is whatever you pulled — see [Local models](/docs/providers/local) |
+
+Every row on the four 2.0 hosts (`deepinfra`, `nvidia`, `sambanova`, `hyperbolic`) carries a `verify slug at publish` marker in the source, for exactly the reason stated there: these vendors rename often, a **stale** key costs nothing (it simply stops matching and you get the fallback), but a **wrong** key would hand out capabilities the model does not have.
+
+### What an unpinned slug gets
+
+Not an error — new models ship constantly and a registry that threw would be a release blocker for every one of them. An unknown slug takes the conservative fallback row and one warning:
+
+```ts
+const result = await generateText({ model: together('some-new-model'), prompt: 'hi' });
+result.warnings; // [{ type: 'unknown-model', message: "Unknown model 'some-new-model' — …" }]
+```
+
+| Field | Fallback value | What it costs you |
+| --- | --- | --- |
+| `maxOutput` | `4096` | **This is the one that matters.** It becomes the request's `max_tokens`, so a long answer is truncated. |
+| `contextWindow` | `128_000` | Feeds compaction sizing — too small truncates history early, too large summarizes too late. |
+| `tools` | `false` | Reported only. No adapter reads it; tool calling works regardless. |
+| `reasoning` | `false` | `effort` is dropped rather than sent. A reasoning model behaves as its own default. |
+| `structuredOutput` | `false` | [`generateObject`](/docs/core/generate-object) uses the tool strategy instead of `json_schema`. |
+| `vision`, `caching`, … | `false` | Reported only. |
+
+The fix is one line, and it is the same line whether the host is Together, an internal gateway, or Ollama — state what you know at the factory:
+
+```ts
+const together = createTogether({
+  apiKey: process.env.TOGETHER_API_KEY!,
+  capabilities: { maxOutput: 32_000, contextWindow: 131_072, reasoning: true },
+});
+```
+
+Nothing is validated: an override is a claim about your model, not a request the SDK can check. See [`capabilities`](#capabilities-for-a-host-the-registry-does-not-know) for the per-factory/per-call precedence.
+
+<Callout type="warn" title="The registry is keyed by slug alone, not by (provider, slug)">
+`getCapabilities` looks the model id up in one flat table. Two hosts serving the **same string** therefore share one row — which is usually exactly right on an aggregator (`openrouter('kimi-k2')` inherits the pinned Moonshot row instead of the 4096-token fallback), and occasionally is not.
+
+The case to watch is a slug pinned for a **first-party** provider being served by someone else. `together('gpt-5.5')` would pick up the OpenAI row and send `max_tokens: 128000`; a slug pinned on the OpenAI *Responses* surface (`gpt-5.4`, `o4-mini`) carries `samplingRestrictions: true`, which makes the Chat Completions adapter send `max_completion_tokens` and **silently drop `temperature`/`topP`** — while the call itself still goes out on the Chat Completions wire, because dispatch reads the descriptor's `surface`, never the row's.
+
+In practice most aggregators prefix their slugs (`openai/gpt-5.5`, `meta-llama/…`), and a prefixed string can never collide. When it does collide and the row is wrong, a per-factory `capabilities` override fixes it — that merge happens after the row is chosen.
+</Callout>
+
 ### DeepSeek V4 always thinks
 
 `deepseek-v4-flash` and `deepseek-v4-pro` reason on every call — there is no switch — and that has two consequences worth knowing before you debug something that is not a bug. Both were confirmed against the live API; the assertions live in `test/live/deepseek.live.test.ts`.
@@ -67,7 +132,7 @@ Reasoning arrives as `reasoning-delta` parts, never spliced into `textStream` �
 
 The wire accepts `max_tokens` up to 65,536, but the registry keeps the default at 8,192: one runaway thinking pass at the ceiling is a real bill. Raise it per call when an answer needs the room.
 
-Every factory takes the same `CompatSettings`: `apiKey`, `baseURL`, `fetch`, `headers`, and (2.0) `capabilities` — capability overrides applied to every slug that factory mints, for a host whose slugs the [registry](/docs/advanced/model-registry) does not pin.
+### Perplexity Sonar does no client tool calling
 
 <Callout title="Perplexity does no client tool calling">
 Sonar's search runs **server-side**; the API has no `tools` array, so the registry rows pin `tools: false` and `structuredOutput: false`, and a tool loop against `sonar*` will not call anything. Perplexity's `citations` array is a top-level response field that the Chat Completions wire has no slot for, so it is not surfaced as a canonical part. Its base URL is also the one exception with no `/v1` segment — the wire path is `https://api.perplexity.ai/chat/completions`.

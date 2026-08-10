@@ -38,16 +38,83 @@ A single object cannot implement `MemoryStore` and `SessionStore` at the same ti
 | Scales to | one process / one machine | a shared cache, narrow scopes | production, wide scopes |
 | Transactions | yes (`BEGIN`/`COMMIT`) | **no MULTI in v1** — see below | yes (the migration batch) |
 
-Rules of thumb: **SQLite** for a single-process agent, a CLI, or a desktop app — it is the only one with zero setup. **Redis** when you already run one and your scopes are narrow (a `chatId`, a `userId`). **Postgres** for anything multi-tenant or long-lived, because it is the only pack whose vector search happens in the database.
+### Pick one in four questions
+
+Read top to bottom and stop at the first "yes".
+
+1. **Is this a CLI, a desktop app, a test, or one long-running process that owns its data?**
+   → **SQLite.** Zero setup, zero dependencies, and the only pack with hybrid (vector + lexical) memory search. It is not a scaling compromise at this size, it is the right answer.
+2. **Do multiple processes or machines need to see the same data?**
+   → SQLite is out. A file is not a network service, and two Node processes writing one database file is a lock-contention story, not a deployment.
+3. **Is memory search a real feature — semantic recall over thousands of records per user?**
+   → **Postgres, with pgvector.** It is the only pack where the vector search happens *in the database*; the other two move rows to your process and rank them there. This is the answer for anything multi-tenant.
+4. **Otherwise — you already run Redis, scopes are narrow (one `chatId`, one `userId`), and memory is a nice-to-have rather than the product?**
+   → **Redis.** Fastest per-key access of the three, no schema to own, and the [MULTI caveat](#no-multi-in-v1--and-the-readers-are-built-for-it) is real but bounded. Note it has no `runs` seam.
+
+Two more things that decide it in practice, before the technical merits do: **who owns the schema** (Postgres puts `deuz_*` tables in a database a DBA already watches — see [schema ownership](#migrations-and-schema-ownership)), and **what the runtime allows** (SQLite writes to a filesystem, which a container with a read-only root or a serverless function does not usefully have).
+
+Mixing packs is legitimate and sometimes right: Postgres for `memory` and `runs`, Redis for `sessions` because checkpoints are hot and short-lived. The seams are ordinary values, so nothing objects.
 
 ## What every pack shares
 
-- **The factory is synchronous.** It is the `createClient` idiom: nothing connects, no optional peer is imported, and no file is opened until the first store call. Building a pack at module scope in a serverless handler costs nothing and cannot throw.
-- **The connection opens once, lazily, and is memoized.** An unsupported runtime or a bad DSN surfaces as a rejected *store call* carrying an actionable message, never as a throw out of module evaluation. A failed open is not cached — the next call retries.
-- **`close()` follows ownership — with one deliberate exception.** The Redis and Postgres packs close only the connection they opened themselves (`{ url }` / `{ connectionString }`); an injected `{ client }` is left alone, because it is yours and something else in your process may still be using it. **SQLite is different**: `{ database }` hands the handle *over* — the pack owns it from that point and `close()` closes it. A SQLite handle is a file, not a pool, and sharing one across owners is not a thing you want silently allowed.
+- **The factory is synchronous.** It is the `createClient` idiom: nothing connects, no optional peer is imported, and no file is opened until the first store call. Building a pack at module scope in a serverless handler costs nothing and — with one exception — cannot throw. The exception is Postgres option *validation*: a `schema` that is not a plain identifier, a `dimensions` outside 1–16000, or neither `client` nor `connectionString` throws `InvalidRequestError` at construction, deliberately, because those are typos rather than runtime conditions.
+- **The connection opens once, lazily, and is memoized.** An unsupported runtime or a bad DSN surfaces as a rejected *store call* carrying an actionable message, never as a throw out of module evaluation.
+- **A failed open is retried — except on SQLite.** Redis forgets a rejected connect (guarded by promise identity, so a later success is never dropped) and Postgres clears a failed `migrate()`, so a transient outage does not poison the pack for its lifetime. **SQLite memoizes the open promise including its failure**: if the first call fails — no `node:sqlite`, an unwritable path — every later call replays that same rejection. Fix the cause and build a new pack; there is nothing to retry into.
+- **`close()` follows ownership — with two deliberate exceptions.** The Redis and Postgres packs close only the connection they opened themselves (`{ url }` / `{ connectionString }`); an injected `{ client }` is left alone, because it is yours and something else in your process may still be using it. **SQLite is different**: `{ database }` hands the handle *over* — the pack owns it from that point and `close()` closes it. A SQLite handle is a file, not a pool, and sharing one across owners is not a thing you want silently allowed. **A closed Redis `{ url }` pack is final**: a later store call rejects with an explanatory error rather than quietly opening a second connection nobody will ever quit. (A pack over an injected client keeps working after `close()`, because closing it released nothing.)
 - **`sweepExpiredMemories(now?)`** is the TTL garbage collector. `MemoryRecord.expiresAt` only *hides* a record at read time, so without a sweep a TTL'd store grows forever. Call it from a cron, or let [`memory.sweep: 'on-extract'`](/docs/modules/memory#sweep-and-ttl) chain it onto write traffic. `now` defaults to the host clock — pass `deps.clock.now()` for a deterministic sweep.
 - **A corrupt row is skipped, never thrown.** A hand-edited record, an unparseable JSON column, a half-written value: readers drop it and carry on. One bad row must not take a chat down.
 - **Scope is a filter over the fields you set.** `{ userId }` matches every record of that user regardless of `chatId`; an unset field is *no test at all*, not a `NULL` test — exactly what `matchesScope` does in memory.
+- **These are Node subpaths, not edge-safe surface.** None of the three is re-exported from [`@deuz-sdk/core/edge`](/docs/advanced/edge). SQLite genuinely needs Node (`node:sqlite`); the Redis and Postgres packs touch no Node built-in themselves — they only need a driver with the right method — so an injected HTTP driver may well work on another runtime, but that is outside what this package tests or promises.
+
+### When you do not need a pack at all
+
+A store pack is persistence, and persistence is not always the requirement:
+
+| Situation | Use |
+| --- | --- |
+| Tests, and anything where losing state on restart is fine | `createInMemoryMemoryStore()`, `createInMemoryChatStore()`, `createInMemorySessionStore()`, `createInMemoryRunStore()` — no dependencies, no files |
+| A single-user CLI that only needs transcripts on disk | [`createJsonlChatStore`](/docs/modules/chat-persistence#createjsonlchatstore-node) and `createFileRunStore` |
+| Memory a human should be able to read and edit | The [markdown vault backend](/docs/modules/memory#markdown-vault-backend-node) — an Obsidian-shaped folder, not a database |
+| You already have your own tables | Implement the seam directly. `ChatStore` is four methods; the [Supabase adapter](/docs/modules/chat-persistence#supabase-table-adapter) is the worked example |
+
+The packs exist to save you writing the fourth of those, not to be mandatory.
+
+## Migrations and schema ownership
+
+"Who creates the tables" is the question that decides whether a store pack is a convenience or a liability, so it is answered explicitly rather than left to discovery.
+
+| | SQLite | Redis | Postgres |
+| --- | --- | --- | --- |
+| Who creates the schema | The pack, on first use | Nobody — keys are the schema | The pack, via `migrate()` |
+| Version marker | `PRAGMA user_version` | none | `deuz_meta.schema_version` |
+| Runs automatically | yes | n/a | yes — every store method awaits `migrate()` first |
+| Needs a DBA | no | no | for `CREATE SCHEMA` and `CREATE EXTENSION vector` only |
+| Namespacing | one file per deployment | `prefix` (default `deuz`) | `schema` (default `public`) |
+
+**SQLite** migrates itself on the first store call: it reads `PRAGMA user_version`, and if the database is already at the current version it does nothing. Otherwise the whole v1 DDL plus the version bump run in one transaction, so an interrupted first boot leaves a database at version 0 that the next boot migrates cleanly. The FTS index is built *separately*, in its own transaction and its own `try`/`catch`, because [fts5 may not exist](#node-version-matrix) — a failure there rolls back and downgrades search rather than failing the store. Backup is a file copy; with WAL on (the default), copy the `-wal` and `-shm` siblings too, or close the pack first.
+
+**Redis** has no schema at all. The namespace is `prefix`, and it is the whole isolation story: two apps sharing one Redis need two prefixes, and *changing* a prefix does not migrate anything — the old keys stay where they are, invisible to the new pack. There is no TTL on any key either; `sweepExpiredMemories` is the only thing that removes memories, and chats and sessions are removed only by `deleteChat` / `sessions.delete`.
+
+**Postgres** is the one with a story to manage:
+
+```ts title="boot.ts"
+const stores = createPostgresStores({
+  connectionString: process.env.DATABASE_URL!,
+  schema: 'agent',       // must already exist
+  pgvector: 'require',   // fail loudly rather than silently degrading
+  dimensions: 1536,      // must match your embedding model
+});
+
+await stores.migrate(); // idempotent; do it at boot to fail before traffic arrives
+```
+
+- **`migrate()` is idempotent and memoized.** Every store method awaits it, so calling it yourself is optional — but calling it at boot converts "the first chat of the day 500s" into "the process refuses to start", which is the trade you want. A *failed* attempt is not cached: the next call retries.
+- **The whole batch is one multi-statement query wrapped in `BEGIN … COMMIT`.** That is not stylistic: `pool.query('BEGIN')` followed by a separate `query(ddl)` can land on different pooled connections and silently run the DDL outside the transaction.
+- **Two statements are never issued: `CREATE SCHEMA` and `CREATE EXTENSION vector`.** Both need rights most managed hosts reserve, and both are decisions rather than side effects. The connection the pack uses needs `CREATE` on the target schema (for the tables and indexes), `SELECT` on `pg_extension` (for the pgvector probe — `pgvector: 'require'` fails explicitly if it cannot read it), and ordinary DML.
+- **The version marker guards forward, not backward.** If `deuz_meta.schema_version` is *newer* than the SDK understands, `migrate()` refuses with an `InvalidRequestError` telling you to upgrade the SDK rather than downgrade the schema. There is exactly one version today, so this matters the day there are two: a rolling deploy where old and new pods share a database fails loudly on the old pods instead of corrupting rows.
+- **In production, prefer a release step.** Every statement is `IF NOT EXISTS` and the batch is transactional, so an accidental second run is harmless — but running `migrate()` in a deploy/release phase surfaces a missing grant before any traffic does.
+
+If you would rather own the DDL entirely, the [Postgres schema below](#postgres-schema-v1) is the whole of it. Create the tables yourself, insert `('schema_version', '1')` into `deuz_meta`, and `migrate()` becomes a no-op that only probes for pgvector.
 
 ---
 
@@ -69,6 +136,50 @@ Zero runtime dependencies, because modern Node carries `node:sqlite` in the box.
 | `database` | `SqliteDatabaseLike` | — | Use **this** handle instead of opening `node:sqlite`. The pack owns it from here on: `close()` closes it. |
 | `wal` | `boolean` | `true` | `PRAGMA journal_mode = WAL` for file databases. Ignored for `':memory:'`. |
 | `fts` | `boolean` | `true` | Build the FTS5 index for lexical search. Falls back to `LIKE` automatically when fts5 is missing. |
+
+### The whole recipe
+
+There is no install step and no schema step — which is the point of this pack.
+
+```bash
+# 1. Nothing to install. Confirm the runtime has the module:
+node -e "require('node:sqlite'); console.log('ok')"
+```
+
+```ts title="stores.ts"
+import { createSqliteStores } from '@deuz-sdk/core/stores/sqlite';
+
+// 2. Module scope is fine: nothing opens until the first store call.
+export const stores = createSqliteStores({ path: './data/agent.db' });
+```
+
+```ts title="chat-route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+import { stores } from './stores';
+
+export async function POST(req: Request) {
+  const { chatId, messages, userId } = await req.json();
+
+  // 3. Both seams are ordinary values. The tables are created on this call.
+  const result = streamChat({
+    model,
+    messages,
+    chat: { store: stores.chats, chatId, scope: { userId } },
+    session: { store: stores.sessions, runId: chatId },
+  });
+
+  return toDeuzStreamResponse(result);
+}
+```
+
+```ts title="shutdown.ts"
+// 4. Close on the way out. WAL means a `-wal` and `-shm` file sit beside the
+//    database; close before copying it, or copy all three.
+process.on('SIGTERM', () => void stores.close());
+```
+
+That is the complete story for a CLI, a desktop app, or a single-process server. The two things to keep in mind: **one writer**. SQLite serializes writes at the file level, so several Node processes pointed at the same file will contend rather than scale, and a container that mounts a read-only root has nowhere to put it. If either of those describes you, question 2 of the [decision list](#pick-one-in-four-questions) already sent you elsewhere.
 
 ### Node version matrix
 
@@ -128,7 +239,7 @@ const stores = createSqliteStores({
 
 better-sqlite3 is **not** a peer dependency and nothing installs it for you. The same hatch takes a pooled connection wrapper or a test double.
 
-### Schema v1
+### SQLite schema v1
 
 Created on first use and versioned with `PRAGMA user_version`; a database already at the current version is left alone.
 
@@ -179,7 +290,15 @@ Plus, when fts5 is available, an external-content index over `deuz_memory.text` 
 | both | **Hybrid**: cosine and bm25 ranks fused with RRF (k = 60) — the same merge [`hybridRetrieve`](/docs/modules/rag) uses. |
 | neither | The freshest rows in the scope, `score: 0`. |
 
+`MemoryQuery.filter` narrows any of those branches, but **in JS, not in SQL**: `metadata` is opaque JSON `TEXT` here, so the containment test cannot ride the scope index. The SQL `LIMIT` is widened to 1,000 rows whenever a filter is present, so the predicate has something to narrow — a filtered query therefore reads more rows than an unfiltered one, and on a very large scope a match outside those 1,000 freshest rows is not found. (Postgres pushes the same filter into `metadata @> $json::jsonb` and has no such window.)
+
+`MemoryQuery.asOf` works exactly as it does on Postgres — `COALESCE(valid_at, created_at) <= asOf AND (invalid_at IS NULL OR invalid_at > asOf)` — and without it the store filters to `invalid_at IS NULL`, i.e. the present.
+
 Two honest caveats. Embeddings round-trip through a **Float32** codec, so a stored `0.6` reads back as `0.6000000238418579` — the store is a float32 index exactly like pgvector, and the difference is far below any embedding model's noise floor. And the vector prefetch is bounded: on a scope with hundreds of thousands of rows the cosine ranking is an approximation over the freshest slice, which is the point at which you want the Postgres pack.
+
+<Callout type="info" title="Why `PRAGMA recursive_triggers = ON` shows up in the log">
+Not tuning — correctness. `upsert` is `INSERT OR REPLACE`, which *deletes* the conflicting row first, and with recursive triggers off that delete does not fire the FTS delete trigger. The old rowid then lingers in the external-content index and a later integrity check reports *"database disk image is malformed"*. The pack sets the pragma on open and tolerates a handle that refuses it, which is one more reason an injected driver should be a real SQLite handle rather than a partial stand-in.
+</Callout>
 
 ---
 
@@ -220,6 +339,51 @@ interface RedisClientLike {
 | `prefix` | `string` | `'deuz'` | Key namespace. Not escaped — it is yours, not a user's. |
 
 `client` and `url` are mutually exclusive arms of a union: pass one.
+
+### The whole recipe
+
+```bash
+npm i redis   # optional peer — skip it entirely if you inject your own client
+```
+
+```ts title="stores.ts"
+import { createClient } from 'redis';
+import { createRedisStores } from '@deuz-sdk/core/stores/redis';
+
+// Own the connection yourself: pool behaviour, TLS, retry policy and shutdown
+// order are decisions this pack should not be making for a production app.
+const redis = createClient({ url: process.env.REDIS_URL! });
+redis.on('error', (err) => log.error('redis', err));
+await redis.connect();
+
+export const stores = createRedisStores({
+  client: redis,
+  prefix: process.env.APP_NAME ?? 'deuz', // one namespace per app on a shared Redis
+});
+export const closeRedis = () => redis.quit(); // NOT stores.close() — it is your client
+```
+
+```ts title="chat-route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+import { stores } from './stores';
+
+export async function POST(req: Request) {
+  const { chatId, messages, userId } = await req.json();
+
+  const result = streamChat({
+    model,
+    messages,
+    chat: { store: stores.chats, chatId, scope: { userId } },
+    session: { store: stores.sessions, runId: chatId },
+    // No `runs` seam on this pack — a run dashboard needs SQLite or Postgres.
+  });
+
+  return toDeuzStreamResponse(result);
+}
+```
+
+There is no schema step, and no migration: the [key layout](#key-schema) is created as it is written. Two setup decisions do matter, though. **Pick a `prefix` per application** if the Redis instance is shared — it is the only isolation boundary, and it is not escaped, so keep it a plain constant rather than anything user-derived. And **decide who closes the connection**: with `{ client }` that is you (`stores.close()` deliberately does nothing), while with `{ url }` it is the pack — and a closed `{ url }` pack never reconnects.
 
 ### ioredis (and anything else) in ten lines
 
@@ -278,6 +442,21 @@ Every reader tolerates exactly that: ids are resolved with one `mGet` and a `nul
 Wrapping the sequence in `MULTI` (or pipelining it) is a 2.x optimization, not a correctness fix — which is why it is stated here instead of quietly deferred.
 </Callout>
 
+#### What that actually means, failure by failure
+
+The ordering was chosen so the *survivable* failure is the one you get. Concretely:
+
+| The process dies… | What is on disk | What a reader sees |
+| --- | --- | --- |
+| after the index `sAdd`s, before the record `set` | an id in one or more index sets, no record | Nothing. `mGet` returns `null` for it and the row is skipped — the memory simply was not written. |
+| after the record `set` | record and indexes both present | The complete record. This is the success case; the record is written **last** for exactly this reason. |
+| mid-`delete` | possibly a record with no index memberships | The record is unreachable through a scoped query but still occupies a key. `delete` on the same id later cleans it up unconditionally. |
+| mid-`upsert` of a record that changed scope | memberships under both the old and the new scope value | A hit under the *old* scope whose record contradicts it — the record's own fields are always the truth, and `findByHash` actively repairs a membership the record disagrees with. |
+
+The one thing the tolerance does **not** buy you is atomicity across seams: saving a chat is two commands (`set` the record, `sAdd` the index), so a crash between them leaves a chat that `loadChat(id)` finds but `listChats()` does not. Rebuild by re-saving, not by patching keys.
+
+The sweeper is deliberately generous here. It reads the `P:mem:expiry` ZSET — cost O(expired), not O(stored) — and then splits on whether a scope was given. `stores.sweepExpiredMemories(now?)` is always **unscoped**, and an unscoped sweep deletes every id it found *including ids whose record has already vanished*, which is what garbage-collects crash orphans. `stores.memory.deleteExpired(now, scope)` is the scoped one, and it can only delete records it can prove belong to the scope — so an orphan (no record → no provable scope) survives it. Either way the returned count is records actually removed, never ids visited. Run the pack-level unscoped sweep on a schedule even if your application only ever sweeps per tenant.
+
 ### Search is client-side
 
 That is the honest trade of a v1 Redis backend. `search()` narrows by the scope indexes (`sInter` over the fields the query pins), pulls those records with **one** `mGet`, and ranks them in your process — cosine when the query carries an embedding, substring otherwise.
@@ -316,7 +495,80 @@ interface PgClientLike {
 
 `migrate()` is idempotent and memoized: every store method awaits it first, so calling it yourself is optional — do it at boot when you would rather fail fast. A failed attempt is **not** cached; the next call retries.
 
-### Schema v1
+### The whole recipe
+
+```bash
+npm i pg   # optional peer — skip it if you inject a driver (Neon, Supabase, a proxy)
+```
+
+```sql
+-- Once, by whoever owns the database. Neither statement is ever issued by the SDK.
+CREATE SCHEMA IF NOT EXISTS agent;
+CREATE EXTENSION IF NOT EXISTS vector;   -- superuser-ish on most managed hosts
+
+-- The connection the app uses needs these, and nothing more:
+GRANT USAGE, CREATE ON SCHEMA agent TO app_user;
+```
+
+```ts title="stores.ts"
+import { Pool } from 'pg';
+import { createPostgresStores } from '@deuz-sdk/core/stores/postgres';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
+
+export const stores = createPostgresStores({
+  client: pool,          // injected → `stores.close()` will not end it
+  schema: 'agent',
+  pgvector: 'require',   // refuse to start rather than silently degrade to JS cosine
+  dimensions: 1536,      // MUST match the embedder — see the mismatch note below
+});
+
+export const closePool = () => pool.end();
+```
+
+```ts title="boot.ts"
+// Run once at startup (or in a release step). Turns "the first write 500s"
+// into "the process refuses to start", which is the failure you want.
+await stores.migrate();
+```
+
+```ts title="chat-route.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
+import { stores } from './stores';
+
+export async function POST(req: Request) {
+  const { chatId, messages, userId } = await req.json();
+
+  const result = streamChat({
+    model,
+    messages,
+    chat: { store: stores.chats, chatId, scope: { userId } },
+    session: { store: stores.sessions, runId: chatId },
+    memory: {
+      seams: { store: stores.memory, embedder, llm, clock, generateId },
+      scope: { userId, chatId },   // multi-tenant isolation is this object
+      sweep: 'on-extract',
+    },
+  });
+
+  return toDeuzStreamResponse(result);
+}
+```
+
+On a serverless platform, replace the `pg.Pool` with an HTTP driver (`@neondatabase/serverless`, a Supabase pooler wrapper) — anything with a `query(sql, params)` method satisfies `PgClientLike` structurally. The pack itself is safe at module scope either way: nothing connects until the first call.
+
+<Callout type="warn" title="`dimensions` is a decision you make once">
+`vector(D)` fixes the width **per column**, and `ALTER TABLE … ADD COLUMN IF NOT EXISTS` is a silent no-op against a column that already exists at another width. The pack therefore checks `pg_attribute` during `migrate()` and refuses to proceed on a mismatch, rather than "migrating successfully" and then failing every write:
+
+> Schema 'agent' already stores `deuz_memory.embedding` as `vector(768)`, but this pack was built with `dimensions: 1536`…
+
+The same guard runs per record on the way in: a memory carrying a 768-dimension embedding against a `vector(1536)` column throws `InvalidRequestError` naming the record id, and it is checked for **every** record in a batch before any of them is written, so a rejected batch never lands half-written.
+
+Practically: pick the embedding model first, then set `dimensions` to its output width (1536 for `text-embedding-3-small`, 3072 for `-large`, 1024 for `voyage-3.5`). Changing model later means an `ALTER COLUMN … TYPE vector(D)` **and** re-embedding every row — the ALTER re-embeds nothing, so the stored vectors must already have the new width. Mixing widths in one table is not possible; a second model needs a second table or a second schema.
+</Callout>
+
+### Postgres schema v1
 
 ```sql
 CREATE TABLE deuz_memory (
@@ -381,7 +633,11 @@ UPDATE deuz_memory
  WHERE embedding IS NULL AND embedding_json IS NOT NULL;
 ```
 
-The next `migrate()` adds the column and the HNSW index for you, so the order is: install the extension, restart (or call `migrate()`), then run the backfill.
+The next `migrate()` adds the column and the HNSW index for you, so the order is: install the extension, restart (or call `migrate()`), then run the backfill. Nothing has to stop while you do it — reads keep working off `embedding_json`, and writes made between the `migrate()` and the backfill already populate both columns.
+
+Two details worth knowing before you plan that window. The backfill is a full-table `UPDATE`, so on a large table run it in batches (`WHERE embedding IS NULL AND embedding_json IS NOT NULL LIMIT …` in a loop) rather than as one statement. And the HNSW index is built by `migrate()` *before* the rows have vectors, which is fine — it fills in as the backfill writes — but if you would rather build it against a populated table, run `migrate()` with `pgvector: 'off'`, backfill, then flip to `'auto'` and let the next `migrate()` create the index.
+
+`pgvector: 'require'` exists for the deployment where degrading is worse than failing. It refuses to migrate both when the extension is absent **and** when the connection cannot read `pg_extension` at all — a permissions problem that `'auto'` would quietly interpret as "not installed", leaving you on the JS fallback with no signal.
 
 <Callout type="info" title="A loaded record carries no embedding">
 The read column set is the write set **minus** `embedding_json`: a 1536-dim array is ~20 KB of text on the wire, so it is fetched only by the fallback search that has to score it. `get`/`list`/`search` therefore return a `MemoryRecord` with no `embedding` field — unlike the in-memory store, which keeps it inline. Re-embed rather than reading it back.
@@ -397,7 +653,33 @@ The read column set is the write set **minus** `embedding_json`: a 1536-dim arra
 | `filter` | `metadata @> $json::jsonb` — combines with any of the above. |
 | neither | Freshest rows in the scope, `score: 0`. |
 
-`MemoryQuery.asOf` turns every branch into a point-in-time query (`valid_at <= asOf AND (invalid_at IS NULL OR invalid_at > asOf)`); without it the store shows the present, so soft-deleted rows are invisible — exactly what the in-memory reference store does.
+`MemoryQuery.asOf` turns every branch into a point-in-time query; without it the store shows the present, so soft-deleted rows are invisible — exactly what the in-memory reference store does. The predicate is `COALESCE(valid_at, created_at) <= asOf AND (invalid_at IS NULL OR invalid_at > asOf)`, and the `COALESCE` is deliberate: a record with no explicit `validAt` is valid from its `createdAt`, not from the beginning of time, so a point-in-time query cannot invent facts that did not exist yet. SQLite and Redis implement the same rule.
+
+One behaviour that surprises people reading the SQL log: an **embedding query still returns rows that have no embedding**. The pgvector branch requires `embedding IS NOT NULL` to use the index, but if that page comes back short — or its worst hit scores below zero — a second query appends the `embedding IS NULL` rows at `score: 0` and the merged list is re-sorted. That is not padding for its own sake; every other backend (in-memory, SQLite, Redis) scores an embedding-less record 0 and still returns it, and a store that silently dropped text-only memories would answer the same query differently depending on which pack you installed. For real (non-negative) embeddings a full page keeps the flagship path at one round-trip.
+
+---
+
+## Performance expectations
+
+Rough shapes rather than benchmarks — the point is which term dominates, and where each pack stops being the right answer.
+
+| | SQLite | Redis | Postgres |
+| --- | --- | --- | --- |
+| Where vector search runs | your process, over a bounded prefetch | your process, over the **whole scope** | **in the database** (HNSW), or your process in fallback mode |
+| Rows moved per vector query | `max(1000, topK × 50)` | every record in the scope | `topK` |
+| Lexical query | FTS5 `bm25()` — an index | substring over the same fetched rows | `ILIKE` — a scan unless you add your own index |
+| Cost driver | disk + the prefetch decode | **network + scope size** | index quality |
+| Comfortable up to | one machine's disk, single writer | a few thousand records per scope | as far as your Postgres goes |
+
+Reading that table sideways gives the three things that actually bite:
+
+- **Redis search cost is O(records in the scope), not O(matching records).** `search()` intersects the scope indexes, pulls those records with one `mGet`, and ranks them locally — so a `{ userId }` scope with 50,000 memories moves 50,000 JSON documents over the wire for every recall. Keep scopes narrow (`chatId`, or `userId` + `chatId`), and treat "one scope grew past a few thousand" as the migration signal.
+- **SQLite vector ranking is approximate at scale.** The prefetch is the freshest `max(1000, topK × 50)` rows in the scope; beyond that, a genuinely relevant old memory can be outside the window and simply never scored. Under a few tens of thousands of rows per scope this is invisible; well past it, it is the moment to move to Postgres.
+- **Postgres without pgvector is SQLite's trade with a network hop added.** The fallback pulls the 1,000 freshest candidates *including* their `embedding_json` (a 1536-dim array is ~20 KB of text each) and scores them in JS. It is correct and it is fine for small tables, but it is not what you chose Postgres for — `pgvector: 'require'` is how you make sure you never ship it by accident.
+
+Two costs that apply everywhere. **Embedding-less recall is cheap**: a query with neither `text` nor `embedding` is just "the freshest rows in the scope", which every pack answers with one indexed read. And **`metadata` filtering is not uniformly cheap**: Postgres pushes it into SQL (`metadata @> $json::jsonb`), while SQLite and Redis evaluate it in JS — SQLite widens its SQL `LIMIT` to 1,000 rows when a filter is present so the predicate has something to narrow, which means a filtered query scans more than an unfiltered one.
+
+Finally, the write path. SQLite batches an `upsert` into one transaction; Redis issues several commands per record with no pipelining ([by design, for now](#no-multi-in-v1--and-the-readers-are-built-for-it)), so a 100-record batch is hundreds of round-trips; Postgres issues one statement per record because a batch spanning a pool cannot be wrapped in a transaction. None of the three is optimized for bulk import — if you are seeding a store with a large corpus, do it once, off the request path.
 
 ---
 

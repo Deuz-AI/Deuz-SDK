@@ -30,6 +30,24 @@ npm i @modelcontextprotocol/sdk
 
 If it is missing at runtime, the call rejects with an `InvalidRequestError` telling you to install it.
 
+## Which path do I want?
+
+Four ways to get MCP tools into a run. They differ in **who owns the connection**, which is the only decision that actually matters.
+
+| Situation | Use | Connection lifetime |
+| --- | --- | --- |
+| A script, a job, one request — nothing to keep warm | `mcp: [{ url }]` | Opened and closed **by the run**. One handshake per call. |
+| A server process handling many requests against the same few servers | `mcp: [{ url }]` **+** `deps.mcpPool` | Opened once **by the pool**, reused across requests, closed at shutdown. |
+| You need `listResources` / `getPrompt` / `setRoots`, or one connection has to outlive many runs | `createMcpClient()`, then `mcp: [{ client }]` (or spread `await client.listTools()` into `tools`) | **Yours.** You call `close()`. |
+| A local server launched as a child process | `mcp: [{ command }]` (Node) or `createStdioMcpClient()` | Same split: config = the run's, a live client = yours. |
+
+Two situations where the answer is "none of the above":
+
+- **`generateObject` / `streamObject` reject `mcp`.** They are single-shot by design; connecting servers only to drop their tools would pay a full handshake for nothing. Passing it is a caller error, not a silent no-op.
+- **A run that only sets `mcp`, with no `tools` of its own, still routes through the agentic loop** — that is where the tool round-trip lives.
+
+Start at the top of the table and move down only when a row's limitation actually bites you. A pool is not an optimization you need before you have concurrency; a hand-built client is not required before you need a method the loop does not call.
+
 ## Transports
 
 | Subpath | Function | Transport | Runtime |
@@ -70,6 +88,21 @@ await generateText({
 });
 ```
 
+`sampling` and `roots` are **not** loop-entry fields. A config entry accepts `auth` and `onElicitationRequest`; everything else a server can ask *you* for is declared at construction, so it needs `createMcpClient()` and a `{ client }` entry.
+
+### Ownership: who closes what
+
+The single most common MCP bug is closing something you borrowed, or leaking something you opened. The rule is mechanical:
+
+| Entry | Opened by | Closed by | What you write |
+| --- | --- | --- | --- |
+| `{ url }` / `{ command }` config | the run | **the run**, at every exit — including a failed connect and a thrown tool | nothing |
+| `{ url }` / `{ command }` **with** `deps.mcpPool` | the pool | **the pool** — never the run, not even on failure | `pool.close()` on shutdown |
+| a live `McpClient` (bare or `{ client }`) | you | **you** | `await client.close()` in a `finally` |
+| a client you built and never handed to `mcp` | you | **you** | same |
+
+Closing a long-lived connector because one request finished is the bug this rule exists to prevent — so `closeOwned()` filters on ownership rather than on "everything the run touched". The mirror image is just as real: a `createMcpClient()` you forget to `close()` keeps an HTTP session (or, on stdio, a **child process**) alive for the life of the host process.
+
 ### Namespacing
 
 Tool names travel to providers that accept `[A-Za-z0-9_-]` only, so a prefix has to be sanitized. The rule, in order:
@@ -81,15 +114,9 @@ Tool names travel to providers that accept `[A-Za-z0-9_-]` only, so a prefix has
 
 Prefixed names are `` `${namespace}_${tool}` ``. Two servers exporting the same final name is not fatal: the later entry wins and the collision is logged — failing a run over a name clash would be worse than an over-specific tool.
 
-### Ownership: who closes what
-
-| Entry | Opened by | Closed by |
-| --- | --- | --- |
-| `{ url }` / `{ command }` config | the run | **the run**, at every exit |
-| `{ url }` / `{ command }` with `deps.mcpPool` | the pool | **the pool** — never the run |
-| a live `McpClient` (bare or `{ client }`) | you | **you** |
-
-Closing a long-lived connector because one request finished is the bug this rule exists to prevent.
+<Callout type="warn" title="Rule 2 is a trap when the entry list grows">
+Adding a second server silently **renames every tool of the first one**, because rule 2 stops applying. A model prompted with `search_query` now sees `github_search_query`, and any `activeTools` list or `hasToolCall('…')` stop condition written against the old name stops matching. Set an explicit `namespace` on day one if the list might ever grow.
+</Callout>
 
 ### Fail fast
 
@@ -102,10 +129,6 @@ A server that cannot be reached **rejects the whole call** rather than quietly r
 Every client — borrowed ones included — is subscribed to `tools/list_changed`. At the next step boundary the loop re-reads the catalogs and rebuilds the wire tool lists. A failed `tools/list` re-arms the dirty flag and keeps the previous catalog: one failed refresh must not end a healthy run.
 
 Config-based connections default to `reconnect: true`, because an agentic run outlives a single request and a dropped session in the middle of step 4 would otherwise fail every remaining tool call. A client **you** built keeps whatever lifecycle you chose.
-
-### Refusals
-
-`generateObject` / `streamObject` **reject** `mcp`: they are single-shot by design, and connecting servers only to drop their tools would pay a full handshake for nothing. A call that sets only `mcp`, with no `tools` of its own, still routes through the agentic loop.
 
 ### `deps.mcpPool` — for server processes
 
@@ -132,9 +155,9 @@ Keyed by the config's **structure**, so the same `{ url }` handed to a hundred r
 The in-flight **promise** is what is cached, so concurrent requests for a cold server share one connect instead of racing several. A failed connect is evicted (the next call retries rather than replaying a dead rejection), and so is an entry whose session has since gone `closed` / `error` — a pool that hands back a corpse is worse than no pool.
 
 <Callout type="warn">
-  Identity-based keys are why a **new object per request** is a leak: build the value once, at module scope. A config carrying a fresh elicitation handler on every call mints a fresh connection every call.
+  Identity-based keys are why a **new object per request** is a leak: build the value once, at module scope. A config carrying a fresh elicitation handler on every call mints a fresh connection every call. The pool says so once, through `createMcpPool({ logger })`.
 
-  The pool bounds that rather than trusting it: `createMcpPool({ maxSize })` defaults to **32** entries and evicts the least recently used one, closing it. Pass a `logger` to hear about an eviction — a pool that churns is telling you a key varies per request.
+  It bounds that rather than trusting it: `maxSize` defaults to **32** entries and evicts the least recently acquired one, **closing** it. The trade is real — the pool cannot see which clients a run is still using, so a session evicted mid-run takes that run's remaining MCP tool calls down with it. Keep the ceiling comfortably above the number of distinct servers in flight.
 </Callout>
 
 ---
@@ -221,6 +244,32 @@ An MCP server that wants OAuth answers the first connect with a 401. The SDK imp
 
 ### The two-step flow
 
+Connecting is **two `createMcpClient` calls with a human in between**. Nothing is retried in place, because the second call may well happen in a different process (a web request finishing a redirect, a CLI resuming after a browser round-trip):
+
+```
+① createMcpClient({ transport, auth })
+   │
+   ├── tokens already in the store? ──────────────────────────────► connected ✓
+   │
+   └── no tokens
+         │  the SDK runs discovery (RFC 8414) → registration (RFC 7591) → PKCE,
+         │  and writes `code-verifier:<serverUrl>` into your TokenStore
+         │
+         ├── auth.onRedirect?.(url)          ← a push copy of the URL, if you set one
+         └── throws McpAuthorizationRequiredError { serverUrl, authorizationUrl }
+
+② your host shows `authorizationUrl` to the user
+   │  (a web app 302s to it · a CLI prints it · a desktop shell launches it)
+   │  the library NEVER opens a browser
+   ▼
+   the user consents; the authorization server redirects to your `redirectUri?code=…`
+
+③ createMcpClient({ transport, auth, authorizationCode: code })
+   │  transport.finishAuth(code) exchanges it BEFORE connect, using the stored
+   │  verifier, and saves `tokens:<serverUrl>`
+   └──────────────────────────────────────────────────────────────► connected ✓
+```
+
 ```ts title="oauth-two-step.ts"
 import { createMcpClient } from '@deuz-sdk/core/mcp';
 import { McpAuthorizationRequiredError } from '@deuz-sdk/core';
@@ -246,7 +295,12 @@ try {
 
 `McpAuthorizationRequiredError` (from `@deuz-sdk/core`) carries `serverUrl` and, when a provider was configured, `authorizationUrl`. It is a plain serializable error, which matters: the process that shows the URL to a user is often not the process that connects.
 
-The authorization code is **single-use**, so it is spent on the first attempt only. A reconnect re-reads whatever tokens it bought.
+Facts that decide whether your flow works:
+
+- **The authorization code is single-use**, so it is spent on the first attempt only. A reconnect re-reads whatever tokens it bought.
+- **The PKCE verifier lives in your `TokenStore`.** Steps ① and ③ must therefore see the *same* store. `inMemoryTokenStore()` is fine within one process and cannot possibly work across two.
+- **Passing `auth` as plain options mints a fresh provider per call.** That is safe precisely because all the state is in the store — but it also means `provider.authorizationUrl()` is not something you can read back later; take the URL off the error.
+- **`onRedirect` does not replace the throw.** It is a notification, delivered the moment the SDK produces the URL. The connect still rejects with `McpAuthorizationRequiredError` (carrying the same URL string), so a `catch` is required either way.
 
 ### Or: `completeAuth(code)`
 
@@ -258,12 +312,12 @@ import { createOAuthProvider, createMcpClient } from '@deuz-sdk/core/mcp';
 const provider = createOAuthProvider({
   redirectUri: 'https://app.example.com/oauth/callback',
   store,
-  onRedirect: (url) => sendToUser(url),   // called INSTEAD of throwing
+  onRedirect: (url) => sendToUser(url),   // pushed as soon as it exists
 });
 
 try {
   client = await createMcpClient({ transport, auth: provider });
-} catch {
+} catch (err) {
   const code = await waitForCallbackCode();
   await provider.completeAuth(code);      // exchange + persist
   client = await createMcpClient({ transport, auth: provider });
@@ -282,7 +336,9 @@ interface DeuzOAuthProvider {
 }
 ```
 
-`redirectToAuthorization` **never opens a browser**: it records the URL and calls `onRedirect`. Deciding how a user sees that URL — a CLI printing it, a web app 302-ing to it, a desktop shell launching one — is the host's call, and a library that spawns a browser on a server is a bug.
+`completeAuth` needs to know *which* server it is finishing an exchange for. `createMcpClient` binds that for you on the first attempt (and persists it as `server-url`); a provider that has never been handed to a client rejects with an actionable error instead of guessing.
+
+`invalidate()` drops the tokens and the verifier but deliberately **keeps the dynamic client registration** — it is not a credential the server rejected, and re-registering on every expiry would litter the authorization server with dead clients.
 
 ### `createOAuthProvider` options
 
@@ -294,7 +350,7 @@ interface DeuzOAuthProvider {
 | `scope` | `string` | Space-separated scopes. |
 | `clientMetadata` | `Record<string, unknown>` | Extra fields for the registration body; your fields win over the defaults. |
 | `store` | `TokenStore` | Default: `inMemoryTokenStore()` — tokens die with the process. |
-| `onRedirect` | `(url: URL) => void \| Promise<void>` | Called with the authorization URL instead of throwing. |
+| `onRedirect` | `(url: URL) => void \| Promise<void>` | Called with the authorization URL as soon as the SDK produces it. A notification, **not** a substitute for catching `McpAuthorizationRequiredError`. |
 
 ### The `TokenStore` seam
 
@@ -323,7 +379,7 @@ server-url                 the server the last authorization was started for
 A file-backed store must create the file `0600`. A browser-storage-backed one is only appropriate for a server the user alone controls. `inMemoryTokenStore()` is the safe default precisely because it forgets everything on exit.
 </Callout>
 
-#### Node: a file store and a loopback listener
+#### Node CLI: a loopback redirect and a file store
 
 `@deuz-sdk/core/mcp/node` ships the two things a CLI or desktop flow needs and a browser-safe runtime cannot provide.
 
@@ -345,7 +401,12 @@ try {
   client = await createMcpClient({ transport, auth });
 } catch (err) {
   if (!(err instanceof McpAuthorizationRequiredError)) throw err;
-  console.log('Open this URL to authorize:\n' + err.authorizationUrl);
+
+  // REQUIRED: the listener only accepts a redirect that echoes ITS state back.
+  const authorize = new URL(err.authorizationUrl!);
+  if (loopback.state) authorize.searchParams.set('state', loopback.state);
+
+  console.log('Open this URL to authorize:\n' + authorize.toString());
   const authorizationCode = await loopback.waitForCode();
   client = await createMcpClient({ transport, auth, authorizationCode });
 } finally {
@@ -353,13 +414,19 @@ try {
 }
 ```
 
+<Callout type="warn" title="Forwarding `loopback.state` is not optional">
+`createLoopbackRedirect()` mints a fresh 256-bit `state` and **refuses any redirect that does not echo it** (400, compared in constant time, and the wait is left running so a forgery cannot cancel a real redirect that is still in flight). Any process on the machine — or any page open in the user's browser — can reach a loopback port, so without the echo the listener would accept an authorization code of someone else's choosing (RFC 6819 §4.4.1.5 code injection).
+
+Hand it a value you already minted with `state: '…'`, or turn the check off with `state: false` **only** when the authorization request genuinely cannot carry `state`.
+</Callout>
+
+`createLoopbackRedirect({ port?, path?, timeoutMs?, state? })` is a **single-shot** listener bound to `127.0.0.1` — not `localhost` (which can resolve to `::1` first, leaving an IPv4 redirect with nothing listening) and never `0.0.0.0` (a wildcard would take an authorization code off the LAN). The timeout defaults to **5 minutes**, measured from **creation** rather than from `waitForCode()`, because the redirect URI is live the moment it resolves. `close()` is idempotent and safe in a `finally`; a bind failure on an explicit `port` rejects instead of hanging.
+
 `createFileTokenStore` writes one JSON file, created `0600`, through a temp file and a rename — a crash mid-write can never tear the existing tokens. Every operation is chained onto the previous one, because `set` is a read-modify-write and the SDK's token save and verifier save race routinely. A file that is missing, unreadable or invalid JSON reads as **empty** rather than throwing: re-authorizing is recoverable, crashing a run on a half-written file is not.
 
-`createLoopbackRedirect({ port?, path?, timeoutMs? })` is a **single-shot** listener on `127.0.0.1` (not `localhost` — the name can resolve to `::1` first, and an authorization server that registered the IPv4 literal would then redirect somewhere nothing is listening). It answers exactly one authorization result and stops. The timer starts at **creation**, not at `waitForCode()`, because the redirect URI is live the moment it resolves. `close()` is idempotent and safe in a `finally`.
+#### Edge: a KV store scoped per user
 
-#### Edge: a KV-backed store
-
-On an edge runtime the same seam is three lines over whatever KV you have:
+On an edge runtime there is no loopback and no filesystem: the redirect is an ordinary route in your app, and the store is three lines over whatever KV you have.
 
 ```ts title="kv-token-store.ts"
 import type { TokenStore } from '@deuz-sdk/core/mcp';
@@ -372,7 +439,45 @@ export const kvTokenStore = (kv: KVNamespace, userId: string): TokenStore => ({
 });
 ```
 
-Scoping the namespace by user is the whole trick: the provider already namespaces by server, so one KV holds every user × every server without collisions. Encrypt at rest if your KV does not.
+```ts title="edge-oauth-route.ts"
+import { generateText, McpAuthorizationRequiredError } from '@deuz-sdk/core';
+import { createOAuthProvider } from '@deuz-sdk/core/mcp';
+
+const MCP_URL = 'https://mcp.example.com/mcp';
+const authOptions = (env: Env, userId: string) => ({
+  redirectUri: `${env.APP_URL}/oauth/callback`,
+  store: kvTokenStore(env.KV, userId),
+});
+
+// POST /chat — run normally, or bounce the user into consent.
+export async function chat(req: Request, env: Env, userId: string) {
+  try {
+    const { text } = await generateText({
+      model, messages, maxSteps: 6,
+      mcp: [{ url: MCP_URL, auth: authOptions(env, userId) }],
+    });
+    return Response.json({ text });
+  } catch (err) {
+    if (!(err instanceof McpAuthorizationRequiredError)) throw err;
+    // Step ② — the client cannot show a URL to a user; your app can.
+    return Response.json({ authorizeUrl: err.authorizationUrl }, { status: 428 });
+  }
+}
+
+// GET /oauth/callback?code=… — step ③, in a completely different request.
+export async function callback(req: Request, env: Env, userId: string) {
+  const code = new URL(req.url).searchParams.get('code')!;
+  // The KV already holds this user's `code-verifier:` and `server-url`, so a
+  // fresh provider can finish the exchange without reconnecting to anything.
+  await createOAuthProvider(authOptions(env, userId)).completeAuth(code);
+  return Response.redirect(`${env.APP_URL}/chat`, 302);
+}
+```
+
+Scoping the KV namespace by user is the whole trick: the provider already namespaces by server, so one KV holds every user × every server without collisions. Encrypt at rest if your KV does not. Two caveats this recipe leans on:
+
+- **`completeAuth` resolves the server from `server-url`**, which records the *last* server bound for that store. With more than one MCP server per user, finish the exchange with `createMcpClient({ transport, auth, authorizationCode })` instead — that binds the server explicitly before exchanging.
+- **Add your own CSRF `state`** to the authorization URL before handing it to the browser, and check it on the callback route. An edge redirect route is exactly as reachable as a loopback port, and nothing mints a `state` for you here the way `createLoopbackRedirect()` does.
 
 ### In a zero-config entry
 
@@ -382,7 +487,7 @@ Scoping the namespace by user is the whole trick: the provider already namespace
 mcp: [{ url: 'https://mcp.example.com/mcp', auth: { redirectUri, store, onRedirect } }]
 ```
 
-A first run with no stored tokens rejects the call with `McpAuthorizationRequiredError`. Sharing one `DeuzOAuthProvider` across several entries shares its store and its registration.
+A first run with no stored tokens rejects the call with `McpAuthorizationRequiredError`. Sharing one `DeuzOAuthProvider` across several entries shares its store and its registration — and, with a pool, keeps them on one connection per provider identity, which is why the provider must be per user and not per request.
 
 ---
 
@@ -428,6 +533,7 @@ So a transport error only **asks the question**, and a single `ping()` answers i
 | `onerror` on a live session, `ping()` succeeds | Not a drop. The session is kept. |
 | `onerror` on a live session, `ping()` fails | A drop. Recovery starts, reporting the **original** transport error (it says what actually happened, not what the ping found). |
 | `onerror`, but the SDK/client has no `ping()` | The 1.x behaviour stands: stay quiet rather than kill a live session on a transient error. |
+| `onerror` **before** the handshake completes | Recorded, not acted on. A failing `connect()` unwinds through its own caller, which already owns the retry. |
 | `keepAliveMs` heartbeat rejects | A drop. The same path. |
 | `onclose` (stdio: the child process died) | A drop. |
 
@@ -468,6 +574,12 @@ interface McpSamplingRequest {
 }
 ```
 
+<Callout type="warn" title="Sampling drives your model and spends your money">
+Configuring `sampling` hands a remote server the ability to run inference on your key, with your credits, inside your rate limits — and the prompt is written entirely by that server. `approve` and the `maxTokens` ceiling exist for exactly that reason: they are the only two things standing between a compromised or greedy server and your bill. A server you do not fully control should have both.
+
+The blast radius is bounded but not zero: the sample runs as a plain single-turn `generateText` with **no tools**, so a server cannot reach your tool set through this door — but it can read whatever your `systemPrompt` and messages contain, because it wrote them.
+</Callout>
+
 Facts worth pinning:
 
 - **The capability is declared only when you configure `sampling`.** A server cannot ask a client that never advertised it.
@@ -500,9 +612,10 @@ The SDK therefore refuses a non-`file://` URI **where you supplied it**, with an
 Notes:
 
 - `roots: []` is a **value** — an explicit "no roots" — and declares the capability. Absence does not.
-- A **function** form is re-read on every `roots/list` request, so a dynamic list needs no re-registration.
+- A **function** form is re-read on every `roots/list` request, so a dynamic list needs no re-registration. Its entries are validated at read time (the array form is validated at construction, so a bad literal rejects `createMcpClient()` outright).
 - `setRoots()` throws when the client was created **without** a `roots` option: the capability is declared at construction, and announcing a change to something never advertised would lie to the server. It validates before swapping, so a refused call leaves the server's view untouched.
 - With a managed connection, `setRoots` notifies the **current** session, so it survives a reconnect.
+- Roots are a **declaration, not a sandbox.** The server decides what to do with them; nothing here confines a server that ignores the list.
 
 ## Elicitation
 
@@ -534,37 +647,50 @@ Requests without a `mode` are form mode (spec back-compat). The lower-level `reg
 
 ## Building a client by hand
 
-Still supported, and the right choice when one connection serves many requests.
+Still supported, and the right choice when one connection serves many requests, or when you need a method the loop never calls.
 
 ```ts title="mcp-http.ts"
-import { generateText } from '@deuz-sdk/core';
+import { generateText, tool } from '@deuz-sdk/core';
 import { createMcpClient } from '@deuz-sdk/core/mcp';
+import { z } from 'zod';
 
-const mcp = await createMcpClient({
+const search = await createMcpClient({
   transport: {
     type: 'http',
-    url: 'https://mcp.example.com/mcp',
+    url: 'https://search.example.com/mcp',
     headers: { Authorization: `Bearer ${process.env.MCP_TOKEN!}` },
   },
   reconnect: true,
   keepAliveMs: 30_000,
 });
+const docs = await createMcpClient({
+  transport: { type: 'sse', url: 'https://docs.example.com/v2/sse' },
+});
 
 try {
-  const tools = await mcp.listTools();
+  // A ToolSet is a plain record, so spread them. Namespace per server.
+  const tools = {
+    ...(await search.listTools('search')),   // search_query, …
+    ...(await docs.listTools('docs')),       // docs_fetch, …
+    now: tool({
+      description: 'Return the current ISO timestamp.',
+      parameters: z.object({}),
+      execute: async () => ({ now: new Date().toISOString() }),
+    }),
+  };
 
   const { text, steps } = await generateText({
     model,
-    messages: [{ role: 'user', content: 'Scrape example.com and summarize it.' }],
-    maxSteps: 5,
+    messages: [{ role: 'user', content: 'What time is it, and what does example.com sell?' }],
+    maxSteps: 6,
     tools,
   });
-
-  console.log(text, steps?.length);
 } finally {
-  await mcp.close();
+  await Promise.all([search.close(), docs.close()]);
 }
 ```
+
+Or hand the live clients to the loop and let it namespace them — `mcp: [{ client: search, namespace: 'search' }, { client: docs, namespace: 'docs' }]`. They are borrowed, so `close()` stays yours, but you get the hot refresh and the merged tool set for free.
 
 ### stdio (Node)
 
@@ -579,42 +705,6 @@ const mcp = await createStdioMcpClient({
 });
 ```
 
-### Mixing MCP tools with your own
-
-A `ToolSet` is a record, so spread them. Use a `namespace` per server when you connect to more than one.
-
-```ts title="mcp-combined.ts"
-import { generateText, tool } from '@deuz-sdk/core';
-import { createMcpClient } from '@deuz-sdk/core/mcp';
-import { z } from 'zod';
-
-const search = await createMcpClient({ transport: { type: 'http', url: 'https://search.example.com/mcp' } });
-const docs = await createMcpClient({ transport: { type: 'sse', url: 'https://docs.example.com/v2/sse' } });
-
-try {
-  const tools = {
-    ...(await search.listTools('search')),   // search_query, …
-    ...(await docs.listTools('docs')),       // docs_fetch, …
-    now: tool({
-      description: 'Return the current ISO timestamp.',
-      parameters: z.object({}),
-      execute: async () => ({ now: new Date().toISOString() }),
-    }),
-  };
-
-  const { text } = await generateText({
-    model,
-    messages: [{ role: 'user', content: 'What time is it, and what does example.com sell?' }],
-    maxSteps: 6,
-    tools,
-  });
-} finally {
-  await Promise.all([search.close(), docs.close()]);
-}
-```
-
-Or hand the live clients to the loop and let it namespace them: `mcp: [{ client: search, namespace: 'search' }, { client: docs, namespace: 'docs' }]` — they are borrowed, so `close()` stays yours.
-
 ### Calling a tool directly
 
 ```ts
@@ -623,12 +713,25 @@ const result = await mcp.callTool('scrape', { url: 'https://example.com' });
 
 If the server returns an error result, `callTool` throws — mirroring `execute`.
 
-## Notes
+## Common mistakes
 
-- **Always `close()`** a client you built. For stdio this terminates the spawned child process. `close()` is idempotent and raises the closed flag *first*, silencing reconnect and keepalive before anything awaits.
-- **Namespacing only renames keys.** It does not change the underlying tool the model calls.
-- **Edge vs Node:** `/mcp` is fetch-only and runs anywhere; `/mcp/stdio` and `/mcp/node` require Node. Importing them in an edge runtime will fail.
-- **A raw client identity changes across a reconnect.** Never cache the SDK client object; the `McpClient` wrapper follows the session for you.
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `InvalidRequestError: MCP support needs the optional peer …` | `@modelcontextprotocol/sdk` is not installed. It is a *peer*, never bundled. | `npm i @modelcontextprotocol/sdk` |
+| An edge/browser build fails resolving `node:child_process` | Something imported `@deuz-sdk/core/mcp/stdio` or `/mcp/node`. Both are Node-only by construction. | Use `{ url }` entries on edge; keep stdio behind a Node route. |
+| Tools silently renamed after adding a second server | Namespace rule 2 ("a single entry gets no prefix") stopped applying. | Set an explicit `namespace` per entry. |
+| `mcp: duplicate tool name '…'` in the log | Two servers export the same final name; the later entry won. | Give at least one of them a `namespace`. |
+| The pool opens a connection per request | The config's `auth` / `onElicitationRequest` is a fresh object each call, so the key falls back to identity. | Hoist the provider/handler to module scope (per **user**, not per request). Pass `createMcpPool({ logger })` to hear it once. |
+| A CLI OAuth redirect shows *"Authorization rejected"* | The authorization URL did not carry `loopback.state`. | Forward it — see [the Node CLI recipe](/docs/modules/mcp#node-cli-a-loopback-redirect-and-a-file-store). |
+| `No PKCE code verifier is stored …` | Steps ① and ③ used different stores, or an in-memory store across two processes. | Use one persistent `TokenStore` for the whole flow. |
+| A stdio server keeps running after the request | The client was built by hand and never closed. | `await client.close()` in a `finally` — or hand a `{ command }` config to `mcp` and let the run own it. |
+| `generateObject` throws about ignored loop options | `mcp` (and `guardrails`) are refused there by design. | Use `generateText` / `streamChat`, or drop the option. |
+| A tool call fails mid-run with a closed session | A pooled entry was evicted by `maxSize` while the run still held it. | Raise `maxSize` above the number of distinct servers in flight. |
+
+Two more that produce no error at all:
+
+- **Never cache the raw SDK client object.** Its identity changes across a reconnect; the `McpClient` wrapper follows the session for you, and so does every `ToolSet` it produced.
+- **`close()` is idempotent** and raises the closed flag *first*, silencing reconnect and keepalive before anything awaits — so calling it from a `finally` on an already-closed client is free.
 
 ## See also
 

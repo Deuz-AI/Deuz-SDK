@@ -3,7 +3,24 @@ title: generateText
 description: Buffered, awaited text generation — single-turn, or the full agentic tool loop when you pass tools.
 ---
 
-`generateText` runs a model to completion and resolves once. It is the buffered counterpart to [streamChat](/docs/core/stream-chat): same orchestration (retry, timeout, the canonical delta stream), but it accumulates every delta for you and returns a plain object. Reach for it when you want the final answer in one `await` and don't need to render tokens as they arrive. Pass `tools` and it becomes the agentic loop — model step, tool execution, feed results back, repeat.
+`generateText` runs a model to completion and resolves once. It is the buffered counterpart to [streamChat](/docs/core/stream-chat): the same orchestration (retry, timeout, the canonical delta stream, the agentic loop), but it accumulates every delta for you and hands back a plain object.
+
+## When to use it
+
+**Reach for `generateText` when:**
+
+- Nobody is watching the output arrive — a background job, a cron task, a classification step inside a larger pipeline.
+- You need the whole answer before you can do anything with it (parse it, branch on it, store it).
+- You are running an agent whose *steps* matter more than its *tokens*, and you will render a summary at the end.
+- You want the simplest possible error handling: it is a `Promise`, so `try/catch` works.
+
+**Reach for [`streamChat`](/docs/core/stream-chat) instead when:**
+
+- A human is waiting. Time-to-first-token is the number they feel; `generateText` has none by definition.
+- You want live tool-call, reasoning, cost or approval events as they happen.
+- You are on a serverless platform with a short response budget and want to start writing bytes early.
+
+Everything else is the same. The two share `CommonCallOptions`, the same registry, the same retry and timeout policy, and — with `tools` — the same loop semantics. Switching between them is a one-word change.
 
 ## Signature
 
@@ -13,48 +30,64 @@ import { generateText } from '@deuz-sdk/core';
 const result = await generateText(options);
 ```
 
-`generateText` is `async` and returns a `Promise<GenerateTextResult>`. Unlike `streamChat`, errors reject the promise — wrap the call in `try/catch`.
+`generateText` is `async` and returns a `Promise<GenerateTextResult>`. **Unlike `streamChat`, errors reject the promise** — wrap the call in `try/catch`. That asymmetry is deliberate: a promise already has a failure channel, so there is no reason to invent one. See [Error handling](/docs/core/errors).
+
+<Callout type="warn" title="`maxSteps` defaults to 1 — the single most common surprise">
+Passing `tools` does **not** by itself give you a multi-step agent. The default step budget is `1`, so the model calls a tool, the loop executes it, and then the run ends — `text` is empty and the answer you wanted never got written. If you want the model to *use* the tool result, set `maxSteps` to something above 1 (5–10 covers most tool agents).
+
+The default is 1 because a step budget is a spend budget: an unbounded loop with a wrong prompt is an unbounded bill. You opt in, explicitly, per call.
+</Callout>
 
 ## Options
 
-`generateText` takes the same `CommonCallOptions` as every other call. The most common:
+`generateText` takes the same `CommonCallOptions` as every other call. The ones you will actually reach for:
 
-| Option | Type | Default | Notes |
+| Option | Type | Default | When you want it |
 | --- | --- | --- | --- |
-| `model` | `LanguageModel` | — | From a provider factory, e.g. `createAnthropic(...)('claude-opus-4-8')`. |
-| `messages` | `Message[]` | — | Canonical message history. Required unless you pass `prompt` — the two are mutually exclusive, and passing both (or neither) rejects with an `InvalidRequestError`. |
-| `prompt` | `string` | — | **1.9.** Shorthand for exactly one user turn. See [Prompts](/docs/core/prompts-and-timeouts). |
-| `instructions` | `string` | — | **1.9.** The system prompt, placed first; a `system` message already in `messages` is preserved after it. |
-| `temperature` | `number` | provider | Sampling temperature. |
-| `maxOutputTokens` | `number` | provider | Cap on generated tokens. |
-| `topP` | `number` | provider | Nucleus sampling. |
-| `stopSequences` | `string[]` | — | Hard stop strings. |
-| `effort` | `'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'` | — | Canonical reasoning effort; each adapter maps it to its own unit (`'xhigh'`/`'max'` clamp down on wires that lack them). |
-| `signal` | `AbortSignal` | — | Cancellation; propagated to the underlying fetch and to tool `execute`. `abortSignal` is a deprecated 1.9 alias. |
-| `maxRetries` | `number` | `2` | Pre-first-byte retries only. |
-| `timeout` | `number \| { ttftMs?, totalMs?, stepMs?, toolMs? }` | ttft 60s / total 300s | **1.9.** A bare number is `{ totalMs }`; `0` disables a layer. Note `stepMs` is enforced in the **streaming** loop only — this buffered loop honours `ttftMs`/`totalMs`/`toolMs`. See [Timeouts](/docs/core/prompts-and-timeouts#timeout). |
-| `capabilities` | `Partial<ModelCapabilities>` | — | **1.9.** Shallow-merged over the model's registry row. See [capabilities](/docs/core/prompts-and-timeouts#capabilities). |
-| `headers` | `Record<string, string>` | — | Extra request headers. |
-| `onUsage` | `(usage, meta) => void` | — | Per-request usage callback. |
-| `onFinish` | `(meta) => void` | — | Fires when the call settles. |
+| `model` | `LanguageModel` | — | Always. From a provider factory, e.g. `createAnthropic(...)('claude-opus-4-8')`. |
+| `messages` | `Message[]` | — | You have a conversation. Required unless you pass `prompt` — the two are mutually exclusive, and passing both (or neither) rejects with an `InvalidRequestError` before any network call. |
+| `prompt` | `string` | — | **1.9.** One-shot calls. Shorthand for exactly one user turn. See [Prompts](/docs/core/prompts-and-timeouts). |
+| `instructions` | `string` | — | **1.9.** The system prompt. Placed first and kept structurally separate from — possibly untrusted — history, so a prompt injection in `messages` cannot reorder or overwrite it. |
+| `temperature` | `number` | provider | You want more or less variance. Silently *dropped* (with a `warning`) on reasoning models that reject it. |
+| `maxOutputTokens` | `number` | provider | You need a hard cap on spend or length. Watch for `finishReason: 'length'`. |
+| `topP` | `number` | provider | Nucleus sampling. Same reasoning-model caveat as `temperature`. |
+| `stopSequences` | `string[]` | — | You are generating into a template and want a hard delimiter. |
+| `effort` | `'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'` | — | Reasoning models. Canonical across wires; each adapter maps it to its own unit, and `'xhigh'`/`'max'` clamp down where the wire lacks them. On a model the registry says cannot reason, the value is dropped and reported as a `warning`. |
+| `signal` | `AbortSignal` | — | The user can cancel. Propagated to the underlying fetch **and** to every tool `execute`. `abortSignal` is a deprecated 1.9 alias; `signal` wins if both are set. |
+| `maxRetries` | `number` | `2` | Flaky upstream. Pre-first-byte only — see [Retries](/docs/core/errors#retry-interplay). |
+| `timeout` | `number \| { ttftMs?, totalMs?, stepMs?, toolMs? }` | ttft 60s / total 300s | You are inside a platform budget the SDK defaults do not respect. A bare number is `{ totalMs }`; an explicit `0` disables a layer. All four layers work in this loop. See [Timeouts](/docs/core/prompts-and-timeouts#timeout). |
+| `capabilities` | `Partial<ModelCapabilities>` | — | **1.9.** The registry does not know your model yet and its conservative fallback is hurting you (notably `maxOutput: 4096`). Shallow-merged over the registry row. |
+| `headers` | `Record<string, string>` | — | A gateway needs a custom header. |
+| `deps` | `Dependencies` | in-memory defaults | Tests, custom transport, tracing, pricing, a shared circuit breaker. The one seam for everything ambient. |
+| `providerOptions` | `{ [provider]: Record<string, unknown> }` | — | A provider-specific field the canonical surface has no name for. Merged into the request body; canonical fields the adapter sets always win. |
+| `promptCaching` | `'auto' \| 'auto-1h'` | — | Long, stable system prompts on Anthropic. Other providers cache implicitly and ignore it. |
+| `onUsage` | `(usage, meta) => void` | — | Per-**model-call** metering. In a loop it fires once per step, so it is the right hook for a per-request token ledger. |
+| `onFinish` | `(meta) => void` | — | Per-**run** notification. Fires once, with the run's `finishReason`. |
 
-Agentic options (only meaningful with `tools`):
+### Agentic options
 
-| Option | Type | Default | Notes |
+These only do anything once `tools` is present (or one of the other loop-routing options — `chat`, `memory`, `verifyStep`, `doneWhen`, `guardrails`, `mcp` — pulls the call into the loop).
+
+| Option | Type | Default | When you want it |
 | --- | --- | --- | --- |
 | `tools` | `ToolSet` | — | A `Record<string, Tool>`. Presence switches on the loop. |
-| `toolChoice` | `'auto' \| 'required' \| 'none' \| { type: 'tool'; toolName: string }` | `'auto'` | Forces / forbids tool use. |
-| `maxSteps` | `number` | `1` | Max model turns in the loop. |
-| `stopWhen` | `StopCondition \| StopCondition[]` | — | Extra stop predicate(s), OR-ed with `maxSteps`. |
-| `maxToolConcurrency` | `number` | `5` | Max parallel tool executions per step. |
-| `onStepFinish` | `(step: StepResult) => void` | — | Fires after each completed step. |
-| `prepareStep` | `(ctx) => PrepareStepResult \| undefined \| Promise<…>` | — | Pre-step hook run before every model call (after compaction). Return per-step overrides to rewrite `messages`, swap the `model`, restrict `activeTools`, or override `toolChoice` for that step. |
-| `compaction` | `'auto' \| CompactionPolicy` | off | Opt-in automatic layered context compaction for the loop. Pruning is free; the summarize layer costs one extra model call whose usage counts toward the total. History stays immutable. |
-| `activeTools` | `string[]` | — | Static tool filter: only these `tools` keys are sent to the model across all steps; unknown names log a warning and are ignored. `prepareStep`'s `activeTools` overrides it per step. |
-| `approveToolCall` | `(call, ctx) => boolean \| Promise<boolean>` | — | Server-mode approval gate for `needsApproval` tools; return `false` (or throw) to deny — denials become an `is_error` tool result and the loop continues. |
-| `approvalResponses` | `ToolApprovalResponse[]` | — | Resume after a client-mode break: verdicts for the trailing assistant turn's pending calls. Unmatched pending calls are denied by default. |
-| `verifyStep` | `(ctx) => VerifyStepResult \| Promise<…>` | — | **1.8.** Runs at every natural completion. Return `{ ok: true }` or `{ ok: false, feedback, retry? }` — a rejection feeds `feedback` back as a user turn and re-drives the loop (bounded by `maxVerifyAttempts`). Sets `providerMetadata.deuz.verified`. See [Autonomy](/docs/modules/autonomy#planner--executor--verifier). |
-| `maxVerifyAttempts` | `number` | `3` | Cap on `verifyStep` re-drives (separate budget from `maxSteps`). |
+| `toolChoice` | `'auto' \| 'required' \| 'none' \| { type: 'tool'; toolName: string }` | `'auto'` | Force the first turn to call a tool (`'required'`), or forbid tools for one call (`'none'`). |
+| `maxSteps` | `number` | `1` | **Always, for real tool use.** Counts model turns, not tool calls. |
+| `stopWhen` | `StopCondition \| StopCondition[]` | — | You want to stop on a *signal* rather than a count. OR-ed with `maxSteps` — it can only stop earlier, never extend the budget. |
+| `budget` | `{ usd?: number; tokens?: number }` | — | A hard spend ceiling. Sugar over `costExceeds` / `totalTokensExceed` with `stoppedBy` markers you can read back. |
+| `maxToolConcurrency` | `number` | `5` | Your tools hit a rate-limited API and 5 at once is too many, or they are cheap and you want more. |
+| `onStepFinish` | `(step: StepResult) => void` | — | Progress reporting. Fires after each step that made tool calls — **not** for the terminal text-only step. |
+| `prepareStep` | `(ctx) => PrepareStepResult \| undefined \| Promise<…>` | — | You want per-step control: rewrite `messages`, swap the `model` (cheap model for the middle steps), restrict `activeTools`, or override `toolChoice`. Runs before every model call, **after** compaction, so it has the last word on history. |
+| `activeTools` | `string[]` | — | You have one big `ToolSet` and want a subset on the wire for this call. Unknown names are ignored with a warning. `prepareStep`'s `activeTools` overrides it per step. |
+| `compaction` | `'auto' \| CompactionPolicy` | off | Long runs that will outgrow the context window. Pruning is free; the summarize layer costs one extra model call whose usage counts toward the total. History stays immutable. |
+| `approveToolCall` | `(call, ctx) => boolean \| Promise<boolean>` | — | Server-mode approval for `needsApproval` tools. Returning `false` (or throwing) denies — the denial becomes an `is_error` tool result and the loop **continues**. |
+| `approvalResponses` | `ToolApprovalResponse[]` | — | Resuming after a client-mode approval break. Unmatched pending calls are denied by default. |
+| `verifyStep` | `(ctx) => VerifyStepResult \| Promise<…>` | — | **1.8.** You want a second opinion before accepting an answer. Runs at every natural completion; `{ ok: false, feedback }` re-drives the loop with the feedback as a user turn. |
+| `maxVerifyAttempts` | `number` | `3` | Cap on `verifyStep` re-drives. A separate budget — it does not consume `maxSteps`. |
+
+<Callout title="`generateObject` and `streamObject` refuse loop options by design">
+Structured output is a single shaped answer, not a multi-step run. Passing `tools`/`maxSteps` there is an error rather than a silent no-op. If you need an agent that *ends* in a typed object, run the loop with `generateText` and call `generateObject` on the result.
+</Callout>
 
 ## Result shape
 
@@ -68,26 +101,32 @@ interface GenerateTextResult {
   toolCalls?: ToolCall[];
   toolResults?: ToolResult[];
   pendingApprovals?: ToolApprovalRequest[];
+  warnings?: CallWarning[];
+  providerMetadata?: Record<string, Record<string, unknown>>;
+  runId?: string;
+  memory?: Promise<MemoryMutation[]>;
+  observation?: { settled: Promise<void> };
 }
 ```
 
-| Field | Type | When | Notes |
-| --- | --- | --- | --- |
-| `text` | `string` | always | Final assistant text. With tools, this is the *last* step's text. |
-| `usage` | `Usage` | always | Token usage summed across all steps. |
-| `finishReason` | `FinishReason` | always | One of `'stop' \| 'length' \| 'tool_calls' \| 'content_filter' \| 'error' \| 'aborted'`. |
-| `response.messages` | `Message[]` | always | New messages to append to history (assistant + tool turns across all steps). |
-| `steps` | `StepResult[]` | with tools | Per-step breakdown. **`undefined` on a single-turn call** (no `tools`). |
-| `toolCalls` | `ToolCall[]` | with tools | Convenience: the last tool-calling step's calls. |
-| `toolResults` | `ToolResult[]` | with tools | Convenience: that step's results. |
-| `pendingApprovals` | `ToolApprovalRequest[]` | client-mode approval break | Calls awaiting a verdict when a `needsApproval` tool broke the loop; resume by calling again with `approvalResponses`. |
-| `warnings` | `CallWarning[]` | when the call produced any | Non-fatal notices — an unknown model slug, a stripped sampling parameter, a dropped document, a hosted tool the wire cannot carry, an `activeTools` name that matches nothing. **Omitted entirely** when there are none, so a clean result's shape is unchanged. On an agentic call the per-step pump writes into the loop's sink, so model-level notices merge in too. Deduplicated by `(type, setting, message)` and capped at 50. |
+| Field | When | Notes |
+| --- | --- | --- |
+| `text` | always | Final assistant text. With tools, this is the **last** step's text — which is empty if the run ended on a tool call (see the `maxSteps` callout above). |
+| `usage` | always | Token usage summed across all steps, sub-agents included. `usage.totalTokens` is the provider's own total where one exists, not `input + output` — on a thinking model those differ by a lot. |
+| `finishReason` | always | `'stop' \| 'length' \| 'tool_calls' \| 'content_filter' \| 'error' \| 'aborted'`. |
+| `response.messages` | always | Only the **new** turns this call produced. Append them to your prior `messages` to continue. |
+| `steps` | with tools | Per-step breakdown. **`undefined` on a single-turn call** — that absence is how you tell the two shapes apart. |
+| `toolCalls` / `toolResults` | with tools | Convenience: the last *tool-calling* step's calls and results. |
+| `pendingApprovals` | client-mode approval break | Calls awaiting a verdict. Resume by calling again with `approvalResponses`. |
+| `warnings` | when any were produced | Non-fatal notices — an unknown model slug, a stripped sampling parameter, a dropped document, a hosted tool the wire cannot carry, an `activeTools` name that matches nothing. **Omitted entirely** when there are none. Deduplicated by `(type, setting, message)` and capped at 50. |
+| `providerMetadata.deuz` | when the loop has something to report | `stoppedBy` (which named `stopWhen`/`budget` condition ended the run), `verified` (the `verifyStep` verdict), `guardrails`, `handoffs`. Absent when the run ended naturally or on the implicit `maxSteps` bound. |
+| `runId` | with `session` | The durable run id — pass it to `resumeFromCheckpoint`. |
+| `memory` | with `memory` extraction on | Resolves with the applied mutations once the post-run extract pass finishes. Never rejects. **Await it on serverless** or the isolate may be torn down first. |
+| `observation` | with an observer or tracer | `await result.observation?.settled` before closing observers, so async enrichments (e.g. price lookups) are flushed. |
 
-`response.messages` only contains the *new* turns this call produced — append them to your prior `messages` to continue the conversation.
+## A single buffered turn
 
-## Simple call
-
-A single buffered turn. With no `tools`, `steps`/`toolCalls`/`toolResults` are absent.
+With no `tools`, `steps` / `toolCalls` / `toolResults` are absent and exactly one model call happens.
 
 ```ts title="generate.ts"
 import { generateText } from '@deuz-sdk/core';
@@ -97,7 +136,7 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const { text, usage, finishReason } = await generateText({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Name three primary colors.' }],
+  prompt: 'Name three primary colors.',
 });
 
 console.log(text);
@@ -107,9 +146,7 @@ console.log(usage.totalTokens);
 
 ## With tools (the agentic loop)
 
-Add `tools` and `generateText` runs the loop: it calls the model, executes any tool calls in parallel (capped by `maxToolConcurrency`), feeds the results back as a new turn, and repeats until the model stops calling tools or a stop condition fires. `maxSteps` bounds the number of model turns — leave it at the default `1` and the loop runs a single turn, so for real tool use set it higher.
-
-Tools are defined with a `parameters` schema (any Standard Schema such as Zod, or a raw JSON Schema) and an `execute` function. A thrown `execute` is caught and fed back to the model as an error tool result — it never rejects the promise.
+Add `tools` and `generateText` becomes the loop: call the model, execute any tool calls in parallel (capped by `maxToolConcurrency`), feed the results back as a new turn, repeat. A thrown `execute` is caught and fed back as an error tool result — it never rejects the promise.
 
 ```ts title="weather.ts"
 import { generateText } from '@deuz-sdk/core';
@@ -120,8 +157,8 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const { text, steps } = await generateText({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'What is the weather in Paris?' }],
-  maxSteps: 5,
+  prompt: 'What is the weather in Paris?',
+  maxSteps: 5, // WITHOUT THIS the loop runs one turn and `text` is empty
   tools: {
     getWeather: {
       description: 'Get the current weather for a city.',
@@ -135,7 +172,7 @@ console.log(text);            // final natural-language answer
 console.log(steps?.length);   // e.g. 2: one tool turn + one final turn
 ```
 
-You can also pass a raw JSON Schema instead of Zod — no extra dependency required:
+Zod is optional. A raw JSON Schema works with no extra dependency at all:
 
 ```ts
 const tools = {
@@ -152,9 +189,11 @@ const tools = {
 } as const;
 ```
 
+For argument types that flow into `execute` without a cast, wrap the definition in [`tool()`](/docs/agents/tools).
+
 ### Step array anatomy
 
-When `tools` are used, `result.steps` is a `StepResult[]` — one entry per model turn, in order. Each step:
+`result.steps` is a `StepResult[]` — one entry per model turn, in order.
 
 ```ts
 interface StepResult {
@@ -169,11 +208,9 @@ interface StepResult {
 }
 ```
 
-The first step is `'initial'`; subsequent steps (produced because the previous step's tool results were fed back) are `'tool-result'`. A step that called no tools has empty `toolCalls`/`toolResults` and is the loop's last step. `usage` on each step is that step alone; `result.usage` is the sum.
+The first step is `'initial'`; every step produced by feeding tool results back is `'tool-result'`. A step with empty `toolCalls` is the loop's last step. `usage` on each step is that step alone; `result.usage` is the sum.
 
-### Reading steps
-
-```ts
+```ts title="read-steps.ts"
 import { generateText } from '@deuz-sdk/core';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
 import { z } from 'zod';
@@ -182,7 +219,7 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const result = await generateText({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Weather in Paris and Berlin?' }],
+  prompt: 'Weather in Paris and Berlin?',
   maxSteps: 5,
   tools: {
     getWeather: {
@@ -205,11 +242,23 @@ for (const step of result.steps ?? []) {
 }
 ```
 
-### Stopping early with `stopWhen`
+<Callout type="warn" title="`onStepFinish` does not fire for the final step">
+It fires after each step that made tool calls (including approval and client-tool breaks). The terminal text-only step — the one that produces the answer — is not reported through it, because that step is the result. Read it from `result.steps.at(-1)` or from `result.text`.
+</Callout>
 
-`stopWhen` adds predicate(s) that are OR-ed with `maxSteps`. A `StopCondition` is a function over the loop state; return `true` to stop after the current step.
+### Stopping early
 
-The SDK also ships four ready-made stop conditions you can import from `@deuz-sdk/core` instead of writing your own: `stepCountIs(n)`, `hasToolCall(name)`, `totalTokensExceed(n)`, and `costExceeds(usd)`. The last two read the real provider-reported usage accumulated across all steps; `costExceeds` needs `deps.priceProvider` injected (without one it warns once and never fires).
+`stopWhen` adds predicate(s) OR-ed with `maxSteps`. Because they are OR-ed, `stopWhen` can only make the run **shorter**; it never extends the step budget.
+
+Five ready-made conditions ship from the package root, so you rarely need to write your own:
+
+| Condition | Stops when | Needs |
+| --- | --- | --- |
+| `stepCountIs(n)` | `stepCount >= n` | — |
+| `hasToolCall(name)` | the latest step called that tool | — |
+| `totalTokensExceed(n)` | cumulative **real** provider-reported usage crosses `n` | — |
+| `costExceeds(usd)` | cumulative cost crosses `usd` | `deps.priceProvider` — without one it warns once and never fires |
+| `durationExceeds(ms)` | the loop has run at least `ms` | nothing (time comes from the injected `deps.clock`, so it is deterministic in tests) |
 
 ```ts
 import { stepCountIs, totalTokensExceed } from '@deuz-sdk/core';
@@ -217,13 +266,28 @@ import { stepCountIs, totalTokensExceed } from '@deuz-sdk/core';
 // Stop at 10 steps or once accumulated usage crosses 50k tokens.
 const result = await generateText({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Plan my trip.' }],
+  prompt: 'Plan my trip.',
   stopWhen: [stepCountIs(10), totalTokensExceed(50_000)],
   tools: { /* … */ },
 });
 ```
 
-You can also write a custom `StopCondition`:
+`budget` is the same machinery with a friendlier shape and a readable marker:
+
+```ts
+const result = await generateText({
+  model: anthropic('claude-opus-4-8'),
+  prompt: 'Research this thoroughly.',
+  maxSteps: 20,
+  budget: { usd: 0.5, tokens: 200_000 },
+  tools: { /* … */ },
+});
+
+// 'budget.usd' | 'budget.tokens' | 'totalTokensExceed' | … | undefined when it ended naturally
+console.log(result.providerMetadata?.deuz?.stoppedBy);
+```
+
+Custom conditions are plain functions and may be `async`:
 
 ```ts
 import type { StopCondition } from '@deuz-sdk/core';
@@ -234,16 +298,20 @@ const untilFinalText: StopCondition = ({ steps }) =>
 
 const result = await generateText({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Plan my trip.' }],
+  prompt: 'Plan my trip.',
   maxSteps: 8,
   stopWhen: untilFinalText,
   tools: { /* … */ },
 });
 ```
 
+<Callout title="Stop conditions run at step boundaries">
+Every condition is evaluated **after** a step that executed tools, and never mid-step. A budget of `$0.50` therefore stops the run once cost has *crossed* the line, not before it does — an in-flight step always completes and is paid for. Size the budget with one step of headroom.
+</Callout>
+
 ### Continuing a conversation
 
-`response.messages` holds only the new turns. Append them to keep the history immutable across calls:
+`response.messages` holds only the new turns. Append them; never mutate the array you passed in — stable history is what makes provider prompt-cache hits possible.
 
 ```ts
 import type { Message } from '@deuz-sdk/core';
@@ -263,24 +331,53 @@ messages = [...messages, ...first.response.messages];
 
 ### Approving tool calls
 
-A tool marked `needsApproval` is gated before it runs. There are two modes:
+A tool marked `needsApproval` is gated before it runs. Two modes, and which one you get depends only on whether you passed `approveToolCall`:
 
-- **Server mode** — pass `approveToolCall`. The loop calls it for each gated tool and runs the call only if it returns `true`; returning `false` (or throwing) denies it, and the denial is fed back as an `is_error` tool result so the loop continues.
-- **Client mode** — omit `approveToolCall`. A gated call breaks the loop and is returned in `result.pendingApprovals`. Collect verdicts from your user, then call `generateText` again with the same appended history plus `approvalResponses` to resume; any pending call without a matching response is denied by default.
+- **Server mode** (`approveToolCall` supplied) — the loop asks your function per gated call and runs it only on `true`. Returning `false` or throwing denies it; the denial becomes an `is_error` tool result and **the loop continues**. Use this when policy lives on the server.
+- **Client mode** (no `approveToolCall`) — the gated call **breaks the loop** and comes back in `result.pendingApprovals`. Collect verdicts from your user, then call `generateText` again with the appended history plus `approvalResponses`. Any pending call without a matching response is denied by default — the safe side.
+
+## Error handling
+
+```ts
+import { generateText, RateLimitError, ContextOverflowError, APICallError } from '@deuz-sdk/core';
+
+try {
+  const { text } = await generateText({ model, prompt: 'hi' });
+} catch (err) {
+  if (err instanceof RateLimitError) console.log('retry after (ms):', err.retryAfterMs);
+  else if (err instanceof ContextOverflowError) { /* trim history and retry */ }
+  else if (err instanceof APICallError) console.error(err.provider, err.statusCode, err.requestId);
+  else throw err;
+}
+```
+
+Two things that do **not** reject:
+
+- **A tool that throws.** It becomes an `is_error` tool result fed back to the model, which is usually able to recover. Look for `toolResults[i].isError`.
+- **A user abort.** It resolves with `finishReason: 'aborted'` and whatever partial usage accumulated. A `TimeoutError`, by contrast, rejects — see [Abort vs timeout](/docs/core/errors#abort-is-not-a-timeout).
 
 ## Loop guarantees
 
-The loop is self-healing and bounded. A few invariants worth knowing here:
+The loop is self-healing and bounded. The invariants that matter here:
 
 - **Client tools** (a key **present in `tools`** with no `execute`) cannot be auto-run — the loop stops and returns them in `toolCalls` so the caller owns the round-trip.
-- **An unregistered tool name is not a client tool** (1.9): a hallucinated name self-heals into an `is_error` `tool_result` and the loop **continues**, instead of breaking out with a dangling `tool_use`.
-- **Runaway guard:** the same tool failing on three consecutive steps hard-stops the loop. Unknown-tool errors and tool timeouts count toward it; approval denials do not.
-- **Stop on tool count, not `finishReason`:** the loop continues whenever the last step emitted tool calls, even if the provider reported `finish: stop` (a Gemini quirk).
+- **An unregistered tool name is not a client tool** (1.9): a hallucinated name self-heals into an `is_error` `tool_result` listing the real tool names, and the loop **continues** rather than breaking out with a dangling `tool_use`.
+- **Runaway guard:** the same tool erroring on three consecutive steps hard-stops the loop. Unknown-tool errors and tool timeouts count toward it; approval denials do not.
+- **Stop on tool count, not `finishReason`:** the loop continues whenever the last step emitted tool calls, even when the provider reported `finish: stop`. This is a live-verified Gemini behaviour, not a hypothetical.
 
-For the full set of agentic invariants — immutable history, parallel execution, the runaway guards, and the Gemini stop-bug guard — see [the tool loop reference](/docs/agents/tool-loop).
+For the full anatomy — the exact per-step ordering, immutable history, parallel execution, and every guard — see [the tool loop reference](/docs/agents/tool-loop).
+
+## What `generateText` does not do
+
+- **No partial output.** If the run fails mid-generation, you get an exception, not the tokens that already arrived. Use `streamChat` if partial output has value to you.
+- **No `consume()` and no lazy start.** It is a promise; calling it *is* starting it.
+- **No live events.** `onStepFinish` and `onUsage` are the only progress hooks; there is no per-token callback. `streamChat`'s `fullStream` is the event channel.
+- **No structured-output validation.** `responseFormat: 'json'` asks for JSON; it does not check it. Use [generateObject](/docs/core/generate-object) for a schema-validated result with a repair retry.
 
 ## See also
 
 - [streamChat](/docs/core/stream-chat) — the streaming counterpart; same orchestration, token-by-token output.
+- [Tool loop](/docs/agents/tool-loop) — the agentic loop's step-by-step anatomy.
 - [generateObject](/docs/core/generate-object) — buffered structured output validated against a schema.
-- [Tool loop](/docs/agents/tool-loop) — the agentic loop's invariants in depth.
+- [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts) — the call-shape options in full.
+- [Error handling](/docs/core/errors) — the taxonomy this call rejects with.

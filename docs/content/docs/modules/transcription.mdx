@@ -18,6 +18,27 @@ Transcription models are a **separate kind** from chat `LanguageModel` (`surface
 This page is about a dedicated STT endpoint. Audio you want a **chat** model to hear travels as `filePart({ mediaType: 'audio/…' })`, exactly like a PDF or an image — the `Part` union stayed at five members in 2.0.
 </Callout>
 
+<Callout type="warn" title="Verified against mocks, not yet against a live API">
+Everything on this page is pinned by unit tests (`test/transcription.test.ts`) that drive both adapters through an injected `deps.fetch` and assert the exact URL, query string, auth scheme, multipart fields, and response parsing. That proves the SDK **sends and reads what this page says it does**. It does not prove OpenAI and Deepgram accept it — this module has no live-API test; `test/live/` covers DeepSeek, Google, and xAI only.
+
+The wire details below come from the providers' documentation. Run one real file through it before you ship, and correct anything that turns out wrong with [`providerOptions`](#provideroptions) rather than waiting for an SDK release.
+</Callout>
+
+## Choosing a wire
+
+The two providers are not interchangeable, and the differences show up in the first hour rather than the second month:
+
+| If you… | Pick | Because |
+| --- | --- | --- |
+| Already have an OpenAI key and want the shortest path | `createOpenAITranscription` | One key, one factory, and `gpt-4o-transcribe` needs no tuning. |
+| Need word timings | `createDeepgram`, or OpenAI **`whisper-1`** | The `gpt-4o-*` models cannot return them at all — see the [`verbose_json` gate](#timestamps). |
+| Have the audio in object storage already | `createDeepgram` with `audio: { url }` | Deepgram fetches it itself; nothing large moves through your process. |
+| Need per-word confidence, or diarization | `createDeepgram` | `confidence` comes back per word; `diarize` rides [`providerOptions`](#provideroptions). |
+| Want a vocabulary hint (names, jargon) | `createOpenAITranscription` | `prompt` is OpenAI-only. Deepgram's equivalent is `keyterm` via `providerOptions`. |
+| Are transcribing to feed a chat model, not a human | Either | The extra fields cost nothing if you ignore them. |
+
+And when **not** to use this module at all: if you want a chat model to reason about *how* something was said (tone, background, overlapping speakers), a transcript throws that away — send the audio to a model whose registry row sets `audio: true` as a [`filePart`](/docs/core/files) instead. If you want live captions, see [what this does not do](#what-transcribe-does-not-do): there is no streaming path here.
+
 ## transcribe
 
 Import `transcribe` from `@deuz-sdk/core/transcription`. Build a model descriptor with a factory, hand it the audio bytes, and pass the `mediaType` along with them.
@@ -162,6 +183,54 @@ providerOptions: { deepgram: { smart_format: false } } // → the param is simpl
 
 Word entries prefer Deepgram's `punctuated_word` over the raw `word` when smart formatting produced one, and carry Deepgram's per-word `confidence`. `language` comes from `results.channels[0].detected_language`, `durationSeconds` from `metadata.duration`.
 
+## A real pipeline: recording → notes
+
+Transcription is rarely the deliverable; it is the step before one. The whole point of `segments` is that they survive into the summary as citations you can jump to.
+
+```ts title="meeting-notes.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { transcribe, createDeepgram } from '@deuz-sdk/core/transcription';
+
+const deepgram = createDeepgram({ apiKey: process.env.DEEPGRAM_API_KEY! });
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+export async function meetingNotes(recordingUrl: string) {
+  // Deepgram pulls the file itself: a 90-minute recording never touches this
+  // process, and `diarize` labels who spoke — a Deepgram query param, not a
+  // canonical option, so it rides providerOptions.
+  const { text, segments, durationSeconds, usage } = await transcribe({
+    model: deepgram('nova-3'),
+    audio: { url: recordingUrl },
+    language: 'en',
+    providerOptions: { deepgram: { diarize: true, utterances: true } },
+  });
+
+  // Timestamped lines, so the summary can cite a position in the audio.
+  const timeline = (segments ?? [])
+    .map((s) => `[${Math.floor(s.start)}s] ${s.text}`)
+    .join('\n');
+
+  const { text: notes } = await generateText({
+    model: anthropic('claude-sonnet-4-6'),
+    instructions:
+      'Summarize this meeting transcript into Decisions, Action items (with owners), ' +
+      'and Open questions. Cite the [Ns] marker for every claim.',
+    prompt: timeline || text,
+    maxOutputTokens: 2_000,
+  });
+
+  return { notes, durationSeconds, billedSeconds: usage.seconds };
+}
+```
+
+Notes on the shape, all of them things that bite once:
+
+- **`segments` is optional and this code treats it as such.** On Deepgram it exists only when `smart_format` produced paragraphs (it is on by default); on OpenAI it exists only for `whisper-1` with `timestamps: true`. `segments ?? []` with a fall back to plain `text` is not defensive noise — it is the actual contract.
+- **Diarization does not reach the canonical shape.** `TranscriptionSegment` is `{ start, end, text }` — no speaker field. Deepgram's speaker labels are in `raw`, which is exactly what `raw` is for: read `result.raw` when you need a field this module does not model.
+- **A long recording is a long wait.** There is no streaming and no progress signal; the promise resolves when the provider is done. Put this behind a queue, not an HTTP request handler.
+- **The transcript is untrusted input.** It came from a microphone someone else controlled. If it flows into a tool-calling agent rather than a summary, treat it the way you would a user message — see [request validation](/docs/modules/request-validation) and [guardrails](/docs/agents/guardrails).
+
 ## usage — two meters, one shape
 
 Providers do not agree on what they charge for, so `TranscriptionUsage` carries every field optionally and fills in only what the response actually reported:
@@ -184,6 +253,10 @@ interface TranscriptionUsage {
 | Deepgram | `{ seconds }` — from `metadata.duration` |
 
 Read `usage.seconds ?? usage.totalTokens` if you need one number for a meter, and branch on which one is present if you are pricing the call.
+
+Two honest caveats about that number. **Nothing here converts it to money**: `deps.priceProvider` is never consulted by `transcribe`, [`PRICES_2026`](/docs/modules/pricing) has no STT rows, and no cost event reaches the observation stream. And **`usage` can be empty**: every field is optional, so a relay that omits both meters yields `{}` rather than a zero — `usage.seconds ?? usage.totalTokens ?? 0` is the safe read, and `durationSeconds` is a second source for the same fact when the provider reports it.
+
+Practically: `seconds` scales with the recording, `inputTokens` scales with the recording *and* the model's tokenizer, and neither scales with the length of the transcript. A silent hour costs the same as a talkative one.
 
 ## providerOptions
 
@@ -246,7 +319,17 @@ The canonical status→class table, shared with every media module: `401`/`403` 
 
 Deepgram wraps its failures in `{ err_code, err_msg }` instead of OpenAI's `{ error: { message } }`; the envelope is normalized before mapping, so `err_msg` lands on `error.message` and `err_code` on `error.upstreamType`.
 
-Two failures happen **before** the request is ever sent: an unsupported `audio` shape, and `{ url }` on the OpenAI wire — both `InvalidRequestError`.
+Two failures happen **before** the request is ever sent: an unsupported `audio` shape, and `{ url }` on the OpenAI wire — both `InvalidRequestError`. A missing API key is the third, from the G1 chain. Failed bodies are read once and parsed as JSON when they can be (a proxy's HTML 502 becomes the message instead of a second exception), and an `x-request-id` response header lands on `error.requestId`.
+
+## What `transcribe` does not do
+
+- **No streaming, no partial results.** Deepgram and OpenAI both offer live/websocket transcription; this module speaks only the batch endpoints. Live captions are out of scope in 2.0.
+- **No chunking, and no size check.** Providers cap how much audio one request may carry, and the SDK neither measures your bytes nor splits them — an over-long file comes back as an `InvalidRequestError` from the provider. Segment it yourself, or hand Deepgram a `{ url }` so the bytes never pass through you.
+- **No retries, no breaker, no timeout.** One plain `fetch`, like every media module. `maxRetries` does not exist here; `retryAfterMs` on the error is advice you act on. Pass `signal` for a deadline.
+- **No format conversion or resampling.** Whatever bytes you pass are the bytes uploaded. The only transformation is the [filename derivation](#media-types-and-filenames), which exists because OpenAI dispatches on the extension.
+- **No speaker labels in the canonical shape.** `TranscriptionSegment` has no `speaker`; Deepgram diarization output lives in `raw`.
+- **No capability matrix.** `TranscriptionModel` is not a `LanguageModel`, so [`getModelCapabilities`](/docs/advanced/model-registry) does not apply and an unknown slug produces no warning — the provider's `404` → `ModelNotFoundError` is the only signal.
+- **Only two wires.** A third STT vendor needs a new `TranscriptionAdapter`; today's extension point is pointing `baseURL` at a relay that mimics one of these two.
 
 ## Related
 

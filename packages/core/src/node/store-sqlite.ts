@@ -554,13 +554,17 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
     // fire `deuz_memory_fts_ad`. The old rowid then lingers in the external-
     // content index and the next integrity check reports "database disk image
     // is malformed". Verified against node:sqlite before this was written.
+    let recursiveTriggers = true;
     try {
       db.exec('PRAGMA recursive_triggers = ON');
     } catch {
-      /* handled below: without it we simply do not build the FTS index */
+      // Without it the index would corrupt on the first replace, so the index
+      // is not built at all and lexical search serves LIKE — the same degraded
+      // path a build without fts5 takes. A slower search beats a malformed one.
+      recursiveTriggers = false;
     }
     migrate(handle);
-    handle.fts = options.fts === false ? false : setupFts(handle);
+    handle.fts = options.fts === false || !recursiveTriggers ? false : setupFts(handle);
     return handle;
   };
 

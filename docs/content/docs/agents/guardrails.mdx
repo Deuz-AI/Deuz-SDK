@@ -27,6 +27,17 @@ providerMetadata?.deuz?.guardrails; // every non-pass verdict, in order
 
 The contract types live on `CommonCallOptions`; the built-in values ship from `@deuz-sdk/core/guardrails` (also re-exported from `@deuz-sdk/core` and `@deuz-sdk/core/edge`). Nothing here has a clock, randomness or I/O — the module is edge-safe, and a call that never names a built-in pulls none of it into a bundle.
 
+## When to reach for this
+
+Use a guardrail when the rule is about **this run**: refuse a request from a suspended tenant, keep a tool off-limits for a role, cap what leaves the process. It is the layer where a policy can *end* a run and where a UI can be told a rule fired.
+
+Do **not** reach for it when:
+
+- the rule is about the **request body** — a client-injected `system` turn, a forged `tool_result`, a message flood. That belongs to [request validation](/docs/modules/request-validation), which runs before the loop and rejects instead of repairing;
+- the rule must apply to **every model call** that a descriptor makes, including compaction summaries and sub-agent side calls. That is [middleware](/docs/modules/middleware) — see [the comparison below](#guardrail-vs-middleware);
+- the rule is really "a human must approve this" — that is `needsApproval` plus `approveToolCall`, which suspends rather than refuses;
+- you need a **sandbox**. A guardrail is advisory code running in your own process; it constrains what the loop does with a model's request, not what a compromised tool implementation can do.
+
 ## Hooks × actions
 
 | | `pass` (or `undefined`) | `block` | `rewrite` |
@@ -34,6 +45,19 @@ The contract types live on `CommonCallOptions`; the built-in values ship from `@
 | **`onInput`**<br/>once per run leg, before the first model call | Nothing happens. No part, no metadata entry. | The run ends **before any provider request**. Empty answer, `stoppedBy: 'guardrail:input'`. A graceful stop, not a throw. | `{ messages }` replaces the history the run starts from. |
 | **`onToolCall`**<br/>per call, before the approval gate | The call proceeds to the gate. | The call becomes an `is_error` `tool_result` the model can react to. The run **continues**. | `{ args }` substitutes the arguments passed to the gate and to `execute`. |
 | **`onOutput`**<br/>at a natural completion, after `doneWhen` + `verifyStep` | The model's text is returned as-is. | The text is suppressed; `replacement ?? ''` is returned instead, with `stoppedBy: 'guardrail:output'`. | `{ text }` replaces the final answer. |
+
+What each verdict actually leaves behind:
+
+| Hook · action | `text` | `stoppedBy` | Stream part | `response.messages` / checkpoint / chat record | Steps still run |
+| --- | --- | --- | --- | --- | --- |
+| `onInput` · block | `''` | `guardrail:input` | `guardrail` (`hook: 'input'`) | Unchanged — nothing was appended, and a durable run is checkpointed **`completed`**, not suspended | none |
+| `onInput` · rewrite | normal | — | `guardrail` | The rewritten history is what the run *starts* from; it is not appended to your delta | all |
+| `onToolCall` · block | normal | — | `guardrail` (`hook: 'tool-call'`, carries `toolCallId`) + a `denied` tool-state part | The `is_error` `tool_result` is written, like any denial | yes, the run continues |
+| `onToolCall` · rewrite | normal | — | `guardrail` | **History keeps the model's original arguments** — see [below](#a-rewrite-deliberately-does-not-rewrite-history) | yes |
+| `onOutput` · block | `replacement ?? ''` | `guardrail:output` | `guardrail` (`hook: 'output'`) | Rewritten to match. A block with no `replacement` on a text-only turn **drops the assistant message entirely** rather than persisting an empty, unsendable one | run ends |
+| `onOutput` · rewrite | the rewritten text | — | `guardrail` | Rewritten to match, including the `steps[]` entry | run ends |
+
+Neither `stoppedBy` marker is an error: both are graceful stops on `providerMetadata.deuz.stoppedBy`, reported the same way a budget stop is. **`finishReason` does not tell you** — an input block reports `'stop'` (no step ever ran) and an output verdict leaves the last step's reason in place, so `stoppedBy` is the only field that distinguishes "the model finished" from "a rule ended it".
 
 Each hook takes one guardrail **or an ordered array**.
 
@@ -46,6 +70,8 @@ Each hook takes one guardrail **or an ordered array**.
 5. **A throw propagates.** A guardrail is caller code, like `prepareStep` / `verifyStep` / `doneWhen`. Swallowing a throw would leave you believing a defense is armed while it is inert — the worse failure mode for a safety control.
 
 For `onToolCall`, rules 1–3 apply **per call**: one call's block never short-circuits another call's evaluation.
+
+Consequences of rules 2 and 3 worth planning around: order your array **cheapest and most decisive first**, since a block skips the rest; and if two rewrites both edit the final text, the second one is editing the first one's output, not the model's.
 
 ## When each hook runs
 
@@ -65,14 +91,14 @@ run leg starts
             └─ onOutput ─────────── the LAST word
 ```
 
-Three placements deserve a sentence each:
+Each placement is a decision, not an accident:
 
-- **`onInput` runs after the resume settle**, so a durable leg that answers pending approvals is not re-gated on a history the user did not just send. It runs **once per run leg** — not once per step.
-- **`onToolCall` runs immediately before the approval gate**, which is why a rewrite reaches the `needsApproval` predicate, the approval request a human sees, and `execute`.
-- **`onOutput` runs after `doneWhen` and `verifyStep` have both accepted.** A re-driven round never reaches it, so the text a guardrail sees is the one the run is actually about to return.
+- **`onInput` runs after the resume settle**, so a durable leg that answers pending approvals is not re-gated on a history the user did not just send. It runs **once per run leg** — not once per step, and not once per sub-agent. It also runs *after* the memory recall block is computed, but that block is spliced in at the model-call site, so an input guardrail does not see it.
+- **`onToolCall` runs immediately before the approval gate**, which is why a rewrite reaches the `needsApproval` predicate, the approval request a human sees, and `execute`. Running it *after* the gate would mean a human approved arguments the loop then changed; running it *before* the handoff interception would mean a routing decision could be blocked as if it were a tool.
+- **`onOutput` runs after `doneWhen` and `verifyStep` have both accepted.** A re-driven round never reaches it, so the text a guardrail sees is the one the run is actually about to return — and it is not re-run per attempt, so an expensive check (a classifier call) is paid for once.
 
 <Callout type="info" title="Handoffs are intercepted before guardrails">
-A `transfer_to_*` call is resolved by the loop deterministically, before `onToolCall`. So an `onToolCall` guardrail never sees a transfer, and a transfer is never queued for approval. See [Handoffs](/docs/agents/handoffs#the-interception-is-deterministic).
+A `transfer_to_*` call is resolved by the loop deterministically, before `onToolCall`. So an `onToolCall` guardrail never sees a transfer, and a transfer is never queued for approval. Guardrails themselves survive a transfer untouched — they belong to the run, not to the agent. See [Handoffs](/docs/agents/handoffs#the-interception-is-deterministic).
 </Callout>
 
 ## A blocked tool call joins the existing denial machinery
@@ -88,7 +114,17 @@ A blocked call takes exactly the path an **approval denial** takes:
 
 It also still rides through the batch, because every `tool_use_id` must be answered (the Anthropic 400 guard) — `executeTools` is what turns the denial into that answer. A blocked call never reaches the approval gate: it already has a verdict, and gating it would suspend the run on a call that is not going to run either way.
 
+A blocked **client** tool is likewise not "pending on the caller": it is answered in the same turn instead of breaking the loop for a round-trip that would never come.
+
 Observation reports the cause as `'server-denied'`: the `ToolDeniedEvent.cause` union is a locked 1.6 surface with no `'guardrail'` member, a guardrail *is* a server-side verdict, and the reason string carries the rest.
+
+<Callout type="warn" title="Guardrails are re-applied after a suspension">
+When a run resumes and settles the tool calls that were waiting for approval, `onToolCall` is **evaluated again** against the calls read back out of the history — before anything runs, and before the approval verdicts are applied. A suspension must not become a way to launder a call a rule blocked or rewrote.
+
+Two things follow. First, a guardrail block on the resume leg **outranks an explicit human approval** — the denial map is written last, so an approved call a rule refuses reports the rule. Second, guardrails are assumed **pure and deterministic**: the same call, on the same history, must produce the same verdict. A guardrail whose answer depends on wall-clock time or an external service that changed in between will disagree with itself across a suspension, and the resume leg's answer is the one that wins.
+
+Verdicts produced on that leg carry no `stepIndex` (the settle happens before step 1), which is how you tell them apart in `deuz.guardrails`.
+</Callout>
 
 ### A rewrite deliberately does not rewrite history
 
@@ -96,7 +132,7 @@ Observation reports the cause as `'server-denied'`: the `ToolDeniedEvent.cause` 
 
 That asymmetry is on purpose. Rewriting history would make the transcript lie about what the model asked for (and would break prompt-cache reuse), while a model that is told it called `rm -rf /` when the loop actually ran `rm -rf ./tmp` cannot reason about the next step. The `tool-call` stream part likewise carries the model's arguments; the `guardrail` part a moment later is how a UI learns they were changed.
 
-`onOutput` is the opposite, and also on purpose: an output rewrite **is** authoritative. The appended assistant message in `response.messages`, the durable checkpoint and the chat record are all rewritten to match, so nothing downstream disagrees with what you were handed.
+`onOutput` is the opposite, and also on purpose: an output rewrite **is** authoritative. The appended assistant message in `response.messages`, the `steps[]` entry, the durable checkpoint and the chat record are all rewritten to match, so nothing downstream disagrees with what you were handed.
 
 ## Contexts
 
@@ -114,6 +150,8 @@ type InputGuardrailContext = GuardrailBaseContext;
 interface OutputGuardrailContext   extends GuardrailBaseContext { text: string; }
 interface ToolCallGuardrailContext extends GuardrailBaseContext { toolCall: ToolCall; }
 ```
+
+`toolCall.args` are already **parsed** — you inspect a value, not a JSON string — and they are the arguments as accumulated from the wire, before any rewrite by an earlier guardrail in the same array (each guardrail sees the previous one's output, per rule 2).
 
 ### `runtimeContext`
 
@@ -139,7 +177,88 @@ await generateText({
 });
 ```
 
-The SDK never reads, copies or serializes `runtimeContext`. It does **not** reach checkpoints, chat records or observation events, so a live connection or a secret is safe to put there.
+The SDK never reads, copies or serializes `runtimeContext`. It does **not** reach checkpoints, chat records or observation events, so a live connection or a secret is safe to put there. It is typed `unknown` on purpose — cast it once, at the top of each guardrail.
+
+## Four guardrails you will probably write
+
+Every example below compiles against the real contract types. None of them needs anything from the SDK at runtime.
+
+### Refuse a request that carries PII
+
+```ts title="pii-input.ts"
+import type { InputGuardrail } from '@deuz-sdk/core';
+
+const SSN = /\b\d{3}-\d{2}-\d{4}\b/;
+const CARD = /\b(?:\d[ -]?){13,16}\b/;
+
+const noPii: InputGuardrail = (ctx) => {
+  const text = ctx.messages
+    .flatMap((m) =>
+      typeof m.content === 'string'
+        ? [m.content]
+        : m.content.map((p) => (p.type === 'text' ? p.text : '')),
+    )
+    .join('\n');
+  if (SSN.test(text) || CARD.test(text)) {
+    return { action: 'block', reason: 'The request contained an SSN or card number.' };
+  }
+  return undefined;   // pass
+};
+
+// text === '', providerMetadata.deuz.stoppedBy === 'guardrail:input', no provider request made.
+```
+
+A `block` here is the whole point: nothing reaches the provider, so the sensitive string never leaves your process. If you would rather **strip** than refuse, return `{ action: 'rewrite', messages }` with the redacted history — the run then proceeds on the sanitized version.
+
+### Block a dangerous shell command
+
+```ts title="dangerous-command.ts"
+import type { ToolCallGuardrail } from '@deuz-sdk/core';
+
+const DENY = [/\brm\s+-rf\s+\/(?!\w)/, /\bmkfs\b/, /\bdd\s+if=/, /:\(\)\s*\{.*\};:/];
+
+const safeShell: ToolCallGuardrail = (ctx) => {
+  if (ctx.toolCall.toolName !== 'shell') return undefined;
+  const { command } = ctx.toolCall.args as { command: string };
+  const hit = DENY.find((re) => re.test(command));
+  return hit ? { action: 'block', reason: `refused: matches ${hit}` } : undefined;
+};
+```
+
+The model gets `Blocked by guardrail 'safeShell': refused: matches /…/` back as a tool result and can try something else. The run does not end, and three refusals in a row do not trip the runaway guard.
+
+A denylist is a backstop, not a security boundary — pair it with `needsApproval` on the tool if the consequences are real.
+
+### Rewrite arguments instead of refusing
+
+```ts title="clamp-args.ts"
+import type { ToolCallGuardrail } from '@deuz-sdk/core';
+
+const clampLimit: ToolCallGuardrail = (ctx) => {
+  if (ctx.toolCall.toolName !== 'searchDocs') return undefined;
+  const args = ctx.toolCall.args as { query: string; limit?: number };
+  if ((args.limit ?? 0) <= 50) return undefined;
+  return { action: 'rewrite', args: { ...args, limit: 50 } };
+};
+```
+
+`execute` and the approval gate see `limit: 50`; the transcript still shows what the model asked for. That is what lets the model notice it got fewer results than it requested.
+
+### Cap or refuse the final answer
+
+```ts title="output-policy.ts"
+import { maxOutputLength } from '@deuz-sdk/core/guardrails';
+import type { OutputGuardrail } from '@deuz-sdk/core';
+
+const noSecrets: OutputGuardrail = (ctx) =>
+  /sk-[A-Za-z0-9]{16,}/.test(ctx.text)
+    ? { action: 'block', reason: 'answer contained an API key', replacement: 'Redacted.' }
+    : undefined;
+
+guardrails: { onOutput: [noSecrets, maxOutputLength(4000)] }
+```
+
+`noSecrets` runs first and short-circuits; otherwise `maxOutputLength` truncates whatever survived. Because an output verdict is authoritative, the caller, the checkpoint and the chat record all see `'Redacted.'` — there is no copy of the leaked answer left behind.
 
 ## Reporting: the `guardrail` part and `deuz.guardrails`
 
@@ -159,6 +278,8 @@ interface GuardrailPart {
 
 `streamChat` emits these live on `fullStream`; **both** loops also collect them in bulk on `providerMetadata.deuz.guardrails` (the same entries minus the `type` discriminant). Both readouts are produced from one part, so they cannot describe the same verdict differently.
 
+Note that a **rewrite carries no `reason`** — only blocks do. A rewrite says *that* the content changed, not why; if you need the why in a UI, name the guardrail.
+
 ### Names come from the function
 
 A guardrail's `name` is read off the **function**, so the common shapes label themselves for free through JavaScript's own name inference:
@@ -171,14 +292,7 @@ guardrails: { onInput: [(ctx) => { … }] }           // an ARRAY element gets n
 
 Set one explicitly with `Object.defineProperty(fn, 'name', { value: 'myRule', configurable: true })`. A plain `fn.name = '…'` **throws** in strict mode — a function's `name` is configurable but not writable, and every ES module is strict. (This is exactly what the built-ins do.)
 
-## `stoppedBy`
-
-| Marker | Meaning |
-| --- | --- |
-| `'guardrail:input'` | The input hook refused. No model call happened; `text` is `''`. |
-| `'guardrail:output'` | The output hook refused the final answer; `text` is the block's `replacement ?? ''`. |
-
-Both are graceful stops on `providerMetadata.deuz.stoppedBy` — never thrown errors. A run an input guardrail refused is also reported as incomplete in the same sense a budget stop is: it did not finish because a rule said so.
+The name is not decoration: it is what the model reads in `Blocked by guardrail 'X': …`, so an anonymous array element also gives the model a vaguer message.
 
 ## Built-ins
 
@@ -190,9 +304,11 @@ Spotlighting: prepends a system turn telling the model to treat user content and
 function promptInjectionGuardrail(opts?: { policy?: string }): InputGuardrail;
 ```
 
-The default policy text is `PROMPT_INJECTION_POLICY`, verbatim the text the [`promptInjectionGuard()` middleware](/docs/modules/middleware#promptinjectionguard) has prepended since 1.2 — so moving a call from the middleware to this guardrail changes **where** the instruction is applied, never **what** the model is told.
+The default policy text is `PROMPT_INJECTION_POLICY` (also exported from `@deuz-sdk/core/guardrails`, so you can extend it rather than replace it), verbatim the text the [`promptInjectionGuard()` middleware](/docs/modules/middleware#promptinjectionguard) has prepended since 1.2 — so moving a call from the middleware to this guardrail changes **where** the instruction is applied, never **what** the model is told.
 
 It adds a separate leading system turn rather than merging into an existing one, so your own system prompt stays byte-identical, which is what keeps prompt caching on the rest of the history intact.
+
+It always returns a `rewrite`, so it always emits one `guardrail` part per run. And it is what it says on the tin — a prompt, not a filter. It raises the cost of an injection; it does not make one impossible.
 
 ### `maxOutputLength(n, opts?)`
 
@@ -207,7 +323,7 @@ function maxOutputLength(n: number, opts?: { mode?: 'truncate' | 'block' }): Out
 | `'truncate'` (default) | Rewrites the text to its first `n` characters. Authoritative: the appended assistant message, the checkpoint and the chat record all carry the truncated text. |
 | `'block'` | Refuses instead — empty answer plus `stoppedBy: 'guardrail:output'`. |
 
-Characters, not tokens: this is a cheap output-size backstop (a UI field limit, a webhook payload cap), not a billing control. `maxOutputTokens` and `budget` are the token-side knobs. A negative or `NaN` cap is clamped to `0` rather than silently disabling the guard.
+Characters, not tokens: this is a cheap output-size backstop (a UI field limit, a webhook payload cap), not a billing control. `maxOutputTokens` and `budget` are the token-side knobs. A negative or `NaN` cap is clamped to `0` rather than silently disabling the guard, and truncation is a plain `slice` — it will cut a word, a code fence or a surrogate pair in half if that is where the limit lands.
 
 ## Guardrail vs. middleware
 
@@ -218,16 +334,25 @@ Both can defend a call, and they wrap different things. Neither replaces the oth
 | Wraps | the **run** | the **model** |
 | Sees | run boundaries: start, each tool call, the final answer | every model call made with that wrapped descriptor |
 | Applies to compaction summaries, sub-agent side calls | **no** — those are model calls, not run boundaries | **yes** — they go through the same wrapped model |
+| Runs per | run leg (input/output) or tool call | model call — every step, every retry-free re-drive |
 | Can refuse a tool call | yes | no (it never sees one) |
 | Can end a run | yes (`stoppedBy`) | no |
 | Reported as | `guardrail` parts + `deuz.guardrails` | nothing (it is transparent) |
+| Attached at | the call site (`guardrails: {…}`) | the model descriptor (so it travels with the model) |
 
-Concretely: `promptInjectionGuard()` (middleware) re-applies its system turn on **every** step *and* on side calls such as compaction summaries, because it wraps the model. `promptInjectionGuardrail()` applies it **once**, at the start of the run, and reports itself as a `guardrail` part. Prefer the guardrail for a run-level policy; keep the middleware when you want the instruction on literally every request that descriptor makes.
+Concretely: `promptInjectionGuard()` (middleware) re-applies its system turn on **every** step *and* on side calls such as compaction summaries, because it wraps the model. `promptInjectionGuardrail()` applies it **once**, at the start of the run, and reports itself as a `guardrail` part.
+
+Which to pick:
+
+- **Guardrail** for run-level policy you want visible and able to stop things — and when the cost of re-applying on every step is not worth paying.
+- **Middleware** when the instruction must be on literally every request that descriptor makes, including the ones the loop makes on its own behalf. It is also the only one of the two that a [handoff](/docs/agents/handoffs) target's *own* model would not carry — a wrapped model is a different descriptor, so a target defined with an unwrapped model loses the middleware while keeping the run's guardrails.
+
+They compose: use the middleware for the always-on instruction and guardrails for the decisions.
 
 ## Routing and refusals
 
 - **A guarded call always routes through the agentic loop**, even with no `tools`. The input and output hooks hang off loop boundaries a single-turn call does not have, and an accepted-but-inert safety control is the worst possible outcome for this option. The visible consequence: `step-start` / `step-finish` parts appear on the stream for a call that previously had none.
-- **`generateObject` / `streamObject` reject `guardrails`** for the same reason — they are single-shot by design and have no such boundary. Passing it is a caller error, not a silent no-op.
+- **`generateObject` / `streamObject` reject `guardrails`** for the same reason — they are single-shot by design and have no such boundary. Passing it is a caller error, not a silent no-op. (`mcp` is refused there too.)
 - **A [handoff](/docs/agents/handoffs) keeps them.** A transfer changes the active agent, not the run, and `guardrails` is a run-level option — so the same rules keep applying after the swap. That is deliberate: a handoff must never silently re-point a defense.
 
 <Callout type="warn" title="Sub-agents do NOT inherit guardrails">

@@ -123,22 +123,13 @@ The rest follows from it:
 
 Most tests replay recorded provider bytes, which proves the SDK builds the request it means to but never that a provider accepts it. So a separate [live suite](./packages/core/test/live) calls the real endpoints. It has already earned its keep: it confirmed that Gemini answers a tool request with `finishReason: STOP` — the exact shape that makes a naive loop hang up holding a tool call instead of an answer — and that a thinking model can spend 112 reasoning tokens against 1 answer token, which an SDK that misreads the usage envelope would under-report by an order of magnitude.
 
-## Where we actually are
+## What this is not
 
-Deuz is young: one maintainer, a small star count, a few hundred npm downloads a week.
-
-The last measured comparison is the **1.8.0 panel, scored 2026-07-22** — sixteen TypeScript AI SDKs, self-scored, where we land **9th at 74.0 / 100**. It has not been re-scored since, so treat it as the last honest data point rather than a claim about 2.0. Community weight is harsh on us and we did not curve it ([scores](./bench) · [research](./bench/research-1.8.0.md)).
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./assets/benchmark-dark.png">
-  <img alt="1.8.0 panel (2026-07-22): self-assessed 100-point benchmark of 16 AI SDKs across 5 scenarios. Vercel AI SDK leads at 86.2; Deuz SDK ranks 9th of 16 at 74.0" src="./assets/benchmark.png">
-</picture>
-
-**Need the largest ecosystem today? Use the Vercel AI SDK.** It has years of production hours, hundreds of contributors and integrations everywhere. That gap is real and it is not closing this year.
+**Need the largest ecosystem today? Use the Vercel AI SDK.** Years of production hours, hundreds of contributors, integrations everywhere. That gap is real and it is not closing this year, and no feature list here changes it.
 
 Our bet is smaller: a runtime you can hold in your head. Durability without a workflow vendor. Autonomy without an Agent god-class. Observability without an account. Nothing phones home.
 
-And what is missing is documented next to what is not: overflow recovery does not reach the Gemini native wire, `generateObject` cannot coerce a DeepSeek V4 model (it refuses both strategies — [why](./docs/content/docs/providers/compat.mdx#deepseek-v4-always-thinks)), the Redis pack has no `MULTI`, token counting is a calibrated heuristic unless you supply a tokenizer, `rerank` is still the identity reranker, MCP has no WebSocket transport, and the `Part` union has no `AudioPart`. [The full list](./docs/content/docs/reference/whats-new-2-0.mdx).
+So the limitations sit next to the features rather than in an issue tracker. Overflow recovery does not reach the Gemini native wire. `generateObject` cannot coerce a DeepSeek V4 model — it refuses both strategies, and [the page says why](./docs/content/docs/providers/compat.mdx#deepseek-v4-always-thinks). The Redis pack has no `MULTI`. Token counting is a calibrated heuristic unless you supply a tokenizer. `rerank` is still the identity reranker, MCP has no WebSocket transport, and the `Part` union has no `AudioPart`. Speech, transcription and video are covered by mocked tests but have not yet been run against a live endpoint. [The full list](./docs/content/docs/reference/whats-new-2-0.mdx).
 
 ## The map
 
@@ -179,7 +170,7 @@ npm run check
 
 Built by **Umutcan Edizaslan** — [X @UEdizaslan](https://x.com/UEdizaslan) · [GitHub @U-C4N](https://github.com/U-C4N)
 
-<sub>With help from <b>Claude Opus 4.8</b> and <b>Claude Fable 5</b>.</sub>
+<sub>With help from <b>Claude Opus 4.8</b> and <b>Claude Opus 5</b>.</sub>
 
 <sub>[MIT](./LICENSE) © 2026</sub>
 

@@ -1,13 +1,17 @@
 ---
 title: The Agentic Tool Loop
-description: How generateText and streamChat run multi-step tool loops — steps, stop conditions, and the invariants that keep the loop safe.
+description: How generateText and streamChat run multi-step tool loops — the exact per-step ordering, stop conditions, self-healing, and the invariants that keep the loop safe.
 ---
 
-When you pass `tools`, both [generateText](/docs/core/generate-text) and [streamChat](/docs/core/stream-chat) stop being single-turn calls and become an agentic loop: run a model step, execute any tool calls in parallel, feed the results back as a new turn, repeat. The loop is self-healing (a thrown tool becomes an error result, not a crash) and bounded (`maxSteps`, `stopWhen`, and a runaway guard). This page documents the machinery and the guarantees it upholds.
+When you pass `tools`, both [generateText](/docs/core/generate-text) and [streamChat](/docs/core/stream-chat) stop being single-turn calls and become an agentic loop: run a model step, execute any tool calls in parallel, feed the results back as a new turn, repeat. The loop is **self-healing** (a thrown tool becomes an error result, not a crash) and **bounded** (`maxSteps`, `stopWhen`, `budget`, and a runaway guard).
+
+This page is the reference for what actually happens, in what order, and why.
 
 ## When the loop runs
 
-The loop activates whenever `tools` is present and non-empty. Omit `tools` (or pass `{}`) and you get a single buffered turn — `generateText` resolves after one model call; `streamChat` streams one turn. There is no separate "agent" entry point; the loop is the same two functions with tools attached.
+The loop activates whenever `tools` is present and non-empty. Omit `tools` (or pass `{}`) and you get a single buffered turn. There is no separate "agent" entry point — the loop is the same two functions with tools attached.
+
+Five other options also route a call through the loop even with no tools at all, because each of them hangs off a loop boundary the single-turn path does not have: `chat` (persistence boundaries), `memory` (recall before, extraction after), `verifyStep` and `doneWhen` (the natural-completion boundary), `guardrails` (the pre-run input hook and the output hook), and `mcp` (the servers' tools *are* the tool set). An accepted-but-inert safety control would be the worst possible outcome, so the option pulls the call into the loop instead.
 
 ```ts title="loop.ts"
 import { generateText } from '@deuz-sdk/core';
@@ -18,7 +22,7 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const { text, steps } = await generateText({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'What is the weather in Paris?' }],
+  prompt: 'What is the weather in Paris?',
   maxSteps: 5, // without this the loop runs a single turn (default 1)
   tools: {
     getWeather: {
@@ -33,28 +37,79 @@ console.log(text); // final natural-language answer
 console.log(steps?.length); // e.g. 2: one tool turn + one final turn
 ```
 
+<Callout type="warn" title="`maxSteps` defaults to 1">
+This is the mistake nearly everyone makes once. With the default budget the loop calls the model, runs the tool, and stops — before the model has seen the tool result, so `text` is empty and `finishReason` is `'tool_calls'`. Set `maxSteps` above 1 for any real tool use.
+
+The default is deliberately conservative: a step budget is a spend budget, and an unbounded loop driven by a wrong prompt is an unbounded bill.
+</Callout>
+
+## Anatomy of one step
+
+Both loops run the same sequence. The streaming one additionally frames it with `step-start` / `step-finish` parts.
+
+```text
+  ── per iteration ─────────────────────────────────────────────────────────
+   1. step deadline check      previous step overran `timeout.stepMs`? fail now
+   2. arm this step's deadline
+   3. COMPACTION               automatic layered compaction, if enabled
+   4. MCP hot-swap             a server announced tools/list_changed → re-read
+   5. prepareStep              your hook — LAST word on messages/model/tools
+   6. MODEL CALL               one turn (retry + ttft/total timeouts inside)
+                               ↳ one context-overflow auto-retry per step
+  ── did the turn emit tool_use parts? ──────────────────────────────────────
+   NO  →  7a. append assistant turn
+          8a. doneWhen guard          may re-drive (own budget)
+          9a. verifyStep              may re-drive (own budget)
+         10a. output guardrails       may block / rewrite the final text
+         11a. checkpoint 'completed'  → LOOP ENDS
+   YES →  7b. append assistant turn FIRST (OpenAI ordering)
+          8b. split off handoff calls
+          9b. onToolCall guardrails   block / rewrite arguments
+         10b. approval gate           server mode denies inline; client mode BREAKS
+         11b. client tools present?   BREAK — the caller owns the round-trip
+         12b. executeTools            parallel, capped by maxToolConcurrency
+         13b. step deadline check     tools may have overrun it
+         14b. append ONE tool turn    every tool_use_id answered
+         15b. onStepFinish
+         16b. runaway guard           3 consecutive same-tool errors → hard stop
+         17b. stopWhen / maxSteps / budget
+         18b. checkpoint 'running'    → NEXT ITERATION
+```
+
+Ordering details that are load-bearing:
+
+- **Compaction runs before `prepareStep`**, so your hook sees — and has the last word on — the compacted history. If it ran after, your rewrite would be silently re-compacted or lost.
+- **The assistant turn is appended before its tool-result turn.** OpenAI's wire rejects the other order.
+- **Guardrails run immediately before the approval gate**, so a rewritten argument reaches the `needsApproval` predicate, the request a human actually sees, and `execute` — while the assistant turn already in history keeps the arguments the *model* issued. What the model said and what ran are both recoverable.
+- **The step deadline is checked twice**: once before starting a step, once after its tools have run. A timer that fires while a tool is executing cannot abort the tool (that is `toolMs` / `Tool.timeoutMs`), so the loop enforces it at its own boundaries rather than feeding results into a model call it can no longer pay for.
+- **A break executes nothing else from the batch.** When a pending approval or a client tool forces a break, the *whole* batch is deferred; the resume call settles all of it. That keeps the "every `tool_use_id` gets a `tool_result`" invariant intact across the suspension.
+
+Before the first iteration, once per run leg: MCP servers connect, the handoff catalog is captured, the tool wires are built and filtered by `activeTools`, any pending approvals from a previous leg are settled, memory recall is computed, and the `onInput` guardrails run.
+
 ## Loop control options
 
-These options live on `CommonCallOptions`, so they work identically for `generateText` and `streamChat`.
+These live on `CommonCallOptions`, so they work identically for `generateText` and `streamChat`.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `tools` | `ToolSet` | — | `Record<string, Tool>`. Presence switches on the loop. |
 | `toolChoice` | `'auto' \| 'required' \| 'none' \| { type: 'tool'; toolName: string }` | `'auto'` | Forces / forbids tool use on each step. |
-| `maxSteps` | `number` | `1` | Max model turns. The default `1` means single-turn — raise it for real tool use. |
+| `maxSteps` | `number` | `1` | Max model turns. Counts **model turns**, not tool calls — a step that runs three tools in parallel is one step. |
 | `stopWhen` | `StopCondition \| StopCondition[]` | — | Extra stop predicate(s), OR-ed with `maxSteps`. |
+| `budget` | `{ usd?: number; tokens?: number }` | — | Hard spend ceiling with readable `stoppedBy` markers. The streaming loop also emits a `budget-exceeded` part. |
 | `maxToolConcurrency` | `number` | `5` | Max parallel tool executions per step. |
-| `onStepFinish` | `(step: StepResult) => void` | — | Fires after each step that made tool calls (including approval / client-tool breaks). It does **not** fire for the terminal text-only step that produces the final answer — read that from `result.steps.at(-1)` or the resolved result. |
-| `verifyStep` | `(ctx) => VerifyStepResult \| Promise<…>` | — | **1.8.** Post-completion verifier. A rejection feeds `feedback` back as a user turn and re-drives (separate budget: `maxVerifyAttempts`, default `3`). See [Autonomy](/docs/modules/autonomy). |
-| `maxVerifyAttempts` | `number` | `3` | Cap on verifier re-drives — does not consume `maxSteps`. |
+| `onStepFinish` | `(step: StepResult) => void` | — | Fires after each step that made tool calls (including approval / client-tool breaks). It does **not** fire for the terminal text-only step — read that from `result.steps.at(-1)`. |
+| `prepareStep` | `(ctx) => PrepareStepResult \| undefined` | — | Per-step overrides: `messages`, `model`, `activeTools`, `toolChoice`. A throw here **fails the call** — it is your code, so it is never swallowed. |
+| `activeTools` | `string[]` | — | Static filter on which tool keys reach the wire. Unknown names warn and are ignored. `prepareStep`'s `activeTools` overrides it per step. |
+| `compaction` | `'auto' \| CompactionPolicy` | off | Automatic layered context compaction. Pruning is free; the summarize layer costs one extra model call whose usage counts toward the total. |
+| `verifyStep` | `(ctx) => VerifyStepResult \| Promise<…>` | — | **1.8.** Post-completion verifier. A rejection feeds `feedback` back as a user turn and re-drives, on its own budget. |
+| `maxVerifyAttempts` | `number` | `3` | Cap on verifier re-drives — does **not** consume `maxSteps`. |
+| `timeout.stepMs` | `number` | unbounded | One step end-to-end: the model call plus its tools. Enforced by **both** loops. |
+| `timeout.toolMs` | `number` | unbounded | One tool `execute`. `Tool.timeoutMs` overrides it per tool. |
 
-`maxSteps` counts **model turns**, not tool calls. A step that executes three tools in parallel is one step.
+## maxSteps, stopWhen and budgets
 
-## maxSteps and stopWhen
-
-The loop stops when **any** stop condition returns `true`. Internally `maxSteps` is itself compiled into a stop condition (`stepCount >= maxSteps`) and OR-ed with whatever you pass in `stopWhen` — so `stopWhen` never *extends* the step budget, it only lets you stop **earlier** or on a custom signal.
-
-A `StopCondition` is a plain function over the loop state. The type is exported; write predicates inline:
+The loop stops when **any** stop condition returns `true`. Internally `maxSteps` is itself compiled into a stop condition (`stepCount >= maxSteps`) and OR-ed with whatever you pass — so `stopWhen` never *extends* the step budget, it only lets you stop **earlier** or on a custom signal.
 
 ```ts
 export type StopCondition = (info: {
@@ -64,10 +119,22 @@ export type StopCondition = (info: {
   usage?: Usage;
   /** Cumulative cost in USD — only when `deps.priceProvider` is set and a condition needs it. */
   costUSD?: number;
+  /** Milliseconds since the loop started, from the injected clock. */
+  elapsedMs?: number;
 }) => boolean | Promise<boolean>;
 ```
 
-It is evaluated **after** a step that executed tools (so it never fires on the terminal text-only step, which already ends the loop on its own). It can be `async`.
+Five ready-made conditions ship from the package root:
+
+| Condition | Stops when | Requires |
+| --- | --- | --- |
+| `stepCountIs(n)` | `stepCount >= n` | — |
+| `hasToolCall(name)` | the latest step called that tool | — |
+| `totalTokensExceed(n)` | cumulative **real** provider-reported usage crosses `n` | — |
+| `costExceeds(usd)` | cumulative cost crosses `usd` | `deps.priceProvider` — without one the loop warns once and the condition never fires |
+| `durationExceeds(ms)` | the loop has been running at least `ms` | nothing; time comes from `deps.clock`, so it is deterministic in tests |
+
+`budget: { usd, tokens }` is sugar over the last two with `stoppedBy` markers of `budget.usd` / `budget.tokens`, so you can tell a budget trip apart from a manual stop after the fact.
 
 ```ts title="stop-when.ts"
 import { generateText, type StopCondition } from '@deuz-sdk/core';
@@ -80,14 +147,12 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const afterFinalize: StopCondition = ({ steps }) =>
   steps.at(-1)?.toolCalls.some((c) => c.toolName === 'finalize') ?? false;
 
-// Stop once we have run at least 3 steps (same idea as a lower maxSteps).
-const afterThreeSteps: StopCondition = ({ stepCount }) => stepCount >= 3;
-
 const result = await generateText({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Research and summarize.' }],
+  prompt: 'Research and summarize.',
   maxSteps: 10,
-  stopWhen: [afterFinalize, afterThreeSteps], // OR-ed together (and with maxSteps)
+  budget: { usd: 0.25 },
+  stopWhen: afterFinalize, // OR-ed with maxSteps and the budget
   tools: {
     finalize: {
       parameters: z.object({ summary: z.string() }),
@@ -95,13 +160,18 @@ const result = await generateText({
     },
   },
 });
+
+// 'hasToolCall' | 'budget.usd' | 'custom' | … | undefined when it ended naturally
+console.log(result.providerMetadata?.deuz?.stoppedBy);
 ```
 
-> Since **1.4** the `stepCountIs` / `hasToolCall` predicate factories are exported (alongside the usage-based `totalTokensExceed` / `costExceeds` — see [Budget stop conditions](/docs/agents/tools#budget-stop-conditions)). The inline predicates above reproduce exactly what `stepCountIs` / `hasToolCall` do, so either style works.
+<Callout title="Conditions are evaluated at step boundaries, after tools ran">
+Two practical consequences. First, a condition never fires on the terminal text-only step — that step already ends the loop on its own. Second, a budget stops the run once cost has **crossed** the line, never before: the in-flight step always completes and is paid for. Size budgets with one step of headroom.
+
+`stoppedBy` reports the *named* condition that fired. The implicit `maxSteps` bound is deliberately excluded — hitting your own step limit is not an exceptional outcome worth marking.
+</Callout>
 
 ## Step anatomy
-
-When tools are used, `result.steps` is a `StepResult[]` — one entry per model turn, in order.
 
 ```ts
 interface StepResult {
@@ -120,14 +190,12 @@ interface StepResult {
 | Field | Notes |
 | --- | --- |
 | `stepType` | `'initial'` for the first step; `'tool-result'` for every step produced by feeding tool results back. |
-| `text` | That step's assistant text (often empty on tool-calling steps; populated on the final step). |
+| `text` | That step's assistant text — often empty on tool-calling steps, populated on the final step. |
 | `reasoningText` | Present only when the model emitted reasoning that turn. |
-| `toolCalls` | Parsed tool calls this step made — empty on the terminal text-only step. |
-| `toolResults` | Execution results, aligned to `toolCalls`. Each carries `isError` when a tool threw or args failed validation. |
-| `usage` | This step alone. The top-level `result.usage` is the sum across all steps. |
-| `response.messages` | Just the turns this step appended: the assistant message, plus the tool-result message if tools ran. |
-
-Reading them back, with a per-step callback:
+| `toolCalls` | Parsed tool calls this step made — empty on the terminal text-only step. Reported in the model's own order, with any guardrail rewrite applied. |
+| `toolResults` | Execution results. Each carries `isError` when a tool threw, timed out, was denied, was blocked, had invalid arguments, or did not exist. |
+| `usage` | This step alone. The top-level `result.usage` is the sum across all steps, sub-agents included. |
+| `response.messages` | Just the turns this step appended. |
 
 ```ts title="read-steps.ts"
 import { generateText } from '@deuz-sdk/core';
@@ -138,7 +206,7 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const result = await generateText({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Weather in Paris and Berlin?' }],
+  prompt: 'Weather in Paris and Berlin?',
   maxSteps: 5,
   tools: {
     getWeather: {
@@ -161,19 +229,21 @@ for (const step of result.steps ?? []) {
 
 ## Streaming the loop
 
-`streamChat` runs the same loop but produces **one** canonical `fullStream` that spans every model call. Within a step the usual deltas pass through (`text-delta`, `reasoning-delta`, `tool-call-delta`); around each step the loop frames the boundaries with extra parts.
+`streamChat` runs the same loop but produces **one** canonical `fullStream` spanning every model call.
 
-| `fullStream` part | When | Payload |
+| `fullStream` part | Position in the step | Payload |
 | --- | --- | --- |
-| `step-start` | Beginning of each model turn | `{ stepIndex }` |
-| `text-delta` / `reasoning-delta` | During the turn | streamed content |
-| `tool-call-delta` | During the turn | raw argument JSON fragments (forwarded for live input-streaming UIs) |
-| `step-finish` | End of each turn | `{ stepIndex, finishReason, usage }` (this step's usage) |
-| `tool-call` | After a turn's tool args finish parsing | `{ toolCallId, toolName, input }` |
-| `tool-result` | After server-side execution | `{ toolCallId, toolName, output, isError? }` |
-| `finish` | Once, at the very end | `{ usage, finishReason }` (usage summed across all steps) |
+| `step-start` | first, every turn | `{ stepIndex }` |
+| `text-delta` / `reasoning-delta` | during the turn | streamed content |
+| `tool-call-delta` | during the turn | raw argument JSON fragments, for live input-streaming UIs |
+| `step-finish` | end of the model turn | `{ stepIndex, finishReason, usage }` (this step alone) |
+| `tool-call` | after args finish parsing | `{ toolCallId, toolName, input }` |
+| `tool-state` | around each call | lifecycle: `input-streaming`, `input-complete`, `awaiting-approval`, `executing`, `complete`, `error` (with `denied: true` when an `error` was an approval refusal) |
+| `tool-result` | after execution | `{ toolCallId, toolName, output, isError? }` |
+| `cost` | after each step | cumulative USD, when `deps.priceProvider` is set |
+| `finish` | once, at the very end | `{ usage, finishReason }` (usage summed across all steps) |
 
-The first part emitted is always `step-start`; the last is always `finish`. `textStream` is the text-only projection across all steps, so it yields only the model's natural-language tokens (tool-call fragments are excluded).
+So a two-step run reads: `step-start(0)` → deltas → `step-finish(0)` → `tool-call` → `tool-result` → `step-start(1)` → deltas → `step-finish(1)` → `finish`. The first part is always `step-start`; the last is always `finish`. `textStream` is the text-only projection across all steps.
 
 ```ts title="stream-loop.ts"
 import { streamChat } from '@deuz-sdk/core';
@@ -184,7 +254,7 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 const result = streamChat({
   model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Weather in Paris?' }],
+  prompt: 'Weather in Paris?',
   maxSteps: 5,
   tools: {
     getWeather: {
@@ -219,39 +289,80 @@ for await (const part of result.fullStream) {
 console.log('total tokens:', (await result.usage).totalTokens);
 ```
 
-`streamChat` returns synchronously and never throws — a failure surfaces as an `error` part on `fullStream` and rejects the `usage` / `finishReason` promises. Keep a `default` case in your switch: `StreamPart` is an open union and new variants are additive.
+`streamChat` returns synchronously and never throws — a failure surfaces as an `error` part and rejects `usage` / `finishReason`. Keep a `default` case: `StreamPart` is an open union.
 
 ## Loop guarantees
 
-These invariants are enforced by the loop implementation and pinned by tests. Treat them as contracts.
+These invariants are enforced by the implementation and pinned by tests. Treat them as contracts.
+
+### Continuation keys on tool-call count, not `finishReason`
+
+The loop decides whether to run another turn by asking whether the last step emitted any `tool_use` parts. It **never** reads `finishReason` to make that decision.
+
+This is not defensive programming against a hypothetical. A live probe of `gemini-3.6-flash` returned `finishReason: STOP` in the **same response** as a `functionCall` — the exact shape that makes a `finishReason`-driven loop hang up one tool short, returning a tool call as if it were the final answer. There are two layers of defence: the native Gemini adapter overrides the mapped finish reason to `'tool_calls'` whenever it saw a function call, and the loop ignores the field entirely.
+
+The practical consequence for you: `step.finishReason` is a *report*, not a control signal. Do not write `stopWhen` predicates that branch on it — branch on `toolCalls.length`.
 
 ### Immutable message history per step
 
-Each step builds a **new** message array (`[...messages, assistantTurn, toolResultTurn]`); prior steps' arrays are never mutated. Stable history is what makes provider prompt-cache hits possible and keeps the loop safe to drive from React state. The assistant message is always appended **before** its tool-result message (OpenAI ordering).
-
-### Stop on tool-call count, not finishReason
-
-The loop decides whether to continue based on whether the last step produced any `tool_use` parts — **not** on the reported `finishReason`. Gemini can emit `finish: stop` while a tool call is still pending; reading `finishReason` would end the loop one tool short. As long as a step emitted tool calls, the loop runs another turn.
+Each step builds a **new** message array (`[...messages, assistantTurn, toolResultTurn]`); prior steps' arrays are never mutated. Three things depend on it: provider prompt-cache hits (a mutated prefix is a cache miss), driving the loop safely from React state, and durable checkpoints that must describe a history that still exists.
 
 ### Parallel, capped tool execution
 
-A step's tool calls run concurrently, capped at `maxToolConcurrency` (default 5). Order of `toolResults` is preserved relative to `toolCalls`.
+A step's tool calls run concurrently, capped at `maxToolConcurrency` (default 5). `toolResults` order is preserved relative to `toolCalls`, so index-based pairing is safe even though completion order is not.
+
+Each `execute` receives a `ToolExecuteContext` carrying `toolCallId`, an immutable `messages` snapshot, a `signal` (your abort signal merged with any per-tool timeout), the call's opaque `runtimeContext`, and — for sub-agents — the parent's resolved `deps`, approver and live-part sink.
 
 ### Self-healing tool errors
 
-A tool that throws does not reject the call. The thrown error is caught and converted into a `tool_result` with `isError: true`, then fed back to the model so it can recover or retry. The same happens when a tool's arguments fail schema validation. Crucially, **every** `tool_use` id always receives a matching `tool_result` — Anthropic returns a 400 if any tool call is left unanswered, so the loop guarantees completeness.
+A tool failure is never a thrown call. Every one of these turns into a `tool_result` with `isError: true` that is fed back to the model, so it can retry with different arguments or pick another tool:
+
+| Cause | Message the model sees | Counts toward the runaway guard |
+| --- | --- | --- |
+| `execute` threw | the thrown error's own message (not an opaque wrapper) | ✅ |
+| Arguments failed schema validation | `Invalid arguments: …` | ✅ |
+| Tool name does not exist | `No such tool: "x". Available tools: a, b, c.` | ✅ |
+| Tool exceeded `timeoutMs` / `timeout.toolMs` | `Tool 'x' timed out after Nms and was abandoned.` | ✅ |
+| Registered tool with no `execute`, reached anyway | `No server-side executor.` | ✅ |
+| Approval **denied** (server mode) | `Tool call denied.` (plus the reason, if given) | ❌ |
+| `onToolCall` guardrail **blocked** it | the denial message | ❌ |
+
+The split in the last column is the design decision worth understanding. A hallucinated name or a hanging tool is a **model-side or tool-side defect the model can fix from the feedback** — and a model re-issuing the same broken call forever is precisely the runaway the guard exists for. A denial is a **human or policy verdict the model cannot fix**; re-asking is the correct behaviour, so counting it would punish the model for obeying.
+
+Crucially, **every** `tool_use` id always receives a matching `tool_result` — Anthropic returns a 400 if any tool call is left unanswered, so the loop guarantees completeness on every exit path, including suspensions.
+
+<Callout title="Timeouts abandon, they do not kill">
+JavaScript cannot kill a running promise. On expiry the tool's `signal` is aborted (a well-behaved tool that passed it to `fetch`, an MCP client or a sandbox stops working) and the orphaned promise gets a no-op catch so an unhandled rejection cannot take the process down. If your tool ignores `signal`, its work continues in the background — cap the work inside the tool, not only at the loop.
+</Callout>
 
 ### Runaway guard
 
-If the **same** tool returns an error on three consecutive steps (`MAX_SAME_TOOL_ERRORS = 3`), the loop hard-stops regardless of `maxSteps`. A single successful call resets that tool's counter. This prevents a persistently failing tool from burning the entire step budget.
+If the **same tool name** returns an error on three consecutive steps (`MAX_SAME_TOOL_ERRORS = 3`), the loop hard-stops regardless of `maxSteps`. The counter is keyed on tool name, so an invented name gets its own budget and never poisons a real tool's. A single successful call **resets** that tool's counter, so a flaky-but-usable tool is never permanently disqualified.
+
+Without this, a tool that fails deterministically burns the entire step budget — and with `toolMs` set, three hangs cost three full caps in wall clock, which on a serverless budget is the difference between a slow answer and no answer.
 
 ### Client tools break the loop early
 
-A `Tool` with no `execute` is a *client tool* — the SDK cannot run it. When the model calls one, the loop stops immediately and returns the pending call(s) in `result.toolCalls` (and as `tool-call` parts on `fullStream`). The caller owns the round-trip: execute it on the client, append a `tool_result`, and call again. See [client tools](/docs/agents/client-tools).
+A `Tool` **present in `tools`** with no `execute` is a *client tool* — the SDK cannot run it. When the model calls one, the loop stops and returns the pending call(s) in `result.toolCalls` (and as `tool-call` parts on `fullStream`). The caller owns the round-trip: execute it on the client, append a `tool_result`, and call again. See [client tools](/docs/agents/client-tools).
+
+<Callout type="warn" title="An unknown tool name is NOT a client tool (1.9)">
+Before 1.9 the test was `!tools[name]?.execute`, which a hallucinated name also satisfied — so an invented name broke the loop and the caller waited forever for a `tool_result` nobody could produce. Now an unknown name falls through to execution, self-heals into an `is_error` result naming the real tools, and the loop **continues** in the same turn.
+
+The lookup uses own keys only, so a model calling `toString` or `constructor` is classified as unknown rather than resolving to an inherited `Object.prototype` member.
+</Callout>
+
+### Approval gates
+
+A tool marked `needsApproval` is gated before it runs, and which mode you get depends only on whether you passed `approveToolCall`:
+
+- **Server mode** — the loop calls your approver per gated call. `false` or a throw denies it; the denial becomes an `is_error` result and **the loop continues**.
+- **Client mode** — the gated call **breaks** the loop and comes back in `result.pendingApprovals` (and as `tool-approval-request` parts). Resume with `approvalResponses`. Any pending call without a matching verdict is **denied by default** — the safe side. With `approvalSigner` configured, an approval without a verifying token is denied too.
+
+On a resume leg, `onToolCall` guardrails are **re-evaluated** before anything runs. The calls being settled are the model's original arguments read back out of history, and a suspension must not become a way to launder a call a guardrail blocked.
 
 ## Continuing across calls
 
-`result.response.messages` (or, while streaming, the assistant + tool turns you reconstruct) contains only the **new** turns this call produced. Append them to your prior history to keep it immutable and prompt-cache friendly:
+`result.response.messages` contains only the **new** turns this call produced. Append them to your prior history to keep it immutable and prompt-cache friendly:
 
 ```ts title="continue.ts"
 import { generateText, type Message } from '@deuz-sdk/core';
@@ -274,9 +385,19 @@ messages = [...messages, ...first.response.messages];
 // the next turn reuses the full, stable history
 ```
 
+## What the loop does not do
+
+- **It does not plan.** There is no built-in decomposition step — the model decides what to call. If you want an explicit plan → execute → verify structure, that is [Autonomy](/docs/modules/autonomy).
+- **It does not validate tool *results*.** `Tool.outputSchema` is carried metadata (MCP populates it from the server); the loop never checks a result against it.
+- **It does not retry a failed model step.** Retries are pre-first-byte and live inside the single model call. A step that fails after streaming began fails the run.
+- **It does not deduplicate tool calls.** If the model asks for the same call twice in one batch, both run.
+- **It does not bound total wall-clock by default.** `maxSteps` bounds turns, not time. Use `durationExceeds` or `timeout.stepMs` for that.
+
 ## See also
 
 - [generateText](/docs/core/generate-text) — buffered loop; awaits to completion.
 - [streamChat](/docs/core/stream-chat) — streaming loop; one `fullStream` across all steps.
-- [Defining tools](/docs/agents/tools) — `Tool` shape, schemas, and `execute`.
+- [Defining tools](/docs/agents/tools) — `Tool` shape, schemas, `execute`, and `tool()`.
 - [Client tools](/docs/agents/client-tools) — tools the loop hands back to the caller.
+- [Guardrails](/docs/agents/guardrails) — the `onInput` / `onToolCall` / `onOutput` hooks in the sequence above.
+- [Error handling](/docs/core/errors) — the taxonomy behind a failed step.
