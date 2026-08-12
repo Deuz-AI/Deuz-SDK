@@ -211,7 +211,7 @@ Structured output is single-turn: `generateObject` and `streamObject` do **not**
 
 Those calls now **fail fast**, before any network request, with an `InvalidRequestError` that names every offending option and says what to do instead. `generateObject` rejects; `streamObject` reports it through its existing never-throw shape (the stream and the `object` / `usage` / `finishReason` promises all reject).
 
-Detected: `tools`, `toolChoice`, `maxSteps`, `stopWhen`, `budget`, `maxToolConcurrency`, `onStepFinish`, `prepareStep`, `activeTools`, `verifyStep`, `maxVerifyAttempts`, `compaction`, `approveToolCall`, `approvalResponses`, `session`, `chat`, `memory`, `fallbackModels`, `approvalSigner`, `approvalMaxAgeMs`.
+Detected: `tools`, `toolChoice`, `maxSteps`, `stopWhen`, `budget`, `maxToolConcurrency`, `onStepFinish`, `prepareStep`, `activeTools`, `verifyStep`, `maxVerifyAttempts`, `compaction`, `approveToolCall`, `approvalResponses`, `session`, `chat`, `memory`, `fallbackModels`, `approvalSigner`, `approvalMaxAgeMs`. **2.0 also refuses** `mcp`, `guardrails`, and `doneWhen` — the same loud failure, instead of silently ignoring them.
 
 There are **no false positives by construction** — an option counts only when it carries a real value. Empty collections (`stopWhen: []`, `activeTools: []`, `tools: {}`) and `maxSteps: 1` (which *is* single-turn behaviour) pass the guard, so wrappers that always spread a full options bag keep working. No public type changed; this is a runtime check.
 

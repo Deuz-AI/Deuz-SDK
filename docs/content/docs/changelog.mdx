@@ -8,7 +8,7 @@ All notable changes to `@deuz-sdk/core`. The package follows semver: minor versi
 
 ## 2.0.0
 
-**The things you used to build yourself.** Eight new subpaths, three new modalities, real databases behind the four storage seams, guardrails and handoffs in the loop, and MCP that connects itself. Everything additive: no existing type gained a required field, every 1.9 call still compiles, every stored checkpoint still loads. Full surface **and its limits**: [What is new in 2.0](/docs/reference/whats-new-2-0).
+**The things you used to build yourself.** Eight new subpaths, three new modalities, real databases behind the four storage seams, guardrails and handoffs in the loop, and MCP that connects itself. The 1.9 call surface still compiles and every stored checkpoint still loads. Four loud breaks — `NotImplementedError` removed, two unions grew a member, `compaction.trigger` is always present, structured output now refuses `mcp` / `guardrails` / `doneWhen` — plus the two recovering behaviour changes, are on [What is new in 2.0](/docs/reference/whats-new-2-0).
 
 - **Persistent stores** (`/stores/sqlite`, `/stores/redis`, `/stores/postgres`) — one factory per backend returning `MemoryStore` / `ChatStore` / `SessionStore` / `RunStore` on one connection. SQLite: FTS5 + vector hybrid over `node:sqlite`, zero dependencies. Postgres: pgvector HNSW with an `embedding_json` fallback and a one-statement upgrade. Redis: a structural client seam, no package dependency. → [Persistent stores](/docs/modules/stores)
 - **Guardrails** (`/guardrails`, `guardrails` call option) — `onInput` / `onToolCall` / `onOutput`, each pass / block / rewrite. A blocked tool call joins the existing denial machinery and does not count toward the runaway guard; a blocked input or output is a graceful `stoppedBy` stop. → [Guardrails](/docs/agents/guardrails)
@@ -19,6 +19,7 @@ All notable changes to `@deuz-sdk/core`. The package follows semver: minor versi
 - **Memory** — `recall.scorer` / `maxChars` / `expandLinks`, `writePolicy`, `sweep: 'on-extract'`, write-time hash dedup, per-fact importance and links, and the optional `findByHash` / `deleteExpired` store fast paths. → [Memory](/docs/modules/memory)
 - **Eight more providers** — Perplexity, Cohere, DeepInfra, NVIDIA NIM, SambaNova, Hyperbolic, plus keyless **Ollama** and **LM Studio**; `CompatSettings.capabilities` and `apiKeyOptional` are public. → [Local models](/docs/providers/local)
 - **`runtimeContext`** — an opaque per-call value threaded into tools, `prepareStep`, `verifyStep`, `doneWhen` and every guardrail hook. Never serialized, never checkpointed.
+- **Breaking** — `NotImplementedError` removed (never thrown). `ObservedSubsystem` gained `speech` / `transcription` / `video`. Compaction `trigger` gained `manual` / `overflow` and is always present on the stream part. `generateObject` / `streamObject` refuse `mcp`, `guardrails`, and `doneWhen`.
 
 ## 1.9.0
 

@@ -2,21 +2,24 @@ import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
 import { appName, gitConfig } from './shared';
 import { i18n, isLocale, type Locale } from './i18n';
 
-const navLabels: Record<Locale, { docs: string; changelog: string }> = {
-  en: { docs: 'Documentation', changelog: 'Changelog' },
-  de: { docs: 'Dokumentation', changelog: 'Changelog' },
-  tr: { docs: 'Dokümantasyon', changelog: 'Sürüm notları' },
-  fr: { docs: 'Documentation', changelog: 'Journal des modifications' },
-  it: { docs: 'Documentazione', changelog: 'Changelog' },
-  es: { docs: 'Documentación', changelog: 'Registro de cambios' },
-  ru: { docs: 'Документация', changelog: 'История изменений' },
-  ja: { docs: 'ドキュメント', changelog: '変更履歴' },
-  ko: { docs: '문서', changelog: '변경 이력' },
-  zh: { docs: '文档', changelog: '更新日志' },
+const navLabels: Record<Locale, { docs: string; whatsNew: string; changelog: string }> = {
+  en: { docs: 'Documentation', whatsNew: 'What is new', changelog: 'Changelog' },
+  de: { docs: 'Dokumentation', whatsNew: 'Was ist neu', changelog: 'Changelog' },
+  tr: { docs: 'Dokümantasyon', whatsNew: 'Yenilikler', changelog: 'Sürüm notları' },
+  fr: { docs: 'Documentation', whatsNew: 'Nouveautés', changelog: 'Journal des modifications' },
+  it: { docs: 'Documentazione', whatsNew: 'Novità', changelog: 'Changelog' },
+  es: { docs: 'Documentación', whatsNew: 'Novedades', changelog: 'Registro de cambios' },
+  ru: { docs: 'Документация', whatsNew: 'Что нового', changelog: 'История изменений' },
+  ja: { docs: 'ドキュメント', whatsNew: '新着', changelog: '変更履歴' },
+  ko: { docs: '문서', whatsNew: '새로운 점', changelog: '변경 이력' },
+  zh: { docs: '文档', whatsNew: '新特性', changelog: '更新日志' },
 };
 
 /** Prefix a path with the locale, except for the default language (hidden prefix). */
 export function localePath(locale: string, path: string): string {
+  if (path === '/') {
+    return locale === i18n.defaultLanguage ? '/' : `/${locale}`;
+  }
   return locale === i18n.defaultLanguage ? path : `/${locale}${path}`;
 }
 
@@ -71,6 +74,11 @@ export function baseOptions(locale: string): BaseLayoutProps {
         text: labels.docs,
         url: localePath(locale, '/docs'),
         active: 'nested-url',
+      },
+      {
+        text: labels.whatsNew,
+        url: localePath(locale, '/docs/reference/whats-new-2-0'),
+        active: 'url',
       },
       {
         text: labels.changelog,

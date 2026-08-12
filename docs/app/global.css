@@ -11,6 +11,24 @@ html > body[data-scroll-locked] {
   --removed-body-scroll-bar-size: 0px !important;
 }
 
+/* CJK locales: keep Inter for Latin, fall back to native system faces. */
+html[lang='ja'] body {
+  font-family:
+    var(--font-sans), 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic UI', 'Noto Sans JP',
+    sans-serif;
+}
+
+html[lang='ko'] body {
+  font-family:
+    var(--font-sans), 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
+}
+
+html[lang='zh'] body {
+  font-family:
+    var(--font-sans), 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC',
+    sans-serif;
+}
+
 /* Slightly larger, calmer reading rhythm for docs prose. */
 .prose {
   --tw-prose-body: var(--color-fd-foreground);
@@ -19,4 +37,12 @@ html > body[data-scroll-locked] {
 
 .prose :where(table):not(:where([class~='not-prose'] *)) {
   font-size: 0.875rem;
+}
+
+.prose :where(h2):not(:where([class~='not-prose'] *)) {
+  scroll-margin-top: 6rem;
+}
+
+.prose :where(h3):not(:where([class~='not-prose'] *)) {
+  scroll-margin-top: 6rem;
 }

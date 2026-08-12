@@ -1,13 +1,62 @@
 ---
 title: What is new in 2.0
-description: The full 2.0 surface — persistent stores, guardrails, handoffs, zero-config MCP with OAuth, three new modalities — and the limits stated plainly.
+description: The full 2.0 surface — persistent stores, guardrails, handoffs, zero-config MCP with OAuth, three new modalities — plus the four loud breaks and the limits stated plainly.
 ---
 
 2.0 is the release where the things you had to build yourself became things you configure. Eight new subpaths, three new modalities, real databases behind the four storage seams, guardrails and handoffs in the loop, and MCP that connects itself.
 
-Everything is **additive**. No existing type gained a required field, every 1.9 call still compiles, and every stored checkpoint still loads. The two behaviours that changed are stated in [Behaviour changes](#behaviour-changes) — both make a previously-dead run recover instead.
+The public 1.9 call surface still compiles. No existing type gained a required field, and every stored checkpoint still loads. That is the contract. Four **loud** breaks sit next to it — a dead error class, two unions that grew a member, a stream part that used to omit a field, and three more loop options that structured output now refuses instead of ignoring. They are listed in [Breaking changes](#breaking-changes), not buried in a changelog.
+
+Two behaviours also changed, both in the recovering direction: a context-overflow rejection is compacted and retried instead of killing the run, and a dead HTTP MCP session is noticed. See [Behaviour changes](#behaviour-changes).
 
 What is **not** in the box is at the bottom, and it is a real list: [Known limits](#known-limits).
+
+## Upgrading from 1.9
+
+Most apps move by bumping the package and doing nothing else. Work through this list only if the matching row applies.
+
+| You… | Do this |
+| --- | --- |
+| Import `NotImplementedError` | Delete the import. It was never thrown. |
+| `switch` exhaustively on `ObservedSubsystem` | Add `speech`, `transcription`, `video`. A `default` branch is enough. |
+| `switch` exhaustively on compaction `trigger` | Add `'manual'` and `'overflow'`. Absent still means `'threshold'`. |
+| Read `compaction` parts off `fullStream` | `trigger` is now always present. Treat missing as `'threshold'` if you still have a 1.9 producer in the mix. |
+| Pass `mcp`, `guardrails`, or `doneWhen` to `generateObject` / `streamObject` | Those calls now fail fast, the same way 1.9 made `tools` / `maxSteps` loud. Run the loop with `generateText` / `streamChat`, then structure the text. |
+| Catch a generic `InvalidRequestError` around a too-long prompt | The run may now **succeed** after one forced compaction pass (Anthropic, Chat Completions, Responses). Gemini `native` is unchanged — set `compaction` explicitly there. |
+| Depend on an HTTP MCP session staying `connected` after the socket dies | 2.0 pings once and counts a failed ping as a drop, so `reconnect: true` can fire without `keepAliveMs`. |
+
+Install:
+
+```bash
+npm install @deuz-sdk/core@2.0.0
+npm install @deuz-sdk/react@2.0.0   # only if you use the hooks
+```
+
+Then pick the row that matches what you are adding, not everything at once:
+
+| You want | Start here |
+| --- | --- |
+| Chat / memory / session / runs on a real database | [Persistent stores](/docs/modules/stores) |
+| Block or rewrite input, tool calls, or the final answer | [Guardrails](/docs/agents/guardrails) |
+| Transfer the run to another agent | [Handoffs](/docs/agents/handoffs) |
+| MCP servers without a manual client | [MCP](/docs/modules/mcp) |
+| Survive turn forty, or recover from a context-overflow 400 | [Compaction](/docs/modules/compaction) |
+| TTS / STT / video | [Speech](/docs/modules/speech) · [Transcription](/docs/modules/transcription) · [Video](/docs/modules/video-generation) |
+| Ollama, LM Studio, or a new cloud host | [Local models](/docs/providers/local) · [OpenAI-compat hosts](/docs/providers/compat) |
+
+## Breaking changes
+
+Four, and none of them change the shape of a 1.9 call that was already valid.
+
+**1. `NotImplementedError` is removed.** It was a leftover from the pre-1.0 scaffolding and was never thrown after 0.1. Delete the import; nothing else changes.
+
+**2. Two unions gained members.** `ObservedSubsystem` now includes `'speech' | 'transcription' | 'video'`. The compaction `trigger` union now includes `'manual' | 'overflow'` (plus the pre-2.0 `'threshold'`). An exhaustive `switch` over either needs a new case — or a `default`, which is what [the stream protocol](/docs/reference/stream-protocol) already asks you to keep.
+
+**3. The streaming `compaction` part always carries `trigger`.** Before 2.0 the field was omitted and meant `'threshold'`. 2.0 writes it every time so overflow recovery and a manual `compactMessages()` pass are distinguishable from the threshold path. Old readers that ignore unknown fields keep working; readers that treated "no `trigger`" as a signal need to treat `'threshold'` as the default.
+
+**4. `generateObject` / `streamObject` refuse `mcp`, `guardrails`, and `doneWhen`.** 1.9 already rejected the rest of the loop options instead of ignoring them. 2.0 extends that list so a safety control or an MCP server cannot sit on a structured-output call and do nothing. `generateObject` throws `InvalidRequestError`; `streamObject` reports it through its never-throw shape. Empty collections and `maxSteps: 1` still pass, so wrappers that spread a full options bag keep working.
+
+The `Part` union stays at five members: `text`, `image`, `tool_use`, `tool_result`, `reasoning`. Audio and documents ride `filePart()` with a media type. A sixth kind would break every exhaustive switch for a wire none of the chat providers offer.
 
 ## The new subpaths
 
@@ -177,4 +226,5 @@ Stated here so you do not discover them at runtime.
 
 - [What is new in 1.9](/docs/reference/whats-new-1-9) — the previous release, with its own limits list.
 - [Persistent stores](/docs/modules/stores) · [Guardrails](/docs/agents/guardrails) · [Handoffs](/docs/agents/handoffs) · [MCP](/docs/modules/mcp) · [Compaction](/docs/modules/compaction)
-- [Changelog](/docs/changelog) — the full release history.
+- [Changelog](/docs/changelog) — the full release history, including 1.9 and earlier.
+- Jump back to [Upgrading from 1.9](#upgrading-from-1-9) if you are bumping a running app.

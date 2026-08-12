@@ -74,7 +74,7 @@ AI SDK 7 is **ESM-only** — its announcement states that `require()` is not sup
 | `result.usage` / `result.totalUsage` | `result.usage` | One field: totals summed across every step and sub-agent. |
 | `result.finishReason` | `result.finishReason` | `'stop' \| 'length' \| 'tool_calls' \| 'content_filter' \| 'error' \| 'aborted'`. |
 | `result.finalStep` | `result.steps?.at(-1)` | Deuz keeps per-step data only in `steps`. |
-| `result.warnings` | `result.warnings` | Live on `streamChat` (`Promise<CallWarning[]>`, settles with `usage`, never rejects) — but **`undefined` on `generateText` / `generateObject` / `streamObject`**, and a `streamChat` carrying `tools` reports only its own `activeTools` notices. See [Partly inert](#partly-inert--check-before-you-port-onto-these). |
+| `result.warnings` | `result.warnings` | A `Promise<CallWarning[]>` on the streaming calls (settles with `usage`, never rejects) and a plain `CallWarning[]` on `generateText` / `generateObject`, with the key **omitted when empty**. See [Partly inert](#partly-inert--check-before-you-port-onto-these). |
 | `instructions` (`system` before 7.0) | `instructions` | Same name, same meaning, since 1.9. Placed first; a system message already in `messages` is preserved after it. |
 | `prompt` | `prompt` | Since 1.9. Shorthand for one user turn, mutually exclusive with `messages`. |
 | `messages` (`ModelMessage[]`) | `messages` (`Message[]`) | Deuz has no `convertToModelMessages` step — see the UI table. |
@@ -430,9 +430,9 @@ The previous version of this page ended with "everything else has a direct equiv
 
 ### Partly inert — check before you port onto these
 
-`warnings` is the one place where Deuz's coverage is narrower than the AI SDK's, and it will not announce itself at runtime.
+`warnings` covers the same ground as the AI SDK's, but it is shaped differently and one notice still does not reach it.
 
-The AI SDK's `result.warnings` reports dropped settings on every result. Deuz's is **live on `streamChat` only**:
+The AI SDK's `result.warnings` reports dropped settings on every result. Deuz's does too — as a promise on the streaming calls, as a plain array on the buffered ones:
 
 ```ts
 const result = streamChat({ model, prompt, temperature: 0.7 });
@@ -441,7 +441,8 @@ for (const w of (await result.warnings) ?? []) console.warn(w.type, w.setting, w
 
 What does not carry over:
 
-- **The field is omitted, not empty, when there is nothing to report.** `result.warnings` is `undefined` on a clean call rather than `[]`, so read `(result.warnings ?? [])`.
+- **On the buffered calls the field is omitted, not empty, when there is nothing to report.** `generateText` / `generateObject` leave `warnings` `undefined` on a clean call rather than `[]`, so read `(result.warnings ?? [])`. The streaming calls always resolve an array.
+- **The buffered loop drops its own `activeTools` notice.** A `generateText` whose `activeTools` names no real tool logs the mismatch and carries on, but the notice never reaches `result.warnings`; the streaming loop records it.
 - **`useObject` cannot receive one.** The object wire carries no canonical part stream, so a `warning` never crosses it. Read `warnings` server-side on a `streamObject` result.
 - **`clamped-setting` has no producer.** That member of the union ships unused; the unknown-slug `maxOutput` clamp happens per adapter, not centrally.
 

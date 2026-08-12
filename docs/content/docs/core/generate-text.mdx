@@ -118,7 +118,7 @@ interface GenerateTextResult {
 | `steps` | with tools | Per-step breakdown. **`undefined` on a single-turn call** — that absence is how you tell the two shapes apart. |
 | `toolCalls` / `toolResults` | with tools | Convenience: the last *tool-calling* step's calls and results. |
 | `pendingApprovals` | client-mode approval break | Calls awaiting a verdict. Resume by calling again with `approvalResponses`. |
-| `warnings` | when any were produced | Non-fatal notices — an unknown model slug, a stripped sampling parameter, a dropped document, a hosted tool the wire cannot carry, an `activeTools` name that matches nothing. **Omitted entirely** when there are none. Deduplicated by `(type, setting, message)` and capped at 50. |
+| `warnings` | when any were produced | Non-fatal notices — an unknown model slug, a stripped sampling parameter, a dropped document, a hosted tool the wire cannot carry. **Omitted entirely** when there are none. Deduplicated by `(type, setting, message)` and capped at 50. One gap: an `activeTools` name that matches nothing is logged here but not recorded on the field — only the streaming loop records it. |
 | `providerMetadata.deuz` | when the loop has something to report | `stoppedBy` (which named `stopWhen`/`budget` condition ended the run), `verified` (the `verifyStep` verdict), `guardrails`, `handoffs`. Absent when the run ended naturally or on the implicit `maxSteps` bound. |
 | `runId` | with `session` | The durable run id — pass it to `resumeFromCheckpoint`. |
 | `memory` | with `memory` extraction on | Resolves with the applied mutations once the post-run extract pass finishes. Never rejects. **Await it on serverless** or the isolate may be torn down first. |

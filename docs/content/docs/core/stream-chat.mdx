@@ -286,7 +286,7 @@ for (const w of (await result.warnings) ?? []) console.warn(w.type, w.message);
 
 `CallWarning.type` is `'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other'`. Treat it as an **open** union — `'other'` is the escape hatch — rather than switching exhaustively.
 
-The buffered readouts carry the same set: `GenerateTextResult.warnings`, `GenerateObjectResult.warnings` and `StreamObjectResult.warnings` are populated too, and are **omitted entirely** when a call produced none, so a clean result's shape is unchanged.
+The other calls carry the same set, in two shapes. `StreamObjectResult.warnings` is the same promise as here — always defined, resolving `[]` on a clean run. The buffered readouts, `GenerateTextResult.warnings` and `GenerateObjectResult.warnings`, are plain arrays whose key is **omitted entirely** when a call produced none, so a clean result's shape is unchanged; read `result.warnings ?? []` if you want an array either way.
 
 ## Abort
 

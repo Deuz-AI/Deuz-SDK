@@ -3,7 +3,7 @@ title: Files, PDFs & images
 description: filePart() and imagePart() — attaching binary media to a message, and how each wire carries a document.
 ---
 
-The canonical `Part` union has **five** members (`text`, `image`, `tool_use`, `tool_result`, `reasoning`) and no `file` kind — adding a sixth is a breaking change queued for 2.0. Until then `ImagePart` is the carrier for **all** binary media: a PDF is `{ type: 'image', image: bytes, mediaType: 'application/pdf' }`.
+The canonical `Part` union has **five** members (`text`, `image`, `tool_use`, `tool_result`, `reasoning`) and no `file` or `audio` kind. 2.0 kept it that way on purpose — a sixth member would break every exhaustive `switch`, and none of the chat wires offer a native audio part. `ImagePart` is the carrier for **all** binary media: a PDF is `{ type: 'image', image: bytes, mediaType: 'application/pdf' }`, and audio you want a chat model to hear travels as `filePart({ mediaType: 'audio/…' })`. Speech and transcription are dedicated modules, not a sixth part.
 
 That convention is correct but undiscoverable — nobody guesses "attach a PDF as an image". Since 1.9 there are two constructors that turn it into an API, and the convention actually **works on all four wires**.
 

@@ -145,7 +145,7 @@ Many AI integrations become hard to test because runtime state, provider-specifi
 
 ## New in 2.0
 
-Everything below is additive — no existing type gained a required field, every 1.9 call still compiles, and every stored checkpoint still loads.
+Almost everything below is additive — no existing type gained a required field, every 1.9 call still compiles, and every stored checkpoint still loads. Four loud breaks are listed on [What is new in 2.0](/docs/reference/whats-new-2-0#breaking-changes): `NotImplementedError` is gone, two unions gained members, the streaming `compaction` part always carries `trigger`, and `generateObject` / `streamObject` now refuse `mcp` / `guardrails` / `doneWhen`.
 
 - **Persistent stores** — SQLite, Redis and Postgres packs behind the memory / chat / session / run seams → [Persistent stores](/docs/modules/stores)
 - **Guardrails** — pass / block / rewrite on the run's input, each tool call, and the final answer → [Guardrails](/docs/agents/guardrails)
