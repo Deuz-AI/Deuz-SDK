@@ -1,0 +1,64 @@
+---
+title: Agent Skills
+description: The two Agent Skills this repository ships for coding agents, what is in them, and the gates that keep them from inventing an API.
+---
+
+Coding agents write most of the code that uses an SDK now, and they write it from memory. For a library the model has never seen, that memory is a guess — a confident one, with plausible function names and the wrong call shape.
+
+This repository ships two [Agent Skills](https://agentskills.io/specification) so an agent working on your project reads the real surface instead of reconstructing it.
+
+```sh
+npx skills add Deuz-AI/Deuz-SDK
+```
+
+Both install for Claude Code and any other agent that reads the format. They live in the repository under [`skills/`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/skills).
+
+## `deuz-sdk` — building on the SDK
+
+A build guide over the whole surface, not an API dump. `SKILL.md` is the part that is always in context: the mental model and its invariants, a reflex table mapping what an agent might reach for to what this SDK already has, a task-to-file router, and five recipes. Everything else is loaded only when the task needs it.
+
+| Reference file | Covers |
+| --- | --- |
+| `core-calls` | The six call functions, the `StreamPart` union, the `Message`/`Part` model, errors, timeouts, the `Dependencies` seam |
+| `providers` | Every factory subpath, the compat hosts, the capability registry, key precedence |
+| `streaming-ui` | The Deuz UI wire, `validateChatRequest`, the chat engine, `useChat` / `useObject`, correct part rendering |
+| `tools-agents` | Tools, the loop contract, approvals, `createAgent`, sub-agents, handoffs, guardrails |
+| `memory-compaction` | Cross-session memory, the recall pipeline, compaction layers, overflow recovery |
+| `rag-and-skills` | Parsing, chunking, hybrid retrieval, citations, and the SDK's own skills module |
+| `persistence-durable` | The four store seams, the SQLite/Redis/Postgres packs, checkpoints and resume |
+| `mcp` | Zero-config servers, OAuth, stdio, sampling, roots |
+| `autonomy-workspace` | Plan/verify, ensembles, workspace memory, CodeAct, browser control, background runs |
+| `media` | Image, speech, transcription, video |
+| `ops` | Observation events, the OTel bridge, pricing and budgets, middleware, resilience |
+| `testing-and-edge` | Mock models, evals, the edge-safety rules and the Node-only subpath list |
+| `migration` | Porting from the Vercel AI SDK, LangChain, LangGraph or LlamaIndex |
+| `api-index` | Generated from source: every subpath, every export, marked value or type |
+
+`api-index` is regenerated from `package.json`'s `exports` crossed with the source export graph, so it is never hand-maintained and never drifts.
+
+## `migrate-from-ai-sdk` — porting an existing app
+
+The verified name-by-name mapping from `ai` and `@ai-sdk/*`, with the porting order that keeps the app compiling at each step, and an honest list of what has no equivalent. See also [Coming from the Vercel AI SDK](/docs/migration/from-vercel-ai-sdk).
+
+## Why you can trust what they say
+
+Documentation drifts. These are gated the way code is:
+
+- **Every symbol is resolved against the real export table.** `verify:docs-refs` — part of `npm run check`, so it runs on every commit and every pull request — builds the export graph from `tsup`'s entry map crossed with `package.json`'s `exports`, following `export *` through the source, and fails on any `@deuz-sdk` import or subpath in the skills that does not resolve. A hallucinated name cannot be merged.
+- **Every code example compiles.** The fenced TypeScript blocks are extracted into a scratch project and typechecked against the built package under `strict`, which catches what a name check cannot: a wrong option key, a wrong result property, a wrong generic.
+- **Staleness fails loudly.** The skill carries the package version and a hash of the locked [API contract](/docs/reference/release-process). When a release moves either one, the check fails and says so, rather than letting the guidance quietly go out of date.
+- **Every internal link is checked.** The `/docs/...` links in the reference files are validated against real routes on the same gate.
+
+They were also written test-first. Nine build tasks — streaming, a chat route, a tool loop, structured extraction, an approval UI, provider fallback, RAG, a durable agent, MCP — were given to agents with no access to the skill or the repository. Across nine answers there were **19 imports of things that do not exist**: an invented client class, invented type names, `defineTool`, a hand-rolled SSE stream in place of the wire helper, and an `await` on the call that is documented never to need one. The skills target those failures specifically, and the same nine tasks are the acceptance test.
+
+## Keeping them current
+
+The skills are maintained inside this repository, verified by the scripts under `.claude/skills/deuz-sdk/scripts/`:
+
+```sh
+npm run build -w @deuz-sdk/core
+node .claude/skills/deuz-sdk/scripts/generate-api-index.mjs   # rebuild the index from source
+node .claude/skills/deuz-sdk/scripts/verify-skill.mjs         # resolve every name, check freshness
+```
+
+The same content lives twice — once where Claude Code loads it for work inside this repository, once under `skills/` where `npx skills add` distributes it — and the verifier fails if the two ever diverge.

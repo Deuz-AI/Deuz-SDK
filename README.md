@@ -105,9 +105,17 @@ npm install @deuz-sdk/react    # optional: useChat, useObject, headless UI
 
 Node ≥ 22, or any edge runtime with `fetch`. Optional peers only when you use them: `zod` (or any Standard Schema library), `@modelcontextprotocol/sdk`, `react`, `pg` / `redis`, `unpdf` / `mammoth` / `xlsx`, `playwright`, `@opentelemetry/api`.
 
+### Teach your coding agent
+
 ```sh
-npx skills add Deuz-AI/Deuz-SDK   # deuz-sdk (API reference) + migrate-from-ai-sdk
+npx skills add Deuz-AI/Deuz-SDK
 ```
+
+Two Agent Skills, for Claude Code and any other agent that reads the format.
+
+**`deuz-sdk`** is a build guide over the whole surface — the mental model and its invariants, a task-to-file router, and thirteen reference files the agent loads only when the task needs them, covering every one of the 53 subpaths. **`migrate-from-ai-sdk`** is the verified name-by-name port from `ai` and `@ai-sdk/*`.
+
+They are gated, not just written. Every `@deuz-sdk` symbol in them is resolved against the real export table on every commit, every code example is compiled against the built package, and a freshness check fails the moment the version or the locked API contract moves — so an agent reading them cannot confidently invent a function that does not exist. Written test-first: nine build tasks were given to agents without the skill first, which produced 19 imaginary imports across 8 of 9 answers.
 
 ## How it is built
 
