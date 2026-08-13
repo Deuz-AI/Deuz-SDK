@@ -6,6 +6,7 @@ import {
   Database,
   Globe,
   Server,
+  Sparkles,
   Waves,
   Workflow,
 } from 'lucide-react';
@@ -199,6 +200,44 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
       </section>
 
       <section className="border-t bg-fd-card/40">
+        <div className="mx-auto grid w-full max-w-5xl items-center gap-10 px-4 py-16 lg:grid-cols-[3fr_2fr]">
+          <div>
+            <p className="text-xs font-medium uppercase tracking-widest text-fd-muted-foreground">
+              {t.skillsTag}
+            </p>
+            <h2 className="mt-3 text-2xl font-bold tracking-tight">{t.skillsTitle}</h2>
+            <p className="mt-3 text-fd-muted-foreground">{t.skillsBody}</p>
+            <Link
+              href={localePath(locale, '/docs/reference/agent-skills')}
+              className="mt-5 inline-flex items-center gap-1.5 font-medium text-fd-primary hover:underline"
+            >
+              {t.skillsCta}
+              <ArrowRight className="size-4" />
+            </Link>
+          </div>
+          <div className="rounded-xl border bg-fd-card p-5">
+            <Sparkles className="size-5 text-fd-primary" aria-hidden="true" />
+            <pre className="mt-4 overflow-x-auto rounded-lg border bg-[#0d1220] p-4 text-sm text-slate-200">
+              <code>
+                <span className="text-slate-500">$ </span>
+                npx skills add Deuz-AI/Deuz-SDK
+              </code>
+            </pre>
+            <ul className="mt-4 space-y-3">
+              {t.skillsList.map((skill) => (
+                <li key={skill.name}>
+                  <code className="text-sm font-semibold text-fd-foreground">{skill.name}</code>
+                  <p className="mt-1 text-sm leading-relaxed text-fd-muted-foreground">
+                    {skill.body}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section className="border-t">
         <div className="mx-auto flex w-full max-w-5xl flex-col items-center gap-4 px-4 py-12 text-center">
           <p className="text-xs font-medium uppercase tracking-widest text-fd-muted-foreground">
             {t.languagesLabel}

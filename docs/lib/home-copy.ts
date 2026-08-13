@@ -22,6 +22,11 @@ export type HomeCopy = {
   features: Record<HomeFeatureKey, { title: string; body: string }>;
   codeTitle: string;
   codeBody: string;
+  skillsTag: string;
+  skillsTitle: string;
+  skillsBody: string;
+  skillsCta: string;
+  skillsList: { name: string; body: string }[];
   languagesLabel: string;
   footerDocs: string;
   footerChangelog: string;
@@ -75,6 +80,15 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     codeTitle: 'Streaming in three lines',
     codeBody:
       'streamChat returns synchronously and never throws — the request starts lazily on first read. Swap the factory to change provider; nothing else moves.',
+    skillsTag: "For your coding agent",
+    skillsTitle: "Your coding agent already knows this SDK",
+    skillsBody:
+      "Two Agent Skills ship with the repository, so an agent writes against the real surface instead of reconstructing it from memory. Every symbol in them is resolved against the export table on each commit and every example is compiled, so a name that does not exist cannot be merged.",
+    skillsCta: "How they are verified",
+    skillsList: [
+      { name: 'deuz-sdk', body: "The whole surface: the invariants, a task-to-file router, and thirteen reference files loaded only when a task needs them." },
+      { name: 'migrate-from-ai-sdk', body: "The verified name-by-name port from ai and @ai-sdk packages." },
+    ],
     languagesLabel: 'Documentation UI',
     footerDocs: 'Documentation',
     footerChangelog: 'Changelog',
@@ -126,6 +140,15 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     codeTitle: 'Streaming in drei Zeilen',
     codeBody:
       'streamChat kehrt synchron zurück und wirft nie — der Request startet lazy beim ersten Lesen. Tausche die Factory, um den Provider zu wechseln; sonst ändert sich nichts.',
+    skillsTag: "Für deinen Coding-Agenten",
+    skillsTitle: "Dein Coding-Agent kennt dieses SDK bereits",
+    skillsBody:
+      "Zwei Agent Skills liegen im Repository, damit ein Agent gegen die echte Oberfläche schreibt, statt sie aus dem Gedächtnis zu rekonstruieren. Jedes Symbol darin wird bei jedem Commit gegen die Export-Tabelle aufgelöst und jedes Beispiel kompiliert — ein Name, den es nicht gibt, kommt nicht durch.",
+    skillsCta: "Wie sie geprüft werden",
+    skillsList: [
+      { name: 'deuz-sdk', body: "Die gesamte Oberfläche: die Invarianten, ein Router von Aufgabe zu Datei und dreizehn Referenzdateien, die nur bei Bedarf geladen werden." },
+      { name: 'migrate-from-ai-sdk', body: "Die geprüfte Migration Name für Name von ai und den @ai-sdk-Paketen." },
+    ],
     languagesLabel: 'Dokumentations-UI',
     footerDocs: 'Dokumentation',
     footerChangelog: 'Changelog',
@@ -177,6 +200,15 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     codeTitle: 'Üç satırda akış',
     codeBody:
       'streamChat senkron döner ve asla fırlatmaz — istek ilk okumada tembelce başlar. Sağlayıcıyı değiştirmek için factory’yi değiştirin; başka hiçbir şey değişmez.',
+    skillsTag: "Kod yazan ajanınız için",
+    skillsTitle: "Ajanınız bu SDK’yı zaten biliyor",
+    skillsBody:
+      "Repo iki Agent Skill ile geliyor; ajan API’yi hafızasından yeniden kurmak yerine gerçek yüzeye göre yazıyor. İçlerindeki her sembol her commit’te export tablosuna karşı çözülüyor ve her örnek derleniyor — var olmayan bir isim merge edilemiyor.",
+    skillsCta: "Nasıl doğrulanıyor",
+    skillsList: [
+      { name: 'deuz-sdk', body: "Yüzeyin tamamı: değişmezler, göreve göre dosya yönlendirmesi ve yalnızca gerektiğinde yüklenen on üç referans dosyası." },
+      { name: 'migrate-from-ai-sdk', body: "ai ve @ai-sdk paketlerinden isim isim doğrulanmış geçiş." },
+    ],
     languagesLabel: 'Dokümantasyon arayüzü',
     footerDocs: 'Dokümantasyon',
     footerChangelog: 'Sürüm notları',
@@ -228,6 +260,15 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     codeTitle: 'Le streaming en trois lignes',
     codeBody:
       'streamChat retourne de façon synchrone et ne lève jamais d’exception — la requête démarre paresseusement à la première lecture. Changez la factory pour changer de fournisseur ; rien d’autre ne bouge.',
+    skillsTag: "Pour votre agent de code",
+    skillsTitle: "Votre agent connaît déjà ce SDK",
+    skillsBody:
+      "Deux Agent Skills sont fournis avec le dépôt : l’agent écrit face à la vraie surface au lieu de la reconstituer de mémoire. Chaque symbole y est résolu contre la table d’exports à chaque commit et chaque exemple est compilé — un nom inexistant ne peut pas être fusionné.",
+    skillsCta: "Comment ils sont vérifiés",
+    skillsList: [
+      { name: 'deuz-sdk', body: "Toute la surface : les invariants, un routeur tâche-vers-fichier et treize fichiers de référence chargés seulement quand la tâche l’exige." },
+      { name: 'migrate-from-ai-sdk', body: "Le portage vérifié, nom par nom, depuis ai et les paquets @ai-sdk." },
+    ],
     languagesLabel: 'Interface de la documentation',
     footerDocs: 'Documentation',
     footerChangelog: 'Journal des modifications',
@@ -279,6 +320,15 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     codeTitle: 'Streaming in tre righe',
     codeBody:
       'streamChat ritorna in modo sincrono e non lancia mai eccezioni — la richiesta parte pigramente alla prima lettura. Cambia la factory per cambiare provider; nient’altro si muove.',
+    skillsTag: "Per il tuo agente di codice",
+    skillsTitle: "Il tuo agente conosce già questo SDK",
+    skillsBody:
+      "Il repository include due Agent Skill, così l’agente scrive sulla superficie reale invece di ricostruirla a memoria. Ogni simbolo viene risolto contro la tabella degli export a ogni commit e ogni esempio viene compilato: un nome che non esiste non passa.",
+    skillsCta: "Come vengono verificate",
+    skillsList: [
+      { name: 'deuz-sdk', body: "L’intera superficie: gli invarianti, un router da attività a file e tredici file di riferimento caricati solo quando servono." },
+      { name: 'migrate-from-ai-sdk', body: "La migrazione verificata, nome per nome, da ai e dai pacchetti @ai-sdk." },
+    ],
     languagesLabel: 'Interfaccia della documentazione',
     footerDocs: 'Documentazione',
     footerChangelog: 'Changelog',
@@ -330,6 +380,15 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     codeTitle: 'Streaming en tres líneas',
     codeBody:
       'streamChat retorna de forma síncrona y nunca lanza excepciones — la petición arranca perezosamente en la primera lectura. Cambia la factory para cambiar de proveedor; nada más se mueve.',
+    skillsTag: "Para tu agente de código",
+    skillsTitle: "Tu agente ya conoce este SDK",
+    skillsBody:
+      "El repositorio incluye dos Agent Skills, de modo que el agente escribe contra la superficie real en lugar de reconstruirla de memoria. Cada símbolo se resuelve contra la tabla de exports en cada commit y cada ejemplo se compila: un nombre que no existe no se puede fusionar.",
+    skillsCta: "Cómo se verifican",
+    skillsList: [
+      { name: 'deuz-sdk', body: "Toda la superficie: los invariantes, un enrutador de tarea a archivo y trece archivos de referencia que se cargan solo cuando hacen falta." },
+      { name: 'migrate-from-ai-sdk', body: "La migración verificada, nombre por nombre, desde ai y los paquetes @ai-sdk." },
+    ],
     languagesLabel: 'Interfaz de la documentación',
     footerDocs: 'Documentación',
     footerChangelog: 'Registro de cambios',
@@ -381,6 +440,15 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     codeTitle: 'Стриминг в три строки',
     codeBody:
       'streamChat возвращается синхронно и никогда не бросает исключений — запрос лениво стартует при первом чтении. Поменяйте фабрику, чтобы сменить провайдера; больше ничего не меняется.',
+    skillsTag: "Для вашего кодового агента",
+    skillsTitle: "Ваш агент уже знает этот SDK",
+    skillsBody:
+      "В репозитории лежат два Agent Skill, поэтому агент пишет по реальной поверхности, а не восстанавливает её по памяти. Каждый символ сверяется с таблицей экспортов на каждом коммите, а каждый пример компилируется — несуществующее имя не пройдёт.",
+    skillsCta: "Как они проверяются",
+    skillsList: [
+      { name: 'deuz-sdk', body: "Вся поверхность: инварианты, маршрутизатор «задача → файл» и тринадцать справочных файлов, загружаемых только по необходимости." },
+      { name: 'migrate-from-ai-sdk', body: "Проверенный перенос имя в имя из ai и пакетов @ai-sdk." },
+    ],
     languagesLabel: 'Интерфейс документации',
     footerDocs: 'Документация',
     footerChangelog: 'История изменений',
@@ -432,6 +500,15 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     codeTitle: '3 行でストリーミング',
     codeBody:
       'streamChat は同期的に返り、決して例外を投げません — リクエストは最初の読み取り時に遅延開始します。ファクトリを差し替えるだけでプロバイダーを変更でき、他には何も変わりません。',
+    skillsTag: "コーディングエージェント向け",
+    skillsTitle: "エージェントはすでにこの SDK を知っています",
+    skillsBody:
+      "リポジトリには 2 つの Agent Skill が同梱されているため、エージェントは記憶から API を組み立てるのではなく実際の表面に従って書きます。含まれるすべてのシンボルはコミットごとにエクスポート表と照合され、すべての例はコンパイルされます。存在しない名前はマージできません。",
+    skillsCta: "検証のしくみ",
+    skillsList: [
+      { name: 'deuz-sdk', body: "表面のすべて: 不変条件、タスクからファイルへのルーター、必要なときだけ読み込まれる 13 個のリファレンス。" },
+      { name: 'migrate-from-ai-sdk', body: "ai および @ai-sdk パッケージからの、名前単位で検証された移行。" },
+    ],
     languagesLabel: 'ドキュメント UI',
     footerDocs: 'ドキュメント',
     footerChangelog: '変更履歴',
@@ -483,6 +560,15 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     codeTitle: '세 줄로 스트리밍',
     codeBody:
       'streamChat은 동기적으로 반환되며 절대 예외를 던지지 않습니다 — 요청은 첫 읽기에서 지연 시작됩니다. 팩토리만 바꾸면 프로바이더가 바뀌고, 그 외에는 아무것도 달라지지 않습니다.',
+    skillsTag: "코딩 에이전트를 위해",
+    skillsTitle: "에이전트는 이미 이 SDK를 알고 있습니다",
+    skillsBody:
+      "저장소에 두 개의 Agent Skill이 함께 제공되므로, 에이전트는 기억으로 API를 재구성하지 않고 실제 표면에 맞춰 작성합니다. 모든 심벌은 커밋마다 익스포트 표와 대조되고 모든 예제는 컴파일됩니다. 존재하지 않는 이름은 머지될 수 없습니다.",
+    skillsCta: "어떻게 검증되나",
+    skillsList: [
+      { name: 'deuz-sdk', body: "표면 전체: 불변 조건, 작업에서 파일로 가는 라우터, 필요할 때만 로드되는 13개의 레퍼런스 파일." },
+      { name: 'migrate-from-ai-sdk', body: "ai 및 @ai-sdk 패키지에서의 이름 단위 검증 마이그레이션." },
+    ],
     languagesLabel: '문서 UI',
     footerDocs: '문서',
     footerChangelog: '변경 이력',
@@ -534,6 +620,15 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     codeTitle: '三行代码实现流式输出',
     codeBody:
       'streamChat 同步返回且永不抛出异常 — 请求在首次读取时惰性启动。换一个 factory 即可切换提供商，其余一切保持不变。',
+    skillsTag: "为你的编码代理准备",
+    skillsTitle: "你的编码代理已经了解这个 SDK",
+    skillsBody:
+      "仓库随附两个 Agent Skill，代理据此按真实接口编写代码，而不是凭记忆拼凑。其中每个符号都会在每次提交时与导出表核对，每个示例都会编译——不存在的名称无法合入。",
+    skillsCta: "它们如何被验证",
+    skillsList: [
+      { name: 'deuz-sdk', body: "完整接口：不变量、从任务到文件的路由，以及仅在需要时加载的十三个参考文件。" },
+      { name: 'migrate-from-ai-sdk', body: "从 ai 与 @ai-sdk 系列包逐个名称验证过的迁移路径。" },
+    ],
     languagesLabel: '文档界面',
     footerDocs: '文档',
     footerChangelog: '更新日志',
