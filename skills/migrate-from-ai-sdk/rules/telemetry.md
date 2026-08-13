@@ -82,11 +82,11 @@ console.log(Object.keys(model)); // ['provider', 'modelId', 'surface']
 
 If the ported app logged the AI SDK's provider object or request bodies, that logging can be deleted rather than reproduced.
 
-## `warnings` reports on `streamChat` only
+## `warnings` reports on every result, in two shapes
 
-The AI SDK's `result.warnings` reports dropped settings on every result. Deuz's is populated on **`streamChat`** (`await result.warnings`, plus live `warning` parts on `fullStream`) and is `undefined` on `generateText` / `generateObject` / `streamObject`. A `streamChat` carrying `tools` / `chat` / `memory` / `verifyStep` / `doneWhen` reports only its own `activeTools` notices.
+The AI SDK's `result.warnings` reports dropped settings on every result, and so does Deuz's. On the streaming calls it is a promise you `await` (plus live `warning` parts on `fullStream` for `streamChat`); on `generateText` / `generateObject` it is a plain array whose key is omitted when empty, so read `result.warnings ?? []`. A loop-routed call reports its steps' notices too — one sink is threaded through every step.
 
-These are the degradations at stake, and every one of them reports through `deps.logger.warn` on every path:
+These are the degradations at stake, and every one of them also reports through `deps.logger.warn`:
 
 - a provider-executed (hosted) tool dropped on a `chat_completions`-surface model,
 - a document dropped on a model whose capability row cannot accept one,
@@ -94,7 +94,7 @@ These are the degradations at stake, and every one of them reports through `deps
 - a `temperature` / `topP` / `effort` value stripped because the model's row cannot carry it,
 - an `activeTools` name that matches no tool.
 
-So the port must wire a logger, and treat the field as a bonus rather than the source:
+The field is the primary readout, but wire a logger anyway — the default is a no-op, and the buffered loop's `activeTools` notices reach the log only:
 
 ```ts
 const deps = {

@@ -96,9 +96,9 @@ Tell the user up front if their app uses any of these; there is no Deuz replacem
 | Codemods | Absent. This skill is the replacement. |
 | Hosted gateway / plain string model ids | Deliberately absent. |
 
-## `result.warnings` does NOT map one-to-one
+## `result.warnings` maps, but in two shapes
 
-The AI SDK reports dropped settings on every result. Deuz's `warnings` is populated on **`streamChat` only** (`Promise<CallWarning[]>`, settles with `usage`, never rejects; `warning` parts also ride `fullStream`). It is `undefined` on `GenerateTextResult` / `GenerateObjectResult` / `StreamObjectResult`, and a `streamChat` carrying `tools` / `chat` / `memory` / `verifyStep` / `doneWhen` reports only its own `activeTools` notices — a model-level warning raised inside a step reaches `deps.logger.warn`, not the field. So a port that reads `warnings` off a buffered result loses information silently: wire a logger (`rules/telemetry.md`), and read the field only as a bonus.
+The AI SDK reports dropped settings on every result, and so does Deuz — the READOUT differs by result family. Streaming results (`StreamChatResult`, `StreamObjectResult`) expose a `Promise<CallWarning[]>` that settles with `usage`, never rejects and resolves `[]` on a clean run; on `streamChat` the notices also ride `fullStream` as `warning` parts. Buffered results (`GenerateTextResult`, `GenerateObjectResult`) expose a plain `CallWarning[]` whose key is OMITTED when empty, so a port that expects `[]` must read `result.warnings ?? []`. Both loops thread one sink through every step, so a model-level notice raised inside a step reaches the outer result. One gap: the buffered loop's `activeTools` notices reach `deps.logger.warn` only — wire a logger during the port anyway (`rules/telemetry.md`), because the default one is a no-op.
 
 Two things that DID need a workaround when 1.9 first landed and no longer do — use them directly: **tool approval DENIAL** (`tool-state.denied` / `deniedReason` → `UIToolCall.denied`, set by the streaming loop; a thrown tool gains no denial fields) and **`sub-agent` parts in `useChat`** (`applyUIPart` folds them into `turn.subAgents`, exposed as `useChat().subAgents` — no hand-rolled `readDeuzStream` needed). See `rules/tools.md` and `rules/ui.md`.
 

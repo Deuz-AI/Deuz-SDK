@@ -96,11 +96,11 @@ Deuz-only members: `compaction`, `sub-agent`, `citation`, `cost`, `budget-exceed
 | `result.finishReason` | `result.finishReason` (`'stop' \| 'length' \| 'tool_calls' \| 'content_filter' \| 'error' \| 'aborted'`) |
 | `result.steps` | `result.steps` — **`undefined` on a single-turn call** (no `tools`) |
 | `result.finalStep` | `result.steps?.at(-1)` |
-| `result.warnings` | `result.warnings` — **`streamChat` only, see below** |
+| `result.warnings` | `result.warnings` — **two shapes, see below** |
 
-### `warnings` is a partial map
+### `warnings` maps in two shapes
 
-`streamChat().warnings` is real: `Promise<CallWarning[]>`, settles with `usage`, NEVER rejects (`[]` on a clean run), and each notice also arrives on `fullStream` as `{ type: 'warning', warning }` ahead of the model's own output.
+`streamChat().warnings` is a `Promise<CallWarning[]>`: settles with `usage`, NEVER rejects (`[]` on a clean run), and each notice also arrives on `fullStream` as `{ type: 'warning', warning }` ahead of that step's output. `streamObject` exposes the same promise shape without the parts.
 
 ```ts
 const result = streamChat({ model, prompt, temperature: 0.7 });
@@ -109,12 +109,13 @@ for (const w of (await result.warnings) ?? []) console.warn(w.type, w.setting, w
 
 `CallWarning` is `{ type: 'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other'; setting?: string; message: string }` — an OPEN union, so treat an unknown `type` as `'other'`. (`clamped-setting` has no producer yet.)
 
-Where it does NOT map:
+Where it differs from the AI SDK:
 
-- **`generateText`, `generateObject` and `streamObject` leave it `undefined`.** A port that reads `warnings` off a buffered result loses information silently.
-- **A `streamChat` with `tools` / `chat` / `memory` / `verifyStep` / `doneWhen`** runs the loop and reports only its own `activeTools` notices; a model-level warning (unknown slug, a stripped sampling param, a hosted tool dropped on Chat Completions, a dropped document) is raised inside the per-step pump and reaches the log only.
+- **`generateText` and `generateObject` return a plain `CallWarning[]`, and OMIT the key when empty.** A port that expects `[]` on a clean call gets `undefined` — read `result.warnings ?? []`. The information is not lost, only shaped differently.
+- **A loop-routed call reports its steps' notices too.** Both loops build one sink per run and thread it into every step, so an unknown slug, a stripped sampling param, a hosted tool the wire cannot carry or a dropped document all reach the outer result. Dedup is by `(type, setting, message)`, so a cause the loop re-derives every step is reported once.
+- **One gap:** the BUFFERED loop's `activeTools` notices are logged but not recorded, so a typo'd name never reaches `GenerateTextResult.warnings`. The streaming loop does record it.
 
-`deps.logger.warn` is still the complete channel, and the DEFAULT LOGGER IS A NO-OP. Wire one during the port:
+`deps.logger.warn` still sees everything, and the DEFAULT LOGGER IS A NO-OP. Wire one during the port:
 
 ```ts
 deps: {
