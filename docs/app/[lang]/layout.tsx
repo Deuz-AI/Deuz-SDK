@@ -3,7 +3,7 @@ import { i18nProvider } from 'fumadocs-ui/i18n';
 import { Banner } from 'fumadocs-ui/components/banner';
 import Link from 'next/link';
 import '../global.css';
-import { Inter } from 'next/font/google';
+import { Instrument_Serif, Inter } from 'next/font/google';
 import type { Metadata } from 'next';
 import { i18n, isLocale, type Locale } from '@/lib/i18n';
 import { translations } from '@/lib/translations';
@@ -14,6 +14,15 @@ const inter = Inter({
   subsets: ['latin', 'latin-ext', 'cyrillic', 'cyrillic-ext'],
   display: 'swap',
   variable: '--font-sans',
+});
+
+// Display face for the hero and section headings (Latin locales only — see global.css).
+const instrumentSerif = Instrument_Serif({
+  weight: '400',
+  style: ['normal', 'italic'],
+  subsets: ['latin', 'latin-ext'],
+  display: 'swap',
+  variable: '--font-instrument-serif',
 });
 
 const siteDescriptions: Record<Locale, string> = {
@@ -96,7 +105,11 @@ export default async function Layout({ params, children }: LayoutProps<'/[lang]'
   const banner = bannerCopy[locale];
 
   return (
-    <html lang={lang} className={`${inter.variable} ${inter.className}`} suppressHydrationWarning>
+    <html
+      lang={lang}
+      className={`${inter.variable} ${inter.className} ${instrumentSerif.variable}`}
+      suppressHydrationWarning
+    >
       <body className="flex min-h-screen flex-col">
         <RootProvider i18n={i18nProvider(translations, lang)}>
           <Banner id="deuz-sdk-2-0">
