@@ -17,7 +17,7 @@ const i18nMiddleware = createI18nMiddleware(i18n);
 
 // Routes that must never be locale-prefixed (route handlers + metadata).
 const SYSTEM_PATH =
-  /^\/(?:api|og|llms\.mdx|llms\.txt|llms-full\.txt|sitemap\.xml|robots\.txt|icon\.svg|favicon\.ico)(?:\/|$)/;
+  /^\/(?:api|og|mascot|llms\.mdx|llms\.txt|llms-full\.txt|sitemap\.xml|robots\.txt|icon\.svg|favicon\.ico)(?:\/|$)/;
 
 export default function proxy(request: NextRequest, ...rest: unknown[]) {
   const { pathname } = request.nextUrl;

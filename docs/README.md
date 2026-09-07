@@ -41,3 +41,12 @@ resources:
   features and API.
 - [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
 - [Fumadocs](https://fumadocs.dev) - learn about Fumadocs
+
+## Brand assets
+
+- `app/icon.svg` and `Logo()` in `lib/layout.shared.tsx` are the ring-and-dot mark.
+- The hero mascot is rendered in 3D from `public/mascot/deuz-mascot.glb`; the export
+  contract for Blender is in [`MASCOT-MODEL.md`](./MASCOT-MODEL.md). The PNG next to it
+  is the server-rendered fallback.
+- Provider marks on the home page come from `@lobehub/icons-static-svg`; run
+  `npm run logos:sync` to regenerate `lib/provider-logos.generated.ts` after bumping it.
