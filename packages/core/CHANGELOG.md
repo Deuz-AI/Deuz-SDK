@@ -1,5 +1,13 @@
 # @deuz-sdk/core
 
+## 2.1.0
+
+### Minor Changes
+
+- Add native typed agent runs with strict recovery, scoped tool context, validated output streams, and explicit verification verdicts. Add bounded swarm task graphs with reducers, durable event journals, and memory and SQLite stores.
+
+  Share mandatory execution policies and request reservations across nested agents and auxiliary model calls. Preserve signed child approvals, stop on strict persistence failures, and price each model invocation independently across handoffs and resume.
+
 ## 2.0.0
 
 ### Major Changes

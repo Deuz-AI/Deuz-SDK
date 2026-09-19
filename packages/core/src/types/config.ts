@@ -15,6 +15,7 @@ import type { Guardrails } from './guardrails';
 import type { ChatPersistOptions } from '../chat';
 import type { MemoryCallOptions } from '../memory';
 import type { ApprovalSigner } from '../durable';
+import type { NativeExecutionContext } from './execution';
 // TYPE-ONLY (see the note below on the registry import): `mcp/shared.ts` has a
 // real runtime body — the SDK wrapper — but `import type` is erased under
 // `verbatimModuleSyntax`, so `CommonCallOptions.mcp` accepting a live
@@ -291,6 +292,10 @@ export type {
  * too (full surface); adapters translate them to each wire in Faz 1.B.
  */
 export interface CommonCallOptions {
+  /** Shared native policy and accounting context, inherited across all model/tool calls. */
+  execution?: NativeExecutionContext;
+  /** Per-attempt admission estimates; provider-reported usage settles the reservation. */
+  executionEstimate?: { tokens?: number; usd?: number };
   model: LanguageModel;
   messages: Message[];
   /**

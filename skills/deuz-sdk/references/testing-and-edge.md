@@ -1,4 +1,4 @@
-<!-- verified: 2026-08-12 against @deuz-sdk/core@2.0.0 · api-contract sha256:209a805b7f32
+<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
      sources: packages/core/src/testing.ts, src/types/{config,deps,methods,stream,tool}.ts, src/internal/resolve-call.ts,
      src/core/resilience.ts, src/inference/tool-loop.ts, src/{openai,anthropic}.ts, tooling/check-runtime-compat.mjs,
      packages/core/test/{testing,tool-loop}.test.ts, docs/content/docs/advanced/edge.mdx,
@@ -24,7 +24,7 @@ Four rules before any code:
 | tool loops, `maxSteps`, `stopWhen`, approvals, agents, handoffs, guardrails | `createMockModel` | drives the REAL adapter + loop over synthesized OpenAI Chat Completions SSE, zero network |
 | what the SDK actually put on the wire (URL, headers, body), retries, HTTP error mapping | `mockFetch` / `mockFetchSequence` + `sseResponse` / `sseEvents` | you own the `Response` and every recorded request |
 | timeouts, retry backoff, generated ids | `deps.clock`, `deps.generateId` | core never calls an ambient timer or `crypto.randomUUID` |
-| cost stops, `budget.usd`, `cost` parts | `deps.priceProvider` | `costExceeds`/`budget.usd` are silently inert without one |
+| legacy cost stops, `budget.usd`, `cost` parts | `deps.priceProvider` | legacy `costExceeds`/`budget.usd` are inert without one; native bounded USD admission requires pricing or an explicit estimate |
 | warnings and degradations | `deps.logger` | the default logger is a **no-op**; `deps.logger.warn` is the complete channel |
 | embeddings, image/speech/video | factory `fetch` on that provider | `createMockModel` returns a `LanguageModel`; `embed` only accepts an `EmbeddingModel` |
 
@@ -196,7 +196,7 @@ export async function retriesA429ThenAssertsTheRequest(): Promise<void> {
 
 Client-mode approval = a tool with `needsApproval` and **no** `approveToolCall`. The loop breaks *before* executing anything in that batch: `generateText` returns `pendingApprovals: ToolApprovalRequest[]`, `streamChat` emits a `tool-approval-request` part per gated call and then `finish`. Resume by calling again with the pending assistant turn in the history plus `approvalResponses`.
 
-Sharp edges to pin in the test: a pending call with **no matching verdict is DENIED**, not left pending; unknown `approvalId`s are ignored (replay-safe); a denied call gets an `is_error` tool_result and the loop continues; under `approvalSigner` an approval must echo the request's `token` or it is denied.
+Legacy sharp edges to pin in the test (native resume keeps missing verdicts suspended; see `references/native-execution.md`): a pending call with **no matching verdict is DENIED**, not left pending; unknown `approvalId`s are ignored (replay-safe); a denied call gets an `is_error` tool_result and the loop continues; under `approvalSigner` an approval must echo the request's `token` or it is denied.
 
 ```ts
 import { generateText } from '@deuz-sdk/core';
@@ -300,7 +300,7 @@ export async function gradeSummaries(): Promise<number> {
 
 ### What "edge-safe" buys you
 
-The core touches only APIs that exist in every modern JS runtime: `fetch`, Web Streams, `TextEncoder`/`TextDecoder`, WebCrypto, timers, `atob`/`btoa`. There are no `node:*` imports, no `Buffer`, no `process` — including no `process.env`. Everything stateful is a `Dependencies` seam with a Web-API default: `deps.clock` instead of ambient `Date.now`/`setTimeout`, `deps.generateId` instead of `crypto.randomUUID`, `deps.logger` instead of `console`. The same build ships to Node 22+, Cloudflare Workers, Vercel Edge, Deno, Bun and the browser; every release bundles root, `/edge` and provider consumers with esbuild's browser platform and fails if the graph reaches a Node-only module.
+The core touches only APIs that exist in every modern JS runtime: `fetch`, Web Streams, `TextEncoder`/`TextDecoder`, WebCrypto, timers, `atob`/`btoa`. There are no `node:*` imports, no `Buffer`, no `process` — including no `process.env`. Everything stateful is a `Dependencies` seam with a Web-API default: `deps.clock` instead of ambient `Date.now`/`setTimeout`, `deps.generateId` instead of `crypto.randomUUID`, `deps.logger` instead of `console`. The same build ships to Node 22+, Cloudflare Workers, Vercel Edge, Deno, Bun and the browser; every release bundles root, `/edge`, provider, native `/agent` and `/swarm` consumers with esbuild's browser platform and fails if the graph reaches a Node-only module.
 
 Consequence you must design for: **you read the key, core never does.** Pass it to the factory (`createAnthropic({ apiKey })`), to `createClient({ apiKeys })`, or resolve it per call with `deps.keyProvider` (async and refreshing — the Vertex OAuth case).
 
@@ -308,11 +308,11 @@ Consequence you must design for: **you read the key, core never does.** Pass it 
 
 A curated re-export subset with a contractual promise: nothing Node-only can ever be in it, so a bundler failure is a build error rather than a 3 a.m. production throw. It carries `streamChat`, `generateText`, `generateObject`, `streamObject` (no `embed`/`embedMany`), `tool`, `agentTool`, `createAgent`, `handoff`, the stop conditions (`stepCountIs`, `hasToolCall`, `totalTokensExceed`, `costExceeds`), the request gate and chat engine (`validateChatRequest`, `parseDeuzChatRequest`, `uiFromMessages`, `applyUIPart`, `createInMemoryChatStore`, …), durable resume (`resumeFromCheckpoint`, `resumeStreamFromCheckpoint`, `resumeDeuzChatResponse`, `createInMemorySessionStore`, `createApprovalSigner`), observation (`createMemoryObserver`, `createCallbackObserver`, `composeObservers`, `filterObserver`, `summarizeRun`) and the OTel bridge, the guardrail built-ins (`promptInjectionGuardrail`, `maxOutputLength`), the hosted search tools, and every canonical type.
 
-Deliberately **not** on `/edge`, though each is itself edge-safe — import from its own subpath: the provider factories (`@deuz-sdk/core/anthropic`, …), `embed`/`embedMany` and the error subclasses (`RateLimitError`, `TimeoutError`, …) from the root, `toDeuzStreamResponse` and friends from `@deuz-sdk/core/ui`, plus `@deuz-sdk/core/pricing`, `@deuz-sdk/core/middleware`, `@deuz-sdk/core/rag`, `@deuz-sdk/core/memory`, `@deuz-sdk/core/skills`, `@deuz-sdk/core/mcp`, `@deuz-sdk/core/guardrails`, `@deuz-sdk/core/image`, `@deuz-sdk/core/speech`, `@deuz-sdk/core/transcription`, `@deuz-sdk/core/video`. The root entry is edge-safe too; `/edge` is the narrower locked promise.
+Deliberately **not** on `/edge`, though each is itself edge-safe — import from its own subpath: the provider factories (`@deuz-sdk/core/anthropic`, …), `embed`/`embedMany` and the error subclasses (`RateLimitError`, `TimeoutError`, …) from the root, `toDeuzStreamResponse` and friends from `@deuz-sdk/core/ui`, plus the native APIs on `@deuz-sdk/core/agent`, `@deuz-sdk/core/swarm`, `@deuz-sdk/core/pricing`, `@deuz-sdk/core/middleware`, `@deuz-sdk/core/rag`, `@deuz-sdk/core/memory`, `@deuz-sdk/core/skills`, `@deuz-sdk/core/mcp`, `@deuz-sdk/core/guardrails`, `@deuz-sdk/core/image`, `@deuz-sdk/core/speech`, `@deuz-sdk/core/transcription`, `@deuz-sdk/core/video`. The root entry is edge-safe too; `/edge` is the narrower locked promise.
 
 ### The complete list of Node-only subpaths
 
-These fifteen reach the filesystem, a child process, or a Node-only peer. Never import them from an edge runtime. Their `node:*` imports are **lazy**, so the module often imports fine and throws at the first call — a Worker bundle can build and fail in production (Cloudflare's bundler fails earlier when `nodejs_compat` is off). The two injected-client store packs still import a Node-only module path even when you hand them a client; the seams (`RedisClientLike`, `PgClientLike`) are plain objects, so an HTTP-driver-backed store reaches the edge only when the implementation lives in **your** module.
+These sixteen reach the filesystem, a child process, or a Node-only peer. Never import them from an edge runtime. Their `node:*` imports are **lazy**, so the module often imports fine and throws at the first call — a Worker bundle can build and fail in production (Cloudflare's bundler fails earlier when `nodejs_compat` is off). The two injected-client store packs still import a Node-only module path even when you hand them a client; the seams (`RedisClientLike`, `PgClientLike`) are plain objects, so an HTTP-driver-backed store reaches the edge only when the implementation lives in **your** module.
 
 | Node-only subpath | Needs | Edge-safe counterpart |
 | --- | --- | --- |
@@ -328,6 +328,7 @@ These fifteen reach the filesystem, a child process, or a Node-only peer. Never 
 | `@deuz-sdk/core/mcp/stdio` | child process + `@modelcontextprotocol/sdk` | `@deuz-sdk/core/mcp` (HTTP / SSE transport) |
 | `@deuz-sdk/core/mcp/node` | `node:fs` (0600 token file), `node:http` (loopback redirect) | `inMemoryTokenStore`, or your own `TokenStore` |
 | `@deuz-sdk/core/vertex/node` | Application Default Credentials | `createServiceAccountKeyProvider` (`@deuz-sdk/core/vertex`, edge-safe JWT signing) |
+| `@deuz-sdk/core/swarm/sqlite` | `node:sqlite` (or an injected database) | `createInMemorySwarmStore` or your own atomic `SwarmStore` |
 | `@deuz-sdk/core/stores/sqlite` | `node:sqlite` (or an injected `SqliteDatabaseLike`) | implement the four store seams yourself |
 | `@deuz-sdk/core/stores/redis` | `redis` peer (or an injected `RedisClientLike`) | implement `RedisClientLike` over an HTTP driver, in your own module |
 | `@deuz-sdk/core/stores/postgres` | `pg` peer (or an injected `PgClientLike`) | implement `PgClientLike` over an HTTP driver, in your own module |

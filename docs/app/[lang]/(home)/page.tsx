@@ -57,7 +57,7 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
         />
         <div className="mx-auto flex w-full max-w-5xl flex-col items-center px-4 pt-20 pb-16 text-center sm:pt-28">
           <Link
-            href={localePath(locale, '/docs/reference/whats-new-2-0')}
+            href={localePath(locale, '/docs/reference/whats-new-2-1')}
             className="mb-6 inline-flex max-w-full items-center gap-2 rounded-full border bg-fd-card px-3 py-1 text-sm text-fd-muted-foreground transition-colors hover:border-fd-primary/40 hover:text-fd-foreground"
           >
             <span className="inline-block size-2 shrink-0 rounded-full bg-fd-primary" />
@@ -81,7 +81,7 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
               <ArrowRight className="size-4" />
             </Link>
             <Link
-              href={localePath(locale, '/docs/reference/whats-new-2-0')}
+              href={localePath(locale, '/docs/reference/whats-new-2-1')}
               className="inline-flex items-center gap-2 rounded-lg border bg-fd-card px-5 py-2.5 font-medium transition-colors hover:bg-fd-accent"
             >
               {t.ctaWhatsNew}
@@ -100,10 +100,7 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
 
           <dl className="mt-14 grid w-full max-w-3xl grid-cols-2 gap-3 sm:grid-cols-4">
             {t.stats.map((stat) => (
-              <div
-                key={stat.label}
-                className="rounded-xl border bg-fd-card/80 px-3 py-4"
-              >
+              <div key={stat.label} className="rounded-xl border bg-fd-card/80 px-3 py-4">
                 <dt className="text-xs font-medium uppercase tracking-wider text-fd-muted-foreground">
                   {stat.label}
                 </dt>
@@ -269,21 +266,18 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
 
       <footer className="border-t">
         <div className="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-3 px-4 py-8 text-sm text-fd-muted-foreground">
-          <span>@deuz-sdk/core 2.0.0</span>
+          <span>@deuz-sdk/core 2.1.0</span>
           <nav className="flex flex-wrap gap-4">
             <Link href={localePath(locale, '/docs')} className="hover:text-fd-foreground">
               {t.footerDocs}
             </Link>
             <Link
-              href={localePath(locale, '/docs/reference/whats-new-2-0')}
+              href={localePath(locale, '/docs/reference/whats-new-2-1')}
               className="hover:text-fd-foreground"
             >
               {t.footerWhatsNew}
             </Link>
-            <Link
-              href={localePath(locale, '/docs/changelog')}
-              className="hover:text-fd-foreground"
-            >
+            <Link href={localePath(locale, '/docs/changelog')} className="hover:text-fd-foreground">
               {t.footerChangelog}
             </Link>
           </nav>

@@ -1,4 +1,4 @@
-<!-- verified: 2026-08-12 against @deuz-sdk/core@2.0.0 · api-contract sha256:209a805b7f32
+<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
      sources: packages/core/src/{autonomy,plan,verify,workspace,compute,browser,runtime}.ts,
      packages/core/src/node/{workspace,compute,browser,runtime}.ts, packages/core/src/inference/agent-tool.ts,
      packages/core/src/types/{config,workspace,compute,browser,runtime,stream,tool}.ts, docs/content/docs/modules/autonomy.mdx, docs/content/docs/cookbooks/{autonomous-agent,coding-agent}.mdx -->

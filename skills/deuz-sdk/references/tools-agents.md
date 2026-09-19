@@ -1,11 +1,11 @@
-<!-- verified: 2026-08-12 against @deuz-sdk/core@2.0.0 · api-contract sha256:209a805b7f32
+<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
      sources: packages/core/src/types/{tool,config,guardrails,stream,message,methods}.ts, packages/core/src/{tool,agent,server-tools}.ts,
      packages/core/src/inference/{agent-tool,handoff,stop,loop-shared}.ts, docs/content/docs/reference/whats-new-2-0.mdx,
      docs/content/docs/agents/{tools,tool-loop,create-agent,client-tools,server-tools,subagents,handoffs,guardrails}.mdx -->
 
 # Tools, loops, agents, handoffs and guardrails
 
-**Load when:** the model has to call your code — tool definitions, multi-step loops, stop conditions and budgets, human approval, reusable agents, sub-agents, triage handoffs, or run-level guardrails. This is the file that replaces LangGraph's `StateGraph` / `interrupt()` and the AI SDK's `ToolLoopAgent`.
+**Load when:** the model has to call your code — tool definitions, multi-step loops, stop conditions and budgets, human approval, reusable agents, sub-agents, triage handoffs, or run-level guardrails. These examples cover the existing loop API. For 2.1 native validated output, strict persistence, inherited execution policy and fixed-DAG swarm, read `references/native-execution.md`.
 
 ## The `Tool` shape
 
@@ -32,7 +32,7 @@ type ToolSet = Record<string, Tool>;
 | `type: 'provider'` | Provider-executed: never runs locally, never breaks the loop. Built by the three factories below. |
 | `outputSchema` / `timeoutMs` | Carried metadata only (never sent on chat wires, never validated — MCP populates it) / per-execution cap for **this** tool, overriding the call's `timeout.toolMs`. |
 
-The map **key** is the name the model calls — `Tool` carries no `name` field. `ToolExecuteContext` is `execute`'s second argument: `toolCallId`, an immutable `messages` snapshot, `signal` (forward it into your `fetch`), `runtimeContext`, plus the loop-populated sub-agent seam (`agentPath`, `deps`, `approveToolCall`, `session`, `emitPart`, `reportUsage`, `approvalResponses`).
+The map **key** is the name the model calls — `Tool` carries no `name` field. `ToolExecuteContext` is `execute`'s second argument: `toolCallId`, an immutable `messages` snapshot, `signal` (forward it into your `fetch`), `runtimeContext`, plus the loop-populated sub-agent seam (`agentPath`, `deps`, `approveToolCall`, `session`, `emitPart`, `reportUsage`, `approvalResponses`, `approvalSigner`, `approvalMaxAgeMs`, `execution`). Pass inherited `execution` into billable child calls.
 
 | Tool kind | Runs where | Shape | Loop effect |
 | --- | --- | --- | --- |
@@ -378,8 +378,8 @@ console.log(res.providerMetadata?.deuz?.stoppedBy, res.providerMetadata?.deuz?.g
 - **A tool-argument rewrite does not rewrite history.** The assistant turn and the `tool-call` part keep the arguments the *model* issued; only the gate and `execute` see the new ones. An **output** rewrite is the opposite — authoritative, so `response.messages`, `steps[]`, the checkpoint and the chat record all match what you were handed.
 - **Neither `stoppedBy` marker is an error,** and `finishReason` will not tell you (an input block reports `'stop'`). Every non-pass verdict emits one `guardrail` part (`{ hook, action, name?, reason?, toolCallId?, stepIndex? }`) and is collected on `providerMetadata.deuz.guardrails`; a rewrite carries no `reason`. Verdicts produced on a resume-leg settle carry no `stepIndex`.
 - **Names come from the function:** `const noSecrets: OutputGuardrail = …` reports `'noSecrets'`, but an anonymous array element reports nothing (and gives the model a vaguer message). Set one with `Object.defineProperty(fn, 'name', { value: 'myRule', configurable: true })` — a plain `fn.name = '…'` throws in strict mode. **Built-ins:** `promptInjectionGuardrail({ policy? })` prepends a spotlighting system turn built from `PROMPT_INJECTION_POLICY` (always a `rewrite`, so it always emits one part); `maxOutputLength(n, { mode?: 'truncate' | 'block' })` caps the final answer at `n` **characters** with a plain `slice`.
-- **Sub-agents do NOT inherit guardrails.** `agentTool` forwards `runtimeContext`, the approver and the abort signal, but not the hooks, and `AgentToolDef` has no `guardrails` field. Constrain a sub-agent from the inside: `needsApproval` on its tools, `stopWhen`, or an `execute` that reads `ctx.runtimeContext`. A **handoff** does keep them.
-- **`generateObject` / `streamObject` reject `guardrails`** (and `mcp`, `tools`, `maxSteps > 1`, `session`, …) with an `InvalidRequestError` before any network request. Run the loop with `generateText`, then structure its `text`.
+- **Sub-agents do NOT inherit guardrail callbacks.** `agentTool` forwards `runtimeContext`, approvals/signers, abort signals and the mandatory `execution` context, but not guardrail hooks. In 2.1 a child cannot loosen inherited execution allowlists, approval requirements, depth, deadline or budget. A **handoff** keeps the run's guardrails. See `references/native-execution.md` for the policy contract.
+- **`generateObject` / `streamObject` reject `guardrails`** (and `mcp`, `tools`, `maxSteps > 1`, `session`, …) with an `InvalidRequestError` before any network request. Use native `runAgent({ tools, guardrails, output })` for one validated run, or retain the existing `generateText` then `generateObject` composition.
 
 Guardrails wrap the **run**; `wrapModel(model, [...])` middleware wraps the **model** and therefore also covers compaction summaries and sub-agent side calls. Use middleware for an instruction that must ride on literally every request, guardrails for decisions that must be visible and able to stop the run.
 

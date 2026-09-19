@@ -114,7 +114,22 @@
     "core/edge/lazy are untouched by the 2.0 publication surface. The new barrel exports (handoff,",
     "the built-in guardrails, compactMessages on the root; handoff + guardrails on edge) tree-shake",
     "out of the measured export sets — verified by bundling the previous barrels side by side with",
-    "the new ones: core came back byte-identical."
+    "the new ones: core came back byte-identical.",
+    "",
+    "2.1.0 — OPTIONAL FEATURE ISOLATION, WITHOUT RAISING THE EAGER OR MCP LIMITS.",
+    "Native request admission, legacy optional usage pricing, and optional memory recall/extraction",
+    "load through narrow dynamic entries only when enabled. Native model/tool policy checks keep",
+    "the same implementation and fatal errors. Memory keeps its existing best-effort promises.",
+    "Source pipeline measurements: core eager 150490/46930, edge 138501/42946 raw/gzip bytes.",
+    "The optional roots measured native-request 2283/1077, usage-cost 1330/606 and memory-pipeline",
+    "10279/4309. Independent limits below carry approximately 10-13% headroom. The checker follows",
+    "each root's static dependency closure, excludes already-eager chunks, and counts shared lazy",
+    "dependencies against every owning feature. Unclassified lazy chunks fail. MCP retains its",
+    "existing 18500/7050 limit and can never borrow a new feature's allowance.",
+    "Native public surfaces also have explicit eager budgets: native-agent measured 175024/54470",
+    "and native-swarm 176912/55810 through the export sets below, with approximately 10% headroom.",
+    "Their native-request lazy roots are smaller (1396/745 and 1401/747) because policy definitions",
+    "are already eagerly required by these opt-in APIs; their own lazy cap is correspondingly lower."
   ],
   "bundles": {
     "core": {
@@ -123,7 +138,21 @@
       "maxRawBytes": 156500,
       "maxGzipBytes": 49200,
       "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050
+      "maxLazyGzipBytes": 7050,
+      "legacyLazyEntryPoint": "resolve",
+      "lazyFeatures": {
+        "native-request": {
+          "entryPoint": "native-request",
+          "maxRawBytes": 2550,
+          "maxGzipBytes": 1200
+        },
+        "usage-cost": { "entryPoint": "usage-cost", "maxRawBytes": 1500, "maxGzipBytes": 675 },
+        "memory-pipeline": {
+          "entryPoint": "memory-pipeline",
+          "maxRawBytes": 11350,
+          "maxGzipBytes": 4750
+        }
+      }
     },
     "edge": {
       "from": "@deuz-sdk/core/edge",
@@ -131,7 +160,77 @@
       "maxRawBytes": 143800,
       "maxGzipBytes": 45400,
       "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050
+      "maxLazyGzipBytes": 7050,
+      "legacyLazyEntryPoint": "resolve",
+      "lazyFeatures": {
+        "native-request": {
+          "entryPoint": "native-request",
+          "maxRawBytes": 2550,
+          "maxGzipBytes": 1200
+        },
+        "usage-cost": { "entryPoint": "usage-cost", "maxRawBytes": 1500, "maxGzipBytes": 675 },
+        "memory-pipeline": {
+          "entryPoint": "memory-pipeline",
+          "maxRawBytes": 11350,
+          "maxGzipBytes": 4750
+        }
+      }
+    },
+    "native-agent": {
+      "from": "@deuz-sdk/core/agent",
+      "exports": [
+        "runAgent",
+        "streamAgent",
+        "resumeAgent",
+        "resumeStreamAgent",
+        "createAgent",
+        "createInMemoryAgentRunStore",
+        "createExecutionContext",
+        "createBudgetLedger",
+        "BudgetLedgerError",
+        "ExecutionPolicyError",
+        "ExecutionPersistenceError"
+      ],
+      "maxRawBytes": 193000,
+      "maxGzipBytes": 60000,
+      "maxLazyRawBytes": 18500,
+      "maxLazyGzipBytes": 7050,
+      "legacyLazyEntryPoint": "resolve",
+      "lazyFeatures": {
+        "native-request": {
+          "entryPoint": "native-request",
+          "maxRawBytes": 1550,
+          "maxGzipBytes": 825
+        },
+        "usage-cost": { "entryPoint": "usage-cost", "maxRawBytes": 1500, "maxGzipBytes": 675 },
+        "memory-pipeline": {
+          "entryPoint": "memory-pipeline",
+          "maxRawBytes": 11350,
+          "maxGzipBytes": 4750
+        }
+      }
+    },
+    "native-swarm": {
+      "from": "@deuz-sdk/core/swarm",
+      "exports": ["createSwarm", "createInMemorySwarmStore", "SwarmConflictError"],
+      "maxRawBytes": 195000,
+      "maxGzipBytes": 61500,
+      "maxLazyRawBytes": 18500,
+      "maxLazyGzipBytes": 7050,
+      "legacyLazyEntryPoint": "resolve",
+      "lazyFeatures": {
+        "native-request": {
+          "entryPoint": "native-request",
+          "maxRawBytes": 1550,
+          "maxGzipBytes": 825
+        },
+        "usage-cost": { "entryPoint": "usage-cost", "maxRawBytes": 1500, "maxGzipBytes": 675 },
+        "memory-pipeline": {
+          "entryPoint": "memory-pipeline",
+          "maxRawBytes": 11350,
+          "maxGzipBytes": 4750
+        }
+      }
     },
     "chat": {
       "from": "@deuz-sdk/core/chat",

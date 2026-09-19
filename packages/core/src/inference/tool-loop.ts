@@ -84,12 +84,14 @@ import {
   type LoopOutcome,
 } from './loop-shared';
 import type { CompactionEvent } from './compaction';
+import type { UsageCostSnapshot } from '../internal/usage-cost';
 
 /**
  * Internal-only knobs (NOT public surface): `resumeFrom` seeds the cross-leg
  * step/usage counters when `resumeFromCheckpoint` re-drives the loop.
  */
 export interface ToolLoopInternal {
+  resumeCost?: UsageCostSnapshot;
   resumeFrom?: { stepIndex: number; usage: Usage };
   /**
    * Handoff (2.0): the checkpoint's active agent, re-applied before the first
@@ -126,6 +128,20 @@ export async function runToolLoop(
    */
   let ownTools: ToolSet = options.tools ?? {};
   const deps = resolveDependencies(options.deps);
+  const usageCost =
+    !options.execution && (deps.priceProvider || internal?.resumeCost)
+      ? (await import('../internal/usage-cost')).createUsageCostAccumulator({
+          priceProvider: deps.priceProvider,
+          snapshot: internal?.resumeCost,
+          unpricedBaseUsage:
+            !internal?.resumeCost && (internal?.resumeFrom?.usage.totalTokens ?? 0) > 0,
+        })
+      : undefined;
+  if (usageCost)
+    options = preserveClientContext(options, {
+      ...options,
+      onUsage: usageCost.wrap(options.onUsage ?? deps.onUsage),
+    });
   /**
    * The run's MCP connections (2.0), resolved inside the try below so a failure
    * still reports run.failed. Declared out here because the `finally` has to
@@ -152,6 +168,7 @@ export async function runToolLoop(
     if (stepTimeout?.expired()) throw stepTimeout.error;
   };
   const durable = setupDurable(options, deps, internal?.resumeFrom);
+  if (durable) durable.cost = usageCost;
   // Observation (1.6): the loop owns the run — inner runStream calls emit only
   // model.* events. `lo` is undefined without an observer (fast path).
   const lo = beginLoopObserve(deps, options, {
@@ -241,7 +258,15 @@ export async function runToolLoop(
     },
     // Durable seam (1.5): lets an agentTool checkpoint a child run and settle
     // its suspended approvals on a resume leg.
-    ...(durable ? { session: { store: durable.store, runId: durable.runId } } : {}),
+    ...(durable
+      ? {
+          session: {
+            store: durable.store,
+            runId: durable.runId,
+            durability: options.session?.durability,
+          },
+        }
+      : {}),
     ...(options.approvalResponses ? { approvalResponses: options.approvalResponses } : {}),
     ...(observeCtx ? { observe: observeCtx } : {}),
   };
@@ -351,6 +376,7 @@ export async function runToolLoop(
       ownTools = active.tools;
       tools = mergeMcpTools(mcp, ownTools);
       if (durable) durable.handoff = internal.resumeHandoff;
+      retargetCompaction(compactionRunner, options, deps, active.model);
     }
     let fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
     let staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
@@ -1017,9 +1043,10 @@ export async function runToolLoop(
         break;
       }
       const runUsage = durableUsage(durable, totalUsage);
-      const costUSD =
-        wantCost && deps.priceProvider
-          ? ((await deps.priceProvider.priceUsage(options.model.modelId, runUsage)) ?? undefined)
+      const costUSD = options.execution
+        ? options.execution.ledger.totals().committed.usd
+        : wantCost && usageCost
+          ? (await usageCost.flush()).costUsd
           : undefined;
       const stop = await shouldStop(stopConditions, steps, {
         usage: runUsage,

@@ -1,4 +1,4 @@
-<!-- verified: 2026-08-12 against @deuz-sdk/core@2.0.0 · api-contract sha256:209a805b7f32
+<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
      sources: docs/content/docs/modules/{observability,pricing,middleware}.mdx,
      docs/content/docs/reference/observe-events.mdx, docs/content/docs/advanced/resilience.mdx,
      skills/deuz-sdk/rules/pitfalls.md, packages/core/src/{observe,otel,pricing,middleware,errors}.ts,
@@ -11,6 +11,8 @@
 **Load when:** you need traces, run reports, OTel export, USD cost or budgets, model-level layers (logging, caching, PII redaction, injection guard), retries, timeouts, cross-provider failover, or a circuit breaker — i.e. anything you would have reached for LangSmith, Langfuse, `@ai-sdk/otel`, or a hand-rolled retry wrapper to get.
 
 Everything here is local-first and injected. There is no hosted service, no account, no data leaving your process, and core imports none of it — you wire it through the one `Dependencies` seam on `deps` (per call) or `createClient({ deps })` (per app). A per-call `deps` field overrides the client's.
+
+For native 2.1 inherited policy and cumulative pre-dispatch reservations, read `references/native-execution.md`. Its shared ledger persists unknown usage and fails bounded USD admission without pricing or an explicit estimate. The legacy stop conditions below retain their existing semantics.
 
 ## The ops seams on `Dependencies`
 

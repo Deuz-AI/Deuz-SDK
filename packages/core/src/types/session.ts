@@ -8,6 +8,7 @@
 import type { Message } from './message';
 import type { Usage } from './usage';
 import type { ToolApprovalRequest } from './tool';
+import type { UsageCostSnapshot } from '../internal/usage-cost';
 
 /**
  * Run state at a checkpoint boundary.
@@ -39,6 +40,8 @@ export interface AgentCheckpoint {
   messages: Message[];
   /** CUMULATIVE usage across the whole run (all legs), not just the current call. */
   usage: Usage;
+  /** Settled per-model charges; historical usage is never repriced on resume. */
+  cost?: UsageCostSnapshot;
   /** Set when `status` is 'suspended' on a client-mode approval break. */
   pendingApprovals?: ToolApprovalRequest[];
   /** Sub-agent path of the checkpointed loop (absent at the root). */
@@ -82,6 +85,8 @@ export interface SessionStore {
  */
 export interface DurableSessionOptions {
   store: SessionStore;
+  /** Native durable runs stop on a failed checkpoint; legacy calls default to best-effort. */
+  durability?: 'best-effort' | 'strict';
   /** Stable run identifier; default `deps.generateId()`. Reuse it to overwrite/continue a run. */
   runId?: string;
 }

@@ -67,6 +67,8 @@ export interface AdapterRequest {
 }
 
 export interface ParseContext {
+  /** Internal metering provenance: missing provider usage must not become a free native call. */
+  usageAvailable?: (available: boolean) => void;
   caps: ModelCapabilities;
   generateId: () => string;
   /** Actual provider id from the model descriptor (important for compat wires). */

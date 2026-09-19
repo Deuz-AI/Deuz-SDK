@@ -1,0 +1,239 @@
+---
+title: Native agents
+description: Typed agent results, strict native checkpoints, tool receipts, verification, and shared execution budgets in 2.1.
+---
+
+`runAgent` and `streamAgent` provide the optional native agent engine. Existing
+`generateText`, `streamChat`, and `createAgent` methods retain their existing
+contracts. Import the native functions from `@deuz-sdk/core/agent`.
+
+## A typed, validated result
+
+This complete example uses a deterministic model, so it needs no API key. A real
+provider model can replace `createMockModel` without changing the result contract.
+Raw JSON Schema requires a runtime validator. A Standard Schema value can provide
+its own validator.
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+type Answer = { answer: number };
+
+const result = await runAgent<Answer>({
+  model: createMockModel({ responses: [{ text: '{"answer":42}' }] }),
+  prompt: 'Return the answer as JSON.',
+  output: {
+    mode: 'json',
+    schema: {
+      type: 'object',
+      properties: { answer: { type: 'number' } },
+      required: ['answer'],
+      additionalProperties: false,
+    },
+    validate(value) {
+      if (value === null || typeof value !== 'object' ||
+          !('answer' in value) || typeof value.answer !== 'number') {
+        throw new Error('Expected a numeric answer');
+      }
+      return { answer: value.answer };
+    },
+  },
+  verify: ({ output }) => output.answer === 42
+    ? { status: 'verified' }
+    : { status: 'rejected', feedback: 'Recheck the calculation.' },
+  maxSteps: 5,
+  maxOutputAttempts: 2,
+  maxVerifyAttempts: 2,
+});
+
+if (result.status === 'completed') {
+  console.log(result.output.answer); // Typed as number.
+} else {
+  console.log(result.status);
+}
+```
+
+Only `completed` contains an accepted `output`. `suspended` exposes pending
+approvals and client calls; `stopped` exposes a reason; `failed` exposes a
+serializable error. Every result carries the run ID, messages, usage and model
+step count. `accounting` exposes the shared ledger's spent, reserved and unknown
+amounts. The result promise resolves to a `failed` result after a persistence
+failure; it never reports completion before the terminal write succeeds. That
+failure result may itself be unpersisted, so recover from the last committed envelope.
+
+With tools, native execution uses the existing tool loop and then a separate
+finalization request with application tools disabled. Without tools, structured
+output can begin directly in finalization. `maxSteps` covers the root tool-loop
+turns and finalization/repair turns; the execution ledger also accounts for
+auxiliary and descendant model requests. `maxOutputAttempts` bounds schema repair
+for each verifier candidate, and `maxVerifyAttempts` bounds verifier invocations.
+
+Verification has three outcomes: `verified` accepts, `rejected` requests another
+candidate within the attempt limit, and `inconclusive` stops without certifying
+the answer. Exceptions from the verifier are inconclusive. Schema validation and
+verification are distinct checks; a valid JSON shape does not prove the answer.
+
+## Streaming
+
+`streamAgent(options)` returns immediately. Accessing its `result`, iterating a
+stream, or calling `consume()` starts the run. Subscribe before execution if every
+event matters.
+
+```ts
+import { streamAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const stream = streamAgent({
+  model: createMockModel({ responses: [{ text: 'Hello' }] }),
+  prompt: 'Say hello.',
+});
+
+for await (const event of stream.events) {
+  if (event.type === 'result') console.log(event.result.status);
+}
+console.log((await stream.result).text);
+```
+
+`textStream`, `partialOutputStream` and `elementStream` are additional views.
+Partial output is an `unknown` draft, and array elements belong to an attempt;
+only a completed result validates the entire final value. Native agent streams
+are live streams. Use the [swarm journal](/docs/modules/swarm) for durable control
+events with sequence cursors.
+
+## Strict checkpoints and approval resume
+
+Native sessions use `AgentRunEnvelope` with `kind: 'deuz-agent-run'` and `version: 1`.
+They do not reuse a legacy `AgentCheckpoint` as the top-level envelope. An
+`AgentRunStore` implements `load(runId)` and `save(envelope)`. `save` must finish
+its durable write before resolving; a rejected write stops further execution.
+
+The following complete approval example uses a volatile store for demonstration.
+The tool returns a string and has no external effect. In an application, obtain
+approval verdicts from the authenticated user before calling `resumeAgent`.
+
+```ts
+import {
+  createInMemoryAgentRunStore,
+  runAgent,
+  resumeAgent,
+} from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const store = createInMemoryAgentRunStore();
+const options = {
+  model: createMockModel({ responses: [
+    { toolCalls: [{ toolName: 'publish', args: {} }] },
+    { text: 'Approved operation finished.' },
+  ] }),
+  prompt: 'Run the publish demonstration.',
+  bindingId: 'publish-demo-v1',
+  session: { store, runId: 'demo-1', scope: 'tenant-a' },
+  tools: {
+    publish: {
+      description: 'Demonstrate an approval gate.',
+      parameters: { type: 'object' as const, properties: {}, additionalProperties: false },
+      needsApproval: true,
+      execute: () => 'demo complete',
+    },
+  },
+};
+
+const first = await runAgent(options);
+if (first.status === 'suspended') {
+  const approvalResponses = first.pendingApprovals.map(request => ({
+    approvalId: request.approvalId,
+    approved: true, // Demonstration verdict; use the user's decision in production.
+    token: request.token,
+  }));
+  const resumed = await resumeAgent({ ...options, approvalResponses });
+  console.log(resumed.status);
+}
+```
+
+The in-memory store does not survive a process restart. Implement the native
+store against durable storage, or use the SQLite-backed swarm adapter to persist
+agent envelopes with their task state. Enforce tenant authorization at the
+application boundary; a caller-selected `scope` is an identity check, not an
+authentication mechanism. Native store run IDs must be unique within that store.
+
+Resume requires the original run ID and scope. Keep `bindingId` stable for the
+same implementation and bump it when tool or verifier semantics change. Stored
+model/tool/output schemas and persisted limits are checked on resume. Function
+bodies cannot be fingerprinted reliably: changing a validator, approval predicate,
+tool implementation or verifier requires a new `bindingId`. A
+completed native envelope returns its stored result without another model call.
+
+Resuming without all pending approval verdicts keeps the run suspended. An absent
+verdict is not a denial. Client-side tools likewise remain suspended until
+`clientToolResults` supplies every pending call ID; each entry has `toolCallId`,
+`output`, and an optional `isError`. Supplied results pass through the same approval,
+validation and model-projection path as server tools.
+
+Use one executor for a given native run. Concurrent starts or resumes through the
+same `AgentRunStore` object are rejected within one JavaScript process. The native
+store interface has no compare-and-swap or distributed lease: an application must
+serialize ownership across processes and across different wrappers for the same
+database. The in-process guard does not make a custom store transactional.
+
+Tool receipts distinguish `executing`, a known child-agent `suspended` state,
+`executed`, validation/projection failures, and completed projection. They are
+scoped to a root model turn plus the provider call ID, so an ID reused in a later
+turn does not retrieve an unrelated result. Raw results are committed before
+validation/projection; a projection can be retried without repeating the effect.
+An interrupted `executing` receipt cannot establish whether an external system
+accepted the effect. Resume returns `tool-reconciliation-required` until the
+application reconciles that effect and explicitly authorizes the relevant
+`retryToolCallIds`. Completed receipts can reuse their result. These receipts do
+not provide exactly-once execution across an external service and the local
+checkpoint transaction.
+
+## Tool context and supported options
+
+`toolsContext` supplies data by tool name. A tool can declare `contextSchema` and
+`validateContext`; its execute and approval callbacks receive the validated value
+as `ctx.context`. These values are not serialized into model requests. Scoped
+contexts expose the call ID, messages, signal, agent path and execution policy;
+they omit ambient dependencies, session internals and other tools' context.
+Scoped contexts on SDK delegation tools such as `agentTool` are rejected before
+execution: stripping their session and approval internals would break child-run
+guarantees. Keep these tools on their ordinary trusted context path.
+
+A native tool's `outputSchema` validates its raw result; raw JSON Schema requires
+`validateResult`. `toModelOutput` projects the validated result into model history,
+while receipts and `tool-output` events retain the raw result. Application code
+must decide which raw result fields belong in a user interface.
+
+Native options support the canonical tool-loop controls, including preparation,
+compaction, approval gates and guardrails. Loop hooks apply to the tool-loop phase;
+the finalization phase disables application tools and validates its own output.
+The native engine currently rejects `chat`, `memory`, `fallbackModels`, and the
+legacy completion hooks `verifyStep`, `doneWhen`, and `falseFinishGuard`. Use the
+existing generation/agent APIs when those options are needed. Legacy
+`generateObject`, `streamChat`, and `createAgent` behavior is unchanged.
+
+## Mandatory policy and shared budgets
+
+`createExecutionContext` binds model/tool allowlists, approval requirements,
+maximum depth, deadlines and shared token/USD accounting. Pass it through
+`execution`; descendants receive narrowed child contexts. Tool context validation
+and output validation are independent of policy. `toModelOutput` can project a
+validated tool result before it enters model history.
+
+Budget admission reserves an estimate before a potentially billable attempt.
+Known usage settles the reservation; uncertain outcomes and missing pricing keep
+amounts held as unknown. Accounting exposes spent, reserved, committed and unknown
+totals. A configured ceiling is enforced against the admitted estimates; it
+cannot guarantee a provider's eventual invoice stays below that ceiling when
+actual usage exceeds an estimate. Direct network calls made by application code
+also require application accounting.
+
+Native sessions persist reservations before dispatch, including when an existing
+execution context is supplied. The supplied context keeps the same shared ledger;
+native persistence is attached for the duration of the run. Verifier callbacks
+receive `execution` and `signal` and must pass them into any SDK model calls they make.
+
+Persist the execution ledger with the owning run. Restore its snapshot instead
+of resetting the budget after a restart. Child policies and budgets can tighten
+inherited constraints; they cannot loosen them. See [Swarm](/docs/modules/swarm)
+for a scheduler that persists the shared context for the entire DAG.

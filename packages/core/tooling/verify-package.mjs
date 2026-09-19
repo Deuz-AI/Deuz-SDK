@@ -15,20 +15,35 @@ function fail(message) {
 
 function parsePackReport(output) {
   const cleaned = output.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '').trim();
+  // npm 11 can key workspace reports by package name; older versions return an array.
+  const normalize = (value) => {
+    const reports = Array.isArray(value)
+      ? value
+      : value && typeof value === 'object'
+        ? Array.isArray(value.files)
+          ? [value]
+          : Object.values(value)
+        : [];
+    const report = reports.find(
+      (item) => item?.name === packageJson.name && Array.isArray(item.files),
+    );
+    if (!report) throw new Error(`npm pack report does not contain ${packageJson.name}`);
+    return report;
+  };
 
   try {
-    return JSON.parse(cleaned);
+    return normalize(JSON.parse(cleaned));
   } catch (initialError) {
-    const starts = [...cleaned.matchAll(/^\[/gm)].map((match) => match.index ?? 0).reverse();
+    const starts = [...cleaned.matchAll(/^[\[{]/gm)].map((match) => match.index ?? 0).reverse();
     for (const start of starts) {
+      const close = cleaned[start] === '[' ? ']' : '}';
       for (
-        let end = cleaned.lastIndexOf(']');
+        let end = cleaned.lastIndexOf(close);
         end > start;
-        end = cleaned.lastIndexOf(']', end - 1)
+        end = cleaned.lastIndexOf(close, end - 1)
       ) {
         try {
-          const report = JSON.parse(cleaned.slice(start, end + 1));
-          if (Array.isArray(report) && Array.isArray(report[0]?.files)) return report;
+          return normalize(JSON.parse(cleaned.slice(start, end + 1)));
         } catch {
           // Lifecycle output may surround npm's JSON report; keep looking for the report boundary.
         }
@@ -100,7 +115,7 @@ if (packed.status !== 0) {
 } else {
   try {
     const report = parsePackReport(packed.stdout);
-    const files = new Set((report[0]?.files ?? []).map((file) => file.path.replaceAll('\\', '/')));
+    const files = new Set(report.files.map((file) => file.path.replaceAll('\\', '/')));
     const forbidden = [...files].filter(
       (file) =>
         file.startsWith('src/') ||

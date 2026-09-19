@@ -1,0 +1,231 @@
+---
+title: Swarm
+description: A fixed DAG of native agents and reducers with bounded concurrency, transactional persistence and cursor events.
+---
+
+`createSwarm` executes a fixed directed acyclic graph of agent tasks and reducers.
+The scheduler persists a task's dispatch before starting its work and commits task
+results and control events atomically. Execution continues without an event
+subscriber.
+
+## Run a DAG in memory
+
+This complete example runs two independent native agents and then reduces their
+accepted outputs. It is deterministic and needs no API key.
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createSwarm, createInMemorySwarmStore } from '@deuz-sdk/core/swarm';
+
+const worker = createAgent({
+  model: createMockModel({ responses: [{ text: 'checked' }] }),
+  maxSteps: 4,
+});
+
+const swarm = createSwarm({
+  agents: { worker: { agent: worker, version: 'worker-v1' } },
+  reducers: {
+    summary: {
+      version: 'summary-v1',
+      execute(results) {
+        return Object.fromEntries(
+          Object.entries(results).map(([id, result]) => [id, result.output]),
+        );
+      },
+    },
+  },
+  store: createInMemorySwarmStore(),
+  concurrency: 2,
+  definitionVersion: 'review-v1',
+});
+
+const handle = await swarm.run({
+  scope: 'tenant-a',
+  runId: 'review-1',
+  tasks: [
+    { id: 'facts', agent: 'worker', prompt: 'Check the facts.' },
+    { id: 'math', agent: 'worker', prompt: 'Check the calculations.' },
+    { id: 'report', reducer: 'summary', dependsOn: ['facts', 'math'] },
+  ],
+});
+
+const outcome = await handle.result;
+console.log(outcome.run.status);
+console.log(outcome.tasks.find(task => task.task.id === 'report')?.result?.output);
+
+for await (const event of handle.events({ afterSequence: 0 })) {
+  console.log(event.sequence, event.type, event.taskId);
+}
+```
+
+`concurrency` limits live tasks, including reducers; it defaults to five. Logical
+task count and live concurrency are separate. Cycles, duplicate task IDs, missing
+dependencies and unknown bindings are rejected before the first run write. A
+dependency is usable only after its task completes. Failed branches block their
+descendants while independent branches can finish.
+
+Agent dependency prompts receive predecessor outputs as labelled data. They do
+not inherit the predecessors' conversation histories. Reducers receive a result
+map keyed by their direct dependencies and a context containing `scope`, `runId`,
+`taskId`, `signal` and a shared child `execution` context. Return a serializable
+value; plain JSON objects, arrays and `Uint8Array` are supported.
+
+## SQLite persistence and event cursors
+
+Import SQLite through `@deuz-sdk/core/swarm/sqlite`, a Node-only entry. It uses
+`node:sqlite` or an injected synchronous compatible database connection. Its schema
+version is independent of the existing store pack's `PRAGMA user_version`.
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createSwarm } from '@deuz-sdk/core/swarm';
+import { createSqliteSwarmStore } from '@deuz-sdk/core/swarm/sqlite';
+
+const store = createSqliteSwarmStore({ path: './swarm.sqlite' });
+const worker = createAgent({
+  model: createMockModel({ responses: [{ text: 'stored answer' }] }),
+});
+const swarm = createSwarm({
+  store,
+  agents: { worker: { agent: worker, version: 'worker-v1' } },
+  concurrency: 2,
+  definitionVersion: 'durable-demo-v1',
+});
+const key = { scope: 'tenant-a', runId: 'durable-demo' };
+
+try {
+  const existing = await swarm.get(key);
+  const handle = existing
+    ? await swarm.resume(key)
+    : await swarm.run({ ...key, tasks: [
+        { id: 'answer', agent: 'worker', prompt: 'Give the answer.' },
+      ] });
+
+  const readEvents = (async () => {
+    for await (const event of handle.events({ afterSequence: 0 })) {
+      console.log(event.sequence, event.type);
+      // Persist this sequence after your consumer processes the event.
+    }
+  })();
+  const result = await handle.result;
+  await readEvents;
+  console.log(result.tasks[0]?.result?.output);
+} finally {
+  await store.close();
+}
+```
+
+`swarm.get(key)` returns the persisted snapshot. `swarm.events(key, { afterSequence })`
+and `handle.events(...)` read the same durable, ordered journal. A cursor is
+exclusive: passing 25 starts after event 25. Consumers read bounded pages rather
+than accumulating an unbounded producer queue. An event iterator ends when the
+current execution settles, including suspension; open another iterator when the
+run resumes. Breaking iteration or aborting its signal does not cancel execution.
+
+The journal stores task/run control events, not every model token. Retrieve
+outputs from the snapshot. A disconnected consumer can replay control events from
+its last stored sequence.
+
+## Suspension, reconciliation and cancellation
+
+`handle.result` settles when the run completes, becomes partial, is cancelled, or
+has only suspended/reconciliation work remaining. Inspect each task's status;
+`partial` can include useful completed results. Approval requests live in a
+suspended task's `result.agentResult`.
+
+With the `swarm` created above, an authenticated application's approval handler can
+resume selected tasks as follows:
+
+```ts
+const snapshot = await swarm.get({ scope: 'tenant-a', runId: 'durable-demo' });
+const task = snapshot?.tasks.find(item => item.task.id === 'answer');
+const native = task?.result?.agentResult;
+
+if (native?.status === 'suspended') {
+  const handle = await swarm.resume({
+    scope: 'tenant-a',
+    runId: 'durable-demo',
+    approvals: {
+      answer: native.pendingApprovals.map(request => ({
+        approvalId: request.approvalId,
+        approved: false,
+        reason: 'The user declined this operation.',
+        token: request.token,
+      })),
+    },
+  });
+  console.log((await handle.result).run.status);
+}
+```
+
+Approval verdicts are scoped by task ID. Resuming a run without verdicts leaves
+approval tasks suspended. Task/run scopes separate persisted identities; the
+application must still authenticate callers and enforce tenant access.
+For client-executed tools, pass `clientToolResults` keyed by task ID; each value is
+an array of `{ toolCallId, output, isError? }` results for that task's pending calls.
+These results pass through native approval and validation handling.
+
+Completed tasks are reused on recovery. If an agent's terminal envelope committed
+before its task's final journal write, recovery can finish the task from that
+envelope without another model call. Otherwise an interrupted task defaults to
+`needs_reconciliation`. After checking its external effects, pass its ID in
+`retryTaskIds` to authorize another attempt. A task declared `replay: 'safe'`
+allows automatic task replay; use that declaration only for work your application
+knows is safe to repeat.
+
+Native tool receipts add a separate effect check. An uncertain `executing` tool
+receipt still requires reconciliation. Pass its call ID under
+`retryToolCallIds: { taskId: ['call-id'] }` together with that task in
+`retryTaskIds` after establishing that repeating the call is appropriate. Task
+replay permission alone does not silently authorize an uncertain tool effect.
+
+Call `await handle.cancel()` to persist cancellation and stop new dispatches.
+Pass a `signal` to `run` or `resume` for the same behavior. Active work receives an
+abort signal; cancellation waits for active effects to settle and preserves
+already-completed task results. Tools and reducers must cooperate with that
+signal; JavaScript cannot forcibly undo an external effect.
+
+## Policy, budgets and versioning
+
+Set `policy` and `budget` on `createSwarm` for the parent constraints. Agent and
+reducer bindings may supply narrower policies and budgets. Every child shares the
+run ledger, including descendants and auxiliary model calls that use the native
+execution context. The scheduler persists reservations before admission and
+retains unknown amounts across recovery. Restoring with weaker defaults cannot
+relax the saved parent limits. Admission uses estimates; it does not promise a
+hard ceiling on a provider's eventual bill.
+
+Use swarm/binding policy and budget fields for agent templates; a template with a
+pre-bound live `execution` context is rejected because the swarm cannot adopt its
+external persistence and accounting ownership. A template's ordinary `budget`
+also narrows its task's budget.
+
+Agent bindings also accept native `tools`, `toolsContext`, `output`, `verify`,
+`maxOutputAttempts` and `maxVerifyAttempts`. Binding tools replace the template's
+tool set when supplied. An inconclusive or exhausted rejected verification does
+not complete a task, so its dependents cannot consume an uncertified output.
+Templates with legacy completion hooks, `chat`, `memory` or `fallbackModels` are
+unsupported by the native runner; configure the binding's native verifier instead.
+
+Keep `definitionVersion` stable for a DAG implementation and each binding's
+`version` stable for its semantics. Their defaults are `'1'`; set explicit values
+for durable applications. Stored `bindingVersion` values are checked on resume.
+Bump versions when instructions, tools, output schemas, reducers or verifier
+semantics change incompatibly; an old run will then fail resume instead of
+silently adopting new behavior.
+
+## Operational boundary
+
+This release supports one executor for a run. The scheduler rejects overlapping
+executors using the same store object, and stores enforce revision checks.
+Multiple processes or independent SQLite connections must not concurrently drive
+the same run; there is no distributed lease or worker takeover protocol.
+
+The in-memory store is volatile. SQLite atomically commits task changes, run
+state and journal events, and fails closed on write errors or unsupported schema
+versions. These transactions do not include external APIs. Exactly-once external
+effects still require the service's idempotency mechanism or application
+reconciliation. A fixed DAG has no runtime task spawning, distributed workers, or
+cross-process cancellation service.

@@ -1,0 +1,192 @@
+---
+title: What is new in 2.1
+description: Optional native agents, validated results, durable swarm DAGs, shared execution policy and budgets, and the release's operational limits.
+---
+
+2.1 adds an optional native agent engine and a persistent swarm scheduler. Native
+agents return an explicit outcome, validate accepted outputs, checkpoint tool
+receipts, and share mandatory execution policy and budget accounting. Swarms run
+a fixed DAG of those agents and reducers with bounded concurrency and a durable
+control-event journal.
+
+The existing `generateText`, `streamChat`, `generateObject`, `streamObject` and
+`createAgent` APIs remain available. Adopting the native engine is an explicit
+choice, with its own result, checkpoint and event types.
+
+## Install and choose an entry
+
+```bash
+npm install @deuz-sdk/core@2.1.0
+```
+
+No new runtime package is needed for the native engine, in-memory swarm store or
+Node's built-in SQLite adapter. Schema conversion and integrations retain their
+existing optional-peer requirements; see [Installation](/docs/installation).
+
+| Entry                         | New surface                                                                                                              |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `@deuz-sdk/core/agent`        | `runAgent`, `streamAgent`, `resumeAgent`, `resumeStreamAgent`, native run stores, execution contexts and budget ledgers. |
+| `@deuz-sdk/core/swarm`        | `createSwarm`, `createInMemorySwarmStore`, and separate swarm state/event/store contracts.                               |
+| `@deuz-sdk/core/swarm/sqlite` | Node-only `createSqliteSwarmStore` for transactional task, result and event persistence.                                 |
+
+Native agent and swarm core imports are web-safe. SQLite requires `node:sqlite`
+or an injected compatible synchronous driver; keep that entry in Node code.
+Native request accounting, optional usage pricing and optional memory pipelines
+load only when their corresponding features are used. The new public entries
+and optional chunks have dedicated bundle-size checks.
+
+## Native agents with explicit outcomes
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const result = await runAgent({
+  model: createMockModel({ responses: [{ text: 'A completed answer.' }] }),
+  prompt: 'Give the answer.',
+  maxSteps: 4,
+});
+
+if (result.status === 'completed') {
+  console.log(result.output);
+} else if (result.status === 'suspended') {
+  console.log(result.pendingApprovals, result.pendingClientCalls);
+} else if (result.status === 'stopped') {
+  console.log(result.reason);
+} else {
+  console.log(result.error);
+}
+```
+
+The example is deterministic and requires no API key. Only `completed` carries
+an accepted `output`. Supplying `output` connects the tool loop to a separate
+finalization phase and runtime validation. Raw JSON Schema requires a validator;
+Standard Schema can provide one. A typed generic alone cannot certify a result.
+
+`streamAgent` exposes text, native events, partial output and array-element
+streams. Partial values are drafts associated with an attempt; the completed
+result validates the final value. Its events are separate from the existing
+`StreamPart` and Deuz UI wire contracts.
+
+The native verifier returns `verified`, `rejected` or `inconclusive`. Rejection
+can request another candidate within the persisted attempt limit. Inconclusive
+verification stops without certifying the output. A verifier exception does not
+turn an answer into verified success.
+
+Native tools also support per-tool validated context, raw-result validation and
+`toModelOutput`. Context is supplied by tool name and stays out of model requests;
+the projection controls what a validated tool result contributes to model history.
+See [Native agents](/docs/modules/native-agents) for complete typed, streaming and
+approval examples.
+
+## Strict persistence and effect recovery
+
+Native sessions use a separate `AgentRunEnvelope` with
+`kind: 'deuz-agent-run'` and `version: 1`. Store writes must commit before they
+resolve. Persistence failures stop execution; they do not allow the agent to
+continue with an unrecorded state. Existing legacy sessions retain their default
+best-effort behavior, with an optional `durability: 'strict'` setting.
+
+Approval and client-tool suspension survives a native checkpoint. Resume requires
+the same run identity and scope. Missing approval verdicts or client results keep
+the run suspended. A completed envelope returns its stored result without another
+model call.
+
+Tool receipts record the dispatch boundary and preserve raw results before
+validation and projection. A result projection can therefore be retried without
+repeating a recorded effect. An interrupted `executing` receipt remains uncertain:
+the application must reconcile the external effect before authorizing specific
+`retryToolCallIds`. A known child-agent suspension remains resumable rather than
+being treated as an unknown external effect.
+
+Keep native `bindingId` stable for the same tool and verifier implementation.
+Model/tool/output schema checks cannot fingerprint function bodies; change the
+binding identity when their semantics change.
+
+## Swarms: fixed DAGs with bounded live work
+
+`createSwarm` binds named agent and reducer implementations. Each task names a
+binding and optional dependencies. Invalid graphs are rejected before execution.
+Only completed dependency outputs are available to downstream tasks. Independent
+branches can finish when another branch fails; descendants of the failed branch
+are blocked.
+
+The scheduler separates logical task count from live concurrency. Reducers share
+the same concurrency bound and can combine direct dependency results. Agent
+tasks receive predecessor outputs as labelled data rather than inheriting their
+conversation histories.
+
+The in-memory and SQLite stores implement the same revision and atomic-commit
+contract. SQLite commits task changes, run state and control events together and
+uses its own schema version instead of changing the existing store pack's
+`PRAGMA user_version`.
+
+`handle.result` progresses without an event consumer. `handle.events()` and
+`swarm.events()` read a durable ordered journal with an exclusive `afterSequence`
+cursor. A disconnected consumer can replay those control events later; the
+journal does not store every model token.
+
+Completed tasks are reused on recovery. If an agent's terminal envelope committed
+before the task's final event, recovery can finish from that envelope. Other
+interrupted tasks default to `needs_reconciliation`; explicit `retryTaskIds`
+authorizes another attempt after reconciliation. `replay: 'safe'` is a caller's
+declaration that task replay is safe, and it does not bypass uncertain native
+tool receipts.
+
+Approvals, client results and reconciled tool IDs are keyed by task ID on swarm
+resume. Cancellation persists the request, stops new dispatch and propagates an
+abort signal to active work. See [Swarm](/docs/modules/swarm) for the complete DAG,
+SQLite, cursor, recovery and cancellation contracts.
+
+## Shared policy and accounting
+
+Execution contexts carry model/tool allowlists, approval requirements, maximum
+depth, deadlines and token/USD budgets. Child contexts narrow inherited policy
+and share their parent's ledger. The swarm persists that ledger with the run;
+native sessions persist reservations before dispatch.
+
+Potentially billable calls reserve estimates before admission. Provider-reported
+usage settles known amounts; uncertain outcomes and missing pricing retain held
+amounts as unknown. Restarting a run does not reset that accounting or loosen
+its saved parent limits. Verifiers making additional SDK calls must forward the
+execution context and signal they receive.
+
+The existing generation loops also improve USD accounting: actual invocation
+models are priced individually, and persisted cost survives resume. Switching
+models no longer reprices the whole accumulated run at the final model's rate.
+
+## Upgrading from 2.0
+
+- Keep existing generation and `createAgent` calls when their behavior fits the
+  application. Native APIs are opt-in and have distinct result/store types.
+- Use a separate native `AgentRunStore`; a legacy checkpoint is not a native run
+  envelope. In-memory stores remain volatile.
+- Native runs currently reject `chat`, `memory`, `fallbackModels` and legacy
+  completion hooks (`verifyStep`, `doneWhen`, `falseFinishGuard`). Use the existing
+  APIs for those options and native `verify` for native verification.
+- Native raw output schemas need runtime validators. Branch on the result status
+  before accessing accepted output.
+- Preserve `bindingId`, swarm `definitionVersion` and binding `version` for
+  compatible implementations. Version changes reject incompatible resume rather
+  than silently altering work already in progress.
+- Keep the existing UI wire for existing chat clients. Native agent events and
+  swarm journal events are separate contracts, not a replacement wire protocol.
+
+## Operational limits
+
+Use one executor per run. In-process guards reject overlapping execution through
+the same store object; separate processes or wrappers still need application
+ownership coordination. There is no distributed lease, worker takeover, runtime
+task spawning or cross-process cancellation service in this release.
+
+SQLite transactions do not include an external API. Receipts cannot promise
+exactly-once external effects; use service idempotency or reconciliation. Active
+tools and reducers must cooperate with cancellation. A scope identifies stored
+state but does not authenticate a tenant.
+
+Budget admission enforces limits against estimates and retained commitments. It
+cannot guarantee that a provider's final invoice stays within an estimate, and
+application network calls outside the SDK need their own accounting.
+
+Previous releases remain documented in [What is new in 2.0](/docs/reference/whats-new-2-0)
+and the [Changelog](/docs/changelog).

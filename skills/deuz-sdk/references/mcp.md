@@ -1,4 +1,4 @@
-<!-- verified: 2026-08-12 against @deuz-sdk/core@2.0.0 · api-contract sha256:209a805b7f32
+<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
      sources: packages/core/src/mcp/index.ts, packages/core/src/mcp/shared.ts, packages/core/src/mcp/resolve.ts,
      packages/core/src/mcp/auth.ts, packages/core/src/mcp/stdio.ts, packages/core/src/node/mcp.ts,
      packages/core/src/types/config.ts, packages/core/src/types/deps.ts, packages/core/src/errors.ts,

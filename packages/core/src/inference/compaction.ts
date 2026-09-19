@@ -24,6 +24,7 @@
  */
 import type { Message, Part } from '../types/message';
 import type { LanguageModel } from '../types/model';
+import { isFatalExecutionError } from '../internal/execution-error';
 
 export type CompactionLayer = 'prune-tool-results' | 'prune-reasoning' | 'summarize';
 
@@ -318,6 +319,7 @@ async function summarizeRun(
     };
     return [...messages.slice(0, start), summaryMessage, ...messages.slice(end)];
   } catch (err) {
+    if (isFatalExecutionError(err)) throw err;
     ctx.onSkip?.('summarize', err instanceof Error ? err.message : String(err));
     return messages;
   }
