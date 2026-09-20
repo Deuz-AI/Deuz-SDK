@@ -54,7 +54,7 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
         <div className="grid items-center gap-10 lg:grid-cols-[1.1fr_0.9fr] lg:gap-16">
           <div className="order-last flex min-w-0 flex-col items-start lg:order-first">
             <Link
-              href={localePath(locale, '/docs/reference/whats-new-2-0')}
+              href={localePath(locale, '/docs/reference/whats-new-2-1')}
               className={`mb-8 inline-flex max-w-full items-center gap-2 rounded-full border px-3 py-1 text-sm text-fd-muted-foreground transition-colors hover:border-fd-foreground hover:text-fd-foreground motion-reduce:transition-none ${focusRing}`}
             >
               <span className="inline-block size-2 shrink-0 rounded-full bg-fd-foreground" />
@@ -72,7 +72,7 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
                 <ArrowRight className="size-4" />
               </Link>
               <Link
-                href={localePath(locale, '/docs/reference/whats-new-2-0')}
+                href={localePath(locale, '/docs/reference/whats-new-2-1')}
                 className={secondaryButton}
               >
                 {t.ctaWhatsNew}
@@ -235,7 +235,7 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
 
       <footer className="border-t">
         <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-8 text-sm text-fd-muted-foreground">
-          <span>@deuz-sdk/core 2.0.0</span>
+          <span>@deuz-sdk/core 2.1.0</span>
           <nav className="flex flex-wrap gap-4">
             <Link
               href={localePath(locale, '/docs')}
@@ -244,7 +244,7 @@ export default async function HomePage(props: PageProps<'/[lang]'>) {
               {t.footerDocs}
             </Link>
             <Link
-              href={localePath(locale, '/docs/reference/whats-new-2-0')}
+              href={localePath(locale, '/docs/reference/whats-new-2-1')}
               className={`hover:text-fd-foreground ${focusRing}`}
             >
               {t.footerWhatsNew}

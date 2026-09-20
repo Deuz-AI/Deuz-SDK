@@ -19,6 +19,8 @@ export default defineConfig({
     compute: 'src/compute.ts',
     'compute/node': 'src/node/compute.ts',
     agent: 'src/agent.ts',
+    swarm: 'src/swarm.ts',
+    'swarm/sqlite': 'src/node/swarm-sqlite.ts',
     autonomy: 'src/autonomy.ts',
     runtime: 'src/runtime.ts',
     'runtime/node': 'src/node/runtime.ts',

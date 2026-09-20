@@ -95,6 +95,7 @@ import {
   type LoopOutcome,
 } from './loop-shared';
 import type { CompactionEvent } from './compaction';
+import type { UsageCostSnapshot } from '../internal/usage-cost';
 
 async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<string> {
   for await (const part of source) {
@@ -111,6 +112,11 @@ async function* projectText(source: AsyncIterable<StreamPart>): AsyncGenerator<s
  * `error` part, never a synchronous throw).
  */
 export interface StreamToolLoopInternal {
+  resumeCost?: UsageCostSnapshot;
+  /** Internal native-runner readout. Available after consume() completes. */
+  onSnapshot?: (snapshot: StreamToolLoopSnapshot) => void;
+  /** Captures the loop outcome in the same native transaction as its checkpoint. */
+  onCheckpoint?: (snapshot: StreamToolLoopSnapshot) => void;
   resumeFrom?: { stepIndex: number; usage: Usage };
   /**
    * Handoff (2.0): the checkpoint's active agent, re-applied before the first
@@ -120,6 +126,7 @@ export interface StreamToolLoopInternal {
    */
   resumeHandoff?: { to: string; count: number };
   resumeLoad?: (rt?: ObservationRuntime) => Promise<{
+    cost?: UsageCostSnapshot;
     messages: Message[];
     resumeFrom: { stepIndex: number; usage: Usage };
     /** Handoff (2.0): `AgentCheckpoint.handoff`, when the checkpoint carried one. */
@@ -131,6 +138,21 @@ export interface StreamToolLoopInternal {
   observeResume?: { stepId: string; stepIndex: number; checkpointAgeMs?: number };
   /** Observation (1.6): sub-agent — share the parent runtime, emit no run.* events. */
   observeInherited?: { runtime: ObservationRuntime; parentSpanId?: string };
+}
+
+export interface StreamToolLoopSnapshot {
+  messages: Message[];
+  steps: StepResult[];
+  usage: Usage;
+  cumulativeUsage: Usage;
+  finishReason: FinishReason;
+  endReason: LoopOutcome['endReason'];
+  stoppedBy?: string;
+  pendingApprovals: ToolApprovalRequest[];
+  pendingClientCalls: ToolCall[];
+  verified?: boolean;
+  error?: unknown;
+  handoff?: { to: string; count: number };
 }
 
 /**
@@ -261,6 +283,7 @@ export function runStreamToolLoop(
       else memoryDeferred.resolve([]);
     };
     let resumeFrom = internal?.resumeFrom;
+    let resumeCost = internal?.resumeCost;
     let resumeHandoff = internal?.resumeHandoff;
     let observeResume = internal?.observeResume;
     // Resume legs pre-create the ROOT runtime so the closure's
@@ -272,9 +295,21 @@ export function runStreamToolLoop(
         const loaded = await internal.resumeLoad(preRt);
         messages = loaded.messages;
         resumeFrom = loaded.resumeFrom;
+        resumeCost = loaded.cost;
         resumeHandoff = loaded.handoff ?? resumeHandoff;
         observeResume = loaded.observeResume ?? observeResume;
       } catch (err) {
+        internal.onSnapshot?.({
+          messages,
+          steps: [],
+          usage: EMPTY_USAGE,
+          cumulativeUsage: EMPTY_USAGE,
+          finishReason: 'error',
+          endReason: 'natural',
+          pendingApprovals: [],
+          pendingClientCalls: [],
+          error: err,
+        });
         broadcaster.push({ type: 'error', error: err });
         usageDeferred.reject(err);
         finishDeferred.reject(err);
@@ -304,6 +339,19 @@ export function runStreamToolLoop(
       internal?.resumeFrom !== undefined || internal?.resumeLoad !== undefined,
     );
     let chatMessages = chatPersistence.messages;
+    const usageCost =
+      !options.execution && (deps.priceProvider || resumeCost)
+        ? (await import('../internal/usage-cost')).createUsageCostAccumulator({
+            priceProvider: deps.priceProvider,
+            snapshot: resumeCost,
+            unpricedBaseUsage: !resumeCost && (resumeFrom?.usage.totalTokens ?? 0) > 0,
+          })
+        : undefined;
+    if (usageCost)
+      options = preserveClientContext(options, {
+        ...options,
+        onUsage: usageCost.wrap(options.onUsage ?? deps.onUsage),
+      });
     const durable: DurableRunner | undefined =
       options.session && runId !== undefined
         ? {
@@ -311,6 +359,7 @@ export function runStreamToolLoop(
             runId,
             baseUsage: resumeFrom?.usage ?? EMPTY_USAGE,
             stepIndex: resumeFrom?.stepIndex ?? 0,
+            cost: usageCost,
           }
         : undefined;
     // Observation (1.6): the loop owns the run — inner runStream calls emit
@@ -341,6 +390,9 @@ export function runStreamToolLoop(
     const errorCounters = new Map<string, number>();
     const compactionRunner = setupCompaction(options, deps);
     let totalUsage: Usage = EMPTY_USAGE;
+    let terminalError: unknown;
+    let snapshotApprovals: ToolApprovalRequest[] = [];
+    let snapshotClientCalls: ToolCall[] = [];
     let lastFinish: FinishReason = 'stop';
     let stoppedBy: string | undefined;
     let prevCostUsd = 0;
@@ -380,6 +432,22 @@ export function runStreamToolLoop(
      * consumer that only reads the finish metadata sees the identical list.
      */
     const handoffLog: HandoffLogEntry[] = [];
+    if (durable && internal?.onCheckpoint) {
+      durable.beforeSave = (checkpoint) =>
+        internal.onCheckpoint!({
+          messages: checkpoint.messages,
+          steps: [...steps],
+          usage: withTotal(totalUsage),
+          cumulativeUsage: checkpoint.usage,
+          finishReason: lastFinish,
+          endReason,
+          stoppedBy,
+          pendingApprovals: checkpoint.pendingApprovals ?? [],
+          pendingClientCalls: snapshotClientCalls,
+          verified,
+          ...(checkpoint.handoff ? { handoff: checkpoint.handoff } : {}),
+        });
+    }
 
     // Mutated per iteration so tool events parent under the current step span;
     // settle-phase executions run step-less under the run span.
@@ -439,6 +507,7 @@ export function runStreamToolLoop(
      * outer catch route through it so the two can never drift apart.
      */
     const failRun = async (error: unknown): Promise<void> => {
+      terminalError = error;
       broadcaster.push({ type: 'error', error });
       usageDeferred.reject(error);
       finishDeferred.reject(error);
@@ -467,7 +536,15 @@ export function runStreamToolLoop(
       // Live sink: an agentTool forwards its stream, already wrapped as sub-agent parts.
       emitPart: (part) => broadcaster.push(part),
       // Durable seam (1.5): child checkpoints + suspended-approval settlement.
-      ...(durable ? { session: { store: durable.store, runId: durable.runId } } : {}),
+      ...(durable
+        ? {
+            session: {
+              store: durable.store,
+              runId: durable.runId,
+              durability: options.session?.durability,
+            },
+          }
+        : {}),
       ...(options.approvalResponses ? { approvalResponses: options.approvalResponses } : {}),
       ...(observeCtx ? { observe: observeCtx } : {}),
     };
@@ -488,6 +565,7 @@ export function runStreamToolLoop(
     };
 
     const emitApprovalRequests = (requests: ToolApprovalRequest[]): void => {
+      snapshotApprovals = requests;
       for (const r of requests) {
         broadcaster.push({
           type: 'tool-approval-request',
@@ -553,6 +631,7 @@ export function runStreamToolLoop(
         ownTools = active.tools;
         tools = mergeMcpTools(mcp, ownTools);
         if (durable) durable.handoff = resumeHandoff;
+        retargetCompaction(compactionRunner, options, deps, active.model);
       }
       let fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
       let staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
@@ -643,7 +722,7 @@ export function runStreamToolLoop(
         }
       } catch (err) {
         if (!(err instanceof SubAgentSuspension)) throw err;
-        emitApprovalRequests(err.approvals);
+        if (options.session?.durability !== 'strict') emitApprovalRequests(err.approvals);
         if (durable) {
           await saveCheckpoint(
             durable,
@@ -655,6 +734,7 @@ export function runStreamToolLoop(
             err.approvals,
           );
         }
+        if (options.session?.durability === 'strict') emitApprovalRequests(err.approvals);
         suspend = {
           reason: 'sub-agent-approval',
           pendingApprovalCount: err.approvals.length,
@@ -730,17 +810,9 @@ export function runStreamToolLoop(
       // Cost continuity (1.7, D2): resume legs seed prevCostUsd with the prior
       // legs' cost so the first cost part's deltaUsd reports THIS step's
       // increment, not the whole run's cumulative.
-      if (deps.priceProvider && durable && withTotal(durable.baseUsage).totalTokens > 0) {
-        try {
-          const base = await deps.priceProvider.priceUsage(
-            options.model.modelId,
-            withTotal(durable.baseUsage),
-          );
-          if (typeof base === 'number') prevCostUsd = base;
-        } catch {
-          /* deltaUsd degrades to cumulative on this leg; costUsd stays correct */
-        }
-      }
+      if (options.execution) {
+        prevCostUsd = options.execution.ledger.totals(options.execution.scopeId).spent.usd;
+      } else if (usageCost) prevCostUsd = (await usageCost.flush()).pricedUsd;
 
       for (;;) {
         // Previous step overran its budget? Fail before starting another one.
@@ -966,15 +1038,19 @@ export function runStreamToolLoop(
         });
         // Live cumulative cost (1.7, D2): one part per step whenever a
         // priceProvider is injected — cross-leg cumulative on durable resumes.
-        if (deps.priceProvider) {
-          const costUsage = durableUsage(durable, totalUsage);
+        if (deps.priceProvider || options.execution) {
           try {
-            const costUsd = await deps.priceProvider.priceUsage(options.model.modelId, costUsage);
+            const accounting = options.execution?.ledger.totals(options.execution.scopeId);
+            const priced = await usageCost?.flush();
+            if (priced && priced.unknownCalls > 0)
+              deps.logger.warn('cost part skipped — per-call pricing unavailable');
+            const costUsd = accounting
+              ? accounting.unknownUsd === 0
+                ? accounting.spent.usd
+                : undefined
+              : priced?.costUsd;
             if (typeof costUsd === 'number') {
-              const savings = await deps.priceProvider.cacheSavings?.(
-                options.model.modelId,
-                costUsage,
-              );
+              const savings = priced?.cacheSavingsUsd;
               broadcaster.push({
                 type: 'cost',
                 costUsd,
@@ -1315,6 +1391,7 @@ export function runStreamToolLoop(
         // Client tools a guardrail BLOCKED are not pending on anyone (see
         // pendingClientCalls) — they fall through to `executeTools` instead.
         const clientCalls = pendingClientCalls(toolCalls, tools, guardedCalls.blocked);
+        snapshotClientCalls = clientCalls;
 
         // Pending approvals and client tools break together: ONE break, nothing
         // from the batch executes; the resume call settles the deferred rest.
@@ -1327,7 +1404,7 @@ export function runStreamToolLoop(
           );
           const handoffMessage = commitHandoffOnBreak();
           for (const c of pendingApproval) toolState(c.toolCallId, c.toolName, 'awaiting-approval');
-          emitApprovalRequests(requests);
+          if (options.session?.durability !== 'strict') emitApprovalRequests(requests);
           const sr = toStepResult(
             stepData,
             toolCalls,
@@ -1359,6 +1436,7 @@ export function runStreamToolLoop(
               requests,
             );
           }
+          if (options.session?.durability === 'strict') emitApprovalRequests(requests);
           suspend = {
             reason: pendingApproval.length > 0 ? 'approval' : 'client-tool',
             pendingApprovalCount: requests.length,
@@ -1391,7 +1469,7 @@ export function runStreamToolLoop(
           // the child. The transfer is not one of them: it never executes, so
           // its answer (and the swap) is committed here rather than deferred to
           // a leg that would find no producer for it.
-          emitApprovalRequests(err.approvals);
+          if (options.session?.durability !== 'strict') emitApprovalRequests(err.approvals);
           const handoffMessage = commitHandoffOnBreak();
           const sr = toStepResult(
             stepData,
@@ -1424,6 +1502,7 @@ export function runStreamToolLoop(
               err.approvals,
             );
           }
+          if (options.session?.durability === 'strict') emitApprovalRequests(err.approvals);
           suspend = {
             reason: 'sub-agent-approval',
             pendingApprovalCount: err.approvals.length,
@@ -1534,9 +1613,10 @@ export function runStreamToolLoop(
           break;
         }
         const runUsage = durableUsage(durable, totalUsage);
-        const costUSD =
-          wantCost && deps.priceProvider
-            ? ((await deps.priceProvider.priceUsage(options.model.modelId, runUsage)) ?? undefined)
+        const costUSD = options.execution
+          ? options.execution.ledger.totals().committed.usd
+          : wantCost && usageCost
+            ? (await usageCost.flush()).costUsd
             : undefined;
         const stop = await shouldStop(stopConditions, steps, {
           usage: runUsage,
@@ -1596,6 +1676,20 @@ export function runStreamToolLoop(
       // lands right after the same post-terminal bookkeeping (settleMemory /
       // persistChat) each of those paths already performed. Never throws.
       await closeMcp(mcp, deps);
+      internal?.onSnapshot?.({
+        messages,
+        steps,
+        usage: withTotal(totalUsage),
+        cumulativeUsage: withTotal(durableUsage(durable, totalUsage)),
+        finishReason: terminalError !== undefined ? 'error' : lastFinish,
+        endReason,
+        stoppedBy,
+        pendingApprovals: snapshotApprovals,
+        pendingClientCalls: snapshotClientCalls,
+        verified,
+        ...(terminalError !== undefined ? { error: terminalError } : {}),
+        ...(durable?.handoff ? { handoff: durable.handoff } : {}),
+      });
     }
   }
 

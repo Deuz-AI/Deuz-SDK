@@ -7,15 +7,16 @@
  * a pinned 2026 price table + a `PriceProvider` factory you can inject via
  * `deps.priceProvider`, but core never imports it and never bills automatically.
  *
- * Prices are USD per 1,000,000 tokens, sourced from public list prices
- * (verified 2026-07-02).
+ * Prices are USD per 1,000,000 tokens, sourced from public list prices.
+ * GPT-6 Astra, GPT-5.6, Claude Fable 5.1, and Claude Opus 5 rates were verified
+ * 2026-09-20; legacy rows retain their earlier price snapshots.
  * They WILL drift — verify against the provider's pricing page before you bill,
- * or pass your own table to `createPriceProvider(customTable)`.
+ * or pass your own table to `createPriceProvider({ table: customTable })`.
  *
  *   import { createPriceProvider } from '@deuz-sdk/core/pricing';
  *   const deuz = createClient({ deps: { priceProvider: createPriceProvider() } });
  *   // …or price a single Usage directly:
- *   const usd = priceUsage('gpt-5.2', usage);
+ *   const usd = priceUsage('gpt-5.6-sol', usage);
  */
 import type { Usage } from './types/usage';
 import type { PriceProvider } from './types/deps';
@@ -28,7 +29,7 @@ export interface ModelPrice {
   output: number;
   /** Cached-read input tokens. Default: 10% of `input` (Anthropic/OpenAI norm). */
   cachedRead?: number;
-  /** 5-minute cache-write tokens (Anthropic). Default: 1.25 × `input`. */
+  /** Cache-write tokens (5-minute TTL for Anthropic). Default: 1.25 × `input`. */
   cacheWrite?: number;
   /** 1-hour cache-write tokens (Anthropic). Default: 2 × `input`. */
   cacheWrite1h?: number;
@@ -36,6 +37,14 @@ export interface ModelPrice {
   audio?: number;
   /** Long-context tier applied when `inputTokens + cachedReadTokens > 200_000` (Gemini Pro). */
   over200k?: { input: number; output: number; cachedRead?: number };
+  /** Full-request tier above 272,000 prompt tokens, including both cache-write buckets. */
+  over272k?: {
+    input: number;
+    output: number;
+    cachedRead?: number;
+    cacheWrite?: number;
+    cacheWrite1h?: number;
+  };
 }
 
 export type PriceTable = Record<string, ModelPrice>;
@@ -46,7 +55,48 @@ export type PriceTable = Record<string, ModelPrice>;
  * point; override per deployment.
  */
 export const PRICES_2026: PriceTable = {
-  // ---- OpenAI (GPT-5 family) ----
+  // ---- OpenAI (GPT-6 / GPT-5.6; verified 2026-09-20) ----
+  // Standard rates: https://developers.openai.com/api/docs/pricing
+  // Above 272k prompt tokens, each model's full request uses 2x input/cache
+  // and 1.5x output rates: https://developers.openai.com/api/docs/models/gpt-6-astra
+  'gpt-6-astra': {
+    input: 10,
+    output: 50,
+    cachedRead: 1,
+    cacheWrite: 12.5,
+    over272k: { input: 20, output: 75, cachedRead: 2, cacheWrite: 25 },
+  },
+  'gpt-5.6-sol': {
+    input: 4,
+    output: 20,
+    cachedRead: 0.4,
+    cacheWrite: 5,
+    over272k: { input: 8, output: 30, cachedRead: 0.8, cacheWrite: 10 },
+  },
+  // GPT-5.6 is an alias for Sol; keep an exact entry ahead of legacy prefixes.
+  'gpt-5.6': {
+    input: 4,
+    output: 20,
+    cachedRead: 0.4,
+    cacheWrite: 5,
+    over272k: { input: 8, output: 30, cachedRead: 0.8, cacheWrite: 10 },
+  },
+  'gpt-5.6-terra': {
+    input: 2,
+    output: 12,
+    cachedRead: 0.2,
+    cacheWrite: 2.5,
+    over272k: { input: 4, output: 18, cachedRead: 0.4, cacheWrite: 5 },
+  },
+  'gpt-5.6-luna': {
+    input: 0.2,
+    output: 1.2,
+    cachedRead: 0.02,
+    cacheWrite: 0.25,
+    over272k: { input: 0.4, output: 1.8, cachedRead: 0.04, cacheWrite: 0.5 },
+  },
+
+  // ---- OpenAI (earlier GPT-5 family snapshots) ----
   'gpt-5.2': { input: 1.25, output: 10, cachedRead: 0.125 },
   'gpt-5.2-pro': { input: 15, output: 120, cachedRead: 1.5 },
   'gpt-5.2-codex': { input: 1.25, output: 10, cachedRead: 0.125 },
@@ -65,6 +115,16 @@ export const PRICES_2026: PriceTable = {
   'o4-mini': { input: 1.1, output: 4.4, cachedRead: 0.275 },
 
   // ---- Anthropic (Claude 5 + 4 families) ----
+  // These two rows verified 2026-09-20; standard pricing across the 1M context.
+  // https://platform.claude.com/docs/en/about-claude/pricing
+  'claude-fable-5-1': {
+    input: 10,
+    output: 50,
+    cachedRead: 0.25,
+    cacheWrite: 12.5,
+    cacheWrite1h: 20,
+  },
+  'claude-opus-5': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
   'claude-fable-5': { input: 10, output: 50, cachedRead: 1, cacheWrite: 12.5, cacheWrite1h: 20 },
   // Sonnet 5 intro pricing ($2/$10) runs through 2026-08-31; standard rates are
   // pinned so we never undercharge — nothing to flip on Sept 1.
@@ -168,6 +228,18 @@ function lookup(table: PriceTable, model: string): ModelPrice | undefined {
 
 const M = 1_000_000;
 
+/** Select the full-request rates once for both cost and cache-savings estimates. */
+function ratesForUsage(price: ModelPrice, usage: Usage): ModelPrice {
+  const promptTokens =
+    usage.inputTokens + usage.cachedReadTokens + usage.cacheWriteTokens + usage.cacheWrite1hTokens;
+  if (price.over272k && promptTokens > 272_000) return { ...price, ...price.over272k };
+  // Preserve the existing Gemini threshold, which counts fresh and cached reads.
+  if (price.over200k && usage.inputTokens + usage.cachedReadTokens > 200_000) {
+    return { ...price, ...price.over200k };
+  }
+  return price;
+}
+
 /**
  * Compute the USD cost of one `Usage` for `model` from a price table.
  * Returns `undefined` when the model is unknown (so callers can fall back).
@@ -182,9 +254,7 @@ export function priceUsage(
   const p = lookup(table, model);
   if (!p) return undefined;
 
-  // Long-context tier (Gemini Pro): different rates past 200k prompt tokens.
-  const longContext = p.over200k && usage.inputTokens + usage.cachedReadTokens > 200_000;
-  const rates = longContext ? { ...p, ...p.over200k } : p;
+  const rates = ratesForUsage(p, usage);
 
   const cachedRead = rates.cachedRead ?? rates.input * 0.1;
   const cacheWrite = rates.cacheWrite ?? rates.input * 1.25;
@@ -218,8 +288,7 @@ export function cacheSavings(
   const p = lookup(table, model);
   if (!p) return undefined;
   if (usage.cachedReadTokens <= 0) return 0;
-  const longContext = p.over200k && usage.inputTokens + usage.cachedReadTokens > 200_000;
-  const rates = longContext ? { ...p, ...p.over200k } : p;
+  const rates = ratesForUsage(p, usage);
   const cachedRead = rates.cachedRead ?? rates.input * 0.1;
   const saved = (usage.cachedReadTokens * (rates.input - cachedRead)) / M;
   return Math.max(0, Math.round(saved * 1e6) / 1e6);

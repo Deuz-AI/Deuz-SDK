@@ -6,6 +6,11 @@ icon: Download
 
 `@deuz-sdk/core` is a single package with **zero runtime dependencies**. Install it, and the chat core, the agentic tool loop, streaming, and the canonical UI wire are all available out of the box. Heavier or stateful capabilities (schema-typed objects, MCP, document parsing, real databases) pull in optional peers only when you actually use them.
 
+Version 2.1 also includes the optional [native agent engine](/docs/modules/native-agents)
+and [swarm scheduler](/docs/modules/swarm) in this package. Existing generation
+APIs remain available. See [What is new in 2.1](/docs/reference/whats-new-2-1) for
+upgrade notes and the native engine's supported options.
+
 ## Install
 
 ```bash title="npm"
@@ -28,22 +33,26 @@ bun add @deuz-sdk/core
 
 The core is **pure and web-first**: it touches only Web APIs (`fetch`, Web Streams, `TextDecoder`, WebCrypto, `atob`/`btoa`). Anything stateful or non-deterministic — HTTP, clock, logging, metering, circuit-breaker, API keys, id generation — is injected through a single `Dependencies` seam, with no-op/in-memory defaults applied for you. As a result the same build runs unchanged on any runtime that has `fetch` plus Web Streams.
 
-| Runtime | Core + tool loop | Node-only subpaths | Notes |
-| --- | --- | --- | --- |
-| **Node.js ≥ 22** | ✅ | ✅ | Enforced via `engines`. Native `fetch` + Web Streams. The reference runtime — every test runs here. |
-| **Deno** | ✅ | ⚠️ depends on its `node:` compat | Web APIs available by default. The `…/node` subpaths reach Node built-ins through a lazy `import('node:…')`, so they work exactly as far as Deno's compatibility layer does. Verify the one you need. |
-| **Bun** | ✅ | ⚠️ depends on its `node:` compat | Same reasoning as Deno. |
-| **Cloudflare Workers** | ✅ | ❌ | Import [`@deuz-sdk/core/edge`](#edge-safe-subset) for the guaranteed-safe subset. |
-| **Vercel Edge** | ✅ | ❌ | Same — use the `/edge` entry. |
-| **Browsers** | ✅ | ❌ | Works, but **never ship provider API keys to the client**. Put the model call on a server route and use the [UI wire](/docs/modules/ui-streaming) to reach the browser. |
+| Runtime                | Core + tool loop | Node-only subpaths               | Notes                                                                                                                                                                                                 |
+| ---------------------- | ---------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Node.js ≥ 22**       | ✅               | ✅                               | Enforced via `engines`. Native `fetch` + Web Streams. The reference runtime — every test runs here.                                                                                                   |
+| **Deno**               | ✅               | ⚠️ depends on its `node:` compat | Web APIs available by default. The `…/node` subpaths reach Node built-ins through a lazy `import('node:…')`, so they work exactly as far as Deno's compatibility layer does. Verify the one you need. |
+| **Bun**                | ✅               | ⚠️ depends on its `node:` compat | Same reasoning as Deno.                                                                                                                                                                               |
+| **Cloudflare Workers** | ✅               | ❌                               | Import [`@deuz-sdk/core/edge`](#edge-safe-subset) for the guaranteed-safe subset.                                                                                                                     |
+| **Vercel Edge**        | ✅               | ❌                               | Same — use the `/edge` entry.                                                                                                                                                                         |
+| **Browsers**           | ✅               | ❌                               | Works, but **never ship provider API keys to the client**. Put the model call on a server route and use the [UI wire](/docs/modules/ui-streaming) to reach the browser.                               |
 
-The browser guarantee is checked, not asserted: a release-gate step bundles the root entry, the `/edge` entry and the provider factories for `platform: 'browser'` and fails if a single `node:` builtin — or a Node-only module — makes it into the graph.
+The browser guarantee is checked, not asserted: a release-gate step bundles the root entry, the `/edge` entry, native agent/swarm entries and the provider factories for `platform: 'browser'` and fails if a single `node:` builtin — or a Node-only module — makes it into the graph.
 
 <Callout type="warn" title="Two version floors that are not `engines`">
-`@deuz-sdk/core/stores/sqlite` needs `node:sqlite`, which ships unflagged only from **Node 22.13 / 23.4**. On an older Node 22 the store throws an explicit "node:sqlite is unavailable" error on the first call rather than at import time — you can pass your own `better-sqlite3`-shaped handle instead. And running a `.ts` file directly with `node --experimental-strip-types` needs **Node 22.6+**; below that, use `tsx` or a build step.
+  `@deuz-sdk/core/stores/sqlite` and `@deuz-sdk/core/swarm/sqlite` need `node:sqlite`, which ships
+  unflagged only from **Node 22.13 / 23.4**, or an injected compatible synchronous database handle.
+  Opening is lazy; constructing a store does not load the built-in. And running a `.ts` file
+  directly with `node --experimental-strip-types` needs **Node 22.6+**; below that, use `tsx` or a
+  build step.
 </Callout>
 
-Node-only capabilities (filesystem skill sources, document parsers, the markdown memory vault, MCP stdio transport, file workspace, compute sandbox, Playwright browser, JSONL run store, the SQLite/Redis/Postgres store packs) live behind dedicated `…/node` subpaths and never leak `node:*` imports into the edge-safe core.
+Node-only capabilities (filesystem skill sources, document parsers, the markdown memory vault, MCP stdio transport, file workspace, compute sandbox, Playwright browser, JSONL run store, database store packs and swarm SQLite) live behind dedicated subpaths and never leak `node:*` imports into the edge-safe core.
 
 ## Optional peer dependencies
 
@@ -51,18 +60,18 @@ The package ships **nothing** in `dependencies`. The chat core, resilience, mete
 
 Install a peer only when you reach for the feature in its row. The last column is the part worth reading before you ship: **skipping a peer is never silent**, but the quality of the failure differs.
 
-| Peer | Needed for | If it is missing |
-| --- | --- | --- |
-| `zod` (or any [Standard Schema](https://standardschema.dev) lib) + `@standard-community/standard-json` | `generateObject` / `streamObject` / typed tool `parameters` with a schema object | Actionable throw: *"Converting it to JSON Schema needs the optional peer `@standard-community/standard-json` — install it, or pass a raw JSON Schema instead."* Raw JSON Schema needs neither peer. |
-| `@modelcontextprotocol/sdk` | [`/mcp`](/docs/modules/mcp), `/mcp/stdio`, `/mcp/node` | Actionable throw naming the package and the install command. Loaded lazily, so importing the module is fine — only connecting fails. |
-| `@opentelemetry/api` | [`/otel`](/docs/modules/observability) — `createOtelTracer` / `createOtelObserver` | Actionable throw naming the package, plus the escape hatch: `createOtelTracer({ tracer })` with a tracer you already have. |
-| `playwright` | [`/browser/node`](/docs/modules/autonomy#browser-control) | Actionable throw: *"requires the optional peer `playwright`. Install it with `npm i playwright && npx playwright install chromium`."* |
-| `redis` | [`/stores/redis`](/docs/modules/stores) via `createRedisStores({ url })` | Actionable throw, with the alternative spelled out: pass a client you connected yourself, `createRedisStores({ client })`. |
-| `pg` | [`/stores/postgres`](/docs/modules/stores) via `createPostgresStores({ connectionString })` | Actionable throw naming `pg`. Passing your own pool skips the peer. |
-| `unpdf` | PDF parsing in [`/rag/node`](/docs/modules/rag) | **Raw module-resolution error** (`ERR_MODULE_NOT_FOUND`) at first parse — the parsers import the peer directly, so the message is your runtime's, not ours. |
-| `mammoth` | DOCX parsing in `/rag/node` | Same — raw `ERR_MODULE_NOT_FOUND`. |
-| `xlsx` | XLSX parsing in `/rag/node` | Same — raw `ERR_MODULE_NOT_FOUND`. |
-| `react` | [`@deuz-sdk/core/react`](/docs/modules/react-hooks) (frozen legacy hooks) | You would not import it without React. Prefer the separate `@deuz-sdk/react` package for new work. |
+| Peer                                                                                                   | Needed for                                                                                  | If it is missing                                                                                                                                                                                    |
+| ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `zod` (or any [Standard Schema](https://standardschema.dev) lib) + `@standard-community/standard-json` | `generateObject` / `streamObject` / typed tool `parameters` with a schema object            | Actionable throw: _"Converting it to JSON Schema needs the optional peer `@standard-community/standard-json` — install it, or pass a raw JSON Schema instead."_ Raw JSON Schema needs neither peer. |
+| `@modelcontextprotocol/sdk`                                                                            | [`/mcp`](/docs/modules/mcp), `/mcp/stdio`, `/mcp/node`                                      | Actionable throw naming the package and the install command. Loaded lazily, so importing the module is fine — only connecting fails.                                                                |
+| `@opentelemetry/api`                                                                                   | [`/otel`](/docs/modules/observability) — `createOtelTracer` / `createOtelObserver`          | Actionable throw naming the package, plus the escape hatch: `createOtelTracer({ tracer })` with a tracer you already have.                                                                          |
+| `playwright`                                                                                           | [`/browser/node`](/docs/modules/autonomy#browser-control)                                   | Actionable throw: _"requires the optional peer `playwright`. Install it with `npm i playwright && npx playwright install chromium`."_                                                               |
+| `redis`                                                                                                | [`/stores/redis`](/docs/modules/stores) via `createRedisStores({ url })`                    | Actionable throw, with the alternative spelled out: pass a client you connected yourself, `createRedisStores({ client })`.                                                                          |
+| `pg`                                                                                                   | [`/stores/postgres`](/docs/modules/stores) via `createPostgresStores({ connectionString })` | Actionable throw naming `pg`. Passing your own pool skips the peer.                                                                                                                                 |
+| `unpdf`                                                                                                | PDF parsing in [`/rag/node`](/docs/modules/rag)                                             | **Raw module-resolution error** (`ERR_MODULE_NOT_FOUND`) at first parse — the parsers import the peer directly, so the message is your runtime's, not ours.                                         |
+| `mammoth`                                                                                              | DOCX parsing in `/rag/node`                                                                 | Same — raw `ERR_MODULE_NOT_FOUND`.                                                                                                                                                                  |
+| `xlsx`                                                                                                 | XLSX parsing in `/rag/node`                                                                 | Same — raw `ERR_MODULE_NOT_FOUND`.                                                                                                                                                                  |
+| `react`                                                                                                | [`@deuz-sdk/core/react`](/docs/modules/react-hooks) (frozen legacy hooks)                   | You would not import it without React. Prefer the separate `@deuz-sdk/react` package for new work.                                                                                                  |
 
 ```bash title="schema-typed generateObject"
 npm install zod @standard-community/standard-json
@@ -80,75 +89,77 @@ npm install unpdf mammoth xlsx
 npm install playwright && npx playwright install chromium
 ```
 
-The RAG core (MIME sniffing, chunkers, retrieve/rerank, BM25, RRF) is edge-safe and needs **no** peers; only the Node document parsers do. Likewise the store *seams* are dependency-free — only the concrete Redis/Postgres packs want a driver, and SQLite wants a Node built-in rather than a package.
+The RAG core (MIME sniffing, chunkers, retrieve/rerank, BM25, RRF) is edge-safe and needs **no** peers; only the Node document parsers do. Likewise the store _seams_ are dependency-free — only the concrete Redis/Postgres packs want a driver, and SQLite wants a Node built-in rather than a package.
 
 ## Subpath exports
 
-There are 52 deep subpaths plus the root. That is not API sprawl — it is the tree-shaking contract. Every subpath is a separate build artifact with its own `.d.ts`, so a Cloudflare Worker that imports `@deuz-sdk/core` and `@deuz-sdk/core/anthropic` never pulls in Playwright glue, a Postgres schema or a 7 KB HTML report template. Three rules cover almost every case:
+Capabilities use separate subpaths as part of the tree-shaking contract. Every subpath is a separate build artifact with its own `.d.ts`, so a Cloudflare Worker that imports `@deuz-sdk/core` and `@deuz-sdk/core/anthropic` never pulls in Playwright glue, a Postgres schema or a 7 KB HTML report template. Three rules cover almost every case:
 
 1. **Free functions and types come from the root.** `streamChat`, `generateText`, `generateObject`, `streamObject`, `embed`, `createClient`, the error classes, `tool()`, the stop conditions, and every canonical type.
 2. **One provider = one subpath.** Import only the factories you actually call.
-3. **A `…/node` suffix means Node built-ins.** If you are on an edge runtime and reaching for one, you want the seam (the plain subpath) plus your own implementation instead.
+3. **Node adapters use separate subpaths.** A `…/node` suffix is one marker; `/stores/sqlite` and `/swarm/sqlite` are also Node-only. On an edge runtime, use the web-safe seam plus your own implementation.
 
 ### Core surface
 
-| Import | Reach for it when |
-| --- | --- |
-| `@deuz-sdk/core` | Always. Free functions, `createClient`, the error taxonomy, stop conditions, `tool()`, `filePart`/`imagePart`, all types |
-| `@deuz-sdk/core/edge` | Your bundle must be provably free of Node APIs — see [below](#edge-safe-subset) |
-| `@deuz-sdk/core/agent` | You want a reusable agent as a frozen value: `createAgent` (1.9) |
-| `@deuz-sdk/core/testing` | You are writing tests: `createMockModel`, `runEval`, golden-replay SSE fixtures |
-| `@deuz-sdk/core/middleware` | You need `wrapModel` + `logging` / `simpleCache` / `redactPII` / `promptInjectionGuard` / `withFallback` |
-| `@deuz-sdk/core/guardrails` | You want the ready-made `promptInjectionGuardrail` / `maxOutputLength` (2.0) |
-| `@deuz-sdk/core/pricing` | You want token → USD: the 2026 cost table + `createPriceProvider` |
+| Import                        | Reach for it when                                                                                                          |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `@deuz-sdk/core`              | Always. Free functions, `createClient`, the error taxonomy, stop conditions, `tool()`, `filePart`/`imagePart`, all types   |
+| `@deuz-sdk/core/edge`         | Your bundle must be provably free of Node APIs — see [below](#edge-safe-subset)                                            |
+| `@deuz-sdk/core/agent`        | Reusable `createAgent` values, plus native `runAgent` / `streamAgent`, resume, execution contexts and shared budgets (2.1) |
+| `@deuz-sdk/core/swarm`        | Native agent/reducer DAGs with bounded concurrency, an in-memory store and durable cursor-event contracts (2.1)            |
+| `@deuz-sdk/core/swarm/sqlite` | Node-only transactional swarm persistence through `createSqliteSwarmStore` (2.1)                                           |
+| `@deuz-sdk/core/testing`      | You are writing tests: `createMockModel`, `runEval`, golden-replay SSE fixtures                                            |
+| `@deuz-sdk/core/middleware`   | You need `wrapModel` + `logging` / `simpleCache` / `redactPII` / `promptInjectionGuard` / `withFallback`                   |
+| `@deuz-sdk/core/guardrails`   | You want the ready-made `promptInjectionGuardrail` / `maxOutputLength` (2.0)                                               |
+| `@deuz-sdk/core/pricing`      | You want token → USD: the 2026 cost table + `createPriceProvider`                                                          |
 
 ### Providers
 
-| Import | Reach for it when |
-| --- | --- |
-| `@deuz-sdk/core/anthropic` | Claude via the Messages API (`createAnthropic`) |
-| `@deuz-sdk/core/openai` | OpenAI Chat Completions + Responses (`createOpenAI`, `createOpenAIResponses`) + `openaiEmbedding` |
-| `@deuz-sdk/core/xai` | xAI Grok (`createXai`) |
-| `@deuz-sdk/core/google` | Gemini — compat (`createGoogle`), native `generateContent` (`createGoogleNative`), `googleEmbedding` |
-| `@deuz-sdk/core/google/extras` | Gemini explicit caching + Files API (`createGeminiCache`, `uploadFile`) |
-| `@deuz-sdk/core/vertex` | Claude or Gemini on Vertex AI with OAuth2 Bearer auth |
-| `@deuz-sdk/core/vertex/node` | Application Default Credentials for Vertex (`createAdcKeyProvider`) — the one documented env-var/filesystem exception in the package |
-| `@deuz-sdk/core/azure` | Azure OpenAI / Foundry (`createAzure`) — deployment URL, `api-key` or Entra |
-| `@deuz-sdk/core/bedrock` | Amazon Bedrock Mantle (`createBedrock`) — Bearer API key, no SigV4 SDK |
-| `@deuz-sdk/core/voyage` | Voyage AI embeddings (`createVoyage`) |
-| `@deuz-sdk/core/yunwu` | The Yunwu unified relay + the 2026 `YUNWU_MODELS` catalog |
-| `@deuz-sdk/core/providers` | Any OpenAI-shaped host: 19 named factories, the keyless Ollama / LM Studio, `createOpenAICompatible` for anything unlisted, and `createProviderRegistry` |
+| Import                         | Reach for it when                                                                                                                                        |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@deuz-sdk/core/anthropic`     | Claude via the Messages API (`createAnthropic`)                                                                                                          |
+| `@deuz-sdk/core/openai`        | OpenAI Chat Completions + Responses (`createOpenAI`, `createOpenAIResponses`) + `openaiEmbedding`                                                        |
+| `@deuz-sdk/core/xai`           | xAI Grok (`createXai`)                                                                                                                                   |
+| `@deuz-sdk/core/google`        | Gemini — compat (`createGoogle`), native `generateContent` (`createGoogleNative`), `googleEmbedding`                                                     |
+| `@deuz-sdk/core/google/extras` | Gemini explicit caching + Files API (`createGeminiCache`, `uploadFile`)                                                                                  |
+| `@deuz-sdk/core/vertex`        | Claude or Gemini on Vertex AI with OAuth2 Bearer auth                                                                                                    |
+| `@deuz-sdk/core/vertex/node`   | Application Default Credentials for Vertex (`createAdcKeyProvider`) — the one documented env-var/filesystem exception in the package                     |
+| `@deuz-sdk/core/azure`         | Azure OpenAI / Foundry (`createAzure`) — deployment URL, `api-key` or Entra                                                                              |
+| `@deuz-sdk/core/bedrock`       | Amazon Bedrock Mantle (`createBedrock`) — Bearer API key, no SigV4 SDK                                                                                   |
+| `@deuz-sdk/core/voyage`        | Voyage AI embeddings (`createVoyage`)                                                                                                                    |
+| `@deuz-sdk/core/yunwu`         | The Yunwu unified relay + the 2026 `YUNWU_MODELS` catalog                                                                                                |
+| `@deuz-sdk/core/providers`     | Any OpenAI-shaped host: 19 named factories, the keyless Ollama / LM Studio, `createOpenAICompatible` for anything unlisted, and `createProviderRegistry` |
 
 ### Agents and long-running work
 
-| Import | Reach for it when |
-| --- | --- |
-| `@deuz-sdk/core/mcp` | MCP over HTTP/SSE, edge-safe (`createMcpClient`) |
-| `@deuz-sdk/core/mcp/stdio` | MCP over stdio — a local process (Node only) |
-| `@deuz-sdk/core/mcp/node` | MCP OAuth on Node: `createFileTokenStore`, `createLoopbackRedirect` (2.0) |
-| `@deuz-sdk/core/durable` | Runs must survive a process restart: checkpoint/resume, signed approvals |
-| `@deuz-sdk/core/autonomy` | Planner → executor → verifier: `planTasks`, `bestOfN`, `selfConsistency`, `parallelAgents` |
-| `@deuz-sdk/core/runtime` | Background runs with a live plan/activity feed + steering (`RunStore`, `createRunManager`) |
-| `@deuz-sdk/core/runtime/node` | The JSONL run store + `pollStaleRuns` |
-| `@deuz-sdk/core/workspace` · `/workspace/node` | Path-addressed external memory; the Node half is a sandboxed directory |
-| `@deuz-sdk/core/compute` · `/compute/node` | CodeAct / shell tools; the Node half is a `child_process` reference sandbox |
-| `@deuz-sdk/core/browser` · `/browser/node` | Browser control seam; the Node half is the Playwright adapter |
-| `@deuz-sdk/core/skills` · `/skills/node` | `SKILL.md` progressive disclosure; the Node half reads them off disk |
+| Import                                         | Reach for it when                                                                          |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `@deuz-sdk/core/mcp`                           | MCP over HTTP/SSE, edge-safe (`createMcpClient`)                                           |
+| `@deuz-sdk/core/mcp/stdio`                     | MCP over stdio — a local process (Node only)                                               |
+| `@deuz-sdk/core/mcp/node`                      | MCP OAuth on Node: `createFileTokenStore`, `createLoopbackRedirect` (2.0)                  |
+| `@deuz-sdk/core/durable`                       | Runs must survive a process restart: checkpoint/resume, signed approvals                   |
+| `@deuz-sdk/core/autonomy`                      | Planner → executor → verifier: `planTasks`, `bestOfN`, `selfConsistency`, `parallelAgents` |
+| `@deuz-sdk/core/runtime`                       | Background runs with a live plan/activity feed + steering (`RunStore`, `createRunManager`) |
+| `@deuz-sdk/core/runtime/node`                  | The JSONL run store + `pollStaleRuns`                                                      |
+| `@deuz-sdk/core/workspace` · `/workspace/node` | Path-addressed external memory; the Node half is a sandboxed directory                     |
+| `@deuz-sdk/core/compute` · `/compute/node`     | CodeAct / shell tools; the Node half is a `child_process` reference sandbox                |
+| `@deuz-sdk/core/browser` · `/browser/node`     | Browser control seam; the Node half is the Playwright adapter                              |
+| `@deuz-sdk/core/skills` · `/skills/node`       | `SKILL.md` progressive disclosure; the Node half reads them off disk                       |
 
 ### State, retrieval and media
 
-| Import | Reach for it when |
-| --- | --- |
-| `@deuz-sdk/core/chat` · `/chat/node` | Framework-neutral chat state/reducers + the `ChatStore` seam; the Node half is a JSONL store |
-| `@deuz-sdk/core/memory` · `/memory/markdown` | mem0-style extract/reconcile/recall; the markdown half is an Obsidian-style vault |
-| `@deuz-sdk/core/rag` · `/rag/node` | MIME sniff, chunkers, BM25 + RRF hybrid retrieval; the Node half adds PDF/DOCX/XLSX |
-| `@deuz-sdk/core/stores/sqlite` · `/stores/redis` · `/stores/postgres` | You want memory / chats / sessions / runs in a real database instead of memory (2.0) |
-| `@deuz-sdk/core/ui` | The versioned Deuz UI wire: `toDeuzStreamResponse` (server) + `readDeuzStream` (client) |
-| `@deuz-sdk/core/react` | Frozen legacy React hooks — prefer `@deuz-sdk/react` for new work |
-| `@deuz-sdk/core/observe` · `/observe/node` | Local observers, run summaries; the Node half is a bounded JSONL sink |
-| `@deuz-sdk/core/otel` | You already run OpenTelemetry and want spans + events to land there |
-| `@deuz-sdk/core/image` · `/midjourney` | Synchronous OpenAI-compatible image generation; Midjourney's async submit/poll/action |
-| `@deuz-sdk/core/speech` · `/transcription` · `/video` | Text-to-speech, speech-to-text, async video jobs (2.0) |
+| Import                                                                | Reach for it when                                                                            |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `@deuz-sdk/core/chat` · `/chat/node`                                  | Framework-neutral chat state/reducers + the `ChatStore` seam; the Node half is a JSONL store |
+| `@deuz-sdk/core/memory` · `/memory/markdown`                          | mem0-style extract/reconcile/recall; the markdown half is an Obsidian-style vault            |
+| `@deuz-sdk/core/rag` · `/rag/node`                                    | MIME sniff, chunkers, BM25 + RRF hybrid retrieval; the Node half adds PDF/DOCX/XLSX          |
+| `@deuz-sdk/core/stores/sqlite` · `/stores/redis` · `/stores/postgres` | You want memory / chats / sessions / runs in a real database instead of memory (2.0)         |
+| `@deuz-sdk/core/ui`                                                   | The versioned Deuz UI wire: `toDeuzStreamResponse` (server) + `readDeuzStream` (client)      |
+| `@deuz-sdk/core/react`                                                | Frozen legacy React hooks — prefer `@deuz-sdk/react` for new work                            |
+| `@deuz-sdk/core/observe` · `/observe/node`                            | Local observers, run summaries; the Node half is a bounded JSONL sink                        |
+| `@deuz-sdk/core/otel`                                                 | You already run OpenTelemetry and want spans + events to land there                          |
+| `@deuz-sdk/core/image` · `/midjourney`                                | Synchronous OpenAI-compatible image generation; Midjourney's async submit/poll/action        |
+| `@deuz-sdk/core/speech` · `/transcription` · `/video`                 | Text-to-speech, speech-to-text, async video jobs (2.0)                                       |
 
 ## Verify it works
 
@@ -175,7 +186,9 @@ console.log(`\n${usage.inputTokens} in / ${usage.outputTokens} out`);
 `res.textStream` is an `AsyncIterable<string>` and `res.usage` is a `Promise<Usage>` — both are explained in [streamChat](/docs/core/stream-chat).
 
 <Callout title="Nothing printed and no error?">
-That is the lazy pump doing its job. `streamChat` sends no request until something reads an output. If you return the result without iterating it — or `await` nothing — the call is a no-op. See [`consume()`](/docs/core/stream-chat#consume).
+  That is the lazy pump doing its job. `streamChat` sends no request until something reads an
+  output. If you return the result without iterating it — or `await` nothing — the call is a no-op.
+  See [`consume()`](/docs/core/stream-chat#consume).
 </Callout>
 
 ## Edge-safe subset
@@ -195,7 +208,10 @@ export async function POST(req: Request): Promise<Response> {
   const parsed = validateChatRequest(await req.json());
   if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
 
-  const res = streamChat({ model: anthropic('claude-opus-4-8'), messages: parsed.request.messages });
+  const res = streamChat({
+    model: anthropic('claude-opus-4-8'),
+    messages: parsed.request.messages,
+  });
   return toDeuzStreamResponse(res); // versioned Deuz UI wire
 }
 ```
@@ -205,7 +221,7 @@ Two things `/edge` deliberately does **not** re-export, so do not go looking:
 - **The full error taxonomy.** Only `DeuzError`, `isDeuzError`, `NoObjectGeneratedError` and `BreakerOpenError` are there. `RateLimitError`, `AuthenticationError` and friends come from the package root — which is itself edge-safe, so importing them costs you nothing.
 - **`renderRunReport`.** It is pure and would be legal, but it carries roughly 7 KB gzip of inline HTML/CSS/JS for a local debugging workflow. Reach it from `@deuz-sdk/core/observe` instead.
 
-The provider factories (`/anthropic`, `/openai`, …) are edge-safe too and are imported normally — `/edge` is about the *orchestration* surface, not the providers.
+The provider factories (`/anthropic`, `/openai`, …) are edge-safe too and are imported normally — `/edge` is about the _orchestration_ surface, not the providers.
 
 ## ESM and CJS
 
@@ -221,6 +237,8 @@ const { generateText } = require('@deuz-sdk/core');
 
 ## Next steps
 
+- [What is new in 2.1](/docs/reference/whats-new-2-1) — release scope, upgrade notes and operational limits.
+- [Native agents](/docs/modules/native-agents) and [Swarm](/docs/modules/swarm) — opt-in validated runs and durable DAG scheduling.
 - [streamChat](/docs/core/stream-chat) — the synchronous, never-throws streaming entry point.
 - [generateText](/docs/core/generate-text) — buffered text plus the agentic tool loop.
 - [generateObject](/docs/core/generate-object) — schema-typed structured output.

@@ -1,0 +1,141 @@
+import { expectTypeOf, test } from 'vitest';
+import { createAgent } from '../src/agent';
+import type { AgentResult, NativeExecutionContext } from '../src/agent';
+import { createInMemorySwarmStore, createSwarm } from '../src/swarm';
+import type {
+  Swarm,
+  SwarmAgentBinding,
+  SwarmEvent,
+  SwarmHandle,
+  SwarmOutcome,
+  SwarmReducerContext,
+  SwarmTask,
+  SwarmTaskResult,
+  SwarmTaskStatus,
+} from '../src/swarm';
+import { createSqliteSwarmStore } from '../src/node/swarm-sqlite';
+import type { SqliteSwarmStore } from '../src/node/swarm-sqlite';
+import type { LanguageModel } from '../src/types/model';
+import type { StandardSchemaV1 } from '../src/types/schema';
+
+declare const model: LanguageModel;
+declare const schema: StandardSchemaV1<unknown, { answer: number }>;
+declare const outcome: SwarmOutcome;
+
+test('swarm methods infer handles and durable typed event cursors', () => {
+  const swarm = createSwarm({
+    agents: { worker: createAgent({ model }) },
+    store: createInMemorySwarmStore(),
+  });
+  expectTypeOf(swarm).toEqualTypeOf<Swarm>();
+  expectTypeOf(
+    swarm.run({ scope: 'tenant', tasks: [{ id: 'a', agent: 'worker', prompt: 'answer' }] }),
+  ).toEqualTypeOf<Promise<SwarmHandle>>();
+  expectTypeOf(
+    swarm.resume({
+      scope: 'tenant',
+      runId: 'run',
+      approvals: { a: [{ approvalId: 'call', approved: true }] },
+    }),
+  ).toEqualTypeOf<Promise<SwarmHandle>>();
+  expectTypeOf(swarm.events({ scope: 'tenant', runId: 'run' }, { afterSequence: 1 })).toEqualTypeOf<
+    AsyncIterable<SwarmEvent>
+  >();
+  expectTypeOf<SwarmHandle['result']>().toEqualTypeOf<Promise<SwarmOutcome>>();
+  expectTypeOf<ReturnType<SwarmHandle['cancel']>>().toEqualTypeOf<Promise<void>>();
+  // @ts-expect-error Persisted runs always require an application tenant/workflow scope.
+  void swarm.run({ tasks: [] });
+  void swarm.resume({
+    scope: 'tenant',
+    runId: 'run',
+    // @ts-expect-error Approval verdicts are keyed by task, not a flat cross-task array.
+    approvals: [{ approvalId: 'call', approved: true }],
+  });
+});
+
+test('agent bindings preserve native validation and tri-state verifier contracts', () => {
+  const binding: SwarmAgentBinding = {
+    agent: createAgent({ model }),
+    output: { schema },
+    maxOutputAttempts: 2,
+    maxVerifyAttempts: 3,
+    toolsContext: { lookup: { tenant: 'a' } },
+    tools: {
+      lookup: { parameters: { type: 'object', properties: {} }, execute: () => ({ answer: 42 }) },
+    },
+    verify(context) {
+      // A heterogeneous task registry cannot promise one task's T for every task.
+      expectTypeOf(context.output).toEqualTypeOf<unknown>();
+      expectTypeOf(context.execution).toEqualTypeOf<NativeExecutionContext>();
+      return { status: 'verified' };
+    },
+  };
+  void binding;
+  const invalidOutput: SwarmAgentBinding = {
+    agent: createAgent({ model }),
+    // @ts-expect-error Raw JSON schema must supply runtime validation.
+    output: { schema: { type: 'object' } },
+  };
+  const invalidVerifier: SwarmAgentBinding = {
+    agent: createAgent({ model }),
+    // @ts-expect-error Boolean completion hooks cannot stand in for a verified verdict.
+    verify: () => true,
+  };
+  void invalidOutput;
+  void invalidVerifier;
+});
+
+test('reducer inputs remain unknown and context exposes shared accounting', () => {
+  void createSwarm({
+    agents: {},
+    store: createInMemorySwarmStore(),
+    reducers: {
+      sum: {
+        execute(results, context) {
+          expectTypeOf(results).toEqualTypeOf<Readonly<Record<string, SwarmTaskResult>>>();
+          expectTypeOf(context).toEqualTypeOf<SwarmReducerContext>();
+          expectTypeOf(context.signal).toEqualTypeOf<AbortSignal>();
+          expectTypeOf(context.execution).toEqualTypeOf<NativeExecutionContext>();
+          // @ts-expect-error Dependency output must be checked before arithmetic.
+          const unsafe: number = results.first?.output;
+          void unsafe;
+          return 42;
+        },
+      },
+    },
+  });
+});
+
+test('task kinds and terminal result acceptance stay explicit', () => {
+  const valid: SwarmTask = { id: 'reduce', reducer: 'sum', dependsOn: ['a', 'b'] as const };
+  // @ts-expect-error One task cannot be both an agent invocation and a reducer.
+  const mixed: SwarmTask = { id: 'mixed', agent: 'worker', prompt: 'answer', reducer: 'sum' };
+  // @ts-expect-error Agent tasks require a prompt.
+  const missingPrompt: SwarmTask = { id: 'agent', agent: 'worker' };
+  void valid;
+  void mixed;
+  void missingPrompt;
+  const agentResult = outcome.tasks[0]?.result?.agentResult;
+  expectTypeOf(agentResult).toEqualTypeOf<AgentResult<unknown> | undefined>();
+  if (agentResult?.status === 'completed')
+    expectTypeOf(agentResult.output).toEqualTypeOf<unknown>();
+  else if (agentResult) {
+    // @ts-expect-error Suspended, failed and stopped agent runs have no accepted output.
+    void agentResult.output;
+  }
+  expectTypeOf<SwarmTaskStatus>().toEqualTypeOf<
+    | 'pending'
+    | 'running'
+    | 'suspended'
+    | 'completed'
+    | 'failed'
+    | 'blocked'
+    | 'cancelled'
+    | 'needs_reconciliation'
+  >();
+});
+
+test('SQLite adds an asynchronous close without changing the swarm store contract', () => {
+  expectTypeOf(createSqliteSwarmStore({ path: ':memory:' })).toEqualTypeOf<SqliteSwarmStore>();
+  expectTypeOf<ReturnType<SqliteSwarmStore['close']>>().toEqualTypeOf<Promise<void>>();
+});

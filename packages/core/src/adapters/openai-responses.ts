@@ -335,6 +335,10 @@ async function* parseStream(
         break;
       case 'response.completed':
       case 'response.incomplete':
+        ctx.usageAvailable?.(
+          typeof data.response?.usage?.input_tokens === 'number' &&
+            typeof data.response.usage.output_tokens === 'number',
+        );
         usage = mapResponsesUsage(data.response?.usage);
         if (data.response?.incomplete_details?.reason === 'max_output_tokens')
           finishReason = 'length';

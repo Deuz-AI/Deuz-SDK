@@ -18,12 +18,10 @@ const size = (buffers) => {
  * A chunk behind a dynamic `import()` is not in this set: a consumer downloads
  * it when — and only when — they call the feature that awaits it.
  */
-const eagerChunks = (metafile) => {
+const staticChunks = (metafile, entries) => {
   const outputs = metafile.outputs;
-  const entry = Object.keys(outputs).find((path) => outputs[path].entryPoint !== undefined);
-  if (entry === undefined) return undefined;
   const seen = new Set();
-  const queue = [entry];
+  const queue = [...entries];
   while (queue.length > 0) {
     const path = queue.pop();
     if (seen.has(path)) continue;
@@ -64,11 +62,14 @@ for (const [name, budget] of Object.entries(config.bundles)) {
     write: false,
   });
 
-  const eagerNames = eagerChunks(result.metafile);
-  if (eagerNames === undefined) {
+  const entry = Object.keys(result.metafile.outputs).find(
+    (path) => basename(result.metafile.outputs[path].entryPoint ?? '') === `${name}-size-entry.mjs`,
+  );
+  if (entry === undefined) {
     failures.push(`${name}: no entry chunk in the metafile`);
     continue;
   }
+  const eagerNames = staticChunks(result.metafile, [entry]);
   const isEager = (file) => eagerNames.has(basename(file.path));
   const eagerFiles = result.outputFiles.filter(isEager);
   const lazyFiles = result.outputFiles.filter((file) => !isEager(file));
@@ -86,7 +87,50 @@ for (const [name, budget] of Object.entries(config.bundles)) {
 
   // Lazy chunks are still weighed, so nothing ships unmeasured — they just get
   // their own ratchet instead of inflating the cost of importing the package.
-  if (lazyFiles.length > 0) {
+  if (budget.lazyFeatures) {
+    // Follow each feature's static dependency closure. Shared lazy dependencies
+    // count against each feature that downloads them, never disappear from the
+    // ratchet, and do not let a new feature consume the existing MCP allowance.
+    const accounted = new Set();
+    const groups = {
+      mcp: {
+        entryPoint: budget.legacyLazyEntryPoint,
+        maxRawBytes: budget.maxLazyRawBytes,
+        maxGzipBytes: budget.maxLazyGzipBytes,
+      },
+      ...budget.lazyFeatures,
+    };
+    for (const [feature, limits] of Object.entries(groups)) {
+      const roots = Object.entries(result.metafile.outputs)
+        .filter(([, output]) => {
+          const input = output.entryPoint && basename(output.entryPoint);
+          return (
+            input &&
+            (input.startsWith(`${limits.entryPoint}-`) || input === `${limits.entryPoint}.ts`)
+          );
+        })
+        .map(([path]) => path);
+      if (roots.length === 0 || roots.some((path) => eagerNames.has(basename(path)))) {
+        failures.push(`${name}/${feature}: expected optional entry is missing or became eager`);
+        continue;
+      }
+      const names = staticChunks(result.metafile, roots);
+      const files = lazyFiles.filter((file) => names.has(basename(file.path)));
+      for (const file of files) accounted.add(file.path);
+      const measured = size(files.map((file) => Buffer.from(file.contents)));
+      console.log(
+        `${name} (${feature} lazy): ${measured.raw} B raw / ${measured.gzip} B gzip (limits ${limits.maxRawBytes} / ${limits.maxGzipBytes})`,
+      );
+      if (measured.raw > limits.maxRawBytes)
+        failures.push(`${name}/${feature}: lazy raw ${measured.raw} > ${limits.maxRawBytes}`);
+      if (measured.gzip > limits.maxGzipBytes)
+        failures.push(`${name}/${feature}: lazy gzip ${measured.gzip} > ${limits.maxGzipBytes}`);
+    }
+    for (const file of lazyFiles) {
+      if (!accounted.has(file.path))
+        failures.push(`${name}: unbudgeted optional chunk ${basename(file.path)}`);
+    }
+  } else if (lazyFiles.length > 0) {
     const lazy = size(lazyFiles.map((file) => Buffer.from(file.contents)));
     const budgeted = budget.maxLazyRawBytes !== undefined;
     console.log(
@@ -102,7 +146,7 @@ for (const [name, budget] of Object.entries(config.bundles)) {
       if (lazy.gzip > budget.maxLazyGzipBytes) {
         failures.push(`${name}: lazy gzip ${lazy.gzip} > ${budget.maxLazyGzipBytes}`);
       }
-    }
+    } else failures.push(`${name}: optional chunks have no size budget`);
   }
 }
 

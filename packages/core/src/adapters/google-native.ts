@@ -365,6 +365,10 @@ async function* parseStream(
   }
 
   const finishReason = blocked ? 'content_filter' : mapFinishReason(lastFinish, sawFunctionCall);
+  ctx.usageAvailable?.(
+    typeof lastUsage?.promptTokenCount === 'number' &&
+      typeof lastUsage.candidatesTokenCount === 'number',
+  );
   yield { type: 'finish', usage: mapGeminiUsage(lastUsage), finishReason };
 }
 

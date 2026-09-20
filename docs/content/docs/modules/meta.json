@@ -5,6 +5,8 @@
   "pages": [
     "observability",
     "autonomy",
+    "native-agents",
+    "swarm",
     "memory",
     "stores",
     "chat-persistence",

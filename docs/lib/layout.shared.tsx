@@ -60,7 +60,7 @@ export function baseOptions(locale: string): BaseLayoutProps {
       },
       {
         text: labels.whatsNew,
-        url: localePath(locale, '/docs/reference/whats-new-2-0'),
+        url: localePath(locale, '/docs/reference/whats-new-2-1'),
         active: 'url',
       },
       {

@@ -217,7 +217,7 @@ describe('live cost part (1.7, D2)', () => {
   it('streams one cumulative cost part per step (cacheSavings when the provider offers it)', async () => {
     const priceProvider = {
       priceUsage: vi.fn((_m: string, usage: Usage) => usage.totalTokens * 0.02),
-      cacheSavings: vi.fn((_m: string, usage: Usage) => (usage.totalTokens >= 30 ? 0.004 : 0)),
+      cacheSavings: vi.fn((_m: string, usage: Usage) => usage.totalTokens * (0.004 / 30)),
     };
     const { fetch } = mockFetchSequence([() => sseResponse([TOOL_CALL])]);
     const result = streamChat({

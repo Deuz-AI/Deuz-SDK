@@ -1,13 +1,13 @@
 <!-- GENERATED FILE — do not hand-edit.
      regenerate: node .claude/skills/deuz-sdk/scripts/generate-api-index.mjs
      source: packages/core/{package.json exports, tsup.config.ts} + src walk (export * followed)
-     verified: 2026-08-12 against @deuz-sdk/core@2.0.0 · api-contract sha256:209a805b7f32 -->
+     verified: 2026-09-19 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500 -->
 
 # API index — every subpath, every export
 
 **Load when:** checking whether a name exists, finding which subpath exports it, or exploring an unfamiliar module.
 
-`@deuz-sdk/core@2.0.0` ships **53 subpaths**; `@deuz-sdk/react` ships one. Names marked under **Types** are type-only — import them with `import type`, or a bundler-free runtime will crash looking for a value that was erased at compile time.
+`@deuz-sdk/core@2.1.0` ships **55 subpaths**; `@deuz-sdk/react` ships one. Names marked under **Types** are type-only — import them with `import type`, or a bundler-free runtime will crash looking for a value that was erased at compile time.
 
 If anything here disagrees with `packages/core/package.json` `exports` or `tooling/api-contract.json`, those win — and this file is stale; regenerate it.
 
@@ -133,11 +133,27 @@ Node child-process sandbox for the compute tools.
 
 ## `@deuz-sdk/core/agent`
 
-createAgent — a reusable agent as a frozen value (no class, no `new`).
+Native run/stream/resume, validated outputs, execution policies and shared budgets; also createAgent templates and handoff.
 
-**Values** (2): createAgent, handoff
+**Values** (13): BudgetLedgerError, createAgent, createBudgetLedger, createExecutionContext, createInMemoryAgentRunStore, ExecutionPersistenceError, ExecutionPolicyError, handoff, intersectExecutionPolicies, resumeAgent, resumeStreamAgent, runAgent, streamAgent
 
-**Types** (6): AgentCallOptions, AgentDef, AgentObjectCallOptions, DeuzAgent, HandoffAgentDef, HandoffOptions
+**Types** (40): AgentArrayElement, AgentCallOptions, AgentDef, AgentEvent, AgentObjectCallOptions, AgentOutput, AgentPartialOutput, AgentResult, AgentRunEnvelope, AgentRunOptions, AgentRunSession, AgentRunStore, AgentStream, AgentTool, AgentToolContext, AgentToolReceipt, AgentToolSet, AgentValidation, AgentValidator, AgentVerification, AgentVerifyContext, BudgetLedger, BudgetLedgerOptions, BudgetLedgerSnapshot, BudgetLimits, BudgetReservation, BudgetReservationInput, BudgetScope, BudgetSettlement, BudgetTotals, DeuzAgent, ExecutionChildOptions, ExecutionContextOptions, ExecutionContextRestoreOptions, ExecutionContextSnapshot, ExecutionPolicy, ExecutionReservationInput, HandoffAgentDef, HandoffOptions, NativeExecutionContext
+
+## `@deuz-sdk/core/swarm`
+
+Bounded fixed-DAG agent/reducer execution, scoped recovery, atomic snapshots and cursor events.
+
+**Values** (3): createInMemorySwarmStore, createSwarm, SwarmConflictError
+
+**Types** (21): Swarm, SwarmAgentBinding, SwarmCommit, SwarmEvent, SwarmEventInput, SwarmHandle, SwarmKey, SwarmOptions, SwarmOutcome, SwarmReducerBinding, SwarmReducerContext, SwarmResumeOptions, SwarmRunOptions, SwarmRunRecord, SwarmRunStatus, SwarmSnapshot, SwarmStore, SwarmTask, SwarmTaskRecord, SwarmTaskResult, SwarmTaskStatus
+
+## `@deuz-sdk/core/swarm/sqlite`
+
+Node-only SQLite persistence for swarm runs, native agent envelopes and events.
+
+**Values** (1): createSqliteSwarmStore
+
+**Types** (2): SqliteSwarmStore, SqliteSwarmStoreOptions
 
 ## `@deuz-sdk/core/autonomy`
 
@@ -460,6 +476,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `bedrock` — `bedrock`, `providers`
 - `bestOfN` — `autonomy`
 - `branchBeforeUserMessage` — `chat`
+- `BudgetLedgerError` — `agent`
 - `buildDecisionPrompt` — `memory`
 - `buildExtractionPrompt` — `memory`
 - `cacheSavings` — `pricing`
@@ -488,6 +505,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createBedrock` — `bedrock`, `providers`
 - `createBm25Index` — `rag`
 - `createBrowserTools` — `browser`
+- `createBudgetLedger` — `agent`
 - `createCallbackObserver` — `observe`
 - `createCerebras` — `providers`
 - `createCohere` — `providers`
@@ -497,6 +515,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createDeuzStream` — `ui`
 - `createElevenLabs` — `speech`
 - `createEmbedder` — `memory`
+- `createExecutionContext` — `agent`
 - `createFileRunStore` — `runtime/node`
 - `createFileTokenStore` — `mcp/node`
 - `createFileWorkspace` — `workspace/node`
@@ -509,11 +528,13 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createGroq` — `providers`
 - `createHyperbolic` — `providers`
 - `createImageProvider` — `image`
+- `createInMemoryAgentRunStore` — `agent`
 - `createInMemoryChatStore` — `chat`
 - `createInMemoryMemoryStore` — `memory`
 - `createInMemoryRunStore` — `runtime`
 - `createInMemorySessionStore` — `durable`
 - `createInMemoryStreamStateStore` — `ui`
+- `createInMemorySwarmStore` — `swarm`
 - `createInMemoryWorkspace` — `workspace`
 - `createJsonlChatStore` — `chat/node`
 - `createJsonlObserver` — `observe/node`
@@ -557,8 +578,10 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `createServiceAccountKeyProvider` — `vertex`
 - `createSkillRegistry` — `skills`
 - `createSqliteStores` — `stores/sqlite`
+- `createSqliteSwarmStore` — `swarm/sqlite`
 - `createStdioMcpClient` — `mcp/stdio`
 - `createSteeringController` — `runtime`
+- `createSwarm` — `swarm`
 - `createTaskList` — `autonomy`
 - `createTogether` — `providers`
 - `createUseChat` — `react`
@@ -596,6 +619,8 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `emitPlanUpdate` — `runtime`
 - `estimatePdfTokens` — `rag`
 - `estimateTokens` — `rag`
+- `ExecutionPersistenceError` — `agent`
+- `ExecutionPolicyError` — `agent`
 - `extractLinks` — `memory`
 - `fetchSkillSource` — `skills`
 - `fetchTask` — `midjourney`
@@ -620,6 +645,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `imagine` — `midjourney`
 - `indexChunks` — `rag`
 - `inMemoryTokenStore` — `mcp`
+- `intersectExecutionPolicies` — `agent`
 - `isExpired` — `memory`
 - `kimi` — `providers`
 - `lexicalMatcher` — `skills`
@@ -673,11 +699,14 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `remember` — `memory`
 - `renderRunReport` — `observe`
 - `renderSkillCatalog` — `skills`
+- `resumeAgent` — `agent`
 - `resumeDeuzChatResponse` — `durable`
 - `resumeDeuzStreamResponse` — `ui`
 - `resumeFromCheckpoint` — `durable`
+- `resumeStreamAgent` — `agent`
 - `resumeStreamFromCheckpoint` — `durable`
 - `retrieve` — `rag`
+- `runAgent` — `agent`
 - `runEval` — `testing`
 - `runGradedEval` — `testing`
 - `sambanova` — `providers`
@@ -695,12 +724,14 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `sseEvents` — `testing`
 - `sseResponse` — `testing`
 - `staticSkillSource` — `skills`
+- `streamAgent` — `agent`
 - `submitAction` — `midjourney`
 - `submitBlend` — `midjourney`
 - `submitDescribe` — `midjourney`
 - `submitImagine` — `midjourney`
 - `submitVideo` — `video`
 - `summarizeRun` — `observe`
+- `SwarmConflictError` — `swarm`
 - `sweepExpired` — `memory`
 - `taskListProgress` — `autonomy`
 - `toDeuzObjectStreamResponse` — `ui`

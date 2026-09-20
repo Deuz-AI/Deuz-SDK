@@ -436,6 +436,9 @@ async function* parseStream(
       }
     } else if (type === 'message_stop') {
       finishEmitted = true;
+      _ctx.usageAvailable?.(
+        typeof inputUsage.input_tokens === 'number' && typeof inputUsage.output_tokens === 'number',
+      );
       yield {
         type: 'finish',
         usage: buildUsage(inputUsage, outputTokens),
@@ -449,6 +452,7 @@ async function* parseStream(
   }
 
   if (!finishEmitted) {
+    _ctx.usageAvailable?.(false);
     yield {
       type: 'finish',
       usage: buildUsage(inputUsage, outputTokens),

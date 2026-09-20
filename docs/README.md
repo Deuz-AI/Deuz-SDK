@@ -1,17 +1,48 @@
-This is a Next.js application generated with
-[Create Fumadocs](https://github.com/fuma-nama/fumadocs).
+# Deuz SDK 2.1 documentation
 
-Run development server:
+The documentation site for `@deuz-sdk/core` and `@deuz-sdk/react`, built with
+Next.js and Fumadocs. Version 2.1 adds an optional native agent engine and durable
+swarm DAGs while keeping the existing generation APIs available.
+
+- [What is new in 2.1](content/docs/reference/whats-new-2-1.mdx): release scope,
+  upgrade guidance and operational limits.
+- [Native agents](content/docs/modules/native-agents.mdx): validated results,
+  strict checkpoints, approval/client-result resume and shared execution budgets.
+- [Swarm](content/docs/modules/swarm.mdx): fixed DAGs, bounded concurrency,
+  memory/SQLite stores, recovery and cursor events.
+- [Installation](content/docs/installation.mdx) and
+  [quickstart](content/docs/quickstart.mdx).
+
+The scheduler uses one executor per run. External effects require idempotency or
+reconciliation, cancellation is cooperative, and budget admission uses estimates.
+The feature guides document these boundaries alongside their examples.
+
+## Develop and verify
+
+Run these commands from the repository root. The docs application has its own
+lockfile and is installed separately from the SDK workspaces:
 
 ```bash
-npm run dev
-# or
-pnpm dev
-# or
-yarn dev
+npm ci
+npm ci --prefix docs
+npm --prefix docs run dev
 ```
 
 Open http://localhost:3000 with your browser to see the result.
+
+```bash
+# Verify documentation links and SDK import names.
+npm run verify:docs-refs
+
+# Generate Fumadocs/Next.js types and check the docs application.
+npm --prefix docs run types:check
+
+# Build the documentation site.
+npm --prefix docs run build
+
+# Run the documentation reference, type and build gates together.
+npm run verify:docs
+```
 
 ## Explore
 
@@ -45,8 +76,9 @@ resources:
 ## Brand assets
 
 - `app/icon.svg` and `Logo()` in `lib/layout.shared.tsx` are the ring-and-dot mark.
-- The hero mascot is rendered in 3D from `public/mascot/deuz-mascot.glb`; the export
-  contract for Blender is in [`MASCOT-MODEL.md`](./MASCOT-MODEL.md). The PNG next to it
-  is the server-rendered fallback.
+- The hero mascot is rendered in 3D from `public/mascot/deuz-mascot.glb`; run
+  `npm run mascot:export -- path/to/mr.deuz.blend` to regenerate it from the Blender
+  file, and see [`MASCOT-MODEL.md`](./MASCOT-MODEL.md) for the contract it meets. The
+  PNG next to it is the server-rendered fallback.
 - Provider marks on the home page come from `@lobehub/icons-static-svg`; run
   `npm run logos:sync` to regenerate `lib/provider-logos.generated.ts` after bumping it.

@@ -63,18 +63,19 @@ That call did more than it looks like: the request was normalized to a canonical
 
 Pick the row that matches what you are building. Each is two or three pages, not the whole site.
 
-| You are building | Read, in order |
-| --- | --- |
-| **A chatbot with a UI** | [Quickstart](/docs/quickstart) → [UI streaming](/docs/modules/ui-streaming) → [React hooks](/docs/modules/react-hooks) |
-| **A tool-using agent** | [Defining tools](/docs/agents/tools) → [The tool loop](/docs/agents/tool-loop) → [createAgent](/docs/agents/create-agent) |
-| **A coding agent** | [Tools](/docs/agents/tools) → [Compute sandbox](/docs/modules/autonomy) → [Coding agent cookbook](/docs/cookbooks/coding-agent) |
-| **A long-running / autonomous agent** | [Autonomy](/docs/modules/autonomy) → [Compaction](/docs/core/compaction) → [Durable runtime](/docs/agents/durable-runtime) |
-| **Structured data extraction** | [generateObject](/docs/core/generate-object) → [streamObject](/docs/core/stream-object) |
-| **Retrieval over your own documents** | [RAG](/docs/modules/rag) → [Embeddings](/docs/core/embeddings) → [Memory](/docs/modules/memory) |
-| **Something that must not lose state** | [Persistent stores](/docs/modules/stores) → [Chat persistence](/docs/modules/chat-persistence) → [Durable runtime](/docs/agents/durable-runtime) |
-| **Something users can attack** | [Request validation](/docs/modules/request-validation) → [Guardrails](/docs/agents/guardrails) → [Client tools](/docs/agents/client-tools) |
-| **A multi-agent system** | [Sub-agents](/docs/agents/subagents) → [Handoffs](/docs/agents/handoffs) |
-| **A port from another SDK** | [Migrating from the Vercel AI SDK](/docs/migration/from-vercel-ai-sdk) |
+| You are building                          | Read, in order                                                                                                                                   |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **A chatbot with a UI**                   | [Quickstart](/docs/quickstart) → [UI streaming](/docs/modules/ui-streaming) → [React hooks](/docs/modules/react-hooks)                           |
+| **A tool-using agent**                    | [Defining tools](/docs/agents/tools) → [The tool loop](/docs/agents/tool-loop) → [createAgent](/docs/agents/create-agent)                        |
+| **An agent with validated final results** | [Native agents](/docs/modules/native-agents) → [What is new in 2.1](/docs/reference/whats-new-2-1)                                               |
+| **A coding agent**                        | [Tools](/docs/agents/tools) → [Compute sandbox](/docs/modules/autonomy) → [Coding agent cookbook](/docs/cookbooks/coding-agent)                  |
+| **A long-running / autonomous agent**     | [Autonomy](/docs/modules/autonomy) → [Compaction](/docs/core/compaction) → [Durable runtime](/docs/agents/durable-runtime)                       |
+| **Structured data extraction**            | [generateObject](/docs/core/generate-object) → [streamObject](/docs/core/stream-object)                                                          |
+| **Retrieval over your own documents**     | [RAG](/docs/modules/rag) → [Embeddings](/docs/core/embeddings) → [Memory](/docs/modules/memory)                                                  |
+| **Something that must not lose state**    | [Persistent stores](/docs/modules/stores) → [Chat persistence](/docs/modules/chat-persistence) → [Durable runtime](/docs/agents/durable-runtime) |
+| **Something users can attack**            | [Request validation](/docs/modules/request-validation) → [Guardrails](/docs/agents/guardrails) → [Client tools](/docs/agents/client-tools)       |
+| **A multi-agent system**                  | [Sub-agents](/docs/agents/subagents) → [Handoffs](/docs/agents/handoffs) → [Durable swarm DAGs](/docs/modules/swarm)                             |
+| **A port from another SDK**               | [Migrating from the Vercel AI SDK](/docs/migration/from-vercel-ai-sdk)                                                                           |
 
 Whatever you build, two pages pay for themselves early: [Error handling](/docs/core/errors) (the taxonomy you branch on) and [Dependencies & clients](/docs/core/dependencies) (how you make any of it testable).
 
@@ -120,7 +121,9 @@ That one seam is why `Date.now()`, `Math.random()`, `process.env` and `console.*
 ```ts
 const res = streamChat({ model, prompt: 'hi' }); // never throws, sends nothing yet
 for await (const part of res.fullStream) {
-  if (part.type === 'error') { /* the only failure channel */ }
+  if (part.type === 'error') {
+    /* the only failure channel */
+  }
 }
 ```
 
@@ -135,72 +138,77 @@ The buffered calls (`generateText`, `generateObject`, `embed`) are ordinary prom
 
 Many AI integrations become hard to test because runtime state, provider-specific stream shapes, and UI wires leak into app code. `@deuz-sdk/core` keeps those seams explicit: dependencies are injected, provider streams are normalized, and the UI wire is owned by the SDK.
 
-| Principle | What it means in practice |
-| --- | --- |
-| **Pure core** | No environment-variable or console coupling; inference consumes replaceable seams for clock, ids, logging, metering, circuit breaker, and keys. Documented host defaults remain injectable, so tests are deterministic and replayable. |
-| **Edge-safe** | Only Web APIs (`fetch`, Web Streams, `TextDecoder`, WebCrypto, `atob`/`btoa`). `node:*` and `Buffer` are forbidden by lint; Node-only code lives in dedicated `…/node` subpaths. |
-| **Zero deps** | The chat core ships nothing in `dependencies`. Heavy or stateful things are optional peers or injected seams. |
-| **No vendor lock** | Our own canonical delta stream and our own versioned UI wire. The SDK never proxies a provider's raw SSE bytes to your client. |
-| **Secrets never leak** | API keys are masked in every log, error, and span path. This is a regression-tested invariant — see [secret redaction](/docs/core/errors#secret-redaction-p0). |
+| Principle              | What it means in practice                                                                                                                                                                                                              |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Pure core**          | No environment-variable or console coupling; inference consumes replaceable seams for clock, ids, logging, metering, circuit breaker, and keys. Documented host defaults remain injectable, so tests are deterministic and replayable. |
+| **Edge-safe**          | Only Web APIs (`fetch`, Web Streams, `TextDecoder`, WebCrypto, `atob`/`btoa`). `node:*` and `Buffer` are forbidden by lint; Node-only code lives in dedicated `…/node` subpaths.                                                       |
+| **Zero deps**          | The chat core ships nothing in `dependencies`. Heavy or stateful things are optional peers or injected seams.                                                                                                                          |
+| **No vendor lock**     | Our own canonical delta stream and our own versioned UI wire. The SDK never proxies a provider's raw SSE bytes to your client.                                                                                                         |
+| **Secrets never leak** | API keys are masked in every log, error, and span path. This is a regression-tested invariant — see [secret redaction](/docs/core/errors#secret-redaction-p0).                                                                         |
 
-## New in 2.0
+## New in 2.1
 
-Almost everything below is additive — no existing type gained a required field, every 1.9 call still compiles, and every stored checkpoint still loads. Four loud breaks are listed on [What is new in 2.0](/docs/reference/whats-new-2-0#breaking-changes): `NotImplementedError` is gone, two unions gained members, the streaming `compaction` part always carries `trigger`, and `generateObject` / `streamObject` now refuse `mcp` / `guardrails` / `doneWhen`.
+2.1 adds an optional native agent engine and a durable swarm scheduler. Existing
+generation and `createAgent` APIs remain available; native results, checkpoints
+and events have their own contracts.
 
-- **Persistent stores** — SQLite, Redis and Postgres packs behind the memory / chat / session / run seams → [Persistent stores](/docs/modules/stores)
-- **Guardrails** — pass / block / rewrite on the run's input, each tool call, and the final answer → [Guardrails](/docs/agents/guardrails)
-- **Handoffs** — `handoff()` transfers the whole run to another agent, history and all → [Handoffs](/docs/agents/handoffs)
-- **Zero-config MCP**, plus OAuth 2.0, sampling, roots, reconnect and a connection pool → [MCP](/docs/modules/mcp)
-- **`compactMessages()`**, a rolling summary, and automatic context-overflow recovery → [Compaction](/docs/modules/compaction)
-- **Speech, transcription and video** → [Speech](/docs/modules/speech) · [Transcription](/docs/modules/transcription) · [Video](/docs/modules/video-generation)
-- **Eight more providers**, two of them keyless → [Local models](/docs/providers/local) · [OpenAI-compat hosts](/docs/providers/compat)
-- **`runtimeContext`** — request-scoped facts travel with the call instead of a closure per request
+- **Validated agent results** — `runAgent` / `streamAgent`, explicit outcomes,
+  structured finalization and three-outcome verification → [Native agents](/docs/modules/native-agents)
+- **Strict persistence** — native checkpoints, approval/client-result resume and
+  tool receipts that require reconciliation for uncertain external effects.
+- **Durable swarm DAGs** — bounded concurrency, reducers, memory/SQLite stores,
+  cancellation, completed-work reuse and cursor events → [Swarm](/docs/modules/swarm)
+- **Shared policy and budgets** — inherited constraints, reservations before
+  admission, and retained unknown amounts across recovery.
 
-The whole surface, **including what is still missing**, is on one page: [What is new in 2.0](/docs/reference/whats-new-2-0). The previous release's page is still there too: [What is new in 1.9](/docs/reference/whats-new-1-9).
+Start with [What is new in 2.1](/docs/reference/whats-new-2-1) for upgrade notes and
+operational limits. Swarms use one executor per run, cancellation is cooperative,
+and budget admission uses estimates. Previous releases: [2.0](/docs/reference/whats-new-2-0)
+and [1.9](/docs/reference/whats-new-1-9).
 
 ## Feature overview
 
-| Area | What you get | Page |
-| --- | --- | --- |
-| Streaming chat | Lazy, never-throwing canonical stream with usage and finish-reason promises | [streamChat](/docs/core/stream-chat) |
-| Text generation | Buffered single-turn or multi-step text | [generateText](/docs/core/generate-text) |
-| Structured output | Schema-typed objects (Standard Schema or JSON Schema) with auto json/tool strategy | [generateObject](/docs/core/generate-object) |
-| Structured output (streaming) | Progressive `DeepPartial<T>` via `partialObjectStream` with a validated final `object` | [streamObject](/docs/core/stream-object) |
-| Embeddings | `embed` / `embedMany` with auto-batching and concurrency caps | [Embeddings](/docs/core/embeddings) |
-| Agentic tools | Parallel, self-healing tool loop with runaway guards | [Tools](/docs/agents/tools) and [Tool loop](/docs/agents/tool-loop) |
-| Memory | mem0 extract/reconcile pipeline over a vector or Obsidian-markdown store | [Memory](/docs/modules/memory) |
-| RAG | MIME sniff, chunkers, dense + lexical (BM25) hybrid retrieval | [RAG](/docs/modules/rag) |
-| Skills | `SKILL.md` parser with progressive disclosure | [Skills](/docs/modules/skills) |
-| MCP | Zero-config servers in the loop, OAuth 2.0, sampling, roots (HTTP/SSE edge-safe; stdio Node-only) | [MCP](/docs/modules/mcp) |
-| Guardrails (2.0) | `onInput` / `onToolCall` / `onOutput` — pass, block or rewrite, reported on the stream | [Guardrails](/docs/agents/guardrails) |
-| Handoffs (2.0) | Transfer the run to another agent, history and all | [Handoffs](/docs/agents/handoffs) |
-| Persistent stores (2.0) | SQLite / Redis / Postgres behind the four storage seams | [Persistent stores](/docs/modules/stores) |
-| Autonomy (1.8) | Workspace memory, CodeAct sandbox, planner/verifier, browser tools, background runs, live plan/activity feed | [Autonomy](/docs/modules/autonomy) |
-| Image generation | Sync OpenAI-compatible generation, async Midjourney, Yunwu relay | [Image generation](/docs/modules/image-generation) |
-| Speech / transcription (2.0) | `generateSpeech` (OpenAI, ElevenLabs) and `transcribe` (OpenAI, Deepgram) | [Speech](/docs/modules/speech) · [Transcription](/docs/modules/transcription) |
-| Video (2.0) | Async submit → poll → download over the OpenAI Videos shape | [Video](/docs/modules/video-generation) |
-| UI streaming | `toDeuzStreamResponse` (server) and `readDeuzStream` (client) | [UI streaming](/docs/modules/ui-streaming) |
-| React hooks | `useChat` (client-tool round-trips + approval pauses + live `plan`/`activity`) and `useObject` over the Deuz UI wire | [React hooks](/docs/modules/react-hooks) |
-| Middleware | `wrapModel` with logging, caching, PII redaction, injection guard | [Middleware](/docs/modules/middleware) |
-| Pricing | Optional token-to-USD cost table | [Pricing](/docs/modules/pricing) |
+| Area                          | What you get                                                                                                         | Page                                                                          |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Streaming chat                | Lazy, never-throwing canonical stream with usage and finish-reason promises                                          | [streamChat](/docs/core/stream-chat)                                          |
+| Text generation               | Buffered single-turn or multi-step text                                                                              | [generateText](/docs/core/generate-text)                                      |
+| Structured output             | Schema-typed objects (Standard Schema or JSON Schema) with auto json/tool strategy                                   | [generateObject](/docs/core/generate-object)                                  |
+| Structured output (streaming) | Progressive `DeepPartial<T>` via `partialObjectStream` with a validated final `object`                               | [streamObject](/docs/core/stream-object)                                      |
+| Embeddings                    | `embed` / `embedMany` with auto-batching and concurrency caps                                                        | [Embeddings](/docs/core/embeddings)                                           |
+| Agentic tools                 | Parallel, self-healing tool loop with runaway guards                                                                 | [Tools](/docs/agents/tools) and [Tool loop](/docs/agents/tool-loop)           |
+| Memory                        | mem0 extract/reconcile pipeline over a vector or Obsidian-markdown store                                             | [Memory](/docs/modules/memory)                                                |
+| RAG                           | MIME sniff, chunkers, dense + lexical (BM25) hybrid retrieval                                                        | [RAG](/docs/modules/rag)                                                      |
+| Skills                        | `SKILL.md` parser with progressive disclosure                                                                        | [Skills](/docs/modules/skills)                                                |
+| MCP                           | Zero-config servers in the loop, OAuth 2.0, sampling, roots (HTTP/SSE edge-safe; stdio Node-only)                    | [MCP](/docs/modules/mcp)                                                      |
+| Guardrails (2.0)              | `onInput` / `onToolCall` / `onOutput` — pass, block or rewrite, reported on the stream                               | [Guardrails](/docs/agents/guardrails)                                         |
+| Handoffs (2.0)                | Transfer the run to another agent, history and all                                                                   | [Handoffs](/docs/agents/handoffs)                                             |
+| Persistent stores (2.0)       | SQLite / Redis / Postgres behind the four storage seams                                                              | [Persistent stores](/docs/modules/stores)                                     |
+| Autonomy (1.8)                | Workspace memory, CodeAct sandbox, planner/verifier, browser tools, background runs, live plan/activity feed         | [Autonomy](/docs/modules/autonomy)                                            |
+| Image generation              | Sync OpenAI-compatible generation, async Midjourney, Yunwu relay                                                     | [Image generation](/docs/modules/image-generation)                            |
+| Speech / transcription (2.0)  | `generateSpeech` (OpenAI, ElevenLabs) and `transcribe` (OpenAI, Deepgram)                                            | [Speech](/docs/modules/speech) · [Transcription](/docs/modules/transcription) |
+| Video (2.0)                   | Async submit → poll → download over the OpenAI Videos shape                                                          | [Video](/docs/modules/video-generation)                                       |
+| UI streaming                  | `toDeuzStreamResponse` (server) and `readDeuzStream` (client)                                                        | [UI streaming](/docs/modules/ui-streaming)                                    |
+| React hooks                   | `useChat` (client-tool round-trips + approval pauses + live `plan`/`activity`) and `useObject` over the Deuz UI wire | [React hooks](/docs/modules/react-hooks)                                      |
+| Middleware                    | `wrapModel` with logging, caching, PII redaction, injection guard                                                    | [Middleware](/docs/modules/middleware)                                        |
+| Pricing                       | Optional token-to-USD cost table                                                                                     | [Pricing](/docs/modules/pricing)                                              |
 
 ## Supported providers
 
 All providers normalize to the same canonical stream, so application code is provider-agnostic.
 
-| Provider | Subpath | Notes |
-| --- | --- | --- |
-| Anthropic | [`@deuz-sdk/core/anthropic`](/docs/providers/anthropic) | Messages API (`/v1/messages`) |
-| OpenAI | [`@deuz-sdk/core/openai`](/docs/providers/openai) | Chat Completions and Responses API + `openaiEmbedding` |
-| **Azure OpenAI** | [`@deuz-sdk/core/azure`](/docs/providers/azure) | Deployment URL + `api-key` / Entra Bearer |
-| **Amazon Bedrock** | [`@deuz-sdk/core/bedrock`](/docs/providers/bedrock) | Mantle OpenAI-compat (Bearer API key; no SigV4 SDK) |
-| xAI Grok | [`@deuz-sdk/core/xai`](/docs/providers/xai) | OpenAI-compatible wire |
-| Google Gemini | [`@deuz-sdk/core/google`](/docs/providers/google) | Compat (`createGoogle`) and native `generateContent` (`createGoogleNative`) + `googleEmbedding` |
-| Vertex AI | [`@deuz-sdk/core/vertex`](/docs/providers/vertex) | Claude and Gemini on Vertex with OAuth2 Bearer auth |
-| Voyage AI | [`@deuz-sdk/core/voyage`](/docs/providers/voyage) | Embeddings |
-| Yunwu | [`@deuz-sdk/core/yunwu`](/docs/providers/yunwu) | Unified relay — chat, image, embed at `/v1`, Midjourney at the root |
-| OpenAI-compat hosts | [`@deuz-sdk/core/providers`](/docs/providers/compat) | **Mistral, DeepSeek, Qwen, Kimi** (`createKimi` / Moonshot), Groq, Together, OpenRouter, Cerebras, Fireworks, GLM, MiniMax + 2.0's Perplexity, Cohere, DeepInfra, NVIDIA NIM, SambaNova, Hyperbolic + Azure/Bedrock re-exports + `createProviderRegistry` |
-| Local models (2.0) | [`@deuz-sdk/core/providers`](/docs/providers/local) | **Ollama** and **LM Studio** — keyless, `localhost` by default |
+| Provider            | Subpath                                                 | Notes                                                                                                                                                                                                                                                     |
+| ------------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Anthropic           | [`@deuz-sdk/core/anthropic`](/docs/providers/anthropic) | Messages API (`/v1/messages`)                                                                                                                                                                                                                             |
+| OpenAI              | [`@deuz-sdk/core/openai`](/docs/providers/openai)       | Chat Completions and Responses API + `openaiEmbedding`                                                                                                                                                                                                    |
+| **Azure OpenAI**    | [`@deuz-sdk/core/azure`](/docs/providers/azure)         | Deployment URL + `api-key` / Entra Bearer                                                                                                                                                                                                                 |
+| **Amazon Bedrock**  | [`@deuz-sdk/core/bedrock`](/docs/providers/bedrock)     | Mantle OpenAI-compat (Bearer API key; no SigV4 SDK)                                                                                                                                                                                                       |
+| xAI Grok            | [`@deuz-sdk/core/xai`](/docs/providers/xai)             | OpenAI-compatible wire                                                                                                                                                                                                                                    |
+| Google Gemini       | [`@deuz-sdk/core/google`](/docs/providers/google)       | Compat (`createGoogle`) and native `generateContent` (`createGoogleNative`) + `googleEmbedding`                                                                                                                                                           |
+| Vertex AI           | [`@deuz-sdk/core/vertex`](/docs/providers/vertex)       | Claude and Gemini on Vertex with OAuth2 Bearer auth                                                                                                                                                                                                       |
+| Voyage AI           | [`@deuz-sdk/core/voyage`](/docs/providers/voyage)       | Embeddings                                                                                                                                                                                                                                                |
+| Yunwu               | [`@deuz-sdk/core/yunwu`](/docs/providers/yunwu)         | Unified relay — chat, image, embed at `/v1`, Midjourney at the root                                                                                                                                                                                       |
+| OpenAI-compat hosts | [`@deuz-sdk/core/providers`](/docs/providers/compat)    | **Mistral, DeepSeek, Qwen, Kimi** (`createKimi` / Moonshot), Groq, Together, OpenRouter, Cerebras, Fireworks, GLM, MiniMax + 2.0's Perplexity, Cohere, DeepInfra, NVIDIA NIM, SambaNova, Hyperbolic + Azure/Bedrock re-exports + `createProviderRegistry` |
+| Local models (2.0)  | [`@deuz-sdk/core/providers`](/docs/providers/local)     | **Ollama** and **LM Studio** — keyless, `localhost` by default                                                                                                                                                                                            |
 
 That is **29 built-in provider ids** across four chat wires. A provider factory returns a tiny `LanguageModel` descriptor; the [model registry](/docs/advanced/model-registry) is the single source of truth for per-model capabilities (vision, tools, reasoning, structured output, caching, native PDF, audio, context window). Unknown model slugs do not throw — they fall back to conservative defaults and record a warning, so new model releases work without a code change.
 

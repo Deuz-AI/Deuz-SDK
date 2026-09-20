@@ -1,4 +1,4 @@
-<!-- verified: 2026-08-12 against @deuz-sdk/core@2.0.0 · api-contract sha256:209a805b7f32
+<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
      sources: docs/content/docs/modules/stores.mdx, docs/content/docs/modules/chat-persistence.mdx,
      docs/content/docs/agents/durable-runtime.mdx, docs/content/docs/agents/unbreakable-chatbot.mdx,
      docs/content/docs/reference/whats-new-2-0.mdx, packages/core/src/durable.ts,
@@ -11,6 +11,8 @@
 # Persistence: stores, chat history, checkpoints and resumable runs
 
 **Load when:** picking a database for an AI feature, persisting a conversation across requests, making an agent survive a crash, a deploy or an approval a human answers hours later, resuming a chat stream after F5, or running long agent jobs in the background.
+
+The store packs and checkpoints below belong to the existing APIs. Native 2.1 `runAgent` uses a separate strict `AgentRunStore`; swarm uses atomic `SwarmStore` snapshots/events and the Node-only `/swarm/sqlite` adapter. These stores are not interchangeable. See `references/native-execution.md` for approval recovery, interrupted-effect reconciliation and process-ownership limits.
 
 ## The four seams
 

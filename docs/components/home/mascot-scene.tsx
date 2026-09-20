@@ -210,8 +210,11 @@ function createStage(host: HTMLElement, modelUrl: string | null, onReady: () => 
     pupil = object.getObjectByName('Pupil') ?? null;
     if (head && pupil) {
       pupilRest.copy(pupil.position);
+      // The box is in world units but the pupil moves in the head's own, which differ
+      // when an export carries its scale on a node — so the radius is converted.
       const headSize = new Box3().setFromObject(head).getSize(new Vector3());
-      gazeRadius = Math.min(headSize.x, headSize.y) * 0.16;
+      const headScale = Math.abs(head.getWorldScale(new Vector3()).x) || 1;
+      gazeRadius = (Math.min(headSize.x, headSize.y) * 0.16) / headScale;
     }
 
     if (clips.length > 0) {

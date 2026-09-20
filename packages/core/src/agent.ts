@@ -93,6 +93,22 @@ import type { Tool } from './types/tool';
  */
 export { handoff } from './inference/handoff';
 export type { HandoffAgentDef, HandoffOptions } from './inference/handoff';
+export {
+  runAgent,
+  streamAgent,
+  resumeAgent,
+  resumeStreamAgent,
+  createInMemoryAgentRunStore,
+} from './agent-run';
+export type * from './types/agent-run';
+export {
+  createExecutionContext,
+  intersectExecutionPolicies,
+  ExecutionPolicyError,
+} from './execution-policy';
+export { createBudgetLedger, BudgetLedgerError } from './budget-ledger';
+export type * from './types/execution';
+export { ExecutionPersistenceError } from './internal/execution-error';
 
 /**
  * A reusable agent definition: every `CommonCallOptions` field EXCEPT the three

@@ -1,0 +1,111 @@
+{
+  "CallerReference": "deuz-docs-1788955599",
+  "Comment": "Deuz SDK docs - Next.js origin on EC2",
+  "Enabled": true,
+  "HttpVersion": "http2and3",
+  "IsIPV6Enabled": true,
+  "PriceClass": "PriceClass_All",
+  "Origins": {
+    "Quantity": 1,
+    "Items": [
+      {
+        "Id": "deuz-ec2-origin",
+        "DomainName": "ec2-3-77-16-98.eu-central-1.compute.amazonaws.com",
+        "OriginPath": "",
+        "CustomHeaders": { "Quantity": 0 },
+        "CustomOriginConfig": {
+          "HTTPPort": 80,
+          "HTTPSPort": 443,
+          "OriginProtocolPolicy": "http-only",
+          "OriginSslProtocols": { "Quantity": 1, "Items": ["TLSv1.2"] },
+          "OriginReadTimeout": 30,
+          "OriginKeepaliveTimeout": 60
+        },
+        "ConnectionAttempts": 3,
+        "ConnectionTimeout": 10,
+        "OriginShield": { "Enabled": false }
+      }
+    ]
+  },
+  "DefaultCacheBehavior": {
+    "TargetOriginId": "deuz-ec2-origin",
+    "ViewerProtocolPolicy": "redirect-to-https",
+    "AllowedMethods": {
+      "Quantity": 3,
+      "Items": ["GET", "HEAD", "OPTIONS"],
+      "CachedMethods": { "Quantity": 2, "Items": ["GET", "HEAD"] }
+    },
+    "Compress": true,
+    "CachePolicyId": "2afc8714-fccf-4619-843e-42bfcc080ba4",
+    "ResponseHeadersPolicyId": "67f7725c-6f97-4210-82d7-5512b31e9d03",
+    "FunctionAssociations": {
+      "Quantity": 1,
+      "Items": [
+        {
+          "EventType": "viewer-request",
+          "FunctionARN": "arn:aws:cloudfront::672850355747:function/deuz-docs-normalize"
+        }
+      ]
+    },
+    "LambdaFunctionAssociations": { "Quantity": 0 },
+    "FieldLevelEncryptionId": "",
+    "SmoothStreaming": false
+  },
+  "CacheBehaviors": {
+    "Quantity": 3,
+    "Items": [
+      {
+        "PathPattern": "/_next/static/*",
+        "TargetOriginId": "deuz-ec2-origin",
+        "ViewerProtocolPolicy": "redirect-to-https",
+        "AllowedMethods": {
+          "Quantity": 2, "Items": ["GET", "HEAD"],
+          "CachedMethods": { "Quantity": 2, "Items": ["GET", "HEAD"] }
+        },
+        "Compress": true,
+        "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+        "FunctionAssociations": { "Quantity": 0 },
+        "LambdaFunctionAssociations": { "Quantity": 0 },
+        "FieldLevelEncryptionId": "",
+        "SmoothStreaming": false
+      },
+      {
+        "PathPattern": "/og/*",
+        "TargetOriginId": "deuz-ec2-origin",
+        "ViewerProtocolPolicy": "redirect-to-https",
+        "AllowedMethods": {
+          "Quantity": 2, "Items": ["GET", "HEAD"],
+          "CachedMethods": { "Quantity": 2, "Items": ["GET", "HEAD"] }
+        },
+        "Compress": true,
+        "CachePolicyId": "0d386266-322c-4bee-be57-4e6db4cca6c4",
+        "FunctionAssociations": { "Quantity": 0 },
+        "LambdaFunctionAssociations": { "Quantity": 0 },
+        "FieldLevelEncryptionId": "",
+        "SmoothStreaming": false
+      },
+      {
+        "PathPattern": "/api/*",
+        "TargetOriginId": "deuz-ec2-origin",
+        "ViewerProtocolPolicy": "redirect-to-https",
+        "AllowedMethods": {
+          "Quantity": 3, "Items": ["GET", "HEAD", "OPTIONS"],
+          "CachedMethods": { "Quantity": 2, "Items": ["GET", "HEAD"] }
+        },
+        "Compress": true,
+        "CachePolicyId": "4d40bf31-b1b5-4fbc-bf26-c608dabf4c81",
+        "FunctionAssociations": { "Quantity": 0 },
+        "LambdaFunctionAssociations": { "Quantity": 0 },
+        "FieldLevelEncryptionId": "",
+        "SmoothStreaming": false
+      }
+    ]
+  },
+  "CustomErrorResponses": { "Quantity": 0 },
+  "Restrictions": { "GeoRestriction": { "RestrictionType": "none", "Quantity": 0 } },
+  "ViewerCertificate": { "CloudFrontDefaultCertificate": true, "MinimumProtocolVersion": "TLSv1", "CertificateSource": "cloudfront" },
+  "Logging": { "Enabled": false, "IncludeCookies": false, "Bucket": "", "Prefix": "" },
+  "WebACLId": "",
+  "DefaultRootObject": "",
+  "Staging": false
+}

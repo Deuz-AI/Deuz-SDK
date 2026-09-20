@@ -40,44 +40,44 @@ const siteDescriptions: Record<Locale, string> = {
 
 const bannerCopy: Record<Locale, { text: string; link: string }> = {
   en: {
-    text: 'Deuz SDK 2.0 is out — stores, guardrails, handoffs, and zero-config MCP.',
-    link: 'What is new in 2.0',
+    text: 'Deuz SDK 2.1 is out — native agents, durable swarms, and shared execution budgets.',
+    link: 'What is new in 2.1',
   },
   de: {
-    text: 'Deuz SDK 2.0 ist da — Stores, Guardrails, Handoffs und Zero-Config-MCP.',
-    link: 'Neu in 2.0',
+    text: 'Deuz SDK 2.1 ist da — native Agenten, persistente Swarms und gemeinsame Ausführungsbudgets.',
+    link: 'Neu in 2.1',
   },
   tr: {
-    text: 'Deuz SDK 2.0 çıktı — store’lar, guardrail’ler, handoff ve sıfır yapılandırmalı MCP.',
-    link: '2.0’da neler yeni',
+    text: 'Deuz SDK 2.1 çıktı — yerel ajanlar, kalıcı swarm’lar ve ortak yürütme bütçeleri.',
+    link: '2.1’de neler yeni',
   },
   fr: {
-    text: 'Deuz SDK 2.0 est sorti — stores, guardrails, handoffs et MCP zéro-config.',
-    link: 'Nouveautés de la 2.0',
+    text: 'Deuz SDK 2.1 est sorti — agents natifs, swarms persistants et budgets d’exécution partagés.',
+    link: 'Nouveautés de la 2.1',
   },
   it: {
-    text: 'Deuz SDK 2.0 è uscito — store, guardrail, handoff e MCP zero-config.',
-    link: 'Novità della 2.0',
+    text: 'Deuz SDK 2.1 è uscito — agenti nativi, swarm persistenti e budget di esecuzione condivisi.',
+    link: 'Novità della 2.1',
   },
   es: {
-    text: 'Deuz SDK 2.0 ya está aquí — stores, guardrails, handoffs y MCP cero-config.',
-    link: 'Novedades de 2.0',
+    text: 'Deuz SDK 2.1 ya está aquí — agentes nativos, swarms persistentes y presupuestos de ejecución compartidos.',
+    link: 'Novedades de 2.1',
   },
   ru: {
-    text: 'Вышел Deuz SDK 2.0 — store, guardrail, handoff и MCP без конфигурации.',
-    link: 'Что нового в 2.0',
+    text: 'Вышел Deuz SDK 2.1 — нативные агенты, персистентные swarms и общие бюджеты выполнения.',
+    link: 'Что нового в 2.1',
   },
   ja: {
-    text: 'Deuz SDK 2.0 リリース — ストア、ガードレール、ハンドオフ、ゼロ設定 MCP。',
-    link: '2.0 の新機能',
+    text: 'Deuz SDK 2.1 リリース — ネイティブエージェント、永続化されたスウォーム、共有実行予算。',
+    link: '2.1 の新機能',
   },
   ko: {
-    text: 'Deuz SDK 2.0 출시 — 스토어, 가드레일, 핸드오프, 제로 설정 MCP.',
-    link: '2.0의 새로운 점',
+    text: 'Deuz SDK 2.1 출시 — 네이티브 에이전트, 영속 스웜, 공유 실행 예산.',
+    link: '2.1의 새로운 점',
   },
   zh: {
-    text: 'Deuz SDK 2.0 已发布 — 存储、护栏、交接与零配置 MCP。',
-    link: '2.0 新特性',
+    text: 'Deuz SDK 2.1 已发布 — 原生智能体、持久化 swarm 与共享执行预算。',
+    link: '2.1 新特性',
   },
 };
 
@@ -112,10 +112,10 @@ export default async function Layout({ params, children }: LayoutProps<'/[lang]'
     >
       <body className="flex min-h-screen flex-col">
         <RootProvider i18n={i18nProvider(translations, lang)}>
-          <Banner id="deuz-sdk-2-0">
+          <Banner id="deuz-sdk-2-1">
             {banner.text}{' '}
             <Link
-              href={localePath(locale, '/docs/reference/whats-new-2-0')}
+              href={localePath(locale, '/docs/reference/whats-new-2-1')}
               className="font-medium underline underline-offset-4"
             >
               {banner.link}

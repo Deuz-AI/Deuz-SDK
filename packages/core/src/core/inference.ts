@@ -36,6 +36,7 @@ import { anthropicAdapter } from '../adapters/anthropic';
 import { openaiCompatibleAdapter } from '../adapters/openai-compatible';
 import { openaiResponsesAdapter } from '../adapters/openai-responses';
 import { googleNativeAdapter } from '../adapters/google-native';
+import type { createNativeRequest } from '../internal/native-request';
 
 /** The only place that references every wire adapter (keeps tree-shaking clean). */
 function getAdapter(surface: ModelSurface): Adapter {
@@ -217,6 +218,11 @@ export function runStream(
     let ttftMs: number | undefined;
     let finalUsage: Usage | undefined;
     let finalFinish: FinishReason | undefined;
+    let native: ReturnType<typeof createNativeRequest> | undefined;
+    let usageAvailable = false;
+    const settleReservation = async (): Promise<void> => {
+      await native?.settle(finalUsage, usageAvailable);
+    };
 
     // --- warnings (1.9) ---
     // Cursor into the sink: everything before it has already been emitted as a
@@ -407,6 +413,16 @@ export function runStream(
           ),
         );
       }
+      if (options.execution) {
+        native = (await import('../internal/native-request')).createNativeRequest(
+          options,
+          internal,
+          deps,
+          modelId,
+          userSignal,
+        );
+        native.assert();
+      }
       const adapter = getAdapter(options.model.surface);
       const startedAt = deps.clock.now();
       // The per-call warning sink rides along (1.9) so a wire can report a lossy
@@ -420,7 +436,15 @@ export function runStream(
         options,
         generateId: deps.generateId,
         object: internal.object,
-        tools: internal.tools,
+        tools:
+          internal.tools && options.execution?.policy.allowedTools
+            ? {
+                ...internal.tools,
+                tools: internal.tools.tools.filter((tool) =>
+                  options.execution!.policy.allowedTools!.includes(tool.name),
+                ),
+              }
+            : internal.tools,
         // Adapters warn through the injected logger when a wire cannot carry
         // something the caller asked for (lossy mapping must never be silent).
         logger: deps.logger,
@@ -441,8 +465,18 @@ export function runStream(
       let res!: Response;
       let timeout!: TimeoutHandle;
       for (let attempt = 0; ; attempt++) {
+        if (native) await native.reserve();
         retries = attempt; // retries performed so far (attempt 0 = first try)
-        timeout = createTimeout(deps.clock, timeouts);
+        const remaining = native?.remaining();
+        timeout = createTimeout(
+          deps.clock,
+          remaining === undefined
+            ? timeouts
+            : {
+                ...timeouts,
+                totalMs: timeouts.totalMs > 0 ? Math.min(timeouts.totalMs, remaining) : remaining,
+              },
+        );
         timeoutSignal = timeout.signal;
         // The loop's stepMs deadline (internal.failSignal) rides along as a
         // third source — merged for the transport, kept out of the user-abort
@@ -452,6 +486,7 @@ export function runStream(
           res = await call.fetch(url, { ...init, signal });
         } catch (raw) {
           timeout.clear();
+          await settleReservation();
           const err = withAbortReason(raw, timeout.signal, internal.failSignal);
           if (err instanceof TimeoutError || isUserAbort(err, userSignal, internal.failSignal))
             throw err;
@@ -479,6 +514,7 @@ export function runStream(
         }
         if (res.ok) break; // keep `timeout` armed for the streaming phase
         timeout.clear();
+        if (native) await native.rejectResponse(res.status);
         const mapped = adapter.mapError(res.status, await readBody(res), res.headers, {
           provider: call.provider,
         });
@@ -529,6 +565,9 @@ export function runStream(
       let firstContent = false;
       try {
         for await (const part of adapter.parseStream(res.body, {
+          usageAvailable: (available) => {
+            usageAvailable = available;
+          },
           caps,
           generateId: deps.generateId,
           provider: call.provider,
@@ -572,6 +611,7 @@ export function runStream(
             }
           }
           if (part.type === 'error') {
+            await settleReservation();
             broadcaster.push(part);
             usageDeferred.reject(part.error);
             finishDeferred.reject(part.error);
@@ -583,6 +623,7 @@ export function runStream(
           if (part.type === 'finish') {
             finalUsage = part.usage;
             finalFinish = part.finishReason;
+            await settleReservation();
             // Live cost (1.7, D2): single-turn calls price the finish usage
             // inline; loop-driven calls (internal.tools set) leave it to the
             // loop's cumulative per-step part.
@@ -613,6 +654,7 @@ export function runStream(
       }
 
       const usage = withTotal(finalUsage ?? EMPTY_USAGE);
+      await settleReservation();
       const finishReason = finalFinish ?? 'stop';
       usageDeferred.resolve(usage);
       finishDeferred.resolve(finishReason);
@@ -675,7 +717,12 @@ export function runStream(
       // Recover our own abort reason first: a ttft/total/step expiry that cut
       // the BODY read can reach us as a bare AbortError, and misreading it as a
       // user cancel would resolve 'aborted' instead of failing (G2).
-      const err = withAbortReason(raw, timeoutSignal, internal.failSignal);
+      let err = withAbortReason(raw, timeoutSignal, internal.failSignal);
+      try {
+        await settleReservation();
+      } catch (settlementError) {
+        err = settlementError;
+      }
       if (isUserAbort(err, userSignal, internal.failSignal)) {
         const usage = withTotal(finalUsage ?? EMPTY_USAGE);
         usageDeferred.resolve(usage);

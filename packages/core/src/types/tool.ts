@@ -4,9 +4,12 @@ import type { Message } from './message';
 import type { StreamPart } from './stream';
 import type { ResolvedDependencies } from './deps';
 import type { SessionStore } from './session';
+import type { ApprovalSigner } from '../durable';
+import type { NativeExecutionContext } from './execution';
 
 /** Context handed to a tool's `execute`. */
 export interface ToolExecuteContext {
+  execution?: NativeExecutionContext;
   toolCallId: string;
   /** Conversation-so-far (immutable snapshot) for context-aware tools. */
   messages: Message[];
@@ -27,7 +30,10 @@ export interface ToolExecuteContext {
   // --- 1.5 additive: durable execution seam (populated by the loop when the
   // call carries `session`; `agentTool` consumes them for nested checkpoints). ---
   /** The parent loop's durable session (store + runId) — lets a sub-agent persist child checkpoints. */
-  session?: { store: SessionStore; runId: string };
+  session?: { store: SessionStore; runId: string; durability?: 'best-effort' | 'strict' };
+  /** Inherited by nested agents; tokens remain bound to the child operation. */
+  approvalSigner?: ApprovalSigner;
+  approvalMaxAgeMs?: number;
   /** The resume call's approval verdicts, forwarded so a suspended sub-agent can settle its own pending calls. */
   approvalResponses?: ToolApprovalResponse[];
   // --- 2.0 additive: request-scoped context seam. ---

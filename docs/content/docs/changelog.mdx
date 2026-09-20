@@ -6,6 +6,41 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## 2.1.0
+
+**Native agents and durable swarm DAGs.** The new engine is opt-in; existing
+generation and `createAgent` APIs remain available. Full contracts, upgrade notes
+and operational limits are on [What is new in 2.1](/docs/reference/whats-new-2-1).
+
+- **Native agent runs** (`/agent`) — `runAgent`, `streamAgent` and their resume
+  functions return explicit completed/suspended/stopped/failed outcomes. Accepted
+  structured output is runtime-validated, with bounded finalization and
+  `verified` / `rejected` / `inconclusive` verification. Native tool context and
+  output validation plus `toModelOutput` separate raw results from model history.
+  → [Native agents](/docs/modules/native-agents)
+- **Strict native persistence** — versioned run envelopes, approval and
+  client-result resume, persisted limits and bindings, and tool receipts that
+  preserve completed effects and require reconciliation for uncertain dispatches.
+  A failed required checkpoint stops execution.
+- **Swarm scheduling** (`/swarm`) — fixed DAG validation, bounded agent/reducer
+  concurrency, independent-branch completion, cancellation, scoped approvals and
+  client results, and an ordered cursor journal. Completed tasks are reused on
+  recovery; interrupted work is not blindly replayed. → [Swarm](/docs/modules/swarm)
+- **Swarm stores** — in-memory storage and Node-only `/swarm/sqlite`, with atomic
+  task/result/event transactions and an independent SQLite schema version.
+- **Execution policy and budgets** — inherited model/tool restrictions, approval
+  gates, depth/deadline constraints and a shared durable reservation ledger.
+  Unknown amounts remain held across recovery; admission uses estimates rather
+  than promising a hard ceiling on the provider's final bill.
+- **Accounting and package boundaries** — legacy loops price individual model
+  invocations and retain historical cost on resume. Native request accounting,
+  optional usage pricing and memory pipelines load through separate optional
+  chunks; existing core/edge eager bundle limits are preserved.
+
+The scheduler is single-executor. External effects still need idempotency or
+reconciliation, and cancellation is cooperative. Native events and stores are
+separate from the existing UI wire and legacy checkpoint contracts.
+
 ## 2.0.0
 
 **The things you used to build yourself.** Eight new subpaths, three new modalities, real databases behind the four storage seams, guardrails and handoffs in the loop, and MCP that connects itself. The 1.9 call surface still compiles and every stored checkpoint still loads. Four loud breaks — `NotImplementedError` removed, two unions grew a member, `compaction.trigger` is always present, structured output now refuses `mcp` / `guardrails` / `doneWhen` — plus the two recovering behaviour changes, are on [What is new in 2.0](/docs/reference/whats-new-2-0).

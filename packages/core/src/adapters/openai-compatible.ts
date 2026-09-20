@@ -434,6 +434,9 @@ async function* parseStream(
     if (choice.finish_reason) finishReason = mapFinish(choice.finish_reason);
   }
 
+  _ctx.usageAvailable?.(
+    typeof lastUsage?.prompt_tokens === 'number' && typeof lastUsage.completion_tokens === 'number',
+  );
   yield { type: 'finish', usage: mapOpenAIUsage(lastUsage), finishReason };
 }
 

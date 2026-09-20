@@ -1,4 +1,4 @@
-<!-- verified: 2026-08-12 against @deuz-sdk/core@2.0.0 · api-contract sha256:209a805b7f32
+<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
      sources: packages/core/src/{providers-compat,providers,openai,anthropic,google,xai,azure,bedrock,vertex,voyage,yunwu}.ts,
      packages/core/src/node/vertex-auth.ts, packages/core/src/types/{config,model,deps}.ts,
      packages/core/src/core/registry.ts, packages/core/src/internal/resolve-call.ts,

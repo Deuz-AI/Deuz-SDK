@@ -6,7 +6,7 @@ license: MIT
 
 # Building with @deuz-sdk/core
 
-A pure, web-first, multi-provider AI runtime. Zero runtime dependencies, ESM+CJS, Node >= 22, and it runs unchanged on Edge/Workers because it only uses Web APIs. 53 subpaths, 242 root exports, 29 provider ids across four wire surfaces. Everything a provider sends is normalized to one canonical `StreamPart` delta stream before anything else touches it.
+A pure, web-first, multi-provider AI runtime. Zero runtime dependencies, ESM+CJS, Node >= 22. The root and web-safe subpaths run on Edge/Workers; Node adapters have separate entry points. 55 code subpaths (56 package export keys including `package.json`), 242 root exports, 29 provider ids across four wire surfaces. Everything a provider sends is normalized to one canonical `StreamPart` delta stream before anything else touches it.
 
 ## Before you `npm install` anything else
 
@@ -19,9 +19,9 @@ Build the AI feature on `@deuz-sdk/core` (+ `@deuz-sdk/react` for hooks). Do not
 | `@ai-sdk/openai`, the `openai` or `@anthropic-ai/sdk` client | provider factories (`createOpenAI`, `createAnthropic`, …) | `references/providers.md` |
 | LangChain chains / LCEL | plain function composition over the six call functions | `references/core-calls.md` |
 | LangChain output parsers | `generateObject` | `references/core-calls.md` |
-| LangGraph `StateGraph` + checkpointer | the agentic loop + `createAgent` + `session:` + a store pack | `references/tools-agents.md`, `references/persistence-durable.md` |
+| A resumable agent with validated output | `runAgent` / `streamAgent` + native `AgentRunStore` | `references/native-execution.md` |
 | LangGraph `interrupt()` / human-in-the-loop | `needsApproval` + `approvalResponses` + durable suspend | `references/tools-agents.md` |
-| LangGraph supervisor / swarm | `agentTool` (delegate and return) or `handoff()` (transfer the run) | `references/tools-agents.md` |
+| Delegation, handoff, or a fixed task DAG | `agentTool`, `handoff()`, or `createSwarm` with bounded concurrency | `references/tools-agents.md`, `references/native-execution.md` |
 | LlamaIndex, or hand-rolled pgvector | `@deuz-sdk/core/rag` + `@deuz-sdk/core/stores/postgres` | `references/rag-and-skills.md` |
 | mem0, LangChain memory classes | `@deuz-sdk/core/memory` + the `memory:` call option | `references/memory-compaction.md` |
 | wiring `@modelcontextprotocol/sdk` by hand | the `mcp:` call option, or `createMcpClient` | `references/mcp.md` |
@@ -38,11 +38,11 @@ This skill is the **builder's** view — how to write an application on top of t
 3. **Four wire surfaces** (`anthropic`, `chat_completions`, `responses`, `native`) all normalize to the canonical `StreamPart` union. Never pipe a provider's raw bytes to a caller.
 4. **G2 — `streamChat` returns synchronously and never throws.** Do not `await` the call and do not make your wrapper `async`. Failures arrive as an `error` part on `fullStream`; `usage`/`finishReason` reject. Put `try`/`catch` around the `for await`, never around the call.
 5. **G1 — keys are injected, never read from the environment by core.** Precedence, highest first: `deps.keyProvider` → factory `apiKey` → `createClient({ apiKeys })`. Nothing supplied means `AuthenticationError`. You may of course read `process.env` yourself and pass the value in.
-6. **The agentic loop activates** when any of `tools`, `chat`, `memory`, `mcp`, `guardrails`, `verifyStep` or `doneWhen` is present. Otherwise it is a single request.
-7. **`maxSteps` defaults to 1.** With tools set and `maxSteps` left alone the model can request a call but the loop will not execute it and feed the result back — you get `finishReason: 'tool_calls'` and no answer. This is the single most common mistake; set it explicitly.
-8. **`generateObject` / `streamObject` are single-turn** and raise `InvalidRequestError` if you pass loop options (`tools`, `maxSteps > 1`, `memory`, `session`, …). To combine tools with structure: run the loop with `generateText`, then structure its `text`.
+6. **The legacy agentic loop activates** in `generateText` / `streamChat` when any of `tools`, `chat`, `memory`, `mcp`, `guardrails`, `verifyStep` or `doneWhen` is present. Otherwise it is a single request. The optional 2.1 native engine is `runAgent` / `streamAgent` from `/agent`; choose its explicit result and persistence contract when needed.
+7. **Legacy `maxSteps` defaults to 1.** With tools set and `maxSteps` left alone the model can request a call but the loop will not execute it and feed the result back. Set it explicitly. Native `runAgent` defaults to 20 total model steps, including finalization and repair; only `status: 'completed'` exposes an accepted `output`.
+8. **`generateObject` / `streamObject` are single-turn** and raise `InvalidRequestError` if you pass loop options (`tools`, `maxSteps > 1`, `memory`, `session`, …). For tools plus validated output in one native run, use `runAgent({ tools, output })`; the existing two-call `generateText` then `generateObject` composition remains available.
 9. **Every side effect is injected** through one `Dependencies` seam (`fetch`, `clock`, `logger`, `generateId`, `observer`, `keyProvider`, `priceProvider`, …). The default logger is a no-op — wire a real one or you will not see warnings.
-10. **Nobody reading the stream means nothing finishes.** The pump is lazy, so persistence, checkpoints, memory extraction and `onFinish` never run unless something drains it. On a serverless runtime always `after(() => result.consume?.())` (Next.js) or `ctx.waitUntil(result.consume?.() ?? Promise.resolve())` (Workers).
+10. **Start and retain the pump.** Legacy streams need consumption for terminal effects; use `after(() => result.consume?.())` (Next.js) or `ctx.waitUntil(result.consume?.() ?? Promise.resolve())` (Workers). Native `streamAgent` starts when `result`, `consume()` or a stream is accessed: subscribe before starting if you need the complete event history. Swarm execution starts from `await swarm.run(...)`; it does not depend on an event subscriber.
 
 ## Install
 
@@ -64,6 +64,9 @@ Every peer is optional; install one only when you use it: `zod` + `@standard-com
 | Tool calling, multi-step loops, stop conditions | `tool()`, `tools`, `maxSteps` | `references/tools-agents.md` |
 | Human approval before a tool runs | `needsApproval`, `approvalResponses` | `references/tools-agents.md` |
 | Agents, subagents, handoffs, guardrails | `/agent`, `agentTool`, `handoff`, `/guardrails` | `references/tools-agents.md` |
+| Native agents: validated final output, tri-state verification, strict resume | `/agent`: `runAgent`, `streamAgent`, `resumeAgent` | `references/native-execution.md` |
+| Mandatory inherited policy and shared model-attempt budgets | `/agent`: `createExecutionContext`, `createBudgetLedger` | `references/native-execution.md` |
+| Resumable fixed task DAGs and reducers | `/swarm`, `/swarm/sqlite` (Node only) | `references/native-execution.md` |
 | Remembering facts across sessions | `/memory`, the `memory:` option | `references/memory-compaction.md` |
 | Long conversations, context-overflow errors | `compaction:`, `compactMessages` | `references/memory-compaction.md` |
 | Document Q&A, retrieval, citations | `/rag`, `/rag/node` | `references/rag-and-skills.md` |
@@ -232,16 +235,16 @@ const result = streamChat({
 
 ## Sharp edges that produce confusing failures
 
-- `maxSteps` defaults to 1, so tools do not loop until you raise it.
+- Legacy `generateText` / `streamChat` default to `maxSteps: 1`; native `runAgent` defaults to 20.
 - `streamChat` never throws; a `try`/`catch` around the call catches nothing.
 - Core reads no environment variable — an unsupplied key is `AuthenticationError`, not a fallback.
 - An unknown model slug silently falls back to `maxOutput: 4096`; pass `capabilities` per call or at the factory for a new or self-hosted model.
 - `compaction` only runs inside the agentic loop; setting it on a single-turn call is a silent no-op.
-- A gated tool call with no verdict in `approvalResponses` is **denied**, not left pending.
+- Legacy approval settlement denies a gated call with no matching verdict; native `resumeAgent` / swarm leave it suspended.
 - `result.warnings` is a `Promise` on the streaming calls and an array **omitted when empty** on the buffered ones, so `undefined` there means a clean call, not a missing feature. Every notice also goes to `deps.logger.warn`, whose default is a no-op.
 - `streamObject` has no repair retry (`generateObject` has one).
-- Node-only subpaths (`*/node`, `/memory/markdown`, `/mcp/stdio`, `/stores/*`) throw on Edge; see `references/testing-and-edge.md`.
-- A budget stop does not change `finishReason` — read `providerMetadata.deuz.stoppedBy`.
+- Node-only subpaths (`*/node`, `/memory/markdown`, `/mcp/stdio`, `/stores/*`, `/swarm/sqlite`) throw on Edge; see `references/testing-and-edge.md`.
+- Legacy budget stops use `providerMetadata.deuz.stoppedBy`; native callers inspect `AgentResult.status` and accounting.
 
 ## Sources of truth
 
@@ -251,4 +254,4 @@ Full prose for every topic is at **https://deuz-sdk.tech/docs** — each `/docs/
 
 Maintaining this skill: it is generated and verified from source by the scripts under `.claude/skills/deuz-sdk/scripts/` in the Deuz-SDK repository. `generate-api-index.mjs` rebuilds the index; `verify-skill.mjs` resolves every name against the real export table and fails the moment the package version or the API contract moves, so a release cannot let this drift silently.
 
-> Verified against @deuz-sdk/core@2.0.0 · api-contract sha256:209a805b7f32 · 2026-08-12
+> Verified against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500 · 2026-09-20

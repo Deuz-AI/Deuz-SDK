@@ -36,17 +36,7 @@ import {
   DEFAULT_MAX_HANDOFFS,
   type HandoffTargetMeta,
 } from './handoff';
-// Static NAMED imports on purpose: tree-shaking keeps only the pipeline
-// functions in the bundle (a dynamic import would drag the whole module in).
-import {
-  recall,
-  remember,
-  sweepExpired,
-  formatMemoriesForPrompt,
-  defaultMemoryScorer,
-  type MemoryMutation,
-  type MemoryScorer,
-} from '../memory';
+import type { MemoryMutation, MemoryScorer } from '../memory';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
   applyCompaction,
@@ -81,6 +71,9 @@ import {
 } from '../internal/observe-runtime';
 import { toObservedError } from '../internal/observe-error';
 import type { ToolCompletedEvent, ToolDeniedEvent } from '../types/observe';
+import { ExecutionPersistenceError, isFatalExecutionError } from '../internal/execution-error';
+import type { UsageCostAccumulator } from '../internal/usage-cost';
+import type { SignedApprovalPayload } from '../durable';
 
 /**
  * Runaway guard: N consecutive is_error results for the SAME tool name hard-stop
@@ -136,6 +129,9 @@ export class SubAgentSuspension extends Error {
 
 /** Per-run durable state: the store/runId plus cross-leg counters. */
 export interface DurableRunner {
+  cost?: UsageCostAccumulator;
+  /** Internal native envelope hook, executed inside the strict save boundary. */
+  beforeSave?: (checkpoint: AgentCheckpoint) => void;
   store: SessionStore;
   runId: string;
   /** Cumulative usage from PRIOR legs (EMPTY on a fresh run). */
@@ -193,6 +189,7 @@ export async function saveCheckpoint(
   legUsage: Usage,
   pendingApprovals?: ToolApprovalRequest[],
 ): Promise<void> {
+  if (runner.cost) await runner.cost.flush();
   runner.stepIndex += 1;
   const checkpoint: AgentCheckpoint = {
     version: 1,
@@ -202,6 +199,7 @@ export async function saveCheckpoint(
     status,
     messages,
     usage: withTotal(durableUsage(runner, legUsage)),
+    ...(runner.cost ? { cost: runner.cost.snapshot() } : {}),
     ...(pendingApprovals && pendingApprovals.length > 0 ? { pendingApprovals } : {}),
     // Handoff (2.0): absent until a transfer happens, then on every checkpoint
     // of the run — the resume leg re-applies the overlay from it.
@@ -212,6 +210,7 @@ export async function saveCheckpoint(
   const ob = runner.observe;
   const span = ob?.rt.startSpan();
   try {
+    runner.beforeSave?.(checkpoint);
     await runner.store.save(checkpoint);
     if (ob && span) {
       ob.rt.emit({
@@ -244,8 +243,14 @@ export async function saveCheckpoint(
         stepId: checkpoint.stepId,
         durationMs: ob.rt.durationSince(span.startedAt),
         error: toObservedError(cause, ob.rt.capture.errorMessages),
-        runContinued: true,
+        runContinued: options.session?.durability !== 'strict',
       });
+    }
+    if (options.session?.durability === 'strict') {
+      throw new ExecutionPersistenceError(
+        `Checkpoint '${checkpoint.stepId}' could not be committed.`,
+        cause,
+      );
     }
   }
 }
@@ -286,6 +291,7 @@ export async function signApprovalRequests(
       })),
     );
   } catch (error) {
+    if (options.execution || options.session?.durability === 'strict') throw error;
     deps.logger.error('approval signing failed — requests go out unsigned', { error });
     return requests;
   }
@@ -304,6 +310,10 @@ export async function findApprovalNeeded(
   messages: Message[],
 ): Promise<Set<string>> {
   const needed = new Set<string>();
+  if (options.execution?.policy.requireApproval) {
+    for (const call of toolCalls) needed.add(call.toolCallId);
+    return needed;
+  }
   if (!toolCalls.some((c) => tools[c.toolName]?.needsApproval)) return needed;
   await Promise.all(
     toolCalls.map(async (call) => {
@@ -1818,36 +1828,87 @@ export async function settlePendingApprovals(
   // `needsApproval` exactly as it did on the leg that suspended.
   const guarded = await applyToolCallGuardrails(options, normalCalls, messages);
   const calls = guarded.calls;
-  const byId = new Map(responses.map((r) => [r.approvalId, r]));
+  const signer = options.approvalSigner;
+  const expectedRunId = options.session?.runId;
+  const payloads = new Map<ToolApprovalResponse, SignedApprovalPayload | null>();
+  let scopedResponses = responses;
+  if (options.execution && signer) {
+    for (const response of responses) {
+      const payload = response.token
+        ? await signer
+            .verify(
+              response.token,
+              options.approvalMaxAgeMs === undefined
+                ? undefined
+                : { maxAgeMs: options.approvalMaxAgeMs },
+            )
+            .catch(() => null)
+        : null;
+      payloads.set(response, payload);
+    }
+    // Provider call IDs can repeat in siblings. A valid signed token routes to
+    // its exact child, while malformed tokens still fail closed below.
+    scopedResponses = responses.filter((response) => {
+      const payload = payloads.get(response);
+      return (
+        !payload ||
+        (payload.runId === expectedRunId &&
+          sameApprovalValue(payload.agentPath ?? [], options.agentPath ?? []))
+      );
+    });
+  }
+  const byId = new Map(scopedResponses.map((r) => [r.approvalId, r]));
+  const duplicateVerdicts = new Set<string>();
+  if (options.execution) {
+    const seen = new Set<string>();
+    for (const response of scopedResponses) {
+      if (seen.has(response.approvalId)) duplicateVerdicts.add(response.approvalId);
+      seen.add(response.approvalId);
+    }
+  }
   const noVerdict = calls.filter((c) => !byId.has(c.toolCallId));
   const gated = await findApprovalNeeded(noVerdict, tools, options, messages);
 
   const denied: DenialMap = new Map();
-  const signer = options.approvalSigner;
-  const expectedRunId = options.session?.runId;
   for (const c of calls) {
     const verdict = byId.get(c.toolCallId);
     if (verdict) {
-      if (!verdict.approved) {
+      if (duplicateVerdicts.has(c.toolCallId)) {
+        denied.set(c.toolCallId, {
+          cause: 'response-denied',
+          reason: 'Duplicate approval verdicts.',
+        });
+      } else if (!verdict.approved) {
         denied.set(c.toolCallId, { cause: 'response-denied', reason: verdict.reason });
       } else if (signer) {
         // Signed-approval enforcement (1.7, D4): an APPROVAL must echo a token
         // that verifies, matches this approvalId, and — on durable runs —
         // binds to this runId. Anything else is a forgery/mismatch: DENY.
-        const payload = verdict.token
-          ? await signer.verify(
-              verdict.token,
-              options.approvalMaxAgeMs !== undefined
-                ? { maxAgeMs: options.approvalMaxAgeMs }
-                : undefined,
-            )
-          : null;
+        const payload = payloads.has(verdict)
+          ? payloads.get(verdict)!
+          : verdict.token
+            ? await signer
+                .verify(
+                  verdict.token,
+                  options.approvalMaxAgeMs !== undefined
+                    ? { maxAgeMs: options.approvalMaxAgeMs }
+                    : undefined,
+                )
+                .catch(() => null)
+            : null;
         const valid =
           payload !== null &&
           payload.approvalId === c.toolCallId &&
           (expectedRunId === undefined ||
             payload.runId === undefined ||
-            payload.runId === expectedRunId);
+            payload.runId === expectedRunId) &&
+          (!options.execution ||
+            (!duplicateVerdicts.has(c.toolCallId) &&
+              payload.runId === expectedRunId &&
+              payload.toolCallId === c.toolCallId &&
+              payload.toolName === c.toolName &&
+              sameApprovalValue(payload.input, c.args) &&
+              sameApprovalValue(payload.agentPath ?? [], options.agentPath ?? [])));
         if (!valid) {
           denied.set(c.toolCallId, {
             cause: 'response-denied',
@@ -1911,6 +1972,23 @@ export async function settlePendingApprovals(
   };
 }
 
+/** Signed JSON values compare structurally, independent of object key order. */
+function sameApprovalValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ak = Object.keys(a).sort();
+  const bk = Object.keys(b).sort();
+  return (
+    ak.length === bk.length &&
+    ak.every(
+      (key, i) =>
+        key === bk[i] &&
+        sameApprovalValue((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key]),
+    )
+  );
+}
+
 /**
  * Extra per-step wiring for `execute`'s context: the sub-agent seam. `deps` and
  * `reportUsage` let an `agentTool` reuse the parent transport and fold its usage
@@ -1922,7 +2000,7 @@ export interface ExecuteExtras {
   deps?: ResolvedDependencies;
   emitPart?: (part: StreamPart) => void;
   reportUsage?: (usage: Usage) => void;
-  session?: { store: SessionStore; runId: string };
+  session?: { store: SessionStore; runId: string; durability?: 'best-effort' | 'strict' };
   approvalResponses?: ToolApprovalResponse[];
   /**
    * Observation (1.6): loop-owned correlation for tool events. The loop
@@ -1997,17 +2075,19 @@ type ToolExecOutcome = { timedOut: true } | { timedOut: false; value: unknown };
  * cleared on EVERY exit path (resolve, reject, expiry) so a long agentic run
  * cannot accumulate armed timers.
  *
- * On expiry the execution is ABANDONED, not killed — JS cannot kill a running
- * promise. Two things happen instead: the tool's own signal is aborted (a
- * well-behaved tool passing it to `fetch` / an MCP client / a sandbox stops
- * working), and the orphaned promise gets a no-op catch, because nobody awaits it
- * anymore and an unhandled rejection would take a Node process down.
+ * On expiry the tool's signal is aborted; JavaScript cannot forcibly kill an
+ * ignored cancellation. Legacy callers abandon the promise with a catch.
+ * Native callers retain their execution slot until the effect settles, so a
+ * timeout cannot release a swarm executor or allow an overlapping retry. Late
+ * values and ordinary errors keep the timeout outcome; fatal infrastructure
+ * failures and durable suspension still propagate after the effect drains.
  */
 async function runWithToolTimeout(
   clock: Clock,
   ms: number,
   expiry: AbortController,
   invoke: () => Promise<unknown>,
+  drainAfterTimeout = false,
 ): Promise<ToolExecOutcome> {
   let cancelTimer: (() => void) | undefined;
   const deadline = new Promise<ToolExecOutcome>((resolve) => {
@@ -2020,7 +2100,13 @@ async function runWithToolTimeout(
     const outcome = await Promise.race([work, deadline]);
     if (outcome.timedOut) {
       expiry.abort(new TimeoutError('total', `Tool execution exceeded ${ms}ms.`));
-      void work.catch(() => {});
+      if (drainAfterTimeout) {
+        try {
+          await work;
+        } catch (error) {
+          if (error instanceof SubAgentSuspension || isFatalExecutionError(error)) throw error;
+        }
+      } else void work.catch(() => {});
     }
     return outcome;
   } finally {
@@ -2060,172 +2146,101 @@ export async function executeTools(
   // keeps the pre-1.9 path allocation-free: no `timeout` → no object, no timer.
   const callToolMs =
     options.timeout === undefined ? undefined : resolveTimeouts(options.timeout).toolMs;
-  return mapWithConcurrency(toolCalls, cap, async (call): Promise<ToolResult> => {
-    // OWN-key lookup (see lookupTool): an inherited `Object.prototype` member
-    // must classify as UNKNOWN, not as an executor-less client tool.
-    const tool: Tool | undefined = lookupTool(tools, call.toolName);
-
-    // Observation (1.6): one tool span per call, emitted INSIDE the worker so
-    // parallel events interleave in real completion order. Provider tools
-    // never reach here — they emit no tool events by design.
-    const ob = extras?.observe;
-    const obSpan = ob?.rt.startSpan();
-    const obBase = ob
-      ? {
-          spanId: obSpan!.spanId,
-          parentSpanId: ob.parentSpanId,
-          stepIndex: ob.stepIndex,
-          agentPath: options.agentPath,
-          toolCallId: call.toolCallId,
+  const nativeBatch = options.execution ? new AbortController() : undefined;
+  const nativePolicy = options.execution ? await import('../internal/native-request') : undefined;
+  const batchErrors: unknown[] = [];
+  if (nativeBatch)
+    options = { ...options, signal: combineSignals([options.signal, nativeBatch.signal]) };
+  const results = mapWithConcurrency(
+    toolCalls,
+    cap,
+    async (call): Promise<ToolResult> => {
+      // OWN-key lookup (see lookupTool): an inherited `Object.prototype` member
+      // must classify as UNKNOWN, not as an executor-less client tool.
+      const tool: Tool | undefined = lookupTool(tools, call.toolName);
+      if (options.execution) {
+        nativePolicy!.assertExecutionPolicy(options.execution, {
           toolName: call.toolName,
-        }
-      : undefined;
-    if (ob) {
-      ob.rt.emit({
-        type: 'tool.started',
-        ...obBase!,
-        needsApproval: tool?.needsApproval !== undefined && tool.needsApproval !== false,
-        // An UNKNOWN name has no mode; it reports 'client' rather than widening
-        // this locked union (append-only surface) — the tool.failed event that
-        // follows immediately carries the real story.
-        executionMode: tool?.execute ? 'server' : 'client',
-        parallel,
-        ...(ob.rt.capture.toolInputs ? { capturedInput: call.args } : {}),
-      });
-    }
-    /** tool.failed with the ORIGINAL cause — nothing downstream retains it. */
-    const emitToolFailed = (cause: unknown, selfHealed: boolean): void => {
-      if (!ob) return;
-      ob.rt.emit({
-        type: 'tool.failed',
-        ...obBase!,
-        durationMs: ob.rt.durationSince(obSpan!.startedAt),
-        selfHealed,
-        consecutiveFailureCount: (ob.counters?.get(call.toolName) ?? 0) + 1,
-        error: toObservedError(cause, ob.rt.capture.errorMessages),
-      });
-    };
+          now: extras?.deps?.clock.now(),
+        });
+        if (options.signal?.aborted)
+          throw options.signal.reason ?? new Error('Execution cancelled.');
+      }
 
-    // Spans settle in the tracer bridge (tool.completed/failed/denied events).
-    const settle = (result: ToolResult): ToolResult => result;
-    try {
-      if (denied?.has(call.toolCallId)) {
-        const denial = denied.get(call.toolCallId)!;
-        if (ob) {
-          ob.rt.emit({
-            type: 'tool.denied',
-            ...obBase!,
-            cause: denial.cause,
-            ...(denial.reason ? { reason: denial.reason } : {}),
+      // Observation (1.6): one tool span per call, emitted INSIDE the worker so
+      // parallel events interleave in real completion order. Provider tools
+      // never reach here — they emit no tool events by design.
+      const ob = extras?.observe;
+      const obSpan = ob?.rt.startSpan();
+      const obBase = ob
+        ? {
+            spanId: obSpan!.spanId,
+            parentSpanId: ob.parentSpanId,
+            stepIndex: ob.stepIndex,
+            agentPath: options.agentPath,
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+          }
+        : undefined;
+      if (ob) {
+        ob.rt.emit({
+          type: 'tool.started',
+          ...obBase!,
+          needsApproval: tool?.needsApproval !== undefined && tool.needsApproval !== false,
+          // An UNKNOWN name has no mode; it reports 'client' rather than widening
+          // this locked union (append-only surface) — the tool.failed event that
+          // follows immediately carries the real story.
+          executionMode: tool?.execute ? 'server' : 'client',
+          parallel,
+          ...(ob.rt.capture.toolInputs ? { capturedInput: call.args } : {}),
+        });
+      }
+      /** tool.failed with the ORIGINAL cause — nothing downstream retains it. */
+      const emitToolFailed = (cause: unknown, selfHealed: boolean): void => {
+        if (!ob) return;
+        ob.rt.emit({
+          type: 'tool.failed',
+          ...obBase!,
+          durationMs: ob.rt.durationSince(obSpan!.startedAt),
+          selfHealed,
+          consecutiveFailureCount: (ob.counters?.get(call.toolName) ?? 0) + 1,
+          error: toObservedError(cause, ob.rt.capture.errorMessages),
+        });
+      };
+
+      // Spans settle in the tracer bridge (tool.completed/failed/denied events).
+      const settle = (result: ToolResult): ToolResult => result;
+      try {
+        if (denied?.has(call.toolCallId)) {
+          const denial = denied.get(call.toolCallId)!;
+          if (ob) {
+            ob.rt.emit({
+              type: 'tool.denied',
+              ...obBase!,
+              cause: denial.cause,
+              ...(denial.reason ? { reason: denial.reason } : {}),
+            });
+          }
+          return settle({
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            result: denial.reason ? `${TOOL_DENIED} Reason: ${denial.reason}` : TOOL_DENIED,
+            isError: true,
           });
         }
-        return settle({
-          toolCallId: call.toolCallId,
-          toolName: call.toolName,
-          result: denial.reason ? `${TOOL_DENIED} Reason: ${denial.reason}` : TOOL_DENIED,
-          isError: true,
-        });
-      }
-      if (!tool) {
-        // Hallucinated tool name (1.9): self-heal like every other tool failure —
-        // an is_error tool_result naming the REAL tools, produced in this same
-        // turn so every tool_use_id stays answered (Anthropic 400 guard). It
-        // deliberately DOES count toward MAX_SAME_TOOL_ERRORS: unlike an
-        // approval denial (a human/policy verdict the model cannot fix, hence
-        // excluded), an invented name is a model-side defect it is expected to
-        // correct from this feedback — and a model re-calling the SAME invented
-        // name forever is precisely the runaway the guard exists for. The
-        // counter keys on toolName, so the invented name gets its own budget
-        // and never poisons a real tool's.
-        const message = unknownToolMessage(tools, call.toolName);
-        emitToolFailed(new Error(message), true);
-        return settle({
-          toolCallId: call.toolCallId,
-          toolName: call.toolName,
-          result: message,
-          isError: true,
-        });
-      }
-      if (!tool.execute) {
-        emitToolFailed(new Error('No server-side executor.'), true);
-        return settle({
-          toolCallId: call.toolCallId,
-          toolName: call.toolName,
-          result: 'No server-side executor.',
-          isError: true,
-        });
-      }
-      const validation = await validateOutput(tool.parameters, call.args);
-      if (!validation.ok) {
-        emitToolFailed(new Error(`Invalid arguments: ${validation.issues}`), true);
-        return settle({
-          toolCallId: call.toolCallId,
-          toolName: call.toolName,
-          result: `Invalid arguments: ${validation.issues}`,
-          isError: true,
-        });
-      }
-      // Per-execution cap (1.9): the tool's OWN `timeoutMs` outranks the call's
-      // `timeout.toolMs`; neither set = no cap, i.e. the pre-1.9 behaviour where a
-      // hung MCP server or a selector-less browser click held the agent forever.
-      // A cap needs the injected clock to schedule it — with no `extras.deps`
-      // (only reachable from a direct `executeTools` call, never from a loop)
-      // there is nothing to schedule on, so the call stays uncapped rather than
-      // reaching for an ambient timer.
-      const capMs = tool.timeoutMs ?? callToolMs;
-      const clock: Clock | undefined = extras?.deps?.clock;
-      const timed = capMs !== undefined && capMs > 0 && clock !== undefined;
-      const expiry = timed ? new AbortController() : undefined;
-      try {
-        // Sub-agent inheritance: a per-call deps clone carries the runtime +
-        // this tool call's span via a non-enumerable symbol (parallel-safe).
-        const ctxDeps =
-          extras?.deps && ob
-            ? attachInheritedObserve(
-                { ...extras.deps },
-                { runtime: ob.rt, parentSpanId: obSpan!.spanId },
-              )
-            : extras?.deps;
-        const ctx: ToolExecuteContext = {
-          toolCallId: call.toolCallId,
-          messages,
-          // The expiry signal is MERGED with the caller's, never replacing it: a
-          // user abort and a tool timeout must both reach the tool.
-          signal: expiry ? combineSignals([options.signal, expiry.signal]) : options.signal,
-          // Request-scoped context (2.0), forwarded UNTOUCHED — the same value
-          // prepareStep/verifyStep/doneWhen and the guardrails see. Omitted (not
-          // `undefined`) when the call carries none. This is also the settle
-          // path's route: `settlePendingApprovals` executes through here.
-          ...runtimeContextOf(options),
-          ...(options.agentPath ? { agentPath: options.agentPath } : {}),
-          ...(options.approveToolCall ? { approveToolCall: options.approveToolCall } : {}),
-          ...(ctxDeps ? { deps: ctxDeps } : {}),
-          ...(extras?.emitPart ? { emitPart: extras.emitPart } : {}),
-          ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
-          ...(extras?.session ? { session: extras.session } : {}),
-          ...(extras?.approvalResponses ? { approvalResponses: extras.approvalResponses } : {}),
-        };
-        const invoke = (): Promise<unknown> =>
-          Promise.resolve(tool.execute!(validation.value, ctx));
-        const outcome: ToolExecOutcome = timed
-          ? await runWithToolTimeout(clock, capMs, expiry!, invoke)
-          : { timedOut: false, value: await invoke() };
-        if (outcome.timedOut) {
-          // SELF-HEALING, never fatal: the abandoned call still gets a
-          // tool_result, so every tool_use_id stays answered (Anthropic 400
-          // guard) and the model can react — retry with a narrower input, or
-          // pick another tool.
-          //
-          // It DOES count toward MAX_SAME_TOOL_ERRORS. An approval denial is
-          // excluded because it is a human/policy verdict the model cannot fix,
-          // and re-asking is the correct behaviour; a timeout is the opposite —
-          // a tool that hangs three times in a row is precisely the runaway the
-          // guard exists for, and each repetition costs the FULL cap in wall
-          // clock (3 × 30s on a serverless budget of 25s). If the model recovers,
-          // one success resets the counter (`bumpErrorGuard`), so a flaky-but-
-          // usable tool is never permanently disqualified.
-          const message = `Tool '${call.toolName}' timed out after ${capMs}ms and was abandoned.`;
-          emitToolFailed(new TimeoutError('total', message), true);
+        if (!tool) {
+          // Hallucinated tool name (1.9): self-heal like every other tool failure —
+          // an is_error tool_result naming the REAL tools, produced in this same
+          // turn so every tool_use_id stays answered (Anthropic 400 guard). It
+          // deliberately DOES count toward MAX_SAME_TOOL_ERRORS: unlike an
+          // approval denial (a human/policy verdict the model cannot fix, hence
+          // excluded), an invented name is a model-side defect it is expected to
+          // correct from this feedback — and a model re-calling the SAME invented
+          // name forever is precisely the runaway the guard exists for. The
+          // counter keys on toolName, so the invented name gets its own budget
+          // and never poisons a real tool's.
+          const message = unknownToolMessage(tools, call.toolName);
+          emitToolFailed(new Error(message), true);
           return settle({
             toolCallId: call.toolCallId,
             toolName: call.toolName,
@@ -2233,46 +2248,187 @@ export async function executeTools(
             isError: true,
           });
         }
-        const out = outcome.value;
-        if (ob) {
-          ob.rt.emit({
-            type: 'tool.completed',
-            ...obBase!,
-            durationMs: ob.rt.durationSince(obSpan!.startedAt),
-            outputType: outputTypeOf(out),
-            ...(typeof out === 'string' ? { outputSize: out.length } : {}),
-            ...(ob.rt.capture.toolOutputs ? { capturedOutput: out } : {}),
+        if (!tool.execute) {
+          emitToolFailed(new Error('No server-side executor.'), true);
+          return settle({
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            result: 'No server-side executor.',
+            isError: true,
           });
         }
-        return settle({ toolCallId: call.toolCallId, toolName: call.toolName, result: out });
+        const validation = await validateOutput(tool.parameters, call.args);
+        if (!validation.ok) {
+          emitToolFailed(new Error(`Invalid arguments: ${validation.issues}`), true);
+          return settle({
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            result: `Invalid arguments: ${validation.issues}`,
+            isError: true,
+          });
+        }
+        // Per-execution cap (1.9): the tool's OWN `timeoutMs` outranks the call's
+        // `timeout.toolMs`; neither set = no cap, i.e. the pre-1.9 behaviour where a
+        // hung MCP server or a selector-less browser click held the agent forever.
+        // A cap needs the injected clock to schedule it — with no `extras.deps`
+        // (only reachable from a direct `executeTools` call, never from a loop)
+        // there is nothing to schedule on, so the call stays uncapped rather than
+        // reaching for an ambient timer.
+        const clock: Clock | undefined = extras?.deps?.clock;
+        const deadlineMs =
+          options.execution?.policy.deadlineAt !== undefined && clock
+            ? Math.max(1, options.execution.policy.deadlineAt - clock.now())
+            : undefined;
+        const requestedCap = tool.timeoutMs ?? callToolMs;
+        const capMs =
+          deadlineMs === undefined
+            ? requestedCap
+            : requestedCap !== undefined && requestedCap > 0
+              ? Math.min(requestedCap, deadlineMs)
+              : deadlineMs;
+        const timed = capMs !== undefined && capMs > 0 && clock !== undefined;
+        const expiry = timed ? new AbortController() : undefined;
+        try {
+          // Sub-agent inheritance: a per-call deps clone carries the runtime +
+          // this tool call's span via a non-enumerable symbol (parallel-safe).
+          const ctxDeps =
+            extras?.deps && ob
+              ? attachInheritedObserve(
+                  { ...extras.deps },
+                  { runtime: ob.rt, parentSpanId: obSpan!.spanId },
+                )
+              : extras?.deps;
+          const ctx: ToolExecuteContext = {
+            toolCallId: call.toolCallId,
+            messages,
+            // The expiry signal is MERGED with the caller's, never replacing it: a
+            // user abort and a tool timeout must both reach the tool.
+            signal: expiry ? combineSignals([options.signal, expiry.signal]) : options.signal,
+            // Request-scoped context (2.0), forwarded UNTOUCHED — the same value
+            // prepareStep/verifyStep/doneWhen and the guardrails see. Omitted (not
+            // `undefined`) when the call carries none. This is also the settle
+            // path's route: `settlePendingApprovals` executes through here.
+            ...runtimeContextOf(options),
+            ...(options.agentPath ? { agentPath: options.agentPath } : {}),
+            ...(options.approveToolCall ? { approveToolCall: options.approveToolCall } : {}),
+            ...(options.approvalSigner ? { approvalSigner: options.approvalSigner } : {}),
+            ...(options.execution ? { execution: options.execution } : {}),
+            ...(options.approvalMaxAgeMs !== undefined
+              ? { approvalMaxAgeMs: options.approvalMaxAgeMs }
+              : {}),
+            ...(ctxDeps ? { deps: ctxDeps } : {}),
+            ...(extras?.emitPart ? { emitPart: extras.emitPart } : {}),
+            ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
+            ...(extras?.session ? { session: extras.session } : {}),
+            ...(extras?.approvalResponses ? { approvalResponses: extras.approvalResponses } : {}),
+          };
+          const invoke = async (): Promise<unknown> => {
+            if (options.execution) {
+              nativePolicy!.assertExecutionPolicy(options.execution, {
+                toolName: call.toolName,
+                now: clock?.now(),
+              });
+              if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('Execution cancelled.');
+            }
+            return tool.execute!(validation.value, ctx);
+          };
+          const outcome: ToolExecOutcome = timed
+            ? await runWithToolTimeout(
+                clock,
+                capMs,
+                expiry!,
+                invoke,
+                options.execution !== undefined,
+              )
+            : { timedOut: false, value: await invoke() };
+          if (outcome.timedOut) {
+            // Ordinary timeouts self-heal: the settled native or abandoned legacy call gets a
+            // tool_result, so every tool_use_id stays answered (Anthropic 400
+            // guard) and the model can react — retry with a narrower input, or
+            // pick another tool.
+            //
+            // It DOES count toward MAX_SAME_TOOL_ERRORS. An approval denial is
+            // excluded because it is a human/policy verdict the model cannot fix,
+            // and re-asking is the correct behaviour; a timeout is the opposite —
+            // a tool that hangs three times in a row is precisely the runaway the
+            // guard exists for, and each repetition costs the FULL cap in wall
+            // clock (3 × 30s on a serverless budget of 25s). If the model recovers,
+            // one success resets the counter (`bumpErrorGuard`), so a flaky-but-
+            // usable tool is never permanently disqualified.
+            const message = options.execution
+              ? `Tool '${call.toolName}' timed out after ${capMs}ms. Its execution has settled.`
+              : `Tool '${call.toolName}' timed out after ${capMs}ms and was abandoned.`;
+            emitToolFailed(new TimeoutError('total', message), true);
+            return settle({
+              toolCallId: call.toolCallId,
+              toolName: call.toolName,
+              result: message,
+              isError: true,
+            });
+          }
+          const out = outcome.value;
+          if (ob) {
+            ob.rt.emit({
+              type: 'tool.completed',
+              ...obBase!,
+              durationMs: ob.rt.durationSince(obSpan!.startedAt),
+              outputType: outputTypeOf(out),
+              ...(typeof out === 'string' ? { outputSize: out.length } : {}),
+              ...(ob.rt.capture.toolOutputs ? { capturedOutput: out } : {}),
+            });
+          }
+          return settle({ toolCallId: call.toolCallId, toolName: call.toolName, result: out });
+        } catch (cause) {
+          // A durable sub-agent suspension is control flow, not a tool failure —
+          // it must reach the loop verbatim so the parent suspends too.
+          if (cause instanceof SubAgentSuspension || isFatalExecutionError(cause)) throw cause;
+          emitToolFailed(cause, true);
+          // Surface the thrown message to the model (self-heal feedback): a tool
+          // that throws `new Error('File not found')` should tell the model that,
+          // not an opaque "threw during execution".
+          const err = new ToolExecutionError(call.toolName, {
+            toolCallId: call.toolCallId,
+            cause,
+            ...(cause instanceof Error && cause.message ? { message: cause.message } : {}),
+          });
+          return settle({
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            result: err.message,
+            isError: true,
+          });
+        }
       } catch (cause) {
-        // A durable sub-agent suspension is control flow, not a tool failure —
-        // it must reach the loop verbatim so the parent suspends too.
-        if (cause instanceof SubAgentSuspension) throw cause;
-        emitToolFailed(cause, true);
-        // Surface the thrown message to the model (self-heal feedback): a tool
-        // that throws `new Error('File not found')` should tell the model that,
-        // not an opaque "threw during execution".
-        const err = new ToolExecutionError(call.toolName, {
-          toolCallId: call.toolCallId,
-          cause,
-          ...(cause instanceof Error && cause.message ? { message: cause.message } : {}),
-        });
-        return settle({
-          toolCallId: call.toolCallId,
-          toolName: call.toolName,
-          result: err.message,
-          isError: true,
-        });
+        // Only control flow (SubAgentSuspension) or unexpected plumbing errors
+        // reach here. A suspension is not a tool failure (no tool event);
+        // anything else reports before propagating.
+        if (!(cause instanceof SubAgentSuspension)) emitToolFailed(cause, false);
+        throw cause;
       }
-    } catch (cause) {
-      // Only control flow (SubAgentSuspension) or unexpected plumbing errors
-      // reach here. A suspension is not a tool failure (no tool event);
-      // anything else reports before propagating.
-      if (!(cause instanceof SubAgentSuspension)) emitToolFailed(cause, false);
-      throw cause;
-    }
-  });
+    },
+    nativeBatch
+      ? {
+          drainOnError: true,
+          onError: (error) => {
+            batchErrors.push(error);
+            // Approval suspension waits for siblings; infrastructure failure cancels them.
+            if (!(error instanceof SubAgentSuspension)) nativeBatch.abort(error);
+          },
+        }
+      : undefined,
+  );
+  if (!nativeBatch) return results;
+  try {
+    return await results;
+  } catch (error) {
+    const fatal = batchErrors.find((item) => !(item instanceof SubAgentSuspension));
+    if (fatal !== undefined) throw fatal;
+    if (batchErrors.length > 0)
+      throw new SubAgentSuspension(
+        batchErrors.flatMap((item) => (item as SubAgentSuspension).approvals),
+      );
+    throw error;
+  }
 }
 
 // --- Loop-level observation (1.6): shared by the buffered + streaming loops ---
@@ -2541,8 +2697,6 @@ export async function computeRecallBlock(
   // `'default'` selects the built-in Generative-Agents scorer without making the
   // caller import it; anything else is used verbatim. Omitted = raw store
   // ranking, the pre-2.0 behavior.
-  const scorer: MemoryScorer | undefined =
-    recallOpts.scorer === 'default' ? defaultMemoryScorer : recallOpts.scorer;
   // Observation (2.0): one operation span per recall. Guarded so the observer-less
   // fast path allocates no event and draws no extra id (scripted-id fixtures).
   const span = ob?.rt.startSpan();
@@ -2557,6 +2711,10 @@ export async function computeRecallBlock(
     });
   }
   try {
+    const { recall, formatMemoriesForPrompt, defaultMemoryScorer } =
+      await import('../internal/memory-pipeline');
+    const scorer: MemoryScorer | undefined =
+      recallOpts.scorer === 'default' ? defaultMemoryScorer : recallOpts.scorer;
     const hits = await recall(
       { scope: memory.scope, text, topK: recallOpts.topK ?? 5 },
       memory.seams,
@@ -2659,43 +2817,46 @@ export function startMemoryExtract(
       operation: 'memory.extract',
     });
   }
-  const settled = remember(turns, memory.scope, memory.seams, { infer }).then(
-    (mutations) => {
-      if (ob && span) {
-        ob.rt.emit({
-          type: 'operation.completed',
-          spanId: span.spanId,
-          parentSpanId: ob.parentSpanId,
-          agentPath: options.agentPath,
-          subsystem: 'memory',
-          operation: 'memory.extract',
-          durationMs: ob.rt.durationSince(span.startedAt),
-          resultCount: mutations.length,
-        });
-      }
-      return mutations;
-    },
-    (error: unknown) => {
-      deps.logger.error('memory extract failed', { error });
-      if (ob && span) {
-        ob.rt.emit({
-          type: 'operation.failed',
-          spanId: span.spanId,
-          parentSpanId: ob.parentSpanId,
-          agentPath: options.agentPath,
-          subsystem: 'memory',
-          operation: 'memory.extract',
-          durationMs: ob.rt.durationSince(span.startedAt),
-          error: toObservedError(error, ob.rt.capture.errorMessages),
-        });
-      }
-      return [] as MemoryMutation[];
-    },
-  );
+  const extract = import('../internal/memory-pipeline');
+  const settled = extract
+    .then(({ remember }) => remember(turns, memory.scope, memory.seams, { infer }))
+    .then(
+      (mutations) => {
+        if (ob && span) {
+          ob.rt.emit({
+            type: 'operation.completed',
+            spanId: span.spanId,
+            parentSpanId: ob.parentSpanId,
+            agentPath: options.agentPath,
+            subsystem: 'memory',
+            operation: 'memory.extract',
+            durationMs: ob.rt.durationSince(span.startedAt),
+            resultCount: mutations.length,
+          });
+        }
+        return mutations;
+      },
+      (error: unknown) => {
+        deps.logger.error('memory extract failed', { error });
+        if (ob && span) {
+          ob.rt.emit({
+            type: 'operation.failed',
+            spanId: span.spanId,
+            parentSpanId: ob.parentSpanId,
+            agentPath: options.agentPath,
+            subsystem: 'memory',
+            operation: 'memory.extract',
+            durationMs: ob.rt.durationSince(span.startedAt),
+            error: toObservedError(error, ob.rt.capture.errorMessages),
+          });
+        }
+        return [] as MemoryMutation[];
+      },
+    );
   if (memory.sweep === 'on-extract') {
     void settled.then(async () => {
       try {
-        await sweepExpired(memory.seams.store, memory.scope, deps.clock);
+        await (await extract).sweepExpired(memory.seams.store, memory.scope, deps.clock);
       } catch (error) {
         deps.logger.error('memory sweep failed', { error });
       }

@@ -1,0 +1,14 @@
+{
+  "Name": "deuz-docs-search",
+  "Comment": "Orama search: key on query strings, short TTL",
+  "DefaultTTL": 300,
+  "MaxTTL": 3600,
+  "MinTTL": 0,
+  "ParametersInCacheKeyAndForwardedToOrigin": {
+    "EnableAcceptEncodingGzip": true,
+    "EnableAcceptEncodingBrotli": true,
+    "HeadersConfig": { "HeaderBehavior": "none" },
+    "CookiesConfig": { "CookieBehavior": "none" },
+    "QueryStringsConfig": { "QueryStringBehavior": "all" }
+  }
+}

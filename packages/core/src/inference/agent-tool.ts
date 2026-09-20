@@ -12,7 +12,11 @@ import type { LanguageModel } from '../types/model';
 import type { Message } from '../types/message';
 import type { Dependencies } from '../types/deps';
 import type { JSONSchema } from '../types/schema';
-import { runStreamToolLoop, type StreamToolLoopInternal } from './stream-tool-loop';
+import {
+  runStreamToolLoop,
+  type StreamToolLoopInternal,
+  type StreamToolLoopSnapshot,
+} from './stream-tool-loop';
 import { SubAgentSuspension } from './loop-shared';
 import { readInheritedObserve } from '../internal/observe-runtime';
 import { toObservedError } from '../internal/observe-error';
@@ -48,11 +52,18 @@ const PROMPT_SCHEMA: JSONSchema = {
   additionalProperties: false,
 };
 
+const delegationExecutors = new WeakSet<NonNullable<Tool['execute']>>();
+
+/** Internal native adapter guard: scoped public contexts cannot carry delegation internals. */
+export function isAgentDelegationTool(tool: Tool): boolean {
+  return tool.execute !== undefined && delegationExecutors.has(tool.execute);
+}
+
 // Returns a plain `Tool` (unknown/unknown) so it drops straight into a
 // `ToolSet` — the prompt shape is enforced by `PROMPT_SCHEMA`, not the generic.
 export function agentTool(def: AgentToolDef): Tool {
   const maxDepth = def.maxDepth ?? 2;
-  return {
+  const tool: Tool = {
     description: def.description,
     parameters: PROMPT_SCHEMA,
     ...(def.needsApproval !== undefined ? { needsApproval: def.needsApproval } : {}),
@@ -96,19 +107,33 @@ export function agentTool(def: AgentToolDef): Tool {
         ? {
             store: ctx.session.store,
             runId: `${ctx.session.runId}::${def.name}#${ctx.toolCallId}`,
+            ...(ctx.session.durability ? { durability: ctx.session.durability } : {}),
           }
         : undefined;
       let resume: StreamToolLoopInternal | undefined;
+      let snapshot: StreamToolLoopSnapshot | undefined;
       let childMessages: Message[] = [
         ...(def.system ? [{ role: 'system', content: def.system } as Message] : []),
         { role: 'user', content: prompt },
       ];
       if (childSession) {
         const checkpoint = await childSession.store.load(childSession.runId);
-        if (checkpoint && checkpoint.status === 'suspended') {
+        if (checkpoint && (checkpoint.status === 'suspended' || ctx.execution)) {
+          if (ctx.execution && checkpoint.status === 'completed') {
+            const last = [...checkpoint.messages].reverse().find((m) => m.role === 'assistant');
+            const text =
+              typeof last?.content === 'string'
+                ? last.content
+                : last?.content
+                    .filter((p) => p.type === 'text')
+                    .map((p) => p.text)
+                    .join('');
+            return text || '(the sub-agent finished without a text answer)';
+          }
           childMessages = [...checkpoint.messages];
           resume = {
             resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+            ...(checkpoint.cost ? { resumeCost: checkpoint.cost } : {}),
             // Handoff (2.0): the CHILD's checkpoint carries the child's own
             // active agent, so a sub-agent that transferred and then suspended
             // must resume as that agent — exactly what `resumeFromCheckpoint`
@@ -163,6 +188,15 @@ export function agentTool(def: AgentToolDef): Tool {
           ...(ctx.runtimeContext !== undefined ? { runtimeContext: ctx.runtimeContext } : {}),
           // Inherit the parent's server-mode approver so sub-agent calls stay gated.
           ...(ctx.approveToolCall ? { approveToolCall: ctx.approveToolCall } : {}),
+          ...(ctx.approvalSigner ? { approvalSigner: ctx.approvalSigner } : {}),
+          ...(ctx.execution
+            ? {
+                execution: ctx.execution.child({
+                  scopeId: childSession?.runId ?? `${ctx.execution.scopeId}/${ctx.toolCallId}`,
+                }),
+              }
+            : {}),
+          ...(ctx.approvalMaxAgeMs !== undefined ? { approvalMaxAgeMs: ctx.approvalMaxAgeMs } : {}),
           ...(innerDeps ? { deps: innerDeps } : {}),
           ...(childSession ? { session: childSession } : {}),
           // Forwarded verdicts settle a resumed child's pending calls; fresh
@@ -171,6 +205,9 @@ export function agentTool(def: AgentToolDef): Tool {
         },
         {
           ...resume,
+          onSnapshot: (value) => {
+            snapshot = value;
+          },
           ...(observe && subSpan
             ? { observeInherited: { runtime: observe.runtime, parentSpanId: subSpan.spanId } }
             : {}),
@@ -181,6 +218,15 @@ export function agentTool(def: AgentToolDef): Tool {
       let stepText = '';
       let lastNonEmpty = '';
       const pendingApprovals: ToolApprovalRequest[] = [];
+      let usageReported = false;
+      const reportUsage = async (): Promise<void> => {
+        if (usageReported) return;
+        await inner.consume!();
+        if (snapshot) {
+          ctx.reportUsage?.(snapshot.usage);
+          usageReported = true;
+        }
+      };
       try {
         for await (const part of inner.fullStream) {
           if (part.type === 'step-finish') childStepCount += 1;
@@ -200,6 +246,7 @@ export function agentTool(def: AgentToolDef): Tool {
               // A deeper descendant's path survives; this loop's own breaks
               // carry `path` from the child loop already, but keep the fallback.
               agentPath: part.agentPath ?? path,
+              ...(part.token ? { token: part.token } : {}),
             });
           } else if (part.type === 'error') throw part.error;
           if (forward) ctx.emitPart!({ type: 'sub-agent', agentPath: path, part });
@@ -208,7 +255,7 @@ export function agentTool(def: AgentToolDef): Tool {
         // Fold the sub-agent's cumulative usage into the parent (result + budget).
         // On a suspension this runs BEFORE the signal below, so the suspended
         // parent's checkpoint still counts the child's tokens.
-        ctx.reportUsage?.(await inner.usage);
+        await reportUsage();
 
         if (pendingApprovals.length > 0) {
           if (childSession) {
@@ -256,6 +303,7 @@ export function agentTool(def: AgentToolDef): Tool {
         const answer = stepText.trim() ? stepText : lastNonEmpty;
         return answer || '(the sub-agent finished without a text answer)';
       } catch (err) {
+        await reportUsage();
         // Suspension is control flow (subagent.suspended already fired);
         // everything else is a sub-agent failure that will self-heal above.
         if (observe && subSpan && !(err instanceof SubAgentSuspension)) {
@@ -274,4 +322,6 @@ export function agentTool(def: AgentToolDef): Tool {
       }
     },
   };
+  delegationExecutors.add(tool.execute!);
+  return tool;
 }

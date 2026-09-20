@@ -1,4 +1,4 @@
-<!-- verified: 2026-08-12 against @deuz-sdk/core@2.0.0 · api-contract sha256:209a805b7f32
+<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
      sources: packages/core/src/{rag.ts, rag-node.ts, skills.ts, skills/node.ts, parts.ts, ui.ts, node/store-postgres.ts},
      packages/core/src/types/{tool.ts, stream.ts, methods.ts, message.ts},
      docs/content/docs/modules/{rag.mdx, skills.mdx}, skills/deuz-sdk/rules/modules.md -->

@@ -1,6 +1,6 @@
 {
   "name": "@deuz-sdk/core",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Pure, web-first, multi-provider TypeScript AI SDK (Anthropic, OpenAI, xAI, Gemini, Azure, Bedrock, …).",
   "license": "MIT",
   "author": "Umutcan Edizaslan (U-C4N)",
@@ -184,6 +184,26 @@
       "require": {
         "types": "./dist/agent.d.cts",
         "default": "./dist/agent.cjs"
+      }
+    },
+    "./swarm": {
+      "import": {
+        "types": "./dist/swarm.d.ts",
+        "default": "./dist/swarm.js"
+      },
+      "require": {
+        "types": "./dist/swarm.d.cts",
+        "default": "./dist/swarm.cjs"
+      }
+    },
+    "./swarm/sqlite": {
+      "import": {
+        "types": "./dist/swarm/sqlite.d.ts",
+        "default": "./dist/swarm/sqlite.js"
+      },
+      "require": {
+        "types": "./dist/swarm/sqlite.d.cts",
+        "default": "./dist/swarm/sqlite.cjs"
       }
     },
     "./autonomy": {
