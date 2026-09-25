@@ -118,6 +118,38 @@ describe('native tool contracts', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
+  it('replays an interrupted idempotent call with a stable modelStep', async () => {
+    const execute = vi.fn(
+      (_args: unknown, ctx: { toolCallId: string; modelStep?: number }) =>
+        `${ctx.toolCallId}@${ctx.modelStep}`,
+    );
+    const receipt: AgentToolReceipt = {
+      toolName: 'post',
+      toolCallId: 'c1',
+      input: {},
+      stage: 'executing',
+      modelStep: 4,
+    };
+    const receipts = { load: () => receipt, save: async () => {}, modelStep: () => 4 };
+    const replayable = await prepareAgentTools(
+      { post: { parameters, execute, replay: 'idempotent' } },
+      {},
+      undefined,
+      receipts,
+    );
+    expect(await replayable.post!.execute!({}, context)).toBe('c1@4');
+    const strict = await prepareAgentTools(
+      { post: { parameters, execute } },
+      {},
+      undefined,
+      receipts,
+    );
+    await expect(strict.post!.execute!({}, context)).rejects.toMatchObject({
+      fatalExecution: true,
+    });
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
   it('rechecks the mandatory deadline after awaiting a tool receipt commit', async () => {
     let now = 1;
     const execute = vi.fn(() => 'effect');

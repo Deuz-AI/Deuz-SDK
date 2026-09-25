@@ -28,6 +28,11 @@ export interface AgentToolContext<T = unknown> extends Pick<
 > {
   /** Only this tool's validated context. Never sent to the provider. */
   context?: T;
+  /**
+   * The root model step that issued this call (2.2). Together with
+   * `toolCallId` it is stable across resume, so it can key an idempotent write.
+   */
+  modelStep?: number;
 }
 
 export interface AgentTool<A = unknown, R = unknown, C = unknown> extends Omit<
@@ -42,6 +47,12 @@ export interface AgentTool<A = unknown, R = unknown, C = unknown> extends Omit<
   validateResult?: AgentValidator<R>;
   /** Provider history receives this projection; result events retain the raw result. */
   toModelOutput?: (result: R, context: AgentToolContext<C>) => unknown | Promise<unknown>;
+  /**
+   * `'idempotent'` (2.2): repeating this call with the same `toolCallId` and
+   * `modelStep` has no further effect, so an interrupted call runs again on
+   * resume without `retryToolCallIds`. Bump `bindingId` when changing it.
+   */
+  replay?: 'idempotent';
 }
 
 // Heterogeneous tool registries intentionally erase each entry's generics.

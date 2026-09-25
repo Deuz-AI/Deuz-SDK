@@ -14,7 +14,7 @@ import { createInMemorySwarmStore, createSwarm } from '../src/swarm';
 import { createSqliteSwarmStore } from '../src/node/swarm-sqlite';
 import { createMockModel, sseEvents, sseResponse } from '../src/testing';
 import type { MockResponse } from '../src/testing';
-import type { AgentRunStore } from '../src/types/agent-run';
+import type { AgentRunStore, AgentToolContext } from '../src/types/agent-run';
 import type { Clock } from '../src/types/deps';
 import type { NativeExecutionContext } from '../src/types/execution';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
@@ -640,6 +640,47 @@ describe('native execution cross-feature regressions', () => {
       status: 'failed',
       error: { message: expect.stringContaining('shared execution context') },
     });
+  });
+
+  it.each([
+    ['replays an idempotent tool', 'idempotent' as const, 'completed', 2],
+    ['still reconciles a plain tool', undefined, 'stopped', 1],
+  ])('after a crash past the effect it %s', async (_name, replay, status, runs) => {
+    const inner = createInMemoryAgentRunStore();
+    let crash = true;
+    const store: AgentRunStore = {
+      load: (id) => inner.load(id),
+      save(envelope) {
+        if (
+          crash &&
+          Object.values(envelope.toolResults ?? {}).some((item) => item.stage === 'executed')
+        )
+          throw new Error('crash after the effect');
+        return inner.save(envelope);
+      },
+    };
+    const calls: string[] = [];
+    const tools = {
+      post: {
+        parameters: { type: 'object', properties: {} },
+        ...(replay ? { replay } : {}),
+        execute: (_args: unknown, ctx: AgentToolContext) => {
+          calls.push(`${ctx.toolCallId}@${ctx.modelStep}`);
+          return 'posted';
+        },
+      },
+    };
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'post', args: {} }] }, { text: 'done' }],
+    });
+    const session = { store, runId: `crash-${replay ?? 'plain'}`, scope: 'tenant' };
+    expect((await runAgent({ model, prompt: 'post', tools, session })).status).toBe('failed');
+    crash = false;
+    const resumed = await resumeAgent({ model, prompt: 'post', tools, session });
+    expect(resumed.status).toBe(status);
+    expect(calls).toHaveLength(runs);
+    expect(new Set(calls).size).toBe(1);
+    expect(calls[0]).toMatch(/@1$/);
   });
 
   it('resumes a 2.1 full-ledger checkpoint after its siblings were compacted', async () => {

@@ -388,6 +388,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         {
           load: (id) => envelope.toolResults?.[JSON.stringify([envelope.modelSteps, id])],
           retryToolCallIds: options.retryToolCallIds,
+          modelStep: () => envelope.modelSteps,
           save: async (receipt, ctx) => {
             envelope.toolResults ??= {};
             receipt.modelStep ??= envelope.modelSteps;
@@ -484,7 +485,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       }
       const unreconciled = Object.values(envelope.toolResults ?? {}).filter(
         (receipt) =>
-          receipt.stage === 'executing' && !options.retryToolCallIds?.includes(receipt.toolCallId),
+          receipt.stage === 'executing' &&
+          options.tools?.[receipt.toolName]?.replay !== 'idempotent' &&
+          !options.retryToolCallIds?.includes(receipt.toolCallId),
       );
       if (resume && unreconciled.length) {
         // This is a recoverable interruption, so do not replace the checkpoint

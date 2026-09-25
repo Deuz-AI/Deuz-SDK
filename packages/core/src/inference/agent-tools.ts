@@ -23,6 +23,8 @@ export interface NativeToolReceipts {
   load(toolCallId: string): AgentToolReceipt | undefined;
   save(receipt: AgentToolReceipt, context: ToolExecuteContext): Promise<void>;
   retryToolCallIds?: readonly string[];
+  /** The root model step whose calls are executing (2.2). */
+  modelStep?(): number;
 }
 
 class ToolReceiptError extends Error {
@@ -60,17 +62,21 @@ export async function prepareAgentTools(
         `Tool ${name} output`,
       );
     }
-    const executionContext = (ctx: ToolExecuteContext): AgentToolContext =>
-      scoped
+    const executionContext = (ctx: ToolExecuteContext): AgentToolContext => {
+      const modelStep = receipts?.modelStep?.();
+      const step = modelStep === undefined ? {} : { modelStep };
+      return scoped
         ? {
             toolCallId: ctx.toolCallId,
             messages: ctx.messages,
             signal: ctx.signal,
             agentPath: ctx.agentPath,
             execution: ctx.execution,
+            ...step,
             context,
           }
-        : { ...ctx, context };
+        : { ...ctx, ...step, context };
+    };
     result[name] = {
       ...tool,
       outputSchema: tool.outputSchema ? await toJSONSchema(tool.outputSchema) : undefined,
@@ -105,6 +111,7 @@ export async function prepareAgentTools(
             if (receipt?.stage === 'completed') return receipt.modelOutput;
             if (
               receipt?.stage === 'executing' &&
+              tool.replay !== 'idempotent' &&
               !receipts?.retryToolCallIds?.includes(ctx.toolCallId)
             ) {
               throw new ToolReceiptError(
