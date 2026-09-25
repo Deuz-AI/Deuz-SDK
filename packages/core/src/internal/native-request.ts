@@ -39,7 +39,8 @@ export function createNativeRequest(
           /* Unknown prices cannot admit a bounded USD request. */
         }
       }
-      const requestId = `${execution.scopeId}/${deps.generateId()}/${execution.ledger.snapshot().reservations.length + 1}`;
+      // The ledger revision only grows; a reservation count shrinks after 2.2 compaction.
+      const requestId = `${execution.scopeId}/${deps.generateId()}/${execution.ledger.snapshot().revision + 1}`;
       await execution.reserve({
         requestId,
         modelId,

@@ -36,7 +36,7 @@ import {
 } from './inference/agent-output';
 import { prepareAgentTools } from './inference/agent-tools';
 import { createExecutionContext, intersectExecutionPolicies } from './execution-policy';
-import { intersectBudgetLimits } from './budget-ledger';
+import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 
 export type * from './types/agent-run';
@@ -83,6 +83,9 @@ function assertAccountingContinuity(
   live: NativeExecutionContext,
 ): void {
   for (const prior of saved.ledger.reservations) {
+    // A child proves its own slice; the parent's durable ledger owns siblings,
+    // which 2.2 compaction may already have folded away.
+    if (live.depth > 0 && !prior.scopes.some((scope) => scope.id === live.scopeId)) continue;
     const current = live.ledger.get(prior.requestId);
     if (
       !current ||
@@ -167,10 +170,24 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   let settledOutcome: AgentResult<T> | undefined;
   let writeTail: Promise<void> = Promise.resolve();
 
+  let persistedLedger: string | undefined;
+  // A child of a caller's shared ledger records only its own slice (2.2): the
+  // parent persists the shared ledger, and every sibling rewriting all of it
+  // made checkpoint volume grow quadratically with swarm size.
+  function executionSnapshot(execution: NativeExecutionContext): ExecutionContextSnapshot {
+    const saved = execution.snapshot();
+    return options.execution && execution.depth > 0
+      ? { ...saved, ledger: subtreeLedgerSnapshot(saved.ledger, execution.scopeId) }
+      : saved;
+  }
+  const ledgerKey = (saved: ExecutionContextSnapshot | undefined): string =>
+    saved ? JSON.stringify([saved.ledger.reservations, saved.ledger.aggregates ?? null]) : '';
+
   // Writes serialize even when multiple sub-agents checkpoint concurrently.
   function persist(): Promise<void> {
-    if (common?.execution) envelope.execution = common.execution.snapshot();
+    if (common?.execution) envelope.execution = executionSnapshot(common.execution);
     if (!options.session || !admitted) return Promise.resolve();
+    persistedLedger = ledgerKey(envelope.execution);
     const snapshot = structuredClone(envelope);
     const write = writeTail.then(() => options.session!.store.save(snapshot));
     writeTail = write.catch((error) => {
@@ -305,6 +322,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       }
       if (options.execution && envelope.execution)
         assertAccountingContinuity(envelope.execution, options.execution);
+      if (!options.execution && envelope.execution?.ledger.subtree !== undefined) {
+        throw new TypeError(
+          'This native run was checkpointed under a shared execution context; resume it with that execution.',
+        );
+      }
       if (!options.execution) {
         const persistLedger = async (): Promise<void> => {
           await persist();
@@ -477,7 +499,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       }
       admitted = true;
       if (options.execution && options.session) {
-        removeLedgerPersistence = options.execution.ledger.addPersistence(() => persist());
+        removeLedgerPersistence = options.execution.ledger.addPersistence(() => {
+          // Sibling reservations on a shared ledger leave this run's slice unchanged.
+          if (ledgerKey(executionSnapshot(common.execution!)) === persistedLedger) return;
+          return persist();
+        });
       }
       if (clientResults.length) envelope.pendingClientCalls = [];
       delete envelope.result;

@@ -591,6 +591,98 @@ describe('native execution cross-feature regressions', () => {
     await expect(handle.result).rejects.toThrow('reservation commit failed');
     expect(model.fetch).not.toHaveBeenCalled();
   });
+
+  it('checkpoints only its own ledger slice under a shared child context', async () => {
+    const store = createInMemoryAgentRunStore();
+    const saves: string[] = [];
+    const counting: AgentRunStore = {
+      load: (id) => store.load(id),
+      save(envelope) {
+        saves.push(envelope.runId);
+        return store.save(envelope);
+      },
+    };
+    const root = createExecutionContext({ scopeId: 'root', budget: { tokens: 1000 } });
+    await root
+      .child({ scopeId: 'sibling' })
+      .reserve({ requestId: 'sib-1', modelId: 'm', tokens: 5 });
+    const child = root.child({ scopeId: 'mine' });
+    const base = createMockModel({ responses: [{ text: 'done' }] });
+    const config = readConfig(base)!;
+    let siblingWrites = -1;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const before = saves.length;
+      await root
+        .child({ scopeId: 'sibling' })
+        .reserve({ requestId: 'sib-2', modelId: 'm', tokens: 5 });
+      siblingWrites = saves.length - before;
+      return config.fetch!(input, init);
+    };
+    const result = await runAgent({
+      model: attachConfig({ ...base }, { ...config, fetch }),
+      prompt: 'go',
+      execution: child,
+      executionEstimate: { tokens: 10 },
+      session: { store: counting, runId: 'slice', scope: 'tenant' },
+    });
+    expect(result.status).toBe('completed');
+    expect(siblingWrites).toBe(0);
+    const ledger = (await store.load('slice'))!.execution!.ledger;
+    expect(ledger.subtree).toBe(child.scopeId);
+    expect(ledger.reservations.map((item) => item.scopes.at(-1)?.id)).toEqual([child.scopeId]);
+    const standalone = await resumeAgent({
+      model: base,
+      prompt: 'go',
+      session: { store, runId: 'slice', scope: 'tenant' },
+    });
+    expect(standalone).toMatchObject({
+      status: 'failed',
+      error: { message: expect.stringContaining('shared execution context') },
+    });
+  });
+
+  it('resumes a 2.1 full-ledger checkpoint after its siblings were compacted', async () => {
+    const store = createInMemoryAgentRunStore();
+    const execute = vi.fn(() => 'written');
+    const tools = {
+      write: {
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+        needsApproval: true,
+        execute,
+      },
+    };
+    const root = createExecutionContext({ scopeId: 'root', budget: { tokens: 1000 } });
+    const sibling = root.child({ scopeId: 'sibling' });
+    await sibling.reserve({ requestId: 'sib', modelId: 'm', tokens: 5 });
+    await root.ledger.settle({ requestId: 'sib', tokens: 5, usd: 0 });
+    const child = root.child({ scopeId: 'mine' });
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'write', args: {} }] }, { text: 'done' }],
+    });
+    const options = {
+      model,
+      prompt: 'write',
+      tools,
+      execution: child,
+      executionEstimate: { tokens: 10 },
+      session: { store, runId: 'legacy', scope: 'tenant' },
+    };
+    const first = await runAgent(options);
+    if (first.status !== 'suspended') throw new Error('Expected approval suspension');
+    // A 2.1 checkpoint embedded the whole shared ledger, siblings included.
+    const legacy = (await store.load('legacy'))!;
+    await store.save({ ...legacy, execution: child.snapshot() });
+    await root.ledger.compact(sibling.scopeId);
+    const resumed = await resumeAgent({
+      ...options,
+      approvalResponses: first.pendingApprovals.map((request) => ({
+        approvalId: request.approvalId,
+        approved: true,
+      })),
+    });
+    expect(resumed.status).toBe('completed');
+    expect(execute).toHaveBeenCalledOnce();
+  });
 });
 
 let DatabaseSync: (new (path: string) => SqliteDatabaseLike) | undefined;
