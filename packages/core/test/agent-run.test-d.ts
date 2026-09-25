@@ -3,6 +3,14 @@ import { runAgent, streamAgent } from '../src/agent-run';
 import type { AgentResult, AgentRunOptions, AgentArrayElement } from '../src/types/agent-run';
 import type { LanguageModel } from '../src/types/model';
 import type { StandardSchemaV1 } from '../src/types/schema';
+import type {
+  AgentTool,
+  AgentToolContext,
+  BudgetAggregate,
+  BudgetCompaction,
+  BudgetLedger,
+  BudgetLedgerSnapshot,
+} from '../src/agent';
 
 declare const model: LanguageModel;
 declare const schema: StandardSchemaV1<unknown, { answer: number }>;
@@ -48,3 +56,16 @@ function declareResult(result: AgentResult<{ answer: number }>): void {
     void result.output;
   }
 }
+
+test('2.2 native seams: idempotent replay, modelStep, ledger compaction', () => {
+  expectTypeOf<AgentTool['replay']>().toEqualTypeOf<'idempotent' | undefined>();
+  expectTypeOf<AgentToolContext['modelStep']>().toEqualTypeOf<number | undefined>();
+  expectTypeOf<BudgetLedger['compact']>().toEqualTypeOf<
+    (scopeId: string) => Promise<BudgetCompaction>
+  >();
+  expectTypeOf<BudgetLedgerSnapshot['version']>().toEqualTypeOf<1 | 2>();
+  expectTypeOf<BudgetLedgerSnapshot['aggregates']>().toEqualTypeOf<
+    readonly BudgetAggregate[] | undefined
+  >();
+  expectTypeOf<BudgetLedgerSnapshot['subtree']>().toEqualTypeOf<string | undefined>();
+});

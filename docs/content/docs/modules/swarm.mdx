@@ -128,6 +128,11 @@ The journal stores task/run control events, not every model token. Retrieve
 outputs from the snapshot. A disconnected consumer can replay control events from
 its last stored sequence.
 
+Between pages, an event reader checks whether the run is still running. A store
+can implement the optional `head(key)` (2.2) to return the run record alone; the
+memory and SQLite stores do. Without it the reader falls back to `load`, which
+reads every task, so a custom store for large runs should provide `head`.
+
 ## Suspension, reconciliation and cancellation
 
 `handle.result` settles when the run completes, becomes partial, is cancelled, or
@@ -196,6 +201,16 @@ execution context. The scheduler persists reservations before admission and
 retains unknown amounts across recovery. Restoring with weaker defaults cannot
 relax the saved parent limits. Admission uses estimates; it does not promise a
 hard ceiling on a provider's eventual bill.
+
+The run ledger grows with live work, not with history (2.2). When a task becomes
+completed, failed, blocked or cancelled it never reserves again, so the scheduler
+folds its reservations into `executionState.ledger.aggregates`: one entry per
+ancestor chain that keeps counting spent, held and unknown amounts against the
+parent limits. Global totals are unchanged, and a later cap still fails closed
+for folded usage that had no estimate. Per-request records of finished tasks are
+gone; read a task's own cost from its agent result's `accounting`. Each agent
+task checkpoints only its slice of the shared ledger. A run whose ledger has
+folded entries uses ledger snapshot version 2, which 2.1 cannot resume.
 
 Use swarm/binding policy and budget fields for agent templates; a template with a
 pre-bound live `execution` context is rejected because the swarm cannot adopt its

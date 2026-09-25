@@ -40,7 +40,7 @@ export function defaultShouldFallback(error: unknown): boolean {
   // A `step` / `tool` deadline (1.9) is a CALLER-IMPOSED BUDGET, not a provider
   // failure: hopping to another model cannot make the budget fit, and re-running
   // the loop would repeat the side effects of tools that already executed. Only
-  // the transport-level layers ('connect'/'ttft'/'total') justify a fail-over.
+  // the transport-level layers ('connect'/'ttft'/'total'/'chunk') justify a fail-over.
   if (error instanceof TimeoutError) return error.layer !== 'step' && error.layer !== 'tool';
   if (error instanceof NetworkError) return true;
   if (error instanceof APICallError) {

@@ -188,6 +188,50 @@ application reconciles that effect and explicitly authorizes the relevant
 not provide exactly-once execution across an external service and the local
 checkpoint transaction.
 
+### Idempotent tools
+
+Some effects are safe to repeat because the tool writes under a key it derives
+from the call itself. Mark such a tool `replay: 'idempotent'` (2.2). An interrupted
+call of that tool runs again on resume without `retryToolCallIds`; plain tools
+still stop for reconciliation. Every native tool also receives `ctx.modelStep`,
+the root model turn that issued the call. Together with `ctx.toolCallId` it is
+stable across resume, so it can key the write:
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const board = new Map<string, string>();
+
+const result = await runAgent({
+  model: createMockModel({ responses: [
+    { toolCalls: [{ toolName: 'note', args: { text: 'checked' } }] },
+    { text: 'Noted.' },
+  ] }),
+  prompt: 'Leave a note.',
+  tools: {
+    note: {
+      description: 'Append a note to the shared board.',
+      parameters: {
+        type: 'object' as const,
+        properties: { text: { type: 'string' } },
+        required: ['text'],
+      },
+      replay: 'idempotent',
+      // A repeated call writes the same key, so a replay adds nothing.
+      execute: ({ text }: { text: string }, ctx) => {
+        board.set(`${ctx.toolCallId}@${ctx.modelStep}`, text);
+        return 'noted';
+      },
+    },
+  },
+});
+console.log(result.status, board.size);
+```
+
+Only mark a tool idempotent when repeating it truly has no further effect, and
+bump `bindingId` when you change the flag on a durable run.
+
 ## Tool context and supported options
 
 `toolsContext` supplies data by tool name. A tool can declare `contextSchema` and
@@ -232,6 +276,14 @@ Native sessions persist reservations before dispatch, including when an existing
 execution context is supplied. The supplied context keeps the same shared ledger;
 native persistence is attached for the duration of the run. Verifier callbacks
 receive `execution` and `signal` and must pass them into any SDK model calls they make.
+
+When the supplied context is a child of a shared ledger, the run checkpoints only
+its own slice of that ledger (2.2): the reservations charged to its scope, marked
+with `ledger.subtree`. The parent owns the shared ledger and persists it; a sibling's
+reservation no longer rewrites this run's envelope. Resume such a run with the same
+execution context. A slice can prove its own continuity but cannot seed a new
+ledger, so resuming it without `execution` fails. A root context, or a run without
+a supplied context, still checkpoints the complete ledger.
 
 Persist the execution ledger with the owning run. Restore its snapshot instead
 of resetting the budget after a restart. Child policies and budgets can tighten

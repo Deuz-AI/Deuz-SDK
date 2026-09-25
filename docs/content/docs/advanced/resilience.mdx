@@ -121,19 +121,24 @@ const result = streamChat({
 
 The parsed value lives on the error too, so you can read it from a rejected promise: `err.retryAfterMs` on any `APICallError`.
 
-## The three-layer timeout
+## Timeout layers
 
-Timeouts are clock-driven (not `AbortSignal.timeout`, which is non-injectable and trips a Cloudflare Workers bug). There are three independent layers, merged into the fetch `signal` via `combineSignals`:
+Timeouts are clock-driven (not `AbortSignal.timeout`, which is non-injectable and trips a Cloudflare Workers bug). Each layer is independent, and the model-call layers merge into the fetch `signal` via `combineSignals`:
 
 | Layer | Default | Fires when | Cleared by |
 | --- | --- | --- | --- |
-| TTFT (time-to-first-token) | `60_000ms` | No content delta has arrived yet | The first `text-delta` / `reasoning-delta` |
-| Total | `300_000ms` | The whole request runs past the ceiling | Completion |
+| `ttftMs` (time to first content) | `60_000ms` | No content delta has arrived yet | The first `text-delta` / `reasoning-delta` / `tool-call-delta` |
+| `totalMs` | `300_000ms` | One model call runs past the ceiling | Completion |
+| `chunkMs` (2.2) | unbounded | The stream goes silent between two parts after content started | Every stream part re-arms it |
+| `stepMs` | unbounded | One agentic step (model call plus its tools) runs long | The end of the step |
+| `toolMs` | unbounded | One tool `execute` runs long | The tool settling |
 | User `signal` | — | Your `AbortSignal` aborts | You |
 
-The defaults are `DEFAULT_TIMEOUTS` in `core/timeout.ts` (`ttftMs: 60_000`, `totalMs: 300_000`). The TTFT timer is armed at **pump start** — i.e. when output is first accessed, not at the synchronous `streamChat` return — and is cancelled the instant the first content delta lands, so a model that streams slowly after starting is bounded only by the total ceiling. The total timer covers the entire request including the streaming phase.
+The defaults are `DEFAULT_TIMEOUTS` in `core/timeout.ts` (`ttftMs: 60_000`, `totalMs: 300_000`). The TTFT timer is armed at **pump start**, when output is first accessed rather than at the synchronous `streamChat` return. It is cancelled the instant the first content delta lands. The total timer covers the entire request including the streaming phase.
 
-A fired timer aborts the request with a `TimeoutError` whose `layer` is `'ttft'` or `'total'`. Because the user `signal` and both timers are combined into one signal handed to `fetch`, whichever trips first wins.
+`chunkMs` closes the gap between those two. Once content is flowing, a provider that stalls mid-answer would otherwise hold the call open until the total ceiling. With `chunkMs` set, any silence longer than that between two stream parts fails the call. Before the first content the TTFT layer still governs, so a model that thinks before it answers is not cut off.
+
+A fired timer aborts the request with a `TimeoutError` whose `layer` names the budget that ran out: `'ttft'`, `'total'`, `'chunk'`, `'step'` or `'tool'`. Because the user `signal` and the timers are combined into one signal handed to `fetch`, whichever trips first wins.
 
 ### TimeoutError is a failure; a user abort is not
 
@@ -167,7 +172,25 @@ if (finishReason === 'aborted') {
 
 ### Controlling timeout durations
 
-There is **no per-call `timeout` option** on `CommonCallOptions`; the layer durations come from the internal `DEFAULT_TIMEOUTS`. What you *do* control is the `clock` that drives the timers — every timer is scheduled through `deps.clock.setTimeout`. In tests this lets you fire the short backoff timers eagerly while never firing the long ttft/total timers:
+Set any layer per call with `timeout`. Unset layers keep their defaults, a bare number is shorthand for `{ totalMs }`, and `0` disables a layer:
+
+```ts
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-4-8'),
+  messages: [{ role: 'user', content: 'Summarise the report.' }],
+  // Fail fast on a stalled stream; keep the default first-content wait.
+  timeout: { totalMs: 25_000, chunkMs: 10_000 },
+});
+```
+
+A stalled stream then rejects `usage` and `finishReason` with a `TimeoutError` whose `layer` is `'chunk'`. A buffered call treats it like `'ttft'` and `'total'` for [cross-provider failover](#cross-provider-failover-17). A streaming call has already delivered content by then, so the error is final there.
+
+You also control the `clock` that drives the timers, since every timer is scheduled through `deps.clock.setTimeout`. In tests this lets you fire the short backoff timers eagerly while never firing the long ttft/total timers:
 
 ```ts title="test/helpers.ts"
 import type { Clock } from '@deuz-sdk/core';

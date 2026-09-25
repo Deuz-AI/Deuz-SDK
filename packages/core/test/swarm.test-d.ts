@@ -7,8 +7,11 @@ import type {
   SwarmAgentBinding,
   SwarmEvent,
   SwarmHandle,
+  SwarmKey,
   SwarmOutcome,
   SwarmReducerContext,
+  SwarmRunRecord,
+  SwarmStore,
   SwarmTask,
   SwarmTaskResult,
   SwarmTaskStatus,
@@ -138,4 +141,10 @@ test('task kinds and terminal result acceptance stay explicit', () => {
 test('SQLite adds an asynchronous close without changing the swarm store contract', () => {
   expectTypeOf(createSqliteSwarmStore({ path: ':memory:' })).toEqualTypeOf<SqliteSwarmStore>();
   expectTypeOf<ReturnType<SqliteSwarmStore['close']>>().toEqualTypeOf<Promise<void>>();
+});
+
+test('2.2 SwarmStore.head is an optional run-record read', () => {
+  expectTypeOf<SwarmStore['head']>().toEqualTypeOf<
+    ((key: SwarmKey) => Promise<SwarmRunRecord | undefined>) | undefined
+  >();
 });
