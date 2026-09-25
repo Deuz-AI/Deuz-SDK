@@ -28,6 +28,12 @@ interface SwarmTaskBase {
   replay?: 'manual' | 'safe';
   /** Wall-clock budget for each attempt (2.2); expiry fails the task. */
   timeoutMs?: number;
+  /**
+   * Blackboard group (2.2): the task posts to this channel and, with
+   * read: 'group', reads it. Letters, digits and underscores, starting with a
+   * letter. Tasks without a group share the 'main' channel.
+   */
+  group?: string;
 }
 
 export type SwarmTask =
@@ -226,6 +232,12 @@ export interface SwarmAgentBinding {
   onFailure?: (
     context: SwarmFailureContext,
   ) => readonly SwarmSpawnRequest[] | Promise<readonly SwarmSpawnRequest[]>;
+  /**
+   * Blackboard tools for this agent (2.2): blackboard_read over its group's
+   * channel ('group') or the listed channels, and blackboard_post to its own
+   * group. Both are idempotent on replay. Needs a store with 'channels'.
+   */
+  blackboard?: { read?: 'group' | readonly string[]; post?: boolean };
 }
 
 export interface SwarmReducerContext extends SwarmKey {
@@ -234,6 +246,12 @@ export interface SwarmReducerContext extends SwarmKey {
   execution: NativeExecutionContext;
   /** Queue tasks to create when this reducer completes (2.2); discarded if it throws. */
   spawn(requests: readonly SwarmSpawnRequest[]): void;
+  /** Page a blackboard channel after a sequence cursor (2.2); limit defaults to 100. */
+  readChannel(
+    channel: string,
+    afterSequence?: number,
+    limit?: number,
+  ): Promise<SwarmChannelEntry[]>;
 }
 
 export interface SwarmReducerBinding {

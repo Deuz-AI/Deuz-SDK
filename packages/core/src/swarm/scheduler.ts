@@ -8,7 +8,7 @@ import {
 import { intersectBudgetLimits } from '../budget-ledger';
 import { resolveDependencies } from '../internal/resolve-deps';
 import type { DeuzAgent } from '../agent';
-import type { AgentRunOptions, AgentRunStore } from '../types/agent-run';
+import type { AgentRunOptions, AgentRunStore, AgentToolSet } from '../types/agent-run';
 import type { NativeExecutionContext } from '../types/execution';
 import type {
   Swarm,
@@ -31,6 +31,7 @@ import type {
 } from '../types/swarm';
 import { cloneSwarm, swarmKey, validateEventCursor, validateSwarmSnapshot } from './store';
 import { resolveDynamicLimits, spawnRecords, tightenLimits } from './spawn';
+import { blackboardTools, readableChannels, SWARM_GROUP } from './blackboard';
 
 const executors = new WeakMap<SwarmStore, Set<string>>();
 // Terminal tasks never run again, so their accounting can fold (2.2).
@@ -71,6 +72,8 @@ function defineTask(task: SwarmTask, options: SwarmOptions): void {
     throw new Error('Invalid task replay policy');
   if (task.timeoutMs !== undefined && (!Number.isSafeInteger(task.timeoutMs) || task.timeoutMs < 1))
     throw new Error(`Invalid task timeoutMs: ${task.id}`);
+  if (task.group !== undefined && (typeof task.group !== 'string' || !SWARM_GROUP.test(task.group)))
+    throw new Error(`Invalid task group: ${task.id}`);
 }
 
 function validateTasks(tasks: readonly SwarmTask[], options: SwarmOptions): void {
@@ -120,6 +123,14 @@ export function createSwarm(options: SwarmOptions): Swarm {
       : (options.reducers![task.reducer]!.version ?? '1');
   const dynamic = options.dynamic ? resolveDynamicLimits(options.dynamic) : undefined;
   const canSpawn = options.store.capabilities?.includes('spawn') ?? false;
+  const blackboards = Object.values(options.agents)
+    .map((value) => binding(value).blackboard)
+    .filter((config) => config !== undefined);
+  for (const config of blackboards) readableChannels(config);
+  if (blackboards.length && !options.store.capabilities?.includes('channels'))
+    throw new Error(
+      'This swarm store cannot keep blackboard channels: it lacks the "channels" capability',
+    );
   if (dynamic && !canSpawn)
     throw new Error(
       'This swarm store cannot persist spawned tasks: it lacks the "spawn" capability',
@@ -387,6 +398,11 @@ export function createSwarm(options: SwarmOptions): Swarm {
                 throw new TypeError('spawn() takes an array of requests');
               queued.push(...requests);
             },
+            async readChannel(channel, afterSequence = 0, limit = 100) {
+              if (!options.store.readChannel)
+                throw new Error('This swarm store has no blackboard channels');
+              return options.store.readChannel(key, channel, afterSequence, limit);
+            },
           });
           if (output === undefined)
             throw new Error('Swarm reducer must return a serializable output');
@@ -418,12 +434,28 @@ export function createSwarm(options: SwarmOptions): Swarm {
             }));
           },
         };
+        const baseTools = agent.tools ?? (agent.agent.def.tools as AgentToolSet | undefined);
+        const boardTools = agent.blackboard
+          ? blackboardTools({
+              key,
+              task,
+              config: agent.blackboard,
+              store: options.store,
+              attempt: () => records.get(task.id)!.attempt,
+              now: () => deps.clock.now(),
+              post: (post) => mutate(() => ({ posts: [post] })),
+            })
+          : {};
+        for (const name of Object.keys(boardTools))
+          if (baseTools && Object.hasOwn(baseTools, name))
+            throw new Error(`Tool name ${name} is reserved for the swarm blackboard`);
+        const tools = agent.blackboard ? { ...baseTools, ...boardTools } : baseTools;
         const nativeOptions = {
           ...agent.agent.def,
           prompt: resolvedPrompt,
           session: { store, runId: nativeId, scope: key.scope },
           output: agent.output,
-          ...(agent.tools !== undefined ? { tools: agent.tools } : {}),
+          ...(tools !== undefined ? { tools } : {}),
           toolsContext: agent.toolsContext,
           verify: agent.verify,
           maxOutputAttempts: agent.maxOutputAttempts,
