@@ -361,8 +361,14 @@
       "streamAgent"
     ],
     "./swarm": [
+      "CreateRoundsOptions",
+      "RoundsConsolidateInput",
+      "RoundsDecision",
+      "RoundsGroupPlan",
       "Swarm",
       "SwarmAgentBinding",
+      "SwarmChannelEntry",
+      "SwarmChannelPost",
       "SwarmCommit",
       "SwarmConflictError",
       "SwarmDynamicLimits",
@@ -376,6 +382,7 @@
       "SwarmReducerBinding",
       "SwarmReducerContext",
       "SwarmResumeOptions",
+      "SwarmRounds",
       "SwarmRunOptions",
       "SwarmRunRecord",
       "SwarmRunStatus",
@@ -389,6 +396,7 @@
       "SwarmTaskResult",
       "SwarmTaskStatus",
       "createInMemorySwarmStore",
+      "createRounds",
       "createSwarm"
     ],
     "./swarm/sqlite": ["SqliteSwarmStore", "SqliteSwarmStoreOptions", "createSqliteSwarmStore"]

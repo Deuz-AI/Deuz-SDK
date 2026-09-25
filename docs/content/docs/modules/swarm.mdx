@@ -143,6 +143,107 @@ because it would drop spawned tasks from its commits. A run created without
 `dynamic` cannot spawn, and 2.1 cannot resume a version 2 run. The journal
 records a `task.spawned` event per child, with the parent ID in `detail`.
 
+## Groups and the blackboard
+
+Agents working on the same problem can share notes (2.2). Give a task a `group`
+and its agent binding a `blackboard`: the agent then gets a `blackboard_post`
+tool that writes to its group's channel and a `blackboard_read` tool over its
+group's channel (`read: 'group'`) or a listed set of channels. Tasks without a
+group share the `main` channel. Reducers page any channel with
+`context.readChannel(channel, afterSequence?, limit?)`.
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createInMemorySwarmStore, createSwarm } from '@deuz-sdk/core/swarm';
+
+const scout = createAgent({
+  model: createMockModel({ responses: [
+    { toolCalls: [{ toolName: 'blackboard_post', args: { text: 'A lead worth checking.' } }] },
+    { text: 'Shared.' },
+  ] }),
+});
+
+const swarm = createSwarm({
+  store: createInMemorySwarmStore(),
+  agents: { scout: { agent: scout, blackboard: { read: 'group', post: true } } },
+});
+const handle = await swarm.run({
+  scope: 'tenant-a',
+  tasks: [{ id: 'first', agent: 'scout', prompt: 'Share what you find.', group: 'euler' }],
+});
+await handle.result;
+```
+
+Notes are durable, ordered per channel, and journaled as `channel.posted`
+events. Both tools are idempotent: a post is keyed by task, model step and tool
+call, so resuming an interrupted post never adds a second note. At the task
+level an interrupted agent task still follows the usual rule and waits in
+`needs_reconciliation` unless it is declared `replay: 'safe'` or retried. A
+blackboard binding needs a store with the `'channels'` capability; the memory
+and SQLite stores have it.
+
+## Soft dependencies
+
+`dependsOn` requires a task to complete: a failed dependency blocks its
+dependents. `after` (2.2) only requires the listed tasks to settle, in any
+terminal state. The task then receives the results of those that completed,
+and a reducer sees every listed task's final status in `context.settled`. Use
+it for a join that must run even when some of the work it gathers fails.
+
+## Rounds
+
+`createRounds` (2.2) builds the pattern of large research runs from these
+pieces: rounds of agents working in blackboard groups, with a consolidator
+between rounds. The consolidator receives the round's completed results by
+group, can read the boards and make its own model calls through `execution`,
+and decides the next round: which groups continue, with how many agents and
+what prompt. Returning `stop`, returning no groups, or reaching `maxRounds`
+ends the chain.
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createInMemorySwarmStore, createRounds, createSwarm } from '@deuz-sdk/core/swarm';
+
+const solver = createAgent({
+  model: createMockModel({ responses: [
+    { text: 'The simpler case breaks down at t=1.' },
+    { text: 'Attempt A.' },
+    { text: 'Attempt B.' },
+  ] }),
+});
+
+const rounds = createRounds({
+  id: 'search',
+  maxRounds: 3,
+  initial: { warmup: { agent: 'solver', count: 1, prompt: 'Solve the simpler case.' } },
+  consolidate({ round, groups }) {
+    if (round === 1) {
+      const lead = String(groups.warmup?.[0]?.output);
+      return { groups: { main: { agent: 'solver', count: 2, prompt: `Build on: ${lead}` } } };
+    }
+    return { stop: true, summary: groups.main?.map(result => result.output) };
+  },
+});
+
+const swarm = createSwarm({
+  store: createInMemorySwarmStore(),
+  dynamic: { maxTasks: 100, maxSpawnDepth: 4 },
+  agents: { solver },
+  reducers: rounds.reducers,
+});
+const outcome = await (await swarm.run({ scope: 'lab', tasks: rounds.tasks })).result;
+console.log(outcome.tasks.at(-1)?.result?.output);
+```
+
+Each consolidator waits for its round with `after`, so a failed explorer does
+not block it. A decision may only schedule the agent bindings named in `agents`,
+which defaults to the ones used in `initial`; this guards bindings chosen by a
+model. The swarm needs `dynamic` limits with `maxSpawnDepth` of at least
+`maxRounds`. Round tasks take the `replay` and `timeoutMs` options of
+`createRounds`.
+
 ## SQLite persistence and event cursors
 
 Import SQLite through `@deuz-sdk/core/swarm/sqlite`, a Node-only entry. It uses

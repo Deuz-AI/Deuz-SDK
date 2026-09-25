@@ -1,10 +1,14 @@
 import { expectTypeOf, test } from 'vitest';
 import { createAgent } from '../src/agent';
 import type { AgentResult, NativeExecutionContext } from '../src/agent';
-import { createInMemorySwarmStore, createSwarm } from '../src/swarm';
+import { createInMemorySwarmStore, createRounds, createSwarm } from '../src/swarm';
 import type {
+  RoundsDecision,
+  RoundsGroupPlan,
   Swarm,
   SwarmAgentBinding,
+  SwarmChannelEntry,
+  SwarmChannelPost,
   SwarmDynamicLimits,
   SwarmEvent,
   SwarmFailureContext,
@@ -13,6 +17,7 @@ import type {
   SwarmOptions,
   SwarmOutcome,
   SwarmReducerContext,
+  SwarmRounds,
   SwarmRunRecord,
   SwarmSpawnContext,
   SwarmSpawnRequest,
@@ -184,4 +189,46 @@ test('2.2 dynamic swarm surface: spawn requests, hooks, limits and capabilities'
   >();
   expectTypeOf<'task.spawned'>().toExtend<SwarmEvent['type']>();
   expectTypeOf<SwarmTask['timeoutMs']>().toEqualTypeOf<number | undefined>();
+});
+
+test('2.2 blackboard, soft dependencies and rounds surface', () => {
+  expectTypeOf<SwarmStoreCapability>().toEqualTypeOf<'spawn' | 'channels'>();
+  expectTypeOf<SwarmTask['group']>().toEqualTypeOf<string | undefined>();
+  expectTypeOf<SwarmTask['after']>().toEqualTypeOf<readonly string[] | undefined>();
+  expectTypeOf<SwarmAgentBinding['blackboard']>().toEqualTypeOf<
+    { read?: 'group' | readonly string[]; post?: boolean } | undefined
+  >();
+  expectTypeOf<SwarmReducerContext['settled']>().toEqualTypeOf<
+    Readonly<Record<string, SwarmTaskStatus>>
+  >();
+  expectTypeOf<SwarmReducerContext['readChannel']>().toEqualTypeOf<
+    (channel: string, afterSequence?: number, limit?: number) => Promise<SwarmChannelEntry[]>
+  >();
+  expectTypeOf<SwarmStore['readChannel']>().toEqualTypeOf<
+    | ((
+        key: SwarmKey,
+        channel: string,
+        afterSequence: number,
+        limit: number,
+      ) => Promise<SwarmChannelEntry[]>)
+    | undefined
+  >();
+  expectTypeOf<'channel.posted'>().toExtend<SwarmEvent['type']>();
+  expectTypeOf<SwarmChannelPost>().toEqualTypeOf<Omit<SwarmChannelEntry, 'sequence'>>();
+  const rounds = createRounds({
+    id: 'r',
+    maxRounds: 2,
+    initial: { g: { agent: 'worker', count: 1, prompt: 'go' } },
+    consolidate: (input) => {
+      expectTypeOf(input.round).toEqualTypeOf<number>();
+      expectTypeOf(input.groups).toEqualTypeOf<
+        Readonly<Record<string, readonly SwarmTaskResult[]>>
+      >();
+      return { stop: true };
+    },
+  });
+  expectTypeOf(rounds).toEqualTypeOf<SwarmRounds>();
+  expectTypeOf<RoundsDecision['groups']>().toEqualTypeOf<
+    Readonly<Record<string, RoundsGroupPlan>> | undefined
+  >();
 });
