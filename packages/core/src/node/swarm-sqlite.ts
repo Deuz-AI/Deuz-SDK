@@ -15,6 +15,7 @@ import {
   SwarmConflictError,
   validateEventCursor,
   validateSwarmSnapshot,
+  validateSpawn,
   validateTaskChange,
 } from '../swarm/store';
 
@@ -31,6 +32,21 @@ export interface SqliteSwarmStore extends SwarmStore {
 
 interface PayloadRow {
   payload: string;
+}
+
+/**
+ * Schema 2 (2.2): run status/updated_at columns for listing and the blackboard
+ * channel table. A 2.1 file (schema 1) upgrades in place, once, inside one
+ * transaction; 2.1 then refuses the file, which is the intended downgrade.
+ */
+const SCHEMA_VERSION = 2;
+
+function createVersion2Objects(db: SqliteDatabaseLike): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS deuz_swarm_channels (
+    scope TEXT NOT NULL, run_id TEXT NOT NULL, channel TEXT NOT NULL, sequence INTEGER NOT NULL,
+    entry_id TEXT NOT NULL, payload TEXT NOT NULL,
+    PRIMARY KEY(scope, run_id, channel, sequence), UNIQUE(scope, run_id, entry_id));
+    CREATE INDEX IF NOT EXISTS deuz_swarm_runs_status ON deuz_swarm_runs(scope, status, updated_at);`);
 }
 
 /** Single executor store. Its private schema version never uses PRAGMA user_version. */
@@ -79,16 +95,40 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
           const row = db!
             .prepare('SELECT version FROM deuz_swarm_schema WHERE singleton = 1')
             .get() as { version: number } | undefined;
-          if (row && row.version !== 1) throw new Error('Unsupported SQLite swarm schema version');
-          db!.exec(`CREATE TABLE IF NOT EXISTS deuz_swarm_runs (
-            scope TEXT NOT NULL, run_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(scope, run_id));
+          if (row && row.version !== 1 && row.version !== SCHEMA_VERSION)
+            throw new Error('Unsupported SQLite swarm schema version');
+          if (!row) {
+            db!.exec(`CREATE TABLE IF NOT EXISTS deuz_swarm_runs (
+            scope TEXT NOT NULL, run_id TEXT NOT NULL, payload TEXT NOT NULL,
+            status TEXT, updated_at INTEGER, PRIMARY KEY(scope, run_id));
             CREATE TABLE IF NOT EXISTS deuz_swarm_tasks (
             scope TEXT NOT NULL, run_id TEXT NOT NULL, task_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
             payload TEXT NOT NULL, PRIMARY KEY(scope, run_id, task_id));
             CREATE TABLE IF NOT EXISTS deuz_swarm_events (
             scope TEXT NOT NULL, run_id TEXT NOT NULL, sequence INTEGER NOT NULL, payload TEXT NOT NULL,
             PRIMARY KEY(scope, run_id, sequence));`);
-          if (!row) db!.exec('INSERT INTO deuz_swarm_schema(singleton,version) VALUES(1,1)');
+            createVersion2Objects(db!);
+            db!.exec(
+              `INSERT INTO deuz_swarm_schema(singleton,version) VALUES(1,${SCHEMA_VERSION})`,
+            );
+          } else if (row.version === 1) {
+            // A 2.1 file: index the run status for listing, backfill it, add channels.
+            db!.exec(`ALTER TABLE deuz_swarm_runs ADD COLUMN status TEXT;
+            ALTER TABLE deuz_swarm_runs ADD COLUMN updated_at INTEGER;`);
+            const update = db!.prepare(
+              'UPDATE deuz_swarm_runs SET status=?, updated_at=? WHERE scope=? AND run_id=?',
+            );
+            for (const run of db!
+              .prepare('SELECT scope, run_id, payload FROM deuz_swarm_runs')
+              .all() as { scope: string; run_id: string; payload: string }[]) {
+              const record = decodeSwarm<SwarmRunRecord>(run.payload);
+              update.run(record.status, record.updatedAt, run.scope, run.run_id);
+            }
+            createVersion2Objects(db!);
+            db!.exec(
+              `UPDATE deuz_swarm_schema SET version = ${SCHEMA_VERSION} WHERE singleton = 1`,
+            );
+          }
         });
         return db;
       } catch (error) {
@@ -127,6 +167,7 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
       insert.run(event.scope, event.runId, event.sequence, encodeSwarm(event));
   };
   return {
+    capabilities: Object.freeze(['spawn'] as const),
     async create(snapshot, inputs) {
       validateSwarmSnapshot(snapshot);
       if (snapshot.run.revision !== 0 || snapshot.run.lastSequence !== 0)
@@ -136,11 +177,10 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
           if (readRun(db, snapshot.run)) throw new SwarmConflictError();
           const events = makeSwarmEvents(snapshot.run, 0, inputs);
           const run = { ...snapshot.run, lastSequence: events.length };
-          statement(db, 'INSERT INTO deuz_swarm_runs(scope,run_id,payload) VALUES(?,?,?)').run(
-            run.scope,
-            run.runId,
-            encodeSwarm(run),
-          );
+          statement(
+            db,
+            'INSERT INTO deuz_swarm_runs(scope,run_id,payload,status,updated_at) VALUES(?,?,?,?,?)',
+          ).run(run.scope, run.runId, encodeSwarm(run), run.status, run.updatedAt);
           const insert = statement(
             db,
             'INSERT INTO deuz_swarm_tasks(scope,run_id,task_id,ordinal,payload) VALUES(?,?,?,?,?)',
@@ -192,11 +232,41 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
               'UPDATE deuz_swarm_tasks SET payload=? WHERE scope=? AND run_id=? AND task_id=?',
             ).run(encodeSwarm(task), change.scope, change.runId, task.task.id);
           }
-          statement(db, 'UPDATE deuz_swarm_runs SET payload=? WHERE scope=? AND run_id=?').run(
-            encodeSwarm(run),
-            change.scope,
-            change.runId,
-          );
+          const spawn = change.spawn ?? [];
+          if (spawn.length) {
+            const count = statement(
+              db,
+              'SELECT COUNT(*) AS n, COALESCE(MAX(ordinal), -1) AS last FROM deuz_swarm_tasks WHERE scope=? AND run_id=?',
+            ).get(change.scope, change.runId) as { n: number; last: number };
+            validateSpawn({
+              run,
+              tasks: change.tasks ?? [],
+              spawn,
+              count: count.n,
+              exists: (taskId) =>
+                !!statement(
+                  db,
+                  'SELECT 1 AS found FROM deuz_swarm_tasks WHERE scope=? AND run_id=? AND task_id=?',
+                ).get(change.scope, change.runId, taskId),
+            });
+            const insert = statement(
+              db,
+              'INSERT INTO deuz_swarm_tasks(scope,run_id,task_id,ordinal,payload) VALUES(?,?,?,?,?)',
+            );
+            spawn.forEach((task, index) =>
+              insert.run(
+                change.scope,
+                change.runId,
+                task.task.id,
+                count.last + 1 + index,
+                encodeSwarm(task),
+              ),
+            );
+          }
+          statement(
+            db,
+            'UPDATE deuz_swarm_runs SET payload=?, status=?, updated_at=? WHERE scope=? AND run_id=?',
+          ).run(encodeSwarm(run), run.status, run.updatedAt, change.scope, change.runId);
           writeEvents(db, makeSwarmEvents(change, previous.lastSequence, change.events ?? []));
           return run;
         }),

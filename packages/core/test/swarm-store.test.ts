@@ -25,11 +25,15 @@ afterEach(async () => {
 
 swarmStoreContracts('memory swarm store', createInMemorySwarmStore, { spawn: true });
 describe.skipIf(!DatabaseSync)('SQLite swarm store', () => {
-  swarmStoreContracts('real SQLite transactional conformance', () => {
-    const store = createSqliteSwarmStore({ path: ':memory:' });
-    cleanup.push(() => store.close());
-    return store;
-  });
+  swarmStoreContracts(
+    'real SQLite transactional conformance',
+    () => {
+      const store = createSqliteSwarmStore({ path: ':memory:' });
+      cleanup.push(() => store.close());
+      return store;
+    },
+    { spawn: true },
+  );
   it('reopens task/result/event journal and leaves the existing global schema version intact', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'deuz-swarm-'));
     cleanup.push(() =>
@@ -67,7 +71,7 @@ describe.skipIf(!DatabaseSync)('SQLite swarm store', () => {
     await expect(store.load(snapshot.run)).rejects.toThrow('Corrupt');
     const futureDb = new DatabaseSync!(':memory:');
     futureDb.exec(
-      'CREATE TABLE deuz_swarm_schema(singleton INTEGER PRIMARY KEY, version INTEGER); INSERT INTO deuz_swarm_schema VALUES(1,2)',
+      'CREATE TABLE deuz_swarm_schema(singleton INTEGER PRIMARY KEY, version INTEGER); INSERT INTO deuz_swarm_schema VALUES(1,3)',
     );
     const future = createSqliteSwarmStore({ path: ':memory:', database: futureDb });
     await expect(future.load(snapshot.run)).rejects.toThrow('Unsupported');
