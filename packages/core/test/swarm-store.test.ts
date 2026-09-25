@@ -6,7 +6,10 @@ import { createInMemorySwarmStore } from '../src/swarm/store';
 import { createSqliteSwarmStore } from '../src/node/swarm-sqlite';
 import { createSwarm } from '../src/swarm';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
-import type { SwarmSnapshot, SwarmStore } from '../src/types/swarm';
+import {
+  initialSnapshot as initial,
+  swarmStoreContracts,
+} from './fixtures/swarm-store-conformance';
 
 let DatabaseSync: (new (path: string) => SqliteDatabaseLike) | undefined;
 try {
@@ -20,92 +23,9 @@ afterEach(async () => {
   for (const close of cleanup.splice(0).reverse()) await close();
 });
 
-function initial(scope = 'a'): SwarmSnapshot {
-  return {
-    run: {
-      kind: 'deuz-swarm',
-      version: 1,
-      scope,
-      runId: 'same',
-      definitionVersion: '1',
-      status: 'running',
-      revision: 0,
-      lastSequence: 0,
-      createdAt: 1,
-      updatedAt: 1,
-      cancelRequested: false,
-    },
-    tasks: [
-      { task: { id: 'a', reducer: 'sum' }, bindingVersion: '1', status: 'pending', attempt: 0 },
-    ],
-  };
-}
-
-function contracts(name: string, make: () => SwarmStore) {
-  describe(name, () => {
-    it('atomically rolls back invalid multi-task writes and event publication', async () => {
-      const store = make();
-      const snapshot = initial();
-      await store.create(snapshot, [{ type: 'run.started', timestamp: 1 }]);
-      await expect(
-        store.commit({
-          ...snapshot.run,
-          expectedRevision: 0,
-          tasks: [
-            { ...snapshot.tasks[0]!, status: 'completed', result: { output: 4 } },
-            { ...snapshot.tasks[0]!, task: { id: 'unknown', reducer: 'sum' } },
-          ],
-          events: [{ type: 'task.completed', taskId: 'a', timestamp: 2 }],
-        }),
-      ).rejects.toThrow('fixed swarm');
-      expect((await store.load(snapshot.run))?.tasks[0]?.status).toBe('pending');
-      expect((await store.readEvents(snapshot.run, 0, 10)).map((event) => event.type)).toEqual([
-        'run.started',
-      ]);
-      expect((await store.load(snapshot.run))?.run.revision).toBe(0);
-    });
-    it('checks revision, isolates scopes, returns copies, and roundtrips bytes', async () => {
-      const store = make();
-      const a = initial();
-      const b = initial('b');
-      await store.create(a, []);
-      await store.create(b, []);
-      await store.commit({
-        ...a.run,
-        expectedRevision: 0,
-        tasks: [
-          { ...a.tasks[0]!, status: 'completed', result: { output: new Uint8Array([0, 255]) } },
-        ],
-      });
-      await expect(store.commit({ ...a.run, expectedRevision: 0 })).rejects.toThrow('conflict');
-      expect((await store.load(b.run))?.tasks[0]?.status).toBe('pending');
-      const copy = await store.load(a.run);
-      expect(copy?.tasks[0]?.result?.output).toEqual(new Uint8Array([0, 255]));
-      copy!.tasks[0]!.status = 'failed';
-      expect((await store.load(a.run))?.tasks[0]?.status).toBe('completed');
-    });
-    it('reads the run record alone through head()', async () => {
-      const store = make();
-      const snapshot = initial();
-      await store.create(snapshot, [{ type: 'run.started', timestamp: 1 }]);
-      await store.commit({
-        ...snapshot.run,
-        expectedRevision: 0,
-        tasks: [{ ...snapshot.tasks[0]!, status: 'running', attempt: 1 }],
-        events: [{ type: 'task.started', taskId: 'a', timestamp: 2 }],
-      });
-      const head = await store.head!(snapshot.run);
-      expect(head).toEqual((await store.load(snapshot.run))?.run);
-      expect(head).toMatchObject({ revision: 1, lastSequence: 2 });
-      head!.status = 'cancelled';
-      expect((await store.head!(snapshot.run))?.status).toBe('running');
-      expect(await store.head!({ scope: 'none', runId: 'none' })).toBeUndefined();
-    });
-  });
-}
-contracts('memory swarm store', createInMemorySwarmStore);
+swarmStoreContracts('memory swarm store', createInMemorySwarmStore, { spawn: true });
 describe.skipIf(!DatabaseSync)('SQLite swarm store', () => {
-  contracts('real SQLite transactional conformance', () => {
+  swarmStoreContracts('real SQLite transactional conformance', () => {
     const store = createSqliteSwarmStore({ path: ':memory:' });
     cleanup.push(() => store.close());
     return store;

@@ -26,11 +26,49 @@ interface SwarmTaskBase {
   dependsOn?: readonly string[];
   /** Manual (default) never repeats interrupted work without explicit authorization. */
   replay?: 'manual' | 'safe';
+  /** Wall-clock budget for each attempt (2.2); expiry fails the task. */
+  timeoutMs?: number;
 }
 
 export type SwarmTask =
   | (SwarmTaskBase & { agent: string; prompt: string; reducer?: never })
   | (SwarmTaskBase & { reducer: string; agent?: never; prompt?: never });
+
+/**
+ * A task created at runtime by a finished task (2.2). Its ID is
+ * `${parentId}/${key}`; `dependsOn` lists full IDs of existing tasks or of
+ * tasks spawned in the same request.
+ */
+export type SwarmSpawnRequest =
+  | (Omit<SwarmTaskBase, 'id'> & { key: string; agent: string; prompt: string; reducer?: never })
+  | (Omit<SwarmTaskBase, 'id'> & { key: string; reducer: string; agent?: never; prompt?: never });
+
+/** What a spawning task knows when it spawns (2.2). */
+export interface SwarmSpawnContext extends SwarmKey {
+  taskId: string;
+  /** 0 for a root task. */
+  depth: number;
+  /** Results of the finished task's direct dependencies. */
+  dependencies: Readonly<Record<string, SwarmTaskResult>>;
+}
+
+/** What a failed task's compensation hook receives (2.2). */
+export interface SwarmFailureContext extends SwarmSpawnContext {
+  error: { name: string; message: string; code?: string };
+}
+
+/** Bounds on runtime task spawning (2.2). */
+export interface SwarmDynamicLimits {
+  /** Upper bound on the run's task count, root tasks included (at most 10 000). */
+  maxTasks: number;
+  /** Spawn generations allowed below a root task (at most 64). */
+  maxSpawnDepth: number;
+  /** Tasks one finished task may spawn; defaults to maxTasks. */
+  maxSpawnPerTask?: number;
+}
+
+/** A persistence feature a store supports (2.2). */
+export type SwarmStoreCapability = 'spawn';
 
 export interface SwarmTaskResult {
   output: unknown;
@@ -50,6 +88,10 @@ export interface SwarmTaskRecord {
   error?: { name: string; message: string; code?: string };
   startedAt?: number;
   finishedAt?: number;
+  /** Set on a spawned task (2.2): the parent attempt that created it. */
+  spawnedBy?: { taskId: string; attempt: number; on: 'completed' | 'failed' };
+  /** Spawn depth (2.2); absent means 0. */
+  depth?: number;
 }
 
 export interface SwarmKey {
@@ -59,7 +101,8 @@ export interface SwarmKey {
 
 export interface SwarmRunRecord extends SwarmKey {
   kind: 'deuz-swarm';
-  version: 1;
+  /** Version 2 (2.2) marks a dynamic run; 2.1 rejects it. */
+  version: 1 | 2;
   definitionVersion: string;
   status: SwarmRunStatus;
   revision: number;
@@ -68,6 +111,8 @@ export interface SwarmRunRecord extends SwarmKey {
   updatedAt: number;
   cancelRequested: boolean;
   executionState?: ExecutionContextSnapshot;
+  /** Version 2: the limits fixed at creation; resume can only tighten them. */
+  dynamic?: Required<SwarmDynamicLimits>;
 }
 
 export interface SwarmSnapshot {
@@ -87,7 +132,8 @@ export interface SwarmEventInput {
     | 'task.suspended'
     | 'task.blocked'
     | 'task.cancelled'
-    | 'task.reconciliation';
+    | 'task.reconciliation'
+    | 'task.spawned';
   taskId?: string;
   timestamp: number;
   /** Small control metadata only; task output is retrieved from the snapshot. */
@@ -105,11 +151,18 @@ export interface SwarmCommit extends SwarmKey {
     Pick<SwarmRunRecord, 'status' | 'updatedAt' | 'cancelRequested' | 'executionState'>
   >;
   tasks?: readonly SwarmTaskRecord[];
+  /** Tasks created by this commit (2.2); each commits with its parent's terminal state. */
+  spawn?: readonly SwarmTaskRecord[];
   events?: readonly SwarmEventInput[];
 }
 
 /** Every commit is atomic, including its event rows. Failed writes MUST reject. */
 export interface SwarmStore {
+  /**
+   * Features this store persists (2.2). A dynamic swarm requires 'spawn': a
+   * store without it would silently drop spawned tasks from its commits.
+   */
+  readonly capabilities?: readonly SwarmStoreCapability[];
   create(snapshot: SwarmSnapshot, events: readonly SwarmEventInput[]): Promise<SwarmRunRecord>;
   load(key: SwarmKey): Promise<SwarmSnapshot | undefined>;
   /**
@@ -134,12 +187,23 @@ export interface SwarmAgentBinding {
   maxVerifyAttempts?: number;
   policy?: ExecutionPolicy;
   budget?: BudgetLimits;
+  /** Tasks to create when this agent's task completes (2.2), from its accepted output. */
+  spawn?: (
+    output: unknown,
+    context: SwarmSpawnContext,
+  ) => readonly SwarmSpawnRequest[] | Promise<readonly SwarmSpawnRequest[]>;
+  /** Compensation tasks to create when this agent's task fails (2.2). */
+  onFailure?: (
+    context: SwarmFailureContext,
+  ) => readonly SwarmSpawnRequest[] | Promise<readonly SwarmSpawnRequest[]>;
 }
 
 export interface SwarmReducerContext extends SwarmKey {
   taskId: string;
   signal: AbortSignal;
   execution: NativeExecutionContext;
+  /** Queue tasks to create when this reducer completes (2.2); discarded if it throws. */
+  spawn(requests: readonly SwarmSpawnRequest[]): void;
 }
 
 export interface SwarmReducerBinding {
@@ -150,6 +214,10 @@ export interface SwarmReducerBinding {
     results: Readonly<Record<string, SwarmTaskResult>>,
     context: SwarmReducerContext,
   ): unknown | Promise<unknown>;
+  /** Compensation tasks to create when this reducer fails (2.2). */
+  onFailure?: (
+    context: SwarmFailureContext,
+  ) => readonly SwarmSpawnRequest[] | Promise<readonly SwarmSpawnRequest[]>;
 }
 
 export interface SwarmOptions {
@@ -161,6 +229,8 @@ export interface SwarmOptions {
   deps?: Dependencies;
   policy?: ExecutionPolicy;
   budget?: BudgetLimits;
+  /** Let finished tasks spawn tasks at runtime (2.2); needs a store with 'spawn'. */
+  dynamic?: SwarmDynamicLimits;
 }
 
 export interface SwarmRunOptions {

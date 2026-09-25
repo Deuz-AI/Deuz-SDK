@@ -73,12 +73,31 @@ export function swarmKey(key: SwarmKey): string {
   return JSON.stringify([key.scope, key.runId]);
 }
 
+/** Hard caps on runtime spawning (2.2). */
+export const SWARM_MAX_TASKS = 10_000;
+export const SWARM_MAX_SPAWN_DEPTH = 64;
+
+const bounded = (value: unknown, max: number): boolean =>
+  Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= max;
+
+function validLimits(limits: SwarmRunRecord['dynamic']): boolean {
+  return (
+    !!limits &&
+    bounded(limits.maxTasks, SWARM_MAX_TASKS) &&
+    bounded(limits.maxSpawnDepth, SWARM_MAX_SPAWN_DEPTH) &&
+    bounded(limits.maxSpawnPerTask, limits.maxTasks)
+  );
+}
+
 export function validateSwarmSnapshot(snapshot: SwarmSnapshot, key?: SwarmKey): void {
   const run = snapshot?.run;
   if (
     !run ||
     run.kind !== 'deuz-swarm' ||
-    run.version !== 1 ||
+    !(
+      (run.version === 1 && run.dynamic === undefined) ||
+      (run.version === 2 && validLimits(run.dynamic))
+    ) ||
     !run.scope ||
     !run.runId ||
     !Number.isSafeInteger(run.revision) ||
@@ -112,11 +131,99 @@ export function validateSwarmSnapshot(snapshot: SwarmSnapshot, key?: SwarmKey): 
         'cancelled',
         'needs_reconciliation',
       ].includes(task.status) ||
-      (task.status === 'completed' && !task.result)
+      (task.status === 'completed' && !task.result) ||
+      (task.depth !== undefined && (!Number.isSafeInteger(task.depth) || task.depth < 0)) ||
+      (task.spawnedBy !== undefined &&
+        (!task.spawnedBy.taskId ||
+          !Number.isSafeInteger(task.spawnedBy.attempt) ||
+          task.spawnedBy.attempt < 1 ||
+          !['completed', 'failed'].includes(task.spawnedBy.on)))
     )
       throw new Error('Corrupt swarm task state');
     ids.add(task.task.id);
   }
+}
+
+/**
+ * Store-side check of a commit's spawned tasks (2.2): each is new, pending and
+ * namespaced under a parent that reaches the matching terminal state in the
+ * same commit, within the run's persisted limits, with dependencies that exist
+ * or are spawned alongside it and form no cycle. Nothing is written on failure.
+ */
+export function validateSpawn(input: {
+  run: SwarmRunRecord;
+  tasks: readonly SwarmTaskRecord[];
+  spawn: readonly SwarmTaskRecord[];
+  exists: (taskId: string) => boolean;
+  count: number;
+}): void {
+  const { run, spawn } = input;
+  if (!spawn.length) return;
+  if (run.version !== 2 || !run.dynamic)
+    throw new Error('Only a dynamic (version 2) swarm run can spawn tasks');
+  const limits = run.dynamic;
+  if (input.count + spawn.length > limits.maxTasks)
+    throw new Error(`Swarm task limit exceeded (${limits.maxTasks})`);
+  const parents = new Map(input.tasks.map((task) => [task.task.id, task]));
+  const perParent = new Map<string, number>();
+  const batch = new Map<string, SwarmTaskRecord>();
+  for (const record of spawn) {
+    const id = record.task?.id;
+    if (!id || batch.has(id) || input.exists(id))
+      throw new Error(`Spawned task ID is not new: ${String(id)}`);
+    if (
+      record.status !== 'pending' ||
+      record.attempt !== 0 ||
+      record.result !== undefined ||
+      record.error !== undefined ||
+      record.agentState !== undefined ||
+      record.resolvedPrompt !== undefined
+    )
+      throw new Error(`Spawned task must start pending: ${id}`);
+    const origin = record.spawnedBy;
+    const parent = origin && parents.get(origin.taskId);
+    if (
+      !origin ||
+      !parent ||
+      parent.status !== origin.on ||
+      parent.attempt !== origin.attempt ||
+      !id.startsWith(`${origin.taskId}/`)
+    )
+      throw new Error(`A spawned task must commit with its parent's terminal state: ${id}`);
+    const depth = (parent.depth ?? 0) + 1;
+    if (record.depth !== depth || depth > limits.maxSpawnDepth)
+      throw new Error(`Swarm spawn depth exceeded (${limits.maxSpawnDepth}): ${id}`);
+    const spawned = (perParent.get(origin.taskId) ?? 0) + 1;
+    if (spawned > limits.maxSpawnPerTask)
+      throw new Error(`Swarm per-task spawn limit exceeded (${limits.maxSpawnPerTask})`);
+    perParent.set(origin.taskId, spawned);
+    batch.set(id, record);
+  }
+  // Existing tasks cannot depend on new ones, so a cycle can only lie inside the batch.
+  const pending = new Map<string, number>();
+  const children = new Map<string, string[]>();
+  for (const [id, record] of batch) {
+    const deps = record.task.dependsOn ?? [];
+    if (new Set(deps).size !== deps.length) throw new Error(`Duplicate dependency: ${id}`);
+    let inBatch = 0;
+    for (const dep of deps) {
+      if (batch.has(dep)) {
+        inBatch++;
+        children.set(dep, [...(children.get(dep) ?? []), id]);
+      } else if (!input.exists(dep)) throw new Error(`Missing dependency: ${dep}`);
+    }
+    pending.set(id, inBatch);
+  }
+  const ready = [...pending].filter(([, count]) => count === 0).map(([id]) => id);
+  for (let index = 0; index < ready.length; index++) {
+    for (const next of children.get(ready[index]!) ?? []) {
+      const left = pending.get(next)! - 1;
+      pending.set(next, left);
+      if (left === 0) ready.push(next);
+    }
+  }
+  if (ready.length !== batch.size) throw new Error('Swarm dependency cycle among spawned tasks');
+  validateSwarmSnapshot({ run, tasks: [...batch.values()] });
 }
 
 export function nextSwarmRun(run: SwarmRunRecord, change: SwarmCommit): SwarmRunRecord {
@@ -178,6 +285,7 @@ export function createInMemorySwarmStore(): SwarmStore {
     { run: SwarmRunRecord; tasks: Map<string, SwarmTaskRecord>; events: SwarmEvent[] }
   >();
   return {
+    capabilities: Object.freeze(['spawn'] as const),
     async create(snapshot, inputs) {
       validateSwarmSnapshot(snapshot);
       if (snapshot.run.revision !== 0 || snapshot.run.lastSequence !== 0)
@@ -207,13 +315,21 @@ export function createInMemorySwarmStore(): SwarmStore {
       if (!row) throw new Error('Swarm run not found');
       const run = cloneSwarm(nextSwarmRun(row.run, change));
       const tasks = cloneSwarm(change.tasks ?? []);
+      const spawn = cloneSwarm(change.spawn ?? []);
       const events = cloneSwarm(makeSwarmEvents(change, row.run.lastSequence, change.events ?? []));
       for (const task of tasks) {
         if (!row.tasks.has(task.task.id)) throw new Error('Cannot add tasks to a fixed swarm DAG');
         validateTaskChange(row.tasks.get(task.task.id)!, task, run);
       }
+      validateSpawn({
+        run,
+        tasks,
+        spawn,
+        exists: (taskId) => row.tasks.has(taskId),
+        count: row.tasks.size,
+      });
       // All validation/serialization precedes the first mutation.
-      for (const task of tasks) row.tasks.set(task.task.id, task);
+      for (const task of [...tasks, ...spawn]) row.tasks.set(task.task.id, task);
       row.run = run;
       row.events.push(...events);
       return cloneSwarm(run);

@@ -279,6 +279,9 @@ export function createSwarm(options: SwarmOptions): Swarm {
             taskId: task.id,
             signal: controller.signal,
             execution: child,
+            spawn() {
+              throw new Error('This swarm cannot spawn tasks');
+            },
           });
           if (output === undefined)
             throw new Error('Swarm reducer must return a serializable output');
