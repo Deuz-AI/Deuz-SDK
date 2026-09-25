@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { BudgetLedgerError, createBudgetLedger } from '../src/budget-ledger';
+import {
+  BudgetLedgerError,
+  createBudgetLedger,
+  subtreeLedgerSnapshot,
+} from '../src/budget-ledger';
 import type { BudgetLedgerSnapshot } from '../src/budget-ledger';
 import type { Usage } from '../src/types/usage';
 
@@ -311,5 +315,130 @@ describe('native shared budget ledger', () => {
     expect(() => createBudgetLedger({ budget: { tokens: Number.POSITIVE_INFINITY } })).toThrow(
       BudgetLedgerError,
     );
+  });
+});
+
+describe('ledger compaction (2.2)', () => {
+  const root = { id: 'root', budget: { tokens: 1000 } };
+  const scoped = (id: string) => [root, { id, budget: {} }];
+
+  it('folds a finished scope without changing global, ancestor or sibling totals', async () => {
+    const ledger = createBudgetLedger({ budget: { tokens: 1000, usd: 10 } });
+    await ledger.reserve({ requestId: 'a1', modelId: 'm', tokens: 50, usd: 1, scopes: scoped('a') });
+    await ledger.settle({ requestId: 'a1', tokens: 40, usd: 0.5 });
+    await ledger.reserve({ requestId: 'a2', modelId: 'm', tokens: 30, usd: 1, scopes: scoped('a') });
+    await ledger.markUnknown('a2');
+    await ledger.reserve({ requestId: 'a3', modelId: 'm', tokens: 5, usd: 0.1, scopes: scoped('a') });
+    await ledger.release('a3');
+    await ledger.reserve({ requestId: 'b1', modelId: 'm', tokens: 20, usd: 1, scopes: scoped('b') });
+    const before = { all: ledger.totals(), root: ledger.totals('root'), b: ledger.totals('b') };
+    expect(await ledger.compact('a')).toEqual({ scopeId: 'a', folded: 2, dropped: 1, retained: 0 });
+    expect(ledger.totals()).toEqual(before.all);
+    expect(ledger.totals('root')).toEqual(before.root);
+    expect(ledger.totals('b')).toEqual(before.b);
+    expect(ledger.totals('a').committed).toEqual({ tokens: 0, usd: 0 });
+    expect(ledger.get('a1')).toBeUndefined();
+    const saved = ledger.snapshot();
+    expect(saved.version).toBe(2);
+    expect(saved.reservations.map((item) => item.requestId)).toEqual(['b1']);
+    expect(saved.aggregates).toEqual([
+      {
+        scopes: [root],
+        count: 2,
+        spent: { tokens: 40, usd: 0.5 },
+        held: { tokens: 30, usd: 1 },
+        unknownTokens: 1,
+        unknownUsd: 1,
+        unestimatedTokens: 0,
+        unestimatedUsd: 0,
+      },
+    ]);
+  });
+
+  it('retains in-flight reservations and folds them after they settle', async () => {
+    const ledger = createBudgetLedger();
+    await ledger.reserve({ requestId: 'live', modelId: 'm', tokens: 10, scopes: scoped('a') });
+    expect(await ledger.compact('a')).toEqual({ scopeId: 'a', folded: 0, dropped: 0, retained: 1 });
+    expect(ledger.snapshot().version).toBe(1);
+    await ledger.settle({ requestId: 'live', tokens: 7, usd: 0 });
+    expect(await ledger.compact('a')).toMatchObject({ folded: 1, retained: 0 });
+    expect(ledger.totals('root').spent).toEqual({ tokens: 7, usd: 0 });
+  });
+
+  it('keeps a later cap fail-closed for folded usage that had no estimate', async () => {
+    const first = createBudgetLedger();
+    await first.reserve({ requestId: 'a', modelId: 'm', tokens: 10, scopes: scoped('a') });
+    await first.settle({ requestId: 'a', tokens: 8 });
+    await first.compact('a');
+    expect(first.snapshot().aggregates?.[0]).toMatchObject({ unknownUsd: 1, unestimatedUsd: 1 });
+    const capped = createBudgetLedger({ snapshot: first.snapshot(), budget: { usd: 5 } });
+    await expect(
+      capped.reserve({ requestId: 'b', modelId: 'm', usd: 1, scopes: [root] }),
+    ).rejects.toMatchObject({ code: 'missing_reservation' });
+  });
+
+  it('counts folded usage against ancestor limits on later admission', async () => {
+    const tight = { id: 'root', budget: { tokens: 100 } };
+    const ledger = createBudgetLedger();
+    const under = (id: string) => [tight, { id, budget: {} }];
+    await ledger.reserve({ requestId: 'a', modelId: 'm', tokens: 80, scopes: under('a') });
+    await ledger.settle({ requestId: 'a', tokens: 80, usd: 0 });
+    await ledger.compact('a');
+    await expect(
+      ledger.reserve({ requestId: 'b', modelId: 'm', tokens: 30, scopes: under('b') }),
+    ).rejects.toMatchObject({ code: 'budget_exceeded' });
+    await ledger.reserve({ requestId: 'c', modelId: 'm', tokens: 20, scopes: under('c') });
+  });
+
+  it('round-trips version 2 snapshots and rejects malformed or sliced ones', async () => {
+    const ledger = createBudgetLedger();
+    await ledger.reserve({ requestId: 'a', modelId: 'm', tokens: 5, usd: 0.1, scopes: scoped('a') });
+    await ledger.settle({ requestId: 'a', tokens: 5, usd: 0.1 });
+    await ledger.compact('a');
+    const saved = JSON.parse(JSON.stringify(ledger.snapshot())) as BudgetLedgerSnapshot;
+    const recovered = createBudgetLedger({ snapshot: saved });
+    expect(recovered.totals()).toEqual(ledger.totals());
+    expect(recovered.snapshot()).toEqual(saved);
+    expect(() => createBudgetLedger({ snapshot: { ...saved, version: 1 } })).toThrow(
+      BudgetLedgerError,
+    );
+    expect(() =>
+      createBudgetLedger({
+        snapshot: { ...saved, aggregates: [...saved.aggregates!, ...saved.aggregates!] },
+      }),
+    ).toThrow(BudgetLedgerError);
+    expect(() =>
+      createBudgetLedger({
+        snapshot: { ...saved, aggregates: [{ ...saved.aggregates![0]!, unestimatedUsd: 3 }] },
+      }),
+    ).toThrow(BudgetLedgerError);
+    expect(() => createBudgetLedger({ snapshot: subtreeLedgerSnapshot(saved, 'root') })).toThrow(
+      /subtree/,
+    );
+  });
+
+  it('writes version 1 snapshots until compaction is used and slices one scope', async () => {
+    const ledger = createBudgetLedger();
+    await ledger.reserve({ requestId: 'a', modelId: 'm', tokens: 1, scopes: scoped('a') });
+    await ledger.reserve({ requestId: 'b', modelId: 'm', tokens: 1, scopes: scoped('b') });
+    expect(Object.keys(ledger.snapshot())).toEqual([
+      'version',
+      'revision',
+      'budget',
+      'reservations',
+    ]);
+    const slice = subtreeLedgerSnapshot(ledger.snapshot(), 'a');
+    expect(slice).toMatchObject({ version: 2, subtree: 'a', revision: 2 });
+    expect(slice.reservations.map((item) => item.requestId)).toEqual(['a']);
+  });
+
+  it('persists a compaction once and skips persistence when nothing folds', async () => {
+    const writes: number[] = [];
+    const ledger = createBudgetLedger({ persist: (saved) => void writes.push(saved.revision) });
+    await ledger.reserve({ requestId: 'a', modelId: 'm', tokens: 1, scopes: scoped('a') });
+    await ledger.settle({ requestId: 'a', tokens: 1, usd: 0 });
+    await ledger.compact('b');
+    await ledger.compact('a');
+    expect(writes).toEqual([1, 2, 3]);
   });
 });

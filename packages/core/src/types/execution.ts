@@ -64,11 +64,52 @@ export interface BudgetTotals {
   readonly unknownUsd: number;
 }
 
+/**
+ * Accounting folded out of finished scopes by `BudgetLedger.compact` (2.2).
+ * Folded reservations keep counting against every ancestor scope, so global
+ * and ancestor totals are unchanged by compaction.
+ */
+export interface BudgetAggregate {
+  /** Ancestor scopes, root first, that the folded reservations still count against. */
+  readonly scopes: readonly BudgetScope[];
+  /** Folded reservations. */
+  readonly count: number;
+  /** Known actual amounts. */
+  readonly spent: Required<BudgetLimits>;
+  /** Estimates still held for dimensions whose actual amount stayed unknown. */
+  readonly held: Required<BudgetLimits>;
+  readonly unknownTokens: number;
+  readonly unknownUsd: number;
+  /** Unknown amounts that carried no estimate: a cap on that dimension fails closed. */
+  readonly unestimatedTokens: number;
+  readonly unestimatedUsd: number;
+}
+
+/** What one `compact` call changed (2.2). */
+export interface BudgetCompaction {
+  readonly scopeId: string;
+  /** Settled or unknown reservations folded into an aggregate. */
+  readonly folded: number;
+  /** Released reservations dropped; they never counted toward totals. */
+  readonly dropped: number;
+  /** In-flight reservations left in place until they settle. */
+  readonly retained: number;
+}
+
 export interface BudgetLedgerSnapshot {
-  readonly version: 1;
+  /** Version 2 (2.2) carries `aggregates` or `subtree`; 2.1 readers reject it. */
+  readonly version: 1 | 2;
   readonly revision: number;
   readonly budget: BudgetLimits;
   readonly reservations: readonly BudgetReservation[];
+  /** Version 2: accounting folded by `compact`. */
+  readonly aggregates?: readonly BudgetAggregate[];
+  /**
+   * Version 2: only the accounting charged to this scope. A native run under a
+   * shared child context checkpoints its own slice; the slice proves
+   * continuity on resume but can never seed a ledger.
+   */
+  readonly subtree?: string;
 }
 
 export interface BudgetLedgerOptions {
@@ -100,6 +141,15 @@ export interface BudgetLedger {
   release(requestId: string): Promise<BudgetReservation>;
   get(requestId: string): BudgetReservation | undefined;
   totals(scopeId?: string): BudgetTotals;
+  /**
+   * Fold the settled and unknown reservations charged to a FINISHED scope (and
+   * its descendants) into one aggregate per ancestor chain, and drop its
+   * released ones (2.2). Global and ancestor totals are unchanged; the scope's
+   * own totals and per-request records are gone. In-flight reservations stay
+   * until they settle. Only compact a scope that will never reserve again —
+   * the swarm does this for terminal tasks.
+   */
+  compact(scopeId: string): Promise<BudgetCompaction>;
   snapshot(): BudgetLedgerSnapshot;
 }
 
