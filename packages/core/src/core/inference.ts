@@ -572,6 +572,8 @@ export function runStream(
           generateId: deps.generateId,
           provider: call.provider,
         })) {
+          // 2.2: the idle timer measures provider silence only, not the pump's own work.
+          timeout.hold();
           if (
             !firstContent &&
             (part.type === 'text-delta' ||
@@ -597,8 +599,6 @@ export function runStream(
               });
             }
           }
-          // 2.2: once content flows, a silence longer than `chunkMs` fails the call.
-          if (firstContent) timeout.chunk();
           if (rt) {
             if (part.type === 'text-delta') {
               outputTextLength += part.text.length;
@@ -650,6 +650,9 @@ export function runStream(
             }
           }
           broadcaster.push(part);
+          // 2.2: once content flows, a silence longer than `chunkMs` before the next
+          // part fails the call. A finished answer is never timed out while it closes.
+          if (firstContent && part.type !== 'finish') timeout.chunk();
         }
       } finally {
         timeout.clear();

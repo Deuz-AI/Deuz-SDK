@@ -95,10 +95,15 @@ export interface TimeoutHandle {
   /** Call when the first content delta arrives — clears the ttft timer. */
   firstByte(): void;
   /**
-   * Call on every stream part once content flows (2.2): re-arms the idle timer
-   * when `chunkMs` is set; otherwise does nothing.
+   * Call right before reading the next stream part once content flows (2.2):
+   * re-arms the idle timer when `chunkMs` is set; otherwise does nothing.
    */
   chunk(): void;
+  /**
+   * Call when a part arrives (2.2): stops the idle timer while the pump does its
+   * own work (settlement, pricing), which is not provider silence.
+   */
+  hold(): void;
   /** Call on completion — clears all timers. */
   clear(): void;
 }
@@ -144,6 +149,10 @@ export function createTimeout(
           ),
         chunkMs,
       );
+    },
+    hold() {
+      chunkCancel?.();
+      chunkCancel = undefined;
     },
     clear() {
       ttftCancel?.();

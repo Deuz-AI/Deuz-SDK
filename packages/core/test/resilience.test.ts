@@ -899,19 +899,50 @@ describe('timeout.chunkMs (2.2)', () => {
     }) as typeof fetch;
   }
 
-  it('re-arms after every part once content flows and a steady stream completes', async () => {
+  it('re-arms before each read once content flows, never after finish, and clears on completion', async () => {
+    const TWO_DELTAS = sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 3, output_tokens: 1 } } },
+      },
+      {
+        event: 'content_block_start',
+        data: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      },
+      {
+        event: 'content_block_delta',
+        data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'o' } },
+      },
+      {
+        event: 'content_block_delta',
+        data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'k' } },
+      },
+      {
+        event: 'message_delta',
+        data: {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 2 },
+        },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
     const clock = controlledClock();
     const result = streamChat({
-      model: anthropic((async () => sseResponse([OK_STREAM])) as typeof fetch),
+      model: anthropic((async () => sseResponse([TWO_DELTAS])) as typeof fetch),
       messages: [{ role: 'user', content: 'hi' }],
       timeout: { chunkMs: 5_000 },
       deps: { clock: clock.clock, generateId: () => 'fixed-id' },
     });
-    await drain(result.textStream);
+    let text = '';
+    for await (const chunk of result.textStream) text += chunk;
+    expect(text).toBe('ok');
     expect(await result.finishReason).toBe('stop');
     const armed = clock.armed();
     expect(armed.slice(0, 2)).toEqual([300_000, 60_000]);
-    expect(armed.filter((ms) => ms === 5_000).length).toBeGreaterThanOrEqual(2);
+    // One idle timer after each content delta; none after the finish part.
+    expect(armed.filter((ms) => ms === 5_000)).toHaveLength(2);
+    expect(clock.fire(5_000)).toBe(false);
   });
 
   it('a stream that stalls after first content FAILS with layer "chunk"', async () => {
@@ -932,5 +963,70 @@ describe('timeout.chunkMs (2.2)', () => {
     expect(text).toBe('ok');
     await expect(result.usage).rejects.toMatchObject({ code: 'timeout', layer: 'chunk' });
     await expect(result.finishReason).rejects.toBeInstanceOf(TimeoutError);
+  });
+});
+
+describe("timeout.chunkMs ignores the pump's own work (2.2)", () => {
+  it('never counts finish-part settlement and pricing as stream silence', async () => {
+    const clock = controlledClock();
+    let closeBody: () => void = () => {};
+    // The provider sends the whole answer but keeps the connection open.
+    const keepAlive = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(OK_STREAM));
+          closeBody = () => {
+            try {
+              controller.close();
+            } catch {
+              /* already errored by an abort */
+            }
+          };
+          signal?.addEventListener(
+            'abort',
+            () => controller.error(signal.reason ?? new DOMException('Aborted', 'AbortError')),
+            { once: true },
+          );
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    }) as typeof globalThis.fetch;
+    let pricingStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      pricingStarted = resolve;
+    });
+    let releasePricing!: () => void;
+    const priced = new Promise<void>((resolve) => {
+      releasePricing = resolve;
+    });
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch: keepAlive })('claude-opus-4-8'),
+      messages: [{ role: 'user', content: 'hi' }],
+      timeout: { chunkMs: 5_000 },
+      deps: {
+        clock: clock.clock,
+        generateId: () => 'fixed-id',
+        priceProvider: {
+          priceUsage: async () => {
+            pricingStarted();
+            await priced;
+            return 0.01;
+          },
+        },
+      },
+    });
+    const drained = drain(result.fullStream);
+    await started;
+    // Only local work is pending now; no idle timer may be running.
+    const fired = clock.fire(5_000);
+    releasePricing();
+    closeBody();
+    await drained;
+    expect(fired).toBe(false);
+    expect(await result.finishReason).toBe('stop');
   });
 });
