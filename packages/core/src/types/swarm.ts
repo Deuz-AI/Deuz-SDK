@@ -68,7 +68,24 @@ export interface SwarmDynamicLimits {
 }
 
 /** A persistence feature a store supports (2.2). */
-export type SwarmStoreCapability = 'spawn';
+export type SwarmStoreCapability = 'spawn' | 'channels';
+
+/** One durable blackboard note (2.2), ordered within its channel. */
+export interface SwarmChannelEntry {
+  channel: string;
+  /** 1-based, gapless within the channel. */
+  sequence: number;
+  /** Idempotency key: an identical repeat is a no-op, a different one is rejected. */
+  entryId: string;
+  taskId: string;
+  attempt: number;
+  text: string;
+  data?: unknown;
+  at: number;
+}
+
+/** A note to append (2.2); the store assigns its sequence. */
+export type SwarmChannelPost = Omit<SwarmChannelEntry, 'sequence'>;
 
 export interface SwarmTaskResult {
   output: unknown;
@@ -133,7 +150,8 @@ export interface SwarmEventInput {
     | 'task.blocked'
     | 'task.cancelled'
     | 'task.reconciliation'
-    | 'task.spawned';
+    | 'task.spawned'
+    | 'channel.posted';
   taskId?: string;
   timestamp: number;
   /** Small control metadata only; task output is retrieved from the snapshot. */
@@ -153,6 +171,11 @@ export interface SwarmCommit extends SwarmKey {
   tasks?: readonly SwarmTaskRecord[];
   /** Tasks created by this commit (2.2); each commits with its parent's terminal state. */
   spawn?: readonly SwarmTaskRecord[];
+  /**
+   * Blackboard notes to append (2.2). The store journals a channel.posted event
+   * for each new one; an identical repeat is a no-op.
+   */
+  posts?: readonly SwarmChannelPost[];
   events?: readonly SwarmEventInput[];
 }
 
@@ -171,6 +194,13 @@ export interface SwarmStore {
    */
   head?(key: SwarmKey): Promise<SwarmRunRecord | undefined>;
   commit(change: SwarmCommit): Promise<SwarmRunRecord>;
+  /** A channel's notes after a sequence cursor (2.2); needs the 'channels' capability. */
+  readChannel?(
+    key: SwarmKey,
+    channel: string,
+    afterSequence: number,
+    limit: number,
+  ): Promise<SwarmChannelEntry[]>;
   readEvents(key: SwarmKey, afterSequence: number, limit: number): Promise<SwarmEvent[]>;
 }
 

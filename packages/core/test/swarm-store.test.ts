@@ -23,7 +23,10 @@ afterEach(async () => {
   for (const close of cleanup.splice(0).reverse()) await close();
 });
 
-swarmStoreContracts('memory swarm store', createInMemorySwarmStore, { spawn: true });
+swarmStoreContracts('memory swarm store', createInMemorySwarmStore, {
+  spawn: true,
+  channels: true,
+});
 describe.skipIf(!DatabaseSync)('SQLite swarm store', () => {
   swarmStoreContracts(
     'real SQLite transactional conformance',
@@ -32,7 +35,7 @@ describe.skipIf(!DatabaseSync)('SQLite swarm store', () => {
       cleanup.push(() => store.close());
       return store;
     },
-    { spawn: true },
+    { spawn: true, channels: true },
   );
   it('reopens task/result/event journal and leaves the existing global schema version intact', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'deuz-swarm-'));

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type {
+  SwarmChannelPost,
   SwarmCommit,
   SwarmSnapshot,
   SwarmStore,
@@ -66,7 +67,7 @@ const child = (id: string, extra: Partial<SwarmTaskRecord> = {}): SwarmTaskRecor
 export function swarmStoreContracts(
   name: string,
   make: () => SwarmStore,
-  options: { spawn?: boolean } = {},
+  options: { spawn?: boolean; channels?: boolean } = {},
 ): void {
   describe(name, () => {
     it('atomically rolls back invalid multi-task writes and event publication', async () => {
@@ -129,6 +130,92 @@ export function swarmStoreContracts(
       expect((await store.head!(snapshot.run))?.status).toBe('running');
       expect(await store.head!({ scope: 'none', runId: 'none' })).toBeUndefined();
     });
+
+    if (options.channels) {
+      const post = (entryId: string, extra: Partial<SwarmChannelPost> = {}): SwarmChannelPost => ({
+        channel: 'euler',
+        entryId,
+        taskId: 'a',
+        attempt: 1,
+        text: `note ${entryId}`,
+        at: 3,
+        ...extra,
+      });
+
+      it('declares the channels capability', () => {
+        expect(make().capabilities).toContain('channels');
+      });
+
+      it('orders posts per channel, pages them and journals only new entries', async () => {
+        const store = make();
+        const snapshot = initialSnapshot();
+        await store.create(snapshot, [{ type: 'run.started', timestamp: 1 }]);
+        await store.commit({
+          ...snapshot.run,
+          expectedRevision: 0,
+          posts: [post('p1'), post('p2', { data: { ok: true } }), post('q1', { channel: 'ns' })],
+        });
+        // An identical replay of an earlier post is a no-op.
+        await store.commit({ ...snapshot.run, expectedRevision: 1, posts: [post('p1')] });
+        const euler = await store.readChannel!(snapshot.run, 'euler', 0, 10);
+        expect(euler.map((entry) => [entry.sequence, entry.entryId, entry.text])).toEqual([
+          [1, 'p1', 'note p1'],
+          [2, 'p2', 'note p2'],
+        ]);
+        expect(euler[1]?.data).toEqual({ ok: true });
+        expect(
+          (await store.readChannel!(snapshot.run, 'euler', 1, 10)).map((entry) => entry.entryId),
+        ).toEqual(['p2']);
+        expect(
+          (await store.readChannel!(snapshot.run, 'euler', 0, 1)).map((entry) => entry.entryId),
+        ).toEqual(['p1']);
+        expect(
+          (await store.readChannel!(snapshot.run, 'ns', 0, 10)).map((entry) => entry.sequence),
+        ).toEqual([1]);
+        expect(await store.readChannel!({ scope: 'none', runId: 'same' }, 'euler', 0, 10)).toEqual(
+          [],
+        );
+        const events = await store.readEvents(snapshot.run, 0, 10);
+        expect(events.map((event) => [event.type, event.detail])).toEqual([
+          ['run.started', undefined],
+          ['channel.posted', 'euler'],
+          ['channel.posted', 'euler'],
+          ['channel.posted', 'ns'],
+        ]);
+        expect((await store.load(snapshot.run))?.run.lastSequence).toBe(4);
+      });
+
+      it('rejects a conflicting repeat or an invalid post without writing anything', async () => {
+        const cases: [string, SwarmChannelPost][] = [
+          ['conflicting repeat', post('p1', { text: 'different' })],
+          ['bad channel', post('x', { channel: 'bad channel!' })],
+          ['unknown task', post('y', { taskId: 'nope' })],
+          ['empty text', post('z', { text: '' })],
+        ];
+        for (const [label, bad] of cases) {
+          const store = make();
+          const snapshot = initialSnapshot();
+          await store.create(snapshot, []);
+          await store.commit({ ...snapshot.run, expectedRevision: 0, posts: [post('p1')] });
+          await expect(
+            store.commit({
+              ...snapshot.run,
+              expectedRevision: 1,
+              tasks: [{ ...snapshot.tasks[0]!, status: 'running', attempt: 1 }],
+              posts: [post('ok'), bad],
+            }),
+            label,
+          ).rejects.toThrow();
+          expect(
+            (await store.readChannel!(snapshot.run, 'euler', 0, 10)).map((entry) => entry.entryId),
+            label,
+          ).toEqual(['p1']);
+          const after = await store.load(snapshot.run);
+          expect(after?.tasks[0]?.status, label).toBe('pending');
+          expect(after?.run.revision, label).toBe(1);
+        }
+      });
+    }
 
     if (!options.spawn) return;
 

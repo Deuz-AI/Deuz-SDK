@@ -1,4 +1,6 @@
 import type {
+  SwarmChannelEntry,
+  SwarmChannelPost,
   SwarmCommit,
   SwarmEvent,
   SwarmEventInput,
@@ -252,6 +254,69 @@ export function validateTaskChange(
   validateSwarmSnapshot({ run, tasks: [next] });
 }
 
+const CHANNEL = /^[A-Za-z0-9._:-]{1,64}$/;
+/** Longest blackboard note text (2.2). */
+export const SWARM_MAX_NOTE = 16_000;
+
+export function validateChannelName(channel: unknown): string {
+  if (typeof channel !== 'string' || !CHANNEL.test(channel))
+    throw new Error(`Invalid swarm channel name: ${String(channel)}`);
+  return channel;
+}
+
+const samePost = (left: SwarmChannelPost, right: SwarmChannelPost): boolean =>
+  left.channel === right.channel &&
+  left.taskId === right.taskId &&
+  left.text === right.text &&
+  encodeSwarm(left.data ?? null) === encodeSwarm(right.data ?? null);
+
+/**
+ * Validate a commit's blackboard posts and assign sequences (2.2). Identical
+ * repeats of an entry — already stored or earlier in the same commit — are
+ * dropped; a different post under the same entryId rejects the whole commit.
+ */
+export function planPosts(input: {
+  posts: readonly SwarmChannelPost[];
+  taskExists: (taskId: string) => boolean;
+  find: (entryId: string) => SwarmChannelPost | undefined;
+  last: (channel: string) => number;
+}): SwarmChannelEntry[] {
+  const planned = new Map<string, SwarmChannelEntry>();
+  const next = new Map<string, number>();
+  for (const post of input.posts) {
+    validateChannelName(post?.channel);
+    if (typeof post.entryId !== 'string' || !post.entryId || post.entryId.length > 512)
+      throw new Error('Invalid swarm post entryId');
+    if (!input.taskExists(post.taskId))
+      throw new Error(`Swarm post from an unknown task: ${post.taskId}`);
+    if (!Number.isSafeInteger(post.attempt) || post.attempt < 1 || !Number.isFinite(post.at))
+      throw new Error('Invalid swarm post attempt or time');
+    if (typeof post.text !== 'string' || !post.text || post.text.length > SWARM_MAX_NOTE)
+      throw new Error(`Swarm post text must be 1..${SWARM_MAX_NOTE} characters`);
+    encodeSwarm(post.data ?? null);
+    const prior = planned.get(post.entryId) ?? input.find(post.entryId);
+    if (prior) {
+      if (!samePost(prior, post))
+        throw new Error(`Conflicting swarm post for entry ${post.entryId}`);
+      continue;
+    }
+    const sequence = (next.get(post.channel) ?? input.last(post.channel)) + 1;
+    next.set(post.channel, sequence);
+    planned.set(post.entryId, cloneSwarm({ ...post, sequence }));
+  }
+  return [...planned.values()];
+}
+
+/** The journal events a commit's newly stored posts produce (2.2). */
+export function postEvents(entries: readonly SwarmChannelEntry[]): SwarmEventInput[] {
+  return entries.map((entry) => ({
+    type: 'channel.posted',
+    taskId: entry.taskId,
+    detail: entry.channel,
+    timestamp: entry.at,
+  }));
+}
+
 export function makeSwarmEvents(
   key: SwarmKey,
   previous: number,
@@ -282,10 +347,16 @@ export function validateEventCursor(afterSequence: number, limit: number): void 
 export function createInMemorySwarmStore(): SwarmStore {
   const runs = new Map<
     string,
-    { run: SwarmRunRecord; tasks: Map<string, SwarmTaskRecord>; events: SwarmEvent[] }
+    {
+      run: SwarmRunRecord;
+      tasks: Map<string, SwarmTaskRecord>;
+      events: SwarmEvent[];
+      channels: Map<string, SwarmChannelEntry[]>;
+      entries: Map<string, SwarmChannelEntry>;
+    }
   >();
   return {
-    capabilities: Object.freeze(['spawn'] as const),
+    capabilities: Object.freeze(['spawn', 'channels'] as const),
     async create(snapshot, inputs) {
       validateSwarmSnapshot(snapshot);
       if (snapshot.run.revision !== 0 || snapshot.run.lastSequence !== 0)
@@ -299,6 +370,8 @@ export function createInMemorySwarmStore(): SwarmStore {
         run: copy.run,
         tasks: new Map(copy.tasks.map((task) => [task.task.id, task])),
         events,
+        channels: new Map(),
+        entries: new Map(),
       });
       return cloneSwarm(copy.run);
     },
@@ -313,26 +386,48 @@ export function createInMemorySwarmStore(): SwarmStore {
     async commit(change) {
       const row = runs.get(swarmKey(change));
       if (!row) throw new Error('Swarm run not found');
-      const run = cloneSwarm(nextSwarmRun(row.run, change));
+      if (row.run.revision !== change.expectedRevision) throw new SwarmConflictError();
       const tasks = cloneSwarm(change.tasks ?? []);
       const spawn = cloneSwarm(change.spawn ?? []);
-      const events = cloneSwarm(makeSwarmEvents(change, row.run.lastSequence, change.events ?? []));
       for (const task of tasks) {
         if (!row.tasks.has(task.task.id)) throw new Error('Cannot add tasks to a fixed swarm DAG');
-        validateTaskChange(row.tasks.get(task.task.id)!, task, run);
+        validateTaskChange(row.tasks.get(task.task.id)!, task, row.run);
       }
       validateSpawn({
-        run,
+        run: row.run,
         tasks,
         spawn,
         exists: (taskId) => row.tasks.has(taskId),
         count: row.tasks.size,
       });
+      const posted = planPosts({
+        posts: change.posts ?? [],
+        taskExists: (taskId) => row.tasks.has(taskId),
+        find: (entryId) => row.entries.get(entryId),
+        last: (channel) => row.channels.get(channel)?.length ?? 0,
+      });
+      const inputs = [...(change.events ?? []), ...postEvents(posted)];
+      const run = cloneSwarm(nextSwarmRun(row.run, { ...change, events: inputs }));
+      const events = cloneSwarm(makeSwarmEvents(change, row.run.lastSequence, inputs));
       // All validation/serialization precedes the first mutation.
       for (const task of [...tasks, ...spawn]) row.tasks.set(task.task.id, task);
+      for (const entry of posted) {
+        row.channels.set(entry.channel, [...(row.channels.get(entry.channel) ?? []), entry]);
+        row.entries.set(entry.entryId, entry);
+      }
       row.run = run;
       row.events.push(...events);
       return cloneSwarm(run);
+    },
+    async readChannel(key, channel, afterSequence, limit) {
+      validateChannelName(channel);
+      validateEventCursor(afterSequence, limit);
+      return cloneSwarm(
+        runs
+          .get(swarmKey(key))
+          ?.channels.get(channel)
+          ?.slice(afterSequence, afterSequence + limit) ?? [],
+      );
     },
     async readEvents(key, afterSequence, limit) {
       validateEventCursor(afterSequence, limit);

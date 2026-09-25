@@ -1,5 +1,6 @@
 import type { SqliteDatabaseLike, SqliteStatementLike } from './store-sqlite';
 import type {
+  SwarmChannelEntry,
   SwarmEvent,
   SwarmKey,
   SwarmRunRecord,
@@ -12,7 +13,10 @@ import {
   encodeSwarm,
   makeSwarmEvents,
   nextSwarmRun,
+  planPosts,
+  postEvents,
   SwarmConflictError,
+  validateChannelName,
   validateEventCursor,
   validateSwarmSnapshot,
   validateSpawn,
@@ -167,7 +171,7 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
       insert.run(event.scope, event.runId, event.sequence, encodeSwarm(event));
   };
   return {
-    capabilities: Object.freeze(['spawn'] as const),
+    capabilities: Object.freeze(['spawn', 'channels'] as const),
     async create(snapshot, inputs) {
       validateSwarmSnapshot(snapshot);
       if (snapshot.run.revision !== 0 || snapshot.run.lastSequence !== 0)
@@ -219,14 +223,14 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
         transaction(db, () => {
           const previous = readRun(db, change);
           if (!previous) throw new Error('Swarm run not found');
-          const run = nextSwarmRun(previous, change);
+          if (previous.revision !== change.expectedRevision) throw new SwarmConflictError();
           for (const task of change.tasks ?? []) {
             const exists = statement(
               db,
               'SELECT payload FROM deuz_swarm_tasks WHERE scope=? AND run_id=? AND task_id=?',
             ).get(change.scope, change.runId, task.task.id) as PayloadRow | undefined;
             if (!exists) throw new Error('Cannot add tasks to a fixed swarm DAG');
-            validateTaskChange(decodeSwarm<SwarmTaskRecord>(exists.payload), task, run);
+            validateTaskChange(decodeSwarm<SwarmTaskRecord>(exists.payload), task, previous);
             statement(
               db,
               'UPDATE deuz_swarm_tasks SET payload=? WHERE scope=? AND run_id=? AND task_id=?',
@@ -239,7 +243,7 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
               'SELECT COUNT(*) AS n, COALESCE(MAX(ordinal), -1) AS last FROM deuz_swarm_tasks WHERE scope=? AND run_id=?',
             ).get(change.scope, change.runId) as { n: number; last: number };
             validateSpawn({
-              run,
+              run: previous,
               tasks: change.tasks ?? [],
               spawn,
               count: count.n,
@@ -263,13 +267,63 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
               ),
             );
           }
+          const taskExists = (taskId: string) =>
+            !!statement(
+              db,
+              'SELECT 1 AS found FROM deuz_swarm_tasks WHERE scope=? AND run_id=? AND task_id=?',
+            ).get(change.scope, change.runId, taskId);
+          const posted = planPosts({
+            posts: change.posts ?? [],
+            taskExists,
+            find: (entryId) => {
+              const row = statement(
+                db,
+                'SELECT payload FROM deuz_swarm_channels WHERE scope=? AND run_id=? AND entry_id=?',
+              ).get(change.scope, change.runId, entryId) as PayloadRow | undefined;
+              return row ? decodeSwarm<SwarmChannelEntry>(row.payload) : undefined;
+            },
+            last: (channel) =>
+              (
+                statement(
+                  db,
+                  'SELECT COALESCE(MAX(sequence), 0) AS last FROM deuz_swarm_channels WHERE scope=? AND run_id=? AND channel=?',
+                ).get(change.scope, change.runId, channel) as { last: number }
+              ).last,
+          });
+          const insertPost = statement(
+            db,
+            'INSERT INTO deuz_swarm_channels(scope,run_id,channel,sequence,entry_id,payload) VALUES(?,?,?,?,?,?)',
+          );
+          for (const entry of posted)
+            insertPost.run(
+              change.scope,
+              change.runId,
+              entry.channel,
+              entry.sequence,
+              entry.entryId,
+              encodeSwarm(entry),
+            );
+          const inputs = [...(change.events ?? []), ...postEvents(posted)];
+          const run = nextSwarmRun(previous, { ...change, events: inputs });
           statement(
             db,
             'UPDATE deuz_swarm_runs SET payload=?, status=?, updated_at=? WHERE scope=? AND run_id=?',
           ).run(encodeSwarm(run), run.status, run.updatedAt, change.scope, change.runId);
-          writeEvents(db, makeSwarmEvents(change, previous.lastSequence, change.events ?? []));
+          writeEvents(db, makeSwarmEvents(change, previous.lastSequence, inputs));
           return run;
         }),
+      );
+    },
+    async readChannel(key, channel, afterSequence, limit) {
+      validateChannelName(channel);
+      validateEventCursor(afterSequence, limit);
+      return use((db) =>
+        (
+          statement(
+            db,
+            'SELECT payload FROM deuz_swarm_channels WHERE scope=? AND run_id=? AND channel=? AND sequence>? ORDER BY sequence LIMIT ?',
+          ).all(key.scope, key.runId, channel, afterSequence, limit) as PayloadRow[]
+        ).map((row) => decodeSwarm<SwarmChannelEntry>(row.payload)),
       );
     },
     async readEvents(key, afterSequence, limit) {
