@@ -1,5 +1,5 @@
 import { runAgent, resumeAgent } from '../agent-run';
-import { assertExecutionPolicy, createExecutionContext } from '../execution-policy';
+import { assertExecutionPolicy, childScopeId, createExecutionContext } from '../execution-policy';
 import { intersectBudgetLimits } from '../budget-ledger';
 import { resolveDependencies } from '../internal/resolve-deps';
 import type { DeuzAgent } from '../agent';
@@ -20,10 +20,18 @@ import type {
   SwarmTask,
   SwarmTaskRecord,
   SwarmTaskResult,
+  SwarmTaskStatus,
 } from '../types/swarm';
 import { cloneSwarm, swarmKey, validateEventCursor, validateSwarmSnapshot } from './store';
 
 const executors = new WeakMap<SwarmStore, Set<string>>();
+// Terminal tasks never run again, so their accounting can fold (2.2).
+const TERMINAL: ReadonlySet<SwarmTaskStatus> = new Set<SwarmTaskStatus>([
+  'completed',
+  'failed',
+  'blocked',
+  'cancelled',
+]);
 
 function binding(value: DeuzAgent | SwarmAgentBinding): SwarmAgentBinding {
   return 'def' in value ? { agent: value } : value;
@@ -113,10 +121,12 @@ export function createSwarm(options: SwarmOptions): Swarm {
           yield event;
         }
         if (page.length === 256) continue;
-        const snapshot = await options.store.load(key);
-        if (!snapshot) throw new Error('Swarm run not found');
-        if (cursor < snapshot.run.lastSequence) continue;
-        if (snapshot.run.status !== 'running') return;
+        const run = options.store.head
+          ? await options.store.head(key)
+          : (await options.store.load(key))?.run;
+        if (!run) throw new Error('Swarm run not found');
+        if (cursor < run.lastSequence) continue;
+        if (run.status !== 'running') return;
         await new Promise<void>((resolve) => {
           let cancelTimer: () => void = () => {};
           const done = () => {
@@ -209,6 +219,12 @@ export function createSwarm(options: SwarmOptions): Swarm {
     };
     const abort = () => {
       void cancel().catch(() => {});
+    };
+    // Every task runs under the same child scope ID its execution context uses.
+    const compactTask = async (taskId: string): Promise<void> => {
+      await execution.ledger.compact(
+        childScopeId(execution.scopeId, JSON.stringify([key.scope, key.runId, taskId])),
+      );
     };
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted || snapshot.run.cancelRequested) await cancel();
@@ -383,6 +399,9 @@ export function createSwarm(options: SwarmOptions): Swarm {
     async function drive(): Promise<SwarmSnapshot> {
       const running = new Set<Promise<void>>();
       try {
+        // A crash between a terminal commit and its compaction, or a 2.1 run.
+        for (const record of records.values())
+          if (TERMINAL.has(record.status)) await compactTask(record.task.id);
         while (true) {
           if (writeFailure) throw writeFailure;
           const changed: SwarmTaskRecord[] = [];
@@ -402,6 +421,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
           }
           if (changed.length) {
             await mutate(() => ({ tasks: changed, events: controlEvents }));
+            for (const record of changed) await compactTask(record.task.id);
             continue;
           }
           for (const record of records.values()) {
@@ -414,7 +434,11 @@ export function createSwarm(options: SwarmOptions): Swarm {
             )
               continue;
             // Reserve a slot synchronously; executeTask's first queued commit precedes its effect.
-            const pending = executeTask(record);
+            // The slot frees only after the finished task's accounting has folded.
+            const pending = executeTask(record).then(async () => {
+              if (TERMINAL.has(records.get(record.task.id)!.status))
+                await compactTask(record.task.id);
+            });
             running.add(pending);
             void pending
               .finally(() => {

@@ -141,7 +141,8 @@ describe('swarm native agent integration', () => {
     ]);
     expect(result.tasks[2]?.result?.output).toBe('answer,answer');
     expect(result.tasks[0]?.agentState?.runId).not.toBe(result.tasks[1]?.agentState?.runId);
-    expect(result.run.executionState?.ledger.reservations.length).toBe(2);
+    expect(result.run.executionState?.ledger.reservations).toHaveLength(0);
+    expect(result.run.executionState?.ledger.aggregates?.[0]?.count).toBe(2);
   });
 
   it('recovers committed native terminal output after the task terminal write fails without a model replay', async () => {
@@ -171,7 +172,8 @@ describe('swarm native agent integration', () => {
     fail = false;
     const recovered = await (await createSwarm(options).resume(handle)).result;
     expect(recovered.tasks[0]?.result?.output).toBe('persisted');
-    expect(recovered.run.executionState?.ledger.reservations.length).toBe(1);
+    expect(recovered.run.executionState?.ledger.reservations).toHaveLength(0);
+    expect(recovered.run.executionState?.ledger.aggregates?.[0]?.count).toBe(1);
   });
 
   it('suspends tool approval durably and resumes only the specifically approved task', async () => {
@@ -219,6 +221,41 @@ describe('swarm native agent integration', () => {
     ).result;
     expect(approved.tasks[0]?.status).toBe('completed');
     expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('folds finished tasks out of the run ledger and keeps each checkpoint to its slice', async () => {
+    const agent = createAgent({
+      model: createMockModel({ responses: Array.from({ length: 12 }, () => ({ text: 'done' })) }),
+      executionEstimate: { tokens: 10 },
+    });
+    const inner = createInMemorySwarmStore();
+    const sizes: number[] = [];
+    const store: SwarmStore = {
+      ...inner,
+      async commit(change) {
+        const ledger = change.run?.executionState?.ledger;
+        if (ledger) sizes.push(ledger.reservations.length);
+        return inner.commit(change);
+      },
+    };
+    const swarm = createSwarm({ agents: { worker: agent }, store, concurrency: 3 });
+    const tasks = Array.from({ length: 12 }, (_, index) => ({
+      id: `t${index}`,
+      agent: 'worker',
+      prompt: `task ${index}`,
+    }));
+    const outcome = await (await swarm.run({ scope: 'tenant', tasks })).result;
+    expect(outcome.run.status).toBe('completed');
+    const ledger = outcome.run.executionState!.ledger;
+    expect(ledger.reservations).toHaveLength(0);
+    expect(ledger.aggregates?.map((item) => item.count)).toEqual([12]);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(3);
+    for (const task of outcome.tasks) {
+      const slice = task.agentState!.execution!.ledger;
+      expect(slice.subtree).toBeDefined();
+      expect(slice.reservations).toHaveLength(1);
+      expect(slice.reservations[0]!.scopes.some((scope) => scope.id === slice.subtree)).toBe(true);
+    }
   });
 
   it('resumes task-scoped client tool results through the native loop', async () => {

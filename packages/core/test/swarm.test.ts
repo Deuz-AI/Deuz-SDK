@@ -325,8 +325,10 @@ describe('native swarm scheduler', () => {
       })
     ).result;
     expect(first.tasks.filter((task) => task.status === 'completed')).toHaveLength(1);
-    expect(first.run.executionState?.ledger.reservations).toHaveLength(1);
-    expect(first.run.executionState?.ledger.reservations[0]?.state).toBe('unknown');
+    expect(first.run.executionState?.ledger.reservations).toHaveLength(0);
+    expect(first.run.executionState?.ledger.aggregates).toMatchObject([
+      { count: 1, held: { tokens: 6 }, unknownTokens: 1, unestimatedUsd: 1 },
+    ]);
     const reopened = createSwarm({
       agents: {},
       store,
@@ -341,7 +343,9 @@ describe('native swarm scheduler', () => {
     });
     const recovered = await (await reopened.resume(first.run)).result;
     expect(recovered.run.executionState?.budget.tokens).toBe(10);
-    expect(recovered.run.executionState?.ledger.reservations[0]?.state).toBe('unknown');
+    expect(recovered.run.executionState?.ledger.aggregates).toMatchObject([
+      { count: 1, unknownTokens: 1 },
+    ]);
   });
 
   it('does not relax persisted policy when a process restarts with weaker defaults', async () => {
@@ -371,5 +375,62 @@ describe('native swarm scheduler', () => {
       allowedTools: ['read'],
       requireApproval: true,
     });
+  });
+});
+
+describe('swarm event head reads (2.2)', () => {
+  it('follows progress through head() without reloading every task', async () => {
+    const inner = createInMemorySwarmStore();
+    let loads = 0;
+    let heads = 0;
+    const store: SwarmStore = {
+      ...inner,
+      async load(key) {
+        loads++;
+        return inner.load(key);
+      },
+      async head(key) {
+        heads++;
+        return inner.head!(key);
+      },
+    };
+    const open = gate();
+    const swarm = createSwarm({
+      agents: {},
+      store,
+      reducers: {
+        work: {
+          async execute() {
+            await open.promise;
+            return 1;
+          },
+        },
+      },
+    });
+    const handle = await swarm.run({ scope: 'tenant', tasks: [{ id: 'a', reducer: 'work' }] });
+    const types: string[] = [];
+    const reading = (async () => {
+      for await (const event of handle.events()) types.push(event.type);
+    })();
+    open.resolve();
+    await handle.result;
+    await reading;
+    expect(types).toContain('run.settled');
+    expect(heads).toBeGreaterThan(0);
+    expect(loads).toBe(0);
+  });
+
+  it('falls back to load() for stores without head()', async () => {
+    const { head: _head, ...plain } = createInMemorySwarmStore();
+    const swarm = createSwarm({
+      agents: {},
+      store: plain,
+      reducers: { work: { execute: () => 1 } },
+    });
+    const handle = await swarm.run({ scope: 'tenant', tasks: [{ id: 'a', reducer: 'work' }] });
+    await handle.result;
+    const types: string[] = [];
+    for await (const event of handle.events()) types.push(event.type);
+    expect(types.at(-1)).toBe('run.settled');
   });
 });

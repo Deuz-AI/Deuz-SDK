@@ -198,6 +198,10 @@ export function createInMemorySwarmStore(): SwarmStore {
       const row = runs.get(swarmKey(key));
       return row ? cloneSwarm({ run: row.run, tasks: [...row.tasks.values()] }) : undefined;
     },
+    async head(key) {
+      const row = runs.get(swarmKey(key));
+      return row ? cloneSwarm(row.run) : undefined;
+    },
     async commit(change) {
       const row = runs.get(swarmKey(change));
       if (!row) throw new Error('Swarm run not found');

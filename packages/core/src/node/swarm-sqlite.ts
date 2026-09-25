@@ -171,6 +171,9 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
         }),
       );
     },
+    async head(key) {
+      return use((db) => readRun(db, key));
+    },
     async commit(change) {
       return use((db) =>
         transaction(db, () => {

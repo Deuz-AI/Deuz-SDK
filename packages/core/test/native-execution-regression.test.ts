@@ -565,7 +565,8 @@ describe('native execution cross-feature regressions', () => {
     const restored = createExecutionContext({ snapshot: first.run.executionState! });
     expect(restored.ledger.totals()).toMatchObject({ reserved: { tokens: 20 }, unknownTokens: 1 });
     const resumed = await (await createSwarm(options).resume(first.run)).result;
-    expect(resumed.run.executionState?.ledger.reservations).toHaveLength(1);
+    expect(resumed.run.executionState?.ledger.reservations).toHaveLength(0);
+    expect(resumed.run.executionState?.ledger.aggregates?.[0]?.count).toBe(1);
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 

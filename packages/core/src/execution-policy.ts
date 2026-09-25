@@ -155,6 +155,11 @@ export function assertExecutionPolicy(
   }
 }
 
+/** The collision-free scope ID of a child context (shared with the swarm scheduler). */
+export function childScopeId(parent: string, child: string): string {
+  return `${parent}/${encodeURIComponent(child)}`;
+}
+
 function scope(id: string, budget: BudgetLimits): BudgetScope {
   if (typeof id !== 'string' || id.length === 0)
     throw new ExecutionPolicyError('invalid_context', 'scopeId must be a nonempty string.');
@@ -187,7 +192,7 @@ function context(
         );
       }
       const childBudget = intersectBudgetLimits(budget, options.budget);
-      const childScope = scope(`${scopeId}/${encodeURIComponent(options.scopeId)}`, childBudget);
+      const childScope = scope(childScopeId(scopeId, options.scopeId), childBudget);
       return context(
         childPolicy,
         childBudget,

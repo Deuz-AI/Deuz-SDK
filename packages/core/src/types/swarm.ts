@@ -112,6 +112,11 @@ export interface SwarmCommit extends SwarmKey {
 export interface SwarmStore {
   create(snapshot: SwarmSnapshot, events: readonly SwarmEventInput[]): Promise<SwarmRunRecord>;
   load(key: SwarmKey): Promise<SwarmSnapshot | undefined>;
+  /**
+   * The run record alone (2.2). Event readers poll it instead of `load`, which
+   * reads every task. Optional: a store without it falls back to `load`.
+   */
+  head?(key: SwarmKey): Promise<SwarmRunRecord | undefined>;
   commit(change: SwarmCommit): Promise<SwarmRunRecord>;
   readEvents(key: SwarmKey, afterSequence: number, limit: number): Promise<SwarmEvent[]>;
 }

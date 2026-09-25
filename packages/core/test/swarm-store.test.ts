@@ -84,6 +84,23 @@ function contracts(name: string, make: () => SwarmStore) {
       copy!.tasks[0]!.status = 'failed';
       expect((await store.load(a.run))?.tasks[0]?.status).toBe('completed');
     });
+    it('reads the run record alone through head()', async () => {
+      const store = make();
+      const snapshot = initial();
+      await store.create(snapshot, [{ type: 'run.started', timestamp: 1 }]);
+      await store.commit({
+        ...snapshot.run,
+        expectedRevision: 0,
+        tasks: [{ ...snapshot.tasks[0]!, status: 'running', attempt: 1 }],
+        events: [{ type: 'task.started', taskId: 'a', timestamp: 2 }],
+      });
+      const head = await store.head!(snapshot.run);
+      expect(head).toEqual((await store.load(snapshot.run))?.run);
+      expect(head).toMatchObject({ revision: 1, lastSequence: 2 });
+      head!.status = 'cancelled';
+      expect((await store.head!(snapshot.run))?.status).toBe('running');
+      expect(await store.head!({ scope: 'none', runId: 'none' })).toBeUndefined();
+    });
   });
 }
 contracts('memory swarm store', createInMemorySwarmStore);
