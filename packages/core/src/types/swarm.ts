@@ -23,7 +23,13 @@ export type SwarmRunStatus = 'running' | 'completed' | 'partial' | 'suspended' |
 
 interface SwarmTaskBase {
   id: string;
+  /** Tasks that must COMPLETE first; a failed one blocks this task. */
   dependsOn?: readonly string[];
+  /**
+   * Tasks that must SETTLE first, in any terminal state (2.2). Their completed
+   * results arrive like dependencies; a failed one does not block this task.
+   */
+  after?: readonly string[];
   /** Manual (default) never repeats interrupted work without explicit authorization. */
   replay?: 'manual' | 'safe';
   /** Wall-clock budget for each attempt (2.2); expiry fails the task. */
@@ -246,6 +252,8 @@ export interface SwarmReducerContext extends SwarmKey {
   execution: NativeExecutionContext;
   /** Queue tasks to create when this reducer completes (2.2); discarded if it throws. */
   spawn(requests: readonly SwarmSpawnRequest[]): void;
+  /** Terminal statuses of the tasks this reducer runs after (2.2). */
+  settled: Readonly<Record<string, SwarmTaskStatus>>;
   /** Page a blackboard channel after a sequence cursor (2.2); limit defaults to 100. */
   readChannel(
     channel: string,

@@ -86,7 +86,8 @@ function validateTasks(tasks: readonly SwarmTask[], options: SwarmOptions): void
   const counts = new Map<string, number>();
   const children = new Map<string, string[]>();
   for (const task of tasks) {
-    const deps = task.dependsOn ?? [];
+    // Hard and soft dependencies share one graph: both order the work (2.2).
+    const deps = [...(task.dependsOn ?? []), ...(task.after ?? [])];
     if (new Set(deps).size !== deps.length) throw new Error(`Duplicate dependency: ${task.id}`);
     counts.set(task.id, deps.length);
     for (const dep of deps) {
@@ -309,6 +310,16 @@ export function createSwarm(options: SwarmOptions): Swarm {
       >;
       for (const dependency of task.dependsOn ?? [])
         dependencies[dependency] = cloneSwarm(records.get(dependency)!.result!);
+      // Soft dependencies contribute only the results they completed with (2.2).
+      const settled: Record<string, SwarmTaskStatus> = Object.create(null) as Record<
+        string,
+        SwarmTaskStatus
+      >;
+      for (const dependency of task.after ?? []) {
+        const done = records.get(dependency)!;
+        settled[dependency] = done.status;
+        if (done.status === 'completed') dependencies[dependency] = cloneSwarm(done.result!);
+      }
       const resolvedPrompt =
         record.resolvedPrompt ??
         (task.agent !== undefined
@@ -398,6 +409,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
                 throw new TypeError('spawn() takes an array of requests');
               queued.push(...requests);
             },
+            settled,
             async readChannel(channel, afterSequence = 0, limit = 100) {
               if (!options.store.readChannel)
                 throw new Error('This swarm store has no blackboard channels');
@@ -557,6 +569,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
           const controlEvents: SwarmEventInput[] = [];
           for (const record of records.values()) {
             if (record.status !== 'pending') continue;
+            // Only hard dependencies block; a soft one just has to settle (2.2).
             const blocked = (record.task.dependsOn ?? []).some((dep) =>
               ['failed', 'blocked', 'cancelled'].includes(records.get(dep)!.status),
             );
@@ -579,7 +592,8 @@ export function createSwarm(options: SwarmOptions): Swarm {
               record.status !== 'pending' ||
               !(record.task.dependsOn ?? []).every(
                 (dep) => records.get(dep)!.status === 'completed',
-              )
+              ) ||
+              !(record.task.after ?? []).every((dep) => TERMINAL.has(records.get(dep)!.status))
             )
               continue;
             // Reserve a slot synchronously; executeTask's first queued commit precedes its effect.

@@ -205,7 +205,7 @@ export function validateSpawn(input: {
   const pending = new Map<string, number>();
   const children = new Map<string, string[]>();
   for (const [id, record] of batch) {
-    const deps = record.task.dependsOn ?? [];
+    const deps = [...(record.task.dependsOn ?? []), ...(record.task.after ?? [])];
     if (new Set(deps).size !== deps.length) throw new Error(`Duplicate dependency: ${id}`);
     let inBatch = 0;
     for (const dep of deps) {
