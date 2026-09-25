@@ -5,13 +5,19 @@ import { createInMemorySwarmStore, createSwarm } from '../src/swarm';
 import type {
   Swarm,
   SwarmAgentBinding,
+  SwarmDynamicLimits,
   SwarmEvent,
+  SwarmFailureContext,
   SwarmHandle,
   SwarmKey,
+  SwarmOptions,
   SwarmOutcome,
   SwarmReducerContext,
   SwarmRunRecord,
+  SwarmSpawnContext,
+  SwarmSpawnRequest,
   SwarmStore,
+  SwarmStoreCapability,
   SwarmTask,
   SwarmTaskResult,
   SwarmTaskStatus,
@@ -147,4 +153,35 @@ test('2.2 SwarmStore.head is an optional run-record read', () => {
   expectTypeOf<SwarmStore['head']>().toEqualTypeOf<
     ((key: SwarmKey) => Promise<SwarmRunRecord | undefined>) | undefined
   >();
+});
+
+test('2.2 dynamic swarm surface: spawn requests, hooks, limits and capabilities', () => {
+  expectTypeOf<SwarmReducerContext['spawn']>().toEqualTypeOf<
+    (requests: readonly SwarmSpawnRequest[]) => void
+  >();
+  const agentSpawn: SwarmSpawnRequest = { key: 'a', agent: 'worker', prompt: 'go' };
+  const reducerSpawn: SwarmSpawnRequest = { key: 'b', reducer: 'join', dependsOn: ['x/a'] };
+  expectTypeOf([agentSpawn, reducerSpawn]).toExtend<readonly SwarmSpawnRequest[]>();
+  // @ts-expect-error an agent spawn needs a prompt
+  const missingPrompt: SwarmSpawnRequest = { key: 'a', agent: 'worker' };
+  void missingPrompt;
+  expectTypeOf<SwarmAgentBinding['spawn']>().toEqualTypeOf<
+    | ((
+        output: unknown,
+        context: SwarmSpawnContext,
+      ) => readonly SwarmSpawnRequest[] | Promise<readonly SwarmSpawnRequest[]>)
+    | undefined
+  >();
+  expectTypeOf<SwarmFailureContext['error']>().toEqualTypeOf<{
+    name: string;
+    message: string;
+    code?: string;
+  }>();
+  expectTypeOf<SwarmOptions['dynamic']>().toEqualTypeOf<SwarmDynamicLimits | undefined>();
+  expectTypeOf<SwarmRunRecord['version']>().toEqualTypeOf<1 | 2>();
+  expectTypeOf<SwarmStore['capabilities']>().toEqualTypeOf<
+    readonly SwarmStoreCapability[] | undefined
+  >();
+  expectTypeOf<'task.spawned'>().toExtend<SwarmEvent['type']>();
+  expectTypeOf<SwarmTask['timeoutMs']>().toEqualTypeOf<number | undefined>();
 });

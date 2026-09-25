@@ -71,11 +71,89 @@ map keyed by their direct dependencies and a context containing `scope`, `runId`
 `taskId`, `signal` and a shared child `execution` context. Return a serializable
 value; plain JSON objects, arrays and `Uint8Array` are supported.
 
+## Dynamic tasks
+
+A swarm created with `dynamic` limits (2.2) lets finished tasks spawn more tasks
+at runtime. A reducer queues requests through `context.spawn`; an agent binding
+maps its accepted output through `spawn(output, context)`. Each request names a
+`key` and either a reducer or an agent with a prompt. The spawned task's ID is
+`parentId/key`, and its `dependsOn` lists full IDs of existing tasks or of tasks
+spawned in the same request.
+
+```ts
+import { createInMemorySwarmStore, createSwarm } from '@deuz-sdk/core/swarm';
+
+const swarm = createSwarm({
+  agents: {},
+  store: createInMemorySwarmStore(),
+  dynamic: { maxTasks: 50, maxSpawnDepth: 2 },
+  reducers: {
+    plan: {
+      execute(_results, context) {
+        const shards = ['north', 'south'];
+        context.spawn([
+          ...shards.map(key => ({ key, reducer: 'count' })),
+          {
+            key: 'total',
+            reducer: 'sum',
+            dependsOn: shards.map(key => `${context.taskId}/${key}`),
+          },
+        ]);
+        return shards.length;
+      },
+    },
+    count: { execute: (_results, context) => context.taskId.length },
+    sum: {
+      execute: results =>
+        Object.values(results).reduce((total, result) => total + Number(result.output), 0),
+    },
+  },
+});
+
+const handle = await swarm.run({
+  scope: 'tenant-a',
+  tasks: [{ id: 'plan', reducer: 'plan' }],
+});
+const outcome = await handle.result;
+console.log(outcome.tasks.map(task => task.task.id)); // plan, plan/north, plan/south, plan/total
+```
+
+Spawned tasks are written in the same commit as their parent's terminal state.
+A crash before that commit replays the parent under the usual rules; a crash
+after it resumes the children without running the parent again. Every request
+is checked before anything commits: an unknown binding, a malformed key, a
+missing dependency, a cycle or an exceeded limit fails the spawning task and
+creates nothing. `maxTasks` (at most 10 000) bounds the whole run,
+`maxSpawnDepth` the generations below a root task, and `maxSpawnPerTask` one
+spawning task. The limits are stored with the run; a resumed run can only
+tighten them.
+
+`onFailure` on an agent or reducer binding returns compensation tasks that
+commit with the failure. A hook that throws or requests invalid tasks is
+recorded on the failed task's error instead. Compensation tasks cannot depend
+on the failed task.
+
+`timeoutMs` on any task (2.2) bounds each attempt. When it expires, the
+attempt's signal aborts and the task fails with `SwarmTaskTimeout`; model calls
+inside the attempt receive the same budget as an execution deadline.
+
+A dynamic run has version 2 and needs a store whose `capabilities` include
+`'spawn'`; the memory and SQLite stores do. A store without it is refused
+because it would drop spawned tasks from its commits. A run created without
+`dynamic` cannot spawn, and 2.1 cannot resume a version 2 run. The journal
+records a `task.spawned` event per child, with the parent ID in `detail`.
+
 ## SQLite persistence and event cursors
 
 Import SQLite through `@deuz-sdk/core/swarm/sqlite`, a Node-only entry. It uses
 `node:sqlite` or an injected synchronous compatible database connection. Its schema
 version is independent of the existing store pack's `PRAGMA user_version`.
+
+2.2 uses swarm schema 2. Opening a file written by 2.1 upgrades it once, inside
+one transaction: runs gain indexed `status` and `updated_at` columns and a
+channel table is added. Existing runs, tasks and events are kept and resume as
+before. After the upgrade, 2.1 refuses the file, so back it up before upgrading
+if you may need to roll back.
 
 ```ts
 import { createAgent } from '@deuz-sdk/core/agent';
@@ -242,5 +320,5 @@ The in-memory store is volatile. SQLite atomically commits task changes, run
 state and journal events, and fails closed on write errors or unsupported schema
 versions. These transactions do not include external APIs. Exactly-once external
 effects still require the service's idempotency mechanism or application
-reconciliation. A fixed DAG has no runtime task spawning, distributed workers, or
-cross-process cancellation service.
+reconciliation. Runtime task spawning requires `dynamic` limits; there are no
+distributed workers or cross-process cancellation service yet.
