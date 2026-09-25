@@ -112,7 +112,9 @@ describe.skipIf(!DatabaseSync)('SQLite swarm store', () => {
   });
   it('reopens task/result/event journal and leaves the existing global schema version intact', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'deuz-swarm-'));
-    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() =>
+      rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }),
+    );
     const path = join(directory, 'swarm.sqlite');
     const db = new DatabaseSync!(path);
     db.exec('PRAGMA user_version = 79');
@@ -153,7 +155,9 @@ describe.skipIf(!DatabaseSync)('SQLite swarm store', () => {
 
   it('recovers a reopened SQLite DAG while reusing completed work and reconciling interrupted effects', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'deuz-swarm-recovery-'));
-    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+    cleanup.push(() =>
+      rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }),
+    );
     const path = join(directory, 'recover.sqlite');
     const first = createSqliteSwarmStore({ path });
     const snapshot = initial();

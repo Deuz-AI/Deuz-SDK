@@ -147,7 +147,7 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
-  await rm(dir, { recursive: true, force: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 /** Connect to the fixture server; the client is auto-closed in afterEach. */

@@ -1,9 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import {
-  BudgetLedgerError,
-  createBudgetLedger,
-  subtreeLedgerSnapshot,
-} from '../src/budget-ledger';
+import { BudgetLedgerError, createBudgetLedger, subtreeLedgerSnapshot } from '../src/budget-ledger';
 import type { BudgetLedgerSnapshot } from '../src/budget-ledger';
 import type { Usage } from '../src/types/usage';
 
@@ -324,13 +320,37 @@ describe('ledger compaction (2.2)', () => {
 
   it('folds a finished scope without changing global, ancestor or sibling totals', async () => {
     const ledger = createBudgetLedger({ budget: { tokens: 1000, usd: 10 } });
-    await ledger.reserve({ requestId: 'a1', modelId: 'm', tokens: 50, usd: 1, scopes: scoped('a') });
+    await ledger.reserve({
+      requestId: 'a1',
+      modelId: 'm',
+      tokens: 50,
+      usd: 1,
+      scopes: scoped('a'),
+    });
     await ledger.settle({ requestId: 'a1', tokens: 40, usd: 0.5 });
-    await ledger.reserve({ requestId: 'a2', modelId: 'm', tokens: 30, usd: 1, scopes: scoped('a') });
+    await ledger.reserve({
+      requestId: 'a2',
+      modelId: 'm',
+      tokens: 30,
+      usd: 1,
+      scopes: scoped('a'),
+    });
     await ledger.markUnknown('a2');
-    await ledger.reserve({ requestId: 'a3', modelId: 'm', tokens: 5, usd: 0.1, scopes: scoped('a') });
+    await ledger.reserve({
+      requestId: 'a3',
+      modelId: 'm',
+      tokens: 5,
+      usd: 0.1,
+      scopes: scoped('a'),
+    });
     await ledger.release('a3');
-    await ledger.reserve({ requestId: 'b1', modelId: 'm', tokens: 20, usd: 1, scopes: scoped('b') });
+    await ledger.reserve({
+      requestId: 'b1',
+      modelId: 'm',
+      tokens: 20,
+      usd: 1,
+      scopes: scoped('b'),
+    });
     const before = { all: ledger.totals(), root: ledger.totals('root'), b: ledger.totals('b') };
     expect(await ledger.compact('a')).toEqual({ scopeId: 'a', folded: 2, dropped: 1, retained: 0 });
     expect(ledger.totals()).toEqual(before.all);
@@ -392,7 +412,13 @@ describe('ledger compaction (2.2)', () => {
 
   it('round-trips version 2 snapshots and rejects malformed or sliced ones', async () => {
     const ledger = createBudgetLedger();
-    await ledger.reserve({ requestId: 'a', modelId: 'm', tokens: 5, usd: 0.1, scopes: scoped('a') });
+    await ledger.reserve({
+      requestId: 'a',
+      modelId: 'm',
+      tokens: 5,
+      usd: 0.1,
+      scopes: scoped('a'),
+    });
     await ledger.settle({ requestId: 'a', tokens: 5, usd: 0.1 });
     await ledger.compact('a');
     const saved = JSON.parse(JSON.stringify(ledger.snapshot())) as BudgetLedgerSnapshot;

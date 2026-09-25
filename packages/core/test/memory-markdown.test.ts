@@ -10,7 +10,7 @@ beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'deuz-mem-'));
 });
 afterEach(async () => {
-  await rm(dir, { recursive: true, force: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 function rec(over: Partial<MemoryRecord> & { id: string; text: string }): MemoryRecord {

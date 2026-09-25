@@ -218,7 +218,7 @@ describe.skipIf(!hasSqlite)('sqlite store pack — schema v1 migration', () => {
       expect(journal.journal_mode).toBe('wal');
       raw.close();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
     }
   });
 
@@ -668,7 +668,7 @@ describe.skipIf(!hasSqlite)('sqlite store pack — chats / sessions / runs', () 
       expect(await reopened.chats.listChats({ userId: 'user-a' })).toEqual(['c1']);
       await reopened.close();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
     }
   });
 });

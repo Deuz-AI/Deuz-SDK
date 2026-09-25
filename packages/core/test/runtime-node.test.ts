@@ -11,7 +11,7 @@ beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'deuz-runs-'));
 });
 afterEach(async () => {
-  await rm(dir, { recursive: true, force: true });
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 const rec = (over: Partial<RunRecord>): RunRecord => ({
