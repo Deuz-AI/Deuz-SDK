@@ -379,3 +379,110 @@ describe('dynamic swarm spawning (2.2)', () => {
     expect(reopened.run.dynamic).toEqual({ maxTasks: 2, maxSpawnDepth: 1, maxSpawnPerTask: 2 });
   });
 });
+
+describe('per-task timeoutMs (2.2)', () => {
+  function recordingClock() {
+    const timers: { ms: number; fn: () => void; cancelled: boolean }[] = [];
+    return {
+      timers,
+      clock: {
+        now: () => 1_000,
+        setTimeout: (fn: () => void, ms: number) => {
+          const timer = { ms, fn, cancelled: false };
+          timers.push(timer);
+          return () => {
+            timer.cancelled = true;
+          };
+        },
+      },
+    };
+  }
+  async function until(predicate: () => boolean) {
+    for (let attempt = 0; attempt < 1000; attempt++) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    throw new Error('Condition not reached');
+  }
+
+  it('fails an attempt that outlives its budget, aborts its signal and clears finished timers', async () => {
+    const { timers, clock } = recordingClock();
+    let signal: AbortSignal | undefined;
+    let deadline: number | undefined;
+    const swarm = createSwarm({
+      agents: {},
+      store: createInMemorySwarmStore(),
+      deps: { clock },
+      reducers: {
+        slow: {
+          execute: (_results, context) =>
+            new Promise((resolve) => {
+              signal = context.signal;
+              deadline = context.execution.policy.deadlineAt;
+              context.signal.addEventListener('abort', () => resolve('late'), { once: true });
+            }),
+        },
+        fast: { execute: () => 'quick' },
+      },
+    });
+    const handle = await swarm.run({
+      scope: 'tenant',
+      tasks: [
+        { id: 'fast', reducer: 'fast', timeoutMs: 5_000 },
+        { id: 'slow', reducer: 'slow', timeoutMs: 5_000 },
+      ],
+    });
+    await until(() => signal !== undefined && timers.filter((t) => t.cancelled).length === 1);
+    expect(deadline).toBe(6_000);
+    const live = timers.filter((timer) => timer.ms === 5_000 && !timer.cancelled);
+    expect(live).toHaveLength(1);
+    live[0]!.fn();
+    const outcome = await handle.result;
+    expect(signal?.aborted).toBe(true);
+    expect(outcome.tasks.map((task) => [task.task.id, task.status])).toEqual([
+      ['fast', 'completed'],
+      ['slow', 'failed'],
+    ]);
+    expect(outcome.tasks[1]?.error).toMatchObject({
+      name: 'SwarmTaskTimeout',
+      message: expect.stringContaining('5000ms'),
+    });
+    expect(timers.every((timer) => timer.cancelled)).toBe(true);
+  });
+
+  it("gives an agent task's execution context the attempt deadline", async () => {
+    const { clock } = recordingClock();
+    let deadline: number | undefined;
+    const swarm = createSwarm({
+      store: createInMemorySwarmStore(),
+      deps: { clock },
+      agents: {
+        worker: {
+          agent: createAgent({ model: createMockModel({ responses: [{ text: 'done' }] }) }),
+          verify: (context) => {
+            deadline = context.execution.policy.deadlineAt;
+            return { status: 'verified' };
+          },
+        },
+      },
+    });
+    const outcome = await (
+      await swarm.run({
+        scope: 'tenant',
+        tasks: [{ id: 'a', agent: 'worker', prompt: 'go', timeoutMs: 2_500 }],
+      })
+    ).result;
+    expect(outcome.tasks[0]?.status).toBe('completed');
+    expect(deadline).toBe(3_500);
+  });
+
+  it.each([0, -1, 1.5])('rejects timeoutMs %s before anything is written', async (timeoutMs) => {
+    const store = createInMemorySwarmStore();
+    const create = vi.spyOn(store, 'create');
+    const swarm = createSwarm({ agents: {}, store, reducers: { work: echo } });
+    await expect(
+      swarm.run({ scope: 'tenant', tasks: [{ id: 'a', reducer: 'work', timeoutMs }] }),
+    ).rejects.toThrow(/timeoutMs/);
+    expect(create).not.toHaveBeenCalled();
+  });
+});

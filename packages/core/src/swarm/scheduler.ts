@@ -1,5 +1,10 @@
 import { runAgent, resumeAgent } from '../agent-run';
-import { assertExecutionPolicy, childScopeId, createExecutionContext } from '../execution-policy';
+import {
+  assertExecutionPolicy,
+  childScopeId,
+  createExecutionContext,
+  intersectExecutionPolicies,
+} from '../execution-policy';
 import { intersectBudgetLimits } from '../budget-ledger';
 import { resolveDependencies } from '../internal/resolve-deps';
 import type { DeuzAgent } from '../agent';
@@ -64,6 +69,8 @@ function defineTask(task: SwarmTask, options: SwarmOptions): void {
     throw new Error(`Unknown reducer: ${task.id}`);
   if (task.replay !== undefined && task.replay !== 'safe' && task.replay !== 'manual')
     throw new Error('Invalid task replay policy');
+  if (task.timeoutMs !== undefined && (!Number.isSafeInteger(task.timeoutMs) || task.timeoutMs < 1))
+    throw new Error(`Invalid task timeoutMs: ${task.id}`);
 }
 
 function validateTasks(tasks: readonly SwarmTask[], options: SwarmOptions): void {
@@ -335,12 +342,37 @@ export function createSwarm(options: SwarmOptions): Swarm {
         }
         await finishTask(task.id, { status: 'failed', error: recorded }, 'task.failed', spawn);
       };
+      // Each attempt runs under its own signal (2.2): run cancellation or the
+      // task's timeoutMs aborts it, and only the timeout fails the task.
+      const attempt = new AbortController();
+      const stop = () => attempt.abort(controller.signal.reason);
+      controller.signal.addEventListener('abort', stop, { once: true });
+      if (controller.signal.aborted) stop();
+      const timeout = {
+        name: 'SwarmTaskTimeout',
+        message: `Swarm task exceeded timeoutMs (${task.timeoutMs}ms)`,
+      };
+      let timedOut = false;
+      const clearTimer =
+        task.timeoutMs === undefined
+          ? undefined
+          : deps.clock.setTimeout(() => {
+              timedOut = true;
+              attempt.abort(new Error(timeout.message));
+            }, task.timeoutMs);
+      // Model calls inside the attempt see the same budget as an execution deadline.
+      const deadline =
+        task.timeoutMs === undefined
+          ? undefined
+          : { deadlineAt: deps.clock.now() + task.timeoutMs };
       try {
         if (task.agent === undefined) {
           const reducer = options.reducers![task.reducer]!;
           const child = execution.child({
             scopeId: JSON.stringify([key.scope, key.runId, task.id]),
-            policy: reducer.policy,
+            policy: deadline
+              ? intersectExecutionPolicies(reducer.policy, deadline)
+              : reducer.policy,
             budget: reducer.budget,
           });
           assertExecutionPolicy(child, { now: deps.clock.now() });
@@ -348,7 +380,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
           const output = await reducer.execute(dependencies, {
             ...key,
             taskId: task.id,
-            signal: controller.signal,
+            signal: attempt.signal,
             execution: child,
             spawn(requests) {
               if (!Array.isArray(requests))
@@ -358,7 +390,8 @@ export function createSwarm(options: SwarmOptions): Swarm {
           });
           if (output === undefined)
             throw new Error('Swarm reducer must return a serializable output');
-          if (controller.signal.aborted)
+          if (timedOut) await fail(timeout);
+          else if (controller.signal.aborted)
             await finishTask(task.id, { status: 'cancelled' }, 'task.cancelled');
           else
             await finishTask(
@@ -395,10 +428,10 @@ export function createSwarm(options: SwarmOptions): Swarm {
           verify: agent.verify,
           maxOutputAttempts: agent.maxOutputAttempts,
           maxVerifyAttempts: agent.maxVerifyAttempts ?? agent.agent.def.maxVerifyAttempts,
-          signal: controller.signal,
+          signal: attempt.signal,
           execution: execution.child({
             scopeId: nativeId,
-            policy: agent.policy,
+            policy: deadline ? intersectExecutionPolicies(agent.policy, deadline) : agent.policy,
             budget: intersectBudgetLimits(agent.agent.def.budget, agent.budget),
           }),
           bindingId: record.bindingVersion,
@@ -416,7 +449,8 @@ export function createSwarm(options: SwarmOptions): Swarm {
               },
             )
           : await runAgent(nativeOptions);
-        if (controller.signal.aborted) {
+        if (timedOut) await fail(timeout);
+        else if (controller.signal.aborted) {
           await finishTask(task.id, { status: 'cancelled' }, 'task.cancelled');
         } else if (result.status === 'completed') {
           if (result.output === undefined)
@@ -465,13 +499,17 @@ export function createSwarm(options: SwarmOptions): Swarm {
         }
       } catch (error) {
         if (writeFailure) throw error;
-        if (controller.signal.aborted)
+        if (timedOut) await fail(timeout);
+        else if (controller.signal.aborted)
           await finishTask(
             task.id,
             { status: 'cancelled', error: errorRecord(error) },
             'task.cancelled',
           );
         else await fail(errorRecord(error));
+      } finally {
+        clearTimer?.();
+        controller.signal.removeEventListener('abort', stop);
       }
     }
 
