@@ -16,6 +16,8 @@ import type {
   SwarmOptions,
   SwarmResumeOptions,
   SwarmSnapshot,
+  SwarmSpawnContext,
+  SwarmSpawnRequest,
   SwarmStore,
   SwarmTask,
   SwarmTaskRecord,
@@ -23,6 +25,7 @@ import type {
   SwarmTaskStatus,
 } from '../types/swarm';
 import { cloneSwarm, swarmKey, validateEventCursor, validateSwarmSnapshot } from './store';
+import { resolveDynamicLimits, spawnRecords, tightenLimits } from './spawn';
 
 const executors = new WeakMap<SwarmStore, Set<string>>();
 // Terminal tasks never run again, so their accounting can fold (2.2).
@@ -43,26 +46,31 @@ function errorRecord(error: unknown): { name: string; message: string } {
     : { name: 'Error', message: String(error) };
 }
 
+/** One task definition against the bindings (shared by root and spawned tasks). */
+function defineTask(task: SwarmTask, options: SwarmOptions): void {
+  if (!task.id) throw new Error('Swarm task ids must be nonempty and unique');
+  if (task.agent !== undefined) {
+    if (
+      !Object.hasOwn(options.agents, task.agent) ||
+      typeof task.prompt !== 'string' ||
+      task.reducer !== undefined
+    )
+      throw new Error(`Unknown or invalid agent task: ${task.id}`);
+    if (binding(options.agents[task.agent]!).agent.def.execution)
+      throw new Error(
+        'Swarm agents must use swarm or binding policy/budget instead of a pre-bound execution context',
+      );
+  } else if (!task.reducer || !Object.hasOwn(options.reducers ?? {}, task.reducer))
+    throw new Error(`Unknown reducer: ${task.id}`);
+  if (task.replay !== undefined && task.replay !== 'safe' && task.replay !== 'manual')
+    throw new Error('Invalid task replay policy');
+}
+
 function validateTasks(tasks: readonly SwarmTask[], options: SwarmOptions): void {
   const nodes = new Map<string, SwarmTask>();
   for (const task of tasks) {
-    if (!task.id || nodes.has(task.id))
-      throw new Error('Swarm task ids must be nonempty and unique');
-    if (task.agent !== undefined) {
-      if (
-        !Object.hasOwn(options.agents, task.agent) ||
-        typeof task.prompt !== 'string' ||
-        task.reducer !== undefined
-      )
-        throw new Error(`Unknown or invalid agent task: ${task.id}`);
-      if (binding(options.agents[task.agent]!).agent.def.execution)
-        throw new Error(
-          'Swarm agents must use swarm or binding policy/budget instead of a pre-bound execution context',
-        );
-    } else if (!task.reducer || !Object.hasOwn(options.reducers ?? {}, task.reducer))
-      throw new Error(`Unknown reducer: ${task.id}`);
-    if (task.replay !== undefined && task.replay !== 'safe' && task.replay !== 'manual')
-      throw new Error('Invalid task replay policy');
+    defineTask(task, options);
+    if (nodes.has(task.id)) throw new Error('Swarm task ids must be nonempty and unique');
     nodes.set(task.id, task);
   }
   const counts = new Map<string, number>();
@@ -103,6 +111,12 @@ export function createSwarm(options: SwarmOptions): Swarm {
     task.agent !== undefined
       ? (binding(options.agents[task.agent]!).version ?? '1')
       : (options.reducers![task.reducer]!.version ?? '1');
+  const dynamic = options.dynamic ? resolveDynamicLimits(options.dynamic) : undefined;
+  const canSpawn = options.store.capabilities?.includes('spawn') ?? false;
+  if (dynamic && !canSpawn)
+    throw new Error(
+      'This swarm store cannot persist spawned tasks: it lacks the "spawn" capability',
+    );
 
   const events = (
     key: SwarmKey,
@@ -164,7 +178,8 @@ export function createSwarm(options: SwarmOptions): Swarm {
           ...change,
           expectedRevision: snapshot.run.revision,
         });
-        for (const task of change.tasks ?? []) records.set(task.task.id, cloneSwarm(task));
+        for (const task of [...(change.tasks ?? []), ...(change.spawn ?? [])])
+          records.set(task.task.id, cloneSwarm(task));
         snapshot = { run, tasks: [] };
       });
       queue = pending.catch((error) => {
@@ -229,15 +244,43 @@ export function createSwarm(options: SwarmOptions): Swarm {
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted || snapshot.run.cancelRequested) await cancel();
 
+    // A v2 run's persisted limits, tightened by this process's options (2.2).
+    const limits = initial.run.dynamic ? tightenLimits(initial.run.dynamic, dynamic) : undefined;
+
+    /** Spawned tasks commit with the parent's terminal state: a crash never duplicates them. */
     async function finishTask(
       taskId: string,
       change: Partial<SwarmTaskRecord>,
       type: SwarmEventInput['type'],
+      spawn: readonly SwarmTaskRecord[] = [],
     ): Promise<void> {
       await mutate(() => ({
         tasks: [{ ...records.get(taskId)!, ...change, finishedAt: deps.clock.now() }],
-        events: [event(type, taskId)],
+        ...(spawn.length ? { spawn } : {}),
+        events: [
+          event(type, taskId),
+          ...spawn.map((item) => event('task.spawned', item.task.id, taskId)),
+        ],
       }));
+    }
+
+    function spawnFor(
+      taskId: string,
+      on: 'completed' | 'failed',
+      requests: readonly SwarmSpawnRequest[],
+    ): SwarmTaskRecord[] {
+      return spawnRecords({
+        run: snapshot.run,
+        limits,
+        parent: records.get(taskId)!,
+        on,
+        requests,
+        records,
+        define: (task) => {
+          defineTask(task, options);
+          return version(task);
+        },
+      });
     }
 
     async function executeTask(record: SwarmTaskRecord): Promise<void> {
@@ -265,6 +308,33 @@ export function createSwarm(options: SwarmOptions): Swarm {
         ],
         events: [event('task.started', task.id)],
       }));
+      const context = (): SwarmSpawnContext => ({
+        ...key,
+        taskId: task.id,
+        depth: records.get(task.id)!.depth ?? 0,
+        dependencies,
+      });
+      // A failure may commit compensation tasks with it (2.2). A hook that throws
+      // or asks for invalid tasks is recorded on the failure instead.
+      const fail = async (error: { name: string; message: string; code?: string }) => {
+        const hook =
+          task.agent !== undefined
+            ? binding(options.agents[task.agent]!).onFailure
+            : options.reducers![task.reducer]!.onFailure;
+        let recorded = error;
+        let spawn: SwarmTaskRecord[] = [];
+        if (hook) {
+          try {
+            spawn = spawnFor(task.id, 'failed', await hook({ ...context(), error }));
+          } catch (compensation) {
+            recorded = {
+              ...error,
+              message: `${error.message} (compensation failed: ${errorRecord(compensation).message})`,
+            };
+          }
+        }
+        await finishTask(task.id, { status: 'failed', error: recorded }, 'task.failed', spawn);
+      };
       try {
         if (task.agent === undefined) {
           const reducer = options.reducers![task.reducer]!;
@@ -274,13 +344,16 @@ export function createSwarm(options: SwarmOptions): Swarm {
             budget: reducer.budget,
           });
           assertExecutionPolicy(child, { now: deps.clock.now() });
+          const queued: SwarmSpawnRequest[] = [];
           const output = await reducer.execute(dependencies, {
             ...key,
             taskId: task.id,
             signal: controller.signal,
             execution: child,
-            spawn() {
-              throw new Error('This swarm cannot spawn tasks');
+            spawn(requests) {
+              if (!Array.isArray(requests))
+                throw new TypeError('spawn() takes an array of requests');
+              queued.push(...requests);
             },
           });
           if (output === undefined)
@@ -292,6 +365,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
               task.id,
               { status: 'completed', result: cloneSwarm({ output }) },
               'task.completed',
+              spawnFor(task.id, 'completed', queued),
             );
           return;
         }
@@ -347,6 +421,11 @@ export function createSwarm(options: SwarmOptions): Swarm {
         } else if (result.status === 'completed') {
           if (result.output === undefined)
             throw new Error('Swarm agents must return a serializable output');
+          const spawn = spawnFor(
+            task.id,
+            'completed',
+            agent.spawn ? await agent.spawn(result.output, context()) : [],
+          );
           await finishTask(
             task.id,
             {
@@ -354,6 +433,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
               result: { output: result.output, text: result.text, agentResult: result },
             },
             'task.completed',
+            spawn,
           );
         } else if (result.status === 'suspended') {
           await finishTask(
@@ -377,25 +457,21 @@ export function createSwarm(options: SwarmOptions): Swarm {
             'task.reconciliation',
           );
         } else {
-          await finishTask(
-            task.id,
-            {
-              status: 'failed',
-              error:
-                result.status === 'failed'
-                  ? result.error
-                  : { name: 'AgentStopped', message: result.reason },
-            },
-            'task.failed',
+          await fail(
+            result.status === 'failed'
+              ? result.error
+              : { name: 'AgentStopped', message: result.reason },
           );
         }
       } catch (error) {
         if (writeFailure) throw error;
-        await finishTask(
-          task.id,
-          { status: controller.signal.aborted ? 'cancelled' : 'failed', error: errorRecord(error) },
-          controller.signal.aborted ? 'task.cancelled' : 'task.failed',
-        );
+        if (controller.signal.aborted)
+          await finishTask(
+            task.id,
+            { status: 'cancelled', error: errorRecord(error) },
+            'task.cancelled',
+          );
+        else await fail(errorRecord(error));
       }
     }
 
@@ -496,6 +572,8 @@ export function createSwarm(options: SwarmOptions): Swarm {
     async run(input) {
       if (!input.scope) throw new Error('Swarm scope is required');
       validateTasks(input.tasks, options);
+      if (dynamic && input.tasks.length > dynamic.maxTasks)
+        throw new Error(`Swarm task limit exceeded (${dynamic.maxTasks})`);
       const now = deps.clock.now();
       const key = { scope: input.scope, runId: input.runId ?? deps.generateId() };
       if (!key.runId) throw new Error('Swarm runId is required');
@@ -503,7 +581,8 @@ export function createSwarm(options: SwarmOptions): Swarm {
         run: {
           ...key,
           kind: 'deuz-swarm',
-          version: 1,
+          // A dynamic run is version 2 and carries its limits; 2.1 rejects it.
+          ...(dynamic ? { version: 2 as const, dynamic } : { version: 1 as const }),
           definitionVersion,
           status: 'running',
           revision: 0,
@@ -536,6 +615,10 @@ export function createSwarm(options: SwarmOptions): Swarm {
       const snapshot = await options.store.load(input);
       if (!snapshot) throw new Error('Swarm run not found');
       validateSwarmSnapshot(snapshot, input);
+      if (snapshot.run.version === 2 && !canSpawn)
+        throw new Error(
+          'This swarm store cannot persist spawned tasks: it lacks the "spawn" capability',
+        );
       validateTasks(
         snapshot.tasks.map((record) => record.task),
         options,
