@@ -32,6 +32,8 @@ export interface ResolvedTimeouts extends Required<TimeoutConfig> {
    * tools actually run (a tool's own `Tool.timeoutMs` overrides it).
    */
   toolMs?: number;
+  /** Longest silence between two stream parts after the first content (2.2). */
+  chunkMs?: number;
 }
 
 /**
@@ -50,6 +52,7 @@ export function resolveTimeouts(timeout: CommonCallOptions['timeout']): Resolved
     totalMs: config.totalMs ?? DEFAULT_TIMEOUTS.totalMs,
     ...(config.stepMs !== undefined ? { stepMs: config.stepMs } : {}),
     ...(config.toolMs !== undefined ? { toolMs: config.toolMs } : {}),
+    ...(config.chunkMs !== undefined ? { chunkMs: config.chunkMs } : {}),
   };
 }
 
@@ -91,6 +94,11 @@ export interface TimeoutHandle {
   signal: AbortSignal;
   /** Call when the first content delta arrives — clears the ttft timer. */
   firstByte(): void;
+  /**
+   * Call on every stream part once content flows (2.2): re-arms the idle timer
+   * when `chunkMs` is set; otherwise does nothing.
+   */
+  chunk(): void;
   /** Call on completion — clears all timers. */
   clear(): void;
 }
@@ -100,10 +108,15 @@ export interface TimeoutHandle {
  * and hits the CF bug). The ttft timer is armed when this is called — i.e. at
  * pump start, not at the synchronous `streamChat` return (G9).
  */
-export function createTimeout(clock: Clock, config: TimeoutConfig = {}): TimeoutHandle {
+export function createTimeout(
+  clock: Clock,
+  config: TimeoutConfig & { chunkMs?: number } = {},
+): TimeoutHandle {
   const controller = new AbortController();
   let ttftCancel: (() => void) | undefined;
   let totalCancel: (() => void) | undefined;
+  let chunkCancel: (() => void) | undefined;
+  const chunkMs = config.chunkMs !== undefined && config.chunkMs > 0 ? config.chunkMs : undefined;
 
   if (config.totalMs && config.totalMs > 0) {
     totalCancel = clock.setTimeout(
@@ -121,11 +134,24 @@ export function createTimeout(clock: Clock, config: TimeoutConfig = {}): Timeout
       ttftCancel?.();
       ttftCancel = undefined;
     },
+    chunk() {
+      if (chunkMs === undefined || controller.signal.aborted) return;
+      chunkCancel?.();
+      chunkCancel = clock.setTimeout(
+        () =>
+          controller.abort(
+            new TimeoutError('chunk', `Stream stalled between parts (chunk, ${chunkMs}ms).`),
+          ),
+        chunkMs,
+      );
+    },
     clear() {
       ttftCancel?.();
       totalCancel?.();
+      chunkCancel?.();
       ttftCancel = undefined;
       totalCancel = undefined;
+      chunkCancel = undefined;
     },
   };
 }

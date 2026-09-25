@@ -228,6 +228,8 @@ export class ContextOverflowError extends APICallError {
  * - `tool` (1.9) — one tool `execute` (`timeout.toolMs` / `Tool.timeoutMs`).
  *   Self-healing: it reaches the model as an is_error tool_result, so this
  *   instance normally surfaces only on an observation event.
+ * - `chunk` (2.2) — ONE model call went silent between two stream parts after
+ *   content started (`timeout.chunkMs`). Final: streaming has begun.
  *
  * `step`/`tool` are ADDITIVE members (1.9): the two deadlines existed already
  * but had to report as `'total'`, which was indistinguishable from a real
@@ -235,9 +237,9 @@ export class ContextOverflowError extends APICallError {
  */
 export class TimeoutError extends DeuzError {
   readonly code = 'timeout';
-  readonly layer: 'connect' | 'ttft' | 'total' | 'step' | 'tool';
+  readonly layer: 'connect' | 'ttft' | 'total' | 'step' | 'tool' | 'chunk';
   constructor(
-    layer: 'connect' | 'ttft' | 'total' | 'step' | 'tool',
+    layer: 'connect' | 'ttft' | 'total' | 'step' | 'tool' | 'chunk',
     message?: string,
     options?: { cause?: unknown },
   ) {

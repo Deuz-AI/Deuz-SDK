@@ -351,7 +351,9 @@ expectTypeOf<CommonCallOptions['abortSignal']>().toEqualTypeOf<AbortSignal | und
 // --- Timeout layers. The object form is INLINE on the interface (deliberately
 // not a named export), so it is pinned structurally. ---
 expectTypeOf<CommonCallOptions['timeout']>().toEqualTypeOf<
-  number | { totalMs?: number; ttftMs?: number; stepMs?: number; toolMs?: number } | undefined
+  | number
+  | { totalMs?: number; ttftMs?: number; stepMs?: number; toolMs?: number; chunkMs?: number }
+  | undefined
 >();
 
 // --- Per-call capability override + the public read accessor. ---

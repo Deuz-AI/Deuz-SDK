@@ -339,6 +339,8 @@ export interface CommonCallOptions {
    *               executions that step triggered.
    * - `toolMs`  — ONE tool `execute` (per call, not per step). `Tool.timeoutMs`
    *               overrides it for an individual tool.
+   * - `chunkMs` — PER MODEL CALL (2.2): longest silence between two stream
+   *               parts once content is flowing. Unbounded when unset.
    *
    * Only the layers you set are overridden; the module defaults in
    * `src/core/timeout.ts` (`DEFAULT_TIMEOUTS`: ttft 60_000, total 300_000)
@@ -346,7 +348,9 @@ export interface CommonCallOptions {
    * Every timer is scheduled through `deps.clock` — never an ambient host timer
    * — so tests stay deterministic (edge-safe purity invariant).
    */
-  timeout?: number | { totalMs?: number; ttftMs?: number; stepMs?: number; toolMs?: number };
+  timeout?:
+    | number
+    | { totalMs?: number; ttftMs?: number; stepMs?: number; toolMs?: number; chunkMs?: number };
   headers?: Record<string, string>;
   /** Per-call infrastructure seam overrides. */
   deps?: Dependencies;

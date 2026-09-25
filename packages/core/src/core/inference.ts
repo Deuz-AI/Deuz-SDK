@@ -597,6 +597,8 @@ export function runStream(
               });
             }
           }
+          // 2.2: once content flows, a silence longer than `chunkMs` fails the call.
+          if (firstContent) timeout.chunk();
           if (rt) {
             if (part.type === 'text-delta') {
               outputTextLength += part.text.length;

@@ -855,3 +855,82 @@ describe('consume() (1.9)', () => {
     expect(errors[0]).toMatchObject({ code: 'invalid_request' });
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2.2: `timeout.chunkMs` — a stream that goes silent after content started.
+// ---------------------------------------------------------------------------
+
+describe('timeout.chunkMs (2.2)', () => {
+  const anthropic = (fetch: typeof globalThis.fetch) =>
+    createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8');
+  const FIRST_PART = sseEvents([
+    {
+      event: 'message_start',
+      data: { type: 'message_start', message: { usage: { input_tokens: 3, output_tokens: 1 } } },
+    },
+    {
+      event: 'content_block_start',
+      data: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    },
+    {
+      event: 'content_block_delta',
+      data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+    },
+  ]);
+
+  /** Delivers the first content, then goes silent until an abort errors the body. */
+  function stallingFetch(): typeof fetch {
+    return (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(FIRST_PART));
+          signal?.addEventListener(
+            'abort',
+            () => controller.error(signal.reason ?? new DOMException('Aborted', 'AbortError')),
+            { once: true },
+          );
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    }) as typeof fetch;
+  }
+
+  it('re-arms after every part once content flows and a steady stream completes', async () => {
+    const clock = controlledClock();
+    const result = streamChat({
+      model: anthropic((async () => sseResponse([OK_STREAM])) as typeof fetch),
+      messages: [{ role: 'user', content: 'hi' }],
+      timeout: { chunkMs: 5_000 },
+      deps: { clock: clock.clock, generateId: () => 'fixed-id' },
+    });
+    await drain(result.textStream);
+    expect(await result.finishReason).toBe('stop');
+    const armed = clock.armed();
+    expect(armed.slice(0, 2)).toEqual([300_000, 60_000]);
+    expect(armed.filter((ms) => ms === 5_000).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('a stream that stalls after first content FAILS with layer "chunk"', async () => {
+    const clock = controlledClock();
+    const result = streamChat({
+      model: anthropic(stallingFetch()),
+      messages: [{ role: 'user', content: 'hi' }],
+      timeout: { chunkMs: 5_000 },
+      deps: { clock: clock.clock, generateId: () => 'fixed-id' },
+    });
+    let text = '';
+    const drained = (async () => {
+      for await (const part of result.fullStream) if (part.type === 'text-delta') text += part.text;
+    })();
+    while (!clock.armed().includes(5_000)) await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(clock.fire(5_000)).toBe(true);
+    await drained;
+    expect(text).toBe('ok');
+    await expect(result.usage).rejects.toMatchObject({ code: 'timeout', layer: 'chunk' });
+    await expect(result.finishReason).rejects.toBeInstanceOf(TimeoutError);
+  });
+});
