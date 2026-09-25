@@ -503,8 +503,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       admitted = true;
       if (options.execution && options.session) {
         removeLedgerPersistence = options.execution.ledger.addPersistence(() => {
-          // Sibling reservations on a shared ledger leave this run's slice unchanged.
-          if (ledgerKey(executionSnapshot(common.execution!)) === persistedLedger) return;
+          // Sibling reservations on a shared ledger leave this run's slice
+          // unchanged, so no new write is needed. A write already issued for
+          // this slice may still be in flight (another persist() can run while
+          // a parent sink yields): admission must wait until it is durable.
+          if (ledgerKey(executionSnapshot(common.execution!)) === persistedLedger) return writeTail;
           return persist();
         });
       }

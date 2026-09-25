@@ -14,7 +14,7 @@ import { createInMemorySwarmStore, createSwarm } from '../src/swarm';
 import { createSqliteSwarmStore } from '../src/node/swarm-sqlite';
 import { createMockModel, sseEvents, sseResponse } from '../src/testing';
 import type { MockResponse } from '../src/testing';
-import type { AgentRunStore, AgentToolContext } from '../src/types/agent-run';
+import type { AgentRunEnvelope, AgentRunStore, AgentToolContext } from '../src/types/agent-run';
 import type { Clock } from '../src/types/deps';
 import type { NativeExecutionContext } from '../src/types/execution';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
@@ -681,6 +681,81 @@ describe('native execution cross-feature regressions', () => {
     expect(calls).toHaveLength(runs);
     expect(new Set(calls).size).toBe(1);
     expect(calls[0]).toMatch(/@1$/);
+  });
+
+  it('never admits a reservation before the write that holds it is durable', async () => {
+    const inner = createInMemoryAgentRunStore();
+    const runId = 'durable-slice';
+    const holds = (envelope?: AgentRunEnvelope) =>
+      envelope?.execution?.ledger.reservations.some((item) => item.requestId === 'x-req') ?? false;
+    const issued = gate();
+    const slowWrite = gate();
+    const store: AgentRunStore = {
+      load: (id) => inner.load(id),
+      async save(envelope) {
+        if (holds(envelope)) {
+          issued.resolve();
+          await slowWrite.promise;
+        }
+        return inner.save(envelope);
+      },
+    };
+    // A parent sink (the swarm's, in production) yields before the child's sink runs.
+    const parentSeen = gate();
+    const parentGate = gate();
+    const root = createExecutionContext({
+      scopeId: 'root',
+      budget: { tokens: 1000 },
+      persist: async (snapshot) => {
+        if (snapshot.reservations.some((item) => item.requestId === 'x-req')) {
+          parentSeen.resolve();
+          await parentGate.promise;
+        }
+      },
+    });
+    let durableAtAdmission: boolean | undefined;
+    const run = runAgent({
+      model: createMockModel({
+        responses: [
+          {
+            toolCalls: [
+              { toolName: 'spend', args: {} },
+              { toolName: 'other', args: {} },
+            ],
+          },
+          { text: 'done' },
+        ],
+      }),
+      prompt: 'go',
+      execution: root.child({ scopeId: 'agent' }),
+      executionEstimate: { tokens: 10 },
+      session: { store, runId, scope: 'tenant' },
+      tools: {
+        spend: {
+          parameters,
+          execute: async (_args: unknown, ctx: AgentToolContext) => {
+            await ctx
+              .execution!.child({ scopeId: 'spend' })
+              .reserve({ requestId: 'x-req', modelId: 'm', tokens: 1 });
+            durableAtAdmission = holds(await inner.load(runId));
+            return 'spent';
+          },
+        },
+        other: {
+          parameters,
+          // Finishes while the reservation is in the ledger but its child sink has not run.
+          execute: async () => {
+            await parentSeen.promise;
+            return 'other';
+          },
+        },
+      },
+    });
+    await issued.promise;
+    parentGate.resolve();
+    setTimeout(slowWrite.resolve, 20);
+    expect((await run).status).toBe('completed');
+    expect(durableAtAdmission).toBe(true);
   });
 
   it('resumes a 2.1 full-ledger checkpoint after its siblings were compacted', async () => {
