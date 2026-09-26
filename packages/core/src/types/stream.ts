@@ -345,14 +345,14 @@ export interface HandoffPart {
 export interface GuardrailPart {
   type: 'guardrail';
   /** Which hook produced the verdict. */
-  hook: 'input' | 'output' | 'tool-call';
+  hook: 'input' | 'output' | 'tool-call' | 'tool-result';
   /** Passes are not emitted, so only the two acting verdicts appear here. */
   action: 'block' | 'rewrite';
   /** The guardrail's `name`, when it declared one. */
   name?: string;
   /** The verdict's stated reason, when given. */
   reason?: string;
-  /** Set on `hook: 'tool-call'` — the call that was blocked or rewritten. */
+  /** Set on `hook: 'tool-call'` / `'tool-result'` — the call that was blocked or rewritten. */
   toolCallId?: string;
   /** Index of the step being evaluated (absent on the pre-run input hook). */
   stepIndex?: number;

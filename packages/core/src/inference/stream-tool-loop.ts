@@ -547,6 +547,8 @@ export function runStreamToolLoop(
         : {}),
       ...(options.approvalResponses ? { approvalResponses: options.approvalResponses } : {}),
       ...(observeCtx ? { observe: observeCtx } : {}),
+      // onToolResult verdicts (2.2) stream and log like every other hook's.
+      onGuardrail: (parts) => emitGuardrails(parts),
     };
 
     /**
@@ -826,6 +828,8 @@ export function runStreamToolLoop(
           observeCtx.parentSpanId = stepSpan.spanId;
           observeCtx.stepIndex = stepIndex;
         }
+        // onToolResult guardrails (2.2) report the step their tools ran in.
+        extras.stepIndex = stepIndex;
         const addCompactionUsage = (u: Usage): void => {
           totalUsage = sumUsage(totalUsage, u);
         };

@@ -7,12 +7,17 @@
  * a built-in pulls none of this into a bundle, and each export is an independent
  * top-level function — tree-shaking keeps exactly the ones you name.
  *
- *   import { promptInjectionGuardrail, maxOutputLength } from '@deuz-sdk/core/guardrails';
+ *   import {
+ *     promptInjectionGuardrail,
+ *     maxOutputLength,
+ *     maxToolResultLength,
+ *   } from '@deuz-sdk/core/guardrails';
  *
  *   await generateText({
  *     model, messages, tools,
  *     guardrails: {
  *       onInput: promptInjectionGuardrail(),
+ *       onToolResult: maxToolResultLength(20_000),
  *       onOutput: maxOutputLength(4000),
  *     },
  *   });
@@ -26,6 +31,9 @@ import type {
   OutputGuardrail,
   OutputGuardrailContext,
   OutputGuardrailResult,
+  ToolResultGuardrail,
+  ToolResultGuardrailContext,
+  ToolResultGuardrailResult,
 } from './types/guardrails';
 
 /**
@@ -108,4 +116,52 @@ export function maxOutputLength(
     return { action: 'rewrite', text: ctx.text.slice(0, limit) };
   };
   return named<OutputGuardrail>(guard, 'maxOutputLength');
+}
+
+/** The text a tool result occupies in the model's context: strings as-is, the rest as JSON. */
+function resultText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * Cap each tool result the model sees at `n` characters (2.2, an
+ * `onToolResult` guardrail). A page scrape or a log dump can fill a context
+ * window in one call; this keeps it bounded before it ever reaches the model.
+ *
+ * - `'truncate'` (default) REWRITES the result to its first `n` characters
+ *   plus a one-line `[truncated: n of total characters shown]` notice, so the
+ *   model knows there is more and can ask for a narrower slice. A non-string
+ *   result is measured and cut as its JSON text, so the model gets a string.
+ * - `'block'` withholds the result instead: the model receives an `is_error`
+ *   result naming the limit.
+ *
+ * Characters, not tokens. In a native `runAgent` run this measures the
+ * model-facing projection; the receipt keeps the full raw result.
+ */
+export function maxToolResultLength(
+  n: number,
+  opts: { mode?: 'truncate' | 'block' } = {},
+): ToolResultGuardrail {
+  const mode = opts.mode ?? 'truncate';
+  const limit = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+  const guard = (ctx: ToolResultGuardrailContext): ToolResultGuardrailResult => {
+    const text = resultText(ctx.result);
+    if (text.length <= limit) return { action: 'pass' };
+    if (mode === 'block') {
+      return {
+        action: 'block',
+        reason: `Tool result exceeded ${limit} characters (${text.length}).`,
+      };
+    }
+    return {
+      action: 'rewrite',
+      result: `${text.slice(0, limit)}\n[truncated: ${limit} of ${text.length} characters shown]`,
+    };
+  };
+  return named<ToolResultGuardrail>(guard, 'maxToolResultLength');
 }

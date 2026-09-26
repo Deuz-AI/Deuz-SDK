@@ -1,13 +1,15 @@
 /**
  * types/guardrails.ts — the guardrail contract (2.0 additive).
  *
- * Three hooks around the agentic loop, each a plain function so the common case
+ * Four hooks around the agentic loop, each a plain function so the common case
  * is a one-liner and the built-ins (`promptInjectionGuardrail`,
  * `maxOutputLength` — `./guardrails`) are ordinary values:
  *
- * - `onInput`    runs ONCE at the start of a run, before any model call.
- * - `onToolCall` runs per tool call, BEFORE the approval gate.
- * - `onOutput`   runs at a natural completion, AFTER `doneWhen` + `verifyStep`.
+ * - `onInput`      runs ONCE at the start of a run, before any model call.
+ * - `onToolCall`   runs per tool call, BEFORE the approval gate.
+ * - `onToolResult` runs per executed tool, AFTER it returns and BEFORE its
+ *                  result reaches the model (2.2).
+ * - `onOutput`     runs at a natural completion, AFTER `doneWhen` + `verifyStep`.
  *
  * Every verdict is one of three actions — `pass` (or `undefined`, the same
  * thing), `block`, `rewrite` — so a guardrail can sanitize as well as refuse.
@@ -54,6 +56,24 @@ export interface ToolCallGuardrailContext extends GuardrailBaseContext {
 }
 
 /**
+ * Context for `onToolResult` (2.2) — the executed call and what it produced,
+ * as the model is about to see it. In a native `runAgent` run that is the
+ * MODEL-FACING projection (`toModelOutput`'s value, else the validated
+ * result); the raw result stays in the tool receipt, untouched.
+ */
+export interface ToolResultGuardrailContext extends GuardrailBaseContext {
+  /** The call that ran (with any `onToolCall` rewrite applied). */
+  toolCall: ToolCall;
+  /** The model-facing result — earlier rewrites in the same hook applied. */
+  result: unknown;
+  /**
+   * True when the tool threw or timed out and `result` is the self-heal error
+   * message the loop would feed back.
+   */
+  isError: boolean;
+}
+
+/**
  * Input verdict. `block` ends the run BEFORE any model call
  * (`stoppedBy: 'guardrail:input'`, a graceful stop — not a throw);
  * `rewrite` replaces the history the run starts from.
@@ -86,6 +106,21 @@ export type ToolCallGuardrailResult =
   | { action: 'rewrite'; args: unknown };
 
 /**
+ * Tool-result verdict (2.2). `block` replaces the result with an `is_error`
+ * `tool_result` carrying the reason — the model learns the output was withheld,
+ * never what it was; `rewrite` replaces the model-facing result (redaction,
+ * truncation, stripping injected instructions). Either way the history, the
+ * `tool-result` stream part and `StepResult.toolResults` carry the guarded
+ * value, so nothing downstream disagrees with what the model saw. Unlike an
+ * `onToolCall` block, the tool DID run, so a blocked result counts toward the
+ * same-tool runaway-error guard.
+ */
+export type ToolResultGuardrailResult =
+  | { action: 'pass' }
+  | { action: 'block'; reason?: string }
+  | { action: 'rewrite'; result: unknown };
+
+/**
  * A guardrail is a FUNCTION with an optional `name` — the name is what a
  * `guardrail` stream part and `providerMetadata.deuz.guardrails` report, so a
  * UI can say WHICH rule fired. Returning `undefined` means pass.
@@ -102,6 +137,10 @@ export type ToolCallGuardrail = { name?: string } & ((
   ctx: ToolCallGuardrailContext,
 ) => ToolCallGuardrailResult | undefined | Promise<ToolCallGuardrailResult | undefined>);
 
+export type ToolResultGuardrail = { name?: string } & ((
+  ctx: ToolResultGuardrailContext,
+) => ToolResultGuardrailResult | undefined | Promise<ToolResultGuardrailResult | undefined>);
+
 /**
  * The `guardrails` option of a call. Each hook takes one guardrail or an
  * ordered array; within a hook they run in array order, rewrites chaining and
@@ -111,4 +150,5 @@ export interface Guardrails {
   onInput?: InputGuardrail | InputGuardrail[];
   onOutput?: OutputGuardrail | OutputGuardrail[];
   onToolCall?: ToolCallGuardrail | ToolCallGuardrail[];
+  onToolResult?: ToolResultGuardrail | ToolResultGuardrail[];
 }
