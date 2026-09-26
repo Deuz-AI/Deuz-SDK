@@ -342,6 +342,9 @@ export function createSwarm(options: SwarmOptions): Swarm {
     let draining = drainSignalled;
     // The durable commit of the last cancel a renewal delivered.
     let cancelling: Promise<void> | undefined;
+    // A renewal delivered a cancel (2.2). One no commit made durable is queued
+    // again before the lease is let go, so the next executor still applies it.
+    let delivered = false;
     let stopBeat: (() => void) | undefined;
     const lose = () => {
       lost ??= new SwarmLeaseError('lost');
@@ -356,6 +359,8 @@ export function createSwarm(options: SwarmOptions): Swarm {
         if (stopped || !held || lost) return;
         try {
           const renewal = await leasing!.provider.renew(held, leaseTtl);
+          // Noted even after this executor stopped: the release queues it again.
+          if (renewal.held && renewal.signals.includes('cancel')) delivered = true;
           if (stopped) return;
           if (!renewal.held) return lose();
           held = renewal.lease;
@@ -796,6 +801,18 @@ export function createSwarm(options: SwarmOptions): Swarm {
         stopped = true;
         stopBeat?.();
         signal?.removeEventListener('abort', abort);
+        // A delivered cancel that no commit made durable, including one a
+        // renewal still in flight brings, goes back in the queue while this
+        // executor holds the lease (2.2), unless the run settled past it.
+        await renewals;
+        await cancelling;
+        if (
+          delivered &&
+          !snapshot.run.cancelRequested &&
+          snapshot.run.status !== 'completed' &&
+          snapshot.run.status !== 'partial'
+        )
+          await restore(key, ['cancel']);
         // A stale token is ignored, so this is safe after a takeover too.
         await unclaim(held);
         owned.delete(id);

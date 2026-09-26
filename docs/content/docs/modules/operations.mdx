@@ -142,8 +142,11 @@ A signalled cancel is not lost when its holder stops first. If the holder
 crashes before reading it, or the cancel arrives just after the holder's last
 check and the run settles `'suspended'`, the `'cancel'` stays queued under the
 run's key, and the next executor to claim the run cancels it before
-dispatching anything. A run that completed or became partial before the cancel
-reached it keeps its status.
+dispatching anything. A holder that reads the cancel but fails before recording
+it, for example because that commit hits a store error, queues it again before
+it lets the lease go; only a process that dies between reading and recording it
+loses it. A run that completed or became partial before the cancel reached it
+keeps its status.
 
 Without a lease provider, a request against a run that another process drives
 is recorded, and that executor's next commit then fails its revision check.

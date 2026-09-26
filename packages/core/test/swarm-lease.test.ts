@@ -618,6 +618,174 @@ describe('swarm requestCancel', () => {
     expect(outcome.run).toMatchObject({ status: 'cancelled', cancelRequested: true });
   });
 
+  it('queues a cancel again when the holder fails to record it before settling', async () => {
+    const time = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    let refuse = true;
+    // A transient error hits the one commit that records the cancel.
+    const flaky: SwarmStore = {
+      ...store,
+      async commit(change) {
+        if (refuse && change.run?.cancelRequested) {
+          refuse = false;
+          throw new Error('transient store error');
+        }
+        return store.commit(change);
+      },
+    };
+    const release = gate();
+    const calls = { count: 0 };
+    const a = swarmOn({
+      store: flaky,
+      clock: time.clock,
+      provider,
+      owner: 'a',
+      work: slow(release.promise, calls),
+    });
+    const handle = await a.run({
+      ...key,
+      tasks: [
+        { id: 'a', reducer: 'work' },
+        { id: 'b', reducer: 'work', dependsOn: ['a'] },
+      ],
+    });
+    await until(() => calls.count === 1);
+    const drained = handle.drain();
+    const b = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      provider,
+      owner: 'b',
+      work: slow(Promise.resolve(), calls),
+    });
+    expect(await b.requestCancel(key)).toBe('signalled');
+    // A's check before the settle delivers the cancel, and its commit fails.
+    release.resolve();
+    await expect(drained).rejects.toThrow('transient store error');
+    expect(await store.head!(key)).toMatchObject({ status: 'running', cancelRequested: false });
+    // Whoever takes the run over next still receives the cancel.
+    const { handles, failed } = await b.recover();
+    expect(failed).toEqual([]);
+    const outcome = await handles[0]!.result;
+    expect(outcome.run).toMatchObject({ status: 'cancelled', cancelRequested: true });
+    expect(outcome.tasks.map((task) => [task.task.id, task.status])).toEqual([
+      ['a', 'completed'],
+      ['b', 'cancelled'],
+    ]);
+    expect(calls.count).toBe(1);
+  });
+
+  it('queues a cancel again when the heartbeat delivers it and its commit fails', async () => {
+    const time = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    let refuse = true;
+    const flaky: SwarmStore = {
+      ...store,
+      async commit(change) {
+        if (refuse && change.run?.cancelRequested) {
+          refuse = false;
+          throw new Error('transient store error');
+        }
+        return store.commit(change);
+      },
+    };
+    const calls = { count: 0 };
+    const a = swarmOn({
+      store: flaky,
+      clock: time.clock,
+      provider,
+      owner: 'a',
+      work: slow(gate().promise, calls),
+    });
+    const handle = await a.run({ ...key, tasks });
+    await until(() => calls.count === 1);
+    const b = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      provider,
+      owner: 'b',
+      work: slow(Promise.resolve(), calls),
+    });
+    expect(await b.requestCancel(key)).toBe('signalled');
+    await time.advance(1_000);
+    await expect(handle.result).rejects.toThrow('transient store error');
+    const outcome = await (await b.resume(key)).result;
+    expect(outcome.run).toMatchObject({ status: 'cancelled', cancelRequested: true });
+    expect(outcome.tasks[0]?.status).toBe('cancelled');
+    expect(calls.count).toBe(1);
+  });
+
+  it('queues a cancel again when a renewal delivers it after the run settled suspended', async () => {
+    const time = manualClock();
+    const inner = createInMemoryLeaseProvider({ clock: time.clock });
+    let hold: Promise<void> | undefined;
+    // Renewals take their signals at once, then answer only when the test says.
+    const provider: LeaseProvider = {
+      ...inner,
+      async renew(lease, ttlMs) {
+        const renewal = await inner.renew(lease, ttlMs);
+        await hold;
+        return renewal;
+      },
+    };
+    const store = createInMemorySwarmStore();
+    const settling = gate();
+    const slowSettle: SwarmStore = {
+      ...store,
+      async commit(change) {
+        if (change.run?.status === 'suspended') await settling.promise;
+        return store.commit(change);
+      },
+    };
+    const release = gate();
+    const calls = { count: 0 };
+    const a = swarmOn({
+      store: slowSettle,
+      clock: time.clock,
+      provider,
+      owner: 'a',
+      work: slow(release.promise, calls),
+    });
+    const handle = await a.run({
+      ...key,
+      tasks: [
+        { id: 'a', reducer: 'work' },
+        { id: 'b', reducer: 'work', dependsOn: ['a'] },
+      ],
+    });
+    await until(() => calls.count === 1);
+    const drained = handle.drain();
+    release.resolve();
+    await time.advance(0);
+    // A's settle commit is in flight: the cancel arrives after its last check.
+    const b = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      provider,
+      owner: 'b',
+      work: slow(Promise.resolve(), calls),
+    });
+    expect(await b.requestCancel(key)).toBe('signalled');
+    const answered = gate();
+    hold = answered.promise;
+    // The heartbeat renewal takes the cancel, but its answer comes after the settle.
+    await time.advance(1_000);
+    settling.resolve();
+    await time.advance(0);
+    answered.resolve();
+    expect((await drained).run.status).toBe('suspended');
+    hold = undefined;
+    const outcome = await (await b.resume(key)).result;
+    expect(outcome.run).toMatchObject({ status: 'cancelled', cancelRequested: true });
+    expect(outcome.tasks.map((task) => [task.task.id, task.status])).toEqual([
+      ['a', 'completed'],
+      ['b', 'cancelled'],
+    ]);
+    expect(calls.count).toBe(1);
+  });
+
   it('starts a new run clean even when its key still queues a cancel', async () => {
     const time = manualClock();
     const provider = createInMemoryLeaseProvider({ clock: time.clock });
