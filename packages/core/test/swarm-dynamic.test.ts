@@ -184,6 +184,45 @@ describe('dynamic swarm spawning (2.2)', () => {
     expect(deep.tasks[1]?.error?.message).toMatch(/depth/);
   });
 
+  it('fails one of two parents racing for the last task slots instead of the whole run', async () => {
+    let started = 0;
+    let release!: () => void;
+    const both = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const swarm = createSwarm({
+      agents: {},
+      store: createInMemorySwarmStore(),
+      dynamic: { maxTasks: 3, maxSpawnDepth: 1 },
+      reducers: {
+        fan: {
+          async execute(_results, context) {
+            if (++started === 2) release();
+            await both;
+            context.spawn([{ key: 'child', reducer: 'leaf' }]);
+            return 'ok';
+          },
+        },
+        leaf: echo,
+      },
+    });
+    const outcome = await (
+      await swarm.run({
+        scope: 'tenant',
+        runId: 'race',
+        tasks: [
+          { id: 'a', reducer: 'fan' },
+          { id: 'b', reducer: 'fan' },
+        ],
+      })
+    ).result;
+    expect(outcome.tasks).toHaveLength(3);
+    const failed = outcome.tasks.filter((task) => task.status === 'failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.error?.message).toMatch(/task limit/);
+    expect(outcome.run.status).toBe('partial');
+  });
+
   it('replays a parent that crashed before its spawn commit without duplicating children', async () => {
     const inner = createInMemorySwarmStore();
     let crash = true;
@@ -450,30 +489,79 @@ describe('per-task timeoutMs (2.2)', () => {
     expect(timers.every((timer) => timer.cancelled)).toBe(true);
   });
 
-  it("gives an agent task's execution context the attempt deadline", async () => {
-    const { clock } = recordingClock();
-    let deadline: number | undefined;
-    const swarm = createSwarm({
-      store: createInMemorySwarmStore(),
-      deps: { clock },
-      agents: {
-        worker: {
-          agent: createAgent({ model: createMockModel({ responses: [{ text: 'done' }] }) }),
-          verify: (context) => {
-            deadline = context.execution.policy.deadlineAt;
-            return { status: 'verified' };
-          },
+  it('keeps an agent task with timeoutMs resumable: its deadline is not saved in the policy', async () => {
+    let now = 1_000;
+    const clock = { now: () => now, setTimeout: () => () => {} };
+    const execute = vi.fn(() => 'written');
+    const agent = createAgent({
+      model: createMockModel({
+        responses: [{ toolCalls: [{ toolName: 'write', args: {} }] }, { text: 'done' }],
+      }),
+      tools: {
+        write: {
+          description: 'write',
+          parameters: { type: 'object', properties: {}, additionalProperties: false },
+          needsApproval: true,
+          execute,
         },
       },
     });
-    const outcome = await (
-      await swarm.run({
+    const store = createInMemorySwarmStore();
+    const options = { agents: { worker: agent }, store, deps: { clock } };
+    const first = await (
+      await createSwarm(options).run({
         scope: 'tenant',
-        tasks: [{ id: 'a', agent: 'worker', prompt: 'go', timeoutMs: 2_500 }],
+        runId: 'approval-timeout',
+        tasks: [{ id: 'a', agent: 'worker', prompt: 'write', timeoutMs: 60_000 }],
       })
     ).result;
-    expect(outcome.tasks[0]?.status).toBe('completed');
-    expect(deadline).toBe(3_500);
+    expect(first.run.status).toBe('suspended');
+    expect(first.tasks[0]?.agentState?.execution?.policy.deadlineAt).toBeUndefined();
+    const native = first.tasks[0]!.result!.agentResult!;
+    if (native.status !== 'suspended') throw new Error('Expected suspension');
+    now += 5_000; // a person approves five seconds later
+    const approved = await (
+      await createSwarm(options).resume({
+        ...first.run,
+        approvals: {
+          a: native.pendingApprovals.map((request) => ({
+            approvalId: request.approvalId,
+            approved: true,
+          })),
+        },
+      })
+    ).result;
+    expect(approved.tasks[0]?.status).toBe('completed');
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('recovers a finished agent task with timeoutMs after a crash without another model call', async () => {
+    let now = 1_000;
+    const clock = { now: () => now, setTimeout: () => () => {} };
+    const inner = createInMemorySwarmStore();
+    let fail = true;
+    const store: SwarmStore = {
+      ...inner,
+      async commit(change) {
+        if (fail && change.events?.some((event) => event.type === 'task.completed'))
+          throw new Error('crash after native checkpoint');
+        return inner.commit(change);
+      },
+    };
+    const model = createMockModel({
+      responses: [{ text: 'persisted' }, { text: 'must not replay' }],
+    });
+    const options = { agents: { worker: createAgent({ model }) }, store, deps: { clock } };
+    const handle = await createSwarm(options).run({
+      scope: 'tenant',
+      runId: 'recover-timeout',
+      tasks: [{ id: 'a', agent: 'worker', prompt: 'answer', timeoutMs: 30_000 }],
+    });
+    await expect(handle.result).rejects.toThrow('crash after native checkpoint');
+    fail = false;
+    now += 1;
+    const recovered = await (await createSwarm(options).resume(handle)).result;
+    expect(recovered.tasks[0]?.result?.output).toBe('persisted');
   });
 
   it.each([0, -1, 1.5])('rejects timeoutMs %s before anything is written', async (timeoutMs) => {

@@ -54,6 +54,8 @@ export function spawnRecords(input: {
   on: 'completed' | 'failed';
   requests: readonly SwarmSpawnRequest[];
   records: ReadonlyMap<string, SwarmTaskRecord>;
+  /** Slots already promised to spawns that have not committed yet. */
+  reserved?: number;
   /** Validates a definition against the bindings and returns its binding version. */
   define: (task: SwarmTask) => string;
 }): SwarmTaskRecord[] {
@@ -81,7 +83,7 @@ export function spawnRecords(input: {
     tasks: [{ ...input.parent, status: input.on }],
     spawn,
     exists: (taskId) => input.records.has(taskId),
-    count: input.records.size,
+    count: input.records.size + (input.reserved ?? 0),
   });
   return spawn;
 }

@@ -90,9 +90,11 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
         db = new module.DatabaseSync(options.path);
       }
       try {
+        // The busy handler must exist before anything that can take a lock:
+        // switching a file to WAL needs one, and another process may hold it.
+        db.exec('PRAGMA busy_timeout = 5000');
         if (options.path !== ':memory:' && options.wal !== false)
           db.exec('PRAGMA journal_mode = WAL');
-        db.exec('PRAGMA busy_timeout = 5000');
         transaction(db, () => {
           db.exec(
             'CREATE TABLE IF NOT EXISTS deuz_swarm_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)',
@@ -141,6 +143,10 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
         throw error;
       }
     })();
+    // A failed open must not poison the store for the rest of the process.
+    opening.catch(() => {
+      opening = undefined;
+    });
     return opening;
   };
   const use = async <T>(operation: (db: SqliteDatabaseLike) => T): Promise<T> => {
