@@ -1,0 +1,418 @@
+---
+title: What is new in 2.2
+description: Dynamic swarms, blackboards and rounds, durable operations across processes, persistent budgets, evolve, schedules and signals, and the release's upgrade notes and operational limits.
+---
+
+2.2 turns the 2.1 swarm from a fixed DAG into a structure that grows at run
+time, lets its agents share notes, and lets several processes share its runs.
+Around it, budgets can outlive a run, `evolve` adds evolutionary program
+search, and schedules and webhooks can start work. Accounting now grows with
+live work instead of history, so large swarms stay cheap to persist.
+
+Everything is additive at the call level: a 2.1 program compiles and, apart
+from three narrow behaviour changes, behaves as before. The other exceptions
+are persisted formats that 2.1 cannot read back and a few widened unions; see
+[Upgrading from 2.1](#upgrading-from-21) before you deploy.
+
+## Install and choose an entry
+
+```bash
+npm install @deuz-sdk/core@2.2.0
+```
+
+No new runtime package is required. The Postgres entries take any client with
+`query(sql, params)`, such as a `pg` pool, which stays an optional peer.
+
+| Entry                           | New surface                                                                                                           | Runtime   |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------- | --------- |
+| `@deuz-sdk/core/ops`            | `createInMemoryLeaseProvider` and the lease contract                                                                  | Edge-safe |
+| `@deuz-sdk/core/ops/sqlite`     | `createSqliteOpsStore` (leases, native agent runs), `createSqliteBudgetStore`                                         | Node      |
+| `@deuz-sdk/core/ops/postgres`   | `createPostgresOpsStore`, `createPostgresBudgetStore`                                                                 | Node      |
+| `@deuz-sdk/core/swarm/postgres` | `createPostgresSwarmStore`                                                                                            | Node      |
+| `@deuz-sdk/core/evolve`         | `evolve`, `resumeEvolve`, `createInMemoryPopulationStore` and the pure patch helpers                                 | Edge-safe |
+| `@deuz-sdk/core/evolve/sqlite`  | `createSqlitePopulationStore`                                                                                         | Node      |
+| `@deuz-sdk/core/schedule`       | `parseCron`, `createScheduler`, `handleSignal` and the webhook verifiers                                              | Edge-safe |
+| `@deuz-sdk/core/swarm`          | `dynamic`, `lease`, `createRounds`, `drain`, `recover`, `requestCancel`, `SwarmLeaseError`                            | Edge-safe |
+| `@deuz-sdk/core/agent`          | `BudgetLedger.compact`, persistent `admission`, `createInMemoryBudgetStore`, tool `replay: 'idempotent'`              | Edge-safe |
+
+`createCohereReranker` joins `@deuz-sdk/core/rag`, `createVoyageReranker` joins
+`@deuz-sdk/core/voyage`, `fingerprintTools` and `detectToolDrift` join
+`@deuz-sdk/core/mcp`, and `maxToolResultLength` joins
+`@deuz-sdk/core/guardrails`.
+
+## Scale: accounting that grows with live work
+
+In 2.1 every agent task copied the whole shared ledger into its checkpoint, and
+the swarm rewrote the whole ledger on every change. A run of thousands of tasks
+wrote quadratically more with every task. 2.2 removes both costs.
+
+- **Ledger compaction.** `ledger.compact(scopeId)` folds the settled and
+  unknown reservations of a finished scope into one aggregate per ancestor
+  chain and drops its released ones. Global and ancestor totals do not change,
+  and a later cap still fails closed for folded usage that had no estimate. The
+  swarm compacts every task that becomes terminal.
+- **Ledger slices.** A native run under a shared child context checkpoints only
+  its own slice of the ledger (`ledger.subtree`). A sibling's reservation no
+  longer rewrites this run's envelope. The parent persists the shared ledger.
+- **Cheap event polling.** Event readers poll the optional `SwarmStore.head()`
+  instead of loading every task.
+- **Stalled streams.** `timeout.chunkMs` fails a model call that goes silent
+  between two stream parts after content started, with `TimeoutError` layer
+  `'chunk'`.
+
+```ts
+import { createExecutionContext, runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const root = createExecutionContext({ scopeId: 'job', budget: { tokens: 10_000 } });
+const children = ['a', 'b'].map(id => root.child({ scopeId: id }));
+
+for (const execution of children) {
+  await runAgent({
+    model: createMockModel({ responses: [{ text: 'done' }] }),
+    prompt: 'Handle your part.',
+    execution,
+    executionEstimate: { tokens: 200 },
+  });
+}
+
+const before = root.ledger.totals();
+// Child scope IDs are paths: 'job/a'. Only compact a scope that never reserves again.
+console.log(await root.ledger.compact(children[0].scopeId)); // { scopeId: 'job/a', folded: 1, ... }
+console.log(root.ledger.totals().committed.tokens === before.committed.tokens); // true
+console.log(root.ledger.snapshot().version); // 2
+```
+
+Per-request records of a compacted scope are gone; read a finished task's own
+cost from its agent result's `accounting`. See
+[Swarm](/docs/modules/swarm#policy-budgets-and-versioning) and
+[Native agents](/docs/modules/native-agents#mandatory-policy-and-shared-budgets).
+
+## Dynamic swarms
+
+A swarm created with `dynamic: { maxTasks, maxSpawnDepth, maxSpawnPerTask? }`
+lets a finished task create more tasks. Reducers queue requests through
+`context.spawn`; agent bindings map their accepted output through
+`spawn(output, context)`. A spawned task's ID is `parentId/key`.
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createInMemorySwarmStore, createSwarm } from '@deuz-sdk/core/swarm';
+
+const planner = createAgent({
+  model: createMockModel({ responses: [{ text: '{"steps":["parse","index"]}' }] }),
+});
+const worker = createAgent({
+  model: createMockModel({ responses: [{ text: 'parse done' }, { text: 'index done' }] }),
+});
+
+const swarm = createSwarm({
+  store: createInMemorySwarmStore(),
+  dynamic: { maxTasks: 20, maxSpawnDepth: 1 },
+  agents: {
+    planner: {
+      agent: planner,
+      output: {
+        schema: {
+          type: 'object',
+          properties: { steps: { type: 'array', items: { type: 'string' } } },
+          required: ['steps'],
+        },
+        mode: 'json',
+        validate: value => value as { steps: string[] },
+      },
+      spawn: output =>
+        (output as { steps: string[] }).steps.map(step => ({
+          key: step,
+          agent: 'worker',
+          prompt: `Do the ${step} step.`,
+        })),
+    },
+    worker,
+  },
+});
+
+const handle = await swarm.run({
+  scope: 'tenant-a',
+  tasks: [{ id: 'plan', agent: 'planner', prompt: 'Plan the steps.' }],
+});
+const outcome = await handle.result;
+console.log(outcome.tasks.map(task => task.task.id)); // ['plan', 'plan/parse', 'plan/index']
+```
+
+Children commit atomically with their parent's terminal state, so a crash
+never duplicates or loses them. Every request is validated before anything
+commits; an invalid one fails the spawning task and creates nothing.
+`onFailure` hooks commit compensation tasks together with a failure, and a
+task's `timeoutMs` fails an attempt that runs long as `SwarmTaskTimeout`.
+Dynamic runs are version 2 and need a store with the `'spawn'` capability. See
+[Dynamic tasks](/docs/modules/swarm#dynamic-tasks).
+
+## Blackboards, soft dependencies and rounds
+
+- **Groups and the blackboard.** Give a task a `group` and its agent binding a
+  `blackboard`, and the agent gets idempotent `blackboard_post` and
+  `blackboard_read` tools over durable, ordered group channels. Reducers page
+  channels with `context.readChannel`. Posts are journaled as `channel.posted`
+  events, and the store needs the `'channels'` capability.
+- **Soft dependencies.** `after` waits for the listed tasks to settle in any
+  terminal state. The task receives only the completed results, and a reducer
+  reads every listed task's status in `context.settled`.
+- **Rounds.** `createRounds` builds rounds of group-parallel agents with a
+  consolidator between rounds. The consolidator reads the round's results by
+  group and decides which groups continue, with how many agents and what
+  prompt.
+
+```ts
+import { createInMemorySwarmStore, createSwarm } from '@deuz-sdk/core/swarm';
+
+const swarm = createSwarm({
+  agents: {},
+  store: createInMemorySwarmStore(),
+  reducers: {
+    probe: {
+      execute: (_results, context) => {
+        if (context.taskId === 'flaky') throw new Error('probe failed');
+        return 'ok';
+      },
+    },
+    join: {
+      execute: (results, context) => ({
+        completed: Object.keys(results),
+        settled: context.settled,
+      }),
+    },
+  },
+});
+
+const handle = await swarm.run({
+  scope: 'tenant-a',
+  tasks: [
+    { id: 'steady', reducer: 'probe' },
+    { id: 'flaky', reducer: 'probe' },
+    { id: 'report', reducer: 'join', after: ['steady', 'flaky'] },
+  ],
+});
+const outcome = await handle.result;
+console.log(outcome.tasks.find(task => task.task.id === 'report')?.result?.output);
+// { completed: ['steady'], settled: { steady: 'completed', flaky: 'failed' } }
+```
+
+See [Groups and the blackboard](/docs/modules/swarm#groups-and-the-blackboard),
+[Soft dependencies](/docs/modules/swarm#soft-dependencies) and
+[Rounds](/docs/modules/swarm#rounds).
+
+## Durability operations
+
+Durable runs can now move between processes. A **lease** decides which
+executor drives a run and is renewed on a heartbeat; the store's **revision**
+check remains the fence that rejects a stale writer.
+
+- `lease: { provider, owner?, ttlMs? }` on `createSwarm`. A second executor
+  gets `SwarmLeaseError` code `'held'`; one that loses its lease stops before
+  its next write and rejects with code `'lost'`.
+- `handle.drain()` stops dispatch, lets in-flight tasks finish, and settles the
+  run `'suspended'` with a `run.drained` event. Use it for rolling deploys.
+- `swarm.recover({ scope?, limit? })` takes over `'running'` runs without a
+  live executor. It needs a store with the `'list'` capability.
+- `swarm.requestCancel(key)` cancels from any process and reports
+  `'signalled'`, `'recorded'` or `'settled'`.
+- `expectedRevision` and `expectedStatus` on `resume` claim a run only in the
+  state you inspected.
+- `AgentRunEnvelope.revision` increases on every save, and the SQLite, Postgres
+  and in-memory agent run stores reject a stale one.
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createInMemorySwarmStore, createSwarm } from '@deuz-sdk/core/swarm';
+
+const worker = createAgent({ model: createMockModel({ responses: [{ text: 'step done' }] }) });
+const swarm = createSwarm({
+  agents: { worker },
+  store: createInMemorySwarmStore(),
+  lease: { provider: createInMemoryLeaseProvider(), owner: 'worker-1' },
+});
+
+const handle = await swarm.run({
+  scope: 'tenant-a',
+  runId: 'deploy-demo',
+  tasks: [
+    { id: 'first', agent: 'worker', prompt: 'Do the first step.' },
+    { id: 'second', agent: 'worker', prompt: 'Do the second step.', dependsOn: ['first'] },
+  ],
+});
+
+// A deploy is starting: finish what is in flight, then hand the run back.
+const drained = await handle.drain();
+console.log(drained.run.status); // 'suspended' while work remains, or a terminal status
+
+// The next process, with the same code, picks the run up again.
+const resumed = await swarm.resume({ scope: 'tenant-a', runId: 'deploy-demo' });
+console.log((await resumed.result).run.status); // 'completed'
+```
+
+Use the SQLite or Postgres lease provider from `@deuz-sdk/core/ops/sqlite` or
+`@deuz-sdk/core/ops/postgres` when processes share runs. The Postgres swarm
+store in `@deuz-sdk/core/swarm/postgres` makes every write one revision-gated
+statement, so pooled clients are safe. See [Operations](/docs/modules/operations).
+
+## Persistent budgets
+
+Execution contexts and ledgers take
+`admission: { store, scopes, warnAtPercent?, onWarning? }`. After local
+admission, every model call is admitted all-or-nothing by a shared
+`BudgetStore` against persistent scopes such as `user:42` or `org:acme`, with
+optional rolling windows. Settlement and release are mirrored, unknown usage
+keeps the hold, and requests are idempotent by request ID. Stores:
+`createInMemoryBudgetStore` (`/agent`), `createSqliteBudgetStore`
+(`/ops/sqlite`) and `createPostgresBudgetStore` (`/ops/postgres`). See
+[Budgets](/docs/modules/budgets).
+
+## Evolve
+
+`evolve` evolves the code between `EVOLVE-BLOCK-START` and `EVOLVE-BLOCK-END`
+markers with model-written SEARCH/REPLACE diffs, full rewrites and crossovers.
+An evaluation cascade scores candidates, islands and a MAP-Elites archive keep
+diversity, and a UCB1 bandit picks from a model ensemble. A budget is
+mandatory. Candidates have deterministic IDs and generations commit with a
+compare-and-set, so `resumeEvolve` replays stored slots with zero model calls.
+It runs on the edge; the SQLite population store is in
+`@deuz-sdk/core/evolve/sqlite`. See [Evolve](/docs/modules/evolve).
+
+## Schedules and signals
+
+`@deuz-sdk/core/schedule` starts work from time and webhooks. `parseCron`
+reads five-field UTC cron. `createScheduler` runs due occurrences from a host
+cron trigger (`tick`) or an injected clock (`start`), dedupes each
+`${id}@${at}` key through a pluggable `claim`, and follows a `catchUp` policy
+after downtime. `verifyGitHubWebhook`, `verifySlackRequest` and
+`verifyHmacSignature` check signatures with WebCrypto in constant time, and
+`handleSignal` turns one verified request into one dispatch. See
+[Schedules and signals](/docs/modules/schedule).
+
+## Rerankers, tool results and MCP drift
+
+- **Rerankers.** `createCohereReranker` (default `rerank-v4.0-pro`) and
+  `createVoyageReranker` (default `rerank-2.5`) plug into the existing
+  `Reranker` seam of `retrieve` and `hybridRetrieve`. See
+  [RAG](/docs/modules/rag).
+- **`onToolResult`.** A fourth guardrail hook runs after a tool returns and
+  before the model sees its result, in `generateText`, `streamChat` and native
+  `runAgent`. It can pass, block into an `is_error` result, or rewrite. In a
+  native run it guards the model-facing projection and leaves the receipt's
+  raw result alone. `maxToolResultLength` caps what the model sees. See
+  [Guarding tool results](/docs/agents/guardrails#guarding-tool-results-22).
+- **MCP drift.** `fingerprintTools` hashes each tool's name, description and
+  input schema, and `detectToolDrift` reports what a server added, removed or
+  changed after you approved it. See
+  [Detecting tool drift](/docs/modules/mcp#detecting-tool-drift-22).
+- **Idempotent native tools.** `replay: 'idempotent'` lets an interrupted call
+  run again on resume without `retryToolCallIds`, keyed by `ctx.toolCallId`
+  and the new `ctx.modelStep`. See
+  [Idempotent tools](/docs/modules/native-agents#idempotent-tools).
+
+## Upgrading from 2.1
+
+Upgrading is safe in place for code, but some persisted data moves forward
+only. Plan the rollout as one-way for every store 2.2 writes to.
+
+### Back up SQLite swarm files first
+
+The SQLite swarm store moves to schema 2. The first 2.2 open of a 2.1 file
+upgrades it in place, in one transaction: runs gain indexed `status` and
+`updated_at` columns and a channel table is added. Existing runs, tasks and
+events are kept and resume as before. **After the upgrade, 2.1 refuses the
+file.** Copy the database file before the first 2.2 process opens it if you may
+need to roll back.
+
+### Data that 2.1 cannot read
+
+- **Version 2 swarm runs.** Every run created with `dynamic` limits is version 2,
+  and 2.1 rejects it on load.
+- **Version 2 ledger snapshots.** A snapshot is version 2 once it carries
+  compacted aggregates, a native ledger slice or persistent admission. The
+  swarm compacts each finished task, so most swarm runs that 2.2 has advanced
+  can no longer be resumed by 2.1. Native runs under a shared child context
+  checkpoint slices, and contexts with `admission` write version 2 execution
+  snapshots.
+- **Agent run revisions.** Envelopes written by 2.2 carry `revision`. A 2.1
+  envelope without one counts as revision 0, so 2.1 data loads in 2.2.
+
+Roll back a deployment only together with the backups taken before it.
+
+### Widened unions
+
+Exhaustive `switch` statements over these types need a new case:
+
+| Type                               | New members                                           |
+| ---------------------------------- | ----------------------------------------------------- |
+| `TimeoutError.layer`               | `'chunk'`                                             |
+| `SwarmEvent['type']`               | `'run.drained'`, `'task.spawned'`, `'channel.posted'` |
+| `SwarmRunRecord.version`           | `2`                                                   |
+| `BudgetLedgerSnapshot.version`     | `2`                                                   |
+| `ExecutionContextSnapshot.version` | `2`                                                   |
+| `BudgetLedgerErrorCode`            | `'admission_failed'`                                  |
+| `GuardrailPart.hook`               | `'tool-result'`                                       |
+| `SwarmStoreCapability`             | New type: `'spawn'`, `'channels'`, `'list'`           |
+
+### New required members for custom implementations
+
+Calling code is unaffected. Code that implements these interfaces itself, such
+as a test double or a wrapper, must add the new members:
+
+- `BudgetLedger.compact(scopeId)`.
+- `SwarmReducerContext.spawn`, `.readChannel` and `.settled`, for code that
+  builds reducer contexts, for example to unit-test a reducer.
+- `SwarmHandle.drain()` and `Swarm.requestCancel` / `Swarm.recover`, for a
+  hand-written swarm double.
+
+The new `SwarmStore` members (`capabilities`, `head`, `readChannel`,
+`listRuns`) are optional. A 2.1-style custom store keeps working for fixed
+DAGs. A swarm refuses to start `dynamic` limits, a `blackboard` binding or
+`recover` against a store that does not declare the matching capability,
+instead of silently losing data. Provide `head` for large runs, or event
+readers fall back to `load`.
+
+### Behaviour changes
+
+- `createInMemoryAgentRunStore` now rejects a save whose `revision` is not the
+  stored revision plus one. Code that saves hand-built envelopes must carry the
+  revision forward.
+- A native run with a supplied child execution context checkpoints only its
+  ledger slice. Resume it with the same execution context; resuming a slice
+  without `execution` fails.
+- A snapshot that records persistent admission cannot be restored without
+  `admission: { store }`.
+
+## Operational limits
+
+- **Leases are liveness, not safety.** Revision checks fence stale writers. A
+  task interrupted by a takeover follows the same `replay` rules as a crash:
+  it waits in `needs_reconciliation` unless it is `replay: 'safe'` or retried.
+- **Clocks.** SQLite leases and budget windows use the host clock, so processes
+  sharing a file need synchronised clocks. Postgres leases and windows use the
+  database clock.
+- **Without a lease provider,** drive one run from one process, as in 2.1.
+- **Dynamic limits.** `maxTasks` is at most 10 000 and `maxSpawnDepth` at most
+  64. Limits are stored with the run, and a resume can only tighten them.
+- **External effects.** Store transactions do not include external APIs. Use
+  service idempotency or reconciliation for exactly-once effects. Cancellation
+  and drain remain cooperative.
+- **Budgets.** Admission enforces limits against estimates and retained holds.
+  It cannot guarantee a provider's final invoice. A hold leaked by a crash stays
+  charged to a lifetime budget and leaves a windowed budget with its bucket.
+  Budget stores keep history and do not prune it.
+- **Evolve** runs model-written code only through your evaluators. Sandbox
+  them.
+- **Schedules.** The default claim dedupes within one process. Use a durable
+  claim, such as a run store's create conflict, across processes and isolates.
+- **Deferred to 2.3:** the MCP 2026-07-28 client, an MCP server, A2A, realtime
+  voice, provider batch APIs, Redis swarm and ops backends, and `chat`,
+  `memory` and `fallbackModels` in native runs.
+
+Previous releases remain documented in
+[What is new in 2.1](/docs/reference/whats-new-2-1) and the
+[Changelog](/docs/changelog).

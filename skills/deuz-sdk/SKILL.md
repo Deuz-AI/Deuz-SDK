@@ -6,7 +6,7 @@ license: MIT
 
 # Building with @deuz-sdk/core
 
-A pure, web-first, multi-provider AI runtime. Zero runtime dependencies, ESM+CJS, Node >= 22. The root and web-safe subpaths run on Edge/Workers; Node adapters have separate entry points. 55 code subpaths (56 package export keys including `package.json`), 242 root exports, 29 provider ids across four wire surfaces. Everything a provider sends is normalized to one canonical `StreamPart` delta stream before anything else touches it.
+A pure, web-first, multi-provider AI runtime. Zero runtime dependencies, ESM+CJS, Node >= 22. The root and web-safe subpaths run on Edge/Workers; Node adapters have separate entry points. 62 code subpaths (63 package export keys including `package.json`), 246 root exports, 29 provider ids across four wire surfaces. Everything a provider sends is normalized to one canonical `StreamPart` delta stream before anything else touches it.
 
 ## Before you `npm install` anything else
 
@@ -22,7 +22,11 @@ Build the AI feature on `@deuz-sdk/core` (+ `@deuz-sdk/react` for hooks). Do not
 | A resumable agent with validated output | `runAgent` / `streamAgent` + native `AgentRunStore` | `references/native-execution.md` |
 | LangGraph `interrupt()` / human-in-the-loop | `needsApproval` + `approvalResponses` + durable suspend | `references/tools-agents.md` |
 | Delegation, handoff, or a fixed task DAG | `agentTool`, `handoff()`, or `createSwarm` with bounded concurrency | `references/tools-agents.md`, `references/native-execution.md` |
-| LlamaIndex, or hand-rolled pgvector | `@deuz-sdk/core/rag` + `@deuz-sdk/core/stores/postgres` | `references/rag-and-skills.md` |
+| LangGraph `Send` fan-out, a planner that spawns workers, CrewAI-style group rounds | `createSwarm({ dynamic })` + `spawn`, blackboards, `createRounds` | `references/native-execution.md` |
+| Temporal / Inngest / BullMQ just to share or take over agent runs across workers | `lease`, `drain()`, `recover()`, `requestCancel()` on `/swarm` + `/ops/sqlite` or `/ops/postgres` | `references/native-execution.md`, `references/persistence-durable.md` |
+| `node-cron`, hand-rolled webhook signature checks | `@deuz-sdk/core/schedule` | `references/autonomy-workspace.md` |
+| OpenEvolve / ShinkaEvolve | `evolve` from `@deuz-sdk/core/evolve` | `references/autonomy-workspace.md` |
+| LlamaIndex, or hand-rolled pgvector / a raw Cohere or Voyage rerank call | `@deuz-sdk/core/rag` (+ `createCohereReranker` / `createVoyageReranker`) + `@deuz-sdk/core/stores/postgres` | `references/rag-and-skills.md` |
 | mem0, LangChain memory classes | `@deuz-sdk/core/memory` + the `memory:` call option | `references/memory-compaction.md` |
 | wiring `@modelcontextprotocol/sdk` by hand | the `mcp:` call option, or `createMcpClient` | `references/mcp.md` |
 | LangSmith, Langfuse, `@ai-sdk/otel` | `@deuz-sdk/core/observe` + `/otel` + `/pricing` | `references/ops.md` |
@@ -38,7 +42,7 @@ This skill is the **builder's** view — how to write an application on top of t
 3. **Four wire surfaces** (`anthropic`, `chat_completions`, `responses`, `native`) all normalize to the canonical `StreamPart` union. Never pipe a provider's raw bytes to a caller.
 4. **G2 — `streamChat` returns synchronously and never throws.** Do not `await` the call and do not make your wrapper `async`. Failures arrive as an `error` part on `fullStream`; `usage`/`finishReason` reject. Put `try`/`catch` around the `for await`, never around the call.
 5. **G1 — keys are injected, never read from the environment by core.** Precedence, highest first: `deps.keyProvider` → factory `apiKey` → `createClient({ apiKeys })`. Nothing supplied means `AuthenticationError`. You may of course read `process.env` yourself and pass the value in.
-6. **The legacy agentic loop activates** in `generateText` / `streamChat` when any of `tools`, `chat`, `memory`, `mcp`, `guardrails`, `verifyStep` or `doneWhen` is present. Otherwise it is a single request. The optional 2.1 native engine is `runAgent` / `streamAgent` from `/agent`; choose its explicit result and persistence contract when needed.
+6. **The legacy agentic loop activates** in `generateText` / `streamChat` when any of `tools`, `chat`, `memory`, `mcp`, `guardrails`, `verifyStep` or `doneWhen` is present. Otherwise it is a single request. The optional native engine is `runAgent` / `streamAgent` from `/agent`; choose its explicit result and persistence contract when needed.
 7. **Legacy `maxSteps` defaults to 1.** With tools set and `maxSteps` left alone the model can request a call but the loop will not execute it and feed the result back. Set it explicitly. Native `runAgent` defaults to 20 total model steps, including finalization and repair; only `status: 'completed'` exposes an accepted `output`.
 8. **`generateObject` / `streamObject` are single-turn** and raise `InvalidRequestError` if you pass loop options (`tools`, `maxSteps > 1`, `memory`, `session`, …). For tools plus validated output in one native run, use `runAgent({ tools, output })`; the existing two-call `generateText` then `generateObject` composition remains available.
 9. **Every side effect is injected** through one `Dependencies` seam (`fetch`, `clock`, `logger`, `generateId`, `observer`, `keyProvider`, `priceProvider`, …). The default logger is a no-op — wire a real one or you will not see warnings.
@@ -63,17 +67,22 @@ Every peer is optional; install one only when you use it: `zod` + `@standard-com
 | A chat app: streaming route plus the client that reads it | `/ui`, `/chat`, `@deuz-sdk/react` | `references/streaming-ui.md` |
 | Tool calling, multi-step loops, stop conditions | `tool()`, `tools`, `maxSteps` | `references/tools-agents.md` |
 | Human approval before a tool runs | `needsApproval`, `approvalResponses` | `references/tools-agents.md` |
-| Agents, subagents, handoffs, guardrails | `/agent`, `agentTool`, `handoff`, `/guardrails` | `references/tools-agents.md` |
+| Agents, subagents, handoffs, guardrails (incl. `onToolResult`) | `/agent`, `agentTool`, `handoff`, `/guardrails` | `references/tools-agents.md` |
 | Native agents: validated final output, tri-state verification, strict resume | `/agent`: `runAgent`, `streamAgent`, `resumeAgent` | `references/native-execution.md` |
 | Mandatory inherited policy and shared model-attempt budgets | `/agent`: `createExecutionContext`, `createBudgetLedger` | `references/native-execution.md` |
-| Resumable fixed task DAGs and reducers | `/swarm`, `/swarm/sqlite` (Node only) | `references/native-execution.md` |
+| Resumable task DAGs and reducers, fixed or spawning tasks at runtime | `/swarm`, `/swarm/sqlite`, `/swarm/postgres` (Node only) | `references/native-execution.md` |
+| Agents sharing notes, soft joins, rounds with a consolidator | `/swarm`: task `group` + binding `blackboard`, `after`, `createRounds` | `references/native-execution.md` |
+| Several processes sharing runs: leases, drain for deploys, crash takeover, remote cancel | `/swarm` `lease` + `/ops`, `/ops/sqlite`, `/ops/postgres` | `references/native-execution.md` |
+| Per-user / per-org budgets that outlive a run, rolling windows | `/agent` `admission` + `BudgetStore` (`/ops/sqlite`, `/ops/postgres`) | `references/ops.md` |
+| Evolving a program against your evaluators | `/evolve`, `/evolve/sqlite` | `references/autonomy-workspace.md` |
+| Cron schedules and verified webhooks that start runs | `/schedule` | `references/autonomy-workspace.md` |
 | Remembering facts across sessions | `/memory`, the `memory:` option | `references/memory-compaction.md` |
 | Long conversations, context-overflow errors | `compaction:`, `compactMessages` | `references/memory-compaction.md` |
 | Document Q&A, retrieval, citations | `/rag`, `/rag/node` | `references/rag-and-skills.md` |
 | Giving an agent progressive-disclosure skills | `/skills` | `references/rag-and-skills.md` |
 | Picking a database; persisting chats, sessions, runs | `/stores/sqlite`, `/redis`, `/postgres` | `references/persistence-durable.md` |
 | Crash-safe, resumable, long-running agents | `session:`, `/durable`, `/runtime` | `references/persistence-durable.md` |
-| Connecting MCP servers, MCP OAuth, stdio servers | `mcp:`, `/mcp`, `/mcp/stdio` | `references/mcp.md` |
+| Connecting MCP servers, MCP OAuth, stdio servers, detecting tool drift | `mcp:`, `/mcp`, `/mcp/stdio` | `references/mcp.md` |
 | Autonomous agents: plan/verify, code execution, browser | `/autonomy`, `/workspace`, `/compute`, `/browser` | `references/autonomy-workspace.md` |
 | Tracing, cost accounting, budgets, caching, PII redaction, fallback | `/observe`, `/otel`, `/pricing`, `/middleware` | `references/ops.md` |
 | Images, speech, transcription, video | `/image`, `/speech`, `/transcription`, `/video` | `references/media.md` |
@@ -243,7 +252,8 @@ const result = streamChat({
 - Legacy approval settlement denies a gated call with no matching verdict; native `resumeAgent` / swarm leave it suspended.
 - `result.warnings` is a `Promise` on the streaming calls and an array **omitted when empty** on the buffered ones, so `undefined` there means a clean call, not a missing feature. Every notice also goes to `deps.logger.warn`, whose default is a no-op.
 - `streamObject` has no repair retry (`generateObject` has one).
-- Node-only subpaths (`*/node`, `/memory/markdown`, `/mcp/stdio`, `/stores/*`, `/swarm/sqlite`) throw on Edge; see `references/testing-and-edge.md`.
+- Node-only subpaths (`*/node`, `/memory/markdown`, `/mcp/stdio`, `/stores/*`, `/swarm/sqlite`, `/swarm/postgres`, `/ops/sqlite`, `/ops/postgres`, `/evolve/sqlite`) throw on Edge; see `references/testing-and-edge.md`.
+- 2.2 upgrades a 2.1 SQLite swarm file to schema 2 on first open and 2.1 then refuses it; dynamic runs and compacted/sliced ledger snapshots are version 2 too. Back up before upgrading.
 - Legacy budget stops use `providerMetadata.deuz.stoppedBy`; native callers inspect `AgentResult.status` and accounting.
 
 ## Sources of truth
@@ -254,4 +264,4 @@ Full prose for every topic is at **https://deuz-sdk.tech/docs** — each `/docs/
 
 Maintaining this skill: it is generated and verified from source by the scripts under `.claude/skills/deuz-sdk/scripts/` in the Deuz-SDK repository. `generate-api-index.mjs` rebuilds the index; `verify-skill.mjs` resolves every name against the real export table and fails the moment the package version or the API contract moves, so a release cannot let this drift silently.
 
-> Verified against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500 · 2026-09-20
+> Verified against @deuz-sdk/core@2.1.0 · api-contract sha256:cb9f41a77273 · 2026-09-26

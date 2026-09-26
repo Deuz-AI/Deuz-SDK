@@ -1,11 +1,11 @@
-<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
      sources: packages/core/src/types/{tool,config,guardrails,stream,message,methods}.ts, packages/core/src/{tool,agent,server-tools}.ts,
      packages/core/src/inference/{agent-tool,handoff,stop,loop-shared}.ts, docs/content/docs/reference/whats-new-2-0.mdx,
      docs/content/docs/agents/{tools,tool-loop,create-agent,client-tools,server-tools,subagents,handoffs,guardrails}.mdx -->
 
 # Tools, loops, agents, handoffs and guardrails
 
-**Load when:** the model has to call your code — tool definitions, multi-step loops, stop conditions and budgets, human approval, reusable agents, sub-agents, triage handoffs, or run-level guardrails. These examples cover the existing loop API. For 2.1 native validated output, strict persistence, inherited execution policy and fixed-DAG swarm, read `references/native-execution.md`.
+**Load when:** the model has to call your code — tool definitions, multi-step loops, stop conditions and budgets, human approval, reusable agents, sub-agents, triage handoffs, or run-level guardrails. These examples cover the existing loop API. For native validated output, strict persistence, inherited execution policy and swarms (fixed or dynamic, with leases), read `references/native-execution.md`.
 
 ## The `Tool` shape
 
@@ -336,12 +336,13 @@ Mechanics to plan around: interception is **deterministic** and happens **before
 
 ## Guardrails
 
-Three hooks, three verdicts, plain functions. Contract types on `CommonCallOptions`; built-in values on `@deuz-sdk/core/guardrails` (`promptInjectionGuardrail`, `maxOutputLength`, `PROMPT_INJECTION_POLICY` — the first two are also root and `/edge` exports).
+Four hooks, three verdicts, plain functions. Contract types on `CommonCallOptions`; built-in values on `@deuz-sdk/core/guardrails` (`promptInjectionGuardrail`, `maxOutputLength`, `maxToolResultLength` (2.2), `PROMPT_INJECTION_POLICY` — `promptInjectionGuardrail`, `maxOutputLength` and `maxToolResultLength` are also root and `/edge` exports).
 
 | Hook | Runs | `block` | `rewrite` |
 | --- | --- | --- | --- |
 | `onInput` | once per run leg, before any model call | run ends with `text: ''` and `stoppedBy: 'guardrail:input'`; **no provider request** | `{ messages }` replaces the history the run starts from |
 | `onToolCall` | per call, **before** the approval gate | `is_error` `tool_result`, run **continues** | `{ args }` substitutes what the gate and `execute` see |
+| `onToolResult` (2.2) | per executed tool, after it returns, **before the model sees it**; once the whole batch settled, in call order | the result becomes an `is_error` `tool_result` carrying the reason; run **continues** | `{ result }` replaces what the model sees — authoritative for history, `steps[].toolResults`, the stream part and the checkpoint |
 | `onOutput` | at a natural completion, after `doneWhen` + `verifyStep` | text suppressed, `replacement ?? ''` returned, `stoppedBy: 'guardrail:output'` | `{ text }` replaces the final answer |
 
 `undefined` and `{ action: 'pass' }` are the same thing and emit nothing. Each hook takes one guardrail or an ordered array: the array runs in order, rewrites **chain** (the next sees the previous one's output), the first `block` short-circuits that hook, and a **throw propagates** — a silently swallowed safety control is the worse failure. Order cheapest and most decisive first.
@@ -375,6 +376,37 @@ console.log(res.providerMetadata?.deuz?.stoppedBy, res.providerMetadata?.deuz?.g
 ```
 
 - **A blocked tool call joins the existing denial machinery:** an `is_error` `tool_result` naming the rule (`Blocked by guardrail 'shellPolicy': …`), a `denied` tool-state part, **exclusion from the runaway guard**, and the run continues. It never reaches the approval gate; a blocked *client* tool is answered in the same turn instead of breaking the loop. Observation reports the cause as `'server-denied'`.
+- **`onToolResult` sees only output a tool produced** (a success, or a throw/timeout as `isError: true` with the self-heal message); SDK-authored answers (denials, unknown tools, argument validation failures) never reach it. `ctx.toolCall` carries the arguments after any `onToolCall` rewrite. A **blocked result counts toward the runaway-error guard** (the tool did run), unlike a blocked call. It runs in `generateText`, `streamChat` and native `runAgent`; in a native run it guards the model-facing projection while the receipt keeps the raw result. Verdicts report `hook: 'tool-result'` with `toolCallId`. `maxToolResultLength(n, { mode?: 'truncate' | 'block' })` caps each result at `n` characters (non-strings measured as JSON) and tells the model how much it cut.
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+import type { ToolResultGuardrail } from '@deuz-sdk/core';
+import { maxToolResultLength } from '@deuz-sdk/core/guardrails';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const redactKeys: ToolResultGuardrail = (ctx) =>
+  typeof ctx.result === 'string' && /sk-[A-Za-z0-9]+/.test(ctx.result)
+    ? { action: 'rewrite', result: ctx.result.replace(/sk-[A-Za-z0-9]+/g, 'sk-[redacted]') }
+    : undefined;
+
+const res = await generateText({
+  model: createMockModel({
+    responses: [{ toolCalls: [{ toolName: 'readFile', args: { path: '.env' } }] }, { text: 'It sets a key.' }],
+  }),
+  prompt: 'What does .env configure?',
+  tools: {
+    readFile: {
+      description: 'Read a file',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      execute: async () => 'OPENAI_API_KEY=sk-live123456',
+    },
+  },
+  maxSteps: 3,
+  guardrails: { onToolResult: [redactKeys, maxToolResultLength(8_000)] },
+});
+console.log(res.steps?.[0]?.toolResults[0]?.result); // 'OPENAI_API_KEY=sk-[redacted]'
+```
+
 - **A tool-argument rewrite does not rewrite history.** The assistant turn and the `tool-call` part keep the arguments the *model* issued; only the gate and `execute` see the new ones. An **output** rewrite is the opposite — authoritative, so `response.messages`, `steps[]`, the checkpoint and the chat record all match what you were handed.
 - **Neither `stoppedBy` marker is an error,** and `finishReason` will not tell you (an input block reports `'stop'`). Every non-pass verdict emits one `guardrail` part (`{ hook, action, name?, reason?, toolCallId?, stepIndex? }`) and is collected on `providerMetadata.deuz.guardrails`; a rewrite carries no `reason`. Verdicts produced on a resume-leg settle carry no `stepIndex`.
 - **Names come from the function:** `const noSecrets: OutputGuardrail = …` reports `'noSecrets'`, but an anonymous array element reports nothing (and gives the model a vaguer message). Set one with `Object.defineProperty(fn, 'name', { value: 'myRule', configurable: true })` — a plain `fn.name = '…'` throws in strict mode. **Built-ins:** `promptInjectionGuardrail({ policy? })` prepends a spotlighting system turn built from `PROMPT_INJECTION_POLICY` (always a `rewrite`, so it always emits one part); `maxOutputLength(n, { mode?: 'truncate' | 'block' })` caps the final answer at `n` **characters** with a plain `slice`.

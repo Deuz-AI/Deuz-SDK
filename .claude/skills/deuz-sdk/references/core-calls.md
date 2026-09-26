@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
      sources: packages/core/src/types/config.ts, packages/core/src/types/methods.ts,
      packages/core/src/types/stream.ts, packages/core/src/types/message.ts,
      packages/core/src/types/deps.ts, packages/core/src/types/model.ts,
@@ -80,7 +80,7 @@ export async function POST(req: Request): Promise<Response> {
 
 ### Timeouts, abort, retry
 
-`timeout` is `number | { totalMs?, ttftMs?, stepMs?, toolMs? }`; a bare number means `{ totalMs }`. Only the layers you set are overridden; an explicit `0` **disables** a layer. Every timer is scheduled through `deps.clock`, never an ambient host timer.
+`timeout` is `number | { totalMs?, ttftMs?, stepMs?, toolMs?, chunkMs? }`; a bare number means `{ totalMs }`. Only the layers you set are overridden; an explicit `0` **disables** a layer. Every timer is scheduled through `deps.clock`, never an ambient host timer.
 
 | Layer | Scope | Default | Cleared by |
 | --- | --- | --- | --- |
@@ -88,8 +88,9 @@ export async function POST(req: Request): Promise<Response> {
 | `totalMs` | one model call — whole response | `300_000` | the call completing |
 | `stepMs` | one agentic step: the model call **plus** the tools it triggered | unbounded | the step ending |
 | `toolMs` | one tool `execute` (per call, not per step); `Tool.timeoutMs` overrides per tool | unbounded | the execution returning |
+| `chunkMs` (2.2) | one model call — the longest silence between two stream parts **after** content started | unbounded | every stream part re-arms it |
 
-A `stepMs` expiry cannot abort tools already running — that is `toolMs`. A tool timeout is self-healing: the execution is abandoned and the model gets an `is_error` `tool_result`, so nothing throws out of the call (it does count toward the runaway-tool guard).
+`chunkMs` catches a provider that stalls mid-answer (otherwise the call hangs until `totalMs`); before the first content `ttftMs` still governs, so a model that thinks first is not cut off. It fails with `TimeoutError` `layer: 'chunk'` — final on a stream, a fallback hop on a buffered call. A `stepMs` expiry cannot abort tools already running — that is `toolMs`. A tool timeout is self-healing: the execution is abandoned and the model gets an `is_error` `tool_result`, so nothing throws out of the call (it does count toward the runaway-tool guard).
 
 **Abort is not a timeout.** A user abort via `signal` resolves `finishReason: 'aborted'` with partial `usage`, no `error` part, `onUsage` with `meta.reason === 'aborted'`. A timeout is a **failure**: a `TimeoutError` `error` part and rejected promises. `abortSignal` is a deprecated alias for `signal`; if both are set, `signal` wins.
 

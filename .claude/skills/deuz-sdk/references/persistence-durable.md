@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
      sources: docs/content/docs/modules/stores.mdx, docs/content/docs/modules/chat-persistence.mdx,
      docs/content/docs/agents/durable-runtime.mdx, docs/content/docs/agents/unbreakable-chatbot.mdx,
      docs/content/docs/reference/whats-new-2-0.mdx, packages/core/src/durable.ts,
@@ -6,13 +6,15 @@
      packages/core/src/node/store-sqlite.ts, packages/core/src/node/store-redis.ts,
      packages/core/src/node/store-postgres.ts, packages/core/src/node/chat-store.ts,
      packages/core/src/node/runtime.ts, packages/core/src/types/session.ts,
-     packages/core/src/types/runtime.ts, packages/core/src/types/config.ts -->
+     packages/core/src/types/runtime.ts, packages/core/src/types/config.ts,
+     packages/core/src/node/{ops-sqlite,ops-postgres,swarm-postgres,budget-sqlite,budget-postgres,evolve-sqlite}.ts,
+     docs/content/docs/modules/operations.mdx -->
 
 # Persistence: stores, chat history, checkpoints and resumable runs
 
-**Load when:** picking a database for an AI feature, persisting a conversation across requests, making an agent survive a crash, a deploy or an approval a human answers hours later, resuming a chat stream after F5, or running long agent jobs in the background.
+**Load when:** picking a database for an AI feature, persisting a conversation across requests, making an agent survive a crash, a deploy or an approval a human answers hours later, resuming a chat stream after F5, running long agent jobs in the background, or choosing the SQLite / Postgres backend for native runs, swarms, leases and persistent budgets.
 
-The store packs and checkpoints below belong to the existing APIs. Native 2.1 `runAgent` uses a separate strict `AgentRunStore`; swarm uses atomic `SwarmStore` snapshots/events and the Node-only `/swarm/sqlite` adapter. These stores are not interchangeable. See `references/native-execution.md` for approval recovery, interrupted-effect reconciliation and process-ownership limits.
+The store packs and checkpoints below belong to the existing APIs. Native `runAgent` uses a separate strict `AgentRunStore`; swarm uses atomic `SwarmStore` snapshots/events. Their durable backends (2.2) are in [Native, swarm and ops backends](#native-swarm-and-ops-backends-22) below. These stores are not interchangeable. See `references/native-execution.md` for approval recovery, interrupted-effect reconciliation, leases and cross-process operations.
 
 ## The four seams
 
@@ -104,6 +106,50 @@ Tables are `deuz_memory`, `deuz_chats`, `deuz_sessions`, `deuz_runs` (+ `deuz_me
 Postgres specifics worth planning around: `migrate()` is idempotent and memoized, a *failed* attempt is not cached, and the whole DDL batch is one multi-statement query wrapped in `BEGIN … COMMIT` (a separate `query('BEGIN')` can land on a different pooled connection). `CREATE SCHEMA` and `CREATE EXTENSION vector` are **never** issued — the app connection needs `CREATE` on the schema, `SELECT` on `pg_extension`, and ordinary DML. A `deuz_meta.schema_version` newer than the SDK understands makes `migrate()` refuse with `InvalidRequestError` instead of corrupting rows during a rolling deploy. `dimensions` is checked against `pg_attribute` and a mismatch refuses to migrate rather than "succeeding" and failing every write; changing the embedding model later means an `ALTER COLUMN … TYPE vector(D)` **and** re-embedding every row.
 
 Redis has no migration story at all: `prefix` is the entire isolation boundary, changing it migrates nothing (old keys stay, invisible), and no key carries a TTL.
+
+## Native, swarm and ops backends (2.2)
+
+The store packs above never hold native agent runs, swarms, leases, persistent budgets or evolve populations. Those have their own backends, each keeping its own schema-version table (never `PRAGMA user_version`):
+
+| Holds | Memory (tests, one process) | SQLite (Node, one machine) | Postgres (Node, many machines) |
+| --- | --- | --- | --- |
+| Native `AgentRunStore` | `createInMemoryAgentRunStore` (`/agent`) | `createSqliteOpsStore(...).agentRuns` (`/ops/sqlite`) | `createPostgresOpsStore(...).agentRuns` (`/ops/postgres`) |
+| `LeaseProvider` | `createInMemoryLeaseProvider` (`/ops`) | `createSqliteOpsStore(...).leases` | `createPostgresOpsStore(...).leases` |
+| `SwarmStore` | `createInMemorySwarmStore` (`/swarm`) | `createSqliteSwarmStore` (`/swarm/sqlite`) | `createPostgresSwarmStore` (`/swarm/postgres`) |
+| `BudgetStore` | `createInMemoryBudgetStore` (`/agent`) | `createSqliteBudgetStore` (`/ops/sqlite`) | `createPostgresBudgetStore` (`/ops/postgres`) |
+| `PopulationStore` (evolve) | `createInMemoryPopulationStore` (`/evolve`) | `createSqlitePopulationStore` (`/evolve/sqlite`) | — |
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createSwarm } from '@deuz-sdk/core/swarm';
+import { createSqliteSwarmStore } from '@deuz-sdk/core/swarm/sqlite';
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const model = createMockModel({ responses: [{ text: 'ok' }] });
+
+// One file can hold swarms, leases and agent runs; every process runs this same code.
+const store = createSqliteSwarmStore({ path: './runs.sqlite' });
+const ops = createSqliteOpsStore({ path: './runs.sqlite' });
+const swarm = createSwarm({
+  agents: { worker: { agent: createAgent({ model }), version: 'worker-v1' } },
+  store,
+  definitionVersion: 'jobs-v1',
+  lease: { provider: ops.leases, ttlMs: 30_000 },
+});
+
+try {
+  for (const handle of await swarm.recover({ scope: 'tenant-a' })) await handle.result;
+} finally {
+  await store.close();
+  await ops.close();
+}
+```
+
+- **SQLite** writes in `BEGIN IMMEDIATE`, so several processes can share a file. Lease times and budget windows come from the store's `clock` (the host clock by default): processes sharing a file need synchronised clocks. `database` accepts an injected `SqliteDatabaseLike` (better-sqlite3), which `close()` then closes.
+- **SQLite swarm schema 2 is a one-way upgrade.** The first 2.2 open of a 2.1 swarm file adds indexed `status` / `updated_at` columns and a channel table in one transaction; existing runs resume. **2.1 then refuses the file — copy it before the first 2.2 open** if you may roll back.
+- **Postgres** takes any `PgClientLike` and `schema?` (default `'public'`, must exist; tables are created on first use). Pools may run consecutive queries on different connections, so every write is **one statement**: a swarm commit updates the run row only at the expected revision and gates every task, channel and event write on it; a budget admission locks its scope rows in the same statement. Leases and budget windows use the **database clock**.
+- **Native agent run revisions.** `AgentRunEnvelope.revision` increases on every save; the SQLite, Postgres and in-memory agent run stores reject anything but stored + 1 (a 2.1 envelope without one counts as 0). A custom `AgentRunStore` should enforce the same rule to fence a stale executor.
 
 ## Wiring a pack into one call
 
@@ -399,3 +445,5 @@ export async function sweepStale(): Promise<void> {
 - [/docs/modules/memory](/docs/modules/memory) — the `MemoryStore` seam, scope rules, TTL sweeping and the recall/extract pipeline.
 - [/docs/modules/ui-streaming](/docs/modules/ui-streaming) — `StreamStateStore`, wire v2, `resumeDeuzStreamResponse` and `connectDeuzStream`.
 - [/docs/reference/whats-new-2-0](/docs/reference/whats-new-2-0) — what the store packs added, and the known-limits list they belong to.
+- [/docs/modules/operations](/docs/modules/operations) — leases, drain, recovery, cross-process cancellation, and the SQLite / Postgres ops and swarm backends.
+- [/docs/reference/whats-new-2-2](/docs/reference/whats-new-2-2) — the one-way SQLite swarm upgrade and what 2.1 can no longer read.

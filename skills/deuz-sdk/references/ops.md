@@ -1,5 +1,6 @@
-<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
-     sources: docs/content/docs/modules/{observability,pricing,middleware}.mdx,
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
+     sources: docs/content/docs/modules/{observability,pricing,middleware,budgets}.mdx,
+     packages/core/src/{budget-ledger,budget-store}.ts, packages/core/src/types/{execution,budget-store}.ts,
      docs/content/docs/reference/observe-events.mdx, docs/content/docs/advanced/resilience.mdx,
      skills/deuz-sdk/rules/pitfalls.md, packages/core/src/{observe,otel,pricing,middleware,errors}.ts,
      packages/core/src/node/observe.ts, packages/core/src/inference/stop.ts,
@@ -8,7 +9,7 @@
 
 # Production operations: observability, cost, middleware, resilience
 
-**Load when:** you need traces, run reports, OTel export, USD cost or budgets, model-level layers (logging, caching, PII redaction, injection guard), retries, timeouts, cross-provider failover, or a circuit breaker — i.e. anything you would have reached for LangSmith, Langfuse, `@ai-sdk/otel`, or a hand-rolled retry wrapper to get.
+**Load when:** you need traces, run reports, OTel export, USD cost or budgets (including persistent per-user/org budgets), model-level layers (logging, caching, PII redaction, injection guard), retries, timeouts, cross-provider failover, or a circuit breaker — i.e. anything you would have reached for LangSmith, Langfuse, `@ai-sdk/otel`, or a hand-rolled retry wrapper to get.
 
 Everything here is local-first and injected. There is no hosted service, no account, no data leaving your process, and core imports none of it — you wire it through the one `Dependencies` seam on `deps` (per call) or `createClient({ deps })` (per app). A per-call `deps` field overrides the client's.
 
@@ -272,6 +273,43 @@ Sharp edges:
 - No `priceProvider`, or an unknown model → no `cost` parts and no errors. A throwing provider logs a warning and the part is skipped.
 - `UsageMeta` carries no dollars, by design: `{ model, reason: 'finished' | 'aborted' | 'error', ttftMs?, agentPath? }`. Compute cost inside your own `onUsage`.
 
+### Budgets that outlive a run (2.2)
+
+The `budget` option and a native execution ledger bound **one** run. A per-user daily cap, an org's monthly dollars or a thread's lifetime tokens need a shared `BudgetStore`: pass `admission` to `createExecutionContext` (native `runAgent`, swarms, evolve). After the ledger's own check, every potentially billable attempt is admitted **all-or-nothing** against every persistent scope; a denial fails the run before the model call with `BudgetLedgerError` code `budget_exceeded`.
+
+```ts
+import { createExecutionContext, createInMemoryBudgetStore, runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const model = createMockModel({ responses: [{ text: 'done' }] });
+const store = createInMemoryBudgetStore(); // createSqliteBudgetStore (/ops/sqlite) or createPostgresBudgetStore (/ops/postgres) across processes
+
+const result = await runAgent({
+  model,
+  prompt: 'Summarise the ticket.',
+  execution: createExecutionContext({
+    scopeId: 'run-7',
+    admission: {
+      store,
+      scopes: [
+        { key: 'user:42', limits: { tokens: 50_000 }, window: { ms: 86_400_000, buckets: 24 } },
+        { key: 'org:acme', limits: { usd: 200 } }, // lifetime: no window
+      ],
+      warnAtPercent: 80,
+      onWarning: (w) => console.warn(`${w.key} at ${Math.round(w.percent)}% of ${w.dimension}`),
+    },
+  }),
+  executionEstimate: { tokens: 100, usd: 0.1 }, // a bounded dimension needs an estimate
+  deps: { priceProvider: { priceUsage: () => 0.01 } }, // a USD scope needs prices or the USD estimate stays held
+});
+console.log(result.status, await store.usage('user:42'));
+```
+
+- Settlement and release are mirrored; **unknown usage keeps the full hold**. Requests are idempotent by request ID. A store failure is `admission_failed` and changes nothing locally.
+- A scope that bounds a dimension needs an estimate for it (`missing_reservation` otherwise). The first request fixes a key's `window`; a different window later is rejected.
+- `snapshot()` then records the scopes (execution snapshot version 2, which 2.1 refuses). Restoring needs the store again: `createExecutionContext({ snapshot, admission: { store } })`; scopes passed on restore can only add or tighten.
+- A crash-leaked hold stays charged to a lifetime budget and leaves a windowed one with its bucket — fail-closed by design. SQLite windows use the store `clock` (share one across processes); Postgres uses database time. Stores never prune history.
+
 ## Middleware
 
 `wrapModel(model, middleware[])` returns a `WrappedModel` — `{ model, streamChat, generateText }` with the model pre-bound, so you pass call options without `model`. It is a thin client, **not** a `LanguageModel`: don't hand the object to something expecting a descriptor.
@@ -337,8 +375,9 @@ Writing your own: a `LanguageModelMiddleware` is a plain object with an optional
 | `totalMs` | one model call, end to end | 300 000 |
 | `stepMs` | one agentic step: the model call **plus** the tools it triggered | unbounded |
 | `toolMs` | one tool `execute` (`Tool.timeoutMs` overrides it per tool) | unbounded |
+| `chunkMs` (2.2) | one model call: the longest silence between two stream parts once content flows; every part re-arms it | unbounded |
 
-An explicit `0` disables a layer — that is how you drop the 300s ceiling a 25s serverless budget makes meaningless. Your own `signal` merges with all of them; the tightest bound wins. A fired timer produces a `TimeoutError` whose `layer` is `'connect' | 'ttft' | 'total' | 'step' | 'tool'` — a genuine failure, never retried. A **user abort is not a failure**: `finishReason` resolves to `'aborted'` and `usage` resolves with partial counts, with no `error` part.
+An explicit `0` disables a layer — that is how you drop the 300s ceiling a 25s serverless budget makes meaningless. Your own `signal` merges with all of them; the tightest bound wins. A fired timer produces a `TimeoutError` whose `layer` is `'connect' | 'ttft' | 'total' | 'step' | 'tool' | 'chunk'` — a genuine failure, never retried. Set `chunkMs` to fail a provider that stalls mid-answer instead of holding the call until `totalMs`; before the first content the TTFT layer still governs, and a buffered call fails over on `'chunk'` like on `'ttft'` / `'total'`. A **user abort is not a failure**: `finishReason` resolves to `'aborted'` and `usage` resolves with partial counts, with no `error` part.
 
 **Cross-provider failover.** Because the whole conversation is canonical, the next candidate receives the identical request. Two equivalent surfaces: the `fallbackModels` call option, or the `withFallback` middleware (which additionally gives you `shouldFallback` and `onFallback`). Streaming hops only **pre-first-content**; buffered calls hop on any fallback-worthy rejection. What hops by default: `BreakerOpenError`, `NetworkError`, transport-layer `TimeoutError` (not `'step'`/`'tool'`, which are caller budgets), and retryable/5xx `APICallError`. Client errors never hop — they would fail identically everywhere. Each candidate keeps its own retry budget; failover engages after a candidate's final failure. The winner carries `providerMetadata.deuz.failedOver = { from, to, reason }`.
 
@@ -394,9 +433,10 @@ Honest caveats: pick fallbacks whose capabilities cover the call (a tool-heavy c
 - [/docs/modules/observability](/docs/modules/observability) — observers, capture, composition, the tracer bridge and `tracerMode`.
 - [/docs/reference/observe-events](/docs/reference/observe-events) — the full event catalog, `ObservedError`, canonical orderings.
 - [/docs/modules/pricing](/docs/modules/pricing) — `Usage` anatomy, `onUsage`, the price table, the live cost stream and the budget guardrail.
+- [/docs/modules/budgets](/docs/modules/budgets) — persistent `BudgetStore` scopes, rolling windows, warnings, SQLite and Postgres stores.
 - [/docs/modules/middleware](/docs/modules/middleware) — `wrapModel`, the hook interface, every bundled layer, writing your own.
 - [/docs/advanced/resilience](/docs/advanced/resilience) — retry policy, timeout layers, the circuit breaker, cross-provider failover.
-- [/docs/core/prompts-and-timeouts](/docs/core/prompts-and-timeouts) — the `timeout` option's four scopes in prose.
+- [/docs/core/prompts-and-timeouts](/docs/core/prompts-and-timeouts) — the `timeout` option's scopes in prose.
 - [/docs/core/dependencies](/docs/core/dependencies) — the whole `Dependencies` seam, `createClient`, G10/G11.
 - [/docs/core/errors](/docs/core/errors) — the `DeuzError` taxonomy, `isRetryable`, `retryAfterMs`.
 - [/docs/agents/guardrails](/docs/agents/guardrails) — run-level pass/block/rewrite hooks and the guardrail twin of `promptInjectionGuard`.

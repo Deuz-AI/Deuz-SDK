@@ -6,6 +6,55 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## 2.2.0
+
+**Dynamic swarms, durable operations and evolve.** Swarms grow at runtime,
+share notes and move between processes; budgets outlive a run; seven new
+subpaths. Call sites from 2.1 keep working, but the SQLite swarm file and
+version 2 runs and ledger snapshots move forward only. Upgrade notes, widened
+unions and operational limits are on [What is new in 2.2](/docs/reference/whats-new-2-2).
+
+- **Scale** — `BudgetLedger.compact` folds finished scopes into ancestor
+  aggregates (ledger snapshot version 2), native runs under a shared child
+  context checkpoint only their ledger slice, event readers poll the optional
+  `SwarmStore.head()`, and `timeout.chunkMs` fails a stalled stream with
+  `TimeoutError` layer `'chunk'`. Native tools can declare
+  `replay: 'idempotent'` and read `ctx.modelStep`.
+- **Dynamic swarms** — `dynamic` limits, `context.spawn` in reducers and
+  `spawn(output)` on agent bindings, committed atomically with the parent's
+  terminal state; `onFailure` compensation tasks and per-task `timeoutMs`.
+  Dynamic runs are version 2 and need a store with `'spawn'`.
+  → [Swarm](/docs/modules/swarm#dynamic-tasks)
+- **Blackboards, soft dependencies and rounds** — task `group`s with idempotent
+  `blackboard_post` / `blackboard_read` tools over durable channels,
+  `context.readChannel`, `after` with `context.settled`, and `createRounds` for
+  group-parallel rounds with a consolidator.
+- **Durability operations** (`/ops`, `/ops/sqlite`, `/ops/postgres`,
+  `/swarm/postgres`) — swarm leases with `SwarmLeaseError` `'held'` / `'lost'`,
+  `handle.drain()`, `swarm.recover()`, `swarm.requestCancel(key)`,
+  `expectedRevision` / `expectedStatus` on resume, a revision-gated Postgres
+  swarm store, and revision-fenced native agent run stores.
+  → [Operations](/docs/modules/operations)
+- **Persistent budgets** — `admission: { store, scopes, warnAtPercent, onWarning }`
+  admits every model call all-or-nothing against shared scopes such as
+  `user:42`, with rolling windows. Memory, SQLite and Postgres budget stores.
+  → [Budgets](/docs/modules/budgets)
+- **Evolve** (`/evolve`, `/evolve/sqlite`) — evolutionary program search over
+  evolve blocks with diffs, rewrites and crossovers, an evaluation cascade,
+  islands, a MAP-Elites archive, a UCB1 model bandit, a mandatory budget and
+  zero-call resume. → [Evolve](/docs/modules/evolve)
+- **Schedules and signals** (`/schedule`) — five-field UTC cron,
+  `createScheduler` with `tick` / `start`, claim-based dedupe and catch-up, and
+  WebCrypto GitHub, Slack and HMAC verifiers behind `handleSignal`.
+  → [Schedules and signals](/docs/modules/schedule)
+- **Polish** — `createCohereReranker` and `createVoyageReranker`, the
+  `onToolResult` guardrail hook with `maxToolResultLength`, and MCP
+  `fingerprintTools` / `detectToolDrift`.
+
+Back up SQLite swarm files before the first 2.2 open: the in-place upgrade to
+schema 2 is one-way and 2.1 refuses the upgraded file. Custom `BudgetLedger`
+implementations and hand-built reducer contexts need the new required members.
+
 ## 2.1.0
 
 **Native agents and durable swarm DAGs.** The new engine is opt-in; existing
