@@ -164,9 +164,11 @@ The same `ops.claims` is a `dedupe` for `handleSignal`, [below](#turn-a-signal-i
 
 <Callout type="info" title="Claimed keys accumulate">
   `deuz_claims` keeps one row per granted key (`key`, and `claimed_at` in epoch milliseconds: the
-  store's clock on SQLite, the database clock on Postgres). Only `release` removes a row. Prune old
-  rows on your own schedule, keeping every key a tick could still look back to (`lookbackMs`) and
-  every delivery id a sender could still redeliver:
+  store's clock on SQLite, the database clock on Postgres). A key longer than 512 characters (too
+  long for a Postgres index) or holding a NUL (which Postgres text rejects) is kept as `sha256:`
+  plus its hex SHA-256 on both stores, and still claims and releases exactly. Only `release`
+  removes a row. Prune old rows on your own schedule, keeping every key a tick could still look back
+  to (`lookbackMs`) and every delivery id a sender could still redeliver:
   `DELETE FROM deuz_claims WHERE claimed_at < $cutoff`.
 </Callout>
 
