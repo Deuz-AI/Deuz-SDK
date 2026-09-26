@@ -13,6 +13,7 @@ import type { CitationPart } from './types/stream';
 import type { ModelCapabilities } from './core/registry';
 import { DeuzError } from './errors';
 import { cosineSimilarity } from './internal/vector';
+import { createHostedReranker, type HostedRerankerSettings } from './internal/rerank-http';
 
 // ===================================================================
 // Typed errors
@@ -565,14 +566,47 @@ export interface Reranker {
 }
 
 /**
- * Default reranker: keep the highest-scoring candidates, truncate to topN
- * (a real cross-encoder rerank is DEFERRED). Sorts defensively so it does not
- * rely on the upstream store already being score-ordered.
+ * Default reranker: keep the highest-scoring candidates, truncate to topN.
+ * Sorts defensively so it does not rely on the upstream store already being
+ * score-ordered. For a real cross-encoder pass, plug in
+ * {@link createCohereReranker} or `createVoyageReranker` from
+ * `@deuz-sdk/core/voyage`.
  */
 export const identityReranker: Reranker = {
   rerank: async (_query, candidates, topN) =>
     [...candidates].sort((a, b) => b.score - a.score).slice(0, topN),
 };
+
+/** Settings for {@link createCohereReranker}. */
+export type CohereRerankerSettings = HostedRerankerSettings;
+
+/** Cohere's current rerank model — the {@link createCohereReranker} default. */
+export const COHERE_RERANK_DEFAULT_MODEL = 'rerank-v4.0-pro';
+
+/**
+ * A {@link Reranker} backed by Cohere's `POST /v2/rerank` cross-encoder (2.2).
+ * The candidates' `text` is sent as `documents`; each returned `index` maps back
+ * to its original chunk, whose `score` becomes Cohere's `relevance_score`
+ * (0–1, best first). Returns `min(topN, topK)` chunks.
+ *
+ * Key precedence: `deps.keyProvider.getKey('cohere')` > `apiKey` > an
+ * `AuthenticationError` before any request. Transport: `fetch` > `deps.fetch`.
+ * HTTP failures map onto the usual `DeuzError` classes (429 `RateLimitError`,
+ * 401/403 `AuthenticationError`, other 4xx `InvalidRequestError`, 5xx a
+ * retryable `APICallError`). One call, no retries: wrap it if you need them.
+ */
+export function createCohereReranker(settings: CohereRerankerSettings = {}): Reranker {
+  return createHostedReranker(
+    {
+      provider: 'cohere',
+      defaultBaseURL: 'https://api.cohere.com/v2',
+      defaultModel: COHERE_RERANK_DEFAULT_MODEL,
+      countField: 'top_n',
+      results: (json) => (json as { results?: unknown } | null)?.results,
+    },
+    settings,
+  );
+}
 
 export interface CitationOptions {
   /** Max snippet characters carried on the part (default 200; 0 = no snippet). */
