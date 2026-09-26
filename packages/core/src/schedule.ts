@@ -1,0 +1,8 @@
+/**
+ * `@deuz-sdk/core/schedule` (2.2): cron schedules and verified signals.
+ * `parseCron` and friends evaluate five-field UTC cron; `createScheduler`
+ * turns due occurrences into deduplicated runs, driven by a host cron trigger
+ * (`tick`) or an injected clock (`start`). Edge-safe.
+ */
+export type { CronSchedule } from './schedule/cron';
+export { parseCron, nextOccurrence, previousOccurrence, occurrencesBetween } from './schedule/cron';
