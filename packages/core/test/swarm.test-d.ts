@@ -1,11 +1,15 @@
 import { expectTypeOf, test } from 'vitest';
 import { createAgent } from '../src/agent';
-import type { AgentResult, NativeExecutionContext } from '../src/agent';
-import { createInMemorySwarmStore, createRounds, createSwarm } from '../src/swarm';
+import type { AgentResult, AgentRunEnvelope, NativeExecutionContext } from '../src/agent';
+import { createInMemorySwarmStore, createRounds, createSwarm, SwarmLeaseError } from '../src/swarm';
 import type {
   RoundsDecision,
   RoundsGroupPlan,
   Swarm,
+  SwarmCancelRequest,
+  SwarmLeaseOptions,
+  SwarmResumeOptions,
+  SwarmRunQuery,
   SwarmAgentBinding,
   SwarmChannelEntry,
   SwarmChannelPost,
@@ -192,7 +196,7 @@ test('2.2 dynamic swarm surface: spawn requests, hooks, limits and capabilities'
 });
 
 test('2.2 blackboard, soft dependencies and rounds surface', () => {
-  expectTypeOf<SwarmStoreCapability>().toEqualTypeOf<'spawn' | 'channels'>();
+  expectTypeOf<SwarmStoreCapability>().toEqualTypeOf<'spawn' | 'channels' | 'list'>();
   expectTypeOf<SwarmTask['group']>().toEqualTypeOf<string | undefined>();
   expectTypeOf<SwarmTask['after']>().toEqualTypeOf<readonly string[] | undefined>();
   expectTypeOf<SwarmAgentBinding['blackboard']>().toEqualTypeOf<
@@ -231,4 +235,26 @@ test('2.2 blackboard, soft dependencies and rounds surface', () => {
   expectTypeOf<RoundsDecision['groups']>().toEqualTypeOf<
     Readonly<Record<string, RoundsGroupPlan>> | undefined
   >();
+});
+
+test('2.2 durability operations surface', () => {
+  expectTypeOf<ReturnType<SwarmHandle['drain']>>().toEqualTypeOf<Promise<SwarmOutcome>>();
+  expectTypeOf<SwarmCancelRequest>().toEqualTypeOf<'signalled' | 'recorded' | 'settled'>();
+  expectTypeOf<ReturnType<Swarm['requestCancel']>>().toEqualTypeOf<Promise<SwarmCancelRequest>>();
+  expectTypeOf<Parameters<Swarm['recover']>>().toEqualTypeOf<
+    [options?: { scope?: string; limit?: number }]
+  >();
+  expectTypeOf<ReturnType<Swarm['recover']>>().toEqualTypeOf<Promise<SwarmHandle[]>>();
+  expectTypeOf<SwarmResumeOptions['expectedRevision']>().toEqualTypeOf<number | undefined>();
+  expectTypeOf<SwarmResumeOptions['expectedStatus']>().toEqualTypeOf<
+    SwarmRunRecord['status'] | undefined
+  >();
+  expectTypeOf<SwarmOptions['lease']>().toEqualTypeOf<SwarmLeaseOptions | undefined>();
+  expectTypeOf<SwarmLeaseOptions['ttlMs']>().toEqualTypeOf<number | undefined>();
+  expectTypeOf<SwarmStore['listRuns']>().toEqualTypeOf<
+    ((query: SwarmRunQuery) => Promise<SwarmRunRecord[]>) | undefined
+  >();
+  expectTypeOf<'run.drained'>().toExtend<SwarmEvent['type']>();
+  expectTypeOf(new SwarmLeaseError('held').code).toEqualTypeOf<'held' | 'lost'>();
+  expectTypeOf<AgentRunEnvelope['revision']>().toEqualTypeOf<number | undefined>();
 });

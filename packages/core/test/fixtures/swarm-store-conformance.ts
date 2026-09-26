@@ -67,7 +67,7 @@ const child = (id: string, extra: Partial<SwarmTaskRecord> = {}): SwarmTaskRecor
 export function swarmStoreContracts(
   name: string,
   make: () => SwarmStore,
-  options: { spawn?: boolean; channels?: boolean } = {},
+  options: { spawn?: boolean; channels?: boolean; list?: boolean } = {},
 ): void {
   describe(name, () => {
     it('atomically rolls back invalid multi-task writes and event publication', async () => {
@@ -214,6 +214,54 @@ export function swarmStoreContracts(
           expect(after?.tasks[0]?.status, label).toBe('pending');
           expect(after?.run.revision, label).toBe(1);
         }
+      });
+    }
+
+    if (options.list) {
+      const at = (scope: string, runId: string, updatedAt: number): SwarmSnapshot => {
+        const snapshot = initialSnapshot(scope);
+        return { ...snapshot, run: { ...snapshot.run, runId, createdAt: updatedAt, updatedAt } };
+      };
+      const ids = (runs: readonly { scope: string; runId: string }[]) =>
+        runs.map((run) => `${run.scope}/${run.runId}`);
+
+      it('declares the list capability', () => {
+        expect(make().capabilities).toContain('list');
+      });
+
+      it('lists runs by status and scope, ordered by updatedAt then scope and runId', async () => {
+        const store = make();
+        await store.create(at('a', 'r1', 5), []);
+        await store.create(at('b', 'r1', 3), []);
+        await store.create(at('a', 'r2', 3), []);
+        await store.create(at('a', 'r3', 9), []);
+        await store.commit({
+          scope: 'a',
+          runId: 'r3',
+          expectedRevision: 0,
+          run: { status: 'suspended', updatedAt: 1 },
+        });
+        expect(ids(await store.listRuns!({ limit: 10 }))).toEqual(['a/r3', 'a/r2', 'b/r1', 'a/r1']);
+        expect(ids(await store.listRuns!({ status: 'running', limit: 10 }))).toEqual([
+          'a/r2',
+          'b/r1',
+          'a/r1',
+        ]);
+        expect(ids(await store.listRuns!({ scope: 'a', limit: 10 }))).toEqual([
+          'a/r3',
+          'a/r2',
+          'a/r1',
+        ]);
+        expect(ids(await store.listRuns!({ scope: 'a', status: 'running', limit: 1 }))).toEqual([
+          'a/r2',
+        ]);
+        expect(await store.listRuns!({ status: 'completed', limit: 10 })).toEqual([]);
+        const [first] = await store.listRuns!({ limit: 1 });
+        expect(first).toEqual((await store.load({ scope: 'a', runId: 'r3' }))?.run);
+        first!.status = 'cancelled';
+        expect((await store.listRuns!({ limit: 1 }))[0]?.status).toBe('suspended');
+        await expect(store.listRuns!({ limit: 0 })).rejects.toThrow();
+        await expect(store.listRuns!({ limit: 1001 })).rejects.toThrow();
       });
     }
 

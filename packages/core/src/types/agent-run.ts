@@ -103,6 +103,12 @@ export interface AgentRunEnvelope {
   kind: 'deuz-agent-run';
   version: 1;
   runId: string;
+  /**
+   * Increases by one on every save (2.2). Durable stores reject a save that is
+   * not the stored revision plus one, which fences out an executor that lost
+   * the run. A 2.1 envelope has none and counts as 0.
+   */
+  revision?: number;
   scope: string;
   phase: 'running' | 'finalizing' | 'terminal';
   messages: Message[];
@@ -145,7 +151,10 @@ export interface AgentToolReceipt {
 
 export interface AgentRunStore {
   load(runId: string): AgentRunEnvelope | undefined | Promise<AgentRunEnvelope | undefined>;
-  /** Must durably commit before resolving; failures stop execution. */
+  /**
+   * Must durably commit before resolving; failures stop execution. Durable
+   * stores (2.2) reject an envelope whose revision is not the stored one plus one.
+   */
   save(envelope: AgentRunEnvelope): void | Promise<void>;
 }
 

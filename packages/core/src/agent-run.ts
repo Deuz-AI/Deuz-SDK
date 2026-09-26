@@ -38,6 +38,7 @@ import { prepareAgentTools } from './inference/agent-tools';
 import { createExecutionContext, intersectExecutionPolicies } from './execution-policy';
 import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
+import { assertEnvelopeRevision } from './ops';
 
 export type * from './types/agent-run';
 
@@ -115,6 +116,7 @@ export function createInMemoryAgentRunStore(): AgentRunStore {
       return value ? structuredClone(value) : undefined;
     },
     save: (envelope) => {
+      assertEnvelopeRevision(runs.get(envelope.runId), envelope);
       runs.set(envelope.runId, structuredClone(envelope));
     },
   };
@@ -188,6 +190,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     if (common?.execution) envelope.execution = executionSnapshot(common.execution);
     if (!options.session || !admitted) return Promise.resolve();
     persistedLedger = ledgerKey(envelope.execution);
+    // Every actual save advances the fence durable stores check (2.2).
+    envelope.revision = (envelope.revision ?? 0) + 1;
     const snapshot = structuredClone(envelope);
     const write = writeTail.then(() => options.session!.store.save(snapshot));
     writeTail = write.catch((error) => {

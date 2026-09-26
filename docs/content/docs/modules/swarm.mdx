@@ -412,14 +412,25 @@ silently adopting new behavior.
 
 ## Operational boundary
 
-This release supports one executor for a run. The scheduler rejects overlapping
-executors using the same store object, and stores enforce revision checks.
-Multiple processes or independent SQLite connections must not concurrently drive
-the same run; there is no distributed lease or worker takeover protocol.
+One executor drives a run at a time. The scheduler rejects overlapping executors
+using the same store object, and stores enforce revision checks, so a stale
+writer's commit is rejected rather than applied.
 
-The in-memory store is volatile. SQLite atomically commits task changes, run
-state and journal events, and fails closed on write errors or unsupported schema
-versions. These transactions do not include external APIs. Exactly-once external
-effects still require the service's idempotency mechanism or application
-reconciliation. Runtime task spawning requires `dynamic` limits; there are no
-distributed workers or cross-process cancellation service yet.
+Several processes can share runs with the `lease` option (2.2). The executor
+holding a run's lease drives it and renews the lease on a heartbeat; a second
+executor's `run` or `resume` fails with `SwarmLeaseError` code `'held'`, and an
+executor that loses its lease stops before its next write. `handle.drain()`,
+`swarm.recover()` and `swarm.requestCancel(key)` drain a run for a deploy, take
+over runs whose executor died, and cancel a run from any process. See
+[Operations](/docs/modules/operations) for leases, the SQLite and Postgres
+backends (`@deuz-sdk/core/ops/sqlite`, `@deuz-sdk/core/swarm/postgres`) and
+their clock requirements. Without a lease provider, do not drive one run from
+several processes.
+
+The in-memory store is volatile. SQLite and Postgres atomically commit task
+changes, run state and journal events, and fail closed on write errors or
+unsupported schema versions. These transactions do not include external APIs.
+Exactly-once external effects still require the service's idempotency mechanism
+or application reconciliation: a task interrupted by a takeover follows the
+same `replay` rules as one interrupted by a crash. Runtime task spawning
+requires `dynamic` limits.

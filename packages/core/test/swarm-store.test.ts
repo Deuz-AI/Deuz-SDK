@@ -26,6 +26,7 @@ afterEach(async () => {
 swarmStoreContracts('memory swarm store', createInMemorySwarmStore, {
   spawn: true,
   channels: true,
+  list: true,
 });
 describe.skipIf(!DatabaseSync)('SQLite swarm store', () => {
   swarmStoreContracts(
@@ -35,7 +36,7 @@ describe.skipIf(!DatabaseSync)('SQLite swarm store', () => {
       cleanup.push(() => store.close());
       return store;
     },
-    { spawn: true, channels: true },
+    { spawn: true, channels: true, list: true },
   );
   it('reopens task/result/event journal and leaves the existing global schema version intact', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'deuz-swarm-'));
