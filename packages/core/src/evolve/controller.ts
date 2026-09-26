@@ -29,7 +29,8 @@ import {
   rankCandidates,
   updateArchive,
 } from './selection';
-import { evolveCandidateId, validateEvolveKey } from './store';
+import { EvolveLeaseError, evolveCandidateId, validateEvolveKey } from './store';
+import type { Lease } from '../types/lease';
 import type {
   EvolveArtifacts,
   EvolveCandidate,
@@ -109,6 +110,12 @@ function normalize(options: EvolveOptions): Config {
     fail('mutationsPerGeneration must be a positive integer');
   if (options.concurrency !== undefined && !positiveInteger(options.concurrency))
     fail('concurrency must be a positive integer');
+  if (options.lease !== undefined) {
+    if (typeof options.lease?.provider?.acquire !== 'function')
+      fail('lease.provider must be a LeaseProvider');
+    const ttl = options.lease.ttlMs ?? 30_000;
+    if (!Number.isSafeInteger(ttl) || ttl < 3) fail('lease ttlMs must be an integer of at least 3');
+  }
   const budget = options.budget;
   if (
     !budget ||
@@ -329,6 +336,49 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
       updatedAt: deps.clock.now(),
     });
     const saveRun = () => write(() => store.saveRun(withState()));
+
+    // Cross-process liveness (2.2): one lease per run, renewed every ttl / 3.
+    // Losing it fails every later write, so the run is left for the next
+    // executor as it stands; saveRun's generation check fences the rest.
+    const leasing = options.lease;
+    const leaseTtl = leasing?.ttlMs ?? 30_000;
+    let held: Lease | undefined;
+    let leaseLost = false;
+    let beating = true;
+    let stopBeat: (() => void) | undefined;
+    const lose = () => {
+      leaseLost = true;
+      writeFailure ??= new EvolveLeaseError('lost');
+      controller.abort(writeFailure);
+    };
+    const renewLease = async (): Promise<void> => {
+      if (!beating || !held) return;
+      try {
+        const renewal = await leasing!.provider.renew(held, leaseTtl);
+        if (!beating) return;
+        if (!renewal.held) return lose();
+        held = renewal.lease;
+        for (const signal of renewal.signals) {
+          if (signal === 'drain') draining = true;
+          else if (signal === 'cancel') {
+            stopReason ??= 'cancelled';
+            controller.abort(new Error('Evolve cancelled'));
+          }
+        }
+      } catch {
+        // A provider outage is survivable until the lease could have lapsed.
+        if (!beating) return;
+        if (deps.clock.now() >= held.expiresAt) return lose();
+      }
+      beat();
+    };
+    const beat = () => {
+      if (beating && held)
+        stopBeat = deps.clock.setTimeout(
+          () => void renewLease(),
+          Math.max(1, Math.floor(leaseTtl / 3)),
+        );
+    };
 
     const load = async (ids: readonly string[]) => {
       const missing = [...new Set(ids)].filter((id) => !cache.has(id));
@@ -811,6 +861,15 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
     };
 
     try {
+      if (leasing) {
+        held = await leasing.provider.acquire({
+          key: `evolve:${JSON.stringify([key.scope, key.runId])}`,
+          owner: leasing.owner ?? deps.generateId(),
+          ttlMs: leaseTtl,
+        });
+        if (!held) throw new EvolveLeaseError('held');
+        beat();
+      }
       if (mode === 'create') {
         const seed = options.seed !== undefined ? String(options.seed) : deps.generateId();
         const now = deps.clock.now();
@@ -963,7 +1022,8 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
       return await finish('completed', 'generations');
     } catch (error) {
       const cause = writeFailure ?? error;
-      if (owned) {
+      // After losing the lease the run belongs to the next executor.
+      if (owned && !leaseLost) {
         await queue;
         try {
           await store.saveRun({
@@ -978,6 +1038,10 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
       }
       emit({ type: 'run.finished', status: 'failed', reason: 'error' });
       throw cause;
+    } finally {
+      beating = false;
+      stopBeat?.();
+      if (held && !leaseLost) await leasing!.provider.release(held).catch(() => {});
     }
   }
 

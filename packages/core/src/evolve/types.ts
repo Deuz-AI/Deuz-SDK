@@ -5,6 +5,7 @@ import type {
   ExecutionContextSnapshot,
   ExecutionPolicy,
 } from '../types/execution';
+import type { LeaseProvider } from '../types/lease';
 import type { EmbeddingModel, LanguageModel } from '../types/model';
 
 /** A run is addressed by a tenant scope and a caller-chosen run ID. */
@@ -287,8 +288,23 @@ export interface EvolveOptions extends EvolveKey {
   /** Replace the built-in prompt. */
   readonly buildPrompt?: (context: EvolvePromptContext) => EvolveMutationPrompt;
   readonly maxOutputTokens?: number;
+  /**
+   * Cross-process liveness (2.2): the run's lease is held while this process
+   * drives it and renewed every ttlMs / 3. Losing it stops the run before its
+   * next write, leaving it for the next executor; cancel and drain signals
+   * sent through the provider stop or drain the run.
+   */
+  readonly lease?: EvolveLeaseOptions;
   readonly signal?: AbortSignal;
   readonly deps?: Dependencies;
+}
+
+export interface EvolveLeaseOptions {
+  readonly provider: LeaseProvider;
+  /** This process's identity; defaults to a generated ID per run. */
+  readonly owner?: string;
+  /** Default 30 000. */
+  readonly ttlMs?: number;
 }
 
 /** Resume a stored run. `seed` and the population shape come from the store. */

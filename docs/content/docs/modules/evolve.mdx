@@ -227,6 +227,40 @@ table, runs every write in `BEGIN IMMEDIATE`, and accepts an injected
 that the initial program, the island count, `mutationsPerGeneration` and the
 number of models match the stored run.
 
+## Leases
+
+When several processes may resume the same run, give each a `lease` with a
+shared `LeaseProvider` from [operations](/docs/modules/operations). The run's
+lease is taken before the run is created or loaded and renewed every
+`ttlMs / 3` (default 30 000 ms). A second executor fails with `EvolveLeaseError`
+(`code: 'held'`). An executor that loses its lease stops before its next write
+with `code: 'lost'` and leaves the run as it stands for the next one; a stale
+write within the same generation is the only overlap, and the generation
+compare-and-set rejects anything later. `cancel` and `drain` signals sent
+through the provider stop or drain the run like `handle.cancel()` and
+`handle.drain()`.
+
+```ts
+import { resumeEvolve } from '@deuz-sdk/core/evolve';
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+import { createSqlitePopulationStore } from '@deuz-sdk/core/evolve/sqlite';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const ops = createSqliteOpsStore({ path: 'ops.sqlite' });
+const result = await resumeEvolve({
+  scope: 'tenant-a',
+  runId: 'grow-2',
+  initial: '# EVOLVE-BLOCK-START\nvalue = 1\n# EVOLVE-BLOCK-END\n',
+  stages: [{ evaluate: (program: string) => ({ score: program.length }) }],
+  models: [{ model: createMockModel({ responses: [{ text: 'value = 2' }] }) }],
+  store: createSqlitePopulationStore({ path: 'evolve.sqlite' }),
+  generations: 3,
+  mutationsPerGeneration: 2,
+  budget: { tokens: 100_000 },
+  lease: { provider: ops.leases, owner: 'worker-1' },
+}).result;
+```
+
 <Callout type="warn" title="Evaluators run model-written code">
 Evolve runs model-written code only through your evaluators. Sandbox that
 execution, for example in a worker, a container or a remote runtime. The

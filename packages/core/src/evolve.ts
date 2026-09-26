@@ -24,6 +24,7 @@ export { buildMutationPrompt } from './evolve/prompt';
 export {
   createInMemoryPopulationStore,
   EvolveConflictError,
+  EvolveLeaseError,
   evolveCandidateId,
 } from './evolve/store';
 export type * from './evolve/types';

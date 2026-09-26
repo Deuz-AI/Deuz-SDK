@@ -21,6 +21,21 @@ export class EvolveConflictError extends Error {
   }
 }
 
+/** Another executor holds the run ('held'), or this one lost it ('lost') (2.2). */
+export class EvolveLeaseError extends Error {
+  readonly name = 'EvolveLeaseError';
+  readonly code: 'held' | 'lost';
+
+  constructor(code: 'held' | 'lost') {
+    super(
+      code === 'held'
+        ? 'Another executor holds this evolve run'
+        : 'This executor lost the evolve run lease',
+    );
+    this.code = code;
+  }
+}
+
 function canonical(value: unknown, path: string): unknown {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
   if (typeof value === 'number') {
