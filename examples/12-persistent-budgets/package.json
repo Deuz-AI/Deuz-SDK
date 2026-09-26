@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/12-persistent-budgets",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A per-user token budget in SQLite, shared by native runs and a swarm, until it denies a call.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

@@ -1,0 +1,9 @@
+# 12 — Persistent budgets
+
+**Shows:** a per-user token budget over a rolling 24-hour window (`user:42`, 75 tokens) in `createSqliteBudgetStore` (2.2), shared by native `runAgent` calls in one process and by a swarm in another (`admission` on `createSwarm`), each process with its own connection to the same file. Every model call reserves an estimate (`executionEstimate: { tokens: 20 }`) all-or-nothing against the scope and settles the usage the provider reports; `warnAtPercent: 70` fires `onWarning` on the way. Once the next estimate no longer fits, the native run fails before its model call with `budget_exceeded`, while another user's scope (`user:7`) is untouched.
+
+**Run:** from the repo root, `npm install && npm run build`, then `npm run dev -w @deuz-examples/12-persistent-budgets`. No API key needed. It needs `node:sqlite`, which ships unflagged from Node 22.13 and 23.4. The SQLite file lives in a temporary directory that the example removes at the end.
+
+**Real provider:** the model is `createMockModel` from `@deuz-sdk/core/testing`, which reports 10 input and 5 output tokens per call. Replace it with `createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY })('claude-opus-4-8')` from `@deuz-sdk/core/anthropic` (see the `REAL PROVIDER` comment in `index.ts`). To bound dollars as well, add a `usd` limit and give the runs a `priceProvider` in `deps` (for example `createPriceProvider()` from `@deuz-sdk/core/pricing`); without prices, every USD-bounded call keeps its whole estimate held.
+
+**Look at:** the store is a second gate after each run's own ledger; admission works on estimates, so it cannot guarantee a provider's final invoice. Every request that names the same key shares the budget, and `usage(key)` reports settled usage plus holds still in flight over the key's history (pass `since` for a time range). For many machines, `createPostgresBudgetStore` from `@deuz-sdk/core/ops/postgres` implements the same contract.
