@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { createPostgresSwarmStore } from '../src/node/swarm-postgres';
 import { createSwarm, SwarmConflictError } from '../src/swarm';
@@ -7,6 +7,8 @@ import type { SwarmStore } from '../src/types/swarm';
 import { initialSnapshot, swarmStoreContracts } from './fixtures/swarm-store-conformance';
 
 const db = new PGlite();
+// Start-up is slow under load; keep it out of the first test's time budget.
+beforeAll(() => db.waitReady, 60_000);
 afterAll(async () => {
   await db.close();
 });
