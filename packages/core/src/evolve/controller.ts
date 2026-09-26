@@ -438,6 +438,15 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
       };
     };
 
+    /** `stopWhen` over the committed run: the target score first, then the plateau. */
+    const stopReached = (): 'target' | 'plateau' | undefined => {
+      const target = options.stopWhen?.targetScore;
+      if (target !== undefined && run.bestScore !== undefined && run.bestScore >= target)
+        return 'target';
+      const plateau = options.stopWhen?.plateau;
+      return plateau !== undefined && run.stale >= plateau ? 'plateau' : undefined;
+    };
+
     const embed = async (texts: string[]): Promise<number[][]> => {
       const embedder = options.novelty!.embed;
       if (typeof embedder === 'function') return embedder(texts);
@@ -1016,6 +1025,9 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
         };
         await commit(integrate(0, [seed]));
       }
+      // The seed, or the run being resumed, may already meet `stopWhen`.
+      const reached = stopReached();
+      if (reached) return await finish('completed', reached);
 
       for (let generation = run.generation + 1; generation <= options.generations; generation++) {
         if (controller.signal.aborted) return await finish('stopped', stopReason ?? 'cancelled');
@@ -1042,12 +1054,8 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
           await execution.ledger.compact(childScopeId(execution.scopeId, slot.id));
         await commit(integrated);
         if (budgetHit) return await finish('stopped', 'budget');
-        const target = options.stopWhen?.targetScore;
-        if (target !== undefined && run.bestScore !== undefined && run.bestScore >= target)
-          return await finish('completed', 'target');
-        const plateau = options.stopWhen?.plateau;
-        if (plateau !== undefined && run.stale >= plateau)
-          return await finish('completed', 'plateau');
+        const stop = stopReached();
+        if (stop) return await finish('completed', stop);
       }
       return await finish('completed', 'generations');
     } catch (error) {

@@ -197,7 +197,10 @@ request, including an open circuit breaker, is not a call.
 
 `stopWhen.targetScore` ends the run with reason `'target'` once the best score
 reaches it. `stopWhen.plateau` ends it with reason `'plateau'` after that many
-generations without improvement. `handle.drain()` finishes the current
+generations without improvement. Both are checked after every committed
+generation, the seed's generation zero included, and again when a run resumes,
+so a seed or a resumed run that already meets them finishes without a model
+call. `handle.drain()` finishes the current
 generation and stops with reason `'drained'`. `handle.cancel()` or
 `options.signal` aborts in-flight work and stops with reason `'cancelled'`.
 `handle.events()` replays every event of the handle from the start:

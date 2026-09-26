@@ -442,6 +442,66 @@ describe('evolve: stopping', () => {
     expect(result).toMatchObject({ status: 'completed', reason: 'plateau', generation: 2 });
   });
 
+  it('finishes at the seed when it already meets the target, without a model call', async () => {
+    const { model, counter } = grower();
+    const result = await evolve(
+      options({
+        models: [{ model }],
+        stages: [{ evaluate: () => ({ score: 10 }) }],
+        stopWhen: { targetScore: 5 },
+        generations: 4,
+        mutationsPerGeneration: 3,
+      }),
+    ).result;
+    expect(result).toMatchObject({
+      status: 'completed',
+      reason: 'target',
+      generation: 0,
+      modelCalls: 0,
+    });
+    expect(counter.calls).toBe(0);
+  });
+
+  it('checks the target and the plateau on resume before paying for a generation', async () => {
+    const { model, counter } = grower();
+    const reached = createInMemoryPopulationStore();
+    await evolve(options({ store: reached, generations: 1 })).result;
+    const target = await resumeEvolve(
+      options({
+        store: reached,
+        models: [{ model }],
+        generations: 5,
+        stopWhen: { targetScore: 1 },
+      }),
+    ).result;
+    expect(target).toMatchObject({
+      status: 'completed',
+      reason: 'target',
+      generation: 1,
+      modelCalls: 0,
+    });
+
+    const flat: EvolveStage = { evaluate: () => ({ score: 1 }) };
+    const stale = createInMemoryPopulationStore();
+    await evolve(options({ store: stale, stages: [flat], generations: 2 })).result;
+    const plateau = await resumeEvolve(
+      options({
+        store: stale,
+        stages: [flat],
+        models: [{ model }],
+        generations: 5,
+        stopWhen: { plateau: 2 },
+      }),
+    ).result;
+    expect(plateau).toMatchObject({
+      status: 'completed',
+      reason: 'plateau',
+      generation: 2,
+      modelCalls: 0,
+    });
+    expect(counter.calls).toBe(0);
+  });
+
   it('stops cleanly on budget exhaustion and keeps the ledger bounded', async () => {
     const { model, counter } = grower();
     const store = createInMemoryPopulationStore();
