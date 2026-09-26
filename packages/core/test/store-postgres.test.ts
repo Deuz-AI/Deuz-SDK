@@ -379,7 +379,8 @@ export function createFakePg(
     for (const raw of sql.split(';')) {
       const statement = raw.trim();
       if (statement === '') continue;
-      if (/^(BEGIN|COMMIT|CREATE INDEX|ALTER TABLE)/.test(statement)) continue;
+      if (/^(BEGIN|COMMIT|CREATE INDEX|ALTER TABLE|SELECT pg_advisory_xact_lock\()/.test(statement))
+        continue;
       if (/^CREATE TABLE/.test(statement)) {
         const m = /^CREATE TABLE IF NOT EXISTS (\S+)/.exec(statement);
         if (m) table(m[1]!);
@@ -408,6 +409,8 @@ export function createFakePg(
         ? []
         : [{ atttypmod: options.existingVectorDimensions }];
     }
+    // Sent after a failed migration batch; the fake keeps no transaction state.
+    if (sql === 'ROLLBACK') return [];
     if (sql.startsWith('SELECT ')) return runSelect(sql, params);
     if (sql.startsWith('INSERT INTO ')) return runInsert(sql, params);
     if (sql.startsWith('UPDATE ')) return runUpdate(sql, params);
@@ -615,6 +618,41 @@ describe('migration', () => {
     await expect(stores.migrate()).rejects.toThrow('connection terminated');
     await expect(stores.migrate()).resolves.toBeUndefined();
     expect(client.rows('deuz_meta')).toHaveLength(1);
+  });
+
+  it('takes an advisory lock first thing in the batch, so concurrent first migrations queue', async () => {
+    const client = createFakePg();
+    await createPostgresStores({ client, schema: 'deuz_2', pgvector: 'off' }).migrate();
+    expect(client.ddl().slice(0, 2)).toEqual([
+      'BEGIN',
+      "SELECT pg_advisory_xact_lock(hashtext('deuz-sdk'), hashtext('stores:deuz_2'))",
+    ]);
+  });
+
+  it('runs the deuz_meta bootstrap and the batch again when a concurrent first migration failed them', async () => {
+    const fake = createFakePg();
+    // 23505, 42P07 and 42710: two sessions created one table at once. 40001:
+    // under REPEATABLE READ the batch's snapshot predates its lock wait.
+    const failures: [RegExp, string[]][] = [
+      [/^CREATE TABLE IF NOT EXISTS public\.deuz_meta\b/, ['42P07', '23505', '42710']],
+      [/^BEGIN;/, ['40001', '23505', '42P07']],
+    ];
+    const racing: PgClientLike = {
+      async query(sql, params) {
+        const text = sql.replace(/\s+/g, ' ').trim();
+        for (const [pattern, codes] of failures) {
+          const code = pattern.test(text) ? codes.shift() : undefined;
+          if (code) throw Object.assign(new Error(`first migration race (${code})`), { code });
+        }
+        return fake.query(sql, params);
+      },
+    };
+    await createPostgresStores({ client: racing, pgvector: 'off' }).migrate();
+    expect(failures.map(([, codes]) => codes)).toEqual([[], []]);
+    expect(fake.rows('deuz_meta')).toEqual([{ key: 'schema_version', value: '1' }]);
+    // A failed batch may leave its connection inside an aborted transaction
+    // block, so each failure is followed by a ROLLBACK before the retry.
+    expect(fake.texts().filter((sql) => sql === 'ROLLBACK')).toHaveLength(3);
   });
 
   it('runs lazily on the first store call, before the statement itself', async () => {

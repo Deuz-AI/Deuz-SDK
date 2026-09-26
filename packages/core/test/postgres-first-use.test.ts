@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createPostgresBudgetStore } from '../src/node/budget-postgres';
 import { createPostgresOpsStore } from '../src/node/ops-postgres';
 import { createPostgresSwarmStore } from '../src/node/swarm-postgres';
+import { createPostgresStores } from '../src/node/store-postgres';
 import type { PgClientLike } from '../src/node/store-postgres';
 import type { BudgetStore } from '../src/types/budget-store';
 
@@ -90,8 +91,8 @@ describe.each(stores)('Postgres $name store, first use', ({ name, meta, table, f
     const schema = await freshSchema();
     // 40001: under REPEATABLE READ or SERIALIZABLE the statement's snapshot
     // predates its advisory-lock wait, so it misses what the lock holder
-    // committed. 23505 and 42P07: two sessions created one table at once.
-    const codes = ['40001', '23505', '42P07'];
+    // committed. 23505, 42P07 and 42710: two sessions created one table at once.
+    const codes = ['40001', '23505', '42P07', '42710'];
     let attempts = 0;
     const racing: PgClientLike = {
       async query(sql, params) {
@@ -103,7 +104,7 @@ describe.each(stores)('Postgres $name store, first use', ({ name, meta, table, f
       },
     };
     await first(racing, schema);
-    expect(attempts).toBe(4);
+    expect(attempts).toBe(5);
     const { rows } = await client.query(`SELECT to_regclass('${schema}.${table}') AS found`);
     expect(rows[0]?.found).not.toBeNull();
   });
@@ -143,6 +144,53 @@ describe.each(stores)('Postgres $name store, first use', ({ name, meta, table, f
     );
     const { rows } = await client.query(`SELECT to_regclass('${schema}.${table}') AS found`);
     expect(rows[0]?.found).toBeNull();
+  });
+});
+
+describe('Postgres store pack (2.0), first use', () => {
+  // Its own database: a regression here leaves the connection unusable.
+  const pack = new PGlite();
+  beforeAll(() => pack.waitReady, 60_000);
+  afterAll(async () => {
+    await pack.close();
+  });
+  // PGlite's query() takes one statement, so the migration batch goes through
+  // exec(): the simple query protocol `pg` sends a parameterless batch with.
+  const packClient: PgClientLike = {
+    async query(sql, params) {
+      if (params === undefined && sql.includes(';')) {
+        const results = await pack.exec(sql);
+        return { rows: (results.at(-1)?.rows ?? []) as Record<string, unknown>[] };
+      }
+      return pack.query<Record<string, unknown>>(sql, params);
+    },
+  };
+
+  it('leaves a single-connection client usable after a failed batch, and migrates on the next call', async () => {
+    await packClient.query('CREATE SCHEMA pack_1');
+    // A deuz_runs without a status column fails the batch's index on it (42703),
+    // after BEGIN.
+    await packClient.query('CREATE TABLE pack_1.deuz_runs (run_id TEXT PRIMARY KEY)');
+    const stores = createPostgresStores({ client: packClient, schema: 'pack_1', pgvector: 'off' });
+    await expect(stores.migrate()).rejects.toMatchObject({ code: '42703' });
+    // Left inside the aborted transaction block, the connection would answer
+    // 25P02 to every statement from here on.
+    await expect(packClient.query('SELECT 1 AS one')).resolves.toMatchObject({
+      rows: [{ one: 1 }],
+    });
+    const { rows } = await packClient.query(`SELECT to_regclass('pack_1.deuz_memory') AS found`);
+    expect(rows[0]?.found).toBeNull();
+    await packClient.query('DROP TABLE pack_1.deuz_runs');
+    await expect(stores.migrate()).resolves.toBeUndefined();
+  });
+
+  it('migrates one new schema from two packs at once', async () => {
+    await packClient.query('CREATE SCHEMA pack_2');
+    const a = createPostgresStores({ client: packClient, schema: 'pack_2', pgvector: 'off' });
+    const b = createPostgresStores({ client: packClient, schema: 'pack_2', pgvector: 'off' });
+    await expect(Promise.all([a.migrate(), b.migrate()])).resolves.toHaveLength(2);
+    await b.runs.create({ runId: 'r', status: 'running', createdAt: 1, updatedAt: 1 });
+    expect(await a.runs.get('r')).toMatchObject({ runId: 'r' });
   });
 });
 

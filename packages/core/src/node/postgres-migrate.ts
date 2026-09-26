@@ -13,7 +13,7 @@
  * snapshot is taken before it waits on the lock, so a session that queued
  * misses the version row the holder committed and fails with 40001. The
  * statement is idempotent, so `createPostgresSchema` sends it again, with a
- * new snapshot, on 40001, 23505 or 42P07. Node-only.
+ * new snapshot, on any of `SCHEMA_RACE_CODES`. Node-only.
  */
 import type { PgClientLike } from './store-postgres';
 
@@ -73,7 +73,14 @@ export async function retryPostgres<T>(
   }
 }
 
+/**
+ * What a concurrent first use can raise; each clears when the idempotent DDL
+ * runs again. 42710 is an unlocked `CREATE TABLE IF NOT EXISTS` whose rival
+ * committed between the existence check and the table's row type.
+ */
+export const SCHEMA_RACE_CODES: readonly string[] = ['40001', '23505', '42P07', '42710'];
+
 /** Sends a store's schema statement, again when a concurrent first use failed it. */
 export async function createPostgresSchema(client: PgClientLike, sql: string): Promise<void> {
-  await retryPostgres(['40001', '23505', '42P07'], () => client.query(sql));
+  await retryPostgres(SCHEMA_RACE_CODES, () => client.query(sql));
 }
