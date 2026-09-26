@@ -1,5 +1,5 @@
 import { PGlite } from '@electric-sql/pglite';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createPostgresBudgetStore } from '../src/node/budget-postgres';
 import { createPostgresOpsStore } from '../src/node/ops-postgres';
 import { createPostgresSwarmStore } from '../src/node/swarm-postgres';
@@ -10,6 +10,8 @@ import type { BudgetStore } from '../src/types/budget-store';
 // tests pin what makes a first use safe on a pool of connections: the whole
 // schema creation is one statement that queues on an advisory lock.
 const db = new PGlite();
+// Start-up is slow under load; keep it out of the first test's time budget.
+beforeAll(() => db.waitReady, 60_000);
 afterAll(async () => {
   await db.close();
 });

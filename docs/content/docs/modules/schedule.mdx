@@ -86,7 +86,8 @@ the others still run. A claim that answers `false` gives `status: 'duplicate'`.
 A failed run keeps its claim, so no tick or process runs that occurrence
 again: a run may have done part of its work before it threw. To let another
 process retry it, give the key back yourself in the run's `catch` with
-`claim.release(occurrence.key)`; `createInMemoryClaim()` has `release`.
+`claim.release(occurrence.key)`; `createInMemoryClaim()` and the
+[durable claims](#durable-claims-from-the-ops-stores) have `release`.
 
 Each tick evaluates the window `(from, now]`. The first tick of a scheduler
 looks back `lookbackMs` (default 60 000 ms, one cron minute, so a trigger that
@@ -111,7 +112,7 @@ occurrences that already ran are reported as duplicates.
 ```ts
 import { createInMemoryClaim, createScheduler } from '@deuz-sdk/core/schedule';
 
-const claim = createInMemoryClaim(); // stands in for a shared, durable claim
+const claim = createInMemoryClaim(); // stands in for a durable claim, such as ops.claims
 const ran: string[] = [];
 const schedules = [
   { id: 'hourly', cron: '0 * * * *', run: (o: { key: string }) => void ran.push(o.key) },
@@ -127,13 +128,51 @@ console.log(result.occurrences.map((o) => o.status)); // duplicates, then 03:00 
 console.log(ran.length); // 4
 ```
 
-## Durable dedupe with a swarm run
+## Durable claims from the ops stores
 
 The default claim is an in-memory set: it dedupes overlapping ticks inside one
 process, not across processes or isolates. On a serverless host every tick may
 run in a fresh isolate, so give the scheduler a claim backed by storage all of
-them share. A durable run store already is one: use the occurrence key as the
-run id, and treat the store's create conflict as "already claimed".
+them share. The SQLite and Postgres ops stores carry one: `claims` grants a key
+once across every process on the same file or database, in one statement
+(`INSERT OR IGNORE` on SQLite, `INSERT … ON CONFLICT DO NOTHING` on Postgres),
+and `claims.release(key)` gives it back.
+
+```ts
+import { createScheduler } from '@deuz-sdk/core/schedule';
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+
+// Every process opens the same file; createPostgresOpsStore({ client: pool })
+// from '@deuz-sdk/core/ops/postgres' does the same on a shared database.
+const ops = createSqliteOpsStore({ path: 'ops.sqlite' });
+
+const scheduler = createScheduler({
+  schedules: [{ id: 'nightly-sync', cron: '0 2 * * *', run: (o) => console.log('sync', o.key) }],
+  claim: ops.claims,
+  // Recover what a restart missed; occurrences that already ran are duplicates.
+  catchUp: 'all',
+  lookbackMs: 6 * 3_600_000,
+});
+
+const result = await scheduler.tick(Date.parse('2026-01-05T02:00:20Z'));
+console.log(result.occurrences.map((o) => o.status)); // ['ran'], then 'duplicate' elsewhere
+await ops.close();
+```
+
+The same `ops.claims` is a `dedupe` for `handleSignal`, [below](#turn-a-signal-into-work).
+
+<Callout type="info" title="Claimed keys accumulate">
+  `deuz_claims` keeps one row per granted key (`key`, and `claimed_at` in epoch milliseconds: the
+  store's clock on SQLite, the database clock on Postgres). Only `release` removes a row. Prune old
+  rows on your own schedule, keeping every key a tick could still look back to (`lookbackMs`) and
+  every delivery id a sender could still redeliver:
+  `DELETE FROM deuz_claims WHERE claimed_at < $cutoff`.
+</Callout>
+
+## Dedupe with a swarm run
+
+A durable run store is a claim too: use the occurrence key as the run id, and
+treat the store's create conflict as "already claimed".
 
 ```ts
 import { createAgent } from '@deuz-sdk/core/agent';
@@ -180,8 +219,10 @@ for (const name of ['a', 'b']) {
 ```
 
 Any storage with an atomic "insert if absent" works the same way as a `claim`:
-a unique-key insert in SQL, a KV `put` with a precondition, or a durable run
-store's create.
+a unique-key insert in SQL (what `ops.claims` is), a KV `put` with a
+precondition, or a durable run store's create. Give such a function a
+`release(key)` that deletes the key if you want `handleSignal` to free it when a
+dispatch fails.
 
 ## Long-running processes
 
@@ -276,7 +317,8 @@ one from the sender's delivery id when there is one.
 ```ts
 import { createInMemoryClaim, handleSignal, verifyGitHubWebhook } from '@deuz-sdk/core/schedule';
 
-const dedupe = createInMemoryClaim(); // use a durable claim across instances
+// One process only; across instances use a durable claim such as ops.claims.
+const dedupe = createInMemoryClaim();
 
 export async function POST(request: Request): Promise<Response> {
   return handleSignal(request, {
@@ -294,8 +336,8 @@ export async function POST(request: Request): Promise<Response> {
 <Callout type="warn" title="Dedupe happens before dispatch">
   The key is claimed before `dispatch` runs. When `dispatch` throws, `handleSignal` gives the key
   back through the claim's `release` and answers `500`, so the sender's retry dispatches again.
-  `createInMemoryClaim()` has `release`; a claim that is a plain function does not, and then the
-  retry is answered as a duplicate. A dispatch that threw
+  `createInMemoryClaim()` and the ops stores' durable `claims` have `release`; a claim that is a
+  plain function does not, and then the retry is answered as a duplicate. A dispatch that threw
   after starting work may see that work again on the retry, so keep `dispatch` short — enqueue the
   work, or start a durable run whose run id is the key — or skip `dedupe` and let an idempotent
   dispatch (a swarm run with `runId: key`, ignoring `SwarmConflictError`) absorb redeliveries.

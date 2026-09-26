@@ -21,6 +21,8 @@ import type {
   ScheduleTickResult,
   SignalVerification,
 } from '../src/schedule';
+import type { SqliteOpsStore } from '../src/node/ops-sqlite';
+import type { PostgresOpsStore } from '../src/node/ops-postgres';
 
 test('cron helpers', () => {
   expectTypeOf(parseCron).returns.toEqualTypeOf<CronSchedule>();
@@ -46,6 +48,13 @@ test('scheduler', () => {
   expectTypeOf<(key: string) => Promise<boolean>>().toExtend<HandleSignalOptions['dedupe']>();
   expectTypeOf<ScheduleClaim['release']>().toEqualTypeOf<
     ((key: string) => void | Promise<void>) | undefined
+  >();
+  // The ops stores' durable claims fit both consumers, and always release.
+  expectTypeOf<SqliteOpsStore['claims']>().toExtend<ScheduleClaim>();
+  expectTypeOf<PostgresOpsStore['claims']>().toExtend<ScheduleClaim>();
+  expectTypeOf<PostgresOpsStore['claims']>().toExtend<HandleSignalOptions['dedupe']>();
+  expectTypeOf<SqliteOpsStore['claims']['release']>().toEqualTypeOf<
+    (key: string) => Promise<void>
   >();
   expectTypeOf<ScheduleOccurrence>().toEqualTypeOf<{
     readonly id: string;
