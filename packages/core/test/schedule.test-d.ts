@@ -46,9 +46,30 @@ test('scheduler', () => {
   // A plain function is still a claim; `release` is optional.
   expectTypeOf<(key: string) => boolean>().toExtend<ScheduleClaim>();
   expectTypeOf<(key: string) => Promise<boolean>>().toExtend<HandleSignalOptions['dedupe']>();
-  expectTypeOf<ScheduleClaim['release']>().toEqualTypeOf<
-    ((key: string) => void | Promise<void>) | undefined
-  >();
+  expectTypeOf<ScheduleClaim['release']>().toEqualTypeOf<((key: string) => unknown) | undefined>();
+  // A release's result is ignored, so natural implementations fit as they are.
+  const seen = new Set<string>();
+  const claimOnce = (key: string) => !seen.has(key) && seen.add(key).has(key);
+  const redis = { del: async (_key: string): Promise<number> => 1 };
+  const pool = {
+    query: async (_sql: string, _params: unknown[]) => ({ rowCount: 1 as number | null }),
+  };
+  createScheduler({
+    schedules: [],
+    claim: Object.assign(claimOnce, { release: (key: string) => seen.delete(key) }),
+  });
+  createScheduler({
+    schedules: [],
+    claim: Object.assign(claimOnce, { release: (key: string) => redis.del(key) }),
+  });
+  const signal: HandleSignalOptions = {
+    verify: () => ({ ok: true, body: '' }),
+    dedupe: Object.assign(async (key: string) => claimOnce(key), {
+      release: (key: string) => pool.query('DELETE FROM claims WHERE key = $1', [key]),
+    }),
+    dispatch: () => undefined,
+  };
+  expectTypeOf(signal.dedupe).toEqualTypeOf<ScheduleClaim | undefined>();
   // The ops stores' durable claims fit both consumers, and always release.
   expectTypeOf<SqliteOpsStore['claims']>().toExtend<ScheduleClaim>();
   expectTypeOf<PostgresOpsStore['claims']>().toExtend<ScheduleClaim>();

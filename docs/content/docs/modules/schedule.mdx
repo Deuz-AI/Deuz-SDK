@@ -135,8 +135,11 @@ process, not across processes or isolates. On a serverless host every tick may
 run in a fresh isolate, so give the scheduler a claim backed by storage all of
 them share. The SQLite and Postgres ops stores carry one: `claims` grants a key
 once across every process on the same file or database, in one statement
-(`INSERT OR IGNORE` on SQLite, `INSERT … ON CONFLICT DO NOTHING` on Postgres),
-and `claims.release(key)` gives it back.
+(`INSERT … ON CONFLICT DO NOTHING RETURNING`: the key is granted when the row
+comes back, so an injected SQLite driver need not report a change count), and
+`claims.release(key)` gives it back. On a Postgres session that defaults to
+`REPEATABLE READ` or `SERIALIZABLE`, the loser of a race meets a serialization
+failure (40001); the store runs the statement again, and it answers `false`.
 
 ```ts
 import { createScheduler } from '@deuz-sdk/core/schedule';
@@ -163,9 +166,11 @@ The same `ops.claims` is a `dedupe` for `handleSignal`, [below](#turn-a-signal-i
 
 <Callout type="info" title="Claimed keys accumulate">
   `deuz_claims` keeps one row per granted key (`key`, and `claimed_at` in epoch milliseconds: the
-  store's clock on SQLite, the database clock on Postgres). Only `release` removes a row. Prune old
-  rows on your own schedule, keeping every key a tick could still look back to (`lookbackMs`) and
-  every delivery id a sender could still redeliver:
+  store's clock on SQLite, the database clock on Postgres). A key longer than 512 characters (too
+  long for a Postgres index) or holding a NUL (which Postgres text rejects) is kept as `sha256:`
+  plus its hex SHA-256 on both stores, and still claims and releases exactly. Only `release`
+  removes a row. Prune old rows on your own schedule, keeping every key a tick could still look back
+  to (`lookbackMs`) and every delivery id a sender could still redeliver:
   `DELETE FROM deuz_claims WHERE claimed_at < $cutoff`.
 </Callout>
 
@@ -222,7 +227,8 @@ Any storage with an atomic "insert if absent" works the same way as a `claim`:
 a unique-key insert in SQL (what `ops.claims` is), a KV `put` with a
 precondition, or a durable run store's create. Give such a function a
 `release(key)` that deletes the key if you want `handleSignal` to free it when a
-dispatch fails.
+dispatch fails. Whatever `release` returns is awaited and ignored, so
+`Object.assign(claim, { release: (key) => redis.del(key) })` fits as written.
 
 ## Long-running processes
 

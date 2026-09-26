@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,7 +10,17 @@ import { createSqliteOpsStore } from '../src/node/ops-sqlite';
 import { createPostgresOpsStore } from '../src/node/ops-postgres';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import type { PgClientLike } from '../src/node/store-postgres';
-import { scheduleClaimContracts } from './fixtures/schedule-claim-conformance';
+import { incompressibleKey, scheduleClaimContracts } from './fixtures/schedule-claim-conformance';
+
+const sha256 = (text: string) =>
+  `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`;
+/** A claim key and the row key both SQL stores keep for it. */
+const ROW_KEYS: [string, string][] = [
+  ['x'.repeat(512), 'x'.repeat(512)],
+  ['x'.repeat(513), sha256('x'.repeat(513))],
+  ['a\u0000b', sha256('a\u0000b')],
+  [incompressibleKey(7), sha256(incompressibleKey(7))],
+];
 
 let DatabaseSync: (new (path: string) => SqliteDatabaseLike) | undefined;
 try {
@@ -38,6 +49,22 @@ function sqliteOps(path: string, database?: SqliteDatabaseLike) {
   return ops;
 }
 
+/** An injected handle whose run() executes but reports nothing, as some drivers do. */
+function quietHandle(db: SqliteDatabaseLike): SqliteDatabaseLike {
+  return {
+    prepare(sql) {
+      const statement = db.prepare(sql);
+      return {
+        run: (...params) => void statement.run(...params),
+        get: (...params) => statement.get(...params),
+        all: (...params) => statement.all(...params),
+      };
+    },
+    exec: (sql) => db.exec(sql),
+    close: () => db.close(),
+  };
+}
+
 const pg = new PGlite();
 // Start-up is slow under load; keep it out of the first test's time budget.
 beforeAll(() => pg.waitReady, 60_000);
@@ -58,6 +85,11 @@ scheduleClaimContracts('in-memory claim', () => createInMemoryClaim());
 
 describe.skipIf(!DatabaseSync)('SQLite ops store claims', () => {
   scheduleClaimContracts('SQLite claim', () => sqliteOps(':memory:').claims);
+  // The grant must not depend on what an injected driver's run() returns.
+  scheduleClaimContracts(
+    'SQLite claim on a handle whose run() reports nothing',
+    () => sqliteOps(':memory:', quietHandle(new DatabaseSync!(':memory:'))).claims,
+  );
 
   it('shares claims between two connections on one file and keeps them across a reopen', async () => {
     const path = await tempFile();
@@ -79,6 +111,16 @@ describe.skipIf(!DatabaseSync)('SQLite ops store claims', () => {
     const reopened = sqliteOps(path);
     expect(await reopened.claims('digest@1')).toBe(false);
     expect(await reopened.claims('race')).toBe(false);
+  });
+
+  it('stores a key over 512 characters or holding a NUL as its SHA-256', async () => {
+    const db = new DatabaseSync!(':memory:');
+    const ops = sqliteOps(':memory:', db);
+    for (const [key] of ROW_KEYS) expect(await ops.claims(key)).toBe(true);
+    const rows = db.prepare('SELECT key FROM deuz_claims ORDER BY rowid').all() as {
+      key: string;
+    }[];
+    expect(rows.map((row) => row.key)).toEqual(ROW_KEYS.map(([, row]) => row));
   });
 
   it('adds the claims table to an ops file written before claims existed', async () => {
@@ -110,6 +152,50 @@ describe('Postgres ops store claims (PGlite)', () => {
     await b.claims.release('digest@1');
     expect(await a.claims('digest@1')).toBe(true);
     expect(await b.claims('digest@1')).toBe(false);
+  });
+
+  it('runs a claim statement again when it fails with 40001, and answers from the retry', async () => {
+    const schema = await freshSchema();
+    expect(await createPostgresOpsStore({ client, schema }).claims('race')).toBe(true);
+    // Under REPEATABLE READ or SERIALIZABLE the loser of a race to insert a key
+    // fails with 40001 instead of doing nothing; run again, its statement sees
+    // the winner's row.
+    let failures = 0;
+    let attempts = 0;
+    const serializing: PgClientLike = {
+      async query(sql, params) {
+        if (/^\s*(INSERT INTO|DELETE FROM) \S+\.deuz_claims\b/.test(sql)) {
+          attempts++;
+          if (failures > 0) {
+            failures--;
+            throw Object.assign(new Error('could not serialize access'), { code: '40001' });
+          }
+        }
+        return client.query(sql, params);
+      },
+    };
+    const loser = createPostgresOpsStore({ client: serializing, schema });
+    failures = 1;
+    expect(await loser.claims('race')).toBe(false);
+    failures = 1;
+    expect(await loser.claims('fresh')).toBe(true);
+    failures = 1;
+    await loser.claims.release('fresh');
+    expect(await loser.claims('fresh')).toBe(true);
+    attempts = 0;
+    failures = Infinity;
+    await expect(loser.claims('stuck')).rejects.toMatchObject({ code: '40001' });
+    expect(attempts).toBe(5);
+  });
+
+  it('stores a key over 512 characters or holding a NUL as its SHA-256', async () => {
+    const schema = await freshSchema();
+    const ops = createPostgresOpsStore({ client, schema });
+    for (const [key] of ROW_KEYS) expect(await ops.claims(key)).toBe(true);
+    const { rows } = await client.query(`SELECT key FROM ${schema}.deuz_claims`);
+    expect(rows.map((row) => String(row.key)).sort()).toEqual(
+      ROW_KEYS.map(([, row]) => row).sort(),
+    );
   });
 
   it('adds the claims table to an ops schema created before claims existed', async () => {

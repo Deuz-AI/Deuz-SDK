@@ -42,7 +42,11 @@
  * - The migration is sent as ONE multi-statement simple query wrapped in
  *   `BEGIN … COMMIT`. That matters: `pg.Pool.query('BEGIN')` followed by a
  *   separate `query(ddl)` can land on DIFFERENT pooled connections, which would
- *   silently defeat the transaction. One query is one connection.
+ *   silently defeat the transaction. One query is one connection. It takes an
+ *   advisory lock right after `BEGIN`, so concurrent first migrations queue
+ *   instead of racing `CREATE TABLE IF NOT EXISTS`; the `deuz_meta` bootstrap
+ *   and the batch run again on 40001, 23505, 42P07 or 42710, and a failed batch
+ *   is followed by a `ROLLBACK` so the connection never stays in an aborted block.
  * - `BIGINT` columns come back from `pg` as STRINGS (int8 overflows a JS
  *   number), so every timestamp is coerced on read — never trust `row.created_at`
  *   to already be a number.
@@ -55,6 +59,7 @@ import { serializeCheckpoint, deserializeCheckpoint } from '../durable';
 import type { RunRecord, RunStore } from '../types/runtime';
 import { InvalidRequestError } from '../errors';
 import { cosineSimilarity } from '../internal/vector';
+import { retryPostgres, SCHEMA_RACE_CODES } from './postgres-migrate';
 
 // ===================================================================
 // Options + public shape
@@ -500,9 +505,12 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     }
 
     // deuz_meta first and on its own: the version gate has to READ before the
-    // rest of the DDL batch runs.
-    await exec(
-      `CREATE TABLE IF NOT EXISTS ${table('deuz_meta')} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+    // rest of the DDL batch runs. Two first migrations may create it at once,
+    // and the loser's 23505, 42P07 or 42710 clears when the statement runs again.
+    await retryPostgres(SCHEMA_RACE_CODES, () =>
+      exec(
+        `CREATE TABLE IF NOT EXISTS ${table('deuz_meta')} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+      ),
     );
     const metaRows = await exec(
       `SELECT value FROM ${table('deuz_meta')} WHERE key = 'schema_version'`,
@@ -518,6 +526,9 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
 
     const statements: string[] = [
       'BEGIN',
+      // Concurrent first migrations queue here until the holder commits,
+      // instead of racing CREATE TABLE IF NOT EXISTS (postgres-migrate.ts).
+      `SELECT pg_advisory_xact_lock(hashtext('deuz-sdk'), hashtext('stores:${schema}'))`,
       `CREATE TABLE IF NOT EXISTS ${table('deuz_memory')} (
          id TEXT PRIMARY KEY,
          text TEXT NOT NULL,
@@ -586,7 +597,21 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     );
 
     // ONE query, so BEGIN/COMMIT cannot be split across pooled connections.
-    await exec(`${statements.join(';\n')};`);
+    // Under REPEATABLE READ or SERIALIZABLE a batch that waited on the lock
+    // fails with 40001 (its snapshot predates the wait) and passes when run again.
+    const batch = `${statements.join(';\n')};`;
+    await retryPostgres(SCHEMA_RACE_CODES, async () => {
+      try {
+        await exec(batch);
+      } catch (error) {
+        // A statement that fails after BEGIN leaves its connection inside an
+        // aborted transaction block. End it, so a single-connection client can
+        // run the retry and every later query; a pool that already dropped
+        // the connection just sees a harmless ROLLBACK.
+        await exec('ROLLBACK').catch(() => undefined);
+        throw error;
+      }
+    });
   };
 
   const ready = (): Promise<void> => {

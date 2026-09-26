@@ -9,7 +9,7 @@
  * and the commit rejects with SwarmConflictError. Node-only.
  */
 import type { PgClientLike } from './store-postgres';
-import { postgresSchemaStatement } from './postgres-migrate';
+import { createPostgresSchema, postgresSchemaStatement } from './postgres-migrate';
 import type {
   SwarmChannelEntry,
   SwarmChannelPost,
@@ -94,11 +94,8 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
       PRIMARY KEY (scope, run_id, channel, sequence), UNIQUE (scope, run_id, entry_id))`,
     ],
   });
-  const migrate = async (): Promise<void> => {
-    await query(schemaSql);
-  };
   const use = async (): Promise<void> => {
-    ready ??= migrate().catch((error: unknown) => {
+    ready ??= createPostgresSchema(options.client, schemaSql).catch((error: unknown) => {
       // A failed first use (the database was unreachable) is retried next call.
       ready = undefined;
       throw error;

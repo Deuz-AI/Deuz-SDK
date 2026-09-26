@@ -38,7 +38,8 @@ export interface SqliteOpsStore {
    * A durable claim for `createScheduler({ claim })` and `handleSignal({ dedupe })`:
    * a key is granted once across every process sharing the file, until
    * `release(key)` gives it back. Granted keys stay in `deuz_claims` (with
-   * `claimed_at`, epoch ms on the store's clock) until you delete them.
+   * `claimed_at`, epoch ms on the store's clock) until you delete them; a key
+   * over 512 characters or holding a NUL is stored as `sha256:<hex>` of it.
    */
   claims: { (key: string): Promise<boolean>; release(key: string): Promise<void> };
   close(): Promise<void>;
@@ -53,6 +54,21 @@ interface LeaseRow {
 
 const SCHEMA_VERSION = 1;
 const SIGNALS: readonly LeaseSignal[] = ['cancel', 'drain'];
+const encoder = new TextEncoder();
+
+/**
+ * The key a claim row stores: the key itself, or `sha256:` and the hex SHA-256
+ * of it when it is longer than 512 characters or holds a NUL, which Postgres
+ * text and its btree index cannot take. The Postgres claims map keys the same
+ * way, so a key has one row on either store.
+ */
+async function claimRowKey(key: string): Promise<string> {
+  if (key.length <= 512 && !key.includes('\0')) return key;
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(key)));
+  let hex = '';
+  for (const byte of digest) hex += byte.toString(16).padStart(2, '0');
+  return `sha256:${hex}`;
+}
 
 export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsStore {
   const clock = options.clock ?? resolveDependencies().clock;
@@ -250,18 +266,23 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
   };
 
   const claims: SqliteOpsStore['claims'] = Object.assign(
-    (key: string): Promise<boolean> =>
-      use((db) => {
-        // One statement: whichever connection inserts the key first wins it.
-        const result = statement(
+    async (key: string): Promise<boolean> => {
+      const row = await claimRowKey(key);
+      return use((db) => {
+        // One statement: whichever connection inserts the key first wins it. The
+        // grant is the row RETURNING yields, not run()'s change count, which an
+        // injected driver may not report.
+        const granted = statement(
           db,
-          'INSERT OR IGNORE INTO deuz_claims(key, claimed_at) VALUES(?, ?)',
-        ).run(key, clock.now());
-        return Number((result as { changes?: unknown } | undefined)?.changes) === 1;
-      }),
+          'INSERT INTO deuz_claims(key, claimed_at) VALUES(?, ?) ON CONFLICT(key) DO NOTHING RETURNING 1 AS claimed',
+        ).get(row, clock.now());
+        return granted !== undefined;
+      });
+    },
     {
       async release(key: string): Promise<void> {
-        await use((db) => statement(db, 'DELETE FROM deuz_claims WHERE key=?').run(key));
+        const row = await claimRowKey(key);
+        await use((db) => statement(db, 'DELETE FROM deuz_claims WHERE key=?').run(row));
       },
     },
   );

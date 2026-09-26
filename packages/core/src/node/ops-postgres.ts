@@ -11,7 +11,7 @@ import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/l
 import { assertLeaseRequest } from '../internal/ops-validate';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 import { postgresSchemaName } from './swarm-postgres';
-import { postgresSchemaStatement } from './postgres-migrate';
+import { createPostgresSchema, postgresSchemaStatement, retryPostgres } from './postgres-migrate';
 
 // Persistent budget scopes (2.2, M5) share this Node-only subpath: one import
 // for every durable ops store on Postgres.
@@ -31,7 +31,8 @@ export interface PostgresOpsStore {
    * A durable claim for `createScheduler({ claim })` and `handleSignal({ dedupe })`:
    * a key is granted once across every process using the schema, until
    * `release(key)` gives it back. Granted keys stay in `deuz_claims` (with
-   * `claimed_at`, epoch ms on the database clock) until you delete them.
+   * `claimed_at`, epoch ms on the database clock) until you delete them; a key
+   * over 512 characters or holding a NUL is stored as `sha256:<hex>` of it.
    */
   claims: { (key: string): Promise<boolean>; release(key: string): Promise<void> };
 }
@@ -40,6 +41,21 @@ const SCHEMA_VERSION = 1;
 const SIGNALS: readonly LeaseSignal[] = ['cancel', 'drain'];
 /** Milliseconds on the database clock. */
 const NOW = `(extract(epoch from clock_timestamp()) * 1000)::bigint`;
+const encoder = new TextEncoder();
+
+/**
+ * The key a claim row stores: the key itself, or `sha256:` and the hex SHA-256
+ * of it when it is longer than 512 characters or holds a NUL. Postgres text
+ * rejects a NUL (22021) and the btree index a row over 2704 bytes (54000); 512
+ * characters is at most 1536 UTF-8 bytes. The SQLite claims map keys the same way.
+ */
+async function claimRowKey(key: string): Promise<string> {
+  if (key.length <= 512 && !key.includes('\0')) return key;
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(key)));
+  let hex = '';
+  for (const byte of digest) hex += byte.toString(16).padStart(2, '0');
+  return `sha256:${hex}`;
+}
 
 type Row = Record<string, unknown>;
 
@@ -69,11 +85,8 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       `CREATE TABLE IF NOT EXISTS ${claimsTable} (key TEXT PRIMARY KEY, claimed_at BIGINT NOT NULL)`,
     ],
   });
-  const migrate = async (): Promise<void> => {
-    await query(schemaSql);
-  };
   const use = async (): Promise<void> => {
-    ready ??= migrate().catch((error: unknown) => {
+    ready ??= createPostgresSchema(options.client, schemaSql).catch((error: unknown) => {
       ready = undefined;
       throw error;
     });
@@ -178,19 +191,27 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
 
   const claims: PostgresOpsStore['claims'] = Object.assign(
     async (key: string): Promise<boolean> => {
+      const row = await claimRowKey(key);
       await use();
-      // One statement: whichever session inserts the key first wins it.
-      const rows = await query(
-        `INSERT INTO ${claimsTable} (key, claimed_at) VALUES ($1, ${NOW})
-        ON CONFLICT (key) DO NOTHING RETURNING 1 AS claimed`,
-        [key],
+      // One statement: whichever session inserts the key first wins it. Under
+      // REPEATABLE READ or SERIALIZABLE the loser fails with 40001 instead of
+      // doing nothing; run again, the statement sees the winner's row.
+      const rows = await retryPostgres(['40001'], () =>
+        query(
+          `INSERT INTO ${claimsTable} (key, claimed_at) VALUES ($1, ${NOW})
+          ON CONFLICT (key) DO NOTHING RETURNING 1 AS claimed`,
+          [row],
+        ),
       );
       return rows.length === 1;
     },
     {
       async release(key: string): Promise<void> {
+        const row = await claimRowKey(key);
         await use();
-        await query(`DELETE FROM ${claimsTable} WHERE key = $1`, [key]);
+        await retryPostgres(['40001'], () =>
+          query(`DELETE FROM ${claimsTable} WHERE key = $1`, [row]),
+        );
       },
     },
   );

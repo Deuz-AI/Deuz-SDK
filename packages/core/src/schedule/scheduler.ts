@@ -26,10 +26,11 @@ export interface ScheduleClaim {
   (key: string): boolean | Promise<boolean>;
   /**
    * Gives a claimed key back, so the next claim of it succeeds again.
-   * `handleSignal` calls it when the dispatch it claimed a key for throws. A
-   * claim without it keeps every key it granted.
+   * `handleSignal` calls it when the dispatch it claimed a key for throws, and
+   * awaits and ignores what it returns (a `DEL` count, a query result). A claim
+   * without it keeps every key it granted.
    */
-  release?(key: string): void | Promise<void>;
+  release?(key: string): unknown;
 }
 
 /**
