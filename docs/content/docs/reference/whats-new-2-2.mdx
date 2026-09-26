@@ -219,7 +219,8 @@ check remains the fence that rejects a stale writer.
   live executor. It pages past live runs (up to 10 000 per call), takes over
   at most `limit`, and resolves to `{ handles, failed }`: a run it cannot
   resume, such as one from an older `definitionVersion`, is reported in
-  `failed` and the others are still recovered. It needs a store with the
+  `failed` and the others are still recovered; a lease-provider outage, or
+  three failures in a row that are not a run's own, ends the call early. It needs a store with the
   `'list'` capability; `listRuns` takes an `after` cursor.
 - `swarm.requestCancel(key)` cancels from any process and reports
   `'signalled'`, `'recorded'` or `'settled'`. A signalled cancel stays queued
@@ -408,6 +409,9 @@ readers fall back to `load`.
   busy timeout before it switches a file to WAL, unless an injected handle
   already has one, and retries a failed open on the next call instead of
   failing forever.
+- The 2.0 Postgres store pack takes an advisory lock for its first migration,
+  retries a lost race and rolls back a failed batch, so processes starting
+  together against an empty schema no longer fail with a duplicate-type error.
 - SQLite stores that open a file path load `node:sqlite` again. The 2.1 build
   stripped the `node:` prefix, so opening a path without an injected
   `database` failed with `ERR_MODULE_NOT_FOUND`.

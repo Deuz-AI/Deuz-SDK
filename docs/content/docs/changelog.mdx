@@ -56,7 +56,8 @@ unions and operational limits are on [What is new in 2.2](/docs/reference/whats-
 
 Fixed: SQLite stores that open a file path load `node:sqlite` again (the 2.1
 build stripped the prefix), and every SQLite store waits for another process's
-lock while opening and retries a failed open.
+lock while opening and retries a failed open. The 2.0 Postgres store pack
+serializes its first migration with an advisory lock and retries a lost race.
 
 Back up SQLite swarm files before the first 2.2 open: the in-place upgrade to
 schema 2 is one-way and 2.1 refuses the upgraded file. Custom `BudgetLedger`
