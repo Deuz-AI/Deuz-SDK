@@ -265,6 +265,159 @@ export function mcpToolsToToolSet(
   return set;
 }
 
+// --- Tool fingerprinting + drift detection (2.2) ------------------------------
+
+/** Schema a tool without an `inputSchema` gets — identical to {@link mcpToolsToToolSet}'s default. */
+const EMPTY_INPUT_SCHEMA: JSONSchema = { type: 'object', properties: {} };
+
+/**
+ * A server's tool catalog, hashed. `tools` maps each tool name to the SHA-256
+ * (lowercase hex) of its canonical definition; `fingerprint` hashes the whole
+ * sorted map, so one comparison answers "did anything change?". Plain JSON —
+ * persist it next to the server's URL and compare on the next connect.
+ */
+export interface ToolFingerprints {
+  algorithm: 'sha-256';
+  /** Tool name → hash of its canonical `{ name, description, inputSchema }`. */
+  tools: Record<string, string>;
+  /** Hash over every `[name, hash]` pair, sorted by name. */
+  fingerprint: string;
+}
+
+/** What changed between two {@link ToolFingerprints}, each list sorted by name. */
+export interface ToolDrift {
+  /** Tools the server now offers that it did not before. */
+  added: string[];
+  /** Tools that disappeared. */
+  removed: string[];
+  /** Tools whose description or input schema changed under the same name. */
+  changed: string[];
+}
+
+/**
+ * Canonical JSON: object keys sorted (UTF-16 code-unit order), `undefined`,
+ * functions and symbols dropped as `JSON.stringify` drops them, non-finite
+ * numbers as `null`. Two structurally equal values always produce the same
+ * string regardless of key order. Cycles are rejected rather than overflowing.
+ */
+function canonicalJson(value: unknown, seen: Set<object> = new Set()): string | undefined {
+  if (value === null) return 'null';
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return JSON.stringify(value);
+    case 'number':
+      return Number.isFinite(value) ? JSON.stringify(value) : 'null';
+    case 'object': {
+      if (seen.has(value)) throw new TypeError('Cannot fingerprint a cyclic tool definition.');
+      seen.add(value);
+      let out: string;
+      if (Array.isArray(value)) {
+        out = `[${value.map((item) => canonicalJson(item, seen) ?? 'null').join(',')}]`;
+      } else {
+        const record = value as Record<string, unknown>;
+        const fields: string[] = [];
+        for (const key of Object.keys(record).sort()) {
+          const encoded = canonicalJson(record[key], seen);
+          if (encoded !== undefined) fields.push(`${JSON.stringify(key)}:${encoded}`);
+        }
+        out = `{${fields.join(',')}}`;
+      }
+      seen.delete(value);
+      return out;
+    }
+    default:
+      return undefined;
+  }
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  let hex = '';
+  for (const byte of new Uint8Array(digest)) hex += byte.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/**
+ * The model-facing identity of one tool. A Standard Schema (zod, valibot, …) in
+ * a hand-built `ToolSet` is reduced to its vendor: its runtime object is not
+ * JSON, and MCP tools always carry plain JSON Schema anyway.
+ */
+function toolIdentity(name: string, description: string | undefined, schema: unknown): unknown {
+  const inputSchema =
+    schema && typeof schema === 'object' && '~standard' in schema
+      ? {
+          '~standard': {
+            vendor: (schema as { '~standard': { vendor?: unknown } })['~standard'].vendor,
+          },
+        }
+      : (schema ?? EMPTY_INPUT_SCHEMA);
+  return { name, ...(description ? { description } : {}), inputSchema };
+}
+
+/**
+ * Fingerprint an MCP server's tools (2.2) — the defense against a "rug pull",
+ * where a server you approved quietly rewrites a tool's description or schema
+ * (the text the model follows) after the fact.
+ *
+ * Each tool hashes its canonical `{ name, description, inputSchema }` with
+ * SHA-256 (WebCrypto, edge-safe); other fields (output schema, annotations) do
+ * not reach the model's instructions and are ignored. Accepts the raw
+ * `McpToolDef[]` or the `ToolSet` `listTools()` returns — the two fingerprint
+ * identically, because a missing schema and an empty description are
+ * normalized exactly the way `listTools()` normalizes them. For a namespaced
+ * `ToolSet` the names are the prefixed keys. Duplicate names are rejected.
+ */
+export async function fingerprintTools(
+  tools: readonly McpToolDef[] | ToolSet,
+): Promise<ToolFingerprints> {
+  const entries: [string, unknown][] = [];
+  if (Array.isArray(tools)) {
+    for (const def of tools as readonly McpToolDef[]) {
+      entries.push([def.name, toolIdentity(def.name, def.description, def.inputSchema)]);
+    }
+  } else {
+    for (const [name, tool] of Object.entries(tools as ToolSet)) {
+      entries.push([name, toolIdentity(name, tool.description, tool.parameters)]);
+    }
+  }
+  // Null prototype: a tool literally named `__proto__` must land as an own key,
+  // never rewire the map's prototype.
+  const map = Object.create(null) as Record<string, string>;
+  for (const [name, identity] of entries) {
+    if (Object.prototype.hasOwnProperty.call(map, name)) {
+      throw new TypeError(`fingerprintTools: duplicate tool name '${name}'.`);
+    }
+    map[name] = await sha256Hex(canonicalJson(identity) ?? 'null');
+  }
+  const names = Object.keys(map).sort();
+  const sorted = Object.create(null) as Record<string, string>;
+  for (const name of names) sorted[name] = map[name]!;
+  const fingerprint = await sha256Hex(
+    canonicalJson(names.map((name) => [name, sorted[name]])) ?? '[]',
+  );
+  return { algorithm: 'sha-256', tools: sorted, fingerprint };
+}
+
+/**
+ * Compare two catalogs from {@link fingerprintTools} — typically the one you
+ * stored when the server was approved and the one it serves now. All three
+ * lists empty means no drift. Works on fingerprints that went through
+ * `JSON.stringify`/`JSON.parse`.
+ */
+export function detectToolDrift(previous: ToolFingerprints, current: ToolFingerprints): ToolDrift {
+  const has = (map: Record<string, string>, name: string): boolean =>
+    Object.prototype.hasOwnProperty.call(map, name);
+  const added: string[] = [];
+  const changed: string[] = [];
+  for (const name of Object.keys(current.tools)) {
+    if (!has(previous.tools, name)) added.push(name);
+    else if (previous.tools[name] !== current.tools[name]) changed.push(name);
+  }
+  const removed = Object.keys(previous.tools).filter((name) => !has(current.tools, name));
+  return { added: added.sort(), removed: removed.sort(), changed: changed.sort() };
+}
+
 // --- Connection lifecycle (2.0) ---------------------------------------------
 
 /**
