@@ -1,0 +1,294 @@
+---
+title: Schedules and signals
+description: Five-field UTC cron, a tick-driven scheduler with dedupe and catch-up, and verified GitHub, Slack and HMAC webhooks.
+---
+
+`@deuz-sdk/core/schedule` starts work from two kinds of outside events: time
+(cron schedules) and inbound webhooks (signals). It is edge-safe. The scheduler
+never reads the host clock on its own; you pass the time, or it reads the
+injected `deps.clock`. Signature checks use WebCrypto (`crypto.subtle`), so they
+run on Workers, Vercel Edge, Deno and Node alike.
+
+## Cron expressions
+
+`parseCron` reads the standard five fields — minute, hour, day of month, month,
+day of week — and evaluates them in **UTC**.
+
+```ts
+import { nextOccurrence, occurrencesBetween, parseCron } from '@deuz-sdk/core/schedule';
+
+const weekdays = parseCron('0 9 * * MON-FRI');
+console.log(weekdays.daysOfWeek); // [1, 2, 3, 4, 5]
+
+const from = Date.parse('2026-01-03T12:00:00Z'); // a Saturday
+console.log(new Date(nextOccurrence(weekdays, from)).toISOString());
+// 2026-01-05T09:00:00.000Z
+
+// The window excludes `from` and includes `to`, so back-to-back windows never overlap.
+const hours = occurrencesBetween('0 */6 * * *', from, from + 86_400_000);
+console.log(hours.map((ms) => new Date(ms).toISOString()));
+```
+
+| Syntax                                                | Meaning                                               |
+| ----------------------------------------------------- | ----------------------------------------------------- |
+| `*`                                                   | every value                                           |
+| `1,15`                                                | a list                                                |
+| `1-5`                                                 | an inclusive range                                    |
+| `*/15`, `10-50/10`                                    | every nth value of the field or of a range            |
+| `5/15`                                                | from 5 to the field maximum, every 15                 |
+| `JAN`–`DEC`, `SUN`–`SAT`                              | month and weekday names, any case; `7` is also Sunday |
+| `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly` | the usual macros (`@midnight`, `@annually` too)       |
+
+When **both** day fields are restricted, a day matches if either one does:
+`0 0 13 * FRI` fires on every 13th _and_ every Friday. A day field that starts
+with `*` (including `*/2`) counts as unrestricted, and then both must match —
+the Vixie cron rule. Expressions that can never fire, such as `0 0 30 2 *`, are
+rejected when parsed. `previousOccurrence(cron, beforeMs)` walks backwards.
+
+## Run schedules from a host cron trigger
+
+`createScheduler` turns schedules into runs. Each firing is an occurrence with
+a key `${id}@${at}` (`at` is the scheduled minute in epoch milliseconds), and a
+run happens only after `claim(key)` resolves `true`. Call `tick()` from your
+platform's cron trigger:
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+import { createScheduler } from '@deuz-sdk/core/schedule';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const model = createMockModel({ responses: [{ text: 'Three PRs merged overnight.' }] });
+
+const scheduler = createScheduler({
+  schedules: [
+    {
+      id: 'morning-digest',
+      cron: '0 9 * * MON-FRI',
+      async run(occurrence) {
+        const { text } = await generateText({ model, prompt: 'Summarise the night.' });
+        console.log(occurrence.key, text);
+      },
+    },
+  ],
+});
+
+// e.g. a Vercel cron route or a Cloudflare `scheduled` handler that fires every minute
+const result = await scheduler.tick(Date.parse('2026-01-05T09:00:20Z'));
+for (const occurrence of result.occurrences) {
+  console.log(occurrence.id, occurrence.status); // morning-digest ran
+}
+```
+
+`tick` never throws for your code: a failing `run` or `claim` comes back as
+`{ status: 'failed', phase: 'run' | 'claim', error }` for that occurrence, and
+the others still run. A claim that answers `false` gives `status: 'duplicate'`.
+
+Each tick evaluates the window `(from, now]`. The first tick of a scheduler
+looks back `lookbackMs` (default 60 000 ms, one cron minute, so a trigger that
+fires a few seconds late still catches its minute). Every later tick starts
+where the previous one ended.
+
+## Catch-up after downtime
+
+When a window holds several due occurrences of one schedule — the process was
+down, or a tick ran late — `catchUp` decides what runs:
+
+| `catchUp`            | Runs                                                                                                     |
+| -------------------- | -------------------------------------------------------------------------------------------------------- |
+| `'latest'` (default) | only the newest due occurrence                                                                           |
+| `'all'`              | every due occurrence, oldest first, keeping the newest `maxCatchUp` (default 100)                        |
+| `'none'`             | the newest one only if it is at most `graceMs` old (default 60 000; `start` uses its interval if larger) |
+
+A restarted process knows only its lookback window. To recover occurrences
+missed while it was down, raise `lookbackMs` and use a durable claim, so
+occurrences that already ran are reported as duplicates.
+
+```ts
+import { createInMemoryClaim, createScheduler } from '@deuz-sdk/core/schedule';
+
+const claim = createInMemoryClaim(); // stands in for a shared, durable claim
+const ran: string[] = [];
+const schedules = [
+  { id: 'hourly', cron: '0 * * * *', run: (o: { key: string }) => void ran.push(o.key) },
+];
+
+const before = createScheduler({ schedules, claim, catchUp: 'all', lookbackMs: 3 * 3_600_000 });
+await before.tick(Date.parse('2026-01-01T02:30:00Z')); // runs 00:00, 01:00, 02:00
+
+// The process restarts; the new scheduler looks back over the same hours.
+const after = createScheduler({ schedules, claim, catchUp: 'all', lookbackMs: 3 * 3_600_000 });
+const result = await after.tick(Date.parse('2026-01-01T03:10:00Z'));
+console.log(result.occurrences.map((o) => o.status)); // duplicates, then 03:00 ran
+console.log(ran.length); // 4
+```
+
+## Durable dedupe with a swarm run
+
+The default claim is an in-memory set: it dedupes overlapping ticks inside one
+process, not across processes or isolates. On a serverless host every tick may
+run in a fresh isolate, so give the scheduler a claim backed by storage all of
+them share. A durable run store already is one: use the occurrence key as the
+run id, and treat the store's create conflict as "already claimed".
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createScheduler } from '@deuz-sdk/core/schedule';
+import type { ScheduleDefinition } from '@deuz-sdk/core/schedule';
+import { createInMemorySwarmStore, createSwarm, SwarmConflictError } from '@deuz-sdk/core/swarm';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const writer = createAgent({ model: createMockModel({ responses: [{ text: 'report' }] }) });
+const swarm = createSwarm({
+  agents: { writer: { agent: writer, version: 'writer-v1' } },
+  store: createInMemorySwarmStore(), // shared by every process: SQLite or Postgres in production
+});
+
+const schedules: ScheduleDefinition[] = [
+  {
+    id: 'weekly-report',
+    cron: '0 8 * * MON',
+    async run(occurrence) {
+      try {
+        const handle = await swarm.run({
+          scope: 'reports',
+          runId: occurrence.key, // the create fails if any process already started it
+          tasks: [{ id: 'write', agent: 'writer', prompt: 'Write the weekly report.' }],
+        });
+        const outcome = await handle.result;
+        console.log(occurrence.key, outcome.run.status);
+      } catch (error) {
+        if (!(error instanceof SwarmConflictError)) throw error;
+        console.log(occurrence.key, 'already claimed elsewhere');
+      }
+    },
+  },
+];
+
+// Two processes tick the same minute. The swarm store is the claim, so each
+// scheduler's own claim can simply say yes.
+for (const name of ['a', 'b']) {
+  const scheduler = createScheduler({ schedules, claim: () => true });
+  await scheduler.tick(Date.parse('2026-01-05T08:00:30Z'));
+  console.log('process', name, 'done');
+}
+// weekly-report@1767600000000 completed, then: already claimed elsewhere
+```
+
+Any storage with an atomic "insert if absent" works the same way as a `claim`:
+a unique-key insert in SQL, a KV `put` with a precondition, or a durable run
+store's create.
+
+## Long-running processes
+
+In a Node worker, `start` ticks immediately and then every `intervalMs` on
+`deps.clock.setTimeout`, until the signal aborts. The returned promise settles
+after the in-flight tick finishes.
+
+```ts
+import { createScheduler } from '@deuz-sdk/core/schedule';
+
+const scheduler = createScheduler({
+  schedules: [{ id: 'heartbeat', cron: '* * * * *', run: (o) => console.log('beat', o.at) }],
+});
+
+const controller = new AbortController();
+const stopped = scheduler.start({
+  intervalMs: 30_000,
+  signal: controller.signal,
+  onTick: (result) => console.log(result.occurrences.length, 'occurrences'),
+});
+
+// on shutdown
+controller.abort();
+await stopped;
+```
+
+## Verify webhooks
+
+Each verifier reads the request body **once** and answers
+`{ ok: true, body }` or `{ ok: false, reason }`, where `reason` is one of
+`missing-signature`, `malformed-signature`, `bad-signature`,
+`missing-timestamp`, `malformed-timestamp`, `stale-timestamp` or `body-used`.
+Signatures are compared in constant time.
+
+```ts
+import {
+  verifyGitHubWebhook,
+  verifyHmacSignature,
+  verifySlackRequest,
+} from '@deuz-sdk/core/schedule';
+
+// GitHub: X-Hub-Signature-256 = "sha256=" + hex HMAC-SHA256 of the raw body.
+const github = await verifyGitHubWebhook(
+  new Request('https://example.com/hooks/github', {
+    method: 'POST',
+    body: 'Hello, World!',
+    headers: {
+      'x-hub-signature-256':
+        'sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17',
+    },
+  }),
+  "It's a Secret to Everybody",
+);
+console.log(github); // { ok: true, body: 'Hello, World!' }
+
+// Slack: v0 signature over "v0:{timestamp}:{body}", with a replay window.
+// `now` is required: pass your clock's time (edge code never reads the host clock).
+const slack = await verifySlackRequest(
+  new Request('https://example.com/slack', { method: 'POST', body: 'text=hi' }),
+  'signing-secret',
+  { now: Date.parse('2026-01-05T09:00:00Z'), toleranceSeconds: 300 },
+);
+console.log(slack); // { ok: false, reason: 'missing-timestamp' }
+
+// Anything else signed with an HMAC: pick the algorithm, encoding and prefix.
+const custom = await verifyHmacSignature({
+  body: '{"event":"paid"}',
+  signature: 'sha256=not-a-real-signature',
+  secret: 'whsec',
+  algorithm: 'SHA-256',
+  encoding: 'hex',
+  prefix: 'sha256=',
+});
+console.log(custom); // { ok: false, reason: 'malformed-signature' }
+```
+
+## Turn a signal into work
+
+`handleSignal` verifies, dedupes and dispatches one request, and answers with
+the status the sender expects:
+
+| Status | When                                                                |
+| ------ | ------------------------------------------------------------------- |
+| `401`  | the verifier rejected the request (`{ ok: false, reason }`)         |
+| `200`  | `dedupe(key)` answered `false`: a redelivery; nothing is dispatched |
+| `202`  | `dispatch` resolved                                                 |
+| `500`  | `verify`, `key`, `dedupe` or `dispatch` threw                       |
+
+The key defaults to `sha256:` plus the hex SHA-256 of the body; derive a better
+one from the sender's delivery id when there is one.
+
+```ts
+import { createInMemoryClaim, handleSignal, verifyGitHubWebhook } from '@deuz-sdk/core/schedule';
+
+const dedupe = createInMemoryClaim(); // use a durable claim across instances
+
+export async function POST(request: Request): Promise<Response> {
+  return handleSignal(request, {
+    verify: (r) => verifyGitHubWebhook(r, 'webhook-secret'),
+    key: ({ request: r }) => r.headers.get('x-github-delivery') ?? undefined,
+    dedupe,
+    async dispatch({ body, key }) {
+      const event = JSON.parse(body) as { action?: string };
+      console.log('start run', key, event.action);
+    },
+  });
+}
+```
+
+<Callout type="warn" title="Dedupe happens before dispatch">
+  The key is claimed before `dispatch` runs, so a dispatch that throws answers `500` and the
+  sender's retry is then seen as a duplicate. Keep `dispatch` short — enqueue the work, or start a
+  durable run whose run id is the key — or skip `dedupe` and let an idempotent dispatch (a swarm run
+  with `runId: key`, ignoring `SwarmConflictError`) absorb redeliveries.
+</Callout>
