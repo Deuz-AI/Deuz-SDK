@@ -728,29 +728,35 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
       if (!evaluation && members.some((member) => member.program === program))
         evaluation = rejected('duplicate', 'The program is identical to a population member');
       if (!evaluation && options.novelty) {
-        embedding = (await embed([program]))[0];
-        if (!embedding) throw new Error('The novelty embedder returned no vector');
-        let closest: { member: EvolveCandidate; cosine: number } | undefined;
-        for (const member of members) {
-          const cosine = cosineSimilarity([...embedding], [...(await embeddingOf(member))]);
-          if (!closest || cosine > closest.cosine) closest = { member, cosine };
-        }
-        if (closest && closest.cosine >= config.maxCosine) {
-          const keep = options.novelty.judge
-            ? await options.novelty.judge({
-                program,
-                similar: {
-                  id: closest.member.id,
-                  program: closest.member.program,
-                  cosine: closest.cosine,
-                },
-              })
-            : false;
-          if (!keep)
-            evaluation = rejected(
-              'novelty',
-              `Cosine ${closest.cosine.toFixed(4)} to ${closest.member.id} is at or above ${config.maxCosine}`,
-            );
+        try {
+          embedding = (await embed([program]))[0];
+          if (!embedding) throw new Error('The novelty embedder returned no vector');
+          let closest: { member: EvolveCandidate; cosine: number } | undefined;
+          for (const member of members) {
+            const cosine = cosineSimilarity([...embedding], [...(await embeddingOf(member))]);
+            if (!closest || cosine > closest.cosine) closest = { member, cosine };
+          }
+          if (closest && closest.cosine >= config.maxCosine) {
+            const keep = options.novelty.judge
+              ? await options.novelty.judge({
+                  program,
+                  similar: {
+                    id: closest.member.id,
+                    program: closest.member.program,
+                    cosine: closest.cosine,
+                  },
+                })
+              : false;
+            if (!keep)
+              evaluation = rejected(
+                'novelty',
+                `Cosine ${closest.cosine.toFixed(4)} to ${closest.member.id} is at or above ${config.maxCosine}`,
+              );
+          }
+        } catch (error) {
+          // A cancel cuts an embedding request off (2.2): the slot is not done.
+          if (controller.signal.aborted) return { skipped: 'aborted' };
+          throw error;
         }
       }
       try {
@@ -1002,14 +1008,16 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
           emit({ type: 'candidate', candidate: seed, replayed: true });
         } else {
           let evaluation: Evaluation;
+          let embedding: readonly number[] | undefined;
           try {
             evaluation = await evaluate(options.initial, { id: seedId, generation: 0, island: 0 });
+            embedding = options.novelty ? (await embed([options.initial]))[0] : undefined;
           } catch (error) {
-            if (error instanceof StopSignal)
+            // A cancel cut the evaluation or the embedding off (2.2).
+            if (error instanceof StopSignal || controller.signal.aborted)
               return await finish('stopped', stopReason ?? 'cancelled');
             throw error;
           }
-          const embedding = options.novelty ? (await embed([options.initial]))[0] : undefined;
           seed = makeCandidate(
             { id: seedId, island: 0, slot: 0 },
             0,

@@ -202,9 +202,9 @@ generation, the seed's generation zero included, and again when a run resumes,
 so a seed or a resumed run that already meets them finishes without a model
 call. `handle.drain()` finishes the current generation and stops with reason
 `'drained'`. `handle.cancel()` or `options.signal` aborts in-flight work and
-stops with reason `'cancelled'`. A mutation cut off mid-call stores no
-candidate, so a resume makes that call again instead of replaying a partial
-answer. `handle.events()` replays every event of the handle from the start:
+stops with reason `'cancelled'`. A mutation cut off mid-call, or while its
+novelty embedding is in flight, stores no candidate, so a resume makes that
+call again instead of replaying a partial answer. `handle.events()` replays every event of the handle from the start:
 `generation.started`, `candidate`, `improvement`, `migration`, `island.reset`,
 `generation.committed` and `run.finished`.
 
