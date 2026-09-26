@@ -1,3 +1,4 @@
+import type { BudgetStore, PersistentBudgetScope } from './budget-store';
 import type { PriceProvider } from './deps';
 import type { Usage } from './usage';
 
@@ -97,7 +98,7 @@ export interface BudgetCompaction {
 }
 
 export interface BudgetLedgerSnapshot {
-  /** Version 2 (2.2) carries `aggregates` or `subtree`; 2.1 readers reject it. */
+  /** Version 2 (2.2) carries `aggregates`, `subtree` or `admission`; 2.1 readers reject it. */
   readonly version: 1 | 2;
   readonly revision: number;
   readonly budget: BudgetLimits;
@@ -110,6 +111,48 @@ export interface BudgetLedgerSnapshot {
    * continuity on resume but can never seed a ledger.
    */
   readonly subtree?: string;
+  /**
+   * Version 2: the persistent scopes every reservation is admitted against.
+   * Restoring requires the store again; a reader that cannot honour them
+   * must refuse the snapshot rather than admit without them.
+   */
+  readonly admission?: readonly PersistentBudgetScope[];
+}
+
+/** One scope crossing its warning threshold on admission (2.2). */
+export interface BudgetWarning {
+  readonly key: string;
+  readonly dimension: 'tokens' | 'usd';
+  /** Committed usage in the window, including the admitted request's estimate. */
+  readonly committed: number;
+  readonly limit: number;
+  /** `committed / limit * 100`. */
+  readonly percent: number;
+  readonly warnAtPercent: number;
+  /** The reservation that crossed the threshold. */
+  readonly requestId: string;
+}
+
+/**
+ * Persistent admission (2.2): after local admission, every reservation is also
+ * admitted by a shared `BudgetStore` against these scopes, inside the ledger's
+ * queue. Settlement and release are mirrored; unknown usage keeps the hold.
+ */
+export interface BudgetAdmission {
+  readonly store: BudgetStore;
+  readonly scopes: readonly PersistentBudgetScope[];
+  /** Warn when committed usage reaches this percentage of a scope limit. */
+  readonly warnAtPercent?: number;
+  /** Called once per crossing per scope and dimension; errors are ignored. */
+  readonly onWarning?: (warning: BudgetWarning) => void;
+}
+
+/**
+ * Admission when restoring: the snapshot supplies its scopes. Scopes given here
+ * are added, and a key the snapshot already has only tightens its limits.
+ */
+export interface BudgetAdmissionRestore extends Omit<BudgetAdmission, 'scopes'> {
+  readonly scopes?: readonly PersistentBudgetScope[];
 }
 
 export interface BudgetLedgerOptions {
@@ -117,6 +160,8 @@ export interface BudgetLedgerOptions {
   readonly snapshot?: BudgetLedgerSnapshot;
   /** Awaited under the shared mutation queue, before admission succeeds. */
   readonly persist?: (snapshot: BudgetLedgerSnapshot) => void | Promise<void>;
+  /** Shared persistent admission (2.2); required to restore a snapshot that records one. */
+  readonly admission?: BudgetAdmissionRestore;
 }
 
 /** In-process serialized accounting; external distributed admission needs a transactional store. */
@@ -154,7 +199,8 @@ export interface BudgetLedger {
 }
 
 export interface ExecutionContextSnapshot {
-  readonly version: 1;
+  /** Version 2 (2.2) when the ledger records persistent admission; 2.1 readers reject it. */
+  readonly version: 1 | 2;
   readonly policy: ExecutionPolicy;
   readonly budget: BudgetLimits;
   readonly depth: number;
@@ -164,6 +210,8 @@ export interface ExecutionContextSnapshot {
 }
 
 export interface ExecutionContextOptions extends BudgetLedgerOptions {
+  /** Shared persistent admission (2.2); child contexts inherit it through the ledger. */
+  readonly admission?: BudgetAdmission;
   readonly policy?: ExecutionPolicy;
   readonly scopeId?: string;
   readonly snapshot?: never;
@@ -175,6 +223,8 @@ export interface ExecutionContextRestoreOptions {
   readonly policy?: ExecutionPolicy;
   readonly budget?: BudgetLimits;
   readonly persist?: BudgetLedgerOptions['persist'];
+  /** Required when the snapshot records persistent admission (2.2). */
+  readonly admission?: BudgetAdmissionRestore;
 }
 
 export interface ExecutionChildOptions {

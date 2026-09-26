@@ -206,14 +206,16 @@ function context(
       return ledger.reserve({ ...input, scopes });
     },
     snapshot(): ExecutionContextSnapshot {
+      const saved = ledger.snapshot();
       return Object.freeze({
-        version: 1,
+        // Persistent admission must not be dropped by a 2.1 reader: it refuses version 2.
+        version: saved.admission ? 2 : 1,
         policy: constraints,
         budget,
         depth,
         scopeId,
         scopes,
-        ledger: ledger.snapshot(),
+        ledger: saved,
       });
     },
   };
@@ -227,7 +229,9 @@ export function createExecutionContext(
   const saved = options.snapshot;
   if (saved) {
     if (
-      saved.version !== 1 ||
+      (saved.version !== 1 && saved.version !== 2) ||
+      // Version 2 exists only to carry persistent admission, and always does.
+      (saved.version === 2) !== (saved.ledger?.admission !== undefined) ||
       !Number.isSafeInteger(saved.depth) ||
       saved.depth < 0 ||
       !Array.isArray(saved.scopes) ||
@@ -263,13 +267,18 @@ export function createExecutionContext(
       snapshot: saved.ledger,
       ...(saved.depth === 0 ? { budget } : {}),
       persist: options.persist,
+      admission: options.admission,
     });
     return context(constraints, budget, saved.depth, Object.freeze(scopes), ledger);
   }
   const constraints = policy(options.policy);
   const budget = intersectBudgetLimits(options.budget);
   const root = scope('scopeId' in options ? (options.scopeId ?? 'root') : 'root', budget);
-  const ledger = createBudgetLedger({ budget, persist: options.persist });
+  const ledger = createBudgetLedger({
+    budget,
+    persist: options.persist,
+    admission: options.admission,
+  });
   return context(constraints, budget, 0, Object.freeze([root]), ledger);
 }
 
