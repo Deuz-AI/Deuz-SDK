@@ -3,6 +3,10 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInMemoryPopulationStore } from '../src/evolve/store';
+import { evolve, resumeEvolve } from '../src/evolve/controller';
+import { createMockModel } from '../src/testing';
+import { attachConfig, readConfig } from '../src/internal/config-symbol';
+import type { EvolveOptions } from '../src/evolve/types';
 import { createSqlitePopulationStore } from '../src/node/evolve-sqlite';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import {
@@ -54,6 +58,56 @@ describe.skipIf(!DatabaseSync)('SQLite population store', () => {
     db.exec('INSERT INTO deuz_evolve_schema VALUES (1, 99)');
     const store = createSqlitePopulationStore({ path: ':memory:', database: db });
     await expect(store.loadRun(runRecord())).rejects.toThrow(/schema version/i);
+  });
+
+  it('drives an evolve run to a file and resumes it from a fresh connection with zero calls', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'deuz-evolve-run-'));
+    cleanup.push(() =>
+      rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }),
+    );
+    const path = join(directory, 'evolve.sqlite');
+    const grow =
+      '<<<<<<< SEARCH\n    return x\n=======\n    x = x + 1\n    return x\n>>>>>>> REPLACE';
+    let calls = 0;
+    const base = createMockModel({ responses: [{ text: grow }] });
+    const config = readConfig(base)!;
+    const model = attachConfig(
+      { ...base },
+      {
+        ...config,
+        fetch: ((input: RequestInfo | URL, init?: RequestInit) => {
+          calls++;
+          return config.fetch!(input, init);
+        }) as typeof fetch,
+      },
+    );
+    const options = (store: EvolveOptions['store'], generations: number): EvolveOptions => ({
+      scope: 'tenant',
+      runId: 'file-run',
+      initial: 'def f(x):\n    # EVOLVE-BLOCK-START\n    return x\n    # EVOLVE-BLOCK-END\n',
+      stages: [{ evaluate: (program) => ({ score: program.split('x = x + 1').length - 1 }) }],
+      models: [{ model }],
+      store,
+      generations,
+      mutationsPerGeneration: 2,
+      budget: { tokens: 1_000_000 },
+      seed: 'file',
+    });
+    const first = createSqlitePopulationStore({ path });
+    const done = await evolve(options(first, 2)).result;
+    await first.close();
+    expect(done).toMatchObject({ status: 'completed', generation: 2 });
+    expect(calls).toBe(4);
+
+    const second = createSqlitePopulationStore({ path });
+    cleanup.push(() => second.close());
+    const again = await resumeEvolve(options(second, 2)).result;
+    expect(calls).toBe(4);
+    expect(again.best?.program).toBe(done.best?.program);
+    const more = await resumeEvolve(options(second, 3)).result;
+    expect(calls).toBe(6);
+    expect(more.generation).toBe(3);
+    expect(more.run.executionState?.ledger.reservations).toEqual([]);
   });
 
   it('rejects use after close', async () => {
