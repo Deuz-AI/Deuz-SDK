@@ -4,6 +4,7 @@
  * lease providers and native agent run stores. Edge-safe.
  */
 import type { Clock } from './types/deps';
+import type { AgentRunEnvelope } from './types/agent-run';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from './types/lease';
 import { resolveDependencies } from './internal/resolve-deps';
 
@@ -16,6 +17,22 @@ export function assertLeaseRequest(key: string, owner: string, ttlMs: number): v
     throw new TypeError('Lease owner must be a nonempty string');
   if (!Number.isSafeInteger(ttlMs) || ttlMs < 1)
     throw new TypeError('Lease ttlMs must be a positive integer');
+}
+
+/**
+ * The native run store fence (2.2): a save must carry the stored revision plus
+ * one. A stored 2.1 envelope without a revision counts as 0, and a
+ * revision-less save is accepted only while the stored run is still unfenced.
+ */
+export function assertEnvelopeRevision(
+  stored: Pick<AgentRunEnvelope, 'revision'> | undefined,
+  next: Pick<AgentRunEnvelope, 'revision' | 'runId'>,
+): void {
+  const current = stored?.revision ?? 0;
+  if (next.revision === undefined ? current === 0 : next.revision === current + 1) return;
+  throw new Error(
+    `Agent run revision conflict for ${next.runId}: expected ${current + 1}, got ${String(next.revision)}`,
+  );
 }
 
 const SIGNALS: readonly LeaseSignal[] = ['cancel', 'drain'];

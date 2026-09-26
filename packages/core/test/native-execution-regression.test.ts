@@ -788,7 +788,8 @@ describe('native execution cross-feature regressions', () => {
     if (first.status !== 'suspended') throw new Error('Expected approval suspension');
     // A 2.1 checkpoint embedded the whole shared ledger, siblings included.
     const legacy = (await store.load('legacy'))!;
-    await store.save({ ...legacy, execution: child.snapshot() });
+    // The rewrite is the next revision: the store fences every save (2.2).
+    await store.save({ ...legacy, revision: legacy.revision! + 1, execution: child.snapshot() });
     await root.ledger.compact(sibling.scopeId);
     const resumed = await resumeAgent({
       ...options,
