@@ -1,6 +1,11 @@
 import { expectTypeOf, test } from 'vitest';
 import { createAgent } from '../src/agent';
-import type { AgentResult, AgentRunEnvelope, NativeExecutionContext } from '../src/agent';
+import type {
+  AgentResult,
+  AgentRunEnvelope,
+  BudgetAdmission,
+  NativeExecutionContext,
+} from '../src/agent';
 import { createInMemorySwarmStore, createRounds, createSwarm, SwarmLeaseError } from '../src/swarm';
 import type {
   RoundsDecision,
@@ -250,6 +255,7 @@ test('2.2 durability operations surface', () => {
     SwarmRunRecord['status'] | undefined
   >();
   expectTypeOf<SwarmOptions['lease']>().toEqualTypeOf<SwarmLeaseOptions | undefined>();
+  expectTypeOf<SwarmOptions['admission']>().toEqualTypeOf<BudgetAdmission | undefined>();
   expectTypeOf<SwarmLeaseOptions['ttlMs']>().toEqualTypeOf<number | undefined>();
   expectTypeOf<SwarmStore['listRuns']>().toEqualTypeOf<
     ((query: SwarmRunQuery) => Promise<SwarmRunRecord[]>) | undefined

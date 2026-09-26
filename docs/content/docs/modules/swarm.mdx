@@ -385,6 +385,11 @@ retains unknown amounts across recovery. Restoring with weaker defaults cannot
 relax the saved parent limits. Admission uses estimates; it does not promise a
 hard ceiling on a provider's eventual bill.
 
+`admission` on `createSwarm` (2.2) also admits every task's model calls against
+persistent scopes in a shared `BudgetStore`, such as a per-user or per-org
+budget that outlives the run. The run records the scopes, so resuming it needs
+the same `admission` store; see [Persistent budgets](/docs/modules/budgets#swarms).
+
 The run ledger grows with live work, not with history (2.2). When a task becomes
 completed, failed, blocked or cancelled it never reserves again, so the scheduler
 folds its reservations into `executionState.ledger.aggregates`: one entry per

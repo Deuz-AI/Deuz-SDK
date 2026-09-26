@@ -4,8 +4,11 @@ import { createInMemoryBudgetStore } from '../src/budget-store';
 import { createExecutionContext } from '../src/execution-policy';
 import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../src/agent-run';
 import { createMockModel } from '../src/testing';
+import { createAgent } from '../src/agent';
+import { createInMemorySwarmStore, createSwarm } from '../src/swarm';
+import type { SwarmStore } from '../src/types/swarm';
 import type { BudgetStore, PersistentBudgetScope } from '../src/types/budget-store';
-import type { BudgetWarning } from '../src/types/execution';
+import type { BudgetAdmission, BudgetWarning } from '../src/types/execution';
 
 function manualClock(start = 1_000_000) {
   let now = start;
@@ -360,5 +363,88 @@ describe('execution contexts with persistent admission', () => {
       status: 'failed',
       error: { message: expect.stringMatching(/persistent/) },
     });
+  });
+});
+
+describe('swarms with persistent admission', () => {
+  // Priced, so settlement replaces each hold with the actual usage.
+  const deps = { priceProvider: { priceUsage: () => 0.01 } };
+  const worker = () =>
+    createAgent({
+      model: createMockModel({
+        responses: [{ text: 'done', usage: { inputTokens: 10, outputTokens: 5 } }],
+      }),
+    });
+
+  it("admits every task's model calls against the swarm's persistent scopes", async () => {
+    const store = createInMemoryBudgetStore();
+    const swarm = createSwarm({
+      store: createInMemorySwarmStore(),
+      agents: { worker: worker() },
+      deps,
+      admission: { store, scopes: [user(100_000)] },
+    });
+    const outcome = await (
+      await swarm.run({ scope: 'tenant', tasks: [{ id: 'a', agent: 'worker', prompt: 'x' }] })
+    ).result;
+    expect(outcome.run.status).toBe('completed');
+    expect(await store.usage('user:1')).toMatchObject({ tokens: 15 });
+    expect(outcome.run.executionState).toMatchObject({
+      version: 2,
+      ledger: { admission: [user(100_000)] },
+    });
+  });
+
+  it('fails a task the shared scope cannot admit', async () => {
+    const store = createInMemoryBudgetStore();
+    const swarm = createSwarm({
+      store: createInMemorySwarmStore(),
+      agents: { worker: worker() },
+      deps,
+      admission: { store, scopes: [user(100)] },
+    });
+    const outcome = await (
+      await swarm.run({ scope: 'tenant', tasks: [{ id: 'a', agent: 'worker', prompt: 'x' }] })
+    ).result;
+    expect(outcome.tasks[0]).toMatchObject({
+      status: 'failed',
+      error: { message: expect.stringMatching(/persistent scope user:1/) },
+    });
+    expect(await store.usage('user:1')).toMatchObject({ tokens: 0 });
+  });
+
+  it('resumes an interrupted swarm with its persistent admission, and never without it', async () => {
+    const store = createInMemoryBudgetStore();
+    const inner = createInMemorySwarmStore();
+    let crash = true;
+    const swarms: SwarmStore = {
+      ...inner,
+      async commit(change) {
+        if (crash && change.events?.some((event) => event.type === 'task.completed')) {
+          crash = false;
+          throw new Error('crash before the task completes');
+        }
+        return inner.commit(change);
+      },
+    };
+    const options = (admission?: BudgetAdmission) => ({
+      store: swarms,
+      agents: { worker: worker() },
+      deps,
+      ...(admission ? { admission } : {}),
+    });
+    const handle = await createSwarm(options({ store, scopes: [user(100_000)] })).run({
+      scope: 'tenant',
+      runId: 'interrupted',
+      tasks: [{ id: 'a', agent: 'worker', prompt: 'x', replay: 'safe' }],
+    });
+    await expect(handle.result).rejects.toThrow('crash before the task completes');
+    await expect(
+      (async () => (await createSwarm(options()).resume(handle)).result)(),
+    ).rejects.toThrow(/persistent budget scopes/);
+    const resumed = await (await createSwarm(options({ store, scopes: [] })).resume(handle)).result;
+    expect(resumed.run.status).toBe('completed');
+    // The finished native run is recovered, not repeated: one admitted, settled call.
+    expect(await store.usage('user:1')).toMatchObject({ tokens: 15 });
   });
 });

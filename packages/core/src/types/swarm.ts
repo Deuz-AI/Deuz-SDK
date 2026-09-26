@@ -4,6 +4,7 @@ import type { AgentRunEnvelope, AgentRunOptions, AgentResult } from './agent-run
 import type { Dependencies } from './deps';
 import type { ToolApprovalResponse } from './tool';
 import type {
+  BudgetAdmission,
   BudgetLimits,
   ExecutionContextSnapshot,
   ExecutionPolicy,
@@ -289,6 +290,12 @@ export interface SwarmOptions {
   deps?: Dependencies;
   policy?: ExecutionPolicy;
   budget?: BudgetLimits;
+  /**
+   * Persistent budget scopes (2.2): every task's model calls are also admitted
+   * by this BudgetStore. The run records the scopes, so resuming it needs the
+   * store again; scopes given on resume only add or tighten.
+   */
+  admission?: BudgetAdmission;
   /** Let finished tasks spawn tasks at runtime (2.2); needs a store with 'spawn'. */
   dynamic?: SwarmDynamicLimits;
   /**

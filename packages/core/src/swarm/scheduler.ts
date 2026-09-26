@@ -261,12 +261,14 @@ export function createSwarm(options: SwarmOptions): Swarm {
             policy: options.policy,
             budget: options.budget,
             persist,
+            admission: options.admission,
           })
         : createExecutionContext({
             scopeId: id,
             policy: options.policy,
             budget: options.budget,
             persist,
+            admission: options.admission,
           });
       // Policy/scope state is durable before the first dispatch or reservation.
       await mutate(() => ({ run: { executionState: execution.snapshot() } }));
@@ -784,6 +786,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
             scopeId: swarmKey(key),
             policy: options.policy,
             budget: options.budget,
+            admission: options.admission,
           }).snapshot(),
         },
         tasks: cloneSwarm(

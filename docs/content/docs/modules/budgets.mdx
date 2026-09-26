@@ -149,6 +149,32 @@ Restoring without `admission` throws. Scopes passed on restore are added, and a
 key the snapshot already has keeps the tighter limits; changing its window
 throws.
 
+## Swarms
+
+A swarm refuses pre-bound execution contexts, so it takes persistent admission
+as an option instead. Every task's model calls are admitted against the scopes,
+and the run records them: resuming it needs the store again, and scopes passed
+on resume only add or tighten.
+
+```ts
+import { createAgent, createInMemoryBudgetStore } from '@deuz-sdk/core/agent';
+import { createInMemorySwarmStore, createSwarm } from '@deuz-sdk/core/swarm';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const budgets = createInMemoryBudgetStore();
+const admission = { store: budgets, scopes: [{ key: 'org:7', limits: { tokens: 1_000_000 } }] };
+const swarm = createSwarm({
+  store: createInMemorySwarmStore(),
+  agents: { worker: createAgent({ model: createMockModel({ responses: [{ text: 'done' }] }) }) },
+  admission,
+});
+const handle = await swarm.run({
+  scope: 'org-7',
+  tasks: [{ id: 'a', agent: 'worker', prompt: 'Work.' }],
+});
+await handle.result;
+```
+
 ## Durable stores
 
 The in-memory store is for tests and single-process deployments. Two durable
