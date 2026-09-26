@@ -3,7 +3,13 @@ import { createAgent } from '../src/agent';
 import { createMockModel } from '../src/testing';
 import { createInMemorySwarmStore, createSwarm } from '../src/swarm';
 import type { AgentToolReceipt } from '../src/types/agent-run';
-import type { SwarmOptions, SwarmStore, SwarmTaskRecord } from '../src/types/swarm';
+import { blackboardTools } from '../src/swarm/blackboard';
+import type {
+  SwarmChannelPost,
+  SwarmOptions,
+  SwarmStore,
+  SwarmTaskRecord,
+} from '../src/types/swarm';
 
 const receipts = (record: SwarmTaskRecord | undefined): AgentToolReceipt[] =>
   Object.values(record?.agentState?.toolResults ?? {});
@@ -117,7 +123,7 @@ describe('swarm blackboard (2.2)', () => {
                 {
                   toolCalls: [
                     { toolName: 'blackboard_post', args: { text: 'one' } },
-                    { toolName: 'blackboard_post', args: { text: 'two', data: { n: 2 } } },
+                    { toolName: 'blackboard_post', args: { text: 'two', data: '{"n":2}' } },
                   ],
                 },
                 { text: 'done' },
@@ -168,5 +174,65 @@ describe('swarm blackboard (2.2)', () => {
         tasks: [{ id: 'a', agent: 'scout', prompt: 'x', group: 'bad group' }],
       }),
     ).rejects.toThrow(/group/);
+  });
+});
+
+describe('swarm blackboard review fixes (2.2)', () => {
+  it('posts from a task with a long ID without failing the run', async () => {
+    const longId = 'x'.repeat(520);
+    const store = createInMemorySwarmStore();
+    const swarm = createSwarm({
+      store,
+      agents: {
+        scout: {
+          agent: createAgent({
+            model: createMockModel({
+              responses: [
+                { toolCalls: [{ toolName: 'blackboard_post', args: { text: 'note' } }] },
+                { text: 'done' },
+              ],
+            }),
+          }),
+          blackboard: { post: true },
+        },
+      },
+    });
+    const outcome = await (
+      await swarm.run({
+        scope: 'tenant',
+        runId: 'long',
+        tasks: [{ id: longId, agent: 'scout', prompt: 'post' }],
+      })
+    ).result;
+    expect(outcome.run.status).toBe('completed');
+    const notes = await store.readChannel!(outcome.run, 'main', 0, 10);
+    expect(notes.map((note) => [note.taskId, note.text])).toEqual([[longId, 'note']]);
+    expect(notes[0]!.entryId.length).toBeLessThanOrEqual(512);
+  });
+
+  it('types every tool parameter so strict providers accept it, and takes data as JSON text', async () => {
+    const posted: SwarmChannelPost[] = [];
+    const tools = blackboardTools({
+      key: { scope: 's', runId: 'r' },
+      task: { id: 'a', agent: 'x', prompt: 'p' },
+      config: { post: true, read: 'group' },
+      store: createInMemorySwarmStore(),
+      attempt: () => 1,
+      now: () => 1,
+      post: async (post) => void posted.push(post),
+    });
+    for (const [tool, definition] of Object.entries(tools)) {
+      const properties = (
+        definition.parameters as { properties: Record<string, { type?: unknown }> }
+      ).properties;
+      for (const [name, schema] of Object.entries(properties))
+        expect(schema.type, `${tool}.${name}`).toBeDefined();
+    }
+    const context = { toolCallId: 'c1', messages: [], modelStep: 1 } as never;
+    await tools.blackboard_post!.execute!({ text: 'n', data: '{"k":1}' }, context);
+    expect(posted[0]?.data).toEqual({ k: 1 });
+    await expect(
+      tools.blackboard_post!.execute!({ text: 'n', data: '{broken' }, context),
+    ).rejects.toThrow(/JSON/);
   });
 });

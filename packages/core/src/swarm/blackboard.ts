@@ -25,10 +25,33 @@ export function readableChannels(
   return config.read.map((channel) => validateChannelName(channel));
 }
 
+/** SHA-256 hex: keeps a post key short however long the task ID is. */
+async function digest(text: string): Promise<string> {
+  const bytes = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)),
+  );
+  let hex = '';
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/**
+ * A note's data arrives as JSON text: strict providers (Gemini) reject a
+ * parameter without a type, and no single type covers every JSON value.
+ */
+function parseData(data: unknown): unknown {
+  if (typeof data !== 'string') return data;
+  try {
+    return JSON.parse(data) as unknown;
+  } catch {
+    throw new Error('data must be JSON text, for example {"key": 1}');
+  }
+}
+
 /**
  * The blackboard tools an agent task receives (2.2). Both are idempotent: a
- * read has no effect, and a post is keyed by task, model step and call ID, so
- * replaying an interrupted call cannot add a second note.
+ * read has no effect, and a post is keyed by a hash of task, model step and
+ * call ID, so replaying an interrupted call cannot add a second note.
  */
 export function blackboardTools(input: {
   key: SwarmKey;
@@ -81,7 +104,7 @@ export function blackboardTools(input: {
         type: 'object',
         properties: {
           text: { type: 'string', minLength: 1, maxLength: SWARM_MAX_NOTE },
-          data: {},
+          data: { type: 'string', description: 'Optional JSON payload, as JSON text.' },
         },
         required: ['text'],
         additionalProperties: false,
@@ -91,15 +114,18 @@ export function blackboardTools(input: {
         const text = args?.text;
         if (typeof text !== 'string' || !text || text.length > SWARM_MAX_NOTE)
           throw new Error(`A note needs 1..${SWARM_MAX_NOTE} characters of text`);
+        const data = parseData(args.data);
         // Reject unserializable data here, as a tool error, before it can reach a commit.
-        encodeSwarm(args.data ?? null);
+        encodeSwarm(data ?? null);
         await input.post({
           channel: own,
-          entryId: JSON.stringify([input.task.id, context.modelStep ?? 0, context.toolCallId]),
+          entryId: `post:${await digest(
+            JSON.stringify([input.task.id, context.modelStep ?? 0, context.toolCallId]),
+          )}`,
           taskId: input.task.id,
           attempt: input.attempt(),
           text,
-          ...(args.data !== undefined ? { data: args.data } : {}),
+          ...(data !== undefined ? { data } : {}),
           at: input.now(),
         });
         return { posted: true, channel: own };

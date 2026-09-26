@@ -267,11 +267,29 @@ export function createSwarm(options: SwarmOptions): Swarm {
     const limits = initial.run.dynamic ? tightenLimits(initial.run.dynamic, dynamic) : undefined;
 
     /** Spawned tasks commit with the parent's terminal state: a crash never duplicates them. */
+    // Slots taken by spawns validated but not yet committed: two parents finishing
+    // together must not both fit under maxTasks and then kill the run at commit.
+    let reservedSlots = 0;
+
     async function finishTask(
       taskId: string,
       change: Partial<SwarmTaskRecord>,
       type: SwarmEventInput['type'],
       spawn: readonly SwarmTaskRecord[] = [],
+    ): Promise<void> {
+      reservedSlots += spawn.length;
+      try {
+        await commitFinish(taskId, change, type, spawn);
+      } finally {
+        reservedSlots -= spawn.length;
+      }
+    }
+
+    async function commitFinish(
+      taskId: string,
+      change: Partial<SwarmTaskRecord>,
+      type: SwarmEventInput['type'],
+      spawn: readonly SwarmTaskRecord[],
     ): Promise<void> {
       await mutate(() => ({
         tasks: [{ ...records.get(taskId)!, ...change, finishedAt: deps.clock.now() }],
@@ -295,6 +313,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
         on,
         requests,
         records,
+        reserved: reservedSlots,
         define: (task) => {
           defineTask(task, options);
           return version(task);
@@ -475,7 +494,10 @@ export function createSwarm(options: SwarmOptions): Swarm {
           signal: attempt.signal,
           execution: execution.child({
             scopeId: nativeId,
-            policy: deadline ? intersectExecutionPolicies(agent.policy, deadline) : agent.policy,
+            // No per-attempt deadline here: the native run saves its policy and a
+            // later attempt's deadline would read as a changed constraint on resume.
+            // The attempt signal enforces timeoutMs for agents.
+            policy: agent.policy,
             budget: intersectBudgetLimits(agent.agent.def.budget, agent.budget),
           }),
           bindingId: record.bindingVersion,

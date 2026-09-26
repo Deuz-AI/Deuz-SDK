@@ -134,8 +134,10 @@ recorded on the failed task's error instead. Compensation tasks cannot depend
 on the failed task.
 
 `timeoutMs` on any task (2.2) bounds each attempt. When it expires, the
-attempt's signal aborts and the task fails with `SwarmTaskTimeout`; model calls
-inside the attempt receive the same budget as an execution deadline.
+attempt's signal aborts and the task fails with `SwarmTaskTimeout`. A reducer's
+model calls also receive the budget as an execution deadline. An agent task
+relies on the signal alone, because its native run saves its policy and a
+changed deadline would stop it from resuming.
 
 A dynamic run has version 2 and needs a store whose `capabilities` include
 `'spawn'`; the memory and SQLite stores do. A store without it is refused
@@ -176,8 +178,10 @@ await handle.result;
 ```
 
 Notes are durable, ordered per channel, and journaled as `channel.posted`
-events. Both tools are idempotent: a post is keyed by task, model step and tool
-call, so resuming an interrupted post never adds a second note. At the task
+events. A post's optional `data` is JSON text, which the tool parses and stores
+as a value; strict providers reject an untyped parameter. Both tools are
+idempotent: a post is keyed by a hash of task, model step and tool call, so
+resuming an interrupted post never adds a second note. At the task
 level an interrupted agent task still follows the usual rule and waits in
 `needs_reconciliation` unless it is declared `replay: 'safe'` or retried. A
 blackboard binding needs a store with the `'channels'` capability; the memory

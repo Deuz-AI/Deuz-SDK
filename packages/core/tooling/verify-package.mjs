@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, resolve, sep } from 'node:path';
+import { dirname, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -157,6 +157,26 @@ for (const target of jsTargets) {
   } catch (error) {
     fail(`${target} cannot be loaded: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+// Built-ins that exist only under the node: prefix must keep it. A bundler that
+// strips the prefix (tsup's removeNodeProtocol) turns a lazy import('node:sqlite')
+// into a package lookup for 'sqlite' that only fails when a store first opens a
+// path — loading the entry above cannot catch it.
+const prefixOnly = /(?:import\(|require\(|from\s*)['"](sqlite|test|sea)['"]/;
+function builtFiles(directory) {
+  return readdirSync(directory).flatMap((name) => {
+    const path = resolve(directory, name);
+    if (statSync(path).isDirectory()) return builtFiles(path);
+    return /\.(?:js|cjs|mjs)$/.test(name) ? [path] : [];
+  });
+}
+for (const file of builtFiles(resolve(root, 'dist'))) {
+  const match = prefixOnly.exec(readFileSync(file, 'utf8'));
+  if (match)
+    fail(
+      `${relative(root, file)} loads '${match[1]}' without its node: prefix; keep removeNodeProtocol off`,
+    );
 }
 
 if (failures.length > 0) {

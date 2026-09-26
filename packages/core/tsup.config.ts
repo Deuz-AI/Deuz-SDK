@@ -65,6 +65,9 @@ export default defineConfig({
   treeshake: true,
   splitting: true,
   target: 'es2022',
+  // Keep `node:` prefixes: node:sqlite has no bare alias, so stripping the prefix
+  // (tsup's default) broke every SQLite store that opens a path. Node >= 22 only.
+  removeNodeProtocol: false,
   outExtension({ format }) {
     return { js: format === 'cjs' ? '.cjs' : '.js' };
   },
