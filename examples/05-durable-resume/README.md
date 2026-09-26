@@ -4,4 +4,6 @@
 
 **Run:** from the repo root, `npm install && npm run build`, then `ANTHROPIC_API_KEY=sk-ant-… npm run dev -w @deuz-examples/05-durable-resume` — **twice**. The first run crashes on purpose; the second one finishes it. Checkpoints land in `examples/05-durable-resume/.runs/`.
 
-**Look at:** `resumeFromCheckpoint(store, runId, options)` takes everything *except* `messages` and `session` — the checkpoint's stored history is the messages, and usage and step indices keep counting across legs.
+**Look at:** `resumeFromCheckpoint(store, runId, options)` takes everything *except* `messages` and `session` — the checkpoint's stored history is the messages. Step indices and the checkpoint's usage keep counting across legs, so budget stops see the whole run; the result of each leg reports that leg's own usage.
+
+This is the legacy `generateText` session. For the native engine (2.1+), a run stored in an `AgentRunStore` resumes with `resumeAgent` — see [`07-native-agent`](../07-native-agent).

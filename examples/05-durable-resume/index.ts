@@ -84,8 +84,9 @@ const goal =
 
 const result = resuming
   ? // The checkpoint's history IS the messages, so `resumeFromCheckpoint` takes
-    // everything EXCEPT `messages` and `session`. Usage and step indices keep
-    // counting across legs.
+    // everything EXCEPT `messages` and `session`. Step indices and the
+    // checkpoint's usage keep counting across legs (budget stops see the whole
+    // run); the result itself reports this leg's own usage.
     await resumeFromCheckpoint(store, RUN_ID, {
       model,
       tools,
@@ -108,6 +109,6 @@ const result = resuming
 
 console.log(`\n${result.text}`);
 console.log(
-  `runId=${result.runId} steps=${result.steps?.length ?? 1} tokens=${result.usage.totalTokens}`,
+  `runId=${result.runId} this leg: steps=${result.steps?.length ?? 1} tokens=${result.usage.totalTokens}`,
 );
 await store.delete?.(RUN_ID); // demo cleanup so the next run starts fresh
