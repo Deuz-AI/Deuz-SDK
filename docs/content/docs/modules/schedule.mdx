@@ -222,7 +222,8 @@ Any storage with an atomic "insert if absent" works the same way as a `claim`:
 a unique-key insert in SQL (what `ops.claims` is), a KV `put` with a
 precondition, or a durable run store's create. Give such a function a
 `release(key)` that deletes the key if you want `handleSignal` to free it when a
-dispatch fails.
+dispatch fails. Whatever `release` returns is awaited and ignored, so
+`Object.assign(claim, { release: (key) => redis.del(key) })` fits as written.
 
 ## Long-running processes
 
