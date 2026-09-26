@@ -201,7 +201,7 @@ const shared = createPostgresBudgetStore({ client: new pg.Pool(), schema: 'publi
   driver). Admission, settlement and release are each one statement, so a
   pooled client never splits them across connections. Windows use database
   time, never host clocks. The schema must exist; the tables are created on
-  first use.
+  first use, and concurrent first uses queue on an advisory lock.
 
 `usage(key, { since, byModel })` reports committed usage (settled amounts plus
 held estimates) over the key's history, or since a point in time; a bucket that

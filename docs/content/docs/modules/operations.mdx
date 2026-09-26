@@ -21,8 +21,8 @@ Two mechanisms keep this safe:
 | Entry | Contents | Runtime |
 | --- | --- | --- |
 | `@deuz-sdk/core/ops` | `createInMemoryLeaseProvider`, lease types | Edge-safe |
-| `@deuz-sdk/core/ops/sqlite` | `createSqliteOpsStore`: leases and agent runs | Node |
-| `@deuz-sdk/core/ops/postgres` | `createPostgresOpsStore`: leases and agent runs | Node |
+| `@deuz-sdk/core/ops/sqlite` | `createSqliteOpsStore`: leases, agent runs and schedule claims | Node |
+| `@deuz-sdk/core/ops/postgres` | `createPostgresOpsStore`: leases, agent runs and schedule claims | Node |
 | `@deuz-sdk/core/swarm/postgres` | `createPostgresSwarmStore` | Node |
 
 ## Leases
@@ -226,17 +226,22 @@ console.log((await runningRuns(createInMemorySwarmStore())).length); // 0
 ## SQLite ops store
 
 `createSqliteOpsStore({ path, database?, wal?, clock? })` returns `leases`,
-`agentRuns` and `close()`. It keeps its own schema version table and writes in
-`BEGIN IMMEDIATE` transactions, so several processes can share the file,
-including the swarm store's file. Lease times come from `clock`, which defaults
-to the host clock: processes sharing a file must have synchronised clocks.
+`agentRuns`, `claims` and `close()`. `claims` is a durable
+[schedule claim](/docs/modules/schedule#durable-claims-from-the-ops-stores) for
+`createScheduler` and `handleSignal`. The store keeps its own schema version
+table and writes in `BEGIN IMMEDIATE` transactions or single statements, so
+several processes can share the file, including the swarm store's file. Lease
+times come from `clock`, which defaults to the host clock: processes sharing a
+file must have synchronised clocks.
 
 ## Postgres
 
 `createPostgresSwarmStore({ client, schema? })` and
 `createPostgresOpsStore({ client, schema? })` take any client with
-`query(sql, params)`, such as a `pg` pool. The schema defaults to `public` and
-must exist; the tables are created on first use.
+`query(sql, params)`, such as a `pg` pool; the ops store returns `leases`,
+`agentRuns` and `claims`. The schema defaults to `public` and must exist; the
+tables are created on first use, in one statement that queues on an advisory
+lock, so several processes can start on a new schema at once.
 
 ```ts
 import pg from 'pg';
@@ -264,6 +269,12 @@ event write in the same statement is gated on that update. If another writer
 moved the run first, nothing is written and the commit rejects with
 `SwarmConflictError`. Postgres leases use the database clock, so host clock skew
 does not matter.
+
+The stores expect `READ COMMITTED`, Postgres's default. Under a
+`REPEATABLE READ` or `SERIALIZABLE` session default, table creation and claims
+run their statement again after a serialization failure (40001), but another
+contended write, such as a lease acquire, an agent run save or a swarm commit,
+can reject with it.
 
 ## Native agent run revisions
 
