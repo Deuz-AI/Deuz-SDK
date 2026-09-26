@@ -48,6 +48,15 @@ const executors = new WeakMap<SwarmStore, Set<string>>();
 // recover (2.2): the most running runs one call examines, and its listing page.
 const RECOVER_SCAN = 10_000;
 const RECOVER_PAGE = 1_000;
+// recover (2.2): consecutive failures, other than a run's own, that end a scan.
+const RECOVER_FAILURES = 3;
+// Why a resume failed, for recover (2.2): 'lease' when the lease provider threw
+// on acquire, 'run' when a check on the run's own content refused it.
+const failureKinds = new WeakMap<object, 'lease' | 'run'>();
+function tagFailure(error: unknown, kind: 'lease' | 'run'): unknown {
+  if (typeof error === 'object' && error !== null) failureKinds.set(error, kind);
+  return error;
+}
 // Terminal tasks never run again, so their accounting can fold (2.2).
 const TERMINAL: ReadonlySet<SwarmTaskStatus> = new Set<SwarmTaskStatus>([
   'completed',
@@ -159,11 +168,16 @@ export function createSwarm(options: SwarmOptions): Swarm {
   const leaseKey = (key: SwarmKey): string => `swarm:${swarmKey(key)}`;
   const claim = async (key: SwarmKey): Promise<Lease | undefined> => {
     if (!leasing) return undefined;
-    const lease = await leasing.provider.acquire({
-      key: leaseKey(key),
-      owner: leaseOwner,
-      ttlMs: leaseTtl,
-    });
+    let lease: Lease | undefined;
+    try {
+      lease = await leasing.provider.acquire({
+        key: leaseKey(key),
+        owner: leaseOwner,
+        ttlMs: leaseTtl,
+      });
+    } catch (error) {
+      throw tagFailure(error, 'lease');
+    }
     if (!lease) throw new SwarmLeaseError('held');
     return lease;
   };
@@ -277,6 +291,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
         run: { executionState: { ...execution.snapshot(), ledger }, updatedAt: deps.clock.now() },
       }));
     };
+    let contextReady = false;
     try {
       execution = initial.run.executionState
         ? createExecutionContext({
@@ -293,12 +308,14 @@ export function createSwarm(options: SwarmOptions): Swarm {
             persist,
             admission: options.admission,
           });
+      contextReady = true;
       // Policy/scope state is durable before the first dispatch or reservation.
       await mutate(() => ({ run: { executionState: execution.snapshot() } }));
     } catch (error) {
       owned.delete(id);
       await unclaim(lease);
-      throw error;
+      // Saved execution state this process cannot restore is the run's own failure.
+      throw contextReady ? error : tagFailure(error, 'run');
     }
 
     const cancel = async () => {
@@ -801,13 +818,18 @@ export function createSwarm(options: SwarmOptions): Swarm {
     return handle;
   }
 
-  /** A resume's reads and checks: the run and the task changes its claim commits. */
-  async function prepareResume(input: SwarmResumeOptions): Promise<{
+  /**
+   * A resume's checks on the loaded run and the task changes its claim commits.
+   * Every failure here is the run's own (2.2): recover reports it and goes on.
+   */
+  function prepareResume(
+    input: SwarmResumeOptions,
+    snapshot: SwarmSnapshot | undefined,
+  ): {
     snapshot: SwarmSnapshot;
     changes: SwarmTaskRecord[];
     controlEvents: SwarmEventInput[];
-  }> {
-    const snapshot = await options.store.load(input);
+  } {
     if (!snapshot) throw new Error('Swarm run not found');
     validateSwarmSnapshot(snapshot, input);
     if (
@@ -948,7 +970,13 @@ export function createSwarm(options: SwarmOptions): Swarm {
       let queued: readonly LeaseSignal[] = [];
       let snapshot: SwarmSnapshot;
       try {
-        const prepared = await prepareResume(input);
+        const loaded = await options.store.load(input);
+        let prepared: ReturnType<typeof prepareResume>;
+        try {
+          prepared = prepareResume(input, loaded);
+        } catch (error) {
+          throw tagFailure(error, 'run');
+        }
         snapshot = prepared.snapshot;
         const { changes, controlEvents } = prepared;
         ({ lease, signals: queued } = await collect(lease));
@@ -1051,6 +1079,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
       }
       const handles: SwarmHandle[] = [];
       const failed: SwarmRecovery['failed'] = [];
+      let failing = 0;
       for (const [id, { key, revision }] of listed) {
         if (handles.length >= limit) break;
         if (owned.has(id)) continue;
@@ -1058,10 +1087,10 @@ export function createSwarm(options: SwarmOptions): Swarm {
           handles.push(
             await swarm.resume({ ...key, expectedRevision: revision, expectedStatus: 'running' }),
           );
+          failing = 0;
         } catch (error) {
           // A live holder, a run that moved on since it was listed, or one this
-          // process took up meanwhile. Anything else is this run's own failure,
-          // and it must not cost the other runs their recovery.
+          // process took up meanwhile.
           if (
             error instanceof SwarmLeaseError ||
             error instanceof SwarmConflictError ||
@@ -1069,6 +1098,14 @@ export function createSwarm(options: SwarmOptions): Swarm {
           )
             continue;
           failed.push({ key, error });
+          // A run's own failure (a definition this process lacks, say) must not
+          // cost the others their recovery. An outage would fail every run
+          // after it: a lease provider that throws on acquire ends the scan at
+          // once, any other failure (a store's, say) once it repeats.
+          const kind = typeof error === 'object' && error ? failureKinds.get(error) : undefined;
+          if (kind === 'lease') break;
+          failing = kind === 'run' ? 0 : failing + 1;
+          if (failing >= RECOVER_FAILURES) break;
         }
       }
       return { handles, failed };

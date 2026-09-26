@@ -404,6 +404,87 @@ describe('swarm recover', () => {
     expect(new Set(examined).size).toBe(1_500);
   });
 
+  it('stops at the first claim the lease provider fails, with what it started', async () => {
+    const time = manualClock();
+    const store = createInMemorySwarmStore();
+    for (let index = 0; index < 300; index++)
+      await store.create(crashed(`r${String(index).padStart(3, '0')}`, index + 1), []);
+    const inner = createInMemoryLeaseProvider({ clock: time.clock });
+    const outage = new Error('connect ECONNREFUSED');
+    let acquired = 0;
+    // The provider answers the first claim, then goes down.
+    const provider: LeaseProvider = {
+      ...inner,
+      async acquire(request) {
+        if (++acquired > 1) throw outage;
+        return inner.acquire(request);
+      },
+    };
+    const swarm = swarmOn({
+      store,
+      clock: time.clock,
+      provider,
+      release: Promise.resolve(),
+      calls: [],
+    });
+    const { handles, failed } = await swarm.recover({ limit: 5 });
+    expect(handles.map((handle) => handle.runId)).toEqual(['r000']);
+    expect(failed).toEqual([{ key: { scope: 'tenant', runId: 'r001' }, error: outage }]);
+    expect(acquired).toBe(2);
+    expect((await handles[0]!.result).run.status).toBe('completed');
+  });
+
+  it('stops after three runs in a row fail for a reason that is not their own', async () => {
+    const time = manualClock();
+    const inner = createInMemorySwarmStore();
+    for (const [index, runId] of ['r1', 'r2', 'r3', 'r4', 'r5'].entries())
+      await inner.create(crashed(runId, index + 1), []);
+    const outage = new Error('connect ECONNREFUSED');
+    let loads = 0;
+    // The store answers the listing, then goes down.
+    const down: SwarmStore = {
+      ...inner,
+      async load() {
+        loads++;
+        throw outage;
+      },
+    };
+    const swarm = swarmOn({
+      store: down,
+      clock: time.clock,
+      provider: createInMemoryLeaseProvider({ clock: time.clock }),
+      release: Promise.resolve(),
+      calls: [],
+    });
+    const { handles, failed } = await swarm.recover();
+    expect(handles).toEqual([]);
+    expect(failed).toEqual(
+      ['r1', 'r2', 'r3'].map((runId) => ({ key: { scope: 'tenant', runId }, error: outage })),
+    );
+    expect(loads).toBe(3);
+  });
+
+  it('goes on past any number of runs that fail on their own content', async () => {
+    const time = manualClock();
+    const store = createInMemorySwarmStore();
+    // After a finished rolling deploy: runs of the previous definition nobody can resume.
+    for (const [index, runId] of ['r1', 'r2', 'r3', 'r4', 'r5'].entries())
+      await store.create(crashed(runId, index + 1, 'v1'), []);
+    await store.create(crashed('r6', 6, 'v2'), []);
+    const swarm = swarmOn({
+      store,
+      clock: time.clock,
+      provider: createInMemoryLeaseProvider({ clock: time.clock }),
+      release: Promise.resolve(),
+      calls: [],
+      definitionVersion: 'v2',
+    });
+    const { handles, failed } = await swarm.recover();
+    expect(failed.map((item) => item.key.runId)).toEqual(['r1', 'r2', 'r3', 'r4', 'r5']);
+    expect(handles.map((handle) => handle.runId)).toEqual(['r6']);
+    expect((await handles[0]!.result).run.status).toBe('completed');
+  });
+
   it('refuses a run another executor holds without reading its snapshot', async () => {
     const time = manualClock();
     const provider = createInMemoryLeaseProvider({ clock: time.clock });

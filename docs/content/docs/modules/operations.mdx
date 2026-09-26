@@ -155,11 +155,15 @@ have no live executor, and resumes each one this process does not drive with
 `expectedRevision`. It resolves to `{ handles, failed }`: the executors it
 started, and the runs it could not resume, each with its `key` and `error`.
 Runs with a live lease holder, and runs that changed while being claimed, are
-skipped silently. Any other failure, such as a run left by a worker with an
-older `definitionVersion` during a rolling deploy, is reported in `failed` and
-does not stop the call: the other runs are still recovered. `recover` needs the
-`lease` option and a store with the `'list'` capability; the memory, SQLite and
-Postgres stores have it.
+skipped silently. Any other failure is reported in `failed`. A run's own
+failure, such as a run left by a worker with an older `definitionVersion` during
+a rolling deploy, does not stop the call: the other runs are still recovered.
+An outage does, because it would fail every run after it. If the lease provider
+throws on an acquire, `recover` stops at once; after three failures in a row of
+any other kind, such as a store that went down after the listing, it stops too.
+Either way it returns the executors it already started, and `failed` ends with
+the run that stopped it. `recover` needs the `lease` option and a store with the
+`'list'` capability; the memory, SQLite and Postgres stores have it.
 
 Heartbeats do not write to the swarm store, so a healthy run can keep an old
 `updatedAt` and sort ahead of a crashed one. `recover` therefore pages through
