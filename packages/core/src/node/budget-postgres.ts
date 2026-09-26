@@ -19,7 +19,7 @@
  * (`postgres-migrate.ts`), so concurrent first uses never race.
  */
 import type { PgClientLike } from './store-postgres';
-import { postgresSchemaStatement } from './postgres-migrate';
+import { createPostgresSchema, postgresSchemaStatement } from './postgres-migrate';
 import type { BudgetStore, BudgetStoreReservation } from '../types/budget-store';
 import {
   assertBudgetActual,
@@ -78,9 +78,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
   });
 
   const migrate = (): Promise<void> => {
-    migrating ??= (async () => {
-      await client.query(schemaSql);
-    })().catch((error: unknown) => {
+    migrating ??= createPostgresSchema(client, schemaSql).catch((error: unknown) => {
       migrating = undefined;
       throw error;
     });

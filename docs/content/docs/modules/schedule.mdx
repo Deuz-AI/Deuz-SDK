@@ -137,7 +137,9 @@ them share. The SQLite and Postgres ops stores carry one: `claims` grants a key
 once across every process on the same file or database, in one statement
 (`INSERT … ON CONFLICT DO NOTHING RETURNING`: the key is granted when the row
 comes back, so an injected SQLite driver need not report a change count), and
-`claims.release(key)` gives it back.
+`claims.release(key)` gives it back. On a Postgres session that defaults to
+`REPEATABLE READ` or `SERIALIZABLE`, the loser of a race meets a serialization
+failure (40001); the store runs the statement again, and it answers `false`.
 
 ```ts
 import { createScheduler } from '@deuz-sdk/core/schedule';

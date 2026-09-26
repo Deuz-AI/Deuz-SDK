@@ -11,7 +11,7 @@ import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/l
 import { assertLeaseRequest } from '../internal/ops-validate';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 import { postgresSchemaName } from './swarm-postgres';
-import { postgresSchemaStatement } from './postgres-migrate';
+import { createPostgresSchema, postgresSchemaStatement, retryPostgres } from './postgres-migrate';
 
 // Persistent budget scopes (2.2, M5) share this Node-only subpath: one import
 // for every durable ops store on Postgres.
@@ -85,11 +85,8 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       `CREATE TABLE IF NOT EXISTS ${claimsTable} (key TEXT PRIMARY KEY, claimed_at BIGINT NOT NULL)`,
     ],
   });
-  const migrate = async (): Promise<void> => {
-    await query(schemaSql);
-  };
   const use = async (): Promise<void> => {
-    ready ??= migrate().catch((error: unknown) => {
+    ready ??= createPostgresSchema(options.client, schemaSql).catch((error: unknown) => {
       ready = undefined;
       throw error;
     });
@@ -196,11 +193,15 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
     async (key: string): Promise<boolean> => {
       const row = await claimRowKey(key);
       await use();
-      // One statement: whichever session inserts the key first wins it.
-      const rows = await query(
-        `INSERT INTO ${claimsTable} (key, claimed_at) VALUES ($1, ${NOW})
-        ON CONFLICT (key) DO NOTHING RETURNING 1 AS claimed`,
-        [row],
+      // One statement: whichever session inserts the key first wins it. Under
+      // REPEATABLE READ or SERIALIZABLE the loser fails with 40001 instead of
+      // doing nothing; run again, the statement sees the winner's row.
+      const rows = await retryPostgres(['40001'], () =>
+        query(
+          `INSERT INTO ${claimsTable} (key, claimed_at) VALUES ($1, ${NOW})
+          ON CONFLICT (key) DO NOTHING RETURNING 1 AS claimed`,
+          [row],
+        ),
       );
       return rows.length === 1;
     },
@@ -208,7 +209,9 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       async release(key: string): Promise<void> {
         const row = await claimRowKey(key);
         await use();
-        await query(`DELETE FROM ${claimsTable} WHERE key = $1`, [row]);
+        await retryPostgres(['40001'], () =>
+          query(`DELETE FROM ${claimsTable} WHERE key = $1`, [row]),
+        );
       },
     },
   );

@@ -154,6 +154,40 @@ describe('Postgres ops store claims (PGlite)', () => {
     expect(await b.claims('digest@1')).toBe(false);
   });
 
+  it('runs a claim statement again when it fails with 40001, and answers from the retry', async () => {
+    const schema = await freshSchema();
+    expect(await createPostgresOpsStore({ client, schema }).claims('race')).toBe(true);
+    // Under REPEATABLE READ or SERIALIZABLE the loser of a race to insert a key
+    // fails with 40001 instead of doing nothing; run again, its statement sees
+    // the winner's row.
+    let failures = 0;
+    let attempts = 0;
+    const serializing: PgClientLike = {
+      async query(sql, params) {
+        if (/^\s*(INSERT INTO|DELETE FROM) \S+\.deuz_claims\b/.test(sql)) {
+          attempts++;
+          if (failures > 0) {
+            failures--;
+            throw Object.assign(new Error('could not serialize access'), { code: '40001' });
+          }
+        }
+        return client.query(sql, params);
+      },
+    };
+    const loser = createPostgresOpsStore({ client: serializing, schema });
+    failures = 1;
+    expect(await loser.claims('race')).toBe(false);
+    failures = 1;
+    expect(await loser.claims('fresh')).toBe(true);
+    failures = 1;
+    await loser.claims.release('fresh');
+    expect(await loser.claims('fresh')).toBe(true);
+    attempts = 0;
+    failures = Infinity;
+    await expect(loser.claims('stuck')).rejects.toMatchObject({ code: '40001' });
+    expect(attempts).toBe(5);
+  });
+
   it('stores a key over 512 characters or holding a NUL as its SHA-256', async () => {
     const schema = await freshSchema();
     const ops = createPostgresOpsStore({ client, schema });
