@@ -44,6 +44,9 @@ async function until(predicate: () => boolean) {
 const key = { scope: 'tenant', runId: 'run' };
 const leaseKey = (runId = 'run') => `swarm:${swarmKey({ scope: 'tenant', runId })}`;
 
+/** Another process's connection to the same durable store. */
+const connection = (store: SwarmStore): SwarmStore => ({ ...store });
+
 /** 'slow' waits for its gate (or an abort); 'fast' returns at once. */
 function reducers(release: Promise<void>, calls: string[]): Record<string, SwarmReducerBinding> {
   return {
@@ -241,6 +244,155 @@ describe('swarm recover', () => {
       status: 'running',
       revision: 0,
     });
+  });
+
+  it('reaches a crashed run behind live runs that keep old updatedAt values', async () => {
+    const time = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    const liveGate = gate();
+    const liveCalls: string[] = [];
+    const live = swarmOn({
+      store,
+      clock: time.clock,
+      provider,
+      owner: 'live',
+      release: liveGate.promise,
+      calls: liveCalls,
+    });
+    const busy = [
+      await live.run({ scope: 'tenant', runId: 'l1', tasks: [{ id: 'a', reducer: 'slow' }] }),
+      await live.run({ scope: 'tenant', runId: 'l2', tasks: [{ id: 'a', reducer: 'slow' }] }),
+    ];
+    // Last written at 5000 by an executor that is gone; its lease has lapsed.
+    await store.create(crashed('gone', 5_000), []);
+    await provider.acquire({ key: leaseKey('gone'), owner: 'dead', ttlMs: 1 });
+    await until(() => liveCalls.length === 2);
+    // l1 and l2 hold live leases, and nothing has moved their updatedAt of 1000.
+    await time.advance(5);
+    const calls: string[] = [];
+    const worker = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      provider,
+      owner: 'worker',
+      release: Promise.resolve(),
+      calls,
+    });
+    const { handles, failed } = await worker.recover({ limit: 2 });
+    expect(failed).toEqual([]);
+    expect(handles.map((handle) => handle.runId)).toEqual(['gone']);
+    expect((await handles[0]!.result).run.status).toBe('completed');
+    liveGate.resolve();
+    for (const handle of busy) expect((await handle.result).run.status).toBe('completed');
+  });
+
+  it('takes over at most limit runs per call', async () => {
+    const time = manualClock();
+    const store = createInMemorySwarmStore();
+    for (const [index, runId] of ['r1', 'r2', 'r3'].entries())
+      await store.create(crashed(runId, index + 1), []);
+    const swarm = swarmOn({
+      store,
+      clock: time.clock,
+      provider: createInMemoryLeaseProvider({ clock: time.clock }),
+      release: Promise.resolve(),
+      calls: [],
+    });
+    const first = await swarm.recover({ limit: 2 });
+    expect(first.handles.map((handle) => handle.runId)).toEqual(['r1', 'r2']);
+    for (const handle of first.handles) await handle.result;
+    const second = await swarm.recover({ limit: 2 });
+    expect(second.handles.map((handle) => handle.runId)).toEqual(['r3']);
+    await expect(swarm.recover({ limit: 0 })).rejects.toThrow(/limit/);
+    await expect(swarm.recover({ limit: 1001 })).rejects.toThrow(/limit/);
+  });
+
+  it('examines at most 10 000 running runs per call', async () => {
+    const time = manualClock();
+    let acquired = 0;
+    const runAt = (index: number) => crashed(`r${String(index).padStart(6, '0')}`, 1).run;
+    // Every listed run has a live holder, and the listing never ends.
+    const endless: SwarmStore = {
+      ...createInMemorySwarmStore(),
+      capabilities: ['list'],
+      async listRuns(query) {
+        const start = query.after ? Number(query.after.runId.slice(1)) + 1 : 0;
+        return Array.from({ length: query.limit }, (_, offset) => runAt(start + offset));
+      },
+    };
+    const provider: LeaseProvider = {
+      ...createInMemoryLeaseProvider({ clock: time.clock }),
+      async acquire() {
+        acquired++;
+        return undefined;
+      },
+    };
+    const swarm = swarmOn({
+      store: endless,
+      clock: time.clock,
+      provider,
+      release: Promise.resolve(),
+      calls: [],
+    });
+    expect(await swarm.recover()).toEqual({ handles: [], failed: [] });
+    expect(acquired).toBe(10_000);
+  });
+
+  it('stops listing when a store ignores the cursor', async () => {
+    const time = manualClock();
+    let acquired = 0;
+    const page = Array.from(
+      { length: 1_000 },
+      (_, index) => crashed(`r${String(index).padStart(4, '0')}`, 1).run,
+    );
+    // A store written against an older contract returns its first page every time.
+    const stale: SwarmStore = {
+      ...createInMemorySwarmStore(),
+      capabilities: ['list'],
+      listRuns: async (query) => page.slice(0, query.limit),
+    };
+    const provider: LeaseProvider = {
+      ...createInMemoryLeaseProvider({ clock: time.clock }),
+      async acquire() {
+        acquired++;
+        return undefined;
+      },
+    };
+    const swarm = swarmOn({
+      store: stale,
+      clock: time.clock,
+      provider,
+      release: Promise.resolve(),
+      calls: [],
+    });
+    expect(await swarm.recover()).toEqual({ handles: [], failed: [] });
+    expect(acquired).toBe(1_000);
+  });
+
+  it('refuses a run another executor holds without reading its snapshot', async () => {
+    const time = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    await store.create(crashed('run', 1), []);
+    await provider.acquire({ key: leaseKey(), owner: 'other', ttlMs: 60_000 });
+    let loads = 0;
+    const counted: SwarmStore = {
+      ...store,
+      load(input) {
+        loads++;
+        return store.load(input);
+      },
+    };
+    const swarm = swarmOn({
+      store: counted,
+      clock: time.clock,
+      provider,
+      release: Promise.resolve(),
+      calls: [],
+    });
+    await expect(swarm.resume(key)).rejects.toMatchObject({ code: 'held' });
+    expect(loads).toBe(0);
   });
 
   it.skipIf(!DatabaseSync)(

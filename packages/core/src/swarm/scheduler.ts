@@ -23,6 +23,7 @@ import type {
   SwarmOptions,
   SwarmRecovery,
   SwarmResumeOptions,
+  SwarmRunQuery,
   SwarmSnapshot,
   SwarmSpawnContext,
   SwarmSpawnRequest,
@@ -44,6 +45,9 @@ import { resolveDynamicLimits, spawnRecords, tightenLimits } from './spawn';
 import { blackboardTools, readableChannels, SWARM_GROUP } from './blackboard';
 
 const executors = new WeakMap<SwarmStore, Set<string>>();
+// recover (2.2): the most running runs one call examines, and its listing page.
+const RECOVER_SCAN = 10_000;
+const RECOVER_PAGE = 1_000;
 // Terminal tasks never run again, so their accounting can fold (2.2).
 const TERMINAL: ReadonlySet<SwarmTaskStatus> = new Set<SwarmTaskStatus>([
   'completed',
@@ -792,6 +796,89 @@ export function createSwarm(options: SwarmOptions): Swarm {
     return handle;
   }
 
+  /** A resume's reads and checks: the run and the task changes its claim commits. */
+  async function prepareResume(input: SwarmResumeOptions): Promise<{
+    snapshot: SwarmSnapshot;
+    changes: SwarmTaskRecord[];
+    controlEvents: SwarmEventInput[];
+  }> {
+    const snapshot = await options.store.load(input);
+    if (!snapshot) throw new Error('Swarm run not found');
+    validateSwarmSnapshot(snapshot, input);
+    if (
+      (input.expectedRevision !== undefined && snapshot.run.revision !== input.expectedRevision) ||
+      (input.expectedStatus !== undefined && snapshot.run.status !== input.expectedStatus)
+    )
+      throw new SwarmConflictError(
+        `Swarm run is at revision ${snapshot.run.revision} with status ${snapshot.run.status}, not the expected one`,
+      );
+    if (snapshot.run.version === 2 && !canSpawn)
+      throw new Error(
+        'This swarm store cannot persist spawned tasks: it lacks the "spawn" capability',
+      );
+    validateTasks(
+      snapshot.tasks.map((record) => record.task),
+      options,
+    );
+    if (
+      snapshot.run.definitionVersion !== definitionVersion ||
+      snapshot.tasks.some((record) => record.bindingVersion !== version(record.task))
+    )
+      throw new Error('Swarm definition version mismatch');
+    const retry = new Set(input.retryTaskIds ?? []);
+    for (const taskId of [
+      ...retry,
+      ...Object.keys(input.approvals ?? {}),
+      ...Object.keys(input.retryToolCallIds ?? {}),
+      ...Object.keys(input.clientToolResults ?? {}),
+    ]) {
+      if (!snapshot.tasks.some((record) => record.task.id === taskId))
+        throw new Error(`Unknown resume task: ${taskId}`);
+    }
+    if (Object.keys(input.retryToolCallIds ?? {}).some((taskId) => !retry.has(taskId)))
+      throw new Error('Tool reconciliation requires explicit retryTaskIds authorization');
+    const changes: SwarmTaskRecord[] = [];
+    const controlEvents: SwarmEventInput[] = [];
+    for (const record of snapshot.tasks) {
+      if (record.status === 'running' || record.status === 'needs_reconciliation') {
+        if (record.agentState?.result?.status === 'suspended') {
+          record.result = {
+            output: null,
+            text: record.agentState.result.text,
+            agentResult: record.agentState.result,
+          };
+          record.status =
+            Object.hasOwn(input.approvals ?? {}, record.task.id) ||
+            Object.hasOwn(input.clientToolResults ?? {}, record.task.id)
+              ? 'pending'
+              : 'suspended';
+          changes.push(record);
+          continue;
+        }
+        const safe =
+          record.agentState?.phase === 'terminal' ||
+          record.task.replay === 'safe' ||
+          retry.has(record.task.id);
+        record.status = safe ? 'pending' : 'needs_reconciliation';
+        if (!safe)
+          controlEvents.push({
+            type: 'task.reconciliation',
+            taskId: record.task.id,
+            timestamp: deps.clock.now(),
+          });
+        changes.push(record);
+      } else if (
+        record.status === 'suspended' &&
+        (Object.hasOwn(input.approvals ?? {}, record.task.id) ||
+          Object.hasOwn(input.clientToolResults ?? {}, record.task.id))
+      ) {
+        record.status = 'pending';
+        changes.push(record);
+      }
+    }
+    return { snapshot, changes, controlEvents };
+  }
+
   const swarm: Swarm = {
     async run(input) {
       if (!input.scope) throw new Error('Swarm scope is required');
@@ -848,86 +935,17 @@ export function createSwarm(options: SwarmOptions): Swarm {
     },
     async resume(input) {
       if (owned.has(swarmKey(input))) throw new Error('Swarm run already has an executor');
-      const snapshot = await options.store.load(input);
-      if (!snapshot) throw new Error('Swarm run not found');
-      validateSwarmSnapshot(snapshot, input);
-      if (
-        (input.expectedRevision !== undefined &&
-          snapshot.run.revision !== input.expectedRevision) ||
-        (input.expectedStatus !== undefined && snapshot.run.status !== input.expectedStatus)
-      )
-        throw new SwarmConflictError(
-          `Swarm run is at revision ${snapshot.run.revision} with status ${snapshot.run.status}, not the expected one`,
-        );
-      if (snapshot.run.version === 2 && !canSpawn)
-        throw new Error(
-          'This swarm store cannot persist spawned tasks: it lacks the "spawn" capability',
-        );
-      validateTasks(
-        snapshot.tasks.map((record) => record.task),
-        options,
-      );
-      if (
-        snapshot.run.definitionVersion !== definitionVersion ||
-        snapshot.tasks.some((record) => record.bindingVersion !== version(record.task))
-      )
-        throw new Error('Swarm definition version mismatch');
-      const retry = new Set(input.retryTaskIds ?? []);
-      for (const taskId of [
-        ...retry,
-        ...Object.keys(input.approvals ?? {}),
-        ...Object.keys(input.retryToolCallIds ?? {}),
-        ...Object.keys(input.clientToolResults ?? {}),
-      ]) {
-        if (!snapshot.tasks.some((record) => record.task.id === taskId))
-          throw new Error(`Unknown resume task: ${taskId}`);
-      }
-      if (Object.keys(input.retryToolCallIds ?? {}).some((taskId) => !retry.has(taskId)))
-        throw new Error('Tool reconciliation requires explicit retryTaskIds authorization');
-      const changes: SwarmTaskRecord[] = [];
-      const controlEvents: SwarmEventInput[] = [];
-      for (const record of snapshot.tasks) {
-        if (record.status === 'running' || record.status === 'needs_reconciliation') {
-          if (record.agentState?.result?.status === 'suspended') {
-            record.result = {
-              output: null,
-              text: record.agentState.result.text,
-              agentResult: record.agentState.result,
-            };
-            record.status =
-              Object.hasOwn(input.approvals ?? {}, record.task.id) ||
-              Object.hasOwn(input.clientToolResults ?? {}, record.task.id)
-                ? 'pending'
-                : 'suspended';
-            changes.push(record);
-            continue;
-          }
-          const safe =
-            record.agentState?.phase === 'terminal' ||
-            record.task.replay === 'safe' ||
-            retry.has(record.task.id);
-          record.status = safe ? 'pending' : 'needs_reconciliation';
-          if (!safe)
-            controlEvents.push({
-              type: 'task.reconciliation',
-              taskId: record.task.id,
-              timestamp: deps.clock.now(),
-            });
-          changes.push(record);
-        } else if (
-          record.status === 'suspended' &&
-          (Object.hasOwn(input.approvals ?? {}, record.task.id) ||
-            Object.hasOwn(input.clientToolResults ?? {}, record.task.id))
-        ) {
-          record.status = 'pending';
-          changes.push(record);
-        }
-      }
-      // The claim precedes the resume commit (2.2); the commit's revision check
-      // then fences out any writer that was still active a moment ago.
+      // The claim comes first (2.2): a run another executor holds is refused
+      // before its snapshot is read, which keeps recover's scan cheap. The
+      // resume commit's revision check then fences out any writer that was
+      // still active a moment ago.
       let lease = await claim(input);
       let queued: readonly LeaseSignal[] = [];
+      let snapshot: SwarmSnapshot;
       try {
+        const prepared = await prepareResume(input);
+        snapshot = prepared.snapshot;
+        const { changes, controlEvents } = prepared;
         ({ lease, signals: queued } = await collect(lease));
         // A cancel whose holder stopped before reading it applies here, before
         // any dispatch; one that lost the race to the run's end changes nothing.
@@ -997,23 +1015,41 @@ export function createSwarm(options: SwarmOptions): Swarm {
       if (!leasing) throw new Error('Swarm recover requires the lease option');
       if (!options.store.listRuns || !options.store.capabilities?.includes('list'))
         throw new Error('This swarm store cannot list runs: it lacks the "list" capability');
-      const runs = await options.store.listRuns({
-        status: 'running',
-        ...(input.scope !== undefined ? { scope: input.scope } : {}),
-        limit: input.limit ?? 100,
-      });
+      const limit = input.limit ?? 100;
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+        throw new Error('Swarm recover limit must be an integer from 1 to 1000');
+      // Page through the running runs (2.2): heartbeats and most commits leave
+      // updatedAt alone, so live runs can fill any one page. The listing comes
+      // first, so a listing failure rejects before anything has started.
+      const listed = new Map<string, { key: SwarmKey; revision: number }>();
+      let after: SwarmRunQuery['after'];
+      while (listed.size < RECOVER_SCAN) {
+        const size = Math.min(RECOVER_PAGE, RECOVER_SCAN - listed.size);
+        const page = await options.store.listRuns({
+          status: 'running',
+          ...(input.scope !== undefined ? { scope: input.scope } : {}),
+          limit: size,
+          ...(after ? { after } : {}),
+        });
+        const known = listed.size;
+        for (const run of page.slice(0, size))
+          listed.set(swarmKey(run), {
+            key: { scope: run.scope, runId: run.runId },
+            revision: run.revision,
+          });
+        const last = page.at(-1);
+        // A short page ends the listing, and so does one that adds nothing.
+        if (!last || page.length < size || listed.size === known) break;
+        after = { updatedAt: last.updatedAt, scope: last.scope, runId: last.runId };
+      }
       const handles: SwarmHandle[] = [];
       const failed: SwarmRecovery['failed'] = [];
-      for (const run of runs) {
-        const key: SwarmKey = { scope: run.scope, runId: run.runId };
-        if (owned.has(swarmKey(key))) continue;
+      for (const [id, { key, revision }] of listed) {
+        if (handles.length >= limit) break;
+        if (owned.has(id)) continue;
         try {
           handles.push(
-            await swarm.resume({
-              ...key,
-              expectedRevision: run.revision,
-              expectedStatus: 'running',
-            }),
+            await swarm.resume({ ...key, expectedRevision: revision, expectedStatus: 'running' }),
           );
         } catch (error) {
           // A live holder, a run that moved on since it was listed, or one this
@@ -1022,7 +1058,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
           if (
             error instanceof SwarmLeaseError ||
             error instanceof SwarmConflictError ||
-            owned.has(swarmKey(key))
+            owned.has(id)
           )
             continue;
           failed.push({ key, error });

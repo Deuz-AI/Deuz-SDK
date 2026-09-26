@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type {
   SwarmChannelPost,
   SwarmCommit,
+  SwarmRunRecord,
   SwarmSnapshot,
   SwarmStore,
   SwarmTaskRecord,
@@ -262,6 +263,68 @@ export function swarmStoreContracts(
         expect((await store.listRuns!({ limit: 1 }))[0]?.status).toBe('suspended');
         await expect(store.listRuns!({ limit: 0 })).rejects.toThrow();
         await expect(store.listRuns!({ limit: 1001 })).rejects.toThrow();
+      });
+
+      it('pages with an exclusive after cursor in the listing order', async () => {
+        const store = make();
+        await store.create(at('a', 'r1', 5), []);
+        await store.create(at('b', 'r1', 3), []);
+        await store.create(at('a', 'r2', 3), []);
+        await store.create(at('a', 'r3', 5), []);
+        await store.create(at('c', 'r0', 7), []);
+        await store.commit({
+          scope: 'c',
+          runId: 'r0',
+          expectedRevision: 0,
+          run: { status: 'suspended' },
+        });
+        const pages: string[][] = [];
+        let after: SwarmRunRecord | undefined;
+        // Bounded, so a store that ignores the cursor fails instead of looping.
+        for (let round = 0; round < 5; round++) {
+          const page = await store.listRuns!({ limit: 2, ...(after ? { after } : {}) });
+          pages.push(ids(page));
+          if (page.length < 2) break;
+          after = page.at(-1);
+        }
+        expect(pages).toEqual([['a/r2', 'b/r1'], ['a/r1', 'a/r3'], ['c/r0']]);
+        // Strictly after the cursor: ties on updatedAt fall back to scope, then runId.
+        const from = (updatedAt: number, scope: string, runId: string) =>
+          store.listRuns!({ limit: 10, after: { updatedAt, scope, runId } });
+        expect(ids(await from(3, 'a', 'r2'))).toEqual(['b/r1', 'a/r1', 'a/r3', 'c/r0']);
+        expect(ids(await from(3, 'b', 'r1'))).toEqual(['a/r1', 'a/r3', 'c/r0']);
+        expect(ids(await from(5, 'a', 'r1'))).toEqual(['a/r3', 'c/r0']);
+        expect(ids(await from(4, 'z', ''))).toEqual(['a/r1', 'a/r3', 'c/r0']);
+        expect(await from(7, 'c', 'r0')).toEqual([]);
+        // The cursor combines with the filters.
+        expect(
+          ids(
+            await store.listRuns!({
+              scope: 'a',
+              status: 'running',
+              limit: 10,
+              after: { updatedAt: 3, scope: 'a', runId: 'r2' },
+            }),
+          ),
+        ).toEqual(['a/r1', 'a/r3']);
+        expect(
+          ids(
+            await store.listRuns!({
+              status: 'running',
+              limit: 10,
+              after: { updatedAt: 5, scope: 'a', runId: 'r3' },
+            }),
+          ),
+        ).toEqual([]);
+        await expect(
+          store.listRuns!({ limit: 1, after: { updatedAt: Number.NaN, scope: 'a', runId: 'r' } }),
+        ).rejects.toThrow();
+        await expect(
+          store.listRuns!({
+            limit: 1,
+            after: { updatedAt: 1, scope: 7, runId: 'r' } as unknown as SwarmRunRecord,
+          }),
+        ).rejects.toThrow();
       });
     }
 

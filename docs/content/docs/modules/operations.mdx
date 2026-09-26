@@ -154,6 +154,14 @@ does not stop the call: the other runs are still recovered. `recover` needs the
 `lease` option and a store with the `'list'` capability; the memory, SQLite and
 Postgres stores have it.
 
+Heartbeats do not write to the swarm store, so a healthy run can keep an old
+`updatedAt` and sort ahead of a crashed one. `recover` therefore pages through
+the running runs, oldest `updatedAt` first, and examines up to 10 000 of them
+per call; `limit` (1 to 1000, default 100) caps how many it takes over. Each
+examined run costs one lease acquire: a run with a live holder is refused
+before its snapshot is read. With more than 10 000 running runs, the ones past
+that point wait until older runs finish.
+
 The following complete example runs a worker process against one SQLite file.
 Every process runs the same code; call `recover` at startup and on a timer.
 
@@ -185,8 +193,28 @@ try {
 }
 ```
 
-`SwarmStore.listRuns({ status?, scope?, limit })` is available directly for
-dashboards; it orders runs by `updatedAt`, then scope and run ID.
+`SwarmStore.listRuns({ status?, scope?, limit, after? })` is available directly
+for dashboards; it orders runs by `updatedAt`, then scope and run ID. Pass the
+last run of a page as `after` to get the runs strictly after it:
+
+```ts
+import { createInMemorySwarmStore } from '@deuz-sdk/core/swarm';
+import type { SwarmRunRecord, SwarmStore } from '@deuz-sdk/core/swarm';
+
+async function runningRuns(store: SwarmStore): Promise<SwarmRunRecord[]> {
+  if (!store.listRuns) throw new Error('This store cannot list runs');
+  const runs: SwarmRunRecord[] = [];
+  let after: SwarmRunRecord | undefined;
+  for (;;) {
+    const page = await store.listRuns({ status: 'running', limit: 100, after });
+    runs.push(...page);
+    if (page.length < 100) return runs;
+    after = page.at(-1);
+  }
+}
+
+console.log((await runningRuns(createInMemorySwarmStore())).length); // 0
+```
 
 ## SQLite ops store
 

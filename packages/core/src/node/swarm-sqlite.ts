@@ -191,6 +191,12 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
         where.push('scope=?');
         params.push(query.scope);
       }
+      if (query.after !== undefined) {
+        // Strictly after the cursor in the ORDER BY below (2.2).
+        const { updatedAt, scope, runId } = query.after;
+        where.push('(updated_at>? OR (updated_at=? AND (scope>? OR (scope=? AND run_id>?))))');
+        params.push(updatedAt, updatedAt, scope, scope, runId);
+      }
       return use((db) =>
         (
           statement(

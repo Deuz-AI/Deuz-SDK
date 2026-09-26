@@ -372,21 +372,31 @@ const RUN_STATUSES: readonly SwarmRunStatus[] = [
   'cancelled',
 ];
 
+/** A position in the listRuns order (2.2). */
+type SwarmRunCursor = NonNullable<SwarmRunQuery['after']>;
+
 /** Shared listRuns validation (2.2). */
 export function validateRunQuery(query: SwarmRunQuery): void {
+  const after: unknown = query?.after;
   if (
     !query ||
     !Number.isSafeInteger(query.limit) ||
     query.limit < 1 ||
     query.limit > 1000 ||
     (query.status !== undefined && !RUN_STATUSES.includes(query.status)) ||
-    (query.scope !== undefined && (typeof query.scope !== 'string' || !query.scope))
+    (query.scope !== undefined && (typeof query.scope !== 'string' || !query.scope)) ||
+    (after !== undefined &&
+      (!after ||
+        typeof after !== 'object' ||
+        !Number.isFinite((after as SwarmRunCursor).updatedAt) ||
+        typeof (after as SwarmRunCursor).scope !== 'string' ||
+        typeof (after as SwarmRunCursor).runId !== 'string'))
   )
-    throw new Error('Invalid swarm run query (status, scope, or limit 1..1000)');
+    throw new Error('Invalid swarm run query (status, scope, after, or limit 1..1000)');
 }
 
 /** The listRuns order (2.2): updatedAt, then scope, then runId. */
-export function compareRuns(left: SwarmRunRecord, right: SwarmRunRecord): number {
+export function compareRuns(left: SwarmRunCursor, right: SwarmRunCursor): number {
   return (
     left.updatedAt - right.updatedAt ||
     (left.scope < right.scope ? -1 : left.scope > right.scope ? 1 : 0) ||
@@ -410,13 +420,15 @@ export function createInMemorySwarmStore(): SwarmStore {
     capabilities: Object.freeze(['spawn', 'channels', 'list'] as const),
     async listRuns(query) {
       validateRunQuery(query);
+      const after = query.after;
       return cloneSwarm(
         [...runs.values()]
           .map((row) => row.run)
           .filter(
             (run) =>
               (query.status === undefined || run.status === query.status) &&
-              (query.scope === undefined || run.scope === query.scope),
+              (query.scope === undefined || run.scope === query.scope) &&
+              (after === undefined || compareRuns(run, after) > 0),
           )
           .sort(compareRuns)
           .slice(0, query.limit),

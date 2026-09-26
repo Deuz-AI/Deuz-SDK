@@ -265,6 +265,9 @@ test('2.2 durability operations surface', () => {
   expectTypeOf<SwarmStore['listRuns']>().toEqualTypeOf<
     ((query: SwarmRunQuery) => Promise<SwarmRunRecord[]>) | undefined
   >();
+  expectTypeOf<SwarmRunQuery['after']>().toEqualTypeOf<
+    Pick<SwarmRunRecord, 'updatedAt' | 'scope' | 'runId'> | undefined
+  >();
   expectTypeOf<'run.drained'>().toExtend<SwarmEvent['type']>();
   expectTypeOf(new SwarmLeaseError('held').code).toEqualTypeOf<'held' | 'lost'>();
   expectTypeOf<AgentRunEnvelope['revision']>().toEqualTypeOf<number | undefined>();

@@ -342,6 +342,11 @@ export interface SwarmRunQuery {
   scope?: string;
   /** 1..1000. */
   limit: number;
+  /**
+   * The next page (2.2): only runs strictly after this position in the order
+   * above. Pass the last run of the previous page.
+   */
+  after?: Pick<SwarmRunRecord, 'updatedAt' | 'scope' | 'runId'>;
 }
 
 export type SwarmOutcome = SwarmSnapshot;
@@ -392,10 +397,12 @@ export interface Swarm {
   requestCancel(key: SwarmKey): Promise<SwarmCancelRequest>;
   /**
    * Take over 'running' runs whose executor is gone (2.2). Needs the `lease`
-   * option and a store with 'list'; runs with a live lease holder, or that
-   * changed while being claimed, are skipped. One run's failure never stops
-   * the others: it is reported in `failed`, and every executor the call
-   * started is returned in `handles`.
+   * option and a store with 'list'. It pages through up to 10 000 running
+   * runs, oldest `updatedAt` first, and takes over at most `limit` of them
+   * (1..1000, default 100); runs with a live lease holder, or that changed
+   * while being claimed, are skipped. One run's failure never stops the
+   * others: it is reported in `failed`, and every executor the call started
+   * is returned in `handles`.
    */
   recover(options?: { scope?: string; limit?: number }): Promise<SwarmRecovery>;
 }

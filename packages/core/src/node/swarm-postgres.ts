@@ -355,12 +355,24 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
     async listRuns(query_) {
       validateRunQuery(query_);
       await use();
+      const after = query_.after;
+      // The cursor compares in the ORDER BY's own collation (2.2).
       return (
         await query(
           `SELECT payload FROM ${runs}
             WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR scope = $2)
+              AND ($4::double precision IS NULL OR updated_at > $4 OR (updated_at = $4
+                AND (scope COLLATE "C" > $5::text
+                  OR (scope COLLATE "C" = $5::text AND run_id COLLATE "C" > $6::text))))
             ORDER BY updated_at, scope COLLATE "C", run_id COLLATE "C" LIMIT $3`,
-          [query_.status ?? null, query_.scope ?? null, query_.limit],
+          [
+            query_.status ?? null,
+            query_.scope ?? null,
+            query_.limit,
+            after?.updatedAt ?? null,
+            after?.scope ?? null,
+            after?.runId ?? null,
+          ],
         )
       ).map((row) => decodeRun(row.payload));
     },
