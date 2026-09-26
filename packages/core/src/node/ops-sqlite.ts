@@ -1,15 +1,16 @@
 /**
- * `@deuz-sdk/core/ops/sqlite` (2.2): durable leases and native agent run
- * stores on one SQLite file. Several processes may share the file; every write
- * is a `BEGIN IMMEDIATE` transaction, so a lease changes hands at most once and
- * an agent run save is a compare-and-set on its revision. Node-only.
+ * `@deuz-sdk/core/ops/sqlite` (2.2): durable leases, native agent run stores
+ * and schedule claims on one SQLite file. Several processes may share the file;
+ * every write is a `BEGIN IMMEDIATE` transaction or a single statement, so a
+ * lease changes hands at most once, an agent run save is a compare-and-set on
+ * its revision, and a claim key is granted once. Node-only.
  */
 import type { SqliteDatabaseLike, SqliteStatementLike } from './store-sqlite';
 import { ensureBusyTimeout } from './sqlite-open';
 import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
 import type { Clock } from '../types/deps';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/lease';
-import { assertEnvelopeRevision, assertLeaseRequest } from '../ops';
+import { assertEnvelopeRevision, assertLeaseRequest } from '../internal/ops-validate';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 
@@ -33,6 +34,13 @@ export interface SqliteOpsStoreOptions {
 export interface SqliteOpsStore {
   leases: LeaseProvider;
   agentRuns: AgentRunStore;
+  /**
+   * A durable claim for `createScheduler({ claim })` and `handleSignal({ dedupe })`:
+   * a key is granted once across every process sharing the file, until
+   * `release(key)` gives it back. Granted keys stay in `deuz_claims` (with
+   * `claimed_at`, epoch ms on the store's clock) until you delete them.
+   */
+  claims: { (key: string): Promise<boolean>; release(key: string): Promise<void> };
   close(): Promise<void>;
 }
 
@@ -103,6 +111,10 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
               payload TEXT NOT NULL, updated_at INTEGER NOT NULL);`);
             db!.exec(`INSERT INTO deuz_ops_schema(singleton,version) VALUES(1,${SCHEMA_VERSION})`);
           }
+          // Outside the first-open branch, so files written before claims existed gain it.
+          db!.exec(
+            'CREATE TABLE IF NOT EXISTS deuz_claims (key TEXT PRIMARY KEY, claimed_at INTEGER NOT NULL)',
+          );
         });
         return db;
       } catch (error) {
@@ -237,9 +249,27 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
     },
   };
 
+  const claims: SqliteOpsStore['claims'] = Object.assign(
+    (key: string): Promise<boolean> =>
+      use((db) => {
+        // One statement: whichever connection inserts the key first wins it.
+        const result = statement(
+          db,
+          'INSERT OR IGNORE INTO deuz_claims(key, claimed_at) VALUES(?, ?)',
+        ).run(key, clock.now());
+        return Number((result as { changes?: unknown } | undefined)?.changes) === 1;
+      }),
+    {
+      async release(key: string): Promise<void> {
+        await use((db) => statement(db, 'DELETE FROM deuz_claims WHERE key=?').run(key));
+      },
+    },
+  );
+
   return {
     leases,
     agentRuns,
+    claims,
     async close() {
       if (closed) return;
       closed = true;

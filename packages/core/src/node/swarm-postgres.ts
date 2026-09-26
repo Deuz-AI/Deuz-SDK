@@ -9,6 +9,7 @@
  * and the commit rejects with SwarmConflictError. Node-only.
  */
 import type { PgClientLike } from './store-postgres';
+import { postgresSchemaStatement } from './postgres-migrate';
 import type {
   SwarmChannelEntry,
   SwarmChannelPost,
@@ -67,40 +68,38 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
     (await options.client.query(sql, params)).rows;
 
   let ready: Promise<void> | undefined;
-  const migrate = async (): Promise<void> => {
-    await query(
-      `CREATE TABLE IF NOT EXISTS ${meta} (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)`,
-    );
-    await query(
-      `INSERT INTO ${meta} (singleton, version) VALUES (1, ${SCHEMA_VERSION}) ON CONFLICT (singleton) DO NOTHING`,
-    );
-    const [row] = await query(`SELECT version FROM ${meta} WHERE singleton = 1`);
-    if (Number(row?.version) !== SCHEMA_VERSION)
-      throw new Error('Unsupported Postgres swarm schema version');
-    await query(`CREATE TABLE IF NOT EXISTS ${runs} (
+  // One statement (a DO block) under an advisory lock, so concurrent first
+  // uses queue instead of racing: see postgres-migrate.ts.
+  const schemaSql = postgresSchemaStatement({
+    lock: `swarm:${schema}`,
+    meta,
+    version: SCHEMA_VERSION,
+    unsupported: 'Unsupported Postgres swarm schema version',
+    create: [
+      `CREATE TABLE IF NOT EXISTS ${runs} (
       scope TEXT NOT NULL, run_id TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL,
       updated_at DOUBLE PRECISION NOT NULL, revision BIGINT NOT NULL, last_sequence BIGINT NOT NULL,
-      PRIMARY KEY (scope, run_id))`);
-    await query(
+      PRIMARY KEY (scope, run_id))`,
       `CREATE INDEX IF NOT EXISTS deuz_swarm_runs_status ON ${runs} (status, updated_at)`,
-    );
-    await query(
       `CREATE INDEX IF NOT EXISTS deuz_swarm_runs_scope_status ON ${runs} (scope, status, updated_at)`,
-    );
-    await query(`CREATE TABLE IF NOT EXISTS ${tasks} (
+      `CREATE TABLE IF NOT EXISTS ${tasks} (
       scope TEXT NOT NULL, run_id TEXT NOT NULL, task_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
-      payload TEXT NOT NULL, PRIMARY KEY (scope, run_id, task_id))`);
-    await query(`CREATE TABLE IF NOT EXISTS ${events} (
+      payload TEXT NOT NULL, PRIMARY KEY (scope, run_id, task_id))`,
+      `CREATE TABLE IF NOT EXISTS ${events} (
       scope TEXT NOT NULL, run_id TEXT NOT NULL, sequence BIGINT NOT NULL, payload TEXT NOT NULL,
-      PRIMARY KEY (scope, run_id, sequence))`);
-    await query(`CREATE TABLE IF NOT EXISTS ${channels} (
+      PRIMARY KEY (scope, run_id, sequence))`,
+      `CREATE TABLE IF NOT EXISTS ${channels} (
       scope TEXT NOT NULL, run_id TEXT NOT NULL, channel TEXT NOT NULL, sequence BIGINT NOT NULL,
       entry_id TEXT NOT NULL, payload TEXT NOT NULL,
-      PRIMARY KEY (scope, run_id, channel, sequence), UNIQUE (scope, run_id, entry_id))`);
+      PRIMARY KEY (scope, run_id, channel, sequence), UNIQUE (scope, run_id, entry_id))`,
+    ],
+  });
+  const migrate = async (): Promise<void> => {
+    await query(schemaSql);
   };
   const use = async (): Promise<void> => {
     ready ??= migrate().catch((error: unknown) => {
-      // A concurrent first migration may race; the next call tries again.
+      // A failed first use (the database was unreachable) is retried next call.
       ready = undefined;
       throw error;
     });

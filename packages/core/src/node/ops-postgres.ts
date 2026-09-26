@@ -1,15 +1,17 @@
 /**
- * `@deuz-sdk/core/ops/postgres` (2.2): durable leases and native agent run
- * stores on Postgres. Every operation is one SQL statement, so it is atomic on
- * any pooled `PgClientLike`. Lease time is the DATABASE clock, which every
- * process shares; host clocks never decide who holds a lease. Node-only.
+ * `@deuz-sdk/core/ops/postgres` (2.2): durable leases, native agent run stores
+ * and schedule claims on Postgres. Every operation is one SQL statement, so it
+ * is atomic on any pooled `PgClientLike`. Lease time is the DATABASE clock,
+ * which every process shares; host clocks never decide who holds a lease.
+ * Node-only.
  */
 import type { PgClientLike } from './store-postgres';
 import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/lease';
-import { assertLeaseRequest } from '../ops';
+import { assertLeaseRequest } from '../internal/ops-validate';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 import { postgresSchemaName } from './swarm-postgres';
+import { postgresSchemaStatement } from './postgres-migrate';
 
 // Persistent budget scopes (2.2, M5) share this Node-only subpath: one import
 // for every durable ops store on Postgres.
@@ -25,6 +27,13 @@ export interface PostgresOpsStoreOptions {
 export interface PostgresOpsStore {
   leases: LeaseProvider;
   agentRuns: AgentRunStore;
+  /**
+   * A durable claim for `createScheduler({ claim })` and `handleSignal({ dedupe })`:
+   * a key is granted once across every process using the schema, until
+   * `release(key)` gives it back. Granted keys stay in `deuz_claims` (with
+   * `claimed_at`, epoch ms on the database clock) until you delete them.
+   */
+  claims: { (key: string): Promise<boolean>; release(key: string): Promise<void> };
 }
 
 const SCHEMA_VERSION = 1;
@@ -38,27 +47,30 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
   const schema = postgresSchemaName(options.schema);
   const leasesTable = `${schema}.deuz_leases`;
   const runsTable = `${schema}.deuz_agent_runs`;
+  const claimsTable = `${schema}.deuz_claims`;
   const meta = `${schema}.deuz_ops_schema`;
   const query = async (sql: string, params: unknown[] = []): Promise<Row[]> =>
     (await options.client.query(sql, params)).rows;
 
   let ready: Promise<void> | undefined;
-  const migrate = async (): Promise<void> => {
-    await query(
-      `CREATE TABLE IF NOT EXISTS ${meta} (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)`,
-    );
-    await query(
-      `INSERT INTO ${meta} (singleton, version) VALUES (1, ${SCHEMA_VERSION}) ON CONFLICT (singleton) DO NOTHING`,
-    );
-    const [row] = await query(`SELECT version FROM ${meta} WHERE singleton = 1`);
-    if (Number(row?.version) !== SCHEMA_VERSION)
-      throw new Error('Unsupported Postgres ops schema version');
-    await query(`CREATE TABLE IF NOT EXISTS ${leasesTable} (
+  // One statement (a DO block) under an advisory lock: see postgres-migrate.ts.
+  const schemaSql = postgresSchemaStatement({
+    lock: `ops:${schema}`,
+    meta,
+    version: SCHEMA_VERSION,
+    unsupported: 'Unsupported Postgres ops schema version',
+    create: [
+      `CREATE TABLE IF NOT EXISTS ${leasesTable} (
       key TEXT PRIMARY KEY, owner TEXT NOT NULL, token BIGINT NOT NULL,
-      expires_at BIGINT NOT NULL, signals JSONB NOT NULL DEFAULT '[]'::jsonb)`);
-    await query(`CREATE TABLE IF NOT EXISTS ${runsTable} (
+      expires_at BIGINT NOT NULL, signals JSONB NOT NULL DEFAULT '[]'::jsonb)`,
+      `CREATE TABLE IF NOT EXISTS ${runsTable} (
       run_id TEXT PRIMARY KEY, scope TEXT NOT NULL, revision BIGINT NOT NULL,
-      payload TEXT NOT NULL, updated_at BIGINT NOT NULL)`);
+      payload TEXT NOT NULL, updated_at BIGINT NOT NULL)`,
+      `CREATE TABLE IF NOT EXISTS ${claimsTable} (key TEXT PRIMARY KEY, claimed_at BIGINT NOT NULL)`,
+    ],
+  });
+  const migrate = async (): Promise<void> => {
+    await query(schemaSql);
   };
   const use = async (): Promise<void> => {
     ready ??= migrate().catch((error: unknown) => {
@@ -164,5 +176,24 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
     },
   };
 
-  return { leases, agentRuns };
+  const claims: PostgresOpsStore['claims'] = Object.assign(
+    async (key: string): Promise<boolean> => {
+      await use();
+      // One statement: whichever session inserts the key first wins it.
+      const rows = await query(
+        `INSERT INTO ${claimsTable} (key, claimed_at) VALUES ($1, ${NOW})
+        ON CONFLICT (key) DO NOTHING RETURNING 1 AS claimed`,
+        [key],
+      );
+      return rows.length === 1;
+    },
+    {
+      async release(key: string): Promise<void> {
+        await use();
+        await query(`DELETE FROM ${claimsTable} WHERE key = $1`, [key]);
+      },
+    },
+  );
+
+  return { leases, agentRuns, claims };
 }

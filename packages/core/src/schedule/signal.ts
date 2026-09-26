@@ -3,6 +3,7 @@
  * (`crypto.subtle`, no randomness) and a handler that turns a verified,
  * deduplicated request into one dispatch. Edge-safe.
  */
+import type { ScheduleClaim } from './scheduler';
 
 export type SignalRejection =
   | 'missing-signature'
@@ -193,10 +194,12 @@ export interface HandleSignalOptions {
   verify(request: Request): SignalVerification | Promise<SignalVerification>;
   /**
    * Resolves true the first time a key is seen (the scheduler's claim shape,
-   * so `createInMemoryClaim()` or a durable claim fits). Omit it when
+   * so `createInMemoryClaim()` or a durable claim fits). When `dispatch`
+   * throws, its `release` gives the key back so the sender's retry dispatches;
+   * a claim without `release` answers that retry as a duplicate. Omit it when
    * `dispatch` is itself idempotent on the key.
    */
-  dedupe?: (key: string) => boolean | Promise<boolean>;
+  dedupe?: ScheduleClaim;
   /** Derives the dedupe key, e.g. from `X-GitHub-Delivery`. Default: a SHA-256 of the body. */
   key?(input: { body: string; request: Request }): string | undefined | Promise<string | undefined>;
   /** Starts or resumes the work. Keep it short: enqueue, or start a durable run keyed by `key`. */
@@ -220,7 +223,9 @@ async function bodyKey(body: string): Promise<string> {
 /**
  * Verifies, dedupes and dispatches one inbound signal. Answers 401 for a
  * rejected signature, 200 for a duplicate (nothing dispatched), 202 once
- * `dispatch` resolves, and 500 when verify, dedupe or dispatch throws.
+ * `dispatch` resolves, and 500 when verify, dedupe or dispatch throws. A 500
+ * invites the sender to retry, so a throwing dispatch first releases the key
+ * it claimed (when the claim has `release`).
  */
 export async function handleSignal(
   request: Request,
@@ -252,6 +257,12 @@ export async function handleSignal(
   try {
     await options.dispatch({ body, key, request });
   } catch {
+    try {
+      // Only a fresh key reaches dispatch, so this gives back our own claim.
+      await options.dedupe?.release?.(key);
+    } catch {
+      // The key stays claimed and the retry is answered as a duplicate.
+    }
     return reply(500, { ok: false, reason: 'dispatch-error' });
   }
   return reply(202, { ok: true, key });

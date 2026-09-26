@@ -21,6 +21,8 @@ import type {
   ScheduleTickResult,
   SignalVerification,
 } from '../src/schedule';
+import type { SqliteOpsStore } from '../src/node/ops-sqlite';
+import type { PostgresOpsStore } from '../src/node/ops-postgres';
 
 test('cron helpers', () => {
   expectTypeOf(parseCron).returns.toEqualTypeOf<CronSchedule>();
@@ -39,7 +41,21 @@ test('scheduler', () => {
   expectTypeOf(scheduler).toEqualTypeOf<Scheduler>();
   expectTypeOf(scheduler.tick).returns.resolves.toEqualTypeOf<ScheduleTickResult>();
   expectTypeOf(scheduler.start).returns.resolves.toBeVoid();
-  expectTypeOf(createInMemoryClaim()).toEqualTypeOf<ScheduleClaim>();
+  expectTypeOf(createInMemoryClaim()).toExtend<ScheduleClaim>();
+  expectTypeOf(createInMemoryClaim().release).toEqualTypeOf<(key: string) => Promise<void>>();
+  // A plain function is still a claim; `release` is optional.
+  expectTypeOf<(key: string) => boolean>().toExtend<ScheduleClaim>();
+  expectTypeOf<(key: string) => Promise<boolean>>().toExtend<HandleSignalOptions['dedupe']>();
+  expectTypeOf<ScheduleClaim['release']>().toEqualTypeOf<
+    ((key: string) => void | Promise<void>) | undefined
+  >();
+  // The ops stores' durable claims fit both consumers, and always release.
+  expectTypeOf<SqliteOpsStore['claims']>().toExtend<ScheduleClaim>();
+  expectTypeOf<PostgresOpsStore['claims']>().toExtend<ScheduleClaim>();
+  expectTypeOf<PostgresOpsStore['claims']>().toExtend<HandleSignalOptions['dedupe']>();
+  expectTypeOf<SqliteOpsStore['claims']['release']>().toEqualTypeOf<
+    (key: string) => Promise<void>
+  >();
   expectTypeOf<ScheduleOccurrence>().toEqualTypeOf<{
     readonly id: string;
     readonly at: number;

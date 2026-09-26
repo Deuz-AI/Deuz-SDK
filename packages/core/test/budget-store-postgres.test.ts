@@ -1,10 +1,12 @@
 import { PGlite } from '@electric-sql/pglite';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createPostgresBudgetStore } from '../src/node/budget-postgres';
 import type { PgClientLike } from '../src/node/store-postgres';
 import { budgetStoreContracts } from './fixtures/budget-store-conformance';
 
 const db = new PGlite();
+// Start-up is slow under load; keep it out of the first test's time budget.
+beforeAll(() => db.waitReady, 60_000);
 const client: PgClientLike = {
   query: (sql, params) => db.query(sql, params) as Promise<{ rows: Record<string, unknown>[] }>,
 };
