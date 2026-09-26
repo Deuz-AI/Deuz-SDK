@@ -10,7 +10,7 @@ import { resolveDependencies } from '../internal/resolve-deps';
 import type { DeuzAgent } from '../agent';
 import type { AgentRunOptions, AgentRunStore, AgentToolSet } from '../types/agent-run';
 import type { NativeExecutionContext } from '../types/execution';
-import type { Lease } from '../types/lease';
+import type { Lease, LeaseSignal } from '../types/lease';
 import type {
   Swarm,
   SwarmCancelRequest,
@@ -165,6 +165,23 @@ export function createSwarm(options: SwarmOptions): Swarm {
   const unclaim = async (lease: Lease | undefined): Promise<void> => {
     if (lease) await leasing!.provider.release(lease).catch(() => {});
   };
+  /**
+   * Take the signals queued under a fresh claim (2.2). A 'cancel' outlives the
+   * holder it was sent to, so it may predate this claim.
+   */
+  const collect = async (
+    lease: Lease | undefined,
+  ): Promise<{ lease: Lease | undefined; signals: readonly LeaseSignal[] }> => {
+    if (!lease) return { lease, signals: [] };
+    const renewal = await leasing!.provider.renew(lease, leaseTtl);
+    if (!renewal.held) throw new SwarmLeaseError('held');
+    return { lease: renewal.lease, signals: renewal.signals };
+  };
+  /** A claim that fails after collecting queues its cancel again before letting go. */
+  const restore = async (key: SwarmKey, signals: readonly LeaseSignal[]): Promise<void> => {
+    if (signals.includes('cancel'))
+      await leasing!.provider.signal(leaseKey(key), 'cancel').catch(() => false);
+  };
 
   const events = (
     key: SwarmKey,
@@ -208,6 +225,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
     initial: SwarmSnapshot,
     resume: SwarmResumeOptions | undefined,
     lease: Lease | undefined,
+    drainSignalled = false,
   ): Promise<SwarmHandle> {
     const key: SwarmKey = { scope: initial.run.scope, runId: initial.run.runId };
     const id = swarmKey(key);
@@ -297,34 +315,39 @@ export function createSwarm(options: SwarmOptions): Swarm {
     // records stay as they are and the next executor reconciles them.
     let held = lease;
     let stopped = false;
+    let lost: SwarmLeaseError | undefined;
     // Drain (2.2): no new dispatch; in-flight tasks finish and the run settles.
-    let draining = false;
+    let draining = drainSignalled;
+    // The durable commit of the last cancel a renewal delivered.
+    let cancelling: Promise<void> | undefined;
     let stopBeat: (() => void) | undefined;
     const lose = () => {
-      writeFailure ??= new SwarmLeaseError('lost');
+      lost ??= new SwarmLeaseError('lost');
+      writeFailure ??= lost;
       controller.abort(writeFailure);
     };
-    const renewLease = async (): Promise<void> => {
-      if (stopped || !held) return;
-      try {
-        const renewal = await leasing!.provider.renew(held, leaseTtl);
-        if (stopped) return;
-        if (!renewal.held) return lose();
-        held = renewal.lease;
-        for (const request of renewal.signals)
-          if (request === 'cancel') void cancel().catch(() => {});
-          else if (request === 'drain') draining = true;
-      } catch {
-        // A provider outage is survivable until the lease could have lapsed.
-        if (stopped) return;
-        if (deps.clock.now() >= held.expiresAt) return lose();
-      }
-      beat();
-    };
+    // One renewal at a time: the heartbeat and the check before the settle
+    // share this chain, so each queued signal reaches exactly one of them.
+    let renewals: Promise<void> = Promise.resolve();
+    const renewLease = (): Promise<void> =>
+      (renewals = renewals.then(async () => {
+        if (stopped || !held || lost) return;
+        try {
+          const renewal = await leasing!.provider.renew(held, leaseTtl);
+          if (stopped) return;
+          if (!renewal.held) return lose();
+          held = renewal.lease;
+          if (renewal.signals.includes('drain')) draining = true;
+          if (renewal.signals.includes('cancel')) cancelling = cancel().catch(() => {});
+        } catch {
+          // A provider outage is survivable until the lease could have lapsed.
+          if (!stopped && deps.clock.now() >= held.expiresAt) lose();
+        }
+      }));
     const beat = () => {
-      if (!stopped && held)
+      if (!stopped && held && !lost)
         stopBeat = deps.clock.setTimeout(
-          () => void renewLease(),
+          () => void renewLease().then(beat),
           Math.max(1, Math.floor(leaseTtl / 3)),
         );
     };
@@ -720,6 +743,14 @@ export function createSwarm(options: SwarmOptions): Swarm {
               : list.every((task) => task.status === 'completed')
                 ? 'completed'
                 : 'partial';
+          if (held && status !== 'cancelled') {
+            // Signals sent since the last beat apply before the run settles (2.2):
+            // a cancel turns this settle into a cancellation.
+            await renewLease();
+            await cancelling;
+            if (writeFailure) throw writeFailure;
+            if (snapshot.run.cancelRequested) continue;
+          }
           await mutate(() => ({
             run: { status, updatedAt: deps.clock.now() },
             events: [
@@ -733,7 +764,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
         controller.abort(error);
         // A replacement executor must not overlap still-running local effects.
         await Promise.allSettled(running);
-        throw writeFailure instanceof SwarmLeaseError ? writeFailure : error;
+        throw lost ?? error;
       } finally {
         stopped = true;
         stopBeat?.();
@@ -798,12 +829,17 @@ export function createSwarm(options: SwarmOptions): Swarm {
           })),
         ),
       };
-      const lease = await claim(key);
+      let lease = await claim(key);
+      let queued: readonly LeaseSignal[] = [];
       try {
+        // A new run starts clean: whatever its key still queues predates it.
+        ({ lease, signals: queued } = await collect(lease));
         snapshot.run = await options.store.create(snapshot, [
           { type: 'run.started', timestamp: now },
         ]);
       } catch (error) {
+        // The key may belong to an existing run, whose queued cancel stays queued.
+        await restore(key, queued);
         await unclaim(lease);
         throw error;
       }
@@ -888,21 +924,40 @@ export function createSwarm(options: SwarmOptions): Swarm {
       }
       // The claim precedes the resume commit (2.2); the commit's revision check
       // then fences out any writer that was still active a moment ago.
-      const lease = await claim(input);
+      let lease = await claim(input);
+      let queued: readonly LeaseSignal[] = [];
       try {
+        ({ lease, signals: queued } = await collect(lease));
+        // A cancel whose holder stopped before reading it applies here, before
+        // any dispatch; one that lost the race to the run's end changes nothing.
+        const cancelNow =
+          queued.includes('cancel') &&
+          !snapshot.run.cancelRequested &&
+          snapshot.run.status !== 'completed' &&
+          snapshot.run.status !== 'partial';
+        const now = deps.clock.now();
         snapshot.run = await options.store.commit({
           scope: input.scope,
           runId: input.runId,
           expectedRevision: snapshot.run.revision,
-          run: { status: 'running', updatedAt: deps.clock.now() },
+          run: {
+            status: 'running',
+            updatedAt: now,
+            ...(cancelNow ? { cancelRequested: true } : {}),
+          },
           tasks: changes,
-          events: [{ type: 'run.resumed', timestamp: deps.clock.now() }, ...controlEvents],
+          events: [
+            { type: 'run.resumed', timestamp: now },
+            ...(cancelNow ? [{ type: 'run.cancelled' as const, timestamp: now }] : []),
+            ...controlEvents,
+          ],
         });
       } catch (error) {
+        await restore(input, queued);
         await unclaim(lease);
         throw error;
       }
-      return start(snapshot, input, lease);
+      return start(snapshot, input, lease, queued.includes('drain'));
     },
     async requestCancel(key): Promise<SwarmCancelRequest> {
       const id = swarmKey(key);

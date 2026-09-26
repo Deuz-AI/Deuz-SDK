@@ -46,6 +46,37 @@ export function leaseProviderContracts(
       });
     });
 
+    it('keeps a queued cancel for the next holder and delivers it once', async () => {
+      const { provider, advance, ttl } = await make();
+      const first = (await provider.acquire({ key: 'run', owner: 'a', ttlMs: ttl }))!;
+      expect(await provider.signal('run', 'cancel')).toBe(true);
+      expect(await provider.signal('run', 'drain')).toBe(true);
+      // The holder dies before its next renewal and the key changes hands.
+      await advance(ttl * 2);
+      const second = (await provider.acquire({ key: 'run', owner: 'b', ttlMs: ttl }))!;
+      expect(second).toMatchObject({ owner: 'b', token: 2 });
+      // The cancel concerns the run and survives; the drain concerned the dead holder.
+      expect(await provider.renew(second, ttl)).toMatchObject({ held: true, signals: ['cancel'] });
+      expect(await provider.renew(second, ttl)).toMatchObject({ held: true, signals: [] });
+      expect(await provider.renew(first, ttl)).toEqual({ held: false });
+    });
+
+    it('keeps a queued cancel across a release, but not a drain', async () => {
+      const { provider, ttl } = await make();
+      const first = (await provider.acquire({ key: 'run', owner: 'a', ttlMs: ttl }))!;
+      expect(await provider.signal('run', 'drain')).toBe(true);
+      expect(await provider.signal('run', 'cancel')).toBe(true);
+      // The holder settles before its next renewal delivers the signals.
+      await provider.release(first);
+      expect(await provider.signal('run', 'cancel')).toBe(false);
+      const second = (await provider.acquire({ key: 'run', owner: 'b', ttlMs: ttl }))!;
+      expect(await provider.renew(second, ttl)).toMatchObject({ held: true, signals: ['cancel'] });
+      // Delivered once: the next holder starts clean.
+      await provider.release(second);
+      const third = (await provider.acquire({ key: 'run', owner: 'c', ttlMs: ttl }))!;
+      expect(await provider.renew(third, ttl)).toMatchObject({ held: true, signals: [] });
+    });
+
     it('releases only its own token and keeps tokens increasing', async () => {
       const { provider, ttl } = await make();
       const lease = (await provider.acquire({ key: 'run', owner: 'a', ttlMs: ttl }))!;

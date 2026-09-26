@@ -143,11 +143,13 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
           const row = readLease(db, key);
           if (row && Number(row.expires_at) > now) return undefined;
           const token = Number(row?.token ?? 0) + 1;
+          // A queued cancel concerns the run and outlives its holder (2.2); a drain does not.
           statement(
             db,
             `INSERT INTO deuz_leases(key,owner,token,expires_at,signals) VALUES(?,?,?,?,'[]')
              ON CONFLICT(key) DO UPDATE SET owner=excluded.owner, token=excluded.token,
-             expires_at=excluded.expires_at, signals='[]'`,
+             expires_at=excluded.expires_at,
+             signals=CASE WHEN instr(signals, '"cancel"') > 0 THEN '["cancel"]' ELSE '[]' END`,
           ).run(key, owner, token, now + ttlMs);
           return view(key, owner, token, now + ttlMs);
         }),
@@ -182,7 +184,9 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
       await use((db) =>
         statement(
           db,
-          `UPDATE deuz_leases SET expires_at=0, signals='[]' WHERE key=? AND token=? AND owner=?`,
+          `UPDATE deuz_leases SET expires_at=0,
+           signals=CASE WHEN instr(signals, '"cancel"') > 0 THEN '["cancel"]' ELSE '[]' END
+           WHERE key=? AND token=? AND owner=?`,
         ).run(lease.key, lease.token, lease.owner),
       );
     },

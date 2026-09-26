@@ -12,7 +12,12 @@ export interface Lease {
   readonly expiresAt: number;
 }
 
-/** A request the current holder receives on its next renewal. */
+/**
+ * A request delivered by a renewal, each signal once. A 'cancel' concerns the
+ * run: it stays queued when the key changes hands or is released, until some
+ * holder's renewal delivers it. A 'drain' concerns the current holder and is
+ * dropped with its lease.
+ */
 export type LeaseSignal = 'cancel' | 'drain';
 
 export type LeaseRenewal =
@@ -20,7 +25,10 @@ export type LeaseRenewal =
   | { held: false };
 
 export interface LeaseProvider {
-  /** Take a free or expired key; undefined while another owner holds it. */
+  /**
+   * Take a free or expired key; undefined while another owner holds it. A
+   * queued 'cancel' carries over to the new holder; a 'drain' does not.
+   */
   acquire(request: { key: string; owner: string; ttlMs: number }): Promise<Lease | undefined>;
   /**
    * Extend a lease and collect its pending signals (each delivered once). A
@@ -28,7 +36,7 @@ export interface LeaseProvider {
    * reports `held: false`.
    */
   renew(lease: Lease, ttlMs: number): Promise<LeaseRenewal>;
-  /** Give the key up; a stale token is ignored. */
+  /** Give the key up, keeping a queued 'cancel'; a stale token is ignored. */
   release(lease: Lease): Promise<void>;
   /** Queue a signal for the current holder; false when nobody holds the key. */
   signal(key: string, signal: LeaseSignal): Promise<boolean>;

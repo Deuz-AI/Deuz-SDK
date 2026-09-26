@@ -34,6 +34,10 @@ lapsed lease that nobody else took can still be renewed. `release` ignores a
 stale token. `signal(key, 'cancel' | 'drain')` queues a request for whoever
 holds the key and reports whether anyone did.
 
+A queued `'cancel'` concerns the run, not the holder: it stays queued when the
+key changes hands or is released, until some holder's renewal delivers it. A
+queued `'drain'` concerns the current holder and is dropped with its lease.
+
 ```ts
 import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
 
@@ -61,6 +65,10 @@ instance.
 
 - `run` and `resume` reject with `SwarmLeaseError` code `'held'` while another
   executor holds the run. `resume` claims the lease before its resume commit.
+- A claim collects the signals queued under the run's key. A `'cancel'` that
+  an earlier holder never read goes into the resume commit, so the run is
+  cancelled before anything is dispatched. A new run ignores whatever its key
+  still queues, because that predates it.
 - If a renewal reports the lease gone, the executor aborts its tasks and writes
   nothing more. Its `handle.result` rejects with `SwarmLeaseError` code
   `'lost'`. Task records stay as they were, and the next executor reconciles
@@ -104,11 +112,15 @@ try {
 `handle.drain()` stops new dispatch and waits for in-flight tasks to finish
 normally. The run then settles `'suspended'` with its remaining tasks pending,
 or reaches its terminal status if nothing remains. A `run.drained` event
-precedes `run.settled`, and the lease is released, so a later `resume` or
-`recover` continues where the drain stopped. Use it for rolling deploys.
+precedes `run.settled`, and the lease is released, so a later `resume`
+continues where the drain stopped. Use it for rolling deploys. `recover` takes
+over only `'running'` runs, so resume drained runs explicitly, for example
+from `listRuns({ status: 'suspended', limit })`; a run suspended on an approval
+simply suspends again.
 
 A `'drain'` lease signal does the same from another process: the executor
-drains on its next heartbeat.
+drains on its next heartbeat. The signal is meant for the current holder, so it
+is dropped if the run changes hands or is released first.
 
 ## Cancellation from any process
 
@@ -116,9 +128,15 @@ drains on its next heartbeat.
 
 | Result | Meaning |
 | --- | --- |
-| `'signalled'` | This process drives the run and cancelled it, or a lease holder was sent `'cancel'` and cancels on its next heartbeat. |
+| `'signalled'` | This process drives the run and cancelled it, or the lease holder was sent `'cancel'`. The holder cancels on its next heartbeat or just before it settles. |
 | `'recorded'` | Nobody drives the run. A compare-and-set commit stored `cancelRequested` and a `run.cancelled` event; the next executor cancels the run's pending work. |
 | `'settled'` | The run already completed, became partial, or was cancelled. |
+
+A signalled cancel is not lost when its holder stops first. If the holder
+crashes, or settles `'suspended'` before its next heartbeat, the `'cancel'`
+stays queued under the run's key, and the next executor to claim the run
+cancels it before dispatching anything. A run that completed or became partial
+before the cancel reached it keeps its status.
 
 Without a lease provider, a request against a run that another process drives
 is recorded, and that executor's next commit then fails its revision check.

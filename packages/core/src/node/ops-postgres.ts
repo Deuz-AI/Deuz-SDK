@@ -75,11 +75,14 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       assertLeaseRequest(key, owner, ttlMs);
       await use();
       // Free, released (expires_at 0) or expired keys change hands; tokens only grow.
+      // A queued cancel concerns the run and outlives its holder (2.2); a drain does not.
       const [row] = await query(
         `INSERT INTO ${leasesTable} AS l (key, owner, token, expires_at, signals)
         VALUES ($1, $2, 1, ${NOW} + $3, '[]'::jsonb)
         ON CONFLICT (key) DO UPDATE SET owner = EXCLUDED.owner, token = l.token + 1,
-          expires_at = EXCLUDED.expires_at, signals = '[]'::jsonb
+          expires_at = EXCLUDED.expires_at,
+          signals = CASE WHEN l.signals @> '["cancel"]'::jsonb
+            THEN '["cancel"]'::jsonb ELSE '[]'::jsonb END
         WHERE l.expires_at <= ${NOW}
         RETURNING token, expires_at`,
         [key, owner, ttlMs],
@@ -107,7 +110,9 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
     async release(lease) {
       await use();
       await query(
-        `UPDATE ${leasesTable} SET expires_at = 0, signals = '[]'::jsonb
+        `UPDATE ${leasesTable} SET expires_at = 0,
+          signals = CASE WHEN signals @> '["cancel"]'::jsonb
+            THEN '["cancel"]'::jsonb ELSE '[]'::jsonb END
         WHERE key = $1 AND token = $2 AND owner = $3`,
         [lease.key, lease.token, lease.owner],
       );

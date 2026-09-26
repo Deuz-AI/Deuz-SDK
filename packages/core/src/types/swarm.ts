@@ -373,7 +373,9 @@ export interface Swarm {
   /**
    * Cancel a run from any process (2.2): 'signalled' when this process or a
    * lease holder drives it, 'recorded' when nobody does (the next executor
-   * cancels it), 'settled' when it already finished.
+   * cancels it), 'settled' when it already finished. A signalled cancel
+   * outlives its holder: if the holder settles or dies before reading it, the
+   * next executor to claim the run cancels it before dispatching anything.
    */
   requestCancel(key: SwarmKey): Promise<SwarmCancelRequest>;
   /**

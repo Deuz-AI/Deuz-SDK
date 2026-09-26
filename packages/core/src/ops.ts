@@ -46,13 +46,22 @@ export function createInMemoryLeaseProvider(options: { clock?: Clock } = {}): Le
   >();
   const view = (key: string, row: { owner: string; token: number; expiresAt: number }): Lease =>
     Object.freeze({ key, owner: row.owner, token: row.token, expiresAt: row.expiresAt });
+  // A queued cancel concerns the run, so it outlives the holder it was sent to
+  // until a renewal delivers it (2.2); a drain concerns that holder alone.
+  const kept = (signals: readonly LeaseSignal[]): LeaseSignal[] =>
+    signals.includes('cancel') ? ['cancel'] : [];
   return {
     async acquire({ key, owner, ttlMs }) {
       assertLeaseRequest(key, owner, ttlMs);
       const now = clock.now();
       const row = leases.get(key);
       if (row && row.expiresAt > now) return undefined;
-      const next = { owner, token: (row?.token ?? 0) + 1, expiresAt: now + ttlMs, signals: [] };
+      const next = {
+        owner,
+        token: (row?.token ?? 0) + 1,
+        expiresAt: now + ttlMs,
+        signals: kept(row?.signals ?? []),
+      };
       leases.set(key, next);
       return view(key, next);
     },
@@ -70,7 +79,7 @@ export function createInMemoryLeaseProvider(options: { clock?: Clock } = {}): Le
       // Keep the row so the next holder's token still increases.
       if (row && row.token === lease.token && row.owner === lease.owner) {
         row.expiresAt = 0;
-        row.signals = [];
+        row.signals = kept(row.signals);
       }
     },
     async signal(key, signal) {
