@@ -1,5 +1,7 @@
 import type { PriceProvider } from './types/deps';
+import type { BudgetScopeUsage, PersistentBudgetScope } from './types/budget-store';
 import type {
+  BudgetAdmission,
   BudgetAggregate,
   BudgetCompaction,
   BudgetLedger,
@@ -20,7 +22,9 @@ export type BudgetLedgerErrorCode =
   | 'reservation_conflict'
   | 'unknown_request'
   | 'invalid_snapshot'
-  | 'persistence_failed';
+  | 'persistence_failed'
+  /** The persistent `BudgetStore` failed; nothing was admitted or changed locally (2.2). */
+  | 'admission_failed';
 
 export class BudgetLedgerError extends Error {
   readonly name = 'BudgetLedgerError';
@@ -206,6 +210,119 @@ function aggregate(input: BudgetAggregate): BudgetAggregate {
   });
 }
 
+function threshold(value: number | undefined): void {
+  if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0))
+    throw new BudgetLedgerError(
+      'invalid_budget',
+      'warnAtPercent must be a finite positive number.',
+    );
+}
+
+function persistentScope(input: PersistentBudgetScope): PersistentBudgetScope {
+  if (input === null || typeof input !== 'object')
+    throw new BudgetLedgerError('invalid_budget', 'Persistent scope must be an object.');
+  identifier(input.key, 'Persistent scope key');
+  const window = input.window;
+  if (window !== undefined) {
+    if (
+      window === null ||
+      typeof window !== 'object' ||
+      !Number.isSafeInteger(window.ms) ||
+      window.ms < 1 ||
+      (window.buckets !== undefined &&
+        (!Number.isSafeInteger(window.buckets) || window.buckets < 1 || window.buckets > window.ms))
+    )
+      throw new BudgetLedgerError(
+        'invalid_budget',
+        `Window of ${input.key} needs positive integer ms and buckets no greater than ms.`,
+      );
+  }
+  threshold(input.warnAtPercent);
+  return Object.freeze({
+    key: input.key,
+    limits: limits(input.limits),
+    ...(window !== undefined
+      ? {
+          window: Object.freeze({
+            ms: window.ms,
+            ...(window.buckets !== undefined ? { buckets: window.buckets } : {}),
+          }),
+        }
+      : {}),
+    ...(input.warnAtPercent !== undefined ? { warnAtPercent: input.warnAtPercent } : {}),
+  });
+}
+
+const windowKey = (scope: PersistentBudgetScope): string =>
+  JSON.stringify(scope.window ? [scope.window.ms, scope.window.buckets ?? null] : null);
+
+type ResolvedAdmission = Omit<BudgetAdmission, 'scopes'> & {
+  readonly scopes: readonly PersistentBudgetScope[];
+};
+
+/** Saved scopes stay; supplied ones are added, and a saved key's limits only tighten. */
+function resolveAdmission(
+  options: BudgetLedgerOptions['admission'],
+  saved: readonly PersistentBudgetScope[] | undefined,
+): ResolvedAdmission | undefined {
+  if (saved !== undefined && !Array.isArray(saved))
+    throw new BudgetLedgerError('invalid_snapshot', 'Snapshot admission must be an array.');
+  if (!options) {
+    if (saved)
+      throw new BudgetLedgerError(
+        'invalid_snapshot',
+        'This budget snapshot records persistent budget scopes; restore it with their BudgetStore (admission.store).',
+      );
+    return undefined;
+  }
+  const store = options.store;
+  if (
+    store === null ||
+    typeof store !== 'object' ||
+    typeof store.reserve !== 'function' ||
+    typeof store.settle !== 'function' ||
+    typeof store.release !== 'function'
+  )
+    throw new BudgetLedgerError('invalid_budget', 'admission.store must be a BudgetStore.');
+  threshold(options.warnAtPercent);
+  if (options.onWarning !== undefined && typeof options.onWarning !== 'function')
+    throw new BudgetLedgerError('invalid_budget', 'admission.onWarning must be a function.');
+  if (options.scopes !== undefined && !Array.isArray(options.scopes))
+    throw new BudgetLedgerError('invalid_budget', 'admission.scopes must be an array.');
+  const scopes = (saved ?? []).map(persistentScope);
+  const supplied = new Set<string>();
+  for (const input of options.scopes ?? []) {
+    const scope = persistentScope(input);
+    if (supplied.has(scope.key))
+      throw new BudgetLedgerError('invalid_budget', `Duplicate persistent scope: ${scope.key}.`);
+    supplied.add(scope.key);
+    const index = scopes.findIndex((item) => item.key === scope.key);
+    const previous = scopes[index];
+    if (!previous) {
+      scopes.push(scope);
+      continue;
+    }
+    if (windowKey(previous) !== windowKey(scope))
+      throw new BudgetLedgerError(
+        'invalid_budget',
+        `Persistent scope ${scope.key} cannot change its window on restore.`,
+      );
+    scopes[index] = persistentScope({
+      ...previous,
+      limits: intersectBudgetLimits(previous.limits, scope.limits),
+      ...(scope.warnAtPercent !== undefined ? { warnAtPercent: scope.warnAtPercent } : {}),
+    });
+  }
+  if (!scopes.length)
+    throw new BudgetLedgerError('invalid_budget', 'Persistent admission needs at least one scope.');
+  return Object.freeze({
+    store,
+    scopes: Object.freeze(scopes),
+    ...(options.warnAtPercent !== undefined ? { warnAtPercent: options.warnAtPercent } : {}),
+    ...(options.onWarning ? { onWarning: options.onWarning } : {}),
+  });
+}
+
 const chainKey = (scopes: readonly BudgetScope[]): string =>
   JSON.stringify(scopes.map((scope) => scope.id));
 
@@ -270,6 +387,7 @@ export function subtreeLedgerSnapshot(
       snapshot.reservations.filter((item) => inScope(item.scopes, scopeId)),
     ),
     ...(aggregates.length ? { aggregates: Object.freeze(aggregates) } : {}),
+    ...(snapshot.admission ? { admission: snapshot.admission } : {}),
     subtree: scopeId,
   });
 }
@@ -296,7 +414,9 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
       !Array.isArray(restored.reservations) ||
       (restored.aggregates !== undefined && !Array.isArray(restored.aggregates)) ||
       (restored.version === 1 &&
-        (restored.aggregates !== undefined || restored.subtree !== undefined)))
+        (restored.aggregates !== undefined ||
+          restored.subtree !== undefined ||
+          restored.admission !== undefined)))
   ) {
     throw new BudgetLedgerError('invalid_snapshot', 'Unsupported or malformed budget snapshot.');
   }
@@ -307,6 +427,9 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
     );
   }
   const budget = intersectBudgetLimits(restored?.budget, options.budget);
+  const admission = resolveAdmission(options.admission, restored?.admission);
+  /** Scope/dimension pairs at or above their warning threshold. */
+  const warned = new Set<string>();
   let revision = restored?.revision ?? 0;
   for (const item of restored?.reservations ?? []) {
     const saved = record(item);
@@ -330,12 +453,114 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
   function snapshot(): BudgetLedgerSnapshot {
     const folded = [...aggregates.values()];
     return Object.freeze({
-      version: folded.length ? 2 : 1,
+      version: folded.length || admission ? 2 : 1,
       revision,
       budget,
       reservations: Object.freeze([...entries.values()]),
       ...(folded.length ? { aggregates: Object.freeze(folded) } : {}),
+      ...(admission ? { admission: admission.scopes } : {}),
     });
+  }
+
+  /** Run a store call; a failure changes nothing locally and admits nothing. */
+  async function mirror<T>(call: () => Promise<T>): Promise<T> {
+    try {
+      return await call();
+    } catch (error) {
+      throw new BudgetLedgerError(
+        'admission_failed',
+        'The persistent budget store failed; nothing was changed.',
+        error,
+      );
+    }
+  }
+
+  /** Second gate (2.2): all-or-nothing admission in the shared store. */
+  async function admitPersistent(candidate: BudgetReservation): Promise<void> {
+    if (!admission) return;
+    for (const scope of admission.scopes) {
+      for (const dimension of dimensions) {
+        if (scope.limits[dimension] !== undefined && candidate.reservation[dimension] === undefined)
+          throw new BudgetLedgerError(
+            'missing_reservation',
+            `Known ${dimension} reservations are required by persistent scope ${scope.key}.`,
+          );
+      }
+    }
+    const store = admission.store;
+    const outcome = await mirror(() =>
+      store.reserve({
+        requestId: candidate.requestId,
+        modelId: candidate.modelId,
+        ...candidate.reservation,
+        scopes: admission.scopes.map((scope) => ({
+          key: scope.key,
+          limits: scope.limits,
+          ...(scope.window ? { window: scope.window } : {}),
+        })),
+      }),
+    );
+    if (!outcome.admitted) {
+      throw new BudgetLedgerError(
+        'budget_exceeded',
+        `${outcome.dimension} budget exceeded in persistent scope ${outcome.key}.`,
+      );
+    }
+    warn(admission, candidate.requestId, outcome.scopes);
+  }
+
+  function warn(
+    active: ResolvedAdmission,
+    requestId: string,
+    usage: readonly BudgetScopeUsage[],
+  ): void {
+    for (const scope of active.scopes) {
+      const warnAtPercent = scope.warnAtPercent ?? active.warnAtPercent;
+      const used = usage.find((item) => item.key === scope.key);
+      if (warnAtPercent === undefined || !used) continue;
+      for (const dimension of dimensions) {
+        const limit = scope.limits[dimension];
+        if (limit === undefined) continue;
+        const committed = used[dimension];
+        const percent = limit > 0 ? (committed * 100) / limit : committed > 0 ? Infinity : 0;
+        const id = JSON.stringify([scope.key, dimension]);
+        if (percent < warnAtPercent) {
+          warned.delete(id);
+          continue;
+        }
+        if (warned.has(id)) continue;
+        warned.add(id);
+        try {
+          active.onWarning?.({
+            key: scope.key,
+            dimension,
+            committed,
+            limit,
+            percent,
+            warnAtPercent,
+            requestId,
+          });
+        } catch {
+          // A warning is advisory: a failing callback never changes admission.
+        }
+      }
+    }
+  }
+
+  /**
+   * Mirror a transition into `settled`; unknown usage keeps the store's hold.
+   * Undefined when there is nothing to mirror, so ledgers without persistent
+   * admission keep their exact queue timing.
+   */
+  function mirrorSettlement(
+    previous: BudgetReservation,
+    next: BudgetReservation,
+  ): Promise<void> | undefined {
+    if (!admission || next.state !== 'settled' || previous.state === 'settled') return undefined;
+    const store = admission.store;
+    return mirror(() =>
+      store.settle(next.requestId, { tokens: next.actual.tokens!, usd: next.actual.usd! }),
+    );
   }
 
   function totals(scopeId?: string): BudgetTotals {
@@ -567,12 +792,17 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
           }
           admit(candidate, effective, scope.id);
         }
+        if (admission) await admitPersistent(candidate);
         return save(candidate);
       });
     },
     settle(input) {
       const copied = { ...input, ...(input.usage ? { usage: copyUsage(input.usage) } : {}) };
-      return enqueue(() => save(applySettlement(copied)));
+      return enqueue(() => {
+        const next = applySettlement(copied);
+        const mirrored = mirrorSettlement(required(copied.requestId), next);
+        return mirrored ? mirrored.then(() => save(next)) : save(next);
+      });
     },
     settleUsage(requestId: string, usage: Usage, priceProvider?: PriceProvider) {
       const copied = copyUsage(usage);
@@ -590,9 +820,11 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
             // A billing outage is not evidence of zero cost. Preserve the hold.
           }
         }
-        return save(
-          usd === undefined ? partial : applySettlement({ requestId, usage: copied, usd }),
-        );
+        const next =
+          usd === undefined ? partial : applySettlement({ requestId, usage: copied, usd });
+        const mirrored = mirrorSettlement(existing, next);
+        if (mirrored) await mirrored;
+        return save(next);
       });
     },
     markUnknown(requestId) {
@@ -612,7 +844,11 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
             `Billed request cannot be released: ${requestId}.`,
           );
         }
-        return save(record({ ...current, state: 'released', actual: {}, usage: undefined }));
+        const released = () =>
+          save(record({ ...current, state: 'released', actual: {}, usage: undefined }));
+        if (!admission || current.state === 'released') return released();
+        const store = admission.store;
+        return mirror(() => store.release(requestId)).then(released);
       });
     },
     get: (requestId) => entries.get(requestId),
@@ -661,6 +897,8 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
 }
 
 export type {
+  BudgetAdmission,
+  BudgetAdmissionRestore,
   BudgetAggregate,
   BudgetCompaction,
   BudgetLedger,
@@ -672,4 +910,5 @@ export type {
   BudgetScope,
   BudgetSettlement,
   BudgetTotals,
+  BudgetWarning,
 } from './types/execution';

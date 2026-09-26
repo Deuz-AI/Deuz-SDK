@@ -1,0 +1,181 @@
+---
+title: Budgets
+description: Persistent token and USD budgets per user, thread or organisation, shared by every run and process, with rolling windows and warnings.
+---
+
+An execution context's ledger bounds one run. A `BudgetStore` bounds usage that
+outlives the run: a user's daily tokens, an organisation's monthly dollars, a
+thread's lifetime cap. Every process that points at the same store shares the
+same budgets. The store is a second gate after the ledger; it does not replace
+local admission.
+
+## Share a budget between two runs
+
+This complete example runs two native agents with separate execution contexts
+against one in-memory store. The first run fits; the second does not, because the
+user scope is already used up. It is deterministic and needs no API key.
+
+```ts
+import { createExecutionContext, createInMemoryBudgetStore, runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const store = createInMemoryBudgetStore();
+const admission = { store, scopes: [{ key: 'user:42', limits: { tokens: 110 } }] };
+
+async function ask(runId: string) {
+  return runAgent({
+    model: createMockModel({ responses: [{ text: 'done' }] }),
+    prompt: 'Summarise the ticket.',
+    execution: createExecutionContext({ scopeId: runId, admission }),
+    // Admission reserves an estimate before the call and settles the actual usage after it.
+    executionEstimate: { tokens: 100, usd: 0.1 },
+    deps: { priceProvider: { priceUsage: () => 0.01 } },
+  });
+}
+
+console.log((await ask('run-1')).status); // 'completed': 100 of 110 reserved, 15 settled
+console.log((await ask('run-2')).status); // 'failed': 15 + 100 does not fit in 110
+console.log(await store.usage('user:42')); // { tokens: 15, usd: 0.01 }
+```
+
+The second run fails before any model call with a `BudgetLedgerError` whose code
+is `budget_exceeded` and whose message names the scope.
+
+## How admission works
+
+Each potentially billable attempt goes through two gates, in order, inside the
+ledger's queue:
+
+1. The ledger checks the context's own budgets, as it always has.
+2. The store admits the attempt against **every** persistent scope, or none. A
+   denial in one scope charges nothing to the others.
+
+Settlement and release are mirrored to the store. When usage stays unknown —
+the provider reported no usage, or no price was available for a USD budget —
+the store keeps the full estimate held. Give native runs a `priceProvider` when a
+scope bounds USD, or every call keeps its USD estimate.
+
+Every request is idempotent by its request ID. Repeating an identical
+reservation returns the recorded outcome, a denial included; repeating it with
+different amounts throws.
+
+A persistent scope that bounds a dimension needs an estimate for it. A context
+with a USD scope but no USD estimate fails closed with `missing_reservation`.
+When the store itself fails, the attempt fails with `admission_failed` and
+nothing changes locally.
+
+## Scopes and rolling windows
+
+```ts
+import { createExecutionContext, createInMemoryBudgetStore } from '@deuz-sdk/core/agent';
+
+const store = createInMemoryBudgetStore();
+const execution = createExecutionContext({
+  scopeId: 'run-7',
+  admission: {
+    store,
+    scopes: [
+      // 50 000 tokens in any rolling hour, counted in 60 one-minute buckets.
+      { key: 'user:42', limits: { tokens: 50_000 }, window: { ms: 3_600_000, buckets: 60 } },
+      // A lifetime dollar cap for the organisation.
+      { key: 'org:acme', limits: { usd: 200 } },
+    ],
+  },
+});
+```
+
+- `key` names the budget. Every request that uses the same key shares it.
+- `limits` holds `tokens`, `usd` or both. Each request brings its own limits, so
+  a key can be checked with different limits by different callers.
+- `window` makes the budget rolling. Usage leaves the window one bucket at a
+  time; the counted span is between `ms - ms / buckets` and `ms`. The first
+  request fixes a key's window, and a later request with a different window is
+  rejected. Omit `window` for a lifetime budget.
+
+A hold is charged to the bucket of its reservation time. A hold leaked by a crash
+therefore leaves a windowed budget with its bucket. In a lifetime budget it stays
+charged; that is the fail-closed outcome, not a leak to repair automatically. A
+settlement that arrives after its bucket left the window updates history but not
+the current window.
+
+## Warnings
+
+```ts
+import { createExecutionContext, createInMemoryBudgetStore } from '@deuz-sdk/core/agent';
+
+const execution = createExecutionContext({
+  admission: {
+    store: createInMemoryBudgetStore(),
+    scopes: [{ key: 'user:42', limits: { tokens: 50_000 }, window: { ms: 86_400_000 } }],
+    warnAtPercent: 80,
+    onWarning: (warning) => {
+      console.log(
+        `${warning.key} is at ${Math.round(warning.percent)}% of its ${warning.dimension}`,
+      );
+    },
+  },
+});
+```
+
+`onWarning` fires once when committed usage in a scope crosses the threshold on
+admission, per scope and dimension. It fires again only after usage falls back
+below the threshold, for example when a window empties. A scope's own
+`warnAtPercent` overrides the admission-wide one. A throwing callback never
+changes admission. Warnings are tracked per ledger: two processes sharing a
+store each warn once.
+
+## Children, snapshots and restore
+
+Child contexts share their parent's ledger, so they inherit its persistent
+admission. `snapshot()` records the persistent scopes in the ledger snapshot,
+which makes the execution snapshot version 2. A 2.1 reader refuses version 2
+instead of silently admitting without the store.
+
+Restoring such a snapshot needs the store again:
+
+```ts
+import { createExecutionContext, createInMemoryBudgetStore } from '@deuz-sdk/core/agent';
+
+const store = createInMemoryBudgetStore();
+const saved = createExecutionContext({
+  admission: { store, scopes: [{ key: 'user:42', limits: { tokens: 1_000 } }] },
+}).snapshot();
+
+// The snapshot supplies the scopes; admission here may only add or tighten them.
+const restored = createExecutionContext({ snapshot: saved, admission: { store } });
+```
+
+Restoring without `admission` throws. Scopes passed on restore are added, and a
+key the snapshot already has keeps the tighter limits; changing its window
+throws.
+
+## Durable stores
+
+The in-memory store is for tests and single-process deployments. Two durable
+stores implement the same contract and pass the same conformance suite:
+
+```ts
+import { createSqliteBudgetStore } from '@deuz-sdk/core/ops/sqlite';
+import { createPostgresBudgetStore } from '@deuz-sdk/core/ops/postgres';
+import pg from 'pg';
+
+// Processes on one machine: one database file, BEGIN IMMEDIATE per change.
+const local = createSqliteBudgetStore({ path: './budgets.sqlite' });
+
+// Many machines: every admission is one statement that locks the scope rows.
+const shared = createPostgresBudgetStore({ client: new pg.Pool(), schema: 'public' });
+```
+
+- **SQLite** keeps its tables and its own schema version under `deuz_budget_*`.
+  Windows use the store's `clock` (the host clock by default), so processes
+  sharing a file should share a clock.
+- **Postgres** takes any `PgClientLike` (`pg.Pool`, `pg.Client`, a serverless
+  driver). Admission, settlement and release are each one statement, so a
+  pooled client never splits them across connections. Windows use database
+  time, never host clocks. The schema must exist; the tables are created on
+  first use.
+
+`usage(key, { since, byModel })` reports committed usage (settled amounts plus
+held estimates) over the key's history, or since a point in time; a bucket that
+straddles `since` counts whole. The stores keep history and request records;
+they do not prune them.
