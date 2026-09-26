@@ -10,6 +10,7 @@ import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/l
 import { assertLeaseRequest } from '../internal/ops-validate';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 import { postgresSchemaName } from './swarm-postgres';
+import { postgresSchemaStatement } from './postgres-migrate';
 
 // Persistent budget scopes (2.2, M5) share this Node-only subpath: one import
 // for every durable ops store on Postgres.
@@ -43,22 +44,23 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
     (await options.client.query(sql, params)).rows;
 
   let ready: Promise<void> | undefined;
-  const migrate = async (): Promise<void> => {
-    await query(
-      `CREATE TABLE IF NOT EXISTS ${meta} (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)`,
-    );
-    await query(
-      `INSERT INTO ${meta} (singleton, version) VALUES (1, ${SCHEMA_VERSION}) ON CONFLICT (singleton) DO NOTHING`,
-    );
-    const [row] = await query(`SELECT version FROM ${meta} WHERE singleton = 1`);
-    if (Number(row?.version) !== SCHEMA_VERSION)
-      throw new Error('Unsupported Postgres ops schema version');
-    await query(`CREATE TABLE IF NOT EXISTS ${leasesTable} (
+  // One statement (a DO block) under an advisory lock: see postgres-migrate.ts.
+  const schemaSql = postgresSchemaStatement({
+    lock: `ops:${schema}`,
+    meta,
+    version: SCHEMA_VERSION,
+    unsupported: 'Unsupported Postgres ops schema version',
+    create: [
+      `CREATE TABLE IF NOT EXISTS ${leasesTable} (
       key TEXT PRIMARY KEY, owner TEXT NOT NULL, token BIGINT NOT NULL,
-      expires_at BIGINT NOT NULL, signals JSONB NOT NULL DEFAULT '[]'::jsonb)`);
-    await query(`CREATE TABLE IF NOT EXISTS ${runsTable} (
+      expires_at BIGINT NOT NULL, signals JSONB NOT NULL DEFAULT '[]'::jsonb)`,
+      `CREATE TABLE IF NOT EXISTS ${runsTable} (
       run_id TEXT PRIMARY KEY, scope TEXT NOT NULL, revision BIGINT NOT NULL,
-      payload TEXT NOT NULL, updated_at BIGINT NOT NULL)`);
+      payload TEXT NOT NULL, updated_at BIGINT NOT NULL)`,
+    ],
+  });
+  const migrate = async (): Promise<void> => {
+    await query(schemaSql);
   };
   const use = async (): Promise<void> => {
     ready ??= migrate().catch((error: unknown) => {

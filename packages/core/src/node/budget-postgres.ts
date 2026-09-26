@@ -15,9 +15,11 @@
  *
  * Windows run on database time (`clock_timestamp()`), never on host clocks.
  * `BIGINT` and `numeric` values arrive as strings from `pg` and are coerced
- * with `Number()`.
+ * with `Number()`. The schema is created by one locked statement
+ * (`postgres-migrate.ts`), so concurrent first uses never race.
  */
 import type { PgClientLike } from './store-postgres';
+import { postgresSchemaStatement } from './postgres-migrate';
 import type { BudgetStore, BudgetStoreReservation } from '../types/budget-store';
 import {
   assertBudgetActual,
@@ -55,28 +57,29 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
   const t = (name: string) => `${schema}.deuz_budget_${name}`;
   let migrating: Promise<void> | undefined;
 
-  const migrate = (): Promise<void> => {
-    migrating ??= (async () => {
-      // One statement per call: some drivers (PGlite) refuse multi-statement queries.
-      await client.query(
-        `CREATE TABLE IF NOT EXISTS ${t('schema')} (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)`,
-      );
-      await client.query(
-        `INSERT INTO ${t('schema')} (singleton, version) VALUES (1, ${SCHEMA_VERSION}) ON CONFLICT (singleton) DO NOTHING`,
-      );
-      const { rows } = await client.query(`SELECT version FROM ${t('schema')} WHERE singleton = 1`);
-      if (Number(rows[0]?.version) !== SCHEMA_VERSION)
-        throw new Error('Unsupported Postgres budget schema version');
-      await client.query(`CREATE TABLE IF NOT EXISTS ${t('scopes')} (
+  // One statement (a DO block) under an advisory lock: see postgres-migrate.ts.
+  const schemaSql = postgresSchemaStatement({
+    lock: `budget:${schema}`,
+    meta: t('schema'),
+    version: SCHEMA_VERSION,
+    unsupported: 'Unsupported Postgres budget schema version',
+    create: [
+      `CREATE TABLE IF NOT EXISTS ${t('scopes')} (
         key TEXT PRIMARY KEY, window_ms BIGINT, buckets INTEGER NOT NULL, bucket_ms BIGINT NOT NULL,
-        ring_idx BIGINT[] NOT NULL, ring_tokens BIGINT[] NOT NULL, ring_usd DOUBLE PRECISION[] NOT NULL)`);
-      await client.query(`CREATE TABLE IF NOT EXISTS ${t('counters')} (
+        ring_idx BIGINT[] NOT NULL, ring_tokens BIGINT[] NOT NULL, ring_usd DOUBLE PRECISION[] NOT NULL)`,
+      `CREATE TABLE IF NOT EXISTS ${t('counters')} (
         key TEXT NOT NULL, bucket BIGINT NOT NULL, model_id TEXT NOT NULL,
-        tokens BIGINT NOT NULL, usd DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, bucket, model_id))`);
-      await client.query(`CREATE TABLE IF NOT EXISTS ${t('requests')} (
+        tokens BIGINT NOT NULL, usd DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, bucket, model_id))`,
+      `CREATE TABLE IF NOT EXISTS ${t('requests')} (
         request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, model_id TEXT NOT NULL,
         tokens BIGINT NOT NULL, usd DOUBLE PRECISION NOT NULL, state TEXT NOT NULL, charges JSONB NOT NULL,
-        actual_tokens BIGINT, actual_usd DOUBLE PRECISION, outcome JSONB NOT NULL, created_at BIGINT NOT NULL)`);
+        actual_tokens BIGINT, actual_usd DOUBLE PRECISION, outcome JSONB NOT NULL, created_at BIGINT NOT NULL)`,
+    ],
+  });
+
+  const migrate = (): Promise<void> => {
+    migrating ??= (async () => {
+      await client.query(schemaSql);
     })().catch((error: unknown) => {
       migrating = undefined;
       throw error;
@@ -143,6 +146,10 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
   const settleSql = transition('settled', '$2::bigint - tg.tokens', '$3::float8 - tg.usd');
   const releaseSql = transition('released', '-tg.tokens', '-tg.usd');
 
+  // `cur` holds the scopes whose stored window matches the request. A scope
+  // created with another window by a concurrent first reserve drops out of it;
+  // then nothing is recorded, `matched` falls short and reserve() answers
+  // window_conflict, as it does when it sees the other window up front.
   const reserveSql = `
     WITH now_ms AS (SELECT ${NOW_MS} AS at),
     req AS (
@@ -196,6 +203,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         (SELECT jsonb_agg(jsonb_build_object('key', key, 'index', hist) ORDER BY ord) FROM cur),
         o.body, n.at
       FROM decision d, outcome o, now_ms n
+      WHERE (SELECT count(*) FROM cur) = cardinality($6::text[])
       ON CONFLICT (request_id) DO NOTHING
       RETURNING state, outcome
     ), ring AS (
@@ -218,7 +226,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         DO UPDATE SET tokens = k.tokens + excluded.tokens, usd = k.usd + excluded.usd
       RETURNING k.key
     )
-    SELECT (SELECT outcome FROM ins) AS outcome,
+    SELECT (SELECT outcome FROM ins) AS outcome, (SELECT count(*) FROM cur) AS matched,
       (SELECT count(*) FROM ring) AS ring, (SELECT count(*) FROM hist) AS hist`;
 
   const recorded = async (requestId: string, fingerprint: string) => {
@@ -226,6 +234,28 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
     if (existing && existing.fingerprint !== fingerprint) throw reservationConflict(requestId);
     return existing?.outcome;
   };
+
+  /** Throws window_conflict for a stored scope row whose window differs from the request's. */
+  const assertStoredWindows = (
+    request: ReturnType<typeof normalizeBudgetReserve>,
+    rows: readonly Record<string, unknown>[],
+  ): void => {
+    for (const row of rows) {
+      const scope = request.scopes.find((item) => item.key === row.key);
+      if (scope)
+        assertSameWindow(scope, {
+          windowMs: row.window_ms === null ? null : Number(row.window_ms),
+          buckets: Number(row.buckets),
+        });
+    }
+  };
+  const readScopes = async (keys: readonly string[]) =>
+    (
+      await client.query(
+        `SELECT key, window_ms, buckets FROM ${t('scopes')} WHERE key = ANY($1::text[])`,
+        [keys],
+      )
+    ).rows;
 
   return Object.freeze({
     async reserve(input) {
@@ -251,14 +281,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
           request.scopes.map((scope) => scope.bucketMs),
         ],
       );
-      for (const row of saved) {
-        const scope = request.scopes.find((item) => item.key === row.key);
-        if (scope)
-          assertSameWindow(scope, {
-            windowMs: row.window_ms === null ? null : Number(row.window_ms),
-            buckets: Number(row.buckets),
-          });
-      }
+      assertStoredWindows(request, saved);
       const { rows } = await client.query(reserveSql, [
         request.requestId,
         request.fingerprint,
@@ -273,6 +296,12 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
       ]);
       const outcome = parse(rows[0]?.outcome);
       if (outcome) return outcome;
+      if (Number(rows[0]?.matched) < keys.length) {
+        // A concurrent first reserve created a key with another window after
+        // the scope insert above took its snapshot, so that check missed it.
+        assertStoredWindows(request, await readScopes(keys));
+        throw new Error('Budget reservation found a scope row missing; retry it');
+      }
       // A concurrent caller recorded this request first.
       const raced = await recorded(request.requestId, request.fingerprint);
       if (!raced) throw new Error('Budget reservation was not recorded');
