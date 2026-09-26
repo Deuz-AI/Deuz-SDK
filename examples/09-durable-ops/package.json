@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/09-durable-ops",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Leases on SQLite: a crashed executor's run taken over by recover(), plus requestCancel and drain.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
