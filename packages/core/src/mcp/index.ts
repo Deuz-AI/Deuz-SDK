@@ -21,6 +21,11 @@ import {
 
 export { createManagedConnection } from './shared';
 
+// Tool fingerprinting (2.2): hash a server's catalog when you approve it, then
+// detect a later description/schema rewrite before the model follows it.
+export { fingerprintTools, detectToolDrift } from './shared';
+export type { ToolFingerprints, ToolDrift } from './shared';
+
 // OAuth 2.0 (2.0) — build a provider up front to share one token store across
 // servers, or to hand the same provider to a `mcp: [{ url, auth }]` loop entry.
 export { createOAuthProvider, inMemoryTokenStore } from './auth';

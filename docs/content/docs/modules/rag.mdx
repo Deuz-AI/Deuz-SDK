@@ -233,7 +233,41 @@ const fused = reciprocalRankFusion([dense, lexical], { k: 60, topN: 5 });
 
 ## The reranker seam
 
-`retrieve` and `hybridRetrieve` accept an optional `reranker`. The default is `identityReranker`, which sorts by score and truncates to `topN` (a real cross-encoder rerank is deferred). Plug in your own `Reranker` to call a cross-encoder model:
+`retrieve` and `hybridRetrieve` accept an optional `reranker`. The default is `identityReranker`, which sorts by the retrieval score and truncates to `topN`. A cross-encoder reads the query and each candidate *together*, so it catches relevance that neither cosine similarity nor BM25 can see. Two hosted ones ship (2.2):
+
+| Factory | Subpath | Endpoint | Default model |
+| --- | --- | --- | --- |
+| `createCohereReranker(settings?)` | `@deuz-sdk/core/rag` | `POST https://api.cohere.com/v2/rerank` | `rerank-v4.0-pro` |
+| `createVoyageReranker(settings?)` | `@deuz-sdk/core/voyage` | `POST https://api.voyageai.com/v1/rerank` | `rerank-2.5` |
+
+```ts title="rerank.ts"
+import { retrieve, createCohereReranker } from '@deuz-sdk/core/rag';
+import { createVoyageReranker } from '@deuz-sdk/core/voyage';
+
+const reranker = createCohereReranker({ apiKey: process.env.COHERE_API_KEY });
+// or: createVoyageReranker({ apiKey: process.env.VOYAGE_API_KEY, model: 'rerank-2.5-lite' })
+
+// Over-fetch with the cheap retriever, let the cross-encoder pick the best few.
+const hits = await retrieve(query, { embedder, store, reranker }, { topK: 40, topN: 5 });
+```
+
+Both take the same settings:
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `apiKey` | — | `deps.keyProvider.getKey('cohere' \| 'voyage')` outranks it when it returns a key. With neither, `rerank` throws `AuthenticationError` before any request. |
+| `model` | see above | Any rerank model id the provider accepts. |
+| `topK` | — | Upper bound per call. The reranker returns `min(topN, topK)` chunks. |
+| `baseURL` | provider root | `/rerank` is appended. For a relay or a regional endpoint. |
+| `fetch` | `deps.fetch` | Wins over `deps.fetch`. |
+| `headers` | — | Extra request headers. |
+| `deps` | — | Only `fetch` and `keyProvider` are read. |
+
+What comes back is the **original chunks** — `index`, `text`, `meta` untouched — with `score` replaced by the provider's `relevance_score`, best first. Your input array is never mutated. An empty candidate list or `topN: 0` makes no request.
+
+Failures map onto the usual [error classes](/docs/core/errors): 429 is `RateLimitError` (with `retryAfterMs`), 401/403 `AuthenticationError`, any other 4xx `InvalidRequestError`, 5xx a retryable `APICallError`, a transport failure `NetworkError`. A response that points at a document index outside the list is rejected rather than guessed at. The key only ever goes into the `authorization` header, never into an error. Each `rerank` is **one** request with no retries; wrap it if you want them.
+
+Any other model is a few lines behind the same seam:
 
 ```ts title="reranker.ts"
 import type { Reranker } from '@deuz-sdk/core/rag';

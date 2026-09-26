@@ -22,6 +22,7 @@ import type {
   InputGuardrailContext,
   OutputGuardrail,
   ToolCallGuardrail,
+  ToolResultGuardrail,
 } from '../types/guardrails';
 import type { WireTool, WireToolRequest } from '../adapters/types';
 import { runOneStep, type OneStep } from './run-step';
@@ -961,6 +962,85 @@ export async function applyToolCallGuardrails(
     calls.push(denied ? original : call);
   }
   return { calls, blocked, parts };
+}
+
+/**
+ * Evaluate `guardrails.onToolResult` (2.2) for the results of the tools that
+ * actually RAN in a batch — AFTER each returned and BEFORE anything reaches the
+ * model. Same ordering rules as {@link evaluateInputGuardrails}, applied per
+ * result, in call order (one result's block never short-circuits another's).
+ *
+ * Only results a tool's own `execute` produced are guarded — a success, a throw
+ * or a timeout (the latter two as `isError: true` with the self-heal message).
+ * SDK-authored answers (approval/guardrail denials, unknown tool names, missing
+ * executors, argument validation failures) never reach the hook: there is no
+ * tool output in them to inspect.
+ *
+ * `rewrite` replaces `result` (the error flag is kept); `block` replaces the
+ * whole answer with an `is_error` result carrying
+ * {@link guardrailDenialReason}. The returned array is a NEW one — the input is
+ * never mutated. In a native run the value guarded is the model-facing
+ * projection; the raw result was already written to the receipt.
+ */
+export async function applyToolResultGuardrails(
+  options: CommonCallOptions,
+  toolCalls: ToolCall[],
+  results: ToolResult[],
+  executed: ReadonlySet<string>,
+  messages: Message[],
+  stepIndex?: number,
+): Promise<{ results: ToolResult[]; parts: GuardrailPart[] }> {
+  const list: ToolResultGuardrail[] = guardrailList(options.guardrails?.onToolResult);
+  if (list.length === 0 || executed.size === 0) return { results, parts: [] };
+  const parts: GuardrailPart[] = [];
+  const base = guardrailBase(options);
+  const callsById = new Map(toolCalls.map((c) => [c.toolCallId, c]));
+  const out: ToolResult[] = [];
+  for (const original of results) {
+    const toolCall = callsById.get(original.toolCallId);
+    if (!toolCall || !executed.has(original.toolCallId)) {
+      out.push(original);
+      continue;
+    }
+    let current = original;
+    const step = stepIndex !== undefined ? { stepIndex } : {};
+    for (const guard of list) {
+      const verdict = await guard({
+        toolCall,
+        result: current.result,
+        isError: current.isError === true,
+        messages,
+        ...step,
+        ...base,
+      });
+      if (!verdict || verdict.action === 'pass') continue;
+      if (verdict.action === 'block') {
+        parts.push(
+          guardrailPart('tool-result', 'block', guard, {
+            reason: verdict.reason,
+            toolCallId: original.toolCallId,
+            ...step,
+          }),
+        );
+        current = {
+          toolCallId: original.toolCallId,
+          toolName: original.toolName,
+          result: guardrailDenialReason(guardrailName(guard), verdict.reason),
+          isError: true,
+        };
+        break;
+      }
+      current = { ...current, result: verdict.result };
+      parts.push(
+        guardrailPart('tool-result', 'rewrite', guard, {
+          toolCallId: original.toolCallId,
+          ...step,
+        }),
+      );
+    }
+    out.push(current);
+  }
+  return { results: out, parts };
 }
 
 /**
@@ -2003,6 +2083,18 @@ export interface ExecuteExtras {
   session?: { store: SessionStore; runId: string; durability?: 'best-effort' | 'strict' };
   approvalResponses?: ToolApprovalResponse[];
   /**
+   * Guardrail sink (2.2): receives the `onToolResult` verdict parts, so the
+   * loop can stream them and add them to `providerMetadata.deuz.guardrails`
+   * exactly like the other hooks' parts.
+   */
+  onGuardrail?: (parts: GuardrailPart[]) => void;
+  /**
+   * Index of the step whose tools are executing (2.2), for the `onToolResult`
+   * context and its parts. The loop MUTATES it per iteration; absent on the
+   * settle phase of a resume leg, which runs before any step.
+   */
+  stepIndex?: number;
+  /**
    * Observation (1.6): loop-owned correlation for tool events. The loop
    * MUTATES parentSpanId/stepIndex per iteration (settle-phase executions run
    * step-less under the run span). `counters` is the loop's same-tool error
@@ -2149,6 +2241,11 @@ export async function executeTools(
   const nativeBatch = options.execution ? new AbortController() : undefined;
   const nativePolicy = options.execution ? await import('../internal/native-request') : undefined;
   const batchErrors: unknown[] = [];
+  // Ids of the calls whose own `execute` was invoked — the only results the
+  // `onToolResult` hook guards (2.2). `undefined` keeps the no-guardrail path
+  // allocation-free.
+  const executed =
+    guardrailList(options.guardrails?.onToolResult).length > 0 ? new Set<string>() : undefined;
   if (nativeBatch)
     options = { ...options, signal: combineSignals([options.signal, nativeBatch.signal]) };
   const results = mapWithConcurrency(
@@ -2330,6 +2427,7 @@ export async function executeTools(
               });
               if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('Execution cancelled.');
             }
+            executed?.add(call.toolCallId);
             return tool.execute!(validation.value, ctx);
           };
           const outcome: ToolExecOutcome = timed
@@ -2417,18 +2515,37 @@ export async function executeTools(
         }
       : undefined,
   );
-  if (!nativeBatch) return results;
-  try {
-    return await results;
-  } catch (error) {
-    const fatal = batchErrors.find((item) => !(item instanceof SubAgentSuspension));
-    if (fatal !== undefined) throw fatal;
-    if (batchErrors.length > 0)
-      throw new SubAgentSuspension(
-        batchErrors.flatMap((item) => (item as SubAgentSuspension).approvals),
-      );
-    throw error;
+  let settled: ToolResult[];
+  if (!nativeBatch) {
+    if (!executed) return results;
+    settled = await results;
+  } else {
+    try {
+      settled = await results;
+    } catch (error) {
+      const fatal = batchErrors.find((item) => !(item instanceof SubAgentSuspension));
+      if (fatal !== undefined) throw fatal;
+      if (batchErrors.length > 0)
+        throw new SubAgentSuspension(
+          batchErrors.flatMap((item) => (item as SubAgentSuspension).approvals),
+        );
+      throw error;
+    }
+    if (!executed) return settled;
   }
+  // Tool-result guardrails (2.2): the whole batch has settled, so a THROWING
+  // guardrail propagates out of here as caller code — it never lands in a
+  // worker's catch, where it would have self-healed into a fake tool failure.
+  const guarded = await applyToolResultGuardrails(
+    options,
+    toolCalls,
+    settled,
+    executed,
+    messages,
+    extras?.stepIndex,
+  );
+  if (guarded.parts.length > 0) extras?.onGuardrail?.(guarded.parts);
+  return guarded.results;
 }
 
 // --- Loop-level observation (1.6): shared by the buffered + streaming loops ---

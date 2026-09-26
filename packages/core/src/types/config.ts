@@ -278,12 +278,15 @@ export type {
   InputGuardrailContext,
   OutputGuardrailContext,
   ToolCallGuardrailContext,
+  ToolResultGuardrailContext,
   InputGuardrailResult,
   OutputGuardrailResult,
   ToolCallGuardrailResult,
+  ToolResultGuardrailResult,
   InputGuardrail,
   OutputGuardrail,
   ToolCallGuardrail,
+  ToolResultGuardrail,
 } from './guardrails';
 
 /**

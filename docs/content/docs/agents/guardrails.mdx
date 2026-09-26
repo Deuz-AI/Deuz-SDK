@@ -1,9 +1,9 @@
 ---
 title: Guardrails
-description: Three hooks around the agentic loop — onInput, onToolCall, onOutput — each returning pass, block or rewrite, with built-ins on @deuz-sdk/core/guardrails.
+description: Four hooks around the agentic loop — onInput, onToolCall, onToolResult, onOutput — each returning pass, block or rewrite, with built-ins on @deuz-sdk/core/guardrails.
 ---
 
-A guardrail is a **plain function** that inspects one boundary of a run and returns a verdict. Three hooks, three verdicts, and no framework:
+A guardrail is a **plain function** that inspects one boundary of a run and returns a verdict. Four hooks, three verdicts, and no framework:
 
 ```ts title="guarded.ts"
 import { generateText } from '@deuz-sdk/core';
@@ -44,6 +44,7 @@ Do **not** reach for it when:
 | --- | --- | --- | --- |
 | **`onInput`**<br/>once per run leg, before the first model call | Nothing happens. No part, no metadata entry. | The run ends **before any provider request**. Empty answer, `stoppedBy: 'guardrail:input'`. A graceful stop, not a throw. | `{ messages }` replaces the history the run starts from. |
 | **`onToolCall`**<br/>per call, before the approval gate | The call proceeds to the gate. | The call becomes an `is_error` `tool_result` the model can react to. The run **continues**. | `{ args }` substitutes the arguments passed to the gate and to `execute`. |
+| **`onToolResult`** (2.2)<br/>per executed tool, after it returns, before the model sees it | The result goes to the model unchanged. | The result becomes an `is_error` `tool_result` carrying the reason. The run **continues**. | `{ result }` replaces what the model sees. |
 | **`onOutput`**<br/>at a natural completion, after `doneWhen` + `verifyStep` | The model's text is returned as-is. | The text is suppressed; `replacement ?? ''` is returned instead, with `stoppedBy: 'guardrail:output'`. | `{ text }` replaces the final answer. |
 
 What each verdict actually leaves behind:
@@ -54,6 +55,8 @@ What each verdict actually leaves behind:
 | `onInput` · rewrite | normal | — | `guardrail` | The rewritten history is what the run *starts* from; it is not appended to your delta | all |
 | `onToolCall` · block | normal | — | `guardrail` (`hook: 'tool-call'`, carries `toolCallId`) + a `denied` tool-state part | The `is_error` `tool_result` is written, like any denial | yes, the run continues |
 | `onToolCall` · rewrite | normal | — | `guardrail` | **History keeps the model's original arguments** — see [below](#a-rewrite-deliberately-does-not-rewrite-history) | yes |
+| `onToolResult` · block | normal | — | `guardrail` (`hook: 'tool-result'`, carries `toolCallId`) + an `error` tool-state part | The `is_error` `tool_result` replaces the real one — the output never enters history | yes, the run continues |
+| `onToolResult` · rewrite | normal | — | `guardrail`, then a `tool-result` part with the rewritten `output` | The rewritten result is what history, `steps[].toolResults` and the checkpoint carry | yes |
 | `onOutput` · block | `replacement ?? ''` | `guardrail:output` | `guardrail` (`hook: 'output'`) | Rewritten to match. A block with no `replacement` on a text-only turn **drops the assistant message entirely** rather than persisting an empty, unsendable one | run ends |
 | `onOutput` · rewrite | the rewritten text | — | `guardrail` | Rewritten to match, including the `steps[]` entry | run ends |
 
@@ -61,7 +64,7 @@ Neither `stoppedBy` marker is an error: both are graceful stops on `providerMeta
 
 Each hook takes one guardrail **or an ordered array**.
 
-## Ordering rules (identical for all three hooks)
+## Ordering rules (identical for all four hooks)
 
 1. **The array runs in order.**
 2. **Rewrites chain** — the next guardrail sees what the previous one wrote.
@@ -69,7 +72,7 @@ Each hook takes one guardrail **or an ordered array**.
 4. **`pass` is silent** — `undefined` and `{ action: 'pass' }` are the same thing, and neither emits a part nor a metadata entry.
 5. **A throw propagates.** A guardrail is caller code, like `prepareStep` / `verifyStep` / `doneWhen`. Swallowing a throw would leave you believing a defense is armed while it is inert — the worse failure mode for a safety control.
 
-For `onToolCall`, rules 1–3 apply **per call**: one call's block never short-circuits another call's evaluation.
+For `onToolCall` and `onToolResult`, rules 1–3 apply **per call**: one call's block never short-circuits another call's evaluation.
 
 Consequences of rules 2 and 3 worth planning around: order your array **cheapest and most decisive first**, since a block skips the rest; and if two rewrites both edit the final text, the second one is editing the first one's output, not the model's.
 
@@ -85,6 +88,7 @@ run leg starts
        ├─ onToolCall (per call) ──── block/rewrite
        ├─ approval gate (needsApproval / approveToolCall)
        ├─ executeTools
+       ├─ onToolResult (per result) ─ block/rewrite, before the model sees it
        └─ at a natural completion:
             ├─ doneWhen
             ├─ verifyStep           ← a rejection re-drives; the hook below never sees that round
@@ -95,6 +99,7 @@ Each placement is a decision, not an accident:
 
 - **`onInput` runs after the resume settle**, so a durable leg that answers pending approvals is not re-gated on a history the user did not just send. It runs **once per run leg** — not once per step, and not once per sub-agent. It also runs *after* the memory recall block is computed, but that block is spliced in at the model-call site, so an input guardrail does not see it.
 - **`onToolCall` runs immediately before the approval gate**, which is why a rewrite reaches the `needsApproval` predicate, the approval request a human sees, and `execute`. Running it *after* the gate would mean a human approved arguments the loop then changed; running it *before* the handoff interception would mean a routing decision could be blocked as if it were a tool.
+- **`onToolResult` runs once the whole batch has settled**, in call order, before the results are appended to history or streamed. A throwing guardrail therefore propagates out of the run instead of self-healing into a fake tool failure.
 - **`onOutput` runs after `doneWhen` and `verifyStep` have both accepted.** A re-driven round never reaches it, so the text a guardrail sees is the one the run is actually about to return — and it is not re-run per attempt, so an expensive check (a classifier call) is paid for once.
 
 <Callout type="info" title="Handoffs are intercepted before guardrails">
@@ -134,6 +139,57 @@ That asymmetry is on purpose. Rewriting history would make the transcript lie ab
 
 `onOutput` is the opposite, and also on purpose: an output rewrite **is** authoritative. The appended assistant message in `response.messages`, the `steps[]` entry, the durable checkpoint and the chat record are all rewritten to match, so nothing downstream disagrees with what you were handed.
 
+## Guarding tool results (2.2)
+
+Tool output is the widest door into a model's context: a scraped page, an email body or an MCP server's reply can carry instructions the model was never meant to follow, or a secret it was never meant to repeat. `onToolResult` sits between a tool's return and the model:
+
+```ts title="tool-result.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import type { ToolResultGuardrail } from '@deuz-sdk/core';
+
+const model = createMockModel({
+  responses: [
+    { toolCalls: [{ toolName: 'readFile', args: { path: '.env.example' } }] },
+    { text: 'The file sets an API key.' },
+  ],
+});
+
+const redactKeys: ToolResultGuardrail = (ctx) =>
+  typeof ctx.result === 'string' && /sk-[A-Za-z0-9]+/.test(ctx.result)
+    ? { action: 'rewrite', result: ctx.result.replace(/sk-[A-Za-z0-9]+/g, 'sk-[redacted]') }
+    : undefined;
+
+const res = await generateText({
+  model,
+  messages: [{ role: 'user', content: 'What does .env.example configure?' }],
+  tools: {
+    readFile: {
+      description: 'Read a file',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      execute: async () => 'OPENAI_API_KEY=sk-live123456',
+    },
+  },
+  maxSteps: 3,
+  guardrails: { onToolResult: redactKeys },
+});
+
+res.steps?.[0]?.toolResults[0]?.result; // 'OPENAI_API_KEY=sk-[redacted]'
+res.providerMetadata?.deuz?.guardrails; // [{ hook: 'tool-result', action: 'rewrite', name: 'redactKeys', toolCallId: 'call_1', stepIndex: 0 }]
+```
+
+What it sees, and what it does not:
+
+- **Only output a tool produced.** A success, a throw or a timeout (the last two with `isError: true` and the self-heal message as `result`). SDK-authored answers never reach it: approval and guardrail denials, unknown tool names, missing executors and argument validation failures carry no tool output to inspect.
+- **The call that ran.** `ctx.toolCall` carries the arguments after any `onToolCall` rewrite.
+- **`rewrite` is authoritative.** Unlike an `onToolCall` rewrite, this one changes history: the model must reason about the result it was given, so the `tool_result` in `response.messages`, `steps[].toolResults`, the `tool-result` stream part and the durable checkpoint all carry the rewritten value. Observation events (`tool.completed` with content capture on) still describe what the tool actually returned.
+- **`block` counts toward the runaway-error guard.** A blocked call never ran; a blocked result did. Three withheld outputs in a row from the same tool is the kind of loop the guard exists to stop. One clean result resets the counter.
+- **Resume legs are guarded too.** Calls executed while a durable run settles its approvals go through the same hook, with no `stepIndex`.
+
+### Native runs: the projection, not the receipt
+
+In a [native `runAgent`](/docs/modules/native-agents) run a tool has two results: the raw value `execute` returned, persisted in the tool receipt, and the model-facing projection (`toModelOutput`'s value, else the validated result). `onToolResult` acts on the **projection**. The receipt is written before the hook runs and keeps the raw result and the projection exactly as the tool produced them, so an audit or a replay still sees the truth while the model sees the guarded version.
+
 ## Contexts
 
 Every hook receives the same base, plus its own field:
@@ -149,6 +205,11 @@ interface GuardrailBaseContext {
 type InputGuardrailContext = GuardrailBaseContext;
 interface OutputGuardrailContext   extends GuardrailBaseContext { text: string; }
 interface ToolCallGuardrailContext extends GuardrailBaseContext { toolCall: ToolCall; }
+interface ToolResultGuardrailContext extends GuardrailBaseContext {
+  toolCall: ToolCall;  // the call that ran
+  result: unknown;     // the model-facing result (earlier rewrites in the array applied)
+  isError: boolean;    // true for a thrown or timed-out tool
+}
 ```
 
 `toolCall.args` are already **parsed** — you inspect a value, not a JSON string — and they are the arguments as accumulated from the wire, before any rewrite by an earlier guardrail in the same array (each guardrail sees the previous one's output, per rule 2).
@@ -267,11 +328,11 @@ One part per **non-pass** verdict — a UI should be able to show that a rule bl
 ```ts
 interface GuardrailPart {
   type: 'guardrail';
-  hook: 'input' | 'output' | 'tool-call';
+  hook: 'input' | 'output' | 'tool-call' | 'tool-result';
   action: 'block' | 'rewrite';   // passes are not emitted
   name?: string;
   reason?: string;
-  toolCallId?: string;           // set on hook: 'tool-call'
+  toolCallId?: string;           // set on hook: 'tool-call' and 'tool-result'
   stepIndex?: number;            // absent on the pre-run input hook
 }
 ```
@@ -325,6 +386,41 @@ function maxOutputLength(n: number, opts?: { mode?: 'truncate' | 'block' }): Out
 
 Characters, not tokens: this is a cheap output-size backstop (a UI field limit, a webhook payload cap), not a billing control. `maxOutputTokens` and `budget` are the token-side knobs. A negative or `NaN` cap is clamped to `0` rather than silently disabling the guard, and truncation is a plain `slice` — it will cut a word, a code fence or a surrogate pair in half if that is where the limit lands.
 
+### `maxToolResultLength(n, opts?)` (2.2)
+
+Caps each tool result the model sees at `n` **characters**, so one page scrape or log dump cannot fill the context window.
+
+```ts
+function maxToolResultLength(n: number, opts?: { mode?: 'truncate' | 'block' }): ToolResultGuardrail;
+```
+
+| `mode` | Behavior |
+| --- | --- |
+| `'truncate'` (default) | Rewrites the result to its first `n` characters plus a `[truncated: n of total characters shown]` line, so the model knows there is more and can ask for a narrower slice. A non-string result is measured and cut as its JSON text. |
+| `'block'` | Withholds the result: the model gets an `is_error` result naming the limit. |
+
+It ships from `@deuz-sdk/core/guardrails`. In a native run it measures the projection; the receipt keeps the full raw result.
+
+```ts title="bounded-results.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { maxToolResultLength } from '@deuz-sdk/core/guardrails';
+
+const model = createMockModel({
+  responses: [{ toolCalls: [{ toolName: 'scrape', args: {} }] }, { text: 'Summarized.' }],
+});
+
+await generateText({
+  model,
+  messages: [{ role: 'user', content: 'Summarize the page.' }],
+  tools: {
+    scrape: { parameters: { type: 'object', properties: {} }, execute: async () => 'x'.repeat(50_000) },
+  },
+  maxSteps: 3,
+  guardrails: { onToolResult: maxToolResultLength(8_000) },
+});
+```
+
 ## Guardrail vs. middleware
 
 Both can defend a call, and they wrap different things. Neither replaces the other.
@@ -332,7 +428,7 @@ Both can defend a call, and they wrap different things. Neither replaces the oth
 | | `guardrails` | [`wrapModel(model, […])`](/docs/modules/middleware) |
 | --- | --- | --- |
 | Wraps | the **run** | the **model** |
-| Sees | run boundaries: start, each tool call, the final answer | every model call made with that wrapped descriptor |
+| Sees | run boundaries: start, each tool call and result, the final answer | every model call made with that wrapped descriptor |
 | Applies to compaction summaries, sub-agent side calls | **no** — those are model calls, not run boundaries | **yes** — they go through the same wrapped model |
 | Runs per | run leg (input/output) or tool call | model call — every step, every retry-free re-drive |
 | Can refuse a tool call | yes | no (it never sees one) |
