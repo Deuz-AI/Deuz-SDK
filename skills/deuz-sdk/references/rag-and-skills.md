@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:c025621e10fd
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd
      sources: packages/core/src/{rag.ts, rag-node.ts, skills.ts, skills/node.ts, parts.ts, ui.ts, voyage.ts, node/store-postgres.ts},
      packages/core/src/internal/rerank-http.ts,
      packages/core/src/types/{tool.ts, stream.ts, methods.ts, message.ts},

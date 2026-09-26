@@ -6,4 +6,6 @@ pnpm-lock.yaml
 package-lock.json
 bench/results.json
 docs/
+# Infra artifacts: kept byte-identical to what AWS runs (the CloudFront function, CLI configs).
+deploy/
 skills/

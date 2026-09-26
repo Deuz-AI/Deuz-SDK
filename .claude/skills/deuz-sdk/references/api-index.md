@@ -1,13 +1,13 @@
 <!-- GENERATED FILE — do not hand-edit.
      regenerate: node .claude/skills/deuz-sdk/scripts/generate-api-index.mjs
      source: packages/core/{package.json exports, tsup.config.ts} + src walk (export * followed)
-     verified: 2026-09-26 against @deuz-sdk/core@2.1.0 · api-contract sha256:c025621e10fd -->
+     verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd -->
 
 # API index — every subpath, every export
 
 **Load when:** checking whether a name exists, finding which subpath exports it, or exploring an unfamiliar module.
 
-`@deuz-sdk/core@2.1.0` ships **62 subpaths**; `@deuz-sdk/react` ships one. Names marked under **Types** are type-only — import them with `import type`, or a bundler-free runtime will crash looking for a value that was erased at compile time.
+`@deuz-sdk/core@2.2.0` ships **62 subpaths**; `@deuz-sdk/react` ships one. Names marked under **Types** are type-only — import them with `import type`, or a bundler-free runtime will crash looking for a value that was erased at compile time.
 
 If anything here disagrees with `packages/core/package.json` `exports` or `tooling/api-contract.json`, those win — and this file is stale; regenerate it.
 

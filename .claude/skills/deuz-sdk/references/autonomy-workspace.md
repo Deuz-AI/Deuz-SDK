@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:c025621e10fd
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd
      sources: packages/core/src/{autonomy,plan,verify,workspace,compute,browser,runtime,evolve,schedule}.ts,
      packages/core/src/evolve/*.ts, packages/core/src/schedule/*.ts, docs/content/docs/modules/{evolve,schedule}.mdx,
      packages/core/src/node/{workspace,compute,browser,runtime}.ts, packages/core/src/inference/agent-tool.ts,

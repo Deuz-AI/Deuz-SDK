@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:c025621e10fd
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd
      sources: packages/core/src/types/{tool,config,guardrails,stream,message,methods}.ts, packages/core/src/{tool,agent,server-tools}.ts,
      packages/core/src/inference/{agent-tool,handoff,stop,loop-shared}.ts, docs/content/docs/reference/whats-new-2-0.mdx,
      docs/content/docs/agents/{tools,tool-loop,create-agent,client-tools,server-tools,subagents,handoffs,guardrails}.mdx -->

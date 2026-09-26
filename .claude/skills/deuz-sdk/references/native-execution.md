@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:c025621e10fd
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd
      sources: packages/core/src/{agent-run,execution-policy,budget-ledger,ops}.ts,
        src/types/{agent-run,execution,swarm,lease}.ts, src/inference/{agent-tools,loop-shared}.ts,
        src/swarm/{scheduler,store,spawn,blackboard,rounds}.ts, src/node/{swarm-sqlite,ops-sqlite}.ts,
