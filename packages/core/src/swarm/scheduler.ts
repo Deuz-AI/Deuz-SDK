@@ -295,6 +295,8 @@ export function createSwarm(options: SwarmOptions): Swarm {
     // records stay as they are and the next executor reconciles them.
     let held = lease;
     let stopped = false;
+    // Drain (2.2): no new dispatch; in-flight tasks finish and the run settles.
+    let draining = false;
     let stopBeat: (() => void) | undefined;
     const lose = () => {
       writeFailure ??= new SwarmLeaseError('lost');
@@ -309,6 +311,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
         held = renewal.lease;
         for (const request of renewal.signals)
           if (request === 'cancel') void cancel().catch(() => {});
+          else if (request === 'drain') draining = true;
       } catch {
         // A provider outage is survivable until the lease could have lapsed.
         if (stopped) return;
@@ -657,7 +660,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
             continue;
           }
           for (const record of records.values()) {
-            if (running.size >= concurrency || snapshot.run.cancelRequested) break;
+            if (running.size >= concurrency || snapshot.run.cancelRequested || draining) break;
             if (
               record.status !== 'pending' ||
               !(record.task.dependsOn ?? []).every(
@@ -695,7 +698,10 @@ export function createSwarm(options: SwarmOptions): Swarm {
                 : 'partial';
           await mutate(() => ({
             run: { status, updatedAt: deps.clock.now() },
-            events: [event('run.settled', undefined, status)],
+            events: [
+              ...(draining ? [event('run.drained')] : []),
+              event('run.settled', undefined, status),
+            ],
           }));
           return cloneSwarm({ run: snapshot.run, tasks: list });
         }
@@ -721,13 +727,16 @@ export function createSwarm(options: SwarmOptions): Swarm {
       result,
       events: (settings) => events(key, settings, () => writeFailure),
       cancel,
-      drain: () => Promise.reject(new Error('Not implemented')),
+      drain: () => {
+        draining = true;
+        return result;
+      },
     };
     active.set(id, handle);
     return handle;
   }
 
-  return {
+  const swarm: Swarm = {
     async run(input) {
       if (!input.scope) throw new Error('Swarm scope is required');
       validateTasks(input.tasks, options);
@@ -903,10 +912,37 @@ export function createSwarm(options: SwarmOptions): Swarm {
         }
       }
     },
-    async recover() {
-      throw new Error('Not implemented');
+    async recover(input = {}) {
+      if (!leasing) throw new Error('Swarm recover requires the lease option');
+      if (!options.store.listRuns || !options.store.capabilities?.includes('list'))
+        throw new Error('This swarm store cannot list runs: it lacks the "list" capability');
+      const runs = await options.store.listRuns({
+        status: 'running',
+        ...(input.scope !== undefined ? { scope: input.scope } : {}),
+        limit: input.limit ?? 100,
+      });
+      const handles: SwarmHandle[] = [];
+      for (const run of runs) {
+        if (owned.has(swarmKey(run))) continue;
+        try {
+          handles.push(
+            await swarm.resume({
+              scope: run.scope,
+              runId: run.runId,
+              expectedRevision: run.revision,
+              expectedStatus: 'running',
+            }),
+          );
+        } catch (error) {
+          // A live holder, or a run that moved on since it was listed.
+          if (error instanceof SwarmLeaseError || error instanceof SwarmConflictError) continue;
+          throw error;
+        }
+      }
+      return handles;
     },
     get: (key) => options.store.load(key),
     events,
   };
+  return swarm;
 }
