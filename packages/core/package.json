@@ -614,8 +614,8 @@
     "tool-calling"
   ],
   "peerDependencies": {
-    "@opentelemetry/api": "^1.9.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@opentelemetry/api": "^1.9.0",
     "@standard-community/standard-json": "^0.2.0",
     "mammoth": "^1.8.0",
     "pg": "^8.11.0",
@@ -663,13 +663,14 @@
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.0",
+    "@electric-sql/pglite": "^0.5.8",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^22.10.0",
     "@types/react": "^19.2.17",
+    "esbuild": "0.27.7",
     "eslint": "^9.18.0",
     "eslint-config-prettier": "^9.1.0",
-    "esbuild": "0.27.7",
     "jsdom": "^29.1.1",
     "msw": "^2.7.0",
     "publint": "^0.3.0",
