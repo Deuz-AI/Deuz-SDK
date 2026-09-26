@@ -7,20 +7,8 @@
  * from the model's capability row; you never choose it by hand.
  */
 import { generateObject, streamObject } from '@deuz-sdk/core';
-import type { StandardSchemaV1 } from '@deuz-sdk/core';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
 import { z } from 'zod';
-
-/**
- * KNOWN GAP (1.9). Core inlines the Standard Schema contract so it can stay
- * zero-dependency, and its `issue.path` is typed `ReadonlyArray<PropertyKey>`
- * while the published spec allows `ReadonlyArray<PropertyKey | PathSegment>`.
- * A real zod/valibot/arktype schema therefore is not STRUCTURALLY assignable
- * to `StandardSchemaV1` yet — it works perfectly at runtime. One cast here, in
- * one place, until `packages/core/src/types/schema.ts` widens that field.
- */
-const asSchema = <T>(schema: z.ZodType<T>): StandardSchemaV1<unknown, T> =>
-  schema as unknown as StandardSchemaV1<unknown, T>;
 
 const apiKey = process.env.ANTHROPIC_API_KEY;
 if (!apiKey) {
@@ -30,7 +18,8 @@ if (!apiKey) {
 const anthropic = createAnthropic({ apiKey }); // app layer owns the key
 const model = anthropic('claude-opus-4-8');
 
-// Any Standard Schema works (zod, valibot, arktype). Converting it to the JSON
+// Any Standard Schema works (zod, valibot, arktype), passed as is: it is both
+// the validator and the source of the result type. Converting it to the JSON
 // Schema that goes on the wire uses the optional peer
 // '@standard-community/standard-json' — pass a raw JSON Schema to skip both.
 const Recipe = z.object({
@@ -43,7 +32,7 @@ const Recipe = z.object({
 // --- buffered: one validated object -----------------------------------------
 const { object, usage } = await generateObject({
   model,
-  schema: asSchema(Recipe),
+  schema: Recipe,
   schemaName: 'Recipe',
   messages: [{ role: 'user', content: 'A 20-minute vegetarian pasta.' }],
 });
@@ -55,7 +44,7 @@ console.log(`(${usage.totalTokens} tokens)\n`);
 // UI can render progressively without ever seeing an invalid shape.
 const stream = streamObject({
   model,
-  schema: asSchema(Recipe),
+  schema: Recipe,
   schemaName: 'Recipe',
   messages: [{ role: 'user', content: 'A 10-minute breakfast.' }],
 });
