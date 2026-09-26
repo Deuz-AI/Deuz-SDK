@@ -38,7 +38,7 @@ import { prepareAgentTools } from './inference/agent-tools';
 import { createExecutionContext, intersectExecutionPolicies } from './execution-policy';
 import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
-import { assertEnvelopeRevision } from './ops';
+import { assertEnvelopeRevision } from './internal/ops-validate';
 
 export type * from './types/agent-run';
 

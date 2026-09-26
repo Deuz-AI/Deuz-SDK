@@ -7,7 +7,7 @@
 import type { PgClientLike } from './store-postgres';
 import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/lease';
-import { assertLeaseRequest } from '../ops';
+import { assertLeaseRequest } from '../internal/ops-validate';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 import { postgresSchemaName } from './swarm-postgres';
 

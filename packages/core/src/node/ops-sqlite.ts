@@ -9,7 +9,7 @@ import { ensureBusyTimeout } from './sqlite-open';
 import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
 import type { Clock } from '../types/deps';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/lease';
-import { assertEnvelopeRevision, assertLeaseRequest } from '../ops';
+import { assertEnvelopeRevision, assertLeaseRequest } from '../internal/ops-validate';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 
