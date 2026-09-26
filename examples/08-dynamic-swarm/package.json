@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/08-dynamic-swarm",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A swarm that spawns tasks at runtime, shares a group blackboard and runs rounds.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
