@@ -30,7 +30,7 @@ export type { HandoffAgentDef, HandoffOptions } from './inference/handoff';
 
 // Built-in guardrails (2.0 additive) — ready-made values for the `guardrails`
 // call option; the contract types ride the `./types` re-export below.
-export { promptInjectionGuardrail, maxOutputLength } from './guardrails';
+export { promptInjectionGuardrail, maxOutputLength, maxToolResultLength } from './guardrails';
 
 // Manual context compaction (2.0 additive) — the loop's layers over a plain
 // array, for callers who own the history. Pure unless given a `summarize`.

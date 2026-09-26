@@ -129,7 +129,33 @@
     "Native public surfaces also have explicit eager budgets: native-agent measured 175024/54470",
     "and native-swarm 176912/55810 through the export sets below, with approximately 10% headroom.",
     "Their native-request lazy roots are smaller (1396/745 and 1401/747) because policy definitions",
-    "are already eagerly required by these opt-in APIs; their own lazy cap is correspondingly lower."
+    "are already eagerly required by these opt-in APIs; their own lazy cap is correspondingly lower.",
+    "",
+    "2.2.0 — FOUR MILESTONES INTEGRATED, TWO DELIBERATE RAISES, THREE NEW BUDGETS.",
+    "native-swarm was OVER (199398/62171 against 195000/61500). This is real surface, not drift.",
+    "Attributed by bundling each branch head src/swarm.ts through this same pipeline (same export set):",
+    "  612e232 base 190804 raw; M3 durability/ops +3389 (swarm leases + heartbeat, drain, requestCancel,",
+    "  recover, listRuns on the memory store, the agent-run revision fence); M5 budgets +4103 (ledger",
+    "  admission against a BudgetStore, version-2 ledger snapshots, subtree admission copy); M7 +1057",
+    "  (the onToolResult evaluator in inference/loop-shared.ts and its reporting). Integrated: 200211 src.",
+    "  native-swarm  199398 B raw / 62171 B gzip  ->  limits 219300 / 68400  (+10.0% / +10.0%)",
+    "native-agent still passed, but its export set now also names createInMemoryBudgetStore and",
+    "BudgetStoreError (new public ./agent surface — an unlisted export ships unmeasured), which left",
+    "1.2% headroom. Re-measured deliberately with the wider set:",
+    "  native-agent  190698 B raw / 59302 B gzip  ->  limits 209800 / 65250  (+10.0% / +10.0%)",
+    "guardrails gained its third built-in, maxToolResultLength (M7), which is now in the measured",
+    "export set. Still three closures over type-only imports:",
+    "  guardrails      1314 B raw /   626 B gzip  ->  limits   1450 /   700  (+10.4% / +11.8%)",
+    "New edge-safe subpaths get budgets before they ship (Node-only ops/sqlite, ops/postgres,",
+    "swarm/postgres and evolve/sqlite cannot be built for the browser and are guarded by",
+    "check-runtime-compat.mjs instead, as with the other store subpaths):",
+    "  ops             1991 B raw /   971 B gzip  ->  limits   2200 /  1070  (+10.5% / +10.2%)",
+    "  schedule       10833 B raw /  4301 B gzip  ->  limits  11920 /  4730  (+10.0% / +10.0%)",
+    "  evolve        172388 B raw / 54630 B gzip  ->  limits 189600 / 60100  (+10.0% / +10.0%)",
+    "evolve is large because its mutation step runs generateText (the full inference path) — measured,",
+    "not accidental. Its lazy chunks are the same optional features as native-agent and carry the same",
+    "limits; MCP keeps the shared 18500/7050 allowance. core (152083/47486) and edge (141290/43952)",
+    "stay inside their 2.0 limits: the new edge.ts re-exports tree-shake out of the measured set."
   ],
   "bundles": {
     "core": {
@@ -146,7 +172,11 @@
           "maxRawBytes": 2550,
           "maxGzipBytes": 1200
         },
-        "usage-cost": { "entryPoint": "usage-cost", "maxRawBytes": 1500, "maxGzipBytes": 675 },
+        "usage-cost": {
+          "entryPoint": "usage-cost",
+          "maxRawBytes": 1500,
+          "maxGzipBytes": 675
+        },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
@@ -168,7 +198,11 @@
           "maxRawBytes": 2550,
           "maxGzipBytes": 1200
         },
-        "usage-cost": { "entryPoint": "usage-cost", "maxRawBytes": 1500, "maxGzipBytes": 675 },
+        "usage-cost": {
+          "entryPoint": "usage-cost",
+          "maxRawBytes": 1500,
+          "maxGzipBytes": 675
+        },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
@@ -189,10 +223,12 @@
         "createBudgetLedger",
         "BudgetLedgerError",
         "ExecutionPolicyError",
-        "ExecutionPersistenceError"
+        "ExecutionPersistenceError",
+        "createInMemoryBudgetStore",
+        "BudgetStoreError"
       ],
-      "maxRawBytes": 193000,
-      "maxGzipBytes": 60000,
+      "maxRawBytes": 209800,
+      "maxGzipBytes": 65250,
       "maxLazyRawBytes": 18500,
       "maxLazyGzipBytes": 7050,
       "legacyLazyEntryPoint": "resolve",
@@ -202,7 +238,11 @@
           "maxRawBytes": 1550,
           "maxGzipBytes": 825
         },
-        "usage-cost": { "entryPoint": "usage-cost", "maxRawBytes": 1500, "maxGzipBytes": 675 },
+        "usage-cost": {
+          "entryPoint": "usage-cost",
+          "maxRawBytes": 1500,
+          "maxGzipBytes": 675
+        },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
@@ -213,8 +253,8 @@
     "native-swarm": {
       "from": "@deuz-sdk/core/swarm",
       "exports": ["createSwarm", "createInMemorySwarmStore", "SwarmConflictError"],
-      "maxRawBytes": 195000,
-      "maxGzipBytes": 61500,
+      "maxRawBytes": 219300,
+      "maxGzipBytes": 68400,
       "maxLazyRawBytes": 18500,
       "maxLazyGzipBytes": 7050,
       "legacyLazyEntryPoint": "resolve",
@@ -224,7 +264,63 @@
           "maxRawBytes": 1550,
           "maxGzipBytes": 825
         },
-        "usage-cost": { "entryPoint": "usage-cost", "maxRawBytes": 1500, "maxGzipBytes": 675 },
+        "usage-cost": {
+          "entryPoint": "usage-cost",
+          "maxRawBytes": 1500,
+          "maxGzipBytes": 675
+        },
+        "memory-pipeline": {
+          "entryPoint": "memory-pipeline",
+          "maxRawBytes": 11350,
+          "maxGzipBytes": 4750
+        }
+      }
+    },
+    "ops": {
+      "from": "@deuz-sdk/core/ops",
+      "exports": ["createInMemoryLeaseProvider", "assertLeaseRequest", "assertEnvelopeRevision"],
+      "maxRawBytes": 2200,
+      "maxGzipBytes": 1070
+    },
+    "schedule": {
+      "from": "@deuz-sdk/core/schedule",
+      "exports": [
+        "createScheduler",
+        "createInMemoryClaim",
+        "parseCron",
+        "nextOccurrence",
+        "handleSignal",
+        "verifyGitHubWebhook",
+        "verifySlackRequest"
+      ],
+      "maxRawBytes": 11920,
+      "maxGzipBytes": 4730
+    },
+    "evolve": {
+      "from": "@deuz-sdk/core/evolve",
+      "exports": [
+        "evolve",
+        "resumeEvolve",
+        "createInMemoryPopulationStore",
+        "applySearchReplace",
+        "parseEvolveBlocks"
+      ],
+      "maxRawBytes": 189600,
+      "maxGzipBytes": 60100,
+      "maxLazyRawBytes": 18500,
+      "maxLazyGzipBytes": 7050,
+      "legacyLazyEntryPoint": "resolve",
+      "lazyFeatures": {
+        "native-request": {
+          "entryPoint": "native-request",
+          "maxRawBytes": 1550,
+          "maxGzipBytes": 825
+        },
+        "usage-cost": {
+          "entryPoint": "usage-cost",
+          "maxRawBytes": 1500,
+          "maxGzipBytes": 675
+        },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
@@ -281,9 +377,9 @@
     },
     "guardrails": {
       "from": "@deuz-sdk/core/guardrails",
-      "exports": ["promptInjectionGuardrail", "maxOutputLength"],
-      "maxRawBytes": 900,
-      "maxGzipBytes": 550
+      "exports": ["promptInjectionGuardrail", "maxOutputLength", "maxToolResultLength"],
+      "maxRawBytes": 1450,
+      "maxGzipBytes": 700
     },
     "openai-provider": {
       "from": "@deuz-sdk/core/openai",

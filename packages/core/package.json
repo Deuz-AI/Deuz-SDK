@@ -206,6 +206,76 @@
         "default": "./dist/swarm/sqlite.cjs"
       }
     },
+    "./swarm/postgres": {
+      "import": {
+        "types": "./dist/swarm/postgres.d.ts",
+        "default": "./dist/swarm/postgres.js"
+      },
+      "require": {
+        "types": "./dist/swarm/postgres.d.cts",
+        "default": "./dist/swarm/postgres.cjs"
+      }
+    },
+    "./ops": {
+      "import": {
+        "types": "./dist/ops.d.ts",
+        "default": "./dist/ops.js"
+      },
+      "require": {
+        "types": "./dist/ops.d.cts",
+        "default": "./dist/ops.cjs"
+      }
+    },
+    "./ops/sqlite": {
+      "import": {
+        "types": "./dist/ops/sqlite.d.ts",
+        "default": "./dist/ops/sqlite.js"
+      },
+      "require": {
+        "types": "./dist/ops/sqlite.d.cts",
+        "default": "./dist/ops/sqlite.cjs"
+      }
+    },
+    "./ops/postgres": {
+      "import": {
+        "types": "./dist/ops/postgres.d.ts",
+        "default": "./dist/ops/postgres.js"
+      },
+      "require": {
+        "types": "./dist/ops/postgres.d.cts",
+        "default": "./dist/ops/postgres.cjs"
+      }
+    },
+    "./evolve": {
+      "import": {
+        "types": "./dist/evolve.d.ts",
+        "default": "./dist/evolve.js"
+      },
+      "require": {
+        "types": "./dist/evolve.d.cts",
+        "default": "./dist/evolve.cjs"
+      }
+    },
+    "./evolve/sqlite": {
+      "import": {
+        "types": "./dist/evolve/sqlite.d.ts",
+        "default": "./dist/evolve/sqlite.js"
+      },
+      "require": {
+        "types": "./dist/evolve/sqlite.d.cts",
+        "default": "./dist/evolve/sqlite.cjs"
+      }
+    },
+    "./schedule": {
+      "import": {
+        "types": "./dist/schedule.d.ts",
+        "default": "./dist/schedule.js"
+      },
+      "require": {
+        "types": "./dist/schedule.d.cts",
+        "default": "./dist/schedule.cjs"
+      }
+    },
     "./autonomy": {
       "import": {
         "types": "./dist/autonomy.d.ts",

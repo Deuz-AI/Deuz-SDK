@@ -11,6 +11,11 @@ import { assertLeaseRequest } from '../ops';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 import { postgresSchemaName } from './swarm-postgres';
 
+// Persistent budget scopes (2.2, M5) share this Node-only subpath: one import
+// for every durable ops store on Postgres.
+export { createPostgresBudgetStore } from './budget-postgres';
+export type { PostgresBudgetStoreOptions } from './budget-postgres';
+
 export interface PostgresOpsStoreOptions {
   client: PgClientLike;
   /** Schema holding the ops tables. Default `'public'`; must already exist. */

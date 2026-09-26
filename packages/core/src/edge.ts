@@ -18,7 +18,7 @@ export type { AgentToolDef } from './inference/agent-tool';
 // randomness or Node API — so they are edge-safe by construction.
 export { handoff } from './inference/handoff';
 export type { HandoffAgentDef, HandoffOptions } from './inference/handoff';
-export { promptInjectionGuardrail, maxOutputLength } from './guardrails';
+export { promptInjectionGuardrail, maxOutputLength, maxToolResultLength } from './guardrails';
 // Typed tool authoring + content-part constructors (1.9 additive). Both modules
 // are pure: type-only imports and a plain object literal, no ambient clock,
 // randomness or Node API — edge-safe by construction.
@@ -114,5 +114,14 @@ export type { AgentDef, DeuzAgent, AgentCallOptions, AgentObjectCallOptions } fr
 // from every runtime via `@deuz-sdk/core/observe`.
 export { createOtelTracer, createOtelObserver, otelReady } from './otel';
 export type { OtelTracerOptions } from './otel';
+
+// 2.2 additive: operational leases, evolutionary program search, and cron
+// schedules with verified signals. All three take time only from arguments or
+// an injected clock, randomness only from a seeded counter PRNG, and crypto
+// only from WebCrypto — no Node API — so they are edge-safe. Their SQLite and
+// Postgres stores are Node-only subpaths and are deliberately NOT reachable here.
+export * from './ops';
+export * from './evolve';
+export * from './schedule';
 
 export type * from './types';

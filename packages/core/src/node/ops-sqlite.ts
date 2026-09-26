@@ -12,6 +12,11 @@ import { assertEnvelopeRevision, assertLeaseRequest } from '../ops';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 
+// Persistent budget scopes (2.2, M5) share this Node-only subpath: one import
+// for every durable ops store on a SQLite file.
+export { createSqliteBudgetStore } from './budget-sqlite';
+export type { SqliteBudgetStoreOptions, SqliteBudgetStore } from './budget-sqlite';
+
 export interface SqliteOpsStoreOptions {
   path: string;
   /** This store owns the injected connection; close() closes it. */

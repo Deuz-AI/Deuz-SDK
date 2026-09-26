@@ -109,6 +109,12 @@ export {
 export { createBudgetLedger, BudgetLedgerError } from './budget-ledger';
 export type * from './types/execution';
 export { ExecutionPersistenceError } from './internal/execution-error';
+// Persistent budget scopes (2.2 additive). Named re-exports on purpose: the
+// validation and bucket helpers in budget-store.ts are @internal and serve the
+// SQLite/Postgres stores only.
+export { createInMemoryBudgetStore, BudgetStoreError } from './budget-store';
+export type { BudgetStoreErrorCode } from './budget-store';
+export type * from './types/budget-store';
 
 /**
  * A reusable agent definition: every `CommonCallOptions` field EXCEPT the three

@@ -35,6 +35,25 @@ const consumers = [
     source: `export { createSwarm, createInMemorySwarmStore, SwarmConflictError }
       from '@deuz-sdk/core/swarm';`,
   },
+  {
+    name: 'ops',
+    source: `export { createInMemoryLeaseProvider, assertEnvelopeRevision }
+      from '@deuz-sdk/core/ops';`,
+  },
+  {
+    name: 'evolve',
+    source: `export { evolve, resumeEvolve, createInMemoryPopulationStore, applySearchReplace }
+      from '@deuz-sdk/core/evolve';`,
+  },
+  {
+    name: 'schedule',
+    source: `export { createScheduler, parseCron, handleSignal, verifyGitHubWebhook }
+      from '@deuz-sdk/core/schedule';`,
+  },
+  {
+    name: 'budget-store',
+    source: "export { createInMemoryBudgetStore, BudgetStoreError } from '@deuz-sdk/core/agent';",
+  },
 ];
 
 function browserBundle(consumer) {
@@ -62,7 +81,7 @@ function nodeOnlyReferences(result) {
   const output = result.outputFiles?.map((file) => file.text).join('\n') ?? '';
   if (forbiddenBuiltins.test(output)) issues.push('bundled output references a node: builtin');
   const nodeOnlyInput = Object.keys(result.metafile?.inputs ?? {}).find((input) =>
-    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/]stdio|swarm[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite))/.test(
+    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/]stdio|swarm[\\/](?:sqlite|postgres)|ops[\\/](?:sqlite|postgres)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|ops-sqlite|ops-postgres|budget-sqlite|budget-postgres|evolve-sqlite))/.test(
       input,
     ),
   );
@@ -82,21 +101,40 @@ for (const consumer of consumers) {
   }
 }
 
-// Negative control: the Node-only SQLite entry must never qualify as web-safe.
+// Negative controls: the Node-only store entries must never qualify as web-safe.
 // A bundler rejection or a detected Node reference both enforce this boundary.
-try {
-  const result = await browserBundle({
-    name: 'node-only-swarm-sqlite',
-    source: "export { createSqliteSwarmStore } from '@deuz-sdk/core/swarm/sqlite';",
-  });
-  if (nodeOnlyReferences(result).length === 0) {
-    failures.push('swarm/sqlite: Node-only entry unexpectedly passed the browser boundary');
+// The Postgres entries import no node: builtin themselves (the client is
+// injected), so for them the node-only input regex above is the guard.
+const nodeOnlyEntries = [
+  ['swarm/sqlite', 'createSqliteSwarmStore'],
+  ['swarm/postgres', 'createPostgresSwarmStore'],
+  ['ops/sqlite', 'createSqliteOpsStore, createSqliteBudgetStore'],
+  ['ops/postgres', 'createPostgresOpsStore, createPostgresBudgetStore'],
+  ['evolve/sqlite', 'createSqlitePopulationStore'],
+];
+for (const [subpath, names] of nodeOnlyEntries) {
+  try {
+    const result = await browserBundle({
+      name: `node-only-${subpath.replace('/', '-')}`,
+      source: `export { ${names} } from '@deuz-sdk/core/${subpath}';`,
+    });
+    if (nodeOnlyReferences(result).length === 0) {
+      failures.push(`${subpath}: Node-only entry unexpectedly passed the browser boundary`);
+    }
+  } catch {
+    // Expected: browser resolvers normally reject the lazy node:sqlite import.
   }
-} catch {
-  // Expected: browser resolvers normally reject the lazy node:sqlite import.
 }
 
-for (const entry of ['dist/index.js', 'dist/edge.js', 'dist/agent.js', 'dist/swarm.js']) {
+for (const entry of [
+  'dist/index.js',
+  'dist/edge.js',
+  'dist/agent.js',
+  'dist/swarm.js',
+  'dist/ops.js',
+  'dist/evolve.js',
+  'dist/schedule.js',
+]) {
   const source = readFileSync(resolve(root, entry), 'utf8');
   if (forbiddenBuiltins.test(source)) failures.push(`${entry}: directly imports a node: builtin`);
 }
@@ -106,6 +144,6 @@ if (failures.length > 0) {
   process.exitCode = 1;
 } else {
   console.log(
-    `Runtime compatibility passed (${consumers.length} browser/edge consumers; swarm/sqlite excluded).`,
+    `Runtime compatibility passed (${consumers.length} browser/edge consumers; ${nodeOnlyEntries.length} Node-only store entries excluded).`,
   );
 }
