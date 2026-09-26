@@ -1,0 +1,237 @@
+---
+title: Operations
+description: Leases, drain, recovery and cross-process cancellation for durable swarms, with SQLite and Postgres backends and fenced native agent runs.
+---
+
+A durable swarm or native agent run can outlive the process that started it.
+The operations surface (2.2) decides which process drives a run right now,
+lets another process take over when that one dies, and lets any process drain
+or cancel a run.
+
+Two mechanisms keep this safe:
+
+- A **lease** is liveness. The executor holding a run's lease drives it and
+  renews the lease on a heartbeat. An executor that loses its lease stops before
+  its next write.
+- A **revision** is the fence. Every swarm commit and every native agent save
+  names the revision it expects. A store rejects a stale one, so a paused
+  "zombie" executor that wakes up after a takeover cannot overwrite the new
+  executor's progress, even if its heartbeat has not noticed yet.
+
+| Entry | Contents | Runtime |
+| --- | --- | --- |
+| `@deuz-sdk/core/ops` | `createInMemoryLeaseProvider`, lease types | Edge-safe |
+| `@deuz-sdk/core/ops/sqlite` | `createSqliteOpsStore`: leases and agent runs | Node |
+| `@deuz-sdk/core/ops/postgres` | `createPostgresOpsStore`: leases and agent runs | Node |
+| `@deuz-sdk/core/swarm/postgres` | `createPostgresSwarmStore` | Node |
+
+## Leases
+
+A `LeaseProvider` hands out one lease per key. `acquire` returns `undefined`
+while another owner holds the key. Every change of hands increases the lease's
+`token`. `renew` extends the lease and delivers queued signals once each; a
+lapsed lease that nobody else took can still be renewed. `release` ignores a
+stale token. `signal(key, 'cancel' | 'drain')` queues a request for whoever
+holds the key and reports whether anyone did.
+
+```ts
+import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+
+const leases = createInMemoryLeaseProvider();
+const lease = await leases.acquire({ key: 'report', owner: 'worker-1', ttlMs: 30_000 });
+console.log(lease?.token); // 1
+console.log(await leases.acquire({ key: 'report', owner: 'worker-2', ttlMs: 30_000 })); // undefined
+
+await leases.signal('report', 'drain');
+const renewal = await leases.renew(lease!, 30_000);
+console.log(renewal.held && renewal.signals); // ['drain']
+await leases.release(lease!);
+```
+
+The in-memory provider suits tests and single-process deployments; its leases
+die with the process. Use the SQLite or Postgres provider when several
+processes share runs.
+
+## Swarm leases
+
+Pass `lease` to `createSwarm`. The executor acquires `swarm:<scope, runId>`
+before it creates or resumes a run and renews it every `ttlMs / 3` through
+`deps.clock`. `ttlMs` defaults to 30 000 and `owner` to a generated ID per swarm
+instance.
+
+- `run` and `resume` reject with `SwarmLeaseError` code `'held'` while another
+  executor holds the run. `resume` claims the lease before its resume commit.
+- If a renewal reports the lease gone, the executor aborts its tasks and writes
+  nothing more. Its `handle.result` rejects with `SwarmLeaseError` code
+  `'lost'`. Task records stay as they were, and the next executor reconciles
+  them as it would after a crash.
+- A renewal that throws, for example during a database outage, counts as lost
+  only once the lease could have expired; until then the next beat retries.
+- The lease is released when the executor stops, whatever the outcome.
+
+`SwarmResumeOptions` accepts `expectedRevision` and `expectedStatus`. A resume
+whose run moved on rejects with `SwarmConflictError` and changes nothing.
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createInMemorySwarmStore, createSwarm, SwarmLeaseError } from '@deuz-sdk/core/swarm';
+
+const worker = createAgent({ model: createMockModel({ responses: [{ text: 'done' }] }) });
+const swarm = createSwarm({
+  agents: { worker },
+  store: createInMemorySwarmStore(),
+  lease: { provider: createInMemoryLeaseProvider(), owner: 'worker-1', ttlMs: 15_000 },
+});
+
+const handle = await swarm.run({
+  scope: 'tenant-a',
+  runId: 'nightly',
+  tasks: [{ id: 'answer', agent: 'worker', prompt: 'Answer.' }],
+});
+try {
+  console.log((await handle.result).run.status);
+} catch (error) {
+  if (error instanceof SwarmLeaseError && error.code === 'lost') {
+    // Another process took the run over; this one has stopped writing.
+  } else throw error;
+}
+```
+
+## Drain
+
+`handle.drain()` stops new dispatch and waits for in-flight tasks to finish
+normally. The run then settles `'suspended'` with its remaining tasks pending,
+or reaches its terminal status if nothing remains. A `run.drained` event
+precedes `run.settled`, and the lease is released, so a later `resume` or
+`recover` continues where the drain stopped. Use it for rolling deploys.
+
+A `'drain'` lease signal does the same from another process: the executor
+drains on its next heartbeat.
+
+## Cancellation from any process
+
+`swarm.requestCancel(key)` reports what it did:
+
+| Result | Meaning |
+| --- | --- |
+| `'signalled'` | This process drives the run and cancelled it, or a lease holder was sent `'cancel'` and cancels on its next heartbeat. |
+| `'recorded'` | Nobody drives the run. A compare-and-set commit stored `cancelRequested` and a `run.cancelled` event; the next executor cancels the run's pending work. |
+| `'settled'` | The run already completed, became partial, or was cancelled. |
+
+Without a lease provider, a request against a run that another process drives
+is recorded, and that executor's next commit then fails its revision check.
+
+## Recovery
+
+`swarm.recover({ scope?, limit? })` lists `'running'` runs, which after a crash
+have no live executor, and resumes each one this process does not drive with
+`expectedRevision`. Runs with a live lease holder, and runs that changed while
+being claimed, are skipped. It returns the handles it started. `recover` needs
+the `lease` option and a store with the `'list'` capability; the memory, SQLite
+and Postgres stores have it.
+
+The following complete example runs a worker process against one SQLite file.
+Every process runs the same code; call `recover` at startup and on a timer.
+
+```ts
+import { createAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createSwarm } from '@deuz-sdk/core/swarm';
+import { createSqliteSwarmStore } from '@deuz-sdk/core/swarm/sqlite';
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+
+const path = './runs.sqlite';
+const store = createSqliteSwarmStore({ path });
+const ops = createSqliteOpsStore({ path });
+const worker = createAgent({ model: createMockModel({ responses: [{ text: 'ok' }] }) });
+const swarm = createSwarm({
+  agents: { worker: { agent: worker, version: 'worker-v1' } },
+  store,
+  definitionVersion: 'jobs-v1',
+  lease: { provider: ops.leases, ttlMs: 30_000 },
+});
+
+try {
+  const handles = await swarm.recover({ scope: 'tenant-a' });
+  for (const handle of handles) console.log(handle.runId, (await handle.result).run.status);
+} finally {
+  await store.close();
+  await ops.close();
+}
+```
+
+`SwarmStore.listRuns({ status?, scope?, limit })` is available directly for
+dashboards; it orders runs by `updatedAt`, then scope and run ID.
+
+## SQLite ops store
+
+`createSqliteOpsStore({ path, database?, wal?, clock? })` returns `leases`,
+`agentRuns` and `close()`. It keeps its own schema version table and writes in
+`BEGIN IMMEDIATE` transactions, so several processes can share the file,
+including the swarm store's file. Lease times come from `clock`, which defaults
+to the host clock: processes sharing a file must have synchronised clocks.
+
+## Postgres
+
+`createPostgresSwarmStore({ client, schema? })` and
+`createPostgresOpsStore({ client, schema? })` take any client with
+`query(sql, params)`, such as a `pg` pool. The schema defaults to `public` and
+must exist; the tables are created on first use.
+
+```ts
+import pg from 'pg';
+import { createSwarm } from '@deuz-sdk/core/swarm';
+import { createPostgresSwarmStore } from '@deuz-sdk/core/swarm/postgres';
+import { createPostgresOpsStore } from '@deuz-sdk/core/ops/postgres';
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const ops = createPostgresOpsStore({ client: pool });
+const swarm = createSwarm({
+  agents: {},
+  reducers: { total: { execute: () => 42 } },
+  store: createPostgresSwarmStore({ client: pool }),
+  lease: { provider: ops.leases },
+});
+
+await swarm.recover();
+```
+
+A pool may run consecutive queries on different connections, so the stores use
+no client-side transactions. Every write is one SQL statement: a swarm commit
+updates the run row only at the expected revision, and every task, channel and
+event write in the same statement is gated on that update. If another writer
+moved the run first, nothing is written and the commit rejects with
+`SwarmConflictError`. Postgres leases use the database clock, so host clock skew
+does not matter.
+
+## Native agent run revisions
+
+`AgentRunEnvelope.revision` increases by one on every save. The SQLite and
+Postgres `agentRuns` stores, and `createInMemoryAgentRunStore`, reject any save
+that is not the stored revision plus one. An envelope written by 2.1 has no
+revision and counts as 0. An executor whose save is rejected stops, and its run
+result reports the failure.
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+
+const ops = createSqliteOpsStore({ path: ':memory:' });
+try {
+  const result = await runAgent({
+    model: createMockModel({ responses: [{ text: 'saved' }] }),
+    prompt: 'Say something.',
+    session: { store: ops.agentRuns, runId: 'agent-1', scope: 'tenant-a' },
+  });
+  console.log(result.status, (await ops.agentRuns.load('agent-1'))?.revision);
+} finally {
+  await ops.close();
+}
+```
+
+Native runs have no lease of their own: the revision check already stops a
+second executor from overwriting the first. Swarm tasks keep their agent state
+inside the swarm run, which the swarm's lease and revision protect.
