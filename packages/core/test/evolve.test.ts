@@ -238,6 +238,114 @@ describe('evolve: the loop', () => {
   });
 });
 
+describe('evolve: full rewrites and the final newline', () => {
+  // Frozen code that ends without a line break, like a template literal that
+  // closes right after its last line.
+  const bare = [
+    'def f(x):',
+    '    # EVOLVE-BLOCK-START',
+    '    return x',
+    '    # EVOLVE-BLOCK-END',
+    'print(f(1))',
+  ].join('\n');
+
+  /**
+   * Answers like a real model: the current program read back from the prompt,
+   * grown by one line, in a fence whose closing line follows a line break. A
+   * diff for the same growth follows, for the slots that ask for one.
+   */
+  function rewriter() {
+    const base = createMockModel({ responses: [] });
+    const model = attachConfig(
+      { ...base },
+      {
+        ...readConfig(base)!,
+        fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+          const { messages } = JSON.parse(String(init?.body)) as {
+            messages: { role: string; content: string | { text: string }[] }[];
+          };
+          const user = messages.find((message) => message.role === 'user')!.content;
+          const prompt = typeof user === 'string' ? user : user.map((part) => part.text).join('');
+          const section = prompt.slice(prompt.indexOf('## Current program'));
+          const start = section.indexOf('```\n') + 4;
+          const parent = section.slice(start, section.indexOf('\n```', start));
+          const grown = parent.replace('    return x', '    x = x + 1\n    return x');
+          const text = '```python\n' + grown + '\n```\n' + GROW;
+          return readConfig(createMockModel({ responses: [{ text }] }))!.fetch!(input, init);
+        }) as typeof fetch,
+      },
+    );
+    return counted(model);
+  }
+
+  it.each([
+    ['without', bare],
+    ['with', `${bare}\n`],
+  ])('accepts full rewrites of a program %s a final newline', async (_label, source) => {
+    const { model, counter } = rewriter();
+    const store = createInMemoryPopulationStore();
+    const result = await evolve(
+      options({
+        store,
+        initial: source,
+        models: [{ model }],
+        patch: { full: 1 },
+        generations: 2,
+        mutationsPerGeneration: 3,
+      }),
+    ).result;
+    expect(counter.calls).toBe(6);
+    const children = (await store.listCandidates(result)).filter((item) => item.generation > 0);
+    expect(children.filter((item) => item.rejection?.kind === 'patch')).toEqual([]);
+    expect(result.best?.score).toBe(2);
+    expect(result.best?.program).toBe(
+      source.replace('    return x', '    x = x + 1\n    x = x + 1\n    return x'),
+    );
+    // A rewrite keeps its parent's final newline, or its absence.
+    for (const child of children) expect(child.program.endsWith('\n')).toBe(source.endsWith('\n'));
+  });
+
+  it.each([
+    ['without', bare],
+    ['with', `${bare}\n`],
+  ])('accepts crossovers of a program %s a final newline', async (_label, source) => {
+    const store = createInMemoryPopulationStore();
+    const result = await evolve(
+      options({
+        store,
+        initial: source,
+        models: [{ model: rewriter().model }],
+        patch: { cross: 1 },
+        generations: 2,
+        mutationsPerGeneration: 1,
+      }),
+    ).result;
+    const [first, second] = await store.listCandidates(result, {
+      ids: ['g1-i0-s0', 'g2-i0-s0'],
+    });
+    // A lone seed has no partner, so generation 1 falls back to a diff.
+    expect(first).toMatchObject({ patchType: 'diff', accepted: true, score: 1 });
+    expect(second).toMatchObject({ patchType: 'cross', accepted: true, score: 2 });
+    expect(second!.program.endsWith('\n')).toBe(source.endsWith('\n'));
+  });
+
+  it('rejects a rewrite that only adds the final newline as a duplicate of its parent', async () => {
+    const echo = '```python\n' + bare + '\n```';
+    const store = createInMemoryPopulationStore();
+    const result = await evolve(
+      options({
+        store,
+        initial: bare,
+        models: [{ model: grower(echo).model }],
+        patch: { full: 1 },
+        generations: 1,
+      }),
+    ).result;
+    const children = await store.listCandidates(result, { generation: 1 });
+    expect(children.map((child) => child.rejection?.kind)).toEqual(['duplicate', 'duplicate']);
+  });
+});
+
 describe('evolve: evaluation cascade', () => {
   it('stops at the first stage below its threshold and scores by the last evaluated stage', async () => {
     let expensive = 0;

@@ -195,16 +195,23 @@ export function applySearchReplace(source: string, diff: string): string {
 
 const FENCE = /```[^\n]*\n([\s\S]*?)```/g;
 const lf = (text: string) => text.replace(/\r\n/g, '\n');
+const finalBreak = (text: string) =>
+  text.endsWith('\r\n') ? '\r\n' : text.endsWith('\n') ? '\n' : '';
 
 /**
  * Read a full-program rewrite from a model reply: the last fenced code block,
  * else the whole reply. The frozen code must survive byte-for-byte (line
- * endings aside) and the block count must not change.
+ * endings aside) and the block count must not change. The rewrite takes the
+ * parent's final newline, or its absence: the prompt shows the parent without
+ * one and a fence always adds one, so a single final line break is not a change.
  */
 export function extractFullRewrite(parent: string, text: string): string {
   const fenced = [...text.matchAll(FENCE)];
-  const program = fenced.length ? fenced[fenced.length - 1]![1]! : text;
-  if (!program.trim().length) throw new EvolvePatchError('empty_rewrite', 'The rewrite is empty.');
+  const reply = fenced.length ? fenced[fenced.length - 1]![1]! : text;
+  if (!reply.trim().length) throw new EvolvePatchError('empty_rewrite', 'The rewrite is empty.');
+  const tail = finalBreak(reply);
+  const eol = tail || (reply.includes('\r\n') ? '\r\n' : '\n');
+  const program = reply.slice(0, reply.length - tail.length) + (finalBreak(parent) ? eol : '');
   const before = parseEvolveBlocks(parent);
   if (before.implicit) return program;
   const after = parseEvolveBlocks(program);
