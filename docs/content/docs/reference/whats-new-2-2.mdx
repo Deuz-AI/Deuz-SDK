@@ -266,7 +266,8 @@ Execution contexts and ledgers take
 admission, every model call is admitted all-or-nothing by a shared
 `BudgetStore` against persistent scopes such as `user:42` or `org:acme`, with
 optional rolling windows. Settlement and release are mirrored, unknown usage
-keeps the hold, and requests are idempotent by request ID. Stores:
+keeps the hold, and requests are idempotent by request ID. Swarms take the same
+`admission` option on `createSwarm` for every task's model calls. Stores:
 `createInMemoryBudgetStore` (`/agent`), `createSqliteBudgetStore`
 (`/ops/sqlite`) and `createPostgresBudgetStore` (`/ops/postgres`). See
 [Budgets](/docs/modules/budgets).
@@ -279,7 +280,8 @@ An evaluation cascade scores candidates, islands and a MAP-Elites archive keep
 diversity, and a UCB1 bandit picks from a model ensemble. A budget is
 mandatory. Candidates have deterministic IDs and generations commit with a
 compare-and-set, so `resumeEvolve` replays stored slots with zero model calls.
-It runs on the edge; the SQLite population store is in
+A `lease` keeps a second process off a run another one drives
+(`EvolveLeaseError`). It runs on the edge; the SQLite population store is in
 `@deuz-sdk/core/evolve/sqlite`. See [Evolve](/docs/modules/evolve).
 
 ## Schedules and signals
@@ -386,6 +388,13 @@ readers fall back to `load`.
   without `execution` fails.
 - A snapshot that records persistent admission cannot be restored without
   `admission: { store }`.
+- Every SQLite store, the 2.0 memory and chat pack included, now sets a 5 s
+  busy timeout before it switches a file to WAL, unless an injected handle
+  already has one, and retries a failed open on the next call instead of
+  failing forever.
+- SQLite stores that open a file path load `node:sqlite` again. The 2.1 build
+  stripped the `node:` prefix, so opening a path without an injected
+  `database` failed with `ERR_MODULE_NOT_FOUND`.
 
 ## Operational limits
 

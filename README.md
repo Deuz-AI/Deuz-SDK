@@ -8,7 +8,7 @@
 [![runtime dependencies](https://img.shields.io/badge/runtime_dependencies-0-18181b?style=flat-square)](./packages/core/package.json)
 [![MIT](https://img.shields.io/badge/license-MIT-18181b?style=flat-square)](./LICENSE)
 
-[Documentation](https://deuz-sdk.tech/docs) · [Examples](./examples) · [What's new in 2.1](./docs/content/docs/reference/whats-new-2-1.mdx)
+[Documentation](https://deuz-sdk.tech/docs) · [Examples](./examples) · [What's new in 2.2](./docs/content/docs/reference/whats-new-2-2.mdx)
 
 </div>
 
@@ -41,11 +41,13 @@ Use Node.js 22+, or an edge runtime with Web APIs. Node integrations have separa
 
 - **Models** — multiple providers, streaming, structured output, and tool calls.
 - **Agents** — typed results, verification, approvals, and resumable runs.
-- **Swarms** — task dependencies, bounded parallel work, reducers, and SQLite persistence.
+- **Swarms** — task dependencies, runtime spawning, shared blackboards, rounds, and SQLite or Postgres persistence.
+- **Operations** — leases, drain, cross-process cancel and recovery, persistent budgets, and schedules.
+- **Evolve** — evolutionary program search with a mandatory budget and zero-call resume.
 - **Context** — memory, retrieval, compaction, and MCP tools.
 - **Control** — shared execution policies, budget accounting, traces, and optional React bindings.
 
-Core has zero required runtime dependencies; integrations use optional peers. In 2.1, each swarm run has one executor, and uncertain external effects require reconciliation before retry.
+Core has zero required runtime dependencies; integrations use optional peers. Without a lease provider, drive each swarm run from one process; uncertain external effects require reconciliation before retry.
 
 [Agents](./docs/content/docs/modules/native-agents.mdx) · [Swarms](./docs/content/docs/modules/swarm.mdx) · [React](./docs/content/docs/modules/react-hooks.mdx) · [Changelog](./packages/core/CHANGELOG.md)
 

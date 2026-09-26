@@ -1,15 +1,15 @@
-# Deuz SDK 2.1 documentation
+# Deuz SDK 2.2 documentation
 
 The documentation site for `@deuz-sdk/core` and `@deuz-sdk/react`, built with
-Next.js and Fumadocs. Version 2.1 adds an optional native agent engine and durable
-swarm DAGs while keeping the existing generation APIs available.
+Next.js and Fumadocs. Version 2.2 adds dynamic swarms, cross-process operations,
+persistent budgets, evolve and schedules while keeping the existing APIs available.
 
-- [What is new in 2.1](content/docs/reference/whats-new-2-1.mdx): release scope,
+- [What is new in 2.2](content/docs/reference/whats-new-2-2.mdx): release scope,
   upgrade guidance and operational limits.
 - [Native agents](content/docs/modules/native-agents.mdx): validated results,
   strict checkpoints, approval/client-result resume and shared execution budgets.
-- [Swarm](content/docs/modules/swarm.mdx): fixed DAGs, bounded concurrency,
-  memory/SQLite stores, recovery and cursor events.
+- [Swarm](content/docs/modules/swarm.mdx): DAGs that grow at runtime, blackboards,
+  rounds, memory/SQLite/Postgres stores, recovery and cursor events.
 - [Installation](content/docs/installation.mdx) and
   [quickstart](content/docs/quickstart.mdx).
 

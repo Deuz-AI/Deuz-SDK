@@ -305,7 +305,8 @@ const result = await runAgent({
 console.log(result.status, await store.usage('user:42'));
 ```
 
-- Settlement and release are mirrored; **unknown usage keeps the full hold**. Requests are idempotent by request ID. A store failure is `admission_failed` and changes nothing locally.
+- Settlement and release are mirrored; **unknown usage keeps the full hold**, except that a call reserved without a USD estimate settles its known tokens even when unpriced. Requests are idempotent by request ID. A store failure is `admission_failed` and changes nothing locally.
+- Swarms refuse pre-bound execution contexts, so pass `admission` to `createSwarm` instead: every task's model calls are admitted, the run records the scopes, and resuming needs the store again.
 - A scope that bounds a dimension needs an estimate for it (`missing_reservation` otherwise). The first request fixes a key's `window`; a different window later is rejected.
 - `snapshot()` then records the scopes (execution snapshot version 2, which 2.1 refuses). Restoring needs the store again: `createExecutionContext({ snapshot, admission: { store } })`; scopes passed on restore can only add or tighten.
 - A crash-leaked hold stays charged to a lifetime budget and leaves a windowed one with its bucket — fail-closed by design. SQLite windows use the store `clock` (share one across processes); Postgres uses database time. Stores never prune history.

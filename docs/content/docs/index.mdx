@@ -146,25 +146,28 @@ Many AI integrations become hard to test because runtime state, provider-specifi
 | **No vendor lock**     | Our own canonical delta stream and our own versioned UI wire. The SDK never proxies a provider's raw SSE bytes to your client.                                                                                                         |
 | **Secrets never leak** | API keys are masked in every log, error, and span path. This is a regression-tested invariant — see [secret redaction](/docs/core/errors#secret-redaction-p0).                                                                         |
 
-## New in 2.1
+## New in 2.2
 
-2.1 adds an optional native agent engine and a durable swarm scheduler. Existing
-generation and `createAgent` APIs remain available; native results, checkpoints
-and events have their own contracts.
+2.2 lets swarms grow while they run, moves durable runs between processes, and
+adds persistent budgets, evolutionary search and schedules. The 2.1 APIs remain
+available.
 
-- **Validated agent results** — `runAgent` / `streamAgent`, explicit outcomes,
-  structured finalization and three-outcome verification → [Native agents](/docs/modules/native-agents)
-- **Strict persistence** — native checkpoints, approval/client-result resume and
-  tool receipts that require reconciliation for uncertain external effects.
-- **Durable swarm DAGs** — bounded concurrency, reducers, memory/SQLite stores,
-  cancellation, completed-work reuse and cursor events → [Swarm](/docs/modules/swarm)
-- **Shared policy and budgets** — inherited constraints, reservations before
-  admission, and retained unknown amounts across recovery.
+- **Dynamic swarms** — finished tasks spawn tasks atomically, with limits,
+  compensation and per-task timeouts → [Swarm](/docs/modules/swarm)
+- **Blackboards and rounds** — group channels agents read and post to, soft
+  dependencies and explore-consolidate rounds.
+- **Operations** — leases, drain, cross-process cancel and recovery, with SQLite
+  and Postgres backends → [Operations](/docs/modules/operations)
+- **Persistent budgets** — per-user or per-org scopes shared by every run and
+  process → [Budgets](/docs/modules/budgets)
+- **Evolve** — evolutionary program search over islands with a mandatory budget
+  and zero-call resume → [Evolve](/docs/modules/evolve)
+- **Schedules and signals** — cron ticks and verified webhooks that start or
+  resume runs → [Schedules](/docs/modules/schedule)
 
-Start with [What is new in 2.1](/docs/reference/whats-new-2-1) for upgrade notes and
-operational limits. Swarms use one executor per run, cancellation is cooperative,
-and budget admission uses estimates. Previous releases: [2.0](/docs/reference/whats-new-2-0)
-and [1.9](/docs/reference/whats-new-1-9).
+Start with [What is new in 2.2](/docs/reference/whats-new-2-2) for upgrade notes and
+operational limits. Previous releases: [2.1](/docs/reference/whats-new-2-1),
+[2.0](/docs/reference/whats-new-2-0) and [1.9](/docs/reference/whats-new-1-9).
 
 ## Feature overview
 

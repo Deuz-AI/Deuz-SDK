@@ -6,10 +6,12 @@ icon: Download
 
 `@deuz-sdk/core` is a single package with **zero runtime dependencies**. Install it, and the chat core, the agentic tool loop, streaming, and the canonical UI wire are all available out of the box. Heavier or stateful capabilities (schema-typed objects, MCP, document parsing, real databases) pull in optional peers only when you actually use them.
 
-Version 2.1 also includes the optional [native agent engine](/docs/modules/native-agents)
-and [swarm scheduler](/docs/modules/swarm) in this package. Existing generation
-APIs remain available. See [What is new in 2.1](/docs/reference/whats-new-2-1) for
-upgrade notes and the native engine's supported options.
+The package also includes the optional [native agent engine](/docs/modules/native-agents)
+and [swarm scheduler](/docs/modules/swarm), and since 2.2 the
+[operations](/docs/modules/operations), [persistent budget](/docs/modules/budgets),
+[evolve](/docs/modules/evolve) and [schedule](/docs/modules/schedule) modules.
+Existing generation APIs remain available. See
+[What is new in 2.2](/docs/reference/whats-new-2-2) for upgrade notes.
 
 ## Install
 
@@ -97,7 +99,7 @@ Capabilities use separate subpaths as part of the tree-shaking contract. Every s
 
 1. **Free functions and types come from the root.** `streamChat`, `generateText`, `generateObject`, `streamObject`, `embed`, `createClient`, the error classes, `tool()`, the stop conditions, and every canonical type.
 2. **One provider = one subpath.** Import only the factories you actually call.
-3. **Node adapters use separate subpaths.** A `…/node` suffix is one marker; `/stores/sqlite` and `/swarm/sqlite` are also Node-only. On an edge runtime, use the web-safe seam plus your own implementation.
+3. **Node adapters use separate subpaths.** A `…/node` suffix is one marker; the `/sqlite` and `/postgres` store subpaths are also Node-only. On an edge runtime, use the web-safe seam plus your own implementation.
 
 ### Core surface
 
@@ -108,6 +110,13 @@ Capabilities use separate subpaths as part of the tree-shaking contract. Every s
 | `@deuz-sdk/core/agent`        | Reusable `createAgent` values, plus native `runAgent` / `streamAgent`, resume, execution contexts and shared budgets (2.1) |
 | `@deuz-sdk/core/swarm`        | Native agent/reducer DAGs with bounded concurrency, an in-memory store and durable cursor-event contracts (2.1)            |
 | `@deuz-sdk/core/swarm/sqlite` | Node-only transactional swarm persistence through `createSqliteSwarmStore` (2.1)                                           |
+| `@deuz-sdk/core/swarm/postgres` | Node-only swarm persistence on Postgres through `createPostgresSwarmStore` (2.2) |
+| `@deuz-sdk/core/ops` | Leases for runs that several processes may drive: `createInMemoryLeaseProvider` (2.2) |
+| `@deuz-sdk/core/ops/sqlite` | Node-only leases, native run storage and budget stores on SQLite (2.2) |
+| `@deuz-sdk/core/ops/postgres` | Node-only leases, native run storage and budget stores on Postgres (2.2) |
+| `@deuz-sdk/core/evolve` | Evolutionary program search: `evolve`, `resumeEvolve` and an in-memory population store (2.2) |
+| `@deuz-sdk/core/evolve/sqlite` | Node-only evolve persistence through `createSqlitePopulationStore` (2.2) |
+| `@deuz-sdk/core/schedule` | Cron schedules and verified webhook signals that start or resume runs (2.2) |
 | `@deuz-sdk/core/testing`      | You are writing tests: `createMockModel`, `runEval`, golden-replay SSE fixtures                                            |
 | `@deuz-sdk/core/middleware`   | You need `wrapModel` + `logging` / `simpleCache` / `redactPII` / `promptInjectionGuard` / `withFallback`                   |
 | `@deuz-sdk/core/guardrails`   | You want the ready-made `promptInjectionGuardrail` / `maxOutputLength` (2.0)                                               |
@@ -237,7 +246,7 @@ const { generateText } = require('@deuz-sdk/core');
 
 ## Next steps
 
-- [What is new in 2.1](/docs/reference/whats-new-2-1) — release scope, upgrade notes and operational limits.
+- [What is new in 2.2](/docs/reference/whats-new-2-2) — release scope, upgrade notes and operational limits.
 - [Native agents](/docs/modules/native-agents) and [Swarm](/docs/modules/swarm) — opt-in validated runs and durable DAG scheduling.
 - [streamChat](/docs/core/stream-chat) — the synchronous, never-throws streaming entry point.
 - [generateText](/docs/core/generate-text) — buffered text plus the agentic tool loop.
