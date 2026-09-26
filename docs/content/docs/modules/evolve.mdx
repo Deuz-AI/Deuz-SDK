@@ -193,7 +193,9 @@ flight finish and keep their candidates, the run is saved with
 as a rate limit that outlasts its retries or a request the provider rejects as
 invalid, reject only that candidate with `rejection.kind: 'model'`.
 `result.modelCalls` counts the calls that sent a request: a refusal before the
-request, including an open circuit breaker, is not a call.
+request, including an open circuit breaker, is not a call. A call that a cancel
+cuts off may still be counted even if its request was never sent, because a
+cancelled call reports the same result either way.
 
 `stopWhen.targetScore` ends the run with reason `'target'` once the best score
 reaches it. `stopWhen.plateau` ends it with reason `'plateau'` after that many

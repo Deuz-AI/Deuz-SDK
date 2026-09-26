@@ -696,6 +696,9 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
             : {}),
           ...(options.deps ? { deps: options.deps } : {}),
         });
+        // Counted even when a cancel stopped it before its request went out: a
+        // cancelled call resolves 'aborted' either way, and its ledger entry
+        // cannot tell (a rate-limited attempt that did go out is released too).
         modelCalls++;
         // A cancelled call resolves with what streamed so far; its slot is not done.
         if (controller.signal.aborted) return { skipped: 'aborted' };

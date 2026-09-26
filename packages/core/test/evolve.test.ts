@@ -625,6 +625,44 @@ describe('evolve: stopping', () => {
     expect(resumed.best?.score).toBe(1);
   });
 
+  it('stores nothing for a mutation cancelled before its request, which may still count', async () => {
+    const { model, counter } = grower();
+    let reached!: () => void;
+    const looking = new Promise<void>((resolve) => (reached = resolve));
+    let answer!: () => void;
+    const held = new Promise<void>((resolve) => (answer = resolve));
+    const store = createInMemoryPopulationStore();
+    const handle = evolve(
+      options({
+        store,
+        models: [{ model }],
+        generations: 1,
+        mutationsPerGeneration: 1,
+        deps: {
+          ...deps,
+          // The breaker lookup before the request answers only after the cancel.
+          breakerStore: {
+            get: async () => {
+              reached();
+              await held;
+              return undefined;
+            },
+            set: () => {},
+          },
+        },
+      }),
+    );
+    await looking;
+    const cancelled = handle.cancel();
+    answer();
+    await cancelled;
+    const result = await handle.result;
+    expect(counter.calls).toBe(0);
+    // As documented: a cancelled call cannot tell whether its request went out.
+    expect(result).toMatchObject({ status: 'stopped', reason: 'cancelled', modelCalls: 1 });
+    expect((await store.listCandidates(result)).map((item) => item.id)).toEqual(['g0-i0-s0']);
+  });
+
   it('stops cancelled when a cancel cuts off a slot novelty embedding', async () => {
     // The seed's embedding is answered; the slot's waits until it is aborted.
     const { model: embedder, reached } = stallingEmbedder(1);
