@@ -1,7 +1,8 @@
 {
   "benchmark": "deuz-sdk-100pt-ranking",
-  "date": "2026-07-22",
-  "deuzVersion": "1.8.0-pre (code-verified; package.json still 1.7.1 pending release)",
+  "date": "2026-09-26",
+  "panel": "2.2.0",
+  "deuzVersion": "2.2.0 (release commit 40a6f3e, tag v2.2.0; npm still served 2.1.0 on 2026-09-26)",
   "methodology": {
     "scenarios": [
       "Chatbot",
@@ -19,26 +20,66 @@
       "price": 0.1
     },
     "anchors": "90-100 market leader · 70-89 strong/production-ready · 50-69 usable but gappy · 30-49 weak/indirect · 0-29 unsupported. Community is log-scale (~16M npm/week → 95; 100k → 70; 1k → 35; <500 → 15-25). CLI scenario favors installable tools; libraries are scored on suitability for building one. Unmeasured performance scores are architecture-based estimates.",
-    "provenance": "Competitor criterion scores carried from 2026-07-20 panel unless material product change (Vercel AI SDK harnesses/sandbox/WorkflowAgent; Mastra Workspace + AgentBrowser + CodeMode + E2B). Deuz re-scored from scratch against local 1.8.0 autonomy surface (workspace, compute/CodeAct, planTasks/verifyStep, runtime, browser, ./providers, ./testing, azure/bedrock). Community numbers re-fetched live 2026-07-22 (npm downloads API + GitHub API)."
+    "scoring": "Scenario score = sum of weight × criterion, rounded half up. Headline = unweighted mean of the five scenario scores; rank = order by headline, as bench/chart.py sorts. Between panels a community criterion moves on the log scale: ΔC = slope × log10(new/old weekly npm downloads), with the slope of the anchor segment the package sits in (25/log10(160) ≈ 11.34 per decade from 100k to ~16M, 17.5 per decade below 100k), held at 95 at or above ~16M. GitHub stars are recorded, not scored. A score without a published breakdown moves by 0.15 × ΔC, rounded half up.",
+    "provenance": "2026-09-26 / 2.2.0 panel. Deuz re-scored against the 2.2.0 release surface, which spans 1.9 → 2.2 since the last panel (chat UI layer, createAgent, SQLite/Redis/Postgres stores, guardrails, handoffs, MCP OAuth, speech/transcription/video, 29 provider ids, native agents, durable and dynamic swarms, leases/drain/recover/cancel on SQLite and Postgres, persistent budgets, evolve, schedules and signals). Competitors: the repo documents no material product change since the 2026-07-22 panel, so every competitor's non-community criteria are carried from it. Community numbers re-fetched live 2026-09-26 (npm downloads API, last-week window 2026-09-18..2026-09-24; GitHub API stars) and moved on the log scale; only Mastra's move changes a rounded score. Earlier panels: 2026-07-22 (1.8.0), 2026-07-20 (1.7.0)."
   },
+  "communityFetched": "2026-09-26 (npm last-week window 2026-09-18..2026-09-24; GitHub stars the same day)",
   "communityLive": {
-    "@deuz-sdk/core": { "npmWeekly": 393, "stars": 2 },
-    "ai": { "npmWeekly": 17984233, "stars": 25729 },
-    "@ai-sdk/react": { "npmWeekly": 6809311 },
-    "@mastra/core": { "npmWeekly": 1200445, "stars": 26436 },
-    "langchain": { "npmWeekly": 2746193, "starsJs": 17974 },
-    "@langchain/langgraph": { "npmWeekly": 2950243 },
-    "llamaindex": { "npmWeekly": 117684, "starsTs": 3076 },
-    "openai": { "npmWeekly": 29425745, "stars": 11057 },
-    "@openai/agents": { "npmWeekly": 1478647, "stars": 3441 },
-    "@anthropic-ai/sdk": { "npmWeekly": 26939975, "stars": 2051 },
-    "@anthropic-ai/claude-agent-sdk": { "npmWeekly": 8266835 },
-    "@anthropic-ai/claude-code": { "npmWeekly": 11546513, "stars": 138681 },
-    "@google/genai": { "npmWeekly": 16018894, "stars": 1650 },
-    "@openai/codex": { "npmWeekly": 16023958, "stars": 100648 },
-    "@google/gemini-cli": { "npmWeekly": 494396, "stars": 106128 },
-    "kimi-cli": { "stars": 10590 },
-    "crewai": { "stars": 55964 }
+    "@deuz-sdk/core": { "npmWeekly": 141, "stars": 697, "repo": "Deuz-AI/Deuz-SDK" },
+    "@deuz-sdk/react": { "npmWeekly": 198 },
+    "ai": { "npmWeekly": 28694661, "stars": 26966, "repo": "vercel/ai" },
+    "@ai-sdk/react": { "npmWeekly": 9273439 },
+    "@mastra/core": { "npmWeekly": 1880772, "stars": 28345, "repo": "mastra-ai/mastra" },
+    "langchain": { "npmWeekly": 3195008, "starsJs": 18230, "repo": "langchain-ai/langchainjs" },
+    "@langchain/langgraph": { "npmWeekly": 3717926 },
+    "llamaindex": {
+      "npmWeekly": 139698,
+      "starsTs": 3081,
+      "repo": "run-llama/LlamaIndexTS",
+      "note": "repo archived (last push 2026-03-11); npm latest is 0.12.1 (2025-12-31)"
+    },
+    "openai": { "npmWeekly": 43397532, "stars": 11187, "repo": "openai/openai-node" },
+    "@openai/agents": { "npmWeekly": 2025262, "stars": 3860, "repo": "openai/openai-agents-js" },
+    "@anthropic-ai/sdk": {
+      "npmWeekly": 43792628,
+      "stars": 2122,
+      "repo": "anthropics/anthropic-sdk-typescript"
+    },
+    "@anthropic-ai/claude-agent-sdk": { "npmWeekly": 12119752 },
+    "@anthropic-ai/claude-code": {
+      "npmWeekly": 14031875,
+      "stars": 148183,
+      "repo": "anthropics/claude-code"
+    },
+    "@google/genai": { "npmWeekly": 25490960, "stars": 1685, "repo": "googleapis/js-genai" },
+    "@openai/codex": { "npmWeekly": 22486298, "stars": 126586, "repo": "openai/codex" },
+    "@google/gemini-cli": {
+      "npmWeekly": 427056,
+      "stars": 107164,
+      "repo": "google-gemini/gemini-cli"
+    },
+    "kimi-cli": {
+      "stars": 11429,
+      "repo": "MoonshotAI/kimi-cli",
+      "note": "archived: legacy Python Kimi CLI, points to Kimi Code CLI"
+    },
+    "kimi-code": { "stars": 7679, "repo": "MoonshotAI/kimi-code" },
+    "crewai": { "stars": 59059, "repo": "crewAIInc/crewAI" },
+    "qwen": {
+      "starsAgent": 17128,
+      "repoAgent": "QwenLM/Qwen-Agent",
+      "starsCodeCli": 28141,
+      "repoCodeCli": "QwenLM/qwen-code",
+      "npmWeeklyCodeCli": 81930
+    },
+    "deepseek": {
+      "stars": 104492,
+      "repo": "deepseek-ai/DeepSeek-V3",
+      "note": "model repo; no official SDK"
+    },
+    "zhipu": {
+      "note": "no live source recorded: PyPI zhipuai declares no repository and the npm Node SDK is community-maintained"
+    }
   },
   "scores": [
     {
@@ -49,7 +90,7 @@
       "asi": 86,
       "agi": 90,
       "average": 86.2,
-      "delta": "+1.0 vs 2026-07-20 — harnesses + experimental_sandbox + WorkflowAgent",
+      "delta": "0.0 vs 2026-07-22 — carried; ai at 28.7M npm/week stays at the top community anchor (95)",
       "criteria": {
         "coding": "F78 D86 P78 C95 E80 $70 — ToolLoopAgent + experimental_sandbox; harness adapters (Claude Code/Codex/Pi); still not a first-party coding-agent product",
         "asi": "F88 D86 P78 C95 E88 $72 — WorkflowAgent durable steps + needsApproval; OPA policy package; ecosystem gravity"
@@ -102,19 +143,19 @@
     },
     {
       "name": "Mastra",
-      "chatbot": 75,
+      "chatbot": 76,
       "cli": 73,
-      "coding": 76,
+      "coding": 77,
       "asi": 79,
       "agi": 76,
-      "average": 75.8,
-      "delta": "+2.8 vs 2026-07-20 — Workspace + AgentBrowser + CodeMode + E2B/Daytona sandboxes",
+      "average": 76.2,
+      "delta": "+0.4 vs 2026-07-22 — community 80 → 82 (@mastra/core 1.20M → 1.88M npm/week); other criteria carried",
       "criteria": {
-        "chatbot": "F76 D74 P60 C80 E82 $82 — agent layer strong; chat UI still rides AI SDK",
-        "cli": "F68 D74 P58 C80 E82 $80 — no CLI product; heavy Node deps (~116 MB)",
-        "coding": "F82 D72 P62 C80 E80 $80 — workspace fs/shell, CodeMode, AgentBrowser a11y refs, remote sandboxes",
-        "asi": "F88 D76 P62 C80 E84 $78 — workflow snapshots, approvals, workspace persistence, CostGuard",
-        "agi": "F78 D74 P58 C80 E86 $80 — 600+ model router; memory/RAG packages; browser + sandbox breadth"
+        "chatbot": "F76 D74 P60 C82 E82 $82 — agent layer strong; chat UI still rides AI SDK",
+        "cli": "F68 D74 P58 C82 E82 $80 — no CLI product; heavy Node deps (106.7 MB measured 2026-09-26)",
+        "coding": "F82 D72 P62 C82 E80 $80 — workspace fs/shell, CodeMode, AgentBrowser a11y refs, remote sandboxes",
+        "asi": "F88 D76 P62 C82 E84 $78 — workflow snapshots, approvals, workspace persistence, CostGuard",
+        "agi": "F78 D74 P58 C82 E86 $80 — 600+ model router; memory/RAG packages; browser + sandbox breadth"
       }
     },
     {
@@ -130,20 +171,20 @@
       "name": "Deuz SDK",
       "chatbot": 77,
       "cli": 72,
-      "coding": 71,
-      "asi": 77,
+      "coding": 70,
+      "asi": 76,
       "agi": 73,
-      "average": 74.0,
+      "average": 73.6,
       "self": true,
       "criteria": {
-        "chatbot": "F90 D78 P86 C23 E88 $92 — 1.7 wire/resume/approvals + 1.8 plan-update/activity/verify parts through useChat; azure/bedrock/providers breadth. Missing: Vue/Svelte, component catalog, speech.",
-        "cli": "F78 D74 P84 C23 E86 $90 — still no CLI product; runtime + workspace + CodeAct + browser are the building kit for one. Node reference sandbox is not production isolation.",
-        "coding": "F78 D72 P84 C23 E80 $88 — biggest 1.8 jump: createWorkspaceTools, codeActTool/shellTool, createNodeSandbox, createBrowserTools/Playwright. Gaps: no first-party git toolset; sandbox is host process not E2B/Docker.",
-        "asi": "F94 D74 P85 C23 E92 $86 — planTasks → verifyStep → bestOfN/selfConsistency/parallelAgents; RunManager + pollStaleRuns; Workspace externalized memory; signed approvals + durable checkpoints retained from 1.7.",
-        "agi": "F78 D74 P86 C23 E90 $90 — published ./providers registry + azure + bedrock (Mantle); browser + parallelAgents. Still no speech/realtime/swarm product."
+        "chatbot": "F92 D80 P86 C15 E89 $92 — F+2: speech (OpenAI, ElevenLabs) and transcription (OpenAI, Deepgram) since 2.0 close the speech gap except realtime; SQLite/Redis/Postgres chat, session and memory stores. D+2: 1.9 chat UI layer (ordered parts, writable useChat state, request validation, auto-resume) and ergonomics pass. E+1: store backends, 29 provider ids. Missing: Vue/Svelte, component catalog (2 headless components), realtime voice.",
+        "cli": "F80 D75 P84 C15 E88 $90 — F+2: the kit for building one grew (zero-dep node:sqlite stores, MCP stdio + OAuth loopback helpers, resumable native runs, schedules). D+1: 1.9 ergonomics (prompt/instructions, timeout layers, typed tool()). E+2: keyless local Ollama and LM Studio. Still no CLI product; the Node reference sandbox is not production isolation.",
+        "coding": "F79 D73 P84 C15 E80 $88 — F+1: workspace sandbox escapes fixed (1.9), doneWhen false-finish guard + createVerifier, evolve's SEARCH/REPLACE patch helpers, idempotent native tools, maxToolResultLength. D+1: typed tool(), per-tool timeouts, unknown tool names self-heal. Gaps unchanged: no first-party git toolset; the Node sandbox is a host child process, not isolation (Docker/E2B are adapters you write).",
+        "asi": "F96 D74 P85 C15 E93 $86 — F+2: native agents with explicit outcomes, strict persistence and tool receipts (2.1); swarms that spawn at runtime, blackboards and rounds; leases, drain, recover and cross-process cancel; persistent budgets; schedules and signals (2.2). E+1: SQLite and Postgres backends for swarm, ops and budgets. D held: 1.9 ergonomics offset by two agent engines (native runs reject chat, memory, fallbackModels). Limits: leases are liveness, not safety; external effects need reconciliation; no Redis swarm/ops backend.",
+        "agi": "F82 D75 P86 C15 E91 $90 — F+4: speech, transcription and video (2.0) and a swarm product (2.1/2.2) close two of the three gaps named on 1.8; Cohere/Voyage rerankers, evolve. E+1: 21 → 29 provider ids, keyless local hosts. D+1: ergonomics pass. Still missing: realtime voice, MCP server, A2A, provider batch APIs (deferred to 2.3)."
       },
-      "previousAverage": 69.6,
-      "delta": "+4.4 vs 2026-07-20 (1.7.0): chatbot 76→77, CLI 68→72, coding 61→71, ASI 74→77, AGI 69→73 · rank 14→9"
+      "previousAverage": 74.0,
+      "delta": "-0.4 vs 2026-07-22 (1.8.0): chatbot 77→77, CLI 72→72, coding 71→70, ASI 77→76, AGI 73→73 · rank 9→9 · features up in every scenario; community 23→15 (393 → 141 npm/week) takes back more than they add"
     },
     {
       "name": "Google Gemini SDK",
@@ -211,9 +252,12 @@
   ],
   "notes": [
     "Self-assessed by the Deuz maintainers — rubric, criterion breakdowns and sources published for scrutiny; re-derive any score from the anchors.",
-    "Deuz community criterion is ONE number (23) applied to every scenario: 393 npm downloads/week + 2 GitHub stars, fetched live 2026-07-22.",
-    "Deuz is scored against the unreleased 1.8.0 code surface in this repo (exports present; npm still 1.7.1). That is intentional — the benchmark tracks shipped code, not marketing version numbers.",
-    "Honesty check: Mastra's remote sandboxes (E2B/Daytona) and AgentBrowser a11y-ref tooling outrank Deuz's Node reference sandbox on production isolation. Deuz wins on zero-deps + edge-safe seams + verifyStep-in-loop.",
-    "Sources 2026-07-22: mastra.ai/docs/workspace, mastra.ai/docs/browser/agent-browser, ai-sdk.dev WorkflowAgent + experimental_sandbox + harness packages, Deuz packages/core/src/{autonomy,workspace,compute,browser,runtime,providers,testing,azure,bedrock}.ts"
+    "Deuz community criterion is ONE number (15) applied to every scenario: 141 @deuz-sdk/core npm downloads/week (2026-09-18..24), fetched live 2026-09-26. Log-scale move from 23 at 393/week: 23 + 17.5 × log10(141/393) = 15.2. GitHub stars (2 → 697) and @deuz-sdk/react (198/week) are recorded, not scored — the anchors are npm downloads.",
+    "Deuz is scored against the 2.2.0 release commit (40a6f3e, tag v2.2.0); npm still served 2.1.0 at fetch time. The criterion notes cover everything since the 1.8.0 panel: 1.9, 2.0, 2.1 and 2.2 (packages/core/CHANGELOG.md, docs/content/docs/reference/whats-new-*.mdx).",
+    "Deuz performance and price are held in every scenario. Footprint re-measured for 2.2.0: 10.0 MB installed, 21.9 ms cold import (the 1.8 local pack measured 4.09 MB / 40.3 ms on Node 24.14) — still the smallest install and fastest import in bench/results.json.",
+    "Competitors: no material product change is documented in this repo since 2026-07-22, so every competitor's non-community criteria are carried. Without a published breakdown the community move is at most 0.36 of a scenario point (@anthropic-ai/sdk, even ignoring the 95 hold), so those integer scores stand; entries with no earlier npm figure to move from (Kimi, CrewAI, Qwen, DeepSeek, Zhipu) are carried whole. Mastra's breakdown is published: C 80 → 82 lifts chatbot 75.3 → 75.6 (76) and coding 76.2 → 76.5 (77, half up).",
+    "Flagged for the next full panel, not re-scored here: MoonshotAI/kimi-cli is archived in favour of Kimi Code CLI (MoonshotAI/kimi-code); run-llama/LlamaIndexTS is archived (last push 2026-03-11). Vercel's coding breakdown computes to 81.65, not its published 79 — both are carried from 1.8.0 as published.",
+    "Honesty check: Deuz stays 9/16 and drops 0.4 to 73.6 — the community criterion takes back more than the 1.9–2.2 features add. Mastra's remote sandboxes (E2B/Daytona) still outrank Deuz's child-process reference sandbox, and Deuz has no CLI product, no git toolset, no Vue/Svelte bindings and no realtime voice.",
+    "Sources 2026-09-26: api.npmjs.org/downloads/point/last-week/<package>, gh api repos/<owner>/<repo>, bench/results.json, Deuz packages/core/CHANGELOG.md (1.9.0–2.2.0) and docs/content/docs/reference/whats-new-{1-9,2-0,2-1,2-2}.mdx."
   ]
 }

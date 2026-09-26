@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Render the Deuz benchmark charts (matplotlib).
 
-Reads bench/scores.json (+ bench/results.json for the footprint panel) and writes:
+Reads bench/scores.json (+ bench/results.json for the footprint panel) and writes the
+charts below. Titles, headline, ranks and version labels all come from the JSON:
   assets/benchmark.png / assets/benchmark-dark.png   — /100 ranking + scenario heatmap
   assets/footprint.png / assets/footprint-dark.png   — install size + cold import (log scale)
 
@@ -10,6 +11,7 @@ Run: python bench/chart.py
 
 import json
 import os
+import re
 
 import matplotlib
 
@@ -55,7 +57,8 @@ def load(name):
 
 def ranking_chart(theme):
     t = THEMES[theme]
-    scores = sorted(load("scores.json")["scores"], key=lambda s: s["average"], reverse=True)
+    data = load("scores.json")
+    scores = sorted(data["scores"], key=lambda s: s["average"], reverse=True)
     names = [s["name"] for s in scores]
     avgs = [s["average"] for s in scores]
     matrix = np.array([[s[k] for k, _ in SCENARIOS] for s in scores], dtype=float)
@@ -117,9 +120,16 @@ def ranking_chart(theme):
     cbar.ax.tick_params(colors=t["muted"], labelsize=8)
     cbar.outline.set_visible(False)
 
-    fig.suptitle("AI SDK benchmark — 16 SDKs, 5 scenarios, /100  (2026-07-22 · 1.8.0 panel; rubric + sources in bench/)",
+    # Title and headline come from scores.json, ranked exactly as the bars above.
+    deuz = scores[deuz_row]
+    previous = f" ({deuz['previousAverage']:.1f} on the previous panel)" if "previousAverage" in deuz else ""
+    npm_weekly = data["communityLive"]["@deuz-sdk/core"]["npmWeekly"]
+    fig.suptitle(f"AI SDK benchmark — {len(scores)} SDKs, {len(SCENARIOS)} scenarios, /100  "
+                 f"({data['date']} · {data['panel']} panel; rubric + sources in bench/)",
                  x=0.16, y=0.955, ha="left", fontsize=13.5, color=t["fg"], fontweight="bold")
-    fig.text(0.16, 0.905, "Deuz SDK 74.0 — 9/16 overall · coding 61→71 · community criterion scored at 393 npm downloads/week + 2 stars, no mercy",
+    fig.text(0.16, 0.905,
+             f"Deuz SDK {deuz['average']:.1f} — {deuz_row + 1}/{len(scores)} overall{previous} · "
+             f"community criterion scored on {npm_weekly} npm downloads/week (stars not scored), no mercy",
              fontsize=10, color=t["muted"])
 
     out = os.path.join(ASSETS, f"benchmark{t['suffix']}.png")
@@ -130,15 +140,14 @@ def ranking_chart(theme):
 
 def footprint_chart(theme):
     t = THEMES[theme]
-    results = load("results.json")["results"]
+    data = load("results.json")
+    results = data["results"]
+    # Every bar names the version it measured; a local pack's "+local" goes to the subtitle.
     names = []
     for r in results:
-        label = r["name"]
-        if label == "@deuz-sdk/core":
-            ver = str(r.get("version", ""))
-            short = ver.split("+")[0] if ver else "?"
-            label = f"@deuz-sdk/core {short}"
-        names.append(label)
+        ver = str(r.get("version", "")).split("+")[0]
+        names.append(f"{r['name']} {ver}" if ver else r["name"])
+    local = [r["name"] for r in results if "+local" in str(r.get("version", ""))]
     mb = [r["installMB"] for r in results]
     ms = [r["importMsMedian"] for r in results]
 
@@ -154,7 +163,9 @@ def footprint_chart(theme):
         ax.barh(y, values, color=colors, height=0.62)
         ax.set_xscale("log")
         for yi, v in enumerate(values):
-            ax.text(v * 1.12, y[yi], f"{v:g} {unit}", va="center", fontsize=9,
+            # results.json stores MB to 2 decimals; keep them, so 10.00 MB does not print as "10".
+            shown = f"{v:.2f}" if unit == "MB" else f"{v:g}"
+            ax.text(v * 1.12, y[yi], f"{shown} {unit}", va="center", fontsize=9,
                     color=t["deuz"] if "deuz" in names[yi] else t["muted"],
                     fontweight="bold" if "deuz" in names[yi] else "normal")
         ax.set_yticks(y, names, fontsize=10, color=t["fg"])
@@ -170,9 +181,16 @@ def footprint_chart(theme):
             spine.set_visible(False)
         ax.set_title(title, color=t["fg"], fontsize=11, loc="left", pad=8)
 
-    date = load("results.json").get("date", "see results.json")
+    date = data.get("date", "see results.json")
     fig.suptitle(f"The cost of the box — bare npm installs, measured {date} (bench/results.json)",
                  x=0.20, y=0.93, ha="left", fontsize=12.5, color=t["fg"], fontweight="bold")
+    machine = data.get("machine", "")
+    node = re.search(r"node(v[\d.]+)", machine)
+    npm = re.search(r"npm([\d.]+)", machine)
+    notes = [f"Node {node.group(1)}" if node else "", f"npm {npm.group(1)} defaults" if npm else "",
+             "cold import = median of 5 runs after 1 warmup",
+             f"{', '.join(local)} from a local npm pack" if local else ""]
+    fig.text(0.20, 0.865, " · ".join(n for n in notes if n), fontsize=9.5, color=t["muted"])
 
     out = os.path.join(ASSETS, f"footprint{t['suffix']}.png")
     fig.savefig(out, dpi=200, facecolor=t["bg"])
