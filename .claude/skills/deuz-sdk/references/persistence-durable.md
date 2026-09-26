@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:c025621e10fd
      sources: docs/content/docs/modules/stores.mdx, docs/content/docs/modules/chat-persistence.mdx,
      docs/content/docs/agents/durable-runtime.mdx, docs/content/docs/agents/unbreakable-chatbot.mdx,
      docs/content/docs/reference/whats-new-2-0.mdx, packages/core/src/durable.ts,
@@ -139,7 +139,9 @@ const swarm = createSwarm({
 });
 
 try {
-  for (const handle of await swarm.recover({ scope: 'tenant-a' })) await handle.result;
+  const { handles, failed } = await swarm.recover({ scope: 'tenant-a' });
+  for (const { key, error } of failed) console.error('cannot resume', key.runId, error);
+  for (const handle of handles) await handle.result;
 } finally {
   await store.close();
   await ops.close();

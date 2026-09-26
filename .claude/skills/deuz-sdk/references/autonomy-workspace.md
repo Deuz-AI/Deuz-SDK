@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:c025621e10fd
      sources: packages/core/src/{autonomy,plan,verify,workspace,compute,browser,runtime,evolve,schedule}.ts,
      packages/core/src/evolve/*.ts, packages/core/src/schedule/*.ts, docs/content/docs/modules/{evolve,schedule}.mdx,
      packages/core/src/node/{workspace,compute,browser,runtime}.ts, packages/core/src/inference/agent-tool.ts,
@@ -458,7 +458,7 @@ export async function POST(request: Request): Promise<Response> {
 ```
 
 - `tick` never throws for your code: a failing `run` / `claim` is `{ status: 'failed', phase }` for that occurrence; a claim answering `false` is `'duplicate'`.
-- **Dedupe across processes needs a durable `claim`.** The default is an in-memory set (one process only). A durable run store is already one: use `occurrence.key` as the swarm `runId` and treat `SwarmConflictError` as "already claimed", with `claim: () => true`.
+- **Dedupe across processes needs a durable `claim`.** The default is an in-memory set (one process only). `createSqliteOpsStore(...).claims` and `createPostgresOpsStore(...).claims` are durable claims (a unique-insert table whose keys accumulate). A durable run store also works: use `occurrence.key` as the swarm `runId` and treat `SwarmConflictError` as "already claimed", with `claim: () => true`. A claim may carry `release(key)`: `handleSignal` calls it when `dispatch` throws, so the sender's retry is dispatched instead of dropped; the scheduler keeps a failed occurrence's claim (call `claim.release(occurrence.key)` in `run`'s catch to allow a retry).
 - `catchUp`: `'latest'` (default, newest due only), `'all'` (oldest first, capped by `maxCatchUp` = 100), `'none'` (newest only if within `graceMs`). A restarted process only sees `lookbackMs` (default 60 000); raise it together with a durable claim to recover missed occurrences.
 - Verifiers (`verifyGitHubWebhook`, `verifySlackRequest(req, secret, { now, toleranceSeconds })`, `verifyHmacSignature`) read the body once, use WebCrypto and constant-time comparison, and answer `{ ok: true, body }` or `{ ok: false, reason }`. `handleSignal` claims the key **before** dispatch: keep `dispatch` short (enqueue, or start a run whose `runId` is the key).
 

@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:c025621e10fd
      sources: packages/core/src/{agent-run,execution-policy,budget-ledger,ops}.ts,
        src/types/{agent-run,execution,swarm,lease}.ts, src/inference/{agent-tools,loop-shared}.ts,
        src/swarm/{scheduler,store,spawn,blackboard,rounds}.ts, src/node/{swarm-sqlite,ops-sqlite}.ts,
@@ -260,10 +260,10 @@ try {
 }
 ```
 
-- `run` / `resume` reject with `SwarmLeaseError` `'held'` while another executor holds the run. A renewal reporting the lease gone aborts the tasks and rejects `handle.result` with `'lost'`; task records stay, and the next executor reconciles them as after a crash. A renewal that throws counts as lost only once the lease could have expired.
+- `run` / `resume` reject with `SwarmLeaseError` `'held'` while another executor holds the run. A renewal reporting the lease gone aborts the tasks and rejects `handle.result` with `'lost'` (also when a stale write meets the revision check first); task records stay, and the next executor reconciles them as after a crash. A renewal that throws counts as lost only once the lease could have expired.
 - `handle.drain()` stops dispatch and waits for in-flight tasks; the run settles `'suspended'` (or terminal if nothing remains) after a `run.drained` event. A `'drain'` lease signal does the same from another process.
-- `swarm.recover({ scope?, limit? })` resumes `'running'` runs without a live lease holder, with `expectedRevision`; it needs the `lease` option and a store with `'list'` (`SwarmStore.listRuns`). Call it at startup and on a timer.
-- `swarm.requestCancel(key)` returns `'signalled'` (this process or the lease holder cancels), `'recorded'` (nobody drives it: a compare-and-set commit stores the request; the next executor cancels), or `'settled'`.
+- `swarm.recover({ scope?, limit? })` resumes `'running'` runs without a live lease holder, with `expectedRevision`; it needs the `lease` option and a store with `'list'` (`SwarmStore.listRuns`, paged with an `after` cursor). It pages past live runs (up to 10 000 per call), takes over at most `limit` (1..1000), and resolves to `{ handles, failed }`: a run it cannot resume (for example an older `definitionVersion`) lands in `failed` while the others are recovered. Call it at startup and on a timer.
+- `swarm.requestCancel(key)` returns `'signalled'` (this process or the lease holder cancels), `'recorded'` (nobody drives it: a compare-and-set commit stores the request; the next executor cancels), or `'settled'`. A signalled cancel stays queued on the lease until an executor collects it, so a crashed holder's successor or the next resume applies it before dispatching; a custom `LeaseProvider` must keep a queued `'cancel'` across `acquire` and `release`.
 - Clocks: SQLite leases use the host clock (synchronise processes sharing a file); Postgres leases use the database clock. Without a lease provider, drive a run from one process only.
 
 Leases do not make external effects exactly-once. A task interrupted by a takeover follows the same `replay` rules as one interrupted by a crash; use the service's idempotency key or reconcile. Cancellation and drain are cooperative: tools and reducers must honor their signal.

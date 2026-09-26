@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:c025621e10fd
      sources: docs/content/docs/modules/{observability,pricing,middleware,budgets}.mdx,
      packages/core/src/{budget-ledger,budget-store}.ts, packages/core/src/types/{execution,budget-store}.ts,
      docs/content/docs/reference/observe-events.mdx, docs/content/docs/advanced/resilience.mdx,

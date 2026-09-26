@@ -264,4 +264,4 @@ Full prose for every topic is at **https://deuz-sdk.tech/docs** — each `/docs/
 
 Maintaining this skill: it is generated and verified from source by the scripts under `.claude/skills/deuz-sdk/scripts/` in the Deuz-SDK repository. `generate-api-index.mjs` rebuilds the index; `verify-skill.mjs` resolves every name against the real export table and fails the moment the package version or the API contract moves, so a release cannot let this drift silently.
 
-> Verified against @deuz-sdk/core@2.1.0 · api-contract sha256:cb9f41a77273 · 2026-09-26
+> Verified against @deuz-sdk/core@2.1.0 · api-contract sha256:c025621e10fd · 2026-09-26

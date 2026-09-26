@@ -31,18 +31,21 @@ unions and operational limits are on [What is new in 2.2](/docs/reference/whats-
   group-parallel rounds with a consolidator.
 - **Durability operations** (`/ops`, `/ops/sqlite`, `/ops/postgres`,
   `/swarm/postgres`) — swarm leases with `SwarmLeaseError` `'held'` / `'lost'`,
-  `handle.drain()`, `swarm.recover()`, `swarm.requestCancel(key)`,
+  `handle.drain()`, a paging `swarm.recover()` that returns `{ handles, failed }`,
+  a `swarm.requestCancel(key)` whose cancel survives a change of executor,
   `expectedRevision` / `expectedStatus` on resume, a revision-gated Postgres
-  swarm store, and revision-fenced native agent run stores.
+  swarm store, revision-fenced native agent run stores, and durable schedule
+  `claims` in the SQLite and Postgres ops stores.
   → [Operations](/docs/modules/operations)
 - **Persistent budgets** — `admission: { store, scopes, warnAtPercent, onWarning }`
   admits every model call all-or-nothing against shared scopes such as
-  `user:42`, with rolling windows. Memory, SQLite and Postgres budget stores.
+  `user:42`, with rolling windows, for native runs and swarms alike. Memory,
+  SQLite and Postgres budget stores.
   → [Budgets](/docs/modules/budgets)
 - **Evolve** (`/evolve`, `/evolve/sqlite`) — evolutionary program search over
   evolve blocks with diffs, rewrites and crossovers, an evaluation cascade,
-  islands, a MAP-Elites archive, a UCB1 model bandit, a mandatory budget and
-  zero-call resume. → [Evolve](/docs/modules/evolve)
+  islands, a MAP-Elites archive, a UCB1 model bandit, a mandatory budget,
+  zero-call resume and leases. → [Evolve](/docs/modules/evolve)
 - **Schedules and signals** (`/schedule`) — five-field UTC cron,
   `createScheduler` with `tick` / `start`, claim-based dedupe and catch-up, and
   WebCrypto GitHub, Slack and HMAC verifiers behind `handleSignal`.
@@ -50,6 +53,10 @@ unions and operational limits are on [What is new in 2.2](/docs/reference/whats-
 - **Polish** — `createCohereReranker` and `createVoyageReranker`, the
   `onToolResult` guardrail hook with `maxToolResultLength`, and MCP
   `fingerprintTools` / `detectToolDrift`.
+
+Fixed: SQLite stores that open a file path load `node:sqlite` again (the 2.1
+build stripped the prefix), and every SQLite store waits for another process's
+lock while opening and retries a failed open.
 
 Back up SQLite swarm files before the first 2.2 open: the in-place upgrade to
 schema 2 is one-way and 2.1 refuses the upgraded file. Custom `BudgetLedger`

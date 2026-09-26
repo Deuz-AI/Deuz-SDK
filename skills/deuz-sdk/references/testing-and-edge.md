@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:c025621e10fd
      sources: packages/core/src/testing.ts, src/types/{config,deps,methods,stream,tool}.ts, src/internal/resolve-call.ts,
      src/core/resilience.ts, src/inference/tool-loop.ts, src/{openai,anthropic}.ts, tooling/check-runtime-compat.mjs,
      packages/core/test/{testing,tool-loop}.test.ts, docs/content/docs/advanced/edge.mdx,
