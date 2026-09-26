@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/07-native-agent",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Native runAgent: a validated structured output and an approval that suspends and resumes.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
