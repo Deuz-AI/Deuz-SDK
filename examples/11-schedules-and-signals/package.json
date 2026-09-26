@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/11-schedules-and-signals",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Cron ticks deduplicated by a durable SQLite claim, and an HMAC-verified webhook with handleSignal.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
