@@ -25,6 +25,7 @@ import type { MemoryHit, MemoryKind, MemoryRecord, MemoryScope, MemoryStore } fr
 import type { AgentCheckpoint, SessionStore } from '../types/session';
 import type { RunRecord, RunStore } from '../types/runtime';
 import { cosineSimilarity, decodeVector, encodeVector, rankFuse } from '../internal/vector';
+import { ensureBusyTimeout } from './sqlite-open';
 
 // ===================================================================
 // The structural driver seam
@@ -541,6 +542,17 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
 
   const open = async (): Promise<SqliteHandle> => {
     const db = await openDatabase(options);
+    try {
+      return prepare(db);
+    } catch (error) {
+      // An injected handle stays open: the next call retries on it.
+      if (!options.database) db.close();
+      throw error;
+    }
+  };
+
+  const prepare = (db: SqliteDatabaseLike): SqliteHandle => {
+    ensureBusyTimeout(db);
     const handle = createHandle(db);
     if (options.path !== ':memory:' && options.wal !== false) {
       try {
@@ -568,7 +580,16 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
     return handle;
   };
 
-  const handle = (): Promise<SqliteHandle> => (opening ??= open());
+  const handle = (): Promise<SqliteHandle> => {
+    if (!opening) {
+      opening = open();
+      // A failed open must not poison the pack for the rest of the process.
+      opening.catch(() => {
+        opening = undefined;
+      });
+    }
+    return opening;
+  };
 
   // --- memory ------------------------------------------------------
 

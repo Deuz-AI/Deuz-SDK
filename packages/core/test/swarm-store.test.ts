@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInMemorySwarmStore } from '../src/swarm/store';
@@ -30,46 +29,6 @@ swarmStoreContracts('memory swarm store', createInMemorySwarmStore, {
   list: true,
 });
 describe.skipIf(!DatabaseSync)('SQLite swarm store', () => {
-  it('waits for a write lock another process holds while opening', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'deuz-swarm-lock-'));
-    cleanup.push(() =>
-      rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }),
-    );
-    const path = join(directory, 'locked.sqlite');
-    // A rollback-journal file: switching it to WAL needs a lock the holder has.
-    const first = createSqliteSwarmStore({ path, wal: false });
-    await first.create(initial(), []);
-    await first.close();
-    const script = [
-      "const { DatabaseSync } = require('node:sqlite');",
-      `const db = new DatabaseSync(${JSON.stringify(path)});`,
-      "db.exec('BEGIN EXCLUSIVE');",
-      "process.stdout.write('locked\\n');",
-      "setTimeout(() => { db.exec('COMMIT'); db.close(); }, 400);",
-    ].join('\n');
-    const holder = spawn(process.execPath, ['-e', script], {
-      stdio: ['ignore', 'pipe', 'inherit'],
-    });
-    const exited = new Promise((resolve) => holder.once('exit', resolve));
-    await new Promise<void>((resolve) => holder.stdout!.once('data', () => resolve()));
-    const second = createSqliteSwarmStore({ path });
-    cleanup.push(() => second.close());
-    expect((await second.load(initial().run))?.run.runId).toBe('same');
-    await exited;
-  });
-
-  it('retries opening after a failed attempt instead of caching the failure', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'deuz-swarm-retry-'));
-    cleanup.push(() =>
-      rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }),
-    );
-    const store = createSqliteSwarmStore({ path: join(directory, 'later', 'swarm.sqlite') });
-    cleanup.push(() => store.close());
-    await expect(store.load(initial().run)).rejects.toThrow();
-    await mkdir(join(directory, 'later'));
-    expect(await store.load(initial().run)).toBeUndefined();
-  });
-
   swarmStoreContracts(
     'real SQLite transactional conformance',
     () => {

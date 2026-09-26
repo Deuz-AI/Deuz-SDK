@@ -5,6 +5,7 @@
  * an agent run save is a compare-and-set on its revision. Node-only.
  */
 import type { SqliteDatabaseLike, SqliteStatementLike } from './store-sqlite';
+import { ensureBusyTimeout } from './sqlite-open';
 import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
 import type { Clock } from '../types/deps';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/lease';
@@ -81,9 +82,9 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
         db = new module.DatabaseSync(options.path);
       }
       try {
+        ensureBusyTimeout(db);
         if (options.path !== ':memory:' && options.wal !== false)
           db.exec('PRAGMA journal_mode = WAL');
-        db.exec('PRAGMA busy_timeout = 5000');
         transaction(db, () => {
           db.exec(
             'CREATE TABLE IF NOT EXISTS deuz_ops_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)',
@@ -105,10 +106,15 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
         });
         return db;
       } catch (error) {
-        db.close();
+        // An injected handle stays open: the next call retries on it.
+        if (!options.database) db.close();
         throw error;
       }
     })();
+    // A failed open must not poison the store for the rest of the process.
+    opening.catch(() => {
+      opening = undefined;
+    });
     return opening;
   };
   const use = async <T>(operation: (db: SqliteDatabaseLike) => T): Promise<T> => {
@@ -237,8 +243,9 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
         await new Promise<void>((resolve) => {
           drained = resolve;
         });
-      if (opening) (await opening).close();
-      else options.database?.close();
+      // A failed open already closed a handle the store made itself.
+      const db = await opening?.catch(() => undefined);
+      (db ?? options.database)?.close();
       statements.clear();
     },
   };

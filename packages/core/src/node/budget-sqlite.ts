@@ -4,6 +4,7 @@
  * over-admitting. Its private schema version never uses PRAGMA user_version.
  */
 import type { SqliteDatabaseLike, SqliteStatementLike } from './store-sqlite';
+import { ensureBusyTimeout } from './sqlite-open';
 import type { Clock } from '../types/deps';
 import type { BudgetStore, BudgetStoreReservation } from '../types/budget-store';
 import {
@@ -86,21 +87,21 @@ export function createSqliteBudgetStore(options: SqliteBudgetStoreOptions): Sqli
         };
         db = new module.DatabaseSync(options.path);
       }
-      database = db;
-      if (options.path !== ':memory:' && options.wal !== false)
-        db.exec('PRAGMA journal_mode = WAL');
-      db.exec('PRAGMA busy_timeout = 5000');
-      transaction(db, () => {
-        db.exec(
-          'CREATE TABLE IF NOT EXISTS deuz_budget_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)',
-        );
-        const row = db
-          .prepare('SELECT version FROM deuz_budget_schema WHERE singleton = 1')
-          .get() as { version: number } | undefined;
-        if (row && row.version !== SCHEMA_VERSION)
-          throw new Error('Unsupported SQLite budget schema version');
-        if (row) return;
-        db.exec(`CREATE TABLE IF NOT EXISTS deuz_budget_scopes (
+      try {
+        ensureBusyTimeout(db);
+        if (options.path !== ':memory:' && options.wal !== false)
+          db.exec('PRAGMA journal_mode = WAL');
+        transaction(db, () => {
+          db.exec(
+            'CREATE TABLE IF NOT EXISTS deuz_budget_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)',
+          );
+          const row = db
+            .prepare('SELECT version FROM deuz_budget_schema WHERE singleton = 1')
+            .get() as { version: number } | undefined;
+          if (row && row.version !== SCHEMA_VERSION)
+            throw new Error('Unsupported SQLite budget schema version');
+          if (row) return;
+          db.exec(`CREATE TABLE IF NOT EXISTS deuz_budget_scopes (
           key TEXT PRIMARY KEY, window_ms INTEGER, buckets INTEGER NOT NULL, bucket_ms INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS deuz_budget_counters (
           key TEXT NOT NULL, bucket INTEGER NOT NULL, model_id TEXT NOT NULL,
@@ -109,10 +110,22 @@ export function createSqliteBudgetStore(options: SqliteBudgetStoreOptions): Sqli
           request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, model_id TEXT NOT NULL,
           tokens INTEGER NOT NULL, usd REAL NOT NULL, state TEXT NOT NULL, charges TEXT NOT NULL,
           actual_tokens INTEGER, actual_usd REAL, outcome TEXT NOT NULL, created_at INTEGER NOT NULL);`);
-        db.exec(`INSERT INTO deuz_budget_schema(singleton, version) VALUES(1, ${SCHEMA_VERSION})`);
-      });
+          db.exec(
+            `INSERT INTO deuz_budget_schema(singleton, version) VALUES(1, ${SCHEMA_VERSION})`,
+          );
+        });
+      } catch (error) {
+        // An injected handle stays open: the next call retries on it.
+        if (!options.database) db.close();
+        throw error;
+      }
+      database = db;
       return db;
     })();
+    // A failed open must not poison the store for the rest of the process.
+    opening.catch(() => {
+      opening = undefined;
+    });
     return opening;
   };
   const use = async <T>(operation: (db: SqliteDatabaseLike) => T): Promise<T> => {
