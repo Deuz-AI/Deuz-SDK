@@ -268,6 +268,15 @@ compare-and-set rejects anything later. `cancel` and `drain` signals sent
 through the provider stop or drain the run like `handle.cancel()` and
 `handle.drain()`.
 
+A `'cancel'` that reaches the run after its holder's last renewal stays queued
+with the provider. The next executor takes it when it claims the run, a new run
+under the same key included, and stops the run with reason `'cancelled'` before
+its first model call. A cancel that lost the race to the run's completion, or
+that finds the run already stopped as cancelled, is dropped instead, so
+resuming a completed run for more generations is not cancelled by it. An
+executor that fails, or stops for another reason, after it received a cancel
+queues it again before it lets the lease go.
+
 ```ts
 import { resumeEvolve } from '@deuz-sdk/core/evolve';
 import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';

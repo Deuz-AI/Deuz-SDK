@@ -79,6 +79,25 @@ const started = async (handle: ReturnType<typeof evolve>) => {
   for await (const event of handle.events()) if (event.type === 'generation.started') return;
 };
 
+const key = { scope: 'tenant', runId: 'run' };
+const leaseKey = `evolve:${JSON.stringify(['tenant', 'run'])}`;
+const pause = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+/**
+ * A run stopped by a drain while a cancel sent through the provider was still
+ * queued: it reached the holder after its last renewal.
+ */
+async function drainedWithQueuedCancel(store: PopulationStore, provider: LeaseProvider) {
+  const { stage, open } = gated();
+  const first = evolve(options({ store, stages: [stage], lease: { provider, owner: 'a' } }));
+  await started(first);
+  expect(await provider.signal(leaseKey, 'cancel')).toBe(true);
+  const drained = first.drain();
+  open();
+  await drained;
+  expect(await first.result).toMatchObject({ status: 'stopped', reason: 'drained', generation: 0 });
+}
+
 describe('evolve leases (2.2)', () => {
   it('refuses a run another executor holds, and releases it when it finishes', async () => {
     const store = createInMemoryPopulationStore();
@@ -156,6 +175,120 @@ describe('evolve leases (2.2)', () => {
       open();
       expect(await handle.result).toMatchObject({ status: 'stopped', reason });
     }
+  });
+
+  it('drops a cancel that lost the race to the run end, so extending the run works', async () => {
+    const store = createInMemoryPopulationStore();
+    const provider = createInMemoryLeaseProvider();
+    const { stage, open } = gated();
+    const first = evolve(options({ store, stages: [stage], lease: { provider, owner: 'a' } }));
+    await started(first);
+    // The cancel reaches the provider mid-run, but the run completes before any heartbeat.
+    expect(await provider.signal(leaseKey, 'cancel')).toBe(true);
+    open();
+    expect(await first.result).toMatchObject({ status: 'completed', reason: 'generations' });
+    let renewals = 0;
+    const counting: LeaseProvider = {
+      ...provider,
+      async renew(lease, ttlMs) {
+        renewals++;
+        return provider.renew(lease, ttlMs);
+      },
+    };
+    const later = gated();
+    const extended = resumeEvolve(
+      options({
+        store,
+        stages: [later.stage],
+        generations: 4,
+        lease: { provider: counting, owner: 'b', ttlMs: 30 },
+      }),
+    );
+    // Heartbeats run while generation 3 waits on its evaluator.
+    for (let wait = 0; wait < 100 && renewals < 3; wait++) await pause();
+    later.open();
+    expect(await extended.result).toMatchObject({
+      status: 'completed',
+      reason: 'generations',
+      generation: 4,
+    });
+    // The stale request was delivered and dropped, not left for the next holder.
+    const probe = (await provider.acquire({ key: leaseKey, owner: 'x', ttlMs: 30_000 }))!;
+    expect(await provider.renew(probe, 30_000)).toMatchObject({ held: true, signals: [] });
+  });
+
+  it('applies a cancel queued after the last renewal before the next executor calls a model', async () => {
+    const store = createInMemoryPopulationStore();
+    const provider = createInMemoryLeaseProvider();
+    await drainedWithQueuedCancel(store, provider);
+    const resumed = await resumeEvolve(options({ store, lease: { provider, owner: 'b' } })).result;
+    expect(resumed).toMatchObject({
+      status: 'stopped',
+      reason: 'cancelled',
+      generation: 0,
+      modelCalls: 0,
+    });
+    expect(await store.loadRun(key)).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+  });
+
+  it('keeps a queued cancel for the next executor when a resume fails', async () => {
+    const store = createInMemoryPopulationStore();
+    const provider = createInMemoryLeaseProvider();
+    await drainedWithQueuedCancel(store, provider);
+    // Refused before it takes the queued signals.
+    await expect(
+      resumeEvolve(options({ store, mutationsPerGeneration: 3, lease: { provider, owner: 'b' } }))
+        .result,
+    ).rejects.toThrow(/shape/);
+    // Refused after it took them: it queues the cancel again.
+    await expect(
+      resumeEvolve(options({ store, initial: 'other', lease: { provider, owner: 'c' } })).result,
+    ).rejects.toThrow(/initial program/);
+    const resumed = await resumeEvolve(options({ store, lease: { provider, owner: 'd' } })).result;
+    expect(resumed).toMatchObject({ status: 'stopped', reason: 'cancelled', modelCalls: 0 });
+  });
+
+  it('queues a cancel again when the run fails to record the stop it asked for', async () => {
+    const inner = createInMemoryPopulationStore();
+    let refuse = true;
+    const flaky: PopulationStore = {
+      ...inner,
+      async saveRun(record) {
+        if (refuse && record.status === 'stopped' && record.reason === 'cancelled') {
+          refuse = false;
+          throw new Error('store down');
+        }
+        return inner.saveRun(record);
+      },
+    };
+    const provider = createInMemoryLeaseProvider();
+    const { stage } = gated();
+    const handle = evolve(
+      options({ store: flaky, stages: [stage], lease: { provider, owner: 'a', ttlMs: 30 } }),
+    );
+    await started(handle);
+    // The next heartbeat delivers it, and saving the stop fails.
+    expect(await provider.signal(leaseKey, 'cancel')).toBe(true);
+    await expect(handle.result).rejects.toThrow('store down');
+    expect(await inner.loadRun(key)).toMatchObject({ status: 'failed' });
+    const resumed = await resumeEvolve(options({ store: inner, lease: { provider, owner: 'b' } }))
+      .result;
+    expect(resumed).toMatchObject({ status: 'stopped', reason: 'cancelled', modelCalls: 0 });
+  });
+
+  it('lets a run stopped as cancelled resume despite a cancel that raced that stop', async () => {
+    const store = createInMemoryPopulationStore();
+    const provider = createInMemoryLeaseProvider();
+    const { stage, open } = gated();
+    const first = evolve(options({ store, stages: [stage], lease: { provider, owner: 'a' } }));
+    await started(first);
+    // A cancel through the provider races a local cancel, which stops the run first.
+    expect(await provider.signal(leaseKey, 'cancel')).toBe(true);
+    await first.cancel();
+    open();
+    expect(await first.result).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+    const resumed = await resumeEvolve(options({ store, lease: { provider, owner: 'b' } })).result;
+    expect(resumed).toMatchObject({ status: 'completed', reason: 'generations', generation: 2 });
   });
 
   it('rejects a lease ttl too short to renew', () => {

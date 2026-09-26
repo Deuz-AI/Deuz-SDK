@@ -369,10 +369,16 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
     // executor as it stands; saveRun's generation check fences the rest.
     const leasing = options.lease;
     const leaseTtl = leasing?.ttlMs ?? 30_000;
+    const leaseKey = `evolve:${JSON.stringify([key.scope, key.runId])}`;
     let held: Lease | undefined;
     let leaseLost = false;
     let beating = true;
     let stopBeat: (() => void) | undefined;
+    let renewing: Promise<void> | undefined;
+    // A renewal delivered a cancel for this run (2.2). Unless the run completes
+    // or stops as cancelled, it is queued again before the lease is let go.
+    let cancelDelivered = false;
+    let cancelMoot = false;
     const lose = () => {
       leaseLost = true;
       writeFailure ??= new EvolveLeaseError('lost');
@@ -382,6 +388,8 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
       if (!beating || !held) return;
       try {
         const renewal = await leasing!.provider.renew(held, leaseTtl);
+        // Noted even after the run stopped: the release queues it again.
+        if (renewal.held && renewal.signals.includes('cancel')) cancelDelivered = true;
         if (!beating) return;
         if (!renewal.held) return lose();
         held = renewal.lease;
@@ -402,7 +410,9 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
     const beat = () => {
       if (beating && held)
         stopBeat = deps.clock.setTimeout(
-          () => void renewLease(),
+          () => {
+            renewing = renewLease();
+          },
           Math.max(1, Math.floor(leaseTtl / 3)),
         );
     };
@@ -423,6 +433,8 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
     ): Promise<EvolveResult> => {
       run = { ...run, status, reason };
       await saveRun();
+      // Once the run completed or stopped as cancelled, a cancel changes nothing.
+      if (status === 'completed' || reason === 'cancelled') cancelMoot = true;
       emit({ type: 'run.finished', status, reason });
       if (run.bestId) await load([run.bestId]);
       return {
@@ -913,12 +925,11 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
     try {
       if (leasing) {
         held = await leasing.provider.acquire({
-          key: `evolve:${JSON.stringify([key.scope, key.runId])}`,
+          key: leaseKey,
           owner: leasing.owner ?? deps.generateId(),
           ttlMs: leaseTtl,
         });
         if (!held) throw new EvolveLeaseError('held');
-        beat();
       }
       if (mode === 'create') {
         const seed = options.seed !== undefined ? String(options.seed) : deps.generateId();
@@ -958,6 +969,26 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
         if (options.seed !== undefined && String(options.seed) !== loaded.seed)
           throw new Error('The resumed run was recorded with a different seed');
         run = loaded;
+      }
+      if (leasing && held) {
+        // Take the signals queued under the run's key (2.2), as the swarm's
+        // claim does: a 'cancel' outlives the holder it was sent to. One that
+        // lost the race to the run's end, or found it stopped as cancelled
+        // already, is dropped; any other stops the run before a model call.
+        const renewal = await leasing.provider.renew(held, leaseTtl);
+        if (!renewal.held) throw new EvolveLeaseError('held');
+        held = renewal.lease;
+        if (renewal.signals.includes('drain')) draining = true;
+        if (
+          renewal.signals.includes('cancel') &&
+          run.status !== 'completed' &&
+          !(run.status === 'stopped' && run.reason === 'cancelled')
+        ) {
+          cancelDelivered = true;
+          stopReason ??= 'cancelled';
+          controller.abort(new Error('Evolve cancelled'));
+        }
+        beat();
       }
       owned = true;
       const persist = (ledger: BudgetLedgerSnapshot) =>
@@ -1092,6 +1123,12 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
     } finally {
       beating = false;
       stopBeat?.();
+      // A delivered cancel the run did not end on, including one a renewal
+      // still in flight brings, goes back in the queue before the lease is let
+      // go (2.2), so the next executor still applies it.
+      await renewing;
+      if (held && cancelDelivered && !cancelMoot)
+        await leasing!.provider.signal(leaseKey, 'cancel').catch(() => false);
       if (held && !leaseLost) await leasing!.provider.release(held).catch(() => {});
     }
   }
