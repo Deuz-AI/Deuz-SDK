@@ -39,7 +39,14 @@ test('scheduler', () => {
   expectTypeOf(scheduler).toEqualTypeOf<Scheduler>();
   expectTypeOf(scheduler.tick).returns.resolves.toEqualTypeOf<ScheduleTickResult>();
   expectTypeOf(scheduler.start).returns.resolves.toBeVoid();
-  expectTypeOf(createInMemoryClaim()).toEqualTypeOf<ScheduleClaim>();
+  expectTypeOf(createInMemoryClaim()).toExtend<ScheduleClaim>();
+  expectTypeOf(createInMemoryClaim().release).toEqualTypeOf<(key: string) => Promise<void>>();
+  // A plain function is still a claim; `release` is optional.
+  expectTypeOf<(key: string) => boolean>().toExtend<ScheduleClaim>();
+  expectTypeOf<(key: string) => Promise<boolean>>().toExtend<HandleSignalOptions['dedupe']>();
+  expectTypeOf<ScheduleClaim['release']>().toEqualTypeOf<
+    ((key: string) => void | Promise<void>) | undefined
+  >();
   expectTypeOf<ScheduleOccurrence>().toEqualTypeOf<{
     readonly id: string;
     readonly at: number;

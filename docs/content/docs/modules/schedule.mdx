@@ -83,6 +83,11 @@ for (const occurrence of result.occurrences) {
 `{ status: 'failed', phase: 'run' | 'claim', error }` for that occurrence, and
 the others still run. A claim that answers `false` gives `status: 'duplicate'`.
 
+A failed run keeps its claim, so no tick or process runs that occurrence
+again: a run may have done part of its work before it threw. To let another
+process retry it, give the key back yourself in the run's `catch` with
+`claim.release(occurrence.key)`; `createInMemoryClaim()` has `release`.
+
 Each tick evaluates the window `(from, now]`. The first tick of a scheduler
 looks back `lookbackMs` (default 60 000 ms, one cron minute, so a trigger that
 fires a few seconds late still catches its minute). Every later tick starts
@@ -258,12 +263,12 @@ console.log(custom); // { ok: false, reason: 'malformed-signature' }
 `handleSignal` verifies, dedupes and dispatches one request, and answers with
 the status the sender expects:
 
-| Status | When                                                                |
-| ------ | ------------------------------------------------------------------- |
-| `401`  | the verifier rejected the request (`{ ok: false, reason }`)         |
-| `200`  | `dedupe(key)` answered `false`: a redelivery; nothing is dispatched |
-| `202`  | `dispatch` resolved                                                 |
-| `500`  | `verify`, `key`, `dedupe` or `dispatch` threw                       |
+| Status | When                                                                                 |
+| ------ | ------------------------------------------------------------------------------------ |
+| `401`  | the verifier rejected the request (`{ ok: false, reason }`)                          |
+| `200`  | `dedupe(key)` answered `false`: a redelivery; nothing is dispatched                  |
+| `202`  | `dispatch` resolved                                                                  |
+| `500`  | `verify`, `key`, `dedupe` or `dispatch` threw; a failed dispatch first frees the key |
 
 The key defaults to `sha256:` plus the hex SHA-256 of the body; derive a better
 one from the sender's delivery id when there is one.
@@ -287,8 +292,11 @@ export async function POST(request: Request): Promise<Response> {
 ```
 
 <Callout type="warn" title="Dedupe happens before dispatch">
-  The key is claimed before `dispatch` runs, so a dispatch that throws answers `500` and the
-  sender's retry is then seen as a duplicate. Keep `dispatch` short — enqueue the work, or start a
-  durable run whose run id is the key — or skip `dedupe` and let an idempotent dispatch (a swarm run
-  with `runId: key`, ignoring `SwarmConflictError`) absorb redeliveries.
+  The key is claimed before `dispatch` runs. When `dispatch` throws, `handleSignal` gives the key
+  back through the claim's `release` and answers `500`, so the sender's retry dispatches again.
+  `createInMemoryClaim()` has `release`; a claim that is a plain function does not, and then the
+  retry is answered as a duplicate. A dispatch that threw
+  after starting work may see that work again on the retry, so keep `dispatch` short — enqueue the
+  work, or start a durable run whose run id is the key — or skip `dedupe` and let an idempotent
+  dispatch (a swarm run with `runId: key`, ignoring `SwarmConflictError`) absorb redeliveries.
 </Callout>

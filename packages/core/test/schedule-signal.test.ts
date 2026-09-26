@@ -334,6 +334,83 @@ describe('handleSignal', () => {
     expect(await dedupe('d-1')).toBe(false);
   });
 
+  describe('when dispatch throws', () => {
+    const delivery = () =>
+      new Request('https://example.test/hook', {
+        method: 'POST',
+        body: payload,
+        headers: { 'x-github-delivery': 'd-1' },
+      });
+    const byDelivery = ({ request }: { request: Request }) =>
+      request.headers.get('x-github-delivery') ?? undefined;
+    const failingOnce = () => {
+      let calls = 0;
+      return vi.fn(async () => {
+        if (++calls === 1) throw new Error('queue full');
+      });
+    };
+
+    it("releases the claimed key, so the sender's retry dispatches", async () => {
+      const dispatch = failingOnce();
+      const options = {
+        verify: accept(payload),
+        dedupe: createInMemoryClaim(),
+        key: byDelivery,
+        dispatch,
+      };
+      const first = await handleSignal(delivery(), options);
+      expect(first.status).toBe(500);
+      expect(await first.json()).toEqual({ ok: false, reason: 'dispatch-error' });
+      const retry = await handleSignal(delivery(), options);
+      expect(retry.status).toBe(202);
+      expect(await retry.json()).toEqual({ ok: true, key: 'd-1' });
+      expect(dispatch).toHaveBeenCalledTimes(2);
+      // Dispatched once successfully: the next redelivery is a duplicate.
+      const again = await handleSignal(delivery(), options);
+      expect(again.status).toBe(200);
+      expect(dispatch).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the key of a claim without release (a plain function)', async () => {
+      const seen = new Set<string>();
+      const dedupe = (key: string) => !seen.has(key) && Boolean(seen.add(key));
+      const dispatch = failingOnce();
+      const options = { verify: accept(payload), dedupe, key: byDelivery, dispatch };
+      expect((await handleSignal(delivery(), options)).status).toBe(500);
+      expect((await handleSignal(delivery(), options)).status).toBe(200);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    });
+
+    it('still answers 500 when the release itself fails', async () => {
+      const dedupe = Object.assign(() => true, {
+        release: vi.fn(async () => {
+          throw new Error('claim store down');
+        }),
+      });
+      const response = await handleSignal(delivery(), {
+        verify: accept(payload),
+        dedupe,
+        key: byDelivery,
+        dispatch: failingOnce(),
+      });
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({ ok: false, reason: 'dispatch-error' });
+      expect(dedupe.release).toHaveBeenCalledWith('d-1');
+    });
+
+    it('never releases a key it did not claim', async () => {
+      const dedupe = Object.assign(() => false, { release: vi.fn() });
+      const response = await handleSignal(delivery(), {
+        verify: accept(payload),
+        dedupe,
+        key: byDelivery,
+        dispatch: failingOnce(),
+      });
+      expect(response.status).toBe(200);
+      expect(dedupe.release).not.toHaveBeenCalled();
+    });
+  });
+
   it('answers 500 when verify, dedupe or dispatch throws', async () => {
     const verifyThrows = await handleSignal(post(), {
       verify: () => {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createInMemoryClaim, createScheduler } from '../src/schedule';
 import type { ScheduleOccurrence, ScheduleTickResult } from '../src/schedule';
 import type { Clock } from '../src/types/deps';
@@ -230,6 +230,32 @@ describe('createScheduler().tick', () => {
     expect(runs.map((r) => r.id)).toEqual(['good']);
   });
 
+  it('keeps the claim of a failed run, so no process runs that occurrence again', async () => {
+    const claim = createInMemoryClaim();
+    const release = vi.spyOn(claim, 'release');
+    const failing = createScheduler({
+      schedules: [
+        {
+          id: 'digest',
+          cron: '0 * * * *',
+          run: () => {
+            throw new Error('boom');
+          },
+        },
+      ],
+      claim,
+    });
+    const first = await failing.tick(at('2026-01-01T12:00:30Z'));
+    expect(first.occurrences).toMatchObject([{ status: 'failed', phase: 'run' }]);
+    expect(release).not.toHaveBeenCalled();
+    // Another process looking back over the same minute sees a duplicate.
+    const { runs, run } = recorder();
+    const other = createScheduler({ schedules: [{ id: 'digest', cron: '0 * * * *', run }], claim });
+    const second = await other.tick(at('2026-01-01T12:00:50Z'));
+    expect(second.occurrences.map((o) => o.status)).toEqual(['duplicate']);
+    expect(runs).toEqual([]);
+  });
+
   it('awaits async runs before the tick resolves', async () => {
     let finished = false;
     const scheduler = createScheduler({
@@ -416,6 +442,16 @@ describe('createInMemoryClaim', () => {
     expect(await claim('a')).toBe(true);
     expect(await claim('a')).toBe(false);
     expect(await claim('b')).toBe(true);
+  });
+
+  it('gives a key back on release', async () => {
+    const claim = createInMemoryClaim();
+    expect(await claim('a')).toBe(true);
+    await claim.release('a');
+    expect(await claim('a')).toBe(true);
+    expect(await claim('a')).toBe(false);
+    await claim.release('never-claimed');
+    expect(await claim('never-claimed')).toBe(true);
   });
 
   it('forgets the oldest keys beyond max', async () => {

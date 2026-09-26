@@ -20,8 +20,17 @@ export interface ScheduleDefinition {
 /**
  * Takes the right to run an occurrence: resolves true for the first caller of
  * a key and false for every later one. Share a durable one across processes.
+ * Any function of that shape is a claim.
  */
-export type ScheduleClaim = (key: string) => boolean | Promise<boolean>;
+export interface ScheduleClaim {
+  (key: string): boolean | Promise<boolean>;
+  /**
+   * Gives a claimed key back, so the next claim of it succeeds again.
+   * `handleSignal` calls it when the dispatch it claimed a key for throws. A
+   * claim without it keeps every key it granted.
+   */
+  release?(key: string): void | Promise<void>;
+}
 
 /**
  * Which due occurrences a tick runs when more than one fell inside its window
@@ -89,12 +98,18 @@ export interface Scheduler {
 const DEFAULT_WINDOW_MS = 60_000;
 const CATCH_UP: readonly ScheduleCatchUp[] = ['latest', 'all', 'none'];
 
-/** The default claim: remembers the most recent `max` (default 10 000) keys. */
-export function createInMemoryClaim(options: { max?: number } = {}): ScheduleClaim {
+/**
+ * The default claim: remembers the most recent `max` (default 10 000) keys.
+ * `release(key)` forgets one.
+ */
+export function createInMemoryClaim(options: { max?: number } = {}): {
+  (key: string): Promise<boolean>;
+  release(key: string): Promise<void>;
+} {
   const max = options.max ?? 10_000;
   if (!Number.isSafeInteger(max) || max < 1) throw new TypeError('max must be a positive integer');
   const seen = new Set<string>();
-  return async (key) => {
+  const claim = async (key: string): Promise<boolean> => {
     if (seen.has(key)) return false;
     seen.add(key);
     if (seen.size > max) {
@@ -103,6 +118,11 @@ export function createInMemoryClaim(options: { max?: number } = {}): ScheduleCla
     }
     return true;
   };
+  return Object.assign(claim, {
+    async release(key: string): Promise<void> {
+      seen.delete(key);
+    },
+  });
 }
 
 function assertDuration(value: number | undefined, name: string, min: number): void {
