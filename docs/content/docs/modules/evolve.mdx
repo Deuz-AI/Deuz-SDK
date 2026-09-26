@@ -182,6 +182,19 @@ reservation would exceed the budget, the run commits what it already has and
 stops with `status: 'stopped'` and `reason: 'budget'`. `result.totals` holds
 the spend. A resumed run can tighten the stored budget but never loosen it.
 
+A model error that every later call would repeat fails the run. That covers an
+execution policy refusal, such as an elapsed `policy.deadlineAt` or a model
+outside `policy.allowedModels`, any other fatal execution error apart from
+budget exhaustion, and the configuration errors `AuthenticationError`,
+`ModelNotFoundError` and `UnsupportedCapabilityError`. The slots already in
+flight finish and keep their candidates, the run is saved with
+`status: 'failed'`, and `handle.result` rejects with the error, so
+`resumeEvolve` can continue once the cause is fixed. Other model errors, such
+as a rate limit that outlasts its retries or a request the provider rejects as
+invalid, reject only that candidate with `rejection.kind: 'model'`.
+`result.modelCalls` counts the calls that sent a request: a refusal before the
+request, including an open circuit breaker, is not a call.
+
 `stopWhen.targetScore` ends the run with reason `'target'` once the best score
 reaches it. `stopWhen.plateau` ends it with reason `'plateau'` after that many
 generations without improvement. `handle.drain()` finishes the current

@@ -493,6 +493,137 @@ describe('evolve: stopping', () => {
   });
 });
 
+describe('evolve: model errors', () => {
+  const key = { scope: 'tenant', runId: 'run' };
+
+  /** A model whose provider answers every request with the same HTTP error. */
+  function answering(status: number, message: string) {
+    const base = createMockModel({ responses: [] });
+    return counted(
+      attachConfig(
+        { ...base },
+        {
+          ...readConfig(base)!,
+          fetch: (async () =>
+            new Response(JSON.stringify({ error: { message } }), {
+              status,
+              headers: { 'content-type': 'application/json' },
+            })) as typeof fetch,
+        },
+      ),
+    );
+  }
+
+  it.each([
+    ['an elapsed deadline', { deadlineAt: 5 }, 'deadline_exceeded'],
+    ['a disallowed model', { allowedModels: ['another-model'] }, 'model_not_allowed'],
+  ])('fails the run on %s without calling the model', async (_label, policy, code) => {
+    const { model, counter } = grower();
+    const store = createInMemoryPopulationStore();
+    const handle = evolve(
+      options({ store, models: [{ model }], policy, generations: 4, mutationsPerGeneration: 2 }),
+    );
+    const events = collect(handle.events());
+    await expect(handle.result).rejects.toMatchObject({ name: 'ExecutionPolicyError', code });
+    expect(counter.calls).toBe(0);
+    expect(await store.loadRun(key)).toMatchObject({
+      status: 'failed',
+      reason: 'error',
+      generation: 0,
+    });
+    expect(await store.listCandidates(key, { generation: 1 })).toEqual([]);
+    expect((await events).at(-1)).toEqual({
+      type: 'run.finished',
+      status: 'failed',
+      reason: 'error',
+    });
+  });
+
+  it.each([
+    [401, 'AuthenticationError'],
+    [403, 'AuthenticationError'],
+    [404, 'ModelNotFoundError'],
+  ])('fails the run when the provider answers %i', async (status, name) => {
+    const { model, counter } = answering(status, 'Incorrect API key provided.');
+    const store = createInMemoryPopulationStore();
+    const handle = evolve(
+      options({ store, models: [{ model }], generations: 4, mutationsPerGeneration: 2 }),
+    );
+    await expect(handle.result).rejects.toMatchObject({ name, statusCode: status });
+    // The two slots of generation 1 were in flight together; nothing ran after them.
+    expect(counter.calls).toBe(2);
+    expect(await store.loadRun(key)).toMatchObject({
+      status: 'failed',
+      error: 'Incorrect API key provided.',
+    });
+    expect(await store.listCandidates(key, { generation: 1 })).toEqual([]);
+  });
+
+  it('fails the run on a missing API key without sending a request', async () => {
+    const { model, counter } = grower();
+    const { apiKey: _omitted, ...keyless } = readConfig(model)!;
+    const handle = evolve(
+      options({ models: [{ model: attachConfig({ ...model }, keyless) }], generations: 4 }),
+    );
+    await expect(handle.result).rejects.toMatchObject({ name: 'AuthenticationError' });
+    expect(counter.calls).toBe(0);
+  });
+
+  it('keeps the paid work of in-flight slots when another slot fails the run', async () => {
+    const good = grower();
+    const store = createInMemoryPopulationStore();
+    const ensemble = (second: LanguageModel) =>
+      options({ store, models: [{ model: good.model }, { model: second }], generations: 1 });
+    // UCB1 tries both models in generation 1: slot 0 draws the working one.
+    await expect(
+      evolve(ensemble(answering(401, 'Incorrect API key provided.').model)).result,
+    ).rejects.toMatchObject({ name: 'AuthenticationError' });
+    expect((await store.listCandidates(key, { generation: 1 })).map((item) => item.id)).toEqual([
+      'g1-i0-s0',
+    ]);
+    // With the key fixed, the stored slot replays and only the failed one is paid again.
+    const fixed = grower();
+    const result = await resumeEvolve(ensemble(fixed.model)).result;
+    expect(result).toMatchObject({ status: 'completed', generation: 1, modelCalls: 1 });
+    expect(good.counter.calls).toBe(1);
+    expect(fixed.counter.calls).toBe(1);
+  });
+
+  it('rejects only the candidate on an error its own prompt may cause, and counts the call', async () => {
+    const { model, counter } = answering(400, 'The prompt is not valid.');
+    const store = createInMemoryPopulationStore();
+    const result = await evolve(options({ store, models: [{ model }], generations: 1 })).result;
+    expect(result).toMatchObject({ status: 'completed', reason: 'generations', modelCalls: 2 });
+    expect(counter.calls).toBe(2);
+    const children = await store.listCandidates(key, { generation: 1 });
+    expect(children.map((child) => child.rejection)).toEqual([
+      { kind: 'model', message: 'The prompt is not valid.' },
+      { kind: 'model', message: 'The prompt is not valid.' },
+    ]);
+  });
+
+  it('does not count a call that an open circuit breaker refused', async () => {
+    const { model, counter } = grower();
+    const store = createInMemoryPopulationStore();
+    const result = await evolve(
+      options({
+        store,
+        models: [{ model }],
+        generations: 1,
+        deps: {
+          ...deps,
+          breakerStore: { get: () => ({ failures: 5, cooldownUntil: 2_000 }), set: () => {} },
+        },
+      }),
+    ).result;
+    expect(counter.calls).toBe(0);
+    expect(result).toMatchObject({ status: 'completed', modelCalls: 0 });
+    const children = await store.listCandidates(key, { generation: 1 });
+    expect(children.map((child) => child.rejection?.kind)).toEqual(['model', 'model']);
+    expect(children[0]!.rejection!.message).toMatch(/Circuit breaker open/);
+  });
+});
+
 describe('evolve: durable resume', () => {
   /** A store that dies on one generation commit, after every slot of it is stored. */
   function crashingOn(generation: number): PopulationStore & { armed: boolean } {

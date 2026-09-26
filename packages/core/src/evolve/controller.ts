@@ -12,8 +12,10 @@
  * Edge-safe: time and IDs come from `deps`, randomness from `./random`.
  */
 import { generateText } from '../generate';
+import { isDeuzError } from '../errors';
 import { embedMany } from '../inference/embed';
 import { childScopeId, createExecutionContext } from '../execution-policy';
+import { isFatalExecutionError } from '../internal/execution-error';
 import { mapWithConcurrency } from '../internal/p-limit';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { cosineSimilarity } from '../internal/vector';
@@ -198,6 +200,31 @@ function isBudgetExceeded(error: unknown): boolean {
     const item = current as { name?: unknown; code?: unknown; cause?: unknown };
     if (item.name === 'BudgetLedgerError' && item.code === 'budget_exceeded') return true;
     current = item.cause;
+  }
+  return false;
+}
+
+/** Configuration errors: every later call to the model fails the same way. */
+const CONFIGURATION_CODES = new Set([
+  'authentication',
+  'model_not_found',
+  'unsupported_capability',
+]);
+
+/**
+ * A model error that fails the run instead of one candidate: a policy refusal
+ * (an elapsed deadline, a disallowed model), an admission or persistence
+ * failure, or a configuration error. Errors a slot's own prompt may cause, and
+ * transient ones, stay that candidate's rejection.
+ */
+function isFatalModelError(error: unknown): boolean {
+  for (let current = error, depth = 0; current && depth < 8; depth++) {
+    if (
+      isFatalExecutionError(current) ||
+      (isDeuzError(current) && CONFIGURATION_CODES.has(current.code))
+    )
+      return true;
+    current = (current as { cause?: unknown }).cause;
   }
   return false;
 }
@@ -669,7 +696,10 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
         }
         if (controller.signal.aborted) return { skipped: 'aborted' };
         if (writeFailure) throw writeFailure;
-        modelCalls++;
+        // The run fails once the slots already in flight finish, keeping their paid work.
+        if (isFatalModelError(error)) throw error;
+        // An open circuit breaker fails fast without sending a request.
+        if (!(isDeuzError(error) && error.code === 'breaker_open')) modelCalls++;
         evaluation = rejected('model', message(error));
       }
       if (text !== undefined) {
