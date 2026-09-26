@@ -7,8 +7,6 @@ Two independent benchmarks, both reproducible end-to-end:
 | **100-point ranking** — 16 SDKs × 5 scenarios, self-assessed | [`scores.json`](./scores.json) | `assets/benchmark.png` / `-dark.png` | [`chart.py`](./chart.py) |
 | **Install footprint** — disk size + cold-import time, measured | [`results.json`](./results.json) | `assets/footprint.png` / `-dark.png` | [`measure.py`](./measure.py) |
 
-Turkish deep-dive for the 1.8 panel (historical): [`research-1.8.0.md`](./research-1.8.0.md).
-
 ## The 100-point ranking
 
 **Panel (16):** Vercel AI SDK, OpenAI SDK + Agents, Anthropic SDK + Agent SDK, LangChain + LangGraph, Claude Code, OpenAI Codex CLI, Mastra, Google Gemini CLI, **Deuz SDK** (self), Google Gemini SDK, LlamaIndex, Moonshot Kimi, CrewAI, Alibaba Qwen, DeepSeek, Zhipu GLM.
