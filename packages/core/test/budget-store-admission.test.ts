@@ -106,6 +106,20 @@ describe('ledger admission through a BudgetStore', () => {
     expect(ledger.snapshot().revision).toBe(0);
   });
 
+  it('settles the tokens of an unpriced call that reserved no USD', async () => {
+    const store = createInMemoryBudgetStore();
+    const ledger = createBudgetLedger({ admission: { store, scopes: [user(10_000)] } });
+    await ledger.reserve({ requestId: 'tokens-only', modelId: 'm', tokens: 4_100 });
+    await ledger.settleUsage('tokens-only', usage(15));
+    // Locally the USD stays unknown, but the store never held USD for it.
+    expect(ledger.get('tokens-only')?.state).toBe('unknown');
+    expect(await store.usage('user:1')).toEqual({ tokens: 15, usd: 0 });
+    // A later price completes the local record without a second store settlement.
+    await ledger.settleUsage('tokens-only', usage(15), { priceUsage: () => 0.01 });
+    expect(ledger.get('tokens-only')?.state).toBe('settled');
+    expect(await store.usage('user:1')).toEqual({ tokens: 15, usd: 0 });
+  });
+
   it('mirrors settlement, release and unknown usage to the store', async () => {
     const store = createInMemoryBudgetStore();
     const ledger = createBudgetLedger({ admission: { store, scopes: [user(1_000)] } });

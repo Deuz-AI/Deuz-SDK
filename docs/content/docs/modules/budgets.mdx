@@ -50,10 +50,12 @@ ledger's queue:
 2. The store admits the attempt against **every** persistent scope, or none. A
    denial in one scope charges nothing to the others.
 
-Settlement and release are mirrored to the store. When usage stays unknown —
-the provider reported no usage, or no price was available for a USD budget —
-the store keeps the full estimate held. Give native runs a `priceProvider` when a
-scope bounds USD, or every call keeps its USD estimate.
+Settlement and release are mirrored to the store. When the provider reports no
+usage, the store keeps the full estimate held. When the tokens are known but no
+price is, a call reserved with a USD estimate keeps its full hold too, because
+its cost is still unknown; a call reserved without one settles its tokens at
+once. Give native runs a `priceProvider` when a scope bounds USD, or every call
+keeps its estimate.
 
 Every request is idempotent by its request ID. Repeating an identical
 reservation returns the recorded outcome, a denial included; repeating it with

@@ -549,17 +549,28 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
 
   /**
    * Mirror a transition into `settled`; unknown usage keeps the store's hold.
-   * Undefined when there is nothing to mirror, so ledgers without persistent
-   * admission keep their exact queue timing.
+   * A request reserved without a USD estimate holds no USD in the store (no
+   * persistent scope can bound USD for it: those require the estimate), so it
+   * settles there as soon as its tokens are known, with zero USD, even while
+   * the local record waits for a price. Undefined when there is nothing to
+   * mirror, so ledgers without persistent admission keep their exact queue
+   * timing.
    */
   function mirrorSettlement(
     previous: BudgetReservation,
     next: BudgetReservation,
   ): Promise<void> | undefined {
-    if (!admission || next.state !== 'settled' || previous.state === 'settled') return undefined;
+    if (!admission || !settledInStore(next) || settledInStore(previous)) return undefined;
     const store = admission.store;
     return mirror(() =>
-      store.settle(next.requestId, { tokens: next.actual.tokens!, usd: next.actual.usd! }),
+      store.settle(next.requestId, { tokens: next.actual.tokens!, usd: next.actual.usd ?? 0 }),
+    );
+  }
+
+  function settledInStore(reservation: BudgetReservation): boolean {
+    return (
+      reservation.state === 'settled' ||
+      (reservation.reservation.usd === undefined && reservation.actual.tokens !== undefined)
     );
   }
 
