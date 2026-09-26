@@ -1,11 +1,12 @@
-<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
-     sources: packages/core/src/{autonomy,plan,verify,workspace,compute,browser,runtime}.ts,
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
+     sources: packages/core/src/{autonomy,plan,verify,workspace,compute,browser,runtime,evolve,schedule}.ts,
+     packages/core/src/evolve/*.ts, packages/core/src/schedule/*.ts, docs/content/docs/modules/{evolve,schedule}.mdx,
      packages/core/src/node/{workspace,compute,browser,runtime}.ts, packages/core/src/inference/agent-tool.ts,
      packages/core/src/types/{config,workspace,compute,browser,runtime,stream,tool}.ts, docs/content/docs/modules/autonomy.mdx, docs/content/docs/cookbooks/{autonomous-agent,coding-agent}.mdx -->
 
 # Autonomous agents: plan, act, verify
 
-**Load when:** building an agent that runs for many steps without a human in the turn — it decomposes its own goal, executes code or drives a browser, decides whether it is finished, keeps state outside the context window, or runs in the background and needs to survive a crash.
+**Load when:** building an agent that runs for many steps without a human in the turn — it decomposes its own goal, executes code or drives a browser, decides whether it is finished, keeps state outside the context window, or runs in the background and needs to survive a crash. Also: evolutionary search over a program (`evolve`, 2.2) and starting runs from cron or webhooks (`/schedule`, 2.2).
 
 ## The shape
 
@@ -22,6 +23,8 @@ There is no agent class and no second runtime. An autonomous run is the ordinary
 | Running while nobody is watching | `createRunManager` + `RunStore`, plus `session:` | `/runtime`, `/runtime/node`, `/durable` |
 | Live to-do panel, activity feed, mid-run steering | `emitPlanUpdate`, `emitActivity`, `createSteeringController` | `/runtime` |
 | Quality bought with tokens | `bestOfN`, `selfConsistency`, `parallelAgents` | `/autonomy` |
+| Searching for a better program (2.2) | `evolve`, `resumeEvolve`, a `PopulationStore` | `/evolve`, `/evolve/sqlite` |
+| Starting work from time or a webhook (2.2) | `createScheduler`, `handleSignal`, webhook verifiers | `/schedule` |
 
 ## Finishing: `doneWhen` runs before `verifyStep`
 
@@ -378,6 +381,86 @@ const { answer, votes } = await selfConsistency({
 const { results } = await parallelAgents({ model, tasks: urls.map((u) => `Summarise ${u}.`), concurrency: 10 });
 ```
 
+## Evolve: search over programs (2.2)
+
+`evolve` from `@deuz-sdk/core/evolve` (edge-safe) improves a program the way AlphaEvolve / OpenEvolve do: a model proposes a change to the code between `EVOLVE-BLOCK-START` / `EVOLVE-BLOCK-END` lines, a cascade of **your** evaluators scores it, and the best programs parent the next generation. It is a standalone controller, not a swarm and not the tool loop.
+
+```ts
+import { createInMemoryPopulationStore, evolve } from '@deuz-sdk/core/evolve';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const initial = 'def f(x):\n    # EVOLVE-BLOCK-START\n    return x\n    # EVOLVE-BLOCK-END\n';
+const diff = '<<<<<<< SEARCH\n    return x\n=======\n    x = x + 1\n    return x\n>>>>>>> REPLACE';
+
+const handle = evolve({
+  scope: 'tenant-a',
+  runId: 'grow-1',
+  initial,
+  instructions: 'Make f return as large a value as possible.',
+  stages: [
+    { name: 'parses', threshold: 1, evaluate: (program) => ({ score: program.includes('return') ? 1 : 0 }) },
+    { name: 'count', evaluate: (program) => ({ score: program.split('x = x + 1').length - 1 }) },
+  ],
+  models: [{ model: createMockModel({ responses: [{ text: diff }] }) }],
+  store: createInMemoryPopulationStore(), // createSqlitePopulationStore from /evolve/sqlite on Node
+  generations: 3,
+  mutationsPerGeneration: 2,
+  patch: { diff: 1 },
+  budget: { tokens: 200_000 }, // REQUIRED: tokens or usd
+  seed: 'demo',
+});
+const result = await handle.result;
+console.log(result.status, result.reason, result.best?.id, result.best?.score); // completed generations g3-i0-s0 3
+```
+
+- **Patches.** Per slot a type is drawn from `patch` (default `diff` 0.6 / `full` 0.3 / `cross` 0.1; passing `patch` zeroes omitted types). Each SEARCH must match exactly once inside an evolve block; otherwise the candidate is rejected (`rejection.kind: 'patch'`, `EvolvePatchError` codes `not_found`, `outside_evolve_block`, `ambiguous`, `marker_in_replace`, `frozen_changed`) and the run goes on. `parseEvolveBlocks`, `applySearchReplace`, `extractFullRewrite` and `buildMutationPrompt` are exported pure helpers.
+- **Cascade.** `stages` run in order and stop at the first score under its `threshold` or `passed: false`; put cheap checks first. Only candidates passing every stage are `accepted`. A throw or `timeoutMs` rejects with `rejection.kind: 'evaluation'`. Returned `artifacts` (stderr…) and `features` (in `[0, 1]`, for the MAP-Elites grid) feed the next prompt and the elite archive.
+- **Search.** `selection` (`'weighted'` default, `'power-law'`, `'beam'`, `{ boltzmann }`), `population` (`size`, `archiveSize`, `eliteRatio`, `exploreRatio`), `islands` (`{ count, migrationEvery, migrationRate, resetWeakestEvery? }`, ring migration), `novelty` (`{ embed, maxCosine = 0.99, judge? }`), `concurrency` (default 4). Several `models` are picked by a UCB1 bandit; `weight: 0` never picks one. Every draw is seeded: same `seed` + store + evaluators replays identically.
+- **Stops.** `budget` → `reason: 'budget'` (each mutation runs under a child execution scope named after its candidate, compacted per generation), `stopWhen.targetScore` → `'target'`, `stopWhen.plateau` → `'plateau'`, `handle.drain()` → `'drained'`, `handle.cancel()` / `signal` → `'cancelled'`, else `'generations'`.
+- **Resume.** Candidate IDs are `g{generation}-i{island}-s{slot}`, writes are idempotent and generations commit with a compare-and-set, so `resumeEvolve(sameOptions)` replays stored slots with **zero model calls** (`result.modelCalls`), and can extend a finished run with more `generations`. Resume refuses a changed `initial`, island count, `mutationsPerGeneration` or model count, and can only tighten the budget.
+- **Safety.** The controller never executes a candidate; your evaluators do. Sandbox them (worker, container, remote runtime) — the code is model-written.
+
+## Schedules and signals: starting work without a user (2.2)
+
+`@deuz-sdk/core/schedule` is edge-safe and never reads the host clock on its own. `parseCron` reads five-field **UTC** cron (lists, ranges, steps, names, macros; both day fields restricted means either matches). `createScheduler({ schedules, claim?, catchUp?, lookbackMs? })` runs due occurrences: call `tick(now)` from a platform cron trigger (Vercel cron, a Workers `scheduled` handler), or `start({ intervalMs, signal })` in a Node worker on `deps.clock`.
+
+```ts
+import { generateText } from '@deuz-sdk/core';
+import { createScheduler, handleSignal, verifyGitHubWebhook } from '@deuz-sdk/core/schedule';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const model = createMockModel({ responses: [{ text: 'Three PRs merged overnight.' }] });
+
+const scheduler = createScheduler({
+  schedules: [
+    {
+      id: 'morning-digest',
+      cron: '0 9 * * MON-FRI',
+      run: async (occurrence) => {
+        const { text } = await generateText({ model, prompt: 'Summarise the night.' });
+        console.log(occurrence.key, text); // key = `${id}@${at}`
+      },
+    },
+  ],
+});
+const tick = await scheduler.tick(Date.parse('2026-01-05T09:00:20Z'));
+console.log(tick.occurrences.map((o) => o.status)); // ['ran']
+
+// Webhooks: verify, dedupe, dispatch — 401 rejected, 200 duplicate, 202 dispatched, 500 threw.
+export async function POST(request: Request): Promise<Response> {
+  return handleSignal(request, {
+    verify: (r) => verifyGitHubWebhook(r, 'webhook-secret'),
+    key: ({ request: r }) => r.headers.get('x-github-delivery') ?? undefined,
+    dispatch: async ({ body, key }) => console.log('start run', key, body.length),
+  });
+}
+```
+
+- `tick` never throws for your code: a failing `run` / `claim` is `{ status: 'failed', phase }` for that occurrence; a claim answering `false` is `'duplicate'`.
+- **Dedupe across processes needs a durable `claim`.** The default is an in-memory set (one process only). A durable run store is already one: use `occurrence.key` as the swarm `runId` and treat `SwarmConflictError` as "already claimed", with `claim: () => true`.
+- `catchUp`: `'latest'` (default, newest due only), `'all'` (oldest first, capped by `maxCatchUp` = 100), `'none'` (newest only if within `graceMs`). A restarted process only sees `lookbackMs` (default 60 000); raise it together with a durable claim to recover missed occurrences.
+- Verifiers (`verifyGitHubWebhook`, `verifySlackRequest(req, secret, { now, toleranceSeconds })`, `verifyHmacSignature`) read the body once, use WebCrypto and constant-time comparison, and answer `{ ok: true, body }` or `{ ok: false, reason }`. `handleSignal` claims the key **before** dispatch: keep `dispatch` short (enqueue, or start a run whose `runId` is the key).
+
 ## How the two cookbooks compose this
 
 The **coding agent** is the skeleton: an orchestrator `generateText`/`streamChat` whose only tool is `agentTool({ name: 'coder', … })`, one shared `approveToolCall` that inherits into the sub-agent at every depth, `stopWhen: [totalTokensExceed(…), costExceeds(…)]` with `deps.priceProvider`, `compaction: 'auto'`, and `session: { store, runId }` so a killed process resumes with `resumeFromCheckpoint`. Sub-agent usage folds into the parent total, tagged by `meta.agentPath` in `onUsage`.
@@ -395,3 +478,5 @@ The **autonomous agent** keeps that skeleton and swaps in the autonomy seams: `p
 - [/docs/modules/compaction](/docs/modules/compaction) — what automatic compaction prunes, i.e. why a workspace beats a bigger context.
 - [/docs/reference/stream-protocol](/docs/reference/stream-protocol) — the wire encoding of `verify`, `false-finish`, `plan-update`, `activity`.
 - [/docs/modules/react-hooks](/docs/modules/react-hooks) — `plan`, `activity`, `verifications` and `falseFinishes` in `useChat`.
+- [/docs/modules/evolve](/docs/modules/evolve) — patches, the evaluation cascade, islands, novelty, budget, durable resume.
+- [/docs/modules/schedule](/docs/modules/schedule) — cron syntax, catch-up, durable dedupe with a swarm run, webhook verification.

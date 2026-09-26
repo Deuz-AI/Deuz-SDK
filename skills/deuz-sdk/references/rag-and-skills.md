@@ -1,5 +1,6 @@
-<!-- verified: 2026-09-20 against @deuz-sdk/core@2.1.0 · api-contract sha256:c301da6ab500
-     sources: packages/core/src/{rag.ts, rag-node.ts, skills.ts, skills/node.ts, parts.ts, ui.ts, node/store-postgres.ts},
+<!-- verified: 2026-09-26 against @deuz-sdk/core@2.1.0 + the 2.2 changesets · api-contract sha256:cb9f41a77273
+     sources: packages/core/src/{rag.ts, rag-node.ts, skills.ts, skills/node.ts, parts.ts, ui.ts, voyage.ts, node/store-postgres.ts},
+     packages/core/src/internal/rerank-http.ts,
      packages/core/src/types/{tool.ts, stream.ts, methods.ts, message.ts},
      docs/content/docs/modules/{rag.mdx, skills.mdx}, skills/deuz-sdk/rules/modules.md -->
 
@@ -197,7 +198,31 @@ interface VectorStore {
 
 ## The reranker seam — read this before you trust `topN`
 
-`retrieve` and `hybridRetrieve` accept `reranker?: Reranker`. **The default, `identityReranker`, is not a reranker**: it sorts candidates by the score they already had and truncates to `topN`. There is no cross-encoder in the box. If precision@3 matters, implement `Reranker` yourself against a rerank endpoint (Voyage rerank, Cohere rerank, a local cross-encoder) — the seam is `rerank(query, candidates: ScoredChunk[], topN): Promise<ScoredChunk[]>` and returning the array re-sorted is the entire contract.
+`retrieve` and `hybridRetrieve` accept `reranker?: Reranker`. **The default, `identityReranker`, is not a reranker**: it sorts candidates by the score they already had and truncates to `topN`. If precision@3 matters, over-fetch (`topK: 40`) and let a cross-encoder pick the few. Two hosted ones ship (2.2): `createCohereReranker` from `@deuz-sdk/core/rag` (`POST https://api.cohere.com/v2/rerank`, default `rerank-v4.0-pro`) and `createVoyageReranker` from `@deuz-sdk/core/voyage` (`POST https://api.voyageai.com/v1/rerank`, default `rerank-2.5`).
+
+```ts
+import { createCohereReranker } from '@deuz-sdk/core/rag';
+import type { ScoredChunk } from '@deuz-sdk/core/rag';
+
+// A stand-in for the network so this runs offline; drop `fetch` in production.
+const fakeFetch: typeof fetch = async () =>
+  new Response(JSON.stringify({ results: [{ index: 1, relevance_score: 0.92 }, { index: 0, relevance_score: 0.11 }] }), {
+    headers: { 'content-type': 'application/json' },
+  });
+
+const reranker = createCohereReranker({ apiKey: 'test-key', fetch: fakeFetch });
+const candidates: ScoredChunk[] = [
+  { index: 0, text: 'Shipping takes 5 days.', score: 0.8 },
+  { index: 1, text: 'Refunds are issued within 14 days.', score: 0.7 },
+];
+const top = await reranker.rerank('How long do refunds take?', candidates, 1);
+console.log(top); // [{ index: 1, text: 'Refunds are issued…', score: 0.92 }]
+```
+
+- Settings (both factories): `apiKey` (outranked by `deps.keyProvider.getKey('cohere' | 'voyage')`; neither → `AuthenticationError` before any request), `model`, `topK` (cap: returns `min(topN, topK)`), `baseURL` (`/rerank` appended), `fetch` (wins over `deps.fetch`), `headers`, `deps` (only `fetch` / `keyProvider` are read).
+- It returns the **original chunks** with `score` replaced by the provider's relevance score, best first; the input array is not mutated; an index outside the list is rejected, not guessed. Empty candidates or `topN: 0` make no request.
+- Errors are the usual classes: 429 `RateLimitError` (`retryAfterMs`), 401/403 `AuthenticationError`, other 4xx `InvalidRequestError`, 5xx retryable `APICallError`, transport `NetworkError`. **One request, no retries** — wrap it if you want them.
+- Anything else (a local cross-encoder) implements the seam directly: `rerank(query, candidates: ScoredChunk[], topN): Promise<ScoredChunk[]>`, returning the array re-sorted is the entire contract.
 
 ## Citations, and how they reach the UI
 
@@ -382,7 +407,7 @@ export async function toolsForSkill(id: string): Promise<ToolSet> {
 - `parse` rejects a renamed upload (`rag_extension_mime_mismatch`) — surface it as a 400, do not retry — and a ZIP with no `hint.filename` cannot be resolved to docx or xlsx, failing with `rag_unsupported_mime`.
 - `chunkRecursive`/`chunkBlocks` do not set `startOffset`/`endOffset`; only `chunkFixed` does.
 - Chunk arrays for the vector store and the BM25 index must be the same array, in the same order, or RRF fuses unrelated chunks and citations point at the wrong text.
-- `identityReranker` is a sort-and-truncate, not a rerank model.
+- `identityReranker` is a sort-and-truncate, not a rerank model; use `createCohereReranker` / `createVoyageReranker` or your own `Reranker`.
 - `createMemoryVectorStore` and `createBm25Index` are process-local; nothing persists them for you, and the `rag/node` peers (`unpdf`, `mammoth`, `xlsx`) are lazy — a missing install fails at first parse, not at import.
 - `ctx.emitPart` is `undefined` outside a streaming parent call, so citations silently vanish under `generateText`.
 - `nodeSkillSource` and every `*/node` subpath throw on Edge/Workers; use `fetchSkillSource` there.
