@@ -1,0 +1,14 @@
+{
+  "Name": "deuz-docs-og",
+  "Comment": "OG images are prerendered but origin sends max-age=0; force a long TTL",
+  "DefaultTTL": 604800,
+  "MaxTTL": 31536000,
+  "MinTTL": 604800,
+  "ParametersInCacheKeyAndForwardedToOrigin": {
+    "EnableAcceptEncodingGzip": true,
+    "EnableAcceptEncodingBrotli": true,
+    "HeadersConfig": { "HeaderBehavior": "none" },
+    "CookiesConfig": { "CookieBehavior": "none" },
+    "QueryStringsConfig": { "QueryStringBehavior": "none" }
+  }
+}

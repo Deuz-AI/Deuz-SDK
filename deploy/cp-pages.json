@@ -1,0 +1,14 @@
+{
+  "Name": "deuz-docs-pages",
+  "Comment": "Next.js pages: cache key = accept + rsc (normalized by viewer function)",
+  "DefaultTTL": 86400,
+  "MaxTTL": 31536000,
+  "MinTTL": 0,
+  "ParametersInCacheKeyAndForwardedToOrigin": {
+    "EnableAcceptEncodingGzip": true,
+    "EnableAcceptEncodingBrotli": true,
+    "HeadersConfig": { "HeaderBehavior": "whitelist", "Headers": { "Quantity": 2, "Items": ["accept", "rsc"] } },
+    "CookiesConfig": { "CookieBehavior": "none" },
+    "QueryStringsConfig": { "QueryStringBehavior": "none" }
+  }
+}

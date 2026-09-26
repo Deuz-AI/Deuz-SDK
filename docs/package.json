@@ -6,7 +6,9 @@
         "build": "next build",
         "dev": "next dev",
         "start": "next start",
-        "types:check": "fumadocs-mdx && next typegen && tsc --noEmit"
+        "types:check": "fumadocs-mdx && next typegen && tsc --noEmit",
+        "logos:sync": "node tooling/sync-provider-logos.mjs",
+        "mascot:export": "node tooling/export-mascot.mjs"
     },
     "dependencies": {
         "fumadocs-core": "^16.9.3",
@@ -16,14 +18,17 @@
         "next": "16.2.6",
         "react": "^19.2.6",
         "react-dom": "^19.2.6",
-        "tailwind-merge": "^3.6.0"
+        "tailwind-merge": "^3.6.0",
+        "three": "^0.185.1"
     },
     "devDependencies": {
+        "@lobehub/icons-static-svg": "1.95.0",
         "@tailwindcss/postcss": "^4.3.0",
         "@types/mdx": "^2.0.13",
         "@types/node": "^25.9.1",
         "@types/react": "^19.2.15",
         "@types/react-dom": "^19.2.3",
+        "@types/three": "0.185.4",
         "postcss": "^8.5.15",
         "tailwindcss": "^4.3.0",
         "typescript": "^6.0.3"

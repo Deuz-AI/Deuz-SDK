@@ -1,6 +1,69 @@
 @import 'tailwindcss';
-@import 'fumadocs-ui/css/ocean.css';
+@import 'fumadocs-ui/css/lib/default-colors.css';
 @import 'fumadocs-ui/css/preset.css';
+
+/* The generated provider-logo module is ~70 KB of SVG markup; nothing in it is a class name. */
+@source not '../lib/*.generated.ts';
+
+/*
+  Ink on paper.
+
+  Two inks — pure black and pure white — plus achromatic greys for the secondary
+  tones (the same oklch values the Deuz product app uses). Dark mode is a full
+  inversion. Every Fumadocs component reads these tokens, so the docs layout, the
+  search dialog and the callouts follow without any further styling.
+*/
+@theme {
+  --color-fd-background: #ffffff;
+  --color-fd-foreground: #000000;
+  --color-fd-muted: oklch(0.97 0 0);
+  --color-fd-muted-foreground: oklch(0.45 0 0);
+  --color-fd-popover: #ffffff;
+  --color-fd-popover-foreground: #000000;
+  --color-fd-card: #ffffff;
+  --color-fd-card-foreground: #000000;
+  --color-fd-border: oklch(0 0 0 / 0.12);
+  --color-fd-primary: #000000;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-secondary: oklch(0.97 0 0);
+  --color-fd-secondary-foreground: #000000;
+  --color-fd-accent: oklch(0.94 0 0);
+  --color-fd-accent-foreground: #000000;
+  --color-fd-ring: #000000;
+  --color-fd-overlay: oklch(0 0 0 / 0.3);
+
+  /* Brand radius: 0.625rem is the product app's `--radius`. */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.875rem;
+  --radius-2xl: 1.125rem;
+}
+
+.dark {
+  --color-fd-background: #000000;
+  --color-fd-foreground: #ffffff;
+  --color-fd-muted: oklch(0.2 0 0);
+  --color-fd-muted-foreground: oklch(0.72 0 0);
+  --color-fd-popover: #000000;
+  --color-fd-popover-foreground: #ffffff;
+  --color-fd-card: #000000;
+  --color-fd-card-foreground: #ffffff;
+  --color-fd-border: oklch(1 0 0 / 0.16);
+  --color-fd-primary: #ffffff;
+  --color-fd-primary-foreground: #000000;
+  --color-fd-secondary: oklch(0.2 0 0);
+  --color-fd-secondary-foreground: #ffffff;
+  --color-fd-accent: oklch(0.25 0 0);
+  --color-fd-accent-foreground: #ffffff;
+  --color-fd-ring: #ffffff;
+  --color-fd-overlay: oklch(0 0 0 / 0.6);
+}
+
+/* Display face — Instrument Serif, loaded by next/font in app/[lang]/layout.tsx. */
+@theme inline {
+  --font-serif: var(--font-instrument-serif), ui-serif, Georgia, 'Times New Roman', serif;
+}
 
 html {
   scrollbar-gutter: stable;
@@ -19,14 +82,51 @@ html[lang='ja'] body {
 }
 
 html[lang='ko'] body {
-  font-family:
-    var(--font-sans), 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
+  font-family: var(--font-sans), 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
 }
 
 html[lang='zh'] body {
   font-family:
     var(--font-sans), 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC',
     sans-serif;
+}
+
+/*
+  Instrument Serif has no Cyrillic or CJK glyphs, so display headings in those
+  locales fall to the same sans stack as their body text instead of a mismatched
+  system serif. `html[lang]` outranks the next/font variable class on the same element.
+*/
+html[lang='ru'] {
+  --font-instrument-serif: var(--font-sans), sans-serif;
+}
+
+html[lang='ja'] {
+  --font-instrument-serif:
+    var(--font-sans), 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic UI', 'Noto Sans JP',
+    sans-serif;
+}
+
+html[lang='ko'] {
+  --font-instrument-serif:
+    var(--font-sans), 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
+}
+
+html[lang='zh'] {
+  --font-instrument-serif:
+    var(--font-sans), 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC',
+    sans-serif;
+}
+
+html:is([lang='ru'], [lang='ja'], [lang='ko'], [lang='zh']) .font-serif {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+@layer base {
+  ::selection {
+    background: var(--color-fd-foreground);
+    color: var(--color-fd-background);
+  }
 }
 
 /* Slightly larger, calmer reading rhythm for docs prose. */

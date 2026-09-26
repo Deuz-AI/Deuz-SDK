@@ -3,7 +3,7 @@ import { i18nProvider } from 'fumadocs-ui/i18n';
 import { Banner } from 'fumadocs-ui/components/banner';
 import Link from 'next/link';
 import '../global.css';
-import { Inter } from 'next/font/google';
+import { Instrument_Serif, Inter } from 'next/font/google';
 import type { Metadata } from 'next';
 import { i18n, isLocale, type Locale } from '@/lib/i18n';
 import { translations } from '@/lib/translations';
@@ -14,6 +14,15 @@ const inter = Inter({
   subsets: ['latin', 'latin-ext', 'cyrillic', 'cyrillic-ext'],
   display: 'swap',
   variable: '--font-sans',
+});
+
+// Display face for the hero and section headings (Latin locales only — see global.css).
+const instrumentSerif = Instrument_Serif({
+  weight: '400',
+  style: ['normal', 'italic'],
+  subsets: ['latin', 'latin-ext'],
+  display: 'swap',
+  variable: '--font-instrument-serif',
 });
 
 const siteDescriptions: Record<Locale, string> = {
@@ -31,44 +40,44 @@ const siteDescriptions: Record<Locale, string> = {
 
 const bannerCopy: Record<Locale, { text: string; link: string }> = {
   en: {
-    text: 'Deuz SDK 2.0 is out — stores, guardrails, handoffs, and zero-config MCP.',
-    link: 'What is new in 2.0',
+    text: 'Deuz SDK 2.2 is out — dynamic swarms, cross-process operations, persistent budgets and evolve.',
+    link: 'What is new in 2.2',
   },
   de: {
-    text: 'Deuz SDK 2.0 ist da — Stores, Guardrails, Handoffs und Zero-Config-MCP.',
-    link: 'Neu in 2.0',
+    text: 'Deuz SDK 2.2 ist da — dynamische Swarms, prozessübergreifender Betrieb, dauerhafte Budgets und Evolve.',
+    link: 'Neu in 2.2',
   },
   tr: {
-    text: 'Deuz SDK 2.0 çıktı — store’lar, guardrail’ler, handoff ve sıfır yapılandırmalı MCP.',
-    link: '2.0’da neler yeni',
+    text: 'Deuz SDK 2.2 çıktı — dinamik swarm’lar, süreçler arası operasyon, kalıcı bütçeler ve evolve.',
+    link: '2.2’de neler yeni',
   },
   fr: {
-    text: 'Deuz SDK 2.0 est sorti — stores, guardrails, handoffs et MCP zéro-config.',
-    link: 'Nouveautés de la 2.0',
+    text: 'Deuz SDK 2.2 est sorti — swarms dynamiques, opérations multi-processus, budgets persistants et evolve.',
+    link: 'Nouveautés de la 2.2',
   },
   it: {
-    text: 'Deuz SDK 2.0 è uscito — store, guardrail, handoff e MCP zero-config.',
-    link: 'Novità della 2.0',
+    text: 'Deuz SDK 2.2 è uscito — swarm dinamici, operazioni tra processi, budget persistenti ed evolve.',
+    link: 'Novità della 2.2',
   },
   es: {
-    text: 'Deuz SDK 2.0 ya está aquí — stores, guardrails, handoffs y MCP cero-config.',
-    link: 'Novedades de 2.0',
+    text: 'Deuz SDK 2.2 ya está aquí — swarms dinámicos, operaciones entre procesos, presupuestos persistentes y evolve.',
+    link: 'Novedades de 2.2',
   },
   ru: {
-    text: 'Вышел Deuz SDK 2.0 — store, guardrail, handoff и MCP без конфигурации.',
-    link: 'Что нового в 2.0',
+    text: 'Вышел Deuz SDK 2.2 — динамические swarms, работа между процессами, постоянные бюджеты и evolve.',
+    link: 'Что нового в 2.2',
   },
   ja: {
-    text: 'Deuz SDK 2.0 リリース — ストア、ガードレール、ハンドオフ、ゼロ設定 MCP。',
-    link: '2.0 の新機能',
+    text: 'Deuz SDK 2.2 リリース — 動的なスウォーム、プロセス間の運用、永続的な予算、Evolve。',
+    link: '2.2 の新機能',
   },
   ko: {
-    text: 'Deuz SDK 2.0 출시 — 스토어, 가드레일, 핸드오프, 제로 설정 MCP.',
-    link: '2.0의 새로운 점',
+    text: 'Deuz SDK 2.2 출시 — 동적 스웜, 프로세스 간 운영, 영속 예산, Evolve.',
+    link: '2.2의 새로운 점',
   },
   zh: {
-    text: 'Deuz SDK 2.0 已发布 — 存储、护栏、交接与零配置 MCP。',
-    link: '2.0 新特性',
+    text: 'Deuz SDK 2.2 已发布 — 动态 swarm、跨进程运行、持久化预算与 Evolve。',
+    link: '2.2 新特性',
   },
 };
 
@@ -96,13 +105,17 @@ export default async function Layout({ params, children }: LayoutProps<'/[lang]'
   const banner = bannerCopy[locale];
 
   return (
-    <html lang={lang} className={`${inter.variable} ${inter.className}`} suppressHydrationWarning>
+    <html
+      lang={lang}
+      className={`${inter.variable} ${inter.className} ${instrumentSerif.variable}`}
+      suppressHydrationWarning
+    >
       <body className="flex min-h-screen flex-col">
         <RootProvider i18n={i18nProvider(translations, lang)}>
-          <Banner id="deuz-sdk-2-0">
+          <Banner id="deuz-sdk-2-2">
             {banner.text}{' '}
             <Link
-              href={localePath(locale, '/docs/reference/whats-new-2-0')}
+              href={localePath(locale, '/docs/reference/whats-new-2-2')}
               className="font-medium underline underline-offset-4"
             >
               {banner.link}

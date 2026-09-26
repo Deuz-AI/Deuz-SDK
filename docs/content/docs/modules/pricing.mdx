@@ -1,373 +1,452 @@
 ---
-title: Pricing & Metering
-description: Optional USD cost accounting — the Usage breakdown, onUsage, the bundled 2026 price table, the live cost stream part, and the budget guardrail.
+title: Pricing & budgets
+description: Estimate GPT-6 Astra, GPT-5.6, Claude Fable 5.1 and Opus 5 costs. Track live spend and share execution budgets across agents in Deuz SDK 2.1.
 ---
 
-The core never bills. Every call returns a token *breakdown* (`Usage`); turning tokens into dollars is an app concern — margins, currency, and contract rates differ per deployment. The `@deuz-sdk/core/pricing` module is therefore fully optional: it ships a pinned 2026 USD price table plus a `PriceProvider` factory you inject via `deps.priceProvider`, but the core never imports it and never charges automatically. Pair it with the [`onUsage`](#metering-the-onusage-callback) callback to log or meter cost per request.
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 
-Since 1.7, injecting a `priceProvider` also unlocks two features inside the loop itself: a [live `cost` stream part](#live-cost-stream-17) and the [`budget` guardrail](#the-budget-guardrail-17).
+Turn token usage into a dollar estimate, show cost as an agent runs, and give a
+whole swarm one shared budget. Everything lives behind the optional
+`@deuz-sdk/core/pricing` module. Deuz reports usage and estimates; your application
+owns billing.
 
-## Usage anatomy
+<Cards className="sm:grid-cols-3">
+  <Card
+    title="Estimate"
+    href="#priceusage"
+    description="Price a model call, including reasoning and cache usage."
+  />
+  <Card
+    title="Track"
+    href="#live-cost-stream"
+    description="Read cumulative cost and cache savings from the stream."
+  />
+  <Card
+    title="Control"
+    href="#native-agent-and-swarm-budgets"
+    description="Share an execution budget across native agent runs."
+  />
+</Cards>
 
-Every result carries a canonical `Usage`. `streamChat` exposes it as `usage: Promise<Usage>` (resolves when the stream finishes); `generateText`, `generateObject`, `embed`, and `embedMany` return `usage: Usage` directly. The shape is locked at 1.0 — the credit system needs the full cache/reasoning breakdown to compute correct cost.
+## Current model prices
 
-```ts
-interface Usage {
-  inputTokens: number; // fresh (uncached) input
-  outputTokens: number; // visible output text
-  reasoningTokens: number; // hidden thinking; billed at the output rate
-  cachedReadTokens: number; // cache-hit reads (~10% of input price)
-  cacheWriteTokens: number; // 5-minute cache writes (Anthropic)
-  cacheWrite1hTokens: number; // 1-hour cache writes (Anthropic)
-  audioTokens?: number; // audio in/out, when billed separately
-  serverToolUses?: number; // provider-executed tool calls (e.g. web searches), billed per call, not tokens
-  totalTokens: number;
-}
-```
+**Verified September 20, 2026.** These models are included in `PRICES_2026`.
+Rates are **USD per 1 million tokens** for standard API processing. Use the exact
+API IDs shown here when calling `priceUsage`.
 
-Reasoning tokens are real output tokens you don't see in the text, so cost code bills them at the output rate. Cache reads are far cheaper than fresh input; cache writes cost a premium. `priceUsage` handles all of this for you.
+<Tabs items={['OpenAI', 'Anthropic']}>
+<Tab value="OpenAI">
 
-## Metering: the `onUsage` callback
+| Model / API ID                      |  Input | Cache read | Output + reasoning |
+| ----------------------------------- | -----: | ---------: | -----------------: |
+| **GPT-6 Astra** · `gpt-6-astra`     | $10.00 |      $1.00 |             $50.00 |
+| **GPT-5.6 Sol** · `gpt-5.6-sol`     |  $4.00 |      $0.40 |             $20.00 |
+| **GPT-5.6 Terra** · `gpt-5.6-terra` |  $2.00 |      $0.20 |             $12.00 |
+| **GPT-5.6 Luna** · `gpt-5.6-luna`   |  $0.20 |      $0.02 |              $1.20 |
 
-`onUsage` fires exactly once per result with the `Usage` and a `UsageMeta`. It exists both as a top-level call option and as a `deps` field — the call-level option *overrides* `deps.onUsage`, so they never both fire (the G10 rule), and your credit system is never double-charged.
+`gpt-5.6` is also priced as Sol. Cache writes cost 1.25× the input rate.
+Sol's promotional rates are available at least through November 21, 2026.
+See [OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
 
-```ts
-import { streamChat } from '@deuz-sdk/core';
-import { createAnthropic } from '@deuz-sdk/core/anthropic';
+</Tab>
+<Tab value="Anthropic">
 
-const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+| Model / API ID                            |  Input | Cache read | Output + reasoning |
+| ----------------------------------------- | -----: | ---------: | -----------------: |
+| **Claude Fable 5.1** · `claude-fable-5-1` | $10.00 |      $0.25 |             $50.00 |
+| **Claude Opus 5** · `claude-opus-5`       |  $5.00 |      $0.50 |             $25.00 |
 
-const result = streamChat({
-  model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Hi' }],
-  onUsage: (usage, meta) => {
-    // meta: { model, reason, ttftMs? }
-    console.log(meta.model, usage.totalTokens, meta.reason);
-  },
-});
-```
+| Cache write        | Fable 5.1 | Opus 5 |
+| ------------------ | --------: | -----: |
+| 5-minute retention |    $12.50 |  $6.25 |
+| 1-hour retention   |    $20.00 | $10.00 |
 
-`UsageMeta` is intentionally cost-free — the core reports tokens, not dollars:
+Fable 5.1 cache reads cost **2.5% of input**, so its row explicitly overrides the
+SDK's 10% default. These models have no long-context premium within their
+supported context windows. See [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing),
+[Fable 5.1](https://platform.claude.com/docs/en/models/fable-5-1/overview) and
+[Opus 5](https://platform.claude.com/docs/en/models/opus-5/overview).
 
-| Field | Type | Notes |
-| --- | --- | --- |
-| `model` | `string` | The model id the call ran against. |
-| `reason` | `'finished' \| 'aborted' \| 'error'` | `'aborted'` carries partial usage; `'error'` carries what was counted before the failure. |
-| `ttftMs` | `number` (optional) | Time-to-first-token in milliseconds, when measured. |
-| `agentPath` | `string[]` (optional) | Sub-agent path when the usage came from an `agentTool` loop; use it to attribute cost per sub-agent. |
+</Tab>
+</Tabs>
 
-To attach cost, compute it inside your `onUsage` handler from the `Usage` — either with [`priceUsage`](#priceusage) directly or a [`PriceProvider`](#priceprovider-and-the-deps-seam).
+### Long context and other tariffs
+
+For the listed OpenAI models, prompts **above 272,000 tokens** use 2× input and
+cache rates and 1.5× output rates for the **whole request**. The bundled rows
+apply that tier automatically. See the [Astra model reference](https://developers.openai.com/api/docs/models/gpt-6-astra)
+and [Sol model reference](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+
+Batch, fast mode, regional processing, gateway markups and negotiated contracts
+can use different prices. Supply a [custom price provider](#custom-rates-and-margins)
+for the tariff you actually use. A model's price-table entry does not grant API
+access or select a processing tier.
 
 ## `priceUsage`
 
-The one-shot estimator. Given a model id and a `Usage`, it returns the USD cost from a price table (the bundled 2026 table by default), or `undefined` when the model is unknown.
+Pass a model ID and the `Usage` returned by an SDK call. The result is a USD
+number, rounded to six decimal places, or `undefined` if no price can be resolved.
 
-```ts
-function priceUsage(
-  model: string,
-  usage: Usage,
-  table?: PriceTable, // defaults to PRICES_2026
-): number | undefined;
-```
-
-```ts
+```ts title="estimate.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createOpenAIResponses } from '@deuz-sdk/core/openai';
 import { priceUsage } from '@deuz-sdk/core/pricing';
 
-const cost = priceUsage('gpt-5.2', {
-  inputTokens: 1_000_000,
-  outputTokens: 1_000_000,
-  reasoningTokens: 0,
-  cachedReadTokens: 0,
+const openai = createOpenAIResponses({ apiKey: process.env.OPENAI_API_KEY! });
+const modelId = 'gpt-5.6-sol';
+
+const { text, usage } = await generateText({
+  model: openai(modelId),
+  prompt: 'Explain what makes an agent run durable.',
+});
+
+const usd = priceUsage(modelId, usage);
+console.log(text);
+console.log(usd === undefined ? 'Price unavailable' : `$${usd.toFixed(6)}`);
+```
+
+### Same usage, different models
+
+This example uses illustrative, separate output and reasoning counters. It is
+local arithmetic and makes no API calls.
+
+```ts title="compare-costs.ts"
+import type { Usage } from '@deuz-sdk/core';
+import { priceUsage } from '@deuz-sdk/core/pricing';
+
+const usage: Usage = {
+  inputTokens: 10_000,
+  outputTokens: 2_000,
+  reasoningTokens: 1_000,
+  cachedReadTokens: 20_000,
   cacheWriteTokens: 0,
   cacheWrite1hTokens: 0,
-  totalTokens: 2_000_000,
-});
-// gpt-5.2: input 1.25 + output 10 (USD / 1M) → 11.25
+  totalTokens: 33_000,
+};
+
+priceUsage('gpt-5.6-sol', usage); // $0.108
+priceUsage('gpt-6-astra', usage); // $0.270
+priceUsage('claude-fable-5-1', usage); // $0.255
+priceUsage('claude-opus-5', usage); // $0.135
 ```
 
-How each bucket is priced (USD per 1,000,000 tokens):
+For Sol, that is **$0.040 input + $0.060 output/reasoning + $0.008 cache reads**.
+This holds token counts constant; actual tokenization and reasoning usage vary
+by model.
 
-- `inputTokens` → `input` rate.
-- `outputTokens` **and** `reasoningTokens` → `output` rate.
-- `cachedReadTokens` → `cachedRead` rate (default: 10% of `input`).
-- `cacheWriteTokens` → `cacheWrite` rate (default: 1.25 × `input`).
-- `cacheWrite1hTokens` → `cacheWrite1h` rate (default: 2 × `input`).
-- `audioTokens` → `audio` rate (default: `input`).
-- `serverToolUses` → **not priced.** Provider-executed tool calls (e.g. web searches) are billed per call, not per token; `priceUsage`/`PRICES_2026` ignore this bucket, so add any server-tool cost separately in your app.
+## Usage anatomy
 
-The result is clamped to be non-negative and rounded to micro-dollars (6 decimals) to avoid float dust.
+`Usage` preserves the token counters available from a provider. `priceUsage`
+applies the following calculation to those counters:
 
-### Tolerant lookup
+| Usage field          | How it is priced                                       |
+| -------------------- | ------------------------------------------------------ |
+| `inputTokens`        | Fresh input × `input`.                                 |
+| `outputTokens`       | Reported output × `output`.                            |
+| `reasoningTokens`    | Hidden reasoning × `output`.                           |
+| `cachedReadTokens`   | Cache hits × `cachedRead`; default is 0.1× input.      |
+| `cacheWriteTokens`   | Cache writes × `cacheWrite`; default is 1.25× input.   |
+| `cacheWrite1hTokens` | One-hour writes × `cacheWrite1h`; default is 2× input. |
+| `audioTokens`        | If present, × `audio`; default is the input rate.      |
+| `serverToolUses`     | Excluded. Add per-call search/tool fees separately.    |
+| `totalTokens`        | A usage total, not an additional charge.               |
 
-Model lookup is forgiving so date-stamped or vendor-prefixed slugs still resolve. It tries the exact slug, then strips a trailing ISO/compact date stamp and a leading `vendor/` prefix, then falls back to the longest known prefix match.
+<Callout title="Reasoning counters can overlap">
+  The current OpenAI and Anthropic adapters can retain reasoning inside `outputTokens` while also
+  reporting it in `reasoningTokens`. Because `priceUsage` adds both, those responses can be
+  overestimated. For billing, normalize the provider's overlapping counters in your own
+  `PriceProvider`. The arithmetic example above uses separate counters.
+</Callout>
+
+`generateText`, `generateObject`, `embed` and `embedMany` return usage directly.
+For `streamChat`, consume the stream and then await `result.usage`. Embedding
+calls populate input usage; their output and cache buckets are zero.
+
+### Cache savings
+
+`cacheSavings(model, usage, table?)` estimates what cache reads saved compared
+with paying the full input rate for those tokens. It excludes cache-write costs.
 
 ```ts
-priceUsage('gpt-5.2-2025-12-11', usage); // → priced as 'gpt-5.2'
-priceUsage('google/gemini-2.5-flash', usage); // → priced as 'gemini-2.5-flash'
+import { cacheSavings } from '@deuz-sdk/core/pricing';
+
+// Reusing the usage above:
+cacheSavings('claude-fable-5-1', usage); // $0.195
+cacheSavings('gpt-5.6-sol', usage); // $0.072
 ```
-
-### Unknown model: no cost, no throw
-
-A genuinely unknown model returns `undefined` — never a wrong charge, never an exception. Callers decide whether to fall back to a default rate, skip billing, or alert.
-
-```ts
-priceUsage('totally-made-up-model', usage); // → undefined
-```
-
-## `PRICES_2026` and `ModelPrice`
-
-`PRICES_2026` is a `PriceTable` (a `Record<string, ModelPrice>`) of pinned 2026 list prices. **It is not authoritative** — list prices drift and enterprise/Vertex/Bedrock rates differ. Treat it as a starting point and override per deployment.
-
-```ts
-interface ModelPrice {
-  input: number; // fresh input, USD / 1M
-  output: number; // output (and reasoning), USD / 1M
-  cachedRead?: number; // default: input * 0.1
-  cacheWrite?: number; // default: input * 1.25
-  cacheWrite1h?: number; // default: input * 2
-  audio?: number; // default: input
-}
-
-type PriceTable = Record<string, ModelPrice>;
-```
-
-A few rows from the bundled table:
-
-| Model | `input` | `output` | `cachedRead` | `cacheWrite` | `cacheWrite1h` |
-| --- | --- | --- | --- | --- | --- |
-| `gpt-5.5` | 5 | 30 | 0.5 | — | — |
-| `gpt-5.4-nano` | 0.2 | 1.25 | 0.02 | — | — |
-| `claude-fable-5` | 10 | 50 | 1 | 12.5 | 20 |
-| `claude-sonnet-5` | 3 | 15 | 0.3 | 3.75 | 6 |
-| `claude-opus-4-8` | 5 | 25 | 0.5 | 6.25 | 10 |
-| `gemini-3.5-flash` | 1.5 | 9 | 0.15 | — | — |
-| `grok-4.3` | 1.25 | 2.5 | 0.125 | — | — |
-| `text-embedding-3-small` | 0.02 | 0 | — | — | — |
-
-Embeddings are input-only — set `output: 0` and the output/cache buckets contribute nothing. Where a row omits `cachedRead`/`cacheWrite`/`cacheWrite1h`, the defaults above apply (e.g. `qwen3-max` has no explicit `cachedRead`, so it falls back to `0.1 × 1.2 = 0.12`).
-
-Long-context tiers: a row may carry `over200k: { input, output, cachedRead? }` — when `inputTokens + cachedReadTokens > 200_000` those rates apply instead (e.g. `gemini-3.1-pro-preview` bills $2/$12 up to 200k prompt tokens and $4/$18 beyond).
 
 ## `PriceProvider` and the `deps` seam
 
-For injection, build a `PriceProvider` with `createPriceProvider` and pass it as `deps.priceProvider`. The seam lets you swap the bundled table for a DB- or remote-backed one (its `priceUsage` may be async).
+Use `createPriceProvider()` to connect the bundled table to calls through
+`deps.priceProvider`. A [client](/docs/core/dependencies) can bind it once for
+all calls. This enables live cost events and USD budget checks.
 
-```ts
-function createPriceProvider(options?: CreatePriceProviderOptions): PriceProvider;
+```ts title="client.ts"
+import { createClient } from '@deuz-sdk/core';
+import { createOpenAIResponses } from '@deuz-sdk/core/openai';
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
 
-interface CreatePriceProviderOptions {
-  table?: PriceTable; // merged shallow over PRICES_2026 (per-model)
-  margin?: number; // multiply every cost, e.g. 1.3 for a 30% markup. Default 1
-}
+const deuz = createClient({
+  apiKeys: { openai: process.env.OPENAI_API_KEY! },
+  deps: { priceProvider: createPriceProvider() },
+});
 
-interface PriceProvider {
-  priceUsage(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
-  /** Optional (1.7): USD saved by prompt-cache reads — feeds `cacheSavingsUsd` on the cost part. */
-  cacheSavings?(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
-}
+const openai = createOpenAIResponses();
+const result = await deuz.generateText({
+  model: openai('gpt-6-astra'),
+  prompt: 'Review this architecture: one scheduler, many bounded agent tasks.',
+});
+
+console.log(result.text);
 ```
 
-How cost surfaces: the core does **not** put dollars on `UsageMeta`. The provider you inject is *yours* to call — typically inside the same `onUsage` handler, since the app owns both. The `priceProvider` seam exists so app-wide wiring (price table, margin) lives in one place that your callback reads. (Since 1.7 the streaming loop *additionally* reads the seam itself to emit [`cost` parts](#live-cost-stream-17) and evaluate [`budget.usd`](#the-budget-guardrail-17) — still estimation for display and guardrails, never billing.)
+A custom `PriceProvider` can load prices from your own service. Its
+`priceUsage(model, usage)` method may return a number, `undefined`, or a promise
+of either. The optional `cacheSavings` method has the same return shape. Keep
+these methods free of billing side effects: the SDK may request multiple
+estimates for the same work.
 
-```ts title="lib/deuz.ts"
-import { createClient } from '@deuz-sdk/core';
-import { createPriceProvider } from '@deuz-sdk/core/pricing';
+## Metering: the `onUsage` callback
+
+`onUsage` receives usage with the **model ID that actually ran**. In a tool loop,
+it can fire multiple times as model invocations finish. Price those invocations
+individually when a run switches models or delegates to another agent.
+
+```ts title="meter.ts"
+import { streamChat } from '@deuz-sdk/core';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createPriceProvider, priceUsage } from '@deuz-sdk/core/pricing';
 
-const priceProvider = createPriceProvider({ margin: 1.3 }); // 30% markup
-
-export const deuz = createClient({
-  apiKeys: { anthropic: process.env.ANTHROPIC_API_KEY! },
-  deps: {
-    priceProvider,
-    onUsage: async (usage, meta) => {
-      const usd = await priceProvider.priceUsage(meta.model, usage);
-      // unknown model → usd is undefined; bill conservatively / skip
-      if (usd !== undefined) await chargeAccount(meta.model, usd, usage.totalTokens);
-    },
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const result = streamChat({
+  model: anthropic('claude-fable-5-1'),
+  prompt: 'Explain prompt caching with a short example.',
+  deps: { priceProvider: createPriceProvider() },
+  onUsage: (usage, meta) => {
+    console.log({
+      model: meta.model,
+      reason: meta.reason,
+      tokens: usage.totalTokens,
+      estimatedUsd: priceUsage(meta.model, usage),
+      agentPath: meta.agentPath,
+    });
   },
 });
 
-export const anthropic = createAnthropic();
+for await (const text of result.textStream) process.stdout.write(text);
 ```
 
-`createPriceProvider` performs no I/O and reads no globals, so it is safe in any edge runtime. Unknown models still yield `undefined` after a margin is applied — a missing price never becomes a wrong charge. Providers built with `createPriceProvider` implement the optional `cacheSavings` seam out of the box (with the same `margin` applied), so the live `cost` part carries `cacheSavingsUsd` without extra wiring.
+The call-level callback overrides `deps.onUsage`; they are not both invoked.
+`UsageMeta` exposes `model`, `reason`, optional `ttftMs` and optional `agentPath`.
+It contains no dollar amount. Aborted calls can report partial usage; a failure
+before usage is available does not guarantee a callback.
 
-## Live cost stream (1.7)
+<Callout title="Keep metering callbacks synchronous">
+  `onUsage` is a notification hook; the SDK does not await an async callback. For database writes,
+  collect records or enqueue work and explicitly await your application's flush before a request or
+  worker exits.
+</Callout>
 
-When `deps.priceProvider` is injected, streaming calls emit a canonical `cost` part — the agentic loop pushes one **after every step**, and a single-turn stream pushes one before its finish. It rides the [UI wire v2](/docs/modules/ui-streaming#wire-part-types) unchanged, so a browser can render a live cost badge with zero server code:
+<span id="live-cost-stream-17" />
 
-```ts
-interface CostPart {
-  type: 'cost';
-  costUsd: number; // CUMULATIVE for the run — cross-leg on durable resumes
-  deltaUsd?: number; // this step's increment
-  cacheSavingsUsd?: number; // what cache reads saved vs full-price input (needs cacheSavings)
-  stepIndex?: number;
-}
-```
+## Live cost stream
 
-- `costUsd` is cumulative across the whole run. On a [durable resume](/docs/agents/durable-runtime) leg, the prior legs' cost seeds the baseline, so the first `cost` part's `deltaUsd` reports *this step's* increment, not the whole run's total.
-- `cacheSavingsUsd` appears only when the provider implements the optional `cacheSavings` seam and the savings are positive. The standalone helper is exported too: `cacheSavings(model, usage, table?)` returns what the `cachedReadTokens` would have cost at the full input rate minus what they cost at the cached-read rate — cache *writes* are the investment side and are not netted.
-- No `priceProvider`, or an unknown model (`priceUsage` → `undefined`) → no `cost` parts, no errors. A throwing provider logs a warning and the part is skipped.
+With a price provider, `streamChat` emits `cost` parts through `fullStream` and
+the [UI wire v2](/docs/modules/ui-streaming). Agent loops emit them at model-step
+boundaries; a single-turn stream emits one before finishing. Tool or child-agent
+work after an event can appear in a subsequent cost update.
 
-```ts title="cost-badge.ts"
-for await (const part of readDeuzStream(res)) {
+```ts title="live-cost.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createOpenAIResponses } from '@deuz-sdk/core/openai';
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+
+const openai = createOpenAIResponses({ apiKey: process.env.OPENAI_API_KEY! });
+const result = streamChat({
+  model: openai('gpt-5.6-sol'),
+  prompt: 'Outline a migration plan in five steps.',
+  deps: { priceProvider: createPriceProvider() },
+});
+
+for await (const part of result.fullStream) {
   if (part.type === 'cost') {
-    badge.textContent = `$${part.costUsd.toFixed(4)}`; // live, per step
-    if (part.cacheSavingsUsd) savings.textContent = `saved $${part.cacheSavingsUsd.toFixed(4)}`;
+    console.log({
+      totalUsd: part.costUsd,
+      stepUsd: part.deltaUsd,
+      savedUsd: part.cacheSavingsUsd,
+    });
   }
 }
 ```
 
-## The budget guardrail (1.7)
+| Field             | Meaning                                                                  |
+| ----------------- | ------------------------------------------------------------------------ |
+| `costUsd`         | Cumulative estimated cost. Display it directly; do not sum these events. |
+| `deltaUsd`        | Optional increment since the previous reported cost.                     |
+| `cacheSavingsUsd` | Optional savings on cache reads, when available and positive.            |
+| `stepIndex`       | Optional step index.                                                     |
 
-`budget` on `CommonCallOptions` hard-stops the agentic loop once cumulative cost or real token usage crosses a limit:
+In 2.1, tool-loop accounting prices individual invocations against their actual
+model and preserves settled dollar totals across [durable resumes](/docs/agents/durable-runtime).
+Changing models does not reprice previous calls at the final model's rate.
+If an invocation cannot be priced, the loop cannot report a complete cumulative
+cost. Missing pricing is **unknown**, not zero.
+
+<span id="the-budget-guardrail-17" />
+
+## The budget guardrail
+
+For existing generation/tool loops, `budget` checks cumulative usage and estimated
+cost at step boundaries. `budget.usd` needs a price provider; `budget.tokens` uses
+reported token usage.
 
 ```ts
 const result = streamChat({
-  model,
-  messages,
+  model: openai('gpt-5.6-sol'),
+  prompt: 'Investigate the issue and propose a fix.',
   tools,
-  maxSteps: 20,
-  budget: { usd: 0.5, tokens: 200_000 }, // either field alone works too
-});
-```
-
-Semantics:
-
-- Sugar over the `costExceeds` / `totalTokensExceed` [stop conditions](/docs/agents/tools#budget-stop-conditions), with distinct `stoppedBy` markers: `providerMetadata.deuz.stoppedBy` is `'budget.usd'` or `'budget.tokens'`, so callers can tell a budget trip from a manual `stopWhen`.
-- **Evaluated at step boundaries** — an in-flight step always completes first (the loop never truncates a model response mid-stream).
-- `budget.usd` needs `deps.priceProvider`; without one the loop warns once and the condition never fires. `budget.tokens` reads provider-reported cumulative usage — no estimation.
-- The streaming loop emits a typed `budget-exceeded` part **right before** the terminal `finish`, so UIs can react without parsing metadata: `{ type: 'budget-exceeded', kind: 'usd' | 'tokens', limit, value }`.
-- On a [durable](/docs/agents/durable-runtime) run, budget checks see the *whole run's* cumulative usage across legs — a resume leg cannot reset the meter.
-
-### Continue-confirmation UI pattern
-
-A budget stop is not an error — the turn finishes cleanly with partial work and full history. The natural UX is a confirmation that re-runs the same conversation with a raised budget:
-
-```tsx title="BudgetGate.tsx"
-// Reducing the stream with applyUIPart (see Chat Persistence) fills
-// turn.budgetExceeded when the guardrail trips.
-{turn.budgetExceeded && (
-  <div role="alert">
-    Stopped at {turn.budgetExceeded.kind === 'usd'
-      ? `$${turn.budgetExceeded.value.toFixed(2)} (limit $${turn.budgetExceeded.limit})`
-      : `${turn.budgetExceeded.value.toLocaleString()} tokens`}.
-    <button
-      onClick={() =>
-        // Raised ceiling, same conversation: include the stopped turn's
-        // assistant/tool messages in `messages` and the model picks up
-        // where the budget cut it off.
-        send(messages, { budget: { usd: turn.budgetExceeded!.limit * 2 } })
-      }
-    >
-      Continue anyway
-    </button>
-  </div>
-)}
-```
-
-## Examples
-
-### Log cost per request
-
-Use `priceUsage` against the bundled table directly when you don't need app-wide injection.
-
-```ts
-import { generateText } from '@deuz-sdk/core';
-import { createOpenAI } from '@deuz-sdk/core/openai';
-import { priceUsage } from '@deuz-sdk/core/pricing';
-
-const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-
-const { text, usage } = await generateText({
-  model: openai('gpt-5.2'),
-  messages: [{ role: 'user', content: 'Summarize the SDK in one line.' }],
+  maxSteps: 12,
+  budget: { usd: 0.5, tokens: 100_000 },
+  deps: { priceProvider: createPriceProvider() },
 });
 
-const usd = priceUsage('gpt-5.2', usage);
-console.log(text);
-console.log(`tokens: ${usage.totalTokens}  cost: ${usd === undefined ? 'n/a' : `$${usd}`}`);
+await result.consume?.();
 ```
 
-### Streaming cost via `onUsage`
+The current step finishes before the check stops further work. Streaming emits
+`budget-exceeded` before `finish`, and `providerMetadata.deuz.stoppedBy` identifies
+`budget.usd` or `budget.tokens`. Resume retains prior usage and known cost.
 
-`streamChat` is lazy and never throws; the usage callback fires once when the stream finishes (including `'aborted'` with partial usage).
+Without a price provider, or with incomplete pricing, the USD condition cannot
+protect the run. Include a token limit and a step limit as independent controls.
+For admission checks before a model attempt, use native execution budgets.
 
-```ts
-import { streamChat } from '@deuz-sdk/core';
-import { createAnthropic } from '@deuz-sdk/core/anthropic';
-import { priceUsage } from '@deuz-sdk/core/pricing';
+## Native agent and swarm budgets
 
-const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+Native agents in 2.1 reserve estimated tokens and dollars **before dispatch**.
+Parent and child contexts share a ledger, so delegated work consumes the same
+budget. A USD limit requires a known USD estimate for admission.
 
-const result = streamChat({
-  model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Explain prompt caching.' }],
-  onUsage: (usage, meta) => {
-    const usd = priceUsage(meta.model, usage);
-    console.log(meta.reason, meta.ttftMs, usage.cachedReadTokens, usd);
-  },
-});
-
-for await (const chunk of result.textStream) process.stdout.write(chunk);
-```
-
-### `createClient` with a `priceProvider`
-
-Bind the price provider and metering once; every call routed through the client inherits them.
-
-```ts
-import { createClient } from '@deuz-sdk/core';
+```ts title="shared-budget.ts"
+import { createExecutionContext, runAgent } from '@deuz-sdk/core/agent';
+import { createOpenAIResponses } from '@deuz-sdk/core/openai';
 import { createPriceProvider } from '@deuz-sdk/core/pricing';
-import { createAnthropic } from '@deuz-sdk/core/anthropic';
 
-const priceProvider = createPriceProvider();
-
-const deuz = createClient({
-  apiKeys: { anthropic: process.env.ANTHROPIC_API_KEY! },
-  deps: {
-    priceProvider,
-    onUsage: async (usage, meta) => {
-      const usd = await priceProvider.priceUsage(meta.model, usage);
-      console.log(meta.model, usd ?? 'unknown-price');
-    },
-  },
+const openai = createOpenAIResponses({ apiKey: process.env.OPENAI_API_KEY! });
+const execution = createExecutionContext({
+  budget: { usd: 2, tokens: 100_000 },
 });
 
-const anthropic = createAnthropic();
-const { text } = await deuz.generateText({
-  model: anthropic('claude-opus-4-8'),
-  messages: [{ role: 'user', content: 'Hi' }],
+const result = await runAgent({
+  model: openai('gpt-6-astra'),
+  prompt: 'Propose a test plan for a durable task scheduler.',
+  maxSteps: 4,
+  maxOutputTokens: 2_000,
+  execution,
+  deps: { priceProvider: createPriceProvider() },
 });
+
+console.log(result.status, result.accounting);
 ```
 
-### Custom price-table override
+| Accounting field               | Meaning                                                 |
+| ------------------------------ | ------------------------------------------------------- |
+| `spent`                        | Known actual token and USD amounts.                     |
+| `reserved`                     | Still-held estimates, including uncertain attempts.     |
+| `committed`                    | Spent + reserved.                                       |
+| `unknownTokens` / `unknownUsd` | Counts of attempts whose actual amounts remain unknown. |
 
-Merge your own rates over the built-ins — useful for negotiated rates, a private model, or a margin. The custom table is shallow-merged per model, so built-in slugs still resolve.
+Missing usage or failed pricing keeps reservations held. Native sessions and
+swarms persist the ledger for recovery; resuming cannot reset spend or loosen
+saved parent limits. Verification callbacks that make SDK calls must forward
+their `execution` and `signal`.
 
-```ts
-import { createPriceProvider } from '@deuz-sdk/core/pricing';
-import type { PriceTable } from '@deuz-sdk/core';
+Admission uses estimates, so actual usage can exceed a reservation. The ledger
+records that overage and prevents later admission when the limit is exhausted.
+See [native agent budgets](/docs/modules/native-agents#mandatory-policy-and-shared-budgets)
+and [swarm budgets](/docs/modules/swarm#policy-budgets-and-versioning) for persistence
+and child-policy details.
 
-const myTable: PriceTable = {
-  'my-private-model': { input: 2, output: 4 },
-  'claude-opus-4-8': { input: 4.5, output: 22, cachedRead: 0.45 }, // negotiated rate
+## Custom rates and margins
+
+Override individual rows for a deployment, or add your own model. **Each supplied
+row replaces the complete row for that ID.** Spread an existing row to preserve
+its cache rates and long-context tiers.
+
+```ts title="custom-prices.ts"
+import { createPriceProvider, PRICES_2026 } from '@deuz-sdk/core/pricing';
+import type { PriceTable } from '@deuz-sdk/core/pricing';
+
+const table: PriceTable = {
+  'claude-opus-5': {
+    ...PRICES_2026['claude-opus-5'],
+    input: 4.5, // Example contract rates, not public list prices.
+    output: 22.5,
+    cachedRead: 0.45,
+    cacheWrite: 5.625,
+    cacheWrite1h: 9,
+  },
 };
 
-const priceProvider = createPriceProvider({ table: myTable, margin: 1.2 });
-
-priceProvider.priceUsage('my-private-model', usage); // uses your row
-priceProvider.priceUsage('gpt-5.2', usage); // still resolves from PRICES_2026
+const priceProvider = createPriceProvider({ table, margin: 1.2 });
+// The factory retains other bundled rows and applies a 20% markup.
+const usd = await priceProvider.priceUsage('claude-opus-5', usage);
 ```
 
-To override globally without a provider, pass your table as the third argument to `priceUsage(model, usage, myTable)`.
+`margin` is a multiplier, defaults to `1`, and also scales `cacheSavings`.
+`createPriceProvider` performs no network calls and works in edge runtimes.
 
-## Related
+Passing `priceUsage(model, usage, table)` directly is different: the third argument
+is the **entire lookup table**, with no automatic merge. To extend the bundled
+table in that form, pass `{ ...PRICES_2026, ...table }`.
 
-- [Dependencies & Clients](/docs/core/dependencies) — the full `deps` seam, `onUsage`/`onFinish` precedence (G10), and `createClient`.
-- [UI Streaming](/docs/modules/ui-streaming) — how the `cost` and `budget-exceeded` parts ride the wire to the browser.
-- [streamChat](/docs/core/stream-chat) — `usage: Promise<Usage>` and the never-throws contract.
-- [generateText](/docs/core/generate-text) and [generateObject](/docs/core/generate-object) — `usage: Usage` on every result.
-- [Embeddings](/docs/core/embeddings) — input-only `Usage` for `embed` / `embedMany`.
+## Model lookup
+
+Lookup first checks the exact ID, then tries a normalized ID with a supported
+vendor prefix or trailing date/suffix removed. Its final fallback is the longest
+known prefix of the original ID.
+
+```ts
+priceUsage('openai/gpt-6-astra', usage); // Resolves the Astra row.
+priceUsage('my-private-model', usage); // undefined without a matching row.
+```
+
+Prefer exact IDs and explicit rows for new models. A family-prefix match can
+resolve a price even when the variant has a different tariff. For strict
+application billing, require `Object.hasOwn(table, modelId)` before estimating.
+Do not turn `undefined` into a zero-dollar charge.
+
+## `PRICES_2026` and `ModelPrice`
+
+`PRICES_2026` is a bundled snapshot, not a live pricing feed. The highlighted rows
+above were verified on the stated date; other bundled models retain their own
+historical rates. Check the provider's tariff when updating a deployment.
+
+`PriceTable` is `Record<string, ModelPrice>`. Each row requires `input` and
+`output`, with optional `cachedRead`, `cacheWrite`, `cacheWrite1h` and `audio` rates.
+Two optional context tiers are supported:
+
+| Row field  | Trigger                                                        | Behavior                                      |
+| ---------- | -------------------------------------------------------------- | --------------------------------------------- |
+| `over200k` | `inputTokens + cachedReadTokens > 200_000`                     | Existing tier for selected Gemini rows.       |
+| `over272k` | Fresh input + cache reads + both cache-write buckets > 272,000 | Tier used by the listed GPT-6 / GPT-5.6 rows. |
+
+An active tier overrides rates for the whole call. Price individual invocations
+before summing their costs; a run's accumulated tokens are not one long prompt.
+`priceUsage` and `cacheSavings` select the same tier.
+
+## API at a glance
+
+| Export                                     | Use it for                            |
+| ------------------------------------------ | ------------------------------------- |
+| `priceUsage(model, usage, table?)`         | Estimate one invocation in USD.       |
+| `cacheSavings(model, usage, table?)`       | Estimate savings from cache reads.    |
+| `createPriceProvider({ table?, margin? })` | Inject pricing into calls or clients. |
+| `PRICES_2026`                              | Read or extend the bundled rates.     |
+| `ModelPrice`, `PriceTable`                 | Type your own pricing configuration.  |
+
+Prices here cover the token buckets available in `Usage`. Per-request fees,
+provider tools, storage, media jobs and application infrastructure need their own
+accounting. Continue with [clients and dependencies](/docs/core/dependencies),
+[UI streaming](/docs/modules/ui-streaming), [native agents](/docs/modules/native-agents)
+or [swarms](/docs/modules/swarm).

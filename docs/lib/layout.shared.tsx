@@ -23,6 +23,7 @@ export function localePath(locale: string, path: string): string {
   return locale === i18n.defaultLanguage ? path : `/${locale}${path}`;
 }
 
+/** The ring and the dot — the same mark the favicon and the mascot's head carry (ring:dot = 4:1). */
 export function Logo() {
   return (
     <svg
@@ -31,28 +32,10 @@ export function Logo() {
       viewBox="0 0 24 24"
       fill="none"
       aria-hidden="true"
-      className="rounded-md"
+      className="size-5"
     >
-      <rect width="24" height="24" rx="6" fill="url(#deuz-logo-gradient)" />
-      <path
-        d="M5 14.5c1.75 0 1.75-2.5 3.5-2.5s1.75 2.5 3.5 2.5 1.75-2.5 3.5-2.5 1.75 2.5 3.5 2.5"
-        stroke="#fff"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-      />
-      <path
-        d="M5 9.5c1.75 0 1.75-2 3.5-2s1.75 2 3.5 2 1.75-2 3.5-2 1.75 2 3.5 2"
-        stroke="#fff"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        opacity="0.55"
-      />
-      <defs>
-        <linearGradient id="deuz-logo-gradient" x1="0" y1="0" x2="24" y2="24">
-          <stop stopColor="#0EA5E9" />
-          <stop offset="1" stopColor="#6366F1" />
-        </linearGradient>
-      </defs>
+      <circle cx="12" cy="12" r="8" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="12" cy="12" r="2" fill="currentColor" />
     </svg>
   );
 }
@@ -77,7 +60,7 @@ export function baseOptions(locale: string): BaseLayoutProps {
       },
       {
         text: labels.whatsNew,
-        url: localePath(locale, '/docs/reference/whats-new-2-1'),
+        url: localePath(locale, '/docs/reference/whats-new-2-2'),
         active: 'url',
       },
       {

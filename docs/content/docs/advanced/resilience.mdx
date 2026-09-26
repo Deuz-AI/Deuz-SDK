@@ -321,7 +321,7 @@ The rules:
 - **The audit trail**: the winning result carries `providerMetadata.deuz.failedOver = { from, to, reason }` (keys are `provider:model` strings, `reason` is the failing error's code). On streaming it rides the terminal `finish` part's `providerMetadata`. The `onFallback` hook fires once per hop.
 - **G2 holds**: the streaming form returns synchronously; an exhausted candidate list surfaces as an `error` part + rejected promises. On streaming, durable identity is stable too — a missing `session.runId` is minted once before the first attempt (and exposed synchronously on the result), so every candidate checkpoints under the same run.
 
-Honest caveats: provider capabilities differ, so pick fallbacks whose capability profile covers your call (a tool-heavy call falling back to a model without tool support will fail on the fallback too — the registry's conservative defaults apply). Cost differs per model too — the loop (and the [`cost` part](/docs/modules/pricing#live-cost-stream-17)) prices against the model that actually ran, not the primary you asked for.
+Honest caveats: provider capabilities differ, so pick fallbacks whose capability profile covers your call (a tool-heavy call falling back to a model without tool support will fail on the fallback too — the registry's conservative defaults apply). Cost differs per model too — the loop (and the [`cost` part](/docs/modules/pricing#live-cost-stream)) prices against the model that actually ran, not the primary you asked for.
 
 ## Related
 
