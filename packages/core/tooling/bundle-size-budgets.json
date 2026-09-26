@@ -278,7 +278,7 @@
     },
     "ops": {
       "from": "@deuz-sdk/core/ops",
-      "exports": ["createInMemoryLeaseProvider", "assertLeaseRequest", "assertEnvelopeRevision"],
+      "exports": ["createInMemoryLeaseProvider"],
       "maxRawBytes": 2200,
       "maxGzipBytes": 1070
     },

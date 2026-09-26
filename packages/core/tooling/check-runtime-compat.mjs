@@ -37,7 +37,7 @@ const consumers = [
   },
   {
     name: 'ops',
-    source: `export { createInMemoryLeaseProvider, assertEnvelopeRevision }
+    source: `export { createInMemoryLeaseProvider }
       from '@deuz-sdk/core/ops';`,
   },
   {
