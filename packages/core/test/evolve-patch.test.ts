@@ -183,4 +183,53 @@ describe('extractFullRewrite', () => {
       expect.objectContaining({ code: 'empty_rewrite' }),
     );
   });
+
+  describe('the final newline', () => {
+    // The shape of a template literal that closes right after the last line.
+    const bare = '# EVOLVE-BLOCK-START\nx = 1\n# EVOLVE-BLOCK-END\nprint(x)';
+    // How a model answers: the prompt shows the program without its final line
+    // break, and the closing fence always sits on a line of its own.
+    const fence = (source: string) => '```python\n' + source + '\n```';
+
+    it('accepts a fenced rewrite of a program without one, and keeps it without one', () => {
+      const rewritten = bare.replace('x = 1', 'x = 2');
+      expect(extractFullRewrite(bare, fence(rewritten))).toBe(rewritten);
+    });
+
+    it('restores the final newline a rewrite of a program with one dropped', () => {
+      const parent = `${bare}\n`;
+      expect(extractFullRewrite(parent, bare.replace('x = 1', 'x = 2'))).toBe(
+        parent.replace('x = 1', 'x = 2'),
+      );
+      expect(extractFullRewrite(parent, '```\n' + bare.replace('x = 1', 'x = 2') + '```')).toBe(
+        parent.replace('x = 1', 'x = 2'),
+      );
+    });
+
+    it('treats a rewrite that differs only in the final newline as the parent itself', () => {
+      expect(extractFullRewrite(bare, fence(bare))).toBe(bare);
+      expect(extractFullRewrite(`${bare}\n`, bare)).toBe(`${bare}\n`);
+    });
+
+    it('sets line endings aside, a CRLF parent included', () => {
+      const crlf = bare.replace(/\n/g, '\r\n');
+      const rewritten = bare.replace('x = 1', 'x = 2');
+      expect(extractFullRewrite(crlf, fence(rewritten))).toBe(rewritten);
+      expect(extractFullRewrite(`${crlf}\r\n`, rewritten)).toBe(`${rewritten}\n`);
+    });
+
+    it('still rejects a changed last line or an added blank line', () => {
+      expect(() => extractFullRewrite(bare, fence(bare.replace('print(x)', 'print(0)')))).toThrow(
+        expect.objectContaining({ code: 'frozen_changed' }),
+      );
+      expect(() => extractFullRewrite(bare, fence(`${bare}\n`))).toThrow(
+        expect.objectContaining({ code: 'frozen_changed' }),
+      );
+    });
+
+    it('follows the parent for a program without markers too', () => {
+      expect(extractFullRewrite('a = 1', fence('a = 2'))).toBe('a = 2');
+      expect(extractFullRewrite('a = 1\n', 'a = 2')).toBe('a = 2\n');
+    });
+  });
 });

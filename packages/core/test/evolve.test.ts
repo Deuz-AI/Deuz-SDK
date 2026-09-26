@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { evolve, resumeEvolve } from '../src/evolve/controller';
 import { createInMemoryPopulationStore } from '../src/evolve/store';
-import { createMockModel } from '../src/testing';
+import { createMockModel, sseEvents } from '../src/testing';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import type { LanguageModel } from '../src/types/model';
 import type {
@@ -238,6 +238,114 @@ describe('evolve: the loop', () => {
   });
 });
 
+describe('evolve: full rewrites and the final newline', () => {
+  // Frozen code that ends without a line break, like a template literal that
+  // closes right after its last line.
+  const bare = [
+    'def f(x):',
+    '    # EVOLVE-BLOCK-START',
+    '    return x',
+    '    # EVOLVE-BLOCK-END',
+    'print(f(1))',
+  ].join('\n');
+
+  /**
+   * Answers like a real model: the current program read back from the prompt,
+   * grown by one line, in a fence whose closing line follows a line break. A
+   * diff for the same growth follows, for the slots that ask for one.
+   */
+  function rewriter() {
+    const base = createMockModel({ responses: [] });
+    const model = attachConfig(
+      { ...base },
+      {
+        ...readConfig(base)!,
+        fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+          const { messages } = JSON.parse(String(init?.body)) as {
+            messages: { role: string; content: string | { text: string }[] }[];
+          };
+          const user = messages.find((message) => message.role === 'user')!.content;
+          const prompt = typeof user === 'string' ? user : user.map((part) => part.text).join('');
+          const section = prompt.slice(prompt.indexOf('## Current program'));
+          const start = section.indexOf('```\n') + 4;
+          const parent = section.slice(start, section.indexOf('\n```', start));
+          const grown = parent.replace('    return x', '    x = x + 1\n    return x');
+          const text = '```python\n' + grown + '\n```\n' + GROW;
+          return readConfig(createMockModel({ responses: [{ text }] }))!.fetch!(input, init);
+        }) as typeof fetch,
+      },
+    );
+    return counted(model);
+  }
+
+  it.each([
+    ['without', bare],
+    ['with', `${bare}\n`],
+  ])('accepts full rewrites of a program %s a final newline', async (_label, source) => {
+    const { model, counter } = rewriter();
+    const store = createInMemoryPopulationStore();
+    const result = await evolve(
+      options({
+        store,
+        initial: source,
+        models: [{ model }],
+        patch: { full: 1 },
+        generations: 2,
+        mutationsPerGeneration: 3,
+      }),
+    ).result;
+    expect(counter.calls).toBe(6);
+    const children = (await store.listCandidates(result)).filter((item) => item.generation > 0);
+    expect(children.filter((item) => item.rejection?.kind === 'patch')).toEqual([]);
+    expect(result.best?.score).toBe(2);
+    expect(result.best?.program).toBe(
+      source.replace('    return x', '    x = x + 1\n    x = x + 1\n    return x'),
+    );
+    // A rewrite keeps its parent's final newline, or its absence.
+    for (const child of children) expect(child.program.endsWith('\n')).toBe(source.endsWith('\n'));
+  });
+
+  it.each([
+    ['without', bare],
+    ['with', `${bare}\n`],
+  ])('accepts crossovers of a program %s a final newline', async (_label, source) => {
+    const store = createInMemoryPopulationStore();
+    const result = await evolve(
+      options({
+        store,
+        initial: source,
+        models: [{ model: rewriter().model }],
+        patch: { cross: 1 },
+        generations: 2,
+        mutationsPerGeneration: 1,
+      }),
+    ).result;
+    const [first, second] = await store.listCandidates(result, {
+      ids: ['g1-i0-s0', 'g2-i0-s0'],
+    });
+    // A lone seed has no partner, so generation 1 falls back to a diff.
+    expect(first).toMatchObject({ patchType: 'diff', accepted: true, score: 1 });
+    expect(second).toMatchObject({ patchType: 'cross', accepted: true, score: 2 });
+    expect(second!.program.endsWith('\n')).toBe(source.endsWith('\n'));
+  });
+
+  it('rejects a rewrite that only adds the final newline as a duplicate of its parent', async () => {
+    const echo = '```python\n' + bare + '\n```';
+    const store = createInMemoryPopulationStore();
+    const result = await evolve(
+      options({
+        store,
+        initial: bare,
+        models: [{ model: grower(echo).model }],
+        patch: { full: 1 },
+        generations: 1,
+      }),
+    ).result;
+    const children = await store.listCandidates(result, { generation: 1 });
+    expect(children.map((child) => child.rejection?.kind)).toEqual(['duplicate', 'duplicate']);
+  });
+});
+
 describe('evolve: evaluation cascade', () => {
   it('stops at the first stage below its threshold and scores by the last evaluated stage', async () => {
     let expensive = 0;
@@ -334,6 +442,66 @@ describe('evolve: stopping', () => {
     expect(result).toMatchObject({ status: 'completed', reason: 'plateau', generation: 2 });
   });
 
+  it('finishes at the seed when it already meets the target, without a model call', async () => {
+    const { model, counter } = grower();
+    const result = await evolve(
+      options({
+        models: [{ model }],
+        stages: [{ evaluate: () => ({ score: 10 }) }],
+        stopWhen: { targetScore: 5 },
+        generations: 4,
+        mutationsPerGeneration: 3,
+      }),
+    ).result;
+    expect(result).toMatchObject({
+      status: 'completed',
+      reason: 'target',
+      generation: 0,
+      modelCalls: 0,
+    });
+    expect(counter.calls).toBe(0);
+  });
+
+  it('checks the target and the plateau on resume before paying for a generation', async () => {
+    const { model, counter } = grower();
+    const reached = createInMemoryPopulationStore();
+    await evolve(options({ store: reached, generations: 1 })).result;
+    const target = await resumeEvolve(
+      options({
+        store: reached,
+        models: [{ model }],
+        generations: 5,
+        stopWhen: { targetScore: 1 },
+      }),
+    ).result;
+    expect(target).toMatchObject({
+      status: 'completed',
+      reason: 'target',
+      generation: 1,
+      modelCalls: 0,
+    });
+
+    const flat: EvolveStage = { evaluate: () => ({ score: 1 }) };
+    const stale = createInMemoryPopulationStore();
+    await evolve(options({ store: stale, stages: [flat], generations: 2 })).result;
+    const plateau = await resumeEvolve(
+      options({
+        store: stale,
+        stages: [flat],
+        models: [{ model }],
+        generations: 5,
+        stopWhen: { plateau: 2 },
+      }),
+    ).result;
+    expect(plateau).toMatchObject({
+      status: 'completed',
+      reason: 'plateau',
+      generation: 2,
+      modelCalls: 0,
+    });
+    expect(counter.calls).toBe(0);
+  });
+
   it('stops cleanly on budget exhaustion and keeps the ledger bounded', async () => {
     const { model, counter } = grower();
     const store = createInMemoryPopulationStore();
@@ -382,6 +550,186 @@ describe('evolve: stopping', () => {
     const result = await cancelled.result;
     expect(result).toMatchObject({ status: 'stopped', reason: 'cancelled' });
     expect(await store.loadRun(result)).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+  });
+
+  it('stores nothing for a mutation cancelled mid-stream, so a resume pays for it again', async () => {
+    let requested!: () => void;
+    const inFlight = new Promise<void>((resolve) => (requested = resolve));
+    const base = createMockModel({ responses: [] });
+    // Half a diff, then silence until the request is aborted.
+    const stalling = attachConfig(
+      { ...base },
+      {
+        ...readConfig(base)!,
+        fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+          const signal = init!.signal!;
+          const half = sseEvents([
+            {
+              data: {
+                choices: [{ index: 0, delta: { content: GROW.slice(0, 30) }, finish_reason: null }],
+              },
+            },
+          ]);
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(half));
+              signal.addEventListener('abort', () => controller.error(signal.reason), {
+                once: true,
+              });
+              requested();
+            },
+          });
+          return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+        }) as typeof fetch,
+      },
+    );
+    const store = createInMemoryPopulationStore();
+    const shape = { store, generations: 1, mutationsPerGeneration: 1 };
+    const handle = evolve(options({ ...shape, models: [{ model: stalling }] }));
+    await inFlight;
+    await handle.cancel();
+    const result = await handle.result;
+    // The request was sent, so it counts, but its slot is not done.
+    expect(result).toMatchObject({ status: 'stopped', reason: 'cancelled', modelCalls: 1 });
+    // Only the seed: the cancelled slot left nothing for a resume to replay.
+    expect((await store.listCandidates(result)).map((item) => item.id)).toEqual(['g0-i0-s0']);
+
+    const { model, counter } = grower();
+    const resumed = await resumeEvolve(options({ ...shape, models: [{ model }] })).result;
+    expect(counter.calls).toBe(1);
+    expect(resumed).toMatchObject({ status: 'completed', generation: 1 });
+    expect(resumed.best?.score).toBe(1);
+  });
+});
+
+describe('evolve: model errors', () => {
+  const key = { scope: 'tenant', runId: 'run' };
+
+  /** A model whose provider answers every request with the same HTTP error. */
+  function answering(status: number, message: string) {
+    const base = createMockModel({ responses: [] });
+    return counted(
+      attachConfig(
+        { ...base },
+        {
+          ...readConfig(base)!,
+          fetch: (async () =>
+            new Response(JSON.stringify({ error: { message } }), {
+              status,
+              headers: { 'content-type': 'application/json' },
+            })) as typeof fetch,
+        },
+      ),
+    );
+  }
+
+  it.each([
+    ['an elapsed deadline', { deadlineAt: 5 }, 'deadline_exceeded'],
+    ['a disallowed model', { allowedModels: ['another-model'] }, 'model_not_allowed'],
+  ])('fails the run on %s without calling the model', async (_label, policy, code) => {
+    const { model, counter } = grower();
+    const store = createInMemoryPopulationStore();
+    const handle = evolve(
+      options({ store, models: [{ model }], policy, generations: 4, mutationsPerGeneration: 2 }),
+    );
+    const events = collect(handle.events());
+    await expect(handle.result).rejects.toMatchObject({ name: 'ExecutionPolicyError', code });
+    expect(counter.calls).toBe(0);
+    expect(await store.loadRun(key)).toMatchObject({
+      status: 'failed',
+      reason: 'error',
+      generation: 0,
+    });
+    expect(await store.listCandidates(key, { generation: 1 })).toEqual([]);
+    expect((await events).at(-1)).toEqual({
+      type: 'run.finished',
+      status: 'failed',
+      reason: 'error',
+    });
+  });
+
+  it.each([
+    [401, 'AuthenticationError'],
+    [403, 'AuthenticationError'],
+    [404, 'ModelNotFoundError'],
+  ])('fails the run when the provider answers %i', async (status, name) => {
+    const { model, counter } = answering(status, 'Incorrect API key provided.');
+    const store = createInMemoryPopulationStore();
+    const handle = evolve(
+      options({ store, models: [{ model }], generations: 4, mutationsPerGeneration: 2 }),
+    );
+    await expect(handle.result).rejects.toMatchObject({ name, statusCode: status });
+    // The two slots of generation 1 were in flight together; nothing ran after them.
+    expect(counter.calls).toBe(2);
+    expect(await store.loadRun(key)).toMatchObject({
+      status: 'failed',
+      error: 'Incorrect API key provided.',
+    });
+    expect(await store.listCandidates(key, { generation: 1 })).toEqual([]);
+  });
+
+  it('fails the run on a missing API key without sending a request', async () => {
+    const { model, counter } = grower();
+    const { apiKey: _omitted, ...keyless } = readConfig(model)!;
+    const handle = evolve(
+      options({ models: [{ model: attachConfig({ ...model }, keyless) }], generations: 4 }),
+    );
+    await expect(handle.result).rejects.toMatchObject({ name: 'AuthenticationError' });
+    expect(counter.calls).toBe(0);
+  });
+
+  it('keeps the paid work of in-flight slots when another slot fails the run', async () => {
+    const good = grower();
+    const store = createInMemoryPopulationStore();
+    const ensemble = (second: LanguageModel) =>
+      options({ store, models: [{ model: good.model }, { model: second }], generations: 1 });
+    // UCB1 tries both models in generation 1: slot 0 draws the working one.
+    await expect(
+      evolve(ensemble(answering(401, 'Incorrect API key provided.').model)).result,
+    ).rejects.toMatchObject({ name: 'AuthenticationError' });
+    expect((await store.listCandidates(key, { generation: 1 })).map((item) => item.id)).toEqual([
+      'g1-i0-s0',
+    ]);
+    // With the key fixed, the stored slot replays and only the failed one is paid again.
+    const fixed = grower();
+    const result = await resumeEvolve(ensemble(fixed.model)).result;
+    expect(result).toMatchObject({ status: 'completed', generation: 1, modelCalls: 1 });
+    expect(good.counter.calls).toBe(1);
+    expect(fixed.counter.calls).toBe(1);
+  });
+
+  it('rejects only the candidate on an error its own prompt may cause, and counts the call', async () => {
+    const { model, counter } = answering(400, 'The prompt is not valid.');
+    const store = createInMemoryPopulationStore();
+    const result = await evolve(options({ store, models: [{ model }], generations: 1 })).result;
+    expect(result).toMatchObject({ status: 'completed', reason: 'generations', modelCalls: 2 });
+    expect(counter.calls).toBe(2);
+    const children = await store.listCandidates(key, { generation: 1 });
+    expect(children.map((child) => child.rejection)).toEqual([
+      { kind: 'model', message: 'The prompt is not valid.' },
+      { kind: 'model', message: 'The prompt is not valid.' },
+    ]);
+  });
+
+  it('does not count a call that an open circuit breaker refused', async () => {
+    const { model, counter } = grower();
+    const store = createInMemoryPopulationStore();
+    const result = await evolve(
+      options({
+        store,
+        models: [{ model }],
+        generations: 1,
+        deps: {
+          ...deps,
+          breakerStore: { get: () => ({ failures: 5, cooldownUntil: 2_000 }), set: () => {} },
+        },
+      }),
+    ).result;
+    expect(counter.calls).toBe(0);
+    expect(result).toMatchObject({ status: 'completed', modelCalls: 0 });
+    const children = await store.listCandidates(key, { generation: 1 });
+    expect(children.map((child) => child.rejection?.kind)).toEqual(['model', 'model']);
+    expect(children[0]!.rejection!.message).toMatch(/Circuit breaker open/);
   });
 });
 

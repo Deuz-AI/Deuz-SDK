@@ -96,7 +96,10 @@ try {
 Each SEARCH must match exactly once inside an evolve block. Otherwise the error
 code is `not_found`, `outside_evolve_block` or `ambiguous`. A REPLACE containing
 a marker is `marker_in_replace`. A full rewrite that changes frozen code is
-`frozen_changed`. In a run, a patch error rejects that candidate with
+`frozen_changed`. Line endings and a single final newline are not changes: the
+prompt shows the parent without its final newline and a fence adds one back, so
+`extractFullRewrite` gives the rewrite its parent's final newline, or leaves it
+off when the parent has none. In a run, a patch error rejects that candidate with
 `rejection.kind: 'patch'`. The evaluators never see it, and the run goes on.
 
 ## Evaluation cascade
@@ -179,12 +182,29 @@ reservation would exceed the budget, the run commits what it already has and
 stops with `status: 'stopped'` and `reason: 'budget'`. `result.totals` holds
 the spend. A resumed run can tighten the stored budget but never loosen it.
 
+A model error that every later call would repeat fails the run. That covers an
+execution policy refusal, such as an elapsed `policy.deadlineAt` or a model
+outside `policy.allowedModels`, any other fatal execution error apart from
+budget exhaustion, and the configuration errors `AuthenticationError`,
+`ModelNotFoundError` and `UnsupportedCapabilityError`. The slots already in
+flight finish and keep their candidates, the run is saved with
+`status: 'failed'`, and `handle.result` rejects with the error, so
+`resumeEvolve` can continue once the cause is fixed. Other model errors, such
+as a rate limit that outlasts its retries or a request the provider rejects as
+invalid, reject only that candidate with `rejection.kind: 'model'`.
+`result.modelCalls` counts the calls that sent a request: a refusal before the
+request, including an open circuit breaker, is not a call.
+
 `stopWhen.targetScore` ends the run with reason `'target'` once the best score
 reaches it. `stopWhen.plateau` ends it with reason `'plateau'` after that many
-generations without improvement. `handle.drain()` finishes the current
-generation and stops with reason `'drained'`. `handle.cancel()` or
-`options.signal` aborts in-flight work and stops with reason `'cancelled'`.
-`handle.events()` replays every event of the handle from the start:
+generations without improvement. Both are checked after every committed
+generation, the seed's generation zero included, and again when a run resumes,
+so a seed or a resumed run that already meets them finishes without a model
+call. `handle.drain()` finishes the current generation and stops with reason
+`'drained'`. `handle.cancel()` or `options.signal` aborts in-flight work and
+stops with reason `'cancelled'`. A mutation cut off mid-call stores no
+candidate, so a resume makes that call again instead of replaying a partial
+answer. `handle.events()` replays every event of the handle from the start:
 `generation.started`, `candidate`, `improvement`, `migration`, `island.reset`,
 `generation.committed` and `run.finished`.
 
