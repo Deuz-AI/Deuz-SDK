@@ -18,3 +18,19 @@ export type {
   Scheduler,
 } from './schedule/scheduler';
 export { createScheduler, createInMemoryClaim } from './schedule/scheduler';
+export type {
+  SignalRejection,
+  SignalVerification,
+  HmacAlgorithm,
+  SignatureEncoding,
+  HmacSignatureOptions,
+  SlackVerifyOptions,
+  SignalDispatchInput,
+  HandleSignalOptions,
+} from './schedule/signal';
+export {
+  verifyHmacSignature,
+  verifyGitHubWebhook,
+  verifySlackRequest,
+  handleSignal,
+} from './schedule/signal';
