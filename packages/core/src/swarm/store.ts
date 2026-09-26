@@ -5,7 +5,9 @@ import type {
   SwarmEvent,
   SwarmEventInput,
   SwarmKey,
+  SwarmRunQuery,
   SwarmRunRecord,
+  SwarmRunStatus,
   SwarmSnapshot,
   SwarmStore,
   SwarmTaskRecord,
@@ -362,6 +364,36 @@ export function validateEventCursor(afterSequence: number, limit: number): void 
   }
 }
 
+const RUN_STATUSES: readonly SwarmRunStatus[] = [
+  'running',
+  'completed',
+  'partial',
+  'suspended',
+  'cancelled',
+];
+
+/** Shared listRuns validation (2.2). */
+export function validateRunQuery(query: SwarmRunQuery): void {
+  if (
+    !query ||
+    !Number.isSafeInteger(query.limit) ||
+    query.limit < 1 ||
+    query.limit > 1000 ||
+    (query.status !== undefined && !RUN_STATUSES.includes(query.status)) ||
+    (query.scope !== undefined && (typeof query.scope !== 'string' || !query.scope))
+  )
+    throw new Error('Invalid swarm run query (status, scope, or limit 1..1000)');
+}
+
+/** The listRuns order (2.2): updatedAt, then scope, then runId. */
+export function compareRuns(left: SwarmRunRecord, right: SwarmRunRecord): number {
+  return (
+    left.updatedAt - right.updatedAt ||
+    (left.scope < right.scope ? -1 : left.scope > right.scope ? 1 : 0) ||
+    (left.runId < right.runId ? -1 : left.runId > right.runId ? 1 : 0)
+  );
+}
+
 /** In-process reference store with exactly the same CAS/atomicity contract as SQLite. */
 export function createInMemorySwarmStore(): SwarmStore {
   const runs = new Map<
@@ -375,7 +407,21 @@ export function createInMemorySwarmStore(): SwarmStore {
     }
   >();
   return {
-    capabilities: Object.freeze(['spawn', 'channels'] as const),
+    capabilities: Object.freeze(['spawn', 'channels', 'list'] as const),
+    async listRuns(query) {
+      validateRunQuery(query);
+      return cloneSwarm(
+        [...runs.values()]
+          .map((row) => row.run)
+          .filter(
+            (run) =>
+              (query.status === undefined || run.status === query.status) &&
+              (query.scope === undefined || run.scope === query.scope),
+          )
+          .sort(compareRuns)
+          .slice(0, query.limit),
+      );
+    },
     async create(snapshot, inputs) {
       validateSwarmSnapshot(snapshot);
       if (snapshot.run.revision !== 0 || snapshot.run.lastSequence !== 0)

@@ -18,6 +18,7 @@ import {
   SwarmConflictError,
   validateChannelName,
   validateEventCursor,
+  validateRunQuery,
   validateSwarmSnapshot,
   validateSpawn,
   validateTaskChange,
@@ -171,7 +172,32 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
       insert.run(event.scope, event.runId, event.sequence, encodeSwarm(event));
   };
   return {
-    capabilities: Object.freeze(['spawn', 'channels'] as const),
+    capabilities: Object.freeze(['spawn', 'channels', 'list'] as const),
+    async listRuns(query) {
+      validateRunQuery(query);
+      const where: string[] = [];
+      const params: (string | number)[] = [];
+      if (query.status !== undefined) {
+        where.push('status=?');
+        params.push(query.status);
+      }
+      if (query.scope !== undefined) {
+        where.push('scope=?');
+        params.push(query.scope);
+      }
+      return use((db) =>
+        (
+          statement(
+            db,
+            `SELECT payload FROM deuz_swarm_runs${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY updated_at, scope, run_id LIMIT ?`,
+          ).all(...params, query.limit) as PayloadRow[]
+        ).map((row) => {
+          const run = decodeSwarm<SwarmRunRecord>(row.payload);
+          validateSwarmSnapshot({ run, tasks: [] });
+          return run;
+        }),
+      );
+    },
     async create(snapshot, inputs) {
       validateSwarmSnapshot(snapshot);
       if (snapshot.run.revision !== 0 || snapshot.run.lastSequence !== 0)
