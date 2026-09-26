@@ -237,6 +237,68 @@ describe('swarm leases', () => {
     expect(frozen.pending()).toBe(0);
   });
 
+  it('reports a zombie as lost when its first write after a takeover meets the revision check', async () => {
+    const time = manualClock();
+    const frozen = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    const stuck = gate();
+    const calls = { count: 0 };
+    const a = swarmOn({
+      store,
+      clock: frozen.clock,
+      provider,
+      owner: 'a',
+      work: slow(stuck.promise, calls),
+    });
+    const zombie = await a.run({ ...key, tasks });
+    await until(() => calls.count === 1);
+    await time.advance(10_000);
+    const b = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      provider,
+      owner: 'b',
+      work: slow(Promise.resolve(), calls),
+    });
+    expect((await (await b.resume(key)).result).run.status).toBe('completed');
+    const settled = await store.head!(key);
+    // A wakes up and its task finishes before any heartbeat fires, so its first
+    // write reaches the store's revision check instead of a renewal.
+    stuck.resolve();
+    const lost = await zombie.result.catch((error: unknown) => error);
+    expect(lost).toBeInstanceOf(SwarmLeaseError);
+    expect(lost).toMatchObject({ code: 'lost' });
+    expect(await store.head!(key)).toEqual(settled);
+  });
+
+  it('keeps a revision conflict when the executor still holds its lease', async () => {
+    const time = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    const release = gate();
+    const calls = { count: 0 };
+    const a = swarmOn({
+      store,
+      clock: time.clock,
+      provider,
+      owner: 'a',
+      work: slow(release.promise, calls),
+    });
+    const handle = await a.run({ ...key, tasks });
+    await until(() => calls.count === 1);
+    // A process without the lease option records a cancel behind the holder's back.
+    const unleased = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      owner: 'b',
+      work: slow(Promise.resolve(), calls),
+    });
+    expect(await unleased.requestCancel(key)).toBe('recorded');
+    release.resolve();
+    await expect(handle.result).rejects.toBeInstanceOf(SwarmConflictError);
+  });
+
   it('treats a failing renew as lost only once the lease expired, leaving tasks running', async () => {
     const time = manualClock();
     const inner = createInMemoryLeaseProvider({ clock: time.clock });

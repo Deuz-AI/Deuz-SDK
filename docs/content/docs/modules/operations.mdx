@@ -73,6 +73,12 @@ instance.
   nothing more. Its `handle.result` rejects with `SwarmLeaseError` code
   `'lost'`. Task records stay as they were, and the next executor reconciles
   them as it would after a crash.
+- A zombie can also learn it was replaced from its own write: after a takeover,
+  its next commit fails the store's revision check, possibly before any
+  heartbeat. On a `SwarmConflictError` the executor renews once, and
+  `handle.result` rejects with `'lost'` when the lease is gone. A conflict with
+  a writer that holds no lease, such as a process without the `lease` option,
+  stays a `SwarmConflictError`.
 - A renewal that throws, for example during a database outage, counts as lost
   only once the lease could have expired; until then the next beat retries.
 - The lease is released when the executor stops, whatever the outcome.

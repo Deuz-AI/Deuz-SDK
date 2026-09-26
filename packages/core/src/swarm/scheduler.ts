@@ -769,6 +769,11 @@ export function createSwarm(options: SwarmOptions): Swarm {
         controller.abort(error);
         // A replacement executor must not overlap still-running local effects.
         await Promise.allSettled(running);
+        // A zombie's first write after a takeover can reach the revision check
+        // before its heartbeat notices (2.2); one renewal tells a lost lease
+        // from a conflict with a holder that still owns the run.
+        if (error instanceof SwarmConflictError || writeFailure instanceof SwarmConflictError)
+          await renewLease();
         throw lost ?? error;
       } finally {
         stopped = true;
