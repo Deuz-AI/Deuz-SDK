@@ -48,6 +48,15 @@ const executors = new WeakMap<SwarmStore, Set<string>>();
 // recover (2.2): the most running runs one call examines, and its listing page.
 const RECOVER_SCAN = 10_000;
 const RECOVER_PAGE = 1_000;
+// recover (2.2): consecutive failures, other than a run's own, that end a scan.
+const RECOVER_FAILURES = 3;
+// Why a resume failed, for recover (2.2): 'lease' when the lease provider threw
+// on acquire, 'run' when a check on the run's own content refused it.
+const failureKinds = new WeakMap<object, 'lease' | 'run'>();
+function tagFailure(error: unknown, kind: 'lease' | 'run'): unknown {
+  if (typeof error === 'object' && error !== null) failureKinds.set(error, kind);
+  return error;
+}
 // Terminal tasks never run again, so their accounting can fold (2.2).
 const TERMINAL: ReadonlySet<SwarmTaskStatus> = new Set<SwarmTaskStatus>([
   'completed',
@@ -159,11 +168,16 @@ export function createSwarm(options: SwarmOptions): Swarm {
   const leaseKey = (key: SwarmKey): string => `swarm:${swarmKey(key)}`;
   const claim = async (key: SwarmKey): Promise<Lease | undefined> => {
     if (!leasing) return undefined;
-    const lease = await leasing.provider.acquire({
-      key: leaseKey(key),
-      owner: leaseOwner,
-      ttlMs: leaseTtl,
-    });
+    let lease: Lease | undefined;
+    try {
+      lease = await leasing.provider.acquire({
+        key: leaseKey(key),
+        owner: leaseOwner,
+        ttlMs: leaseTtl,
+      });
+    } catch (error) {
+      throw tagFailure(error, 'lease');
+    }
     if (!lease) throw new SwarmLeaseError('held');
     return lease;
   };
@@ -191,14 +205,14 @@ export function createSwarm(options: SwarmOptions): Swarm {
   const events = (
     key: SwarmKey,
     settings: { afterSequence?: number; signal?: AbortSignal } = {},
-    failure?: () => unknown,
+    failure?: () => Promise<unknown> | undefined,
   ): AsyncIterable<SwarmEvent> => ({
     async *[Symbol.asyncIterator]() {
       let cursor = settings.afterSequence ?? 0;
       validateEventCursor(cursor, 256);
       while (!settings.signal?.aborted) {
         const failed = failure?.();
-        if (failed) throw failed;
+        if (failed) throw await failed;
         const page = await options.store.readEvents(key, cursor, 256);
         for (const event of page) {
           cursor = event.sequence;
@@ -277,6 +291,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
         run: { executionState: { ...execution.snapshot(), ledger }, updatedAt: deps.clock.now() },
       }));
     };
+    let contextReady = false;
     try {
       execution = initial.run.executionState
         ? createExecutionContext({
@@ -293,12 +308,14 @@ export function createSwarm(options: SwarmOptions): Swarm {
             persist,
             admission: options.admission,
           });
+      contextReady = true;
       // Policy/scope state is durable before the first dispatch or reservation.
       await mutate(() => ({ run: { executionState: execution.snapshot() } }));
     } catch (error) {
       owned.delete(id);
       await unclaim(lease);
-      throw error;
+      // Saved execution state this process cannot restore is the run's own failure.
+      throw contextReady ? error : tagFailure(error, 'run');
     }
 
     const cancel = async () => {
@@ -325,6 +342,9 @@ export function createSwarm(options: SwarmOptions): Swarm {
     let draining = drainSignalled;
     // The durable commit of the last cancel a renewal delivered.
     let cancelling: Promise<void> | undefined;
+    // A renewal delivered a cancel (2.2). One no commit made durable is queued
+    // again before the lease is let go, so the next executor still applies it.
+    let delivered = false;
     let stopBeat: (() => void) | undefined;
     const lose = () => {
       lost ??= new SwarmLeaseError('lost');
@@ -339,6 +359,8 @@ export function createSwarm(options: SwarmOptions): Swarm {
         if (stopped || !held || lost) return;
         try {
           const renewal = await leasing!.provider.renew(held, leaseTtl);
+          // Noted even after this executor stopped: the release queues it again.
+          if (renewal.held && renewal.signals.includes('cancel')) delivered = true;
           if (stopped) return;
           if (!renewal.held) return lose();
           held = renewal.lease;
@@ -779,6 +801,18 @@ export function createSwarm(options: SwarmOptions): Swarm {
         stopped = true;
         stopBeat?.();
         signal?.removeEventListener('abort', abort);
+        // A delivered cancel that no commit made durable, including one a
+        // renewal still in flight brings, goes back in the queue while this
+        // executor holds the lease (2.2), unless the run settled past it.
+        await renewals;
+        await cancelling;
+        if (
+          delivered &&
+          !snapshot.run.cancelRequested &&
+          snapshot.run.status !== 'completed' &&
+          snapshot.run.status !== 'partial'
+        )
+          await restore(key, ['cancel']);
         // A stale token is ignored, so this is safe after a takeover too.
         await unclaim(held);
         owned.delete(id);
@@ -790,7 +824,17 @@ export function createSwarm(options: SwarmOptions): Swarm {
     const handle: SwarmHandle = {
       ...key,
       result,
-      events: (settings) => events(key, settings, () => writeFailure),
+      // A failed executor's reader throws what result rejects with (2.2): a
+      // revision conflict can still turn out to be a lost lease.
+      events: (settings) =>
+        events(key, settings, () =>
+          writeFailure === undefined
+            ? undefined
+            : result.then(
+                () => writeFailure,
+                (error: unknown) => error,
+              ),
+        ),
       cancel,
       drain: () => {
         draining = true;
@@ -801,13 +845,18 @@ export function createSwarm(options: SwarmOptions): Swarm {
     return handle;
   }
 
-  /** A resume's reads and checks: the run and the task changes its claim commits. */
-  async function prepareResume(input: SwarmResumeOptions): Promise<{
+  /**
+   * A resume's checks on the loaded run and the task changes its claim commits.
+   * Every failure here is the run's own (2.2): recover reports it and goes on.
+   */
+  function prepareResume(
+    input: SwarmResumeOptions,
+    snapshot: SwarmSnapshot | undefined,
+  ): {
     snapshot: SwarmSnapshot;
     changes: SwarmTaskRecord[];
     controlEvents: SwarmEventInput[];
-  }> {
-    const snapshot = await options.store.load(input);
+  } {
     if (!snapshot) throw new Error('Swarm run not found');
     validateSwarmSnapshot(snapshot, input);
     if (
@@ -948,7 +997,13 @@ export function createSwarm(options: SwarmOptions): Swarm {
       let queued: readonly LeaseSignal[] = [];
       let snapshot: SwarmSnapshot;
       try {
-        const prepared = await prepareResume(input);
+        const loaded = await options.store.load(input);
+        let prepared: ReturnType<typeof prepareResume>;
+        try {
+          prepared = prepareResume(input, loaded);
+        } catch (error) {
+          throw tagFailure(error, 'run');
+        }
         snapshot = prepared.snapshot;
         const { changes, controlEvents } = prepared;
         ({ lease, signals: queued } = await collect(lease));
@@ -1037,18 +1092,21 @@ export function createSwarm(options: SwarmOptions): Swarm {
           ...(after ? { after } : {}),
         });
         const known = listed.size;
-        for (const run of page.slice(0, size))
+        // A store may return more rows than asked: the cursor follows the rows kept.
+        const kept = page.slice(0, size);
+        for (const run of kept)
           listed.set(swarmKey(run), {
             key: { scope: run.scope, runId: run.runId },
             revision: run.revision,
           });
-        const last = page.at(-1);
+        const last = kept.at(-1);
         // A short page ends the listing, and so does one that adds nothing.
-        if (!last || page.length < size || listed.size === known) break;
+        if (!last || kept.length < size || listed.size === known) break;
         after = { updatedAt: last.updatedAt, scope: last.scope, runId: last.runId };
       }
       const handles: SwarmHandle[] = [];
       const failed: SwarmRecovery['failed'] = [];
+      let failing = 0;
       for (const [id, { key, revision }] of listed) {
         if (handles.length >= limit) break;
         if (owned.has(id)) continue;
@@ -1056,10 +1114,10 @@ export function createSwarm(options: SwarmOptions): Swarm {
           handles.push(
             await swarm.resume({ ...key, expectedRevision: revision, expectedStatus: 'running' }),
           );
+          failing = 0;
         } catch (error) {
           // A live holder, a run that moved on since it was listed, or one this
-          // process took up meanwhile. Anything else is this run's own failure,
-          // and it must not cost the other runs their recovery.
+          // process took up meanwhile.
           if (
             error instanceof SwarmLeaseError ||
             error instanceof SwarmConflictError ||
@@ -1067,6 +1125,14 @@ export function createSwarm(options: SwarmOptions): Swarm {
           )
             continue;
           failed.push({ key, error });
+          // A run's own failure (a definition this process lacks, say) must not
+          // cost the others their recovery. An outage would fail every run
+          // after it: a lease provider that throws on acquire ends the scan at
+          // once, any other failure (a store's, say) once it repeats.
+          const kind = typeof error === 'object' && error ? failureKinds.get(error) : undefined;
+          if (kind === 'lease') break;
+          failing = kind === 'run' ? 0 : failing + 1;
+          if (failing >= RECOVER_FAILURES) break;
         }
       }
       return { handles, failed };

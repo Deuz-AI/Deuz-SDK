@@ -305,7 +305,9 @@ and `handle.events(...)` read the same durable, ordered journal. A cursor is
 exclusive: passing 25 starts after event 25. Consumers read bounded pages rather
 than accumulating an unbounded producer queue. An event iterator ends when the
 current execution settles, including suspension; open another iterator when the
-run resumes. Breaking iteration or aborting its signal does not cancel execution.
+run resumes. If the executor fails, `handle.events()` throws the error that
+`handle.result` rejects with, once the executor has stopped. Breaking iteration
+or aborting its signal does not cancel execution.
 
 The journal stores task/run control events, not every model token. Retrieve
 outputs from the snapshot. A disconnected consumer can replay control events from

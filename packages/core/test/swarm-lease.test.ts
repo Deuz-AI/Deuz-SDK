@@ -272,6 +272,73 @@ describe('swarm leases', () => {
     expect(await store.head!(key)).toEqual(settled);
   });
 
+  it('reports the same lost lease from events() as from result', async () => {
+    const time = manualClock();
+    const frozen = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    let conflicted = false;
+    const noting: SwarmStore = {
+      ...store,
+      async commit(change) {
+        try {
+          return await store.commit(change);
+        } catch (error) {
+          if (error instanceof SwarmConflictError) conflicted = true;
+          throw error;
+        }
+      },
+    };
+    const first = gate();
+    const stubborn = gate();
+    const calls = { count: 0 };
+    const pair: SwarmTask[] = [
+      { id: 'a', reducer: 'work', replay: 'safe' },
+      { id: 'b', reducer: 'stubborn', replay: 'safe' },
+    ];
+    const a = createSwarm({
+      agents: {},
+      store: noting,
+      reducers: {
+        work: slow(first.promise, calls),
+        // Ignores the run's signal: it returns only once its gate opens.
+        stubborn: {
+          async execute() {
+            calls.count++;
+            await stubborn.promise;
+            return 'late';
+          },
+        },
+      },
+      deps: { clock: frozen.clock },
+      lease: { provider, owner: 'a', ttlMs: 3_000 },
+    });
+    const zombie = await a.run({ ...key, tasks: pair });
+    await until(() => calls.count === 2);
+    await time.advance(10_000);
+    const b = createSwarm({
+      agents: {},
+      store: connection(store),
+      reducers: { work: slow(Promise.resolve(), calls), stubborn: { execute: () => 'fresh' } },
+      deps: { clock: time.clock },
+      lease: { provider, owner: 'b', ttlMs: 3_000 },
+    });
+    expect((await (await b.resume(key)).result).run.status).toBe('completed');
+    // A's first task finishes and its write meets the revision check while its
+    // second task is still running, so A has not yet told a lost lease apart.
+    first.resolve();
+    await until(() => conflicted);
+    const next = zombie.events()[Symbol.asyncIterator]().next();
+    void next.catch(() => {});
+    stubborn.resolve();
+    const verdict = await zombie.result.catch((error: unknown) => error);
+    expect(verdict).toBeInstanceOf(SwarmLeaseError);
+    expect(verdict).toMatchObject({ code: 'lost' });
+    await expect(next).rejects.toBe(verdict);
+    // A reader that starts afterwards gets the same error.
+    await expect(zombie.events()[Symbol.asyncIterator]().next()).rejects.toBe(verdict);
+  });
+
   it('keeps a revision conflict when the executor still holds its lease', async () => {
     const time = manualClock();
     const provider = createInMemoryLeaseProvider({ clock: time.clock });
@@ -616,6 +683,174 @@ describe('swarm requestCancel', () => {
     // The next claim still receives it.
     const outcome = await (await swarm.resume(key)).result;
     expect(outcome.run).toMatchObject({ status: 'cancelled', cancelRequested: true });
+  });
+
+  it('queues a cancel again when the holder fails to record it before settling', async () => {
+    const time = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    let refuse = true;
+    // A transient error hits the one commit that records the cancel.
+    const flaky: SwarmStore = {
+      ...store,
+      async commit(change) {
+        if (refuse && change.run?.cancelRequested) {
+          refuse = false;
+          throw new Error('transient store error');
+        }
+        return store.commit(change);
+      },
+    };
+    const release = gate();
+    const calls = { count: 0 };
+    const a = swarmOn({
+      store: flaky,
+      clock: time.clock,
+      provider,
+      owner: 'a',
+      work: slow(release.promise, calls),
+    });
+    const handle = await a.run({
+      ...key,
+      tasks: [
+        { id: 'a', reducer: 'work' },
+        { id: 'b', reducer: 'work', dependsOn: ['a'] },
+      ],
+    });
+    await until(() => calls.count === 1);
+    const drained = handle.drain();
+    const b = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      provider,
+      owner: 'b',
+      work: slow(Promise.resolve(), calls),
+    });
+    expect(await b.requestCancel(key)).toBe('signalled');
+    // A's check before the settle delivers the cancel, and its commit fails.
+    release.resolve();
+    await expect(drained).rejects.toThrow('transient store error');
+    expect(await store.head!(key)).toMatchObject({ status: 'running', cancelRequested: false });
+    // Whoever takes the run over next still receives the cancel.
+    const { handles, failed } = await b.recover();
+    expect(failed).toEqual([]);
+    const outcome = await handles[0]!.result;
+    expect(outcome.run).toMatchObject({ status: 'cancelled', cancelRequested: true });
+    expect(outcome.tasks.map((task) => [task.task.id, task.status])).toEqual([
+      ['a', 'completed'],
+      ['b', 'cancelled'],
+    ]);
+    expect(calls.count).toBe(1);
+  });
+
+  it('queues a cancel again when the heartbeat delivers it and its commit fails', async () => {
+    const time = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    let refuse = true;
+    const flaky: SwarmStore = {
+      ...store,
+      async commit(change) {
+        if (refuse && change.run?.cancelRequested) {
+          refuse = false;
+          throw new Error('transient store error');
+        }
+        return store.commit(change);
+      },
+    };
+    const calls = { count: 0 };
+    const a = swarmOn({
+      store: flaky,
+      clock: time.clock,
+      provider,
+      owner: 'a',
+      work: slow(gate().promise, calls),
+    });
+    const handle = await a.run({ ...key, tasks });
+    await until(() => calls.count === 1);
+    const b = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      provider,
+      owner: 'b',
+      work: slow(Promise.resolve(), calls),
+    });
+    expect(await b.requestCancel(key)).toBe('signalled');
+    await time.advance(1_000);
+    await expect(handle.result).rejects.toThrow('transient store error');
+    const outcome = await (await b.resume(key)).result;
+    expect(outcome.run).toMatchObject({ status: 'cancelled', cancelRequested: true });
+    expect(outcome.tasks[0]?.status).toBe('cancelled');
+    expect(calls.count).toBe(1);
+  });
+
+  it('queues a cancel again when a renewal delivers it after the run settled suspended', async () => {
+    const time = manualClock();
+    const inner = createInMemoryLeaseProvider({ clock: time.clock });
+    let hold: Promise<void> | undefined;
+    // Renewals take their signals at once, then answer only when the test says.
+    const provider: LeaseProvider = {
+      ...inner,
+      async renew(lease, ttlMs) {
+        const renewal = await inner.renew(lease, ttlMs);
+        await hold;
+        return renewal;
+      },
+    };
+    const store = createInMemorySwarmStore();
+    const settling = gate();
+    const slowSettle: SwarmStore = {
+      ...store,
+      async commit(change) {
+        if (change.run?.status === 'suspended') await settling.promise;
+        return store.commit(change);
+      },
+    };
+    const release = gate();
+    const calls = { count: 0 };
+    const a = swarmOn({
+      store: slowSettle,
+      clock: time.clock,
+      provider,
+      owner: 'a',
+      work: slow(release.promise, calls),
+    });
+    const handle = await a.run({
+      ...key,
+      tasks: [
+        { id: 'a', reducer: 'work' },
+        { id: 'b', reducer: 'work', dependsOn: ['a'] },
+      ],
+    });
+    await until(() => calls.count === 1);
+    const drained = handle.drain();
+    release.resolve();
+    await time.advance(0);
+    // A's settle commit is in flight: the cancel arrives after its last check.
+    const b = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      provider,
+      owner: 'b',
+      work: slow(Promise.resolve(), calls),
+    });
+    expect(await b.requestCancel(key)).toBe('signalled');
+    const answered = gate();
+    hold = answered.promise;
+    // The heartbeat renewal takes the cancel, but its answer comes after the settle.
+    await time.advance(1_000);
+    settling.resolve();
+    await time.advance(0);
+    answered.resolve();
+    expect((await drained).run.status).toBe('suspended');
+    hold = undefined;
+    const outcome = await (await b.resume(key)).result;
+    expect(outcome.run).toMatchObject({ status: 'cancelled', cancelRequested: true });
+    expect(outcome.tasks.map((task) => [task.task.id, task.status])).toEqual([
+      ['a', 'completed'],
+      ['b', 'cancelled'],
+    ]);
+    expect(calls.count).toBe(1);
   });
 
   it('starts a new run clean even when its key still queues a cancel', async () => {

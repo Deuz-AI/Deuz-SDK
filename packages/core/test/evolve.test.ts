@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { evolve, resumeEvolve } from '../src/evolve/controller';
 import { createInMemoryPopulationStore } from '../src/evolve/store';
 import { createMockModel, sseEvents } from '../src/testing';
+import { createOpenAIEmbedding } from '../src/openai';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import type { LanguageModel } from '../src/types/model';
 import type {
@@ -55,6 +56,29 @@ function counted(model: LanguageModel): { model: LanguageModel; counter: Counter
 
 function grower(text = GROW) {
   return counted(createMockModel({ responses: [{ text }] }));
+}
+
+/** An embedding model that answers `answered` requests, then holds the next until it is aborted. */
+function stallingEmbedder(answered: number) {
+  let requests = 0;
+  let stalled!: () => void;
+  const reached = new Promise<void>((resolve) => (stalled = resolve));
+  const model = createOpenAIEmbedding({
+    apiKey: 'sk-test',
+    fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (requests++ < answered)
+        return Response.json({
+          data: [{ index: 0, embedding: [1, 0] }],
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        });
+      stalled();
+      const signal = init!.signal!;
+      return new Promise<Response>((_resolve, reject) =>
+        signal.addEventListener('abort', () => reject(signal.reason as Error), { once: true }),
+      );
+    }) as typeof fetch,
+  })('text-embedding-3-small');
+  return { model, reached };
 }
 
 let ids = 0;
@@ -600,6 +624,73 @@ describe('evolve: stopping', () => {
     expect(resumed).toMatchObject({ status: 'completed', generation: 1 });
     expect(resumed.best?.score).toBe(1);
   });
+
+  it('stores nothing for a mutation cancelled before its request, which may still count', async () => {
+    const { model, counter } = grower();
+    let reached!: () => void;
+    const looking = new Promise<void>((resolve) => (reached = resolve));
+    let answer!: () => void;
+    const held = new Promise<void>((resolve) => (answer = resolve));
+    const store = createInMemoryPopulationStore();
+    const handle = evolve(
+      options({
+        store,
+        models: [{ model }],
+        generations: 1,
+        mutationsPerGeneration: 1,
+        deps: {
+          ...deps,
+          // The breaker lookup before the request answers only after the cancel.
+          breakerStore: {
+            get: async () => {
+              reached();
+              await held;
+              return undefined;
+            },
+            set: () => {},
+          },
+        },
+      }),
+    );
+    await looking;
+    const cancelled = handle.cancel();
+    answer();
+    await cancelled;
+    const result = await handle.result;
+    expect(counter.calls).toBe(0);
+    // As documented: a cancelled call cannot tell whether its request went out.
+    expect(result).toMatchObject({ status: 'stopped', reason: 'cancelled', modelCalls: 1 });
+    expect((await store.listCandidates(result)).map((item) => item.id)).toEqual(['g0-i0-s0']);
+  });
+
+  it('stops cancelled when a cancel cuts off a slot novelty embedding', async () => {
+    // The seed's embedding is answered; the slot's waits until it is aborted.
+    const { model: embedder, reached } = stallingEmbedder(1);
+    const store = createInMemoryPopulationStore();
+    const handle = evolve(
+      options({ store, generations: 1, mutationsPerGeneration: 1, novelty: { embed: embedder } }),
+    );
+    await reached;
+    await handle.cancel();
+    const result = await handle.result;
+    expect(result).toMatchObject({ status: 'stopped', reason: 'cancelled', generation: 0 });
+    // The slot is not done, so a resume pays for it again.
+    expect((await store.listCandidates(result)).map((item) => item.id)).toEqual(['g0-i0-s0']);
+    expect(await store.loadRun(result)).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+  });
+
+  it('stops cancelled when a cancel cuts off the seed novelty embedding', async () => {
+    const { model: embedder, reached } = stallingEmbedder(0);
+    const store = createInMemoryPopulationStore();
+    const handle = evolve(options({ store, generations: 1, novelty: { embed: embedder } }));
+    await reached;
+    await handle.cancel();
+    const result = await handle.result;
+    expect(result).toMatchObject({ status: 'stopped', reason: 'cancelled', generation: -1 });
+    // Nothing was stored, so a resume evaluates and embeds the seed again.
+    expect(await store.listCandidates(result)).toEqual([]);
+    expect(await store.loadRun(result)).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+  });
 });
 
 describe('evolve: model errors', () => {
@@ -646,6 +737,21 @@ describe('evolve: model errors', () => {
       status: 'failed',
       reason: 'error',
     });
+  });
+
+  it('keeps an elapsed deadline on resume, so that run cannot continue', async () => {
+    const { model, counter } = grower();
+    const store = createInMemoryPopulationStore();
+    const shape = { store, models: [{ model }], generations: 2 };
+    await expect(
+      evolve(options({ ...shape, policy: { deadlineAt: 5 } })).result,
+    ).rejects.toMatchObject({ code: 'deadline_exceeded' });
+    // The run saved its policy, and a resume can only narrow it.
+    await expect(resumeEvolve(options(shape)).result).rejects.toMatchObject({
+      code: 'deadline_exceeded',
+    });
+    expect(counter.calls).toBe(0);
+    expect(await store.loadRun(key)).toMatchObject({ status: 'failed', generation: 0 });
   });
 
   it.each([

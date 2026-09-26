@@ -373,8 +373,9 @@ export interface SwarmRecovery {
   handles: SwarmHandle[];
   /**
    * Runs it could not resume, for example one whose definitionVersion or
-   * bindings this process lacks. Runs with a live lease holder, or that moved
-   * on while being claimed, are skipped silently instead.
+   * bindings this process lacks, including the one whose failure ended the
+   * call early. Runs with a live lease holder, or that moved on while being
+   * claimed, are skipped silently instead.
    */
   failed: { key: SwarmKey; error: unknown }[];
 }
@@ -400,9 +401,11 @@ export interface Swarm {
    * option and a store with 'list'. It pages through up to 10 000 running
    * runs, oldest `updatedAt` first, and takes over at most `limit` of them
    * (1..1000, default 100); runs with a live lease holder, or that changed
-   * while being claimed, are skipped. One run's failure never stops the
-   * others: it is reported in `failed`, and every executor the call started
-   * is returned in `handles`.
+   * while being claimed, are skipped. A failure is reported in `failed`, and
+   * every executor the call started is returned in `handles`. A run's own
+   * failure, such as a definition this process lacks, never stops the others;
+   * an outage does: a lease acquire that throws ends the call at once, and
+   * three failures in a row of any other kind, such as a store's, end it too.
    */
   recover(options?: { scope?: string; limit?: number }): Promise<SwarmRecovery>;
 }
