@@ -8,6 +8,7 @@ Writes bench/results.json. Reproducible: python bench/measure.py
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,7 +30,7 @@ PACKAGES = [
 IMPORT_RUNS = 5
 
 # Optional: measure a local `npm pack` tarball instead of the published @deuz-sdk/core.
-# Example: DEUZ_TARBALL=./deuz-sdk-core-1.7.1.tgz python bench/measure.py
+# Example: DEUZ_TARBALL=./deuz-sdk-core-2.2.0.tgz python bench/measure.py
 DEUZ_TARBALL = os.environ.get("DEUZ_TARBALL", "").strip()
 
 
@@ -100,6 +101,19 @@ def import_time_ms(pkg_dir, pkg_name):
     return times[len(times) // 2]
 
 
+def blocked_install_scripts(npm_stderr):
+    """Scripts npm skipped, as "pkg@version event" (npm 12 blocks them unless allow-listed).
+
+    A local tarball's `prepare` shows up here too; npm never runs it for a registry install.
+    """
+    blocked = []
+    for line in npm_stderr.splitlines():
+        match = re.match(r"^npm warn install-scripts\s{2,}(\S+@\S+) \(([\w-]+):", line)
+        if match:
+            blocked.append(f"{match.group(1)} {match.group(2)}")
+    return blocked
+
+
 def main():
     results = []
     for pkg in PACKAGES:
@@ -110,13 +124,17 @@ def main():
         try:
             t0 = time.time()
             # Quote the install target — local tarball paths may contain spaces.
+            # loglevel=warn keeps npm's "install scripts blocked" notice, recorded below.
             proc = run(
-                f'npm init -y >NUL 2>&1 & npm install "{spec}" --no-audit --no-fund --loglevel=error',
+                f'npm init -y >NUL 2>&1 & npm install "{spec}" --no-audit --no-fund --loglevel=warn',
                 cwd=tmp,
             )
             if proc.returncode != 0:
                 print(f"  npm install FAILED: {proc.stderr.strip()[:300]}")
                 continue
+            blocked = blocked_install_scripts(proc.stderr)
+            if blocked:
+                print(f"  install scripts blocked by npm: {', '.join(blocked)}", flush=True)
             nm = os.path.join(tmp, "node_modules")
             size_bytes, files = dir_stats(nm)
             pkgs = package_count(nm)
@@ -129,8 +147,8 @@ def main():
             except OSError:
                 pass
             if spec != pkg and version != "?":
-                version = f"{version}+local1.8"
-            results.append({
+                version = f"{version}+local"
+            entry = {
                 "name": pkg,
                 "version": version,
                 "installMB": round(size_bytes / 1e6, 2),
@@ -138,18 +156,32 @@ def main():
                 "fileCount": files,
                 "importMsMedian": ms,
                 "installSeconds": round(time.time() - t0, 1),
-            })
+            }
+            if blocked:
+                entry["blockedInstallScripts"] = blocked
+            results.append(entry)
             print(f"  -> import {ms} ms (median of {IMPORT_RUNS})", flush=True)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    node = subprocess.check_output("node --version", shell=True, text=True).strip()
+    npm = subprocess.check_output("npm --version", shell=True, text=True).strip()
+    procedure = (
+        "npm install <pkg> into a clean temp dir with npm's default settings; "
+        "node_modules size/pkg/file counts; cold ESM import median of 5 (1 warmup)"
+    )
+    if DEUZ_TARBALL:
+        procedure += (
+            f". @deuz-sdk/core installed from a local npm pack ({os.path.basename(DEUZ_TARBALL)}); "
+            "the other packages from the registry"
+        )
     out = os.path.join(os.path.dirname(__file__), "results.json")
     with open(out, "w", encoding="utf-8") as fh:
         json.dump({
             "benchmark": "install-footprint",
             "date": time.strftime("%Y-%m-%d"),
-            "machine": f"{os.name}-py{sys.version_info.major}.{sys.version_info.minor}-node{subprocess.check_output('node --version', shell=True, text=True).strip()}",
-            "procedure": "npm install <pkg> into a clean temp dir; node_modules size/pkg/file counts; cold ESM import median of 5 (1 warmup)",
+            "machine": f"{os.name}-py{sys.version_info.major}.{sys.version_info.minor}-node{node}-npm{npm}",
+            "procedure": procedure,
             "results": results,
         }, fh, indent=2)
     print(f"\nwrote {out}")
