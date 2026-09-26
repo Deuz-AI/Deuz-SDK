@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/10-evolve",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Evolve a function between EVOLVE-BLOCK markers on SQLite, then resume with zero model calls.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
