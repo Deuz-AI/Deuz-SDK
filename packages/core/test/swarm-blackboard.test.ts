@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createAgent } from '../src/agent';
 import { createMockModel } from '../src/testing';
 import { createInMemorySwarmStore, createSwarm } from '../src/swarm';
@@ -208,6 +208,38 @@ describe('swarm blackboard review fixes (2.2)', () => {
     const notes = await store.readChannel!(outcome.run, 'main', 0, 10);
     expect(notes.map((note) => [note.taskId, note.text])).toEqual([[longId, 'note']]);
     expect(notes[0]!.entryId.length).toBeLessThanOrEqual(512);
+  });
+
+  it('posts parallel notes in call order even when hashing finishes out of order', async () => {
+    const posted: string[] = [];
+    const tools = blackboardTools({
+      key: { scope: 's', runId: 'r' },
+      task: { id: 'a', agent: 'x', prompt: 'p' },
+      config: { post: true },
+      store: createInMemorySwarmStore(),
+      attempt: () => 1,
+      now: () => 1,
+      post: async (post) => void posted.push(post.text),
+    });
+    const subtle = globalThis.crypto.subtle;
+    const original = subtle.digest.bind(subtle);
+    let calls = 0;
+    // The first digest answers only after the second one has.
+    const spy = vi.spyOn(subtle, 'digest').mockImplementation(async (algorithm, data) => {
+      const hash = await original(algorithm, data);
+      if (calls++ === 0) await new Promise((resolve) => setTimeout(resolve, 20));
+      return hash;
+    });
+    try {
+      const context = (id: string) => ({ toolCallId: id, messages: [], modelStep: 1 }) as never;
+      await Promise.all([
+        tools.blackboard_post!.execute!({ text: 'first' }, context('c1')),
+        tools.blackboard_post!.execute!({ text: 'second' }, context('c2')),
+      ]);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(posted).toEqual(['first', 'second']);
   });
 
   it('types every tool parameter so strict providers accept it, and takes data as JSON text', async () => {

@@ -65,6 +65,7 @@ export function blackboardTools(input: {
   const own = channelOf(input.task);
   const readable = readableChannels(input.config, input.task);
   const tools: AgentToolSet = {};
+  let posting: Promise<unknown> = Promise.resolve();
   if (readable.length) {
     tools.blackboard_read = {
       description: `Read notes other agents posted to the shared board. Channels: ${readable.join(', ')}.`,
@@ -117,17 +118,22 @@ export function blackboardTools(input: {
         const data = parseData(args.data);
         // Reject unserializable data here, as a tool error, before it can reach a commit.
         encodeSwarm(data ?? null);
-        await input.post({
-          channel: own,
-          entryId: `post:${await digest(
-            JSON.stringify([input.task.id, context.modelStep ?? 0, context.toolCallId]),
-          )}`,
-          taskId: input.task.id,
-          attempt: input.attempt(),
-          text,
-          ...(data !== undefined ? { data } : {}),
-          at: input.now(),
-        });
+        const key = JSON.stringify([input.task.id, context.modelStep ?? 0, context.toolCallId]);
+        // Parallel calls post in call order: each joins the queue before its
+        // first await, so the hash's timing cannot reorder the notes.
+        const turn = posting.then(async () =>
+          input.post({
+            channel: own,
+            entryId: `post:${await digest(key)}`,
+            taskId: input.task.id,
+            attempt: input.attempt(),
+            text,
+            ...(data !== undefined ? { data } : {}),
+            at: input.now(),
+          }),
+        );
+        posting = turn.catch(() => {});
+        await turn;
         return { posted: true, channel: own };
       },
     };
