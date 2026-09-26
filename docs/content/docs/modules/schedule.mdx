@@ -135,8 +135,9 @@ process, not across processes or isolates. On a serverless host every tick may
 run in a fresh isolate, so give the scheduler a claim backed by storage all of
 them share. The SQLite and Postgres ops stores carry one: `claims` grants a key
 once across every process on the same file or database, in one statement
-(`INSERT OR IGNORE` on SQLite, `INSERT … ON CONFLICT DO NOTHING` on Postgres),
-and `claims.release(key)` gives it back.
+(`INSERT … ON CONFLICT DO NOTHING RETURNING`: the key is granted when the row
+comes back, so an injected SQLite driver need not report a change count), and
+`claims.release(key)` gives it back.
 
 ```ts
 import { createScheduler } from '@deuz-sdk/core/schedule';

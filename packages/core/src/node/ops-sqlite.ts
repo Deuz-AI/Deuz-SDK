@@ -252,12 +252,14 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
   const claims: SqliteOpsStore['claims'] = Object.assign(
     (key: string): Promise<boolean> =>
       use((db) => {
-        // One statement: whichever connection inserts the key first wins it.
-        const result = statement(
+        // One statement: whichever connection inserts the key first wins it. The
+        // grant is the row RETURNING yields, not run()'s change count, which an
+        // injected driver may not report.
+        const granted = statement(
           db,
-          'INSERT OR IGNORE INTO deuz_claims(key, claimed_at) VALUES(?, ?)',
-        ).run(key, clock.now());
-        return Number((result as { changes?: unknown } | undefined)?.changes) === 1;
+          'INSERT INTO deuz_claims(key, claimed_at) VALUES(?, ?) ON CONFLICT(key) DO NOTHING RETURNING 1 AS claimed',
+        ).get(key, clock.now());
+        return granted !== undefined;
       }),
     {
       async release(key: string): Promise<void> {

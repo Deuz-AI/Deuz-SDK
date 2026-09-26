@@ -38,6 +38,22 @@ function sqliteOps(path: string, database?: SqliteDatabaseLike) {
   return ops;
 }
 
+/** An injected handle whose run() executes but reports nothing, as some drivers do. */
+function quietHandle(db: SqliteDatabaseLike): SqliteDatabaseLike {
+  return {
+    prepare(sql) {
+      const statement = db.prepare(sql);
+      return {
+        run: (...params) => void statement.run(...params),
+        get: (...params) => statement.get(...params),
+        all: (...params) => statement.all(...params),
+      };
+    },
+    exec: (sql) => db.exec(sql),
+    close: () => db.close(),
+  };
+}
+
 const pg = new PGlite();
 // Start-up is slow under load; keep it out of the first test's time budget.
 beforeAll(() => pg.waitReady, 60_000);
@@ -58,6 +74,11 @@ scheduleClaimContracts('in-memory claim', () => createInMemoryClaim());
 
 describe.skipIf(!DatabaseSync)('SQLite ops store claims', () => {
   scheduleClaimContracts('SQLite claim', () => sqliteOps(':memory:').claims);
+  // The grant must not depend on what an injected driver's run() returns.
+  scheduleClaimContracts(
+    'SQLite claim on a handle whose run() reports nothing',
+    () => sqliteOps(':memory:', quietHandle(new DatabaseSync!(':memory:'))).claims,
+  );
 
   it('shares claims between two connections on one file and keeps them across a reopen', async () => {
     const path = await tempFile();
