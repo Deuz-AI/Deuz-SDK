@@ -18,6 +18,25 @@ export class SwarmConflictError extends Error {
   }
 }
 
+/**
+ * The run's lease (2.2): 'held' when another executor drives it right now,
+ * 'lost' when this executor's lease lapsed or changed hands and it stopped
+ * writing. Task records stay as they were for the next executor.
+ */
+export class SwarmLeaseError extends Error {
+  readonly code: 'held' | 'lost';
+  constructor(code: 'held' | 'lost', message?: string) {
+    super(
+      message ??
+        (code === 'held'
+          ? 'Another executor holds this swarm run'
+          : 'This executor lost the swarm run lease'),
+    );
+    this.name = 'SwarmLeaseError';
+    this.code = code;
+  }
+}
+
 /** Persistence deliberately rejects values JSON would silently change. */
 export function encodeSwarm(value: unknown): string {
   const encoded = JSON.stringify(value, function (key, item: unknown) {

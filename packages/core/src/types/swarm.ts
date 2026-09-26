@@ -1,4 +1,5 @@
 import type { DeuzAgent } from '../agent';
+import type { LeaseProvider } from './lease';
 import type { AgentRunEnvelope, AgentRunOptions, AgentResult } from './agent-run';
 import type { Dependencies } from './deps';
 import type { ToolApprovalResponse } from './tool';
@@ -80,7 +81,7 @@ export interface SwarmDynamicLimits {
 }
 
 /** A persistence feature a store supports (2.2). */
-export type SwarmStoreCapability = 'spawn' | 'channels';
+export type SwarmStoreCapability = 'spawn' | 'channels' | 'list';
 
 /** One durable blackboard note (2.2), ordered within its channel. */
 export interface SwarmChannelEntry {
@@ -155,6 +156,7 @@ export interface SwarmEventInput {
     | 'run.resumed'
     | 'run.settled'
     | 'run.cancelled'
+    | 'run.drained'
     | 'task.started'
     | 'task.completed'
     | 'task.failed'
@@ -214,6 +216,8 @@ export interface SwarmStore {
     limit: number,
   ): Promise<SwarmChannelEntry[]>;
   readEvents(key: SwarmKey, afterSequence: number, limit: number): Promise<SwarmEvent[]>;
+  /** Run records matching a query (2.2); needs the 'list' capability. */
+  listRuns?(query: SwarmRunQuery): Promise<SwarmRunRecord[]>;
 }
 
 export interface SwarmAgentBinding {
@@ -287,6 +291,20 @@ export interface SwarmOptions {
   budget?: BudgetLimits;
   /** Let finished tasks spawn tasks at runtime (2.2); needs a store with 'spawn'. */
   dynamic?: SwarmDynamicLimits;
+  /**
+   * Cross-process liveness (2.2). The executor holds the run's lease while it
+   * drives it and renews it every ttlMs / 3; losing it stops the executor
+   * before its next write, so another process can take the run over.
+   */
+  lease?: SwarmLeaseOptions;
+}
+
+export interface SwarmLeaseOptions {
+  provider: LeaseProvider;
+  /** This process's identity; defaults to a generated ID per swarm instance. */
+  owner?: string;
+  /** Default 30 000. */
+  ttlMs?: number;
 }
 
 export interface SwarmRunOptions {
@@ -305,6 +323,18 @@ export interface SwarmResumeOptions extends SwarmKey {
   retryTaskIds?: readonly string[];
   /** Reconciled native tool calls, keyed by task id; requires retryTaskIds for that task. */
   retryToolCallIds?: Readonly<Record<string, readonly string[]>>;
+  /** Claim the run only at this revision (2.2); otherwise SwarmConflictError. */
+  expectedRevision?: number;
+  /** Claim the run only in this status (2.2); otherwise SwarmConflictError. */
+  expectedStatus?: SwarmRunStatus;
+}
+
+/** A page of runs (2.2), ordered by updatedAt, then scope and runId. */
+export interface SwarmRunQuery {
+  status?: SwarmRunStatus;
+  scope?: string;
+  /** 1..1000. */
+  limit: number;
 }
 
 export type SwarmOutcome = SwarmSnapshot;
@@ -314,7 +344,16 @@ export interface SwarmHandle extends SwarmKey {
   result: Promise<SwarmOutcome>;
   events(options?: { afterSequence?: number; signal?: AbortSignal }): AsyncIterable<SwarmEvent>;
   cancel(): Promise<void>;
+  /**
+   * Stop dispatching, let in-flight tasks finish, and settle (2.2): the run is
+   * 'suspended' with its remaining tasks pending, or terminal if nothing
+   * remains. A 'run.drained' event precedes 'run.settled'; the lease is released.
+   */
+  drain(): Promise<SwarmOutcome>;
 }
+
+/** What requestCancel did (2.2). */
+export type SwarmCancelRequest = 'signalled' | 'recorded' | 'settled';
 
 export interface Swarm {
   run(options: SwarmRunOptions): Promise<SwarmHandle>;
@@ -324,4 +363,16 @@ export interface Swarm {
     key: SwarmKey,
     options?: { afterSequence?: number; signal?: AbortSignal },
   ): AsyncIterable<SwarmEvent>;
+  /**
+   * Cancel a run from any process (2.2): 'signalled' when this process or a
+   * lease holder drives it, 'recorded' when nobody does (the next executor
+   * cancels it), 'settled' when it already finished.
+   */
+  requestCancel(key: SwarmKey): Promise<SwarmCancelRequest>;
+  /**
+   * Take over 'running' runs whose executor is gone (2.2). Needs the `lease`
+   * option and a store with 'list'; runs with a live lease holder, or that
+   * changed while being claimed, are skipped.
+   */
+  recover(options?: { scope?: string; limit?: number }): Promise<SwarmHandle[]>;
 }

@@ -192,7 +192,7 @@ test('2.2 dynamic swarm surface: spawn requests, hooks, limits and capabilities'
 });
 
 test('2.2 blackboard, soft dependencies and rounds surface', () => {
-  expectTypeOf<SwarmStoreCapability>().toEqualTypeOf<'spawn' | 'channels'>();
+  expectTypeOf<SwarmStoreCapability>().toEqualTypeOf<'spawn' | 'channels' | 'list'>();
   expectTypeOf<SwarmTask['group']>().toEqualTypeOf<string | undefined>();
   expectTypeOf<SwarmTask['after']>().toEqualTypeOf<readonly string[] | undefined>();
   expectTypeOf<SwarmAgentBinding['blackboard']>().toEqualTypeOf<

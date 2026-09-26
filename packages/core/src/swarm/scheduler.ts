@@ -10,8 +10,10 @@ import { resolveDependencies } from '../internal/resolve-deps';
 import type { DeuzAgent } from '../agent';
 import type { AgentRunOptions, AgentRunStore, AgentToolSet } from '../types/agent-run';
 import type { NativeExecutionContext } from '../types/execution';
+import type { Lease } from '../types/lease';
 import type {
   Swarm,
+  SwarmCancelRequest,
   SwarmAgentBinding,
   SwarmCommit,
   SwarmEvent,
@@ -29,7 +31,14 @@ import type {
   SwarmTaskResult,
   SwarmTaskStatus,
 } from '../types/swarm';
-import { cloneSwarm, swarmKey, validateEventCursor, validateSwarmSnapshot } from './store';
+import {
+  cloneSwarm,
+  SwarmConflictError,
+  SwarmLeaseError,
+  swarmKey,
+  validateEventCursor,
+  validateSwarmSnapshot,
+} from './store';
 import { resolveDynamicLimits, spawnRecords, tightenLimits } from './spawn';
 import { blackboardTools, readableChannels, SWARM_GROUP } from './blackboard';
 
@@ -136,6 +145,26 @@ export function createSwarm(options: SwarmOptions): Swarm {
     throw new Error(
       'This swarm store cannot persist spawned tasks: it lacks the "spawn" capability',
     );
+  // Cross-process liveness (2.2): one lease per run, renewed every ttl / 3.
+  const leasing = options.lease;
+  const leaseTtl = leasing?.ttlMs ?? 30_000;
+  if (leasing && (!Number.isSafeInteger(leaseTtl) || leaseTtl < 3))
+    throw new Error('Swarm lease ttlMs must be an integer of at least 3');
+  const leaseOwner = leasing ? (leasing.owner ?? deps.generateId()) : '';
+  const leaseKey = (key: SwarmKey): string => `swarm:${swarmKey(key)}`;
+  const claim = async (key: SwarmKey): Promise<Lease | undefined> => {
+    if (!leasing) return undefined;
+    const lease = await leasing.provider.acquire({
+      key: leaseKey(key),
+      owner: leaseOwner,
+      ttlMs: leaseTtl,
+    });
+    if (!lease) throw new SwarmLeaseError('held');
+    return lease;
+  };
+  const unclaim = async (lease: Lease | undefined): Promise<void> => {
+    if (lease) await leasing!.provider.release(lease).catch(() => {});
+  };
 
   const events = (
     key: SwarmKey,
@@ -175,10 +204,17 @@ export function createSwarm(options: SwarmOptions): Swarm {
     },
   });
 
-  async function start(initial: SwarmSnapshot, resume?: SwarmResumeOptions): Promise<SwarmHandle> {
+  async function start(
+    initial: SwarmSnapshot,
+    resume: SwarmResumeOptions | undefined,
+    lease: Lease | undefined,
+  ): Promise<SwarmHandle> {
     const key: SwarmKey = { scope: initial.run.scope, runId: initial.run.runId };
     const id = swarmKey(key);
-    if (owned.has(id)) throw new Error('Swarm run already has an executor');
+    if (owned.has(id)) {
+      await unclaim(lease);
+      throw new Error('Swarm run already has an executor');
+    }
     owned.add(id);
     let snapshot = initial;
     const records = new Map(snapshot.tasks.map((task) => [task.task.id, task]));
@@ -236,6 +272,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
       await mutate(() => ({ run: { executionState: execution.snapshot() } }));
     } catch (error) {
       owned.delete(id);
+      await unclaim(lease);
       throw error;
     }
 
@@ -254,6 +291,39 @@ export function createSwarm(options: SwarmOptions): Swarm {
     const abort = () => {
       void cancel().catch(() => {});
     };
+    // The heartbeat (2.2). Losing the lease stops every further write: task
+    // records stay as they are and the next executor reconciles them.
+    let held = lease;
+    let stopped = false;
+    let stopBeat: (() => void) | undefined;
+    const lose = () => {
+      writeFailure ??= new SwarmLeaseError('lost');
+      controller.abort(writeFailure);
+    };
+    const renewLease = async (): Promise<void> => {
+      if (stopped || !held) return;
+      try {
+        const renewal = await leasing!.provider.renew(held, leaseTtl);
+        if (stopped) return;
+        if (!renewal.held) return lose();
+        held = renewal.lease;
+        for (const request of renewal.signals)
+          if (request === 'cancel') void cancel().catch(() => {});
+      } catch {
+        // A provider outage is survivable until the lease could have lapsed.
+        if (stopped) return;
+        if (deps.clock.now() >= held.expiresAt) return lose();
+      }
+      beat();
+    };
+    const beat = () => {
+      if (!stopped && held)
+        stopBeat = deps.clock.setTimeout(
+          () => void renewLease(),
+          Math.max(1, Math.floor(leaseTtl / 3)),
+        );
+    };
+    beat();
     // Every task runs under the same child scope ID its execution context uses.
     const compactTask = async (taskId: string): Promise<void> => {
       await execution.ledger.compact(
@@ -633,9 +703,13 @@ export function createSwarm(options: SwarmOptions): Swarm {
         controller.abort(error);
         // A replacement executor must not overlap still-running local effects.
         await Promise.allSettled(running);
-        throw error;
+        throw writeFailure instanceof SwarmLeaseError ? writeFailure : error;
       } finally {
+        stopped = true;
+        stopBeat?.();
         signal?.removeEventListener('abort', abort);
+        // A stale token is ignored, so this is safe after a takeover too.
+        await unclaim(held);
         owned.delete(id);
         active.delete(id);
       }
@@ -647,6 +721,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
       result,
       events: (settings) => events(key, settings, () => writeFailure),
       cancel,
+      drain: () => Promise.reject(new Error('Not implemented')),
     };
     active.set(id, handle);
     return handle;
@@ -689,16 +764,30 @@ export function createSwarm(options: SwarmOptions): Swarm {
           })),
         ),
       };
-      snapshot.run = await options.store.create(snapshot, [
-        { type: 'run.started', timestamp: now },
-      ]);
-      return start(snapshot, { ...key, signal: input.signal });
+      const lease = await claim(key);
+      try {
+        snapshot.run = await options.store.create(snapshot, [
+          { type: 'run.started', timestamp: now },
+        ]);
+      } catch (error) {
+        await unclaim(lease);
+        throw error;
+      }
+      return start(snapshot, { ...key, signal: input.signal }, lease);
     },
     async resume(input) {
       if (owned.has(swarmKey(input))) throw new Error('Swarm run already has an executor');
       const snapshot = await options.store.load(input);
       if (!snapshot) throw new Error('Swarm run not found');
       validateSwarmSnapshot(snapshot, input);
+      if (
+        (input.expectedRevision !== undefined &&
+          snapshot.run.revision !== input.expectedRevision) ||
+        (input.expectedStatus !== undefined && snapshot.run.status !== input.expectedStatus)
+      )
+        throw new SwarmConflictError(
+          `Swarm run is at revision ${snapshot.run.revision} with status ${snapshot.run.status}, not the expected one`,
+        );
       if (snapshot.run.version === 2 && !canSpawn)
         throw new Error(
           'This swarm store cannot persist spawned tasks: it lacks the "spawn" capability',
@@ -763,14 +852,59 @@ export function createSwarm(options: SwarmOptions): Swarm {
           changes.push(record);
         }
       }
-      snapshot.run = await options.store.commit({
-        ...input,
-        expectedRevision: snapshot.run.revision,
-        run: { status: 'running', updatedAt: deps.clock.now() },
-        tasks: changes,
-        events: [{ type: 'run.resumed', timestamp: deps.clock.now() }, ...controlEvents],
-      });
-      return start(snapshot, input);
+      // The claim precedes the resume commit (2.2); the commit's revision check
+      // then fences out any writer that was still active a moment ago.
+      const lease = await claim(input);
+      try {
+        snapshot.run = await options.store.commit({
+          scope: input.scope,
+          runId: input.runId,
+          expectedRevision: snapshot.run.revision,
+          run: { status: 'running', updatedAt: deps.clock.now() },
+          tasks: changes,
+          events: [{ type: 'run.resumed', timestamp: deps.clock.now() }, ...controlEvents],
+        });
+      } catch (error) {
+        await unclaim(lease);
+        throw error;
+      }
+      return start(snapshot, input, lease);
+    },
+    async requestCancel(key): Promise<SwarmCancelRequest> {
+      const id = swarmKey(key);
+      for (let attempt = 0; ; attempt++) {
+        const local = active.get(id);
+        if (local) {
+          await local.cancel();
+          return 'signalled';
+        }
+        const run = options.store.head
+          ? await options.store.head(key)
+          : (await options.store.load(key))?.run;
+        if (!run) throw new Error('Swarm run not found');
+        if (run.status === 'completed' || run.status === 'partial' || run.status === 'cancelled')
+          return 'settled';
+        if (leasing && (await leasing.provider.signal(leaseKey(key), 'cancel'))) return 'signalled';
+        if (run.cancelRequested) return 'recorded';
+        // Nobody drives it: record the request for whichever executor comes next.
+        try {
+          const now = deps.clock.now();
+          await options.store.commit({
+            scope: key.scope,
+            runId: key.runId,
+            expectedRevision: run.revision,
+            run: { cancelRequested: true, updatedAt: now },
+            events: [{ type: 'run.cancelled', timestamp: now }],
+          });
+          return 'recorded';
+        } catch (error) {
+          // An executor may have claimed the run meanwhile; look again.
+          if (!(error instanceof SwarmConflictError) || attempt >= 4) throw error;
+        }
+      }
+    },
+    async recover() {
+      throw new Error('Not implemented');
     },
     get: (key) => options.store.load(key),
     events,
