@@ -13,6 +13,7 @@ import type {
   Swarm,
   SwarmCancelRequest,
   SwarmLeaseOptions,
+  SwarmRecovery,
   SwarmResumeOptions,
   SwarmRunQuery,
   SwarmAgentBinding,
@@ -249,7 +250,11 @@ test('2.2 durability operations surface', () => {
   expectTypeOf<Parameters<Swarm['recover']>>().toEqualTypeOf<
     [options?: { scope?: string; limit?: number }]
   >();
-  expectTypeOf<ReturnType<Swarm['recover']>>().toEqualTypeOf<Promise<SwarmHandle[]>>();
+  expectTypeOf<ReturnType<Swarm['recover']>>().toEqualTypeOf<Promise<SwarmRecovery>>();
+  expectTypeOf<SwarmRecovery>().toEqualTypeOf<{
+    handles: SwarmHandle[];
+    failed: { key: SwarmKey; error: unknown }[];
+  }>();
   expectTypeOf<SwarmResumeOptions['expectedRevision']>().toEqualTypeOf<number | undefined>();
   expectTypeOf<SwarmResumeOptions['expectedStatus']>().toEqualTypeOf<
     SwarmRunRecord['status'] | undefined

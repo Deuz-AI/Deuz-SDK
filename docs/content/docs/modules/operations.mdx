@@ -145,10 +145,14 @@ is recorded, and that executor's next commit then fails its revision check.
 
 `swarm.recover({ scope?, limit? })` lists `'running'` runs, which after a crash
 have no live executor, and resumes each one this process does not drive with
-`expectedRevision`. Runs with a live lease holder, and runs that changed while
-being claimed, are skipped. It returns the handles it started. `recover` needs
-the `lease` option and a store with the `'list'` capability; the memory, SQLite
-and Postgres stores have it.
+`expectedRevision`. It resolves to `{ handles, failed }`: the executors it
+started, and the runs it could not resume, each with its `key` and `error`.
+Runs with a live lease holder, and runs that changed while being claimed, are
+skipped silently. Any other failure, such as a run left by a worker with an
+older `definitionVersion` during a rolling deploy, is reported in `failed` and
+does not stop the call: the other runs are still recovered. `recover` needs the
+`lease` option and a store with the `'list'` capability; the memory, SQLite and
+Postgres stores have it.
 
 The following complete example runs a worker process against one SQLite file.
 Every process runs the same code; call `recover` at startup and on a timer.
@@ -172,7 +176,8 @@ const swarm = createSwarm({
 });
 
 try {
-  const handles = await swarm.recover({ scope: 'tenant-a' });
+  const { handles, failed } = await swarm.recover({ scope: 'tenant-a' });
+  for (const { key, error } of failed) console.error('Cannot resume', key.runId, error);
   for (const handle of handles) console.log(handle.runId, (await handle.result).run.status);
 } finally {
   await store.close();
@@ -213,7 +218,8 @@ const swarm = createSwarm({
   lease: { provider: ops.leases },
 });
 
-await swarm.recover();
+const { handles, failed } = await swarm.recover();
+console.log(`${handles.length} runs taken over, ${failed.length} could not be resumed`);
 ```
 
 A pool may run consecutive queries on different connections, so the stores use

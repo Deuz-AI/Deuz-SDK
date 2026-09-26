@@ -10,7 +10,7 @@ import { swarmKey } from '../src/swarm/store';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import type { Clock } from '../src/types/deps';
 import type { LeaseProvider } from '../src/types/lease';
-import type { SwarmReducerBinding, SwarmStore, SwarmTask } from '../src/types/swarm';
+import type { SwarmReducerBinding, SwarmSnapshot, SwarmStore, SwarmTask } from '../src/types/swarm';
 import { manualClock } from './fixtures/manual-clock';
 
 let DatabaseSync: (new (path: string) => SqliteDatabaseLike) | undefined;
@@ -76,6 +76,7 @@ function swarmOn(input: {
   release: Promise<void>;
   calls: string[];
   concurrency?: number;
+  definitionVersion?: string;
 }) {
   return createSwarm({
     agents: {},
@@ -83,10 +84,38 @@ function swarmOn(input: {
     reducers: reducers(input.release, input.calls),
     concurrency: input.concurrency ?? 1,
     deps: { clock: input.clock },
+    ...(input.definitionVersion ? { definitionVersion: input.definitionVersion } : {}),
     ...(input.provider
       ? { lease: { provider: input.provider, owner: input.owner ?? 'a', ttlMs: 3_000 } }
       : {}),
   });
+}
+
+/** A run whose executor crashed mid-task, as a store holds it. */
+function crashed(runId: string, updatedAt: number, definitionVersion = '1'): SwarmSnapshot {
+  return {
+    run: {
+      kind: 'deuz-swarm',
+      version: 1,
+      scope: 'tenant',
+      runId,
+      definitionVersion,
+      status: 'running',
+      revision: 0,
+      lastSequence: 0,
+      createdAt: updatedAt,
+      updatedAt,
+      cancelRequested: false,
+    },
+    tasks: [
+      {
+        task: { id: 'a', reducer: 'fast', replay: 'safe' },
+        bindingVersion: '1',
+        status: 'running',
+        attempt: 1,
+      },
+    ],
+  };
 }
 
 const drainTasks: SwarmTask[] = [
@@ -182,6 +211,38 @@ describe('swarm recover', () => {
     await expect(noList.recover()).rejects.toThrow(/list/);
   });
 
+  it('reports a run it cannot resume and still recovers the others', async () => {
+    const time = manualClock();
+    const store = createInMemorySwarmStore();
+    // A rolling deploy: the middle run belongs to the previous definition.
+    await store.create(crashed('r1', 1, 'v2'), []);
+    await store.create(crashed('r2', 2, 'v1'), []);
+    await store.create(crashed('r3', 3, 'v2'), []);
+    const calls: string[] = [];
+    const swarm = swarmOn({
+      store,
+      clock: time.clock,
+      provider: createInMemoryLeaseProvider({ clock: time.clock }),
+      release: Promise.resolve(),
+      calls,
+      definitionVersion: 'v2',
+    });
+    const { handles, failed } = await swarm.recover();
+    expect(handles.map((handle) => handle.runId)).toEqual(['r1', 'r3']);
+    expect(failed).toEqual([
+      {
+        key: { scope: 'tenant', runId: 'r2' },
+        error: new Error('Swarm definition version mismatch'),
+      },
+    ]);
+    for (const handle of handles) expect((await handle.result).run.status).toBe('completed');
+    // The failed run is untouched and its lease is free for a v1 worker.
+    expect(await store.head!({ scope: 'tenant', runId: 'r2' })).toMatchObject({
+      status: 'running',
+      revision: 0,
+    });
+  });
+
   it.skipIf(!DatabaseSync)(
     'takes over a crashed executor on one SQLite file and skips a run with a live holder',
     async () => {
@@ -243,12 +304,13 @@ describe('swarm recover', () => {
         calls: callsB,
       });
       const recovered = await b.recover({ scope: 'tenant' });
-      expect(recovered.map((handle) => handle.runId)).toEqual(['run']);
-      const outcome = await recovered[0]!.result;
+      expect(recovered.failed).toEqual([]);
+      expect(recovered.handles.map((handle) => handle.runId)).toEqual(['run']);
+      const outcome = await recovered.handles[0]!.result;
       expect(outcome.run.status).toBe('completed');
       expect(callsB).toEqual(['a', 'b']);
       // Nothing else to recover: one run is done, the other has a live holder.
-      expect(await b.recover()).toEqual([]);
+      expect(await b.recover()).toEqual({ handles: [], failed: [] });
 
       const settled = await pb.store.head!(key);
       await frozen.advance(1_000);

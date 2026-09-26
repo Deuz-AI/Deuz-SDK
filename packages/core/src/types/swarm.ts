@@ -362,6 +362,18 @@ export interface SwarmHandle extends SwarmKey {
 /** What requestCancel did (2.2). */
 export type SwarmCancelRequest = 'signalled' | 'recorded' | 'settled';
 
+/** What recover did (2.2). */
+export interface SwarmRecovery {
+  /** The executors this call started, one per run it took over. */
+  handles: SwarmHandle[];
+  /**
+   * Runs it could not resume, for example one whose definitionVersion or
+   * bindings this process lacks. Runs with a live lease holder, or that moved
+   * on while being claimed, are skipped silently instead.
+   */
+  failed: { key: SwarmKey; error: unknown }[];
+}
+
 export interface Swarm {
   run(options: SwarmRunOptions): Promise<SwarmHandle>;
   resume(options: SwarmResumeOptions): Promise<SwarmHandle>;
@@ -381,7 +393,9 @@ export interface Swarm {
   /**
    * Take over 'running' runs whose executor is gone (2.2). Needs the `lease`
    * option and a store with 'list'; runs with a live lease holder, or that
-   * changed while being claimed, are skipped.
+   * changed while being claimed, are skipped. One run's failure never stops
+   * the others: it is reported in `failed`, and every executor the call
+   * started is returned in `handles`.
    */
-  recover(options?: { scope?: string; limit?: number }): Promise<SwarmHandle[]>;
+  recover(options?: { scope?: string; limit?: number }): Promise<SwarmRecovery>;
 }

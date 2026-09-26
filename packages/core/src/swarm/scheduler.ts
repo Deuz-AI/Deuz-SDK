@@ -21,6 +21,7 @@ import type {
   SwarmHandle,
   SwarmKey,
   SwarmOptions,
+  SwarmRecovery,
   SwarmResumeOptions,
   SwarmSnapshot,
   SwarmSpawnContext,
@@ -1002,24 +1003,32 @@ export function createSwarm(options: SwarmOptions): Swarm {
         limit: input.limit ?? 100,
       });
       const handles: SwarmHandle[] = [];
+      const failed: SwarmRecovery['failed'] = [];
       for (const run of runs) {
-        if (owned.has(swarmKey(run))) continue;
+        const key: SwarmKey = { scope: run.scope, runId: run.runId };
+        if (owned.has(swarmKey(key))) continue;
         try {
           handles.push(
             await swarm.resume({
-              scope: run.scope,
-              runId: run.runId,
+              ...key,
               expectedRevision: run.revision,
               expectedStatus: 'running',
             }),
           );
         } catch (error) {
-          // A live holder, or a run that moved on since it was listed.
-          if (error instanceof SwarmLeaseError || error instanceof SwarmConflictError) continue;
-          throw error;
+          // A live holder, a run that moved on since it was listed, or one this
+          // process took up meanwhile. Anything else is this run's own failure,
+          // and it must not cost the other runs their recovery.
+          if (
+            error instanceof SwarmLeaseError ||
+            error instanceof SwarmConflictError ||
+            owned.has(swarmKey(key))
+          )
+            continue;
+          failed.push({ key, error });
         }
       }
-      return handles;
+      return { handles, failed };
     },
     get: (key) => options.store.load(key),
     events,
