@@ -304,13 +304,13 @@ describe('execution contexts with persistent admission', () => {
     const first = await run('run-a');
     expect(first.status).toBe('completed');
     // The first run settled to its actual 15 tokens; 15 + 100 no longer fits in 110.
-    expect(await store.usage('user:1')).toEqual({ tokens: 15, usd: expect.closeTo(0.01, 10) });
+    expect(await store.usage('user:1')).toEqual({ tokens: 15, usd: 0.01 });
     const second = await run('run-b');
     expect(second).toMatchObject({
       status: 'failed',
       error: { message: expect.stringMatching(/budget exceeded in persistent scope user:1/) },
     });
-    expect(await store.usage('user:1')).toEqual({ tokens: 15, usd: expect.closeTo(0.01, 10) });
+    expect(await store.usage('user:1')).toEqual({ tokens: 15, usd: 0.01 });
   });
 
   it('resumes a suspended native run with its persistent admission, and never without it', async () => {

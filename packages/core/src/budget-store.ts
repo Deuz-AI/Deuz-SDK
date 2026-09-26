@@ -188,19 +188,41 @@ export function decideBudgetAdmission(
 ): BudgetStoreReservation {
   const scopes: BudgetScopeUsage[] = [];
   for (const [index, scope] of request.scopes.entries()) {
-    const current = committed[index] ?? { tokens: 0, usd: 0 };
+    const raw = committed[index] ?? { tokens: 0, usd: 0 };
+    const current = { tokens: raw.tokens, usd: roundUsd(raw.usd) };
     for (const dimension of ['tokens', 'usd'] as const) {
       const limit = scope.limits[dimension];
-      if (limit !== undefined && current[dimension] + (request[dimension] ?? 0) > limit)
+      const sum = current[dimension] + (request[dimension] ?? 0);
+      const after = dimension === 'usd' ? roundUsd(sum) : sum;
+      if (limit !== undefined && after > limit)
         return { admitted: false, key: scope.key, dimension, limit, committed: current[dimension] };
     }
     scopes.push({
       key: scope.key,
       tokens: current.tokens + (request.tokens ?? 0),
-      usd: current.usd + (request.usd ?? 0),
+      usd: roundUsd(current.usd + (request.usd ?? 0)),
     });
   }
   return { admitted: true, scopes };
+}
+
+/**
+ * @internal USD counters move by (actual - estimate), which leaves binary
+ * floating-point residue such as 0.009999999999999995. Reported and compared
+ * amounts are rounded to 1e-12 USD, far below any price a provider bills.
+ */
+export const roundUsd = (value: number): number => Math.round(value * 1e12) / 1e12;
+
+/** @internal Apply `roundUsd` to a stored outcome. */
+export function roundBudgetOutcome(outcome: BudgetStoreReservation): BudgetStoreReservation {
+  if (!outcome.admitted)
+    return outcome.dimension === 'usd'
+      ? { ...outcome, committed: roundUsd(outcome.committed) }
+      : outcome;
+  return {
+    admitted: true,
+    scopes: outcome.scopes.map((scope) => ({ ...scope, usd: roundUsd(scope.usd) })),
+  };
 }
 
 /** @internal */
@@ -261,6 +283,8 @@ export function summarizeBudgetUsage(
     model.tokens += row.tokens;
     model.usd += row.usd;
   }
+  for (const model of Object.values(models)) model.usd = roundUsd(model.usd);
+  usd = roundUsd(usd);
   return byModel ? { tokens, usd, byModel: models } : { tokens, usd };
 }
 

@@ -78,6 +78,20 @@ export function budgetStoreContracts(name: string, make: () => Promise<BudgetSto
       ).toMatchObject({ admitted: false, key: 'user:usd', dimension: 'usd', limit: 1 });
     });
 
+    it('reports USD without floating-point residue', async () => {
+      const { store } = await make();
+      const scope = { key: 'user:cents', limits: { usd: 1 } };
+      await store.reserve({ requestId: 'a', modelId: 'm', usd: 0.1, scopes: [scope] });
+      await store.settle('a', { tokens: 0, usd: 0.01 });
+      expect(await store.usage('user:cents')).toEqual({ tokens: 0, usd: 0.01 });
+      expect(
+        await store.reserve({ requestId: 'b', modelId: 'm', usd: 0.2, scopes: [scope] }),
+      ).toEqual({ admitted: true, scopes: [{ key: 'user:cents', tokens: 0, usd: 0.21 }] });
+      expect(
+        await store.reserve({ requestId: 'b', modelId: 'm', usd: 0.2, scopes: [scope] }),
+      ).toEqual({ admitted: true, scopes: [{ key: 'user:cents', tokens: 0, usd: 0.21 }] });
+    });
+
     it('is idempotent by requestId and rejects a conflicting repeat', async () => {
       const { store } = await make();
       const input = { requestId: 'r', modelId: 'm', tokens: 60, scopes: [user(100)] };

@@ -28,6 +28,7 @@ import {
   normalizeBudgetReserve,
   planBudgetTransition,
   reservationConflict,
+  roundBudgetOutcome,
   summarizeBudgetUsage,
 } from '../budget-store';
 
@@ -83,6 +84,14 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
     return migrating;
   };
 
+  /** jsonb arrives parsed from `pg` and PGlite, as text from some drivers. */
+  const parse = (value: unknown): BudgetStoreReservation | undefined =>
+    value === null || value === undefined
+      ? undefined
+      : roundBudgetOutcome(
+          (typeof value === 'string' ? JSON.parse(value) : value) as BudgetStoreReservation,
+        );
+
   const readRequest = async (requestId: string) => {
     const { rows } = await client.query(
       `SELECT fingerprint, state, actual_tokens, actual_usd, outcome FROM ${t('requests')} WHERE request_id = $1`,
@@ -95,9 +104,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
       state: String(row.state) as RequestState,
       actualTokens: row.actual_tokens === null ? null : Number(row.actual_tokens),
       actualUsd: row.actual_usd === null ? null : Number(row.actual_usd),
-      outcome: (typeof row.outcome === 'string'
-        ? JSON.parse(row.outcome)
-        : row.outcome) as BudgetStoreReservation,
+      outcome: parse(row.outcome)!,
     };
   };
 
@@ -162,7 +169,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         AND NOT EXISTS (
           SELECT 1 FROM cur
           WHERE (lt IS NOT NULL AND used_tokens + $4::bigint > lt)
-             OR (lu IS NOT NULL AND used_usd + $5::float8 > lu)
+             OR (lu IS NOT NULL AND round((used_usd + $5::float8)::numeric, 12) > lu::numeric)
         ) AS admitted
     ), failure AS (
       SELECT key, dim, lim, used FROM (
@@ -170,7 +177,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         FROM cur WHERE lt IS NOT NULL AND used_tokens + $4::bigint > lt
         UNION ALL
         SELECT key, ord, 1 AS dn, 'usd' AS dim, lu AS lim, used_usd AS used
-        FROM cur WHERE lu IS NOT NULL AND used_usd + $5::float8 > lu
+        FROM cur WHERE lu IS NOT NULL AND round((used_usd + $5::float8)::numeric, 12) > lu::numeric
       ) f ORDER BY ord, dn LIMIT 1
     ), outcome AS (
       SELECT CASE WHEN d.admitted THEN jsonb_build_object(
@@ -213,11 +220,6 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
     )
     SELECT (SELECT outcome FROM ins) AS outcome,
       (SELECT count(*) FROM ring) AS ring, (SELECT count(*) FROM hist) AS hist`;
-
-  const parse = (value: unknown): BudgetStoreReservation | undefined =>
-    value === null || value === undefined
-      ? undefined
-      : ((typeof value === 'string' ? JSON.parse(value) : value) as BudgetStoreReservation);
 
   const recorded = async (requestId: string, fingerprint: string) => {
     const existing = await readRequest(requestId);
