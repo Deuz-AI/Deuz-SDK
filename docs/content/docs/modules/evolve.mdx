@@ -1,0 +1,234 @@
+---
+title: Evolve
+description: Evolutionary program search with evolve blocks, SEARCH/REPLACE diffs, an evaluation cascade, islands, a model bandit, a mandatory budget and zero-call resume.
+---
+
+`evolve` (2.2) improves a program the way AlphaEvolve, OpenEvolve and
+ShinkaEvolve do. A model proposes a change to the evolvable part of the
+program. A cascade of evaluators scores the result. The best programs become
+the parents and inspirations of the next generation. It is a standalone
+controller, not a swarm, and runs on the edge. Populations persist through a
+`PopulationStore`: memory ships in `@deuz-sdk/core/evolve`, SQLite in
+`@deuz-sdk/core/evolve/sqlite`.
+
+## Evolve a function
+
+This complete example is deterministic and needs no API key. The mock model
+always answers with the same diff, which adds one line per generation, and the
+evaluator counts those lines.
+
+```ts
+import { createInMemoryPopulationStore, evolve } from '@deuz-sdk/core/evolve';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const initial = `def f(x):
+    # EVOLVE-BLOCK-START
+    return x
+    # EVOLVE-BLOCK-END
+`;
+
+const diff = `<<<<<<< SEARCH
+    return x
+=======
+    x = x + 1
+    return x
+>>>>>>> REPLACE`;
+
+const handle = evolve({
+  scope: 'tenant-a',
+  runId: 'grow-1',
+  initial,
+  instructions: 'Make f return as large a value as possible.',
+  stages: [{ name: 'count', evaluate: program => ({ score: program.split('x = x + 1').length - 1 }) }],
+  models: [{ model: createMockModel({ responses: [{ text: diff }] }) }],
+  store: createInMemoryPopulationStore(),
+  generations: 3,
+  mutationsPerGeneration: 2,
+  patch: { diff: 1 },
+  budget: { tokens: 200_000 },
+  seed: 'demo',
+});
+
+for await (const event of handle.events()) {
+  if (event.type === 'improvement') console.log(event.generation, event.score); // 0 0, 1 1, 2 2, 3 3
+}
+const result = await handle.result;
+console.log(result.status, result.reason); // completed generations
+console.log(result.best?.id, result.best?.score); // g3-i0-s0 3
+```
+
+Generation zero evaluates `initial` once as candidate `g0-i0-s0`. Each later
+generation makes `mutationsPerGeneration` model calls, dealt round-robin over
+the islands, and every candidate gets the ID `g{generation}-i{island}-s{slot}`.
+
+## Evolve blocks and patches
+
+Only the code between lines containing `EVOLVE-BLOCK-START` and
+`EVOLVE-BLOCK-END` may change; any comment syntax works around the markers. A
+program without markers is evolvable as a whole. Three patch types are drawn
+per slot, with default probabilities 0.6, 0.3 and 0.1:
+
+| `patch` key | The model returns | Applied with |
+| --- | --- | --- |
+| `diff` | `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks | `applySearchReplace` |
+| `full` | the whole program in a fenced block | `extractFullRewrite` |
+| `cross` | a program combining two parents | `extractFullRewrite` |
+
+When you pass `patch`, omitted types get probability zero. `cross` falls back
+to `diff` while there is no second parent. The helpers are strict and pure:
+
+```ts
+import { applySearchReplace, EvolvePatchError, parseEvolveBlocks } from '@deuz-sdk/core/evolve';
+
+const source = 'setup()\n# EVOLVE-BLOCK-START\nx = 1\n# EVOLVE-BLOCK-END\n';
+console.log(parseEvolveBlocks(source).blocks[0]?.content); // "x = 1\n"
+
+const diff = '<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE';
+console.log(applySearchReplace(source, diff));
+
+try {
+  applySearchReplace(source, '<<<<<<< SEARCH\nsetup()\n=======\nhack()\n>>>>>>> REPLACE');
+} catch (error) {
+  if (error instanceof EvolvePatchError) console.log(error.code); // outside_evolve_block
+}
+```
+
+Each SEARCH must match exactly once inside an evolve block. Otherwise the error
+code is `not_found`, `outside_evolve_block` or `ambiguous`. A REPLACE containing
+a marker is `marker_in_replace`. A full rewrite that changes frozen code is
+`frozen_changed`. In a run, a patch error rejects that candidate with
+`rejection.kind: 'patch'`. The evaluators never see it, and the run goes on.
+
+## Evaluation cascade
+
+`stages` run in order and stop at the first stage whose score is below its
+`threshold` or that returns `passed: false`. Put cheap checks first so that
+broken candidates never reach the expensive benchmark. A candidate's `score` is
+the last evaluated stage's score, and higher is better. Only candidates that
+pass every stage are `accepted` and can become parents.
+
+```ts
+import type { EvolveStage } from '@deuz-sdk/core/evolve';
+
+const stages: EvolveStage[] = [
+  { name: 'compiles', threshold: 1, evaluate: program => ({ score: program.includes('return') ? 1 : 0 }) },
+  {
+    name: 'benchmark',
+    timeoutMs: 30_000,
+    async evaluate(program, context) {
+      const runtimeMs = 12; // run your benchmark here and honour context.signal
+      return {
+        score: 1000 / runtimeMs,
+        metrics: { runtimeMs },
+        features: { size: Math.min(1, program.length / 5000) },
+        artifacts: { stderr: '' },
+      };
+    },
+  },
+];
+```
+
+A stage that throws or passes `timeoutMs` rejects the candidate with
+`rejection.kind: 'evaluation'`, and its message lands in `artifacts.error`.
+Artifacts are a side channel: the parent's artifacts and the island's recent
+failed attempts, stderr included, go into the next generation's prompt.
+`features` in `[0, 1]` place accepted candidates in a MAP-Elites grid
+(`population.featureBins`, default 10), which is the elite archive.
+
+## Selection, islands and models
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `selection` | `'weighted'` | Exploit strategy: `'weighted'`, `'power-law'`, `'beam'` or `{ boltzmann: temperature }` |
+| `population.exploreRatio` | 0.2 | Parent drawn uniformly from the island |
+| `population.eliteRatio` | 0.1 | Parent drawn from the elite archive |
+| `population.size` | 20 | Members kept per island |
+| `population.archiveSize` | 20 | Elite archive cells kept |
+| `inspirations` | `{ top: 3, diverse: 2 }` | Programs shown in the prompt besides the parent |
+| `islands` | one island | `{ count, migrationEvery, migrationRate, resetWeakestEvery? }` |
+| `concurrency` | 4 | Concurrent mutations |
+
+With islands, every `migrationEvery` generations each island copies its best
+`migrationRate` share to the next island in a ring. Every `resetWeakestEvery`
+generations, the island whose best score is lowest restarts from the global
+best. With more than one entry in `models`, a UCB1 bandit picks the model for
+each slot. A model earns a reward when its candidate beats its parent. `weight`
+scales a model's score, and `weight: 0` never picks it.
+
+Every random draw comes from a PRNG keyed by the seed, the generation, the
+island and the slot. A run with the same `seed`, store contents and evaluators
+replays identically at any concurrency. Without `seed`, one is derived from
+`deps.generateId()` and recorded in the run.
+
+## Novelty
+
+`novelty.embed` takes an `EmbeddingModel` or any `(texts) => Promise<number[][]>`,
+such as a RAG embedder's `embed`. A candidate whose embedding has cosine
+similarity of at least `maxCosine` (default 0.99) to an island member is
+rejected with `rejection.kind: 'novelty'` before evaluation. A candidate
+identical to a member is always rejected as `duplicate`. An optional `judge`
+gets the near-duplicate pair and can keep the candidate by returning `true`.
+Embeddings are stored on candidates, so a resumed run never re-embeds them.
+
+## Budget, stopping and control
+
+`budget` is required and needs `tokens` or `usd`. Every mutation runs under a
+child execution scope named after its candidate ID. The finished scopes are
+compacted after each generation, so the persisted ledger stays bounded. When a
+reservation would exceed the budget, the run commits what it already has and
+stops with `status: 'stopped'` and `reason: 'budget'`. `result.totals` holds
+the spend. A resumed run can tighten the stored budget but never loosen it.
+
+`stopWhen.targetScore` ends the run with reason `'target'` once the best score
+reaches it. `stopWhen.plateau` ends it with reason `'plateau'` after that many
+generations without improvement. `handle.drain()` finishes the current
+generation and stops with reason `'drained'`. `handle.cancel()` or
+`options.signal` aborts in-flight work and stops with reason `'cancelled'`.
+`handle.events()` replays every event of the handle from the start:
+`generation.started`, `candidate`, `improvement`, `migration`, `island.reset`,
+`generation.committed` and `run.finished`.
+
+## Durable resume
+
+Candidates are written as soon as they are evaluated. A write with an existing
+ID is a no-op when identical and a conflict otherwise. A generation commits
+with a compare-and-set on its number. `resumeEvolve` loads the run and replays
+the slots already in the store without calling a model, then continues. It also
+continues a run that completed with reason `'generations'` when you ask for
+more generations.
+
+```ts
+import { evolve, resumeEvolve } from '@deuz-sdk/core/evolve';
+import { createSqlitePopulationStore } from '@deuz-sdk/core/evolve/sqlite';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const store = createSqlitePopulationStore({ path: 'evolve.sqlite' });
+const options = {
+  scope: 'tenant-a',
+  runId: 'grow-2',
+  initial: '# EVOLVE-BLOCK-START\nvalue = 1\n# EVOLVE-BLOCK-END\n',
+  stages: [{ evaluate: (program: string) => ({ score: program.length }) }],
+  models: [{ model: createMockModel({ responses: [{ text: '<<<<<<< SEARCH\nvalue = 1\n=======\nvalue = 10\n>>>>>>> REPLACE' }] }) }],
+  store,
+  mutationsPerGeneration: 2,
+  budget: { tokens: 100_000 },
+};
+
+await evolve({ ...options, generations: 1 }).result;
+// Later, or in another process after a crash:
+const more = await resumeEvolve({ ...options, generations: 2 }).result;
+console.log(more.generation, more.modelCalls);
+await store.close();
+```
+
+The SQLite store keeps its schema version in its own `deuz_evolve_schema`
+table, runs every write in `BEGIN IMMEDIATE`, and accepts an injected
+`SqliteDatabaseLike` (better-sqlite3 works) through `database`. Resuming checks
+that the initial program, the island count, `mutationsPerGeneration` and the
+number of models match the stored run.
+
+<Callout type="warn" title="Evaluators run model-written code">
+Evolve runs model-written code only through your evaluators. Sandbox that
+execution, for example in a worker, a container or a remote runtime. The
+controller itself never executes a candidate.
+</Callout>
