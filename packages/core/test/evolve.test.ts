@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { evolve, resumeEvolve } from '../src/evolve/controller';
 import { createInMemoryPopulationStore } from '../src/evolve/store';
-import { createMockModel } from '../src/testing';
+import { createMockModel, sseEvents } from '../src/testing';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import type { LanguageModel } from '../src/types/model';
 import type {
@@ -550,6 +550,55 @@ describe('evolve: stopping', () => {
     const result = await cancelled.result;
     expect(result).toMatchObject({ status: 'stopped', reason: 'cancelled' });
     expect(await store.loadRun(result)).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+  });
+
+  it('stores nothing for a mutation cancelled mid-stream, so a resume pays for it again', async () => {
+    let requested!: () => void;
+    const inFlight = new Promise<void>((resolve) => (requested = resolve));
+    const base = createMockModel({ responses: [] });
+    // Half a diff, then silence until the request is aborted.
+    const stalling = attachConfig(
+      { ...base },
+      {
+        ...readConfig(base)!,
+        fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+          const signal = init!.signal!;
+          const half = sseEvents([
+            {
+              data: {
+                choices: [{ index: 0, delta: { content: GROW.slice(0, 30) }, finish_reason: null }],
+              },
+            },
+          ]);
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(half));
+              signal.addEventListener('abort', () => controller.error(signal.reason), {
+                once: true,
+              });
+              requested();
+            },
+          });
+          return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+        }) as typeof fetch,
+      },
+    );
+    const store = createInMemoryPopulationStore();
+    const shape = { store, generations: 1, mutationsPerGeneration: 1 };
+    const handle = evolve(options({ ...shape, models: [{ model: stalling }] }));
+    await inFlight;
+    await handle.cancel();
+    const result = await handle.result;
+    // The request was sent, so it counts, but its slot is not done.
+    expect(result).toMatchObject({ status: 'stopped', reason: 'cancelled', modelCalls: 1 });
+    // Only the seed: the cancelled slot left nothing for a resume to replay.
+    expect((await store.listCandidates(result)).map((item) => item.id)).toEqual(['g0-i0-s0']);
+
+    const { model, counter } = grower();
+    const resumed = await resumeEvolve(options({ ...shape, models: [{ model }] })).result;
+    expect(counter.calls).toBe(1);
+    expect(resumed).toMatchObject({ status: 'completed', generation: 1 });
+    expect(resumed.best?.score).toBe(1);
   });
 });
 

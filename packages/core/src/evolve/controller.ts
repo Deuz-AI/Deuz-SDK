@@ -697,6 +697,8 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
           ...(options.deps ? { deps: options.deps } : {}),
         });
         modelCalls++;
+        // A cancelled call resolves with what streamed so far; its slot is not done.
+        if (controller.signal.aborted) return { skipped: 'aborted' };
         text = response.text;
       } catch (error) {
         if (isBudgetExceeded(error)) {
