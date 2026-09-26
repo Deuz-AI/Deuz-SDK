@@ -188,10 +188,16 @@ outside `policy.allowedModels`, any other fatal execution error apart from
 budget exhaustion, and the configuration errors `AuthenticationError`,
 `ModelNotFoundError` and `UnsupportedCapabilityError`. The slots already in
 flight finish and keep their candidates, the run is saved with
-`status: 'failed'`, and `handle.result` rejects with the error, so
-`resumeEvolve` can continue once the cause is fixed. Other model errors, such
-as a rate limit that outlasts its retries or a request the provider rejects as
-invalid, reject only that candidate with `rejection.kind: 'model'`.
+`status: 'failed'`, and `handle.result` rejects with the error. After a
+configuration error, such as a bad API key or an unknown model, fix the cause
+and `resumeEvolve` continues the run. A policy refusal is different: the run
+saves its execution policy, and a resume can only narrow it. A resume keeps the
+earliest `deadlineAt` and the lowest `maxDepth`, so after an elapsed deadline or
+a depth refusal every resume fails again at once and that run is finished. After
+an `allowedModels` refusal, resume with models the saved list allows. Other
+model errors, such as a rate limit that outlasts its retries or a request the
+provider rejects as invalid, reject only that candidate with
+`rejection.kind: 'model'`.
 `result.modelCalls` counts the calls that sent a request: a refusal before the
 request, including an open circuit breaker, is not a call. A call that a cancel
 cuts off may still be counted even if its request was never sent, because a

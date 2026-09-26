@@ -739,6 +739,21 @@ describe('evolve: model errors', () => {
     });
   });
 
+  it('keeps an elapsed deadline on resume, so that run cannot continue', async () => {
+    const { model, counter } = grower();
+    const store = createInMemoryPopulationStore();
+    const shape = { store, models: [{ model }], generations: 2 };
+    await expect(
+      evolve(options({ ...shape, policy: { deadlineAt: 5 } })).result,
+    ).rejects.toMatchObject({ code: 'deadline_exceeded' });
+    // The run saved its policy, and a resume can only narrow it.
+    await expect(resumeEvolve(options(shape)).result).rejects.toMatchObject({
+      code: 'deadline_exceeded',
+    });
+    expect(counter.calls).toBe(0);
+    expect(await store.loadRun(key)).toMatchObject({ status: 'failed', generation: 0 });
+  });
+
   it.each([
     [401, 'AuthenticationError'],
     [403, 'AuthenticationError'],
