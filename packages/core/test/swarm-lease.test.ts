@@ -272,6 +272,73 @@ describe('swarm leases', () => {
     expect(await store.head!(key)).toEqual(settled);
   });
 
+  it('reports the same lost lease from events() as from result', async () => {
+    const time = manualClock();
+    const frozen = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    let conflicted = false;
+    const noting: SwarmStore = {
+      ...store,
+      async commit(change) {
+        try {
+          return await store.commit(change);
+        } catch (error) {
+          if (error instanceof SwarmConflictError) conflicted = true;
+          throw error;
+        }
+      },
+    };
+    const first = gate();
+    const stubborn = gate();
+    const calls = { count: 0 };
+    const pair: SwarmTask[] = [
+      { id: 'a', reducer: 'work', replay: 'safe' },
+      { id: 'b', reducer: 'stubborn', replay: 'safe' },
+    ];
+    const a = createSwarm({
+      agents: {},
+      store: noting,
+      reducers: {
+        work: slow(first.promise, calls),
+        // Ignores the run's signal: it returns only once its gate opens.
+        stubborn: {
+          async execute() {
+            calls.count++;
+            await stubborn.promise;
+            return 'late';
+          },
+        },
+      },
+      deps: { clock: frozen.clock },
+      lease: { provider, owner: 'a', ttlMs: 3_000 },
+    });
+    const zombie = await a.run({ ...key, tasks: pair });
+    await until(() => calls.count === 2);
+    await time.advance(10_000);
+    const b = createSwarm({
+      agents: {},
+      store: connection(store),
+      reducers: { work: slow(Promise.resolve(), calls), stubborn: { execute: () => 'fresh' } },
+      deps: { clock: time.clock },
+      lease: { provider, owner: 'b', ttlMs: 3_000 },
+    });
+    expect((await (await b.resume(key)).result).run.status).toBe('completed');
+    // A's first task finishes and its write meets the revision check while its
+    // second task is still running, so A has not yet told a lost lease apart.
+    first.resolve();
+    await until(() => conflicted);
+    const next = zombie.events()[Symbol.asyncIterator]().next();
+    void next.catch(() => {});
+    stubborn.resolve();
+    const verdict = await zombie.result.catch((error: unknown) => error);
+    expect(verdict).toBeInstanceOf(SwarmLeaseError);
+    expect(verdict).toMatchObject({ code: 'lost' });
+    await expect(next).rejects.toBe(verdict);
+    // A reader that starts afterwards gets the same error.
+    await expect(zombie.events()[Symbol.asyncIterator]().next()).rejects.toBe(verdict);
+  });
+
   it('keeps a revision conflict when the executor still holds its lease', async () => {
     const time = manualClock();
     const provider = createInMemoryLeaseProvider({ clock: time.clock });

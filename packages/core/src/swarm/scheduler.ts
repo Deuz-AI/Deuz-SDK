@@ -205,14 +205,14 @@ export function createSwarm(options: SwarmOptions): Swarm {
   const events = (
     key: SwarmKey,
     settings: { afterSequence?: number; signal?: AbortSignal } = {},
-    failure?: () => unknown,
+    failure?: () => Promise<unknown> | undefined,
   ): AsyncIterable<SwarmEvent> => ({
     async *[Symbol.asyncIterator]() {
       let cursor = settings.afterSequence ?? 0;
       validateEventCursor(cursor, 256);
       while (!settings.signal?.aborted) {
         const failed = failure?.();
-        if (failed) throw failed;
+        if (failed) throw await failed;
         const page = await options.store.readEvents(key, cursor, 256);
         for (const event of page) {
           cursor = event.sequence;
@@ -824,7 +824,17 @@ export function createSwarm(options: SwarmOptions): Swarm {
     const handle: SwarmHandle = {
       ...key,
       result,
-      events: (settings) => events(key, settings, () => writeFailure),
+      // A failed executor's reader throws what result rejects with (2.2): a
+      // revision conflict can still turn out to be a lost lease.
+      events: (settings) =>
+        events(key, settings, () =>
+          writeFailure === undefined
+            ? undefined
+            : result.then(
+                () => writeFailure,
+                (error: unknown) => error,
+              ),
+        ),
       cancel,
       drain: () => {
         draining = true;
