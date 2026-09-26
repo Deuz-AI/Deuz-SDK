@@ -6,3 +6,15 @@
  */
 export type { CronSchedule } from './schedule/cron';
 export { parseCron, nextOccurrence, previousOccurrence, occurrencesBetween } from './schedule/cron';
+export type {
+  ScheduleOccurrence,
+  ScheduleDefinition,
+  ScheduleClaim,
+  ScheduleCatchUp,
+  SchedulerOptions,
+  ScheduleOccurrenceResult,
+  ScheduleTickResult,
+  ScheduleStartOptions,
+  Scheduler,
+} from './schedule/scheduler';
+export { createScheduler, createInMemoryClaim } from './schedule/scheduler';
