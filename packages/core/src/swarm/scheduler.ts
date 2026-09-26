@@ -1037,14 +1037,16 @@ export function createSwarm(options: SwarmOptions): Swarm {
           ...(after ? { after } : {}),
         });
         const known = listed.size;
-        for (const run of page.slice(0, size))
+        // A store may return more rows than asked: the cursor follows the rows kept.
+        const kept = page.slice(0, size);
+        for (const run of kept)
           listed.set(swarmKey(run), {
             key: { scope: run.scope, runId: run.runId },
             revision: run.revision,
           });
-        const last = page.at(-1);
+        const last = kept.at(-1);
         // A short page ends the listing, and so does one that adds nothing.
-        if (!last || page.length < size || listed.size === known) break;
+        if (!last || kept.length < size || listed.size === known) break;
         after = { updatedAt: last.updatedAt, scope: last.scope, runId: last.runId };
       }
       const handles: SwarmHandle[] = [];

@@ -370,6 +370,40 @@ describe('swarm recover', () => {
     expect(acquired).toBe(1_000);
   });
 
+  it('pages on from the last run it kept when a store returns more rows than asked', async () => {
+    const time = manualClock();
+    const examined: string[] = [];
+    const runs = Array.from(
+      { length: 1_500 },
+      (_, index) => crashed(`r${String(index).padStart(4, '0')}`, 1).run,
+    );
+    // Honours the cursor, but returns every run after it whatever the limit.
+    const greedy: SwarmStore = {
+      ...createInMemorySwarmStore(),
+      capabilities: ['list'],
+      listRuns: async (query) =>
+        runs.filter((run) => query.after === undefined || run.runId > query.after.runId),
+    };
+    const provider: LeaseProvider = {
+      ...createInMemoryLeaseProvider({ clock: time.clock }),
+      async acquire(request) {
+        examined.push(request.key);
+        return undefined;
+      },
+    };
+    const swarm = swarmOn({
+      store: greedy,
+      clock: time.clock,
+      provider,
+      release: Promise.resolve(),
+      calls: [],
+    });
+    expect(await swarm.recover()).toEqual({ handles: [], failed: [] });
+    // Every run was examined once, including the 500 past the first page.
+    expect(examined).toHaveLength(1_500);
+    expect(new Set(examined).size).toBe(1_500);
+  });
+
   it('refuses a run another executor holds without reading its snapshot', async () => {
     const time = manualClock();
     const provider = createInMemoryLeaseProvider({ clock: time.clock });
