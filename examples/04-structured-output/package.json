@@ -8,7 +8,7 @@
     "dev": "node --experimental-strip-types index.ts"
   },
   "dependencies": {
-    "@deuz-sdk/core": "*",
+    "@deuz-sdk/core": "^2.2.0",
     "@standard-community/standard-json": "^0.2.0",
     "zod": "^3.25.0"
   },

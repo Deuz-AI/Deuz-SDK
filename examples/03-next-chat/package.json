@@ -9,8 +9,8 @@
     "start": "next start"
   },
   "dependencies": {
-    "@deuz-sdk/core": "*",
-    "@deuz-sdk/react": "*",
+    "@deuz-sdk/core": "^2.2.0",
+    "@deuz-sdk/react": "^2.2.0",
     "next": "^15.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
