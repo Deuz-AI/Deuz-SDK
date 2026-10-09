@@ -50,9 +50,26 @@ export interface FileWorkspaceOptions {
 }
 
 /**
+ * True when a `path.relative` result leaves its base: it starts with a real `..`
+ * SEGMENT, two dots followed by the separator or the end. A bare
+ * `startsWith('..')` also matched ordinary names such as `..notes` or `...` and
+ * refused them as traversal (F11).
+ */
+const climbsOut = (path: NodePath, rel: string): boolean =>
+  rel === '..' || rel.startsWith(`..${path.sep}`);
+
+/** Nothing at the path: it is missing, or one of its parents is a file. */
+const isMissing = (err: unknown): boolean => {
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+};
+
+/**
  * A `Workspace` backed by a sandboxed directory. Reads/writes/lists happen
- * under `root`; a path that would escape the root (after normalization) throws.
- * `write` creates parent directories; `delete` of a missing path is a no-op.
+ * under `root`; a path that would escape the root (after normalization) throws,
+ * from every method. `write` creates parent directories. A missing path is the
+ * only soft case: `exists` returns false and `delete` is a no-op; any other
+ * failure (deleting a directory, a locked file) rejects.
  */
 export function createFileWorkspace(options: FileWorkspaceOptions): Workspace {
   // Layer 2: lexical containment, defense in depth over normalizeWorkspacePath.
@@ -67,7 +84,7 @@ export function createFileWorkspace(options: FileWorkspaceOptions): Workspace {
     const abs = path.resolve(root, normalizeWorkspacePath(rel));
     const relToRoot = path.relative(root, abs);
     if (
-      relToRoot.startsWith('..') ||
+      climbsOut(path, relToRoot) ||
       path.isAbsolute(relToRoot) ||
       path.resolve(root, relToRoot) !== abs
     ) {
@@ -103,7 +120,9 @@ export function createFileWorkspace(options: FileWorkspaceOptions): Workspace {
       const real = await realpathOr(fs, probe);
       if (real !== undefined) {
         const relReal = path.relative(realRoot, real);
-        if (relReal !== '' && (relReal.startsWith('..') || path.isAbsolute(relReal))) {
+        // The same segment test as layer 2: with only layer 2 fixed, a `..notes`
+        // write went through and its read failed here as "(via a link)".
+        if (relReal !== '' && (climbsOut(path, relReal) || path.isAbsolute(relReal))) {
           throw new Error(`Workspace path '${rel}' escapes the sandbox root (via a link).`);
         }
         return abs;
@@ -166,31 +185,38 @@ export function createFileWorkspace(options: FileWorkspaceOptions): Workspace {
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.writeFile(abs, content);
     },
+    // exists/delete used to run the guard INSIDE their try/catch: an illegal or
+    // escaping path came back as `false` / a silent success, unlike read/write
+    // and unlike createInMemoryWorkspace, and delete() "succeeded" on anything it
+    // could not remove. Only a missing path is soft now.
     async exists(rel: string): Promise<boolean> {
       const { fs, path } = await load();
+      const abs = await resolveInside(fs, path, options.root, rel);
       try {
-        await fs.stat(await resolveInside(fs, path, options.root, rel));
+        await fs.stat(abs);
         return true;
-      } catch {
-        return false;
+      } catch (err) {
+        if (isMissing(err)) return false;
+        throw err;
       }
     },
     async list(prefix?: string): Promise<WorkspaceEntry[]> {
+      // Checked up front: per entry, an empty root never checked it at all.
+      const norm = prefix ? normalizeWorkspacePath(prefix) : '';
       const { fs, path } = await load();
       const out: WorkspaceEntry[] = [];
       await walk(fs, path, options.root, options.root, out);
-      const filtered = prefix
-        ? out.filter((e) => e.path.startsWith(normalizeWorkspacePath(prefix)))
-        : out;
+      const filtered = norm ? out.filter((e) => e.path.startsWith(norm)) : out;
       filtered.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
       return filtered;
     },
     async delete(rel: string): Promise<void> {
       const { fs, path } = await load();
+      const abs = await resolveInside(fs, path, options.root, rel);
       try {
-        await fs.unlink(await resolveInside(fs, path, options.root, rel));
-      } catch {
-        /* already gone */
+        await fs.unlink(abs);
+      } catch (err) {
+        if (!isMissing(err)) throw err; // already gone is fine; still there is not
       }
     },
   };
