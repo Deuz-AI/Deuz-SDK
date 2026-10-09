@@ -17,9 +17,19 @@ import type { MemoryMutation } from '../memory';
  *
  * `type` is an OPEN string union in spirit — 'other' is the escape hatch, so
  * treat unknown members defensively rather than switching exhaustively.
+ *
+ * `unpriced-model` (2.3): the model has no price, so a USD budget could not be
+ * applied to that call. The call still runs and token limits still apply; set
+ * `unknownPrice: 'reject'` to refuse unpriced models instead.
  */
 export interface CallWarning {
-  type: 'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other';
+  type:
+    | 'unsupported-setting'
+    | 'clamped-setting'
+    | 'unknown-model'
+    | 'unsupported-tool'
+    | 'unpriced-model'
+    | 'other';
   /** The option that triggered it, when there is one (e.g. 'topP', 'effort'). */
   setting?: string;
   /** Human-readable explanation. Never contains secrets (P0 redaction). */

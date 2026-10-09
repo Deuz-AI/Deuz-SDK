@@ -5,8 +5,14 @@
  * reasoning tokens billed as output but invisible in text).
  */
 export interface Usage {
+  /** Prompt tokens billed at the full input rate. Excludes `cachedReadTokens`. */
   inputTokens: number;
+  /**
+   * Every generated token, reasoning included. All adapters normalize to this
+   * (2.3), so price `outputTokens` once at the output rate.
+   */
   outputTokens: number;
+  /** The reasoning share of `outputTokens` (a subset, never added on top). */
   reasoningTokens: number;
   cachedReadTokens: number;
   cacheWriteTokens: number;
