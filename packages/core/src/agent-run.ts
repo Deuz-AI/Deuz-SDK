@@ -11,6 +11,7 @@ import type {
 import type { CommonCallOptions } from './types/config';
 import type { StopDetails } from './types/methods';
 import type { Message } from './types/message';
+import type { WireToolRequest } from './adapters/types';
 import type { SessionStore } from './types/session';
 import type { StreamPart } from './types/stream';
 import type { ExecutionContextSnapshot, NativeExecutionContext } from './types/execution';
@@ -23,10 +24,14 @@ import { EMPTY_USAGE } from './core/metering';
 import { getCapabilities } from './core/registry';
 import { runStream } from './core/inference';
 import { runStreamToolLoop, type StreamToolLoopSnapshot } from './inference/stream-tool-loop';
-import { stopDetailsFrom } from './inference/run-step';
+import { assembleAssistant, stopDetailsFrom, type EncryptedReasoning } from './inference/run-step';
 import {
+  buildWireTools,
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
+  filterWireTools,
+  mergeMcpTools,
+  rewriteAssistantText,
   sumUsage,
 } from './inference/loop-shared';
 import { pickObjectStrategy } from './inference/object-shared';
@@ -94,6 +99,20 @@ function finalTurnText(messages: Message[]): string {
 /** Native stop reasons name a refusal plainly (2.3); other finish reasons pass through. */
 function stopReasonOf(finishReason: string): string {
   return finishReason === 'content_filter' ? 'refusal' : finishReason;
+}
+
+/**
+ * The user turn that closes the loop's history before finalization (2.3, F15).
+ * It is part of the durable, append-only transcript.
+ */
+const FINALIZE_PROMPT =
+  'Now provide the final output in the required format, based on the work above.';
+
+/** A turn with nothing in it: never stored, because no provider accepts one back. */
+function isBlankTurn(message: Message): boolean {
+  return typeof message.content === 'string'
+    ? message.content === ''
+    : message.content.length === 0;
 }
 
 function positiveInteger(value: number, name: string): number {
@@ -605,10 +624,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
 
       // Structured-only runs go straight to finalization. Runs with tools/MCP
       // traverse the canonical loop first; no tool executor exists here.
-      if (
-        envelope.phase === 'running' &&
-        (!options.output || Object.keys(common.tools).length > 0 || (options.mcp?.length ?? 0) > 0)
-      ) {
+      const hasLoopTools = Object.keys(common.tools).length > 0 || (options.mcp?.length ?? 0) > 0;
+      /** The tool request of the loop's last model call, when this leg ran the loop. */
+      let loopWire: WireToolRequest | undefined;
+      if (envelope.phase === 'running' && (!options.output || hasLoopTools)) {
         const checkpoint = envelope.checkpoints[envelope.runId];
         const recoveredOutcome =
           resume && checkpoint?.status === 'completed' ? envelope.loopOutcome : undefined;
@@ -703,6 +722,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             return;
           }
           if (!options.output) envelope.candidateText = currentText = finalTurnText(loop.messages);
+          loopWire = loop.wire;
         }
       } else if (envelope.phase === 'running') {
         const input = await evaluateInputGuardrails(common, envelope.messages);
@@ -717,6 +737,29 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       envelope.phase = 'finalizing';
       events.push({ type: 'phase', phase: 'finalizing' });
       await persist();
+      // Finalization is one more turn of the same conversation (2.3, F15). It
+      // keeps the loop's tools on the wire, with `tool_choice: 'none'`, so the
+      // request prefix (prompt cache, preserved thinking) is the loop's own. A
+      // leg that did not run the loop rebuilds the run's static tool request.
+      let finalizeTools: WireToolRequest | undefined | null = null;
+      const finalizeToolRequest = async (): Promise<WireToolRequest | undefined> => {
+        if (finalizeTools !== null) return finalizeTools;
+        const wire =
+          loopWire ??
+          (hasLoopTools
+            ? filterWireTools(
+                await buildWireTools(
+                  mergeMcpTools(undefined, common.tools),
+                  common.toolChoice,
+                  common.maxToolConcurrency,
+                ),
+                common.activeTools,
+                resolveDependencies(options.deps).logger,
+              )
+            : undefined);
+        finalizeTools = wire && wire.tools.length > 0 ? { ...wire, toolChoice: 'none' } : undefined;
+        return finalizeTools;
+      };
       for (;;) {
         if (envelope.candidateText === undefined) {
           if (!(await checkLimit())) return;
@@ -724,6 +767,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             await stopped('output-attempts-exhausted');
             return;
           }
+          // The request must end with a user turn: one that ends with the
+          // assistant's own answer is a prefill, which Claude 5.x models reject.
+          // Appended once and persisted below, so a resumed attempt reuses it.
+          if (envelope.messages.at(-1)?.role === 'assistant')
+            envelope.messages = [...envelope.messages, { role: 'user', content: FINALIZE_PROMPT }];
           const attempt = envelope.finalizationAttempts++;
           envelope.outputAttempts = (envelope.outputAttempts ?? 0) + 1;
           envelope.modelSteps++;
@@ -737,6 +785,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                 getCapabilities(common.model, undefined, common.capabilities),
               )
             : undefined;
+          const toolRequest = await finalizeToolRequest();
+          const spentBefore = common.execution!.ledger.totals(common.execution!.scopeId).spent.usd;
           const inner = runStream(
             {
               ...common,
@@ -748,19 +798,25 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               session: undefined,
               mcp: undefined,
             },
-            output && outputSchema
-              ? {
-                  object: {
-                    schema: outputSchema,
-                    name: output.name,
-                    description: output.description,
-                    strategy: strategy!,
-                  },
-                  operation: 'stream-object',
-                }
-              : {},
+            {
+              ...(output && outputSchema
+                ? {
+                    object: {
+                      schema: outputSchema,
+                      name: output.name,
+                      description: output.description,
+                      strategy: strategy!,
+                    },
+                    operation: 'stream-object' as const,
+                  }
+                : {}),
+              ...(toolRequest ? { tools: toolRequest } : {}),
+            },
           );
           let buffer = '';
+          let reasoningText = '';
+          let reasoningSignature: string | undefined;
+          const encryptedReasoning: EncryptedReasoning = [];
           let toolId: string | undefined;
           let lastDraft: string | undefined;
           let elementCount = 0;
@@ -801,6 +857,14 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             emitPart(part, 'finalizing');
             if (part.type === 'error') streamError = part.error;
             if (part.type === 'finish') finishMeta = part.providerMetadata;
+            if (part.type === 'reasoning-delta') {
+              if (part.encrypted)
+                encryptedReasoning.push({ text: part.text, signature: part.signature });
+              else {
+                reasoningText += part.text;
+                if (part.signature) reasoningSignature = part.signature;
+              }
+            }
             if (part.type === 'text-delta' && strategy !== 'tool') {
               buffer += part.text;
               await publishDraft();
@@ -821,6 +885,22 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             /* transport error below */
           }
           if (streamError !== undefined) throw streamError;
+          // A request that rides the loop's tools is a loop-style call, so the
+          // per-request cost part is ours to emit: the run's cumulative cost,
+          // exactly as the loop reports it after each step.
+          if (toolRequest) {
+            const totals = common.execution!.ledger.totals(common.execution!.scopeId);
+            if (totals.unknownUsd === 0)
+              emitPart(
+                {
+                  type: 'cost',
+                  costUsd: totals.spent.usd,
+                  deltaUsd: Math.max(0, Math.round((totals.spent.usd - spentBefore) * 1e6) / 1e6),
+                  stepIndex: envelope.modelSteps - 1,
+                },
+                'finalizing',
+              );
+          }
           const reason = await inner.finishReason;
           if (reason !== 'stop' && !(strategy === 'tool' && reason === 'tool_calls')) {
             currentText = buffer;
@@ -829,7 +909,24 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           }
           envelope.candidateText = buffer;
           currentText = buffer;
-          envelope.messages = [...envelope.messages, { role: 'assistant', content: buffer }];
+          // The whole answer turn is kept: reasoning included, so the transcript
+          // stays append-only. A forced `json_output` call (tool strategy) is
+          // recorded as its JSON text, as before: a stored call would need an
+          // answering tool result before the next request.
+          const phase = (finishMeta?.openai as { phase?: string } | undefined)?.phase;
+          const answer: Message =
+            strategy === 'tool'
+              ? { role: 'assistant', content: buffer }
+              : assembleAssistant(
+                  buffer,
+                  reasoningText,
+                  reasoningSignature,
+                  new Map(),
+                  [],
+                  encryptedReasoning,
+                ).assistantMessage;
+          if (phase && strategy !== 'tool') answer.providerMetadata = { openai: { phase } };
+          if (!isBlankTurn(answer)) envelope.messages = [...envelope.messages, answer];
           await persist();
         }
         currentText = envelope.candidateText;
@@ -861,12 +958,16 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         const wasRewritten = finalText !== currentText;
         if (wasRewritten) {
           currentText = finalText;
-          const last = envelope.messages.length - 1;
-          envelope.messages = envelope.messages.map((message, index) =>
-            index === last && message.role === 'assistant'
-              ? { ...message, content: currentText }
-              : message,
-          );
+          // The answer turn keeps its reasoning; only its text is replaced.
+          const last = envelope.messages.at(-1);
+          if (last?.role === 'assistant') {
+            const rewritten = rewriteAssistantText(last, currentText);
+            envelope.messages = isBlankTurn(rewritten)
+              ? envelope.messages.slice(0, -1)
+              : [...envelope.messages.slice(0, -1), rewritten];
+          } else if (currentText) {
+            envelope.messages = [...envelope.messages, { role: 'assistant', content: currentText }];
+          }
           envelope.candidateText = currentText;
         }
         if (guarded.outcome === 'block') {

@@ -154,7 +154,7 @@ describe('native agent execution', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it('uses the canonical tool loop then a tools-disabled finalizer', async () => {
+  it('uses the canonical tool loop then a finalization turn', async () => {
     const { model, requests } = mocked([
       { toolCalls: [{ toolName: 'lookup', args: {} }] },
       { text: 'I found it.' },
@@ -178,7 +178,8 @@ describe('native agent execution', () => {
     });
     expect(execute).toHaveBeenCalledTimes(1);
     expect(requests()[0]).toHaveProperty('tools');
-    expect(requests()[2]).not.toHaveProperty('tools');
+    // Finalization never ends on the assistant's own turn (2.3, F15).
+    expect((requests()[2]!.messages as { role: string }[]).at(-1)?.role).toBe('user');
     expect(JSON.stringify(requests()[1])).not.toContain('secret');
     expect(events).toContainEqual(
       expect.objectContaining({
@@ -289,7 +290,11 @@ describe('native agent execution', () => {
       accounting: { spent: { tokens: 15 }, unknownUsd: 1 },
     });
     expect(verify.mock.calls).toHaveLength(1);
-    expect(result.messages.at(-1)?.content).toBe('{"answer":2}');
+    // The stored answer is the full assistant turn (2.3) with the rewritten text.
+    expect(result.messages.at(-1)).toEqual({
+      role: 'assistant',
+      content: [{ type: 'text', text: '{"answer":2}' }],
+    });
   });
 
   it('streams untrusted drafts separately from independently validated complete array elements', async () => {
@@ -453,7 +458,7 @@ describe('native agent execution', () => {
     expect(JSON.stringify(requests()[1])).not.toContain('private');
   });
 
-  it('honors input guardrails and canonical preparation while structured finalization disables tools', async () => {
+  it('honors input guardrails and canonical preparation through structured finalization', async () => {
     const blocked = mocked([{ text: 'unused' }]);
     expect(
       await runAgent({

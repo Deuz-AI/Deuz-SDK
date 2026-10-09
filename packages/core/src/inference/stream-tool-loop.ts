@@ -5,6 +5,7 @@ import type { Message } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
 import type { ToolCall, ToolSet, StepResult, ToolApprovalRequest } from '../types/tool';
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
+import type { WireToolRequest } from '../adapters/types';
 import { runStream } from '../core/inference';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { resolveSignal } from '../internal/resolve-call';
@@ -159,6 +160,12 @@ export interface StreamToolLoopSnapshot {
   verified?: boolean;
   /** The provider's stop explanation for the last step (2.3), e.g. a refusal's category. */
   stopDetails?: StopDetails;
+  /**
+   * The tool request the last model call carried (2.3). Native finalization
+   * sends the same tools (with `tool_choice: 'none'`), so the conversation's
+   * tool definitions stay byte-identical up to the final answer.
+   */
+  wire?: WireToolRequest;
   error?: unknown;
   handoff?: { to: string; count: number };
 }
@@ -408,6 +415,8 @@ export function runStreamToolLoop(
      * `stop_details` survives the loop.
      */
     let lastFinishMeta: Record<string, unknown> | undefined;
+    /** The tool request of the last model call (2.3), for native finalization. */
+    let lastWire: WireToolRequest | undefined;
     let stoppedBy: string | undefined;
     let prevCostUsd = 0;
     let stepIndex = resumeFrom?.stepIndex ?? 0;
@@ -899,6 +908,7 @@ export function runStreamToolLoop(
         );
         flushWarnings();
         messages = prepared.messages;
+        lastWire = prepared.wire;
         const estimateAtCall = (): number =>
           (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;
         let estimatedAtCall = estimateAtCall();
@@ -1742,6 +1752,7 @@ export function runStreamToolLoop(
         pendingClientCalls: snapshotClientCalls,
         verified,
         ...(stopDetails ? { stopDetails } : {}),
+        ...(lastWire ? { wire: lastWire } : {}),
         ...(terminalError !== undefined ? { error: terminalError } : {}),
         ...(durable?.handoff ? { handoff: durable.handoff } : {}),
       });
