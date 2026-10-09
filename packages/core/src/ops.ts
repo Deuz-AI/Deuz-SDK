@@ -40,14 +40,17 @@ export function createInMemoryLeaseProvider(options: { clock?: Clock } = {}): Le
       leases.set(key, next);
       return view(key, next);
     },
-    async renew(lease, ttlMs): Promise<LeaseRenewal> {
+    async renew(lease, ttlMs, options = {}): Promise<LeaseRenewal> {
       assertLeaseRequest(lease.key, lease.owner, ttlMs);
       const row = leases.get(lease.key);
       if (!row || row.token !== lease.token || row.owner !== lease.owner || row.expiresAt === 0)
         return { held: false };
       row.expiresAt = clock.now() + ttlMs;
       const signals = row.signals.splice(0);
-      return { held: true, lease: view(lease.key, row), signals };
+      if (!options.acknowledge) return { held: true, lease: view(lease.key, row), signals };
+      // Acknowledged delivery (2.3): the cancel stays queued until ack().
+      row.signals = kept(signals);
+      return { held: true, lease: view(lease.key, row), signals, queued: [...row.signals] };
     },
     async release(lease) {
       const row = leases.get(lease.key);
@@ -62,6 +65,15 @@ export function createInMemoryLeaseProvider(options: { clock?: Clock } = {}): Le
       const row = leases.get(key);
       if (!row || row.expiresAt <= clock.now()) return false;
       if (!row.signals.includes(signal)) row.signals.push(signal);
+      return true;
+    },
+    async ack(lease, signal) {
+      if (signal !== 'cancel')
+        throw new TypeError(`Only a cancel is acknowledged: ${String(signal)}`);
+      const row = leases.get(lease.key);
+      // Fenced by the token: once the key changed hands, the cancel is the new holder's.
+      if (!row || row.token !== lease.token || row.owner !== lease.owner) return false;
+      row.signals = row.signals.filter((queued) => queued !== 'cancel');
       return true;
     },
   };

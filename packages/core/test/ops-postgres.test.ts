@@ -56,6 +56,22 @@ describe('Postgres ops store', () => {
     expect(await a.agentRuns.load('r')).toMatchObject({ revision: 2, modelSteps: 4 });
   });
 
+  it('stores a cancel awaiting acknowledgement as 2.2 stores a queued cancel', async () => {
+    const schema = `ops_${++schemas}`;
+    await client.query(`CREATE SCHEMA ${schema}`);
+    const ops = createPostgresOpsStore({ client, schema });
+    const lease = (await ops.leases.acquire({ key: 'run', owner: 'a', ttlMs: 60_000 }))!;
+    await ops.leases.signal('run', 'drain');
+    await ops.leases.signal('run', 'cancel');
+    await ops.leases.renew(lease, 60_000, { acknowledge: true });
+    const stored = async () =>
+      (await client.query(`SELECT signals::text AS signals FROM ${schema}.deuz_leases`)).rows[0];
+    // A 2.2 process on the same schema reads the same queued cancel.
+    expect(await stored()).toEqual({ signals: '["cancel"]' });
+    await ops.leases.ack!(lease, 'cancel');
+    expect(await stored()).toEqual({ signals: '[]' });
+  });
+
   it('rejects an invalid schema name and an unknown signal', async () => {
     expect(() => createPostgresOpsStore({ client, schema: 'x;drop' })).toThrow(/schema/);
     const ops = await freshOps();

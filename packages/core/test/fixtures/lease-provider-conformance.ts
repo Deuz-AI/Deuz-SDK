@@ -106,4 +106,131 @@ export function leaseProviderContracts(
       await expect(provider.acquire({ key: 'run', owner: 'a', ttlMs: 1.5 })).rejects.toThrow();
     });
   });
+
+  describe(`${name}: acknowledged delivery (2.3)`, () => {
+    const ack = (provider: LeaseProvider) => {
+      if (!provider.ack) throw new Error('This provider cannot acknowledge a cancel');
+      return provider.ack.bind(provider);
+    };
+
+    it('keeps a delivered cancel queued until the holder acknowledges it', async () => {
+      const { provider, ttl } = await make();
+      const lease = (await provider.acquire({ key: 'run', owner: 'a', ttlMs: ttl }))!;
+      expect(await provider.signal('run', 'cancel')).toBe(true);
+      const first = await provider.renew(lease, ttl, { acknowledge: true });
+      expect(first).toMatchObject({ held: true, signals: ['cancel'], queued: ['cancel'] });
+      // Delivered again on every renewal until it is acknowledged.
+      expect(await provider.renew(lease, ttl, { acknowledge: true })).toMatchObject({
+        held: true,
+        signals: ['cancel'],
+        queued: ['cancel'],
+      });
+      expect(await ack(provider)(lease, 'cancel')).toBe(true);
+      expect(await provider.renew(lease, ttl, { acknowledge: true })).toMatchObject({
+        held: true,
+        signals: [],
+        queued: [],
+      });
+    });
+
+    it('hands a cancel its holder never acknowledged to the next holder', async () => {
+      const { provider, advance, ttl } = await make();
+      const first = (await provider.acquire({ key: 'run', owner: 'a', ttlMs: ttl }))!;
+      expect(await provider.signal('run', 'cancel')).toBe(true);
+      expect(await provider.renew(first, ttl, { acknowledge: true })).toMatchObject({
+        signals: ['cancel'],
+      });
+      // The holder dies before it records the cancel; the key changes hands.
+      await advance(ttl * 2);
+      const second = (await provider.acquire({ key: 'run', owner: 'b', ttlMs: ttl }))!;
+      expect(second).toMatchObject({ owner: 'b', token: 2 });
+      expect(await provider.renew(second, ttl, { acknowledge: true })).toMatchObject({
+        held: true,
+        signals: ['cancel'],
+      });
+      // A stale holder's acknowledgement removes nothing.
+      expect(await ack(provider)(first, 'cancel')).toBe(false);
+      expect(await provider.renew(second, ttl, { acknowledge: true })).toMatchObject({
+        signals: ['cancel'],
+      });
+    });
+
+    it('keeps an unacknowledged cancel across a lapse and a release, with nobody to re-queue it', async () => {
+      const { provider, advance, ttl } = await make();
+      const first = (await provider.acquire({ key: 'run', owner: 'a', ttlMs: ttl }))!;
+      expect(await provider.signal('run', 'cancel')).toBe(true);
+      expect(await provider.renew(first, ttl, { acknowledge: true })).toMatchObject({
+        signals: ['cancel'],
+      });
+      // The holder's lease lapses: nobody holds the key, so nobody can signal it.
+      await advance(ttl * 2);
+      expect(await provider.signal('run', 'cancel')).toBe(false);
+      const second = (await provider.acquire({ key: 'run', owner: 'b', ttlMs: ttl }))!;
+      expect(await provider.renew(second, ttl, { acknowledge: true })).toMatchObject({
+        signals: ['cancel'],
+      });
+      // Released without an acknowledgement, it waits for the next holder too.
+      await provider.release(second);
+      const third = (await provider.acquire({ key: 'run', owner: 'c', ttlMs: ttl }))!;
+      expect(await provider.renew(third, ttl, { acknowledge: true })).toMatchObject({
+        signals: ['cancel'],
+      });
+    });
+
+    it('accepts an acknowledgement from a lapsed lease nobody took over', async () => {
+      const { provider, advance, ttl } = await make();
+      const first = (await provider.acquire({ key: 'run', owner: 'a', ttlMs: ttl }))!;
+      expect(await provider.signal('run', 'cancel')).toBe(true);
+      await provider.renew(first, ttl, { acknowledge: true });
+      await advance(ttl * 2);
+      expect(await ack(provider)(first, 'cancel')).toBe(true);
+      const second = (await provider.acquire({ key: 'run', owner: 'b', ttlMs: ttl }))!;
+      expect(await provider.renew(second, ttl, { acknowledge: true })).toMatchObject({
+        signals: [],
+        queued: [],
+      });
+    });
+
+    it('delivers a drain once, and an acknowledgement leaves a queued drain alone', async () => {
+      const { provider, ttl } = await make();
+      const lease = (await provider.acquire({ key: 'run', owner: 'a', ttlMs: ttl }))!;
+      expect(await provider.signal('run', 'drain')).toBe(true);
+      expect(await provider.renew(lease, ttl, { acknowledge: true })).toMatchObject({
+        signals: ['drain'],
+        queued: [],
+      });
+      expect(await provider.renew(lease, ttl, { acknowledge: true })).toMatchObject({
+        signals: [],
+      });
+      expect(await provider.signal('run', 'cancel')).toBe(true);
+      await provider.renew(lease, ttl, { acknowledge: true });
+      expect(await provider.signal('run', 'drain')).toBe(true);
+      expect(await ack(provider)(lease, 'cancel')).toBe(true);
+      expect(await provider.renew(lease, ttl, { acknowledge: true })).toMatchObject({
+        signals: ['drain'],
+        queued: [],
+      });
+    });
+
+    it('lets a renewal without acknowledgement consume a kept cancel, as in 2.2', async () => {
+      const { provider, ttl } = await make();
+      const lease = (await provider.acquire({ key: 'run', owner: 'a', ttlMs: ttl }))!;
+      expect(await provider.signal('run', 'cancel')).toBe(true);
+      await provider.renew(lease, ttl, { acknowledge: true });
+      const consumed = await provider.renew(lease, ttl);
+      expect(consumed).toMatchObject({ held: true, signals: ['cancel'] });
+      expect(consumed).not.toHaveProperty('queued');
+      expect(await provider.renew(lease, ttl, { acknowledge: true })).toMatchObject({
+        signals: [],
+      });
+    });
+
+    it('acknowledges only a cancel', async () => {
+      const { provider, ttl } = await make();
+      const lease = (await provider.acquire({ key: 'run', owner: 'a', ttlMs: ttl }))!;
+      expect(await ack(provider)(lease, 'cancel')).toBe(true);
+      await expect(ack(provider)(lease, 'drain' as 'cancel')).rejects.toThrow(TypeError);
+      expect(await ack(provider)({ ...lease, key: 'nobody' }, 'cancel')).toBe(false);
+    });
+  });
 }

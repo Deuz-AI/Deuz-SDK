@@ -114,22 +114,26 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       );
       return row ? view(key, owner, row.token, row.expires_at) : undefined;
     },
-    async renew(lease, ttlMs): Promise<LeaseRenewal> {
+    async renew(lease, ttlMs, options = {}): Promise<LeaseRenewal> {
       assertLeaseRequest(lease.key, lease.owner, ttlMs);
       await use();
-      // The locked read returns the signals this renewal consumes.
+      // The locked read returns the signals this renewal delivers. Acknowledged
+      // delivery (2.3) keeps the cancel queued until ack().
       const [row] = await query(
-        `UPDATE ${leasesTable} l SET expires_at = ${NOW} + $4, signals = '[]'::jsonb
+        `UPDATE ${leasesTable} l SET expires_at = ${NOW} + $4,
+          signals = CASE WHEN $5::boolean AND old.signals @> '["cancel"]'::jsonb
+            THEN '["cancel"]'::jsonb ELSE '[]'::jsonb END
         FROM (SELECT key, signals FROM ${leasesTable} WHERE key = $1 FOR UPDATE) AS old
         WHERE l.key = old.key AND l.owner = $2 AND l.token = $3 AND l.expires_at <> 0
-        RETURNING l.expires_at, old.signals::text AS signals`,
-        [lease.key, lease.owner, lease.token, ttlMs],
+        RETURNING l.expires_at, old.signals::text AS signals, l.signals::text AS queued`,
+        [lease.key, lease.owner, lease.token, ttlMs, options.acknowledge === true],
       );
       if (!row) return { held: false };
       return {
         held: true,
         lease: view(lease.key, lease.owner, lease.token, row.expires_at),
         signals: JSON.parse(String(row.signals)) as LeaseSignal[],
+        ...(options.acknowledge ? { queued: JSON.parse(String(row.queued)) as LeaseSignal[] } : {}),
       };
     },
     async release(lease) {
@@ -152,6 +156,19 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
         WHERE key = $1 AND expires_at > ${NOW}
         RETURNING 1 AS held`,
         [key, signal],
+      );
+      return rows.length === 1;
+    },
+    async ack(lease, signal) {
+      if (signal !== 'cancel')
+        throw new TypeError(`Only a cancel is acknowledged: ${String(signal)}`);
+      await use();
+      // Fenced by the token: once the key changed hands, the cancel is the new holder's.
+      const rows = await query(
+        `UPDATE ${leasesTable} SET signals = signals - 'cancel'
+        WHERE key = $1 AND token = $2 AND owner = $3
+        RETURNING 1 AS held`,
+        [lease.key, lease.token, lease.owner],
       );
       return rows.length === 1;
     },

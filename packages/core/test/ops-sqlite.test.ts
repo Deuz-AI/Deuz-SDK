@@ -68,6 +68,21 @@ describe.skipIf(!DatabaseSync)('SQLite ops store', () => {
     expect(await a.agentRuns.load('run')).toMatchObject({ revision: 2, modelSteps: 5 });
   });
 
+  it('stores a cancel awaiting acknowledgement as 2.2 stores a queued cancel', async () => {
+    const db = new DatabaseSync!(':memory:');
+    const { clock } = manualClock();
+    const ops = createSqliteOpsStore({ path: ':memory:', database: db, clock });
+    cleanup.push(() => ops.close());
+    const lease = (await ops.leases.acquire({ key: 'run', owner: 'a', ttlMs: 1_000 }))!;
+    await ops.leases.signal('run', 'drain');
+    await ops.leases.signal('run', 'cancel');
+    await ops.leases.renew(lease, 1_000, { acknowledge: true });
+    // A 2.2 process sharing the file reads the same queued cancel.
+    expect(db.prepare('SELECT signals FROM deuz_leases').get()).toEqual({ signals: '["cancel"]' });
+    await ops.leases.ack!(lease, 'cancel');
+    expect(db.prepare('SELECT signals FROM deuz_leases').get()).toEqual({ signals: '[]' });
+  });
+
   it('refuses an unsupported ops schema version and a closed store', async () => {
     const db = new DatabaseSync!(':memory:');
     db.exec(

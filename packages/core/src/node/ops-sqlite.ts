@@ -183,7 +183,7 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
         }),
       );
     },
-    async renew(lease, ttlMs): Promise<LeaseRenewal> {
+    async renew(lease, ttlMs, options = {}): Promise<LeaseRenewal> {
       assertLeaseRequest(lease.key, lease.owner, ttlMs);
       return use((db) =>
         transaction(db, (): LeaseRenewal => {
@@ -196,14 +196,20 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
           )
             return { held: false };
           const expiresAt = clock.now() + ttlMs;
-          statement(db, `UPDATE deuz_leases SET expires_at=?, signals='[]' WHERE key=?`).run(
+          const signals = JSON.parse(row.signals) as LeaseSignal[];
+          // Acknowledged delivery (2.3): the cancel stays queued until ack().
+          const queued: LeaseSignal[] =
+            options.acknowledge && signals.includes('cancel') ? ['cancel'] : [];
+          statement(db, 'UPDATE deuz_leases SET expires_at=?, signals=? WHERE key=?').run(
             expiresAt,
+            JSON.stringify(queued),
             lease.key,
           );
           return {
             held: true,
             lease: view(lease.key, lease.owner, lease.token, expiresAt),
-            signals: JSON.parse(row.signals) as LeaseSignal[],
+            signals,
+            ...(options.acknowledge ? { queued } : {}),
           };
         }),
       );
@@ -229,6 +235,25 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
           statement(db, 'UPDATE deuz_leases SET signals=? WHERE key=?').run(
             JSON.stringify(signals),
             key,
+          );
+          return true;
+        }),
+      );
+    },
+    async ack(lease, signal) {
+      if (signal !== 'cancel')
+        throw new TypeError(`Only a cancel is acknowledged: ${String(signal)}`);
+      return use((db) =>
+        transaction(db, () => {
+          const row = readLease(db, lease.key);
+          // Fenced by the token: once the key changed hands, the cancel is the new holder's.
+          if (!row || Number(row.token) !== lease.token || row.owner !== lease.owner) return false;
+          const signals = (JSON.parse(row.signals) as LeaseSignal[]).filter(
+            (queued) => queued !== 'cancel',
+          );
+          statement(db, 'UPDATE deuz_leases SET signals=? WHERE key=?').run(
+            JSON.stringify(signals),
+            lease.key,
           );
           return true;
         }),
