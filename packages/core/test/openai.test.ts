@@ -7,7 +7,7 @@ import { runStream } from '../src/core/inference';
 import { getCapabilities } from '../src/core/registry';
 import { withCapabilityOverride } from '../src/internal/config-symbol';
 import { InvalidRequestError } from '../src/errors';
-import { sseResponse, sseEvents, mockFetch } from './fixtures/sse';
+import { sseResponse, sseEvents, mockFetch, mockFetchSequence } from './fixtures/sse';
 import type { JSONSchema } from '../src/types/schema';
 import type { Logger } from '../src/types/deps';
 import type { LanguageModel } from '../src/types/model';
@@ -547,5 +547,86 @@ describe('unknown-model output cap (2.3, F08)', () => {
       capabilities: { maxOutput: 32_000 },
     });
     expect(override.body.max_output_tokens).toBe(32_000);
+  });
+});
+
+describe('Responses is stateless by default (2.3, F20 — retention behaviour not live-verified)', () => {
+  it('every Responses request carries store:false — with or without tools, reasoning or not', async () => {
+    for (const [id, tools] of [
+      ['gpt-5.4', undefined],
+      ['gpt-5.4', ECHO_TOOL],
+      ['gpt-6.2-unreleased', undefined],
+      ['gpt-6.2-unreleased', ECHO_TOOL],
+    ] as const) {
+      const { body } = await openaiRequest(responses(id), {}, tools);
+      expect(body.store, `${id}/${tools ? 'tools' : 'no tools'}`).toBe(false);
+    }
+  });
+
+  it('a reasoning model asks for encrypted reasoning even without tools', async () => {
+    const { body } = await openaiRequest(responses('gpt-5.4'));
+    expect(body.include).toEqual(['reasoning.encrypted_content']);
+    // A model that does not reason has nothing to round-trip.
+    const plain = await openaiRequest(responses('gpt-6.2-unreleased'));
+    expect('include' in plain.body).toBe(false);
+  });
+
+  it('providerOptions.openai.store:true opts back into server-side storage', async () => {
+    const { body } = await openaiRequest(responses('gpt-5.4'), {
+      providerOptions: { openai: { store: true } },
+    });
+    expect(body.store).toBe(true);
+  });
+
+  it('a caller-supplied include list is merged, not dropped', async () => {
+    const { body } = await openaiRequest(responses('gpt-5.4'), {
+      providerOptions: { openai: { include: ['message.output_text.logprobs'] } },
+    });
+    expect(body.include).toEqual(['reasoning.encrypted_content', 'message.output_text.logprobs']);
+  });
+
+  it('encrypted reasoning round-trips on a tool-less multi-turn conversation', async () => {
+    const TURN = sseEvents([
+      {
+        event: 'response.output_item.done',
+        data: {
+          type: 'response.output_item.done',
+          item: { type: 'reasoning', id: 'rs_9', encrypted_content: 'ENC_TOOLLESS' },
+        },
+      },
+      {
+        event: 'response.output_text.delta',
+        data: { type: 'response.output_text.delta', delta: 'A' },
+      },
+      {
+        event: 'response.completed',
+        data: { type: 'response.completed', response: { status: 'completed', usage: {} } },
+      },
+    ]);
+    const { fetch, calls } = mockFetchSequence([
+      () => sseResponse([TURN]),
+      () => sseResponse([RESP_OK]),
+    ]);
+    const model = createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.4');
+    const first = await generateText({ model, messages: [{ role: 'user', content: 'q1' }] });
+    await generateText({
+      model,
+      messages: [
+        { role: 'user', content: 'q1' },
+        ...first.response.messages,
+        { role: 'user', content: 'q2' },
+      ],
+    });
+    const second = JSON.parse(String(calls[1]!.init!.body)) as {
+      input: Record<string, unknown>[];
+      store: boolean;
+    };
+    expect(second.store).toBe(false);
+    expect(second.input).toContainEqual({
+      type: 'reasoning',
+      id: 'rs_9',
+      encrypted_content: 'ENC_TOOLLESS',
+      summary: [],
+    });
   });
 });

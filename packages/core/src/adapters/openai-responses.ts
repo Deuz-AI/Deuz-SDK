@@ -160,6 +160,14 @@ function mapResponsesToolChoice(
   return undefined;
 }
 
+/** The include list: the caller's entries (if any) plus the encrypted reasoning blob. */
+function withEncryptedReasoning(include: unknown): string[] {
+  const extra = Array.isArray(include)
+    ? include.filter((v): v is string => typeof v === 'string')
+    : [];
+  return [...new Set(['reasoning.encrypted_content', ...extra])];
+}
+
 function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options, object, tools } = ctx;
   const { system, rest } = extractSystem(messages);
@@ -186,11 +194,14 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   const effort = planEffort(ctx, OPENAI_EFFORT, 'send');
   if (effort.none) body.reasoning = { effort: 'none' };
   else if (effort.level !== undefined) body.reasoning = { effort: effort.level };
-  if (tools && caps.reasoning) {
-    // Stateless multi-step tool use: get encrypted reasoning back and replay it.
-    body.include = ['reasoning.encrypted_content'];
-    body.store = false;
-  }
+  // F20 (2.3): every Responses request is stateless unless the caller opts in
+  // with `providerOptions.<provider>.store: true`. A reasoning model always
+  // gets its encrypted reasoning back so the next turn can replay it — with or
+  // without tools — which also keeps zero-data-retention organisations working.
+  // OpenAI's retention behaviour itself is not live-verified.
+  const own = options.providerOptions?.[call.provider];
+  body.store = own?.store === true;
+  if (caps.reasoning) body.include = withEncryptedReasoning(own?.include);
   if (!caps.samplingRestrictions) {
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.topP !== undefined) body.top_p = options.topP;
