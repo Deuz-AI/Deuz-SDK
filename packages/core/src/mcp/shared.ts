@@ -20,7 +20,13 @@ import { generateText } from '../generate';
 export interface RawMcpClient {
   connect(transport: unknown): Promise<void>;
   callTool(req: { name: string; arguments: unknown }): Promise<McpCallResult>;
-  listTools(): Promise<{ tools: McpToolDef[] }>;
+  /**
+   * One `tools/list` page (2.3: the cursor). Without `params` the v1 SDK answers
+   * with the first page plus `nextCursor`; the v2 SDK walks every page itself and
+   * answers with none. `wrapMcpClient` follows `nextCursor` either way, so an
+   * implementation that ignores `params` and never sets `nextCursor` stays valid.
+   */
+  listTools(params?: { cursor?: string }): Promise<{ tools: McpToolDef[]; nextCursor?: string }>;
   close(): Promise<void>;
   /** SDK request-handler registration (used for elicitation/create). */
   setRequestHandler?(
@@ -891,7 +897,13 @@ export function wrapMcpClient(raw: RawMcpClient, managed?: ManagedMcp): McpClien
     async listTools(namespace) {
       if (!cachedTools) {
         const gen = cacheGeneration;
-        const { tools } = await current().listTools();
+        const c = current();
+        // Every page, not the first one (2.3): a paginated catalog used to lose
+        // everything past page one. Same cursor walk and cap as resources/prompts.
+        const tools = await paginate(async (cursor) => {
+          const page = await c.listTools(cursor ? { cursor } : undefined);
+          return { items: page.tools, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
+        });
         // Invalidated while in flight → serve this list but do not cache it.
         if (gen === cacheGeneration) cachedTools = tools;
         return mcpToolsToToolSet(caller, tools, namespace);

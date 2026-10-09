@@ -175,6 +175,21 @@ describe('createMcpClient over HTTP — the canonical ToolSet (parity with mcp-s
     expect(client.status()).toBe('connected');
   });
 
+  it('listTools() walks every page of a paginated tools/list (2.3)', async () => {
+    // Seven tools, three per page: a first-page-only client sees three of them.
+    const many = Array.from({ length: 7 }, (_, i) => ({
+      name: `tool${i}`,
+      handler: () => `ran ${i}`,
+    }));
+    const server = await startServer({ tools: many, toolsPageSize: 3 });
+    const client = await connect(server.url);
+
+    const tools = await client.listTools();
+    expect(Object.keys(tools)).toEqual(many.map((t) => t.name));
+    // A tool from the LAST page is not just listed — it is callable.
+    expect(await tools.tool6!.execute!({}, TOOL_CTX)).toBe('ran 6');
+  });
+
   it('execute() round-trips over the wire: text, structuredContent priority, is_error self-heal', async () => {
     const server = await startServer();
     const client = await connect(server.url);

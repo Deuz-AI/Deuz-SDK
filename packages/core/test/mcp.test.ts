@@ -58,6 +58,62 @@ describe('MCP → ToolSet mapping', () => {
   });
 });
 
+describe('listTools pagination (2.3)', () => {
+  // Until 2.3 listTools() read the FIRST tools/list page only, so a server that
+  // paginates its catalog silently lost every tool past page one — the v1 SDK's
+  // `listTools()` returns one page plus `nextCursor` and never walks the rest.
+  it('walks every tools/list page — cursor forwarded, pages merged in order', async () => {
+    const cursors: Array<string | undefined> = [];
+    const raw: RawMcpClient = {
+      ...fakeRaw,
+      listTools: async (params?: { cursor?: string }) => {
+        cursors.push(params?.cursor);
+        if (params?.cursor === 'p2') return { tools: [{ name: 'c' }] };
+        if (params?.cursor === 'p1') return { tools: [{ name: 'b' }], nextCursor: 'p2' };
+        return { tools: [{ name: 'a' }], nextCursor: 'p1' };
+      },
+    };
+    const tools = await wrapMcpClient(raw).listTools();
+    expect(Object.keys(tools)).toEqual(['a', 'b', 'c']);
+    expect(cursors).toEqual([undefined, 'p1', 'p2']);
+  });
+
+  it('caches the WHOLE catalog, so a later page is not lost to the cache either', async () => {
+    let calls = 0;
+    const fake = makeFakeMcp();
+    fake.client.listTools = async (params?: { cursor?: string }) => {
+      calls++;
+      return params?.cursor === 'next'
+        ? { tools: [{ name: 'second' }] }
+        : { tools: [{ name: 'first' }], nextCursor: 'next' };
+    };
+    const managed = await createManagedConnection({
+      ...factories([fake]),
+      lifecycle: { clock: makeFakeClock() },
+    });
+    const client = wrapMcpClient(managed.raw(), managed);
+
+    expect(Object.keys(await client.listTools())).toEqual(['first', 'second']);
+    // Served from the cache: both pages, no further round trip.
+    expect(Object.keys(await client.listTools('ns'))).toEqual(['ns_first', 'ns_second']);
+    expect(calls).toBe(2);
+  });
+
+  it('stops at the safety cap on an endless cursor instead of looping forever', async () => {
+    let pages = 0;
+    const raw: RawMcpClient = {
+      ...fakeRaw,
+      listTools: async () => {
+        pages++;
+        return { tools: [{ name: `t${pages}` }], nextCursor: 'again' };
+      },
+    };
+    const tools = await wrapMcpClient(raw).listTools();
+    expect(pages).toBe(100);
+    expect(Object.keys(tools)).toHaveLength(100);
+  });
+});
+
 describe('structuredContent + outputSchema (MCP 2025-11-25)', () => {
   it('prefers structuredContent verbatim over the text join', () => {
     expect(
