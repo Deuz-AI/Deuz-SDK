@@ -331,7 +331,7 @@ const maxTokensOf = (body: unknown): number =>
   (JSON.parse(String(body)) as { max_tokens: number }).max_tokens;
 
 describe('registry: capability overrides (1.9)', () => {
-  it('THE BUG: an unknown slug truncates at 4096 unless overridden — the override reaches the wire', async () => {
+  it('THE BUG: an unknown slug is no longer truncated at 4096 — and the override still reaches the wire', async () => {
     const { fetch, calls } = ccReplay();
     const together = createOpenAICompatible({
       id: 'together',
@@ -341,8 +341,12 @@ describe('registry: capability overrides (1.9)', () => {
     });
     const model = together(UNKNOWN_SLUG);
 
+    // 2.3 (F08, deliberate): the 4096 placeholder used to reach the wire and
+    // silently truncate. Chat Completions' cap is optional, so it is now left
+    // off and the host's own default applies.
     await generateText({ model, prompt: 'hi' });
-    expect(maxTokensOf(calls[0]!.init!.body)).toBe(4_096); // the silent truncation
+    expect(JSON.parse(String(calls[0]!.init!.body))).not.toHaveProperty('max_tokens');
+    expect(getModelCapabilities(model).maxOutput).toBe(4_096); // still the reported placeholder
 
     await generateText({ model, prompt: 'hi', capabilities: { maxOutput: 32_000 } });
     expect(maxTokensOf(calls[1]!.init!.body)).toBe(32_000);

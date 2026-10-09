@@ -6,6 +6,15 @@ import type { ToolChoice } from '../types/tool';
 import type { NormalizedMessage } from '../core/normalize';
 import type { DeuzError } from '../errors';
 import { extractSystem } from '../core/normalize';
+import {
+  OPENAI_EFFORT,
+  assertToolSurface,
+  describeToolChoice,
+  isForcedToolChoice,
+  optionalOutputCap,
+  planEffort,
+  reportClamp,
+} from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
 import {
   acceptsDocuments,
@@ -126,10 +135,24 @@ function toResponsesInput(messages: NormalizedMessage[], media: MediaContext): I
   return items;
 }
 
-/** Map canonical tool choice → Responses API (flat function form). */
-function mapResponsesToolChoice(choice: ToolChoice | undefined): string | object | undefined {
+/**
+ * Map canonical tool choice → Responses API (flat function form). A forced
+ * choice the row says the model rejects goes out as auto, reported (2.3).
+ */
+function mapResponsesToolChoice(
+  ctx: BuildContext,
+  choice: ToolChoice | undefined,
+): string | object | undefined {
   if (!choice || choice === 'auto') return undefined;
   if (choice === 'none') return 'none';
+  if (ctx.caps.forcedToolChoice === false && isForcedToolChoice(choice)) {
+    reportClamp(
+      ctx,
+      'toolChoice',
+      `toolChoice ${describeToolChoice(choice)} was sent as 'auto': ${ctx.call.modelId} rejects a forced tool_choice.`,
+    );
+    return undefined;
+  }
   if (choice === 'required') return 'required';
   if (typeof choice === 'object' && choice.type === 'tool') {
     return { type: 'function', name: choice.toolName };
@@ -140,7 +163,11 @@ function mapResponsesToolChoice(choice: ToolChoice | undefined): string | object
 function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options, object, tools } = ctx;
   const { system, rest } = extractSystem(messages);
+  assertToolSurface(ctx, 'responses');
 
+  // An unknown model's placeholder cap is left off (2.3): the provider's own
+  // default bounds it instead of the SDK's 4096 guess.
+  const maxOutput = optionalOutputCap(caps, options);
   const body: Record<string, unknown> = {
     model: call.modelId,
     input: toResponsesInput(rest, {
@@ -151,13 +178,14 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       warnings: ctx.warnings,
     }),
     stream: true,
-    max_output_tokens: options.maxOutputTokens ?? caps.maxOutput,
+    ...(maxOutput !== undefined ? { max_output_tokens: maxOutput } : {}),
   };
   if (system) body.instructions = system;
-  if (caps.reasoning && options.effort !== undefined) {
-    // 'none' is a real OpenAI value (disables reasoning); 'max' clamps to xhigh.
-    body.reasoning = { effort: options.effort === 'max' ? 'xhigh' : options.effort };
-  }
+  // 'none' is a real OpenAI value (disables reasoning). 'max' is sent only to a
+  // model that lists it (gpt-6.1-sol); elsewhere it clamps to xhigh — reported.
+  const effort = planEffort(ctx, OPENAI_EFFORT, 'send');
+  if (effort.none) body.reasoning = { effort: 'none' };
+  else if (effort.level !== undefined) body.reasoning = { effort: effort.level };
   if (tools && caps.reasoning) {
     // Stateless multi-step tool use: get encrypted reasoning back and replay it.
     body.include = ['reasoning.encrypted_content'];
@@ -201,7 +229,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
             parameters: t.parameters,
           },
     );
-    const tc = mapResponsesToolChoice(tools.toolChoice);
+    const tc = mapResponsesToolChoice(ctx, tools.toolChoice);
     if (tc !== undefined) body.tool_choice = tc;
   } else if (options.responseFormat === 'json') {
     body.text = { format: { type: 'json_object' } };

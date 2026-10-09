@@ -136,6 +136,13 @@ const PLACEHOLDER_MAX_OUTPUT = 4_096;
 const PLACEHOLDER_ROWS = new WeakSet<Row>();
 const PLACEHOLDER_CAPS = new WeakSet<ModelCapabilities>();
 
+/** A pinned row whose output limit is undocumented: `maxOutput` is a placeholder. */
+function undocumentedOutput(provider: string, surface: ModelSurface, over: Partial<Row>): Row {
+  const r = row(provider, surface, { ...over, maxOutput: PLACEHOLDER_MAX_OUTPUT });
+  PLACEHOLDER_ROWS.add(r);
+  return r;
+}
+
 /**
  * True when `caps.maxOutput` is only a placeholder (2.3): no registry row knows
  * the limit and neither override layer set one. Wires where the output cap is
@@ -264,20 +271,51 @@ const REGISTRY: Record<string, Row> = {
   }),
 
   // --- OpenAI Chat Completions (GPT-5.4+ expose reasoning_effort here too) ---
+  // 2.3 (F08): reasoning rows, so sampling is stripped and the cap rides
+  // `max_completion_tokens` next to reasoning_effort (the samplingRestrictions
+  // note above). NOT live-verified.
   'gpt-5.5': row('openai', 'chat_completions', {
     vision: true,
     reasoning: true,
+    samplingRestrictions: true,
     contextWindow: 1_050_000,
     maxOutput: 128_000,
   }),
   'gpt-5.5-pro': row('openai', 'chat_completions', {
     vision: true,
     reasoning: true,
+    samplingRestrictions: true,
     contextWindow: 1_050_000,
     maxOutput: 128_000,
   }),
 
   // --- OpenAI Responses (reasoning + tools live here) ---
+  // 2.3 (F08) — the current GPT-6 ids. Research-dated (roadmap 5.3,
+  // 2026-10-09), NOT live-verified: only the documented facts are pinned, the
+  // rest keeps the OpenAI reasoning-row defaults (sampling stripped) and the
+  // model profile marks it unknown.
+  // gpt-6.1-sol: 1_050_000 context / 128_000 output; effort low…max where 'max'
+  // is a real value (no max→xhigh) and 'none'/'minimal' do not exist; tool
+  // calling only on Responses (Chat Completions works tool-less).
+  'gpt-6.1-sol': row('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
+    contextWindow: 1_050_000,
+    maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    effortNone: 'lowest',
+    toolSurfaces: ['responses'],
+  }),
+  // Limits undocumented → placeholder cap, never sent. Luna documents 'none'.
+  'gpt-6-astra': undocumentedOutput('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
+  }),
+  'gpt-6-luna': undocumentedOutput('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
+    effortNone: 'send',
+  }),
   'gpt-5.4': row('openai', 'responses', {
     vision: true,
     reasoning: true,
@@ -545,6 +583,21 @@ const NATIVE_REGISTRY: Record<string, Row> = {
     contextWindow: 1_000_000,
     maxOutput: 64_000,
   }),
+  // 2.3 (F08) — GA; research-dated (roadmap 5.3, 2026-10-09), NOT live-verified.
+  // Documented: thinking levels low/medium/high (default medium), no `minimal`
+  // — so effort 'none' clamps to low. The output limit is undocumented (the
+  // cap is left off); the other flags keep the native-family defaults.
+  'gemini-3.8-flash': undocumentedOutput('google', 'native', {
+    vision: true,
+    reasoning: true,
+    caching: true,
+    nativePdf: true,
+    audio: true,
+    contextWindow: 1_000_000,
+    effortLevels: ['low', 'medium', 'high'],
+    effortDefault: 'medium',
+    effortNone: 'lowest',
+  }),
   'gemini-2.5-pro': row('google', 'native', {
     vision: true,
     reasoning: true,
@@ -623,23 +676,24 @@ export function registryMatch(model: LanguageModel): RegistryMatch {
 }
 
 /**
- * What the unknown-model warning says about the output cap (2.3). Anthropic's
- * `max_tokens` is required, so an unknown model gets the placeholder — the
- * documented default lives in the warning itself, with both ways to set a real
- * value. Silent when an override already supplied the limit.
+ * What the unknown-model warning says about the output cap (2.3). The
+ * optional-cap wires send none; Anthropic's `max_tokens` is required, so an
+ * unknown model gets the placeholder — the documented default lives in the
+ * warning itself, with both ways to set a real value. Silent when an override
+ * already supplied the limit.
  */
 function outputCapNote(
   model: LanguageModel,
   resolved: Row,
   overrides: Partial<ModelCapabilities> | undefined,
 ): string {
-  if (!PLACEHOLDER_ROWS.has(resolved) || model.surface !== 'anthropic') return '';
+  if (!PLACEHOLDER_ROWS.has(resolved)) return '';
   if (overrides?.maxOutput !== undefined) return '';
   if (readConfig(model)?.capabilities?.maxOutput !== undefined) return '';
-  return (
-    ` (max_tokens ${resolved.maxOutput}, which the Anthropic wire requires — pass ` +
-    'maxOutputTokens or capabilities: { maxOutput } for longer answers)'
-  );
+  return model.surface === 'anthropic'
+    ? ` (max_tokens ${resolved.maxOutput}, which the Anthropic wire requires — pass ` +
+        'maxOutputTokens or capabilities: { maxOutput } for longer answers)'
+    : ' (no output cap is sent unless you pass maxOutputTokens)';
 }
 
 /**

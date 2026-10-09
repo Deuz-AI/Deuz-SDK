@@ -143,9 +143,10 @@ describe('unsupported-setting', () => {
     });
     await drain(result.fullStream);
     expect(await result.warnings!).toEqual([]);
-    // gpt-5.5 is not sampling-restricted, so it keeps `max_tokens`; the point of
-    // the assertion is that the value REACHED the wire, so warning would be a lie.
-    expect(body(calls[0]!).max_tokens).toBe(555);
+    // 2.3: gpt-5.5 is a reasoning row (not live-verified), so the restricted wire
+    // RENAMES the cap to `max_completion_tokens`; the point of the assertion is
+    // that the value REACHED the wire, so a warning would be a lie.
+    expect(body(calls[0]!).max_completion_tokens).toBe(555);
   });
 
   it('effort on a model with no reasoning capability is reported', async () => {

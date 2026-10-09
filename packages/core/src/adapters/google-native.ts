@@ -14,6 +14,16 @@ import {
   RateLimitError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
+import type { EffortLevel } from '../core/registry';
+import {
+  EFFORT_SCALE,
+  assertToolSurface,
+  describeToolChoice,
+  isForcedToolChoice,
+  optionalOutputCap,
+  planEffort,
+  reportClamp,
+} from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
 import { resolveMedia } from '../internal/image';
 import { parseSSE } from '../internal/sse';
@@ -61,7 +71,7 @@ function usesJsonSchema(modelId: string): boolean {
   return /^gemini-3/.test(modelId);
 }
 
-const BUDGET_MAP: Record<string, number> = {
+const BUDGET_MAP: Record<EffortLevel, number> = {
   low: 4096,
   medium: 12288,
   high: 24576,
@@ -74,17 +84,34 @@ function levelOnlyLowHigh(modelId: string): boolean {
   return /^gemini-3(\.\d+)?-pro/.test(modelId);
 }
 
-function thinkingLevelFor(modelId: string, effort: string): string {
-  const full: Record<string, string> = {
-    low: 'low',
-    medium: 'medium',
-    high: 'high',
-    xhigh: 'high',
-    max: 'high',
-  };
-  const level = full[effort] ?? 'low';
-  if (levelOnlyLowHigh(modelId)) return level === 'high' ? 'high' : 'low';
-  return level;
+/**
+ * The thinking config for `options.effort` — never both a level AND a budget
+ * (400). The level wire's accepted set comes from the row when it lists one,
+ * else from the family (Pro: low/high, others low/medium/high); every clamp
+ * on the way is reported (2.3, F26).
+ */
+function thinkingConfigFor(ctx: BuildContext): Record<string, unknown> | undefined {
+  const { call } = ctx;
+  if (usesThinkingLevel(call.modelId)) {
+    const family: readonly EffortLevel[] = levelOnlyLowHigh(call.modelId)
+      ? ['low', 'high']
+      : ['low', 'medium', 'high'];
+    const effort = planEffort(ctx, family);
+    if (effort.level === undefined) return undefined;
+    return { includeThoughts: true, thinkingLevel: effort.level };
+  }
+  const effort = planEffort(ctx, EFFORT_SCALE);
+  if (effort.level === undefined) return undefined;
+  const budget = BUDGET_MAP[effort.level];
+  if (effort.level === 'xhigh' || effort.level === 'max') {
+    reportClamp(
+      ctx,
+      'effort',
+      `effort '${effort.level}' was sent as thinkingBudget ${budget}: the thinkingBudget wire ` +
+        `caps 'xhigh' and 'max' at the same budget (${call.modelId}).`,
+    );
+  }
+  return { includeThoughts: true, thinkingBudget: budget };
 }
 
 function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart | null {
@@ -155,9 +182,18 @@ function toGeminiContents(messages: NormalizedMessage[]): {
   };
 }
 
-function mapToolChoice(choice: ToolChoice | undefined): unknown {
+function mapToolChoice(ctx: BuildContext, choice: ToolChoice | undefined): unknown {
   if (!choice || choice === 'auto') return { functionCallingConfig: { mode: 'AUTO' } };
   if (choice === 'none') return { functionCallingConfig: { mode: 'NONE' } };
+  // A forced choice the row says the model rejects goes out as AUTO, reported (2.3).
+  if (ctx.caps.forcedToolChoice === false && isForcedToolChoice(choice)) {
+    reportClamp(
+      ctx,
+      'toolChoice',
+      `toolChoice ${describeToolChoice(choice)} was sent as 'auto': ${ctx.call.modelId} rejects a forced tool_choice.`,
+    );
+    return { functionCallingConfig: { mode: 'AUTO' } };
+  }
   if (choice === 'required') return { functionCallingConfig: { mode: 'ANY' } };
   if (typeof choice === 'object' && choice.type === 'tool') {
     return { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [choice.toolName] } };
@@ -166,30 +202,22 @@ function mapToolChoice(choice: ToolChoice | undefined): unknown {
 }
 
 function buildRequest(ctx: BuildContext): AdapterRequest {
-  const { call, messages, caps, options, object, tools } = ctx;
+  const { call, messages, options, object, tools } = ctx;
   const { systemInstruction, contents } = toGeminiContents(messages);
+  assertToolSurface(ctx, 'native');
 
-  const generationConfig: Record<string, unknown> = {
-    maxOutputTokens: options.maxOutputTokens ?? caps.maxOutput,
-  };
+  // An unknown model's placeholder cap is left off (2.3): Gemini's own default
+  // (the model's maximum) applies instead of a guess.
+  const maxOutput = optionalOutputCap(ctx.caps, options);
+  const generationConfig: Record<string, unknown> =
+    maxOutput !== undefined ? { maxOutputTokens: maxOutput } : {};
   if (options.temperature !== undefined) generationConfig.temperature = options.temperature;
   if (options.topP !== undefined) generationConfig.topP = options.topP;
   if (options.stopSequences) generationConfig.stopSequences = options.stopSequences;
 
   // Thinking (gate strictly by model family — never send both level AND budget).
-  if (caps.reasoning && options.effort && options.effort !== 'none') {
-    if (usesThinkingLevel(call.modelId)) {
-      generationConfig.thinkingConfig = {
-        includeThoughts: true,
-        thinkingLevel: thinkingLevelFor(call.modelId, options.effort),
-      };
-    } else {
-      generationConfig.thinkingConfig = {
-        includeThoughts: true,
-        thinkingBudget: BUDGET_MAP[options.effort] ?? 12288,
-      };
-    }
-  }
+  const thinkingConfig = thinkingConfigFor(ctx);
+  if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
 
   // Structured output (json strategy → responseSchema / responseJsonSchema).
   if (object) {
@@ -221,7 +249,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     }
     entries.push(...providerTools); // e.g. { google_search: {} } — separate array members
     body.tools = entries;
-    if (fns.length > 0) body.toolConfig = mapToolChoice(tools.toolChoice);
+    if (fns.length > 0) body.toolConfig = mapToolChoice(ctx, tools.toolChoice);
   }
 
   // Opaque explicit-cache passthrough (the cacheStore seam creates it elsewhere).
