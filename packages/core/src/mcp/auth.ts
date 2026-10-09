@@ -41,7 +41,8 @@ type SdkInvalidationScope = 'all' | 'client' | 'tokens' | 'verifier' | 'discover
 interface SdkOAuthClientProvider {
   readonly redirectUrl: string;
   readonly clientMetadata: Record<string, unknown>;
-  clientInformation(): Promise<Record<string, unknown> | undefined>;
+  /** v2 passes the resolved authorization server's `issuer` (SEP-2352); v1 passes nothing. */
+  clientInformation(ctx?: { issuer?: string }): Promise<Record<string, unknown> | undefined>;
   saveClientInformation(info: Record<string, unknown>): Promise<void>;
   tokens(): Promise<Record<string, unknown> | undefined>;
   saveTokens(tokens: Record<string, unknown>): Promise<void>;
@@ -51,7 +52,11 @@ interface SdkOAuthClientProvider {
   invalidateCredentials(scope: SdkInvalidationScope): Promise<void>;
 }
 
-/** The slice of `@modelcontextprotocol/sdk/client/auth.js` we drive. */
+/**
+ * The slice of the SDK's auth module we drive — `@modelcontextprotocol/client`
+ * (v2) and `@modelcontextprotocol/sdk/client/auth.js` (v1) export the same two
+ * names with the same shape.
+ */
 interface SdkAuthModule {
   auth(
     provider: SdkOAuthClientProvider,
@@ -64,32 +69,56 @@ interface SdkAuthModule {
   UnauthorizedError: new (message?: string) => Error;
 }
 
-async function loadAuthModule(): Promise<SdkAuthModule> {
-  try {
-    const spec: string = '@modelcontextprotocol/sdk/client/auth.js';
-    return (await import(spec)) as SdkAuthModule;
-  } catch (err) {
-    throw new InvalidRequestError({
-      message:
-        'MCP OAuth needs the optional peer "@modelcontextprotocol/sdk". Install it: npm i @modelcontextprotocol/sdk',
-      cause: err,
-    });
+/** Where each SDK line keeps its OAuth machinery — v2 first, as `sdk: 'auto'` prefers. */
+const AUTH_MODULES = ['@modelcontextprotocol/client', '@modelcontextprotocol/sdk/client/auth.js'];
+
+/** Every installed line's auth module, in preference order (2.3). */
+async function loadAuthModules(): Promise<{ modules: SdkAuthModule[]; cause?: unknown }> {
+  const modules: SdkAuthModule[] = [];
+  let cause: unknown;
+  for (const candidate of AUTH_MODULES) {
+    try {
+      const spec: string = candidate;
+      const mod = (await import(spec)) as Partial<SdkAuthModule>;
+      if (typeof mod.auth === 'function' && typeof mod.UnauthorizedError === 'function') {
+        modules.push(mod as SdkAuthModule);
+      }
+    } catch (err) {
+      cause ??= err;
+    }
   }
+  return { modules, cause };
+}
+
+/**
+ * The OAuth machinery, from whichever SDK line is installed (2.3). The provider
+ * below is the same object for both: the v2 `OAuthClientProvider` only ADDED
+ * optional members (an `issuer` context argument, DPoP, discovery-state caching)
+ * that this provider leaves unset.
+ */
+async function loadAuthModule(): Promise<SdkAuthModule> {
+  const { modules, cause } = await loadAuthModules();
+  const preferred = modules[0];
+  if (preferred) return preferred;
+  throw new InvalidRequestError({
+    message:
+      'MCP OAuth needs an MCP SDK — install the MCP 2026-07-28 client (npm i @modelcontextprotocol/client) or the 2025-11-25 one (npm i @modelcontextprotocol/sdk).',
+    cause,
+  });
 }
 
 /**
  * Recognize the SDK's `UnauthorizedError` — the signal that a server wants
- * OAuth. `instanceof` first (correct across the SDK's own subclasses), falling
- * back to the name because the thrown instance may come from a DIFFERENT copy
- * of the SDK than the one we just imported (transports carry their own).
+ * OAuth. `instanceof` against EVERY installed line's class (2.3: the client may
+ * run on either, and the v1 class sets no distinctive `name`), falling back to
+ * the name because the thrown instance may come from a DIFFERENT copy of the
+ * SDK than the one we just imported (transports carry their own).
  */
 export async function isUnauthorizedError(value: unknown): Promise<boolean> {
   if (!value || typeof value !== 'object') return false;
-  try {
-    const { UnauthorizedError } = await loadAuthModule();
+  const { modules } = await loadAuthModules();
+  for (const { UnauthorizedError } of modules) {
     if (value instanceof UnauthorizedError) return true;
-  } catch {
-    /* peer missing — the name check below still identifies it */
   }
   return (value as Error).name === 'UnauthorizedError';
 }
@@ -225,19 +254,27 @@ export function createOAuthProvider(options: McpOAuthOptions): DeuzOAuthProvider
       };
     },
 
-    async clientInformation() {
+    async clientInformation(ctx) {
       // A configured `clientId` short-circuits dynamic registration entirely:
       // the SDK skips the registration request when this resolves.
       if (options.clientId) {
         return {
           client_id: options.clientId,
           ...(options.clientSecret ? { client_secret: options.clientSecret } : {}),
+          // The v2 SDK (SEP-2352) binds client info to an authorization server
+          // by an `issuer` stamp and WRITES BACK an unstamped value to stamp it —
+          // which would copy a configured secret into the token store, and warn
+          // on every call. A configured client is meant for whichever server
+          // this provider was bound to, so it carries the issuer being asked about.
+          ...(ctx?.issuer ? { issuer: ctx.issuer } : {}),
         };
       }
       return readJson('client-info');
     },
 
     async saveClientInformation(info) {
+      // Configuration, not state: a configured client is never persisted.
+      if (options.clientId) return;
       await store.set(key('client-info'), JSON.stringify(info));
     },
 

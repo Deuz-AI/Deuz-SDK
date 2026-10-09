@@ -17,7 +17,15 @@ import {
   type McpRootsClient,
   type McpRootsOption,
   type McpSamplingOptions,
+  type McpSdkSelection,
+  type McpVersionNegotiation,
 } from './shared';
+import {
+  NO_MCP_SDK_MESSAGE,
+  assertLineSupports,
+  recordV1NegotiatedVersion,
+  selectMcpSdk,
+} from './sdk-line';
 
 export { createManagedConnection } from './shared';
 
@@ -48,6 +56,9 @@ export type {
   McpClient,
   McpClientHooks,
   McpConnectionStatus,
+  McpSdkLine,
+  McpSdkSelection,
+  McpVersionNegotiation,
   McpElicitationHandler,
   McpElicitationRequest,
   McpElicitationResult,
@@ -74,19 +85,39 @@ export type {
  * MCP client over HTTP — edge-safe (fetch-only; no node builtins). `http` uses
  * the current Streamable HTTP transport; `sse` is the legacy fallback some
  * servers (e.g. Firecrawl `/v2/sse`) still expose. The Node-only stdio transport
- * lives in `./mcp/stdio`. `@modelcontextprotocol/sdk` is an optional peer,
- * imported lazily so the edge bundle never pulls it in unless used.
+ * lives in `./mcp/stdio`. The MCP SDKs (`@modelcontextprotocol/client` for
+ * 2026-07-28, `@modelcontextprotocol/sdk` for 2025-11-25) are optional peers,
+ * imported lazily so the edge bundle never pulls them in unless used.
  */
 export interface McpHttpTransport {
   type: 'http' | 'sse';
   url: string;
   headers?: Record<string, string>;
+  /**
+   * The `fetch` every request goes through (2.3) — a proxy, a Cloudflare
+   * service binding (`env.MCP.fetch`), or an in-process server's own handler.
+   * Default: the runtime's global `fetch`. Both SDK lines honor it.
+   */
+  fetch?: (input: string | URL, init?: RequestInit) => Promise<Response>;
 }
 
 export interface McpClientOptions extends McpLifecycleOptions {
   transport: McpHttpTransport;
   name?: string;
   version?: string;
+  /**
+   * Which MCP SDK drives the client (2.3). `'auto'` (the default) uses the v2
+   * SDK (`@modelcontextprotocol/client`, MCP 2026-07-28) when it can be imported
+   * and the v1 SDK (`@modelcontextprotocol/sdk`, 2025-11-25) otherwise. Every
+   * feature below works on both lines; `client.sdk()` reports the choice.
+   */
+  sdk?: McpSdkSelection;
+  /**
+   * Protocol negotiation on the v2 line (2.3) — see {@link McpVersionNegotiation}.
+   * Default `'auto'`: 2026-07-28 with a server that offers it, the 2025-era
+   * handshake otherwise. `client.protocolVersion()` reports the outcome.
+   */
+  versionNegotiation?: McpVersionNegotiation;
   /**
    * Handle server-initiated `elicitation/create` requests (MCP 2025-11-25).
    * Providing it declares the elicitation capability (form + url modes).
@@ -130,15 +161,22 @@ interface AuthableTransport {
   finishAuth?(authorizationCode: string): Promise<void>;
 }
 
-async function loadSdk(): Promise<{ Client: new (info: object, opts: object) => RawMcpClient }> {
+/**
+ * Import the v1 SDK client. `viaAuto` says the line was picked by `'auto'`
+ * BECAUSE the v2 package is missing too, in which case the hint names both.
+ */
+async function loadSdk(
+  viaAuto = false,
+): Promise<{ Client: new (info: object, opts: object) => RawMcpClient }> {
   try {
     const spec: string = '@modelcontextprotocol/sdk/client/index.js';
     const mod = await import(spec);
     return mod as { Client: new (info: object, opts: object) => RawMcpClient };
   } catch (err) {
     throw new InvalidRequestError({
-      message:
-        'MCP support needs the optional peer "@modelcontextprotocol/sdk". Install it: npm i @modelcontextprotocol/sdk',
+      message: viaAuto
+        ? NO_MCP_SDK_MESSAGE
+        : 'MCP support needs the optional peer "@modelcontextprotocol/sdk". Install it: npm i @modelcontextprotocol/sdk',
       cause: err,
     });
   }
@@ -146,10 +184,11 @@ async function loadSdk(): Promise<{ Client: new (info: object, opts: object) => 
 
 async function makeHttpTransport(t: McpHttpTransport, authProvider?: unknown): Promise<unknown> {
   const opts =
-    t.headers || authProvider
+    t.headers || authProvider || t.fetch
       ? {
           ...(t.headers ? { requestInit: { headers: t.headers } } : {}),
           ...(authProvider ? { authProvider } : {}),
+          ...(t.fetch ? { fetch: t.fetch } : {}),
         }
       : undefined;
   if (t.type === 'sse') {
@@ -251,8 +290,9 @@ async function makeHttpClient(
   options: McpClientOptions,
   hooks: McpClientHooks,
   rootsBox: McpRootsBox | undefined,
+  viaAuto: boolean,
 ): Promise<RawMcpClient> {
-  const { Client } = await loadSdk();
+  const { Client } = await loadSdk(viaAuto);
   const client = new Client(
     { name: options.name ?? 'deuz', version: options.version ?? '0.0.0' },
     // Declaring a capability without a handler would lie to servers — gate each
@@ -279,10 +319,19 @@ async function makeHttpClient(
     ...(rootsBox !== undefined ? { roots: () => readRootsBox(rootsBox) } : {}),
   });
   await registerToolListChanged(client, hooks.toolListChanged);
-  return client;
+  return recordV1NegotiatedVersion(client);
 }
 
 export async function createMcpClient(options: McpClientOptions): Promise<McpRootsClient> {
+  // Line first: an impossible combination must fail before any side effect
+  // (an OAuth binding write, a socket).
+  const line = await selectMcpSdk(options.sdk);
+  assertLineSupports(line, options.versionNegotiation);
+  // Literal specifier: the v2 adapter is its own chunk, fetched only when used.
+  const v2 = line === 'v2' ? await import('./sdk-v2') : undefined;
+  if (v2) await v2.loadV2Client(); // an explicit 'v2' without the package fails here
+  const viaAuto = options.sdk === undefined || options.sdk === 'auto';
+
   const auth = options.auth ? toOAuthProvider(options.auth) : undefined;
   // The SDK's provider callbacks carry no server URL — bind before the
   // transport starts so every stored key lands in this server's namespace.
@@ -293,7 +342,9 @@ export async function createMcpClient(options: McpClientOptions): Promise<McpRoo
   let pendingCode = options.authorizationCode;
 
   const makeTransport = async (): Promise<unknown> => {
-    const transport = await makeHttpTransport(options.transport, auth?.provider);
+    const transport = v2
+      ? await v2.makeV2HttpTransport(options.transport, auth?.provider)
+      : await makeHttpTransport(options.transport, auth?.provider);
     if (pendingCode) {
       const finishAuth = (transport as AuthableTransport).finishAuth;
       if (!finishAuth) {
@@ -311,7 +362,10 @@ export async function createMcpClient(options: McpClientOptions): Promise<McpRoo
   let managed;
   try {
     managed = await createManagedConnection({
-      makeClient: (hooks) => makeHttpClient(options, hooks, rootsBox),
+      makeClient: (hooks) =>
+        v2
+          ? v2.makeV2Client(options, hooks, rootsBox)
+          : makeHttpClient(options, hooks, rootsBox, viaAuto),
       // A transport is single-use, so every attempt gets a brand-new one.
       makeTransport,
       lifecycle: options,
@@ -330,5 +384,10 @@ export async function createMcpClient(options: McpClientOptions): Promise<McpRoo
     }
     throw err;
   }
-  return attachRoots(wrapMcpClient(managed.raw(), managed), managed.raw(), rootsBox, managed);
+  return attachRoots(
+    wrapMcpClient(managed.raw(), managed, { sdk: line }),
+    managed.raw(),
+    rootsBox,
+    managed,
+  );
 }

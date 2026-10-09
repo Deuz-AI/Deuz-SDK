@@ -37,12 +37,31 @@ import type {
   McpLoopEntry,
   McpStdioLoopConfig,
 } from '../types/config';
-import type { McpClient } from './shared';
+import type { McpClient, McpSdkSelection, McpVersionNegotiation } from './shared';
 import { InvalidRequestError } from '../errors';
 import { createMcpClient } from './index';
 
 /** A `CommonCallOptions.mcp` entry the run can CONNECT (as opposed to borrow). */
 export type McpConnectableConfig = McpHttpLoopConfig | McpStdioLoopConfig;
+
+/**
+ * The SDK-line fields (2.3) a connectable entry may carry. Read through this
+ * widening so an entry's choice reaches the connection the run opens — see
+ * `McpClientOptions.sdk` / `versionNegotiation`.
+ */
+interface McpLineFields {
+  sdk?: McpSdkSelection;
+  versionNegotiation?: McpVersionNegotiation;
+}
+
+/** Just the line fields an entry set — absent ones stay absent, never `undefined`. */
+function lineFields(config: McpConnectableConfig): McpLineFields {
+  const { sdk, versionNegotiation } = config as McpConnectableConfig & McpLineFields;
+  return {
+    ...(sdk !== undefined ? { sdk } : {}),
+    ...(versionNegotiation !== undefined ? { versionNegotiation } : {}),
+  };
+}
 
 /**
  * A cross-call connection cache (`deps.mcpPool`). Server processes hold one of
@@ -196,6 +215,7 @@ async function connectConfig(config: McpConnectableConfig, clock?: Clock): Promi
       },
       ...(config.auth ? { auth: config.auth } : {}),
       ...(config.onElicitationRequest ? { onElicitationRequest: config.onElicitationRequest } : {}),
+      ...lineFields(config),
       reconnect: true,
       ...(clock ? { clock } : {}),
     });
@@ -216,6 +236,7 @@ async function connectConfig(config: McpConnectableConfig, clock?: Clock): Promi
     command: config.command,
     ...(config.args ? { args: config.args } : {}),
     ...(config.env ? { env: config.env } : {}),
+    ...lineFields(config),
     reconnect: true,
     ...(clock ? { clock } : {}),
   });

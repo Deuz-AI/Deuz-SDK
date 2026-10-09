@@ -697,6 +697,30 @@ describe('resolveMcpForLoop — closeOwned()', () => {
     await runtime.closeOwned();
   });
 
+  it('forwards an entry’s sdk and versionNegotiation to the connection it opens (2.3)', async () => {
+    const server = await startServer();
+    const { logger } = captureLogger();
+    // `sdk`/`versionNegotiation` are read structurally until the loop config
+    // types declare them (see the 2.3 lane report's wiring request).
+    const v1 = { url: server.url, sdk: 'v1' } as Parameters<typeof resolveMcpForLoop>[0][number];
+    const v2 = {
+      url: server.url,
+      sdk: 'v2',
+      versionNegotiation: 'legacy',
+    } as Parameters<typeof resolveMcpForLoop>[0][number];
+
+    const runtime = await resolveMcpForLoop([v1, v2], { logger });
+    try {
+      expect(runtime.clients.map((c) => c.sdk?.())).toEqual(['v1', 'v2']);
+      expect(runtime.clients.map((c) => c.protocolVersion?.())).toEqual([
+        '2025-11-25',
+        '2025-11-25',
+      ]);
+    } finally {
+      await runtime.closeOwned();
+    }
+  }, 20_000);
+
   it('rejects with an actionable message when a server is unreachable', async () => {
     const dead = await startTestMcpServer();
     const url = dead.url;
