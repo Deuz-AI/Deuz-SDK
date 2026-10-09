@@ -1,5 +1,5 @@
 import type { CommonCallOptions } from '../types/config';
-import type { CallWarning, StreamChatResult } from '../types/methods';
+import type { CallWarning, StopDetails, StreamChatResult } from '../types/methods';
 import type { GuardrailPart, StreamPart, ToolRunState } from '../types/stream';
 import type { Message } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
@@ -18,7 +18,13 @@ import { toObservedError } from '../internal/observe-error';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
 import { createWarningSink } from '../internal/warnings';
 import type { MemoryMutation } from '../memory';
-import { assembleAssistant, type ToolArgMap, type EncryptedReasoning } from './run-step';
+import {
+  assembleAssistant,
+  blocksToolDispatch,
+  stopDetailsFrom,
+  type ToolArgMap,
+  type EncryptedReasoning,
+} from './run-step';
 import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
 import {
   buildWireTools,
@@ -151,6 +157,8 @@ export interface StreamToolLoopSnapshot {
   pendingApprovals: ToolApprovalRequest[];
   pendingClientCalls: ToolCall[];
   verified?: boolean;
+  /** The provider's stop explanation for the last step (2.3), e.g. a refusal's category. */
+  stopDetails?: StopDetails;
   error?: unknown;
   handoff?: { to: string; count: number };
 }
@@ -394,6 +402,12 @@ export function runStreamToolLoop(
     let snapshotApprovals: ToolApprovalRequest[] = [];
     let snapshotClientCalls: ToolCall[] = [];
     let lastFinish: FinishReason = 'stop';
+    /**
+     * The last step's provider finish detail (2.3) — carried onto the loop's
+     * `finish` part exactly as a single-turn stream carries it, so a refusal's
+     * `stop_details` survives the loop.
+     */
+    let lastFinishMeta: Record<string, unknown> | undefined;
     let stoppedBy: string | undefined;
     let prevCostUsd = 0;
     let stepIndex = resumeFrom?.stepIndex ?? 0;
@@ -433,7 +447,8 @@ export function runStreamToolLoop(
      */
     const handoffLog: HandoffLogEntry[] = [];
     if (durable && internal?.onCheckpoint) {
-      durable.beforeSave = (checkpoint) =>
+      durable.beforeSave = (checkpoint) => {
+        const stopDetails = stopDetailsFrom(lastFinishMeta);
         internal.onCheckpoint!({
           messages: checkpoint.messages,
           steps: [...steps],
@@ -445,8 +460,10 @@ export function runStreamToolLoop(
           pendingApprovals: checkpoint.pendingApprovals ?? [],
           pendingClientCalls: snapshotClientCalls,
           verified,
+          ...(stopDetails ? { stopDetails } : {}),
           ...(checkpoint.handoff ? { handoff: checkpoint.handoff } : {}),
         });
+      };
     }
 
     // Mutated per iteration so tool events parent under the current step span;
@@ -907,6 +924,8 @@ export function runStreamToolLoop(
         let stepUsage: Usage = EMPTY_USAGE;
         let stepFinish: FinishReason = 'stop';
         let stepPhase: string | undefined;
+        /** The provider's finish detail for this step (2.3), e.g. refusal `stop_details`. */
+        let stepFinishMeta: Record<string, unknown> | undefined;
         // Overflow auto-recovery (2.0): ONE retry per step. G2 turns the
         // provider's rejection into an `error` PART, not a throw, so the retry
         // gate lives inside the consumption loop rather than around a try.
@@ -941,6 +960,7 @@ export function runStreamToolLoop(
           stepUsage = EMPTY_USAGE;
           stepFinish = 'stop';
           stepPhase = undefined;
+          stepFinishMeta = undefined;
           /** Set instead of failing when the rejection is a recoverable overflow. */
           let overflow: unknown;
 
@@ -982,6 +1002,7 @@ export function runStreamToolLoop(
                 stepFinish = part.finishReason;
                 stepPhase = (part.providerMetadata?.openai as { phase?: string } | undefined)
                   ?.phase;
+                stepFinishMeta = part.providerMetadata;
                 break; // re-framed as step-finish below
               case 'error':
                 // Recoverable overflow: hold the error instead of publishing it —
@@ -1034,11 +1055,13 @@ export function runStreamToolLoop(
         totalUsage = sumUsage(totalUsage, stepUsage);
         calibrateCompaction(compactionRunner, estimatedAtCall, stepUsage);
         lastFinish = stepFinish;
+        lastFinishMeta = stepFinishMeta;
         broadcaster.push({
           type: 'step-finish',
           stepIndex,
           finishReason: stepFinish,
           usage: stepUsage,
+          ...(stepFinishMeta ? { providerMetadata: stepFinishMeta } : {}),
         });
         // Live cumulative cost (1.7, D2): one part per step whenever a
         // priceProvider is injected — cross-leg cumulative on durable resumes.
@@ -1069,15 +1092,21 @@ export function runStreamToolLoop(
           }
         }
 
+        // Finish-reason gate (2.3, F16): a refused or cut-off turn keeps its text
+        // and reasoning, never its tool calls — their arguments may be truncated.
+        const cutOff = blocksToolDispatch(stepFinish);
         const { assistantMessage, toolUseParts } = assembleAssistant(
           text,
           reasoningText,
           reasoningSignature,
           toolArgs,
-          toolOrder,
+          cutOff ? [] : toolOrder,
           encryptedReasoning,
         );
         if (stepPhase) assistantMessage.providerMetadata = { openai: { phase: stepPhase } };
+        // A UI already shows these calls as `input-streaming`; close each one,
+        // since no `tool-call` or `tool-result` will ever follow.
+        if (cutOff) for (const id of toolOrder) toolState(id, toolArgs.get(id)?.name, 'error');
 
         const stepData = {
           text,
@@ -1124,23 +1153,30 @@ export function runStreamToolLoop(
             );
           }
           // Rebase effective model history for the completed checkpoint; the
-          // raw ChatStore history is tracked separately.
-          messages = [...messages, assistantMessage];
-          appended.push(assistantMessage);
-          chatMessages = [...chatMessages, assistantMessage];
+          // raw ChatStore history is tracked separately. An empty turn is not
+          // recorded: no provider accepts `content: []` back.
+          const stored = !isEmptyTurn(assistantMessage);
+          if (stored) {
+            messages = [...messages, assistantMessage];
+            appended.push(assistantMessage);
+            chatMessages = [...chatMessages, assistantMessage];
+          }
 
           // False-finish guard (1.9, N2): consulted BEFORE verifyStep at this
           // same natural-completion boundary — it is the cheaper, narrower
           // question, and a rejection that re-drives SHORT-CIRCUITS verification
           // for this round (nothing worth verifying in an answer the caller
           // already calls incomplete). The two retry budgets never mix.
-          const completion = await evaluateDoneWhen(options, {
-            stepIndex,
-            attempt: falseFinishRetries,
-            text,
-            messages,
-            usage: durableUsage(durable, totalUsage),
-          });
+          // Neither hook re-drives a refused or cut-off turn (2.3).
+          const completion = cutOff
+            ? undefined
+            : await evaluateDoneWhen(options, {
+                stepIndex,
+                attempt: falseFinishRetries,
+                text,
+                messages,
+                usage: durableUsage(durable, totalUsage),
+              });
           if (completion) {
             if (completion.done) {
               // A later round genuinely finished: an earlier give-up must not
@@ -1173,13 +1209,15 @@ export function runStreamToolLoop(
 
           // Verified generation (1.8): emit a verify part; on a rejected
           // verdict, feed feedback back as a user turn and re-drive the loop.
-          const verification = await evaluateVerifyStep(options, {
-            stepIndex,
-            attempt: verifyAttempts,
-            text,
-            messages,
-            usage: durableUsage(durable, totalUsage),
-          });
+          const verification = cutOff
+            ? undefined
+            : await evaluateVerifyStep(options, {
+                stepIndex,
+                attempt: verifyAttempts,
+                text,
+                messages,
+                usage: durableUsage(durable, totalUsage),
+              });
           if (verification) {
             verified = verification.verdict.ok;
             broadcaster.push({
@@ -1231,12 +1269,19 @@ export function runStreamToolLoop(
             // content array is not a message any wire accepts (see isEmptyTurn)
             // — so the turn is DROPPED rather than persisted unsendable.
             const drop = isEmptyTurn(rewritten);
-            messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
-            chatMessages = drop
-              ? chatMessages.slice(0, -1)
-              : [...chatMessages.slice(0, -1), rewritten];
-            if (drop) appended.pop();
-            else appended[appended.length - 1] = rewritten;
+            if (stored) {
+              messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
+              chatMessages = drop
+                ? chatMessages.slice(0, -1)
+                : [...chatMessages.slice(0, -1), rewritten];
+              if (drop) appended.pop();
+              else appended[appended.length - 1] = rewritten;
+            } else if (!drop) {
+              // A replacement gives an empty turn something to say: record it now.
+              messages = [...messages, rewritten];
+              appended.push(rewritten);
+              chatMessages = [...chatMessages, rewritten];
+            }
             // The SAME step must agree — `stopWhen` conditions read `steps[]`.
             steps[steps.length - 1] = {
               ...sr,
@@ -1654,11 +1699,15 @@ export function runStreamToolLoop(
 
       const usage = withTotal(totalUsage);
       const deuzMeta = finishMeta();
+      const providerMetadata: Record<string, unknown> = {
+        ...lastFinishMeta,
+        ...(deuzMeta ? { deuz: deuzMeta } : {}),
+      };
       broadcaster.push({
         type: 'finish',
         usage,
         finishReason: lastFinish,
-        ...(deuzMeta ? { providerMetadata: { deuz: deuzMeta } } : {}),
+        ...(Object.keys(providerMetadata).length > 0 ? { providerMetadata } : {}),
       });
       usageDeferred.resolve(usage);
       finishDeferred.resolve(lastFinish);
@@ -1680,6 +1729,7 @@ export function runStreamToolLoop(
       // lands right after the same post-terminal bookkeeping (settleMemory /
       // persistChat) each of those paths already performed. Never throws.
       await closeMcp(mcp, deps);
+      const stopDetails = stopDetailsFrom(lastFinishMeta);
       internal?.onSnapshot?.({
         messages,
         steps,
@@ -1691,6 +1741,7 @@ export function runStreamToolLoop(
         pendingApprovals: snapshotApprovals,
         pendingClientCalls: snapshotClientCalls,
         verified,
+        ...(stopDetails ? { stopDetails } : {}),
         ...(terminalError !== undefined ? { error: terminalError } : {}),
         ...(durable?.handoff ? { handoff: durable.handoff } : {}),
       });

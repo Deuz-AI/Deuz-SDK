@@ -36,6 +36,21 @@ export interface CallWarning {
   message: string;
 }
 
+/**
+ * Why the provider stopped a turn early, when it explained it (2.3 additive).
+ * Today this is Anthropic's `stop_details` on a refusal (`stop_reason:
+ * 'refusal'`, surfaced as `finishReason: 'content_filter'`). The raw provider
+ * object also stays on finish parts as `providerMetadata.anthropic.stop_details`.
+ */
+export interface StopDetails {
+  /** What the detail explains, e.g. `'refusal'`. Treat unknown values defensively. */
+  type: string;
+  /** Provider category, when given (Anthropic refusal categories such as `'cyber'`). */
+  category?: string | null;
+  /** Provider explanation, when given. */
+  explanation?: string | null;
+}
+
 // --- streamChat ---
 export type StreamChatOptions = CommonCallOptions;
 
@@ -110,6 +125,11 @@ export interface GenerateTextResult {
   /** Total usage summed across all agentic steps. */
   usage: Usage;
   finishReason: FinishReason;
+  /**
+   * The provider's explanation of the last turn's stop (2.3 additive), when it
+   * gave one — e.g. a refusal's category. See {@link StopDetails}.
+   */
+  stopDetails?: StopDetails;
   /** Messages to append to history (assistant + tool turns across all steps). */
   response: { messages: Message[] };
   /** Per-step breakdown (present when `tools` were used). Additive. */

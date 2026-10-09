@@ -1,10 +1,45 @@
 import type { CommonCallOptions } from '../types/config';
-import type { CallWarning } from '../types/methods';
+import type { CallWarning, StopDetails } from '../types/methods';
 import type { Message, Part } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
 import { runStream, type InternalRunOptions } from '../core/inference';
 
 type ToolUsePart = Extract<Part, { type: 'tool_use' }>;
+
+/**
+ * The finish-reason gate (2.3, F16): a turn the provider refused
+ * (`content_filter`) or cut off (`length`) never dispatches its `tool_use` parts.
+ * Their arguments may be truncated JSON, and acting on a refused turn executes
+ * work the provider declined to produce. Both loops consult this BEFORE any
+ * guardrail, approval or execution, and neither re-drives such a turn through
+ * `doneWhen` or `verifyStep`.
+ */
+export function blocksToolDispatch(finishReason: FinishReason): boolean {
+  return finishReason === 'content_filter' || finishReason === 'length';
+}
+
+/**
+ * Read the provider's stop explanation off a finish part's `providerMetadata`
+ * (2.3). Anthropic sends `stop_details` with a refusal; other providers send
+ * nothing comparable today, so this returns `undefined` for them.
+ */
+export function stopDetailsFrom(
+  providerMetadata: Record<string, unknown> | undefined,
+): StopDetails | undefined {
+  const anthropic = providerMetadata?.anthropic;
+  const raw =
+    anthropic && typeof anthropic === 'object'
+      ? (anthropic as { stop_details?: unknown }).stop_details
+      : undefined;
+  if (!raw || typeof raw !== 'object') return undefined;
+  const { type, category, explanation } = raw as Record<string, unknown>;
+  if (typeof type !== 'string') return undefined;
+  return {
+    type,
+    ...(typeof category === 'string' || category === null ? { category } : {}),
+    ...(typeof explanation === 'string' || explanation === null ? { explanation } : {}),
+  };
+}
 
 /** Per-tool streamed-argument accumulator (id → name + concatenated JSON fragments + provider meta). */
 export type ToolArgMap = Map<
@@ -72,6 +107,8 @@ export interface OneStep {
   toolUseParts: ToolUsePart[];
   usage: Usage;
   finishReason: FinishReason;
+  /** The provider's stop explanation for this turn (2.3), e.g. a refusal's category. */
+  stopDetails?: StopDetails;
   /** assistant turn in canonical order (reasoning, text, tool_use…). */
   assistantMessage: Message;
   /** Observation settlement passthrough (1.6.1) — root single-turn calls only. */
@@ -100,6 +137,7 @@ export async function runOneStep(
   let reasoningText = '';
   let reasoningSignature: string | undefined;
   let messagePhase: string | undefined;
+  let stopDetails: StopDetails | undefined;
   const encryptedReasoning: EncryptedReasoning = [];
   const toolArgs: ToolArgMap = new Map();
   const toolOrder: string[] = [];
@@ -109,6 +147,7 @@ export async function runOneStep(
       case 'finish':
         // Responses `phase` rides finish providerMetadata → onto the assistant message.
         messagePhase = (part.providerMetadata?.openai as { phase?: string } | undefined)?.phase;
+        stopDetails = stopDetailsFrom(part.providerMetadata);
         break;
       case 'text-delta':
         text += part.text;
@@ -148,7 +187,8 @@ export async function runOneStep(
     reasoningText,
     reasoningSignature,
     toolArgs,
-    toolOrder,
+    // A refused or cut-off turn keeps its text and reasoning, never its tool calls.
+    blocksToolDispatch(finishReason) ? [] : toolOrder,
     encryptedReasoning,
   );
   if (messagePhase) assistantMessage.providerMetadata = { openai: { phase: messagePhase } };
@@ -160,6 +200,7 @@ export async function runOneStep(
     toolUseParts,
     usage,
     finishReason,
+    ...(stopDetails ? { stopDetails } : {}),
     assistantMessage,
     ...(result.observation ? { observation: result.observation } : {}),
     // `warnings` never rejects by contract (core/inference.ts resolves it from

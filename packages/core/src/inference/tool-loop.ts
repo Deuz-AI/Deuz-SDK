@@ -5,7 +5,7 @@ import type { Message } from '../types/message';
 import type { Usage } from '../types/usage';
 import type { ToolCall, ToolSet, StepResult, ToolApprovalRequest } from '../types/tool';
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
-import { runOneStep, type OneStep } from './run-step';
+import { runOneStep, blocksToolDispatch, type OneStep } from './run-step';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { createStepTimeout, resolveTimeouts, type StepTimeoutHandle } from '../core/timeout';
@@ -282,6 +282,7 @@ export async function runToolLoop(
       text: guardrailText ?? lastStep?.text ?? '',
       usage: withTotal(totalUsage),
       finishReason: lastStep?.finishReason ?? 'stop',
+      ...(lastStep?.stopDetails ? { stopDetails: lastStep.stopDetails } : {}),
       response: { messages: appended },
       steps,
       ...(warnings.list().length ? { warnings: warnings.list() } : {}),
@@ -620,7 +621,10 @@ export async function runToolLoop(
       calibrateCompaction(compactionRunner, estimatedAtCall, step.usage);
 
       // *** GEMINI GUARD: continue on tool_use parts, NOT finishReason ***
+      // A refused or cut-off turn arrives here too (2.3, F16): `runOneStep`
+      // already dropped its tool_use parts, so nothing of it is dispatched.
       if (step.toolUseParts.length === 0) {
+        const cutOff = blocksToolDispatch(step.finishReason);
         const sr = toStepResult(step, [], [], steps.length);
         steps.push(sr);
         if (lo && stepSpan) {
@@ -635,10 +639,14 @@ export async function runToolLoop(
           );
         }
         // Rebase effective model history for the completed checkpoint; the
-        // raw ChatStore history and response delta are tracked separately.
-        messages = [...messages, step.assistantMessage];
-        appended.push(step.assistantMessage);
-        chatMessages = [...chatMessages, step.assistantMessage];
+        // raw ChatStore history and response delta are tracked separately. An
+        // empty turn is not recorded: no provider accepts `content: []` back.
+        const stored = !isEmptyTurn(step.assistantMessage);
+        if (stored) {
+          messages = [...messages, step.assistantMessage];
+          appended.push(step.assistantMessage);
+          chatMessages = [...chatMessages, step.assistantMessage];
+        }
 
         // False-finish guard (1.9, N2): consulted BEFORE verifyStep at this same
         // natural-completion boundary — the cheaper, narrower question — and a
@@ -646,13 +654,16 @@ export async function runToolLoop(
         // (nothing worth verifying in an answer the caller calls incomplete).
         // The two retry budgets never mix. Mirrors the streaming loop exactly;
         // the buffered path has no stream, so there is no `false-finish` part.
-        const completion = await evaluateDoneWhen(options, {
-          stepIndex,
-          attempt: falseFinishRetries,
-          text: step.text,
-          messages,
-          usage: durableUsage(durable, totalUsage),
-        });
+        // Neither hook re-drives a refused or cut-off turn (2.3).
+        const completion = cutOff
+          ? undefined
+          : await evaluateDoneWhen(options, {
+              stepIndex,
+              attempt: falseFinishRetries,
+              text: step.text,
+              messages,
+              usage: durableUsage(durable, totalUsage),
+            });
         if (completion) {
           if (completion.done) {
             // A later round genuinely finished: an earlier give-up must not mark
@@ -679,13 +690,15 @@ export async function runToolLoop(
 
         // Verified generation (1.8): a rejected verdict feeds feedback back as
         // a user turn and re-drives the loop (bounded by maxVerifyAttempts).
-        const verification = await evaluateVerifyStep(options, {
-          stepIndex,
-          attempt: verifyAttempts,
-          text: step.text,
-          messages,
-          usage: durableUsage(durable, totalUsage),
-        });
+        const verification = cutOff
+          ? undefined
+          : await evaluateVerifyStep(options, {
+              stepIndex,
+              attempt: verifyAttempts,
+              text: step.text,
+              messages,
+              usage: durableUsage(durable, totalUsage),
+            });
         if (verification) {
           verified = verification.verdict.ok;
           if (verification.retry) {
@@ -726,12 +739,19 @@ export async function runToolLoop(
           // content array is not a message any wire accepts (see isEmptyTurn) —
           // so the turn is DROPPED rather than persisted in an unsendable shape.
           const drop = isEmptyTurn(rewritten);
-          messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
-          chatMessages = drop
-            ? chatMessages.slice(0, -1)
-            : [...chatMessages.slice(0, -1), rewritten];
-          if (drop) appended.pop();
-          else appended[appended.length - 1] = rewritten;
+          if (stored) {
+            messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
+            chatMessages = drop
+              ? chatMessages.slice(0, -1)
+              : [...chatMessages.slice(0, -1), rewritten];
+            if (drop) appended.pop();
+            else appended[appended.length - 1] = rewritten;
+          } else if (!drop) {
+            // A replacement gives an empty turn something to say: record it now.
+            messages = [...messages, rewritten];
+            appended.push(rewritten);
+            chatMessages = [...chatMessages, rewritten];
+          }
           // The SAME step must agree: a consumer auditing `steps[]` would
           // otherwise still read the text the guardrail removed.
           steps[steps.length - 1] = {

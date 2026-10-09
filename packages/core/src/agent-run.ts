@@ -9,6 +9,7 @@ import type {
   AgentValidation,
 } from './types/agent-run';
 import type { CommonCallOptions } from './types/config';
+import type { StopDetails } from './types/methods';
 import type { Message } from './types/message';
 import type { SessionStore } from './types/session';
 import type { StreamPart } from './types/stream';
@@ -22,6 +23,7 @@ import { EMPTY_USAGE } from './core/metering';
 import { getCapabilities } from './core/registry';
 import { runStream } from './core/inference';
 import { runStreamToolLoop, type StreamToolLoopSnapshot } from './inference/stream-tool-loop';
+import { stopDetailsFrom } from './inference/run-step';
 import {
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
@@ -62,18 +64,36 @@ function errorData(error: unknown): { name: string; message: string; code?: stri
   return { name: 'Error', message: String(error) };
 }
 
+function messageText(message: Message): string {
+  return typeof message.content === 'string'
+    ? message.content
+    : message.content
+        .filter((p) => p.type === 'text')
+        .map((p) => p.text)
+        .join('');
+}
+
 function lastAssistantText(messages: Message[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i]!;
-    if (message.role !== 'assistant') continue;
-    return typeof message.content === 'string'
-      ? message.content
-      : message.content
-          .filter((p) => p.type === 'text')
-          .map((p) => p.text)
-          .join('');
+    if (message.role === 'assistant') return messageText(message);
   }
   return '';
+}
+
+/**
+ * The answer of a loop that ended naturally: the text of its FINAL turn. An
+ * empty final turn is not recorded (2.3), and an earlier assistant turn's text
+ * must never stand in for the answer the model did not give.
+ */
+function finalTurnText(messages: Message[]): string {
+  const last = messages.at(-1);
+  return last?.role === 'assistant' ? messageText(last) : '';
+}
+
+/** Native stop reasons name a refusal plainly (2.3); other finish reasons pass through. */
+function stopReasonOf(finishReason: string): string {
+  return finishReason === 'content_filter' ? 'refusal' : finishReason;
 }
 
 function positiveInteger(value: number, name: string): number {
@@ -225,7 +245,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     await persist();
     settledOutcome = outcome;
   }
-  const stopped = (reason: string) => finish({ ...base(), status: 'stopped', reason });
+  const stopped = (reason: string, stopDetails?: StopDetails) =>
+    finish({ ...base(), status: 'stopped', reason, ...(stopDetails ? { stopDetails } : {}) });
   function emitPart(part: StreamPart, phase: 'running' | 'finalizing'): void {
     events.push({ type: 'part', part, phase });
     if (part.type === 'text-delta') text.push(part.text);
@@ -605,11 +626,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               recoveredOutcome.stoppedBy ??
                 (recoveredOutcome.endReason !== 'natural'
                   ? recoveredOutcome.endReason
-                  : recoveredOutcome.finishReason),
+                  : stopReasonOf(recoveredOutcome.finishReason)),
+              recoveredOutcome.stopDetails,
             );
             return;
           }
-          if (!options.output) envelope.candidateText = currentText;
+          if (!options.output)
+            envelope.candidateText = currentText = finalTurnText(envelope.messages);
         } else {
           if (!(await checkLimit())) return;
           events.push({ type: 'phase', phase: 'running' });
@@ -640,6 +663,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                   finishReason: value.finishReason,
                   endReason: value.endReason,
                   stoppedBy: value.stoppedBy,
+                  ...(value.stopDetails ? { stopDetails: value.stopDetails } : {}),
                 };
                 envelope.pendingClientCalls = value.pendingClientCalls;
               },
@@ -668,13 +692,17 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             });
             return;
           }
+          // A refused or cut-off final turn (2.3, F16) stops here: it is never
+          // reported completed, and verification never re-drives it.
           if (loop.stoppedBy || loop.endReason !== 'natural' || loop.finishReason !== 'stop') {
             await stopped(
-              loop.stoppedBy ?? (loop.endReason !== 'natural' ? loop.endReason : loop.finishReason),
+              loop.stoppedBy ??
+                (loop.endReason !== 'natural' ? loop.endReason : stopReasonOf(loop.finishReason)),
+              loop.stopDetails,
             );
             return;
           }
-          if (!options.output) envelope.candidateText = currentText;
+          if (!options.output) envelope.candidateText = currentText = finalTurnText(loop.messages);
         }
       } else if (envelope.phase === 'running') {
         const input = await evaluateInputGuardrails(common, envelope.messages);
@@ -737,6 +765,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           let lastDraft: string | undefined;
           let elementCount = 0;
           let streamError: unknown;
+          let finishMeta: Record<string, unknown> | undefined;
           const publishDraft = async (): Promise<void> => {
             if (!output) return;
             const draft = parsePartialJson(buffer);
@@ -771,6 +800,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           for await (const part of inner.fullStream) {
             emitPart(part, 'finalizing');
             if (part.type === 'error') streamError = part.error;
+            if (part.type === 'finish') finishMeta = part.providerMetadata;
             if (part.type === 'text-delta' && strategy !== 'tool') {
               buffer += part.text;
               await publishDraft();
@@ -794,7 +824,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           const reason = await inner.finishReason;
           if (reason !== 'stop' && !(strategy === 'tool' && reason === 'tool_calls')) {
             currentText = buffer;
-            await stopped(reason);
+            await stopped(stopReasonOf(reason), stopDetailsFrom(finishMeta));
             return;
           }
           envelope.candidateText = buffer;

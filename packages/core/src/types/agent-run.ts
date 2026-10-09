@@ -7,6 +7,7 @@ import type { JSONSchema, StandardSchemaV1 } from './schema';
 import type { Tool, ToolApprovalRequest, ToolCall, ToolExecuteContext } from './tool';
 import type { BudgetTotals, ExecutionContextSnapshot, NativeExecutionContext } from './execution';
 import type { FinishReason } from './usage';
+import type { StopDetails } from './methods';
 
 /** A validator returns its validated (possibly transformed) value or throws. */
 export type AgentValidator<T> = (value: unknown) => T | Promise<T>;
@@ -83,6 +84,11 @@ interface AgentResultBase {
   modelSteps: number;
   accounting?: BudgetTotals;
   verification?: AgentVerification['status'];
+  /**
+   * The provider's explanation of an early stop (2.3), e.g. on a `stopped` result
+   * with reason `'refusal'`: the refusal category and explanation.
+   */
+  stopDetails?: StopDetails;
 }
 
 /** Only a completed result has an accepted, runtime-validated output. */
@@ -125,7 +131,13 @@ export interface AgentRunEnvelope {
   verification?: AgentVerification['status'];
   binding?: { model: string; tools: string; output: string; revision?: string };
   limits?: { maxSteps: number; maxOutputAttempts: number; maxVerifyAttempts: number };
-  loopOutcome?: { finishReason: FinishReason; endReason: string; stoppedBy?: string };
+  loopOutcome?: {
+    finishReason: FinishReason;
+    endReason: string;
+    stoppedBy?: string;
+    /** The provider's stop explanation for the loop's last turn (2.3). */
+    stopDetails?: StopDetails;
+  };
   toolResults?: Record<string, AgentToolReceipt>;
   pendingClientCalls?: ToolCall[];
   result?: AgentResult<unknown>;
