@@ -1,9 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { streamChat, generateText, generateObject, streamObject } from '../src/index';
 import { ContextOverflowError, InvalidRequestError } from '../src/errors';
 import { createAnthropic } from '../src/anthropic';
 import { runStream } from '../src/core/inference';
 import { withCapabilityOverride } from '../src/internal/config-symbol';
+import { createWarningSink } from '../src/internal/warnings';
 import type { StreamPart } from '../src/types/stream';
 import type { JSONSchema } from '../src/types/schema';
 import type { CommonCallOptions } from '../src/types/config';
@@ -564,6 +565,90 @@ describe('Anthropic context overflow mapping (2.0)', () => {
 });
 
 // ===================================================================
+// 2.3 (F26) — every value the Anthropic wire changes is reported. The
+// `clamped-setting` warning type existed since 1.9 but was never emitted.
+// ===================================================================
+
+describe('Anthropic clamps are reported, never silent (2.3, F26)', () => {
+  it("budget_tokens wire: 'xhigh' and 'max' share the 48k budget → clamped-setting", async () => {
+    for (const effort of ['xhigh', 'max'] as const) {
+      const { body, warnings } = await claudeRequest('claude-opus-4-6', { effort });
+      expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 48_000 });
+      const clamp = warnings.find((w) => w.type === 'clamped-setting');
+      expect(clamp, effort).toMatchObject({ setting: 'effort' });
+      expect(clamp!.message).toContain('48000');
+    }
+    // A level with its own budget is not a clamp.
+    const high = await claudeRequest('claude-opus-4-6', { effort: 'high' });
+    expect(high.body.thinking).toEqual({ type: 'enabled', budget_tokens: 24_000 });
+    expect(high.warnings).toEqual([]);
+  });
+
+  it('temperature and topP dropped while extended thinking is on → clamped-setting each', async () => {
+    const { body, warnings } = await claudeRequest('claude-opus-4-6', {
+      effort: 'high',
+      temperature: 0.2,
+      topP: 0.9,
+    });
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_p).toBeUndefined();
+    expect(settingsOf(warnings, 'clamped-setting')).toEqual(['temperature', 'topP']);
+    // Without thinking the same values ride the wire, and nothing is reported.
+    const free = await claudeRequest('claude-opus-4-6', { temperature: 0.2 });
+    expect(free.body.temperature).toBe(0.2);
+    expect(free.warnings).toEqual([]);
+  });
+
+  it('an explicit maxOutputTokens raised to fit the thinking budget is reported', async () => {
+    const { body, warnings } = await claudeRequest('claude-opus-4-6', {
+      effort: 'max',
+      maxOutputTokens: 1_000,
+    });
+    expect(body.max_tokens).toBe(49_024);
+    const raised = warnings.find((w) => w.setting === 'maxOutputTokens');
+    expect(raised).toMatchObject({ type: 'clamped-setting' });
+    expect(raised!.message).toContain('1000');
+    expect(raised!.message).toContain('49024');
+  });
+
+  it('forced toolChoice under extended thinking falls back to auto — and now says so', async () => {
+    const { body, warnings } = await claudeRequest(
+      'claude-opus-4-6',
+      { effort: 'high' },
+      { tools: [WEATHER_TOOL], toolChoice: 'required' },
+    );
+    expect(body.tool_choice).toEqual({ type: 'auto' });
+    expect(settingsOf(warnings, 'clamped-setting')).toEqual(['toolChoice']);
+  });
+
+  it('the clamp is logged once per run, not once per rebuilt request', async () => {
+    const warn = vi.fn();
+    const logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
+    const sink = createWarningSink();
+    const { fetch } = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+    for (let step = 0; step < 3; step++) {
+      const result = runStream(
+        {
+          model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-6'),
+          messages: [{ role: 'user', content: 'hi' }],
+          effort: 'max',
+          deps: { logger },
+        },
+        { warnings: sink },
+      );
+      for await (const _ of result.fullStream) void _;
+    }
+    expect(sink.list().filter((w) => w.type === 'clamped-setting')).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![1]).toMatchObject({
+      warning: 'clamped-setting',
+      setting: 'effort',
+      modelId: 'claude-opus-4-6',
+    });
+  });
+});
+
+// ===================================================================
 // 2.3 (F14) — Claude 5.x request rules. Verified against Anthropic's API
 // reference (cached 2026-10-06), NOT live-verified: the 400s these guard
 // against are inferred from the documented rules, so the tests pin the
@@ -739,6 +824,16 @@ describe('Claude 5.x request rules (2.3, F14)', () => {
     });
     expect(configured.body.max_tokens).toBe(32_000);
     expect(configured.warnings[0]!.message).not.toContain('max_tokens');
+  });
+
+  it('a dropped promptCaching is reported on the Anthropic wire', async () => {
+    const { body, warnings } = await claudeRequest('claude-unreleased-9', {
+      promptCaching: 'auto',
+    });
+    expect(body.cache_control).toBeUndefined();
+    expect(warnings.find((w) => w.setting === 'promptCaching')).toMatchObject({
+      type: 'unsupported-setting',
+    });
   });
 
   it('prompt caching reaches the wire on the 5.x rows (it used to be dropped)', async () => {
