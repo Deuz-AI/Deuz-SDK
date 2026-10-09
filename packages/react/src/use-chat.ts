@@ -31,6 +31,10 @@
  * - F06 — a verdict resumes the chat only when it answers the gate the chat is
  *   paused on. One with nothing pending (a double click, a stale card, another
  *   run's verdict) used to POST a fresh round and render an empty bubble.
+ * - F07 — a turn read back through `reconnect()` settles exactly like one read
+ *   from the POST (`settleTurn`). Its unresolved client calls used to reach
+ *   neither `onToolCall` nor `pendingToolCalls`; and a call the replay
+ *   re-delivers after this client answered it is not dispatched again.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
@@ -142,6 +146,67 @@ function openApprovals(turn: AssistantTurnState, replayed: boolean): ToolApprova
   return open;
 }
 
+/** JSON replacer that emits object keys in sorted order — see `invocationKey`. */
+function sortedKeys(_key: string, value: unknown): unknown {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    ),
+  );
+}
+
+/**
+ * Identity of ONE client tool invocation (2.3, F07): the server-issued id plus
+ * what it invokes. The id alone is not enough — an OpenAI-compatible server
+ * that omits call ids gets `tool_${index}` from core's adapter, so one id
+ * recurs across the rounds of an exchange — but a replay re-delivers the SAME
+ * call, not merely the same id. Key order does not count: a history restored
+ * from a store that reorders object keys (Postgres `jsonb` does) still holds
+ * the same input.
+ */
+function invocationKey(toolCallId: string, toolName: string, input: unknown): string {
+  try {
+    return JSON.stringify([toolCallId, toolName, input ?? null], sortedKeys);
+  } catch {
+    // Not JSON-serializable (a restored history can hold anything).
+    return JSON.stringify([toolCallId, toolName]);
+  }
+}
+
+const keyOfCall = (call: UIToolCall): string =>
+  invocationKey(call.toolCallId, call.toolName, call.input);
+
+/**
+ * The client tool invocations the canonical history already ANSWERS within its
+ * current exchange (after the last user message): a `tool_use` followed by a
+ * `tool_result` for its id (2.3, F07). That result is the only durable
+ * evidence this hook has that a client call completed, which is why it — not a
+ * set of ids seen so far — decides whether a REPLAYED call may be dispatched:
+ * it survives a reload exactly when the app restores `history.canonical`.
+ */
+function answeredInvocations(history: Message[]): Set<string> {
+  const answered = new Set<string>();
+  const results = new Set<string>();
+  // Backwards, so a result is seen before the call it answers. A paired id is
+  // consumed: an older `tool_use` that recycled it is not answered by it.
+  for (let i = history.length - 1; i >= 0; i--) {
+    const message = history[i]!;
+    if (message.role === 'user') break;
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type === 'tool_result') results.add(part.toolUseId);
+    }
+    if (message.role !== 'assistant') continue;
+    for (const part of message.content) {
+      if (part.type === 'tool_use' && results.delete(part.id)) {
+        answered.add(invocationKey(part.id, part.name, part.input));
+      }
+    }
+  }
+  return answered;
+}
+
 /** Local id fallback — this package is not edge-lint-constrained. */
 const defaultGenerateId = (): string =>
   typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -222,10 +287,16 @@ export interface UseChatResumeOptions {
    * whose resume endpoint answers 404 (nothing in flight) would otherwise paint
    * a permanent error. A caught-up endpoint (immediate `[DONE]`) is a silent
    * no-op — no bubble, no state change. Call `reconnect()` yourself when you
-   * want the failure surfaced.
+   * want the failure surfaced. Only the READ is silent: when the replayed turn
+   * continues the chat (2.3 — `onToolCall` answered its client calls), that
+   * POST to `api` reports a failure like any other.
    */
   auto?: boolean;
-  /** Cursor persistence adapter (see {@link UseChatCursorStore}). */
+  /**
+   * Cursor persistence adapter (see {@link UseChatCursorStore}). Only reads
+   * through `endpoint` advance the cursor — the POST response is read without
+   * its `id:` lines — so it marks how far the RESUME reads got.
+   */
   cursor?: UseChatCursorStore;
 }
 
@@ -273,6 +344,16 @@ export interface UseChatOptions {
    * OMIT it to drive client tools from outside the hook instead: the
    * round-trip PARKS, the calls appear in `pendingToolCalls`, and
    * `addToolResult` answers them.
+   *
+   * Since 2.3 a turn read back through `reconnect()` / `resume.auto` reaches
+   * this the same way. A replayed call is dispatched AT MOST ONCE per mounted
+   * hook: not when the canonical history already holds its result, and not
+   * while it is parked or still running. Across a reload that evidence is the
+   * history the app restored — a call whose result was not persisted before
+   * the page went away runs again, so make such tools idempotent, or omit
+   * `onToolCall` and confirm parked calls yourself. A tab that only WATCHES a
+   * stream another tab drives should omit it too, or it would run that tab's
+   * calls.
    */
   onToolCall?: (call: {
     toolCallId: string;
@@ -317,6 +398,7 @@ export interface UseChatResult {
   /**
    * Client tool calls the round-trip is PARKED on (no `onToolCall` executor).
    * Answer each with `addToolResult`; the chat continues once all are answered.
+   * A turn read back through `reconnect()` parks its calls here too (2.3).
    */
   pendingToolCalls: UIToolCall[];
   /** Live cumulative cost from the wire's `cost` parts (last one wins). */
@@ -427,6 +509,12 @@ export interface UseChatResult {
   /**
    * Re-read the stream from `resume.endpoint` via `connectDeuzStream` and fold
    * the parts into the current turn. No-op unless `options.resume` is set.
+   *
+   * The read turn settles exactly like a streamed one (2.3): its approvals
+   * pause the chat, its unresolved client calls reach `onToolCall` (and the
+   * chat continues with a POST) or `pendingToolCalls`, and a call the replay
+   * re-delivers after this client answered it is not dispatched again. A
+   * `stop()` during the read settles nothing; the next call continues it.
    */
   reconnect: () => Promise<void>;
 }
@@ -509,8 +597,24 @@ export function useChat(options: UseChatOptions): UseChatResult {
    */
   const approvalsRef = useRef<ToolApprovalRequest[]>([]);
   const verdictsRef = useRef<ToolApprovalResponse[]>([]);
+  /**
+   * Invocation keys (`invocationKey`) of client calls an `onToolCall` batch is
+   * running right now. Parked calls live in `clientToolsRef`; together they are
+   * the calls a concurrent replay must not dispatch a second time (2.3, F07).
+   */
+  const executingRef = useRef<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
   const lastEventIdRef = useRef<string | undefined>(options.resume?.lastEventId);
+  /**
+   * The turn `lastEventIdRef` is a cursor INTO (2.3). Only the resume read
+   * advances the cursor — `connectDeuzStream` sees the `id:` lines,
+   * `readDeuzStream` on the POST response does not — so a reconnect may fold
+   * into the in-flight turn only when that turn is the one the cursor
+   * addresses. A turn the POST read was building (e.g. the continuation after
+   * a resumed client tool) is rebuilt from the cursor instead; folding the
+   * replay into it would apply its already-received parts twice.
+   */
+  const cursorTurnRef = useRef<AssistantTurnState | undefined>(undefined);
   /**
    * Id of the turn's message AS IT SITS in `ui`. The wire's `start` part
    * RENAMES the message (`applyUIPart`), so the id is not stable across a turn
@@ -665,6 +769,108 @@ export function useChat(options: UseChatOptions): UseChatResult {
     abortRef.current?.abort();
   }, []);
 
+  /**
+   * Settle a turn whose stream ENDED cleanly: append it to the canonical
+   * history, then pause on its approvals, park or run its client tool calls,
+   * or finish. ONE implementation behind both reads (2.3, F07) — before 2.3
+   * only the POST round-trip settled client tools, so an unresolved call that
+   * arrived through `reconnect()` reached neither `onToolCall` nor
+   * `pendingToolCalls`, and the transcript kept a `tool_use` nobody answered.
+   *
+   * `replayed` marks a turn read back from `resume.endpoint`. A replay
+   * re-delivers whatever the journal holds after the cursor — with a lost
+   * cursor, or a journal holding the leg before the one in flight, that
+   * includes calls this client already answered. So for a replayed turn a call
+   * is dispatched only when the canonical history does not already answer it
+   * and it is not parked or running right now: within a mounted hook, at most
+   * once per invocation. A fresh POST leg skips those checks — it cannot
+   * repeat a call, and providers that number their calls (`tool_0`, …)
+   * legitimately recycle an answered id in the next round.
+   *
+   * Resolves `true` when client results were appended and the next round must
+   * be POSTed, `false` when the chat is done or paused.
+   */
+  const settleTurn = useCallback(
+    async (settled: AssistantTurnState, replayed: boolean): Promise<boolean> => {
+      let turn = settled;
+      // Completion evidence for a replay, read BEFORE this turn joins it.
+      const history = snapshotRef.current.history.canonical;
+      // Append the canonical assistant turn (client-tools reconstruction).
+      appendCanonical(assistantMessageFromTurn(turn));
+      turnRef.current = undefined;
+
+      // Approval pause: verdicts arrive via addToolApprovalResponse.
+      const gate = openApprovals(turn, replayed);
+      if (gate.length > 0) {
+        approvalsRef.current = gate;
+        verdictsRef.current = [];
+        setPendingApprovals(gate);
+        return false;
+      }
+
+      // Client tools: everything the server didn't execute — on a replay,
+      // minus what this client already answered or is answering right now.
+      const serverResults = new Set(turn.serverResults);
+      const answered = replayed ? answeredInvocations(history) : undefined;
+      const parked = new Set(clientToolsRef.current.map(keyOfCall));
+      const clientPending = (turn.message.toolCalls ?? []).filter((call) => {
+        if (serverResults.has(call.toolCallId)) return false;
+        if (!answered) return true;
+        const key = keyOfCall(call);
+        return !answered.has(key) && !parked.has(key) && !executingRef.current.has(key);
+      });
+      if (clientPending.length === 0) return false;
+      if (!options.onToolCall) {
+        // No in-hook executor: PARK the round-trip instead of abandoning
+        // it. 1.8 returned here and the `tool_use` never got its
+        // `tool_result`, so a tool that needs user interaction was
+        // unanswerable. `addToolResult` folds the verdicts into THIS turn.
+        parkedTurnRef.current = turn;
+        clientToolsRef.current = clientPending;
+        toolResultsRef.current = [];
+        setPendingToolCalls(clientPending);
+        return false;
+      }
+      const running = clientPending.map(keyOfCall);
+      for (const key of running) executingRef.current.add(key);
+      try {
+        const results: Array<{ toolCallId: string; result: unknown; isError?: boolean }> = [];
+        for (const call of clientPending) {
+          try {
+            const out = await options.onToolCall({
+              toolCallId: call.toolCallId,
+              toolName: call.toolName,
+              input: call.input,
+            });
+            results.push({ toolCallId: call.toolCallId, result: out });
+            turn = applyUIPart(turn, {
+              type: 'tool-result',
+              toolCallId: call.toolCallId,
+              toolName: call.toolName,
+              output: out,
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            results.push({ toolCallId: call.toolCallId, result: message, isError: true });
+            turn = applyUIPart(turn, {
+              type: 'tool-result',
+              toolCallId: call.toolCallId,
+              toolName: call.toolName,
+              output: message,
+              isError: true,
+            });
+          }
+          syncTurn(turn);
+        }
+        appendCanonical(clientToolResultMessage(results));
+      } finally {
+        for (const key of running) executingRef.current.delete(key);
+      }
+      return true;
+    },
+    [options.onToolCall, appendCanonical, syncTurn],
+  );
+
   const run = useCallback(
     async (approvalResponses?: ToolApprovalResponse[]): Promise<void> => {
       const controller = new AbortController();
@@ -717,64 +923,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
           flush(); // terminal frame — never coalesced away
           if (turn.error !== undefined) throw new Error(turn.error);
 
-          // Append the canonical assistant turn (client-tools reconstruction).
-          appendCanonical(assistantMessageFromTurn(turn));
-          turnRef.current = undefined;
-
-          // Approval pause: verdicts arrive via addToolApprovalResponse.
-          const gate = openApprovals(turn, false);
-          if (gate.length > 0) {
-            approvalsRef.current = gate;
-            verdictsRef.current = [];
-            setPendingApprovals(gate);
-            return;
-          }
-
-          // Client tools: everything the server didn't execute.
-          const toolCalls = turn.message.toolCalls ?? [];
-          const serverResults = new Set(turn.serverResults);
-          const clientPending = toolCalls.filter((t) => !serverResults.has(t.toolCallId));
-          if (clientPending.length === 0) return;
-          if (!options.onToolCall) {
-            // No in-hook executor: PARK the round-trip instead of abandoning
-            // it. 1.8 returned here and the `tool_use` never got its
-            // `tool_result`, so a tool that needs user interaction was
-            // unanswerable. `addToolResult` folds the verdicts into THIS turn.
-            parkedTurnRef.current = turn;
-            clientToolsRef.current = clientPending;
-            toolResultsRef.current = [];
-            setPendingToolCalls(clientPending);
-            return;
-          }
-          const results: Array<{ toolCallId: string; result: unknown; isError?: boolean }> = [];
-          for (const call of clientPending) {
-            try {
-              const out = await options.onToolCall({
-                toolCallId: call.toolCallId,
-                toolName: call.toolName,
-                input: call.input,
-              });
-              results.push({ toolCallId: call.toolCallId, result: out });
-              turn = applyUIPart(turn, {
-                type: 'tool-result',
-                toolCallId: call.toolCallId,
-                toolName: call.toolName,
-                output: out,
-              });
-            } catch (err) {
-              const message = err instanceof Error ? err.message : String(err);
-              results.push({ toolCallId: call.toolCallId, result: message, isError: true });
-              turn = applyUIPart(turn, {
-                type: 'tool-result',
-                toolCallId: call.toolCallId,
-                toolName: call.toolName,
-                output: message,
-                isError: true,
-              });
-            }
-            syncTurn(turn);
-          }
-          appendCanonical(clientToolResultMessage(results));
+          // The settlement `reconnect()` shares (F07): done or paused → stop.
+          if (!(await settleTurn(turn, false))) return;
           // loop → next round POSTs the extended history
         }
       } catch (err) {
@@ -807,12 +957,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
       options.body,
       options.chatId,
       options.generateId,
-      options.onToolCall,
       options.onError,
       options.onHttpError,
-      appendCanonical,
       fold,
       flush,
+      settleTurn,
       syncTurn,
     ],
   );
@@ -998,17 +1147,20 @@ export function useChat(options: UseChatOptions): UseChatResult {
         // beats the persisted one — it is strictly the more recent of the two.
         const cursor = lastEventIdRef.current ?? loadCursor(resume);
         const inFlight = turnRef.current;
-        let turn = inFlight;
-        if (turn === undefined || cursor === undefined) {
-          // No cursor → full replay rebuilds the turn from the start. It takes
-          // the place of a partial turn already on screen (`placedIdRef` keeps
-          // pointing at it); with nothing on screen the turn stays UNPLACED
-          // until the first part arrives, so a caught-up endpoint answering
-          // `[DONE]` immediately is a silent no-op rather than an empty bubble.
-          if (inFlight === undefined) placedIdRef.current = undefined;
-          turn = createAssistantTurn(genId());
-        }
+        // The replay continues the in-flight turn only when the cursor
+        // addresses THAT turn (2.3, see `cursorTurnRef`). Otherwise it rebuilds
+        // the turn — from the start without a cursor, from the cursor when the
+        // in-flight turn is one the POST read was building — and the rebuilt
+        // turn takes the place of a partial one already on screen
+        // (`placedIdRef` keeps pointing at it). With nothing on screen the turn
+        // stays UNPLACED until the first part arrives, so a caught-up endpoint
+        // answering `[DONE]` immediately is a silent no-op, not an empty bubble.
+        const continuing =
+          inFlight !== undefined && cursor !== undefined && cursorTurnRef.current === inFlight;
+        if (inFlight === undefined) placedIdRef.current = undefined;
+        let turn = continuing && inFlight ? inFlight : createAssistantTurn(genId());
         turnRef.current = turn;
+        cursorTurnRef.current = turn;
         const parts = connectDeuzStream(resume.endpoint, {
           ...(cursor !== undefined ? { lastEventId: cursor } : {}),
           onCursor: (id) => {
@@ -1023,6 +1175,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
           folded++;
           turn = fold(turn, part);
           turnRef.current = turn;
+          cursorTurnRef.current = turn;
           syncTurn(turn);
         }
         if (folded === 0) {
@@ -1031,7 +1184,21 @@ export function useChat(options: UseChatOptions): UseChatResult {
           // message would poison the next request). Not an error. The turn we
           // speculatively created is discarded; a real in-flight one is kept
           // (sealed — no `finish` is coming for it now).
-          turnRef.current = inFlight === undefined ? undefined : sealAssistantTurn(inFlight);
+          const kept = inFlight === undefined ? undefined : sealAssistantTurn(inFlight);
+          turnRef.current = kept;
+          cursorTurnRef.current = continuing ? kept : undefined;
+          return;
+        }
+        if (controller.signal.aborted) {
+          // `connectDeuzStream` ends QUIETLY on a user abort, so the loop above
+          // just stops. That ends the read, not the turn: like the POST path's
+          // abort, seal what arrived and settle nothing (2.3) — settling would
+          // append a turn the user stopped and run its client tools. The cursor
+          // still addresses this turn, so the next `reconnect()` continues it.
+          const stopped = sealAssistantTurn(turn);
+          turnRef.current = stopped;
+          cursorTurnRef.current = stopped;
+          if (stopped !== turn) syncTurn(stopped);
           return;
         }
         const sealed = sealAssistantTurn(turn);
@@ -1040,15 +1207,13 @@ export function useChat(options: UseChatOptions): UseChatResult {
           syncTurn(turn);
         }
         turnRef.current = turn;
+        cursorTurnRef.current = turn;
         if (turn.error !== undefined) throw new Error(turn.error);
-        appendCanonical(assistantMessageFromTurn(turn));
-        turnRef.current = undefined;
-        const gate = openApprovals(turn, true);
-        if (gate.length > 0) {
-          approvalsRef.current = gate;
-          verdictsRef.current = [];
-          setPendingApprovals(gate);
-        }
+        // The settlement the POST path uses (F07): approvals pause the chat and
+        // unresolved client calls reach `onToolCall` or `pendingToolCalls`.
+        // Results from `onToolCall` continue the chat with a POST, as the POST
+        // path's loop does — unless the user stopped it while they ran.
+        if ((await settleTurn(turn, true)) && !controller.signal.aborted) await run();
       } catch (err) {
         if (controller.signal.aborted) return; // user abort — not an error
         if (silent) return; // best-effort auto attempt — invisible by contract
@@ -1068,9 +1233,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
       options.headers,
       options.generateId,
       options.onError,
-      appendCanonical,
       fold,
       flush,
+      run,
+      settleTurn,
       syncTurn,
     ],
   );
