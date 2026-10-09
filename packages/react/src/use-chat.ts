@@ -26,6 +26,11 @@
  *   `steps`, `verifications`, reconciled `dataParts`, tool `denied`, plus the
  *   three channels the wiring pass gave producers — `warnings`, `falseFinishes`
  *   and `subAgents` (a delegated `agentTool` run used to be invisible here).
+ *
+ * 2.3 fixes two settlement holes, no API change:
+ * - F06 — a verdict resumes the chat only when it answers the gate the chat is
+ *   paused on. One with nothing pending (a double click, a stale card, another
+ *   run's verdict) used to POST a fresh round and render an empty bubble.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
@@ -78,6 +83,63 @@ function foldPart(
     };
   }
   return next;
+}
+
+/**
+ * Verdict ↔ request identity (2.3): the approval id plus the request's signed
+ * token. A RECORDED verdict always carries its request's exact token, so this
+ * pairs the two one-to-one.
+ */
+function sameTarget(
+  a: { approvalId: string; token?: string },
+  b: { approvalId: string; token?: string },
+): boolean {
+  return a.approvalId === b.approvalId && a.token === b.token;
+}
+
+/**
+ * Does the caller's verdict answer `request`? (2.3, F06.) The approval id must
+ * match and, when the verdict carries a signed token, it must be THIS
+ * request's token: a token is minted per run and call (`createApprovalSigner`),
+ * so a different one means the verdict was issued for another run — a card
+ * left over from an earlier turn, or another chat whose provider recycled the
+ * same call id.
+ */
+function answersRequest(verdict: ToolApprovalResponse, request: ToolApprovalRequest): boolean {
+  return (
+    verdict.approvalId === request.approvalId &&
+    (verdict.token === undefined || verdict.token === request.token)
+  );
+}
+
+/** One request delivered twice (a repeated frame), as opposed to two calls sharing an id. */
+function sameRequest(a: ToolApprovalRequest, b: ToolApprovalRequest): boolean {
+  return (
+    sameTarget(a, b) &&
+    a.toolCallId === b.toolCallId &&
+    (a.agentPath ?? []).join('\u0000') === (b.agentPath ?? []).join('\u0000')
+  );
+}
+
+/**
+ * The approvals a settled turn actually PAUSES on (2.3). `turn.approvals` is
+ * the reducer's raw arrival log, so it keeps a request the wire repeated —
+ * one question, asked once. On a REPLAY it can also hold a request whose call
+ * already has its result: a journal that spans an approval leg and the
+ * continuation that settled it folds both into one turn, and an executed call
+ * cannot be approved again. A fresh POST leg is never filtered that way: the
+ * loop breaks right after emitting its approvals, so a result for the same id
+ * in that leg belongs to a different call.
+ */
+function openApprovals(turn: AssistantTurnState, replayed: boolean): ToolApprovalRequest[] {
+  const settled = new Set(replayed ? turn.serverResults : []);
+  const open: ToolApprovalRequest[] = [];
+  for (const request of turn.approvals) {
+    if (settled.has(request.toolCallId)) continue;
+    if (open.some((seen) => sameRequest(seen, request))) continue;
+    open.push(request);
+  }
+  return open;
 }
 
 /** Local id fallback — this package is not edge-lint-constrained. */
@@ -247,7 +309,10 @@ export interface UseChatResult {
   history: ChatHistory;
   status: 'idle' | 'streaming' | 'error';
   error: Error | undefined;
-  /** Gated tool calls awaiting verdicts — the chat is PAUSED while non-empty. */
+  /**
+   * Gated tool calls awaiting verdicts — the chat is PAUSED while non-empty.
+   * One entry per request: a repeated wire frame does not add a second card.
+   */
   pendingApprovals: ToolApprovalRequest[];
   /**
    * Client tool calls the round-trip is PARKED on (no `onToolCall` executor).
@@ -346,8 +411,17 @@ export interface UseChatResult {
   clearError: () => void;
   /**
    * Record one verdict (the request's signed `token` is auto-preserved). Once
-   * EVERY pending approval has a verdict, the chat auto-resumes with
+   * EVERY pending approval has a verdict, the chat auto-resumes ONCE with
    * `approvalResponses` in the request body.
+   *
+   * The verdict must answer an approval in `pendingApprovals`: its
+   * `approvalId`, and — when the verdict carries a `token` — that request's
+   * token, which binds it to the run that issued it. ANYTHING ELSE IS A NO-OP
+   * (2.3): no request, no state change, and the promise resolves — the same
+   * contract as `addToolResult`. That covers a verdict with nothing pending, a
+   * repeat of one already sent (a double click), a card left over from an
+   * earlier turn or a replaced transcript, and another run's verdict. Before
+   * the last verdict lands, answering an approval again replaces its verdict.
    */
   addToolApprovalResponse: (response: ToolApprovalResponse) => Promise<void>;
   /**
@@ -428,6 +502,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
   const toolResultsRef = useRef<Array<{ toolCallId: string; result: unknown; isError?: boolean }>>(
     [],
   );
+  /**
+   * The gate the chat is PAUSED on: the open approvals of the last settled turn
+   * (deduplicated, see `openApprovals`). Emptied the moment its verdicts are
+   * sent, so a verdict that arrives later answers nothing (2.3, F06).
+   */
   const approvalsRef = useRef<ToolApprovalRequest[]>([]);
   const verdictsRef = useRef<ToolApprovalResponse[]>([]);
   const abortRef = useRef<AbortController | null>(null);
@@ -643,10 +722,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
           turnRef.current = undefined;
 
           // Approval pause: verdicts arrive via addToolApprovalResponse.
-          if (turn.approvals.length > 0) {
-            approvalsRef.current = turn.approvals;
+          const gate = openApprovals(turn, false);
+          if (gate.length > 0) {
+            approvalsRef.current = gate;
             verdictsRef.current = [];
-            setPendingApprovals(turn.approvals);
+            setPendingApprovals(gate);
             return;
           }
 
@@ -862,21 +942,35 @@ export function useChat(options: UseChatOptions): UseChatResult {
 
   const addToolApprovalResponse = useCallback(
     async (response: ToolApprovalResponse): Promise<void> => {
-      // Preserve the request's signed token unless the caller set one.
-      const request = approvalsRef.current.find((p) => p.approvalId === response.approvalId);
-      const verdict =
-        response.token === undefined && request?.token !== undefined
-          ? { ...response, token: request.token }
-          : response;
+      const gate = approvalsRef.current;
+      // F06 (2.3): a verdict must answer a request of the gate the chat is
+      // paused on; anything else is a NO-OP — the `addToolResult` contract: no
+      // request, no state change. Before, `every()` over an EMPTY gate was
+      // `true`, so a verdict with nothing pending (a double click after the
+      // gate completed, a stale card, another run's verdict) POSTed a fresh
+      // round and rendered an empty bubble, and a foreign verdict recorded
+      // while a gate was open rode along in its `approvalResponses`.
+      const targets = gate.filter((request) => answersRequest(response, request));
+      if (targets.length === 0) return;
+      // One verdict per request identity, carrying that request's signed token
+      // unless the caller set one (`answersRequest` proved it equal). Answering
+      // the same request again before the gate completes REPLACES the verdict.
+      const recorded: ToolApprovalResponse[] = [];
+      for (const request of targets) {
+        const verdict =
+          response.token === undefined && request.token !== undefined
+            ? { ...response, token: request.token }
+            : response;
+        if (!recorded.some((v) => sameTarget(v, verdict))) recorded.push(verdict);
+      }
       verdictsRef.current = [
-        ...verdictsRef.current.filter((v) => v.approvalId !== verdict.approvalId),
-        verdict,
+        ...verdictsRef.current.filter((v) => !recorded.some((r) => sameTarget(r, v))),
+        ...recorded,
       ];
       const verdicts = verdictsRef.current;
-      const allSettled = approvalsRef.current.every((p) =>
-        verdicts.some((v) => v.approvalId === p.approvalId),
-      );
-      if (!allSettled) return;
+      if (!gate.every((request) => verdicts.some((v) => sameTarget(v, request)))) return;
+      // Consumed. Cleared BEFORE the round starts, so a verdict that lands while
+      // it is in flight finds no gate and is a no-op too.
       approvalsRef.current = [];
       verdictsRef.current = [];
       setPendingApprovals([]);
@@ -949,10 +1043,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
         if (turn.error !== undefined) throw new Error(turn.error);
         appendCanonical(assistantMessageFromTurn(turn));
         turnRef.current = undefined;
-        if (turn.approvals.length > 0) {
-          approvalsRef.current = turn.approvals;
+        const gate = openApprovals(turn, true);
+        if (gate.length > 0) {
+          approvalsRef.current = gate;
           verdictsRef.current = [];
-          setPendingApprovals(turn.approvals);
+          setPendingApprovals(gate);
         }
       } catch (err) {
         if (controller.signal.aborted) return; // user abort — not an error
