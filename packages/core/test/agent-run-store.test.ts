@@ -47,3 +47,64 @@ describe('native envelope revision', () => {
     expect((await memory.load('z'))?.modelSteps).toBe(42);
   });
 });
+
+describe('native executor claim (2.3)', () => {
+  it('gives the run back when the store fails while the executor starts', async () => {
+    const memory = createInMemoryAgentRunStore();
+    let down = true;
+    const store: AgentRunStore = {
+      load: async (runId) => {
+        if (down) {
+          down = false;
+          throw new Error('store down');
+        }
+        return memory.load(runId);
+      },
+      save: memory.save,
+    };
+    const session = { store, scope: 'tenant', runId: 'claimed' };
+    const first = await runAgent({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      prompt: 'x',
+      session,
+    });
+    expect(first).toMatchObject({ status: 'failed', error: { message: 'store down' } });
+    // No stale claim is left behind: the next executor runs.
+    const second = await runAgent({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      prompt: 'x',
+      session,
+    });
+    expect(second.status).toBe('completed');
+  });
+
+  it('still refuses a second executor while the first one runs', async () => {
+    const memory = createInMemoryAgentRunStore();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const store: AgentRunStore = {
+      load: memory.load,
+      save: async (envelope: AgentRunEnvelope) => {
+        await held;
+        await memory.save(envelope);
+      },
+    };
+    const session = { store, scope: 'tenant', runId: 'busy' };
+    const first = runAgent({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      prompt: 'x',
+      session,
+    });
+    const second = await runAgent({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      prompt: 'x',
+      session,
+    });
+    expect(second).toMatchObject({
+      status: 'failed',
+      error: { message: 'This native run already has an active executor.' },
+    });
+    release();
+    expect((await first).status).toBe('completed');
+  });
+});

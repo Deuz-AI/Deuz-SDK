@@ -291,32 +291,6 @@ export function createSwarm(options: SwarmOptions): Swarm {
         run: { executionState: { ...execution.snapshot(), ledger }, updatedAt: deps.clock.now() },
       }));
     };
-    let contextReady = false;
-    try {
-      execution = initial.run.executionState
-        ? createExecutionContext({
-            snapshot: initial.run.executionState,
-            policy: options.policy,
-            budget: options.budget,
-            persist,
-            admission: options.admission,
-          })
-        : createExecutionContext({
-            scopeId: id,
-            policy: options.policy,
-            budget: options.budget,
-            persist,
-            admission: options.admission,
-          });
-      contextReady = true;
-      // Policy/scope state is durable before the first dispatch or reservation.
-      await mutate(() => ({ run: { executionState: execution.snapshot() } }));
-    } catch (error) {
-      owned.delete(id);
-      await unclaim(lease);
-      // Saved execution state this process cannot restore is the run's own failure.
-      throw contextReady ? error : tagFailure(error, 'run');
-    }
 
     const cancel = async () => {
       if (!owned.has(id)) return;
@@ -378,15 +352,68 @@ export function createSwarm(options: SwarmOptions): Swarm {
           Math.max(1, Math.floor(leaseTtl / 3)),
         );
     };
-    beat();
+    /**
+     * Give back everything this executor took on: the heartbeat, the abort
+     * listener, the lease and the run's in-process ownership. Shared by a
+     * start that fails and by the end of drive() (2.3).
+     */
+    const teardown = async (): Promise<void> => {
+      stopped = true;
+      stopBeat?.();
+      signal?.removeEventListener('abort', abort);
+      // A delivered cancel that no commit made durable, including one a
+      // renewal still in flight brings, goes back in the queue while this
+      // executor holds the lease (2.2), unless the run settled past it.
+      await renewals;
+      await cancelling;
+      if (
+        delivered &&
+        !snapshot.run.cancelRequested &&
+        snapshot.run.status !== 'completed' &&
+        snapshot.run.status !== 'partial'
+      )
+        await restore(key, ['cancel']);
+      // A stale token is ignored, so this is safe after a takeover too.
+      await unclaim(held);
+      owned.delete(id);
+      active.delete(id);
+    };
+    // Every step after the ownership check shares one cleanup (2.3): a failed
+    // commit here must not leave the run owned, leased and heartbeating.
+    let contextReady = false;
+    try {
+      execution = initial.run.executionState
+        ? createExecutionContext({
+            snapshot: initial.run.executionState,
+            policy: options.policy,
+            budget: options.budget,
+            persist,
+            admission: options.admission,
+          })
+        : createExecutionContext({
+            scopeId: id,
+            policy: options.policy,
+            budget: options.budget,
+            persist,
+            admission: options.admission,
+          });
+      contextReady = true;
+      // Policy/scope state is durable before the first dispatch or reservation.
+      await mutate(() => ({ run: { executionState: execution.snapshot() } }));
+      beat();
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted || snapshot.run.cancelRequested) await cancel();
+    } catch (error) {
+      await teardown();
+      // Saved execution state this process cannot restore is the run's own failure.
+      throw contextReady ? error : tagFailure(error, 'run');
+    }
     // Every task runs under the same child scope ID its execution context uses.
     const compactTask = async (taskId: string): Promise<void> => {
       await execution.ledger.compact(
         childScopeId(execution.scopeId, JSON.stringify([key.scope, key.runId, taskId])),
       );
     };
-    signal?.addEventListener('abort', abort, { once: true });
-    if (signal?.aborted || snapshot.run.cancelRequested) await cancel();
 
     // A v2 run's persisted limits, tightened by this process's options (2.2).
     const limits = initial.run.dynamic ? tightenLimits(initial.run.dynamic, dynamic) : undefined;
@@ -798,25 +825,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
           await renewLease();
         throw lost ?? error;
       } finally {
-        stopped = true;
-        stopBeat?.();
-        signal?.removeEventListener('abort', abort);
-        // A delivered cancel that no commit made durable, including one a
-        // renewal still in flight brings, goes back in the queue while this
-        // executor holds the lease (2.2), unless the run settled past it.
-        await renewals;
-        await cancelling;
-        if (
-          delivered &&
-          !snapshot.run.cancelRequested &&
-          snapshot.run.status !== 'completed' &&
-          snapshot.run.status !== 'partial'
-        )
-          await restore(key, ['cancel']);
-        // A stale token is ignored, so this is safe after a takeover too.
-        await unclaim(held);
-        owned.delete(id);
-        active.delete(id);
+        await teardown();
       }
     }
     const result = drive();
