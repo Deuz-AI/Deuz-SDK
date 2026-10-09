@@ -455,12 +455,30 @@ describe.each([
   });
 });
 
-describe('createFileWorkspace — delete() never reports success for a path it left in place', () => {
+describe('createFileWorkspace — exists() and delete() do not hide a filesystem failure', () => {
   it('deleting a directory rejects and leaves the directory alone', async () => {
     // EISDIR on Linux, EPERM on Windows and macOS. It used to resolve.
     await ws.write('dir/a.txt', 'x');
     await expect(ws.delete('dir')).rejects.toThrow();
     expect(await ws.read('dir/a.txt')).toBe('x');
+  });
+
+  it('exists() surfaces an I/O error (a link that points at itself) instead of answering false', async () => {
+    // ELOOP for stat and read alike: only a missing path is "false".
+    const loop = join(root, 'loop');
+    let made = false;
+    for (const kind of linkKinds) {
+      try {
+        await symlink(loop, loop, kind);
+        made = true;
+        break;
+      } catch {
+        /* EPERM without Developer Mode / admin — try the next kind */
+      }
+    }
+    if (!made) throw new Error('SKIPPED: this platform refuses to create a link unprivileged.');
+    await expect(ws.read('loop')).rejects.toMatchObject({ code: 'ELOOP' });
+    await expect(ws.exists('loop')).rejects.toMatchObject({ code: 'ELOOP' });
   });
 
   it('a path below a FILE is just missing (ENOTDIR is not an error)', async () => {
