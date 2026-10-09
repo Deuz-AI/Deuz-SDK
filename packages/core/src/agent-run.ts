@@ -35,7 +35,11 @@ import {
   validateAgentValue,
 } from './inference/agent-output';
 import { prepareAgentTools } from './inference/agent-tools';
-import { createExecutionContext, intersectExecutionPolicies } from './execution-policy';
+import {
+  assertExecutionPolicy,
+  createExecutionContext,
+  intersectExecutionPolicies,
+} from './execution-policy';
 import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
@@ -531,11 +535,25 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         },
       };
 
-      const checkLimit = async (): Promise<boolean> => {
+      // Cancellation and the execution deadline (2.3, F05). Checked before every
+      // model call AND at every point where async caller code (validation,
+      // guardrails, the verifier) may have outlived the run, right before the
+      // terminal commit. An elapsed deadline fails the run, exactly as it fails
+      // model and tool dispatch; an abort stops it.
+      const checkCancellation = async (): Promise<boolean> => {
         if (options.signal?.aborted) {
           await stopped('aborted');
           return false;
         }
+        if (common.execution)
+          assertExecutionPolicy(common.execution, {
+            now: resolveDependencies(options.deps).clock.now(),
+          });
+        return true;
+      };
+
+      const checkLimit = async (): Promise<boolean> => {
+        if (!(await checkCancellation())) return false;
         if (envelope.modelSteps >= maxSteps) {
           await stopped('max-steps');
           return false;
@@ -831,6 +849,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           accepted = options.output
             ? await validateAgentValue(options.output, JSON.parse(currentText))
             : (currentText as T);
+        // Validation and guardrails are async caller code: a run cancelled while
+        // they ran must not reach the verifier or the terminal commit.
+        if (!(await checkCancellation())) return;
         if (options.verify) {
           if (envelope.verificationAttempts >= maxVerifyAttempts) {
             await stopped('verification-attempts-exhausted');
@@ -850,6 +871,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               signal: options.signal,
             });
           } catch {
+            // A verifier that threw because the run was cancelled reports the
+            // cancellation, not an inconclusive verdict.
+            if (!(await checkCancellation())) return;
             envelope.verification = 'inconclusive';
             await stopped('verification-inconclusive');
             return;
@@ -857,6 +881,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           if (!verdict || !['verified', 'rejected', 'inconclusive'].includes(verdict.status))
             throw new TypeError('Verifier must return verified, rejected, or inconclusive.');
           envelope.verification = verdict.status;
+          // The verdict is recorded, but a cancellation or deadline that arrived
+          // while the verifier ran outranks it: nothing is committed as completed.
+          if (!(await checkCancellation())) return;
           if (verdict.status === 'inconclusive') {
             await stopped('verification-inconclusive');
             return;
