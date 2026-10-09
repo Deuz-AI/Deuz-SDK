@@ -96,7 +96,10 @@ describe('registry (unknown slug never throws)', () => {
   });
 
   it('falls back to conservative caps for an unknown slug', () => {
-    const caps = getCapabilities(anthropic('claude-opus-9-9'));
+    // 2.3: an unknown claude-{fable,opus,sonnet,haiku}-N (N >= 5) such as
+    // 'claude-opus-9-9' now takes the Claude 5.x family rules instead (pinned
+    // in registry.test.ts), so the conservative row is shown on a non-family id.
+    const caps = getCapabilities(anthropic('claude-unreleased-9'));
     expect(caps.known).toBe(false);
     expect(caps.tools).toBe(false);
     expect(caps.maxOutput).toBe(4_096);

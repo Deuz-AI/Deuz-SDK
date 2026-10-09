@@ -69,6 +69,131 @@ describe('registry: 2026-07 Anthropic catalog', () => {
   });
 });
 
+// ===================================================================
+// 2.3 (F14) — Claude 5.x rows. Verified against Anthropic's API reference
+// (cached 2026-10-06), NOT live-verified: these pin what the SDK sends.
+// ===================================================================
+
+describe('registry: Claude 5.x (2.3, F14)', () => {
+  const CLAUDE_5 = ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
+
+  it('the four current ids are known rows with the Claude 5.x request rules', () => {
+    for (const id of CLAUDE_5) {
+      const caps = getCapabilities(anthropic(id));
+      expect(caps.known, id).toBe(true);
+      expect(caps, id).toMatchObject({
+        effortWire: 'output_config',
+        samplingRestrictions: true,
+        structuredOutput: true,
+        caching: true,
+        vision: true,
+        reasoning: true,
+        contextWindow: 1_000_000,
+        maxOutput: 128_000,
+      });
+      expect(caps.effortLevels, id).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    }
+  });
+
+  it('forced tool_choice: rejected by Fable 5.1 / Opus 5.5 / Sonnet 5.5, accepted by Haiku 5.5', () => {
+    for (const id of ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5']) {
+      expect(getCapabilities(anthropic(id)).forcedToolChoice, id).toBe(false);
+    }
+    expect(getCapabilities(anthropic('claude-haiku-5-5')).forcedToolChoice).toBe(true);
+  });
+
+  it("effort 'none' maps per model; documented defaults are recorded", () => {
+    expect(getCapabilities(anthropic('claude-fable-5-1')).effortNone).toBe('lowest');
+    expect(getCapabilities(anthropic('claude-opus-5-5'))).toMatchObject({
+      effortNone: 'lowest',
+      effortDefault: 'medium',
+    });
+    expect(getCapabilities(anthropic('claude-sonnet-5-5'))).toMatchObject({
+      effortNone: 'thinking-between-tools',
+      effortDefault: 'high',
+    });
+    expect(getCapabilities(anthropic('claude-haiku-5-5'))).toMatchObject({
+      effortNone: 'thinking-disabled',
+      effortDefault: 'medium',
+    });
+  });
+
+  it('claude-opus-5 is now a known row (thinking can be disabled at effort <= high)', () => {
+    const caps = getCapabilities(anthropic('claude-opus-5'));
+    expect(caps.known).toBe(true);
+    expect(caps).toMatchObject({
+      effortWire: 'output_config',
+      samplingRestrictions: true,
+      contextWindow: 1_000_000,
+      maxOutput: 128_000,
+      effortNone: 'thinking-disabled',
+    });
+  });
+
+  it('family fallback: an unknown claude-{fable,opus,sonnet,haiku}-N (N >= 5) gets the 5.x rules', () => {
+    const logger: Logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    for (const id of [
+      'claude-opus-9-9',
+      'claude-sonnet-6',
+      'claude-haiku-5-7',
+      'claude-fable-5-2',
+    ]) {
+      const caps = getCapabilities(anthropic(id), logger);
+      expect(caps.known, id).toBe(false); // still a fallback — the unknown-model warning fires
+      expect(caps, id).toMatchObject({
+        effortWire: 'output_config',
+        samplingRestrictions: true,
+        structuredOutput: true,
+        caching: true,
+        reasoning: true,
+        forcedToolChoice: false,
+        effortNone: 'lowest',
+        contextWindow: 1_000_000,
+        maxOutput: 128_000,
+      });
+    }
+    expect(logger.warn).toHaveBeenCalledTimes(4);
+    expect(String((logger.warn as ReturnType<typeof vi.fn>).mock.calls[0]![0])).toContain(
+      'Claude 5.x',
+    );
+  });
+
+  it('the family fallback stays narrow: 4.x, other names and other wires keep the old fallback', () => {
+    expect(getCapabilities(anthropic('claude-opus-4-9')).effortWire).toBe('budget_tokens');
+    expect(getCapabilities(anthropic('claude-zeta-9-9')).effortWire).toBe('budget_tokens');
+    expect(getCapabilities(anthropic('claude-opus-5x')).effortWire).toBe('budget_tokens');
+    // The 5.x rules are Messages-wire rules: a chat_completions proxy keeps its own fallback.
+    const viaProxy = getCapabilities({
+      provider: 'openrouter',
+      modelId: 'claude-opus-9-9',
+      surface: 'chat_completions',
+    });
+    expect(viaProxy.samplingRestrictions).toBe(false);
+  });
+
+  it('the capabilities override cannot re-enable budget_tokens or sampling for the 5.x family', () => {
+    for (const id of ['claude-opus-5-5', 'claude-opus-9-9']) {
+      const caps = getCapabilities(anthropic(id), undefined, {
+        reasoning: true,
+        effortWire: 'budget_tokens',
+        samplingRestrictions: false,
+      });
+      expect(caps.effortWire, id).toBe('output_config');
+      expect(caps.samplingRestrictions, id).toBe(true);
+      expect(caps.reasoning, id).toBe(true);
+    }
+    // A plain `{ reasoning: true }` (the documented cure) keeps the 5.x wire too.
+    expect(
+      getCapabilities(anthropic('claude-opus-9-9'), undefined, { reasoning: true }).effortWire,
+    ).toBe('output_config');
+    // Older families are untouched: an override is still a claim the SDK does not check.
+    expect(
+      getCapabilities(anthropic('claude-opus-4-6'), undefined, { samplingRestrictions: true })
+        .samplingRestrictions,
+    ).toBe(true);
+  });
+});
+
 describe('registry: 2026-07 OpenAI catalog', () => {
   it('gpt-5.5 exposes reasoning (effort ships on both OpenAI wires)', () => {
     const caps = getCapabilities({

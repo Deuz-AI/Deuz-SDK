@@ -8,6 +8,26 @@ import type { Logger } from '../types/deps';
 import type { WarningSink } from '../internal/warnings';
 import { readConfig } from '../internal/config-symbol';
 
+/** A canonical effort level other than `'none'`, in ascending order of depth (2.3). */
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/**
+ * How a model honours `effort: 'none'` (2.3):
+ *  - `'send'` — the wire has a real `'none'` value (OpenAI);
+ *  - `'thinking-disabled'` / `'thinking-between-tools'` — Anthropic turns
+ *    thinking off with `thinking: { type: 'disabled' | 'between_tools' }`;
+ *  - `'lowest'` — reasoning cannot be turned off, so the lowest accepted level
+ *    is sent with a `clamped-setting` warning;
+ *  - `'omit'` — reasoning cannot be turned off and no level is documented, so
+ *    nothing is sent and an `unsupported-setting` warning says so.
+ */
+export type EffortNoneMapping =
+  | 'send'
+  | 'thinking-disabled'
+  | 'thinking-between-tools'
+  | 'lowest'
+  | 'omit';
+
 /**
  * Single source of truth for per-model behavior. Everything capability-aware
  * (which params to send, structured-output strategy, quirk handling, default
@@ -28,6 +48,16 @@ export interface ModelCapabilities {
   nativePdf: boolean;
   audio: boolean;
   contextWindow: number;
+  /**
+   * Output ceiling, sent as the wire's output cap when the caller gives no
+   * `maxOutputTokens`. When the row does not know the model's limit (an unknown
+   * slug, or a 2.3 row whose limit is undocumented) this is only a conservative
+   * PLACEHOLDER (2.3): wires where the cap is optional (OpenAI Chat Completions
+   * and Responses, Gemini native) omit it instead of truncating there, and the
+   * Anthropic wire — where `max_tokens` is required — sends it; the
+   * `unknown-model` warning names that default. A `capabilities: { maxOutput }`
+   * override (or `maxOutputTokens` per call) replaces the placeholder.
+   */
   maxOutput: number;
   /** Provider returns usage on EVERY chunk → take the LAST (Gemini-compat). */
   usagePerChunk: boolean;
@@ -39,6 +69,34 @@ export interface ModelCapabilities {
    *  (pre-4.7) vs `output_config.effort` (Opus 4.7+, Sonnet 5, Fable 5 —
    *  budget_tokens returns 400 there). Non-Anthropic wires ignore this. */
   effortWire: 'budget_tokens' | 'output_config';
+  /**
+   * A FORCED `toolChoice` (`'required'` or a named tool) is accepted (2.3).
+   * `false` → the wire sends auto instead, with a `clamped-setting` warning, and
+   * structured output never takes the forced-tool strategy. Absent → not known
+   * to be rejected (the wire's own rules apply, e.g. Anthropic's "no forced tool
+   * while extended thinking is on").
+   */
+  forcedToolChoice?: boolean;
+  /**
+   * Effort levels the model accepts on the wire, ascending (2.3). A requested
+   * level the model lacks is clamped DOWN to the nearest accepted one (or up to
+   * the lowest) with a `clamped-setting` warning. An EMPTY list means the model
+   * exposes no effort control: effort is dropped with an `unsupported-setting`
+   * warning. Absent → the wire's historical mapping. `'none'` is never listed —
+   * see {@link ModelCapabilities.effortNone}.
+   */
+  effortLevels?: readonly EffortLevel[];
+  /** The provider's documented default effort when none is sent (2.3, informational). */
+  effortDefault?: EffortLevel;
+  /** How `effort: 'none'` is honoured (2.3). Absent → the wire's historical behaviour. */
+  effortNone?: EffortNoneMapping;
+  /**
+   * The only wires on which this model accepts tool calling (2.3). Absent → any.
+   * A tool request on another wire fails fast with an `InvalidRequestError`
+   * instead of an opaque provider 400 (e.g. `gpt-6.1-sol` takes tools only on
+   * the Responses API).
+   */
+  toolSurfaces?: readonly ModelSurface[];
   /** False when this row is a fallback for an unknown slug. */
   known: boolean;
 }
@@ -66,19 +124,48 @@ function row(provider: string, surface: ModelSurface, over: Partial<Row>): Row {
   };
 }
 
-// 2026-current slugs (pinned; adjust at launch). See plan's wire reference.
-const REGISTRY: Record<string, Row> = {
-  // --- Anthropic (surface 'anthropic') ---
-  'claude-fable-5': row('anthropic', 'anthropic', {
-    vision: true,
-    reasoning: true,
-    caching: true,
-    contextWindow: 1_000_000,
-    maxOutput: 128_000,
-    effortWire: 'output_config',
-    samplingRestrictions: true, // temperature/top_p/top_k non-default → 400
-  }),
-  'claude-sonnet-5': row('anthropic', 'anthropic', {
+/** The conservative output placeholder for a limit the registry does not know. */
+const PLACEHOLDER_MAX_OUTPUT = 4_096;
+
+/**
+ * Rows whose `maxOutput` is a PLACEHOLDER rather than the model's documented
+ * limit (2.3): every fallback row, plus pinned rows whose limit is undocumented.
+ * Identity sets — `finalize` tags the frozen copy it hands out, so the wire can
+ * tell a placeholder from a real limit without a public flag.
+ */
+const PLACEHOLDER_ROWS = new WeakSet<Row>();
+const PLACEHOLDER_CAPS = new WeakSet<ModelCapabilities>();
+
+/**
+ * True when `caps.maxOutput` is only a placeholder (2.3): no registry row knows
+ * the limit and neither override layer set one. Wires where the output cap is
+ * optional omit it in that case; Anthropic, where it is required, sends it.
+ */
+export function isMaxOutputPlaceholder(caps: ModelCapabilities): boolean {
+  return PLACEHOLDER_CAPS.has(caps);
+}
+
+/**
+ * Provider placeholder for a row describing an OPEN-WEIGHT model that any host
+ * may serve (2.3): `finalize` reports the caller's own provider instead.
+ */
+const ANY_HOST = '*';
+
+const CLAUDE_5_EFFORT: readonly EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+/**
+ * Claude 5.x request rules (2.3, F14). Verified against Anthropic's API
+ * reference (cached 2026-10-06), NOT live-verified:
+ *  - effort rides `output_config.effort` (low…max); `thinking.budget_tokens`
+ *    returns 400;
+ *  - no sampling parameters: Fable 5.1 / Opus 5.5 reject every value, Sonnet
+ *    5.5 / Haiku 5.5 accept only the defaults (Haiku: temperature 1 or top_p
+ *    0.99, never both) — so all of them are stripped, and reported;
+ *  - structured output via `output_config.format`, prompt caching, vision;
+ *  - 1M context / 128K output.
+ */
+function claude5(over: Partial<Row>): Row {
+  return row('anthropic', 'anthropic', {
     vision: true,
     reasoning: true,
     caching: true,
@@ -86,7 +173,56 @@ const REGISTRY: Record<string, Row> = {
     maxOutput: 128_000,
     effortWire: 'output_config',
     samplingRestrictions: true,
+    effortLevels: CLAUDE_5_EFFORT,
+    ...over,
+  });
+}
+
+/**
+ * `claude-{fable,opus,sonnet,haiku}-N…` with N ≥ 5 (2.3, F14). On the
+ * Anthropic wire an id in this family that has no row of its own still gets
+ * the Claude 5.x request rules — never `budget_tokens`, never sampling
+ * parameters, never a forced tool_choice — instead of the generic fallback,
+ * whose `budget_tokens` wire and raw temperature 400 on every current Claude.
+ */
+export function isClaude5Family(modelId: string): boolean {
+  const match = /^claude-(?:fable|opus|sonnet|haiku)-(\d+)(?=$|[-.@:_])/.exec(modelId);
+  return match !== null && Number(match[1]) >= 5;
+}
+
+/** The family fallback: the strictest documented 5.x rules, since the id is unknown. */
+function claude5FamilyRow(): Row {
+  return claude5({ forcedToolChoice: false, effortNone: 'lowest' });
+}
+
+// 2026-current slugs (pinned; adjust at launch). See plan's wire reference.
+const REGISTRY: Record<string, Row> = {
+  // --- Anthropic (surface 'anthropic') ---
+  // 2.3 (F14) — the current Claude 5.x ids (see `claude5` for the shared rules).
+  // A forced tool_choice 400s on Fable 5.1 / Opus 5.5 / Sonnet 5.5; Haiku 5.5
+  // accepts it but skips thinking. `effort: 'none'`: Fable 5.1 and Opus 5.5
+  // cannot turn thinking off (→ low); Sonnet 5.5 → `between_tools`, Haiku 5.5
+  // → `disabled`, both only at effort ≤ high, which their defaults satisfy.
+  'claude-fable-5-1': claude5({ forcedToolChoice: false, effortNone: 'lowest' }),
+  'claude-opus-5-5': claude5({
+    forcedToolChoice: false,
+    effortNone: 'lowest',
+    effortDefault: 'medium',
   }),
+  'claude-sonnet-5-5': claude5({
+    forcedToolChoice: false,
+    effortNone: 'thinking-between-tools',
+    effortDefault: 'high',
+  }),
+  'claude-haiku-5-5': claude5({
+    forcedToolChoice: true,
+    effortNone: 'thinking-disabled',
+    effortDefault: 'medium',
+  }),
+  // The previous Opus: thinking can be disabled, at effort ≤ high only.
+  'claude-opus-5': claude5({ effortNone: 'thinking-disabled' }),
+  'claude-fable-5': claude5({}), // temperature/top_p/top_k non-default → 400
+  'claude-sonnet-5': claude5({}),
   'claude-opus-4-8': row('anthropic', 'anthropic', {
     vision: true,
     reasoning: true,
@@ -432,28 +568,78 @@ const NATIVE_REGISTRY: Record<string, Row> = {
 /** Conservative fallback for an unknown slug — risky flags default OFF. */
 function defaultRow(provider: string, surface: ModelSurface): Row {
   const isGeminiCompat = provider === 'google' && surface === 'chat_completions';
-  return row(provider, surface, {
+  const fallback = row(provider, surface, {
     tools: false,
     reasoning: false,
     structuredOutput: false,
     contextWindow: 128_000,
-    maxOutput: 4_096, // conservative — feeds Anthropic max_tokens; too-high would 400/truncate
+    // A placeholder (2.3): omitted where the wire allows; Anthropic's required
+    // max_tokens still gets it (named in the unknown-model warning) — too high
+    // would 400, so keep it low.
+    maxOutput: PLACEHOLDER_MAX_OUTPUT,
     usagePerChunk: isGeminiCompat,
     toolIndexAllZero: isGeminiCompat,
   });
+  PLACEHOLDER_ROWS.add(fallback);
+  return fallback;
 }
 
 /** Native-Gemini fallback for an unknown `surface:'native'` slug (full caps ON). */
 function defaultNativeRow(): Row {
-  return row('google', 'native', {
+  const fallback = row('google', 'native', {
     vision: true,
     reasoning: true,
     caching: true,
     nativePdf: true,
     audio: true,
     contextWindow: 1_000_000,
-    maxOutput: 64_000,
+    maxOutput: 64_000, // placeholder (2.3): the native wire omits it
   });
+  PLACEHOLDER_ROWS.add(fallback);
+  return fallback;
+}
+
+/** How a descriptor's slug was answered (2.3; also read by the model profile). */
+export type RegistryMatch = 'exact' | 'family' | 'fallback';
+
+/** The table entry for a descriptor — pure, no logging. */
+function lookup(model: LanguageModel): { row: Row; match: RegistryMatch } {
+  // Native surface is keyed in its own table so a slug can serve both wires.
+  if (model.surface === 'native') {
+    const nrow = NATIVE_REGISTRY[model.modelId];
+    return nrow ? { row: nrow, match: 'exact' } : { row: defaultNativeRow(), match: 'fallback' };
+  }
+  const known = REGISTRY[model.modelId];
+  if (known) return { row: known, match: 'exact' };
+  if (model.surface === 'anthropic' && isClaude5Family(model.modelId)) {
+    return { row: claude5FamilyRow(), match: 'family' };
+  }
+  return { row: defaultRow(model.provider, model.surface), match: 'fallback' };
+}
+
+/** Which kind of registry entry answers for `model` (2.3). Pure: never warns. */
+export function registryMatch(model: LanguageModel): RegistryMatch {
+  return lookup(model).match;
+}
+
+/**
+ * What the unknown-model warning says about the output cap (2.3). Anthropic's
+ * `max_tokens` is required, so an unknown model gets the placeholder — the
+ * documented default lives in the warning itself, with both ways to set a real
+ * value. Silent when an override already supplied the limit.
+ */
+function outputCapNote(
+  model: LanguageModel,
+  resolved: Row,
+  overrides: Partial<ModelCapabilities> | undefined,
+): string {
+  if (!PLACEHOLDER_ROWS.has(resolved) || model.surface !== 'anthropic') return '';
+  if (overrides?.maxOutput !== undefined) return '';
+  if (readConfig(model)?.capabilities?.maxOutput !== undefined) return '';
+  return (
+    ` (max_tokens ${resolved.maxOutput}, which the Anthropic wire requires — pass ` +
+    'maxOutputTokens or capabilities: { maxOutput } for longer answers)'
+  );
 }
 
 /**
@@ -476,18 +662,70 @@ function defaultNativeRow(): Row {
  * The result is a FROZEN COPY. Returning the live `REGISTRY` row would let one
  * caller mutate a module-level singleton and poison every later call in the
  * process.
+ *
+ * One exception to "nothing is validated" (2.3, F14): on the Anthropic wire a
+ * Claude 5.x id keeps effort on `output_config` and sampling stripped whatever
+ * an override claims, because both are documented 400s for the whole family —
+ * see {@link enforceClaude5}.
  */
 function finalize(
   row: Row,
   known: boolean,
   model: LanguageModel,
   overrides?: Partial<ModelCapabilities>,
+  logger?: Logger,
+  warnings?: WarningSink,
 ): ModelCapabilities {
   const caps: ModelCapabilities = { ...row, known };
+  // An open-weight row answers for whichever host serves it.
+  if (row.provider === ANY_HOST) caps.provider = model.provider;
   // Factory blob first, explicit argument last — per-call always outranks factory.
-  apply(caps, readConfig(model)?.capabilities);
+  const factory = readConfig(model)?.capabilities;
+  apply(caps, factory);
   apply(caps, overrides);
-  return Object.freeze(caps);
+  if (model.surface === 'anthropic' && isClaude5Family(model.modelId)) {
+    enforceClaude5(caps, model, logger, warnings);
+  }
+  const frozen = Object.freeze(caps);
+  if (
+    PLACEHOLDER_ROWS.has(row) &&
+    factory?.maxOutput === undefined &&
+    overrides?.maxOutput === undefined
+  ) {
+    PLACEHOLDER_CAPS.add(frozen);
+  }
+  return frozen;
+}
+
+/**
+ * The two Claude 5.x rules no override may break (2.3, F14): effort stays on
+ * `output_config` (`thinking.budget_tokens` is a 400) and sampling parameters
+ * stay stripped (any non-default value is a 400). Verified against Anthropic's
+ * API reference (cached 2026-10-06), not live-verified. A contrary override is
+ * overruled and reported — once in the log, once as a typed warning.
+ */
+function enforceClaude5(
+  caps: ModelCapabilities,
+  model: LanguageModel,
+  logger: Logger | undefined,
+  warnings: WarningSink | undefined,
+): void {
+  if (caps.effortWire === 'output_config' && caps.samplingRestrictions) return;
+  caps.effortWire = 'output_config';
+  caps.samplingRestrictions = true;
+  const message =
+    `The capabilities override for '${model.modelId}' was overruled: Claude 5.x models reject ` +
+    'thinking.budget_tokens and sampling parameters, so effort stays on output_config and ' +
+    'temperature/topP stay stripped.';
+  logger?.warn(message, {
+    provider: model.provider,
+    modelId: model.modelId,
+    surface: model.surface,
+  });
+  warnings?.add(
+    { type: 'unsupported-setting', setting: 'capabilities', message },
+    { mirror: false },
+  );
 }
 
 /** Shallow-assign the DEFINED keys of one override layer. No validation, ever. */
@@ -525,24 +763,15 @@ export function getCapabilities(
   overrides?: Partial<ModelCapabilities>,
   warnings?: WarningSink,
 ): ModelCapabilities {
-  // Native surface is keyed in its own table so a slug can serve both wires.
-  if (model.surface === 'native') {
-    const nrow = NATIVE_REGISTRY[model.modelId];
-    if (nrow) return finalize(nrow, true, model, overrides);
-    const message = `Unknown native model '${model.modelId}' — using Gemini-native defaults.`;
-    logger?.warn(message, {
-      provider: model.provider,
-      modelId: model.modelId,
-      surface: model.surface,
-    });
-    // Already logged by the line above — record only (see WarningSink.add).
-    warnings?.add({ type: 'unknown-model', message }, { mirror: false });
-    return finalize(defaultNativeRow(), false, model, overrides);
-  }
-
-  const known = REGISTRY[model.modelId];
-  if (known) return finalize(known, true, model, overrides);
-  const message = `Unknown model '${model.modelId}' — using conservative ${model.provider}/${model.surface} defaults.`;
+  const { row: resolved, match } = lookup(model);
+  if (match === 'exact') return finalize(resolved, true, model, overrides, logger, warnings);
+  const base =
+    model.surface === 'native'
+      ? `Unknown native model '${model.modelId}' — using Gemini-native defaults`
+      : match === 'family'
+        ? `Unknown model '${model.modelId}' — using the Claude 5.x family rules for ${model.provider}/${model.surface}`
+        : `Unknown model '${model.modelId}' — using conservative ${model.provider}/${model.surface} defaults`;
+  const message = `${base}${outputCapNote(model, resolved, overrides)}.`;
   logger?.warn(message, {
     provider: model.provider,
     modelId: model.modelId,
@@ -550,7 +779,7 @@ export function getCapabilities(
   });
   // Already logged by the line above — record only (see WarningSink.add).
   warnings?.add({ type: 'unknown-model', message }, { mirror: false });
-  return finalize(defaultRow(model.provider, model.surface), false, model, overrides);
+  return finalize(resolved, false, model, overrides, logger, warnings);
 }
 
 /**
