@@ -5,6 +5,10 @@ description: useChat and useObject from @deuz-sdk/react — ordered part renderi
 
 > **Import from `@deuz-sdk/react`.** The frozen `@deuz-sdk/core/react` subpath still works, but every feature since 1.7 lands in the package. The hooks bind the pure chat engine at [`@deuz-sdk/core/chat`](/docs/modules/chat-persistence) to React state; no business logic lives in them.
 
+<Callout type="warn" title="The 2.3 settlement fixes are not in `@deuz-sdk/core/react`">
+The frozen hook is unchanged, so it still has the bugs 2.3 fixed in `@deuz-sdk/react`. A verdict sent when nothing is pending still POSTs a new round and adds an empty assistant bubble, and a double click sends the continuation twice. It also drops the approval's signed `token`, so it cannot approve calls made with an `approvalSigner`. It has no `reconnect()`, and with no `onToolCall` it drops client tool calls instead of parking them. Migrate to `@deuz-sdk/react` for [verdict matching](#verdicts-answer-the-open-gate) and [resumed client tools](#client-tools-after-a-reconnect).
+</Callout>
+
 **React is an optional peer** (`^18 || ^19`) — install it yourself; nothing else in the SDK depends on it. The hooks are plain TypeScript (no JSX) and SSR-safe: network runs only inside user-triggered callbacks, never at render time.
 
 ```bash
@@ -242,6 +246,19 @@ When the server streams a `tool-call` it did not execute (a client tool — a **
 
 Parking is new in 1.9. Before it, a turn producing client tool calls with no executor abandoned the round-trip and left a `tool_use` with no `tool_result`.
 
+### Client tools after a reconnect
+
+Since 2.3, a turn read back through `reconnect()` or `resume.auto` settles exactly like one read from the POST. Its unresolved client calls reach `onToolCall`, and the hook then re-POSTs, or they park in `pendingToolCalls`. Before 2.3 the resume path only restored approvals. Such a call reached neither, and the transcript kept a `tool_use` nobody would answer.
+
+A replay can re-deliver calls this client already handled. The endpoint replays everything after the hook's cursor, and a journal that spans several legs holds the earlier legs too. So the hook dispatches a replayed call **at most once per mounted hook**:
+
+- **A call whose result is in the replay** ran on the server. It never reaches the client.
+- **A call the canonical history already answers** is not dispatched again. That means a `tool_use` followed by its `tool_result` in the current exchange; key order inside the input does not matter.
+- **A call that is parked, or whose `onToolCall` is still running,** is not dispatched a second time.
+- **A `stop()` during the read settles nothing.** A call the read had already delivered does not run, and the next `reconnect()` continues the same turn from the cursor.
+
+That evidence is the canonical history. It survives a reload only if you persist `history.canonical` and restore it through `initialMessages`. A call whose result was not saved before the page went away is dispatched again after the reload, because the hook cannot know it ran. So this is at-most-once within a mounted hook, not exactly-once across reloads. Make such tools idempotent, or omit `onToolCall` and confirm parked calls yourself. A tab that only watches a stream another tab drives should omit `onToolCall` too, or it runs that tab's calls.
+
 <Callout type="warn" title="A client-tool route needs `rejectToolResults: false`">
 The round-trip POSTs a `role: 'tool'` message, which [`validateChatRequest`](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false) rejects by default. Pass `{ rejectToolResults: false }` — and read what that accepts.
 </Callout>
@@ -261,6 +278,20 @@ A `tool-approval-request` part **pauses** the chat: the request lands in `pendin
   />
 ))}
 ```
+
+### Verdicts answer the open gate
+
+A verdict counts only if it answers an approval in `pendingApprovals`, the gate the chat is paused on. It must name that approval's `approvalId`. If it carries a `token`, it must be that request's token: a token is minted per run and per call, so a different one means the verdict was issued for another run. **Anything else is a no-op** since 2.3. Nothing is sent, no state changes, and the promise resolves. That is the same contract as `addToolResult`.
+
+| Verdict | Before 2.3 | Since 2.3 |
+| --- | --- | --- |
+| Nothing is pending | A new POST and an empty assistant bubble | No-op |
+| A repeat of one already sent (a double click) | The continuation is sent twice | No-op |
+| Left over from an earlier turn or a replaced transcript | A new POST, or sent along with the next gate's verdicts | No-op |
+| An `approvalId` the gate does not hold | Sent along with the gate's verdicts | No-op |
+| Another run's `token` for a pending `approvalId` | Accepted, and sent with the wrong token | No-op |
+
+Until the last verdict arrives you can change your mind: answering an approval again replaces its verdict. Once every pending approval has one, the hook sends `approvalResponses` **once** and closes the gate. A repeated `tool-approval-request` frame is one entry in `pendingApprovals`, not two. Denials, reasons and tokens are sent exactly as before.
 
 A refused call carries `denied` on the `UIToolCall`, so it stops rendering as "getWeather failed":
 
@@ -310,6 +341,8 @@ useChat({
 - **A failing automatic attempt is silent**: no `error`, no `status: 'error'`, no `onError`. The user did not ask for it, and every cold load of an app whose resume endpoint answers 404 would otherwise paint a permanent error. `reconnect()` called by hand keeps 1.8's exact error semantics.
 - **A caught-up endpoint is a no-op.** A resume that folds zero parts (an immediate `[DONE]`) changes nothing at all; 1.8 pre-pushed the assistant bubble before reading and left a permanently empty one on screen.
 - **`cursor` is an injectable adapter** — no `localStorage` is hardcoded (that would break SSR and React Native), and a throwing adapter cannot kill a live stream.
+- **A resumed turn settles like a streamed one** (2.3). Its approvals pause the chat, and its client calls reach `onToolCall` or `pendingToolCalls`; see [Client tools after a reconnect](#client-tools-after-a-reconnect). Under `auto` the read stays silent, but a POST it triggers (an `onToolCall` result continuing the chat) reports a failure like any other request.
+- **The cursor advances only on resume reads.** The POST response is read without its `id:` lines, so the cursor records how far the *resume* reads got. A reconnect after a dropped POST stream therefore rebuilds the turn from the cursor; folding the replay into the partial turn would apply the parts it already showed twice. Call `reconnect()` for a turn that is actually in flight. With nothing in flight it appends again whatever the endpoint still replays after the cursor. The replay guard protects side effects, not the transcript.
 
 ## Truncated turns
 
