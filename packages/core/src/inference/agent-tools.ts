@@ -4,12 +4,14 @@ import type {
   AgentValidation,
   AgentToolReceipt,
 } from '../types/agent-run';
-import type { ToolSet, ToolExecuteContext } from '../types/tool';
+import type { Tool, ToolSet, ToolExecuteContext } from '../types/tool';
 import { assertAgentValidation, validateAgentValue } from './agent-output';
 import { toJSONSchema } from '../schema/bridge';
 import { assertExecutionPolicy } from '../execution-policy';
 import { SubAgentSuspension } from './loop-shared';
 import { isAgentDelegationTool } from './agent-tool';
+import { HANDOFF_TARGET, readHandoffTarget, type HandoffTargetMeta } from './handoff';
+import { isFatalExecutionError } from '../internal/execution-error';
 
 export interface NativeToolOutput {
   toolCallId: string;
@@ -39,7 +41,43 @@ export async function prepareAgentTools(
   onOutput?: (output: NativeToolOutput) => void | Promise<void>,
   receipts?: NativeToolReceipts,
 ): Promise<ToolSet> {
-  const result: ToolSet = Object.create(null) as ToolSet;
+  return prepareToolSet(tools, contexts, onOutput, receipts, new Map());
+}
+
+/**
+ * Carry a handoff transfer marker (2.3) onto the prepared copy of a tool. The
+ * spread that builds the copy drops it, because the marker is deliberately
+ * NON-enumerable. The target agent's own tools are prepared too: once a transfer
+ * is accepted they run in this same native run, so they need the same receipts.
+ */
+async function preparedHandoffTarget(
+  meta: HandoffTargetMeta,
+  onOutput: ((output: NativeToolOutput) => void | Promise<void>) | undefined,
+  receipts: NativeToolReceipts | undefined,
+  seen: Map<object, ToolSet>,
+): Promise<HandoffTargetMeta> {
+  const targetTools = meta.def.tools;
+  if (!targetTools) return meta;
+  // One prepared set per target set. It is registered BEFORE it is filled, so
+  // transfer groups that reference each other resolve to the same object.
+  let prepared = seen.get(targetTools);
+  if (!prepared) {
+    prepared = Object.create(null) as ToolSet;
+    seen.set(targetTools, prepared);
+    await prepareToolSet(targetTools as AgentToolSet, {}, onOutput, receipts, seen, prepared);
+  }
+  return { ...meta, def: { ...meta.def, tools: prepared } };
+}
+
+async function prepareToolSet(
+  tools: AgentToolSet,
+  contexts: Record<string, unknown>,
+  onOutput: ((output: NativeToolOutput) => void | Promise<void>) | undefined,
+  receipts: NativeToolReceipts | undefined,
+  seen: Map<object, ToolSet>,
+  into?: ToolSet,
+): Promise<ToolSet> {
+  const result: ToolSet = into ?? (Object.create(null) as ToolSet);
   for (const [name, tool] of Object.entries(tools)) {
     const scoped =
       Object.prototype.hasOwnProperty.call(contexts, name) || tool.contextSchema !== undefined;
@@ -77,7 +115,7 @@ export async function prepareAgentTools(
           }
         : { ...ctx, ...step, context };
     };
-    result[name] = {
+    const prepared: Tool = {
       ...tool,
       outputSchema: tool.outputSchema ? await toJSONSchema(tool.outputSchema) : undefined,
       needsApproval:
@@ -109,6 +147,9 @@ export async function prepareAgentTools(
               );
             }
             if (receipt?.stage === 'completed') return receipt.modelOutput;
+            // The model was already answered with this failure (2.3): a replay
+            // reports the same error and never repeats the effect.
+            if (receipt?.stage === 'failed') throw new Error(receipt.error);
             if (
               receipt?.stage === 'executing' &&
               tool.replay !== 'idempotent' &&
@@ -140,6 +181,12 @@ export async function prepareAgentTools(
               } catch (error) {
                 if (error instanceof SubAgentSuspension)
                   await save({ ...receipt!, stage: 'suspended' });
+                // An ordinary throw is a KNOWN outcome: the loop answers the call
+                // with this error, so a resume must not stop for reconciliation.
+                // A fatal infrastructure error keeps `executing`: whether the
+                // effect happened is unknown.
+                else if (!isFatalExecutionError(error))
+                  await save({ ...receipt!, stage: 'failed', error: failureText(error) });
                 throw error;
               }
               await save({ ...receipt!, stage: 'executed', rawResult });
@@ -193,6 +240,21 @@ export async function prepareAgentTools(
           }
         : undefined,
     };
+    const target = readHandoffTarget(tool as Tool);
+    if (target) {
+      Object.defineProperty(prepared, HANDOFF_TARGET, {
+        value: await preparedHandoffTarget(target, onOutput, receipts, seen),
+        enumerable: false,
+        writable: false,
+        configurable: false,
+      });
+    }
+    result[name] = prepared;
   }
   return result;
+}
+
+/** The text the loop's self-heal gives the model for a thrown error, so a replay reads the same. */
+function failureText(error: unknown): string {
+  return error instanceof Error && error.message ? error.message : String(error);
 }

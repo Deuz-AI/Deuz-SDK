@@ -137,11 +137,17 @@ export interface AgentToolReceipt {
   toolCallId: string;
   toolName: string;
   input: unknown;
+  /**
+   * `executing` means the outcome is unknown, so a resume stops for
+   * reconciliation. `failed` (2.3) means `execute` threw and the model was given
+   * the error; a replay reports the recorded `error` and runs nothing again.
+   */
   stage:
     | 'executing'
     | 'suspended'
     | 'executed'
     | 'completed'
+    | 'failed'
     | 'validation-failed'
     | 'projection-failed';
   rawResult?: unknown;
