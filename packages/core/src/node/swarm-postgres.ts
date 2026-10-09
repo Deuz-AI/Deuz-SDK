@@ -6,10 +6,17 @@
  * Validation reads are separate queries; every WRITE is one SQL statement whose
  * data-modifying CTEs are all gated on the run row's revision update. If the
  * revision moved since the reads, the gate matches nothing, nothing is written,
- * and the commit rejects with SwarmConflictError. Node-only.
+ * and the commit rejects with SwarmConflictError. A write that fails with 40001
+ * or 40P01 runs again (2.3); one that keeps failing rejects with
+ * SwarmConflictError too. Node-only.
  */
 import type { PgClientLike } from './store-postgres';
-import { createPostgresSchema, postgresSchemaStatement } from './postgres-migrate';
+import {
+  createPostgresSchema,
+  postgresSchemaStatement,
+  retryPostgres,
+  SERIALIZATION_CODES,
+} from './postgres-migrate';
 import type {
   SwarmChannelEntry,
   SwarmChannelPost,
@@ -66,6 +73,24 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
   const meta = `${schema}.deuz_swarm_pg_schema`;
   const query = async (sql: string, params: unknown[] = []): Promise<Row[]> =>
     (await options.client.query(sql, params)).rows;
+  /**
+   * One write statement, again while it fails with 40001 or 40P01 (2.3):
+   * Postgres rolled it back whole, and its revision gate re-checks the run.
+   * Retries that run out are a conflict like any other.
+   */
+  const write = async (sql: string, params: unknown[]): Promise<Row[]> => {
+    try {
+      return await retryPostgres(SERIALIZATION_CODES, () => query(sql, params));
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (typeof code === 'string' && SERIALIZATION_CODES.includes(code))
+        throw new SwarmConflictError(
+          `Swarm write kept conflicting with a concurrent transaction (${code})`,
+          { cause: error },
+        );
+      throw error;
+    }
+  };
 
   let ready: Promise<void> | undefined;
   // One statement (a DO block) under an advisory lock, so concurrent first
@@ -133,7 +158,7 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
         ordinal,
         payload: encodeSwarm(task),
       }));
-      const [row] = await query(
+      const [row] = await write(
         `WITH run AS (
           INSERT INTO ${runs} (scope, run_id, payload, status, updated_at, revision, last_sequence)
           VALUES ($1, $2, $3, $4, $5, 0, $6)
@@ -266,7 +291,7 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
       const run = nextSwarmRun(previous, { ...change, events: inputs });
       const journal = makeSwarmEvents(change, previous.lastSequence, inputs);
 
-      const [row] = await query(
+      const [row] = await write(
         `WITH run AS (
           UPDATE ${runs} SET payload = $3, status = $4, updated_at = $5, revision = $6,
             last_sequence = $7

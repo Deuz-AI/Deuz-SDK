@@ -1,9 +1,9 @@
 /**
  * `@deuz-sdk/core/ops/postgres` (2.2): durable leases, native agent run stores
  * and schedule claims on Postgres. Every operation is one SQL statement, so it
- * is atomic on any pooled `PgClientLike`. Lease time is the DATABASE clock,
- * which every process shares; host clocks never decide who holds a lease.
- * Node-only.
+ * is atomic on any pooled `PgClientLike`, and a write that fails with 40001 or
+ * 40P01 runs again (2.3). Lease time is the DATABASE clock, which every
+ * process shares; host clocks never decide who holds a lease. Node-only.
  */
 import type { PgClientLike } from './store-postgres';
 import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
@@ -11,7 +11,12 @@ import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/l
 import { assertLeaseRequest } from '../internal/ops-validate';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 import { postgresSchemaName } from './swarm-postgres';
-import { createPostgresSchema, postgresSchemaStatement, retryPostgres } from './postgres-migrate';
+import {
+  createPostgresSchema,
+  postgresSchemaStatement,
+  retryPostgres,
+  SERIALIZATION_CODES,
+} from './postgres-migrate';
 
 // Persistent budget scopes (2.2, M5) share this Node-only subpath: one import
 // for every durable ops store on Postgres.
@@ -67,6 +72,11 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
   const meta = `${schema}.deuz_ops_schema`;
   const query = async (sql: string, params: unknown[] = []): Promise<Row[]> =>
     (await options.client.query(sql, params)).rows;
+  // Under REPEATABLE READ or SERIALIZABLE a contended write fails with 40001,
+  // or 40P01 as a deadlock victim, and is rolled back whole (2.3). Each write
+  // here is one statement whose checks run inside it, so it runs again.
+  const write = (sql: string, params: unknown[]): Promise<Row[]> =>
+    retryPostgres(SERIALIZATION_CODES, () => query(sql, params));
 
   let ready: Promise<void> | undefined;
   // One statement (a DO block) under an advisory lock: see postgres-migrate.ts.
@@ -101,7 +111,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       await use();
       // Free, released (expires_at 0) or expired keys change hands; tokens only grow.
       // A queued cancel concerns the run and outlives its holder (2.2); a drain does not.
-      const [row] = await query(
+      const [row] = await write(
         `INSERT INTO ${leasesTable} AS l (key, owner, token, expires_at, signals)
         VALUES ($1, $2, 1, ${NOW} + $3, '[]'::jsonb)
         ON CONFLICT (key) DO UPDATE SET owner = EXCLUDED.owner, token = l.token + 1,
@@ -119,7 +129,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       await use();
       // The locked read returns the signals this renewal delivers. Acknowledged
       // delivery (2.3) keeps the cancel queued until ack().
-      const [row] = await query(
+      const [row] = await write(
         `UPDATE ${leasesTable} l SET expires_at = ${NOW} + $4,
           signals = CASE WHEN $5::boolean AND old.signals @> '["cancel"]'::jsonb
             THEN '["cancel"]'::jsonb ELSE '[]'::jsonb END
@@ -138,7 +148,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
     },
     async release(lease) {
       await use();
-      await query(
+      await write(
         `UPDATE ${leasesTable} SET expires_at = 0,
           signals = CASE WHEN signals @> '["cancel"]'::jsonb
             THEN '["cancel"]'::jsonb ELSE '[]'::jsonb END
@@ -149,7 +159,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
     async signal(key, signal) {
       if (!SIGNALS.includes(signal)) throw new TypeError(`Unknown lease signal: ${String(signal)}`);
       await use();
-      const rows = await query(
+      const rows = await write(
         `UPDATE ${leasesTable} SET signals = CASE
           WHEN signals @> jsonb_build_array($2::text) THEN signals
           ELSE signals || jsonb_build_array($2::text) END
@@ -164,7 +174,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
         throw new TypeError(`Only a cancel is acknowledged: ${String(signal)}`);
       await use();
       // Fenced by the token: once the key changed hands, the cancel is the new holder's.
-      const rows = await query(
+      const rows = await write(
         `UPDATE ${leasesTable} SET signals = signals - 'cancel'
         WHERE key = $1 AND token = $2 AND owner = $3
         RETURNING 1 AS held`,
@@ -189,7 +199,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       await use();
       // Column revision 0 is a 2.1 envelope. A new run starts at 1 (or 0 for a
       // 2.1 write); an existing one advances by exactly one.
-      const rows = await query(
+      const rows = await write(
         `INSERT INTO ${runsTable} AS r (run_id, scope, revision, payload, updated_at)
         SELECT $1, $2, $3::bigint, $4, ${NOW}
         WHERE $3::bigint <= 1 OR EXISTS (SELECT 1 FROM ${runsTable} WHERE run_id = $1)
@@ -213,12 +223,10 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       // One statement: whichever session inserts the key first wins it. Under
       // REPEATABLE READ or SERIALIZABLE the loser fails with 40001 instead of
       // doing nothing; run again, the statement sees the winner's row.
-      const rows = await retryPostgres(['40001'], () =>
-        query(
-          `INSERT INTO ${claimsTable} (key, claimed_at) VALUES ($1, ${NOW})
-          ON CONFLICT (key) DO NOTHING RETURNING 1 AS claimed`,
-          [row],
-        ),
+      const rows = await write(
+        `INSERT INTO ${claimsTable} (key, claimed_at) VALUES ($1, ${NOW})
+        ON CONFLICT (key) DO NOTHING RETURNING 1 AS claimed`,
+        [row],
       );
       return rows.length === 1;
     },
@@ -226,9 +234,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       async release(key: string): Promise<void> {
         const row = await claimRowKey(key);
         await use();
-        await retryPostgres(['40001'], () =>
-          query(`DELETE FROM ${claimsTable} WHERE key = $1`, [row]),
-        );
+        await write(`DELETE FROM ${claimsTable} WHERE key = $1`, [row]);
       },
     },
   );

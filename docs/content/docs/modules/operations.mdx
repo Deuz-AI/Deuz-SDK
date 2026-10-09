@@ -277,11 +277,29 @@ moved the run first, nothing is written and the commit rejects with
 `SwarmConflictError`. Postgres leases use the database clock, so host clock skew
 does not matter.
 
-The stores expect `READ COMMITTED`, Postgres's default. Under a
-`REPEATABLE READ` or `SERIALIZABLE` session default, table creation and claims
-run their statement again after a serialization failure (40001), but another
-contended write, such as a lease acquire, an agent run save or a swarm commit,
-can reject with it.
+The stores are built for `READ COMMITTED`, Postgres's default, and also run
+under a `REPEATABLE READ` or `SERIALIZABLE` session default. There a contended
+write can fail with a serialization failure (40001), and any write can be
+chosen as a deadlock victim (40P01). Postgres rolls such a statement back
+whole, so since 2.3 every store sends it again, up to five attempts in all:
+
+| Store | Writes that run again |
+| --- | --- |
+| Ops (`createPostgresOpsStore`) | Lease acquire, renew, release, signal and ack; agent run saves; claims and their release |
+| Swarm (`createPostgresSwarmStore`) | Run creation and commits |
+| Budget (`createPostgresBudgetStore`) | Reserve, settle and release |
+| Store pack (`createPostgresStores`) | Memory, chat, session and run upserts, updates and deletes |
+
+Table creation runs again on the same codes. When the attempts run out, a swarm
+create or commit rejects with `SwarmConflictError`, whose `cause` is the driver
+error, so `resume`, `recover` and `requestCancel` treat it like any other
+conflict. Every other write rejects with the driver error, whose `code` is
+`'40001'` or `'40P01'`; a budget admission reports it as `admission_failed`.
+Each write's checks run inside its statement, so running it again cannot
+double-apply it: a retried agent run save whose revision moved on is rejected as
+a revision conflict, for example. Concurrency under `REPEATABLE READ` is
+covered by tests that inject these failures, not yet by a live multi-connection
+run.
 
 ## Native agent run revisions
 

@@ -14,8 +14,9 @@ import type {
 } from '../types/swarm';
 
 export class SwarmConflictError extends Error {
-  constructor(message = 'Swarm revision conflict or run already exists') {
-    super(message);
+  /** `options.cause` (2.3): the driver error behind it, such as a serialization failure. */
+  constructor(message = 'Swarm revision conflict or run already exists', options?: ErrorOptions) {
+    super(message, options);
     this.name = 'SwarmConflictError';
   }
 }

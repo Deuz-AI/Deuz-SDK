@@ -74,11 +74,24 @@ export async function retryPostgres<T>(
 }
 
 /**
+ * What a contended single-statement write can raise (2.3): 40001 when, under
+ * REPEATABLE READ or SERIALIZABLE, a concurrent transaction changed its rows,
+ * and 40P01 when it was chosen as a deadlock victim. Postgres rolled the whole
+ * statement back, so the stores send it again.
+ */
+export const SERIALIZATION_CODES: readonly string[] = ['40001', '40P01'];
+
+/**
  * What a concurrent first use can raise; each clears when the idempotent DDL
  * runs again. 42710 is an unlocked `CREATE TABLE IF NOT EXISTS` whose rival
  * committed between the existence check and the table's row type.
  */
-export const SCHEMA_RACE_CODES: readonly string[] = ['40001', '23505', '42P07', '42710'];
+export const SCHEMA_RACE_CODES: readonly string[] = [
+  ...SERIALIZATION_CODES,
+  '23505',
+  '42P07',
+  '42710',
+];
 
 /** Sends a store's schema statement, again when a concurrent first use failed it. */
 export async function createPostgresSchema(client: PgClientLike, sql: string): Promise<void> {

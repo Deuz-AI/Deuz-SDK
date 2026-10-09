@@ -13,13 +13,22 @@
  * - Settlement and release move a request out of `reserved` with a row lock,
  *   so concurrent callers apply each transition exactly once.
  *
+ * Under REPEATABLE READ or SERIALIZABLE a contended statement fails with 40001,
+ * or 40P01 as a deadlock victim; Postgres rolled it back whole, so each of
+ * these writes runs again, up to five attempts in all (2.3).
+ *
  * Windows run on database time (`clock_timestamp()`), never on host clocks.
  * `BIGINT` and `numeric` values arrive as strings from `pg` and are coerced
  * with `Number()`. The schema is created by one locked statement
  * (`postgres-migrate.ts`), so concurrent first uses never race.
  */
 import type { PgClientLike } from './store-postgres';
-import { createPostgresSchema, postgresSchemaStatement } from './postgres-migrate';
+import {
+  createPostgresSchema,
+  postgresSchemaStatement,
+  retryPostgres,
+  SERIALIZATION_CODES,
+} from './postgres-migrate';
 import type { BudgetStore, BudgetStoreReservation } from '../types/budget-store';
 import {
   assertBudgetActual,
@@ -55,6 +64,9 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
     );
   const client = options.client;
   const t = (name: string) => `${schema}.deuz_budget_${name}`;
+  /** One write statement, again after a serialization failure or a deadlock (2.3). */
+  const write = (sql: string, params: unknown[]) =>
+    retryPostgres(SERIALIZATION_CODES, () => client.query(sql, params));
   let migrating: Promise<void> | undefined;
 
   // One statement (a DO block) under an advisory lock: see postgres-migrate.ts.
@@ -263,7 +275,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
       if (repeat) return repeat;
       const keys = request.scopes.map((scope) => scope.key);
       // Create missing scope rows; an existing key keeps its first window.
-      const { rows: saved } = await client.query(
+      const { rows: saved } = await write(
         `WITH created AS (
           INSERT INTO ${t('scopes')} (key, window_ms, buckets, bucket_ms, ring_idx, ring_tokens, ring_usd)
           SELECT x.key, x.w, x.b, x.bm, array_fill(-1::bigint, ARRAY[x.b]),
@@ -280,7 +292,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         ],
       );
       assertStoredWindows(request, saved);
-      const { rows } = await client.query(reserveSql, [
+      const { rows } = await write(reserveSql, [
         request.requestId,
         request.fingerprint,
         request.modelId,
@@ -309,7 +321,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
       assertBudgetKey(requestId);
       const settle = assertBudgetActual(actual);
       await migrate();
-      const { rows } = await client.query(settleSql, [requestId, settle.tokens, settle.usd]);
+      const { rows } = await write(settleSql, [requestId, settle.tokens, settle.usd]);
       if (Number(rows[0]?.applied) > 0) return;
       const current = await readRequest(requestId);
       if (current) planBudgetTransition(requestId, current, { settle });
@@ -317,13 +329,13 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
     async release(requestId) {
       assertBudgetKey(requestId);
       await migrate();
-      const { rows } = await client.query(releaseSql, [requestId]);
+      const { rows } = await write(releaseSql, [requestId]);
       if (Number(rows[0]?.applied) > 0) return;
       const current = await readRequest(requestId);
       if (!current || planBudgetTransition(requestId, current, { release: true }) === 'noop')
         return;
       // A settled request that cost nothing: nothing to subtract.
-      await client.query(
+      await write(
         `UPDATE ${t('requests')} SET state = 'released'
          WHERE request_id = $1 AND state = 'settled' AND actual_tokens = 0 AND actual_usd = 0`,
         [requestId],
