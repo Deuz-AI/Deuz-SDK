@@ -6,6 +6,7 @@
 import type { Clock } from './types/deps';
 import type { BudgetLimits } from './types/execution';
 import type {
+  BudgetPruneOptions,
   BudgetScopeUsage,
   BudgetStore,
   BudgetStoreReservation,
@@ -295,6 +296,33 @@ export function assertUsageOptions(key: string, options: BudgetUsageOptions = {}
     throw invalid('since must be a finite epoch millisecond value.');
 }
 
+/** @internal Validate `prune` options (2.3); returns `before`. */
+export function assertPruneOptions(options: BudgetPruneOptions): number {
+  if (options === null || typeof options !== 'object') throw invalid('Prune options are required.');
+  if (typeof options.before !== 'number' || !Number.isFinite(options.before))
+    throw invalid('before must be a finite epoch millisecond value.');
+  return options.before;
+}
+
+/**
+ * @internal Whether `prune` may fold a history bucket at `at` (2.3). It closed
+ * by `before`, and a whole bucket length before `at`, so no reservation still
+ * in flight charges it; in a windowed scope admission no longer counts it. The
+ * SQL stores make the same three comparisons.
+ */
+export function isFoldableBucket(
+  scope: { windowMs: number | null; buckets: number; bucketMs: number },
+  index: number,
+  before: number,
+  at: number,
+): boolean {
+  return (
+    (index + 1) * scope.bucketMs <= before &&
+    (index + 2) * scope.bucketMs <= at &&
+    (scope.windowMs === null || (index + scope.buckets) * scope.bucketMs <= at)
+  );
+}
+
 interface Charge {
   readonly key: string;
   readonly index: number;
@@ -310,7 +338,11 @@ interface MemoryRequest {
   actualTokens?: number;
   actualUsd?: number;
   readonly outcome: BudgetStoreReservation;
+  /** When it was reserved (2.3). */
+  readonly at: number;
 }
+
+const chargeKey = (charge: Charge): string => JSON.stringify([charge.key, charge.index]);
 
 /** For tests and single-process deployments; its budgets die with the process. */
 export function createInMemoryBudgetStore(options: { clock?: Clock } = {}): BudgetStore {
@@ -318,6 +350,10 @@ export function createInMemoryBudgetStore(options: { clock?: Clock } = {}): Budg
   const windows = new Map<string, { windowMs: number | null; buckets: number; bucketMs: number }>();
   /** key → bucket index → model → amounts. */
   const counters = new Map<string, Map<number, Map<string, { tokens: number; usd: number }>>>();
+  /** key → every bucket summed (2.3): a lifetime admission reads it, not the history. */
+  const totals = new Map<string, { tokens: number; usd: number }>();
+  /** key → the newest bucket index it was charged in (2.3). */
+  const newest = new Map<string, number>();
   const requests = new Map<string, MemoryRequest>();
 
   const add = (charge: Charge, modelId: string, tokens: number, usd: number) => {
@@ -327,18 +363,32 @@ export function createInMemoryBudgetStore(options: { clock?: Clock } = {}): Budg
     if (!models) buckets.set(charge.index, (models = new Map()));
     const row = models.get(modelId) ?? { tokens: 0, usd: 0 };
     models.set(modelId, { tokens: row.tokens + tokens, usd: row.usd + usd });
+    const total = totals.get(charge.key) ?? { tokens: 0, usd: 0 };
+    totals.set(charge.key, { tokens: total.tokens + tokens, usd: total.usd + usd });
+    const last = newest.get(charge.key);
+    if (last === undefined || charge.index > last) newest.set(charge.key, charge.index);
   };
   const committed = (scope: NormalizedBudgetScope, at: number) => {
-    const first = firstCountedBucket(scope, at);
+    if (scope.windowMs === null) return totals.get(scope.key) ?? { tokens: 0, usd: 0 };
+    const buckets = counters.get(scope.key);
     let tokens = 0;
     let usd = 0;
-    for (const [index, models] of counters.get(scope.key) ?? []) {
-      if (index < first) continue;
+    const count = (models: Map<string, { tokens: number; usd: number }>) => {
       for (const row of models.values()) {
         tokens += row.tokens;
         usd += row.usd;
       }
-    }
+    };
+    const first = firstCountedBucket(scope, at);
+    const last = newest.get(scope.key) ?? first;
+    // A window spans `buckets` indexes (more only if the clock went back):
+    // walk whichever is shorter, the window or the history.
+    if (buckets && last - first < buckets.size)
+      for (let index = first; index <= last; index++) {
+        const models = buckets.get(index);
+        if (models) count(models);
+      }
+    else for (const [index, models] of buckets ?? []) if (index >= first) count(models);
     return { tokens, usd };
   };
   const recorded = (request: NormalizedBudgetReserve) => {
@@ -379,6 +429,7 @@ export function createInMemoryBudgetStore(options: { clock?: Clock } = {}): Budg
         state: outcome.admitted ? 'reserved' : 'denied',
         charges,
         outcome,
+        at,
       });
       return outcome;
     },
@@ -418,6 +469,52 @@ export function createInMemoryBudgetStore(options: { clock?: Clock } = {}): Budg
         for (const [modelId, row] of models) rows.push({ modelId, ...row });
       }
       return summarizeBudgetUsage(rows, usageOptions.byModel);
+    },
+    async prune(pruneOptions) {
+      const before = assertPruneOptions(pruneOptions);
+      const at = clock.now();
+      // An open hold keeps its record and the buckets its settlement adjusts.
+      const held = new Set<string>();
+      let pruned = 0;
+      for (const [requestId, request] of requests) {
+        if (request.state === 'reserved')
+          for (const charge of request.charges) held.add(chargeKey(charge));
+        else if (request.at < before) {
+          requests.delete(requestId);
+          pruned++;
+        }
+      }
+      let folded = 0;
+      for (const [key, buckets] of counters) {
+        const scope = windows.get(key)!;
+        const foldable = new Map<string, number[]>();
+        for (const [index, models] of buckets) {
+          if (held.has(chargeKey({ key, index })) || !isFoldableBucket(scope, index, before, at))
+            continue;
+          for (const modelId of models.keys()) {
+            const indexes = foldable.get(modelId);
+            if (indexes) indexes.push(index);
+            else foldable.set(modelId, [index]);
+          }
+        }
+        for (const [modelId, indexes] of foldable) {
+          if (indexes.length < 2) continue;
+          const keep = indexes.reduce((left, right) => Math.max(left, right));
+          const sum = { tokens: 0, usd: 0 };
+          for (const index of indexes) {
+            const models = buckets.get(index)!;
+            const row = models.get(modelId)!;
+            sum.tokens += row.tokens;
+            sum.usd += row.usd;
+            if (index === keep) continue;
+            models.delete(modelId);
+            if (!models.size) buckets.delete(index);
+            folded++;
+          }
+          buckets.get(keep)!.set(modelId, sum);
+        }
+      }
+      return { requests: pruned, buckets: folded };
     },
   } satisfies BudgetStore);
 }

@@ -80,6 +80,24 @@ export interface BudgetUsage {
   readonly byModel?: Readonly<Record<string, { readonly tokens: number; readonly usd: number }>>;
 }
 
+/** What `BudgetStore.prune` may remove (2.3). */
+export interface BudgetPruneOptions {
+  /**
+   * Epoch milliseconds on the store's clock (database time for Postgres).
+   * Request records created before it, and history in buckets that closed
+   * before it, are pruned.
+   */
+  readonly before: number;
+}
+
+/** What `BudgetStore.prune` removed (2.3). */
+export interface BudgetPruneResult {
+  /** Settled, released and denied request records deleted. */
+  readonly requests: number;
+  /** History rows folded into a newer row of the same scope and model. */
+  readonly buckets: number;
+}
+
 /**
  * Shared, durable admission. Every method is atomic. A hold is charged to the
  * bucket of its reservation time, so a hold leaked by a crash leaves a
@@ -103,4 +121,16 @@ export interface BudgetStore {
   release(requestId: string): Promise<void>;
   /** Totals across the key's recorded history, or since a point in time. */
   usage(key: string, options?: BudgetUsageOptions): Promise<BudgetUsage>;
+  /**
+   * Retention (2.3). Deletes the settled, released and denied request records
+   * created before `before`: a pruned request is forgotten, so repeating its
+   * reservation admits it anew and a late settlement of it is ignored. Folds
+   * each scope's history, per model, from the buckets that closed a whole
+   * bucket length before both `before` and now, and that admission no longer
+   * counts, into the newest of them. Usage totals and admission do not change;
+   * `usage(key, { since })` counts a folded amount at the bucket it was folded
+   * into. A request still reserved keeps its record and its bucket. Optional:
+   * the memory, SQLite and Postgres stores have it.
+   */
+  prune?(options: BudgetPruneOptions): Promise<BudgetPruneResult>;
 }

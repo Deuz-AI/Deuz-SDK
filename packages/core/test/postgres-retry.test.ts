@@ -265,6 +265,21 @@ describe('Postgres budget store retries (2.3)', () => {
     },
   );
 
+  it.each(CODES)('runs a prune again after %s', async (code) => {
+    const schema = await freshSchema();
+    const pg = contended();
+    const store = createPostgresBudgetStore({ client: pg.client, schema });
+    await store.reserve({ requestId: 'a', modelId: 'm', tokens: 40, scopes: [scope] });
+    await store.settle('a', { tokens: 10, usd: 0 });
+    pg.fail(/dropped AS \(/, 1, code);
+    expect(await store.prune!({ before: Date.now() + 1_000 })).toEqual({
+      requests: 1,
+      buckets: 0,
+    });
+    expect(pg.attempts()).toBe(2);
+    expect(await store.usage('user:1')).toEqual({ tokens: 10, usd: 0 });
+  });
+
   it('gives up on a reserve after five attempts with the driver error', async () => {
     const schema = await freshSchema();
     const pg = contended();

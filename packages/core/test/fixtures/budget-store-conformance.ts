@@ -9,9 +9,17 @@ export interface BudgetStoreHarness {
   now(): number;
 }
 
+export interface BudgetStoreContractOptions {
+  /** `advance` moves hours at no cost (a manual clock), which lifetime history needs. */
+  hours?: boolean;
+}
+
 /** Window used by the expiry tests: four 100 ms buckets. */
 const WINDOW = { ms: 400, buckets: 4 } as const;
+const BUCKET = 100;
 const PAST_WINDOW = 600;
+/** A lifetime scope's history bucket (LIFETIME_BUCKET_MS). */
+const HOUR = 3_600_000;
 
 const user = (
   tokens: number,
@@ -23,7 +31,11 @@ const user = (
 });
 
 /** The BudgetStore contract (2.2), shared by the memory, SQLite and Postgres stores. */
-export function budgetStoreContracts(name: string, make: () => Promise<BudgetStoreHarness>): void {
+export function budgetStoreContracts(
+  name: string,
+  make: () => Promise<BudgetStoreHarness>,
+  options: BudgetStoreContractOptions = {},
+): void {
   describe(name, () => {
     it('admits within every scope and reports committed usage', async () => {
       const { store } = await make();
@@ -285,5 +297,113 @@ export function budgetStoreContracts(name: string, make: () => Promise<BudgetSto
       await expect(store.settle('r', { tokens: 1.5, usd: 0 })).rejects.toThrow();
       await expect(store.usage('')).rejects.toThrow();
     });
+
+    it('prunes finished request records before a time, never an open hold (2.3)', async () => {
+      const { store, advance, now } = await make();
+      const scope = user(100, { key: 'user:p', window: WINDOW });
+      await store.reserve({ requestId: 'settled', modelId: 'm', tokens: 10, scopes: [scope] });
+      await store.settle('settled', { tokens: 5, usd: 0 });
+      await store.reserve({ requestId: 'released', modelId: 'm', tokens: 10, scopes: [scope] });
+      await store.release('released');
+      await store.reserve({ requestId: 'open', modelId: 'm', tokens: 80, scopes: [scope] });
+      expect(
+        await store.reserve({ requestId: 'denied', modelId: 'm', tokens: 50, scopes: [scope] }),
+      ).toMatchObject({ admitted: false });
+      await advance(PAST_WINDOW);
+      const cut = now();
+      await store.reserve({ requestId: 'late', modelId: 'm', tokens: 1, scopes: [scope] });
+      expect(await store.prune!({ before: cut })).toMatchObject({ requests: 3 });
+      // The open hold keeps its record: its settlement still corrects the usage.
+      await store.settle('open', { tokens: 20, usd: 0 });
+      expect(await store.usage('user:p')).toEqual({ tokens: 26, usd: 0 });
+      // A pruned request is forgotten: a late settlement of it changes nothing.
+      await store.settle('settled', { tokens: 99, usd: 0 });
+      expect(await store.usage('user:p')).toEqual({ tokens: 26, usd: 0 });
+      expect(await store.prune!({ before: cut })).toMatchObject({ requests: 1 });
+    });
+
+    it('folds closed history without changing usage or admission (2.3)', async () => {
+      const { store, advance, now } = await make();
+      const scope = user(100, { key: 'user:f', window: WINDOW });
+      const settled = async (requestId: string, modelId: string, tokens: number, usd: number) => {
+        await store.reserve({ requestId, modelId, tokens, usd, scopes: [scope] });
+        await store.settle(requestId, { tokens, usd });
+      };
+      await settled('a', 'alpha', 10, 1);
+      await advance(BUCKET);
+      await settled('b', 'alpha', 20, 2);
+      await advance(BUCKET);
+      await settled('c', 'beta', 30, 0);
+      await advance(PAST_WINDOW);
+      const before = await store.usage('user:f', { byModel: true });
+      // alpha's two buckets fold into one; beta has one bucket to keep.
+      expect(await store.prune!({ before: now() })).toEqual({ requests: 3, buckets: 1 });
+      expect(await store.usage('user:f', { byModel: true })).toEqual(before);
+      expect(
+        await store.reserve({ requestId: 'd', modelId: 'm', tokens: 100, scopes: [scope] }),
+      ).toMatchObject({ admitted: true });
+      expect(await store.prune!({ before: now() })).toEqual({ requests: 0, buckets: 0 });
+    });
+
+    it('leaves the bucket of an open hold for its settlement (2.3)', async () => {
+      const { store, advance, now } = await make();
+      const scope = user(100, { key: 'user:k', window: WINDOW });
+      await store.reserve({ requestId: 'open', modelId: 'm', tokens: 10, scopes: [scope] });
+      await advance(BUCKET);
+      await store.reserve({ requestId: 'b', modelId: 'm', tokens: 20, scopes: [scope] });
+      await store.settle('b', { tokens: 20, usd: 0 });
+      await advance(BUCKET);
+      await store.reserve({ requestId: 'c', modelId: 'm', tokens: 30, scopes: [scope] });
+      await store.settle('c', { tokens: 30, usd: 0 });
+      await advance(PAST_WINDOW);
+      expect(await store.prune!({ before: now() })).toEqual({ requests: 2, buckets: 1 });
+      await store.settle('open', { tokens: 1, usd: 0 });
+      expect(await store.usage('user:k')).toEqual({ tokens: 51, usd: 0 });
+    });
+
+    it('never prunes what admission still counts (2.3)', async () => {
+      const { store, now } = await make();
+      const scope = user(100, { key: 'user:n', window: { ms: 60_000, buckets: 60 } });
+      await store.reserve({ requestId: 'a', modelId: 'm', tokens: 60, scopes: [scope] });
+      await store.settle('a', { tokens: 60, usd: 0 });
+      await store.reserve({ requestId: 'b', modelId: 'm', tokens: 40, scopes: [scope] });
+      await store.settle('b', { tokens: 40, usd: 0 });
+      await store.reserve({ requestId: 'l', modelId: 'm', tokens: 100, scopes: [user(100)] });
+      await store.settle('l', { tokens: 100, usd: 0 });
+      // A `before` in the future still spares the open window and the lifetime total.
+      expect(await store.prune!({ before: now() + 86_400_000 })).toEqual({
+        requests: 3,
+        buckets: 0,
+      });
+      expect(
+        await store.reserve({ requestId: 'c', modelId: 'm', tokens: 1, scopes: [scope] }),
+      ).toMatchObject({ admitted: false, committed: 100 });
+      expect(
+        await store.reserve({ requestId: 'd', modelId: 'm', tokens: 1, scopes: [user(100)] }),
+      ).toMatchObject({ admitted: false, committed: 100 });
+      await expect(store.prune!({ before: Number.NaN })).rejects.toThrow(/before/);
+      await expect(store.prune!(undefined as never)).rejects.toThrow();
+    });
+
+    it.skipIf(!options.hours)(
+      'folds lifetime history per model and keeps its total (2.3)',
+      async () => {
+        const { store, advance, now } = await make();
+        for (let hour = 0; hour < 4; hour++) {
+          const requestId = `h${hour}`;
+          const modelId = hour % 2 ? 'beta' : 'alpha';
+          await store.reserve({ requestId, modelId, tokens: 10, usd: 0.1, scopes: [user(1_000)] });
+          await store.settle(requestId, { tokens: 10, usd: 0.1 });
+          await advance(HOUR);
+        }
+        await advance(HOUR);
+        const before = await store.usage('user:1', { byModel: true });
+        expect(await store.prune!({ before: now() })).toEqual({ requests: 4, buckets: 2 });
+        expect(await store.usage('user:1', { byModel: true })).toEqual(before);
+        expect(
+          await store.reserve({ requestId: 'x', modelId: 'm', tokens: 961, scopes: [user(1_000)] }),
+        ).toMatchObject({ admitted: false, committed: 40 });
+      },
+    );
   });
 }

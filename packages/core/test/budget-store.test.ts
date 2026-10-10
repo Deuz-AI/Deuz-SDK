@@ -14,10 +14,14 @@ function manualClock(start = 1_000_000) {
   };
 }
 
-budgetStoreContracts('memory budget store', async () => {
-  const { clock, advance, now } = manualClock();
-  return { store: createInMemoryBudgetStore({ clock }), advance, now };
-});
+budgetStoreContracts(
+  'memory budget store',
+  async () => {
+    const { clock, advance, now } = manualClock();
+    return { store: createInMemoryBudgetStore({ clock }), advance, now };
+  },
+  { hours: true },
+);
 
 describe('memory budget store', () => {
   it('counts a window in whole buckets', async () => {
@@ -34,5 +38,34 @@ describe('memory budget store', () => {
     expect(
       await store.reserve({ requestId: 'c', modelId: 'm', tokens: 1, scopes: [scope] }),
     ).toMatchObject({ admitted: true });
+  });
+
+  // 2.2 summed a key's whole history on every admission: a lifetime budget a
+  // year old walked thousands of buckets per model call (F25).
+  it('admits against a long history without walking it', { timeout: 15_000 }, async () => {
+    const { clock, advance } = manualClock(0);
+    const store = createInMemoryBudgetStore({ clock });
+    const scopes = [
+      { key: 'org:life', limits: { tokens: 1e12 } },
+      { key: 'org:week', limits: { tokens: 1e12 }, window: { ms: 7 * 3_600_000, buckets: 7 } },
+    ];
+    // An hourly call for two and a half years: 20 000 buckets per key.
+    for (let hour = 0; hour < 20_000; hour++) {
+      await store.reserve({ requestId: `h${hour}`, modelId: 'm', tokens: 1, scopes });
+      await store.settle(`h${hour}`, { tokens: 1, usd: 0 });
+      await advance(3_600_000);
+    }
+    for (let call = 0; call < 20_000; call++)
+      await store.reserve({ requestId: `c${call}`, modelId: 'm', tokens: 0, scopes });
+    expect(
+      await store.reserve({ requestId: 'last', modelId: 'm', tokens: 1, scopes }),
+    ).toMatchObject({
+      admitted: true,
+      // The week counts its last six hourly calls and this one.
+      scopes: [
+        { key: 'org:life', tokens: 20_001 },
+        { key: 'org:week', tokens: 7 },
+      ],
+    });
   });
 });

@@ -29,10 +29,11 @@ import {
   retryPostgres,
   SERIALIZATION_CODES,
 } from './postgres-migrate';
-import type { BudgetStore, BudgetStoreReservation } from '../types/budget-store';
+import type { BudgetPruneResult, BudgetStore, BudgetStoreReservation } from '../types/budget-store';
 import {
   assertBudgetActual,
   assertBudgetKey,
+  assertPruneOptions,
   assertSameWindow,
   assertUsageOptions,
   BudgetStoreError,
@@ -86,6 +87,8 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, model_id TEXT NOT NULL,
         tokens BIGINT NOT NULL, usd DOUBLE PRECISION NOT NULL, state TEXT NOT NULL, charges JSONB NOT NULL,
         actual_tokens BIGINT, actual_usd DOUBLE PRECISION, outcome JSONB NOT NULL, created_at BIGINT NOT NULL)`,
+      // 2.3: for prune and the open holds; 2.2 ignores it, so version 1 stays.
+      `CREATE INDEX IF NOT EXISTS deuz_budget_requests_state ON ${t('requests')} (state, created_at)`,
     ],
   });
 
@@ -146,8 +149,12 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         AND (SELECT count(*) FROM locked) >= 0
       RETURNING s.key
     ), hist AS (
-      UPDATE ${t('counters')} k SET tokens = k.tokens + ch.dt, usd = k.usd + ch.du
-      FROM ch WHERE k.key = ch.key AND k.bucket = ch.hist AND k.model_id = ch.model_id
+      -- An upsert (2.3): a prune whose snapshot predates the reservation may
+      -- have folded its row away; the difference then lands in a row of its own.
+      INSERT INTO ${t('counters')} AS k (key, bucket, model_id, tokens, usd)
+      SELECT key, hist, model_id, dt, du FROM ch
+      ON CONFLICT (key, bucket, model_id)
+        DO UPDATE SET tokens = k.tokens + excluded.tokens, usd = k.usd + excluded.usd
       RETURNING k.key
     )
     SELECT (SELECT count(*) FROM upd) AS applied,
@@ -155,6 +162,46 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
 
   const settleSql = transition('settled', '$2::bigint - tg.tokens', '$3::float8 - tg.usd');
   const releaseSql = transition('released', '-tg.tokens', '-tg.usd');
+
+  // Retention (2.3), one statement. A folded row is deleted and its amount
+  // moved into its group's newest row by an upsert, never re-read from the
+  // snapshot: under READ COMMITTED a concurrent prune or settlement changes
+  // either row in place, and no amount is lost or counted twice. The three
+  // bucket comparisons are isFoldableBucket's.
+  const pruneSql = `
+    WITH now_ms AS (SELECT ${NOW_MS} AS at),
+    dropped AS (
+      DELETE FROM ${t('requests')} WHERE state <> 'reserved' AND created_at < $1::float8
+      RETURNING 1
+    ), held AS (
+      SELECT DISTINCT c->>'key' AS key, (c->>'index')::bigint AS bucket
+      FROM ${t('requests')} r, jsonb_array_elements(r.charges) AS c WHERE r.state = 'reserved'
+    ), foldable AS (
+      SELECT k.key, k.bucket, k.model_id FROM ${t('counters')} k
+      JOIN ${t('scopes')} s ON s.key = k.key CROSS JOIN now_ms n
+      WHERE (k.bucket + 1) * s.bucket_ms <= $1::float8
+        AND (k.bucket + 2) * s.bucket_ms <= n.at
+        AND (s.window_ms IS NULL OR (k.bucket + s.buckets) * s.bucket_ms <= n.at)
+        AND NOT EXISTS (SELECT 1 FROM held h WHERE h.key = k.key AND h.bucket = k.bucket)
+    ), groups AS (
+      SELECT key, model_id, max(bucket) AS keep FROM foldable
+      GROUP BY key, model_id HAVING count(*) > 1
+    ), gone AS (
+      DELETE FROM ${t('counters')} k USING groups g
+      WHERE k.key = g.key AND k.model_id = g.model_id AND k.bucket < g.keep
+        AND (k.key, k.bucket, k.model_id) IN (SELECT key, bucket, model_id FROM foldable)
+      RETURNING k.key, k.model_id, k.tokens, k.usd
+    ), kept AS (
+      INSERT INTO ${t('counters')} AS k (key, bucket, model_id, tokens, usd)
+      SELECT g.key, g.keep, g.model_id, sum(x.tokens), sum(x.usd)
+      FROM gone x JOIN groups g ON g.key = x.key AND g.model_id = x.model_id
+      GROUP BY g.key, g.keep, g.model_id
+      ON CONFLICT (key, bucket, model_id)
+        DO UPDATE SET tokens = k.tokens + excluded.tokens, usd = k.usd + excluded.usd
+      RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM dropped) AS requests, (SELECT count(*) FROM gone) AS buckets,
+      (SELECT count(*) FROM kept) AS kept`;
 
   // `cur` holds the scopes whose stored window matches the request. A scope
   // created with another window by a concurrent first reserve drops out of it;
@@ -360,6 +407,12 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         })),
         usageOptions.byModel,
       );
+    },
+    async prune(pruneOptions): Promise<BudgetPruneResult> {
+      const before = assertPruneOptions(pruneOptions);
+      await migrate();
+      const { rows } = await write(pruneSql, [before]);
+      return { requests: Number(rows[0]?.requests ?? 0), buckets: Number(rows[0]?.buckets ?? 0) };
     },
   } satisfies BudgetStore);
 }
