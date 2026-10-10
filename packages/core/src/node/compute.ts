@@ -22,16 +22,21 @@ import type {
 // builder from statically resolving node: (matches node/chat-store.ts).
 interface Readable {
   on(event: 'data', listener: (chunk: Uint8Array) => void): void;
+  destroy(): void;
 }
 interface Writable {
-  write(chunk: string): void;
+  write(chunk: Uint8Array): boolean;
   end(): void;
+  destroy(): void;
+  on(event: 'error', listener: (err: Error) => void): void;
+  on(event: 'close', listener: () => void): void;
+  once(event: 'drain', listener: () => void): void;
 }
 interface ChildProcessLike {
   stdout: Readable | null;
   stderr: Readable | null;
   stdin: Writable | null;
-  on(event: 'close', listener: (code: number | null, signal: string | null) => void): void;
+  on(event: 'exit' | 'close', listener: (code: number | null, signal: string | null) => void): void;
   on(event: 'error', listener: (err: Error) => void): void;
   kill(signal?: string): boolean;
 }
@@ -39,7 +44,11 @@ interface ChildProcessModule {
   spawn(
     command: string,
     args: string[],
-    options: { cwd?: string; env?: Record<string, string | undefined> },
+    options: {
+      cwd?: string;
+      env?: Record<string, string | undefined>;
+      stdio: ['ignore' | 'pipe', 'pipe', 'pipe'];
+    },
   ): ChildProcessLike;
 }
 
@@ -127,13 +136,78 @@ interface ExecInput {
   args: string[];
   cwd?: string;
   env: Record<string, string | undefined>;
+  /**
+   * The child's stdin. `undefined` means none at all: the null device, so a read
+   * sees EOF at once. A string, `''` included, is a pipe that receives exactly
+   * these UTF-8 bytes and is then closed. Neither keeps stdin open; interactive
+   * or streamed input would be a separate, explicit mode, not a value of this.
+   */
   stdin?: string;
   timeoutMs: number;
   maxOutputBytes: number;
   signal?: AbortSignal;
 }
 
-/** Spawn one process, capture bounded stdout/stderr, honor timeout + abort. */
+/** Bytes per stdin write: one OS pipe buffer (64 KiB on Linux and Windows). */
+const STDIN_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * How long a killed run (timeout or abort) waits for its output pipes to close
+ * before it stops waiting. The process we spawned dies at once, but a program IT
+ * started inherits stdout/stderr and can hold them open: every external command
+ * under `cmd.exe /c`, or `a` in `bash -c 'a && b'`. 'close' then waited for that
+ * program to exit on its own, so the timeout bounded nothing.
+ */
+const KILL_GRACE_MS = 500;
+
+/**
+ * Feed `text` to the child's stdin as UTF-8, then close it (EOF).
+ *
+ * The child may stop reading at any moment: it exits without reading, crashes,
+ * closes its stdin, or the timeout/abort kills it. Its end of the pipe closes
+ * and the pending write fails asynchronously, with EPIPE on POSIX and 'write
+ * EOF' on Windows. With no 'error' listener that failure is an UNCAUGHT
+ * exception: once the input outgrew the 64 KiB pipe buffer it took the HOST
+ * process down and the caller's try/catch never ran (F03). It is not an
+ * execution error (the exit code and output already say what happened), so it
+ * is absorbed here and writing stops. The listener stays for the stream's whole
+ * life: a late error with nobody listening would crash the host just the same.
+ *
+ * Bytes go out one pipe buffer at a time, waiting for 'drain', so a large input
+ * is not queued into the stream at once and nothing more is written after the
+ * child has stopped reading.
+ */
+function writeStdin(stdin: Writable, text: string): void {
+  const bytes = new TextEncoder().encode(text);
+  let offset = 0;
+  let stopped = false;
+  const stop = (): void => {
+    stopped = true;
+  };
+  stdin.on('error', stop);
+  stdin.on('close', stop);
+  const pump = (): void => {
+    while (!stopped && offset < bytes.byteLength) {
+      const chunk = bytes.subarray(offset, offset + STDIN_CHUNK_BYTES);
+      offset += chunk.byteLength;
+      if (!stdin.write(chunk)) {
+        stdin.once('drain', pump);
+        return;
+      }
+    }
+    if (!stopped) stdin.end();
+  };
+  pump();
+}
+
+/**
+ * Spawn one process, capture bounded stdout/stderr, honor timeout + abort.
+ *
+ * Settles exactly once, on whichever comes first: the child's 'close' (all
+ * output read), a spawn 'error', or the kill grace after a timeout/abort. That
+ * releases both timers and the caller's 'abort' listener and closes our ends of
+ * the pipes, so nothing of the run keeps the host alive afterwards.
+ */
 async function execProcess(
   spawn: ChildProcessModule['spawn'],
   input: ExecInput,
@@ -148,6 +222,9 @@ async function execProcess(
       child = spawn(input.command, input.args, {
         ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
         env: input.env,
+        // No stdin given: the null device, not a pipe nobody ever closes (a
+        // program reading to EOF used to wait out the whole timeout, F10).
+        stdio: [input.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       });
     } catch (err) {
       resolve({
@@ -164,6 +241,9 @@ async function execProcess(
     let errBytes = 0;
     let timedOut = false;
     let settled = false;
+    /** From 'exit', for a killed run that settles before 'close' comes. */
+    let exitCode: number | null = null;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
 
     const collect = (chunks: Uint8Array[], countRef: 'out' | 'err') => (chunk: Uint8Array) => {
       const current = countRef === 'out' ? outBytes : errBytes;
@@ -189,56 +269,63 @@ async function execProcess(
       return decoder.decode(merged);
     };
 
-    const timer = setTimeout(() => {
+    // Timeout and abort both kill the child and report `timedOut: true`.
+    const kill = (): void => {
+      if (settled || timedOut) return;
       timedOut = true;
       child.kill('SIGKILL');
-    }, input.timeoutMs);
-
-    const onAbort = (): void => {
-      timedOut = true;
-      child.kill('SIGKILL');
+      graceTimer = setTimeout(() => finish(exitCode), KILL_GRACE_MS);
     };
-    input.signal?.addEventListener('abort', onAbort, { once: true });
+    const timer = setTimeout(kill, input.timeoutMs);
+    input.signal?.addEventListener('abort', kill, { once: true });
 
-    const finish = (exitCode: number | null): void => {
+    const finish = (code: number | null, error?: Error): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      input.signal?.removeEventListener('abort', onAbort);
+      clearTimeout(graceTimer);
+      input.signal?.removeEventListener('abort', kill);
+      // Close our ends of the pipes. After 'close' they are closed already; after
+      // a spawn error or the kill grace the far side may still hold them open,
+      // and an open pipe keeps the host's event loop alive.
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
       resolve({
         stdout: concat(outChunks),
-        stderr: concat(errChunks),
-        exitCode,
+        stderr: error ? `${concat(errChunks)}${error.message}` : concat(errChunks),
+        exitCode: code,
         ...(timedOut ? { timedOut: true } : {}),
         durationMs: Date.now() - start,
       });
     };
 
-    child.on('error', (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      input.signal?.removeEventListener('abort', onAbort);
-      resolve({
-        stdout: concat(outChunks),
-        stderr: `${concat(errChunks)}${err.message}`,
-        exitCode: null,
-        ...(timedOut ? { timedOut: true } : {}),
-        durationMs: Date.now() - start,
-      });
+    child.on('error', (err) => finish(null, err));
+    child.on('exit', (code) => {
+      exitCode = code;
     });
     child.on('close', (code) => finish(code));
 
-    if (input.stdin !== undefined && child.stdin) {
-      child.stdin.write(input.stdin);
-      child.stdin.end();
-    }
+    if (input.stdin !== undefined && child.stdin) writeStdin(child.stdin, input.stdin);
   });
 }
 
 /**
+ * A `runShell` request as this backend reads it: `stdin` works exactly as on
+ * `runCode`, whether or not the seam's `ShellExecutionRequest` declares it.
+ */
+type ShellRequest = ShellExecutionRequest & { stdin?: string };
+
+/**
  * A `node:child_process`-backed reference sandbox. See the file header: this is
  * for local development and the seam contract, NOT production isolation.
+ *
+ * `runCode` and `runShell` take the same `stdin`: omitted, the child's stdin is
+ * the null device (a read sees EOF at once); a string, `''` included, is piped
+ * as UTF-8 and then closed. Neither offers interactive input. A timeout or abort
+ * kills the spawned process and settles within a short grace period even when a
+ * program it started still holds the output pipes; that program is NOT killed
+ * (one more reason this is not an isolation boundary).
  */
 export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSandbox {
   const interpreters = { ...DEFAULT_INTERPRETERS, ...options.interpreters };
@@ -276,7 +363,7 @@ export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSand
       });
     },
 
-    async runShell(request: ShellExecutionRequest): Promise<CodeExecutionResult> {
+    async runShell(request: ShellRequest): Promise<CodeExecutionResult> {
       if (options.allowedCommands) {
         const firstToken = request.command.trim().split(/\s+/)[0] ?? '';
         if (!options.allowedCommands.includes(firstToken)) {
@@ -297,6 +384,7 @@ export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSand
         args: shellArgs,
         ...(cwd !== undefined ? { cwd } : {}),
         env: buildEnv(proc.env, inheritEnv, request.env),
+        ...(request.stdin !== undefined ? { stdin: request.stdin } : {}),
         timeoutMs: request.timeoutMs ?? timeoutMs,
         maxOutputBytes,
         ...(request.signal ? { signal: request.signal } : {}),

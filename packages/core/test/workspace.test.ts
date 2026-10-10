@@ -20,6 +20,18 @@ describe('normalizeWorkspacePath', () => {
     expect(() => normalizeWorkspacePath('/abs')).toThrow();
     expect(() => normalizeWorkspacePath('')).toThrow();
   });
+
+  it('only a whole ".." segment is traversal; names that start with two dots are fine', () => {
+    // The reference the file backend's own checks must agree with (F11).
+    expect(normalizeWorkspacePath('..notes')).toBe('..notes');
+    expect(normalizeWorkspacePath('..notes/x.txt')).toBe('..notes/x.txt');
+    expect(normalizeWorkspacePath('...')).toBe('...');
+    expect(normalizeWorkspacePath('./..notes')).toBe('..notes');
+    expect(normalizeWorkspacePath('a/..b.txt')).toBe('a/..b.txt');
+    for (const bad of ['..', 'a/..', './..', '..\\x', 'a/../b']) {
+      expect(() => normalizeWorkspacePath(bad)).toThrow(/Illegal workspace path/);
+    }
+  });
 });
 
 describe('createInMemoryWorkspace', () => {
@@ -43,6 +55,14 @@ describe('createInMemoryWorkspace', () => {
     await ws.delete('b.txt');
     expect(await ws.exists('b.txt')).toBe(false);
     await ws.delete('b.txt'); // idempotent, no throw
+  });
+
+  it('an illegal path rejects from exists() and delete() too, not just read/write', async () => {
+    // The contract createFileWorkspace now shares (it used to answer false / no-op).
+    const ws = createInMemoryWorkspace();
+    await expect(ws.exists('../x')).rejects.toMatchObject({ name: 'InvalidRequestError' });
+    await expect(ws.delete('../x')).rejects.toMatchObject({ name: 'InvalidRequestError' });
+    await expect(ws.list('../')).rejects.toMatchObject({ name: 'InvalidRequestError' });
   });
 
   it('read of a missing path throws; bytes round-trip', async () => {
