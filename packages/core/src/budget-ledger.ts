@@ -227,9 +227,10 @@ function aggregate(input: BudgetAggregate): BudgetAggregate {
     input.unpricedUsd === undefined ? 0 : count(input.unpricedUsd, 'Aggregate unpricedUsd');
   if (
     unknownTokens > folded ||
-    unknownUsd + unpriced > folded ||
+    unknownUsd > folded ||
     unestimatedTokens > unknownTokens ||
-    unestimatedUsd > unknownUsd
+    unestimatedUsd > unknownUsd ||
+    unpriced > unestimatedUsd
   )
     throw new BudgetLedgerError('invalid_snapshot', 'Budget aggregate counts are inconsistent.');
   return Object.freeze({
@@ -394,11 +395,6 @@ function fold(
         next.spent[dimension] += actual;
         continue;
       }
-      if (dimension === 'usd' && item.unpriced) {
-        // Unpriced USD stays out of every total after folding, too (2.3).
-        next.unpricedUsd++;
-        continue;
-      }
       const estimate = item.reservation[dimension];
       next.held[dimension] += estimate ?? 0;
       if (dimension === 'tokens') {
@@ -407,6 +403,8 @@ function fold(
       } else {
         next.unknownUsd++;
         if (estimate === undefined) next.unestimatedUsd++;
+        // Still unpriced after folding (2.3): it never fails a later USD cap closed.
+        if (item.unpriced) next.unpricedUsd++;
       }
     }
   }
@@ -642,13 +640,13 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
       for (const dimension of dimensions) {
         const value = item.actual[dimension];
         if (value !== undefined) spent[dimension] += value;
-        else if (dimension === 'usd' && item.unpriced) unpriced++;
         else {
           reserved[dimension] += item.reservation[dimension] ?? 0;
           if (dimension === 'tokens') unknownTokens++;
           else unknownUsd++;
         }
       }
+      if (unpricedUsd(item)) unpriced++;
     }
     for (const item of aggregates.values()) {
       if (!inScope(item.scopes, scopeId)) continue;
@@ -759,7 +757,9 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
         [...aggregates.values()].some(
           (item) =>
             inScope(item.scopes, scopeId) &&
-            (dimension === 'tokens' ? item.unestimatedTokens : item.unestimatedUsd) > 0,
+            (dimension === 'tokens'
+              ? item.unestimatedTokens
+              : item.unestimatedUsd - (item.unpricedUsd ?? 0)) > 0,
         );
       if (estimate === undefined || unreserved) {
         throw new BudgetLedgerError(

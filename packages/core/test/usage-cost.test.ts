@@ -158,7 +158,7 @@ describe('legacy per-invocation usage cost', () => {
       pricedUsd: 1,
       costUsd: 1,
       calls: 4,
-      unknownCalls: 0,
+      unknownCalls: 2,
       unpricedCalls: 2,
       unpricedModels: ['unpriced'],
     });
@@ -169,7 +169,7 @@ describe('legacy per-invocation usage cost', () => {
         pricedUsd: 0,
         costUsd: 0,
         calls: 1,
-        unknownCalls: 0,
+        unknownCalls: 1,
         unpricedCalls: 1,
         unpricedModels: ['m'],
       });
@@ -187,7 +187,7 @@ describe('legacy per-invocation usage cost', () => {
       version: 1,
       pricedUsd: 2,
       calls: 2,
-      unknownCalls: 0,
+      unknownCalls: 1,
       unpricedCalls: 1,
       unpricedModels: ['free-tier'],
     });
@@ -196,7 +196,7 @@ describe('legacy per-invocation usage cost', () => {
     expect(priceUsage).toHaveBeenCalledTimes(2);
     expect(() =>
       createUsageCostAccumulator({
-        snapshot: { ...saved, unknownCalls: 2 },
+        snapshot: { ...saved, unknownCalls: 0 },
       }),
     ).toThrow(/snapshot/);
   });

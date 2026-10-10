@@ -9,9 +9,9 @@ export interface UsageCostSnapshot {
   readonly version: 1;
   readonly pricedUsd: number;
   readonly calls: number;
-  /** Calls whose price lookup failed or was still pending: their cost is unknown. */
+  /** Calls whose cost is unknown: failed, still pending, or unpriced. */
   readonly unknownCalls: number;
-  /** Calls to a model with no price (2.3); they add nothing to `pricedUsd`. */
+  /** The part of `unknownCalls` made to a model with no price (2.3). */
   readonly unpricedCalls?: number;
   /** Those models in first-seen order (2.3). */
   readonly unpricedModels?: readonly string[];
@@ -28,8 +28,9 @@ export interface UsageCostSummary {
    */
   readonly costUsd?: number;
   readonly calls: number;
+  /** Calls whose cost is unknown, unpriced calls included. */
   readonly unknownCalls: number;
-  /** Calls to a model with no price (2.3); omitted when zero. */
+  /** The part of `unknownCalls` made to a model with no price (2.3); omitted when zero. */
   readonly unpricedCalls?: number;
   /** Those models in first-seen order (2.3). */
   readonly unpricedModels?: readonly string[];
@@ -101,8 +102,9 @@ export function createUsageCostAccumulator(
       saved.calls < 0 ||
       !Number.isSafeInteger(saved.unknownCalls) ||
       saved.unknownCalls < 0 ||
+      saved.unknownCalls > saved.calls ||
       !count(saved.unpricedCalls) ||
-      saved.unknownCalls + (saved.unpricedCalls ?? 0) > saved.calls ||
+      (saved.unpricedCalls ?? 0) > saved.unknownCalls ||
       (saved.unpricedModels !== undefined &&
         (!Array.isArray(saved.unpricedModels) ||
           saved.unpricedModels.length > (saved.unpricedCalls ?? 0) ||
@@ -153,8 +155,9 @@ export function createUsageCostAccumulator(
         // A price lookup failure is not a zero-cost model invocation.
       }
       if (price === undefined) {
-        // No price for this model (2.3): it adds nothing to the priced total,
-        // and nothing to the cache savings either.
+        // No price for this model (2.3): its cost stays unknown, but it adds
+        // nothing to the priced total or the cache savings.
+        unknownCalls++;
         unpricedCalls++;
         if (!unpricedModels.includes(model)) unpricedModels.push(model);
         warn(model);
@@ -215,7 +218,8 @@ export function createUsageCostAccumulator(
       while (pending > 0) await queue;
       return Object.freeze({
         pricedUsd,
-        ...(unknownCalls === 0 ? { costUsd: pricedUsd } : {}),
+        // Only a failed lookup makes the cost unknowable; unpriced calls add nothing.
+        ...(unknownCalls === unpricedCalls ? { costUsd: pricedUsd } : {}),
         calls,
         unknownCalls,
         ...unpriced(),

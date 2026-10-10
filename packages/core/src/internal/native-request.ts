@@ -4,10 +4,34 @@ import { EMPTY_USAGE, withTotal } from '../core/metering';
 import { getCapabilities } from '../core/registry';
 import { createTokenEstimator } from './estimate-tokens';
 import { wireOutputCap } from './output-cap';
+import { unpricedModelWarning } from './unpriced';
 import type { CommonCallOptions } from '../types/config';
-import type { ResolvedDependencies } from '../types/deps';
+import type { PriceProvider, ResolvedDependencies } from '../types/deps';
+import type { BudgetLedger, NativeExecutionContext } from '../types/execution';
 import type { Usage } from '../types/usage';
 import type { InternalRunOptions } from '../core/inference';
+
+/** Without a `deps.priceProvider` no model has a price (2.3). */
+const NO_PRICES: PriceProvider = { priceUsage: () => undefined };
+
+/** Models reported per ledger: one `unpriced-model` warning per run and model. */
+const reported = new WeakMap<BudgetLedger, Set<string>>();
+/** Whether a ledger's persistent scopes bound USD; fixed when the ledger is created. */
+const persistentUsd = new WeakMap<BudgetLedger, boolean>();
+
+/** True when a USD bound applies to calls made under this context. */
+function boundsUsd(execution: NativeExecutionContext): boolean {
+  // The context budget already intersects every ancestor's.
+  if (execution.budget.usd !== undefined) return true;
+  let bounded = persistentUsd.get(execution.ledger);
+  if (bounded === undefined) {
+    bounded =
+      execution.ledger.snapshot().admission?.some((scope) => scope.limits.usd !== undefined) ??
+      false;
+    persistentUsd.set(execution.ledger, bounded);
+  }
+  return bounded;
+}
 
 /** Loaded only for callers opting into mandatory execution accounting. */
 export function createNativeRequest(
@@ -20,6 +44,17 @@ export function createNativeRequest(
   const execution = options.execution!;
   let reservationId: string | undefined;
   const assert = () => assertExecutionPolicy(execution, { modelId, now: deps.clock.now() });
+  /** Report that the USD budget cannot count this model, once per ledger. */
+  const reportUnpriced = (): void => {
+    let models = reported.get(execution.ledger);
+    if (models?.has(modelId) || !boundsUsd(execution)) return;
+    if (!models) reported.set(execution.ledger, (models = new Set()));
+    models.add(modelId);
+    const warning = unpricedModelWarning(modelId, deps.priceProvider !== undefined);
+    // A loop's sink puts it on the result and mirrors it to the logger.
+    if (internal.warnings) internal.warnings.add(warning);
+    else deps.logger.warn(warning.message, { warning: warning.type, setting: warning.setting });
+  };
   return {
     assert,
     async reserve(): Promise<void> {
@@ -45,24 +80,31 @@ export function createNativeRequest(
         totalTokens: promptTokens + outputTokens,
       };
       let usd = options.executionEstimate?.usd;
-      if (usd === undefined && deps.priceProvider) {
+      // Decision 4 (2.3): no price provider, or no price for this model, makes an
+      // unpriced call; its budget's `unknownPrice` decides. A lookup that throws
+      // is an outage: without an estimate a USD bound still refuses the call.
+      let unpriced = false;
+      if (usd === undefined) {
         try {
-          usd = (await deps.priceProvider.priceUsage(modelId, estimatedUsage)) ?? undefined;
+          usd = (await deps.priceProvider?.priceUsage(modelId, estimatedUsage)) ?? undefined;
+          unpriced = usd === undefined;
         } catch {
           /* Unknown prices cannot admit a bounded USD request. */
         }
       }
       // The ledger revision only grows; a reservation count shrinks after 2.2 compaction.
       const requestId = `${execution.scopeId}/${deps.generateId()}/${execution.ledger.snapshot().revision + 1}`;
-      await execution.reserve({
+      const reservation = await execution.reserve({
         requestId,
         modelId,
         now: deps.clock.now(),
         kind: internal.observe?.purpose ?? internal.operation ?? 'model',
         tokens: options.executionEstimate?.tokens ?? estimatedUsage.totalTokens,
         ...(usd !== undefined ? { usd } : {}),
+        ...(unpriced ? { unpriced: true } : {}),
       });
       reservationId = requestId;
+      if (reservation.unpriced) reportUnpriced();
       try {
         assert();
         if (userSignal?.aborted)
@@ -78,7 +120,7 @@ export function createNativeRequest(
       const id = reservationId;
       reservationId = undefined;
       if (usage && available)
-        await execution.ledger.settleUsage(id, withTotal(usage), deps.priceProvider);
+        await execution.ledger.settleUsage(id, withTotal(usage), deps.priceProvider ?? NO_PRICES);
       else await execution.ledger.markUnknown(id);
     },
     async rejectResponse(status: number): Promise<void> {

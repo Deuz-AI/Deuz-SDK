@@ -44,7 +44,7 @@ describe('unpriced models under a USD budget (decision 4)', () => {
     expect(ledger.totals()).toMatchObject({
       reserved: { tokens: 60, usd: 0 },
       unknownTokens: 1,
-      unknownUsd: 0,
+      unknownUsd: 1,
       unpriced: 1,
     });
     await expect(
@@ -58,7 +58,7 @@ describe('unpriced models under a USD budget (decision 4)', () => {
     expect(ledger.totals()).toMatchObject({
       spent: { tokens: 40, usd: 0 },
       reserved: { tokens: 0, usd: 0 },
-      unknownUsd: 0,
+      unknownUsd: 1,
       unpriced: 1,
     });
   });
@@ -197,13 +197,24 @@ describe('unpriced models under a USD budget (decision 4)', () => {
     expect(ledger.snapshot().aggregates?.[0]).toMatchObject({
       count: 1,
       spent: { tokens: 7, usd: 0 },
-      unknownUsd: 0,
-      unestimatedUsd: 0,
+      unknownUsd: 1,
+      unestimatedUsd: 1,
       unpricedUsd: 1,
     });
     expect(ledger.totals()).toMatchObject({ spent: { tokens: 7, usd: 0 }, unpriced: 1 });
+    // A 2.2 reader drops the 2.3 count and keeps failing a USD cap closed.
+    const legacy = roundTrip(ledger.snapshot());
+    const dropped = createBudgetLedger({
+      snapshot: {
+        ...legacy,
+        aggregates: legacy.aggregates!.map(({ unpricedUsd: _unknownTo22, ...rest }) => rest),
+      },
+    });
+    await expect(
+      dropped.reserve({ requestId: 'b', modelId: 'priced', tokens: 1, usd: 0.5, scopes: [root] }),
+    ).rejects.toMatchObject({ code: 'missing_reservation' });
     const restored = createBudgetLedger({ snapshot: roundTrip(ledger.snapshot()) });
-    expect(restored.totals()).toMatchObject({ unknownUsd: 0, unpriced: 1 });
+    expect(restored.totals()).toMatchObject({ unknownUsd: 1, unpriced: 1 });
     await expect(
       restored.reserve({ requestId: 'b', modelId: 'priced', tokens: 1, usd: 0.5, scopes: [root] }),
     ).resolves.toMatchObject({ state: 'reserved' });

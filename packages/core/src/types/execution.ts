@@ -103,8 +103,9 @@ export interface BudgetTotals {
   readonly unknownTokens: number;
   readonly unknownUsd: number;
   /**
-   * Attempts whose model has no price (2.3): their cost is in no USD total and
-   * not in `unknownUsd`, so `spent.usd` is a lower bound. Omitted when zero.
+   * The part of `unknownUsd` whose model has no price (2.3): those attempts
+   * hold no USD and add nothing to any USD total, so `spent.usd` is a lower
+   * bound. Omitted when zero.
    */
   readonly unpriced?: number;
 }
@@ -129,8 +130,9 @@ export interface BudgetAggregate {
   readonly unestimatedTokens: number;
   readonly unestimatedUsd: number;
   /**
-   * Folded attempts whose model had no price (2.3): their USD stays out of
-   * every total and does not fail a USD cap closed. Omitted when zero.
+   * The part of `unestimatedUsd` whose model had no price (2.3): it does not
+   * fail a later USD cap closed. Omitted when zero; a 2.2 reader, which drops
+   * it, keeps failing closed.
    */
   readonly unpricedUsd?: number;
 }
