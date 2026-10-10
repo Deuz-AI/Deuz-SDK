@@ -318,6 +318,14 @@ can implement the optional `head(key)` (2.2) to return the run record alone; the
 memory and SQLite stores do. Without it the reader falls back to `load`, which
 reads every task, so a custom store for large runs should provide `head`.
 
+A settled run stays in the store until you prune it (2.3).
+`store.prune({ before, scope?, limit? })` deletes up to `limit` (default 100)
+completed, partial or cancelled runs whose `updatedAt` is before `before`,
+oldest first, with their tasks, events and blackboard notes, and returns how
+many it deleted. Running and suspended runs stay. A pruned run can no longer be
+resumed, read or replayed. The memory, SQLite and Postgres stores have it; see
+[Retention](/docs/modules/operations#retention).
+
 ## Suspension, reconciliation and cancellation
 
 `handle.result` settles when the run completes, becomes partial, is cancelled, or
