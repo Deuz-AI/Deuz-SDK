@@ -226,6 +226,25 @@ describe('finish-reason gate: buffered loop', () => {
     expect(String(result.steps?.[0]?.toolResults[0]?.result)).toContain('not a JSON object');
   });
 
+  // A raw JSON Schema (every MCP tool's) performs no validation, so a value that
+  // parsed but is not an object would otherwise reach `execute` verbatim.
+  it.each([
+    ['null', null],
+    ['an array', [1, 2]],
+    ['a number', 5],
+  ])('never executes a tool call whose arguments parsed to %s', async (_label, args) => {
+    const { execute, tools } = weatherTool();
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'get_weather', id: 'bad', args }] }, { text: 'ok' }],
+    });
+    const result = await generateText({ model, prompt: 'x', tools, maxSteps: 3 });
+    expect(execute).not.toHaveBeenCalled();
+    expect(result.steps?.[0]?.toolResults).toEqual([
+      expect.objectContaining({ toolCallId: 'bad', isError: true }),
+    ]);
+    expect(String(result.steps?.[0]?.toolResults[0]?.result)).toContain('not a JSON object');
+  });
+
   it('never executes a pending call with unparsed arguments on the settle path', async () => {
     const { execute, tools } = weatherTool();
     const { model } = anthropic([done()]);
