@@ -27,18 +27,34 @@ export type BudgetLedgerErrorCode =
   /** The persistent `BudgetStore` failed; nothing was admitted or changed locally (2.2). */
   | 'admission_failed'
   /** A model with no price was refused under a USD bound with `unknownPrice: 'reject'` (2.3). */
-  | 'unpriced_model';
+  | 'unpriced_model'
+  /**
+   * A billed attempt could not be settled because the persistent store kept
+   * failing (2.3). Its hold stays at the estimate under `requestId`; settle it
+   * again with `settlement` once the store is back.
+   */
+  | 'settlement_failed';
 
 export class BudgetLedgerError extends Error {
   readonly name = 'BudgetLedgerError';
   readonly fatalExecution = true;
+  // `declare`: only errors that carry them get these properties.
+  /** The attempt this error leaves held (2.3, `settlement_failed`). */
+  declare readonly requestId?: string;
+  /** What still has to be settled for `requestId` (2.3, `settlement_failed`). */
+  declare readonly settlement?: BudgetSettlement;
 
   constructor(
     readonly code: BudgetLedgerErrorCode,
     message: string,
     cause?: unknown,
+    details?: { readonly requestId: string; readonly settlement?: BudgetSettlement },
   ) {
     super(message, cause === undefined ? undefined : { cause });
+    if (details) {
+      this.requestId = details.requestId;
+      if (details.settlement) this.settlement = details.settlement;
+    }
   }
 }
 
