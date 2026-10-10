@@ -1,6 +1,6 @@
 ---
 title: Operations
-description: Leases, drain, recovery and cross-process cancellation for durable swarms, with SQLite and Postgres backends, fenced native agent runs, retention and schema versions.
+description: Leases, drain, recovery and cross-process cancellation for durable swarms, with SQLite, Postgres and Redis backends, fenced native agent runs, retention and schema versions.
 ---
 
 A durable swarm or native agent run can outlive the process that started it.
@@ -24,6 +24,8 @@ Two mechanisms keep this safe:
 | `@deuz-sdk/core/ops/sqlite` | `createSqliteOpsStore`: leases, agent runs and schedule claims | Node |
 | `@deuz-sdk/core/ops/postgres` | `createPostgresOpsStore`: leases, agent runs and schedule claims | Node |
 | `@deuz-sdk/core/swarm/postgres` | `createPostgresSwarmStore` | Node |
+| `@deuz-sdk/core/ops/redis` | `createRedisOpsStore`: leases, agent runs and schedule claims; `createRedisBudgetStore` (2.3) | Node |
+| `@deuz-sdk/core/swarm/redis` | `createRedisSwarmStore` (2.3) | Node |
 
 ## Leases
 
@@ -44,8 +46,8 @@ queued, reports it on every later renewal and hands it to the next holder,
 until the holder records it durably and calls `ack(lease, 'cancel')`. The
 renewal reports what stays queued in `queued`. `ack` is fenced by the lease: it
 returns `false` and removes nothing once the key changed hands. The memory,
-SQLite and Postgres providers support both; a provider without `ack` ignores
-the option and removes every signal it delivers, as in 2.2.
+SQLite, Postgres and Redis providers support both; a provider without `ack`
+ignores the option and removes every signal it delivers, as in 2.2.
 
 ```ts
 import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
@@ -62,7 +64,7 @@ await leases.release(lease!);
 ```
 
 The in-memory provider suits tests and single-process deployments; its leases
-die with the process. Use the SQLite or Postgres provider when several
+die with the process. Use the SQLite, Postgres or Redis provider when several
 processes share runs.
 
 ## Swarm leases
@@ -154,7 +156,7 @@ run's key, and the next executor to claim the run cancels it before
 dispatching anything.
 
 Since 2.3 it is not lost after the holder reads it either. With a provider that
-has `ack`, as the memory, SQLite and Postgres providers do, the executor renews
+has `ack`, as the memory, SQLite, Postgres and Redis providers do, the executor renews
 with acknowledged delivery: the cancel stays queued until the commit that
 records it, or until the run's end makes it moot, and only then is it
 acknowledged. A holder that reads the cancel and dies, or whose cancel commit
@@ -185,7 +187,7 @@ throws on an acquire, `recover` stops at once; after three failures in a row of
 any other kind, such as a store that went down after the listing, it stops too.
 Either way it returns the executors it already started, and `failed` ends with
 the run that stopped it. `recover` needs the `lease` option and a store with the
-`'list'` capability; the memory, SQLite and Postgres stores have it.
+`'list'` capability; the memory, SQLite, Postgres and Redis stores have it.
 
 Heartbeats do not write to the swarm store, so a healthy run can keep an old
 `updatedAt` and sort ahead of a crashed one. `recover` therefore pages through
@@ -255,8 +257,8 @@ The ops and swarm stores keep their rows until you prune them (2.3). Each
 prune deletes only rows that nothing can still need and returns how many it
 deleted; call them from a periodic job. Times are epoch milliseconds on the
 store's clock: the injected `clock` for the memory and SQLite stores, the
-database clock for Postgres. Budget stores have their own
-[`prune`](/docs/modules/budgets#retention).
+database clock for Postgres, the server's `TIME` for Redis. Budget stores have
+their own [`prune`](/docs/modules/budgets#retention).
 
 | Call | Deletes | Keeps |
 | --- | --- | --- |
@@ -266,9 +268,9 @@ database clock for Postgres. Budget stores have their own
 | `prune({ before, scope?, limit? })` on a swarm store | Up to `limit` (1 to 1000, default 100) completed, partial or cancelled runs whose `updatedAt` is before `before`, oldest first, with their tasks, events and blackboard notes | Running and suspended runs |
 
 `leases.prune` is part of `LeaseProvider` (optional, like `ack`), and
-`prune` of `SwarmStore`; the memory, SQLite and Postgres implementations have
-both. `agentRuns.prune` and `claims.prune` belong to the SQLite and Postgres ops
-stores.
+`prune` of `SwarmStore`; the memory, SQLite, Postgres and Redis implementations
+have both. `agentRuns.prune` and `claims.prune` belong to the SQLite, Postgres
+and Redis ops stores.
 
 What a prune deletes is gone:
 
@@ -385,6 +387,88 @@ stores' contracts and races of concurrent writers on a real Postgres, through a
 pool of several connections that all default to `REPEATABLE READ`. That suite
 runs when `DEUZ_TEST_POSTGRES_URL` names a database, as in the repository's CI.
 
+## Redis
+
+`createRedisOpsStore({ client | url, prefix? })` (2.3) returns `leases`,
+`agentRuns`, `claims` and `close()`, like the SQLite and Postgres ops stores.
+The same entry has `createRedisBudgetStore`, the
+[budget store](/docs/modules/budgets#durable-stores), and
+`@deuz-sdk/core/swarm/redis` has `createRedisSwarmStore`, the swarm store. All
+three are Node-only and need Redis 7 or later.
+
+```ts
+import { createClient } from 'redis';
+import { createSwarm } from '@deuz-sdk/core/swarm';
+import { createRedisSwarmStore } from '@deuz-sdk/core/swarm/redis';
+import { createRedisOpsStore } from '@deuz-sdk/core/ops/redis';
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+const ops = createRedisOpsStore({ client: redis, prefix: 'jobs' });
+const swarm = createSwarm({
+  agents: {},
+  reducers: { total: { execute: () => 42 } },
+  store: createRedisSwarmStore({ client: redis, prefix: 'jobs' }),
+  lease: { provider: ops.leases },
+});
+
+const { handles, failed } = await swarm.recover();
+console.log(`${handles.length} runs taken over, ${failed.length} could not be resumed`);
+```
+
+- **One Lua script per operation.** Redis runs a script atomically, so a lease
+  changes hands at most once, an agent run save is a compare-and-set on its
+  revision, a claim key is granted once and a budget admission never admits
+  past a limit. A swarm commit reads what its validation needs in one script
+  and writes in another that runs only while the run is still at the revision
+  and generation it read: a concurrent writer gets `SwarmConflictError` and
+  nothing of its commit is written, and a run pruned and created again under the
+  same key never takes a write meant for the old one. There is no `WATCH` or
+  `MULTI`: on a shared node-redis connection a watch is not isolated from the
+  other commands in flight, and an optimistic transaction needs a retry loop
+  under contention.
+- **Server time.** Lease expiry, claim and agent run times and budget windows
+  come from Redis `TIME`, read inside the scripts, so host clock skew does not
+  matter.
+- **One hash tag per store.** Every key starts with `{<prefix>:ops}`,
+  `{<prefix>:budget}` or `{<prefix>:swarm}` (the prefix defaults to `deuz`), so
+  a Redis Cluster keeps each store in one slot, where every script stays atomic.
+  A prefix holding `{` or `}` is refused.
+- **Clients.** The stores need one method, `eval(script, { keys, arguments })`,
+  node-redis's `EVAL` signature, typed `RedisScriptClient`. A connected
+  node-redis client (v4, v5 or v6, standalone or cluster) fits as it is; wrap
+  ioredis with `wrapIoredisClient(io)`. `{ url }` instead of `{ client }`
+  imports the optional `redis` peer on first use and connects once; `close()`
+  quits that connection and is final. An injected client is never closed.
+- **Batched retention.** `leases.prune`, `agentRuns.prune`, `claims.prune` and
+  the budget store's `prune` remove at most 1 000 entries per script and run
+  again until a batch comes back short, so a large backlog never holds the
+  server in one long script. A swarm prune deletes up to its `limit` in one
+  script.
+- **Durability is your server's.** Redis acknowledges a write from memory. What
+  survives a crash depends on its persistence: with AOF and
+  `appendfsync everysec` up to about a second of writes can be lost, and with
+  snapshots alone everything since the last one. A replica promoted after a
+  failover may lack the last writes it had not received. A lost lease write
+  costs liveness, which the revision fence covers; a lost budget charge or
+  agent run save is lost. Enable AOF for these stores.
+
+| Key (tag `T`) | Holds |
+| --- | --- |
+| `T:lease:owner`, `T:lease:token`, `T:lease:signals` | Hashes by lease key |
+| `T:lease:expiry` | Sorted set of lease keys by expiry, 0 once released |
+| `T:run:payload`, `T:run:revision` | Hashes by native run ID |
+| `T:run:terminal` | Sorted set of terminal native runs by their last save |
+| `T:claims` | Sorted set of claim keys by the time they were granted; keys are stored as they are |
+| `T:schema` | The layout version, one string per store |
+
+The budget and swarm stores keep a hash per request, scope and run, with sorted
+sets that index them; their key layouts are listed in the source of
+`node/redis-budget.ts` and `node/swarm-redis.ts`. The stores' contracts run
+offline against ioredis-mock, which runs the same Lua scripts, and against a
+real Redis 7 in the repository's CI when `DEUZ_TEST_REDIS_URL` names one,
+including races of concurrent writers on two connections.
+
 ## Schema versions and upgrades
 
 Every durable store keeps its own schema version in a table of its own,
@@ -400,6 +484,7 @@ through a newer layout.
 | SQLite and Postgres ops (`createSqliteOpsStore`, `createPostgresOpsStore`) | `deuz_ops_schema` | 1 |
 | SQLite and Postgres budget (`createSqliteBudgetStore`, `createPostgresBudgetStore`) | `deuz_budget_schema` | 1 |
 | SQLite evolve (`createSqlitePopulationStore`) | `deuz_evolve_schema` | 1 |
+| Redis ops, budget and swarm (`createRedisOpsStore`, `createRedisBudgetStore`, `createRedisSwarmStore`) | the key `{<prefix>:<store>}:schema`, stamped on first use | 1 (new in 2.3) |
 | Store packs (`createSqliteStores`, `createPostgresStores`) | `PRAGMA user_version`, `deuz_meta` | 1; see [Stores](/docs/modules/stores#migrations-and-schema-ownership) |
 
 The records inside carry versions of their own:
@@ -443,8 +528,8 @@ back.
 
 ## Native agent run revisions
 
-`AgentRunEnvelope.revision` increases by one on every save. The SQLite and
-Postgres `agentRuns` stores, and `createInMemoryAgentRunStore`, reject any save
+`AgentRunEnvelope.revision` increases by one on every save. The SQLite,
+Postgres and Redis `agentRuns` stores, and `createInMemoryAgentRunStore`, reject any save
 that is not the stored revision plus one. An envelope written by 2.1 has no
 revision and counts as 0. An executor whose save is rejected stops, and its run
 result reports the failure.

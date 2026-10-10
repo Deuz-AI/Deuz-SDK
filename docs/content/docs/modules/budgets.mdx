@@ -328,19 +328,26 @@ await handle.result;
 
 ## Durable stores
 
-The in-memory store is for tests and single-process deployments. Two durable
+The in-memory store is for tests and single-process deployments. Three durable
 stores implement the same contract and pass the same conformance suite:
 
 ```ts
 import { createSqliteBudgetStore } from '@deuz-sdk/core/ops/sqlite';
 import { createPostgresBudgetStore } from '@deuz-sdk/core/ops/postgres';
+import { createRedisBudgetStore } from '@deuz-sdk/core/ops/redis';
 import pg from 'pg';
+import { createClient } from 'redis';
 
 // Processes on one machine: one database file, BEGIN IMMEDIATE per change.
 const local = createSqliteBudgetStore({ path: './budgets.sqlite' });
 
 // Many machines: every admission is one statement that locks the scope rows.
 const shared = createPostgresBudgetStore({ client: new pg.Pool(), schema: 'public' });
+
+// Many machines on Redis 7+: every admission is one Lua script (2.3).
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+const onRedis = createRedisBudgetStore({ client: redis });
 ```
 
 - **SQLite** keeps its tables and its own schema version under `deuz_budget_*`.
@@ -354,6 +361,15 @@ const shared = createPostgresBudgetStore({ client: new pg.Pool(), schema: 'publi
   pooled client never splits them across connections. Windows use database
   time, never host clocks. The schema must exist; the tables are created on
   first use, and concurrent first uses queue on an advisory lock.
+- **Redis** (2.3, `@deuz-sdk/core/ops/redis`) takes a client that runs Lua
+  scripts: a connected node-redis client as it is, or ioredis through
+  `wrapIoredisClient`. Admission, settlement and release are each one script,
+  atomic on the server, and windows use the server's `TIME`, never host clocks.
+  It keeps the Postgres store's model (a ring of window slots per scope, history
+  per model) under keys that share the hash tag `{<prefix>:budget}`, so a Redis
+  Cluster keeps them in one slot. Needs Redis 7 or later. `{ url }` instead of
+  `{ client }` imports the optional `redis` peer on first use, and `close()` then
+  quits that connection.
 
 `usage(key, { since, byModel })` reports committed usage (settled amounts plus
 held estimates) over the key's history, or since a point in time; a bucket that
@@ -365,8 +381,8 @@ until you [prune](#retention) them.
 A hold stays open when its caller never settles or releases it: the process
 crashed after reserving, or every attempt to settle failed. An open hold keeps
 its estimate charged. In a windowed budget it leaves with its bucket; in a
-lifetime budget it stays until you close it. Since 2.3 the memory, SQLite and
-Postgres stores list and close open holds:
+lifetime budget it stays until you close it. Since 2.3 the memory, SQLite,
+Postgres and Redis stores list and close open holds:
 
 - `holds({ before, limit?, after? })` lists the holds reserved before a time,
   oldest first, a page at a time: request ID, model, held estimates, the time it

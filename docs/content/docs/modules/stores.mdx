@@ -32,7 +32,7 @@ A single object cannot implement `MemoryStore` and `SessionStore` at the same ti
 | `memory` | yes — FTS5 + vector **hybrid** (RRF) | yes — client-side cosine / substring | yes — pgvector HNSW, or JS cosine fallback |
 | `chats` | yes | yes | yes |
 | `sessions` | yes | yes | yes |
-| `runs` | yes | **no** | yes |
+| `runs` | yes | yes (2.3) | yes |
 | Vector search | in-process cosine over a bounded prefetch | in-process cosine over the scope | in-database (`vector_cosine_ops`) when pgvector is installed |
 | Lexical search | FTS5 `bm25()`, LIKE fallback | substring | `ILIKE` |
 | Scales to | one process / one machine | a shared cache, narrow scopes | production, wide scopes |
@@ -49,7 +49,7 @@ Read top to bottom and stop at the first "yes".
 3. **Is memory search a real feature — semantic recall over thousands of records per user?**
    → **Postgres, with pgvector.** It is the only pack where the vector search happens *in the database*; the other two move rows to your process and rank them there. This is the answer for anything multi-tenant.
 4. **Otherwise — you already run Redis, scopes are narrow (one `chatId`, one `userId`), and memory is a nice-to-have rather than the product?**
-   → **Redis.** Fastest per-key access of the three, no schema to own, and the [MULTI caveat](#no-multi-in-v1--and-the-readers-are-built-for-it) is real but bounded. Note it has no `runs` seam.
+   → **Redis.** Fastest per-key access of the three, no schema to own, and the [MULTI caveat](#no-multi-in-v1--and-the-readers-are-built-for-it) is real but bounded. Since 2.3 it serves `runs` too.
 
 Two more things that decide it in practice, before the technical merits do: **who owns the schema** (Postgres puts `deuz_*` tables in a database a DBA already watches — see [schema ownership](#migrations-and-schema-ownership)), and **what the runtime allows** (SQLite writes to a filesystem, which a container with a read-only root or a serverless function does not usefully have).
 
@@ -315,10 +315,10 @@ import { createRedisStores } from '@deuz-sdk/core/stores/redis';
 const client = createClient({ url: process.env.REDIS_URL! });
 await client.connect();
 
-const stores = createRedisStores({ client }); // { memory, chats, sessions }
+const stores = createRedisStores({ client }); // { memory, chats, sessions, runs }
 ```
 
-There is **no hard dependency on any Redis package**: the pack talks to `RedisClientLike`, an eleven-command structural seam spelled exactly the way node-redis spells it, so a connected `RedisClientType` (v4 **or** v5) is assignable with no wrapper and no `as`.
+There is **no hard dependency on any Redis package**: the pack talks to `RedisClientLike`, an eleven-command structural seam spelled exactly the way node-redis spells it, so a connected `RedisClientType` (v4, v5 **or** v6) is assignable with no wrapper and no `as`. Since 2.3 the seam has one optional twelfth method, `eval`, in node-redis's `EVAL` signature: this pack never calls it, and it is the only method the [Redis ops, budget and swarm stores](/docs/modules/operations#redis) need (`RedisScriptClient`).
 
 ```ts
 interface RedisClientLike {
@@ -333,13 +333,14 @@ interface RedisClientLike {
   zAdd(key: string, members: RedisZMember | RedisZMember[]): Promise<unknown>;
   zRem(key: string, members: string | string[]): Promise<unknown>;
   zRangeByScore(key: string, min: number | string, max: number | string): Promise<string[]>;
+  eval?(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>; // 2.3
 }
 ```
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `client` | `RedisClientLike` | — | An **already connected** client. The production path: your app owns pool size, TLS, retries and shutdown order, and `close()` never quits it. |
-| `url` | `string` | — | The convenience path. Lazily `import('redis')`s the **optional** peer (`^4.6.0 \|\| ^5.0.0`) and connects on the first command; `close()` quits exactly this client, because the pack opened it. |
+| `url` | `string` | — | The convenience path. Lazily `import('redis')`s the **optional** peer (`^4.6.0 \|\| ^5.0.0 \|\| ^6.0.0`) and connects on the first command; `close()` quits exactly this client, because the pack opened it. |
 | `prefix` | `string` | `'deuz'` | Key namespace. Not escaped — it is yours, not a user's. |
 
 `client` and `url` are mutually exclusive arms of a union: pass one.
@@ -380,7 +381,6 @@ export async function POST(req: Request) {
     messages,
     chat: { store: stores.chats, chatId, scope: { userId } },
     session: { store: stores.sessions, runId: chatId },
-    // No `runs` seam on this pack — a run dashboard needs SQLite or Postgres.
   });
 
   return toDeuzStreamResponse(result);
@@ -389,35 +389,19 @@ export async function POST(req: Request) {
 
 There is no schema step, and no migration: the [key layout](#key-schema) is created as it is written. Two setup decisions do matter, though. **Pick a `prefix` per application** if the Redis instance is shared — it is the only isolation boundary, and it is not escaped, so keep it a plain constant rather than anything user-derived. And **decide who closes the connection**: with `{ client }` that is you (`stores.close()` deliberately does nothing), while with `{ url }` it is the pack — and a closed `{ url }` pack never reconnects.
 
-### ioredis (and anything else) in ten lines
+### ioredis (and anything else)
 
-ioredis spells its commands in lowercase and is in upstream maintenance mode, which is why node-redis is the documented client. It still fits through a plain object — no class, no adapter package:
+ioredis spells its commands in lowercase and is in upstream maintenance mode, which is why node-redis is the documented client. Since 2.3 `wrapIoredisClient` fits an ioredis client (or cluster) to the whole seam, `eval` included, so the same wrapped client also serves the [Redis ops, budget and swarm stores](/docs/modules/operations#redis):
 
-```ts title="ioredis-adapter.ts"
+```ts title="ioredis.ts"
 import Redis from 'ioredis';
-import { createRedisStores, type RedisClientLike } from '@deuz-sdk/core/stores/redis';
+import { createRedisStores, wrapIoredisClient } from '@deuz-sdk/core/stores/redis';
 
 const io = new Redis(process.env.REDIS_URL!);
-
-const client: RedisClientLike = {
-  get: (k) => io.get(k),
-  set: (k, v) => io.set(k, v),
-  del: (k) => io.del(...(Array.isArray(k) ? k : [k])),
-  sAdd: (k, m) => io.sadd(k, ...(Array.isArray(m) ? m : [m])),
-  sRem: (k, m) => io.srem(k, ...(Array.isArray(m) ? m : [m])),
-  sMembers: (k) => io.smembers(k),
-  sInter: (k) => io.sinter(...(Array.isArray(k) ? k : [k])),
-  mGet: (keys) => io.mget(...keys),
-  zAdd: (k, m) =>
-    io.zadd(k, ...(Array.isArray(m) ? m : [m]).flatMap((e) => [e.score, e.value])),
-  zRem: (k, m) => io.zrem(k, ...(Array.isArray(m) ? m : [m])),
-  zRangeByScore: (k, min, max) => io.zrangebyscore(k, min, max),
-};
-
-const stores = createRedisStores({ client });
+const stores = createRedisStores({ client: wrapIoredisClient(io) });
 ```
 
-The same shape covers a cluster proxy, a Upstash HTTP client, or a test double.
+It maps each command onto its lowercase spelling and `eval`'s key list onto ioredis's positional key count, and answers an empty batch (`mGet([])`, `del([])`) itself, because Redis rejects those commands without a key. The connection stays yours. Anything else with the twelve methods fits the seam as a plain object: a cluster proxy, an HTTP client, a test double.
 
 ### Key schema
 
@@ -434,6 +418,9 @@ P:chat:rec:<chatId>   STRING  serializeChatRecord (binary-safe)
 P:chat:ix             SET     chat ids
 P:sess:rec:<runId>    STRING  serializeCheckpoint (binary-safe)
 P:sess:ix             SET     run ids
+P:run:rec:<runId>     STRING  JSON RunRecord (2.3)
+P:run:ix              ZSET    score = createdAt, member = runId
+P:run:st:<status>     ZSET    the same, one per status
 ```
 
 `sweepExpiredMemories` reads the `P:mem:expiry` ZSET, so its cost is O(expired), not O(stored).
@@ -467,7 +454,9 @@ That is the honest trade of a v1 Redis backend. `search()` narrows by the scope 
 
 So a query costs O(records in the scope), not O(matching records), and it moves the scope's rows over the wire. Keep scopes narrow (`chatId`, `userId`); reach for the Postgres pack once a single scope grows past a few thousand records. A server-side vector index would mean Redis Stack, a schema and a migration — out of scope for a drop-in adapter.
 
-This pack serves `memory`, `chats` and `sessions`. It has **no `runs`**: [`RunStore.list({ status })`](/docs/modules/autonomy) is a scan, and a scan is the one thing this key layout is worst at. Use SQLite or Postgres for the run dashboard.
+### Runs (2.3)
+
+`stores.runs` is the [`RunStore`](/docs/modules/autonomy) the SQLite and Postgres packs already had (the 2.0 changelog listed it for Redis too, before it existed). A run is its record string plus a membership in `P:run:ix` and in one ZSET per status, so `list()` and `list({ status })` are index reads followed by one `mGet`, oldest `createdAt` first. Writes follow the pack's rule for surviving a crash between commands: the new status set first, then the record, then the stale status set, and a listing trusts the record's own status, so a run is never listed under a status it no longer has and never missing from the one it has. `update` reads the record and writes it back, which is safe because a run has one writer, its worker. The seam needs only the eleven commands, not `eval`.
 
 ---
 
