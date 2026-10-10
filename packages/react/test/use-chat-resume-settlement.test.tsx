@@ -767,4 +767,110 @@ describe('useChat — recycled call ids in a replayed turn (2.3)', () => {
       content: [{ type: 'tool_result', toolUseId: 'tool_0', result: 'paper-2' }],
     });
   });
+
+  it('runs an identical repeated client call after a reconnect from no cursor', async () => {
+    // Both legs ask roll({}) as tool_0. Leg 1 is answered; leg 2's stream drops.
+    const leg = [parts.toolCall('tool_0', 'roll', {}), parts.finish()];
+    const wire = journal();
+    let posts = 0;
+    const fetchMock: typeof fetch = async () => {
+      posts++;
+      if (posts === 1) return wire.respond(leg);
+      if (posts === 2) return wire.respondDropping(leg, 1);
+      return postResponse([parts.text('Rolled twice.'), parts.finish()]);
+    };
+    const onToolCall = vi.fn(async (_call: ToolCallArg) => 4);
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: fetchMock,
+        onToolCall,
+        resume: { endpoint: wire.endpoint },
+      }),
+    );
+    await act(async () => {
+      await result.current.sendMessage('roll twice');
+    });
+    await waitFor(() => expect(result.current.status).toBe('error'));
+    expect(onToolCall).toHaveBeenCalledTimes(1);
+
+    // POST reads never advance the cursor, so this replays both legs: two
+    // deliveries of roll({}) against one answer in the history.
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(wire.cursors).toEqual([undefined]);
+    expect(onToolCall).toHaveBeenCalledTimes(2);
+    expect(posts).toBe(3);
+    expect(result.current.messages.at(-1)?.content).toBe('Rolled twice.');
+  });
+
+  it('runs an identical repeated client call after a reconnect from the cursor', async () => {
+    const leg = [parts.toolCall('tool_0', 'roll', {}), parts.finish()];
+    const wire = journal();
+    await wire.leg(leg); // the server ran leg 1 while the page reloaded
+    let posts = 0;
+    const fetchMock: typeof fetch = async () => {
+      posts++;
+      if (posts === 1) return wire.respondDropping(leg, 1);
+      return postResponse([parts.text('Rolled twice.'), parts.finish()]);
+    };
+    const onToolCall = vi.fn(async (_call: ToolCallArg) => 4);
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: fetchMock,
+        onToolCall,
+        resume: { endpoint: wire.endpoint, auto: true },
+        initialMessages: [{ role: 'user', content: 'roll twice' }],
+      }),
+    );
+    // The auto resume reads leg 1, runs roll and POSTs its result; that continuation drops.
+    await waitFor(() => expect(posts).toBe(1));
+    await waitFor(() => expect(result.current.status).toBe('error'));
+    expect(onToolCall).toHaveBeenCalledTimes(1);
+
+    // The replay holds leg 2 only. Its roll({}) is new, although the history
+    // already answers an identical tool_0 from leg 1.
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(wire.cursors).toEqual([undefined, '1']);
+    expect(onToolCall).toHaveBeenCalledTimes(2);
+    expect(posts).toBe(2);
+    // The transcript never ends on an unanswered tool_use.
+    expect(result.current.history.canonical.at(-1)).toEqual({
+      role: 'assistant',
+      content: 'Rolled twice.',
+    });
+  });
+
+  it('still never runs an answered call again when the endpoint ignores the cursor', async () => {
+    const leg = [parts.toolCall('tool_0', 'roll', {}), parts.finish()];
+    const wire = journal();
+    await wire.leg(leg);
+    const route = answeringRoute('Rolled.');
+    const onToolCall = vi.fn(async (_call: ToolCallArg) => 4);
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: route.fetch,
+        onToolCall,
+        resume: { endpoint: wire.replayEverything },
+        initialMessages: [USER],
+      }),
+    );
+    for (let read = 0; read < 3; read++) {
+      await act(async () => {
+        await result.current.reconnect();
+      });
+      await waitFor(() => expect(result.current.status).toBe('idle'));
+    }
+    // One delivery of roll({}), answered once: re-reading it from the start changes nothing.
+    expect(wire.cursors).toEqual([undefined, '1', '1']);
+    expect(onToolCall).toHaveBeenCalledTimes(1);
+    expect(route.bodies).toHaveLength(1);
+  });
 });
