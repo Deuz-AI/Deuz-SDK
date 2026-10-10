@@ -191,7 +191,7 @@ Each transfer tool is an ordinary tool with one optional parameter:
 
 A transfer is decided by the loop **before any tool executes**, by looking at the call — never by a control-flow exception thrown out of an `execute`. The transfer tools carry a hidden, non-enumerable marker that the loop reads; `Object.keys`, `JSON.stringify` and every wire builder never see it.
 
-Order within a step: **handoff interception → guardrails → approval gate → `executeTools`**. So an `onToolCall` [guardrail](/docs/agents/guardrails) never sees a transfer call, and a transfer is never queued for human approval.
+Order within a step (2.3): **execution policy → `onToolCall` guardrails → approval gate → handoff decision → `executeTools`**. A transfer call takes the same policy and gate as any call: an `onToolCall` [guardrail](/docs/agents/guardrails) sees it and can block it, and `requireApproval` (or a `needsApproval` you set on a transfer tool) gates it. A refused transfer is answered with its denial and the run stays with the current agent; a transfer waiting for a verdict suspends the run and the resume decides it. The decision is still deterministic: a cleared transfer is decided by looking at the call, never by executing it.
 
 Consequences worth stating:
 
@@ -304,7 +304,7 @@ Pin `compaction.summarizeModel` (and, if the two models' windows differ a lot, `
 
 - [Sub-agents](/docs/agents/subagents) — `agentTool`, the delegation counterpart.
 - [createAgent](/docs/agents/create-agent) — agents as frozen values, usable directly as handoff targets.
-- [Guardrails](/docs/agents/guardrails) — the hooks a transfer is deliberately intercepted *before*.
+- [Guardrails](/docs/agents/guardrails) — `onToolCall` sees transfer calls too (2.3).
 - [Tool loop](/docs/agents/tool-loop) — step boundaries, the runaway guard, and denial handling.
 - [Durable runtime](/docs/agents/durable-runtime) — checkpoints and `resumeFromCheckpoint`.
 - [Compaction](/docs/modules/compaction) — the summarize layer a transfer re-points.

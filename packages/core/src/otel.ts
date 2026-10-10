@@ -465,12 +465,18 @@ function toSemconvPart(raw: unknown): Record<string, unknown> {
     input?: unknown;
     toolUseId?: unknown;
     result?: unknown;
+    encrypted?: unknown;
+    redacted?: unknown;
   };
   switch (part.type) {
     case 'text':
       return { type: 'text', content: String(part.text ?? '') };
     case 'reasoning':
-      return { type: 'reasoning', content: String(part.text ?? '') };
+      // Encrypted and redacted blocks are opaque provider state: their kind only (2.3).
+      return {
+        type: 'reasoning',
+        content: part.encrypted === true || part.redacted === true ? '' : String(part.text ?? ''),
+      };
     case 'tool_use':
       return {
         type: 'tool_call',

@@ -444,7 +444,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
 
 // --- stream parsing ---
 
-interface AnthropicUsage {
+export interface AnthropicUsage {
   input_tokens?: number;
   output_tokens?: number;
   cache_read_input_tokens?: number;
@@ -589,16 +589,16 @@ function mapStopReason(reason: string | null): FinishReason {
   }
 }
 
-function buildUsage(input: AnthropicUsage, outputTokens: number): Usage {
+export function mapAnthropicUsage(input: AnthropicUsage, outputTokens: number): Usage {
   // Fallbacks/compaction report per-attempt usage in `iterations` while the
   // top-level usage covers only the serving attempt — sum iterations instead.
   // An entry carries token counters only (@anthropic-ai/sdk 0.133.0,
   // `BetaIterationsUsage`): the server tool requests and the thinking-token
   // detail are reported at the top level alone, so they are kept from there.
   if (input.iterations && input.iterations.length > 0) {
-    const top = buildUsage({ ...input, iterations: undefined }, outputTokens);
+    const top = mapAnthropicUsage({ ...input, iterations: undefined }, outputTokens);
     const attempts = input.iterations.map((it) =>
-      buildUsage({ ...it, iterations: undefined }, it.output_tokens ?? 0),
+      mapAnthropicUsage({ ...it, iterations: undefined }, it.output_tokens ?? 0),
     );
     const sum = (count: (u: Usage) => number): number =>
       attempts.reduce((total, u) => total + count(u), 0);
@@ -777,7 +777,7 @@ async function* parseStream(
       if (notice) yield notice;
       yield {
         type: 'finish',
-        usage: buildUsage(inputUsage, outputTokens),
+        usage: mapAnthropicUsage(inputUsage, outputTokens),
         finishReason: mapStopReason(stopReason),
         ...finishMeta(),
       };
@@ -793,7 +793,7 @@ async function* parseStream(
     if (notice) yield notice;
     yield {
       type: 'finish',
-      usage: buildUsage(inputUsage, outputTokens),
+      usage: mapAnthropicUsage(inputUsage, outputTokens),
       finishReason: mapStopReason(stopReason),
       ...finishMeta(),
     };

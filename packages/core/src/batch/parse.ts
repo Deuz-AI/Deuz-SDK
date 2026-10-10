@@ -8,11 +8,13 @@
  * `Response` / `ChatCompletion`, `@google/genai` 2.28 `GenerateContentResponse`);
  * not live-verified.
  *
- * The Anthropic and Responses usage mappings repeat their adapters' private
- * ones; `test/batch-parse.test.ts` holds them to the adapters' results.
+ * Usage goes through each wire's own adapter mapper, so a batch reply bills
+ * exactly as the streamed reply would; `test/batch-parse.test.ts` pins it.
  */
+import { mapAnthropicUsage, type AnthropicUsage } from '../adapters/anthropic';
 import { mapGeminiUsage } from '../adapters/google-native';
 import { mapOpenAIUsage } from '../adapters/openai-compatible';
+import { mapResponsesUsage, type ResponsesUsage } from '../adapters/openai-responses';
 import type { StopDetails } from '../types/methods';
 import type { ModelSurface } from '../types/model';
 import type { FinishReason, Usage } from '../types/usage';
@@ -91,51 +93,6 @@ export function parseReply(surface: ModelSurface, body: unknown): ParsedReply {
 
 // --- Anthropic Messages ---
 
-interface AnthropicUsage {
-  input_tokens?: number;
-  output_tokens?: number;
-  cache_read_input_tokens?: number;
-  cache_creation_input_tokens?: number;
-  cache_creation?: { ephemeral_1h_input_tokens?: number };
-  output_tokens_details?: { thinking_tokens?: number };
-  server_tool_use?: { web_search_requests?: number; code_execution_requests?: number };
-  iterations?: AnthropicUsage[];
-}
-
-/** As `buildUsage` in adapters/anthropic.ts: iterations are summed, thinking is a share of output. */
-function anthropicUsage(input: AnthropicUsage, outputTokens: number): Usage {
-  if (input.iterations && input.iterations.length > 0) {
-    return input.iterations
-      .map((it) => anthropicUsage({ ...it, iterations: undefined }, it.output_tokens ?? 0))
-      .reduce((acc, u) => ({
-        inputTokens: acc.inputTokens + u.inputTokens,
-        outputTokens: acc.outputTokens + u.outputTokens,
-        reasoningTokens: acc.reasoningTokens + u.reasoningTokens,
-        cachedReadTokens: acc.cachedReadTokens + u.cachedReadTokens,
-        cacheWriteTokens: acc.cacheWriteTokens + u.cacheWriteTokens,
-        cacheWrite1hTokens: acc.cacheWrite1hTokens + u.cacheWrite1hTokens,
-        totalTokens: acc.totalTokens + u.totalTokens,
-      }));
-  }
-  const cacheRead = input.cache_read_input_tokens ?? 0;
-  const cacheWriteTotal = input.cache_creation_input_tokens ?? 0;
-  const cacheWrite1h = input.cache_creation?.ephemeral_1h_input_tokens ?? 0;
-  const inputTokens = input.input_tokens ?? 0;
-  const serverTools =
-    (input.server_tool_use?.web_search_requests ?? 0) +
-    (input.server_tool_use?.code_execution_requests ?? 0);
-  return {
-    inputTokens,
-    outputTokens,
-    reasoningTokens: input.output_tokens_details?.thinking_tokens ?? 0,
-    cachedReadTokens: cacheRead,
-    cacheWriteTokens: Math.max(0, cacheWriteTotal - cacheWrite1h),
-    cacheWrite1hTokens: cacheWrite1h,
-    ...(serverTools > 0 ? { serverToolUses: serverTools } : {}),
-    totalTokens: inputTokens + cacheRead + cacheWriteTotal + outputTokens,
-  };
-}
-
 function anthropicFinish(reason: unknown): FinishReason {
   switch (reason) {
     case 'max_tokens':
@@ -180,7 +137,7 @@ function parseMessage(body: Json): ParsedReply {
     reasoning,
     toolCalls,
     finishReason: anthropicFinish(body.stop_reason),
-    usage: anthropicUsage(usage, usage.output_tokens ?? 0),
+    usage: mapAnthropicUsage(usage, usage.output_tokens ?? 0),
     usageAvailable:
       typeof usage.input_tokens === 'number' && typeof usage.output_tokens === 'number',
     ...(stopDetails ? { stopDetails } : {}),
@@ -189,34 +146,6 @@ function parseMessage(body: Json): ParsedReply {
 }
 
 // --- OpenAI Responses ---
-
-interface ResponsesUsage {
-  input_tokens?: number;
-  output_tokens?: number;
-  total_tokens?: number;
-  input_tokens_details?: { cached_tokens?: number };
-  output_tokens_details?: { reasoning_tokens?: number };
-}
-
-/** As `mapResponsesUsage` in adapters/openai-responses.ts. */
-function responsesUsage(u: ResponsesUsage | undefined): Usage {
-  const input = u?.input_tokens ?? 0;
-  const cached = u?.input_tokens_details?.cached_tokens ?? 0;
-  const reported = u?.output_tokens ?? 0;
-  const reasoning = u?.output_tokens_details?.reasoning_tokens ?? 0;
-  const reasoningApart =
-    reasoning > 0 && (reasoning > reported || u?.total_tokens === input + reported + reasoning);
-  const output = reasoningApart ? reported + reasoning : reported;
-  return {
-    inputTokens: Math.max(0, input - cached),
-    outputTokens: output,
-    reasoningTokens: reasoning,
-    cachedReadTokens: cached,
-    cacheWriteTokens: 0,
-    cacheWrite1hTokens: 0,
-    totalTokens: u?.total_tokens ?? input + output,
-  };
-}
 
 function parseResponse(body: Json): ParsedReply {
   let out = '';
@@ -262,7 +191,7 @@ function parseResponse(body: Json): ParsedReply {
     reasoning,
     toolCalls,
     finishReason,
-    usage: responsesUsage(usage),
+    usage: mapResponsesUsage(usage),
     usageAvailable:
       typeof usage?.input_tokens === 'number' && typeof usage.output_tokens === 'number',
     ...(Object.keys(openai).length > 0 ? { providerMetadata: { openai } } : {}),

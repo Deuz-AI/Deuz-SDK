@@ -659,3 +659,53 @@ import { CheckpointVersionError } from '../src/durable';
 expectTypeOf(edgeResolveModelProfile).toEqualTypeOf<typeof resolveModelProfile>();
 expectTypeOf(EdgeUnpricedModelError).toEqualTypeOf<typeof UnpricedModelError>();
 expectTypeOf(EdgeCheckpointVersionError).toEqualTypeOf<typeof CheckpointVersionError>();
+
+// W2a: native run discovery and the run lease (23.6).
+import { createInMemoryAgentRunStore, ExecutionPolicyError } from '../src/agent';
+import type {
+  AgentRunStore,
+  AgentRunListPage,
+  AgentRunLeaseOptions,
+  AgentRunOptions,
+} from '../src/agent';
+expectTypeOf<ReturnType<NonNullable<AgentRunStore['list']>>>().toEqualTypeOf<
+  Promise<AgentRunListPage>
+>();
+expectTypeOf<AgentRunOptions['lease']>().toEqualTypeOf<AgentRunLeaseOptions | undefined>();
+expectTypeOf(createInMemoryAgentRunStore).returns.toEqualTypeOf<
+  AgentRunStore & Required<Pick<AgentRunStore, 'list'>>
+>();
+
+// W2a: one dispatch contract (23.2): outcomes, catalog changes, inherited guardrails.
+import type {
+  ToolCallOutcome,
+  ToolResult,
+  ToolResultStreamPart,
+  ToolExecuteContext,
+} from '../src/index';
+expectTypeOf<ToolResult['outcome']>().toEqualTypeOf<ToolCallOutcome | undefined>();
+expectTypeOf<ToolStatePart['outcome']>().toEqualTypeOf<ToolCallOutcome | undefined>();
+expectTypeOf<ToolResultStreamPart['outcome']>().toEqualTypeOf<ToolCallOutcome | undefined>();
+expectTypeOf<AgentRunOptions['onCatalogChange']>().toEqualTypeOf<'stop' | 'accept' | undefined>();
+expectTypeOf<CommonCallOptions['onCatalogChange']>().toEqualTypeOf<'stop' | 'accept' | undefined>();
+expectTypeOf<Extract<AgentResult, { status: 'stopped' }>['unknownEffects']>().toEqualTypeOf<
+  AgentToolReceipt[] | undefined
+>();
+expectTypeOf<ToolExecuteContext>().toHaveProperty('guardrails');
+expectTypeOf<ExecutionPolicyError['toolCallId']>().toEqualTypeOf<string | undefined>();
+
+// W2a: the Redis backends.
+import type { RedisClientLike, RedisStores } from '../src/node/store-redis';
+import type { RunStore } from '../src/runtime';
+import {
+  createRedisOpsStore,
+  createRedisBudgetStore,
+  type RedisOpsStore,
+  type RedisBudgetStore,
+} from '../src/node/ops-redis';
+import { createRedisSwarmStore, type RedisSwarmStore } from '../src/node/swarm-redis';
+expectTypeOf<undefined>().toMatchTypeOf<RedisClientLike['eval']>();
+expectTypeOf(createRedisOpsStore).returns.toEqualTypeOf<RedisOpsStore>();
+expectTypeOf(createRedisBudgetStore).returns.toEqualTypeOf<RedisBudgetStore>();
+expectTypeOf(createRedisSwarmStore).returns.toEqualTypeOf<RedisSwarmStore>();
+expectTypeOf<RedisStores['runs']>().toEqualTypeOf<Required<RunStore>>();

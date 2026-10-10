@@ -34,7 +34,7 @@ Every event extends `ObserveEventBase`:
 | `tool.completed` | `durationMs`, `outputType`, `outputSize?` |
 | `tool.failed` | The ORIGINAL thrown error (normalized), `selfHealed`, `consecutiveFailureCount` |
 | `tool.denied` | `cause` (`server-denied`/`response-denied`/`no-response`/`client-tool-no-result`), `reason?` |
-| `approval.requested` | `approvalId` (= `toolCallId` today), `mode` (`server`/`client`) |
+| `approval.requested` | `approvalId` (the request's identity-bound id, 2.3), `mode` (`server`/`client`) |
 | `approval.resolved` | `approved: boolean`, `source` (`server`/`client-response`/`default-deny`), `waitDurationMs?` (resume legs, from checkpoint age) |
 | `checkpoint.saved` | `stepId`, `checkpointStepIndex` (1-based boundary counter), `checkpointStatus`, save `durationMs`, cumulative `usage` |
 | `checkpoint.loaded` | Emitted by the resume entry points BEFORE `run.started`; `checkpointAgeMs?` |

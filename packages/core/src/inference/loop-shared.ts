@@ -1292,11 +1292,11 @@ export async function applyToolResultGuardrails(
 }
 
 /**
- * Return a COPY of an assistant turn whose text is `text` — the shape
- * `assembleAssistant` would have produced had the model said that. Reasoning and
- * `tool_use` parts survive untouched and stay in canonical order; an EMPTY
- * `text` removes the text part entirely, exactly as `assembleAssistant` omits
- * one for an empty answer.
+ * Return a COPY of an assistant turn whose text is `text` — the turn the model
+ * would have produced had it said that. Reasoning and `tool_use` parts survive
+ * untouched and keep their places; the new text takes the first text part's
+ * place (or goes before the first `tool_use`), and an EMPTY `text` removes the
+ * text part entirely, as a turn assembles none for an empty answer.
  *
  * Never mutates: the immutable-history invariant means the loop replaces the
  * last element of each array with this copy rather than editing in place.
@@ -1703,8 +1703,10 @@ function renderTranscript(messages: Message[]): string {
     const parts: string[] = [];
     for (const p of m.content) {
       if (p.type === 'text') parts.push(p.text);
-      else if (p.type === 'reasoning') parts.push(`(thinking) ${p.text}`);
-      else if (p.type === 'tool_use') parts.push(`[calls ${p.name}(${safeText(p.input)})]`);
+      else if (p.type === 'reasoning') {
+        // Encrypted and redacted blocks are opaque provider state, not text to summarize.
+        if (!p.encrypted && !p.redacted) parts.push(`(thinking) ${p.text}`);
+      } else if (p.type === 'tool_use') parts.push(`[calls ${p.name}(${safeText(p.input)})]`);
       else if (p.type === 'tool_result') parts.push(`[tool result: ${safeText(p.result)}]`);
       else if (p.type === 'image') parts.push('[image]');
       else parts.push('[content]');
@@ -2017,6 +2019,7 @@ export function toStepResult(
     toolCalls,
     toolResults,
     finishReason: step.finishReason,
+    ...(step.stopDetails ? { stopDetails: step.stopDetails } : {}),
     usage: step.usage,
     response: { messages },
   };

@@ -37,8 +37,14 @@ const consumers = [
   },
   {
     name: 'ops',
-    source: `export { createInMemoryLeaseProvider }
+    source: `export { createInMemoryLeaseProvider, findStaleAgentRuns, agentRunLeaseKey }
       from '@deuz-sdk/core/ops';`,
+  },
+  {
+    name: 'goal',
+    source: `export { createGoal, transitionGoal, assessGoal, parseGoal, serializeGoal,
+      createGoalEvent, goalEventFromOccurrence, goalEventFromSignal, goalWakeupEvent,
+      createInMemoryGoalStore, GoalError } from '@deuz-sdk/core/goal';`,
   },
   {
     name: 'evolve',
@@ -63,6 +69,16 @@ const consumers = [
     source: `export { createRealtimeSession, createOpenAIRealtime, createGeminiLive,
       createOpenAIClientSecret, createGeminiAuthToken, realtimePriceTable, RealtimeError }
       from '@deuz-sdk/core/realtime';`,
+  },
+  {
+    name: 'batch',
+    source:
+      "export { createBatchClient, createMemoryBatchJobStore, BatchError } from '@deuz-sdk/core/batch';",
+  },
+  {
+    name: 'a2a',
+    source: `export { createA2AClient, fetchAgentCard, createA2AHandler, createInMemoryA2ATaskStore,
+      a2aText, A2AError } from '@deuz-sdk/core/a2a';`,
   },
 ];
 
@@ -91,7 +107,7 @@ function nodeOnlyReferences(result) {
   const output = result.outputFiles?.map((file) => file.text).join('\n') ?? '';
   if (forbiddenBuiltins.test(output)) issues.push('bundled output references a node: builtin');
   const nodeOnlyInput = Object.keys(result.metafile?.inputs ?? {}).find((input) =>
-    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/](?:server[\\/])?stdio|swarm[\\/](?:sqlite|postgres)|ops[\\/](?:sqlite|postgres)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|ops-sqlite|ops-postgres|budget-sqlite|budget-postgres|evolve-sqlite))/.test(
+    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/](?:server[\\/])?stdio|swarm[\\/](?:sqlite|postgres|redis)|ops[\\/](?:sqlite|postgres|redis)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|swarm-redis|ops-sqlite|ops-postgres|ops-redis|budget-sqlite|budget-postgres|redis-budget|redis-scripts|evolve-sqlite))/.test(
       input,
     ),
   );
@@ -120,6 +136,8 @@ const nodeOnlyEntries = [
   ['swarm/postgres', 'createPostgresSwarmStore'],
   ['ops/sqlite', 'createSqliteOpsStore, createSqliteBudgetStore'],
   ['ops/postgres', 'createPostgresOpsStore, createPostgresBudgetStore'],
+  ['ops/redis', 'createRedisOpsStore, createRedisBudgetStore'],
+  ['swarm/redis', 'createRedisSwarmStore'],
   ['evolve/sqlite', 'createSqlitePopulationStore'],
   ['mcp/server/stdio', 'serveMcpStdio'],
 ];
@@ -147,6 +165,9 @@ for (const entry of [
   'dist/schedule.js',
   'dist/realtime.js',
   'dist/mcp/server.js',
+  'dist/goal.js',
+  'dist/batch.js',
+  'dist/a2a.js',
 ]) {
   const source = readFileSync(resolve(root, entry), 'utf8');
   if (forbiddenBuiltins.test(source)) failures.push(`${entry}: directly imports a node: builtin`);

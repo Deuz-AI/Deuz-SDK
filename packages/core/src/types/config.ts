@@ -635,6 +635,15 @@ export interface CommonCallOptions {
    */
   mcp?: McpLoopEntry[];
   /**
+   * What the run does when an MCP server changes its tool catalog mid-run (2.3):
+   * `'accept'` (the default for `generateText`/`streamChat`) carries on with the
+   * new catalog and reports the change as a `warning` (`setting: 'mcp'`);
+   * `'stop'` ends the run with `providerMetadata.deuz.stoppedBy:
+   * 'mcp-catalog-changed'` before the model is offered it. Native runs declare
+   * their own (`AgentRunOptions.onCatalogChange`, default `'stop'`).
+   */
+  onCatalogChange?: 'stop' | 'accept';
+  /**
    * Opaque per-call context (2.0 additive) threaded, UNTOUCHED, into every hook
    * that can act on it: `ToolExecuteContext.runtimeContext`, `prepareStep`,
    * `verifyStep`, `doneWhen`, and all three guardrail hooks. Sub-agents

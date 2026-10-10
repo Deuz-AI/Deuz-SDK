@@ -29,7 +29,7 @@ import { EMPTY_USAGE } from './core/metering';
 import { getCapabilities } from './core/registry';
 import { runStream } from './core/inference';
 import { runStreamToolLoop, type StreamToolLoopSnapshot } from './inference/stream-tool-loop';
-import { assembleAssistant, stopDetailsFrom, type EncryptedReasoning } from './inference/run-step';
+import { createTurnContent, stopDetailsFrom } from './inference/run-step';
 import {
   answersApproval,
   buildWireTools,
@@ -1087,9 +1087,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             },
           );
           let buffer = '';
-          let reasoningText = '';
-          let reasoningSignature: string | undefined;
-          const encryptedReasoning: EncryptedReasoning = [];
+          // The answer turn keeps every reasoning block where it arrived (2.3, F21).
+          const turn = createTurnContent();
           let toolId: string | undefined;
           let lastDraft: string | undefined;
           let elementCount = 0;
@@ -1130,15 +1129,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             emitPart(part, 'finalizing');
             if (part.type === 'error') streamError = part.error;
             if (part.type === 'finish') finishMeta = part.providerMetadata;
-            if (part.type === 'reasoning-delta') {
-              if (part.encrypted)
-                encryptedReasoning.push({ text: part.text, signature: part.signature });
-              else {
-                reasoningText += part.text;
-                if (part.signature) reasoningSignature = part.signature;
-              }
-            }
+            if (part.type === 'reasoning-delta') turn.reasoning(part);
             if (part.type === 'text-delta' && strategy !== 'tool') {
+              turn.text(part);
               buffer += part.text;
               await publishDraft();
             }
@@ -1196,14 +1189,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           const answer: Message =
             strategy === 'tool'
               ? { role: 'assistant', content: buffer }
-              : assembleAssistant(
-                  buffer,
-                  reasoningText,
-                  reasoningSignature,
-                  new Map(),
-                  [],
-                  encryptedReasoning,
-                ).assistantMessage;
+              : turn.assemble(new Map(), []).assistantMessage;
           if (phase && strategy !== 'tool') answer.providerMetadata = { openai: { phase } };
           if (!isBlankTurn(answer)) envelope.messages = [...envelope.messages, answer];
           await persist();

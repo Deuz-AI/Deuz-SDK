@@ -677,6 +677,8 @@ interface McpSamplingRequest {
 }
 ```
 
+`execution` (2.3): pass the run's execution context and a sampling request takes the dispatch contract's path. The policy decides first (`allowedModels`, deadline), then `approve`, and the call is reserved on the context's ledger. `deps` supplies its clock, priceProvider and transport. See [native MCP](/docs/modules/native-mcp#sampling-requests).
+
 <Callout type="warn" title="Sampling drives your model and spends your money">
 Configuring `sampling` hands a remote server the ability to run inference on your key, with your credits, inside your rate limits — and the prompt is written entirely by that server. `approve` and the `maxTokens` ceiling exist for exactly that reason: they are the only two things standing between a compromised or greedy server and your bill. A server you do not fully control should have both.
 
@@ -686,7 +688,7 @@ The blast radius is bounded but not zero: the sample runs as a plain single-turn
 Facts worth pinning:
 
 - **The capability is declared only when you configure `sampling`.** A server cannot ask a client that never advertised it.
-- **`approve` is the HITL gate and it runs first**, so a refused request never reaches the provider. Returning `false` — or throwing — refuses it; the SDK turns either into a JSON-RPC error back to the server, so a refusal costs nothing and is visible upstream. A throw propagates verbatim, because its message is more useful to the server than one we would invent.
+- **`approve` is the HITL gate and it runs first** (after the execution policy, when you pass `execution`), so a refused request never reaches the provider. Returning `false` — or throwing — refuses it; the SDK turns either into a JSON-RPC error back to the server, so a refusal costs nothing and is visible upstream. A throw propagates verbatim, because its message is more useful to the server than one we would invent.
 - **The request is reviewed in canonical shape.** An approval gate that had to re-parse the MCP wire shape would be one more place to get the mapping wrong.
 - **Your model always wins.** `modelPreferences` is forwarded into the request object for your `approve` to read; it never selects a model.
 - **`maxTokens` is a clamp, never a raise.** A server that omits it gets a 1024-token default — never sample unbounded.

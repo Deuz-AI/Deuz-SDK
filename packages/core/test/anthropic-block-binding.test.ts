@@ -263,6 +263,19 @@ describe('input_transformations surface as a typed warning', () => {
     expect(finish.providerMetadata).toEqual({ anthropic: { input_transformations: DROPPED } });
   });
 
+  it("a single streamChat streams it once and reports it on the result's warnings", async () => {
+    const { fetch } = mockFetch(() => sseResponse([done({ start: DROPPED })]));
+    const result = streamChat({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-5-5'),
+      messages: REPLAYS,
+    });
+    const parts = await drain(result.fullStream);
+    expect(parts.filter((p) => p.type === 'warning')).toHaveLength(1);
+    expect(
+      (await result.warnings)?.filter((w) => w.setting === 'thinking.block_binding'),
+    ).toHaveLength(1);
+  });
+
   it('a shown-anyway mismatch is reported too', async () => {
     const allowed = [
       {

@@ -429,7 +429,7 @@ describe('native finalization on the Anthropic wire (F15)', () => {
       expect(result.messages.at(-1)).toEqual({
         role: 'assistant',
         content: [
-          { type: 'reasoning', text: 'Format it.', signature: 'SIG_C' },
+          { type: 'reasoning', text: 'Format it.', signature: 'SIG_C', source: 'anthropic' },
           { type: 'text', text: '{"a":"20C"}' },
         ],
       });

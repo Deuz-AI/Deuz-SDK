@@ -24,6 +24,7 @@ import type {
   CallWarning,
   GenerateTextOptions,
   GenerateTextResult,
+  StopDetails,
   StreamChatOptions,
   StreamChatResult,
 } from '../types/methods';
@@ -166,6 +167,8 @@ export function runStreamWithFallback(
   const broadcaster = createBroadcaster<StreamPart>();
   const usageDeferred = createDeferred<Usage>();
   const finishDeferred = createDeferred<FinishReason>();
+  // The winner's stop explanation (2.3), settled with `finishReason`.
+  const stopDetailsDeferred = createDeferred<StopDetails | undefined>();
   const fullSub = broadcaster.subscribe();
   const textSub = broadcaster.subscribe();
   const memoryDeferred =
@@ -266,6 +269,7 @@ export function runStreamWithFallback(
           // Pre-first-content failure — this attempt may fail over.
           attempt.usage.catch(() => {});
           attempt.finishReason.catch(() => {});
+          void attempt.stopDetails?.catch(() => {});
           void attempt.memory?.catch(() => {});
           lastError = failure;
           if (i < candidates.length - 1 && should(failure)) {
@@ -277,6 +281,7 @@ export function runStreamWithFallback(
           broadcaster.push({ type: 'error', error: failure });
           usageDeferred.reject(failure);
           finishDeferred.reject(failure);
+          stopDetailsDeferred.reject(failure);
           memoryDeferred?.resolve([]);
           broadcaster.close();
           return;
@@ -305,6 +310,7 @@ export function runStreamWithFallback(
               broadcaster.push({ type: 'error', error });
               usageDeferred.reject(error);
               finishDeferred.reject(error);
+              stopDetailsDeferred.reject(error);
               memoryDeferred?.resolve([]);
               broadcaster.close();
               return;
@@ -323,6 +329,11 @@ export function runStreamWithFallback(
         } catch (error) {
           finishDeferred.reject(error);
         }
+        try {
+          stopDetailsDeferred.resolve(await attempt.stopDetails);
+        } catch (error) {
+          stopDetailsDeferred.reject(error);
+        }
         if (memoryDeferred) {
           if (attempt.memory) {
             void attempt.memory.then((mutations) => memoryDeferred.resolve(mutations));
@@ -338,6 +349,7 @@ export function runStreamWithFallback(
       broadcaster.push({ type: 'error', error });
       usageDeferred.reject(error);
       finishDeferred.reject(error);
+      stopDetailsDeferred.reject(error);
       memoryDeferred?.resolve([]);
       broadcaster.close();
     }
@@ -440,6 +452,10 @@ export function runStreamWithFallback(
     get finishReason() {
       ensureStarted();
       return finishDeferred.promise;
+    },
+    get stopDetails() {
+      ensureStarted();
+      return stopDetailsDeferred.promise;
     },
     get warnings() {
       ensureStarted();

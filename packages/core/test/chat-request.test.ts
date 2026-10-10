@@ -264,6 +264,26 @@ describe('volume limits', () => {
     expect(joined(validateChatRequest(bigToolInput))).toContain('messages[0] carries more than');
   });
 
+  it('excludes encrypted and redacted reasoning, like image bytes (2.3)', () => {
+    // useChat posts every reasoning block of a turn back; opaque provider state is not prose.
+    const turn = (reasoning: Record<string, unknown>) => ({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'r'.repeat(200), ...reasoning },
+            { type: 'text', text: 'ok' },
+          ],
+        },
+      ],
+    });
+    expect(validateChatRequest(turn({ encrypted: true }), { maxTextBytes: 100 }).ok).toBe(true);
+    expect(validateChatRequest(turn({ redacted: true }), { maxTextBytes: 100 }).ok).toBe(true);
+    expect(joined(validateChatRequest(turn({}), { maxTextBytes: 100 }))).toContain(
+      'messages[0] carries more than 100 text bytes',
+    );
+  });
+
   it('a payload nested past the walk depth is REFUSED, not waved through', () => {
     // The bypass this closes: bury the volume deeper than the byte walk goes and
     // it used to count as zero. Fail-closed — "cannot measure" is not "small".

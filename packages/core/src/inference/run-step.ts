@@ -4,6 +4,7 @@ import type { Message, Part } from '../types/message';
 import type { ReasoningDeltaPart, TextDeltaPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
 import { runStream, type InternalRunOptions } from '../core/inference';
+import { stopDetailsFrom } from '../internal/stop-details';
 
 type ToolUsePart = Extract<Part, { type: 'tool_use' }>;
 
@@ -19,37 +20,14 @@ export function blocksToolDispatch(finishReason: FinishReason): boolean {
   return finishReason === 'content_filter' || finishReason === 'length';
 }
 
-/**
- * Read the provider's stop explanation off a finish part's `providerMetadata`
- * (2.3). Anthropic sends `stop_details` with a refusal; other providers send
- * nothing comparable today, so this returns `undefined` for them.
- */
-export function stopDetailsFrom(
-  providerMetadata: Record<string, unknown> | undefined,
-): StopDetails | undefined {
-  const anthropic = providerMetadata?.anthropic;
-  const raw =
-    anthropic && typeof anthropic === 'object'
-      ? (anthropic as { stop_details?: unknown }).stop_details
-      : undefined;
-  if (!raw || typeof raw !== 'object') return undefined;
-  const { type, category, explanation } = raw as Record<string, unknown>;
-  if (typeof type !== 'string') return undefined;
-  return {
-    type,
-    ...(typeof category === 'string' || category === null ? { category } : {}),
-    ...(typeof explanation === 'string' || explanation === null ? { explanation } : {}),
-  };
-}
+/** The stop explanation's one normalization, shared with the single-turn results (2.3). */
+export { stopDetailsFrom };
 
 /** Per-tool streamed-argument accumulator (id → name + concatenated JSON fragments + provider meta). */
 export type ToolArgMap = Map<
   string,
   { name?: string; args: string; meta?: Record<string, unknown> }
 >;
-
-/** Opaque encrypted reasoning payloads (OpenAI Responses); signature carries the item id. */
-export type EncryptedReasoning = { text: string; signature?: string }[];
 
 /** A streamed tool call → its canonical `tool_use` part (arguments parsed once, here). */
 function toolUsePart(
@@ -70,47 +48,6 @@ function toolUsePart(
     ...(entry.meta ? { providerMetadata: entry.meta } : {}),
   };
   return part;
-}
-
-/**
- * Assemble the assistant turn (reasoning-first, then text, then tool_use) from
- * accumulated state — the 2.2 shape, which merges a turn's reasoning into one
- * part. The loops use {@link createTurnContent}, which keeps every block; this
- * stays for callers that accumulate merged reasoning themselves.
- */
-export function assembleAssistant(
-  text: string,
-  reasoningText: string,
-  reasoningSignature: string | undefined,
-  toolArgs: ToolArgMap,
-  toolOrder: string[],
-  encryptedReasoning?: EncryptedReasoning,
-): { assistantMessage: Message; toolUseParts: ToolUsePart[] } {
-  const content: Part[] = [];
-  for (const er of encryptedReasoning ?? []) {
-    content.push({
-      type: 'reasoning',
-      text: er.text,
-      encrypted: true,
-      ...(er.signature ? { signature: er.signature } : {}),
-    });
-  }
-  if (reasoningText) {
-    content.push({
-      type: 'reasoning',
-      text: reasoningText,
-      ...(reasoningSignature ? { signature: reasoningSignature } : {}),
-    });
-  }
-  if (text) content.push({ type: 'text', text });
-
-  const toolUseParts: ToolUsePart[] = [];
-  for (const id of toolOrder) {
-    const part = toolUsePart(id, toolArgs.get(id)!);
-    content.push(part);
-    toolUseParts.push(part);
-  }
-  return { assistantMessage: { role: 'assistant', content }, toolUseParts };
 }
 
 /** One element of a model turn, in the order it arrived. */
@@ -313,10 +250,10 @@ export async function runOneStep(
         stopDetails = stopDetailsFrom(part.providerMetadata);
         break;
       case 'warning':
-        // A wire's own notice about the response (2.3: Anthropic's
-        // input_transformations) never passed the call's sink. Record it in an
-        // enclosing loop's sink (a no-op for a warning the sink streamed) and
-        // on this step, so a result reports it like any other warning.
+        // The pump records a wire's own notice about the response (2.3:
+        // Anthropic's input_transformations) in the call's sink, so recording
+        // it in an enclosing loop's sink is a no-op there; keeping it on this
+        // step lets the step report it like any other warning.
         internal?.warnings?.add(part.warning);
         streamed.push(part.warning);
         break;

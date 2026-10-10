@@ -271,7 +271,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
 
 // --- stream parsing ---
 
-interface ResponsesUsage {
+export interface ResponsesUsage {
   input_tokens?: number;
   output_tokens?: number;
   total_tokens?: number;
@@ -305,7 +305,7 @@ interface ResponsesEvent {
 // cached share is split out. A Responses-shaped host that counts reasoning beside
 // the output (its total is input + output + reasoning, or the reasoning exceeds
 // the output) has it folded in; not live-verified. No cache-write counter exists.
-function mapResponsesUsage(u: ResponsesUsage | undefined): Usage {
+export function mapResponsesUsage(u: ResponsesUsage | undefined): Usage {
   const input = u?.input_tokens ?? 0;
   const cached = u?.input_tokens_details?.cached_tokens ?? 0;
   const reported = u?.output_tokens ?? 0;

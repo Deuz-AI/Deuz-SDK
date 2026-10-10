@@ -181,7 +181,7 @@ if (!payload || payload.runId !== 'run-42') reject();
 - `verify` returns the payload on a valid MAC, else `null` — a garbled, forged, or expired token is a verdict of `null`, never a thrown exception. A token whose age is ≥ `maxAgeMs` is expired; omit `maxAgeMs` for no expiry.
 - The clock is injectable (`clock`) for deterministic tests; the secret stays server-side.
 
-`approvalId` was kept distinct from `toolCallId` in the 1.3 type exactly so this scheme could stay additive — the id contract is unchanged.
+`approvalId` was kept distinct from `toolCallId` in the 1.3 type exactly so this scheme could stay additive. Since 2.3 `approvalId` is bound to the call it was issued for (the run, the suspended step, the call id, the tool and a digest of the arguments), and a signed token must name it.
 
 ## Cryptographic approval trail (1.7)
 

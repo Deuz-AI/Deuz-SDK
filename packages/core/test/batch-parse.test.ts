@@ -145,6 +145,19 @@ describe('parseReply: Anthropic Message', () => {
         ],
       },
     ],
+    [
+      'fallback iterations with top-level server tools and thinking',
+      {
+        input_tokens: 10,
+        output_tokens: 20,
+        output_tokens_details: { thinking_tokens: 8 },
+        server_tool_use: { web_search_requests: 2 },
+        iterations: [
+          { input_tokens: 10, output_tokens: 5 },
+          { input_tokens: 12, output_tokens: 20 },
+        ],
+      },
+    ],
   ])('bills %s exactly as the streaming adapter does', async (_label, usage) => {
     const stream = await streamFinish(anthropicAdapter, [
       { event: 'message_start', data: { type: 'message_start', message: { usage } } },

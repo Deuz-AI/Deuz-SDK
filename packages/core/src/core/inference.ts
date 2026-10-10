@@ -634,7 +634,8 @@ export function runStream(
               if (rt.capture.outputText) capturedText = (capturedText ?? '') + part.text;
             } else if (part.type === 'reasoning-delta') {
               reasoningLength += part.text.length;
-              if (rt.capture.reasoning && !part.encrypted) {
+              // Encrypted and redacted payloads are opaque provider state, not reasoning text.
+              if (rt.capture.reasoning && !part.encrypted && !part.redacted) {
                 capturedReasoning = (capturedReasoning ?? '') + part.text;
               }
             } else if (part.type === 'tool-call-delta') {
@@ -681,7 +682,13 @@ export function runStream(
               }
             }
           }
-          broadcaster.push(part);
+          // A wire's own notice about the response (2.3: Anthropic's
+          // input_transformations) joins the call's warnings, so the result's
+          // `warnings` carries it too; the stream gets it once, from the sink.
+          if (part.type === 'warning') {
+            addWarning(part.warning);
+            flushWarnings();
+          } else broadcaster.push(part);
           // 2.2: once content flows, a silence longer than `chunkMs` before the next
           // part fails the call. A finished answer is never timed out while it closes.
           if (firstContent && part.type !== 'finish') timeout.chunk();

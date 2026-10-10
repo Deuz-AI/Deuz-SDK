@@ -195,18 +195,19 @@ export interface BudgetStore {
    * counts, into the newest of them. Usage totals and admission do not change;
    * `usage(key, { since })` counts a folded amount at the bucket it was folded
    * into. A request still reserved keeps its record and its bucket. Optional:
-   * the memory, SQLite and Postgres stores have it.
+   * the memory, SQLite, Postgres and Redis stores have it.
    */
   prune?(options: BudgetPruneOptions): Promise<BudgetPruneResult>;
   /**
    * The holds still open that were reserved before `query.before` (2.3),
-   * oldest first. Optional: the memory, SQLite and Postgres stores have it.
+   * oldest first. Optional: the memory, SQLite, Postgres and Redis stores have
+   * it.
    */
   holds?(query: BudgetHoldQuery): Promise<BudgetHold[]>;
   /**
    * Close stale holds (2.3), oldest first, each through `settle` or `release`.
    * A hold its own caller closed while the sweep ran is skipped. Optional: the
-   * memory, SQLite and Postgres stores have it.
+   * memory, SQLite, Postgres and Redis stores have it.
    */
   sweep?(options: BudgetSweepOptions): Promise<BudgetSweepResult>;
 }

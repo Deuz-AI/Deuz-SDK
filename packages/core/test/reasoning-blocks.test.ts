@@ -19,6 +19,8 @@ import { createAnthropic } from '../src/anthropic';
 import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../src/agent-run';
 import { createInMemorySessionStore, resumeFromCheckpoint } from '../src/durable';
 import { mockFetchSequence, sseEvents, sseResponse } from '../src/testing';
+import { createMemoryObserver } from '../src/observe';
+import type { Message } from '../src/types/message';
 import type { StreamPart } from '../src/types/stream';
 import type { JSONSchema } from '../src/types/schema';
 
@@ -299,5 +301,49 @@ describe('checkpoints and native envelopes keep every block', () => {
     const body = resumed.bodies()[0]!;
     const assistant = body.messages.find((m) => m.role === 'assistant');
     expect(JSON.stringify(assistant?.content)).toBe(JSON.stringify(REPLAYED));
+  });
+});
+
+describe('opaque reasoning stays out of captures and summaries', () => {
+  it('captured reasoning holds the readable blocks, never redacted data', async () => {
+    const observer = createMemoryObserver({ observation: { capture: { reasoning: true } } });
+    const { model } = anthropic([turn(SEQUENCE.slice(0, 4), 'end_turn')]);
+    await generateText({ model, messages: [{ role: 'user', content: 'q' }], deps: { observer } });
+    const completed = observer.events().find((e) => e.type === 'model.completed') as
+      | { capturedReasoning?: string }
+      | undefined;
+    expect(completed?.capturedReasoning).toBe('a');
+  });
+
+  it('the compaction summary renders readable reasoning only', async () => {
+    const history: Message[] = [
+      { role: 'user', content: 'Original task.' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'PLAIN-THOUGHT', signature: S1, source: 'anthropic' },
+          { type: 'reasoning', text: REDACTED, redacted: true, source: 'anthropic' },
+          { type: 'reasoning', text: 'OPAQUE-ENCRYPTED', encrypted: true, source: 'openai' },
+          { type: 'text', text: 'x'.repeat(400) },
+        ],
+      },
+      { role: 'user', content: 'y'.repeat(400) },
+      { role: 'assistant', content: [{ type: 'text', text: 'z'.repeat(400) }] },
+      { role: 'user', content: 'Current question.' },
+    ];
+    const { model, bodies } = anthropic([
+      turn([{ type: 'text', text: 'Earlier: the user asked things.' }], 'end_turn'),
+      DONE,
+    ]);
+    await generateText({
+      model,
+      messages: history,
+      tools: { lookup: { parameters: LOOKUP, execute: () => 'result' } },
+      compaction: { threshold: 0.000_001, keepRecentSteps: 1, layers: ['summarize'] },
+    });
+    const summary = JSON.stringify(bodies()[0]);
+    expect(summary).toContain('(thinking) PLAIN-THOUGHT');
+    expect(summary).not.toContain(REDACTED);
+    expect(summary).not.toContain('OPAQUE-ENCRYPTED');
   });
 });

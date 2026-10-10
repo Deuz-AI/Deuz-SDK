@@ -218,6 +218,8 @@ export function runStreamToolLoop(
   const broadcaster = createBroadcaster<StreamPart>();
   const usageDeferred = createDeferred<Usage>();
   const finishDeferred = createDeferred<FinishReason>();
+  // The last step's stop explanation (2.3): settles with `finishReason`.
+  const stopDetailsDeferred = createDeferred<StopDetails | undefined>();
   const fullSub = broadcaster.subscribe();
   const textSub = broadcaster.subscribe();
   // Memory extraction settlement (1.7, D1) — synchronous field, resolved by
@@ -363,6 +365,7 @@ export function runStreamToolLoop(
         broadcaster.push({ type: 'error', error: err });
         usageDeferred.reject(err);
         finishDeferred.reject(err);
+        stopDetailsDeferred.reject(err);
         if (preRt) {
           // run.started never fired — the leg dies at load (checkpoint.failed
           // was emitted by the closure); report the run failure once.
@@ -596,6 +599,7 @@ export function runStreamToolLoop(
       broadcaster.push({ type: 'error', error });
       usageDeferred.reject(error);
       finishDeferred.reject(error);
+      stopDetailsDeferred.reject(error);
       if (lo) {
         endLoopObserve(lo, deps, options, {
           finishReason: 'error',
@@ -839,6 +843,7 @@ export function runStreamToolLoop(
         broadcaster.push({ type: 'finish', usage, finishReason: lastFinish });
         usageDeferred.resolve(usage);
         finishDeferred.resolve(lastFinish);
+        stopDetailsDeferred.resolve(stopDetailsFrom(lastFinishMeta));
         fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
         observeEnd();
         broadcaster.close();
@@ -890,6 +895,7 @@ export function runStreamToolLoop(
           });
           usageDeferred.resolve(usage);
           finishDeferred.resolve(lastFinish);
+          stopDetailsDeferred.resolve(stopDetailsFrom(lastFinishMeta));
           fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
           observeEnd();
           broadcaster.close();
@@ -1113,12 +1119,12 @@ export function runStreamToolLoop(
               // promise ever sees them — the exact silent gap Sprint 1 had to fix
               // for `verify`.
               case 'warning': {
-                // A wire's own notice about the response (2.3: Anthropic's
-                // input_transformations) never passed the run's sink: record
-                // it there, so the result's `warnings` carries it, and stream it
-                // from the sink, once. A warning the sink already holds was
-                // streamed by the step's own pump and is forwarded as before,
-                // as is anything the sink has nothing new for (past its cap).
+                // The step's pump records every warning in the run's sink (2.3:
+                // a wire's own notice, such as Anthropic's input_transformations,
+                // included) and streams it from there, so a warning the sink
+                // already holds is forwarded as is. One it has not seen is
+                // recorded and streamed from the sink, once; anything the sink
+                // has nothing new for (past its cap) is forwarded as before.
                 const fresh = warningSink.add(part.warning) ? warningSink.take() : [];
                 if (fresh.length === 0) broadcaster.push(part);
                 for (const warning of fresh) broadcaster.push({ type: 'warning', warning });
@@ -1207,12 +1213,14 @@ export function runStreamToolLoop(
         // since no `tool-call` or `tool-result` will ever follow.
         if (cutOff) for (const id of toolOrder) toolState(id, toolArgs.get(id)?.name, 'error');
 
+        const stepStopDetails = stopDetailsFrom(stepFinishMeta);
         const stepData = {
           text,
           reasoningText: turn.reasoningText,
           toolUseParts,
           usage: stepUsage,
           finishReason: stepFinish,
+          ...(stepStopDetails ? { stopDetails: stepStopDetails } : {}),
           assistantMessage,
         };
 
@@ -1755,6 +1763,7 @@ export function runStreamToolLoop(
       });
       usageDeferred.resolve(usage);
       finishDeferred.resolve(lastFinish);
+      stopDetailsDeferred.resolve(stopDetailsFrom(lastFinishMeta));
       fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
       observeEnd();
       broadcaster.close();
@@ -1870,6 +1879,10 @@ export function runStreamToolLoop(
     get finishReason() {
       ensureStarted();
       return finishDeferred.promise;
+    },
+    get stopDetails() {
+      ensureStarted();
+      return stopDetailsDeferred.promise;
     },
     // Unconditional (1.9), like `usage`/`finishReason`: the readout is declared
     // as always present on a full StreamChatResult, and it resolves with the

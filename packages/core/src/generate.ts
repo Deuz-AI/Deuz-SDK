@@ -28,6 +28,7 @@ import type {
   GenerateObjectResult,
   GenerateTextOptions,
   GenerateTextResult,
+  StopDetails,
   StreamChatOptions,
   StreamChatResult,
   StreamObjectResult,
@@ -135,13 +136,16 @@ function rejectingIterable<T>(error: unknown): AsyncIterable<T> {
 function failedStream(error: unknown): StreamChatResult {
   const usage = createDeferred<Usage>();
   const finishReason = createDeferred<FinishReason>();
+  const stopDetails = createDeferred<StopDetails | undefined>();
   usage.reject(error);
   finishReason.reject(error);
+  stopDetails.reject(error);
   return {
     textStream: rejectingIterable<string>(error),
     fullStream: { [Symbol.asyncIterator]: () => errorPartStream(error) },
     usage: usage.promise,
     finishReason: finishReason.promise,
+    stopDetails: stopDetails.promise,
     // Never rejects; the failure is reported through `onError` (consume contract).
     consume: async (opts) => {
       opts?.onError?.(error);
@@ -154,14 +158,17 @@ function failedObjectStream<T>(error: unknown): StreamObjectResult<T> {
   const object = createDeferred<T>();
   const usage = createDeferred<Usage>();
   const finishReason = createDeferred<FinishReason>();
+  const stopDetails = createDeferred<StopDetails | undefined>();
   object.reject(error);
   usage.reject(error);
   finishReason.reject(error);
+  stopDetails.reject(error);
   return {
     partialObjectStream: rejectingIterable<DeepPartial<T>>(error),
     object: object.promise,
     usage: usage.promise,
     finishReason: finishReason.promise,
+    stopDetails: stopDetails.promise,
     consume: async (opts) => {
       opts?.onError?.(error);
     },

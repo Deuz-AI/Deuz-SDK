@@ -577,6 +577,36 @@ describe('createOtelObserver — content capture', () => {
     expect(captured).toContain('"type":"image"');
     expect(captured).not.toContain('base64-bytes');
   });
+
+  it('encrypted and redacted reasoning report their kind only (2.3)', async () => {
+    const { tracer, spans } = fakeOtel();
+    const observer = createOtelObserver({ tracer, captureContent: true });
+    observer.emit(
+      runStarted({
+        operation: 'embed',
+        capturedMessages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'reasoning', text: 'PLAIN-THOUGHT' },
+              { type: 'reasoning', text: 'OPAQUE-ENCRYPTED', encrypted: true },
+              { type: 'reasoning', text: 'OPAQUE-REDACTED', redacted: true },
+            ],
+          },
+        ],
+      }),
+    );
+    await otelReady(observer);
+
+    const captured = JSON.parse(spans[0]!.attributes['gen_ai.input.messages'] as string) as {
+      parts: { type: string; content: string }[];
+    }[];
+    expect(captured[0]!.parts).toEqual([
+      { type: 'reasoning', content: 'PLAIN-THOUGHT' },
+      { type: 'reasoning', content: '' },
+      { type: 'reasoning', content: '' },
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------

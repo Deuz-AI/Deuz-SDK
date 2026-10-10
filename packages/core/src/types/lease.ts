@@ -76,7 +76,7 @@ export interface LeaseProvider {
    * `before` (epoch milliseconds on the provider's clock), that queue no
    * 'cancel', and return how many. The next holder of a pruned key starts
    * again at token 1, and a holder whose lease expired before `before` finds
-   * it lost when it renews. Optional: the memory, SQLite and Postgres
+   * it lost when it renews. Optional: the memory, SQLite, Postgres and Redis
    * providers have it.
    */
   prune?(before: number): Promise<number>;

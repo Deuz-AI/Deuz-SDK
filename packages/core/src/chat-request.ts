@@ -72,7 +72,8 @@ export interface ValidateChatOptions {
    * Per-message text budget in UTF-8 bytes. Default 100_000 (~25k tokens).
    * Counts `content` when it is a string plus every `text`/`reasoning` part and
    * every string inside a `tool_use.input` / `tool_result.result`. Image/PDF
-   * payloads are EXCLUDED — see `messageTextBytes`.
+   * payloads and encrypted or redacted reasoning (2.3) are EXCLUDED — see
+   * `messageTextBytes`.
    */
   maxTextBytes?: number;
   /**
@@ -269,7 +270,9 @@ function countTextBytes(value: unknown, budget: number, depth: number, walk: Wal
  * `image.image` is deliberately EXCLUDED — a legitimate photo or PDF is
  * megabytes of base64 and would trip a cap sized for prose. Binary volume is a
  * raw-body-size concern: cap that at the edge (or before calling this), which
- * this pure validator cannot do for you.
+ * this pure validator cannot do for you. Encrypted and redacted reasoning
+ * blocks are excluded for the same reason (2.3): they are opaque provider
+ * state, not prose, and `useChat` posts every block of a turn back.
  */
 function messageTextBytes(
   message: Record<string, unknown>,
@@ -284,6 +287,7 @@ function messageTextBytes(
   let total = 0;
   for (const part of content) {
     if (!isRecord(part)) continue;
+    if (part.type === 'reasoning' && (part.encrypted === true || part.redacted === true)) continue;
     const payload =
       part.type === 'text' || part.type === 'reasoning'
         ? part.text

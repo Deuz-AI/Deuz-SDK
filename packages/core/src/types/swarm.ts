@@ -224,8 +224,8 @@ export interface SwarmStore {
    * partial or cancelled with an `updatedAt` before `before`, oldest first,
    * with their tasks, events and blackboard notes, and return how many.
    * Running and suspended runs stay; a pruned run can no longer be resumed,
-   * read or replayed, and its key is free again. Optional: the memory, SQLite
-   * and Postgres stores have it.
+   * read or replayed, and its key is free again. Optional: the memory, SQLite,
+   * Postgres and Redis stores have it.
    */
   prune?(options: SwarmPruneOptions): Promise<number>;
 }

@@ -259,6 +259,7 @@ function deferStream(p: Promise<StreamChatResult>, known: DeferredKnown): Stream
     fullStream: full(),
     usage: silence(p.then((r) => r.usage)),
     finishReason: silence(p.then((r) => r.finishReason)),
+    stopDetails: silence(p.then((r) => r.stopDetails)),
     // Never rejects (the declared contract): a call that produced no warnings —
     // or never got as far as producing any — reports an empty set.
     warnings: p.then((r) => r.warnings ?? []).catch((): CallWarning[] => []),
