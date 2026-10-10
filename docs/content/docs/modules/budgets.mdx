@@ -171,7 +171,10 @@ unpriced call switched that stop off for the rest of the run. Its `budget`
 applies the same policy to every model the loop calls: a compaction summary's
 `summarizeModel` and an `agentTool` sub-agent's model are checked before they
 are called, too. Under `'reject'` the run fails with an `UnpricedModelError`,
-whose code is also `unpriced_model`.
+whose code is also `unpriced_model`. A call whose usage the provider did not
+report is different: its cost is unknown, not zero, so from then on
+`budget.usd` waits instead of stopping the loop, as after a price lookup that
+fails (see [the budget guardrail](/docs/modules/pricing#the-budget-guardrail)).
 
 ## When a settlement fails
 

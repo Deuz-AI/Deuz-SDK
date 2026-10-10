@@ -2,6 +2,7 @@ import type { CommonCallOptions } from '../types/config';
 import type { CallWarning, StreamChatResult } from '../types/methods';
 import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
+import type { UsageMeta } from '../types/deps';
 import type { ModelSurface } from '../types/model';
 import type { Adapter, BuildContext, ObjectRequest, WireToolRequest } from '../adapters/types';
 import { APICallError, BreakerOpenError, NetworkError, TimeoutError } from '../errors';
@@ -223,6 +224,13 @@ export function runStream(
     const settleReservation = async (): Promise<void> => {
       await native?.settle(finalUsage, usageAvailable);
     };
+    /**
+     * F02 (2.3): `onUsage` says when the usage is not the provider's (none was
+     * reported, or the stream ended first), so every path counts that call's
+     * cost as unknown, as native settlement does.
+     */
+    const availability = (): Pick<UsageMeta, 'usageAvailable'> =>
+      finalUsage !== undefined && usageAvailable ? {} : { usageAvailable: false };
 
     // --- warnings (1.9) ---
     /**
@@ -645,8 +653,9 @@ export function runStream(
             await settleReservation();
             // Live cost (1.7, D2): single-turn calls price the finish usage
             // inline; loop-driven calls (internal.tools set) leave it to the
-            // loop's cumulative per-step part.
-            if (!internal.tools && deps.priceProvider) {
+            // loop's cumulative per-step part. Usage the provider did not
+            // report has no known cost, so it gets no part (2.3, F02).
+            if (!internal.tools && deps.priceProvider && usageAvailable) {
               try {
                 const priced = withTotal(part.usage);
                 const costUsd = await deps.priceProvider.priceUsage(modelId, priced);
@@ -680,7 +689,12 @@ export function runStream(
       const finishReason = finalFinish ?? 'stop';
       usageDeferred.resolve(usage);
       finishDeferred.resolve(finishReason);
-      fireUsage(options, deps, usage, { model: options.model.modelId, reason: 'finished', ttftMs });
+      fireUsage(options, deps, usage, {
+        model: options.model.modelId,
+        reason: 'finished',
+        ttftMs,
+        ...availability(),
+      });
       // G12 (1.9): `onFinish` belongs to the RUN, so only the run's owner fires
       // it. A STEP of an agentic loop (`internal.tools` set — the same
       // "loop-driven call" test the cost part above uses) leaves it to the loop,
@@ -753,6 +767,7 @@ export function runStream(
           model: options.model.modelId,
           reason: 'aborted',
           ttftMs,
+          ...availability(),
         });
         if (rt) {
           // Same rule for events: the model call COMPLETED with 'aborted'

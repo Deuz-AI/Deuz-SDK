@@ -54,7 +54,12 @@ export interface UsageCostAccumulatorOptions {
 }
 
 export interface UsageCostAccumulator {
-  record(usage: Usage, meta: Pick<UsageMeta, 'model'>): void;
+  /**
+   * Price one model call. Usage its provider did not report
+   * (`meta.usageAvailable: false`) leaves the call's cost unknown, never $0
+   * (2.3, F02), as native settlement does.
+   */
+  record(usage: Usage, meta: Pick<UsageMeta, 'model' | 'usageAvailable'>): void;
   /** Observe each callback once, preserving the user's effective callback. */
   wrap(callback?: Dependencies['onUsage']): NonNullable<Dependencies['onUsage']>;
   flush(): Promise<UsageCostSummary>;
@@ -141,11 +146,12 @@ export function createUsageCostAccumulator(
       options.warnings?.add(unpricedModelWarning(model, hasProvider));
   }
 
-  function record(usage: Usage, meta: Pick<UsageMeta, 'model'>): void {
+  function record(usage: Usage, meta: Pick<UsageMeta, 'model' | 'usageAvailable'>): void {
     // The hook is synchronous; copy before the async price lookup so mutable
     // result objects cannot change the charge after the event was observed.
     const copied = Object.freeze({ ...usage });
     const model = meta.model;
+    const available = meta.usageAvailable !== false;
     calls++;
     pending++;
     queue = queue.then(async () => {
@@ -162,6 +168,14 @@ export function createUsageCostAccumulator(
         unpricedCalls++;
         if (!unpricedModels.includes(model)) unpricedModels.push(model);
         warn(model);
+        pending--;
+        return;
+      }
+      if (!available) {
+        // The provider reported no usage, or the stream ended first (2.3, F02):
+        // the zeros are not a free call, so its cost stays unknown.
+        unknownCalls++;
+        savingsKnown = false;
         pending--;
         return;
       }
