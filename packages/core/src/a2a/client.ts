@@ -10,6 +10,7 @@ import { parseSSE } from '../internal/sse';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { A2AError } from './errors';
 import {
+  A2A_CONTENT_TYPE,
   A2A_EXTENSIONS_HEADER,
   A2A_PROTOCOL_VERSION,
   A2A_VERSION_HEADER,
@@ -58,50 +59,66 @@ function invalidResponse(message: string, statusCode?: number): A2AError {
   });
 }
 
-/** The reason in an `ErrorInfo` detail, if the list has one. */
-function errorInfoReason(details: unknown): string | undefined {
-  if (!Array.isArray(details)) return undefined;
+/** The `ErrorInfo` detail of an error's detail list (`data` in JSON-RPC, `details` in REST). */
+function errorInfo(details: unknown): { reason?: string; metadata?: Record<string, string> } {
+  if (!Array.isArray(details)) return {};
   for (const detail of details) {
-    if (
-      isRecord(detail) &&
-      detail['@type'] === ERROR_INFO_TYPE &&
-      typeof detail.reason === 'string'
-    ) {
-      return detail.reason;
+    if (isRecord(detail) && detail['@type'] === ERROR_INFO_TYPE) {
+      return {
+        ...(typeof detail.reason === 'string' ? { reason: detail.reason } : {}),
+        ...(isRecord(detail.metadata)
+          ? { metadata: detail.metadata as Record<string, string> }
+          : {}),
+      };
     }
   }
-  return undefined;
+  return {};
 }
 
-function errorInfoMetadata(details: unknown): Record<string, string> | undefined {
-  if (!Array.isArray(details)) return undefined;
-  for (const detail of details) {
-    if (isRecord(detail) && detail['@type'] === ERROR_INFO_TYPE && isRecord(detail.metadata)) {
-      return detail.metadata as Record<string, string>;
-    }
-  }
-  return undefined;
+function errorMessage(error: Record<string, unknown>): string {
+  return typeof error.message === 'string' ? error.message : 'A2A error';
 }
 
 /** A JSON-RPC `error` member as an `A2AError`. */
 function rpcError(error: Record<string, unknown>, statusCode: number): A2AError {
   const code = typeof error.code === 'number' ? error.code : undefined;
-  const metadata = errorInfoMetadata(error.data);
+  const info = errorInfo(error.data);
   return new A2AError({
     kind: 'protocol',
-    message: typeof error.message === 'string' ? error.message : 'A2A error',
-    reason:
-      errorInfoReason(error.data) ??
-      (code !== undefined ? reasonForRpcCode(code) : undefined) ??
-      'UNKNOWN',
+    message: errorMessage(error),
+    reason: info.reason ?? (code !== undefined ? reasonForRpcCode(code) : undefined) ?? 'UNKNOWN',
     ...(code !== undefined ? { rpcCode: code } : {}),
     statusCode,
-    ...(metadata ? { metadata } : {}),
+    ...(info.metadata ? { metadata: info.metadata } : {}),
+  });
+}
+
+/** The `error` member of an HTTP+JSON error body (`google.rpc.Status`) as an `A2AError`. */
+function restError(error: Record<string, unknown>, statusCode: number): A2AError {
+  const info = errorInfo(error.details);
+  return new A2AError({
+    kind: 'protocol',
+    message: errorMessage(error),
+    reason: info.reason ?? 'UNKNOWN',
+    statusCode,
+    ...(info.metadata ? { metadata: info.metadata } : {}),
   });
 }
 
 function isRpcErrorEnvelope(body: unknown): body is { error: Record<string, unknown> } {
   return isRecord(body) && body.jsonrpc === '2.0' && isRecord(body.error);
+}
+
+function isRestErrorBody(body: unknown): body is { error: Record<string, unknown> } {
+  return isRecord(body) && isRecord(body.error);
+}
+
+function httpError(statusCode: number): A2AError {
+  return new A2AError({
+    kind: 'http',
+    message: `The A2A agent answered HTTP ${statusCode}.`,
+    statusCode,
+  });
 }
 
 function createClientCore(options: A2AClientOptions) {
@@ -220,13 +237,7 @@ function jsonRpcTransport(url: string, core: ClientCore): Transport {
       );
       const json = await core.readJson(response, options?.signal);
       if (isRpcErrorEnvelope(json)) throw rpcError(json.error, response.status);
-      if (!response.ok) {
-        throw new A2AError({
-          kind: 'http',
-          message: `The A2A agent answered HTTP ${response.status}.`,
-          statusCode: response.status,
-        });
-      }
+      if (!response.ok) throw httpError(response.status);
       if (!isRecord(json) || json.jsonrpc !== '2.0') {
         throw invalidResponse(
           `${method}: the answer is not a JSON-RPC 2.0 response.`,
@@ -260,13 +271,7 @@ function jsonRpcTransport(url: string, core: ClientCore): Transport {
         // A server answers an error found before the stream starts as plain JSON-RPC.
         const json = await core.readJson(response, options?.signal);
         if (isRpcErrorEnvelope(json)) throw rpcError(json.error, response.status);
-        if (!response.ok) {
-          throw new A2AError({
-            kind: 'http',
-            message: `The A2A agent answered HTTP ${response.status}.`,
-            statusCode: response.status,
-          });
-        }
+        if (!response.ok) throw httpError(response.status);
         throw invalidResponse(`${method}: expected an event stream.`, response.status);
       }
       for await (const { event, data } of core.events(response, options?.signal)) {
@@ -276,6 +281,98 @@ function jsonRpcTransport(url: string, core: ClientCore): Transport {
           throw invalidResponse(`${method}: a stream event is not a response to this request.`);
         }
         yield data.result;
+      }
+    },
+  };
+}
+
+/** One HTTP+JSON request: the route of a method and what goes in the body. */
+function restRoute(
+  method: string,
+  params: Params,
+): { verb: 'GET' | 'POST'; path: string; body?: Params } {
+  const { tenant: _tenant, ...rest } = params;
+  const id = encodeURIComponent(String(params.id));
+  switch (method) {
+    case 'SendMessage':
+      return { verb: 'POST', path: '/message:send', body: rest };
+    case 'SendStreamingMessage':
+      return { verb: 'POST', path: '/message:stream', body: rest };
+    case 'GetTask': {
+      const query =
+        params.historyLength !== undefined ? `?historyLength=${params.historyLength}` : '';
+      return { verb: 'GET', path: `/tasks/${id}${query}` };
+    }
+    case 'CancelTask':
+      return {
+        verb: 'POST',
+        path: `/tasks/${id}:cancel`,
+        body: params.metadata !== undefined ? { metadata: params.metadata } : {},
+      };
+    case 'SubscribeToTask':
+      return { verb: 'POST', path: `/tasks/${id}:subscribe` };
+    default:
+      throw new InvalidRequestError({
+        message: `The HTTP+JSON binding has no route for ${method}.`,
+      });
+  }
+}
+
+function restTransport(baseUrl: string, core: ClientCore): Transport {
+  const base = baseUrl.replace(/\/+$/, '');
+
+  function target(method: string, params: Params) {
+    const route = restRoute(method, params);
+    const tenant = typeof params.tenant === 'string' ? `/${encodeURIComponent(params.tenant)}` : '';
+    return { ...route, url: `${base}${tenant}${route.path}` };
+  }
+
+  async function open(method: string, params: Params, accept: string, options?: A2ACallOptions) {
+    const { verb, url, body } = target(method, params);
+    const fixed: Record<string, string> = { Accept: accept };
+    if (body !== undefined) fixed['Content-Type'] = JSON_CONTENT_TYPE;
+    return core.send(
+      url,
+      {
+        method: verb,
+        headers: await core.headers(fixed, options),
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      },
+      options?.signal,
+    );
+  }
+
+  return {
+    async call(method, params, options) {
+      const response = await open(
+        method,
+        params,
+        `${A2A_CONTENT_TYPE}, ${JSON_CONTENT_TYPE}`,
+        options,
+      );
+      const json = await core.readJson(response, options?.signal);
+      if (!response.ok) {
+        if (isRestErrorBody(json)) throw restError(json.error, response.status);
+        throw httpError(response.status);
+      }
+      if (json === undefined) {
+        throw invalidResponse(`${method}: the answer is not JSON.`, response.status);
+      }
+      return json;
+    },
+
+    async *stream(method, params, options) {
+      const response = await open(method, params, SSE_CONTENT_TYPE, options);
+      if (!core.isEventStream(response)) {
+        const json = await core.readJson(response, options?.signal);
+        if (isRestErrorBody(json)) throw restError(json.error, response.status);
+        if (!response.ok) throw httpError(response.status);
+        throw invalidResponse(`${method}: expected an event stream.`, response.status);
+      }
+      for await (const { event, data } of core.events(response, options?.signal)) {
+        if (isRestErrorBody(data)) throw restError(data.error, response.status);
+        if (event === 'error') throw invalidResponse(`${method}: the stream failed.`);
+        yield data;
       }
     },
   };
@@ -317,9 +414,14 @@ export function createA2AClient(options: A2AClientOptions): A2AClient {
   }
   const url = options.url;
   const binding: A2ABinding = options.binding ?? 'JSONRPC';
+  if (binding !== 'JSONRPC' && binding !== 'HTTP+JSON') {
+    throw new InvalidRequestError({
+      message: `createA2AClient speaks the 'JSONRPC' and 'HTTP+JSON' bindings, not '${String(binding)}'.`,
+    });
+  }
   const tenant = options.tenant;
   const core = createClientCore(options);
-  const transport = jsonRpcTransport(url, core);
+  const transport = binding === 'JSONRPC' ? jsonRpcTransport(url, core) : restTransport(url, core);
 
   function sendParams(
     input: Parameters<A2AClient['sendMessage']>[0],

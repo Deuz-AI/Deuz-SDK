@@ -11,7 +11,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { A2AError, createA2AClient, type A2AStreamResponse } from '../src/a2a';
-import { AbortError } from '../src/errors';
+import { AbortError, InvalidRequestError } from '../src/errors';
 
 interface Captured {
   url: string;
@@ -418,6 +418,214 @@ describe('A2A client — JSON-RPC binding', () => {
     );
     expect(await rejection(collect(client(fetch).subscribeToTask('task-1')))).toMatchObject({
       kind: 'invalid-response',
+    });
+  });
+});
+
+describe('A2A client — HTTP+JSON binding', () => {
+  const BASE = 'https://agent.test/a2a/rest';
+
+  function client(fetch: typeof globalThis.fetch, extra: Record<string, unknown> = {}) {
+    let next = 0;
+    return createA2AClient({
+      url: `${BASE}/`,
+      binding: 'HTTP+JSON',
+      deps: { fetch, generateId: () => `gen-${++next}` },
+      ...extra,
+    });
+  }
+
+  const a2aJson =
+    (body: unknown, status = 200): Answer =>
+    () =>
+      json(body, status, 'application/a2a+json');
+
+  it('posts SendMessage params to /message:send', async () => {
+    const { fetch, requests } = scriptedFetch(a2aJson({ task: TASK }));
+    const result = await client(fetch).sendMessage('hello', {
+      configuration: { historyLength: 1 },
+    });
+    expect(result).toEqual({ task: TASK });
+    const [request] = requests;
+    expect(request?.url).toBe(`${BASE}/message:send`);
+    expect(request?.method).toBe('POST');
+    expect(request?.headers.get('a2a-version')).toBe('1.0');
+    expect(request?.headers.get('content-type')).toBe('application/json');
+    expect(request?.body).toEqual({
+      message: { messageId: 'gen-1', role: 'ROLE_USER', parts: [{ text: 'hello' }] },
+      configuration: { historyLength: 1 },
+    });
+  });
+
+  it('returns a direct message answer', async () => {
+    const answer = { messageId: 'r-1', role: 'ROLE_AGENT', parts: [{ text: 'hi there' }] };
+    const { fetch } = scriptedFetch(a2aJson({ message: answer }));
+    expect(await client(fetch).sendMessage('hello')).toEqual({ message: answer });
+  });
+
+  it('gets a task by its encoded id with historyLength in the query', async () => {
+    const { fetch, requests } = scriptedFetch(a2aJson(TASK));
+    expect(await client(fetch).getTask('task/1', { historyLength: 2 })).toEqual(TASK);
+    expect(requests[0]?.method).toBe('GET');
+    expect(requests[0]?.url).toBe(`${BASE}/tasks/task%2F1?historyLength=2`);
+    expect(requests[0]?.body).toBeUndefined();
+  });
+
+  it('posts a cancel with its metadata as the body', async () => {
+    const { fetch, requests } = scriptedFetch(a2aJson(TASK), a2aJson(TASK));
+    const a2a = client(fetch);
+    await a2a.cancelTask('task-1', { metadata: { why: 'user' } });
+    await a2a.cancelTask('task-1');
+    expect(requests.map(({ method, url, body }) => ({ method, url, body }))).toEqual([
+      { method: 'POST', url: `${BASE}/tasks/task-1:cancel`, body: { metadata: { why: 'user' } } },
+      { method: 'POST', url: `${BASE}/tasks/task-1:cancel`, body: {} },
+    ]);
+  });
+
+  it('prefixes every route with the tenant', async () => {
+    const { fetch, requests } = scriptedFetch(a2aJson({ task: TASK }), a2aJson(TASK), () =>
+      sse([{ data: { task: TASK } }]),
+    );
+    const a2a = client(fetch, { tenant: 'acme' });
+    await a2a.sendMessage('hello');
+    await a2a.getTask('task-1');
+    await collect(a2a.subscribeToTask('task-1'));
+    expect(requests.map((request) => request.url)).toEqual([
+      `${BASE}/acme/message:send`,
+      `${BASE}/acme/tasks/task-1`,
+      `${BASE}/acme/tasks/task-1:subscribe`,
+    ]);
+  });
+
+  it('streams /message:stream events', async () => {
+    const events = [
+      { task: { ...TASK, status: { state: 'TASK_STATE_WORKING' } } },
+      {
+        statusUpdate: {
+          taskId: 'task-1',
+          contextId: 'ctx-1',
+          status: { state: 'TASK_STATE_COMPLETED' },
+        },
+      },
+    ];
+    const { fetch, requests } = scriptedFetch(() => sse(events.map((data) => ({ data }))));
+    expect(await collect(client(fetch).sendStreamingMessage('hello'))).toEqual(events);
+    expect(requests[0]?.url).toBe(`${BASE}/message:stream`);
+    expect(requests[0]?.method).toBe('POST');
+    expect(requests[0]?.headers.get('accept')).toBe('text/event-stream');
+    expect(requests[0]?.body).toMatchObject({ message: { parts: [{ text: 'hello' }] } });
+  });
+
+  it('subscribes with a POST to /tasks/{id}:subscribe', async () => {
+    const { fetch, requests } = scriptedFetch(() => sse([{ data: { task: TASK } }]));
+    expect(await collect(client(fetch).subscribeToTask('task-1'))).toEqual([{ task: TASK }]);
+    expect(requests[0]?.method).toBe('POST');
+    expect(requests[0]?.url).toBe(`${BASE}/tasks/task-1:subscribe`);
+  });
+
+  it('turns a REST error body into an A2AError carrying the ErrorInfo reason', async () => {
+    const { fetch } = scriptedFetch(
+      a2aJson(
+        {
+          error: {
+            code: 404,
+            status: 'NOT_FOUND',
+            message: 'Task not found: t-9',
+            details: [errorInfo('TASK_NOT_FOUND')],
+          },
+        },
+        404,
+      ),
+    );
+    const error = await rejection(client(fetch).getTask('t-9'));
+    expect(error).toBeInstanceOf(A2AError);
+    expect(error).toMatchObject({
+      kind: 'protocol',
+      reason: 'TASK_NOT_FOUND',
+      rpcCode: -32001,
+      statusCode: 404,
+      message: 'Task not found: t-9',
+    });
+  });
+
+  it('keeps a REST error without ErrorInfo as an unknown protocol error', async () => {
+    const { fetch } = scriptedFetch(
+      a2aJson({ error: { code: 400, status: 'INVALID_ARGUMENT', message: 'bad input' } }, 400),
+    );
+    expect(await rejection(client(fetch).sendMessage('hello'))).toMatchObject({
+      kind: 'protocol',
+      reason: 'UNKNOWN',
+      statusCode: 400,
+      message: 'bad input',
+    });
+  });
+
+  it('reports a non-JSON error answer as an http failure', async () => {
+    const { fetch } = scriptedFetch(() => new Response('Unauthorized', { status: 401 }));
+    expect(await rejection(client(fetch).getTask('task-1'))).toMatchObject({
+      kind: 'http',
+      statusCode: 401,
+    });
+  });
+
+  it('throws the error of an SSE error event', async () => {
+    const { fetch } = scriptedFetch(() =>
+      sse([
+        { data: { task: TASK } },
+        {
+          event: 'error',
+          data: {
+            error: { code: 500, status: 'INTERNAL', message: 'store unavailable', details: [] },
+          },
+        },
+      ]),
+    );
+    expect(await rejection(collect(client(fetch).subscribeToTask('task-1')))).toMatchObject({
+      kind: 'protocol',
+      message: 'store unavailable',
+    });
+  });
+
+  it('throws the error a server answers a stream request with before streaming', async () => {
+    const { fetch } = scriptedFetch(
+      a2aJson(
+        {
+          error: {
+            code: 400,
+            status: 'FAILED_PRECONDITION',
+            message: 'Streaming is not supported.',
+            details: [errorInfo('UNSUPPORTED_OPERATION')],
+          },
+        },
+        400,
+      ),
+    );
+    expect(await rejection(collect(client(fetch).sendStreamingMessage('hello')))).toMatchObject({
+      kind: 'protocol',
+      reason: 'UNSUPPORTED_OPERATION',
+      statusCode: 400,
+    });
+  });
+
+  it('rejects a binding it does not speak', () => {
+    expect(() => createA2AClient({ url: BASE, binding: 'GRPC' as unknown as 'JSONRPC' })).toThrow(
+      InvalidRequestError,
+    );
+  });
+});
+
+describe('A2AError', () => {
+  it('serializes kind, reason and codes for logs', () => {
+    const error = new A2AError({
+      reason: 'TASK_NOT_FOUND',
+      message: 'Task not found',
+      statusCode: 404,
+    });
+    expect(error.toJSON()).toEqual({
+      name: 'A2AError',
+      code: 'a2a_error',
+      message: 'Task not found',
+      details: { statusCode: 404, kind: 'protocol', reason: 'TASK_NOT_FOUND', rpcCode: -32001 },
     });
   });
 });

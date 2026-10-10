@@ -1,4 +1,4 @@
-import { DeuzError } from '../errors';
+import { DeuzError, type DeuzErrorJSON } from '../errors';
 import { REASON_WIRE, type A2AErrorReason } from './protocol';
 
 /**
@@ -58,5 +58,18 @@ export class A2AError extends DeuzError {
     if (rpcCode !== undefined) this.rpcCode = rpcCode;
     if (options.statusCode !== undefined) this.statusCode = options.statusCode;
     if (options.metadata !== undefined) this.metadata = options.metadata;
+  }
+
+  override toJSON(): DeuzErrorJSON {
+    const json = super.toJSON();
+    return {
+      ...json,
+      details: {
+        ...json.details,
+        kind: this.kind,
+        ...(this.reason !== undefined ? { reason: this.reason } : {}),
+        ...(this.rpcCode !== undefined ? { rpcCode: this.rpcCode } : {}),
+      },
+    };
   }
 }
