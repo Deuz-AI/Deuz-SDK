@@ -100,6 +100,17 @@ export function preserveClientContext<O extends object>(source: object, cloned: 
 /** Denial message fed back to the model as an is_error tool_result. */
 export const TOOL_DENIED = 'Tool call denied.';
 
+/** The `is_error` answer a denied call gets (the model reads the reason, when there is one). */
+function deniedResult(call: ToolCall, denial: Denial): ToolResult {
+  return {
+    toolCallId: call.toolCallId,
+    toolName: call.toolName,
+    result: denial.reason ? `${TOOL_DENIED} Reason: ${denial.reason}` : TOOL_DENIED,
+    isError: true,
+    outcome: denial.outcome,
+  };
+}
+
 /**
  * The tool call an execution-policy refusal names (2.3), when `error` is one:
  * the run fails, and the loop reports that call as `'permission-denied'` first.
@@ -2062,29 +2073,26 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
       });
     }
   }
+  // Policy: the run's `onToolCall` guardrails, over EVERY call of the batch —
+  // transfers included (2.3): a transfer hands the run to another agent, so a
+  // rule that may refuse a call may refuse that one too. It runs BEFORE the
+  // approval gate, so a rewrite reaches `needsApproval` and the request a human
+  // sees.
+  const guarded = await applyToolCallGuardrails(options, issued, messages, stepIndex);
+  const calls = guarded.calls;
   const catalog = input.handoff?.tools;
-  // Transfers are decided by looking at the call, before the guardrails and the
-  // approval gate. A settle also reads the run's whole transfer catalog: an
-  // agent never carries a transfer to itself, so the tool that produced a
-  // pending id may be missing from the set of the agent driving now.
-  const { handoffCalls, normalCalls } =
-    catalog && hasHandoffTools(catalog)
-      ? splitHandoffCalls(issued, settle ? { ...tools, ...catalog } : tools)
-      : { handoffCalls: NO_HANDOFF_CALLS, normalCalls: issued };
-
-  // Policy: the run's execution-side defense. It runs BEFORE the approval gate,
-  // so a rewrite reaches `needsApproval` and the request a human sees.
-  const guarded = await applyToolCallGuardrails(options, normalCalls, messages, stepIndex);
-  const execCalls = guarded.calls;
-  const calls =
-    handoffCalls.length === 0
-      ? execCalls
-      : (() => {
-          const rewritten = new Map(execCalls.map((c) => [c.toolCallId, c]));
-          return issued.map((c) => rewritten.get(c.toolCallId) ?? c);
-        })();
-  const handoff =
-    handoffCalls.length > 0 ? decideHandoff(handoffCalls, input.handoff?.active) : undefined;
+  // The transfers among them are decided, never executed. A settle also reads
+  // the run's whole transfer catalog: an agent never carries a transfer to
+  // itself, so the tool that produced a pending id may be missing from the set
+  // of the agent driving now.
+  const transferSet =
+    catalog && hasHandoffTools(catalog) ? (settle ? { ...tools, ...catalog } : tools) : undefined;
+  const { handoffCalls, normalCalls } = transferSet
+    ? splitHandoffCalls(calls, transferSet)
+    : { handoffCalls: NO_HANDOFF_CALLS, normalCalls: calls };
+  const execCalls = normalCalls;
+  // The gate reads a transfer's `needsApproval` off the same set.
+  const gateTools = settle && transferSet ? transferSet : tools;
 
   const scope = input.approval ?? {};
   let denied: DenialMap;
@@ -2094,9 +2102,9 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
   let clientCalls: ToolCall[] = [];
   if (settle) {
     ({ denied, gated } = await settleVerdicts(
-      execCalls,
+      calls,
       verdicts,
-      tools,
+      gateTools,
       options,
       messages,
       observe,
@@ -2106,12 +2114,10 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
     // A blocked call never reaches the approval gate: it already has a verdict,
     // and gating it would suspend the run on a call that will not run anyway.
     const candidates =
-      guarded.blocked.size > 0
-        ? execCalls.filter((c) => !guarded.blocked.has(c.toolCallId))
-        : execCalls;
+      guarded.blocked.size > 0 ? calls.filter((c) => !guarded.blocked.has(c.toolCallId)) : calls;
     // Server mode denies inline; without `approveToolCall` the gated calls
     // break the loop like client tools (client mode).
-    gated = await findApprovalNeeded(candidates, tools, options, messages);
+    gated = await findApprovalNeeded(candidates, gateTools, options, messages);
     denied = options.approveToolCall
       ? await resolveServerApprovals(gated, candidates, options, messages)
       : new Map<string, Denial>();
@@ -2145,6 +2151,25 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
   // LAST, so a guardrail block outranks every other verdict: an approved call a
   // rule refuses must report the rule, not the approval.
   for (const [id, denial] of guarded.blocked) denied.set(id, denial);
+
+  // The transfer verdict, among the transfers the policy and the gate cleared.
+  // One still waiting for a verdict defers them all to the resume's settle, so
+  // the model's first transfer keeps its precedence.
+  let handoff: HandoffDecision | undefined;
+  const waiting = new Set(pendingApproval.map((c) => c.toolCallId));
+  if (handoffCalls.length > 0 && !handoffCalls.some((h) => waiting.has(h.call.toolCallId))) {
+    const cleared = handoffCalls.filter((h) => !denied.has(h.call.toolCallId));
+    const decision = cleared.length > 0 ? decideHandoff(cleared, input.handoff?.active) : undefined;
+    const decided = new Map(decision?.results.map((r) => [r.toolCallId, r]) ?? []);
+    handoff = {
+      // One answer per transfer id, in the model's order.
+      results: handoffCalls.map(
+        ({ call }) =>
+          decided.get(call.toolCallId) ?? deniedResult(call, denied.get(call.toolCallId)!),
+      ),
+      ...(decision?.accepted ? { accepted: decision.accepted } : {}),
+    };
+  }
 
   return {
     calls,
@@ -2671,6 +2696,16 @@ export async function executeTools(
   // allocation-free.
   const executed =
     guardrailList(options.guardrails?.onToolResult).length > 0 ? new Set<string>() : undefined;
+  // The tool-call and tool-result hooks a sub-agent inherits (2.3); undefined
+  // when the run has neither, so a plain tool's context is unchanged.
+  const { onToolCall, onToolResult } = options.guardrails ?? {};
+  const inheritedGuardrails =
+    onToolCall !== undefined || onToolResult !== undefined
+      ? {
+          ...(onToolCall !== undefined ? { onToolCall } : {}),
+          ...(onToolResult !== undefined ? { onToolResult } : {}),
+        }
+      : undefined;
   if (nativeBatch)
     options = { ...options, signal: combineSignals([options.signal, nativeBatch.signal]) };
   const results = mapWithConcurrency(
@@ -2744,13 +2779,7 @@ export async function executeTools(
               ...(denial.reason ? { reason: denial.reason } : {}),
             });
           }
-          return settle({
-            toolCallId: call.toolCallId,
-            toolName: call.toolName,
-            result: denial.reason ? `${TOOL_DENIED} Reason: ${denial.reason}` : TOOL_DENIED,
-            isError: true,
-            outcome: denial.outcome,
-          });
+          return settle(deniedResult(call, denial));
         }
         if (!tool) {
           // Hallucinated tool name (1.9): self-heal like every other tool failure —
@@ -2869,6 +2898,8 @@ export async function executeTools(
             ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
             ...(extras?.session ? { session: extras.session } : {}),
             ...(extras?.approvalResponses ? { approvalResponses: extras.approvalResponses } : {}),
+            // A sub-agent's calls stay under this run's tool policy (2.3).
+            ...(inheritedGuardrails ? { guardrails: inheritedGuardrails } : {}),
           };
           const invoke = async (): Promise<unknown> => {
             if (options.execution) {

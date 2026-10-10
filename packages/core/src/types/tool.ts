@@ -6,6 +6,7 @@ import type { ResolvedDependencies } from './deps';
 import type { SessionStore } from './session';
 import type { ApprovalSigner } from '../durable';
 import type { NativeExecutionContext } from './execution';
+import type { Guardrails } from './guardrails';
 
 /** Context handed to a tool's `execute`. */
 export interface ToolExecuteContext {
@@ -46,6 +47,13 @@ export interface ToolExecuteContext {
    * an observation event. Sub-agents inherit it.
    */
   runtimeContext?: unknown;
+  // --- 2.3 additive: the dispatch contract seam. ---
+  /**
+   * The run's `onToolCall` / `onToolResult` guardrails, inherited by a sub-agent
+   * (`agentTool`) so its own tool calls stay under the parent run's policy: a
+   * sub-agent narrows what the run may do, never widens it.
+   */
+  guardrails?: Pick<Guardrails, 'onToolCall' | 'onToolResult'>;
 }
 
 /**
