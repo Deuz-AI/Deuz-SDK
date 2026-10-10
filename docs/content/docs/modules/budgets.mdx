@@ -173,7 +173,10 @@ A billed attempt is settled after the call, and a refused one is released.
 Both are idempotent in the store, so the ledger tries a failing settlement or
 release three times. When the store stays down, the call fails with
 `admission_failed` as before, and nothing changed locally: the hold stays at its
-estimate, which is the safe direction. The error now names the attempt in
+estimate, which is the safe direction. A store that answers with a
+`reservation_conflict` has already closed the hold, usually through a
+[sweep](#open-holds): that is not a failure, so it is neither retried nor
+reported, and the local entry closes. The error now names the attempt in
 `error.requestId`, and for a settlement `error.settlement` replays it exactly.
 Settle it once the store answers again, in the same ledger or in one restored
 from its durable snapshot:
@@ -198,7 +201,9 @@ call's error path before it is reported.
 A process that dies between a call and its settlement leaves the same kind of
 hold: its request ID is a `reserved` entry in the last persisted ledger snapshot.
 Restore the context from that snapshot with its store, then settle the request,
-or release it when the call was never billed.
+or release it when the call was never billed. A replay that a sweep has
+overtaken closes the entry the same way, and the store keeps what the sweep
+billed.
 
 ## Scopes and rolling windows
 
@@ -365,8 +370,10 @@ Postgres stores list and close open holds:
   skipped. `limit` caps how many holds one call examines (default 1 000).
 
 Choose `before` well past your longest call and its settlement retries. A sweep
-that closes a hold its caller is about to settle turns that settlement into a
-`reservation_conflict` error.
+that closes a hold its caller is about to settle wins: the store keeps the
+sweep's amounts, and the ledger accepts the caller's settlement or release as
+already closed, without retrying it or failing the call. The ledger records
+the call's actual usage, so for that call it and the store disagree.
 
 ```ts
 import { createSqliteBudgetStore } from '@deuz-sdk/core/ops/sqlite';

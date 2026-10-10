@@ -158,3 +158,89 @@ describe('native settlement survives a failing BudgetStore (F17)', () => {
     expect(await store.usage('user:1')).toEqual({ tokens: 0, usd: 0 });
   });
 });
+
+describe('a sweep that closed the hold first (F17)', () => {
+  /** The documented periodic sweep (default: settle at the estimate) runs before `method`'s first call. */
+  function sweptFirst(method: 'settle' | 'release') {
+    const inner = createInMemoryBudgetStore();
+    let calls = 0;
+    const store: BudgetStore = {
+      ...inner,
+      [method]: async (...args: unknown[]) => {
+        calls++;
+        if (calls === 1) await inner.sweep({ before: Date.now() + 60_000 });
+        return (inner[method] as (...a: unknown[]) => Promise<void>)(...args);
+      },
+    };
+    return { store, inner, calls: () => calls };
+  }
+
+  it('accepts a settlement as already closed: no retry, no error, the local entry settles', async () => {
+    const { store, inner, calls } = sweptFirst('settle');
+    const ledger = createBudgetLedger({ admission: { store, scopes } });
+    await ledger.reserve({ requestId: 'a', modelId: 'm', tokens: 100, usd: 1 });
+    // Before: three attempts, then admission_failed, and the entry stayed 'reserved' for good.
+    await expect(ledger.settle({ requestId: 'a', tokens: 10, usd: 0.5 })).resolves.toMatchObject({
+      state: 'settled',
+      actual: { tokens: 10, usd: 0.5 },
+    });
+    expect(calls()).toBe(1);
+    expect(ledger.totals()).toMatchObject({ reserved: { tokens: 0, usd: 0 }, unknownUsd: 0 });
+    // The store keeps what the sweep billed.
+    expect(await inner.usage('user:1')).toEqual({ tokens: 100, usd: 1 });
+    // A replay is a no-op.
+    await expect(ledger.settle({ requestId: 'a', tokens: 10, usd: 0.5 })).resolves.toMatchObject({
+      state: 'settled',
+    });
+    expect(calls()).toBe(1);
+    expect(await ledger.compact('root')).toMatchObject({ retained: 0 });
+  });
+
+  it('accepts a release as already closed', async () => {
+    const { store, calls } = sweptFirst('release');
+    const ledger = createBudgetLedger({ admission: { store, scopes } });
+    await ledger.reserve({ requestId: 'a', modelId: 'm', tokens: 100, usd: 1 });
+    // The sweep billed the hold, so the store refuses to release it.
+    await expect(ledger.release('a')).resolves.toMatchObject({ state: 'released' });
+    expect(calls()).toBe(1);
+    await expect(ledger.release('a')).resolves.toMatchObject({ state: 'released' });
+    expect(calls()).toBe(1);
+  });
+
+  it('lets a call whose hold a sweep closed in flight succeed', async () => {
+    const { store, inner, calls } = sweptFirst('settle');
+    const execution = createExecutionContext({ admission: { store, scopes } });
+    await expect(
+      generateText({ model: model(), prompt: 'hi', execution, deps: { priceProvider: prices } }),
+    ).resolves.toMatchObject({ text: 'done' });
+    // Before: six store calls, then admission_failed although the call succeeded.
+    expect(calls()).toBe(1);
+    expect(execution.ledger.snapshot().reservations[0]).toMatchObject({
+      state: 'settled',
+      actual: { tokens: 15, usd: 0.01 },
+    });
+    expect(await inner.holds({ before: Date.now() + 60_000 })).toEqual([]);
+  });
+
+  it('closes the entry when error.settlement is replayed after a sweep', async () => {
+    const { store, inner } = flaky('settle', Number.POSITIVE_INFINITY);
+    const execution = createExecutionContext({ admission: { store, scopes } });
+    const error = (await generateText({
+      model: model(),
+      prompt: 'hi',
+      execution,
+      deps: { priceProvider: prices },
+    }).catch((caught: unknown) => caught)) as BudgetLedgerError;
+    expect(error).toMatchObject({ code: 'admission_failed' });
+    // The store is back; the operator's periodic sweep ran before the replay.
+    await inner.sweep({ before: Date.now() + 60_000 });
+    const recovered = createExecutionContext({
+      snapshot: execution.snapshot(),
+      admission: { store: inner },
+    });
+    await expect(recovered.ledger.settle(error.settlement!)).resolves.toMatchObject({
+      state: 'settled',
+    });
+    expect(recovered.ledger.get(error.requestId!)?.state).toBe('settled');
+  });
+});
