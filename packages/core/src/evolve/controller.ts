@@ -18,7 +18,7 @@ import { childScopeId, createExecutionContext } from '../execution-policy';
 import { isFatalExecutionError } from '../internal/execution-error';
 import { mapWithConcurrency } from '../internal/p-limit';
 import { resolveDependencies } from '../internal/resolve-deps';
-import { markRunLedger } from '../internal/unpriced';
+import { markRunLedger } from '../internal/run-ledger';
 import { cosineSimilarity } from '../internal/vector';
 import type { BudgetLedgerSnapshot, NativeExecutionContext } from '../types/execution';
 import { applySearchReplace, EvolvePatchError, extractFullRewrite } from './patch';

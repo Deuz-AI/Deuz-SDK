@@ -7,7 +7,7 @@ import {
 } from '../execution-policy';
 import { intersectBudgetLimits } from '../budget-ledger';
 import { resolveDependencies } from '../internal/resolve-deps';
-import { markRunLedger } from '../internal/unpriced';
+import { markRunLedger } from '../internal/run-ledger';
 import type { DeuzAgent } from '../agent';
 import type { AgentRunOptions, AgentRunStore, AgentToolSet } from '../types/agent-run';
 import type { NativeExecutionContext } from '../types/execution';

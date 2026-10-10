@@ -4,7 +4,8 @@ import { EMPTY_USAGE, withTotal } from '../core/metering';
 import { getCapabilities } from '../core/registry';
 import { createTokenEstimator } from './estimate-tokens';
 import { wireOutputCap } from './output-cap';
-import { firstRunReport, unpricedModelWarning } from './unpriced';
+import { firstRunReport } from './run-ledger';
+import { unpricedModelWarning } from './unpriced';
 import type { CommonCallOptions } from '../types/config';
 import type { CallWarning } from '../types/methods';
 import type { PriceProvider, ResolvedDependencies } from '../types/deps';
@@ -89,9 +90,8 @@ export function createNativeRequest(
         type: 'clamped-setting',
         setting: 'maxOutputTokens',
         message:
-          `maxOutputTokens ${caps.maxOutput} was sent: ${modelId} documents no output limit, ` +
-          'and a call under an execution budget sends the cap its reservation holds; ' +
-          'pass maxOutputTokens to raise it.',
+          `maxOutputTokens ${caps.maxOutput} was sent: ${modelId} documents no output limit ` +
+          'and the call has a budget; pass maxOutputTokens to raise it.',
       }
     : undefined;
   return {
