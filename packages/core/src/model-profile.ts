@@ -267,6 +267,14 @@ const NO_SAMPLING = {
   rule: 'temperature, top_p and top_k are rejected (400)',
 } as const;
 const GPT_6_UNSTATED = ['tools', 'vision', 'structuredOutput', 'nativePdf', 'audio'] as const;
+/** What the compat-host sources leave open (the rows keep their conservative defaults). */
+const COMPAT_UNSTATED = [
+  'vision',
+  'structuredOutput',
+  'nativePdf',
+  'audio',
+  'contextWindow',
+] as const;
 const DEEPSEEK_V4_NOTES = [
   'Always reasons; reasoning tokens share the output budget, so a cap sized for the answer alone can return an empty answer.',
   'Rejects response_format json_schema, and a forced tool_choice in thinking mode.',
@@ -341,6 +349,9 @@ const FACTS: Readonly<Record<string, Facts>> = {
     sourceUrl: OPENAI_MODELS,
     checkedAt: RESEARCHED,
     unknown: [...GPT_6_UNSTATED, 'contextWindow'],
+    // Whether reasoning can be turned off is undocumented: 'none' rides the
+    // OpenAI wire's historical mapping, but no mode is claimed.
+    thinking: { mode: 'unknown' },
     sampling: { accepted: 'unknown' },
   },
   'gpt-6-luna': {
@@ -391,7 +402,7 @@ const FACTS: Readonly<Record<string, Facts>> = {
   'deepseek-flash': {
     ...DEEPSEEK_SOURCE,
     resolvedId: 'V4.1-Flash',
-    unknown: ['vision', 'contextWindow'],
+    unknown: COMPAT_UNSTATED,
     thinking: { mode: 'unknown' },
     sampling: { accepted: 'unknown' },
     notes: [
@@ -403,7 +414,8 @@ const FACTS: Readonly<Record<string, Facts>> = {
   'deepseek-v4-pro': {
     ...DEEPSEEK_SOURCE,
     resolvedId: 'V4-Pro-0813',
-    unknown: ['vision', 'contextWindow'],
+    // json_schema is a verified rejection on V4, so structuredOutput stays stated.
+    unknown: ['vision', 'nativePdf', 'audio', 'contextWindow'],
     maxOutput: 65_536,
     forcedToolChoice: 'unsupported',
     sampling: { accepted: 'unknown' },
@@ -411,7 +423,7 @@ const FACTS: Readonly<Record<string, Facts>> = {
   },
   'deepseek-v4-flash': {
     ...DEEPSEEK_SOURCE,
-    unknown: ['vision', 'contextWindow'],
+    unknown: ['vision', 'nativePdf', 'audio', 'contextWindow'],
     maxOutput: 65_536,
     forcedToolChoice: 'unsupported',
     sampling: { accepted: 'unknown' },
@@ -425,7 +437,7 @@ const FACTS: Readonly<Record<string, Facts>> = {
   'kimi-k3': {
     sourceUrl: 'https://platform.kimi.ai/docs/guide/kimi-k3-quickstart',
     checkedAt: RESEARCHED,
-    unknown: ['vision', 'contextWindow'],
+    unknown: COMPAT_UNSTATED,
     sampling: { accepted: 'unknown' },
     notes: [
       'Never send the K2.x thinking parameter.',
@@ -435,14 +447,15 @@ const FACTS: Readonly<Record<string, Facts>> = {
   'kimi-k2.7-code': {
     sourceUrl: 'https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart',
     checkedAt: RESEARCHED,
-    unknown: ['vision', 'contextWindow'],
+    unknown: COMPAT_UNSTATED,
     sampling: { accepted: 'unknown' },
     notes: ["No non-thinking mode, and K3's effort levels do not apply: no effort is sent."],
   },
   'glm-5.3': {
     sourceUrl: 'https://docs.z.ai/guides/llm/glm-5.3',
     checkedAt: RESEARCHED,
-    unknown: ['contextWindow'],
+    // Text-only is documented, so vision / PDF / audio stay stated (unsupported).
+    unknown: ['structuredOutput', 'contextWindow'],
     sampling: { accepted: 'unknown' },
     notes: [
       "Access depends on the account and its Coding Plan history, so the endpoint is never guessed from the id: createGLM defaults to BigModel (open.bigmodel.cn); pass baseURL for Z.ai's international API.",

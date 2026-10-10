@@ -561,3 +561,20 @@ describe('the profile predicts the request (cross-check against the real pump)',
     }
   });
 });
+
+describe('documented gaps stay unknown (2.3)', () => {
+  it('a conservative row default is never reported as a fact', () => {
+    // The compat rows keep structuredOutput: false as a safe default; no source states it.
+    for (const model of [deepseek('deepseek-flash'), kimi('kimi-k3'), glm('glm-5.3')]) {
+      expect(resolveModelProfile(model).capabilities.structuredOutput, model.modelId).toBe(
+        'unknown',
+      );
+    }
+    // ...except where it IS a fact: DeepSeek V4 rejects json_schema.
+    expect(resolveModelProfile(deepseek('deepseek-v4-pro')).capabilities.structuredOutput).toBe(
+      'unsupported',
+    );
+    // Only luna documents 'none'; astra claims no thinking mode either way.
+    expect(resolveModelProfile(responses('gpt-6-astra')).thinking.mode).toBe('unknown');
+  });
+});
