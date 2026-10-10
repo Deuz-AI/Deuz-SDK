@@ -38,15 +38,27 @@ export type {
   McpToolApprovalRequest,
 } from '../mcp/server';
 
-/** The slice of a Node `Readable` the stdio transport reads requests from. */
+/**
+ * What the stdio transport reads requests from: a Node `Readable` (a socket, a
+ * `PassThrough`). Every member below is one the SDK's transport calls — a
+ * look-alike missing any of them cannot be served on.
+ */
 export interface McpStdioReadable {
   on(event: string, listener: (...args: unknown[]) => void): unknown;
+  off(event: string, listener: (...args: unknown[]) => void): unknown;
+  listenerCount(event: string): number;
+  pause(): unknown;
+  readonly readableEnded: boolean;
+  readonly destroyed: boolean;
 }
 
-/** The slice of a Node `Writable` the stdio transport writes responses to. */
+/** What the stdio transport writes responses to: a Node `Writable` — see {@link McpStdioReadable}. */
 export interface McpStdioWritable {
   write(chunk: string): boolean;
   on(event: string, listener: (...args: unknown[]) => void): unknown;
+  off(event: string, listener: (...args: unknown[]) => void): unknown;
+  once(event: string, listener: (...args: unknown[]) => void): unknown;
+  listeners(event: string): unknown[];
 }
 
 export interface McpStdioServeOptions {
@@ -70,12 +82,19 @@ export interface McpStdioServerHandle {
 
 const STDIO_PACKAGE = '@modelcontextprotocol/server/stdio';
 
+interface V2StdioTransport {
+  start(): Promise<void>;
+}
+
 interface V2StdioModule {
   serveStdio(
     factory: (ctx: { era: 'legacy' | 'modern' }) => Promise<unknown>,
     options?: Record<string, unknown>,
   ): { close(): Promise<void> };
-  StdioServerTransport: new (stdin?: unknown, stdout?: unknown) => unknown;
+  StdioServerTransport: new (
+    stdin?: McpStdioReadable,
+    stdout?: McpStdioWritable,
+  ) => V2StdioTransport;
 }
 
 async function loadStdio(): Promise<V2StdioModule> {
@@ -111,12 +130,31 @@ export async function serveMcpStdio(
   }
   await internals.ready();
   const stdio = await loadStdio();
-  const custom = options.stdin !== undefined || options.stdout !== undefined;
+  // Built here (an absent stream defaults to the process's own, as inside
+  // serveStdio) so its start can be awaited: serveStdio starts the transport
+  // before it returns but only REPORTS a failed start, which would resolve a
+  // handle to a server that never reads a byte.
+  const transport = new stdio.StdioServerTransport(options.stdin, options.stdout);
+  let starting: Promise<void> | undefined;
+  const start = transport.start.bind(transport);
+  transport.start = () => (starting = start());
   const served = stdio.serveStdio(internals.factory('stdio'), {
     legacy: options.legacy ?? 'serve',
     onerror: internals.report,
-    ...(custom ? { transport: new stdio.StdioServerTransport(options.stdin, options.stdout) } : {}),
+    transport,
   });
+  try {
+    await starting;
+  } catch (error) {
+    await served.close().catch(() => {});
+    const custom = options.stdin !== undefined || options.stdout !== undefined;
+    throw new InvalidRequestError({
+      message: custom
+        ? 'serveMcpStdio could not start on the given stdin/stdout. Pass Node streams (a Readable and a Writable, such as a socket or a PassThrough): the stdio transport uses their whole stream API.'
+        : 'serveMcpStdio could not start on process.stdin/process.stdout.',
+      cause: error,
+    });
+  }
   return { close: () => served.close() };
 }
 

@@ -10,11 +10,17 @@
  * HTTP, a `needsApproval` tool can ask a 2025-11-25 client's user (the SDK sends
  * a real `elicitation/create` and re-enters the handler with the answer).
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, expectTypeOf, afterEach, vi } from 'vitest';
+import type { PassThrough } from 'node:stream';
 import { Client as V1Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { Client as V2Client } from '@modelcontextprotocol/client';
-import { serveMcpStdio, type McpStdioServerHandle } from '../src/node/mcp-server';
+import {
+  serveMcpStdio,
+  type McpStdioReadable,
+  type McpStdioServerHandle,
+  type McpStdioWritable,
+} from '../src/node/mcp-server';
 import { createMcpServer, type McpServerOptions } from '../src/mcp/server';
 import { InvalidRequestError } from '../src/errors';
 import { stdioPipe } from './helpers/mcp-pipe-transport';
@@ -177,6 +183,47 @@ describe('serveMcpStdio — startup', () => {
     );
     // Nothing was written: a half-started server never answers anybody.
     expect(pipe.stdout.readableLength).toBe(0);
+  });
+
+  it('rejects streams the transport cannot start on, instead of resolving a server that never serves', async () => {
+    // Shaped exactly like the slices the first 2.3 types published (`on`, and
+    // `write` + `on`). The SDK's transport also calls `listeners`, `off`, `once`,
+    // `listenerCount` and `pause`, so it throws in `start()` before it reads a byte.
+    const dataListeners: Array<(chunk: unknown) => void> = [];
+    const written: string[] = [];
+    const stdin = {
+      on(event: string, listener: (chunk: unknown) => void) {
+        if (event === 'data') dataListeners.push(listener);
+        return stdin;
+      },
+    };
+    const stdout = {
+      write(chunk: string) {
+        written.push(chunk);
+        return true;
+      },
+      on: () => stdout,
+    };
+    // The published types name every member the transport uses, so this no
+    // longer compiles; real Node streams still do.
+    expectTypeOf(stdin).not.toExtend<McpStdioReadable>();
+    expectTypeOf(stdout).not.toExtend<McpStdioWritable>();
+    expectTypeOf<PassThrough>().toExtend<McpStdioReadable>();
+    expectTypeOf<PassThrough>().toExtend<McpStdioWritable>();
+
+    const reported: string[] = [];
+    const serving = serveMcpStdio(
+      { name: 'slices', tools: tools(), onError: (error) => reported.push(error.message) },
+      { stdin: stdin as never, stdout: stdout as never },
+    );
+    serving.then((handle) => handles.push(handle)).catch(() => {});
+    await expect(serving).rejects.toThrow(InvalidRequestError);
+    await expect(serving).rejects.toThrow(/could not start/);
+    expect(reported.join('\n')).toContain('listeners');
+
+    // Nothing half-started: no reader is attached, so nothing is ever answered.
+    expect(dataListeners).toHaveLength(0);
+    expect(written).toEqual([]);
   });
 
   it('rejects a handle createMcpServer did not build', async () => {

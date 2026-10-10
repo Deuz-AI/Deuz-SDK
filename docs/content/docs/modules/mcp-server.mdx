@@ -89,7 +89,7 @@ A client launches it as a child process — for example in a desktop client's MC
 { "mcpServers": { "notes": { "command": "node", "args": ["/abs/path/notes-server.mjs"] } } }
 ```
 
-`serveMcpStdio` prepares every tool **before** reading the first byte, so a broken definition rejects instead of half-starting a server the client then waits on. The opening exchange pins the connection to one era: `server/discover` for an MCP 2026-07-28 client, `initialize` for a 2025-era one. `legacy: 'reject'` refuses 2025-era openings. `stdin`/`stdout` default to the process's own streams; pass others (a socket) to serve elsewhere. `serveMcpStdio` also accepts the options object directly, building the server for you.
+`serveMcpStdio` prepares every tool **before** reading the first byte, so a broken definition rejects instead of half-starting a server the client then waits on. The opening exchange pins the connection to one era: `server/discover` for an MCP 2026-07-28 client, `initialize` for a 2025-era one. `legacy: 'reject'` refuses 2025-era openings. `stdin`/`stdout` default to the process's own streams; pass other Node streams (a socket, a `PassThrough`) to serve elsewhere. The transport drives their whole stream API, so `serveMcpStdio` rejects when it cannot start on them rather than resolving a server that never reads a byte. `serveMcpStdio` also accepts the options object directly, building the server for you.
 
 <Callout type="warn" title="Never write to stdout from a stdio server">
 Every byte on stdout is protocol. A stray `console.log` corrupts the stream and the client drops the connection. Log to stderr.
