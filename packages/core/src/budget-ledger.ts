@@ -3,6 +3,7 @@ import type { BudgetScopeUsage, PersistentBudgetScope } from './types/budget-sto
 import type {
   BudgetAdmission,
   BudgetAggregate,
+  BudgetAmounts,
   BudgetCompaction,
   BudgetLedger,
   BudgetLedgerOptions,
@@ -176,7 +177,7 @@ function count(value: number, label: string): number {
   return value;
 }
 
-function known(value: BudgetLimits, label: string): Required<BudgetLimits> {
+function known(value: BudgetLimits, label: string): BudgetAmounts {
   const copy = limits(value);
   if (copy.tokens === undefined || copy.usd === undefined)
     throw new BudgetLedgerError('invalid_snapshot', `${label} requires token and USD amounts.`);
@@ -911,6 +912,7 @@ export type {
   BudgetAdmission,
   BudgetAdmissionRestore,
   BudgetAggregate,
+  BudgetAmounts,
   BudgetCompaction,
   BudgetLedger,
   BudgetLedgerOptions,

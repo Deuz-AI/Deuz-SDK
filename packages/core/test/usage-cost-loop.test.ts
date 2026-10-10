@@ -43,6 +43,39 @@ describe.each([false, true])('per-invocation legacy cost (streaming=%s)', (strea
     }
     expect(priceUsage.mock.calls.map(([id]) => id)).toContain('expensive');
   });
+
+  it('keeps budget.usd counting priced calls after a call to an unpriced model (F13)', async () => {
+    // Step 0 runs on a model with no price; every later step costs $15.
+    const free = createMockModel({ responses: [{ toolCalls: [{ toolName: 'read', args: {} }] }] });
+    const paid = attachConfig({ ...free, modelId: 'priced' }, readConfig(free)!);
+    const options = {
+      model: free,
+      messages,
+      tools,
+      maxSteps: 10,
+      budget: { usd: 40 },
+      prepareStep: ({ stepIndex }: { stepIndex: number }) =>
+        stepIndex > 0 ? { model: paid } : undefined,
+      deps: {
+        priceProvider: {
+          priceUsage: (id: string, usage: { totalTokens: number }) =>
+            id === 'priced' ? usage.totalTokens : undefined,
+        },
+      },
+    };
+    // 2.2 lost the cost after step 0 and ran all 10 steps. Now $15 + $15 + $15 >= $40.
+    if (streaming) {
+      const parts: StreamPart[] = [];
+      for await (const part of streamChat(options).fullStream) parts.push(part);
+      expect(parts.filter((p) => p.type === 'step-start')).toHaveLength(4);
+      expect(parts.find((p) => p.type === 'budget-exceeded')).toMatchObject({ kind: 'usd' });
+      expect(parts.filter((p) => p.type === 'cost').map((p) => p.costUsd)).toEqual([0, 15, 30, 45]);
+    } else {
+      const result = await generateText(options);
+      expect(result.steps).toHaveLength(4);
+      expect(result.providerMetadata?.deuz).toMatchObject({ stoppedBy: 'budget.usd' });
+    }
+  });
 });
 
 it('retains historical settled cost when prices change between approval legs', async () => {

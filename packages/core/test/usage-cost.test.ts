@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createUsageCostAccumulator } from '../src/internal/usage-cost';
 import type { UsageCostSnapshot } from '../src/internal/usage-cost';
+import { UnpricedModelError } from '../src/internal/unpriced';
+import { createWarningSink } from '../src/internal/warnings';
 import type { Usage } from '../src/types/usage';
 
 function usage(tokens: number): Usage {
@@ -128,10 +130,8 @@ describe('legacy per-invocation usage cost', () => {
     expect(Object.isFrozen(cost.snapshot())).toBe(true);
   });
 
-  it('does not treat unavailable or failed pricing as zero cost', async () => {
+  it('does not treat failed pricing as zero cost', async () => {
     for (const priceProvider of [
-      undefined,
-      { priceUsage: () => undefined },
       { priceUsage: () => Number.NaN },
       { priceUsage: () => -1 },
       {
@@ -146,6 +146,61 @@ describe('legacy per-invocation usage cost', () => {
     }
   });
 
+  it('keeps costUsd as the sum of priced calls when a model has no price (F13)', async () => {
+    // 2.2 dropped costUsd for good after one unpriced call, so budget.usd never fired again.
+    const priceProvider = { priceUsage: (model: string) => (model === 'priced' ? 0.5 : undefined) };
+    const cost = createUsageCostAccumulator({ priceProvider });
+    cost.record(usage(1), { model: 'unpriced' });
+    cost.record(usage(1), { model: 'priced' });
+    cost.record(usage(1), { model: 'unpriced' });
+    cost.record(usage(1), { model: 'priced' });
+    expect(await cost.flush()).toEqual({
+      pricedUsd: 1,
+      costUsd: 1,
+      calls: 4,
+      unknownCalls: 0,
+      unpricedCalls: 2,
+      unpricedModels: ['unpriced'],
+    });
+    for (const missing of [undefined, { priceUsage: () => undefined }]) {
+      const none = createUsageCostAccumulator({ priceProvider: missing });
+      none.record(usage(1), { model: 'm' });
+      expect(await none.flush()).toEqual({
+        pricedUsd: 0,
+        costUsd: 0,
+        calls: 1,
+        unknownCalls: 0,
+        unpricedCalls: 1,
+        unpricedModels: ['m'],
+      });
+    }
+  });
+
+  it('carries unpriced calls across resume without repricing them', async () => {
+    const priceUsage = vi.fn((model: string) => (model === 'priced' ? 2 : undefined));
+    const cost = createUsageCostAccumulator({ priceProvider: { priceUsage } });
+    cost.record(usage(1), { model: 'free-tier' });
+    cost.record(usage(1), { model: 'priced' });
+    await cost.flush();
+    const saved = JSON.parse(JSON.stringify(cost.snapshot())) as UsageCostSnapshot;
+    expect(saved).toEqual({
+      version: 1,
+      pricedUsd: 2,
+      calls: 2,
+      unknownCalls: 0,
+      unpricedCalls: 1,
+      unpricedModels: ['free-tier'],
+    });
+    const resumed = createUsageCostAccumulator({ snapshot: saved, priceProvider: { priceUsage } });
+    expect(await resumed.flush()).toMatchObject({ costUsd: 2, unpricedModels: ['free-tier'] });
+    expect(priceUsage).toHaveBeenCalledTimes(2);
+    expect(() =>
+      createUsageCostAccumulator({
+        snapshot: { ...saved, unknownCalls: 2 },
+      }),
+    ).toThrow(/snapshot/);
+  });
+
   it('records usage even when the user callback throws', async () => {
     const cost = createUsageCostAccumulator({ priceProvider: { priceUsage: () => 1 } });
     const callback = cost.wrap(() => {
@@ -153,6 +208,66 @@ describe('legacy per-invocation usage cost', () => {
     });
     expect(() => callback(usage(1), { model: 'm', reason: 'finished' })).toThrow('consumer');
     expect((await cost.flush()).costUsd).toBe(1);
+  });
+
+  it('warns once per model while a USD budget is set, through the loop sink', async () => {
+    const warnings = createWarningSink();
+    const cost = createUsageCostAccumulator({
+      priceProvider: { priceUsage: (model: string) => (model === 'priced' ? 1 : undefined) },
+      budget: { usd: 5 },
+      warnings,
+    });
+    for (const model of ['glm-5.3', 'priced', 'glm-5.3', 'kimi-k3', 'glm-5.3'])
+      cost.record(usage(1), { model });
+    await cost.flush();
+    expect(warnings.list().map((w) => [w.type, w.setting])).toEqual([
+      ['unpriced-model', 'budget.usd'],
+      ['unpriced-model', 'budget.usd'],
+    ]);
+    expect(warnings.list()[0]!.message).toContain('glm-5.3');
+    expect(warnings.list()[1]!.message).toContain('kimi-k3');
+    // Without a USD bound nothing was waived, so nothing is reported.
+    const quiet = createWarningSink();
+    const tokensOnly = createUsageCostAccumulator({
+      priceProvider: { priceUsage: () => undefined },
+      budget: { tokens: 100 },
+      warnings: quiet,
+    });
+    tokensOnly.record(usage(1), { model: 'glm-5.3' });
+    await tokensOnly.flush();
+    expect(quiet.list()).toEqual([]);
+  });
+
+  it('admits a model before its call: warns, or refuses it under unknownPrice reject', async () => {
+    const priceUsage = vi.fn((model: string) => (model === 'priced' ? 1 : undefined));
+    const warnings = createWarningSink();
+    const warn = createUsageCostAccumulator({
+      priceProvider: { priceUsage },
+      budget: { usd: 5 },
+      warnings,
+    });
+    await warn.admit('priced');
+    await warn.admit('glm-5.3');
+    await warn.admit('glm-5.3');
+    expect(warnings.list()).toHaveLength(1);
+    expect(warnings.list()[0]).toMatchObject({ type: 'unpriced-model' });
+    // One probe per model per run.
+    expect(priceUsage.mock.calls.map(([model]) => model)).toEqual(['priced', 'glm-5.3']);
+
+    const strict = createUsageCostAccumulator({
+      priceProvider: { priceUsage },
+      budget: { usd: 5, unknownPrice: 'reject' },
+    });
+    await expect(strict.admit('priced')).resolves.toBeUndefined();
+    const refused = await strict.admit('glm-5.3').catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(UnpricedModelError);
+    expect(refused).toMatchObject({ code: 'unpriced_model', modelId: 'glm-5.3' });
+    // No price provider at all is the same as no price.
+    const bare = createUsageCostAccumulator({ budget: { usd: 5, unknownPrice: 'reject' } });
+    await expect(bare.admit('priced')).rejects.toMatchObject({ code: 'unpriced_model' });
+    // The policy only guards a USD bound.
+    const tokensOnly = createUsageCostAccumulator({ budget: { unknownPrice: 'reject' } });
+    await expect(tokensOnly.admit('glm-5.3')).resolves.toBeUndefined();
   });
 
   it('rejects corrupt cost snapshots', () => {
