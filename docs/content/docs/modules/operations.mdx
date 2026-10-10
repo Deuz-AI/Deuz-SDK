@@ -504,6 +504,12 @@ for the next page. A run saved while you page moves ahead of the cursor, so a
 traversal never returns a run twice, but can miss one saved meanwhile. A
 malformed query rejects with a `TypeError`.
 
+A store of your own that implements `list` keeps the same contract: it records
+the time of each save on its own clock, reads `phase` and `status` from the
+saved envelope (`phase`, and `result.status` when there is a result), orders by
+that time and then run ID, both descending, and treats its cursor as its own
+opaque string naming the last run returned.
+
 ```ts
 import { runAgent } from '@deuz-sdk/core/agent';
 import { createMockModel } from '@deuz-sdk/core/testing';
