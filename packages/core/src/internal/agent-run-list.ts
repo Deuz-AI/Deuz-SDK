@@ -63,10 +63,11 @@ function decodeCursor(cursor: unknown): { updatedAt: number; runId: string } {
   } catch {
     position = undefined;
   }
+  // The SQL stores' times are whole milliseconds; an injected clock's need not be.
   if (
     !Array.isArray(position) ||
     position.length !== 2 ||
-    !Number.isSafeInteger(position[0]) ||
+    !Number.isFinite(position[0]) ||
     typeof position[1] !== 'string'
   )
     throw new TypeError('Malformed agent run listing cursor');

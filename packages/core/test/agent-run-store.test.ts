@@ -5,6 +5,7 @@ import type { AgentRunEnvelope, AgentRunStore } from '../src/types/agent-run';
 import {
   agentRunListContracts,
   agentRunStoreContracts,
+  envelope,
 } from './fixtures/agent-run-store-conformance';
 import { manualClock } from './fixtures/manual-clock';
 
@@ -18,6 +19,25 @@ agentRunListContracts('memory agent run listing', async () => {
     now: () => clock.now(),
     frozen: true,
   };
+});
+
+describe('memory agent run listing (2.3)', () => {
+  it('pages on a clock with sub-millisecond time', async () => {
+    let time = 1_000.25;
+    const store = createInMemoryAgentRunStore({
+      clock: { now: () => time, setTimeout: () => () => {} },
+    });
+    for (const runId of ['a', 'b', 'c']) {
+      await store.save(envelope(runId, 1));
+      time += 0.5;
+    }
+    const first = await store.list({ limit: 2 });
+    expect(first.runs.map((run) => run.runId)).toEqual(['c', 'b']);
+    const second = await store.list({ limit: 2, cursor: first.cursor });
+    expect(second).toEqual({
+      runs: [expect.objectContaining({ runId: 'a', updatedAt: 1_000.25 })],
+    });
+  });
 });
 
 describe('native envelope revision', () => {
