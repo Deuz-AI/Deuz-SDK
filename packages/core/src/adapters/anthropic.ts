@@ -16,9 +16,9 @@ import {
 import { extractSystem } from '../core/normalize';
 import type { EffortLevel } from '../core/registry';
 import {
-  EFFORT_SCALE,
   atMostHigh,
   describeToolChoice,
+  effortWire,
   planEffort,
   reportClamp,
   reportDrop,
@@ -114,14 +114,6 @@ function orderReasoningFirst(blocks: AnthropicBlock[]): AnthropicBlock[] {
   return [...thinking, ...rest];
 }
 
-const THINKING_BUDGET: Record<EffortLevel, number> = {
-  low: 4_000,
-  medium: 10_000,
-  high: 24_000,
-  xhigh: 48_000,
-  max: 48_000,
-};
-
 /**
  * Map canonical tool choice → Anthropic. A forced choice the model cannot take
  * (`forcedOk` false: the row says so, or extended thinking is on) falls back
@@ -173,10 +165,12 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     ),
   }));
 
-  // Opus 4.7+/Sonnet 5/Fable 5/Claude 5.x: budget_tokens returns 400 — effort rides output_config.
-  const useOutputConfig = caps.effortWire === 'output_config';
-  // Every value changed on the way is reported (2.3): see core/request-rules.ts.
-  const effort = planEffort(ctx, EFFORT_SCALE);
+  // Opus 4.7+/Sonnet 5/Fable 5/Claude 5.x: budget_tokens returns 400 — effort
+  // rides output_config. Every value changed on the way is reported (2.3): see
+  // core/request-rules.ts.
+  const wire = effortWire('anthropic', caps, call.modelId);
+  const useOutputConfig = wire.field === 'output_config.effort';
+  const effort = planEffort(ctx, wire);
   let budget: number | undefined;
   let outputEffort: EffortLevel | undefined;
   let thinking: Record<string, unknown> | undefined;
@@ -190,16 +184,8 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     if (useOutputConfig) {
       outputEffort = effort.level;
     } else {
-      budget = THINKING_BUDGET[effort.level];
+      budget = effort.budget;
       thinking = { type: 'enabled', budget_tokens: budget };
-      if (effort.level === 'xhigh' || effort.level === 'max') {
-        reportClamp(
-          ctx,
-          'effort',
-          `effort '${effort.level}' was sent as thinking.budget_tokens ${budget}: the ` +
-            `budget_tokens wire caps 'xhigh' and 'max' at the same budget (${call.modelId}).`,
-        );
-      }
     }
   }
   // Adaptive thinking runs whenever an effort level rides output_config.

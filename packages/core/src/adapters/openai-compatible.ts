@@ -27,9 +27,9 @@ import { applyProviderOptions } from '../internal/provider-options';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
 import {
-  OPENAI_EFFORT,
   assertToolSurface,
   describeToolChoice,
+  effortWire,
   isForcedToolChoice,
   optionalOutputCap,
   planEffort,
@@ -254,7 +254,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   // OpenAI accepts 'none' as a real value; 'max' reaches the wire only for a
   // model that lists it (2.3), elsewhere it clamps to xhigh — reported. An
   // always-reasoning model (DeepSeek v4) never gets 'none'.
-  const effort = planEffort(ctx, OPENAI_EFFORT, 'send');
+  const effort = planEffort(ctx, effortWire('chat_completions', caps, call.modelId));
   if (effort.none) body.reasoning_effort = 'none';
   else if (effort.level !== undefined) body.reasoning_effort = effort.level;
 

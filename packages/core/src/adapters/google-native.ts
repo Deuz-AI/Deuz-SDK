@@ -14,11 +14,10 @@ import {
   RateLimitError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
-import type { EffortLevel } from '../core/registry';
 import {
-  EFFORT_SCALE,
   assertToolSurface,
   describeToolChoice,
+  effortWire,
   isForcedToolChoice,
   optionalOutputCap,
   planEffort,
@@ -61,57 +60,24 @@ interface GeminiUsageMetadata {
 
 // --- request building ---
 
-/** gemini-3* uses thinkingLevel; gemini-2.5* uses thinkingBudget (never both → 400). */
-function usesThinkingLevel(modelId: string): boolean {
-  return /^gemini-3/.test(modelId);
-}
-
 /** gemini-3* accepts the fuller responseJsonSchema; 2.5 uses the restricted responseSchema. */
 function usesJsonSchema(modelId: string): boolean {
   return /^gemini-3/.test(modelId);
 }
 
-const BUDGET_MAP: Record<EffortLevel, number> = {
-  low: 4096,
-  medium: 12288,
-  high: 24576,
-  xhigh: 32768,
-  max: 32768,
-};
-
-/** Pro-tier Gemini 3 models accept only low/high thinking levels. */
-function levelOnlyLowHigh(modelId: string): boolean {
-  return /^gemini-3(\.\d+)?-pro/.test(modelId);
-}
-
 /**
  * The thinking config for `options.effort` — never both a level AND a budget
- * (400). The level wire's accepted set comes from the row when it lists one,
- * else from the family (Pro: low/high, others low/medium/high); every clamp
- * on the way is reported (2.3, F26).
+ * (400): gemini-3* takes `thinkingLevel`, gemini-2.5* `thinkingBudget`. The
+ * level wire's accepted set comes from the row when it lists one, else from
+ * the family (Pro: low/high, others low/medium/high); every clamp on the way
+ * is reported (2.3, F26). The table lives in core/request-rules.ts.
  */
 function thinkingConfigFor(ctx: BuildContext): Record<string, unknown> | undefined {
-  const { call } = ctx;
-  if (usesThinkingLevel(call.modelId)) {
-    const family: readonly EffortLevel[] = levelOnlyLowHigh(call.modelId)
-      ? ['low', 'high']
-      : ['low', 'medium', 'high'];
-    const effort = planEffort(ctx, family);
-    if (effort.level === undefined) return undefined;
-    return { includeThoughts: true, thinkingLevel: effort.level };
-  }
-  const effort = planEffort(ctx, EFFORT_SCALE);
+  const effort = planEffort(ctx, effortWire('native', ctx.caps, ctx.call.modelId));
   if (effort.level === undefined) return undefined;
-  const budget = BUDGET_MAP[effort.level];
-  if (effort.level === 'xhigh' || effort.level === 'max') {
-    reportClamp(
-      ctx,
-      'effort',
-      `effort '${effort.level}' was sent as thinkingBudget ${budget}: the thinkingBudget wire ` +
-        `caps 'xhigh' and 'max' at the same budget (${call.modelId}).`,
-    );
-  }
-  return { includeThoughts: true, thinkingBudget: budget };
+  return effort.budget !== undefined
+    ? { includeThoughts: true, thinkingBudget: effort.budget }
+    : { includeThoughts: true, thinkingLevel: effort.level };
 }
 
 function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart | null {

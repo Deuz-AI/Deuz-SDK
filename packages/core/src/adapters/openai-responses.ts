@@ -7,9 +7,9 @@ import type { NormalizedMessage } from '../core/normalize';
 import type { DeuzError } from '../errors';
 import { extractSystem } from '../core/normalize';
 import {
-  OPENAI_EFFORT,
   assertToolSurface,
   describeToolChoice,
+  effortWire,
   isForcedToolChoice,
   optionalOutputCap,
   planEffort,
@@ -191,7 +191,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   if (system) body.instructions = system;
   // 'none' is a real OpenAI value (disables reasoning). 'max' is sent only to a
   // model that lists it (gpt-6.1-sol); elsewhere it clamps to xhigh — reported.
-  const effort = planEffort(ctx, OPENAI_EFFORT, 'send');
+  const effort = planEffort(ctx, effortWire('responses', caps, call.modelId));
   if (effort.none) body.reasoning = { effort: 'none' };
   else if (effort.level !== undefined) body.reasoning = { effort: effort.level };
   // F20 (2.3): every Responses request is stateless unless the caller opts in
