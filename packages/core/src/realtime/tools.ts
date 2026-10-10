@@ -131,7 +131,8 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
     controller: AbortController,
   ): Promise<void> {
     const work = new Promise<unknown>((resolve) => resolve(execute()));
-    if (timeoutMs === undefined || timeoutMs <= 0) {
+    // Infinity means no cap: a host timer would clamp it to 1 ms.
+    if (timeoutMs === undefined || timeoutMs <= 0 || !Number.isFinite(timeoutMs)) {
       settle(batch, call, await work, false);
       return;
     }

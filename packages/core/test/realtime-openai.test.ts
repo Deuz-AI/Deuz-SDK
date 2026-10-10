@@ -618,6 +618,27 @@ describe('OpenAI Realtime — tool calls', () => {
     ]);
   });
 
+  it('arms no tool timer for timeoutMs Infinity', async () => {
+    const { clock, pending } = manualClock();
+    let finish: (value: string) => void = () => {};
+    const { socket, sent } = await openSession({
+      tools: {
+        get_weather: tool({
+          parameters: CITY,
+          timeoutMs: Number.POSITIVE_INFINITY,
+          execute: () => new Promise<string>((resolve) => (finish = resolve)),
+        }),
+      },
+      deps: { clock },
+    });
+    socket.push(doneWithCall('completed'));
+    await flush();
+    expect(pending()).toBe(0);
+    finish('sunny');
+    await flush();
+    expect((sent()[0]!.item as { output: string }).output).toBe('sunny');
+  });
+
   it('abandons a tool that outlives its timeoutMs on the injected clock', async () => {
     const { clock, advance } = manualClock();
     const { socket, sent } = await openSession({
