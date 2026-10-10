@@ -454,6 +454,30 @@ describe('createMcpServer — approval', () => {
     ]);
   });
 
+  it("a throwing approve denies with 'Tool call denied.' and reports the error to onError only", async () => {
+    const execute = vi.fn(() => 'restarted');
+    const reported: string[] = [];
+    const server = serve({
+      name: 't',
+      tools: { restart: { parameters: { type: 'object' }, needsApproval: true, execute } },
+      approve: () => {
+        throw new Error('policy backend at 10.0.0.5:8443 unreachable');
+      },
+      onError: (error) => reported.push(error.message),
+    });
+    const client = await connect(server);
+
+    // The client's model reads the standard denial — the loop's verdict for a
+    // throwing approveToolCall — never the operator's internals.
+    const error = await client.callTool('restart', {}).then(
+      () => undefined,
+      (err: unknown) => err as Error,
+    );
+    expect(error?.message).toBe('Tool call denied.');
+    expect(execute).not.toHaveBeenCalled();
+    expect(reported).toEqual(['policy backend at 10.0.0.5:8443 unreachable']);
+  });
+
   it("by default the client's user is asked through elicitation: approve runs, decline denies", async () => {
     const execute = vi.fn(() => 'deployed');
     const server = serve({

@@ -112,7 +112,7 @@ Every byte on stdout is protocol. A stray `console.log` corrupts the stream and 
 | `legacy` | `'stateless' \| 'reject'` | `'stateless'` | HTTP: serve 2025-era clients statelessly, or make a 2026-07-28-only endpoint. |
 | `responseMode` | `'auto' \| 'sse' \| 'json'` | `'auto'` | 2026-07-28 response shaping: JSON, upgraded to SSE when a call streams. |
 | `maxRequestBodySize` | `number` | 4 MiB | Largest POST body read. |
-| `onError` | `(error) => void` | — | Out-of-band failures (rejected requests, a missing peer). Reporting only. |
+| `onError` | `(error) => void` | — | Out-of-band failures (rejected requests, a missing peer, a throwing `approve`). Reporting only. |
 | `clock` | `Clock` | host clock | Time source for `Tool.timeoutMs`. |
 
 Construction rejects what can never be served, while the stack still points at your definition: a client tool (no `execute` — it runs in the caller's UI), a provider-executed tool, the same name twice across `tools`/`agentTools`/`agents`, and `toolAnnotations` for a name that is not served.

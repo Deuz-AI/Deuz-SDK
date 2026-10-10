@@ -197,8 +197,9 @@ export interface McpServerOptions {
   /** Largest POST body the handler reads, in bytes. SDK default 4 MiB. */
   maxRequestBodySize?: number;
   /**
-   * Out-of-band failures: a request the SDK rejected, a missing peer. Reporting
-   * only — it never changes a response. A throwing callback is swallowed.
+   * Out-of-band failures: a request the SDK rejected, a missing peer, an
+   * `approve` callback that threw (the call is denied). Reporting only — it
+   * never changes a response. A throwing callback is swallowed.
    */
   onError?: (error: Error) => void;
   /** Time source for `Tool.timeoutMs`. Default: the host clock. */
@@ -808,8 +809,8 @@ export function createMcpServer(options: McpServerOptions): DeuzMcpServer {
       if (outcome.isError) return errorResult(resultText(outcome.result));
       return toCallToolResult(outcome.result, entry.hasOutputSchema);
     } catch (error) {
-      // A failing runtimeContext/toolsContext/approve/guardrail is the call's
-      // failure, answered like a throwing tool — never a dropped request.
+      // A failing runtimeContext/toolsContext/guardrail is the call's failure,
+      // answered like a throwing tool — never a dropped request.
       return errorResult(messageOf(error));
     }
   }
@@ -823,9 +824,15 @@ export function createMcpServer(options: McpServerOptions): DeuzMcpServer {
   ): Promise<ApprovalDecision> {
     const approve = options.approve ?? 'elicit';
     if (typeof approve === 'function') {
-      return (await approve({ toolName: call.toolName, args: call.args, request }))
-        ? { kind: 'approved' }
-        : { kind: 'denied' };
+      let approved = false;
+      try {
+        approved = Boolean(await approve({ toolName: call.toolName, args: call.args, request }));
+      } catch (error) {
+        // A throw denies, as a throwing approveToolCall does in the loop. Its
+        // message is the operator's business: onError gets it, the client does not.
+        report(error);
+      }
+      return approved ? { kind: 'approved' } : { kind: 'denied' };
     }
     const answer = sdk.inputResponse(ctx.mcpReq.inputResponses, APPROVAL_KEY);
     if (answer.kind === 'elicit') {
