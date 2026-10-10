@@ -69,6 +69,12 @@ export interface TestToolSpec {
    */
   inputSchema?: unknown;
   /**
+   * Raw JSON Schema, listed as the tool's `outputSchema` VERBATIM (2.3). The
+   * server never checks a result against it: that is the client SDK's job, and
+   * a handler that breaks its own schema is how a test proves the check ran.
+   */
+  outputSchema?: unknown;
+  /**
    * Runs on `tools/call`. The return value is mapped to a `CallToolResult`:
    * a string becomes one text block; a plain object becomes `structuredContent`
    * plus its JSON serialization as text; `undefined` becomes empty content.
@@ -309,6 +315,9 @@ export async function startTestMcpServer(
           inputSchema: (spec.inputSchema ?? EMPTY_INPUT_SCHEMA) as Tool['inputSchema'],
         };
         if (spec.description !== undefined) tool.description = spec.description;
+        if (spec.outputSchema !== undefined) {
+          tool.outputSchema = spec.outputSchema as Tool['outputSchema'];
+        }
         return tool;
       });
       const size = opts.toolsPageSize;

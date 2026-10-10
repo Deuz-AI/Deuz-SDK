@@ -89,7 +89,7 @@ A client launches it as a child process — for example in a desktop client's MC
 { "mcpServers": { "notes": { "command": "node", "args": ["/abs/path/notes-server.mjs"] } } }
 ```
 
-`serveMcpStdio` prepares every tool **before** reading the first byte, so a broken definition rejects instead of half-starting a server the client then waits on. The opening exchange pins the connection to one era: `server/discover` for an MCP 2026-07-28 client, `initialize` for a 2025-era one. `legacy: 'reject'` refuses 2025-era openings. `stdin`/`stdout` default to the process's own streams; pass others (a socket) to serve elsewhere. `serveMcpStdio` also accepts the options object directly, building the server for you.
+`serveMcpStdio` prepares every tool **before** reading the first byte, so a broken definition rejects instead of half-starting a server the client then waits on. The opening exchange pins the connection to one era: `server/discover` for an MCP 2026-07-28 client, `initialize` for a 2025-era one. `legacy: 'reject'` refuses 2025-era openings. `stdin`/`stdout` default to the process's own streams; pass other Node streams (a socket, a `PassThrough`) to serve elsewhere. The transport drives their whole stream API, so `serveMcpStdio` rejects when it cannot start on them rather than resolving a server that never reads a byte. `serveMcpStdio` also accepts the options object directly, building the server for you.
 
 <Callout type="warn" title="Never write to stdout from a stdio server">
 Every byte on stdout is protocol. A stray `console.log` corrupts the stream and the client drops the connection. Log to stderr.
@@ -112,7 +112,7 @@ Every byte on stdout is protocol. A stray `console.log` corrupts the stream and 
 | `legacy` | `'stateless' \| 'reject'` | `'stateless'` | HTTP: serve 2025-era clients statelessly, or make a 2026-07-28-only endpoint. |
 | `responseMode` | `'auto' \| 'sse' \| 'json'` | `'auto'` | 2026-07-28 response shaping: JSON, upgraded to SSE when a call streams. |
 | `maxRequestBodySize` | `number` | 4 MiB | Largest POST body read. |
-| `onError` | `(error) => void` | — | Out-of-band failures (rejected requests, a missing peer). Reporting only. |
+| `onError` | `(error) => void` | — | Out-of-band failures (rejected requests, a missing peer, a throwing `approve`). Reporting only. |
 | `clock` | `Clock` | host clock | Time source for `Tool.timeoutMs`. |
 
 Construction rejects what can never be served, while the stack still points at your definition: a client tool (no `execute` — it runs in the caller's UI), a provider-executed tool, the same name twice across `tools`/`agentTools`/`agents`, and `toolAnnotations` for a name that is not served.
@@ -249,7 +249,7 @@ Both eras run the same definition, so they cannot drift apart. Over stateless HT
 
 - **Tools only.** The server publishes tools; it serves no resources or prompts, and its catalog is fixed at construction (no `tools/list_changed`).
 - **No conversation.** `messages` is `[]` and `toolCallId` is per JSON-RPC request — a 2026-07-28 approval retry is a new request with a new id.
-- **Per-tool timeouts only.** `Tool.timeoutMs` is honored; the loop's call-level `timeout` has no counterpart. A client's own request timeout and cancellation bound every call.
+- **Per-tool timeouts only.** `Tool.timeoutMs` is honored (`0` or `Infinity` means no cap, as in the loop); the loop's call-level `timeout` has no counterpart. A client's own request timeout and cancellation bound every call.
 - **No usage reporting.** An agent's token usage stays on the server (observe it with `deps.onUsage`); MCP has no field for it.
 - **Not live-verified against third-party hosts.** The server is verified offline, in-process, against the Deuz client on both SDK lines and the official v1 and v2 SDK clients (HTTP and a real stdio child) — not against hosted MCP clients.
 

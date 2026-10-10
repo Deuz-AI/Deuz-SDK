@@ -162,6 +162,55 @@ describe('v2 line ↔ a 2026-07-28 server — tools/list_changed over subscripti
     await waitFor(() => changes.length >= 2, 'a change on the reopened stream');
     expect(Object.keys(await client.listTools())).toEqual(['echo', 'after-cut']);
   });
+
+  it('a stream cut on a schedule is re-opened every time, however many cuts', async () => {
+    // A gateway's maximum response duration, a proxy cap or a rolling restart
+    // ends the long-lived listen response every so often, with no catalog
+    // change in between. Those cuts must not count as a crash loop: push
+    // invalidation has to outlive any number of them.
+    const { clock, advance } = manualClock();
+    const server = v2Server({ tools: [ECHO] });
+    const client = await connect(server, { clock });
+    const changes: number[] = [];
+    client.onToolListChanged(() => changes.push(1));
+    await client.listTools();
+    const listens = (): number => server.methods.filter((m) => m === 'subscriptions/listen').length;
+
+    for (let cut = 1; cut <= 6; cut++) {
+      await advance(60_000); // the stream stays open, and quiet, for a minute
+      await waitFor(() => server.endListenStreams() === 1, `cut ${cut}`);
+      await waitFor(() => listens() === cut + 1, `the re-listen after cut ${cut}`);
+    }
+    expect(client.status()).toBe('connected');
+
+    // The catalog changes only now: the stream reopened after the sixth cut delivers it.
+    server.addTool({ name: 'late', handler: () => 'late' });
+    await waitFor(() => changes.length > 6, 'tools/list_changed on the reopened stream');
+    expect(Object.keys(await client.listTools())).toEqual(['echo', 'late']);
+  }, 20_000);
+
+  it('a stream that keeps ending as soon as it opens is given up after three re-opens', async () => {
+    // The cap that remains: a server ending every subscription at once must not
+    // spin a re-listen loop. Giving up is reported, and the liveness probe keeps
+    // the session, which still serves its tools.
+    const { clock } = manualClock();
+    const server = v2Server({ tools: [ECHO] });
+    const client = await connect(server, { clock });
+    const listens = (): number => server.methods.filter((m) => m === 'subscriptions/listen').length;
+    const discovers = (): number => server.methods.filter((m) => m === 'server/discover').length;
+
+    for (let cut = 1; cut <= 3; cut++) {
+      await waitFor(() => server.endListenStreams() === 1, `cut ${cut}`);
+      await waitFor(() => listens() === cut + 1, `the re-listen after cut ${cut}`);
+    }
+    const probesBefore = discovers();
+    await waitFor(() => server.endListenStreams() === 1, 'cut 4');
+    await waitFor(() => discovers() > probesBefore, 'the liveness probe after giving up');
+
+    expect(listens()).toBe(4);
+    expect(client.status()).toBe('connected');
+    expect(await client.callTool('echo', { value: 'still here' })).toBe('echo:still here');
+  });
 });
 
 describe('v2 line ↔ a 2026-07-28 server — liveness without ping', () => {

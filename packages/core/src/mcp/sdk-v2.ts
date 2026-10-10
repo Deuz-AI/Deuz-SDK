@@ -27,6 +27,8 @@
  * bundled. The Node-only stdio transport lives in `./stdio`.
  */
 import { InvalidRequestError } from '../errors';
+import { resolveDependencies } from '../internal/resolve-deps';
+import type { Clock } from '../types/deps';
 import {
   buildElicitationHandler,
   buildRootsHandler,
@@ -115,6 +117,8 @@ export interface V2ClientOptions {
   onElicitationRequest?: McpElicitationHandler;
   sampling?: McpSamplingOptions;
   versionNegotiation?: McpVersionNegotiation;
+  /** `McpLifecycleOptions.clock` — how long a listen stream lived. Default: the host clock. */
+  clock?: Clock;
 }
 
 /** The HTTP half — `McpHttpTransport` in `./index`. */
@@ -143,9 +147,19 @@ export async function makeV2HttpTransport(
 /**
  * Unexpected ends of the listen stream tolerated in a row before the adapter
  * stops re-opening it and lets the liveness probe decide. A server that ends
- * every subscription immediately must not spin a re-listen loop forever.
+ * every subscription immediately must not spin a re-listen loop forever. "In a
+ * row" means with no healthy stream in between — see {@link LISTEN_HEALTHY_MS}.
  */
 const MAX_LISTEN_REOPENS = 3;
+
+/**
+ * A listen stream that stayed open this long was healthy, however it ended. A
+ * gateway or serverless platform caps how long one response may stay open, and
+ * a rolling restart ends every stream, so a long-lived session has to keep
+ * re-opening a stream cut that way. Only a stream that ends sooner counts toward
+ * {@link MAX_LISTEN_REOPENS}, so a crash loop is still given up quickly.
+ */
+const LISTEN_HEALTHY_MS = 5_000;
 
 /**
  * Build ONE fresh, unconnected v2 client with every handler registered — the
@@ -187,6 +201,7 @@ export async function makeV2Client(
   }
   if (rootsBox !== undefined) client.setRequestHandler('roots/list', buildRootsHandler(rootsBox));
 
+  const clock = options.clock ?? resolveDependencies().clock;
   let reopens = 0;
   client.setNotificationHandler('notifications/tools/list_changed', () => {
     reopens = 0; // a stream that delivers is a healthy one
@@ -207,12 +222,16 @@ export async function makeV2Client(
    */
   const listen = async (): Promise<void> => {
     if (!modern() || !client.getServerCapabilities()?.tools?.listChanged) return;
+    // Timed from the request: only a stream the server acknowledged gets as far
+    // as the handler below, so this differs from its open time by the ack only.
+    const requestedAt = clock.now();
     const subscription = await client.listen({ toolsListChanged: true });
     void subscription.closed.then((how) => {
       if (closing || how === 'local') return;
       // A notification may have been lost while the stream was down: drop the
       // tool cache so the next listTools() refetches, then listen again.
       hooks.toolListChanged();
+      if (clock.now() - requestedAt >= LISTEN_HEALTHY_MS) reopens = 0;
       if (++reopens > MAX_LISTEN_REOPENS) {
         report(new Error('The MCP subscriptions/listen stream keeps ending.'));
         return;

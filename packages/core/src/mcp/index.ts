@@ -139,6 +139,14 @@ export interface McpClientOptions extends McpLifecycleOptions {
    */
   authorizationCode?: string;
   /**
+   * The `?iss=` from the same redirect (RFC 9207, 2.3), when it carries one —
+   * pass it whenever it does. The v2 SDK checks it against the authorization
+   * server's issuer before redeeming `authorizationCode` (the mix-up defense)
+   * and refuses the exchange without it when the server advertises
+   * `authorization_response_iss_parameter_supported`. The v1 SDK ignores it.
+   */
+  authorizationIss?: string;
+  /**
    * Serve the server's `sampling/createMessage` requests with OUR model (2.0):
    * the server writes the prompt, we run it and pay for the tokens. Providing
    * this declares the sampling capability — gate a server you do not fully
@@ -158,7 +166,8 @@ export interface McpClientOptions extends McpLifecycleOptions {
 
 /** The transport members we reach past the SDK's `Transport` interface for. */
 interface AuthableTransport {
-  finishAuth?(authorizationCode: string): Promise<void>;
+  /** v2 checks `iss` (RFC 9207); v1 1.29 takes the code only and ignores it. */
+  finishAuth?(authorizationCode: string, iss?: string): Promise<void>;
 }
 
 /**
@@ -334,12 +343,14 @@ export async function createMcpClient(options: McpClientOptions): Promise<McpRoo
 
   const auth = options.auth ? toOAuthProvider(options.auth) : undefined;
   // The SDK's provider callbacks carry no server URL — bind before the
-  // transport starts so every stored key lands in this server's namespace.
-  if (auth) await bindOAuthServer(auth, options.transport.url);
+  // transport starts so every stored key lands in this server's namespace. The
+  // line goes with it: a later `completeAuth` must run this line's exchange.
+  if (auth) await bindOAuthServer(auth, options.transport.url, line);
   const rootsBox = options.roots !== undefined ? createRootsBox(options.roots) : undefined;
   // An authorization code is single-use: spend it on the first attempt only. A
   // reconnect re-reads whatever tokens it bought from the provider's store.
   let pendingCode = options.authorizationCode;
+  let pendingIss = options.authorizationIss;
 
   const makeTransport = async (): Promise<unknown> => {
     const transport = v2
@@ -353,8 +364,9 @@ export async function createMcpClient(options: McpClientOptions): Promise<McpRoo
             'This transport cannot finish an OAuth exchange — upgrade the optional peer to "@modelcontextprotocol/sdk" ^1.29.0.',
         });
       }
-      await finishAuth.call(transport, pendingCode);
+      await finishAuth.call(transport, pendingCode, pendingIss);
       pendingCode = undefined;
+      pendingIss = undefined;
     }
     return transport;
   };

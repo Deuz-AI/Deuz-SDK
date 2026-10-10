@@ -25,6 +25,8 @@ export interface RawMcpClient {
    * with the first page plus `nextCursor`; the v2 SDK walks every page itself and
    * answers with none. `wrapMcpClient` follows `nextCursor` either way, so an
    * implementation that ignores `params` and never sets `nextCursor` stays valid.
+   * After a walk of more than one page it hands the merged catalog to a v1
+   * client's `cacheToolMetadata`, which each page call replaced.
    */
   listTools(params?: { cursor?: string }): Promise<{ tools: McpToolDef[]; nextCursor?: string }>;
   close(): Promise<void>;
@@ -917,6 +919,21 @@ export interface McpClient {
 }
 
 /**
+ * Hand a multi-page catalog back to the v1 SDK client. Each of its
+ * `listTools()` calls REPLACES the tool metadata it caches — the compiled
+ * `outputSchema` validators `callTool` checks structured results with, and the
+ * task-support sets — with that one page's, so after a cursor walk only the
+ * last page would be checked. `cacheToolMetadata` is a plain runtime method of
+ * the v1 `Client` (private only in its `.d.ts`); the v2 client walks the pages
+ * itself and has none, so this is a no-op there. The items are the SDK's own
+ * tool objects, so nothing the SDK caches (`execution` included) is lost.
+ */
+function primeToolMetadata(client: RawMcpClient, tools: McpToolDef[]): void {
+  const prime = (client as { cacheToolMetadata?: (tools: McpToolDef[]) => void }).cacheToolMetadata;
+  if (typeof prime === 'function') prime.call(client, tools);
+}
+
+/**
  * Wrap a connected raw SDK client in our `McpClient`.
  *
  * With a `managed` connection every call routes through `managed.raw()`, so the
@@ -948,10 +965,13 @@ export function wrapMcpClient(
         const c = current();
         // Every page, not the first one (2.3): a paginated catalog used to lose
         // everything past page one. Same cursor walk and cap as resources/prompts.
+        let pages = 0;
         const tools = await paginate(async (cursor) => {
+          pages++;
           const page = await c.listTools(cursor ? { cursor } : undefined);
           return { items: page.tools, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
         });
+        if (pages > 1) primeToolMetadata(c, tools);
         // Invalidated while in flight → serve this list but do not cache it.
         if (gen === cacheGeneration) cachedTools = tools;
         return mcpToolsToToolSet(caller, tools, namespace);

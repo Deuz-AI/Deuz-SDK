@@ -92,7 +92,7 @@ What changes on a 2026-07-28 connection, and what Deuz does about it:
 
 - **Server→client requests are gone.** Elicitation, sampling and roots arrive as `input_required` results; the SDK fulfils them through the **same** `onElicitationRequest`, `sampling` and `roots` handlers and retries the call. Nothing to change on your side.
 - **`ping` is gone.** The `keepAliveMs` heartbeat and the [dead-session probe](#how-a-dead-http-session-is-detected) ask `server/discover` instead, so liveness checks keep working.
-- **`tools/list_changed` travels only on a `subscriptions/listen` stream.** The client opens it after connecting (when the server advertises `tools.listChanged`) and re-opens it if it is cut — dropping the tool cache, since a change may have been lost meanwhile.
+- **`tools/list_changed` travels only on a `subscriptions/listen` stream.** The client opens it after connecting (when the server advertises `tools.listChanged`) and re-opens it every time it is cut (a gateway capping how long a response may stay open, a rolling restart), dropping the tool cache, since a change may have been lost meanwhile. Only a stream that keeps ending within seconds of opening is given up, once three quick re-opens have ended the same way: the error goes to the [dead-session probe](#how-a-dead-http-session-is-detected), and a session the probe keeps gets no further push invalidation until it reconnects.
 - **`notifications/roots/list_changed` is gone.** `setRoots()` sends nothing; the server reads the current roots on its next request.
 - **URL-mode elicitations carry no `elicitationId`** on 2026-07-28 (it is `''`); correlate on the server's own state.
 - **stdio:** `versionNegotiation: 'auto'` runs the probe on a short-lived **sibling process** spawned from the same command, so the server starts twice per connect. Pass `'legacy'` for a server with side effects at startup.
@@ -223,6 +223,7 @@ const client = await createMcpClient(options);
 | `onElicitationRequest` | `McpElicitationHandler` | — | [Elicitation](#elicitation). Declares the capability. |
 | `auth` | `McpOAuthOptions \| DeuzOAuthProvider` | — | [OAuth 2.0](#oauth-20). |
 | `authorizationCode` | `string` | — | The `?code=` from the redirect — exchanged **before** connecting. Requires `auth`. |
+| `authorizationIss` | `string` | — | 2.3. The `?iss=` from the same redirect ([RFC 9207](#forward-the-redirects-iss-rfc-9207-23)), when it carries one. |
 | `sampling` | `McpSamplingOptions` | — | [Sampling](#sampling). Declares the capability. |
 | `roots` | `McpRootsOption` | — | [Roots](#roots). Declares the capability. |
 | `reconnect` | `boolean \| McpReconnectPolicy` | off | [Reconnect](#reconnect-status-and-keepalive). |
@@ -349,11 +350,12 @@ Connecting is **two `createMcpClient` calls with a human in between**. Nothing i
    │  (a web app 302s to it · a CLI prints it · a desktop shell launches it)
    │  the library NEVER opens a browser
    ▼
-   the user consents; the authorization server redirects to your `redirectUri?code=…`
+   the user consents; the authorization server redirects to your
+   `redirectUri?code=…` (plus `&iss=…` from an RFC 9207 server)
 
-③ createMcpClient({ transport, auth, authorizationCode: code })
-   │  transport.finishAuth(code) exchanges it BEFORE connect, using the stored
-   │  verifier, and saves `tokens:<serverUrl>`
+③ createMcpClient({ transport, auth, authorizationCode: code, authorizationIss: iss })
+   │  transport.finishAuth(code, iss) exchanges it BEFORE connect, using the
+   │  stored verifier, and saves `tokens:<serverUrl>`
    └──────────────────────────────────────────────────────────────► connected ✓
 ```
 
@@ -373,10 +375,15 @@ try {
 
   // The SDK already ran discovery + registration, so the URL exists.
   redirect(err.authorizationUrl!);            // your host decides HOW
-  const authorizationCode = await waitForCallbackCode();
+  const query = await waitForRedirectQuery(); // URLSearchParams of the redirect
 
   // 2nd attempt — the code is exchanged BEFORE connecting.
-  client = await createMcpClient({ transport, auth, authorizationCode });
+  client = await createMcpClient({
+    transport,
+    auth,
+    authorizationCode: query.get('code')!,
+    authorizationIss: query.get('iss') ?? undefined, // RFC 9207, when sent
+  });
 }
 ```
 
@@ -388,6 +395,10 @@ Facts that decide whether your flow works:
 - **The PKCE verifier lives in your `TokenStore`.** Steps ① and ③ must therefore see the *same* store. `inMemoryTokenStore()` is fine within one process and cannot possibly work across two.
 - **Passing `auth` as plain options mints a fresh provider per call.** That is safe precisely because all the state is in the store — but it also means `provider.authorizationUrl()` is not something you can read back later; take the URL off the error.
 - **`onRedirect` does not replace the throw.** It is a notification, delivered the moment the SDK produces the URL. The connect still rejects with `McpAuthorizationRequiredError` (carrying the same URL string), so a `catch` is required either way.
+
+### Forward the redirect's `iss` (RFC 9207, 2.3)
+
+An authorization server that advertises `authorization_response_iss_parameter_supported` (Keycloak does, for one) redirects back with `?code=…&iss=…`, naming itself. The v2 SDK checks that `iss` against the issuer it discovered **before** it redeems the code — the defense against an authorization-server mix-up — and refuses the exchange (an `IssuerMismatchError`) when `iss` is missing or names another server. So whenever the redirect carries an `iss`, pass it on: `authorizationIss` next to `authorizationCode`, `completeAuth(code, iss)`, and `waitForCallback()` on [the loopback listener](#node-cli-a-loopback-redirect-and-a-file-store). The v1 SDK has no RFC 9207 check and ignores it, so passing it is always safe.
 
 ### Or: `completeAuth(code)`
 
@@ -405,8 +416,8 @@ const provider = createOAuthProvider({
 try {
   client = await createMcpClient({ transport, auth: provider });
 } catch (err) {
-  const code = await waitForCallbackCode();
-  await provider.completeAuth(code);      // exchange + persist
+  const query = await waitForRedirectQuery(); // URLSearchParams of the redirect
+  await provider.completeAuth(query.get('code')!, query.get('iss') ?? undefined); // exchange + persist
   client = await createMcpClient({ transport, auth: provider });
 }
 ```
@@ -417,13 +428,15 @@ One provider can serve **many** servers: every stored key is namespaced by serve
 interface DeuzOAuthProvider {
   readonly provider: unknown;              // the SDK-side OAuthClientProvider — pass it through, do not inspect it
   authorizationUrl(): URL | undefined;
-  completeAuth(code: string): Promise<void>;
+  completeAuth(code: string, iss?: string): Promise<void>; // iss: the redirect's RFC 9207 ?iss= (2.3)
   tokens(): Promise<Record<string, unknown> | undefined>;
   invalidate(): Promise<void>;             // drop tokens → next connect re-authorizes
 }
 ```
 
 `completeAuth` needs to know *which* server it is finishing an exchange for. `createMcpClient` binds that for you on the first attempt (and persists it as `server-url`); a provider that has never been handed to a client rejects with an actionable error instead of guessing.
+
+It also runs the exchange on the **SDK line** of the client that bound it (2.3), so a provider handed to an `sdk: 'v1'` client keeps the 2.2 exchange. A fresh provider that only found `server-url` in the store — a second process, a callback route — uses the v2 SDK when it is installed, so forward the redirect's `iss` there.
 
 `invalidate()` drops the tokens and the verifier but deliberately **keeps the dynamic client registration** — it is not a credential the server rejected, and re-registering on every expiry would litter the authorization server with dead clients.
 
@@ -494,8 +507,8 @@ try {
   if (loopback.state) authorize.searchParams.set('state', loopback.state);
 
   console.log('Open this URL to authorize:\n' + authorize.toString());
-  const authorizationCode = await loopback.waitForCode();
-  client = await createMcpClient({ transport, auth, authorizationCode });
+  const { code, iss } = await loopback.waitForCallback();   // iss: RFC 9207, when sent
+  client = await createMcpClient({ transport, auth, authorizationCode: code, authorizationIss: iss });
 } finally {
   await loopback.close();
 }
@@ -507,7 +520,7 @@ try {
 Hand it a value you already minted with `state: '…'`, or turn the check off with `state: false` **only** when the authorization request genuinely cannot carry `state`.
 </Callout>
 
-`createLoopbackRedirect({ port?, path?, timeoutMs?, state? })` is a **single-shot** listener bound to `127.0.0.1` — not `localhost` (which can resolve to `::1` first, leaving an IPv4 redirect with nothing listening) and never `0.0.0.0` (a wildcard would take an authorization code off the LAN). The timeout defaults to **5 minutes**, measured from **creation** rather than from `waitForCode()`, because the redirect URI is live the moment it resolves. `close()` is idempotent and safe in a `finally`; a bind failure on an explicit `port` rejects instead of hanging.
+`createLoopbackRedirect({ port?, path?, timeoutMs?, state? })` is a **single-shot** listener bound to `127.0.0.1` — not `localhost` (which can resolve to `::1` first, leaving an IPv4 redirect with nothing listening) and never `0.0.0.0` (a wildcard would take an authorization code off the LAN). `waitForCallback()` (2.3) resolves with `{ code, iss? }`, the redirect's `iss` included when it carries one; `waitForCode()` resolves with the code alone. The timeout defaults to **5 minutes**, measured from **creation** rather than from the wait, because the redirect URI is live the moment it resolves. `close()` is idempotent and safe in a `finally`; a bind failure on an explicit `port` rejects instead of hanging.
 
 `createFileTokenStore` writes one JSON file, created `0600`, through a temp file and a rename — a crash mid-write can never tear the existing tokens. Every operation is chained onto the previous one, because `set` is a read-modify-write and the SDK's token save and verifier save race routinely. A file that is missing, unreadable or invalid JSON reads as **empty** rather than throwing: re-authorizing is recoverable, crashing a run on a half-written file is not.
 
@@ -551,12 +564,15 @@ export async function chat(req: Request, env: Env, userId: string) {
   }
 }
 
-// GET /oauth/callback?code=… — step ③, in a completely different request.
+// GET /oauth/callback?code=…[&iss=…] — step ③, in a completely different request.
 export async function callback(req: Request, env: Env, userId: string) {
-  const code = new URL(req.url).searchParams.get('code')!;
+  const params = new URL(req.url).searchParams;
   // The KV already holds this user's `code-verifier:` and `server-url`, so a
   // fresh provider can finish the exchange without reconnecting to anything.
-  await createOAuthProvider(authOptions(env, userId)).completeAuth(code);
+  await createOAuthProvider(authOptions(env, userId)).completeAuth(
+    params.get('code')!,
+    params.get('iss') ?? undefined, // RFC 9207: required by the v2 SDK when the AS sends it
+  );
   return Response.redirect(`${env.APP_URL}/chat`, 302);
 }
 ```
@@ -814,6 +830,7 @@ If the server returns an error result, `callTool` throws — mirroring `execute`
 | The pool opens a connection per request | The config's `auth` / `onElicitationRequest` is a fresh object each call, so the key falls back to identity. | Hoist the provider/handler to module scope (per **user**, not per request). Pass `createMcpPool({ logger })` to hear it once. |
 | A CLI OAuth redirect shows *"Authorization rejected"* | The authorization URL did not carry `loopback.state`. | Forward it — see [the Node CLI recipe](/docs/modules/mcp#node-cli-a-loopback-redirect-and-a-file-store). |
 | `No PKCE code verifier is stored …` | Steps ① and ③ used different stores, or an in-memory store across two processes. | Use one persistent `TokenStore` for the whole flow. |
+| `IssuerMismatchError: … (RFC 9207): expected "…", received undefined` | The authorization server sends `iss` on the redirect, and the v2 SDK will not redeem the code without it. | Forward it — [`authorizationIss`, `completeAuth(code, iss)` or `waitForCallback()`](#forward-the-redirects-iss-rfc-9207-23). |
 | A stdio server keeps running after the request | The client was built by hand and never closed. | `await client.close()` in a `finally` — or hand a `{ command }` config to `mcp` and let the run own it. |
 | `generateObject` throws about ignored loop options | `mcp` (and `guardrails`) are refused there by design. | Use `generateText` / `streamChat`, or drop the option. |
 | A tool call fails mid-run with a closed session | A pooled entry was evicted by `maxSize` while the run still held it. | Raise `maxSize` above the number of distinct servers in flight. |

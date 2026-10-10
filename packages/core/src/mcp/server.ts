@@ -197,8 +197,9 @@ export interface McpServerOptions {
   /** Largest POST body the handler reads, in bytes. SDK default 4 MiB. */
   maxRequestBodySize?: number;
   /**
-   * Out-of-band failures: a request the SDK rejected, a missing peer. Reporting
-   * only — it never changes a response. A throwing callback is swallowed.
+   * Out-of-band failures: a request the SDK rejected, a missing peer, an
+   * `approve` callback that threw (the call is denied). Reporting only — it
+   * never changes a response. A throwing callback is swallowed.
    */
   onError?: (error: Error) => void;
   /** Time source for `Tool.timeoutMs`. Default: the host clock. */
@@ -609,7 +610,8 @@ async function runWithTimeout(
   run: (signal: AbortSignal | undefined) => Promise<unknown>,
   signal: AbortSignal,
 ): Promise<{ timedOut: true; message: string } | { timedOut: false; value: unknown }> {
-  if (timeoutMs === undefined || timeoutMs <= 0) {
+  // Infinity means no cap, as in the loop: a host setTimeout clamps it to 1ms.
+  if (timeoutMs === undefined || timeoutMs <= 0 || !Number.isFinite(timeoutMs)) {
     return { timedOut: false, value: await run(signal) };
   }
   const expiry = new AbortController();
@@ -771,7 +773,9 @@ export function createMcpServer(options: McpServerOptions): DeuzMcpServer {
       const call = guarded.call;
 
       const gate = tool.needsApproval;
-      const needs = typeof gate === 'function' ? await gate(call.args, execCtx) : gate === true;
+      // Fail closed like the loop: a truthy non-function (a 'true' from a JSON
+      // config) gates the call there too, because calling it throws.
+      const needs = typeof gate === 'function' ? await gate(call.args, execCtx) : Boolean(gate);
       if (needs) {
         const decision = await decide(sdk, call, request, ctx, instance);
         if (decision.kind === 'ask') return decision.result;
@@ -805,8 +809,8 @@ export function createMcpServer(options: McpServerOptions): DeuzMcpServer {
       if (outcome.isError) return errorResult(resultText(outcome.result));
       return toCallToolResult(outcome.result, entry.hasOutputSchema);
     } catch (error) {
-      // A failing runtimeContext/toolsContext/approve/guardrail is the call's
-      // failure, answered like a throwing tool — never a dropped request.
+      // A failing runtimeContext/toolsContext/guardrail is the call's failure,
+      // answered like a throwing tool — never a dropped request.
       return errorResult(messageOf(error));
     }
   }
@@ -820,9 +824,15 @@ export function createMcpServer(options: McpServerOptions): DeuzMcpServer {
   ): Promise<ApprovalDecision> {
     const approve = options.approve ?? 'elicit';
     if (typeof approve === 'function') {
-      return (await approve({ toolName: call.toolName, args: call.args, request }))
-        ? { kind: 'approved' }
-        : { kind: 'denied' };
+      let approved = false;
+      try {
+        approved = Boolean(await approve({ toolName: call.toolName, args: call.args, request }));
+      } catch (error) {
+        // A throw denies, as a throwing approveToolCall does in the loop. Its
+        // message is the operator's business: onError gets it, the client does not.
+        report(error);
+      }
+      return approved ? { kind: 'approved' } : { kind: 'denied' };
     }
     const answer = sdk.inputResponse(ctx.mcpReq.inputResponses, APPROVAL_KEY);
     if (answer.kind === 'elicit') {

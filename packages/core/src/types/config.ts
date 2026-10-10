@@ -221,8 +221,14 @@ export interface DeuzOAuthProvider {
   readonly provider: unknown;
   /** The URL to send the user to, once discovery/registration has produced one. */
   authorizationUrl(): URL | undefined;
-  /** Exchange the authorization code for tokens and persist them. */
-  completeAuth(code: string): Promise<void>;
+  /**
+   * Exchange the authorization code for tokens and persist them. `iss` is the
+   * redirect's `?iss=` (RFC 9207, 2.3): pass it whenever the redirect carries one.
+   * The v2 SDK checks it against the authorization server's issuer before it
+   * redeems the code, and refuses a code without it from a server that
+   * advertises `authorization_response_iss_parameter_supported`.
+   */
+  completeAuth(code: string, iss?: string): Promise<void>;
   /** Current tokens, if any (refreshed on demand by the SDK). */
   tokens(): Promise<Record<string, unknown> | undefined>;
   /** Drop the stored tokens — forces a fresh authorization on the next connect. */

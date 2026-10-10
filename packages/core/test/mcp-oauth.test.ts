@@ -30,7 +30,11 @@ import { createMcpClient, type McpClientOptions, type McpSdkLine } from '../src/
 import { createOAuthProvider } from '../src/mcp/auth';
 import { McpAuthorizationRequiredError } from '../src/errors';
 import type { TokenStore } from '../src/types/config';
-import { startFakeAuthServer, type FakeAuthServerHandle } from './helpers/mcp-oauth-server';
+import {
+  startFakeAuthServer,
+  type FakeAuthServerHandle,
+  type FakeAuthServerOptions,
+} from './helpers/mcp-oauth-server';
 import {
   startTestMcpServer,
   type TestMcpServerHandle,
@@ -100,8 +104,11 @@ interface Fixture {
  * server issued, and whose 401 points at its own RFC 9728 document naming it.
  * That indirection is the entire discovery half of the flow.
  */
-async function startFixture(mcpOptions: TestMcpServerOptions = {}): Promise<Fixture> {
-  const as = await startFakeAuthServer();
+async function startFixture(
+  mcpOptions: TestMcpServerOptions = {},
+  asOptions: FakeAuthServerOptions = {},
+): Promise<Fixture> {
+  const as = await startFakeAuthServer(asOptions);
   authServers.push(as);
   // A test that pins its own gate (e.g. `requireBearer`) keeps it; otherwise the
   // resource server defers to the AS, which is what makes a refreshed token work.
@@ -311,6 +318,43 @@ describe.each(SDK_LINES)('MCP OAuth [%s SDK]', (sdk) => {
     }, 20_000);
   });
 
+  describe('RFC 9207 — an authorization server that names itself on the redirect', () => {
+    // Keycloak and node-oidc-provider advertise
+    // `authorization_response_iss_parameter_supported` and redirect back with
+    // `?code=…&iss=…`. The v2 SDK refuses to redeem such a code without its `iss`,
+    // so the redirect's `iss` must reach the SDK on both roads to an exchange.
+    // Per RFC 9207 §2 it is the AS's issuer identifier: here, its origin.
+    it('createMcpClient({ authorizationCode, authorizationIss }) connects', async () => {
+      const { as, transport } = await startFixture({}, { issParameterSupported: true });
+      const provider = createOAuthProvider({ redirectUri: REDIRECT_URI });
+
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+      const code = as.simulateUserAuthorization(err.authorizationUrl!);
+
+      const client = await connect(sdk, {
+        transport,
+        auth: provider,
+        authorizationCode: code,
+        authorizationIss: as.url,
+      });
+      expect(as.tokenRequests.find((r) => r.grantType === 'authorization_code')?.status).toBe(200);
+      expect(await client.callTool('echo', { value: 'rfc9207' })).toBe('echo:rfc9207');
+    }, 20_000);
+
+    it('provider.completeAuth(code, iss) exchanges the code; the next connect needs none', async () => {
+      const { as, transport } = await startFixture({}, { issParameterSupported: true });
+      const provider = createOAuthProvider({ redirectUri: REDIRECT_URI });
+
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+      const code = as.simulateUserAuthorization(err.authorizationUrl!);
+
+      await provider.completeAuth(code, as.url);
+      expect(await provider.tokens()).toMatchObject({ access_token: 'at-1' });
+      const client = await connect(sdk, { transport, auth: provider });
+      expect(await client.callTool('echo', { value: 'imperative' })).toBe('echo:imperative');
+    }, 20_000);
+  });
+
   describe('refresh', () => {
     it('a stale access token is refreshed in place — no second trip through consent', async () => {
       const { as, mcp, transport } = await startFixture();
@@ -497,4 +541,37 @@ describe.each(SDK_LINES)('MCP OAuth [%s SDK]', (sdk) => {
       expect(as.tokenRequests.filter((r) => r.grantType === 'authorization_code')).toHaveLength(2);
     }, 20_000);
   });
+});
+
+describe('MCP OAuth against an RFC 9207 authorization server — what differs per line', () => {
+  it('v2: a redirect whose iss names another server is refused before the code is spent', async () => {
+    const { as, transport } = await startFixture({}, { issParameterSupported: true });
+    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI });
+    const err = await expectAuthorizationRequired('v2', { transport, auth: provider });
+    const code = as.simulateUserAuthorization(err.authorizationUrl!);
+
+    // The mix-up defense RFC 9207 exists for: the code came back labelled with
+    // somebody else's issuer, so it must never reach this server's /token.
+    await expect(
+      connect('v2', {
+        transport,
+        auth: provider,
+        authorizationCode: code,
+        authorizationIss: 'https://attacker.example',
+      }),
+    ).rejects.toThrow(/issuer/i);
+    expect(as.tokenRequests.filter((r) => r.grantType === 'authorization_code')).toEqual([]);
+  }, 20_000);
+
+  it('v1: a provider bound through a v1 client keeps the 2.2 exchange — completeAuth(code) needs no iss', async () => {
+    const { as, transport } = await startFixture({}, { issParameterSupported: true });
+    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI });
+    const err = await expectAuthorizationRequired('v1', { transport, auth: provider });
+    const code = as.simulateUserAuthorization(err.authorizationUrl!);
+
+    // 2.2 code, with the v2 package installed: `sdk: 'v1'` promises the v1
+    // exchange, which has no RFC 9207 check — completeAuth must run on that line.
+    await provider.completeAuth(code);
+    expect(await provider.tokens()).toMatchObject({ access_token: 'at-1' });
+  }, 20_000);
 });
