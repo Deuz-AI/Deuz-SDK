@@ -206,4 +206,54 @@ describe('native verification and cancellation (F05)', () => {
     expect(parked.calls()).toBe(2);
     expect(fetch).toHaveBeenCalledTimes(1);
   });
+
+  it('stops a rejected verdict that raced an abort once, and resume never redoes it', async () => {
+    const controller = new AbortController();
+    const { model, fetch } = counted([{ text: 'draft' }, { text: 'better' }]);
+    const store = createInMemoryAgentRunStore();
+    const parked = parkedVerifier(() => ({ status: 'rejected', feedback: 'Be precise.' }));
+    const options = {
+      model,
+      prompt: 'answer',
+      verify: parked.verify,
+      session: { store, runId: 'abort-rejected', scope: 't' },
+    };
+    const stream = streamAgent({ ...options, signal: controller.signal });
+    const results: unknown[] = [];
+    const drained = (async () => {
+      for await (const event of stream.events) if (event.type === 'result') results.push(event);
+    })();
+    await parked.entered;
+    controller.abort();
+    parked.release();
+    const result = await stream.result;
+    await drained;
+    expect(result).toMatchObject({ status: 'stopped', reason: 'aborted' });
+    // One terminal event, and the stored state says the same thing.
+    expect(results).toHaveLength(1);
+    const stored = (await store.load('abort-rejected'))!;
+    expect(stored).toMatchObject({ phase: 'terminal', result: { status: 'stopped' } });
+    // The rejection's feedback never became a re-drive.
+    expect(stored.messages.map((m) => m.role)).toEqual(['user', 'assistant']);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    // A terminal run resumes to its stored result: no verifier, no model call.
+    expect(await resumeAgent(options)).toEqual(result);
+    expect(parked.calls()).toBe(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('still re-drives a rejected candidate when nothing was cancelled', async () => {
+    const { model, fetch } = counted([{ text: 'draft' }, { text: 'better' }]);
+    let verdicts = 0;
+    const result = await streamAgent({
+      model,
+      prompt: 'answer',
+      verify: () =>
+        verdicts++ === 0
+          ? { status: 'rejected', feedback: 'Be precise.' }
+          : { status: 'verified' },
+    }).result;
+    expect(result).toMatchObject({ status: 'completed', output: 'better' });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
 });
