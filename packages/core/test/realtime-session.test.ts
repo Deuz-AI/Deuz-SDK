@@ -380,7 +380,7 @@ describe('tool calls handled from inside a tool-call listener', () => {
         type: 'conversation.item.create',
         item: { type: 'function_call_output', call_id: 'call_1', output: '{"tempC":19}' },
       },
-      expect.objectContaining({ type: 'response.create' }),
+      { type: 'response.create', event_id: expect.any(String) },
     ]);
     expect(swallowed).toEqual([]);
     // Answered once: a second answer is refused as before.

@@ -283,7 +283,7 @@ describe('OpenAI Realtime — audio, transcripts and text', () => {
       { type: 'input_audio_buffer.append', audio: 'AQID+g==' },
       { type: 'input_audio_buffer.append', audio: 'AQD//w==' },
       { type: 'input_audio_buffer.commit' },
-      { type: 'response.create' },
+      { type: 'response.create', event_id: expect.any(String) },
     ]);
 
     socket.push({ type: 'input_audio_buffer.committed', event_id: 'e1', item_id: 'item_u1' });
@@ -379,7 +379,7 @@ describe('OpenAI Realtime — audio, transcripts and text', () => {
         type: 'conversation.item.create',
         item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hello' }] },
       },
-      { type: 'response.create' },
+      { type: 'response.create', event_id: expect.any(String) },
       {
         type: 'conversation.item.create',
         item: {
@@ -463,7 +463,7 @@ describe('OpenAI Realtime — tool calls', () => {
           output: '{"city":"Paris","tempC":21}',
         },
       },
-      { type: 'response.create' },
+      { type: 'response.create', event_id: expect.any(String) },
     ]);
     expect(ofType(events, 'tool-call')).toEqual([
       {
@@ -586,7 +586,7 @@ describe('OpenAI Realtime — tool calls', () => {
         type: 'conversation.item.create',
         item: { type: 'function_call_output', call_id: 'call_1', output: '{"tempC":19}' },
       },
-      { type: 'response.create' },
+      { type: 'response.create', event_id: expect.any(String) },
     ]);
     expect(() => session.sendToolResult('call_1', 'again')).toThrow(RealtimeError);
   });
@@ -658,6 +658,143 @@ describe('OpenAI Realtime — tool calls', () => {
     expect((sent()[0]!.item as { output: string }).output).toBe(
       "Tool 'get_weather' timed out after 50ms and was abandoned.",
     );
+  });
+});
+
+describe('OpenAI Realtime — one response at a time', () => {
+  // Only one response can write to the default conversation at a time; a
+  // response.create the server has not acknowledged yet already counts.
+  const creates = (sent: Record<string, unknown>[]) =>
+    sent.filter((message) => message.type === 'response.create');
+
+  it('holds a second response.create until the first response is done', async () => {
+    const { session, socket, sent } = await openSession();
+    session.sendText('a');
+    session.sendText('b');
+    expect(sent().map((message) => message.type)).toEqual([
+      'conversation.item.create',
+      'response.create',
+      'conversation.item.create',
+    ]);
+
+    socket.push({ type: 'response.created', event_id: 'e1', response: { id: 'resp_1' } });
+    await flush();
+    expect(creates(sent())).toHaveLength(1);
+
+    socket.push({
+      type: 'response.done',
+      event_id: 'e2',
+      response: { id: 'resp_1', status: 'completed', output: [] },
+    });
+    await flush();
+    expect(sent().map((message) => message.type)).toEqual([
+      'conversation.item.create',
+      'response.create',
+      'conversation.item.create',
+      'response.create',
+    ]);
+  });
+
+  it('holds the tool results response.create while a text turn create is unacknowledged', async () => {
+    let finish: (value: string) => void = () => {};
+    const { session, socket, sent } = await openSession({
+      tools: {
+        get_weather: tool({
+          parameters: CITY,
+          execute: () => new Promise<string>((resolve) => (finish = resolve)),
+        }),
+      },
+    });
+    socket.push({
+      type: 'response.done',
+      event_id: 'e0',
+      response: {
+        id: 'resp_0',
+        status: 'completed',
+        output: [
+          { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{}' },
+        ],
+      },
+    });
+    await flush();
+    session.sendText('Also, what time is it?'); // its response.created is still on its way
+    finish('sunny');
+    await flush();
+    expect(sent().map((message) => message.type)).toEqual([
+      'conversation.item.create',
+      'response.create',
+      'conversation.item.create', // the function_call_output; its response.create waits
+    ]);
+
+    socket.push({ type: 'response.created', event_id: 'e1', response: { id: 'resp_1' } });
+    socket.push({
+      type: 'response.done',
+      event_id: 'e2',
+      response: { id: 'resp_1', status: 'completed', output: [] },
+    });
+    await flush();
+    expect(creates(sent())).toHaveLength(2);
+  });
+
+  it('asks again after the running response when the server refused a create for it', async () => {
+    const { session, socket, events, sent } = await openSession();
+    session.sendText('a');
+    const [create] = creates(sent());
+    expect(create).toEqual({ type: 'response.create', event_id: expect.any(String) });
+
+    // Server VAD started a response first; the create lost the race.
+    socket.push({ type: 'response.created', event_id: 'e1', response: { id: 'resp_vad' } });
+    socket.push({
+      type: 'error',
+      event_id: 'e2',
+      error: {
+        type: 'invalid_request_error',
+        code: 'conversation_already_has_active_response',
+        message: 'Conversation already has an active response in progress: resp_vad.',
+        event_id: create!.event_id,
+      },
+    });
+    await flush();
+    expect(ofType(events, 'error')[0]).toMatchObject({
+      fatal: false,
+      error: { kind: 'provider', upstreamType: 'conversation_already_has_active_response' },
+    });
+    expect(creates(sent())).toHaveLength(1);
+
+    socket.push({
+      type: 'response.done',
+      event_id: 'e3',
+      response: { id: 'resp_vad', status: 'completed', output: [] },
+    });
+    await flush();
+    expect(creates(sent())).toHaveLength(2);
+  });
+
+  it('sends a held response.create at once when the one in flight fails for another reason', async () => {
+    const { session, socket, sent } = await openSession();
+    session.sendText('a');
+    session.sendText('b');
+    const [create] = creates(sent());
+    // An error about another event leaves the create in flight.
+    socket.push({
+      type: 'error',
+      event_id: 'e1',
+      error: { type: 'invalid_request_error', code: 'unknown_parameter', message: 'Bad event' },
+    });
+    await flush();
+    expect(creates(sent())).toHaveLength(1);
+
+    socket.push({
+      type: 'error',
+      event_id: 'e2',
+      error: {
+        type: 'server_error',
+        message: 'The server had an error.',
+        event_id: create!.event_id,
+      },
+    });
+    await flush();
+    expect(creates(sent())).toHaveLength(2);
   });
 });
 

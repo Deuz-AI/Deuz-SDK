@@ -265,6 +265,8 @@ Subscribe with `session.on(type, listener)` (or `'*'` for everything; it returns
 
 `sendText(text)` adds a user text turn and asks for an answer; `sendText(text, { respond: false })` only adds context.
 
+**One answer at a time (OpenAI).** OpenAI lets one response write to the conversation at a time. A `response.create` (from `sendText`, `createResponse()` or [tool results](#tools)) therefore waits while a response is running, or while an earlier `response.create` has not started its response yet, and goes out when that response is done; requests that pile up meanwhile become one `response.create`. If the server refuses a create because a response it started itself (server VAD) got there first, the session asks again once that response is done. The refusal is matched by the create's `event_id` and the server's `conversation_already_has_active_response` code, which is not live-verified.
+
 ## Tools
 
 Tools are ordinary Deuz [tools](/docs/agents/tools) — the same `tool()` shape, schemas, `needsApproval` and `timeoutMs` as everywhere in core:
@@ -274,7 +276,7 @@ Tools are ordinary Deuz [tools](/docs/agents/tools) — the same `tool()` shape,
 - `needsApproval` asks `approveToolCall(call)` (a session option). Without an approver, the call is denied and the model hears `Tool call denied.`
 - Unknown tools, unparsable or invalid arguments, a thrown error and a timeout all become an error result the model hears, so the conversation goes on — the same self-healing as the [tool loop](/docs/agents/tool-loop). Timeouts run on `deps.clock`.
 - `close()` (or aborting the session's `signal`) aborts every running tool's `signal`, and a call that has not started yet never starts, even when you close from inside its `tool-call` listener.
-- The calls of one model turn are answered together once all of them settle (Gemini expects one `toolResponse`; OpenAI gets one `response.create`). If the model is already answering something else, the `response.create` waits until that answer is done.
+- The calls of one model turn are answered together once all of them settle (Gemini expects one `toolResponse`; OpenAI gets one `response.create`). If the model is already answering something else, the `response.create` waits until that answer is done ([one answer at a time](#audio)).
 - Provider-executed tools (`type: 'provider'`) are left out with an `unsupported-tool` warning.
 
 Two safety rules decide which calls run:
