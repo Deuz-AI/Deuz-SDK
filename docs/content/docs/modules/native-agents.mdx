@@ -71,8 +71,19 @@ for each verifier candidate, and `maxVerifyAttempts` bounds verifier invocations
 
 Verification has three outcomes: `verified` accepts, `rejected` requests another
 candidate within the attempt limit, and `inconclusive` stops without certifying
-the answer. Exceptions from the verifier are inconclusive. Schema validation and
+the answer. Exceptions from the verifier are inconclusive, unless the run was
+cancelled (it stops with reason `aborted`) or the execution deadline elapsed (it
+fails with `ExecutionPolicyError`). Cancellation and the deadline are checked again
+after the verifier returns, and they outrank its verdict. Schema validation and
 verification are distinct checks; a valid JSON shape does not prove the answer.
+
+If the write that follows a verdict fails, the run stays in `finalizing`. Resuming
+it runs the verifier again on the same candidate, without a model call. The repeat
+counts as a new attempt toward `maxVerifyAttempts`; when none is left, the resume
+stops with `verification-attempts-exhausted` instead. Verifiers must therefore be
+idempotent: a repeated verdict on the same candidate must have no further effect.
+Key any side effect on the run and the candidate's `text`, not on `attempt`, which
+differs on the repeat.
 
 ## Streaming
 
