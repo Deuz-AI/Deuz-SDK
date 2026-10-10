@@ -265,6 +265,48 @@ describe('v2 line ↔ a 2026-07-28 server — input_required replaces server→c
     expect(server.methods).not.toContain('elicitation/create');
   });
 
+  it('URL-mode elicitation reaches the same handler, with no elicitationId on this era', async () => {
+    const asked: unknown[] = [];
+    const server = v2Server({
+      tools: [
+        {
+          name: 'login',
+          handler: (_args, ctx: ServerContext) => {
+            const reply = inputResponse(ctx.mcpReq.inputResponses, 'consent');
+            if (reply.kind !== 'elicit') {
+              return inputRequired({
+                inputRequests: {
+                  consent: inputRequired.elicitUrl({
+                    message: 'Sign in to continue.',
+                    url: 'https://auth.example.com/start',
+                  }),
+                },
+              });
+            }
+            return `consent:${reply.action}`;
+          },
+        },
+      ],
+    });
+    const client = await connect(server, {
+      onElicitationRequest: (request) => {
+        asked.push(request);
+        return { action: 'accept' };
+      },
+    });
+
+    expect(await client.callTool('login', {})).toBe('consent:accept');
+    // The 2025-era `elicitationId` is not part of the 2026-07-28 URL-mode shape.
+    expect(asked).toEqual([
+      {
+        mode: 'url',
+        message: 'Sign in to continue.',
+        url: 'https://auth.example.com/start',
+        elicitationId: '',
+      },
+    ]);
+  });
+
   it('sampling: the server asks for a completion, our model answers, the tool completes', async () => {
     const model = createMockModel({ responses: [{ text: 'a haiku about MCP' }] });
     const server = v2Server({
