@@ -14,6 +14,7 @@ import type { Tool, ToolApprovalRequest, ToolCall, ToolExecuteContext } from './
 import type { BudgetTotals, ExecutionContextSnapshot, NativeExecutionContext } from './execution';
 import type { FinishReason } from './usage';
 import type { StopDetails } from './methods';
+import type { LeaseProvider } from './lease';
 
 /** A validator returns its validated (possibly transformed) value or throws. */
 export type AgentValidator<T> = (value: unknown) => T | Promise<T>;
@@ -290,6 +291,19 @@ export interface AgentRunSession {
   scope: string;
 }
 
+/**
+ * A native run's cross-process claim (2.3), like `createSwarm`'s `lease`: the
+ * executor holds the run's lease while it drives the run and renews it every
+ * `ttlMs / 3` on `deps.clock`.
+ */
+export interface AgentRunLeaseOptions {
+  provider: LeaseProvider;
+  /** This process's identity; defaults to a generated ID per run. */
+  owner?: string;
+  /** An integer of at least 3. Default 30 000. */
+  ttlMs?: number;
+}
+
 export type AgentRunOptions<T = string> = Omit<
   CommonCallOptions,
   | 'messages'
@@ -314,6 +328,17 @@ export type AgentRunOptions<T = string> = Omit<
   mcp?: AgentMcpEntry[];
   toolsContext?: Record<string, unknown>;
   session?: AgentRunSession;
+  /**
+   * Claim the session's run through a `LeaseProvider` (2.3), so two processes
+   * never drive it at once. Its key is `agentRunLeaseKey(session)` from
+   * `@deuz-sdk/core/ops`. While another executor holds it, the run fails with
+   * code `'lease_held'` before reading or writing anything; an executor that
+   * loses it stops writing and fails with `'lease_lost'`, leaving the run as
+   * its last save had it for the next executor. A `'cancel'` signalled to the
+   * key stops the run with reason `'cancelled'`, and is acknowledged once that
+   * is saved. Requires `session`.
+   */
+  lease?: AgentRunLeaseOptions;
   output?: AgentOutput<T>;
   /** Bump when changing tool implementation or verifier semantics for a durable run. */
   bindingId?: string;

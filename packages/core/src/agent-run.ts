@@ -65,9 +65,10 @@ import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
 import { assertCheckpointVersion } from './internal/checkpoint-version';
-// Native run discovery (2.3).
+// Native run discovery and the run lease (2.3).
 import type { AgentRunListPage, AgentRunListQuery } from './types/agent-run';
 import type { Clock } from './types/deps';
+import { claimNativeRunLease, type NativeRunLease } from './internal/agent-run-lease';
 import {
   agentRunListPage,
   compareAgentRunSummaries,
@@ -78,8 +79,9 @@ import {
 
 export type * from './types/agent-run';
 
-// This coordinates one JavaScript process. External stores still need an
-// application lease when multiple processes or distinct store wrappers share it.
+// This coordinates one JavaScript process. When multiple processes or distinct
+// store wrappers share a store, the `lease` option (2.3) claims the run across
+// them; the store's revision check stays the fence against a stale writer.
 const activeNativeRuns = new WeakMap<AgentRunStore, Set<string>>();
 
 function errorData(error: unknown): { name: string; message: string; code?: string } {
@@ -317,6 +319,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   let admitted = false;
   let removeLedgerPersistence: (() => void) | undefined;
   let releaseRun: (() => void) | undefined;
+  /** The cross-process claim (2.3, `lease`), released on every exit. */
+  let lease: NativeRunLease | undefined;
+  /** The run's terminal state is durable: a cancel it was sent is settled. */
+  let terminalSaved = false;
   let settledOutcome: AgentResult<T> | undefined;
   let writeTail: Promise<void> = Promise.resolve();
   /** The run's MCP servers (2.3, F01), closed on every exit. */
@@ -343,7 +349,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     // Every actual save advances the fence durable stores check (2.2).
     envelope.revision = (envelope.revision ?? 0) + 1;
     const snapshot = structuredClone(envelope);
-    const write = writeTail.then(() => options.session!.store.save(snapshot));
+    const write = writeTail.then(() => {
+      // An executor that lost its lease (2.3) writes nothing more.
+      lease?.assertHeld();
+      return options.session!.store.save(snapshot);
+    });
     writeTail = write.catch((error) => {
       persistFailed = true;
       throw error;
@@ -369,10 +379,17 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     envelope.result = outcome;
     envelope.phase = outcome.status === 'suspended' ? 'running' : 'terminal';
     await persist();
+    if (admitted && envelope.phase === 'terminal') terminalSaved = true;
     settledOutcome = outcome;
   }
+  // An abort that a lease cancel caused (2.3) stops the run as 'cancelled'.
   const stopped = (reason: string, stopDetails?: StopDetails) =>
-    finish({ ...base(), status: 'stopped', reason, ...(stopDetails ? { stopDetails } : {}) });
+    finish({
+      ...base(),
+      status: 'stopped',
+      reason: reason === 'aborted' && lease?.cancelled ? 'cancelled' : reason,
+      ...(stopDetails ? { stopDetails } : {}),
+    });
   function emitPart(part: StreamPart, phase: 'running' | 'finalizing'): void {
     events.push({ type: 'part', part, phase });
     if (part.type === 'text-delta') text.push(part.text);
@@ -387,6 +404,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       if (options.session && (!options.session.runId || !options.session.scope)) {
         throw new TypeError('Native sessions require non-empty runId and scope.');
       }
+      if (options.lease !== undefined && !options.session)
+        throw new TypeError('A native run lease requires a session.');
       if (options.session) {
         const { store, runId } = options.session;
         let active = activeNativeRuns.get(store);
@@ -402,6 +421,15 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           if (active.size === 0) activeNativeRuns.delete(store);
         };
       }
+      // Across processes (2.3): the run's lease, taken before the run is read,
+      // so a run another executor drives is refused before anything else.
+      if (options.lease !== undefined)
+        lease = await claimNativeRunLease(
+          options.lease,
+          options.session!,
+          resolveDependencies(options.deps),
+          options.signal ?? options.abortSignal,
+        );
       // These legacy completion hooks have accept-as-is semantics. Native runs
       // use only the tri-state verifier and never silently inherit that behavior.
       const legacy = options as AgentRunOptions<T> & {
@@ -450,6 +478,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       } else if (options.session && (await options.session.store.load(options.session.runId))) {
         throw new TypeError('Native run already exists; use resumeAgent.');
       }
+      // A cancel queued under the run's key stops a stored run that has not
+      // ended before any model call; a new run, or an ended one, drops it.
+      await lease?.collect(
+        !resume ? 'fresh' : envelope.phase === 'terminal' ? 'terminal' : 'active',
+      );
       if (!resume) {
         const invalid = inputShapeError(options, 'runAgent');
         if (invalid) throw invalid;
@@ -457,6 +490,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       common = foldCallInput(
         {
           ...options,
+          ...(lease ? { signal: lease.signal } : {}),
           tools: undefined,
           session: undefined,
           messages: resume ? envelope.messages : options.messages,
@@ -610,6 +644,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           throw new TypeError('Invalid native terminal checkpoint.');
         const terminal = envelope.result as AgentResult<T>;
         settledOutcome = terminal;
+        terminalSaved = true;
         return;
       }
       // MCP (2.3, F01): connected only now, after a terminal run has returned
@@ -731,7 +766,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       // terminal commit. An elapsed deadline fails the run, exactly as it fails
       // model and tool dispatch; an abort stops it.
       const checkCancellation = async (): Promise<boolean> => {
-        if (options.signal?.aborted) {
+        if ((lease?.signal ?? options.signal)?.aborted) {
           await stopped('aborted');
           return false;
         }
@@ -1202,7 +1237,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               usage: { ...envelope.usage },
               attempt,
               execution: common.execution!,
-              signal: options.signal,
+              signal: lease?.signal ?? options.signal,
             });
           } catch {
             // A verifier that threw because the run was cancelled reports the
@@ -1244,7 +1279,12 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         return;
       }
     } catch (error) {
-      const failed: AgentResult<T> = { ...base(), status: 'failed', error: errorData(error) };
+      const failed: AgentResult<T> = {
+        ...base(),
+        status: 'failed',
+        // A lost lease (2.3) is the reason, however the loss surfaced.
+        error: errorData(lease ? lease.failure(error) : error),
+      };
       // A failed durable commit must never publish a successful completion.
       // Keep the last persisted recovery point rather than overwriting it.
       if (!persistFailed && common && admitted) {
@@ -1259,6 +1299,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     } finally {
       await nativeMcp?.close();
       removeLedgerPersistence?.();
+      // The lease goes back before the in-process claim, so the next executor
+      // of this run in this process finds it free.
+      await lease?.release(terminalSaved);
       releaseRun?.();
       if (settledOutcome) {
         events.push({ type: 'result', result: settledOutcome });

@@ -12,6 +12,12 @@ import { assertLeaseRequest } from './internal/ops-validate';
 import { assertRetentionTime } from './internal/ops-retention';
 
 export type * from './types/lease';
+/**
+ * The lease key of a native run (2.3): what runAgent's `lease` holds, and
+ * where another process signals the run, e.g.
+ * `leases.signal(agentRunLeaseKey({ scope, runId }), 'cancel')`.
+ */
+export { agentRunLeaseKey } from './internal/agent-run-lease';
 
 const SIGNALS: readonly LeaseSignal[] = ['cancel', 'drain'];
 
