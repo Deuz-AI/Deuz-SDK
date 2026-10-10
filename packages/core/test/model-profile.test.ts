@@ -183,6 +183,7 @@ describe('Claude 5.x profiles (verified against Anthropic’s API reference, cac
       { setting: 'topP', from: '*', to: 'dropped', warning: 'unsupported-setting' },
       { setting: 'toolChoice', from: "'required'", to: 'auto', warning: 'clamped-setting' },
       { setting: 'toolChoice', from: "{ type: 'tool' }", to: 'auto', warning: 'clamped-setting' },
+      { setting: 'mode', from: "'tool'", to: 'json', warning: 'clamped-setting' },
     ]);
     // Haiku 5.5 takes a forced choice and turns thinking off for 'none' — neither is a clamp.
     const haiku = resolveModelProfile(anthropic('claude-haiku-5-5'));
@@ -576,5 +577,33 @@ describe('documented gaps stay unknown (2.3)', () => {
     );
     // Only luna documents 'none'; astra claims no thinking mode either way.
     expect(resolveModelProfile(responses('gpt-6-astra')).thinking.mode).toBe('unknown');
+  });
+});
+
+describe("structured output: an explicit mode 'tool' the model cannot take (2.3)", () => {
+  const modeClamps = (model: LanguageModel) =>
+    clampsOf(resolveModelProfile(model), 'mode').map((c) => ({ to: c.to, when: c.when }));
+
+  it('is always json where forcing is rejected or adaptive thinking is always on', () => {
+    for (const model of [
+      anthropic('claude-opus-5-5'),
+      anthropic('claude-haiku-5-5'), // takes a forced tool_choice, but always thinks on this wire
+      anthropic('claude-opus-9-9'),
+      anthropic('claude-opus-4-8'),
+    ]) {
+      expect(modeClamps(model), model.modelId).toEqual([{ to: 'json', when: undefined }]);
+    }
+  });
+
+  it('is json only while extended thinking is on for a budget_tokens Claude', () => {
+    expect(modeClamps(anthropic('claude-opus-4-6'))).toEqual([
+      { to: 'json', when: 'effort is set (extended thinking is on)' },
+    ]);
+  });
+
+  it('is never changed where nothing stops the forced tool', () => {
+    for (const model of [responses('gpt-5.4'), deepseek('deepseek-v4-pro'), kimi('kimi-k3')]) {
+      expect(modeClamps(model), model.modelId).toEqual([]);
+    }
   });
 });

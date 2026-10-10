@@ -413,6 +413,21 @@ export function runStream(
           ),
         );
       }
+      // generateObject / streamObject asked for the forced-tool strategy but the
+      // model cannot be forced (2.3, F26): `pickObjectStrategy` switched to the
+      // json one, because the row rejects a forced tool_choice or Anthropic's
+      // thinking is on. The call's own options carry the requested `mode`.
+      if ((options as { mode?: unknown }).mode === 'tool' && internal.object?.strategy === 'json') {
+        addWarning({
+          type: 'clamped-setting',
+          setting: 'mode',
+          message:
+            `mode 'tool' was sent as the json strategy (native structured output): ${modelId} ` +
+            (caps.forcedToolChoice === false
+              ? 'rejects a forced tool_choice.'
+              : 'thinks on this request, and a forced tool_choice does not combine with thinking.'),
+        });
+      }
       if (options.execution) {
         native = (await import('../internal/native-request')).createNativeRequest(
           options,

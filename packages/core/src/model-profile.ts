@@ -165,7 +165,14 @@ export interface ModelProfileCache {
 /** One value a request changes on the way to the wire, and the warning that says so (2.3). */
 export interface ModelProfileClamp {
   /** The call option that is changed. */
-  setting: 'effort' | 'temperature' | 'topP' | 'toolChoice' | 'maxOutputTokens' | 'promptCaching';
+  setting:
+    | 'effort'
+    | 'temperature'
+    | 'topP'
+    | 'toolChoice'
+    | 'mode'
+    | 'maxOutputTokens'
+    | 'promptCaching';
   /** The value asked for (`'*'`: any value). */
   from: string;
   /** What the request carries instead, in the wire's own terms; `'dropped'` when nothing is sent. */
@@ -742,6 +749,17 @@ function clampsFor(
     for (const from of forced) clamp('toolChoice', from, 'auto');
   } else if (protocol === 'anthropic' && caps.forcedToolChoice === undefined && caps.reasoning) {
     for (const from of forced) clamp('toolChoice', from, 'auto', thinking);
+  }
+
+  // generateObject / streamObject: an explicit `mode: 'tool'` runs the json
+  // strategy where the forced tool cannot be taken (inference/object-shared.ts).
+  if (
+    caps.forcedToolChoice === false ||
+    (protocol === 'anthropic' && caps.effortWire === 'output_config')
+  ) {
+    clamp('mode', "'tool'", 'json');
+  } else if (protocol === 'anthropic' && caps.reasoning) {
+    clamp('mode', "'tool'", 'json', thinking);
   }
 
   if (protocol === 'anthropic' && caps.reasoning && wire.budgets) {

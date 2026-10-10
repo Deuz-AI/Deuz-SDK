@@ -878,3 +878,89 @@ describe('Claude 5.x request rules (2.3, F14)', () => {
     }
   });
 });
+
+describe("an explicit mode: 'tool' the model cannot take is reported (2.3, F26)", () => {
+  const schema = {
+    type: 'object',
+    properties: { a: { type: 'string' } },
+    required: ['a'],
+    additionalProperties: false,
+  } as JSONSchema;
+  const modeWarnings = (warnings: CallWarning[] | undefined) =>
+    (warnings ?? []).filter((w) => w.setting === 'mode');
+
+  it('generateObject on Claude 5.x runs the json strategy and says so', async () => {
+    for (const id of ['claude-opus-5-5', FAMILY_ID]) {
+      const { fetch, calls } = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+      const result = await generateObject({
+        model: createAnthropic({ apiKey: 'k', fetch })(id),
+        messages: [{ role: 'user', content: 'hi' }],
+        schema,
+        mode: 'tool',
+      });
+      expect(lastBody(calls).tool_choice, id).toBeUndefined();
+      const reported = modeWarnings(result.warnings);
+      expect(
+        reported.map((w) => w.type),
+        id,
+      ).toEqual(['clamped-setting']);
+      expect(reported[0]!.message, id).toContain("mode 'tool'");
+    }
+  });
+
+  it('streamObject reports it too, once', async () => {
+    const { fetch } = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+    const streamed = streamObject({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-sonnet-5-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      schema,
+      mode: 'tool',
+    });
+    expect(await streamed.object).toEqual({ a: 'x' });
+    expect(modeWarnings(await streamed.warnings).map((w) => w.type)).toEqual(['clamped-setting']);
+  });
+
+  it("'auto' choosing json, or a tool strategy the model takes, is not a clamp", async () => {
+    const auto = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+    const picked = await generateObject({
+      model: createAnthropic({ apiKey: 'k', fetch: auto.fetch })('claude-opus-5-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      schema,
+    });
+    expect(modeWarnings(picked.warnings)).toEqual([]);
+    // Haiku 4.5 without effort takes the forced tool: the request is what was asked for.
+    const TOOL_JSON = sseEvents([
+      {
+        event: 'content_block_start',
+        data: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: 'tu_1', name: 'json_output', input: {} },
+        },
+      },
+      {
+        event: 'content_block_delta',
+        data: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'input_json_delta', partial_json: '{"a":"x"}' },
+        },
+      },
+      { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
+      {
+        event: 'message_delta',
+        data: { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: {} },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+    const forced = mockFetch(() => sseResponse([TOOL_JSON]));
+    const kept = await generateObject({
+      model: createAnthropic({ apiKey: 'k', fetch: forced.fetch })('claude-haiku-4-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      schema,
+      mode: 'tool',
+    });
+    expect(lastBody(forced.calls).tool_choice).toEqual({ type: 'tool', name: 'json_output' });
+    expect(modeWarnings(kept.warnings)).toEqual([]);
+  });
+});
