@@ -269,6 +269,23 @@ const REGISTRY: Record<string, Row> = {
     contextWindow: 200_000,
     maxOutput: 64_000,
   }),
+  // 2.3 (F19): priced models the registry did not know, which fell back to a
+  // row that disables thinking and caching. Extended thinking on budget_tokens.
+  // Not live-verified.
+  'claude-opus-4-5': row('anthropic', 'anthropic', {
+    vision: true,
+    reasoning: true,
+    caching: true,
+    contextWindow: 200_000,
+    maxOutput: 64_000,
+  }),
+  'claude-sonnet-4-5': row('anthropic', 'anthropic', {
+    vision: true,
+    reasoning: true,
+    caching: true,
+    contextWindow: 200_000,
+    maxOutput: 64_000,
+  }),
 
   // --- OpenAI Chat Completions (GPT-5.4+ expose reasoning_effort here too) ---
   // 2.3 (F08): reasoning rows, so sampling is stripped and the cap rides
@@ -343,6 +360,78 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+  }),
+  // 2.3 (F19): priced OpenAI models the registry did not know. They fell back to
+  // a non-reasoning row, so `effort` was dropped and `temperature` was sent to
+  // a reasoning model. Every GPT-5 model reasons and rejects sampling
+  // parameters. The GPT-5.6 rows (GPT-5.6 is Sol) and the pro/codex snapshots
+  // pin no limits: placeholder cap, never sent. Not live-verified.
+  'gpt-5.6-sol': undocumentedOutput('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
+  }),
+  'gpt-5.6': undocumentedOutput('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
+  }),
+  'gpt-5.6-terra': undocumentedOutput('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
+  }),
+  'gpt-5.6-luna': undocumentedOutput('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
+  }),
+  'gpt-5.2': row('openai', 'responses', {
+    vision: true,
+    reasoning: true,
+    samplingRestrictions: true,
+    contextWindow: 400_000,
+    maxOutput: 128_000,
+  }),
+  'gpt-5.1': row('openai', 'responses', {
+    vision: true,
+    reasoning: true,
+    samplingRestrictions: true,
+    contextWindow: 400_000,
+    maxOutput: 128_000,
+  }),
+  'gpt-5': row('openai', 'responses', {
+    vision: true,
+    reasoning: true,
+    samplingRestrictions: true,
+    contextWindow: 400_000,
+    maxOutput: 128_000,
+  }),
+  'gpt-5-mini': row('openai', 'responses', {
+    vision: true,
+    reasoning: true,
+    samplingRestrictions: true,
+    contextWindow: 400_000,
+    maxOutput: 128_000,
+  }),
+  'gpt-5-nano': row('openai', 'responses', {
+    vision: true,
+    reasoning: true,
+    samplingRestrictions: true,
+    contextWindow: 400_000,
+    maxOutput: 128_000,
+  }),
+  'gpt-5.4-pro': undocumentedOutput('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
+  }),
+  'gpt-5.2-pro': undocumentedOutput('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
+  }),
+  'gpt-5.2-codex': undocumentedOutput('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
+  }),
+  'gpt-5-pro': undocumentedOutput('openai', 'responses', {
+    reasoning: true,
+    samplingRestrictions: true,
   }),
   'o4-mini': row('openai', 'responses', {
     vision: true,
@@ -730,6 +819,14 @@ function lookup(model: LanguageModel): { row: Row; match: RegistryMatch } {
 /** Which kind of registry entry answers for `model` (2.3). Pure: never warns. */
 export function registryMatch(model: LanguageModel): RegistryMatch {
   return lookup(model).match;
+}
+
+/**
+ * @internal Every pinned slug with its table (2.3): the price-table consistency
+ * test (F19) walks it. Not part of the package surface.
+ */
+export function pinnedModelIds(): { native: readonly string[]; other: readonly string[] } {
+  return { native: Object.keys(NATIVE_REGISTRY), other: Object.keys(REGISTRY) };
 }
 
 /**
