@@ -94,6 +94,18 @@ export function reasonForRpcCode(code: number): A2AErrorReason | undefined {
   return undefined;
 }
 
+const TERMINAL_STATES: ReadonlySet<A2ATaskState> = new Set([
+  'TASK_STATE_COMPLETED',
+  'TASK_STATE_FAILED',
+  'TASK_STATE_CANCELED',
+  'TASK_STATE_REJECTED',
+]);
+
+/** `COMPLETED`, `FAILED`, `CANCELED` and `REJECTED`: nothing changes a task after these. */
+export function isTerminalState(state: A2ATaskState): boolean {
+  return TERMINAL_STATES.has(state);
+}
+
 // --- enum normalization ----------------------------------------------------------
 
 // ProtoJSON parsers accept an enum's number as well as its name.

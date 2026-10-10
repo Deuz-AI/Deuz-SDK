@@ -3,6 +3,9 @@
  *
  * - `fetchAgentCard` reads an agent's card; `createA2AClient` talks to the
  *   agent over the JSON-RPC or the HTTP+JSON binding.
+ * - `createA2AHandler` serves an agent: `Request` in, `Response` out, with a
+ *   task store (`createInMemoryA2ATaskStore` by default) and an executor that
+ *   drives each task.
  *
  * Edge-safe (Web APIs only), zero dependencies. NOT LIVE-VERIFIED against
  * third-party agents: the wire was derived from `@a2a-js/sdk` 1.3.0 and is
@@ -10,6 +13,8 @@
  * supported.
  */
 export { createA2AClient, fetchAgentCard } from './client';
+export { createA2AHandler } from './handler';
+export { createInMemoryA2ATaskStore } from './task-store';
 export { A2AError } from './errors';
 export type { A2AErrorKind, A2AErrorOptions } from './errors';
 export type { A2AErrorReason } from './protocol';
