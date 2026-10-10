@@ -5,7 +5,11 @@ import { join } from 'node:path';
 import { createSqliteOpsStore } from '../src/node/ops-sqlite';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import { leaseProviderContracts } from './fixtures/lease-provider-conformance';
-import { agentRunStoreContracts, envelope } from './fixtures/agent-run-store-conformance';
+import {
+  agentRunPruneContracts,
+  agentRunStoreContracts,
+  envelope,
+} from './fixtures/agent-run-store-conformance';
 import { manualClock } from './fixtures/manual-clock';
 
 let DatabaseSync: (new (path: string) => SqliteDatabaseLike) | undefined;
@@ -33,13 +37,20 @@ describe.skipIf(!DatabaseSync)('SQLite ops store', () => {
     const { clock, advance } = manualClock();
     const ops = createSqliteOpsStore({ path: ':memory:', clock });
     cleanup.push(() => ops.close());
-    return { provider: ops.leases, advance, ttl: 1_000 };
+    return { provider: ops.leases, advance, ttl: 1_000, now: () => clock.now() };
   });
 
   agentRunStoreContracts('SQLite agent run store', () => {
     const ops = createSqliteOpsStore({ path: ':memory:' });
     cleanup.push(() => ops.close());
     return ops.agentRuns;
+  });
+
+  agentRunPruneContracts('SQLite agent run retention', async () => {
+    const { clock, advance } = manualClock();
+    const ops = createSqliteOpsStore({ path: ':memory:', clock });
+    cleanup.push(() => ops.close());
+    return { store: ops.agentRuns, advance, now: () => clock.now() };
   });
 
   it('keeps two connections on one file consistent', async () => {

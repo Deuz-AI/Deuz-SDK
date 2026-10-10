@@ -87,3 +87,56 @@ export function agentRunStoreContracts(
     });
   });
 }
+
+/**
+ * Agent run retention (2.3), shared by the SQLite and Postgres ops stores:
+ * `prune` deletes the terminal runs last saved before a time. `advance` moves
+ * the store's time forward and `now` reads it.
+ */
+export function agentRunPruneContracts(
+  name: string,
+  make: () => Promise<{
+    store: AgentRunStore & { prune(before: number): Promise<number> };
+    advance(ms: number): Promise<void>;
+    now(): number;
+  }>,
+): void {
+  describe(name, () => {
+    it('prunes terminal runs last saved before a time, and nothing a run may still need', async () => {
+      const { store, advance, now } = await make();
+      // A NUL, a lone surrogate or an escape spelled out in a message must not
+      // trip the prune's reading of the phase.
+      const nul = {
+        messages: [
+          {
+            role: 'user' as const,
+            content: [{ type: 'text' as const, text: 'a\u0000b \ud800 \\u0000 \\\u0000' }],
+          },
+        ],
+      };
+      await store.save(envelope('done', 1, { phase: 'terminal', ...nul }));
+      await store.save(envelope('running', 1, nul));
+      await store.save(envelope('finalizing', 1, { phase: 'finalizing' }));
+      // A suspended native run keeps phase 'running' until it settles.
+      await store.save(envelope('suspended', 1));
+      await store.save(envelope('legacy', undefined, { phase: 'terminal' }));
+      await advance(50);
+      const cut = now();
+      await advance(50);
+      await store.save(envelope('recent', 1, { phase: 'terminal' }));
+
+      expect(await store.prune(cut)).toBe(2);
+      expect(await store.load('done')).toBeUndefined();
+      expect(await store.load('legacy')).toBeUndefined();
+      for (const runId of ['running', 'finalizing', 'suspended', 'recent'])
+        expect(await store.load(runId), runId).toBeDefined();
+      expect(await store.prune(cut)).toBe(0);
+      // A pruned run's ID is free again.
+      await store.save(envelope('done', 1));
+      expect(await store.load('done')).toMatchObject({ revision: 1, phase: 'running' });
+      await expect(Promise.resolve().then(() => store.prune(Number.NaN))).rejects.toThrow(
+        TypeError,
+      );
+    });
+  });
+}

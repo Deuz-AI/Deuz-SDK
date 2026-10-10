@@ -5,6 +5,7 @@ import type {
   SwarmEvent,
   SwarmEventInput,
   SwarmKey,
+  SwarmPruneOptions,
   SwarmRunQuery,
   SwarmRunRecord,
   SwarmRunStatus,
@@ -396,6 +397,36 @@ export function validateRunQuery(query: SwarmRunQuery): void {
     throw new Error('Invalid swarm run query (status, scope, after, or limit 1..1000)');
 }
 
+/** The run statuses `prune` deletes (2.3): nothing will run again. */
+export const SETTLED_RUN_STATUSES: readonly SwarmRunStatus[] = [
+  'completed',
+  'partial',
+  'cancelled',
+];
+
+/** Shared prune validation (2.3); returns the options with their default limit. */
+export function validatePruneOptions(options: SwarmPruneOptions): {
+  before: number;
+  limit: number;
+  scope?: string;
+} {
+  const limit = options?.limit ?? 100;
+  if (
+    !options ||
+    !Number.isFinite(options.before) ||
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > 1000 ||
+    (options.scope !== undefined && (typeof options.scope !== 'string' || !options.scope))
+  )
+    throw new Error('Invalid swarm prune options (finite before, scope, or limit 1..1000)');
+  return {
+    before: options.before,
+    limit,
+    ...(options.scope !== undefined ? { scope: options.scope } : {}),
+  };
+}
+
 /** The listRuns order (2.2): updatedAt, then scope, then runId. */
 export function compareRuns(left: SwarmRunCursor, right: SwarmRunCursor): number {
   return (
@@ -406,7 +437,7 @@ export function compareRuns(left: SwarmRunCursor, right: SwarmRunCursor): number
 }
 
 /** In-process reference store with exactly the same CAS/atomicity contract as SQLite. */
-export function createInMemorySwarmStore(): SwarmStore {
+export function createInMemorySwarmStore(): SwarmStore & Required<Pick<SwarmStore, 'prune'>> {
   const runs = new Map<
     string,
     {
@@ -512,6 +543,21 @@ export function createInMemorySwarmStore(): SwarmStore {
       return cloneSwarm(
         runs.get(swarmKey(key))?.events.slice(afterSequence, afterSequence + limit) ?? [],
       );
+    },
+    async prune(options) {
+      const { before, scope, limit } = validatePruneOptions(options);
+      const settled = [...runs.values()]
+        .map((row) => row.run)
+        .filter(
+          (run) =>
+            SETTLED_RUN_STATUSES.includes(run.status) &&
+            run.updatedAt < before &&
+            (scope === undefined || run.scope === scope),
+        )
+        .sort(compareRuns)
+        .slice(0, limit);
+      for (const run of settled) runs.delete(swarmKey(run));
+      return settled.length;
     },
   };
 }

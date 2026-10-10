@@ -4,11 +4,17 @@ import type { LeaseProvider } from '../../src/types/lease';
 /**
  * The lease contract (2.2). `make` returns a provider plus `advance`, which
  * moves the provider's notion of time forward: an injected clock for memory
- * and SQLite, a real wait for providers that use database time.
+ * and SQLite, a real wait for providers that use database time. `now` reads
+ * that time.
  */
 export function leaseProviderContracts(
   name: string,
-  make: () => Promise<{ provider: LeaseProvider; advance(ms: number): Promise<void>; ttl: number }>,
+  make: () => Promise<{
+    provider: LeaseProvider;
+    advance(ms: number): Promise<void>;
+    ttl: number;
+    now(): number;
+  }>,
 ): void {
   describe(name, () => {
     it('grants a free key and refuses it to another owner', async () => {
@@ -231,6 +237,34 @@ export function leaseProviderContracts(
       expect(await ack(provider)(lease, 'cancel')).toBe(true);
       await expect(ack(provider)(lease, 'drain' as 'cancel')).rejects.toThrow(TypeError);
       expect(await ack(provider)({ ...lease, key: 'nobody' }, 'cancel')).toBe(false);
+    });
+  });
+
+  describe(`${name}: retention (2.3)`, () => {
+    it('prunes the keys nobody holds, but not a held key or a queued cancel', async () => {
+      const { provider, advance, ttl, now } = await make();
+      if (!provider.prune) throw new Error('This provider cannot prune');
+      const released = (await provider.acquire({ key: 'released', owner: 'a', ttlMs: ttl }))!;
+      await provider.release(released);
+      const lapsed = (await provider.acquire({ key: 'lapsed', owner: 'a', ttlMs: ttl }))!;
+      const cancelled = (await provider.acquire({ key: 'cancelled', owner: 'a', ttlMs: ttl }))!;
+      expect(await provider.signal('cancelled', 'cancel')).toBe(true);
+      await provider.release(cancelled);
+      await advance(ttl * 2);
+      const held = (await provider.acquire({ key: 'held', owner: 'a', ttlMs: ttl * 10 }))!;
+      expect(await provider.prune(now())).toBe(2);
+      // A holder whose lease lapsed that long ago finds it lost; a new one starts over.
+      expect(await provider.renew(lapsed, ttl)).toEqual({ held: false });
+      expect(await provider.acquire({ key: 'released', owner: 'b', ttlMs: ttl })).toMatchObject({
+        owner: 'b',
+        token: 1,
+      });
+      // The queued cancel still reaches the next holder of its run.
+      const next = (await provider.acquire({ key: 'cancelled', owner: 'b', ttlMs: ttl }))!;
+      expect(await provider.renew(next, ttl)).toMatchObject({ held: true, signals: ['cancel'] });
+      expect(await provider.renew(held, ttl)).toMatchObject({ held: true });
+      expect(await provider.prune(now())).toBe(0);
+      await expect(provider.prune(Number.NaN)).rejects.toThrow(TypeError);
     });
   });
 }

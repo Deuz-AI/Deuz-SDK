@@ -71,4 +71,13 @@ export interface LeaseProvider {
    * counts. Optional: a provider with it honours `renew`'s `acknowledge`.
    */
   ack?(lease: Lease, signal: 'cancel'): Promise<boolean>;
+  /**
+   * Retention (2.3): delete the keys nobody holds, released or expired before
+   * `before` (epoch milliseconds on the provider's clock), that queue no
+   * 'cancel', and return how many. The next holder of a pruned key starts
+   * again at token 1, and a holder whose lease expired before `before` finds
+   * it lost when it renews. Optional: the memory, SQLite and Postgres
+   * providers have it.
+   */
+  prune?(before: number): Promise<number>;
 }

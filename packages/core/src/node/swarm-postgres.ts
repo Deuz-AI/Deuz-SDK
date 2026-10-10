@@ -34,9 +34,11 @@ import {
   nextSwarmRun,
   planPosts,
   postEvents,
+  SETTLED_RUN_STATUSES,
   SwarmConflictError,
   validateChannelName,
   validateEventCursor,
+  validatePruneOptions,
   validateRunQuery,
   validateSpawn,
   validateSwarmSnapshot,
@@ -64,7 +66,9 @@ export function postgresSchemaName(schema: string | undefined): string {
 
 type Row = Record<string, unknown>;
 
-export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): SwarmStore {
+export function createPostgresSwarmStore(
+  options: PostgresSwarmStoreOptions,
+): SwarmStore & Required<Pick<SwarmStore, 'prune'>> {
   const schema = postgresSchemaName(options.schema);
   const runs = `${schema}.deuz_swarm_runs`;
   const tasks = `${schema}.deuz_swarm_tasks`;
@@ -396,6 +400,35 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
           ],
         )
       ).map((row) => decodeRun(row.payload));
+    },
+    async prune(options) {
+      const { before, scope, limit } = validatePruneOptions(options);
+      await use();
+      // One statement. The outer conditions repeat the inner ones, so a run a
+      // concurrent commit moved on is re-checked in its new version and kept.
+      const settled = `status IN (${SETTLED_RUN_STATUSES.map((status) => `'${status}'`).join(', ')})
+        AND updated_at < $1::float8`;
+      const [row] = await retryPostgres(SERIALIZATION_CODES, () =>
+        query(
+          `WITH gone AS (
+            DELETE FROM ${runs} WHERE (scope, run_id) IN (
+              SELECT scope, run_id FROM ${runs}
+              WHERE ${settled} AND ($2::text IS NULL OR scope = $2::text)
+              ORDER BY updated_at, scope COLLATE "C", run_id COLLATE "C" LIMIT $3
+            ) AND ${settled}
+            RETURNING scope, run_id
+          ), old_tasks AS (
+            DELETE FROM ${tasks} t USING gone g WHERE t.scope = g.scope AND t.run_id = g.run_id
+          ), old_events AS (
+            DELETE FROM ${events} e USING gone g WHERE e.scope = g.scope AND e.run_id = g.run_id
+          ), old_notes AS (
+            DELETE FROM ${channels} c USING gone g WHERE c.scope = g.scope AND c.run_id = g.run_id
+          )
+          SELECT COUNT(*) AS n FROM gone`,
+          [before, scope ?? null, limit],
+        ),
+      );
+      return Number(row?.n ?? 0);
     },
   };
 }

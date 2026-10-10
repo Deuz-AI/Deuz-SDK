@@ -68,7 +68,7 @@ const child = (id: string, extra: Partial<SwarmTaskRecord> = {}): SwarmTaskRecor
 export function swarmStoreContracts(
   name: string,
   make: () => SwarmStore,
-  options: { spawn?: boolean; channels?: boolean; list?: boolean } = {},
+  options: { spawn?: boolean; channels?: boolean; list?: boolean; prune?: boolean } = {},
 ): void {
   describe(name, () => {
     it('atomically rolls back invalid multi-task writes and event publication', async () => {
@@ -325,6 +325,69 @@ export function swarmStoreContracts(
             after: { updatedAt: 1, scope: 7, runId: 'r' } as unknown as SwarmRunRecord,
           }),
         ).rejects.toThrow();
+      });
+    }
+
+    if (options.prune) {
+      const at = (scope: string, runId: string, updatedAt: number): SwarmSnapshot => {
+        const snapshot = initialSnapshot(scope);
+        return { ...snapshot, run: { ...snapshot.run, runId, createdAt: updatedAt, updatedAt } };
+      };
+
+      it('prunes settled runs updated before a time, oldest first, with all they hold (2.3)', async () => {
+        const store = make();
+        const settle = async (
+          scope: string,
+          runId: string,
+          status: SwarmRunRecord['status'],
+          updatedAt: number,
+          expectedRevision = 0,
+        ) =>
+          store.commit({
+            scope,
+            runId,
+            expectedRevision,
+            run: { status, updatedAt },
+            events: [{ type: 'run.settled', timestamp: updatedAt }],
+          });
+        await store.create(at('a', 'done', 1), [{ type: 'run.started', timestamp: 1 }]);
+        await store.commit({
+          scope: 'a',
+          runId: 'done',
+          expectedRevision: 0,
+          posts: [{ channel: 'main', entryId: 'n1', taskId: 'a', attempt: 1, text: 'note', at: 1 }],
+        });
+        await settle('a', 'done', 'completed', 5, 1);
+        await store.create(at('a', 'partial', 1), []);
+        await settle('a', 'partial', 'partial', 3);
+        await store.create(at('b', 'cancelled', 1), []);
+        await settle('b', 'cancelled', 'cancelled', 4);
+        await store.create(at('a', 'running', 1), []);
+        await store.create(at('a', 'suspended', 1), []);
+        await settle('a', 'suspended', 'suspended', 2);
+        await store.create(at('a', 'recent', 1), []);
+        await settle('a', 'recent', 'completed', 20);
+
+        expect(await store.prune!({ before: 10, limit: 2 })).toBe(2);
+        expect(await store.load({ scope: 'a', runId: 'partial' })).toBeUndefined();
+        expect(await store.load({ scope: 'b', runId: 'cancelled' })).toBeUndefined();
+        expect(await store.readEvents({ scope: 'b', runId: 'cancelled' }, 0, 10)).toEqual([]);
+        expect(await store.prune!({ before: 10, scope: 'b' })).toBe(0);
+        expect(await store.prune!({ before: 10 })).toBe(1);
+        expect(await store.prune!({ before: 10 })).toBe(0);
+        const left = await store.listRuns!({ limit: 10 });
+        expect(left.map((run) => run.runId)).toEqual(['running', 'suspended', 'recent']);
+
+        // A run created again under a pruned key starts afresh: nothing of the old one remains.
+        await store.create(at('a', 'done', 30), [{ type: 'run.started', timestamp: 30 }]);
+        expect((await store.load({ scope: 'a', runId: 'done' }))?.run.revision).toBe(0);
+        expect(await store.readEvents({ scope: 'a', runId: 'done' }, 0, 10)).toHaveLength(1);
+        expect(await store.readChannel!({ scope: 'a', runId: 'done' }, 'main', 0, 10)).toEqual([]);
+
+        await expect(store.prune!({ before: Number.NaN })).rejects.toThrow();
+        await expect(store.prune!({ before: 10, limit: 0 })).rejects.toThrow();
+        await expect(store.prune!({ before: 10, limit: 1001 })).rejects.toThrow();
+        await expect(store.prune!({ before: 10, scope: '' })).rejects.toThrow();
       });
     }
 

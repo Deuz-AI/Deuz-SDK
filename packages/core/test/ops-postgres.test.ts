@@ -3,7 +3,11 @@ import { PGlite } from '@electric-sql/pglite';
 import { createPostgresOpsStore } from '../src/node/ops-postgres';
 import type { PgClientLike } from '../src/node/store-postgres';
 import { leaseProviderContracts } from './fixtures/lease-provider-conformance';
-import { agentRunStoreContracts, envelope } from './fixtures/agent-run-store-conformance';
+import {
+  agentRunPruneContracts,
+  agentRunStoreContracts,
+  envelope,
+} from './fixtures/agent-run-store-conformance';
 
 const db = new PGlite();
 // Start-up is slow under load; keep it out of the first test's time budget.
@@ -27,12 +31,20 @@ leaseProviderContracts('Postgres lease provider (PGlite, database time)', async 
   provider: (await freshOps()).leases,
   advance: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   ttl: 200,
+  // PGlite runs in this process, so the database clock is the host clock.
+  now: () => Date.now(),
 }));
 
 agentRunStoreContracts(
   'Postgres agent run store (PGlite)',
   async () => (await freshOps()).agentRuns,
 );
+
+agentRunPruneContracts('Postgres agent run retention (PGlite, database time)', async () => ({
+  store: (await freshOps()).agentRuns,
+  advance: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
+}));
 
 describe('Postgres ops store', () => {
   it('shares leases and fenced agent runs across store instances on one database', async () => {

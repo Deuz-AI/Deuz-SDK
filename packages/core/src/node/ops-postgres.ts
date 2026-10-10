@@ -9,6 +9,7 @@ import type { PgClientLike } from './store-postgres';
 import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/lease';
 import { assertLeaseRequest } from '../internal/ops-validate';
+import { assertRetentionTime } from '../internal/ops-retention';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 import { postgresSchemaName } from './swarm-postgres';
 import {
@@ -30,16 +31,34 @@ export interface PostgresOpsStoreOptions {
 }
 
 export interface PostgresOpsStore {
-  leases: LeaseProvider;
-  agentRuns: AgentRunStore;
+  /** Has `ack` and, for retention (2.3), `prune`, on the database clock. */
+  leases: LeaseProvider & Required<Pick<LeaseProvider, 'ack' | 'prune'>>;
+  agentRuns: AgentRunStore & {
+    /**
+     * Retention (2.3): delete the terminal runs (completed, stopped or failed)
+     * last saved before `before`, epoch ms on the database clock, and return
+     * how many. Running, finalizing and suspended runs stay; a pruned run can
+     * no longer be resumed or inspected, and its ID is free again.
+     */
+    prune(before: number): Promise<number>;
+  };
   /**
    * A durable claim for `createScheduler({ claim })` and `handleSignal({ dedupe })`:
    * a key is granted once across every process using the schema, until
    * `release(key)` gives it back. Granted keys stay in `deuz_claims` (with
-   * `claimed_at`, epoch ms on the database clock) until you delete them; a key
-   * over 512 characters or holding a NUL is stored as `sha256:<hex>` of it.
+   * `claimed_at`, epoch ms on the database clock) until released or pruned; a
+   * key over 512 characters or holding a NUL is stored as `sha256:<hex>` of it.
    */
-  claims: { (key: string): Promise<boolean>; release(key: string): Promise<void> };
+  claims: {
+    (key: string): Promise<boolean>;
+    release(key: string): Promise<void>;
+    /**
+     * Retention (2.3): delete the keys granted before `before`, epoch ms on the
+     * database clock, and return how many. A pruned key can be claimed again,
+     * so keep every key an occurrence or delivery may still repeat.
+     */
+    prune(before: number): Promise<number>;
+  };
 }
 
 const SCHEMA_VERSION = 1;
@@ -47,6 +66,7 @@ const SIGNALS: readonly LeaseSignal[] = ['cancel', 'drain'];
 /** Milliseconds on the database clock. */
 const NOW = `(extract(epoch from clock_timestamp()) * 1000)::bigint`;
 const encoder = new TextEncoder();
+const BACKSLASH = String.fromCharCode(92);
 
 /**
  * The key a claim row stores: the key itself, or `sha256:` and the hex SHA-256
@@ -93,6 +113,9 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       run_id TEXT PRIMARY KEY, scope TEXT NOT NULL, revision BIGINT NOT NULL,
       payload TEXT NOT NULL, updated_at BIGINT NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS ${claimsTable} (key TEXT PRIMARY KEY, claimed_at BIGINT NOT NULL)`,
+      // 2.3, for retention: additions 2.2 ignores, so version 1 stays.
+      `CREATE INDEX IF NOT EXISTS deuz_claims_claimed_at ON ${claimsTable} (claimed_at)`,
+      `CREATE INDEX IF NOT EXISTS deuz_agent_runs_updated_at ON ${runsTable} (updated_at)`,
     ],
   });
   const use = async (): Promise<void> => {
@@ -104,8 +127,23 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
   };
   const view = (key: string, owner: string, token: unknown, expiresAt: unknown): Lease =>
     Object.freeze({ key, owner, token: Number(token), expiresAt: Number(expiresAt) });
+  /** Deletes the rows `where` matches (2.3), in one statement, and counts them. */
+  const prune = async (
+    table: string,
+    where: string,
+    before: number,
+    params: unknown[] = [],
+  ): Promise<number> => {
+    assertRetentionTime(before);
+    await use();
+    const [row] = await write(
+      `WITH gone AS (DELETE FROM ${table} WHERE ${where} RETURNING 1) SELECT count(*) AS n FROM gone`,
+      [before, ...params],
+    );
+    return Number(row?.n ?? 0);
+  };
 
-  const leases: LeaseProvider = {
+  const leases: PostgresOpsStore['leases'] = {
     async acquire({ key, owner, ttlMs }) {
       assertLeaseRequest(key, owner, ttlMs);
       await use();
@@ -182,9 +220,16 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       );
       return rows.length === 1;
     },
+    // Nobody holds the key, and no cancel waits for its run's next executor.
+    prune: (before) =>
+      prune(
+        leasesTable,
+        `(expires_at = 0 OR expires_at < $1::float8) AND NOT signals @> '["cancel"]'::jsonb`,
+        before,
+      ),
   };
 
-  const agentRuns: AgentRunStore = {
+  const agentRuns: PostgresOpsStore['agentRuns'] = {
     async load(runId) {
       await use();
       const [row] = await query(`SELECT payload FROM ${runsTable} WHERE run_id = $1`, [runId]);
@@ -214,6 +259,20 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
           `Agent run revision conflict for ${envelope.runId}: revision ${String(revision)} is not the next one`,
         );
     },
+    // Postgres refuses to read a JSON text whose strings hold a \u0000 escape or
+    // a lone surrogate, which a message may. Every \uXXXX escape is read as a
+    // space instead: only its hex digits change, so the JSON stays well-formed
+    // and its top-level phase stays what it was.
+    prune: (before) =>
+      prune(
+        runsTable,
+        `updated_at < $1::float8
+          AND (regexp_replace(payload, $2, $3, 'g')::json ->> 'phase') = 'terminal'`,
+        before,
+        // As SQL text, the pattern is a backslash (escaped for the regex) then u and
+        // four hex digits; the replacement, a backslash (escaped likewise) then u0020.
+        [`${BACKSLASH}${BACKSLASH}u[0-9A-Fa-f]{4}`, `${BACKSLASH}${BACKSLASH}u0020`],
+      ),
   };
 
   const claims: PostgresOpsStore['claims'] = Object.assign(
@@ -236,6 +295,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
         await use();
         await write(`DELETE FROM ${claimsTable} WHERE key = $1`, [row]);
       },
+      prune: (before: number) => prune(claimsTable, 'claimed_at < $1::float8', before),
     },
   );
 

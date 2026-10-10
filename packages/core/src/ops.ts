@@ -7,6 +7,7 @@ import type { Clock } from './types/deps';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from './types/lease';
 import { resolveDependencies } from './internal/resolve-deps';
 import { assertLeaseRequest } from './internal/ops-validate';
+import { assertRetentionTime } from './internal/ops-retention';
 
 export type * from './types/lease';
 
@@ -75,6 +76,16 @@ export function createInMemoryLeaseProvider(options: { clock?: Clock } = {}): Le
       if (!row || row.token !== lease.token || row.owner !== lease.owner) return false;
       row.signals = row.signals.filter((queued) => queued !== 'cancel');
       return true;
+    },
+    async prune(before) {
+      assertRetentionTime(before);
+      let pruned = 0;
+      for (const [key, row] of leases)
+        if ((row.expiresAt === 0 || row.expiresAt < before) && !row.signals.includes('cancel')) {
+          leases.delete(key);
+          pruned++;
+        }
+      return pruned;
     },
   };
 }

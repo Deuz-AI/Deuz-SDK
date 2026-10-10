@@ -16,9 +16,11 @@ import {
   nextSwarmRun,
   planPosts,
   postEvents,
+  SETTLED_RUN_STATUSES,
   SwarmConflictError,
   validateChannelName,
   validateEventCursor,
+  validatePruneOptions,
   validateRunQuery,
   validateSwarmSnapshot,
   validateSpawn,
@@ -33,6 +35,8 @@ export interface SqliteSwarmStoreOptions {
 }
 
 export interface SqliteSwarmStore extends SwarmStore {
+  /** Retention (2.3): see `SwarmStore.prune`. */
+  prune: NonNullable<SwarmStore['prune']>;
   close(): Promise<void>;
 }
 
@@ -135,6 +139,10 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
               `UPDATE deuz_swarm_schema SET version = ${SCHEMA_VERSION} WHERE singleton = 1`,
             );
           }
+          // 2.3, for prune and unscoped listing: an index 2.2 ignores, so version 2 stays.
+          db!.exec(
+            'CREATE INDEX IF NOT EXISTS deuz_swarm_runs_settled ON deuz_swarm_runs(status, updated_at)',
+          );
         });
         return db;
       } catch (error) {
@@ -373,6 +381,30 @@ export function createSqliteSwarmStore(options: SqliteSwarmStoreOptions): Sqlite
             'SELECT payload FROM deuz_swarm_events WHERE scope=? AND run_id=? AND sequence>? ORDER BY sequence LIMIT ?',
           ).all(key.scope, key.runId, afterSequence, limit) as PayloadRow[]
         ).map((row) => decodeSwarm<SwarmEvent>(row.payload)),
+      );
+    },
+    async prune(options) {
+      const { before, scope, limit } = validatePruneOptions(options);
+      const settled = SETTLED_RUN_STATUSES.map((status) => `'${status}'`).join(',');
+      return use((db) =>
+        transaction(db, () => {
+          const keys = statement(
+            db,
+            `SELECT scope, run_id FROM deuz_swarm_runs
+             WHERE status IN (${settled}) AND updated_at < ? AND (? IS NULL OR scope = ?)
+             ORDER BY updated_at, scope, run_id LIMIT ?`,
+          ).all(before, scope ?? null, scope ?? null, limit) as { scope: string; run_id: string }[];
+          for (const table of [
+            'deuz_swarm_tasks',
+            'deuz_swarm_events',
+            'deuz_swarm_channels',
+            'deuz_swarm_runs',
+          ]) {
+            const remove = statement(db, `DELETE FROM ${table} WHERE scope=? AND run_id=?`);
+            for (const key of keys) remove.run(key.scope, key.run_id);
+          }
+          return keys.length;
+        }),
       );
     },
     async close() {
