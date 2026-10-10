@@ -4,14 +4,25 @@
  * old and that is still running or finalizing lost its executor (or is in a
  * long tool call: the run lease tells the two apart on resume).
  */
+import { PGlite } from '@electric-sql/pglite';
 import { describe, expect, it } from 'vitest';
 import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../src/agent-run';
 import { findStaleAgentRuns } from '../src/ops';
 import { createSqliteOpsStore } from '../src/node/ops-sqlite';
+import { createPostgresOpsStore } from '../src/node/ops-postgres';
+import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import { createMockModel } from '../src/testing';
 import type { AgentResult, AgentRunEnvelope, AgentRunStore } from '../src/types/agent-run';
 import { envelope } from './fixtures/agent-run-store-conformance';
 import { manualClock } from './fixtures/manual-clock';
+
+let DatabaseSync: (new (path: string) => SqliteDatabaseLike) | undefined;
+try {
+  DatabaseSync = ((await import('node:sqlite' as string)) as { DatabaseSync: typeof DatabaseSync })
+    .DatabaseSync;
+} catch {
+  /* optional runtime */
+}
 
 const usage = envelope('x', 1).usage;
 const suspended: AgentResult<unknown> = {
@@ -105,7 +116,7 @@ describe('findStaleAgentRuns (2.3)', () => {
       );
   });
 
-  it('works on a durable store', async () => {
+  it.skipIf(!DatabaseSync)('works on a durable store', async () => {
     const { clock, advance } = manualClock(0);
     const ops = createSqliteOpsStore({ path: ':memory:', clock });
     try {
@@ -154,4 +165,67 @@ describe('findStaleAgentRuns (2.3)', () => {
     expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
     expect(await findStaleAgentRuns(store, { clock })).toEqual([]);
   });
+});
+
+describe('listing the runs of a database a 2.2 process wrote (2.3)', () => {
+  const payload = (runId: string, phase: string) =>
+    JSON.stringify({ ...envelope(runId, 1), phase }).replace(/'/g, "''");
+
+  it.skipIf(!DatabaseSync)('adds the index on first use and keeps version 1 (SQLite)', async () => {
+    const db = new DatabaseSync!(':memory:');
+    db.exec(`CREATE TABLE deuz_ops_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL);
+      INSERT INTO deuz_ops_schema VALUES (1, 1);
+      CREATE TABLE deuz_leases (key TEXT PRIMARY KEY, owner TEXT NOT NULL, token INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL, signals TEXT NOT NULL);
+      CREATE TABLE deuz_agent_runs (run_id TEXT PRIMARY KEY, scope TEXT NOT NULL,
+        revision INTEGER NOT NULL, payload TEXT NOT NULL, updated_at INTEGER NOT NULL);
+      INSERT INTO deuz_agent_runs VALUES ('old', 'tenant', 1, '${payload('old', 'running')}', 5);
+      INSERT INTO deuz_agent_runs VALUES ('done', 'tenant', 1, '${payload('done', 'terminal')}', 7);`);
+    const ops = createSqliteOpsStore({ path: ':memory:', database: db });
+    try {
+      // Listing is the first thing this store does with the file.
+      expect(await ops.agentRuns.list()).toEqual({
+        runs: [
+          { runId: 'done', scope: 'tenant', phase: 'terminal', revision: 1, updatedAt: 7 },
+          { runId: 'old', scope: 'tenant', phase: 'running', revision: 1, updatedAt: 5 },
+        ],
+      });
+      expect(
+        db
+          .prepare(`SELECT name FROM sqlite_master WHERE name = 'deuz_agent_runs_updated_at'`)
+          .get(),
+      ).toEqual({ name: 'deuz_agent_runs_updated_at' });
+      expect(db.prepare('SELECT version FROM deuz_ops_schema').get()).toEqual({ version: 1 });
+    } finally {
+      await ops.close();
+    }
+  });
+
+  it('adds the index on first use and keeps version 1 (Postgres)', async () => {
+    const pg = new PGlite();
+    try {
+      await pg.exec(`CREATE SCHEMA ops22;
+        CREATE TABLE ops22.deuz_ops_schema (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL);
+        INSERT INTO ops22.deuz_ops_schema VALUES (1, 1);
+        CREATE TABLE ops22.deuz_agent_runs (run_id TEXT PRIMARY KEY, scope TEXT NOT NULL,
+          revision BIGINT NOT NULL, payload TEXT NOT NULL, updated_at BIGINT NOT NULL);
+        INSERT INTO ops22.deuz_agent_runs VALUES ('old', 'tenant', 1, '${payload('old', 'running')}', 5);`);
+      const ops = createPostgresOpsStore({
+        client: { query: (sql, params) => pg.query<Record<string, unknown>>(sql, params) },
+        schema: 'ops22',
+      });
+      expect(await ops.agentRuns.list({ phases: ['running'] })).toEqual({
+        runs: [{ runId: 'old', scope: 'tenant', phase: 'running', revision: 1, updatedAt: 5 }],
+      });
+      const found = await pg.query(
+        `SELECT to_regclass('ops22.deuz_agent_runs_updated_at') AS found`,
+      );
+      expect(found.rows).toEqual([{ found: 'ops22.deuz_agent_runs_updated_at' }]);
+      expect((await pg.query('SELECT version FROM ops22.deuz_ops_schema')).rows).toEqual([
+        { version: 1 },
+      ]);
+    } finally {
+      await pg.close();
+    }
+  }, 60_000);
 });

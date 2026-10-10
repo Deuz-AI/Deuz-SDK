@@ -13,7 +13,16 @@ import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import { createDeferred } from '../src/internal/async-iter';
 import type { AgentRunEnvelope, AgentRunStore, AgentToolSet } from '../src/types/agent-run';
 import type { LeaseProvider } from '../src/types/lease';
+import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import { manualClock } from './fixtures/manual-clock';
+
+let DatabaseSync: (new (path: string) => SqliteDatabaseLike) | undefined;
+try {
+  DatabaseSync = ((await import('node:sqlite' as string)) as { DatabaseSync: typeof DatabaseSync })
+    .DatabaseSync;
+} catch {
+  /* optional runtime */
+}
 
 /** A mock model that counts its calls. */
 function counted(responses: Parameters<typeof createMockModel>[0]['responses']) {
@@ -442,7 +451,7 @@ describe('runAgent lease (2.3)', () => {
     expect(await store.load('job')).toEqual(before);
   });
 
-  it('works with a durable lease provider and store', async () => {
+  it.skipIf(!DatabaseSync)('works with a durable lease provider and store', async () => {
     const { clock } = manualClock(0);
     const ops = createSqliteOpsStore({ path: ':memory:', clock });
     try {
