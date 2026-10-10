@@ -3,6 +3,7 @@
  * client and the handler (2.3). Values come from `@a2a-js/sdk` 1.3.0.
  */
 import type {
+  A2AArtifact,
   A2AMessage,
   A2AMessageInput,
   A2APart,
@@ -204,4 +205,21 @@ export function toMessage(
     messageId: input.messageId ?? defaults.generateId(),
     role: input.role ?? defaults.role,
   };
+}
+
+/**
+ * The text of a message, an artifact or a list of parts: its `text` parts,
+ * concatenated (so streamed chunks join up). `''` when there are none.
+ *
+ * ```ts
+ * a2aText(ctx.message);                 // what the client asked
+ * a2aText(answer.task?.artifacts?.[0]); // what the agent produced
+ * ```
+ */
+export function a2aText(value: A2AMessage | A2AArtifact | readonly A2APart[] | undefined): string {
+  const parts: readonly A2APart[] =
+    value === undefined ? [] : 'parts' in value ? value.parts : value;
+  let text = '';
+  for (const part of parts) if (typeof part.text === 'string') text += part.text;
+  return text;
 }

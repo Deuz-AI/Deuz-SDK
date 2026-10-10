@@ -17,5 +17,6 @@ export { createA2AHandler } from './handler';
 export { createInMemoryA2ATaskStore } from './task-store';
 export { A2AError } from './errors';
 export type { A2AErrorKind, A2AErrorOptions } from './errors';
+export { a2aText } from './protocol';
 export type { A2AErrorReason } from './protocol';
 export type * from './types';

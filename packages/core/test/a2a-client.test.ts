@@ -12,6 +12,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   A2AError,
+  a2aText,
   createA2AClient,
   fetchAgentCard,
   type A2AAgentCard,
@@ -763,5 +764,24 @@ describe('A2AError', () => {
       message: 'Task not found',
       details: { statusCode: 404, kind: 'protocol', reason: 'TASK_NOT_FOUND', rpcCode: -32001 },
     });
+  });
+});
+
+describe('a2aText', () => {
+  it('concatenates the text parts of a message, an artifact or a part list', () => {
+    const parts = [
+      { text: 'Sunny, ' },
+      { data: { highC: 24 } },
+      { url: 'https://x/map.png', mediaType: 'image/png' },
+      { text: '24 °C.' },
+    ];
+    expect(a2aText({ messageId: 'm', role: 'ROLE_AGENT', parts })).toBe('Sunny, 24 °C.');
+    expect(a2aText({ artifactId: 'a', parts })).toBe('Sunny, 24 °C.');
+    expect(a2aText(parts)).toBe('Sunny, 24 °C.');
+  });
+
+  it('is empty without text', () => {
+    expect(a2aText(undefined)).toBe('');
+    expect(a2aText([{ data: null }])).toBe('');
   });
 });
