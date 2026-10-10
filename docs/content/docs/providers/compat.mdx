@@ -132,6 +132,10 @@ Reasoning arrives as `reasoning-delta` parts, never spliced into `textStream` â€
 
 The wire accepts `max_tokens` up to 65,536, but the registry keeps the default at 8,192: one runaway thinking pass at the ceiling is a real bill. Raise it per call when an answer needs the room.
 
+### Reasoning round-trips on DeepSeek and Kimi (2.3)
+
+`reasoning_content` from any Chat Completions host becomes a `reasoning` part marked with that host's provider id as its `source` (`'deepseek'`, `'moonshot'`, â€¦). On `createDeepSeek` and `createKimi` (provider `moonshot`) it rides back as `reasoning_content` on the assistant message that carries the turn's `tool_calls`, so a multi-step tool conversation keeps its reasoning. A text-only turn sends none, other hosts send none, and reasoning from another provider (a Claude thinking block, an OpenAI encrypted item) is never sent. Both hosts document keeping `reasoning_content` across a tool conversation; the round trip is not live-verified.
+
 ### Perplexity Sonar does no client tool calling
 
 <Callout title="Perplexity does no client tool calling">

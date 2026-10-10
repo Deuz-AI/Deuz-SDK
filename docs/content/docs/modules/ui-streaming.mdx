@@ -105,7 +105,7 @@ function toDeuzTextStreamResponse(
 ): Response;
 ```
 
-Body bytes equal the concatenation of `result.textStream`. It projects the **canonical** `fullStream` (never provider bytes), so the canonical line is intact. `includeReasoning: true` interleaves reasoning deltas — `encrypted` reasoning is always skipped, because it is an opaque provider payload, not display text.
+Body bytes equal the concatenation of `result.textStream`. It projects the **canonical** `fullStream` (never provider bytes), so the canonical line is intact. `includeReasoning: true` interleaves reasoning deltas — `encrypted` and `redacted` reasoning is always skipped, because it is an opaque provider payload, not display text.
 
 <Callout type="warn" title="A mid-stream failure writes nothing — the response just truncates">
 A frameless format has nowhere to put an error, and any string written into the body would be indistinguishable from model output: it would land in the user's transcript and be persisted as if the model said it. So an `error` part (or a throwing source) simply **closes the body**. HTTP truncation without a terminal frame is the only signal, exactly as it is for a dropped connection.
@@ -388,7 +388,7 @@ stream.writeData('progress', 0.4, { transient: true }); // never journaled
 | `step-start` | `step: number` | An agentic loop step begins. |
 | `step-finish` | `step: number`, `finishReason: FinishReason`, `usage: Usage` | A loop step ends. |
 | `text-delta` | `text: string` | A chunk of assistant text. |
-| `reasoning-delta` | `text: string`, `signature?: string` | A chunk of reasoning / thinking text. |
+| `reasoning-delta` | `text: string`, `signature?: string`, `id?`, `encrypted?`, `redacted?`, `source?` **(2.3)** | A chunk of one reasoning block. `id` names the block (deltas of one block share it); `encrypted` / `redacted` mark an opaque payload, never display text; `source` is the provider family that produced it. |
 | `tool-input-delta` | `toolCallId: string`, `toolName?: string`, `delta: string` | A raw fragment of a tool call's argument JSON. |
 | `tool-call` | `toolCallId: string`, `toolName: string`, `input: unknown` | A fully parsed tool call. |
 | `tool-result` | `toolCallId: string`, `toolName: string`, `output: unknown`, `isError?: boolean` | A tool finished executing (`isError: true` on a failed/self-healed tool). |
@@ -413,7 +413,7 @@ stream.writeData('progress', 0.4, { transient: true }); // never journaled
 
 `Usage` and `FinishReason` are the canonical types from the core ([usage breakdown](/docs/core/stream-chat)). The `tool-input-delta` fragments accumulate into the `input` you receive on the matching `tool-call` — render the deltas for a live "typing the arguments" effect, then swap to the final `input`.
 
-Note that the wire's `reasoning-delta` carries **no** `encrypted` flag — that field exists only on canonical `ReasoningPart`s and on `UIMessagePart`s projected from history by `uiFromMessages`.
+Since 2.3 the wire's `reasoning-delta` carries the canonical part's `id`, `encrypted`, `redacted` and `source`, so a chat client rebuilds every reasoning block and sends it back unchanged (`useChat` does; see [Reasoning parts](/docs/core/messages#reasoning-parts)). Before 2.3 it carried only `text` and `signature`. The fields ride every wire version; a client that does not know them ignores them like any unknown key.
 
 ### Rendering a denial, not a failure
 

@@ -70,7 +70,9 @@ for await (const part of result.fullStream) {
 }
 ```
 
-Reasoning models emit a `thoughtSignature` on reasoning and tool-call parts. The adapter carries it through `providerMetadata.google.thoughtSignature` and replays it on the next turn, so the agentic [tool loop](/docs/agents/tool-loop) round-trips multi-step thinking correctly. Keep the message history immutable — the signature lives on the prior turn's parts.
+Reasoning models emit a `thoughtSignature` on reasoning, tool-call and plain text parts. The adapter keeps a thought's signature on its `reasoning` part (with `source: 'google'`) and a tool call's or text part's in `providerMetadata.google.thoughtSignature`, and replays each on the next turn, so the agentic [tool loop](/docs/agents/tool-loop) round-trips multi-step thinking correctly. Keep the message history immutable — the signature lives on the prior turn's parts.
+
+Since 2.3 a signature on a plain text part is kept too, including one streamed in a final chunk whose text is empty: it rides back on that text part. Gemini does not enforce text signatures, but drops in reasoning quality without them (not live-verified). Only Gemini's own thoughts are replayed here: reasoning another provider produced (a Claude thinking block, an OpenAI encrypted item) never becomes a `thoughtSignature`.
 
 ## Google Search grounding
 

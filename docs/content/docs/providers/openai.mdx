@@ -139,6 +139,8 @@ for await (const part of result.fullStream) {
 
 Since 1.2.0, when a Responses call includes tools on a reasoning model, the adapter automatically requests `include: ["reasoning.encrypted_content"]` with `store: false`, and replays the encrypted reasoning items verbatim (ahead of their `function_call`) on later loop steps — stateless multi-step tool use stays coherent without server-side storage. `reasoning-delta` parts with `encrypted: true` carry the opaque payload; skip them when rendering. Replayed assistant messages preserve the `phase` field (`commentary`/`final_answer`) via `Message.providerMetadata.openai.phase`.
 
+Since 2.3 each reasoning item is its own block (`id` = the item id) and its parts carry `source: 'openai'`. The encrypted item rides back only to the Responses wire: a fallback to Claude or Gemini leaves it out of the request instead of sending it as a thinking block or a thought signature, as earlier versions did. See [Reasoning parts](/docs/core/messages#reasoning-parts).
+
 ## Hosted web search (Responses)
 
 `openaiWebSearch()` adds OpenAI's provider-executed web search; citations stream back as canonical `source` parts.

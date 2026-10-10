@@ -202,8 +202,8 @@ Both may be consumed at the same time — see [Multiple consumers](#multiple-con
 
 | `type` | Shape | Emitted |
 | --- | --- | --- |
-| `text-delta` | `{ text }` | Assistant text fragment. |
-| `reasoning-delta` | `{ text, signature?, encrypted? }` | Extended-thinking / reasoning fragment. When `encrypted` is true, `text` is an opaque payload (OpenAI Responses) — do **not** render it as thinking text. |
+| `text-delta` | `{ text, providerMetadata? }` | Assistant text fragment. `providerMetadata` (2.3) carries round-trip data such as a Gemini text part's `thoughtSignature`. |
+| `reasoning-delta` | `{ text, signature?, encrypted?, id?, redacted?, source? }` | Extended-thinking / reasoning fragment of one block: deltas sharing an `id` (2.3) build one block, a new `id` opens the next. When `encrypted` or `redacted` is true, `text` is an opaque payload (an OpenAI encrypted item, an Anthropic redacted thinking block) — do **not** render it as thinking text. `source` (2.3) is the provider family that produced it. See [Reasoning parts](/docs/core/messages#reasoning-parts). |
 | `tool-call-delta` | `{ id, name?, argsTextDelta, providerMetadata? }` | Raw tool-args JSON fragment — accumulate as a string, parse once at block end. For live "the agent is typing arguments" UIs. |
 | `source` | `{ id, url?, title? }` | Citation / grounding source from a provider-executed search. |
 | `finish` | `{ usage, finishReason }` | Terminal part. In a loop, usage is summed across all steps. |

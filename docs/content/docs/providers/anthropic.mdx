@@ -86,7 +86,7 @@ For a one-shot, buffered call use [generateText](/docs/core/generate-text) inste
 
 Set `effort` to control Claude's thinking depth. The wire depends on the model generation (`effortWire` in the registry):
 
-- **Opus 4.7+, Sonnet 5, Fable 5** (`effortWire: 'output_config'`): the adapter sends `output_config.effort` with your level verbatim (`'low' | 'medium' | 'high' | 'xhigh' | 'max'`). Manual `thinking.budget_tokens` returns HTTP 400 on these models, so the adapter never sends a `thinking` block. Adaptive thinking is always available; omitting `effort` leaves the model default.
+- **Opus 4.7+, Sonnet 5, Fable 5** (`effortWire: 'output_config'`): the adapter sends `output_config.effort` with your level verbatim (`'low' | 'medium' | 'high' | 'xhigh' | 'max'`). Manual `thinking.budget_tokens` returns HTTP 400 on these models, so the adapter never sends it; a `thinking` field appears only as `{ type: 'adaptive' }` carrying the [block binding](#thinking-blocks-and-block-binding) when a request replays thinking to a Claude 5.x model. Adaptive thinking is always available; omitting `effort` leaves the model default.
 - **Opus 4.6 and older** (`effortWire: 'budget_tokens'`): the canonical level maps to a `thinking.budget_tokens` value:
 
 | `effort` | `budget_tokens` |
@@ -97,7 +97,7 @@ Set `effort` to control Claude's thinking depth. The wire depends on the model g
 | `'high'` | 24,000 |
 | `'xhigh'` / `'max'` | 48,000 |
 
-On the legacy wire, `max_tokens` is automatically raised to at least `budget_tokens + 1024`, and `temperature`/`topP` are **not** sent (Anthropic requires them unset with thinking enabled). Thinking text streams as `reasoning-delta` parts on `fullStream`; a trailing `reasoning-delta` carries the block `signature`. Thinking tokens bill inside `outputTokens`; since May 2026 the API also breaks them out, so `usage.reasoningTokens` reports the `output_tokens_details.thinking_tokens` count (0 on older models).
+On the legacy wire, `max_tokens` is automatically raised to at least `budget_tokens + 1024`, and `temperature`/`topP` are **not** sent (Anthropic requires them unset with thinking enabled). Thinking text streams as `reasoning-delta` parts on `fullStream`, each carrying its block's `id` and `source: 'anthropic'`; the block's last `reasoning-delta` carries its `signature`. Thinking tokens bill inside `outputTokens`; since May 2026 the API also breaks them out, so `usage.reasoningTokens` reports the `output_tokens_details.thinking_tokens` count (0 on older models).
 
 ```ts title="thinking.ts"
 import { streamChat } from '@deuz-sdk/core';
@@ -122,6 +122,58 @@ for await (const part of result.fullStream) {
 ```
 
 The `signature` round-trips automatically inside the agentic loop — preserve any `reasoning` part you persist, or follow-up tool turns will be rejected.
+
+## Thinking blocks and block binding
+
+Since 2.3 every block Claude sends is its own `reasoning` part, replayed unchanged and in its original place on the next request, in `generateText`, `streamChat`, native runs and [`useChat`](/docs/modules/react-hooks):
+
+- A thinking block with empty text and a `signature` is kept. Claude 5.x models default to `display: 'omitted'`, which streams only the signature.
+- Consecutive thinking blocks stay separate parts, each with its own signature, and a `redacted_thinking` block is a part with `redacted: true` whose `text` is the opaque `data`.
+- Thinking between two tool calls stays between them; the adapter no longer moves thinking to the front of the message.
+- Only Claude's own blocks are sent. Reasoning from another provider (an OpenAI encrypted item, a Gemini thought) and a thinking block without a signature are left out of the request. See [Reasoning parts](/docs/core/messages#reasoning-parts).
+
+Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind each thinking block's signature to the conversation before it. On accounts opened from 2026-08-31 a replayed block whose prefix changed (an edited earlier message, a rewritten system prompt) fails the whole request with HTTP 400. Until every Deuz path keeps that prefix stable, a request that sends thinking back to one of these models, or to an unknown `claude-{fable,opus,sonnet,haiku}-5…` id, carries:
+
+```json
+{
+  "thinking": {
+    "type": "adaptive",
+    "block_binding": { "prefix_mismatch_behavior": "drop_block" }
+  }
+}
+```
+
+with the header `anthropic-beta: thinking-binding-controls-2026-08-01` (added to any `anthropic-beta` list you pass in `headers`). A mismatched block is then dropped and the request proceeds. A request without replayed thinking, an older model, or `effort: 'none'` (thinking `disabled` or `between_tools`, which carry no binding) is sent as before.
+
+`providerOptions.anthropic.thinking.block_binding` overrides the default: an object is sent as given, `null` sends none. The rest of your `providerOptions.anthropic.thinking` (for example `display`) is kept next to the binding.
+
+```ts title="block-binding.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+const result = streamChat({
+  model: anthropic('claude-opus-5-5'),
+  messages, // an earlier assistant turn carries thinking blocks
+  // Fail with 400 on a changed prefix instead of dropping the block:
+  providerOptions: {
+    anthropic: {
+      thinking: { type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'error' } },
+    },
+  },
+});
+
+for await (const part of result.fullStream) {
+  if (part.type === 'warning' && part.warning.setting === 'thinking.block_binding') {
+    console.warn(part.warning.message); // what the API changed in the request
+  }
+}
+```
+
+The response's `input_transformations` report (blocks the API removed, and blocks that failed the check but were shown anyway) rides the finish part as `providerMetadata.anthropic.input_transformations` and surfaces as one warning with `type: 'other'` and `setting: 'thinking.block_binding'`, on the stream and on the loops' `warnings`. A single `streamChat` without tools reports it as the `warning` part only.
+
+The binding controls follow the beta types of `@anthropic-ai/sdk` 0.133.0 and Anthropic's API reference (cached 2026-10-06); they are not live-verified.
 
 ## Vision
 
@@ -266,11 +318,11 @@ Notable mappings:
 
 - System messages are hoisted into the top-level `system` field.
 - `tool` role messages are sent as `user` turns containing `tool_result` blocks.
-- `reasoning` parts are ordered first in each content array (Anthropic requires thinking blocks before other content) and serialized as `thinking` / `redacted_thinking` blocks.
+- `reasoning` parts keep their place in each content array and are serialized as `thinking` / `redacted_thinking` blocks; only Claude's own signed blocks are sent (since 2.3).
 
 ### Streaming tool-call accumulation
 
-Claude emits a `content_block_start` for each `tool_use` block (carrying the tool `id` and `name`), then a sequence of `input_json_delta` events whose `partial_json` fragments are the argument JSON. The adapter slots each fragment by block `index`, emits canonical `tool-call-delta` parts as strings, and parses the accumulated JSON once at block end. Text streams via `text_delta`, thinking via `thinking_delta`, and the block signature via `signature_delta`.
+Claude emits a `content_block_start` for each `tool_use` block (carrying the tool `id` and `name`), then a sequence of `input_json_delta` events whose `partial_json` fragments are the argument JSON. The adapter slots each fragment by block `index`, emits canonical `tool-call-delta` parts as strings, and parses the accumulated JSON once at block end. Text streams via `text_delta`, thinking via `thinking_delta`, and the block signature via `signature_delta`; a `redacted_thinking` block arrives complete in its `content_block_start`. Each reasoning delta carries its block's `index` as its `id`, so consecutive blocks stay apart.
 
 ### Claude on Vertex AI
 

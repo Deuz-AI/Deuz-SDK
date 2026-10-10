@@ -79,7 +79,7 @@ It is not re-adopted when the prop changes: apps pass an inline array literal, s
 The hook keeps **two** views of the conversation and publishes them in a **single** state commit, so no render can ever see one a frame behind the other:
 
 - `messages` — the render-friendly `UIMessage[]` (accumulated `content`, `reasoning`, `toolCalls` with live `state`, and ordered `parts`).
-- `history.canonical` — the canonical `Message[]` it POSTs, reconstructing each assistant `tool_use` turn from the streamed `tool-call` parts.
+- `history.canonical` — the canonical `Message[]` it POSTs, reconstructing each assistant turn from the streamed parts in arrival order. Since 2.3 that includes every reasoning block, unchanged and in place, so a Claude, Gemini or OpenAI tool loop continues with its reasoning (see [Reasoning parts](/docs/core/messages#reasoning-parts)).
 
 `history` exposes the pair the hook already holds, so **persisting a chat should persist `history.canonical`** rather than round-tripping through the lossy `canonicalFromUI`. Its identity is stable until a view changes. History is immutable — new arrays on every update.
 
@@ -110,8 +110,8 @@ export function Turn({ message }: { message: UIMessage }) {
           case 'text':
             return <Prose key={i} text={part.text} streaming={part.state === 'streaming'} />;
           case 'reasoning':
-            // `encrypted` text is an opaque provider payload, not thinking text.
-            return part.encrypted ? null : <Thinking key={i} text={part.text} />;
+            // `encrypted` / `redacted` text is an opaque provider payload, not thinking text.
+            return part.encrypted || part.redacted ? null : <Thinking key={i} text={part.text} />;
           case 'tool': {
             const call = byId(message.toolCalls, part.toolCallId);
             return call ? <ToolCard key={i} call={call} /> : null;
@@ -135,7 +135,7 @@ Rules that are easy to get wrong:
 
 - **`parts` is optional and absent until the first element exists.** `createAssistantTurn`'s shape is public surface, and a `UIMessage` restored from pre-1.9 storage legitimately has none. Render `parts` when present, the buckets otherwise.
 - **`step-start` is normally `parts[0]`** of a real streamed turn, because the streaming loop pushes one at the top of every iteration. A renderer without a case for it will hit its `default` on the very first element.
-- **Skip `reasoning` parts flagged `encrypted`** — the text is an opaque encrypted provider payload (OpenAI Responses), not display text. `redacted` marks a provider-redacted thinking block. Neither flag can appear on a *streamed* turn (the wire's `reasoning-delta` carries no such field); they arrive on history projected by `uiFromMessages`.
+- **Skip `reasoning` parts flagged `encrypted` or `redacted`** — the text is an opaque provider payload (an OpenAI encrypted item, an Anthropic redacted thinking block), not display text. Since 2.3 both flags arrive on a *streamed* turn too, and each model block is its own part (a thinking block can have empty text when the model omits its thinking display). The `reasoning` bucket holds the readable text only.
 - **A `tool` element carries only `{ type, toolCallId }`** — a reference into `toolCalls`, not a copy, because a call's state mutates over the turn's life and two copies would drift.
 - **A `file` element carries the canonical value verbatim.** `url` is set only when `data` is already a renderable `data:` / `http(s):` src; for bytes, build one yourself. See [Files](/docs/core/files).
 - **A `citation` element is the same object** already pushed into `turn.citations` — one object, no drift.
