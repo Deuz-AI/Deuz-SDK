@@ -6,6 +6,7 @@ import { createSqliteOpsStore } from '../src/node/ops-sqlite';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import { leaseProviderContracts } from './fixtures/lease-provider-conformance';
 import {
+  agentRunListContracts,
   agentRunPruneContracts,
   agentRunStoreContracts,
   envelope,
@@ -51,6 +52,13 @@ describe.skipIf(!DatabaseSync)('SQLite ops store', () => {
     const ops = createSqliteOpsStore({ path: ':memory:', clock });
     cleanup.push(() => ops.close());
     return { store: ops.agentRuns, advance, now: () => clock.now() };
+  });
+
+  agentRunListContracts('SQLite agent run listing', async () => {
+    const { clock, advance } = manualClock();
+    const ops = createSqliteOpsStore({ path: ':memory:', clock });
+    cleanup.push(() => ops.close());
+    return { store: ops.agentRuns, advance, now: () => clock.now(), frozen: true };
   });
 
   it('keeps two connections on one file consistent', async () => {

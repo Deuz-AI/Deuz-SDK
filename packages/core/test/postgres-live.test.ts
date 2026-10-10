@@ -24,6 +24,7 @@ import { SwarmConflictError } from '../src/swarm';
 import type { SwarmStore } from '../src/types/swarm';
 import { leaseProviderContracts } from './fixtures/lease-provider-conformance';
 import {
+  agentRunListContracts,
   agentRunPruneContracts,
   agentRunStoreContracts,
 } from './fixtures/agent-run-store-conformance';
@@ -141,6 +142,13 @@ describe.skipIf(!url)('Postgres stores on a live server (REPEATABLE READ, pooled
     store: (await freshOps()).agentRuns,
     advance: wait,
     now,
+  }));
+  agentRunListContracts('agent run listing', async () => ({
+    store: (await freshOps()).agentRuns,
+    advance: wait,
+    now,
+    // `now` estimates the database clock across a network round trip.
+    slack: 25,
   }));
   scheduleClaimContracts('claim', async () => (await freshOps()).claims);
   scheduleClaimPruneContracts('claim retention', async () => ({

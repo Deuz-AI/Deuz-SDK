@@ -14,6 +14,7 @@ import type { Tool, ToolApprovalRequest, ToolCall, ToolExecuteContext } from './
 import type { BudgetTotals, ExecutionContextSnapshot, NativeExecutionContext } from './execution';
 import type { FinishReason } from './usage';
 import type { StopDetails } from './methods';
+import type { LeaseProvider } from './lease';
 
 /** A validator returns its validated (possibly transformed) value or throws. */
 export type AgentValidator<T> = (value: unknown) => T | Promise<T>;
@@ -223,6 +224,64 @@ export interface AgentRunStore {
    * stores (2.2) reject an envelope whose revision is not the stored one plus one.
    */
   save(envelope: AgentRunEnvelope): void | Promise<void>;
+  /**
+   * Native run discovery (2.3): a page of the stored runs, newest change first
+   * (last save descending, then run ID descending), summarised without their
+   * transcripts. Pass a page's `cursor` back for the next one. Optional: the
+   * memory, SQLite and Postgres stores have it. Rejects a malformed query
+   * with a TypeError.
+   */
+  list?(query?: AgentRunListQuery): Promise<AgentRunListPage>;
+}
+
+/** Where a native run stands, as its envelope records it (2.3 names the union). */
+export type AgentRunPhase = AgentRunEnvelope['phase'];
+
+/** Which runs `AgentRunStore.list` returns (2.3). Every filter is optional. */
+export interface AgentRunListQuery {
+  /** Only runs in one of these phases; an empty list matches none. */
+  phases?: readonly AgentRunPhase[];
+  /**
+   * Only runs last saved before this time: epoch ms on the store's clock (the
+   * injected clock for the memory and SQLite stores, the database clock for
+   * Postgres). Stale-run discovery passes `now - staleMs`.
+   */
+  updatedBefore?: number;
+  /** Only this scope's runs. */
+  scope?: string;
+  /** The most runs per page, 1..1000. Default 100. */
+  limit?: number;
+  /** The `cursor` of the previous page: only runs after it in the order. */
+  cursor?: string;
+}
+
+/** One run in a listing (2.3): what a supervisor needs without loading its transcript. */
+export interface AgentRunSummary {
+  runId: string;
+  scope: string;
+  phase: AgentRunPhase;
+  /** The envelope's revision; 0 for an envelope written by 2.1. */
+  revision: number;
+  /** Epoch ms of the run's last save, on the store's clock. */
+  updatedAt: number;
+  /**
+   * The status of the result the envelope records: `'suspended'` for a run
+   * waiting on approvals or client results (its phase stays `'running'`), the
+   * outcome of a terminal run. Absent while the run is in progress.
+   */
+  status?: AgentResult['status'];
+}
+
+/** A page of runs (2.3). */
+export interface AgentRunListPage {
+  runs: AgentRunSummary[];
+  /**
+   * Present when more runs follow: pass it as `cursor`. Opaque, and only
+   * meaningful to the store that made it. A run saved while you page moves
+   * ahead of the cursor, so a traversal never repeats a run but can miss one
+   * that was saved meanwhile.
+   */
+  cursor?: string;
 }
 
 export interface AgentRunSession {
@@ -230,6 +289,19 @@ export interface AgentRunSession {
   runId: string;
   /** Application-selected tenant/workflow scope, checked on every resume. */
   scope: string;
+}
+
+/**
+ * A native run's cross-process claim (2.3), like `createSwarm`'s `lease`: the
+ * executor holds the run's lease while it drives the run and renews it every
+ * `ttlMs / 3` on `deps.clock`.
+ */
+export interface AgentRunLeaseOptions {
+  provider: LeaseProvider;
+  /** This process's identity; defaults to a generated ID per run. */
+  owner?: string;
+  /** An integer of at least 3. Default 30 000. */
+  ttlMs?: number;
 }
 
 export type AgentRunOptions<T = string> = Omit<
@@ -256,6 +328,17 @@ export type AgentRunOptions<T = string> = Omit<
   mcp?: AgentMcpEntry[];
   toolsContext?: Record<string, unknown>;
   session?: AgentRunSession;
+  /**
+   * Claim the session's run through a `LeaseProvider` (2.3), so two processes
+   * never drive it at once. Its key is `agentRunLeaseKey(session)` from
+   * `@deuz-sdk/core/ops`. While another executor holds it, the run fails with
+   * code `'lease_held'` before reading or writing anything; an executor that
+   * loses it stops writing and fails with `'lease_lost'`, leaving the run as
+   * its last save had it for the next executor. A `'cancel'` signalled to the
+   * key stops the run with reason `'cancelled'`, and is acknowledged once that
+   * is saved. Requires `session`.
+   */
+  lease?: AgentRunLeaseOptions;
   output?: AgentOutput<T>;
   /** Bump when changing tool implementation or verifier semantics for a durable run. */
   bindingId?: string;

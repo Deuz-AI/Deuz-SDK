@@ -20,7 +20,7 @@ Two mechanisms keep this safe:
 
 | Entry | Contents | Runtime |
 | --- | --- | --- |
-| `@deuz-sdk/core/ops` | `createInMemoryLeaseProvider`, lease types | Edge-safe |
+| `@deuz-sdk/core/ops` | `createInMemoryLeaseProvider`, lease types, `findStaleAgentRuns`, `agentRunLeaseKey` | Edge-safe |
 | `@deuz-sdk/core/ops/sqlite` | `createSqliteOpsStore`: leases, agent runs and schedule claims | Node |
 | `@deuz-sdk/core/ops/postgres` | `createPostgresOpsStore`: leases, agent runs and schedule claims | Node |
 | `@deuz-sdk/core/swarm/postgres` | `createPostgresSwarmStore` | Node |
@@ -467,8 +467,190 @@ try {
 }
 ```
 
-Native runs have no lease of their own: the revision check already stops a
-second executor from overwriting the first. Swarm tasks keep their agent state
+The revision check stops a second executor from overwriting the first, but not
+from running: both may still call the model and tools until one save fails.
+Since 2.3 the `lease` option keeps a second process from driving the run at
+all; see [below](#leasing-a-native-run). Swarm tasks keep their agent state
 inside the swarm run, which the swarm's lease and revision protect. Terminal
 runs stay in the store until `agentRuns.prune` removes them; see
 [Retention](#retention).
+
+## Listing, leasing and cancelling native runs
+
+Since 2.3 a native run can be listed, found when its executor died, held by one
+process at a time, and cancelled from another process.
+
+### Listing native runs
+
+`agentRuns.list({ phases?, updatedBefore?, scope?, limit?, cursor? })` returns
+a page of runs, newest save first (then run ID, descending), as summaries
+without their transcripts. The memory store (`createInMemoryAgentRunStore`),
+and the SQLite and Postgres `agentRuns` have it; on SQLite and Postgres it pages
+by the `deuz_agent_runs_updated_at` index. `AgentRunStore.list` is optional, so
+a store of your own may leave it out.
+
+| Summary field | Meaning |
+| --- | --- |
+| `runId`, `scope` | The run |
+| `phase` | `'running'`, `'finalizing'` or `'terminal'`, as the envelope records it |
+| `revision` | The envelope's revision; 0 for an envelope written by 2.1 |
+| `updatedAt` | When the run was last saved, epoch ms on the store's clock: the injected clock for memory and SQLite, the database clock for Postgres |
+| `status` | The stored result's status: `'suspended'` for a run waiting on approvals or client results (its phase stays `'running'`), the outcome of a terminal run; absent while the run is in progress |
+
+`phases` keeps runs in those phases (an empty list keeps none), `updatedBefore`
+those last saved before a time, and `scope` one scope's. `limit` is 1 to 1000,
+default 100. A page carries a `cursor` only while more runs follow; pass it back
+for the next page. A run saved while you page moves ahead of the cursor, so a
+traversal never returns a run twice, but can miss one saved meanwhile. A
+malformed query rejects with a `TypeError`.
+
+A store of your own that implements `list` keeps the same contract: it records
+the time of each save on its own clock, reads `phase` and `status` from the
+saved envelope (`phase`, and `result.status` when there is a result), orders by
+that time and then run ID, both descending, and treats its cursor as its own
+opaque string naming the last run returned.
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+
+const ops = createSqliteOpsStore({ path: ':memory:' });
+try {
+  for (const runId of ['a', 'b', 'c'])
+    await runAgent({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      prompt: 'Work.',
+      session: { store: ops.agentRuns, runId, scope: 'tenant-a' },
+    });
+  let cursor: string | undefined;
+  do {
+    const page = await ops.agentRuns.list({ phases: ['terminal'], limit: 2, cursor });
+    for (const run of page.runs) console.log(run.runId, run.status); // c completed, b completed, a completed
+    cursor = page.cursor;
+  } while (cursor);
+} finally {
+  await ops.close();
+}
+```
+
+### Finding runs that lost their executor
+
+`findStaleAgentRuns(store, { staleMs?, scope?, includeSuspended?, limit?, clock? })`
+from `@deuz-sdk/core/ops` returns the runs still running or finalizing whose
+last save is more than `staleMs` (default 60 000) before the clock's time,
+newest change first, up to `limit` (1 to 1000, default 100). Suspended runs
+wait for a person rather than an executor, so they are left out unless
+`includeSuspended` is set. It needs a store with `list`, rejects one without,
+and examines at most 10 000 runs per call.
+
+A native run saves at every step, not on a heartbeat: a run in a long tool call
+or model turn looks stale too. Resume what it finds with the `lease` option, so
+a run whose executor is alive is refused instead of driven twice:
+
+```ts
+import { resumeAgent } from '@deuz-sdk/core/agent';
+import { findStaleAgentRuns } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+
+const ops = createSqliteOpsStore({ path: './runs.sqlite' });
+try {
+  for (const run of await findStaleAgentRuns(ops.agentRuns, { staleMs: 5 * 60_000 })) {
+    const result = await resumeAgent({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      session: { store: ops.agentRuns, runId: run.runId, scope: run.scope },
+      lease: { provider: ops.leases, owner: 'worker-1' },
+    });
+    if (result.status === 'failed' && result.error.code === 'lease_held') continue; // still alive
+    console.log(run.runId, result.status);
+  }
+} finally {
+  await ops.close();
+}
+```
+
+### Leasing a native run
+
+`runAgent`, `streamAgent`, `resumeAgent` and `resumeStreamAgent` take
+`lease: { provider, owner?, ttlMs? }`, like `createSwarm`. It requires a
+`session`. The executor acquires the run's key,
+`agentRunLeaseKey({ scope, runId })` (`agent:["<scope>","<runId>"]`), before it
+reads the run, renews it every `ttlMs / 3` (default 30 000) on `deps.clock`, and
+releases it when the run returns, whatever the outcome. `owner` defaults to a
+generated ID per run.
+
+- While another executor holds the key, the run fails at once with an error
+  named `AgentRunLeaseError`, code `'lease_held'`. Nothing is read, written or
+  sent to a model.
+- An executor whose renewal reports the lease gone aborts the run and writes
+  nothing more. Its result fails with code `'lease_lost'`; the stored run stays
+  as its last save left it, for the next executor.
+- A renewal that throws, for example during a database outage, counts as lost
+  only once the lease could have expired.
+- The revision check stays the fence: a paused executor whose lease lapsed
+  cannot overwrite a newer save.
+
+### Cancelling a native run from another process
+
+`leases.signal(agentRunLeaseKey({ scope, runId }), 'cancel')` reaches the
+executor that holds the run and returns `true`. At its next renewal the
+executor aborts the run, which stops with reason `'cancelled'`. With a provider
+that has `ack`, as the memory, SQLite and Postgres providers do, the executor
+renews with acknowledged delivery: the cancel stays queued until the stopped run
+is saved, and only then is it acknowledged. An executor that dies in between, or
+cannot save the run, leaves the cancel for the next one. With a provider without
+`ack`, a delivered cancel the run could not save is queued again before the
+lease is released.
+
+When an executor claims a run, a cancel still queued under its key applies
+before any model call: a resumed run that has not ended stops as
+`'cancelled'`. A new run starts clean of a cancel queued for its run ID before
+it existed, and a run that already ended keeps its result. A resume that stops
+before it takes the run up, for pending approvals or a tool call to reconcile,
+leaves the cancel queued until a resume does.
+
+`signal` returns `false` when no executor holds the run, for example a suspended
+run, and queues nothing. Native runs ignore a `'drain'` signal.
+
+```ts
+import { createInMemoryAgentRunStore, runAgent } from '@deuz-sdk/core/agent';
+import { agentRunLeaseKey, createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const leases = createInMemoryLeaseProvider();
+const store = createInMemoryAgentRunStore();
+const session = { store, runId: 'report', scope: 'tenant-a' };
+
+let started!: () => void;
+const working = new Promise<void>((resolve) => (started = resolve));
+const run = runAgent({
+  model: createMockModel({
+    responses: [{ toolCalls: [{ toolName: 'crunch', args: {} }] }, { text: 'done' }],
+  }),
+  prompt: 'Crunch the numbers.',
+  tools: {
+    crunch: {
+      description: 'Takes a while.',
+      parameters: { type: 'object', properties: {} },
+      execute: (_args, { signal }) =>
+        new Promise((resolve, reject) => {
+          started();
+          const timer = setTimeout(() => resolve('crunched'), 60_000);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(new Error('cancelled'));
+          });
+        }),
+    },
+  },
+  session,
+  lease: { provider: leases, ttlMs: 300 },
+});
+
+await working;
+// Elsewhere, another process with the same lease provider:
+console.log(await leases.signal(agentRunLeaseKey(session), 'cancel')); // true
+const result = await run;
+console.log(result.status, result.status === 'stopped' && result.reason); // stopped cancelled
+```

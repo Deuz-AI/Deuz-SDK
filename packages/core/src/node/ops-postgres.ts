@@ -6,10 +6,16 @@
  * process shares; host clocks never decide who holds a lease. Node-only.
  */
 import type { PgClientLike } from './store-postgres';
-import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
+import type {
+  AgentRunEnvelope,
+  AgentRunListPage,
+  AgentRunListQuery,
+  AgentRunStore,
+} from '../types/agent-run';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/lease';
 import { assertLeaseRequest } from '../internal/ops-validate';
 import { assertRetentionTime } from '../internal/ops-retention';
+import { agentRunListPage, planAgentRunList, summarizeAgentRun } from '../internal/agent-run-list';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 import { postgresSchemaName } from './swarm-postgres';
 import {
@@ -42,6 +48,11 @@ export interface PostgresOpsStore {
      * no longer be resumed or inspected, and its ID is free again.
      */
     prune(before: number): Promise<number>;
+    /**
+     * Native run discovery (2.3): a page of runs, newest save first, by the
+     * `deuz_agent_runs_updated_at` index. Times are on the database clock.
+     */
+    list(query?: AgentRunListQuery): Promise<AgentRunListPage>;
   };
   /**
    * A durable claim for `createScheduler({ claim })` and `handleSignal({ dedupe })`:
@@ -68,6 +79,16 @@ const SIGNALS: readonly LeaseSignal[] = ['cancel', 'drain'];
 const NOW = `(extract(epoch from clock_timestamp()) * 1000)::bigint`;
 const encoder = new TextEncoder();
 const BACKSLASH = String.fromCharCode(92);
+/**
+ * `regexp_replace` arguments that read every \uXXXX escape of a stored payload
+ * as a space (see the agent runs' prune). As SQL text, the pattern is a
+ * backslash (escaped for the regex) then u and four hex digits; the
+ * replacement, a backslash (escaped likewise) then u0020.
+ */
+const UNICODE_ESCAPES = [
+  `${BACKSLASH}${BACKSLASH}u[0-9A-Fa-f]{4}`,
+  `${BACKSLASH}${BACKSLASH}u0020`,
+];
 
 /**
  * The key a claim row stores: the key itself, or `sha256:` and the hex SHA-256
@@ -277,10 +298,60 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
         `updated_at < $1::bigint
           AND (regexp_replace(payload, $2, $3, 'g')::json ->> 'phase') = 'terminal'`,
         before,
-        // As SQL text, the pattern is a backslash (escaped for the regex) then u and
-        // four hex digits; the replacement, a backslash (escaped likewise) then u0020.
-        [`${BACKSLASH}${BACKSLASH}u[0-9A-Fa-f]{4}`, `${BACKSLASH}${BACKSLASH}u0020`],
+        UNICODE_ESCAPES,
       ),
+    // Native run discovery (2.3). The phase and the result's status are read
+    // from the payload as prune reads the phase; the time and order come from
+    // the columns, so the updated_at index serves the scan. Run IDs compare
+    // under the "C" collation, the same in the order and in the cursor.
+    async list(listing) {
+      const plan = planAgentRunList(listing);
+      if (plan.phases?.length === 0) return { runs: [] };
+      const params: unknown[] = [...UNICODE_ESCAPES];
+      const bind = (value: unknown): string => {
+        params.push(value);
+        return `$${params.length}`;
+      };
+      const where: string[] = [];
+      if (plan.scope !== undefined) where.push(`r.scope = ${bind(plan.scope)}`);
+      if (plan.updatedBefore !== undefined)
+        where.push(`r.updated_at < ${bind(bigintCutoff(plan.updatedBefore))}::bigint`);
+      if (plan.after !== undefined) {
+        const at = bind(plan.after.updatedAt);
+        where.push(
+          `(r.updated_at < ${at}::bigint OR (r.updated_at = ${at}::bigint
+            AND r.run_id COLLATE "C" < ${bind(plan.after.runId)}))`,
+        );
+      }
+      if (plan.phases !== undefined)
+        where.push(
+          `(d.doc ->> 'phase') IN (${plan.phases.map((phase) => bind(phase)).join(', ')})`,
+        );
+      await use();
+      const rows = await query(
+        `SELECT r.run_id, r.scope, r.revision, r.updated_at,
+          d.doc ->> 'phase' AS phase, d.doc -> 'result' ->> 'status' AS status
+        FROM ${runsTable} r
+        CROSS JOIN LATERAL (SELECT regexp_replace(r.payload, $1, $2, 'g')::json AS doc) d
+        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+        ORDER BY r.updated_at DESC, r.run_id COLLATE "C" DESC
+        LIMIT ${bind(plan.limit + 1)}`,
+        params,
+      );
+      return agentRunListPage(
+        rows.map((row) =>
+          summarizeAgentRun({
+            runId: String(row.run_id),
+            scope: String(row.scope),
+            revision: row.revision,
+            updatedAt: row.updated_at,
+            phase: row.phase,
+            status: row.status,
+          }),
+        ),
+        plan.limit,
+      );
+    },
   };
 
   const claims: PostgresOpsStore['claims'] = Object.assign(
