@@ -200,6 +200,9 @@ async function prepareToolSet(
                 toolName: name,
                 input: args,
                 stage: 'executing',
+                // Recorded so a resume judges this call by this tool (2.3), not
+                // by a namesake: a handoff target's tool can share a root name.
+                idempotent: tool.replay === 'idempotent',
               });
               if (ctx.execution)
                 assertExecutionPolicy(ctx.execution, {

@@ -19,7 +19,12 @@ import { createMockModel, type MockResponse } from '../src/testing';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import { ExecutionPersistenceError } from '../src/internal/execution-error';
 import { resolveDependencies } from '../src/internal/resolve-deps';
-import type { AgentEvent, AgentToolReceipt } from '../src/types/agent-run';
+import type {
+  AgentEvent,
+  AgentRunStore,
+  AgentToolReceipt,
+  AgentToolSet,
+} from '../src/types/agent-run';
 import type { LanguageModel } from '../src/types/model';
 import type { Message } from '../src/types/message';
 
@@ -284,5 +289,102 @@ describe('native resume binding of handoff targets', () => {
     });
     expect(executed).toEqual(['v1']);
     expect((await store.load('target-adopt'))?.binding?.handoffs).toBe(saved.binding?.handoffs);
+  });
+});
+
+// A resume judges an interrupted call by the replay policy of the tool that
+// ran it. After a handoff that can be a target's own tool sharing its name with
+// a root tool, so a lookup by name judged the wrong tool.
+describe('reconciliation of interrupted handoff-target calls', () => {
+  const transferCall = { toolCalls: [{ toolName: 'transfer_to_billing', id: 'h1', args: {} }] };
+
+  /** Fails the first save after the effect happened: the receipt stays `executing`. */
+  function failingAfterEffect(inner: AgentRunStore, effects: string[]): AgentRunStore {
+    let thrown = false;
+    return {
+      load: (id) => inner.load(id),
+      save(envelope) {
+        if (effects.length > 0 && !thrown) {
+          thrown = true;
+          throw new Error('store down right after the effect');
+        }
+        return inner.save(envelope);
+      },
+    };
+  }
+
+  it('stops a target tool whose idempotent root namesake shares its name', async () => {
+    const effects: string[] = [];
+    const triage = counted('triage-model', [transferCall]);
+    const billing = counted('billing-model', [
+      { toolCalls: [{ toolName: 'lookup', id: 'l1', args: {} }] },
+      { text: 'done' },
+    ]);
+    const tools: AgentToolSet = {
+      ...handoff({
+        billing: {
+          model: billing.model,
+          tools: {
+            // The target's own implementation has an effect and is NOT idempotent.
+            lookup: {
+              parameters,
+              execute: () => {
+                effects.push('target-lookup');
+                return 'charged';
+              },
+            },
+          },
+        },
+      }),
+      // The root agent's read-only namesake is declared idempotent.
+      lookup: { parameters, replay: 'idempotent', execute: () => 'read' },
+    };
+    const inner = createInMemoryAgentRunStore();
+    const options = { model: triage.model, prompt: 'x', tools };
+    const store = failingAfterEffect(inner, effects);
+    const first = await runAgent({ ...options, session: { store, runId: 'collide', scope: 't' } });
+    expect(first.status).toBe('failed');
+    expect(Object.values((await inner.load('collide'))!.toolResults ?? {})).toEqual([
+      expect.objectContaining({ toolName: 'lookup', stage: 'executing', idempotent: false }),
+    ]);
+    const resumed = await resumeAgent({
+      ...options,
+      session: { store: inner, runId: 'collide', scope: 't' },
+    });
+    // 2.3-W1 let the call through the gate; the target's receipt then refused
+    // the replay as a fatal error, and the run was stored terminal `failed`.
+    expect(resumed).toMatchObject({ status: 'stopped', reason: 'tool-reconciliation-required' });
+    expect((await inner.load('collide'))?.phase).toBe('running');
+    expect(effects).toEqual(['target-lookup']);
+  });
+
+  it('replays an interrupted target tool declared idempotent', async () => {
+    const effects: string[] = [];
+    const triage = counted('triage-model', [transferCall]);
+    const billing = counted('billing-model', [
+      { toolCalls: [{ toolName: 'note', id: 'n1', args: {} }] },
+      { text: 'noted' },
+    ]);
+    const note = {
+      parameters,
+      replay: 'idempotent' as const,
+      execute: () => {
+        effects.push('note');
+        return 'noted';
+      },
+    };
+    const tools = handoff({ billing: { model: billing.model, tools: { note } } });
+    const inner = createInMemoryAgentRunStore();
+    const options = { model: triage.model, prompt: 'x', tools };
+    const store = failingAfterEffect(inner, effects);
+    const first = await runAgent({ ...options, session: { store, runId: 'replay', scope: 't' } });
+    expect(first.status).toBe('failed');
+    const resumed = await resumeAgent({
+      ...options,
+      session: { store: inner, runId: 'replay', scope: 't' },
+    });
+    // The gate looked the name up among the root tools only and stopped it.
+    expect(resumed).toMatchObject({ status: 'completed', output: 'noted' });
+    expect(effects).toEqual(['note', 'note']);
   });
 });

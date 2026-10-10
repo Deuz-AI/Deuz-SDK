@@ -645,7 +645,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const unreconciled = Object.values(envelope.toolResults ?? {}).filter(
         (receipt) =>
           receipt.stage === 'executing' &&
-          replayOf(receipt.toolName) !== 'idempotent' &&
+          // The policy the receipt recorded (2.3) is that of the tool that ran
+          // the call, a handoff target's own included. Older receipts have none.
+          !(receipt.idempotent ?? replayOf(receipt.toolName) === 'idempotent') &&
           !options.retryToolCallIds?.includes(receipt.toolCallId),
       );
       if (resume && unreconciled.length) {

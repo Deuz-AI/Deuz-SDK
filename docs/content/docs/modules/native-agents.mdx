@@ -201,9 +201,11 @@ checkpoint transaction.
 Some effects are safe to repeat because the tool writes under a key it derives
 from the call itself. Mark such a tool `replay: 'idempotent'` (2.2). An interrupted
 call of that tool runs again on resume without `retryToolCallIds`; plain tools
-still stop for reconciliation. Every native tool also receives `ctx.modelStep`,
-the root model turn that issued the call. Together with `ctx.toolCallId` it is
-stable across resume, so it can key the write:
+still stop for reconciliation. Since 2.3 each receipt records the flag of the tool
+that ran the call (`AgentToolReceipt.idempotent`), so a handoff target's own tool is
+judged by its own flag, never by a root tool of the same name. Every native tool
+also receives `ctx.modelStep`, the root model turn that issued the call. Together
+with `ctx.toolCallId` it is stable across resume, so it can key the write:
 
 ```ts
 import { runAgent } from '@deuz-sdk/core/agent';
