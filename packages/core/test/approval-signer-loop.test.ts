@@ -101,7 +101,9 @@ describe('approvalSigner loop wiring (1.7, D4)', () => {
       if (p.type === 'tool-approval-request') token = p.token;
     }
     expect(token).toBeDefined();
-    expect(await signer.verify(token!)).toMatchObject({ approvalId: 'toolu_1' });
+    expect(await signer.verify(token!)).toMatchObject({
+      approvalId: expect.stringMatching(/^toolu_1@[0-9a-f]{24}$/),
+    });
     expect(pay).not.toHaveBeenCalled();
 
     // Resume with the VALID token -> the tool executes.

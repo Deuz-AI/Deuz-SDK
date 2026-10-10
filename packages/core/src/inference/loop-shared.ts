@@ -256,18 +256,129 @@ export async function saveCheckpoint(
   }
 }
 
-/** Tag pending approvals with the loop's sub-agent path (root loops pass undefined). */
-export function toApprovalRequests(
+/**
+ * What an approval is bound to besides the call itself (2.3): the durable run,
+ * and the step it suspended at — the `stepIndex` of its suspended checkpoint.
+ * Both are absent on a call without a `session`: it has no run, and a chat UI
+ * folds each request's steps into one assistant turn, so no step survives the
+ * round trip. Such an approval binds the call id, the tool and the arguments.
+ */
+export interface ApprovalScope {
+  runId?: string;
+  step?: number;
+}
+
+/** Hex digits of the approval digest kept in an `approvalId` (96 bits). */
+const APPROVAL_DIGEST_HEX = 24;
+
+/** JSON with object keys sorted, so key order never changes an approval digest. */
+function canonicalJson(value: unknown): string {
+  const sorted = (item: unknown): unknown => {
+    const plain =
+      item !== null &&
+      typeof item === 'object' &&
+      typeof (item as { toJSON?: unknown }).toJSON === 'function'
+        ? (item as { toJSON(): unknown }).toJSON()
+        : item;
+    if (Array.isArray(plain)) return plain.map(sorted);
+    if (plain === null || typeof plain !== 'object') return plain;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(plain).sort()) {
+      out[key] = sorted((plain as Record<string, unknown>)[key]);
+    }
+    return out;
+  };
+  try {
+    return JSON.stringify(sorted(value)) ?? 'undefined';
+  } catch {
+    // Arguments come from JSON; only a guardrail's rewrite can be unserializable.
+    return String(value);
+  }
+}
+
+/**
+ * The `approvalId` a gated call is issued under (2.3): its tool call id, then a
+ * digest of everything the approval covers — the run, the step, the sub-agent
+ * path, the call id, the tool and the arguments. A verdict names it, so one kept
+ * from an earlier gate never approves what the model issues later under the same
+ * provider call id (`tool_0` again): another tool, other arguments, or the same
+ * call at another step.
+ */
+export async function approvalIdOf(
+  call: ToolCall,
+  agentPath: string[] | undefined,
+  scope: ApprovalScope,
+): Promise<string> {
+  const identity = JSON.stringify([
+    'deuz.approval.v1',
+    scope.runId ?? null,
+    scope.step ?? null,
+    agentPath ?? [],
+    call.toolCallId,
+    call.toolName,
+    canonicalJson(call.args),
+  ]);
+  const digest = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity)),
+  );
+  let hex = '';
+  for (const byte of digest.subarray(0, APPROVAL_DIGEST_HEX / 2)) {
+    hex += byte.toString(16).padStart(2, '0');
+  }
+  return `${call.toolCallId}@${hex}`;
+}
+
+/** Pending approvals, bound to their identity and tagged with the loop's sub-agent path. */
+export async function toApprovalRequests(
   calls: ToolCall[],
   agentPath: string[] | undefined,
-): ToolApprovalRequest[] {
-  return calls.map((c) => ({
-    approvalId: c.toolCallId,
-    toolCallId: c.toolCallId,
-    toolName: c.toolName,
-    input: c.args,
-    ...(agentPath && agentPath.length > 0 ? { agentPath } : {}),
-  }));
+  scope: ApprovalScope,
+): Promise<ToolApprovalRequest[]> {
+  return Promise.all(
+    calls.map(async (c) => ({
+      approvalId: await approvalIdOf(c, agentPath, scope),
+      toolCallId: c.toolCallId,
+      toolName: c.toolName,
+      input: c.args,
+      ...(agentPath && agentPath.length > 0 ? { agentPath } : {}),
+    })),
+  );
+}
+
+/**
+ * Whether `responses` hold a verdict for `request` (2.3): one naming its
+ * `approvalId`, or the 2.2 form, its bare tool call id, when that id occurs once
+ * in `messages`. The settle applies the same rule (`settleVerdicts`).
+ */
+export function answersApproval(
+  request: ToolApprovalRequest,
+  responses: readonly ToolApprovalResponse[] | undefined,
+  messages: Message[],
+): boolean {
+  if (!responses || responses.length === 0) return false;
+  if (responses.some((response) => response.approvalId === request.approvalId)) return true;
+  return (
+    responses.some((response) => response.approvalId === request.toolCallId) &&
+    !reusedToolCallIds(messages).has(request.toolCallId)
+  );
+}
+
+/**
+ * Tool call ids that occur more than once among the history's `tool_use` parts:
+ * a provider without call ids numbers each response's calls from `tool_0`.
+ */
+function reusedToolCallIds(messages: Message[]): Set<string> {
+  const seen = new Set<string>();
+  const reused = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== 'tool_use') continue;
+      if (seen.has(part.id)) reused.add(part.id);
+      seen.add(part.id);
+    }
+  }
+  return reused;
 }
 
 /**
@@ -1861,6 +1972,11 @@ export interface ToolDispatchPlan {
   gated: ReadonlySet<string>;
   /** A live step's calls waiting for a client verdict. Non-empty: the step suspends. */
   pendingApproval: ToolCall[];
+  /**
+   * The approval requests for {@link pendingApproval}, bound to their identity
+   * (unsigned: the loop signs them when it suspends).
+   */
+  requests: ToolApprovalRequest[];
   /** A live step's client tools waiting on the caller. Non-empty: the step suspends. */
   clientCalls: ToolCall[];
   /** The transfer verdict, when the batch held a transfer. */
@@ -1889,6 +2005,8 @@ export interface ToolDispatchInput {
    * gated calls go to `approveToolCall` or suspend the run.
    */
   verdicts?: readonly ToolApprovalResponse[];
+  /** What the batch's approvals are bound to besides the calls (see {@link ApprovalScope}). */
+  approval?: ApprovalScope;
   observe?: ExecuteExtras['observe'];
 }
 
@@ -1927,9 +2045,11 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
   const handoff =
     handoffCalls.length > 0 ? decideHandoff(handoffCalls, input.handoff?.active) : undefined;
 
+  const scope = input.approval ?? {};
   let denied: DenialMap;
   let gated: Set<string>;
   let pendingApproval: ToolCall[] = [];
+  let requests: ToolApprovalRequest[] = [];
   let clientCalls: ToolCall[] = [];
   if (settle) {
     ({ denied, gated } = await settleVerdicts(
@@ -1939,6 +2059,7 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
       options,
       messages,
       observe,
+      scope,
     ));
   } else {
     // A blocked call never reaches the approval gate: it already has a verdict,
@@ -1956,15 +2077,25 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
     pendingApproval = options.approveToolCall
       ? []
       : candidates.filter((c) => gated.has(c.toolCallId));
+    requests = await toApprovalRequests(pendingApproval, options.agentPath, scope);
     if (observe && gated.size > 0) {
       const gatedCalls = calls.filter((c) => gated.has(c.toolCallId));
+      const ids = new Map(requests.map((r) => [r.toolCallId, r.approvalId]));
+      for (const c of gatedCalls) {
+        if (!ids.has(c.toolCallId)) {
+          ids.set(c.toolCallId, await approvalIdOf(c, options.agentPath, scope));
+        }
+      }
       observeApprovalRequests(
         observe,
         options,
         gatedCalls,
         options.approveToolCall ? 'server' : 'client',
+        ids,
       );
-      if (options.approveToolCall) observeServerResolutions(observe, options, gatedCalls, denied);
+      if (options.approveToolCall) {
+        observeServerResolutions(observe, options, gatedCalls, denied, ids);
+      }
     }
     // Client tools a guardrail BLOCKED are not pending on anyone (see
     // pendingClientCalls): they fall through to `executeTools` instead.
@@ -1981,6 +2112,7 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
     guardrails: guarded.parts,
     gated,
     pendingApproval,
+    requests,
     clientCalls,
     ...(handoff ? { handoff } : {}),
   };
@@ -2014,6 +2146,12 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
  * A transfer is a decision, never an execution (`handoff.ts`'s `execute` throws
  * on purpose), so it is answered from {@link decideHandoff} and the accepted
  * swap is handed back for the caller to apply.
+ *
+ * `approval` (2.3) is the identity the suspended leg bound its requests to: a
+ * verdict counts only under the `approvalId` its call was issued with (see
+ * {@link approvalIdOf}). A durable leg that does not know its suspension step
+ * (a plain call carrying the run's `session`) reads it from the stored
+ * checkpoint.
  */
 export async function settlePendingApprovals(
   messages: Message[],
@@ -2025,6 +2163,7 @@ export async function settlePendingApprovals(
     beforeExecute?: (calls: ToolCall[], deniedIds: ReadonlySet<string>) => void;
   },
   handoff?: { active?: ActiveAgentState; tools: ToolSet },
+  approval?: ApprovalScope,
 ): Promise<{
   messages: Message[];
   results: ToolResult[];
@@ -2070,6 +2209,15 @@ export async function settlePendingApprovals(
     toolName: p.name,
     args: p.input,
   }));
+  let scope: ApprovalScope = approval ?? {};
+  if (scope.runId !== undefined && scope.step === undefined && options.session) {
+    try {
+      const saved = await options.session.store.load(scope.runId);
+      if (saved?.status === 'suspended') scope = { ...scope, step: saved.stepIndex };
+    } catch {
+      // Unreadable: no verdict can match a step-bound id, so gated calls deny.
+    }
+  }
   // The same plan a live step makes (transfers by decision, the re-derived
   // `onToolCall` guardrails, then the gate), here with the leg's verdicts.
   const plan = await planToolDispatch({
@@ -2079,6 +2227,7 @@ export async function settlePendingApprovals(
     messages,
     ...(handoff ? { handoff } : {}),
     verdicts: responses,
+    approval: scope,
     ...(extras?.observe ? { observe: extras.observe } : {}),
   });
 
@@ -2113,6 +2262,12 @@ export async function settlePendingApprovals(
  * denials. Approved calls run; denied ones get the verdict's reason; a gated call
  * with no verdict and a client tool with no result are denied (safe side).
  * Signed approvals must echo a token that verifies and is bound to this call.
+ *
+ * A verdict answers a call only under the `approvalId` the call was issued with
+ * (2.3, {@link approvalIdOf}). The 2.2 form, the bare tool call id, still answers
+ * a call whose id occurs once in the history (a run suspended before 2.3, or a
+ * client that built its verdicts from `toolCallId`); a reused id (`tool_0`) needs
+ * the bound one, because the bare id cannot say which of its calls it approves.
  */
 async function settleVerdicts(
   calls: ToolCall[],
@@ -2121,6 +2276,7 @@ async function settleVerdicts(
   options: CommonCallOptions,
   messages: Message[],
   ob: ExecuteExtras['observe'] | undefined,
+  scope: ApprovalScope,
 ): Promise<{ denied: DenialMap; gated: Set<string> }> {
   const signer = options.approvalSigner;
   const expectedRunId = options.session?.runId;
@@ -2160,14 +2316,27 @@ async function settleVerdicts(
       seen.add(response.approvalId);
     }
   }
-  const noVerdict = calls.filter((c) => !byId.has(c.toolCallId));
+  // Each call's verdict, under the id it was issued with (or the 2.2 form).
+  const reused = reusedToolCallIds(messages);
+  const matched = new Map<string, { verdict: ToolApprovalResponse; approvalId: string }>();
+  const boundIds = new Map<string, string>();
+  for (const c of calls) {
+    const bound = await approvalIdOf(c, options.agentPath, scope);
+    boundIds.set(c.toolCallId, bound);
+    const exact = byId.get(bound);
+    if (exact) matched.set(c.toolCallId, { verdict: exact, approvalId: bound });
+    else if (!reused.has(c.toolCallId) && byId.has(c.toolCallId))
+      matched.set(c.toolCallId, { verdict: byId.get(c.toolCallId)!, approvalId: c.toolCallId });
+  }
+  const noVerdict = calls.filter((c) => !matched.has(c.toolCallId));
   const gated = await findApprovalNeeded(noVerdict, tools, options, messages);
 
   const denied: DenialMap = new Map();
   for (const c of calls) {
-    const verdict = byId.get(c.toolCallId);
-    if (verdict) {
-      if (duplicateVerdicts.has(c.toolCallId)) {
+    const entry = matched.get(c.toolCallId);
+    const verdict = entry?.verdict;
+    if (entry && verdict) {
+      if (duplicateVerdicts.has(entry.approvalId)) {
         denied.set(c.toolCallId, {
           cause: 'response-denied',
           reason: 'Duplicate approval verdicts.',
@@ -2190,14 +2359,17 @@ async function settleVerdicts(
                 )
                 .catch(() => null)
             : null;
+        // The token names the approval it was issued for: the id the verdict
+        // matched, or this call's bound id (a 2.2-form verdict echoing a 2.3 token).
         const valid =
           payload !== null &&
-          payload.approvalId === c.toolCallId &&
+          (payload.approvalId === entry.approvalId ||
+            payload.approvalId === boundIds.get(c.toolCallId)) &&
           (expectedRunId === undefined ||
             payload.runId === undefined ||
             payload.runId === expectedRunId) &&
           (!options.execution ||
-            (!duplicateVerdicts.has(c.toolCallId) &&
+            (!duplicateVerdicts.has(entry.approvalId) &&
               payload.runId === expectedRunId &&
               payload.toolCallId === c.toolCallId &&
               payload.toolName === c.toolName &&
@@ -2227,7 +2399,8 @@ async function settleVerdicts(
   // Client tools without a result are not approvals (tool.denied covers them).
   if (ob) {
     for (const c of calls) {
-      const verdict = byId.get(c.toolCallId);
+      const entry = matched.get(c.toolCallId);
+      const verdict = entry?.verdict;
       const defaultDenied = !verdict && gated.has(c.toolCallId);
       if (!verdict && !defaultDenied) continue;
       ob.rt.emit({
@@ -2235,7 +2408,7 @@ async function settleVerdicts(
         spanId: ob.rt.startSpan().spanId,
         parentSpanId: ob.parentSpanId,
         agentPath: options.agentPath,
-        approvalId: c.toolCallId,
+        approvalId: entry?.approvalId ?? boundIds.get(c.toolCallId) ?? c.toolCallId,
         toolCallId: c.toolCallId,
         toolName: c.toolName,
         approved: verdict?.approved === true,
@@ -2312,6 +2485,8 @@ export function observeApprovalRequests(
   options: CommonCallOptions,
   gatedCalls: ToolCall[],
   mode: 'server' | 'client',
+  /** Each call's identity-bound approval id (2.3), by tool call id. */
+  ids: ReadonlyMap<string, string>,
 ): void {
   for (const call of gatedCalls) {
     ob.rt.emit({
@@ -2320,7 +2495,7 @@ export function observeApprovalRequests(
       parentSpanId: ob.parentSpanId,
       stepIndex: ob.stepIndex,
       agentPath: options.agentPath,
-      approvalId: call.toolCallId, // === toolCallId today (toApprovalRequests contract)
+      approvalId: ids.get(call.toolCallId) ?? call.toolCallId,
       toolCallId: call.toolCallId,
       toolName: call.toolName,
       mode,
@@ -2335,6 +2510,8 @@ export function observeServerResolutions(
   options: CommonCallOptions,
   gatedCalls: ToolCall[],
   denied: DenialMap,
+  /** Each call's identity-bound approval id (2.3), by tool call id. */
+  ids: ReadonlyMap<string, string>,
 ): void {
   for (const call of gatedCalls) {
     ob.rt.emit({
@@ -2343,7 +2520,7 @@ export function observeServerResolutions(
       parentSpanId: ob.parentSpanId,
       stepIndex: ob.stepIndex,
       agentPath: options.agentPath,
-      approvalId: call.toolCallId,
+      approvalId: ids.get(call.toolCallId) ?? call.toolCallId,
       toolCallId: call.toolCallId,
       toolName: call.toolName,
       approved: !denied.has(call.toolCallId),

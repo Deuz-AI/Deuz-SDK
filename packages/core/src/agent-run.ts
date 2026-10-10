@@ -31,6 +31,7 @@ import { runStream } from './core/inference';
 import { runStreamToolLoop, type StreamToolLoopSnapshot } from './inference/stream-tool-loop';
 import { assembleAssistant, stopDetailsFrom, type EncryptedReasoning } from './inference/run-step';
 import {
+  answersApproval,
   buildWireTools,
   collectHandoffTools,
   evaluateInputGuardrails,
@@ -626,11 +627,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       if (
         resume &&
         pendingCheckpoint?.status === 'suspended' &&
+        // A verdict must name the approval it answers (2.3): one kept from an
+        // earlier gate under a reused call id leaves the run suspended.
         (pendingApprovals.some(
-          (request) =>
-            !options.approvalResponses?.some(
-              (response) => response.approvalId === request.approvalId,
-            ),
+          (request) => !answersApproval(request, options.approvalResponses, envelope.messages),
         ) ||
           pendingClients.some((call) => !clientIds.has(call.toolCallId)))
       ) {

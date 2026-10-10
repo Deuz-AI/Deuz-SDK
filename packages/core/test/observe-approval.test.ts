@@ -128,7 +128,11 @@ describe('approval observation — server mode', () => {
       (e) => e.type === 'approval.requested',
     ) as Ev<'approval.requested'>;
     const resolved = events.find((e) => e.type === 'approval.resolved') as Ev<'approval.resolved'>;
-    expect(requested).toMatchObject({ mode: 'server', toolName: 'guarded', approvalId: 'toolu_1' });
+    expect(requested).toMatchObject({
+      mode: 'server',
+      toolName: 'guarded',
+      approvalId: expect.stringMatching(/^toolu_1@[0-9a-f]{24}$/),
+    });
     expect(requested.capturedInput).toBeUndefined(); // capture off by default
     expect(resolved).toMatchObject({ approved: true, source: 'server' });
     // requested precedes resolved precedes tool execution

@@ -479,7 +479,7 @@ describe('guardrails: onToolCall', () => {
     });
     // The gated call suspended the batch, so NOTHING ran — including the call
     // the guardrail had already refused.
-    expect(first.pendingApprovals?.map((a) => a.approvalId)).toEqual(['t_wire']);
+    expect(first.pendingApprovals?.map((a) => a.toolCallId)).toEqual(['t_wire']);
     expect(ran).toEqual([]);
 
     const resumed = await resumeFromCheckpoint(store, first.runId!, {

@@ -42,7 +42,6 @@ import {
   withSystemBlock,
   startMemoryExtract,
   durableUsage,
-  toApprovalRequests,
   signApprovalRequests,
   preserveClientContext,
   beginLoopObserve,
@@ -412,6 +411,8 @@ export async function runToolLoop(
         extras,
         undefined,
         { ...(active ? { active } : {}), tools: handoffTools },
+        // The identity the suspended leg bound its approvals to (2.3).
+        { runId: durable?.runId, step: internal?.resumeFrom?.stepIndex },
       );
       if (settled) {
         messages = settled.messages;
@@ -806,6 +807,9 @@ export async function runToolLoop(
         ...(hasHandoffTools(handoffTools)
           ? { handoff: { tools: handoffTools, ...(active ? { active } : {}) } }
           : {}),
+        // An approval is bound to the run and to the checkpoint its suspension
+        // writes next (2.3); a call without a session binds neither.
+        approval: { runId: durable?.runId, step: durable ? durable.stepIndex + 1 : undefined },
         ...(observeCtx ? { observe: observeCtx } : {}),
       });
       logGuardrailParts(guardrailLog, plan.guardrails);
@@ -867,7 +871,7 @@ export async function runToolLoop(
       if (pendingApproval.length > 0 || clientCalls.length > 0) {
         if (pendingApproval.length > 0) {
           pendingApprovals = await signApprovalRequests(
-            toApprovalRequests(pendingApproval, options.agentPath),
+            plan.requests,
             options,
             deps,
             durable?.runId,

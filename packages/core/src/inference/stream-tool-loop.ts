@@ -59,7 +59,6 @@ import {
   withSystemBlock,
   startMemoryExtract,
   durableUsage,
-  toApprovalRequests,
   signApprovalRequests,
   preserveClientContext,
   beginLoopObserve,
@@ -722,6 +721,8 @@ export function runStreamToolLoop(
             },
           },
           { ...(active ? { active } : {}), tools: handoffTools },
+          // The identity the suspended leg bound its approvals to (2.3).
+          { runId: durable?.runId, step: resumeFrom?.stepIndex },
         );
         if (settled) {
           const settledMessages = settled.messages.slice(messages.length);
@@ -1391,6 +1392,9 @@ export function runStreamToolLoop(
           ...(hasHandoffTools(handoffTools)
             ? { handoff: { tools: handoffTools, ...(active ? { active } : {}) } }
             : {}),
+          // An approval is bound to the run and to the checkpoint its suspension
+          // writes next (2.3); a call without a session binds neither.
+          approval: { runId: durable?.runId, step: durable ? durable.stepIndex + 1 : undefined },
           ...(observeCtx ? { observe: observeCtx } : {}),
         });
         emitGuardrails(plan.guardrails);
@@ -1463,12 +1467,7 @@ export function runStreamToolLoop(
         // Pending approvals and client tools break together: ONE break, nothing
         // from the batch executes; the resume call settles the deferred rest.
         if (pendingApproval.length > 0 || clientCalls.length > 0) {
-          const requests = await signApprovalRequests(
-            toApprovalRequests(pendingApproval, options.agentPath),
-            options,
-            deps,
-            durable?.runId,
-          );
+          const requests = await signApprovalRequests(plan.requests, options, deps, durable?.runId);
           const handoffMessage = commitHandoffOnBreak();
           for (const c of pendingApproval) toolState(c.toolCallId, c.toolName, 'awaiting-approval');
           if (options.session?.durability !== 'strict') emitApprovalRequests(requests);
