@@ -243,7 +243,7 @@ Subscribe with `session.on(type, listener)` (or `'*'` for everything; it returns
 | `tool-call-cancelled` | `toolCallIds`, `reason` | `'provider'` cancelled them, or `'response-not-completed'`. |
 | `interrupted` | `responseId?` | Barge-in: the provider cut the model's turn short — drop queued audio. |
 | `response-done` | `responseId?`, `status`, `reason?` | `completed`, `cancelled`, `incomplete` or `failed`. |
-| `usage` | `responseId?`, `usage`, `tokens`, `costUsd?` | Before the `response-done` it belongs to. See [usage](#usage-and-pricing). |
+| `usage` | `responseId?`, `usage`, `tokens`, `costUsd?` | Before the `response-done` it belongs to, except a Gemini report that arrives after `turnComplete`: that one follows the `response-done` and carries the same `responseId`. See [usage](#usage-and-pricing). |
 | `go-away` / `session-resumption` | `timeLeftMs?` / `handle?`, `resumable` | Gemini only. |
 | `warning` | `warning: CallWarning` | A setting the wire cannot carry, an unpriced model. |
 | `error` | `error: RealtimeError`, `fatal` | `fatal: true` means the session is closing. |
@@ -318,7 +318,7 @@ const priceProvider = createPriceProvider({
 Two provider details:
 
 - **OpenAI input transcription is billed separately**, by the transcription model, and is not part of the session's usage.
-- **Gemini usage reports are taken as cumulative within a turn**: the last report of a turn is committed when the turn ends; a report that arrives after the turn adds only what grew since the last committed one; a report still pending when the session closes is billed.
+- **Gemini usage reports are taken as cumulative within a turn**: the last report of a turn is committed when the turn ends; a report that arrives after the turn adds only what grew since the last committed one (its `usage` event follows that turn's `response-done`, with the same `responseId`); a report still pending when the session closes is billed. If you settle accounting per response, do it on `usage`, not on `response-done`.
 
 There is no budget enforcement inside a session: watch the `usage` events and `close()` when your limit is reached.
 

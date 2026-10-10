@@ -567,6 +567,12 @@ describe('Gemini Live — usage and pricing', () => {
     await flush();
     expect(ofType(events, 'usage')).toHaveLength(1);
     expect(ofType(events, 'usage')[0]!.costUsd).toBe(0.00905);
+    // As the docs' event table says: after its response-done, with the same responseId.
+    const types = events.map((event) => event.type);
+    expect(types.indexOf('usage')).toBeGreaterThan(types.indexOf('response-done'));
+    expect(ofType(events, 'usage')[0]!.responseId).toBe(
+      ofType(events, 'response-done')[0]!.responseId,
+    );
   });
 
   it('attributes cached and unspecified-modality tokens without losing any', async () => {
