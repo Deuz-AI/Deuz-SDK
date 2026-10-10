@@ -5,6 +5,7 @@ import { createOpenAI, createOpenAIResponses } from '../src/openai';
 import { createGoogleNative } from '../src/google';
 import { filePart } from '../src/parts';
 import { runStream } from '../src/core/inference';
+import { runStreamToolLoop } from '../src/inference/stream-tool-loop';
 import { createWarningSink } from '../src/internal/warnings';
 import { sseResponse, sseEvents, mockFetch } from './fixtures/sse';
 import type { StreamPart } from '../src/types/stream';
@@ -718,5 +719,24 @@ describe('a loop streams each warning once', () => {
     expect(parts.findIndex((p) => p.type === 'warning')).toBeLessThan(
       parts.findIndex((p) => p.type === 'tool-call-delta'),
     );
+  });
+
+  it('a runner that owns the run can share one sink across its loop runs', async () => {
+    const { fetch } = mockFetch(() => sseResponse([CC_DONE]));
+    const sink = createWarningSink();
+    const loop = () =>
+      runStreamToolLoop(
+        {
+          model: createOpenAI({ apiKey: 'k', fetch })('gpt-unreleased-9'),
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: { noop: { parameters: { type: 'object', properties: {} }, execute: () => 'ok' } },
+        },
+        { warnings: sink },
+      );
+    const first = await drain(loop().fullStream);
+    const second = await drain(loop().fullStream);
+    expect(warningParts(first).map((w) => w.type)).toEqual(['unknown-model']);
+    expect(warningParts(second)).toEqual([]);
+    expect(sink.list().map((w) => w.type)).toEqual(['unknown-model']);
   });
 });

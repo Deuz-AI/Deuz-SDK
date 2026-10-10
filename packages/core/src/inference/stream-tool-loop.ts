@@ -17,7 +17,7 @@ import {
 } from '../internal/observe-runtime';
 import { toObservedError } from '../internal/observe-error';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
-import { createWarningSink } from '../internal/warnings';
+import { createWarningSink, type WarningSink } from '../internal/warnings';
 import type { MemoryMutation } from '../memory';
 import {
   assembleAssistant,
@@ -160,6 +160,13 @@ export interface StreamToolLoopInternal {
      */
     refreshed(): Promise<CallWarning[]>;
   };
+  /**
+   * The warning sink of a run this loop is one part of (2.3), in place of the
+   * loop's own: a runner that drives several loops and model calls for one run
+   * passes the same sink to each, so the run reports and streams every warning
+   * once.
+   */
+  warnings?: WarningSink;
 }
 
 export interface StreamToolLoopSnapshot {
@@ -215,8 +222,9 @@ export function runStreamToolLoop(
   // every iteration is reported once. It ALWAYS mirrors to `deps.logger.warn`
   // (internal/warnings.ts), which is why log-only callers see no change — the
   // readout is additive. Unconditional, like `fallback.ts`'s twin: `warnings` is
-  // a declared always-present readout, never an opt-in.
-  const warningSink = createWarningSink(deps.logger);
+  // a declared always-present readout, never an opt-in. A runner that owns
+  // the whole run may hand in its own sink (2.3).
+  const warningSink = internal?.warnings ?? createWarningSink(deps.logger);
   const warningsDeferred = createDeferred<CallWarning[]>();
 
   let started = false;
