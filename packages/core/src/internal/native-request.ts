@@ -1,7 +1,9 @@
 import { assertExecutionPolicy } from '../execution-policy';
 export { assertExecutionPolicy } from '../execution-policy';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
+import { getCapabilities } from '../core/registry';
 import { createTokenEstimator } from './estimate-tokens';
+import { wireOutputCap } from './output-cap';
 import type { CommonCallOptions } from '../types/config';
 import type { ResolvedDependencies } from '../types/deps';
 import type { Usage } from '../types/usage';
@@ -23,14 +25,25 @@ export function createNativeRequest(
     async reserve(): Promise<void> {
       assert();
       if (userSignal?.aborted) throw userSignal.reason ?? new DOMException('Aborted', 'AbortError');
-      const inputTokens =
+      const promptTokens =
         createTokenEstimator().estimate(options.messages) +
         Math.ceil(JSON.stringify(internal.tools?.tools ?? []).length / 3.6);
-      const estimatedUsage = withTotal({
+      // F12 (2.3): reserve the output cap the wire actually sends (Anthropic's
+      // thinking raise included), not a fixed 4,096 — the provider may bill up
+      // to it, reasoning included. A prompt cached by this call is billed as a
+      // cache write, the dearest input rate.
+      const caps = getCapabilities(options.model);
+      const outputTokens = wireOutputCap(options.model.surface, caps, options) ?? caps.maxOutput;
+      const estimatedUsage: Usage = {
         ...EMPTY_USAGE,
-        inputTokens,
-        outputTokens: options.maxOutputTokens ?? 4096,
-      });
+        ...(options.promptCaching === 'auto-1h'
+          ? { cacheWrite1hTokens: promptTokens }
+          : options.promptCaching
+            ? { cacheWriteTokens: promptTokens }
+            : { inputTokens: promptTokens }),
+        outputTokens,
+        totalTokens: promptTokens + outputTokens,
+      };
       let usd = options.executionEstimate?.usd;
       if (usd === undefined && deps.priceProvider) {
         try {
