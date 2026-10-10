@@ -271,7 +271,11 @@ export type RealtimeResponseStatus = 'completed' | 'cancelled' | 'incomplete' | 
 export type RealtimeEvent =
   /** The provider accepted the session configuration; sending is now allowed. */
   | { type: 'session-ready'; sessionId?: string }
-  /** The socket closed. `initiator` says who started the close. */
+  /**
+   * The socket closed — always the last event. `initiator` says who started
+   * the close; `code` and `reason` are the closing handshake's (on a client
+   * close, whatever the server echoed back).
+   */
   | { type: 'session-closed'; code: number; reason: string; initiator: 'client' | 'server' }
   /** Gemini: the server will end the connection soon. */
   | { type: 'go-away'; timeLeftMs?: number }
