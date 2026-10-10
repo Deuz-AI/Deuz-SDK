@@ -8,6 +8,7 @@ import {
   type RealtimeWebSocketFactory,
 } from '../src/realtime';
 import { tool } from '../src/tool';
+import { InvalidRequestError } from '../src/errors';
 import type { JSONSchema } from '../src/types/schema';
 import {
   fakeRealtimeServer,
@@ -334,6 +335,28 @@ describe('session lifecycle edges', () => {
         warning: expect.objectContaining({ type: 'unsupported-tool', setting: 'web_search' }),
       },
     ]);
+  });
+
+  it('rejects a tool schema it cannot declare with a connect-failed RealtimeError', async () => {
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      tools: {
+        // A Standard Schema no JSON Schema converter knows.
+        lookup: tool({
+          parameters: {
+            '~standard': { version: 1, vendor: 'acme', validate: (value: unknown) => ({ value }) },
+          },
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    const failure = await session.connect().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RealtimeError);
+    expect(failure).toMatchObject({ kind: 'connect-failed' });
+    expect((failure as Error).cause).toBeInstanceOf(InvalidRequestError);
+    expect(server.sockets).toHaveLength(0);
+    expect(session.status).toBe('closed');
   });
 
   it('scrubs the credential out of a socket factory error, plain or URL-encoded', async () => {

@@ -382,7 +382,7 @@ Failures are `RealtimeError`s with a `kind`:
 
 | `kind` | When |
 | --- | --- |
-| `connect-failed` | The socket could not be created (e.g. a browser asked to send a header), or the setup could not be sent. |
+| `connect-failed` | The socket could not be created (e.g. a browser asked to send a header), the connection could not be prepared (a `baseURL` that does not parse, a tool schema that cannot be converted), or the setup could not be sent. |
 | `connect-timeout` | The provider did not accept the session within `connectTimeoutMs`. |
 | `no-websocket` | The runtime has no `WebSocket` and no `deps.webSocket` was given. |
 | `provider` | The provider reported an error. Before `session-ready` it rejects `connect()`; after, it is non-fatal (the session stays open). |
@@ -392,7 +392,7 @@ Failures are `RealtimeError`s with a `kind`:
 | `invalid-message` | A server frame that is not a JSON object (non-fatal, ignored). |
 | `tool` | `sendToolResult` for a call that is not waiting. Non-fatal when a tool result could not be JSON-encoded or the tool results could not be sent. |
 
-A failure before a socket exists (no credential — `AuthenticationError`; a pre-aborted `signal` — `AbortError`; no `WebSocket`) only rejects `connect()`. Once a socket exists, a failure is also a fatal `error` event, followed by `session-closed`. Error messages never contain the API key or token — plain or URL-encoded.
+A failure before a socket exists (no credential — `AuthenticationError`; a pre-aborted `signal` — `AbortError`; no `WebSocket`; a bad `baseURL` or tool schema — `connect-failed`) only rejects `connect()`. Once a socket exists, a failure is also a fatal `error` event, followed by `session-closed`. Error messages never contain the API key or token — plain or URL-encoded.
 
 ## API at a glance
 

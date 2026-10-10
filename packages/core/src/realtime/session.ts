@@ -38,6 +38,7 @@ import type {
   RealtimeConnection,
   RealtimeCredential,
   RealtimeProtocol,
+  WireTool,
 } from './protocol';
 import { buildWireTools, createToolRunner, type ToolRunner } from './tools';
 import type {
@@ -752,13 +753,30 @@ export function createRealtimeSession(options: RealtimeSessionOptions): Realtime
     );
   }
 
+  /** A step before the socket exists failed: `connect()` still rejects with a RealtimeError. */
+  function preparationFailed(cause: unknown, what: string): RealtimeError {
+    if (cause instanceof RealtimeError) return cause;
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    return realtimeError('connect-failed', `Could not ${what}: ${detail}`, { cause });
+  }
+
   async function dial(): Promise<void> {
     try {
       const credential = await resolveCredential();
       if (status !== 'connecting') return;
-      const wireTools = await buildWireTools(options.tools, warn);
+      let wireTools: WireTool[];
+      try {
+        wireTools = await buildWireTools(options.tools, warn);
+      } catch (cause) {
+        throw preparationFailed(cause, 'declare the session tools');
+      }
       if (status !== 'connecting') return;
-      const connection = protocol.connection(model, readRealtimeConfig(model), credential);
+      let connection: RealtimeConnection;
+      try {
+        connection = protocol.connection(model, readRealtimeConfig(model), credential);
+      } catch (cause) {
+        throw preparationFailed(cause, `prepare the ${protocol.label} connection (check baseURL)`);
+      }
       codec = protocol.createCodec({ model, config: options, tools: wireTools, sink });
       tools = createToolRunner({
         tools: options.tools,

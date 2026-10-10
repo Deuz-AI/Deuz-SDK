@@ -4,7 +4,9 @@ import { DeuzError, type DeuzErrorJSON } from '../errors';
  * What went wrong in a realtime session:
  *
  * - `connect-failed` — the socket could not be created (e.g. a browser asked to
- *   send an API key in a header), or the session setup could not be sent.
+ *   send an API key in a header), the connection could not be prepared (a
+ *   `baseURL` that does not parse, a tool schema that cannot be converted), or
+ *   the session setup could not be sent.
  * - `connect-timeout` — the provider did not accept the session in time.
  * - `no-websocket` — the runtime has no global `WebSocket` and no
  *   `deps.webSocket` was given.

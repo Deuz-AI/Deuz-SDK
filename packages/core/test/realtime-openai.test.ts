@@ -185,6 +185,23 @@ describe('OpenAI Realtime — connect', () => {
     }
   });
 
+  it('rejects a baseURL that does not parse with a connect-failed RealtimeError', async () => {
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk-test', baseURL: 'api.example.com/v1' })(
+        'gpt-realtime',
+      ),
+      deps: { webSocket: server.webSocket },
+    });
+    const failure = await session.connect().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RealtimeError);
+    expect(failure).toMatchObject({ kind: 'connect-failed', provider: 'openai' });
+    expect((failure as Error).message).toContain('baseURL');
+    expect((failure as Error).cause).toBeInstanceOf(TypeError);
+    expect(server.sockets).toHaveLength(0);
+    expect(session.status).toBe('closed');
+  });
+
   it('refuses to dial without a credential', async () => {
     const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
     const session = createRealtimeSession({
