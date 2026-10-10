@@ -65,6 +65,14 @@ export interface ResolvedMcpRuntime {
    * silently rewritten under the model.
    */
   tools: ToolSet;
+  /**
+   * Where each tool of {@link tools} comes from (2.3): the index of its `mcp`
+   * entry and its own name on that server, before any namespace prefix. Replaced
+   * together with {@link tools}. A native run keys per-server and per-tool
+   * declarations (`replay`) on it. Always set by `resolveMcpForLoop`; optional
+   * only so the public type stays additive.
+   */
+  origins?: Record<string, { entry: number; name: string }>;
   /** True once any connected server invalidated its tool list (`tools/list_changed`). */
   changed(): boolean;
   /** Re-read every catalog, rebuild {@link tools}, clear the dirty flag. */
@@ -175,6 +183,28 @@ async function listEntryTools(entry: ResolvedEntry): Promise<ToolSet> {
   return entry.namespace === undefined
     ? entry.client.listTools()
     : entry.client.listTools(entry.namespace);
+}
+
+/**
+ * Where each merged name comes from (2.3), resolved the way {@link mergeToolSets}
+ * resolves a duplicate: the later entry wins. The server's own name is the key
+ * without its `${namespace}_` prefix.
+ */
+function toolOrigins(
+  sets: ToolSet[],
+  entries: ResolvedEntry[],
+): Record<string, { entry: number; name: string }> {
+  // Null prototype: a tool literally named `__proto__` must land as an own key.
+  const origins = Object.create(null) as Record<string, { entry: number; name: string }>;
+  for (const [index, set] of sets.entries()) {
+    const namespace = entries[index]!.namespace;
+    const prefix = namespace === undefined ? undefined : `${namespace}_`;
+    for (const key of Object.keys(set)) {
+      const name = prefix !== undefined && key.startsWith(prefix) ? key.slice(prefix.length) : key;
+      origins[key] = { entry: index, name };
+    }
+  }
+  return origins;
 }
 
 // --- connecting -------------------------------------------------------------
@@ -328,21 +358,26 @@ export async function resolveMcpForLoop(
       );
     }
 
-    const build = async (): Promise<ToolSet> => {
+    // One entry per resolved client, in entry order: the index IS the entry's.
+    const listAll = async (): Promise<ToolSet[]> => {
       const sets: ToolSet[] = [];
       for (const entry of resolved) sets.push(await listEntryTools(entry));
-      return mergeToolSets(sets, deps.logger);
+      return sets;
     };
 
+    const initial = await listAll();
     const runtime: ResolvedMcpRuntime = {
-      tools: await build(),
+      tools: mergeToolSets(initial, deps.logger),
+      origins: toolOrigins(initial, resolved),
       changed: () => dirty,
       async refresh() {
         // Cleared FIRST: a notification that lands while the catalogs are being
         // re-read must survive as a pending refresh, not be erased by this one.
         dirty = false;
         try {
-          runtime.tools = await build();
+          const sets = await listAll();
+          runtime.tools = mergeToolSets(sets, deps.logger);
+          runtime.origins = toolOrigins(sets, resolved);
         } catch (error) {
           // Still stale: re-arm so the NEXT step boundary tries again. The caller
           // keeps the previous catalog (see `refreshMcpTools` in loop-shared) —

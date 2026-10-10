@@ -1,6 +1,7 @@
 import type { GenerateText, GenerateTextOptions, GenerateTextResult } from '../types/methods';
 import { runOneStep } from './run-step';
 import { runToolLoop } from './tool-loop';
+import { isEmptyTurn } from './loop-shared';
 import { runGenerateWithFallback } from '../internal/fallback';
 
 /**
@@ -45,10 +46,14 @@ export const generateText: GenerateText = async (options): Promise<GenerateTextR
     text: step.text,
     usage: step.usage,
     finishReason: step.finishReason,
+    // A refusal's explanation (2.3): omitted when the provider gave none.
+    ...(step.stopDetails ? { stopDetails: step.stopDetails } : {}),
     // Non-fatal notices (1.9): omitted entirely when there are none, so a clean
     // call's result shape is byte-identical to 1.8.
     ...(step.warnings?.length ? { warnings: step.warnings } : {}),
-    response: { messages: [step.assistantMessage] },
+    // An empty turn (e.g. thinking-only with its text omitted) is not a message
+    // any provider accepts back (2.3), so there is nothing to append.
+    response: { messages: isEmptyTurn(step.assistantMessage) ? [] : [step.assistantMessage] },
     ...(step.observation ? { observation: step.observation } : {}),
   };
 };

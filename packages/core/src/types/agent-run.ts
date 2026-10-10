@@ -1,4 +1,10 @@
-import type { CommonCallOptions } from './config';
+import type {
+  CommonCallOptions,
+  McpClientLoopEntry,
+  McpHttpLoopConfig,
+  McpStdioLoopConfig,
+} from './config';
+import type { McpClient } from '../mcp/shared';
 import type { Message } from './message';
 import type { Usage } from './usage';
 import type { StreamPart } from './stream';
@@ -7,6 +13,7 @@ import type { JSONSchema, StandardSchemaV1 } from './schema';
 import type { Tool, ToolApprovalRequest, ToolCall, ToolExecuteContext } from './tool';
 import type { BudgetTotals, ExecutionContextSnapshot, NativeExecutionContext } from './execution';
 import type { FinishReason } from './usage';
+import type { StopDetails } from './methods';
 
 /** A validator returns its validated (possibly transformed) value or throws. */
 export type AgentValidator<T> = (value: unknown) => T | Promise<T>;
@@ -59,6 +66,24 @@ export interface AgentTool<A = unknown, R = unknown, C = unknown> extends Omit<
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type AgentToolSet = Record<string, AgentTool<any, any, any>>;
 
+/**
+ * Which interrupted calls of an MCP server a native run may repeat on resume
+ * (2.3): `'idempotent'` for every tool of the server, or a map from the server's
+ * own tool names (before any `namespace` prefix) to `'idempotent'`. The MCP
+ * counterpart of {@link AgentTool.replay}; bump `bindingId` when changing it.
+ */
+export type AgentMcpReplay = 'idempotent' | Readonly<Record<string, 'idempotent'>>;
+
+/**
+ * One `mcp` entry of a native run (2.3): any `CommonCallOptions.mcp` entry. A
+ * config or `{ client }` entry may also declare `replay`.
+ */
+export type AgentMcpEntry =
+  | McpClient
+  | ((McpHttpLoopConfig | McpStdioLoopConfig | McpClientLoopEntry) & {
+      replay?: AgentMcpReplay;
+    });
+
 export type AgentVerification =
   | { status: 'verified' }
   | { status: 'rejected'; feedback?: string }
@@ -83,6 +108,11 @@ interface AgentResultBase {
   modelSteps: number;
   accounting?: BudgetTotals;
   verification?: AgentVerification['status'];
+  /**
+   * The provider's explanation of an early stop (2.3), e.g. on a `stopped` result
+   * with reason `'refusal'`: the refusal category and explanation.
+   */
+  stopDetails?: StopDetails;
 }
 
 /** Only a completed result has an accepted, runtime-validated output. */
@@ -123,9 +153,26 @@ export interface AgentRunEnvelope {
   /** A persisted candidate avoids another model call after a verifier/store interruption. */
   candidateText?: string;
   verification?: AgentVerification['status'];
-  binding?: { model: string; tools: string; output: string; revision?: string };
+  binding?: {
+    model: string;
+    tools: string;
+    output: string;
+    revision?: string;
+    /**
+     * The MCP servers' tool catalog (2.3): `fingerprintTools` JSON. Resume
+     * rejects a catalog that drifted from it; a hot refresh records the new one.
+     * Absent before 2.3 and for runs without MCP; resume then records the catalog.
+     */
+    mcp?: string;
+  };
   limits?: { maxSteps: number; maxOutputAttempts: number; maxVerifyAttempts: number };
-  loopOutcome?: { finishReason: FinishReason; endReason: string; stoppedBy?: string };
+  loopOutcome?: {
+    finishReason: FinishReason;
+    endReason: string;
+    stoppedBy?: string;
+    /** The provider's stop explanation for the loop's last turn (2.3). */
+    stopDetails?: StopDetails;
+  };
   toolResults?: Record<string, AgentToolReceipt>;
   pendingClientCalls?: ToolCall[];
   result?: AgentResult<unknown>;
@@ -137,11 +184,17 @@ export interface AgentToolReceipt {
   toolCallId: string;
   toolName: string;
   input: unknown;
+  /**
+   * `executing` means the outcome is unknown, so a resume stops for
+   * reconciliation. `failed` (2.3) means `execute` threw and the model was given
+   * the error; a replay reports the recorded `error` and runs nothing again.
+   */
   stage:
     | 'executing'
     | 'suspended'
     | 'executed'
     | 'completed'
+    | 'failed'
     | 'validation-failed'
     | 'projection-failed';
   rawResult?: unknown;
@@ -177,9 +230,16 @@ export type AgentRunOptions<T = string> = Omit<
   | 'chat'
   | 'memory'
   | 'fallbackModels'
+  | 'mcp'
 > & {
   messages?: Message[];
   tools?: AgentToolSet;
+  /**
+   * MCP servers, as `CommonCallOptions.mcp` (2.3: through the native run's effect
+   * receipts, with the servers' tool catalog in the resume binding). An entry may
+   * declare `replay` for its idempotent tools.
+   */
+  mcp?: AgentMcpEntry[];
   toolsContext?: Record<string, unknown>;
   session?: AgentRunSession;
   output?: AgentOutput<T>;

@@ -62,6 +62,11 @@ export interface StepFinishPart {
   stepIndex: number;
   finishReason: FinishReason;
   usage: Usage;
+  /**
+   * The step's provider finish detail, exactly as on {@link FinishStreamPart}
+   * (e.g. `{ anthropic: { stop_details } }` on a refusal). 2.3 additive.
+   */
+  providerMetadata?: Record<string, unknown>;
 }
 
 /** Final, parsed tool call (emitted after `tool-call-delta` fragments complete). */

@@ -6,10 +6,13 @@ import type {
   AgentRunSession,
   AgentRunStore,
   AgentStream,
+  AgentTool,
   AgentValidation,
 } from './types/agent-run';
 import type { CommonCallOptions } from './types/config';
+import type { CallWarning, StopDetails } from './types/methods';
 import type { Message } from './types/message';
+import type { WireToolRequest } from './adapters/types';
 import type { SessionStore } from './types/session';
 import type { StreamPart } from './types/stream';
 import type { ExecutionContextSnapshot, NativeExecutionContext } from './types/execution';
@@ -22,9 +25,14 @@ import { EMPTY_USAGE } from './core/metering';
 import { getCapabilities } from './core/registry';
 import { runStream } from './core/inference';
 import { runStreamToolLoop, type StreamToolLoopSnapshot } from './inference/stream-tool-loop';
+import { assembleAssistant, stopDetailsFrom, type EncryptedReasoning } from './inference/run-step';
 import {
+  buildWireTools,
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
+  filterWireTools,
+  mergeMcpTools,
+  rewriteAssistantText,
   sumUsage,
 } from './inference/loop-shared';
 import { pickObjectStrategy } from './inference/object-shared';
@@ -34,8 +42,18 @@ import {
   completedArrayElements,
   validateAgentValue,
 } from './inference/agent-output';
-import { prepareAgentTools } from './inference/agent-tools';
-import { createExecutionContext, intersectExecutionPolicies } from './execution-policy';
+import {
+  prepareAgentTools,
+  prepareMcpTools,
+  type NativeToolOutput,
+  type NativeToolReceipts,
+} from './inference/agent-tools';
+import type { NativeMcp } from './inference/native-mcp';
+import {
+  assertExecutionPolicy,
+  createExecutionContext,
+  intersectExecutionPolicies,
+} from './execution-policy';
 import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
@@ -58,18 +76,50 @@ function errorData(error: unknown): { name: string; message: string; code?: stri
   return { name: 'Error', message: String(error) };
 }
 
+function messageText(message: Message): string {
+  return typeof message.content === 'string'
+    ? message.content
+    : message.content
+        .filter((p) => p.type === 'text')
+        .map((p) => p.text)
+        .join('');
+}
+
 function lastAssistantText(messages: Message[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i]!;
-    if (message.role !== 'assistant') continue;
-    return typeof message.content === 'string'
-      ? message.content
-      : message.content
-          .filter((p) => p.type === 'text')
-          .map((p) => p.text)
-          .join('');
+    if (message.role === 'assistant') return messageText(message);
   }
   return '';
+}
+
+/**
+ * The answer of a loop that ended naturally: the text of its FINAL turn. An
+ * empty final turn is not recorded (2.3), and an earlier assistant turn's text
+ * must never stand in for the answer the model did not give.
+ */
+function finalTurnText(messages: Message[]): string {
+  const last = messages.at(-1);
+  return last?.role === 'assistant' ? messageText(last) : '';
+}
+
+/** Native stop reasons name a refusal plainly (2.3); other finish reasons pass through. */
+function stopReasonOf(finishReason: string): string {
+  return finishReason === 'content_filter' ? 'refusal' : finishReason;
+}
+
+/**
+ * The user turn that closes the loop's history before finalization (2.3, F15).
+ * It is part of the durable, append-only transcript.
+ */
+const FINALIZE_PROMPT =
+  'Now provide the final output in the required format, based on the work above.';
+
+/** A turn with nothing in it: never stored, because no provider accepts one back. */
+function isBlankTurn(message: Message): boolean {
+  return typeof message.content === 'string'
+    ? message.content === ''
+    : message.content.length === 0;
 }
 
 function positiveInteger(value: number, name: string): number {
@@ -171,6 +221,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   let releaseRun: (() => void) | undefined;
   let settledOutcome: AgentResult<T> | undefined;
   let writeTail: Promise<void> = Promise.resolve();
+  /** The run's MCP servers (2.3, F01), closed on every exit. */
+  let nativeMcp: NativeMcp | undefined;
 
   let persistedLedger: string | undefined;
   // A child of a caller's shared ledger records only its own slice (2.2): the
@@ -221,7 +273,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     await persist();
     settledOutcome = outcome;
   }
-  const stopped = (reason: string) => finish({ ...base(), status: 'stopped', reason });
+  const stopped = (reason: string, stopDetails?: StopDetails) =>
+    finish({ ...base(), status: 'stopped', reason, ...(stopDetails ? { stopDetails } : {}) });
   function emitPart(part: StreamPart, phase: 'running' | 'finalizing'): void {
     events.push({ type: 'part', part, phase });
     if (part.type === 'text-delta') text.push(part.text);
@@ -385,38 +438,44 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           },
         };
       }
+      const onToolOutput = (output: NativeToolOutput): void => {
+        events.push({ type: 'tool-output', ...output });
+      };
+      // One receipt boundary for every tool the run can execute: local, handoff
+      // targets and (2.3, F01) MCP tools, refreshed catalogs included.
+      const receipts: NativeToolReceipts = {
+        load: (id) => envelope.toolResults?.[JSON.stringify([envelope.modelSteps, id])],
+        retryToolCallIds: options.retryToolCallIds,
+        modelStep: () => envelope.modelSteps,
+        save: async (receipt, ctx) => {
+          envelope.toolResults ??= {};
+          receipt.modelStep ??= envelope.modelSteps;
+          envelope.toolResults[JSON.stringify([receipt.modelStep, receipt.toolCallId])] = receipt;
+          envelope.messages = [...ctx.messages];
+          // Persist the in-flight tool-call history as well as its receipt so
+          // canonical resume can settle that exact ID without another model call.
+          const previous = envelope.checkpoints[envelope.runId];
+          envelope.checkpoints[envelope.runId] = {
+            version: 1,
+            runId: envelope.runId,
+            stepId: `${envelope.runId}#${previous?.stepIndex ?? 0}`,
+            stepIndex: previous?.stepIndex ?? 0,
+            status: 'running',
+            messages: envelope.messages,
+            usage: envelope.usage,
+            createdAt: resolveDependencies(options.deps).clock.now(),
+            ...(previous?.handoff ? { handoff: previous.handoff } : {}),
+          };
+          await persist();
+        },
+      };
       common.tools = await prepareAgentTools(
         nativeTools,
         options.toolsContext,
-        (output) => events.push({ type: 'tool-output', ...output }),
-        {
-          load: (id) => envelope.toolResults?.[JSON.stringify([envelope.modelSteps, id])],
-          retryToolCallIds: options.retryToolCallIds,
-          modelStep: () => envelope.modelSteps,
-          save: async (receipt, ctx) => {
-            envelope.toolResults ??= {};
-            receipt.modelStep ??= envelope.modelSteps;
-            envelope.toolResults[JSON.stringify([receipt.modelStep, receipt.toolCallId])] = receipt;
-            envelope.messages = [...ctx.messages];
-            // Persist the in-flight tool-call history as well as its receipt so
-            // canonical resume can settle that exact ID without another model call.
-            const previous = envelope.checkpoints[envelope.runId];
-            envelope.checkpoints[envelope.runId] = {
-              version: 1,
-              runId: envelope.runId,
-              stepId: `${envelope.runId}#${previous?.stepIndex ?? 0}`,
-              stepIndex: previous?.stepIndex ?? 0,
-              status: 'running',
-              messages: envelope.messages,
-              usage: envelope.usage,
-              createdAt: resolveDependencies(options.deps).clock.now(),
-              ...(previous?.handoff ? { handoff: previous.handoff } : {}),
-            };
-            await persist();
-          },
-        },
+        onToolOutput,
+        receipts,
       );
-      const binding = {
+      const binding: NonNullable<AgentRunEnvelope['binding']> = {
         model: `${common.model.provider}/${common.model.surface}/${common.model.modelId}`,
         tools: JSON.stringify(
           await Promise.all(
@@ -434,9 +493,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         output: JSON.stringify(outputSchema ?? null),
         ...(options.bindingId !== undefined ? { revision: options.bindingId } : {}),
       };
-      if (envelope.binding && JSON.stringify(binding) !== JSON.stringify(envelope.binding))
-        throw new TypeError('Native agent binding changed across resume.');
-      envelope.binding = binding;
+      // The MCP catalog (2.3) is compared below, once the servers are reached.
+      const recordedCatalog = envelope.binding?.mcp;
+      if (envelope.binding) {
+        const { mcp: _catalog, ...recorded } = envelope.binding;
+        if (JSON.stringify(binding) !== JSON.stringify(recorded))
+          throw new TypeError('Native agent binding changed across resume.');
+      }
       if (envelope.phase === 'terminal') {
         if (!envelope.result || envelope.result.status === 'suspended')
           throw new TypeError('Invalid native terminal checkpoint.');
@@ -444,6 +507,25 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         settledOutcome = terminal;
         return;
       }
+      // MCP (2.3, F01): connected only now, after a terminal run has returned
+      // and before anything is persisted, so an unreachable server fails a fresh
+      // run cleanly and a resume checks the servers' catalog before it writes. The
+      // tools pass through the same receipts as local tools.
+      if ((options.mcp?.length ?? 0) > 0 || recordedCatalog !== undefined) {
+        const native = await import('./inference/native-mcp');
+        if (options.mcp?.length) {
+          nativeMcp = await native.resolveNativeMcp(
+            options.mcp,
+            resolveDependencies(options.deps),
+            (tools, replayOf) => prepareMcpTools(tools, replayOf, onToolOutput, receipts),
+          );
+          binding.mcp = await nativeMcp.catalog();
+        }
+        const drift = native.catalogDrift(recordedCatalog, binding.mcp);
+        // Rejected like a changed local tool set; the stored run stays intact.
+        if (drift) throw new TypeError(`MCP tool catalog changed across resume (${drift}).`);
+      }
+      envelope.binding = binding;
       if (envelope.limits) {
         maxSteps = Math.min(maxSteps, envelope.limits.maxSteps);
         maxOutputAttempts = Math.min(maxOutputAttempts, envelope.limits.maxOutputAttempts);
@@ -487,10 +569,15 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         settledOutcome = outcome;
         return;
       }
+      // A local tool shadows an MCP tool of the same name, as in the loop's merge.
+      const replayOf = (name: string): AgentTool['replay'] =>
+        options.tools && Object.hasOwn(options.tools, name)
+          ? options.tools[name]!.replay
+          : nativeMcp?.replayOf(name);
       const unreconciled = Object.values(envelope.toolResults ?? {}).filter(
         (receipt) =>
           receipt.stage === 'executing' &&
-          options.tools?.[receipt.toolName]?.replay !== 'idempotent' &&
+          replayOf(receipt.toolName) !== 'idempotent' &&
           !options.retryToolCallIds?.includes(receipt.toolCallId),
       );
       if (resume && unreconciled.length) {
@@ -531,11 +618,25 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         },
       };
 
-      const checkLimit = async (): Promise<boolean> => {
+      // Cancellation and the execution deadline (2.3, F05). Checked before every
+      // model call AND at every point where async caller code (validation,
+      // guardrails, the verifier) may have outlived the run, right before the
+      // terminal commit. An elapsed deadline fails the run, exactly as it fails
+      // model and tool dispatch; an abort stops it.
+      const checkCancellation = async (): Promise<boolean> => {
         if (options.signal?.aborted) {
           await stopped('aborted');
           return false;
         }
+        if (common.execution)
+          assertExecutionPolicy(common.execution, {
+            now: resolveDependencies(options.deps).clock.now(),
+          });
+        return true;
+      };
+
+      const checkLimit = async (): Promise<boolean> => {
+        if (!(await checkCancellation())) return false;
         if (envelope.modelSteps >= maxSteps) {
           await stopped('max-steps');
           return false;
@@ -564,12 +665,32 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         return true;
       };
 
+      // A hot refresh mid-run (2.3, F01) opens a new binding revision: the new
+      // catalog is recorded, durably, before the model is offered it, so a later
+      // resume compares against the catalog the run actually used. The change is
+      // reported as a warning; its tools carry receipts like every other.
+      const recordCatalog = async (): Promise<CallWarning[]> => {
+        const catalog = await nativeMcp!.catalog();
+        const { catalogDrift } = await import('./inference/native-mcp');
+        const drift = catalogDrift(envelope.binding?.mcp, catalog);
+        if (!drift) return [];
+        envelope.binding = { ...envelope.binding!, mcp: catalog };
+        await persist();
+        return [
+          {
+            type: 'other',
+            setting: 'mcp',
+            message: `MCP tool catalog changed mid-run (${drift}); the run's resume binding now records the new catalog.`,
+          },
+        ];
+      };
+
       // Structured-only runs go straight to finalization. Runs with tools/MCP
       // traverse the canonical loop first; no tool executor exists here.
-      if (
-        envelope.phase === 'running' &&
-        (!options.output || Object.keys(common.tools).length > 0 || (options.mcp?.length ?? 0) > 0)
-      ) {
+      const hasLoopTools = Object.keys(common.tools).length > 0 || (options.mcp?.length ?? 0) > 0;
+      /** The tool request of the loop's last model call, when this leg ran the loop. */
+      let loopWire: WireToolRequest | undefined;
+      if (envelope.phase === 'running' && (!options.output || hasLoopTools)) {
         const checkpoint = envelope.checkpoints[envelope.runId];
         const recoveredOutcome =
           resume && checkpoint?.status === 'completed' ? envelope.loopOutcome : undefined;
@@ -587,11 +708,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               recoveredOutcome.stoppedBy ??
                 (recoveredOutcome.endReason !== 'natural'
                   ? recoveredOutcome.endReason
-                  : recoveredOutcome.finishReason),
+                  : stopReasonOf(recoveredOutcome.finishReason)),
+              recoveredOutcome.stopDetails,
             );
             return;
           }
-          if (!options.output) envelope.candidateText = currentText;
+          if (!options.output)
+            envelope.candidateText = currentText = finalTurnText(envelope.messages);
         } else {
           if (!(await checkLimit())) return;
           events.push({ type: 'phase', phase: 'running' });
@@ -622,9 +745,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                   finishReason: value.finishReason,
                   endReason: value.endReason,
                   stoppedBy: value.stoppedBy,
+                  ...(value.stopDetails ? { stopDetails: value.stopDetails } : {}),
                 };
                 envelope.pendingClientCalls = value.pendingClientCalls;
               },
+              ...(nativeMcp
+                ? { mcp: { runtime: nativeMcp.runtime, refreshed: recordCatalog } }
+                : {}),
             },
           );
           for await (const part of inner.fullStream) {
@@ -650,13 +777,18 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             });
             return;
           }
+          // A refused or cut-off final turn (2.3, F16) stops here: it is never
+          // reported completed, and verification never re-drives it.
           if (loop.stoppedBy || loop.endReason !== 'natural' || loop.finishReason !== 'stop') {
             await stopped(
-              loop.stoppedBy ?? (loop.endReason !== 'natural' ? loop.endReason : loop.finishReason),
+              loop.stoppedBy ??
+                (loop.endReason !== 'natural' ? loop.endReason : stopReasonOf(loop.finishReason)),
+              loop.stopDetails,
             );
             return;
           }
-          if (!options.output) envelope.candidateText = currentText;
+          if (!options.output) envelope.candidateText = currentText = finalTurnText(loop.messages);
+          loopWire = loop.wire;
         }
       } else if (envelope.phase === 'running') {
         const input = await evaluateInputGuardrails(common, envelope.messages);
@@ -671,6 +803,29 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       envelope.phase = 'finalizing';
       events.push({ type: 'phase', phase: 'finalizing' });
       await persist();
+      // Finalization is one more turn of the same conversation (2.3, F15). It
+      // keeps the loop's tools on the wire, with `tool_choice: 'none'`, so the
+      // request prefix (prompt cache, preserved thinking) is the loop's own. A
+      // leg that did not run the loop rebuilds the run's static tool request.
+      let finalizeTools: WireToolRequest | undefined | null = null;
+      const finalizeToolRequest = async (): Promise<WireToolRequest | undefined> => {
+        if (finalizeTools !== null) return finalizeTools;
+        const wire =
+          loopWire ??
+          (hasLoopTools
+            ? filterWireTools(
+                await buildWireTools(
+                  mergeMcpTools(nativeMcp?.runtime, common.tools),
+                  common.toolChoice,
+                  common.maxToolConcurrency,
+                ),
+                common.activeTools,
+                resolveDependencies(options.deps).logger,
+              )
+            : undefined);
+        finalizeTools = wire && wire.tools.length > 0 ? { ...wire, toolChoice: 'none' } : undefined;
+        return finalizeTools;
+      };
       for (;;) {
         if (envelope.candidateText === undefined) {
           if (!(await checkLimit())) return;
@@ -678,6 +833,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             await stopped('output-attempts-exhausted');
             return;
           }
+          // The request must end with a user turn: one that ends with the
+          // assistant's own answer is a prefill, which Claude 5.x models reject.
+          // Appended once and persisted below, so a resumed attempt reuses it.
+          if (envelope.messages.at(-1)?.role === 'assistant')
+            envelope.messages = [...envelope.messages, { role: 'user', content: FINALIZE_PROMPT }];
           const attempt = envelope.finalizationAttempts++;
           envelope.outputAttempts = (envelope.outputAttempts ?? 0) + 1;
           envelope.modelSteps++;
@@ -691,6 +851,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                 getCapabilities(common.model, undefined, common.capabilities),
               )
             : undefined;
+          const toolRequest = await finalizeToolRequest();
+          const spentBefore = common.execution!.ledger.totals(common.execution!.scopeId).spent.usd;
           const inner = runStream(
             {
               ...common,
@@ -702,23 +864,30 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               session: undefined,
               mcp: undefined,
             },
-            output && outputSchema
-              ? {
-                  object: {
-                    schema: outputSchema,
-                    name: output.name,
-                    description: output.description,
-                    strategy: strategy!,
-                  },
-                  operation: 'stream-object',
-                }
-              : {},
+            {
+              ...(output && outputSchema
+                ? {
+                    object: {
+                      schema: outputSchema,
+                      name: output.name,
+                      description: output.description,
+                      strategy: strategy!,
+                    },
+                    operation: 'stream-object' as const,
+                  }
+                : {}),
+              ...(toolRequest ? { tools: toolRequest } : {}),
+            },
           );
           let buffer = '';
+          let reasoningText = '';
+          let reasoningSignature: string | undefined;
+          const encryptedReasoning: EncryptedReasoning = [];
           let toolId: string | undefined;
           let lastDraft: string | undefined;
           let elementCount = 0;
           let streamError: unknown;
+          let finishMeta: Record<string, unknown> | undefined;
           const publishDraft = async (): Promise<void> => {
             if (!output) return;
             const draft = parsePartialJson(buffer);
@@ -753,6 +922,15 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           for await (const part of inner.fullStream) {
             emitPart(part, 'finalizing');
             if (part.type === 'error') streamError = part.error;
+            if (part.type === 'finish') finishMeta = part.providerMetadata;
+            if (part.type === 'reasoning-delta') {
+              if (part.encrypted)
+                encryptedReasoning.push({ text: part.text, signature: part.signature });
+              else {
+                reasoningText += part.text;
+                if (part.signature) reasoningSignature = part.signature;
+              }
+            }
             if (part.type === 'text-delta' && strategy !== 'tool') {
               buffer += part.text;
               await publishDraft();
@@ -773,15 +951,48 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             /* transport error below */
           }
           if (streamError !== undefined) throw streamError;
+          // A request that rides the loop's tools is a loop-style call, so the
+          // per-request cost part is ours to emit: the run's cumulative cost,
+          // exactly as the loop reports it after each step.
+          if (toolRequest) {
+            const totals = common.execution!.ledger.totals(common.execution!.scopeId);
+            if (totals.unknownUsd === 0)
+              emitPart(
+                {
+                  type: 'cost',
+                  costUsd: totals.spent.usd,
+                  deltaUsd: Math.max(0, Math.round((totals.spent.usd - spentBefore) * 1e6) / 1e6),
+                  stepIndex: envelope.modelSteps - 1,
+                },
+                'finalizing',
+              );
+          }
           const reason = await inner.finishReason;
           if (reason !== 'stop' && !(strategy === 'tool' && reason === 'tool_calls')) {
             currentText = buffer;
-            await stopped(reason);
+            await stopped(stopReasonOf(reason), stopDetailsFrom(finishMeta));
             return;
           }
           envelope.candidateText = buffer;
           currentText = buffer;
-          envelope.messages = [...envelope.messages, { role: 'assistant', content: buffer }];
+          // The whole answer turn is kept: reasoning included, so the transcript
+          // stays append-only. A forced `json_output` call (tool strategy) is
+          // recorded as its JSON text, as before: a stored call would need an
+          // answering tool result before the next request.
+          const phase = (finishMeta?.openai as { phase?: string } | undefined)?.phase;
+          const answer: Message =
+            strategy === 'tool'
+              ? { role: 'assistant', content: buffer }
+              : assembleAssistant(
+                  buffer,
+                  reasoningText,
+                  reasoningSignature,
+                  new Map(),
+                  [],
+                  encryptedReasoning,
+                ).assistantMessage;
+          if (phase && strategy !== 'tool') answer.providerMetadata = { openai: { phase } };
+          if (!isBlankTurn(answer)) envelope.messages = [...envelope.messages, answer];
           await persist();
         }
         currentText = envelope.candidateText;
@@ -813,12 +1024,16 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         const wasRewritten = finalText !== currentText;
         if (wasRewritten) {
           currentText = finalText;
-          const last = envelope.messages.length - 1;
-          envelope.messages = envelope.messages.map((message, index) =>
-            index === last && message.role === 'assistant'
-              ? { ...message, content: currentText }
-              : message,
-          );
+          // The answer turn keeps its reasoning; only its text is replaced.
+          const last = envelope.messages.at(-1);
+          if (last?.role === 'assistant') {
+            const rewritten = rewriteAssistantText(last, currentText);
+            envelope.messages = isBlankTurn(rewritten)
+              ? envelope.messages.slice(0, -1)
+              : [...envelope.messages.slice(0, -1), rewritten];
+          } else if (currentText) {
+            envelope.messages = [...envelope.messages, { role: 'assistant', content: currentText }];
+          }
           envelope.candidateText = currentText;
         }
         if (guarded.outcome === 'block') {
@@ -831,6 +1046,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           accepted = options.output
             ? await validateAgentValue(options.output, JSON.parse(currentText))
             : (currentText as T);
+        // Validation and guardrails are async caller code: a run cancelled while
+        // they ran must not reach the verifier or the terminal commit.
+        if (!(await checkCancellation())) return;
         if (options.verify) {
           if (envelope.verificationAttempts >= maxVerifyAttempts) {
             await stopped('verification-attempts-exhausted');
@@ -850,6 +1068,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               signal: options.signal,
             });
           } catch {
+            // A verifier that threw because the run was cancelled reports the
+            // cancellation, not an inconclusive verdict.
+            if (!(await checkCancellation())) return;
             envelope.verification = 'inconclusive';
             await stopped('verification-inconclusive');
             return;
@@ -857,6 +1078,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           if (!verdict || !['verified', 'rejected', 'inconclusive'].includes(verdict.status))
             throw new TypeError('Verifier must return verified, rejected, or inconclusive.');
           envelope.verification = verdict.status;
+          // The verdict is recorded, but a cancellation or deadline that arrived
+          // while the verifier ran outranks it: nothing is committed as completed.
+          if (!(await checkCancellation())) return;
           if (verdict.status === 'inconclusive') {
             await stopped('verification-inconclusive');
             return;
@@ -896,6 +1120,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         settledOutcome = failed;
       }
     } finally {
+      await nativeMcp?.close();
       removeLedgerPersistence?.();
       releaseRun?.();
       if (settledOutcome) {

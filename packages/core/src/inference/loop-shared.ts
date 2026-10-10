@@ -1732,7 +1732,9 @@ export function toStepResult(
   index: number,
   toolResultMessage?: Message,
 ): StepResult {
-  const messages: Message[] = [step.assistantMessage];
+  // An empty turn is never appended to the history (2.3), so the step does not
+  // report one either.
+  const messages: Message[] = isEmptyTurn(step.assistantMessage) ? [] : [step.assistantMessage];
   if (toolResultMessage) messages.push(toolResultMessage);
   return {
     stepType: index === 0 ? 'initial' : 'tool-result',
@@ -2351,6 +2353,21 @@ export async function executeTools(
             toolCallId: call.toolCallId,
             toolName: call.toolName,
             result: 'No server-side executor.',
+            isError: true,
+          });
+        }
+        // Arguments that never parsed reach here as their raw JSON text (2.3,
+        // F16): a call cut off mid-stream, a malformed one, or one read back from
+        // an older checkpoint. A raw JSON Schema performs no validation, so the
+        // string would otherwise reach `execute` verbatim. It self-heals instead.
+        if (typeof call.args === 'string') {
+          const message =
+            'Invalid arguments: the tool input is not a JSON object (it may have been cut off). The call was not executed.';
+          emitToolFailed(new Error(message), true);
+          return settle({
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            result: message,
             isError: true,
           });
         }

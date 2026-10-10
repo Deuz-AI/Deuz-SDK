@@ -1,10 +1,11 @@
 import type { CommonCallOptions } from '../types/config';
-import type { CallWarning, StreamChatResult } from '../types/methods';
+import type { CallWarning, StopDetails, StreamChatResult } from '../types/methods';
 import type { GuardrailPart, StreamPart, ToolRunState } from '../types/stream';
 import type { Message } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
 import type { ToolCall, ToolSet, StepResult, ToolApprovalRequest } from '../types/tool';
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
+import type { WireToolRequest } from '../adapters/types';
 import { runStream } from '../core/inference';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { resolveSignal } from '../internal/resolve-call';
@@ -18,7 +19,13 @@ import { toObservedError } from '../internal/observe-error';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
 import { createWarningSink } from '../internal/warnings';
 import type { MemoryMutation } from '../memory';
-import { assembleAssistant, type ToolArgMap, type EncryptedReasoning } from './run-step';
+import {
+  assembleAssistant,
+  blocksToolDispatch,
+  stopDetailsFrom,
+  type ToolArgMap,
+  type EncryptedReasoning,
+} from './run-step';
 import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
 import {
   buildWireTools,
@@ -138,6 +145,21 @@ export interface StreamToolLoopInternal {
   observeResume?: { stepId: string; stepIndex: number; checkpointAgeMs?: number };
   /** Observation (1.6): sub-agent — share the parent runtime, emit no run.* events. */
   observeInherited?: { runtime: ObservationRuntime; parentSpanId?: string };
+  /**
+   * Native runs (2.3, F01): the MCP runtime the native runner resolved before it
+   * admitted the run, because the servers' catalog is part of its resume
+   * binding. The loop uses it in place of connecting `options.mcp`, and never
+   * closes it: the runner does. Its tools already pass through the runner's
+   * effect receipts, and so does every catalog a hot refresh brings.
+   */
+  mcp?: {
+    runtime: ResolvedMcpRuntime;
+    /**
+     * Called after each hot refresh, before the refreshed catalog reaches the
+     * wire. It records the catalog; its warnings go out as `warning` parts.
+     */
+    refreshed(): Promise<CallWarning[]>;
+  };
 }
 
 export interface StreamToolLoopSnapshot {
@@ -151,6 +173,14 @@ export interface StreamToolLoopSnapshot {
   pendingApprovals: ToolApprovalRequest[];
   pendingClientCalls: ToolCall[];
   verified?: boolean;
+  /** The provider's stop explanation for the last step (2.3), e.g. a refusal's category. */
+  stopDetails?: StopDetails;
+  /**
+   * The tool request the last model call carried (2.3). Native finalization
+   * sends the same tools (with `tool_choice: 'none'`), so the conversation's
+   * tool definitions stay byte-identical up to the final answer.
+   */
+  wire?: WireToolRequest;
   error?: unknown;
   handoff?: { to: string; count: number };
 }
@@ -394,6 +424,14 @@ export function runStreamToolLoop(
     let snapshotApprovals: ToolApprovalRequest[] = [];
     let snapshotClientCalls: ToolCall[] = [];
     let lastFinish: FinishReason = 'stop';
+    /**
+     * The last step's provider finish detail (2.3) — carried onto the loop's
+     * `finish` part exactly as a single-turn stream carries it, so a refusal's
+     * `stop_details` survives the loop.
+     */
+    let lastFinishMeta: Record<string, unknown> | undefined;
+    /** The tool request of the last model call (2.3), for native finalization. */
+    let lastWire: WireToolRequest | undefined;
     let stoppedBy: string | undefined;
     let prevCostUsd = 0;
     let stepIndex = resumeFrom?.stepIndex ?? 0;
@@ -433,7 +471,8 @@ export function runStreamToolLoop(
      */
     const handoffLog: HandoffLogEntry[] = [];
     if (durable && internal?.onCheckpoint) {
-      durable.beforeSave = (checkpoint) =>
+      durable.beforeSave = (checkpoint) => {
+        const stopDetails = stopDetailsFrom(lastFinishMeta);
         internal.onCheckpoint!({
           messages: checkpoint.messages,
           steps: [...steps],
@@ -445,8 +484,10 @@ export function runStreamToolLoop(
           pendingApprovals: checkpoint.pendingApprovals ?? [],
           pendingClientCalls: snapshotClientCalls,
           verified,
+          ...(stopDetails ? { stopDetails } : {}),
           ...(checkpoint.handoff ? { handoff: checkpoint.handoff } : {}),
         });
+      };
     }
 
     // Mutated per iteration so tool events parent under the current step span;
@@ -611,7 +652,7 @@ export function runStreamToolLoop(
       // tools ride the very first model call. Inside the try on purpose — an
       // unreachable server rejects here, and the pump's catch turns that into an
       // `error` part with rejected promises, which is what keeps G2 intact.
-      mcp = await setupMcp(options, deps);
+      mcp = internal?.mcp ? internal.mcp.runtime : await setupMcp(options, deps);
       tools = mergeMcpTools(mcp, ownTools);
       // Handoff (2.0): the transfer catalog is read from the ROOT set, ONCE — an
       // agent's own set never carries a transfer to itself, so re-deriving it
@@ -865,6 +906,9 @@ export function runStreamToolLoop(
           // the set belongs to the ACTIVE agent, and re-merging the caller's
           // would silently undo the transfer.
           tools = await refreshMcpTools(mcp, ownTools, deps);
+          // A native run records the refreshed catalog (2.3, F01) before the
+          // model is offered it, and reports how the catalog changed.
+          for (const warning of (await internal?.mcp?.refreshed()) ?? []) warningSink.add(warning);
           fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
           staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
           flushWarnings();
@@ -882,6 +926,7 @@ export function runStreamToolLoop(
         );
         flushWarnings();
         messages = prepared.messages;
+        lastWire = prepared.wire;
         const estimateAtCall = (): number =>
           (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;
         let estimatedAtCall = estimateAtCall();
@@ -907,6 +952,8 @@ export function runStreamToolLoop(
         let stepUsage: Usage = EMPTY_USAGE;
         let stepFinish: FinishReason = 'stop';
         let stepPhase: string | undefined;
+        /** The provider's finish detail for this step (2.3), e.g. refusal `stop_details`. */
+        let stepFinishMeta: Record<string, unknown> | undefined;
         // Overflow auto-recovery (2.0): ONE retry per step. G2 turns the
         // provider's rejection into an `error` PART, not a throw, so the retry
         // gate lives inside the consumption loop rather than around a try.
@@ -941,6 +988,7 @@ export function runStreamToolLoop(
           stepUsage = EMPTY_USAGE;
           stepFinish = 'stop';
           stepPhase = undefined;
+          stepFinishMeta = undefined;
           /** Set instead of failing when the rejection is a recoverable overflow. */
           let overflow: unknown;
 
@@ -982,6 +1030,7 @@ export function runStreamToolLoop(
                 stepFinish = part.finishReason;
                 stepPhase = (part.providerMetadata?.openai as { phase?: string } | undefined)
                   ?.phase;
+                stepFinishMeta = part.providerMetadata;
                 break; // re-framed as step-finish below
               case 'error':
                 // Recoverable overflow: hold the error instead of publishing it —
@@ -1034,11 +1083,13 @@ export function runStreamToolLoop(
         totalUsage = sumUsage(totalUsage, stepUsage);
         calibrateCompaction(compactionRunner, estimatedAtCall, stepUsage);
         lastFinish = stepFinish;
+        lastFinishMeta = stepFinishMeta;
         broadcaster.push({
           type: 'step-finish',
           stepIndex,
           finishReason: stepFinish,
           usage: stepUsage,
+          ...(stepFinishMeta ? { providerMetadata: stepFinishMeta } : {}),
         });
         // Live cumulative cost (1.7, D2): one part per step whenever a
         // priceProvider is injected — cross-leg cumulative on durable resumes.
@@ -1069,15 +1120,21 @@ export function runStreamToolLoop(
           }
         }
 
+        // Finish-reason gate (2.3, F16): a refused or cut-off turn keeps its text
+        // and reasoning, never its tool calls — their arguments may be truncated.
+        const cutOff = blocksToolDispatch(stepFinish);
         const { assistantMessage, toolUseParts } = assembleAssistant(
           text,
           reasoningText,
           reasoningSignature,
           toolArgs,
-          toolOrder,
+          cutOff ? [] : toolOrder,
           encryptedReasoning,
         );
         if (stepPhase) assistantMessage.providerMetadata = { openai: { phase: stepPhase } };
+        // A UI already shows these calls as `input-streaming`; close each one,
+        // since no `tool-call` or `tool-result` will ever follow.
+        if (cutOff) for (const id of toolOrder) toolState(id, toolArgs.get(id)?.name, 'error');
 
         const stepData = {
           text,
@@ -1124,23 +1181,30 @@ export function runStreamToolLoop(
             );
           }
           // Rebase effective model history for the completed checkpoint; the
-          // raw ChatStore history is tracked separately.
-          messages = [...messages, assistantMessage];
-          appended.push(assistantMessage);
-          chatMessages = [...chatMessages, assistantMessage];
+          // raw ChatStore history is tracked separately. An empty turn is not
+          // recorded: no provider accepts `content: []` back.
+          const stored = !isEmptyTurn(assistantMessage);
+          if (stored) {
+            messages = [...messages, assistantMessage];
+            appended.push(assistantMessage);
+            chatMessages = [...chatMessages, assistantMessage];
+          }
 
           // False-finish guard (1.9, N2): consulted BEFORE verifyStep at this
           // same natural-completion boundary — it is the cheaper, narrower
           // question, and a rejection that re-drives SHORT-CIRCUITS verification
           // for this round (nothing worth verifying in an answer the caller
           // already calls incomplete). The two retry budgets never mix.
-          const completion = await evaluateDoneWhen(options, {
-            stepIndex,
-            attempt: falseFinishRetries,
-            text,
-            messages,
-            usage: durableUsage(durable, totalUsage),
-          });
+          // Neither hook re-drives a refused or cut-off turn (2.3).
+          const completion = cutOff
+            ? undefined
+            : await evaluateDoneWhen(options, {
+                stepIndex,
+                attempt: falseFinishRetries,
+                text,
+                messages,
+                usage: durableUsage(durable, totalUsage),
+              });
           if (completion) {
             if (completion.done) {
               // A later round genuinely finished: an earlier give-up must not
@@ -1173,13 +1237,15 @@ export function runStreamToolLoop(
 
           // Verified generation (1.8): emit a verify part; on a rejected
           // verdict, feed feedback back as a user turn and re-drive the loop.
-          const verification = await evaluateVerifyStep(options, {
-            stepIndex,
-            attempt: verifyAttempts,
-            text,
-            messages,
-            usage: durableUsage(durable, totalUsage),
-          });
+          const verification = cutOff
+            ? undefined
+            : await evaluateVerifyStep(options, {
+                stepIndex,
+                attempt: verifyAttempts,
+                text,
+                messages,
+                usage: durableUsage(durable, totalUsage),
+              });
           if (verification) {
             verified = verification.verdict.ok;
             broadcaster.push({
@@ -1231,12 +1297,19 @@ export function runStreamToolLoop(
             // content array is not a message any wire accepts (see isEmptyTurn)
             // — so the turn is DROPPED rather than persisted unsendable.
             const drop = isEmptyTurn(rewritten);
-            messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
-            chatMessages = drop
-              ? chatMessages.slice(0, -1)
-              : [...chatMessages.slice(0, -1), rewritten];
-            if (drop) appended.pop();
-            else appended[appended.length - 1] = rewritten;
+            if (stored) {
+              messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
+              chatMessages = drop
+                ? chatMessages.slice(0, -1)
+                : [...chatMessages.slice(0, -1), rewritten];
+              if (drop) appended.pop();
+              else appended[appended.length - 1] = rewritten;
+            } else if (!drop) {
+              // A replacement gives an empty turn something to say: record it now.
+              messages = [...messages, rewritten];
+              appended.push(rewritten);
+              chatMessages = [...chatMessages, rewritten];
+            }
             // The SAME step must agree — `stopWhen` conditions read `steps[]`.
             steps[steps.length - 1] = {
               ...sr,
@@ -1654,11 +1727,15 @@ export function runStreamToolLoop(
 
       const usage = withTotal(totalUsage);
       const deuzMeta = finishMeta();
+      const providerMetadata: Record<string, unknown> = {
+        ...lastFinishMeta,
+        ...(deuzMeta ? { deuz: deuzMeta } : {}),
+      };
       broadcaster.push({
         type: 'finish',
         usage,
         finishReason: lastFinish,
-        ...(deuzMeta ? { providerMetadata: { deuz: deuzMeta } } : {}),
+        ...(Object.keys(providerMetadata).length > 0 ? { providerMetadata } : {}),
       });
       usageDeferred.resolve(usage);
       finishDeferred.resolve(lastFinish);
@@ -1678,8 +1755,10 @@ export function runStreamToolLoop(
       // site that covers every pump exit — the finish path, the suspension
       // `return`s, the mid-stream `failRun` return and the outer catch — so it
       // lands right after the same post-terminal bookkeeping (settleMemory /
-      // persistChat) each of those paths already performed. Never throws.
-      await closeMcp(mcp, deps);
+      // persistChat) each of those paths already performed. Never throws. A
+      // runtime a native runner handed in is the runner's to close (2.3).
+      if (!internal?.mcp) await closeMcp(mcp, deps);
+      const stopDetails = stopDetailsFrom(lastFinishMeta);
       internal?.onSnapshot?.({
         messages,
         steps,
@@ -1691,6 +1770,8 @@ export function runStreamToolLoop(
         pendingApprovals: snapshotApprovals,
         pendingClientCalls: snapshotClientCalls,
         verified,
+        ...(stopDetails ? { stopDetails } : {}),
+        ...(lastWire ? { wire: lastWire } : {}),
         ...(terminalError !== undefined ? { error: terminalError } : {}),
         ...(durable?.handoff ? { handoff: durable.handoff } : {}),
       });
