@@ -113,6 +113,8 @@ The canonical `effort` option is `'none' | 'low' | 'medium' | 'high' | 'xhigh' |
 
 On **Chat Completions** (GPT-5.4+ ships `reasoning_effort` there, so `gpt-5.5`/`gpt-5.5-pro` accept `effort` too), `'none'` is likewise sent verbatim as `reasoning_effort: 'none'`. Both surfaces send `'none'` as an explicit effort value; the reasoning block/param is skipped only when `effort` is undefined.
 
+That is the default mapping. Since 2.3, a model whose registry row lists its own effort levels uses those instead, on both surfaces, and reports every changed value as a `clamped-setting` warning. For example, `gpt-6.1-sol` sends `'max'` as `'max'`, `gpt-5` sends `'none'` as `'low'` because it has no `'none'`, and `gpt-5-pro` sends every level as `'high'`. [Model profiles](/docs/modules/model-profiles#effort-and-what-none-becomes) lists the levels of each model.
+
 Reasoning models on the Responses surface have `samplingRestrictions` set, so `temperature` and `topP` are dropped for those models. `maxOutputTokens` maps to `max_output_tokens` (falling back to the model's registry `maxOutput`).
 
 Reasoning tokens surface on `usage.reasoningTokens` (from the response's `output_tokens_details.reasoning_tokens`). On the streaming side, reasoning summary/text deltas arrive as `reasoning-delta` parts on `fullStream`.

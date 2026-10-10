@@ -378,6 +378,53 @@ describe('request snapshots per model id (2.3 — not live-verified)', () => {
   }
 });
 
+describe('GPT-5 snapshots: the effort sets OpenAI publishes (2.3 — research-dated, not live-verified)', () => {
+  const EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+  /**
+   * The effort each requested value reaches the wire as, in `EFFORTS` order;
+   * a trailing `*` marks a change the call reports as `clamped-setting`.
+   */
+  const SENT: [string, Make, string[]][] = [
+    // minimal / low / medium / high: 'minimal' has no Deuz level, so 'none' is sent as 'low'.
+    ...['gpt-5', 'gpt-5-mini', 'gpt-5-nano'].map((id): [string, Make, string[]] => [
+      id,
+      responses(id),
+      ['low*', 'low', 'medium', 'high', 'high*', 'high*'],
+    ]),
+    [
+      'gpt-5 (Chat Completions)',
+      chat('gpt-5'),
+      ['low*', 'low', 'medium', 'high', 'high*', 'high*'],
+    ],
+    ['gpt-5.1', responses('gpt-5.1'), ['none', 'low', 'medium', 'high', 'high*', 'high*']],
+    ['gpt-5.2', responses('gpt-5.2'), ['none', 'low', 'medium', 'high', 'xhigh', 'xhigh*']],
+    // 'high' is the only level gpt-5-pro takes.
+    ['gpt-5-pro', responses('gpt-5-pro'), ['high*', 'high*', 'high*', 'high', 'high*', 'high*']],
+    // No published set is pinned for these: the wire's historical mapping, like gpt-6-astra.
+    ...['gpt-5.6-sol', 'gpt-5.2-pro', 'gpt-5.4-pro', 'gpt-5.2-codex'].map(
+      (id): [string, Make, string[]] => [
+        id,
+        responses(id),
+        ['none', 'low', 'medium', 'high', 'xhigh', 'xhigh*'],
+      ],
+    ),
+  ];
+
+  for (const [label, make, sent] of SENT) {
+    it(`${label}: every effort value`, async () => {
+      for (const [i, effort] of EFFORTS.entries()) {
+        const got = await snapshot(make, { effort });
+        const where = `${label} effort=${effort}`;
+        if ('error' in got) throw got.error;
+        // Responses carries `reasoning: { effort }`, Chat Completions `reasoning_effort`.
+        const carried = got.wire.reasoning ?? { effort: got.wire.reasoning_effort };
+        expect(carried, where).toEqual({ effort: sent[i]!.replace('*', '') });
+        expect(got.warnings, where).toEqual(sent[i]!.endsWith('*') ? [EFFORT_CLAMPED] : []);
+      }
+    });
+  }
+});
+
 describe('forced tool choice per model id (2.3, F14 — not live-verified)', () => {
   const FORCED: WireToolRequest = {
     tools: [{ name: 'echo', parameters: { type: 'object', properties: {} } }],

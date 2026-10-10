@@ -366,6 +366,12 @@ const REGISTRY: Record<string, Row> = {
   // a reasoning model. Every GPT-5 model reasons and rejects sampling
   // parameters. The GPT-5.6 rows (GPT-5.6 is Sol) and the pro/codex snapshots
   // pin no limits: placeholder cap, never sent. Not live-verified.
+  // Effort: the level sets OpenAI publishes per snapshot, research-dated
+  // (2026-10-10) and NOT live-verified. gpt-5 / -mini / -nano take
+  // minimal…high, and 'minimal' has no Deuz level, so 'none' is sent as 'low';
+  // gpt-5.1 takes none…high, gpt-5.2 none…xhigh, gpt-5-pro high only. No set
+  // is pinned for the GPT-5.6 rows or the 5.2-pro / 5.4-pro / 5.2-codex
+  // snapshots: they keep the wire's historical mapping, like gpt-6-astra.
   'gpt-5.6-sol': undocumentedOutput('openai', 'responses', {
     reasoning: true,
     samplingRestrictions: true,
@@ -388,6 +394,8 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high', 'xhigh'],
+    effortNone: 'send',
   }),
   'gpt-5.1': row('openai', 'responses', {
     vision: true,
@@ -395,6 +403,8 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high'],
+    effortNone: 'send',
   }),
   'gpt-5': row('openai', 'responses', {
     vision: true,
@@ -402,6 +412,8 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high'],
+    effortNone: 'lowest',
   }),
   'gpt-5-mini': row('openai', 'responses', {
     vision: true,
@@ -409,6 +421,8 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high'],
+    effortNone: 'lowest',
   }),
   'gpt-5-nano': row('openai', 'responses', {
     vision: true,
@@ -416,6 +430,8 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high'],
+    effortNone: 'lowest',
   }),
   'gpt-5.4-pro': undocumentedOutput('openai', 'responses', {
     reasoning: true,
@@ -432,6 +448,8 @@ const REGISTRY: Record<string, Row> = {
   'gpt-5-pro': undocumentedOutput('openai', 'responses', {
     reasoning: true,
     samplingRestrictions: true,
+    effortLevels: ['high'],
+    effortNone: 'lowest',
   }),
   'o4-mini': row('openai', 'responses', {
     vision: true,

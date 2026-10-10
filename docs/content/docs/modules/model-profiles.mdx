@@ -133,6 +133,20 @@ The current models:
 | `glm-5.3` | low, high, max | max | `'lowest'` |
 | `Qwen/Qwen3-Coder-Next` | non-thinking: effort is dropped | — | `'model-default'` |
 
+The earlier GPT-5 snapshots take the effort levels OpenAI publishes for each
+one. These sets are research-dated (2026-10-10) and not live-verified:
+
+| Model | `effort.levels` | `'none'` |
+| --- | --- | --- |
+| `gpt-5`, `gpt-5-mini`, `gpt-5-nano` | low, medium, high (OpenAI's `'minimal'` has no Deuz level) | `'lowest'`: sent as `'low'` |
+| `gpt-5.1` | low, medium, high | `'send'` |
+| `gpt-5.2` | low … xhigh | `'send'` |
+| `gpt-5-pro` | high only: every other level is sent as `'high'` | `'lowest'`: sent as `'high'` |
+
+The GPT-5.6 rows and the `gpt-5.2-pro`, `gpt-5.4-pro` and `gpt-5.2-codex`
+snapshots have no pinned set. Like `gpt-6-astra`, they keep the OpenAI wire's
+historical mapping: low … xhigh, with `'none'` sent as `'none'`.
+
 ## Three output limits
 
 A profile keeps three numbers apart:

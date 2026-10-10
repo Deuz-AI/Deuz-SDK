@@ -282,6 +282,9 @@ const COMPAT_UNSTATED = [
   'audio',
   'contextWindow',
 ] as const;
+const GPT_5_MINIMAL = [
+  "OpenAI documents effort minimal, low, medium and high; 'minimal' has no Deuz level, so 'none' is sent as 'low' (research-dated 2026-10-10, not live-verified).",
+] as const;
 const DEEPSEEK_V4_NOTES = [
   'Always reasons; reasoning tokens share the output budget, so a cap sized for the answer alone can return an empty answer.',
   'Rejects response_format json_schema, and a forced tool_choice in thinking mode.',
@@ -381,6 +384,26 @@ const FACTS: Readonly<Record<string, Facts>> = /* @__PURE__ */ (() => ({
     sampling: { accepted: 'unknown' },
     notes: [
       'A reasoning row on Chat Completions (max_completion_tokens, no sampling parameters): not live-verified.',
+    ],
+  },
+  // The GPT-5 snapshots' effort sets as OpenAI publishes them (the rows hold
+  // the levels): research-dated 2026-10-10, not live-verified.
+  'gpt-5': { notes: GPT_5_MINIMAL },
+  'gpt-5-mini': { notes: GPT_5_MINIMAL },
+  'gpt-5-nano': { notes: GPT_5_MINIMAL },
+  'gpt-5.1': {
+    notes: [
+      'OpenAI documents effort none, low, medium and high (research-dated 2026-10-10, not live-verified).',
+    ],
+  },
+  'gpt-5.2': {
+    notes: [
+      'OpenAI documents effort none, low, medium, high and xhigh (research-dated 2026-10-10, not live-verified).',
+    ],
+  },
+  'gpt-5-pro': {
+    notes: [
+      "OpenAI documents effort high only, so any other level and 'none' are sent as 'high' (research-dated 2026-10-10, not live-verified).",
     ],
   },
 

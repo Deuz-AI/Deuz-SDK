@@ -252,6 +252,48 @@ describe('OpenAI profiles (research 2026-10-09, not live-verified)', () => {
     expect(resolveModelProfile(responses('gpt-6-luna')).thinking.mode).toBe('default');
   });
 
+  it('the GPT-5 snapshots carry the effort sets OpenAI publishes (research-dated)', () => {
+    const effortOf = (id: string) => resolveModelProfile(responses(id)).effort;
+    const field = 'reasoning.effort';
+    for (const id of ['gpt-5', 'gpt-5-mini', 'gpt-5-nano']) {
+      // minimal…high: 'minimal' has no Deuz level, so reasoning cannot be turned off.
+      expect(effortOf(id), id).toEqual({
+        field,
+        levels: ['low', 'medium', 'high'],
+        none: 'lowest',
+      });
+      expect(resolveModelProfile(responses(id)).notes.join(' '), id).toContain('minimal');
+    }
+    expect(effortOf('gpt-5.1')).toEqual({ field, levels: ['low', 'medium', 'high'], none: 'send' });
+    expect(effortOf('gpt-5.2')).toEqual({
+      field,
+      levels: ['low', 'medium', 'high', 'xhigh'],
+      none: 'send',
+    });
+    expect(effortOf('gpt-5-pro')).toEqual({ field, levels: ['high'], none: 'lowest' });
+    // No published set is pinned for these: the wire's historical mapping, like gpt-6-astra.
+    for (const id of ['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.2-pro', 'gpt-5.4-pro', 'gpt-5.2-codex']) {
+      expect(effortOf(id), id).toEqual({
+        field,
+        levels: ['low', 'medium', 'high', 'xhigh'],
+        none: 'send',
+      });
+    }
+    // Every changed level is a listed clamp.
+    const changed = (id: string) =>
+      clampsOf(resolveModelProfile(responses(id)), 'effort').map((c) => `${c.from}→${c.to}`);
+    expect(changed('gpt-5')).toEqual(['xhigh→high', 'max→high', 'none→low']);
+    expect(changed('gpt-5.1')).toEqual(['xhigh→high', 'max→high']);
+    expect(changed('gpt-5.2')).toEqual(['max→xhigh']);
+    expect(changed('gpt-5-pro')).toEqual([
+      'low→high',
+      'medium→high',
+      'xhigh→high',
+      'max→high',
+      'none→high',
+    ]);
+  });
+
   it("a legacy pinned row mirrors the registry: gpt-5.4 clamps 'max' to 'xhigh'", () => {
     const profile = resolveModelProfile(responses('gpt-5.4'));
     expect(profile).toMatchObject({ match: 'exact', status: 'unknown', liveVerified: false });
@@ -523,6 +565,10 @@ const CROSS_CHECK: [string, (fetch: typeof globalThis.fetch) => LanguageModel][]
   ['claude-opus-9-9', (fetch) => createAnthropic({ apiKey: 'k', fetch })('claude-opus-9-9')],
   ['gemini-2.5-pro', (fetch) => createGoogleNative({ apiKey: 'AIza-k', fetch })('gemini-2.5-pro')],
   ['gpt-5.4', (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.4')],
+  // The GPT-5 snapshots' published effort sets.
+  ['gpt-5', (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5')],
+  ['gpt-5.1 (chat)', (fetch) => createOpenAI({ apiKey: 'k', fetch })('gpt-5.1')],
+  ['gpt-5-pro', (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5-pro')],
   ['gpt-6.1-sol (chat)', (fetch) => createOpenAI({ apiKey: 'k', fetch })('gpt-6.1-sol')],
   ['gpt-6.2-unreleased', (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-6.2')],
 ];
