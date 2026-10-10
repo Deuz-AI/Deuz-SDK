@@ -1,0 +1,288 @@
+---
+title: Model profiles
+description: Ask what Deuz knows about a model before you call it — supported, unsupported or unknown capabilities, limits, effort rules, and every value a request changes. New in 2.3.
+---
+
+`resolveModelProfile(model)` returns one explainable record for a model
+descriptor: what the SDK **knows** about the model (capabilities, lifecycle
+status, limits, and where those facts come from) and the **request rules** it
+applies when it calls the model (where `effort` goes, what `effort: 'none'`
+becomes, what happens to `temperature` and forced tool choice, and every value
+a request changes on the way).
+
+A profile is a pure read. Resolving one never calls the provider, never logs,
+and never contains your API key or base URL, so it runs offline, in a browser
+or on an edge runtime.
+
+<Callout type="warn" title="Facts are dated, not live-verified">
+Anthropic facts are verified against Anthropic's API reference as cached on
+2026-10-06. OpenAI, Google, DeepSeek, Kimi, Z.ai and Qwen facts come from
+research dated 2026-10-09. No profile has been checked against the live API, so
+`liveVerified` is always `false`. Each profile carries its `sourceUrl` and
+`checkedAt` date.
+</Callout>
+
+## Resolve a profile
+
+```ts title="profile.ts"
+import { resolveModelProfile } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const profile = resolveModelProfile(anthropic('claude-opus-5-5'));
+
+profile.status; // 'stable'
+profile.capabilities.vision; // 'supported'
+profile.capabilities.audio; // 'unknown' (the source does not say)
+profile.effort; // { field: 'output_config.effort', levels: ['low', …, 'max'], default: 'medium', none: 'lowest' }
+profile.limits; // { contextWindow: 1_000_000, maxOutput: 128_000, defaultOutputCap: 128_000 }
+profile.liveVerified; // false
+```
+
+The result is a frozen copy, rebuilt on every call. Unknown model ids never
+throw. They get a profile whose facts are `'unknown'`.
+
+## What a profile contains
+
+| Field | Meaning |
+| --- | --- |
+| `provider`, `requestedId`, `protocol` | The descriptor's provider id, the model id you passed, and the wire it speaks (`'anthropic'`, `'chat_completions'`, `'responses'` or `'native'`). |
+| `resolvedId` | What the provider documents the id resolving to, such as an alias target. Absent when undocumented. It is the provider's name for the model and may not be a callable id. |
+| `match` | How the registry answered: `'exact'` (a pinned row), `'family'` (the Claude 5.x family rules for an unknown `claude-*-N`, N ≥ 5) or `'fallback'` (conservative defaults). |
+| `status` | `'stable'`, `'preview'`, `'deprecated'` or `'unknown'`. |
+| `capabilities` | `tools`, `vision`, `reasoning`, `structuredOutput`, `caching`, `nativePdf` and `audio`, each `'supported'`, `'unsupported'` or `'unknown'`. |
+| `effort` | The request `field` effort rides on, the `levels` that reach the wire unchanged, the provider's documented `default`, and what `none` becomes. |
+| `thinking` | The reasoning `mode`, the Anthropic `thinking.type` values the model accepts, and how reasoning state `replay`s into the next turn. |
+| `limits` | `contextWindow`, the provider's `maxOutput`, and the `defaultOutputCap` a request carries when you pass no `maxOutputTokens`. |
+| `sampling` | What the SDK does with `temperature` and `topP` (`handling`), what the provider accepts, and the documented rule. |
+| `forcedToolChoice`, `prefill` | Whether the model accepts a forced `toolChoice`, and a conversation that ends with an assistant turn. |
+| `toolProtocols` | The only wires the model takes tool calls on. Absent means any wire. |
+| `usage`, `cache`, `refusal` | Whether the provider's output count includes reasoning tokens, how prompt caching works, and how a refusal arrives. |
+| `clamps` | Every value a request changes on the way to the wire, and the typed warning it reports. |
+| `sourceUrl`, `checkedAt`, `liveVerified`, `notes` | Where the facts come from, when they were checked, `false`, and caveats in words. |
+
+Prices are not part of a profile. They stay in the price table; see
+[Pricing & budgets](/docs/modules/pricing).
+
+## Supported, unsupported, unknown
+
+The capability matrix the adapters read ([`getModelCapabilities`](/docs/advanced/model-registry#reading-the-effective-matrix))
+holds booleans, and an unknown model gets conservative defaults such as
+`tools: false`. A profile does not repeat those defaults as facts. A capability
+is reported as supported or unsupported only when:
+
+- a pinned registry row states it and the documented source does not leave it open, or
+- you claimed it through a factory `capabilities` override.
+
+Everything else is `'unknown'`. For example, DeepSeek V4 rejects
+`response_format: json_schema`, so its `structuredOutput` is `'unsupported'`,
+while the newer `deepseek-flash` row keeps the same safe default without a
+source to back it, so its profile says `'unknown'`.
+
+```ts title="claims.ts"
+import { resolveModelProfile } from '@deuz-sdk/core';
+import { createOllama } from '@deuz-sdk/core/providers';
+
+// A model you pulled yourself has no registry row: everything is unknown...
+const local = createOllama()('my-finetune:latest');
+resolveModelProfile(local).capabilities.tools; // 'unknown'
+
+// ...until you say what you know, once, on the factory.
+const told = createOllama({ capabilities: { tools: true, maxOutput: 32_000 } });
+const profile = resolveModelProfile(told('my-finetune:latest'));
+profile.capabilities.tools; // 'supported'
+profile.limits; // { maxOutput: 32_000, defaultOutputCap: 32_000 }
+```
+
+## Effort, and what `'none'` becomes
+
+`effort.levels` lists the levels that reach the wire unchanged. A level the
+model lacks is lowered to the nearest accepted level below it (or raised to the
+lowest one) and reported as a `clamped-setting` warning. `effort.none` says what
+`effort: 'none'` becomes:
+
+| `none` | What the request carries |
+| --- | --- |
+| `'send'` | The wire's own `'none'` (OpenAI). |
+| `'thinking-disabled'` | Anthropic `thinking: { type: 'disabled' }`. |
+| `'thinking-between-tools'` | Anthropic `thinking: { type: 'between_tools' }`. |
+| `'lowest'` | The model cannot turn reasoning off, so the lowest accepted level is sent, with a `clamped-setting` warning. |
+| `'omit'` | The model cannot turn reasoning off and documents no level to use instead, so nothing is sent, with an `unsupported-setting` warning. |
+| `'model-default'` | Nothing is sent, and the model runs at its own default. |
+
+The current models:
+
+| Model | `effort.levels` | Default | `'none'` |
+| --- | --- | --- | --- |
+| `claude-fable-5-1` | low … max | — | `'lowest'` |
+| `claude-opus-5-5` | low … max | medium | `'lowest'` |
+| `claude-sonnet-5-5` | low … max | high | `'thinking-between-tools'` |
+| `claude-haiku-5-5` | low … max | medium | `'thinking-disabled'` |
+| `gpt-6.1-sol` | low … max (`'max'` is sent as `'max'`) | — | `'lowest'` |
+| `gpt-6-astra`, `gpt-6-luna` | low … xhigh (`'max'` becomes `'xhigh'`) | — | `'send'` |
+| `gemini-3.8-flash` | low, medium, high | medium | `'lowest'` |
+| `gemini-3.1-pro-preview` (native) | low, high | — | `'model-default'` |
+| `deepseek-flash`, `deepseek-v4-pro`, `deepseek-v4-flash` | low … xhigh | — | `'omit'` |
+| `kimi-k3` | low, high, max | max | `'lowest'` |
+| `kimi-k2.7-code` | none documented: effort is dropped | — | `'omit'` |
+| `glm-5.3` | low, high, max | max | `'lowest'` |
+| `Qwen/Qwen3-Coder-Next` | non-thinking: effort is dropped | — | `'model-default'` |
+
+## Three output limits
+
+A profile keeps three numbers apart:
+
+- `limits.contextWindow`: the model's total context window.
+- `limits.maxOutput`: the most the provider lets the model write.
+- `limits.defaultOutputCap`: what a request carries when you pass no
+  `maxOutputTokens`.
+
+They differ on purpose. DeepSeek V4 accepts up to 65,536 output tokens, but its
+default request cap stays at 8,192 so one runaway thinking pass does not turn
+into a large bill.
+
+When a limit is undocumented, the SDK does not guess one onto the wire. On
+OpenAI Chat Completions, OpenAI Responses and Gemini native, where the output
+cap is optional, `defaultOutputCap` is `'omitted'` and the provider's own
+default applies. Earlier releases sent a 4,096-token placeholder there, which
+silently truncated long answers. Anthropic's `max_tokens` is required, so an
+unknown Claude id still sends 4,096. The `unknown-model` warning says so and
+names the two ways to raise it: `maxOutputTokens` per call, or
+`capabilities: { maxOutput }`.
+
+## Clamps: no value changes in silence
+
+`profile.clamps` lists every value a request changes on the way to the wire and
+the typed [`CallWarning`](/docs/core/stream-chat#warnings) the call reports for
+it. Read it before a call to warn a user up front:
+
+```ts title="preflight.ts"
+import { resolveModelProfile } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+for (const clamp of resolveModelProfile(anthropic('claude-opus-5-5')).clamps) {
+  console.log(`${clamp.setting}: ${clamp.from} → ${clamp.to} (${clamp.warning})`);
+}
+// effort: none → low (clamped-setting)
+// temperature: * → dropped (unsupported-setting)
+// topP: * → dropped (unsupported-setting)
+// toolChoice: 'required' → auto (clamped-setting)
+// toolChoice: { type: 'tool' } → auto (clamped-setting)
+// mode: 'tool' → json (clamped-setting)
+```
+
+The same changes arrive at run time as `warnings` on the result and as
+`warning` parts on `fullStream`, logged once per run. The clamps a request can
+report:
+
+- **Effort levels.** OpenAI `'max'` becomes `'xhigh'` unless the model lists
+  `'max'` (as `gpt-6.1-sol` does). Gemini 3 `'xhigh'` and `'max'` become
+  `'high'`, and Gemini 3 Pro `'medium'` becomes `'low'`. On the two budget
+  wires (Anthropic `thinking.budget_tokens`, Gemini 2.5 `thinkingBudget`),
+  `'xhigh'` and `'max'` send the same budget.
+- **Effort `'none'`** on a model that cannot turn reasoning off.
+- **Sampling.** `temperature` and `topP` are dropped for a model that rejects
+  them, and on the Anthropic budget wire while extended thinking is on.
+- **Forced tool choice.** `'required'` or a named tool becomes `'auto'` for a
+  model that rejects forcing.
+- **Structured-output `mode`.** An explicit `mode: 'tool'` in `generateObject`
+  or `streamObject` runs the json strategy when the model cannot be forced into
+  a tool, or Anthropic thinking is on for the request.
+- **`maxOutputTokens`** is raised when an Anthropic thinking budget needs room
+  for the answer.
+- **`promptCaching`** is dropped for an Anthropic model without the caching capability.
+
+## Claude 5.x request rules
+
+These rules are verified against Anthropic's API reference (cached 2026-10-06)
+and are not live-verified. For `claude-fable-5-1`, `claude-opus-5-5`,
+`claude-sonnet-5-5` and `claude-haiku-5-5`:
+
+- Effort rides `output_config.effort`. `thinking.budget_tokens` is never sent.
+- `temperature`, `top_p` and `top_k` are never sent. Fable 5.1 and Opus 5.5
+  reject every value. Sonnet 5.5 and Haiku 5.5 accept only the defaults, and
+  Haiku 5.5 never accepts both together.
+- Structured output uses `output_config.format`. `generateObject` and
+  `streamObject` never take the forced-tool strategy on these models.
+- A forced `toolChoice` is sent as `'auto'` on Fable 5.1, Opus 5.5 and Sonnet
+  5.5. Haiku 5.5 accepts it, but skips thinking for that turn.
+- Prompt caching, vision, a 1,000,000-token context window and 128,000 output tokens.
+- Any unknown `claude-fable-N`, `claude-opus-N`, `claude-sonnet-N` or
+  `claude-haiku-N` with N ≥ 5 (for example `claude-opus-9-9`) gets the
+  strictest of these rules instead of the generic fallback. A `capabilities`
+  override cannot put `budget_tokens` or sampling parameters back on the wire
+  for this family.
+
+## OpenAI Responses is stateless by default
+
+Every Responses request carries `store: false`. A reasoning model always asks
+for `reasoning.encrypted_content`, with or without tools, and the SDK replays
+that encrypted reasoning on the next turn. Conversations keep their reasoning
+state without server-side storage, and organisations with zero data retention
+keep working. To opt back in to server-side storage:
+
+```ts title="store.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createOpenAIResponses } from '@deuz-sdk/core/openai';
+
+const openai = createOpenAIResponses({ apiKey: process.env.OPENAI_API_KEY! });
+
+await generateText({
+  model: openai('gpt-6.1-sol'),
+  prompt: 'Summarise the release notes.',
+  providerOptions: { openai: { store: true } },
+});
+```
+
+OpenAI's retention behaviour itself is not live-verified.
+
+## Endpoints are never guessed from a model id
+
+- **Z.ai GLM.** Access to `glm-5.3` depends on the account and its Coding Plan
+  history. `createGLM` defaults to BigModel (`open.bigmodel.cn`). Pass `baseURL`
+  for Z.ai's international API:
+
+  ```ts title="glm.ts"
+  import { createGLM } from '@deuz-sdk/core/providers';
+
+  const glm = createGLM({
+    apiKey: process.env.ZAI_API_KEY!,
+    baseURL: 'https://api.z.ai/api/paas/v4',
+  });
+  const model = glm('glm-5.3');
+  ```
+
+- **Open weights.** `Qwen/Qwen3-Coder-Next` has one profile for every host that
+  serves it: [Ollama, LM Studio](/docs/providers/local), or vLLM and SGLang
+  through [`createOpenAICompatible`](/docs/providers/compat#createopenaicompatible)
+  with a `baseURL`. Tool calling depends on the engine's `qwen3_coder` tool
+  parser, so its profile reports `tools` as `'unknown'`.
+
+## Current model support
+
+What 2.3 knows about each tracked model. Everything here is pinned in the
+registry and is not live-verified.
+
+| Model | Wire | Status | Notes |
+| --- | --- | --- | --- |
+| `claude-fable-5-1` | Anthropic | stable | Requires 30-day data retention; zero data retention only with Anthropic's approval. |
+| `claude-opus-5-5` | Anthropic | stable | Thinking cannot be turned off. |
+| `claude-sonnet-5-5` | Anthropic | stable | Thinking turns off through `between_tools`, at effort high or below. |
+| `claude-haiku-5-5` | Anthropic | stable | Accepts a forced tool choice; no server-side fallback. |
+| `gpt-6.1-sol` | Responses (tools), Chat Completions (no tools) | unknown | A tool request on Chat Completions fails fast with `InvalidRequestError`. |
+| `gpt-6-astra`, `gpt-6-luna` | Responses | unknown | Limits undocumented: no output cap is sent. |
+| `gemini-3.8-flash` | Gemini native | stable | Output limit undocumented: no output cap is sent. |
+| `gemini-3.1-pro-preview` | Gemini native, OpenAI-compatible | preview | A profile of its own; it does not inherit `gemini-3.8-flash` rules. |
+| `deepseek-flash` | Chat Completions | unknown | Resolves to V4.1-Flash; treated like the always-reasoning V4 family. |
+| `deepseek-v4-pro`, `deepseek-v4-flash` | Chat Completions | unknown | `deepseek-v4-pro` resolves to V4-Pro-0813; `deepseek-v4-flash` is a legacy alias. |
+| `kimi-k3`, `kimi-k2.7-code` | Chat Completions | unknown | Reasoning cannot be turned off. |
+| `glm-5.3` | Chat Completions | unknown | Text-only. Effort rides `reasoning_effort`. |
+| `Qwen/Qwen3-Coder-Next` | Chat Completions (any host) | unknown | Non-thinking; 262,144-token native context. |
+
+## Related
+
+- [Model registry & capabilities](/docs/advanced/model-registry): the capability matrix and its `capabilities` override.
+- [Pricing & budgets](/docs/modules/pricing): prices, cache rates and long-context tiers.
+- [streamChat warnings](/docs/core/stream-chat#warnings): how `CallWarning`s reach your code.

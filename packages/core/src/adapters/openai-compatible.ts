@@ -26,6 +26,15 @@ import {
 import { applyProviderOptions } from '../internal/provider-options';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
+import {
+  assertToolSurface,
+  describeToolChoice,
+  effortWire,
+  isForcedToolChoice,
+  optionalOutputCap,
+  planEffort,
+  reportClamp,
+} from '../core/request-rules';
 
 // --- request building ---
 
@@ -186,10 +195,25 @@ function toOpenAIMessages(
   return out;
 }
 
-/** Map canonical tool choice → OpenAI. undefined ⇒ omit (provider default 'auto'). */
-function mapOpenAIToolChoice(choice: ToolChoice | undefined): string | object | undefined {
+/**
+ * Map canonical tool choice → OpenAI. undefined ⇒ omit (provider default
+ * 'auto'). A forced choice the row says the model rejects is omitted too —
+ * reported as a `clamped-setting` (2.3).
+ */
+function mapOpenAIToolChoice(
+  ctx: BuildContext,
+  choice: ToolChoice | undefined,
+): string | object | undefined {
   if (!choice || choice === 'auto') return undefined;
   if (choice === 'none') return 'none';
+  if (ctx.caps.forcedToolChoice === false && isForcedToolChoice(choice)) {
+    reportClamp(
+      ctx,
+      'toolChoice',
+      `toolChoice ${describeToolChoice(choice)} was sent as 'auto': ${ctx.call.modelId} rejects a forced tool_choice.`,
+    );
+    return undefined;
+  }
   if (choice === 'required') return 'required';
   if (typeof choice === 'object' && choice.type === 'tool') {
     return { type: 'function', function: { name: choice.toolName } };
@@ -199,8 +223,9 @@ function mapOpenAIToolChoice(choice: ToolChoice | undefined): string | object | 
 
 function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options, object, tools, logger, warnings } = ctx;
-  const reasoning = caps.reasoning;
   const restricted = caps.samplingRestrictions;
+  // A model that takes tools only on another wire fails here, before any I/O.
+  assertToolSurface(ctx, 'chat_completions');
 
   const body: Record<string, unknown> = {
     model: call.modelId,
@@ -214,20 +239,24 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     stream: true,
   };
 
-  // Reasoning models use max_completion_tokens and reject sampling params.
-  const maxTokens = options.maxOutputTokens ?? caps.maxOutput;
+  // Reasoning models use max_completion_tokens and reject sampling params. An
+  // unknown model's placeholder cap is left off (2.3) — the host's own default
+  // bounds it instead of the SDK's 4096 guess.
+  const maxTokens = optionalOutputCap(caps, options);
   if (restricted) {
-    body.max_completion_tokens = maxTokens;
+    if (maxTokens !== undefined) body.max_completion_tokens = maxTokens;
   } else {
-    body.max_tokens = maxTokens;
+    if (maxTokens !== undefined) body.max_tokens = maxTokens;
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.topP !== undefined) body.top_p = options.topP;
   }
   if (options.stopSequences) body.stop = options.stopSequences;
-  if (reasoning && options.effort !== undefined) {
-    // OpenAI accepts 'none' as a real value; 'max' is Anthropic-only → clamp.
-    body.reasoning_effort = options.effort === 'max' ? 'xhigh' : options.effort;
-  }
+  // OpenAI accepts 'none' as a real value; 'max' reaches the wire only for a
+  // model that lists it (2.3), elsewhere it clamps to xhigh — reported. An
+  // always-reasoning model (DeepSeek v4) never gets 'none'.
+  const effort = planEffort(ctx, effortWire('chat_completions', caps, call.modelId));
+  if (effort.none) body.reasoning_effort = 'none';
+  else if (effort.level !== undefined) body.reasoning_effort = effort.level;
 
   // Stream-usage opt-in. Despite docs claiming Gemini-compat emits usage on
   // every chunk regardless, in practice it stays silent without this flag — so
@@ -289,7 +318,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
           parameters: t.parameters,
         },
       }));
-    const tc = mapOpenAIToolChoice(tools.toolChoice);
+    const tc = mapOpenAIToolChoice(ctx, tools.toolChoice);
     if (tc !== undefined) body.tool_choice = tc;
     if (tools.allowParallel === false) body.parallel_tool_calls = false;
   } else if (options.responseFormat === 'json') {

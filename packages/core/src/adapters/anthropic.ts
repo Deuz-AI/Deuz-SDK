@@ -14,6 +14,15 @@ import {
   RateLimitError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
+import type { EffortLevel } from '../core/registry';
+import {
+  atMostHigh,
+  describeToolChoice,
+  effortWire,
+  planEffort,
+  reportClamp,
+  reportDrop,
+} from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
 import { acceptsDocuments, resolveMedia, warnDroppedDocument } from '../internal/image';
 import { parseSSE } from '../internal/sse';
@@ -105,23 +114,32 @@ function orderReasoningFirst(blocks: AnthropicBlock[]): AnthropicBlock[] {
   return [...thinking, ...rest];
 }
 
-const THINKING_BUDGET: Record<'low' | 'medium' | 'high' | 'xhigh' | 'max', number> = {
-  low: 4_000,
-  medium: 10_000,
-  high: 24_000,
-  xhigh: 48_000,
-  max: 48_000,
-};
-
-/** Map canonical tool choice → Anthropic. Forced choice is illegal with thinking → fall back to auto. */
+/**
+ * Map canonical tool choice → Anthropic. A forced choice the model cannot take
+ * (`forcedOk` false: the row says so, or extended thinking is on) falls back
+ * to auto — reported as a `clamped-setting`, never silent (2.3).
+ */
 function mapAnthropicToolChoice(
+  ctx: BuildContext,
   choice: ToolChoice | undefined,
-  thinkingOn: boolean,
+  forcedOk: boolean,
   allowParallel: boolean | undefined,
 ): Record<string, unknown> {
   const dp = allowParallel === false ? { disable_parallel_tool_use: true } : {};
   if (choice === 'none') return { type: 'none' };
-  if (!choice || choice === 'auto' || thinkingOn) return { type: 'auto', ...dp };
+  if (!choice || choice === 'auto') return { type: 'auto', ...dp };
+  if (!forcedOk) {
+    const why =
+      ctx.caps.forcedToolChoice === false
+        ? 'rejects a forced tool_choice'
+        : 'rejects a forced tool_choice while extended thinking is on';
+    reportClamp(
+      ctx,
+      'toolChoice',
+      `toolChoice ${describeToolChoice(choice)} was sent as 'auto': ${ctx.call.modelId} ${why}.`,
+    );
+    return { type: 'auto', ...dp };
+  }
   if (choice === 'required') return { type: 'any', ...dp };
   if (typeof choice === 'object' && choice.type === 'tool') {
     return { type: 'tool', name: choice.toolName, ...dp };
@@ -147,27 +165,69 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     ),
   }));
 
-  const effortOn = caps.reasoning && options.effort !== undefined && options.effort !== 'none';
-  // Opus 4.7+/Sonnet 5/Fable 5: budget_tokens returns 400 — effort rides output_config.
-  const useOutputConfig = caps.effortWire === 'output_config';
-  const thinkingOn = effortOn && !useOutputConfig;
-  const maxTokens = options.maxOutputTokens ?? caps.maxOutput;
+  // Opus 4.7+/Sonnet 5/Fable 5/Claude 5.x: budget_tokens returns 400 — effort
+  // rides output_config. Every value changed on the way is reported (2.3): see
+  // core/request-rules.ts.
+  const wire = effortWire('anthropic', caps, call.modelId);
+  const useOutputConfig = wire.field === 'output_config.effort';
+  const effort = planEffort(ctx, wire);
+  let budget: number | undefined;
+  let outputEffort: EffortLevel | undefined;
+  let thinking: Record<string, unknown> | undefined;
+  if (effort.thinkingOff) {
+    // `effort: 'none'` on a model that can turn thinking off. That is only
+    // allowed at effort ≤ high: a documented default within the limit is left
+    // alone, an unknown one is pinned to the lowest effort.
+    thinking = { type: effort.thinkingOff };
+    if (useOutputConfig && !atMostHigh(caps.effortDefault)) outputEffort = 'low';
+  } else if (effort.level !== undefined) {
+    if (useOutputConfig) {
+      outputEffort = effort.level;
+    } else {
+      budget = effort.budget;
+      thinking = { type: 'enabled', budget_tokens: budget };
+    }
+  }
+  // Adaptive thinking runs whenever an effort level rides output_config.
+  const thinkingOn = budget !== undefined || (useOutputConfig && effort.level !== undefined);
+
+  // `max_tokens` is REQUIRED on this wire, so an unknown model's placeholder is
+  // still sent; the registry's `unknown-model` warning names that default and
+  // the two ways to raise it (2.3).
+  const requested = options.maxOutputTokens;
+  let maxTokens = requested ?? caps.maxOutput;
+  if (budget !== undefined && maxTokens < budget + 1_024) {
+    maxTokens = budget + 1_024;
+    if (requested !== undefined) {
+      reportClamp(
+        ctx,
+        'maxOutputTokens',
+        `maxOutputTokens ${requested} was raised to ${maxTokens}: thinking.budget_tokens ` +
+          `${budget} needs room for the answer (${call.modelId}).`,
+      );
+    }
+  }
 
   const body: Record<string, unknown> = {
     model: call.modelId,
-    max_tokens: thinkingOn
-      ? Math.max(maxTokens, THINKING_BUDGET[options.effort as keyof typeof THINKING_BUDGET] + 1_024)
-      : maxTokens,
+    max_tokens: maxTokens,
     messages: wireMessages,
     stream: true,
   };
   if (system) body.system = system;
-  if (thinkingOn) {
-    body.thinking = {
-      type: 'enabled',
-      budget_tokens: THINKING_BUDGET[options.effort as keyof typeof THINKING_BUDGET],
-    };
-    // Anthropic requires temperature unset (=1) when thinking is enabled.
+  if (thinking) body.thinking = thinking;
+  if (budget !== undefined) {
+    // Anthropic requires temperature unset (=1) when thinking is enabled. A
+    // restricted row already reported the drop (core/inference.ts).
+    if (!caps.samplingRestrictions) {
+      const why = `extended thinking (thinking.budget_tokens) on ${call.modelId} runs at the default`;
+      if (options.temperature !== undefined) {
+        reportClamp(ctx, 'temperature', `temperature was dropped from the request: ${why}.`);
+      }
+      if (options.topP !== undefined) {
+        reportClamp(ctx, 'topP', `topP was dropped from the request: ${why}.`);
+      }
+    }
   } else if (!caps.samplingRestrictions) {
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.topP !== undefined) body.top_p = options.topP;
@@ -179,6 +239,13 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       type: 'ephemeral',
       ...(options.promptCaching === 'auto-1h' ? { ttl: '1h' } : {}),
     };
+  } else if (options.promptCaching) {
+    reportDrop(
+      ctx,
+      'promptCaching',
+      `promptCaching was dropped from the request: ${call.modelId} has no prompt-caching ` +
+        'capability in the registry (pass capabilities: { caching: true } if it does).',
+    );
   }
 
   if (ctx.object) {
@@ -206,18 +273,20 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
           },
     );
     body.tool_choice = mapAnthropicToolChoice(
+      ctx,
       ctx.tools.toolChoice,
-      thinkingOn || (effortOn && useOutputConfig),
+      // The row's word wins; otherwise the historical rule: no forcing while thinking.
+      caps.forcedToolChoice ?? !thinkingOn,
       ctx.tools.allowParallel,
     );
   }
 
   // Effort rides output_config on adaptive-thinking models; merge with the
   // json-strategy `output_config.format` set above when both are present.
-  if (effortOn && useOutputConfig) {
+  if (outputEffort !== undefined) {
     body.output_config = {
       ...(body.output_config as Record<string, unknown> | undefined),
-      effort: options.effort,
+      effort: outputEffort,
     };
   }
 

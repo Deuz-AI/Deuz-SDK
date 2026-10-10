@@ -1,9 +1,15 @@
-import { describe, it, expect } from 'vitest';
-import { streamChat, generateText, generateObject } from '../src/index';
+import { describe, it, expect, vi } from 'vitest';
+import { streamChat, generateText, generateObject, streamObject } from '../src/index';
 import { ContextOverflowError, InvalidRequestError } from '../src/errors';
 import { createAnthropic } from '../src/anthropic';
+import { runStream } from '../src/core/inference';
+import { withCapabilityOverride } from '../src/internal/config-symbol';
+import { createWarningSink } from '../src/internal/warnings';
 import type { StreamPart } from '../src/types/stream';
 import type { JSONSchema } from '../src/types/schema';
+import type { CommonCallOptions } from '../src/types/config';
+import type { CallWarning } from '../src/types/methods';
+import type { WireToolRequest } from '../src/adapters/types';
 import { sseResponse, sseEvents, mockFetch } from './fixtures/sse';
 
 const TEXT_STREAM = sseEvents([
@@ -555,5 +561,406 @@ describe('Anthropic context overflow mapping (2.0)', () => {
     });
     expect(error).toBeInstanceOf(InvalidRequestError);
     expect(error).not.toBeInstanceOf(ContextOverflowError);
+  });
+});
+
+// ===================================================================
+// 2.3 (F26) — every value the Anthropic wire changes is reported. The
+// `clamped-setting` warning type existed since 1.9 but was never emitted.
+// ===================================================================
+
+describe('Anthropic clamps are reported, never silent (2.3, F26)', () => {
+  it("budget_tokens wire: 'xhigh' and 'max' share the 48k budget → clamped-setting", async () => {
+    for (const effort of ['xhigh', 'max'] as const) {
+      const { body, warnings } = await claudeRequest('claude-opus-4-6', { effort });
+      expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 48_000 });
+      const clamp = warnings.find((w) => w.type === 'clamped-setting');
+      expect(clamp, effort).toMatchObject({ setting: 'effort' });
+      expect(clamp!.message).toContain('48000');
+    }
+    // A level with its own budget is not a clamp.
+    const high = await claudeRequest('claude-opus-4-6', { effort: 'high' });
+    expect(high.body.thinking).toEqual({ type: 'enabled', budget_tokens: 24_000 });
+    expect(high.warnings).toEqual([]);
+  });
+
+  it('temperature and topP dropped while extended thinking is on → clamped-setting each', async () => {
+    const { body, warnings } = await claudeRequest('claude-opus-4-6', {
+      effort: 'high',
+      temperature: 0.2,
+      topP: 0.9,
+    });
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_p).toBeUndefined();
+    expect(settingsOf(warnings, 'clamped-setting')).toEqual(['temperature', 'topP']);
+    // Without thinking the same values ride the wire, and nothing is reported.
+    const free = await claudeRequest('claude-opus-4-6', { temperature: 0.2 });
+    expect(free.body.temperature).toBe(0.2);
+    expect(free.warnings).toEqual([]);
+  });
+
+  it('an explicit maxOutputTokens raised to fit the thinking budget is reported', async () => {
+    const { body, warnings } = await claudeRequest('claude-opus-4-6', {
+      effort: 'max',
+      maxOutputTokens: 1_000,
+    });
+    expect(body.max_tokens).toBe(49_024);
+    const raised = warnings.find((w) => w.setting === 'maxOutputTokens');
+    expect(raised).toMatchObject({ type: 'clamped-setting' });
+    expect(raised!.message).toContain('1000');
+    expect(raised!.message).toContain('49024');
+  });
+
+  it('forced toolChoice under extended thinking falls back to auto — and now says so', async () => {
+    const { body, warnings } = await claudeRequest(
+      'claude-opus-4-6',
+      { effort: 'high' },
+      { tools: [WEATHER_TOOL], toolChoice: 'required' },
+    );
+    expect(body.tool_choice).toEqual({ type: 'auto' });
+    expect(settingsOf(warnings, 'clamped-setting')).toEqual(['toolChoice']);
+  });
+
+  it('the clamp is logged once per run, not once per rebuilt request', async () => {
+    const warn = vi.fn();
+    const logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
+    const sink = createWarningSink();
+    const { fetch } = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+    for (let step = 0; step < 3; step++) {
+      const result = runStream(
+        {
+          model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-6'),
+          messages: [{ role: 'user', content: 'hi' }],
+          effort: 'max',
+          deps: { logger },
+        },
+        { warnings: sink },
+      );
+      for await (const _ of result.fullStream) void _;
+    }
+    expect(sink.list().filter((w) => w.type === 'clamped-setting')).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![1]).toMatchObject({
+      warning: 'clamped-setting',
+      setting: 'effort',
+      modelId: 'claude-opus-4-6',
+    });
+  });
+});
+
+// ===================================================================
+// 2.3 (F14) — Claude 5.x request rules. Verified against Anthropic's API
+// reference (cached 2026-10-06), NOT live-verified: the 400s these guard
+// against are inferred from the documented rules, so the tests pin the
+// REQUEST the SDK builds, per model id.
+// ===================================================================
+
+const CLAUDE_5 = ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
+/** An id the registry has never heard of, in the 5.x family → family fallback rules. */
+const FAMILY_ID = 'claude-opus-9-9';
+
+const WEATHER_TOOL: WireToolRequest['tools'][number] = {
+  name: 'get_weather',
+  description: 'Weather',
+  parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+};
+
+/**
+ * Drive ONE request through the real pump and hand back the wire body + warnings.
+ * The pump is called directly (so a tool request needs no loop); the per-call
+ * `capabilities` is folded into the descriptor exactly as the public call
+ * boundary (`generate.ts`) does.
+ */
+async function claudeRequest(
+  modelId: string,
+  options: Partial<CommonCallOptions> = {},
+  tools?: WireToolRequest,
+): Promise<{ body: Record<string, unknown>; warnings: CallWarning[] }> {
+  const { fetch, calls } = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+  const result = runStream(
+    {
+      ...options,
+      model: withCapabilityOverride(
+        createAnthropic({ apiKey: 'k', fetch })(modelId),
+        options.capabilities,
+      ),
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    tools ? { tools } : {},
+  );
+  for await (const _ of result.fullStream) void _;
+  return { body: lastBody(calls), warnings: await result.warnings! };
+}
+
+const settingsOf = (warnings: CallWarning[], type: CallWarning['type']) =>
+  warnings.filter((w) => w.type === type).map((w) => w.setting);
+
+describe('Claude 5.x request rules (2.3, F14)', () => {
+  it('every id × effort max/high/low × temperature 0.2 sends ONLY output_config.effort', async () => {
+    for (const id of [...CLAUDE_5, FAMILY_ID]) {
+      for (const effort of ['max', 'high', 'low'] as const) {
+        const { body } = await claudeRequest(id, { effort, temperature: 0.2, topP: 0.9 });
+        expect(body.output_config, `${id}/${effort}`).toEqual({ effort });
+        expect(body.thinking, `${id}/${effort}`).toBeUndefined();
+        expect(body.temperature, `${id}/${effort}`).toBeUndefined();
+        expect(body.top_p, `${id}/${effort}`).toBeUndefined();
+        expect(body.max_tokens, `${id}/${effort}`).toBe(128_000);
+      }
+    }
+  });
+
+  it('the dropped sampling parameters are reported, never silent', async () => {
+    const { warnings } = await claudeRequest('claude-opus-5-5', { temperature: 0.2, topP: 0.9 });
+    expect(settingsOf(warnings, 'unsupported-setting')).toEqual(['temperature', 'topP']);
+  });
+
+  it("forced toolChoice ('required' / a named tool) becomes auto + clamped-setting where it is rejected", async () => {
+    for (const id of ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', FAMILY_ID]) {
+      for (const toolChoice of ['required', { type: 'tool', toolName: 'get_weather' }] as const) {
+        // Without effort too: these models think by default, so forcing is always a 400.
+        const { body, warnings } = await claudeRequest(
+          id,
+          {},
+          { tools: [WEATHER_TOOL], toolChoice },
+        );
+        expect(body.tool_choice, id).toEqual({ type: 'auto' });
+        expect(settingsOf(warnings, 'clamped-setting'), id).toEqual(['toolChoice']);
+      }
+    }
+  });
+
+  it('Haiku 5.5 accepts a forced tool_choice (thinking is skipped), so it is sent as-is', async () => {
+    const { body, warnings } = await claudeRequest(
+      'claude-haiku-5-5',
+      { effort: 'high' },
+      { tools: [WEATHER_TOOL], toolChoice: 'required' },
+    );
+    expect(body.tool_choice).toEqual({ type: 'any' });
+    expect(warnings).toEqual([]);
+  });
+
+  it("toolChoice 'none' and 'auto' are never clamped", async () => {
+    for (const toolChoice of ['none', 'auto'] as const) {
+      const { body, warnings } = await claudeRequest(
+        'claude-opus-5-5',
+        {},
+        { tools: [WEATHER_TOOL], toolChoice },
+      );
+      expect(body.tool_choice).toEqual({ type: toolChoice });
+      expect(warnings).toEqual([]);
+    }
+  });
+
+  it("effort 'none': Sonnet 5.5 → thinking between_tools, nothing else", async () => {
+    const { body, warnings } = await claudeRequest('claude-sonnet-5-5', { effort: 'none' });
+    expect(body.thinking).toEqual({ type: 'between_tools' });
+    expect(body.output_config).toBeUndefined(); // the API default (high) is within the ≤ high limit
+    expect(warnings).toEqual([]);
+  });
+
+  it("effort 'none': Haiku 5.5 → thinking disabled, nothing else", async () => {
+    const { body, warnings } = await claudeRequest('claude-haiku-5-5', { effort: 'none' });
+    expect(body.thinking).toEqual({ type: 'disabled' });
+    expect(body.output_config).toBeUndefined(); // the API default (medium) is within the limit
+    expect(warnings).toEqual([]);
+  });
+
+  it("effort 'none': Opus 5 disables thinking and pins effort low (its default is undocumented)", async () => {
+    const { body, warnings } = await claudeRequest('claude-opus-5', { effort: 'none' });
+    expect(body.thinking).toEqual({ type: 'disabled' });
+    expect(body.output_config).toEqual({ effort: 'low' });
+    expect(warnings).toEqual([]);
+  });
+
+  it("effort 'none': Fable 5.1, Opus 5.5 and the family fallback cannot disable thinking → low + clamped-setting", async () => {
+    for (const id of ['claude-fable-5-1', 'claude-opus-5-5', FAMILY_ID]) {
+      const { body, warnings } = await claudeRequest(id, { effort: 'none' });
+      expect(body.thinking, id).toBeUndefined();
+      expect(body.output_config, id).toEqual({ effort: 'low' });
+      const clamp = warnings.find((w) => w.type === 'clamped-setting');
+      expect(clamp, id).toMatchObject({ setting: 'effort' });
+      expect(clamp!.message).toContain("'none'");
+      expect(clamp!.message).toContain("'low'");
+    }
+  });
+
+  it('the documented capabilities override cannot put budget_tokens or temperature on the wire', async () => {
+    // F14's broken cure: `{ reasoning: true }` on an unknown 5.x id used to send budget_tokens.
+    const cured = await claudeRequest(FAMILY_ID, {
+      effort: 'high',
+      temperature: 0.2,
+      capabilities: { reasoning: true },
+    });
+    expect(cured.body.thinking).toBeUndefined();
+    expect(cured.body.output_config).toEqual({ effort: 'high' });
+    expect(cured.body.temperature).toBeUndefined();
+
+    // Even an override that explicitly claims the old wire is overruled — and says so.
+    const forced = await claudeRequest('claude-opus-5-5', {
+      effort: 'max',
+      temperature: 0.2,
+      capabilities: { effortWire: 'budget_tokens', samplingRestrictions: false },
+    });
+    expect(forced.body.thinking).toBeUndefined();
+    expect(forced.body.output_config).toEqual({ effort: 'max' });
+    expect(forced.body.temperature).toBeUndefined();
+    expect(forced.warnings.find((w) => w.setting === 'capabilities')).toMatchObject({
+      type: 'unsupported-setting',
+    });
+  });
+
+  it('an unknown non-family slug still sends the required max_tokens, and the warning documents it', async () => {
+    const plain = await claudeRequest('claude-unreleased-9');
+    expect(plain.body.max_tokens).toBe(4_096);
+    const unknown = plain.warnings.filter((w) => w.type === 'unknown-model');
+    expect(unknown).toHaveLength(1); // the default is named in THE warning — no second one
+    expect(unknown[0]!.message).toContain('max_tokens 4096');
+    expect(unknown[0]!.message).toContain('maxOutputTokens');
+    expect(unknown[0]!.message).toContain('capabilities: { maxOutput }');
+
+    // Configured: the override reaches the wire and the note is no longer true, so it goes.
+    const configured = await claudeRequest('claude-unreleased-9', {
+      capabilities: { maxOutput: 32_000 },
+    });
+    expect(configured.body.max_tokens).toBe(32_000);
+    expect(configured.warnings[0]!.message).not.toContain('max_tokens');
+  });
+
+  it('a dropped promptCaching is reported on the Anthropic wire', async () => {
+    const { body, warnings } = await claudeRequest('claude-unreleased-9', {
+      promptCaching: 'auto',
+    });
+    expect(body.cache_control).toBeUndefined();
+    expect(warnings.find((w) => w.setting === 'promptCaching')).toMatchObject({
+      type: 'unsupported-setting',
+    });
+  });
+
+  it('prompt caching reaches the wire on the 5.x rows (it used to be dropped)', async () => {
+    for (const id of [...CLAUDE_5, FAMILY_ID]) {
+      const { body } = await claudeRequest(id, { promptCaching: 'auto-1h' });
+      expect(body.cache_control, id).toEqual({ type: 'ephemeral', ttl: '1h' });
+    }
+  });
+
+  it('generateObject / streamObject use output_config.format — never the forced-tool strategy', async () => {
+    const schema = {
+      type: 'object',
+      properties: { a: { type: 'string' } },
+      required: ['a'],
+      additionalProperties: false,
+    } as JSONSchema;
+    for (const id of [...CLAUDE_5, FAMILY_ID]) {
+      for (const mode of ['auto', 'tool'] as const) {
+        const gen = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+        await generateObject({
+          model: createAnthropic({ apiKey: 'k', fetch: gen.fetch })(id),
+          messages: [{ role: 'user', content: 'hi' }],
+          schema,
+          mode,
+        });
+        const body = lastBody(gen.calls);
+        expect(body.output_config, `${id}/${mode}`).toEqual({
+          format: { type: 'json_schema', schema },
+        });
+        expect(body.tools, `${id}/${mode}`).toBeUndefined();
+        expect(body.tool_choice, `${id}/${mode}`).toBeUndefined();
+      }
+      const str = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+      const streamed = streamObject({
+        model: createAnthropic({ apiKey: 'k', fetch: str.fetch })(id),
+        messages: [{ role: 'user', content: 'hi' }],
+        schema,
+        mode: 'tool',
+      });
+      expect(await streamed.object).toEqual({ a: 'x' });
+      expect(lastBody(str.calls).tool_choice, id).toBeUndefined();
+    }
+  });
+});
+
+describe("an explicit mode: 'tool' the model cannot take is reported (2.3, F26)", () => {
+  const schema = {
+    type: 'object',
+    properties: { a: { type: 'string' } },
+    required: ['a'],
+    additionalProperties: false,
+  } as JSONSchema;
+  const modeWarnings = (warnings: CallWarning[] | undefined) =>
+    (warnings ?? []).filter((w) => w.setting === 'mode');
+
+  it('generateObject on Claude 5.x runs the json strategy and says so', async () => {
+    for (const id of ['claude-opus-5-5', FAMILY_ID]) {
+      const { fetch, calls } = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+      const result = await generateObject({
+        model: createAnthropic({ apiKey: 'k', fetch })(id),
+        messages: [{ role: 'user', content: 'hi' }],
+        schema,
+        mode: 'tool',
+      });
+      expect(lastBody(calls).tool_choice, id).toBeUndefined();
+      const reported = modeWarnings(result.warnings);
+      expect(
+        reported.map((w) => w.type),
+        id,
+      ).toEqual(['clamped-setting']);
+      expect(reported[0]!.message, id).toContain("mode 'tool'");
+    }
+  });
+
+  it('streamObject reports it too, once', async () => {
+    const { fetch } = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+    const streamed = streamObject({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-sonnet-5-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      schema,
+      mode: 'tool',
+    });
+    expect(await streamed.object).toEqual({ a: 'x' });
+    expect(modeWarnings(await streamed.warnings).map((w) => w.type)).toEqual(['clamped-setting']);
+  });
+
+  it("'auto' choosing json, or a tool strategy the model takes, is not a clamp", async () => {
+    const auto = mockFetch(() => sseResponse([TEXT_STREAM_JSON]));
+    const picked = await generateObject({
+      model: createAnthropic({ apiKey: 'k', fetch: auto.fetch })('claude-opus-5-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      schema,
+    });
+    expect(modeWarnings(picked.warnings)).toEqual([]);
+    // Haiku 4.5 without effort takes the forced tool: the request is what was asked for.
+    const TOOL_JSON = sseEvents([
+      {
+        event: 'content_block_start',
+        data: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: 'tu_1', name: 'json_output', input: {} },
+        },
+      },
+      {
+        event: 'content_block_delta',
+        data: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'input_json_delta', partial_json: '{"a":"x"}' },
+        },
+      },
+      { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
+      {
+        event: 'message_delta',
+        data: { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: {} },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+    const forced = mockFetch(() => sseResponse([TOOL_JSON]));
+    const kept = await generateObject({
+      model: createAnthropic({ apiKey: 'k', fetch: forced.fetch })('claude-haiku-4-5'),
+      messages: [{ role: 'user', content: 'hi' }],
+      schema,
+      mode: 'tool',
+    });
+    expect(lastBody(forced.calls).tool_choice).toEqual({ type: 'tool', name: 'json_output' });
+    expect(modeWarnings(kept.warnings)).toEqual([]);
   });
 });
