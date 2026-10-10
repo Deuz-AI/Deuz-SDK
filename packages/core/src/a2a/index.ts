@@ -6,6 +6,7 @@
  * - `createA2AHandler` serves an agent: `Request` in, `Response` out, with a
  *   task store (`createInMemoryA2ATaskStore` by default) and an executor that
  *   drives each task.
+ * - `a2aText` reads the text out of a message or an artifact.
  *
  * Edge-safe (Web APIs only), zero dependencies. NOT LIVE-VERIFIED against
  * third-party agents: the wire was derived from `@a2a-js/sdk` 1.3.0 and is
@@ -15,8 +16,67 @@
 export { createA2AClient, fetchAgentCard } from './client';
 export { createA2AHandler } from './handler';
 export { createInMemoryA2ATaskStore } from './task-store';
+export { a2aText } from './protocol';
 export { A2AError } from './errors';
 export type { A2AErrorKind, A2AErrorOptions } from './errors';
-export { a2aText } from './protocol';
 export type { A2AErrorReason } from './protocol';
-export type * from './types';
+export type {
+  // wire model
+  A2ARole,
+  A2ATaskState,
+  A2ATextPart,
+  A2ARawPart,
+  A2AUrlPart,
+  A2ADataPart,
+  A2APart,
+  A2AMessage,
+  A2AArtifact,
+  A2ATaskStatus,
+  A2ATask,
+  A2ATaskStatusUpdateEvent,
+  A2ATaskArtifactUpdateEvent,
+  A2AStreamResponse,
+  A2ASendMessageResponse,
+  A2ATaskPushNotificationConfig,
+  A2ASendMessageConfiguration,
+  A2ASendMessageRequest,
+  A2AGetTaskRequest,
+  A2ACancelTaskRequest,
+  A2ASubscribeToTaskRequest,
+  // agent card
+  A2AProtocolBinding,
+  A2AAgentInterface,
+  A2AAgentProvider,
+  A2AAgentExtension,
+  A2AAgentCapabilities,
+  A2ASecurityRequirement,
+  A2AOAuthFlows,
+  A2ASecurityScheme,
+  A2AAgentSkill,
+  A2AAgentCardSignature,
+  A2AAgentCard,
+  // client
+  A2AMessageDraft,
+  A2AMessageInput,
+  A2ABinding,
+  A2AHeaders,
+  A2AClientOptions,
+  A2ACallOptions,
+  A2ASendMessageOptions,
+  A2AGetTaskOptions,
+  A2ACancelTaskOptions,
+  A2AFetchAgentCardOptions,
+  A2AClient,
+  // handler
+  A2ATaskScope,
+  A2ATaskStore,
+  A2AStatusOptions,
+  A2AArtifactInput,
+  A2AArtifactOptions,
+  A2AExecutionContext,
+  A2ACancelContext,
+  A2AExecuteFunction,
+  A2AExecutor,
+  A2AHandlerOptions,
+  A2AHandler,
+} from './types';
