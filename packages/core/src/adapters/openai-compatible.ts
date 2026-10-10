@@ -340,6 +340,10 @@ interface OpenAIUsage {
   total_tokens?: number;
   prompt_tokens_details?: { cached_tokens?: number; audio_tokens?: number };
   completion_tokens_details?: { reasoning_tokens?: number; audio_tokens?: number };
+  /** DeepSeek: the cached share of `prompt_tokens`. */
+  prompt_cache_hit_tokens?: number;
+  /** Moonshot: the cached share of `prompt_tokens`, reported top-level. */
+  cached_tokens?: number;
 }
 
 interface OpenAIChunk {
@@ -373,21 +377,40 @@ function mapFinish(reason: string | null | undefined): FinishReason {
   }
 }
 
+/**
+ * Chat Completions usage → the canonical contract (`outputTokens` includes
+ * reasoning; `inputTokens` excludes cached reads). OpenAI's completion_tokens
+ * already include reasoning_tokens. Hosts that count reasoning beside the
+ * completion (xAI's shape) give themselves away: their total is prompt +
+ * completion + reasoning, or the reasoning exceeds the completion; reasoning is
+ * then folded into the output. Cache hits are read from whichever counter the
+ * host reports. Host shapes beyond OpenAI's are not live-verified.
+ */
 export function mapOpenAIUsage(u: OpenAIUsage | null | undefined): Usage {
   const prompt = u?.prompt_tokens ?? 0;
-  const cached = u?.prompt_tokens_details?.cached_tokens ?? 0;
+  // One hit may appear in several fields; never count it twice.
+  const cached = Math.max(
+    u?.prompt_tokens_details?.cached_tokens ?? 0,
+    u?.prompt_cache_hit_tokens ?? 0,
+    u?.cached_tokens ?? 0,
+  );
   const completion = u?.completion_tokens ?? 0;
+  const reasoning = u?.completion_tokens_details?.reasoning_tokens ?? 0;
+  const reasoningApart =
+    reasoning > 0 &&
+    (reasoning > completion || u?.total_tokens === prompt + completion + reasoning);
+  const output = reasoningApart ? completion + reasoning : completion;
   const audio =
     (u?.prompt_tokens_details?.audio_tokens ?? 0) +
     (u?.completion_tokens_details?.audio_tokens ?? 0);
   const usage: Usage = {
     inputTokens: Math.max(0, prompt - cached),
-    outputTokens: completion,
-    reasoningTokens: u?.completion_tokens_details?.reasoning_tokens ?? 0,
+    outputTokens: output,
+    reasoningTokens: reasoning,
     cachedReadTokens: cached,
-    cacheWriteTokens: 0,
+    cacheWriteTokens: 0, // no cache-write counter in Chat Completions usage
     cacheWrite1hTokens: 0,
-    totalTokens: u?.total_tokens ?? prompt + completion,
+    totalTokens: u?.total_tokens ?? prompt + output,
   };
   if (audio > 0) usage.audioTokens = audio;
   return usage;

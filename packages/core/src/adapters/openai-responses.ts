@@ -254,14 +254,23 @@ interface ResponsesEvent {
   error?: { message?: string; code?: string };
 }
 
+// output_tokens already includes reasoning_tokens and input_tokens includes the
+// cached reads (OpenAI token counting), which is the canonical contract once the
+// cached share is split out. A Responses-shaped host that counts reasoning beside
+// the output (its total is input + output + reasoning, or the reasoning exceeds
+// the output) has it folded in; not live-verified. No cache-write counter exists.
 function mapResponsesUsage(u: ResponsesUsage | undefined): Usage {
   const input = u?.input_tokens ?? 0;
   const cached = u?.input_tokens_details?.cached_tokens ?? 0;
-  const output = u?.output_tokens ?? 0;
+  const reported = u?.output_tokens ?? 0;
+  const reasoning = u?.output_tokens_details?.reasoning_tokens ?? 0;
+  const reasoningApart =
+    reasoning > 0 && (reasoning > reported || u?.total_tokens === input + reported + reasoning);
+  const output = reasoningApart ? reported + reasoning : reported;
   return {
     inputTokens: Math.max(0, input - cached),
     outputTokens: output,
-    reasoningTokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
+    reasoningTokens: reasoning,
     cachedReadTokens: cached,
     cacheWriteTokens: 0,
     cacheWrite1hTokens: 0,

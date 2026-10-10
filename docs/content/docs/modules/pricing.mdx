@@ -1,6 +1,6 @@
 ---
 title: Pricing & budgets
-description: Estimate GPT-6 Astra, GPT-5.6, Claude Fable 5.1 and Opus 5 costs. Track live spend and share execution budgets across agents in Deuz SDK 2.1.
+description: Estimate GPT-6 Astra, GPT-5.6, Claude Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1 costs from one usage contract. Track live spend and share execution budgets across agents in Deuz SDK 2.3.
 ---
 
 import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
@@ -30,52 +30,78 @@ owns billing.
 
 ## Current model prices
 
-**Verified September 20, 2026.** These models are included in `PRICES_2026`.
-Rates are **USD per 1 million tokens** for standard API processing. Use the exact
-API IDs shown here when calling `priceUsage`.
+These models are included in `PRICES_2026`. Rates are **USD per 1 million
+tokens** for standard API processing. Use the exact API IDs shown here when
+calling `priceUsage`; an ID the table does not list returns `undefined` rather
+than a related model's price (see [model lookup](#model-lookup)).
 
 <Tabs items={['OpenAI', 'Anthropic']}>
 <Tab value="OpenAI">
 
+**Verified September 20, 2026**, except GPT-6.1 Sol.
+
 | Model / API ID                      |  Input | Cache read | Output + reasoning |
 | ----------------------------------- | -----: | ---------: | -----------------: |
 | **GPT-6 Astra** · `gpt-6-astra`     | $10.00 |      $1.00 |             $50.00 |
+| **GPT-6.1 Sol** · `gpt-6.1-sol` ¹   |  $2.00 |      $0.10 |             $10.00 |
 | **GPT-5.6 Sol** · `gpt-5.6-sol`     |  $4.00 |      $0.40 |             $20.00 |
 | **GPT-5.6 Terra** · `gpt-5.6-terra` |  $2.00 |      $0.20 |             $12.00 |
 | **GPT-5.6 Luna** · `gpt-5.6-luna`   |  $0.20 |      $0.02 |              $1.20 |
 
-`gpt-5.6` is also priced as Sol. Cache writes cost 1.25× the input rate.
-Sol's promotional rates are available at least through November 21, 2026.
-See [OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
+¹ Research-dated (October 9, 2026) and not re-verified. Its long-context, tier
+and regional multipliers are unverified, so the row applies its standard rates
+to every prompt length.
+
+`gpt-5.6` is also priced as Sol. Sol's promotional rates are available at least
+through November 21, 2026. OpenAI lists cache writes at 1.25× the input rate,
+but its usage reports no cache-write counter: the OpenAI adapters report
+`cacheWriteTokens: 0`, so those prompt tokens are estimated at the input rate
+(not live-verified). See [OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
 
 </Tab>
 <Tab value="Anthropic">
 
-| Model / API ID                            |  Input | Cache read | Output + reasoning |
-| ----------------------------------------- | -----: | ---------: | -----------------: |
-| **Claude Fable 5.1** · `claude-fable-5-1` | $10.00 |      $0.25 |             $50.00 |
-| **Claude Opus 5** · `claude-opus-5`       |  $5.00 |      $0.50 |             $25.00 |
+**Checked October 6, 2026** against Anthropic's Claude API reference.
 
-| Cache write        | Fable 5.1 | Opus 5 |
-| ------------------ | --------: | -----: |
-| 5-minute retention |    $12.50 |  $6.25 |
-| 1-hour retention   |    $20.00 | $10.00 |
+| Model / API ID                                         |  Input | Cache read | Output + reasoning |
+| ------------------------------------------------------ | -----: | ---------: | -----------------: |
+| **Claude Opus 5.5** · `claude-opus-5-5`                |  $4.00 |      $0.20 |             $20.00 |
+| **Claude Sonnet 5.5** · `claude-sonnet-5-5`            |  $2.00 |      $0.20 |             $10.00 |
+| **Claude Haiku 5.5** · `claude-haiku-5-5`, up to 100K |  $0.10 |      $0.01 |              $0.50 |
+| **Claude Haiku 5.5** · `claude-haiku-5-5`, above 100K |  $0.50 |      $0.05 |              $2.50 |
+| **Claude Fable 5.1** · `claude-fable-5-1`              | $10.00 |      $0.25 |             $50.00 |
+| **Claude Opus 5** · `claude-opus-5`                    |  $5.00 |      $0.50 |             $25.00 |
+| **Claude Sonnet 5** · `claude-sonnet-5`                |  $2.00 |      $0.20 |             $10.00 |
 
-Fable 5.1 cache reads cost **2.5% of input**, so its row explicitly overrides the
-SDK's 10% default. These models have no long-context premium within their
-supported context windows. See [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing),
-[Fable 5.1](https://platform.claude.com/docs/en/models/fable-5-1/overview) and
-[Opus 5](https://platform.claude.com/docs/en/models/opus-5/overview).
+| Cache write | 5-minute retention | 1-hour retention |
+| ----------- | -----------------: | ---------------: |
+| Opus 5.5    |              $5.00 |            $8.00 |
+| Sonnet 5.5  |              $2.50 |            $4.00 |
+| Haiku 5.5   |    $0.125 / $0.625 |    $0.20 / $1.00 |
+| Fable 5.1   |             $12.50 |           $20.00 |
+| Opus 5      |              $6.25 |           $10.00 |
+| Sonnet 5    |              $2.50 |            $4.00 |
+
+Cache reads cost 10% of input except on **Opus 5.5 (5%)** and **Fable 5.1
+(2.5%)**, whose rows override the SDK's 10% default. Haiku 5.5 has two cards: a
+prompt above 100,000 tokens (fresh input, cache reads and cache writes together)
+moves the **whole request** to the higher card. The other models have no
+long-context premium within their 1M context. Claude Sonnet 5 was pinned at
+$3/$15 before 2.3; the reference lists $2/$10. See
+[Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) and
+the [model overview](https://platform.claude.com/docs/en/about-claude/models/overview).
 
 </Tab>
 </Tabs>
 
 ### Long context and other tariffs
 
-For the listed OpenAI models, prompts **above 272,000 tokens** use 2× input and
-cache rates and 1.5× output rates for the **whole request**. The bundled rows
-apply that tier automatically. See the [Astra model reference](https://developers.openai.com/api/docs/models/gpt-6-astra)
+For the listed GPT-6 Astra and GPT-5.6 models, prompts **above 272,000 tokens**
+use 2× input and cache rates and 1.5× output rates for the **whole request**.
+The bundled rows apply that tier automatically. See the [Astra model reference](https://developers.openai.com/api/docs/models/gpt-6-astra)
 and [Sol model reference](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+Haiku 5.5 uses the same mechanism at 100,000 tokens, and a row's
+[`tiers`](#prices_2026-and-modelprice) can express any other threshold.
 
 Batch, fast mode, regional processing, gateway markups and negotiated contracts
 can use different prices. Supply a [custom price provider](#custom-rates-and-margins)
@@ -107,8 +133,8 @@ console.log(usd === undefined ? 'Price unavailable' : `$${usd.toFixed(6)}`);
 
 ### Same usage, different models
 
-This example uses illustrative, separate output and reasoning counters. It is
-local arithmetic and makes no API calls.
+This example is local arithmetic and makes no API calls. `reasoningTokens` is
+the reasoning share of `outputTokens`, as every adapter reports it.
 
 ```ts title="compare-costs.ts"
 import type { Usage } from '@deuz-sdk/core';
@@ -116,7 +142,7 @@ import { priceUsage } from '@deuz-sdk/core/pricing';
 
 const usage: Usage = {
   inputTokens: 10_000,
-  outputTokens: 2_000,
+  outputTokens: 3_000, // 1,000 of them reasoning
   reasoningTokens: 1_000,
   cachedReadTokens: 20_000,
   cacheWriteTokens: 0,
@@ -126,36 +152,56 @@ const usage: Usage = {
 
 priceUsage('gpt-5.6-sol', usage); // $0.108
 priceUsage('gpt-6-astra', usage); // $0.270
+priceUsage('claude-opus-5-5', usage); // $0.104
+priceUsage('claude-sonnet-5-5', usage); // $0.054
+priceUsage('claude-haiku-5-5', usage); // $0.0027
 priceUsage('claude-fable-5-1', usage); // $0.255
-priceUsage('claude-opus-5', usage); // $0.135
 ```
 
-For Sol, that is **$0.040 input + $0.060 output/reasoning + $0.008 cache reads**.
-This holds token counts constant; actual tokenization and reasoning usage vary
-by model.
+For Sol, that is **$0.040 input + $0.060 output (reasoning included) + $0.008
+cache reads**. This holds token counts constant; actual tokenization and
+reasoning usage vary by model.
 
 ## Usage anatomy
 
-`Usage` preserves the token counters available from a provider. `priceUsage`
-applies the following calculation to those counters:
+Every adapter normalizes the provider's counters to one contract: the input
+buckets are disjoint, `outputTokens` holds every generated token, and
+`reasoningTokens` and `audioTokens` are shares of those buckets. `priceUsage`
+therefore bills each token once:
 
-| Usage field          | How it is priced                                       |
-| -------------------- | ------------------------------------------------------ |
-| `inputTokens`        | Fresh input × `input`.                                 |
-| `outputTokens`       | Reported output × `output`.                            |
-| `reasoningTokens`    | Hidden reasoning × `output`.                           |
-| `cachedReadTokens`   | Cache hits × `cachedRead`; default is 0.1× input.      |
-| `cacheWriteTokens`   | Cache writes × `cacheWrite`; default is 1.25× input.   |
-| `cacheWrite1hTokens` | One-hour writes × `cacheWrite1h`; default is 2× input. |
-| `audioTokens`        | If present, × `audio`; default is the input rate.      |
-| `serverToolUses`     | Excluded. Add per-call search/tool fees separately.    |
-| `totalTokens`        | A usage total, not an additional charge.               |
+| Usage field          | How it is priced                                                       |
+| -------------------- | ---------------------------------------------------------------------- |
+| `inputTokens`        | Fresh input × `input`. Excludes cache reads and cache writes.          |
+| `outputTokens`       | Every generated token, reasoning included, × `output`.                 |
+| `reasoningTokens`    | Not billed again: it is the reasoning share of `outputTokens`.         |
+| `cachedReadTokens`   | Cache hits × `cachedRead`; default is 0.1× input.                      |
+| `cacheWriteTokens`   | Cache writes × `cacheWrite`; default is 1.25× input.                   |
+| `cacheWrite1hTokens` | One-hour writes × `cacheWrite1h`; default is 2× input.                 |
+| `audioTokens`        | Not billed again; a row's `audio` rate re-prices the share from input. |
+| `serverToolUses`     | Excluded. Add per-call search/tool fees separately.                    |
+| `totalTokens`        | A usage total, not an additional charge.                               |
 
-<Callout title="Reasoning counters can overlap">
-  The current OpenAI and Anthropic adapters can retain reasoning inside `outputTokens` while also
-  reporting it in `reasoningTokens`. Because `priceUsage` adds both, those responses can be
-  overestimated. For billing, normalize the provider's overlapping counters in your own
-  `PriceProvider`. The arithmetic example above uses separate counters.
+How each wire maps onto that contract:
+
+| Adapter            | Normalization                                                              |
+| ------------------ | -------------------------------------------------------------------------- |
+| OpenAI Responses   | `output_tokens` already includes `reasoning_tokens`.                       |
+| Chat Completions   | `completion_tokens` already includes reasoning.                            |
+| DeepSeek, Moonshot | `prompt_cache_hit_tokens` or a top-level `cached_tokens` are cached reads. |
+| Anthropic          | `output_tokens` includes thinking; `thinking_tokens` is its share.         |
+| Gemini native      | `outputTokens` is candidates + thoughts; thoughts are its share.           |
+
+On every wire, `inputTokens` leaves cached reads out. A Chat Completions or
+Responses-shaped host that counts reasoning beside the output (its total is
+prompt + output + reasoning, or the reasoning exceeds the output) has it folded
+into `outputTokens`. These host shapes come from provider documentation and are
+not live-verified. Usage you build yourself in the 2.2 shape, with
+`reasoningTokens` larger than `outputTokens`, still bills both counters in full.
+
+<Callout title="Audio">
+  `audioTokens` merges prompt and completion audio. A row's `audio` rate re-prices that whole share
+  from the input rate, which fits audio input. If a model bills audio output at yet another rate,
+  price it in your own `PriceProvider`.
 </Callout>
 
 `generateText`, `generateObject`, `embed` and `embedMany` return usage directly.
@@ -402,48 +448,98 @@ table in that form, pass `{ ...PRICES_2026, ...table }`.
 
 ## Model lookup
 
-Lookup first checks the exact ID, then tries a normalized ID with a supported
-vendor prefix or trailing date/suffix removed. Its final fallback is the longest
-known prefix of the original ID.
+Lookup is explicit. It resolves an ID in this order and stops at the first row
+it finds:
+
+1. The exact ID.
+2. An entry in `PRICE_ALIASES`, such as `mistral-large-latest` → `mistral-large`.
+3. Both again after dropping one vendor prefix, in any case (`openai/…`, `Qwen/…`).
+4. Both again after dropping a trailing snapshot date with a real month and
+   day (`-2025-12-11`, `-20251001` or `-251001`).
+
+Anything else returns `undefined`. Lookup never falls back to a family prefix,
+so a new model, a variant with its own tariff or a made-up suffix stays unpriced
+instead of borrowing a related row.
 
 ```ts
-priceUsage('openai/gpt-6-astra', usage); // Resolves the Astra row.
+priceUsage('openai/gpt-6-astra', usage); // The Astra row.
+priceUsage('claude-haiku-4-5-20251001', usage); // The claude-haiku-4-5 row.
+priceUsage('claude-opus-5-not-a-real-model', usage); // undefined, not the Opus 5 price.
 priceUsage('my-private-model', usage); // undefined without a matching row.
 ```
 
-Prefer exact IDs and explicit rows for new models. A family-prefix match can
-resolve a price even when the variant has a different tariff. For strict
-application billing, require `Object.hasOwn(table, modelId)` before estimating.
-Do not turn `undefined` into a zero-dollar charge.
+Map your own IDs onto rows with `aliases`. An alias resolves only when its target
+row exists, and the target can be one of your custom rows:
+
+```ts title="aliases.ts"
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+
+const priceProvider = createPriceProvider({
+  aliases: {
+    'prod-sonnet': 'claude-sonnet-5-5', // a deployment name
+    'kimi-k2-0905-preview': 'kimi-k2', // a snapshot you bill at the K2 rate
+  },
+});
+```
+
+With a USD budget, a call to an unpriced model is not bounded in dollars and
+reports an `unpriced-model` warning; token limits still apply. Price the model
+with a row or an alias, or keep a token limit beside the USD limit. Do not turn
+`undefined` into a zero-dollar charge.
 
 ## `PRICES_2026` and `ModelPrice`
 
 `PRICES_2026` is a bundled snapshot, not a live pricing feed. The highlighted rows
-above were verified on the stated date; other bundled models retain their own
+above were checked on the stated dates; other bundled models retain their own
 historical rates. Check the provider's tariff when updating a deployment.
 
 `PriceTable` is `Record<string, ModelPrice>`. Each row requires `input` and
 `output`, with optional `cachedRead`, `cacheWrite`, `cacheWrite1h` and `audio` rates.
-Two optional context tiers are supported:
+Long-context price cards go in `tiers`:
+
+```ts title="tiered-row.ts"
+import type { PriceTable } from '@deuz-sdk/core/pricing';
+
+const table: PriceTable = {
+  'my-model': {
+    input: 1,
+    output: 4,
+    cachedRead: 0.1,
+    tiers: [
+      { above: 128_000, input: 2, output: 6 },
+      { above: 512_000, input: 4, output: 8, cachedRead: 0.4 },
+    ],
+  },
+};
+```
+
+A tier's `above` is an exclusive threshold on the prompt: fresh input, cache
+reads and both cache-write buckets. The highest threshold the prompt exceeds
+prices the **whole call**. A rate the tier omits falls back to the row's own
+rate (the 128K card above keeps `cachedRead: 0.1`), so spell out every rate that
+changes. The two earlier fixed tiers keep working and take part in the same
+choice:
 
 | Row field  | Trigger                                                        | Behavior                                      |
 | ---------- | -------------------------------------------------------------- | --------------------------------------------- |
+| `tiers`    | The prompt exceeds a tier's `above`                            | Used by the Haiku 5.5 row at 100,000 tokens.  |
 | `over200k` | `inputTokens + cachedReadTokens > 200_000`                     | Existing tier for selected Gemini rows.       |
 | `over272k` | Fresh input + cache reads + both cache-write buckets > 272,000 | Tier used by the listed GPT-6 / GPT-5.6 rows. |
 
-An active tier overrides rates for the whole call. Price individual invocations
-before summing their costs; a run's accumulated tokens are not one long prompt.
-`priceUsage` and `cacheSavings` select the same tier.
+Price individual invocations before summing their costs; a run's accumulated
+tokens are not one long prompt. `priceUsage` and `cacheSavings` select the same
+tier.
 
 ## API at a glance
 
-| Export                                     | Use it for                            |
-| ------------------------------------------ | ------------------------------------- |
-| `priceUsage(model, usage, table?)`         | Estimate one invocation in USD.       |
-| `cacheSavings(model, usage, table?)`       | Estimate savings from cache reads.    |
-| `createPriceProvider({ table?, margin? })` | Inject pricing into calls or clients. |
-| `PRICES_2026`                              | Read or extend the bundled rates.     |
-| `ModelPrice`, `PriceTable`                 | Type your own pricing configuration.  |
+| Export                                               | Use it for                            |
+| ---------------------------------------------------- | ------------------------------------- |
+| `priceUsage(model, usage, table?)`                   | Estimate one invocation in USD.       |
+| `cacheSavings(model, usage, table?)`                 | Estimate savings from cache reads.    |
+| `createPriceProvider({ table?, aliases?, margin? })` | Inject pricing into calls or clients. |
+| `PRICES_2026`                                        | Read or extend the bundled rates.     |
+| `PRICE_ALIASES`                                      | Read the bundled explicit aliases.    |
+| `ModelPrice`, `PriceTable`, `PriceTier`              | Type your own pricing configuration.  |
 
 Prices here cover the token buckets available in `Usage`. Per-request fees,
 provider tools, storage, media jobs and application infrastructure need their own

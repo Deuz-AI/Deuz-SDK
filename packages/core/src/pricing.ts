@@ -8,8 +8,11 @@
  * `deps.priceProvider`, but core never imports it and never bills automatically.
  *
  * Prices are USD per 1,000,000 tokens, sourced from public list prices.
- * GPT-6 Astra, GPT-5.6, Claude Fable 5.1, and Claude Opus 5 rates were verified
- * 2026-09-20; legacy rows retain their earlier price snapshots.
+ * GPT-6 Astra and GPT-5.6 rates were verified 2026-09-20; the Claude 5.x rows
+ * were checked against Anthropic's Claude API reference on 2026-10-06;
+ * gpt-6.1-sol carries research-dated (2026-10-09) rates; legacy rows retain
+ * their earlier price snapshots. Every row and alias is explicit: an id the
+ * table does not list prices as `undefined`, never as a related model.
  * They WILL drift — verify against the provider's pricing page before you bill,
  * or pass your own table to `createPriceProvider({ table: customTable })`.
  *
@@ -21,11 +24,25 @@
 import type { Usage } from './types/usage';
 import type { PriceProvider } from './types/deps';
 
+/** A long-context price card: its rates bill the whole request once the prompt passes `above`. */
+export interface PriceTier {
+  /**
+   * Prompt-token threshold, exclusive. The prompt counts fresh input, cache
+   * reads and both cache-write buckets — everything but the output.
+   */
+  above: number;
+  input: number;
+  output: number;
+  cachedRead?: number;
+  cacheWrite?: number;
+  cacheWrite1h?: number;
+}
+
 /** USD per 1,000,000 tokens for one model. Omitted fields fall back sensibly. */
 export interface ModelPrice {
   /** Fresh (uncached) input tokens. */
   input: number;
-  /** Output tokens (reasoning tokens are billed at the output rate). */
+  /** Output tokens, reasoning included (`Usage.outputTokens` already contains it). */
   output: number;
   /** Cached-read input tokens. Default: 10% of `input` (Anthropic/OpenAI norm). */
   cachedRead?: number;
@@ -33,8 +50,20 @@ export interface ModelPrice {
   cacheWrite?: number;
   /** 1-hour cache-write tokens (Anthropic). Default: 2 × `input`. */
   cacheWrite1h?: number;
-  /** Audio input/output tokens, when billed separately. Default: `input`. */
+  /**
+   * Audio tokens, when billed at their own rate. `Usage.audioTokens` is a share
+   * of the input and output buckets, which already bill it at the text rate, so
+   * this re-prices that share from `input` to `audio`. Omit it when audio bills
+   * like text. Usage merges prompt and completion audio, so a model whose audio
+   * output has a different rate again needs its own `PriceProvider`.
+   */
   audio?: number;
+  /**
+   * Long-context price cards. The tier with the highest `above` that the
+   * prompt exceeds prices the whole request; a rate the tier omits falls back
+   * to this row's own rate. `over200k` and `over272k` take part in the same choice.
+   */
+  tiers?: PriceTier[];
   /** Long-context tier applied when `inputTokens + cachedReadTokens > 200_000` (Gemini Pro). */
   over200k?: { input: number; output: number; cachedRead?: number };
   /** Full-request tier above 272,000 prompt tokens, including both cache-write buckets. */
@@ -59,41 +88,46 @@ export const PRICES_2026: PriceTable = {
   // Standard rates: https://developers.openai.com/api/docs/pricing
   // Above 272k prompt tokens, each model's full request uses 2x input/cache
   // and 1.5x output rates: https://developers.openai.com/api/docs/models/gpt-6-astra
+  // OpenAI lists cache writes at 1.25x input, but neither OpenAI usage shape
+  // carries a cache-write counter (only cached reads), so the adapters report
+  // cacheWriteTokens 0 and those prompt tokens bill at the input rate. The rows
+  // leave cacheWrite to the 1.25x default, which equals the list rate for a
+  // counter you supply yourself. Not live-verified.
   'gpt-6-astra': {
     input: 10,
     output: 50,
     cachedRead: 1,
-    cacheWrite: 12.5,
-    over272k: { input: 20, output: 75, cachedRead: 2, cacheWrite: 25 },
+    over272k: { input: 20, output: 75, cachedRead: 2 },
   },
+  // Research-dated, not re-verified. source: https://developers.openai.com/api/docs/models/gpt-6.1-sol
+  // checkedAt: 2026-10-09 (research). The listed $2.50 cache write is the 1.25x
+  // default. Long-context, tier and regional multipliers are unverified, so a
+  // prompt above 272k bills at these standard rates.
+  'gpt-6.1-sol': { input: 2, output: 10, cachedRead: 0.1 },
   'gpt-5.6-sol': {
     input: 4,
     output: 20,
     cachedRead: 0.4,
-    cacheWrite: 5,
-    over272k: { input: 8, output: 30, cachedRead: 0.8, cacheWrite: 10 },
+    over272k: { input: 8, output: 30, cachedRead: 0.8 },
   },
-  // GPT-5.6 is an alias for Sol; keep an exact entry ahead of legacy prefixes.
+  // GPT-5.6 is an alias for Sol, kept as its own row for direct table reads.
   'gpt-5.6': {
     input: 4,
     output: 20,
     cachedRead: 0.4,
-    cacheWrite: 5,
-    over272k: { input: 8, output: 30, cachedRead: 0.8, cacheWrite: 10 },
+    over272k: { input: 8, output: 30, cachedRead: 0.8 },
   },
   'gpt-5.6-terra': {
     input: 2,
     output: 12,
     cachedRead: 0.2,
-    cacheWrite: 2.5,
-    over272k: { input: 4, output: 18, cachedRead: 0.4, cacheWrite: 5 },
+    over272k: { input: 4, output: 18, cachedRead: 0.4 },
   },
   'gpt-5.6-luna': {
     input: 0.2,
     output: 1.2,
     cachedRead: 0.02,
-    cacheWrite: 0.25,
-    over272k: { input: 0.4, output: 1.8, cachedRead: 0.04, cacheWrite: 0.5 },
+    over272k: { input: 0.4, output: 1.8, cachedRead: 0.04 },
   },
 
   // ---- OpenAI (earlier GPT-5 family snapshots) ----
@@ -115,8 +149,31 @@ export const PRICES_2026: PriceTable = {
   'o4-mini': { input: 1.1, output: 4.4, cachedRead: 0.275 },
 
   // ---- Anthropic (Claude 5 + 4 families) ----
-  // These two rows verified 2026-09-20; standard pricing across the 1M context.
-  // https://platform.claude.com/docs/en/about-claude/pricing
+  // source: https://platform.claude.com/docs/en/about-claude/pricing (Claude API
+  // reference). Standard pricing across the 1M context unless a row lists tiers.
+  // checkedAt 2026-10-06; cache reads at 5% of input.
+  'claude-opus-5-5': { input: 4, output: 20, cachedRead: 0.2, cacheWrite: 5, cacheWrite1h: 8 },
+  // checkedAt 2026-10-06.
+  'claude-sonnet-5-5': { input: 2, output: 10, cachedRead: 0.2, cacheWrite: 2.5, cacheWrite1h: 4 },
+  // checkedAt 2026-10-06. Two cards by prompt length: up to 100K tokens, and above.
+  'claude-haiku-5-5': {
+    input: 0.1,
+    output: 0.5,
+    cachedRead: 0.01,
+    cacheWrite: 0.125,
+    cacheWrite1h: 0.2,
+    tiers: [
+      {
+        above: 100_000,
+        input: 0.5,
+        output: 2.5,
+        cachedRead: 0.05,
+        cacheWrite: 0.625,
+        cacheWrite1h: 1,
+      },
+    ],
+  },
+  // checkedAt 2026-10-06 (unchanged since 2026-09-20); cache reads at 2.5% of input.
   'claude-fable-5-1': {
     input: 10,
     output: 50,
@@ -124,11 +181,12 @@ export const PRICES_2026: PriceTable = {
     cacheWrite: 12.5,
     cacheWrite1h: 20,
   },
+  // checkedAt 2026-10-06 (unchanged since 2026-09-20).
   'claude-opus-5': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
   'claude-fable-5': { input: 10, output: 50, cachedRead: 1, cacheWrite: 12.5, cacheWrite1h: 20 },
-  // Sonnet 5 intro pricing ($2/$10) runs through 2026-08-31; standard rates are
-  // pinned so we never undercharge — nothing to flip on Sept 1.
-  'claude-sonnet-5': { input: 3, output: 15, cachedRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
+  // checkedAt 2026-10-06: the reference lists $2/$10. The earlier $3/$15 pin
+  // assumed an intro price that the reference no longer shows.
+  'claude-sonnet-5': { input: 2, output: 10, cachedRead: 0.2, cacheWrite: 2.5, cacheWrite1h: 4 },
   'claude-opus-4-8': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
   'claude-opus-4-7': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
   'claude-opus-4-6': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
@@ -169,10 +227,10 @@ export const PRICES_2026: PriceTable = {
   'deepseek-r1': { input: 0.55, output: 2.19, cachedRead: 0.14 },
 
   // ---- OpenAI-compatible hosts (providers-compat) ----
-  // mistral-large-latest → Mistral Large 3 list price (verified 2026-07).
+  // Mistral Large 3 list price (verified 2026-07); `mistral-large-latest` is an alias.
   'mistral-large': { input: 0.5, output: 1.5 },
-  // Moonshot list prices (verified 2026-07). kimi-k2 covers the legacy K2 family;
-  // kimi-k2.6 is pinned explicitly so the prefix lookup can't undercharge it.
+  // Moonshot list prices (verified 2026-07). Each row prices its exact id only:
+  // other K2 variants need a row or an alias of their own.
   'kimi-k2': { input: 0.6, output: 2.5, cachedRead: 0.15 },
   'kimi-k2.6': { input: 0.95, output: 4, cachedRead: 0.16 },
 
@@ -181,8 +239,8 @@ export const PRICES_2026: PriceTable = {
   // search itself (a few dollars per 1,000 requests, tiered by search mode).
   // That dimension has no token equivalent, so `priceUsage` returns the token
   // floor, never the invoice. Add the request fee in your own accounting.
-  // `sonar-reasoning-pro` has no row of its own — the prefix lookup resolves it
-  // to `sonar`, which under-counts; pass a custom table if you bill on it.
+  // `sonar-reasoning-pro` has no row of its own, so it is unpriced (it no longer
+  // borrows the cheaper `sonar` row); pass a custom table if you bill on it.
   sonar: { input: 1, output: 1 },
   'sonar-pro': { input: 3, output: 15 },
 
@@ -204,70 +262,106 @@ export const PRICES_2026: PriceTable = {
   'voyage-3.5-lite': { input: 0.02, output: 0 },
 };
 
-/** Tolerant lookup: exact slug, then a date-stamp / `-all` / region-suffix strip. */
-function lookup(table: PriceTable, model: string): ModelPrice | undefined {
-  if (table[model]) return table[model];
-  // strip a trailing date stamp (gpt-5.2-2025-12-11 → gpt-5.2) or vendor prefix (google/…)
-  const stripped = model
-    .replace(/^[a-z-]+\//, '') // "google/gemini-2.5-flash" → "gemini-2.5-flash"
-    .replace(/-\d{4}-\d{2}-\d{2}$/, '') // ISO date stamp
-    .replace(/-\d{6,8}$/, '') // compact date stamp (…-250828)
-    .replace(/-(all|latest|fast|preview|exp)$/, '');
-  if (stripped !== model && table[stripped]) return table[stripped];
-  // last resort: longest known prefix match (gpt-5.2-chat → gpt-5.2)
-  let best: ModelPrice | undefined;
-  let bestLen = 0;
-  for (const key of Object.keys(table)) {
-    if (model.startsWith(key) && key.length > bestLen) {
-      best = table[key];
-      bestLen = key.length;
-    }
-  }
-  return best;
+/**
+ * Explicit aliases: an id → the row that prices it. Lookup resolves an id by
+ * exact row, then this table, then the same two after dropping one vendor
+ * prefix (`google/…`, `Qwen/…`) and a trailing snapshot date. It never falls
+ * back to a family prefix, so a new or invented id stays unpriced.
+ */
+export const PRICE_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  // Mistral's moving alias for Mistral Large 3, the id the registry uses.
+  'mistral-large-latest': 'mistral-large',
+});
+
+const VENDOR_PREFIX = /^[A-Za-z0-9][\w.-]*\//;
+// -2025-12-11, -20251211 or -251211, with a real month and day.
+const DATE_STAMP =
+  /-(?:20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])|(?:20)?\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))$/;
+
+function own<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
+  return Object.hasOwn(record, key) ? record[key] : undefined;
+}
+
+function lookup(
+  table: PriceTable,
+  model: string,
+  aliases: Readonly<Record<string, string>>,
+): ModelPrice | undefined {
+  const find = (id: string): ModelPrice | undefined => {
+    const target = own(aliases, id);
+    return own(table, id) ?? (target === undefined ? undefined : own(table, target));
+  };
+  const bare = model.replace(VENDOR_PREFIX, '');
+  return find(model) ?? find(bare) ?? find(bare.replace(DATE_STAMP, ''));
 }
 
 const M = 1_000_000;
 
-/** Select the full-request rates once for both cost and cache-savings estimates. */
+type TierRates = Omit<PriceTier, 'above'>;
+
+/**
+ * Select the full-request rates once for both cost and cache-savings
+ * estimates: the applicable tier with the highest threshold, if any.
+ */
 function ratesForUsage(price: ModelPrice, usage: Usage): ModelPrice {
-  const promptTokens =
+  const prompt =
     usage.inputTokens + usage.cachedReadTokens + usage.cacheWriteTokens + usage.cacheWrite1hTokens;
-  if (price.over272k && promptTokens > 272_000) return { ...price, ...price.over272k };
-  // Preserve the existing Gemini threshold, which counts fresh and cached reads.
-  if (price.over200k && usage.inputTokens + usage.cachedReadTokens > 200_000) {
-    return { ...price, ...price.over200k };
+  const candidates: [above: number, measured: number, rates: TierRates | undefined][] = [
+    // The legacy Gemini threshold keeps counting fresh and cached reads only.
+    [200_000, usage.inputTokens + usage.cachedReadTokens, price.over200k],
+    [272_000, prompt, price.over272k],
+    ...(price.tiers ?? []).map((tier): [number, number, TierRates] => [tier.above, prompt, tier]),
+  ];
+  let selected: TierRates | undefined;
+  let selectedAbove = -Infinity;
+  for (const [above, measured, rates] of candidates) {
+    if (rates && measured > above && above > selectedAbove) {
+      selected = rates;
+      selectedAbove = above;
+    }
   }
-  return price;
+  return selected ? { ...price, ...selected } : price;
 }
 
 /**
  * Compute the USD cost of one `Usage` for `model` from a price table.
  * Returns `undefined` when the model is unknown (so callers can fall back).
- * Reasoning tokens bill at the output rate; cached-read/cache-write/audio use
- * their dedicated rate or a sensible multiple of `input`.
+ * Every token bills once: `outputTokens` (reasoning included) at the output
+ * rate, the cache buckets at their dedicated rate or a sensible multiple of
+ * `input`. `reasoningTokens` and `audioTokens` are shares of those buckets,
+ * not extra tokens; a row's `audio` rate re-prices the audio share only.
  */
 export function priceUsage(
   model: string,
   usage: Usage,
   table: PriceTable = PRICES_2026,
 ): number | undefined {
-  const p = lookup(table, model);
-  if (!p) return undefined;
+  const p = lookup(table, model, PRICE_ALIASES);
+  return p && costOf(p, usage);
+}
 
+function costOf(p: ModelPrice, usage: Usage): number {
   const rates = ratesForUsage(p, usage);
 
   const cachedRead = rates.cachedRead ?? rates.input * 0.1;
   const cacheWrite = rates.cacheWrite ?? rates.input * 1.25;
   const cacheWrite1h = rates.cacheWrite1h ?? rates.input * 2;
-  const audioRate = rates.audio ?? rates.input;
+  // A subset never exceeds its superset: usage built the 2.2 way, with reasoning
+  // counted beside the output, shows up like this and still bills in full.
+  const output =
+    usage.reasoningTokens > usage.outputTokens
+      ? usage.outputTokens + usage.reasoningTokens
+      : usage.outputTokens;
+  const audioPremium =
+    rates.audio === undefined ? 0 : (usage.audioTokens ?? 0) * (rates.audio - rates.input);
 
   const cost =
     (usage.inputTokens * rates.input +
-      (usage.outputTokens + usage.reasoningTokens) * rates.output +
+      output * rates.output +
       usage.cachedReadTokens * cachedRead +
       usage.cacheWriteTokens * cacheWrite +
       usage.cacheWrite1hTokens * cacheWrite1h +
-      (usage.audioTokens ?? 0) * audioRate) /
+      audioPremium) /
     M;
 
   // Avoid -0 and float dust; round to micro-dollars.
@@ -285,8 +379,11 @@ export function cacheSavings(
   usage: Usage,
   table: PriceTable = PRICES_2026,
 ): number | undefined {
-  const p = lookup(table, model);
-  if (!p) return undefined;
+  const p = lookup(table, model, PRICE_ALIASES);
+  return p && savingsOf(p, usage);
+}
+
+function savingsOf(p: ModelPrice, usage: Usage): number {
   if (usage.cachedReadTokens <= 0) return 0;
   const rates = ratesForUsage(p, usage);
   const cachedRead = rates.cachedRead ?? rates.input * 0.1;
@@ -299,26 +396,33 @@ export interface CreatePriceProviderOptions {
   table?: PriceTable;
   /** Multiply every computed cost (e.g. 1.3 for a 30% margin). Default 1. */
   margin?: number;
+  /**
+   * More explicit aliases (your id → a row id), merged over `PRICE_ALIASES`:
+   * deployment names, gateway ids or snapshots the bundled table does not list.
+   * An alias resolves only when its target row exists in the merged table.
+   */
+  aliases?: Record<string, string>;
 }
 
 /**
  * Build a `PriceProvider` to inject via `deps.priceProvider`. The 2026 table is
- * the default; pass `{ table }` to override prices and `{ margin }` to apply a
- * markup. Unknown models yield `undefined` (never a wrong charge). Implements
- * the optional `cacheSavings` seam, so the live `cost` stream part carries
- * `cacheSavingsUsd` out of the box.
+ * the default; pass `{ table }` to override prices, `{ aliases }` to map your
+ * own ids onto rows and `{ margin }` to apply a markup. Unknown models yield
+ * `undefined` (never a wrong charge). Implements the optional `cacheSavings`
+ * seam, so the live `cost` stream part carries `cacheSavingsUsd` out of the box.
  */
 export function createPriceProvider(options: CreatePriceProviderOptions = {}): PriceProvider {
   const table = options.table ? { ...PRICES_2026, ...options.table } : PRICES_2026;
+  const aliases = options.aliases ? { ...PRICE_ALIASES, ...options.aliases } : PRICE_ALIASES;
   const margin = options.margin ?? 1;
   return {
     priceUsage(model: string, usage: Usage): number | undefined {
-      const base = priceUsage(model, usage, table);
-      return base === undefined ? undefined : Math.round(base * margin * 1e6) / 1e6;
+      const p = lookup(table, model, aliases);
+      return p && Math.round(costOf(p, usage) * margin * 1e6) / 1e6;
     },
     cacheSavings(model: string, usage: Usage): number | undefined {
-      const base = cacheSavings(model, usage, table);
-      return base === undefined ? undefined : Math.round(base * margin * 1e6) / 1e6;
+      const p = lookup(table, model, aliases);
+      return p && Math.round(savingsOf(p, usage) * margin * 1e6) / 1e6;
     },
   };
 }

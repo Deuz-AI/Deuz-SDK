@@ -260,18 +260,22 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
 export function mapGeminiUsage(u: GeminiUsageMetadata | undefined): Usage {
   const prompt = u?.promptTokenCount ?? 0;
   const cached = u?.cachedContentTokenCount ?? 0;
+  // Gemini counts thoughts beside the candidates; the contract folds them into
+  // outputTokens (both bill at the output rate) and keeps reasoningTokens a subset.
+  const thoughts = u?.thoughtsTokenCount ?? 0;
+  const output = (u?.candidatesTokenCount ?? 0) + thoughts;
   const audio = (u?.promptTokensDetails ?? [])
     .concat(u?.candidatesTokensDetails ?? [])
     .filter((d) => d.modality === 'AUDIO')
     .reduce((sum, d) => sum + (d.tokenCount ?? 0), 0);
   const usage: Usage = {
     inputTokens: Math.max(0, prompt - cached),
-    outputTokens: u?.candidatesTokenCount ?? 0,
-    reasoningTokens: u?.thoughtsTokenCount ?? 0,
+    outputTokens: output,
+    reasoningTokens: thoughts,
     cachedReadTokens: cached,
     cacheWriteTokens: 0, // Gemini has no per-request cache-write counter
     cacheWrite1hTokens: 0,
-    totalTokens: u?.totalTokenCount ?? prompt + (u?.candidatesTokenCount ?? 0),
+    totalTokens: u?.totalTokenCount ?? prompt + output,
   };
   if (audio > 0) usage.audioTokens = audio;
   return usage;
