@@ -433,6 +433,15 @@ const REGISTRY: Record<string, Row> = {
     structuredOutput: false,
     effortNone: 'omit',
   }),
+  // 2.3 (F08) — research-dated (roadmap 5.3, 2026-10-09), NOT live-verified.
+  // `deepseek-flash` resolves to V4.1-Flash and returns `reasoning_content`;
+  // it is treated like the always-reasoning V4 family above ('none' omitted).
+  // Limits undocumented → placeholder cap, never sent.
+  'deepseek-flash': undocumentedOutput('deepseek', 'chat_completions', {
+    reasoning: true,
+    structuredOutput: false,
+    effortNone: 'omit',
+  }),
   'mistral-large-latest': row('mistral', 'chat_completions', {
     vision: true, // Mistral Large 3 is multimodal-by-design
     structuredOutput: false,
@@ -442,6 +451,24 @@ const REGISTRY: Record<string, Row> = {
     structuredOutput: false,
     contextWindow: 131_072,
   }),
+  // 2.3 (F08) — research-dated (roadmap 5.3, 2026-10-09), NOT live-verified.
+  // kimi-k3: reasoning cannot be turned off; reasoning_effort low/high/max,
+  // default max ('max' is a real value). Never the K2.x thinking parameter.
+  'kimi-k3': undocumentedOutput('moonshot', 'chat_completions', {
+    reasoning: true,
+    structuredOutput: false,
+    effortLevels: ['low', 'high', 'max'],
+    effortDefault: 'max',
+    effortNone: 'lowest',
+  }),
+  // kimi-k2.7-code has no non-thinking mode either, and K3's effort scheme
+  // does not carry over: no effort level is documented, so none is sent.
+  'kimi-k2.7-code': undocumentedOutput('moonshot', 'chat_completions', {
+    reasoning: true,
+    structuredOutput: false,
+    effortLevels: [],
+    effortNone: 'omit',
+  }),
   'qwen3-max': row('qwen', 'chat_completions', {
     structuredOutput: false,
     contextWindow: 262_144,
@@ -449,6 +476,19 @@ const REGISTRY: Record<string, Row> = {
   'glm-4.6': row('glm', 'chat_completions', {
     structuredOutput: false,
     contextWindow: 200_000,
+  }),
+  // 2.3 (F08) — research-dated (roadmap 5.3, 2026-10-09), NOT live-verified.
+  // glm-5.3: text-only, reasoning cannot be turned off (`thinking.type:
+  // disabled` is unsupported); effort low/high/max, default max, sent as
+  // reasoning_effort on this wire. Access depends on the account, so the
+  // endpoint is never guessed from the id: Z.ai's international API is a
+  // `baseURL` (createGLM defaults to BigModel).
+  'glm-5.3': undocumentedOutput('glm', 'chat_completions', {
+    reasoning: true,
+    structuredOutput: false,
+    effortLevels: ['low', 'high', 'max'],
+    effortDefault: 'max',
+    effortNone: 'lowest',
   }),
   'minimax-m2': row('minimax', 'chat_completions', {
     structuredOutput: false,
@@ -544,6 +584,19 @@ const REGISTRY: Record<string, Row> = {
   // That override channel is exactly why `CompatSettings.capabilities` is
   // public in 2.0. Same reasoning applies to any self-hosted vLLM/llama.cpp
   // reached through `createOpenAICompatible`.
+  //
+  // The one exception (2.3): an open-weight model under its CANONICAL
+  // `Org/Model` id, which names the weights rather than a local tag. Such a row
+  // carries the `ANY_HOST` provider and answers for whichever host serves it.
+
+  // 2.3 (F08) — official model card, research-dated 2026-10-09, NOT
+  // live-verified. Non-thinking only (never infer reasoning from the Qwen3
+  // family), 262_144 native context. Tool calling depends on the engine's
+  // qwen3_coder parser, and the output limit is undocumented (cap left off).
+  'Qwen/Qwen3-Coder-Next': undocumentedOutput(ANY_HOST, 'chat_completions', {
+    structuredOutput: false,
+    contextWindow: 262_144,
+  }),
 };
 
 // --- Gemini NATIVE (generateContent) rows — surface:'native', keyed separately

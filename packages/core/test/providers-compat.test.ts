@@ -21,6 +21,7 @@ import {
   createHyperbolic,
   createOllama,
   createLMStudio,
+  createKimi,
   groq,
   mistral,
   deepseek,
@@ -658,5 +659,147 @@ describe("DeepSeek v4 always reasons: effort 'none' never reaches the wire (2.3,
     });
     expect(body.reasoning_effort).toBe('high');
     expect(warnings).toEqual([]);
+  });
+});
+
+describe('deepseek-flash (2.3, F08 — resolves to V4.1-Flash)', () => {
+  it('is a known reasoning row; the undocumented output cap is left off', async () => {
+    const caps = getCapabilities(createDeepSeek()('deepseek-flash'));
+    expect(caps).toMatchObject({ known: true, reasoning: true, structuredOutput: false });
+    const { body, warnings } = await compatRequest(createDeepSeek, 'deepseek-flash', {
+      effort: 'high',
+    });
+    expect(body.reasoning_effort).toBe('high');
+    expect('max_tokens' in body).toBe(false);
+    expect(warnings).toEqual([]); // no unknown-model fallback any more
+  });
+
+  it("is treated like the always-reasoning V4 family: 'none' is dropped, reported", async () => {
+    const { body, warnings } = await compatRequest(createDeepSeek, 'deepseek-flash', {
+      effort: 'none',
+    });
+    expect('reasoning_effort' in body).toBe(false);
+    expect(warned(warnings, 'unsupported-setting')).toEqual(['effort']);
+  });
+});
+
+describe('kimi-k3 (2.3, F08 — reasoning cannot be turned off; effort low/high/max)', () => {
+  it('is a known reasoning row with the documented levels and default', () => {
+    expect(getCapabilities(createKimi()('kimi-k3'))).toMatchObject({
+      known: true,
+      reasoning: true,
+      effortLevels: ['low', 'high', 'max'],
+      effortDefault: 'max',
+    });
+  });
+
+  it("'max' is sent as 'max'; the documented levels reach the wire unchanged", async () => {
+    for (const effort of ['low', 'high', 'max'] as const) {
+      const { body, warnings } = await compatRequest(createKimi, 'kimi-k3', { effort });
+      expect(body.reasoning_effort, effort).toBe(effort);
+      expect(warnings, effort).toEqual([]);
+      expect('max_tokens' in body, effort).toBe(false); // output limit undocumented
+    }
+  });
+
+  it('a level K3 lacks is clamped down, reported; none becomes the lowest level', async () => {
+    for (const [effort, sent] of [
+      ['medium', 'low'],
+      ['xhigh', 'high'],
+      ['none', 'low'],
+    ] as const) {
+      const { body, warnings } = await compatRequest(createKimi, 'kimi-k3', { effort });
+      expect(body.reasoning_effort, effort).toBe(sent);
+      expect(warned(warnings, 'clamped-setting'), effort).toEqual(['effort']);
+    }
+  });
+});
+
+describe('kimi-k2.7-code (2.3, F08 — always reasons; K3 effort scheme not applied)', () => {
+  it('a known reasoning row that sends no effort at all — every level is reported as dropped', async () => {
+    expect(getCapabilities(createKimi()('kimi-k2.7-code'))).toMatchObject({
+      known: true,
+      reasoning: true,
+      effortLevels: [],
+    });
+    for (const effort of ['high', 'max', 'none'] as const) {
+      const { body, warnings } = await compatRequest(createKimi, 'kimi-k2.7-code', { effort });
+      expect('reasoning_effort' in body, effort).toBe(false);
+      expect(warned(warnings, 'unsupported-setting'), effort).toEqual(['effort']);
+    }
+  });
+});
+
+describe('glm-5.3 (2.3, F08 — text-only, always reasons, effort low/high/max)', () => {
+  it('is a known text-only reasoning row with the documented levels and default', () => {
+    expect(getCapabilities(createGLM()('glm-5.3'))).toMatchObject({
+      known: true,
+      reasoning: true,
+      vision: false,
+      nativePdf: false,
+      audio: false,
+      effortLevels: ['low', 'high', 'max'],
+      effortDefault: 'max',
+    });
+  });
+
+  it("'max' reaches the wire; 'none' cannot disable thinking → the lowest level, reported", async () => {
+    const max = await compatRequest(createGLM, 'glm-5.3', { effort: 'max' });
+    expect(max.body.reasoning_effort).toBe('max');
+    expect(max.warnings).toEqual([]);
+    expect('max_tokens' in max.body).toBe(false);
+    const none = await compatRequest(createGLM, 'glm-5.3', { effort: 'none' });
+    expect(none.body.reasoning_effort).toBe('low');
+    expect(warned(none.warnings, 'clamped-setting')).toEqual(['effort']);
+  });
+
+  it("the endpoint is never inferred from the model id: Z.ai's international API is a baseURL", async () => {
+    const { fetch, calls } = mockFetch(() => sseResponse([COMPAT_OK]));
+    for (const baseURL of [undefined, 'https://api.z.ai/api/paas/v4']) {
+      const model = createGLM({ apiKey: 'k', fetch, ...(baseURL ? { baseURL } : {}) })('glm-5.3');
+      await streamChat({ model, messages: [{ role: 'user', content: 'hi' }] }).finishReason;
+    }
+    expect(calls.map((c) => c.url)).toEqual([
+      'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+      'https://api.z.ai/api/paas/v4/chat/completions',
+    ]);
+  });
+});
+
+describe('Qwen/Qwen3-Coder-Next (2.3, F08 — open weights, non-thinking, any host)', () => {
+  const HOSTS: [string, (settings?: CompatSettings) => Provider][] = [
+    ['ollama', createOllama],
+    ['lmstudio', createLMStudio],
+    [
+      'vllm',
+      (settings) =>
+        createOpenAICompatible({ id: 'vllm', baseURL: 'http://localhost:8000/v1', ...settings }),
+    ],
+  ];
+
+  it('one known row answers for every host, under the caller’s provider id', () => {
+    for (const [provider, create] of HOSTS) {
+      const caps = getCapabilities(create()('Qwen/Qwen3-Coder-Next'));
+      expect(caps, provider).toMatchObject({
+        known: true,
+        provider,
+        reasoning: false,
+        contextWindow: 262_144,
+      });
+    }
+  });
+
+  it('non-thinking: effort is dropped (reported), sampling is sent, no output cap is invented', async () => {
+    for (const [provider, create] of HOSTS) {
+      const { body, warnings } = await compatRequest(create, 'Qwen/Qwen3-Coder-Next', {
+        effort: 'high',
+        temperature: 0.2,
+      });
+      expect('reasoning_effort' in body, provider).toBe(false);
+      expect(body.temperature, provider).toBe(0.2);
+      expect('max_tokens' in body, provider).toBe(false);
+      expect(warned(warnings, 'unsupported-setting'), provider).toEqual(['effort']);
+      expect(warned(warnings, 'unknown-model'), provider).toEqual([]);
+    }
   });
 });
