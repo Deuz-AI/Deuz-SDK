@@ -583,7 +583,17 @@ export function createRealtimeSession(options: RealtimeSessionOptions): Realtime
 
   function onOpen(): void {
     if (status !== 'connecting' || !codec) return;
-    transmit(codec.setup());
+    try {
+      transmit(codec.setup());
+    } catch (cause) {
+      failConnect(
+        realtimeError(
+          'connect-failed',
+          `Could not send the ${protocol.label} session setup: ${cause instanceof Error ? cause.message : String(cause)}`,
+          { cause },
+        ),
+      );
+    }
   }
 
   function onText(text: string): void {

@@ -44,7 +44,8 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
 /**
  * Merge `override` into a copy of `base`: plain objects merge recursively,
  * everything else (arrays, scalars, `null`) replaces. `undefined` is skipped,
- * so an absent option never erases a mapped field.
+ * so an absent option never erases a mapped field. An own `__proto__` key (a
+ * JSON-parsed override can carry one) is ignored rather than re-parenting the copy.
  */
 export function deepMerge(
   base: Record<string, unknown>,
@@ -53,7 +54,7 @@ export function deepMerge(
   if (!override) return base;
   const out: Record<string, unknown> = { ...base };
   for (const [key, value] of Object.entries(override)) {
-    if (value === undefined) continue;
+    if (value === undefined || key === '__proto__') continue;
     const current = out[key];
     out[key] = isPlainObject(current) && isPlainObject(value) ? deepMerge(current, value) : value;
   }

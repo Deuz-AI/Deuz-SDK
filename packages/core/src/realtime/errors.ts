@@ -4,13 +4,14 @@ import { DeuzError, type DeuzErrorJSON } from '../errors';
  * What went wrong in a realtime session:
  *
  * - `connect-failed` — the socket could not be created (e.g. a browser asked to
- *   send an API key in a header).
+ *   send an API key in a header), or the session setup could not be sent.
  * - `connect-timeout` — the provider did not accept the session in time.
  * - `no-websocket` — the runtime has no global `WebSocket` and no
  *   `deps.webSocket` was given.
  * - `provider` — the provider reported an error event.
  * - `transport` — the socket reported a network failure.
- * - `closed` — the socket closed abnormally (`closeCode` says how).
+ * - `closed` — the socket closed abnormally (`closeCode` says how), or the
+ *   session is already closed (sessions are single-use).
  * - `not-connected` — a send on a session that is not open.
  * - `invalid-message` — a server frame that is not JSON.
  * - `tool` — `sendToolResult` for a call that is not waiting.

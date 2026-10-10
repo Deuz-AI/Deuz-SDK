@@ -201,7 +201,10 @@ export interface RealtimeSessionOptions extends RealtimeSessionConfig {
   approveToolCall?: (call: ToolCall) => boolean | Promise<boolean>;
   /** Forwarded untouched to every tool's `execute` context. */
   runtimeContext?: unknown;
-  /** How long `connect()` waits for the provider to accept the session. Default 15 000 ms. */
+  /**
+   * How long `connect()` waits for the provider to accept the session, token
+   * fetch included. Timed on `deps.clock`. Default 15 000 ms.
+   */
   connectTimeoutMs?: number;
   /** Aborting closes the session (and rejects a pending `connect()`). */
   signal?: AbortSignal;
@@ -360,10 +363,16 @@ export interface RealtimeSession {
    * Open the socket and configure the session. Resolves on `session-ready`.
    * Rejects with a `RealtimeError` (or `AuthenticationError` without a
    * credential, `AbortError` on abort). Calling it again while connecting
-   * shares the same attempt; once open it resolves at once.
+   * shares the same attempt; once open it resolves at once; once closed it
+   * rejects (`kind: 'closed'`). A failure after the socket was created is
+   * also reported as a fatal `error` event, followed by `session-closed`; a
+   * failure before that (no credential, no WebSocket) only rejects.
    */
   connect(): Promise<void>;
-  /** Close the socket. Resolves once `session-closed` was emitted. Idempotent. */
+  /**
+   * Close the socket. Resolves once `session-closed` was emitted (at once
+   * when no socket was ever opened). Idempotent.
+   */
   close(): Promise<void>;
   /** Subscribe to one event type (or `'*'`). Returns the unsubscribe function. */
   on<T extends RealtimeEventType>(
@@ -384,8 +393,9 @@ export interface RealtimeSession {
   /**
    * Cut the model off. OpenAI: cancels the running response and, with
    * `playedMs`, truncates the assistant audio to what the user actually heard.
-   * Gemini Live has no client-side cancel: a warning is emitted and nothing is
-   * sent (Gemini stops on its own when the user speaks).
+   * Gemini Live has no client-side cancel: nothing is sent and the first call
+   * emits an `unsupported-setting` warning (Gemini stops on its own when the
+   * user speaks).
    */
   interrupt(options?: { playedMs?: number }): void;
   /** Answer a pending client-tool call (a tool without `execute`). */
