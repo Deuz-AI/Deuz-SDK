@@ -200,6 +200,49 @@ export function script(
   return (client, keys, args) => client.eval(source, { keys, arguments: args });
 }
 
+/** The key layout version the 2.3 Redis stores write. */
+export const REDIS_SCHEMA_VERSION = 1;
+
+// KEYS: the schema marker. ARGV: this build's version. Answers the stored one.
+const schemaScript = script(`
+local stored = redis.call('GET', KEYS[1])
+if has(stored) then return stored end
+redis.call('SET', KEYS[1], ARGV[1])
+return ARGV[1]
+`);
+
+/**
+ * A store's client, once its schema marker `<tag>:schema` reads the version
+ * this build writes. The first use stamps it; a different stored version is
+ * refused, as the SQL stores refuse a newer schema, so an older build never
+ * writes through a newer layout. Checked once per store; a failed check is
+ * retried by the next call.
+ */
+export function versionedClient(
+  connection: RedisConnection<RedisScriptClient>,
+  tag: string,
+  store: string,
+): () => Promise<RedisScriptClient> {
+  let checked: Promise<void> | undefined;
+  return async () => {
+    const client = await connection.use();
+    checked ??= (async () => {
+      const stored = replyText(
+        await schemaScript(client, [`${tag}:schema`], [String(REDIS_SCHEMA_VERSION)]),
+      );
+      if (Number(stored) !== REDIS_SCHEMA_VERSION)
+        throw new Error(
+          `Unsupported Redis ${store} schema version ${String(stored)}; this build reads version ${REDIS_SCHEMA_VERSION}`,
+        );
+    })().catch((error: unknown) => {
+      checked = undefined;
+      throw error;
+    });
+    await checked;
+    return client;
+  };
+}
+
 /** A list reply (an empty one when the script answered nothing). */
 export function replyList(reply: unknown): unknown[] {
   return Array.isArray(reply) ? reply : [];

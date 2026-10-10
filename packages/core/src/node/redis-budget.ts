@@ -60,6 +60,7 @@ import {
   replyNumber,
   replyText,
   script,
+  versionedClient,
 } from './redis-scripts';
 
 export type RedisBudgetStoreOptions =
@@ -438,6 +439,7 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
     factory: 'createRedisBudgetStore',
     noun: 'budget store',
   });
+  const use = versionedClient(connection, tag, 'budget');
   const requestPrefix = `${tag}:req:`;
   const scopePrefix = `${tag}:scope:`;
   const historyPrefix = `${tag}:hist:`;
@@ -453,7 +455,7 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
     run: (client: RedisScriptClient) => Promise<unknown>,
     next: { settle: { tokens: number; usd: number } } | { release: true },
   ): Promise<void> => {
-    const reply = replyList(await run(await connection.use()));
+    const reply = replyList(await run(await use()));
     const state = replyText(reply[0]);
     if (state === 'applied' || state === 'missing' || state === undefined) return;
     // Repeating the same settlement, or releasing twice, is a no-op; anything
@@ -472,7 +474,7 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
   const store: RedisBudgetStore = Object.freeze({
     async reserve(input) {
       const request = normalizeBudgetReserve(input);
-      const client = await connection.use();
+      const client = await use();
       const reply = replyList(
         await reserveScript(
           client,
@@ -546,7 +548,7 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
     },
     async usage(key, usageOptions = {}) {
       assertUsageOptions(key, usageOptions);
-      const client = await connection.use();
+      const client = await use();
       const reply = replyList(
         await usageScript(client, [scopePrefix + key, historyPrefix + key], []),
       );
@@ -570,7 +572,7 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
     },
     async prune(pruneOptions): Promise<BudgetPruneResult> {
       const before = assertPruneOptions(pruneOptions);
-      const client = await connection.use();
+      const client = await use();
       const requests = await inBatches(PRUNE_BATCH, async (size) =>
         replyNumber(
           await requestPruneScript(client, [closed], [arg(before), arg(size), requestPrefix]),
@@ -608,7 +610,7 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
           ? `(${padTime(after.reservedAt)}${after.requestId}`
           : `[${padTime(Math.ceil(after.reservedAt))}`;
       }
-      const client = await connection.use();
+      const client = await use();
       const reply = replyList(
         await holdsScript(client, [open], [min, max, arg(limit), requestPrefix]),
       );

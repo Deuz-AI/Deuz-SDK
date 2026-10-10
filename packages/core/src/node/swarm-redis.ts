@@ -65,6 +65,7 @@ import {
   replyText,
   script,
   sortableNumber,
+  versionedClient,
 } from './redis-scripts';
 
 export { wrapIoredisClient } from './store-redis';
@@ -274,6 +275,7 @@ export function createRedisSwarmStore(options: RedisSwarmStoreOptions): RedisSwa
     factory: 'createRedisSwarmStore',
     noun: 'swarm store',
   });
+  const use = versionedClient(connection, tag, 'swarm');
   const name = (key: SwarmKey) => `${hexUnits(key.scope)}-${hexUnits(key.runId)}`;
   const runKey = (key: SwarmKey) => `${tag}:run:${name(key)}`;
   const tasksKey = (key: SwarmKey) => `${tag}:tasks:${name(key)}`;
@@ -305,7 +307,7 @@ export function createRedisSwarmStore(options: RedisSwarmStoreOptions): RedisSwa
         throw new Error('New swarm counters must start at zero');
       const events = makeSwarmEvents(snapshot.run, 0, inputs);
       const run = { ...snapshot.run, lastSequence: events.length };
-      const client = await connection.use();
+      const client = await use();
       const created = await createScript(
         client,
         [
@@ -333,7 +335,7 @@ export function createRedisSwarmStore(options: RedisSwarmStoreOptions): RedisSwa
       return run;
     },
     async load(key) {
-      const client = await connection.use();
+      const client = await use();
       const [run, ...tasks] = texts(
         await loadScript(client, [runKey(key), tasksKey(key), orderKey(key)], []),
       );
@@ -346,7 +348,7 @@ export function createRedisSwarmStore(options: RedisSwarmStoreOptions): RedisSwa
       return snapshot;
     },
     async head(key) {
-      const client = await connection.use();
+      const client = await use();
       const run = replyText(await headScript(client, [runKey(key)], []));
       return run ? decodeRun(run, key) : undefined;
     },
@@ -372,7 +374,7 @@ export function createRedisSwarmStore(options: RedisSwarmStoreOptions): RedisSwa
       const channels = [...new Set(posts.map((post) => post?.channel))].filter(
         (channel): channel is string => typeof channel === 'string',
       );
-      const client = await connection.use();
+      const client = await use();
       const read = texts(
         await prepareScript(
           client,
@@ -464,14 +466,14 @@ export function createRedisSwarmStore(options: RedisSwarmStoreOptions): RedisSwa
     async readChannel(key, channel, afterSequence, limit) {
       validateChannelName(channel);
       validateEventCursor(afterSequence, limit);
-      const client = await connection.use();
+      const client = await use();
       return texts(
         await channelScript(client, [notesKey(key)], [channel, arg(afterSequence), arg(limit)]),
       ).map((note) => decodeSwarm<SwarmChannelEntry>(note));
     },
     async readEvents(key, afterSequence, limit) {
       validateEventCursor(afterSequence, limit);
-      const client = await connection.use();
+      const client = await use();
       return texts(
         await eventsScript(client, [eventsKey(key)], [arg(afterSequence), arg(limit)]),
       ).map((event) => decodeSwarm<SwarmEvent>(event));
@@ -488,14 +490,14 @@ export function createRedisSwarmStore(options: RedisSwarmStoreOptions): RedisSwa
               : all;
       // Strictly after the cursor, in the listing order.
       const min = query.after ? `(${member(query.after)}` : '-';
-      const client = await connection.use();
+      const client = await use();
       return texts(await listScript(client, [index], [min, arg(query.limit), `${tag}:run:`])).map(
         (run) => decodeRun(run),
       );
     },
     async prune(pruneOptions) {
       const { before, scope, limit } = validatePruneOptions(pruneOptions);
-      const client = await connection.use();
+      const client = await use();
       const indexes = SETTLED_RUN_STATUSES.map((status) =>
         scope === undefined ? byStatus(status) : byBoth(status, scope),
       );

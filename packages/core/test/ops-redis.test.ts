@@ -65,11 +65,30 @@ describe('Redis ops store', () => {
       '{deuz:ops}:run:payload',
       '{deuz:ops}:run:revision',
       '{deuz:ops}:run:terminal',
+      '{deuz:ops}:schema',
     ]);
     await ops.leases.release(lease);
     const custom = createRedisOpsStore({ client: server.client, prefix: 'app' });
     expect(await custom.claims('nightly@1')).toBe(true);
     expect(await server.redis.exists('{app:ops}:claims')).toBe(1);
+  });
+
+  it('stamps its schema version on first use and refuses a newer one', async () => {
+    const { server, ops } = fresh();
+    expect(await ops.claims('a')).toBe(true);
+    expect(await server.redis.get('{deuz:ops}:schema')).toBe('1');
+    // A newer build moved the layout on: this one must not write through it.
+    await server.redis.set('{deuz:ops}:schema', '2');
+    const older = createRedisOpsStore({ client: server.client });
+    await expect(older.claims('b')).rejects.toThrow(
+      'Unsupported Redis ops schema version 2; this build reads version 1',
+    );
+    await expect(older.leases.acquire({ key: 'k', owner: 'a', ttlMs: 10 })).rejects.toThrow(
+      /schema version 2/,
+    );
+    // The refusal is not cached as success: once the schema is right, it works.
+    await server.redis.set('{deuz:ops}:schema', '1');
+    expect(await older.claims('b')).toBe(true);
   });
 
   it('refuses a prefix that would break the hash tag', () => {

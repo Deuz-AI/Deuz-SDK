@@ -61,6 +61,16 @@ describe('Redis budget store', () => {
     expect(hold?.reservedAt).toBe(server.now() - 61_000);
   });
 
+  it('stamps its schema version on first use and refuses a newer one', async () => {
+    const server = mockRedisServer();
+    await createRedisBudgetStore({ client: server.client }).usage('user:1');
+    expect(await server.redis.get('{deuz:budget}:schema')).toBe('1');
+    await server.redis.set('{deuz:budget}:schema', '3');
+    await expect(createRedisBudgetStore({ client: server.client }).usage('user:1')).rejects.toThrow(
+      'Unsupported Redis budget schema version 3; this build reads version 1',
+    );
+  });
+
   it('shares one budget between two stores on the same server', async () => {
     const server = mockRedisServer();
     const first = createRedisBudgetStore({ client: server.client });

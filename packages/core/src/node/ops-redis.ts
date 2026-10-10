@@ -38,6 +38,7 @@ import {
   replyNumber,
   replyText,
   script,
+  versionedClient,
 } from './redis-scripts';
 
 // The Redis budget store shares this Node-only subpath, as on SQLite and
@@ -293,6 +294,7 @@ export function createRedisOpsStore(options: RedisOpsStoreOptions): RedisOpsStor
     factory: 'createRedisOpsStore',
     noun: 'ops store',
   });
+  const use = versionedClient(connection, tag, 'ops');
   const leaseKeys = [
     `${tag}:lease:owner`,
     `${tag}:lease:token`,
@@ -309,14 +311,14 @@ export function createRedisOpsStore(options: RedisOpsStoreOptions): RedisOpsStor
   const leases: RedisOpsStore['leases'] = {
     async acquire({ key, owner, ttlMs }) {
       assertLeaseRequest(key, owner, ttlMs);
-      const client = await connection.use();
+      const client = await use();
       const reply = replyList(await acquireScript(client, leaseKeys, [key, owner, arg(ttlMs)]));
       if (!reply.length) return undefined;
       return view(key, owner, replyNumber(reply[0]), replyNumber(reply[1]));
     },
     async renew(lease, ttlMs, renewOptions = {}): Promise<LeaseRenewal> {
       assertLeaseRequest(lease.key, lease.owner, ttlMs);
-      const client = await connection.use();
+      const client = await use();
       const acknowledge = renewOptions.acknowledge === true;
       const reply = replyList(
         await renewScript(client, leaseKeys, [
@@ -336,18 +338,18 @@ export function createRedisOpsStore(options: RedisOpsStoreOptions): RedisOpsStor
       };
     },
     async release(lease) {
-      const client = await connection.use();
+      const client = await use();
       await releaseScript(client, leaseKeys, [lease.key, lease.owner, arg(lease.token)]);
     },
     async signal(key, signal) {
       if (!SIGNALS.includes(signal)) throw new TypeError(`Unknown lease signal: ${String(signal)}`);
-      const client = await connection.use();
+      const client = await use();
       return replyNumber(await signalScript(client, leaseKeys, [key, signal])) === 1;
     },
     async ack(lease, signal) {
       if (signal !== 'cancel')
         throw new TypeError(`Only a cancel is acknowledged: ${String(signal)}`);
-      const client = await connection.use();
+      const client = await use();
       return (
         replyNumber(
           await ackScript(client, leaseKeys, [lease.key, lease.owner, arg(lease.token)]),
@@ -356,7 +358,7 @@ export function createRedisOpsStore(options: RedisOpsStoreOptions): RedisOpsStor
     },
     async prune(before) {
       assertRetentionTime(before);
-      const client = await connection.use();
+      const client = await use();
       // Keys that still owe a cancel stay in the expiry range; page past them.
       let total = 0;
       let offset = 0;
@@ -373,7 +375,7 @@ export function createRedisOpsStore(options: RedisOpsStoreOptions): RedisOpsStor
 
   const agentRuns: RedisOpsStore['agentRuns'] = {
     async load(runId) {
-      const client = await connection.use();
+      const client = await use();
       const payload = replyText(await loadScript(client, runKeys.slice(0, 1), [runId]));
       return payload ? decodeSwarm<AgentRunEnvelope>(payload) : undefined;
     },
@@ -383,7 +385,7 @@ export function createRedisOpsStore(options: RedisOpsStoreOptions): RedisOpsStor
       if (revision !== undefined && (!Number.isSafeInteger(revision) || revision < 1))
         throw new Error(`Agent run revision conflict for ${envelope.runId}: invalid revision`);
       const payload = encodeSwarm(envelope);
-      const client = await connection.use();
+      const client = await use();
       const reply = replyList(
         await saveScript(client, runKeys, [
           envelope.runId,
@@ -398,7 +400,7 @@ export function createRedisOpsStore(options: RedisOpsStoreOptions): RedisOpsStor
     },
     async prune(before) {
       assertRetentionTime(before);
-      const client = await connection.use();
+      const client = await use();
       return inBatches(PRUNE_BATCH, async (size) =>
         replyNumber(await runPruneScript(client, runKeys, [arg(before), arg(size)])),
       );
@@ -407,17 +409,17 @@ export function createRedisOpsStore(options: RedisOpsStoreOptions): RedisOpsStor
 
   const claims: RedisOpsStore['claims'] = Object.assign(
     async (key: string): Promise<boolean> => {
-      const client = await connection.use();
+      const client = await use();
       return replyNumber(await claimScript(client, claimKeys, [key])) === 1;
     },
     {
       async release(key: string): Promise<void> {
-        const client = await connection.use();
+        const client = await use();
         await unclaimScript(client, claimKeys, [key]);
       },
       async prune(before: number): Promise<number> {
         assertRetentionTime(before);
-        const client = await connection.use();
+        const client = await use();
         return inBatches(PRUNE_BATCH, async (size) =>
           replyNumber(await claimPruneScript(client, claimKeys, [arg(before), arg(size)])),
         );

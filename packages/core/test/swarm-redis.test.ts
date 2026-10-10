@@ -38,6 +38,18 @@ describe('Redis swarm store', () => {
     expect(() => createRedisSwarmStore({ client: server.client, prefix: 'a{' })).toThrow(TypeError);
   });
 
+  it('stamps its schema version on first use and refuses a newer one', async () => {
+    const server = mockRedisServer();
+    expect(await createRedisSwarmStore({ client: server.client }).head(initialSnapshot().run)).toBe(
+      undefined,
+    );
+    expect(await server.redis.get('{deuz:swarm}:schema')).toBe('1');
+    await server.redis.set('{deuz:swarm}:schema', '2');
+    await expect(
+      createRedisSwarmStore({ client: server.client }).create(initialSnapshot(), []),
+    ).rejects.toThrow('Unsupported Redis swarm schema version 2; this build reads version 1');
+  });
+
   it('keeps runs apart whose scope and runId only split differently', async () => {
     const store = freshStore();
     await store.create(at('a', 'bc', 1), []);
@@ -142,6 +154,9 @@ describe('Redis swarm store', () => {
       expectedRevision: 0,
       run: { status: 'completed' },
     });
+    // Warm the writer's store (its first call checks the schema version), so
+    // the next two calls are the commit's read and its write.
+    await store.head({ scope: 'a', runId: 'r' });
     armed = true;
     await expect(
       store.commit({ scope: 'a', runId: 'r', expectedRevision: 1, run: { status: 'cancelled' } }),
