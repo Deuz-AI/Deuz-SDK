@@ -18,6 +18,7 @@ import {
   retryPostgres,
   SERIALIZATION_CODES,
 } from './postgres-migrate';
+import { bigintCutoff } from './budget-postgres';
 
 // Persistent budget scopes (2.2, M5) share this Node-only subpath: one import
 // for every durable ops store on Postgres.
@@ -127,7 +128,11 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
   };
   const view = (key: string, owner: string, token: unknown, expiresAt: unknown): Lease =>
     Object.freeze({ key, owner, token: Number(token), expiresAt: Number(expiresAt) });
-  /** Deletes the rows `where` matches (2.3), in one statement, and counts them. */
+  /**
+   * Deletes the rows `where` matches (2.3), in one statement, and counts them.
+   * `$1` is `before` as a bigint cutoff (`bigintCutoff`), so a BIGINT time
+   * column compares in its own type and its retention index serves the range.
+   */
   const prune = async (
     table: string,
     where: string,
@@ -138,7 +143,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
     await use();
     const [row] = await write(
       `WITH gone AS (DELETE FROM ${table} WHERE ${where} RETURNING 1) SELECT count(*) AS n FROM gone`,
-      [before, ...params],
+      [bigintCutoff(before), ...params],
     );
     return Number(row?.n ?? 0);
   };
@@ -226,7 +231,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
     prune: (before) =>
       prune(
         leasesTable,
-        `(expires_at = 0 OR expires_at < LEAST($1::float8, ${NOW}))
+        `(expires_at = 0 OR expires_at < LEAST($1::bigint, ${NOW}))
           AND NOT signals @> '["cancel"]'::jsonb`,
         before,
       ),
@@ -269,7 +274,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
     prune: (before) =>
       prune(
         runsTable,
-        `updated_at < $1::float8
+        `updated_at < $1::bigint
           AND (regexp_replace(payload, $2, $3, 'g')::json ->> 'phase') = 'terminal'`,
         before,
         // As SQL text, the pattern is a backslash (escaped for the regex) then u and
@@ -298,7 +303,7 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
         await use();
         await write(`DELETE FROM ${claimsTable} WHERE key = $1`, [row]);
       },
-      prune: (before: number) => prune(claimsTable, 'claimed_at < $1::float8', before),
+      prune: (before: number) => prune(claimsTable, 'claimed_at < $1::bigint', before),
     },
   );
 

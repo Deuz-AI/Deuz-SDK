@@ -106,4 +106,50 @@ describe('Postgres budget store', () => {
       /schema/i,
     );
   });
+
+  it('bounds the open holds by created_at on its index, for any finite cutoff (2.3)', async () => {
+    const schema = await freshSchema();
+    const reads: Array<{ sql: string; params: unknown[] }> = [];
+    const recording: PgClientLike = {
+      query: (sql, params) => {
+        if (/^SELECT request_id/.test(sql.trim())) reads.push({ sql, params: params ?? [] });
+        return client.query(sql, params);
+      },
+    };
+    const store = createPostgresBudgetStore({ client: recording, schema });
+    await store.usage('nobody'); // first use creates the tables and the 2.3 index
+    // Even ids hold, odd ids settled: whole-millisecond times 1 to 2000.
+    await client.query(
+      `INSERT INTO ${schema}.deuz_budget_requests
+         (request_id, fingerprint, model_id, tokens, usd, state, charges, outcome, created_at)
+       SELECT 'r' || lpad(g::text, 4, '0'), 'f', 'm', 1, 0,
+         CASE WHEN g % 2 = 0 THEN 'reserved' ELSE 'settled' END, '[]'::jsonb, '{}'::jsonb, g
+       FROM generate_series(1, 2000) g`,
+    );
+    await client.query(`ANALYZE ${schema}.deuz_budget_requests`);
+
+    // Times are whole milliseconds, so a cutoff of 100.5 keeps 101 and later.
+    const holds = await store.holds({ before: 100.5, limit: 1_000 });
+    expect(holds).toHaveLength(50);
+    expect(holds.at(-1)).toMatchObject({ requestId: 'r0100', reservedAt: 100 });
+    await db.query('SET enable_seqscan = off');
+    try {
+      const { rows } = await db.query<Record<string, unknown>>(
+        `EXPLAIN ${reads[0]!.sql}`,
+        reads[0]!.params,
+      );
+      const plan = rows.map((row) => String(Object.values(row)[0])).join('\n');
+      // A float8 `before` would cast every row's created_at and leave the
+      // index only its state column.
+      expect(plan).toMatch(/Index Cond: \(\(state = 'reserved'::text\) AND \(created_at < /);
+    } finally {
+      await db.query('SET enable_seqscan = on');
+    }
+    // Any finite cutoff, however far from the stored times.
+    expect(await store.holds({ before: -Number.MAX_VALUE })).toEqual([]);
+    expect(await store.holds({ before: Number.MAX_VALUE, limit: 1_000 })).toHaveLength(1_000);
+    expect(await store.prune({ before: 100.5 })).toMatchObject({ requests: 50 });
+    expect(await store.prune({ before: -1e300 })).toMatchObject({ requests: 0 });
+    expect(await store.prune({ before: Number.MAX_VALUE })).toMatchObject({ requests: 950 });
+  });
 });

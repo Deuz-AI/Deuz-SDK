@@ -65,6 +65,18 @@ const SCHEMA_NAME_PATTERN = /^[a-z_][a-z0-9_]*$/;
 const SCHEMA_VERSION = 1;
 const NOW_MS = '(extract(epoch from clock_timestamp()) * 1000)::bigint';
 
+/**
+ * @internal A retention cutoff for a BIGINT time column, bound as `::bigint`
+ * (2.3; the ops store's prunes use it too). Times are whole milliseconds, so
+ * `column < ceil(before)` holds exactly when `column < before`, and comparing
+ * in the column's own type lets the planner range-scan the column's index,
+ * where a float8 parameter casts every row. Clamped to the safe integers, far
+ * past any stored time, so that no finite cutoff overflows `bigint`.
+ */
+export function bigintCutoff(before: number): number {
+  return Math.ceil(Math.min(Math.max(before, Number.MIN_SAFE_INTEGER), Number.MAX_SAFE_INTEGER));
+}
+
 type RequestState = 'reserved' | 'settled' | 'released' | 'denied';
 
 export function createPostgresBudgetStore(
@@ -180,11 +192,12 @@ export function createPostgresBudgetStore(
   // moved into its group's newest row by an upsert, never re-read from the
   // snapshot: under READ COMMITTED a concurrent prune or settlement changes
   // either row in place, and no amount is lost or counted twice. The three
-  // bucket comparisons are isFoldableBucket's.
+  // bucket comparisons are isFoldableBucket's; $2 is `before` as a bigint
+  // cutoff for the request records (`bigintCutoff`).
   const pruneSql = `
     WITH now_ms AS (SELECT ${NOW_MS} AS at),
     dropped AS (
-      DELETE FROM ${t('requests')} WHERE state <> 'reserved' AND created_at < $1::float8
+      DELETE FROM ${t('requests')} WHERE state <> 'reserved' AND created_at < $2::bigint
       RETURNING 1
     ), held AS (
       SELECT DISTINCT c->>'key' AS key, (c->>'index')::bigint AS bucket
@@ -424,19 +437,21 @@ export function createPostgresBudgetStore(
     async prune(pruneOptions): Promise<BudgetPruneResult> {
       const before = assertPruneOptions(pruneOptions);
       await migrate();
-      const { rows } = await write(pruneSql, [before]);
+      const { rows } = await write(pruneSql, [before, bigintCutoff(before)]);
       return { requests: Number(rows[0]?.requests ?? 0), buckets: Number(rows[0]?.buckets ?? 0) };
     },
     async holds(query) {
       const { before, limit, after } = normalizeHoldQuery(query);
       await migrate();
+      // A bigint `before` bounds the (state, created_at) index range; the
+      // `after` filter stays float8, exact for any position a caller passes.
       const { rows } = await client.query(
         `SELECT request_id, model_id, tokens, usd, charges, created_at FROM ${t('requests')}
-         WHERE state = 'reserved' AND created_at < $1::float8
+         WHERE state = 'reserved' AND created_at < $1::bigint
            AND ($2::float8 IS NULL OR created_at > $2::float8
              OR (created_at = $2::float8 AND request_id COLLATE "C" > $3::text))
          ORDER BY created_at, request_id COLLATE "C" LIMIT $4`,
-        [before, after?.reservedAt ?? null, after?.requestId ?? null, limit],
+        [bigintCutoff(before), after?.reservedAt ?? null, after?.requestId ?? null, limit],
       );
       return rows.map(
         (row): BudgetHold =>
