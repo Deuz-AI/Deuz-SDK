@@ -65,9 +65,9 @@ export interface RedisZMember {
 
 /**
  * The SLICE of a Redis client this store uses. Deliberately tiny and spelled in
- * node-redis's camelCase, so a real `RedisClientType` (v4 or v5) is assignable
- * with no wrapper, no adapter and no `as` — and so a test (or ioredis, or a
- * cluster proxy) can satisfy it with a plain object.
+ * node-redis's camelCase, so a real `RedisClientType` (v4, v5 or v6) is
+ * assignable with no wrapper, no adapter and no `as` — and so a test, a
+ * cluster proxy or ioredis (through {@link wrapIoredisClient}) can satisfy it.
  *
  * Return types are as loose as the store's own needs: it reads `get`/`mGet`
  * strings, `sMembers`/`sInter`/`zRangeByScore` string arrays, and IGNORES what
@@ -86,6 +86,74 @@ export interface RedisClientLike {
   zAdd(key: string, members: RedisZMember | RedisZMember[]): Promise<unknown>;
   zRem(key: string, members: string | string[]): Promise<unknown>;
   zRangeByScore(key: string, min: number | string, max: number | string): Promise<string[]>;
+  /**
+   * Run a Lua script atomically (2.3), in node-redis's `EVAL` signature. This
+   * pack never calls it; the ops, budget and swarm stores of
+   * `@deuz-sdk/core/ops/redis` and `@deuz-sdk/core/swarm/redis` need nothing
+   * else (see {@link RedisScriptClient}).
+   */
+  eval?(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
+}
+
+/**
+ * The client the 2.3 Redis stores take: one that runs Lua scripts (2.3). Every
+ * read and write of those stores is one script, atomic on the server, so a
+ * connected node-redis client (v4, v5 or v6) or cluster client fits as it is;
+ * wrap ioredis with {@link wrapIoredisClient}. The scripts need Redis 7 or
+ * later.
+ */
+export type RedisScriptClient = Required<Pick<RedisClientLike, 'eval'>>;
+
+/**
+ * The lowercase ioredis commands {@link wrapIoredisClient} calls (2.3). An
+ * ioredis `Redis` or `Cluster` client satisfies it structurally; ioredis is not
+ * a dependency of this package.
+ */
+export interface IoredisClientLike {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<unknown>;
+  del(...keys: string[]): Promise<unknown>;
+  sadd(key: string, ...members: string[]): Promise<unknown>;
+  srem(key: string, ...members: string[]): Promise<unknown>;
+  smembers(key: string): Promise<string[]>;
+  sinter(...keys: string[]): Promise<string[]>;
+  mget(...keys: string[]): Promise<Array<string | null>>;
+  zadd(key: string, ...scoresAndMembers: Array<number | string>): Promise<unknown>;
+  zrem(key: string, ...members: string[]): Promise<unknown>;
+  zrangebyscore(key: string, min: number | string, max: number | string): Promise<string[]>;
+  eval(script: string, numKeys: number, ...keysAndArguments: string[]): Promise<unknown>;
+}
+
+const list = (value: string | string[]): string[] => (Array.isArray(value) ? value : [value]);
+
+/**
+ * Fit an ioredis client to the seam (2.3): the store pack's eleven commands
+ * and `eval`, so it serves `createRedisStores` and the ops, budget and swarm
+ * stores alike. ioredis spells commands in lowercase and takes `EVAL`'s key
+ * count positionally; this maps one onto the other and nothing more, so the
+ * connection, its retries and its shutdown stay yours. An empty batch answers
+ * locally, because Redis rejects `MGET` or `DEL` with no key.
+ */
+export function wrapIoredisClient(client: IoredisClientLike): Required<RedisClientLike> {
+  return {
+    get: (key) => client.get(key),
+    set: (key, value) => client.set(key, value),
+    del: async (keys) => (list(keys).length ? client.del(...list(keys)) : 0),
+    sAdd: async (key, members) => (list(members).length ? client.sadd(key, ...list(members)) : 0),
+    sRem: async (key, members) => (list(members).length ? client.srem(key, ...list(members)) : 0),
+    sMembers: (key) => client.smembers(key),
+    sInter: async (keys) => (list(keys).length ? client.sinter(...list(keys)) : []),
+    mGet: async (keys) => (keys.length ? client.mget(...keys) : []),
+    zAdd: async (key, members) => {
+      const entries = Array.isArray(members) ? members : [members];
+      if (!entries.length) return 0;
+      return client.zadd(key, ...entries.flatMap((entry) => [entry.score, entry.value]));
+    },
+    zRem: async (key, members) => (list(members).length ? client.zrem(key, ...list(members)) : 0),
+    zRangeByScore: (key, min, max) => client.zrangebyscore(key, min, max),
+    eval: (script, options) =>
+      client.eval(script, options.keys.length, ...options.keys, ...options.arguments),
+  };
 }
 
 /** What the `{ url }` path opens for itself — the seam plus its lifecycle. */
