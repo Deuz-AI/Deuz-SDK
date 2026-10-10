@@ -1,0 +1,334 @@
+---
+title: A2A
+description: Agent2Agent v1.0.0 — call other agents with createA2AClient and serve your own with createA2AHandler, over JSON-RPC or HTTP+JSON, edge-safe and dependency-free.
+---
+
+`@deuz-sdk/core/a2a` (2.3) speaks the [Agent2Agent (A2A) protocol](https://a2a-protocol.org/v1.0.0/specification/), version **1.0.0**: the open protocol agents use to discover each other through an **agent card**, hand each other **messages**, and track the work as **tasks** that move through states (`WORKING`, `INPUT_REQUIRED`, `COMPLETED`, …) and produce **artifacts**. The module has both halves:
+
+- **`createA2AClient`** calls any A2A 1.0 agent — another team's, a partner's, one built on the official SDK — over the **JSON-RPC** or the **HTTP+JSON** binding, with streaming over SSE.
+- **`createA2AHandler`** serves your own agent as a fetch-style handler (`Request` in, `Response` out — Workers, Deno, Bun, route handlers), with the task lifecycle, streaming, re-subscription and cancellation done for you. You write the **executor**: what the agent does with a message.
+
+| Export | What it is |
+| --- | --- |
+| `fetchAgentCard`, `createA2AClient` | Discover and call an agent. |
+| `createA2AHandler`, `createInMemoryA2ATaskStore` | Serve an agent; the default task store. |
+| `a2aText` | The text of a message, an artifact or a list of parts. |
+| `A2AError` | Every A2A failure, on either side of the wire. |
+
+The module is **edge-safe** (Web APIs only — `fetch`, `Request`, `Response`, `ReadableStream`) and has **no dependencies**; ids and timestamps come from the injected [`deps`](/docs/core/dependencies).
+
+<Callout type="warn" title="Not live-verified">
+The wire was derived from the types and codecs of [`@a2a-js/sdk`](https://www.npmjs.com/package/@a2a-js/sdk) 1.3.0, the official TypeScript SDK, which implements A2A 1.0.0. Both halves are tested **offline against that SDK, in both directions**: the SDK's client drives `createA2AHandler`, and `createA2AClient` drives the SDK's server — over JSON-RPC in-process, over HTTP+JSON through the SDK's own express handlers on 127.0.0.1. They have not been run against third-party hosted agents. The gRPC binding and A2A 0.3 compatibility are not supported.
+</Callout>
+
+## Quick start
+
+Both halves in one file, no network: the client discovers the handler's card and talks to it through `deps.fetch`, straight into the handler.
+
+```ts title="a2a-quickstart.ts"
+import {
+  a2aText,
+  createA2AClient,
+  createA2AHandler,
+  fetchAgentCard,
+  type A2AAgentCard,
+} from '@deuz-sdk/core/a2a';
+
+const card: A2AAgentCard = {
+  name: 'Echo',
+  description: 'Repeats what it is told.',
+  version: '1.0.0',
+  supportedInterfaces: [
+    { url: 'https://echo.example.com/a2a', protocolBinding: 'JSONRPC', protocolVersion: '1.0' },
+  ],
+  capabilities: { streaming: true },
+  defaultInputModes: ['text/plain'],
+  defaultOutputModes: ['text/plain'],
+  skills: [{ id: 'echo', name: 'Echo', description: 'Repeats the message.', tags: ['echo'] }],
+};
+
+const handler = createA2AHandler({
+  card,
+  executor: async (ctx) => {
+    await ctx.working('Thinking…');
+    await ctx.artifact({ name: 'echo', parts: [{ text: `You said: ${a2aText(ctx.message)}` }] });
+    await ctx.complete();
+  },
+});
+
+// In production the client uses the global fetch; here it calls the handler directly.
+const fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+  handler(new Request(input, init))) as typeof globalThis.fetch;
+
+const client = createA2AClient({
+  card: await fetchAgentCard('https://echo.example.com', { deps: { fetch } }),
+  deps: { fetch },
+});
+
+const answer = await client.sendMessage('Hello, agent');
+console.log(answer.task?.status.state);              // 'TASK_STATE_COMPLETED'
+console.log(a2aText(answer.task?.artifacts?.[0]));   // 'You said: Hello, agent'
+
+for await (const event of client.sendStreamingMessage('Hello again')) {
+  console.log(Object.keys(event)[0]);                // task, statusUpdate, artifactUpdate, statusUpdate
+}
+```
+
+## Serving an agent
+
+`createA2AHandler({ card, executor })` serves two things:
+
+- the **agent card** at `/.well-known/agent-card.json` (change it with `cardPath`), and
+- every interface of the card with `protocolBinding: 'JSONRPC'` or `'HTTP+JSON'` and `protocolVersion: '1.0'`, at **its URL's path**. The host is not matched, so the same card works behind a proxy, on a preview URL or on `localhost`. Interfaces of other bindings (gRPC) or versions are left alone.
+
+The card is the routing table: put the URLs your clients should use in it, then hand every request to the handler.
+
+```ts title="worker.ts"
+export default { fetch: (request: Request) => handler(request) };
+```
+
+In a framework with file-based routes, send both the card path and the interfaces' paths to the same handler (for example a `/.well-known/agent-card.json` route and an `/a2a/[[...path]]` catch-all, each exporting `GET` and `POST` as `(request: Request) => handler(request)`).
+
+The card must declare `capabilities.streaming: true` for `SendStreamingMessage` and `SubscribeToTask` to be served; otherwise they answer `UNSUPPORTED_OPERATION`. Every A2A request must carry the `A2A-Version: 1.0` header. A request without it is read as A2A 0.3 — as the official SDK's server reads it — and refused with `VERSION_NOT_SUPPORTED`. The card itself is served without that check.
+
+<Callout type="warn" title="Authentication and CORS go in front of the handler">
+The handler checks the protocol, not the caller. Authenticate (and answer browser preflights) before you call it, and name the verified caller with [`owner`](#tasks-tenants-and-owners) so callers cannot reach each other's tasks. Request bodies over `maxRequestBodyBytes` (4 MiB) are refused with 413.
+</Callout>
+
+### The executor
+
+Every incoming message starts a **turn**: the handler calls your executor once, and the executor drives the task through its context.
+
+```ts
+const handler = createA2AHandler({
+  card,
+  executor: async (ctx) => {
+    if (ctx.message.parts.some((part) => part.text === undefined)) {
+      // Thrown before any update: the request is answered with this A2A error.
+      throw new A2AError({ reason: 'CONTENT_TYPE_NOT_SUPPORTED', message: 'Text only, please.' });
+    }
+    await ctx.working('Looking it up…');
+    const forecast = await lookUp(a2aText(ctx.message), ctx.signal);
+    await ctx.artifact({ name: 'forecast', parts: [{ data: forecast, mediaType: 'application/json' }] });
+    await ctx.complete('Here is the forecast.');
+  },
+});
+```
+
+| Context member | What it does |
+| --- | --- |
+| `message` | The message that started the turn, with `taskId` and `contextId` filled in. |
+| `task` | The task this turn continues (its `history` ends with `message`); `undefined` for a new interaction. |
+| `taskId`, `contextId` | The existing task's ids, or the ones a new task gets. |
+| `tenant`, `owner` | Where the task lives — see [tasks, tenants and owners](#tasks-tenants-and-owners). |
+| `request` | The full `SendMessage` params: `configuration.acceptedOutputModes`, `metadata`, … |
+| `extensions` | The extension URIs the client requested (`A2A-Extensions`) that the card declares. |
+| `signal` | Aborted when the task is canceled. |
+| `httpRequest` | The HTTP request that carried the message. |
+| `reply(message)` | Answer with a single message and **no task** — a new interaction only, before any update. |
+| `working(message?)` | `TASK_STATE_WORKING`, with an optional progress message. |
+| `artifact(artifact, { append?, lastChunk? })` | Add an artifact, or extend one with `append`; resolves with the artifact's id. |
+| `requireInput(message?)` | `TASK_STATE_INPUT_REQUIRED`: ask the client. Its next message starts the next turn. |
+| `requireAuth(message?)` | `TASK_STATE_AUTH_REQUIRED`. The turn stays open, so the executor may carry on once authorized. |
+| `complete`, `fail`, `reject` (`message?`) | The terminal states `COMPLETED`, `FAILED`, `REJECTED`. |
+| `setStatus(state, message?)` | Any state; the helpers above are shorthands. |
+
+A message is a string, a list of parts, or a message draft (`messageId` and `role` are filled in). The status helpers take `{ metadata }`, merged into the task's `metadata`.
+
+How a turn plays out:
+
+- **A new interaction gets its task at the first update.** The task is created `SUBMITTED`, with the client's message as its history, and the update applies to it; a stream sees the `task` snapshot first, then `statusUpdate` and `artifactUpdate` events. An executor that `reply`s never creates a task.
+- **The turn ends** at `reply`, at a terminal state, at `INPUT_REQUIRED`, or when the executor's promise settles. Updates after that are rejected with an `A2AError`.
+- **An executor that returns while the task is `SUBMITTED` or `WORKING` completes it.** One that returns while `AUTH_REQUIRED` leaves the task waiting.
+- **An executor that throws fails the task** with the error's message as the status message — so throw errors whose messages are safe to show the client. The exception: an `A2AError` thrown **before the task changed** answers the request with that error (`CONTENT_TYPE_NOT_SUPPORTED`, `INVALID_PARAMS`, …) and leaves the task as it was.
+- An executor that neither replies nor updates the task answers `INVALID_AGENT_RESPONSE`.
+
+The executor is stateless across turns, which is what lets any instance serve the next message of a task when the [store](#tasks-tenants-and-owners) is shared.
+
+### Asking the client for input
+
+`requireInput` ends the turn; the client's next message for the task (`taskId` set) starts the next one, with `ctx.task` set:
+
+```ts
+const handler = createA2AHandler({
+  card,
+  executor: async (ctx) => {
+    if (!ctx.task) return ctx.requireInput('Which city?');
+    await ctx.complete(`Sunny in ${a2aText(ctx.message)}.`);
+  },
+});
+
+const asked = (await client.sendMessage('What is the weather?')).task!;
+asked.status.state;                                    // 'TASK_STATE_INPUT_REQUIRED'
+const done = (await client.sendMessage('Izmir', { taskId: asked.id })).task!;
+done.status.message?.parts;                            // [{ text: 'Sunny in Izmir.' }]
+```
+
+A message for a task that is still working (`SUBMITTED`, `WORKING`, or `AUTH_REQUIRED` with its turn still running) is refused with `UNSUPPORTED_OPERATION`; a message for a finished task likewise; one naming another `contextId` than the task's with `INVALID_PARAMS`.
+
+### Backed by a model
+
+The executor is ordinary code, so a Deuz model call, a [native agent](/docs/modules/native-agents) run or a tool loop fits in it. Pass `ctx.signal` along so a cancellation stops the model call:
+
+```ts title="model-agent.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { a2aText, createA2AHandler } from '@deuz-sdk/core/a2a';
+
+const model = createMockModel({ responses: [{ text: 'Paris is the capital of France.' }] });
+
+const handler = createA2AHandler({
+  card, // as in the quick start
+  executor: async (ctx) => {
+    await ctx.working();
+    const { text } = await generateText({ model, prompt: a2aText(ctx.message), signal: ctx.signal });
+    await ctx.artifact({ name: 'answer', parts: [{ text }] });
+    await ctx.complete();
+  },
+});
+```
+
+### Streaming and subscriptions
+
+`SendStreamingMessage` answers with Server-Sent Events: one `message` event (a `reply`), or the task's lifecycle — the `task` snapshot, then its `statusUpdate` and `artifactUpdate` events — until the turn ends. A refusal found before the first event (an unknown task, an `A2AError` from the executor) is answered as a plain error rather than a stream. A failure after it arrives as a `FAILED` status update, or — when the executor refuses a follow-up message after its snapshot was sent — as an `event: error` carrying the A2A error.
+
+`SubscribeToTask` re-attaches to a task: the stored snapshot first, then the events of its running turn until that turn ends. A task with no running turn (one waiting for input) yields its snapshot alone; a finished task is refused with `UNSUPPORTED_OPERATION`. A client that disconnects does not stop the task — it can subscribe again, or poll `GetTask`.
+
+### Cancellation
+
+`CancelTask` asks the executor's optional `cancel` hook, cancels the task, ends its streams with a `CANCELED` status update, and aborts the running turn's `ctx.signal`. Pass an object instead of a function to have the hook:
+
+```ts
+const handler = createA2AHandler({
+  card,
+  executor: {
+    execute: async (ctx) => {
+      /* … long work that honours ctx.signal … */
+    },
+    // Called whether or not a turn is running (an INPUT_REQUIRED task has none).
+    cancel: async ({ task, running }) => {
+      if (await alreadyShipped(task.id)) {
+        throw new A2AError({ reason: 'TASK_NOT_CANCELABLE', message: 'The order has shipped.' });
+      }
+    },
+  },
+});
+```
+
+A canceled task is returned as it is when canceled again; a task in another terminal state answers `TASK_NOT_CANCELABLE`. Updates the executor makes after the cancellation are rejected. Do not wait for `execute` inside `cancel` — the cancellation holds the task until the hook returns.
+
+### Tasks, tenants and owners
+
+Tasks live in an `A2ATaskStore` — `load(taskId, scope)` and `save(task, scope)`, synchronous or not, with plain JSON tasks. The handler loads the task before every change and saves the whole task after it, under a per-task lock, so updates, cancellations and follow-up messages of one task never interleave in one process. The default, `createInMemoryA2ATaskStore()`, keeps every task in memory for as long as the process (or isolate) lives: right for development, tests and single-process agents. Bring a durable store when tasks must survive a restart or be shared by several instances; an instance that finds a task finished by another one (a cancellation) drops the update and aborts its turn.
+
+The `scope` keeps tasks apart:
+
+- **`tenant`** — the A2A tenant of the request (the JSON-RPC `tenant` param, or the `/{tenant}` path segment over HTTP+JSON). A card interface can name one for its clients.
+- **`owner`** — whatever `options.owner(request)` returns. Return the identity you verified (a session, a checked token); a caller then only ever sees, continues, cancels or subscribes to its own tasks, and the executor gets it as `ctx.owner`. Without the option, every caller shares the tasks and the random task ids are the only key.
+
+```ts
+const handler = createA2AHandler({
+  card,
+  executor,
+  owner: async (request) => (await verifySession(request))?.userId,
+});
+```
+
+### What the handler answers
+
+| JSON-RPC method | HTTP+JSON route | Served |
+| --- | --- | --- |
+| `SendMessage` | `POST /message:send` | Yes |
+| `SendStreamingMessage` | `POST /message:stream` | Yes (SSE), with `capabilities.streaming` |
+| `GetTask` | `GET /tasks/{id}?historyLength=N` | Yes |
+| `CancelTask` | `POST /tasks/{id}:cancel` | Yes |
+| `SubscribeToTask` | `GET` or `POST /tasks/{id}:subscribe` | Yes (SSE), with `capabilities.streaming` |
+| `ListTasks` | `GET /tasks` | `UNSUPPORTED_OPERATION` |
+| `…TaskPushNotificationConfig…` | `/tasks/{id}/pushNotificationConfigs…` | `PUSH_NOTIFICATION_NOT_SUPPORTED` |
+| `GetExtendedAgentCard` | `GET /extendedAgentCard` | `UNSUPPORTED_OPERATION` |
+
+HTTP+JSON routes may start with a `/{tenant}` segment. `historyLength` (in `GetTask`, or in `SendMessage`'s `configuration`) trims the returned history to the most recent messages; `0` leaves it empty. A card that declares a `required` extension refuses messages from clients that did not request it (`EXTENSION_SUPPORT_REQUIRED`).
+
+Errors follow the bindings: a JSON-RPC error object with the A2A code (`-32001` `TASK_NOT_FOUND`, `-32002` `TASK_NOT_CANCELABLE`, …) and a `google.rpc.ErrorInfo` detail naming the reason, sent with HTTP 200 (500 for internal errors); over HTTP+JSON, a `google.rpc.Status` body (`{ error: { code, status, message, details } }`) with the binding's HTTP status (404 for `TASK_NOT_FOUND`, 400 for most others). An unknown route is 404, a wrong method 405.
+
+## Calling an agent
+
+`fetchAgentCard(url)` reads `/.well-known/agent-card.json` at the URL's origin — or the URL itself when it ends in `.json`, or `path` resolved against it. `createA2AClient({ card })` then talks to the first `JSONRPC` or `HTTP+JSON` interface the card declares for A2A 1.x (`binding` picks one), with the interface's `tenant`. Or skip the card: `createA2AClient({ url, binding })`.
+
+```ts
+import { a2aText, createA2AClient, fetchAgentCard } from '@deuz-sdk/core/a2a';
+
+const card = await fetchAgentCard('https://travel-agent.example.com');
+const client = createA2AClient({
+  card,
+  headers: async () => ({ Authorization: `Bearer ${await getToken()}` }),
+});
+
+const answer = await client.sendMessage('Find me a hotel in Lisbon for May 3–5.');
+if (answer.message) {
+  console.log(a2aText(answer.message));                // the agent answered directly
+} else if (answer.task.status.state === 'TASK_STATE_INPUT_REQUIRED') {
+  await client.sendMessage('Under 200 EUR a night.', { taskId: answer.task.id });
+}
+```
+
+| Method | A2A method | Returns |
+| --- | --- | --- |
+| `sendMessage(message, options?)` | `SendMessage` | `{ task }` once it is terminal or interrupted (or as soon as it exists with `configuration.returnImmediately`), or `{ message }`. |
+| `sendStreamingMessage(message, options?)` | `SendStreamingMessage` | An async generator of stream events; it ends when the agent's turn does. |
+| `getTask(taskId, { historyLength? })` | `GetTask` | The task. |
+| `cancelTask(taskId, { metadata? })` | `CancelTask` | The task after the request. |
+| `subscribeToTask(taskId)` | `SubscribeToTask` | The task's snapshot, then its updates. |
+
+A message is a string, a list of parts or a draft; `options` take `taskId` and `contextId` (continue a task, join a context), `configuration` (`acceptedOutputModes`, `historyLength`, `returnImmediately`), `metadata`, `signal` and per-call `headers`. Every request carries `A2A-Version: 1.0`, the client's `headers` (static or a function called per request) and, with `extensions`, the `A2A-Extensions` header. Stream events are the wire's own shapes — exactly one of `task`, `message`, `statusUpdate`, `artifactUpdate` — and enum values sent as numbers are named (`'TASK_STATE_WORKING'`).
+
+An aborted `signal` rejects with `AbortError` at once, even through a `fetch` that ignores signals (an in-process handler, a custom transport). Breaking out of a stream releases the connection.
+
+### Errors
+
+Every failure is an `A2AError` (`code: 'a2a_error'`), with a `kind`:
+
+| `kind` | When | Also set |
+| --- | --- | --- |
+| `protocol` | The agent answered with an A2A error. | `reason` (the `ErrorInfo` reason, or one derived from the JSON-RPC code; `'UNKNOWN'` otherwise), `rpcCode`, `statusCode`, `metadata` |
+| `http` | A non-2xx answer without an A2A error in it — a proxy, an auth layer. | `statusCode` |
+| `network` | The request got no response, or a stream broke off. | `cause` |
+| `invalid-response` | Not what the binding defines: not JSON, not JSON-RPC 2.0, another request's id, an unknown result. | |
+
+```ts
+try {
+  await client.cancelTask(taskId);
+} catch (error) {
+  if (error instanceof A2AError && error.reason === 'TASK_NOT_CANCELABLE') {
+    // already finished
+  } else throw error;
+}
+```
+
+A card without a usable interface, and a `binding` other than `'JSONRPC'` or `'HTTP+JSON'`, throw `InvalidRequestError` when the client is created.
+
+## Not covered
+
+- **gRPC** and **A2A 0.3** clients or servers.
+- **Push notifications**, **`ListTasks`** and the **extended agent card**: answered as unsupported by the handler, not offered by the client.
+- **Signed agent cards** (JWS): a card's `signatures` are carried, not verified.
+- **Keep-alive comments** on long, silent streams: a turn that stays quiet longer than a proxy's idle timeout should report progress with `working(…)`.
+- **A `runAgent` adapter** — tasks as native runs, `INPUT_REQUIRED` as a suspended run, cancellation as an abort, artifacts as typed output — is planned; the executor interface is built for it.
+
+## API at a glance
+
+| Export | What it is |
+| --- | --- |
+| `fetchAgentCard(url, options?)` | Read an agent card. |
+| `createA2AClient(options)` | A client for one agent endpoint (`A2AClient`). |
+| `createA2AHandler(options)` | Serve an agent: `(request: Request) => Promise<Response>`. |
+| `createInMemoryA2ATaskStore()` | The default task store. |
+| `a2aText(value)` | The text parts of a message, an artifact or a list of parts, concatenated. |
+| `A2AError` | `kind`, `reason`, `rpcCode`, `statusCode`. |
+| Types | `A2AAgentCard`, `A2AMessage`, `A2APart`, `A2ATask`, `A2AArtifact`, `A2AStreamResponse`, `A2ASendMessageResponse`, `A2AClientOptions`, `A2AHandlerOptions`, `A2AExecutor`, `A2AExecutionContext`, `A2ATaskStore`, `A2ATaskScope`, `A2AErrorReason`, … |
+
+## See also
+
+- [MCP server](/docs/modules/mcp-server) — serve tools (rather than an agent) to MCP clients.
+- [Native agents](/docs/modules/native-agents) — `runAgent`, a natural executor for a long task.
+- [Dependencies](/docs/core/dependencies) — `deps.fetch`, `generateId` and `clock`.
