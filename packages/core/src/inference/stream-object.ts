@@ -146,6 +146,9 @@ export const streamObject: StreamObject = <T = unknown>(
       usageDeferred.reject(err);
       finishDeferred.reject(err);
       stopDetailsDeferred.reject(err);
+      // Never rejects (the declared contract): a failed call still reports
+      // the notices collected before it failed.
+      warningsDeferred.resolve(warningSink.list());
       // fail(), not close(): consumers of the partial stream must see the
       // failure, not a clean end-of-stream.
       broadcaster.fail(err);
