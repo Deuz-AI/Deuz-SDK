@@ -600,6 +600,46 @@ describe('createA2AHandler — GetTask and scopes', () => {
     expect(await store.load(id, { tenant: 'acme' })).toMatchObject({ id });
   });
 
+  it('keeps the tasks of different owners apart', async () => {
+    const store = createInMemoryA2ATaskStore();
+    const owners: (string | undefined)[] = [];
+    const cancelOwners: (string | undefined)[] = [];
+    const { handler } = handlerWith(() => {}, {
+      taskStore: store,
+      // A test stand-in: a real deployment returns an identity it verified.
+      owner: (request) => request.headers.get('x-test-user') ?? undefined,
+      executor: {
+        execute: (ctx) => {
+          owners.push(ctx.owner);
+          return ctx.task ? ctx.complete() : ctx.requireInput('?');
+        },
+        cancel: (cancel) => {
+          cancelOwners.push(cancel.owner);
+        },
+      },
+    });
+    const as = (user: string) => ({ 'A2A-Version': '1.0', 'x-test-user': user });
+    const created = await rpc(handler, 'SendMessage', { message: userMessage('a') }, as('alice'));
+    const id = (created.body.result as { task: A2ATask }).task.id;
+    expect(owners).toEqual(['alice']);
+    expect(await store.load(id, { owner: 'alice' })).toMatchObject({ id });
+
+    for (const [method, params] of [
+      ['GetTask', { id }],
+      ['CancelTask', { id }],
+      ['SubscribeToTask', { id }],
+      ['SendMessage', { message: userMessage('b', { taskId: id }) }],
+    ] as const) {
+      const { body } = await rpc(handler, method, params, as('bob'));
+      expect(body.error, method).toMatchObject({ code: -32001 });
+    }
+    expect((await rpc(handler, 'GetTask', { id })).body.error).toMatchObject({ code: -32001 });
+
+    expect((await rpc(handler, 'GetTask', { id }, as('alice'))).body.result).toMatchObject({ id });
+    await rpc(handler, 'CancelTask', { id }, as('alice'));
+    expect(cancelOwners).toEqual(['alice']);
+  });
+
   it('gives the executor the tenant, the request and the requested extensions it declares', async () => {
     let seen: A2AExecutionContext | undefined;
     const card: A2AAgentCard = {

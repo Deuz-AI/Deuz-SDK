@@ -462,9 +462,11 @@ export interface A2AClient {
 
 // --- handler -------------------------------------------------------------------
 
-/** Where a task lives: tasks of different tenants never see each other. */
+/** Where a task lives: tasks of different tenants or owners never see each other. */
 export interface A2ATaskScope {
   tenant?: string;
+  /** The caller `options.owner` named. */
+  owner?: string;
 }
 
 /**
@@ -517,6 +519,8 @@ export interface A2AExecutionContext {
   readonly taskId: string;
   readonly contextId: string;
   readonly tenant: string | undefined;
+  /** The caller, as `options.owner` named it. */
+  readonly owner: string | undefined;
   /** The full `SendMessage` params: `configuration` (accepted output modes, …) and `metadata`. */
   readonly request: A2ASendMessageRequest;
   /** Extension URIs the client requested (`A2A-Extensions`). */
@@ -554,6 +558,7 @@ export interface A2ACancelContext {
   /** The task, not yet canceled. */
   readonly task: A2ATask;
   readonly tenant: string | undefined;
+  readonly owner: string | undefined;
   readonly request: A2ACancelTaskRequest;
   /** A turn of this task is running in this handler; its `signal` is aborted next. */
   readonly running: boolean;
@@ -584,6 +589,14 @@ export interface A2AHandlerOptions {
   executor: A2AExecutor | A2AExecuteFunction;
   /** Default: an in-memory store (`createInMemoryA2ATaskStore`). */
   taskStore?: A2ATaskStore;
+  /**
+   * Who is calling. Tasks are kept per owner (within a tenant), so a caller
+   * only ever sees, continues, cancels or subscribes to its own tasks; the
+   * executor gets it as `owner`. Return an identity you verified — a session,
+   * a checked token — never a header you did not check. Default: no owner,
+   * every caller shares the tasks (their random ids are the only key).
+   */
+  owner?: (request: Request) => string | undefined | Promise<string | undefined>;
   /** Default `/.well-known/agent-card.json`. */
   cardPath?: string;
   /** The largest request body read, in bytes. Default 4 MiB. */

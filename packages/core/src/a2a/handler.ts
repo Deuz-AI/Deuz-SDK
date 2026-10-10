@@ -260,10 +260,6 @@ function rpcFraming(id: JsonRpcId, historyLength: number | undefined): StreamFra
   };
 }
 
-function scopeOf(tenant: string | undefined): A2ATaskScope {
-  return tenant !== undefined ? { tenant } : {};
-}
-
 /** An A2A error as an HTTP+JSON error: the HTTP status and a `google.rpc.Status` body. */
 function restErrorBody(error: A2AError): { status: number; body: unknown } {
   const wire = REASON_WIRE[(error.reason ?? 'INTERNAL_ERROR') as A2AErrorReason];
@@ -560,7 +556,16 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
     );
   }
 
-  function turnInfo(request: Request, tenant: string | undefined): TurnInfo {
+  /** The tenant the request names and the owner `options.owner` sees in it. */
+  async function scopeFor(request: Request, tenant: string | undefined): Promise<A2ATaskScope> {
+    const owner = options.owner ? await options.owner(request) : undefined;
+    return {
+      ...(tenant !== undefined ? { tenant } : {}),
+      ...(owner !== undefined && owner !== '' ? { owner } : {}),
+    };
+  }
+
+  function turnInfo(request: Request, scope: A2ATaskScope): TurnInfo {
     const requested = parseExtensions(request.headers.get(A2A_EXTENSIONS_HEADER));
     const missing = requiredExtensions.filter((uri) => !requested.includes(uri));
     if (missing.length > 0) {
@@ -570,7 +575,7 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
       );
     }
     return {
-      scope: scopeOf(tenant),
+      scope,
       extensions: requested.filter((uri) => declaredExtensions.has(uri)),
       httpRequest: request,
     };
@@ -598,10 +603,10 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
   async function sendMessage(
     params: Record<string, unknown>,
     request: Request,
-    tenant: string | undefined,
+    scope: A2ATaskScope,
   ): Promise<A2ASendMessageResponse> {
-    const sendRequest = parseSendMessageRequest(params, tenant);
-    const turn = await runtime.start(sendRequest, turnInfo(request, tenant));
+    const sendRequest = parseSendMessageRequest(params, scope.tenant);
+    const turn = await runtime.start(sendRequest, turnInfo(request, scope));
     const configuration = sendRequest.configuration;
     const answer = configuration?.returnImmediately
       ? await turn.first.promise
@@ -616,13 +621,14 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
     request: Request,
   ): Promise<Response> {
     const tenant = optionalString(params.tenant, 'tenant');
+    const scope = await scopeFor(request, tenant);
     switch (method) {
       case 'SendMessage':
-        return rpcResult(id, await sendMessage(params, request, tenant));
+        return rpcResult(id, await sendMessage(params, request, scope));
       case 'SendStreamingMessage': {
         requireStreaming();
         const sendRequest = parseSendMessageRequest(params, tenant);
-        const info = turnInfo(request, tenant);
+        const info = turnInfo(request, scope);
         return streamResponse(
           async (sink) => {
             await runtime.start(sendRequest, info, sink);
@@ -634,21 +640,21 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
       case 'GetTask': {
         const taskId = requiredString(params.id, 'id');
         const historyLength = optionalHistoryLength(params.historyLength);
-        return rpcResult(id, await runtime.getTask(taskId, scopeOf(tenant), historyLength));
+        return rpcResult(id, await runtime.getTask(taskId, scope, historyLength));
       }
       case 'CancelTask': {
         const taskId = requiredString(params.id, 'id');
         const metadata = optionalRecord(params.metadata, 'metadata');
         return rpcResult(
           id,
-          await runtime.cancel(cancelRequest(taskId, tenant, metadata), scopeOf(tenant), request),
+          await runtime.cancel(cancelRequest(taskId, tenant, metadata), scope, request),
         );
       }
       case 'SubscribeToTask': {
         requireStreaming();
         const taskId = requiredString(params.id, 'id');
         return streamResponse(
-          (sink) => runtime.subscribe(taskId, scopeOf(tenant), sink),
+          (sink) => runtime.subscribe(taskId, scope, sink),
           rpcFraming(id, undefined),
           asProtocolError,
         );
@@ -754,14 +760,14 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
     tenant: string | undefined,
     request: Request,
   ): Promise<Response> {
-    const scope = scopeOf(tenant);
+    const scope = await scopeFor(request, tenant);
     switch (route.kind) {
       case 'send':
-        return restResult(await sendMessage(await restBody(request), request, tenant));
+        return restResult(await sendMessage(await restBody(request), request, scope));
       case 'stream': {
         requireStreaming();
         const sendRequest = parseSendMessageRequest(await restBody(request), tenant);
-        const info = turnInfo(request, tenant);
+        const info = turnInfo(request, scope);
         return streamResponse(
           async (sink) => {
             await runtime.start(sendRequest, info, sink);

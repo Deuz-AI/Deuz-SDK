@@ -145,7 +145,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
 
   const now = () => new Date(deps.clock.now()).toISOString();
   const keyOf = (taskId: string, scope: A2ATaskScope) =>
-    JSON.stringify([scope.tenant ?? null, taskId]);
+    JSON.stringify([scope.tenant ?? null, scope.owner ?? null, taskId]);
 
   function withLock<T>(key: string, work: () => Promise<T>): Promise<T> {
     const run = (locks.get(key) ?? Promise.resolve()).then(work);
@@ -395,6 +395,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
       taskId: turn.taskId,
       contextId: turn.contextId,
       tenant: turn.scope.tenant,
+      owner: turn.scope.owner,
       request: structuredClone(request),
       extensions: info.extensions,
       signal: turn.controller.signal,
@@ -598,6 +599,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
       await executor.cancel?.({
         task: structuredClone(task),
         tenant: scope.tenant,
+        owner: scope.owner,
         request: structuredClone(request),
         running: turn !== undefined,
         httpRequest,
