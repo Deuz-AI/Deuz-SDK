@@ -79,9 +79,12 @@ export function createInMemoryLeaseProvider(options: { clock?: Clock } = {}): Le
     },
     async prune(before) {
       assertRetentionTime(before);
+      // A key held now is never pruned, whatever the cutoff: a lease expiring
+      // after now still has a holder even when it expires before `before`.
+      const cutoff = Math.min(before, clock.now());
       let pruned = 0;
       for (const [key, row] of leases)
-        if ((row.expiresAt === 0 || row.expiresAt < before) && !row.signals.includes('cancel')) {
+        if ((row.expiresAt === 0 || row.expiresAt < cutoff) && !row.signals.includes('cancel')) {
           leases.delete(key);
           pruned++;
         }

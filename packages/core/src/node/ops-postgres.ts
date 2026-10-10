@@ -221,10 +221,13 @@ export function createPostgresOpsStore(options: PostgresOpsStoreOptions): Postgr
       return rows.length === 1;
     },
     // Nobody holds the key, and no cancel waits for its run's next executor.
+    // The cutoff stops at the database's time: a lease expiring later is held,
+    // whatever a host clock ahead of the database passed as `before`.
     prune: (before) =>
       prune(
         leasesTable,
-        `(expires_at = 0 OR expires_at < $1::float8) AND NOT signals @> '["cancel"]'::jsonb`,
+        `(expires_at = 0 OR expires_at < LEAST($1::float8, ${NOW}))
+          AND NOT signals @> '["cancel"]'::jsonb`,
         before,
       ),
   };

@@ -274,7 +274,9 @@ What a prune deletes is gone:
 
 - The next holder of a pruned lease key starts again at token 1, and a holder
   whose lease expired before `before` finds it lost when it renews. Choose
-  `before` well past any pause an executor could survive.
+  `before` well past any pause an executor could survive. A lease that has not
+  expired yet is never pruned: a `before` later than the store's clock, such as
+  a host clock running ahead of the database, is cut back to the store's time.
 - A pruned agent run can no longer be resumed or inspected, and its run ID is
   free again.
 - A pruned claim key can be claimed again. Keep every key that an occurrence or

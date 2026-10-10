@@ -297,12 +297,13 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
     async prune(before) {
       assertRetentionTime(before);
       // Nobody holds the key, and no cancel waits for its run's next executor.
+      // The cutoff stops at the store's time: a lease expiring later is held.
       return use((db) =>
         prune(
           db,
           'deuz_leases',
           `(expires_at = 0 OR expires_at < ?) AND instr(signals, '"cancel"') = 0`,
-          before,
+          Math.min(before, clock.now()),
         ),
       );
     },
