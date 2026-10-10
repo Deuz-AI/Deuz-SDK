@@ -272,7 +272,13 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       ];
       body.tool_choice = { type: 'tool', name: toolName };
     }
-  } else if (ctx.tools && ctx.tools.tools.length > 0) {
+  }
+  // A json-strategy object request keeps the call's tools and their tool_choice
+  // beside `output_config.format` (2.3, F15): runAgent's finalization asks with
+  // the loop's tools and `toolChoice: 'none'`, so its request prefix (prompt
+  // cache, preserved thinking) stays the loop's. The tool strategy forces its
+  // own call instead. Not live-verified.
+  if (ctx.object?.strategy !== 'tool' && ctx.tools && ctx.tools.tools.length > 0) {
     body.tools = ctx.tools.tools.map((t) =>
       t.provider
         ? t.provider // provider-executed tool — raw native definition, verbatim

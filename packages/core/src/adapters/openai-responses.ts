@@ -229,7 +229,12 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       ];
       body.tool_choice = { type: 'function', name };
     }
-  } else if (tools && tools.tools.length > 0) {
+  }
+  // A json-strategy object request keeps the call's tools and their tool_choice
+  // beside `text.format` (2.3, F15): runAgent's finalization asks with the
+  // loop's tools and `toolChoice: 'none'`, so its request prefix stays the
+  // loop's. The tool strategy forces its own call instead. Not live-verified.
+  if (object?.strategy !== 'tool' && tools && tools.tools.length > 0) {
     body.tools = tools.tools.map((t) =>
       t.provider
         ? t.provider // hosted tool (web_search, …) — raw native definition, verbatim
@@ -242,7 +247,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     );
     const tc = mapResponsesToolChoice(ctx, tools.toolChoice);
     if (tc !== undefined) body.tool_choice = tc;
-  } else if (options.responseFormat === 'json') {
+  } else if (!object && options.responseFormat === 'json') {
     body.text = { format: { type: 'json_object' } };
   }
 

@@ -22,6 +22,7 @@ import {
   optionalOutputCap,
   planEffort,
   reportClamp,
+  reportRequestWarning,
 } from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
 import { resolveMedia } from '../internal/image';
@@ -200,7 +201,23 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   const body: Record<string, unknown> = { contents, generationConfig };
   if (systemInstruction) body.systemInstruction = systemInstruction;
 
-  if (tools && tools.tools.length > 0 && !object) {
+  if (tools && tools.tools.length > 0 && object) {
+    // A structured-output request does not carry the call's tools on this wire
+    // (2.3, F15): @google/genai 2.28.0 documents no request that combines
+    // function declarations with a JSON response schema (not live-verified).
+    // runAgent's finalization sends `toolChoice: 'none'`, which the API defines
+    // as behaving like a request without declarations, so nothing is lost
+    // there; any other drop of callable tools is reported.
+    if (tools.toolChoice !== 'none') {
+      reportRequestWarning(ctx, {
+        type: 'unsupported-tool',
+        message:
+          `Dropped ${tools.tools.length} tool(s) (${tools.tools.map((t) => t.name).join(', ')}): ` +
+          'the Gemini native wire sends no tools with a structured-output request, so ' +
+          `${call.provider}/${call.modelId} will answer without them.`,
+      });
+    }
+  } else if (tools && tools.tools.length > 0) {
     const fns = tools.tools.filter((t) => !t.provider);
     const providerTools = tools.tools.filter((t) => t.provider).map((t) => t.provider!);
     const entries: unknown[] = [];
