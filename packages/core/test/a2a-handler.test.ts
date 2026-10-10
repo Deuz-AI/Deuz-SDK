@@ -1029,3 +1029,260 @@ describe('createA2AHandler — AUTH_REQUIRED', () => {
     ]);
   });
 });
+
+/** One HTTP+JSON request; `body` is sent as JSON. */
+async function rest(
+  handler: (request: Request) => Promise<Response>,
+  method: string,
+  path: string,
+  body?: unknown,
+  headers: Record<string, string> = {},
+) {
+  return handler(
+    new Request(`${REST_URL}${path}`, {
+      method,
+      headers: {
+        'A2A-Version': '1.0',
+        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        ...headers,
+      },
+      ...(body !== undefined
+        ? { body: typeof body === 'string' ? body : JSON.stringify(body) }
+        : {}),
+    }),
+  );
+}
+
+/** A google.rpc.Status error body as the HTTP+JSON binding writes it. */
+const restErrorBody = (code: number, status: string, reason?: string) => ({
+  error: {
+    code,
+    status,
+    message: expect.any(String),
+    details: reason ? errorInfo(reason) : [],
+  },
+});
+
+describe('createA2AHandler — HTTP+JSON binding', () => {
+  it('runs a turn for POST /message:send and answers the task as application/a2a+json', async () => {
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.artifact({ parts: [{ text: 'hello' }] });
+      await ctx.complete();
+    });
+    const response = await rest(handler, 'POST', '/message:send', {
+      message: userMessage('hello'),
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('application/a2a+json');
+    const body = (await response.json()) as { task: A2ATask };
+    expect(body.task.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(body.task.artifacts?.[0]?.parts).toEqual([{ text: 'hello' }]);
+  });
+
+  it('answers a direct reply as { message }', async () => {
+    const { handler } = handlerWith((ctx) => ctx.reply('pong'));
+    const response = await rest(handler, 'POST', '/message:send', { message: userMessage('ping') });
+    expect(await response.json()).toMatchObject({ message: { parts: [{ text: 'pong' }] } });
+  });
+
+  it('gets a task with GET /tasks/{id}, honouring historyLength', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete('done'));
+    const created = (await (
+      await rest(handler, 'POST', '/message:send', { message: userMessage('hello') })
+    ).json()) as { task: A2ATask };
+    const full = (await (
+      await rest(handler, 'GET', `/tasks/${created.task.id}`)
+    ).json()) as A2ATask;
+    expect(full).toEqual(created.task);
+    const trimmed = (await (
+      await rest(handler, 'GET', `/tasks/${created.task.id}?historyLength=1`)
+    ).json()) as A2ATask;
+    expect(trimmed.history?.map((message) => message.parts)).toEqual([[{ text: 'done' }]]);
+  });
+
+  it('cancels with POST /tasks/{id}:cancel and no body', async () => {
+    const { handler } = handlerWith((ctx) => ctx.requireInput('Which city?'));
+    const created = (await (
+      await rest(handler, 'POST', '/message:send', { message: userMessage('weather?') })
+    ).json()) as { task: A2ATask };
+    const response = await handler(
+      new Request(`${REST_URL}/tasks/${created.task.id}:cancel`, {
+        method: 'POST',
+        headers: { 'A2A-Version': '1.0', 'Content-Type': 'application/json' },
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as A2ATask).status.state).toBe('TASK_STATE_CANCELED');
+  });
+
+  it('round-trips a task id that needs encoding', async () => {
+    let next = 0;
+    const { handler } = handlerWith((ctx) => ctx.requireInput('?'), {
+      deps: {
+        generateId: () => (++next === 1 ? 'urn:task/1' : `id-${next}`),
+        clock: { now: () => Date.parse(NOW), setTimeout: () => () => {} },
+      },
+    });
+    await rest(handler, 'POST', '/message:send', { message: userMessage('a') });
+    const id = encodeURIComponent('urn:task/1');
+    expect(await (await rest(handler, 'GET', `/tasks/${id}`)).json()).toMatchObject({
+      id: 'urn:task/1',
+    });
+    expect(await (await rest(handler, 'POST', `/tasks/${id}:cancel`, {})).json()).toMatchObject({
+      id: 'urn:task/1',
+      status: { state: 'TASK_STATE_CANCELED' },
+    });
+  });
+
+  it('streams POST /message:stream as bare StreamResponse events', async () => {
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.working();
+      await ctx.complete();
+    });
+    const response = await rest(handler, 'POST', '/message:stream', {
+      message: userMessage('hello'),
+    });
+    const events = (await sseReader(response).rest()).map(({ data }) => data);
+    expect(events.map((event) => Object.keys(event))).toEqual([
+      ['task'],
+      ['statusUpdate'],
+      ['statusUpdate'],
+    ]);
+    expect(events[2]).toMatchObject({
+      statusUpdate: { status: { state: 'TASK_STATE_COMPLETED' } },
+    });
+  });
+
+  it('subscribes with GET or POST /tasks/{id}:subscribe', async () => {
+    const { handler } = handlerWith((ctx) => ctx.requireInput('?'));
+    const created = (await (
+      await rest(handler, 'POST', '/message:send', { message: userMessage('a') })
+    ).json()) as { task: A2ATask };
+    for (const method of ['GET', 'POST']) {
+      const response = await rest(handler, method, `/tasks/${created.task.id}:subscribe`);
+      expect((await sseReader(response).rest()).map(({ data }) => data)).toEqual([
+        { task: created.task },
+      ]);
+    }
+  });
+
+  it('scopes tasks by the tenant path segment', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete());
+    const created = (await (
+      await rest(handler, 'POST', '/acme/message:send', { message: userMessage('a') })
+    ).json()) as { task: A2ATask };
+    expect((await rest(handler, 'GET', `/acme/tasks/${created.task.id}`)).status).toBe(200);
+    expect((await rest(handler, 'GET', `/tasks/${created.task.id}`)).status).toBe(404);
+  });
+
+  it('writes errors as google.rpc.Status bodies with the binding’s HTTP status', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete());
+    const missing = await rest(handler, 'GET', '/tasks/missing');
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get('content-type')).toBe('application/a2a+json');
+    expect(await missing.json()).toEqual(restErrorBody(404, 'NOT_FOUND', 'TASK_NOT_FOUND'));
+
+    const created = (await (
+      await rest(handler, 'POST', '/message:send', { message: userMessage('a') })
+    ).json()) as { task: A2ATask };
+    const notCancelable = await rest(handler, 'POST', `/tasks/${created.task.id}:cancel`, {});
+    expect(notCancelable.status).toBe(400);
+    expect(await notCancelable.json()).toEqual(
+      restErrorBody(400, 'FAILED_PRECONDITION', 'TASK_NOT_CANCELABLE'),
+    );
+  });
+
+  it('refuses a request without A2A-Version 1.0', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete());
+    const response = await rest(handler, 'GET', '/tasks/x', undefined, { 'A2A-Version': '' });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(
+      restErrorBody(400, 'FAILED_PRECONDITION', 'VERSION_NOT_SUPPORTED'),
+    );
+  });
+
+  it('refuses malformed JSON and other content types', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete());
+    const malformed = await rest(handler, 'POST', '/message:send', '{not json');
+    expect(malformed.status).toBe(400);
+    expect(await malformed.json()).toEqual(
+      restErrorBody(400, 'INVALID_ARGUMENT', 'INVALID_PARAMS'),
+    );
+    const text = await rest(handler, 'POST', '/message:send', 'hello', {
+      'Content-Type': 'text/plain',
+    });
+    expect(await text.json()).toEqual(
+      restErrorBody(400, 'INVALID_ARGUMENT', 'CONTENT_TYPE_NOT_SUPPORTED'),
+    );
+    const a2aJson = await rest(
+      handler,
+      'POST',
+      '/message:send',
+      { message: userMessage('a') },
+      {
+        'Content-Type': 'application/a2a+json',
+      },
+    );
+    expect(a2aJson.status).toBe(200);
+  });
+
+  it('answers the routes it does not serve with their A2A errors', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete());
+    expect(await (await rest(handler, 'GET', '/tasks')).json()).toEqual(
+      restErrorBody(400, 'FAILED_PRECONDITION', 'UNSUPPORTED_OPERATION'),
+    );
+    for (const [method, path] of [
+      ['POST', '/tasks/t1/pushNotificationConfigs'],
+      ['GET', '/tasks/t1/pushNotificationConfigs'],
+      ['GET', '/tasks/t1/pushNotificationConfigs/c1'],
+      ['DELETE', '/tasks/t1/pushNotificationConfigs/c1'],
+    ] as const) {
+      expect(await (await rest(handler, method, path)).json()).toEqual(
+        restErrorBody(400, 'FAILED_PRECONDITION', 'PUSH_NOTIFICATION_NOT_SUPPORTED'),
+      );
+    }
+    expect(await (await rest(handler, 'GET', '/extendedAgentCard')).json()).toEqual(
+      restErrorBody(400, 'FAILED_PRECONDITION', 'UNSUPPORTED_OPERATION'),
+    );
+  });
+
+  it('answers an unknown route with 404 and a wrong method with 405', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete());
+    expect((await rest(handler, 'GET', '/messages')).status).toBe(404);
+    const wrong = await rest(handler, 'GET', '/message:send');
+    expect(wrong.status).toBe(405);
+    expect(wrong.headers.get('allow')).toBe('POST');
+  });
+
+  it('answers a stream refused before its first event with an error body', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete());
+    const response = await rest(handler, 'POST', '/message:stream', {
+      message: userMessage('a', { taskId: 'missing' }),
+    });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual(restErrorBody(404, 'NOT_FOUND', 'TASK_NOT_FOUND'));
+  });
+
+  it('ends a stream refused after the snapshot with an `event: error` status body', async () => {
+    const { handler } = handlerWith((ctx) => {
+      if (!ctx.task) return ctx.requireInput('Which city?');
+      throw new A2AError({ reason: 'CONTENT_TYPE_NOT_SUPPORTED', message: 'Text only.' });
+    });
+    const created = (await (
+      await rest(handler, 'POST', '/message:send', { message: userMessage('weather?') })
+    ).json()) as { task: A2ATask };
+    const response = await rest(handler, 'POST', '/message:stream', {
+      message: { ...userMessage('a picture'), taskId: created.task.id },
+    });
+    const events = await sseReader(response).rest();
+    expect(events.map(({ event }) => event)).toEqual([undefined, 'error']);
+    expect(events[1]?.data).toEqual({
+      error: {
+        code: 400,
+        status: 'INVALID_ARGUMENT',
+        message: 'Text only.',
+        details: errorInfo('CONTENT_TYPE_NOT_SUPPORTED'),
+      },
+    });
+  });
+});

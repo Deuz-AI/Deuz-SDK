@@ -9,6 +9,7 @@ import { InvalidRequestError } from '../errors';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { A2AError } from './errors';
 import {
+  A2A_CONTENT_TYPE,
   A2A_ERROR_DOMAIN,
   A2A_EXTENSIONS_HEADER,
   A2A_PROTOCOL_VERSION,
@@ -254,6 +255,96 @@ function scopeOf(tenant: string | undefined): A2ATaskScope {
   return tenant !== undefined ? { tenant } : {};
 }
 
+/** An A2A error as an HTTP+JSON error: the HTTP status and a `google.rpc.Status` body. */
+function restErrorBody(error: A2AError): { status: number; body: unknown } {
+  const wire = REASON_WIRE[(error.reason ?? 'INTERNAL_ERROR') as A2AErrorReason];
+  const status = wire?.http ?? 500;
+  return {
+    status,
+    body: {
+      error: {
+        code: status,
+        status: wire?.status ?? 'UNKNOWN',
+        message: error.message,
+        details: errorInfo(error),
+      },
+    },
+  };
+}
+
+function restError(error: A2AError): Response {
+  const { status, body } = restErrorBody(error);
+  return json(body, status, A2A_CONTENT_TYPE);
+}
+
+function restResult(body: unknown): Response {
+  return json(body, 200, A2A_CONTENT_TYPE);
+}
+
+/** HTTP+JSON streams: every event is a bare `StreamResponse`. */
+function restFraming(historyLength: number | undefined): StreamFraming {
+  return {
+    event: (event) => (event.task ? { task: withHistory(event.task, historyLength) } : event),
+    error: (error) => restErrorBody(error).body,
+    errorResponse: restError,
+  };
+}
+
+/** A route of the HTTP+JSON binding, below the interface's path. */
+type RestRoute =
+  | { kind: 'send' | 'stream' | 'list' | 'push' | 'extendedCard' }
+  | { kind: 'get' | 'cancel' | 'subscribe'; taskId: string };
+
+const ROUTE_STARTS = new Set(['message:send', 'message:stream', 'tasks', 'extendedAgentCard']);
+
+/**
+ * The route, its allowed methods and the tenant of a path below an HTTP+JSON
+ * interface: `/message:send`, `/tasks/{id}:cancel`, ... with an optional
+ * `/{tenant}` first segment.
+ */
+function parseRestPath(
+  remainder: string,
+): { route: RestRoute; allow: string[]; tenant: string | undefined } | undefined {
+  const parts: string[] = [];
+  for (const segment of remainder.split('/')) {
+    if (segment === '') continue;
+    try {
+      parts.push(decodeURIComponent(segment));
+    } catch {
+      return undefined;
+    }
+  }
+  const tenant =
+    parts.length > 0 && !ROUTE_STARTS.has(parts[0] as string) ? parts.shift() : undefined;
+  const [first, second, third] = parts;
+  const at = (route: RestRoute, ...allow: string[]) => ({ route, allow, tenant });
+  if (parts.length === 1 && first === 'message:send') return at({ kind: 'send' }, 'POST');
+  if (parts.length === 1 && first === 'message:stream') return at({ kind: 'stream' }, 'POST');
+  if (parts.length === 1 && first === 'extendedAgentCard') {
+    return at({ kind: 'extendedCard' }, 'GET');
+  }
+  if (first !== 'tasks') return undefined;
+  if (parts.length === 1) return at({ kind: 'list' }, 'GET');
+  if (third === 'pushNotificationConfigs' && parts.length <= 4) {
+    return at({ kind: 'push' }, 'GET', 'POST', 'DELETE');
+  }
+  if (parts.length !== 2 || second === undefined) return undefined;
+  if (second.endsWith(':cancel')) {
+    return at({ kind: 'cancel', taskId: second.slice(0, -':cancel'.length) }, 'POST');
+  }
+  if (second.endsWith(':subscribe')) {
+    return at({ kind: 'subscribe', taskId: second.slice(0, -':subscribe'.length) }, 'GET', 'POST');
+  }
+  return at({ kind: 'get', taskId: second }, 'GET');
+}
+
+/** The path below `base`, or `undefined` when `path` is not under it. */
+function below(base: string, path: string): string | undefined {
+  if (base === '/') return path;
+  if (path === base) return '';
+  return path.startsWith(`${base}/`) ? path.slice(base.length) : undefined;
+}
+
 function isJsonRpcId(value: unknown): value is JsonRpcId {
   return (
     value === null ||
@@ -431,6 +522,8 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
     deps,
     report,
   });
+  // The most specific HTTP+JSON base first, should two be nested.
+  const restBases = [...endpoints.rest].sort((left, right) => right.length - left.length);
   const cardPath = normalizePath(options.cardPath ?? AGENT_CARD_PATH);
   const cardJson = JSON.stringify(card);
   const maxBodyBytes = options.maxRequestBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
@@ -619,6 +712,117 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
     }
   }
 
+  /** The JSON object of an HTTP+JSON request body; an empty body is `{}`. */
+  async function restBody(request: Request): Promise<Record<string, unknown>> {
+    const text = await readBody(request, maxBodyBytes);
+    if (text.trim() === '') return {};
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw invalidParams('Invalid JSON payload.');
+    }
+    if (!isRecord(body)) throw invalidParams('The request body must be a JSON object.');
+    return body;
+  }
+
+  function historyLengthQuery(request: Request): number | undefined {
+    const value = new URL(request.url).searchParams.get('historyLength');
+    if (value === null || value === '') return undefined;
+    if (!/^[0-9]+$/.test(value)) {
+      throw invalidParams('historyLength must be a non-negative integer.');
+    }
+    return Number(value);
+  }
+
+  async function dispatchRest(
+    route: RestRoute,
+    tenant: string | undefined,
+    request: Request,
+  ): Promise<Response> {
+    const scope = scopeOf(tenant);
+    switch (route.kind) {
+      case 'send':
+        return restResult(await sendMessage(await restBody(request), request, tenant));
+      case 'stream': {
+        requireStreaming();
+        const sendRequest = parseSendMessageRequest(await restBody(request), tenant);
+        const info = turnInfo(request, tenant);
+        return streamResponse(
+          async (sink) => {
+            await runtime.start(sendRequest, info, sink);
+          },
+          restFraming(sendRequest.configuration?.historyLength),
+          asProtocolError,
+        );
+      }
+      case 'get':
+        return restResult(await runtime.getTask(route.taskId, scope, historyLengthQuery(request)));
+      case 'cancel': {
+        const metadata = optionalRecord((await restBody(request)).metadata, 'metadata');
+        return restResult(
+          await runtime.cancel(cancelRequest(route.taskId, tenant, metadata), scope, request),
+        );
+      }
+      case 'subscribe': {
+        requireStreaming();
+        const taskId = route.taskId;
+        return streamResponse(
+          (sink) => runtime.subscribe(taskId, scope, sink),
+          restFraming(undefined),
+          asProtocolError,
+        );
+      }
+      case 'list':
+        throw protocolError('UNSUPPORTED_OPERATION', 'ListTasks is not supported by this agent.');
+      case 'push':
+        throw protocolError(
+          'PUSH_NOTIFICATION_NOT_SUPPORTED',
+          'Push notifications are not supported by this agent.',
+        );
+      case 'extendedCard':
+        throw protocolError('UNSUPPORTED_OPERATION', 'This agent has no extended agent card.');
+    }
+  }
+
+  async function handleRest(request: Request, remainder: string, path: string): Promise<Response> {
+    const parsed = parseRestPath(remainder);
+    if (!parsed) return notFound(path);
+    if (!parsed.allow.includes(request.method)) return methodNotAllowed(parsed.allow.join(', '));
+    try {
+      const unsupportedVersion = versionError(request);
+      if (unsupportedVersion) throw unsupportedVersion;
+      const contentType = mediaType(request.headers.get('content-type'));
+      if (
+        contentType !== undefined &&
+        contentType !== JSON_CONTENT_TYPE &&
+        contentType !== A2A_CONTENT_TYPE
+      ) {
+        throw protocolError(
+          'CONTENT_TYPE_NOT_SUPPORTED',
+          `Unsupported Content-Type '${contentType}'; expected ${JSON_CONTENT_TYPE} or ${A2A_CONTENT_TYPE}.`,
+        );
+      }
+      return await dispatchRest(parsed.route, parsed.tenant, request);
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        return json(
+          {
+            error: {
+              code: 413,
+              status: 'INVALID_ARGUMENT',
+              message: `The request body exceeds ${maxBodyBytes} bytes.`,
+              details: [],
+            },
+          },
+          413,
+          A2A_CONTENT_TYPE,
+        );
+      }
+      return restError(asProtocolError(error));
+    }
+  }
+
   function notFound(path: string): Response {
     return json(
       { error: { code: 404, status: 'NOT_FOUND', message: `No A2A endpoint at '${path}'.` } },
@@ -644,6 +848,10 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
     if (endpoints.jsonrpc.has(path)) {
       if (request.method !== 'POST') return methodNotAllowed('POST');
       return handleJsonRpc(request);
+    }
+    for (const base of restBases) {
+      const remainder = below(base, path);
+      if (remainder !== undefined) return handleRest(request, remainder, path);
     }
     return notFound(path);
   };
