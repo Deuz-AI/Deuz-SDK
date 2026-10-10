@@ -65,6 +65,16 @@ import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
 import { assertCheckpointVersion } from './internal/checkpoint-version';
+// Native run discovery (2.3).
+import type { AgentRunListPage, AgentRunListQuery } from './types/agent-run';
+import type { Clock } from './types/deps';
+import {
+  agentRunListPage,
+  compareAgentRunSummaries,
+  isAfterAgentRunCursor,
+  planAgentRunList,
+  summarizeAgentRunEnvelope,
+} from './internal/agent-run-list';
 
 export type * from './types/agent-run';
 
@@ -224,17 +234,38 @@ async function handoffBinding(tools: ToolSet): Promise<string | undefined> {
   return targets.size > 0 ? JSON.stringify([...targets.values()]) : undefined;
 }
 
-/** Store for tests and single-process applications; durable applications supply their own store. */
-export function createInMemoryAgentRunStore(): AgentRunStore {
-  const runs = new Map<string, AgentRunEnvelope>();
+/**
+ * Store for tests and single-process applications; durable applications supply
+ * their own store. It lists its runs (2.3) by the time of their last save on
+ * `clock`, which defaults to the host clock.
+ */
+export function createInMemoryAgentRunStore(options: { clock?: Clock } = {}): AgentRunStore & {
+  list(query?: AgentRunListQuery): Promise<AgentRunListPage>;
+} {
+  const clock = options.clock ?? resolveDependencies().clock;
+  const runs = new Map<string, { envelope: AgentRunEnvelope; updatedAt: number }>();
   return {
     load: (runId) => {
       const value = runs.get(runId);
-      return value ? structuredClone(value) : undefined;
+      return value ? structuredClone(value.envelope) : undefined;
     },
     save: (envelope) => {
-      assertEnvelopeRevision(runs.get(envelope.runId), envelope);
-      runs.set(envelope.runId, structuredClone(envelope));
+      assertEnvelopeRevision(runs.get(envelope.runId)?.envelope, envelope);
+      runs.set(envelope.runId, { envelope: structuredClone(envelope), updatedAt: clock.now() });
+    },
+    async list(query) {
+      const plan = planAgentRunList(query);
+      const rows = [...runs.values()]
+        .map((row) => summarizeAgentRunEnvelope(row.envelope, row.updatedAt))
+        .filter(
+          (run) =>
+            (plan.phases === undefined || plan.phases.includes(run.phase)) &&
+            (plan.updatedBefore === undefined || run.updatedAt < plan.updatedBefore) &&
+            (plan.scope === undefined || run.scope === plan.scope) &&
+            isAfterAgentRunCursor(run, plan.after),
+        )
+        .sort(compareAgentRunSummaries);
+      return agentRunListPage(rows.slice(0, plan.limit + 1), plan.limit);
     },
   };
 }

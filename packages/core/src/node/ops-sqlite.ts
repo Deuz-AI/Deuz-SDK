@@ -7,11 +7,17 @@
  */
 import type { SqliteDatabaseLike, SqliteStatementLike } from './store-sqlite';
 import { ensureBusyTimeout } from './sqlite-open';
-import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
+import type {
+  AgentRunEnvelope,
+  AgentRunListPage,
+  AgentRunListQuery,
+  AgentRunStore,
+} from '../types/agent-run';
 import type { Clock } from '../types/deps';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/lease';
 import { assertEnvelopeRevision, assertLeaseRequest } from '../internal/ops-validate';
 import { assertRetentionTime } from '../internal/ops-retention';
+import { agentRunListPage, planAgentRunList, summarizeAgentRun } from '../internal/agent-run-list';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 
@@ -43,6 +49,11 @@ export interface SqliteOpsStore {
      * longer be resumed or inspected, and its ID is free again.
      */
     prune(before: number): Promise<number>;
+    /**
+     * Native run discovery (2.3): a page of runs, newest save first, by the
+     * `deuz_agent_runs_updated_at` index. Times are on the store's clock.
+     */
+    list(query?: AgentRunListQuery): Promise<AgentRunListPage>;
   };
   /**
    * A durable claim for `createScheduler({ claim })` and `handleSignal({ dedupe })`:
@@ -345,6 +356,60 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
           `updated_at < ? AND json_extract(payload, '$.phase') = 'terminal'`,
           before,
         ),
+      );
+    },
+    async list(query) {
+      const plan = planAgentRunList(query);
+      if (plan.phases?.length === 0) return { runs: [] };
+      const where: string[] = [];
+      const params: (string | number)[] = [];
+      if (plan.scope !== undefined) {
+        where.push('scope=?');
+        params.push(plan.scope);
+      }
+      if (plan.updatedBefore !== undefined) {
+        where.push('updated_at<?');
+        params.push(plan.updatedBefore);
+      }
+      if (plan.after !== undefined) {
+        // Strictly after the cursor in the ORDER BY below.
+        where.push('(updated_at<? OR (updated_at=? AND run_id<?))');
+        params.push(plan.after.updatedAt, plan.after.updatedAt, plan.after.runId);
+      }
+      if (plan.phases !== undefined) {
+        where.push(`json_extract(payload, '$.phase') IN (${plan.phases.map(() => '?').join(',')})`);
+        params.push(...plan.phases);
+      }
+      const rows = await use(
+        (db) =>
+          statement(
+            db,
+            `SELECT run_id, scope, revision, updated_at,
+             json_extract(payload, '$.phase') AS phase,
+             json_extract(payload, '$.result.status') AS status
+             FROM deuz_agent_runs${where.length ? ` WHERE ${where.join(' AND ')}` : ''}
+             ORDER BY updated_at DESC, run_id DESC LIMIT ?`,
+          ).all(...params, plan.limit + 1) as {
+            run_id: string;
+            scope: string;
+            revision: number;
+            updated_at: number;
+            phase: unknown;
+            status: unknown;
+          }[],
+      );
+      return agentRunListPage(
+        rows.map((row) =>
+          summarizeAgentRun({
+            runId: row.run_id,
+            scope: row.scope,
+            revision: row.revision,
+            updatedAt: row.updated_at,
+            phase: row.phase,
+            status: row.status,
+          }),
+        ),
+        plan.limit,
       );
     },
   };

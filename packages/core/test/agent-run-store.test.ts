@@ -2,9 +2,23 @@ import { describe, expect, it } from 'vitest';
 import { createInMemoryAgentRunStore, runAgent } from '../src/agent-run';
 import { createMockModel } from '../src/testing';
 import type { AgentRunEnvelope, AgentRunStore } from '../src/types/agent-run';
-import { agentRunStoreContracts } from './fixtures/agent-run-store-conformance';
+import {
+  agentRunListContracts,
+  agentRunStoreContracts,
+} from './fixtures/agent-run-store-conformance';
+import { manualClock } from './fixtures/manual-clock';
 
-agentRunStoreContracts('memory agent run store', createInMemoryAgentRunStore);
+agentRunStoreContracts('memory agent run store', () => createInMemoryAgentRunStore());
+
+agentRunListContracts('memory agent run listing', async () => {
+  const { clock, advance } = manualClock();
+  return {
+    store: createInMemoryAgentRunStore({ clock }),
+    advance,
+    now: () => clock.now(),
+    frozen: true,
+  };
+});
 
 describe('native envelope revision', () => {
   it('advances the revision by one on every save', async () => {

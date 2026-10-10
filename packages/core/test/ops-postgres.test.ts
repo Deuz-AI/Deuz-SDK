@@ -4,6 +4,7 @@ import { createPostgresOpsStore } from '../src/node/ops-postgres';
 import type { PgClientLike } from '../src/node/store-postgres';
 import { leaseProviderContracts } from './fixtures/lease-provider-conformance';
 import {
+  agentRunListContracts,
   agentRunPruneContracts,
   agentRunStoreContracts,
   envelope,
@@ -41,6 +42,12 @@ agentRunStoreContracts(
 );
 
 agentRunPruneContracts('Postgres agent run retention (PGlite, database time)', async () => ({
+  store: (await freshOps()).agentRuns,
+  advance: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
+}));
+
+agentRunListContracts('Postgres agent run listing (PGlite, database time)', async () => ({
   store: (await freshOps()).agentRuns,
   advance: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   now: () => Date.now(),

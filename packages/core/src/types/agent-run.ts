@@ -223,6 +223,64 @@ export interface AgentRunStore {
    * stores (2.2) reject an envelope whose revision is not the stored one plus one.
    */
   save(envelope: AgentRunEnvelope): void | Promise<void>;
+  /**
+   * Native run discovery (2.3): a page of the stored runs, newest change first
+   * (last save descending, then run ID descending), summarised without their
+   * transcripts. Pass a page's `cursor` back for the next one. Optional: the
+   * memory, SQLite and Postgres stores have it. Rejects a malformed query
+   * with a TypeError.
+   */
+  list?(query?: AgentRunListQuery): AgentRunListPage | Promise<AgentRunListPage>;
+}
+
+/** Where a native run stands, as its envelope records it (2.3 names the union). */
+export type AgentRunPhase = AgentRunEnvelope['phase'];
+
+/** Which runs `AgentRunStore.list` returns (2.3). Every filter is optional. */
+export interface AgentRunListQuery {
+  /** Only runs in one of these phases; an empty list matches none. */
+  phases?: readonly AgentRunPhase[];
+  /**
+   * Only runs last saved before this time: epoch ms on the store's clock (the
+   * injected clock for the memory and SQLite stores, the database clock for
+   * Postgres). Stale-run discovery passes `now - staleMs`.
+   */
+  updatedBefore?: number;
+  /** Only this scope's runs. */
+  scope?: string;
+  /** The most runs per page, 1..1000. Default 100. */
+  limit?: number;
+  /** The `cursor` of the previous page: only runs after it in the order. */
+  cursor?: string;
+}
+
+/** One run in a listing (2.3): what a supervisor needs without loading its transcript. */
+export interface AgentRunSummary {
+  runId: string;
+  scope: string;
+  phase: AgentRunPhase;
+  /** The envelope's revision; 0 for an envelope written by 2.1. */
+  revision: number;
+  /** Epoch ms of the run's last save, on the store's clock. */
+  updatedAt: number;
+  /**
+   * The status of the result the envelope records: `'suspended'` for a run
+   * waiting on approvals or client results (its phase stays `'running'`), the
+   * outcome of a terminal run. Absent while the run is in progress.
+   */
+  status?: AgentResult['status'];
+}
+
+/** A page of runs (2.3). */
+export interface AgentRunListPage {
+  runs: AgentRunSummary[];
+  /**
+   * Present when more runs follow: pass it as `cursor`. Opaque, and only
+   * meaningful to the store that made it. A run saved while you page moves
+   * ahead of the cursor, so a traversal never repeats a run but can miss one
+   * that was saved meanwhile.
+   */
+  cursor?: string;
 }
 
 export interface AgentRunSession {
