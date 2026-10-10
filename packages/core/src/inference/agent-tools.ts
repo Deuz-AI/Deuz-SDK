@@ -1,4 +1,5 @@
 import type {
+  AgentTool,
   AgentToolSet,
   AgentToolContext,
   AgentValidation,
@@ -42,6 +43,37 @@ export async function prepareAgentTools(
   receipts?: NativeToolReceipts,
 ): Promise<ToolSet> {
   return prepareToolSet(tools, contexts, onOutput, receipts, new Map());
+}
+
+/**
+ * Route a native run's MCP tools through the receipts its local tools use (2.3,
+ * F01): the `executing` stage before the call, reconciliation on resume and a
+ * `tool-output` event. `replayOf` names the tools whose `mcp` entry declared
+ * them idempotent.
+ *
+ * An MCP tool's `outputSchema` is its server's raw JSON Schema. It stays
+ * metadata, as on every `Tool`: the MCP client validates structured results
+ * against it (the official SDK rejects a result that does not conform), and
+ * core ships no JSON Schema validator to repeat that check. Receipts and
+ * `tool-output` events keep the result the client returned.
+ */
+export async function prepareMcpTools(
+  tools: ToolSet,
+  replayOf: (name: string) => AgentTool['replay'],
+  onOutput?: (output: NativeToolOutput) => void | Promise<void>,
+  receipts?: NativeToolReceipts,
+): Promise<ToolSet> {
+  const view = Object.create(null) as AgentToolSet;
+  for (const [name, tool] of Object.entries(tools)) {
+    const replay = replayOf(name);
+    // An MCP `execute` ignores its context, so the native context fits it.
+    view[name] = { ...tool, outputSchema: undefined, ...(replay ? { replay } : {}) } as AgentTool;
+  }
+  const prepared = await prepareToolSet(view, {}, onOutput, receipts, new Map());
+  for (const [name, tool] of Object.entries(tools)) {
+    if (tool.outputSchema) prepared[name]!.outputSchema = tool.outputSchema;
+  }
+  return prepared;
 }
 
 /**

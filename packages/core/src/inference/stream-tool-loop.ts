@@ -145,6 +145,21 @@ export interface StreamToolLoopInternal {
   observeResume?: { stepId: string; stepIndex: number; checkpointAgeMs?: number };
   /** Observation (1.6): sub-agent — share the parent runtime, emit no run.* events. */
   observeInherited?: { runtime: ObservationRuntime; parentSpanId?: string };
+  /**
+   * Native runs (2.3, F01): the MCP runtime the native runner resolved before it
+   * admitted the run, because the servers' catalog is part of its resume
+   * binding. The loop uses it in place of connecting `options.mcp`, and never
+   * closes it: the runner does. Its tools already pass through the runner's
+   * effect receipts, and so does every catalog a hot refresh brings.
+   */
+  mcp?: {
+    runtime: ResolvedMcpRuntime;
+    /**
+     * Called after each hot refresh, before the refreshed catalog reaches the
+     * wire. It records the catalog; its warnings go out as `warning` parts.
+     */
+    refreshed(): Promise<CallWarning[]>;
+  };
 }
 
 export interface StreamToolLoopSnapshot {
@@ -637,7 +652,7 @@ export function runStreamToolLoop(
       // tools ride the very first model call. Inside the try on purpose — an
       // unreachable server rejects here, and the pump's catch turns that into an
       // `error` part with rejected promises, which is what keeps G2 intact.
-      mcp = await setupMcp(options, deps);
+      mcp = internal?.mcp ? internal.mcp.runtime : await setupMcp(options, deps);
       tools = mergeMcpTools(mcp, ownTools);
       // Handoff (2.0): the transfer catalog is read from the ROOT set, ONCE — an
       // agent's own set never carries a transfer to itself, so re-deriving it
@@ -891,6 +906,9 @@ export function runStreamToolLoop(
           // the set belongs to the ACTIVE agent, and re-merging the caller's
           // would silently undo the transfer.
           tools = await refreshMcpTools(mcp, ownTools, deps);
+          // A native run records the refreshed catalog (2.3, F01) before the
+          // model is offered it, and reports how the catalog changed.
+          for (const warning of (await internal?.mcp?.refreshed()) ?? []) warningSink.add(warning);
           fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
           staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
           flushWarnings();
@@ -1737,8 +1755,9 @@ export function runStreamToolLoop(
       // site that covers every pump exit — the finish path, the suspension
       // `return`s, the mid-stream `failRun` return and the outer catch — so it
       // lands right after the same post-terminal bookkeeping (settleMemory /
-      // persistChat) each of those paths already performed. Never throws.
-      await closeMcp(mcp, deps);
+      // persistChat) each of those paths already performed. Never throws. A
+      // runtime a native runner handed in is the runner's to close (2.3).
+      if (!internal?.mcp) await closeMcp(mcp, deps);
       const stopDetails = stopDetailsFrom(lastFinishMeta);
       internal?.onSnapshot?.({
         messages,

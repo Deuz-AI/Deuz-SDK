@@ -1,4 +1,10 @@
-import type { CommonCallOptions } from './config';
+import type {
+  CommonCallOptions,
+  McpClientLoopEntry,
+  McpHttpLoopConfig,
+  McpStdioLoopConfig,
+} from './config';
+import type { McpClient } from '../mcp/shared';
 import type { Message } from './message';
 import type { Usage } from './usage';
 import type { StreamPart } from './stream';
@@ -59,6 +65,24 @@ export interface AgentTool<A = unknown, R = unknown, C = unknown> extends Omit<
 // Heterogeneous tool registries intentionally erase each entry's generics.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type AgentToolSet = Record<string, AgentTool<any, any, any>>;
+
+/**
+ * Which interrupted calls of an MCP server a native run may repeat on resume
+ * (2.3): `'idempotent'` for every tool of the server, or a map from the server's
+ * own tool names (before any `namespace` prefix) to `'idempotent'`. The MCP
+ * counterpart of {@link AgentTool.replay}; bump `bindingId` when changing it.
+ */
+export type AgentMcpReplay = 'idempotent' | Readonly<Record<string, 'idempotent'>>;
+
+/**
+ * One `mcp` entry of a native run (2.3): any `CommonCallOptions.mcp` entry. A
+ * config or `{ client }` entry may also declare `replay`.
+ */
+export type AgentMcpEntry =
+  | McpClient
+  | ((McpHttpLoopConfig | McpStdioLoopConfig | McpClientLoopEntry) & {
+      replay?: AgentMcpReplay;
+    });
 
 export type AgentVerification =
   | { status: 'verified' }
@@ -129,7 +153,18 @@ export interface AgentRunEnvelope {
   /** A persisted candidate avoids another model call after a verifier/store interruption. */
   candidateText?: string;
   verification?: AgentVerification['status'];
-  binding?: { model: string; tools: string; output: string; revision?: string };
+  binding?: {
+    model: string;
+    tools: string;
+    output: string;
+    revision?: string;
+    /**
+     * The MCP servers' tool catalog (2.3): `fingerprintTools` JSON. Resume
+     * rejects a catalog that drifted from it; a hot refresh records the new one.
+     * Absent before 2.3 and for runs without MCP; resume then records the catalog.
+     */
+    mcp?: string;
+  };
   limits?: { maxSteps: number; maxOutputAttempts: number; maxVerifyAttempts: number };
   loopOutcome?: {
     finishReason: FinishReason;
@@ -195,9 +230,16 @@ export type AgentRunOptions<T = string> = Omit<
   | 'chat'
   | 'memory'
   | 'fallbackModels'
+  | 'mcp'
 > & {
   messages?: Message[];
   tools?: AgentToolSet;
+  /**
+   * MCP servers, as `CommonCallOptions.mcp` (2.3: through the native run's effect
+   * receipts, with the servers' tool catalog in the resume binding). An entry may
+   * declare `replay` for its idempotent tools.
+   */
+  mcp?: AgentMcpEntry[];
   toolsContext?: Record<string, unknown>;
   session?: AgentRunSession;
   output?: AgentOutput<T>;

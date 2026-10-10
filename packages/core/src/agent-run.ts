@@ -6,10 +6,11 @@ import type {
   AgentRunSession,
   AgentRunStore,
   AgentStream,
+  AgentTool,
   AgentValidation,
 } from './types/agent-run';
 import type { CommonCallOptions } from './types/config';
-import type { StopDetails } from './types/methods';
+import type { CallWarning, StopDetails } from './types/methods';
 import type { Message } from './types/message';
 import type { WireToolRequest } from './adapters/types';
 import type { SessionStore } from './types/session';
@@ -41,7 +42,12 @@ import {
   completedArrayElements,
   validateAgentValue,
 } from './inference/agent-output';
-import { prepareAgentTools } from './inference/agent-tools';
+import {
+  prepareAgentTools,
+  type NativeToolOutput,
+  type NativeToolReceipts,
+} from './inference/agent-tools';
+import type { NativeMcp } from './inference/native-mcp';
 import {
   assertExecutionPolicy,
   createExecutionContext,
@@ -214,6 +220,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   let releaseRun: (() => void) | undefined;
   let settledOutcome: AgentResult<T> | undefined;
   let writeTail: Promise<void> = Promise.resolve();
+  /** The run's MCP servers (2.3, F01), closed on every exit. */
+  let nativeMcp: NativeMcp | undefined;
 
   let persistedLedger: string | undefined;
   // A child of a caller's shared ledger records only its own slice (2.2): the
@@ -429,38 +437,44 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           },
         };
       }
+      const onToolOutput = (output: NativeToolOutput): void => {
+        events.push({ type: 'tool-output', ...output });
+      };
+      // One receipt boundary for every tool the run can execute: local, handoff
+      // targets and (2.3, F01) MCP tools, refreshed catalogs included.
+      const receipts: NativeToolReceipts = {
+        load: (id) => envelope.toolResults?.[JSON.stringify([envelope.modelSteps, id])],
+        retryToolCallIds: options.retryToolCallIds,
+        modelStep: () => envelope.modelSteps,
+        save: async (receipt, ctx) => {
+          envelope.toolResults ??= {};
+          receipt.modelStep ??= envelope.modelSteps;
+          envelope.toolResults[JSON.stringify([receipt.modelStep, receipt.toolCallId])] = receipt;
+          envelope.messages = [...ctx.messages];
+          // Persist the in-flight tool-call history as well as its receipt so
+          // canonical resume can settle that exact ID without another model call.
+          const previous = envelope.checkpoints[envelope.runId];
+          envelope.checkpoints[envelope.runId] = {
+            version: 1,
+            runId: envelope.runId,
+            stepId: `${envelope.runId}#${previous?.stepIndex ?? 0}`,
+            stepIndex: previous?.stepIndex ?? 0,
+            status: 'running',
+            messages: envelope.messages,
+            usage: envelope.usage,
+            createdAt: resolveDependencies(options.deps).clock.now(),
+            ...(previous?.handoff ? { handoff: previous.handoff } : {}),
+          };
+          await persist();
+        },
+      };
       common.tools = await prepareAgentTools(
         nativeTools,
         options.toolsContext,
-        (output) => events.push({ type: 'tool-output', ...output }),
-        {
-          load: (id) => envelope.toolResults?.[JSON.stringify([envelope.modelSteps, id])],
-          retryToolCallIds: options.retryToolCallIds,
-          modelStep: () => envelope.modelSteps,
-          save: async (receipt, ctx) => {
-            envelope.toolResults ??= {};
-            receipt.modelStep ??= envelope.modelSteps;
-            envelope.toolResults[JSON.stringify([receipt.modelStep, receipt.toolCallId])] = receipt;
-            envelope.messages = [...ctx.messages];
-            // Persist the in-flight tool-call history as well as its receipt so
-            // canonical resume can settle that exact ID without another model call.
-            const previous = envelope.checkpoints[envelope.runId];
-            envelope.checkpoints[envelope.runId] = {
-              version: 1,
-              runId: envelope.runId,
-              stepId: `${envelope.runId}#${previous?.stepIndex ?? 0}`,
-              stepIndex: previous?.stepIndex ?? 0,
-              status: 'running',
-              messages: envelope.messages,
-              usage: envelope.usage,
-              createdAt: resolveDependencies(options.deps).clock.now(),
-              ...(previous?.handoff ? { handoff: previous.handoff } : {}),
-            };
-            await persist();
-          },
-        },
+        onToolOutput,
+        receipts,
       );
-      const binding = {
+      const binding: NonNullable<AgentRunEnvelope['binding']> = {
         model: `${common.model.provider}/${common.model.surface}/${common.model.modelId}`,
         tools: JSON.stringify(
           await Promise.all(
@@ -478,9 +492,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         output: JSON.stringify(outputSchema ?? null),
         ...(options.bindingId !== undefined ? { revision: options.bindingId } : {}),
       };
-      if (envelope.binding && JSON.stringify(binding) !== JSON.stringify(envelope.binding))
-        throw new TypeError('Native agent binding changed across resume.');
-      envelope.binding = binding;
+      // The MCP catalog (2.3) is compared below, once the servers are reached.
+      const recordedCatalog = envelope.binding?.mcp;
+      if (envelope.binding) {
+        const { mcp: _catalog, ...recorded } = envelope.binding;
+        if (JSON.stringify(binding) !== JSON.stringify(recorded))
+          throw new TypeError('Native agent binding changed across resume.');
+      }
       if (envelope.phase === 'terminal') {
         if (!envelope.result || envelope.result.status === 'suspended')
           throw new TypeError('Invalid native terminal checkpoint.');
@@ -488,6 +506,26 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         settledOutcome = terminal;
         return;
       }
+      // MCP (2.3, F01): connected only now, after a terminal run has returned
+      // and before anything is persisted, so an unreachable server fails a fresh
+      // run cleanly and a resume checks the servers' catalog before it writes. The
+      // tools pass through the same receipts as local tools.
+      if ((options.mcp?.length ?? 0) > 0 || recordedCatalog !== undefined) {
+        const native = await import('./inference/native-mcp');
+        if (options.mcp?.length) {
+          nativeMcp = await native.resolveNativeMcp(
+            options.mcp,
+            resolveDependencies(options.deps),
+            onToolOutput,
+            receipts,
+          );
+          binding.mcp = await nativeMcp.catalog();
+        }
+        const drift = native.catalogDrift(recordedCatalog, binding.mcp);
+        // Rejected like a changed local tool set; the stored run stays intact.
+        if (drift) throw new TypeError(`MCP tool catalog changed across resume (${drift}).`);
+      }
+      envelope.binding = binding;
       if (envelope.limits) {
         maxSteps = Math.min(maxSteps, envelope.limits.maxSteps);
         maxOutputAttempts = Math.min(maxOutputAttempts, envelope.limits.maxOutputAttempts);
@@ -531,10 +569,15 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         settledOutcome = outcome;
         return;
       }
+      // A local tool shadows an MCP tool of the same name, as in the loop's merge.
+      const replayOf = (name: string): AgentTool['replay'] =>
+        options.tools && Object.hasOwn(options.tools, name)
+          ? options.tools[name]!.replay
+          : nativeMcp?.replayOf(name);
       const unreconciled = Object.values(envelope.toolResults ?? {}).filter(
         (receipt) =>
           receipt.stage === 'executing' &&
-          options.tools?.[receipt.toolName]?.replay !== 'idempotent' &&
+          replayOf(receipt.toolName) !== 'idempotent' &&
           !options.retryToolCallIds?.includes(receipt.toolCallId),
       );
       if (resume && unreconciled.length) {
@@ -622,6 +665,26 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         return true;
       };
 
+      // A hot refresh mid-run (2.3, F01) opens a new binding revision: the new
+      // catalog is recorded, durably, before the model is offered it, so a later
+      // resume compares against the catalog the run actually used. The change is
+      // reported as a warning; its tools carry receipts like every other.
+      const recordCatalog = async (): Promise<CallWarning[]> => {
+        const catalog = await nativeMcp!.catalog();
+        const { catalogDrift } = await import('./inference/native-mcp');
+        const drift = catalogDrift(envelope.binding?.mcp, catalog);
+        if (!drift) return [];
+        envelope.binding = { ...envelope.binding!, mcp: catalog };
+        await persist();
+        return [
+          {
+            type: 'other',
+            setting: 'mcp',
+            message: `MCP tool catalog changed mid-run (${drift}); the run's resume binding now records the new catalog.`,
+          },
+        ];
+      };
+
       // Structured-only runs go straight to finalization. Runs with tools/MCP
       // traverse the canonical loop first; no tool executor exists here.
       const hasLoopTools = Object.keys(common.tools).length > 0 || (options.mcp?.length ?? 0) > 0;
@@ -686,6 +749,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                 };
                 envelope.pendingClientCalls = value.pendingClientCalls;
               },
+              ...(nativeMcp
+                ? { mcp: { runtime: nativeMcp.runtime, refreshed: recordCatalog } }
+                : {}),
             },
           );
           for await (const part of inner.fullStream) {
@@ -749,7 +815,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           (hasLoopTools
             ? filterWireTools(
                 await buildWireTools(
-                  mergeMcpTools(undefined, common.tools),
+                  mergeMcpTools(nativeMcp?.runtime, common.tools),
                   common.toolChoice,
                   common.maxToolConcurrency,
                 ),
@@ -1054,6 +1120,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         settledOutcome = failed;
       }
     } finally {
+      await nativeMcp?.close();
       removeLedgerPersistence?.();
       releaseRun?.();
       if (settledOutcome) {
