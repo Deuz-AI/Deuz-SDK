@@ -661,7 +661,9 @@ async function* parseStream(
       }
       // Final here when streaming (beta thinking-binding-controls-2026-08-01).
       if (Array.isArray(data.message?.input_transformations)) {
-        inputTransformations = data.message.input_transformations as AnthropicInputTransformation[];
+        inputTransformations = data.message.input_transformations.filter(
+          isRecord,
+        ) as AnthropicInputTransformation[];
       }
     } else if (type === 'content_block_start') {
       const idx = data.index ?? 0;
@@ -732,7 +734,9 @@ async function* parseStream(
       // Present only after a mid-stream server-side model fallback: the
       // serving model's report replaces message_start's.
       if (Array.isArray(data.input_transformations)) {
-        inputTransformations = data.input_transformations as AnthropicInputTransformation[];
+        inputTransformations = data.input_transformations.filter(
+          isRecord,
+        ) as AnthropicInputTransformation[];
       }
       if (data.usage) {
         if (data.usage.output_tokens !== undefined) outputTokens = data.usage.output_tokens;

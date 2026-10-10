@@ -318,6 +318,27 @@ describe('input_transformations surface as a typed warning', () => {
     expect(parts.find((p) => p.type === 'finish')).not.toHaveProperty('providerMetadata');
   });
 
+  it('a malformed report entry is skipped, never thrown on', async () => {
+    const { fetch } = mockFetch(() => sseResponse([done({ start: [null, 'x', 7, DROPPED[0]] })]));
+    const parts = await drain(
+      streamChat({
+        model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-5-5'),
+        messages: REPLAYS,
+      }).fullStream,
+    );
+    expect(parts.some((p) => p.type === 'error')).toBe(false);
+    const warning = parts.find((p) => p.type === 'warning') as Extract<
+      StreamPart,
+      { type: 'warning' }
+    >;
+    expect(warning.warning.message).toContain('removed 1 thinking block ');
+    const finish = parts.find((p) => p.type === 'finish') as Extract<
+      StreamPart,
+      { type: 'finish' }
+    >;
+    expect(finish.providerMetadata).toEqual({ anthropic: { input_transformations: [DROPPED[0]] } });
+  });
+
   const LOOKUP: JSONSchema = { type: 'object', properties: {}, additionalProperties: false };
   const toolCall = sseEvents([
     {
