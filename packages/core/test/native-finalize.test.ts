@@ -16,7 +16,10 @@ import { describe, expect, it, vi } from 'vitest';
 import * as inference from '../src/core/inference';
 import { createInMemoryAgentRunStore, resumeAgent, runAgent, streamAgent } from '../src/agent-run';
 import { createAnthropic } from '../src/anthropic';
+import { createGoogleNative } from '../src/google';
+import { createOpenAI, createOpenAIResponses } from '../src/openai';
 import { createMockModel, mockFetchSequence, sseEvents, sseResponse } from '../src/testing';
+import type { LanguageModel } from '../src/types/model';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import type { AgentEvent, AgentRunStore } from '../src/types/agent-run';
 import type { MockResponse } from '../src/testing';
@@ -321,6 +324,99 @@ describe('native finalization on the Anthropic wire (F15)', () => {
           { type: 'text', text: '{"a":"20C"}' },
         ],
       });
+    },
+  );
+});
+
+/** One streamed text answer, in each wire's own event shape. */
+const wireText = {
+  anthropic: (text: string) =>
+    sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 2 } } },
+      },
+      {
+        event: 'content_block_delta',
+        data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
+      },
+      {
+        event: 'message_delta',
+        data: {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 1 },
+        },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]),
+  chat: (text: string) =>
+    sseEvents([
+      { data: { choices: [{ index: 0, delta: { content: text }, finish_reason: null }] } },
+      { data: { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] } },
+      { data: { choices: [], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 } } },
+      { data: '[DONE]' },
+    ]),
+  responses: (text: string) =>
+    sseEvents([
+      {
+        event: 'response.output_text.delta',
+        data: { type: 'response.output_text.delta', delta: text },
+      },
+      {
+        event: 'response.completed',
+        data: {
+          type: 'response.completed',
+          response: { status: 'completed', usage: { input_tokens: 2, output_tokens: 1 } },
+        },
+      },
+    ]),
+  google: (text: string) =>
+    sseEvents([
+      { data: { candidates: [{ content: { role: 'model', parts: [{ text }] } }] } },
+      {
+        data: {
+          candidates: [{ content: { role: 'model', parts: [] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 1, totalTokenCount: 3 },
+        },
+      },
+    ]),
+};
+
+describe('native finalization across provider wires (F15)', () => {
+  // Tools plus `output` is the trigger: the loop's final answer is an assistant
+  // turn, and finalization must follow it with a user turn on every wire.
+  const lastRole: Record<keyof typeof wireText, (body: Record<string, unknown>) => unknown> = {
+    anthropic: (body) => (body.messages as { role: string }[]).at(-1)?.role,
+    chat: (body) => (body.messages as { role: string }[]).at(-1)?.role,
+    responses: (body) => (body.input as { role?: string }[]).at(-1)?.role,
+    google: (body) => (body.contents as { role: string }[]).at(-1)?.role,
+  };
+  const models: Record<keyof typeof wireText, (fetch: typeof globalThis.fetch) => LanguageModel> = {
+    anthropic: (fetch) => createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-8'),
+    chat: (fetch) => createOpenAI({ apiKey: 'k', fetch })('gpt-5.5'),
+    responses: (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.5'),
+    google: (fetch) => createGoogleNative({ apiKey: 'k', fetch })('gemini-2.5-flash'),
+  };
+
+  it.each(Object.keys(wireText) as (keyof typeof wireText)[])(
+    '%s: the finalization request ends with a user turn',
+    async (wire) => {
+      const sequence = mockFetchSequence([
+        () => sseResponse([wireText[wire]('Rome is mild today.')]),
+        () => sseResponse([wireText[wire]('{"a":"mild"}')]),
+      ]);
+      const result = await runAgent({
+        model: models[wire](sequence.fetch),
+        prompt: 'Weather in Rome as JSON.',
+        maxRetries: 0,
+        tools: { lookup: { parameters, execute: () => 'mild' } },
+        output: { schema: OBJ, validate: (value: unknown) => value as { a: string } },
+      });
+      expect(result).toMatchObject({ status: 'completed', output: { a: 'mild' } });
+      expect(sequence.calls).toHaveLength(2);
+      const finalize = JSON.parse(String(sequence.calls[1]!.init!.body)) as Record<string, unknown>;
+      expect(lastRole[wire](finalize)).toBe('user');
     },
   );
 });
