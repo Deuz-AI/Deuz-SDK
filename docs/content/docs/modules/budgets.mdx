@@ -111,9 +111,10 @@ call runs by default:
 - its cost is left out of every USD total, so `spent.usd` counts the priced
   calls only. `accounting.unpriced` counts the unpriced ones, which also stay in
   `unknownUsd` because their cost is unknown;
-- the run reports one `unpriced-model` warning per model: on the result's
-  `warnings` when the call goes through an agentic loop, and through
-  `deps.logger` otherwise.
+- each run reports one `unpriced-model` warning per model through
+  `deps.logger`, and an agentic loop also on its result's `warnings` and as a
+  `warning` part on its stream. Runs that share an execution context each
+  report it; a swarm or `evolve` run reports it once for all its tasks.
 
 ```ts
 import { runAgent } from '@deuz-sdk/core/agent';

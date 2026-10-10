@@ -4,7 +4,7 @@ import { EMPTY_USAGE, withTotal } from '../core/metering';
 import { getCapabilities } from '../core/registry';
 import { createTokenEstimator } from './estimate-tokens';
 import { wireOutputCap } from './output-cap';
-import { unpricedModelWarning } from './unpriced';
+import { firstRunReport, unpricedModelWarning } from './unpriced';
 import type { CommonCallOptions } from '../types/config';
 import type { CallWarning } from '../types/methods';
 import type { PriceProvider, ResolvedDependencies } from '../types/deps';
@@ -15,8 +15,6 @@ import type { InternalRunOptions } from '../core/inference';
 /** Without a `deps.priceProvider` no model has a price (2.3). */
 const NO_PRICES: PriceProvider = { priceUsage: () => undefined };
 
-/** Models reported per ledger: one `unpriced-model` warning per run and model. */
-const reported = new WeakMap<BudgetLedger, Set<string>>();
 /** What a ledger's persistent scopes bound; fixed when the ledger is created. */
 const persistentBounds = new WeakMap<BudgetLedger, { usd: boolean; tokens: boolean }>();
 
@@ -71,16 +69,19 @@ export function createNativeRequest(
   /** Rounds of settlement the current reservation's store failed (F17: two at most). */
   let settleRounds = 0;
   const assert = () => assertExecutionPolicy(execution, { modelId, now: deps.clock.now() });
-  /** Report that the USD budget cannot count this model, once per ledger. */
+  /**
+   * Report that the USD budget cannot count this model, once per run (decision
+   * 4): a loop or a finalization through its warning sink, which puts it on the
+   * result and the stream; a single model call on its own; a swarm or `evolve`
+   * run once for all its tasks. A shared execution context does not silence a
+   * later run.
+   */
   const reportUnpriced = (): void => {
-    let models = reported.get(execution.ledger);
-    if (models?.has(modelId) || !boundsUsd(execution)) return;
-    if (!models) reported.set(execution.ledger, (models = new Set()));
-    models.add(modelId);
+    if (!boundsUsd(execution) || !firstRunReport(execution.ledger, modelId)) return;
     const warning = unpricedModelWarning(modelId, deps.priceProvider !== undefined);
-    // A loop's sink puts it on the result and mirrors it to the logger.
-    if (internal.warnings) internal.warnings.add(warning);
-    else deps.logger.warn(warning.message, { warning: warning.type, setting: warning.setting });
+    // The line is logged here, once, even when the sink carries a logger too.
+    if (internal.warnings && !internal.warnings.add(warning, { mirror: false })) return;
+    deps.logger.warn(warning.message, { warning: warning.type, setting: warning.setting });
   };
   /** The cap this request adds, reported once per run. */
   const warning: CallWarning | undefined = capped

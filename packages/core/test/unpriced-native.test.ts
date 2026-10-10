@@ -320,3 +320,52 @@ describe('the unpriced-model warning reaches a native stream once (decision 4)',
     expect(unpricedParts(parts)).toBe(1);
   });
 });
+
+describe('one unpriced-model warning per run and model (decision 4)', () => {
+  it('two runAgent runs under one shared context each report it', async () => {
+    const root = createExecutionContext({ budget: { usd: 1 } });
+    const perRun: number[] = [];
+    for (const scopeId of ['run-1', 'run-2']) {
+      const log = logger();
+      const run = await runAgent({
+        model: createMockModel({ responses: [{ text: 'done' }] }),
+        prompt: 'Summarise the ticket.',
+        execution: root.child({ scopeId }),
+        deps: { priceProvider: prices, logger: log },
+      });
+      expect(run.status).toBe('completed');
+      perRun.push(unpricedWarnings(log).length);
+    }
+    // Before: reported once per ledger, so the second run said nothing.
+    expect(perRun).toEqual([1, 1]);
+  });
+
+  it('two generateText loops on one context each carry it on result.warnings', async () => {
+    const execution = createExecutionContext({ budget: { usd: 1 } });
+    const perRun: number[] = [];
+    for (let i = 0; i < 2; i++) {
+      const result = await generateText({
+        model: createMockModel({ responses: [{ text: 'done' }] }),
+        prompt: 'hi',
+        tools: { noop: { parameters: schema, execute: () => 'ok' } },
+        execution,
+        deps: { priceProvider: prices },
+      });
+      perRun.push(result.warnings?.filter((w) => w.type === 'unpriced-model').length ?? 0);
+    }
+    expect(perRun).toEqual([1, 1]);
+  });
+
+  it('single model calls on one context each log it', async () => {
+    const execution = createExecutionContext({ budget: { usd: 1 } });
+    const log = logger();
+    for (let i = 0; i < 2; i++)
+      await generateText({
+        model: createMockModel({ responses: [{ text: 'done' }] }),
+        prompt: 'hi',
+        execution,
+        deps: { priceProvider: prices, logger: log },
+      });
+    expect(unpricedWarnings(log)).toHaveLength(2);
+  });
+});

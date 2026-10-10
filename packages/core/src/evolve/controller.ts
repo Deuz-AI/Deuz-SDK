@@ -18,6 +18,7 @@ import { childScopeId, createExecutionContext } from '../execution-policy';
 import { isFatalExecutionError } from '../internal/execution-error';
 import { mapWithConcurrency } from '../internal/p-limit';
 import { resolveDependencies } from '../internal/resolve-deps';
+import { markRunLedger } from '../internal/unpriced';
 import { cosineSimilarity } from '../internal/vector';
 import type { BudgetLedgerSnapshot, NativeExecutionContext } from '../types/execution';
 import { applySearchReplace, EvolvePatchError, extractFullRewrite } from './patch';
@@ -1025,6 +1026,8 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
             policy: options.policy,
             persist,
           });
+      // One evolve run owns this ledger: its mutations report an unpriced model once in all.
+      markRunLedger(execution.ledger);
 
       const seedId = evolveCandidateId(0, 0, 0);
       if (run.generation >= 0) {
