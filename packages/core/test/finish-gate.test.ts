@@ -276,6 +276,22 @@ describe('finish-reason gate: streaming loop', () => {
     });
     expect(parts.some((p) => p.type === 'false-finish')).toBe(false);
   });
+
+  it('does not let verifyStep re-drive a refusal', async () => {
+    const { model, calls } = anthropic([
+      turn([], 'refusal', STOP_DETAILS),
+      turn([], 'refusal', STOP_DETAILS),
+    ]);
+    const verifyStep = vi.fn(() => ({ ok: false, feedback: 'try again' }));
+    const parts = await collect(
+      streamChat({ model, prompt: 'x', maxSteps: 5, verifyStep }).fullStream,
+    );
+    expect(calls).toHaveLength(1);
+    expect(verifyStep).not.toHaveBeenCalled();
+    expect(parts.find((p) => p.type === 'finish')).toMatchObject({
+      finishReason: 'content_filter',
+    });
+  });
 });
 
 describe('finish-reason gate: native runs', () => {
