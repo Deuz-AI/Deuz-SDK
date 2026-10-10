@@ -272,7 +272,11 @@ interface OpenAIContext {
   sessionId: string | undefined;
   /** The response the server is generating, between `response.created` and `response.done`. */
   activeResponseId: string | undefined;
-  /** A `response.create` waiting for the active response to finish. */
+  /** A `response.create` went out and the server has not started its response yet. */
+  createPending: boolean;
+  /** The `event_id` of the last `response.create`, to match an `error` about it. */
+  createId: string | undefined;
+  /** A `response.create` waiting for the response in flight to finish. */
   responseRequested: boolean;
   /** The assistant audio the user may still be hearing — what `interrupt({ playedMs })` truncates. */
   lastAudio: { itemId: string; contentIndex: number } | undefined;
@@ -283,6 +287,28 @@ interface OpenAIContext {
 }
 
 type ServerEventHandler = (ctx: OpenAIContext, event: Record<string, unknown>) => void;
+
+/**
+ * `response.create` now, or once the response in flight is done: one response
+ * can write to the conversation at a time, and one that was asked for but has
+ * not started yet counts. A create that goes out also answers a held request.
+ */
+function requestResponse(ctx: OpenAIContext): ProviderMessage[] {
+  if (ctx.activeResponseId || ctx.createPending) {
+    ctx.responseRequested = true;
+    return [];
+  }
+  ctx.responseRequested = false;
+  ctx.createPending = true;
+  ctx.createId = ctx.sink.generateId();
+  return [{ type: 'response.create', event_id: ctx.createId }];
+}
+
+/** Send a held `response.create`, unless a response is still in flight. */
+function sendRequestedResponse(ctx: OpenAIContext): void {
+  if (!ctx.responseRequested) return;
+  for (const message of requestResponse(ctx)) ctx.sink.send(message);
+}
 
 function reportInterruption(ctx: OpenAIContext, responseId: string): void {
   if (ctx.interrupted.has(responseId)) return;
@@ -305,10 +331,18 @@ const SERVER_EVENTS: Readonly<Record<string, ServerEventHandler>> = {
   error: (ctx, event) => {
     const error = obj(event.error);
     const upstreamType = str(error.code) ?? str(error.type);
+    // The server refused our `response.create`, so it is no longer in flight.
+    const refusedCreate = ctx.createId !== undefined && str(error.event_id) === ctx.createId;
+    // Another response holds the conversation (server VAD won the race): ask
+    // again once that one is done. NOT LIVE-VERIFIED: the code is the server's.
+    const raced = refusedCreate && str(error.code) === 'conversation_already_has_active_response';
+    if (refusedCreate) ctx.createPending = false;
+    if (raced) ctx.responseRequested = true;
     ctx.sink.providerError({
       message: str(error.message) ?? 'OpenAI Realtime reported an error.',
       ...(upstreamType ? { upstreamType } : {}),
     });
+    if (refusedCreate && !raced) sendRequestedResponse(ctx);
   },
   'input_audio_buffer.committed': (ctx, event) => {
     ctx.sink.emit({ type: 'input-audio-committed', ...itemOnly(event) });
@@ -362,6 +396,7 @@ const SERVER_EVENTS: Readonly<Record<string, ServerEventHandler>> = {
   },
   'response.created': (ctx, event) => {
     const responseId = str(obj(event.response).id) ?? ctx.sink.generateId();
+    ctx.createPending = false;
     ctx.activeResponseId = responseId;
     ctx.sink.emit({ type: 'response-started', responseId });
   },
@@ -405,6 +440,7 @@ const SERVER_EVENTS: Readonly<Record<string, ServerEventHandler>> = {
     const failure = obj(details.error);
     const reason = str(details.reason) ?? str(failure.code) ?? str(failure.type);
     if (!responseId || ctx.activeResponseId === responseId) ctx.activeResponseId = undefined;
+    ctx.createPending = false; // a done always follows its created
 
     if (responseId) {
       if (status === 'cancelled' && reason === 'turn_detected') reportInterruption(ctx, responseId);
@@ -437,10 +473,7 @@ const SERVER_EVENTS: Readonly<Record<string, ServerEventHandler>> = {
       status,
       ...(reason ? { reason } : {}),
     });
-    if (ctx.responseRequested && !ctx.activeResponseId) {
-      ctx.responseRequested = false;
-      ctx.sink.send({ type: 'response.create' });
-    }
+    sendRequestedResponse(ctx);
   },
 };
 
@@ -461,20 +494,13 @@ function createCodec(init: CodecInit): RealtimeCodec {
     ready: false,
     sessionId: undefined,
     activeResponseId: undefined,
+    createPending: false,
+    createId: undefined,
     responseRequested: false,
     lastAudio: undefined,
     interruptsOnSpeech: true,
     interrupted: new Set(),
   };
-
-  /** `response.create` now, or once the running response is done (one at a time). */
-  function requestResponse(): ProviderMessage[] {
-    if (ctx.activeResponseId) {
-      ctx.responseRequested = true;
-      return [];
-    }
-    return [{ type: 'response.create' }];
-  }
 
   return {
     setup() {
@@ -498,10 +524,10 @@ function createCodec(init: CodecInit): RealtimeCodec {
         type: 'conversation.item.create',
         item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
       };
-      return [item, ...(respond ? requestResponse() : [])];
+      return [item, ...(respond ? requestResponse(ctx) : [])];
     },
 
-    createResponse: requestResponse,
+    createResponse: () => requestResponse(ctx),
 
     interrupt(playedMs) {
       const messages: ProviderMessage[] = [];
@@ -527,7 +553,7 @@ function createCodec(init: CodecInit): RealtimeCodec {
           output: outputText(outcome.result),
         },
       }));
-      return [...outputs, ...requestResponse()];
+      return [...outputs, ...requestResponse(ctx)];
     },
 
     closed() {},

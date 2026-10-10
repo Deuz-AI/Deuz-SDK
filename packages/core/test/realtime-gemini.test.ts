@@ -381,6 +381,69 @@ describe('Gemini Live — tool calls', () => {
     ]);
     expect(ofType(events, 'tool-result')).toEqual([]);
   });
+
+  it('answers a result JSON cannot encode with an error and keeps its siblings', async () => {
+    const { session, socket, events, sent } = await openSession({
+      tools: {
+        get_row: tool({ parameters: { type: 'object' }, execute: async () => ({ id: 10n }) }),
+        get_weather: tool({ parameters: CITY, execute: async () => 'sunny' }),
+      },
+    });
+    socket.push({
+      toolCall: {
+        functionCalls: [
+          { id: 'a', name: 'get_row', args: {} },
+          { id: 'b', name: 'get_weather', args: { city: 'Rome' } },
+        ],
+      },
+    });
+    await flush();
+    expect(sent()).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [
+            {
+              id: 'a',
+              name: 'get_row',
+              response: { error: "The result of tool 'get_row' could not be JSON-encoded." },
+            },
+            { id: 'b', name: 'get_weather', response: { output: 'sunny' } },
+          ],
+        },
+      },
+    ]);
+    // The app hears it too: its tool broke the JSON contract.
+    const [error] = ofType(events, 'error');
+    expect(error).toMatchObject({ fatal: false, error: { kind: 'tool' } });
+    expect(error!.error.message).toContain("'get_row'");
+    expect(session.status).toBe('open');
+  });
+
+  it('answers a circular client-tool result with an error instead of dropping it', async () => {
+    const { session, socket, events, sent } = await openSession({
+      tools: { lookup: tool({ parameters: { type: 'object' } }) }, // a client tool
+    });
+    socket.push({ toolCall: { functionCalls: [{ id: 'c', name: 'lookup', args: {} }] } });
+    await flush();
+    const circular: Record<string, unknown> = { name: 'row' };
+    circular.self = circular;
+    session.sendToolResult('c', circular);
+    await flush();
+    expect(sent()).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [
+            {
+              id: 'c',
+              name: 'lookup',
+              response: { error: "The result of tool 'lookup' could not be JSON-encoded." },
+            },
+          ],
+        },
+      },
+    ]);
+    expect(ofType(events, 'error')).toHaveLength(1);
+  });
 });
 
 describe('Gemini Live — interruption, lifecycle and errors', () => {
@@ -504,6 +567,12 @@ describe('Gemini Live — usage and pricing', () => {
     await flush();
     expect(ofType(events, 'usage')).toHaveLength(1);
     expect(ofType(events, 'usage')[0]!.costUsd).toBe(0.00905);
+    // As the docs' event table says: after its response-done, with the same responseId.
+    const types = events.map((event) => event.type);
+    expect(types.indexOf('usage')).toBeGreaterThan(types.indexOf('response-done'));
+    expect(ofType(events, 'usage')[0]!.responseId).toBe(
+      ofType(events, 'response-done')[0]!.responseId,
+    );
   });
 
   it('attributes cached and unspecified-modality tokens without losing any', async () => {
@@ -631,6 +700,109 @@ describe('Gemini Live — configuration and edge cases', () => {
     socket.push({ serverContent: { interrupted: true } });
     await flush();
     expect(events.slice(1)).toEqual([{ type: 'interrupted' }]);
+  });
+});
+
+describe('Gemini Live — output transcript chunks after turnComplete', () => {
+  // The output transcription is not ordered with the model turn (LiveServerContent
+  // docs in @google/genai): a chunk can follow the turnComplete of its turn.
+  const transcript = (text: string, finished?: boolean) => ({
+    serverContent: { outputTranscription: { text, ...(finished ? { finished } : {}) } },
+  });
+  const turnComplete = { serverContent: { turnComplete: true } };
+  const deterministic = () => {
+    let ids = 0;
+    return { generateId: () => `turn_${++ids}` };
+  };
+  const shape = (events: RealtimeEvent[]) =>
+    events.slice(1).map((event) => {
+      const { type, responseId, delta, transcript } = event as Record<string, unknown>;
+      return [type, responseId, delta ?? transcript].filter((part) => part !== undefined);
+    });
+
+  it('belongs to the turn that just ended and opens no new turn', async () => {
+    const { socket, events } = await openSession({ deps: deterministic() });
+    socket.push(audioPart('AAA='));
+    socket.push(transcript('Hello'));
+    socket.push(turnComplete);
+    socket.push(transcript(' there.'));
+    socket.push(audioPart('AAA='));
+    socket.push(transcript('Bye.'));
+    socket.push(turnComplete);
+    await flush();
+    expect(shape(events)).toEqual([
+      ['response-started', 'turn_1'],
+      ['audio-delta', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', 'Hello'],
+      ['audio-done', 'turn_1'],
+      ['output-transcript-done', 'turn_1', 'Hello'],
+      ['response-done', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', ' there.'],
+      // The whole transcript once the next turn starts.
+      ['output-transcript-done', 'turn_1', 'Hello there.'],
+      ['response-started', 'turn_2'],
+      ['audio-delta', 'turn_2'],
+      ['output-transcript-delta', 'turn_2', 'Bye.'],
+      ['audio-done', 'turn_2'],
+      ['output-transcript-done', 'turn_2', 'Bye.'],
+      ['response-done', 'turn_2'],
+    ]);
+  });
+
+  it('does not lose the usage report of the ended turn that follows a late chunk', async () => {
+    const { session, socket, events } = await openSession({ deps: deterministic() });
+    const usage = (total: number) => ({
+      promptTokenCount: total - 10,
+      responseTokenCount: 10,
+      totalTokenCount: total,
+    });
+    socket.push(audioPart('AAA='));
+    socket.push(turnComplete);
+    socket.push(transcript('tail'));
+    socket.push({ usageMetadata: usage(150) }); // the first turn's report, after turnComplete
+    socket.push(audioPart('AAA='));
+    socket.push({ ...turnComplete, usageMetadata: usage(260) });
+    await flush();
+    expect(session.usage.usage.totalTokens).toBe(410);
+    expect(
+      ofType(events, 'usage').map((event) => [event.responseId, event.usage.totalTokens]),
+    ).toEqual([
+      ['turn_1', 150],
+      ['turn_2', 260],
+    ]);
+    expect(ofType(events, 'response-started')).toHaveLength(2);
+  });
+
+  it('closes the late transcript on finished; a chunk after that starts a new turn', async () => {
+    const { socket, events } = await openSession({ deps: deterministic() });
+    socket.push(audioPart('AAA='));
+    socket.push(transcript('Hi'));
+    socket.push(turnComplete);
+    socket.push(transcript(' there', true));
+    socket.push(transcript('Next'));
+    await flush();
+    expect(shape(events).slice(-5)).toEqual([
+      ['response-done', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', ' there'],
+      ['output-transcript-done', 'turn_1', 'Hi there'],
+      ['response-started', 'turn_2'],
+      ['output-transcript-delta', 'turn_2', 'Next'],
+    ]);
+  });
+
+  it('ends a transcript that arrived wholly after turnComplete, at the latest on close', async () => {
+    const { session, socket, events } = await openSession({ deps: deterministic() });
+    socket.push(audioPart('AAA='));
+    socket.push(turnComplete);
+    socket.push(transcript('Sure.'));
+    await flush();
+    await session.close();
+    expect(shape(events).slice(-4)).toEqual([
+      ['response-done', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', 'Sure.'],
+      ['output-transcript-done', 'turn_1', 'Sure.'],
+      ['session-closed'],
+    ]);
   });
 });
 

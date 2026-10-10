@@ -5,11 +5,15 @@ import {
   createGeminiLive,
   RealtimeError,
   type RealtimeEvent,
+  type RealtimeWebSocketFactory,
 } from '../src/realtime';
 import { tool } from '../src/tool';
+import { InvalidRequestError } from '../src/errors';
+import type { JSONSchema } from '../src/types/schema';
 import {
   fakeRealtimeServer,
   openaiHandshake,
+  geminiHandshake,
   flush,
   FakeRealtimeSocket,
 } from './fixtures/realtime-socket';
@@ -171,6 +175,49 @@ describe('session plumbing', () => {
     expect(server.socket.messages.at(-1)).toEqual({ type: 'input_audio_buffer.clear' });
   });
 
+  it('reports tool results the socket refused instead of dropping them silently', async () => {
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    let finish: (value: string) => void = () => {};
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      tools: {
+        get_weather: tool({
+          parameters: { type: 'object' },
+          execute: () => new Promise<string>((resolve) => (finish = resolve)),
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    const events: RealtimeEvent[] = [];
+    session.on('*', (event) => events.push(event));
+    await session.connect();
+    server.socket.push({
+      type: 'response.done',
+      event_id: 'e',
+      response: {
+        id: 'resp_1',
+        status: 'completed',
+        output: [
+          { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{}' },
+        ],
+      },
+    });
+    await flush();
+    server.socket.readyState = 2; // going down; its close event has not arrived yet
+    finish('sunny');
+    await flush();
+    expect(events.filter((event) => event.type === 'error')).toEqual([
+      {
+        type: 'error',
+        fatal: false,
+        error: expect.objectContaining({
+          kind: 'tool',
+          message: expect.stringContaining('Could not send the tool results'),
+        }),
+      },
+    ]);
+  });
+
   it('ignores frames it cannot parse, reporting them as non-fatal', async () => {
     const { session, server } = await open();
     const events: RealtimeEvent[] = [];
@@ -290,6 +337,28 @@ describe('session lifecycle edges', () => {
     ]);
   });
 
+  it('rejects a tool schema it cannot declare with a connect-failed RealtimeError', async () => {
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      tools: {
+        // A Standard Schema no JSON Schema converter knows.
+        lookup: tool({
+          parameters: {
+            '~standard': { version: 1, vendor: 'acme', validate: (value: unknown) => ({ value }) },
+          },
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    const failure = await session.connect().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RealtimeError);
+    expect(failure).toMatchObject({ kind: 'connect-failed' });
+    expect((failure as Error).cause).toBeInstanceOf(InvalidRequestError);
+    expect(server.sockets).toHaveLength(0);
+    expect(session.status).toBe('closed');
+  });
+
   it('scrubs the credential out of a socket factory error, plain or URL-encoded', async () => {
     const session = createRealtimeSession({
       model: createGeminiLive({ apiKey: 'g key/1', apiKeyLocation: 'query' })(
@@ -321,5 +390,239 @@ describe('session lifecycle edges', () => {
         model: { provider: 'acme', modelId: 'x', surface: 'acme-live' as never },
       }),
     ).toThrow(RealtimeError);
+  });
+});
+
+describe('tool calls handled from inside a tool-call listener', () => {
+  const CITY: JSONSchema = {
+    type: 'object',
+    properties: { city: { type: 'string' } },
+    required: ['city'],
+  };
+
+  /** A logger that records what the session swallowed (the default one is silent). */
+  function recordingLogger(sink: string[]) {
+    return {
+      debug() {},
+      info() {},
+      warn() {},
+      error: (message: string, fields?: Record<string, unknown>) =>
+        sink.push(`${message} ${String(fields?.error ?? '')}`),
+    };
+  }
+
+  it('OpenAI: a client tool answered synchronously from on("tool-call") reaches the wire', async () => {
+    const swallowed: string[] = [];
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      tools: { get_weather: tool({ parameters: CITY }) }, // a client tool: no execute
+      deps: { webSocket: server.webSocket, logger: recordingLogger(swallowed) },
+    });
+    session.on('tool-call', (event) => session.sendToolResult(event.toolCallId, { tempC: 19 }));
+    await session.connect();
+    const baseline = server.socket.sent.length;
+
+    server.socket.push({
+      type: 'response.done',
+      event_id: 'e',
+      response: {
+        id: 'resp_1',
+        status: 'completed',
+        output: [
+          {
+            type: 'function_call',
+            call_id: 'call_1',
+            name: 'get_weather',
+            arguments: '{"city":"Paris"}',
+          },
+        ],
+      },
+    });
+    await flush();
+
+    expect(server.socket.messages.slice(baseline)).toEqual([
+      {
+        type: 'conversation.item.create',
+        item: { type: 'function_call_output', call_id: 'call_1', output: '{"tempC":19}' },
+      },
+      { type: 'response.create', event_id: expect.any(String) },
+    ]);
+    expect(swallowed).toEqual([]);
+    // Answered once: a second answer is refused as before.
+    expect(() => session.sendToolResult('call_1', 'again')).toThrow(
+      expect.objectContaining({ kind: 'tool' }),
+    );
+  });
+
+  it('Gemini: a synchronous answer joins the batch with its executed sibling', async () => {
+    const swallowed: string[] = [];
+    const server = fakeRealtimeServer((socket) => geminiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createGeminiLive({ apiKey: 'g-key' })('gemini-live-2.5-flash-preview'),
+      tools: {
+        get_location: tool({ parameters: { type: 'object' } }), // a client tool
+        get_weather: tool({ parameters: CITY, execute: async () => 'sunny' }),
+      },
+      deps: { webSocket: server.webSocket, logger: recordingLogger(swallowed) },
+    });
+    const events: RealtimeEvent[] = [];
+    session.on('*', (event) => events.push(event));
+    session.on('tool-call', (event) => {
+      if (event.toolName === 'get_location') session.sendToolResult(event.toolCallId, 'Rome');
+    });
+    await session.connect();
+    const baseline = server.socket.sent.length;
+
+    server.socket.push({
+      toolCall: {
+        functionCalls: [
+          { id: 'fc_1', name: 'get_location', args: {} },
+          { id: 'fc_2', name: 'get_weather', args: { city: 'Rome' } },
+        ],
+      },
+    });
+    await flush();
+
+    expect(server.socket.messages.slice(baseline)).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [
+            { id: 'fc_1', name: 'get_location', response: { output: 'Rome' } },
+            { id: 'fc_2', name: 'get_weather', response: { output: 'sunny' } },
+          ],
+        },
+      },
+    ]);
+    expect(swallowed).toEqual([]);
+    // Each result follows its own call.
+    const order = events
+      .filter((event) => event.type === 'tool-call' || event.type === 'tool-result')
+      .map((event) => `${event.type}:${(event as { toolCallId: string }).toolCallId}`);
+    expect(order.indexOf('tool-result:fc_1')).toBeGreaterThan(order.indexOf('tool-call:fc_1'));
+    expect(order.indexOf('tool-result:fc_2')).toBeGreaterThan(order.indexOf('tool-call:fc_2'));
+  });
+
+  /** An OpenAI server that acknowledges the closing handshake after a round trip, like a real one. */
+  function slowCloseServer(): {
+    webSocket: RealtimeWebSocketFactory;
+    socket: () => FakeRealtimeSocket;
+  } {
+    class SlowCloseSocket extends FakeRealtimeSocket {
+      override close(code?: number, reason?: string): void {
+        this.closeCalls.push({ code, reason });
+        if (this.readyState >= 2) return;
+        this.readyState = 2;
+        setTimeout(() => this.drop(code ?? 1005, reason ?? ''), 5);
+      }
+    }
+    let latest: FakeRealtimeSocket | undefined;
+    return {
+      webSocket: (url, init) => {
+        latest = new SlowCloseSocket(url, init);
+        openaiHandshake(latest);
+        return latest;
+      },
+      socket: () => latest!,
+    };
+  }
+
+  const transferCall = (calls: { call_id: string; name: string }[]) => ({
+    type: 'response.done',
+    event_id: 'e',
+    response: {
+      id: 'resp_1',
+      status: 'completed',
+      output: calls.map((call) => ({ type: 'function_call', ...call, arguments: '{}' })),
+    },
+  });
+
+  async function closeHandshake(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await flush();
+  }
+
+  it('close() inside on("tool-call") keeps the announced call from executing', async () => {
+    const server = slowCloseServer();
+    const ran: string[] = [];
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      tools: {
+        transfer: tool({
+          parameters: { type: 'object' },
+          execute: async () => {
+            ran.push(session.status);
+            return 'transferred $100';
+          },
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    session.on('tool-call', () => void session.close()); // e.g. a max-tool-calls guard
+    await session.connect();
+    server.socket().push(transferCall([{ call_id: 'c1', name: 'transfer' }]));
+    await closeHandshake();
+    expect(session.status).toBe('closed');
+    expect(ran).toEqual([]);
+  });
+
+  it('aborting the signal inside on("tool-call") keeps the announced call from executing', async () => {
+    const server = slowCloseServer();
+    const controller = new AbortController();
+    const ran: string[] = [];
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      signal: controller.signal,
+      tools: {
+        transfer: tool({
+          parameters: { type: 'object' },
+          execute: async () => {
+            ran.push(session.status);
+            return 'transferred $100';
+          },
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    session.on('tool-call', () => controller.abort());
+    await session.connect();
+    server.socket().push(transferCall([{ call_id: 'c1', name: 'transfer' }]));
+    await closeHandshake();
+    expect(session.status).toBe('closed');
+    expect(ran).toEqual([]);
+  });
+
+  it('a close from a tool-result listener stops the rest of the batch', async () => {
+    const server = slowCloseServer();
+    const ran: string[] = [];
+    const approveToolCall = vi.fn(() => true);
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      approveToolCall,
+      tools: {
+        transfer: tool({
+          parameters: { type: 'object' },
+          needsApproval: true,
+          execute: async () => {
+            ran.push(session.status);
+            return 'transferred $100';
+          },
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    // The unknown tool is answered at once; its result closes the session.
+    session.on('tool-result', () => void session.close());
+    await session.connect();
+    server.socket().push(
+      transferCall([
+        { call_id: 'c1', name: 'nope' },
+        { call_id: 'c2', name: 'transfer' },
+      ]),
+    );
+    await closeHandshake();
+    expect(session.status).toBe('closed');
+    expect(approveToolCall).not.toHaveBeenCalled();
+    expect(ran).toEqual([]);
   });
 });

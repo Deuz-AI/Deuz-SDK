@@ -154,7 +154,16 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
     }
   }
 
+  /** A call the app answers with `sendToolResult`: a known function tool without `execute`. */
+  function isClientCall(call: DecodedToolCall): boolean {
+    const tool = options.tools?.[call.toolName];
+    return !!tool && tool.type !== 'provider' && !tool.execute && call.argsError === undefined;
+  }
+
   async function run(batch: Batch, call: DecodedToolCall): Promise<void> {
+    // A listener of this batch's tool-call or tool-result events may have closed
+    // the session (or aborted its signal): nothing starts after that.
+    if (closed) return;
     const tool = options.tools?.[call.toolName];
     if (!tool || tool.type === 'provider') {
       settle(batch, call, unknownToolMessage(options.tools, call.toolName), true);
@@ -164,13 +173,13 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
       settle(batch, call, `Invalid arguments: ${call.argsError}`, true);
       return;
     }
-    if (!tool.execute) {
-      clientCalls.set(call.toolCallId, { batch, call });
-      return;
-    }
     const execute = tool.execute;
+    // A client call is registered by `dispatch` and answered by `sendToolResult`.
+    if (!execute) return;
     const controller = new AbortController();
     running.set(call.toolCallId, controller);
+    /** The session closed, or the provider cancelled the call, during an await. */
+    const stopped = () => closed || controller.signal.aborted;
     const ctx: ToolExecuteContext = {
       toolCallId: call.toolCallId,
       messages: [],
@@ -180,6 +189,7 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
     };
     try {
       const validation = await validateOutput(tool.parameters, call.args);
+      if (stopped()) return;
       if (!validation.ok) {
         settle(batch, call, `Invalid arguments: ${validation.issues}`, true);
         return;
@@ -199,6 +209,8 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
           );
           return;
         }
+        // Nobody is asked to approve a call that can no longer run.
+        if (stopped()) return;
         const approved = await options.approveToolCall({
           toolCallId: call.toolCallId,
           toolName: call.toolName,
@@ -209,7 +221,7 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
           return;
         }
       }
-      if (controller.signal.aborted) return;
+      if (stopped()) return;
       await invoke(batch, call, () => execute(args, ctx), tool.timeoutMs, controller);
     } catch (cause) {
       // A throw is fed back to the model (self-heal), never out of the session.
@@ -229,6 +241,10 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
       if (closed || calls.length === 0) return;
       const batch: Batch = { calls, outcomes: new Map(), cancelled: new Set(), flushed: false };
       open.add(batch);
+      // A client call waits for its answer from the moment it is announced, so a
+      // listener may answer it synchronously, inside `on('tool-call')`.
+      const clientSide = new Set(calls.filter(isClientCall));
+      for (const call of clientSide) clientCalls.set(call.toolCallId, { batch, call });
       for (const call of calls) {
         options.emit({
           type: 'tool-call',
@@ -238,7 +254,7 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
           ...(responseId ? { responseId } : {}),
         });
       }
-      for (const call of calls) void run(batch, call);
+      for (const call of calls) if (!clientSide.has(call)) void run(batch, call);
     },
 
     resolveClientCall(toolCallId, result, isError) {

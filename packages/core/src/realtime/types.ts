@@ -371,7 +371,8 @@ export interface RealtimeSession {
    * shares the same attempt; once open it resolves at once; once closed it
    * rejects (`kind: 'closed'`). A failure after the socket was created is
    * also reported as a fatal `error` event, followed by `session-closed`; a
-   * failure before that (no credential, no WebSocket) only rejects.
+   * failure before that (no credential, no WebSocket, a bad `baseURL` or tool
+   * schema) only rejects.
    */
   connect(): Promise<void>;
   /**

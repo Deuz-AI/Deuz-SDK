@@ -237,17 +237,19 @@ Subscribe with `session.on(type, listener)` (or `'*'` for everything; it returns
 | `input-transcript-delta` / `-done` | `itemId?`, `delta` / `transcript` | What the user said (with `inputTranscription`). |
 | `response-started` | `responseId` | A model turn began. Gemini's ids are generated locally. |
 | `audio-delta` / `audio-done` | `responseId?`, `itemId?`, `audio: Uint8Array` | Output audio in `session.audioFormat.output`. |
-| `output-transcript-delta` / `-done` | `responseId?`, `itemId?`, `delta` / `transcript` | What the model is saying. |
+| `output-transcript-delta` / `-done` | `responseId?`, `itemId?`, `delta` / `transcript` | What the model is saying. On Gemini, chunks can follow `response-done` (see below). |
 | `text-delta` / `text-done` | `responseId?`, `itemId?`, `delta` / `text` | Text output (`outputModality: 'text'`). |
 | `tool-call` / `tool-result` | `toolCallId`, `toolName`, `args` / `result`, `isError?` | See [tools](#tools). |
 | `tool-call-cancelled` | `toolCallIds`, `reason` | `'provider'` cancelled them, or `'response-not-completed'`. |
 | `interrupted` | `responseId?` | Barge-in: the provider cut the model's turn short — drop queued audio. |
 | `response-done` | `responseId?`, `status`, `reason?` | `completed`, `cancelled`, `incomplete` or `failed`. |
-| `usage` | `responseId?`, `usage`, `tokens`, `costUsd?` | Before the `response-done` it belongs to. See [usage](#usage-and-pricing). |
+| `usage` | `responseId?`, `usage`, `tokens`, `costUsd?` | Before the `response-done` it belongs to, except a Gemini report that arrives after `turnComplete`: that one follows the `response-done` and carries the same `responseId`. See [usage](#usage-and-pricing). |
 | `go-away` / `session-resumption` | `timeLeftMs?` / `handle?`, `resumable` | Gemini only. |
 | `warning` | `warning: CallWarning` | A setting the wire cannot carry, an unpriced model. |
 | `error` | `error: RealtimeError`, `fatal` | `fatal: true` means the session is closing. |
 | `raw` | `message` | Every parsed server frame, with `rawEvents: true`. |
+
+**Late Gemini transcripts.** Gemini does not order its output transcription with the model's audio, so a transcript chunk can arrive after its turn's `response-done`. The chunk keeps that turn's `responseId` and starts no new response. When Gemini marks the transcript finished, the next response starts or the session closes, an `output-transcript-done` carries the whole text. If the turn had already ended with part of the transcript, this is a second `output-transcript-done` for that `responseId`.
 
 ## Audio
 
@@ -265,15 +267,19 @@ Subscribe with `session.on(type, listener)` (or `'*'` for everything; it returns
 
 `sendText(text)` adds a user text turn and asks for an answer; `sendText(text, { respond: false })` only adds context.
 
+**One answer at a time (OpenAI).** OpenAI lets one response write to the conversation at a time. A `response.create` (from `sendText`, `createResponse()` or [tool results](#tools)) therefore waits while a response is running, or while an earlier `response.create` has not started its response yet, and goes out when that response is done; requests that pile up meanwhile become one `response.create`. If the server refuses a create because a response it started itself (server VAD) got there first, the session asks again once that response is done. The refusal is matched by the create's `event_id` and the server's `conversation_already_has_active_response` code, which is not live-verified.
+
 ## Tools
 
 Tools are ordinary Deuz [tools](/docs/agents/tools) — the same `tool()` shape, schemas, `needsApproval` and `timeoutMs` as everywhere in core:
 
 - A tool **with `execute`** runs in this process; its result goes back to the model, which then continues. `execute` gets the usual context — `toolCallId`, an abort `signal`, `deps` and the session's `runtimeContext` — but `messages` is empty: the conversation lives on the provider's side.
-- A tool **without `execute`** is a [client tool](/docs/agents/client-tools): the session emits `tool-call` and waits for `session.sendToolResult(toolCallId, result)` (pass `{ isError: true }` for a failure). Answering a call that is not waiting — already answered, or cancelled — throws a `RealtimeError` with `kind: 'tool'`.
+- A tool **without `execute`** is a [client tool](/docs/agents/client-tools): the session emits `tool-call` and waits for `session.sendToolResult(toolCallId, result)` (pass `{ isError: true }` for a failure). The call is waiting by the time its `tool-call` event arrives, so you can answer it from inside that listener or later. Answering a call that is not waiting — already answered, or cancelled — throws a `RealtimeError` with `kind: 'tool'`.
 - `needsApproval` asks `approveToolCall(call)` (a session option). Without an approver, the call is denied and the model hears `Tool call denied.`
 - Unknown tools, unparsable or invalid arguments, a thrown error and a timeout all become an error result the model hears, so the conversation goes on — the same self-healing as the [tool loop](/docs/agents/tool-loop). Timeouts run on `deps.clock`.
-- The calls of one model turn are answered together once all of them settle (Gemini expects one `toolResponse`; OpenAI gets one `response.create`). If the model is already answering something else, the `response.create` waits until that answer is done.
+- A result must be JSON-serializable, as everywhere in core. On Gemini, one that is not (a `BigInt`, a cycle) is answered as an error for that call alone, and the session emits a non-fatal `error` with `kind: 'tool'`. Tool results the session could not send at all are reported the same way, never dropped silently.
+- `close()` (or aborting the session's `signal`) aborts every running tool's `signal`, and a call that has not started yet never starts, even when you close from inside its `tool-call` listener.
+- The calls of one model turn are answered together once all of them settle (Gemini expects one `toolResponse`; OpenAI gets one `response.create`). If the model is already answering something else, the `response.create` waits until that answer is done ([one answer at a time](#audio)).
 - Provider-executed tools (`type: 'provider'`) are left out with an `unsupported-tool` warning.
 
 Two safety rules decide which calls run:
@@ -312,7 +318,7 @@ const priceProvider = createPriceProvider({
 Two provider details:
 
 - **OpenAI input transcription is billed separately**, by the transcription model, and is not part of the session's usage.
-- **Gemini usage reports are taken as cumulative within a turn**: the last report of a turn is committed when the turn ends; a report that arrives after the turn adds only what grew since the last committed one; a report still pending when the session closes is billed.
+- **Gemini usage reports are taken as cumulative within a turn**: the last report of a turn is committed when the turn ends; a report that arrives after the turn adds only what grew since the last committed one (its `usage` event follows that turn's `response-done`, with the same `responseId`); a report still pending when the session closes is billed. If you settle accounting per response, do it on `usage`, not on `response-done`.
 
 There is no budget enforcement inside a session: watch the `usage` events and `close()` when your limit is reached.
 
@@ -376,17 +382,17 @@ Failures are `RealtimeError`s with a `kind`:
 
 | `kind` | When |
 | --- | --- |
-| `connect-failed` | The socket could not be created (e.g. a browser asked to send a header), or the setup could not be sent. |
+| `connect-failed` | The socket could not be created (e.g. a browser asked to send a header), the connection could not be prepared (a `baseURL` that does not parse, a tool schema that cannot be converted), or the setup could not be sent. |
 | `connect-timeout` | The provider did not accept the session within `connectTimeoutMs`. |
 | `no-websocket` | The runtime has no `WebSocket` and no `deps.webSocket` was given. |
 | `provider` | The provider reported an error. Before `session-ready` it rejects `connect()`; after, it is non-fatal (the session stays open). |
 | `transport` | The socket reported a network failure (fatal). |
 | `closed` | The connection closed abnormally (`closeCode` says how), or the session is already closed. |
-| `not-connected` | A send on a session that is not open. |
+| `not-connected` | A send on a session that is not open. Non-fatal when the socket refuses a message the session sent by itself (a deferred `response.create`). |
 | `invalid-message` | A server frame that is not a JSON object (non-fatal, ignored). |
-| `tool` | `sendToolResult` for a call that is not waiting. |
+| `tool` | `sendToolResult` for a call that is not waiting. Non-fatal when a tool result could not be JSON-encoded or the tool results could not be sent. |
 
-A failure before a socket exists (no credential — `AuthenticationError`; a pre-aborted `signal` — `AbortError`; no `WebSocket`) only rejects `connect()`. Once a socket exists, a failure is also a fatal `error` event, followed by `session-closed`. Error messages never contain the API key or token — plain or URL-encoded.
+A failure before a socket exists (no credential — `AuthenticationError`; a pre-aborted `signal` — `AbortError`; no `WebSocket`; a bad `baseURL` or tool schema — `connect-failed`) only rejects `connect()`. Once a socket exists, a failure is also a fatal `error` event, followed by `session-closed`. Error messages never contain the API key or token — plain or URL-encoded.
 
 ## API at a glance
 
