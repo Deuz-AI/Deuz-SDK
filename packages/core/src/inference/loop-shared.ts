@@ -2358,11 +2358,14 @@ export async function executeTools(
         }
         // Arguments that never parsed reach here as their raw JSON text (2.3,
         // F16): a call cut off mid-stream, a malformed one, or one read back from
-        // an older checkpoint. A raw JSON Schema performs no validation, so the
-        // string would otherwise reach `execute` verbatim. It self-heals instead.
-        if (typeof call.args === 'string') {
-          const message =
-            'Invalid arguments: the tool input is not a JSON object (it may have been cut off). The call was not executed.';
+        // an older checkpoint. Arguments that parsed to null, an array or a number
+        // fit no provider's tool schema either. A raw JSON Schema performs no
+        // validation, so the value would otherwise reach `execute` verbatim. It
+        // self-heals instead.
+        if (call.args === null || typeof call.args !== 'object' || Array.isArray(call.args)) {
+          const message = `Invalid arguments: the tool input is not a JSON object${
+            typeof call.args === 'string' ? ' (it may have been cut off)' : ''
+          }. The call was not executed.`;
           emitToolFailed(new Error(message), true);
           return settle({
             toolCallId: call.toolCallId,

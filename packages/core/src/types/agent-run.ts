@@ -164,6 +164,13 @@ export interface AgentRunEnvelope {
      * Absent before 2.3 and for runs without MCP; resume then records the catalog.
      */
     mcp?: string;
+    /**
+     * The run's handoff targets (2.3), as JSON: each target's name, model,
+     * instructions and own tools, which run in this native run once a transfer
+     * is accepted. Resume rejects a change like a changed root tool. Absent
+     * before 2.3 and for runs without targets; resume then records them.
+     */
+    handoffs?: string;
   };
   limits?: { maxSteps: number; maxOutputAttempts: number; maxVerifyAttempts: number };
   loopOutcome?: {
@@ -197,6 +204,13 @@ export interface AgentToolReceipt {
     | 'failed'
     | 'validation-failed'
     | 'projection-failed';
+  /**
+   * Whether the tool running this call declared `replay: 'idempotent'` (2.3). A
+   * resume judges an interrupted call by it, so a handoff target's tool is never
+   * mistaken for a root tool of the same name. A receipt written before 2.3 has
+   * none; its tool is then looked up by name.
+   */
+  idempotent?: boolean;
   rawResult?: unknown;
   modelOutput?: unknown;
   error?: string;

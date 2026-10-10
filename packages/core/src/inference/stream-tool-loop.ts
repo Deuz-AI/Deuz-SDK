@@ -1104,10 +1104,14 @@ export function runStreamToolLoop(
           try {
             const accounting = options.execution?.ledger.totals(options.execution.scopeId);
             const priced = await usageCost?.flush();
-            // A model with no price adds nothing (2.3): the cost is the priced
-            // sum. Only a failed lookup or an unknown settlement hides it.
+            // A model the provider has no price for adds nothing (2.3): the cost
+            // is the priced sum. Only a failed lookup or an unknown settlement
+            // hides it. Without a provider nothing is priced, so the cost is
+            // unknown and no part is streamed, as in 2.2.
             const costUsd = accounting
-              ? accounting.unknownUsd - (accounting.unpriced ?? 0) === 0
+              ? accounting.unknownUsd === 0 ||
+                (deps.priceProvider !== undefined &&
+                  accounting.unknownUsd === (accounting.unpriced ?? 0))
                 ? accounting.spent.usd
                 : undefined
               : priced?.costUsd;

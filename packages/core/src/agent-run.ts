@@ -12,6 +12,8 @@ import type {
 import type { CommonCallOptions } from './types/config';
 import type { CallWarning, StopDetails } from './types/methods';
 import type { Message } from './types/message';
+import type { LanguageModel } from './types/model';
+import type { ToolSet } from './types/tool';
 import type { WireToolRequest } from './adapters/types';
 import type { SessionStore } from './types/session';
 import type { StreamPart } from './types/stream';
@@ -29,10 +31,12 @@ import { runStreamToolLoop, type StreamToolLoopSnapshot } from './inference/stre
 import { assembleAssistant, stopDetailsFrom, type EncryptedReasoning } from './inference/run-step';
 import {
   buildWireTools,
+  collectHandoffTools,
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
   filterWireTools,
   mergeMcpTools,
+  resumeHandoffState,
   rewriteAssistantText,
   sumUsage,
 } from './inference/loop-shared';
@@ -50,6 +54,7 @@ import {
   type NativeToolReceipts,
 } from './inference/agent-tools';
 import type { NativeMcp } from './inference/native-mcp';
+import { readHandoffTarget } from './inference/handoff';
 import {
   assertExecutionPolicy,
   createExecutionContext,
@@ -58,6 +63,7 @@ import {
 import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
+import { assertCheckpointVersion } from './internal/checkpoint-version';
 
 export type * from './types/agent-run';
 
@@ -156,6 +162,65 @@ function assertAccountingContinuity(
       );
     }
   }
+}
+
+/** A model's part of the native resume binding. */
+function modelBinding(model: LanguageModel): string {
+  return `${model.provider}/${model.surface}/${model.modelId}`;
+}
+
+/**
+ * A tool set's part of the native resume binding: each tool's name, description
+ * and schemas. Function bodies cannot be compared; `bindingId` covers them.
+ */
+function toolBinding(
+  tools: ToolSet,
+  contextSchemaOf: (name: string) => AgentTool['contextSchema'],
+): Promise<unknown[]> {
+  return Promise.all(
+    Object.entries(tools).map(async ([name, tool]) => {
+      const contextSchema = contextSchemaOf(name);
+      return [
+        name,
+        tool.description,
+        await toJSONSchema(tool.parameters),
+        tool.outputSchema,
+        contextSchema ? await toJSONSchema(contextSchema) : undefined,
+      ];
+    }),
+  );
+}
+
+/**
+ * The handoff targets of a run's prepared tools (2.3), for its resume binding:
+ * each target's name, model, instructions and own tools, which run in this
+ * native run once a transfer is accepted. A target's own transfer tools are
+ * followed too. Undefined when the run has no target.
+ */
+async function handoffBinding(tools: ToolSet): Promise<string | undefined> {
+  const targets = new Map<string, unknown>();
+  // Transfer groups can reference each other: each tool set is read once.
+  const visited = new Set<ToolSet>();
+  const visit = async (set: ToolSet): Promise<void> => {
+    if (visited.has(set)) return;
+    visited.add(set);
+    for (const tool of Object.values(set)) {
+      const meta = readHandoffTarget(tool);
+      if (!meta) continue;
+      const own = meta.def.tools ?? {};
+      const target = [
+        meta.name,
+        modelBinding(meta.def.model),
+        meta.def.instructions ?? null,
+        // A prepared tool keeps its original's context schema.
+        await toolBinding(own, (name) => (own[name] as Partial<AgentTool>).contextSchema),
+      ];
+      targets.set(JSON.stringify(target), target);
+      await visit(own);
+    }
+  };
+  await visit(tools);
+  return targets.size > 0 ? JSON.stringify([...targets.values()]) : undefined;
 }
 
 /** Store for tests and single-process applications; durable applications supply their own store. */
@@ -343,6 +408,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           saved.scope !== options.session.scope
         )
           throw new TypeError('Native checkpoint version, identity, or scope mismatch.');
+        // So are the loop and sub-agent checkpoints it holds (2.3): one a newer
+        // SDK wrote fails the resume here, before admission, so the stored run
+        // stays resumable by that SDK.
+        for (const [runId, checkpoint] of Object.entries(saved.checkpoints))
+          assertCheckpointVersion(checkpoint, runId);
         envelope = structuredClone(saved);
         currentText = envelope.candidateText ?? lastAssistantText(envelope.messages);
       } else if (options.session && (await options.session.store.load(options.session.runId))) {
@@ -477,30 +547,27 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         receipts,
       );
       const binding: NonNullable<AgentRunEnvelope['binding']> = {
-        model: `${common.model.provider}/${common.model.surface}/${common.model.modelId}`,
+        model: modelBinding(common.model),
         tools: JSON.stringify(
-          await Promise.all(
-            Object.entries(common.tools).map(async ([name, tool]) => [
-              name,
-              tool.description,
-              await toJSONSchema(tool.parameters),
-              tool.outputSchema,
-              options.tools?.[name]?.contextSchema
-                ? await toJSONSchema(options.tools[name]!.contextSchema!)
-                : undefined,
-            ]),
-          ),
+          await toolBinding(common.tools, (name) => options.tools?.[name]?.contextSchema),
         ),
         output: JSON.stringify(outputSchema ?? null),
         ...(options.bindingId !== undefined ? { revision: options.bindingId } : {}),
       };
-      // The MCP catalog (2.3) is compared below, once the servers are reached.
+      // Handoff targets (2.3) are compared on their own, and the MCP catalog
+      // below, once the servers are reached: an envelope written before 2.3
+      // records neither, and its resume records them.
+      const handoffs = await handoffBinding(common.tools);
       const recordedCatalog = envelope.binding?.mcp;
       if (envelope.binding) {
-        const { mcp: _catalog, ...recorded } = envelope.binding;
-        if (JSON.stringify(binding) !== JSON.stringify(recorded))
+        const { mcp: _catalog, handoffs: recordedHandoffs, ...recorded } = envelope.binding;
+        if (
+          JSON.stringify(binding) !== JSON.stringify(recorded) ||
+          (recordedHandoffs !== undefined && recordedHandoffs !== handoffs)
+        )
           throw new TypeError('Native agent binding changed across resume.');
       }
+      if (handoffs !== undefined) binding.handoffs = handoffs;
       if (envelope.phase === 'terminal') {
         if (!envelope.result || envelope.result.status === 'suspended')
           throw new TypeError('Invalid native terminal checkpoint.');
@@ -578,7 +645,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const unreconciled = Object.values(envelope.toolResults ?? {}).filter(
         (receipt) =>
           receipt.stage === 'executing' &&
-          replayOf(receipt.toolName) !== 'idempotent' &&
+          // The policy the receipt recorded (2.3) is that of the tool that ran
+          // the call, a handoff target's own included. Older receipts have none.
+          !(receipt.idempotent ?? replayOf(receipt.toolName) === 'idempotent') &&
           !options.retryToolCallIds?.includes(receipt.toolCallId),
       );
       if (resume && unreconciled.length) {
@@ -691,6 +760,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const hasLoopTools = Object.keys(common.tools).length > 0 || (options.mcp?.length ?? 0) > 0;
       /** The tool request of the loop's last model call, when this leg ran the loop. */
       let loopWire: WireToolRequest | undefined;
+      /** The loop's active handoff agent at its end, when this leg ran the loop. */
+      let loopHandoff: StreamToolLoopSnapshot['handoff'];
       if (envelope.phase === 'running' && (!options.output || hasLoopTools)) {
         const checkpoint = envelope.checkpoints[envelope.runId];
         const recoveredOutcome =
@@ -790,6 +861,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           }
           if (!options.output) envelope.candidateText = currentText = finalTurnText(loop.messages);
           loopWire = loop.wire;
+          loopHandoff = loop.handoff;
         }
       } else if (envelope.phase === 'running') {
         const input = await evaluateInputGuardrails(common, envelope.messages);
@@ -804,10 +876,25 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       envelope.phase = 'finalizing';
       events.push({ type: 'phase', phase: 'finalizing' });
       await persist();
+      // A handoff (2.0) gives its target every following step, finalization
+      // included (2.3): the target's model answers, with the target's tools on
+      // a rebuilt wire. A leg that did not run the loop reads the transfer from
+      // the run's checkpoint.
+      const transfer = loopHandoff ?? envelope.checkpoints[envelope.runId]?.handoff;
+      const finalAgent = transfer
+        ? resumeHandoffState(
+            transfer,
+            common.tools,
+            collectHandoffTools(common.tools),
+            common.model,
+            resolveDependencies(options.deps).logger,
+          )
+        : undefined;
+      const finalModel = finalAgent?.model ?? common.model;
       // Finalization is one more turn of the same conversation (2.3, F15). It
       // keeps the loop's tools on the wire, with `tool_choice: 'none'`, so the
       // request prefix (prompt cache, preserved thinking) is the loop's own. A
-      // leg that did not run the loop rebuilds the run's static tool request.
+      // leg that did not run the loop rebuilds the active agent's tool request.
       let finalizeTools: WireToolRequest | undefined | null = null;
       const finalizeToolRequest = async (): Promise<WireToolRequest | undefined> => {
         if (finalizeTools !== null) return finalizeTools;
@@ -816,7 +903,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           (hasLoopTools
             ? filterWireTools(
                 await buildWireTools(
-                  mergeMcpTools(nativeMcp?.runtime, common.tools),
+                  mergeMcpTools(nativeMcp?.runtime, finalAgent?.tools ?? common.tools),
                   common.toolChoice,
                   common.maxToolConcurrency,
                 ),
@@ -851,8 +938,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           const output = options.output;
           const strategy = output
             ? pickObjectStrategy(
-                { model: common.model, mode: output.mode, effort: common.effort },
-                getCapabilities(common.model, undefined, common.capabilities),
+                { model: finalModel, mode: output.mode, effort: common.effort },
+                getCapabilities(finalModel, undefined, common.capabilities),
               )
             : undefined;
           const toolRequest = await finalizeToolRequest();
@@ -860,6 +947,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           const inner = runStream(
             {
               ...common,
+              model: finalModel,
               messages: envelope.messages,
               prompt: undefined,
               instructions: undefined,
@@ -964,8 +1052,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           // exactly as the loop reports it after each step.
           if (toolRequest) {
             const totals = common.execution!.ledger.totals(common.execution!.scopeId);
-            // Unpriced calls add nothing to the cost (2.3), as in the loop.
-            if (totals.unknownUsd - (totals.unpriced ?? 0) === 0)
+            // Calls the provider has no price for add nothing to the cost (2.3),
+            // and without a provider the cost is unknown: as in the loop.
+            if (
+              totals.unknownUsd === 0 ||
+              (options.deps?.priceProvider !== undefined &&
+                totals.unknownUsd === (totals.unpriced ?? 0))
+            )
               emitPart(
                 {
                   type: 'cost',

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { generateText } from '../src/generate';
-import { runAgent } from '../src/agent-run';
+import { runAgent, streamAgent } from '../src/agent-run';
 import { createAgent } from '../src/agent';
 import { createInMemorySwarmStore, createSwarm } from '../src/swarm';
 import { evolve } from '../src/evolve/controller';
@@ -9,6 +9,7 @@ import { createExecutionContext } from '../src/execution-policy';
 import { createInMemoryBudgetStore } from '../src/budget-store';
 import { createMockModel } from '../src/testing';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
+import type { AgentEvent } from '../src/types/agent-run';
 import type { BudgetLimits } from '../src/types/execution';
 import type { LanguageModel } from '../src/types/model';
 import type { Usage } from '../src/types/usage';
@@ -258,5 +259,52 @@ describe('runAgent, swarm and evolve follow the same policy (t4)', () => {
     expect(run.status).toBe('completed');
     // 2.2 refused the run; with a caller estimate it kept the estimate held forever.
     expect(await store.usage('tenant:1')).toEqual({ tokens: 15, usd: 0 });
+  });
+});
+
+describe('native cost parts follow the price provider (2.3)', () => {
+  // One tool step, the loop's answer, then a structured finalization: cost parts
+  // can come from the loop's steps and from the finalization request.
+  const run = async (deps?: { priceProvider: typeof prices }) => {
+    const model = createMockModel({
+      responses: [
+        { toolCalls: [{ toolName: 'noop', id: 'n1', args: {} }] },
+        { text: 'ready' },
+        { text: '{}' },
+      ],
+    });
+    const stream = streamAgent({
+      model,
+      prompt: 'go',
+      tools: { noop: { parameters: schema, execute: () => 'ok' } },
+      output: { schema, mode: 'json', validate: (value: unknown) => value as object },
+      ...(deps ? { deps } : {}),
+    });
+    const events: AgentEvent<object>[] = [];
+    for await (const event of stream.events) events.push(event);
+    const costs = events.flatMap((e) =>
+      e.type === 'part' && e.part.type === 'cost'
+        ? [{ phase: e.phase, costUsd: e.part.costUsd }]
+        : [],
+    );
+    return { result: await stream.result, costs };
+  };
+
+  it('stream none without a priceProvider, whose cost is unknown rather than zero', async () => {
+    const { result, costs } = await run();
+    expect(result.status).toBe('completed');
+    expect(result.accounting).toMatchObject({ spent: { usd: 0 }, unknownUsd: 3, unpriced: 3 });
+    // 2.2 streamed no cost part here; a $0 part would read as a free run.
+    expect(costs).toEqual([]);
+  });
+
+  it('stream the priced sum when the provider has no price for the model (decision 4)', async () => {
+    const { result, costs } = await run({ priceProvider: prices });
+    expect(result.status).toBe('completed');
+    expect(costs).toEqual([
+      { phase: 'running', costUsd: 0 },
+      { phase: 'running', costUsd: 0 },
+      { phase: 'finalizing', costUsd: 0 },
+    ]);
   });
 });

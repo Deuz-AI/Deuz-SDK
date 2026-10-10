@@ -19,6 +19,7 @@ import { createAnthropic } from '../src/anthropic';
 import { createGoogleNative } from '../src/google';
 import { createOpenAI, createOpenAIResponses } from '../src/openai';
 import { createMockModel, mockFetchSequence, sseEvents, sseResponse } from '../src/testing';
+import { handoff } from '../src/inference/handoff';
 import type { LanguageModel } from '../src/types/model';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import type { AgentEvent, AgentRunStore } from '../src/types/agent-run';
@@ -48,11 +49,11 @@ interface WireBody {
   response_format?: unknown;
 }
 
-function mocked(responses: MockResponse[]) {
+function mocked(responses: MockResponse[], modelId?: string) {
   const base = createMockModel({ responses });
   const config = readConfig(base)!;
   const fetch = vi.fn(config.fetch!);
-  const model = attachConfig({ ...base }, { ...config, fetch });
+  const model = attachConfig({ ...base, ...(modelId ? { modelId } : {}) }, { ...config, fetch });
   const bodies = (): WireBody[] =>
     fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)) as WireBody);
   return { model, fetch, bodies };
@@ -186,6 +187,108 @@ describe('native finalization request (F15)', () => {
     );
     expect(finalizingCost).toHaveLength(1);
     expect(finalizingCost[0]).toMatchObject({ part: { costUsd: 0.003, deltaUsd: 0.001 } });
+  });
+});
+
+// After a handoff the target's model and tools drive every following step
+// (handoffs.mdx), and finalization is one more turn of that conversation.
+describe('native finalization after a handoff', () => {
+  const answer = {
+    schema: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] },
+    mode: 'json' as const,
+    validate(value: unknown) {
+      if (!value || typeof (value as { answer?: unknown }).answer !== 'string')
+        throw new Error('answer must be a string');
+      return value as { answer: string };
+    },
+  };
+  const transfer = { toolCalls: [{ toolName: 'transfer_to_billing', id: 'h1', args: {} }] };
+
+  it('asks the target agent’s model for the structured output', async () => {
+    const triage = mocked([transfer, { text: '{"answer":"from-triage"}' }], 'triage-model');
+    const billing = mocked(
+      [{ text: 'Billing handled it.' }, { text: '{"answer":"from-billing"}' }],
+      'billing-model',
+    );
+    const result = await runAgent({
+      model: triage.model,
+      prompt: 'Refund me.',
+      output: answer,
+      tools: handoff({ billing: { model: billing.model, instructions: 'You are billing.' } }),
+    });
+    expect(result).toMatchObject({ status: 'completed', output: { answer: 'from-billing' } });
+    expect(triage.fetch).toHaveBeenCalledTimes(1);
+    expect(billing.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('lets the target agent answer a verifier re-drive', async () => {
+    const triage = mocked([transfer, { text: 'triage second draft' }], 'triage-model');
+    const billing = mocked(
+      [{ text: 'billing first draft' }, { text: 'billing second draft' }],
+      'billing-model',
+    );
+    let verdicts = 0;
+    const result = await runAgent({
+      model: triage.model,
+      prompt: 'Refund me.',
+      tools: handoff({ billing: { model: billing.model, instructions: 'You are billing.' } }),
+      verify: () =>
+        verdicts++ === 0 ? { status: 'rejected', feedback: 'Again.' } : { status: 'verified' },
+    });
+    expect(result).toMatchObject({ status: 'completed', output: 'billing second draft' });
+    expect(triage.fetch).toHaveBeenCalledTimes(1);
+    expect(billing.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the target’s model and tools when a finalizing leg is resumed', async () => {
+    const triage = mocked([transfer, { text: 'triage redraft' }], 'triage-model');
+    const billing = mocked(
+      [{ text: 'billing draft' }, { text: 'billing redraft' }],
+      'billing-model',
+    );
+    const inner = createInMemoryAgentRunStore();
+    let lost = false;
+    const store: AgentRunStore = {
+      load: (id) => inner.load(id),
+      save(envelope) {
+        // Lose the write that records the re-drive attempt: the run stays `finalizing`.
+        if (!lost && envelope.phase === 'finalizing' && envelope.finalizationAttempts === 1) {
+          lost = true;
+          throw new Error('disk full');
+        }
+        return inner.save(envelope);
+      },
+    };
+    let verdicts = 0;
+    const options = {
+      model: triage.model,
+      prompt: 'Refund me.',
+      tools: handoff({
+        billing: {
+          model: billing.model,
+          instructions: 'You are billing.',
+          tools: { refund: { parameters, execute: () => 'ok' } },
+        },
+      }),
+      verify: () =>
+        verdicts++ === 0
+          ? { status: 'rejected' as const, feedback: 'Again.' }
+          : { status: 'verified' as const },
+    };
+    const first = await runAgent({ ...options, session: { store, runId: 'fin', scope: 't' } });
+    expect(first.status).toBe('failed');
+    expect((await inner.load('fin'))?.phase).toBe('finalizing');
+    const resumed = await resumeAgent({
+      ...options,
+      session: { store: inner, runId: 'fin', scope: 't' },
+    });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'billing redraft' });
+    expect(triage.fetch).toHaveBeenCalledTimes(1);
+    expect(billing.fetch).toHaveBeenCalledTimes(2);
+    const [loopBody, redrive] = billing.bodies();
+    expect(toolNames(loopBody!)).toEqual(['refund']);
+    expect(toolNames(redrive!)).toEqual(['refund']);
+    expect(redrive!.tool_choice).toBe('none');
   });
 });
 

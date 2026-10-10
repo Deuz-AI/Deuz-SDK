@@ -71,8 +71,19 @@ for each verifier candidate, and `maxVerifyAttempts` bounds verifier invocations
 
 Verification has three outcomes: `verified` accepts, `rejected` requests another
 candidate within the attempt limit, and `inconclusive` stops without certifying
-the answer. Exceptions from the verifier are inconclusive. Schema validation and
+the answer. Exceptions from the verifier are inconclusive, unless the run was
+cancelled (it stops with reason `aborted`) or the execution deadline elapsed (it
+fails with `ExecutionPolicyError`). Cancellation and the deadline are checked again
+after the verifier returns, and they outrank its verdict. Schema validation and
 verification are distinct checks; a valid JSON shape does not prove the answer.
+
+If the write that follows a verdict fails, the run stays in `finalizing`. Resuming
+it runs the verifier again on the same candidate, without a model call. The repeat
+counts as a new attempt toward `maxVerifyAttempts`; when none is left, the resume
+stops with `verification-attempts-exhausted` instead. Verifiers must therefore be
+idempotent: a repeated verdict on the same candidate must have no further effect.
+Key any side effect on the run and the candidate's `text`, not on `attempt`, which
+differs on the repeat.
 
 ## Streaming
 
@@ -104,9 +115,14 @@ events with sequence cursors.
 ## Strict checkpoints and approval resume
 
 Native sessions use `AgentRunEnvelope` with `kind: 'deuz-agent-run'` and `version: 1`.
-They do not reuse a legacy `AgentCheckpoint` as the top-level envelope. An
-`AgentRunStore` implements `load(runId)` and `save(envelope)`. `save` must finish
-its durable write before resolving; a rejected write stops further execution.
+They do not reuse a legacy `AgentCheckpoint` as the top-level envelope; the loop and
+sub-agent checkpoints inside it are `AgentCheckpoint` records. A resume refuses an
+envelope of another version. Since 2.3 it also refuses one holding a checkpoint whose
+version is not 1, with `CheckpointVersionError` (code `checkpoint_version_unsupported`).
+Both refusals happen before anything is written, so the stored run stays resumable by
+the SDK that wrote it. An `AgentRunStore` implements `load(runId)` and
+`save(envelope)`. `save` must finish its durable write before resolving; a rejected
+write stops further execution.
 
 The following complete approval example uses a volatile store for demonstration.
 The tool returns a string and has no external effect. In an application, obtain
@@ -159,7 +175,8 @@ authentication mechanism. Native store run IDs must be unique within that store.
 
 Resume requires the original run ID and scope. Keep `bindingId` stable for the
 same implementation and bump it when tool or verifier semantics change. Stored
-model/tool/output schemas and persisted limits are checked on resume. Function
+model/tool/output schemas and persisted limits are checked on resume, and since 2.3
+so is each handoff target's model, instructions and tool schemas. Function
 bodies cannot be fingerprinted reliably: changing a validator, approval predicate,
 tool implementation or verifier requires a new `bindingId`. A
 completed native envelope returns its stored result without another model call.
@@ -195,9 +212,11 @@ checkpoint transaction.
 Some effects are safe to repeat because the tool writes under a key it derives
 from the call itself. Mark such a tool `replay: 'idempotent'` (2.2). An interrupted
 call of that tool runs again on resume without `retryToolCallIds`; plain tools
-still stop for reconciliation. Every native tool also receives `ctx.modelStep`,
-the root model turn that issued the call. Together with `ctx.toolCallId` it is
-stable across resume, so it can key the write:
+still stop for reconciliation. Since 2.3 each receipt records the flag of the tool
+that ran the call (`AgentToolReceipt.idempotent`), so a handoff target's own tool is
+judged by its own flag, never by a root tool of the same name. Every native tool
+also receives `ctx.modelStep`, the root model turn that issued the call. Together
+with `ctx.toolCallId` it is stable across resume, so it can key the write:
 
 ```ts
 import { runAgent } from '@deuz-sdk/core/agent';
@@ -254,6 +273,9 @@ Native options support the canonical tool-loop controls, including preparation,
 compaction, approval gates and guardrails. Loop hooks apply to the tool-loop phase.
 Finalization is one more turn of the same conversation: it ends with a user turn,
 offers the loop's tools with `tool_choice: 'none'`, and validates its own output.
+After a [handoff](/docs/agents/handoffs), the target agent's model and tools drive
+every later step, finalization and verifier re-drives included, and its tools pass
+through the same receipts as the root agent's.
 MCP servers in `mcp` cross the same receipt boundary as local tools; see
 [MCP in native runs](/docs/modules/native-mcp).
 The native engine currently rejects `chat`, `memory`, `fallbackModels`, and the
