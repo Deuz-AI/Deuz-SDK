@@ -1,22 +1,40 @@
 import type { Dependencies, PriceProvider, UsageMeta } from '../types/deps';
+import type { BudgetLimits } from '../types/execution';
 import type { Usage } from '../types/usage';
+import { unpricedModelWarning } from './unpriced';
+import { UnpricedModelError } from './unpriced-error';
+import type { WarningSink } from './warnings';
 
 /** Persisted paid totals, not a mixed-model token total to reprice on resume. */
 export interface UsageCostSnapshot {
   readonly version: 1;
   readonly pricedUsd: number;
   readonly calls: number;
+  /** Calls whose cost is unknown: failed, still pending, or unpriced. */
   readonly unknownCalls: number;
+  /** The part of `unknownCalls` made to a model with no price (2.3). */
+  readonly unpricedCalls?: number;
+  /** Those models in first-seen order (2.3). */
+  readonly unpricedModels?: readonly string[];
   readonly cacheSavingsUsd?: number;
 }
 
 export interface UsageCostSummary {
   /** Known charges; a lower bound when unknownCalls is nonzero. */
   readonly pricedUsd: number;
-  /** Exact cumulative cost is unavailable if any call could not be priced. */
+  /**
+   * The cumulative cost, unavailable while any price lookup failed. A model
+   * with no price adds nothing (2.3): the sum stays defined, so a `budget.usd`
+   * keeps counting the priced calls. 2.2 dropped it for the rest of the run.
+   */
   readonly costUsd?: number;
   readonly calls: number;
+  /** Calls whose cost is unknown, unpriced calls included. */
   readonly unknownCalls: number;
+  /** The part of `unknownCalls` made to a model with no price (2.3); omitted when zero. */
+  readonly unpricedCalls?: number;
+  /** Those models in first-seen order (2.3). */
+  readonly unpricedModels?: readonly string[];
   readonly cacheSavingsUsd?: number;
 }
 
@@ -25,6 +43,14 @@ export interface UsageCostAccumulatorOptions {
   readonly snapshot?: UsageCostSnapshot;
   /** Old checkpoints with usage but no model-aware cost have an unknown base. */
   readonly unpricedBaseUsage?: boolean;
+  /**
+   * The loop's `budget` (2.3). While it bounds `usd`, a model with no price
+   * adds one `unpriced-model` warning per model to `warnings`, and
+   * `unknownPrice: 'reject'` makes {@link UsageCostAccumulator.admit} refuse it.
+   */
+  readonly budget?: BudgetLimits;
+  /** The run's warning sink (2.3), deduplicating per model. */
+  readonly warnings?: WarningSink;
 }
 
 export interface UsageCostAccumulator {
@@ -34,6 +60,28 @@ export interface UsageCostAccumulator {
   flush(): Promise<UsageCostSummary>;
   /** Pending price lookups become unknown in a snapshot taken before flush. */
   snapshot(): UsageCostSnapshot;
+  /**
+   * Call before each model call (2.3). Under a `budget.usd` it looks the
+   * model's price up once per run: a model with no price is reported
+   * (`'warn'`, the default) or refused with {@link UnpricedModelError}
+   * (`'reject'`). Without a USD bound it does nothing.
+   */
+  admit(model: string): Promise<void>;
+}
+
+/** One input and one output token: enough to ask whether a model has a price. */
+const PROBE: Usage = Object.freeze({
+  inputTokens: 1,
+  outputTokens: 1,
+  reasoningTokens: 0,
+  cachedReadTokens: 0,
+  cacheWriteTokens: 0,
+  cacheWrite1hTokens: 0,
+  totalTokens: 2,
+});
+
+function count(value: number | undefined): boolean {
+  return value === undefined || (Number.isSafeInteger(value) && value >= 0);
 }
 
 /**
@@ -56,6 +104,12 @@ export function createUsageCostAccumulator(
       !Number.isSafeInteger(saved.unknownCalls) ||
       saved.unknownCalls < 0 ||
       saved.unknownCalls > saved.calls ||
+      !count(saved.unpricedCalls) ||
+      (saved.unpricedCalls ?? 0) > saved.unknownCalls ||
+      (saved.unpricedModels !== undefined &&
+        (!Array.isArray(saved.unpricedModels) ||
+          saved.unpricedModels.length > (saved.unpricedCalls ?? 0) ||
+          saved.unpricedModels.some((model) => typeof model !== 'string' || !model))) ||
       (saved.cacheSavingsUsd !== undefined &&
         (!Number.isFinite(saved.cacheSavingsUsd) || saved.cacheSavingsUsd < 0)) ||
       (saved.calls === 0 && saved.pricedUsd !== 0))
@@ -65,6 +119,8 @@ export function createUsageCostAccumulator(
   let pricedUsd = saved?.pricedUsd ?? 0;
   let calls = saved?.calls ?? 0;
   let unknownCalls = saved?.unknownCalls ?? 0;
+  let unpricedCalls = saved?.unpricedCalls ?? 0;
+  const unpricedModels: string[] = [...(saved?.unpricedModels ?? [])];
   let pending = 0;
   let cacheSavingsUsd = saved?.cacheSavingsUsd ?? 0;
   let savingsCalls = saved?.cacheSavingsUsd !== undefined ? saved.calls : 0;
@@ -75,6 +131,15 @@ export function createUsageCostAccumulator(
     unknownCalls++;
     savingsKnown = false;
   }
+  /** Whether each model has a price, looked up once per run by `admit`. */
+  const probes = new Map<string, Promise<boolean>>();
+  const hasProvider = options.priceProvider !== undefined;
+
+  /** Report a model with no price, once per model (the sink deduplicates). */
+  function warn(model: string): void {
+    if (options.budget?.usd !== undefined)
+      options.warnings?.add(unpricedModelWarning(model, hasProvider));
+  }
 
   function record(usage: Usage, meta: Pick<UsageMeta, 'model'>): void {
     // The hook is synchronous; copy before the async price lookup so mutable
@@ -84,14 +149,24 @@ export function createUsageCostAccumulator(
     calls++;
     pending++;
     queue = queue.then(async () => {
+      let price: number | undefined | null = null;
       try {
-        const price = await options.priceProvider?.priceUsage(model, copied);
-        if (price !== undefined && Number.isFinite(price) && price >= 0) pricedUsd += price;
-        else unknownCalls++;
+        price = (await options.priceProvider?.priceUsage(model, copied)) ?? undefined;
       } catch {
         // A price lookup failure is not a zero-cost model invocation.
-        unknownCalls++;
       }
+      if (price === undefined) {
+        // No price for this model (2.3): its cost stays unknown, but it adds
+        // nothing to the priced total or the cache savings.
+        unknownCalls++;
+        unpricedCalls++;
+        if (!unpricedModels.includes(model)) unpricedModels.push(model);
+        warn(model);
+        pending--;
+        return;
+      }
+      if (price !== null && Number.isFinite(price) && price >= 0) pricedUsd += price;
+      else unknownCalls++;
       try {
         const savings = await options.priceProvider?.cacheSavings?.(model, copied);
         if (savings !== undefined && Number.isFinite(savings) && savings >= 0) {
@@ -105,12 +180,27 @@ export function createUsageCostAccumulator(
     });
   }
 
+  /** Price a probe usage: whether the model has a price; rejects when the lookup fails. */
+  async function probe(model: string): Promise<boolean> {
+    const price = (await options.priceProvider?.priceUsage(model, PROBE)) ?? undefined;
+    if (price !== undefined && !(Number.isFinite(price) && price >= 0))
+      throw new TypeError(`Invalid price for ${model}.`);
+    return price !== undefined;
+  }
+
+  function unpriced(): Pick<UsageCostSummary, 'unpricedCalls' | 'unpricedModels'> {
+    return unpricedCalls > 0
+      ? { unpricedCalls, unpricedModels: Object.freeze([...unpricedModels]) }
+      : {};
+  }
+
   function snapshot(): UsageCostSnapshot {
     return Object.freeze({
       version: 1,
       pricedUsd,
       calls,
       unknownCalls: unknownCalls + pending,
+      ...unpriced(),
       ...(pending === 0 && savingsKnown && savingsCalls > 0 ? { cacheSavingsUsd } : {}),
     });
   }
@@ -128,12 +218,30 @@ export function createUsageCostAccumulator(
       while (pending > 0) await queue;
       return Object.freeze({
         pricedUsd,
-        ...(unknownCalls === 0 ? { costUsd: pricedUsd } : {}),
+        // Only a failed lookup makes the cost unknowable; unpriced calls add nothing.
+        ...(unknownCalls === unpricedCalls ? { costUsd: pricedUsd } : {}),
         calls,
         unknownCalls,
+        ...unpriced(),
         ...(savingsKnown && savingsCalls > 0 ? { cacheSavingsUsd } : {}),
       });
     },
     snapshot,
+    async admit(model: string): Promise<void> {
+      const budget = options.budget;
+      if (budget?.usd === undefined) return;
+      let lookup = probes.get(model);
+      if (!lookup) probes.set(model, (lookup = probe(model)));
+      try {
+        if (await lookup) return;
+      } catch (cause) {
+        // An outage is not a missing price: ask again before the next call.
+        probes.delete(model);
+        if (budget.unknownPrice === 'reject') throw new UnpricedModelError(model, cause);
+        return;
+      }
+      if (budget.unknownPrice === 'reject') throw new UnpricedModelError(model);
+      warn(model);
+    },
   });
 }

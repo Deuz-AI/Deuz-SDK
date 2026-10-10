@@ -51,20 +51,143 @@ ledger's queue:
    denial in one scope charges nothing to the others.
 
 Settlement and release are mirrored to the store. When the provider reports no
-usage, the store keeps the full estimate held. When the tokens are known but no
-price is, a call reserved with a USD estimate keeps its full hold too, because
-its cost is still unknown; a call reserved without one settles its tokens at
-once. Give native runs a `priceProvider` when a scope bounds USD, or every call
-keeps its estimate.
+usage, the store keeps the full estimate held. When the tokens are known but the
+model has no price (see [Models without a price](#models-without-a-price)), the
+tokens settle at once: a call reserved with a USD estimate settles that estimate
+as its charge, and a call reserved without one holds no USD. A price lookup that
+throws is an outage, not a missing price, so that call keeps its full hold.
 
 Every request is idempotent by its request ID. Repeating an identical
 reservation returns the recorded outcome, a denial included; repeating it with
 different amounts throws.
 
-A persistent scope that bounds a dimension needs an estimate for it. A context
-with a USD scope but no USD estimate fails closed with `missing_reservation`.
-When the store itself fails, the attempt fails with `admission_failed` and
-nothing changes locally.
+A persistent scope that bounds a dimension needs an estimate for it. A call
+whose USD estimate is missing because its model has no price follows the
+budget's `unknownPrice` policy; any other missing estimate fails closed with
+`missing_reservation`. When the store itself fails, the attempt fails with
+`admission_failed` and nothing changes locally.
+
+### What a reservation holds
+
+Before each attempt, a native request reserves its worst case: the prompt,
+estimated from its characters, plus the output cap the request actually sends.
+That cap is `maxOutputTokens` or, without it, the model's `maxOutput` from the
+registry (128 000 tokens for several current models). Anthropic raises it to the
+thinking budget plus 1 024 while extended thinking runs, even over an explicit
+`maxOutputTokens`. Reasoning tokens are part of the output, so the cap covers
+them. A prompt the call caches with `promptCaching` is priced at the cache-write
+rate.
+
+The ledger therefore admits on estimates; it is not a limit the provider
+enforces. The prompt estimate can be low, and an actual overage is still
+recorded and blocks later admission.
+
+Set `maxOutputTokens` when a USD budget is small. Without it, one call to a
+large-output model can reserve more than the whole budget and is refused with
+`budget_exceeded` before it is sent. 2.2 reserved 4 096 output tokens instead,
+which let parallel calls spend past the budget.
+
+## Models without a price
+
+A model has no price when no `deps.priceProvider` is configured, or when the
+provider returns `undefined` for it, for example a model released after your
+price table. Under the USD budget of an execution context (`runAgent`, swarms,
+`evolve`, or an `execution` passed to `generateText` and `streamChat`), such a
+call runs by default:
+
+- its tokens are still reserved, bounded and settled;
+- its cost is left out of every USD total, so `spent.usd` counts the priced
+  calls only. `accounting.unpriced` counts the unpriced ones, which also stay in
+  `unknownUsd` because their cost is unknown;
+- the run reports one `unpriced-model` warning per model: on the result's
+  `warnings` when the call goes through an agentic loop, and through
+  `deps.logger` otherwise.
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+// This table knows one model; the mock model is not in it.
+const priceProvider = {
+  priceUsage: (model: string) => (model === 'gpt-5.4' ? 0.01 : undefined),
+};
+
+const run = await runAgent({
+  model: createMockModel({ responses: [{ text: 'done' }] }),
+  prompt: 'Summarise the ticket.',
+  budget: { usd: 1 },
+  deps: { priceProvider },
+});
+console.log(run.status); // 'completed'
+console.log(run.accounting?.unpriced); // 1: a call the USD budget could not count
+```
+
+Set `unknownPrice: 'reject'` to refuse unpriced models instead. The call fails
+before it is sent, with a `BudgetLedgerError` whose code is `unpriced_model`:
+
+```ts
+import { createExecutionContext, runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const execution = createExecutionContext({ budget: { usd: 1, unknownPrice: 'reject' } });
+const run = await runAgent({
+  model: createMockModel({ responses: [{ text: 'done' }] }),
+  prompt: 'Summarise the ticket.',
+  execution,
+  deps: { priceProvider: { priceUsage: () => undefined } },
+});
+if (run.status === 'failed') console.log(run.error.code); // 'unpriced_model'
+```
+
+The policy lives on the budget, so it applies wherever a budget does: an
+execution context and its children, `runAgent`, swarm, task and reducer budgets,
+`evolve`, and persistent scope limits such as
+`{ key: 'org:7', limits: { usd: 50, unknownPrice: 'reject' } }`. Budgets
+intersect, and `'reject'` always wins: a child, task or restored budget can
+tighten the policy but never loosen it. A persistent scope refuses an unpriced
+call when its own limits or any budget of the run say `'reject'`. Without a USD
+bound the policy has nothing to protect, so it neither warns nor refuses.
+
+A price lookup that throws is an outage, not a missing price: under a USD bound
+that call still fails closed with `missing_reservation`, as in 2.2.
+
+The agentic loop of `generateText` and `streamChat` without an execution context
+counts the same way for its `budget.usd` stop: calls to an unpriced model add
+nothing to the cost, so the priced calls still stop the loop. In 2.2 a single
+unpriced call switched that stop off for the rest of the run.
+
+## When a settlement fails
+
+A billed attempt is settled after the call, and a refused one is released.
+Both are idempotent in the store, so the ledger tries a failing settlement or
+release three times. When the store stays down, the call fails with
+`admission_failed` as before, and nothing changed locally: the hold stays at its
+estimate, which is the safe direction. The error now names the attempt in
+`error.requestId`, and for a settlement `error.settlement` replays it exactly.
+Settle it once the store answers again, in the same ledger or in one restored
+from its durable snapshot:
+
+```ts
+import { BudgetLedgerError } from '@deuz-sdk/core/agent';
+import type { NativeExecutionContext } from '@deuz-sdk/core/agent';
+
+export async function settleLater(
+  error: unknown,
+  execution: NativeExecutionContext,
+): Promise<void> {
+  if (!(error instanceof BudgetLedgerError) || !error.settlement) throw error;
+  await execution.ledger.settle(error.settlement);
+}
+```
+
+The native request forgets an attempt's request ID only after the ledger
+accepted its settlement, so a failure on the way out is retried once more on the
+call's error path before it is reported.
+
+A process that dies between a call and its settlement leaves the same kind of
+hold: its request ID is a `reserved` entry in the last persisted ledger snapshot.
+Restore the context from that snapshot with its store, then settle the request,
+or release it when the call was never billed.
 
 ## Scopes and rolling windows
 

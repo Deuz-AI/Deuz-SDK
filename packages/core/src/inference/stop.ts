@@ -1,3 +1,4 @@
+import type { BudgetLimits } from '../types/execution';
 import type { StopCondition } from '../types/tool';
 
 /**
@@ -36,7 +37,9 @@ export const totalTokensExceed = (n: number): StopCondition =>
 
 /**
  * Stop once cumulative cost reaches `usd`. Requires `deps.priceProvider`;
- * without one the loop warns once and the condition never fires.
+ * without one the loop warns once and the condition never fires. Calls to a
+ * model the provider has no price for add nothing to the cost (2.3); a price
+ * lookup that fails leaves the cost unknown, and the condition waits.
  */
 export const costExceeds = (usd: number): StopCondition =>
   named('costExceeds', ({ costUSD }) => costUSD !== undefined && costUSD >= usd, {
@@ -56,8 +59,11 @@ export const durationExceeds = (ms: number): StopCondition =>
  * stop conditions. Same semantics as `costExceeds`/`totalTokensExceed`, but
  * with `budget.usd`/`budget.tokens` `stoppedBy` markers so callers (and the
  * `budget-exceeded` stream part) can tell a budget trip from a manual stop.
+ * `budget.usd` counts the priced calls only: a call to a model with no price
+ * adds nothing (2.3, decision 4) and `budget.unknownPrice` decides whether the
+ * run warns or refuses that model before calling it.
  */
-export function budgetConditions(budget: { usd?: number; tokens?: number }): StopCondition[] {
+export function budgetConditions(budget: BudgetLimits): StopCondition[] {
   const conditions: StopCondition[] = [];
   if (budget.usd !== undefined) {
     const limit = budget.usd;

@@ -2,10 +2,34 @@ import type { BudgetStore, PersistentBudgetScope } from './budget-store';
 import type { PriceProvider } from './deps';
 import type { Usage } from './usage';
 
+/**
+ * How a USD budget treats a call whose model has no price (2.3): no
+ * `deps.priceProvider`, or one that returns `undefined` for the model.
+ * - `'warn'` (default): the call runs. Its tokens are still reserved, settled
+ *   and bounded; its unknown cost is left out of every USD total, and the run
+ *   reports one `unpriced-model` warning per model.
+ * - `'reject'`: the call is refused before it is sent (code `unpriced_model`).
+ *
+ * A price lookup that throws is an outage, not a missing price: a USD bound
+ * still refuses that call (`missing_reservation`), as in 2.2.
+ */
+export type UnknownPricePolicy = 'warn' | 'reject';
+
 /** Limits include all descendant calls, including auxiliary model calls. */
 export interface BudgetLimits {
   readonly tokens?: number;
   readonly usd?: number;
+  /**
+   * Unpriced models under the `usd` bound (2.3); defaults to `'warn'`. Child,
+   * task and restored budgets can only tighten it: `'reject'` always wins.
+   */
+  readonly unknownPrice?: UnknownPricePolicy;
+}
+
+/** Known token and USD amounts (2.3 name for what 2.2 typed as `Required<BudgetLimits>`). */
+export interface BudgetAmounts {
+  readonly tokens: number;
+  readonly usd: number;
 }
 
 /** Mandatory constraints. An omitted allowlist allows all; an empty one allows none. */
@@ -35,6 +59,14 @@ export interface BudgetReservationInput {
   readonly usd?: number;
   /** Contexts provide these automatically; direct ledger callers may omit them. */
   readonly scopes?: readonly BudgetScope[];
+  /**
+   * The model has no price, so no `usd` estimate exists (2.3). Under a USD
+   * bound its `unknownPrice` decides: `'warn'` admits it without a USD hold,
+   * `'reject'` refuses it with code `unpriced_model`. Without this marker a
+   * missing estimate under a USD bound still fails closed
+   * (`missing_reservation`). Never combined with `usd`.
+   */
+  readonly unpriced?: boolean;
 }
 
 export interface BudgetReservation {
@@ -46,6 +78,13 @@ export interface BudgetReservation {
   readonly scopes: readonly BudgetScope[];
   readonly state: 'reserved' | 'settled' | 'unknown' | 'released';
   readonly usage?: Readonly<Usage>;
+  /**
+   * No price was available for this attempt (2.3), at reservation or for its
+   * actual usage. While `actual.usd` is unknown its cost is left out of every
+   * USD total; when the reservation held a USD estimate, that estimate was
+   * settled as the charge (`actual.usd`).
+   */
+  readonly unpriced?: true;
 }
 
 export interface BudgetSettlement {
@@ -56,13 +95,19 @@ export interface BudgetSettlement {
 }
 
 export interface BudgetTotals {
-  readonly spent: Required<BudgetLimits>;
-  readonly reserved: Required<BudgetLimits>;
+  readonly spent: BudgetAmounts;
+  readonly reserved: BudgetAmounts;
   /** Spent plus still-held reservations. */
-  readonly committed: Required<BudgetLimits>;
+  readonly committed: BudgetAmounts;
   /** Attempts with unknown actual amounts, even when the held estimate is zero. */
   readonly unknownTokens: number;
   readonly unknownUsd: number;
+  /**
+   * The part of `unknownUsd` whose model has no price (2.3): those attempts
+   * hold no USD and add nothing to any USD total, so `spent.usd` is a lower
+   * bound. Omitted when zero.
+   */
+  readonly unpriced?: number;
 }
 
 /**
@@ -76,14 +121,20 @@ export interface BudgetAggregate {
   /** Folded reservations. */
   readonly count: number;
   /** Known actual amounts. */
-  readonly spent: Required<BudgetLimits>;
+  readonly spent: BudgetAmounts;
   /** Estimates still held for dimensions whose actual amount stayed unknown. */
-  readonly held: Required<BudgetLimits>;
+  readonly held: BudgetAmounts;
   readonly unknownTokens: number;
   readonly unknownUsd: number;
   /** Unknown amounts that carried no estimate: a cap on that dimension fails closed. */
   readonly unestimatedTokens: number;
   readonly unestimatedUsd: number;
+  /**
+   * The part of `unestimatedUsd` whose model had no price (2.3): it does not
+   * fail a later USD cap closed. Omitted when zero; a 2.2 reader, which drops
+   * it, keeps failing closed.
+   */
+  readonly unpricedUsd?: number;
 }
 
 /** What one `compact` call changed (2.2). */
