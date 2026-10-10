@@ -170,6 +170,7 @@ for (const clamp of resolveModelProfile(anthropic('claude-opus-5-5')).clamps) {
 // topP: * → dropped (unsupported-setting)
 // toolChoice: 'required' → auto (clamped-setting)
 // toolChoice: { type: 'tool' } → auto (clamped-setting)
+// mode: 'tool' → json (clamped-setting)
 ```
 
 The same changes arrive at run time as `warnings` on the result and as
@@ -186,6 +187,9 @@ report:
   them, and on the Anthropic budget wire while extended thinking is on.
 - **Forced tool choice.** `'required'` or a named tool becomes `'auto'` for a
   model that rejects forcing.
+- **Structured-output `mode`.** An explicit `mode: 'tool'` in `generateObject`
+  or `streamObject` runs the json strategy when the model cannot be forced into
+  a tool, or Anthropic thinking is on for the request.
 - **`maxOutputTokens`** is raised when an Anthropic thinking budget needs room
   for the answer.
 - **`promptCaching`** is dropped for an Anthropic model without the caching capability.
