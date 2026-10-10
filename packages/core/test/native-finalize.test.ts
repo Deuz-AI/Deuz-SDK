@@ -418,7 +418,13 @@ describe('native finalization on the Anthropic wire (F15)', () => {
       expect(finalize.messages.at(-1)?.role).toBe('user');
       expect(finalize.output_config?.format).toMatchObject({ type: 'json_schema' });
       expect(finalize).not.toHaveProperty('temperature');
-      expect(finalize).not.toHaveProperty('thinking');
+      // Never budget_tokens. The request replays thinking to a model that binds
+      // it to the prefix, so adaptive thinking carries the drop_block binding
+      // (2.3, F21 with F22's binding controls).
+      expect(finalize.thinking).toEqual({
+        type: 'adaptive',
+        block_binding: { prefix_mismatch_behavior: 'drop_block' },
+      });
       // The finalize turn is stored whole: its reasoning survives with its signature.
       expect(result.messages.at(-1)).toEqual({
         role: 'assistant',

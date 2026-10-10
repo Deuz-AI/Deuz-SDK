@@ -1074,7 +1074,13 @@ export function runStreamToolLoop(
               // promise ever sees them — the exact silent gap Sprint 1 had to fix
               // for `verify`.
               case 'warning':
-                broadcaster.push(part);
+                // A wire's own notice about the response (2.3: Anthropic's
+                // input_transformations) never passed the run's sink: record
+                // it there, so the result's `warnings` carries it, and stream it
+                // from the sink, once. A warning the sink already holds was
+                // streamed by the step's own pump and is forwarded as before.
+                if (warningSink.add(part.warning)) flushWarnings();
+                else broadcaster.push(part);
                 break;
               default:
                 break;

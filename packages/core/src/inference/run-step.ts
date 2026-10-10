@@ -302,6 +302,8 @@ export async function runOneStep(
   const turn = createTurnContent();
   const toolArgs: ToolArgMap = new Map();
   const toolOrder: string[] = [];
+  /** Every `warning` part this turn's stream carried. */
+  const streamed: CallWarning[] = [];
 
   for await (const part of result.fullStream) {
     switch (part.type) {
@@ -309,6 +311,14 @@ export async function runOneStep(
         // Responses `phase` rides finish providerMetadata → onto the assistant message.
         messagePhase = (part.providerMetadata?.openai as { phase?: string } | undefined)?.phase;
         stopDetails = stopDetailsFrom(part.providerMetadata);
+        break;
+      case 'warning':
+        // A wire's own notice about the response (2.3: Anthropic's
+        // input_transformations) never passed the call's sink. Record it in an
+        // enclosing loop's sink (a no-op for a warning the sink streamed) and
+        // on this step, so a result reports it like any other warning.
+        internal?.warnings?.add(part.warning);
+        streamed.push(part.warning);
         break;
       case 'text-delta':
         text += part.text;
@@ -346,6 +356,11 @@ export async function runOneStep(
   );
   if (messagePhase) assistantMessage.providerMetadata = { openai: { phase: messagePhase } };
 
+  // `warnings` never rejects by contract (core/inference.ts resolves it from
+  // the pump's `finally`), so awaiting it here cannot fail the step.
+  const listed = result.warnings ? await result.warnings : undefined;
+  const warnings = listed || streamed.length > 0 ? withStreamed(listed ?? [], streamed) : undefined;
+
   return {
     text,
     reasoningText: turn.reasoningText,
@@ -356,8 +371,19 @@ export async function runOneStep(
     ...(stopDetails ? { stopDetails } : {}),
     assistantMessage,
     ...(result.observation ? { observation: result.observation } : {}),
-    // `warnings` never rejects by contract (core/inference.ts resolves it from
-    // the pump's `finally`), so awaiting it here cannot fail the step.
-    ...(result.warnings ? { warnings: await result.warnings } : {}),
+    ...(warnings ? { warnings } : {}),
   };
+}
+
+/** `listed` plus the streamed warnings it lacks, by the sink's own identity rule. */
+function withStreamed(listed: CallWarning[], streamed: CallWarning[]): CallWarning[] {
+  const key = (w: CallWarning): string => `${w.type} ${w.setting ?? ''} ${w.message}`;
+  const known = new Set(listed.map(key));
+  const out = [...listed];
+  for (const warning of streamed) {
+    if (known.has(key(warning))) continue;
+    known.add(key(warning));
+    out.push(warning);
+  }
+  return out;
 }
