@@ -880,6 +880,7 @@ export function createMcpServer(options: McpServerOptions): DeuzMcpServer {
         }
         return instance;
       },
+    report,
   };
 
   let handler: Promise<V2HttpHandler> | undefined;

@@ -26,6 +26,8 @@ export interface McpServerInternals {
    * it resolves with a fresh `McpServer` that has every tool registered.
    */
   factory(transport: McpServerTransportKind): (ctx: { era: McpServerEra }) => Promise<unknown>;
+  /** The server's `onError` sink (never throws), shared by every transport. */
+  report(error: unknown): void;
 }
 
 /** The registered key the internals live under on a `DeuzMcpServer` handle. */
