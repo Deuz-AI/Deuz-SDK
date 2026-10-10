@@ -201,6 +201,63 @@ describe('useChat — approval verdicts are matched to the open gate (F06)', () 
     ]);
   });
 
+  it('a stale card for a RECYCLED approval id answers nothing when it echoes its own token', async () => {
+    // Both gates pause on `tool_0` (an OpenAI-compatible server that omits call
+    // ids), so only the token minted for each request tells the two apart.
+    const route = recordingFetch((round) => {
+      if (round > 2) return postResponse([parts.text('Both gone.'), parts.finish()]);
+      const input = { p: round === 1 ? '/x' : '/y' };
+      return postResponse([
+        parts.toolCall('tool_0', 'del', input),
+        parts.approval('tool_0', 'tool_0', 'del', input, `tok-${round}`),
+        parts.finish(),
+      ]);
+    });
+    const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: route.fetch }));
+    await act(async () => {
+      await result.current.sendMessage('delete /x then /y');
+    });
+    await waitFor(() => expect(result.current.pendingApprovals).toHaveLength(1));
+    const first = result.current.pendingApprovals[0]!; // what a stale card's closure keeps
+
+    await act(async () => {
+      await result.current.addToolApprovalResponse({
+        approvalId: first.approvalId,
+        approved: true,
+        token: first.token,
+      });
+    });
+    await waitFor(() =>
+      expect(result.current.pendingApprovals.map((a) => a.token)).toEqual(['tok-2']),
+    );
+    expect(route.bodies).toHaveLength(2);
+
+    // The first card answers again: the same id, but the first request's token.
+    await act(async () => {
+      await result.current.addToolApprovalResponse({
+        approvalId: first.approvalId,
+        approved: false,
+        token: first.token,
+      });
+    });
+    expect(route.bodies).toHaveLength(2);
+    expect(result.current.pendingApprovals.map((a) => a.token)).toEqual(['tok-2']);
+
+    const second = result.current.pendingApprovals[0]!;
+    await act(async () => {
+      await result.current.addToolApprovalResponse({
+        approvalId: second.approvalId,
+        approved: true,
+        token: second.token,
+      });
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(route.bodies).toHaveLength(3);
+    expect(route.bodies[2]!.approvalResponses).toEqual([
+      { approvalId: 'tool_0', approved: true, token: 'tok-2' },
+    ]);
+  });
+
   it('a gate replaced by setHistory takes its approvals with it: a late verdict is a no-op', async () => {
     const route = gatedRoute([{ approvalId: 'a1', toolCallId: 't1', toolName: 'del' }]);
     const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: route.fetch }));
