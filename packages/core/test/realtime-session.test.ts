@@ -7,9 +7,11 @@ import {
   type RealtimeEvent,
 } from '../src/realtime';
 import { tool } from '../src/tool';
+import type { JSONSchema } from '../src/types/schema';
 import {
   fakeRealtimeServer,
   openaiHandshake,
+  geminiHandshake,
   flush,
   FakeRealtimeSocket,
 } from './fixtures/realtime-socket';
@@ -321,5 +323,116 @@ describe('session lifecycle edges', () => {
         model: { provider: 'acme', modelId: 'x', surface: 'acme-live' as never },
       }),
     ).toThrow(RealtimeError);
+  });
+});
+
+describe('tool calls handled from inside a tool-call listener', () => {
+  const CITY: JSONSchema = {
+    type: 'object',
+    properties: { city: { type: 'string' } },
+    required: ['city'],
+  };
+
+  /** A logger that records what the session swallowed (the default one is silent). */
+  function recordingLogger(sink: string[]) {
+    return {
+      debug() {},
+      info() {},
+      warn() {},
+      error: (message: string, fields?: Record<string, unknown>) =>
+        sink.push(`${message} ${String(fields?.error ?? '')}`),
+    };
+  }
+
+  it('OpenAI: a client tool answered synchronously from on("tool-call") reaches the wire', async () => {
+    const swallowed: string[] = [];
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      tools: { get_weather: tool({ parameters: CITY }) }, // a client tool: no execute
+      deps: { webSocket: server.webSocket, logger: recordingLogger(swallowed) },
+    });
+    session.on('tool-call', (event) => session.sendToolResult(event.toolCallId, { tempC: 19 }));
+    await session.connect();
+    const baseline = server.socket.sent.length;
+
+    server.socket.push({
+      type: 'response.done',
+      event_id: 'e',
+      response: {
+        id: 'resp_1',
+        status: 'completed',
+        output: [
+          {
+            type: 'function_call',
+            call_id: 'call_1',
+            name: 'get_weather',
+            arguments: '{"city":"Paris"}',
+          },
+        ],
+      },
+    });
+    await flush();
+
+    expect(server.socket.messages.slice(baseline)).toEqual([
+      {
+        type: 'conversation.item.create',
+        item: { type: 'function_call_output', call_id: 'call_1', output: '{"tempC":19}' },
+      },
+      expect.objectContaining({ type: 'response.create' }),
+    ]);
+    expect(swallowed).toEqual([]);
+    // Answered once: a second answer is refused as before.
+    expect(() => session.sendToolResult('call_1', 'again')).toThrow(
+      expect.objectContaining({ kind: 'tool' }),
+    );
+  });
+
+  it('Gemini: a synchronous answer joins the batch with its executed sibling', async () => {
+    const swallowed: string[] = [];
+    const server = fakeRealtimeServer((socket) => geminiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createGeminiLive({ apiKey: 'g-key' })('gemini-live-2.5-flash-preview'),
+      tools: {
+        get_location: tool({ parameters: { type: 'object' } }), // a client tool
+        get_weather: tool({ parameters: CITY, execute: async () => 'sunny' }),
+      },
+      deps: { webSocket: server.webSocket, logger: recordingLogger(swallowed) },
+    });
+    const events: RealtimeEvent[] = [];
+    session.on('*', (event) => events.push(event));
+    session.on('tool-call', (event) => {
+      if (event.toolName === 'get_location') session.sendToolResult(event.toolCallId, 'Rome');
+    });
+    await session.connect();
+    const baseline = server.socket.sent.length;
+
+    server.socket.push({
+      toolCall: {
+        functionCalls: [
+          { id: 'fc_1', name: 'get_location', args: {} },
+          { id: 'fc_2', name: 'get_weather', args: { city: 'Rome' } },
+        ],
+      },
+    });
+    await flush();
+
+    expect(server.socket.messages.slice(baseline)).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [
+            { id: 'fc_1', name: 'get_location', response: { output: 'Rome' } },
+            { id: 'fc_2', name: 'get_weather', response: { output: 'sunny' } },
+          ],
+        },
+      },
+    ]);
+    expect(swallowed).toEqual([]);
+    // Each result follows its own call.
+    const order = events
+      .filter((event) => event.type === 'tool-call' || event.type === 'tool-result')
+      .map((event) => `${event.type}:${(event as { toolCallId: string }).toolCallId}`);
+    expect(order.indexOf('tool-result:fc_1')).toBeGreaterThan(order.indexOf('tool-call:fc_1'));
+    expect(order.indexOf('tool-result:fc_2')).toBeGreaterThan(order.indexOf('tool-call:fc_2'));
   });
 });

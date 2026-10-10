@@ -154,6 +154,12 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
     }
   }
 
+  /** A call the app answers with `sendToolResult`: a known function tool without `execute`. */
+  function isClientCall(call: DecodedToolCall): boolean {
+    const tool = options.tools?.[call.toolName];
+    return !!tool && tool.type !== 'provider' && !tool.execute && call.argsError === undefined;
+  }
+
   async function run(batch: Batch, call: DecodedToolCall): Promise<void> {
     const tool = options.tools?.[call.toolName];
     if (!tool || tool.type === 'provider') {
@@ -164,11 +170,9 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
       settle(batch, call, `Invalid arguments: ${call.argsError}`, true);
       return;
     }
-    if (!tool.execute) {
-      clientCalls.set(call.toolCallId, { batch, call });
-      return;
-    }
     const execute = tool.execute;
+    // A client call is registered by `dispatch` and answered by `sendToolResult`.
+    if (!execute) return;
     const controller = new AbortController();
     running.set(call.toolCallId, controller);
     const ctx: ToolExecuteContext = {
@@ -229,6 +233,10 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
       if (closed || calls.length === 0) return;
       const batch: Batch = { calls, outcomes: new Map(), cancelled: new Set(), flushed: false };
       open.add(batch);
+      // A client call waits for its answer from the moment it is announced, so a
+      // listener may answer it synchronously, inside `on('tool-call')`.
+      const clientSide = new Set(calls.filter(isClientCall));
+      for (const call of clientSide) clientCalls.set(call.toolCallId, { batch, call });
       for (const call of calls) {
         options.emit({
           type: 'tool-call',
@@ -238,7 +246,7 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
           ...(responseId ? { responseId } : {}),
         });
       }
-      for (const call of calls) void run(batch, call);
+      for (const call of calls) if (!clientSide.has(call)) void run(batch, call);
     },
 
     resolveClientCall(toolCallId, result, isError) {
