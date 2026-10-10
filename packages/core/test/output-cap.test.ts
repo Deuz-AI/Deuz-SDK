@@ -211,7 +211,7 @@ async function reserveOnce(
   ).rejects.toThrow();
   const [record] = execution.ledger.snapshot().reservations;
   expect(record?.state).toBe('released');
-  return { model, wire: WIRES[surface].read(body!), reservation: record!.reservation };
+  return { model, body, wire: WIRES[surface].read(body!), reservation: record!.reservation };
 }
 
 describe('native reservation covers the wire cap (F12)', () => {
@@ -252,6 +252,23 @@ describe('native reservation covers the wire cap (F12)', () => {
     expect(oneHour.reservation.tokens).toBe(plain.reservation.tokens);
     expect(fiveMinutes.reservation.usd).toBeGreaterThan(plain.reservation.usd!);
     expect(oneHour.reservation.usd).toBeGreaterThan(fiveMinutes.reservation.usd!);
+  });
+
+  it('prices the prompt at the input rate on a wire that writes no cache', async () => {
+    // Gemini native sends no cache field, so `promptCaching` changes nothing the
+    // provider bills, its long-context tier above 200k prompt tokens included.
+    const prompt = 'lorem ipsum dolor sit amet '.repeat(42_000);
+    const plain = await reserveOnce('native', {}, prompt, 'gemini-3.1-pro-preview');
+    const cached = await reserveOnce(
+      'native',
+      { promptCaching: 'auto' },
+      prompt,
+      'gemini-3.1-pro-preview',
+    );
+    expect(cached.body).toEqual(plain.body);
+    expect(plain.reservation.tokens! - (plain.wire as number)).toBeGreaterThan(200_000);
+    // Before: the prompt was priced as a cache write, which skipped the tier (35% less).
+    expect(cached.reservation).toEqual(plain.reservation);
   });
 
   /** A Claude turn that bills `output` output tokens. */

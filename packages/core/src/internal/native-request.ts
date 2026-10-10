@@ -106,17 +106,21 @@ export function createNativeRequest(
         Math.ceil(JSON.stringify(internal.tools?.tools ?? []).length / 3.6);
       // F12 (2.3): reserve the output cap the wire actually sends (Anthropic's
       // thinking raise included), not a fixed 4,096 — the provider may bill up
-      // to it, reasoning included. A prompt cached by this call is billed as a
-      // cache write, the dearest input rate. Only a call with no token or USD
-      // bound can leave the cap off (see `capped`); nothing is admitted against
-      // its reservation, so the row's placeholder is an estimate there.
+      // to it, reasoning included. Only a call with no token or USD bound can
+      // leave the cap off (see `capped`); nothing is admitted against its
+      // reservation, so the row's placeholder is an estimate there.
       const outputTokens =
         wireOutputCap(options.model.surface, caps, callOptions, modelId) ?? caps.maxOutput;
+      // A prompt the call caches is billed as a cache write, above the input
+      // rate. Only the Anthropic wire writes one, for a row that caches; every
+      // other wire bills the prompt as input, long-context tiers included.
+      const cacheWrite =
+        options.model.surface === 'anthropic' && caps.caching ? options.promptCaching : undefined;
       const estimatedUsage: Usage = {
         ...EMPTY_USAGE,
-        ...(options.promptCaching === 'auto-1h'
+        ...(cacheWrite === 'auto-1h'
           ? { cacheWrite1hTokens: promptTokens }
-          : options.promptCaching
+          : cacheWrite
             ? { cacheWriteTokens: promptTokens }
             : { inputTokens: promptTokens }),
         outputTokens,

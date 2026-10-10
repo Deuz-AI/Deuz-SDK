@@ -76,7 +76,8 @@ registry (128 000 tokens for several current models). Anthropic raises it to the
 thinking budget plus 1 024 while extended thinking runs, even over an explicit
 `maxOutputTokens`. Reasoning tokens are part of the output, so the cap covers
 them. A prompt the call caches with `promptCaching` is priced at the cache-write
-rate.
+rate on Anthropic, the only wire that writes a cache. The other wires bill it as
+input, so it is priced as input there, long-context tiers included.
 
 Some rows document no output limit: a model the registry does not know, and
 models whose limit is not published, such as `gpt-6-astra`, `gpt-5.6` and
