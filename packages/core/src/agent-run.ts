@@ -659,10 +659,25 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       if (resume && unreconciled.length) {
         // This is a recoverable interruption, so do not replace the checkpoint
         // with a terminal record that would prevent an explicit reconciliation.
+        // Which calls are unknown is part of the result (2.3), and each is
+        // reported on the stream as an unknown effect.
+        for (const receipt of unreconciled) {
+          emitPart(
+            {
+              type: 'tool-state',
+              toolCallId: receipt.toolCallId,
+              toolName: receipt.toolName,
+              state: 'error',
+              outcome: 'unknown-effect',
+            },
+            'running',
+          );
+        }
         const outcome: AgentResult<T> = {
           ...base(),
           status: 'stopped',
           reason: 'tool-reconciliation-required',
+          unknownEffects: structuredClone(unreconciled),
         };
         settledOutcome = outcome;
         return;

@@ -124,7 +124,18 @@ export type AgentResult<T = string> = AgentResultBase &
         pendingApprovals: ToolApprovalRequest[];
         pendingClientCalls: ToolCall[];
       }
-    | { status: 'stopped'; reason: string }
+    | {
+        status: 'stopped';
+        reason: string;
+        /**
+         * With reason `'tool-reconciliation-required'` (2.3): the receipts of the
+         * calls whose effect is unknown — each started (stage `'executing'`) and
+         * its outcome was never recorded. Check each effect in the system it
+         * touched, then resume with `retryToolCallIds` for the ones to run
+         * again; a tool declared `replay: 'idempotent'` runs again by itself.
+         */
+        unknownEffects?: AgentToolReceipt[];
+      }
     | { status: 'failed'; error: { name: string; message: string; code?: string } }
   );
 

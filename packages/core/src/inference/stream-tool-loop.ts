@@ -3,7 +3,14 @@ import type { CallWarning, StopDetails, StreamChatResult } from '../types/method
 import type { GuardrailPart, StreamPart, ToolRunState } from '../types/stream';
 import type { Message } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
-import type { ToolCall, ToolSet, StepResult, ToolApprovalRequest } from '../types/tool';
+import type {
+  ToolCall,
+  ToolCallOutcome,
+  ToolResult,
+  ToolSet,
+  StepResult,
+  ToolApprovalRequest,
+} from '../types/tool';
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import type { WireToolRequest } from '../adapters/types';
 import { runStream } from '../core/inference';
@@ -51,6 +58,7 @@ import {
   shouldStop,
   sumUsage,
   planToolDispatch,
+  policyRefusalOf,
   settlePendingApprovals,
   saveCheckpoint,
   prepareChatPersistence,
@@ -570,6 +578,12 @@ export function runStreamToolLoop(
       terminalError = error;
       // What the run collected still reaches the stream (2.3).
       flushWarnings();
+      // A call the execution policy refused ends the run; the stream still says
+      // which call it was, and why (2.3), before the error.
+      const refused = policyRefusalOf(error);
+      if (refused !== undefined) {
+        toolState(refused, toolNames.get(refused), 'error', undefined, 'permission-denied');
+      }
       broadcaster.push({ type: 'error', error });
       usageDeferred.reject(error);
       finishDeferred.reject(error);
@@ -646,11 +660,15 @@ export function runStreamToolLoop(
     // call a human refused. It changes ONLY what the UI is told — the model
     // still receives the same is_error tool_result it always did, and the
     // reason is the one the denier supplied (never invented here).
+    //
+    // `outcome` (2.3) names what the dispatch contract decided — set with a
+    // terminal 'error' and with 'awaiting-approval'.
     const toolState = (
       toolCallId: string,
       toolName: string | undefined,
       state: ToolRunState,
       denial?: Denial,
+      outcome?: ToolCallOutcome,
     ): void => {
       broadcaster.push({
         type: 'tool-state',
@@ -660,7 +678,22 @@ export function runStreamToolLoop(
         ...(denial
           ? { denied: true, ...(denial.reason ? { deniedReason: denial.reason } : {}) }
           : {}),
+        ...(outcome ? { outcome } : {}),
       });
+    };
+    /** The tool name behind each streamed `tool-call` id (a policy refusal names only the id). */
+    const toolNames = new Map<string, string>();
+    /** The `tool-result` part and terminal `tool-state` part for one settled call. */
+    const publishResult = (r: ToolResult, denial?: Denial): void => {
+      broadcaster.push({
+        type: 'tool-result',
+        toolCallId: r.toolCallId,
+        toolName: r.toolName,
+        output: r.result,
+        ...(r.isError ? { isError: true } : {}),
+        ...(r.outcome ? { outcome: r.outcome } : {}),
+      });
+      toolState(r.toolCallId, r.toolName, r.isError ? 'error' : 'complete', denial, r.outcome);
     };
 
     try {
@@ -731,23 +764,11 @@ export function runStreamToolLoop(
           messages = settled.messages;
           emitGuardrails(settled.guardrails);
           for (const r of settled.results) {
-            broadcaster.push({
-              type: 'tool-result',
-              toolCallId: r.toolCallId,
-              toolName: r.toolName,
-              output: r.result,
-              ...(r.isError ? { isError: true } : {}),
-            });
             // The resume leg's verdicts (explicit `approvalResponses` denial,
             // default-deny, an unverifiable signed approval, a client tool the
             // caller never answered) carry the reason the CLIENT supplied — it
             // reaches the UI here or nowhere.
-            toolState(
-              r.toolCallId,
-              r.toolName,
-              r.isError ? 'error' : 'complete',
-              settled.denied.get(r.toolCallId),
-            );
+            publishResult(r, settled.denied.get(r.toolCallId));
           }
           // A transfer left unanswered by an earlier leg is applied HERE: from
           // this point the resume leg is the target agent.
@@ -1372,6 +1393,7 @@ export function runStreamToolLoop(
             input: c.args,
           });
           toolState(c.toolCallId, c.toolName, 'input-complete');
+          toolNames.set(c.toolCallId, c.toolName);
         }
         messages = [...messages, assistantMessage];
         appended.push(assistantMessage);
@@ -1395,6 +1417,7 @@ export function runStreamToolLoop(
           // An approval is bound to the run and to the checkpoint its suspension
           // writes next (2.3); a call without a session binds neither.
           approval: { runId: durable?.runId, step: durable ? durable.stepIndex + 1 : undefined },
+          clock: deps.clock,
           ...(observeCtx ? { observe: observeCtx } : {}),
         });
         emitGuardrails(plan.guardrails);
@@ -1419,16 +1442,7 @@ export function runStreamToolLoop(
          */
         const commitHandoffOnBreak = (): Message | undefined => {
           if (!handoffDecision) return undefined;
-          for (const r of handoffDecision.results) {
-            broadcaster.push({
-              type: 'tool-result',
-              toolCallId: r.toolCallId,
-              toolName: r.toolName,
-              output: r.result,
-              ...(r.isError ? { isError: true } : {}),
-            });
-            toolState(r.toolCallId, r.toolName, r.isError ? 'error' : 'complete');
-          }
+          for (const r of handoffDecision.results) publishResult(r);
           const message: Message = {
             role: 'tool',
             content: handoffDecision.results.map(toToolResultPart),
@@ -1469,7 +1483,9 @@ export function runStreamToolLoop(
         if (pendingApproval.length > 0 || clientCalls.length > 0) {
           const requests = await signApprovalRequests(plan.requests, options, deps, durable?.runId);
           const handoffMessage = commitHandoffOnBreak();
-          for (const c of pendingApproval) toolState(c.toolCallId, c.toolName, 'awaiting-approval');
+          for (const c of pendingApproval) {
+            toolState(c.toolCallId, c.toolName, 'awaiting-approval', undefined, 'approval-pending');
+          }
           if (options.session?.durability !== 'strict') emitApprovalRequests(requests);
           const sr = toStepResult(
             stepData,
@@ -1592,22 +1608,10 @@ export function runStreamToolLoop(
           toolResults = mergeResultsInCallOrder(toolCalls, toolResults, handoffDecision.results);
         }
         for (const r of toolResults) {
-          broadcaster.push({
-            type: 'tool-result',
-            toolCallId: r.toolCallId,
-            toolName: r.toolName,
-            output: r.result,
-            ...(r.isError ? { isError: true } : {}),
-          });
           // Server mode: `approveToolCall` said no (or threw). The verdict is a
-          // boolean, so there is no reason string to relay — `denied: true`
-          // alone is what separates "refused" from "failed".
-          toolState(
-            r.toolCallId,
-            r.toolName,
-            r.isError ? 'error' : 'complete',
-            denied.get(r.toolCallId),
-          );
+          // boolean, so there is no reason string to relay — `denied: true` and
+          // the outcome are what separate "refused" from "failed".
+          publishResult(r, denied.get(r.toolCallId));
         }
         const toolResultMessage: Message = {
           role: 'tool',

@@ -7,6 +7,7 @@ import type {
   ToolSet,
   ToolChoice,
   ToolCall,
+  ToolCallOutcome,
   ToolResult,
   ToolExecuteContext,
   ToolApprovalRequest,
@@ -100,6 +101,18 @@ export function preserveClientContext<O extends object>(source: object, cloned: 
 export const TOOL_DENIED = 'Tool call denied.';
 
 /**
+ * The tool call an execution-policy refusal names (2.3), when `error` is one:
+ * the run fails, and the loop reports that call as `'permission-denied'` first.
+ * Read structurally, so the eager loop bundle does not load the policy module.
+ */
+export function policyRefusalOf(error: unknown): string | undefined {
+  const e = error as { name?: unknown; toolCallId?: unknown } | null;
+  return e && e.name === 'ExecutionPolicyError' && typeof e.toolCallId === 'string'
+    ? e.toolCallId
+    : undefined;
+}
+
+/**
  * A denial verdict for one tool call. `reason` is the free-text fed back to
  * the model (unchanged strings); `cause` is the machine-readable origin for
  * tool.denied observe events — it cannot be parsed from the strings.
@@ -107,6 +120,12 @@ export const TOOL_DENIED = 'Tool call denied.';
 export interface Denial {
   cause: ToolDeniedEvent['cause'];
   reason?: string;
+  /**
+   * What the result reports (2.3): which step of the dispatch contract refused
+   * the call. `cause` cannot say it: a guardrail block reports `'server-denied'`
+   * like an approver's no, because the observe union is locked.
+   */
+  outcome: ToolCallOutcome;
 }
 export type DenialMap = Map<string, Denial>;
 
@@ -472,7 +491,7 @@ export async function resolveServerApprovals(
         } catch {
           ok = false;
         }
-        if (!ok) denied.set(c.toolCallId, { cause: 'server-denied' });
+        if (!ok) denied.set(c.toolCallId, { cause: 'server-denied', outcome: 'approval-denied' });
       }),
   );
   return denied;
@@ -1055,6 +1074,7 @@ export async function applyToolCallGuardrails(
           // it reports as 'server-denied' and the reason string carries the rest.
           cause: 'server-denied',
           reason: guardrailDenialReason(guardrailName(guard), verdict.reason),
+          outcome: 'permission-denied',
         });
         denied = true;
         break;
@@ -1138,6 +1158,8 @@ export async function applyToolResultGuardrails(
           toolName: original.toolName,
           result: guardrailDenialReason(guardrailName(guard), verdict.reason),
           isError: true,
+          // The call ran; the policy withheld its output from the model.
+          outcome: 'permission-denied',
         };
         break;
       }
@@ -1325,6 +1347,7 @@ export function decideHandoff(
         toolName: call.toolName,
         result: `Handoff limit (${max}) reached; continue yourself.`,
         isError: true,
+        outcome: 'permission-denied',
       });
     }
     return { results };
@@ -1343,6 +1366,7 @@ export function decideHandoff(
       toolName: call.toolName,
       result: `Ignored: already transferred to '${to}' this step.`,
       isError: true,
+      outcome: 'permission-denied',
     });
   }
   return {
@@ -2007,6 +2031,8 @@ export interface ToolDispatchInput {
   verdicts?: readonly ToolApprovalResponse[];
   /** What the batch's approvals are bound to besides the calls (see {@link ApprovalScope}). */
   approval?: ApprovalScope;
+  /** The injected clock: the execution policy's deadline is checked against it. */
+  clock?: Clock;
   observe?: ExecuteExtras['observe'];
 }
 
@@ -2021,6 +2047,21 @@ export interface ToolDispatchInput {
 export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDispatchPlan> {
   const { calls: issued, tools, options, messages, stepIndex, verdicts, observe } = input;
   const settle = verdicts !== undefined;
+  // Policy first (2.3): the run's execution policy refuses a call it forbids
+  // before anything else happens to the batch — no guardrail runs on it, no
+  // human is asked to approve it, no sibling starts, no receipt is written. A
+  // refusal is fatal (`ExecutionPolicyError`, naming the call), as before 2.3;
+  // only its place in the order moved. Transfers and client tools are calls too.
+  if (options.execution) {
+    const { assertExecutionPolicy } = await import('../internal/native-request');
+    for (const call of issued) {
+      assertExecutionPolicy(options.execution, {
+        toolName: call.toolName,
+        toolCallId: call.toolCallId,
+        now: input.clock?.now(),
+      });
+    }
+  }
   const catalog = input.handoff?.tools;
   // Transfers are decided by looking at the call, before the guardrails and the
   // approval gate. A settle also reads the run's whole transfer catalog: an
@@ -2228,6 +2269,7 @@ export async function settlePendingApprovals(
     ...(handoff ? { handoff } : {}),
     verdicts: responses,
     approval: scope,
+    ...(extras?.deps ? { clock: extras.deps.clock } : {}),
     ...(extras?.observe ? { observe: extras.observe } : {}),
   });
 
@@ -2340,9 +2382,14 @@ async function settleVerdicts(
         denied.set(c.toolCallId, {
           cause: 'response-denied',
           reason: 'Duplicate approval verdicts.',
+          outcome: 'approval-denied',
         });
       } else if (!verdict.approved) {
-        denied.set(c.toolCallId, { cause: 'response-denied', reason: verdict.reason });
+        denied.set(c.toolCallId, {
+          cause: 'response-denied',
+          reason: verdict.reason,
+          outcome: 'approval-denied',
+        });
       } else if (signer) {
         // Signed-approval enforcement (1.7, D4): an APPROVAL must echo a token
         // that verifies, matches this approvalId, and — on durable runs —
@@ -2379,6 +2426,7 @@ async function settleVerdicts(
           denied.set(c.toolCallId, {
             cause: 'response-denied',
             reason: 'Approval token missing, invalid, expired, or bound to another run.',
+            outcome: 'approval-denied',
           });
         }
       }
@@ -2386,11 +2434,16 @@ async function settleVerdicts(
       denied.set(c.toolCallId, {
         cause: 'client-tool-no-result',
         reason: 'No result provided for this client tool.',
+        outcome: 'tool-error',
       });
       // A HALLUCINATED name is not a client tool (1.9): no denial is recorded so
       // it reaches executeTools and gets the actionable unknown-tool is_error.
     } else if (gated.has(c.toolCallId)) {
-      denied.set(c.toolCallId, { cause: 'no-response', reason: 'No approval response.' });
+      denied.set(c.toolCallId, {
+        cause: 'no-response',
+        reason: 'No approval response.',
+        outcome: 'approval-denied',
+      });
     }
   }
 
@@ -2630,6 +2683,7 @@ export async function executeTools(
       if (options.execution) {
         nativePolicy!.assertExecutionPolicy(options.execution, {
           toolName: call.toolName,
+          toolCallId: call.toolCallId,
           now: extras?.deps?.clock.now(),
         });
         if (options.signal?.aborted)
@@ -2695,6 +2749,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: denial.reason ? `${TOOL_DENIED} Reason: ${denial.reason}` : TOOL_DENIED,
             isError: true,
+            outcome: denial.outcome,
           });
         }
         if (!tool) {
@@ -2715,6 +2770,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: message,
             isError: true,
+            outcome: 'tool-error',
           });
         }
         if (!tool.execute) {
@@ -2724,6 +2780,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: 'No server-side executor.',
             isError: true,
+            outcome: 'tool-error',
           });
         }
         // Arguments that never parsed reach here as their raw JSON text (2.3,
@@ -2742,6 +2799,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: message,
             isError: true,
+            outcome: 'tool-error',
           });
         }
         const validation = await validateOutput(tool.parameters, call.args);
@@ -2752,6 +2810,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: `Invalid arguments: ${validation.issues}`,
             isError: true,
+            outcome: 'tool-error',
           });
         }
         // Per-execution cap (1.9): the tool's OWN `timeoutMs` outranks the call's
@@ -2815,6 +2874,7 @@ export async function executeTools(
             if (options.execution) {
               nativePolicy!.assertExecutionPolicy(options.execution, {
                 toolName: call.toolName,
+                toolCallId: call.toolCallId,
                 now: clock?.now(),
               });
               if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('Execution cancelled.');
@@ -2854,6 +2914,7 @@ export async function executeTools(
               toolName: call.toolName,
               result: message,
               isError: true,
+              outcome: 'tool-error',
             });
           }
           const out = outcome.value;
@@ -2886,6 +2947,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: err.message,
             isError: true,
+            outcome: 'tool-error',
           });
         }
       } catch (cause) {

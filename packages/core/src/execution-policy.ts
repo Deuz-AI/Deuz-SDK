@@ -22,12 +22,16 @@ export type ExecutionPolicyErrorCode =
 export class ExecutionPolicyError extends Error {
   readonly name = 'ExecutionPolicyError';
   readonly fatalExecution = true;
+  /** The tool call the policy refused (2.3), when a tool call was checked. */
+  readonly toolCallId?: string;
 
   constructor(
     readonly code: ExecutionPolicyErrorCode,
     message: string,
+    call?: { toolCallId?: string },
   ) {
     super(message);
+    if (call?.toolCallId !== undefined) this.toolCallId = call.toolCallId;
   }
 }
 
@@ -106,6 +110,8 @@ export function intersectExecutionPolicies(
 
 export interface ExecutionPolicyCheck {
   readonly toolName?: string;
+  /** The checked tool call (2.3): a refusal names it on `ExecutionPolicyError.toolCallId`. */
+  readonly toolCallId?: string;
   readonly modelId?: string;
   /** Injected clock value. Required for contexts with an absolute deadline. */
   readonly now?: number;
@@ -117,10 +123,13 @@ export function assertExecutionPolicy(
   check: ExecutionPolicyCheck = {},
 ): void {
   const constraints = context.policy;
+  // A refusal of a tool call names it (2.3), so a run can report which call was refused.
+  const call = check.toolCallId !== undefined ? { toolCallId: check.toolCallId } : undefined;
   if (constraints.maxDepth !== undefined && context.depth > constraints.maxDepth) {
     throw new ExecutionPolicyError(
       'depth_exceeded',
       `Execution depth ${context.depth} exceeds ${constraints.maxDepth}.`,
+      call,
     );
   }
   if (constraints.deadlineAt !== undefined) {
@@ -128,10 +137,11 @@ export function assertExecutionPolicy(
       throw new ExecutionPolicyError(
         'invalid_context',
         'A current clock value is required to enforce the execution deadline.',
+        call,
       );
     }
     if (check.now >= constraints.deadlineAt)
-      throw new ExecutionPolicyError('deadline_exceeded', 'Execution deadline has elapsed.');
+      throw new ExecutionPolicyError('deadline_exceeded', 'Execution deadline has elapsed.', call);
   }
   if (
     check.toolName !== undefined &&
@@ -141,6 +151,7 @@ export function assertExecutionPolicy(
     throw new ExecutionPolicyError(
       'tool_not_allowed',
       `Tool is not allowed by execution policy: ${check.toolName}.`,
+      call,
     );
   }
   if (
