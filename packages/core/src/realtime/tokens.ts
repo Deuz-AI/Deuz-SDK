@@ -15,6 +15,7 @@
  */
 import { InvalidRequestError, UnsupportedCapabilityError } from '../errors';
 import { mapMediaError, readErrorBody } from '../internal/media-http';
+import { redactString } from '../internal/redact';
 import { resolveDependencies } from '../internal/resolve-deps';
 import type { ResolvedDependencies } from '../types/deps';
 import type { CallWarning } from '../types/methods';
@@ -49,10 +50,16 @@ function logWarning(deps: ResolvedDependencies): (warning: CallWarning) => void 
   return (warning) => deps.logger.warn(warning.message, { setting: warning.setting });
 }
 
+/** The key out of a provider-written message: some error bodies echo it back. */
+function scrubKey(text: string | undefined, apiKey: string): string | undefined {
+  return text === undefined ? undefined : redactString(text.split(apiKey).join('[redacted]'));
+}
+
 async function post(
   deps: ResolvedDependencies,
   provider: string,
   url: string,
+  apiKey: string,
   headers: Record<string, string>,
   body: unknown,
   signal: AbortSignal | undefined,
@@ -67,15 +74,15 @@ async function post(
     const error = obj(await readErrorBody(response)).error;
     // Google's envelope names the error in `status` ('PERMISSION_DENIED'), OpenAI's in `type`.
     const envelope = obj(error);
-    const normalized =
-      typeof error === 'object' && error !== null
-        ? {
-            error: {
-              message: str(envelope.message),
+    const normalized = {
+      error:
+        typeof error === 'object' && error !== null
+          ? {
+              message: scrubKey(str(envelope.message), apiKey),
               type: str(envelope.type) ?? str(envelope.status) ?? str(envelope.code),
-            },
-          }
-        : { error };
+            }
+          : scrubKey(str(error), apiKey),
+    };
     throw mapMediaError(provider, response.status, normalized, response.headers);
   }
   const json = obj(await response.json().catch(() => undefined));
@@ -122,6 +129,7 @@ export async function createOpenAIClientSecret(
     deps,
     model.provider,
     `${base}/realtime/client_secrets`,
+    apiKey,
     { authorization: `Bearer ${apiKey}`, ...config.headers },
     body,
     options.signal,
@@ -180,6 +188,7 @@ export async function createGeminiAuthToken(
     deps,
     model.provider,
     `${geminiBaseURL(config)}/v1alpha/auth_tokens`,
+    apiKey,
     { 'x-goog-api-key': apiKey, ...config.headers },
     body,
     options.signal,

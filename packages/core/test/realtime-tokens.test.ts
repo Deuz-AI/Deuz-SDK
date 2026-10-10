@@ -269,3 +269,33 @@ describe('ephemeral token edges', () => {
     ).rejects.toBeInstanceOf(InvalidRequestError);
   });
 });
+
+describe('ephemeral token error hygiene', () => {
+  it('scrubs the server key out of an error message the provider echoes back', async () => {
+    const key = 'sk-echoed-0123456789abcdef';
+    const { fetch } = jsonFetch(
+      { error: { message: `Incorrect API key provided: ${key}`, type: 'invalid_request_error' } },
+      401,
+    );
+    const failure = (await createOpenAIClientSecret({
+      model: createOpenAIRealtime({ apiKey: key })('gpt-realtime'),
+      deps: { fetch },
+    }).catch((error: unknown) => error)) as Error;
+    expect(failure).toBeInstanceOf(AuthenticationError);
+    expect(failure.message).toContain('Incorrect API key provided');
+    expect(failure.message).not.toContain(key);
+
+    const gemini = jsonFetch(
+      {
+        error: { code: 400, message: 'API key g-plain-key not valid', status: 'INVALID_ARGUMENT' },
+      },
+      400,
+    );
+    const geminiFailure = (await createGeminiAuthToken({
+      model: createGeminiLive({ apiKey: 'g-plain-key' })('gemini-live-2.5-flash-preview'),
+      deps: { fetch: gemini.fetch },
+    }).catch((error: unknown) => error)) as Error;
+    expect(geminiFailure).toBeInstanceOf(InvalidRequestError);
+    expect(geminiFailure.message).not.toContain('g-plain-key');
+  });
+});
