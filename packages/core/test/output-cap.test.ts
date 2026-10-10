@@ -57,9 +57,12 @@ const WIRES: Record<ModelSurface, Wire> = {
 
 const SURFACES = Object.keys(WIRES) as ModelSurface[];
 
-function modelFor(surface: ModelSurface, fetch?: typeof globalThis.fetch): LanguageModel {
-  const wire = WIRES[surface];
-  return wire.factory({ apiKey: 'k', ...(fetch ? { fetch } : {}) })(wire.modelId);
+function modelFor(
+  surface: ModelSurface,
+  fetch?: typeof globalThis.fetch,
+  modelId = WIRES[surface].modelId,
+): LanguageModel {
+  return WIRES[surface].factory({ apiKey: 'k', ...(fetch ? { fetch } : {}) })(modelId);
 }
 
 /** The cap the adapter itself puts on the wire for these capabilities and options. */
@@ -67,8 +70,9 @@ function builtCap(
   surface: ModelSurface,
   caps: ModelCapabilities,
   options: Pick<CommonCallOptions, 'maxOutputTokens' | 'effort'>,
+  modelId?: string,
 ): unknown {
-  const model = modelFor(surface);
+  const model = modelFor(surface, undefined, modelId);
   const { init } = WIRES[surface].adapter.buildRequest({
     call: {
       provider: model.provider,
@@ -96,6 +100,15 @@ const CAPS: Partial<ModelCapabilities>[] = [
   { reasoning: false, effortWire: 'budget_tokens', maxOutput: 4_096 },
   { reasoning: true, samplingRestrictions: true, maxOutput: 64_000 },
   { reasoning: false, samplingRestrictions: false, maxOutput: 2_048 },
+  // 2.3 rows: a level list clamps 'max' to 'high' (a smaller thinking budget),
+  // and 'none' can be sent as the lowest level (a thinking budget after all).
+  {
+    reasoning: true,
+    effortWire: 'budget_tokens',
+    maxOutput: 8_192,
+    effortLevels: ['low', 'medium', 'high'],
+  },
+  { reasoning: true, effortWire: 'budget_tokens', maxOutput: 8_192, effortNone: 'lowest' },
 ];
 
 describe('wire output cap (F12)', () => {
@@ -121,6 +134,31 @@ describe('wire output cap (F12)', () => {
         }
       }
       expect(compared).toBe(CAPS.length * EFFORTS.length * REQUESTED.length);
+    },
+  );
+
+  it.each(SURFACES)(
+    'matches what the %s adapter sends for a model the registry does not know',
+    (surface) => {
+      // A placeholder row: the optional-cap wires leave the cap off (C1, 2.3),
+      // Anthropic still sends its required max_tokens.
+      const modelId = 'deuz-unlisted-model-1';
+      const caps = getCapabilities(modelFor(surface, undefined, modelId));
+      for (const effort of EFFORTS) {
+        for (const maxOutputTokens of REQUESTED) {
+          const options = {
+            ...(effort !== undefined ? { effort } : {}),
+            ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+          };
+          expect(
+            { options, cap: wireOutputCap(surface, caps, options, modelId) },
+            `${surface} ${JSON.stringify(options)}`,
+          ).toEqual({ options, cap: builtCap(surface, caps, options, modelId) });
+        }
+      }
+      expect(wireOutputCap(surface, caps, {}, modelId)).toBe(
+        surface === 'anthropic' ? caps.maxOutput : undefined,
+      );
     },
   );
 

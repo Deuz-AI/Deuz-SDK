@@ -66,9 +66,13 @@ export function createNativeRequest(
       // F12 (2.3): reserve the output cap the wire actually sends (Anthropic's
       // thinking raise included), not a fixed 4,096 — the provider may bill up
       // to it, reasoning included. A prompt cached by this call is billed as a
-      // cache write, the dearest input rate.
+      // cache write, the dearest input rate. A model the registry does not know
+      // sends no cap on the OpenAI and Gemini wires; its reservation is then the
+      // row's placeholder, an estimate rather than a bound (`maxOutputTokens`
+      // makes it one).
       const caps = getCapabilities(options.model);
-      const outputTokens = wireOutputCap(options.model.surface, caps, options) ?? caps.maxOutput;
+      const outputTokens =
+        wireOutputCap(options.model.surface, caps, options, modelId) ?? caps.maxOutput;
       const estimatedUsage: Usage = {
         ...EMPTY_USAGE,
         ...(options.promptCaching === 'auto-1h'

@@ -16,6 +16,7 @@ import {
 import { extractSystem } from '../core/normalize';
 import type { EffortLevel } from '../core/registry';
 import {
+  anthropicMaxTokens,
   atMostHigh,
   describeToolChoice,
   effortWire,
@@ -195,17 +196,14 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   // still sent; the registry's `unknown-model` warning names that default and
   // the two ways to raise it (2.3).
   const requested = options.maxOutputTokens;
-  let maxTokens = requested ?? caps.maxOutput;
-  if (budget !== undefined && maxTokens < budget + 1_024) {
-    maxTokens = budget + 1_024;
-    if (requested !== undefined) {
-      reportClamp(
-        ctx,
-        'maxOutputTokens',
-        `maxOutputTokens ${requested} was raised to ${maxTokens}: thinking.budget_tokens ` +
-          `${budget} needs room for the answer (${call.modelId}).`,
-      );
-    }
+  const maxTokens = anthropicMaxTokens(caps, requested, budget);
+  if (requested !== undefined && maxTokens !== requested) {
+    reportClamp(
+      ctx,
+      'maxOutputTokens',
+      `maxOutputTokens ${requested} was raised to ${maxTokens}: thinking.budget_tokens ` +
+        `${budget} needs room for the answer (${call.modelId}).`,
+    );
   }
 
   const body: Record<string, unknown> = {

@@ -124,7 +124,20 @@ export function budgetPeers(
   return EFFORT_SCALE.filter((other) => other !== level && budgets[other] === budgets[level]);
 }
 
-type RequestContext = Pick<BuildContext, 'call' | 'logger' | 'warnings'>;
+/**
+ * What reporting needs. Without `warnings` and `logger` nothing is reported, so
+ * native admission can replay a rule silently (F12).
+ */
+type RequestContext = { call: Pick<BuildContext['call'], 'provider' | 'modelId'> } & Pick<
+  BuildContext,
+  'logger' | 'warnings'
+>;
+
+/** What {@link planEffort} reads. Every `BuildContext` is one. */
+export type EffortContext = RequestContext & {
+  caps: ModelCapabilities;
+  options: Pick<CommonCallOptions, 'effort'>;
+};
 
 /**
  * Report a value the request builder changed or dropped. Typed on the call's
@@ -202,7 +215,7 @@ export interface EffortPlan {
  * its budget with another is reported too. Effort is gated on `caps.reasoning`
  * exactly as before; `core/inference.ts` reports that drop.
  */
-export function planEffort(ctx: BuildContext, wire: EffortWire): EffortPlan {
+export function planEffort(ctx: EffortContext, wire: EffortWire): EffortPlan {
   const { caps, options, call } = ctx;
   const effort = options.effort;
   if (!caps.reasoning || effort === undefined) return {};
@@ -269,10 +282,26 @@ export function planEffort(ctx: BuildContext, wire: EffortWire): EffortPlan {
  */
 export function optionalOutputCap(
   caps: ModelCapabilities,
-  options: CommonCallOptions,
+  options: Pick<CommonCallOptions, 'maxOutputTokens'>,
 ): number | undefined {
   if (options.maxOutputTokens !== undefined) return options.maxOutputTokens;
   return isMaxOutputPlaceholder(caps) ? undefined : caps.maxOutput;
+}
+
+/**
+ * Anthropic's `max_tokens` (2.3). The field is REQUIRED on this wire, so an
+ * unknown model's placeholder is still sent. While extended thinking runs on a
+ * `budget_tokens` budget the cap is raised to `budget + 1024`, even over an
+ * explicit `maxOutputTokens`. The adapter and native admission both call this,
+ * so a reservation covers the cap the wire sends (F12).
+ */
+export function anthropicMaxTokens(
+  caps: ModelCapabilities,
+  requested: number | undefined,
+  budget: number | undefined,
+): number {
+  const cap = requested ?? caps.maxOutput;
+  return budget !== undefined && cap < budget + 1_024 ? budget + 1_024 : cap;
 }
 
 /** `'required'` or a named tool — the choices a model may refuse to be forced into. */
