@@ -634,6 +634,109 @@ describe('Gemini Live — configuration and edge cases', () => {
   });
 });
 
+describe('Gemini Live — output transcript chunks after turnComplete', () => {
+  // The output transcription is not ordered with the model turn (LiveServerContent
+  // docs in @google/genai): a chunk can follow the turnComplete of its turn.
+  const transcript = (text: string, finished?: boolean) => ({
+    serverContent: { outputTranscription: { text, ...(finished ? { finished } : {}) } },
+  });
+  const turnComplete = { serverContent: { turnComplete: true } };
+  const deterministic = () => {
+    let ids = 0;
+    return { generateId: () => `turn_${++ids}` };
+  };
+  const shape = (events: RealtimeEvent[]) =>
+    events.slice(1).map((event) => {
+      const { type, responseId, delta, transcript } = event as Record<string, unknown>;
+      return [type, responseId, delta ?? transcript].filter((part) => part !== undefined);
+    });
+
+  it('belongs to the turn that just ended and opens no new turn', async () => {
+    const { socket, events } = await openSession({ deps: deterministic() });
+    socket.push(audioPart('AAA='));
+    socket.push(transcript('Hello'));
+    socket.push(turnComplete);
+    socket.push(transcript(' there.'));
+    socket.push(audioPart('AAA='));
+    socket.push(transcript('Bye.'));
+    socket.push(turnComplete);
+    await flush();
+    expect(shape(events)).toEqual([
+      ['response-started', 'turn_1'],
+      ['audio-delta', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', 'Hello'],
+      ['audio-done', 'turn_1'],
+      ['output-transcript-done', 'turn_1', 'Hello'],
+      ['response-done', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', ' there.'],
+      // The whole transcript once the next turn starts.
+      ['output-transcript-done', 'turn_1', 'Hello there.'],
+      ['response-started', 'turn_2'],
+      ['audio-delta', 'turn_2'],
+      ['output-transcript-delta', 'turn_2', 'Bye.'],
+      ['audio-done', 'turn_2'],
+      ['output-transcript-done', 'turn_2', 'Bye.'],
+      ['response-done', 'turn_2'],
+    ]);
+  });
+
+  it('does not lose the usage report of the ended turn that follows a late chunk', async () => {
+    const { session, socket, events } = await openSession({ deps: deterministic() });
+    const usage = (total: number) => ({
+      promptTokenCount: total - 10,
+      responseTokenCount: 10,
+      totalTokenCount: total,
+    });
+    socket.push(audioPart('AAA='));
+    socket.push(turnComplete);
+    socket.push(transcript('tail'));
+    socket.push({ usageMetadata: usage(150) }); // the first turn's report, after turnComplete
+    socket.push(audioPart('AAA='));
+    socket.push({ ...turnComplete, usageMetadata: usage(260) });
+    await flush();
+    expect(session.usage.usage.totalTokens).toBe(410);
+    expect(
+      ofType(events, 'usage').map((event) => [event.responseId, event.usage.totalTokens]),
+    ).toEqual([
+      ['turn_1', 150],
+      ['turn_2', 260],
+    ]);
+    expect(ofType(events, 'response-started')).toHaveLength(2);
+  });
+
+  it('closes the late transcript on finished; a chunk after that starts a new turn', async () => {
+    const { socket, events } = await openSession({ deps: deterministic() });
+    socket.push(audioPart('AAA='));
+    socket.push(transcript('Hi'));
+    socket.push(turnComplete);
+    socket.push(transcript(' there', true));
+    socket.push(transcript('Next'));
+    await flush();
+    expect(shape(events).slice(-5)).toEqual([
+      ['response-done', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', ' there'],
+      ['output-transcript-done', 'turn_1', 'Hi there'],
+      ['response-started', 'turn_2'],
+      ['output-transcript-delta', 'turn_2', 'Next'],
+    ]);
+  });
+
+  it('ends a transcript that arrived wholly after turnComplete, at the latest on close', async () => {
+    const { session, socket, events } = await openSession({ deps: deterministic() });
+    socket.push(audioPart('AAA='));
+    socket.push(turnComplete);
+    socket.push(transcript('Sure.'));
+    await flush();
+    await session.close();
+    expect(shape(events).slice(-4)).toEqual([
+      ['response-done', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', 'Sure.'],
+      ['output-transcript-done', 'turn_1', 'Sure.'],
+      ['session-closed'],
+    ]);
+  });
+});
+
 describe('Gemini Live — usage reports across turn boundaries', () => {
   const report = (prompt: number, response: number) => ({
     promptTokenCount: prompt,

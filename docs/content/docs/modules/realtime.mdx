@@ -237,7 +237,7 @@ Subscribe with `session.on(type, listener)` (or `'*'` for everything; it returns
 | `input-transcript-delta` / `-done` | `itemId?`, `delta` / `transcript` | What the user said (with `inputTranscription`). |
 | `response-started` | `responseId` | A model turn began. Gemini's ids are generated locally. |
 | `audio-delta` / `audio-done` | `responseId?`, `itemId?`, `audio: Uint8Array` | Output audio in `session.audioFormat.output`. |
-| `output-transcript-delta` / `-done` | `responseId?`, `itemId?`, `delta` / `transcript` | What the model is saying. |
+| `output-transcript-delta` / `-done` | `responseId?`, `itemId?`, `delta` / `transcript` | What the model is saying. On Gemini, chunks can follow `response-done` (see below). |
 | `text-delta` / `text-done` | `responseId?`, `itemId?`, `delta` / `text` | Text output (`outputModality: 'text'`). |
 | `tool-call` / `tool-result` | `toolCallId`, `toolName`, `args` / `result`, `isError?` | See [tools](#tools). |
 | `tool-call-cancelled` | `toolCallIds`, `reason` | `'provider'` cancelled them, or `'response-not-completed'`. |
@@ -248,6 +248,8 @@ Subscribe with `session.on(type, listener)` (or `'*'` for everything; it returns
 | `warning` | `warning: CallWarning` | A setting the wire cannot carry, an unpriced model. |
 | `error` | `error: RealtimeError`, `fatal` | `fatal: true` means the session is closing. |
 | `raw` | `message` | Every parsed server frame, with `rawEvents: true`. |
+
+**Late Gemini transcripts.** Gemini does not order its output transcription with the model's audio, so a transcript chunk can arrive after its turn's `response-done`. The chunk keeps that turn's `responseId` and starts no new response. When Gemini marks the transcript finished, the next response starts or the session closes, an `output-transcript-done` carries the whole text. If the turn had already ended with part of the transcript, this is a second `output-transcript-done` for that `responseId`.
 
 ## Audio
 

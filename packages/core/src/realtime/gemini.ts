@@ -281,19 +281,39 @@ interface GeminiContext {
   activityOpen: boolean;
   readonly inputMime: string;
   turn: Turn | undefined;
-  /** The last finished turn, for a usage report that arrives after `turnComplete`. */
+  /** The last finished turn, for a usage report or transcript that arrives after `turnComplete`. */
   lastTurn:
     | {
         responseId: string | undefined;
         status: RealtimeResponseStatus;
         committed: DecodedUsage | undefined;
+        /** Its output transcript, which may still grow: transcription is not ordered with the turn. */
+        transcript?: string;
+        /** The provider marked that transcript finished: a later chunk starts a new turn. */
+        transcriptDone?: boolean;
+        /** Chunks arrived after `turnComplete` that no `output-transcript-done` carried yet. */
+        transcriptPending?: boolean;
       }
     | undefined;
   inputTranscript: string | undefined;
 }
 
+/** The ended turn's transcript again, whole, when chunks extended it after `turnComplete`. */
+function flushLateTranscript(ctx: GeminiContext): void {
+  const last = ctx.lastTurn;
+  if (!last?.transcriptPending || last.responseId === undefined) return;
+  last.transcriptPending = false;
+  ctx.sink.emit({
+    type: 'output-transcript-done',
+    responseId: last.responseId,
+    transcript: last.transcript ?? '',
+  });
+}
+
 function openTurn(ctx: GeminiContext): Turn {
   if (ctx.turn) return ctx.turn;
+  // A new turn starts: the ended turn's late transcript is complete.
+  flushLateTranscript(ctx);
   const turn: Turn = {
     responseId: ctx.sink.generateId(),
     audio: false,
@@ -373,7 +393,24 @@ const MESSAGE_FIELDS: ReadonlyArray<readonly [string, FieldHandler]> = [
 
       const output = obj(content.outputTranscription);
       const outputText = str(output.text);
-      if (outputText) {
+      const last = ctx.lastTurn;
+      if (!ctx.turn && last?.responseId !== undefined && !last.transcriptDone) {
+        // With no turn open, a chunk is the tail of the turn that just ended
+        // (until its transcript is marked finished): it opens no new turn.
+        if (outputText) {
+          last.transcript = (last.transcript ?? '') + outputText;
+          last.transcriptPending = true;
+          ctx.sink.emit({
+            type: 'output-transcript-delta',
+            responseId: last.responseId,
+            delta: outputText,
+          });
+        }
+        if (output.finished === true) {
+          last.transcriptDone = true;
+          flushLateTranscript(ctx);
+        }
+      } else if (outputText) {
         const turn = openTurn(ctx);
         turn.transcript = (turn.transcript ?? '') + outputText;
         ctx.sink.emit({
@@ -451,6 +488,7 @@ const MESSAGE_FIELDS: ReadonlyArray<readonly [string, FieldHandler]> = [
       if (!last?.committed) {
         commitUsage(ctx, report, last?.responseId, last?.status ?? 'completed');
         ctx.lastTurn = {
+          ...last,
           responseId: last?.responseId,
           status: last?.status ?? 'completed',
           committed: report,
@@ -480,7 +518,13 @@ const MESSAGE_FIELDS: ReadonlyArray<readonly [string, FieldHandler]> = [
         ctx.sink.emit({ type: 'text-done', responseId, text: turn.text });
       if (turn.usage) commitUsage(ctx, turn.usage, responseId, outcome.status);
       ctx.sink.emit({ type: 'response-done', responseId, ...outcome });
-      ctx.lastTurn = { responseId, status: outcome.status, committed: turn.usage };
+      ctx.lastTurn = {
+        responseId,
+        status: outcome.status,
+        committed: turn.usage,
+        ...(turn.transcript !== undefined ? { transcript: turn.transcript } : {}),
+        transcriptDone: turn.transcriptDone,
+      };
     },
   ],
   [
@@ -579,8 +623,9 @@ function createCodec(init: CodecInit): RealtimeCodec {
       ];
     },
 
-    // A report of a turn the close cut short is still billed.
+    // A late transcript still ends; a report of a turn the close cut short is still billed.
     closed() {
+      flushLateTranscript(ctx);
       const turn = ctx.turn;
       ctx.turn = undefined;
       if (turn?.usage) commitUsage(ctx, turn.usage, turn.responseId, 'cancelled');
