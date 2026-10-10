@@ -86,6 +86,8 @@ interface StreamChatResult {
   fullStream: AsyncIterable<StreamPart>;
   usage: Promise<Usage>;
   finishReason: Promise<FinishReason>;
+  /** 2.3 — the provider's explanation of the stop. Settles with `finishReason`. */
+  stopDetails?: Promise<StopDetails | undefined>;
   /** 1.9 — drain the stream so terminal effects run. Optional; see below. */
   consume?: (options?: { onError?: (error: unknown) => void }) => Promise<void>;
   /** 1.9 — non-fatal notices. Settles with `usage`; never rejects. */
@@ -103,6 +105,16 @@ interface StreamChatResult {
 - **`fullStream`** — the full canonical delta stream of `StreamPart`. Errors surface as an `error` part, not a throw.
 - **`usage`** — resolves once with the final `Usage` breakdown (input / output / reasoning / cache tokens). `totalTokens` is the provider's own total where one exists, not `input + output` — on a thinking model those differ substantially.
 - **`finishReason`** — resolves with `'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error' | 'aborted'`.
+- **`stopDetails`** (2.3) — resolves with the provider's explanation of the stop when it gave one, else `undefined`. Today that is Anthropic's `stop_details` on a refusal (`finishReason: 'content_filter'`), normalized to `{ type, category?, explanation? }`; the raw object also stays on the `finish` part's `providerMetadata`. It settles with `finishReason`: `undefined` when you aborted, rejected when the call failed. A run with `tools` reports its last step's.
+
+```ts title="refusal.ts"
+const result = streamChat({ model, prompt: 'Write a port scanner.' });
+for await (const chunk of result.textStream) process.stdout.write(chunk);
+if ((await result.finishReason) === 'content_filter') {
+  const details = await result.stopDetails;
+  console.warn(`\nrefused (${details?.category ?? 'no category'})`, details?.explanation ?? '');
+}
+```
 
 There is no `response.messages` on a streaming result. If you need the canonical turns to append to history, either reconstruct them from the stream or use the [chat](/docs/modules/chat-persistence) layer, which does it for you.
 

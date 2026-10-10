@@ -15,7 +15,7 @@ Need the object to render progressively while it generates? Use [streamObject](/
 import { generateObject } from '@deuz-sdk/core';
 
 const result = await generateObject<T>(options);
-// result: { object: T; usage: Usage; finishReason: FinishReason }
+// result: { object: T; usage: Usage; finishReason: FinishReason; stopDetails?: StopDetails }
 ```
 
 `generateObject` is `async` and returns a `Promise<GenerateObjectResult<T>>`. The type parameter `T` is inferred from a Standard Schema's output type, or you can supply it explicitly when passing a raw JSON Schema.
@@ -38,6 +38,7 @@ The two top-level fields of the result you will use most:
 | `object` | `T` | The parsed, validated object. |
 | `usage` | `Usage` | Token usage for the call. |
 | `finishReason` | `FinishReason` | Why the model stopped. |
+| `stopDetails` | `StopDetails \| undefined` | 2.3. The provider's explanation of the stop, when it gave one — e.g. a refusal's category. |
 
 ## Schema input
 
@@ -83,6 +84,8 @@ Anthropic rejects a forced `tool_choice` while extended thinking is enabled (HTT
 | `cause` | `unknown` | The last parse/validation error. |
 
 A hard transport error (an `error` part on the underlying stream) is thrown immediately and is not wrapped in `NoObjectGeneratedError`.
+
+A refused request (`finishReason: 'content_filter'`, such as Anthropic's `stop_reason: 'refusal'`) rarely returns JSON that matches the schema, so it usually ends in `NoObjectGeneratedError` after the repair attempt, and the error does not carry the refusal's explanation. When you need its category, use [streamObject](/docs/core/stream-object): its `finishReason` and `stopDetails` resolve before validation, even when `object` rejects.
 
 ## Gemini schema conversion
 

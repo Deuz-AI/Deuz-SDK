@@ -67,6 +67,7 @@ export const generateObject: GenerateObject = async <T = unknown>(
     const raw = await collect(result, strategy); // throws on hard transport error
     const usage = await result.usage;
     const finishReason = await result.finishReason;
+    const stopDetails = await result.stopDetails;
     lastRaw = raw;
 
     let parsed: unknown;
@@ -82,6 +83,7 @@ export const generateObject: GenerateObject = async <T = unknown>(
         object: validation.value,
         usage,
         finishReason,
+        ...(stopDetails ? { stopDetails } : {}),
         ...(warnings.list().length ? { warnings: warnings.list() } : {}),
       };
     }

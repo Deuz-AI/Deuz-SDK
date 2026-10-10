@@ -283,7 +283,13 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       ];
       body.tool_choice = { type: 'function', function: { name } };
     }
-  } else if (tools && tools.tools.length > 0) {
+  }
+  // A json-strategy object request keeps the call's tools and their tool_choice
+  // beside `response_format` (2.3, F15): runAgent's finalization asks with the
+  // loop's tools and `toolChoice: 'none'`, so its request prefix stays the
+  // loop's. The tool strategy forces its own call instead. Not live-verified,
+  // and a compatible host may not accept the combination.
+  if (object?.strategy !== 'tool' && tools && tools.tools.length > 0) {
     // Chat Completions has no hosted tools — provider-executed entries are
     // dropped. The drop MUST be loud: ~15 provider ids ride this wire, and a
     // silently removed `openaiWebSearch()` looks exactly like a model that
@@ -321,7 +327,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     const tc = mapOpenAIToolChoice(ctx, tools.toolChoice);
     if (tc !== undefined) body.tool_choice = tc;
     if (tools.allowParallel === false) body.parallel_tool_calls = false;
-  } else if (options.responseFormat === 'json') {
+  } else if (!object && options.responseFormat === 'json') {
     body.response_format = { type: 'json_object' };
   }
 

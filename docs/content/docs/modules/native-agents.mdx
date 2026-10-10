@@ -63,7 +63,8 @@ failure; it never reports completion before the terminal write succeeds. That
 failure result may itself be unpersisted, so recover from the last committed envelope.
 
 With tools, native execution uses the existing tool loop and then a separate
-finalization request with application tools disabled. Without tools, structured
+finalization request that offers the loop's tools with `tool_choice: 'none'`, so the
+model cannot call them (details below). Without tools, structured
 output can begin directly in finalization. `maxSteps` covers the root tool-loop
 turns and finalization/repair turns; the execution ledger also accounts for
 auxiliary and descendant model requests. `maxOutputAttempts` bounds schema repair
@@ -273,6 +274,14 @@ Native options support the canonical tool-loop controls, including preparation,
 compaction, approval gates and guardrails. Loop hooks apply to the tool-loop phase.
 Finalization is one more turn of the same conversation: it ends with a user turn,
 offers the loop's tools with `tool_choice: 'none'`, and validates its own output.
+With `output` in the json strategy, the Anthropic, OpenAI Chat Completions and
+OpenAI Responses wires (2.3) send those tools unchanged beside the output format
+(`output_config.format`, `response_format`, `text.format`), so the request prefix
+stays the loop's for the prompt cache and preserved thinking. Gemini's native wire
+sends the JSON schema alone: `@google/genai` documents no request that combines
+function declarations with a response schema, and with `'none'` the model could not
+call them anyway. The tool strategy sends only its own forced output tool
+(`json_output` unless `output.name` is set). None of this is live-verified.
 After a [handoff](/docs/agents/handoffs), the target agent's model and tools drive
 every later step, finalization and verifier re-drives included, and its tools pass
 through the same receipts as the root agent's.

@@ -6,6 +6,7 @@ import type { ResolvedDependencies } from './deps';
 import type { SessionStore } from './session';
 import type { ApprovalSigner } from '../durable';
 import type { NativeExecutionContext } from './execution';
+import type { StopDetails } from './methods';
 
 /** Context handed to a tool's `execute`. */
 export interface ToolExecuteContext {
@@ -151,6 +152,11 @@ export interface StepResult {
   toolCalls: ToolCall[];
   toolResults: ToolResult[];
   finishReason: FinishReason;
+  /**
+   * The provider's explanation of this step's stop (2.3 additive), when it gave
+   * one — e.g. a refusal's category. See {@link StopDetails}.
+   */
+  stopDetails?: StopDetails;
   usage: Usage;
   /** Messages this step appended (assistant turn + the tool-result turn). */
   response: { messages: Message[] };
