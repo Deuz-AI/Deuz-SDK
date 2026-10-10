@@ -2087,9 +2087,9 @@ export function pendingClientCalls(
 //
 // Every tool call of a run takes ONE path, in this order: the finish-reason gate
 // (`run-step.ts`: a refused or cut-off turn dispatches nothing), the policy (the
-// run's `onToolCall` guardrails), the approval gate, then `executeTools`
-// (admission, the native effect receipt, execution, `onToolResult`) and the
-// step checkpoint. `planToolDispatch` is everything BEFORE `executeTools`, and it
+// execution policy, then the run's `onToolCall` guardrails), the approval gate,
+// then `executeTools` (admission, the native effect receipt, execution,
+// `onToolResult`) and the step checkpoint. `planToolDispatch` is everything BEFORE `executeTools`, and it
 // is the only implementation of it: the buffered loop's step, the streaming
 // loop's step and the resume settle (`settlePendingApprovals`) all call it, so a
 // rule added here holds for every family that reaches a loop.
@@ -2152,9 +2152,10 @@ export interface ToolDispatchInput {
 }
 
 /**
- * Decide what a batch of tool calls may do, in the contract's order: split off
- * the transfers (decided, never executed), run the `onToolCall` guardrails, then
- * the approval gate. Nothing executes here; the caller hands
+ * Decide what a batch of tool calls may do, in the contract's order: the
+ * execution policy, the `onToolCall` guardrails, then the approval gate, for
+ * every call (2.3, transfers included), and last the transfer decision among the
+ * transfers they cleared (decided, never executed). Nothing executes here; the caller hands
  * {@link ToolDispatchPlan.execCalls} and {@link ToolDispatchPlan.denied} to
  * `executeTools`, or suspends when the plan holds pending approvals or client
  * calls.

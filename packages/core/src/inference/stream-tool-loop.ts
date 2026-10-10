@@ -1423,12 +1423,13 @@ export function runStreamToolLoop(
         appended.push(assistantMessage);
         chatMessages = [...chatMessages, assistantMessage];
 
-        // The dispatch contract (2.3): ONE plan for the batch — transfers
-        // decided by looking at the call (never by an exception out of an
-        // `execute`), the `onToolCall` guardrails, then the approval gate —
-        // shared with the buffered loop and the resume settle. Everything ELSE
-        // in the batch runs completely normally: a model that calls `search` and
-        // `transfer_to_billing` in one step gets both honored.
+        // The dispatch contract (2.3): ONE plan for the batch, shared with the
+        // buffered loop and the resume settle — the execution policy, the
+        // `onToolCall` guardrails and the approval gate for every call, then the
+        // transfer decision (made by looking at the call, never by an exception out
+        // of an `execute`). Everything ELSE in the batch runs completely normally: a
+        // model that calls `search` and `transfer_to_billing` in one step gets both
+        // honored.
         const plan = await planToolDispatch({
           calls: toolCalls,
           tools,
