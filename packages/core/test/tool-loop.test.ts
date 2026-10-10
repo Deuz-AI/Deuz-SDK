@@ -470,7 +470,8 @@ describe('tool approval — client mode (no approveToolCall)', () => {
     expect(weather).not.toHaveBeenCalled();
     expect(res.pendingApprovals).toEqual([
       {
-        approvalId: 'toolu_1',
+        // Bound to the call it was issued for (2.3): the call id, then a digest.
+        approvalId: expect.stringMatching(/^toolu_1@[0-9a-f]{24}$/),
         toolCallId: 'toolu_1',
         toolName: 'getWeather',
         input: { city: 'Paris' },
@@ -519,7 +520,7 @@ describe('tool approval — client mode (no approveToolCall)', () => {
     expect(types.at(-1)).toBe('finish');
     const approval = parts.find((p) => p.type === 'tool-approval-request');
     expect(approval).toMatchObject({
-      approvalId: 'toolu_1',
+      approvalId: expect.stringMatching(/^toolu_1@[0-9a-f]{24}$/),
       toolCallId: 'toolu_1',
       toolName: 'getWeather',
       input: { city: 'Paris' },
@@ -1004,7 +1005,7 @@ describe('hallucinated tool names (unknown name ≠ client tool)', () => {
     expect(res.steps).toHaveLength(1);
     expect(res.pendingApprovals).toEqual([
       {
-        approvalId: 'call_1',
+        approvalId: expect.stringMatching(/^call_1@[0-9a-f]{24}$/),
         toolCallId: 'call_1',
         toolName: 'askUser',
         input: { q: 'ok?' },

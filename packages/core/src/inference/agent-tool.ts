@@ -191,6 +191,10 @@ export function agentTool(def: AgentToolDef): Tool {
           ...(ctx.runtimeContext !== undefined ? { runtimeContext: ctx.runtimeContext } : {}),
           // Inherit the parent's server-mode approver so sub-agent calls stay gated.
           ...(ctx.approveToolCall ? { approveToolCall: ctx.approveToolCall } : {}),
+          // And the parent run's tool policy (2.3): its `onToolCall` /
+          // `onToolResult` guardrails judge the sub-agent's calls too. A child
+          // narrows what the run may do, never widens it.
+          ...(ctx.guardrails ? { guardrails: ctx.guardrails } : {}),
           ...(ctx.approvalSigner ? { approvalSigner: ctx.approvalSigner } : {}),
           ...(ctx.execution
             ? {

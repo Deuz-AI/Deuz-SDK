@@ -31,6 +31,7 @@
  */
 import type { Clock, Logger } from '../types/deps';
 import type { ToolSet } from '../types/tool';
+import type { CallWarning } from '../types/methods';
 import type {
   McpClientLoopEntry,
   McpHttpLoopConfig,
@@ -108,6 +109,13 @@ export interface McpResolveDeps {
   /** Backoff/keepalive timers for run-opened connections (edge-safety: never ambient). */
   clock?: Clock;
   mcpPool?: McpConnectionPool;
+  /**
+   * Where a name collision between two servers is reported (2.3), as a typed
+   * `unsupported-tool` warning with `setting: 'mcp'`: a loop passes its warning
+   * sink, so the collision reaches the call's `warnings`. Without it the
+   * resolver logs the line, as before.
+   */
+  warn?: (warning: CallWarning) => void;
 }
 
 // --- entry classification ---------------------------------------------------
@@ -183,14 +191,15 @@ interface ResolvedEntry {
  * uses, because failing a run over a name clash would be worse than an
  * over-specific tool.
  */
-function mergeToolSets(sets: ToolSet[], logger: Logger): ToolSet {
+function mergeToolSets(sets: ToolSet[], deps: McpResolveDeps): ToolSet {
   const merged: ToolSet = {};
   for (const set of sets) {
     for (const [name, tool] of Object.entries(set)) {
       if (Object.prototype.hasOwnProperty.call(merged, name)) {
-        logger.warn(
-          `mcp: duplicate tool name '${name}' — the later server wins; set a \`namespace\` to keep both`,
-        );
+        const message = `mcp: duplicate tool name '${name}' — the later server wins; set a \`namespace\` to keep both`;
+        // A typed warning when the loop listens (the sink also logs it), else the log line.
+        if (deps.warn) deps.warn({ type: 'unsupported-tool', setting: 'mcp', message });
+        else deps.logger.warn(message);
       }
       merged[name] = tool;
     }
@@ -388,7 +397,7 @@ export async function resolveMcpForLoop(
 
     const initial = await listAll();
     const runtime: ResolvedMcpRuntime = {
-      tools: mergeToolSets(initial, deps.logger),
+      tools: mergeToolSets(initial, deps),
       origins: toolOrigins(initial, resolved),
       changed: () => dirty,
       async refresh() {
@@ -397,7 +406,7 @@ export async function resolveMcpForLoop(
         dirty = false;
         try {
           const sets = await listAll();
-          runtime.tools = mergeToolSets(sets, deps.logger);
+          runtime.tools = mergeToolSets(sets, deps);
           runtime.origins = toolOrigins(sets, resolved);
         } catch (error) {
           // Still stale: re-arm so the NEXT step boundary tries again. The caller

@@ -3,7 +3,14 @@ import type { CallWarning, StopDetails, StreamChatResult } from '../types/method
 import type { GuardrailPart, StreamPart, ToolRunState } from '../types/stream';
 import type { Message } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
-import type { ToolCall, ToolSet, StepResult, ToolApprovalRequest } from '../types/tool';
+import type {
+  ToolCall,
+  ToolCallOutcome,
+  ToolResult,
+  ToolSet,
+  StepResult,
+  ToolApprovalRequest,
+} from '../types/tool';
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import type { WireToolRequest } from '../adapters/types';
 import { runStream } from '../core/inference';
@@ -34,6 +41,9 @@ import {
   setupMcp,
   mergeMcpTools,
   refreshMcpTools,
+  catalogChangePolicy,
+  legacyCatalogVerdict,
+  MCP_CATALOG_CHANGED_STOPPED_BY,
   closeMcp,
   setupCompaction,
   runCompaction,
@@ -44,15 +54,14 @@ import {
   executeTools,
   toToolResultPart,
   toStepResult,
-  pendingClientCalls,
   isUnknownTool,
   bumpErrorGuard,
   normalizeStop,
   needsCost,
   shouldStop,
   sumUsage,
-  findApprovalNeeded,
-  resolveServerApprovals,
+  planToolDispatch,
+  policyRefusalOf,
   settlePendingApprovals,
   saveCheckpoint,
   prepareChatPersistence,
@@ -61,15 +70,12 @@ import {
   withSystemBlock,
   startMemoryExtract,
   durableUsage,
-  toApprovalRequests,
   signApprovalRequests,
   preserveClientContext,
   beginLoopObserve,
   endLoopObserve,
   emitStepStarted,
   emitStepCompleted,
-  observeApprovalRequests,
-  observeServerResolutions,
   evaluateVerifyStep,
   verifyFeedbackMessage,
   evaluateDoneWhen,
@@ -78,7 +84,6 @@ import {
   FALSE_FINISH_STOPPED_BY,
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
-  applyToolCallGuardrails,
   logGuardrailParts,
   rewriteAssistantText,
   isEmptyTurn,
@@ -86,8 +91,6 @@ import {
   GUARDRAIL_OUTPUT_STOPPED_BY,
   collectHandoffTools,
   hasHandoffTools,
-  splitHandoffCalls,
-  decideHandoff,
   mergeResultsInCallOrder,
   applyHandoffSwap,
   resumeHandoffState,
@@ -95,6 +98,7 @@ import {
   modelGate,
   setModelGate,
   type ActiveAgentState,
+  type CatalogChangeVerdict,
   type CompactionTrigger,
   type Denial,
   type DurableRunner,
@@ -159,9 +163,10 @@ export interface StreamToolLoopInternal {
     runtime: ResolvedMcpRuntime;
     /**
      * Called after each hot refresh, before the refreshed catalog reaches the
-     * wire. It records the catalog; its warnings go out as `warning` parts.
+     * wire. The runner applies its `onCatalogChange` (2.3): it records an
+     * accepted catalog, or stops the run; its warnings go out as `warning` parts.
      */
-    refreshed(): Promise<CallWarning[]>;
+    refreshed(): Promise<CatalogChangeVerdict>;
   };
   /**
    * The warning sink of a run this loop is one part of (2.3), in place of the
@@ -228,6 +233,10 @@ export function runStreamToolLoop(
   // a declared always-present readout, never an opt-in. A runner that owns
   // the whole run may hand in its own sink (2.3).
   const warningSink = internal?.warnings ?? createWarningSink(deps.logger);
+  /** MCP name collisions (2.3) reach the same sink. */
+  const warn = (warning: CallWarning): void => {
+    warningSink.add(warning);
+  };
   const warningsDeferred = createDeferred<CallWarning[]>();
 
   let started = false;
@@ -578,6 +587,12 @@ export function runStreamToolLoop(
       terminalError = error;
       // What the run collected still reaches the stream (2.3).
       flushWarnings();
+      // A call the execution policy refused ends the run; the stream still says
+      // which call it was, and why (2.3), before the error.
+      const refused = policyRefusalOf(error);
+      if (refused !== undefined) {
+        toolState(refused, toolNames.get(refused), 'error', undefined, 'permission-denied');
+      }
       broadcaster.push({ type: 'error', error });
       usageDeferred.reject(error);
       finishDeferred.reject(error);
@@ -654,11 +669,15 @@ export function runStreamToolLoop(
     // call a human refused. It changes ONLY what the UI is told — the model
     // still receives the same is_error tool_result it always did, and the
     // reason is the one the denier supplied (never invented here).
+    //
+    // `outcome` (2.3) names what the dispatch contract decided — set with a
+    // terminal 'error' and with 'awaiting-approval'.
     const toolState = (
       toolCallId: string,
       toolName: string | undefined,
       state: ToolRunState,
       denial?: Denial,
+      outcome?: ToolCallOutcome,
     ): void => {
       broadcaster.push({
         type: 'tool-state',
@@ -668,16 +687,33 @@ export function runStreamToolLoop(
         ...(denial
           ? { denied: true, ...(denial.reason ? { deniedReason: denial.reason } : {}) }
           : {}),
+        ...(outcome ? { outcome } : {}),
       });
+    };
+    /** The tool name behind each streamed `tool-call` id (a policy refusal names only the id). */
+    const toolNames = new Map<string, string>();
+    /** The `tool-result` part and terminal `tool-state` part for one settled call. */
+    const publishResult = (r: ToolResult, denial?: Denial): void => {
+      broadcaster.push({
+        type: 'tool-result',
+        toolCallId: r.toolCallId,
+        toolName: r.toolName,
+        output: r.result,
+        ...(r.isError ? { isError: true } : {}),
+        ...(r.outcome ? { outcome: r.outcome } : {}),
+      });
+      toolState(r.toolCallId, r.toolName, r.isError ? 'error' : 'complete', denial, r.outcome);
     };
 
     try {
+      // What a mid-run MCP catalog change does (2.3); an unknown value fails the run.
+      const catalogPolicy = catalogChangePolicy(options);
       // Zero-config MCP (2.0): connect BEFORE the wire is built so the servers'
       // tools ride the very first model call. Inside the try on purpose — an
       // unreachable server rejects here, and the pump's catch turns that into an
       // `error` part with rejected promises, which is what keeps G2 intact.
-      mcp = internal?.mcp ? internal.mcp.runtime : await setupMcp(options, deps);
-      tools = mergeMcpTools(mcp, ownTools);
+      mcp = internal?.mcp ? internal.mcp.runtime : await setupMcp(options, deps, warn);
+      tools = mergeMcpTools(mcp, ownTools, warn);
       // Handoff (2.0): the transfer catalog is read from the ROOT set, ONCE — an
       // agent's own set never carries a transfer to itself, so re-deriving it
       // later would lose targets one by one.
@@ -696,7 +732,7 @@ export function runStreamToolLoop(
           deps.logger,
         );
         ownTools = active.tools;
-        tools = mergeMcpTools(mcp, ownTools);
+        tools = mergeMcpTools(mcp, ownTools, warn);
         if (durable) durable.handoff = resumeHandoff;
         retargetCompaction(compactionRunner, options, deps, active.model);
       }
@@ -729,6 +765,8 @@ export function runStreamToolLoop(
             },
           },
           { ...(active ? { active } : {}), tools: handoffTools },
+          // The identity the suspended leg bound its approvals to (2.3).
+          { runId: durable?.runId, step: resumeFrom?.stepIndex },
         );
         if (settled) {
           const settledMessages = settled.messages.slice(messages.length);
@@ -737,23 +775,11 @@ export function runStreamToolLoop(
           messages = settled.messages;
           emitGuardrails(settled.guardrails);
           for (const r of settled.results) {
-            broadcaster.push({
-              type: 'tool-result',
-              toolCallId: r.toolCallId,
-              toolName: r.toolName,
-              output: r.result,
-              ...(r.isError ? { isError: true } : {}),
-            });
             // The resume leg's verdicts (explicit `approvalResponses` denial,
             // default-deny, an unverifiable signed approval, a client tool the
             // caller never answered) carry the reason the CLIENT supplied — it
             // reaches the UI here or nowhere.
-            toolState(
-              r.toolCallId,
-              r.toolName,
-              r.isError ? 'error' : 'complete',
-              settled.denied.get(r.toolCallId),
-            );
+            publishResult(r, settled.denied.get(r.toolCallId));
           }
           // A transfer left unanswered by an earlier leg is applied HERE: from
           // this point the resume leg is the target agent.
@@ -770,7 +796,7 @@ export function runStreamToolLoop(
             handoffLog.push(swap.entry);
             broadcaster.push({ type: 'handoff', ...swap.entry });
             ownTools = active.tools;
-            tools = mergeMcpTools(mcp, ownTools);
+            tools = mergeMcpTools(mcp, ownTools, warn);
             fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
             staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
             flushWarnings();
@@ -888,6 +914,35 @@ export function runStreamToolLoop(
         assertStepDeadline();
         stepTimeout?.clear();
         stepTimeout = createStepTimeout(deps.clock, timeouts.stepMs);
+        // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
+        // the last step is re-read HERE, before the step starts, so the new
+        // catalog is on the wire from the very next call. Both wires are rebuilt
+        // so `activeTools` still applies to the refreshed set; `prepareStep`
+        // below keeps the last word. A catalog that really changed is reported,
+        // or ends the run before any model sees it (2.3, `onCatalogChange`): a
+        // native run decides that itself and records the catalog it accepts.
+        if (mcp?.changed()) {
+          const before = mcp.tools;
+          // `ownTools`, not `options.tools`: after a handoff the local half of
+          // the set belongs to the ACTIVE agent, and re-merging the caller's
+          // would silently undo the transfer.
+          tools = await refreshMcpTools(mcp, ownTools, deps, warn);
+          const verdict = internal?.mcp
+            ? await internal.mcp.refreshed()
+            : legacyCatalogVerdict(before, mcp.tools, catalogPolicy);
+          for (const warning of verdict.warnings) warningSink.add(warning);
+          if (verdict.stop) {
+            stoppedBy = MCP_CATALOG_CHANGED_STOPPED_BY;
+            endReason = 'stop-condition';
+            if (durable) {
+              await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+            }
+            break;
+          }
+          fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+          staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
+          flushWarnings();
+        }
         broadcaster.push({ type: 'step-start', stepIndex });
         const stepSpan = lo?.rt.startSpan();
         if (observeCtx && stepSpan) {
@@ -922,22 +977,6 @@ export function runStreamToolLoop(
             observeCtx,
             recallOverheadTokens,
           );
-        }
-        // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
-        // the last step is re-read HERE, so the new catalog is on the wire from
-        // the very next call. Both wires are rebuilt so `activeTools` still
-        // applies to the refreshed set; `prepareStep` below keeps the last word.
-        if (mcp?.changed()) {
-          // `ownTools`, not `options.tools`: after a handoff the local half of
-          // the set belongs to the ACTIVE agent, and re-merging the caller's
-          // would silently undo the transfer.
-          tools = await refreshMcpTools(mcp, ownTools, deps);
-          // A native run records the refreshed catalog (2.3, F01) before the
-          // model is offered it, and reports how the catalog changed.
-          for (const warning of (await internal?.mcp?.refreshed()) ?? []) warningSink.add(warning);
-          fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
-          staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
-          flushWarnings();
         }
         const prepared = await applyPrepareStep(
           // Handoff (2.0): the active agent's model drives every step after the
@@ -1378,59 +1417,48 @@ export function runStreamToolLoop(
             input: c.args,
           });
           toolState(c.toolCallId, c.toolName, 'input-complete');
+          toolNames.set(c.toolCallId, c.toolName);
         }
         messages = [...messages, assistantMessage];
         appended.push(assistantMessage);
         chatMessages = [...chatMessages, assistantMessage];
 
-        // Handoff (2.0): the DETERMINISTIC interception — before guardrails, the
-        // approval gate and `executeTools`. A transfer is decided by looking at
-        // the call, never by an exception thrown out of an `execute`. Everything
-        // ELSE in the batch runs completely normally: a model that calls
-        // `search` and `transfer_to_billing` in one step gets both honored.
-        const { handoffCalls, normalCalls } = hasHandoffTools(handoffTools)
-          ? splitHandoffCalls(toolCalls, tools)
-          : { handoffCalls: [], normalCalls: toolCalls };
-
-        // Tool-call guardrails (2.0): evaluated IMMEDIATELY before the approval
-        // gate, so a rewrite reaches the `needsApproval` predicate, the approval
-        // request a human sees, and `execute` — while the assistant turn
-        // appended just above keeps the arguments the MODEL issued.
-        const guardedCalls = await applyToolCallGuardrails(
+        // The dispatch contract (2.3): ONE plan for the batch, shared with the
+        // buffered loop and the resume settle — the execution policy, the
+        // `onToolCall` guardrails and the approval gate for every call, then the
+        // transfer decision (made by looking at the call, never by an exception out
+        // of an `execute`). Everything ELSE in the batch runs completely normally: a
+        // model that calls `search` and `transfer_to_billing` in one step gets both
+        // honored.
+        const plan = await planToolDispatch({
+          calls: toolCalls,
+          tools,
           options,
-          normalCalls,
           messages,
           stepIndex,
-        );
-        emitGuardrails(guardedCalls.parts);
-        /** What actually reaches the gate + `executeTools` (transfers excluded). */
-        const execCalls = guardedCalls.calls;
+          ...(hasHandoffTools(handoffTools)
+            ? { handoff: { tools: handoffTools, ...(active ? { active } : {}) } }
+            : {}),
+          // An approval is bound to the run and to the checkpoint its suspension
+          // writes next (2.3); a call without a session binds neither.
+          approval: { runId: durable?.runId, step: durable ? durable.stepIndex + 1 : undefined },
+          clock: deps.clock,
+          ...(observeCtx ? { observe: observeCtx } : {}),
+        });
+        emitGuardrails(plan.guardrails);
+        /** What actually reaches `executeTools` (transfers excluded). */
+        const execCalls = plan.execCalls;
         // The REPORTED calls stay in the model's own order and include the
         // transfers, so `StepResult.toolCalls` describes the step the model
-        // took — with any guardrail rewrite applied, exactly as before.
-        toolCalls =
-          handoffCalls.length === 0
-            ? execCalls
-            : (() => {
-                const rewritten = new Map(execCalls.map((c) => [c.toolCallId, c]));
-                return toolCalls.map((c) => rewritten.get(c.toolCallId) ?? c);
-              })();
-        // A blocked call never reaches the approval gate: it already has a
-        // verdict, and gating it would suspend the run on a call that is not
-        // going to run either way.
-        const gateCandidates =
-          guardedCalls.blocked.size > 0
-            ? execCalls.filter((c) => !guardedCalls.blocked.has(c.toolCallId))
-            : execCalls;
+        // took — with any guardrail rewrite applied.
+        toolCalls = plan.calls;
 
-        // The transfer verdict is computed HERE — before the approval gate and
-        // before `executeTools`, both of which can leave the step early. A break
-        // that left a transfer's `tool_use` id unanswered would hand the
-        // provider an unanswerable turn on the next request AND silently drop
-        // the routing decision, so it is decided once and committed on every
-        // exit.
-        const handoffDecision =
-          handoffCalls.length > 0 ? decideHandoff(handoffCalls, active) : undefined;
+        // The transfer verdict is part of the plan — made before the approval
+        // gate and `executeTools` can leave the step early. A break that left a
+        // transfer's `tool_use` id unanswered would hand the provider an
+        // unanswerable turn on the next request AND silently drop the routing
+        // decision, so it is decided once and committed on every exit.
+        const handoffDecision = plan.handoff;
         /**
          * Apply the transfer on a path that executes NOTHING else. Publishes the
          * same `tool-result`/`tool-state`/`handoff` parts the completed path
@@ -1439,16 +1467,7 @@ export function runStreamToolLoop(
          */
         const commitHandoffOnBreak = (): Message | undefined => {
           if (!handoffDecision) return undefined;
-          for (const r of handoffDecision.results) {
-            broadcaster.push({
-              type: 'tool-result',
-              toolCallId: r.toolCallId,
-              toolName: r.toolName,
-              output: r.result,
-              ...(r.isError ? { isError: true } : {}),
-            });
-            toolState(r.toolCallId, r.toolName, r.isError ? 'error' : 'complete');
-          }
+          for (const r of handoffDecision.results) publishResult(r);
           const message: Message = {
             role: 'tool',
             content: handoffDecision.results.map(toToolResultPart),
@@ -1477,47 +1496,21 @@ export function runStreamToolLoop(
           return message;
         };
 
-        // Approval gate: server mode denies inline; without approveToolCall the
-        // gated calls break the loop like client tools (client mode).
-        const gated = await findApprovalNeeded(gateCandidates, tools, options, messages);
-        const denied = options.approveToolCall
-          ? await resolveServerApprovals(gated, gateCandidates, options, messages)
-          : new Map<string, Denial>();
-        // Guardrail blocks JOIN the approval flow's denial map — one machinery
-        // for every "this call does not run" verdict.
-        for (const [id, denial] of guardedCalls.blocked) denied.set(id, denial);
-        const pendingApproval = options.approveToolCall
-          ? []
-          : gateCandidates.filter((c) => gated.has(c.toolCallId));
-        if (observeCtx && gated.size > 0) {
-          const gatedCalls = toolCalls.filter((c) => gated.has(c.toolCallId));
-          observeApprovalRequests(
-            observeCtx,
-            options,
-            gatedCalls,
-            options.approveToolCall ? 'server' : 'client',
-          );
-          if (options.approveToolCall) {
-            observeServerResolutions(observeCtx, options, gatedCalls, denied);
-          }
-        }
-
-        // Client tools a guardrail BLOCKED are not pending on anyone (see
-        // pendingClientCalls) — they fall through to `executeTools` instead.
-        const clientCalls = pendingClientCalls(toolCalls, tools, guardedCalls.blocked);
+        // Guardrail blocks and approval denials share ONE denial map — one
+        // machinery for every "this call does not run" verdict.
+        const denied = plan.denied;
+        const pendingApproval = plan.pendingApproval;
+        const clientCalls = plan.clientCalls;
         snapshotClientCalls = clientCalls;
 
         // Pending approvals and client tools break together: ONE break, nothing
         // from the batch executes; the resume call settles the deferred rest.
         if (pendingApproval.length > 0 || clientCalls.length > 0) {
-          const requests = await signApprovalRequests(
-            toApprovalRequests(pendingApproval, options.agentPath),
-            options,
-            deps,
-            durable?.runId,
-          );
+          const requests = await signApprovalRequests(plan.requests, options, deps, durable?.runId);
           const handoffMessage = commitHandoffOnBreak();
-          for (const c of pendingApproval) toolState(c.toolCallId, c.toolName, 'awaiting-approval');
+          for (const c of pendingApproval) {
+            toolState(c.toolCallId, c.toolName, 'awaiting-approval', undefined, 'approval-pending');
+          }
           if (options.session?.durability !== 'strict') emitApprovalRequests(requests);
           const sr = toStepResult(
             stepData,
@@ -1640,22 +1633,10 @@ export function runStreamToolLoop(
           toolResults = mergeResultsInCallOrder(toolCalls, toolResults, handoffDecision.results);
         }
         for (const r of toolResults) {
-          broadcaster.push({
-            type: 'tool-result',
-            toolCallId: r.toolCallId,
-            toolName: r.toolName,
-            output: r.result,
-            ...(r.isError ? { isError: true } : {}),
-          });
           // Server mode: `approveToolCall` said no (or threw). The verdict is a
-          // boolean, so there is no reason string to relay — `denied: true`
-          // alone is what separates "refused" from "failed".
-          toolState(
-            r.toolCallId,
-            r.toolName,
-            r.isError ? 'error' : 'complete',
-            denied.get(r.toolCallId),
-          );
+          // boolean, so there is no reason string to relay — `denied: true` and
+          // the outcome are what separate "refused" from "failed".
+          publishResult(r, denied.get(r.toolCallId));
         }
         const toolResultMessage: Message = {
           role: 'tool',
@@ -1683,7 +1664,7 @@ export function runStreamToolLoop(
           handoffLog.push(swap.entry);
           broadcaster.push({ type: 'handoff', ...swap.entry });
           ownTools = active.tools;
-          tools = mergeMcpTools(mcp, ownTools);
+          tools = mergeMcpTools(mcp, ownTools, warn);
           fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
           staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
           flushWarnings();
@@ -1712,8 +1693,9 @@ export function runStreamToolLoop(
         // guard. A refused HANDOFF (budget spent, or a sibling transfer in the
         // same batch) is the same kind of verdict, so it is excluded too: the
         // model is being told to carry on, not failing at anything.
-        const handoffIds =
-          handoffCalls.length > 0 ? new Set(handoffCalls.map((h) => h.call.toolCallId)) : undefined;
+        const handoffIds = handoffDecision
+          ? new Set(handoffDecision.results.map((r) => r.toolCallId))
+          : undefined;
         if (
           bumpErrorGuard(
             errorCounters,

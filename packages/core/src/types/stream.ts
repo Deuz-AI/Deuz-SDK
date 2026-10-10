@@ -1,6 +1,7 @@
 import type { Usage, FinishReason } from './usage';
 import type { CompactionLayer } from './config';
 import type { CallWarning } from './methods';
+import type { ToolCallOutcome } from './tool';
 
 /**
  * Canonical streaming delta. Open discriminated union — consumers should keep a
@@ -84,6 +85,8 @@ export interface ToolResultStreamPart {
   toolName: string;
   output: unknown;
   isError?: boolean;
+  /** Why the call ended in an error (2.3, `ToolCallOutcome`); absent on success. */
+  outcome?: ToolCallOutcome;
 }
 
 /**
@@ -294,6 +297,14 @@ export interface ToolStatePart {
    */
   denied?: boolean;
   deniedReason?: string;
+  /**
+   * What the dispatch contract decided (2.3): set with `state: 'error'` (a tool
+   * error, a policy or approval denial, an unknown effect) and with
+   * `'awaiting-approval'` (`'approval-pending'`); absent on success. It names the
+   * cause `denied` alone cannot: a guardrail block and an approver's no both set
+   * `denied`, but report `'permission-denied'` and `'approval-denied'`.
+   */
+  outcome?: ToolCallOutcome;
 }
 
 /**

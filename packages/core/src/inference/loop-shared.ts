@@ -7,6 +7,7 @@ import type {
   ToolSet,
   ToolChoice,
   ToolCall,
+  ToolCallOutcome,
   ToolResult,
   ToolExecuteContext,
   ToolApprovalRequest,
@@ -51,6 +52,7 @@ import { attachClientContext, readClientContext } from '../internal/client-conte
 // Type-only: the sink itself is created by the loop (or not at all), so nothing
 // from internal/warnings.ts is pulled into a bundle that never collects one.
 import type { WarningSink } from '../internal/warnings';
+import type { CallWarning } from '../types/methods';
 // Type-only for the same reason as `mcp/shared` in types/config.ts: the MCP
 // runtime is reached through a LITERAL dynamic import in `setupMcp` below, so a
 // call without `options.mcp` pulls none of that module graph into the bundle.
@@ -99,6 +101,29 @@ export function preserveClientContext<O extends object>(source: object, cloned: 
 /** Denial message fed back to the model as an is_error tool_result. */
 export const TOOL_DENIED = 'Tool call denied.';
 
+/** The `is_error` answer a denied call gets (the model reads the reason, when there is one). */
+function deniedResult(call: ToolCall, denial: Denial): ToolResult {
+  return {
+    toolCallId: call.toolCallId,
+    toolName: call.toolName,
+    result: denial.reason ? `${TOOL_DENIED} Reason: ${denial.reason}` : TOOL_DENIED,
+    isError: true,
+    outcome: denial.outcome,
+  };
+}
+
+/**
+ * The tool call an execution-policy refusal names (2.3), when `error` is one:
+ * the run fails, and the loop reports that call as `'permission-denied'` first.
+ * Read structurally, so the eager loop bundle does not load the policy module.
+ */
+export function policyRefusalOf(error: unknown): string | undefined {
+  const e = error as { name?: unknown; toolCallId?: unknown } | null;
+  return e && e.name === 'ExecutionPolicyError' && typeof e.toolCallId === 'string'
+    ? e.toolCallId
+    : undefined;
+}
+
 /**
  * A denial verdict for one tool call. `reason` is the free-text fed back to
  * the model (unchanged strings); `cause` is the machine-readable origin for
@@ -107,6 +132,12 @@ export const TOOL_DENIED = 'Tool call denied.';
 export interface Denial {
   cause: ToolDeniedEvent['cause'];
   reason?: string;
+  /**
+   * What the result reports (2.3): which step of the dispatch contract refused
+   * the call. `cause` cannot say it: a guardrail block reports `'server-denied'`
+   * like an approver's no, because the observe union is locked.
+   */
+  outcome: ToolCallOutcome;
 }
 export type DenialMap = Map<string, Denial>;
 
@@ -256,18 +287,129 @@ export async function saveCheckpoint(
   }
 }
 
-/** Tag pending approvals with the loop's sub-agent path (root loops pass undefined). */
-export function toApprovalRequests(
+/**
+ * What an approval is bound to besides the call itself (2.3): the durable run,
+ * and the step it suspended at — the `stepIndex` of its suspended checkpoint.
+ * Both are absent on a call without a `session`: it has no run, and a chat UI
+ * folds each request's steps into one assistant turn, so no step survives the
+ * round trip. Such an approval binds the call id, the tool and the arguments.
+ */
+export interface ApprovalScope {
+  runId?: string;
+  step?: number;
+}
+
+/** Hex digits of the approval digest kept in an `approvalId` (96 bits). */
+const APPROVAL_DIGEST_HEX = 24;
+
+/** JSON with object keys sorted, so key order never changes an approval digest. */
+function canonicalJson(value: unknown): string {
+  const sorted = (item: unknown): unknown => {
+    const plain =
+      item !== null &&
+      typeof item === 'object' &&
+      typeof (item as { toJSON?: unknown }).toJSON === 'function'
+        ? (item as { toJSON(): unknown }).toJSON()
+        : item;
+    if (Array.isArray(plain)) return plain.map(sorted);
+    if (plain === null || typeof plain !== 'object') return plain;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(plain).sort()) {
+      out[key] = sorted((plain as Record<string, unknown>)[key]);
+    }
+    return out;
+  };
+  try {
+    return JSON.stringify(sorted(value)) ?? 'undefined';
+  } catch {
+    // Arguments come from JSON; only a guardrail's rewrite can be unserializable.
+    return String(value);
+  }
+}
+
+/**
+ * The `approvalId` a gated call is issued under (2.3): its tool call id, then a
+ * digest of everything the approval covers — the run, the step, the sub-agent
+ * path, the call id, the tool and the arguments. A verdict names it, so one kept
+ * from an earlier gate never approves what the model issues later under the same
+ * provider call id (`tool_0` again): another tool, other arguments, or the same
+ * call at another step.
+ */
+export async function approvalIdOf(
+  call: ToolCall,
+  agentPath: string[] | undefined,
+  scope: ApprovalScope,
+): Promise<string> {
+  const identity = JSON.stringify([
+    'deuz.approval.v1',
+    scope.runId ?? null,
+    scope.step ?? null,
+    agentPath ?? [],
+    call.toolCallId,
+    call.toolName,
+    canonicalJson(call.args),
+  ]);
+  const digest = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity)),
+  );
+  let hex = '';
+  for (const byte of digest.subarray(0, APPROVAL_DIGEST_HEX / 2)) {
+    hex += byte.toString(16).padStart(2, '0');
+  }
+  return `${call.toolCallId}@${hex}`;
+}
+
+/** Pending approvals, bound to their identity and tagged with the loop's sub-agent path. */
+export async function toApprovalRequests(
   calls: ToolCall[],
   agentPath: string[] | undefined,
-): ToolApprovalRequest[] {
-  return calls.map((c) => ({
-    approvalId: c.toolCallId,
-    toolCallId: c.toolCallId,
-    toolName: c.toolName,
-    input: c.args,
-    ...(agentPath && agentPath.length > 0 ? { agentPath } : {}),
-  }));
+  scope: ApprovalScope,
+): Promise<ToolApprovalRequest[]> {
+  return Promise.all(
+    calls.map(async (c) => ({
+      approvalId: await approvalIdOf(c, agentPath, scope),
+      toolCallId: c.toolCallId,
+      toolName: c.toolName,
+      input: c.args,
+      ...(agentPath && agentPath.length > 0 ? { agentPath } : {}),
+    })),
+  );
+}
+
+/**
+ * Whether `responses` hold a verdict for `request` (2.3): one naming its
+ * `approvalId`, or the 2.2 form, its bare tool call id, when that id occurs once
+ * in `messages`. The settle applies the same rule (`settleVerdicts`).
+ */
+export function answersApproval(
+  request: ToolApprovalRequest,
+  responses: readonly ToolApprovalResponse[] | undefined,
+  messages: Message[],
+): boolean {
+  if (!responses || responses.length === 0) return false;
+  if (responses.some((response) => response.approvalId === request.approvalId)) return true;
+  return (
+    responses.some((response) => response.approvalId === request.toolCallId) &&
+    !reusedToolCallIds(messages).has(request.toolCallId)
+  );
+}
+
+/**
+ * Tool call ids that occur more than once among the history's `tool_use` parts:
+ * a provider without call ids numbers each response's calls from `tool_0`.
+ */
+function reusedToolCallIds(messages: Message[]): Set<string> {
+  const seen = new Set<string>();
+  const reused = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== 'tool_use') continue;
+      if (seen.has(part.id)) reused.add(part.id);
+      seen.add(part.id);
+    }
+  }
+  return reused;
 }
 
 /**
@@ -361,7 +503,7 @@ export async function resolveServerApprovals(
         } catch {
           ok = false;
         }
-        if (!ok) denied.set(c.toolCallId, { cause: 'server-denied' });
+        if (!ok) denied.set(c.toolCallId, { cause: 'server-denied', outcome: 'approval-denied' });
       }),
   );
   return denied;
@@ -462,6 +604,8 @@ export function filterWireTools(
 export async function setupMcp(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
+  /** Where a collision between two servers is reported (2.3): the loop's warning sink. */
+  warn?: (warning: CallWarning) => void,
 ): Promise<ResolvedMcpRuntime | undefined> {
   const entries = options.mcp;
   if (!entries || entries.length === 0) return undefined;
@@ -472,6 +616,7 @@ export async function setupMcp(
     // an MCP connection opened by the loop must not schedule ambient timers.
     clock: deps.clock,
     ...(deps.mcpPool ? { mcpPool: deps.mcpPool } : {}),
+    ...(warn ? { warn } : {}),
   });
 }
 
@@ -480,13 +625,30 @@ export async function setupMcp(
  * Explicit tools always win a name collision — they were written by hand at the
  * call site, and a remote server must never be able to shadow a local tool by
  * exporting the same name.
+ *
+ * The collision is no longer silent (2.3): each MCP tool a local one shadows is
+ * reported through `warn` as an `unsupported-tool` warning with `setting: 'mcp'`
+ * — the server's tool is not offered, and its owner should know.
  */
 export function mergeMcpTools(
   mcp: ResolvedMcpRuntime | undefined,
   tools: ToolSet | undefined,
+  warn?: (warning: CallWarning) => void,
 ): ToolSet {
   const own = tools ?? {};
-  return mcp ? { ...mcp.tools, ...own } : own;
+  if (!mcp) return own;
+  if (warn) {
+    for (const name of Object.keys(mcp.tools)) {
+      if (Object.prototype.hasOwnProperty.call(own, name)) {
+        warn({
+          type: 'unsupported-tool',
+          setting: 'mcp',
+          message: `mcp: the local tool '${name}' shadows the MCP tool of the same name — the server's tool is not offered`,
+        });
+      }
+    }
+  }
+  return { ...mcp.tools, ...own };
 }
 
 /**
@@ -509,13 +671,96 @@ export async function refreshMcpTools(
   mcp: ResolvedMcpRuntime,
   own: ToolSet,
   deps: ResolvedDependencies,
+  warn?: (warning: CallWarning) => void,
 ): Promise<ToolSet> {
   try {
     await mcp.refresh();
   } catch (error) {
     deps.logger.warn('mcp: tool-list refresh failed — keeping the previous catalog', { error });
   }
-  return mergeMcpTools(mcp, own);
+  return mergeMcpTools(mcp, own, warn);
+}
+
+/** `providerMetadata.deuz.stoppedBy` (and a native stop reason) for a mid-run catalog change. */
+export const MCP_CATALOG_CHANGED_STOPPED_BY = 'mcp-catalog-changed';
+
+/** What a run does when an MCP server changes its tool catalog mid-run (2.3). */
+export type CatalogChangePolicy = 'stop' | 'accept';
+
+/**
+ * A call's `onCatalogChange` (2.3). Native runs declare it on `AgentRunOptions`
+ * and decide it in the runner (default `'stop'`); the legacy loops read it here,
+ * default `'accept'`. An unknown value is refused.
+ */
+export function catalogChangePolicy(options: CommonCallOptions): CatalogChangePolicy {
+  const value = (options as { onCatalogChange?: unknown }).onCatalogChange;
+  if (value === undefined) return 'accept';
+  if (value === 'stop' || value === 'accept') return value;
+  throw new TypeError("onCatalogChange must be 'stop' or 'accept'.");
+}
+
+/** A tool's part of a catalog comparison: its description and schemas. */
+function catalogEntry(tool: Tool): string {
+  return JSON.stringify([tool.description ?? null, tool.parameters, tool.outputSchema ?? null]);
+}
+
+/**
+ * How an MCP catalog changed across a refresh (2.3), as `added: …; removed: …;
+ * changed: …` text; `undefined` when nothing did — servers may announce
+ * `tools/list_changed` without a change.
+ */
+export function mcpCatalogDiff(before: ToolSet, after: ToolSet): string | undefined {
+  const added = Object.keys(after).filter((name) => !Object.hasOwn(before, name));
+  const removed = Object.keys(before).filter((name) => !Object.hasOwn(after, name));
+  const changed = Object.keys(after).filter(
+    (name) =>
+      Object.hasOwn(before, name) && catalogEntry(before[name]!) !== catalogEntry(after[name]!),
+  );
+  const parts = (
+    [
+      ['added', added],
+      ['removed', removed],
+      ['changed', changed],
+    ] as const
+  )
+    .filter(([, names]) => names.length > 0)
+    .map(([kind, names]) => `${kind}: ${names.join(', ')}`);
+  return parts.length > 0 ? parts.join('; ') : undefined;
+}
+
+/** A refresh's verdict: the warnings to report, and whether the run stops. */
+export interface CatalogChangeVerdict {
+  warnings: CallWarning[];
+  stop: boolean;
+}
+
+/**
+ * What a legacy loop does with a catalog that changed mid-run (2.3): `'accept'`
+ * (the default) carries on with it and reports the change; `'stop'` ends the run
+ * before the model is offered the new catalog (`stoppedBy:
+ * 'mcp-catalog-changed'`).
+ */
+export function legacyCatalogVerdict(
+  before: ToolSet,
+  after: ToolSet,
+  policy: CatalogChangePolicy,
+): CatalogChangeVerdict {
+  const drift = mcpCatalogDiff(before, after);
+  if (!drift) return { warnings: [], stop: false };
+  const outcome =
+    policy === 'stop'
+      ? "the run stopped before offering it (onCatalogChange: 'stop')"
+      : 'the run continues with the new catalog';
+  return {
+    warnings: [
+      {
+        type: 'other',
+        setting: 'mcp',
+        message: `MCP tool catalog changed mid-run (${drift}); ${outcome}.`,
+      },
+    ],
+    stop: policy === 'stop',
+  };
 }
 
 /**
@@ -944,6 +1189,7 @@ export async function applyToolCallGuardrails(
           // it reports as 'server-denied' and the reason string carries the rest.
           cause: 'server-denied',
           reason: guardrailDenialReason(guardrailName(guard), verdict.reason),
+          outcome: 'permission-denied',
         });
         denied = true;
         break;
@@ -1027,6 +1273,8 @@ export async function applyToolResultGuardrails(
           toolName: original.toolName,
           result: guardrailDenialReason(guardrailName(guard), verdict.reason),
           isError: true,
+          // The call ran; the policy withheld its output from the model.
+          outcome: 'permission-denied',
         };
         break;
       }
@@ -1214,6 +1462,7 @@ export function decideHandoff(
         toolName: call.toolName,
         result: `Handoff limit (${max}) reached; continue yourself.`,
         isError: true,
+        outcome: 'permission-denied',
       });
     }
     return { results };
@@ -1232,6 +1481,7 @@ export function decideHandoff(
       toolName: call.toolName,
       result: `Ignored: already transferred to '${to}' this step.`,
       isError: true,
+      outcome: 'permission-denied',
     });
   }
   return {
@@ -1833,6 +2083,212 @@ export function pendingClientCalls(
   return toolCalls.filter((c) => isClientTool(tools, c.toolName) && !blocked?.has(c.toolCallId));
 }
 
+// --- The dispatch contract (2.3, roadmap 23.2) -------------------------------
+//
+// Every tool call of a run takes ONE path, in this order: the finish-reason gate
+// (`run-step.ts`: a refused or cut-off turn dispatches nothing), the policy (the
+// execution policy, then the run's `onToolCall` guardrails), the approval gate,
+// then `executeTools` (admission, the native effect receipt, execution,
+// `onToolResult`) and the step checkpoint. `planToolDispatch` is everything BEFORE `executeTools`, and it
+// is the only implementation of it: the buffered loop's step, the streaming
+// loop's step and the resume settle (`settlePendingApprovals`) all call it, so a
+// rule added here holds for every family that reaches a loop.
+
+/** What a batch of tool calls is cleared to do, decided before anything executes. */
+export interface ToolDispatchPlan {
+  /**
+   * The batch as REPORTED (`StepResult.toolCalls`): the model's own order,
+   * transfers included, with a guardrail's rewrite applied.
+   */
+  calls: ToolCall[];
+  /** What `executeTools` receives: every call but the transfers. Denied calls ride along. */
+  execCalls: ToolCall[];
+  /** Every "this call does not run" verdict: guardrail blocks and approval denials. */
+  denied: DenialMap;
+  /** The verdicts of the `onToolCall` guardrails. */
+  guardrails: GuardrailPart[];
+  /** Ids of the calls the approval gate held. */
+  gated: ReadonlySet<string>;
+  /** A live step's calls waiting for a client verdict. Non-empty: the step suspends. */
+  pendingApproval: ToolCall[];
+  /**
+   * The approval requests for {@link pendingApproval}, bound to their identity
+   * (unsigned: the loop signs them when it suspends).
+   */
+  requests: ToolApprovalRequest[];
+  /** A live step's client tools waiting on the caller. Non-empty: the step suspends. */
+  clientCalls: ToolCall[];
+  /** The transfer verdict, when the batch held a transfer. */
+  handoff?: HandoffDecision;
+}
+
+/** One batch for {@link planToolDispatch}. */
+export interface ToolDispatchInput {
+  /** The calls, in the model's emission order. */
+  calls: ToolCall[];
+  /** The effective tool set the calls resolve against. */
+  tools: ToolSet;
+  options: CommonCallOptions;
+  messages: Message[];
+  /** The step the calls belong to; absent on the settle of a resume leg. */
+  stepIndex?: number;
+  /**
+   * The run's transfer catalog and its active agent (handoff, 2.0). A live step
+   * reads transfers off `tools`; a settle also off the catalog, because the agent
+   * that issued a pending call may no longer be driving.
+   */
+  handoff?: { tools: ToolSet; active?: ActiveAgentState };
+  /**
+   * The resume leg's verdicts. Present: SETTLE mode (verdicts decide, a gated
+   * call without one is denied, nothing suspends). Absent: a live step, whose
+   * gated calls go to `approveToolCall` or suspend the run.
+   */
+  verdicts?: readonly ToolApprovalResponse[];
+  /** What the batch's approvals are bound to besides the calls (see {@link ApprovalScope}). */
+  approval?: ApprovalScope;
+  /** The injected clock: the execution policy's deadline is checked against it. */
+  clock?: Clock;
+  observe?: ExecuteExtras['observe'];
+}
+
+/**
+ * Decide what a batch of tool calls may do, in the contract's order: the
+ * execution policy, the `onToolCall` guardrails, then the approval gate, for
+ * every call (2.3, transfers included), and last the transfer decision among the
+ * transfers they cleared (decided, never executed). Nothing executes here; the caller hands
+ * {@link ToolDispatchPlan.execCalls} and {@link ToolDispatchPlan.denied} to
+ * `executeTools`, or suspends when the plan holds pending approvals or client
+ * calls.
+ */
+export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDispatchPlan> {
+  const { calls: issued, tools, options, messages, stepIndex, verdicts, observe } = input;
+  const settle = verdicts !== undefined;
+  // Policy first (2.3): the run's execution policy refuses a call it forbids
+  // before anything else happens to the batch — no guardrail runs on it, no
+  // human is asked to approve it, no sibling starts, no receipt is written. A
+  // refusal is fatal (`ExecutionPolicyError`, naming the call), as before 2.3;
+  // only its place in the order moved. Transfers and client tools are calls too.
+  if (options.execution) {
+    const { assertExecutionPolicy } = await import('../internal/native-request');
+    for (const call of issued) {
+      assertExecutionPolicy(options.execution, {
+        toolName: call.toolName,
+        toolCallId: call.toolCallId,
+        now: input.clock?.now(),
+      });
+    }
+  }
+  // Policy: the run's `onToolCall` guardrails, over EVERY call of the batch —
+  // transfers included (2.3): a transfer hands the run to another agent, so a
+  // rule that may refuse a call may refuse that one too. It runs BEFORE the
+  // approval gate, so a rewrite reaches `needsApproval` and the request a human
+  // sees.
+  const guarded = await applyToolCallGuardrails(options, issued, messages, stepIndex);
+  const calls = guarded.calls;
+  const catalog = input.handoff?.tools;
+  // The transfers among them are decided, never executed. A settle also reads
+  // the run's whole transfer catalog: an agent never carries a transfer to
+  // itself, so the tool that produced a pending id may be missing from the set
+  // of the agent driving now.
+  const transferSet =
+    catalog && hasHandoffTools(catalog) ? (settle ? { ...tools, ...catalog } : tools) : undefined;
+  const { handoffCalls, normalCalls } = transferSet
+    ? splitHandoffCalls(calls, transferSet)
+    : { handoffCalls: NO_HANDOFF_CALLS, normalCalls: calls };
+  const execCalls = normalCalls;
+  // The gate reads a transfer's `needsApproval` off the same set.
+  const gateTools = settle && transferSet ? transferSet : tools;
+
+  const scope = input.approval ?? {};
+  let denied: DenialMap;
+  let gated: Set<string>;
+  let pendingApproval: ToolCall[] = [];
+  let requests: ToolApprovalRequest[] = [];
+  let clientCalls: ToolCall[] = [];
+  if (settle) {
+    ({ denied, gated } = await settleVerdicts(
+      calls,
+      verdicts,
+      gateTools,
+      options,
+      messages,
+      observe,
+      scope,
+    ));
+  } else {
+    // A blocked call never reaches the approval gate: it already has a verdict,
+    // and gating it would suspend the run on a call that will not run anyway.
+    const candidates =
+      guarded.blocked.size > 0 ? calls.filter((c) => !guarded.blocked.has(c.toolCallId)) : calls;
+    // Server mode denies inline; without `approveToolCall` the gated calls
+    // break the loop like client tools (client mode).
+    gated = await findApprovalNeeded(candidates, gateTools, options, messages);
+    denied = options.approveToolCall
+      ? await resolveServerApprovals(gated, candidates, options, messages)
+      : new Map<string, Denial>();
+    pendingApproval = options.approveToolCall
+      ? []
+      : candidates.filter((c) => gated.has(c.toolCallId));
+    requests = await toApprovalRequests(pendingApproval, options.agentPath, scope);
+    if (observe && gated.size > 0) {
+      const gatedCalls = calls.filter((c) => gated.has(c.toolCallId));
+      const ids = new Map(requests.map((r) => [r.toolCallId, r.approvalId]));
+      for (const c of gatedCalls) {
+        if (!ids.has(c.toolCallId)) {
+          ids.set(c.toolCallId, await approvalIdOf(c, options.agentPath, scope));
+        }
+      }
+      observeApprovalRequests(
+        observe,
+        options,
+        gatedCalls,
+        options.approveToolCall ? 'server' : 'client',
+        ids,
+      );
+      if (options.approveToolCall) {
+        observeServerResolutions(observe, options, gatedCalls, denied, ids);
+      }
+    }
+    // Client tools a guardrail BLOCKED are not pending on anyone (see
+    // pendingClientCalls): they fall through to `executeTools` instead.
+    clientCalls = pendingClientCalls(calls, tools, guarded.blocked);
+  }
+  // LAST, so a guardrail block outranks every other verdict: an approved call a
+  // rule refuses must report the rule, not the approval.
+  for (const [id, denial] of guarded.blocked) denied.set(id, denial);
+
+  // The transfer verdict, among the transfers the policy and the gate cleared.
+  // One still waiting for a verdict defers them all to the resume's settle, so
+  // the model's first transfer keeps its precedence.
+  let handoff: HandoffDecision | undefined;
+  const waiting = new Set(pendingApproval.map((c) => c.toolCallId));
+  if (handoffCalls.length > 0 && !handoffCalls.some((h) => waiting.has(h.call.toolCallId))) {
+    const cleared = handoffCalls.filter((h) => !denied.has(h.call.toolCallId));
+    const decision = cleared.length > 0 ? decideHandoff(cleared, input.handoff?.active) : undefined;
+    const decided = new Map(decision?.results.map((r) => [r.toolCallId, r]) ?? []);
+    handoff = {
+      // One answer per transfer id, in the model's order.
+      results: handoffCalls.map(
+        ({ call }) =>
+          decided.get(call.toolCallId) ?? deniedResult(call, denied.get(call.toolCallId)!),
+      ),
+      ...(decision?.accepted ? { accepted: decision.accepted } : {}),
+    };
+  }
+
+  return {
+    calls,
+    execCalls,
+    denied,
+    guardrails: guarded.parts,
+    gated,
+    pendingApproval,
+    requests,
+    clientCalls,
+    ...(handoff ? { handoff } : {}),
+  };
+}
+
 /**
  * Settle the trailing assistant turn's un-answered tool_use ids on a resume
  * call (`approvalResponses` provided). Verdicts: approved → execute; denied →
@@ -1861,6 +2317,12 @@ export function pendingClientCalls(
  * A transfer is a decision, never an execution (`handoff.ts`'s `execute` throws
  * on purpose), so it is answered from {@link decideHandoff} and the accepted
  * swap is handed back for the caller to apply.
+ *
+ * `approval` (2.3) is the identity the suspended leg bound its requests to: a
+ * verdict counts only under the `approvalId` its call was issued with (see
+ * {@link approvalIdOf}). A durable leg that does not know its suspension step
+ * (a plain call carrying the run's `session`) reads it from the stored
+ * checkpoint.
  */
 export async function settlePendingApprovals(
   messages: Message[],
@@ -1872,6 +2334,7 @@ export async function settlePendingApprovals(
     beforeExecute?: (calls: ToolCall[], deniedIds: ReadonlySet<string>) => void;
   },
   handoff?: { active?: ActiveAgentState; tools: ToolSet },
+  approval?: ApprovalScope,
 ): Promise<{
   messages: Message[];
   results: ToolResult[];
@@ -1917,23 +2380,76 @@ export async function settlePendingApprovals(
     toolName: p.name,
     args: p.input,
   }));
-  // Transfers are resolved by DECISION, never by executing them. The lookup
-  // spans the run's whole transfer catalog, not just the active agent's set: an
-  // agent never carries a transfer to itself, so the tool that produced the
-  // pending id may well be missing from `tools` on this leg.
-  const catalog = handoff?.tools;
-  const { handoffCalls, normalCalls } =
-    catalog && hasHandoffTools(catalog)
-      ? splitHandoffCalls(issued, { ...tools, ...catalog })
-      : { handoffCalls: NO_HANDOFF_CALLS, normalCalls: issued };
-  const decision =
-    handoffCalls.length > 0 ? decideHandoff(handoffCalls, handoff?.active) : undefined;
+  let scope: ApprovalScope = approval ?? {};
+  if (scope.runId !== undefined && scope.step === undefined && options.session) {
+    try {
+      const saved = await options.session.store.load(scope.runId);
+      if (saved?.status === 'suspended') scope = { ...scope, step: saved.stepIndex };
+    } catch {
+      // Unreadable: no verdict can match a step-bound id, so gated calls deny.
+    }
+  }
+  // The same plan a live step makes (transfers by decision, the re-derived
+  // `onToolCall` guardrails, then the gate), here with the leg's verdicts.
+  const plan = await planToolDispatch({
+    calls: issued,
+    tools,
+    options,
+    messages,
+    ...(handoff ? { handoff } : {}),
+    verdicts: responses,
+    approval: scope,
+    ...(extras?.deps ? { clock: extras.deps.clock } : {}),
+    ...(extras?.observe ? { observe: extras.observe } : {}),
+  });
 
-  // The run's own execution-side defense, re-derived on this leg (see the note
-  // above). It runs BEFORE the approval gate so a rewrite reaches
-  // `needsApproval` exactly as it did on the leg that suspended.
-  const guarded = await applyToolCallGuardrails(options, normalCalls, messages);
-  const calls = guarded.calls;
+  const deniedIds = new Set(plan.denied.keys());
+  lifecycle?.beforeExecute?.(plan.execCalls, deniedIds);
+  const executed = await executeTools(
+    plan.execCalls,
+    tools,
+    options,
+    messages,
+    plan.denied,
+    extras,
+  );
+  // Back into the order the MODEL issued them, transfers included — the turn
+  // has to read the way it was written.
+  const results = plan.handoff
+    ? mergeResultsInCallOrder(issued, executed, plan.handoff.results)
+    : executed;
+  const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
+  return {
+    messages: [...messages, toolMessage],
+    results,
+    deniedIds,
+    denied: plan.denied,
+    guardrails: plan.guardrails,
+    ...(plan.handoff ? { handoff: plan.handoff } : {}),
+  };
+}
+
+/**
+ * The settle half of the approval gate: turn a resume leg's verdicts into
+ * denials. Approved calls run; denied ones get the verdict's reason; a gated call
+ * with no verdict and a client tool with no result are denied (safe side).
+ * Signed approvals must echo a token that verifies and is bound to this call.
+ *
+ * A verdict answers a call only under the `approvalId` the call was issued with
+ * (2.3, {@link approvalIdOf}). The 2.2 form, the bare tool call id, still answers
+ * a call whose id occurs once in the history (a run suspended before 2.3, or a
+ * client that built its verdicts from `toolCallId`); a reused id (`tool_0`) needs
+ * the bound one, because the bare id cannot say which of its calls it approves.
+ */
+async function settleVerdicts(
+  calls: ToolCall[],
+  responses: readonly ToolApprovalResponse[],
+  tools: ToolSet,
+  options: CommonCallOptions,
+  messages: Message[],
+  ob: ExecuteExtras['observe'] | undefined,
+  scope: ApprovalScope,
+): Promise<{ denied: DenialMap; gated: Set<string> }> {
   const signer = options.approvalSigner;
   const expectedRunId = options.session?.runId;
   const payloads = new Map<ToolApprovalResponse, SignedApprovalPayload | null>();
@@ -1972,20 +2488,38 @@ export async function settlePendingApprovals(
       seen.add(response.approvalId);
     }
   }
-  const noVerdict = calls.filter((c) => !byId.has(c.toolCallId));
+  // Each call's verdict, under the id it was issued with (or the 2.2 form).
+  const reused = reusedToolCallIds(messages);
+  const matched = new Map<string, { verdict: ToolApprovalResponse; approvalId: string }>();
+  const boundIds = new Map<string, string>();
+  for (const c of calls) {
+    const bound = await approvalIdOf(c, options.agentPath, scope);
+    boundIds.set(c.toolCallId, bound);
+    const exact = byId.get(bound);
+    if (exact) matched.set(c.toolCallId, { verdict: exact, approvalId: bound });
+    else if (!reused.has(c.toolCallId) && byId.has(c.toolCallId))
+      matched.set(c.toolCallId, { verdict: byId.get(c.toolCallId)!, approvalId: c.toolCallId });
+  }
+  const noVerdict = calls.filter((c) => !matched.has(c.toolCallId));
   const gated = await findApprovalNeeded(noVerdict, tools, options, messages);
 
   const denied: DenialMap = new Map();
   for (const c of calls) {
-    const verdict = byId.get(c.toolCallId);
-    if (verdict) {
-      if (duplicateVerdicts.has(c.toolCallId)) {
+    const entry = matched.get(c.toolCallId);
+    const verdict = entry?.verdict;
+    if (entry && verdict) {
+      if (duplicateVerdicts.has(entry.approvalId)) {
         denied.set(c.toolCallId, {
           cause: 'response-denied',
           reason: 'Duplicate approval verdicts.',
+          outcome: 'approval-denied',
         });
       } else if (!verdict.approved) {
-        denied.set(c.toolCallId, { cause: 'response-denied', reason: verdict.reason });
+        denied.set(c.toolCallId, {
+          cause: 'response-denied',
+          reason: verdict.reason,
+          outcome: 'approval-denied',
+        });
       } else if (signer) {
         // Signed-approval enforcement (1.7, D4): an APPROVAL must echo a token
         // that verifies, matches this approvalId, and — on durable runs —
@@ -2002,14 +2536,17 @@ export async function settlePendingApprovals(
                 )
                 .catch(() => null)
             : null;
+        // The token names the approval it was issued for: the id the verdict
+        // matched, or this call's bound id (a 2.2-form verdict echoing a 2.3 token).
         const valid =
           payload !== null &&
-          payload.approvalId === c.toolCallId &&
+          (payload.approvalId === entry.approvalId ||
+            payload.approvalId === boundIds.get(c.toolCallId)) &&
           (expectedRunId === undefined ||
             payload.runId === undefined ||
             payload.runId === expectedRunId) &&
           (!options.execution ||
-            (!duplicateVerdicts.has(c.toolCallId) &&
+            (!duplicateVerdicts.has(entry.approvalId) &&
               payload.runId === expectedRunId &&
               payload.toolCallId === c.toolCallId &&
               payload.toolName === c.toolName &&
@@ -2019,6 +2556,7 @@ export async function settlePendingApprovals(
           denied.set(c.toolCallId, {
             cause: 'response-denied',
             reason: 'Approval token missing, invalid, expired, or bound to another run.',
+            outcome: 'approval-denied',
           });
         }
       }
@@ -2026,24 +2564,26 @@ export async function settlePendingApprovals(
       denied.set(c.toolCallId, {
         cause: 'client-tool-no-result',
         reason: 'No result provided for this client tool.',
+        outcome: 'tool-error',
       });
       // A HALLUCINATED name is not a client tool (1.9): no denial is recorded so
       // it reaches executeTools and gets the actionable unknown-tool is_error.
     } else if (gated.has(c.toolCallId)) {
-      denied.set(c.toolCallId, { cause: 'no-response', reason: 'No approval response.' });
+      denied.set(c.toolCallId, {
+        cause: 'no-response',
+        reason: 'No approval response.',
+        outcome: 'approval-denied',
+      });
     }
   }
-  // LAST, so a guardrail block outranks every other verdict: an approved call a
-  // rule refuses must report the rule, not the approval.
-  for (const [id, denial] of guarded.blocked) denied.set(id, denial);
 
   // Observation (1.6): resume-leg approval resolutions. Explicit verdicts
   // resolve as 'client-response'; verdict-less gated calls as 'default-deny'.
   // Client tools without a result are not approvals (tool.denied covers them).
-  const ob = extras?.observe;
   if (ob) {
     for (const c of calls) {
-      const verdict = byId.get(c.toolCallId);
+      const entry = matched.get(c.toolCallId);
+      const verdict = entry?.verdict;
       const defaultDenied = !verdict && gated.has(c.toolCallId);
       if (!verdict && !defaultDenied) continue;
       ob.rt.emit({
@@ -2051,7 +2591,7 @@ export async function settlePendingApprovals(
         spanId: ob.rt.startSpan().spanId,
         parentSpanId: ob.parentSpanId,
         agentPath: options.agentPath,
-        approvalId: c.toolCallId,
+        approvalId: entry?.approvalId ?? boundIds.get(c.toolCallId) ?? c.toolCallId,
         toolCallId: c.toolCallId,
         toolName: c.toolName,
         approved: verdict?.approved === true,
@@ -2060,22 +2600,7 @@ export async function settlePendingApprovals(
       });
     }
   }
-
-  const deniedIds = new Set(denied.keys());
-  lifecycle?.beforeExecute?.(calls, deniedIds);
-  const executed = await executeTools(calls, tools, options, messages, denied, extras);
-  // Back into the order the MODEL issued them, transfers included — the turn
-  // has to read the way it was written.
-  const results = decision ? mergeResultsInCallOrder(issued, executed, decision.results) : executed;
-  const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
-  return {
-    messages: [...messages, toolMessage],
-    results,
-    deniedIds,
-    denied,
-    guardrails: guarded.parts,
-    ...(decision ? { handoff: decision } : {}),
-  };
+  return { denied, gated };
 }
 
 /** Signed JSON values compare structurally, independent of object key order. */
@@ -2143,6 +2668,8 @@ export function observeApprovalRequests(
   options: CommonCallOptions,
   gatedCalls: ToolCall[],
   mode: 'server' | 'client',
+  /** Each call's identity-bound approval id (2.3), by tool call id. */
+  ids: ReadonlyMap<string, string>,
 ): void {
   for (const call of gatedCalls) {
     ob.rt.emit({
@@ -2151,7 +2678,7 @@ export function observeApprovalRequests(
       parentSpanId: ob.parentSpanId,
       stepIndex: ob.stepIndex,
       agentPath: options.agentPath,
-      approvalId: call.toolCallId, // === toolCallId today (toApprovalRequests contract)
+      approvalId: ids.get(call.toolCallId) ?? call.toolCallId,
       toolCallId: call.toolCallId,
       toolName: call.toolName,
       mode,
@@ -2166,6 +2693,8 @@ export function observeServerResolutions(
   options: CommonCallOptions,
   gatedCalls: ToolCall[],
   denied: DenialMap,
+  /** Each call's identity-bound approval id (2.3), by tool call id. */
+  ids: ReadonlyMap<string, string>,
 ): void {
   for (const call of gatedCalls) {
     ob.rt.emit({
@@ -2174,7 +2703,7 @@ export function observeServerResolutions(
       parentSpanId: ob.parentSpanId,
       stepIndex: ob.stepIndex,
       agentPath: options.agentPath,
-      approvalId: call.toolCallId,
+      approvalId: ids.get(call.toolCallId) ?? call.toolCallId,
       toolCallId: call.toolCallId,
       toolName: call.toolName,
       approved: !denied.has(call.toolCallId),
@@ -2272,6 +2801,16 @@ export async function executeTools(
   // allocation-free.
   const executed =
     guardrailList(options.guardrails?.onToolResult).length > 0 ? new Set<string>() : undefined;
+  // The tool-call and tool-result hooks a sub-agent inherits (2.3); undefined
+  // when the run has neither, so a plain tool's context is unchanged.
+  const { onToolCall, onToolResult } = options.guardrails ?? {};
+  const inheritedGuardrails =
+    onToolCall !== undefined || onToolResult !== undefined
+      ? {
+          ...(onToolCall !== undefined ? { onToolCall } : {}),
+          ...(onToolResult !== undefined ? { onToolResult } : {}),
+        }
+      : undefined;
   if (nativeBatch)
     options = { ...options, signal: combineSignals([options.signal, nativeBatch.signal]) };
   const results = mapWithConcurrency(
@@ -2284,6 +2823,7 @@ export async function executeTools(
       if (options.execution) {
         nativePolicy!.assertExecutionPolicy(options.execution, {
           toolName: call.toolName,
+          toolCallId: call.toolCallId,
           now: extras?.deps?.clock.now(),
         });
         if (options.signal?.aborted)
@@ -2344,12 +2884,7 @@ export async function executeTools(
               ...(denial.reason ? { reason: denial.reason } : {}),
             });
           }
-          return settle({
-            toolCallId: call.toolCallId,
-            toolName: call.toolName,
-            result: denial.reason ? `${TOOL_DENIED} Reason: ${denial.reason}` : TOOL_DENIED,
-            isError: true,
-          });
+          return settle(deniedResult(call, denial));
         }
         if (!tool) {
           // Hallucinated tool name (1.9): self-heal like every other tool failure —
@@ -2369,6 +2904,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: message,
             isError: true,
+            outcome: 'tool-error',
           });
         }
         if (!tool.execute) {
@@ -2378,6 +2914,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: 'No server-side executor.',
             isError: true,
+            outcome: 'tool-error',
           });
         }
         // Arguments that never parsed reach here as their raw JSON text (2.3,
@@ -2396,6 +2933,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: message,
             isError: true,
+            outcome: 'tool-error',
           });
         }
         const validation = await validateOutput(tool.parameters, call.args);
@@ -2406,6 +2944,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: `Invalid arguments: ${validation.issues}`,
             isError: true,
+            outcome: 'tool-error',
           });
         }
         // Per-execution cap (1.9): the tool's OWN `timeoutMs` outranks the call's
@@ -2464,11 +3003,14 @@ export async function executeTools(
             ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
             ...(extras?.session ? { session: extras.session } : {}),
             ...(extras?.approvalResponses ? { approvalResponses: extras.approvalResponses } : {}),
+            // A sub-agent's calls stay under this run's tool policy (2.3).
+            ...(inheritedGuardrails ? { guardrails: inheritedGuardrails } : {}),
           };
           const invoke = async (): Promise<unknown> => {
             if (options.execution) {
               nativePolicy!.assertExecutionPolicy(options.execution, {
                 toolName: call.toolName,
+                toolCallId: call.toolCallId,
                 now: clock?.now(),
               });
               if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('Execution cancelled.');
@@ -2508,6 +3050,7 @@ export async function executeTools(
               toolName: call.toolName,
               result: message,
               isError: true,
+              outcome: 'tool-error',
             });
           }
           const out = outcome.value;
@@ -2540,6 +3083,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: err.message,
             isError: true,
+            outcome: 'tool-error',
           });
         }
       } catch (cause) {

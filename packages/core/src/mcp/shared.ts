@@ -1,6 +1,7 @@
 import type { ToolSet, Tool } from '../types/tool';
 import type { JSONSchema } from '../types/schema';
-import type { Clock } from '../types/deps';
+import type { Clock, Dependencies } from '../types/deps';
+import type { NativeExecutionContext } from '../types/execution';
 import type { ImagePart, Message, TextPart } from '../types/message';
 import type { LanguageModel } from '../types/model';
 import { resolveDependencies } from '../internal/resolve-deps';
@@ -1078,6 +1079,17 @@ export interface McpSamplingOptions {
    * back to the server, so a refusal costs nothing and is visible upstream.
    */
   approve?: (req: McpSamplingRequest) => boolean | Promise<boolean>;
+  /**
+   * The execution context sampling requests run under (2.3): a request takes the
+   * dispatch contract's path like a tool call. Its policy is checked first
+   * (`allowedModels`, the deadline), before `approve` asks anyone, and the call
+   * is reserved on its ledger like any model call of the run, so the server
+   * cannot spend past the run's budget. Pass a child of the run's context to
+   * account for sampling separately. Omitted: no policy and no budget, as before.
+   */
+  execution?: NativeExecutionContext;
+  /** Dependencies of the sampling call (2.3): its clock, `priceProvider` and transport. */
+  deps?: Dependencies;
 }
 
 /** The `sampling/createMessage` result, in MCP's shape (always one text block). */
@@ -1165,9 +1177,19 @@ export function buildSamplingHandler(
         ? { modelPreferences: p.modelPreferences as Record<string, unknown> }
         : {}),
     };
-    // The gate runs FIRST, so a refused request never reaches the provider. A
-    // throwing `approve` propagates verbatim — its message is more useful to the
-    // server than one we would invent for it.
+    // The run's policy comes first (2.3, the dispatch contract's order): a
+    // request it forbids is refused before `approve` asks anyone.
+    if (opts.execution) {
+      // The chunk the loops already load for native policy checks (no new split point).
+      const { assertExecutionPolicy } = await import('../internal/native-request');
+      assertExecutionPolicy(opts.execution, {
+        modelId: opts.model.modelId,
+        now: resolveDependencies(opts.deps).clock.now(),
+      });
+    }
+    // The gate runs before the model, so a refused request never reaches the
+    // provider. A throwing `approve` propagates verbatim — its message is more
+    // useful to the server than one we would invent for it.
     if (opts.approve && !(await opts.approve(request))) {
       throw new InvalidRequestError({
         message: 'The MCP sampling request was declined by the client.',
@@ -1180,6 +1202,9 @@ export function buildSamplingHandler(
       maxOutputTokens: request.maxTokens,
       ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
       ...(request.stopSequences ? { stopSequences: request.stopSequences } : {}),
+      // Reserved on the run's ledger like its own model calls (2.3).
+      ...(opts.execution ? { execution: opts.execution } : {}),
+      ...(opts.deps ? { deps: opts.deps } : {}),
     });
     return {
       role: 'assistant',

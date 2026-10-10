@@ -138,14 +138,37 @@ persisted or any model call is made.
 A run checkpointed before 2.3, or one that had no MCP servers, has no recorded
 catalog. Resuming it records the catalog it is resumed with.
 
-## Hot refresh
+## Hot refresh and `onCatalogChange`
 
-A server that announces `tools/list_changed` is re-read at the next step
-boundary, as in the tool loop. In a native run the refreshed catalog opens a new
-binding revision: the new catalog is persisted before the model is offered it,
-and the change is reported as a `warning` part with `setting: 'mcp'`:
+A server that announces `tools/list_changed` is re-read before the next step, as
+in the tool loop. When its catalog really changed, the run's `onCatalogChange`
+decides what happens (2.3):
+
+- `'stop'`, the default: the run stops with reason `'mcp-catalog-changed'` before
+  the model is offered the new catalog. Its binding keeps the catalog the run was
+  bound to, and no step is counted for the stop.
+- `'accept'`: the refreshed catalog opens a new binding revision. It is persisted
+  before the model is offered it, so a later resume compares against it, and the
+  tools that arrive this way carry receipts like every other tool.
+
+Either way the change is reported as a `warning` part with `setting: 'mcp'`. An
+announcement that changed nothing does neither. A server rewriting a tool's
+description in the middle of a run is a change too; the
+[drift guide](/docs/modules/mcp#detecting-tool-drift-22) explains why that matters.
 
 ```ts
+import { streamAgent } from '@deuz-sdk/core/agent';
+import type { McpClient } from '@deuz-sdk/core/mcp';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+declare const orders: McpClient; // a connected server that may change its tools
+
+const stream = streamAgent({
+  model: createMockModel({ responses: [{ text: 'Done.' }] }),
+  prompt: 'Process the order.',
+  mcp: [orders],
+  onCatalogChange: 'accept', // the default 'stop' ends the run instead
+});
 for await (const event of stream.events) {
   if (event.type === 'part' && event.part.type === 'warning' && event.part.warning.setting === 'mcp') {
     console.warn(event.part.warning.message);
@@ -154,11 +177,42 @@ for await (const event of stream.events) {
 }
 ```
 
-Tools that arrive this way carry receipts like every other tool. A later resume
-compares against the refreshed catalog. If the change itself is unacceptable,
-for example a server rewriting a tool's description in the middle of a run,
-stop the run from the warning: the [drift guide](/docs/modules/mcp#detecting-tool-drift-22)
-covers the policy options.
+`generateText` and `streamChat` default to `'accept'`: they carry on with the new
+catalog and report the change as a warning. With `onCatalogChange: 'stop'` they end
+with `providerMetadata.deuz.stoppedBy: 'mcp-catalog-changed'` instead.
+
+## Name collisions
+
+A local tool wins over an MCP tool of the same name, and of two servers that expose
+the same (namespaced) name the later one wins. Since 2.3 neither is silent: each is
+a typed warning (`type: 'unsupported-tool'`, `setting: 'mcp'`) on the call's
+`warnings` and as a `warning` part, in native runs and in the tool loop. Set a
+`namespace` on an entry to keep both servers' tools.
+
+## Sampling requests
+
+A server can ask the client to run a model call for it (MCP sampling). Pass the
+run's execution context as `sampling.execution` and the request takes the same
+path as a tool call: the context's policy decides first (`allowedModels`, the
+deadline), then your `approve` gate, and the call is reserved on the context's
+ledger like the run's own model calls, so a server cannot spend past the run's
+budget. Pass a child of the run's context to account for sampling on its own.
+
+```ts
+import { createExecutionContext } from '@deuz-sdk/core/agent';
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const execution = createExecutionContext({ budget: { tokens: 20_000 } });
+const client = await createMcpClient({
+  transport: { type: 'http', url: 'https://tools.example.com/mcp' },
+  sampling: {
+    model: createMockModel({ responses: [{ text: 'A short summary.' }] }),
+    execution,
+    approve: (request) => request.maxTokens <= 1_000,
+  },
+});
+```
 
 ## Output schemas
 

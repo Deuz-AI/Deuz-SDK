@@ -195,6 +195,21 @@ async function prepareToolSet(
             if (receipt && receipt.stage !== 'executing' && receipt.stage !== 'suspended')
               rawResult = receipt.rawResult;
             else {
+              // Admission BEFORE the effect identity (2.3, dispatch contract): a
+              // call the policy refuses, or one cancelled before it starts, never
+              // leaves an 'executing' receipt, which a resume would read as an
+              // effect of unknown outcome.
+              const admit = (): void => {
+                if (ctx.execution)
+                  assertExecutionPolicy(ctx.execution, {
+                    toolName: name,
+                    toolCallId: ctx.toolCallId,
+                    now: ctx.deps?.clock.now(),
+                  });
+                if (ctx.signal?.aborted)
+                  throw new ToolReceiptError('Tool execution was cancelled before dispatch.');
+              };
+              admit();
               await save({
                 toolCallId: ctx.toolCallId,
                 toolName: name,
@@ -204,13 +219,8 @@ async function prepareToolSet(
                 // by a namesake: a handoff target's tool can share a root name.
                 idempotent: tool.replay === 'idempotent',
               });
-              if (ctx.execution)
-                assertExecutionPolicy(ctx.execution, {
-                  toolName: name,
-                  now: ctx.deps?.clock.now(),
-                });
-              if (ctx.signal?.aborted)
-                throw new ToolReceiptError('Tool execution was cancelled before dispatch.');
+              // The commit itself can outlast the deadline or a cancel (2.2).
+              admit();
               try {
                 rawResult = await tool.execute!(args, scopedContext);
               } catch (error) {

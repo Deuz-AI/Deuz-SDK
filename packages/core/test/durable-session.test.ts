@@ -208,7 +208,8 @@ describe('durable checkpoints — buffered loop (generateText)', () => {
     expect(cp.stepIndex).toBe(1);
     expect(cp.pendingApprovals).toEqual([
       {
-        approvalId: 'toolu_1',
+        // Bound to the run, the suspended checkpoint's step and the call (2.3).
+        approvalId: expect.stringMatching(/^toolu_1@[0-9a-f]{24}$/),
         toolCallId: 'toolu_1',
         toolName: 'getWeather',
         input: { city: 'Paris' },

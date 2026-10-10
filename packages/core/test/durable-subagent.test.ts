@@ -132,7 +132,7 @@ describe('durable sub-agent client-mode approval — suspend', () => {
     expect(res.runId).toBe('run-sub');
     expect(res.pendingApprovals).toEqual([
       {
-        approvalId: 'call_d',
+        approvalId: expect.stringMatching(/^call_d@[0-9a-f]{24}$/),
         toolCallId: 'call_d',
         toolName: 'danger',
         input: { q: 'x' },
@@ -148,7 +148,7 @@ describe('durable sub-agent client-mode approval — suspend', () => {
     const parent = await store.load('run-sub');
     expect(parent?.status).toBe('suspended');
     expect(parent?.pendingApprovals?.[0]).toMatchObject({
-      approvalId: 'call_d',
+      approvalId: expect.stringMatching(/^call_d@[0-9a-f]{24}$/),
       agentPath: ['worker'],
     });
     // Parent usage: parent step (15) + child step (15).
@@ -161,7 +161,7 @@ describe('durable sub-agent client-mode approval — suspend', () => {
     expect(child?.agentPath).toEqual(['worker']);
     expect(child?.usage.totalTokens).toBe(15);
     expect(child?.pendingApprovals?.[0]).toMatchObject({
-      approvalId: 'call_d',
+      approvalId: expect.stringMatching(/^call_d@[0-9a-f]{24}$/),
       toolName: 'danger',
       agentPath: ['worker'],
     });
@@ -192,7 +192,7 @@ describe('durable sub-agent client-mode approval — suspend', () => {
         p.type === 'tool-approval-request',
     );
     expect(approvals).toHaveLength(1);
-    expect(approvals[0]).toMatchObject({ approvalId: 'call_d', agentPath: ['worker'] });
+    expect(approvals[0]).toMatchObject({ toolCallId: 'call_d', agentPath: ['worker'] });
     expect((await store.load('run-st-sub'))?.status).toBe('suspended');
     expect((await store.load('run-st-sub::worker#call_w'))?.status).toBe('suspended');
     // The parent's own step finished on tool_calls — no new FinishReason invented.
@@ -337,7 +337,7 @@ describe('durable sub-agent client-mode approval — resume', () => {
     expect(dangerFn).toHaveBeenCalledTimes(1); // call_d ran; call_d2 is pending
     expect(res2.pendingApprovals).toEqual([
       {
-        approvalId: 'call_d2',
+        approvalId: expect.stringMatching(/^call_d2@[0-9a-f]{24}$/),
         toolCallId: 'call_d2',
         toolName: 'danger',
         input: { q: 'y' },

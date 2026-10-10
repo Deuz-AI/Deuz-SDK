@@ -183,7 +183,13 @@ tool implementation or verifier requires a new `bindingId`. A
 completed native envelope returns its stored result without another model call.
 
 Resuming without all pending approval verdicts keeps the run suspended. An absent
-verdict is not a denial. Client-side tools likewise remain suspended until
+verdict is not a denial. Since 2.3 a pending approval's `approvalId` is bound to the
+call it was issued for: the run, the step it suspended at, the tool call ID, the tool
+name and a digest of the arguments. Answer with the `approvalId` you were given. A
+verdict kept from an earlier gate then never approves a later call, even when a
+provider that sends no call IDs reuses `tool_0` for it. A verdict that names only the
+tool call ID (the 2.2 form) still counts when that ID occurs once in the run's history.
+Client-side tools likewise remain suspended until
 `clientToolResults` supplies every pending call ID; each entry has `toolCallId`,
 `output`, and an optional `isError`. Supplied results pass through the same approval,
 validation and model-projection path as server tools.
@@ -204,7 +210,9 @@ validation/projection; a projection can be retried without repeating the effect.
 An interrupted `executing` receipt cannot establish whether an external system
 accepted the effect. Resume returns `tool-reconciliation-required` until the
 application reconciles that effect and explicitly authorizes the relevant
-`retryToolCallIds`. Completed receipts can reuse their result. These receipts do
+`retryToolCallIds`; since 2.3 the stopped result lists those receipts in
+`unknownEffects` (see [When the store fails](#when-the-store-fails)). Completed
+receipts can reuse their result. These receipts do
 not provide exactly-once execution across an external service and the local
 checkpoint transaction.
 
@@ -253,6 +261,107 @@ console.log(result.status, board.size);
 
 Only mark a tool idempotent when repeating it truly has no further effect, and
 bump `bindingId` when you change the flag on a durable run.
+
+### When the store fails
+
+What a resume does depends on where the store failed:
+
+- **Before the effect.** The `executing` receipt could not be written, so the tool
+  never ran. The run fails; a resume replays the step from its last checkpoint.
+- **Between the effect and its completed receipt.** The outcome is unknown. The
+  resume stops with `tool-reconciliation-required`, writes nothing, and lists the
+  receipts in `unknownEffects`. Check each effect in the system it touched, then
+  resume with `retryToolCallIds` for the calls to run again. A
+  `replay: 'idempotent'` tool runs again by itself, under the same
+  `[modelStep, toolCallId]` identity.
+- **After the completed receipt** (the step checkpoint). A resume replays the
+  recorded result; the tool does not run again.
+
+```ts
+import { createInMemoryAgentRunStore, resumeAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const options = {
+  model: createMockModel({ responses: [{ text: 'Charged.' }] }),
+  prompt: 'Charge the order.',
+  tools: {
+    charge: {
+      description: 'Charge the order once.',
+      parameters: { type: 'object' as const, properties: {} },
+      execute: () => 'charged',
+    },
+  },
+  session: { store: createInMemoryAgentRunStore(), runId: 'order-7', scope: 'tenant-a' },
+};
+
+// A run interrupted between the effect and its receipt (not shown) resumes here.
+const resumed = await resumeAgent(options);
+if (resumed.status === 'stopped' && resumed.reason === 'tool-reconciliation-required') {
+  // Decide per call, from the system the effect touched.
+  const lost = (resumed.unknownEffects ?? []).filter((receipt) => receipt.toolName === 'charge');
+  await resumeAgent({ ...options, retryToolCallIds: lost.map((receipt) => receipt.toolCallId) });
+}
+```
+
+A call that is listed in `retryToolCallIds` runs once more; a completed run never
+runs it again.
+
+## One path for every tool call
+
+Since 2.3 every tool call of a run takes one path, in this order (roadmap 23.2):
+
+1. **Finish-reason gate.** A refused or cut-off turn (`content_filter`, `length`)
+   dispatches none of its calls.
+2. **Policy.** The execution policy decides first, for the whole batch: a call it
+   forbids fails the run with `ExecutionPolicyError` (`code: 'tool_not_allowed'`,
+   `toolCallId` names the call) before any guardrail runs on the batch, any human is
+   asked to approve it, or any sibling starts. Then the `onToolCall` guardrails block
+   or rewrite.
+3. **Approval.** `needsApproval`, `requireApproval`, and `approveToolCall` or a
+   client-mode suspension.
+4. **Admission.** The deadline and cancellation are checked again right before the
+   effect. A model call reserves its budget here.
+5. **Effect identity.** `[modelStep, toolCallId]`, and the receipt `executing`.
+6. **Execution.**
+7. **Receipt `completed`, and `onToolResult`.** The receipt keeps the raw result and
+   the tool's own projection. `onToolResult` changes only the copy the model sees,
+   and runs again on a replayed receipt.
+8. **Checkpoint.**
+
+The same path serves local tools, MCP tools (at connect, after a hot refresh, with
+an `outputSchema`), [handoff](/docs/agents/handoffs) transfers, swarm blackboard
+tools, the calls of spawned swarm tasks and of sub-agents, and, for the model calls
+they make, evolve mutations and MCP sampling requests. A tool that `prepareStep`
+puts on the wire, or that an MCP refresh brings in, is gated like any other. The
+resume settle takes the same path as a live step: it re-runs the policy before it
+executes an approved call.
+
+A transfer is gated like any call. A guardrail, `requireApproval`, or a
+`needsApproval` on the transfer tool can refuse it; the refused transfer is answered
+with its denial, and the run stays with the current agent. A transfer waiting for a
+verdict suspends the run like any gated call.
+
+A child only narrows the run. A sub-agent (`agentTool`) runs under a child of the
+run's execution context (allowlists, deadline, budget, cancellation) and inherits
+its approver and its `onToolCall` / `onToolResult` guardrails. A handoff target's
+model and tools are held to the run's allowlists and spend from its ledger. A
+spawned swarm task runs under the swarm's policy and budget.
+
+### Outcomes
+
+Each way a call can end is distinguishable, on results and on stream parts:
+
+| Outcome | Where it shows |
+| --- | --- |
+| `'tool-error'` | `ToolResult.outcome`, the `tool-result` part and the terminal `tool-state` part: the tool threw, timed out, got invalid input, has no executor, or does not exist |
+| `'permission-denied'` | the same places: an `onToolCall` guardrail or the handoff budget refused the call, or `onToolResult` withheld its output. A call the execution policy forbids fails the run; a `tool-state` part names it first |
+| `'approval-denied'` | the same places: the approver said no, or the resume had no valid verdict for the call |
+| `'approval-pending'` | the `awaiting-approval` `tool-state` part; the run suspends with `pendingApprovals` |
+| `'unknown-effect'` | a resume that stops with `tool-reconciliation-required` lists the receipts in `unknownEffects` and streams a `tool-state` part for each |
+| model error | the run fails (`status: 'failed'`, the provider error's `name` and `code`); the stream ends with an `error` part |
+| refusal | the run stops with reason `'refusal'`; `stopDetails` carries the provider's explanation |
+
+A successful result carries no `outcome`, as before 2.3.
 
 ## Tool context and supported options
 

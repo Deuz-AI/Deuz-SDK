@@ -7,6 +7,7 @@ import type { SessionStore } from './session';
 import type { ApprovalSigner } from '../durable';
 import type { NativeExecutionContext } from './execution';
 import type { StopDetails } from './methods';
+import type { Guardrails } from './guardrails';
 
 /** Context handed to a tool's `execute`. */
 export interface ToolExecuteContext {
@@ -47,6 +48,13 @@ export interface ToolExecuteContext {
    * an observation event. Sub-agents inherit it.
    */
   runtimeContext?: unknown;
+  // --- 2.3 additive: the dispatch contract seam. ---
+  /**
+   * The run's `onToolCall` / `onToolResult` guardrails, inherited by a sub-agent
+   * (`agentTool`) so its own tool calls stay under the parent run's policy: a
+   * sub-agent narrows what the run may do, never widens it.
+   */
+  guardrails?: Pick<Guardrails, 'onToolCall' | 'onToolResult'>;
 }
 
 /**
@@ -101,12 +109,44 @@ export interface ToolCall {
   args: unknown;
 }
 
+/**
+ * How a tool call ended (2.3), named after the step of the dispatch contract
+ * that decided it:
+ *
+ * - `'success'` — the tool ran and returned.
+ * - `'tool-error'` — the tool failed: it threw or timed out, its input was not
+ *   valid, its name is unknown, it has no executor, or a client tool got no
+ *   result. The model can correct the call.
+ * - `'permission-denied'` — the run's policy refused it: an `onToolCall`
+ *   guardrail, the execution policy (`allowedTools`, which also fails the run),
+ *   the handoff budget, or an `onToolResult` guardrail that withheld the output
+ *   of a call that did run.
+ * - `'approval-denied'` — an approval verdict refused it: the approver said no,
+ *   or the resume carried no valid verdict for it.
+ * - `'approval-pending'` — it waits for a verdict; the run suspended.
+ * - `'unknown-effect'` — it started, but its outcome was never recorded (an
+ *   interrupted native receipt); see `AgentResult.unknownEffects`.
+ *
+ * Results and parts carry it on errors and pending states; a successful result
+ * carries none, as before 2.3. A model error and a refusal end the run, not a
+ * call: they surface as an `error` part and a `content_filter` finish.
+ */
+export type ToolCallOutcome =
+  | 'success'
+  | 'tool-error'
+  | 'permission-denied'
+  | 'approval-denied'
+  | 'approval-pending'
+  | 'unknown-effect';
+
 /** The result of executing a `ToolCall`. */
 export interface ToolResult {
   toolCallId: string;
   toolName: string;
   result: unknown;
   isError?: boolean;
+  /** Why the call ended in an error (2.3); absent on a successful result. */
+  outcome?: ToolCallOutcome;
 }
 
 /**
