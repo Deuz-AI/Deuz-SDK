@@ -183,18 +183,20 @@ therefore bills each token once:
 
 How each wire maps onto that contract:
 
-| Adapter                         | Normalization                                                                                                                                                   |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| OpenAI Responses                | `output_tokens` already includes `reasoning_tokens`; cached reads are split out of `input_tokens`.                                                              |
-| Chat Completions (OpenAI-style) | `completion_tokens` includes reasoning. A host that counts reasoning beside it (its total is prompt + completion + reasoning) has it folded into `outputTokens`. |
-| DeepSeek, Moonshot              | Cache hits from `prompt_cache_hit_tokens` or a top-level `cached_tokens` count as cached reads.                                                                 |
-| Anthropic                       | `output_tokens` includes thinking; the `thinking_tokens` detail becomes `reasoningTokens`. Both cache-write TTLs are kept apart.                                 |
-| Gemini native                   | `outputTokens` is candidates + thoughts; `thoughtsTokenCount` becomes `reasoningTokens`.                                                                        |
+| Adapter            | Normalization                                                              |
+| ------------------ | -------------------------------------------------------------------------- |
+| OpenAI Responses   | `output_tokens` already includes `reasoning_tokens`.                       |
+| Chat Completions   | `completion_tokens` already includes reasoning.                            |
+| DeepSeek, Moonshot | `prompt_cache_hit_tokens` or a top-level `cached_tokens` are cached reads. |
+| Anthropic          | `output_tokens` includes thinking; `thinking_tokens` is its share.         |
+| Gemini native      | `outputTokens` is candidates + thoughts; thoughts are its share.           |
 
-The DeepSeek, Moonshot and folded-reasoning shapes come from provider
-documentation and are not live-verified. Usage you build yourself in the 2.2
-shape, with `reasoningTokens` larger than `outputTokens`, still bills both
-counters in full.
+On every wire, `inputTokens` leaves cached reads out. A Chat Completions or
+Responses-shaped host that counts reasoning beside the output (its total is
+prompt + output + reasoning, or the reasoning exceeds the output) has it folded
+into `outputTokens`. These host shapes come from provider documentation and are
+not live-verified. Usage you build yourself in the 2.2 shape, with
+`reasoningTokens` larger than `outputTokens`, still bills both counters in full.
 
 <Callout title="Audio">
   `audioTokens` merges prompt and completion audio. A row's `audio` rate re-prices that whole share
@@ -530,14 +532,14 @@ tier.
 
 ## API at a glance
 
-| Export                                               | Use it for                               |
-| ---------------------------------------------------- | ---------------------------------------- |
-| `priceUsage(model, usage, table?)`                   | Estimate one invocation in USD.          |
-| `cacheSavings(model, usage, table?)`                 | Estimate savings from cache reads.       |
-| `createPriceProvider({ table?, aliases?, margin? })` | Inject pricing into calls or clients.    |
-| `PRICES_2026`                                        | Read or extend the bundled rates.        |
-| `PRICE_ALIASES`                                      | Read the bundled explicit aliases.       |
-| `ModelPrice`, `PriceTable`, `PriceTier`              | Type your own pricing configuration.     |
+| Export                                               | Use it for                            |
+| ---------------------------------------------------- | ------------------------------------- |
+| `priceUsage(model, usage, table?)`                   | Estimate one invocation in USD.       |
+| `cacheSavings(model, usage, table?)`                 | Estimate savings from cache reads.    |
+| `createPriceProvider({ table?, aliases?, margin? })` | Inject pricing into calls or clients. |
+| `PRICES_2026`                                        | Read or extend the bundled rates.     |
+| `PRICE_ALIASES`                                      | Read the bundled explicit aliases.    |
+| `ModelPrice`, `PriceTable`, `PriceTier`              | Type your own pricing configuration.  |
 
 Prices here cover the token buckets available in `Usage`. Per-request fees,
 provider tools, storage, media jobs and application infrastructure need their own

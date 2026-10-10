@@ -100,6 +100,26 @@ describe('usage contract: OpenAI Responses', () => {
     });
     expect(price(usage)).toBe(0.01128); // 600 × 2 + 400 × 0.2 + 1000 × 10 micro-dollars
   });
+
+  it('folds reasoning into output for a Responses-shaped host that counts it apart', async () => {
+    // createOpenAICompatible({ surface: 'responses' }): total 135 = 32 + 9 + 94.
+    const usage = await finishUsage(openaiResponsesAdapter, [
+      {
+        data: {
+          type: 'response.completed',
+          response: {
+            usage: {
+              input_tokens: 32,
+              output_tokens: 9,
+              output_tokens_details: { reasoning_tokens: 94 },
+              total_tokens: 135,
+            },
+          },
+        },
+      },
+    ]);
+    expect(usage).toMatchObject({ outputTokens: 103, reasoningTokens: 94, totalTokens: 135 });
+  });
 });
 
 describe('usage contract: OpenAI-compatible Chat Completions', () => {
