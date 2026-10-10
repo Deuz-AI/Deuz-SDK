@@ -110,14 +110,46 @@ export interface KeyProvider {
 }
 
 export interface PriceProvider {
-  /** May be async — real price tables (DB/remote) resolve a Promise. */
-  priceUsage(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
+  /**
+   * May be async — real price tables (DB/remote) resolve a Promise. `options`
+   * (2.3 additive) names the service tier that billed the usage; omitted, it
+   * is the standard tier.
+   */
+  priceUsage(
+    model: string,
+    usage: Usage,
+    options?: PriceUsageOptions,
+  ): number | undefined | Promise<number | undefined>;
   /**
    * Optional (1.7 additive): USD SAVED by prompt-cache reads vs paying the
    * full input rate for those tokens. Feeds `cacheSavingsUsd` on the live
    * `cost` stream part. `createPriceProvider` implements it from the table.
    */
-  cacheSavings?(model: string, usage: Usage): number | undefined | Promise<number | undefined>;
+  cacheSavings?(
+    model: string,
+    usage: Usage,
+    options?: PriceUsageOptions,
+  ): number | undefined | Promise<number | undefined>;
+}
+
+/**
+ * The provider tier that billed a call (2.3). `'standard'` is the ordinary
+ * synchronous rate; `'batch'` is the asynchronous batch tier that
+ * `@deuz-sdk/core/batch` submits to, which providers bill at their own rates.
+ */
+export type ServiceTier = 'standard' | 'batch';
+
+/** How a {@link PriceProvider} prices one usage (2.3). */
+export interface PriceUsageOptions {
+  /**
+   * The tier that billed the usage; default `'standard'`. A provider with no
+   * rate for the model on this tier returns `undefined`, which makes the call
+   * unpriced (`budget.unknownPrice` decides what a USD budget does with it),
+   * never a guessed discount. `createPriceProvider` reads a row's `batch` card.
+   * A provider written before 2.3 ignores the option and returns its standard
+   * price, so a batch request costs its standard price there.
+   */
+  readonly tier?: ServiceTier;
 }
 
 export interface UsageMeta {
