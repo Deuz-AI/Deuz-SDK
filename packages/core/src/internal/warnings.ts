@@ -25,7 +25,10 @@ const MAX_WARNINGS = 50;
 
 export interface WarningSink {
   /**
-   * Record a warning, deduplicated by (type, setting, message).
+   * Record a warning, deduplicated by (type, setting, message). Returns whether
+   * it was new (2.3): `false` for a repeat, `true` otherwise, also when the
+   * list cap only counts it as omitted. A site that logs its own line gates
+   * that line on this, so the log carries each warning once.
    *
    * `mirror` (default true) also sends it to `deps.logger.warn`. Pass `false` at
    * a site that ALREADY logs - the registry's unknown-slug fallback, the Chat
@@ -33,9 +36,16 @@ export interface WarningSink {
    * typed channel without turning one log line into two. Several tests pin those
    * call counts and field shapes precisely because they are the pre-1.9 contract.
    */
-  add(warning: CallWarning, options?: { mirror?: boolean }): void;
+  add(warning: CallWarning, options?: { mirror?: boolean }): boolean;
   /** Everything recorded, in first-seen order. The returned array is a copy. */
   list(): CallWarning[];
+  /**
+   * What no stream has carried yet, in first-seen order, now marked as carried
+   * (2.3). A loop and the model calls it drives share one sink, and whichever
+   * flushes first streams a warning, so it reaches the run's stream once. The
+   * omitted-warnings notice is carried once, when the cap is first passed.
+   */
+  take(): CallWarning[];
 }
 
 /**
@@ -50,11 +60,20 @@ export function createWarningSink(logger?: Logger): WarningSink {
   // step for the same one cause.
   const seen = new Set<string>();
   let dropped = 0;
+  /** How much of `out` (append-only) a stream has carried, and whether the notice went too. */
+  let carried = 0;
+  let noticeCarried = false;
+  // Say what was withheld rather than truncating in silence - the whole point
+  // of this module is that a quiet decision becomes a visible one.
+  const notice = (): CallWarning => ({
+    type: 'other',
+    message: `${dropped} further warning(s) omitted (cap ${MAX_WARNINGS}).`,
+  });
 
   return {
-    add(warning: CallWarning, options?: { mirror?: boolean }): void {
+    add(warning: CallWarning, options?: { mirror?: boolean }): boolean {
       const key = `${warning.type} ${warning.setting ?? ''} ${warning.message}`;
-      if (seen.has(key)) return;
+      if (seen.has(key)) return false;
       seen.add(key);
       if (options?.mirror !== false) {
         logger?.warn(warning.message, {
@@ -64,21 +83,22 @@ export function createWarningSink(logger?: Logger): WarningSink {
       }
       if (out.length >= MAX_WARNINGS) {
         dropped++;
-        return;
+        return true;
       }
       out.push(warning);
+      return true;
     },
     list(): CallWarning[] {
-      if (dropped === 0) return [...out];
-      // Say what was withheld rather than truncating in silence - the whole point
-      // of this module is that a quiet decision becomes a visible one.
-      return [
-        ...out,
-        {
-          type: 'other',
-          message: `${dropped} further warning(s) omitted (cap ${MAX_WARNINGS}).`,
-        },
-      ];
+      return dropped === 0 ? [...out] : [...out, notice()];
+    },
+    take(): CallWarning[] {
+      const fresh = out.slice(carried);
+      carried = out.length;
+      if (dropped > 0 && !noticeCarried) {
+        noticeCarried = true;
+        fresh.push(notice());
+      }
+      return fresh;
     },
   };
 }

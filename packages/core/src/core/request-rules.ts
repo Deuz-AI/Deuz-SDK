@@ -142,17 +142,12 @@ export type EffortContext = RequestContext & {
 /**
  * Report a value the request builder changed or dropped. Typed on the call's
  * sink (deduped across the steps of a run) and logged ONCE: the log line is
- * written only when the sink accepted the entry, so a loop that rebuilds the
- * request every step does not repeat it. A direct `buildRequest` with no sink
- * still logs.
+ * written only when the sink reports the entry as new, so a loop that rebuilds
+ * the request every step does not repeat it, and a run past the sink's list cap
+ * still logs a new one. A direct `buildRequest` with no sink still logs.
  */
 export function reportRequestWarning(ctx: RequestContext, warning: CallWarning): void {
-  const sink = ctx.warnings;
-  if (sink) {
-    const before = sink.list().length;
-    sink.add(warning, { mirror: false });
-    if (sink.list().length === before) return;
-  }
+  if (ctx.warnings && !ctx.warnings.add(warning, { mirror: false })) return;
   ctx.logger?.warn(warning.message, {
     warning: warning.type,
     ...(warning.setting !== undefined ? { setting: warning.setting } : {}),

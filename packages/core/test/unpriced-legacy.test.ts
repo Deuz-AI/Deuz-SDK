@@ -68,6 +68,29 @@ describe('legacy agentic loop with an unpriced model under budget.usd (decision 
     expect((await res.warnings)?.filter((w) => w.type === 'unpriced-model')).toHaveLength(1);
   });
 
+  it('streams it before the first model output when the only step answers directly', async () => {
+    const parts: StreamPart[] = [];
+    const res = streamChat({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      prompt: 'go',
+      tools,
+      maxSteps: 3,
+      budget: { usd: 1 },
+      deps: { priceProvider: prices },
+    });
+    for await (const part of res.fullStream) parts.push(part);
+    const unpriced = parts.findIndex(
+      (p) => p.type === 'warning' && p.warning.type === 'unpriced-model',
+    );
+    // Before: recorded after the step's last flush, so it reached only `warnings`.
+    expect(unpriced).toBeGreaterThanOrEqual(0);
+    expect(unpriced).toBeLessThan(parts.findIndex((p) => p.type === 'text-delta'));
+    expect(
+      parts.filter((p) => p.type === 'warning' && p.warning.type === 'unpriced-model'),
+    ).toHaveLength(1);
+    expect((await res.warnings)?.filter((w) => w.type === 'unpriced-model')).toHaveLength(1);
+  });
+
   it("refuses the model before any call under unknownPrice 'reject'", async () => {
     const { model, calls } = counted();
     const error = await generateText({

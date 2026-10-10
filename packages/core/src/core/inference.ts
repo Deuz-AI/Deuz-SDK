@@ -126,7 +126,7 @@ export interface InternalRunOptions {
    * degradation (a stripped `temperature`, an unknown slug) is discovered again
    * each time. Passing one sink for the whole run makes it a single report: the
    * sink dedupes by (type, setting, message), and this pump only emits `warning`
-   * parts for entries that were not already in it when the step started.
+   * parts for entries no stream has carried yet (`WarningSink.take`, 2.3).
    *
    * Absent (a bare `streamChat`/`generateText`) → the pump owns a fresh sink for
    * the single call.
@@ -225,28 +225,22 @@ export function runStream(
     };
 
     // --- warnings (1.9) ---
-    // Cursor into the sink: everything before it has already been emitted as a
-    // `warning` part. An INHERITED sink starts at its current length, because the
-    // enclosing loop's earlier steps already put those parts on the same stream.
-    let emittedWarnings = internal.warnings ? internal.warnings.list().length : 0;
-    /** Emit a canonical `warning` part for each newly discovered warning. */
+    /**
+     * Emit a canonical `warning` part for each warning no stream carried yet. An
+     * INHERITED sink is shared with the enclosing loop, which forwards these
+     * parts and streams the rest itself: the sink hands each one out once (2.3).
+     */
     const flushWarnings = (): void => {
-      const all = warnings.list();
-      for (let i = emittedWarnings; i < all.length; i++) {
-        broadcaster.push({ type: 'warning', warning: all[i]! });
-      }
-      emittedWarnings = all.length;
+      for (const warning of warnings.take()) broadcaster.push({ type: 'warning', warning });
     };
     /**
      * Record a warning discovered HERE (a site with no pre-1.9 log line of its
-     * own) and mirror it to the logger, so a log-only workflow sees it too. The
-     * mirror is gated on the sink actually having accepted the entry, so the
-     * dedupe covers the log as well as the list.
+     * own) and log it, so a log-only workflow sees it too. The line is written
+     * here, once, when the sink reports the entry as new: never also through a
+     * logger the sink carries (2.3), and still past the sink's list cap.
      */
     const addWarning = (warning: CallWarning): void => {
-      const before = warnings.list().length;
-      warnings.add(warning);
-      if (warnings.list().length === before) return;
+      if (!warnings.add(warning, { mirror: false })) return;
       deps.logger.warn(warning.message, {
         warning: warning.type,
         ...(warning.setting !== undefined ? { setting: warning.setting } : {}),
@@ -470,8 +464,9 @@ export function runStream(
       };
       const { url, init } = adapter.buildRequest(buildCtx);
       // Every warning site of a call runs before the first byte (capability
-      // resolution + request building), so one flush here puts them on the
-      // stream ahead of the model's own parts.
+      // resolution, request building and, below, native admission), so this
+      // flush and the one after each reservation put them on the stream ahead
+      // of the model's own parts.
       flushWarnings();
 
       // --- pre-first-byte retry loop with 3-layer timeout ---
@@ -483,7 +478,11 @@ export function runStream(
       let res!: Response;
       let timeout!: TimeoutHandle;
       for (let attempt = 0; ; attempt++) {
-        if (native) await native.reserve();
+        if (native) {
+          await native.reserve();
+          // Admission may report the model as unpriced (2.3).
+          flushWarnings();
+        }
         retries = attempt; // retries performed so far (attempt 0 = first try)
         const remaining = native?.remaining();
         timeout = createTimeout(

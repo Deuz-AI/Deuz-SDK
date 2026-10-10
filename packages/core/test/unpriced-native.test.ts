@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { generateText } from '../src/generate';
-import { runAgent } from '../src/agent-run';
+import { runAgent, streamAgent } from '../src/agent-run';
 import { createAgent } from '../src/agent';
 import { createInMemorySwarmStore, createSwarm } from '../src/swarm';
 import { evolve } from '../src/evolve/controller';
@@ -12,6 +12,8 @@ import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import type { BudgetLimits } from '../src/types/execution';
 import type { LanguageModel } from '../src/types/model';
 import type { Usage } from '../src/types/usage';
+import type { AgentEvent } from '../src/types/agent-run';
+import type { StreamPart } from '../src/types/stream';
 
 /** Prices only `priced-model`, at $1 per million tokens; every other model has no price. */
 const prices = {
@@ -258,5 +260,63 @@ describe('runAgent, swarm and evolve follow the same policy (t4)', () => {
     expect(run.status).toBe('completed');
     // 2.2 refused the run; with a caller estimate it kept the estimate held forever.
     expect(await store.usage('tenant:1')).toEqual({ tokens: 15, usd: 0 });
+  });
+});
+
+describe('the unpriced-model warning reaches a native stream once (decision 4)', () => {
+  const unpricedParts = (parts: StreamPart[]): number =>
+    parts.filter((p) => p.type === 'warning' && p.warning.type === 'unpriced-model').length;
+
+  async function streamedParts(stream: ReturnType<typeof streamAgent>): Promise<StreamPart[]> {
+    const events: AgentEvent<unknown>[] = [];
+    for await (const event of stream.events) events.push(event);
+    expect((await stream.result).status).toBe('completed');
+    return events.flatMap((event) => (event.type === 'part' ? [event.part] : []));
+  }
+
+  it('a run with one model step streams it before the model output', async () => {
+    const model = createMockModel({ responses: [{ text: 'done' }] });
+    const parts = await streamedParts(
+      streamAgent({ model, prompt: 'x', budget: { usd: 1 }, deps: { priceProvider: prices } }),
+    );
+    // Before: recorded during the reservation, after the call's only flush.
+    expect(unpricedParts(parts)).toBe(1);
+    expect(
+      parts.findIndex((p) => p.type === 'warning' && p.warning.type === 'unpriced-model'),
+    ).toBeLessThan(parts.findIndex((p) => p.type === 'text-delta'));
+  });
+
+  it('a structured-only run, whose finalization is the only model call', async () => {
+    const model = createMockModel({ responses: [{ text: '{"answer":"x"}' }] });
+    const parts = await streamedParts(
+      streamAgent({
+        model,
+        prompt: 'x',
+        budget: { usd: 1 },
+        deps: { priceProvider: prices },
+        output: {
+          schema: { type: 'object', properties: { answer: { type: 'string' } } },
+          mode: 'json' as const,
+          validate: (value: unknown) => value as { answer: string },
+        },
+      }),
+    );
+    expect(unpricedParts(parts)).toBe(1);
+  });
+
+  it('a run with two model steps streams it exactly once', async () => {
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'noop', id: 'n1', args: {} }] }, { text: 'done' }],
+    });
+    const parts = await streamedParts(
+      streamAgent({
+        model,
+        prompt: 'x',
+        tools: { noop: { parameters: schema, execute: () => 'ok' } },
+        budget: { usd: 1 },
+        deps: { priceProvider: prices },
+      }),
+    );
+    expect(unpricedParts(parts)).toBe(1);
   });
 });

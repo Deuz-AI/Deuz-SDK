@@ -553,6 +553,8 @@ export function runStreamToolLoop(
      */
     const failRun = async (error: unknown): Promise<void> => {
       terminalError = error;
+      // What the run collected still reaches the stream (2.3).
+      flushWarnings();
       broadcaster.push({ type: 'error', error });
       usageDeferred.reject(error);
       finishDeferred.reject(error);
@@ -597,18 +599,13 @@ export function runStreamToolLoop(
     };
 
     /**
-     * Push whatever the sink recorded since the last flush as live `warning`
-     * parts (1.9). Driven off `list()` rather than `add`'s return so the sink
-     * stays the single owner of dedup and of the 50-entry cap: an entry it
-     * dropped or collapsed never reaches the stream twice.
+     * Push what the sink recorded and no stream carried yet as live `warning`
+     * parts (1.9). The sink stays the single owner of dedup, of the 50-entry
+     * cap and of what was carried (`take`, 2.3): a warning a step's own stream
+     * already carried, and this loop forwarded, never goes out twice.
      */
-    let warningsEmitted = 0;
     const flushWarnings = (): void => {
-      const all = warningSink.list();
-      for (let i = warningsEmitted; i < all.length; i++) {
-        broadcaster.push({ type: 'warning', warning: all[i]! });
-      }
-      warningsEmitted = all.length;
+      for (const warning of warningSink.take()) broadcaster.push({ type: 'warning', warning });
     };
 
     const emitApprovalRequests = (requests: ToolApprovalRequest[]): void => {
@@ -789,6 +786,7 @@ export function runStreamToolLoop(
           ...checkpointRef(),
         };
         const usage = withTotal(totalUsage);
+        flushWarnings();
         broadcaster.push({ type: 'finish', usage, finishReason: lastFinish });
         usageDeferred.resolve(usage);
         finishDeferred.resolve(lastFinish);
@@ -834,6 +832,7 @@ export function runStreamToolLoop(
           }
           const usage = withTotal(totalUsage);
           const deuzMeta = finishMeta();
+          flushWarnings();
           broadcaster.push({
             type: 'finish',
             usage,
@@ -964,9 +963,11 @@ export function runStreamToolLoop(
         // A ContextOverflowError is always pre-first-byte, so nothing of this
         // step has reached the consumer yet and the attempt restarts cleanly.
         let overflowRetried = false;
-        // A model with no price under a USD budget (2.3): reported once, or
-        // refused before the call with `budget.unknownPrice: 'reject'`.
+        // A model with no price under a USD budget (2.3): reported once, ahead
+        // of the step's output, or refused before the call with
+        // `budget.unknownPrice: 'reject'`.
         await usageCost?.admit(prepared.options.model.modelId);
+        flushWarnings();
 
         attempts: for (;;) {
           const inner = runStream(
@@ -1740,6 +1741,8 @@ export function runStreamToolLoop(
         ...lastFinishMeta,
         ...(deuzMeta ? { deuz: deuzMeta } : {}),
       };
+      // Whatever the run recorded since the last step's flush goes out before it ends.
+      flushWarnings();
       broadcaster.push({
         type: 'finish',
         usage,
