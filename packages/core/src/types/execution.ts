@@ -59,6 +59,14 @@ export interface BudgetReservationInput {
   readonly usd?: number;
   /** Contexts provide these automatically; direct ledger callers may omit them. */
   readonly scopes?: readonly BudgetScope[];
+  /**
+   * The model has no price, so no `usd` estimate exists (2.3). Under a USD
+   * bound its `unknownPrice` decides: `'warn'` admits it without a USD hold,
+   * `'reject'` refuses it with code `unpriced_model`. Without this marker a
+   * missing estimate under a USD bound still fails closed
+   * (`missing_reservation`). Never combined with `usd`.
+   */
+  readonly unpriced?: boolean;
 }
 
 export interface BudgetReservation {
@@ -70,6 +78,13 @@ export interface BudgetReservation {
   readonly scopes: readonly BudgetScope[];
   readonly state: 'reserved' | 'settled' | 'unknown' | 'released';
   readonly usage?: Readonly<Usage>;
+  /**
+   * No price was available for this attempt (2.3), at reservation or for its
+   * actual usage. While `actual.usd` is unknown its cost is left out of every
+   * USD total; when the reservation held a USD estimate, that estimate was
+   * settled as the charge (`actual.usd`).
+   */
+  readonly unpriced?: true;
 }
 
 export interface BudgetSettlement {
@@ -87,6 +102,11 @@ export interface BudgetTotals {
   /** Attempts with unknown actual amounts, even when the held estimate is zero. */
   readonly unknownTokens: number;
   readonly unknownUsd: number;
+  /**
+   * Attempts whose model has no price (2.3): their cost is in no USD total and
+   * not in `unknownUsd`, so `spent.usd` is a lower bound. Omitted when zero.
+   */
+  readonly unpriced?: number;
 }
 
 /**
@@ -108,6 +128,11 @@ export interface BudgetAggregate {
   /** Unknown amounts that carried no estimate: a cap on that dimension fails closed. */
   readonly unestimatedTokens: number;
   readonly unestimatedUsd: number;
+  /**
+   * Folded attempts whose model had no price (2.3): their USD stays out of
+   * every total and does not fail a USD cap closed. Omitted when zero.
+   */
+  readonly unpricedUsd?: number;
 }
 
 /** What one `compact` call changed (2.2). */
