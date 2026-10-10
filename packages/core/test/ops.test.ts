@@ -4,5 +4,10 @@ import { manualClock } from './fixtures/manual-clock';
 
 leaseProviderContracts('memory lease provider', async () => {
   const { clock, advance } = manualClock();
-  return { provider: createInMemoryLeaseProvider({ clock }), advance, ttl: 1_000 };
+  return {
+    provider: createInMemoryLeaseProvider({ clock }),
+    advance,
+    ttl: 1_000,
+    now: () => clock.now(),
+  };
 });

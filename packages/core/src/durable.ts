@@ -13,6 +13,7 @@ import type { AgentCheckpoint, SessionStore } from './types/session';
 import type { ToolApprovalRequest } from './types/tool';
 import type { Clock } from './types/deps';
 import { DeuzError } from './errors';
+import { assertCheckpointVersion } from './internal/checkpoint-version';
 import { runToolLoop } from './inference/tool-loop';
 import { runStreamToolLoop } from './inference/stream-tool-loop';
 import { resolveDependencies } from './internal/resolve-deps';
@@ -31,6 +32,7 @@ import {
 } from './ui';
 
 export type { AgentCheckpoint, SessionStore, CheckpointStatus } from './types/session';
+export { CheckpointVersionError } from './internal/checkpoint-version';
 
 /** `resumeFromCheckpoint` was asked for a runId the store does not know. */
 export class CheckpointNotFoundError extends DeuzError {
@@ -97,9 +99,13 @@ export function serializeCheckpoint(checkpoint: AgentCheckpoint): string {
   });
 }
 
-/** Reverse of `serializeCheckpoint` — restores tagged `Uint8Array` values. */
+/**
+ * Reverse of `serializeCheckpoint` — restores tagged `Uint8Array` values.
+ * Throws `CheckpointVersionError` for a checkpoint whose `version` is not 1
+ * (2.3), such as one a newer Deuz SDK wrote.
+ */
 export function deserializeCheckpoint(json: string): AgentCheckpoint {
-  return JSON.parse(json, (_key, value: unknown) => {
+  const checkpoint = JSON.parse(json, (_key, value: unknown) => {
     // Only the codec's own exact shape converts: a single-key object whose
     // value decodes as base64. Anything else — including tool payloads that
     // merely contain the reserved key with a garbled value — stays plain data
@@ -118,6 +124,8 @@ export function deserializeCheckpoint(json: string): AgentCheckpoint {
     }
     return value;
   }) as AgentCheckpoint;
+  assertCheckpointVersion(checkpoint);
+  return checkpoint;
 }
 
 // --- Resume ------------------------------------------------------------------
@@ -131,6 +139,8 @@ export type ResumeOptions = Omit<CommonCallOptions, 'messages' | 'session'>;
 async function loadCheckpoint(store: SessionStore, runId: string): Promise<AgentCheckpoint> {
   const checkpoint = await store.load(runId);
   if (!checkpoint) throw new CheckpointNotFoundError(runId);
+  // Stores that keep objects, not JSON, never pass through the codec's check (2.3).
+  assertCheckpointVersion(checkpoint, runId);
   return checkpoint;
 }
 

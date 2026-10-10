@@ -1,6 +1,6 @@
 ---
 title: Operations
-description: Leases, drain, recovery and cross-process cancellation for durable swarms, with SQLite and Postgres backends and fenced native agent runs.
+description: Leases, drain, recovery and cross-process cancellation for durable swarms, with SQLite and Postgres backends, fenced native agent runs, retention and schema versions.
 ---
 
 A durable swarm or native agent run can outlive the process that started it.
@@ -37,6 +37,15 @@ holds the key and reports whether anyone did.
 A queued `'cancel'` concerns the run, not the holder: it stays queued when the
 key changes hands or is released, until some holder's renewal delivers it. A
 queued `'drain'` concerns the current holder and is dropped with its lease.
+
+Since 2.3 a holder can ask for acknowledged delivery:
+`renew(lease, ttlMs, { acknowledge: true })` keeps a delivered `'cancel'`
+queued, reports it on every later renewal and hands it to the next holder,
+until the holder records it durably and calls `ack(lease, 'cancel')`. The
+renewal reports what stays queued in `queued`. `ack` is fenced by the lease: it
+returns `false` and removes nothing once the key changed hands. The memory,
+SQLite and Postgres providers support both; a provider without `ack` ignores
+the option and removes every signal it delivers, as in 2.2.
 
 ```ts
 import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
@@ -142,11 +151,21 @@ A signalled cancel is not lost when its holder stops first. If the holder
 crashes before reading it, or the cancel arrives just after the holder's last
 check and the run settles `'suspended'`, the `'cancel'` stays queued under the
 run's key, and the next executor to claim the run cancels it before
-dispatching anything. A holder that reads the cancel but fails before recording
-it, for example because that commit hits a store error, queues it again before
-it lets the lease go; only a process that dies between reading and recording it
-loses it. A run that completed or became partial before the cancel reached it
-keeps its status.
+dispatching anything.
+
+Since 2.3 it is not lost after the holder reads it either. With a provider that
+has `ack`, as the memory, SQLite and Postgres providers do, the executor renews
+with acknowledged delivery: the cancel stays queued until the commit that
+records it, or until the run's end makes it moot, and only then is it
+acknowledged. A holder that reads the cancel and dies, or whose cancel commit
+fails, leaves it for the next executor, even if its lease lapsed meanwhile.
+With a provider without `ack`, the 2.2 behaviour applies: the holder queues a
+cancel it failed to record again before it lets the lease go, which needs it to
+still hold the key, and a process that dies between reading and recording the
+cancel loses it.
+
+A run that completed or became partial before the cancel reached it keeps its
+status.
 
 Without a lease provider, a request against a run that another process drives
 is recorded, and that executor's next commit then fails its revision check.
@@ -230,6 +249,67 @@ async function runningRuns(store: SwarmStore): Promise<SwarmRunRecord[]> {
 console.log((await runningRuns(createInMemorySwarmStore())).length); // 0
 ```
 
+## Retention
+
+The ops and swarm stores keep their rows until you prune them (2.3). Each
+prune deletes only rows that nothing can still need and returns how many it
+deleted; call them from a periodic job. Times are epoch milliseconds on the
+store's clock: the injected `clock` for the memory and SQLite stores, the
+database clock for Postgres. Budget stores have their own
+[`prune`](/docs/modules/budgets#retention).
+
+| Call | Deletes | Keeps |
+| --- | --- | --- |
+| `leases.prune(before)` | Keys nobody holds: released, or expired before `before` | Held keys, and keys that queue a `'cancel'` for their run's next executor |
+| `agentRuns.prune(before)` | Terminal native runs (completed, stopped or failed) last saved before `before` | Running, finalizing and suspended runs |
+| `claims.prune(before)` | Claim keys granted before `before` | Newer keys |
+| `prune({ before, scope?, limit? })` on a swarm store | Up to `limit` (1 to 1000, default 100) completed, partial or cancelled runs whose `updatedAt` is before `before`, oldest first, with their tasks, events and blackboard notes | Running and suspended runs |
+
+`leases.prune` is part of `LeaseProvider` (optional, like `ack`), and
+`prune` of `SwarmStore`; the memory, SQLite and Postgres implementations have
+both. `agentRuns.prune` and `claims.prune` belong to the SQLite and Postgres ops
+stores.
+
+What a prune deletes is gone:
+
+- The next holder of a pruned lease key starts again at token 1, and a holder
+  whose lease expired before `before` finds it lost when it renews. Choose
+  `before` well past any pause an executor could survive.
+- A pruned agent run can no longer be resumed or inspected, and its run ID is
+  free again.
+- A pruned claim key can be claimed again. Keep every key that an occurrence or
+  a delivery may still repeat: the scheduler's `lookbackMs` and catch-up
+  window, and your webhook provider's retry period.
+- A pruned swarm run can no longer be resumed, read or replayed, and its key is
+  free again.
+
+```ts
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+import { createSqliteSwarmStore } from '@deuz-sdk/core/swarm/sqlite';
+
+const day = 86_400_000;
+const ops = createSqliteOpsStore({ path: './runs.sqlite' });
+const swarms = createSqliteSwarmStore({ path: './runs.sqlite' });
+
+try {
+  const now = Date.now();
+  const leases = await ops.leases.prune(now - day);
+  const agentRuns = await ops.agentRuns.prune(now - 30 * day);
+  const claims = await ops.claims.prune(now - 7 * day);
+  // A swarm prune deletes a page of runs per call: repeat while a page is full.
+  let swarmRuns = 0;
+  for (;;) {
+    const page = await swarms.prune({ before: now - 30 * day, limit: 100 });
+    swarmRuns += page;
+    if (page < 100) break;
+  }
+  console.log({ leases, agentRuns, claims, swarmRuns });
+} finally {
+  await swarms.close();
+  await ops.close();
+}
+```
+
 ## SQLite ops store
 
 `createSqliteOpsStore({ path, database?, wal?, clock? })` returns `leases`,
@@ -277,11 +357,85 @@ moved the run first, nothing is written and the commit rejects with
 `SwarmConflictError`. Postgres leases use the database clock, so host clock skew
 does not matter.
 
-The stores expect `READ COMMITTED`, Postgres's default. Under a
-`REPEATABLE READ` or `SERIALIZABLE` session default, table creation and claims
-run their statement again after a serialization failure (40001), but another
-contended write, such as a lease acquire, an agent run save or a swarm commit,
-can reject with it.
+The stores are built for `READ COMMITTED`, Postgres's default, and also run
+under a `REPEATABLE READ` or `SERIALIZABLE` session default. There a contended
+write can fail with a serialization failure (40001), and any write can be
+chosen as a deadlock victim (40P01). Postgres rolls such a statement back
+whole, so since 2.3 every store sends it again, up to five attempts in all:
+
+| Store | Writes that run again |
+| --- | --- |
+| Ops (`createPostgresOpsStore`) | Lease acquire, renew, release, signal and ack; agent run saves; claims and their release; every prune |
+| Swarm (`createPostgresSwarmStore`) | Run creation, commits and prune |
+| Budget (`createPostgresBudgetStore`) | Reserve, settle, release and prune |
+| Store pack (`createPostgresStores`) | Memory, chat, session and run upserts, updates and deletes |
+
+Table creation runs again on the same codes. When the attempts run out, a swarm
+create or commit rejects with `SwarmConflictError`, whose `cause` is the driver
+error, so `resume`, `recover` and `requestCancel` treat it like any other
+conflict. Every other write rejects with the driver error, whose `code` is
+`'40001'` or `'40P01'`; a budget admission reports it as `admission_failed`.
+Each write's checks run inside its statement, so running it again cannot
+double-apply it: a retried agent run save whose revision moved on is rejected as
+a revision conflict, for example. Concurrency under `REPEATABLE READ` is
+covered by tests that inject these failures, not yet by a live multi-connection
+run.
+
+## Schema versions and upgrades
+
+Every durable store keeps its own schema version in a table of its own,
+separate from the versions of the records it stores. A store refuses a schema
+version newer than it reads, with an error such as `Unsupported Postgres ops
+schema version 2; this build reads version 1`, so an older process never writes
+through a newer layout.
+
+| Store | Version table | Version in 2.2 and 2.3 |
+| --- | --- | --- |
+| SQLite swarm (`createSqliteSwarmStore`) | `deuz_swarm_schema` | 2. A 2.1 file (version 1) is upgraded in place on first open, and 2.1 then refuses it |
+| Postgres swarm (`createPostgresSwarmStore`) | `deuz_swarm_pg_schema` | 1, the same layout as SQLite's 2 |
+| SQLite and Postgres ops (`createSqliteOpsStore`, `createPostgresOpsStore`) | `deuz_ops_schema` | 1 |
+| SQLite and Postgres budget (`createSqliteBudgetStore`, `createPostgresBudgetStore`) | `deuz_budget_schema` | 1 |
+| SQLite evolve (`createSqlitePopulationStore`) | `deuz_evolve_schema` | 1 |
+| Store packs (`createSqliteStores`, `createPostgresStores`) | `PRAGMA user_version`, `deuz_meta` | 1; see [Stores](/docs/modules/stores#migrations-and-schema-ownership) |
+
+The records inside carry versions of their own:
+
+| Record | Versions |
+| --- | --- |
+| Legacy loop checkpoint (`AgentCheckpoint.version`) | 1. Since 2.3, `deserializeCheckpoint` and `resumeFromCheckpoint` refuse any other version with `CheckpointVersionError` (code `checkpoint_version_unsupported`); a checkpoint without a version reads as 1 |
+| Native run envelope (`AgentRunEnvelope.version`) | 1; a resume refuses any other. Its `revision` is the write fence, not a format version |
+| Swarm run (`SwarmRunRecord.version`) | 1 for a fixed DAG, 2 for a dynamic run (2.2), which 2.1 refuses |
+| Execution snapshot (`ExecutionContextSnapshot.version`) | 1, or 2 when it carries persistent admission (2.2), which 2.1 refuses |
+| Ledger snapshot (`BudgetLedgerSnapshot.version`) | 1, or 2 when it carries folded aggregates or persistent admission (2.2), which 2.1 refuses |
+
+No store changes its schema version in 2.3. On first use the stores add only
+objects that 2.2 ignores, so 2.2 and 2.3 processes can share a database during a
+rolling deploy:
+
+| Store | Added on first 2.3 use |
+| --- | --- |
+| SQLite and Postgres ops | Indexes `deuz_claims_claimed_at` and `deuz_agent_runs_updated_at` |
+| SQLite and Postgres budget | Index `deuz_budget_requests_state`. SQLite also adds `deuz_budget_totals`, kept by three triggers on the history table, which 2.2 processes fire too, and fills it from the history |
+| SQLite swarm | Index `deuz_swarm_runs_settled` |
+
+Building an index blocks writes to its table until it is built. On a large
+Postgres table, create the index beforehand without blocking writes, under the
+same name in the store's schema, and the store finds it in place:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS deuz_claims_claimed_at ON public.deuz_claims (claimed_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS deuz_agent_runs_updated_at ON public.deuz_agent_runs (updated_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS deuz_budget_requests_state ON public.deuz_budget_requests (state, created_at);
+```
+
+A later change that older builds cannot work with will raise a store's version.
+The Postgres stores then upgrade a schema forward on first use: the steps from
+its stored version to the current one run in order, followed by any new tables
+and indexes, in the one statement that holds the store's advisory lock. A
+failure leaves the schema as it was, and processes starting together upgrade it
+once. Processes with an older build then refuse the schema, so upgrade every
+process that shares it, and back the database up first if you may need to roll
+back.
 
 ## Native agent run revisions
 
@@ -311,4 +465,6 @@ try {
 
 Native runs have no lease of their own: the revision check already stops a
 second executor from overwriting the first. Swarm tasks keep their agent state
-inside the swarm run, which the swarm's lease and revision protect.
+inside the swarm run, which the swarm's lease and revision protect. Terminal
+runs stay in the store until `agentRuns.prune` removes them; see
+[Retention](#retention).

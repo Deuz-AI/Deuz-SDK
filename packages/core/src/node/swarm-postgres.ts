@@ -6,10 +6,17 @@
  * Validation reads are separate queries; every WRITE is one SQL statement whose
  * data-modifying CTEs are all gated on the run row's revision update. If the
  * revision moved since the reads, the gate matches nothing, nothing is written,
- * and the commit rejects with SwarmConflictError. Node-only.
+ * and the commit rejects with SwarmConflictError. A write that fails with 40001
+ * or 40P01 runs again (2.3); one that keeps failing rejects with
+ * SwarmConflictError too. Node-only.
  */
 import type { PgClientLike } from './store-postgres';
-import { createPostgresSchema, postgresSchemaStatement } from './postgres-migrate';
+import {
+  createPostgresSchema,
+  postgresSchemaStatement,
+  retryPostgres,
+  SERIALIZATION_CODES,
+} from './postgres-migrate';
 import type {
   SwarmChannelEntry,
   SwarmChannelPost,
@@ -27,9 +34,11 @@ import {
   nextSwarmRun,
   planPosts,
   postEvents,
+  SETTLED_RUN_STATUSES,
   SwarmConflictError,
   validateChannelName,
   validateEventCursor,
+  validatePruneOptions,
   validateRunQuery,
   validateSpawn,
   validateSwarmSnapshot,
@@ -57,7 +66,9 @@ export function postgresSchemaName(schema: string | undefined): string {
 
 type Row = Record<string, unknown>;
 
-export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): SwarmStore {
+export function createPostgresSwarmStore(
+  options: PostgresSwarmStoreOptions,
+): SwarmStore & Required<Pick<SwarmStore, 'prune'>> {
   const schema = postgresSchemaName(options.schema);
   const runs = `${schema}.deuz_swarm_runs`;
   const tasks = `${schema}.deuz_swarm_tasks`;
@@ -66,6 +77,24 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
   const meta = `${schema}.deuz_swarm_pg_schema`;
   const query = async (sql: string, params: unknown[] = []): Promise<Row[]> =>
     (await options.client.query(sql, params)).rows;
+  /**
+   * One write statement, again while it fails with 40001 or 40P01 (2.3):
+   * Postgres rolled it back whole, and its revision gate re-checks the run.
+   * Retries that run out are a conflict like any other.
+   */
+  const write = async (sql: string, params: unknown[]): Promise<Row[]> => {
+    try {
+      return await retryPostgres(SERIALIZATION_CODES, () => query(sql, params));
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (typeof code === 'string' && SERIALIZATION_CODES.includes(code))
+        throw new SwarmConflictError(
+          `Swarm write kept conflicting with a concurrent transaction (${code})`,
+          { cause: error },
+        );
+      throw error;
+    }
+  };
 
   let ready: Promise<void> | undefined;
   // One statement (a DO block) under an advisory lock, so concurrent first
@@ -133,7 +162,7 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
         ordinal,
         payload: encodeSwarm(task),
       }));
-      const [row] = await query(
+      const [row] = await write(
         `WITH run AS (
           INSERT INTO ${runs} (scope, run_id, payload, status, updated_at, revision, last_sequence)
           VALUES ($1, $2, $3, $4, $5, 0, $6)
@@ -266,7 +295,7 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
       const run = nextSwarmRun(previous, { ...change, events: inputs });
       const journal = makeSwarmEvents(change, previous.lastSequence, inputs);
 
-      const [row] = await query(
+      const [row] = await write(
         `WITH run AS (
           UPDATE ${runs} SET payload = $3, status = $4, updated_at = $5, revision = $6,
             last_sequence = $7
@@ -371,6 +400,35 @@ export function createPostgresSwarmStore(options: PostgresSwarmStoreOptions): Sw
           ],
         )
       ).map((row) => decodeRun(row.payload));
+    },
+    async prune(options) {
+      const { before, scope, limit } = validatePruneOptions(options);
+      await use();
+      // One statement. The outer conditions repeat the inner ones, so a run a
+      // concurrent commit moved on is re-checked in its new version and kept.
+      const settled = `status IN (${SETTLED_RUN_STATUSES.map((status) => `'${status}'`).join(', ')})
+        AND updated_at < $1::float8`;
+      const [row] = await retryPostgres(SERIALIZATION_CODES, () =>
+        query(
+          `WITH gone AS (
+            DELETE FROM ${runs} WHERE (scope, run_id) IN (
+              SELECT scope, run_id FROM ${runs}
+              WHERE ${settled} AND ($2::text IS NULL OR scope = $2::text)
+              ORDER BY updated_at, scope COLLATE "C", run_id COLLATE "C" LIMIT $3
+            ) AND ${settled}
+            RETURNING scope, run_id
+          ), old_tasks AS (
+            DELETE FROM ${tasks} t USING gone g WHERE t.scope = g.scope AND t.run_id = g.run_id
+          ), old_events AS (
+            DELETE FROM ${events} e USING gone g WHERE e.scope = g.scope AND e.run_id = g.run_id
+          ), old_notes AS (
+            DELETE FROM ${channels} c USING gone g WHERE c.scope = g.scope AND c.run_id = g.run_id
+          )
+          SELECT COUNT(*) AS n FROM gone`,
+          [before, scope ?? null, limit],
+        ),
+      );
+      return Number(row?.n ?? 0);
     },
   };
 }

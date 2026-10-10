@@ -297,3 +297,73 @@ describe('evolve leases (2.2)', () => {
     ).toThrow(/ttlMs/);
   });
 });
+
+describe('evolve lease cancels with acknowledged delivery (2.3)', () => {
+  it('cancels a run whose process died between receiving a cancel and recording it', async () => {
+    const inner = createInMemoryPopulationStore();
+    // The stop it asked for is never saved: the process dies writing it.
+    const dying: PopulationStore = {
+      ...inner,
+      saveRun(record) {
+        if (record.status === 'stopped' && record.reason === 'cancelled')
+          return new Promise(() => {});
+        return inner.saveRun(record);
+      },
+    };
+    const provider = createInMemoryLeaseProvider();
+    // And every lease call after the renewal that delivered the cancel hangs.
+    let dead = false;
+    const hang = () => new Promise<never>(() => {});
+    const process: LeaseProvider = {
+      acquire: (request) => (dead ? hang() : provider.acquire(request)),
+      async renew(lease, ttlMs, renewOptions) {
+        if (dead) return hang();
+        const renewal = await provider.renew(lease, ttlMs, renewOptions);
+        if (renewal.held && renewal.signals.includes('cancel')) dead = true;
+        return renewal;
+      },
+      release: (lease) => (dead ? hang() : provider.release(lease)),
+      signal: (signalKey, signal) => (dead ? hang() : provider.signal(signalKey, signal)),
+      ack: (lease, signal) => (dead ? hang() : provider.ack!(lease, signal)),
+    };
+    const { stage } = gated();
+    const first = evolve(
+      options({
+        store: dying,
+        stages: [stage],
+        lease: { provider: process, owner: 'a', ttlMs: 30 },
+      }),
+    );
+    await started(first);
+    expect(await provider.signal(leaseKey, 'cancel')).toBe(true);
+    for (let wait = 0; wait < 200 && !dead; wait++) await pause();
+    expect(dead).toBe(true);
+    // Its lease lapses; the cancel it received is still queued for the next executor.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const resumed = await resumeEvolve(options({ store: inner, lease: { provider, owner: 'b' } }))
+      .result;
+    expect(resumed).toMatchObject({ status: 'stopped', reason: 'cancelled', modelCalls: 0 });
+  });
+
+  it('acknowledges the cancel it recorded, so the next executor starts clean', async () => {
+    const store = createInMemoryPopulationStore();
+    const provider = createInMemoryLeaseProvider();
+    const acks: string[] = [];
+    const counting: LeaseProvider = {
+      ...provider,
+      ack: (lease, signal) => (acks.push(lease.owner), provider.ack!(lease, signal)),
+    };
+    const { stage } = gated();
+    const handle = evolve(
+      options({ store, stages: [stage], lease: { provider: counting, owner: 'a', ttlMs: 30 } }),
+    );
+    await started(handle);
+    expect(await provider.signal(leaseKey, 'cancel')).toBe(true);
+    expect(await handle.result).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+    expect(acks).toEqual(['a']);
+    const probe = (await provider.acquire({ key: leaseKey, owner: 'x', ttlMs: 30_000 }))!;
+    expect(await provider.renew(probe, 30_000, { acknowledge: true })).toMatchObject({
+      signals: [],
+    });
+  });
+});

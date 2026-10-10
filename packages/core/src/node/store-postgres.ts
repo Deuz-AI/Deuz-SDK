@@ -47,6 +47,9 @@
  *   instead of racing `CREATE TABLE IF NOT EXISTS`; the `deuz_meta` bootstrap
  *   and the batch run again on 40001, 23505, 42P07 or 42710, and a failed batch
  *   is followed by a `ROLLBACK` so the connection never stays in an aborted block.
+ * - Every write is one statement. Under REPEATABLE READ or SERIALIZABLE a
+ *   contended one fails with 40001, or 40P01 as a deadlock victim, and is
+ *   rolled back whole, so it runs again, up to five attempts in all (2.3).
  * - `BIGINT` columns come back from `pg` as STRINGS (int8 overflows a JS
  *   number), so every timestamp is coerced on read — never trust `row.created_at`
  *   to already be a number.
@@ -59,7 +62,7 @@ import { serializeCheckpoint, deserializeCheckpoint } from '../durable';
 import type { RunRecord, RunStore } from '../types/runtime';
 import { InvalidRequestError } from '../errors';
 import { cosineSimilarity } from '../internal/vector';
-import { retryPostgres, SCHEMA_RACE_CODES } from './postgres-migrate';
+import { retryPostgres, SCHEMA_RACE_CODES, SERIALIZATION_CODES } from './postgres-migrate';
 
 // ===================================================================
 // Options + public shape
@@ -435,6 +438,9 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     const result = await (await client()).query(sql, params);
     return result.rows ?? [];
   };
+  /** One write statement, again after a serialization failure or a deadlock (2.3). */
+  const write = (sql: string, params: unknown[]): Promise<Record<string, unknown>[]> =>
+    retryPostgres(SERIALIZATION_CODES, () => exec(sql, params));
 
   // --- migration ------------------------------------------------------------
 
@@ -672,7 +678,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     for (const record of records) {
       const values = memoryValues(record);
       if (vectorEnabled) values.push(record.embedding ? toVectorLiteral(record.embedding) : null);
-      await exec(sql, values);
+      await write(sql, values);
     }
   };
 
@@ -800,7 +806,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     async delete(ids) {
       if (ids.length === 0) return;
       await ready();
-      await exec(`DELETE FROM ${table('deuz_memory')} WHERE id = ANY($1)`, [ids]);
+      await write(`DELETE FROM ${table('deuz_memory')} WHERE id = ANY($1)`, [ids]);
     },
     /**
      * Targeted column UPDATE rather than read-modify-write: a round-trip would
@@ -843,7 +849,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
         }
       }
       if (sets.length === 0) return;
-      await exec(
+      await write(
         `UPDATE ${table('deuz_memory')} SET ${sets.join(', ')} WHERE id = $1`,
         bind.params,
       );
@@ -872,7 +878,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
         `expires_at <= ${bind.add(now)}`,
         ...scopeConditions(scope, MEMORY_SCOPE_COLUMNS, bind),
       ];
-      const rows = await exec(
+      const rows = await write(
         `DELETE FROM ${table('deuz_memory')}${whereClause(where)} RETURNING id`,
         bind.params,
       );
@@ -900,7 +906,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
       const assignments = CHAT_COLUMNS.filter((c) => c !== 'chat_id')
         .map((c) => `${c} = EXCLUDED.${c}`)
         .join(', ');
-      await exec(
+      await write(
         `INSERT INTO ${table('deuz_chats')} (${CHAT_COLUMNS.join(', ')}) ` +
           `VALUES (${CHAT_COLUMNS.map((_c, i) => `$${i + 1}`).join(', ')}) ` +
           `ON CONFLICT (chat_id) DO UPDATE SET ${assignments}`,
@@ -930,7 +936,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     },
     async deleteChat(chatId) {
       await ready();
-      await exec(`DELETE FROM ${table('deuz_chats')} WHERE chat_id = $1`, [chatId]);
+      await write(`DELETE FROM ${table('deuz_chats')} WHERE chat_id = $1`, [chatId]);
     },
     async listChats(scope) {
       await ready();
@@ -949,7 +955,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
   const sessions: Required<SessionStore> = {
     async save(checkpoint: AgentCheckpoint) {
       await ready();
-      await exec(
+      await write(
         `INSERT INTO ${table('deuz_sessions')} (run_id, status, step_index, checkpoint, created_at) ` +
           `VALUES ($1, $2, $3, $4, $5) ` +
           `ON CONFLICT (run_id) DO UPDATE SET status = EXCLUDED.status, ` +
@@ -975,7 +981,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     },
     async delete(runId) {
       await ready();
-      await exec(`DELETE FROM ${table('deuz_sessions')} WHERE run_id = $1`, [runId]);
+      await write(`DELETE FROM ${table('deuz_sessions')} WHERE run_id = $1`, [runId]);
     },
     async list() {
       await ready();
@@ -989,7 +995,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
   // --- RunStore -------------------------------------------------------------
 
   const writeRun = async (record: RunRecord): Promise<void> => {
-    await exec(
+    await write(
       `INSERT INTO ${table('deuz_runs')} (run_id, status, record, created_at, updated_at) ` +
         `VALUES ($1, $2, $3, $4, $5) ` +
         `ON CONFLICT (run_id) DO UPDATE SET status = EXCLUDED.status, record = EXCLUDED.record, ` +
@@ -1040,7 +1046,7 @@ export function createPostgresStores(options: PostgresStoreOptions): PostgresSto
     },
     async delete(runId) {
       await ready();
-      await exec(`DELETE FROM ${table('deuz_runs')} WHERE run_id = $1`, [runId]);
+      await write(`DELETE FROM ${table('deuz_runs')} WHERE run_id = $1`, [runId]);
     },
   };
 

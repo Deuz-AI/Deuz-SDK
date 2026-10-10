@@ -116,6 +116,10 @@ await stores.migrate(); // idempotent; do it at boot to fail before traffic arri
 
 If you would rather own the DDL entirely, the [Postgres schema below](#postgres-schema-v1) is the whole of it. Create the tables yourself, insert `('schema_version', '1')` into `deuz_meta`, and `migrate()` becomes a no-op that only probes for pgvector.
 
+The ops, swarm and budget stores of 2.2 are versioned separately, each with a table of its own; their numbers, the indexes 2.3 adds on first use, and how a Postgres schema is upgraded forward are listed in [Schema versions and upgrades](/docs/modules/operations#schema-versions-and-upgrades).
+
+**Checkpoints carry a version too.** Every legacy checkpoint is written with `version: 1`. Since 2.3, `deserializeCheckpoint` and the resume functions refuse any other version with `CheckpointVersionError` (code `checkpoint_version_unsupported`), so a checkpoint written by a newer SDK is never resumed as if this build understood it. The Postgres pack's `sessions.load` passes that error on; the SQLite and Redis packs skip a row they cannot read, so the resume reports the checkpoint as not found instead.
+
 ---
 
 ## SQLite

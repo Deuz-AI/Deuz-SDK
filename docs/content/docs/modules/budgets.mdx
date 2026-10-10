@@ -1,6 +1,6 @@
 ---
 title: Budgets
-description: Persistent token and USD budgets per user, thread or organisation, shared by every run and process, with rolling windows and warnings.
+description: Persistent token and USD budgets per user, thread or organisation, shared by every run and process, with rolling windows, warnings, hold recovery and retention.
 ---
 
 An execution context's ledger bounds one run. A `BudgetStore` bounds usage that
@@ -96,9 +96,9 @@ const execution = createExecutionContext({
 
 A hold is charged to the bucket of its reservation time. A hold leaked by a crash
 therefore leaves a windowed budget with its bucket. In a lifetime budget it stays
-charged; that is the fail-closed outcome, not a leak to repair automatically. A
-settlement that arrives after its bucket left the window updates history but not
-the current window.
+charged, the fail-closed outcome, until you close it: see
+[Open holds](#open-holds). A settlement that arrives after its bucket left the
+window updates history but not the current window.
 
 ## Warnings
 
@@ -196,7 +196,10 @@ const shared = createPostgresBudgetStore({ client: new pg.Pool(), schema: 'publi
 
 - **SQLite** keeps its tables and its own schema version under `deuz_budget_*`.
   Windows use the store's `clock` (the host clock by default), so processes
-  sharing a file should share a clock.
+  sharing a file should share a clock. A lifetime scope is admitted from a
+  running total (2.3), kept by triggers on the history table, so its cost does
+  not grow with history, and 2.2 processes sharing the file keep the total
+  right.
 - **Postgres** takes any `PgClientLike` (`pg.Pool`, `pg.Client`, a serverless
   driver). Admission, settlement and release are each one statement, so a
   pooled client never splits them across connections. Windows use database
@@ -205,5 +208,81 @@ const shared = createPostgresBudgetStore({ client: new pg.Pool(), schema: 'publi
 
 `usage(key, { since, byModel })` reports committed usage (settled amounts plus
 held estimates) over the key's history, or since a point in time; a bucket that
-straddles `since` counts whole. The stores keep history and request records;
-they do not prune them.
+straddles `since` counts whole. The stores keep history and request records
+until you [prune](#retention) them.
+
+## Open holds
+
+A hold stays open when its caller never settles or releases it: the process
+crashed after reserving, or every attempt to settle failed. An open hold keeps
+its estimate charged. In a windowed budget it leaves with its bucket; in a
+lifetime budget it stays until you close it. Since 2.3 the memory, SQLite and
+Postgres stores list and close open holds:
+
+- `holds({ before, limit?, after? })` lists the holds reserved before a time,
+  oldest first, a page at a time: request ID, model, held estimates, the time it
+  was reserved and the scope keys it is charged to.
+- `sweep({ before, resolve?, limit? })` closes them through the store's own
+  `settle` and `release`. By default it settles each at its estimate, so the
+  budget keeps the charge: the fail-closed choice for a call that may have run.
+  `resolve: 'release'` frees them, for calls you know never reached the
+  provider. A function decides per hold, and may return the actual amounts from
+  your own records, or `'keep'`. A hold its caller closed while the sweep ran is
+  skipped. `limit` caps how many holds one call examines (default 1 000).
+
+Choose `before` well past your longest call and its settlement retries. A sweep
+that closes a hold its caller is about to settle turns that settlement into a
+`reservation_conflict` error.
+
+```ts
+import { createSqliteBudgetStore } from '@deuz-sdk/core/ops/sqlite';
+
+const store = createSqliteBudgetStore({ path: './budgets.sqlite' });
+
+/** Run every few minutes: close the holds of calls whose process died. */
+async function closeStaleHolds(
+  usedBy: (requestId: string) => { tokens: number; usd: number } | undefined,
+) {
+  return store.sweep({
+    before: Date.now() - 15 * 60_000,
+    // Bill what the call really used when you know it, its estimate otherwise.
+    resolve: (hold) => usedBy(hold.requestId) ?? 'settle',
+  });
+}
+```
+
+`sweep` resolves to `{ settled, released, skipped }`. To recover a lifetime
+budget from a hold leaked by a crash, sweep it: with its real usage when your
+records have it, with `'release'` when the call never ran.
+
+## Retention
+
+`prune({ before })` (2.3) removes what admission no longer needs:
+
+- It deletes the settled, released and denied request records created before
+  `before`. A pruned request is forgotten: repeating its reservation admits it
+  anew, and a late settlement of it is ignored, so prune only records older
+  than any retry could be.
+- It folds history. Per scope and model, the buckets that closed a whole bucket
+  length before both `before` and now, and that admission no longer counts, are
+  summed into the newest of them. Usage totals and every admission decision stay
+  the same; `usage(key, { since })` counts a folded amount at the bucket it was
+  folded into.
+- A hold that is still open keeps its record and its bucket, so sweep stale
+  holds first.
+
+It resolves to `{ requests, buckets }`: the records deleted and the history rows
+folded away.
+
+```ts
+import { createInMemoryBudgetStore } from '@deuz-sdk/core/agent';
+
+const store = createInMemoryBudgetStore();
+const scope = { key: 'org:acme', limits: { tokens: 1_000_000 } };
+await store.reserve({ requestId: 'call-1', modelId: 'm', tokens: 500, scopes: [scope] });
+await store.settle('call-1', { tokens: 420, usd: 0 });
+
+const result = await store.prune({ before: Date.now() + 1 });
+console.log(result.requests); // 1: the settled record of call-1
+console.log(await store.usage('org:acme')); // { tokens: 420, usd: 0 }: history is kept
+```

@@ -13,25 +13,46 @@
  * - Settlement and release move a request out of `reserved` with a row lock,
  *   so concurrent callers apply each transition exactly once.
  *
+ * Under REPEATABLE READ or SERIALIZABLE a contended statement fails with 40001,
+ * or 40P01 as a deadlock victim; Postgres rolled it back whole, so each of
+ * these writes runs again, up to five attempts in all (2.3).
+ *
  * Windows run on database time (`clock_timestamp()`), never on host clocks.
  * `BIGINT` and `numeric` values arrive as strings from `pg` and are coerced
  * with `Number()`. The schema is created by one locked statement
  * (`postgres-migrate.ts`), so concurrent first uses never race.
  */
 import type { PgClientLike } from './store-postgres';
-import { createPostgresSchema, postgresSchemaStatement } from './postgres-migrate';
-import type { BudgetStore, BudgetStoreReservation } from '../types/budget-store';
+import {
+  createPostgresSchema,
+  postgresSchemaStatement,
+  retryPostgres,
+  SERIALIZATION_CODES,
+} from './postgres-migrate';
+import type {
+  BudgetHold,
+  BudgetPruneResult,
+  BudgetStore,
+  BudgetStoreMaintenance,
+  BudgetStoreReservation,
+  BudgetSweepOptions,
+  BudgetSweepResult,
+} from '../types/budget-store';
 import {
   assertBudgetActual,
   assertBudgetKey,
+  assertPruneOptions,
+  budgetHold,
   assertSameWindow,
   assertUsageOptions,
   BudgetStoreError,
   normalizeBudgetReserve,
+  normalizeHoldQuery,
   planBudgetTransition,
   reservationConflict,
   roundBudgetOutcome,
   summarizeBudgetUsage,
+  sweepBudgetHolds,
 } from '../budget-store';
 
 export interface PostgresBudgetStoreOptions {
@@ -46,7 +67,9 @@ const NOW_MS = '(extract(epoch from clock_timestamp()) * 1000)::bigint';
 
 type RequestState = 'reserved' | 'settled' | 'released' | 'denied';
 
-export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): BudgetStore {
+export function createPostgresBudgetStore(
+  options: PostgresBudgetStoreOptions,
+): BudgetStore & BudgetStoreMaintenance {
   const schema = options.schema ?? 'public';
   if (!SCHEMA_NAME_PATTERN.test(schema) || schema.length > 63)
     throw new BudgetStoreError(
@@ -55,6 +78,9 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
     );
   const client = options.client;
   const t = (name: string) => `${schema}.deuz_budget_${name}`;
+  /** One write statement, again after a serialization failure or a deadlock (2.3). */
+  const write = (sql: string, params: unknown[]) =>
+    retryPostgres(SERIALIZATION_CODES, () => client.query(sql, params));
   let migrating: Promise<void> | undefined;
 
   // One statement (a DO block) under an advisory lock: see postgres-migrate.ts.
@@ -74,6 +100,8 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, model_id TEXT NOT NULL,
         tokens BIGINT NOT NULL, usd DOUBLE PRECISION NOT NULL, state TEXT NOT NULL, charges JSONB NOT NULL,
         actual_tokens BIGINT, actual_usd DOUBLE PRECISION, outcome JSONB NOT NULL, created_at BIGINT NOT NULL)`,
+      // 2.3: for prune and the open holds; 2.2 ignores it, so version 1 stays.
+      `CREATE INDEX IF NOT EXISTS deuz_budget_requests_state ON ${t('requests')} (state, created_at)`,
     ],
   });
 
@@ -134,8 +162,12 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         AND (SELECT count(*) FROM locked) >= 0
       RETURNING s.key
     ), hist AS (
-      UPDATE ${t('counters')} k SET tokens = k.tokens + ch.dt, usd = k.usd + ch.du
-      FROM ch WHERE k.key = ch.key AND k.bucket = ch.hist AND k.model_id = ch.model_id
+      -- An upsert (2.3): a prune whose snapshot predates the reservation may
+      -- have folded its row away; the difference then lands in a row of its own.
+      INSERT INTO ${t('counters')} AS k (key, bucket, model_id, tokens, usd)
+      SELECT key, hist, model_id, dt, du FROM ch
+      ON CONFLICT (key, bucket, model_id)
+        DO UPDATE SET tokens = k.tokens + excluded.tokens, usd = k.usd + excluded.usd
       RETURNING k.key
     )
     SELECT (SELECT count(*) FROM upd) AS applied,
@@ -143,6 +175,46 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
 
   const settleSql = transition('settled', '$2::bigint - tg.tokens', '$3::float8 - tg.usd');
   const releaseSql = transition('released', '-tg.tokens', '-tg.usd');
+
+  // Retention (2.3), one statement. A folded row is deleted and its amount
+  // moved into its group's newest row by an upsert, never re-read from the
+  // snapshot: under READ COMMITTED a concurrent prune or settlement changes
+  // either row in place, and no amount is lost or counted twice. The three
+  // bucket comparisons are isFoldableBucket's.
+  const pruneSql = `
+    WITH now_ms AS (SELECT ${NOW_MS} AS at),
+    dropped AS (
+      DELETE FROM ${t('requests')} WHERE state <> 'reserved' AND created_at < $1::float8
+      RETURNING 1
+    ), held AS (
+      SELECT DISTINCT c->>'key' AS key, (c->>'index')::bigint AS bucket
+      FROM ${t('requests')} r, jsonb_array_elements(r.charges) AS c WHERE r.state = 'reserved'
+    ), foldable AS (
+      SELECT k.key, k.bucket, k.model_id FROM ${t('counters')} k
+      JOIN ${t('scopes')} s ON s.key = k.key CROSS JOIN now_ms n
+      WHERE (k.bucket + 1) * s.bucket_ms <= $1::float8
+        AND (k.bucket + 2) * s.bucket_ms <= n.at
+        AND (s.window_ms IS NULL OR (k.bucket + s.buckets) * s.bucket_ms <= n.at)
+        AND NOT EXISTS (SELECT 1 FROM held h WHERE h.key = k.key AND h.bucket = k.bucket)
+    ), groups AS (
+      SELECT key, model_id, max(bucket) AS keep FROM foldable
+      GROUP BY key, model_id HAVING count(*) > 1
+    ), gone AS (
+      DELETE FROM ${t('counters')} k USING groups g
+      WHERE k.key = g.key AND k.model_id = g.model_id AND k.bucket < g.keep
+        AND (k.key, k.bucket, k.model_id) IN (SELECT key, bucket, model_id FROM foldable)
+      RETURNING k.key, k.model_id, k.tokens, k.usd
+    ), kept AS (
+      INSERT INTO ${t('counters')} AS k (key, bucket, model_id, tokens, usd)
+      SELECT g.key, g.keep, g.model_id, sum(x.tokens), sum(x.usd)
+      FROM gone x JOIN groups g ON g.key = x.key AND g.model_id = x.model_id
+      GROUP BY g.key, g.keep, g.model_id
+      ON CONFLICT (key, bucket, model_id)
+        DO UPDATE SET tokens = k.tokens + excluded.tokens, usd = k.usd + excluded.usd
+      RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM dropped) AS requests, (SELECT count(*) FROM gone) AS buckets,
+      (SELECT count(*) FROM kept) AS kept`;
 
   // `cur` holds the scopes whose stored window matches the request. A scope
   // created with another window by a concurrent first reserve drops out of it;
@@ -255,7 +327,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
       )
     ).rows;
 
-  return Object.freeze({
+  const store = Object.freeze({
     async reserve(input) {
       const request = normalizeBudgetReserve(input);
       await migrate();
@@ -263,7 +335,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
       if (repeat) return repeat;
       const keys = request.scopes.map((scope) => scope.key);
       // Create missing scope rows; an existing key keeps its first window.
-      const { rows: saved } = await client.query(
+      const { rows: saved } = await write(
         `WITH created AS (
           INSERT INTO ${t('scopes')} (key, window_ms, buckets, bucket_ms, ring_idx, ring_tokens, ring_usd)
           SELECT x.key, x.w, x.b, x.bm, array_fill(-1::bigint, ARRAY[x.b]),
@@ -280,7 +352,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         ],
       );
       assertStoredWindows(request, saved);
-      const { rows } = await client.query(reserveSql, [
+      const { rows } = await write(reserveSql, [
         request.requestId,
         request.fingerprint,
         request.modelId,
@@ -309,7 +381,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
       assertBudgetKey(requestId);
       const settle = assertBudgetActual(actual);
       await migrate();
-      const { rows } = await client.query(settleSql, [requestId, settle.tokens, settle.usd]);
+      const { rows } = await write(settleSql, [requestId, settle.tokens, settle.usd]);
       if (Number(rows[0]?.applied) > 0) return;
       const current = await readRequest(requestId);
       if (current) planBudgetTransition(requestId, current, { settle });
@@ -317,13 +389,13 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
     async release(requestId) {
       assertBudgetKey(requestId);
       await migrate();
-      const { rows } = await client.query(releaseSql, [requestId]);
+      const { rows } = await write(releaseSql, [requestId]);
       if (Number(rows[0]?.applied) > 0) return;
       const current = await readRequest(requestId);
       if (!current || planBudgetTransition(requestId, current, { release: true }) === 'noop')
         return;
       // A settled request that cost nothing: nothing to subtract.
-      await client.query(
+      await write(
         `UPDATE ${t('requests')} SET state = 'released'
          WHERE request_id = $1 AND state = 'settled' AND actual_tokens = 0 AND actual_usd = 0`,
         [requestId],
@@ -349,5 +421,40 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
         usageOptions.byModel,
       );
     },
-  } satisfies BudgetStore);
+    async prune(pruneOptions): Promise<BudgetPruneResult> {
+      const before = assertPruneOptions(pruneOptions);
+      await migrate();
+      const { rows } = await write(pruneSql, [before]);
+      return { requests: Number(rows[0]?.requests ?? 0), buckets: Number(rows[0]?.buckets ?? 0) };
+    },
+    async holds(query) {
+      const { before, limit, after } = normalizeHoldQuery(query);
+      await migrate();
+      const { rows } = await client.query(
+        `SELECT request_id, model_id, tokens, usd, charges, created_at FROM ${t('requests')}
+         WHERE state = 'reserved' AND created_at < $1::float8
+           AND ($2::float8 IS NULL OR created_at > $2::float8
+             OR (created_at = $2::float8 AND request_id COLLATE "C" > $3::text))
+         ORDER BY created_at, request_id COLLATE "C" LIMIT $4`,
+        [before, after?.reservedAt ?? null, after?.requestId ?? null, limit],
+      );
+      return rows.map(
+        (row): BudgetHold =>
+          budgetHold(String(row.request_id), {
+            modelId: String(row.model_id),
+            tokens: Number(row.tokens),
+            usd: Number(row.usd),
+            at: Number(row.created_at),
+            charges: (typeof row.charges === 'string' ? JSON.parse(row.charges) : row.charges) as {
+              key: string;
+              index: number;
+            }[],
+          }),
+      );
+    },
+    async sweep(sweepOptions: BudgetSweepOptions): Promise<BudgetSweepResult> {
+      return sweepBudgetHolds(store, sweepOptions);
+    },
+  } satisfies BudgetStore & BudgetStoreMaintenance);
+  return store;
 }
