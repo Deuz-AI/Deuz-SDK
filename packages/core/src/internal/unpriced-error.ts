@@ -8,6 +8,12 @@ import { DeuzError } from '../errors';
  */
 export class UnpricedModelError extends DeuzError {
   readonly code = 'unpriced_model';
+  /**
+   * The refusal ends the run, as a `BudgetLedgerError` does (2.3): raised in a
+   * compaction summary or inside an `agentTool` sub-agent, it is never a
+   * skipped layer or a tool error the model may retry.
+   */
+  readonly fatalExecution = true;
   readonly modelId: string;
 
   constructor(modelId: string, cause?: unknown) {

@@ -1529,6 +1529,27 @@ export function retargetCompaction(
 export type CompactionTrigger = 'threshold' | 'overflow';
 
 /**
+ * A legacy loop's unknown-price gate (2.3, decision 4): what its
+ * `budget.unknownPrice`, and that of the loop whose tool started it, say before
+ * a model is called. The loop keeps it on its resolved `deps`, so compaction
+ * asks it before a summary, and the `deps` its tools receive carry it on to an
+ * `agentTool` sub-agent, which asks it before each of its own model calls.
+ */
+export type ModelGate = (modelId: string) => Promise<void>;
+
+const MODEL_GATE = Symbol('deuz.model-gate');
+
+/** The gate `deps` carries: its loop's own, or the one a parent loop handed down. */
+export function modelGate(deps: object | undefined): ModelGate | undefined {
+  return deps ? (deps as Record<symbol, ModelGate | undefined>)[MODEL_GATE] : undefined;
+}
+
+/** Put `gate` on `deps`: an enumerable property, so every copy of `deps` keeps it. */
+export function setModelGate(deps: object, gate: ModelGate | undefined): void {
+  if (gate) (deps as Record<symbol, ModelGate>)[MODEL_GATE] = gate;
+}
+
+/**
  * Run compaction before a model step. `addUsage` folds the summarize call's
  * usage into the loop total (so it counts toward budget stops); `onEvent`
  * surfaces each layer (stream part / log line) together with the `trigger` that
@@ -1567,12 +1588,15 @@ export async function runCompaction(
       // The slice is rendered to a transcript inside ONE user message so the
       // request is user-first (valid on every wire, incl. Anthropic). With a
       // previous summary in hand the call FOLDS instead of re-summarizing.
+      // The ACTIVE agent's model after a handoff (2.0) — `runner.model`, not
+      // `options.model`, which is whoever STARTED the run.
+      const model = runner.policy.summarizeModel ?? runner.model;
+      // A model call like any other (2.3): the loop's unknown-price gate first.
+      await modelGate(deps)?.(model.modelId);
       const step = await runOneStep(
         preserveClientContext(options, {
           ...options,
-          // The ACTIVE agent's model after a handoff (2.0) — `runner.model`, not
-          // `options.model`, which is whoever STARTED the run.
-          model: runner.policy.summarizeModel ?? runner.model,
+          model,
           messages: [
             {
               role: 'user',
