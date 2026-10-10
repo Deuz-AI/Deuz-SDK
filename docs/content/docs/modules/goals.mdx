@@ -1,0 +1,435 @@
+---
+title: Goals
+description: Versioned goal records with acceptance criteria and evidence, explicit waiting reasons, budgets and deadlines, and wakeup and event envelopes, moved forward by pure transitions.
+---
+
+`@deuz-sdk/core/goal` (2.3) is the data contract for work that outlives one
+model call: a goal that is done only when its acceptance criteria pass on
+evidence, that says what it is waiting for, and that a schedule, a webhook or
+another goal can wake. It is edge-safe and pure. Nothing in it runs a model, a
+timer or a background service: you keep the records in your own storage and
+move them forward with `transitionGoal`, giving it the time.
+
+| Piece | What it is |
+| --- | --- |
+| `GoalRecord` | A versioned JSON record: objective, criteria, evidence, verdicts, budget, deadline, status |
+| `transitionGoal` | The one way a record changes: a pure function of the record, a command and `now` |
+| `assessGoal` | Where acceptance stands: passed, failed or inconclusive, per criterion and overall |
+| `GoalEvent` | A wakeup or outside event addressed to a goal, with a dedupe key |
+| `GoalStore` | Your persistence boundary; `createInMemoryGoalStore` is the reference |
+
+A running supervisor that drives goals on its own, a durable inbox and timezone
+aware wakeups are planned for 2.4. The 2.3 records are the contract they will
+build on.
+
+## A goal
+
+`createGoal` returns an `active` record at revision 1. Each criterion is
+required unless it says `required: false`, and a goal needs at least one
+required criterion. Without criteria, the objective itself is the one
+criterion.
+
+```ts
+import { createGoal } from '@deuz-sdk/core/goal';
+
+const now = Date.parse('2026-10-12T09:00:00Z');
+const goal = createGoal(
+  {
+    goalId: 'fix-nightly',
+    scope: 'acme',
+    objective: 'Make the nightly build green.',
+    criteria: [
+      { id: 'build', description: 'The nightly build passes.' },
+      { id: 'notes', description: 'The changelog explains the fix.', required: false },
+    ],
+    budget: { usd: 5 },
+    deadline: now + 2 * 86_400_000,
+  },
+  { now },
+);
+
+console.log(goal.status, goal.revision); // active 1
+```
+
+| Field | Meaning |
+| --- | --- |
+| `goalId`, `scope` | Identity, and the tenant or workflow it belongs to |
+| `parentGoalId`, `runId` | The goal this one serves; the native run working on it now, or last |
+| `revision` | Increases by one on every change; a store saves only the next revision |
+| `objective`, `criteria` | What to achieve, and what must be true for it to count |
+| `evidence`, `results` | References to evidence, append-only; the latest verdict per criterion |
+| `budget`, `spent`, `deadline` | Limits for the goal as a whole, what its runs spent, and when it fails |
+| `status`, `waiting`, `outcome` | `active`, `waiting` (with `waiting`) or ended: `completed`, `failed`, `cancelled` (with `outcome`) |
+| `seen` | The dedupe keys of the last 64 events and charges the goal applied |
+| `meta` | Your own data, JSON |
+
+## Transitions
+
+Every change is a command given to `transitionGoal` with the time:
+
+```ts
+const next = transitionGoal(goal, command, { now: Date.now() });
+if (next.changed) await store.save(next.record);
+```
+
+It never changes the record it is given. It returns the next record, one
+revision higher, and says what it did:
+
+| `outcome` | Meaning |
+| --- | --- |
+| `'applied'` | The command or event took effect |
+| `'ignored'` | An event, a charge or a no-op left the goal as it was; `reason` says why |
+| `'rejected'` | The goal refused the command; `reason` says why, and nothing changed |
+
+A malformed record or command, an event meant for another goal, and an
+`expectedRevision` the record is not at throw a `GoalError` instead, with a
+`code`: `invalid_goal`, `invalid_command`, `invalid_event`, `scope_mismatch` or
+`revision_conflict`.
+
+| Command | Does |
+| --- | --- |
+| `{ type: 'wait', wait }` | Waits, for a stated reason (below) |
+| `{ type: 'resume' }` | Ends a wait yourself, for example when a person answered in your own UI |
+| `{ type: 'event', event }` | Applies a wakeup or outside event |
+| `{ type: 'evidence', evidence }` | Records references to evidence |
+| `{ type: 'evaluate', results, evidence? }` | Records verdicts on criteria |
+| `{ type: 'complete' }` | Completes the goal, only once acceptance passed |
+| `{ type: 'fail', reason }`, `{ type: 'cancel', reason? }` | Ends the goal |
+| `{ type: 'charge', usd?, tokens?, key? }` | Adds what a run spent |
+| `{ type: 'revise', objective?, criteria?, budget?, deadline?, meta? }` | Changes the goal; `null` removes the budget, the deadline or `meta` |
+| `{ type: 'link-run', runId }` | Names the native run working on the goal |
+| `{ type: 'tick' }` | Applies time alone: a passed deadline, a due wakeup |
+
+An ended goal refuses every command (`'terminal'`), except a repeated cancel,
+which it ignores, and a charge, which it still records.
+
+## Waiting, explicitly
+
+A goal no model call is working on is not done, and it is not idle either: it
+is `active` until a command says what it waits for. `waiting.reason` is one of:
+
+| Reason | Waits for | Ends on |
+| --- | --- | --- |
+| `'user'` | A person | A `user` event, or `resume` |
+| `'event'` | An outside event from `source` (a type, and an ID when given) | A matching event, or `resume` |
+| `'dependency'` | Other goals or native runs, in `on` | An event from each of them (`goal` or `run` source with its ID), or `resume` |
+| `'wakeup'` | A time, `at`, optionally a schedule's occurrence | A `tick` at or after `at`, an event dated then, or `resume` |
+| `'budget'` | More budget: a charge reached a limit | A `revise` that raises the budget, or a cancel |
+
+Every wait has an `id` (by default `<goalId>#<revision>`) and a `since`. An
+event that answers the wait carries the `id` as `correlationId`. A new wait
+replaces the current one, except a budget wait, which only a revision raising
+the budget ends.
+
+```ts
+import { createGoal, goalEventFromSignal, transitionGoal } from '@deuz-sdk/core/goal';
+
+const start = Date.parse('2026-10-12T09:00:00Z');
+let goal = createGoal(
+  { goalId: 'fix-nightly', scope: 'acme', objective: 'Make the nightly build green.' },
+  { now: start },
+);
+
+goal = transitionGoal(
+  goal,
+  { type: 'wait', wait: { reason: 'event', source: { type: 'signal', id: 'ci' } } },
+  { now: start + 60_000 },
+).record;
+console.log(goal.waiting); // { reason: 'event', id: 'fix-nightly#2', since: …, source: { type: 'signal', id: 'ci' } }
+
+// The CI webhook arrives; handleSignal's dispatch builds the event.
+const event = goalEventFromSignal(
+  { key: 'delivery-812' },
+  { scope: 'acme', goalId: 'fix-nightly', name: 'ci', at: start + 600_000 },
+);
+const answered = transitionGoal(goal, { type: 'event', event }, { now: start + 600_000 });
+console.log(answered.outcome, answered.record.status); // applied active
+
+// The sender retries the same delivery.
+const again = transitionGoal(answered.record, { type: 'event', event }, { now: start + 601_000 });
+console.log(again.outcome, again.reason); // ignored duplicate
+```
+
+## Acceptance on evidence
+
+A goal completes only when every required criterion passed, and a `passed`
+verdict counts only when something other than the working model reached it,
+on evidence from outside the model. A model saying it is done is evidence of
+what the model said, not of the result: `evaluate` records such a verdict as
+`inconclusive`, with a note, and `complete` refuses it with
+`'acceptance-not-passed'`.
+
+| Evidence and verdict `source` | |
+| --- | --- |
+| `'test'`, `'artifact'`, `'human'`, `'verifier'`, `'tool'`, `'external'` | Can carry a passed verdict |
+| `'model'` | The working model's own claim: never passes a criterion on its own |
+
+```ts
+import { assessGoal, createGoal, transitionGoal } from '@deuz-sdk/core/goal';
+
+const now = Date.parse('2026-10-12T12:00:00Z');
+const goal = createGoal(
+  {
+    goalId: 'fix-nightly',
+    scope: 'acme',
+    objective: 'Make the nightly build green.',
+    criteria: [{ id: 'build', description: 'The nightly build passes.' }],
+  },
+  { now },
+);
+
+// The model says the build is fixed.
+const claimed = transitionGoal(
+  goal,
+  {
+    type: 'evaluate',
+    evidence: [{ id: 'answer', source: 'model', ref: 'run:fix-nightly-1', summary: 'Fixed it.' }],
+    results: [{ criterionId: 'build', verdict: 'passed', source: 'model', evidence: ['answer'] }],
+  },
+  { now: now + 1 },
+);
+console.log(claimed.acceptance?.verdict); // inconclusive
+console.log(transitionGoal(claimed.record, { type: 'complete' }, { now: now + 2 }).reason);
+// acceptance-not-passed
+
+// The CI run says so too.
+const tested = transitionGoal(
+  claimed.record,
+  {
+    type: 'evaluate',
+    evidence: [{ id: 'ci-812', source: 'test', ref: 'https://ci.example.com/runs/812' }],
+    results: [{ criterionId: 'build', verdict: 'passed', source: 'test', evidence: ['ci-812'] }],
+  },
+  { now: now + 3 },
+);
+console.log(assessGoal(tested.record).verdict); // passed
+const done = transitionGoal(tested.record, { type: 'complete' }, { now: now + 4 });
+console.log(done.record.status, done.record.outcome); // completed { reason: 'accepted', at: … }
+```
+
+A `failed` verdict on a required criterion makes acceptance `failed`, but the
+goal stays open, so the work can go on. To give up, send `fail`. A verdict
+names its criterion and the evidence it rests on; an unknown one is refused
+(`'unknown-criterion'`, `'unknown-evidence'`), and so is evidence under a known
+ID that says something else (`'evidence-conflict'`). When a revision changes a
+criterion, its verdict is dropped; evidence is kept.
+
+## Budget and deadline
+
+`charge` adds what a run spent. When the spend reaches `budget.usd` or
+`budget.tokens`, the goal waits with reason `'budget'` until a `revise` raises
+the limit, which makes it active again. A charge without `usd`, for a model
+without a price, counts its tokens only, as everywhere else in 2.3. Give a
+charge a `key`, such as the run ID, and the same charge again is ignored as a
+duplicate.
+
+```ts
+import { createGoal, transitionGoal } from '@deuz-sdk/core/goal';
+
+const now = Date.parse('2026-10-12T09:00:00Z');
+let goal = createGoal(
+  { goalId: 'report', scope: 'acme', objective: 'Write the report.', budget: { usd: 1 } },
+  { now },
+);
+const charge = { type: 'charge', usd: 1.2, tokens: 9_000, key: 'run-1' } as const;
+goal = transitionGoal(goal, charge, { now: now + 1 }).record;
+console.log(goal.status, goal.waiting?.reason); // waiting budget
+
+goal = transitionGoal(goal, { type: 'revise', budget: { usd: 3 } }, { now: now + 2 }).record;
+console.log(goal.status); // active
+```
+
+A goal whose `deadline` passed fails with `outcome.reason` `'deadline'` at the
+first transition at or after it, before that transition's command applies;
+a `tick` is enough. A revision can extend or remove the deadline while it has
+not passed, but never set one at or before `now` (`'deadline-passed'`).
+
+## Wakeups and events
+
+A `GoalEvent` is a small, versioned envelope: what happened, to which goal, and
+how to recognise it again. Keep the payload in your own storage and pass a
+reference to it.
+
+| Field | Meaning |
+| --- | --- |
+| `id` | The event's identity; defaults to `key` |
+| `source` | Who sent it: `schedule`, `signal`, `user`, `run`, `goal`, `wakeup` or `custom`, and an `id` |
+| `scope`, `goalId`, `runId` | Where it goes; an event for another goal or scope throws `scope_mismatch` |
+| `key` | Its dedupe key |
+| `at`, `notBefore`, `expiresAt` | When it happened; not to be applied before, or at and after |
+| `payload` | `{ ref, digest?, mediaType?, bytes? }`: where the payload is |
+| `correlationId`, `causationId` | The wait it answers; the event that caused it |
+
+Its `key` shares one space with the keys the [schedule](/docs/modules/schedule)
+module already produces, so one durable claim, such as the ops stores' `claims`,
+dedupes all of them:
+
+| Builder | `key` |
+| --- | --- |
+| `goalEventFromOccurrence(occurrence, target)` | The occurrence key, `<scheduleId>@<at>` |
+| `goalEventFromSignal({ key }, { ...target, name, at })` | `handleSignal`'s key: your delivery ID, or `sha256:<hex>` of the body |
+| `goalWakeupEvent(goal)` | `goalWakeupKey(goalId, at)`: `goal:<goalId>@<at>` |
+| `createGoalEvent(fields)` | Your own |
+
+Applying an event never throws for the goal's own reasons. It ends the wait it
+answers (a dependency wait once every dependency reported), and remembers its
+key; or it reports why it was dropped, checking in this order:
+
+| `reason` | When |
+| --- | --- |
+| `'terminal'` | The goal ended |
+| `'duplicate'` | The goal applied this `key` before |
+| `'expired'` | `now` is at or after `expiresAt` |
+| `'early'` | `now` is before `notBefore`: deliver it again then |
+| `'unmatched'` | The goal is not waiting |
+| `'stale'` | It answers another wait (`correlationId`), or happened before this wait began |
+| `'unmatched'` | The wait is for something else: another source, a dependency not listed, a wakeup not yet due |
+
+A goal remembers the keys of its last 64 events and charges. Further back,
+claim the key durably before you apply the event, as `handleSignal` does with
+its `dedupe`.
+
+Nothing in 2.3 fires a wakeup by itself. A periodic job of yours finds the due
+ones and ticks them, with a claim so that one process wakes each:
+
+```ts
+import { createInMemoryGoalStore, goalWakeupKey, transitionGoal } from '@deuz-sdk/core/goal';
+import { createInMemoryClaim } from '@deuz-sdk/core/schedule';
+
+const goals = createInMemoryGoalStore();
+const claim = createInMemoryClaim(); // across processes: ops.claims
+
+async function wakeDueGoals(now: number): Promise<void> {
+  let cursor: string | undefined;
+  do {
+    const page = await goals.list({ statuses: ['waiting'], cursor });
+    for (const goal of page.goals) {
+      const wait = goal.waiting;
+      if (wait?.reason !== 'wakeup' || wait.at > now) continue;
+      if (!(await claim(goalWakeupKey(goal.goalId, wait.at)))) continue;
+      const woken = transitionGoal(goal, { type: 'tick' }, { now });
+      if (woken.changed) await goals.save(woken.record);
+      // Resume the goal's run here.
+    }
+    cursor = page.cursor;
+  } while (cursor);
+}
+
+await wakeDueGoals(Date.now());
+```
+
+## Revisions and the persistence boundary
+
+The records are yours to store. A `GoalStore` is the boundary the SDK expects:
+
+- `load(goalId)` returns a copy, or `undefined`.
+- `save(record)` commits durably before it resolves, and only when
+  `record.revision` is the stored revision plus one, or 1 for a new goal. Any
+  other save rejects with a revision conflict and writes nothing.
+- `list({ statuses?, scope?, limit?, cursor? })`, optional, pages through the
+  goals newest change first.
+
+`createInMemoryGoalStore()` is the reference implementation, for tests and a
+single process; the SDK's test suite runs a conformance fixture against it, and
+a store of yours on SQL or a key-value store with compare-and-set should pass
+the same checks. Around a store, every writer runs the same loop: load,
+transition, save, and on a conflict load again. A transition is pure, so the
+retry is safe, and a duplicate event or charge is recognised on the fresh copy:
+
+```ts
+import { GoalError, createInMemoryGoalStore, createGoal, transitionGoal } from '@deuz-sdk/core/goal';
+import type { GoalCommand, GoalStore } from '@deuz-sdk/core/goal';
+
+async function updateGoal(store: GoalStore, goalId: string, command: GoalCommand) {
+  for (let attempt = 0; ; attempt++) {
+    const current = await store.load(goalId);
+    if (!current) throw new Error(`Unknown goal ${goalId}`);
+    const next = transitionGoal(current, command, { now: Date.now() });
+    if (!next.changed) return next;
+    try {
+      await store.save(next.record);
+      return next;
+    } catch (error) {
+      const conflict = error instanceof GoalError && error.code === 'revision_conflict';
+      if (!conflict || attempt >= 3) throw error;
+    }
+  }
+}
+
+const store = createInMemoryGoalStore();
+await store.save(createGoal({ goalId: 'g', scope: 'acme', objective: 'x' }, { now: Date.now() }));
+console.log((await updateGoal(store, 'g', { type: 'link-run', runId: 'g-run-1' })).record.revision); // 2
+```
+
+Pass `expectedRevision` to `transitionGoal` to refuse a command made for an
+older revision (`revision_conflict`), for example a change a person made in a
+UI that showed revision 5 when the goal is now at 7.
+
+## Versions
+
+Records and events carry `kind` and `version`. `serializeGoal` and
+`parseGoal` (`serializeGoalEvent`, `parseGoalEvent`) write and read their JSON:
+
+- A reader accepts every version up to its own, `GOAL_RECORD_VERSION`
+  (`GOAL_EVENT_VERSION`), and refuses a newer one with `unsupported_version`.
+  2.3 writes and reads version 1.
+- Within a version, later 2.x releases only add optional fields. A reader keeps
+  fields it does not know, through every transition, and fills in the ones a
+  writer may leave out (no evidence, verdicts, spend or keys yet).
+- Anything JSON would change, such as a `Date`, a function or `NaN` in `meta`,
+  is refused (`invalid_goal`).
+
+## Goals and native runs
+
+A goal and the native runs that work on it meet through IDs: `link-run` names
+the run, and the run's result feeds the goal. A run that completes is not a
+completed goal. Its usage is a charge, its verifier verdict or test output is
+evidence, and a suspended run is a goal waiting for a person.
+
+```ts
+import { createInMemoryAgentRunStore, runAgent } from '@deuz-sdk/core/agent';
+import { createGoal, transitionGoal } from '@deuz-sdk/core/goal';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const now = Date.now();
+let goal = createGoal(
+  {
+    goalId: 'summary',
+    scope: 'acme',
+    objective: 'Summarise the incident.',
+    criteria: [{ id: 'reviewed', description: 'An on-call engineer approved the summary.' }],
+  },
+  { now },
+);
+const runs = createInMemoryAgentRunStore();
+goal = transitionGoal(goal, { type: 'link-run', runId: 'summary-1' }, { now }).record;
+
+const result = await runAgent({
+  model: createMockModel({ responses: [{ text: 'Disk filled up; rotated logs.' }] }),
+  prompt: goal.objective,
+  session: { store: runs, runId: 'summary-1', scope: goal.scope },
+});
+goal = transitionGoal(
+  goal,
+  { type: 'charge', tokens: result.usage.totalTokens, key: result.runId },
+  { now: now + 1 },
+).record;
+// The run completed, but the goal waits for its reviewer.
+goal = transitionGoal(goal, { type: 'wait', wait: { reason: 'user' } }, { now: now + 2 }).record;
+console.log(result.status, goal.status); // completed waiting
+```
+
+Leases, run discovery and cross-process cancellation of native runs are on the
+[operations](/docs/modules/operations#listing-leasing-and-cancelling-native-runs)
+page: a goal's cancel is yours to forward to its run, by signalling `'cancel'` to
+the run's lease key.
+
+## Design note: plugin manifests and hook provenance
+
+2.3 defines no plugin format. Where a result came from is recorded instead:
+evidence and verdicts name their `source`, evidence its `runId`, and events
+their `source`, `causationId` and `correlationId`. A later plugin manifest is
+expected to declare the hooks a plugin adds, and its hooks to stamp what they
+produce with the plugin's name and version through these same fields, so that
+acceptance can tell a plugin's verdict from a test's. Nothing here installs,
+loads or isolates plugins.
