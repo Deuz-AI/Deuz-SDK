@@ -521,11 +521,11 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
     });
   }
 
-  /** Run a store call; a failure changes nothing locally and admits nothing. */
   /**
-   * A call that closes a hold (settle, release) is repeated: both are
-   * idempotent in the store. Its final failure names the request and what it
-   * still owes, so the hold can be closed later (2.3, F17).
+   * Run a store call; a failure changes nothing locally and admits nothing. A
+   * call that closes a hold (settle, release) is repeated, since both are
+   * idempotent in the store, and its final failure names the request and what
+   * it still owes, so the hold can be closed later (2.3, F17).
    */
   async function mirror<T>(
     call: () => Promise<T>,
@@ -1060,4 +1060,5 @@ export type {
   BudgetSettlement,
   BudgetTotals,
   BudgetWarning,
+  UnknownPricePolicy,
 } from './types/execution';
