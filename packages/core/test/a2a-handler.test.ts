@@ -64,6 +64,22 @@ function handlerWith(executor: A2AExecuteFunction, extra: Partial<A2AHandlerOpti
 
 let rpcId = 0;
 
+/** A POST whose body stream fails after the first chunk, as a dropped connection does. */
+function brokenBodyRequest(url: string): Request {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"jsonrpc":"2.0",'));
+      controller.error(new Error('connection reset'));
+    },
+  });
+  return new Request(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'A2A-Version': '1.0' },
+    body,
+    duplex: 'half',
+  } as RequestInit);
+}
+
 /** POST one JSON-RPC request; the parsed body and the HTTP status. */
 async function rpc(
   handler: (request: Request) => Promise<Response>,
@@ -278,6 +294,14 @@ describe('createA2AHandler — JSON-RPC envelope', () => {
     );
     expect(response.status).toBe(413);
     expect(await response.json()).toMatchObject({ error: { code: -32600 } });
+  });
+
+  it('answers a body that breaks off while being read with 400 and -32600', async () => {
+    const { handler, errors } = handlerWith((ctx) => ctx.reply('pong'));
+    const response = await handler(brokenBodyRequest(RPC_URL));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ id: null, error: { code: -32600 } });
+    expect(errors).toEqual([]);
   });
 });
 
@@ -1244,6 +1268,14 @@ describe('createA2AHandler — HTTP+JSON binding', () => {
     expect(await (await rest(handler, 'GET', '/extendedAgentCard')).json()).toEqual(
       restErrorBody(400, 'FAILED_PRECONDITION', 'UNSUPPORTED_OPERATION'),
     );
+  });
+
+  it('answers a body that breaks off while being read with 400', async () => {
+    const { handler, errors } = handlerWith((ctx) => ctx.reply('pong'));
+    const response = await handler(brokenBodyRequest(`${REST_URL}/message:send`));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(restErrorBody(400, 'INVALID_ARGUMENT', 'INVALID_PARAMS'));
+    expect(errors).toEqual([]);
   });
 
   it('answers an unknown route with 404 and a wrong method with 405', async () => {

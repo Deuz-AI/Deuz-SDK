@@ -50,6 +50,9 @@ type JsonRpcId = string | number | null;
 
 class BodyTooLargeError extends Error {}
 
+/** The request body broke off (the client went away mid-upload). */
+class BodyReadError extends Error {}
+
 function normalizePath(pathname: string): string {
   return pathname.length > 1 ? pathname.replace(/\/+$/, '') || '/' : pathname;
 }
@@ -72,7 +75,13 @@ async function readBody(request: Request, limit: number): Promise<string> {
   const chunks: Uint8Array[] = [];
   let size = 0;
   for (;;) {
-    const { done, value } = await reader.read();
+    let next: ReadableStreamReadResult<Uint8Array>;
+    try {
+      next = await reader.read();
+    } catch (error) {
+      throw new BodyReadError('The request body could not be read.', { cause: error });
+    }
+    const { done, value } = next;
     if (done) break;
     size += value.byteLength;
     if (size > limit) {
@@ -676,12 +685,17 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
     try {
       text = await readBody(request, maxBodyBytes);
     } catch (error) {
-      if (!(error instanceof BodyTooLargeError)) throw error;
-      return rpcError(
-        null,
-        protocolError('INVALID_REQUEST', `The request body exceeds ${maxBodyBytes} bytes.`),
-        413,
-      );
+      if (error instanceof BodyTooLargeError) {
+        return rpcError(
+          null,
+          protocolError('INVALID_REQUEST', `The request body exceeds ${maxBodyBytes} bytes.`),
+          413,
+        );
+      }
+      if (error instanceof BodyReadError) {
+        return rpcError(null, protocolError('INVALID_REQUEST', error.message), 400);
+      }
+      throw error;
     }
     let body: unknown;
     try {
@@ -805,6 +819,10 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
       }
       return await dispatchRest(parsed.route, parsed.tenant, request);
     } catch (error) {
+      if (error instanceof BodyReadError) {
+        const { body } = restErrorBody(invalidParams(error.message));
+        return json(body, 400, A2A_CONTENT_TYPE);
+      }
       if (error instanceof BodyTooLargeError) {
         return json(
           {
