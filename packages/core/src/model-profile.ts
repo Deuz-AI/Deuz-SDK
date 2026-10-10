@@ -39,6 +39,7 @@ import {
 } from './core/registry';
 import {
   EFFORT_SCALE,
+  atMostHigh,
   budgetPeers,
   clampEffortLevel,
   effortWire,
@@ -735,6 +736,15 @@ function clampsFor(
     const lowest = none === 'lowest' ? clampEffortLevel('low', levels) : undefined;
     if (lowest !== undefined) clamp('effort', 'none', lowest);
     else drop('effort', 'none');
+  }
+  // Anthropic turns thinking off only at effort ≤ high: without a documented
+  // default within that limit, the request pins output_config.effort 'low'.
+  if (
+    wire.field === 'output_config.effort' &&
+    (none === 'thinking-disabled' || none === 'thinking-between-tools') &&
+    !atMostHigh(caps.effortDefault)
+  ) {
+    clamp('effort', 'none', 'low');
   }
 
   const thinking = 'effort is set (extended thinking is on)';

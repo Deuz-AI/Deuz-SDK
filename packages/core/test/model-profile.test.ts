@@ -191,6 +191,17 @@ describe('Claude 5.x profiles (verified against Anthropic’s API reference, cac
     expect(clampsOf(haiku, 'effort')).toEqual([]);
   });
 
+  it("Opus 5: 'none' turns thinking off and pins output_config.effort 'low' — a listed clamp", () => {
+    // Thinking turns off only at effort ≤ high, and Opus 5 documents no default.
+    const opus5 = resolveModelProfile(anthropic('claude-opus-5'));
+    expect(opus5.effort.none).toBe('thinking-disabled');
+    expect(clampsOf(opus5, 'effort')).toEqual([
+      { setting: 'effort', from: 'none', to: 'low', warning: 'clamped-setting' },
+    ]);
+    // A documented default within the limit is left alone: nothing is pinned.
+    expect(clampsOf(resolveModelProfile(anthropic('claude-sonnet-5-5')), 'effort')).toEqual([]);
+  });
+
   it('an unknown id in the 5.x family: the family rules, its facts left unknown', () => {
     const profile = resolveModelProfile(anthropic('claude-opus-9-9'));
     expect(profile.match).toBe('family');
@@ -505,7 +516,9 @@ const CROSS_CHECK: [string, (fetch: typeof globalThis.fetch) => LanguageModel][]
       }
     },
   ]),
-  // Legacy wires with their own clamps, the family fallback and a plain fallback.
+  // Opus 5's pinned 'none' effort, legacy wires with their own clamps, the
+  // family fallback and a plain fallback.
+  ['claude-opus-5', (fetch) => createAnthropic({ apiKey: 'k', fetch })('claude-opus-5')],
   ['claude-opus-4-6', (fetch) => createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-6')],
   ['claude-opus-9-9', (fetch) => createAnthropic({ apiKey: 'k', fetch })('claude-opus-9-9')],
   ['gemini-2.5-pro', (fetch) => createGoogleNative({ apiKey: 'AIza-k', fetch })('gemini-2.5-pro')],
@@ -535,7 +548,10 @@ describe('the profile predicts the request (cross-check against the real pump)',
           expect(sent, where).toBe(clamp.to);
         } else if (clamp) {
           expect(`${profile.effort.field} ${String(sent)}`, where).toBe(clamp.to);
-        } else if (effort !== 'none' && profile.effort.levels.length > 0) {
+        } else if (effort === 'none') {
+          // No clamp listed: 'none' reaches the wire only as the wire's own value.
+          expect(sent, where).toBe(profile.effort.none === 'send' ? 'none' : undefined);
+        } else if (profile.effort.levels.length > 0) {
           expect(sent === effort || typeof sent === 'number', where).toBe(true);
         }
       }

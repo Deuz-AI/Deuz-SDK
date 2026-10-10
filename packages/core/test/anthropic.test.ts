@@ -765,11 +765,14 @@ describe('Claude 5.x request rules (2.3, F14)', () => {
     expect(warnings).toEqual([]);
   });
 
-  it("effort 'none': Opus 5 disables thinking and pins effort low (its default is undocumented)", async () => {
+  it("effort 'none': Opus 5 disables thinking and pins effort low (its default is undocumented), reported", async () => {
     const { body, warnings } = await claudeRequest('claude-opus-5', { effort: 'none' });
     expect(body.thinking).toEqual({ type: 'disabled' });
     expect(body.output_config).toEqual({ effort: 'low' });
-    expect(warnings).toEqual([]);
+    // The call runs at 'low' instead of the model's own default: never in silence (F26).
+    expect(warnings.map((w) => `${w.type}:${w.setting}`)).toEqual(['clamped-setting:effort']);
+    expect(warnings[0]!.message).toContain("'none'");
+    expect(warnings[0]!.message).toContain("output_config.effort 'low'");
   });
 
   it("effort 'none': Fable 5.1, Opus 5.5 and the family fallback cannot disable thinking → low + clamped-setting", async () => {

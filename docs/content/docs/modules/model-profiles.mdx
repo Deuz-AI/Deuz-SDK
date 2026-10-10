@@ -110,6 +110,11 @@ lowest one) and reported as a `clamped-setting` warning. `effort.none` says what
 | `'omit'` | The model cannot turn reasoning off and documents no level to use instead, so nothing is sent, with an `unsupported-setting` warning. |
 | `'model-default'` | Nothing is sent, and the model runs at its own default. |
 
+Anthropic turns thinking off only at effort high or below. A model whose
+documented default effort is within that limit keeps it. One that documents no
+default, such as `claude-opus-5`, also gets `output_config.effort: 'low'`, and
+the call reports that as a `clamped-setting` warning.
+
 The current models:
 
 | Model | `effort.levels` | Default | `'none'` |
@@ -182,7 +187,9 @@ report:
   `'high'`, and Gemini 3 Pro `'medium'` becomes `'low'`. On the two budget
   wires (Anthropic `thinking.budget_tokens`, Gemini 2.5 `thinkingBudget`),
   `'xhigh'` and `'max'` send the same budget.
-- **Effort `'none'`** on a model that cannot turn reasoning off.
+- **Effort `'none'`** on a model that cannot turn reasoning off, and on an
+  Anthropic model that turns thinking off but documents no default effort of
+  high or below, where `output_config.effort` is pinned to `'low'`.
 - **Sampling.** `temperature` and `topP` are dropped for a model that rejects
   them, and on the Anthropic budget wire while extended thinking is on.
 - **Forced tool choice.** `'required'` or a named tool becomes `'auto'` for a
