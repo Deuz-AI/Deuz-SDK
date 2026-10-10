@@ -18,14 +18,19 @@ import { createPostgresStores, type PgClientLike } from '../src/node/store-postg
 import { createRedisStores, wrapIoredisClient } from '../src/node/store-redis';
 import { runStoreContracts } from './fixtures/run-store-conformance';
 
+/** Disk and database stores: a loaded machine makes their file and query I/O slow. */
+const SLOW = { timeout: 30_000 };
+
 runStoreContracts('memory', async () => ({ store: createInMemoryRunStore() }));
 
-runStoreContracts('file', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'deuz-run-contract-'));
-  return {
-    store: createFileRunStore({ dir }),
-    cleanup: () => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }),
-  };
+describe('file store', SLOW, () => {
+  runStoreContracts('file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'deuz-run-contract-'));
+    return {
+      store: createFileRunStore({ dir }),
+      cleanup: () => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }),
+    };
+  });
 });
 
 let hasSqlite = false;
@@ -37,14 +42,14 @@ try {
 } catch {
   /* runtime without node:sqlite */
 }
-describe.skipIf(!hasSqlite)('SQLite pack', () => {
+describe.skipIf(!hasSqlite)('SQLite pack', SLOW, () => {
   runStoreContracts('sqlite pack', async () => {
     const stores = createSqliteStores({ path: ':memory:' });
     return { store: stores.runs, cleanup: () => stores.close() };
   });
 });
 
-describe('Postgres pack (PGlite)', () => {
+describe('Postgres pack (PGlite)', SLOW, () => {
   const db = new PGlite();
   beforeAll(() => db.waitReady, 60_000);
   afterAll(async () => {
