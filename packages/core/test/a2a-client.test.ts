@@ -322,6 +322,62 @@ describe('A2A client — JSON-RPC binding', () => {
     expect(await rejection(pending)).toBeInstanceOf(AbortError);
   });
 
+  it('rejects with AbortError even through a fetch that ignores the signal', async () => {
+    // An in-process handler or a custom transport may never look at the signal.
+    let called!: () => void;
+    const inFlight = new Promise<void>((resolve) => (called = resolve));
+    const never = (() => {
+      called();
+      return new Promise<Response>(() => {});
+    }) as typeof globalThis.fetch;
+    const controller = new AbortController();
+    const pending = client(never).getTask('task-1', { signal: controller.signal });
+    await inFlight;
+    controller.abort();
+    expect(await rejection(pending)).toBeInstanceOf(AbortError);
+  });
+
+  it('reports a stream that breaks off as a network failure', async () => {
+    const { fetch } = scriptedFetch((request) => {
+      const id = (request.body as { id: unknown }).id;
+      const first = `data: ${JSON.stringify({ jsonrpc: '2.0', id, result: { task: TASK } })}\n\n`;
+      let pulls = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (pulls++ === 0) controller.enqueue(new TextEncoder().encode(first));
+          else controller.error(new TypeError('terminated'));
+        },
+      });
+      return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+    });
+    const seen: A2AStreamResponse[] = [];
+    const error = await rejection(
+      (async () => {
+        for await (const event of client(fetch).subscribeToTask('task-1')) seen.push(event);
+      })(),
+    );
+    expect(seen).toEqual([{ task: TASK }]);
+    expect(error).toBeInstanceOf(A2AError);
+    expect(error).toMatchObject({ kind: 'network' });
+  });
+
+  it('stops a stream at the abort even when the response keeps coming', async () => {
+    const controller = new AbortController();
+    const { fetch } = scriptedFetch((request) => {
+      const id = (request.body as { id: unknown }).id;
+      return sse([
+        { data: { jsonrpc: '2.0', id, result: { task: TASK } } },
+        { data: { jsonrpc: '2.0', id, result: { task: TASK } } },
+      ]);
+    });
+    const stream = client(fetch)
+      .subscribeToTask('task-1', { signal: controller.signal })
+      [Symbol.asyncIterator]();
+    expect((await stream.next()).value).toEqual({ task: TASK });
+    controller.abort();
+    expect(await rejection(stream.next())).toBeInstanceOf(AbortError);
+  });
+
   it('streams SendStreamingMessage events out of the SSE envelopes', async () => {
     const events = [
       { task: { ...TASK, status: { state: 'TASK_STATE_SUBMITTED' }, artifacts: [] } },

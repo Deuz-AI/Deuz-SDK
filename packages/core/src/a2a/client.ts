@@ -55,6 +55,40 @@ function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * `promise`, or an `AbortError` as soon as `signal` aborts — whether or not
+ * whatever produces `promise` (a custom `fetch`, an in-process handler)
+ * honours the signal itself.
+ */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new AbortError());
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** A failure while `signal` is aborted is the abort; anything else is `otherwise(error)`. */
+function asAbort(
+  error: unknown,
+  signal: AbortSignal | undefined,
+  otherwise: (error: unknown) => unknown,
+): unknown {
+  if (!signal?.aborted) return otherwise(error);
+  return error instanceof AbortError ? error : new AbortError(undefined, { cause: error });
+}
+
 function invalidResponse(message: string, statusCode?: number): A2AError {
   return new A2AError({
     kind: 'invalid-response',
@@ -152,14 +186,18 @@ function createClientCore(options: A2AClientOptions) {
   ): Promise<Response> {
     if (signal?.aborted) throw new AbortError();
     try {
-      return await deps.fetch(url, { ...init, ...(signal ? { signal } : {}) });
+      return await abortable(deps.fetch(url, { ...init, ...(signal ? { signal } : {}) }), signal);
     } catch (error) {
-      if (signal?.aborted) throw new AbortError(undefined, { cause: error });
-      throw new A2AError({
-        kind: 'network',
-        message: `A2A request failed: ${describe(error)}`,
-        cause: error,
-      });
+      throw asAbort(
+        error,
+        signal,
+        (cause) =>
+          new A2AError({
+            kind: 'network',
+            message: `A2A request failed: ${describe(cause)}`,
+            cause,
+          }),
+      );
     }
   }
 
@@ -167,14 +205,18 @@ function createClientCore(options: A2AClientOptions) {
   async function readJson(response: Response, signal: AbortSignal | undefined): Promise<unknown> {
     let text: string;
     try {
-      text = await response.text();
+      text = await abortable(response.text(), signal);
     } catch (error) {
-      if (signal?.aborted) throw new AbortError(undefined, { cause: error });
-      throw new A2AError({
-        kind: 'network',
-        message: `A2A response could not be read: ${describe(error)}`,
-        cause: error,
-      });
+      throw asAbort(
+        error,
+        signal,
+        (cause) =>
+          new A2AError({
+            kind: 'network',
+            message: `A2A response could not be read: ${describe(cause)}`,
+            cause,
+          }),
+      );
     }
     try {
       return JSON.parse(text) as unknown;
@@ -183,27 +225,51 @@ function createClientCore(options: A2AClientOptions) {
     }
   }
 
-  /** Iterates an SSE response, mapping a caller abort to `AbortError`. */
+  /**
+   * Iterates an SSE response. A caller abort ends it with `AbortError` at once,
+   * even while a read is pending; a connection that breaks off is a `network`
+   * failure.
+   */
   async function* events(
     response: Response,
     signal: AbortSignal | undefined,
   ): AsyncGenerator<{ event?: string; data: unknown }, void, undefined> {
     if (!response.body) throw invalidResponse('The A2A stream response has no body.');
+    const iterator = parseSSE(response.body)[Symbol.asyncIterator]();
+    let drained = false;
     try {
-      for await (const event of parseSSE(response.body)) {
+      for (;;) {
+        let step: IteratorResult<{ event?: string; data: string }>;
+        try {
+          step = await abortable(iterator.next(), signal);
+        } catch (error) {
+          throw asAbort(
+            error,
+            signal,
+            (cause) =>
+              new A2AError({
+                kind: 'network',
+                message: `The A2A stream broke off: ${describe(cause)}`,
+                cause,
+              }),
+          );
+        }
+        if (step.done) {
+          drained = true;
+          return;
+        }
+        if (signal?.aborted) throw new AbortError();
         let data: unknown;
         try {
-          data = JSON.parse(event.data) as unknown;
+          data = JSON.parse(step.value.data) as unknown;
         } catch {
           throw invalidResponse('An A2A stream event is not JSON.');
         }
-        yield { ...(event.event !== undefined ? { event: event.event } : {}), data };
+        yield { ...(step.value.event !== undefined ? { event: step.value.event } : {}), data };
       }
-    } catch (error) {
-      if (signal?.aborted && !(error instanceof AbortError)) {
-        throw new AbortError(undefined, { cause: error });
-      }
-      throw error;
+    } finally {
+      // Releases the connection; a read still pending finishes first, so do not wait.
+      if (!drained) void iterator.return?.(undefined);
     }
   }
 
