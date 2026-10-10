@@ -17,11 +17,18 @@ import {
   ERROR_INFO_TYPE,
   JSON_CONTENT_TYPE,
   REASON_WIRE,
+  SSE_CONTENT_TYPE,
   isRecord,
   roleName,
   type A2AErrorReason,
 } from './protocol';
-import { createTaskRuntime, protocolError, withHistory, type TurnInfo } from './runtime';
+import {
+  createTaskRuntime,
+  protocolError,
+  withHistory,
+  type TurnInfo,
+  type TurnSink,
+} from './runtime';
 import { createInMemoryA2ATaskStore } from './task-store';
 import type {
   A2AAgentCard,
@@ -32,6 +39,8 @@ import type {
   A2ASendMessageConfiguration,
   A2ASendMessageRequest,
   A2ASendMessageResponse,
+  A2AStreamResponse,
+  A2ATaskScope,
 } from './types';
 
 const DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -116,8 +125,133 @@ function rpcError(id: JsonRpcId, error: A2AError, status?: number): Response {
   return json(body, status ?? (code === REASON_WIRE.INTERNAL_ERROR.rpc ? 500 : 200));
 }
 
+type QueueItem =
+  | { kind: 'event'; event: A2AStreamResponse }
+  | { kind: 'error'; error: A2AError }
+  | { kind: 'end' };
+
+/** Holds a turn's events until the response stream pulls them. */
+function eventQueue() {
+  const items: QueueItem[] = [];
+  let wake: (() => void) | undefined;
+  let closed = false;
+  const push = (item: QueueItem) => {
+    if (closed) return;
+    items.push(item);
+    wake?.();
+    wake = undefined;
+  };
+  const sink: TurnSink = {
+    event: (event) => push({ kind: 'event', event }),
+    end: () => push({ kind: 'end' }),
+    error: (error) => push({ kind: 'error', error }),
+    get closed() {
+      return closed;
+    },
+  };
+  return {
+    sink,
+    async next(): Promise<QueueItem> {
+      while (items.length === 0) {
+        if (closed) return { kind: 'end' };
+        await new Promise<void>((resolve) => (wake = resolve));
+      }
+      return items.shift() as QueueItem;
+    },
+    /** The response is done (or the client went away): drop the rest. */
+    close() {
+      closed = true;
+      items.length = 0;
+      wake?.();
+      wake = undefined;
+    },
+  };
+}
+
+const SSE_HEADERS = {
+  'Content-Type': SSE_CONTENT_TYPE,
+  'Cache-Control': 'no-cache',
+  'X-Accel-Buffering': 'no',
+};
+
+/** How one binding writes a stream. */
+interface StreamFraming {
+  /** The `data:` JSON of an event. */
+  event(event: A2AStreamResponse): unknown;
+  /** The `data:` JSON of an `event: error`. */
+  error(error: A2AError): unknown;
+  /** The answer to a stream refused before its first event. */
+  errorResponse(error: A2AError): Response;
+}
+
+/**
+ * Answers a streaming request. `open` attaches the stream's sink (or refuses
+ * the request); a refusal or an error before the first event is answered as
+ * a plain error, anything later as SSE, ending with `event: error` when the
+ * turn fails.
+ */
+async function streamResponse(
+  open: (sink: TurnSink) => Promise<void>,
+  framing: StreamFraming,
+  asError: (error: unknown) => A2AError,
+): Promise<Response> {
+  const queue = eventQueue();
+  try {
+    await open(queue.sink);
+  } catch (error) {
+    queue.close();
+    return framing.errorResponse(asError(error));
+  }
+  let pending: QueueItem | undefined = await queue.next();
+  if (pending.kind === 'error') {
+    queue.close();
+    return framing.errorResponse(pending.error);
+  }
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const item = pending ?? (await queue.next());
+      pending = undefined;
+      if (item.kind === 'event') {
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify(framing.event(item.event))}\n\n`),
+        );
+        return;
+      }
+      if (item.kind === 'error') {
+        controller.enqueue(
+          encoder.encode(`event: error\ndata: ${JSON.stringify(framing.error(item.error))}\n\n`),
+        );
+      }
+      queue.close();
+      controller.close();
+    },
+    cancel() {
+      queue.close();
+    },
+  });
+  return new Response(body, { headers: SSE_HEADERS });
+}
+
 function rpcResult(id: JsonRpcId, result: unknown): Response {
   return json({ jsonrpc: '2.0', id, result });
+}
+
+/** JSON-RPC streams: every event is a response to the request's id. */
+function rpcFraming(id: JsonRpcId, historyLength: number | undefined): StreamFraming {
+  return {
+    event: (event) => ({
+      jsonrpc: '2.0',
+      id,
+      result: event.task ? { task: withHistory(event.task, historyLength) } : event,
+    }),
+    error: (error) => ({ jsonrpc: '2.0', id, error: rpcErrorObject(error) }),
+    errorResponse: (error) => rpcError(id, error),
+  };
+}
+
+function scopeOf(tenant: string | undefined): A2ATaskScope {
+  return tenant !== undefined ? { tenant } : {};
 }
 
 function isJsonRpcId(value: unknown): value is JsonRpcId {
@@ -334,9 +468,28 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
       );
     }
     return {
-      scope: tenant !== undefined ? { tenant } : {},
+      scope: scopeOf(tenant),
       extensions: requested.filter((uri) => declaredExtensions.has(uri)),
       httpRequest: request,
+    };
+  }
+
+  function requireStreaming(): void {
+    if (card.capabilities?.streaming !== true) {
+      throw protocolError('UNSUPPORTED_OPERATION', 'Streaming is not supported by this agent.');
+    }
+  }
+
+  /** The params of CancelTask, from the binding's parts. */
+  function cancelRequest(
+    taskId: string,
+    tenant: string | undefined,
+    metadata: Record<string, unknown> | undefined,
+  ) {
+    return {
+      ...(tenant !== undefined ? { tenant } : {}),
+      id: taskId,
+      ...(metadata !== undefined ? { metadata } : {}),
     };
   }
 
@@ -364,11 +517,39 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
     switch (method) {
       case 'SendMessage':
         return rpcResult(id, await sendMessage(params, request, tenant));
+      case 'SendStreamingMessage': {
+        requireStreaming();
+        const sendRequest = parseSendMessageRequest(params, tenant);
+        const info = turnInfo(request, tenant);
+        return streamResponse(
+          async (sink) => {
+            await runtime.start(sendRequest, info, sink);
+          },
+          rpcFraming(id, sendRequest.configuration?.historyLength),
+          asProtocolError,
+        );
+      }
       case 'GetTask': {
         const taskId = requiredString(params.id, 'id');
         const historyLength = optionalHistoryLength(params.historyLength);
-        const scope = tenant !== undefined ? { tenant } : {};
-        return rpcResult(id, await runtime.getTask(taskId, scope, historyLength));
+        return rpcResult(id, await runtime.getTask(taskId, scopeOf(tenant), historyLength));
+      }
+      case 'CancelTask': {
+        const taskId = requiredString(params.id, 'id');
+        const metadata = optionalRecord(params.metadata, 'metadata');
+        return rpcResult(
+          id,
+          await runtime.cancel(cancelRequest(taskId, tenant, metadata), scopeOf(tenant), request),
+        );
+      }
+      case 'SubscribeToTask': {
+        requireStreaming();
+        const taskId = requiredString(params.id, 'id');
+        return streamResponse(
+          (sink) => runtime.subscribe(taskId, scopeOf(tenant), sink),
+          rpcFraming(id, undefined),
+          asProtocolError,
+        );
       }
       case 'ListTasks':
         throw protocolError('UNSUPPORTED_OPERATION', 'ListTasks is not supported by this agent.');

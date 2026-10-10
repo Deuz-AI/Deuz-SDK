@@ -22,6 +22,7 @@ import {
   type A2ATask,
 } from '../src/a2a';
 import { InvalidRequestError } from '../src/errors';
+import { parseSSE } from '../src/internal/sse';
 
 const NOW = '2026-10-10T10:00:00.000Z';
 const RPC_URL = 'https://agent.test/a2a/jsonrpc';
@@ -618,5 +619,413 @@ describe('createA2AHandler — GetTask and scopes', () => {
       { 'A2A-Version': '1.0', 'A2A-Extensions': 'urn:ext:must' },
     );
     expect(served.body.result).toMatchObject({ message: { parts: [{ text: 'ok' }] } });
+  });
+});
+
+/** POST a streaming JSON-RPC request; the raw response. */
+async function rpcStream(
+  handler: (request: Request) => Promise<Response>,
+  method: string,
+  params: unknown,
+) {
+  const id = ++rpcId;
+  const response = await handler(
+    new Request(RPC_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+        'A2A-Version': '1.0',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+    }),
+  );
+  return { id, response };
+}
+
+/** Reads an SSE response one event at a time; `data` is parsed JSON. */
+function sseReader(response: Response) {
+  expect(response.headers.get('content-type')).toBe('text/event-stream');
+  const iterator = parseSSE(response.body as ReadableStream<Uint8Array>)[Symbol.asyncIterator]();
+  async function next(): Promise<{ event?: string; data: Record<string, unknown> } | undefined> {
+    const { done, value } = await iterator.next();
+    if (done) return undefined;
+    return {
+      ...(value.event ? { event: value.event } : {}),
+      data: JSON.parse(value.data) as Record<string, unknown>,
+    };
+  }
+  return {
+    next,
+    async rest() {
+      const events: { event?: string; data: Record<string, unknown> }[] = [];
+      for (let event = await next(); event; event = await next()) events.push(event);
+      return events;
+    },
+    close: () => iterator.return?.(undefined),
+  };
+}
+
+/** The `result` of each JSON-RPC envelope of a stream, checked against the request id. */
+async function results(id: number, response: Response): Promise<Record<string, unknown>[]> {
+  const events = await sseReader(response).rest();
+  for (const { data } of events) expect(data).toMatchObject({ jsonrpc: '2.0', id });
+  return events.map(({ data }) => data.result as Record<string, unknown>);
+}
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe('createA2AHandler — SendStreamingMessage', () => {
+  it('streams the task lifecycle as JSON-RPC responses over SSE', async () => {
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.working('on it');
+      await ctx.artifact({ artifactId: 'answer', parts: [{ text: 'hello' }] }, { lastChunk: true });
+      await ctx.complete();
+    });
+    const { id, response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: userMessage('hello'),
+    });
+    const events = await results(id, response);
+    const task = (events[0] as { task: A2ATask }).task;
+    expect(events).toEqual([
+      {
+        task: {
+          id: task.id,
+          contextId: task.contextId,
+          status: { state: 'TASK_STATE_SUBMITTED', timestamp: NOW },
+          artifacts: [],
+          history: [{ ...userMessage('hello'), taskId: task.id, contextId: task.contextId }],
+        },
+      },
+      {
+        statusUpdate: {
+          taskId: task.id,
+          contextId: task.contextId,
+          status: {
+            state: 'TASK_STATE_WORKING',
+            message: {
+              messageId: expect.any(String),
+              role: 'ROLE_AGENT',
+              parts: [{ text: 'on it' }],
+              taskId: task.id,
+              contextId: task.contextId,
+            },
+            timestamp: NOW,
+          },
+        },
+      },
+      {
+        artifactUpdate: {
+          taskId: task.id,
+          contextId: task.contextId,
+          artifact: { artifactId: 'answer', parts: [{ text: 'hello' }] },
+          lastChunk: true,
+        },
+      },
+      {
+        statusUpdate: {
+          taskId: task.id,
+          contextId: task.contextId,
+          status: { state: 'TASK_STATE_COMPLETED', timestamp: NOW },
+        },
+      },
+    ]);
+  });
+
+  it('streams a direct reply as one message event', async () => {
+    const { handler } = handlerWith((ctx) => ctx.reply('pong'));
+    const { id, response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: userMessage('ping'),
+    });
+    const events = await results(id, response);
+    expect(events).toEqual([{ message: expect.objectContaining({ parts: [{ text: 'pong' }] }) }]);
+  });
+
+  it('applies historyLength to the streamed task snapshot', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete());
+    const { id, response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: userMessage('hello'),
+      configuration: { historyLength: 0 },
+    });
+    const [first] = await results(id, response);
+    expect((first as { task: A2ATask }).task.history).toEqual([]);
+  });
+
+  it('answers a refused stream request with a plain JSON-RPC error', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete());
+    const { id, response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: userMessage('hello', { taskId: 'missing' }),
+    });
+    expect(response.headers.get('content-type')).toBe('application/json');
+    expect(await response.json()).toMatchObject({ id, error: { code: -32001 } });
+  });
+
+  it('answers an A2AError the executor throws before any event as plain JSON-RPC', async () => {
+    const { handler } = handlerWith(() => {
+      throw new A2AError({ reason: 'CONTENT_TYPE_NOT_SUPPORTED', message: 'Text only.' });
+    });
+    const { response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: userMessage('hello'),
+    });
+    expect(await response.json()).toMatchObject({ error: { code: -32005, message: 'Text only.' } });
+  });
+
+  it('refuses streams when the card does not declare streaming', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete(), {
+      card: { ...CARD, capabilities: {} },
+    });
+    const sent = await rpcStream(handler, 'SendStreamingMessage', { message: userMessage('a') });
+    expect(await sent.response.json()).toMatchObject({ error: { code: -32004 } });
+    const subscribed = await rpcStream(handler, 'SubscribeToTask', { id: 'x' });
+    expect(await subscribed.response.json()).toMatchObject({ error: { code: -32004 } });
+  });
+
+  it('streams a failure after the first event as a FAILED status update', async () => {
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.working();
+      throw new Error('the model is down');
+    });
+    const { id, response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: userMessage('hello'),
+    });
+    const events = await results(id, response);
+    expect(events.at(-1)).toMatchObject({
+      statusUpdate: {
+        status: { state: 'TASK_STATE_FAILED', message: { parts: [{ text: 'the model is down' }] } },
+      },
+    });
+  });
+
+  it('ends a stream whose turn is refused after the snapshot with an SSE error event', async () => {
+    const { handler } = handlerWith((ctx) => {
+      if (!ctx.task) return ctx.requireInput('Which city?');
+      throw new A2AError({ reason: 'CONTENT_TYPE_NOT_SUPPORTED', message: 'Text only.' });
+    });
+    const task = ((await send(handler, 'weather?')).result as { task: A2ATask }).task;
+    const { id, response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: { ...userMessage('a picture'), taskId: task.id },
+    });
+    const events = await sseReader(response).rest();
+    expect(events.map(({ event }) => event)).toEqual([undefined, 'error']);
+    expect(events[0]?.data).toMatchObject({ id, result: { task: { id: task.id } } });
+    expect(events[1]?.data).toMatchObject({
+      jsonrpc: '2.0',
+      id,
+      error: { code: -32005, message: 'Text only.' },
+    });
+    const stored = (await rpc(handler, 'GetTask', { id: task.id })).body.result as A2ATask;
+    expect(stored.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+  });
+
+  it('keeps the task running when the client leaves the stream', async () => {
+    const release = gate();
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.working();
+      await release.promise;
+      await ctx.complete();
+    });
+    const { response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: userMessage('hello'),
+    });
+    const reader = sseReader(response);
+    const first = (await reader.next())?.data.result as { task: A2ATask };
+    await reader.close();
+    release.open();
+    await tick();
+    const stored = (await rpc(handler, 'GetTask', { id: first.task.id })).body.result as A2ATask;
+    expect(stored.status.state).toBe('TASK_STATE_COMPLETED');
+  });
+});
+
+describe('createA2AHandler — SubscribeToTask', () => {
+  it('streams a running task from a snapshot to the end of its turn', async () => {
+    const release = gate();
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.working();
+      await release.promise;
+      await ctx.artifact({ artifactId: 'a', parts: [{ text: 'late' }] });
+      await ctx.complete();
+    });
+    const task = (
+      (await send(handler, 'hello', {}, { returnImmediately: true })).result as { task: A2ATask }
+    ).task;
+    const { id, response } = await rpcStream(handler, 'SubscribeToTask', { id: task.id });
+    const reader = sseReader(response);
+    const snapshot = await reader.next();
+    expect(snapshot?.data).toMatchObject({
+      id,
+      result: { task: { id: task.id, status: { state: 'TASK_STATE_WORKING' } } },
+    });
+    release.open();
+    const rest = (await reader.rest()).map(({ data }) => data.result);
+    expect(rest).toEqual([
+      {
+        artifactUpdate: expect.objectContaining({
+          artifact: { artifactId: 'a', parts: [{ text: 'late' }] },
+        }),
+      },
+      {
+        statusUpdate: expect.objectContaining({
+          status: { state: 'TASK_STATE_COMPLETED', timestamp: NOW },
+        }),
+      },
+    ]);
+  });
+
+  it('yields the snapshot of a task waiting for input and ends', async () => {
+    const { handler } = handlerWith((ctx) => ctx.requireInput('Which city?'));
+    const task = ((await send(handler, 'weather?')).result as { task: A2ATask }).task;
+    const { id, response } = await rpcStream(handler, 'SubscribeToTask', { id: task.id });
+    expect(await results(id, response)).toEqual([{ task }]);
+  });
+
+  it('refuses an unknown task and a finished one', async () => {
+    const { handler } = handlerWith((ctx) => ctx.complete());
+    const missing = await rpcStream(handler, 'SubscribeToTask', { id: 'missing' });
+    expect(await missing.response.json()).toMatchObject({ error: { code: -32001 } });
+    const task = ((await send(handler, 'hello')).result as { task: A2ATask }).task;
+    const finished = await rpcStream(handler, 'SubscribeToTask', { id: task.id });
+    expect(await finished.response.json()).toMatchObject({
+      error: { code: -32004, data: errorInfo('UNSUPPORTED_OPERATION') },
+    });
+  });
+});
+
+describe('createA2AHandler — CancelTask', () => {
+  it('aborts the running turn, ends its streams and returns the canceled task', async () => {
+    let signal: AbortSignal | undefined;
+    let lateUpdate: unknown;
+    const stopped = gate();
+    const { handler, errors } = handlerWith(async (ctx) => {
+      signal = ctx.signal;
+      await ctx.working();
+      await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve));
+      try {
+        await ctx.working('still here?');
+      } catch (error) {
+        lateUpdate = error;
+      }
+      stopped.open();
+    });
+    const { id, response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: userMessage('hello'),
+    });
+    const reader = sseReader(response);
+    const task = ((await reader.next())?.data.result as { task: A2ATask }).task;
+    expect((await reader.next())?.data.result).toMatchObject({
+      statusUpdate: { status: { state: 'TASK_STATE_WORKING' } },
+    });
+
+    const canceled = (await rpc(handler, 'CancelTask', { id: task.id })).body.result as A2ATask;
+    expect(canceled.status).toEqual({ state: 'TASK_STATE_CANCELED', timestamp: NOW });
+    expect((await reader.rest()).map(({ data }) => data)).toEqual([
+      {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          statusUpdate: {
+            taskId: task.id,
+            contextId: task.contextId,
+            status: { state: 'TASK_STATE_CANCELED', timestamp: NOW },
+          },
+        },
+      },
+    ]);
+    await stopped.promise;
+    expect(signal?.aborted).toBe(true);
+    expect(lateUpdate).toBeInstanceOf(A2AError);
+    expect(errors).toEqual([]);
+  });
+
+  it('returns a canceled task again and refuses a finished or unknown one', async () => {
+    const { handler } = handlerWith((ctx) => (ctx.task ? ctx.complete() : ctx.requireInput('?')));
+    const waiting = ((await send(handler, 'a')).result as { task: A2ATask }).task;
+    const first = (await rpc(handler, 'CancelTask', { id: waiting.id })).body.result;
+    expect((await rpc(handler, 'CancelTask', { id: waiting.id })).body.result).toEqual(first);
+
+    const { handler: done } = handlerWith((ctx) => ctx.complete());
+    const finished = ((await send(done, 'b')).result as { task: A2ATask }).task;
+    expect((await rpc(done, 'CancelTask', { id: finished.id })).body.error).toMatchObject({
+      code: -32002,
+      data: errorInfo('TASK_NOT_CANCELABLE'),
+    });
+    expect((await rpc(done, 'CancelTask', { id: 'missing' })).body.error).toMatchObject({
+      code: -32001,
+    });
+  });
+
+  it('cancels a task waiting for input after telling executor.cancel, which no message can resume', async () => {
+    const told: { running: boolean; state: string; metadata: unknown }[] = [];
+    const { handler } = handlerWith(() => {}, {
+      executor: {
+        execute: (ctx) => (ctx.task ? ctx.complete() : ctx.requireInput('Which city?')),
+        cancel: (cancel) => {
+          told.push({
+            running: cancel.running,
+            state: cancel.task.status.state,
+            metadata: cancel.request.metadata,
+          });
+        },
+      },
+    });
+    const task = ((await send(handler, 'weather?')).result as { task: A2ATask }).task;
+    const canceled = await rpc(handler, 'CancelTask', { id: task.id, metadata: { why: 'user' } });
+    expect((canceled.body.result as A2ATask).status.state).toBe('TASK_STATE_CANCELED');
+    expect(told).toEqual([
+      { running: false, state: 'TASK_STATE_INPUT_REQUIRED', metadata: { why: 'user' } },
+    ]);
+    expect((await send(handler, 'Izmir', { taskId: task.id })).error).toMatchObject({
+      code: -32004,
+    });
+  });
+
+  it('lets executor.cancel refuse with TASK_NOT_CANCELABLE', async () => {
+    const { handler } = handlerWith(() => {}, {
+      executor: {
+        execute: (ctx) => ctx.requireInput('?'),
+        cancel: () => {
+          throw new A2AError({ reason: 'TASK_NOT_CANCELABLE', message: 'Payment already sent.' });
+        },
+      },
+    });
+    const task = ((await send(handler, 'pay')).result as { task: A2ATask }).task;
+    expect((await rpc(handler, 'CancelTask', { id: task.id })).body.error).toMatchObject({
+      code: -32002,
+      message: 'Payment already sent.',
+    });
+    const stored = (await rpc(handler, 'GetTask', { id: task.id })).body.result as A2ATask;
+    expect(stored.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+  });
+});
+
+describe('createA2AHandler — AUTH_REQUIRED', () => {
+  it('answers a blocking call at AUTH_REQUIRED and keeps the turn open', async () => {
+    const authorized = gate();
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.requireAuth('Sign in at https://auth.test');
+      await authorized.promise;
+      await ctx.complete('Signed in and done.');
+    });
+    const task = ((await send(handler, 'hello')).result as { task: A2ATask }).task;
+    expect(task.status.state).toBe('TASK_STATE_AUTH_REQUIRED');
+
+    expect((await send(handler, 'again', { taskId: task.id })).error).toMatchObject({
+      code: -32004,
+    });
+
+    const { id, response } = await rpcStream(handler, 'SubscribeToTask', { id: task.id });
+    const reader = sseReader(response);
+    expect((await reader.next())?.data).toMatchObject({
+      id,
+      result: { task: { status: { state: 'TASK_STATE_AUTH_REQUIRED' } } },
+    });
+    authorized.open();
+    expect((await reader.rest()).map(({ data }) => data.result)).toEqual([
+      {
+        statusUpdate: expect.objectContaining({
+          status: expect.objectContaining({ state: 'TASK_STATE_COMPLETED' }),
+        }),
+      },
+    ]);
   });
 });

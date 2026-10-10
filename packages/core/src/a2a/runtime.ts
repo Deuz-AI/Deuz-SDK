@@ -8,7 +8,7 @@
  * process. The task is reloaded before every change, so a task finished by
  * another instance sharing the store is noticed at the next update.
  */
-import { InvalidRequestError } from '../errors';
+import { AbortError, InvalidRequestError } from '../errors';
 import type { ResolvedDependencies } from '../types/deps';
 import { A2AError } from './errors';
 import { isTerminalState, toMessage, type A2AErrorReason } from './protocol';
@@ -16,6 +16,7 @@ import type {
   A2AArtifact,
   A2AArtifactInput,
   A2AArtifactOptions,
+  A2ACancelTaskRequest,
   A2AExecutionContext,
   A2AExecutor,
   A2AMessage,
@@ -71,6 +72,17 @@ function deferred<T>(): Deferred<T> {
   };
 }
 
+/** Where a stream's events go: the response of a streaming request. */
+export interface TurnSink {
+  event(event: A2AStreamResponse): void;
+  /** No more events. */
+  end(): void;
+  /** The turn failed after events may have been sent; no more events. */
+  error(error: A2AError): void;
+  /** The client went away: skip it from now on. */
+  readonly closed: boolean;
+}
+
 /** What a request needs to know about the turn it started. */
 export interface Turn {
   readonly key: string;
@@ -86,6 +98,8 @@ export interface Turn {
   readonly first: Deferred<A2ASendMessageResponse>;
   /** Resolves when the turn ends or the task is interrupted. */
   readonly outcome: Deferred<A2ASendMessageResponse>;
+  /** The streams following this turn. */
+  readonly sinks: Set<TurnSink>;
   task: A2ATask | undefined;
   replied: A2AMessage | undefined;
   /** This turn changed the task. */
@@ -153,12 +167,15 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
     scope: A2ATaskScope;
     message: A2AMessage;
     started: A2ATask | undefined;
+    sink: TurnSink | undefined;
   }): Turn {
+    const { sink, ...rest } = fields;
     return {
-      ...fields,
+      ...rest,
       controller: new AbortController(),
       first: deferred(),
       outcome: deferred(),
+      sinks: new Set(sink ? [sink] : []),
       task: fields.started,
       replied: undefined,
       changed: false,
@@ -172,27 +189,38 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
       : { task: structuredClone(turn.task as A2ATask) };
   }
 
-  function publish(turn: Turn, _event: A2AStreamResponse): void {
+  function publish(turn: Turn, event: A2AStreamResponse): void {
     turn.first.resolve(result(turn));
+    for (const sink of turn.sinks) {
+      if (sink.closed) turn.sinks.delete(sink);
+      else sink.event(structuredClone(event));
+    }
+  }
+
+  function detach(turn: Turn): void {
+    turn.ended = true;
+    if (live.get(turn.key) === turn) live.delete(turn.key);
   }
 
   /** The turn is over: whatever waits for it gets the task or the reply. */
   function end(turn: Turn): void {
     if (turn.ended) return;
-    turn.ended = true;
-    if (live.get(turn.key) === turn) live.delete(turn.key);
+    detach(turn);
     const value = result(turn);
     turn.first.resolve(value);
     turn.outcome.resolve(value);
+    for (const sink of turn.sinks) sink.end();
+    turn.sinks.clear();
   }
 
   /** The turn is over and the request is answered with `error`. */
   function fail(turn: Turn, error: A2AError): void {
     if (turn.ended) return;
-    turn.ended = true;
-    if (live.get(turn.key) === turn) live.delete(turn.key);
+    detach(turn);
     turn.first.reject(error);
     turn.outcome.reject(error);
+    for (const sink of turn.sinks) sink.error(error);
+    turn.sinks.clear();
   }
 
   function turnOver(turn: Turn): A2AError {
@@ -438,8 +466,15 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
       });
   }
 
-  /** Starts the turn a SendMessage asks for. Refused messages throw an `A2AError`. */
-  async function start(request: A2ASendMessageRequest, info: TurnInfo): Promise<Turn> {
+  /**
+   * Starts the turn a SendMessage asks for; `sink` (a streaming request) gets
+   * every event of the turn. Refused messages throw an `A2AError`.
+   */
+  async function start(
+    request: A2ASendMessageRequest,
+    info: TurnInfo,
+    sink?: TurnSink,
+  ): Promise<Turn> {
     const incoming = request.message;
     const scope = info.scope;
     let turn: Turn;
@@ -481,6 +516,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
           scope,
           message,
           started: structuredClone(next),
+          sink,
         });
         live.set(key, continued);
         publish(continued, { task: structuredClone(next) });
@@ -496,6 +532,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
         scope,
         message: { ...incoming, taskId, contextId },
         started: undefined,
+        sink,
       });
       live.set(turn.key, turn);
     }
@@ -513,5 +550,79 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
     return withHistory(task, historyLength);
   }
 
-  return { start, getTask };
+  /**
+   * `SubscribeToTask`: the task's snapshot, then the events of its running
+   * turn until that turn ends (no running turn: the snapshot alone).
+   */
+  async function subscribe(taskId: string, scope: A2ATaskScope, sink: TurnSink): Promise<void> {
+    const key = keyOf(taskId, scope);
+    await withLock(key, async () => {
+      const task = await store.load(taskId, scope);
+      if (!task) throw protocolError('TASK_NOT_FOUND', `Task not found: ${taskId}`);
+      if (isTerminalState(task.status.state)) {
+        throw protocolError(
+          'UNSUPPORTED_OPERATION',
+          `Task ${taskId} is ${task.status.state}; there is nothing left to subscribe to.`,
+        );
+      }
+      sink.event({ task });
+      const turn = live.get(key);
+      if (turn) turn.sinks.add(sink);
+      else sink.end();
+    });
+  }
+
+  /**
+   * `CancelTask`: asks `executor.cancel`, cancels the task, then ends and
+   * aborts its running turn. A task that is already canceled is returned as is.
+   */
+  async function cancel(
+    request: A2ACancelTaskRequest,
+    scope: A2ATaskScope,
+    httpRequest: Request,
+  ): Promise<A2ATask> {
+    const taskId = request.id;
+    const key = keyOf(taskId, scope);
+    return withLock(key, async () => {
+      const task = await store.load(taskId, scope);
+      if (!task) throw protocolError('TASK_NOT_FOUND', `Task not found: ${taskId}`);
+      const state = task.status.state;
+      if (state === 'TASK_STATE_CANCELED') return task;
+      if (isTerminalState(state)) {
+        throw protocolError(
+          'TASK_NOT_CANCELABLE',
+          `Task ${taskId} is ${state} and cannot be canceled.`,
+        );
+      }
+      const turn = live.get(key);
+      await executor.cancel?.({
+        task: structuredClone(task),
+        tenant: scope.tenant,
+        request: structuredClone(request),
+        running: turn !== undefined,
+        httpRequest,
+      });
+      const canceled: A2ATask = {
+        ...task,
+        status: { state: 'TASK_STATE_CANCELED', timestamp: now() },
+      };
+      await store.save(canceled, scope);
+      if (turn) {
+        turn.task = canceled;
+        turn.changed = true;
+        publish(turn, {
+          statusUpdate: {
+            taskId,
+            contextId: canceled.contextId,
+            status: structuredClone(canceled.status),
+          },
+        });
+        end(turn);
+        turn.controller.abort(new AbortError('The task was canceled.'));
+      }
+      return canceled;
+    });
+  }
+
+  return { start, getTask, subscribe, cancel };
 }
