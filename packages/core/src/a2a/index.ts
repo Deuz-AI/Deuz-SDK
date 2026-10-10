@@ -21,7 +21,6 @@ export { A2AError } from './errors';
 export type { A2AErrorKind, A2AErrorOptions } from './errors';
 export type { A2AErrorReason } from './protocol';
 export type {
-  // wire model
   A2ARole,
   A2ATaskState,
   A2ATextPart,
@@ -43,7 +42,6 @@ export type {
   A2AGetTaskRequest,
   A2ACancelTaskRequest,
   A2ASubscribeToTaskRequest,
-  // agent card
   A2AProtocolBinding,
   A2AAgentInterface,
   A2AAgentProvider,
@@ -55,7 +53,6 @@ export type {
   A2AAgentSkill,
   A2AAgentCardSignature,
   A2AAgentCard,
-  // client
   A2AMessageDraft,
   A2AMessageInput,
   A2ABinding,
@@ -67,7 +64,6 @@ export type {
   A2ACancelTaskOptions,
   A2AFetchAgentCardOptions,
   A2AClient,
-  // handler
   A2ATaskScope,
   A2ATaskStore,
   A2AStatusOptions,
