@@ -293,6 +293,8 @@ A verdict counts only if it answers an approval in `pendingApprovals`, the gate 
 
 Until the last verdict arrives you can change your mind: answering an approval again replaces its verdict. Once every pending approval has one, the hook sends `approvalResponses` **once** and closes the gate. A repeated `tool-approval-request` frame is one entry in `pendingApprovals`, not two. Denials, reasons and tokens are sent exactly as before.
 
+Without a token, the `approvalId` is all a verdict has, and today it equals the call's tool call id. An OpenAI-compatible server that omits call ids gets `tool_0`, `tool_1`, … from the adapter, so a later gate can reuse an earlier gate's id. A verdict from a card that still holds the earlier request then answers the new gate. To tie each verdict to the request it was shown for, sign approvals with [`createApprovalSigner`](/docs/agents/durable-runtime#hmac-signed-approvals) and echo the token: `addToolApprovalResponse({ approvalId: req.approvalId, approved, token: req.token })`. A stale card then carries a stale token, and its verdict is a no-op.
+
 A refused call carries `denied` on the `UIToolCall`, so it stops rendering as "getWeather failed":
 
 ```tsx
