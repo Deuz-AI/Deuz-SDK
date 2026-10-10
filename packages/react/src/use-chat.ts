@@ -34,7 +34,9 @@
  * - F07 — a turn read back through `reconnect()` settles exactly like one read
  *   from the POST (`settleTurn`). Its unresolved client calls used to reach
  *   neither `onToolCall` nor `pendingToolCalls`; and a call the replay
- *   re-delivers after this client answered it is not dispatched again.
+ *   re-delivers after this client answered it is not dispatched again. A
+ *   result settles only the call or gate that came before it, so a provider
+ *   that recycles call ids (`tool_0` in every response) keeps a later one open.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
@@ -126,23 +128,55 @@ function sameRequest(a: ToolApprovalRequest, b: ToolApprovalRequest): boolean {
 }
 
 /**
+ * What a resume read saw in ARRIVAL order (2.3), which the reducer's state
+ * cannot tell: it merges the calls that share an id into one entry, and a
+ * provider without call ids gets `tool_0`, `tool_1`, … from core's adapter
+ * afresh in every model response, so one id can name several calls of one
+ * exchange. Kept with the cursor turn (`cursorLedgerRef`), so a turn continued
+ * from the cursor carries it across reads.
+ */
+interface ReplayLedger {
+  /** Indexes into the turn's `approvals` whose call got a result AFTER the request. */
+  readonly answeredApprovals: Set<number>;
+}
+
+const newLedger = (): ReplayLedger => ({ answeredApprovals: new Set() });
+
+/** Note one wire part of a resume read, BEFORE it folds into `turn`. */
+function recordPart(ledger: ReplayLedger, turn: AssistantTurnState, part: DeuzUIPart): void {
+  if (part.type !== 'tool-result') return;
+  // A result settles the requests that came before it, never a later one
+  // that reuses its call id.
+  turn.approvals.forEach((request, index) => {
+    if (request.toolCallId === part.toolCallId) ledger.answeredApprovals.add(index);
+  });
+}
+
+const NO_INDEXES: ReadonlySet<number> = new Set();
+
+/**
  * The approvals a settled turn actually PAUSES on (2.3). `turn.approvals` is
  * the reducer's raw arrival log, so it keeps a request the wire repeated —
- * one question, asked once. On a REPLAY it can also hold a request whose call
- * already has its result: a journal that spans an approval leg and the
- * continuation that settled it folds both into one turn, and an executed call
- * cannot be approved again. A fresh POST leg is never filtered that way: the
- * loop breaks right after emitting its approvals, so a result for the same id
- * in that leg belongs to a different call.
+ * one question, asked once: the latest delivery stands for it. On a REPLAY it
+ * can also hold a request whose call already has its result (`answered`): a
+ * journal that spans an approval leg and the continuation that settled it
+ * folds both into one turn, and an executed call cannot be approved again.
+ * Only a result that arrived after the request settles it: an earlier one
+ * belongs to an earlier call that used the same id. A fresh POST leg settles
+ * none (`answered` is empty): the loop breaks right after emitting its
+ * approvals.
  */
-function openApprovals(turn: AssistantTurnState, replayed: boolean): ToolApprovalRequest[] {
-  const settled = new Set(replayed ? turn.serverResults : []);
+function openApprovals(
+  turn: AssistantTurnState,
+  answered: ReadonlySet<number>,
+): ToolApprovalRequest[] {
   const open: ToolApprovalRequest[] = [];
-  for (const request of turn.approvals) {
-    if (settled.has(request.toolCallId)) continue;
-    if (open.some((seen) => sameRequest(seen, request))) continue;
-    open.push(request);
-  }
+  turn.approvals.forEach((request, index) => {
+    if (answered.has(index)) return;
+    const seen = open.findIndex((entry) => sameRequest(entry, request));
+    if (seen === -1) open.push(request);
+    else open[seen] = request;
+  });
   return open;
 }
 
@@ -615,6 +649,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
    * replay into it would apply its already-received parts twice.
    */
   const cursorTurnRef = useRef<AssistantTurnState | undefined>(undefined);
+  /** What the reads of `cursorTurnRef`'s turn saw in arrival order (see `ReplayLedger`). */
+  const cursorLedgerRef = useRef<ReplayLedger>(newLedger());
   /**
    * Id of the turn's message AS IT SITS in `ui`. The wire's `start` part
    * RENAMES the message (`applyUIPart`), so the id is not stable across a turn
@@ -777,21 +813,22 @@ export function useChat(options: UseChatOptions): UseChatResult {
    * arrived through `reconnect()` reached neither `onToolCall` nor
    * `pendingToolCalls`, and the transcript kept a `tool_use` nobody answered.
    *
-   * `replayed` marks a turn read back from `resume.endpoint`. A replay
-   * re-delivers whatever the journal holds after the cursor — with a lost
-   * cursor, or a journal holding the leg before the one in flight, that
-   * includes calls this client already answered. So for a replayed turn a call
-   * is dispatched only when the canonical history does not already answer it
-   * and it is not parked or running right now: within a mounted hook, at most
-   * once per invocation. A fresh POST leg skips those checks — it cannot
-   * repeat a call, and providers that number their calls (`tool_0`, …)
-   * legitimately recycle an answered id in the next round.
+   * `replay` marks a turn read back from `resume.endpoint`, with what its
+   * reads saw in arrival order. A replay re-delivers whatever the journal
+   * holds after the cursor — with a lost cursor, or a journal holding the leg
+   * before the one in flight, that includes calls this client already
+   * answered. So for a replayed turn a call is dispatched only when the
+   * canonical history does not already answer it and it is not parked or
+   * running right now: within a mounted hook, at most once per invocation. A
+   * fresh POST leg skips those checks — it cannot repeat a call, and providers
+   * that number their calls (`tool_0`, …) legitimately recycle an answered id
+   * in the next round.
    *
    * Resolves `true` when client results were appended and the next round must
    * be POSTed, `false` when the chat is done or paused.
    */
   const settleTurn = useCallback(
-    async (settled: AssistantTurnState, replayed: boolean): Promise<boolean> => {
+    async (settled: AssistantTurnState, replay?: { ledger: ReplayLedger }): Promise<boolean> => {
       let turn = settled;
       // Completion evidence for a replay, read BEFORE this turn joins it.
       const history = snapshotRef.current.history.canonical;
@@ -800,7 +837,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       turnRef.current = undefined;
 
       // Approval pause: verdicts arrive via addToolApprovalResponse.
-      const gate = openApprovals(turn, replayed);
+      const gate = openApprovals(turn, replay?.ledger.answeredApprovals ?? NO_INDEXES);
       if (gate.length > 0) {
         approvalsRef.current = gate;
         verdictsRef.current = [];
@@ -808,13 +845,16 @@ export function useChat(options: UseChatOptions): UseChatResult {
         return false;
       }
 
-      // Client tools: everything the server didn't execute — on a replay,
-      // minus what this client already answered or is answering right now.
-      const serverResults = new Set(turn.serverResults);
-      const answered = replayed ? answeredInvocations(history) : undefined;
+      // Client tools: every call no result followed — on a replay, minus what
+      // this client already answered or is answering right now.
+      const answered = replay ? answeredInvocations(history) : undefined;
       const parked = new Set(clientToolsRef.current.map(keyOfCall));
       const clientPending = (turn.message.toolCalls ?? []).filter((call) => {
-        if (serverResults.has(call.toolCallId)) return false;
+        // The reducer merges the calls that share an id and keeps the latest
+        // one's state, so a result for an earlier call under a recycled id
+        // (`tool_0` again) leaves this one a 'call'. Testing the id against
+        // `turn.serverResults` took the later call for the executed one.
+        if (call.state !== 'call') return false;
         if (!answered) return true;
         const key = keyOfCall(call);
         return !answered.has(key) && !parked.has(key) && !executingRef.current.has(key);
@@ -924,7 +964,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
           if (turn.error !== undefined) throw new Error(turn.error);
 
           // The settlement `reconnect()` shares (F07): done or paused → stop.
-          if (!(await settleTurn(turn, false))) return;
+          if (!(await settleTurn(turn))) return;
           // loop → next round POSTs the extended history
         }
       } catch (err) {
@@ -1161,6 +1201,9 @@ export function useChat(options: UseChatOptions): UseChatResult {
         let turn = continuing && inFlight ? inFlight : createAssistantTurn(genId());
         turnRef.current = turn;
         cursorTurnRef.current = turn;
+        // A continued turn keeps what its earlier reads saw.
+        const ledger = continuing ? cursorLedgerRef.current : newLedger();
+        cursorLedgerRef.current = ledger;
         const parts = connectDeuzStream(resume.endpoint, {
           ...(cursor !== undefined ? { lastEventId: cursor } : {}),
           onCursor: (id) => {
@@ -1173,6 +1216,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
         });
         for await (const part of parts) {
           folded++;
+          recordPart(ledger, turn, part);
           turn = fold(turn, part);
           turnRef.current = turn;
           cursorTurnRef.current = turn;
@@ -1213,7 +1257,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
         // unresolved client calls reach `onToolCall` or `pendingToolCalls`.
         // Results from `onToolCall` continue the chat with a POST, as the POST
         // path's loop does — unless the user stopped it while they ran.
-        if ((await settleTurn(turn, true)) && !controller.signal.aborted) await run();
+        if ((await settleTurn(turn, { ledger })) && !controller.signal.aborted) await run();
       } catch (err) {
         if (controller.signal.aborted) return; // user abort — not an error
         if (silent) return; // best-effort auto attempt — invisible by contract

@@ -590,3 +590,181 @@ describe('useChat — reconnect settles client tools like the POST path (F07)', 
     expect(route.bodies).toHaveLength(3);
   });
 });
+
+/**
+ * A provider without call ids gets `tool_0`, `tool_1`, … from core's adapter
+ * afresh in every model response, so one id can name several calls of one
+ * exchange. A result settles the call that came BEFORE it, never a later one
+ * that reuses its id, and a call this client answered under a recycled id does
+ * not stand in for a newer, identical call the server still waits on.
+ */
+describe('useChat — recycled call ids in a replayed turn (2.3)', () => {
+  const CLEANUP: Message = { role: 'user', content: 'clean up /tmp' };
+  // Round 1 runs the server tool `search` as tool_0; round 2's gated `del` is tool_0 again.
+  const GATED_LEG = [
+    parts.start('srv-1'),
+    parts.toolCall('tool_0', 'search', { q: 'tmp' }),
+    parts.toolResult('tool_0', 'search', '1 file'),
+    parts.toolCall('tool_0', 'del', { p: '/tmp/a' }),
+    parts.approval('tool_0', 'tool_0', 'del', { p: '/tmp/a' }),
+    parts.finish(),
+  ];
+
+  it('keeps the gate of a call whose id an earlier, executed call used — on the POST and in a replay', async () => {
+    const post = recordingFetch((round) =>
+      round === 1
+        ? postResponse(GATED_LEG)
+        : postResponse([parts.text('Deleted.'), parts.finish()]),
+    );
+    const { result: posted } = renderHook(() => useChat({ api: '/api/chat', fetch: post.fetch }));
+    await act(async () => {
+      await posted.current.sendMessage('clean up /tmp');
+    });
+    await waitFor(() => expect(posted.current.status).toBe('idle'));
+    expect(posted.current.pendingApprovals.map((a) => a.toolName)).toEqual(['del']);
+
+    // The same leg read back after a reload pauses on the same gate.
+    const wire = journal();
+    await wire.leg(GATED_LEG);
+    const route = answeringRoute('Deleted.');
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: route.fetch,
+        resume: { endpoint: wire.endpoint, auto: true },
+        initialMessages: [CLEANUP],
+      }),
+    );
+    await waitFor(() => expect(wire.cursors).toHaveLength(1));
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.messages.at(-1)?.toolCalls?.[0]).toMatchObject({
+      toolCallId: 'tool_0',
+      toolName: 'del',
+      state: 'approval-requested',
+    });
+    expect(result.current.pendingApprovals.map((a) => a.toolName)).toEqual(['del']);
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId: 'tool_0', approved: true });
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(route.bodies).toHaveLength(1);
+    expect(route.bodies[0]!.approvalResponses).toEqual([{ approvalId: 'tool_0', approved: true }]);
+  });
+
+  it('rebuilds that gate when reconnect() follows a dropped POST', async () => {
+    const wire = journal();
+    let posts = 0;
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock: typeof fetch = async (_url, init) => {
+      posts++;
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      // The server journals the whole leg; the client sees two frames, then the drop.
+      if (posts === 1) return wire.respondDropping(GATED_LEG, 2);
+      return postResponse([parts.text('Deleted.'), parts.finish()]);
+    };
+    const { result } = renderHook(() =>
+      useChat({ api: '/api/chat', fetch: fetchMock, resume: { endpoint: wire.endpoint } }),
+    );
+    await act(async () => {
+      await result.current.sendMessage('clean up /tmp');
+    });
+    await waitFor(() => expect(result.current.status).toBe('error'));
+
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.pendingApprovals.map((a) => a.toolName)).toEqual(['del']);
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId: 'tool_0', approved: true });
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(posts).toBe(2);
+    expect(bodies[1]!.approvalResponses).toEqual([{ approvalId: 'tool_0', approved: true }]);
+  });
+
+  it('opens only the newest gate of a replay whose continuation reuses the settled id', async () => {
+    const wire = journal();
+    await wire.leg([
+      parts.toolCall('tool_0', 'del', { p: '/a' }),
+      parts.approval('tool_0', 'tool_0', 'del', { p: '/a' }),
+      parts.finish(),
+    ]);
+    // Approved: the server ran it, and the model's next gated call is tool_0 again.
+    await wire.leg([
+      parts.toolResult('tool_0', 'del', 'deleted /a'),
+      parts.toolCall('tool_0', 'del', { p: '/b' }),
+      parts.approval('tool_0', 'tool_0', 'del', { p: '/b' }),
+      parts.finish(),
+    ]);
+    const route = answeringRoute('Done.');
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: route.fetch,
+        resume: { endpoint: wire.endpoint, auto: true },
+        initialMessages: [CLEANUP],
+      }),
+    );
+    await waitFor(() => expect(wire.cursors).toHaveLength(1));
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.pendingApprovals.map((a) => a.input)).toEqual([{ p: '/b' }]);
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId: 'tool_0', approved: true });
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(route.bodies).toHaveLength(1);
+  });
+
+  it('runs a client call whose id an earlier, executed call used — on the POST and in a replay', async () => {
+    // Round 1 runs the server tool `search` as tool_0; round 2 asks the client for `pick`, tool_0 again.
+    const leg = [
+      parts.toolCall('tool_0', 'search', { q: 'rag' }),
+      parts.toolResult('tool_0', 'search', '3 hits'),
+      parts.toolCall('tool_0', 'pick', { n: 3 }),
+      parts.finish(),
+    ];
+    const post = recordingFetch((round) =>
+      round === 1 ? postResponse(leg) : postResponse([parts.text('Picked.'), parts.finish()]),
+    );
+    const onPost = vi.fn(async (_call: ToolCallArg) => 'paper-2');
+    const { result: posted } = renderHook(() =>
+      useChat({ api: '/api/chat', fetch: post.fetch, onToolCall: onPost }),
+    );
+    await act(async () => {
+      await posted.current.sendMessage('find and pick');
+    });
+    await waitFor(() => expect(posted.current.status).toBe('idle'));
+    expect(onPost.mock.calls.map(([call]) => call.toolName)).toEqual(['pick']);
+    expect(post.bodies).toHaveLength(2);
+
+    const wire = journal();
+    await wire.leg(leg);
+    const route = answeringRoute('Picked.');
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: route.fetch,
+        resume: { endpoint: wire.endpoint },
+        initialMessages: [USER],
+      }),
+    );
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.pendingToolCalls).toHaveLength(1));
+    expect(result.current.pendingToolCalls[0]).toMatchObject({
+      toolCallId: 'tool_0',
+      toolName: 'pick',
+    });
+    await act(async () => {
+      await result.current.addToolResult({ toolCallId: 'tool_0', output: 'paper-2' });
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(route.bodies).toHaveLength(1);
+    expect(route.bodies[0]!.messages.at(-1)).toEqual({
+      role: 'tool',
+      content: [{ type: 'tool_result', toolUseId: 'tool_0', result: 'paper-2' }],
+    });
+  });
+});
