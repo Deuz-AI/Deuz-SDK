@@ -222,3 +222,22 @@ export function replyNumber(reply: unknown): number {
 
 /** A number as a script argument: `String` keeps every finite double exact. */
 export const arg = (value: number): string => String(value);
+
+/**
+ * The most entries one retention script removes. Retention runs in batches so
+ * a large backlog never holds the server in one long script.
+ */
+export const PRUNE_BATCH = 1_000;
+
+/** Run a batch script of `size` until a batch removes fewer; the total removed. */
+export async function inBatches(
+  size: number,
+  batch: (size: number) => Promise<number>,
+): Promise<number> {
+  let total = 0;
+  for (;;) {
+    const removed = await batch(size);
+    total += removed;
+    if (removed < size) return total;
+  }
+}
