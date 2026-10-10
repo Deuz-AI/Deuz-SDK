@@ -29,10 +29,12 @@ import { runStreamToolLoop, type StreamToolLoopSnapshot } from './inference/stre
 import { assembleAssistant, stopDetailsFrom, type EncryptedReasoning } from './inference/run-step';
 import {
   buildWireTools,
+  collectHandoffTools,
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
   filterWireTools,
   mergeMcpTools,
+  resumeHandoffState,
   rewriteAssistantText,
   sumUsage,
 } from './inference/loop-shared';
@@ -697,6 +699,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const hasLoopTools = Object.keys(common.tools).length > 0 || (options.mcp?.length ?? 0) > 0;
       /** The tool request of the loop's last model call, when this leg ran the loop. */
       let loopWire: WireToolRequest | undefined;
+      /** The loop's active handoff agent at its end, when this leg ran the loop. */
+      let loopHandoff: StreamToolLoopSnapshot['handoff'];
       if (envelope.phase === 'running' && (!options.output || hasLoopTools)) {
         const checkpoint = envelope.checkpoints[envelope.runId];
         const recoveredOutcome =
@@ -796,6 +800,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           }
           if (!options.output) envelope.candidateText = currentText = finalTurnText(loop.messages);
           loopWire = loop.wire;
+          loopHandoff = loop.handoff;
         }
       } else if (envelope.phase === 'running') {
         const input = await evaluateInputGuardrails(common, envelope.messages);
@@ -810,10 +815,25 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       envelope.phase = 'finalizing';
       events.push({ type: 'phase', phase: 'finalizing' });
       await persist();
+      // A handoff (2.0) gives its target every following step, finalization
+      // included (2.3): the target's model answers, with the target's tools on
+      // a rebuilt wire. A leg that did not run the loop reads the transfer from
+      // the run's checkpoint.
+      const transfer = loopHandoff ?? envelope.checkpoints[envelope.runId]?.handoff;
+      const finalAgent = transfer
+        ? resumeHandoffState(
+            transfer,
+            common.tools,
+            collectHandoffTools(common.tools),
+            common.model,
+            resolveDependencies(options.deps).logger,
+          )
+        : undefined;
+      const finalModel = finalAgent?.model ?? common.model;
       // Finalization is one more turn of the same conversation (2.3, F15). It
       // keeps the loop's tools on the wire, with `tool_choice: 'none'`, so the
       // request prefix (prompt cache, preserved thinking) is the loop's own. A
-      // leg that did not run the loop rebuilds the run's static tool request.
+      // leg that did not run the loop rebuilds the active agent's tool request.
       let finalizeTools: WireToolRequest | undefined | null = null;
       const finalizeToolRequest = async (): Promise<WireToolRequest | undefined> => {
         if (finalizeTools !== null) return finalizeTools;
@@ -822,7 +842,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           (hasLoopTools
             ? filterWireTools(
                 await buildWireTools(
-                  mergeMcpTools(nativeMcp?.runtime, common.tools),
+                  mergeMcpTools(nativeMcp?.runtime, finalAgent?.tools ?? common.tools),
                   common.toolChoice,
                   common.maxToolConcurrency,
                 ),
@@ -857,8 +877,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           const output = options.output;
           const strategy = output
             ? pickObjectStrategy(
-                { model: common.model, mode: output.mode, effort: common.effort },
-                getCapabilities(common.model, undefined, common.capabilities),
+                { model: finalModel, mode: output.mode, effort: common.effort },
+                getCapabilities(finalModel, undefined, common.capabilities),
               )
             : undefined;
           const toolRequest = await finalizeToolRequest();
@@ -866,6 +886,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           const inner = runStream(
             {
               ...common,
+              model: finalModel,
               messages: envelope.messages,
               prompt: undefined,
               instructions: undefined,

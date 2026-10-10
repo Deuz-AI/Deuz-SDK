@@ -259,6 +259,9 @@ Native options support the canonical tool-loop controls, including preparation,
 compaction, approval gates and guardrails. Loop hooks apply to the tool-loop phase.
 Finalization is one more turn of the same conversation: it ends with a user turn,
 offers the loop's tools with `tool_choice: 'none'`, and validates its own output.
+After a [handoff](/docs/agents/handoffs), the target agent's model and tools drive
+every later step, finalization and verifier re-drives included, and its tools pass
+through the same receipts as the root agent's.
 MCP servers in `mcp` cross the same receipt boundary as local tools; see
 [MCP in native runs](/docs/modules/native-mcp).
 The native engine currently rejects `chat`, `memory`, `fallbackModels`, and the
