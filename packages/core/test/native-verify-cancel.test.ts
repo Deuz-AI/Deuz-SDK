@@ -249,9 +249,7 @@ describe('native verification and cancellation (F05)', () => {
       model,
       prompt: 'answer',
       verify: () =>
-        verdicts++ === 0
-          ? { status: 'rejected', feedback: 'Be precise.' }
-          : { status: 'verified' },
+        verdicts++ === 0 ? { status: 'rejected', feedback: 'Be precise.' } : { status: 'verified' },
     }).result;
     expect(result).toMatchObject({ status: 'completed', output: 'better' });
     expect(fetch).toHaveBeenCalledTimes(2);
