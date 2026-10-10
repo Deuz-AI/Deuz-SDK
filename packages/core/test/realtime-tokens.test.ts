@@ -6,7 +6,12 @@ import {
   createGeminiLive,
 } from '../src/realtime';
 import { tool } from '../src/tool';
-import { AuthenticationError, InvalidRequestError } from '../src/errors';
+import {
+  AuthenticationError,
+  InvalidRequestError,
+  RateLimitError,
+  UnsupportedCapabilityError,
+} from '../src/errors';
 import type { JSONSchema } from '../src/types/schema';
 import { manualClock } from './fixtures/manual-clock';
 
@@ -196,5 +201,71 @@ describe('createGeminiAuthToken', () => {
     await expect(
       createGeminiAuthToken({ model: createGeminiLive({ apiKey: 'g' })(MODEL), deps: { fetch } }),
     ).rejects.toBeInstanceOf(AuthenticationError);
+  });
+});
+
+describe('ephemeral token edges', () => {
+  it('refuses a model of the other wire before any request', async () => {
+    const { fetch, calls } = jsonFetch({});
+    await expect(
+      createOpenAIClientSecret({
+        model: createGeminiLive({ apiKey: 'g' })('gemini-live-2.5-flash-preview'),
+        deps: { fetch },
+      }),
+    ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+    await expect(
+      createGeminiAuthToken({
+        model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+        deps: { fetch },
+      }),
+    ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('leaves the lifetime to the provider when none is given, and honours a custom baseURL', async () => {
+    const { fetch, calls } = jsonFetch({ value: 'ek_1' });
+    const secret = await createOpenAIClientSecret({
+      model: createOpenAIRealtime({ apiKey: 'sk', baseURL: 'https://gateway.example/v1/' })(
+        'gpt-realtime',
+      ),
+      deps: { fetch },
+    });
+    expect(calls[0]!.url).toBe('https://gateway.example/v1/realtime/client_secrets');
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({
+      session: { type: 'realtime', model: 'gpt-realtime' },
+    });
+    expect(secret.expiresAt).toBeUndefined();
+  });
+
+  it('treats an empty lockConfig list as no lock at all', async () => {
+    const { fetch, calls } = jsonFetch({ name: 'auth_tokens/c' });
+    await createGeminiAuthToken({
+      model: createGeminiLive({ apiKey: 'g' })('gemini-live-2.5-flash-preview'),
+      instructions: 'not locked',
+      lockConfig: [],
+      deps: { fetch },
+    });
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({});
+  });
+
+  it('maps a rate limit onto RateLimitError and a reply without a name onto InvalidRequestError', async () => {
+    const limited = jsonFetch(
+      { error: { code: 429, message: 'Quota', status: 'RESOURCE_EXHAUSTED' } },
+      429,
+    );
+    const failure = await createGeminiAuthToken({
+      model: createGeminiLive({ apiKey: 'g' })('gemini-live-2.5-flash-preview'),
+      deps: { fetch: limited.fetch },
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RateLimitError);
+    expect(failure).toMatchObject({ upstreamType: 'RESOURCE_EXHAUSTED', message: 'Quota' });
+
+    const nameless = jsonFetch({ expireTime: '2026-10-10T12:30:00Z' });
+    await expect(
+      createGeminiAuthToken({
+        model: createGeminiLive({ apiKey: 'g' })('gemini-live-2.5-flash-preview'),
+        deps: { fetch: nameless.fetch },
+      }),
+    ).rejects.toBeInstanceOf(InvalidRequestError);
   });
 });

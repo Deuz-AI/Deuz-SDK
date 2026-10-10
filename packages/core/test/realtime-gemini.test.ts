@@ -534,3 +534,130 @@ describe('Gemini Live — usage and pricing', () => {
     expect(usage!.costUsd).toBeUndefined();
   });
 });
+
+describe('Gemini Live — configuration and edge cases', () => {
+  it('asks for text output, and warns about settings Gemini Live cannot carry', async () => {
+    const { socket, events } = await openSession({
+      outputModality: 'text',
+      toolChoice: 'required',
+      inputTranscription: { model: 'whisper-1', language: 'en-US' },
+    });
+    const setup = socket.messages[0]!.setup as Record<string, unknown>;
+    expect(setup.generationConfig).toEqual({ responseModalities: ['TEXT'] });
+    expect(setup.inputAudioTranscription).toEqual({ languageCodes: ['en-US'] });
+    expect(setup).not.toHaveProperty('toolConfig');
+    expect(ofType(events, 'warning').map((event) => event.warning.setting)).toEqual([
+      'toolChoice',
+      'inputTranscription',
+    ]);
+  });
+
+  it('flushes an unfinished input transcript at turn end and reports a blocked turn as incomplete', async () => {
+    const { socket, events } = await openSession();
+    socket.push({ serverContent: { inputTranscription: { text: 'Merhaba' } } });
+    socket.push(audioPart('AAA='));
+    socket.push({
+      serverContent: { turnComplete: true, turnCompleteReason: 'PROHIBITED_INPUT_CONTENT' },
+    });
+    await flush();
+    const responseId = ofType(events, 'response-started')[0]!.responseId;
+    expect(events.slice(1)).toEqual([
+      { type: 'input-transcript-delta', delta: 'Merhaba' },
+      { type: 'response-started', responseId },
+      { type: 'audio-delta', responseId, audio: new Uint8Array([0, 0]) },
+      { type: 'input-transcript-done', transcript: 'Merhaba' },
+      { type: 'audio-done', responseId },
+      {
+        type: 'response-done',
+        responseId,
+        status: 'incomplete',
+        reason: 'PROHIBITED_INPUT_CONTENT',
+      },
+    ]);
+  });
+
+  it('emits a finished output transcript once', async () => {
+    const { socket, events } = await openSession();
+    socket.push({ serverContent: { outputTranscription: { text: 'Hi', finished: true } } });
+    socket.push({ serverContent: { turnComplete: true } });
+    await flush();
+    expect(events.slice(1).map((event) => event.type)).toEqual([
+      'response-started',
+      'output-transcript-delta',
+      'output-transcript-done',
+      'response-done',
+    ]);
+  });
+
+  it('answers a call that came without an id by name only', async () => {
+    let ids = 0;
+    const { socket, events, sent } = await openSession({
+      tools: { get_weather: tool({ parameters: CITY, execute: async () => 'cold' }) },
+      deps: { generateId: () => `gen_${++ids}` },
+    });
+    socket.push({
+      toolCall: { functionCalls: [{ name: 'get_weather', args: { city: 'Oslo' } }] },
+    });
+    await flush();
+    expect(sent()).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [{ name: 'get_weather', response: { output: 'cold' } }],
+        },
+      },
+    ]);
+    expect(ofType(events, 'tool-call')[0]!.toolCallId).toMatch(/^gen_/);
+  });
+
+  it('sends nothing for a manual commit without speech', async () => {
+    const { session, events, sent } = await openSession({ turnDetection: 'manual' });
+    session.commitAudio();
+    expect(sent()).toEqual([]);
+    expect(ofType(events, 'input-audio-committed')).toEqual([]);
+  });
+
+  it('reports a barge-in that arrives with no open turn', async () => {
+    const { socket, events } = await openSession();
+    socket.push({ serverContent: { interrupted: true } });
+    await flush();
+    expect(events.slice(1)).toEqual([{ type: 'interrupted' }]);
+  });
+});
+
+describe('Gemini Live — usage reports across turn boundaries', () => {
+  const report = (prompt: number, response: number) => ({
+    promptTokenCount: prompt,
+    promptTokensDetails: [{ modality: 'AUDIO', tokenCount: prompt }],
+    responseTokenCount: response,
+    responseTokensDetails: [{ modality: 'AUDIO', tokenCount: response }],
+    totalTokenCount: prompt + response,
+  });
+
+  it('commits only the growth of a report that follows a committed one', async () => {
+    const { session, socket, events } = await openSession();
+    socket.push(audioPart('AAA='));
+    socket.push({ serverContent: { turnComplete: true }, usageMetadata: report(100, 40) });
+    socket.push({ usageMetadata: report(100, 60) });
+    socket.push({ usageMetadata: report(100, 60) });
+    await flush();
+    expect(ofType(events, 'usage').map((event) => event.tokens.audio)).toEqual([
+      { input: 100, cachedInput: 0, output: 40 },
+      { input: 0, cachedInput: 0, output: 20 },
+    ]);
+    expect(session.usage.tokens.audio).toEqual({ input: 100, cachedInput: 0, output: 60 });
+  });
+
+  it('still bills the report of a turn that the close cut short', async () => {
+    const onUsage = vi.fn();
+    const { session, socket, events } = await openSession({ deps: { onUsage } });
+    socket.push(audioPart('AAA='));
+    socket.push({ usageMetadata: report(80, 10) });
+    await flush();
+    expect(ofType(events, 'usage')).toEqual([]);
+
+    await session.close();
+    const types = events.map((event) => event.type);
+    expect(types.slice(-2)).toEqual(['usage', 'session-closed']);
+    expect(onUsage.mock.calls[0]![1]).toEqual({ model: MODEL, reason: 'aborted' });
+  });
+});

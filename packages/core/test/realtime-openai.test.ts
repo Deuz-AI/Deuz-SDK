@@ -863,3 +863,167 @@ describe('OpenAI Realtime — usage and pricing', () => {
     expect(ofType(events, 'usage')[0]!.costUsd).toBe(0.75);
   });
 });
+
+describe('OpenAI Realtime — configuration and edge cases', () => {
+  it('maps server turn detection and default transcription, and warns about what the wire cannot carry', async () => {
+    const { socket, events } = await openSession({
+      turnDetection: 'server',
+      inputTranscription: true,
+      inputSampleRate: 16_000,
+      outputTranscription: false,
+    });
+    const update = socket.messages[0] as { session: { audio: { input: unknown } } };
+    expect(update.session.audio.input).toEqual({
+      transcription: { model: 'gpt-4o-mini-transcribe' },
+      turn_detection: { type: 'server_vad' },
+    });
+    expect(
+      ofType(events, 'warning').map((event) => [event.warning.type, event.warning.setting]),
+    ).toEqual([
+      ['unsupported-setting', 'inputSampleRate'],
+      ['unsupported-setting', 'outputTranscription'],
+    ]);
+  });
+
+  it('forces a named tool, and sends no tool_choice without tools', async () => {
+    const forced = await openSession({
+      tools: { get_weather: tool({ parameters: CITY }) },
+      toolChoice: { type: 'tool', toolName: 'get_weather' },
+    });
+    expect(
+      (forced.socket.messages[0] as { session: Record<string, unknown> }).session,
+    ).toMatchObject({
+      tool_choice: { type: 'function', name: 'get_weather' },
+    });
+
+    const none = await openSession({ toolChoice: 'required' });
+    expect(
+      (none.socket.messages[0] as { session: Record<string, unknown> }).session,
+    ).not.toHaveProperty('tool_choice');
+  });
+
+  it('reports G.711 audio when providerOptions picks it', () => {
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      providerOptions: {
+        audio: {
+          input: { format: { type: 'audio/pcmu' } },
+          output: { format: { type: 'audio/pcma' } },
+        },
+      },
+    });
+    expect(session.audioFormat).toEqual({
+      input: { encoding: 'g711-ulaw', sampleRate: 8000, mimeType: 'audio/pcmu' },
+      output: { encoding: 'g711-alaw', sampleRate: 8000, mimeType: 'audio/pcma' },
+    });
+  });
+
+  it('does not report barge-in when turn detection is told not to interrupt', async () => {
+    const { socket, events } = await openSession({
+      providerOptions: {
+        audio: { input: { turn_detection: { type: 'server_vad', interrupt_response: false } } },
+      },
+    });
+    socket.push({ type: 'response.created', event_id: 'e', response: { id: 'resp_9' } });
+    socket.push({ type: 'input_audio_buffer.speech_started', event_id: 'e', item_id: 'item_u9' });
+    await flush();
+    expect(ofType(events, 'speech-started')).toHaveLength(1);
+    expect(ofType(events, 'interrupted')).toEqual([]);
+  });
+
+  it('truncates the last heard audio once, and sends nothing when there is nothing to stop', async () => {
+    const { session, socket, sent } = await openSession();
+    session.interrupt({ playedMs: 100 });
+    expect(sent()).toEqual([]);
+
+    socket.push({ type: 'response.created', event_id: 'e', response: { id: 'resp_6' } });
+    socket.push({
+      type: 'response.output_audio.delta',
+      event_id: 'e',
+      response_id: 'resp_6',
+      item_id: 'item_a6',
+      output_index: 0,
+      content_index: 0,
+      delta: 'AAA=',
+    });
+    socket.push({
+      type: 'response.done',
+      event_id: 'e',
+      response: { id: 'resp_6', status: 'completed', output: [] },
+    });
+    await flush();
+    // The response is over but its audio may still be playing: truncate only.
+    session.interrupt({ playedMs: 250.7 });
+    session.interrupt({ playedMs: 300 });
+    expect(sent()).toEqual([
+      {
+        type: 'conversation.item.truncate',
+        item_id: 'item_a6',
+        content_index: 0,
+        audio_end_ms: 250,
+      },
+    ]);
+  });
+
+  it('treats a response.done without a final status as not completed', async () => {
+    const execute = vi.fn(() => 'never');
+    const { socket, events } = await openSession({
+      tools: { get_weather: tool({ parameters: CITY, execute }) },
+    });
+    socket.push({
+      type: 'response.done',
+      event_id: 'e',
+      response: {
+        id: 'resp_7',
+        output: [
+          { type: 'function_call', call_id: 'call_7', name: 'get_weather', arguments: '{}' },
+        ],
+      },
+    });
+    await flush();
+    expect(execute).not.toHaveBeenCalled();
+    expect(ofType(events, 'response-done')).toEqual([
+      { type: 'response-done', responseId: 'resp_7', status: 'incomplete' },
+    ]);
+  });
+
+  it('attributes tokens reported without a modality breakdown to text', async () => {
+    const { socket, events } = await openSession();
+    socket.push({
+      type: 'response.done',
+      event_id: 'e',
+      response: {
+        id: 'resp_8',
+        status: 'completed',
+        output: [],
+        usage: { input_tokens: 50, output_tokens: 20, total_tokens: 70 },
+      },
+    });
+    await flush();
+    const [usage] = ofType(events, 'usage');
+    expect(usage!.tokens).toEqual({
+      text: { input: 50, cachedInput: 0, output: 20 },
+      audio: { input: 0, cachedInput: 0, output: 0 },
+      image: { input: 0, cachedInput: 0, output: 0 },
+    });
+    expect(usage!.usage).not.toHaveProperty('audioTokens');
+  });
+
+  it('counts a throwing price provider as unpriced instead of failing the session', async () => {
+    const priceProvider = {
+      priceUsage: () => {
+        throw new Error('price table unavailable');
+      },
+    };
+    const { session, socket, events } = await openSession({ deps: { priceProvider } });
+    socket.push({
+      type: 'response.done',
+      event_id: 'e',
+      response: { id: 'r', status: 'completed', output: [], usage: { input_tokens: 5 } },
+    });
+    await flush();
+    expect(ofType(events, 'warning')[0]!.warning.type).toBe('unpriced-model');
+    expect(ofType(events, 'usage')[0]!.costUsd).toBeUndefined();
+    expect(session.status).toBe('open');
+  });
+});

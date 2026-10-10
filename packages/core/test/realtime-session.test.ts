@@ -6,6 +6,7 @@ import {
   RealtimeError,
   type RealtimeEvent,
 } from '../src/realtime';
+import { tool } from '../src/tool';
 import {
   fakeRealtimeServer,
   openaiHandshake,
@@ -179,5 +180,127 @@ describe('session plumbing', () => {
     await flush();
     expect(events.slice(1).map((event) => event.type)).toEqual(['error', 'response-started']);
     expect(events[1]).toMatchObject({ fatal: false, error: { kind: 'invalid-message' } });
+  });
+});
+
+describe('session lifecycle edges', () => {
+  it('cancels the dial when close() runs before the credential resolves', async () => {
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    let release: (token: string) => void = () => {};
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime()('gpt-realtime'),
+      ephemeralToken: () => new Promise<string>((resolve) => (release = resolve)),
+      deps: { webSocket: server.webSocket },
+    });
+    const pending = session.connect().catch((error: unknown) => error);
+    await session.close();
+    release('ek_late');
+    await flush();
+    expect(await pending).toMatchObject({ kind: 'closed' });
+    expect(server.sockets).toHaveLength(0);
+    expect(session.status).toBe('closed');
+  });
+
+  it('rejects an already-aborted connect without dialing', async () => {
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      signal: AbortSignal.abort(),
+      deps: { webSocket: server.webSocket },
+    });
+    await expect(session.connect()).rejects.toMatchObject({ code: 'aborted' });
+    expect(server.sockets).toHaveLength(0);
+  });
+
+  it('closes an open session from the client side when its signal aborts', async () => {
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    const controller = new AbortController();
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      signal: controller.signal,
+      deps: { webSocket: server.webSocket },
+    });
+    const closed: RealtimeEvent[] = [];
+    session.on('session-closed', (event) => closed.push(event));
+    await session.connect();
+    controller.abort();
+    await flush();
+    expect(closed).toEqual([
+      { type: 'session-closed', code: 1000, reason: 'aborted', initiator: 'client' },
+    ]);
+  });
+
+  it('ends quietly when the server closes normally', async () => {
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      deps: { webSocket: server.webSocket },
+    });
+    const events: RealtimeEvent[] = [];
+    session.on('*', (event) => events.push(event));
+    await session.connect();
+    server.socket.drop(1000, 'session ended');
+    await flush();
+    expect(events.slice(1)).toEqual([
+      { type: 'session-closed', code: 1000, reason: 'session ended', initiator: 'server' },
+    ]);
+  });
+
+  it('leaves provider-executed tools out of the session with a warning', async () => {
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      tools: {
+        web_search: tool({
+          type: 'provider',
+          parameters: { type: 'object' },
+          providerTool: { type: 'web_search' },
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    const warnings: RealtimeEvent[] = [];
+    session.on('warning', (event) => warnings.push(event));
+    await session.connect();
+    expect(server.socket.messages[0]).not.toHaveProperty('session.tools');
+    expect(warnings).toEqual([
+      {
+        type: 'warning',
+        warning: expect.objectContaining({ type: 'unsupported-tool', setting: 'web_search' }),
+      },
+    ]);
+  });
+
+  it('scrubs the credential out of a socket factory error, plain or URL-encoded', async () => {
+    const session = createRealtimeSession({
+      model: createGeminiLive({ apiKey: 'g key/1', apiKeyLocation: 'query' })(
+        'gemini-live-2.5-flash-preview',
+      ),
+      deps: {
+        webSocket: (url) => {
+          throw new Error(`cannot open ${url} (key g key/1)`);
+        },
+      },
+    });
+    const failure = (await session.connect().catch((error: unknown) => error)) as Error;
+    expect(failure).toMatchObject({ kind: 'connect-failed' });
+    expect(failure.message).not.toContain('g key/1');
+    expect(failure.message).not.toContain('g%20key%2F1');
+    expect(failure.message).toContain('[redacted]');
+  });
+
+  it('refuses sends and tool results before connect, and an unknown model surface outright', () => {
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+    });
+    expect(() => session.sendText('hi')).toThrow(RealtimeError);
+    expect(() => session.sendToolResult('call_1', 'x')).toThrow(
+      expect.objectContaining({ kind: 'not-connected' }),
+    );
+    expect(() =>
+      createRealtimeSession({
+        model: { provider: 'acme', modelId: 'x', surface: 'acme-live' as never },
+      }),
+    ).toThrow(RealtimeError);
   });
 });
