@@ -91,7 +91,9 @@ which let parallel calls spend past the budget.
 
 A model has no price when no `deps.priceProvider` is configured, or when the
 provider returns `undefined` for it, for example a model released after your
-price table. Under a USD budget such a call runs by default:
+price table. Under the USD budget of an execution context (`runAgent`, swarms,
+`evolve`, or an `execution` passed to `generateText` and `streamChat`), such a
+call runs by default:
 
 - its tokens are still reserved, bounded and settled;
 - its cost is left out of every USD total, so `spent.usd` counts the priced
