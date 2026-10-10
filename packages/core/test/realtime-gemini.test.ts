@@ -381,6 +381,69 @@ describe('Gemini Live — tool calls', () => {
     ]);
     expect(ofType(events, 'tool-result')).toEqual([]);
   });
+
+  it('answers a result JSON cannot encode with an error and keeps its siblings', async () => {
+    const { session, socket, events, sent } = await openSession({
+      tools: {
+        get_row: tool({ parameters: { type: 'object' }, execute: async () => ({ id: 10n }) }),
+        get_weather: tool({ parameters: CITY, execute: async () => 'sunny' }),
+      },
+    });
+    socket.push({
+      toolCall: {
+        functionCalls: [
+          { id: 'a', name: 'get_row', args: {} },
+          { id: 'b', name: 'get_weather', args: { city: 'Rome' } },
+        ],
+      },
+    });
+    await flush();
+    expect(sent()).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [
+            {
+              id: 'a',
+              name: 'get_row',
+              response: { error: "The result of tool 'get_row' could not be JSON-encoded." },
+            },
+            { id: 'b', name: 'get_weather', response: { output: 'sunny' } },
+          ],
+        },
+      },
+    ]);
+    // The app hears it too: its tool broke the JSON contract.
+    const [error] = ofType(events, 'error');
+    expect(error).toMatchObject({ fatal: false, error: { kind: 'tool' } });
+    expect(error!.error.message).toContain("'get_row'");
+    expect(session.status).toBe('open');
+  });
+
+  it('answers a circular client-tool result with an error instead of dropping it', async () => {
+    const { session, socket, events, sent } = await openSession({
+      tools: { lookup: tool({ parameters: { type: 'object' } }) }, // a client tool
+    });
+    socket.push({ toolCall: { functionCalls: [{ id: 'c', name: 'lookup', args: {} }] } });
+    await flush();
+    const circular: Record<string, unknown> = { name: 'row' };
+    circular.self = circular;
+    session.sendToolResult('c', circular);
+    await flush();
+    expect(sent()).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [
+            {
+              id: 'c',
+              name: 'lookup',
+              response: { error: "The result of tool 'lookup' could not be JSON-encoded." },
+            },
+          ],
+        },
+      },
+    ]);
+    expect(ofType(events, 'error')).toHaveLength(1);
+  });
 });
 
 describe('Gemini Live — interruption, lifecycle and errors', () => {

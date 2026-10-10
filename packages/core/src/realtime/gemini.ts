@@ -15,6 +15,7 @@
 import type { CallWarning } from '../types/methods';
 import { toGeminiSchema } from '../schema/gemini';
 import { count, decodeBase64, deepMerge, isPlainObject, list, obj, str } from './encoding';
+import { RealtimeError } from './errors';
 import type { RealtimeModelConfig } from './models';
 import type {
   CodecInit,
@@ -568,6 +569,32 @@ function createCodec(init: CodecInit): RealtimeCodec {
     inputTranscript: undefined,
   };
 
+  /**
+   * One call's `response`. The message goes out as JSON, so a result JSON
+   * cannot encode (a BigInt, a cycle) is answered as an error for that call
+   * alone, and the app hears about it, instead of the whole batch failing.
+   */
+  function functionResponse(outcome: ToolOutcome): Record<string, unknown> {
+    try {
+      JSON.stringify(outcome.result);
+    } catch (cause) {
+      const name = outcome.call.toolName;
+      const detail = (cause instanceof Error ? cause.message : String(cause)).split('\n')[0];
+      sink.emit({
+        type: 'error',
+        fatal: false,
+        error: new RealtimeError({
+          kind: 'tool',
+          message: `The result of tool '${name}' could not be JSON-encoded (${detail}), so the model was sent an error instead.`,
+          provider: model.provider,
+          cause,
+        }),
+      });
+      return { error: `The result of tool '${name}' could not be JSON-encoded.` };
+    }
+    return outcome.isError ? { error: outcome.result } : { output: outcome.result };
+  }
+
   return {
     setup: () => [{ setup: geminiSetup(model, config, tools, (warning) => sink.warn(warning)) }],
 
@@ -616,7 +643,7 @@ function createCodec(init: CodecInit): RealtimeCodec {
             functionResponses: outcomes.map((outcome) => ({
               ...(outcome.call.wireId ? { id: outcome.call.wireId } : {}),
               name: outcome.call.toolName,
-              response: outcome.isError ? { error: outcome.result } : { output: outcome.result },
+              response: functionResponse(outcome),
             })),
           },
         },

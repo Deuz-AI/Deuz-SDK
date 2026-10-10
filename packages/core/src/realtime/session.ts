@@ -359,14 +359,26 @@ export function createRealtimeSession(options: RealtimeSessionOptions): Realtime
     });
   }
 
-  /** A send the session decided on itself (deferred `response.create`, tool results). */
-  function transmitQuietly(messages: ProviderMessage[]): void {
+  /**
+   * A send the session decided on itself (deferred `response.create`, tool
+   * results). Nobody awaits it, so a failure, building the messages or on the
+   * socket, is reported as a non-fatal `error` event: the model never got them.
+   */
+  function transmitQuietly(
+    kind: RealtimeError['kind'],
+    action: string,
+    build: () => ProviderMessage[],
+  ): void {
     if (status !== 'open') return;
     try {
-      transmit(messages);
-    } catch (error) {
-      deps.logger.warn('A realtime message could not be sent.', {
-        error: scrub(error instanceof Error ? error.message : String(error)),
+      transmit(build());
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      deps.logger.warn('A realtime message could not be sent.', { error: scrub(detail) });
+      emit({
+        type: 'error',
+        fatal: false,
+        error: realtimeError(kind, `Could not ${action}: ${detail}`, { cause }),
       });
     }
   }
@@ -473,7 +485,8 @@ export function createRealtimeSession(options: RealtimeSessionOptions): Realtime
       if (status !== 'closed') emit(event);
     },
     send(message) {
-      transmitQuietly([message]);
+      const name = typeof message.type === 'string' ? message.type : 'a message';
+      transmitQuietly('not-connected', `send ${name}`, () => [message]);
     },
     providerError({ message, upstreamType }) {
       const error = realtimeError('provider', message, upstreamType ? { upstreamType } : {});
@@ -756,7 +769,12 @@ export function createRealtimeSession(options: RealtimeSessionOptions): Realtime
         deps,
         emit,
         flush: (outcomes) => {
-          if (codec) transmitQuietly(codec.toolResults(outcomes));
+          const wire = codec;
+          if (!wire) return;
+          const names = outcomes.map((outcome) => outcome.call.toolName).join(', ');
+          transmitQuietly('tool', `send the tool results (${names})`, () =>
+            wire.toolResults(outcomes),
+          );
         },
       });
       let opened: RealtimeWebSocket;

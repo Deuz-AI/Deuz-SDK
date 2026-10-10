@@ -174,6 +174,49 @@ describe('session plumbing', () => {
     expect(server.socket.messages.at(-1)).toEqual({ type: 'input_audio_buffer.clear' });
   });
 
+  it('reports tool results the socket refused instead of dropping them silently', async () => {
+    const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+    let finish: (value: string) => void = () => {};
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      tools: {
+        get_weather: tool({
+          parameters: { type: 'object' },
+          execute: () => new Promise<string>((resolve) => (finish = resolve)),
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    const events: RealtimeEvent[] = [];
+    session.on('*', (event) => events.push(event));
+    await session.connect();
+    server.socket.push({
+      type: 'response.done',
+      event_id: 'e',
+      response: {
+        id: 'resp_1',
+        status: 'completed',
+        output: [
+          { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{}' },
+        ],
+      },
+    });
+    await flush();
+    server.socket.readyState = 2; // going down; its close event has not arrived yet
+    finish('sunny');
+    await flush();
+    expect(events.filter((event) => event.type === 'error')).toEqual([
+      {
+        type: 'error',
+        fatal: false,
+        error: expect.objectContaining({
+          kind: 'tool',
+          message: expect.stringContaining('Could not send the tool results'),
+        }),
+      },
+    ]);
+  });
+
   it('ignores frames it cannot parse, reporting them as non-fatal', async () => {
     const { session, server } = await open();
     const events: RealtimeEvent[] = [];
