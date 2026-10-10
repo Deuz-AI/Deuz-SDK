@@ -20,11 +20,11 @@ import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../interna
 import { createWarningSink, type WarningSink } from '../internal/warnings';
 import type { MemoryMutation } from '../memory';
 import {
-  assembleAssistant,
   blocksToolDispatch,
+  createTurnContent,
   stopDetailsFrom,
   type ToolArgMap,
-  type EncryptedReasoning,
+  type TurnContent,
 } from './run-step';
 import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
 import {
@@ -970,9 +970,8 @@ export function runStreamToolLoop(
           );
         }
         let text = '';
-        let reasoningText = '';
-        let reasoningSignature: string | undefined;
-        let encryptedReasoning: EncryptedReasoning = [];
+        // Every reasoning block, text run and tool call in arrival order (2.3, F21).
+        let turn: TurnContent = createTurnContent();
         let toolArgs: ToolArgMap = new Map();
         let toolOrder: string[] = [];
         let stepUsage: Usage = EMPTY_USAGE;
@@ -1011,9 +1010,7 @@ export function runStreamToolLoop(
             },
           );
           text = '';
-          reasoningText = '';
-          reasoningSignature = undefined;
-          encryptedReasoning = [];
+          turn = createTurnContent();
           toolArgs = new Map();
           toolOrder = [];
           stepUsage = EMPTY_USAGE;
@@ -1027,16 +1024,11 @@ export function runStreamToolLoop(
             switch (part.type) {
               case 'text-delta':
                 text += part.text;
+                turn.text(part);
                 broadcaster.push(part);
                 break;
               case 'reasoning-delta':
-                if (part.encrypted) {
-                  encryptedReasoning.push({ text: part.text, signature: part.signature });
-                  broadcaster.push(part);
-                  break;
-                }
-                reasoningText += part.text;
-                if (part.signature) reasoningSignature = part.signature;
+                turn.reasoning(part);
                 broadcaster.push(part);
                 break;
               case 'tool-call-delta': {
@@ -1045,6 +1037,7 @@ export function runStreamToolLoop(
                   entry = { name: part.name, args: '' };
                   toolArgs.set(part.id, entry);
                   toolOrder.push(part.id);
+                  turn.tool(part.id);
                   toolState(part.id, part.name, 'input-streaming');
                 }
                 if (part.name && !entry.name) entry.name = part.name;
@@ -1160,14 +1153,7 @@ export function runStreamToolLoop(
         // Finish-reason gate (2.3, F16): a refused or cut-off turn keeps its text
         // and reasoning, never its tool calls — their arguments may be truncated.
         const cutOff = blocksToolDispatch(stepFinish);
-        const { assistantMessage, toolUseParts } = assembleAssistant(
-          text,
-          reasoningText,
-          reasoningSignature,
-          toolArgs,
-          cutOff ? [] : toolOrder,
-          encryptedReasoning,
-        );
+        const { assistantMessage, toolUseParts } = turn.assemble(toolArgs, cutOff ? [] : toolOrder);
         if (stepPhase) assistantMessage.providerMetadata = { openai: { phase: stepPhase } };
         // A UI already shows these calls as `input-streaming`; close each one,
         // since no `tool-call` or `tool-result` will ever follow.
@@ -1175,7 +1161,7 @@ export function runStreamToolLoop(
 
         const stepData = {
           text,
-          reasoningText,
+          reasoningText: turn.reasoningText,
           toolUseParts,
           usage: stepUsage,
           finishReason: stepFinish,

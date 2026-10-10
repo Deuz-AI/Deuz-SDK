@@ -25,6 +25,7 @@ import {
   reportDrop,
 } from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
+import { replaysTo } from '../internal/reasoning';
 import { acceptsDocuments, resolveMedia, warnDroppedDocument } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -48,7 +49,10 @@ interface MediaContext {
   warnings: BuildContext['warnings'];
 }
 
-/** Returns null when the part cannot be carried and was dropped (warned). */
+/**
+ * Returns null when the part cannot be carried: a dropped document (warned),
+ * or reasoning this wire must not replay (see the `reasoning` case).
+ */
 function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
   switch (part.type) {
     case 'text':
@@ -63,13 +67,15 @@ function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
         ...(part.isError ? { is_error: true } : {}),
       };
     case 'reasoning':
-      return part.redacted
-        ? { type: 'redacted_thinking', data: part.text }
-        : {
-            type: 'thinking',
-            thinking: part.text,
-            ...(part.signature ? { signature: part.signature } : {}),
-          };
+      // Claude's own blocks ride back exactly as they came (2.3, F21), between
+      // Claude models too: the API drops the ones the model cannot read.
+      // Another provider's reasoning is never a thinking block (an OpenAI
+      // encrypted item used to go out as one), and a thinking block without
+      // its signature is always rejected.
+      if (!replaysTo(part, 'anthropic')) return null;
+      if (part.redacted) return { type: 'redacted_thinking', data: part.text };
+      if (!part.signature) return null;
+      return { type: 'thinking', thinking: part.text, signature: part.signature };
     case 'image': {
       // `ImagePart` carries documents too (the Part union is locked until 2.0)
       // — a PDF must become a `document` block, never an `image` one: /v1/messages
@@ -106,13 +112,6 @@ function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
       };
     }
   }
-}
-
-/** Reasoning/thinking blocks MUST come first in an Anthropic content array. */
-function orderReasoningFirst(blocks: AnthropicBlock[]): AnthropicBlock[] {
-  const thinking = blocks.filter((b) => b.type === 'thinking' || b.type === 'redacted_thinking');
-  const rest = blocks.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
-  return [...thinking, ...rest];
 }
 
 /**
@@ -159,11 +158,13 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     logger: ctx.logger,
     warnings: ctx.warnings,
   };
+  // Blocks keep the order the model produced them in (2.3, F21): thinking
+  // between tool calls stays there, since a moved block is a modified prefix.
   const wireMessages = rest.map((m) => ({
     role: m.role === 'tool' ? 'user' : m.role,
-    content: orderReasoningFirst(
-      m.content.map((p) => partToBlock(p, media)).filter((b): b is AnthropicBlock => b !== null),
-    ),
+    content: m.content
+      .map((p) => partToBlock(p, media))
+      .filter((b): b is AnthropicBlock => b !== null),
   }));
 
   // Opus 4.7+/Sonnet 5/Fable 5/Claude 5.x: budget_tokens returns 400 — effort
@@ -360,6 +361,11 @@ interface AnthropicEvent {
     name?: string;
     tool_use_id?: string;
     content?: unknown;
+    /** `thinking` blocks: the text and signature so far (both empty when streamed). */
+    thinking?: string;
+    signature?: string;
+    /** `redacted_thinking` blocks: the opaque payload, complete in the start event. */
+    data?: string;
   };
   delta?: {
     type?: string;
@@ -374,6 +380,16 @@ interface AnthropicEvent {
   /** Server-side context editing report (`{ applied_edits: [...] }`) — opaque pass-through. */
   context_management?: unknown;
   error?: { type?: string; message?: string };
+}
+
+/**
+ * Block identity for a reasoning delta (2.3, F21): the content block index
+ * keeps consecutive thinking blocks apart (each has its own signature, and a
+ * merged block is a modified one), and the source marks the family whose API
+ * signed it, so no other provider is ever sent it.
+ */
+function reasoningBlock(index: number): { id: string; source: 'anthropic' } {
+  return { id: String(index), source: 'anthropic' };
 }
 
 function mapStopReason(reason: string | null): FinishReason {
@@ -465,7 +481,26 @@ async function* parseStream(
     } else if (type === 'content_block_start') {
       const idx = data.index ?? 0;
       const block = data.content_block;
-      if (block?.type === 'tool_use' && block.id) {
+      if (block?.type === 'thinking') {
+        // A streamed block starts empty; its text and signature follow as
+        // deltas. Anything the start already carries is part of the block.
+        if (block.thinking || block.signature) {
+          yield {
+            type: 'reasoning-delta',
+            text: block.thinking ?? '',
+            ...(block.signature ? { signature: block.signature } : {}),
+            ...reasoningBlock(idx),
+          };
+        }
+      } else if (block?.type === 'redacted_thinking') {
+        // Complete in the start event: opaque data that rides back unchanged.
+        yield {
+          type: 'reasoning-delta',
+          text: block.data ?? '',
+          redacted: true,
+          ...reasoningBlock(idx),
+        };
+      } else if (block?.type === 'tool_use' && block.id) {
         toolIds.set(idx, block.id);
         yield { type: 'tool-call-delta', id: block.id, name: block.name, argsTextDelta: '' };
       } else if (block?.type === 'web_search_tool_result') {
@@ -489,9 +524,14 @@ async function* parseStream(
       if (d?.type === 'text_delta' && d.text !== undefined) {
         yield { type: 'text-delta', text: d.text };
       } else if (d?.type === 'thinking_delta' && d.thinking !== undefined) {
-        yield { type: 'reasoning-delta', text: d.thinking };
+        yield { type: 'reasoning-delta', text: d.thinking, ...reasoningBlock(idx) };
       } else if (d?.type === 'signature_delta' && d.signature !== undefined) {
-        yield { type: 'reasoning-delta', text: '', signature: d.signature };
+        yield {
+          type: 'reasoning-delta',
+          text: '',
+          signature: d.signature,
+          ...reasoningBlock(idx),
+        };
       } else if (d?.type === 'input_json_delta') {
         // Only blocks registered as client tool_use stream tool-call deltas;
         // server_tool_use argument deltas are skipped (provider executes them).
