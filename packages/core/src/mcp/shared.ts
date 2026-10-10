@@ -1180,7 +1180,8 @@ export function buildSamplingHandler(
     // The run's policy comes first (2.3, the dispatch contract's order): a
     // request it forbids is refused before `approve` asks anyone.
     if (opts.execution) {
-      const { assertExecutionPolicy } = await import('../execution-policy');
+      // The chunk the loops already load for native policy checks (no new split point).
+      const { assertExecutionPolicy } = await import('../internal/native-request');
       assertExecutionPolicy(opts.execution, {
         modelId: opts.model.modelId,
         now: resolveDependencies(opts.deps).clock.now(),
