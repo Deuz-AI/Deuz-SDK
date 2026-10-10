@@ -63,6 +63,14 @@ export interface StreamChatResult {
   usage: Promise<Usage>;
   finishReason: Promise<FinishReason>;
   /**
+   * The provider's explanation of the stop (2.3 additive), when it gave one —
+   * e.g. a refusal's category. Resolves together with `finishReason`, with
+   * `undefined` when the provider explained nothing or the caller aborted, and
+   * rejects when the call failed. The raw provider object also stays on the
+   * `finish` part's `providerMetadata`. See {@link StopDetails}.
+   */
+  stopDetails?: Promise<StopDetails | undefined>;
+  /**
    * Durable run id — present only when the call carried `session` (or came
    * from `resumeStreamFromCheckpoint`). Known synchronously. Additive (1.5).
    */
@@ -192,6 +200,11 @@ export interface GenerateObjectResult<T = unknown> {
   usage: Usage;
   finishReason: FinishReason;
   /**
+   * The provider's explanation of the stop (2.3 additive), when it gave one —
+   * e.g. a refusal's category. See {@link StopDetails}.
+   */
+  stopDetails?: StopDetails;
+  /**
    * Non-fatal execution notices (1.9 additive) — e.g. an unknown slug forcing
    * the 'tool' strategy because the fallback row reports no native structured
    * output. See {@link CallWarning}.
@@ -229,6 +242,14 @@ export interface StreamObjectResult<T = unknown> {
   /** Resolve even when final validation fails (the tokens were still spent). */
   usage: Promise<Usage>;
   finishReason: Promise<FinishReason>;
+  /**
+   * The provider's explanation of the stop (2.3 additive), e.g. a refusal's
+   * category. Resolves together with `usage` and `finishReason`, before the
+   * final validation, so a refused request is explained even when `object`
+   * rejects; `undefined` when the provider explained nothing. Rejects when the
+   * call failed. See {@link StopDetails}.
+   */
+  stopDetails?: Promise<StopDetails | undefined>;
   /**
    * Non-fatal execution notices (1.9 additive). Resolves together with `usage`
    * and `finishReason`; never rejects. See {@link CallWarning}.

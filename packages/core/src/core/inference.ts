@@ -1,5 +1,5 @@
 import type { CommonCallOptions } from '../types/config';
-import type { CallWarning, StreamChatResult } from '../types/methods';
+import type { CallWarning, StopDetails, StreamChatResult } from '../types/methods';
 import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
 import type { UsageMeta } from '../types/deps';
@@ -18,6 +18,7 @@ import { toObservedError } from '../internal/observe-error';
 import type { RunStartedEvent, ObservedError } from '../types/observe';
 import { readClientContext } from '../internal/client-context';
 import { createWarningSink, unsupportedSetting, type WarningSink } from '../internal/warnings';
+import { stopDetailsFrom } from '../internal/stop-details';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
 import { normalizeMessages } from './normalize';
 import { getCapabilities } from './registry';
@@ -152,6 +153,8 @@ export function runStream(
   const broadcaster = createBroadcaster<StreamPart>();
   const usageDeferred = createDeferred<Usage>();
   const finishDeferred = createDeferred<FinishReason>();
+  // The provider's stop explanation (2.3): settles with `finishReason`.
+  const stopDetailsDeferred = createDeferred<StopDetails | undefined>();
   // Warnings (1.9): the sink is CALL-SCOPED — a module-level one would leak
   // across concurrent calls on an edge isolate. It is created here rather than
   // inside pump() so `warnings` can settle from the pump's `finally` (below) and
@@ -219,6 +222,7 @@ export function runStream(
     let ttftMs: number | undefined;
     let finalUsage: Usage | undefined;
     let finalFinish: FinishReason | undefined;
+    let finalStopDetails: StopDetails | undefined;
     let native: ReturnType<typeof createNativeRequest> | undefined;
     let usageAvailable = false;
     const settleReservation = async (): Promise<void> => {
@@ -642,6 +646,7 @@ export function runStream(
             broadcaster.push(part);
             usageDeferred.reject(part.error);
             finishDeferred.reject(part.error);
+            stopDetailsDeferred.reject(part.error);
             // mid-stream error is final — the bridge fails the invoke span
             emitFailure(part.error);
             broadcaster.close();
@@ -650,6 +655,7 @@ export function runStream(
           if (part.type === 'finish') {
             finalUsage = part.usage;
             finalFinish = part.finishReason;
+            finalStopDetails = stopDetailsFrom(part.providerMetadata);
             await settleReservation();
             // Live cost (1.7, D2): single-turn calls price the finish usage
             // inline; loop-driven calls (internal.tools set) leave it to the
@@ -689,6 +695,7 @@ export function runStream(
       const finishReason = finalFinish ?? 'stop';
       usageDeferred.resolve(usage);
       finishDeferred.resolve(finishReason);
+      stopDetailsDeferred.resolve(finalStopDetails);
       fireUsage(options, deps, usage, {
         model: options.model.modelId,
         reason: 'finished',
@@ -763,6 +770,8 @@ export function runStream(
         const usage = withTotal(finalUsage ?? EMPTY_USAGE);
         usageDeferred.resolve(usage);
         finishDeferred.resolve('aborted');
+        // An abort is the caller's stop, not one the provider explained.
+        stopDetailsDeferred.resolve(undefined);
         fireUsage(options, deps, usage, {
           model: options.model.modelId,
           reason: 'aborted',
@@ -825,6 +834,7 @@ export function runStream(
       broadcaster.push({ type: 'error', error: err });
       usageDeferred.reject(err);
       finishDeferred.reject(err);
+      stopDetailsDeferred.reject(err);
       emitFailure(err);
       broadcaster.close();
     }
@@ -901,6 +911,10 @@ export function runStream(
     get finishReason() {
       ensureStarted();
       return finishDeferred.promise;
+    },
+    get stopDetails() {
+      ensureStarted();
+      return stopDetailsDeferred.promise;
     },
     get warnings() {
       // Starts the pump like `usage`/`finishReason` do: the set is only known

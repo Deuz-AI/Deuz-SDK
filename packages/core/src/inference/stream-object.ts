@@ -1,5 +1,6 @@
 import type {
   GenerateObjectOptions,
+  StopDetails,
   StreamObject,
   StreamObjectResult,
   DeepPartial,
@@ -34,6 +35,7 @@ export const streamObject: StreamObject = <T = unknown>(
   const objectDeferred = createDeferred<T>();
   const usageDeferred = createDeferred<Usage>();
   const finishDeferred = createDeferred<FinishReason>();
+  const stopDetailsDeferred = createDeferred<StopDetails | undefined>();
   const warningsDeferred = createDeferred<CallWarning[]>();
   const warningSink = createWarningSink(resolveDependencies(options.deps).logger);
   // Eager subscription BEFORE the lazy start so no part can be missed (G2).
@@ -107,9 +109,11 @@ export const streamObject: StreamObject = <T = unknown>(
       }
 
       // Resolve BEFORE parse/validation — the tokens were spent either way,
-      // so usage/finishReason survive a NoObjectGeneratedError.
+      // so usage/finishReason survive a NoObjectGeneratedError, and a refused
+      // request keeps its explanation.
       usageDeferred.resolve(await inner.usage);
       finishDeferred.resolve(await inner.finishReason);
+      stopDetailsDeferred.resolve(await inner.stopDetails);
       warningsDeferred.resolve(warningSink.list());
 
       let parsed: unknown;
@@ -141,6 +145,7 @@ export const streamObject: StreamObject = <T = unknown>(
       objectDeferred.reject(err);
       usageDeferred.reject(err);
       finishDeferred.reject(err);
+      stopDetailsDeferred.reject(err);
       // fail(), not close(): consumers of the partial stream must see the
       // failure, not a clean end-of-stream.
       broadcaster.fail(err);
@@ -199,6 +204,10 @@ export const streamObject: StreamObject = <T = unknown>(
     get finishReason() {
       ensureStarted();
       return finishDeferred.promise;
+    },
+    get stopDetails() {
+      ensureStarted();
+      return stopDetailsDeferred.promise;
     },
     get warnings() {
       ensureStarted();
