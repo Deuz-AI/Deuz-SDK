@@ -20,9 +20,16 @@
  *   const deuz = createClient({ deps: { priceProvider: createPriceProvider() } });
  *   // …or price a single Usage directly:
  *   const usd = priceUsage('gpt-5.6-sol', usage);
+ *
+ * Batch requests (2.3, `@deuz-sdk/core/batch`) are priced from a row's `batch`
+ * card: `priceUsage(model, usage, table, { tier: 'batch' })`. Only rates a
+ * primary source states explicitly are carded; a row without one has no batch
+ * price, never a guessed discount.
  */
 import type { Usage } from './types/usage';
-import type { PriceProvider } from './types/deps';
+import type { PriceProvider, PriceUsageOptions } from './types/deps';
+
+export type { PriceUsageOptions, ServiceTier } from './types/deps';
 
 /** A long-context price card: its rates bill the whole request once the prompt passes `above`. */
 export interface PriceTier {
@@ -74,6 +81,15 @@ export interface ModelPrice {
     cacheWrite?: number;
     cacheWrite1h?: number;
   };
+  /**
+   * The rates of the provider's asynchronous batch tier (2.3), read by
+   * `{ tier: 'batch' }` lookups. A complete card: nothing falls back to the
+   * standard rates above, so list its long-context cards too; omitted cache
+   * rates take their usual multiples of the card's own `input`. Only rates a
+   * primary source states belong here: a row without a card has no batch
+   * price, and a batch request on it is unpriced.
+   */
+  batch?: Omit<ModelPrice, 'batch'>;
 }
 
 export type PriceTable = Record<string, ModelPrice>;
@@ -151,10 +167,29 @@ export const PRICES_2026: PriceTable = {
   // ---- Anthropic (Claude 5 + 4 families) ----
   // source: https://platform.claude.com/docs/en/about-claude/pricing (Claude API
   // reference). Standard pricing across the 1M context unless a row lists tiers.
+  // Batch cards (2.3): the same reference (cached 2026-10-06) prices Message
+  // Batches "at 50% of standard prices", "50% off every token in the request,
+  // including cache reads and writes", and lists Claude Fable 5.1 at batch
+  // $5/$25. Only the rows that reference lists carry one; Opus 4.5 and Sonnet
+  // 4.5 are not in it, so their batch requests are unpriced. Not live-verified.
   // checkedAt 2026-10-06; cache reads at 5% of input.
-  'claude-opus-5-5': { input: 4, output: 20, cachedRead: 0.2, cacheWrite: 5, cacheWrite1h: 8 },
+  'claude-opus-5-5': {
+    input: 4,
+    output: 20,
+    cachedRead: 0.2,
+    cacheWrite: 5,
+    cacheWrite1h: 8,
+    batch: { input: 2, output: 10, cachedRead: 0.1, cacheWrite: 2.5, cacheWrite1h: 4 },
+  },
   // checkedAt 2026-10-06.
-  'claude-sonnet-5-5': { input: 2, output: 10, cachedRead: 0.2, cacheWrite: 2.5, cacheWrite1h: 4 },
+  'claude-sonnet-5-5': {
+    input: 2,
+    output: 10,
+    cachedRead: 0.2,
+    cacheWrite: 2.5,
+    cacheWrite1h: 4,
+    batch: { input: 1, output: 5, cachedRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2 },
+  },
   // checkedAt 2026-10-06. Two cards by prompt length: up to 100K tokens, and above.
   'claude-haiku-5-5': {
     input: 0.1,
@@ -172,6 +207,23 @@ export const PRICES_2026: PriceTable = {
         cacheWrite1h: 1,
       },
     ],
+    batch: {
+      input: 0.05,
+      output: 0.25,
+      cachedRead: 0.005,
+      cacheWrite: 0.0625,
+      cacheWrite1h: 0.1,
+      tiers: [
+        {
+          above: 100_000,
+          input: 0.25,
+          output: 1.25,
+          cachedRead: 0.025,
+          cacheWrite: 0.3125,
+          cacheWrite1h: 0.5,
+        },
+      ],
+    },
   },
   // checkedAt 2026-10-06 (unchanged since 2026-09-20); cache reads at 2.5% of input.
   'claude-fable-5-1': {
@@ -180,20 +232,77 @@ export const PRICES_2026: PriceTable = {
     cachedRead: 0.25,
     cacheWrite: 12.5,
     cacheWrite1h: 20,
+    batch: { input: 5, output: 25, cachedRead: 0.125, cacheWrite: 6.25, cacheWrite1h: 10 },
   },
   // checkedAt 2026-10-06 (unchanged since 2026-09-20).
-  'claude-opus-5': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
-  'claude-fable-5': { input: 10, output: 50, cachedRead: 1, cacheWrite: 12.5, cacheWrite1h: 20 },
+  'claude-opus-5': {
+    input: 5,
+    output: 25,
+    cachedRead: 0.5,
+    cacheWrite: 6.25,
+    cacheWrite1h: 10,
+    batch: { input: 2.5, output: 12.5, cachedRead: 0.25, cacheWrite: 3.125, cacheWrite1h: 5 },
+  },
+  'claude-fable-5': {
+    input: 10,
+    output: 50,
+    cachedRead: 1,
+    cacheWrite: 12.5,
+    cacheWrite1h: 20,
+    batch: { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
+  },
   // checkedAt 2026-10-06: the reference lists $2/$10. The earlier $3/$15 pin
   // assumed an intro price that the reference no longer shows.
-  'claude-sonnet-5': { input: 2, output: 10, cachedRead: 0.2, cacheWrite: 2.5, cacheWrite1h: 4 },
-  'claude-opus-4-8': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
-  'claude-opus-4-7': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
-  'claude-opus-4-6': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
+  'claude-sonnet-5': {
+    input: 2,
+    output: 10,
+    cachedRead: 0.2,
+    cacheWrite: 2.5,
+    cacheWrite1h: 4,
+    batch: { input: 1, output: 5, cachedRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2 },
+  },
+  'claude-opus-4-8': {
+    input: 5,
+    output: 25,
+    cachedRead: 0.5,
+    cacheWrite: 6.25,
+    cacheWrite1h: 10,
+    batch: { input: 2.5, output: 12.5, cachedRead: 0.25, cacheWrite: 3.125, cacheWrite1h: 5 },
+  },
+  'claude-opus-4-7': {
+    input: 5,
+    output: 25,
+    cachedRead: 0.5,
+    cacheWrite: 6.25,
+    cacheWrite1h: 10,
+    batch: { input: 2.5, output: 12.5, cachedRead: 0.25, cacheWrite: 3.125, cacheWrite1h: 5 },
+  },
+  'claude-opus-4-6': {
+    input: 5,
+    output: 25,
+    cachedRead: 0.5,
+    cacheWrite: 6.25,
+    cacheWrite1h: 10,
+    batch: { input: 2.5, output: 12.5, cachedRead: 0.25, cacheWrite: 3.125, cacheWrite1h: 5 },
+  },
   'claude-opus-4-5': { input: 5, output: 25, cachedRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
-  'claude-sonnet-4-6': { input: 3, output: 15, cachedRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
+  'claude-sonnet-4-6': {
+    input: 3,
+    output: 15,
+    cachedRead: 0.3,
+    cacheWrite: 3.75,
+    cacheWrite1h: 6,
+    batch: { input: 1.5, output: 7.5, cachedRead: 0.15, cacheWrite: 1.875, cacheWrite1h: 3 },
+  },
   'claude-sonnet-4-5': { input: 3, output: 15, cachedRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
-  'claude-haiku-4-5': { input: 1, output: 5, cachedRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2 },
+  'claude-haiku-4-5': {
+    input: 1,
+    output: 5,
+    cachedRead: 0.1,
+    cacheWrite: 1.25,
+    cacheWrite1h: 2,
+    batch: { input: 0.5, output: 2.5, cachedRead: 0.05, cacheWrite: 0.625, cacheWrite1h: 1 },
+  },
 
   // ---- Google Gemini (3.x / 2.5) ----
   'gemini-3.1-pro-preview': {
@@ -295,6 +404,20 @@ function lookup(
   return find(model) ?? find(bare) ?? find(bare.replace(DATE_STAMP, ''));
 }
 
+/**
+ * The card that bills `options.tier` on a row (2.3): the row itself for the
+ * standard tier, its `batch` card for the batch tier, nothing for a tier the
+ * row has no rates for (or one this table does not know).
+ */
+function cardFor(
+  price: ModelPrice | undefined,
+  options: PriceUsageOptions | undefined,
+): ModelPrice | undefined {
+  const tier = options?.tier ?? 'standard';
+  if (tier === 'standard') return price;
+  return tier === 'batch' ? price?.batch : undefined;
+}
+
 const M = 1_000_000;
 
 type TierRates = Omit<PriceTier, 'above'>;
@@ -330,13 +453,16 @@ function ratesForUsage(price: ModelPrice, usage: Usage): ModelPrice {
  * rate, the cache buckets at their dedicated rate or a sensible multiple of
  * `input`. `reasoningTokens` and `audioTokens` are shares of those buckets,
  * not extra tokens; a row's `audio` rate re-prices the audio share only.
+ * `options.tier` (2.3) picks the rates: `'batch'` prices the row's `batch`
+ * card and returns `undefined` for a row without one.
  */
 export function priceUsage(
   model: string,
   usage: Usage,
   table: PriceTable = PRICES_2026,
+  options?: PriceUsageOptions,
 ): number | undefined {
-  const p = lookup(table, model, PRICE_ALIASES);
+  const p = cardFor(lookup(table, model, PRICE_ALIASES), options);
   return p && costOf(p, usage);
 }
 
@@ -373,13 +499,15 @@ function costOf(p: ModelPrice, usage: Usage): number {
  * have cost at the full input rate minus what they actually cost at the
  * cached-read rate. Cache WRITES are the investment side and are not netted
  * here. Returns `undefined` for unknown models, `0` when nothing was cached.
+ * `options.tier` (2.3) picks the rates, as for {@link priceUsage}.
  */
 export function cacheSavings(
   model: string,
   usage: Usage,
   table: PriceTable = PRICES_2026,
+  options?: PriceUsageOptions,
 ): number | undefined {
-  const p = lookup(table, model, PRICE_ALIASES);
+  const p = cardFor(lookup(table, model, PRICE_ALIASES), options);
   return p && savingsOf(p, usage);
 }
 
@@ -410,18 +538,20 @@ export interface CreatePriceProviderOptions {
  * own ids onto rows and `{ margin }` to apply a markup. Unknown models yield
  * `undefined` (never a wrong charge). Implements the optional `cacheSavings`
  * seam, so the live `cost` stream part carries `cacheSavingsUsd` out of the box.
+ * Both honour the service tier (2.3): `{ tier: 'batch' }` reads a row's `batch`
+ * card, and a row your `table` replaces keeps only the cards you give it.
  */
 export function createPriceProvider(options: CreatePriceProviderOptions = {}): PriceProvider {
   const table = options.table ? { ...PRICES_2026, ...options.table } : PRICES_2026;
   const aliases = options.aliases ? { ...PRICE_ALIASES, ...options.aliases } : PRICE_ALIASES;
   const margin = options.margin ?? 1;
   return {
-    priceUsage(model: string, usage: Usage): number | undefined {
-      const p = lookup(table, model, aliases);
+    priceUsage(model: string, usage: Usage, priceOptions?: PriceUsageOptions) {
+      const p = cardFor(lookup(table, model, aliases), priceOptions);
       return p && Math.round(costOf(p, usage) * margin * 1e6) / 1e6;
     },
-    cacheSavings(model: string, usage: Usage): number | undefined {
-      const p = lookup(table, model, aliases);
+    cacheSavings(model: string, usage: Usage, priceOptions?: PriceUsageOptions) {
+      const p = cardFor(lookup(table, model, aliases), priceOptions);
       return p && Math.round(savingsOf(p, usage) * margin * 1e6) / 1e6;
     },
   };
