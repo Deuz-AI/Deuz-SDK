@@ -1,0 +1,402 @@
+---
+title: Realtime voice
+description: createRealtimeSession — live speech-to-speech over the OpenAI Realtime and Gemini Live WebSockets, with Deuz tools, browser-safe ephemeral tokens and per-modality pricing.
+---
+
+`@deuz-sdk/core/realtime` (2.3) opens a **live, two-way voice session** with a speech-to-speech model: you stream microphone audio in, the model streams audio (and a transcript) back, and it can call your tools mid-conversation. Where [generateSpeech](/docs/modules/speech) and [transcribe](/docs/modules/transcription) are one request and one answer, a realtime session is a long-lived WebSocket with a conversation on it.
+
+Two wires ship, behind one normalized event model:
+
+| Provider | Factory | Endpoint | Server auth | Browser auth |
+| --- | --- | --- | --- | --- |
+| OpenAI Realtime (GA) | `createOpenAIRealtime` | `wss://…/v1/realtime?model=…` | `Authorization: Bearer` handshake header | client secret (`ek_…`) in the WebSocket subprotocol list |
+| Gemini Live (Developer API) | `createGeminiLive` | `…/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent` | `x-goog-api-key` header (or `?key=`) | auth token (`auth_tokens/…`) on the `v1alpha` constrained endpoint |
+
+The module is edge-safe (Web APIs only — the runtime's `WebSocket`, `fetch`, `btoa`), and every timer and id comes from the injected [`deps`](/docs/core/dependencies).
+
+<Callout type="warn" title="Not live-verified">
+Neither wire has been exercised against the real OpenAI or Google endpoints. The message shapes were derived from the providers' official SDK type definitions (`openai` 7.32 and `@google/genai` 2.28), and the module is tested offline: a scripted fake socket drives every event mapping, and a second suite runs both wires through Node's real global `WebSocket` against a local RFC 6455 server. That proves the SDK **sends and parses what this page says**; it does not prove the providers still agree. Make one real call before you ship, and use [`providerOptions`](#provideroptions) or [`sendRaw`](#raw-escape-hatches) to correct a field without waiting for a release.
+</Callout>
+
+WebRTC is not covered (planned for 2.4); neither are Vertex AI's Live endpoint, OpenAI transcription-only or translation sessions, and SIP.
+
+## Run it offline
+
+The whole session runs against anything that looks like a WebSocket, which is what makes it testable. This example plugs a scripted stand-in for the OpenAI endpoint into the [socket seam](#the-socket-seam-depswebsocket) — no key, no network — and walks one tool round trip and one spoken answer:
+
+```ts title="offline-voice.ts"
+import {
+  createRealtimeSession,
+  createOpenAIRealtime,
+  realtimePriceTable,
+  type RealtimeWebSocket,
+  type RealtimeWebSocketFactory,
+} from '@deuz-sdk/core/realtime';
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+import { tool } from '@deuz-sdk/core';
+
+// A scripted stand-in for the OpenAI Realtime endpoint: it accepts the session,
+// answers the first turn with a tool call and the second with speech.
+const scriptedServer: RealtimeWebSocketFactory = () => {
+  const listeners: Record<string, ((event: unknown) => void)[]> = {};
+  const fire = (type: string, event: unknown) => listeners[type]?.forEach((fn) => fn(event));
+  const reply = (message: object) =>
+    setTimeout(() => fire('message', { data: JSON.stringify(message) }));
+  const usage = { input_tokens: 120, output_tokens: 40, output_token_details: { audio_tokens: 40 } };
+  let turn = 0;
+  const socket: RealtimeWebSocket = {
+    readyState: 1,
+    addEventListener: (type, fn) => void (listeners[type] ??= []).push(fn),
+    send(data) {
+      const message = JSON.parse(data) as { type: string };
+      if (message.type === 'session.update') {
+        reply({ type: 'session.updated', session: { id: 'sess_demo' } });
+      }
+      if (message.type !== 'response.create') return;
+      const id = `resp_${++turn}`;
+      reply({ type: 'response.created', response: { id } });
+      if (turn === 1) {
+        const call = { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Istanbul"}' };
+        reply({ type: 'response.done', response: { id, status: 'completed', output: [call], usage } });
+        return;
+      }
+      const item = { response_id: id, item_id: 'item_1', output_index: 0, content_index: 0 };
+      reply({ type: 'response.output_audio_transcript.delta', ...item, delta: 'Sunny, 24 degrees.' });
+      reply({ type: 'response.output_audio.delta', ...item, delta: 'AAAAAAAA' });
+      reply({ type: 'response.done', response: { id, status: 'completed', output: [], usage } });
+    },
+    close: (code = 1000, reason = '') => void setTimeout(() => fire('close', { code, reason })),
+  };
+  setTimeout(() => fire('open', {}));
+  return socket;
+};
+
+const session = createRealtimeSession({
+  model: createOpenAIRealtime({ apiKey: 'not-needed-offline' })('gpt-realtime'),
+  instructions: 'You are a terse weather assistant.',
+  tools: {
+    get_weather: tool({
+      description: 'Current weather for a city',
+      parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+      execute: async (args) => ({ city: (args as { city: string }).city, sky: 'sunny', tempC: 24 }),
+    }),
+  },
+  deps: {
+    webSocket: scriptedServer,
+    priceProvider: createPriceProvider({
+      // Illustrative rates (USD per 1M tokens) — check your provider's price page.
+      table: realtimePriceTable({
+        'gpt-realtime': { text: { input: 4, output: 16 }, audio: { input: 32, output: 64 } },
+      }),
+    }),
+  },
+});
+
+session.on('tool-call', (e) => console.log('tool call:', e.toolName, e.args));
+session.on('tool-result', (e) => console.log('tool result:', e.result));
+session.on('output-transcript-delta', (e) => console.log('model says:', e.delta));
+session.on('audio-delta', (e) => console.log(`audio: ${e.audio.byteLength} bytes of PCM16`));
+session.on('usage', (e) => console.log(`usage: ${e.usage.totalTokens} tokens, $${e.costUsd}`));
+
+await session.connect();
+const events = session.events();
+session.sendText('What is the weather in Istanbul?');
+for await (const event of events) {
+  // The tool round trip is turn one; the spoken answer is turn two.
+  if (event.type === 'response-done' && event.responseId === 'resp_2') await session.close();
+}
+console.log(`session total: $${session.usage.costUsd}`);
+```
+
+It prints:
+
+```txt
+usage: 160 tokens, $0.00304
+tool call: get_weather { city: 'Istanbul' }
+tool result: { city: 'Istanbul', sky: 'sunny', tempC: 24 }
+model says: Sunny, 24 degrees.
+audio: 6 bytes of PCM16
+usage: 160 tokens, $0.00304
+session total: $0.00608
+```
+
+Delete the `webSocket` line and pass a real key, and the same code talks to OpenAI.
+
+## Server side (Node.js)
+
+On a server, the model factory holds the API key and the session sends it as a handshake header. The runtime's global `WebSocket` does that in Node.js 22 and later (undici accepts `new WebSocket(url, { protocols, headers })` — the test suite drives the real one), and Bun and Deno 2.5+ document the same option.
+
+```ts title="voice-server.ts"
+import { createRealtimeSession, createOpenAIRealtime } from '@deuz-sdk/core/realtime';
+
+const session = createRealtimeSession({
+  model: createOpenAIRealtime({ apiKey: process.env.OPENAI_API_KEY })('gpt-realtime'),
+  instructions: 'You are a friendly receptionist. Keep answers short.',
+  voice: 'marin',
+  inputTranscription: true, // also transcribe what the caller says
+});
+
+session.on('audio-delta', (e) => playback.write(e.audio)); // PCM16, 24 kHz, mono
+session.on('speech-started', () => playback.clear()); // the caller is talking: stop playing
+session.on('input-transcript-done', (e) => console.log('caller:', e.transcript));
+session.on('output-transcript-done', (e) => console.log('agent:', e.transcript));
+session.on('error', (e) => console.error(e.error.kind, e.error.message));
+
+await session.connect();
+microphone.on('data', (chunk: Uint8Array) => session.appendAudio(chunk)); // PCM16, 24 kHz, mono
+```
+
+Gemini Live is the same code with another factory — only the model and the audio rates change:
+
+```ts
+import { createRealtimeSession, createGeminiLive } from '@deuz-sdk/core/realtime';
+
+const session = createRealtimeSession({
+  model: createGeminiLive({ apiKey: process.env.GEMINI_API_KEY })('gemini-live-2.5-flash-preview'),
+  voice: 'Kore',
+  inputSampleRate: 16_000, // Gemini takes any PCM16 rate and resamples; 16 kHz is native
+  outputTranscription: true,
+});
+```
+
+`deps.keyProvider` wins over the factory key, the same precedence as every other module.
+
+## Browser: ephemeral tokens
+
+A browser cannot set WebSocket handshake headers, so it cannot authenticate with an API key — and must never hold one. Your server mints a short-lived token with its key; the browser connects with that.
+
+```ts title="app/api/voice-token/route.ts (server)"
+import { createOpenAIClientSecret, createOpenAIRealtime } from '@deuz-sdk/core/realtime';
+
+export async function POST() {
+  const { token, expiresAt } = await createOpenAIClientSecret({
+    model: createOpenAIRealtime({ apiKey: process.env.OPENAI_API_KEY })('gpt-realtime'),
+    instructions: 'You are a friendly receptionist.',
+    expiresInSeconds: 120,
+  });
+  return Response.json({ token, expiresAt });
+}
+```
+
+```ts title="voice-client.ts (browser)"
+import { createRealtimeSession, createOpenAIRealtime } from '@deuz-sdk/core/realtime';
+
+const session = createRealtimeSession({
+  model: createOpenAIRealtime()('gpt-realtime'), // no key in the browser
+  ephemeralToken: async () => {
+    const response = await fetch('/api/voice-token', { method: 'POST' });
+    return ((await response.json()) as { token: string }).token;
+  },
+});
+await session.connect();
+```
+
+`ephemeralToken` takes a string or a function; the function runs inside `connect()`, and the [connect timeout](#session-options) covers it. On OpenAI the secret rides in the subprotocol list (`['realtime', 'openai-insecure-api-key.ek_…']`, what the official SDK sends); on Gemini it goes in `?access_token=` on the `v1alpha` `BidiGenerateContentConstrained` endpoint.
+
+The two helpers differ in one important way:
+
+| | `createOpenAIClientSecret` | `createGeminiAuthToken` |
+| --- | --- | --- |
+| Request | `POST {baseURL}/realtime/client_secrets` | `POST {baseURL}/v1alpha/auth_tokens` |
+| Lifetime | `expiresInSeconds` (10–7200, provider default 600) | `expiresInSeconds` (messages, default 30 min), `newSessionExpiresInSeconds` (new sessions, default 60 s), `uses` (default 1) |
+| Session config | attached as a **default** — the browser's own `session.update` can change it | **locked** by default (`lockConfig: true`): the browser cannot change any setup field |
+| Result | `{ token: 'ek_…', expiresAt, raw }` | `{ token: 'auth_tokens/…', expiresAt, raw }` |
+
+`lockConfig` on Gemini takes `true` (lock everything given here, the default), `false` (no constraints: the browser configures the session) or a list of setup field paths (`['systemInstruction', 'generationConfig.temperature']`) to lock only those. HTTP failures map onto the usual [error taxonomy](/docs/core/errors) (401/403 → `AuthenticationError`, 429 → `RateLimitError`, …).
+
+## The socket seam (`deps.webSocket`)
+
+`deps.webSocket` is a factory `(url, { protocols, headers }) => socket`. The default uses the runtime's global `WebSocket`, passing headers through the `{ protocols, headers }` init form when there are any. Supply your own when the runtime cannot send headers, or to use a specific client — the [`ws`](https://github.com/websockets/ws) package, for example:
+
+```ts
+import WebSocket from 'ws';
+import { createRealtimeSession, createOpenAIRealtime } from '@deuz-sdk/core/realtime';
+
+const session = createRealtimeSession({
+  model: createOpenAIRealtime({ apiKey: process.env.OPENAI_API_KEY })('gpt-realtime'),
+  deps: {
+    webSocket: (url, { protocols, headers }) => new WebSocket(url, protocols, { headers }),
+  },
+});
+```
+
+A socket only needs the WHATWG surface: `readyState`, `send(string)`, `close(code, reason)` and `addEventListener` for `open`, `message`, `error` and `close`. The session sets `binaryType = 'arraybuffer'` when it can; Gemini sends its JSON in binary frames, and a `Blob` still works (decoded asynchronously, without reordering frames).
+
+If the default factory fails because a browser was asked to send a header, the error (`kind: 'connect-failed'`) points at ephemeral tokens; if the runtime has no `WebSocket` at all, `kind: 'no-websocket'` says to pass `deps.webSocket`.
+
+## Events
+
+Subscribe with `session.on(type, listener)` (or `'*'` for everything; it returns the unsubscribe function), or iterate `session.events()`, which buffers every event from the moment you call it and ends after `session-closed`. A throwing listener is logged through `deps.logger` and never takes the session down.
+
+| Event | Fields | Notes |
+| --- | --- | --- |
+| `session-ready` | `sessionId?` | The provider accepted the configuration; `connect()` resolves. |
+| `session-closed` | `code`, `reason`, `initiator` | Always the last event. `code`/`reason` come from the closing handshake (on a client close, the server's echo). |
+| `speech-started` / `speech-stopped` | `itemId?`, `audioStartMs?` / `audioEndMs?` | Voice activity. Stop local playback on `speech-started`. |
+| `input-audio-committed` | `itemId?` | The appended audio became a user turn. Gemini has no acknowledgement, so it is emitted on send. |
+| `input-transcript-delta` / `-done` | `itemId?`, `delta` / `transcript` | What the user said (with `inputTranscription`). |
+| `response-started` | `responseId` | A model turn began. Gemini's ids are generated locally. |
+| `audio-delta` / `audio-done` | `responseId?`, `itemId?`, `audio: Uint8Array` | Output audio in `session.audioFormat.output`. |
+| `output-transcript-delta` / `-done` | `responseId?`, `itemId?`, `delta` / `transcript` | What the model is saying. |
+| `text-delta` / `text-done` | `responseId?`, `itemId?`, `delta` / `text` | Text output (`outputModality: 'text'`). |
+| `tool-call` / `tool-result` | `toolCallId`, `toolName`, `args` / `result`, `isError?` | See [tools](#tools). |
+| `tool-call-cancelled` | `toolCallIds`, `reason` | `'provider'` cancelled them, or `'response-not-completed'`. |
+| `interrupted` | `responseId?` | Barge-in: the provider cut the model's turn short — drop queued audio. |
+| `response-done` | `responseId?`, `status`, `reason?` | `completed`, `cancelled`, `incomplete` or `failed`. |
+| `usage` | `responseId?`, `usage`, `tokens`, `costUsd?` | Before the `response-done` it belongs to. See [usage](#usage-and-pricing). |
+| `go-away` / `session-resumption` | `timeLeftMs?` / `handle?`, `resumable` | Gemini only. |
+| `warning` | `warning: CallWarning` | A setting the wire cannot carry, an unpriced model. |
+| `error` | `error: RealtimeError`, `fatal` | `fatal: true` means the session is closing. |
+| `raw` | `message` | Every parsed server frame, with `rawEvents: true`. |
+
+## Audio
+
+| | OpenAI Realtime | Gemini Live |
+| --- | --- | --- |
+| Input | PCM16, 24 kHz, mono | PCM16, mono, at `inputSampleRate` (default 16 kHz; any rate is resampled) |
+| Output | PCM16, 24 kHz, mono | PCM16, 24 kHz, mono |
+| Other formats | G.711 µ-law / A-law via `providerOptions.audio.{input,output}.format` | — |
+
+`session.audioFormat` reports both directions (encoding, sample rate, MIME type). `appendAudio` takes any `ArrayBuffer` or typed array — an `Int16Array` of samples or raw little-endian bytes — and base64-encodes it for the wire.
+
+**Turn detection.** By default both providers detect the end of the user's turn themselves (server VAD) and answer. With `turnDetection: 'manual'`, you end the turn with `commitAudio()` — and on OpenAI ask for the answer with `createResponse()`. On Gemini, manual mode brackets your audio with `activityStart`/`activityEnd` automatically; in automatic mode `commitAudio()` sends `audioStreamEnd` (the microphone went quiet).
+
+**Interruption.** When the user talks over the model, both providers cut the answer short and the session emits `interrupted` — stop playback and drop whatever audio is queued. On OpenAI, call `session.interrupt({ playedMs })` with how much of the answer the user actually heard: it cancels a running response and truncates the assistant's audio to that point, so the conversation history matches what was heard. Gemini Live has no client-side cancel — it stops on its own when the user speaks — so `interrupt()` sends nothing there (the first call emits a warning).
+
+`sendText(text)` adds a user text turn and asks for an answer; `sendText(text, { respond: false })` only adds context.
+
+## Tools
+
+Tools are ordinary Deuz [tools](/docs/agents/tools) — the same `tool()` shape, schemas, `needsApproval` and `timeoutMs` as everywhere in core:
+
+- A tool **with `execute`** runs in this process; its result goes back to the model, which then continues. `execute` gets the usual context — `toolCallId`, an abort `signal`, `deps` and the session's `runtimeContext` — but `messages` is empty: the conversation lives on the provider's side.
+- A tool **without `execute`** is a [client tool](/docs/agents/client-tools): the session emits `tool-call` and waits for `session.sendToolResult(toolCallId, result)` (pass `{ isError: true }` for a failure). Answering a call that is not waiting — already answered, or cancelled — throws a `RealtimeError` with `kind: 'tool'`.
+- `needsApproval` asks `approveToolCall(call)` (a session option). Without an approver, the call is denied and the model hears `Tool call denied.`
+- Unknown tools, unparsable or invalid arguments, a thrown error and a timeout all become an error result the model hears, so the conversation goes on — the same self-healing as the [tool loop](/docs/agents/tool-loop). Timeouts run on `deps.clock`.
+- The calls of one model turn are answered together once all of them settle (Gemini expects one `toolResponse`; OpenAI gets one `response.create`). If the model is already answering something else, the `response.create` waits until that answer is done.
+- Provider-executed tools (`type: 'provider'`) are left out with an `unsupported-tool` warning.
+
+Two safety rules decide which calls run:
+
+- **OpenAI: only a completed response's calls run.** A cancelled, truncated or failed response may carry half-written arguments, so its calls are reported as `tool-call-cancelled` (`reason: 'response-not-completed'`) and never executed.
+- **Gemini: a cancellation stops the call.** A `toolCallCancellation` aborts the tool's `signal`, its result is never sent, and the session emits `tool-call-cancelled` (`reason: 'provider'`).
+
+`toolChoice` maps on OpenAI (`'auto' | 'required' | 'none' | { type: 'tool', toolName }`); Gemini Live has none and warns.
+
+## Usage and pricing
+
+Realtime providers bill audio at several times the text rate, so one aggregate count cannot be priced correctly. Every `usage` event therefore carries both shapes:
+
+- `tokens` — split by modality: `{ text, audio, image }`, each `{ input, cachedInput, output }`. `input` excludes cached tokens; `image` also counts video frames; tokens the provider reports without a modality are counted as text, so nothing is lost.
+- `usage` — the canonical core [`Usage`](/docs/modules/pricing): `inputTokens` excludes cached reads, `outputTokens` includes reasoning (Gemini thoughts), and `audioTokens` is the audio share.
+
+With a `deps.priceProvider`, each response is priced **per modality** through the public `priceUsage` seam, under three keys: text under the model id, audio under `audio:<model>` and images under `image:<model>`. `realtimePriceTable` expands per-modality rates into those rows for `createPriceProvider`:
+
+```ts
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+import { realtimePriceTable } from '@deuz-sdk/core/realtime';
+
+const priceProvider = createPriceProvider({
+  table: realtimePriceTable({
+    // USD per 1M tokens — illustrative; take the numbers from the provider's price page.
+    'gpt-realtime': {
+      text: { input: 4, output: 16, cachedRead: 0.4 },
+      audio: { input: 32, output: 64, cachedRead: 0.4 },
+    },
+  }),
+});
+```
+
+**No realtime prices ship with Deuz** — they could not be verified offline. If a response uses a modality that has no price, the whole response is unpriced (never partially charged): it is reported once per session as an `unpriced-model` warning, its `costUsd` is absent, and the session keeps going. `session.usage` holds the running totals (`usage`, `tokens`, `costUsd`); `deps.onUsage` is called once per response.
+
+Two provider details:
+
+- **OpenAI input transcription is billed separately**, by the transcription model, and is not part of the session's usage.
+- **Gemini usage reports are taken as cumulative within a turn**: the last report of a turn is committed when the turn ends; a report that arrives after the turn adds only what grew since the last committed one; a report still pending when the session closes is billed.
+
+There is no budget enforcement inside a session: watch the `usage` events and `close()` when your limit is reached.
+
+## Configuration
+
+These options configure a session and the token helpers alike:
+
+| Option | OpenAI wire | Gemini wire |
+| --- | --- | --- |
+| `instructions` | `session.instructions` | `setup.systemInstruction` |
+| `voice` | `audio.output.voice` (`marin`, `cedar`, …) | `speechConfig…prebuiltVoiceConfig.voiceName` (`Kore`, …) |
+| `outputModality: 'audio' \| 'text'` | `output_modalities` | `generationConfig.responseModalities` |
+| `maxOutputTokens` | `max_output_tokens` | `generationConfig.maxOutputTokens` |
+| `tools`, `toolChoice` | `tools`, `tool_choice` | `tools[].functionDeclarations` (no tool choice) |
+| `inputTranscription: true \| { model, language, prompt }` | `audio.input.transcription` (default model `gpt-4o-mini-transcribe`) | `inputAudioTranscription` (`language` only) |
+| `outputTranscription` | always on with audio | `outputAudioTranscription` |
+| `turnDetection: 'server' \| 'manual'` | `turn_detection: { type: 'server_vad' }` / `null` | `automaticActivityDetection.disabled` |
+| `inputSampleRate` | 24 kHz only (anything else warns) | input MIME `audio/pcm;rate=…` |
+| `providerOptions` | deep-merged over `session` | deep-merged over `setup` |
+
+### providerOptions
+
+`providerOptions` is the escape hatch for everything the normalized options do not cover. It is deep-merged over the mapped wire object — the OpenAI `session`, or the Gemini `setup`: plain objects merge, arrays and scalars replace, `null` clears, `undefined` is skipped.
+
+```ts
+createRealtimeSession({
+  model,
+  providerOptions: {
+    // OpenAI: semantic VAD, far-field noise reduction
+    audio: { input: { turn_detection: { type: 'semantic_vad' }, noise_reduction: { type: 'far_field' } } },
+  },
+});
+```
+
+On Gemini the same field reaches `realtimeInputConfig`, `sessionResumption`, `contextWindowCompression` and the rest of the setup.
+
+### Session options
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `model` | — | From `createOpenAIRealtime` / `createGeminiLive`. Required. |
+| `ephemeralToken` | unset | A string, or a function that fetches one inside `connect()`. When set, no API key is used. |
+| `approveToolCall` | unset | Server-side approver for `needsApproval` tools. |
+| `runtimeContext` | unset | Forwarded untouched to every tool's `execute` context. |
+| `connectTimeoutMs` | `15000` | Covers the whole connect, token fetch included. Timed on `deps.clock`; `0` or `Infinity` disables it. |
+| `signal` | unset | Aborting closes the session and rejects a pending `connect()`. |
+| `rawEvents` | `false` | Also emit every parsed server frame as a `raw` event. |
+| `deps` | resolved defaults | The usual [`Dependencies`](/docs/core/dependencies) plus `webSocket`. |
+
+Model factories take `apiKey`, `baseURL`, `headers` and `provider`; `createGeminiLive` also takes `apiVersion` (default `v1beta`) and `apiKeyLocation: 'header' | 'query'` (default `'header'`; the query form puts the key in the URL, where proxies may log it).
+
+### Raw escape hatches
+
+`session.sendRaw(message)` sends a provider message as-is (an OpenAI `conversation.item.create` with an image, a Gemini `realtimeInput.video` frame, …), and `rawEvents: true` lets you see every server frame the normalized events do not map.
+
+## Lifecycle and errors
+
+`connect()` resolves on `session-ready`. Calling it again while connecting shares the attempt; a session is **single-use** — after `close()` (or a failure), create a new one. `close()` resolves once `session-closed` was delivered, and is idempotent.
+
+Failures are `RealtimeError`s with a `kind`:
+
+| `kind` | When |
+| --- | --- |
+| `connect-failed` | The socket could not be created (e.g. a browser asked to send a header), or the setup could not be sent. |
+| `connect-timeout` | The provider did not accept the session within `connectTimeoutMs`. |
+| `no-websocket` | The runtime has no `WebSocket` and no `deps.webSocket` was given. |
+| `provider` | The provider reported an error. Before `session-ready` it rejects `connect()`; after, it is non-fatal (the session stays open). |
+| `transport` | The socket reported a network failure (fatal). |
+| `closed` | The connection closed abnormally (`closeCode` says how), or the session is already closed. |
+| `not-connected` | A send on a session that is not open. |
+| `invalid-message` | A server frame that is not a JSON object (non-fatal, ignored). |
+| `tool` | `sendToolResult` for a call that is not waiting. |
+
+A failure before a socket exists (no credential — `AuthenticationError`; a pre-aborted `signal` — `AbortError`; no `WebSocket`) only rejects `connect()`. Once a socket exists, a failure is also a fatal `error` event, followed by `session-closed`. Error messages never contain the API key or token — plain or URL-encoded.
+
+## API at a glance
+
+| Export | What it is |
+| --- | --- |
+| `createRealtimeSession(options)` | Open a session (`RealtimeSession`). |
+| `createOpenAIRealtime(settings)(modelId)` | OpenAI Realtime model descriptor. |
+| `createGeminiLive(settings)(modelId)` | Gemini Live model descriptor. |
+| `createOpenAIClientSecret(options)` | Mint an OpenAI client secret (server side). |
+| `createGeminiAuthToken(options)` | Mint a Gemini auth token (server side). |
+| `realtimePriceTable(prices)` | Per-modality prices → `PriceTable` rows. |
+| `RealtimeError` | The session's error class (`kind`, `closeCode`, `upstreamType`). |
+| Types | `RealtimeSession`, `RealtimeEvent`, `RealtimeSessionOptions`, `RealtimeSessionConfig`, `RealtimeWebSocket`, `RealtimeWebSocketFactory`, `RealtimeTokenBreakdown`, `RealtimeUsageTotals`, `RealtimeModelPrice`, `RealtimeToken`, … |
