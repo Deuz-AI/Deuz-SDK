@@ -172,6 +172,19 @@ describe('OpenAI Realtime — connect', () => {
     expect(server.socket.init.headers).toEqual({ Authorization: 'Bearer sk-provider' });
   });
 
+  it('keeps a plain ws:// or http:// base URL unencrypted (local proxies)', async () => {
+    for (const baseURL of ['ws://localhost:8080/v1', 'http://localhost:8080/v1']) {
+      const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
+      const session = createRealtimeSession({
+        model: createOpenAIRealtime({ apiKey: 'sk', baseURL })('gpt-realtime'),
+        deps: { webSocket: server.webSocket },
+      });
+      await session.connect();
+      expect(server.socket.url).toBe('ws://localhost:8080/v1/realtime?model=gpt-realtime');
+      await session.close();
+    }
+  });
+
   it('refuses to dial without a credential', async () => {
     const server = fakeRealtimeServer((socket) => openaiHandshake(socket));
     const session = createRealtimeSession({

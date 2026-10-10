@@ -47,7 +47,7 @@ const PCM_RATE = 24_000;
 export function openaiRealtimeURL(modelId: string, config: RealtimeModelConfig): string {
   const url = new URL(config.baseURL ?? DEFAULT_BASE_URL);
   url.pathname += url.pathname.endsWith('/') ? 'realtime' : '/realtime';
-  url.protocol = url.protocol === 'http:' ? 'ws:' : 'wss:';
+  url.protocol = url.protocol === 'http:' || url.protocol === 'ws:' ? 'ws:' : 'wss:';
   url.hash = '';
   url.searchParams.set('model', modelId);
   return url.toString();
