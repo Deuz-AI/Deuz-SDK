@@ -122,6 +122,43 @@ jobs:
       - run: npm run typecheck -w @deuz-sdk/core
       - run: npm run test -w @deuz-sdk/core -- test/react.test.ts
 
+  integration:
+    # Real servers for what the offline suite only fakes: the Redis ops, swarm
+    # and runs stores (2.3) against redis:7, and the Postgres stores' concurrent
+    # legs (F23) against postgres:16. A test that needs a server reads
+    # DEUZ_TEST_REDIS_URL or DEUZ_TEST_POSTGRES_URL and skips without it, so the
+    # `check` legs stay offline.
+    name: Integration (Redis 7, Postgres 16)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s
+          --health-retries 10
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: deuz
+          POSTGRES_DB: deuz
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s
+          --health-retries 10
+    env:
+      DEUZ_TEST_REDIS_URL: redis://localhost:6379
+      DEUZ_TEST_POSTGRES_URL: postgres://postgres:deuz@localhost:5432/deuz
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w @deuz-sdk/core
+      - run: npm run test -w @deuz-sdk/core
+
   docs:
     name: Documentation build
     runs-on: ubuntu-latest
