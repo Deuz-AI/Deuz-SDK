@@ -50,7 +50,7 @@ import { serializeChatRecord, deserializeChatRecord } from '../chat';
 import type { MemoryHit, MemoryRecord, MemoryScope, MemoryStore } from '../memory';
 import { matchesScope } from '../memory';
 import type { AgentCheckpoint, SessionStore } from '../types/session';
-import { serializeCheckpoint, deserializeCheckpoint } from '../durable';
+import { serializeCheckpoint, deserializeCheckpoint, CheckpointVersionError } from '../durable';
 import { cosineSimilarity } from '../internal/vector';
 
 // ===================================================================
@@ -226,7 +226,9 @@ function parseChat(json: string): ChatRecord | undefined {
 function parseCheckpoint(json: string): AgentCheckpoint | undefined {
   try {
     return deserializeCheckpoint(json);
-  } catch {
+  } catch (error) {
+    // A newer SDK's checkpoint is not a missing one (2.3).
+    if (error instanceof CheckpointVersionError) throw error;
     return undefined;
   }
 }

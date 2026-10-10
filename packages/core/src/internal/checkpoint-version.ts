@@ -10,6 +10,8 @@ import { DeuzError } from '../errors';
 /** A stored checkpoint in a format this build does not read (2.3). */
 export class CheckpointVersionError extends DeuzError {
   readonly code = 'checkpoint_version_unsupported';
+  /** Never a tool error the model could retry: a sub-agent's resume fails the run. */
+  readonly fatalExecution = true;
   /** The version the checkpoint carries. */
   readonly version: unknown;
   readonly runId?: string;

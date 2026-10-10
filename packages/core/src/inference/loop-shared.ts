@@ -2400,7 +2400,9 @@ export async function executeTools(
             : requestedCap !== undefined && requestedCap > 0
               ? Math.min(requestedCap, deadlineMs)
               : deadlineMs;
-        const timed = capMs !== undefined && capMs > 0 && clock !== undefined;
+        // Infinity means no cap: a host setTimeout clamps it to 1ms (2.3).
+        const timed =
+          capMs !== undefined && capMs > 0 && Number.isFinite(capMs) && clock !== undefined;
         const expiry = timed ? new AbortController() : undefined;
         try {
           // Sub-agent inheritance: a per-call deps clone carries the runtime +

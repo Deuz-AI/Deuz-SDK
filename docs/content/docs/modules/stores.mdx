@@ -118,7 +118,7 @@ If you would rather own the DDL entirely, the [Postgres schema below](#postgres-
 
 The ops, swarm and budget stores of 2.2 are versioned separately, each with a table of its own; their numbers, the indexes 2.3 adds on first use, and how a Postgres schema is upgraded forward are listed in [Schema versions and upgrades](/docs/modules/operations#schema-versions-and-upgrades).
 
-**Checkpoints carry a version too.** Every legacy checkpoint is written with `version: 1`. Since 2.3, `deserializeCheckpoint` and the resume functions refuse any other version with `CheckpointVersionError` (code `checkpoint_version_unsupported`), so a checkpoint written by a newer SDK is never resumed as if this build understood it. The Postgres pack's `sessions.load` passes that error on; the SQLite and Redis packs skip a row they cannot read, so the resume reports the checkpoint as not found instead.
+**Checkpoints carry a version too.** Every legacy checkpoint is written with `version: 1`. Since 2.3, `deserializeCheckpoint` and the resume functions refuse any other version with `CheckpointVersionError` (code `checkpoint_version_unsupported`), so a checkpoint written by a newer SDK is never resumed as if this build understood it. Every store pack's `sessions.load` (Postgres, SQLite and Redis) passes that error on, so the resume reports the version instead of a missing checkpoint; a row that is not a checkpoint at all still reads as missing in the SQLite and Redis packs.
 
 ---
 

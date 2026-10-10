@@ -18,6 +18,7 @@ import type { StreamPart } from './types/stream';
 import type { ExecutionContextSnapshot, NativeExecutionContext } from './types/execution';
 import { createBroadcaster, createDeferred } from './internal/async-iter';
 import { resolveDependencies } from './internal/resolve-deps';
+import { createWarningSink } from './internal/warnings';
 import { parsePartialJson } from './internal/partial-json';
 import { foldCallInput } from './generate';
 import { inputShapeError } from './core/normalize';
@@ -826,6 +827,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         finalizeTools = wire && wire.tools.length > 0 ? { ...wire, toolChoice: 'none' } : undefined;
         return finalizeTools;
       };
+      // One sink for every finalization attempt, so a re-drive does not repeat
+      // a warning its first attempt already reported.
+      const finalizeWarnings = createWarningSink(resolveDependencies(options.deps).logger);
       for (;;) {
         if (envelope.candidateText === undefined) {
           if (!(await checkLimit())) return;
@@ -863,6 +867,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               toolChoice: undefined,
               session: undefined,
               mcp: undefined,
+              // The requested mode, so a 'tool' the model cannot take is
+              // reported like generateObject's (2.3, F26).
+              ...(output?.mode !== undefined ? { mode: output.mode } : {}),
             },
             {
               ...(output && outputSchema
@@ -877,6 +884,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                   }
                 : {}),
               ...(toolRequest ? { tools: toolRequest } : {}),
+              warnings: finalizeWarnings,
             },
           );
           let buffer = '';
@@ -956,7 +964,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           // exactly as the loop reports it after each step.
           if (toolRequest) {
             const totals = common.execution!.ledger.totals(common.execution!.scopeId);
-            if (totals.unknownUsd === 0)
+            // Unpriced calls add nothing to the cost (2.3), as in the loop.
+            if (totals.unknownUsd - (totals.unpriced ?? 0) === 0)
               emitPart(
                 {
                   type: 'cost',

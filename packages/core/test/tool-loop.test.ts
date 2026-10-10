@@ -1222,6 +1222,34 @@ describe('per-tool timeout (self-healing, clock-driven)', () => {
     expect(String(res.steps![0]!.toolResults[0]!.result)).toContain('timed out after 25ms');
   });
 
+  it('an Infinity cap arms no timer: a host clamps it to 1ms (2.3)', async () => {
+    const { clock, timers } = fakeClock();
+    const model = createMockModel({
+      responses: [
+        { toolCalls: [{ toolName: 'own', args: {} }] },
+        { toolCalls: [{ toolName: 'call', args: {} }] },
+        { text: 'done' },
+      ],
+    });
+    const res = await generateText({
+      model,
+      prompt: 'go',
+      tools: {
+        own: { parameters: EMPTY, timeoutMs: Infinity, execute: async () => 'own ok' },
+        call: { parameters: EMPTY, execute: async () => 'call ok' },
+      },
+      maxSteps: 3,
+      timeout: { toolMs: Infinity },
+      deps: { clock },
+    });
+    expect(timers.some((t) => !Number.isFinite(t.ms))).toBe(false);
+    expect(res.steps!.map((s) => s.toolResults[0]?.result)).toEqual([
+      'own ok',
+      'call ok',
+      undefined,
+    ]);
+  });
+
   it('no cap = 1.8 behaviour: the caller’s signal passes through untouched', async () => {
     const controller = new AbortController();
     let seenSignal: AbortSignal | undefined;

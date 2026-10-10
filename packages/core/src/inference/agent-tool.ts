@@ -19,6 +19,7 @@ import {
 } from './stream-tool-loop';
 import { SubAgentSuspension } from './loop-shared';
 import { readInheritedObserve } from '../internal/observe-runtime';
+import { assertCheckpointVersion } from '../internal/checkpoint-version';
 import { toObservedError } from '../internal/observe-error';
 
 export interface AgentToolDef {
@@ -118,6 +119,8 @@ export function agentTool(def: AgentToolDef): Tool {
       ];
       if (childSession) {
         const checkpoint = await childSession.store.load(childSession.runId);
+        // A child checkpoint a newer SDK wrote is never resumed as if understood (2.3).
+        if (checkpoint) assertCheckpointVersion(checkpoint, childSession.runId);
         if (checkpoint && (checkpoint.status === 'suspended' || ctx.execution)) {
           if (ctx.execution && checkpoint.status === 'completed') {
             const last = [...checkpoint.messages].reverse().find((m) => m.role === 'assistant');

@@ -420,3 +420,28 @@ describe('native finalization across provider wires (F15)', () => {
     },
   );
 });
+
+describe("runAgent reports an output mode 'tool' the model cannot take (2.3, F26)", () => {
+  it('streams one clamped-setting warning in the finalizing phase', async () => {
+    const sequence = mockFetchSequence([
+      () => sseResponse([turn([{ type: 'text', text: 'Rome is mild.' }])]),
+      () => sseResponse([turn([{ type: 'text', text: '{"a":"mild"}' }])]),
+    ]);
+    const stream = streamAgent({
+      model: createAnthropic({ apiKey: 'k', fetch: sequence.fetch })('claude-opus-5-5'),
+      prompt: 'Weather in Rome as JSON.',
+      output: { schema: OBJ, mode: 'tool', validate: (value: unknown) => value as { a: string } },
+    });
+    const events: AgentEvent<{ a: string }>[] = [];
+    for await (const event of stream.events) events.push(event);
+    expect(await stream.result).toMatchObject({ status: 'completed', output: { a: 'mild' } });
+    const clamps = events.filter(
+      (e) => e.type === 'part' && e.part.type === 'warning' && e.part.warning.setting === 'mode',
+    );
+    expect(clamps).toHaveLength(1);
+    expect(clamps[0]).toMatchObject({
+      phase: 'finalizing',
+      part: { warning: { type: 'clamped-setting' } },
+    });
+  });
+});

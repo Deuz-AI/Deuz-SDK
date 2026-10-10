@@ -279,6 +279,19 @@ describe('timeout layers (1.9)', () => {
     await expect(result.usage).rejects.toMatchObject({ code: 'timeout', layer: 'total' });
   });
 
+  it('`Infinity` disables a layer like `0`: a host clamps it to a 1ms timer (2.3)', async () => {
+    const clock = controlledClock();
+    const result = streamChat({
+      model: anthropic((async () => sseResponse([OK_STREAM])) as typeof fetch),
+      messages: [{ role: 'user', content: 'hi' }],
+      timeout: { ttftMs: Infinity, totalMs: Infinity, stepMs: Infinity, chunkMs: Infinity },
+      deps: { clock: clock.clock, generateId: () => 'fixed-id' },
+    });
+    expect(await drain(result.textStream)).toBeUndefined();
+    expect(await result.finishReason).toBe('stop');
+    expect(clock.armed()).toEqual([]);
+  });
+
   it('a user abort still resolves "aborted" with partial usage — the two paths stay distinct', async () => {
     const clock = controlledClock();
     const controller = new AbortController();

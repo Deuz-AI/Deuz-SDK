@@ -20,7 +20,7 @@
  */
 import type { ChatRecord, ChatStore } from '../chat';
 import { serializeChatRecord, deserializeChatRecord } from '../chat';
-import { serializeCheckpoint, deserializeCheckpoint } from '../durable';
+import { serializeCheckpoint, deserializeCheckpoint, CheckpointVersionError } from '../durable';
 import type { MemoryHit, MemoryKind, MemoryRecord, MemoryScope, MemoryStore } from '../memory';
 import type { AgentCheckpoint, SessionStore } from '../types/session';
 import type { RunRecord, RunStore } from '../types/runtime';
@@ -924,7 +924,9 @@ export function createSqliteStores(options: SqliteStoreOptions): SqliteStores {
       if (json === undefined) return undefined;
       try {
         return deserializeCheckpoint(json);
-      } catch {
+      } catch (error) {
+        // A newer SDK's checkpoint is not a missing one (2.3).
+        if (error instanceof CheckpointVersionError) throw error;
         return undefined;
       }
     },

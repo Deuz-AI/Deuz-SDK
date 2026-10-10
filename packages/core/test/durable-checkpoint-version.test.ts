@@ -10,6 +10,8 @@ import {
   serializeCheckpoint,
 } from '../src/durable';
 import { createPostgresStores } from '../src/node/store-postgres';
+import { createSqliteStores } from '../src/node/store-sqlite';
+import { createRedisStores, type RedisClientLike } from '../src/node/store-redis';
 import type { PgClientLike } from '../src/node/store-postgres';
 import type { StreamPart } from '../src/types/stream';
 import type { AgentCheckpoint, SessionStore } from '../src/types/session';
@@ -129,5 +131,40 @@ describe('checkpoint version (2.3)', () => {
       await expect(failure).rejects.not.toBeInstanceOf(CheckpointNotFoundError);
       expect(spy).not.toHaveBeenCalled();
     });
+  });
+
+  it('reports the version through the SQLite store pack, not a missing run', async () => {
+    const stores = createSqliteStores({ path: ':memory:' });
+    try {
+      await stores.sessions.save(checkpoint(2, 'run-sqlite'));
+      await expect(stores.sessions.load('run-sqlite')).rejects.toBeInstanceOf(
+        CheckpointVersionError,
+      );
+      const { model, spy } = untouchedModel();
+      const failure = resumeFromCheckpoint(stores.sessions, 'run-sqlite', { model, maxSteps: 3 });
+      await expect(failure).rejects.toBeInstanceOf(CheckpointVersionError);
+      expect(spy).not.toHaveBeenCalled();
+      await stores.sessions.save(checkpoint(1, 'run-ok'));
+      expect((await stores.sessions.load('run-ok'))?.runId).toBe('run-ok');
+    } finally {
+      await stores.close();
+    }
+  });
+
+  it('reports the version through the Redis store pack, not a missing run', async () => {
+    const values = new Map<string, string>();
+    const client = {
+      get: async (key: string) => values.get(key) ?? null,
+      set: async (key: string, value: string) => void values.set(key, value),
+      sAdd: async () => 1,
+    } as unknown as RedisClientLike;
+    const stores = createRedisStores({ client });
+    await stores.sessions.save(checkpoint(2, 'run-redis'));
+    await expect(stores.sessions.load('run-redis')).rejects.toBeInstanceOf(CheckpointVersionError);
+    // A record that is not a checkpoint at all still reads as missing.
+    await stores.sessions.save(checkpoint(1, 'run-junk'));
+    const [junkKey] = [...values.keys()].filter((key) => key.includes('run-junk'));
+    values.set(junkKey!, '{not json');
+    expect(await stores.sessions.load('run-junk')).toBeUndefined();
   });
 });

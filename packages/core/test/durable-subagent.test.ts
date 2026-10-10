@@ -1,6 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { generateText, streamChat, agentTool } from '../src/index';
-import { createInMemorySessionStore, resumeFromCheckpoint } from '../src/durable';
+import {
+  CheckpointVersionError,
+  createInMemorySessionStore,
+  resumeFromCheckpoint,
+} from '../src/durable';
 import { handoff } from '../src/inference/handoff';
 import { createMockModel, type MockResponse } from '../src/testing';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
@@ -270,6 +274,26 @@ describe('durable sub-agent client-mode approval — resume', () => {
     const parent = await store.load('run-sub');
     expect(parent?.status).toBe('completed');
     expect(parent?.usage.totalTokens).toBe(82);
+  });
+
+  it('refuses a child checkpoint a newer SDK wrote, before the child runs (2.3)', async () => {
+    const store = createInMemorySessionStore();
+    const dangerFn = vi.fn(async () => 'dangerous result');
+    await suspend(store, dangerFn);
+    const child = await store.load('run-sub::worker#call_w');
+    await store.save({ ...child!, version: 2 } as unknown as typeof child & object);
+
+    const { fetch, calls } = mockFetchSequence([() => sseResponse([textSse('never')])]);
+    const resumed = resumeFromCheckpoint(store, 'run-sub', {
+      model: model(fetch),
+      tools: workerTools(fetch, dangerFn),
+      approvalResponses: [{ approvalId: 'call_d', approved: true }],
+      maxSteps: 5,
+    });
+    // Fatal, not a tool error the model could retry: no call at all.
+    await expect(resumed).rejects.toBeInstanceOf(CheckpointVersionError);
+    expect(dangerFn).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
   });
 
   it('denied verdict feeds an is_error into the child, which recovers', async () => {
