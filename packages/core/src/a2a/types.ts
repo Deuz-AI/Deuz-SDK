@@ -513,7 +513,7 @@ export interface A2AArtifactOptions {
 export interface A2AExecutionContext {
   /** The message that started this turn, with `taskId` and `contextId` filled in. */
   readonly message: A2AMessage;
-  /** The task as it was when the turn started; `undefined` for a new interaction. */
+  /** The task this turn continues, its `history` ending with `message`; `undefined` for a new interaction. */
   readonly task: A2ATask | undefined;
   /** The task's id: the existing task's, or the one a new task gets. */
   readonly taskId: string;
