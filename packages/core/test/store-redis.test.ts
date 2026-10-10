@@ -870,7 +870,7 @@ describe('createRedisStores — connection lifecycle', () => {
     const stores = create({ url: 'redis://localhost:6379' });
 
     await expect(stores.memory.list({ userId: 'user-a' })).rejects.toThrow(
-      /optional peer `redis` \(node-redis v4 or v5\).*npm i redis/s,
+      /optional peer `redis` \(node-redis v4, v5 or v6\).*npm i redis/s,
     );
     // Every seam funnels through the same accessor, so the message is the same
     // whichever one the caller reached for first.

@@ -57,6 +57,7 @@ import type { AgentCheckpoint, SessionStore } from '../types/session';
 import type { RunRecord, RunStatus, RunStore } from '../types/runtime';
 import { serializeCheckpoint, deserializeCheckpoint, CheckpointVersionError } from '../durable';
 import { cosineSimilarity } from '../internal/vector';
+import { redisConnection } from './redis-scripts';
 
 // ===================================================================
 // The client seam
@@ -161,16 +162,6 @@ export function wrapIoredisClient(client: IoredisClientLike): Required<RedisClie
   };
 }
 
-/** What the `{ url }` path opens for itself — the seam plus its lifecycle. */
-interface ManagedRedisClient extends RedisClientLike {
-  connect(): Promise<unknown>;
-  quit(): Promise<unknown>;
-}
-
-interface RedisModule {
-  createClient(options: { url: string }): ManagedRedisClient;
-}
-
 export type RedisStoreOptions =
   | {
       /**
@@ -185,9 +176,9 @@ export type RedisStoreOptions =
   | {
       /**
        * Connection string for the convenience path. `redis` (node-redis
-       * `^4.6.0 || ^5.0.0`) is an OPTIONAL peer, imported lazily on the first
-       * command — construction itself never touches it — and `close()` quits
-       * exactly this client, because the store opened it.
+       * `^4.6.0 || ^5.0.0 || ^6.0.0`) is an OPTIONAL peer, imported lazily on the
+       * first command — construction itself never touches it — and `close()`
+       * quits exactly this client, because the store opened it.
        */
       url: string;
       prefix?: string;
@@ -368,23 +359,6 @@ function matchesMetadataFilter(
   );
 }
 
-async function openClient(url: string): Promise<ManagedRedisClient> {
-  let mod: RedisModule;
-  try {
-    // `as string` keeps tsup's dts builder from statically resolving the
-    // optional peer (matches node/browser.ts and rag-node.ts).
-    mod = (await import('redis' as string)) as unknown as RedisModule;
-  } catch (err) {
-    throw new Error(
-      'createRedisStores({ url }) requires the optional peer `redis` (node-redis v4 or v5). Install it with `npm i redis`, or pass a client you connected yourself: createRedisStores({ client }).',
-      { cause: err },
-    );
-  }
-  const client = mod.createClient({ url });
-  await client.connect();
-  return client;
-}
-
 // ===================================================================
 // The pack
 // ===================================================================
@@ -407,33 +381,12 @@ async function openClient(url: string): Promise<ManagedRedisClient> {
  */
 export function createRedisStores(options: RedisStoreOptions): RedisStores {
   const k = keyspace(options.prefix ?? DEFAULT_PREFIX);
-  let opened: Promise<ManagedRedisClient> | undefined;
-  let closed = false;
-
+  const connection = redisConnection<RedisClientLike>(options, {
+    factory: 'createRedisStores',
+    noun: 'store pack',
+  });
   /** The client for the next command (injected as-is, or lazily opened ONCE). */
-  const use = async (): Promise<RedisClientLike> => {
-    if ('client' in options) return options.client;
-    if (closed) {
-      throw new Error(
-        'createRedisStores({ url }): this store pack is closed. close() quit the connection it ' +
-          'opened, and a closed pack does not reconnect — silently opening a second connection ' +
-          'nobody will ever quit is how a long-lived process runs out of them. Build a new pack ' +
-          'with createRedisStores({ url }), or inject a client whose lifecycle you own: ' +
-          'createRedisStores({ client }).',
-      );
-    }
-    const pending = opened ?? openClient(options.url);
-    if (pending !== opened) {
-      opened = pending;
-      // A failed connect must not poison the pack for its whole life: forget
-      // the rejected promise so the next call retries instead of replaying it.
-      // Guarded by identity, so a later successful connection is never dropped.
-      pending.catch(() => {
-        if (opened === pending) opened = undefined;
-      });
-    }
-    return pending;
-  };
+  const use = connection.use;
 
   // --- memory plumbing ------------------------------------------------------
 
@@ -806,15 +759,6 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
     sessions,
     runs,
     sweepExpiredMemories: (now = Date.now()) => deleteExpiredRecords(now),
-    async close() {
-      // Marked before the await: `use()` reads this flag, so a call racing the
-      // quit must not slip through and re-open behind it.
-      closed = true;
-      const pending = opened;
-      opened = undefined;
-      if (!pending) return; // injected client, or never connected — not ours
-      const client = await pending.catch(() => undefined);
-      await client?.quit();
-    },
+    close: connection.close,
   };
 }
