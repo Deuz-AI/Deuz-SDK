@@ -207,6 +207,33 @@ describe.each(SDK_LINES)('createMcpClient over HTTP [%s SDK]', (sdk) => {
       expect(await tools.tool6!.execute!({}, TOOL_CTX)).toBe('ran 6');
     });
 
+    it("a paginated walk keeps the SDK's outputSchema check for EVERY page, not just the last", async () => {
+      // The v1 SDK compiles its output validators from each listTools() page and
+      // drops the previous page's, so a cursor walk used to leave only the last
+      // page checked. `weather` is on page one and breaks its own outputSchema.
+      const server = await startServer({
+        toolsPageSize: 1,
+        tools: [
+          {
+            name: 'weather',
+            outputSchema: {
+              type: 'object',
+              properties: { tempC: { type: 'number' } },
+              required: ['tempC'],
+            },
+            handler: () => ({ tempC: 'hot' }),
+          },
+          { name: 'other', handler: () => 'ok' },
+        ],
+      });
+      const client = await connect(sdk, server.url);
+
+      const tools = await client.listTools();
+      expect(Object.keys(tools)).toEqual(['weather', 'other']);
+      await expect(tools.weather!.execute!({}, TOOL_CTX)).rejects.toThrow(/output schema/i);
+      expect(await tools.other!.execute!({}, TOOL_CTX)).toBe('ok');
+    });
+
     it('execute() round-trips over the wire: text, structuredContent priority, is_error self-heal', async () => {
       const server = await startServer();
       const client = await connect(sdk, server.url);
