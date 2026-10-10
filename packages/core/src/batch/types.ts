@@ -102,7 +102,10 @@ export interface BatchJob {
   readonly requests: readonly BatchJobRequest[];
   /** Notices from building the requests: dropped or clamped settings, an unpriced model. */
   readonly warnings?: readonly CallWarning[];
-  /** Set once every result was read and every hold closed. */
+  /**
+   * Set once every result was read: every hold is settled, released, or left
+   * unknown for a `BudgetStore.sweep` (reading again would not change it).
+   */
   readonly closedAt?: number;
 }
 
@@ -235,7 +238,8 @@ export interface BatchWaitOptions extends BatchCallOptions {
 export interface BatchResultsOptions extends BatchCallOptions {
   /**
    * Schemas to validate `object` with, by request id. The client keeps the
-   * ones it submitted in memory; a new process passes them here.
+   * ones it submitted in memory until the job's results were read once; a
+   * later read, or a new process, passes them here.
    */
   readonly schemas?: Readonly<Record<string, StandardSchemaV1 | JSONSchema>>;
 }

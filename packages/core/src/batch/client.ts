@@ -339,6 +339,8 @@ export function createBatchClient(options: BatchClientOptions): BatchClient {
       await close(request, how);
       yield result;
     }
+    // Every result was read: a long-lived client keeps no schemas for the job.
+    schemas.delete(job.id);
     if (options.store) {
       try {
         await options.store.put({ ...job, closedAt: deps.clock.now() });

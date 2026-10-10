@@ -209,6 +209,21 @@ describe('structured requests', () => {
     });
   });
 
+  it('forgets a job’s schemas once its results were read, so a long-lived client does not grow', async () => {
+    const { server, batch } = anthropicSetup();
+    const job = await batch.submit([{ id: 'a', prompt: 'x', schema: Label }]);
+    server.finish(job.id, {
+      a: { type: 'succeeded', message: message([{ type: 'text', text: '{"label":"eggs"}' }]) },
+    });
+    const [first] = await batch.collect(job);
+    expect(first!.error).toBeInstanceOf(NoObjectGeneratedError);
+    // A second pass validates only with the schemas it is given.
+    const [again] = await batch.collect(job);
+    expect(again).toMatchObject({ object: { label: 'eggs' } });
+    const [checked] = await batch.collect(job, { schemas: { a: Label } });
+    expect(checked!.error).toBeInstanceOf(NoObjectGeneratedError);
+  });
+
   it('validates with the schemas a new client is given', async () => {
     const { server, model, batch } = anthropicSetup();
     const job = await batch.submit([{ id: 'a', prompt: 'x', schema: Label }]);

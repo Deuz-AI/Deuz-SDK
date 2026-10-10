@@ -149,7 +149,7 @@ A `BatchJob` is plain JSON: store it anywhere and hand it to another process. It
 
 A structured request whose object does not parse or validate keeps `status: 'succeeded'`, because it ran and was billed, and carries a `NoObjectGeneratedError`. There is no repair attempt: resubmit it in the next batch. A request the provider never answered comes back with `status: 'cancelled'` or `'expired'` when the batch was cancelled or expired, and as `'errored'` otherwise.
 
-The client keeps the schemas of the batches it submitted in memory. A new process passes them to `results(job, { schemas: { q1: LabelSchema } })`; without one the object is parsed but not validated.
+The client keeps the schemas of the batches it submitted in memory until their results were read once. A later read, or a new process, passes them to `results(job, { schemas: { q1: LabelSchema } })`; without one the object is parsed but not validated.
 
 ## Pricing on the batch tier
 
@@ -234,7 +234,7 @@ await store.sweep({
 
 ## Resuming after a restart
 
-Pass a `store` and every submitted job is recorded; `pending()` lists the jobs whose results were not all read, oldest first, and a job is marked closed (`closedAt`) once every result was read. `createMemoryBatchJobStore()` keeps them in memory; any `BatchJobStore` (`put`, `get`, `list`, `delete`) keeps them in your database, one JSON row per `job.id`.
+Pass a `store` and every submitted job is recorded; `pending()` lists the jobs whose results were not all read, oldest first, and a job is marked closed (`closedAt`) once every result was read: its holds are then settled, released, or left unknown for a sweep. `createMemoryBatchJobStore()` keeps them in memory; any `BatchJobStore` (`put`, `get`, `list`, `delete`) keeps them in your database, one JSON row per `job.id`.
 
 ```ts
 import { createBatchClient, createMemoryBatchJobStore } from '@deuz-sdk/core/batch';
