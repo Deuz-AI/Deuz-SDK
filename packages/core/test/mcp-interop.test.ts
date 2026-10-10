@@ -34,7 +34,7 @@ import {
   Client as V2Client,
   StreamableHTTPClientTransport as V2HttpTransport,
 } from '@modelcontextprotocol/client';
-import { createMcpClient } from '../src/mcp/index';
+import { createMcpClient, fingerprintTools } from '../src/mcp/index';
 import { createStdioMcpClient, type McpSdkLine } from '../src/mcp/stdio';
 import { createMcpServer, type DeuzMcpServer } from '../src/mcp/server';
 import type { ToolSet } from '../src/types/tool';
@@ -214,6 +214,31 @@ describe.each(CLIENTS)('MCP interop over HTTP — %s client', (client) => {
       expect(await s.call('boom', {})).toEqual({ error: 'tool exploded' });
     },
   );
+});
+
+describe('MCP interop — one catalog, one fingerprint', () => {
+  // A native run pins the MCP catalog's fingerprint in its resume binding, so a
+  // catalog must hash the same whichever client line reads it and whichever
+  // server SDK (and protocol era) serves it — installing the v2 SDK between a
+  // suspend and its resume must not read as a "catalog changed" rug pull.
+  it('fingerprints identically across client lines, eras and server SDKs', async () => {
+    const prints = new Set<string>();
+    for (const server of SERVERS) {
+      for (const options of [
+        { sdk: 'v1' as const },
+        { sdk: 'v2' as const },
+        { sdk: 'v2' as const, versionNegotiation: 'legacy' as const },
+      ]) {
+        const client = await createMcpClient({
+          transport: { type: 'http', url: urls[server] },
+          ...options,
+        });
+        closables.push(client);
+        prints.add((await fingerprintTools(await client.listTools())).fingerprint);
+      }
+    }
+    expect(prints.size).toBe(1);
+  });
 });
 
 describe('MCP interop — protocol negotiation, both directions', () => {
