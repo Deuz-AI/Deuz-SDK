@@ -280,7 +280,8 @@ export async function inBatches(
   let total = 0;
   for (;;) {
     const removed = await batch(size);
+    // A full batch runs again; anything else, a malformed reply included, ends it.
+    if (!(removed >= size)) return removed >= 0 ? total + removed : total;
     total += removed;
-    if (removed < size) return total;
   }
 }

@@ -7,6 +7,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   hexUnits,
+  inBatches,
   redisStoreTag,
   replyList,
   replyNumber,
@@ -28,6 +29,30 @@ describe('redisStoreTag', () => {
   it('refuses a prefix that would move or empty the tag', () => {
     for (const prefix of ['', '{app', 'app}', '}x', 7 as unknown as string])
       expect(() => redisStoreTag(prefix, 'ops'), String(prefix)).toThrow(TypeError);
+  });
+});
+
+describe('inBatches', () => {
+  it('runs a full batch again and stops at a short one, totalling both', async () => {
+    const replies = [4, 4, 2, 4];
+    const sizes: number[] = [];
+    const total = await inBatches(4, async (size) => {
+      sizes.push(size);
+      return replies.shift()!;
+    });
+    expect(total).toBe(10);
+    expect(sizes).toEqual([4, 4, 4]);
+  });
+
+  it('stops at a malformed count instead of looping forever', async () => {
+    let calls = 0;
+    expect(
+      await inBatches(4, async () => {
+        calls++;
+        return calls === 1 ? 4 : Number.NaN;
+      }),
+    ).toBe(4);
+    expect(calls).toBe(2);
   });
 });
 

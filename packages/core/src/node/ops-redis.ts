@@ -368,7 +368,8 @@ export function createRedisOpsStore(options: RedisOpsStoreOptions): RedisOpsStor
           await leasePruneScript(client, leaseKeys, [arg(before), arg(offset), arg(PRUNE_BATCH)]),
         ).map(replyNumber);
         total += pruned ?? 0;
-        if ((examined ?? 0) < PRUNE_BATCH) return total;
+        // A full batch pages on; anything else, a malformed reply included, ends it.
+        if (!((examined ?? 0) >= PRUNE_BATCH)) return total;
         offset += kept ?? 0;
       }
     },
