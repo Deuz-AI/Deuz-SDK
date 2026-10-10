@@ -203,7 +203,8 @@ export interface RealtimeSessionOptions extends RealtimeSessionConfig {
   runtimeContext?: unknown;
   /**
    * How long `connect()` waits for the provider to accept the session, token
-   * fetch included. Timed on `deps.clock`. Default 15 000 ms.
+   * fetch included. Timed on `deps.clock`. Default 15 000 ms; `0` or
+   * `Infinity` disables it.
    */
   connectTimeoutMs?: number;
   /** Aborting closes the session (and rejects a pending `connect()`). */

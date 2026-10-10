@@ -798,16 +798,19 @@ export function createRealtimeSession(options: RealtimeSessionOptions): Realtime
     status = 'connecting';
     connectAttempt = deferred<void>();
     const attempt = connectAttempt.promise;
-    // The timeout covers the whole attempt, token fetch included.
-    cancelConnectTimer = deps.clock.setTimeout(() => {
-      failConnect(
-        realtimeError(
-          'connect-timeout',
-          `${protocol.label} did not accept the session within ${connectTimeoutMs} ms.`,
-        ),
-        { closeReason: 'connect timeout' },
-      );
-    }, connectTimeoutMs);
+    // The timeout covers the whole attempt, token fetch included. 0 or Infinity
+    // disables it (a host timer would clamp Infinity to 1 ms).
+    if (connectTimeoutMs > 0 && Number.isFinite(connectTimeoutMs)) {
+      cancelConnectTimer = deps.clock.setTimeout(() => {
+        failConnect(
+          realtimeError(
+            'connect-timeout',
+            `${protocol.label} did not accept the session within ${connectTimeoutMs} ms.`,
+          ),
+          { closeReason: 'connect timeout' },
+        );
+      }, connectTimeoutMs);
+    }
     if (options.signal?.aborted) {
       failConnect(
         new AbortError('The realtime session was aborted.', { cause: options.signal.reason }),

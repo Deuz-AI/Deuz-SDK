@@ -357,7 +357,7 @@ On Gemini the same field reaches `realtimeInputConfig`, `sessionResumption`, `co
 | `ephemeralToken` | unset | A string, or a function that fetches one inside `connect()`. When set, no API key is used. |
 | `approveToolCall` | unset | Server-side approver for `needsApproval` tools. |
 | `runtimeContext` | unset | Forwarded untouched to every tool's `execute` context. |
-| `connectTimeoutMs` | `15000` | Covers the whole connect, token fetch included. Timed on `deps.clock`. |
+| `connectTimeoutMs` | `15000` | Covers the whole connect, token fetch included. Timed on `deps.clock`; `0` or `Infinity` disables it. |
 | `signal` | unset | Aborting closes the session and rejects a pending `connect()`. |
 | `rawEvents` | `false` | Also emit every parsed server frame as a `raw` event. |
 | `deps` | resolved defaults | The usual [`Dependencies`](/docs/core/dependencies) plus `webSocket`. |

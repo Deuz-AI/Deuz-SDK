@@ -13,6 +13,7 @@ import {
   flush,
   FakeRealtimeSocket,
 } from './fixtures/realtime-socket';
+import { manualClock } from './fixtures/manual-clock';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -199,6 +200,24 @@ describe('session lifecycle edges', () => {
     expect(await pending).toMatchObject({ kind: 'closed' });
     expect(server.sockets).toHaveLength(0);
     expect(session.status).toBe('closed');
+  });
+
+  it('arms no connect timer when connectTimeoutMs is 0 or Infinity', async () => {
+    for (const connectTimeoutMs of [0, Number.POSITIVE_INFINITY]) {
+      const { clock, pending } = manualClock();
+      const server = fakeRealtimeServer(); // never accepts
+      const session = createRealtimeSession({
+        model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+        connectTimeoutMs,
+        deps: { webSocket: server.webSocket, clock },
+      });
+      const attempt = session.connect().catch((error: unknown) => error);
+      await flush();
+      expect(pending()).toBe(0);
+      expect(session.status).toBe('connecting');
+      await session.close();
+      expect(await attempt).toMatchObject({ kind: 'closed' });
+    }
   });
 
   it('rejects an already-aborted connect without dialing', async () => {
