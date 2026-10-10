@@ -280,6 +280,33 @@ describe('Postgres budget store retries (2.3)', () => {
     expect(await store.usage('user:1')).toEqual({ tokens: 10, usd: 0 });
   });
 
+  it('closes a hold whose settlement ran out of retries with its real usage, by sweep (2.3)', async () => {
+    const schema = await freshSchema();
+    const pg = contended();
+    const store = createPostgresBudgetStore({ client: pg.client, schema });
+    await store.reserve({ requestId: 'call-1', modelId: 'm', tokens: 90, scopes: [scope] });
+    pg.fail(/WITH target AS/, Infinity);
+    await expect(store.settle('call-1', { tokens: 12, usd: 0 })).rejects.toMatchObject({
+      code: '40001',
+    });
+    pg.fail(/^$/, 0);
+    // The estimate is still held, so the budget looks nearly spent.
+    expect(await store.usage('user:1')).toEqual({ tokens: 90, usd: 0 });
+    const [hold] = await store.holds({ before: Date.now() + 1_000 });
+    expect(hold).toMatchObject({ requestId: 'call-1', tokens: 90, keys: ['user:1'] });
+    // The caller's own records know what the call really used.
+    const actual: Record<string, { tokens: number; usd: number }> = {
+      'call-1': { tokens: 12, usd: 0 },
+    };
+    expect(
+      await store.sweep({
+        before: Date.now() + 1_000,
+        resolve: (open) => actual[open.requestId] ?? 'keep',
+      }),
+    ).toEqual({ settled: 1, released: 0, skipped: 0 });
+    expect(await store.usage('user:1')).toEqual({ tokens: 12, usd: 0 });
+  });
+
   it('gives up on a reserve after five attempts with the driver error', async () => {
     const schema = await freshSchema();
     const pg = contended();

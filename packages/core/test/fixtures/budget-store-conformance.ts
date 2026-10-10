@@ -405,5 +405,151 @@ export function budgetStoreContracts(
         ).toMatchObject({ admitted: false, committed: 40 });
       },
     );
+
+    it('lists the holds still open before a time, oldest first, a page at a time (2.3)', async () => {
+      const { store, advance, now } = await make();
+      const scope = user(1_000, { key: 'user:h' });
+      const org = { key: 'org:h', limits: { tokens: 10_000 } };
+      await store.reserve({
+        requestId: 'b',
+        modelId: 'm1',
+        tokens: 10,
+        usd: 0.5,
+        scopes: [scope, org],
+      });
+      await advance(10);
+      await store.reserve({ requestId: 'a', modelId: 'm2', tokens: 20, scopes: [scope] });
+      await store.reserve({ requestId: 'settled', modelId: 'm', tokens: 5, scopes: [scope] });
+      await store.settle('settled', { tokens: 5, usd: 0 });
+      expect(
+        await store.reserve({ requestId: 'denied', modelId: 'm', tokens: 5_000, scopes: [scope] }),
+      ).toMatchObject({ admitted: false });
+      await advance(10);
+      const cut = now();
+      await store.reserve({ requestId: 'late', modelId: 'm', tokens: 1, scopes: [scope] });
+
+      const holds = await store.holds!({ before: cut });
+      expect(holds).toEqual([
+        {
+          requestId: 'b',
+          modelId: 'm1',
+          tokens: 10,
+          usd: 0.5,
+          reservedAt: expect.any(Number),
+          keys: ['user:h', 'org:h'],
+        },
+        {
+          requestId: 'a',
+          modelId: 'm2',
+          tokens: 20,
+          usd: 0,
+          reservedAt: expect.any(Number),
+          keys: ['user:h'],
+        },
+      ]);
+      expect(holds[0]!.reservedAt).toBeLessThan(holds[1]!.reservedAt);
+      expect(holds[1]!.reservedAt).toBeLessThan(cut);
+      const [first] = await store.holds!({ before: cut, limit: 1 });
+      expect(first?.requestId).toBe('b');
+      expect(
+        (await store.holds!({ before: cut, limit: 1, after: first })).map((hold) => hold.requestId),
+      ).toEqual(['a']);
+      expect(await store.holds!({ before: cut, after: holds[1] })).toEqual([]);
+      expect((await store.holds!({ before: now() + 1 })).map((hold) => hold.requestId)).toEqual([
+        'b',
+        'a',
+        'late',
+      ]);
+      await expect(store.holds!({ before: Number.NaN })).rejects.toThrow(/before/);
+      await expect(store.holds!({ before: cut, limit: 0 })).rejects.toThrow(/limit/);
+    });
+
+    it('sweeps stale holds: settles their estimate by default, or as a resolver says (2.3)', async () => {
+      const { store, advance, now } = await make();
+      const scope = user(1_000, { key: 'user:s' });
+      for (const requestId of ['crashed', 'unsent', 'known']) {
+        await store.reserve({ requestId, modelId: 'm', tokens: 30, scopes: [scope] });
+        await advance(10);
+      }
+      const cut = now();
+      await store.reserve({ requestId: 'fresh', modelId: 'm', tokens: 10, scopes: [scope] });
+      const seen: string[] = [];
+      expect(
+        await store.sweep!({
+          before: cut,
+          resolve: (hold) => {
+            seen.push(hold.requestId);
+            if (hold.requestId === 'unsent') return 'release';
+            return hold.requestId === 'known' ? { tokens: 12, usd: 0 } : 'settle';
+          },
+        }),
+      ).toEqual({ settled: 2, released: 1, skipped: 0 });
+      expect(seen).toEqual(['crashed', 'unsent', 'known']);
+      expect(await store.usage('user:s')).toEqual({ tokens: 30 + 12 + 10, usd: 0 });
+      expect((await store.holds!({ before: now() + 1 })).map((hold) => hold.requestId)).toEqual([
+        'fresh',
+      ]);
+      expect(await store.sweep!({ before: cut })).toEqual({ settled: 0, released: 0, skipped: 0 });
+      expect(await store.sweep!({ before: now() + 1 })).toEqual({
+        settled: 1,
+        released: 0,
+        skipped: 0,
+      });
+      expect(await store.usage('user:s')).toEqual({ tokens: 52, usd: 0 });
+      expect(await store.holds!({ before: now() + 1 })).toEqual([]);
+    });
+
+    it('recovers a lifetime budget from a hold leaked by a crash (2.3)', async () => {
+      const { store, now } = await make();
+      await store.reserve({ requestId: 'leaked', modelId: 'm', tokens: 100, scopes: [user(100)] });
+      expect(
+        await store.reserve({ requestId: 'r', modelId: 'm', tokens: 1, scopes: [user(100)] }),
+      ).toMatchObject({ admitted: false, committed: 100 });
+      // The call never reached the provider, so its hold is released.
+      expect(await store.sweep!({ before: now() + 1, resolve: 'release' })).toEqual({
+        settled: 0,
+        released: 1,
+        skipped: 0,
+      });
+      expect(
+        await store.reserve({ requestId: 'r2', modelId: 'm', tokens: 1, scopes: [user(100)] }),
+      ).toMatchObject({ admitted: true });
+    });
+
+    it('skips holds a resolver keeps or their caller closes meanwhile, up to its limit (2.3)', async () => {
+      const { store, advance, now } = await make();
+      const scope = user(1_000, { key: 'user:r' });
+      for (const requestId of ['a', 'b', 'c', 'd']) {
+        await store.reserve({ requestId, modelId: 'm', tokens: 10, scopes: [scope] });
+        await advance(10);
+      }
+      const cut = now();
+      expect(
+        await store.sweep!({
+          before: cut,
+          limit: 3,
+          resolve: async (hold) => {
+            // 'b' is settled by its own caller while the sweep looks at 'a'.
+            if (hold.requestId === 'a') {
+              await store.settle('b', { tokens: 1, usd: 0 });
+              return 'keep';
+            }
+            return 'release';
+          },
+        }),
+      ).toEqual({ settled: 0, released: 1, skipped: 2 });
+      expect((await store.holds!({ before: cut })).map((hold) => hold.requestId)).toEqual([
+        'a',
+        'd',
+      ]);
+      await expect(store.sweep!({ before: Number.NaN })).rejects.toThrow(/before/);
+      await expect(store.sweep!({ before: cut, limit: 0 })).rejects.toThrow(/limit/);
+      await expect(store.sweep!({ before: cut, resolve: 'drop' as never })).rejects.toThrow(
+        /resolve/,
+      );
+      await expect(
+        store.sweep!({ before: cut, resolve: () => ({ tokens: -1, usd: 0 }) }),
+      ).rejects.toThrow();
+    });
   });
 }

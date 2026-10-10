@@ -29,19 +29,30 @@ import {
   retryPostgres,
   SERIALIZATION_CODES,
 } from './postgres-migrate';
-import type { BudgetPruneResult, BudgetStore, BudgetStoreReservation } from '../types/budget-store';
+import type {
+  BudgetHold,
+  BudgetPruneResult,
+  BudgetStore,
+  BudgetStoreMaintenance,
+  BudgetStoreReservation,
+  BudgetSweepOptions,
+  BudgetSweepResult,
+} from '../types/budget-store';
 import {
   assertBudgetActual,
   assertBudgetKey,
   assertPruneOptions,
+  budgetHold,
   assertSameWindow,
   assertUsageOptions,
   BudgetStoreError,
   normalizeBudgetReserve,
+  normalizeHoldQuery,
   planBudgetTransition,
   reservationConflict,
   roundBudgetOutcome,
   summarizeBudgetUsage,
+  sweepBudgetHolds,
 } from '../budget-store';
 
 export interface PostgresBudgetStoreOptions {
@@ -56,7 +67,9 @@ const NOW_MS = '(extract(epoch from clock_timestamp()) * 1000)::bigint';
 
 type RequestState = 'reserved' | 'settled' | 'released' | 'denied';
 
-export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): BudgetStore {
+export function createPostgresBudgetStore(
+  options: PostgresBudgetStoreOptions,
+): BudgetStore & BudgetStoreMaintenance {
   const schema = options.schema ?? 'public';
   if (!SCHEMA_NAME_PATTERN.test(schema) || schema.length > 63)
     throw new BudgetStoreError(
@@ -314,7 +327,7 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
       )
     ).rows;
 
-  return Object.freeze({
+  const store = Object.freeze({
     async reserve(input) {
       const request = normalizeBudgetReserve(input);
       await migrate();
@@ -414,5 +427,34 @@ export function createPostgresBudgetStore(options: PostgresBudgetStoreOptions): 
       const { rows } = await write(pruneSql, [before]);
       return { requests: Number(rows[0]?.requests ?? 0), buckets: Number(rows[0]?.buckets ?? 0) };
     },
-  } satisfies BudgetStore);
+    async holds(query) {
+      const { before, limit, after } = normalizeHoldQuery(query);
+      await migrate();
+      const { rows } = await client.query(
+        `SELECT request_id, model_id, tokens, usd, charges, created_at FROM ${t('requests')}
+         WHERE state = 'reserved' AND created_at < $1::float8
+           AND ($2::float8 IS NULL OR created_at > $2::float8
+             OR (created_at = $2::float8 AND request_id COLLATE "C" > $3::text))
+         ORDER BY created_at, request_id COLLATE "C" LIMIT $4`,
+        [before, after?.reservedAt ?? null, after?.requestId ?? null, limit],
+      );
+      return rows.map(
+        (row): BudgetHold =>
+          budgetHold(String(row.request_id), {
+            modelId: String(row.model_id),
+            tokens: Number(row.tokens),
+            usd: Number(row.usd),
+            at: Number(row.created_at),
+            charges: (typeof row.charges === 'string' ? JSON.parse(row.charges) : row.charges) as {
+              key: string;
+              index: number;
+            }[],
+          }),
+      );
+    },
+    async sweep(sweepOptions: BudgetSweepOptions): Promise<BudgetSweepResult> {
+      return sweepBudgetHolds(store, sweepOptions);
+    },
+  } satisfies BudgetStore & BudgetStoreMaintenance);
+  return store;
 }

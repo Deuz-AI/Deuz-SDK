@@ -11,20 +11,29 @@
 import type { SqliteDatabaseLike, SqliteStatementLike } from './store-sqlite';
 import { ensureBusyTimeout } from './sqlite-open';
 import type { Clock } from '../types/deps';
-import type { BudgetPruneResult, BudgetStore, BudgetStoreReservation } from '../types/budget-store';
+import type {
+  BudgetHold,
+  BudgetPruneResult,
+  BudgetStore,
+  BudgetStoreMaintenance,
+  BudgetStoreReservation,
+} from '../types/budget-store';
 import {
   assertBudgetActual,
   assertBudgetKey,
   assertPruneOptions,
+  budgetHold,
   assertSameWindow,
   assertUsageOptions,
   bucketIndex,
   decideBudgetAdmission,
   firstCountedBucket,
   normalizeBudgetReserve,
+  normalizeHoldQuery,
   planBudgetTransition,
   reservationConflict,
   summarizeBudgetUsage,
+  sweepBudgetHolds,
 } from '../budget-store';
 import { resolveDependencies } from '../internal/resolve-deps';
 
@@ -40,6 +49,12 @@ export interface SqliteBudgetStoreOptions {
 }
 
 export interface SqliteBudgetStore extends BudgetStore {
+  /** Retention (2.3): see `BudgetStore.prune`. */
+  prune: BudgetStoreMaintenance['prune'];
+  /** Open holds (2.3): see `BudgetStore.holds`. */
+  holds: BudgetStoreMaintenance['holds'];
+  /** Hold reconciliation (2.3): see `BudgetStore.sweep`. */
+  sweep: BudgetStoreMaintenance['sweep'];
   close(): Promise<void>;
 }
 
@@ -213,7 +228,7 @@ export function createSqliteBudgetStore(options: SqliteBudgetStoreOptions): Sqli
   const chargesOf = (row: RequestRow) =>
     JSON.parse(row.charges) as { key: string; index: number }[];
 
-  return {
+  const store: SqliteBudgetStore = {
     async reserve(input) {
       const request = normalizeBudgetReserve(input);
       return use((db) =>
@@ -439,6 +454,40 @@ export function createSqliteBudgetStore(options: SqliteBudgetStoreOptions): Sqli
         }),
       );
     },
+    async holds(query) {
+      const { before, limit, after } = normalizeHoldQuery(query);
+      return use((db) =>
+        (
+          statement(
+            db,
+            `SELECT request_id, model_id, tokens, usd, charges, created_at FROM deuz_budget_requests
+             WHERE state = 'reserved' AND created_at < ?
+               AND (? IS NULL OR created_at > ? OR (created_at = ? AND request_id > ?))
+             ORDER BY created_at, request_id LIMIT ?`,
+          ).all(
+            before,
+            after?.reservedAt ?? null,
+            after?.reservedAt ?? null,
+            after?.reservedAt ?? null,
+            after?.requestId ?? null,
+            limit,
+          ) as (Pick<RequestRow, 'model_id' | 'tokens' | 'usd' | 'charges'> & {
+            request_id: string;
+            created_at: number;
+          })[]
+        ).map(
+          (row): BudgetHold =>
+            budgetHold(row.request_id, {
+              modelId: row.model_id,
+              tokens: Number(row.tokens),
+              usd: Number(row.usd),
+              at: Number(row.created_at),
+              charges: JSON.parse(row.charges) as { key: string; index: number }[],
+            }),
+        ),
+      );
+    },
+    sweep: (sweepOptions) => sweepBudgetHolds(store, sweepOptions),
     async close() {
       if (closed) return;
       closed = true;
@@ -451,4 +500,5 @@ export function createSqliteBudgetStore(options: SqliteBudgetStoreOptions): Sqli
       statements.clear();
     },
   };
+  return store;
 }

@@ -99,10 +99,74 @@ export interface BudgetPruneResult {
 }
 
 /**
+ * A hold (2.3): a request the store admitted that was never settled or
+ * released, such as one whose caller crashed or whose settlement failed.
+ */
+export interface BudgetHold {
+  readonly requestId: string;
+  readonly modelId: string;
+  /** The held estimates. */
+  readonly tokens: number;
+  readonly usd: number;
+  /** When it was reserved: epoch milliseconds on the store's clock. */
+  readonly reservedAt: number;
+  /** The scopes it is charged to, in reservation order. */
+  readonly keys: readonly string[];
+}
+
+/** A page of open holds (2.3), oldest first: by `reservedAt`, then `requestId`. */
+export interface BudgetHoldQuery {
+  /** Only holds reserved before this time: epoch milliseconds on the store's clock. */
+  readonly before: number;
+  /** 1..1000, default 100. */
+  readonly limit?: number;
+  /** The next page: holds strictly after this one. Pass the last hold of the previous page. */
+  readonly after?: Pick<BudgetHold, 'reservedAt' | 'requestId'>;
+}
+
+/** How `BudgetStore.sweep` closes one stale hold (2.3). */
+export type BudgetHoldResolution =
+  | 'settle'
+  | 'release'
+  | 'keep'
+  | { readonly tokens: number; readonly usd: number };
+
+export interface BudgetSweepOptions {
+  /**
+   * Holds reserved before this time (epoch milliseconds on the store's clock)
+   * are stale. Choose it well past your longest call and its settlement
+   * retries: a sweep that closes a hold its caller is about to settle makes
+   * that settlement fail as a conflict.
+   */
+  readonly before: number;
+  /**
+   * How each stale hold closes. 'settle', the default, bills its held
+   * estimates, so the budget keeps them: the fail-closed choice for a call
+   * that may have run. 'release' frees them, for a call that never reached
+   * the provider. A function decides per hold, and may return the actual
+   * amounts from your own records, or 'keep' to leave the hold open.
+   */
+  readonly resolve?:
+    | 'settle'
+    | 'release'
+    | ((hold: BudgetHold) => BudgetHoldResolution | Promise<BudgetHoldResolution>);
+  /** The most holds one call examines, oldest first: 1..10 000, default 1 000. */
+  readonly limit?: number;
+}
+
+/** What `BudgetStore.sweep` did (2.3). */
+export interface BudgetSweepResult {
+  readonly settled: number;
+  readonly released: number;
+  /** Holds left open by 'keep', or that their own caller closed while the sweep ran. */
+  readonly skipped: number;
+}
+
+/**
  * Shared, durable admission. Every method is atomic. A hold is charged to the
  * bucket of its reservation time, so a hold leaked by a crash leaves a
  * windowed budget with its bucket; in a lifetime budget it stays charged,
- * which is the fail-closed outcome.
+ * which is the fail-closed outcome, until `sweep` closes it (2.3).
  */
 export interface BudgetStore {
   /**
@@ -133,4 +197,25 @@ export interface BudgetStore {
    * the memory, SQLite and Postgres stores have it.
    */
   prune?(options: BudgetPruneOptions): Promise<BudgetPruneResult>;
+  /**
+   * The holds still open that were reserved before `query.before` (2.3),
+   * oldest first. Optional: the memory, SQLite and Postgres stores have it.
+   */
+  holds?(query: BudgetHoldQuery): Promise<BudgetHold[]>;
+  /**
+   * Close stale holds (2.3), oldest first, each through `settle` or `release`.
+   * A hold its own caller closed while the sweep ran is skipped. Optional: the
+   * memory, SQLite and Postgres stores have it.
+   */
+  sweep?(options: BudgetSweepOptions): Promise<BudgetSweepResult>;
+}
+
+/**
+ * Retention and hold reconciliation (2.3), which the memory, SQLite and
+ * Postgres stores add to `BudgetStore`; see its `prune`, `holds` and `sweep`.
+ */
+export interface BudgetStoreMaintenance {
+  prune(options: BudgetPruneOptions): Promise<BudgetPruneResult>;
+  holds(query: BudgetHoldQuery): Promise<BudgetHold[]>;
+  sweep(options: BudgetSweepOptions): Promise<BudgetSweepResult>;
 }

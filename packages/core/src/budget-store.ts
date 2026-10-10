@@ -6,11 +6,16 @@
 import type { Clock } from './types/deps';
 import type { BudgetLimits } from './types/execution';
 import type {
+  BudgetHold,
+  BudgetHoldQuery,
   BudgetPruneOptions,
   BudgetScopeUsage,
   BudgetStore,
+  BudgetStoreMaintenance,
   BudgetStoreReservation,
   BudgetStoreReserveInput,
+  BudgetSweepOptions,
+  BudgetSweepResult,
   BudgetUsage,
   BudgetUsageOptions,
 } from './types/budget-store';
@@ -296,12 +301,16 @@ export function assertUsageOptions(key: string, options: BudgetUsageOptions = {}
     throw invalid('since must be a finite epoch millisecond value.');
 }
 
+const finiteTime = (value: unknown, label: string): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value))
+    throw invalid(`${label} must be a finite epoch millisecond value.`);
+  return value;
+};
+
 /** @internal Validate `prune` options (2.3); returns `before`. */
 export function assertPruneOptions(options: BudgetPruneOptions): number {
   if (options === null || typeof options !== 'object') throw invalid('Prune options are required.');
-  if (typeof options.before !== 'number' || !Number.isFinite(options.before))
-    throw invalid('before must be a finite epoch millisecond value.');
-  return options.before;
+  return finiteTime(options.before, 'before');
 }
 
 /**
@@ -321,6 +330,98 @@ export function isFoldableBucket(
     (index + 2) * scope.bucketMs <= at &&
     (scope.windowMs === null || (index + scope.buckets) * scope.bucketMs <= at)
   );
+}
+
+/** @internal A validated hold query (2.3). */
+export interface NormalizedHoldQuery {
+  readonly before: number;
+  readonly limit: number;
+  readonly after?: Pick<BudgetHold, 'reservedAt' | 'requestId'>;
+}
+
+/** @internal Validate a hold query (2.3). */
+export function normalizeHoldQuery(query: BudgetHoldQuery): NormalizedHoldQuery {
+  if (query === null || typeof query !== 'object') throw invalid('A hold query is required.');
+  const before = finiteTime(query.before, 'before');
+  const limit = query.limit ?? 100;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000)
+    throw invalid('limit must be an integer from 1 to 1000.');
+  const after = query.after;
+  if (after === undefined) return { before, limit };
+  if (after === null || typeof after !== 'object' || typeof after.requestId !== 'string')
+    throw invalid('after must be a hold: { reservedAt, requestId }.');
+  return {
+    before,
+    limit,
+    after: {
+      reservedAt: finiteTime(after.reservedAt, 'after.reservedAt'),
+      requestId: after.requestId,
+    },
+  };
+}
+
+/** @internal A hold from a stored request: its estimates and the keys its charges name. */
+export const budgetHold = (
+  requestId: string,
+  row: { modelId: string; tokens: number; usd: number; at: number; charges: readonly Charge[] },
+): BudgetHold => ({
+  requestId,
+  modelId: row.modelId,
+  tokens: row.tokens,
+  usd: row.usd,
+  reservedAt: row.at,
+  keys: row.charges.map((charge) => charge.key),
+});
+
+const SWEEP_LIMIT = 10_000;
+
+/**
+ * @internal `sweep` for any store with `holds` (2.3): pages through the stale
+ * holds and closes each with the store's own `settle` or `release`, so every
+ * store reconciles exactly as it settles. A conflict means the hold's caller
+ * closed it meanwhile: that hold is skipped.
+ */
+export async function sweepBudgetHolds(
+  store: Pick<BudgetStore, 'settle' | 'release'> & Required<Pick<BudgetStore, 'holds'>>,
+  options: BudgetSweepOptions,
+): Promise<BudgetSweepResult> {
+  if (options === null || typeof options !== 'object') throw invalid('Sweep options are required.');
+  const before = finiteTime(options.before, 'before');
+  const resolve = options.resolve ?? 'settle';
+  if (resolve !== 'settle' && resolve !== 'release' && typeof resolve !== 'function')
+    throw invalid("resolve must be 'settle', 'release' or a function.");
+  const limit = options.limit ?? 1_000;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > SWEEP_LIMIT)
+    throw invalid(`limit must be an integer from 1 to ${SWEEP_LIMIT}.`);
+  const result = { settled: 0, released: 0, skipped: 0 };
+  let after: BudgetHold | undefined;
+  for (let left = limit; left > 0; left -= 1_000) {
+    const size = Math.min(left, 1_000);
+    const page = await store.holds({ before, limit: size, ...(after ? { after } : {}) });
+    for (const hold of page) {
+      const decision = typeof resolve === 'function' ? await resolve(hold) : resolve;
+      try {
+        if (decision === 'keep') result.skipped++;
+        else if (decision === 'release') {
+          await store.release(hold.requestId);
+          result.released++;
+        } else {
+          await store.settle(
+            hold.requestId,
+            decision === 'settle' ? { tokens: hold.tokens, usd: hold.usd } : decision,
+          );
+          result.settled++;
+        }
+      } catch (error) {
+        if (!(error instanceof BudgetStoreError && error.code === 'reservation_conflict'))
+          throw error;
+        result.skipped++;
+      }
+    }
+    if (page.length < size) break;
+    after = page.at(-1);
+  }
+  return result;
 }
 
 interface Charge {
@@ -344,8 +445,18 @@ interface MemoryRequest {
 
 const chargeKey = (charge: Charge): string => JSON.stringify([charge.key, charge.index]);
 
+/** The hold order (2.3): by reservation time, then request ID. */
+const compareHolds = (
+  left: Pick<BudgetHold, 'reservedAt' | 'requestId'>,
+  right: Pick<BudgetHold, 'reservedAt' | 'requestId'>,
+): number =>
+  left.reservedAt - right.reservedAt ||
+  (left.requestId < right.requestId ? -1 : left.requestId > right.requestId ? 1 : 0);
+
 /** For tests and single-process deployments; its budgets die with the process. */
-export function createInMemoryBudgetStore(options: { clock?: Clock } = {}): BudgetStore {
+export function createInMemoryBudgetStore(
+  options: { clock?: Clock } = {},
+): BudgetStore & BudgetStoreMaintenance {
   const clock = options.clock ?? resolveDependencies().clock;
   const windows = new Map<string, { windowMs: number | null; buckets: number; bucketMs: number }>();
   /** key → bucket index → model → amounts. */
@@ -398,7 +509,7 @@ export function createInMemoryBudgetStore(options: { clock?: Clock } = {}): Budg
     return existing;
   };
 
-  return Object.freeze({
+  const store = Object.freeze({
     async reserve(input) {
       const request = normalizeBudgetReserve(input);
       const existing = recorded(request);
@@ -516,5 +627,21 @@ export function createInMemoryBudgetStore(options: { clock?: Clock } = {}): Budg
       }
       return { requests: pruned, buckets: folded };
     },
-  } satisfies BudgetStore);
+    async holds(query) {
+      const { before, limit, after } = normalizeHoldQuery(query);
+      const open: BudgetHold[] = [];
+      for (const [requestId, request] of requests)
+        if (
+          request.state === 'reserved' &&
+          request.at < before &&
+          (!after || compareHolds({ reservedAt: request.at, requestId }, after) > 0)
+        )
+          open.push(budgetHold(requestId, request));
+      return open.sort(compareHolds).slice(0, limit);
+    },
+    async sweep(sweepOptions: BudgetSweepOptions): Promise<BudgetSweepResult> {
+      return sweepBudgetHolds(store, sweepOptions);
+    },
+  } satisfies BudgetStore & BudgetStoreMaintenance);
+  return store;
 }
