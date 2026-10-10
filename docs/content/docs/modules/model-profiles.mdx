@@ -77,7 +77,10 @@ is reported as supported or unsupported only when:
 Everything else is `'unknown'`. For example, DeepSeek V4 rejects
 `response_format: json_schema`, so its `structuredOutput` is `'unsupported'`,
 while the newer `deepseek-flash` row keeps the same safe default without a
-source to back it, so its profile says `'unknown'`.
+source to back it, so its profile says `'unknown'`. The same holds for a pinned
+row whose limits are undocumented, such as the GPT-5.6 rows: their context
+window, vision and the other values no source states are `'unknown'`, not the
+row's conservative defaults.
 
 ```ts title="claims.ts"
 import { resolveModelProfile } from '@deuz-sdk/core';

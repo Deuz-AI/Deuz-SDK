@@ -12,6 +12,7 @@ import {
   createOpenAICompatible,
 } from '../src/providers-compat';
 import { runStream } from '../src/core/inference';
+import { getCapabilities, isMaxOutputPlaceholder, pinnedModelIds } from '../src/core/registry';
 import type { LanguageModel } from '../src/types/model';
 import type { CallWarning } from '../src/types/methods';
 import type { WireToolRequest } from '../src/adapters/types';
@@ -644,6 +645,55 @@ describe('documented gaps stay unknown (2.3)', () => {
     );
     // Only luna documents 'none'; astra claims no thinking mode either way.
     expect(resolveModelProfile(responses('gpt-6-astra')).thinking.mode).toBe('unknown');
+  });
+
+  it('the F19 rows that pin no limits report them, and vision, as unknown — like gpt-6-astra', () => {
+    const astra = resolveModelProfile(responses('gpt-6-astra'));
+    for (const id of [
+      'gpt-5.6',
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5-pro',
+      'gpt-5.2-pro',
+      'gpt-5.4-pro',
+      'gpt-5.2-codex',
+    ]) {
+      const profile = resolveModelProfile(responses(id));
+      // Not the row's 128_000 default: the price table bills GPT-5.6 prompts above 272K.
+      expect(profile.limits, id).toEqual({ defaultOutputCap: 'omitted' });
+      expect(profile.capabilities, id).toEqual(astra.capabilities);
+      expect(profile.capabilities.vision, id).toBe('unknown');
+      expect(profile.sampling.accepted, id).toBe('unknown');
+      expect(profile.sourceUrl, id).toBeUndefined(); // not researched: no source is claimed
+    }
+    // 'none' rides the historical mapping on these, so no thinking mode is claimed...
+    expect(resolveModelProfile(responses('gpt-5.6-sol')).thinking.mode).toBe('unknown');
+    // ...while gpt-5-pro's published set (high only) means reasoning never turns off.
+    expect(resolveModelProfile(responses('gpt-5-pro')).thinking.mode).toBe('always');
+  });
+
+  it('no pinned row with undocumented limits states them, or vision, without a source', () => {
+    const { native, other } = pinnedModelIds();
+    const models: LanguageModel[] = [
+      ...native.map(
+        (modelId): LanguageModel => ({ provider: 'google', surface: 'native', modelId }),
+      ),
+      ...other.map(
+        (modelId): LanguageModel => ({ provider: 'openai', surface: 'responses', modelId }),
+      ),
+    ];
+    const unsourced = models.filter(
+      (model) =>
+        isMaxOutputPlaceholder(getCapabilities(model)) &&
+        resolveModelProfile(model).sourceUrl === undefined,
+    );
+    expect(unsourced.map((m) => m.modelId)).toContain('gpt-5.6-sol');
+    for (const model of unsourced) {
+      const profile = resolveModelProfile(model);
+      expect(profile.limits.contextWindow, model.modelId).toBeUndefined();
+      expect(profile.capabilities.vision, model.modelId).toBe('unknown');
+    }
   });
 });
 

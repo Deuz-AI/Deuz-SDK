@@ -31,6 +31,7 @@ import type { LanguageModel, ModelSurface } from './types/model';
 import {
   getCapabilities,
   isMaxOutputPlaceholder,
+  isUndocumentedRow,
   registryMatch,
   type EffortLevel,
   type EffortNoneMapping,
@@ -285,6 +286,16 @@ const COMPAT_UNSTATED = [
 const GPT_5_MINIMAL = [
   "OpenAI documents effort minimal, low, medium and high; 'minimal' has no Deuz level, so 'none' is sent as 'low' (research-dated 2026-10-10, not live-verified).",
 ] as const;
+/**
+ * A priced GPT-5 snapshot pinned with no researched facts (F19). Like
+ * gpt-6-astra, its limits, vision and sampling rules stay unstated, and since
+ * 'none' rides the OpenAI wire's historical mapping, no thinking mode is claimed.
+ */
+const GPT_5_UNRESEARCHED: Facts = /* @__PURE__ */ (() => ({
+  unknown: [...GPT_6_UNSTATED, 'contextWindow'],
+  thinking: { mode: 'unknown' },
+  sampling: { accepted: 'unknown' },
+}))();
 const DEEPSEEK_V4_NOTES = [
   'Always reasons; reasoning tokens share the output budget, so a cap sized for the answer alone can return an empty answer.',
   'Rejects response_format json_schema, and a forced tool_choice in thinking mode.',
@@ -402,10 +413,20 @@ const FACTS: Readonly<Record<string, Facts>> = /* @__PURE__ */ (() => ({
     ],
   },
   'gpt-5-pro': {
+    unknown: [...GPT_6_UNSTATED, 'contextWindow'],
+    sampling: { accepted: 'unknown' },
     notes: [
       "OpenAI documents effort high only, so any other level and 'none' are sent as 'high' (research-dated 2026-10-10, not live-verified).",
     ],
   },
+  // The other F19 rows that pin no limits: nothing about them was researched.
+  'gpt-5.6': GPT_5_UNRESEARCHED,
+  'gpt-5.6-sol': GPT_5_UNRESEARCHED,
+  'gpt-5.6-terra': GPT_5_UNRESEARCHED,
+  'gpt-5.6-luna': GPT_5_UNRESEARCHED,
+  'gpt-5.2-pro': GPT_5_UNRESEARCHED,
+  'gpt-5.4-pro': GPT_5_UNRESEARCHED,
+  'gpt-5.2-codex': GPT_5_UNRESEARCHED,
 
   // --- Google: research-dated (2026-10-09), not live-verified. ---
   'gemini-3.8-flash': {
@@ -551,10 +572,15 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
   const claimed: Partial<Record<string, unknown>> = readConfig(model)?.capabilities ?? {};
   const protocol = model.surface;
   const wire = effortWire(protocol, caps, model.modelId);
+  // A pinned row that leaves its output limit undocumented pins only what its
+  // request rules need. Without a documentary entry, its other values are the
+  // row's conservative defaults: never facts, whatever an override claims.
+  const undocumented = facts === undefined && isUndocumentedRow(model);
 
   /** Known = the caller claimed it, or a pinned row states it and no fact marks it unstated. */
   const known = (key: ProfileCapability | 'contextWindow'): boolean =>
-    claimed[key] !== undefined || (match === 'exact' && !facts?.unknown?.includes(key));
+    claimed[key] !== undefined ||
+    (match === 'exact' && !undocumented && !facts?.unknown?.includes(key));
 
   const capabilities = Object.fromEntries(
     CAPABILITIES.map((key): [ProfileCapability, ProfileSupport] => [
@@ -584,7 +610,7 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
     handling,
     accepted:
       facts?.sampling?.accepted ??
-      (match !== 'exact' ? 'unknown' : caps.samplingRestrictions ? 'none' : 'any'),
+      (match !== 'exact' || undocumented ? 'unknown' : caps.samplingRestrictions ? 'none' : 'any'),
     ...(facts?.sampling?.rule !== undefined ? { rule: facts.sampling.rule } : {}),
   };
 
@@ -606,7 +632,7 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
     mode: facts?.thinking?.mode ?? thinkingMode(caps, wire, none, known('reasoning')),
     ...(facts?.thinking?.types ? { types: [...facts.thinking.types] } : {}),
     replay:
-      match === 'fallback' && claimed.reasoning === undefined
+      (match === 'fallback' || undocumented) && claimed.reasoning === undefined
         ? 'unknown'
         : replayFor(protocol, model.provider, caps.reasoning),
   };

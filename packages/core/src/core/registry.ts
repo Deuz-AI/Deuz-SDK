@@ -845,6 +845,17 @@ export function registryMatch(model: LanguageModel): RegistryMatch {
 }
 
 /**
+ * @internal True when a pinned row whose output limit is undocumented answers
+ * for `model` (2.3), whatever an override claims. Such a row pins only what its
+ * request rules need, so the model profile never reports its other values as
+ * facts unless a documentary entry states them. Not part of the package surface.
+ */
+export function isUndocumentedRow(model: LanguageModel): boolean {
+  const { row, match } = lookup(model);
+  return match === 'exact' && PLACEHOLDER_ROWS.has(row);
+}
+
+/**
  * @internal Every pinned slug with its table (2.3): the price-table consistency
  * test (F19) walks it. Not part of the package surface.
  */
