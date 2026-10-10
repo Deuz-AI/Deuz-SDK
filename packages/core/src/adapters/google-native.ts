@@ -24,6 +24,7 @@ import {
   reportClamp,
 } from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
+import { replaysTo } from '../internal/reasoning';
 import { resolveMedia } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -80,10 +81,19 @@ function thinkingConfigFor(ctx: BuildContext): Record<string, unknown> | undefin
     : { includeThoughts: true, thinkingLevel: effort.level };
 }
 
+/** A Gemini thought signature carried in canonical provider metadata, if any. */
+function thoughtSignatureOf(meta: Record<string, unknown> | undefined): string | undefined {
+  const google = meta?.google as { thoughtSignature?: unknown } | undefined;
+  return typeof google?.thoughtSignature === 'string' ? google.thoughtSignature : undefined;
+}
+
 function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart | null {
   switch (part.type) {
-    case 'text':
-      return { text: part.text };
+    case 'text': {
+      // Gemini can sign a plain text part too (2.3, F21): echo it back on it.
+      const sig = thoughtSignatureOf(part.providerMetadata);
+      return sig ? { text: part.text, thoughtSignature: sig } : { text: part.text };
+    }
     case 'image': {
       // This wire already carries documents correctly: inlineData/fileData pass
       // the mimeType straight through, so an `ImagePart` holding a PDF (the
@@ -110,6 +120,9 @@ function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart
     }
     case 'reasoning': {
       // Echo thought summary; carry the signature so multi-step tool use round-trips.
+      // Only Gemini's own thoughts (2.3, F21): an OpenAI encrypted item or a
+      // Claude signature is no thought signature (they used to ride as one).
+      if (!replaysTo(part, 'google')) return null;
       const gp: GeminiPart = { text: part.text, thought: true };
       if (part.signature) gp.thoughtSignature = part.signature;
       return gp;
@@ -348,9 +361,18 @@ async function* parseStream(
           type: 'reasoning-delta',
           text: part.text ?? '',
           ...(part.thoughtSignature ? { signature: part.thoughtSignature } : {}),
+          source: 'google',
         };
       } else if (typeof part.text === 'string') {
-        yield { type: 'text-delta', text: part.text };
+        // A plain text part can carry the signature too, often in a final chunk
+        // whose text is empty (2.3, F21): it rides on the text it belongs to.
+        yield {
+          type: 'text-delta',
+          text: part.text,
+          ...(part.thoughtSignature
+            ? { providerMetadata: { google: { thoughtSignature: part.thoughtSignature } } }
+            : {}),
+        };
       }
     }
 

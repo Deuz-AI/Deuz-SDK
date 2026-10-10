@@ -56,8 +56,34 @@ type OpenAIContentBlock =
 interface OpenAIMessage {
   role: string;
   content: string | OpenAIContentBlock[] | null;
+  /** DeepSeek / Kimi: the turn's own reasoning, sent back with its tool calls (2.3). */
+  reasoning_content?: string;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
+}
+
+/**
+ * Hosts whose `reasoning_content` must ride back on an assistant tool-call
+ * message (2.3, F21): DeepSeek's thinking mode and Kimi's reasoning models keep
+ * reasoning across a tool conversation. Matches the model profile's
+ * `'reasoning-content'` replay. Researched 2026-10-09, not live-verified.
+ */
+const REASONING_CONTENT_HOSTS: ReadonlySet<string> = new Set(['deepseek', 'moonshot']);
+
+/**
+ * The reasoning `provider` itself produced on this turn, joined as its
+ * `reasoning_content`; empty for any other host, and for another family's
+ * reasoning, which is never replayed.
+ */
+function ownReasoningContent(content: Part[], provider: string): string {
+  if (!REASONING_CONTENT_HOSTS.has(provider)) return '';
+  return content
+    .filter(
+      (p): p is Extract<Part, { type: 'reasoning' }> =>
+        p.type === 'reasoning' && p.source === provider && !p.encrypted && !p.redacted,
+    )
+    .map((p) => p.text)
+    .join('');
 }
 
 /**
@@ -115,9 +141,11 @@ function toOpenAIMessages(
       .join('');
 
     if (toolUses.length > 0) {
+      const reasoning = ownReasoningContent(m.content, media.provider);
       out.push({
         role: 'assistant',
         content: text || null,
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
         tool_calls: toolUses.map((t) => ({
           id: t.id,
           type: 'function',
@@ -187,7 +215,8 @@ function toOpenAIMessages(
         if (blocks.some((b) => b.type !== 'text')) out.push({ role, content: blocks });
         else out.push({ role, content: text });
       } else {
-        // Reasoning parts have no Chat Completions round-trip — dropped here.
+        // Reasoning rides back only on a tool-call turn (above); a text turn
+        // carries none.
         out.push({ role, content: text });
       }
     }
@@ -467,7 +496,10 @@ async function* parseStream(
     if (!choice) continue;
     const delta = choice.delta;
     if (delta?.content) yield { type: 'text-delta', text: delta.content };
-    if (delta?.reasoning_content) yield { type: 'reasoning-delta', text: delta.reasoning_content };
+    // The host's own reasoning, marked so only that host ever gets it back (2.3).
+    if (delta?.reasoning_content) {
+      yield { type: 'reasoning-delta', text: delta.reasoning_content, source: _ctx.provider };
+    }
     if (delta?.tool_calls) {
       for (const tc of delta.tool_calls) {
         const index = tc.index ?? 0;
