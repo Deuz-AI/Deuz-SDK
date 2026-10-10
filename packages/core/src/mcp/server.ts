@@ -609,7 +609,8 @@ async function runWithTimeout(
   run: (signal: AbortSignal | undefined) => Promise<unknown>,
   signal: AbortSignal,
 ): Promise<{ timedOut: true; message: string } | { timedOut: false; value: unknown }> {
-  if (timeoutMs === undefined || timeoutMs <= 0) {
+  // Infinity means no cap, as in the loop: a host setTimeout clamps it to 1ms.
+  if (timeoutMs === undefined || timeoutMs <= 0 || !Number.isFinite(timeoutMs)) {
     return { timedOut: false, value: await run(signal) };
   }
   const expiry = new AbortController();

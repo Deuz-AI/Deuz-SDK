@@ -317,6 +317,33 @@ describe('createMcpServer — arguments, results and failures', () => {
     expect(abortedWith).toBeInstanceOf(Error);
   });
 
+  it('timeoutMs: Infinity arms no timer, as in the loop — a slow call completes', async () => {
+    let abortedWhileRunning: boolean | undefined;
+    // No `clock` option: the host clock is the one that clamps Infinity to 1 ms.
+    const server = serve({
+      name: 't',
+      tools: {
+        slow: {
+          parameters: { type: 'object' },
+          timeoutMs: Infinity,
+          execute: (_args, ctx) =>
+            new Promise((resolve) => {
+              setTimeout(() => {
+                // Read before resolving: once the response is on its way the SDK
+                // aborts the request's signal itself.
+                abortedWhileRunning = ctx.signal!.aborted;
+                resolve('done');
+              }, 40);
+            }),
+        },
+      },
+    });
+    const client = await connect(server);
+
+    expect(await client.callTool('slow', {})).toBe('done');
+    expect(abortedWhileRunning).toBe(false);
+  });
+
   it('execute gets a call context: toolCallId, signal, and the runtimeContext built from the request', async () => {
     let seen: ToolExecuteContext | undefined;
     const server = serve({

@@ -249,7 +249,7 @@ Both eras run the same definition, so they cannot drift apart. Over stateless HT
 
 - **Tools only.** The server publishes tools; it serves no resources or prompts, and its catalog is fixed at construction (no `tools/list_changed`).
 - **No conversation.** `messages` is `[]` and `toolCallId` is per JSON-RPC request — a 2026-07-28 approval retry is a new request with a new id.
-- **Per-tool timeouts only.** `Tool.timeoutMs` is honored; the loop's call-level `timeout` has no counterpart. A client's own request timeout and cancellation bound every call.
+- **Per-tool timeouts only.** `Tool.timeoutMs` is honored (`0` or `Infinity` means no cap, as in the loop); the loop's call-level `timeout` has no counterpart. A client's own request timeout and cancellation bound every call.
 - **No usage reporting.** An agent's token usage stays on the server (observe it with `deps.onUsage`); MCP has no field for it.
 - **Not live-verified against third-party hosts.** The server is verified offline, in-process, against the Deuz client on both SDK lines and the official v1 and v2 SDK clients (HTTP and a real stdio child) — not against hosted MCP clients.
 
