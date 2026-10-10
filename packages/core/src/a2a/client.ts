@@ -12,6 +12,7 @@ import { A2AError } from './errors';
 import {
   A2A_CONTENT_TYPE,
   A2A_EXTENSIONS_HEADER,
+  AGENT_CARD_PATH,
   A2A_PROTOCOL_VERSION,
   A2A_VERSION_HEADER,
   ERROR_INFO_TYPE,
@@ -25,10 +26,13 @@ import {
   toMessage,
 } from './protocol';
 import type {
+  A2AAgentCard,
+  A2AAgentInterface,
   A2ABinding,
   A2ACallOptions,
   A2AClient,
   A2AClientOptions,
+  A2AFetchAgentCardOptions,
   A2ASendMessageOptions,
   A2ASendMessageResponse,
   A2AStreamResponse,
@@ -399,27 +403,107 @@ function compact(record: Record<string, unknown>): Params {
 }
 
 /**
- * Connect to an A2A agent endpoint:
+ * Fetch an agent's card. The card is read from `/.well-known/agent-card.json`
+ * at the URL's origin, from the URL itself when it ends in `.json`, or from
+ * `path` resolved against the URL.
+ */
+export async function fetchAgentCard(
+  url: string,
+  options: A2AFetchAgentCardOptions = {},
+): Promise<A2AAgentCard> {
+  let target: URL;
+  try {
+    target =
+      options.path !== undefined
+        ? new URL(options.path, url)
+        : new URL(url).pathname.endsWith('.json')
+          ? new URL(url)
+          : new URL(AGENT_CARD_PATH, url);
+  } catch (error) {
+    throw new InvalidRequestError({ message: `Not a URL: '${url}'.`, cause: error });
+  }
+  const core = createClientCore({ ...(options.deps ? { deps: options.deps } : {}) });
+  const response = await core.send(
+    target.href,
+    { method: 'GET', headers: await core.headers({ Accept: JSON_CONTENT_TYPE }, options) },
+    options.signal,
+  );
+  const json = await core.readJson(response, options.signal);
+  if (!response.ok) throw httpError(response.status);
+  if (!isRecord(json) || typeof json.name !== 'string') {
+    throw invalidResponse('The document is not an A2A agent card.', response.status);
+  }
+  return json as unknown as A2AAgentCard;
+}
+
+function canonicalBinding(value: unknown): A2ABinding | undefined {
+  const upper = typeof value === 'string' ? value.toUpperCase() : '';
+  return upper === 'JSONRPC' || upper === 'HTTP+JSON' ? upper : undefined;
+}
+
+/** A 1.x version, or none declared (accepted only when no 1.x interface exists). */
+function versionRank(version: unknown): number {
+  if (version === undefined || version === '') return 1;
+  return typeof version === 'string' && /^1(?:\.|$)/.test(version.trim()) ? 2 : 0;
+}
+
+/** The interface the client uses: the first 1.x one of a binding it speaks (or the one asked for). */
+function pickInterface(card: A2AAgentCard, binding: A2ABinding | undefined): A2AAgentInterface {
+  const interfaces = Array.isArray(card.supportedInterfaces) ? card.supportedInterfaces : [];
+  const usable = interfaces.filter((candidate) => {
+    const speaks = canonicalBinding(candidate.protocolBinding);
+    return (
+      typeof candidate.url === 'string' &&
+      speaks !== undefined &&
+      (binding === undefined || speaks === binding)
+    );
+  });
+  const chosen =
+    usable.find((candidate) => versionRank(candidate.protocolVersion) === 2) ??
+    usable.find((candidate) => versionRank(candidate.protocolVersion) === 1);
+  if (chosen) return chosen;
+  const offered = interfaces
+    .map((candidate) => `${candidate.protocolBinding} ${candidate.protocolVersion ?? '?'}`)
+    .join(', ');
+  throw new InvalidRequestError({
+    message:
+      `The agent card of '${card.name}' declares no A2A 1.x ${binding ?? 'JSONRPC or HTTP+JSON'} ` +
+      `interface (it offers: ${offered || 'none'}).`,
+  });
+}
+
+/**
+ * Connect to an A2A agent — from its card, or straight to an endpoint:
  *
  * ```ts
- * const client = createA2AClient({ url: 'https://agent.example.com/a2a' });
+ * const client = createA2AClient({ card: await fetchAgentCard('https://agent.example.com') });
  * const answer = await client.sendMessage('What is the weather in Izmir?');
  * ```
  *
- * Every request carries `A2A-Version: 1.0`.
+ * `url` wins over the card's interfaces (a proxy, a test server); `binding`
+ * then names the endpoint's binding (default `'JSONRPC'`). Every request
+ * carries `A2A-Version: 1.0`.
  */
 export function createA2AClient(options: A2AClientOptions): A2AClient {
-  if (typeof options.url !== 'string' || options.url === '') {
-    throw new InvalidRequestError({ message: 'createA2AClient needs a url.' });
+  let url: string;
+  let binding: A2ABinding;
+  let tenant = options.tenant;
+  if (typeof options.url === 'string' && options.url !== '') {
+    url = options.url;
+    binding = options.binding ?? 'JSONRPC';
+    if (canonicalBinding(binding) !== binding) {
+      throw new InvalidRequestError({
+        message: `createA2AClient speaks the 'JSONRPC' and 'HTTP+JSON' bindings, not '${String(binding)}'.`,
+      });
+    }
+  } else if (options.card) {
+    const chosen = pickInterface(options.card, options.binding);
+    url = chosen.url;
+    binding = canonicalBinding(chosen.protocolBinding) as A2ABinding;
+    if (tenant === undefined && chosen.tenant) tenant = chosen.tenant;
+  } else {
+    throw new InvalidRequestError({ message: 'createA2AClient needs a card or a url.' });
   }
-  const url = options.url;
-  const binding: A2ABinding = options.binding ?? 'JSONRPC';
-  if (binding !== 'JSONRPC' && binding !== 'HTTP+JSON') {
-    throw new InvalidRequestError({
-      message: `createA2AClient speaks the 'JSONRPC' and 'HTTP+JSON' bindings, not '${String(binding)}'.`,
-    });
-  }
-  const tenant = options.tenant;
   const core = createClientCore(options);
   const transport = binding === 'JSONRPC' ? jsonRpcTransport(url, core) : restTransport(url, core);
 
@@ -443,7 +527,7 @@ export function createA2AClient(options: A2AClientOptions): A2AClient {
   return {
     url,
     binding,
-    card: undefined,
+    card: options.card,
 
     async sendMessage(input, call) {
       const result = await transport.call('SendMessage', sendParams(input, call), call);

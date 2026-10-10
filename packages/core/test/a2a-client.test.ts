@@ -10,7 +10,13 @@
  * `a2a-interop.test.ts`.
  */
 import { describe, it, expect } from 'vitest';
-import { A2AError, createA2AClient, type A2AStreamResponse } from '../src/a2a';
+import {
+  A2AError,
+  createA2AClient,
+  fetchAgentCard,
+  type A2AAgentCard,
+  type A2AStreamResponse,
+} from '../src/a2a';
 import { AbortError, InvalidRequestError } from '../src/errors';
 
 interface Captured {
@@ -611,6 +617,136 @@ describe('A2A client — HTTP+JSON binding', () => {
     expect(() => createA2AClient({ url: BASE, binding: 'GRPC' as unknown as 'JSONRPC' })).toThrow(
       InvalidRequestError,
     );
+  });
+});
+
+describe('A2A client — agent card', () => {
+  const card = (supportedInterfaces: unknown[]) =>
+    ({
+      name: 'Weather',
+      description: 'Forecasts.',
+      version: '1.0.0',
+      supportedInterfaces,
+      capabilities: { streaming: true },
+      defaultInputModes: ['text/plain'],
+      defaultOutputModes: ['text/plain'],
+      skills: [],
+    }) as unknown as A2AAgentCard;
+
+  it('fetches /.well-known/agent-card.json at the URL’s origin with A2A-Version', async () => {
+    const served = card([
+      { url: 'https://agent.test/a2a', protocolBinding: 'JSONRPC', protocolVersion: '1.0' },
+    ]);
+    const { fetch, requests } = scriptedFetch(() => json(served));
+    expect(await fetchAgentCard('https://agent.test/some/page', { deps: { fetch } })).toEqual(
+      served,
+    );
+    expect(requests[0]?.method).toBe('GET');
+    expect(requests[0]?.url).toBe('https://agent.test/.well-known/agent-card.json');
+    expect(requests[0]?.headers.get('a2a-version')).toBe('1.0');
+  });
+
+  it('fetches a URL that ends in .json as the card itself', async () => {
+    const { fetch, requests } = scriptedFetch(() => json(card([])));
+    await fetchAgentCard('https://agent.test/cards/weather.json', { deps: { fetch } });
+    expect(requests[0]?.url).toBe('https://agent.test/cards/weather.json');
+  });
+
+  it('resolves path against the URL', async () => {
+    const { fetch, requests } = scriptedFetch(() => json(card([])));
+    await fetchAgentCard('https://agent.test/agents/a/', {
+      path: '.well-known/agent-card.json',
+      deps: { fetch },
+    });
+    expect(requests[0]?.url).toBe('https://agent.test/agents/a/.well-known/agent-card.json');
+  });
+
+  it('reports a missing card as an http failure', async () => {
+    const { fetch } = scriptedFetch(() => new Response('Not found', { status: 404 }));
+    expect(
+      await rejection(fetchAgentCard('https://agent.test', { deps: { fetch } })),
+    ).toMatchObject({ kind: 'http', statusCode: 404 });
+  });
+
+  it('rejects a document that is not an agent card', async () => {
+    const { fetch } = scriptedFetch(() => json(['not', 'a', 'card']));
+    expect(
+      await rejection(fetchAgentCard('https://agent.test', { deps: { fetch } })),
+    ).toMatchObject({ kind: 'invalid-response' });
+  });
+
+  it('talks to the first JSON-RPC or HTTP+JSON interface the card declares for A2A 1.x', async () => {
+    const served = card([
+      { url: 'https://agent.test/grpc', protocolBinding: 'GRPC', protocolVersion: '1.0' },
+      { url: 'https://agent.test/legacy', protocolBinding: 'JSONRPC', protocolVersion: '0.3' },
+      { url: 'https://agent.test/rest', protocolBinding: 'http+json', protocolVersion: '1.0' },
+      { url: 'https://agent.test/rpc', protocolBinding: 'JSONRPC', protocolVersion: '1.0' },
+    ]);
+    const { fetch, requests } = scriptedFetch(() => json(TASK));
+    const a2a = createA2AClient({ card: served, deps: { fetch } });
+    expect(a2a.card).toBe(served);
+    expect(a2a.binding).toBe('HTTP+JSON');
+    expect(a2a.url).toBe('https://agent.test/rest');
+    await a2a.getTask('task-1');
+    expect(requests[0]?.url).toBe('https://agent.test/rest/tasks/task-1');
+  });
+
+  it('uses the first interface of the binding asked for', () => {
+    const served = card([
+      { url: 'https://agent.test/rest', protocolBinding: 'HTTP+JSON', protocolVersion: '1.0' },
+      { url: 'https://agent.test/rpc', protocolBinding: 'JSONRPC', protocolVersion: '1.0' },
+    ]);
+    const a2a = createA2AClient({ card: served, binding: 'JSONRPC' });
+    expect([a2a.binding, a2a.url]).toEqual(['JSONRPC', 'https://agent.test/rpc']);
+  });
+
+  it('falls back to an interface that declares no protocol version', () => {
+    const a2a = createA2AClient({
+      card: card([{ url: 'https://agent.test/rpc', protocolBinding: 'JSONRPC' }]),
+    });
+    expect(a2a.url).toBe('https://agent.test/rpc');
+  });
+
+  it('sends the chosen interface’s tenant unless the options name one', async () => {
+    const served = card([
+      {
+        url: 'https://agent.test/rest',
+        protocolBinding: 'HTTP+JSON',
+        protocolVersion: '1.0',
+        tenant: 'acme',
+      },
+    ]);
+    const { fetch, requests } = scriptedFetch(
+      () => json(TASK),
+      () => json(TASK),
+    );
+    await createA2AClient({ card: served, deps: { fetch } }).getTask('task-1');
+    await createA2AClient({ card: served, tenant: 'globex', deps: { fetch } }).getTask('task-1');
+    expect(requests.map((request) => request.url)).toEqual([
+      'https://agent.test/rest/acme/tasks/task-1',
+      'https://agent.test/rest/globex/tasks/task-1',
+    ]);
+  });
+
+  it('prefers an explicit url over the card’s interfaces', () => {
+    const served = card([
+      { url: 'https://agent.test/rest', protocolBinding: 'HTTP+JSON', protocolVersion: '1.0' },
+    ]);
+    const a2a = createA2AClient({ card: served, url: 'https://proxy.test/a2a' });
+    expect([a2a.url, a2a.binding, a2a.card]).toEqual(['https://proxy.test/a2a', 'JSONRPC', served]);
+  });
+
+  it('rejects a card without a 1.x JSON-RPC or HTTP+JSON interface', () => {
+    const served = card([
+      { url: 'https://agent.test/grpc', protocolBinding: 'GRPC', protocolVersion: '1.0' },
+      { url: 'https://agent.test/legacy', protocolBinding: 'JSONRPC', protocolVersion: '0.3' },
+    ]);
+    expect(() => createA2AClient({ card: served })).toThrow(InvalidRequestError);
+    expect(() => createA2AClient({ card: served })).toThrow(/GRPC 1\.0.*JSONRPC 0\.3/);
+  });
+
+  it('needs a card or a url', () => {
+    expect(() => createA2AClient({})).toThrow(InvalidRequestError);
   });
 });
 
