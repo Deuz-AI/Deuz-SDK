@@ -21,6 +21,7 @@
 import type { ToolSet } from '../types/tool';
 import type { McpLoopEntry } from '../types/config';
 import type { ResolvedDependencies } from '../types/deps';
+import type { CallWarning } from '../types/methods';
 import type { AgentMcpEntry, AgentMcpReplay } from '../types/agent-run';
 import { resolveMcpForLoop, type ResolvedMcpRuntime } from '../mcp/resolve';
 import { detectToolDrift, fingerprintTools, type ToolFingerprints } from '../mcp/shared';
@@ -105,9 +106,12 @@ export async function resolveNativeMcp(
   entries: readonly AgentMcpEntry[],
   deps: ResolvedDependencies,
   prepare: PrepareMcpTools,
+  /** Where a name collision between two servers is reported (2.3): the run's warnings. */
+  warn?: (warning: CallWarning) => void,
 ): Promise<NativeMcp> {
   const { connect, replays } = splitEntries(entries);
   const inner = await resolveMcpForLoop(connect, {
+    ...(warn ? { warn } : {}),
     logger: deps.logger,
     // Reconnect backoff and keepalive run on the INJECTED clock (edge-safety).
     clock: deps.clock,

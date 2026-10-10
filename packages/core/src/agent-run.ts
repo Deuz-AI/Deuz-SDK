@@ -10,7 +10,7 @@ import type {
   AgentValidation,
 } from './types/agent-run';
 import type { CommonCallOptions } from './types/config';
-import type { CallWarning, StopDetails } from './types/methods';
+import type { StopDetails } from './types/methods';
 import type { Message } from './types/message';
 import type { LanguageModel } from './types/model';
 import type { ToolSet } from './types/tool';
@@ -55,6 +55,7 @@ import {
   type NativeToolOutput,
   type NativeToolReceipts,
 } from './inference/agent-tools';
+import type { CatalogChangeVerdict } from './inference/loop-shared';
 import type { NativeMcp } from './inference/native-mcp';
 import { readHandoffTarget } from './inference/handoff';
 import {
@@ -354,6 +355,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       let maxSteps = positiveInteger(options.maxSteps ?? 20, 'maxSteps');
       let maxOutputAttempts = positiveInteger(options.maxOutputAttempts ?? 2, 'maxOutputAttempts');
       let maxVerifyAttempts = positiveInteger(options.maxVerifyAttempts ?? 3, 'maxVerifyAttempts');
+      // A mid-run MCP catalog change stops a native run unless it accepts it (2.3).
+      const catalogPolicy = options.onCatalogChange ?? 'stop';
+      if (catalogPolicy !== 'stop' && catalogPolicy !== 'accept')
+        throw new TypeError("onCatalogChange must be 'stop' or 'accept'.");
       if (options.session && (!options.session.runId || !options.session.scope)) {
         throw new TypeError('Native sessions require non-empty runId and scope.');
       }
@@ -593,6 +598,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             options.mcp,
             resolveDependencies(options.deps),
             (tools, replayOf) => prepareMcpTools(tools, replayOf, onToolOutput, receipts),
+            // Two servers exposing one name reach the run's warnings (2.3).
+            (warning) => {
+              runWarnings.add(warning);
+            },
           );
           binding.mcp = await nativeMcp.catalog();
         }
@@ -756,24 +765,42 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         return true;
       };
 
-      // A hot refresh mid-run (2.3, F01) opens a new binding revision: the new
-      // catalog is recorded, durably, before the model is offered it, so a later
-      // resume compares against the catalog the run actually used. The change is
-      // reported as a warning; its tools carry receipts like every other.
-      const recordCatalog = async (): Promise<CallWarning[]> => {
+      // A hot refresh mid-run (2.3, F01) that really changed the catalog either
+      // stops the run before the model is offered it (`onCatalogChange: 'stop'`,
+      // the default: nobody reviewed the new tools), or opens a new binding
+      // revision: the new catalog is recorded, durably, before the model is
+      // offered it, so a later resume compares against the catalog the run
+      // actually used. Either way the change is reported as a warning; accepted
+      // tools carry receipts like every other.
+      const recordCatalog = async (): Promise<CatalogChangeVerdict> => {
         const catalog = await nativeMcp!.catalog();
         const { catalogDrift } = await import('./inference/native-mcp');
         const drift = catalogDrift(envelope.binding?.mcp, catalog);
-        if (!drift) return [];
+        if (!drift) return { warnings: [], stop: false };
+        if (catalogPolicy === 'stop') {
+          return {
+            warnings: [
+              {
+                type: 'other',
+                setting: 'mcp',
+                message: `MCP tool catalog changed mid-run (${drift}); the run stopped before offering it (onCatalogChange: 'stop').`,
+              },
+            ],
+            stop: true,
+          };
+        }
         envelope.binding = { ...envelope.binding!, mcp: catalog };
         await persist();
-        return [
-          {
-            type: 'other',
-            setting: 'mcp',
-            message: `MCP tool catalog changed mid-run (${drift}); the run's resume binding now records the new catalog.`,
-          },
-        ];
+        return {
+          warnings: [
+            {
+              type: 'other',
+              setting: 'mcp',
+              message: `MCP tool catalog changed mid-run (${drift}); the run's resume binding now records the new catalog.`,
+            },
+          ],
+          stop: false,
+        };
       };
 
       // Structured-only runs go straight to finalization. Runs with tools/MCP

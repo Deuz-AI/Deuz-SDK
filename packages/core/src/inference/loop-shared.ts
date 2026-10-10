@@ -52,6 +52,7 @@ import { attachClientContext, readClientContext } from '../internal/client-conte
 // Type-only: the sink itself is created by the loop (or not at all), so nothing
 // from internal/warnings.ts is pulled into a bundle that never collects one.
 import type { WarningSink } from '../internal/warnings';
+import type { CallWarning } from '../types/methods';
 // Type-only for the same reason as `mcp/shared` in types/config.ts: the MCP
 // runtime is reached through a LITERAL dynamic import in `setupMcp` below, so a
 // call without `options.mcp` pulls none of that module graph into the bundle.
@@ -603,6 +604,8 @@ export function filterWireTools(
 export async function setupMcp(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
+  /** Where a collision between two servers is reported (2.3): the loop's warning sink. */
+  warn?: (warning: CallWarning) => void,
 ): Promise<ResolvedMcpRuntime | undefined> {
   const entries = options.mcp;
   if (!entries || entries.length === 0) return undefined;
@@ -613,6 +616,7 @@ export async function setupMcp(
     // an MCP connection opened by the loop must not schedule ambient timers.
     clock: deps.clock,
     ...(deps.mcpPool ? { mcpPool: deps.mcpPool } : {}),
+    ...(warn ? { warn } : {}),
   });
 }
 
@@ -621,13 +625,30 @@ export async function setupMcp(
  * Explicit tools always win a name collision — they were written by hand at the
  * call site, and a remote server must never be able to shadow a local tool by
  * exporting the same name.
+ *
+ * The collision is no longer silent (2.3): each MCP tool a local one shadows is
+ * reported through `warn` as an `unsupported-tool` warning with `setting: 'mcp'`
+ * — the server's tool is not offered, and its owner should know.
  */
 export function mergeMcpTools(
   mcp: ResolvedMcpRuntime | undefined,
   tools: ToolSet | undefined,
+  warn?: (warning: CallWarning) => void,
 ): ToolSet {
   const own = tools ?? {};
-  return mcp ? { ...mcp.tools, ...own } : own;
+  if (!mcp) return own;
+  if (warn) {
+    for (const name of Object.keys(mcp.tools)) {
+      if (Object.prototype.hasOwnProperty.call(own, name)) {
+        warn({
+          type: 'unsupported-tool',
+          setting: 'mcp',
+          message: `mcp: the local tool '${name}' shadows the MCP tool of the same name — the server's tool is not offered`,
+        });
+      }
+    }
+  }
+  return { ...mcp.tools, ...own };
 }
 
 /**
@@ -650,13 +671,96 @@ export async function refreshMcpTools(
   mcp: ResolvedMcpRuntime,
   own: ToolSet,
   deps: ResolvedDependencies,
+  warn?: (warning: CallWarning) => void,
 ): Promise<ToolSet> {
   try {
     await mcp.refresh();
   } catch (error) {
     deps.logger.warn('mcp: tool-list refresh failed — keeping the previous catalog', { error });
   }
-  return mergeMcpTools(mcp, own);
+  return mergeMcpTools(mcp, own, warn);
+}
+
+/** `providerMetadata.deuz.stoppedBy` (and a native stop reason) for a mid-run catalog change. */
+export const MCP_CATALOG_CHANGED_STOPPED_BY = 'mcp-catalog-changed';
+
+/** What a run does when an MCP server changes its tool catalog mid-run (2.3). */
+export type CatalogChangePolicy = 'stop' | 'accept';
+
+/**
+ * A call's `onCatalogChange` (2.3). Native runs declare it on `AgentRunOptions`
+ * and decide it in the runner (default `'stop'`); the legacy loops read it here,
+ * default `'accept'`. An unknown value is refused.
+ */
+export function catalogChangePolicy(options: CommonCallOptions): CatalogChangePolicy {
+  const value = (options as { onCatalogChange?: unknown }).onCatalogChange;
+  if (value === undefined) return 'accept';
+  if (value === 'stop' || value === 'accept') return value;
+  throw new TypeError("onCatalogChange must be 'stop' or 'accept'.");
+}
+
+/** A tool's part of a catalog comparison: its description and schemas. */
+function catalogEntry(tool: Tool): string {
+  return JSON.stringify([tool.description ?? null, tool.parameters, tool.outputSchema ?? null]);
+}
+
+/**
+ * How an MCP catalog changed across a refresh (2.3), as `added: …; removed: …;
+ * changed: …` text; `undefined` when nothing did — servers may announce
+ * `tools/list_changed` without a change.
+ */
+export function mcpCatalogDiff(before: ToolSet, after: ToolSet): string | undefined {
+  const added = Object.keys(after).filter((name) => !Object.hasOwn(before, name));
+  const removed = Object.keys(before).filter((name) => !Object.hasOwn(after, name));
+  const changed = Object.keys(after).filter(
+    (name) =>
+      Object.hasOwn(before, name) && catalogEntry(before[name]!) !== catalogEntry(after[name]!),
+  );
+  const parts = (
+    [
+      ['added', added],
+      ['removed', removed],
+      ['changed', changed],
+    ] as const
+  )
+    .filter(([, names]) => names.length > 0)
+    .map(([kind, names]) => `${kind}: ${names.join(', ')}`);
+  return parts.length > 0 ? parts.join('; ') : undefined;
+}
+
+/** A refresh's verdict: the warnings to report, and whether the run stops. */
+export interface CatalogChangeVerdict {
+  warnings: CallWarning[];
+  stop: boolean;
+}
+
+/**
+ * What a legacy loop does with a catalog that changed mid-run (2.3): `'accept'`
+ * (the default) carries on with it and reports the change; `'stop'` ends the run
+ * before the model is offered the new catalog (`stoppedBy:
+ * 'mcp-catalog-changed'`).
+ */
+export function legacyCatalogVerdict(
+  before: ToolSet,
+  after: ToolSet,
+  policy: CatalogChangePolicy,
+): CatalogChangeVerdict {
+  const drift = mcpCatalogDiff(before, after);
+  if (!drift) return { warnings: [], stop: false };
+  const outcome =
+    policy === 'stop'
+      ? "the run stopped before offering it (onCatalogChange: 'stop')"
+      : 'the run continues with the new catalog';
+  return {
+    warnings: [
+      {
+        type: 'other',
+        setting: 'mcp',
+        message: `MCP tool catalog changed mid-run (${drift}); ${outcome}.`,
+      },
+    ],
+    stop: policy === 'stop',
+  };
 }
 
 /**

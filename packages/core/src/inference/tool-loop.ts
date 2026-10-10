@@ -1,6 +1,6 @@
 import type { CommonCallOptions } from '../types/config';
 import { createWarningSink } from '../internal/warnings';
-import type { GenerateTextResult } from '../types/methods';
+import type { CallWarning, GenerateTextResult } from '../types/methods';
 import type { Message } from '../types/message';
 import type { Usage } from '../types/usage';
 import type { ToolCall, ToolSet, StepResult, ToolApprovalRequest } from '../types/tool';
@@ -17,6 +17,9 @@ import {
   setupMcp,
   mergeMcpTools,
   refreshMcpTools,
+  catalogChangePolicy,
+  legacyCatalogVerdict,
+  MCP_CATALOG_CHANGED_STOPPED_BY,
   closeMcp,
   setupCompaction,
   runCompaction,
@@ -126,6 +129,10 @@ export async function runToolLoop(
   // per-step sink would report a single stripped setting once per step. The
   // sink's own dedupe only works if every step shares it.
   const warnings = createWarningSink(deps.logger);
+  /** MCP name collisions (2.3) reach the same sink. */
+  const warn = (warning: CallWarning): void => {
+    warnings.add(warning);
+  };
   // A USD budget needs the accumulator even without a price provider (2.3):
   // every model is then unpriced, and `budget.unknownPrice` decides.
   const usageCost =
@@ -366,11 +373,13 @@ export async function runToolLoop(
       : {};
 
   try {
+    // What a mid-run MCP catalog change does (2.3); an unknown value fails the call.
+    const catalogPolicy = catalogChangePolicy(options);
     // Zero-config MCP (2.0): connect BEFORE the wire is built, so the servers'
     // tools are part of the very first model call. Explicit `tools` are merged
     // LAST and always win a name collision.
-    mcp = await setupMcp(options, deps);
-    tools = mergeMcpTools(mcp, ownTools);
+    mcp = await setupMcp(options, deps, warn);
+    tools = mergeMcpTools(mcp, ownTools, warn);
     // Handoff (2.0): the transfer catalog is read from the ROOT set, ONCE — an
     // agent's own set never carries a transfer to itself, so re-deriving it
     // later would lose targets one by one.
@@ -388,7 +397,7 @@ export async function runToolLoop(
         deps.logger,
       );
       ownTools = active.tools;
-      tools = mergeMcpTools(mcp, ownTools);
+      tools = mergeMcpTools(mcp, ownTools, warn);
       if (durable) durable.handoff = internal.resumeHandoff;
       retargetCompaction(compactionRunner, options, deps, active.model);
     }
@@ -434,7 +443,7 @@ export async function runToolLoop(
           messages = swap.messages;
           handoffLog.push(swap.entry);
           ownTools = active.tools;
-          tools = mergeMcpTools(mcp, ownTools);
+          tools = mergeMcpTools(mcp, ownTools, warn);
           fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
           staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
           retargetCompaction(compactionRunner, options, deps, active.model);
@@ -527,6 +536,32 @@ export async function runToolLoop(
       const logCompaction = (e: CompactionEvent, trigger: CompactionTrigger): void => {
         deps.logger.info(`compaction[${trigger}]: ${e.layer} ${e.tokensBefore}->${e.tokensAfter}`);
       };
+      // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
+      // the last step gets re-read HERE, first thing in the step, so the new
+      // catalog is on the wire from the very next call. Rebuilding both wires
+      // (not just the full one) keeps `activeTools` applied to the refreshed
+      // set, and `prepareStep` below still has the last word. A catalog that
+      // really changed is reported, or ends the run before any model sees it
+      // (2.3, `onCatalogChange: 'stop'`).
+      if (mcp?.changed()) {
+        const before = mcp.tools;
+        // `ownTools`, not `options.tools`: after a handoff the local half of the
+        // set belongs to the ACTIVE agent, and re-merging the caller's would
+        // silently undo the transfer.
+        tools = await refreshMcpTools(mcp, ownTools, deps, warn);
+        const verdict = legacyCatalogVerdict(before, mcp.tools, catalogPolicy);
+        for (const warning of verdict.warnings) warnings.add(warning);
+        if (verdict.stop) {
+          stoppedBy = MCP_CATALOG_CHANGED_STOPPED_BY;
+          endReason = 'stop-condition';
+          if (durable) {
+            await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+          }
+          break;
+        }
+        fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+        staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
+      }
       // Compaction first, so prepareStep sees (and has the last word on) the
       // compacted history.
       if (compactionRunner) {
@@ -540,19 +575,6 @@ export async function runToolLoop(
           observeCtx,
           recallOverheadTokens,
         );
-      }
-      // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
-      // the last step gets re-read HERE, so the new catalog is on the wire from
-      // the very next call. Rebuilding both wires (not just the full one) keeps
-      // `activeTools` applied to the refreshed set, and `prepareStep` below
-      // still has the last word.
-      if (mcp?.changed()) {
-        // `ownTools`, not `options.tools`: after a handoff the local half of the
-        // set belongs to the ACTIVE agent, and re-merging the caller's would
-        // silently undo the transfer.
-        tools = await refreshMcpTools(mcp, ownTools, deps);
-        fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
-        staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
       }
       const prepared = await applyPrepareStep(
         // Handoff (2.0): the active agent's model drives every step after the
@@ -1010,7 +1032,7 @@ export async function runToolLoop(
         messages = swap.messages;
         handoffLog.push(swap.entry);
         ownTools = active.tools;
-        tools = mergeMcpTools(mcp, ownTools);
+        tools = mergeMcpTools(mcp, ownTools, warn);
         fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
         staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
         // Compaction is measured against — and summarized by — whoever is

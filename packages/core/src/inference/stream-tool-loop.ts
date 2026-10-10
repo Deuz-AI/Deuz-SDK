@@ -41,6 +41,9 @@ import {
   setupMcp,
   mergeMcpTools,
   refreshMcpTools,
+  catalogChangePolicy,
+  legacyCatalogVerdict,
+  MCP_CATALOG_CHANGED_STOPPED_BY,
   closeMcp,
   setupCompaction,
   runCompaction,
@@ -95,6 +98,7 @@ import {
   modelGate,
   setModelGate,
   type ActiveAgentState,
+  type CatalogChangeVerdict,
   type CompactionTrigger,
   type Denial,
   type DurableRunner,
@@ -159,9 +163,10 @@ export interface StreamToolLoopInternal {
     runtime: ResolvedMcpRuntime;
     /**
      * Called after each hot refresh, before the refreshed catalog reaches the
-     * wire. It records the catalog; its warnings go out as `warning` parts.
+     * wire. The runner applies its `onCatalogChange` (2.3): it records an
+     * accepted catalog, or stops the run; its warnings go out as `warning` parts.
      */
-    refreshed(): Promise<CallWarning[]>;
+    refreshed(): Promise<CatalogChangeVerdict>;
   };
   /**
    * The warning sink of a run this loop is one part of (2.3), in place of the
@@ -228,6 +233,10 @@ export function runStreamToolLoop(
   // a declared always-present readout, never an opt-in. A runner that owns
   // the whole run may hand in its own sink (2.3).
   const warningSink = internal?.warnings ?? createWarningSink(deps.logger);
+  /** MCP name collisions (2.3) reach the same sink. */
+  const warn = (warning: CallWarning): void => {
+    warningSink.add(warning);
+  };
   const warningsDeferred = createDeferred<CallWarning[]>();
 
   let started = false;
@@ -697,12 +706,14 @@ export function runStreamToolLoop(
     };
 
     try {
+      // What a mid-run MCP catalog change does (2.3); an unknown value fails the run.
+      const catalogPolicy = catalogChangePolicy(options);
       // Zero-config MCP (2.0): connect BEFORE the wire is built so the servers'
       // tools ride the very first model call. Inside the try on purpose — an
       // unreachable server rejects here, and the pump's catch turns that into an
       // `error` part with rejected promises, which is what keeps G2 intact.
-      mcp = internal?.mcp ? internal.mcp.runtime : await setupMcp(options, deps);
-      tools = mergeMcpTools(mcp, ownTools);
+      mcp = internal?.mcp ? internal.mcp.runtime : await setupMcp(options, deps, warn);
+      tools = mergeMcpTools(mcp, ownTools, warn);
       // Handoff (2.0): the transfer catalog is read from the ROOT set, ONCE — an
       // agent's own set never carries a transfer to itself, so re-deriving it
       // later would lose targets one by one.
@@ -721,7 +732,7 @@ export function runStreamToolLoop(
           deps.logger,
         );
         ownTools = active.tools;
-        tools = mergeMcpTools(mcp, ownTools);
+        tools = mergeMcpTools(mcp, ownTools, warn);
         if (durable) durable.handoff = resumeHandoff;
         retargetCompaction(compactionRunner, options, deps, active.model);
       }
@@ -785,7 +796,7 @@ export function runStreamToolLoop(
             handoffLog.push(swap.entry);
             broadcaster.push({ type: 'handoff', ...swap.entry });
             ownTools = active.tools;
-            tools = mergeMcpTools(mcp, ownTools);
+            tools = mergeMcpTools(mcp, ownTools, warn);
             fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
             staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
             flushWarnings();
@@ -903,6 +914,35 @@ export function runStreamToolLoop(
         assertStepDeadline();
         stepTimeout?.clear();
         stepTimeout = createStepTimeout(deps.clock, timeouts.stepMs);
+        // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
+        // the last step is re-read HERE, before the step starts, so the new
+        // catalog is on the wire from the very next call. Both wires are rebuilt
+        // so `activeTools` still applies to the refreshed set; `prepareStep`
+        // below keeps the last word. A catalog that really changed is reported,
+        // or ends the run before any model sees it (2.3, `onCatalogChange`): a
+        // native run decides that itself and records the catalog it accepts.
+        if (mcp?.changed()) {
+          const before = mcp.tools;
+          // `ownTools`, not `options.tools`: after a handoff the local half of
+          // the set belongs to the ACTIVE agent, and re-merging the caller's
+          // would silently undo the transfer.
+          tools = await refreshMcpTools(mcp, ownTools, deps, warn);
+          const verdict = internal?.mcp
+            ? await internal.mcp.refreshed()
+            : legacyCatalogVerdict(before, mcp.tools, catalogPolicy);
+          for (const warning of verdict.warnings) warningSink.add(warning);
+          if (verdict.stop) {
+            stoppedBy = MCP_CATALOG_CHANGED_STOPPED_BY;
+            endReason = 'stop-condition';
+            if (durable) {
+              await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+            }
+            break;
+          }
+          fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+          staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
+          flushWarnings();
+        }
         broadcaster.push({ type: 'step-start', stepIndex });
         const stepSpan = lo?.rt.startSpan();
         if (observeCtx && stepSpan) {
@@ -937,22 +977,6 @@ export function runStreamToolLoop(
             observeCtx,
             recallOverheadTokens,
           );
-        }
-        // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
-        // the last step is re-read HERE, so the new catalog is on the wire from
-        // the very next call. Both wires are rebuilt so `activeTools` still
-        // applies to the refreshed set; `prepareStep` below keeps the last word.
-        if (mcp?.changed()) {
-          // `ownTools`, not `options.tools`: after a handoff the local half of
-          // the set belongs to the ACTIVE agent, and re-merging the caller's
-          // would silently undo the transfer.
-          tools = await refreshMcpTools(mcp, ownTools, deps);
-          // A native run records the refreshed catalog (2.3, F01) before the
-          // model is offered it, and reports how the catalog changed.
-          for (const warning of (await internal?.mcp?.refreshed()) ?? []) warningSink.add(warning);
-          fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
-          staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
-          flushWarnings();
         }
         const prepared = await applyPrepareStep(
           // Handoff (2.0): the active agent's model drives every step after the
@@ -1639,7 +1663,7 @@ export function runStreamToolLoop(
           handoffLog.push(swap.entry);
           broadcaster.push({ type: 'handoff', ...swap.entry });
           ownTools = active.tools;
-          tools = mergeMcpTools(mcp, ownTools);
+          tools = mergeMcpTools(mcp, ownTools, warn);
           fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
           staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
           flushWarnings();

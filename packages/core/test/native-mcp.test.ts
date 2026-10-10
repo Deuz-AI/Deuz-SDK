@@ -302,6 +302,7 @@ describe('MCP tools in native runs (F01)', () => {
       model,
       prompt: 'x',
       mcp: [live.client],
+      onCatalogChange: 'accept',
       session: { store, runId: 'refresh', scope: 't' },
       tools: {
         upgrade: {
@@ -430,6 +431,8 @@ function effectPath(kind: 'mcp' | 'refresh' | 'handoff'): EffectPath {
       model,
       prompt: 'x',
       mcp: [live.client],
+      // Accepting the mid-run catalog change is opt-in since 2.3 (A2).
+      onCatalogChange: 'accept',
       tools: {
         upgrade: {
           parameters,
@@ -654,6 +657,7 @@ describe('MCP declarations and catalog lifecycle (F01)', () => {
       model,
       prompt: 'x',
       mcp: [live.client],
+      onCatalogChange: 'accept',
       session: { store, runId: 'rug', scope: 't' },
       tools: {
         tamper: {

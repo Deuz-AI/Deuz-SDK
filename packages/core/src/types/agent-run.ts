@@ -74,6 +74,9 @@ export type AgentToolSet = Record<string, AgentTool<any, any, any>>;
  */
 export type AgentMcpReplay = 'idempotent' | Readonly<Record<string, 'idempotent'>>;
 
+/** `AgentRunOptions.onCatalogChange` (2.3): stop the run, or accept the new MCP catalog. */
+export type AgentMcpCatalogChange = 'stop' | 'accept';
+
 /**
  * One `mcp` entry of a native run (2.3): any `CommonCallOptions.mcp` entry. A
  * config or `{ client }` entry may also declare `replay`.
@@ -265,6 +268,15 @@ export type AgentRunOptions<T = string> = Omit<
    * declare `replay` for its idempotent tools.
    */
   mcp?: AgentMcpEntry[];
+  /**
+   * What the run does when an MCP server changes its tool catalog mid-run (2.3):
+   * `'stop'` (the default) ends it with reason `'mcp-catalog-changed'` before the
+   * model is offered the new catalog, and keeps the catalog the run is bound to;
+   * `'accept'` records the new catalog as the run's binding and carries on. Both
+   * report the change as a `warning` part (`setting: 'mcp'`); an announcement
+   * that changed nothing does neither.
+   */
+  onCatalogChange?: AgentMcpCatalogChange;
   toolsContext?: Record<string, unknown>;
   session?: AgentRunSession;
   output?: AgentOutput<T>;
