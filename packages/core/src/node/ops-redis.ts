@@ -40,6 +40,10 @@ import {
   script,
 } from './redis-scripts';
 
+// The Redis budget store shares this Node-only subpath, as on SQLite and
+// Postgres: one import for every durable ops store on Redis.
+export { createRedisBudgetStore } from './redis-budget';
+export type { RedisBudgetStore, RedisBudgetStoreOptions } from './redis-budget';
 export { wrapIoredisClient } from './store-redis';
 export type { IoredisClientLike, RedisScriptClient } from './store-redis';
 

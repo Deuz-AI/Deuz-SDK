@@ -11,7 +11,7 @@ vi.mock('../src/node/redis-scripts', async (importOriginal) => ({
   PRUNE_BATCH: 4,
 }));
 
-const { createRedisOpsStore } = await import('../src/node/ops-redis');
+const { createRedisOpsStore, createRedisBudgetStore } = await import('../src/node/ops-redis');
 const { envelope } = await import('./fixtures/agent-run-store-conformance');
 const { mockRedisServer } = await import('./fixtures/redis-harness');
 
@@ -47,5 +47,31 @@ describe('Redis ops store retention in batches of four', () => {
     expect(await ops.agentRuns.prune(server.now())).toBe(9);
     expect(await server.redis.zcard('{deuz:ops}:claims')).toBe(0);
     expect(await server.redis.hlen('{deuz:ops}:run:payload')).toBe(0);
+  });
+});
+
+describe('Redis budget store retention in batches of four', () => {
+  it('deletes request records a batch at a time and folds every page of scopes', async () => {
+    const server = mockRedisServer();
+    const store = createRedisBudgetStore({ client: server.client });
+    // Nine scopes, each with two settled buckets of one model to fold.
+    const scopes = Array.from({ length: 9 }, (_, index) => ({
+      key: `user:${index}`,
+      limits: { tokens: 1_000 },
+      window: { ms: 400, buckets: 4 },
+    }));
+    for (const round of [0, 1]) {
+      for (const scope of scopes) {
+        const requestId = `${scope.key}#${round}`;
+        await store.reserve({ requestId, modelId: 'm', tokens: 10, scopes: [scope] });
+        await store.settle(requestId, { tokens: 10, usd: 0.5 });
+      }
+      await server.advance(100);
+    }
+    await server.advance(600);
+    const before = await Promise.all(scopes.map((scope) => store.usage(scope.key)));
+    expect(await store.prune({ before: server.now() })).toEqual({ requests: 18, buckets: 9 });
+    expect(await Promise.all(scopes.map((scope) => store.usage(scope.key)))).toEqual(before);
+    expect(await store.prune({ before: server.now() })).toEqual({ requests: 0, buckets: 0 });
   });
 });
