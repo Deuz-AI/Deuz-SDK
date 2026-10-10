@@ -642,6 +642,10 @@ import type { AgentToolReceipt, AgentMcpEntry, AgentRunEnvelope, AgentResult } f
 expectTypeOf<'failed'>().toMatchTypeOf<AgentToolReceipt['stage']>();
 expectTypeOf<AgentMcpEntry>().not.toBeNever();
 expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['mcp']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['handoffs']>().toEqualTypeOf<
+  string | undefined
+>();
+expectTypeOf<AgentToolReceipt['idempotent']>().toEqualTypeOf<boolean | undefined>();
 expectTypeOf<GenerateTextResult['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
 expectTypeOf<AgentResult['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
 

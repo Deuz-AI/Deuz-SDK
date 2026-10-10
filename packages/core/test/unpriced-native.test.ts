@@ -351,6 +351,32 @@ describe('the unpriced-model warning reaches a native stream once (decision 4)',
     expect(unpricedParts(parts)).toBe(1);
   });
 
+  it('a run with a loop phase and a finalization streams it once', async () => {
+    const model = createMockModel({
+      responses: [
+        { toolCalls: [{ toolName: 'noop', id: 'n1', args: {} }] },
+        { text: 'ready' },
+        { text: '{"answer":"x"}' },
+      ],
+    });
+    const parts = await streamedParts(
+      streamAgent({
+        model,
+        prompt: 'x',
+        tools: { noop: { parameters: schema, execute: () => 'ok' } },
+        budget: { usd: 1 },
+        deps: { priceProvider: prices },
+        output: {
+          schema: { type: 'object', properties: { answer: { type: 'string' } } },
+          mode: 'json' as const,
+          validate: (value: unknown) => value as { answer: string },
+        },
+      }),
+    );
+    // Before: the loop and the finalization each had a sink, so it came twice.
+    expect(unpricedParts(parts)).toBe(1);
+  });
+
   it('a run with two model steps streams it exactly once', async () => {
     const model = createMockModel({
       responses: [{ toolCalls: [{ toolName: 'noop', id: 'n1', args: {} }] }, { text: 'done' }],

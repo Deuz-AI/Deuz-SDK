@@ -171,13 +171,16 @@
     "facts tables are built by /* @__PURE__ */ calls: without that the core entry carried them",
     "(+6.1 KB) although nothing reached them.",
     "Lazy groups: mcp 22500 / 8450 (native runs fingerprint MCP catalogs, F01; dual-stack MCP client);",
-    "native-request 3600 / 1700 in core, 2700 / 1375 elsewhere (wire-cap reservation F12, unpriced",
+    "native-request 4300 / 1950 in core, 3400 / 1650 elsewhere (wire-cap reservation F12, unpriced",
     "policy, settlement retries F17); usage-cost 3200 / 1400 (unpriced counters, admit, F13); new",
     "optional chunks sdk-v2 (MCP 2026-07-28 client) 13100 / 5300 and native-mcp (MCP receipts in",
     "native runs) 24200 / 9000.",
     "New bundles: mcp-server 15697 / 6031 eager -> 17150 / 6570, lazy 227815 / 72870 (the native",
     "agent machinery, loaded only when agents or agentTools are served) -> 239000 / 76500; realtime",
-    "44443 / 15343 -> 48700 / 16800. ./mcp/server/stdio is Node-only and not budgeted."
+    "44443 / 15343 -> 48700 / 16800. ./mcp/server/stdio is Node-only and not budgeted.",
+    "Raised again after the W1 review fixes: native-request 4004 / 1837 measured in core (the F12 cap",
+    "sent under a bound, the F17 conflict handling and decision 4's per-run reporting).",
+    "evolve 189775 B raw after the W1 review fixes (run-ledger marking, per-run warnings) -> 199000 / 63100."
   ],
   "bundles": {
     "core": {
@@ -191,8 +194,8 @@
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 3600,
-          "maxGzipBytes": 1700
+          "maxRawBytes": 4300,
+          "maxGzipBytes": 1950
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
@@ -222,8 +225,8 @@
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 2700,
-          "maxGzipBytes": 1375
+          "maxRawBytes": 3400,
+          "maxGzipBytes": 1650
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
@@ -272,8 +275,8 @@
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 2700,
-          "maxGzipBytes": 1375
+          "maxRawBytes": 3400,
+          "maxGzipBytes": 1650
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
@@ -308,8 +311,8 @@
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 2700,
-          "maxGzipBytes": 1375
+          "maxRawBytes": 3400,
+          "maxGzipBytes": 1650
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
@@ -362,16 +365,16 @@
         "applySearchReplace",
         "parseEvolveBlocks"
       ],
-      "maxRawBytes": 189600,
-      "maxGzipBytes": 60100,
+      "maxRawBytes": 199000,
+      "maxGzipBytes": 63100,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 2700,
-          "maxGzipBytes": 1375
+          "maxRawBytes": 3400,
+          "maxGzipBytes": 1650
         },
         "usage-cost": {
           "entryPoint": "usage-cost",

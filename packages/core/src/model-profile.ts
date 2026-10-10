@@ -569,7 +569,13 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
   const caps = getCapabilities(model);
   const match = registryMatch(model);
   const facts =
-    match === 'exact' ? FACTS[model.modelId] : match === 'family' ? CLAUDE_5_FAMILY : undefined;
+    match === 'exact'
+      ? Object.hasOwn(FACTS, model.modelId)
+        ? FACTS[model.modelId]
+        : undefined
+      : match === 'family'
+        ? CLAUDE_5_FAMILY
+        : undefined;
   const claimed: Partial<Record<string, unknown>> = readConfig(model)?.capabilities ?? {};
   const protocol = model.surface;
   const wire = effortWire(protocol, caps, model.modelId);

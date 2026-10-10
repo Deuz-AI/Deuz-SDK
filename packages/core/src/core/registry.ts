@@ -836,14 +836,22 @@ function defaultNativeRow(): Row {
 /** How a descriptor's slug was answered (2.3; also read by the model profile). */
 export type RegistryMatch = 'exact' | 'family' | 'fallback';
 
+/**
+ * A table's own row for `modelId` (2.3): `constructor`, `toString` or
+ * `__proto__` are model ids like any other, never inherited object members.
+ */
+function ownRow<T>(table: Record<string, T>, modelId: string): T | undefined {
+  return Object.hasOwn(table, modelId) ? table[modelId] : undefined;
+}
+
 /** The table entry for a descriptor — pure, no logging. */
 function lookup(model: LanguageModel): { row: Row; match: RegistryMatch } {
   // Native surface is keyed in its own table so a slug can serve both wires.
   if (model.surface === 'native') {
-    const nrow = NATIVE_REGISTRY[model.modelId];
+    const nrow = ownRow(NATIVE_REGISTRY, model.modelId);
     return nrow ? { row: nrow, match: 'exact' } : { row: defaultNativeRow(), match: 'fallback' };
   }
-  const known = REGISTRY[model.modelId];
+  const known = ownRow(REGISTRY, model.modelId);
   if (known) return { row: known, match: 'exact' };
   if (model.surface === 'anthropic' && isClaude5Family(model.modelId)) {
     return { row: claude5FamilyRow(), match: 'family' };
@@ -1167,7 +1175,7 @@ export function getEmbeddingCapabilities(
   model: EmbeddingModel,
   logger?: Logger,
 ): EmbeddingCapabilities {
-  const known = EMBEDDING_REGISTRY[model.modelId];
+  const known = ownRow(EMBEDDING_REGISTRY, model.modelId);
   if (known) return { ...known, known: true };
   logger?.warn(
     `Unknown embedding model '${model.modelId}' — using conservative ${model.provider}/${model.surface} defaults.`,

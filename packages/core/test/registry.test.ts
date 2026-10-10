@@ -4,8 +4,10 @@ import {
   getEmbeddingCapabilities,
   getModelCapabilities,
   isMaxOutputPlaceholder,
+  registryMatch,
   type ModelCapabilities,
 } from '../src/core/registry';
+import { resolveModelProfile } from '../src/model-profile';
 import { generateText } from '../src/generate';
 import {
   createOpenAICompatible,
@@ -487,4 +489,25 @@ describe('registry: 2026-07 embedding catalog', () => {
     });
     expect(caps.known).toBe(false);
   });
+});
+
+describe('registry lookups read own rows only (2.3)', () => {
+  it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])(
+    '%s is an unknown model, not an inherited object member',
+    (modelId) => {
+      for (const surface of ['anthropic', 'chat_completions', 'responses', 'native'] as const) {
+        expect(registryMatch({ provider: 'x', surface, modelId }), surface).toBe('fallback');
+        const caps = getModelCapabilities({ provider: 'x', surface, modelId });
+        expect(caps.known, surface).toBe(false);
+        expect(caps.maxOutput, surface).toBeGreaterThan(0);
+      }
+      expect(
+        getEmbeddingCapabilities({ provider: 'openai', surface: 'openai-embeddings', modelId })
+          .known,
+      ).toBe(false);
+      expect(resolveModelProfile({ provider: 'x', surface: 'responses', modelId }).match).toBe(
+        'fallback',
+      );
+    },
+  );
 });

@@ -21,6 +21,7 @@ import type { ExecutionContextSnapshot, NativeExecutionContext } from './types/e
 import { createBroadcaster, createDeferred } from './internal/async-iter';
 import { resolveDependencies } from './internal/resolve-deps';
 import { createWarningSink } from './internal/warnings';
+import { markRunLedger } from './internal/run-ledger';
 import { parsePartialJson } from './internal/partial-json';
 import { foldCallInput } from './generate';
 import { inputShapeError } from './core/normalize';
@@ -466,7 +467,12 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               budget: options.budget,
               persist: persistLedger,
             });
+        // The run owns this ledger, so its sub-agents report a warning once too.
+        markRunLedger(common.execution.ledger);
       }
+      // One warning sink for the whole run (2.3): the loop phases and every
+      // finalization attempt report and stream each warning once.
+      const runWarnings = createWarningSink(resolveDependencies(options.deps).logger);
       if (!resume) envelope.messages = [...common.messages];
       common.messages = envelope.messages;
       // Validate ALL schema/context configuration before the first paid call.
@@ -824,6 +830,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               ...(nativeMcp
                 ? { mcp: { runtime: nativeMcp.runtime, refreshed: recordCatalog } }
                 : {}),
+              warnings: runWarnings,
             },
           );
           for await (const part of inner.fullStream) {
@@ -914,9 +921,6 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         finalizeTools = wire && wire.tools.length > 0 ? { ...wire, toolChoice: 'none' } : undefined;
         return finalizeTools;
       };
-      // One sink for every finalization attempt, so a re-drive does not repeat
-      // a warning its first attempt already reported.
-      const finalizeWarnings = createWarningSink(resolveDependencies(options.deps).logger);
       for (;;) {
         if (envelope.candidateText === undefined) {
           if (!(await checkLimit())) return;
@@ -972,7 +976,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                   }
                 : {}),
               ...(toolRequest ? { tools: toolRequest } : {}),
-              warnings: finalizeWarnings,
+              warnings: runWarnings,
             },
           );
           let buffer = '';

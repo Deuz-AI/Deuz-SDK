@@ -136,7 +136,8 @@ export interface BudgetSweepOptions {
    * Holds reserved before this time (epoch milliseconds on the store's clock)
    * are stale. Choose it well past your longest call and its settlement
    * retries: a sweep that closes a hold its caller is about to settle makes
-   * that settlement fail as a conflict.
+   * that settlement fail as a conflict. A BudgetLedger accepts that conflict as
+   * already closed (2.3), and the store keeps the sweep's amounts.
    */
   readonly before: number;
   /**

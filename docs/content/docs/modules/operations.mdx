@@ -407,7 +407,7 @@ The records inside carry versions of their own:
 | Record | Versions |
 | --- | --- |
 | Legacy loop checkpoint (`AgentCheckpoint.version`) | 1. Since 2.3, `deserializeCheckpoint` and `resumeFromCheckpoint` refuse any other version with `CheckpointVersionError` (code `checkpoint_version_unsupported`); a checkpoint without a version reads as 1 |
-| Native run envelope (`AgentRunEnvelope.version`) | 1; a resume refuses any other. Its `revision` is the write fence, not a format version |
+| Native run envelope (`AgentRunEnvelope.version`) | 1; a resume refuses any other, and since 2.3 also an envelope holding a loop or sub-agent checkpoint whose version is not 1 (`CheckpointVersionError`), before anything is written. Its `revision` is the write fence, not a format version |
 | Swarm run (`SwarmRunRecord.version`) | 1 for a fixed DAG, 2 for a dynamic run (2.2), which 2.1 refuses |
 | Execution snapshot (`ExecutionContextSnapshot.version`) | 1, or 2 when it carries persistent admission (2.2), which 2.1 refuses |
 | Ledger snapshot (`BudgetLedgerSnapshot.version`) | 1, or 2 when it carries folded aggregates or persistent admission (2.2), which 2.1 refuses |
