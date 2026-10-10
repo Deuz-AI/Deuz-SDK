@@ -3,6 +3,7 @@ import {
   getCapabilities,
   getEmbeddingCapabilities,
   getModelCapabilities,
+  isMaxOutputPlaceholder,
   type ModelCapabilities,
 } from '../src/core/registry';
 import { generateText } from '../src/generate';
@@ -240,6 +241,16 @@ describe('registry: 2026-07 Google catalog', () => {
       surface: 'native',
     });
     expect(caps.known).toBe(true);
+  });
+  it('gemini-3.1-pro, the GA id, is known on both wires: natively it shares the preview row', () => {
+    const on = (modelId: string, surface: 'native' | 'chat_completions') =>
+      getCapabilities({ provider: 'google', modelId, surface });
+    const ga = on('gemini-3.1-pro', 'native');
+    expect(ga).toEqual(on('gemini-3.1-pro-preview', 'native'));
+    expect(ga.known).toBe(true);
+    // A documented limit, not the fallback's placeholder: the native wire sends it.
+    expect(isMaxOutputPlaceholder(ga)).toBe(false);
+    expect(on('gemini-3.1-pro', 'chat_completions').known).toBe(true);
   });
 });
 

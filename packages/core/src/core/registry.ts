@@ -366,6 +366,12 @@ const REGISTRY: Record<string, Row> = {
   // a reasoning model. Every GPT-5 model reasons and rejects sampling
   // parameters. The GPT-5.6 rows (GPT-5.6 is Sol) and the pro/codex snapshots
   // pin no limits: placeholder cap, never sent. Not live-verified.
+  // Effort: the level sets OpenAI publishes per snapshot, research-dated
+  // (2026-10-10) and NOT live-verified. gpt-5 / -mini / -nano take
+  // minimal…high, and 'minimal' has no Deuz level, so 'none' is sent as 'low';
+  // gpt-5.1 takes none…high, gpt-5.2 none…xhigh, gpt-5-pro high only. No set
+  // is pinned for the GPT-5.6 rows or the 5.2-pro / 5.4-pro / 5.2-codex
+  // snapshots: they keep the wire's historical mapping, like gpt-6-astra.
   'gpt-5.6-sol': undocumentedOutput('openai', 'responses', {
     reasoning: true,
     samplingRestrictions: true,
@@ -388,6 +394,8 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high', 'xhigh'],
+    effortNone: 'send',
   }),
   'gpt-5.1': row('openai', 'responses', {
     vision: true,
@@ -395,6 +403,8 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high'],
+    effortNone: 'send',
   }),
   'gpt-5': row('openai', 'responses', {
     vision: true,
@@ -402,6 +412,8 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high'],
+    effortNone: 'lowest',
   }),
   'gpt-5-mini': row('openai', 'responses', {
     vision: true,
@@ -409,6 +421,8 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high'],
+    effortNone: 'lowest',
   }),
   'gpt-5-nano': row('openai', 'responses', {
     vision: true,
@@ -416,6 +430,8 @@ const REGISTRY: Record<string, Row> = {
     samplingRestrictions: true,
     contextWindow: 400_000,
     maxOutput: 128_000,
+    effortLevels: ['low', 'medium', 'high'],
+    effortNone: 'lowest',
   }),
   'gpt-5.4-pro': undocumentedOutput('openai', 'responses', {
     reasoning: true,
@@ -432,6 +448,8 @@ const REGISTRY: Record<string, Row> = {
   'gpt-5-pro': undocumentedOutput('openai', 'responses', {
     reasoning: true,
     samplingRestrictions: true,
+    effortLevels: ['high'],
+    effortNone: 'lowest',
   }),
   'o4-mini': row('openai', 'responses', {
     vision: true,
@@ -511,15 +529,20 @@ const REGISTRY: Record<string, Row> = {
   // default that high turns one runaway thinking pass into a real bill. Raise it
   // per call when a long answer needs the room.
   // 2.3 (F26): reasoning cannot be turned off, so `effort: 'none'` is dropped
-  // (reported) instead of being sent as `reasoning_effort: 'none'`.
+  // (reported) instead of being sent as `reasoning_effort: 'none'`. The forced
+  // tool_choice rejection above is stated too (F14): a forced choice is sent as
+  // auto with a `clamped-setting` warning, and `generateObject` takes the json
+  // strategy — which V4 also rejects, so the gap stays (live-verified).
   'deepseek-v4-flash': row('deepseek', 'chat_completions', {
     reasoning: true,
     structuredOutput: false,
+    forcedToolChoice: false,
     effortNone: 'omit',
   }),
   'deepseek-v4-pro': row('deepseek', 'chat_completions', {
     reasoning: true,
     structuredOutput: false,
+    forcedToolChoice: false,
     effortNone: 'omit',
   }),
   // 2.3 (F08) — research-dated (roadmap 5.3, 2026-10-09), NOT live-verified.
@@ -700,6 +723,18 @@ const NATIVE_REGISTRY: Record<string, Row> = {
     contextWindow: 1_000_000,
     maxOutput: 64_000,
   }),
+  // 2.3 (F19): the GA id of the preview above. It is priced and pinned on the
+  // compat wire with the same 1M / 64K limits, but this table missed it, so the
+  // native wire ran it on the fallback. Same row as the preview; not live-verified.
+  'gemini-3.1-pro': row('google', 'native', {
+    vision: true,
+    reasoning: true,
+    caching: true,
+    nativePdf: true,
+    audio: true,
+    contextWindow: 1_000_000,
+    maxOutput: 64_000,
+  }),
   'gemini-3.1-flash-lite': row('google', 'native', {
     vision: true,
     reasoning: true,
@@ -819,6 +854,17 @@ function lookup(model: LanguageModel): { row: Row; match: RegistryMatch } {
 /** Which kind of registry entry answers for `model` (2.3). Pure: never warns. */
 export function registryMatch(model: LanguageModel): RegistryMatch {
   return lookup(model).match;
+}
+
+/**
+ * @internal True when a pinned row whose output limit is undocumented answers
+ * for `model` (2.3), whatever an override claims. Such a row pins only what its
+ * request rules need, so the model profile never reports its other values as
+ * facts unless a documentary entry states them. Not part of the package surface.
+ */
+export function isUndocumentedRow(model: LanguageModel): boolean {
+  const { row, match } = lookup(model);
+  return match === 'exact' && PLACEHOLDER_ROWS.has(row);
 }
 
 /**

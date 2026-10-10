@@ -11,6 +11,7 @@ import {
   createOpenAICompatible,
 } from '../src/providers-compat';
 import { runStream } from '../src/core/inference';
+import { generateObject } from '../src/index';
 import { InvalidRequestError } from '../src/errors';
 import type { LanguageModel } from '../src/types/model';
 import type { CommonCallOptions } from '../src/types/config';
@@ -377,6 +378,53 @@ describe('request snapshots per model id (2.3 — not live-verified)', () => {
   }
 });
 
+describe('GPT-5 snapshots: the effort sets OpenAI publishes (2.3 — research-dated, not live-verified)', () => {
+  const EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+  /**
+   * The effort each requested value reaches the wire as, in `EFFORTS` order;
+   * a trailing `*` marks a change the call reports as `clamped-setting`.
+   */
+  const SENT: [string, Make, string[]][] = [
+    // minimal / low / medium / high: 'minimal' has no Deuz level, so 'none' is sent as 'low'.
+    ...['gpt-5', 'gpt-5-mini', 'gpt-5-nano'].map((id): [string, Make, string[]] => [
+      id,
+      responses(id),
+      ['low*', 'low', 'medium', 'high', 'high*', 'high*'],
+    ]),
+    [
+      'gpt-5 (Chat Completions)',
+      chat('gpt-5'),
+      ['low*', 'low', 'medium', 'high', 'high*', 'high*'],
+    ],
+    ['gpt-5.1', responses('gpt-5.1'), ['none', 'low', 'medium', 'high', 'high*', 'high*']],
+    ['gpt-5.2', responses('gpt-5.2'), ['none', 'low', 'medium', 'high', 'xhigh', 'xhigh*']],
+    // 'high' is the only level gpt-5-pro takes.
+    ['gpt-5-pro', responses('gpt-5-pro'), ['high*', 'high*', 'high*', 'high', 'high*', 'high*']],
+    // No published set is pinned for these: the wire's historical mapping, like gpt-6-astra.
+    ...['gpt-5.6-sol', 'gpt-5.2-pro', 'gpt-5.4-pro', 'gpt-5.2-codex'].map(
+      (id): [string, Make, string[]] => [
+        id,
+        responses(id),
+        ['none', 'low', 'medium', 'high', 'xhigh', 'xhigh*'],
+      ],
+    ),
+  ];
+
+  for (const [label, make, sent] of SENT) {
+    it(`${label}: every effort value`, async () => {
+      for (const [i, effort] of EFFORTS.entries()) {
+        const got = await snapshot(make, { effort });
+        const where = `${label} effort=${effort}`;
+        if ('error' in got) throw got.error;
+        // Responses carries `reasoning: { effort }`, Chat Completions `reasoning_effort`.
+        const carried = got.wire.reasoning ?? { effort: got.wire.reasoning_effort };
+        expect(carried, where).toEqual({ effort: sent[i]!.replace('*', '') });
+        expect(got.warnings, where).toEqual(sent[i]!.endsWith('*') ? [EFFORT_CLAMPED] : []);
+      }
+    });
+  }
+});
+
 describe('forced tool choice per model id (2.3, F14 — not live-verified)', () => {
   const FORCED: WireToolRequest = {
     tools: [{ name: 'echo', parameters: { type: 'object', properties: {} } }],
@@ -399,6 +447,48 @@ describe('forced tool choice per model id (2.3, F14 — not live-verified)', () 
     });
   });
 
+  it('DeepSeek V4 sends auto, reported: it rejects a forced tool_choice in thinking mode', async () => {
+    // A live-verified rejection ("Thinking mode does not support this
+    // tool_choice", test/live/deepseek.live.test.ts) that the rows now state.
+    for (const id of ['deepseek-v4-pro', 'deepseek-v4-flash']) {
+      for (const toolChoice of ['required', { type: 'tool', toolName: 'echo' }] as const) {
+        const got = await snapshot(deepseek(id), {}, { ...FORCED, toolChoice });
+        expect(got, id).toEqual({
+          url: '/v1/chat/completions',
+          wire: { max_tokens: 8_192 },
+          warnings: ['clamped-setting:toolChoice'],
+        });
+      }
+    }
+  });
+
+  it("DeepSeek V4: generateObject mode 'tool' runs the json strategy, reported", async () => {
+    const { fetch, calls } = mockFetch(() =>
+      sseResponse([
+        sseEvents([
+          { data: { choices: [{ delta: { content: '{"a":"x"}' }, finish_reason: 'stop' }] } },
+          { data: '[DONE]' },
+        ]),
+      ]),
+    );
+    const result = await generateObject({
+      model: createDeepSeek({ apiKey: 'k', fetch })('deepseek-v4-pro'),
+      prompt: 'hi',
+      schema: {
+        type: 'object',
+        properties: { a: { type: 'string' } },
+        required: ['a'],
+        additionalProperties: false,
+      },
+      mode: 'tool',
+    });
+    const body = JSON.parse(String(calls[0]!.init!.body)) as Record<string, unknown>;
+    expect(body.tool_choice).toBeUndefined();
+    expect(body.response_format).toMatchObject({ type: 'json_schema' });
+    const modes = (result.warnings ?? []).filter((w) => w.setting === 'mode');
+    expect(modes.map((w) => w.type)).toEqual(['clamped-setting']);
+  });
+
   it('every other tracked id keeps the forced choice on its wire', async () => {
     const cases: [string, Make, Record<string, unknown>][] = [
       ['gpt-6.1-sol', responses('gpt-6.1-sol'), { tool_choice: 'required' }],
@@ -414,8 +504,8 @@ describe('forced tool choice per model id (2.3, F14 — not live-verified)', () 
         native('gemini-3.1-pro-preview'),
         { toolConfig: { functionCallingConfig: { mode: 'ANY' } } },
       ],
+      // No source states the V4 rejection for deepseek-flash, so it is not assumed.
       ['deepseek-flash', deepseek('deepseek-flash'), { tool_choice: 'required' }],
-      ['deepseek-v4-pro', deepseek('deepseek-v4-pro'), { tool_choice: 'required' }],
       ['kimi-k3', kimi('kimi-k3'), { tool_choice: 'required' }],
       ['glm-5.3', glm('glm-5.3'), { tool_choice: 'required' }],
     ];

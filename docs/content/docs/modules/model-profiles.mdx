@@ -17,9 +17,10 @@ or on an edge runtime.
 <Callout type="warn" title="Facts are dated, not live-verified">
 Anthropic facts are verified against Anthropic's API reference as cached on
 2026-10-06. OpenAI, Google, DeepSeek, Kimi, Z.ai and Qwen facts come from
-research dated 2026-10-09. No profile has been checked against the live API, so
-`liveVerified` is always `false`. Each profile carries its `sourceUrl` and
-`checkedAt` date.
+research dated 2026-10-09, and the effort levels of the earlier GPT-5 snapshots
+from 2026-10-10. No profile has been checked against the live API, so
+`liveVerified` is always `false`. A profile carries the `sourceUrl` and
+`checkedAt` date of its facts where they were checked against a source.
 </Callout>
 
 ## Resolve a profile
@@ -77,7 +78,10 @@ is reported as supported or unsupported only when:
 Everything else is `'unknown'`. For example, DeepSeek V4 rejects
 `response_format: json_schema`, so its `structuredOutput` is `'unsupported'`,
 while the newer `deepseek-flash` row keeps the same safe default without a
-source to back it, so its profile says `'unknown'`.
+source to back it, so its profile says `'unknown'`. The same holds for a pinned
+row whose limits are undocumented, such as the GPT-5.6 rows: their context
+window, vision and the other values no source states are `'unknown'`, not the
+row's conservative defaults.
 
 ```ts title="claims.ts"
 import { resolveModelProfile } from '@deuz-sdk/core';
@@ -110,6 +114,11 @@ lowest one) and reported as a `clamped-setting` warning. `effort.none` says what
 | `'omit'` | The model cannot turn reasoning off and documents no level to use instead, so nothing is sent, with an `unsupported-setting` warning. |
 | `'model-default'` | Nothing is sent, and the model runs at its own default. |
 
+Anthropic turns thinking off only at effort high or below. A model whose
+documented default effort is within that limit keeps it. One that documents no
+default, such as `claude-opus-5`, also gets `output_config.effort: 'low'`, and
+the call reports that as a `clamped-setting` warning.
+
 The current models:
 
 | Model | `effort.levels` | Default | `'none'` |
@@ -127,6 +136,20 @@ The current models:
 | `kimi-k2.7-code` | none documented: effort is dropped | — | `'omit'` |
 | `glm-5.3` | low, high, max | max | `'lowest'` |
 | `Qwen/Qwen3-Coder-Next` | non-thinking: effort is dropped | — | `'model-default'` |
+
+The earlier GPT-5 snapshots take the effort levels OpenAI publishes for each
+one. These sets are research-dated (2026-10-10) and not live-verified:
+
+| Model | `effort.levels` | `'none'` |
+| --- | --- | --- |
+| `gpt-5`, `gpt-5-mini`, `gpt-5-nano` | low, medium, high (OpenAI's `'minimal'` has no Deuz level) | `'lowest'`: sent as `'low'` |
+| `gpt-5.1` | low, medium, high | `'send'` |
+| `gpt-5.2` | low … xhigh | `'send'` |
+| `gpt-5-pro` | high only: every other level is sent as `'high'` | `'lowest'`: sent as `'high'` |
+
+The GPT-5.6 rows and the `gpt-5.2-pro`, `gpt-5.4-pro` and `gpt-5.2-codex`
+snapshots have no pinned set. Like `gpt-6-astra`, they keep the OpenAI wire's
+historical mapping: low … xhigh, with `'none'` sent as `'none'`.
 
 ## Three output limits
 
@@ -182,7 +205,9 @@ report:
   `'high'`, and Gemini 3 Pro `'medium'` becomes `'low'`. On the two budget
   wires (Anthropic `thinking.budget_tokens`, Gemini 2.5 `thinkingBudget`),
   `'xhigh'` and `'max'` send the same budget.
-- **Effort `'none'`** on a model that cannot turn reasoning off.
+- **Effort `'none'`** on a model that cannot turn reasoning off, and on an
+  Anthropic model that turns thinking off but documents no default effort of
+  high or below, where `output_config.effort` is pinned to `'low'`.
 - **Sampling.** `temperature` and `topP` are dropped for a model that rejects
   them, and on the Anthropic budget wire while extended thinking is on.
 - **Forced tool choice.** `'required'` or a named tool becomes `'auto'` for a
@@ -276,7 +301,7 @@ registry and is not live-verified.
 | `gemini-3.8-flash` | Gemini native | stable | Output limit undocumented: no output cap is sent. |
 | `gemini-3.1-pro-preview` | Gemini native, OpenAI-compatible | preview | A profile of its own; it does not inherit `gemini-3.8-flash` rules. |
 | `deepseek-flash` | Chat Completions | unknown | Resolves to V4.1-Flash; treated like the always-reasoning V4 family. |
-| `deepseek-v4-pro`, `deepseek-v4-flash` | Chat Completions | unknown | `deepseek-v4-pro` resolves to V4-Pro-0813; `deepseek-v4-flash` is a legacy alias. |
+| `deepseek-v4-pro`, `deepseek-v4-flash` | Chat Completions | unknown | `deepseek-v4-pro` resolves to V4-Pro-0813; `deepseek-v4-flash` is a legacy alias. A forced tool choice is sent as `'auto'`. |
 | `kimi-k3`, `kimi-k2.7-code` | Chat Completions | unknown | Reasoning cannot be turned off. |
 | `glm-5.3` | Chat Completions | unknown | Text-only. Effort rides `reasoning_effort`. |
 | `Qwen/Qwen3-Coder-Next` | Chat Completions (any host) | unknown | Non-thinking; 262,144-token native context. |

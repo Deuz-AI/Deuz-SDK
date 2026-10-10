@@ -12,6 +12,7 @@ import {
   createOpenAICompatible,
 } from '../src/providers-compat';
 import { runStream } from '../src/core/inference';
+import { getCapabilities, isMaxOutputPlaceholder, pinnedModelIds } from '../src/core/registry';
 import type { LanguageModel } from '../src/types/model';
 import type { CallWarning } from '../src/types/methods';
 import type { WireToolRequest } from '../src/adapters/types';
@@ -191,6 +192,17 @@ describe('Claude 5.x profiles (verified against Anthropic’s API reference, cac
     expect(clampsOf(haiku, 'effort')).toEqual([]);
   });
 
+  it("Opus 5: 'none' turns thinking off and pins output_config.effort 'low' — a listed clamp", () => {
+    // Thinking turns off only at effort ≤ high, and Opus 5 documents no default.
+    const opus5 = resolveModelProfile(anthropic('claude-opus-5'));
+    expect(opus5.effort.none).toBe('thinking-disabled');
+    expect(clampsOf(opus5, 'effort')).toEqual([
+      { setting: 'effort', from: 'none', to: 'low', warning: 'clamped-setting' },
+    ]);
+    // A documented default within the limit is left alone: nothing is pinned.
+    expect(clampsOf(resolveModelProfile(anthropic('claude-sonnet-5-5')), 'effort')).toEqual([]);
+  });
+
   it('an unknown id in the 5.x family: the family rules, its facts left unknown', () => {
     const profile = resolveModelProfile(anthropic('claude-opus-9-9'));
     expect(profile.match).toBe('family');
@@ -239,6 +251,48 @@ describe('OpenAI profiles (research 2026-10-09, not live-verified)', () => {
     }
     expect(resolveModelProfile(responses('gpt-6-luna')).effort.none).toBe('send');
     expect(resolveModelProfile(responses('gpt-6-luna')).thinking.mode).toBe('default');
+  });
+
+  it('the GPT-5 snapshots carry the effort sets OpenAI publishes (research-dated)', () => {
+    const effortOf = (id: string) => resolveModelProfile(responses(id)).effort;
+    const field = 'reasoning.effort';
+    for (const id of ['gpt-5', 'gpt-5-mini', 'gpt-5-nano']) {
+      // minimal…high: 'minimal' has no Deuz level, so reasoning cannot be turned off.
+      expect(effortOf(id), id).toEqual({
+        field,
+        levels: ['low', 'medium', 'high'],
+        none: 'lowest',
+      });
+      expect(resolveModelProfile(responses(id)).notes.join(' '), id).toContain('minimal');
+    }
+    expect(effortOf('gpt-5.1')).toEqual({ field, levels: ['low', 'medium', 'high'], none: 'send' });
+    expect(effortOf('gpt-5.2')).toEqual({
+      field,
+      levels: ['low', 'medium', 'high', 'xhigh'],
+      none: 'send',
+    });
+    expect(effortOf('gpt-5-pro')).toEqual({ field, levels: ['high'], none: 'lowest' });
+    // No published set is pinned for these: the wire's historical mapping, like gpt-6-astra.
+    for (const id of ['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.2-pro', 'gpt-5.4-pro', 'gpt-5.2-codex']) {
+      expect(effortOf(id), id).toEqual({
+        field,
+        levels: ['low', 'medium', 'high', 'xhigh'],
+        none: 'send',
+      });
+    }
+    // Every changed level is a listed clamp.
+    const changed = (id: string) =>
+      clampsOf(resolveModelProfile(responses(id)), 'effort').map((c) => `${c.from}→${c.to}`);
+    expect(changed('gpt-5')).toEqual(['xhigh→high', 'max→high', 'none→low']);
+    expect(changed('gpt-5.1')).toEqual(['xhigh→high', 'max→high']);
+    expect(changed('gpt-5.2')).toEqual(['max→xhigh']);
+    expect(changed('gpt-5-pro')).toEqual([
+      'low→high',
+      'medium→high',
+      'xhigh→high',
+      'max→high',
+      'none→high',
+    ]);
   });
 
   it("a legacy pinned row mirrors the registry: gpt-5.4 clamps 'max' to 'xhigh'", () => {
@@ -308,7 +362,12 @@ describe('compat-host profiles (research 2026-10-09, not live-verified)', () => 
     expect(pro.limits).toEqual({ maxOutput: 65_536, defaultOutputCap: 8_192 });
     expect(pro.effort.none).toBe('omit');
     expect(pro.thinking).toMatchObject({ mode: 'always', replay: 'reasoning-content' });
+    // The live-verified rejection is the row's word, so a forced choice becomes auto.
     expect(pro.forcedToolChoice).toBe('unsupported');
+    expect(clampsOf(pro, 'toolChoice').map((c) => `${c.from}→${c.to}`)).toEqual([
+      "'required'→auto",
+      "{ type: 'tool' }→auto",
+    ]);
     expect(pro.capabilities.structuredOutput).toBe('unsupported');
     expect(clampsOf(pro, 'effort')).toContainEqual({
       setting: 'effort',
@@ -500,11 +559,17 @@ const CROSS_CHECK: [string, (fetch: typeof globalThis.fetch) => LanguageModel][]
       }
     },
   ]),
-  // Legacy wires with their own clamps, the family fallback and a plain fallback.
+  // Opus 5's pinned 'none' effort, legacy wires with their own clamps, the
+  // family fallback and a plain fallback.
+  ['claude-opus-5', (fetch) => createAnthropic({ apiKey: 'k', fetch })('claude-opus-5')],
   ['claude-opus-4-6', (fetch) => createAnthropic({ apiKey: 'k', fetch })('claude-opus-4-6')],
   ['claude-opus-9-9', (fetch) => createAnthropic({ apiKey: 'k', fetch })('claude-opus-9-9')],
   ['gemini-2.5-pro', (fetch) => createGoogleNative({ apiKey: 'AIza-k', fetch })('gemini-2.5-pro')],
   ['gpt-5.4', (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.4')],
+  // The GPT-5 snapshots' published effort sets.
+  ['gpt-5', (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5')],
+  ['gpt-5.1 (chat)', (fetch) => createOpenAI({ apiKey: 'k', fetch })('gpt-5.1')],
+  ['gpt-5-pro', (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5-pro')],
   ['gpt-6.1-sol (chat)', (fetch) => createOpenAI({ apiKey: 'k', fetch })('gpt-6.1-sol')],
   ['gpt-6.2-unreleased', (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-6.2')],
 ];
@@ -530,7 +595,10 @@ describe('the profile predicts the request (cross-check against the real pump)',
           expect(sent, where).toBe(clamp.to);
         } else if (clamp) {
           expect(`${profile.effort.field} ${String(sent)}`, where).toBe(clamp.to);
-        } else if (effort !== 'none' && profile.effort.levels.length > 0) {
+        } else if (effort === 'none') {
+          // No clamp listed: 'none' reaches the wire only as the wire's own value.
+          expect(sent, where).toBe(profile.effort.none === 'send' ? 'none' : undefined);
+        } else if (profile.effort.levels.length > 0) {
           expect(sent === effort || typeof sent === 'number', where).toBe(true);
         }
       }
@@ -578,6 +646,55 @@ describe('documented gaps stay unknown (2.3)', () => {
     // Only luna documents 'none'; astra claims no thinking mode either way.
     expect(resolveModelProfile(responses('gpt-6-astra')).thinking.mode).toBe('unknown');
   });
+
+  it('the F19 rows that pin no limits report them, and vision, as unknown — like gpt-6-astra', () => {
+    const astra = resolveModelProfile(responses('gpt-6-astra'));
+    for (const id of [
+      'gpt-5.6',
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5-pro',
+      'gpt-5.2-pro',
+      'gpt-5.4-pro',
+      'gpt-5.2-codex',
+    ]) {
+      const profile = resolveModelProfile(responses(id));
+      // Not the row's 128_000 default: the price table bills GPT-5.6 prompts above 272K.
+      expect(profile.limits, id).toEqual({ defaultOutputCap: 'omitted' });
+      expect(profile.capabilities, id).toEqual(astra.capabilities);
+      expect(profile.capabilities.vision, id).toBe('unknown');
+      expect(profile.sampling.accepted, id).toBe('unknown');
+      expect(profile.sourceUrl, id).toBeUndefined(); // not researched: no source is claimed
+    }
+    // 'none' rides the historical mapping on these, so no thinking mode is claimed...
+    expect(resolveModelProfile(responses('gpt-5.6-sol')).thinking.mode).toBe('unknown');
+    // ...while gpt-5-pro's published set (high only) means reasoning never turns off.
+    expect(resolveModelProfile(responses('gpt-5-pro')).thinking.mode).toBe('always');
+  });
+
+  it('no pinned row with undocumented limits states them, or vision, without a source', () => {
+    const { native, other } = pinnedModelIds();
+    const models: LanguageModel[] = [
+      ...native.map(
+        (modelId): LanguageModel => ({ provider: 'google', surface: 'native', modelId }),
+      ),
+      ...other.map(
+        (modelId): LanguageModel => ({ provider: 'openai', surface: 'responses', modelId }),
+      ),
+    ];
+    const unsourced = models.filter(
+      (model) =>
+        isMaxOutputPlaceholder(getCapabilities(model)) &&
+        resolveModelProfile(model).sourceUrl === undefined,
+    );
+    expect(unsourced.map((m) => m.modelId)).toContain('gpt-5.6-sol');
+    for (const model of unsourced) {
+      const profile = resolveModelProfile(model);
+      expect(profile.limits.contextWindow, model.modelId).toBeUndefined();
+      expect(profile.capabilities.vision, model.modelId).toBe('unknown');
+    }
+  });
 });
 
 describe("structured output: an explicit mode 'tool' the model cannot take (2.3)", () => {
@@ -590,6 +707,8 @@ describe("structured output: an explicit mode 'tool' the model cannot take (2.3)
       anthropic('claude-haiku-5-5'), // takes a forced tool_choice, but always thinks on this wire
       anthropic('claude-opus-9-9'),
       anthropic('claude-opus-4-8'),
+      deepseek('deepseek-v4-pro'), // rejects a forced tool_choice in thinking mode
+      deepseek('deepseek-v4-flash'),
     ]) {
       expect(modeClamps(model), model.modelId).toEqual([{ to: 'json', when: undefined }]);
     }
@@ -602,7 +721,8 @@ describe("structured output: an explicit mode 'tool' the model cannot take (2.3)
   });
 
   it('is never changed where nothing stops the forced tool', () => {
-    for (const model of [responses('gpt-5.4'), deepseek('deepseek-v4-pro'), kimi('kimi-k3')]) {
+    // deepseek-flash: no source states the V4 rejection for it, so none is assumed.
+    for (const model of [responses('gpt-5.4'), deepseek('deepseek-flash'), kimi('kimi-k3')]) {
       expect(modeClamps(model), model.modelId).toEqual([]);
     }
   });

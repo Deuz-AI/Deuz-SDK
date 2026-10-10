@@ -25,12 +25,14 @@
  *
  * Nothing here is live-verified (`liveVerified` is always `false`): Anthropic
  * facts are verified against Anthropic's API reference (cached 2026-10-06),
- * the other providers' facts are research-dated (2026-10-09).
+ * the other providers' facts are research-dated (2026-10-09; the earlier GPT-5
+ * snapshots' effort sets 2026-10-10).
  */
 import type { LanguageModel, ModelSurface } from './types/model';
 import {
   getCapabilities,
   isMaxOutputPlaceholder,
+  isUndocumentedRow,
   registryMatch,
   type EffortLevel,
   type EffortNoneMapping,
@@ -39,6 +41,7 @@ import {
 } from './core/registry';
 import {
   EFFORT_SCALE,
+  atMostHigh,
   budgetPeers,
   clampEffortLevel,
   effortWire,
@@ -248,7 +251,6 @@ interface Facts {
   maxOutput?: number;
   thinking?: Partial<Pick<ModelProfileThinking, 'mode' | 'types'>>;
   sampling?: Pick<ModelProfileSampling, 'accepted' | 'rule'>;
-  forcedToolChoice?: ProfileSupport;
   prefill?: ProfileSupport;
   notes?: readonly string[];
 }
@@ -282,6 +284,19 @@ const COMPAT_UNSTATED = [
   'audio',
   'contextWindow',
 ] as const;
+const GPT_5_MINIMAL = [
+  "OpenAI documents effort minimal, low, medium and high; 'minimal' has no Deuz level, so 'none' is sent as 'low' (research-dated 2026-10-10, not live-verified).",
+] as const;
+/**
+ * A priced GPT-5 snapshot pinned with no researched facts (F19). Like
+ * gpt-6-astra, its limits, vision and sampling rules stay unstated, and since
+ * 'none' rides the OpenAI wire's historical mapping, no thinking mode is claimed.
+ */
+const GPT_5_UNRESEARCHED: Facts = /* @__PURE__ */ (() => ({
+  unknown: [...GPT_6_UNSTATED, 'contextWindow'],
+  thinking: { mode: 'unknown' },
+  sampling: { accepted: 'unknown' },
+}))();
 const DEEPSEEK_V4_NOTES = [
   'Always reasons; reasoning tokens share the output budget, so a cap sized for the answer alone can return an empty answer.',
   'Rejects response_format json_schema, and a forced tool_choice in thinking mode.',
@@ -383,6 +398,36 @@ const FACTS: Readonly<Record<string, Facts>> = /* @__PURE__ */ (() => ({
       'A reasoning row on Chat Completions (max_completion_tokens, no sampling parameters): not live-verified.',
     ],
   },
+  // The GPT-5 snapshots' effort sets as OpenAI publishes them (the rows hold
+  // the levels): research-dated 2026-10-10, not live-verified.
+  'gpt-5': { notes: GPT_5_MINIMAL },
+  'gpt-5-mini': { notes: GPT_5_MINIMAL },
+  'gpt-5-nano': { notes: GPT_5_MINIMAL },
+  'gpt-5.1': {
+    notes: [
+      'OpenAI documents effort none, low, medium and high (research-dated 2026-10-10, not live-verified).',
+    ],
+  },
+  'gpt-5.2': {
+    notes: [
+      'OpenAI documents effort none, low, medium, high and xhigh (research-dated 2026-10-10, not live-verified).',
+    ],
+  },
+  'gpt-5-pro': {
+    unknown: [...GPT_6_UNSTATED, 'contextWindow'],
+    sampling: { accepted: 'unknown' },
+    notes: [
+      "OpenAI documents effort high only, so any other level and 'none' are sent as 'high' (research-dated 2026-10-10, not live-verified).",
+    ],
+  },
+  // The other F19 rows that pin no limits: nothing about them was researched.
+  'gpt-5.6': GPT_5_UNRESEARCHED,
+  'gpt-5.6-sol': GPT_5_UNRESEARCHED,
+  'gpt-5.6-terra': GPT_5_UNRESEARCHED,
+  'gpt-5.6-luna': GPT_5_UNRESEARCHED,
+  'gpt-5.2-pro': GPT_5_UNRESEARCHED,
+  'gpt-5.4-pro': GPT_5_UNRESEARCHED,
+  'gpt-5.2-codex': GPT_5_UNRESEARCHED,
 
   // --- Google: research-dated (2026-10-09), not live-verified. ---
   'gemini-3.8-flash': {
@@ -424,10 +469,10 @@ const FACTS: Readonly<Record<string, Facts>> = /* @__PURE__ */ (() => ({
   'deepseek-v4-pro': {
     ...DEEPSEEK_SOURCE,
     resolvedId: 'V4-Pro-0813',
-    // json_schema is a verified rejection on V4, so structuredOutput stays stated.
+    // json_schema is a verified rejection on V4, so structuredOutput stays
+    // stated. The forced tool_choice rejection is the row's own field.
     unknown: ['vision', 'nativePdf', 'audio', 'contextWindow'],
     maxOutput: 65_536,
-    forcedToolChoice: 'unsupported',
     sampling: { accepted: 'unknown' },
     notes: DEEPSEEK_V4_NOTES,
   },
@@ -435,7 +480,6 @@ const FACTS: Readonly<Record<string, Facts>> = /* @__PURE__ */ (() => ({
     ...DEEPSEEK_SOURCE,
     unknown: ['vision', 'nativePdf', 'audio', 'contextWindow'],
     maxOutput: 65_536,
-    forcedToolChoice: 'unsupported',
     sampling: { accepted: 'unknown' },
     notes: [
       ...DEEPSEEK_V4_NOTES,
@@ -529,10 +573,15 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
   const claimed: Partial<Record<string, unknown>> = readConfig(model)?.capabilities ?? {};
   const protocol = model.surface;
   const wire = effortWire(protocol, caps, model.modelId);
+  // A pinned row that leaves its output limit undocumented pins only what its
+  // request rules need. Without a documentary entry, its other values are the
+  // row's conservative defaults: never facts, whatever an override claims.
+  const undocumented = facts === undefined && isUndocumentedRow(model);
 
   /** Known = the caller claimed it, or a pinned row states it and no fact marks it unstated. */
   const known = (key: ProfileCapability | 'contextWindow'): boolean =>
-    claimed[key] !== undefined || (match === 'exact' && !facts?.unknown?.includes(key));
+    claimed[key] !== undefined ||
+    (match === 'exact' && !undocumented && !facts?.unknown?.includes(key));
 
   const capabilities = Object.fromEntries(
     CAPABILITIES.map((key): [ProfileCapability, ProfileSupport] => [
@@ -562,7 +611,7 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
     handling,
     accepted:
       facts?.sampling?.accepted ??
-      (match !== 'exact' ? 'unknown' : caps.samplingRestrictions ? 'none' : 'any'),
+      (match !== 'exact' || undocumented ? 'unknown' : caps.samplingRestrictions ? 'none' : 'any'),
     ...(facts?.sampling?.rule !== undefined ? { rule: facts.sampling.rule } : {}),
   };
 
@@ -584,7 +633,7 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
     mode: facts?.thinking?.mode ?? thinkingMode(caps, wire, none, known('reasoning')),
     ...(facts?.thinking?.types ? { types: [...facts.thinking.types] } : {}),
     replay:
-      match === 'fallback' && claimed.reasoning === undefined
+      (match === 'fallback' || undocumented) && claimed.reasoning === undefined
         ? 'unknown'
         : replayFor(protocol, model.provider, caps.reasoning),
   };
@@ -601,13 +650,14 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
     thinking,
     limits,
     sampling,
+    // The row's own field, never a fact beside it: what the profile reports is
+    // what the wire does with a forced choice.
     forcedToolChoice:
-      facts?.forcedToolChoice ??
-      (caps.forcedToolChoice === undefined
+      caps.forcedToolChoice === undefined
         ? 'unknown'
         : caps.forcedToolChoice
           ? 'supported'
-          : 'unsupported'),
+          : 'unsupported',
     prefill: facts?.prefill ?? 'unknown',
     ...(caps.toolSurfaces ? { toolProtocols: [...caps.toolSurfaces] } : {}),
     usage: {
@@ -736,6 +786,15 @@ function clampsFor(
     const lowest = none === 'lowest' ? clampEffortLevel('low', levels) : undefined;
     if (lowest !== undefined) clamp('effort', 'none', lowest);
     else drop('effort', 'none');
+  }
+  // Anthropic turns thinking off only at effort ≤ high: without a documented
+  // default within that limit, the request pins output_config.effort 'low'.
+  if (
+    wire.field === 'output_config.effort' &&
+    (none === 'thinking-disabled' || none === 'thinking-between-tools') &&
+    !atMostHigh(caps.effortDefault)
+  ) {
+    clamp('effort', 'none', 'low');
   }
 
   const thinking = 'effort is set (extended thinking is on)';

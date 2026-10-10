@@ -178,9 +178,21 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   if (effort.thinkingOff) {
     // `effort: 'none'` on a model that can turn thinking off. That is only
     // allowed at effort ≤ high: a documented default within the limit is left
-    // alone, an unknown one is pinned to the lowest effort.
+    // alone, any other is pinned to the lowest effort — and reported (F26).
     thinking = { type: effort.thinkingOff };
-    if (useOutputConfig && !atMostHigh(caps.effortDefault)) outputEffort = 'low';
+    if (useOutputConfig && !atMostHigh(caps.effortDefault)) {
+      outputEffort = 'low';
+      const why =
+        caps.effortDefault === undefined
+          ? 'documents no default effort'
+          : `defaults to effort '${caps.effortDefault}'`;
+      reportClamp(
+        ctx,
+        'effort',
+        `effort 'none' was sent as thinking.type '${effort.thinkingOff}' with output_config.effort ` +
+          `'low': ${call.modelId} turns thinking off only at effort high or below, and ${why}.`,
+      );
+    }
   } else if (effort.level !== undefined) {
     if (useOutputConfig) {
       outputEffort = effort.level;
