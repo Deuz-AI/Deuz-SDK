@@ -79,6 +79,11 @@ Each known slug maps to a `ModelCapabilities` row. These booleans and numbers dr
 | `samplingRestrictions` | `boolean` | Reasoning model rejects `temperature` / `topP` → strip them before sending. |
 | `effortWire` | `'budget_tokens' \| 'output_config'` | How `effort` reaches Anthropic: manual `thinking.budget_tokens` (pre-4.7) vs `output_config.effort` (Opus 4.7+, Sonnet 5, Fable 5 — where budget_tokens returns 400). |
 | `known` | `boolean` | `false` when the row is a fallback for an unknown slug. |
+| `forcedToolChoice` | `boolean?` | 2.3. `false`: a forced `toolChoice` (`'required'` or a named tool) is sent as auto with a `clamped-setting` warning, and structured output never takes the forced-tool strategy. |
+| `effortLevels` | `EffortLevel[]?` | 2.3. The levels the model accepts; a missing level is clamped down with a `clamped-setting` warning, an empty list drops `effort`. |
+| `effortDefault` | `EffortLevel?` | 2.3. The provider's documented default effort (informational). |
+| `effortNone` | `EffortNoneMapping?` | 2.3. How `effort: 'none'` is honoured: `send`, `thinking-disabled`, `thinking-between-tools`, `lowest` or `omit`. |
+| `toolSurfaces` | `ModelSurface[]?` | 2.3. The only wires the model takes tools on; a tool request on another wire fails fast with `InvalidRequestError`. |
 
 A few representative pinned rows (2026-07 catalog):
 
@@ -110,7 +115,7 @@ There is also a behavioral guard that is *not* a registry flag: the agentic loop
 
 When a slug is not in the registry, the orchestrator builds a conservative fallback row and calls `logger.warn` (route a logger in through [dependencies](/docs/core/dependencies) to see it). It also records a typed `{ type: 'unknown-model' }` [`CallWarning`](/docs/core/stream-chat#warnings) — readable on any result's `warnings`, including a tool-carrying one, and as a `warning` part on `fullStream`, still exactly one log line. The fallback differs by surface so the failure mode is always "degraded but working," never a crash:
 
-- **Generic fallback** (`anthropic` / `chat_completions` / `responses`): risky flags default OFF — `tools: false`, `reasoning: false`, `structuredOutput: false`, `contextWindow: 128_000`, `maxOutput: 4_096` (kept low so an unknown model can't 400 or truncate on an over-large `max_tokens`). For an unknown Gemini-compat slug, `usagePerChunk` and `toolIndexAllZero` are inferred from `(provider === 'google', surface === 'chat_completions')`.
+- **Generic fallback** (`anthropic` / `chat_completions` / `responses`): risky flags default OFF — `tools: false`, `reasoning: false`, `structuredOutput: false`, `contextWindow: 128_000`, `maxOutput: 4_096` as a placeholder that, since 2.3, reaches the wire only as Anthropic's required `max_tokens`; OpenAI Chat Completions/Responses and Gemini native leave the cap off. For an unknown Gemini-compat slug, `usagePerChunk` and `toolIndexAllZero` are inferred from `(provider === 'google', surface === 'chat_completions')`.
 - **Native-Gemini fallback** (`surface: 'native'`): full capabilities ON (`vision`, `reasoning`, `caching`, `nativePdf`, `audio`, `contextWindow: 1_000_000`, `maxOutput: 64_000`), because the native wire is uniform across Gemini generations.
 
 So calling a brand-new model that the SDK has never heard of just works:
@@ -133,7 +138,7 @@ The `known: false` flag on the resolved row records that a fallback was used.
 
 ## Overriding the row: `capabilities` (1.9)
 
-A conservative row is safe but wrong for a model that is genuinely capable: `maxOutput: 4096` **silently truncates** a brand-new Together / Groq / OpenRouter slug, `reasoning: false` drops the canonical `effort`, and `structuredOutput: false` pushes `generateObject` onto the tool strategy. Before 1.9 the only fix was a registry release.
+A conservative row is safe but wrong for a model that is genuinely capable: an unknown Anthropic slug is capped at `max_tokens: 4096`, `reasoning: false` drops the canonical `effort`, and `structuredOutput: false` pushes `generateObject` onto the tool strategy. Before 1.9 the only fix was a registry release.
 
 ```ts title="capabilities-override.ts"
 const { text } = await generateText({
@@ -201,6 +206,7 @@ The conservative fallback is great for forward-compatibility but useless for ass
 
 ## Related
 
+- [Model profiles](/docs/modules/model-profiles) — what each model accepts, its limits, and every value a request changes (2.3).
 - [Provider factories](/docs/providers/anthropic) — each factory's settings and the surface it selects.
 - [streamChat](/docs/core/stream-chat) — where capability resolution drives the request.
 - [generateObject](/docs/core/generate-object) — `structuredOutput` selects the json vs tool strategy.

@@ -31,6 +31,7 @@ import {
   type McpPoolOptions,
 } from '../src/mcp/resolve';
 import type { McpClient } from '../src/mcp/shared';
+import type { McpHttpLoopConfig } from '../src/types/config';
 import type { Logger } from '../src/types/deps';
 import type { JSONSchema } from '../src/types/schema';
 import type { StreamPart } from '../src/types/stream';
@@ -700,14 +701,8 @@ describe('resolveMcpForLoop — closeOwned()', () => {
   it('forwards an entry’s sdk and versionNegotiation to the connection it opens (2.3)', async () => {
     const server = await startServer();
     const { logger } = captureLogger();
-    // `sdk`/`versionNegotiation` are read structurally until the loop config
-    // types declare them (see the 2.3 lane report's wiring request).
-    const v1 = { url: server.url, sdk: 'v1' } as Parameters<typeof resolveMcpForLoop>[0][number];
-    const v2 = {
-      url: server.url,
-      sdk: 'v2',
-      versionNegotiation: 'legacy',
-    } as Parameters<typeof resolveMcpForLoop>[0][number];
+    const v1: McpHttpLoopConfig = { url: server.url, sdk: 'v1' };
+    const v2: McpHttpLoopConfig = { url: server.url, sdk: 'v2', versionNegotiation: 'legacy' };
 
     const runtime = await resolveMcpForLoop([v1, v2], { logger });
     try {

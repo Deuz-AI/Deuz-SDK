@@ -54,6 +54,16 @@ const consumers = [
     name: 'budget-store',
     source: "export { createInMemoryBudgetStore, BudgetStoreError } from '@deuz-sdk/core/agent';",
   },
+  {
+    name: 'mcp-server',
+    source: "export { createMcpServer } from '@deuz-sdk/core/mcp/server';",
+  },
+  {
+    name: 'realtime',
+    source: `export { createRealtimeSession, createOpenAIRealtime, createGeminiLive,
+      createOpenAIClientSecret, createGeminiAuthToken, realtimePriceTable, RealtimeError }
+      from '@deuz-sdk/core/realtime';`,
+  },
 ];
 
 function browserBundle(consumer) {
@@ -81,7 +91,7 @@ function nodeOnlyReferences(result) {
   const output = result.outputFiles?.map((file) => file.text).join('\n') ?? '';
   if (forbiddenBuiltins.test(output)) issues.push('bundled output references a node: builtin');
   const nodeOnlyInput = Object.keys(result.metafile?.inputs ?? {}).find((input) =>
-    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/]stdio|swarm[\\/](?:sqlite|postgres)|ops[\\/](?:sqlite|postgres)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|ops-sqlite|ops-postgres|budget-sqlite|budget-postgres|evolve-sqlite))/.test(
+    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/](?:server[\\/])?stdio|swarm[\\/](?:sqlite|postgres)|ops[\\/](?:sqlite|postgres)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|ops-sqlite|ops-postgres|budget-sqlite|budget-postgres|evolve-sqlite))/.test(
       input,
     ),
   );
@@ -111,6 +121,7 @@ const nodeOnlyEntries = [
   ['ops/sqlite', 'createSqliteOpsStore, createSqliteBudgetStore'],
   ['ops/postgres', 'createPostgresOpsStore, createPostgresBudgetStore'],
   ['evolve/sqlite', 'createSqlitePopulationStore'],
+  ['mcp/server/stdio', 'serveMcpStdio'],
 ];
 for (const [subpath, names] of nodeOnlyEntries) {
   try {
@@ -134,6 +145,8 @@ for (const entry of [
   'dist/ops.js',
   'dist/evolve.js',
   'dist/schedule.js',
+  'dist/realtime.js',
+  'dist/mcp/server.js',
 ]) {
   const source = readFileSync(resolve(root, entry), 'utf8');
   if (forbiddenBuiltins.test(source)) failures.push(`${entry}: directly imports a node: builtin`);

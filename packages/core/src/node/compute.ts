@@ -311,12 +311,6 @@ async function execProcess(
 }
 
 /**
- * A `runShell` request as this backend reads it: `stdin` works exactly as on
- * `runCode`, whether or not the seam's `ShellExecutionRequest` declares it.
- */
-type ShellRequest = ShellExecutionRequest & { stdin?: string };
-
-/**
  * A `node:child_process`-backed reference sandbox. See the file header: this is
  * for local development and the seam contract, NOT production isolation.
  *
@@ -363,7 +357,7 @@ export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSand
       });
     },
 
-    async runShell(request: ShellRequest): Promise<CodeExecutionResult> {
+    async runShell(request: ShellExecutionRequest): Promise<CodeExecutionResult> {
       if (options.allowedCommands) {
         const firstToken = request.command.trim().split(/\s+/)[0] ?? '';
         if (!options.allowedCommands.includes(firstToken)) {

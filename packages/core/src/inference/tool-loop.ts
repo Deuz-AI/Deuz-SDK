@@ -128,13 +128,22 @@ export async function runToolLoop(
    */
   let ownTools: ToolSet = options.tools ?? {};
   const deps = resolveDependencies(options.deps);
+  // ONE sink per RUN (1.9): the loop re-derives capabilities every step, so a
+  // per-step sink would report a single stripped setting once per step. The
+  // sink's own dedupe only works if every step shares it.
+  const warnings = createWarningSink(deps.logger);
+  // A USD budget needs the accumulator even without a price provider (2.3):
+  // every model is then unpriced, and `budget.unknownPrice` decides.
   const usageCost =
-    !options.execution && (deps.priceProvider || internal?.resumeCost)
+    !options.execution &&
+    (deps.priceProvider || internal?.resumeCost || options.budget?.usd !== undefined)
       ? (await import('../internal/usage-cost')).createUsageCostAccumulator({
           priceProvider: deps.priceProvider,
           snapshot: internal?.resumeCost,
           unpricedBaseUsage:
             !internal?.resumeCost && (internal?.resumeFrom?.usage.totalTokens ?? 0) > 0,
+          budget: options.budget,
+          warnings,
         })
       : undefined;
   if (usageCost)
@@ -213,10 +222,6 @@ export async function runToolLoop(
   // Verified generation (1.8): attempt counter + final verdict for metadata.
   let verifyAttempts = 0;
   let verified: boolean | undefined;
-  // ONE sink per RUN (1.9): the loop re-derives capabilities every step, so a
-  // per-step sink would report a single stripped setting once per step. The
-  // sink's own dedupe only works if every step shares it.
-  const warnings = createWarningSink(deps.logger);
   let falseFinishRetries = 0;
   let falseFinishAccepted = false;
   // Guardrails (2.0): the buffered loop has no stream, so every non-pass verdict
@@ -568,6 +573,9 @@ export async function runToolLoop(
           durableUsage(durable, totalUsage),
         );
       }
+      // A model with no price under a USD budget (2.3): reported once, or
+      // refused before the call with `budget.unknownPrice: 'reject'`.
+      await usageCost?.admit(prepared.options.model.modelId);
       // Overflow auto-recovery (2.0): ONE retry per step. The provider rejected
       // the request as too long, so force a compaction pass and re-run the same
       // step against the shrunk history — recall block included, exactly as the

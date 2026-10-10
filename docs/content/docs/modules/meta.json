@@ -6,6 +6,7 @@
     "observability",
     "autonomy",
     "native-agents",
+    "native-mcp",
     "swarm",
     "operations",
     "budgets",
@@ -18,14 +19,17 @@
     "rag",
     "skills",
     "mcp",
+    "mcp-server",
     "image-generation",
     "speech",
     "transcription",
+    "realtime",
     "video-generation",
     "ui-streaming",
     "react-hooks",
     "request-validation",
     "middleware",
-    "pricing"
+    "pricing",
+    "model-profiles"
   ]
 }

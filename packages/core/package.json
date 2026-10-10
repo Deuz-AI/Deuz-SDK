@@ -386,6 +386,16 @@
         "default": "./dist/transcription.cjs"
       }
     },
+    "./realtime": {
+      "import": {
+        "types": "./dist/realtime.d.ts",
+        "default": "./dist/realtime.js"
+      },
+      "require": {
+        "types": "./dist/realtime.d.cts",
+        "default": "./dist/realtime.cjs"
+      }
+    },
     "./video": {
       "import": {
         "types": "./dist/video.d.ts",
@@ -524,6 +534,26 @@
       "require": {
         "types": "./dist/mcp/node.d.cts",
         "default": "./dist/mcp/node.cjs"
+      }
+    },
+    "./mcp/server": {
+      "import": {
+        "types": "./dist/mcp/server.d.ts",
+        "default": "./dist/mcp/server.js"
+      },
+      "require": {
+        "types": "./dist/mcp/server.d.cts",
+        "default": "./dist/mcp/server.cjs"
+      }
+    },
+    "./mcp/server/stdio": {
+      "import": {
+        "types": "./dist/mcp/server/stdio.d.ts",
+        "default": "./dist/mcp/server/stdio.js"
+      },
+      "require": {
+        "types": "./dist/mcp/server/stdio.d.cts",
+        "default": "./dist/mcp/server/stdio.cjs"
       }
     },
     "./stores/sqlite": {

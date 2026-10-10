@@ -37,7 +37,7 @@ It is the wrong tool when:
 | Situation | Use instead |
 | --- | --- |
 | You want audio to start playing before the sentence is finished | Nothing here — this module returns one finished file. See [what it does not do](#what-generatespeech-does-not-do). |
-| You want the *model* to speak natively (speech-to-speech, realtime) | Not in 2.0. This is a plain TTS endpoint in front of your text. |
+| You want the *model* to speak natively (speech-to-speech, realtime) | Use [Realtime voice](/docs/modules/realtime) (2.3). This is a plain TTS endpoint in front of your text. |
 | You want a chat model to *listen* to audio | [`filePart({ mediaType: 'audio/…' })`](/docs/core/messages) on a model whose registry row sets `audio: true`, or [`transcribe`](/docs/modules/transcription) first. |
 | You want word-level timing to animate a mouth or highlight text | Not produced here. [`transcribe`](/docs/modules/transcription#timestamps) on the generated audio is the (slow, paid twice) workaround. |
 

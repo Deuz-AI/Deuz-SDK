@@ -177,7 +177,9 @@ serialize ownership across processes and across different wrappers for the same
 database. The in-process guard does not make a custom store transactional.
 
 Tool receipts distinguish `executing`, a known child-agent `suspended` state,
-`executed`, validation/projection failures, and completed projection. They are
+`executed`, `failed` (execute threw; the model got the error, and a resume replays
+it without running the tool again), validation/projection failures, and completed
+projection. They are
 scoped to a root model turn plus the provider call ID, so an ID reused in a later
 turn does not retrieve an unrelated result. Raw results are committed before
 validation/projection; a projection can be retried without repeating the effect.
@@ -249,8 +251,11 @@ while receipts and `tool-output` events retain the raw result. Application code
 must decide which raw result fields belong in a user interface.
 
 Native options support the canonical tool-loop controls, including preparation,
-compaction, approval gates and guardrails. Loop hooks apply to the tool-loop phase;
-the finalization phase disables application tools and validates its own output.
+compaction, approval gates and guardrails. Loop hooks apply to the tool-loop phase.
+Finalization is one more turn of the same conversation: it ends with a user turn,
+offers the loop's tools with `tool_choice: 'none'`, and validates its own output.
+MCP servers in `mcp` cross the same receipt boundary as local tools; see
+[MCP in native runs](/docs/modules/native-mcp).
 The native engine currently rejects `chat`, `memory`, `fallbackModels`, and the
 legacy completion hooks `verifyStep`, `doneWhen`, and `falseFinishGuard`. Use the
 existing generation/agent APIs when those options are needed. Legacy

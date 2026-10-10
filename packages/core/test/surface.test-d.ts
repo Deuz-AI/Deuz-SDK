@@ -216,8 +216,9 @@ import type { CostPart, BudgetExceededPart } from '../src/index';
 import { durationExceeds as durationExceedsRoot } from '../src/index';
 expectTypeOf<CostPart>().toMatchTypeOf<{ type: 'cost'; costUsd: number }>();
 expectTypeOf<BudgetExceededPart['kind']>().toEqualTypeOf<'usd' | 'tokens'>();
+// 2.3: `unknownPrice` decides what a model with no price does under `usd`.
 expectTypeOf<CommonCallOptions['budget']>().toEqualTypeOf<
-  { usd?: number; tokens?: number } | undefined
+  { usd?: number; tokens?: number; unknownPrice?: 'warn' | 'reject' } | undefined
 >();
 expectTypeOf(durationExceedsRoot).returns.toBeFunction();
 // PriceProvider.cacheSavings stays OPTIONAL (additive seam extension).
@@ -608,3 +609,49 @@ expectTypeOf(edgeValidateChatRequest).toEqualTypeOf<typeof validateChatRequest>(
 expectTypeOf(edgeParseDeuzChatRequest).toEqualTypeOf<typeof parseDeuzChatRequest>();
 expectTypeOf<EdgeUIMessagePart>().toEqualTypeOf<UIMessagePart>();
 expectTypeOf<EdgeChatInput>().toEqualTypeOf<ChatInput>();
+
+// --- 2.3 additive surface. ---
+import type { CodeExecutionRequest, ShellExecutionRequest } from '../src/compute';
+// runShell takes stdin exactly like runCode (F10).
+expectTypeOf<ShellExecutionRequest>().toHaveProperty('stdin');
+expectTypeOf<ShellExecutionRequest['stdin']>().toEqualTypeOf<CodeExecutionRequest['stdin']>();
+
+// Unknown prices (decision 4): one policy spelling on every budget.
+import { type BudgetLimits, BudgetLedgerError } from '../src/agent';
+import {
+  UnpricedModelError,
+  PRICE_ALIASES,
+  resolveModelProfile,
+  type ModelProfile,
+  type PriceTier,
+  type StopDetails,
+} from '../src/index';
+expectTypeOf<BudgetLimits['unknownPrice']>().toEqualTypeOf<'warn' | 'reject' | undefined>();
+expectTypeOf<'unpriced_model'>().toMatchTypeOf<BudgetLedgerError['code']>();
+expectTypeOf<UnpricedModelError['code']>().toEqualTypeOf<'unpriced_model'>();
+expectTypeOf(PRICE_ALIASES).toEqualTypeOf<Readonly<Record<string, string>>>();
+expectTypeOf<PriceTier>().toHaveProperty('above');
+
+// Model profiles: never claim a live check.
+expectTypeOf(resolveModelProfile).toBeCallableWith({} as LanguageModel);
+expectTypeOf(resolveModelProfile).returns.toEqualTypeOf<ModelProfile>();
+expectTypeOf<ModelProfile['liveVerified']>().toEqualTypeOf<false>();
+
+// Native dispatch: failed receipts, MCP entries, the catalog binding, stop details.
+import type { AgentToolReceipt, AgentMcpEntry, AgentRunEnvelope, AgentResult } from '../src/agent';
+expectTypeOf<'failed'>().toMatchTypeOf<AgentToolReceipt['stage']>();
+expectTypeOf<AgentMcpEntry>().not.toBeNever();
+expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['mcp']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<GenerateTextResult['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
+expectTypeOf<AgentResult['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
+
+// The 2.3 edge re-exports are the same values as their modules'.
+import {
+  resolveModelProfile as edgeResolveModelProfile,
+  UnpricedModelError as EdgeUnpricedModelError,
+  CheckpointVersionError as EdgeCheckpointVersionError,
+} from '../src/edge';
+import { CheckpointVersionError } from '../src/durable';
+expectTypeOf(edgeResolveModelProfile).toEqualTypeOf<typeof resolveModelProfile>();
+expectTypeOf(EdgeUnpricedModelError).toEqualTypeOf<typeof UnpricedModelError>();
+expectTypeOf(EdgeCheckpointVersionError).toEqualTypeOf<typeof CheckpointVersionError>();

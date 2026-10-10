@@ -34,11 +34,18 @@ export interface Workspace {
   read(path: string): Promise<string>;
   /** Write (overwrite) a UTF-8 text file, creating parents as needed. */
   write(path: string, content: string): Promise<void>;
-  /** True when the path exists. */
+  /**
+   * True when the path exists, false when it is missing. An illegal path
+   * rejects, as from every method, and so does a storage error other than
+   * 'not found'.
+   */
   exists(path: string): Promise<boolean>;
   /** List entries, optionally under a path `prefix`. Deterministic order (sorted by path). */
   list(prefix?: string): Promise<WorkspaceEntry[]>;
-  /** Remove a path. A missing path is a no-op (never throws). */
+  /**
+   * Remove a path. A missing path is a no-op; an illegal path rejects, and so
+   * does a path the backend cannot remove (a directory, for example).
+   */
   delete(path: string): Promise<void>;
   /** Optional: read raw bytes (binary artifacts — screenshots, generated files). */
   readBytes?(path: string): Promise<Uint8Array>;

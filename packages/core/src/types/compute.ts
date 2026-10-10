@@ -33,7 +33,11 @@ export interface CodeExecutionRequest {
   timeoutMs?: number;
   /** Cancellation — the backend must kill the process when it fires. */
   signal?: AbortSignal;
-  /** Optional stdin piped to the process. */
+  /**
+   * Optional stdin, written to the process as UTF-8 and then closed (EOF).
+   * Omitted, the process reads EOF at once; `''` is an empty input. Neither keeps
+   * stdin open: there is no interactive input.
+   */
   stdin?: string;
   /** Extra environment variables (backends that support it). */
   env?: Record<string, string>;
@@ -64,6 +68,11 @@ export interface ShellExecutionRequest {
   timeoutMs?: number;
   signal?: AbortSignal;
   env?: Record<string, string>;
+  /**
+   * Optional stdin, exactly as on {@link CodeExecutionRequest}: written to the
+   * command as UTF-8 and then closed. Omitted, the command reads EOF at once.
+   */
+  stdin?: string;
 }
 
 /** Same shape as a code execution outcome. */

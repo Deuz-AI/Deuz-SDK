@@ -49,6 +49,79 @@ jobs:
       - run: npm ci
       - run: npm run check
 
+  react18:
+    # F29: @deuz-sdk/react and the frozen @deuz-sdk/core/react declare
+    # `react: ^18.0.0 || ^19.0.0`, but the `check` legs only install the React
+    # 19 devDependencies, so React 18 was never exercised. This leg puts ONE
+    # React 18 under the whole tree. Root `overrides` retarget every react edge
+    # (the workspace devDependencies and the peer edges of
+    # @testing-library/react, next and styled-jsx). Unlocking the React entries
+    # is what makes npm re-resolve them at the root: on an unchanged lockfile
+    # npm keeps the hoisted react@19 those peer edges were locked to and nests
+    # React 18 under each workspace, so the hooks and the hoisted
+    # @testing-library/react would load two different Reacts (`npm i -w` splits
+    # the same way). `npm dedupe` would merge them but also floats unrelated
+    # packages; this keeps every other package at its locked version.
+    name: React 18 (ubuntu-latest, Node 22)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      # The repo's pinned npm (`packageManager`), as release.yml does: override
+      # and peer placement differ between npm majors, and this recipe was
+      # verified on 11.18.0.
+      - run: npm install --global npm@11.18.0
+      - name: Install React 18 repo-wide
+        shell: bash
+        run: |
+          npm pkg set overrides.react=^18.3.1 overrides.react-dom=^18.3.1 \
+            overrides.@types/react=^18.3.0 overrides.@types/react-dom=^18.3.0
+          node -e '
+            const fs = require("node:fs");
+            const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
+            const family = /(^|\/)node_modules\/(react|react-dom|scheduler|@types\/react|@types\/react-dom)$/;
+            let dropped = 0;
+            for (const key of Object.keys(lock.packages)) {
+              if (family.test(key)) {
+                delete lock.packages[key];
+                dropped++;
+              }
+            }
+            fs.writeFileSync("package-lock.json", JSON.stringify(lock, null, 2) + "\n");
+            console.log(`unlocked ${dropped} React lockfile entries`);
+          '
+          npm install --no-audit --no-fund
+      - name: Assert a single hoisted React 18
+        shell: bash
+        run: |
+          npm ls react react-dom
+          node -e '
+            const path = require("node:path");
+            const root = path.resolve("node_modules");
+            let ok = true;
+            for (const from of ["packages/react", "packages/core", "node_modules/@testing-library/react"]) {
+              for (const pkg of ["react", "react-dom", "@types/react"]) {
+                const file = require.resolve(`${pkg}/package.json`, { paths: [path.resolve(from)] });
+                const { version } = require(file);
+                const hoisted = file.startsWith(root + path.sep);
+                console.log(`${from} -> ${pkg}@${version}${hoisted ? "" : ` NOT HOISTED: ${file}`}`);
+                if (!version.startsWith("18.") || !hoisted) ok = false;
+              }
+            }
+            if (!ok) process.exit(1);
+          '
+      # The react tests import @deuz-sdk/core from its dist.
+      - run: npm run build -w @deuz-sdk/core
+      - run: npm run typecheck -w @deuz-sdk/react
+      - run: npm run test -w @deuz-sdk/react
+      # The frozen @deuz-sdk/core/react hook: its types against @types/react 18,
+      # and its tests.
+      - run: npm run typecheck -w @deuz-sdk/core
+      - run: npm run test -w @deuz-sdk/core -- test/react.test.ts
+
   docs:
     name: Documentation build
     runs-on: ubuntu-latest

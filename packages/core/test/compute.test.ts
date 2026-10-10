@@ -143,12 +143,6 @@ const WAIT_FOR_EOF =
   "let n=0;process.stdin.on('data',d=>n+=d.length);process.stdin.on('end',()=>process.stdout.write('eof '+n))";
 
 /**
- * `runShell` takes `stdin` exactly like `runCode`. Typed through a variable so
- * the request stays checkable whether or not the seam type declares the field.
- */
-type ShellRequest = ShellExecutionRequest & { stdin?: string };
-
-/**
  * Scripts for `runShell`, run as `node <file>` from their own directory: a shell
  * command line with no quotes means the same thing to `cmd.exe /c` and `bash -c`.
  */
@@ -203,7 +197,7 @@ describe('createNodeSandbox — stdin when none (or an empty one) is given (F10)
   });
 
   it('runShell forwards stdin to the command', async () => {
-    const request: ShellRequest = {
+    const request: ShellExecutionRequest = {
       command: 'node echo.cjs',
       cwd: scripts,
       stdin: 'b\na\nçğ 😀\n',

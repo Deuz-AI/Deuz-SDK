@@ -288,7 +288,10 @@ const DEEPSEEK_V4_NOTES = [
   'Keep reasoning_content across a multi-turn tool conversation.',
 ] as const;
 
-const FACTS: Readonly<Record<string, Facts>> = {
+// The tables below spread shared sources, which a bundler cannot prove free of
+// side effects, so each is built by a pure-annotated call: an app that never
+// calls resolveModelProfile does not carry them.
+const FACTS: Readonly<Record<string, Facts>> = /* @__PURE__ */ (() => ({
   // --- Anthropic: verified against Anthropic's API reference (cached
   // 2026-10-06), not live-verified. ---
   'claude-fable-5-1': {
@@ -480,10 +483,10 @@ const FACTS: Readonly<Record<string, Facts>> = {
       'No dedicated vLLM/SGLang factory: use createOpenAICompatible with a baseURL.',
     ],
   },
-};
+}))();
 
 /** An unknown `claude-{fable,opus,sonnet,haiku}-N` (N ≥ 5): the family rules, not facts about the id. */
-const CLAUDE_5_FAMILY: Facts = {
+const CLAUDE_5_FAMILY: Facts = /* @__PURE__ */ (() => ({
   ...ANTHROPIC_SOURCE,
   thinking: { mode: 'always', types: ['adaptive'] },
   sampling: { accepted: 'unknown' },
@@ -491,7 +494,7 @@ const CLAUDE_5_FAMILY: Facts = {
   notes: [
     'No row of its own: the strictest documented Claude 5.x rules apply — effort on output_config, no budget_tokens, no sampling parameters, no forced tool_choice.',
   ],
-};
+}))();
 
 const CAPABILITIES: readonly ProfileCapability[] = [
   'tools',

@@ -155,58 +155,95 @@
     "evolve is large because its mutation step runs generateText (the full inference path) — measured,",
     "not accidental. Its lazy chunks are the same optional features as native-agent and carry the same",
     "limits; MCP keeps the shared 18500/7050 allowance. core (152083/47486) and edge (141290/43952)",
-    "stay inside their 2.0 limits: the new edge.ts re-exports tree-shake out of the measured set."
+    "stay inside their 2.0 limits: the new edge.ts re-exports tree-shake out of the measured set.",
+    "",
+    "RAISED FOR 2.3 (wave 1). Measured on feat/2.3 after the nine W1 lanes, same pipeline (base = 2.2.0",
+    "stubs a1dd464):",
+    "  core          164412 B raw / 50825 gzip  (base 152083 / 47485)  -> 172000 / 53300",
+    "  edge          153610 B raw / 47410 gzip  (base 141290 / 43955)  -> 161000 / 49700",
+    "  native-agent  212166 B raw / 65965 gzip                          -> 222000 / 69000",
+    "  native-swarm  220888 B raw / 68690 gzip                          -> 231000 / 71900",
+    "  ops             2389 B raw /  1084 gzip  (F24 ack, F25 prune)    ->   2500 /  1150",
+    "What grew in core (src attribution, minified): core/registry.ts +4.6 KB and core/request-rules.ts",
+    "+3.3 KB (2.3 model rows, effort/cap rules and the reported clamps, F08/F14/F19/F26), the four",
+    "adapters +1.7 KB, the loops +1.5 KB (refusal/length gate F16, unpriced admission F13), the",
+    "legacy UnpricedModelError. resolveModelProfile shares a dist chunk with createClient, so its",
+    "facts tables are built by /* @__PURE__ */ calls: without that the core entry carried them",
+    "(+6.1 KB) although nothing reached them.",
+    "Lazy groups: mcp 22500 / 8450 (native runs fingerprint MCP catalogs, F01; dual-stack MCP client);",
+    "native-request 3600 / 1700 in core, 2700 / 1375 elsewhere (wire-cap reservation F12, unpriced",
+    "policy, settlement retries F17); usage-cost 3200 / 1400 (unpriced counters, admit, F13); new",
+    "optional chunks sdk-v2 (MCP 2026-07-28 client) 13100 / 5300 and native-mcp (MCP receipts in",
+    "native runs) 24200 / 9000.",
+    "New bundles: mcp-server 15697 / 6031 eager -> 17150 / 6570, lazy 227815 / 72870 (the native",
+    "agent machinery, loaded only when agents or agentTools are served) -> 239000 / 76500; realtime",
+    "44443 / 15343 -> 48700 / 16800. ./mcp/server/stdio is Node-only and not budgeted."
   ],
   "bundles": {
     "core": {
       "from": "@deuz-sdk/core",
       "exports": ["streamChat", "generateText", "generateObject", "createClient"],
-      "maxRawBytes": 156500,
-      "maxGzipBytes": 49200,
-      "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050,
+      "maxRawBytes": 172000,
+      "maxGzipBytes": 53300,
+      "maxLazyRawBytes": 22500,
+      "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 2550,
-          "maxGzipBytes": 1200
+          "maxRawBytes": 3600,
+          "maxGzipBytes": 1700
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
-          "maxRawBytes": 1500,
-          "maxGzipBytes": 675
+          "maxRawBytes": 3200,
+          "maxGzipBytes": 1400
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
           "maxGzipBytes": 4750
+        },
+        "sdk-v2": {
+          "entryPoint": "sdk-v2",
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5300
         }
       }
     },
     "edge": {
       "from": "@deuz-sdk/core/edge",
       "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
-      "maxRawBytes": 143800,
-      "maxGzipBytes": 45400,
-      "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050,
+      "maxRawBytes": 161000,
+      "maxGzipBytes": 49700,
+      "maxLazyRawBytes": 22500,
+      "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 2550,
-          "maxGzipBytes": 1200
+          "maxRawBytes": 2700,
+          "maxGzipBytes": 1375
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
-          "maxRawBytes": 1500,
-          "maxGzipBytes": 675
+          "maxRawBytes": 3200,
+          "maxGzipBytes": 1400
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
           "maxGzipBytes": 4750
+        },
+        "sdk-v2": {
+          "entryPoint": "sdk-v2",
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5300
+        },
+        "native-mcp": {
+          "entryPoint": "native-mcp",
+          "maxRawBytes": 24200,
+          "maxGzipBytes": 9000
         }
       }
     },
@@ -227,60 +264,80 @@
         "createInMemoryBudgetStore",
         "BudgetStoreError"
       ],
-      "maxRawBytes": 209800,
-      "maxGzipBytes": 65250,
-      "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050,
+      "maxRawBytes": 222000,
+      "maxGzipBytes": 69000,
+      "maxLazyRawBytes": 22500,
+      "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 1550,
-          "maxGzipBytes": 825
+          "maxRawBytes": 2700,
+          "maxGzipBytes": 1375
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
-          "maxRawBytes": 1500,
-          "maxGzipBytes": 675
+          "maxRawBytes": 3200,
+          "maxGzipBytes": 1400
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
           "maxGzipBytes": 4750
+        },
+        "sdk-v2": {
+          "entryPoint": "sdk-v2",
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5300
+        },
+        "native-mcp": {
+          "entryPoint": "native-mcp",
+          "maxRawBytes": 24200,
+          "maxGzipBytes": 9000
         }
       }
     },
     "native-swarm": {
       "from": "@deuz-sdk/core/swarm",
       "exports": ["createSwarm", "createInMemorySwarmStore", "SwarmConflictError"],
-      "maxRawBytes": 219300,
-      "maxGzipBytes": 68400,
-      "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050,
+      "maxRawBytes": 231000,
+      "maxGzipBytes": 71900,
+      "maxLazyRawBytes": 22500,
+      "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 1550,
-          "maxGzipBytes": 825
+          "maxRawBytes": 2700,
+          "maxGzipBytes": 1375
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
-          "maxRawBytes": 1500,
-          "maxGzipBytes": 675
+          "maxRawBytes": 3200,
+          "maxGzipBytes": 1400
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
           "maxGzipBytes": 4750
+        },
+        "sdk-v2": {
+          "entryPoint": "sdk-v2",
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5300
+        },
+        "native-mcp": {
+          "entryPoint": "native-mcp",
+          "maxRawBytes": 24200,
+          "maxGzipBytes": 9000
         }
       }
     },
     "ops": {
       "from": "@deuz-sdk/core/ops",
       "exports": ["createInMemoryLeaseProvider"],
-      "maxRawBytes": 2200,
-      "maxGzipBytes": 1070
+      "maxRawBytes": 2500,
+      "maxGzipBytes": 1150
     },
     "schedule": {
       "from": "@deuz-sdk/core/schedule",
@@ -307,24 +364,29 @@
       ],
       "maxRawBytes": 189600,
       "maxGzipBytes": 60100,
-      "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050,
+      "maxLazyRawBytes": 22500,
+      "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 1550,
-          "maxGzipBytes": 825
+          "maxRawBytes": 2700,
+          "maxGzipBytes": 1375
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
-          "maxRawBytes": 1500,
-          "maxGzipBytes": 675
+          "maxRawBytes": 3200,
+          "maxGzipBytes": 1400
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
           "maxGzipBytes": 4750
+        },
+        "sdk-v2": {
+          "entryPoint": "sdk-v2",
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5300
         }
       }
     },
@@ -386,6 +448,28 @@
       "exports": ["createOpenAI", "createOpenAIResponses"],
       "maxRawBytes": 1000,
       "maxGzipBytes": 600
+    },
+    "mcp-server": {
+      "from": "@deuz-sdk/core/mcp/server",
+      "exports": ["createMcpServer"],
+      "maxRawBytes": 17150,
+      "maxGzipBytes": 6570,
+      "maxLazyRawBytes": 239000,
+      "maxLazyGzipBytes": 76500
+    },
+    "realtime": {
+      "from": "@deuz-sdk/core/realtime",
+      "exports": [
+        "createRealtimeSession",
+        "createOpenAIRealtime",
+        "createGeminiLive",
+        "createOpenAIClientSecret",
+        "createGeminiAuthToken",
+        "realtimePriceTable",
+        "RealtimeError"
+      ],
+      "maxRawBytes": 48700,
+      "maxGzipBytes": 16800
     }
   }
 }

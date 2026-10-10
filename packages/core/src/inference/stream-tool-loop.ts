@@ -369,12 +369,16 @@ export function runStreamToolLoop(
       internal?.resumeFrom !== undefined || internal?.resumeLoad !== undefined,
     );
     let chatMessages = chatPersistence.messages;
+    // A USD budget needs the accumulator even without a price provider (2.3):
+    // every model is then unpriced, and `budget.unknownPrice` decides.
     const usageCost =
-      !options.execution && (deps.priceProvider || resumeCost)
+      !options.execution && (deps.priceProvider || resumeCost || options.budget?.usd !== undefined)
         ? (await import('../internal/usage-cost')).createUsageCostAccumulator({
             priceProvider: deps.priceProvider,
             snapshot: resumeCost,
             unpricedBaseUsage: !resumeCost && (resumeFrom?.usage.totalTokens ?? 0) > 0,
+            budget: options.budget,
+            warnings: warningSink,
           })
         : undefined;
     if (usageCost)
@@ -960,6 +964,9 @@ export function runStreamToolLoop(
         // A ContextOverflowError is always pre-first-byte, so nothing of this
         // step has reached the consumer yet and the attempt restarts cleanly.
         let overflowRetried = false;
+        // A model with no price under a USD budget (2.3): reported once, or
+        // refused before the call with `budget.unknownPrice: 'reject'`.
+        await usageCost?.admit(prepared.options.model.modelId);
 
         attempts: for (;;) {
           const inner = runStream(
@@ -1097,13 +1104,15 @@ export function runStreamToolLoop(
           try {
             const accounting = options.execution?.ledger.totals(options.execution.scopeId);
             const priced = await usageCost?.flush();
-            if (priced && priced.unknownCalls > 0)
-              deps.logger.warn('cost part skipped — per-call pricing unavailable');
+            // A model with no price adds nothing (2.3): the cost is the priced
+            // sum. Only a failed lookup or an unknown settlement hides it.
             const costUsd = accounting
-              ? accounting.unknownUsd === 0
+              ? accounting.unknownUsd - (accounting.unpriced ?? 0) === 0
                 ? accounting.spent.usd
                 : undefined
               : priced?.costUsd;
+            if (costUsd === undefined && priced && priced.unknownCalls > 0)
+              deps.logger.warn('cost part skipped — per-call pricing unavailable');
             if (typeof costUsd === 'number') {
               const savings = priced?.cacheSavingsUsd;
               broadcaster.push({

@@ -21,7 +21,12 @@ import type { NativeExecutionContext } from './execution';
 // `verbatimModuleSyntax`, so `CommonCallOptions.mcp` accepting a live
 // `McpClient` costs the core bundle NOTHING. The loop reaches the MCP code
 // through a dynamic import; this seam is types only.
-import type { McpClient, McpElicitationHandler } from '../mcp/shared';
+import type {
+  McpClient,
+  McpElicitationHandler,
+  McpSdkSelection,
+  McpVersionNegotiation,
+} from '../mcp/shared';
 // TYPE-ONLY, and deliberately outward: `types/` already reaches into `../chat`,
 // `../memory` and `../durable` above, so importing the capability row from the
 // registry is consistent with the existing shape. `import type` is fully erased
@@ -247,6 +252,10 @@ export interface McpHttpLoopConfig {
   namespace?: string;
   /** Handle server-initiated `elicitation/create` requests — see `McpClientOptions`. */
   onElicitationRequest?: McpElicitationHandler;
+  /** Which MCP SDK line connects this entry (2.3) — see `McpClientOptions.sdk`. */
+  sdk?: McpSdkSelection;
+  /** Protocol negotiation on the v2 line (2.3) — see `McpClientOptions.versionNegotiation`. */
+  versionNegotiation?: McpVersionNegotiation;
 }
 
 /** An MCP server launched as a child process (Node only — `./mcp/stdio`). */
@@ -256,6 +265,10 @@ export interface McpStdioLoopConfig {
   env?: Record<string, string>;
   /** Tool-name prefix — see {@link McpHttpLoopConfig.namespace}. */
   namespace?: string;
+  /** Which MCP SDK line connects this entry (2.3) — see `McpClientOptions.sdk`. */
+  sdk?: McpSdkSelection;
+  /** Protocol negotiation on the v2 line (2.3) — see `McpClientOptions.versionNegotiation`. */
+  versionNegotiation?: McpVersionNegotiation;
 }
 
 /** An ALREADY-CONNECTED client, with an explicit namespace. Never closed by the loop. */
@@ -403,8 +416,10 @@ export interface CommonCallOptions {
    *
    * Why it exists: an unknown slug does not throw, it falls back to
    * `defaultRow(provider, surface)`, whose `maxOutput` is a deliberately
-   * conservative 4_096. So a brand-new Together / Groq / OpenRouter slug is
-   * SILENTLY TRUNCATED at 4096 output tokens; `reasoning: false` on the same
+   * conservative 4_096 placeholder. Since 2.3 that placeholder is left off the
+   * wire where the output cap is optional (OpenAI Chat Completions/Responses,
+   * Gemini native) and only sent as Anthropic's required `max_tokens`, where a
+   * brand-new slug is still truncated at 4096; `reasoning: false` on the same
    * row also drops the canonical `effort`, and `structuredOutput: false` pushes
    * `generateObject` onto the 'tool' strategy. Passing
    * `capabilities: { maxOutput: 32_000, reasoning: true, structuredOutput: true }`
@@ -430,8 +445,12 @@ export interface CommonCallOptions {
    * with `stoppedBy` markers `budget.usd`/`budget.tokens`; the streaming loop
    * additionally emits a typed `budget-exceeded` part before `finish`.
    * Evaluated at step boundaries — an in-flight step always completes first.
+   *
+   * `unknownPrice` (2.3): a model with no price adds nothing to `budget.usd`
+   * and is reported once per model ('warn', the default) or refused before the
+   * call ('reject').
    */
-  budget?: { usd?: number; tokens?: number };
+  budget?: { usd?: number; tokens?: number; unknownPrice?: 'warn' | 'reject' };
   /** Max parallel tool executions per step. Default 5. */
   maxToolConcurrency?: number;
   onStepFinish?: (step: StepResult) => void;
