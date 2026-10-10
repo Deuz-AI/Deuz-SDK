@@ -339,7 +339,18 @@ export function createBatchClient(options: BatchClientOptions): BatchClient {
       await close(request, how);
       yield result;
     }
-    if (options.store) await options.store.put({ ...job, closedAt: deps.clock.now() });
+    if (options.store) {
+      try {
+        await options.store.put({ ...job, closedAt: deps.clock.now() });
+      } catch (error) {
+        // Every result was read and every hold closed: the job only stays open,
+        // and the next pass reads it again (settlement is idempotent).
+        deps.logger.warn('The job store failed to mark a batch job closed.', {
+          batchId: job.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 
   /** Sleep on the injected clock; an abort ends it early. */

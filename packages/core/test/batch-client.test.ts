@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { createAnthropic } from '../src/anthropic';
 import { createBatchClient } from '../src/batch/client';
@@ -266,6 +266,33 @@ describe('job store', () => {
       kind: 'store',
       job: { id: 'msgbatch_1', protocol: 'anthropic' },
     });
+  });
+
+  it('keeps the results when the store fails to mark the job closed', async () => {
+    const memory = createMemoryBatchJobStore();
+    let failing = false;
+    const store: BatchJobStore = {
+      ...memory,
+      put: async (job) => {
+        if (failing) throw new Error('disk full');
+        await memory.put(job);
+      },
+    };
+    const warn = vi.fn();
+    const server = fakeAnthropicBatches();
+    const model = createAnthropic({ apiKey: 'k', fetch: server.fetch })('claude-haiku-5-5');
+    const logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
+    const batch = createBatchClient({ model, store, deps: { logger } });
+    const job = await batch.submit([{ id: 'a', prompt: 'x' }]);
+    server.finish(job.id, {
+      a: { type: 'succeeded', message: message([{ type: 'text', text: 'A' }]) },
+    });
+    failing = true;
+    const results = await batch.collect(job);
+    expect(results.map((result) => result.text)).toEqual(['A']);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/job store/), expect.anything());
+    // The job stays open, so the next pass reads it again.
+    expect((await batch.pending()).map((open) => open.id)).toEqual([job.id]);
   });
 
   it('keeps stored jobs apart from the caller’s objects', async () => {

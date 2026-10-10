@@ -213,7 +213,7 @@ const batch = createBatchClient({
   | Errored with 400, 401, 403, 404, 422 or 429 | Released: refused without running |
   | Any other error, or no result from a completed batch | Kept, unknown: it may have been billed |
 
-- **Settlement is idempotent.** Reading the results again changes nothing in the ledger or the store, so an interrupted read can simply start over.
+- **Settlement is idempotent.** Reading the results again changes nothing in the ledger or the store, so an interrupted read can simply start over. When the store cannot take a settlement (a `BudgetLedgerError` with code `admission_failed`, after the ledger's retries), `results` throws at that request; read the results again once the store answers. `results` hands out every result it settled before that, while `collect` rejects as a whole.
 - **A submission that fails** releases the holds when no batch can exist (validation, an OpenAI input upload) or the provider refused the batch call, and keeps them unknown otherwise.
 - **Unpriced models** follow the [same rule as everywhere](/docs/modules/budgets#models-without-a-price): under a USD budget a model with no batch price runs, its holds count tokens but no dollars, and the job carries one `unpriced-model` warning; `budget.unknownPrice: 'reject'` refuses the batch before anything is sent.
 
