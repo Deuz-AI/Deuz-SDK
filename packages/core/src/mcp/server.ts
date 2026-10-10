@@ -365,7 +365,7 @@ async function standardToJsonSchema(
     return (await toJSONSchema(schema)) as Record<string, unknown>;
   } catch (err) {
     throw new InvalidRequestError({
-      message: `MCP server tool '${name}' takes a Standard Schema, and tools/list must advertise it as JSON Schema: install the optional peer "@standard-community/standard-json", use a schema library that implements ~standard.jsonSchema, or pass a raw JSON Schema.`,
+      message: `MCP server tool '${name}' has a Standard Schema, and tools/list advertises schemas as JSON Schema: install the optional peer "@standard-community/standard-json", use a schema library that implements ~standard.jsonSchema, or pass a raw JSON Schema.`,
       cause: err,
     });
   }
@@ -678,18 +678,22 @@ export function createMcpServer(options: McpServerOptions): DeuzMcpServer {
     const agentTools = options.agentTools ?? {};
     if (Object.keys(agentTools).length > 0) {
       const { prepareAgentTools } = await import('../inference/agent-tools');
-      const contexts = options.toolsContext;
-      // A static context is validated ONCE, here, so a broken one fails ready();
-      // the function form can only be checked per call.
-      const fixed =
-        typeof contexts === 'function' ? undefined : await prepareAgentTools(agentTools, contexts);
+      const perCall =
+        typeof options.toolsContext === 'function'
+          ? (options.toolsContext as PerCallContexts)
+          : undefined;
+      let fixed: ToolSet | undefined;
       for (const [name, agentTool] of Object.entries(agentTools)) {
+        // Converted even when unused, so a schema that cannot be listed fails
+        // ready() with this server's error rather than inside native preparation.
+        const output = agentTool.outputSchema;
+        const converted =
+          output !== undefined && isStandardSchema(output)
+            ? await standardToJsonSchema(name, output)
+            : output;
         // A `toModelOutput` projection is what the client receives, so the raw
         // result's schema would describe the wrong value.
-        const advertised =
-          agentTool.outputSchema !== undefined && agentTool.toModelOutput === undefined
-            ? await toJSONSchema(agentTool.outputSchema)
-            : undefined;
+        const advertised = agentTool.toModelOutput === undefined ? converted : undefined;
         entries.push({
           name,
           config: {
@@ -700,13 +704,19 @@ export function createMcpServer(options: McpServerOptions): DeuzMcpServer {
               : {}),
           },
           hasOutputSchema: advertised !== undefined,
-          resolve: fixed
-            ? async () => fixed[name]!
-            : async (request) => {
-                const perCall = await (contexts as PerCallContexts)(request);
-                return (await prepareAgentTools({ [name]: agentTool }, perCall))[name]!;
-              },
+          resolve: perCall
+            ? async (request) =>
+                (await prepareAgentTools({ [name]: agentTool }, await perCall(request)))[name]!
+            : async () => fixed![name]!,
         });
+      }
+      // A static context is validated ONCE, here, so a broken one fails ready();
+      // the function form can only be checked per call.
+      if (!perCall) {
+        fixed = await prepareAgentTools(
+          agentTools,
+          options.toolsContext as Record<string, unknown> | undefined,
+        );
       }
     }
 

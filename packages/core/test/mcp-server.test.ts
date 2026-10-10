@@ -755,7 +755,35 @@ describe('createMcpServer — the optional peer is missing', () => {
 
   afterEach(() => {
     vi.doUnmock('@modelcontextprotocol/server');
+    vi.doUnmock('@standard-community/standard-json');
     vi.resetModules();
+  });
+
+  it('a Standard Schema that cannot be listed as JSON Schema fails ready(), naming the tool', async () => {
+    vi.doMock(
+      '@standard-community/standard-json',
+      notInstalled('@standard-community/standard-json'),
+    );
+    vi.resetModules();
+    const { createMcpServer: fresh } = await import('../src/mcp/server');
+
+    const input = fresh({
+      name: 't',
+      tools: { scale: { parameters: z.object({ n: z.number() }), execute: () => 1 } },
+    });
+    await expect(input.ready()).rejects.toThrow(/'scale'.*standard-json/);
+
+    const output = fresh({
+      name: 't',
+      agentTools: {
+        total: {
+          parameters: { type: 'object' },
+          outputSchema: z.object({ total: z.number() }),
+          execute: () => ({ total: 1 }),
+        },
+      },
+    });
+    await expect(output.ready()).rejects.toThrow(/'total'.*standard-json/);
   });
 
   it('ready() rejects with the install hint and fetch answers a JSON-RPC error', async () => {
