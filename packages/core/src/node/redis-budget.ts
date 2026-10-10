@@ -23,6 +23,7 @@
  * B:open              ZSET  score 0, member = 16-digit reservedAt + requestId
  * B:closed            ZSET  requestId -> reservedAt (settled, released, denied)
  * B:scopes            ZSET  score 0, member = scope key (prune walks it)
+ * B:schema            STRING the key layout version (1), stamped on first use
  * ```
  */
 import type {

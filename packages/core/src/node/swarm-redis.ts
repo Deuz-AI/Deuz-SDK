@@ -22,6 +22,7 @@
  * W:notes:R        HASH  q:<channel>:<n> -> note, e:<entryId> -> <channel>:<n>,
  *                        n:<channel> -> last sequence
  * W:gen            STRING the generation counter
+ * W:schema         STRING the key layout version (1), stamped on first use
  * W:ix, W:ix:st:<status>, W:ix:sc:<hex scope>, W:ix:ss:<status>:<hex scope>
  *                  ZSET  score 0, member = sortable updatedAt + R, so ZRANGEBYLEX
  *                        pages runs by updatedAt, then scope, then runId

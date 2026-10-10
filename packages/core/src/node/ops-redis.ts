@@ -20,6 +20,7 @@
  * T:run:revision    HASH  runId -> revision (0 for a 2.1 envelope)
  * T:run:terminal    ZSET  runId -> server ms of its save, terminal runs only
  * T:claims          ZSET  key -> server ms it was granted
+ * T:schema          STRING the key layout version (1), stamped on first use
  * ```
  */
 import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
