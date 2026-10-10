@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createUsageCostAccumulator } from '../src/internal/usage-cost';
 import type { UsageCostSnapshot } from '../src/internal/usage-cost';
-import { UnpricedModelError } from '../src/internal/unpriced';
+import { UnpricedModelError } from '../src/internal/unpriced-error';
 import { createWarningSink } from '../src/internal/warnings';
 import type { Usage } from '../src/types/usage';
 

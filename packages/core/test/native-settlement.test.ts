@@ -2,10 +2,21 @@ import { describe, expect, it } from 'vitest';
 import { generateText } from '../src/generate';
 import { createExecutionContext } from '../src/execution-policy';
 import { createInMemoryBudgetStore } from '../src/budget-store';
-import { BudgetLedgerError } from '../src/budget-ledger';
+import { BudgetLedgerError, createBudgetLedger } from '../src/budget-ledger';
 import { createMockModel } from '../src/testing';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import type { BudgetStore } from '../src/types/budget-store';
+import type { Usage } from '../src/types/usage';
+
+const usage = (totalTokens: number): Usage => ({
+  inputTokens: totalTokens,
+  outputTokens: 0,
+  reasoningTokens: 0,
+  cachedReadTokens: 0,
+  cacheWriteTokens: 0,
+  cacheWrite1hTokens: 0,
+  totalTokens,
+});
 
 const prices = { priceUsage: () => 0.01 };
 const scopes = [{ key: 'user:1', limits: { tokens: 100_000 } }];
@@ -56,10 +67,10 @@ describe('native settlement survives a failing BudgetStore (F17)', () => {
     expect(error).toBeInstanceOf(BudgetLedgerError);
     const [record] = execution.ledger.snapshot().reservations;
     expect(error).toMatchObject({
-      code: 'settlement_failed',
+      code: 'admission_failed',
       requestId: record!.requestId,
-      settlement: { requestId: record!.requestId, usage: { totalTokens: 15 } },
-      cause: { code: 'admission_failed' },
+      settlement: { requestId: record!.requestId, usage: { totalTokens: 15 }, usd: 0.01 },
+      cause: { message: 'could not serialize access (40001)' },
     });
     expect(error.message).toContain(record!.requestId);
     // Bounded: three attempts on the finish path and three on the error path.
@@ -85,13 +96,43 @@ describe('native settlement survives a failing BudgetStore (F17)', () => {
       snapshot: execution.snapshot(),
       admission: { store: inner },
     });
-    await recovered.ledger.settleUsage(
-      error.settlement!.requestId,
-      error.settlement!.usage!,
-      prices,
-    );
+    await recovered.ledger.settle(error.settlement!);
     expect(await inner.usage('user:1')).toEqual({ tokens: 15, usd: 0.01 });
     expect(recovered.ledger.get(error.requestId!)).toMatchObject({ state: 'settled' });
+  });
+
+  it('gives direct ledger callers the same retries and a replayable settlement', async () => {
+    const flaked = flaky('settle', 2);
+    const ledger = createBudgetLedger({ admission: { store: flaked.store, scopes } });
+    await ledger.reserve({ requestId: 'a', modelId: 'm', tokens: 100, usd: 1 });
+    await expect(ledger.settle({ requestId: 'a', tokens: 10, usd: 0.5 })).resolves.toMatchObject({
+      state: 'settled',
+    });
+    expect(flaked.calls()).toBe(3);
+
+    const down = flaky('settle', Number.POSITIVE_INFINITY);
+    const stuck = createBudgetLedger({ admission: { store: down.store, scopes } });
+    await stuck.reserve({ requestId: 'b', modelId: 'm', tokens: 100, usd: 1 });
+    const error = (await stuck
+      .settleUsage('b', usage(12), prices)
+      .catch((caught: unknown) => caught)) as BudgetLedgerError;
+    expect(error).toMatchObject({
+      code: 'admission_failed',
+      requestId: 'b',
+      settlement: { requestId: 'b', usage: { totalTokens: 12 }, usd: 0.01 },
+    });
+    expect(stuck.get('b')?.state).toBe('reserved');
+    // Errors that close no hold carry no request id.
+    const plain = await createBudgetLedger({
+      admission: {
+        store: { ...down.store, reserve: () => Promise.reject(new Error('down')) },
+        scopes,
+      },
+    })
+      .reserve({ requestId: 'c', modelId: 'm', tokens: 1 })
+      .catch((caught: unknown) => caught);
+    expect(plain).toMatchObject({ code: 'admission_failed' });
+    expect(Object.keys(plain as object)).not.toContain('requestId');
   });
 
   it('retries releasing the hold of a request the provider refused', async () => {

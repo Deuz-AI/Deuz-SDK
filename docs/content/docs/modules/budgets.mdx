@@ -156,29 +156,31 @@ unpriced call switched that stop off for the rest of the run.
 
 ## When a settlement fails
 
-A billed attempt is settled after the call. When the store refuses the
-settlement (`admission_failed`, so nothing changed locally), the native request
-tries again, three attempts in all. When the store stays down, the call fails
-with a `BudgetLedgerError` whose code is `settlement_failed`. The hold stays at
-its estimate, which is the safe direction, under `error.requestId`, and
-`error.settlement` carries what is still owed. Settle it once the store answers
-again, in the same ledger or in one restored from its durable snapshot:
+A billed attempt is settled after the call, and a refused one is released.
+Both are idempotent in the store, so the ledger tries a failing settlement or
+release three times. When the store stays down, the call fails with
+`admission_failed` as before, and nothing changed locally: the hold stays at its
+estimate, which is the safe direction. The error now names the attempt in
+`error.requestId`, and for a settlement `error.settlement` replays it exactly.
+Settle it once the store answers again, in the same ledger or in one restored
+from its durable snapshot:
 
 ```ts
 import { BudgetLedgerError } from '@deuz-sdk/core/agent';
 import type { NativeExecutionContext } from '@deuz-sdk/core/agent';
-import type { PriceProvider } from '@deuz-sdk/core';
 
 export async function settleLater(
   error: unknown,
   execution: NativeExecutionContext,
-  prices: PriceProvider,
 ): Promise<void> {
-  if (!(error instanceof BudgetLedgerError) || error.code !== 'settlement_failed') throw error;
-  const { requestId, usage } = error.settlement!;
-  await execution.ledger.settleUsage(requestId, usage!, prices);
+  if (!(error instanceof BudgetLedgerError) || !error.settlement) throw error;
+  await execution.ledger.settle(error.settlement);
 }
 ```
+
+The native request forgets an attempt's request ID only after the ledger
+accepted its settlement, so a failure on the way out is retried once more on the
+call's error path before it is reported.
 
 A process that dies between a call and its settlement leaves the same kind of
 hold: its request ID is a `reserved` entry in the last persisted ledger snapshot.

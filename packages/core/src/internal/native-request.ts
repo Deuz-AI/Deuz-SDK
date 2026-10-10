@@ -1,6 +1,5 @@
 import { assertExecutionPolicy } from '../execution-policy';
 export { assertExecutionPolicy } from '../execution-policy';
-import { BudgetLedgerError } from '../budget-ledger';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import { getCapabilities } from '../core/registry';
 import { createTokenEstimator } from './estimate-tokens';
@@ -14,29 +13,6 @@ import type { InternalRunOptions } from '../core/inference';
 
 /** Without a `deps.priceProvider` no model has a price (2.3). */
 const NO_PRICES: PriceProvider = { priceUsage: () => undefined };
-
-/** Attempts at a ledger write the persistent BudgetStore refused (F17, 2.3). */
-const LEDGER_ATTEMPTS = 3;
-
-/**
- * Repeat a ledger write while the persistent store fails it. `admission_failed`
- * guarantees nothing changed locally, so the write is safe to repeat; the
- * stores retry their own serialization conflicts, so this does not wait.
- */
-async function retrying<T>(write: () => Promise<T>): Promise<T> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await write();
-    } catch (error) {
-      if (
-        attempt >= LEDGER_ATTEMPTS ||
-        !(error instanceof BudgetLedgerError) ||
-        error.code !== 'admission_failed'
-      )
-        throw error;
-    }
-  }
-}
 
 /** Models reported per ledger: one `unpriced-model` warning per run and model. */
 const reported = new WeakMap<BudgetLedger, Set<string>>();
@@ -135,7 +111,7 @@ export function createNativeRequest(
           throw userSignal.reason ?? new DOMException('Aborted', 'AbortError');
       } catch (error) {
         try {
-          await retrying(() => execution.ledger.release(requestId));
+          await execution.ledger.release(requestId);
           reservationId = undefined;
         } catch {
           // The kept id is settled as unknown on the caller's error path.
@@ -143,39 +119,22 @@ export function createNativeRequest(
         throw error;
       }
     },
+    // F17 (2.3): the request id is forgotten only once the ledger accepted the
+    // write, so a failed settlement can still be closed on the error path.
     async settle(usage: Usage | undefined, available: boolean): Promise<void> {
       const id = reservationId;
       if (!id) return;
-      const actual = usage && available ? withTotal(usage) : undefined;
-      try {
-        await retrying(() =>
-          actual
-            ? execution.ledger.settleUsage(id, actual, deps.priceProvider ?? NO_PRICES)
-            : execution.ledger.markUnknown(id),
-        );
-      } catch (error) {
-        // F17 (2.3): the id is cleared only after the ledger accepts the
-        // settlement, so the caller's error path can still close this hold.
-        if (error instanceof BudgetLedgerError && error.code === 'admission_failed')
-          throw new BudgetLedgerError(
-            'settlement_failed',
-            `Settling ${id} failed ${LEDGER_ATTEMPTS} times because the persistent budget store ` +
-              'is unavailable; its hold stays at the estimate until it is settled again.',
-            error,
-            { requestId: id, settlement: { requestId: id, ...(actual ? { usage: actual } : {}) } },
-          );
-        throw error;
-      }
+      await (usage && available
+        ? execution.ledger.settleUsage(id, withTotal(usage), deps.priceProvider ?? NO_PRICES)
+        : execution.ledger.markUnknown(id));
       reservationId = undefined;
     },
     async rejectResponse(status: number): Promise<void> {
       const id = reservationId;
       if (!id) return;
-      await retrying(() =>
-        [400, 401, 403, 404, 422, 429].includes(status)
-          ? execution.ledger.release(id)
-          : execution.ledger.markUnknown(id),
-      );
+      await ([400, 401, 403, 404, 422, 429].includes(status)
+        ? execution.ledger.release(id)
+        : execution.ledger.markUnknown(id));
       reservationId = undefined;
     },
     remaining(): number | undefined {

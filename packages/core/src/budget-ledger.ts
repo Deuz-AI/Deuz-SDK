@@ -24,24 +24,28 @@ export type BudgetLedgerErrorCode =
   | 'unknown_request'
   | 'invalid_snapshot'
   | 'persistence_failed'
-  /** The persistent `BudgetStore` failed; nothing was admitted or changed locally (2.2). */
+  /**
+   * The persistent `BudgetStore` failed; nothing was admitted or changed
+   * locally (2.2). A settlement or release is tried three times first and the
+   * error then carries `requestId` and, for a settlement, `settlement` (2.3).
+   */
   | 'admission_failed'
   /** A model with no price was refused under a USD bound with `unknownPrice: 'reject'` (2.3). */
-  | 'unpriced_model'
-  /**
-   * A billed attempt could not be settled because the persistent store kept
-   * failing (2.3). Its hold stays at the estimate under `requestId`; settle it
-   * again with `settlement` once the store is back.
-   */
-  | 'settlement_failed';
+  | 'unpriced_model';
+
+/** Attempts at closing a hold (settle, release) in the persistent store (2.3, F17). */
+const CLOSE_ATTEMPTS = 3;
 
 export class BudgetLedgerError extends Error {
   readonly name = 'BudgetLedgerError';
   readonly fatalExecution = true;
   // `declare`: only errors that carry them get these properties.
-  /** The attempt this error leaves held (2.3, `settlement_failed`). */
+  /**
+   * The attempt whose hold a failed store call left in place (2.3). Settle or
+   * release it again once the store answers.
+   */
   declare readonly requestId?: string;
-  /** What still has to be settled for `requestId` (2.3, `settlement_failed`). */
+  /** For a failed settlement: `ledger.settle(settlement)` replays it (2.3). */
   declare readonly settlement?: BudgetSettlement;
 
   constructor(
@@ -518,15 +522,29 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
   }
 
   /** Run a store call; a failure changes nothing locally and admits nothing. */
-  async function mirror<T>(call: () => Promise<T>): Promise<T> {
-    try {
-      return await call();
-    } catch (error) {
-      throw new BudgetLedgerError(
-        'admission_failed',
-        'The persistent budget store failed; nothing was changed.',
-        error,
-      );
+  /**
+   * A call that closes a hold (settle, release) is repeated: both are
+   * idempotent in the store. Its final failure names the request and what it
+   * still owes, so the hold can be closed later (2.3, F17).
+   */
+  async function mirror<T>(
+    call: () => Promise<T>,
+    closing?: { readonly requestId: string; readonly settlement?: BudgetSettlement },
+  ): Promise<T> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await call();
+      } catch (error) {
+        if (closing && attempt < CLOSE_ATTEMPTS) continue;
+        throw new BudgetLedgerError(
+          'admission_failed',
+          closing
+            ? `The persistent budget store failed to close ${closing.requestId}; nothing was changed and its hold stays.`
+            : 'The persistent budget store failed; nothing was changed.',
+          error,
+          closing,
+        );
+      }
     }
   }
 
@@ -629,8 +647,18 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
   ): Promise<void> | undefined {
     if (!admission || !settledInStore(next) || settledInStore(previous)) return undefined;
     const store = admission.store;
-    return mirror(() =>
-      store.settle(next.requestId, { tokens: next.actual.tokens!, usd: next.actual.usd ?? 0 }),
+    return mirror(
+      () =>
+        store.settle(next.requestId, { tokens: next.actual.tokens!, usd: next.actual.usd ?? 0 }),
+      {
+        requestId: next.requestId,
+        // `ledger.settle(settlement)` replays exactly this transition.
+        settlement: {
+          requestId: next.requestId,
+          ...(next.usage ? { usage: next.usage } : { tokens: next.actual.tokens! }),
+          ...(next.actual.usd !== undefined ? { usd: next.actual.usd } : {}),
+        },
+      },
     );
   }
 
@@ -968,7 +996,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
           save(record({ ...current, state: 'released', actual: {}, usage: undefined }));
         if (!admission || current.state === 'released') return released();
         const store = admission.store;
-        return mirror(() => store.release(requestId)).then(released);
+        return mirror(() => store.release(requestId), { requestId }).then(released);
       });
     },
     get: (requestId) => entries.get(requestId),

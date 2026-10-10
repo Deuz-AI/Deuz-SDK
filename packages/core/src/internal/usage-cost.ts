@@ -1,7 +1,8 @@
 import type { Dependencies, PriceProvider, UsageMeta } from '../types/deps';
 import type { BudgetLimits } from '../types/execution';
 import type { Usage } from '../types/usage';
-import { UnpricedModelError, unpricedModelWarning } from './unpriced';
+import { unpricedModelWarning } from './unpriced';
+import { UnpricedModelError } from './unpriced-error';
 import type { WarningSink } from './warnings';
 
 /** Persisted paid totals, not a mixed-model token total to reprice on resume. */
@@ -179,13 +180,12 @@ export function createUsageCostAccumulator(
     });
   }
 
-  /** Price a probe usage; `true` when the model has a usable price. */
+  /** Price a probe usage: whether the model has a price; rejects when the lookup fails. */
   async function probe(model: string): Promise<boolean> {
-    if (!options.priceProvider) return false;
-    const price = (await options.priceProvider.priceUsage(model, PROBE)) ?? undefined;
-    if (price === undefined) return false;
-    if (Number.isFinite(price) && price >= 0) return true;
-    throw new TypeError(`The priceProvider returned an invalid price for ${model}.`);
+    const price = (await options.priceProvider?.priceUsage(model, PROBE)) ?? undefined;
+    if (price !== undefined && !(Number.isFinite(price) && price >= 0))
+      throw new TypeError(`Invalid price for ${model}.`);
+    return price !== undefined;
   }
 
   function unpriced(): Pick<UsageCostSummary, 'unpricedCalls' | 'unpricedModels'> {
@@ -231,23 +231,16 @@ export function createUsageCostAccumulator(
       const budget = options.budget;
       if (budget?.usd === undefined) return;
       let lookup = probes.get(model);
-      if (!lookup) {
-        lookup = probe(model);
-        probes.set(model, lookup);
-      }
-      let priced: boolean;
+      if (!lookup) probes.set(model, (lookup = probe(model)));
       try {
-        priced = await lookup;
+        if (await lookup) return;
       } catch (cause) {
         // An outage is not a missing price: ask again before the next call.
         probes.delete(model);
-        if (budget.unknownPrice === 'reject')
-          throw new UnpricedModelError(model, { priceProvider: hasProvider, cause });
+        if (budget.unknownPrice === 'reject') throw new UnpricedModelError(model, cause);
         return;
       }
-      if (priced) return;
-      if (budget.unknownPrice === 'reject')
-        throw new UnpricedModelError(model, { priceProvider: hasProvider });
+      if (budget.unknownPrice === 'reject') throw new UnpricedModelError(model);
       warn(model);
     },
   });
