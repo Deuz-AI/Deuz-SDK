@@ -1,0 +1,71 @@
+{
+  "kind": "deuz-goal",
+  "version": 1,
+  "goalId": "release-notes",
+  "scope": "tenant-a",
+  "revision": 7,
+  "parentGoalId": "release-2.3",
+  "runId": "release-notes-run-2",
+  "objective": "Write the 2.3 release notes.",
+  "criteria": [
+    { "id": "draft", "description": "A draft exists in docs/whats-new.mdx." },
+    { "id": "review", "description": "A maintainer approved the draft.", "required": true },
+    { "id": "links", "description": "Every link resolves.", "required": false }
+  ],
+  "evidence": [
+    {
+      "id": "ev-1",
+      "source": "artifact",
+      "ref": "docs/whats-new.mdx",
+      "digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "summary": "Draft written.",
+      "runId": "release-notes-run-1",
+      "at": 1760090400000
+    },
+    {
+      "id": "ev-2",
+      "source": "model",
+      "ref": "run:release-notes-run-2#3",
+      "summary": "The model says the links work.",
+      "at": 1760090460000
+    }
+  ],
+  "results": [
+    {
+      "criterionId": "draft",
+      "verdict": "passed",
+      "source": "test",
+      "evidence": ["ev-1"],
+      "at": 1760090410000
+    },
+    {
+      "criterionId": "links",
+      "verdict": "inconclusive",
+      "source": "model",
+      "evidence": ["ev-2"],
+      "note": "A passed verdict needs evidence from outside the model.",
+      "at": 1760090470000
+    }
+  ],
+  "budget": { "usd": 5, "tokens": 2000000 },
+  "spent": { "usd": 1.25, "tokens": 340000 },
+  "deadline": 1760176800000,
+  "status": "waiting",
+  "waiting": {
+    "reason": "dependency",
+    "id": "release-notes#7",
+    "since": 1760090500000,
+    "note": "Waiting for the changelog goal and the link check.",
+    "on": [
+      { "kind": "goal", "id": "changelog", "settled": true },
+      { "kind": "run", "id": "link-check-run" }
+    ]
+  },
+  "seen": [
+    "nightly@1760054400000",
+    "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+  ],
+  "createdAt": 1760090000000,
+  "updatedAt": 1760090500000,
+  "meta": { "channel": "#releases", "priority": 2 }
+}
