@@ -280,8 +280,8 @@ OpenAI Responses wires (2.3) send those tools unchanged beside the output format
 stays the loop's for the prompt cache and preserved thinking. Gemini's native wire
 sends the JSON schema alone: `@google/genai` documents no request that combines
 function declarations with a response schema, and with `'none'` the model could not
-call them anyway. The tool strategy sends its own forced `json_output` tool instead.
-None of this is live-verified.
+call them anyway. The tool strategy sends only its own forced output tool
+(`json_output` unless `output.name` is set). None of this is live-verified.
 After a [handoff](/docs/agents/handoffs), the target agent's model and tools drive
 every later step, finalization and verifier re-drives included, and its tools pass
 through the same receipts as the root agent's.
