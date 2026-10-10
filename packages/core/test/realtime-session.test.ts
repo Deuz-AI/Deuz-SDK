@@ -5,6 +5,7 @@ import {
   createGeminiLive,
   RealtimeError,
   type RealtimeEvent,
+  type RealtimeWebSocketFactory,
 } from '../src/realtime';
 import { tool } from '../src/tool';
 import type { JSONSchema } from '../src/types/schema';
@@ -434,5 +435,128 @@ describe('tool calls handled from inside a tool-call listener', () => {
       .map((event) => `${event.type}:${(event as { toolCallId: string }).toolCallId}`);
     expect(order.indexOf('tool-result:fc_1')).toBeGreaterThan(order.indexOf('tool-call:fc_1'));
     expect(order.indexOf('tool-result:fc_2')).toBeGreaterThan(order.indexOf('tool-call:fc_2'));
+  });
+
+  /** An OpenAI server that acknowledges the closing handshake after a round trip, like a real one. */
+  function slowCloseServer(): {
+    webSocket: RealtimeWebSocketFactory;
+    socket: () => FakeRealtimeSocket;
+  } {
+    class SlowCloseSocket extends FakeRealtimeSocket {
+      override close(code?: number, reason?: string): void {
+        this.closeCalls.push({ code, reason });
+        if (this.readyState >= 2) return;
+        this.readyState = 2;
+        setTimeout(() => this.drop(code ?? 1005, reason ?? ''), 5);
+      }
+    }
+    let latest: FakeRealtimeSocket | undefined;
+    return {
+      webSocket: (url, init) => {
+        latest = new SlowCloseSocket(url, init);
+        openaiHandshake(latest);
+        return latest;
+      },
+      socket: () => latest!,
+    };
+  }
+
+  const transferCall = (calls: { call_id: string; name: string }[]) => ({
+    type: 'response.done',
+    event_id: 'e',
+    response: {
+      id: 'resp_1',
+      status: 'completed',
+      output: calls.map((call) => ({ type: 'function_call', ...call, arguments: '{}' })),
+    },
+  });
+
+  async function closeHandshake(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await flush();
+  }
+
+  it('close() inside on("tool-call") keeps the announced call from executing', async () => {
+    const server = slowCloseServer();
+    const ran: string[] = [];
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      tools: {
+        transfer: tool({
+          parameters: { type: 'object' },
+          execute: async () => {
+            ran.push(session.status);
+            return 'transferred $100';
+          },
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    session.on('tool-call', () => void session.close()); // e.g. a max-tool-calls guard
+    await session.connect();
+    server.socket().push(transferCall([{ call_id: 'c1', name: 'transfer' }]));
+    await closeHandshake();
+    expect(session.status).toBe('closed');
+    expect(ran).toEqual([]);
+  });
+
+  it('aborting the signal inside on("tool-call") keeps the announced call from executing', async () => {
+    const server = slowCloseServer();
+    const controller = new AbortController();
+    const ran: string[] = [];
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      signal: controller.signal,
+      tools: {
+        transfer: tool({
+          parameters: { type: 'object' },
+          execute: async () => {
+            ran.push(session.status);
+            return 'transferred $100';
+          },
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    session.on('tool-call', () => controller.abort());
+    await session.connect();
+    server.socket().push(transferCall([{ call_id: 'c1', name: 'transfer' }]));
+    await closeHandshake();
+    expect(session.status).toBe('closed');
+    expect(ran).toEqual([]);
+  });
+
+  it('a close from a tool-result listener stops the rest of the batch', async () => {
+    const server = slowCloseServer();
+    const ran: string[] = [];
+    const approveToolCall = vi.fn(() => true);
+    const session = createRealtimeSession({
+      model: createOpenAIRealtime({ apiKey: 'sk' })('gpt-realtime'),
+      approveToolCall,
+      tools: {
+        transfer: tool({
+          parameters: { type: 'object' },
+          needsApproval: true,
+          execute: async () => {
+            ran.push(session.status);
+            return 'transferred $100';
+          },
+        }),
+      },
+      deps: { webSocket: server.webSocket },
+    });
+    // The unknown tool is answered at once; its result closes the session.
+    session.on('tool-result', () => void session.close());
+    await session.connect();
+    server.socket().push(
+      transferCall([
+        { call_id: 'c1', name: 'nope' },
+        { call_id: 'c2', name: 'transfer' },
+      ]),
+    );
+    await closeHandshake();
+    expect(session.status).toBe('closed');
+    expect(approveToolCall).not.toHaveBeenCalled();
+    expect(ran).toEqual([]);
   });
 });

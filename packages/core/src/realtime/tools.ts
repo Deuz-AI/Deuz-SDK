@@ -161,6 +161,9 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
   }
 
   async function run(batch: Batch, call: DecodedToolCall): Promise<void> {
+    // A listener of this batch's tool-call or tool-result events may have closed
+    // the session (or aborted its signal): nothing starts after that.
+    if (closed) return;
     const tool = options.tools?.[call.toolName];
     if (!tool || tool.type === 'provider') {
       settle(batch, call, unknownToolMessage(options.tools, call.toolName), true);
@@ -175,6 +178,8 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
     if (!execute) return;
     const controller = new AbortController();
     running.set(call.toolCallId, controller);
+    /** The session closed, or the provider cancelled the call, during an await. */
+    const stopped = () => closed || controller.signal.aborted;
     const ctx: ToolExecuteContext = {
       toolCallId: call.toolCallId,
       messages: [],
@@ -184,6 +189,7 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
     };
     try {
       const validation = await validateOutput(tool.parameters, call.args);
+      if (stopped()) return;
       if (!validation.ok) {
         settle(batch, call, `Invalid arguments: ${validation.issues}`, true);
         return;
@@ -203,6 +209,8 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
           );
           return;
         }
+        // Nobody is asked to approve a call that can no longer run.
+        if (stopped()) return;
         const approved = await options.approveToolCall({
           toolCallId: call.toolCallId,
           toolName: call.toolName,
@@ -213,7 +221,7 @@ export function createToolRunner(options: ToolRunnerOptions): ToolRunner {
           return;
         }
       }
-      if (controller.signal.aborted) return;
+      if (stopped()) return;
       await invoke(batch, call, () => execute(args, ctx), tool.timeoutMs, controller);
     } catch (cause) {
       // A throw is fed back to the model (self-heal), never out of the session.

@@ -273,6 +273,7 @@ Tools are ordinary Deuz [tools](/docs/agents/tools) — the same `tool()` shape,
 - A tool **without `execute`** is a [client tool](/docs/agents/client-tools): the session emits `tool-call` and waits for `session.sendToolResult(toolCallId, result)` (pass `{ isError: true }` for a failure). The call is waiting by the time its `tool-call` event arrives, so you can answer it from inside that listener or later. Answering a call that is not waiting — already answered, or cancelled — throws a `RealtimeError` with `kind: 'tool'`.
 - `needsApproval` asks `approveToolCall(call)` (a session option). Without an approver, the call is denied and the model hears `Tool call denied.`
 - Unknown tools, unparsable or invalid arguments, a thrown error and a timeout all become an error result the model hears, so the conversation goes on — the same self-healing as the [tool loop](/docs/agents/tool-loop). Timeouts run on `deps.clock`.
+- `close()` (or aborting the session's `signal`) aborts every running tool's `signal`, and a call that has not started yet never starts, even when you close from inside its `tool-call` listener.
 - The calls of one model turn are answered together once all of them settle (Gemini expects one `toolResponse`; OpenAI gets one `response.create`). If the model is already answering something else, the `response.create` waits until that answer is done.
 - Provider-executed tools (`type: 'provider'`) are left out with an `unsupported-tool` warning.
 
