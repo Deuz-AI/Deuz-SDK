@@ -25,7 +25,8 @@
  *
  * Nothing here is live-verified (`liveVerified` is always `false`): Anthropic
  * facts are verified against Anthropic's API reference (cached 2026-10-06),
- * the other providers' facts are research-dated (2026-10-09).
+ * the other providers' facts are research-dated (2026-10-09; the earlier GPT-5
+ * snapshots' effort sets 2026-10-10).
  */
 import type { LanguageModel, ModelSurface } from './types/model';
 import {
