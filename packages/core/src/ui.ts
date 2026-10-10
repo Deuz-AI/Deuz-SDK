@@ -51,7 +51,23 @@ export type DeuzUIPart =
   | { type: 'step-start'; step: number }
   | { type: 'step-finish'; step: number; finishReason: FinishReason; usage: Usage }
   | { type: 'text-delta'; text: string }
-  | { type: 'reasoning-delta'; text: string; signature?: string }
+  /**
+   * A reasoning delta. 2.3 adds four optional fields, the canonical part's own
+   * (`ReasoningDeltaPart`), so a chat client can send every block back
+   * unchanged: `id` (deltas of one block share it), `encrypted` / `redacted`
+   * (`text` is an opaque payload, never display text) and `source` (the
+   * provider family that produced it). An older client ignores them, as it
+   * ignores any unknown key; they ride every wire version.
+   */
+  | {
+      type: 'reasoning-delta';
+      text: string;
+      signature?: string;
+      id?: string;
+      encrypted?: boolean;
+      redacted?: boolean;
+      source?: string;
+    }
   | { type: 'tool-input-delta'; toolCallId: string; toolName?: string; delta: string }
   | { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown }
   | {
@@ -323,6 +339,10 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         type: 'reasoning-delta',
         text: part.text,
         ...(part.signature ? { signature: part.signature } : {}),
+        ...(part.id !== undefined ? { id: part.id } : {}),
+        ...(part.encrypted ? { encrypted: true } : {}),
+        ...(part.redacted ? { redacted: true } : {}),
+        ...(part.source !== undefined ? { source: part.source } : {}),
       };
     case 'tool-call-delta':
       return {
@@ -797,9 +817,15 @@ export function toDeuzTextStreamResponse(
         for await (const part of result.fullStream) {
           if (part.type === 'text-delta') {
             enqueue(part.text);
-          } else if (includeReasoning && part.type === 'reasoning-delta' && !part.encrypted) {
-            // `encrypted` reasoning is an opaque provider payload (OpenAI
-            // Responses), not display text — never write it to a text body.
+          } else if (
+            includeReasoning &&
+            part.type === 'reasoning-delta' &&
+            !part.encrypted &&
+            !part.redacted
+          ) {
+            // `encrypted` reasoning (OpenAI Responses) and `redacted` thinking
+            // (Anthropic) are opaque provider payloads, not display text —
+            // never write them to a text body.
             enqueue(part.text);
           }
           // Everything else — tool calls, steps, citations, and notably the

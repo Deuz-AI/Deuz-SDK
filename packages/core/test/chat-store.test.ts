@@ -1325,13 +1325,16 @@ describe('canonicalFromUI (1.9, 3.2a)', () => {
       },
       { role: 'tool', content: [{ type: 'tool_result', toolUseId: 't1', result: 'hit' }] },
     ]);
-    // `assistantMessageFromTurn` (the streaming path) is unchanged: buckets,
-    // text-then-tools. The two are different projections on purpose.
+    // `assistantMessageFromTurn` (the streaming path) follows the same ordered
+    // parts since 2.3 (F21): it used to drop the reasoning and move the text
+    // ahead of the tools, and a provider rejects a turn sent back modified.
     expect(assistantMessageFromTurn(turn)).toEqual({
       role: 'assistant',
       content: [
-        { type: 'text', text: 'one. two.' },
+        { type: 'reasoning', text: 'plan', signature: 's' },
+        { type: 'text', text: 'one. ' },
         { type: 'tool_use', id: 't1', name: 'search', input: { q: 'x' } },
+        { type: 'text', text: 'two.' },
       ],
     });
   });
