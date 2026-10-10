@@ -207,11 +207,11 @@ describe('createFileWorkspace — sandbox escape guard', () => {
  */
 const linkKinds = isWin ? (['dir', 'junction'] as const) : (['dir'] as const);
 
-/** Plant a link at <root>/escape → <outside>. Returns the kind that worked. */
-async function plantLink(): Promise<'dir' | 'junction' | undefined> {
+/** Plant a link at <root>/escape → `target` (default <outside>). Returns the kind that worked. */
+async function plantLink(target = outside): Promise<'dir' | 'junction' | undefined> {
   for (const kind of linkKinds) {
     try {
-      await symlink(outside, join(root, 'escape'), kind);
+      await symlink(target, join(root, 'escape'), kind);
       return kind;
     } catch {
       /* EPERM without Developer Mode / admin — try the next kind */
@@ -244,6 +244,28 @@ describe('createFileWorkspace — symlink / junction escape (FIXED, layer 3)', (
     await expect(ws.exists('escape/secret.txt')).rejects.toThrow(/escapes the sandbox root/);
     await expect(ws.delete('escape/secret.txt')).rejects.toThrow(/escapes the sandbox root/);
     expect(await readFile(join(outside, 'secret.txt'), 'utf-8')).toBe(SECRET);
+  });
+
+  it('refuses to write through a DANGLING link, one whose target does not exist yet', async () => {
+    // realpath() cannot resolve such a link, so the check took it for a path that
+    // "does not exist yet" and the write FOLLOWED it to the far side: open() with
+    // O_CREAT creates the missing target FILE outside the root on POSIX, and on
+    // Windows writing through a dangling junction created the target DIRECTORY
+    // outside (needs no privilege). Nothing outside the root may be created.
+    const kind = await plantLink(join(outside, 'planted'));
+    if (!kind) throw new Error('SKIPPED: this platform refuses to create a link unprivileged.');
+    await expect(ws.write('escape', MARKER)).rejects.toThrow(/link that does not resolve/);
+    await expect(ws.writeBytes!('escape', new Uint8Array([1]))).rejects.toThrow(
+      /link that does not resolve/,
+    );
+    await expect(ws.write('escape/pwned.txt', MARKER)).rejects.toThrow(
+      /link that does not resolve/,
+    );
+    expect(await outsideFiles()).toEqual(['secret.txt']);
+    // Reading through it creates nothing and simply finds nothing there.
+    await expect(ws.read('escape')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await ws.exists('escape')).toBe(false);
+    expect(await outsideFiles()).toEqual(['secret.txt']);
   });
 });
 
