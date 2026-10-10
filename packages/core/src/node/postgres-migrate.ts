@@ -13,7 +13,13 @@
  * snapshot is taken before it waits on the lock, so a session that queued
  * misses the version row the holder committed and fails with 40001. The
  * statement is idempotent, so `createPostgresSchema` sends it again, with a
- * new snapshot, on any of `SCHEMA_RACE_CODES`. Node-only.
+ * new snapshot, on any of `SCHEMA_RACE_CODES`.
+ *
+ * Forward migrations (2.3): a schema stored at an older version runs the
+ * store's upgrade steps, in order, inside the same locked statement, then the
+ * `create` statements and the version bump; a failure anywhere leaves the
+ * schema as it was. A newer version, written by a newer build, is refused.
+ * Node-only.
  */
 import type { PgClientLike } from './store-postgres';
 
@@ -22,33 +28,76 @@ export interface PostgresSchemaSpec {
   lock: string;
   /** The schema-qualified version table. */
   meta: string;
+  /** The version this build writes. */
   version: number;
-  /** The message raised for a stored version this build does not know. */
+  /**
+   * The message raised for a stored version this build does not know; the
+   * stored version and the readable ones are appended.
+   */
   unsupported: string;
-  /** `CREATE ... IF NOT EXISTS` statements, run in order under the lock. */
+  /**
+   * `CREATE ... IF NOT EXISTS` statements for the current version, run in
+   * order under the lock on every first use, after any upgrade step. An object
+   * a schema lacks is created here, so an addition older builds can ignore,
+   * such as an index, needs no version change.
+   */
   create: readonly string[];
+  /**
+   * Forward migrations (2.3): `upgrades[n]` takes a schema stored at version n
+   * to n + 1, for every n from the oldest version this build still upgrades to
+   * `version - 1`. Change `version` only for a change older builds must not
+   * write through: they refuse a newer version. Each statement must be safe to
+   * run twice, because a session whose REPEATABLE READ snapshot predates the
+   * lock holder's upgrade runs it again before its retry sees the new version.
+   */
+  upgrades?: Readonly<Record<number, readonly string[]>>;
 }
 
 /** Quotes a constant for SQL text; the stores' identifiers are validated before use. */
 const literal = (text: string): string => `'${text.replace(/'/g, "''")}'`;
 
-/** The one statement that creates a store's schema; send it with `createPostgresSchema`. */
+/** The one statement that creates or upgrades a store's schema; send it with `createPostgresSchema`. */
 export function postgresSchemaStatement(spec: PostgresSchemaSpec): string {
-  if (!Number.isSafeInteger(spec.version)) throw new TypeError('Schema version must be an integer');
-  return `DO $deuz$
-DECLARE
-  stored integer;
-BEGIN
-  PERFORM pg_advisory_xact_lock(hashtext('deuz-sdk'), hashtext(${literal(spec.lock)}));
-  CREATE TABLE IF NOT EXISTS ${spec.meta} (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL);
-  INSERT INTO ${spec.meta} (singleton, version) VALUES (1, ${spec.version}) ON CONFLICT (singleton) DO NOTHING;
-  SELECT version INTO stored FROM ${spec.meta} WHERE singleton = 1;
-  IF stored IS DISTINCT FROM ${spec.version} THEN
-    RAISE EXCEPTION USING MESSAGE = ${literal(spec.unsupported)};
-  END IF;
-${spec.create.map((sql) => `  ${sql};`).join('\n')}
-END
-$deuz$`;
+  const { version } = spec;
+  if (!Number.isSafeInteger(version)) throw new TypeError('Schema version must be an integer');
+  const steps = Object.entries(spec.upgrades ?? {})
+    .map(([from, sql]) => ({ from: Number(from), sql }))
+    .sort((left, right) => left.from - right.from);
+  const oldest = steps[0]?.from ?? version;
+  if (
+    steps.some(
+      (step, index) =>
+        !Number.isSafeInteger(step.from) || step.from !== version - steps.length + index,
+    )
+  )
+    throw new TypeError(`Schema upgrade steps must run without gaps up to version ${version}`);
+  const readable = oldest === version ? `version ${version}` : `versions ${oldest} to ${version}`;
+  return [
+    'DO $deuz$',
+    'DECLARE',
+    '  stored integer;',
+    'BEGIN',
+    `  PERFORM pg_advisory_xact_lock(hashtext('deuz-sdk'), hashtext(${literal(spec.lock)}));`,
+    `  CREATE TABLE IF NOT EXISTS ${spec.meta} (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL);`,
+    `  SELECT version INTO stored FROM ${spec.meta} WHERE singleton = 1;`,
+    `  IF stored < ${oldest} OR stored > ${version} THEN`,
+    `    RAISE EXCEPTION USING MESSAGE = ${literal(`${spec.unsupported} `)} || stored || ${literal(`; this build reads ${readable}`)};`,
+    '  END IF;',
+    // A new schema (stored IS NULL) skips every step: `create` builds it whole.
+    ...steps.flatMap((step) => [
+      `  IF stored <= ${step.from} THEN`,
+      ...step.sql.map((sql) => `    ${sql};`),
+      '  END IF;',
+    ]),
+    ...spec.create.map((sql) => `  ${sql};`),
+    '  IF stored IS NULL THEN',
+    `    INSERT INTO ${spec.meta} (singleton, version) VALUES (1, ${version}) ON CONFLICT (singleton) DO NOTHING;`,
+    `  ELSIF stored < ${version} THEN`,
+    `    UPDATE ${spec.meta} SET version = ${version} WHERE singleton = 1;`,
+    '  END IF;',
+    'END',
+    '$deuz$',
+  ].join('\n');
 }
 
 /** How many times a store sends one statement before it gives up. */
