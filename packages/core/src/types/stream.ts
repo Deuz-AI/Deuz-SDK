@@ -11,6 +11,12 @@ import type { ToolCallOutcome } from './tool';
 export interface TextDeltaPart {
   type: 'text-delta';
   text: string;
+  /**
+   * Provider round-trip data for the text this delta belongs to (2.3
+   * additive), e.g. a Gemini `{ google: { thoughtSignature } }` on a plain
+   * text part. Echoed back on the next turn; never display content.
+   */
+  providerMetadata?: Record<string, unknown>;
 }
 
 export interface ReasoningDeltaPart {
@@ -19,6 +25,24 @@ export interface ReasoningDeltaPart {
   signature?: string;
   /** True when `text` is an opaque encrypted reasoning payload (OpenAI Responses) — not display text. */
   encrypted?: boolean;
+  /**
+   * The reasoning block this delta belongs to (2.3 additive), unique within
+   * one model response. Deltas with the same `id` build one block; a new `id`
+   * opens the next one, so consecutive blocks are never merged. Absent: the
+   * delta extends the current block (the 2.2 behaviour).
+   */
+  id?: string;
+  /**
+   * True when `text` is the opaque `data` of a provider-redacted block
+   * (Anthropic `redacted_thinking`, 2.3 additive) — not display text.
+   */
+  redacted?: boolean;
+  /**
+   * The provider family that produced the block (2.3 additive), recorded on the
+   * canonical part as `ReasoningPart.source`: `'anthropic'`, `'openai'`,
+   * `'google'`, or the Chat Completions host's provider id.
+   */
+  source?: string;
 }
 
 export interface ToolCallDeltaPart {

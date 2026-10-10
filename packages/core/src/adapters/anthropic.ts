@@ -14,7 +14,7 @@ import {
   RateLimitError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
-import type { EffortLevel } from '../core/registry';
+import { registryMatch, type EffortLevel } from '../core/registry';
 import {
   anthropicMaxTokens,
   atMostHigh,
@@ -25,6 +25,7 @@ import {
   reportDrop,
 } from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
+import { replaysTo } from '../internal/reasoning';
 import { acceptsDocuments, resolveMedia, warnDroppedDocument } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -48,7 +49,10 @@ interface MediaContext {
   warnings: BuildContext['warnings'];
 }
 
-/** Returns null when the part cannot be carried and was dropped (warned). */
+/**
+ * Returns null when the part cannot be carried: a dropped document (warned),
+ * or reasoning this wire must not replay (see the `reasoning` case).
+ */
 function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
   switch (part.type) {
     case 'text':
@@ -63,13 +67,15 @@ function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
         ...(part.isError ? { is_error: true } : {}),
       };
     case 'reasoning':
-      return part.redacted
-        ? { type: 'redacted_thinking', data: part.text }
-        : {
-            type: 'thinking',
-            thinking: part.text,
-            ...(part.signature ? { signature: part.signature } : {}),
-          };
+      // Claude's own blocks ride back exactly as they came (2.3, F21), between
+      // Claude models too: the API drops the ones the model cannot read.
+      // Another provider's reasoning is never a thinking block (an OpenAI
+      // encrypted item used to go out as one), and a thinking block without
+      // its signature is always rejected.
+      if (!replaysTo(part, 'anthropic')) return null;
+      if (part.redacted) return { type: 'redacted_thinking', data: part.text };
+      if (!part.signature) return null;
+      return { type: 'thinking', thinking: part.text, signature: part.signature };
     case 'image': {
       // `ImagePart` carries documents too (the Part union is locked until 2.0)
       // — a PDF must become a `document` block, never an `image` one: /v1/messages
@@ -108,13 +114,6 @@ function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
   }
 }
 
-/** Reasoning/thinking blocks MUST come first in an Anthropic content array. */
-function orderReasoningFirst(blocks: AnthropicBlock[]): AnthropicBlock[] {
-  const thinking = blocks.filter((b) => b.type === 'thinking' || b.type === 'redacted_thinking');
-  const rest = blocks.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
-  return [...thinking, ...rest];
-}
-
 /**
  * Map canonical tool choice → Anthropic. A forced choice the model cannot take
  * (`forcedOk` false: the row says so, or extended thinking is on) falls back
@@ -148,6 +147,96 @@ function mapAnthropicToolChoice(
   return { type: 'auto', ...dp };
 }
 
+// --- thinking block binding (2.3, F21 with F22) ---
+//
+// Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind each thinking block's
+// signature to the conversation before it (Anthropic API reference, cached
+// 2026-10-06). On accounts opened from 2026-08-31 a replayed block whose prefix
+// changed fails the request with 400, and Deuz's transcript prefix is not yet
+// stable (F22: recall, handoff and compaction still rewrite it). A request that
+// sends thinking back to such a model therefore asks the API to drop a
+// mismatched block instead. Shapes from @anthropic-ai/sdk 0.133.0's beta types;
+// not live-verified.
+
+const BLOCK_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
+
+/** The binding models; an unknown 5.x id on the family fallback counts too. */
+const PREFIX_BOUND_MODELS: ReadonlySet<string> = new Set([
+  'claude-fable-5-1',
+  'claude-opus-5-5',
+  'claude-sonnet-5-5',
+  'claude-haiku-5-5',
+]);
+
+function bindsThinkingToPrefix(call: BuildContext['call']): boolean {
+  return (
+    PREFIX_BOUND_MODELS.has(call.modelId) ||
+    registryMatch({ provider: call.provider, modelId: call.modelId, surface: 'anthropic' }) ===
+      'family'
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Set `thinking.block_binding` on `body`; returns whether the request carries
+ * one (and so needs the beta header). The default is `drop_block` when the
+ * request replays thinking to a binding model. `providerOptions.<provider>
+ * .thinking.block_binding` replaces it: an object is sent as given, `null`
+ * sends none. Only `adaptive` and `enabled` thinking can carry a binding, so a
+ * request that turned thinking off (`effort: 'none'`) carries none. The
+ * caller's other `thinking` fields ride along when the request sets no thinking
+ * of its own; when it does, its own wins, as for every provider option.
+ */
+function applyBlockBinding(
+  ctx: BuildContext,
+  body: Record<string, unknown>,
+  replaysThinking: boolean,
+): boolean {
+  const own = ctx.options.providerOptions?.[ctx.call.provider];
+  const caller = isRecord(own?.thinking) ? own.thinking : undefined;
+  const explicit = caller !== undefined && Object.hasOwn(caller, 'block_binding');
+  const binding = explicit
+    ? caller.block_binding
+    : replaysThinking && bindsThinkingToPrefix(ctx.call)
+      ? { prefix_mismatch_behavior: 'drop_block' }
+      : undefined;
+  if (binding === undefined) return false;
+  const adapter = isRecord(body.thinking) ? body.thinking : undefined;
+  if (!isRecord(binding)) {
+    // An explicit "no binding": strip the field from the caller's thinking.
+    // A key left without a value keeps the raw option off the wire (it is not
+    // re-merged, and JSON drops it) when nothing else of it remains.
+    if (!adapter && caller) {
+      const { block_binding: _none, ...rest } = caller;
+      body.thinking = Object.keys(rest).length > 0 ? rest : undefined;
+    }
+    return false;
+  }
+  const base = adapter ?? caller ?? {};
+  const type = base.type ?? 'adaptive';
+  if (type !== 'adaptive' && type !== 'enabled') return false;
+  body.thinking = { ...base, type, block_binding: binding };
+  return true;
+}
+
+/** `headers` with `beta` added to `anthropic-beta` (a caller's list is kept). */
+function withBeta(headers: Record<string, string>, beta: string): Record<string, string> {
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === 'anthropic-beta');
+  const listed = key
+    ? headers[key]!.split(',')
+        .map((v) => v.trim())
+        .filter(Boolean)
+    : [];
+  if (listed.includes(beta)) return headers;
+  const next = { ...headers };
+  if (key) delete next[key];
+  next[key ?? 'anthropic-beta'] = [...listed, beta].join(',');
+  return next;
+}
+
 function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options } = ctx;
   const { system, rest } = extractSystem(messages);
@@ -159,11 +248,13 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     logger: ctx.logger,
     warnings: ctx.warnings,
   };
+  // Blocks keep the order the model produced them in (2.3, F21): thinking
+  // between tool calls stays there, since a moved block is a modified prefix.
   const wireMessages = rest.map((m) => ({
     role: m.role === 'tool' ? 'user' : m.role,
-    content: orderReasoningFirst(
-      m.content.map((p) => partToBlock(p, media)).filter((b): b is AnthropicBlock => b !== null),
-    ),
+    content: m.content
+      .map((p) => partToBlock(p, media))
+      .filter((b): b is AnthropicBlock => b !== null),
   }));
 
   // Opus 4.7+/Sonnet 5/Fable 5/Claude 5.x: budget_tokens returns 400 — effort
@@ -306,6 +397,15 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     };
   }
 
+  const replaysThinking = wireMessages.some(
+    (m) =>
+      m.role === 'assistant' &&
+      m.content.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking'),
+  );
+  const extraHeaders = applyBlockBinding(ctx, body, replaysThinking)
+    ? withBeta(call.headers, BLOCK_BINDING_BETA)
+    : call.headers;
+
   applyProviderOptions(body, call.provider, options);
 
   // Claude on Vertex AI: same Messages body, but model goes in the URL,
@@ -320,7 +420,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
         headers: {
           'content-type': 'application/json',
           authorization: `Bearer ${call.apiKey}`,
-          ...call.headers,
+          ...extraHeaders,
         },
         body: JSON.stringify(body),
       },
@@ -335,7 +435,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
         'content-type': 'application/json',
         'x-api-key': call.apiKey,
         'anthropic-version': ANTHROPIC_VERSION,
-        ...call.headers,
+        ...extraHeaders,
       },
       body: JSON.stringify(body),
     },
@@ -356,16 +456,32 @@ interface AnthropicUsage {
   iterations?: AnthropicUsage[];
 }
 
+/** One `input_transformations` entry (beta thinking-binding-controls-2026-08-01). */
+interface AnthropicInputTransformation {
+  /** `thinking_dropped` | `thinking_mismatch_allowed`; more may be added. */
+  type?: string;
+  /** `messages.{i}.content.{j}` of the request. */
+  path?: string;
+  reason?: string;
+}
+
 interface AnthropicEvent {
   type?: string;
   index?: number;
-  message?: { usage?: AnthropicUsage };
+  message?: { usage?: AnthropicUsage; input_transformations?: unknown };
+  /** Final `message_delta` only, after a mid-stream server-side model fallback. */
+  input_transformations?: unknown;
   content_block?: {
     type?: string;
     id?: string;
     name?: string;
     tool_use_id?: string;
     content?: unknown;
+    /** `thinking` blocks: the text and signature so far (both empty when streamed). */
+    thinking?: string;
+    signature?: string;
+    /** `redacted_thinking` blocks: the opaque payload, complete in the start event. */
+    data?: string;
   };
   delta?: {
     type?: string;
@@ -380,6 +496,84 @@ interface AnthropicEvent {
   /** Server-side context editing report (`{ applied_edits: [...] }`) — opaque pass-through. */
   context_management?: unknown;
   error?: { type?: string; message?: string };
+}
+
+/** `count` thinking block(s), worded. */
+function blocks(count: number): string {
+  return `${count} thinking block${count === 1 ? '' : 's'}`;
+}
+
+/** `reason at path, path; reason at path` — at most five paths per reason. */
+function describeTransformations(entries: AnthropicInputTransformation[]): string {
+  const byReason = new Map<string, string[]>();
+  for (const entry of entries) {
+    const reason = typeof entry.reason === 'string' ? entry.reason : 'unknown reason';
+    const paths = byReason.get(reason) ?? [];
+    if (typeof entry.path === 'string') paths.push(entry.path);
+    byReason.set(reason, paths);
+  }
+  return [...byReason]
+    .map(([reason, paths]) => {
+      if (paths.length === 0) return reason;
+      const shown = paths.slice(0, 5).join(', ');
+      return `${reason} at ${shown}${paths.length > 5 ? ` and ${paths.length - 5} more` : ''}`;
+    })
+    .join('; ');
+}
+
+/**
+ * The response's `input_transformations` (2.3) as ONE typed warning: blocks the
+ * API removed before the model saw them, and blocks that failed the
+ * conversation check but were shown anyway. The raw entries ride the finish
+ * part as `providerMetadata.anthropic.input_transformations`.
+ */
+function transformationWarning(
+  entries: AnthropicInputTransformation[] | undefined,
+): StreamPart | undefined {
+  if (!entries || entries.length === 0) return undefined;
+  const dropped = entries.filter((e) => e.type === 'thinking_dropped');
+  const allowed = entries.filter((e) => e.type === 'thinking_mismatch_allowed');
+  const other = entries.filter(
+    (e) => e.type !== 'thinking_dropped' && e.type !== 'thinking_mismatch_allowed',
+  );
+  const said: string[] = [];
+  if (dropped.length > 0) {
+    said.push(
+      `removed ${blocks(dropped.length)} from the request (${describeTransformations(dropped)}), ` +
+        'so the model did not see that reasoning',
+    );
+  }
+  if (allowed.length > 0) {
+    said.push(
+      `${blocks(allowed.length)} failed the conversation check ` +
+        `(${describeTransformations(allowed)}) and ${allowed.length === 1 ? 'was' : 'were'} ` +
+        'shown to the model anyway, because the check is not enforced for this request',
+    );
+  }
+  if (other.length > 0) {
+    const kinds = [...new Set(other.map((e) => (typeof e.type === 'string' ? e.type : '?')))];
+    said.push(`made ${other.length} other change(s) (${kinds.join(', ')})`);
+  }
+  return {
+    type: 'warning',
+    warning: {
+      type: 'other',
+      setting: 'thinking.block_binding',
+      message:
+        `Anthropic changed the request's input: ${said.join('; ')}. ` +
+        'See providerMetadata.anthropic.input_transformations.',
+    },
+  };
+}
+
+/**
+ * Block identity for a reasoning delta (2.3, F21): the content block index
+ * keeps consecutive thinking blocks apart (each has its own signature, and a
+ * merged block is a modified one), and the source marks the family whose API
+ * signed it, so no other provider is ever sent it.
+ */
+function reasoningBlock(index: number): { id: string; source: 'anthropic' } {
+  return { id: String(index), source: 'anthropic' };
 }
 
 function mapStopReason(reason: string | null): FinishReason {
@@ -455,6 +649,8 @@ async function* parseStream(
   let stopReason: string | null = null;
   let stopDetails: unknown;
   let contextManagement: unknown;
+  /** What the API changed in the request's input (block binding, 2.3); `[]` when nothing. */
+  let inputTransformations: AnthropicInputTransformation[] | undefined;
   const toolIds = new Map<number, string>();
   let finishEmitted = false;
 
@@ -463,6 +659,7 @@ async function* parseStream(
     const anthropic: Record<string, unknown> = {
       ...(stopDetails ? { stop_details: stopDetails } : {}),
       ...(contextManagement !== undefined ? { contextManagement } : {}),
+      ...(inputTransformations?.length ? { input_transformations: inputTransformations } : {}),
     };
     return Object.keys(anthropic).length > 0 ? { providerMetadata: { anthropic } } : {};
   };
@@ -482,10 +679,35 @@ async function* parseStream(
         inputUsage = data.message.usage;
         outputTokens = data.message.usage.output_tokens ?? 0;
       }
+      // Final here when streaming (beta thinking-binding-controls-2026-08-01).
+      if (Array.isArray(data.message?.input_transformations)) {
+        inputTransformations = data.message.input_transformations.filter(
+          isRecord,
+        ) as AnthropicInputTransformation[];
+      }
     } else if (type === 'content_block_start') {
       const idx = data.index ?? 0;
       const block = data.content_block;
-      if (block?.type === 'tool_use' && block.id) {
+      if (block?.type === 'thinking') {
+        // A streamed block starts empty; its text and signature follow as
+        // deltas. Anything the start already carries is part of the block.
+        if (block.thinking || block.signature) {
+          yield {
+            type: 'reasoning-delta',
+            text: block.thinking ?? '',
+            ...(block.signature ? { signature: block.signature } : {}),
+            ...reasoningBlock(idx),
+          };
+        }
+      } else if (block?.type === 'redacted_thinking') {
+        // Complete in the start event: opaque data that rides back unchanged.
+        yield {
+          type: 'reasoning-delta',
+          text: block.data ?? '',
+          redacted: true,
+          ...reasoningBlock(idx),
+        };
+      } else if (block?.type === 'tool_use' && block.id) {
         toolIds.set(idx, block.id);
         yield { type: 'tool-call-delta', id: block.id, name: block.name, argsTextDelta: '' };
       } else if (block?.type === 'web_search_tool_result') {
@@ -509,9 +731,14 @@ async function* parseStream(
       if (d?.type === 'text_delta' && d.text !== undefined) {
         yield { type: 'text-delta', text: d.text };
       } else if (d?.type === 'thinking_delta' && d.thinking !== undefined) {
-        yield { type: 'reasoning-delta', text: d.thinking };
+        yield { type: 'reasoning-delta', text: d.thinking, ...reasoningBlock(idx) };
       } else if (d?.type === 'signature_delta' && d.signature !== undefined) {
-        yield { type: 'reasoning-delta', text: '', signature: d.signature };
+        yield {
+          type: 'reasoning-delta',
+          text: '',
+          signature: d.signature,
+          ...reasoningBlock(idx),
+        };
       } else if (d?.type === 'input_json_delta') {
         // Only blocks registered as client tool_use stream tool-call deltas;
         // server_tool_use argument deltas are skipped (provider executes them).
@@ -524,6 +751,13 @@ async function* parseStream(
       if (data.delta?.stop_reason) stopReason = data.delta.stop_reason;
       if (data.delta?.stop_details) stopDetails = data.delta.stop_details;
       if (data.context_management !== undefined) contextManagement = data.context_management;
+      // Present only after a mid-stream server-side model fallback: the
+      // serving model's report replaces message_start's.
+      if (Array.isArray(data.input_transformations)) {
+        inputTransformations = data.input_transformations.filter(
+          isRecord,
+        ) as AnthropicInputTransformation[];
+      }
       if (data.usage) {
         if (data.usage.output_tokens !== undefined) outputTokens = data.usage.output_tokens;
         // The final message_delta carries output_tokens_details / iterations;
@@ -539,6 +773,8 @@ async function* parseStream(
       _ctx.usageAvailable?.(
         typeof inputUsage.input_tokens === 'number' && typeof inputUsage.output_tokens === 'number',
       );
+      const notice = transformationWarning(inputTransformations);
+      if (notice) yield notice;
       yield {
         type: 'finish',
         usage: buildUsage(inputUsage, outputTokens),
@@ -553,6 +789,8 @@ async function* parseStream(
 
   if (!finishEmitted) {
     _ctx.usageAvailable?.(false);
+    const notice = transformationWarning(inputTransformations);
+    if (notice) yield notice;
     yield {
       type: 'finish',
       usage: buildUsage(inputUsage, outputTokens),

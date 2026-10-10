@@ -16,6 +16,7 @@ import {
   reportClamp,
 } from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
+import { replaysTo } from '../internal/reasoning';
 import {
   acceptsDocuments,
   documentFilename,
@@ -45,9 +46,10 @@ function toResponsesInput(messages: NormalizedMessage[], media: MediaContext): I
   const items: InputItem[] = [];
   for (const m of messages) {
     for (const part of m.content) {
-      if (part.type === 'reasoning' && part.encrypted) {
+      if (part.type === 'reasoning' && part.encrypted && replaysTo(part, 'openai')) {
         // Encrypted reasoning round-trip: replay the item verbatim BEFORE its
-        // function_call (signature carries the original item id).
+        // function_call (signature carries the original item id). Only
+        // OpenAI's own items (2.3, F21); summaries are display text only.
         items.push({
           type: 'reasoning',
           ...(part.signature ? { id: part.signature } : {}),
@@ -347,7 +349,15 @@ async function* parseStream(
         break;
       case 'response.reasoning_summary_text.delta':
       case 'response.reasoning_text.delta':
-        if (data.delta) yield { type: 'reasoning-delta', text: data.delta };
+        // One block per reasoning item (2.3, F21), marked as OpenAI's own.
+        if (data.delta) {
+          yield {
+            type: 'reasoning-delta',
+            text: data.delta,
+            ...(data.item_id ? { id: data.item_id } : {}),
+            source: 'openai',
+          };
+        }
         break;
       case 'response.output_item.added':
         if (data.item?.type === 'function_call') {
@@ -366,6 +376,8 @@ async function* parseStream(
             text: data.item.encrypted_content,
             signature: data.item.id,
             encrypted: true,
+            ...(data.item.id ? { id: data.item.id } : {}),
+            source: 'openai',
           };
         }
         if (data.item?.type === 'message' && data.item.phase) phase = data.item.phase;

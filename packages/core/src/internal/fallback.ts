@@ -1,10 +1,20 @@
 /**
  * fallback.ts — the cross-provider fail-over engine (1.7, D6). Because the
  * WHOLE history is canonical (`Message[]`/`Part[]`), a conversation can hop
- * providers mid-chat: the next candidate receives the identical request the
- * failed one got. Streaming semantics are strict pre-first-byte: an attempt
- * may fail over only while it has produced NO content — once the first
- * content part arrived, a mid-stream error is final (the existing rule).
+ * providers mid-chat: the next candidate receives the identical canonical
+ * request the failed one got. Streaming semantics are strict pre-first-byte:
+ * an attempt may fail over only while it has produced NO content — once the
+ * first content part arrived, a mid-stream error is final (the existing rule).
+ *
+ * Reasoning is the one part a hop does not carry across families (2.3, F21):
+ * an Anthropic signature, an OpenAI encrypted item or a Gemini thought
+ * signature can only be read back by the API that produced it. Each part
+ * records its `source`, and each wire replays only its own family's reasoning
+ * (`internal/reasoning.ts`), so a candidate of another family never receives
+ * the failed provider's blocks — an OpenAI item used to reach Claude as a
+ * `thinking` block — while a hop between Claude models forwards them unchanged
+ * and the API drops what the new model cannot read. Nothing is filtered here:
+ * the same rule holds for every model switch, fail-over or not.
  *
  * Shared by `withFallback` (the middleware) and the `fallbackModels` call
  * option — this module deliberately imports NO orchestrators (no cycles).

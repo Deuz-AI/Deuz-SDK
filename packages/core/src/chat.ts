@@ -107,12 +107,19 @@ export type UIMessagePart =
       signature?: string;
       /**
        * `text` is an OPAQUE encrypted provider payload (OpenAI Responses), not
-       * display text — do not render it. Only `uiFromMessages` can set this:
-       * the wire's `reasoning-delta` carries no such flag.
+       * display text — do not render it. Set from history by `uiFromMessages`,
+       * and since 2.3 from the wire's `reasoning-delta` too.
        */
       encrypted?: boolean;
-      /** Provider-redacted thinking block (same projection-only rule as `encrypted`). */
+      /** Provider-redacted thinking block: `text` is opaque data, never rendered (as `encrypted`). */
       redacted?: boolean;
+      /**
+       * The block's id from the wire (2.3): one model block per part, so two
+       * consecutive thinking blocks stay two parts. Absent on history.
+       */
+      id?: string;
+      /** The provider family that produced the block (2.3), as `ReasoningPart.source`. */
+      source?: string;
       state: 'streaming' | 'done';
     }
   /**
@@ -320,6 +327,27 @@ function finishReasonFromWire(value: unknown): FinishReason | undefined {
   return typeof value === 'string' ? (value as FinishReason) : undefined;
 }
 
+/** The block fields a wire `reasoning-delta` may carry (2.3). */
+type ReasoningBlockFields = Pick<
+  Extract<UIMessagePart, { type: 'reasoning' }>,
+  'id' | 'source' | 'encrypted' | 'redacted'
+>;
+
+/**
+ * The 2.3 block fields of a wire `reasoning-delta`, kept only when well typed.
+ * Same rule as `usageFromWire`: `applyUIPart` is TOTAL, and a field typed
+ * `string` or `true` must never end up holding anything else.
+ */
+function reasoningBlockFromWire(part: DeuzUIPart): ReasoningBlockFields {
+  const raw = part as { id?: unknown; source?: unknown; encrypted?: unknown; redacted?: unknown };
+  return {
+    ...(typeof raw.id === 'string' ? { id: raw.id } : {}),
+    ...(raw.encrypted === true ? { encrypted: true } : {}),
+    ...(raw.redacted === true ? { redacted: true } : {}),
+    ...(typeof raw.source === 'string' ? { source: raw.source } : {}),
+  };
+}
+
 /**
  * A finite number from the wire, or `undefined`. Same rule as `usageFromWire`:
  * `applyUIPart` is TOTAL, so a hostile/older/newer server's `"3"`, `NaN` or
@@ -481,20 +509,36 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
       // Anthropic sends the signature on the LAST thinking delta, so a later
       // one wins and a delta without it keeps what the block already had.
       const signature = typeof part.signature === 'string' ? { signature: part.signature } : {};
-      const next: UIMessagePart[] =
-        tail?.type === 'reasoning' && tail.state === 'streaming'
-          ? [...parts.slice(0, -1), { ...tail, text: tail.text + part.text, ...signature }]
-          : openPart(parts, {
-              type: 'reasoning',
-              text: part.text,
-              state: 'streaming',
-              ...signature,
-            });
+      // One part per model block (2.3, F21): a delta extends the open block
+      // only when it belongs to it — same id and source, neither one opaque.
+      // A new id is the next block (a merged block is a modified one), and an
+      // encrypted or redacted payload is always a block of its own. The flags
+      // cross a network boundary, so only well-typed values are kept.
+      const block = reasoningBlockFromWire(part);
+      const opaque = block.encrypted === true || block.redacted === true;
+      const continues =
+        tail?.type === 'reasoning' &&
+        tail.state === 'streaming' &&
+        !opaque &&
+        !tail.encrypted &&
+        !tail.redacted &&
+        tail.id === block.id &&
+        tail.source === block.source;
+      const next: UIMessagePart[] = continues
+        ? [...parts.slice(0, -1), { ...tail, text: tail.text + part.text, ...signature }]
+        : openPart(parts, {
+            type: 'reasoning',
+            text: part.text,
+            state: 'streaming',
+            ...signature,
+            ...block,
+          });
       return {
         ...turn,
         message: {
           ...turn.message,
-          reasoning: (turn.message.reasoning ?? '') + part.text,
+          // The readable bucket: an opaque payload is never display text.
+          ...(opaque ? {} : { reasoning: (turn.message.reasoning ?? '') + part.text }),
           parts: next,
         },
       };
@@ -841,13 +885,34 @@ function toolUseFromUI(call: UIToolCall): ToolUsePart {
 }
 
 /**
- * Canonical assistant turn for the request history: text plus `tool_use`
- * parts, exactly as the wire streamed them (client-tools reconstruction).
+ * Canonical assistant turn for the request history, exactly as the wire
+ * streamed it (client-tools reconstruction). Since 2.3 it follows the ordered
+ * `parts`: every reasoning block rides back unchanged and in place (a provider
+ * rejects a modified or missing block, and Claude binds each one to the
+ * conversation before it), with text and `tool_use` where they came. A plain
+ * answer is still a plain string, and a turn with neither text nor a tool call
+ * sends no reasoning back: alone it is no answer.
  */
 export function assistantMessageFromTurn(turn: AssistantTurnState): Message {
   const toolCalls = turn.message.toolCalls ?? [];
-  const toolUses: ToolUsePart[] = toolCalls.map(toolUseFromUI);
   const text = turn.message.content;
+  if (partsOf(turn.message).length > 0) {
+    const ordered = canonicalContentFromUI(turn.message);
+    if (typeof ordered === 'string') return { role: 'assistant', content: ordered };
+    if (!ordered.some((p) => p.type === 'text' || p.type === 'tool_use')) {
+      return { role: 'assistant', content: text };
+    }
+    // Text the UI split around a step or data boundary is one run again.
+    const content: Part[] = [];
+    for (const part of ordered) {
+      const last = content.at(-1);
+      if (part.type === 'text' && last?.type === 'text') last.text += part.text;
+      else content.push(part.type === 'text' ? { ...part } : part);
+    }
+    return { role: 'assistant', content };
+  }
+  // No ordered projection (a turn built by hand before 1.9): the buckets.
+  const toolUses: ToolUsePart[] = toolCalls.map(toolUseFromUI);
   const content: string | Part[] =
     toolUses.length > 0 ? [...(text ? [{ type: 'text' as const, text }] : []), ...toolUses] : text;
   return { role: 'assistant', content };
@@ -982,6 +1047,7 @@ function uiPartsFromContent(content: string | Part[]): UIMessagePart[] {
           ...(p.signature !== undefined ? { signature: p.signature } : {}),
           ...(p.encrypted ? { encrypted: true } : {}),
           ...(p.redacted ? { redacted: true } : {}),
+          ...(p.source !== undefined ? { source: p.source } : {}),
         });
         break;
       case 'tool_use':
@@ -1027,8 +1093,12 @@ export function uiFromMessages(messages: Message[], generateId: () => string): U
     }
     if (message.role === 'assistant') {
       const parts = typeof message.content === 'string' ? [] : message.content;
+      // The readable bucket: an encrypted or redacted payload is not display text.
       const reasoning = parts
-        .filter((p): p is Extract<Part, { type: 'reasoning' }> => p.type === 'reasoning')
+        .filter(
+          (p): p is Extract<Part, { type: 'reasoning' }> =>
+            p.type === 'reasoning' && !p.encrypted && !p.redacted,
+        )
         .map((p) => p.text)
         .join('');
       const toolCalls: UIToolCall[] = parts
@@ -1083,13 +1153,17 @@ function canonicalContentFromUI(message: UIMessage): string | Part[] {
           if (p.text) parts.push({ type: 'text', text: p.text });
           break;
         case 'reasoning':
-          if (p.text) {
+          // A block with empty text is real when it is signed or opaque (2.3,
+          // F21): Claude's default `display: 'omitted'` streams only the
+          // signature, and that block must ride back like any other.
+          if (p.text || p.signature !== undefined || p.encrypted || p.redacted) {
             parts.push({
               type: 'reasoning',
               text: p.text,
               ...(p.signature !== undefined ? { signature: p.signature } : {}),
               ...(p.encrypted ? { encrypted: true } : {}),
               ...(p.redacted ? { redacted: true } : {}),
+              ...(p.source !== undefined ? { source: p.source } : {}),
             });
           }
           break;
@@ -1139,7 +1213,8 @@ function canonicalContentFromUI(message: UIMessage): string | Part[] {
  * SURVIVES (via the 1.9 ordered `parts`, which this prefers over the buckets):
  * - the interleave — text / reasoning / tool_use in the exact rendered order;
  * - `ImagePart` attachments, carrier verbatim (bytes stay bytes) plus media type;
- * - reasoning `signature` / `encrypted` / `redacted`;
+ * - reasoning `signature` / `encrypted` / `redacted` / `source`, one part per
+ *   block, including a signed block whose text is empty (2.3);
  * - `tool_use.providerMetadata` when the UI call carries it (`uiFromMessages` does);
  * - executed tool calls, re-emitted as the `role: 'tool'` message that follows
  *   the turn — every `tool_use` MUST get a `tool_result` or Anthropic 400s.

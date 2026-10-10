@@ -43,9 +43,9 @@ System handling is automatic: adapters that need a top-level system field (Anthr
 
 | `type` | Fields | Direction |
 | --- | --- | --- |
-| `text` | `text: string` | in / out |
+| `text` | `text: string`, `providerMetadata?` | in / out |
 | `image` | `image: string \| Uint8Array`, `mediaType?: string` | in (also carries PDFs/files) |
-| `reasoning` | `text: string`, `signature?`, `encrypted?`, `redacted?` | out (replay back in) |
+| `reasoning` | `text: string`, `signature?`, `encrypted?`, `redacted?`, `source?` | out (replay back in) |
 | `tool_use` | `id`, `name`, `input: unknown`, `providerMetadata?` | out (replay back in) |
 | `tool_result` | `toolUseId: string`, `result: unknown`, `isError?` | in |
 
@@ -174,9 +174,10 @@ The `uri` is an `https://` URL, so it resolves to the native `fileData` form aut
 
 `ReasoningPart` carries a model's thinking output. It is produced on the way out (as `reasoning-delta` events on [`fullStream`](/docs/core/stream-chat), and as `reasoning` parts in `response.messages`) and **must be replayed back** in multi-step tool loops. Dropping it breaks the next turn:
 
-- **Anthropic** emits `thinking` blocks with a `signature` (or `redacted_thinking`); both must be returned, thinking-first.
+- **Anthropic** emits `thinking` blocks with a `signature` (or `redacted_thinking` blocks with opaque `data`); each must be returned unmodified and in its original place.
 - **Gemini** carries a `thoughtSignature`; without it the follow-up request 400s.
-- **OpenAI Responses** uses encrypted reasoning.
+- **OpenAI Responses** uses encrypted reasoning items.
+- **DeepSeek and Kimi** stream `reasoning_content`, which rides back on the assistant's tool-call turn.
 
 The agentic loop in [`generateText`](/docs/core/generate-text) and [`streamChat`](/docs/core/stream-chat) preserves these automatically — each step builds a new history array that includes the prior `reasoning` and `tool_use` parts, so you rarely construct a `ReasoningPart` by hand. The shape:
 
@@ -187,8 +188,29 @@ const reasoning: ReasoningPart = {
   type: 'reasoning',
   text: 'The user wants a summary…',
   signature: 'opaque-provider-signature',
+  source: 'anthropic',
 };
 ```
+
+### One part per block (2.3)
+
+Every block the provider sends is its own `reasoning` part, kept where it arrived in the turn:
+
+- A thinking block whose `text` is empty but which carries a `signature` is a real block. Claude 5.x models default to `display: 'omitted'`, which streams only the signature, and that block must ride back like any other.
+- Two consecutive thinking blocks stay two parts, each with its own signature. A merged block is a modified one, which Anthropic rejects.
+- `encrypted: true` (an OpenAI item) and `redacted: true` (an Anthropic `redacted_thinking` block) mark opaque payloads. Their `text` is not display text; never render it.
+- Blocks are never reordered: thinking that sits between two tool calls stays between them.
+- A turn that produced neither text nor a tool call (cut off by `max_tokens` while thinking, for example) is not stored at all: its reasoning alone is no answer, and no provider takes it back.
+
+On the stream, each `reasoning-delta` carries the block's `id` (deltas of one block share it), `redacted` when its text is opaque data, and its `source`. The display text of a step (`StepResult.reasoningText`) joins the readable blocks only.
+
+### Reasoning stays with its provider
+
+`source` records the provider family whose API produced the block: `'anthropic'`, `'openai'`, `'google'`, or the Chat Completions host's provider id (for example `'deepseek'`). Each wire replays only its own family's reasoning, so a conversation that moves to another provider (a [fallback](/docs/advanced/resilience), a handoff, a `prepareStep` model switch, or your own choice) never sends it an Anthropic signature, an OpenAI encrypted item or a Gemini thought signature it cannot read. The blocks stay in the history for the provider that can use them.
+
+Between Claude models the blocks are forwarded unchanged; the API drops the ones the new model cannot read. A Claude thinking block without a `signature` is never sent (the API always rejects it).
+
+A part written before 2.3 has no `source`. It is replayed as in 2.2, except `encrypted` parts (only OpenAI Responses produced them) and `redacted` parts (only Anthropic did), whose origin is known.
 
 ### thoughtSignature round-trip on Gemini
 
@@ -205,7 +227,9 @@ On Gemini native, a streamed tool call arrives with its `thoughtSignature` attac
 }
 ```
 
-When you replay this part, the adapter re-attaches `thoughtSignature` to the outgoing `functionCall`. Preserve `providerMetadata` untouched — it is opaque round-trip data, not something to inspect or rewrite.
+Since 2.3 a plain text part keeps its signature too, often streamed in a final chunk whose text is empty: it lands on the text it belongs to as `providerMetadata: { google: { thoughtSignature } }` and rides back on that text part. Gemini does not enforce text signatures, but omitting them degrades its reasoning (not live-verified).
+
+When you replay these parts, the adapter re-attaches `thoughtSignature` to the outgoing `functionCall` or text part. Preserve `providerMetadata` untouched — it is opaque round-trip data, not something to inspect or rewrite.
 
 ## Multi-turn with tools
 
@@ -236,7 +260,7 @@ Every `tool_use` must be answered by a `tool_result` with a matching `toolUseId`
 
 ## Normalization rules
 
-- String content → a single `TextPart`. Author order is never reordered (except Anthropic's thinking-first requirement, handled by the adapter).
+- String content → a single `TextPart`. Author order is never reordered: since 2.3 not even reasoning, which keeps its place on every wire.
 - All `system` messages are pulled out and concatenated with blank lines between them.
 - A `tool`-role message is folded into a `user` turn on wires (Anthropic, Gemini) that have no dedicated tool role.
 - Unknown future part kinds are additive — keep a `default` branch when you switch over `Part.type`.
