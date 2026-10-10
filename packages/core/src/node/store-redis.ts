@@ -1,12 +1,13 @@
 /**
- * store-redis.ts — one Redis-backed pack of the three storage seams (2.0):
- * `MemoryStore` + `ChatStore` + `SessionStore`. Ships as
- * `@deuz-sdk/core/stores/redis`.
+ * store-redis.ts — one Redis-backed pack of the storage seams (2.0):
+ * `MemoryStore` + `ChatStore` + `SessionStore`, and since 2.3 `RunStore`.
+ * Ships as `@deuz-sdk/core/stores/redis`.
  *
  * A PACK rather than one object, for a hard reason: `MemoryStore.delete(ids[])`
  * and `SessionStore.delete(runId)` are different methods with the same name, so
  * a single value cannot implement both interfaces. `createRedisStores` returns
- * `{ memory, chats, sessions }` sharing one connection and one key namespace.
+ * `{ memory, chats, sessions, runs }` sharing one connection and one key
+ * namespace.
  *
  * ZERO hard dependency, by construction: this talks to a STRUCTURAL seam
  * ({@link RedisClientLike} — eleven commands, spelled exactly as node-redis v4/v5
@@ -33,6 +34,9 @@
  * P:chat:ix             SET     chat ids
  * P:sess:rec:<runId>    STRING  serializeCheckpoint (binary-safe)
  * P:sess:ix             SET     run ids
+ * P:run:rec:<runId>     STRING  JSON RunRecord (2.3)
+ * P:run:ix              ZSET    score = createdAt, member = runId
+ * P:run:st:<status>     ZSET      the same, one per status (list({ status }))
  * ```
  *
  * NO MULTI IN v1 — stated plainly because it is a real, bounded weakness. A
@@ -50,6 +54,7 @@ import { serializeChatRecord, deserializeChatRecord } from '../chat';
 import type { MemoryHit, MemoryRecord, MemoryScope, MemoryStore } from '../memory';
 import { matchesScope } from '../memory';
 import type { AgentCheckpoint, SessionStore } from '../types/session';
+import type { RunRecord, RunStatus, RunStore } from '../types/runtime';
 import { serializeCheckpoint, deserializeCheckpoint, CheckpointVersionError } from '../durable';
 import { cosineSimilarity } from '../internal/vector';
 
@@ -188,12 +193,19 @@ export type RedisStoreOptions =
       prefix?: string;
     };
 
-/** The three seams plus the two operations that belong to the pack, not to a seam. */
+/** The four seams plus the two operations that belong to the pack, not to a seam. */
 export interface RedisStores {
   /** Full `MemoryStore`, including the 2.0 `findByHash` / `deleteExpired` fast paths. */
   memory: Required<MemoryStore>;
   chats: Required<ChatStore>;
   sessions: Required<SessionStore>;
+  /**
+   * Background-run metadata (2.3), as in the SQLite and Postgres packs. One
+   * ZSET per status keeps `list({ status })` an index read; listings come
+   * oldest `createdAt` first. A run has one writer, its worker, which is what
+   * makes `update`'s read-modify-write safe.
+   */
+  runs: Required<RunStore>;
   /**
    * TTL garbage collection: hard-delete every memory whose `expiresAt` is at or
    * before `now` and return how many went. Backed by the `P:mem:expiry` ZSET, so
@@ -254,6 +266,9 @@ function keyspace(prefix: string): {
   chatIndex: string;
   sessionRecord: (runId: string) => string;
   sessionIndex: string;
+  runRecord: (runId: string) => string;
+  runIndex: string;
+  runStatus: (status: string) => string;
 } {
   return {
     memRecord: (id) => `${prefix}:mem:rec:${seg(id)}`,
@@ -265,8 +280,20 @@ function keyspace(prefix: string): {
     chatIndex: `${prefix}:chat:ix`,
     sessionRecord: (runId) => `${prefix}:sess:rec:${seg(runId)}`,
     sessionIndex: `${prefix}:sess:ix`,
+    runRecord: (runId) => `${prefix}:run:rec:${seg(runId)}`,
+    runIndex: `${prefix}:run:ix`,
+    runStatus: (status) => `${prefix}:run:st:${seg(status)}`,
   };
 }
+
+/** Every `RunStatus`: `runs.delete` clears the run from each status index. */
+const RUN_STATUSES: readonly RunStatus[] = [
+  'queued',
+  'running',
+  'suspended',
+  'completed',
+  'failed',
+];
 
 // ===================================================================
 // Pure decoding helpers (a corrupt value is SKIPPED, never thrown)
@@ -286,6 +313,17 @@ function parseRecord(json: string): MemoryRecord | undefined {
 function parseChat(json: string): ChatRecord | undefined {
   try {
     return deserializeChatRecord(json);
+  } catch {
+    return undefined;
+  }
+}
+
+function parseRun(json: string): RunRecord | undefined {
+  try {
+    const value: unknown = JSON.parse(json);
+    if (!value || typeof value !== 'object') return undefined;
+    const record = value as RunRecord;
+    return typeof record.runId === 'string' ? record : undefined;
   } catch {
     return undefined;
   }
@@ -692,10 +730,81 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
     },
   };
 
+  // --- runs (2.3) -----------------------------------------------------------
+
+  const readRun = async (runId: string): Promise<RunRecord | undefined> => {
+    const client = await use();
+    const json = await client.get(k.runRecord(runId));
+    return typeof json === 'string' ? parseRun(json) : undefined;
+  };
+
+  /**
+   * The new status index first, the record, then the stale status index: a
+   * crash between them leaves a membership the record contradicts, which
+   * `list({ status })` filters out, and never a run its own status cannot find.
+   */
+  const writeRun = async (record: RunRecord, previous: RunRecord | undefined): Promise<void> => {
+    const client = await use();
+    const member: RedisZMember = { score: record.createdAt, value: record.runId };
+    await client.zAdd(k.runIndex, member);
+    await client.zAdd(k.runStatus(record.status), member);
+    await client.set(k.runRecord(record.runId), JSON.stringify(record));
+    if (previous && previous.status !== record.status)
+      await client.zRem(k.runStatus(previous.status), record.runId);
+  };
+
+  const runs: Required<RunStore> = {
+    async create(record: RunRecord) {
+      // A second create under the same runId replaces the run, as in SQLite and Postgres.
+      await writeRun(record, await readRun(record.runId));
+    },
+
+    async update(runId, patch) {
+      const existing = await readRun(runId);
+      if (!existing) return; // unknown run — the same no-op as every RunStore
+      await writeRun({ ...existing, ...patch, runId }, existing);
+    },
+
+    get: readRun,
+
+    async list(filter) {
+      const client = await use();
+      const status = filter?.status;
+      const ids = await client.zRangeByScore(
+        status ? k.runStatus(status) : k.runIndex,
+        '-inf',
+        '+inf',
+      );
+      if (ids.length === 0) return [];
+      const rows = await client.mGet(ids.map((id) => k.runRecord(id)));
+      const out: RunRecord[] = [];
+      for (const json of rows) {
+        if (typeof json !== 'string') continue;
+        const record = parseRun(json);
+        // The record's own status decides, never the membership that led here.
+        if (record && (!status || record.status === status)) out.push(record);
+      }
+      return out;
+    },
+
+    async delete(runId) {
+      const client = await use();
+      const existing = await readRun(runId);
+      await client.del(k.runRecord(runId));
+      // Unconditional, like the other seams' deletes: an orphan membership left
+      // by a crashed write is reachable from the runId alone.
+      await client.zRem(k.runIndex, runId);
+      const statuses = new Set<string>(RUN_STATUSES);
+      if (existing) statuses.add(existing.status);
+      for (const status of statuses) await client.zRem(k.runStatus(status), runId);
+    },
+  };
+
   return {
     memory,
     chats,
     sessions,
+    runs,
     sweepExpiredMemories: (now = Date.now()) => deleteExpiredRecords(now),
     async close() {
       // Marked before the await: `use()` reads this flag, so a call racing the
