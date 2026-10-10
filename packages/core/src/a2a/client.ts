@@ -553,7 +553,7 @@ function pickInterface(card: A2AAgentCard, binding: A2ABinding | undefined): A2A
 export function createA2AClient(options: A2AClientOptions): A2AClient {
   let url: string;
   let binding: A2ABinding;
-  let tenant = options.tenant;
+  let tenant = options.tenant || undefined;
   if (typeof options.url === 'string' && options.url !== '') {
     url = options.url;
     binding = options.binding ?? 'JSONRPC';

@@ -545,6 +545,12 @@ describe('A2A client — HTTP+JSON binding', () => {
     ]);
   });
 
+  it('treats an empty tenant as none', async () => {
+    const { fetch, requests } = scriptedFetch(a2aJson(TASK));
+    await client(fetch, { tenant: '' }).getTask('task-1');
+    expect(requests[0]?.url).toBe(`${BASE}/tasks/task-1`);
+  });
+
   it('prefixes every route with the tenant', async () => {
     const { fetch, requests } = scriptedFetch(a2aJson({ task: TASK }), a2aJson(TASK), () =>
       sse([{ data: { task: TASK } }]),
