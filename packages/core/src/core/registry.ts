@@ -511,15 +511,20 @@ const REGISTRY: Record<string, Row> = {
   // default that high turns one runaway thinking pass into a real bill. Raise it
   // per call when a long answer needs the room.
   // 2.3 (F26): reasoning cannot be turned off, so `effort: 'none'` is dropped
-  // (reported) instead of being sent as `reasoning_effort: 'none'`.
+  // (reported) instead of being sent as `reasoning_effort: 'none'`. The forced
+  // tool_choice rejection above is stated too (F14): a forced choice is sent as
+  // auto with a `clamped-setting` warning, and `generateObject` takes the json
+  // strategy — which V4 also rejects, so the gap stays (live-verified).
   'deepseek-v4-flash': row('deepseek', 'chat_completions', {
     reasoning: true,
     structuredOutput: false,
+    forcedToolChoice: false,
     effortNone: 'omit',
   }),
   'deepseek-v4-pro': row('deepseek', 'chat_completions', {
     reasoning: true,
     structuredOutput: false,
+    forcedToolChoice: false,
     effortNone: 'omit',
   }),
   // 2.3 (F08) — research-dated (roadmap 5.3, 2026-10-09), NOT live-verified.

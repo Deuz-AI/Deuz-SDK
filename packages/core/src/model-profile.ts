@@ -248,7 +248,6 @@ interface Facts {
   maxOutput?: number;
   thinking?: Partial<Pick<ModelProfileThinking, 'mode' | 'types'>>;
   sampling?: Pick<ModelProfileSampling, 'accepted' | 'rule'>;
-  forcedToolChoice?: ProfileSupport;
   prefill?: ProfileSupport;
   notes?: readonly string[];
 }
@@ -424,10 +423,10 @@ const FACTS: Readonly<Record<string, Facts>> = /* @__PURE__ */ (() => ({
   'deepseek-v4-pro': {
     ...DEEPSEEK_SOURCE,
     resolvedId: 'V4-Pro-0813',
-    // json_schema is a verified rejection on V4, so structuredOutput stays stated.
+    // json_schema is a verified rejection on V4, so structuredOutput stays
+    // stated. The forced tool_choice rejection is the row's own field.
     unknown: ['vision', 'nativePdf', 'audio', 'contextWindow'],
     maxOutput: 65_536,
-    forcedToolChoice: 'unsupported',
     sampling: { accepted: 'unknown' },
     notes: DEEPSEEK_V4_NOTES,
   },
@@ -435,7 +434,6 @@ const FACTS: Readonly<Record<string, Facts>> = /* @__PURE__ */ (() => ({
     ...DEEPSEEK_SOURCE,
     unknown: ['vision', 'nativePdf', 'audio', 'contextWindow'],
     maxOutput: 65_536,
-    forcedToolChoice: 'unsupported',
     sampling: { accepted: 'unknown' },
     notes: [
       ...DEEPSEEK_V4_NOTES,
@@ -601,13 +599,14 @@ export function resolveModelProfile(model: LanguageModel): ModelProfile {
     thinking,
     limits,
     sampling,
+    // The row's own field, never a fact beside it: what the profile reports is
+    // what the wire does with a forced choice.
     forcedToolChoice:
-      facts?.forcedToolChoice ??
-      (caps.forcedToolChoice === undefined
+      caps.forcedToolChoice === undefined
         ? 'unknown'
         : caps.forcedToolChoice
           ? 'supported'
-          : 'unsupported'),
+          : 'unsupported',
     prefill: facts?.prefill ?? 'unknown',
     ...(caps.toolSurfaces ? { toolProtocols: [...caps.toolSurfaces] } : {}),
     usage: {

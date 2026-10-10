@@ -308,7 +308,12 @@ describe('compat-host profiles (research 2026-10-09, not live-verified)', () => 
     expect(pro.limits).toEqual({ maxOutput: 65_536, defaultOutputCap: 8_192 });
     expect(pro.effort.none).toBe('omit');
     expect(pro.thinking).toMatchObject({ mode: 'always', replay: 'reasoning-content' });
+    // The live-verified rejection is the row's word, so a forced choice becomes auto.
     expect(pro.forcedToolChoice).toBe('unsupported');
+    expect(clampsOf(pro, 'toolChoice').map((c) => `${c.from}→${c.to}`)).toEqual([
+      "'required'→auto",
+      "{ type: 'tool' }→auto",
+    ]);
     expect(pro.capabilities.structuredOutput).toBe('unsupported');
     expect(clampsOf(pro, 'effort')).toContainEqual({
       setting: 'effort',
@@ -590,6 +595,8 @@ describe("structured output: an explicit mode 'tool' the model cannot take (2.3)
       anthropic('claude-haiku-5-5'), // takes a forced tool_choice, but always thinks on this wire
       anthropic('claude-opus-9-9'),
       anthropic('claude-opus-4-8'),
+      deepseek('deepseek-v4-pro'), // rejects a forced tool_choice in thinking mode
+      deepseek('deepseek-v4-flash'),
     ]) {
       expect(modeClamps(model), model.modelId).toEqual([{ to: 'json', when: undefined }]);
     }
@@ -602,7 +609,8 @@ describe("structured output: an explicit mode 'tool' the model cannot take (2.3)
   });
 
   it('is never changed where nothing stops the forced tool', () => {
-    for (const model of [responses('gpt-5.4'), deepseek('deepseek-v4-pro'), kimi('kimi-k3')]) {
+    // deepseek-flash: no source states the V4 rejection for it, so none is assumed.
+    for (const model of [responses('gpt-5.4'), deepseek('deepseek-flash'), kimi('kimi-k3')]) {
       expect(modeClamps(model), model.modelId).toEqual([]);
     }
   });

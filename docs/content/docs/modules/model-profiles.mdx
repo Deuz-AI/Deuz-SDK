@@ -276,7 +276,7 @@ registry and is not live-verified.
 | `gemini-3.8-flash` | Gemini native | stable | Output limit undocumented: no output cap is sent. |
 | `gemini-3.1-pro-preview` | Gemini native, OpenAI-compatible | preview | A profile of its own; it does not inherit `gemini-3.8-flash` rules. |
 | `deepseek-flash` | Chat Completions | unknown | Resolves to V4.1-Flash; treated like the always-reasoning V4 family. |
-| `deepseek-v4-pro`, `deepseek-v4-flash` | Chat Completions | unknown | `deepseek-v4-pro` resolves to V4-Pro-0813; `deepseek-v4-flash` is a legacy alias. |
+| `deepseek-v4-pro`, `deepseek-v4-flash` | Chat Completions | unknown | `deepseek-v4-pro` resolves to V4-Pro-0813; `deepseek-v4-flash` is a legacy alias. A forced tool choice is sent as `'auto'`. |
 | `kimi-k3`, `kimi-k2.7-code` | Chat Completions | unknown | Reasoning cannot be turned off. |
 | `glm-5.3` | Chat Completions | unknown | Text-only. Effort rides `reasoning_effort`. |
 | `Qwen/Qwen3-Coder-Next` | Chat Completions (any host) | unknown | Non-thinking; 262,144-token native context. |

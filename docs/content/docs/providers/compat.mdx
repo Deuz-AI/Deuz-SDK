@@ -116,7 +116,7 @@ const result = await generateText({
 Reasoning arrives as `reasoning-delta` parts, never spliced into `textStream` — the two channels stay apart.
 
 <Callout type="warn">
-  **`generateObject` does not work on V4.** It has two strategies and V4 rejects both: `json` sends `response_format: json_schema`, which V4 answers with *"This response_format type is unavailable now"*, and `tool` forces `tool_choice`, which it answers with *"Thinking mode does not support this tool_choice"*.
+  **`generateObject` does not work on V4.** It has two strategies and V4 rejects both: `json` sends `response_format: json_schema`, which V4 answers with *"This response_format type is unavailable now"*, and `tool` forces `tool_choice`, which it answers with *"Thinking mode does not support this tool_choice"*. Since 2.3 the V4 rows record the second rejection, so the SDK never forces a tool there: a forced `toolChoice` is sent as `auto` with a `clamped-setting` warning, and `generateObject` takes the `json` strategy, reporting an explicit `mode: 'tool'`. That request still fails on the first rejection.
 
   Ordinary (unforced) tool calling is unaffected, so the agentic loop works normally — only the forced-coercion path is closed. Until a `json_object` strategy exists, ask for the shape in the prompt:
 
