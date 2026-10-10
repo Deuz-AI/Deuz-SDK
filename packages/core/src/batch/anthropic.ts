@@ -131,18 +131,15 @@ function outcomeOf(line: unknown, provider: string): BatchOutcome | undefined {
 
 /**
  * The results URL to read. `results_url` is used as given when it is on the
- * client's base URL; a different host (a proxy in front of the API, say) is
- * read through the base URL's own results path, so the key only ever goes to
- * the configured host.
+ * client's base URL's host; on another host (the API behind a proxy, say) its
+ * path is read through the configured base URL instead, so the key only ever
+ * goes to the host you configured.
  */
-function resultsUrl(call: ResolvedCall, id: string, given: string): string {
-  const own = `${call.baseURL}/v1/messages/batches/${encodeURIComponent(id)}/results`;
-  try {
-    const url = new URL(given, `${call.baseURL}/`);
-    return url.origin === new URL(call.baseURL).origin ? url.toString() : own;
-  } catch {
-    return own;
-  }
+function resultsUrl(call: ResolvedCall, given: string): string {
+  const url = new URL(given, `${call.baseURL}/`);
+  return url.origin === new URL(call.baseURL).origin
+    ? url.toString()
+    : `${call.baseURL}${url.pathname}${url.search}`;
 }
 
 export const anthropicBatchDriver: BatchDriver = {
@@ -221,7 +218,19 @@ export const anthropicBatchDriver: BatchDriver = {
           `Message Batch ${job.id} has ended but has no results_url` +
           (typeof batch.archived_at === 'string' ? ': its results were archived.' : '.'),
       });
-    const response = await send(ctx, adapter, resultsUrl(ctx.call, job.id, batch.results_url), {
+    let url: string;
+    try {
+      url = resultsUrl(ctx.call, batch.results_url);
+    } catch (cause) {
+      throw new BatchError({
+        kind: 'provider',
+        provider: ctx.call.provider,
+        batchId: job.id,
+        cause,
+        message: `Message Batch ${job.id} has a results_url that is not a URL.`,
+      });
+    }
+    const response = await send(ctx, adapter, url, {
       method: 'GET',
       headers: headers(ctx.call, { accept: 'application/binary' }),
     });

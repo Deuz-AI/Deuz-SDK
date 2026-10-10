@@ -189,19 +189,32 @@ describe('Anthropic batch: results', () => {
     expect(results.late).toEqual({ id: 'late', status: 'expired', text: '' });
   });
 
-  it('reads results on the configured host when results_url points elsewhere', async () => {
-    const { server, batch } = setup({ baseURL: 'https://proxy.example.com' });
+  it('reads results through the configured base URL when results_url is on another host', async () => {
+    const { server, batch } = setup({ baseURL: 'https://proxy.example.com/anthropic' });
     const job = await batch.submit([{ id: 'a', prompt: 'x' }]);
     server.finish(
       job.id,
       { a: { type: 'succeeded', message: message('A') } },
-      { resultsUrl: `https://api.anthropic.com/v1/messages/batches/${job.id}/results` },
+      { resultsUrl: `https://api.anthropic.com/v1/messages/batches/${job.id}/results?page=1` },
     );
     const [result] = await batch.collect(job);
     expect(result!.text).toBe('A');
     const read = server.calls.at(-1)!;
-    expect(read.url).toBe(`https://proxy.example.com/v1/messages/batches/${job.id}/results`);
+    // The provider's path and query, on the host the key was configured for.
+    expect(read.url).toBe(
+      `https://proxy.example.com/anthropic/v1/messages/batches/${job.id}/results?page=1`,
+    );
     expect(read.headers.get('x-api-key')).toBe('sk-ant-test');
+  });
+
+  it('reads results_url as given on the configured host', async () => {
+    const { server, batch } = setup();
+    const job = await batch.submit([{ id: 'a', prompt: 'x' }]);
+    server.finish(job.id, { a: { type: 'succeeded', message: message('A') } });
+    await batch.collect(job);
+    expect(server.calls.at(-1)!.url).toBe(
+      `https://api.anthropic.com/v1/messages/batches/${job.id}/results`,
+    );
   });
 
   it('explains an ended batch whose results were archived', async () => {

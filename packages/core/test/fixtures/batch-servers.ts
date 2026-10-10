@@ -178,12 +178,13 @@ export function fakeAnthropicBatches(base = 'https://api.anthropic.com') {
   const batches = new Map<string, { batch: Json; requests: Json[]; results?: string }>();
   const calls: RecordedCall[] = [];
   let ids = 0;
+  const prefix = new URL(base).pathname.replace(/\/$/, '');
 
   const fetch = (async (input: string | URL | Request, init: RequestInit = {}) => {
     const url = urlOf(input);
     const method = init.method ?? 'GET';
     calls.push({ method, url: url.href, headers: new Headers(init.headers), body: init.body });
-    const route = url.pathname;
+    const route = url.pathname.slice(prefix.length);
     if (method === 'POST' && route === '/v1/messages/batches') {
       const body = JSON.parse(init.body as string) as { requests: Json[] };
       const id = `msgbatch_${++ids}`;
