@@ -380,8 +380,10 @@ conflict. Every other write rejects with the driver error, whose `code` is
 Each write's checks run inside its statement, so running it again cannot
 double-apply it: a retried agent run save whose revision moved on is rejected as
 a revision conflict, for example. Concurrency under `REPEATABLE READ` is
-covered by tests that inject these failures, not yet by a live multi-connection
-run.
+covered by tests that inject these failures, and by a suite that runs the
+stores' contracts and races of concurrent writers on a real Postgres, through a
+pool of several connections that all default to `REPEATABLE READ`. That suite
+runs when `DEUZ_TEST_POSTGRES_URL` names a database, as in the repository's CI.
 
 ## Schema versions and upgrades
 
