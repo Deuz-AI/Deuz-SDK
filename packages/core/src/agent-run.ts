@@ -66,7 +66,6 @@ import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
 import { assertCheckpointVersion } from './internal/checkpoint-version';
 // Native run discovery and the run lease (2.3).
-import type { AgentRunListPage, AgentRunListQuery } from './types/agent-run';
 import type { Clock } from './types/deps';
 import { claimNativeRunLease, type NativeRunLease } from './internal/agent-run-lease';
 import {
@@ -241,9 +240,9 @@ async function handoffBinding(tools: ToolSet): Promise<string | undefined> {
  * their own store. It lists its runs (2.3) by the time of their last save on
  * `clock`, which defaults to the host clock.
  */
-export function createInMemoryAgentRunStore(options: { clock?: Clock } = {}): AgentRunStore & {
-  list(query?: AgentRunListQuery): Promise<AgentRunListPage>;
-} {
+export function createInMemoryAgentRunStore(
+  options: { clock?: Clock } = {},
+): AgentRunStore & Required<Pick<AgentRunStore, 'list'>> {
   const clock = options.clock ?? resolveDependencies().clock;
   const runs = new Map<string, { envelope: AgentRunEnvelope; updatedAt: number }>();
   return {

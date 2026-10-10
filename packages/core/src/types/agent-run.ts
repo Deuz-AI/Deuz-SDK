@@ -231,7 +231,7 @@ export interface AgentRunStore {
    * memory, SQLite and Postgres stores have it. Rejects a malformed query
    * with a TypeError.
    */
-  list?(query?: AgentRunListQuery): AgentRunListPage | Promise<AgentRunListPage>;
+  list?(query?: AgentRunListQuery): Promise<AgentRunListPage>;
 }
 
 /** Where a native run stands, as its envelope records it (2.3 names the union). */
