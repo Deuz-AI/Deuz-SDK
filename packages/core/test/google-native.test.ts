@@ -63,7 +63,7 @@ describe('Gemini native generateContent wire', () => {
     const usage = await result.usage;
     expect(usage).toMatchObject({
       inputTokens: 7, // 10 - 3 cached
-      outputTokens: 4,
+      outputTokens: 6, // 4 candidates + 2 thoughts: reasoning is part of output (2.3)
       reasoningTokens: 2,
       cachedReadTokens: 3,
       totalTokens: 14,

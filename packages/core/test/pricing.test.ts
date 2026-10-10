@@ -22,9 +22,33 @@ describe('priceUsage', () => {
     expect(cost).toBeCloseTo(1.25 + 10, 6);
   });
 
-  it('bills reasoning tokens at the output rate', () => {
-    const cost = priceUsage('gpt-5.2', usage({ reasoningTokens: 1_000_000 }));
-    expect(cost).toBeCloseTo(10, 6);
+  it('bills reasoning once, as part of outputTokens (F02)', () => {
+    // 600k of the 1M output tokens are reasoning: the output rate applies to 1M, not 1.6M.
+    const cost = priceUsage(
+      'gpt-5.2',
+      usage({ outputTokens: 1_000_000, reasoningTokens: 600_000, totalTokens: 1_000_000 }),
+    );
+    expect(cost).toBe(10);
+  });
+
+  it('still bills 2.2-shaped usage whose reasoning exceeds outputTokens in full', () => {
+    // A subset cannot exceed its superset, so these counters were kept apart.
+    const cost = priceUsage('gpt-5.2', usage({ outputTokens: 200_000, reasoningTokens: 800_000 }));
+    expect(cost).toBe(10);
+  });
+
+  it('keeps audio tokens inside the input and output buckets (F18)', () => {
+    const cost = priceUsage(
+      'gpt-5.2',
+      usage({ inputTokens: 1_000_000, audioTokens: 300_000, totalTokens: 1_000_000 }),
+    );
+    expect(cost).toBe(1.25);
+  });
+
+  it('re-prices only the audio share when a row has a dedicated audio rate', () => {
+    const table = { voice: { input: 2, output: 10, audio: 40 } };
+    // 700 text tokens at $2 + 300 audio tokens at $40, not 1,000 at $2 plus 300 at $40.
+    expect(priceUsage('voice', usage({ inputTokens: 1000, audioTokens: 300 }), table)).toBe(0.0134);
   });
 
   it('uses the dedicated cached-read rate (Anthropic)', () => {
@@ -152,7 +176,7 @@ describe('PRICES 2026-09 current models', () => {
     ['gpt-5.6-sol', 0.54],
     ['gpt-5.6-terra', 0.27],
     ['gpt-5.6-luna', 0.027],
-  ])('uses the explicit read and write rates for %s', (model, expected) => {
+  ])('prices cache reads and 1.25x cache writes for %s', (model, expected) => {
     expect(
       priceUsage(model as string, usage({ cachedReadTokens: 100_000, cacheWriteTokens: 100_000 })),
     ).toBe(expected);
@@ -193,7 +217,7 @@ describe('272k prompt tier', () => {
     cachedReadTokens: 100_000,
     cacheWriteTokens: 50_000,
     cacheWrite1hTokens: 50_000,
-    outputTokens: 9_000,
+    outputTokens: 10_000, // 1,000 of them reasoning
     reasoningTokens: 1_000,
     totalTokens: 282_000,
   });

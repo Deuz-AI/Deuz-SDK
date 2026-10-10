@@ -25,7 +25,7 @@ import type { PriceProvider } from './types/deps';
 export interface ModelPrice {
   /** Fresh (uncached) input tokens. */
   input: number;
-  /** Output tokens (reasoning tokens are billed at the output rate). */
+  /** Output tokens, reasoning included (`Usage.outputTokens` already contains it). */
   output: number;
   /** Cached-read input tokens. Default: 10% of `input` (Anthropic/OpenAI norm). */
   cachedRead?: number;
@@ -33,7 +33,13 @@ export interface ModelPrice {
   cacheWrite?: number;
   /** 1-hour cache-write tokens (Anthropic). Default: 2 × `input`. */
   cacheWrite1h?: number;
-  /** Audio input/output tokens, when billed separately. Default: `input`. */
+  /**
+   * Audio tokens, when billed at their own rate. `Usage.audioTokens` is a share
+   * of the input and output buckets, which already bill it at the text rate, so
+   * this re-prices that share from `input` to `audio`. Omit it when audio bills
+   * like text. Usage merges prompt and completion audio, so a model whose audio
+   * output has a different rate again needs its own `PriceProvider`.
+   */
   audio?: number;
   /** Long-context tier applied when `inputTokens + cachedReadTokens > 200_000` (Gemini Pro). */
   over200k?: { input: number; output: number; cachedRead?: number };
@@ -59,41 +65,41 @@ export const PRICES_2026: PriceTable = {
   // Standard rates: https://developers.openai.com/api/docs/pricing
   // Above 272k prompt tokens, each model's full request uses 2x input/cache
   // and 1.5x output rates: https://developers.openai.com/api/docs/models/gpt-6-astra
+  // OpenAI lists cache writes at 1.25x input, but neither OpenAI usage shape
+  // carries a cache-write counter (only cached reads), so the adapters report
+  // cacheWriteTokens 0 and those prompt tokens bill at the input rate. The rows
+  // leave cacheWrite to the 1.25x default, which equals the list rate for a
+  // counter you supply yourself. Not live-verified.
   'gpt-6-astra': {
     input: 10,
     output: 50,
     cachedRead: 1,
-    cacheWrite: 12.5,
-    over272k: { input: 20, output: 75, cachedRead: 2, cacheWrite: 25 },
+    over272k: { input: 20, output: 75, cachedRead: 2 },
   },
   'gpt-5.6-sol': {
     input: 4,
     output: 20,
     cachedRead: 0.4,
-    cacheWrite: 5,
-    over272k: { input: 8, output: 30, cachedRead: 0.8, cacheWrite: 10 },
+    over272k: { input: 8, output: 30, cachedRead: 0.8 },
   },
   // GPT-5.6 is an alias for Sol; keep an exact entry ahead of legacy prefixes.
   'gpt-5.6': {
     input: 4,
     output: 20,
     cachedRead: 0.4,
-    cacheWrite: 5,
-    over272k: { input: 8, output: 30, cachedRead: 0.8, cacheWrite: 10 },
+    over272k: { input: 8, output: 30, cachedRead: 0.8 },
   },
   'gpt-5.6-terra': {
     input: 2,
     output: 12,
     cachedRead: 0.2,
-    cacheWrite: 2.5,
-    over272k: { input: 4, output: 18, cachedRead: 0.4, cacheWrite: 5 },
+    over272k: { input: 4, output: 18, cachedRead: 0.4 },
   },
   'gpt-5.6-luna': {
     input: 0.2,
     output: 1.2,
     cachedRead: 0.02,
-    cacheWrite: 0.25,
-    over272k: { input: 0.4, output: 1.8, cachedRead: 0.04, cacheWrite: 0.5 },
+    over272k: { input: 0.4, output: 1.8, cachedRead: 0.04 },
   },
 
   // ---- OpenAI (earlier GPT-5 family snapshots) ----
@@ -243,8 +249,10 @@ function ratesForUsage(price: ModelPrice, usage: Usage): ModelPrice {
 /**
  * Compute the USD cost of one `Usage` for `model` from a price table.
  * Returns `undefined` when the model is unknown (so callers can fall back).
- * Reasoning tokens bill at the output rate; cached-read/cache-write/audio use
- * their dedicated rate or a sensible multiple of `input`.
+ * Every token bills once: `outputTokens` (reasoning included) at the output
+ * rate, the cache buckets at their dedicated rate or a sensible multiple of
+ * `input`. `reasoningTokens` and `audioTokens` are shares of those buckets,
+ * not extra tokens; a row's `audio` rate re-prices the audio share only.
  */
 export function priceUsage(
   model: string,
@@ -259,15 +267,22 @@ export function priceUsage(
   const cachedRead = rates.cachedRead ?? rates.input * 0.1;
   const cacheWrite = rates.cacheWrite ?? rates.input * 1.25;
   const cacheWrite1h = rates.cacheWrite1h ?? rates.input * 2;
-  const audioRate = rates.audio ?? rates.input;
+  // A subset never exceeds its superset: usage built the 2.2 way, with reasoning
+  // counted beside the output, shows up like this and still bills in full.
+  const output =
+    usage.reasoningTokens > usage.outputTokens
+      ? usage.outputTokens + usage.reasoningTokens
+      : usage.outputTokens;
+  const audioPremium =
+    rates.audio === undefined ? 0 : (usage.audioTokens ?? 0) * (rates.audio - rates.input);
 
   const cost =
     (usage.inputTokens * rates.input +
-      (usage.outputTokens + usage.reasoningTokens) * rates.output +
+      output * rates.output +
       usage.cachedReadTokens * cachedRead +
       usage.cacheWriteTokens * cacheWrite +
       usage.cacheWrite1hTokens * cacheWrite1h +
-      (usage.audioTokens ?? 0) * audioRate) /
+      audioPremium) /
     M;
 
   // Avoid -0 and float dust; round to micro-dollars.

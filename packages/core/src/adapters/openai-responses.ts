@@ -254,6 +254,9 @@ interface ResponsesEvent {
   error?: { message?: string; code?: string };
 }
 
+// output_tokens already includes reasoning_tokens and input_tokens includes the
+// cached reads (OpenAI token counting), which is the canonical contract once the
+// cached share is split out. Responses usage has no cache-write counter.
 function mapResponsesUsage(u: ResponsesUsage | undefined): Usage {
   const input = u?.input_tokens ?? 0;
   const cached = u?.input_tokens_details?.cached_tokens ?? 0;

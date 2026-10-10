@@ -336,7 +336,8 @@ function buildUsage(input: AnthropicUsage, outputTokens: number): Usage {
   return {
     inputTokens,
     outputTokens,
-    // Thinking tokens bill inside output_tokens; the detail field breaks them out.
+    // Thinking tokens bill inside output_tokens; the detail field breaks them out
+    // as a subset, so it is never priced on top of outputTokens.
     reasoningTokens: input.output_tokens_details?.thinking_tokens ?? 0,
     cachedReadTokens: cacheRead,
     cacheWriteTokens: Math.max(0, cacheWriteTotal - cacheWrite1h),
