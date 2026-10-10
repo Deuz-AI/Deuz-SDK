@@ -392,18 +392,32 @@ function mapStopReason(reason: string | null): FinishReason {
 function buildUsage(input: AnthropicUsage, outputTokens: number): Usage {
   // Fallbacks/compaction report per-attempt usage in `iterations` while the
   // top-level usage covers only the serving attempt — sum iterations instead.
+  // An entry carries token counters only (@anthropic-ai/sdk 0.133.0,
+  // `BetaIterationsUsage`): the server tool requests and the thinking-token
+  // detail are reported at the top level alone, so they are kept from there.
   if (input.iterations && input.iterations.length > 0) {
-    return input.iterations
-      .map((it) => buildUsage({ ...it, iterations: undefined }, it.output_tokens ?? 0))
-      .reduce((acc, u) => ({
-        inputTokens: acc.inputTokens + u.inputTokens,
-        outputTokens: acc.outputTokens + u.outputTokens,
-        reasoningTokens: acc.reasoningTokens + u.reasoningTokens,
-        cachedReadTokens: acc.cachedReadTokens + u.cachedReadTokens,
-        cacheWriteTokens: acc.cacheWriteTokens + u.cacheWriteTokens,
-        cacheWrite1hTokens: acc.cacheWrite1hTokens + u.cacheWrite1hTokens,
-        totalTokens: acc.totalTokens + u.totalTokens,
-      }));
+    const top = buildUsage({ ...input, iterations: undefined }, outputTokens);
+    const attempts = input.iterations.map((it) =>
+      buildUsage({ ...it, iterations: undefined }, it.output_tokens ?? 0),
+    );
+    const sum = (count: (u: Usage) => number): number =>
+      attempts.reduce((total, u) => total + count(u), 0);
+    const output = sum((u) => u.outputTokens);
+    const reasoning = sum((u) => u.reasoningTokens);
+    const toolUses = sum((u) => u.serverToolUses ?? 0);
+    // Whichever view is the more complete one, so nothing is counted twice.
+    const serverTools = Math.max(toolUses, top.serverToolUses ?? 0);
+    return {
+      inputTokens: sum((u) => u.inputTokens),
+      outputTokens: output,
+      // A share of the summed output, never more than it.
+      reasoningTokens: Math.min(output, Math.max(reasoning, top.reasoningTokens)),
+      cachedReadTokens: sum((u) => u.cachedReadTokens),
+      cacheWriteTokens: sum((u) => u.cacheWriteTokens),
+      cacheWrite1hTokens: sum((u) => u.cacheWrite1hTokens),
+      ...(serverTools > 0 ? { serverToolUses: serverTools } : {}),
+      totalTokens: sum((u) => u.totalTokens),
+    };
   }
   const cacheRead = input.cache_read_input_tokens ?? 0;
   const cacheWriteTotal = input.cache_creation_input_tokens ?? 0;
