@@ -8,15 +8,25 @@ import { resolveCall } from '../internal/resolve-call';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { createWarningSink } from '../internal/warnings';
 import { validateOutput } from '../schema/bridge';
+import type { BudgetScope } from '../types/execution';
 import type { JSONSchema, StandardSchemaV1 } from '../types/schema';
 import { anthropicBatchDriver } from './anthropic';
+import {
+  batchPrice,
+  bounded,
+  closeAfterFailure,
+  closeForStatus,
+  closeHold,
+  reserveHolds,
+  type HoldClose,
+} from './budget';
 import { isObject, SubmitFailure, type BatchDriver, type BatchOutcome } from './driver';
 import { BatchError } from './errors';
 import { geminiBatchDriver } from './gemini';
 import type { BatchCallContext } from './http';
 import { openaiBatchDriver } from './openai';
 import { parseReply, type ParsedReply } from './parse';
-import { prepareRequests, protocolFor, validateRequests } from './prepare';
+import { prepareRequests, protocolFor, reporter, validateRequests } from './prepare';
 import type {
   BatchClient,
   BatchClientOptions,
@@ -167,29 +177,31 @@ export function createBatchClient(options: BatchClientOptions): BatchClient {
         };
   }
 
-  /** One result from one outcome. */
+  /** One result from one outcome, and how it closes the request's hold. */
   async function resultOf(
     job: BatchJob,
     request: BatchJobRequest,
     outcome: BatchOutcome,
     schema: Schema | undefined,
-  ): Promise<BatchResult> {
+  ): Promise<{ result: BatchResult; close: HoldClose }> {
     const id = request.id;
-    if (outcome.kind === 'cancelled') return { id, status: 'cancelled', text: '' };
-    if (outcome.kind === 'expired') return { id, status: 'expired', text: '' };
-    if (outcome.kind === 'error') return { id, status: 'errored', text: '', error: outcome.error };
+    // Never attempted: nothing was billed.
+    if (outcome.kind === 'cancelled')
+      return { result: { id, status: 'cancelled', text: '' }, close: { kind: 'release' } };
+    if (outcome.kind === 'expired')
+      return { result: { id, status: 'expired', text: '' }, close: { kind: 'release' } };
+    if (outcome.kind === 'error')
+      return {
+        result: { id, status: 'errored', text: '', error: outcome.error },
+        close: closeForStatus(outcome.status),
+      };
     const reply = parseReply(job.surface, outcome.body);
-    let costUsd: number | undefined;
-    if (reply.usageAvailable && deps.priceProvider) {
-      try {
-        const price = await deps.priceProvider.priceUsage(job.modelId, reply.usage, {
-          tier: 'batch',
-        });
-        if (price !== undefined && Number.isFinite(price) && price >= 0) costUsd = price;
-      } catch {
-        // A price lookup that fails leaves the cost unknown.
-      }
-    }
+    // One batch-tier lookup prices both the result and its settlement.
+    const price = reply.usageAvailable ? await batchPrice(deps, job.modelId, reply.usage) : {};
+    const costUsd =
+      price.usd !== undefined && Number.isFinite(price.usd) && price.usd >= 0
+        ? price.usd
+        : undefined;
     const extracted =
       request.object && !reply.error ? await objectOf(id, reply, request.object, schema) : {};
     const error: DeuzError | undefined = reply.error
@@ -204,60 +216,97 @@ export function createBatchClient(options: BatchClientOptions): BatchClient {
         })
       : extracted.error;
     return {
-      id,
-      status: reply.error ? 'errored' : 'succeeded',
-      text: reply.text,
-      ...(reply.reasoning ? { reasoning: reply.reasoning } : {}),
-      ...('object' in extracted ? { object: extracted.object } : {}),
-      finishReason: reply.finishReason,
-      usage: reply.usage,
-      usageAvailable: reply.usageAvailable,
-      ...(costUsd !== undefined ? { costUsd } : {}),
-      ...(error ? { error } : {}),
-      ...(reply.stopDetails ? { stopDetails: reply.stopDetails } : {}),
-      ...(reply.providerMetadata ? { providerMetadata: reply.providerMetadata } : {}),
+      result: {
+        id,
+        status: reply.error ? 'errored' : 'succeeded',
+        text: reply.text,
+        ...(reply.reasoning ? { reasoning: reply.reasoning } : {}),
+        ...('object' in extracted ? { object: extracted.object } : {}),
+        finishReason: reply.finishReason,
+        usage: reply.usage,
+        usageAvailable: reply.usageAvailable,
+        ...(costUsd !== undefined ? { costUsd } : {}),
+        ...(error ? { error } : {}),
+        ...(reply.stopDetails ? { stopDetails: reply.stopDetails } : {}),
+        ...(reply.providerMetadata ? { providerMetadata: reply.providerMetadata } : {}),
+      },
+      // Usage the provider reported is what it billed; without it the cost is unknown (F02).
+      close: reply.usageAvailable
+        ? { kind: 'settle', usage: reply.usage, price }
+        : { kind: 'unknown' },
     };
   }
 
-  /** The result of a request an ended batch reports nothing for. */
-  function missingResult(job: BatchJob, request: BatchJobRequest, ended: BatchStatus): BatchResult {
+  /** The result of a request an ended batch reports nothing for, and how its hold closes. */
+  function missingResult(
+    job: BatchJob,
+    request: BatchJobRequest,
+    ended: BatchStatus,
+  ): { result: BatchResult; close: HoldClose } {
     const id = request.id;
     switch (driver.missing(ended.state)) {
       case 'cancelled':
-        return { id, status: 'cancelled', text: '' };
+        return { result: { id, status: 'cancelled', text: '' }, close: { kind: 'release' } };
       case 'expired':
-        return { id, status: 'expired', text: '' };
+        return { result: { id, status: 'expired', text: '' }, close: { kind: 'release' } };
       case 'not-run':
         return {
-          id,
-          status: 'errored',
-          text: '',
-          error: new BatchError({
-            kind: 'provider',
-            provider: job.provider,
-            batchId: job.id,
-            message:
-              `Batch ${job.id} failed before request "${id}" ran` +
-              (ended.error ? `: ${ended.error}` : '.'),
-          }),
+          result: {
+            id,
+            status: 'errored',
+            text: '',
+            error: new BatchError({
+              kind: 'provider',
+              provider: job.provider,
+              batchId: job.id,
+              message:
+                `Batch ${job.id} failed before request "${id}" ran` +
+                (ended.error ? `: ${ended.error}` : '.'),
+            }),
+          },
+          close: { kind: 'release' },
         };
       case 'unknown':
         return {
-          id,
-          status: 'errored',
-          text: '',
-          error: new BatchError({
-            kind: 'provider',
-            provider: job.provider,
-            batchId: job.id,
-            message: `${job.provider} reported no result for batch request "${id}" (batch ${job.id} is ${ended.state}).`,
-          }),
+          result: {
+            id,
+            status: 'errored',
+            text: '',
+            error: new BatchError({
+              kind: 'provider',
+              provider: job.provider,
+              batchId: job.id,
+              message: `${job.provider} reported no result for batch request "${id}" (batch ${job.id} is ${ended.state}).`,
+            }),
+          },
+          // It may have run and been billed: the hold stays.
+          close: { kind: 'unknown' },
         };
     }
   }
 
   async function* results(job: BatchJob, read: BatchResultsOptions = {}) {
     check(job);
+    const execution = options.execution;
+    if (!execution && job.requests.some((request) => request.hold !== undefined))
+      throw new BatchError({
+        kind: 'invalid-job',
+        provider: job.provider,
+        batchId: job.id,
+        message: `Batch ${job.id} reserved budget holds: read its results through a client with an execution context, so they close.`,
+      });
+    let scopes: readonly BudgetScope[] | undefined;
+    /** Settle, release or keep a request's hold before its result is handed out. */
+    const close = async (request: BatchJobRequest, how: HoldClose): Promise<void> => {
+      if (execution && request.hold)
+        await closeHold(
+          execution,
+          job,
+          request.hold,
+          how,
+          () => (scopes ??= execution.snapshot().scopes),
+        );
+    };
     const ctx = await context(read.signal);
     const { status: ended, raw } = await driver.status(job.id, ctx);
     if (!ended.ended)
@@ -275,15 +324,21 @@ export function createBatchClient(options: BatchClientOptions): BatchClient {
       // A result for no request of this job, or a repeated one, is ignored.
       if (!request || seen.has(outcome.id)) continue;
       seen.add(outcome.id);
-      yield await resultOf(
+      const { result, close: how } = await resultOf(
         job,
         request,
         outcome,
         read.schemas?.[request.id] ?? known?.get(request.id),
       );
+      await close(request, how);
+      yield result;
     }
-    for (const request of job.requests)
-      if (!seen.has(request.id)) yield missingResult(job, request, ended);
+    for (const request of job.requests) {
+      if (seen.has(request.id)) continue;
+      const { result, close: how } = missingResult(job, request, ended);
+      await close(request, how);
+      yield result;
+    }
     if (options.store) await options.store.put({ ...job, closedAt: deps.clock.now() });
   }
 
@@ -316,15 +371,26 @@ export function createBatchClient(options: BatchClientOptions): BatchClient {
           message: `A ${model.provider} batch takes at most ${driver.maxRequests} requests; this one has ${requests.length}.`,
         });
       const ctx = await context(submitOptions.signal);
+      const execution = options.execution;
       const warnings = createWarningSink();
       const prepared = await prepareRequests(requests, {
         model,
         call: ctx.call,
         deps,
         warnings,
-        bounded: false,
+        bounded: bounded(execution),
       });
       const submittedAt = deps.clock.now();
+      // One hold per request, all or none, before the provider sees anything.
+      const holds = execution
+        ? await reserveHolds(prepared, {
+            execution,
+            deps,
+            model,
+            key: deps.generateId(),
+            report: reporter(warnings, deps.logger),
+          })
+        : [];
       let submitted;
       try {
         submitted = await driver.submit(prepared, ctx, {
@@ -335,7 +401,16 @@ export function createBatchClient(options: BatchClientOptions): BatchClient {
             : {}),
         });
       } catch (error) {
-        throw error instanceof SubmitFailure ? error.error : error;
+        // A failure that is not a SubmitFailure came from an unknown point: fail closed.
+        const failure = error instanceof SubmitFailure ? error : new SubmitFailure(error, true);
+        if (execution && holds.length > 0)
+          await closeAfterFailure(
+            execution,
+            holds,
+            { error: failure.error, mayExist: failure.mayExist },
+            deps,
+          );
+        throw failure.error;
       }
       const notices = warnings.list();
       const job: BatchJob = {
@@ -353,8 +428,10 @@ export function createBatchClient(options: BatchClientOptions): BatchClient {
         ...(submitOptions.displayName !== undefined
           ? { displayName: submitOptions.displayName }
           : {}),
-        requests: prepared.map((request) => ({
+        ...(execution ? { scopeId: execution.scopeId } : {}),
+        requests: prepared.map((request, index) => ({
           id: request.id,
+          ...(holds[index] ? { hold: holds[index] } : {}),
           ...(request.object
             ? {
                 object: {

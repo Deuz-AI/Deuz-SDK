@@ -20,7 +20,7 @@ import type { ResolvedCall } from '../internal/resolve-call';
 import { unsupportedSetting, type WarningSink } from '../internal/warnings';
 import { toJSONSchema } from '../schema/bridge';
 import type { CommonCallOptions } from '../types/config';
-import type { ResolvedDependencies } from '../types/deps';
+import type { Logger, ResolvedDependencies } from '../types/deps';
 import type { CallWarning } from '../types/methods';
 import type { LanguageModel, ModelSurface } from '../types/model';
 import type { JSONSchema, StandardSchemaV1 } from '../types/schema';
@@ -98,6 +98,17 @@ export interface PrepareInput {
   readonly bounded: boolean;
 }
 
+/** Record a warning in the batch's sink and log it once, as the inference pump does. */
+export function reporter(warnings: WarningSink, logger: Logger): (warning: CallWarning) => void {
+  return (warning) => {
+    if (!warnings.add(warning, { mirror: false })) return;
+    logger.warn(warning.message, {
+      warning: warning.type,
+      ...(warning.setting !== undefined ? { setting: warning.setting } : {}),
+    });
+  };
+}
+
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 function invalid(message: string, cause?: unknown): BatchError {
@@ -154,14 +165,7 @@ export async function prepareRequests(
   validateRequests(requests);
   const { model, call, deps, warnings } = input;
   const adapter = adapterFor(model.surface);
-  /** Record a warning and log it once, as the inference pump does. */
-  const report = (warning: CallWarning): void => {
-    if (!warnings.add(warning, { mirror: false })) return;
-    deps.logger.warn(warning.message, {
-      warning: warning.type,
-      ...(warning.setting !== undefined ? { setting: warning.setting } : {}),
-    });
-  };
+  const report = reporter(warnings, deps.logger);
   // One model per batch: its row is resolved (and an unknown slug reported) once.
   const caps = getCapabilities(model, deps.logger, undefined, warnings);
   const prepared: PreparedRequest[] = [];
