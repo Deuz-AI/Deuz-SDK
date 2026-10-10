@@ -11,6 +11,12 @@
  * when a run has (or had) MCP servers. The MCP module graph stays out of the
  * native agent bundle for every run without MCP, exactly as `setupMcp` keeps it
  * out of the loop's.
+ *
+ * It must not import a VALUE from a module the core bundles load eagerly: a
+ * bundler keeps every export a lazy chunk imports, even in a bundle that
+ * tree-shakes `agent-run.ts` away (the edge entry), so such an import would
+ * make all of native tool preparation eager there. The receipt wrapper is
+ * therefore passed in (`prepare`).
  */
 import type { ToolSet } from '../types/tool';
 import type { McpLoopEntry } from '../types/config';
@@ -18,8 +24,12 @@ import type { ResolvedDependencies } from '../types/deps';
 import type { AgentMcpEntry, AgentMcpReplay } from '../types/agent-run';
 import { resolveMcpForLoop, type ResolvedMcpRuntime } from '../mcp/resolve';
 import { detectToolDrift, fingerprintTools, type ToolFingerprints } from '../mcp/shared';
-import { closeMcp } from './loop-shared';
-import { prepareMcpTools, type NativeToolOutput, type NativeToolReceipts } from './agent-tools';
+
+/** Puts MCP tools behind the run's receipts (`prepareMcpTools`, bound by the runner). */
+export type PrepareMcpTools = (
+  tools: ToolSet,
+  replayOf: (name: string) => 'idempotent' | undefined,
+) => Promise<ToolSet>;
 
 export interface NativeMcp {
   /**
@@ -78,6 +88,15 @@ function splitEntries(entries: readonly AgentMcpEntry[]): {
   return { connect, replays };
 }
 
+/** Close what the run opened. Never throws: teardown must not fail a finished run. */
+async function closeQuietly(runtime: ResolvedMcpRuntime, deps: ResolvedDependencies) {
+  try {
+    await runtime.closeOwned();
+  } catch (error) {
+    deps.logger.error('mcp: closing run-owned connections failed', { error });
+  }
+}
+
 /**
  * Connect the run's MCP servers and put their tools behind the run's receipts.
  * Rejects, with nothing left open, when a server cannot be reached.
@@ -85,8 +104,7 @@ function splitEntries(entries: readonly AgentMcpEntry[]): {
 export async function resolveNativeMcp(
   entries: readonly AgentMcpEntry[],
   deps: ResolvedDependencies,
-  onOutput: (output: NativeToolOutput) => void | Promise<void>,
-  receipts: NativeToolReceipts,
+  prepare: PrepareMcpTools,
 ): Promise<NativeMcp> {
   const { connect, replays } = splitEntries(entries);
   const inner = await resolveMcpForLoop(connect, {
@@ -102,11 +120,9 @@ export async function resolveNativeMcp(
     if (declared === 'idempotent') return 'idempotent';
     return Object.hasOwn(declared, origin.name) ? declared[origin.name] : undefined;
   };
-  const prepare = (tools: ToolSet): Promise<ToolSet> =>
-    prepareMcpTools(tools, replayOf, onOutput, receipts);
   try {
     const runtime: ResolvedMcpRuntime = {
-      tools: await prepare(inner.tools),
+      tools: await prepare(inner.tools, replayOf),
       get origins() {
         return inner.origins;
       },
@@ -114,7 +130,7 @@ export async function resolveNativeMcp(
       async refresh() {
         // A failed re-read keeps the previous, already prepared catalog.
         await inner.refresh();
-        runtime.tools = await prepare(inner.tools);
+        runtime.tools = await prepare(inner.tools, replayOf);
         return runtime.tools;
       },
       closeOwned: () => inner.closeOwned(),
@@ -124,10 +140,10 @@ export async function resolveNativeMcp(
       runtime,
       replayOf,
       catalog: async () => JSON.stringify(await fingerprintTools(inner.tools)),
-      close: () => closeMcp(inner, deps),
+      close: () => closeQuietly(inner, deps),
     };
   } catch (error) {
-    await closeMcp(inner, deps);
+    await closeQuietly(inner, deps);
     throw error;
   }
 }

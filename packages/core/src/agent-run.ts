@@ -44,6 +44,7 @@ import {
 } from './inference/agent-output';
 import {
   prepareAgentTools,
+  prepareMcpTools,
   type NativeToolOutput,
   type NativeToolReceipts,
 } from './inference/agent-tools';
@@ -516,8 +517,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           nativeMcp = await native.resolveNativeMcp(
             options.mcp,
             resolveDependencies(options.deps),
-            onToolOutput,
-            receipts,
+            (tools, replayOf) => prepareMcpTools(tools, replayOf, onToolOutput, receipts),
           );
           binding.mcp = await nativeMcp.catalog();
         }
