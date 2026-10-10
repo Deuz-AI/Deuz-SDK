@@ -246,8 +246,10 @@ describe('Redis ops store { url }', () => {
   });
 });
 
+// A network round trip per script, and real waits for server time.
+if (liveRedisUrl) vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
+
 describe.skipIf(!liveRedisUrl)('Redis ops store on a live server', () => {
-  vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
   let server: Awaited<ReturnType<typeof liveRedisServer>>;
   beforeAll(async () => {
     server = await liveRedisServer(liveRedisUrl!);

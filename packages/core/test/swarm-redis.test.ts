@@ -231,8 +231,10 @@ describe('a swarm on the Redis store', () => {
   });
 });
 
+// A network round trip per script, and real waits for server time.
+if (liveRedisUrl) vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
+
 describe.skipIf(!liveRedisUrl)('Redis swarm store on a live server', () => {
-  vi.setConfig({ testTimeout: 30_000, hookTimeout: 60_000 });
   let server: Awaited<ReturnType<typeof liveRedisServer>>;
   beforeAll(async () => {
     server = await liveRedisServer(liveRedisUrl!);
