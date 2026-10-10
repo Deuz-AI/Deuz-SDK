@@ -121,6 +121,38 @@ describe('client information (dynamic registration)', () => {
     expect(store.reads).toEqual([]);
   });
 
+  it('a configured client carries the issuer it is asked about and is never persisted (v2, SEP-2352)', async () => {
+    // The v2 SDK binds client info to an authorization server with an `issuer`
+    // stamp, and writes an UNSTAMPED value back to stamp it. For a configured
+    // client that write-back would copy the client secret into the token store
+    // (and warn on every call), so the configured value is stamped on read and a
+    // save of it is ignored — it is configuration, not state.
+    const store = spyStore();
+    const provider = createOAuthProvider({
+      redirectUri: 'https://app.example.com/cb',
+      clientId: 'preregistered-123',
+      clientSecret: 'shh',
+      store,
+    });
+    await bindOAuthServer(provider, SERVER);
+    const v2 = provider.provider as {
+      clientInformation(ctx?: { issuer: string }): Promise<Record<string, unknown> | undefined>;
+      saveClientInformation(info: Record<string, unknown>): Promise<void>;
+    };
+
+    expect(await v2.clientInformation({ issuer: 'https://as.example.com' })).toEqual({
+      client_id: 'preregistered-123',
+      client_secret: 'shh',
+      issuer: 'https://as.example.com',
+    });
+    await v2.saveClientInformation({
+      client_id: 'preregistered-123',
+      client_secret: 'shh',
+      issuer: 'https://as.example.com',
+    });
+    expect(store.entries.has(`client-info:${SERVER}`)).toBe(false);
+  });
+
   it('without a clientId, saveClientInformation persists what DCR minted', async () => {
     const store = spyStore();
     const provider = createOAuthProvider({ redirectUri: 'https://app.example.com/cb', store });

@@ -1,0 +1,261 @@
+---
+title: MCP server
+description: Publish Deuz tools, native agent tools and whole agents over MCP — one definition served over fetch-native Streamable HTTP and stdio, MCP 2026-07-28 with a 2025-11-25 fallback.
+---
+
+`createMcpServer` (2.3) turns the tools you already wrote for the loop into a [Model Context Protocol](https://modelcontextprotocol.io) server. One definition publishes a `ToolSet`, a native `AgentToolSet` and whole agents (`runAgent` behind a tool), and serves them two ways: `server.fetch` is a fetch-native Streamable HTTP handler (`Request` in, `Response` out — Workers, Deno, Bun, route handlers), and `serveMcpStdio(server)` serves the **same handle** over stdin/stdout for clients that launch the server as a child process.
+
+The server speaks **MCP 2026-07-28** to a client that negotiates it and, by default, serves 2025-era clients (MCP 2025-11-25) through a stateless fallback — so the Deuz client on either SDK line, the official SDK clients and most hosted agents can all call it.
+
+It is built on the v2 MCP SDK, an **optional peer** imported lazily:
+
+```bash
+npm i @modelcontextprotocol/server
+```
+
+The v2 SDK needs Node ≥ 20 (or a fetch-native edge runtime) and brings its own Zod 4 as a nested dependency; Deuz passes it JSON Schemas and never imports Zod from it. When the peer is missing, `ready()` rejects with an `InvalidRequestError` naming the install command, and `fetch` answers a JSON-RPC error with status 500.
+
+| Subpath | Exports | Runtime |
+| --- | --- | --- |
+| `@deuz-sdk/core/mcp/server` | `createMcpServer` | Edge-safe (Web APIs only) |
+| `@deuz-sdk/core/mcp/server/stdio` | `serveMcpStdio` | Node-only |
+
+## Quick start
+
+This runs without a key and without a socket: the Deuz client talks straight into `server.fetch` through `McpHttpTransport.fetch`.
+
+```ts title="mcp-server-quickstart.ts"
+import { tool } from '@deuz-sdk/core';
+import { createMcpServer } from '@deuz-sdk/core/mcp/server';
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+
+const forecast = tool({
+  description: 'Tomorrow’s forecast for a city.',
+  parameters: {
+    type: 'object',
+    properties: { city: { type: 'string' } },
+    required: ['city'],
+    additionalProperties: false,
+  },
+  execute: async (args) => ({ city: (args as { city: string }).city, highC: 24 }),
+});
+
+const server = createMcpServer({ name: 'weather', version: '1.0.0', tools: { forecast } });
+
+const client = await createMcpClient({
+  transport: {
+    type: 'http',
+    url: 'http://weather.local/mcp',
+    fetch: (input, init) => server.fetch(new Request(input, init)),
+  },
+});
+console.log(client.protocolVersion?.());                      // '2026-07-28'
+console.log(await client.callTool('forecast', { city: 'Izmir' })); // { city: 'Izmir', highC: 24 }
+await client.close();
+await server.close();
+```
+
+In production the handler goes wherever a `fetch(request)` goes:
+
+```ts title="worker.ts"
+export default { fetch: (request: Request) => server.fetch(request) };
+```
+
+```ts title="app/mcp/route.ts"
+const handle = (request: Request) => server.fetch(request);
+export { handle as GET, handle as POST, handle as DELETE };
+```
+
+`fetch` is bound, so it can be detached. Call `await server.ready()` at startup to load the SDK and prepare every tool before the first request — a missing peer or a schema that cannot be listed then fails your deploy instead of your first user.
+
+<Callout type="warn" title="The handler does no validation or authentication of its own">
+Put Origin/Host validation (DNS-rebinding protection) and authentication **in front of** `server.fetch`. The SDK ships framework-free helpers for both — `hostHeaderValidationResponse`, `originValidationResponse` and `requireBearerAuth` from `@modelcontextprotocol/server`. Pass the verified identity as `server.fetch(request, { authInfo })`; it is never derived from headers.
+</Callout>
+
+## stdio
+
+```ts title="notes-server.mjs"
+#!/usr/bin/env node
+import { createMcpServer } from '@deuz-sdk/core/mcp/server';
+import { serveMcpStdio } from '@deuz-sdk/core/mcp/server/stdio';
+
+const server = createMcpServer({ name: 'notes', tools: { search, append } });
+await serveMcpStdio(server);
+```
+
+A client launches it as a child process — for example in a desktop client's MCP configuration:
+
+```json
+{ "mcpServers": { "notes": { "command": "node", "args": ["/abs/path/notes-server.mjs"] } } }
+```
+
+`serveMcpStdio` prepares every tool **before** reading the first byte, so a broken definition rejects instead of half-starting a server the client then waits on. The opening exchange pins the connection to one era: `server/discover` for an MCP 2026-07-28 client, `initialize` for a 2025-era one. `legacy: 'reject'` refuses 2025-era openings. `stdin`/`stdout` default to the process's own streams; pass others (a socket) to serve elsewhere. `serveMcpStdio` also accepts the options object directly, building the server for you.
+
+<Callout type="warn" title="Never write to stdout from a stdio server">
+Every byte on stdout is protocol. A stray `console.log` corrupts the stream and the client drops the connection. Log to stderr.
+</Callout>
+
+## Options
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `name` / `version` | `string` | — / `'0.0.0'` | The server's identity in the handshake. |
+| `instructions` | `string` | — | How to use the server, shown to the client's model. |
+| `tools` | `ToolSet` | — | Served with the loop's semantics. Every tool needs an `execute`. |
+| `agentTools` | `AgentToolSet` | — | Served with native semantics — see [Native agent tools](#native-agent-tools). |
+| `toolsContext` | record \| `(request) => record` | — | Per-tool context for `agentTools`; the function form runs per call. |
+| `agents` | `Record<string, McpServedAgent>` | — | Agents published as `{ prompt }` tools — see [Agents as tools](#agents-as-tools). |
+| `toolAnnotations` | `Record<string, McpToolAnnotations>` | — | MCP hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, `title`). |
+| `approve` | `'elicit'` \| `(request) => boolean` | `'elicit'` | Who approves a `needsApproval` call — see [Approval](#approval). |
+| `guardrails` | `{ onToolCall?, onToolResult? }` | — | The loop's tool guardrails, applied to every served call. |
+| `runtimeContext` | `(request) => unknown` | — | Builds the call's `runtimeContext` from the request (e.g. a tenant from `authInfo`). |
+| `legacy` | `'stateless' \| 'reject'` | `'stateless'` | HTTP: serve 2025-era clients statelessly, or make a 2026-07-28-only endpoint. |
+| `responseMode` | `'auto' \| 'sse' \| 'json'` | `'auto'` | 2026-07-28 response shaping: JSON, upgraded to SSE when a call streams. |
+| `maxRequestBodySize` | `number` | 4 MiB | Largest POST body read. |
+| `onError` | `(error) => void` | — | Out-of-band failures (rejected requests, a missing peer). Reporting only. |
+| `clock` | `Clock` | host clock | Time source for `Tool.timeoutMs`. |
+
+Construction rejects what can never be served, while the stack still points at your definition: a client tool (no `execute` — it runs in the caller's UI), a provider-executed tool, the same name twice across `tools`/`agentTools`/`agents`, and `toolAnnotations` for a name that is not served.
+
+The `request` every callback receives:
+
+```ts
+interface McpServerRequest {
+  transport: 'http' | 'stdio';
+  era: 'modern' | 'legacy';      // MCP 2026-07-28, or a 2025-era client
+  authInfo?: McpAuthInfo;        // what you passed to fetch(request, { authInfo }) — HTTP only
+  request?: Request;             // the HTTP request — HTTP only
+}
+```
+
+## What a served call runs
+
+A served call runs the pipeline a loop call runs, in the loop's order — so a tool behaves the same whether a model called it in-process or a client called it over MCP:
+
+1. **Argument check.** The SDK checks the arguments against the advertised schema before anything else runs. A raw JSON Schema is listed verbatim and enforced by the SDK's validator (AJV on Node, `@cfworker/json-schema` on workerd and browsers). A Standard Schema (zod, valibot, ArkType) is listed as its JSON Schema — through its own `~standard.jsonSchema` when the library has one, else the optional `@standard-community/standard-json` peer — and checked by itself.
+2. **`guardrails.onToolCall`** — `block` answers the loop's denial (`Blocked by guardrail 'name': reason`); `rewrite` swaps the arguments.
+3. **The approval gate**, when the tool's `needsApproval` holds — see [Approval](#approval).
+4. **Validation, exactly as the loop does it.** A Standard Schema's transform applies here, **once** — step 1 only checks.
+5. **`execute`**, with a context carrying a `toolCallId` (`mcp-<request id>`), the request's abort signal (a client cancellation aborts it), an empty `messages` array and the `runtimeContext`. A throw — or a `Tool.timeoutMs` expiry, which aborts the tool's signal — becomes an error result carrying the message: the loop's self-heal.
+6. **`guardrails.onToolResult`**, for results `execute` produced.
+7. **The result**, mapped as below.
+
+| `execute` returns | The client receives |
+| --- | --- |
+| a string | one text block |
+| a plain object | `structuredContent` **plus** its JSON text — so a Deuz client gets the object back |
+| an array, number, boolean, `null` | its JSON text |
+| `undefined` | no content |
+| anything, when the tool has an `outputSchema` | `structuredContent`, validated by the SDK (a mismatch is an error result) |
+| a throw / timeout / denial / guardrail block | `isError: true` with the message as text |
+
+Only the error **message** crosses the wire, never a stack — but it does cross it, so do not put secrets in error messages of a server facing clients you do not trust.
+
+## Approval
+
+`needsApproval` (a boolean or a predicate over the arguments) is honored on every call. Who decides:
+
+| Configuration | Over MCP |
+| --- | --- |
+| `approve: (request) => boolean` | A **server-side** verdict — the counterpart of the loop's [`approveToolCall`](/docs/agents/tool-loop#approval-gates). `false` (or a throw) denies with `Tool call denied.` |
+| `approve: 'elicit'` (the default), MCP 2026-07-28 client with form elicitation | The **client's user** is asked through an elicitation: a yes/no form naming the tool and its arguments. Approve runs the call; decline or cancel denies it. |
+| `'elicit'`, 2025-era client over **stdio** | Asked the same way — the SDK sends a real `elicitation/create` on the stateful session. |
+| `'elicit'`, 2025-era client over **HTTP** | **Denied** — a stateless request has no session to ask on. |
+| `'elicit'`, a client that declared no form elicitation | **Denied** (`… the client cannot be asked …`). |
+
+A call nobody can approve is denied — never run. The loop's **client-mode** approval (suspend the run, resume later with `ToolApprovalResponse` verdicts and optional `approvalSigner` tokens) has no MCP counterpart: an MCP call cannot be suspended across requests.
+
+<Callout type="warn" title="'elicit' takes the client's word for it">
+An elicitation is answered by the client, and nothing proves a human saw it. That is the right trust model for a client acting for its own user — and the wrong one for a server exposed to clients it does not trust. There, decide on the server: `approve: (request) => policy.allows(request.request.authInfo, request.toolName, request.args)`.
+</Callout>
+
+```ts title="approval.ts"
+const server = createMcpServer({
+  name: 'ops',
+  tools: {
+    restart: {
+      description: 'Restart a service.',
+      parameters: { type: 'object', properties: { service: { type: 'string' } }, required: ['service'] },
+      needsApproval: (args) => (args as { service: string }).service.startsWith('prod-'),
+      execute: async (args) => restartService((args as { service: string }).service),
+    },
+  },
+  approve: ({ request }) => request.authInfo?.scopes.includes('ops:write') ?? false,
+});
+```
+
+## Guardrails
+
+`guardrails.onToolCall` and `guardrails.onToolResult` take the [same guardrail functions the loop takes](/docs/agents/guardrails), with the same verdicts and ordering: rewrites chain, the first `block` short-circuits, a throw fails the call. A guardrail sees `messages: []` — a served call has no conversation — and the call's `runtimeContext`. `onInput` and `onOutput` have no counterpart on a server (there is no model turn); an [agent you serve](#agents-as-tools) runs its own guardrails inside its run.
+
+## Native agent tools
+
+`agentTools` serves an `AgentToolSet` with the semantics `runAgent` gives it: the tool context is validated (`contextSchema` / `validateContext`), the result is validated (`outputSchema` / `validateResult`), and the client receives the `toModelOutput` projection — never the raw result. An `outputSchema` is advertised only when no projection replaces the result. A static `toolsContext` is validated once, by `ready()`; the function form runs per call, so a context derived from the caller's identity works:
+
+```ts
+createMcpServer({
+  name: 'orders',
+  agentTools: { lookup },
+  toolsContext: ({ authInfo }) => ({ lookup: { tenant: authInfo?.clientId } }),
+});
+```
+
+Tool receipts, `replay: 'idempotent'` and `retryToolCallIds` belong to a durable run and do not apply to a served call.
+
+## Agents as tools
+
+An entry in `agents` publishes a whole agent as a tool taking `{ prompt }` — the `agentTool` input contract. Each call is one `runAgent` with the caller's prompt as the user turn. This example runs keyless with a deterministic model:
+
+```ts title="mcp-agent-tool.ts"
+import { createMcpServer } from '@deuz-sdk/core/mcp/server';
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const server = createMcpServer({
+  name: 'research',
+  agents: {
+    researcher: {
+      description: 'Answers research questions with sources.',
+      agent: { model: createMockModel({ responses: [{ text: 'Ankara is the capital.' }] }) },
+    },
+  },
+});
+
+const client = await createMcpClient({
+  transport: { type: 'http', url: 'http://research.local/mcp', fetch: (i, init) => server.fetch(new Request(i, init)) },
+});
+console.log(await client.callTool('researcher', { prompt: 'What is the capital of Türkiye?' }));
+```
+
+| The run ends | The client receives |
+| --- | --- |
+| `completed` | the output — text, or the structured value when the run has an `output` |
+| `suspended` (pending approvals or client tools) | an error result: an MCP call cannot resume it, so give the agent a server-side `approveToolCall` |
+| `stopped` | an error result naming the reason, with any partial text |
+| `failed` | an error result with the run's error message |
+
+`agent` may be a function `(input, request) => options`, called per call — use it to mint a fresh durable `session` per call (a fixed `runId` makes concurrent calls collide) or to pick a per-tenant model. The call's abort signal is combined with any `signal` in the options, so a client cancellation stops the run; the call's `runtimeContext` reaches the run unless the options set their own. `needsApproval: true` on the entry gates the agent call itself.
+
+## Protocol eras
+
+| Client | HTTP (`fetch`) | stdio |
+| --- | --- | --- |
+| MCP 2026-07-28 (`server/discover`) | served per request | the connection is pinned to 2026-07-28 |
+| 2025-era (`initialize`) | stateless fallback (`legacy: 'stateless'`); `'reject'` refuses it | a stateful 2025 session; `legacy: 'reject'` refuses it |
+
+Both eras run the same definition, so they cannot drift apart. Over stateless HTTP a 2025-era client has no session: `GET`/`DELETE` session operations answer `405`, and nothing can be asked of the client mid-call (hence the approval row above).
+
+## Limits
+
+- **Tools only.** The server publishes tools; it serves no resources or prompts, and its catalog is fixed at construction (no `tools/list_changed`).
+- **No conversation.** `messages` is `[]` and `toolCallId` is per JSON-RPC request — a 2026-07-28 approval retry is a new request with a new id.
+- **Per-tool timeouts only.** `Tool.timeoutMs` is honored; the loop's call-level `timeout` has no counterpart. A client's own request timeout and cancellation bound every call.
+- **No usage reporting.** An agent's token usage stays on the server (observe it with `deps.onUsage`); MCP has no field for it.
+- **Not live-verified against third-party hosts.** The server is verified offline, in-process, against the Deuz client on both SDK lines and the official v1 and v2 SDK clients (HTTP and a real stdio child) — not against hosted MCP clients.
+
+## See also
+
+- [MCP client](/docs/modules/mcp) — the dual-stack client, OAuth, sampling, roots and elicitation.
+- [Guardrails](/docs/agents/guardrails) — the hooks a served call runs.
+- [Native agents](/docs/modules/native-agents) — `runAgent`, `AgentToolSet` and tool contexts.
+- [Tool loop](/docs/agents/tool-loop) — the pipeline a served call mirrors.

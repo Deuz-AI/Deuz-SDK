@@ -26,13 +26,16 @@
  * Every server and client is torn down in `afterEach`; the fetch swap too.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { createMcpClient, type McpRootsClient } from '../src/mcp';
+import { createMcpClient, type McpRootsClient, type McpSdkLine } from '../src/mcp';
 import { InvalidRequestError } from '../src/errors';
 import {
   startTestMcpServer,
   type TestMcpServerHandle,
   type TestMcpServerOptions,
 } from './helpers/mcp-http-server';
+
+/** Both SDK lines (2.3); every describe below runs once per line against the v1 server. */
+const SDK_LINES: McpSdkLine[] = ['v1', 'v2'];
 
 // ===================================================================
 // Harness plumbing
@@ -69,10 +72,12 @@ async function startServer(opts: TestMcpServerOptions = {}): Promise<TestMcpServ
  * server→client request and only exists once that stream is live.
  */
 async function connect(
+  sdk: McpSdkLine,
   server: TestMcpServerHandle,
   options: Omit<Parameters<typeof createMcpClient>[0], 'transport'> = {},
 ): Promise<McpRootsClient> {
   const client = await createMcpClient({
+    sdk,
     transport: { type: 'http', url: server.url },
     ...options,
   });
@@ -120,208 +125,211 @@ function sentMethods(bodies: string[]): string[] {
 // Capability declaration — read off the real `initialize` params
 // ===================================================================
 
-describe('roots capability declaration', () => {
-  it('declares `roots: { listChanged: true }` only when roots are configured', async () => {
-    const bodies = recordHttp();
-    const plain = await startServer();
-    const rooted = await startServer();
+describe.each(SDK_LINES)('mcp-roots [%s SDK]', (sdk) => {
+  describe('roots capability declaration', () => {
+    it('declares `roots: { listChanged: true }` only when roots are configured', async () => {
+      const bodies = recordHttp();
+      const plain = await startServer();
+      const rooted = await startServer();
 
-    await connect(plain, {});
-    await connect(rooted, { roots: ['/srv/app'] });
+      await connect(sdk, plain, {});
+      await connect(sdk, rooted, { roots: ['/srv/app'] });
 
-    // `listChanged` is advertised because `setRoots()` really does notify —
-    // declaring it without that would lie to the server.
-    expect(declaredCapabilities(bodies)).toEqual([{}, { roots: { listChanged: true } }]);
-  });
-
-  it('declares the capability for an EMPTY roots list (an explicit "none")', async () => {
-    const bodies = recordHttp();
-    const server = await startServer();
-
-    await connect(server, { roots: [] });
-
-    expect(declaredCapabilities(bodies)).toEqual([{ roots: { listChanged: true } }]);
-    expect(await server.listClientRoots()).toEqual({ roots: [] });
-  });
-
-  it('refuses roots/list on a client that declared nothing', async () => {
-    const server = await startServer();
-    await connect(server, {});
-
-    // No capability AND no registered handler: JSON-RPC -32601, not a silent [].
-    await expect(server.listClientRoots()).rejects.toThrow(/MCP error -32601: Method not found/);
-  });
-});
-
-// ===================================================================
-// roots/list
-// ===================================================================
-
-describe('roots/list over a real MCP server', () => {
-  it('answers with normalized file:// URIs', async () => {
-    const server = await startServer();
-    await connect(server, {
-      roots: ['/srv/app', 'C:\\Users\\umut\\project', 'file:///already/a/uri'],
+      // `listChanged` is advertised because `setRoots()` really does notify —
+      // declaring it without that would lie to the server.
+      expect(declaredCapabilities(bodies)).toEqual([{}, { roots: { listChanged: true } }]);
     });
 
-    expect(await server.listClientRoots()).toEqual({
-      roots: [
-        // A plain POSIX path is promoted…
-        { uri: 'file:///srv/app' },
-        // …a Windows path is promoted AND its separators flipped (a backslash
-        // path is not a URI at all)…
-        { uri: 'file://C:/Users/umut/project' },
-        // …and something already carrying a scheme travels verbatim.
-        { uri: 'file:///already/a/uri' },
-      ],
+    it('declares the capability for an EMPTY roots list (an explicit "none")', async () => {
+      const bodies = recordHttp();
+      const server = await startServer();
+
+      await connect(sdk, server, { roots: [] });
+
+      expect(declaredCapabilities(bodies)).toEqual([{ roots: { listChanged: true } }]);
+      expect(await server.listClientRoots()).toEqual({ roots: [] });
+    });
+
+    it('refuses roots/list on a client that declared nothing', async () => {
+      const server = await startServer();
+      await connect(sdk, server, {});
+
+      // No capability AND no registered handler: JSON-RPC -32601, not a silent [].
+      await expect(server.listClientRoots()).rejects.toThrow(/MCP error -32601: Method not found/);
     });
   });
 
-  it('re-reads a function form on every request (async)', async () => {
-    const server = await startServer();
-    let n = 0;
-    await connect(server, { roots: async () => [`/run/${++n}`] });
+  // ===================================================================
+  // roots/list
+  // ===================================================================
 
-    expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///run/1' }] });
-    expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///run/2' }] });
-    expect(n).toBe(2);
-  });
+  describe('roots/list over a real MCP server', () => {
+    it('answers with normalized file:// URIs', async () => {
+      const server = await startServer();
+      await connect(sdk, server, {
+        roots: ['/srv/app', 'C:\\Users\\umut\\project', 'file:///already/a/uri'],
+      });
 
-  it('re-reads a function form on every request (sync)', async () => {
-    const server = await startServer();
-    const live = ['/first'];
-    await connect(server, { roots: () => [...live] });
-
-    expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///first' }] });
-    live.push('/second');
-    expect(await server.listClientRoots()).toEqual({
-      roots: [{ uri: 'file:///first' }, { uri: 'file:///second' }],
-    });
-  });
-});
-
-// ===================================================================
-// setRoots
-// ===================================================================
-
-describe('setRoots over a real MCP server', () => {
-  it('notifies the server, which then sees the new list', async () => {
-    const bodies = recordHttp();
-    const server = await startServer();
-    const client = await connect(server, { roots: ['/one'] });
-
-    expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///one' }] });
-
-    // Resolving means the real server accepted the POST (the transport rejects
-    // on any non-2xx), and the recorded body names the notification.
-    await client.setRoots(['/two', 'C:\\three']);
-    expect(sentMethods(bodies)).toContain('notifications/roots/list_changed');
-
-    // The handler was registered ONCE, before connect — it reads through to the
-    // swapped box rather than being re-registered.
-    expect(await server.listClientRoots()).toEqual({
-      roots: [{ uri: 'file:///two' }, { uri: 'file://C:/three' }],
-    });
-  });
-
-  it('sends the notification once per call, in order', async () => {
-    const bodies = recordHttp();
-    const server = await startServer();
-    const client = await connect(server, { roots: ['/one'] });
-
-    await client.setRoots(['/two']);
-    await client.setRoots(['/three']);
-
-    expect(
-      sentMethods(bodies).filter((m) => m === 'notifications/roots/list_changed'),
-    ).toHaveLength(2);
-    expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///three' }] });
-  });
-
-  it('replaces a function form with the fixed list it was given', async () => {
-    const server = await startServer();
-    let reads = 0;
-    const client = await connect(server, {
-      roots: () => {
-        reads += 1;
-        return ['/dynamic'];
-      },
+      expect(await server.listClientRoots()).toEqual({
+        roots: [
+          // A plain POSIX path is promoted…
+          { uri: 'file:///srv/app' },
+          // …a Windows path is promoted AND its separators flipped (a backslash
+          // path is not a URI at all)…
+          { uri: 'file://C:/Users/umut/project' },
+          // …and something already carrying a scheme travels verbatim.
+          { uri: 'file:///already/a/uri' },
+        ],
+      });
     });
 
-    expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///dynamic' }] });
-    await client.setRoots(['/fixed']);
+    it('re-reads a function form on every request (async)', async () => {
+      const server = await startServer();
+      let n = 0;
+      await connect(sdk, server, { roots: async () => [`/run/${++n}`] });
 
-    expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///fixed' }] });
-    // The function is gone, not merely shadowed.
-    expect(reads).toBe(1);
+      expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///run/1' }] });
+      expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///run/2' }] });
+      expect(n).toBe(2);
+    });
+
+    it('re-reads a function form on every request (sync)', async () => {
+      const server = await startServer();
+      const live = ['/first'];
+      await connect(sdk, server, { roots: () => [...live] });
+
+      expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///first' }] });
+      live.push('/second');
+      expect(await server.listClientRoots()).toEqual({
+        roots: [{ uri: 'file:///first' }, { uri: 'file:///second' }],
+      });
+    });
   });
 
-  it('rejects with InvalidRequestError on a client created without `roots`', async () => {
-    const server = await startServer();
-    const client = await connect(server, {});
+  // ===================================================================
+  // setRoots
+  // ===================================================================
 
-    // The capability is declared at construction; announcing a change to
-    // something we never advertised would lie to the server.
-    await expect(client.setRoots(['/x'])).rejects.toBeInstanceOf(InvalidRequestError);
-    await expect(client.setRoots(['/x'])).rejects.toThrow(/needs a `roots` option/);
+  describe('setRoots over a real MCP server', () => {
+    it('notifies the server, which then sees the new list', async () => {
+      const bodies = recordHttp();
+      const server = await startServer();
+      const client = await connect(sdk, server, { roots: ['/one'] });
+
+      expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///one' }] });
+
+      // Resolving means the real server accepted the POST (the transport rejects
+      // on any non-2xx), and the recorded body names the notification.
+      await client.setRoots(['/two', 'C:\\three']);
+      expect(sentMethods(bodies)).toContain('notifications/roots/list_changed');
+
+      // The handler was registered ONCE, before connect — it reads through to the
+      // swapped box rather than being re-registered.
+      expect(await server.listClientRoots()).toEqual({
+        roots: [{ uri: 'file:///two' }, { uri: 'file://C:/three' }],
+      });
+    });
+
+    it('sends the notification once per call, in order', async () => {
+      const bodies = recordHttp();
+      const server = await startServer();
+      const client = await connect(sdk, server, { roots: ['/one'] });
+
+      await client.setRoots(['/two']);
+      await client.setRoots(['/three']);
+
+      expect(
+        sentMethods(bodies).filter((m) => m === 'notifications/roots/list_changed'),
+      ).toHaveLength(2);
+      expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///three' }] });
+    });
+
+    it('replaces a function form with the fixed list it was given', async () => {
+      const server = await startServer();
+      let reads = 0;
+      const client = await connect(sdk, server, {
+        roots: () => {
+          reads += 1;
+          return ['/dynamic'];
+        },
+      });
+
+      expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///dynamic' }] });
+      await client.setRoots(['/fixed']);
+
+      expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///fixed' }] });
+      // The function is gone, not merely shadowed.
+      expect(reads).toBe(1);
+    });
+
+    it('rejects with InvalidRequestError on a client created without `roots`', async () => {
+      const server = await startServer();
+      const client = await connect(sdk, server, {});
+
+      // The capability is declared at construction; announcing a change to
+      // something we never advertised would lie to the server.
+      await expect(client.setRoots(['/x'])).rejects.toBeInstanceOf(InvalidRequestError);
+      await expect(client.setRoots(['/x'])).rejects.toThrow(/needs a `roots` option/);
+    });
+
+    it('does not send the notification when setRoots refuses', async () => {
+      const bodies = recordHttp();
+      const server = await startServer();
+      const client = await connect(sdk, server, {});
+
+      await expect(client.setRoots(['/x'])).rejects.toThrow(InvalidRequestError);
+
+      expect(sentMethods(bodies)).not.toContain('notifications/roots/list_changed');
+    });
   });
 
-  it('does not send the notification when setRoots refuses', async () => {
-    const bodies = recordHttp();
-    const server = await startServer();
-    const client = await connect(server, {});
+  // ===================================================================
+  // Non-file schemes — refused HERE, because the server refuses ALL of them
+  // ===================================================================
 
-    await expect(client.setRoots(['/x'])).rejects.toThrow(InvalidRequestError);
+  describe('non-file roots are refused at the call, not on the wire', () => {
+    it('createMcpClient rejects a non-file scheme with an actionable error', async () => {
+      const server = await startServer();
 
-    expect(sentMethods(bodies)).not.toContain('notifications/roots/list_changed');
-  });
-});
+      const failure = await createMcpClient({
+        sdk,
+        transport: { type: 'http', url: server.url },
+        roots: ['/srv/app', 'https://example.com/repo'],
+      }).catch((err: unknown) => err);
 
-// ===================================================================
-// Non-file schemes — refused HERE, because the server refuses ALL of them
-// ===================================================================
+      expect(failure).toBeInstanceOf(InvalidRequestError);
+      // Which value, why, and what to pass instead.
+      expect((failure as Error).message).toMatch(/https:\/\/example\.com\/repo/);
+      expect((failure as Error).message).toMatch(/file:\/\/ roots only/);
+      expect((failure as Error).message).toMatch(/pass a filesystem path/);
+    });
 
-describe('non-file roots are refused at the call, not on the wire', () => {
-  it('createMcpClient rejects a non-file scheme with an actionable error', async () => {
-    const server = await startServer();
+    it('is what a live server would have done to the WHOLE list anyway', async () => {
+      const server = await startServer();
+      // Prove the premise rather than assert it: a handler that answers with an
+      // https root fails MCP's result validation, and the good root beside it dies
+      // with it. That total loss is what the eager rejection replaces.
+      await connect(sdk, server, { roots: () => ['/srv/app', 'https://example.com/repo'] });
 
-    const failure = await createMcpClient({
-      transport: { type: 'http', url: server.url },
-      roots: ['/srv/app', 'https://example.com/repo'],
-    }).catch((err: unknown) => err);
+      await expect(server.listClientRoots()).rejects.toThrow();
+      // The reachable roots are still reachable once the bad one is gone.
+      const clean = await startServer();
+      await connect(sdk, clean, { roots: ['/srv/app'] });
+      expect(await clean.listClientRoots()).toEqual({ roots: [{ uri: 'file:///srv/app' }] });
+    });
 
-    expect(failure).toBeInstanceOf(InvalidRequestError);
-    // Which value, why, and what to pass instead.
-    expect((failure as Error).message).toMatch(/https:\/\/example\.com\/repo/);
-    expect((failure as Error).message).toMatch(/file:\/\/ roots only/);
-    expect((failure as Error).message).toMatch(/pass a filesystem path/);
-  });
+    it('setRoots rejects, sends nothing, and leaves the server on the old list', async () => {
+      const bodies = recordHttp();
+      const server = await startServer();
+      const client = await connect(sdk, server, { roots: ['/one'] });
 
-  it('is what a live server would have done to the WHOLE list anyway', async () => {
-    const server = await startServer();
-    // Prove the premise rather than assert it: a handler that answers with an
-    // https root fails MCP's result validation, and the good root beside it dies
-    // with it. That total loss is what the eager rejection replaces.
-    await connect(server, { roots: () => ['/srv/app', 'https://example.com/repo'] });
+      await expect(client.setRoots(['/two', 'https://example.com/repo'])).rejects.toThrow(
+        InvalidRequestError,
+      );
 
-    await expect(server.listClientRoots()).rejects.toThrow();
-    // The reachable roots are still reachable once the bad one is gone.
-    const clean = await startServer();
-    await connect(clean, { roots: ['/srv/app'] });
-    expect(await clean.listClientRoots()).toEqual({ roots: [{ uri: 'file:///srv/app' }] });
-  });
-
-  it('setRoots rejects, sends nothing, and leaves the server on the old list', async () => {
-    const bodies = recordHttp();
-    const server = await startServer();
-    const client = await connect(server, { roots: ['/one'] });
-
-    await expect(client.setRoots(['/two', 'https://example.com/repo'])).rejects.toThrow(
-      InvalidRequestError,
-    );
-
-    expect(sentMethods(bodies)).not.toContain('notifications/roots/list_changed');
-    // Refused BEFORE the swap — `/two` never became visible either.
-    expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///one' }] });
+      expect(sentMethods(bodies)).not.toContain('notifications/roots/list_changed');
+      // Refused BEFORE the swap — `/two` never became visible either.
+      expect(await server.listClientRoots()).toEqual({ roots: [{ uri: 'file:///one' }] });
+    });
   });
 });
