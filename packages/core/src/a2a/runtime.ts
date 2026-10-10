@@ -236,6 +236,9 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
       contextId: _contextId,
       ...message
     } = toMessage(input, { role: 'ROLE_AGENT', generateId: deps.generateId });
+    if (!Array.isArray(message.parts)) {
+      throw new InvalidRequestError({ message: 'An agent message needs a list of parts.' });
+    }
     return {
       ...message,
       contextId: turn.contextId,
@@ -462,6 +465,8 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
         (error: unknown) => settleFailure(turn, error),
       )
       .catch((error: unknown) => {
+        // A turn a cancel ended meanwhile needs no completing or failing.
+        if (turn.ended) return;
         report(error);
         fail(turn, protocolError('INTERNAL_ERROR', 'The agent could not finish the task.'));
       });
@@ -566,7 +571,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
           `Task ${taskId} is ${task.status.state}; there is nothing left to subscribe to.`,
         );
       }
-      sink.event({ task });
+      sink.event({ task: structuredClone(task) });
       const turn = live.get(key);
       if (turn) turn.sinks.add(sink);
       else sink.end();

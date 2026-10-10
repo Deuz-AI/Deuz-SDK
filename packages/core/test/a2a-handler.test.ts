@@ -447,6 +447,21 @@ describe('createA2AHandler — SendMessage and the task lifecycle', () => {
     expect(task.metadata).toEqual({ runId: 'run-1', tokens: 12 });
   });
 
+  it('refuses an agent message without parts', async () => {
+    let failure: unknown;
+    const { handler } = handlerWith(async (ctx) => {
+      try {
+        await ctx.working({ metadata: { note: 'no parts' } } as unknown as string);
+      } catch (error) {
+        failure = error;
+      }
+      await ctx.complete('done');
+    });
+    const task = ((await send(handler, 'hello')).result as { task: A2ATask }).task;
+    expect(failure).toBeInstanceOf(InvalidRequestError);
+    expect(task.history?.every((message) => Array.isArray(message.parts))).toBe(true);
+  });
+
   it('appends to an artifact or replaces it', async () => {
     const { handler } = handlerWith(async (ctx) => {
       const id = await ctx.artifact({ parts: [{ text: 'Hel' }] });
@@ -1041,6 +1056,32 @@ describe('createA2AHandler — CancelTask', () => {
     expect((await send(handler, 'Izmir', { taskId: task.id })).error).toMatchObject({
       code: -32004,
     });
+  });
+
+  it('does not report the auto-complete a concurrent cancel made pointless', async () => {
+    const finish = gate();
+    const allowCancel = gate();
+    const { handler, errors } = handlerWith(() => {}, {
+      executor: {
+        // Resolves while WORKING, so the handler completes the task itself.
+        execute: async (ctx) => {
+          await ctx.working();
+          await finish.promise;
+        },
+        cancel: () => allowCancel.promise,
+      },
+    });
+    const task = (
+      (await send(handler, 'a', {}, { returnImmediately: true })).result as { task: A2ATask }
+    ).task;
+    const canceling = rpc(handler, 'CancelTask', { id: task.id });
+    await tick();
+    finish.open(); // the auto-complete now waits behind the cancel
+    await tick();
+    allowCancel.open();
+    expect(((await canceling).body.result as A2ATask).status.state).toBe('TASK_STATE_CANCELED');
+    await tick();
+    expect(errors).toEqual([]);
   });
 
   it('lets executor.cancel refuse with TASK_NOT_CANCELABLE', async () => {
