@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { generateText } from '../src/generate';
+import { runAgent } from '../src/agent-run';
 import { createExecutionContext } from '../src/execution-policy';
 import { createInMemoryBudgetStore } from '../src/budget-store';
 import { BudgetLedgerError, createBudgetLedger } from '../src/budget-ledger';
@@ -53,6 +54,32 @@ describe('native settlement survives a failing BudgetStore (F17)', () => {
       state: 'settled',
       actual: { tokens: 15, usd: 0.01 },
     });
+  });
+
+  it('completes the call when the second round of settlement closes the hold', async () => {
+    const { store, calls } = flaky('settle', 4);
+    const execution = createExecutionContext({ admission: { store, scopes } });
+    // Before: the fifth store call settled the hold, yet the call rejected with
+    // the first round's admission_failed ("its hold stays").
+    await expect(
+      generateText({ model: model(), prompt: 'hi', execution, deps: { priceProvider: prices } }),
+    ).resolves.toMatchObject({ text: 'done' });
+    expect(calls()).toBe(5);
+    expect(execution.ledger.snapshot().reservations[0]).toMatchObject({
+      state: 'settled',
+      actual: { tokens: 15, usd: 0.01 },
+    });
+    expect(await store.usage('user:1')).toEqual({ tokens: 15, usd: 0.01 });
+
+    const flaked = flaky('settle', 4);
+    const run = await runAgent({
+      model: model(),
+      prompt: 'hi',
+      execution: createExecutionContext({ admission: { store: flaked.store, scopes } }),
+      deps: { priceProvider: prices },
+    });
+    expect(run.status).toBe('completed');
+    expect(flaked.calls()).toBe(5);
   });
 
   it('keeps the request id when the store stays down, and surfaces a recoverable error', async () => {

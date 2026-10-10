@@ -195,8 +195,9 @@ export async function settleLater(
 ```
 
 The native request forgets an attempt's request ID only after the ledger
-accepted its settlement, so a failure on the way out is retried once more on the
-call's error path before it is reported.
+accepted its settlement. A settlement that still fails after the ledger's three
+attempts gets one more round of three before the call fails, and when that
+round closes the hold, the call completes normally.
 
 A process that dies between a call and its settlement leaves the same kind of
 hold: its request ID is a `reserved` entry in the last persisted ledger snapshot.

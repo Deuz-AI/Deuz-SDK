@@ -68,6 +68,8 @@ export function createNativeRequest(
     ? { ...options, maxOutputTokens: caps.maxOutput }
     : options;
   let reservationId: string | undefined;
+  /** Rounds of settlement the current reservation's store failed (F17: two at most). */
+  let settleRounds = 0;
   const assert = () => assertExecutionPolicy(execution, { modelId, now: deps.clock.now() });
   /** Report that the USD budget cannot count this model, once per ledger. */
   const reportUnpriced = (): void => {
@@ -145,6 +147,7 @@ export function createNativeRequest(
         ...(unpriced ? { unpriced: true } : {}),
       });
       reservationId = requestId;
+      settleRounds = 0;
       if (reservation.unpriced) reportUnpriced();
       try {
         assert();
@@ -161,14 +164,23 @@ export function createNativeRequest(
       }
     },
     // F17 (2.3): the request id is forgotten only once the ledger accepted the
-    // write, so a failed settlement can still be closed on the error path.
+    // write. A settlement the store failed (three attempts in the ledger) gets
+    // one more round here, while the call can still finish; once that fails
+    // too, the call reports it, and the error path does not try a third round.
     async settle(usage: Usage | undefined, available: boolean): Promise<void> {
       const id = reservationId;
-      if (!id) return;
-      await (usage && available
-        ? execution.ledger.settleUsage(id, withTotal(usage), deps.priceProvider ?? NO_PRICES)
-        : execution.ledger.markUnknown(id));
-      reservationId = undefined;
+      while (id && settleRounds < 2) {
+        try {
+          await (usage && available
+            ? execution.ledger.settleUsage(id, withTotal(usage), deps.priceProvider ?? NO_PRICES)
+            : execution.ledger.markUnknown(id));
+          reservationId = undefined;
+          return;
+        } catch (error) {
+          if ((error as { code?: unknown } | null)?.code !== 'admission_failed') throw error;
+          if (++settleRounds === 2) throw error;
+        }
+      }
     },
     async rejectResponse(status: number): Promise<void> {
       const id = reservationId;
