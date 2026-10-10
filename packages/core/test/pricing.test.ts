@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { priceUsage, cacheSavings, createPriceProvider, PRICES_2026 } from '../src/pricing';
+import {
+  priceUsage,
+  cacheSavings,
+  createPriceProvider,
+  PRICE_ALIASES,
+  PRICES_2026,
+} from '../src/pricing';
 import type { Usage } from '../src/types/usage';
 
 function usage(over: Partial<Usage> = {}): Usage {
@@ -118,6 +124,20 @@ describe('createPriceProvider', () => {
     // built-ins still resolve
     expect(pp.priceUsage('gpt-5.2', usage({ inputTokens: 1_000_000 }))).toBeCloseTo(1.25, 6);
   });
+
+  it('resolves your own aliases to a row, merged over the built-in ones', () => {
+    const pp = createPriceProvider({
+      aliases: { 'prod-sonnet': 'claude-sonnet-5-5', 'gone-model': 'no-such-row' },
+    });
+    expect(pp.priceUsage('prod-sonnet', usage({ inputTokens: 1_000_000 }))).toBe(2);
+    expect(pp.priceUsage('mistral-large-latest', usage({ inputTokens: 1_000_000 }))).toBe(0.5);
+    expect(pp.priceUsage('gone-model', usage({ inputTokens: 1 }))).toBeUndefined();
+  });
+
+  it('resolves an alias against the merged table, so an overridden row wins', () => {
+    const pp = createPriceProvider({ table: { 'mistral-large': { input: 1, output: 1 } } });
+    expect(pp.priceUsage('mistral-large-latest', usage({ inputTokens: 1_000_000 }))).toBe(1);
+  });
 });
 
 describe('PRICES 2026-07 refresh', () => {
@@ -140,8 +160,8 @@ describe('PRICES 2026-07 refresh', () => {
       ),
     ).toBe(80);
   });
-  it('claude-sonnet-5 bills standard 3/15', () => {
-    expect(priceUsage('claude-sonnet-5', usage(oneM))).toBe(18);
+  it('claude-sonnet-5 bills 2/10, the rate the 2026-10-06 reference lists (F19)', () => {
+    expect(priceUsage('claude-sonnet-5', usage(oneM))).toBe(12);
   });
   it('gemini-3.1-pro-preview uses over200k tier when input exceeds 200k', () => {
     expect(
@@ -283,6 +303,171 @@ describe('272k prompt tier', () => {
     const above = { ...tokens, inputTokens: 100_001 };
     expect(priceUsage('gemini-3.1-pro', above)).toBe(0.440009);
     expect(cacheSavings('gemini-3.1-pro', above)).toBe(0.36);
+  });
+});
+
+describe('model lookup: exact ids and explicit aliases (F09)', () => {
+  const oneM = usage({ inputTokens: 1_000_000, outputTokens: 1_000_000 });
+
+  it('prices a newer model at its own row, never a shorter family row', () => {
+    expect(priceUsage('claude-opus-5-5', oneM)).toBe(24);
+    expect(priceUsage('claude-sonnet-5-5', oneM)).toBe(12);
+    // Adding the 5.5 rows leaves the older models' prices alone.
+    expect(priceUsage('claude-opus-5', oneM)).toBe(30);
+  });
+
+  it.each([
+    'claude-opus-5-not-a-real-model',
+    'kimi-k2.7-code',
+    'sonar-reasoning-pro',
+    'grok-4.1-fast',
+    'gpt-5.2-chat',
+    'claude-opus-4-8-12345678',
+  ])('returns undefined for %s instead of borrowing a related row', (model) => {
+    expect(priceUsage(model, oneM)).toBeUndefined();
+  });
+
+  it('resolves explicit aliases, also behind a vendor prefix', () => {
+    expect(priceUsage('mistral-large-latest', oneM)).toBe(2);
+    expect(priceUsage('mistralai/mistral-large-latest', oneM)).toBe(2);
+  });
+
+  it('resolves dated snapshots of a priced model', () => {
+    const tokens = usage({ inputTokens: 1_000_000 });
+    expect(priceUsage('claude-haiku-4-5-20251001', tokens)).toBe(1);
+    expect(priceUsage('claude-sonnet-4-5-20250929', tokens)).toBe(3);
+    expect(priceUsage('gpt-5.2-2025-12-11', tokens)).toBe(1.25);
+  });
+
+  it('strips an organization prefix in any case', () => {
+    const tokens = usage({ inputTokens: 1_000_000 });
+    expect(priceUsage('Qwen/qwen3-max', tokens)).toBe(1.2);
+    expect(priceUsage('deepseek-ai/deepseek-v3.2', tokens)).toBe(0.28);
+    // The model part still has to match exactly.
+    expect(priceUsage('Qwen/Qwen3-Coder-Next', tokens)).toBeUndefined();
+  });
+
+  it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])(
+    'does not resolve the inherited key %s',
+    (model) => {
+      expect(priceUsage(model, oneM)).toBeUndefined();
+      expect(cacheSavings(model, usage({ cachedReadTokens: 1 }))).toBeUndefined();
+    },
+  );
+
+  it('prices a custom table by exact id and keeps the built-in aliases available to it', () => {
+    const table = { 'mistral-large': { input: 3, output: 3 }, 'my-model': { input: 1, output: 1 } };
+    expect(priceUsage('my-model', oneM, table)).toBe(2);
+    expect(priceUsage('mistral-large-latest', oneM, table)).toBe(6);
+    expect(priceUsage('gpt-5.2', oneM, table)).toBeUndefined();
+  });
+
+  it('exposes the alias table read-only', () => {
+    expect(PRICE_ALIASES['mistral-large-latest']).toBe('mistral-large');
+    expect(Object.isFrozen(PRICE_ALIASES)).toBe(true);
+  });
+});
+
+describe('PRICES 2026-10 rows (F19)', () => {
+  const allBuckets = usage({
+    inputTokens: 100_000,
+    outputTokens: 100_000,
+    cachedReadTokens: 100_000,
+    cacheWriteTokens: 100_000,
+    cacheWrite1hTokens: 100_000,
+  });
+
+  it.each([
+    // input + output + cache read + 5-minute write + 1-hour write, 100k each
+    ['claude-opus-5-5', 3.72], // 0.4 + 2 + 0.02 + 0.5 + 0.8
+    ['claude-sonnet-5-5', 1.87], // 0.2 + 1 + 0.02 + 0.25 + 0.4
+    ['claude-sonnet-5', 1.87],
+  ])('prices every Anthropic bucket for %s', (model, expected) => {
+    expect(priceUsage(model as string, allBuckets)).toBe(expected);
+  });
+
+  it('prices a Haiku 5.5 prompt of up to 100K tokens on the lower card', () => {
+    expect(
+      priceUsage('claude-haiku-5-5', usage({ inputTokens: 100_000, outputTokens: 1_000 })),
+    ).toBe(0.0105);
+  });
+
+  it('prices a 100,001-token Haiku 5.5 prompt at $0.50/$2.50', () => {
+    expect(
+      priceUsage('claude-haiku-5-5', usage({ inputTokens: 100_001, outputTokens: 1_001 })),
+    ).toBe(0.052503);
+  });
+
+  it('counts cache reads and writes toward the Haiku 5.5 threshold', () => {
+    // 60,000 fresh + 40,001 cached = 100,001 prompt tokens: the upper card.
+    expect(
+      priceUsage('claude-haiku-5-5', usage({ inputTokens: 60_000, cachedReadTokens: 40_001 })),
+    ).toBe(0.032);
+    // Writes alone push the prompt to 200K: 0.625 and 1.00 per 1M.
+    expect(
+      priceUsage(
+        'claude-haiku-5-5',
+        usage({ cacheWriteTokens: 100_000, cacheWrite1hTokens: 100_000 }),
+      ),
+    ).toBe(0.1625);
+    expect(cacheSavings('claude-haiku-5-5', usage({ cachedReadTokens: 200_000 }))).toBe(0.09);
+  });
+
+  it('prices gpt-6.1-sol at its research-dated standard rates', () => {
+    expect(priceUsage('gpt-6.1-sol', usage({ inputTokens: 100_000, outputTokens: 100_000 }))).toBe(
+      1.2,
+    );
+    expect(
+      priceUsage('gpt-6.1-sol', usage({ cachedReadTokens: 100_000, cacheWriteTokens: 100_000 })),
+    ).toBe(0.26);
+  });
+});
+
+describe('threshold tiers (F19)', () => {
+  const tiered = {
+    t: {
+      input: 1,
+      output: 2,
+      cachedRead: 0.05,
+      // Deliberately unsorted: the highest threshold the prompt exceeds wins.
+      tiers: [
+        { above: 5_000, input: 5, output: 6 },
+        { above: 1_000, input: 3, output: 4 },
+      ],
+    },
+  };
+
+  it('keeps the base rates up to and including the lowest threshold', () => {
+    expect(priceUsage('t', usage({ inputTokens: 1_000, outputTokens: 1_000 }), tiered)).toBe(0.003);
+  });
+
+  it('applies the highest tier the whole prompt exceeds to the whole request', () => {
+    expect(priceUsage('t', usage({ inputTokens: 1_001, outputTokens: 1_000 }), tiered)).toBe(
+      0.007003,
+    );
+    expect(priceUsage('t', usage({ inputTokens: 5_001, outputTokens: 1_000 }), tiered)).toBe(
+      0.031005,
+    );
+  });
+
+  it("falls back to the row's own rate for a rate the tier omits", () => {
+    // The tier names no cachedRead, so the row's 0.05 holds (not 10% of the tier input).
+    expect(priceUsage('t', usage({ inputTokens: 1_000, cachedReadTokens: 1_000 }), tiered)).toBe(
+      0.00305,
+    );
+  });
+
+  it('combines a tier list with the legacy over272k field', () => {
+    const table = {
+      both: {
+        input: 1,
+        output: 1,
+        tiers: [{ above: 100_000, input: 2, output: 2 }],
+        over272k: { input: 4, output: 4 },
+      },
+    };
+    expect(priceUsage('both', usage({ inputTokens: 150_000 }), table)).toBe(0.3);
+    expect(priceUsage('both', usage({ inputTokens: 300_000 }), table)).toBe(1.2);
   });
 });
 
