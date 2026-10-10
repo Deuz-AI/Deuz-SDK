@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { generateText } from '../src/generate';
 import { createExecutionContext } from '../src/execution-policy';
+import { createInMemoryBudgetStore } from '../src/budget-store';
 import { createPriceProvider, priceUsage } from '../src/pricing';
 import { createAnthropic } from '../src/anthropic';
 import { createOpenAI, createOpenAIResponses } from '../src/openai';
@@ -15,6 +16,7 @@ import { wireOutputCap } from '../src/internal/output-cap';
 import { sseEvents, sseResponse } from '../src/testing';
 import type { Adapter } from '../src/adapters/types';
 import type { CommonCallOptions } from '../src/types/config';
+import type { BudgetLimits } from '../src/types/execution';
 import type { LanguageModel, ModelSurface, Provider } from '../src/types/model';
 import type { Usage } from '../src/types/usage';
 
@@ -188,6 +190,7 @@ async function reserveOnce(
   surface: ModelSurface,
   options: Pick<CommonCallOptions, 'maxOutputTokens' | 'effort' | 'promptCaching'>,
   prompt = 'hi',
+  modelId?: string,
 ) {
   let body: Body | undefined;
   const fetch = (async (_url: unknown, init?: RequestInit) => {
@@ -196,7 +199,7 @@ async function reserveOnce(
     return new Response(JSON.stringify({ error: { message: 'stop here' } }), { status: 400 });
   }) as typeof globalThis.fetch;
   const execution = createExecutionContext({ budget: { usd: 1_000 } });
-  const model = modelFor(surface, fetch);
+  const model = modelFor(surface, fetch, modelId);
   await expect(
     generateText({
       model,
@@ -212,24 +215,30 @@ async function reserveOnce(
 }
 
 describe('native reservation covers the wire cap (F12)', () => {
-  const cases: [ModelSurface, Pick<CommonCallOptions, 'maxOutputTokens' | 'effort'>][] = [
+  const cases: [ModelSurface, Pick<CommonCallOptions, 'maxOutputTokens' | 'effort'>, string?][] = [
     ['anthropic', { effort: 'max', maxOutputTokens: 1_000 }],
     ['anthropic', {}],
     ['responses', {}],
     ['responses', { effort: 'high', maxOutputTokens: 2_000 }],
     ['chat_completions', {}],
     ['native', { effort: 'high' }],
+    // Rows whose output limit is a placeholder: priced, so a USD bound applies.
+    ['responses', {}, 'gpt-6-astra'],
+    ['responses', {}, 'gpt-5.6-sol'],
+    ['responses', {}, 'gpt-5-pro'],
+    ['chat_completions', {}, 'grok-4'],
+    ['native', {}, 'gemini-3.8-flash'],
   ];
 
   it.each(cases)(
-    '%s %j reserves at least the price of the wire output cap',
-    async (surface, options) => {
-      const { model, wire, reservation } = await reserveOnce(surface, options);
+    '%s %j %s reserves at least the price of the wire output cap',
+    async (surface, options, modelId) => {
+      const { model, wire, reservation } = await reserveOnce(surface, options, 'hi', modelId);
       expect(typeof wire).toBe('number');
       expect(reservation.tokens).toBeGreaterThanOrEqual(wire as number);
-      expect(reservation.usd).toBeGreaterThanOrEqual(
-        priceUsage(model.modelId, outputOnly(wire as number))!,
-      );
+      const price = priceUsage(model.modelId, outputOnly(wire as number));
+      if (modelId === undefined || price !== undefined)
+        expect(reservation.usd).toBeGreaterThanOrEqual(price!);
     },
   );
 
@@ -313,5 +322,166 @@ describe('native reservation covers the wire cap (F12)', () => {
     for (const outcome of one.outcomes.filter((o) => o.status === 'rejected'))
       expect((outcome as PromiseRejectedResult).reason).toMatchObject({ code: 'budget_exceeded' });
     expect(one.spent).toBeLessThanOrEqual(7);
+  });
+});
+
+describe('a bounded native call to a row with no documented output limit (F12)', () => {
+  /** A Responses turn that bills `output` output tokens, optionally calling `noop` first. */
+  function responsesTurn(output: number, callTool = false): Response {
+    return sseResponse([
+      sseEvents([
+        ...(callTool
+          ? [
+              {
+                data: {
+                  type: 'response.output_item.added',
+                  item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'noop' },
+                },
+              },
+              {
+                data: {
+                  type: 'response.function_call_arguments.delta',
+                  item_id: 'fc_1',
+                  delta: '{}',
+                },
+              },
+            ]
+          : [{ data: { type: 'response.output_text.delta', delta: 'ok' } }]),
+        {
+          data: {
+            type: 'response.completed',
+            response: {
+              usage: {
+                input_tokens: 2,
+                output_tokens: output,
+                output_tokens_details: { reasoning_tokens: 0 },
+                total_tokens: 2 + output,
+              },
+            },
+          },
+        },
+      ]),
+    ]);
+  }
+
+  /**
+   * A provider that bills up to the output cap the request carries, and up to
+   * its own default (30,000 output tokens here) when the request carries none.
+   */
+  function billing(modelId: string, toolTurns = 0) {
+    const caps: unknown[] = [];
+    const model = createOpenAIResponses({
+      apiKey: 'k',
+      fetch: (async (_url: unknown, init?: RequestInit) => {
+        const cap = (JSON.parse(init!.body as string) as Body).max_output_tokens;
+        caps.push(cap);
+        const output = Math.min(typeof cap === 'number' ? cap : 30_000, 30_000);
+        return responsesTurn(output, caps.length <= toolTurns);
+      }) as typeof fetch,
+    })(modelId);
+    return { model, caps };
+  }
+
+  async function parallel(modelId: string, budget: BudgetLimits) {
+    const { model, caps } = billing(modelId);
+    const execution = createExecutionContext({ budget });
+    await Promise.allSettled(
+      [1, 2, 3, 4].map(() =>
+        generateText({
+          model,
+          prompt: 'hi',
+          execution,
+          deps: { priceProvider: createPriceProvider() },
+        }),
+      ),
+    );
+    return { caps, spent: execution.ledger.totals().spent };
+  }
+
+  it.each(['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5-pro'])(
+    '%s: parallel calls cannot spend past a USD budget',
+    async (modelId) => {
+      // Before: no cap on the wire against a 4,096-token reservation, so 30,000
+      // billed tokens per call spent several times the budget.
+      const { caps, spent } = await parallel(modelId, { usd: 1 });
+      expect(caps.length).toBeGreaterThan(0);
+      expect(caps.every((cap) => cap === 4_096)).toBe(true);
+      expect(spent.usd).toBeLessThanOrEqual(1);
+    },
+  );
+
+  it.each(['gpt-6-luna', 'gpt-6-astra'])(
+    '%s: parallel calls cannot spend past a token budget',
+    async (modelId) => {
+      // gpt-6-luna has no price: only the token bound applies to it.
+      const { caps, spent } = await parallel(modelId, { tokens: 10_000 });
+      expect(caps.length).toBeGreaterThan(0);
+      expect(caps.every((cap) => cap === 4_096)).toBe(true);
+      expect(spent.tokens).toBeLessThanOrEqual(10_000);
+    },
+  );
+
+  it('a persistent USD scope is not exceeded by one gpt-6-astra call', async () => {
+    const { model, caps } = billing('gpt-6-astra');
+    const store = createInMemoryBudgetStore();
+    const execution = createExecutionContext({
+      admission: { store, scopes: [{ key: 'tenant:1', limits: { usd: 1 } }] },
+    });
+    await generateText({
+      model,
+      prompt: 'hi',
+      execution,
+      deps: { priceProvider: createPriceProvider() },
+    });
+    expect(caps).toEqual([4_096]);
+    expect((await store.usage('tenant:1')).usd).toBeLessThanOrEqual(1);
+  });
+
+  it('reports the added cap once per run and reserves exactly that', async () => {
+    const { model, caps } = billing('gpt-6-astra', 1);
+    const execution = createExecutionContext({ budget: { usd: 5 } });
+    const result = await generateText({
+      model,
+      prompt: 'hi',
+      tools: { noop: { parameters: { type: 'object', properties: {} }, execute: () => 'ok' } },
+      maxSteps: 3,
+      execution,
+      deps: { priceProvider: createPriceProvider() },
+    });
+    expect(caps).toEqual([4_096, 4_096]);
+    expect(result.warnings?.filter((w) => w.setting === 'maxOutputTokens')).toEqual([
+      {
+        type: 'clamped-setting',
+        setting: 'maxOutputTokens',
+        message: expect.stringMatching(/4096.*pass maxOutputTokens/),
+      },
+    ]);
+    for (const { reservation } of execution.ledger.snapshot().reservations)
+      expect(reservation.tokens).toBeLessThan(4_096 + 100);
+  });
+
+  it('leaves the cap off without a bound, and keeps an explicit cap', async () => {
+    const unbounded = billing('gpt-6-astra');
+    const free = await generateText({
+      model: unbounded.model,
+      prompt: 'hi',
+      tools: { noop: { parameters: { type: 'object', properties: {} }, execute: () => 'ok' } },
+      execution: createExecutionContext(),
+      deps: { priceProvider: createPriceProvider() },
+    });
+    expect(unbounded.caps).toEqual([undefined]);
+    expect(free.warnings?.some((w) => w.setting === 'maxOutputTokens') ?? false).toBe(false);
+
+    const explicit = billing('gpt-6-astra');
+    const set = await generateText({
+      model: explicit.model,
+      prompt: 'hi',
+      tools: { noop: { parameters: { type: 'object', properties: {} }, execute: () => 'ok' } },
+      maxOutputTokens: 1_000,
+      execution: createExecutionContext({ budget: { usd: 5 } }),
+      deps: { priceProvider: createPriceProvider() },
+    });
+    expect(explicit.caps).toEqual([1_000]);
+    expect(set.warnings?.some((w) => w.setting === 'maxOutputTokens') ?? false).toBe(false);
   });
 });

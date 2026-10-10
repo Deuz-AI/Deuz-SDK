@@ -78,6 +78,17 @@ thinking budget plus 1 024 while extended thinking runs, even over an explicit
 them. A prompt the call caches with `promptCaching` is priced at the cache-write
 rate.
 
+Some rows document no output limit: a model the registry does not know, and
+models whose limit is not published, such as `gpt-6-astra`, `gpt-5.6` and
+`gpt-5-pro`. OpenAI Chat Completions, OpenAI Responses and Gemini native then
+leave the cap off, and the provider's own default applies. When a token or USD
+bound applies to the call, in the context's budget or in a persistent scope's
+limits, the request sends the row's placeholder, 4 096 tokens, as
+`maxOutputTokens` instead and reserves exactly that, so the reservation still
+bounds what the provider can bill. The run reports it once as a
+`clamped-setting` warning on `maxOutputTokens`; pass `maxOutputTokens` to raise
+the cap. A call with no token or USD bound keeps the cap off.
+
 The ledger therefore admits on estimates; it is not a limit the provider
 enforces. The prompt estimate can be low, and an actual overage is still
 recorded and blocks later admission.

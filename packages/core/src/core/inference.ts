@@ -437,6 +437,8 @@ export function runStream(
           userSignal,
         );
         native.assert();
+        // F12 (2.3): a bounded call may carry an output cap the caller did not set.
+        if (native.warning) addWarning(native.warning);
       }
       const adapter = getAdapter(options.model.surface);
       const startedAt = deps.clock.now();
@@ -448,7 +450,8 @@ export function runStream(
         call,
         messages,
         caps,
-        options,
+        // Native admission's options: the output cap it reserves rides the wire.
+        options: native?.options ?? options,
         generateId: deps.generateId,
         object: internal.object,
         tools:

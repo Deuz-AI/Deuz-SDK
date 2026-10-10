@@ -6,6 +6,7 @@ import { createTokenEstimator } from './estimate-tokens';
 import { wireOutputCap } from './output-cap';
 import { unpricedModelWarning } from './unpriced';
 import type { CommonCallOptions } from '../types/config';
+import type { CallWarning } from '../types/methods';
 import type { PriceProvider, ResolvedDependencies } from '../types/deps';
 import type { BudgetLedger, NativeExecutionContext } from '../types/execution';
 import type { Usage } from '../types/usage';
@@ -16,21 +17,35 @@ const NO_PRICES: PriceProvider = { priceUsage: () => undefined };
 
 /** Models reported per ledger: one `unpriced-model` warning per run and model. */
 const reported = new WeakMap<BudgetLedger, Set<string>>();
-/** Whether a ledger's persistent scopes bound USD; fixed when the ledger is created. */
-const persistentUsd = new WeakMap<BudgetLedger, boolean>();
+/** What a ledger's persistent scopes bound; fixed when the ledger is created. */
+const persistentBounds = new WeakMap<BudgetLedger, { usd: boolean; tokens: boolean }>();
+
+function persistent(ledger: BudgetLedger): { usd: boolean; tokens: boolean } {
+  let bounds = persistentBounds.get(ledger);
+  if (!bounds) {
+    const scopes = ledger.snapshot().admission ?? [];
+    bounds = {
+      usd: scopes.some((scope) => scope.limits.usd !== undefined),
+      tokens: scopes.some((scope) => scope.limits.tokens !== undefined),
+    };
+    persistentBounds.set(ledger, bounds);
+  }
+  return bounds;
+}
 
 /** True when a USD bound applies to calls made under this context. */
 function boundsUsd(execution: NativeExecutionContext): boolean {
   // The context budget already intersects every ancestor's.
-  if (execution.budget.usd !== undefined) return true;
-  let bounded = persistentUsd.get(execution.ledger);
-  if (bounded === undefined) {
-    bounded =
-      execution.ledger.snapshot().admission?.some((scope) => scope.limits.usd !== undefined) ??
-      false;
-    persistentUsd.set(execution.ledger, bounded);
-  }
-  return bounded;
+  return execution.budget.usd !== undefined || persistent(execution.ledger).usd;
+}
+
+/** True when a token or USD bound applies to calls made under this context. */
+function bounded(execution: NativeExecutionContext): boolean {
+  return (
+    boundsUsd(execution) ||
+    execution.budget.tokens !== undefined ||
+    persistent(execution.ledger).tokens
+  );
 }
 
 /** Loaded only for callers opting into mandatory execution accounting. */
@@ -42,6 +57,16 @@ export function createNativeRequest(
   userSignal?: AbortSignal,
 ) {
   const execution = options.execution!;
+  const caps = getCapabilities(options.model);
+  // F12 (2.3): a row with no documented output limit sends no cap on the OpenAI
+  // and Gemini wires (F08). Under a token or USD bound the call sends the row's
+  // placeholder instead, so the reservation below bounds what it can bill.
+  const capped =
+    wireOutputCap(options.model.surface, caps, options, modelId) === undefined &&
+    bounded(execution);
+  const callOptions: CommonCallOptions = capped
+    ? { ...options, maxOutputTokens: caps.maxOutput }
+    : options;
   let reservationId: string | undefined;
   const assert = () => assertExecutionPolicy(execution, { modelId, now: deps.clock.now() });
   /** Report that the USD budget cannot count this model, once per ledger. */
@@ -55,8 +80,22 @@ export function createNativeRequest(
     if (internal.warnings) internal.warnings.add(warning);
     else deps.logger.warn(warning.message, { warning: warning.type, setting: warning.setting });
   };
+  /** The cap this request adds, reported once per run. */
+  const warning: CallWarning | undefined = capped
+    ? {
+        type: 'clamped-setting',
+        setting: 'maxOutputTokens',
+        message:
+          `maxOutputTokens ${caps.maxOutput} was sent: ${modelId} documents no output limit, ` +
+          'and a call under an execution budget sends the cap its reservation holds; ' +
+          'pass maxOutputTokens to raise it.',
+      }
+    : undefined;
   return {
     assert,
+    /** The options the request is built from: the call's own, or with the cap above. */
+    options: callOptions,
+    warning,
     async reserve(): Promise<void> {
       assert();
       if (userSignal?.aborted) throw userSignal.reason ?? new DOMException('Aborted', 'AbortError');
@@ -66,13 +105,11 @@ export function createNativeRequest(
       // F12 (2.3): reserve the output cap the wire actually sends (Anthropic's
       // thinking raise included), not a fixed 4,096 — the provider may bill up
       // to it, reasoning included. A prompt cached by this call is billed as a
-      // cache write, the dearest input rate. A model the registry does not know
-      // sends no cap on the OpenAI and Gemini wires; its reservation is then the
-      // row's placeholder, an estimate rather than a bound (`maxOutputTokens`
-      // makes it one).
-      const caps = getCapabilities(options.model);
+      // cache write, the dearest input rate. Only a call with no token or USD
+      // bound can leave the cap off (see `capped`); nothing is admitted against
+      // its reservation, so the row's placeholder is an estimate there.
       const outputTokens =
-        wireOutputCap(options.model.surface, caps, options, modelId) ?? caps.maxOutput;
+        wireOutputCap(options.model.surface, caps, callOptions, modelId) ?? caps.maxOutput;
       const estimatedUsage: Usage = {
         ...EMPTY_USAGE,
         ...(options.promptCaching === 'auto-1h'
