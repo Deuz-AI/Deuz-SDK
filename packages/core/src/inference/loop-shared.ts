@@ -1833,6 +1833,159 @@ export function pendingClientCalls(
   return toolCalls.filter((c) => isClientTool(tools, c.toolName) && !blocked?.has(c.toolCallId));
 }
 
+// --- The dispatch contract (2.3, roadmap 23.2) -------------------------------
+//
+// Every tool call of a run takes ONE path, in this order: the finish-reason gate
+// (`run-step.ts`: a refused or cut-off turn dispatches nothing), the policy (the
+// run's `onToolCall` guardrails), the approval gate, then `executeTools`
+// (admission, the native effect receipt, execution, `onToolResult`) and the
+// step checkpoint. `planToolDispatch` is everything BEFORE `executeTools`, and it
+// is the only implementation of it: the buffered loop's step, the streaming
+// loop's step and the resume settle (`settlePendingApprovals`) all call it, so a
+// rule added here holds for every family that reaches a loop.
+
+/** What a batch of tool calls is cleared to do, decided before anything executes. */
+export interface ToolDispatchPlan {
+  /**
+   * The batch as REPORTED (`StepResult.toolCalls`): the model's own order,
+   * transfers included, with a guardrail's rewrite applied.
+   */
+  calls: ToolCall[];
+  /** What `executeTools` receives: every call but the transfers. Denied calls ride along. */
+  execCalls: ToolCall[];
+  /** Every "this call does not run" verdict: guardrail blocks and approval denials. */
+  denied: DenialMap;
+  /** The verdicts of the `onToolCall` guardrails. */
+  guardrails: GuardrailPart[];
+  /** Ids of the calls the approval gate held. */
+  gated: ReadonlySet<string>;
+  /** A live step's calls waiting for a client verdict. Non-empty: the step suspends. */
+  pendingApproval: ToolCall[];
+  /** A live step's client tools waiting on the caller. Non-empty: the step suspends. */
+  clientCalls: ToolCall[];
+  /** The transfer verdict, when the batch held a transfer. */
+  handoff?: HandoffDecision;
+}
+
+/** One batch for {@link planToolDispatch}. */
+export interface ToolDispatchInput {
+  /** The calls, in the model's emission order. */
+  calls: ToolCall[];
+  /** The effective tool set the calls resolve against. */
+  tools: ToolSet;
+  options: CommonCallOptions;
+  messages: Message[];
+  /** The step the calls belong to; absent on the settle of a resume leg. */
+  stepIndex?: number;
+  /**
+   * The run's transfer catalog and its active agent (handoff, 2.0). A live step
+   * reads transfers off `tools`; a settle also off the catalog, because the agent
+   * that issued a pending call may no longer be driving.
+   */
+  handoff?: { tools: ToolSet; active?: ActiveAgentState };
+  /**
+   * The resume leg's verdicts. Present: SETTLE mode (verdicts decide, a gated
+   * call without one is denied, nothing suspends). Absent: a live step, whose
+   * gated calls go to `approveToolCall` or suspend the run.
+   */
+  verdicts?: readonly ToolApprovalResponse[];
+  observe?: ExecuteExtras['observe'];
+}
+
+/**
+ * Decide what a batch of tool calls may do, in the contract's order: split off
+ * the transfers (decided, never executed), run the `onToolCall` guardrails, then
+ * the approval gate. Nothing executes here; the caller hands
+ * {@link ToolDispatchPlan.execCalls} and {@link ToolDispatchPlan.denied} to
+ * `executeTools`, or suspends when the plan holds pending approvals or client
+ * calls.
+ */
+export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDispatchPlan> {
+  const { calls: issued, tools, options, messages, stepIndex, verdicts, observe } = input;
+  const settle = verdicts !== undefined;
+  const catalog = input.handoff?.tools;
+  // Transfers are decided by looking at the call, before the guardrails and the
+  // approval gate. A settle also reads the run's whole transfer catalog: an
+  // agent never carries a transfer to itself, so the tool that produced a
+  // pending id may be missing from the set of the agent driving now.
+  const { handoffCalls, normalCalls } =
+    catalog && hasHandoffTools(catalog)
+      ? splitHandoffCalls(issued, settle ? { ...tools, ...catalog } : tools)
+      : { handoffCalls: NO_HANDOFF_CALLS, normalCalls: issued };
+
+  // Policy: the run's execution-side defense. It runs BEFORE the approval gate,
+  // so a rewrite reaches `needsApproval` and the request a human sees.
+  const guarded = await applyToolCallGuardrails(options, normalCalls, messages, stepIndex);
+  const execCalls = guarded.calls;
+  const calls =
+    handoffCalls.length === 0
+      ? execCalls
+      : (() => {
+          const rewritten = new Map(execCalls.map((c) => [c.toolCallId, c]));
+          return issued.map((c) => rewritten.get(c.toolCallId) ?? c);
+        })();
+  const handoff =
+    handoffCalls.length > 0 ? decideHandoff(handoffCalls, input.handoff?.active) : undefined;
+
+  let denied: DenialMap;
+  let gated: Set<string>;
+  let pendingApproval: ToolCall[] = [];
+  let clientCalls: ToolCall[] = [];
+  if (settle) {
+    ({ denied, gated } = await settleVerdicts(
+      execCalls,
+      verdicts,
+      tools,
+      options,
+      messages,
+      observe,
+    ));
+  } else {
+    // A blocked call never reaches the approval gate: it already has a verdict,
+    // and gating it would suspend the run on a call that will not run anyway.
+    const candidates =
+      guarded.blocked.size > 0
+        ? execCalls.filter((c) => !guarded.blocked.has(c.toolCallId))
+        : execCalls;
+    // Server mode denies inline; without `approveToolCall` the gated calls
+    // break the loop like client tools (client mode).
+    gated = await findApprovalNeeded(candidates, tools, options, messages);
+    denied = options.approveToolCall
+      ? await resolveServerApprovals(gated, candidates, options, messages)
+      : new Map<string, Denial>();
+    pendingApproval = options.approveToolCall
+      ? []
+      : candidates.filter((c) => gated.has(c.toolCallId));
+    if (observe && gated.size > 0) {
+      const gatedCalls = calls.filter((c) => gated.has(c.toolCallId));
+      observeApprovalRequests(
+        observe,
+        options,
+        gatedCalls,
+        options.approveToolCall ? 'server' : 'client',
+      );
+      if (options.approveToolCall) observeServerResolutions(observe, options, gatedCalls, denied);
+    }
+    // Client tools a guardrail BLOCKED are not pending on anyone (see
+    // pendingClientCalls): they fall through to `executeTools` instead.
+    clientCalls = pendingClientCalls(calls, tools, guarded.blocked);
+  }
+  // LAST, so a guardrail block outranks every other verdict: an approved call a
+  // rule refuses must report the rule, not the approval.
+  for (const [id, denial] of guarded.blocked) denied.set(id, denial);
+
+  return {
+    calls,
+    execCalls,
+    denied,
+    guardrails: guarded.parts,
+    gated,
+    pendingApproval,
+    clientCalls,
+    ...(handoff ? { handoff } : {}),
+  };
+}
+
 /**
  * Settle the trailing assistant turn's un-answered tool_use ids on a resume
  * call (`approvalResponses` provided). Verdicts: approved → execute; denied →
@@ -1917,23 +2070,58 @@ export async function settlePendingApprovals(
     toolName: p.name,
     args: p.input,
   }));
-  // Transfers are resolved by DECISION, never by executing them. The lookup
-  // spans the run's whole transfer catalog, not just the active agent's set: an
-  // agent never carries a transfer to itself, so the tool that produced the
-  // pending id may well be missing from `tools` on this leg.
-  const catalog = handoff?.tools;
-  const { handoffCalls, normalCalls } =
-    catalog && hasHandoffTools(catalog)
-      ? splitHandoffCalls(issued, { ...tools, ...catalog })
-      : { handoffCalls: NO_HANDOFF_CALLS, normalCalls: issued };
-  const decision =
-    handoffCalls.length > 0 ? decideHandoff(handoffCalls, handoff?.active) : undefined;
+  // The same plan a live step makes (transfers by decision, the re-derived
+  // `onToolCall` guardrails, then the gate), here with the leg's verdicts.
+  const plan = await planToolDispatch({
+    calls: issued,
+    tools,
+    options,
+    messages,
+    ...(handoff ? { handoff } : {}),
+    verdicts: responses,
+    ...(extras?.observe ? { observe: extras.observe } : {}),
+  });
 
-  // The run's own execution-side defense, re-derived on this leg (see the note
-  // above). It runs BEFORE the approval gate so a rewrite reaches
-  // `needsApproval` exactly as it did on the leg that suspended.
-  const guarded = await applyToolCallGuardrails(options, normalCalls, messages);
-  const calls = guarded.calls;
+  const deniedIds = new Set(plan.denied.keys());
+  lifecycle?.beforeExecute?.(plan.execCalls, deniedIds);
+  const executed = await executeTools(
+    plan.execCalls,
+    tools,
+    options,
+    messages,
+    plan.denied,
+    extras,
+  );
+  // Back into the order the MODEL issued them, transfers included — the turn
+  // has to read the way it was written.
+  const results = plan.handoff
+    ? mergeResultsInCallOrder(issued, executed, plan.handoff.results)
+    : executed;
+  const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
+  return {
+    messages: [...messages, toolMessage],
+    results,
+    deniedIds,
+    denied: plan.denied,
+    guardrails: plan.guardrails,
+    ...(plan.handoff ? { handoff: plan.handoff } : {}),
+  };
+}
+
+/**
+ * The settle half of the approval gate: turn a resume leg's verdicts into
+ * denials. Approved calls run; denied ones get the verdict's reason; a gated call
+ * with no verdict and a client tool with no result are denied (safe side).
+ * Signed approvals must echo a token that verifies and is bound to this call.
+ */
+async function settleVerdicts(
+  calls: ToolCall[],
+  responses: readonly ToolApprovalResponse[],
+  tools: ToolSet,
+  options: CommonCallOptions,
+  messages: Message[],
+  ob: ExecuteExtras['observe'] | undefined,
+): Promise<{ denied: DenialMap; gated: Set<string> }> {
   const signer = options.approvalSigner;
   const expectedRunId = options.session?.runId;
   const payloads = new Map<ToolApprovalResponse, SignedApprovalPayload | null>();
@@ -2033,14 +2221,10 @@ export async function settlePendingApprovals(
       denied.set(c.toolCallId, { cause: 'no-response', reason: 'No approval response.' });
     }
   }
-  // LAST, so a guardrail block outranks every other verdict: an approved call a
-  // rule refuses must report the rule, not the approval.
-  for (const [id, denial] of guarded.blocked) denied.set(id, denial);
 
   // Observation (1.6): resume-leg approval resolutions. Explicit verdicts
   // resolve as 'client-response'; verdict-less gated calls as 'default-deny'.
   // Client tools without a result are not approvals (tool.denied covers them).
-  const ob = extras?.observe;
   if (ob) {
     for (const c of calls) {
       const verdict = byId.get(c.toolCallId);
@@ -2060,22 +2244,7 @@ export async function settlePendingApprovals(
       });
     }
   }
-
-  const deniedIds = new Set(denied.keys());
-  lifecycle?.beforeExecute?.(calls, deniedIds);
-  const executed = await executeTools(calls, tools, options, messages, denied, extras);
-  // Back into the order the MODEL issued them, transfers included — the turn
-  // has to read the way it was written.
-  const results = decision ? mergeResultsInCallOrder(issued, executed, decision.results) : executed;
-  const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
-  return {
-    messages: [...messages, toolMessage],
-    results,
-    deniedIds,
-    denied,
-    guardrails: guarded.parts,
-    ...(decision ? { handoff: decision } : {}),
-  };
+  return { denied, gated };
 }
 
 /** Signed JSON values compare structurally, independent of object key order. */

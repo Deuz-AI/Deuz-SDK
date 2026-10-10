@@ -27,14 +27,12 @@ import {
   executeTools,
   toToolResultPart,
   toStepResult,
-  pendingClientCalls,
   bumpErrorGuard,
   normalizeStop,
   needsCost,
   shouldStop,
   sumUsage,
-  findApprovalNeeded,
-  resolveServerApprovals,
+  planToolDispatch,
   settlePendingApprovals,
   setupDurable,
   saveCheckpoint,
@@ -51,8 +49,6 @@ import {
   endLoopObserve,
   emitStepStarted,
   emitStepCompleted,
-  observeApprovalRequests,
-  observeServerResolutions,
   evaluateVerifyStep,
   evaluateDoneWhen,
   falseFinishMessage,
@@ -61,7 +57,6 @@ import {
   verifyFeedbackMessage,
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
-  applyToolCallGuardrails,
   logGuardrailParts,
   rewriteAssistantText,
   isEmptyTurn,
@@ -69,8 +64,6 @@ import {
   GUARDRAIL_OUTPUT_STOPPED_BY,
   collectHandoffTools,
   hasHandoffTools,
-  splitHandoffCalls,
-  decideHandoff,
   mergeResultsInCallOrder,
   applyHandoffSwap,
   resumeHandoffState,
@@ -79,7 +72,6 @@ import {
   setModelGate,
   type ActiveAgentState,
   type CompactionTrigger,
-  type Denial,
   type ExecuteExtras,
   type GuardrailLogEntry,
   type HandoffLogEntry,
@@ -799,48 +791,37 @@ export async function runToolLoop(
       appended.push(step.assistantMessage);
       chatMessages = [...chatMessages, step.assistantMessage];
 
-      // Handoff (2.0): the DETERMINISTIC interception — before guardrails, the
-      // approval gate and `executeTools`. A transfer is decided by looking at
-      // the call, never by an exception thrown out of an `execute`. Everything
-      // ELSE in the batch runs completely normally: a model that calls `search`
-      // and `transfer_to_billing` in one step gets both honored.
-      const { handoffCalls, normalCalls } = hasHandoffTools(handoffTools)
-        ? splitHandoffCalls(toolCalls, tools)
-        : { handoffCalls: [], normalCalls: toolCalls };
-
-      // Tool-call guardrails (2.0): evaluated IMMEDIATELY before the approval
-      // gate, so a rewrite reaches the `needsApproval` predicate, the approval
-      // request a human sees, and `execute` — while the assistant turn appended
-      // just above keeps the arguments the MODEL issued.
-      const guardedCalls = await applyToolCallGuardrails(options, normalCalls, messages, stepIndex);
-      logGuardrailParts(guardrailLog, guardedCalls.parts);
-      /** What actually reaches the gate + `executeTools` (transfers excluded). */
-      const execCalls = guardedCalls.calls;
+      // The dispatch contract (2.3): ONE plan for the batch — transfers decided
+      // by looking at the call (never by an exception out of an `execute`), the
+      // `onToolCall` guardrails, then the approval gate — shared with the
+      // streaming loop and the resume settle. Everything ELSE in the batch runs
+      // completely normally: a model that calls `search` and
+      // `transfer_to_billing` in one step gets both honored.
+      const plan = await planToolDispatch({
+        calls: toolCalls,
+        tools,
+        options,
+        messages,
+        stepIndex,
+        ...(hasHandoffTools(handoffTools)
+          ? { handoff: { tools: handoffTools, ...(active ? { active } : {}) } }
+          : {}),
+        ...(observeCtx ? { observe: observeCtx } : {}),
+      });
+      logGuardrailParts(guardrailLog, plan.guardrails);
+      /** What actually reaches `executeTools` (transfers excluded). */
+      const execCalls = plan.execCalls;
       // The REPORTED calls stay in the model's own order and include the
       // transfers, so `StepResult.toolCalls` describes the step the model took —
-      // with any guardrail rewrite applied, exactly as before.
-      toolCalls =
-        handoffCalls.length === 0
-          ? execCalls
-          : (() => {
-              const rewritten = new Map(execCalls.map((c) => [c.toolCallId, c]));
-              return toolCalls.map((c) => rewritten.get(c.toolCallId) ?? c);
-            })();
-      // A blocked call never reaches the approval gate: it already has a
-      // verdict, and gating it would suspend the run on a call that is not
-      // going to run either way.
-      const gateCandidates =
-        guardedCalls.blocked.size > 0
-          ? execCalls.filter((c) => !guardedCalls.blocked.has(c.toolCallId))
-          : execCalls;
+      // with any guardrail rewrite applied.
+      toolCalls = plan.calls;
 
-      // The transfer verdict is computed HERE — before the approval gate and
-      // before `executeTools`, both of which can leave the step early. A break
-      // that left a transfer's `tool_use` id unanswered would hand the provider
-      // an unanswerable turn on the next request AND silently drop the routing
+      // The transfer verdict is part of the plan — made before the approval
+      // gate and `executeTools` can leave the step early. A break that left a
+      // transfer's `tool_use` id unanswered would hand the provider an
+      // unanswerable turn on the next request AND silently drop the routing
       // decision, so the decision is made once and committed on every exit.
-      const handoffDecision =
-        handoffCalls.length > 0 ? decideHandoff(handoffCalls, active) : undefined;
+      const handoffDecision = plan.handoff;
       /**
        * Apply the transfer on a path that executes NOTHING else. Returns the
        * `{role:'tool'}` turn that answers the transfer ids so the caller can
@@ -875,34 +856,11 @@ export async function runToolLoop(
         return message;
       };
 
-      // Approval gate: server mode denies inline; without approveToolCall the
-      // gated calls break the loop like client tools (client mode).
-      const gated = await findApprovalNeeded(gateCandidates, tools, options, messages);
-      const denied = options.approveToolCall
-        ? await resolveServerApprovals(gated, gateCandidates, options, messages)
-        : new Map<string, Denial>();
-      // Guardrail blocks JOIN the approval flow's denial map — one machinery for
-      // every "this call does not run" verdict.
-      for (const [id, denial] of guardedCalls.blocked) denied.set(id, denial);
-      const pendingApproval = options.approveToolCall
-        ? []
-        : gateCandidates.filter((c) => gated.has(c.toolCallId));
-      if (observeCtx && gated.size > 0) {
-        const gatedCalls = toolCalls.filter((c) => gated.has(c.toolCallId));
-        observeApprovalRequests(
-          observeCtx,
-          options,
-          gatedCalls,
-          options.approveToolCall ? 'server' : 'client',
-        );
-        if (options.approveToolCall) {
-          observeServerResolutions(observeCtx, options, gatedCalls, denied);
-        }
-      }
-
-      // Client tools a guardrail BLOCKED are not pending on anyone (see
-      // pendingClientCalls) — they fall through to `executeTools` instead.
-      const clientCalls = pendingClientCalls(toolCalls, tools, guardedCalls.blocked);
+      // Guardrail blocks and approval denials share ONE denial map — one
+      // machinery for every "this call does not run" verdict.
+      const denied = plan.denied;
+      const pendingApproval = plan.pendingApproval;
+      const clientCalls = plan.clientCalls;
 
       // Pending approvals and client tools (no execute) can't be auto-continued —
       // ONE break, executing nothing from the batch; the resume settles the rest.
@@ -1075,8 +1033,9 @@ export async function runToolLoop(
       // guard. A refused HANDOFF (budget spent, or a sibling transfer in the
       // same batch) is the same kind of verdict, so it is excluded too: the
       // model is being told to carry on, not failing at anything.
-      const handoffIds =
-        handoffCalls.length > 0 ? new Set(handoffCalls.map((h) => h.call.toolCallId)) : undefined;
+      const handoffIds = handoffDecision
+        ? new Set(handoffDecision.results.map((r) => r.toolCallId))
+        : undefined;
       if (
         bumpErrorGuard(
           errorCounters,
