@@ -266,5 +266,21 @@ export function leaseProviderContracts(
       expect(await provider.prune(now())).toBe(0);
       await expect(provider.prune(Number.NaN)).rejects.toThrow(TypeError);
     });
+
+    it('keeps a held key for a cutoff past the store clock, and still prunes a lapsed one', async () => {
+      const { provider, advance, ttl, now } = await make();
+      if (!provider.prune) throw new Error('This provider cannot prune');
+      await provider.acquire({ key: 'lapsed', owner: 'a', ttlMs: ttl });
+      await advance(ttl * 2);
+      const held = (await provider.acquire({ key: 'held', owner: 'a', ttlMs: ttl * 10 }))!;
+      // A host clock ahead of the database, or a `before` computed with a slip:
+      // the cutoff is later than every expiry, yet the held key is not free.
+      expect(await provider.prune(now() + ttl * 100)).toBe(1);
+      expect(await provider.renew(held, ttl)).toMatchObject({ held: true, lease: { token: 1 } });
+      expect(await provider.acquire({ key: 'held', owner: 'b', ttlMs: ttl })).toBeUndefined();
+      expect(await provider.acquire({ key: 'lapsed', owner: 'b', ttlMs: ttl })).toMatchObject({
+        token: 1,
+      });
+    });
   });
 }

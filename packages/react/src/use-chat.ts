@@ -34,7 +34,9 @@
  * - F07 — a turn read back through `reconnect()` settles exactly like one read
  *   from the POST (`settleTurn`). Its unresolved client calls used to reach
  *   neither `onToolCall` nor `pendingToolCalls`; and a call the replay
- *   re-delivers after this client answered it is not dispatched again.
+ *   re-delivers after this client answered it is not dispatched again. A
+ *   result settles only the call or gate that came before it, so a provider
+ *   that recycles call ids (`tool_0` in every response) keeps a later one open.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
@@ -126,23 +128,95 @@ function sameRequest(a: ToolApprovalRequest, b: ToolApprovalRequest): boolean {
 }
 
 /**
+ * What a resume read saw in ARRIVAL order (2.3), which the reducer's state
+ * cannot tell: it merges the calls that share an id into one entry, and a
+ * provider without call ids gets `tool_0`, `tool_1`, … from core's adapter
+ * afresh in every model response, so one id can name several calls of one
+ * exchange. Kept with the cursor turn (`cursorLedgerRef`), so a turn continued
+ * from the cursor carries it across reads.
+ */
+interface ReplayLedger {
+  /** Indexes into the turn's `approvals` whose call got a result AFTER the request. */
+  readonly answeredApprovals: Set<number>;
+  /** Per invocation key (`invocationKey`): how many finished legs delivered that call. */
+  readonly legs: Map<string, number>;
+  /** Invocation keys of the calls the current, unfinished leg delivered. */
+  readonly openLeg: Set<string>;
+  /** The cursor the turn's first read sent. */
+  readonly cursor: string | undefined;
+  /**
+   * Whether the endpoint resumed AFTER that cursor: the first event id it
+   * delivered is a later one. Unknown until an id arrives, and unknown (no id,
+   * no cursor, ids that are not sequence numbers) counts as no.
+   */
+  afterCursor?: boolean;
+}
+
+const newLedger = (cursor?: string): ReplayLedger => ({
+  answeredApprovals: new Set(),
+  legs: new Map(),
+  openLeg: new Set(),
+  cursor,
+});
+
+/** Note one wire part of a resume read, BEFORE it folds into `turn`. */
+function recordPart(ledger: ReplayLedger, turn: AssistantTurnState, part: DeuzUIPart): void {
+  switch (part.type) {
+    case 'tool-result':
+      // A result settles the requests that came before it, never a later one
+      // that reuses its call id.
+      turn.approvals.forEach((request, index) => {
+        if (request.toolCallId === part.toolCallId) ledger.answeredApprovals.add(index);
+      });
+      return;
+    case 'tool-call':
+      // Once per leg: a frame the wire repeats is one delivery.
+      ledger.openLeg.add(invocationKey(part.toolCallId, part.toolName, part.input));
+      return;
+    case 'finish':
+      // Every leg ends with one, and a replay sails through leg boundaries.
+      for (const key of ledger.openLeg) ledger.legs.set(key, (ledger.legs.get(key) ?? 0) + 1);
+      ledger.openLeg.clear();
+      return;
+  }
+}
+
+/** How many legs of a replayed turn delivered the call: at least once, as it is in the turn. */
+const deliveries = (ledger: ReplayLedger, key: string): number =>
+  Math.max(1, (ledger.legs.get(key) ?? 0) + (ledger.openLeg.has(key) ? 1 : 0));
+
+/** Whether event id `id` comes after `cursor`; no when either is not a sequence number. */
+function isLaterId(id: string, cursor: string | undefined): boolean {
+  return (
+    cursor !== undefined && /^\d+$/.test(id) && /^\d+$/.test(cursor) && Number(id) > Number(cursor)
+  );
+}
+
+const NO_INDEXES: ReadonlySet<number> = new Set();
+
+/**
  * The approvals a settled turn actually PAUSES on (2.3). `turn.approvals` is
  * the reducer's raw arrival log, so it keeps a request the wire repeated —
- * one question, asked once. On a REPLAY it can also hold a request whose call
- * already has its result: a journal that spans an approval leg and the
- * continuation that settled it folds both into one turn, and an executed call
- * cannot be approved again. A fresh POST leg is never filtered that way: the
- * loop breaks right after emitting its approvals, so a result for the same id
- * in that leg belongs to a different call.
+ * one question, asked once: the latest delivery stands for it. On a REPLAY it
+ * can also hold a request whose call already has its result (`answered`): a
+ * journal that spans an approval leg and the continuation that settled it
+ * folds both into one turn, and an executed call cannot be approved again.
+ * Only a result that arrived after the request settles it: an earlier one
+ * belongs to an earlier call that used the same id. A fresh POST leg settles
+ * none (`answered` is empty): the loop breaks right after emitting its
+ * approvals.
  */
-function openApprovals(turn: AssistantTurnState, replayed: boolean): ToolApprovalRequest[] {
-  const settled = new Set(replayed ? turn.serverResults : []);
+function openApprovals(
+  turn: AssistantTurnState,
+  answered: ReadonlySet<number>,
+): ToolApprovalRequest[] {
   const open: ToolApprovalRequest[] = [];
-  for (const request of turn.approvals) {
-    if (settled.has(request.toolCallId)) continue;
-    if (open.some((seen) => sameRequest(seen, request))) continue;
-    open.push(request);
-  }
+  turn.approvals.forEach((request, index) => {
+    if (answered.has(index)) return;
+    const seen = open.findIndex((entry) => sameRequest(entry, request));
+    if (seen === -1) open.push(request);
+    else open[seen] = request;
+  });
   return open;
 }
 
@@ -178,15 +252,24 @@ const keyOfCall = (call: UIToolCall): string =>
   invocationKey(call.toolCallId, call.toolName, call.input);
 
 /**
- * The client tool invocations the canonical history already ANSWERS within its
- * current exchange (after the last user message): a `tool_use` followed by a
- * `tool_result` for its id (2.3, F07). That result is the only durable
- * evidence this hook has that a client call completed, which is why it — not a
- * set of ids seen so far — decides whether a REPLAYED call may be dispatched:
- * it survives a reload exactly when the app restores `history.canonical`.
+ * How often the canonical history already ANSWERS each client tool invocation
+ * within its current exchange (after the last user message): a `tool_use`
+ * followed by a `tool_result` for its id (2.3, F07). That result is the only
+ * durable evidence this hook has that a client call completed, which is why it
+ * — not a set of ids seen so far — decides whether a REPLAYED call may be
+ * dispatched: it survives a reload exactly when the app restores
+ * `history.canonical`. It is a count, not a set, because a provider without
+ * call ids can ask the identical call (`tool_0`, same input) again in a later
+ * leg, and one answer covers one delivery.
+ *
+ * `behind` holds the messages a read that resumed after its cursor cannot
+ * deliver again (`behindCursorRef`): their answers do not count.
  */
-function answeredInvocations(history: Message[]): Set<string> {
-  const answered = new Set<string>();
+function answeredInvocations(
+  history: Message[],
+  behind?: ReadonlySet<Message>,
+): Map<string, number> {
+  const answered = new Map<string, number>();
   const results = new Set<string>();
   // Backwards, so a result is seen before the call it answers. A paired id is
   // consumed: an older `tool_use` that recycled it is not answered by it.
@@ -199,8 +282,9 @@ function answeredInvocations(history: Message[]): Set<string> {
     }
     if (message.role !== 'assistant') continue;
     for (const part of message.content) {
-      if (part.type === 'tool_use' && results.delete(part.id)) {
-        answered.add(invocationKey(part.id, part.name, part.input));
+      if (part.type === 'tool_use' && results.delete(part.id) && !behind?.has(message)) {
+        const key = invocationKey(part.id, part.name, part.input);
+        answered.set(key, (answered.get(key) ?? 0) + 1);
       }
     }
   }
@@ -615,6 +699,15 @@ export function useChat(options: UseChatOptions): UseChatResult {
    * replay into it would apply its already-received parts twice.
    */
   const cursorTurnRef = useRef<AssistantTurnState | undefined>(undefined);
+  /** What the reads of `cursorTurnRef`'s turn saw in arrival order (see `ReplayLedger`). */
+  const cursorLedgerRef = useRef<ReplayLedger>(newLedger());
+  /**
+   * The canonical history as it stood when the last replayed turn settled
+   * (2.3). Its read ended on the cursor, so a read that resumes after the
+   * cursor cannot deliver any of these messages' calls again, and their
+   * answers are no evidence about the calls it does deliver.
+   */
+  const behindCursorRef = useRef<readonly Message[]>([]);
   /**
    * Id of the turn's message AS IT SITS in `ui`. The wire's `start` part
    * RENAMES the message (`applyUIPart`), so the id is not stable across a turn
@@ -777,30 +870,36 @@ export function useChat(options: UseChatOptions): UseChatResult {
    * arrived through `reconnect()` reached neither `onToolCall` nor
    * `pendingToolCalls`, and the transcript kept a `tool_use` nobody answered.
    *
-   * `replayed` marks a turn read back from `resume.endpoint`. A replay
-   * re-delivers whatever the journal holds after the cursor — with a lost
-   * cursor, or a journal holding the leg before the one in flight, that
-   * includes calls this client already answered. So for a replayed turn a call
-   * is dispatched only when the canonical history does not already answer it
-   * and it is not parked or running right now: within a mounted hook, at most
-   * once per invocation. A fresh POST leg skips those checks — it cannot
-   * repeat a call, and providers that number their calls (`tool_0`, …)
-   * legitimately recycle an answered id in the next round.
+   * `replay` marks a turn read back from `resume.endpoint`, with what its
+   * reads saw in arrival order. A replay re-delivers whatever the journal
+   * holds after the cursor — with a lost cursor, or a journal holding the leg
+   * before the one in flight, that includes calls this client already
+   * answered. So for a replayed turn a call is dispatched only while the read
+   * delivered it more often than the canonical history answers it (one answer
+   * per leg that asked it), and not while it is parked or running: within a
+   * mounted hook, at most once per invocation. A fresh POST leg skips those
+   * checks — it cannot repeat a call, and providers that number their calls
+   * (`tool_0`, …) legitimately recycle an answered id in the next round.
    *
    * Resolves `true` when client results were appended and the next round must
    * be POSTed, `false` when the chat is done or paused.
    */
   const settleTurn = useCallback(
-    async (settled: AssistantTurnState, replayed: boolean): Promise<boolean> => {
+    async (settled: AssistantTurnState, replay?: { ledger: ReplayLedger }): Promise<boolean> => {
       let turn = settled;
-      // Completion evidence for a replay, read BEFORE this turn joins it.
+      // Completion evidence for a replay, read BEFORE this turn joins it. A
+      // read that resumed after its cursor cannot have delivered the calls of
+      // the turns settled behind that cursor again.
       const history = snapshotRef.current.history.canonical;
+      const behind = replay?.ledger.afterCursor ? new Set(behindCursorRef.current) : undefined;
       // Append the canonical assistant turn (client-tools reconstruction).
       appendCanonical(assistantMessageFromTurn(turn));
       turnRef.current = undefined;
+      // Its read ended on the cursor: this turn and all before it are behind it now.
+      if (replay) behindCursorRef.current = snapshotRef.current.history.canonical;
 
       // Approval pause: verdicts arrive via addToolApprovalResponse.
-      const gate = openApprovals(turn, replayed);
+      const gate = openApprovals(turn, replay?.ledger.answeredApprovals ?? NO_INDEXES);
       if (gate.length > 0) {
         approvalsRef.current = gate;
         verdictsRef.current = [];
@@ -808,16 +907,23 @@ export function useChat(options: UseChatOptions): UseChatResult {
         return false;
       }
 
-      // Client tools: everything the server didn't execute — on a replay,
-      // minus what this client already answered or is answering right now.
-      const serverResults = new Set(turn.serverResults);
-      const answered = replayed ? answeredInvocations(history) : undefined;
+      // Client tools: every call no result followed — on a replay, minus what
+      // this client already answered or is answering right now.
+      const answered = replay ? answeredInvocations(history, behind) : undefined;
       const parked = new Set(clientToolsRef.current.map(keyOfCall));
       const clientPending = (turn.message.toolCalls ?? []).filter((call) => {
-        if (serverResults.has(call.toolCallId)) return false;
-        if (!answered) return true;
+        // The reducer merges the calls that share an id and keeps the latest
+        // one's state, so a result for an earlier call under a recycled id
+        // (`tool_0` again) leaves this one a 'call'. Testing the id against
+        // `turn.serverResults` took the later call for the executed one.
+        if (call.state !== 'call') return false;
+        if (!replay || !answered) return true;
         const key = keyOfCall(call);
-        return !answered.has(key) && !parked.has(key) && !executingRef.current.has(key);
+        return (
+          deliveries(replay.ledger, key) > (answered.get(key) ?? 0) &&
+          !parked.has(key) &&
+          !executingRef.current.has(key)
+        );
       });
       if (clientPending.length === 0) return false;
       if (!options.onToolCall) {
@@ -924,7 +1030,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
           if (turn.error !== undefined) throw new Error(turn.error);
 
           // The settlement `reconnect()` shares (F07): done or paused → stop.
-          if (!(await settleTurn(turn, false))) return;
+          if (!(await settleTurn(turn))) return;
           // loop → next round POSTs the extended history
         }
       } catch (err) {
@@ -1161,9 +1267,13 @@ export function useChat(options: UseChatOptions): UseChatResult {
         let turn = continuing && inFlight ? inFlight : createAssistantTurn(genId());
         turnRef.current = turn;
         cursorTurnRef.current = turn;
+        // A continued turn keeps what its earlier reads saw.
+        const ledger = continuing ? cursorLedgerRef.current : newLedger(cursor);
+        cursorLedgerRef.current = ledger;
         const parts = connectDeuzStream(resume.endpoint, {
           ...(cursor !== undefined ? { lastEventId: cursor } : {}),
           onCursor: (id) => {
+            ledger.afterCursor ??= isLaterId(id, ledger.cursor);
             lastEventIdRef.current = id;
             saveCursor(resume, id);
           },
@@ -1173,6 +1283,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
         });
         for await (const part of parts) {
           folded++;
+          recordPart(ledger, turn, part);
           turn = fold(turn, part);
           turnRef.current = turn;
           cursorTurnRef.current = turn;
@@ -1213,7 +1324,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
         // unresolved client calls reach `onToolCall` or `pendingToolCalls`.
         // Results from `onToolCall` continue the chat with a POST, as the POST
         // path's loop does — unless the user stopped it while they ran.
-        if ((await settleTurn(turn, true)) && !controller.signal.aborted) await run();
+        if ((await settleTurn(turn, { ledger })) && !controller.signal.aborted) await run();
       } catch (err) {
         if (controller.signal.aborted) return; // user abort — not an error
         if (silent) return; // best-effort auto attempt — invisible by contract

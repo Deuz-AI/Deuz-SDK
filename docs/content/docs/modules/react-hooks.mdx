@@ -252,8 +252,8 @@ Since 2.3, a turn read back through `reconnect()` or `resume.auto` settles exact
 
 A replay can re-deliver calls this client already handled. The endpoint replays everything after the hook's cursor, and a journal that spans several legs holds the earlier legs too. So the hook dispatches a replayed call **at most once per mounted hook**:
 
-- **A call whose result is in the replay** ran on the server. It never reaches the client.
-- **A call the canonical history already answers** is not dispatched again. That means a `tool_use` followed by its `tool_result` in the current exchange; key order inside the input does not matter.
+- **A call whose result is in the replay** ran on the server. It never reaches the client. A result answers only the call, or the approval request, that came before it: an OpenAI-compatible server that omits call ids gets `tool_0`, `tool_1`, … in every model response, so a later call or gate under the same id stays open, in a replay and on the POST alike.
+- **A call the canonical history already answers** is not dispatched again. That means a `tool_use` followed by its `tool_result` in the current exchange; key order inside the input does not matter. One answer covers one delivery: when a provider without call ids asks the identical call again in a later leg (`tool_0` with the same input), a replay that delivers it twice against one answer dispatches it. A replay that resumes after a cursor this hook's own reads reached leaves out the answers to the calls behind it. After a reload the hook cannot tell which answers those are, so it counts them all and never runs a call twice.
 - **A call that is parked, or whose `onToolCall` is still running,** is not dispatched a second time.
 - **A `stop()` during the read settles nothing.** A call the read had already delivered does not run, and the next `reconnect()` continues the same turn from the cursor.
 
