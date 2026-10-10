@@ -126,6 +126,13 @@ export interface UsageMeta {
   ttftMs?: number;
   /** Sub-agent path when this usage came from an `agentTool` loop (1.4 additive). */
   agentPath?: string[];
+  /**
+   * `false` when the provider did not report this call's usage (2.3 additive):
+   * it sent no usage, or the stream ended before its usage arrived. `usage`
+   * then holds zeros or only what arrived, and the call's cost is unknown.
+   * Omitted when the usage is the provider's.
+   */
+  usageAvailable?: boolean;
 }
 
 export interface FinishMeta {

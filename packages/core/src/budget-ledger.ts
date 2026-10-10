@@ -525,16 +525,26 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
    * Run a store call; a failure changes nothing locally and admits nothing. A
    * call that closes a hold (settle, release) is repeated, since both are
    * idempotent in the store, and its final failure names the request and what
-   * it still owes, so the hold can be closed later (2.3, F17).
+   * it still owes, so the hold can be closed later (2.3, F17). A conflict is
+   * not a failure: the store already closed that hold, typically a sweep that
+   * got there first, so it keeps its own amounts and the caller's local
+   * transition goes ahead without a retry.
    */
+  function mirror<T>(call: () => Promise<T>): Promise<T>;
+  function mirror(
+    call: () => Promise<void>,
+    closing: { readonly requestId: string; readonly settlement?: BudgetSettlement },
+  ): Promise<void>;
   async function mirror<T>(
     call: () => Promise<T>,
     closing?: { readonly requestId: string; readonly settlement?: BudgetSettlement },
-  ): Promise<T> {
+  ): Promise<T | void> {
     for (let attempt = 1; ; attempt++) {
       try {
         return await call();
       } catch (error) {
+        if (closing && (error as { code?: unknown } | null)?.code === 'reservation_conflict')
+          return;
         if (closing && attempt < CLOSE_ATTEMPTS) continue;
         throw new BudgetLedgerError(
           'admission_failed',

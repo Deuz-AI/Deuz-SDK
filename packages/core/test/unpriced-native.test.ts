@@ -13,6 +13,7 @@ import type { AgentEvent } from '../src/types/agent-run';
 import type { BudgetLimits } from '../src/types/execution';
 import type { LanguageModel } from '../src/types/model';
 import type { Usage } from '../src/types/usage';
+import type { StreamPart } from '../src/types/stream';
 
 /** Prices only `priced-model`, at $1 per million tokens; every other model has no price. */
 const prices = {
@@ -306,5 +307,112 @@ describe('native cost parts follow the price provider (2.3)', () => {
       { phase: 'running', costUsd: 0 },
       { phase: 'finalizing', costUsd: 0 },
     ]);
+  });
+});
+
+describe('the unpriced-model warning reaches a native stream once (decision 4)', () => {
+  const unpricedParts = (parts: StreamPart[]): number =>
+    parts.filter((p) => p.type === 'warning' && p.warning.type === 'unpriced-model').length;
+
+  async function streamedParts(stream: ReturnType<typeof streamAgent>): Promise<StreamPart[]> {
+    const events: AgentEvent<unknown>[] = [];
+    for await (const event of stream.events) events.push(event);
+    expect((await stream.result).status).toBe('completed');
+    return events.flatMap((event) => (event.type === 'part' ? [event.part] : []));
+  }
+
+  it('a run with one model step streams it before the model output', async () => {
+    const model = createMockModel({ responses: [{ text: 'done' }] });
+    const parts = await streamedParts(
+      streamAgent({ model, prompt: 'x', budget: { usd: 1 }, deps: { priceProvider: prices } }),
+    );
+    // Before: recorded during the reservation, after the call's only flush.
+    expect(unpricedParts(parts)).toBe(1);
+    expect(
+      parts.findIndex((p) => p.type === 'warning' && p.warning.type === 'unpriced-model'),
+    ).toBeLessThan(parts.findIndex((p) => p.type === 'text-delta'));
+  });
+
+  it('a structured-only run, whose finalization is the only model call', async () => {
+    const model = createMockModel({ responses: [{ text: '{"answer":"x"}' }] });
+    const parts = await streamedParts(
+      streamAgent({
+        model,
+        prompt: 'x',
+        budget: { usd: 1 },
+        deps: { priceProvider: prices },
+        output: {
+          schema: { type: 'object', properties: { answer: { type: 'string' } } },
+          mode: 'json' as const,
+          validate: (value: unknown) => value as { answer: string },
+        },
+      }),
+    );
+    expect(unpricedParts(parts)).toBe(1);
+  });
+
+  it('a run with two model steps streams it exactly once', async () => {
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'noop', id: 'n1', args: {} }] }, { text: 'done' }],
+    });
+    const parts = await streamedParts(
+      streamAgent({
+        model,
+        prompt: 'x',
+        tools: { noop: { parameters: schema, execute: () => 'ok' } },
+        budget: { usd: 1 },
+        deps: { priceProvider: prices },
+      }),
+    );
+    expect(unpricedParts(parts)).toBe(1);
+  });
+});
+
+describe('one unpriced-model warning per run and model (decision 4)', () => {
+  it('two runAgent runs under one shared context each report it', async () => {
+    const root = createExecutionContext({ budget: { usd: 1 } });
+    const perRun: number[] = [];
+    for (const scopeId of ['run-1', 'run-2']) {
+      const log = logger();
+      const run = await runAgent({
+        model: createMockModel({ responses: [{ text: 'done' }] }),
+        prompt: 'Summarise the ticket.',
+        execution: root.child({ scopeId }),
+        deps: { priceProvider: prices, logger: log },
+      });
+      expect(run.status).toBe('completed');
+      perRun.push(unpricedWarnings(log).length);
+    }
+    // Before: reported once per ledger, so the second run said nothing.
+    expect(perRun).toEqual([1, 1]);
+  });
+
+  it('two generateText loops on one context each carry it on result.warnings', async () => {
+    const execution = createExecutionContext({ budget: { usd: 1 } });
+    const perRun: number[] = [];
+    for (let i = 0; i < 2; i++) {
+      const result = await generateText({
+        model: createMockModel({ responses: [{ text: 'done' }] }),
+        prompt: 'hi',
+        tools: { noop: { parameters: schema, execute: () => 'ok' } },
+        execution,
+        deps: { priceProvider: prices },
+      });
+      perRun.push(result.warnings?.filter((w) => w.type === 'unpriced-model').length ?? 0);
+    }
+    expect(perRun).toEqual([1, 1]);
+  });
+
+  it('single model calls on one context each log it', async () => {
+    const execution = createExecutionContext({ budget: { usd: 1 } });
+    const log = logger();
+    for (let i = 0; i < 2; i++)
+      await generateText({
+        model: createMockModel({ responses: [{ text: 'done' }] }),
+        prompt: 'hi',
+        execution,
+        deps: { priceProvider: prices, logger: log },
+      });
+    expect(unpricedWarnings(log)).toHaveLength(2);
   });
 });

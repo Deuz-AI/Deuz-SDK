@@ -17,7 +17,7 @@ import {
 } from '../internal/observe-runtime';
 import { toObservedError } from '../internal/observe-error';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
-import { createWarningSink } from '../internal/warnings';
+import { createWarningSink, type WarningSink } from '../internal/warnings';
 import type { MemoryMutation } from '../memory';
 import {
   assembleAssistant,
@@ -92,6 +92,8 @@ import {
   applyHandoffSwap,
   resumeHandoffState,
   SubAgentSuspension,
+  modelGate,
+  setModelGate,
   type ActiveAgentState,
   type CompactionTrigger,
   type Denial,
@@ -100,6 +102,7 @@ import {
   type GuardrailLogEntry,
   type HandoffLogEntry,
   type LoopOutcome,
+  type ModelGate,
 } from './loop-shared';
 import type { CompactionEvent } from './compaction';
 import type { UsageCostSnapshot } from '../internal/usage-cost';
@@ -160,6 +163,13 @@ export interface StreamToolLoopInternal {
      */
     refreshed(): Promise<CallWarning[]>;
   };
+  /**
+   * The warning sink of a run this loop is one part of (2.3), in place of the
+   * loop's own: a runner that drives several loops and model calls for one run
+   * passes the same sink to each, so the run reports and streams every warning
+   * once.
+   */
+  warnings?: WarningSink;
 }
 
 export interface StreamToolLoopSnapshot {
@@ -215,8 +225,9 @@ export function runStreamToolLoop(
   // every iteration is reported once. It ALWAYS mirrors to `deps.logger.warn`
   // (internal/warnings.ts), which is why log-only callers see no change — the
   // readout is additive. Unconditional, like `fallback.ts`'s twin: `warnings` is
-  // a declared always-present readout, never an opt-in.
-  const warningSink = createWarningSink(deps.logger);
+  // a declared always-present readout, never an opt-in. A runner that owns
+  // the whole run may hand in its own sink (2.3).
+  const warningSink = internal?.warnings ?? createWarningSink(deps.logger);
   const warningsDeferred = createDeferred<CallWarning[]>();
 
   let started = false;
@@ -386,6 +397,18 @@ export function runStreamToolLoop(
         ...options,
         onUsage: usageCost.wrap(options.onUsage ?? deps.onUsage),
       });
+    // Decision 4 (2.3): every model this run calls, compaction summaries
+    // included, passes its own unknown-price gate and that of the loop whose
+    // `agentTool` started it. Kept on `deps`, so the tools' copy carries it on.
+    const parentGate = modelGate(deps);
+    const admitModel: ModelGate | undefined =
+      usageCost || parentGate
+        ? async (modelId) => {
+            await usageCost?.admit(modelId);
+            await parentGate?.(modelId);
+          }
+        : undefined;
+    setModelGate(deps, admitModel);
     const durable: DurableRunner | undefined =
       options.session && runId !== undefined
         ? {
@@ -553,6 +576,8 @@ export function runStreamToolLoop(
      */
     const failRun = async (error: unknown): Promise<void> => {
       terminalError = error;
+      // What the run collected still reaches the stream (2.3).
+      flushWarnings();
       broadcaster.push({ type: 'error', error });
       usageDeferred.reject(error);
       finishDeferred.reject(error);
@@ -597,18 +622,13 @@ export function runStreamToolLoop(
     };
 
     /**
-     * Push whatever the sink recorded since the last flush as live `warning`
-     * parts (1.9). Driven off `list()` rather than `add`'s return so the sink
-     * stays the single owner of dedup and of the 50-entry cap: an entry it
-     * dropped or collapsed never reaches the stream twice.
+     * Push what the sink recorded and no stream carried yet as live `warning`
+     * parts (1.9). The sink stays the single owner of dedup, of the 50-entry
+     * cap and of what was carried (`take`, 2.3): a warning a step's own stream
+     * already carried, and this loop forwarded, never goes out twice.
      */
-    let warningsEmitted = 0;
     const flushWarnings = (): void => {
-      const all = warningSink.list();
-      for (let i = warningsEmitted; i < all.length; i++) {
-        broadcaster.push({ type: 'warning', warning: all[i]! });
-      }
-      warningsEmitted = all.length;
+      for (const warning of warningSink.take()) broadcaster.push({ type: 'warning', warning });
     };
 
     const emitApprovalRequests = (requests: ToolApprovalRequest[]): void => {
@@ -789,6 +809,7 @@ export function runStreamToolLoop(
           ...checkpointRef(),
         };
         const usage = withTotal(totalUsage);
+        flushWarnings();
         broadcaster.push({ type: 'finish', usage, finishReason: lastFinish });
         usageDeferred.resolve(usage);
         finishDeferred.resolve(lastFinish);
@@ -834,6 +855,7 @@ export function runStreamToolLoop(
           }
           const usage = withTotal(totalUsage);
           const deuzMeta = finishMeta();
+          flushWarnings();
           broadcaster.push({
             type: 'finish',
             usage,
@@ -964,9 +986,11 @@ export function runStreamToolLoop(
         // A ContextOverflowError is always pre-first-byte, so nothing of this
         // step has reached the consumer yet and the attempt restarts cleanly.
         let overflowRetried = false;
-        // A model with no price under a USD budget (2.3): reported once, or
-        // refused before the call with `budget.unknownPrice: 'reject'`.
-        await usageCost?.admit(prepared.options.model.modelId);
+        // A model with no price under a USD budget (2.3): reported once, ahead
+        // of the step's output, or refused before the call with
+        // `budget.unknownPrice: 'reject'`.
+        await admitModel?.(prepared.options.model.modelId);
+        flushWarnings();
 
         attempts: for (;;) {
           const inner = runStream(
@@ -1744,6 +1768,8 @@ export function runStreamToolLoop(
         ...lastFinishMeta,
         ...(deuzMeta ? { deuz: deuzMeta } : {}),
       };
+      // Whatever the run recorded since the last step's flush goes out before it ends.
+      flushWarnings();
       broadcaster.push({
         type: 'finish',
         usage,

@@ -171,7 +171,10 @@ default applies. Earlier releases sent a 4,096-token placeholder there, which
 silently truncated long answers. Anthropic's `max_tokens` is required, so an
 unknown Claude id still sends 4,096. The `unknown-model` warning says so and
 names the two ways to raise it: `maxOutputTokens` per call, or
-`capabilities: { maxOutput }`.
+`capabilities: { maxOutput }`. A native call under a token or USD budget is the
+exception: it sends the placeholder, so its
+[reservation](/docs/modules/budgets#what-a-reservation-holds) bounds what it can
+bill.
 
 ## Clamps: no value changes in silence
 

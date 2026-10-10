@@ -285,7 +285,10 @@ for await (const text of result.textStream) process.stdout.write(text);
 The call-level callback overrides `deps.onUsage`; they are not both invoked.
 `UsageMeta` exposes `model`, `reason`, optional `ttftMs` and optional `agentPath`.
 It contains no dollar amount. Aborted calls can report partial usage; a failure
-before usage is available does not guarantee a callback.
+before usage is available does not guarantee a callback. Since 2.3,
+`usageAvailable: false` marks usage the provider did not report: it sent none,
+or the stream ended before its usage arrived. `usage` then holds zeros or only
+what arrived, so the call's cost is unknown; do not bill it as a free call.
 
 <Callout title="Keep metering callbacks synchronous">
   `onUsage` is a notification hook; the SDK does not await an async callback. For database writes,
@@ -336,7 +339,10 @@ In 2.1, tool-loop accounting prices individual invocations against their actual
 model and preserves settled dollar totals across [durable resumes](/docs/agents/durable-runtime).
 Changing models does not reprice previous calls at the final model's rate.
 If an invocation cannot be priced, the loop cannot report a complete cumulative
-cost. Missing pricing is **unknown**, not zero.
+cost. Missing pricing is **unknown**, not zero. So is a call whose usage the
+provider did not report (since 2.3): a single call emits no `cost` part for it,
+and a loop emits no further `cost` parts, exactly as an execution context's
+ledger keeps that call's cost unknown.
 
 <span id="the-budget-guardrail-17" />
 
@@ -366,6 +372,13 @@ The current step finishes before the check stops further work. Streaming emits
 Without a price provider, or with incomplete pricing, the USD condition cannot
 protect the run. Include a token limit and a step limit as independent controls.
 For admission checks before a model attempt, use native execution budgets.
+
+When a call's cost is unknown, because its price lookup failed or the provider
+did not report its usage, the run's cost is unknown from then on, and
+`budget.usd`, like `costExceeds`, waits instead of stopping the loop. A call
+without usage adds no tokens either, so only the step limit is sure to bound a
+host that never reports usage. A native execution budget keeps that call's
+reservation held instead, so its limits still apply.
 
 ## Native agent and swarm budgets
 

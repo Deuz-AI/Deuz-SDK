@@ -75,6 +75,8 @@ import {
   applyHandoffSwap,
   resumeHandoffState,
   SubAgentSuspension,
+  modelGate,
+  setModelGate,
   type ActiveAgentState,
   type CompactionTrigger,
   type Denial,
@@ -82,6 +84,7 @@ import {
   type GuardrailLogEntry,
   type HandoffLogEntry,
   type LoopOutcome,
+  type ModelGate,
 } from './loop-shared';
 import type { CompactionEvent } from './compaction';
 import type { UsageCostSnapshot } from '../internal/usage-cost';
@@ -151,6 +154,18 @@ export async function runToolLoop(
       ...options,
       onUsage: usageCost.wrap(options.onUsage ?? deps.onUsage),
     });
+  // Decision 4 (2.3): every model this run calls, compaction summaries
+  // included, passes its own unknown-price gate and that of the loop whose
+  // `agentTool` started it. Kept on `deps`, so the tools' copy carries it on.
+  const parentGate = modelGate(deps);
+  const admitModel: ModelGate | undefined =
+    usageCost || parentGate
+      ? async (modelId) => {
+          await usageCost?.admit(modelId);
+          await parentGate?.(modelId);
+        }
+      : undefined;
+  setModelGate(deps, admitModel);
   /**
    * The run's MCP connections (2.0), resolved inside the try below so a failure
    * still reports run.failed. Declared out here because the `finally` has to
@@ -575,7 +590,7 @@ export async function runToolLoop(
       }
       // A model with no price under a USD budget (2.3): reported once, or
       // refused before the call with `budget.unknownPrice: 'reject'`.
-      await usageCost?.admit(prepared.options.model.modelId);
+      await admitModel?.(prepared.options.model.modelId);
       // Overflow auto-recovery (2.0): ONE retry per step. The provider rejected
       // the request as too long, so force a compaction pass and re-run the same
       // step against the shrunk history — recall block included, exactly as the

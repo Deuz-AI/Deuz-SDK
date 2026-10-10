@@ -7,6 +7,7 @@ import {
 } from '../execution-policy';
 import { intersectBudgetLimits } from '../budget-ledger';
 import { resolveDependencies } from '../internal/resolve-deps';
+import { markRunLedger } from '../internal/run-ledger';
 import type { DeuzAgent } from '../agent';
 import type { AgentRunOptions, AgentRunStore, AgentToolSet } from '../types/agent-run';
 import type { NativeExecutionContext } from '../types/execution';
@@ -420,6 +421,8 @@ export function createSwarm(options: SwarmOptions): Swarm {
             persist,
             admission: options.admission,
           });
+      // One swarm run owns this ledger: its tasks report an unpriced model once in all.
+      markRunLedger(execution.ledger);
       contextReady = true;
       // Policy/scope state is durable before the first dispatch or reservation.
       await mutate(() => ({ run: { executionState: execution.snapshot() } }));
