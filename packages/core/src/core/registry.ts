@@ -723,6 +723,18 @@ const NATIVE_REGISTRY: Record<string, Row> = {
     contextWindow: 1_000_000,
     maxOutput: 64_000,
   }),
+  // 2.3 (F19): the GA id of the preview above. It is priced and pinned on the
+  // compat wire with the same 1M / 64K limits, but this table missed it, so the
+  // native wire ran it on the fallback. Same row as the preview; not live-verified.
+  'gemini-3.1-pro': row('google', 'native', {
+    vision: true,
+    reasoning: true,
+    caching: true,
+    nativePdf: true,
+    audio: true,
+    contextWindow: 1_000_000,
+    maxOutput: 64_000,
+  }),
   'gemini-3.1-flash-lite': row('google', 'native', {
     vision: true,
     reasoning: true,
