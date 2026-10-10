@@ -164,6 +164,13 @@ export interface AgentRunEnvelope {
      * Absent before 2.3 and for runs without MCP; resume then records the catalog.
      */
     mcp?: string;
+    /**
+     * The run's handoff targets (2.3), as JSON: each target's name, model,
+     * instructions and own tools, which run in this native run once a transfer
+     * is accepted. Resume rejects a change like a changed root tool. Absent
+     * before 2.3 and for runs without targets; resume then records them.
+     */
+    handoffs?: string;
   };
   limits?: { maxSteps: number; maxOutputAttempts: number; maxVerifyAttempts: number };
   loopOutcome?: {

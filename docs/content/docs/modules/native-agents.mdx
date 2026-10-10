@@ -164,7 +164,8 @@ authentication mechanism. Native store run IDs must be unique within that store.
 
 Resume requires the original run ID and scope. Keep `bindingId` stable for the
 same implementation and bump it when tool or verifier semantics change. Stored
-model/tool/output schemas and persisted limits are checked on resume. Function
+model/tool/output schemas and persisted limits are checked on resume, and since 2.3
+so is each handoff target's model, instructions and tool schemas. Function
 bodies cannot be fingerprinted reliably: changing a validator, approval predicate,
 tool implementation or verifier requires a new `bindingId`. A
 completed native envelope returns its stored result without another model call.

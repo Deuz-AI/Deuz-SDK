@@ -12,6 +12,8 @@ import type {
 import type { CommonCallOptions } from './types/config';
 import type { CallWarning, StopDetails } from './types/methods';
 import type { Message } from './types/message';
+import type { LanguageModel } from './types/model';
+import type { ToolSet } from './types/tool';
 import type { WireToolRequest } from './adapters/types';
 import type { SessionStore } from './types/session';
 import type { StreamPart } from './types/stream';
@@ -52,6 +54,7 @@ import {
   type NativeToolReceipts,
 } from './inference/agent-tools';
 import type { NativeMcp } from './inference/native-mcp';
+import { readHandoffTarget } from './inference/handoff';
 import {
   assertExecutionPolicy,
   createExecutionContext,
@@ -159,6 +162,65 @@ function assertAccountingContinuity(
       );
     }
   }
+}
+
+/** A model's part of the native resume binding. */
+function modelBinding(model: LanguageModel): string {
+  return `${model.provider}/${model.surface}/${model.modelId}`;
+}
+
+/**
+ * A tool set's part of the native resume binding: each tool's name, description
+ * and schemas. Function bodies cannot be compared; `bindingId` covers them.
+ */
+function toolBinding(
+  tools: ToolSet,
+  contextSchemaOf: (name: string) => AgentTool['contextSchema'],
+): Promise<unknown[]> {
+  return Promise.all(
+    Object.entries(tools).map(async ([name, tool]) => {
+      const contextSchema = contextSchemaOf(name);
+      return [
+        name,
+        tool.description,
+        await toJSONSchema(tool.parameters),
+        tool.outputSchema,
+        contextSchema ? await toJSONSchema(contextSchema) : undefined,
+      ];
+    }),
+  );
+}
+
+/**
+ * The handoff targets of a run's prepared tools (2.3), for its resume binding:
+ * each target's name, model, instructions and own tools, which run in this
+ * native run once a transfer is accepted. A target's own transfer tools are
+ * followed too. Undefined when the run has no target.
+ */
+async function handoffBinding(tools: ToolSet): Promise<string | undefined> {
+  const targets = new Map<string, unknown>();
+  // Transfer groups can reference each other: each tool set is read once.
+  const visited = new Set<ToolSet>();
+  const visit = async (set: ToolSet): Promise<void> => {
+    if (visited.has(set)) return;
+    visited.add(set);
+    for (const tool of Object.values(set)) {
+      const meta = readHandoffTarget(tool);
+      if (!meta) continue;
+      const own = meta.def.tools ?? {};
+      const target = [
+        meta.name,
+        modelBinding(meta.def.model),
+        meta.def.instructions ?? null,
+        // A prepared tool keeps its original's context schema.
+        await toolBinding(own, (name) => (own[name] as Partial<AgentTool>).contextSchema),
+      ];
+      targets.set(JSON.stringify(target), target);
+      await visit(own);
+    }
+  };
+  await visit(tools);
+  return targets.size > 0 ? JSON.stringify([...targets.values()]) : undefined;
 }
 
 /** Store for tests and single-process applications; durable applications supply their own store. */
@@ -485,30 +547,27 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         receipts,
       );
       const binding: NonNullable<AgentRunEnvelope['binding']> = {
-        model: `${common.model.provider}/${common.model.surface}/${common.model.modelId}`,
+        model: modelBinding(common.model),
         tools: JSON.stringify(
-          await Promise.all(
-            Object.entries(common.tools).map(async ([name, tool]) => [
-              name,
-              tool.description,
-              await toJSONSchema(tool.parameters),
-              tool.outputSchema,
-              options.tools?.[name]?.contextSchema
-                ? await toJSONSchema(options.tools[name]!.contextSchema!)
-                : undefined,
-            ]),
-          ),
+          await toolBinding(common.tools, (name) => options.tools?.[name]?.contextSchema),
         ),
         output: JSON.stringify(outputSchema ?? null),
         ...(options.bindingId !== undefined ? { revision: options.bindingId } : {}),
       };
-      // The MCP catalog (2.3) is compared below, once the servers are reached.
+      // Handoff targets (2.3) are compared on their own, and the MCP catalog
+      // below, once the servers are reached: an envelope written before 2.3
+      // records neither, and its resume records them.
+      const handoffs = await handoffBinding(common.tools);
       const recordedCatalog = envelope.binding?.mcp;
       if (envelope.binding) {
-        const { mcp: _catalog, ...recorded } = envelope.binding;
-        if (JSON.stringify(binding) !== JSON.stringify(recorded))
+        const { mcp: _catalog, handoffs: recordedHandoffs, ...recorded } = envelope.binding;
+        if (
+          JSON.stringify(binding) !== JSON.stringify(recorded) ||
+          (recordedHandoffs !== undefined && recordedHandoffs !== handoffs)
+        )
           throw new TypeError('Native agent binding changed across resume.');
       }
+      if (handoffs !== undefined) binding.handoffs = handoffs;
       if (envelope.phase === 'terminal') {
         if (!envelope.result || envelope.result.status === 'suspended')
           throw new TypeError('Invalid native terminal checkpoint.');
