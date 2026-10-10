@@ -35,6 +35,7 @@ import {
   type McpRootsClient,
 } from '../src/mcp/index';
 import { InvalidRequestError } from '../src/errors';
+import { generateText } from '../src/generate';
 import { createMockModel } from '../src/testing';
 import { readConfig } from '../src/internal/config-symbol';
 import { manualClock } from './fixtures/manual-clock';
@@ -533,6 +534,54 @@ describe('createMcpServer — approval', () => {
     expect(await client.callTool('pay', { amount: 5 })).toBe('paid 5');
     await expect(client.callTool('pay', { amount: 500 })).rejects.toThrow('Tool call denied.');
     expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  // Outside the declared `boolean | predicate` type, which is exactly what an
+  // unchecked JSON/YAML tool config or plain JS produces. The loop calls it, the
+  // call throws, and an exploding predicate gates the call: fail closed.
+  describe.each([
+    ['the string "true"', 'true'],
+    ['the number 1', 1],
+  ] as const)('a truthy needsApproval that is neither true nor a function (%s)', (_l, gate) => {
+    const gatedTool = (ran: { count: number }): Tool => ({
+      parameters: { type: 'object', properties: {} },
+      needsApproval: gate as unknown as Tool['needsApproval'],
+      execute: () => {
+        ran.count += 1;
+        return 'ran';
+      },
+    });
+
+    it('the loop gates it: nobody approves, so it never runs', async () => {
+      const ran = { count: 0 };
+      await generateText({
+        model: createMockModel({
+          responses: [{ toolCalls: [{ toolName: 'danger', args: {} }] }, { text: 'done' }],
+        }),
+        prompt: 'go',
+        tools: { danger: gatedTool(ran) },
+        approveToolCall: () => false,
+      });
+      expect(ran.count).toBe(0);
+    });
+
+    it('a served call is gated the same way: approve is asked, says no, the tool never runs', async () => {
+      const ran = { count: 0 };
+      const asked: string[] = [];
+      const server = serve({
+        name: 't',
+        tools: { danger: gatedTool(ran) },
+        approve: ({ toolName }) => {
+          asked.push(toolName);
+          return false;
+        },
+      });
+      const client = await connect(server);
+
+      await expect(client.callTool('danger', {})).rejects.toThrow('Tool call denied.');
+      expect(asked).toEqual(['danger']);
+      expect(ran.count).toBe(0);
+    });
   });
 });
 

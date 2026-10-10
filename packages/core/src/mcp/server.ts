@@ -772,7 +772,9 @@ export function createMcpServer(options: McpServerOptions): DeuzMcpServer {
       const call = guarded.call;
 
       const gate = tool.needsApproval;
-      const needs = typeof gate === 'function' ? await gate(call.args, execCtx) : gate === true;
+      // Fail closed like the loop: a truthy non-function (a 'true' from a JSON
+      // config) gates the call there too, because calling it throws.
+      const needs = typeof gate === 'function' ? await gate(call.args, execCtx) : Boolean(gate);
       if (needs) {
         const decision = await decide(sdk, call, request, ctx, instance);
         if (decision.kind === 'ask') return decision.result;
