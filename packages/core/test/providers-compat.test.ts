@@ -46,6 +46,9 @@ import type { Provider } from '../src/types/model';
 import { readConfig } from '../src/internal/config-symbol';
 import { getCapabilities, type ModelCapabilities } from '../src/core/registry';
 import { AuthenticationError, InvalidRequestError } from '../src/errors';
+import { runStream } from '../src/core/inference';
+import type { CommonCallOptions } from '../src/types/config';
+import type { CallWarning } from '../src/types/methods';
 import { sseResponse, sseEvents, mockFetch } from './fixtures/sse';
 
 const FACTORIES: {
@@ -602,5 +605,58 @@ describe('providers-compat: keyless local hosts (2.0)', () => {
     await result.finishReason;
     const body = JSON.parse(String(calls[0]!.init!.body)) as { max_tokens: number };
     expect(body.max_tokens).toBe(32_000); // not the 4096 silent-truncation default
+  });
+});
+
+// ===================================================================
+// 2.3 — current compat-host models (F08) and their effort rules (F26).
+// Research-dated facts (roadmap 5.3, 2026-10-09), NOT live-verified: these
+// tests pin the REQUEST the SDK builds for each model id.
+// ===================================================================
+
+const COMPAT_OK = sseEvents([
+  { data: { choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] } },
+  { data: { choices: [], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 } } },
+  { data: '[DONE]' },
+]);
+
+/** One request through the real pump: the wire body and the call's warnings. */
+async function compatRequest(
+  create: (settings?: CompatSettings) => Provider,
+  modelId: string,
+  options: Partial<CommonCallOptions> = {},
+): Promise<{ body: Record<string, unknown>; warnings: CallWarning[] }> {
+  const { fetch, calls } = mockFetch(() => sseResponse([COMPAT_OK]));
+  const result = runStream({
+    ...options,
+    model: create({ apiKey: 'k', fetch })(modelId),
+    messages: [{ role: 'user', content: 'hi' }],
+  });
+  for await (const _ of result.fullStream) void _;
+  return {
+    body: JSON.parse(String(calls[0]!.init!.body)) as Record<string, unknown>,
+    warnings: await result.warnings!,
+  };
+}
+
+const warned = (warnings: CallWarning[], type: CallWarning['type']) =>
+  warnings.filter((w) => w.type === type).map((w) => w.setting);
+
+describe("DeepSeek v4 always reasons: effort 'none' never reaches the wire (2.3, F26)", () => {
+  it("'none' is dropped from the request and reported, instead of reasoning_effort 'none'", async () => {
+    for (const id of ['deepseek-v4-pro', 'deepseek-v4-flash']) {
+      const { body, warnings } = await compatRequest(createDeepSeek, id, { effort: 'none' });
+      expect('reasoning_effort' in body, id).toBe(false);
+      expect(warned(warnings, 'unsupported-setting'), id).toEqual(['effort']);
+      expect(warnings[0]!.message, id).toContain("'none'");
+    }
+  });
+
+  it('a real level still rides reasoning_effort', async () => {
+    const { body, warnings } = await compatRequest(createDeepSeek, 'deepseek-v4-pro', {
+      effort: 'high',
+    });
+    expect(body.reasoning_effort).toBe('high');
+    expect(warnings).toEqual([]);
   });
 });

@@ -421,13 +421,17 @@ const REGISTRY: Record<string, Row> = {
   // maxOutput stays at the 8_192 default: the wire accepts up to 65_536, but a
   // default that high turns one runaway thinking pass into a real bill. Raise it
   // per call when a long answer needs the room.
+  // 2.3 (F26): reasoning cannot be turned off, so `effort: 'none'` is dropped
+  // (reported) instead of being sent as `reasoning_effort: 'none'`.
   'deepseek-v4-flash': row('deepseek', 'chat_completions', {
     reasoning: true,
     structuredOutput: false,
+    effortNone: 'omit',
   }),
   'deepseek-v4-pro': row('deepseek', 'chat_completions', {
     reasoning: true,
     structuredOutput: false,
+    effortNone: 'omit',
   }),
   'mistral-large-latest': row('mistral', 'chat_completions', {
     vision: true, // Mistral Large 3 is multimodal-by-design
