@@ -214,6 +214,8 @@ Edge cases (per Anthropic docs): if the last block already carries an explicit `
 
 `anthropicWebSearch()` (root export) adds Anthropic's provider-executed web search — the model decides to search, Anthropic runs it during the turn, and results stream back as canonical `source` parts. Searches are counted in `usage.serverToolUses` ($10 / 1,000 searches).
 
+When a response reports `usage.iterations` (server-side fallback, compaction, server tool loops), the token counters are the sum of the iterations. Since 2.3 the search count and the `reasoningTokens` share are kept as well: the iteration entries carry token counters only, so both come from the top-level usage (shapes from `@anthropic-ai/sdk` 0.133.0; not live-verified).
+
 ```ts
 import { generateText, anthropicWebSearch } from '@deuz-sdk/core';
 

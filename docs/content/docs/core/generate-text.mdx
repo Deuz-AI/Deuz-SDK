@@ -96,6 +96,7 @@ interface GenerateTextResult {
   text: string;
   usage: Usage;
   finishReason: FinishReason;
+  stopDetails?: StopDetails;
   response: { messages: Message[] };
   steps?: StepResult[];
   toolCalls?: ToolCall[];
@@ -114,6 +115,7 @@ interface GenerateTextResult {
 | `text` | always | Final assistant text. With tools, this is the **last** step's text — which is empty if the run ended on a tool call (see the `maxSteps` callout above). |
 | `usage` | always | Token usage summed across all steps, sub-agents included. `usage.totalTokens` is the provider's own total where one exists, not `input + output` — on a thinking model those differ by a lot. |
 | `finishReason` | always | `'stop' \| 'length' \| 'tool_calls' \| 'content_filter' \| 'error' \| 'aborted'`. |
+| `stopDetails` | when the provider explained the stop | 2.3. The last step's explanation, normalized to `{ type, category?, explanation? }` — today Anthropic's `stop_details` on a refusal (`finishReason: 'content_filter'`). Each entry of `steps` carries its own. |
 | `response.messages` | always | Only the **new** turns this call produced. Append them to your prior `messages` to continue. |
 | `steps` | with tools | Per-step breakdown. **`undefined` on a single-turn call** — that absence is how you tell the two shapes apart. |
 | `toolCalls` / `toolResults` | with tools | Convenience: the last *tool-calling* step's calls and results. |
@@ -203,6 +205,7 @@ interface StepResult {
   toolCalls: ToolCall[];
   toolResults: ToolResult[];
   finishReason: FinishReason;
+  stopDetails?: StopDetails; // 2.3 — this step's stop explanation, when given
   usage: Usage;
   response: { messages: Message[] };
 }
