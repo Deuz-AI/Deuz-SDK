@@ -416,7 +416,9 @@ const MESSAGE_FIELDS: ReadonlyArray<readonly [string, FieldHandler]> = [
         }
       }
 
-      if (content.interrupted === true) {
+      // Once per turn, like OpenAI's once per response; outside a turn it is
+      // still worth a signal: buffered audio may be playing.
+      if (content.interrupted === true && !ctx.turn?.interrupted) {
         if (ctx.turn) ctx.turn.interrupted = true;
         ctx.sink.emit({
           type: 'interrupted',

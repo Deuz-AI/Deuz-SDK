@@ -616,6 +616,16 @@ describe('Gemini Live — configuration and edge cases', () => {
     expect(ofType(events, 'input-audio-committed')).toEqual([]);
   });
 
+  it('reports a barge-in once per turn even when the flag repeats', async () => {
+    const { socket, events } = await openSession();
+    socket.push(audioPart('AAA='));
+    socket.push({ serverContent: { interrupted: true } });
+    socket.push({ serverContent: { interrupted: true } });
+    socket.push({ serverContent: { turnComplete: true } });
+    await flush();
+    expect(ofType(events, 'interrupted')).toHaveLength(1);
+  });
+
   it('reports a barge-in that arrives with no open turn', async () => {
     const { socket, events } = await openSession();
     socket.push({ serverContent: { interrupted: true } });
