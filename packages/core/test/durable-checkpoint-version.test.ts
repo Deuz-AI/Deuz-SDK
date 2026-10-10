@@ -15,7 +15,12 @@ import { createRedisStores, type RedisClientLike } from '../src/node/store-redis
 import type { PgClientLike } from '../src/node/store-postgres';
 import type { StreamPart } from '../src/types/stream';
 import type { AgentCheckpoint, SessionStore } from '../src/types/session';
+import type { AgentRunEnvelope, AgentRunStore } from '../src/types/agent-run';
 import { createAnthropic } from '../src/anthropic';
+import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../src/agent-run';
+import { agentTool } from '../src/inference/agent-tool';
+import { createMockModel, type MockResponse } from '../src/testing';
+import { attachConfig, readConfig } from '../src/internal/config-symbol';
 
 // AgentCheckpoint.version (1.5) is the legacy loops' forward-compatibility
 // gate, but nothing read it: a checkpoint written by a newer SDK resumed as if
@@ -166,5 +171,93 @@ describe('checkpoint version (2.3)', () => {
     const [junkKey] = [...values.keys()].filter((key) => key.includes('run-junk'));
     values.set(junkKey!, '{not json');
     expect(await stores.sessions.load('run-junk')).toBeUndefined();
+  });
+});
+
+// A native run keeps its loop and sub-agent checkpoints inside its envelope.
+// One a newer SDK wrote fails the resume BEFORE the run is admitted, exactly as
+// a newer envelope does, so the stored run stays resumable by that SDK.
+describe('checkpoint version in native runs (2.3)', () => {
+  const parameters = { type: 'object' as const, properties: {} };
+
+  function counted(responses: MockResponse[]) {
+    const base = createMockModel({ responses });
+    const config = readConfig(base)!;
+    const fetch = vi.fn(config.fetch!);
+    return { model: attachConfig({ ...base }, { ...config, fetch }), fetch };
+  }
+
+  /** Edit the stored envelope the way another writer would, revision fence included. */
+  async function rewrite(
+    store: AgentRunStore,
+    runId: string,
+    edit: (envelope: AgentRunEnvelope) => void,
+  ): Promise<void> {
+    const next = structuredClone((await store.load(runId))!);
+    edit(next);
+    next.revision = (next.revision ?? 0) + 1;
+    await store.save(next);
+  }
+
+  /** A parent whose `worker` sub-agent suspends on an approval-gated `pay`. */
+  function delegation(runId: string) {
+    const pay = vi.fn(() => 'paid');
+    const child = counted([
+      { toolCalls: [{ toolName: 'pay', id: 'pay-child', args: {} }] },
+      { text: 'paid' },
+    ]);
+    const parent = counted([
+      { toolCalls: [{ toolName: 'worker', id: 'delegate', args: { prompt: 'pay' } }] },
+      { text: 'done' },
+    ]);
+    const store = createInMemoryAgentRunStore();
+    const options = {
+      model: parent.model,
+      prompt: 'pay',
+      tools: {
+        worker: agentTool({
+          name: 'worker',
+          description: 'worker',
+          model: child.model,
+          tools: { pay: { parameters, execute: pay, needsApproval: true } },
+        }),
+      },
+      session: { store, runId, scope: 'tenant' },
+      approvalResponses: [{ approvalId: 'pay-child', approved: true }],
+    };
+    return { pay, child, store, options };
+  }
+
+  it('control: a newer envelope fails the resume and leaves the stored run resumable', async () => {
+    const { store, options } = delegation('native-root');
+    expect((await runAgent(options)).status).toBe('suspended');
+    await rewrite(store, 'native-root', (envelope) => {
+      (envelope as { version: number }).version = 2;
+    });
+    expect((await resumeAgent(options)).status).toBe('failed');
+    expect((await store.load('native-root'))?.phase).toBe('running');
+  });
+
+  it('a newer sub-agent checkpoint fails the resume without ending the stored run', async () => {
+    const { pay, child, store, options } = delegation('native-child');
+    expect((await runAgent(options)).status).toBe('suspended');
+    const childKey = 'native-child::worker#delegate';
+    expect((await store.load('native-child'))?.checkpoints[childKey]).toBeDefined();
+    await rewrite(store, 'native-child', (envelope) => {
+      (envelope.checkpoints[childKey] as unknown as { version: number }).version = 2;
+    });
+    const resumed = await resumeAgent(options);
+    expect(resumed).toMatchObject({
+      status: 'failed',
+      error: { code: 'checkpoint_version_unsupported' },
+    });
+    // 2.3-W1 stored the failure as terminal, so the newer SDK could never resume it.
+    const stored = await store.load('native-child');
+    expect({ phase: stored?.phase, result: stored?.result?.status }).toEqual({
+      phase: 'running',
+      result: 'suspended',
+    });
+    expect(pay).not.toHaveBeenCalled();
+    expect(child.fetch).toHaveBeenCalledTimes(1);
   });
 });

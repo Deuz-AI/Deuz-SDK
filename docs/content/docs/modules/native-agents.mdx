@@ -104,9 +104,14 @@ events with sequence cursors.
 ## Strict checkpoints and approval resume
 
 Native sessions use `AgentRunEnvelope` with `kind: 'deuz-agent-run'` and `version: 1`.
-They do not reuse a legacy `AgentCheckpoint` as the top-level envelope. An
-`AgentRunStore` implements `load(runId)` and `save(envelope)`. `save` must finish
-its durable write before resolving; a rejected write stops further execution.
+They do not reuse a legacy `AgentCheckpoint` as the top-level envelope; the loop and
+sub-agent checkpoints inside it are `AgentCheckpoint` records. A resume refuses an
+envelope of another version. Since 2.3 it also refuses one holding a checkpoint whose
+version is not 1, with `CheckpointVersionError` (code `checkpoint_version_unsupported`).
+Both refusals happen before anything is written, so the stored run stays resumable by
+the SDK that wrote it. An `AgentRunStore` implements `load(runId)` and
+`save(envelope)`. `save` must finish its durable write before resolving; a rejected
+write stops further execution.
 
 The following complete approval example uses a volatile store for demonstration.
 The tool returns a string and has no external effect. In an application, obtain

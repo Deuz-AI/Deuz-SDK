@@ -58,6 +58,7 @@ import {
 import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
+import { assertCheckpointVersion } from './internal/checkpoint-version';
 
 export type * from './types/agent-run';
 
@@ -343,6 +344,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           saved.scope !== options.session.scope
         )
           throw new TypeError('Native checkpoint version, identity, or scope mismatch.');
+        // So are the loop and sub-agent checkpoints it holds (2.3): one a newer
+        // SDK wrote fails the resume here, before admission, so the stored run
+        // stays resumable by that SDK.
+        for (const [runId, checkpoint] of Object.entries(saved.checkpoints))
+          assertCheckpointVersion(checkpoint, runId);
         envelope = structuredClone(saved);
         currentText = envelope.candidateText ?? lastAssistantText(envelope.messages);
       } else if (options.session && (await options.session.store.load(options.session.runId))) {
