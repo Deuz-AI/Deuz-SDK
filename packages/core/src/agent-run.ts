@@ -964,8 +964,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           // exactly as the loop reports it after each step.
           if (toolRequest) {
             const totals = common.execution!.ledger.totals(common.execution!.scopeId);
-            // Unpriced calls add nothing to the cost (2.3), as in the loop.
-            if (totals.unknownUsd - (totals.unpriced ?? 0) === 0)
+            // Calls the provider has no price for add nothing to the cost (2.3),
+            // and without a provider the cost is unknown: as in the loop.
+            if (
+              totals.unknownUsd === 0 ||
+              (options.deps?.priceProvider !== undefined &&
+                totals.unknownUsd === (totals.unpriced ?? 0))
+            )
               emitPart(
                 {
                   type: 'cost',
