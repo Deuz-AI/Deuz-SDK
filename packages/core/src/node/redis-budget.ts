@@ -19,6 +19,8 @@
  * B:scope:<key>       HASH  w (window ms, -1 lifetime), b (buckets), bm (bucket ms),
  *                           ring slots: i<n> bucket index, t<n> tokens, u<n> USD
  * B:hist:<key>        HASH  "<bucket>:<modelId>" -> "<tokens> <usd>"
+ * B:fold:<key>        HASH  modelId -> the history field prune folds that model
+ *                           into, while a pass of prune runs over the scope
  * B:held              HASH  "<bucket>:<key>" -> open holds charging that bucket
  * B:open              ZSET  score 0, member = 16-digit reservedAt + requestId
  * B:closed            ZSET  requestId -> reservedAt (settled, released, denied)
@@ -54,6 +56,7 @@ import type { RedisScriptClient } from './store-redis';
 import {
   arg,
   inBatches,
+  LUA_HSCAN,
   PRUNE_BATCH,
   redisConnection,
   redisStoreTag,
@@ -336,53 +339,70 @@ for i = 1, #found do out[#out + 1] = found[i] end
 return arr(out)
 `);
 
-// KEYS: scope, hist, held. ARGV: scope key, before. Folds the scope's history,
-// per model, from the buckets isFoldableBucket allows and no open hold
-// charges, into the newest of them. Answers the rows folded away.
-const foldScript = script(`${BUDGET_HELPERS}
+// KEYS: scope, hist, held, fold. ARGV: cursor ('0' starts a pass), scope key,
+// before, count. Folds one page of the scope's history (HSCAN, about 'count'
+// rows): a row of a bucket isFoldableBucket allows and no open hold charges
+// goes into the newest such row of its model seen so far, which the fold hash
+// remembers between pages, and is deleted. A pass ends when the cursor comes
+// back as '0', and drops the fold hash. Answers { next cursor, rows seen, rows
+// folded away, and on a pass's first page the rows the history held }.
+const foldScript = script(`${LUA_HSCAN}${BUDGET_HELPERS}
 local cfg = redis.call('HMGET', KEYS[1], 'w', 'b', 'bm')
-if not has(cfg[3]) then return 0 end
+if not has(cfg[3]) then
+  redis.call('DEL', KEYS[4])
+  return arr({'0', '0', '0', '0'})
+end
 local w, buckets, bm = num(cfg[1]), num(cfg[2]), num(cfg[3])
-local before, now = num(ARGV[2]), now_ms()
-local rows = redis.call('HGETALL', KEYS[2])
-local groups, models = {}, {}
+local before, now = num(ARGV[3]), now_ms()
+local function foldable(bucket)
+  return (bucket + 1) * bm <= before and (bucket + 2) * bm <= now
+    and (w < 0 or (bucket + buckets) * bm <= now)
+end
+local function bucket_of(field) return num(string.match(field, '^(%-?%d+):')) end
+-- Add the row 'from' (now 'from_row') into 'to' (now 'to_row'), and delete it.
+local function move(from, from_row, to, to_row)
+  local t1, u1 = split2(from_row)
+  local t2, u2 = split2(to_row)
+  redis.call('HSET', KEYS[2], to, int(t1 + t2) .. ' ' .. real(u1 + u2))
+  redis.call('HDEL', KEYS[2], from)
+end
+local size = ''
+if ARGV[1] == '0' then size = int(num(redis.call('HLEN', KEYS[2]))) end
+local cursor, rows = hscan(KEYS[2], ARGV[1], ARGV[4])
+local folded = 0
 for i = 1, #rows, 2 do
   local field = rows[i]
   local b, model = string.match(field, '^(%-?%d+):(.*)$')
   local bucket = num(b)
-  if (bucket + 1) * bm <= before and (bucket + 2) * bm <= now
-    and (w < 0 or (bucket + buckets) * bm <= now)
-    and not has(redis.call('HGET', KEYS[3], int(bucket) .. ':' .. ARGV[1])) then
-    local t, u = split2(rows[i + 1])
-    if not groups[model] then
-      groups[model] = {}
-      models[#models + 1] = model
-    end
-    local list = groups[model]
-    list[#list + 1] = {field, bucket, t, u}
+  local row = nil
+  if foldable(bucket) and not has(redis.call('HGET', KEYS[3], int(bucket) .. ':' .. ARGV[2])) then
+    -- Read now: this script may have folded the row already.
+    row = redis.call('HGET', KEYS[2], field)
   end
-end
-local folded = 0
-for m = 1, #models do
-  local list = groups[models[m]]
-  if #list > 1 then
-    local keep = list[1]
-    local t, u = 0, 0
-    for j = 1, #list do
-      if list[j][2] > keep[2] then keep = list[j] end
-      t = t + list[j][3]
-      u = u + list[j][4]
+  if has(row) then
+    local target = redis.call('HGET', KEYS[4], model)
+    local kept = nil
+    if has(target) and target ~= field then
+      kept = redis.call('HGET', KEYS[2], target)
+      -- A target this pass may not fold into (a stopped prune with a later
+      -- 'before' left it), or one gone since, is replaced.
+      if has(kept) and not foldable(bucket_of(target)) then kept = nil end
     end
-    for j = 1, #list do
-      if list[j] ~= keep then
-        redis.call('HDEL', KEYS[2], list[j][1])
-        folded = folded + 1
+    if has(kept) then
+      if bucket < bucket_of(target) then
+        move(field, row, target, kept)
+      else
+        move(target, kept, field, row)
+        redis.call('HSET', KEYS[4], model, field)
       end
+      folded = folded + 1
+    elseif target ~= field then
+      redis.call('HSET', KEYS[4], model, field)
     end
-    redis.call('HSET', KEYS[2], keep[1], int(t) .. ' ' .. real(u))
   end
 end
-return folded
+if cursor == '0' then redis.call('DEL', KEYS[4]) end
+return arr({cursor, int(#rows / 2), int(folded), size})
 `);
 
 // KEYS: open. ARGV: min, max (ZRANGEBYLEX bounds), limit.
@@ -452,6 +472,39 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
   const held = `${tag}:held`;
   const scopes = `${tag}:scopes`;
   const closing = (requestId: string) => [requestPrefix + requestId, open, closed, held];
+
+  /**
+   * Fold one scope's history, a page of about PRUNE_BATCH rows per script, and
+   * answer the rows folded away. Redis returns every row present for a whole
+   * scan, so one pass folds them all. A pass that saw fewer rows than the
+   * history held when it began missed some, as a cursor that is an offset into
+   * the hash does (ioredis-mock's skips a row for each one deleted behind it),
+   * and another pass folds them.
+   */
+  const foldHistory = async (
+    client: RedisScriptClient,
+    key: string,
+    before: number,
+  ): Promise<number> => {
+    const keys = [scopePrefix + key, historyPrefix + key, held, `${tag}:fold:${key}`];
+    let folded = 0;
+    for (;;) {
+      let cursor = '0';
+      let seen = 0;
+      let size = 0;
+      do {
+        const reply = replyList(
+          await foldScript(client, keys, [cursor, key, arg(before), arg(PRUNE_BATCH)]),
+        );
+        if (cursor === '0') size = replyNumber(reply[3]);
+        cursor = replyText(reply[0]) || '0';
+        seen += replyNumber(reply[1]);
+        folded += replyNumber(reply[2]);
+      } while (cursor !== '0');
+      // Every row seen ends it, and so does a malformed reply.
+      if (!(seen < size)) return folded;
+    }
+  };
 
   /** Settle or release `requestId` through its script, then judge what it found. */
   const transition = async (
@@ -577,21 +630,14 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
       const requests = await inBatches(PRUNE_BATCH, async (size) =>
         replyNumber(await requestPruneScript(client, [closed], [arg(before), arg(size)])),
       );
-      // Each scope folds in a script of its own, a page of scope keys at a time.
+      // Each scope folds in scripts of its own, a page of scope keys at a time.
       let buckets = 0;
       let last = '';
       for (;;) {
         const page = replyList(await scopePageScript(client, [scopes], [last, arg(PRUNE_BATCH)]))
           .map(replyText)
           .filter((key): key is string => key !== undefined);
-        for (const key of page)
-          buckets += replyNumber(
-            await foldScript(
-              client,
-              [scopePrefix + key, historyPrefix + key, held],
-              [key, arg(before)],
-            ),
-          );
+        for (const key of page) buckets += await foldHistory(client, key, before);
         if (page.length < PRUNE_BATCH) return { requests, buckets };
         last = page[page.length - 1]!;
       }

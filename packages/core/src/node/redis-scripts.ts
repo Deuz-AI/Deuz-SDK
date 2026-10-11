@@ -200,6 +200,23 @@ end
 local function key_base(key, name) return string.sub(key, 1, #key - #name) end
 `;
 
+/**
+ * `hscan(key, cursor, count)`: one `HSCAN` page, as its next cursor (`'0'` once
+ * the scan is done) and a list of field, value, field, value. Redis hands the
+ * nested list over 1-indexed and ioredis-mock (fengari) 0-indexed, so it is
+ * read either way. Only the scripts that scan include it.
+ */
+export const LUA_HSCAN = `
+local function hscan(key, cursor, count)
+  local page = redis.call('HSCAN', key, cursor, 'COUNT', count)
+  local list, rows = page[2], {}
+  local first = 1
+  if list[0] ~= nil then first = 0 end
+  for i = first, first + #list - 1 do rows[#rows + 1] = list[i] end
+  return page[1], rows
+end
+`;
+
 /** Run one script; `body` is prefixed with {@link LUA_HELPERS}. */
 export function script(
   body: string,
@@ -275,8 +292,9 @@ export function replyNumber(reply: unknown): number {
 export const arg = (value: number): string => String(value);
 
 /**
- * The most entries one retention script removes. Retention runs in batches so
- * a large backlog never holds the server in one long script.
+ * The most entries one retention script removes, and the page size of the
+ * scan that folds budget history. Retention runs in batches so a large
+ * backlog never holds the server in one long script.
  */
 export const PRUNE_BATCH = 1_000;
 

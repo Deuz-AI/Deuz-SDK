@@ -444,9 +444,10 @@ console.log(`${handles.length} runs taken over, ${failed.length} could not be re
   final. An injected client is never closed.
 - **Batched retention.** `leases.prune`, `agentRuns.prune`, `claims.prune` and
   the budget store's `prune` remove at most 1 000 entries per script and run
-  again until a batch comes back short, so a large backlog never holds the
-  server in one long script. A swarm prune deletes up to its `limit` in one
-  script.
+  again until a batch comes back short, and the budget store folds each scope's
+  history a page of about 1 000 rows per script (`HSCAN`), so a large backlog
+  never holds the server in one long script. A swarm prune deletes up to its
+  `limit` in one script.
 - **Durability is your server's.** Redis acknowledges a write from memory. What
   survives a crash depends on its persistence: with AOF and
   `appendfsync everysec` up to about a second of writes can be lost, and with
