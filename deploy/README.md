@@ -18,19 +18,24 @@ CloudFront in front. Everything here is checked in so the stack can be rebuilt f
 
 ## Deploying
 
-```powershell
-powershell -File deploy\deploy.ps1
+There is no local wrapper script: a deploy is three commands from the repository root
+(`tar`, `scp` and `ssh` ship with Windows 10 and later as well as Linux and macOS):
+
+```sh
+tar --exclude=node_modules --exclude=.next --exclude=.source -czf deuz-docs.tar.gz -C docs .
+scp -i ~/.ssh/deuz-docs.pem deuz-docs.tar.gz deploy/redeploy.sh ec2-user@3.77.16.98:/tmp/
+ssh -i ~/.ssh/deuz-docs.pem ec2-user@3.77.16.98 bash /tmp/redeploy.sh
 ```
 
-It tars `docs/` (excluding `node_modules`, `.next`, `.source`), uploads it, then runs
-`redeploy.sh` on the server: extract to a staging directory, reuse `node_modules` when
-`package-lock.json` is unchanged, build, swap directories, health-check `/docs`. If the
-health check fails it restores the previous directory and exits non-zero, so a broken
+`redeploy.sh` expects the tarball at `/tmp/deuz-docs.tar.gz`, with the contents of
+`docs/` at its root. It extracts it to a staging directory, reuses `node_modules` when
+`package-lock.json` is unchanged, builds, swaps directories and health-checks `/docs`. If
+the health check fails it restores the previous directory and exits non-zero, so a broken
 build never stays live.
 
-The site is deployed from the **working tree**, not from git. The live content lives on
-the unpushed `docs/ink-redesign` branch — cloning the repo on the server would ship an
-older `main`.
+The server never clones the repository: it builds whatever `docs/` you upload. Deploy from
+a checkout of the `main` branch. The redesign branch the site was first deployed from is
+merged into it, so `main` is where the current docs live.
 
 ## CloudFront
 
@@ -50,7 +55,11 @@ Once Support verifies the account:
 aws cloudfront create-distribution --profile deuz --distribution-config file://deploy/dist.json
 ```
 
-then put the distribution ID into `$DIST` in `deploy.ps1` so deploys invalidate the cache.
+then invalidate the cache after every deploy (see below for why `/*`):
+
+```powershell
+aws cloudfront create-invalidation --profile deuz --distribution-id <DIST> --paths "/*"
+```
 
 ### Why the cache key is what it is
 
@@ -79,8 +88,7 @@ with a 7-day `MinTTL`.
 
 | File | Purpose |
 |---|---|
-| `deploy.ps1` | run this — packages, uploads, triggers a rebuild, invalidates CloudFront |
-| `redeploy.sh` | server side of a deploy, with health check and rollback |
+| `redeploy.sh` | server side of a deploy (upload it with the tarball), with health check and rollback |
 | `user-data.sh` | EC2 bootstrap: swap, Node 22 (arm64), systemd unit |
 | `dist.json` | CloudFront distribution config |
 | `normalize.js` | CloudFront viewer-request function (cache-key normalisation) |

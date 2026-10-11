@@ -262,6 +262,6 @@ The installed package wins over anything written here. `node_modules/@deuz-sdk/c
 
 Full prose for every topic is at **https://deuz-sdk.tech/docs** — each `/docs/...` link in the reference files resolves there. Runnable projects are in [the repository's `examples/`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples): `01-basic-stream`, `02-tool-loop`, `03-next-chat`, `04-structured-output`, `05-durable-resume`, `06-autonomous-agent`.
 
-Maintaining this skill: it is generated and verified from source by the scripts under `.claude/skills/deuz-sdk/scripts/` in the Deuz-SDK repository. `generate-api-index.mjs` rebuilds the index; `verify-skill.mjs` resolves every name against the real export table and fails the moment the package version or the API contract moves, so a release cannot let this drift silently.
+Maintaining this skill: it is generated and verified from source by the scripts under `packages/core/tooling/skills/` in the Deuz-SDK repository. `generate-api-index.mjs` rebuilds the index; `verify-skill.mjs` resolves every name against the real export table and fails the moment the package version or the API contract moves, so a release cannot let this drift silently. `skills/deuz-sdk/` is the source; `sync-skill-copy.mjs --write` mirrors it into `.claude/skills/deuz-sdk/`.
 
 > Verified against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd · 2026-09-26
