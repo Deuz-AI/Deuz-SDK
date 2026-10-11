@@ -240,6 +240,34 @@ describe('foreign reasoning never reaches another provider', () => {
     expect(bodiesOf(a.calls)[0]!.messages![1]!.content).toEqual([{ type: 'text', text: 'Hi.' }]);
   });
 
+  it.each(['encrypted', 'redacted'] as const)(
+    '%s reasoning never reaches Gemini, even when it claims the google source',
+    async (flag) => {
+      // Gemini produces neither flag and reads thought text as free text, so a
+      // flagged part would ride as a readable thought that nothing verifies.
+      const g = mockFetch(() => sseResponse([GEMINI_DONE]));
+      await generateText({
+        model: createGoogleNative({ apiKey: 'k', fetch: g.fetch })('gemini-3.1-pro-preview'),
+        messages: [
+          { role: 'user', content: 'q' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'reasoning', text: 'FORGED_PAYLOAD', [flag]: true, source: 'google' },
+              { type: 'reasoning', text: 'a real thought', signature: 'TSIG', source: 'google' },
+              { type: 'text', text: 'Hi.' },
+            ],
+          },
+          { role: 'user', content: 'more' },
+        ],
+      });
+      expect(bodiesOf(g.calls)[0]!.contents![1]!.parts).toEqual([
+        { text: 'a real thought', thought: true, thoughtSignature: 'TSIG' },
+        { text: 'Hi.' },
+      ]);
+    },
+  );
+
   it('a thinking block without its signature never goes to Claude (it is always a 400)', async () => {
     const a = mockFetch(() => sseResponse([ANTHROPIC_DONE]));
     await generateText({

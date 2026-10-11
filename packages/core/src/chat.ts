@@ -69,9 +69,10 @@ export interface UIToolCall {
   deniedReason?: string;
   /**
    * Opaque provider round-trip data for this call (e.g. Gemini's
-   * thoughtSignature), carried so `canonicalFromUI` can rebuild a `tool_use`
-   * that the NEXT request will not 400 on. Only `uiFromMessages` sets it: the
-   * UI wire does not carry provider metadata, so a streamed turn never has it.
+   * thoughtSignature), carried so `assistantMessageFromTurn` and
+   * `canonicalFromUI` rebuild a `tool_use` that the NEXT request will not 400
+   * on. `uiFromMessages` sets it from history and, since 2.3, `applyUIPart`
+   * from the wire's `tool-call` frame.
    */
   providerMetadata?: Record<string, unknown>;
 }
@@ -108,7 +109,8 @@ export type UIMessagePart =
       /**
        * `text` is an OPAQUE encrypted provider payload (OpenAI Responses), not
        * display text — do not render it. Set from history by `uiFromMessages`,
-       * and since 2.3 from the wire's `reasoning-delta` too.
+       * and since 2.3 from the wire's `reasoning-delta` too (whose `data`
+       * carries the payload).
        */
       encrypted?: boolean;
       /** Provider-redacted thinking block: `text` is opaque data, never rendered (as `encrypted`). */
@@ -349,6 +351,17 @@ function reasoningBlockFromWire(part: DeuzUIPart): ReasoningBlockFields {
 }
 
 /**
+ * A `tool-call` frame's provider metadata (2.3), kept only when it is a plain
+ * object: `applyUIPart` is TOTAL, and `UIToolCall.providerMetadata` is echoed
+ * into the next request as given.
+ */
+function providerMetadataFromWire(value: unknown): Pick<UIToolCall, 'providerMetadata'> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? { providerMetadata: value as Record<string, unknown> }
+    : {};
+}
+
+/**
  * A finite number from the wire, or `undefined`. Same rule as `usageFromWire`:
  * `applyUIPart` is TOTAL, so a hostile/older/newer server's `"3"`, `NaN` or
  * `null` must fold without throwing AND without landing in a field typed
@@ -516,6 +529,11 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
       // cross a network boundary, so only well-typed values are kept.
       const block = reasoningBlockFromWire(part);
       const opaque = block.encrypted === true || block.redacted === true;
+      // An opaque block's payload rides the frame's `data` (2.3), with `text`
+      // left empty for clients that predate the flags; the UI part keeps it in
+      // `text`, as `uiFromMessages` does. A frame without a string `data`
+      // carries its payload in `text`.
+      const text = opaque && typeof part.data === 'string' ? part.data : part.text;
       const continues =
         tail?.type === 'reasoning' &&
         tail.state === 'streaming' &&
@@ -525,10 +543,10 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
         tail.id === block.id &&
         tail.source === block.source;
       const next: UIMessagePart[] = continues
-        ? [...parts.slice(0, -1), { ...tail, text: tail.text + part.text, ...signature }]
+        ? [...parts.slice(0, -1), { ...tail, text: tail.text + text, ...signature }]
         : openPart(parts, {
             type: 'reasoning',
-            text: part.text,
+            text,
             state: 'streaming',
             ...signature,
             ...block,
@@ -538,12 +556,15 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
         message: {
           ...turn.message,
           // The readable bucket: an opaque payload is never display text.
-          ...(opaque ? {} : { reasoning: (turn.message.reasoning ?? '') + part.text }),
+          ...(opaque ? {} : { reasoning: (turn.message.reasoning ?? '') + text }),
           parts: next,
         },
       };
     }
     case 'tool-call': {
+      // The call's provider round-trip data (2.3), e.g. a Gemini function
+      // call's signature, which `toolUseFromUI` echoes into the next request.
+      const meta = providerMetadataFromWire(part.providerMetadata);
       // A `tool-state: input-streaming` may have created a placeholder for
       // this id already — complete it in place instead of duplicating.
       if ((turn.message.toolCalls ?? []).some((c) => c.toolCallId === part.toolCallId)) {
@@ -553,6 +574,7 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
             toolName: part.toolName,
             input: part.input,
             state: 'call',
+            ...meta,
           })),
           part.toolCallId,
         );
@@ -562,6 +584,7 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
         toolName: part.toolName,
         input: part.input,
         state: 'call',
+        ...meta,
       };
       return withToolPart(
         {

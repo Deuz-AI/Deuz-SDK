@@ -28,7 +28,7 @@ import {
 The version an SSE response speaks is stamped in its `x-deuz-stream` response header. `DEUZ_STREAM_VERSION` is `'v2'` (the default emitted); `DEUZ_STREAM_VERSIONS` is `['v1', 'v2']`.
 
 - **v2** frames each event as `id: <seq>\ndata: <json>\n\n` and may carry the v2-only part types (`data-{name}`, `citation`, `tool-state`, `cost`, `budget-exceeded`, `plan-update`, `activity`).
-- **v1** output is **byte-identical to pre-1.7 releases**: no `id:` lines, and v2-only parts are dropped entirely (recursively — a v2-only part inside a `sub-agent` frame is just as invisible).
+- **v1** output has no `id:` lines, and v2-only parts are dropped entirely (recursively — a v2-only part inside a `sub-agent` frame is just as invisible). It is not byte-identical to pre-1.7 output: optional fields that later releases added to v1 parts (the approval `token` in 1.7; the `reasoning-delta` block fields and the `tool-call` provider metadata in 2.3) ride it too, and an older client ignores them.
 
 `negotiateDeuzStreamVersion(source)` picks the version from the client's `x-deuz-stream` *request* header: only an explicit `v1` downgrades — anything else, including no header at all, gets v2 (v1 clients never sent the header, and v2's additions are invisible to them). It accepts a `Request`, `Headers`, the raw header string, or `null`.
 
@@ -388,9 +388,9 @@ stream.writeData('progress', 0.4, { transient: true }); // never journaled
 | `step-start` | `step: number` | An agentic loop step begins. |
 | `step-finish` | `step: number`, `finishReason: FinishReason`, `usage: Usage` | A loop step ends. |
 | `text-delta` | `text: string` | A chunk of assistant text. |
-| `reasoning-delta` | `text: string`, `signature?: string`, `id?`, `encrypted?`, `redacted?`, `source?` **(2.3)** | A chunk of one reasoning block. `id` names the block (deltas of one block share it); `encrypted` / `redacted` mark an opaque payload, never display text; `source` is the provider family that produced it. |
+| `reasoning-delta` | `text: string`, `signature?: string`, `id?`, `encrypted?`, `redacted?`, `source?`, `data?` **(2.3)** | A chunk of one reasoning block. `id` names the block (deltas of one block share it); `encrypted` / `redacted` mark an opaque payload, which rides `data` with an empty `text`; `source` is the provider family that produced it. |
 | `tool-input-delta` | `toolCallId: string`, `toolName?: string`, `delta: string` | A raw fragment of a tool call's argument JSON. |
-| `tool-call` | `toolCallId: string`, `toolName: string`, `input: unknown` | A fully parsed tool call. |
+| `tool-call` | `toolCallId: string`, `toolName: string`, `input: unknown`, `providerMetadata?` **(2.3)** | A fully parsed tool call. `providerMetadata` is the call's provider round-trip data (a Gemini function call's `thoughtSignature`), which a chat client sends back with the call; never display it. |
 | `tool-result` | `toolCallId: string`, `toolName: string`, `output: unknown`, `isError?: boolean` | A tool finished executing (`isError: true` on a failed/self-healed tool). |
 | `tool-approval-request` | `approvalId`, `toolCallId`, `toolName`, `input`, `token?: string` | A gated tool call awaits the user's verdict — the loop broke; resume with `approvalResponses`. `token` is the HMAC-signed approval token when the call carried [`approvalSigner`](/docs/agents/durable-runtime#cryptographic-approval-trail-17) — echo it back on the verdict. |
 | `tool-approval-response` | `approvalId`, `approved: boolean`, `reason?`, `token?` | Client→server direction ONLY (declared for wire symmetry): the verdict travels in the next HTTP request body as `approvalResponses` — the server never serializes this part. `token` echoes the request's signed token (required to APPROVE under `approvalSigner`). |
@@ -413,7 +413,7 @@ stream.writeData('progress', 0.4, { transient: true }); // never journaled
 
 `Usage` and `FinishReason` are the canonical types from the core ([usage breakdown](/docs/core/stream-chat)). The `tool-input-delta` fragments accumulate into the `input` you receive on the matching `tool-call` — render the deltas for a live "typing the arguments" effect, then swap to the final `input`.
 
-Since 2.3 the wire's `reasoning-delta` carries the canonical part's `id`, `encrypted`, `redacted` and `source`, so a chat client rebuilds every reasoning block and sends it back unchanged (`useChat` does; see [Reasoning parts](/docs/core/messages#reasoning-parts)). Before 2.3 it carried only `text` and `signature`. The fields ride every wire version; a client that does not know them ignores them like any unknown key.
+Since 2.3 the wire's `reasoning-delta` carries the canonical part's `id`, `encrypted`, `redacted` and `source`, so a chat client rebuilds every reasoning block and sends it back unchanged (`useChat` does; see [Reasoning parts](/docs/core/messages#reasoning-parts)). Before 2.3 it carried only `text` and `signature`. The fields ride every wire version, and a client that does not know them ignores them like any unknown key. That is why an opaque block (an OpenAI encrypted item, a Claude `redacted_thinking` block) puts its payload in `data` and sends an empty `text`: a client that predates these fields, such as a 2.2 `@deuz-sdk/react`, the frozen `@deuz-sdk/core/react` hook or your own reader, appends `text` to the reasoning it shows, so it shows nothing for the block instead of the payload. `applyUIPart` reads the payload back from `data`. A reader of your own should skip a frame flagged `encrypted` or `redacted` when it renders reasoning, and keep `data` only to send the block back.
 
 ### Rendering a denial, not a failure
 

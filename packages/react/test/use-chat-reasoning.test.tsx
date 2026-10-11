@@ -14,6 +14,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { streamChat } from '@deuz-sdk/core';
 import type { Message } from '@deuz-sdk/core';
 import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createGoogleNative } from '@deuz-sdk/core/google';
 import { toDeuzStreamResponse } from '@deuz-sdk/core/ui';
 import { mockFetchSequence, sseEvents, sseResponse } from '@deuz-sdk/core/testing';
 import { useChat } from '../src/use-chat';
@@ -141,5 +142,79 @@ describe('useChat keeps reasoning blocks (2.3, F21)', () => {
     });
     // The readable reasoning shown to the user is the thinking text only.
     expect(result.current.messages[1]!.reasoning).toBe('a');
+  });
+});
+
+describe('useChat keeps a Gemini function call signature (2.3)', () => {
+  /** One Gemini `streamGenerateContent` SSE turn, one chunk per inner array. */
+  function geminiTurn(chunks: Record<string, unknown>[][]): string {
+    return sseEvents(
+      chunks.map((parts, i) => ({
+        data: {
+          candidates: [
+            {
+              content: { role: 'model', parts },
+              ...(i === chunks.length - 1 ? { finishReason: 'STOP' } : {}),
+            },
+          ],
+          ...(i === chunks.length - 1
+            ? {
+                usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
+              }
+            : {}),
+        },
+      })),
+    );
+  }
+
+  it('a client tool loop sends the thought and the function call signature back', async () => {
+    // Gemini 3 checks a function call's signature within the current turn, and
+    // a dropped one fails the next request (not live-verified).
+    const provider = mockFetchSequence([
+      () =>
+        sseResponse([
+          geminiTurn([
+            [{ text: 'a thought', thought: true, thoughtSignature: 'TS_THOUGHT' }],
+            [{ functionCall: { name: 'lookup', args: { q: 'x' } }, thoughtSignature: 'TS_FC' }],
+          ]),
+        ]),
+      () => sseResponse([geminiTurn([[{ text: 'Found it.' }]])]),
+    ]);
+    const model = createGoogleNative({ apiKey: 'k', fetch: provider.fetch })(
+      'gemini-3.1-pro-preview',
+    );
+    let n = 0;
+    // Unique ids per round, as a real route gets from `deps.generateId`.
+    const route: typeof fetch = async (_url, init) => {
+      const { messages } = JSON.parse(String(init?.body)) as { messages: Message[] };
+      const generateId = () => `srv-${n++}`;
+      return toDeuzStreamResponse(
+        streamChat({
+          model,
+          messages,
+          tools: { lookup: { parameters: { type: 'object', properties: {} } } },
+          deps: { generateId },
+        }),
+        { generateId },
+      );
+    };
+
+    const { result } = renderHook(() =>
+      useChat({ api: '/api/chat', fetch: route, onToolCall: () => 'result' }),
+    );
+    await act(async () => {
+      await result.current.sendMessage('q');
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+
+    expect(provider.calls).toHaveLength(2);
+    const second = JSON.parse(String(provider.calls[1]!.init!.body)) as {
+      contents: { role: string; parts: Record<string, unknown>[] }[];
+    };
+    expect(second.contents.find((c) => c.role === 'model')!.parts).toEqual([
+      { text: 'a thought', thought: true, thoughtSignature: 'TS_THOUGHT' },
+      { functionCall: { name: 'lookup', args: { q: 'x' } }, thoughtSignature: 'TS_FC' },
+    ]);
+    expect(result.current.messages[1]!.reasoning).toBe('a thought');
   });
 });

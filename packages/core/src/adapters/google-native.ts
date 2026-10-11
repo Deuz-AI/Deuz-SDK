@@ -123,7 +123,10 @@ function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart
       // Echo thought summary; carry the signature so multi-step tool use round-trips.
       // Only Gemini's own thoughts (2.3, F21): an OpenAI encrypted item or a
       // Claude signature is no thought signature (they used to ride as one).
-      if (!replaysTo(part, 'google')) return null;
+      // Gemini never produces an encrypted or redacted part, and it reads
+      // thought text as free text, so a flagged part is never sent, whatever
+      // its `source` claims.
+      if (part.encrypted || part.redacted || !replaysTo(part, 'google')) return null;
       const gp: GeminiPart = { text: part.text, thought: true };
       if (part.signature) gp.thoughtSignature = part.signature;
       return gp;
