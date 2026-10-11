@@ -281,9 +281,9 @@ function countTextBytes(value: unknown, budget: number, depth: number, walk: Wal
  * Whether a reasoning part is an opaque provider payload (2.3). The flags are
  * client-controlled, so one counts only on the family that produces it: only
  * OpenAI Responses produces `encrypted` reasoning and only Anthropic `redacted`
- * thinking, and those two wires hand the payload to an API that verifies it.
- * Any other flagged part (a "redacted" Gemini thought, say) is text to every
- * wire that sends it, so it is counted as text.
+ * thinking, and those two wires send the payload back only as the opaque block
+ * it came from. Any other flagged part (a "redacted" Gemini thought, say) is
+ * text to every wire that sends it, so it is counted as text.
  */
 function isOpaqueReasoning(part: Record<string, unknown>): boolean {
   if (part.type !== 'reasoning') return false;
