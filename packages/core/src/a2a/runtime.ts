@@ -10,7 +10,7 @@
  */
 import { AbortError, InvalidRequestError } from '../errors';
 import type { ResolvedDependencies } from '../types/deps';
-import { A2AError } from './errors';
+import { A2AError, isOwnProtocolError } from './errors';
 import { isTerminalState, toMessage, type A2AErrorReason } from './protocol';
 import type {
   A2AArtifact,
@@ -436,13 +436,16 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
     end(turn);
   }
 
-  /** The executor threw: an A2AError before any change answers the request, anything else fails the task. */
+  /**
+   * The executor threw: an A2AError of its own before any change answers the
+   * request, anything else (another agent's error included) fails the task.
+   */
   async function settleFailure(turn: Turn, error: unknown): Promise<void> {
     if (turn.ended) {
       if (!turn.controller.signal.aborted) report(error);
       return;
     }
-    if (error instanceof A2AError && error.kind === 'protocol' && !turn.changed) {
+    if (isOwnProtocolError(error) && !turn.changed) {
       fail(turn, error);
       return;
     }

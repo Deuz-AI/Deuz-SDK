@@ -507,8 +507,9 @@ export interface A2AArtifactOptions {
  * `execute` settles; updates after that are rejected. If `execute` resolves
  * while the task is `SUBMITTED` or `WORKING` the task is completed; if it
  * throws, the task fails with the error's message — unless it throws an
- * `A2AError` before changing the task, which answers the request with that
- * error instead.
+ * `A2AError` of its own before changing the task, which answers the request
+ * with that error instead. An `A2AError` a `createA2AClient` call threw is
+ * another agent's answer: it fails the task like any other error.
  */
 export interface A2AExecutionContext {
   /** The message that started this turn, with `taskId` and `contextId` filled in. */
@@ -574,7 +575,10 @@ export interface A2AExecutor {
   /**
    * Called before a task is canceled, whether or not a turn of it is running
    * here (an `INPUT_REQUIRED` task has none). Throw an `A2AError` with reason
-   * `'TASK_NOT_CANCELABLE'` to refuse. Do not wait for `execute` in here.
+   * `'TASK_NOT_CANCELABLE'` to refuse. Whatever it throws leaves the task
+   * uncanceled; anything but an `A2AError` of its own (one a
+   * `createA2AClient` call threw included) answers `INTERNAL_ERROR`. Do not
+   * wait for `execute` in here.
    */
   cancel?(context: A2ACancelContext): void | Promise<void>;
 }

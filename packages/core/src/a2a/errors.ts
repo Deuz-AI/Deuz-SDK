@@ -36,7 +36,9 @@ export interface A2AErrorOptions {
 /**
  * An A2A failure, on either side of the wire. The client throws it for every
  * failed call; an executor throws one with a `reason` to answer a request
- * with that A2A error.
+ * with that A2A error. Only one the executor raises itself does that: an
+ * `A2AError` a client call threw is another agent's answer, and fails the
+ * task like any other error.
  */
 export class A2AError extends DeuzError {
   readonly code = 'a2a_error';
@@ -72,4 +74,22 @@ export class A2AError extends DeuzError {
       },
     };
   }
+}
+
+/** The errors `createA2AClient` decoded from another agent's answer (internal, not exported). */
+const REMOTE = new WeakSet<A2AError>();
+
+/** Brands an error decoded from another agent's answer. */
+export function markRemote(error: A2AError): A2AError {
+  REMOTE.add(error);
+  return error;
+}
+
+/**
+ * A `protocol` error raised in this process: the only kind a handler answers
+ * a request with, so another agent's code, reason and metadata are never
+ * sent on as this agent's own.
+ */
+export function isOwnProtocolError(error: unknown): error is A2AError {
+  return error instanceof A2AError && error.kind === 'protocol' && !REMOTE.has(error);
 }
