@@ -125,6 +125,24 @@ describe('Redis swarm store', () => {
       expect(await server.redis.zcard(key)).toBe(0);
   });
 
+  it('prunes a settled run whose record is gone, and drops its index entries', async () => {
+    const server = mockRedisServer();
+    const store = createRedisSwarmStore({ client: server.client });
+    await store.create(at('a', 'r', 1), []);
+    await store.commit({
+      scope: 'a',
+      runId: 'r',
+      expectedRevision: 0,
+      run: { status: 'completed', updatedAt: 9 },
+    });
+    // The record is lost (evicted, say) while the indexes still name the run.
+    await server.redis.del('{deuz:swarm}:run:0061-0072');
+    expect(await store.prune({ before: 10 })).toBe(1);
+    for (const key of await server.redis.keys('{deuz:swarm}:ix*'))
+      expect(await server.redis.zcard(key)).toBe(0);
+    expect(await store.prune({ before: 10 })).toBe(0);
+  });
+
   it('fences a commit by the run generation, so a run created again under its key is safe', async () => {
     const server = mockRedisServer();
     const other = createRedisSwarmStore({ client: server.client });

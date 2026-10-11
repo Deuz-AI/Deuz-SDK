@@ -369,7 +369,10 @@ const onRedis = createRedisBudgetStore({ client: redis });
   per model) under keys that share the hash tag `{<prefix>:budget}`, so a Redis
   Cluster keeps them in one slot. Needs Redis 7 or later. `{ url }` instead of
   `{ client }` imports the optional `redis` peer on first use, and `close()` then
-  quits that connection.
+  quits that connection. The server must never evict these keys: an evicted
+  scope starts again empty and admits its whole limit again. Use
+  `maxmemory-policy noeviction` or a `volatile-*` policy, and AOF; see
+  [Redis](/docs/modules/operations#redis) in Operations.
 
 `usage(key, { since, byModel })` reports committed usage (settled amounts plus
 held estimates) over the key's history, or since a point in time; a bucket that

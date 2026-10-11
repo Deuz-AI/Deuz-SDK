@@ -401,7 +401,7 @@ const io = new Redis(process.env.REDIS_URL!);
 const stores = createRedisStores({ client: wrapIoredisClient(io) });
 ```
 
-It maps each command onto its lowercase spelling and `eval`'s key list onto ioredis's positional key count, and answers an empty batch (`mGet([])`, `del([])`) itself, because Redis rejects those commands without a key. The connection stays yours. Anything else with the twelve methods fits the seam as a plain object: a cluster proxy, an HTTP client, a test double.
+It maps each command onto its lowercase spelling and `eval`'s key list onto ioredis's positional key count, and answers an empty batch (`mGet([])`, `del([])`) itself, because Redis rejects those commands without a key. The connection stays yours, and so does its `keyPrefix`: ioredis applies it to every key of the pack and of the 2.3 stores, whose scripts build their keys only from the keys they declare. Anything else with the twelve methods fits the seam as a plain object: a cluster proxy, an HTTP client, a test double.
 
 ### Key schema
 

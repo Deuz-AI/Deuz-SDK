@@ -8,7 +8,13 @@
  * means waiting.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { createRedisOpsStore, type RedisOpsStoreOptions } from '../src/node/ops-redis';
+import {
+  createRedisBudgetStore,
+  createRedisOpsStore,
+  type RedisOpsStoreOptions,
+} from '../src/node/ops-redis';
+import { createRedisSwarmStore } from '../src/node/swarm-redis';
+import { initialSnapshot } from './fixtures/swarm-store-conformance';
 import { leaseProviderContracts } from './fixtures/lease-provider-conformance';
 import {
   agentRunPruneContracts,
@@ -137,6 +143,24 @@ describe('Redis ops store', () => {
     expect(await a.agentRuns.load('r')).toMatchObject({ revision: 2, modelSteps: 5 });
     expect(await a.claims('k')).toBe(true);
     expect(await b.claims('k')).toBe(false);
+  });
+
+  it('sets no TTL on any key, so only an allkeys-* eviction policy can drop one', async () => {
+    // operations.mdx tells operators to run noeviction or a volatile-* policy,
+    // which evicts only keys that have a TTL: none of these may have one.
+    const { server, ops } = fresh();
+    await ops.leases.acquire({ key: 'run', owner: 'a', ttlMs: 60_000 });
+    await ops.leases.signal('run', 'cancel');
+    await ops.agentRuns.save(envelope('r1', 1, { phase: 'terminal' }));
+    expect(await ops.claims('nightly@1')).toBe(true);
+    const budget = createRedisBudgetStore({ client: server.client });
+    const scope = { key: 'u', limits: { tokens: 100 }, window: { ms: 60_000 } };
+    await budget.reserve({ requestId: 'b', modelId: 'm', tokens: 1, scopes: [scope] });
+    await budget.prune({ before: server.now() });
+    await createRedisSwarmStore({ client: server.client }).create(initialSnapshot(), []);
+    const keys = await server.redis.keys('*');
+    expect(keys.length).toBeGreaterThan(20);
+    for (const key of keys) expect(await server.redis.pttl(key), key).toBe(-1);
   });
 
   it('rejects an invalid revision and a malformed retention cutoff', async () => {

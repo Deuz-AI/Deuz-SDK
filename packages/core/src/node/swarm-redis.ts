@@ -225,21 +225,25 @@ end
 return arr(out)
 `);
 
-// KEYS: an index. ARGV: min, limit, the run-hash prefix.
+// KEYS: an index, the index of every run. ARGV: min, limit.
 const listScript = script(`
+local w = key_base(KEYS[2], 'ix')
 local members = redis.call('ZRANGEBYLEX', KEYS[1], ARGV[1], '+', 'LIMIT', '0', ARGV[2])
 local out = {}
 for i = 1, #members do
-  local rec = redis.call('HGET', ARGV[3] .. string.sub(members[i], 17), 'rec')
+  local rec = redis.call('HGET', w .. 'run:' .. string.sub(members[i], 17), 'rec')
   if has(rec) then out[#out + 1] = rec end
 end
 return arr(out)
 `);
 
+/** The settled statuses as a Lua list, e.g. `{'completed', 'partial', 'cancelled'}`. */
+const SETTLED_LUA = `{${SETTLED_RUN_STATUSES.map((status) => `'${status}'`).join(', ')}}`;
+
 // KEYS: a scratch ZSET, then the three settled-status indexes to prune from.
-// ARGV: max (exclusive, the sortable 'before'), limit, the tag prefix. Merges
-// the oldest candidates of each index in the scratch set, so Redis orders
-// them, and deletes the first 'limit' runs with all their keys and entries.
+// ARGV: max (exclusive, the sortable 'before'), limit. Merges the oldest
+// candidates of each index in the scratch set, so Redis orders them, and
+// deletes the first 'limit' runs with all their keys and entries.
 const pruneScript = script(`
 redis.call('DEL', KEYS[1])
 for i = 2, 4 do
@@ -250,7 +254,7 @@ local chosen = redis.call('ZRANGEBYLEX', KEYS[1], '-', '+', 'LIMIT', '0', ARGV[2
 local victims = {}
 for j = 1, #chosen do victims[#victims + 1] = chosen[j] end
 redis.call('DEL', KEYS[1])
-local w = ARGV[3]
+local w = key_base(KEYS[1], 'prune')
 for j = 1, #victims do
   local member = victims[j]
   local id = string.sub(member, 17)
@@ -258,9 +262,17 @@ for j = 1, #victims do
   local scope = string.match(id, '^([^-]*)-')
   redis.call('DEL', w .. 'run:' .. id, w .. 'tasks:' .. id, w .. 'order:' .. id, w .. 'events:' .. id, w .. 'notes:' .. id)
   redis.call('ZREM', w .. 'ix', member)
-  redis.call('ZREM', w .. 'ix:st:' .. status, member)
   redis.call('ZREM', w .. 'ix:sc:' .. scope, member)
-  redis.call('ZREM', w .. 'ix:ss:' .. status .. ':' .. scope, member)
+  if has(status) then
+    redis.call('ZREM', w .. 'ix:st:' .. status, member)
+    redis.call('ZREM', w .. 'ix:ss:' .. status .. ':' .. scope, member)
+  else
+    -- The run's record is gone (evicted, say): drop it from every settled index.
+    for _, settled in ipairs(${SETTLED_LUA}) do
+      redis.call('ZREM', w .. 'ix:st:' .. settled, member)
+      redis.call('ZREM', w .. 'ix:ss:' .. settled .. ':' .. scope, member)
+    end
+  end
 end
 return #victims
 `);
@@ -492,8 +504,8 @@ export function createRedisSwarmStore(options: RedisSwarmStoreOptions): RedisSwa
       // Strictly after the cursor, in the listing order.
       const min = query.after ? `(${member(query.after)}` : '-';
       const client = await use();
-      return texts(await listScript(client, [index], [min, arg(query.limit), `${tag}:run:`])).map(
-        (run) => decodeRun(run),
+      return texts(await listScript(client, [index, all], [min, arg(query.limit)])).map((run) =>
+        decodeRun(run),
       );
     },
     async prune(pruneOptions) {
@@ -506,7 +518,7 @@ export function createRedisSwarmStore(options: RedisSwarmStoreOptions): RedisSwa
         await pruneScript(
           client,
           [`${tag}:prune`, ...indexes],
-          [`(${sortableNumber(before)}`, arg(limit), `${tag}:`],
+          [`(${sortableNumber(before)}`, arg(limit)],
         ),
       );
     },

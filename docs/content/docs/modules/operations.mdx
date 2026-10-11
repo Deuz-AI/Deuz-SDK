@@ -437,14 +437,17 @@ console.log(`${handles.length} runs taken over, ${failed.length} could not be re
 - **Clients.** The stores need one method, `eval(script, { keys, arguments })`,
   node-redis's `EVAL` signature, typed `RedisScriptClient`. A connected
   node-redis client (v4, v5 or v6, standalone or cluster) fits as it is; wrap
-  ioredis with `wrapIoredisClient(io)`. `{ url }` instead of `{ client }`
-  imports the optional `redis` peer on first use and connects once; `close()`
-  quits that connection and is final. An injected client is never closed.
+  ioredis with `wrapIoredisClient(io)`. A `keyPrefix` set on the ioredis client
+  applies to every key, because each script builds its keys only from the keys
+  it declares. `{ url }` instead of `{ client }` imports the optional `redis`
+  peer on first use and connects once; `close()` quits that connection and is
+  final. An injected client is never closed.
 - **Batched retention.** `leases.prune`, `agentRuns.prune`, `claims.prune` and
   the budget store's `prune` remove at most 1 000 entries per script and run
-  again until a batch comes back short, so a large backlog never holds the
-  server in one long script. A swarm prune deletes up to its `limit` in one
-  script.
+  again until a batch comes back short, and the budget store folds each scope's
+  history a page of about 1 000 rows per script (`HSCAN`), so a large backlog
+  never holds the server in one long script. A swarm prune deletes up to its
+  `limit` in one script.
 - **Durability is your server's.** Redis acknowledges a write from memory. What
   survives a crash depends on its persistence: with AOF and
   `appendfsync everysec` up to about a second of writes can be lost, and with
@@ -452,6 +455,20 @@ console.log(`${handles.length} runs taken over, ${failed.length} could not be re
   failover may lack the last writes it had not received. A lost lease write
   costs liveness, which the revision fence covers; a lost budget charge or
   agent run save is lost. Enable AOF for these stores.
+- **Nothing may be evicted.** The stores set no TTL on any key: their keys hold
+  state, not a cache. Run them on a server whose `maxmemory-policy` is
+  `noeviction` (the Redis default) or a `volatile-*` policy, which evicts only
+  keys that have a TTL. An `allkeys-*` policy (`allkeys-lru`, `allkeys-lfu`,
+  `allkeys-random`), usual on a server set up as a cache, drops whole keys
+  under memory pressure without an error, and one key can hold a whole store's
+  leases, claims or runs. An evicted budget scope
+  (`{<prefix>:budget}:scope:<key>`) starts again empty and admits its whole
+  limit again. An evicted `{<prefix>:ops}:lease:expiry` lets a second executor
+  take a lease that is still held. An evicted `{<prefix>:ops}:claims` makes
+  every claim key claimable again, so an occurrence or a delivery can run
+  twice. An evicted `{<prefix>:ops}:run:payload`, or a swarm run's keys, loses
+  those runs. Under `noeviction` a full server refuses writes instead and the
+  stores' calls reject, so leave it room and prune.
 
 | Key (tag `T`) | Holds |
 | --- | --- |

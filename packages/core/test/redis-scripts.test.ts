@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   hexUnits,
   inBatches,
+  LUA_HSCAN,
   redisStoreTag,
   replyList,
   replyNumber,
@@ -156,6 +157,33 @@ function helperContracts(name: string, make: () => Promise<RedisScriptClient>) {
         redis.call('DEL', KEYS[1])
         return arr(out)`);
       expect(replyList(await run(client, [`{t}:${Math.random()}`], []))).toEqual(['1', '-', '1']);
+    });
+
+    it('reads an HSCAN page as a list, however the server indexes the nested reply', async () => {
+      const client = await make();
+      const run = script(`${LUA_HSCAN}
+        if ARGV[1] == '1' then redis.call('HSET', KEYS[1], 'a', '1', 'b', '2', 'c', '3') end
+        local cursor, rows = hscan(KEYS[1], '0', '10')
+        redis.call('DEL', KEYS[1])
+        local out = {cursor}
+        for i = 1, #rows do out[#out + 1] = rows[i] end
+        return arr(out)`);
+      const key = `{t}:${Math.random()}`;
+      const [cursor, ...rows] = replyList(await run(client, [key], ['1'])).map(replyText);
+      expect(cursor).toBe('0');
+      const pairs = Array.from({ length: rows.length / 2 }, (_, i) => rows.slice(2 * i, 2 * i + 2));
+      expect(pairs.sort()).toEqual([
+        ['a', '1'],
+        ['b', '2'],
+        ['c', '3'],
+      ]);
+      expect(replyList(await run(client, [key], ['0']))).toEqual(['0']);
+    });
+
+    it('takes the key base from a declared key, a client prefix included', async () => {
+      const client = await make();
+      const run = script(`return key_base(KEYS[1], 'open')`);
+      expect(await run(client, ['app:{t}:open'], [])).toBe('app:{t}:');
     });
 
     it('reads the time in whole milliseconds', async () => {

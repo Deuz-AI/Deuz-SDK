@@ -336,6 +336,9 @@ runs Lua scripts, such as a connected node-redis client, or ioredis through
 run is still at the revision its validation read, so a concurrent writer gets
 `SwarmConflictError` and nothing of its commit is written. Its keys share the
 hash tag `{<prefix>:swarm}`, so a Redis Cluster keeps the store in one slot.
+The server must keep them: an evicted key loses a run, or hides it from
+`listRuns` and `recover()`. Use `maxmemory-policy noeviction` or a `volatile-*`
+policy, and AOF; see [Redis](/docs/modules/operations#redis) in Operations.
 
 ```ts
 import { createClient } from 'redis';

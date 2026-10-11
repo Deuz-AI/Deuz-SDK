@@ -12,6 +12,12 @@
  * hash tag, so a Redis Cluster keeps the store in one slot and a script that
  * reaches a key through an index stays atomic and legal there.
  *
+ * Every key a script touches is one it declares or is built from one
+ * (`key_base` strips a declared key's known name to get the store's key base),
+ * never from an argument: a client-side key prefix, such as ioredis
+ * `keyPrefix`, reaches only the declared keys, so a key built from an argument
+ * would miss it.
+ *
  * The scripts run on Redis's Lua 5.1 and on the Lua 5.3 of ioredis-mock
  * (fengari), which the offline tests use. So every number a script computes
  * with is a float (`num`, `floor`: fengari's integers are 32 bits and wrap,
@@ -173,7 +179,8 @@ export function sortableNumber(value: number): string {
 
 /**
  * The helpers every script starts with (see the module note). `now_ms` reads
- * Redis `TIME` in whole milliseconds.
+ * Redis `TIME` in whole milliseconds; `key_base(key, name)` is a declared `key`
+ * without its trailing `name`, the store's key base, prefix included.
  */
 export const LUA_HELPERS = `
 local function num(v) return tonumber(v) + 0.0 end
@@ -189,6 +196,24 @@ local function arr(t)
   local out = {}
   for i = #t, 1, -1 do out[i] = t[i] end
   return out
+end
+local function key_base(key, name) return string.sub(key, 1, #key - #name) end
+`;
+
+/**
+ * `hscan(key, cursor, count)`: one `HSCAN` page, as its next cursor (`'0'` once
+ * the scan is done) and a list of field, value, field, value. Redis hands the
+ * nested list over 1-indexed and ioredis-mock (fengari) 0-indexed, so it is
+ * read either way. Only the scripts that scan include it.
+ */
+export const LUA_HSCAN = `
+local function hscan(key, cursor, count)
+  local page = redis.call('HSCAN', key, cursor, 'COUNT', count)
+  local list, rows = page[2], {}
+  local first = 1
+  if list[0] ~= nil then first = 0 end
+  for i = first, first + #list - 1 do rows[#rows + 1] = list[i] end
+  return page[1], rows
 end
 `;
 
@@ -267,8 +292,9 @@ export function replyNumber(reply: unknown): number {
 export const arg = (value: number): string => String(value);
 
 /**
- * The most entries one retention script removes. Retention runs in batches so
- * a large backlog never holds the server in one long script.
+ * The most entries one retention script removes, and the page size of the
+ * scan that folds budget history. Retention runs in batches so a large
+ * backlog never holds the server in one long script.
  */
 export const PRUNE_BATCH = 1_000;
 
