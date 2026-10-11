@@ -118,18 +118,39 @@ function normalizeContent(content: string | Part[]): Part[] {
 }
 
 /**
- * Split out system-role messages (text concatenated) from the rest. Adapters
- * that need a top-level system slot (Anthropic) use this; adapters that keep
- * system inline (OpenAI) may ignore it.
+ * Split the top-level system slot from the rest, for the wires that have one
+ * (Anthropic `system`, Responses `instructions`, Gemini `systemInstruction`).
+ *
+ * The slot is the LEADING run of system messages (2.3, F22): a system message
+ * after the first non-system message is a MID-CONVERSATION system message, and
+ * where it goes is the wire's call:
+ *
+ * - `inPlace: true` keeps it in `rest` at its position (Claude 5.x, OpenAI
+ *   Responses). Claude 5.x binds its thinking to the transcript prefix, so a
+ *   system message appended mid-run must not rewrite the top-level slot.
+ * - the default folds its text into the slot after the leading run's, in array
+ *   order: the 2.2 behaviour, for the wires without a mid-conversation system
+ *   role (Gemini) or where it is not known to be accepted (older Claude).
+ *
+ * A system message without text (2.3: the carrier of a tool-set change, see
+ * `internal/stable-prefix.ts`) contributes nothing to the slot; in place it
+ * stays in `rest` for the wire that can render it.
  */
-export function extractSystem(messages: NormalizedMessage[]): {
+export function extractSystem(
+  messages: NormalizedMessage[],
+  options: { inPlace?: boolean } = {},
+): {
   system?: string;
   rest: NormalizedMessage[];
 } {
   const systemTexts: string[] = [];
   const rest: NormalizedMessage[] = [];
+  let leading = true;
   for (const m of messages) {
-    if (m.role === 'system') {
+    if (m.role !== 'system') {
+      leading = false;
+      rest.push(m);
+    } else if (leading || !options.inPlace) {
       for (const p of m.content) if (p.type === 'text') systemTexts.push(p.text);
     } else {
       rest.push(m);

@@ -172,7 +172,11 @@ function withEncryptedReasoning(include: unknown): string[] {
 
 function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options, object, tools } = ctx;
-  const { system, rest } = extractSystem(messages);
+  // The leading system run is `instructions`; a system message later in the
+  // history stays in place as a `system` input item (2.3, F22), which
+  // `EasyInputMessage` types next to `developer`. 2.2 folded it into
+  // `instructions`.
+  const { system, rest } = extractSystem(messages, { inPlace: true });
   assertToolSurface(ctx, 'responses');
 
   // An unknown model's placeholder cap is left off (2.3): the provider's own

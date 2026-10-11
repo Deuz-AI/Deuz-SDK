@@ -14,7 +14,7 @@ import {
   RateLimitError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
-import { registryMatch, type EffortLevel } from '../core/registry';
+import type { EffortLevel } from '../core/registry';
 import {
   anthropicMaxTokens,
   atMostHigh,
@@ -26,6 +26,7 @@ import {
 } from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
 import { replaysTo } from '../internal/reasoning';
+import { bindsThinkingToPrefix } from '../internal/stable-prefix';
 import { acceptsDocuments, resolveMedia, warnDroppedDocument } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -152,29 +153,13 @@ function mapAnthropicToolChoice(
 // Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind each thinking block's
 // signature to the conversation before it (Anthropic API reference, cached
 // 2026-10-06). On accounts opened from 2026-08-31 a replayed block whose prefix
-// changed fails the request with 400, and Deuz's transcript prefix is not yet
-// stable (F22: recall, handoff and compaction still rewrite it). A request that
-// sends thinking back to such a model therefore asks the API to drop a
-// mismatched block instead. Shapes from @anthropic-ai/sdk 0.133.0's beta types;
-// not live-verified.
+// changed fails the request with 400. The loops keep the prefix stable (F22,
+// `internal/stable-prefix.ts`); a request that sends thinking back to such a
+// model still asks the API to drop a mismatched block instead, as the safety
+// net for a history edited elsewhere. Shapes from @anthropic-ai/sdk 0.133.0's
+// beta types; not live-verified.
 
 const BLOCK_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
-
-/** The binding models; an unknown 5.x id on the family fallback counts too. */
-const PREFIX_BOUND_MODELS: ReadonlySet<string> = new Set([
-  'claude-fable-5-1',
-  'claude-opus-5-5',
-  'claude-sonnet-5-5',
-  'claude-haiku-5-5',
-]);
-
-function bindsThinkingToPrefix(call: BuildContext['call']): boolean {
-  return (
-    PREFIX_BOUND_MODELS.has(call.modelId) ||
-    registryMatch({ provider: call.provider, modelId: call.modelId, surface: 'anthropic' }) ===
-      'family'
-  );
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -193,14 +178,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function applyBlockBinding(
   ctx: BuildContext,
   body: Record<string, unknown>,
-  replaysThinking: boolean,
+  /** The request replays thinking to a model that binds it to the prefix. */
+  bindsReplay: boolean,
 ): boolean {
   const own = ctx.options.providerOptions?.[ctx.call.provider];
   const caller = isRecord(own?.thinking) ? own.thinking : undefined;
   const explicit = caller !== undefined && Object.hasOwn(caller, 'block_binding');
   const binding = explicit
     ? caller.block_binding
-    : replaysThinking && bindsThinkingToPrefix(ctx.call)
+    : bindsReplay
       ? { prefix_mismatch_behavior: 'drop_block' }
       : undefined;
   if (binding === undefined) return false;
@@ -239,7 +225,17 @@ function withBeta(headers: Record<string, string>, beta: string): Record<string,
 
 function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options } = ctx;
-  const { system, rest } = extractSystem(messages);
+  // Claude 5.x binds thinking to the transcript prefix (2.3, F22): a system
+  // message appended mid-conversation rides in place as a `role: 'system'`
+  // message (GA `MessageParam`) instead of rewriting the top-level `system`.
+  // Older models keep the 2.2 fold; whether they accept the role is not
+  // live-verified.
+  const bound = bindsThinkingToPrefix({
+    provider: call.provider,
+    modelId: call.modelId,
+    surface: 'anthropic',
+  });
+  const { system, rest } = extractSystem(messages, { inPlace: bound });
 
   const media: MediaContext = {
     caps,
@@ -250,12 +246,15 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   };
   // Blocks keep the order the model produced them in (2.3, F21): thinking
   // between tool calls stays there, since a moved block is a modified prefix.
-  const wireMessages = rest.map((m) => ({
-    role: m.role === 'tool' ? 'user' : m.role,
-    content: m.content
-      .map((p) => partToBlock(p, media))
-      .filter((b): b is AnthropicBlock => b !== null),
-  }));
+  const wireMessages = rest
+    .map((m) => ({
+      role: m.role === 'tool' ? 'user' : m.role,
+      content: m.content
+        .map((p) => partToBlock(p, media))
+        .filter((b): b is AnthropicBlock => b !== null),
+    }))
+    // A mid-conversation system message with nothing to say is not sent.
+    .filter((m) => m.role !== 'system' || m.content.length > 0);
 
   // Opus 4.7+/Sonnet 5/Fable 5/Claude 5.x: budget_tokens returns 400 — effort
   // rides output_config. Every value changed on the way is reported (2.3): see
@@ -402,7 +401,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       m.role === 'assistant' &&
       m.content.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking'),
   );
-  const extraHeaders = applyBlockBinding(ctx, body, replaysThinking)
+  const extraHeaders = applyBlockBinding(ctx, body, replaysThinking && bound)
     ? withBeta(call.headers, BLOCK_BINDING_BETA)
     : call.headers;
 
