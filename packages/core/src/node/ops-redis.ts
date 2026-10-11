@@ -40,7 +40,7 @@
  * Runs saved by a pre-release 2.3 build, before the listing index existed,
  * have no entry. A store this build created is stamped `T:run:indexed` with
  * its schema; on any other, the first `list` indexes the runs that lack an
- * entry, a page of 100 per script, then sets the marker. A terminal run is
+ * entry, a page of about 100 per script, then sets the marker. A terminal run is
  * listed at its terminal save time; another, whose last save nothing
  * recorded, at the time it was indexed.
  */

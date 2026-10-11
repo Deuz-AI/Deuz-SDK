@@ -313,8 +313,9 @@ export const PRUNE_BATCH = 1_000;
 
 /**
  * The page of runs one script looks at when the ops store indexes the agent
- * runs saved before its listing index existed. Small, because each run found
- * unindexed comes back with its payload.
+ * runs saved before its listing index existed (an `HSCAN` COUNT, so a hint:
+ * Redis answers a small hash whole). Small, because each run found unindexed
+ * comes back with its payload.
  */
 export const BACKFILL_BATCH = 100;
 
