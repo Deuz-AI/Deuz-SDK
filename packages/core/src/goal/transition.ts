@@ -99,6 +99,19 @@ const criterionOf = (input: GoalCriterionInput): GoalCriterion => ({
   ...(input.required !== undefined ? { required: input.required } : {}),
 });
 
+/** Criteria that say the same, on the fields this build knows. */
+const sameCriterion = (left: GoalCriterion, right: GoalCriterion): boolean =>
+  left.id === right.id &&
+  left.description === right.description &&
+  left.required === right.required;
+
+/** The fields of a stored criterion this build does not know: a later 2.x release added them. */
+function addedFields(criterion: GoalCriterion | undefined): Record<string, unknown> {
+  if (!criterion) return {};
+  const { id: _id, description: _description, required: _required, ...added } = criterion;
+  return added;
+}
+
 const evidenceOf = (input: GoalEvidenceInput, now: number): GoalEvidence => ({
   id: input.id,
   source: input.source,
@@ -109,9 +122,14 @@ const evidenceOf = (input: GoalEvidenceInput, now: number): GoalEvidence => ({
   at: input.at ?? now,
 });
 
-/** Evidence that says the same, whenever it was recorded. */
+/**
+ * Evidence that says the same, whenever it was recorded, on the fields this
+ * build knows: what a later 2.x release added to it makes no conflict.
+ */
 const sameEvidence = (left: GoalEvidence, right: GoalEvidence): boolean =>
-  JSON.stringify({ ...left, at: 0 }) === JSON.stringify({ ...right, at: 0 });
+  (['id', 'source', 'ref', 'digest', 'summary', 'runId'] as const).every(
+    (field) => left[field] === right[field],
+  );
 
 /**
  * A new goal (2.3): `active`, at revision 1. Without criteria, the objective
@@ -621,17 +639,23 @@ function revise(draft: Draft, command: Extract<GoalCommand, { type: 'revise' }>)
   }
   if (command.criteria !== undefined) {
     const criteria = command.criteria.map(criterionOf);
-    if (differs(criteria, goal.criteria)) {
+    const stored = new Map(goal.criteria.map((criterion) => [criterion.id, criterion]));
+    if (
+      criteria.length !== goal.criteria.length ||
+      criteria.some((criterion, index) => !sameCriterion(criterion, goal.criteria[index]!))
+    ) {
       const next = draft.edit();
       // A verdict stands only for a criterion that still says the same.
-      const kept = new Map(
-        goal.criteria.map((criterion) => [criterion.id, JSON.stringify(criterion)]),
-      );
       next.results = next.results.filter((result) => {
-        const criterion = criteria.find((item) => item.id === result.criterionId);
-        return criterion !== undefined && kept.get(criterion.id) === JSON.stringify(criterion);
+        const before = stored.get(result.criterionId);
+        const after = criteria.find((item) => item.id === result.criterionId);
+        return before !== undefined && after !== undefined && sameCriterion(before, after);
       });
-      next.criteria = criteria;
+      // What a later 2.x release added to a criterion stays with it.
+      next.criteria = criteria.map((criterion) => ({
+        ...criterion,
+        ...addedFields(stored.get(criterion.id)),
+      }));
       changed = true;
     }
   }

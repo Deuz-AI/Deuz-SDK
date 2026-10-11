@@ -166,6 +166,89 @@ describe('GoalRecord serialization', () => {
     expect((next as GoalRecord & { inbox?: unknown }).inbox).toEqual([{ key: 'k' }]);
   });
 
+  it('keeps what a later 2.x release added to criteria through a revise, and the verdicts on them', () => {
+    const created = createGoal(
+      {
+        goalId: 'g',
+        scope: 's',
+        objective: 'x',
+        criteria: [
+          { id: 'build', description: 'passes' },
+          { id: 'docs', description: 'documented' },
+        ],
+      },
+      { now: T0 },
+    );
+    // As a later 2.x writer stored them.
+    const later = parseGoal({
+      ...created,
+      criteria: [
+        { id: 'build', description: 'passes', weight: 2 },
+        { id: 'docs', description: 'documented', weight: 1 },
+      ],
+    });
+    const judged = transitionGoal(
+      later,
+      {
+        type: 'evaluate',
+        evidence: [{ id: 'ci', source: 'test', ref: 'ci/1' }],
+        results: [
+          { criterionId: 'build', verdict: 'passed', source: 'test', evidence: ['ci'] },
+          { criterionId: 'docs', verdict: 'passed', source: 'human', evidence: ['ci'] },
+        ],
+      },
+      { now: T0 + 1 },
+    ).record;
+    expect(judged.results).toHaveLength(2);
+    // Passed back as they were read, the criteria change nothing.
+    const revised = transitionGoal(
+      judged,
+      { type: 'revise', objective: 'y', criteria: judged.criteria },
+      { now: T0 + 2 },
+    ).record;
+    expect(revised.objective).toBe('y');
+    expect(revised.criteria).toEqual(judged.criteria);
+    expect(revised.results).toEqual(judged.results);
+    // A 2.3 host rewording one drops that verdict alone, and keeps what it does not know.
+    const reworded = transitionGoal(
+      judged,
+      {
+        type: 'revise',
+        criteria: [
+          { id: 'build', description: 'passes' },
+          { id: 'docs', description: 'documented in the guide' },
+        ],
+      },
+      { now: T0 + 3 },
+    ).record;
+    expect(reworded.criteria).toEqual([
+      { id: 'build', description: 'passes', weight: 2 },
+      { id: 'docs', description: 'documented in the guide', weight: 1 },
+    ]);
+    expect(reworded.results.map((result) => result.criterionId)).toEqual(['build']);
+  });
+
+  it('takes evidence a later 2.x release recorded with more fields as the same evidence', () => {
+    const later = parseGoal({
+      ...goal,
+      evidence: [{ id: 'ci', source: 'test', ref: 'ci/1', at: T0, attempt: 2 }],
+    });
+    expect(
+      transitionGoal(
+        later,
+        { type: 'evidence', evidence: [{ id: 'ci', source: 'test', ref: 'ci/1' }] },
+        { now: T0 + 2 },
+      ),
+    ).toMatchObject({ changed: false, outcome: 'ignored', reason: 'unchanged' });
+    expect(
+      transitionGoal(
+        later,
+        { type: 'evidence', evidence: [{ id: 'ci', source: 'test', ref: 'ci/2' }] },
+        { now: T0 + 2 },
+      ),
+    ).toMatchObject({ outcome: 'rejected', reason: 'evidence-conflict' });
+  });
+
   it('refuses a version it cannot read, and anything that is not a goal record', () => {
     const newer = { ...JSON.parse(serializeGoal(goal)), version: 2 };
     expect(() => parseGoal(newer)).toThrow(

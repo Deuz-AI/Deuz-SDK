@@ -218,7 +218,8 @@ goal stays open, so the work can go on. To give up, send `fail`. A verdict
 names its criterion and the evidence it rests on; an unknown one is refused
 (`'unknown-criterion'`, `'unknown-evidence'`), and so is evidence under a known
 ID that says something else (`'evidence-conflict'`). When a revision changes a
-criterion, its verdict is dropped; evidence is kept.
+criterion's `description` or `required`, its verdict is dropped; evidence is
+kept. Passing `goal.criteria` back unchanged changes nothing.
 
 ## Budget and deadline
 
@@ -396,7 +397,9 @@ Records and events carry `kind` and `version`. `serializeGoal` and
   2.3 writes and reads version 1.
 - Within a version, later 2.x releases only add optional fields. A reader keeps
   fields it does not know, through every transition, and fills in the ones a
-  writer may leave out (no evidence, verdicts, spend or keys yet).
+  writer may leave out (no evidence, verdicts, spend or keys yet). It compares
+  criteria and evidence on the fields it knows, so a criterion a revision passes
+  back keeps what a later release added to it, and so does its verdict.
 - Anything JSON would change, such as a `Date`, a function or `NaN` in `meta`,
   is refused (`invalid_goal`).
 
