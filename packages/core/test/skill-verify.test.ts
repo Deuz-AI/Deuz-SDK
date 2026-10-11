@@ -476,7 +476,8 @@ describe('sync-skill-copy', () => {
   });
 });
 
-describe('command line', () => {
+// Each case starts node, which loads the TypeScript parser: allow for a slow CI runner.
+describe('command line', { timeout: 30_000 }, () => {
   const node = (script: string, args: string[]) =>
     spawnSync(process.execPath, [join(TOOLING, script), ...args], { encoding: 'utf8' });
 

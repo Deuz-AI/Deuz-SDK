@@ -144,7 +144,7 @@ describe('extract-examples', () => {
     );
   });
 
-  it('runs from the command line', () => {
+  it('runs from the command line', { timeout: 30_000 }, () => {
     const dir = skillDir();
     const out = join(scratch, 'cli-out');
     const result = spawnSync(process.execPath, [SCRIPT, out, '--skill', dir], { encoding: 'utf8' });

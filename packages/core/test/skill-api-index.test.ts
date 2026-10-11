@@ -425,7 +425,8 @@ describe('stamp date', () => {
   });
 });
 
-describe('generate-api-index CLI', () => {
+// Each case starts node, which loads the TypeScript parser: allow for a slow CI runner.
+describe('generate-api-index CLI', { timeout: 30_000 }, () => {
   const run = (args: string[], env: Record<string, string | undefined> = {}) =>
     spawnSync(process.execPath, [GENERATOR, ...args], {
       encoding: 'utf8',
