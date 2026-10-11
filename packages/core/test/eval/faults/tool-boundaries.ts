@@ -34,10 +34,11 @@ function chargeTool(
       ...extra,
       execute: (_args: unknown, call: AgentToolContext) => {
         // An idempotent charge is keyed by its call identity; the payment
-        // system drops a repeat of a key it has seen.
+        // system drops a repeat of a key it has seen. Any charge it accepts
+        // charges order 7, so a replay under another identity is a repeat.
         const key = extra.replay ? `charge:${call.modelStep}:${call.toolCallId}` : 'charge:order-7';
         if (extra.replay && effects.includes(key)) return 'charged';
-        context.effect(key);
+        context.effect('charge:order-7');
         effects.push(key);
         return 'charged';
       },

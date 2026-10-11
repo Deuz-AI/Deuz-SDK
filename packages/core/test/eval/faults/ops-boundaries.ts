@@ -125,13 +125,15 @@ export const leaseLoss: EvalTaskManifest = {
       tools: {
         sync: {
           parameters,
-          // The catalog service keys a sync by its call identity and drops repeats.
+          // The catalog service keys a sync by its call identity and drops
+          // repeats. Any sync it accepts syncs the catalog, so a replay under
+          // another identity is a repeat.
           replay: 'idempotent' as const,
           async execute(_args: unknown, call: AgentToolContext) {
             executions += 1;
             const key = `sync:${call.modelStep}:${call.toolCallId}`;
             if (!effects.includes(key)) {
-              context.effect(key);
+              context.effect('sync:catalog');
               effects.push(key);
             }
             entered.resolve();
