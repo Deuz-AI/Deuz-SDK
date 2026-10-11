@@ -273,6 +273,44 @@ describe.skipIf(!liveRedisUrl)('Redis agent run listing on a live server', () =>
     slack: 25,
   }));
 
+  it('indexes the runs a pre-index build saved on the first listing', async () => {
+    // The layout a pre-release 2.3 build wrote: a stamped schema, runs without entries.
+    const prefix = server.prefix();
+    const t = `{${prefix}:ops}`;
+    const doneAt = Math.floor(now()) - 60_000;
+    const seeded = [
+      envelope('old-done', 2, { phase: 'terminal', result: completed }),
+      envelope('old-waiting', 1, { result: suspended }),
+      ...Array.from({ length: 150 }, (_, index) => envelope(`old-${index}`, 1)),
+    ];
+    await server.client.set(`${t}:schema`, '1');
+    for (const value of seeded) {
+      await server.client.hSet(`${t}:run:payload`, value.runId, JSON.stringify(value));
+      await server.client.hSet(`${t}:run:revision`, value.runId, String(value.revision));
+    }
+    await server.client.zAdd(`${t}:run:terminal`, { score: doneAt, value: 'old-done' });
+    const before = now();
+    const ops = createRedisOpsStore({ client: server.client, prefix });
+    const { runs } = await ops.agentRuns.list({ limit: 1000 });
+    expect(runs).toHaveLength(seeded.length);
+    expect(runs.at(-1)).toEqual({
+      runId: 'old-done',
+      scope: 'tenant',
+      phase: 'terminal',
+      revision: 2,
+      status: 'completed',
+      updatedAt: doneAt,
+    });
+    for (const run of runs.slice(0, -1)) {
+      expect(run.updatedAt).toBeGreaterThanOrEqual(before - 25);
+      expect(run.updatedAt).toBeLessThanOrEqual(now() + 25);
+    }
+    expect(runs.find((run) => run.runId === 'old-waiting')).toMatchObject({ status: 'suspended' });
+    const running = await ops.agentRuns.list({ phases: ['running'], limit: 1000 });
+    expect(running.runs).toHaveLength(seeded.length - 1);
+    expect(await server.client.get(`${t}:run:indexed`)).toBe('1');
+  });
+
   it('finds stale runs on the server clock', async () => {
     const ops = live();
     await ops.agentRuns.save(envelope('crashed', 1));
