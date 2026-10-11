@@ -1412,12 +1412,16 @@ export function runStreamToolLoop(
         // an execution-side substitution, and it announces itself with its own
         // `guardrail` part a moment later rather than by silently editing the
         // call a UI already rendered.
-        for (const c of toolCalls) {
+        for (const [index, c] of toolCalls.entries()) {
+          // The call's round-trip data rides with it (2.3): a chat client that
+          // sends the turn back must echo it (a Gemini function call's signature).
+          const providerMetadata = toolUseParts[index]!.providerMetadata;
           broadcaster.push({
             type: 'tool-call',
             toolCallId: c.toolCallId,
             toolName: c.toolName,
             input: c.args,
+            ...(providerMetadata ? { providerMetadata } : {}),
           });
           toolState(c.toolCallId, c.toolName, 'input-complete');
           toolNames.set(c.toolCallId, c.toolName);

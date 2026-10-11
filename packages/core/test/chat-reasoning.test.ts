@@ -12,6 +12,7 @@
 import { describe, expect, it } from 'vitest';
 import { streamChat } from '../src/index';
 import { createAnthropic } from '../src/anthropic';
+import { createGoogleNative } from '../src/google';
 import {
   applyUIPart,
   assistantMessageFromTurn,
@@ -445,5 +446,143 @@ describe('F21 acceptance through the UI wire: server → client → server', () 
       type: 'adaptive',
       block_binding: { prefix_mismatch_behavior: 'drop_block' },
     });
+  });
+});
+
+describe('provider metadata on the tool-call frame (W2a review S2-3)', () => {
+  const geminiTurn = (chunks: Record<string, unknown>[][]) =>
+    sseEvents(
+      chunks.map((parts, i) => ({
+        data: {
+          candidates: [
+            {
+              content: { role: 'model', parts },
+              ...(i === chunks.length - 1 ? { finishReason: 'STOP' } : {}),
+            },
+          ],
+          ...(i === chunks.length - 1
+            ? {
+                usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
+              }
+            : {}),
+        },
+      })),
+    );
+
+  it('a Gemini client tool loop over the UI wire echoes the function call thoughtSignature', async () => {
+    // Gemini 3 checks a function call's signature within the current turn, and
+    // a dropped one fails the next request (not live-verified).
+    const provider = mockFetchSequence([
+      () =>
+        sseResponse([
+          geminiTurn([
+            [{ text: 'a thought', thought: true, thoughtSignature: 'TS_THOUGHT' }],
+            [{ functionCall: { name: 'lookup', args: { q: 'x' } }, thoughtSignature: 'TS_FC' }],
+          ]),
+        ]),
+      () => sseResponse([geminiTurn([[{ text: 'Found it.' }]])]),
+    ]);
+    const model = createGoogleNative({ apiKey: 'k', fetch: provider.fetch })(
+      'gemini-3.1-pro-preview',
+    );
+    // `lookup` has no execute: a client tool, answered by the chat client.
+    const tools = { lookup: { parameters: { type: 'object' as const, properties: {} } } };
+
+    // Leg 1 on the server, read by the client exactly as useChat does.
+    const history: Message[] = [{ role: 'user', content: 'q' }];
+    const leg1 = toDeuzStreamResponse(streamChat({ model, messages: [...history], tools }));
+    let state = createAssistantTurn('t1');
+    for await (const part of readDeuzStream(leg1)) state = applyUIPart(state, part);
+    const call = state.message.toolCalls![0]!;
+    expect(call.providerMetadata).toEqual({ google: { thoughtSignature: 'TS_FC' } });
+    history.push(
+      assistantMessageFromTurn(state),
+      clientToolResultMessage([{ toolCallId: call.toolCallId, result: 'r' }]),
+    );
+
+    // Leg 2: the client POSTs the history as JSON; the server replays it.
+    const posted = JSON.parse(JSON.stringify(history)) as Message[];
+    const leg2 = toDeuzStreamResponse(streamChat({ model, messages: posted, tools }));
+    for await (const _ of readDeuzStream(leg2)) void _;
+
+    const second = JSON.parse(String(provider.calls[1]!.init!.body)) as {
+      contents: { role: string; parts: Record<string, unknown>[] }[];
+    };
+    expect(second.contents.find((c) => c.role === 'model')!.parts).toEqual([
+      { text: 'a thought', thought: true, thoughtSignature: 'TS_THOUGHT' },
+      { functionCall: { name: 'lookup', args: { q: 'x' } }, thoughtSignature: 'TS_FC' },
+    ]);
+  });
+
+  it('the streaming loop puts the call metadata on the tool-call part and the frame', async () => {
+    const provider = mockFetchSequence([
+      () =>
+        sseResponse([
+          geminiTurn([
+            [{ functionCall: { name: 'lookup', args: { q: 'x' } }, thoughtSignature: 'TS_FC' }],
+          ]),
+        ]),
+    ]);
+    const model = createGoogleNative({ apiKey: 'k', fetch: provider.fetch })(
+      'gemini-3.1-pro-preview',
+    );
+    const tools = { lookup: { parameters: { type: 'object' as const, properties: {} } } };
+    const frames: DeuzUIPart[] = [];
+    const response = toDeuzStreamResponse(
+      streamChat({ model, messages: [{ role: 'user', content: 'q' }], tools }),
+    );
+    for await (const frame of readDeuzStream(response)) frames.push(frame);
+    const toolCall = frames.find((f) => f.type === 'tool-call');
+    expect(toolCall).toMatchObject({
+      type: 'tool-call',
+      toolName: 'lookup',
+      input: { q: 'x' },
+      providerMetadata: { google: { thoughtSignature: 'TS_FC' } },
+    });
+  });
+
+  it('applyUIPart keeps a well-formed metadata object on the UI call, on both paths', () => {
+    const meta = { google: { thoughtSignature: 'TS_FC' } };
+    // A fresh call.
+    const fresh = fold([
+      {
+        type: 'tool-call',
+        toolCallId: 'c1',
+        toolName: 'lookup',
+        input: {},
+        providerMetadata: meta,
+      },
+    ]);
+    expect(fresh.message.toolCalls![0]!.providerMetadata).toEqual(meta);
+    // A call the `input-streaming` state opened first, completed in place.
+    const placed = fold([
+      { type: 'tool-state', toolCallId: 'c1', toolName: 'lookup', state: 'input-streaming' },
+      {
+        type: 'tool-call',
+        toolCallId: 'c1',
+        toolName: 'lookup',
+        input: {},
+        providerMetadata: meta,
+      },
+    ]);
+    expect(placed.message.toolCalls).toHaveLength(1);
+    expect(placed.message.toolCalls![0]!.providerMetadata).toEqual(meta);
+    expect(assistantMessageFromTurn(placed)).toEqual({
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'c1', name: 'lookup', input: {}, providerMetadata: meta }],
+    });
+    // Anything but a plain object reads as absent (the reducer is total).
+    for (const bad of ['sig', 7, null, ['x']]) {
+      const turn = fold([
+        {
+          type: 'tool-call',
+          toolCallId: 'c1',
+          toolName: 'lookup',
+          input: {},
+          providerMetadata: bad,
+        } as unknown as DeuzUIPart,
+      ]);
+      expect(turn.message.toolCalls![0]).not.toHaveProperty('providerMetadata');
+    }
   });
 });

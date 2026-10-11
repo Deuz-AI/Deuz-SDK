@@ -69,9 +69,10 @@ export interface UIToolCall {
   deniedReason?: string;
   /**
    * Opaque provider round-trip data for this call (e.g. Gemini's
-   * thoughtSignature), carried so `canonicalFromUI` can rebuild a `tool_use`
-   * that the NEXT request will not 400 on. Only `uiFromMessages` sets it: the
-   * UI wire does not carry provider metadata, so a streamed turn never has it.
+   * thoughtSignature), carried so `assistantMessageFromTurn` and
+   * `canonicalFromUI` rebuild a `tool_use` that the NEXT request will not 400
+   * on. `uiFromMessages` sets it from history and, since 2.3, `applyUIPart`
+   * from the wire's `tool-call` frame.
    */
   providerMetadata?: Record<string, unknown>;
 }
@@ -350,6 +351,17 @@ function reasoningBlockFromWire(part: DeuzUIPart): ReasoningBlockFields {
 }
 
 /**
+ * A `tool-call` frame's provider metadata (2.3), kept only when it is a plain
+ * object: `applyUIPart` is TOTAL, and `UIToolCall.providerMetadata` is echoed
+ * into the next request as given.
+ */
+function providerMetadataFromWire(value: unknown): Pick<UIToolCall, 'providerMetadata'> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? { providerMetadata: value as Record<string, unknown> }
+    : {};
+}
+
+/**
  * A finite number from the wire, or `undefined`. Same rule as `usageFromWire`:
  * `applyUIPart` is TOTAL, so a hostile/older/newer server's `"3"`, `NaN` or
  * `null` must fold without throwing AND without landing in a field typed
@@ -550,6 +562,9 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
       };
     }
     case 'tool-call': {
+      // The call's provider round-trip data (2.3), e.g. a Gemini function
+      // call's signature, which `toolUseFromUI` echoes into the next request.
+      const meta = providerMetadataFromWire(part.providerMetadata);
       // A `tool-state: input-streaming` may have created a placeholder for
       // this id already — complete it in place instead of duplicating.
       if ((turn.message.toolCalls ?? []).some((c) => c.toolCallId === part.toolCallId)) {
@@ -559,6 +574,7 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
             toolName: part.toolName,
             input: part.input,
             state: 'call',
+            ...meta,
           })),
           part.toolCallId,
         );
@@ -568,6 +584,7 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
         toolName: part.toolName,
         input: part.input,
         state: 'call',
+        ...meta,
       };
       return withToolPart(
         {

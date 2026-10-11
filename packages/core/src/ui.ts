@@ -13,8 +13,9 @@
  * types are skipped (open-union rule). A response negotiated to v1 (via
  * {@link negotiateDeuzStreamVersion} / `wireVersion`) carries no `id:` lines
  * and no v2-only part. It is not byte-identical to pre-1.7 output: later
- * releases added optional fields to v1 parts (the approval `token` in 1.7, the
- * `reasoning-delta` block fields in 2.3), which an older client ignores.
+ * releases added optional fields to v1 parts (the approval `token` in 1.7; the
+ * `reasoning-delta` block fields and the `tool-call` provider metadata in
+ * 2.3), which an older client ignores.
  */
 import type { CallWarning, StreamChatResult, StreamObjectResult } from './types/methods';
 import type { StreamPart, ToolRunState } from './types/stream';
@@ -79,7 +80,19 @@ export type DeuzUIPart =
       data?: string;
     }
   | { type: 'tool-input-delta'; toolCallId: string; toolName?: string; delta: string }
-  | { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown }
+  /**
+   * A fully parsed tool call. `providerMetadata` (2.3 additive) is the call's
+   * provider round-trip data, such as a Gemini function call's thought
+   * signature, so a chat client sends the `tool_use` back as the provider
+   * produced it (`applyUIPart` keeps it on the UI call). Never display it.
+   */
+  | {
+      type: 'tool-call';
+      toolCallId: string;
+      toolName: string;
+      input: unknown;
+      providerMetadata?: Record<string, unknown>;
+    }
   | {
       type: 'tool-result';
       toolCallId: string;
@@ -372,6 +385,7 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         toolCallId: part.toolCallId,
         toolName: part.toolName,
         input: part.input,
+        ...(part.providerMetadata ? { providerMetadata: part.providerMetadata } : {}),
       };
     case 'tool-result':
       return {
@@ -545,8 +559,8 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
  * part types pre-1.7 emitted, and `readDeuzStream`'s open-union rule means a v1
  * client would skip them anyway. The information is not lost — it also
  * resolves in bulk on `StreamChatResult.warnings`. (Optional FIELDS on a v1
- * part do ride v1, such as the 2.3 `reasoning-delta` block fields; an older
- * client ignores them.)
+ * part do ride v1, such as the 2.3 `reasoning-delta` block fields and
+ * `tool-call` provider metadata; an older client ignores them.)
  */
 function isV2OnlyPart(part: DeuzUIPart): boolean {
   if (part.type === 'sub-agent') return isV2OnlyPart(part.part);
@@ -574,7 +588,8 @@ export interface ToDeuzStreamOptions {
    * Wire version to emit (default 'v2'). Pass
    * `negotiateDeuzStreamVersion(request)` to honor an explicit v1 client.
    * v1 output has no `id:` lines and no v2-only parts; optional fields added to
-   * v1 parts since (such as the 2.3 `reasoning-delta` block fields) ride it too.
+   * v1 parts since (such as the 2.3 `reasoning-delta` block fields and `tool-call`
+   * provider metadata) ride it too.
    */
   wireVersion?: DeuzWireVersion;
   /**

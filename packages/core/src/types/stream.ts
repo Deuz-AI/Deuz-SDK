@@ -100,6 +100,13 @@ export interface ToolCallPart {
   toolCallId: string;
   toolName: string;
   input: unknown;
+  /**
+   * The call's provider round-trip data (2.3 additive): its `tool_use` part's
+   * `providerMetadata`, e.g. Gemini's `{ google: { thoughtSignature } }`, which
+   * the next request must echo back. A chat client keeps it so the `tool_use`
+   * it sends back is the one the provider produced. Never display content.
+   */
+  providerMetadata?: Record<string, unknown>;
 }
 
 /** Result of executing a `tool-call`, emitted after server-side execution. */
