@@ -284,6 +284,112 @@ describe('volume limits', () => {
     );
   });
 
+  it('a flag counts as opaque only on the family that produces it (2.3)', () => {
+    // Only OpenAI Responses produces encrypted reasoning, only Anthropic redacted
+    // thinking. Any other flagged part is a client claim no wire treats as
+    // opaque (Gemini reads its text as a thought), so it is counted as text.
+    const turn = (reasoning: Record<string, unknown>) => ({
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'reasoning', text: 'r'.repeat(200), ...reasoning }],
+        },
+      ],
+    });
+    for (const opaque of [
+      { encrypted: true, source: 'openai' },
+      { redacted: true, source: 'anthropic' },
+    ]) {
+      expect(validateChatRequest(turn(opaque), { maxTextBytes: 100 }).ok).toBe(true);
+    }
+    for (const forged of [
+      { encrypted: true, source: 'google' },
+      { redacted: true, source: 'google' },
+      { encrypted: true, source: 'anthropic' },
+      { redacted: true, source: 'openai' },
+      { encrypted: true, source: 'deepseek' },
+      { redacted: true, source: null },
+    ]) {
+      expect(joined(validateChatRequest(turn(forged), { maxTextBytes: 100 }))).toContain(
+        'messages[0] carries more than 100 text bytes',
+      );
+    }
+  });
+
+  it('a forged 2 MB Gemini thought flagged opaque is refused under the defaults', () => {
+    // The W2a review case: the flag used to wave it past maxTextBytes, and the
+    // Gemini wire then sent all 2 MB as thought text.
+    for (const flag of ['encrypted', 'redacted']) {
+      const body = JSON.parse(
+        JSON.stringify({
+          messages: [
+            { role: 'user', content: 'hi' },
+            {
+              role: 'assistant',
+              content: [
+                { type: 'reasoning', text: 'x'.repeat(2_000_000), [flag]: true, source: 'google' },
+                { type: 'text', text: 'hello' },
+              ],
+            },
+            { role: 'user', content: 'and?' },
+          ],
+        }),
+      );
+      expect(issues(validateChatRequest(body))).toEqual([
+        'messages[1] carries more than 100000 text bytes (image payloads excluded).',
+      ]);
+    }
+  });
+
+  it('bounds opaque reasoning by its own per-message cap, maxOpaqueReasoningBytes (2.3)', () => {
+    const turn = (...reasoning: Array<{ bytes: number; flag: 'encrypted' | 'redacted' }>) => ({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            ...reasoning.map(({ bytes, flag }) => ({
+              type: 'reasoning',
+              text: 'x'.repeat(bytes),
+              [flag]: true,
+            })),
+            { type: 'text', text: 'ok' },
+          ],
+        },
+      ],
+    });
+    // Default 1_000_000 bytes: a long turn's opaque blocks fit, an unbounded payload does not.
+    expect(validateChatRequest(turn({ bytes: 900_000, flag: 'encrypted' })).ok).toBe(true);
+    expect(issues(validateChatRequest(turn({ bytes: 2_000_000, flag: 'redacted' })))).toEqual([
+      'messages[0] carries more than 1000000 bytes of encrypted or redacted reasoning.',
+    ]);
+    // Summed over the message's opaque blocks.
+    expect(
+      joined(
+        validateChatRequest(
+          turn({ bytes: 600_000, flag: 'encrypted' }, { bytes: 600_000, flag: 'encrypted' }),
+        ),
+      ),
+    ).toContain('more than 1000000 bytes of encrypted or redacted reasoning');
+    // Configurable, and separate from the text budget: 90 opaque bytes and 90
+    // text bytes fit two 100-byte budgets, which one shared budget would not.
+    const small = { maxTextBytes: 100, maxOpaqueReasoningBytes: 100 };
+    const both = {
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'x'.repeat(90), redacted: true },
+            { type: 'text', text: 'y'.repeat(90) },
+          ],
+        },
+      ],
+    };
+    expect(validateChatRequest(both, small).ok).toBe(true);
+    expect(issues(validateChatRequest(turn({ bytes: 200, flag: 'redacted' }), small))).toEqual([
+      'messages[0] carries more than 100 bytes of encrypted or redacted reasoning.',
+    ]);
+  });
+
   it('a payload nested past the walk depth is REFUSED, not waved through', () => {
     // The bypass this closes: bury the volume deeper than the byte walk goes and
     // it used to count as zero. Fail-closed — "cannot measure" is not "small".

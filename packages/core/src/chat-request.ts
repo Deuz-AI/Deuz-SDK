@@ -72,10 +72,22 @@ export interface ValidateChatOptions {
    * Per-message text budget in UTF-8 bytes. Default 100_000 (~25k tokens).
    * Counts `content` when it is a string plus every `text`/`reasoning` part and
    * every string inside a `tool_use.input` / `tool_result.result`. Image/PDF
-   * payloads and encrypted or redacted reasoning (2.3) are EXCLUDED — see
-   * `messageTextBytes`.
+   * payloads are EXCLUDED, and so is opaque reasoning (2.3), which
+   * `maxOpaqueReasoningBytes` bounds instead — see `messageTextBytes`.
    */
   maxTextBytes?: number;
+  /**
+   * Per-message budget in UTF-8 bytes for opaque reasoning (2.3): the payload of
+   * an `encrypted` reasoning part (OpenAI Responses) and of a `redacted` one
+   * (Anthropic `redacted_thinking`). Default 1_000_000. `useChat` posts every
+   * block of a turn back, and these payloads are provider state, not prose, so
+   * they get a larger budget of their own instead of `maxTextBytes`. A part
+   * counts here only when its flag matches the family that produces it
+   * (`encrypted` with `source` absent or `'openai'`, `redacted` with `source`
+   * absent or `'anthropic'`); any other flagged part counts as text. Raise it
+   * for long multi-step turns with high reasoning effort.
+   */
+  maxOpaqueReasoningBytes?: number;
   /**
    * Reject `role: 'system'` inside the client's messages. Default TRUE — this
    * is the live vector. Opt out only if the client legitimately owns the system
@@ -117,6 +129,9 @@ const DEFAULT_MAX_MESSAGES = 1000;
 
 /** Default per-message text cap (`maxTextBytes`): 100 KB ≈ 25k tokens. */
 const DEFAULT_MAX_TEXT_BYTES = 100_000;
+
+/** Default per-message cap on opaque reasoning payloads (`maxOpaqueReasoningBytes`): 1 MB. */
+const DEFAULT_MAX_OPAQUE_REASONING_BYTES = 1_000_000;
 
 /**
  * Issue budget. A 1000-message hostile body must not amplify into 1000 strings
@@ -263,6 +278,23 @@ function countTextBytes(value: unknown, budget: number, depth: number, walk: Wal
 }
 
 /**
+ * Whether a reasoning part is an opaque provider payload (2.3). The flags are
+ * client-controlled, so one counts only on the family that produces it: only
+ * OpenAI Responses produces `encrypted` reasoning and only Anthropic `redacted`
+ * thinking, and those two wires hand the payload to an API that verifies it.
+ * Any other flagged part (a "redacted" Gemini thought, say) is text to every
+ * wire that sends it, so it is counted as text.
+ */
+function isOpaqueReasoning(part: Record<string, unknown>): boolean {
+  if (part.type !== 'reasoning') return false;
+  const source = part.source;
+  return (
+    (part.encrypted === true && (source === undefined || source === 'openai')) ||
+    (part.redacted === true && (source === undefined || source === 'anthropic'))
+  );
+}
+
+/**
  * Text bytes ONE message carries: `content` when it is a string, plus every
  * `text`/`reasoning` part and every string inside a `tool_use.input` /
  * `tool_result.result`.
@@ -270,24 +302,31 @@ function countTextBytes(value: unknown, budget: number, depth: number, walk: Wal
  * `image.image` is deliberately EXCLUDED — a legitimate photo or PDF is
  * megabytes of base64 and would trip a cap sized for prose. Binary volume is a
  * raw-body-size concern: cap that at the edge (or before calling this), which
- * this pure validator cannot do for you. Encrypted and redacted reasoning
- * blocks are excluded for the same reason (2.3): they are opaque provider
- * state, not prose, and `useChat` posts every block of a turn back.
+ * this pure validator cannot do for you. Opaque reasoning (2.3, see
+ * `isOpaqueReasoning`) is provider state, not prose, and `useChat` posts every
+ * block of a turn back, so it is counted on its own, against `opaqueBudget`.
  */
 function messageTextBytes(
   message: Record<string, unknown>,
   budget: number,
-): { bytes: number; tooDeep: boolean } {
+  opaqueBudget: number,
+): { bytes: number; opaqueBytes: number; tooDeep: boolean } {
   const walk: Walk = { seen: new WeakSet<object>(), tooDeep: false };
   const content = message.content;
   if (typeof content === 'string') {
-    return { bytes: countTextBytes(content, budget, 0, walk), tooDeep: walk.tooDeep };
+    const bytes = countTextBytes(content, budget, 0, walk);
+    return { bytes, opaqueBytes: 0, tooDeep: walk.tooDeep };
   }
-  if (!Array.isArray(content)) return { bytes: 0, tooDeep: false };
+  if (!Array.isArray(content)) return { bytes: 0, opaqueBytes: 0, tooDeep: false };
   let total = 0;
+  let opaque = 0;
   for (const part of content) {
     if (!isRecord(part)) continue;
-    if (part.type === 'reasoning' && (part.encrypted === true || part.redacted === true)) continue;
+    if (isOpaqueReasoning(part)) {
+      opaque += countTextBytes(part.text, Math.max(0, opaqueBudget - opaque), 0, walk);
+      if (opaque > opaqueBudget) break;
+      continue;
+    }
     const payload =
       part.type === 'text' || part.type === 'reasoning'
         ? part.text
@@ -300,7 +339,7 @@ function messageTextBytes(
     total += countTextBytes(payload, Math.max(0, budget - total), 0, walk);
     if (total > budget) break;
   }
-  return { bytes: total, tooDeep: walk.tooDeep };
+  return { bytes: total, opaqueBytes: opaque, tooDeep: walk.tooDeep };
 }
 
 // ===================================================================
@@ -313,6 +352,7 @@ interface Gates {
   rejectToolResults: boolean;
   rejectAssistantTurns: boolean;
   maxTextBytes: number;
+  maxOpaqueReasoningBytes: number;
 }
 
 type Fail = (issue: string) => void;
@@ -423,7 +463,7 @@ function validateMessage(value: unknown, path: string, gates: Gates, fail: Fail)
       `${path}.providerMetadata must be an object when present; got ${typeOf(value.providerMetadata)}.`,
     );
   }
-  const size = messageTextBytes(value, gates.maxTextBytes);
+  const size = messageTextBytes(value, gates.maxTextBytes, gates.maxOpaqueReasoningBytes);
   if (size.tooDeep) {
     fail(
       `${path} has a content payload nested deeper than ${MAX_WALK_DEPTH} levels — its size cannot be accounted for, so it is refused.`,
@@ -432,6 +472,10 @@ function validateMessage(value: unknown, path: string, gates: Gates, fail: Fail)
     // "more than" is the honest wording: the walk abandons early, so the exact
     // size is unknown (and printing it would be a second amplification vector).
     fail(`${path} carries more than ${gates.maxTextBytes} text bytes (image payloads excluded).`);
+  } else if (size.opaqueBytes > gates.maxOpaqueReasoningBytes) {
+    fail(
+      `${path} carries more than ${gates.maxOpaqueReasoningBytes} bytes of encrypted or redacted reasoning.`,
+    );
   }
 }
 
@@ -451,6 +495,7 @@ export function validateChatRequest(
     rejectToolResults: options.rejectToolResults ?? true,
     rejectAssistantTurns: options.rejectAssistantTurns ?? false,
     maxTextBytes: options.maxTextBytes ?? DEFAULT_MAX_TEXT_BYTES,
+    maxOpaqueReasoningBytes: options.maxOpaqueReasoningBytes ?? DEFAULT_MAX_OPAQUE_REASONING_BYTES,
   };
 
   const issues: string[] = [];
