@@ -10,6 +10,7 @@ import type {
   BudgetLedgerSnapshot,
   BudgetLimits,
   BudgetReservation,
+  BudgetReservationInput,
   BudgetScope,
   BudgetSettlement,
   BudgetTotals,
@@ -455,6 +456,70 @@ function same(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+/** The reservation an input asks for, validated and copied. */
+function reservationOf(input: BudgetReservationInput): BudgetReservation {
+  if (input.unpriced !== undefined && typeof input.unpriced !== 'boolean')
+    throw new BudgetLedgerError('invalid_budget', 'unpriced must be boolean.');
+  if (input.unpriced && input.usd !== undefined)
+    throw new BudgetLedgerError(
+      'invalid_budget',
+      'An unpriced reservation carries no usd estimate.',
+    );
+  return record({
+    requestId: input.requestId,
+    modelId: input.modelId,
+    kind: input.kind ?? 'model',
+    reservation: amounts(input),
+    actual: {},
+    scopes: input.scopes ?? [],
+    state: 'reserved',
+    ...(input.unpriced ? { unpriced: true as const } : {}),
+  });
+}
+
+/** True when a recorded reservation is the one `candidate` asks for again. */
+function sameReservation(existing: BudgetReservation, candidate: BudgetReservation): boolean {
+  return (
+    existing.modelId === candidate.modelId &&
+    existing.kind === candidate.kind &&
+    same(existing.reservation, candidate.reservation) &&
+    same(existing.scopes, candidate.scopes) &&
+    existing.unpriced === candidate.unpriced
+  );
+}
+
+const conflicting = (requestId: string) =>
+  new BudgetLedgerError('reservation_conflict', `Conflicting reservation for ${requestId}.`);
+
+/**
+ * Ledger operations batch holds need (2.3), kept off the public
+ * `BudgetLedger` type: each ledger `createBudgetLedger` makes registers its own.
+ */
+interface LedgerInternals {
+  adopt(input: BudgetReservationInput): Promise<BudgetReservation>;
+}
+
+const internals = new WeakMap<BudgetLedger, LedgerInternals>();
+
+/**
+ * Record a reservation another ledger already admitted (2.3): a batch hold a
+ * fresh context reads back after a restart, whose provider request has run.
+ * This ledger's budgets, its scope budgets and their `unknownPrice` policies
+ * do not refuse it (refusing would only hide the spend); its amounts count
+ * against them from then on, as an overage settled by the first ledger does.
+ * A persistent `BudgetStore` is still asked, where an identical repeat is the
+ * same hold; a store or ledger record of that request with other amounts or
+ * scope limits is a `reservation_conflict`. A ledger `createBudgetLedger` did
+ * not make reserves it instead.
+ */
+export function adoptReservation(
+  ledger: BudgetLedger,
+  input: BudgetReservationInput,
+): Promise<BudgetReservation> {
+  const own = internals.get(ledger);
+  return own ? own.adopt(input) : ledger.reserve(input);
+}
+
 /**
  * Reservations are admission estimates, not a provider-enforced spend ceiling.
  * Actual overages remain recorded and prevent later admission. Unknown usage
@@ -872,6 +937,35 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
     });
   }
 
+  /** See `adoptReservation`: `reserve` without this ledger's own admission. */
+  function adopt(input: BudgetReservationInput): Promise<BudgetReservation> {
+    const candidate = reservationOf(input);
+    return enqueue(async () => {
+      const existing = entries.get(candidate.requestId);
+      if (existing) {
+        if (!sameReservation(existing, candidate)) throw conflicting(candidate.requestId);
+        return save(existing);
+      }
+      if (admission) {
+        try {
+          // Not strict: this ledger's unknownPrice policy is local admission too.
+          await admitPersistent(candidate, false);
+        } catch (error) {
+          // The store's own record of this request has other amounts or scope limits.
+          const cause = error instanceof BudgetLedgerError ? error.cause : undefined;
+          if ((cause as { code?: unknown } | undefined)?.code === 'reservation_conflict')
+            throw new BudgetLedgerError(
+              'reservation_conflict',
+              `The persistent budget store records ${candidate.requestId} with other amounts or scope limits.`,
+              cause,
+            );
+          throw error;
+        }
+      }
+      return save(candidate);
+    });
+  }
+
   const ledger: BudgetLedger = {
     budget,
     addPersistence(persist) {
@@ -890,39 +984,12 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
       };
     },
     reserve(input) {
-      if (input.unpriced !== undefined && typeof input.unpriced !== 'boolean')
-        throw new BudgetLedgerError('invalid_budget', 'unpriced must be boolean.');
-      if (input.unpriced && input.usd !== undefined)
-        throw new BudgetLedgerError(
-          'invalid_budget',
-          'An unpriced reservation carries no usd estimate.',
-        );
       // Copy before queueing so caller mutation cannot change admission.
-      const candidate = record({
-        requestId: input.requestId,
-        modelId: input.modelId,
-        kind: input.kind ?? 'model',
-        reservation: amounts(input),
-        actual: {},
-        scopes: input.scopes ?? [],
-        state: 'reserved',
-        ...(input.unpriced ? { unpriced: true as const } : {}),
-      });
+      const candidate = reservationOf(input);
       return enqueue(async () => {
         const existing = entries.get(candidate.requestId);
         if (existing) {
-          if (
-            existing.modelId !== candidate.modelId ||
-            existing.kind !== candidate.kind ||
-            !same(existing.reservation, candidate.reservation) ||
-            !same(existing.scopes, candidate.scopes) ||
-            existing.unpriced !== candidate.unpriced
-          ) {
-            throw new BudgetLedgerError(
-              'reservation_conflict',
-              `Conflicting reservation for ${candidate.requestId}.`,
-            );
-          }
+          if (!sameReservation(existing, candidate)) throw conflicting(candidate.requestId);
           return save(existing);
         }
         admit(candidate, budget);
@@ -1051,6 +1118,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
     },
     snapshot,
   };
+  internals.set(ledger, { adopt });
   return Object.freeze(ledger);
 }
 

@@ -455,4 +455,140 @@ describe('resuming after a restart', () => {
       message: /scope/,
     });
   });
+
+  // A fresh context adopts the job's holds without its own budget admission:
+  // the provider already ran (and billed) the requests, so refusing a hold
+  // would only hide the spend and leave the results unreadable (W2a S5-1).
+  function restart() {
+    const budgetStore = createInMemoryBudgetStore();
+    const jobs = createMemoryBatchJobStore();
+    const scope: PersistentBudgetScope = { key: 'org:1', limits: { usd: 100, tokens: 10_000_000 } };
+    const server = fakeAnthropicBatches();
+    const model = createAnthropic({ apiKey: 'k', fetch: server.fetch })('claude-haiku-5-5');
+    /** One process: its own context of the same scope, budget and persistent scopes. */
+    const start = (budget: BudgetLimits) => {
+      const execution = createExecutionContext({
+        budget,
+        admission: { store: budgetStore, scopes: [scope] },
+      });
+      const batch = createBatchClient({
+        model,
+        execution,
+        store: jobs,
+        deps: { priceProvider: prices },
+      });
+      return { execution, batch };
+    };
+    return { budgetStore, server, start };
+  }
+
+  it('reads every result of a fresh context whose budget the actual usage exceeds', async () => {
+    const { budgetStore, server, start } = restart();
+    // Process A: two holds of $0.0002 fit its $0.0005 budget; then it dies.
+    const a = start({ usd: 0.0005 });
+    const job = await a.batch.submit([
+      { id: 'a', prompt: 'x', executionEstimate: { tokens: 3000, usd: 0.0002 } },
+      { id: 'b', prompt: 'y', executionEstimate: { tokens: 3000, usd: 0.0002 } },
+    ]);
+    // The provider bills each request more than its estimate.
+    server.finish(job.id, { a: ok(2000, 1000), b: ok(2000, 1000) });
+    const cost = priceUsage('claude-haiku-5-5', usage(2000, 1000), PRICES_2026, { tier: 'batch' })!;
+    expect(cost).toBeGreaterThan(0.0002);
+
+    // Process B: a's actual cost leaves no room in its budget for b's hold.
+    const b = start({ usd: 0.0005 });
+    const [open] = await b.batch.pending();
+    expect(open!.id).toBe(job.id);
+    const results = await b.batch.collect(open!);
+    expect(results.map((result) => [result.id, result.status])).toEqual([
+      ['a', 'succeeded'],
+      ['b', 'succeeded'],
+    ]);
+    for (const request of job.requests)
+      expect(b.execution.ledger.get(request.hold!.id)).toMatchObject({ state: 'settled' });
+    // The overage counts in B as it would in A: new work is refused.
+    expect(b.execution.ledger.totals().spent.usd).toBeCloseTo(2 * cost, 12);
+    await expect(
+      b.execution.reserve({ requestId: 'next', modelId: 'claude-haiku-5-5', tokens: 1, usd: 0 }),
+    ).rejects.toMatchObject({ code: 'budget_exceeded' });
+    // The store holds what the provider billed, each request once.
+    expect((await budgetStore.usage('org:1')).usd).toBeCloseTo(2 * cost, 12);
+    expect(await b.batch.pending()).toEqual([]);
+  });
+
+  it('reads an old job after the fresh context reserved other work first', async () => {
+    const { server, start } = restart();
+    const a = start({ usd: 1 });
+    const old = await a.batch.submit([
+      { id: 'a', prompt: 'x', executionEstimate: { tokens: 1000, usd: 0.3 } },
+    ]);
+    server.finish(old.id, { a: ok(200, 100) });
+
+    // After a restart the worker submits tonight's batch, then reads last night's.
+    const b = start({ usd: 1 });
+    await b.batch.submit([{ id: 'n', prompt: 'z', executionEstimate: { tokens: 1000, usd: 0.8 } }]);
+    const open = (await b.batch.pending()).find((job) => job.id === old.id);
+    await expect(b.batch.collect(open!)).resolves.toMatchObject([{ id: 'a', status: 'succeeded' }]);
+    expect(b.execution.ledger.get(old.requests[0]!.hold!.id)).toMatchObject({ state: 'settled' });
+  });
+
+  it('settles, releases or keeps every adopted hold, however full the fresh budget is', async () => {
+    const { budgetStore, server, start } = restart();
+    const a = start({ usd: 1 });
+    const job = await a.batch.submit([
+      { id: 'ok', prompt: 'x', executionEstimate: { tokens: 1000, usd: 0.2 } },
+      { id: 'late', prompt: 'y', executionEstimate: { tokens: 1000, usd: 0.2 } },
+      { id: 'busy', prompt: 'z', executionEstimate: { tokens: 1000, usd: 0.2 } },
+    ]);
+    server.finish(job.id, {
+      ok: ok(200, 100),
+      late: { type: 'expired' },
+      busy: {
+        type: 'errored',
+        error: { type: 'error', error: { type: 'overloaded_error', message: 'x' } },
+      },
+    });
+
+    // B's own budget is already committed in full when it reads the job.
+    const b = start({ usd: 1 });
+    await b.execution.reserve({
+      requestId: 'other',
+      modelId: 'claude-haiku-5-5',
+      usd: 1,
+      tokens: 1,
+    });
+    const results = await b.batch.collect((await b.batch.pending())[0]!);
+    expect(results.map((result) => result.status)).toEqual(['succeeded', 'expired', 'errored']);
+    const hold = (id: string) =>
+      b.execution.ledger.get(job.requests.find((request) => request.id === id)!.hold!.id)!;
+    expect(hold('ok').state).toBe('settled');
+    expect(hold('late').state).toBe('released');
+    // A server-side failure may have been billed: its hold stays, at its estimate.
+    expect(hold('busy')).toMatchObject({ state: 'unknown', reservation: { usd: 0.2 } });
+    const cost = priceUsage('claude-haiku-5-5', usage(200, 100), PRICES_2026, { tier: 'batch' })!;
+    // The store: the billed request, the hold kept for `busy` and B's own work, each once.
+    expect((await budgetStore.usage('org:1')).usd).toBeCloseTo(cost + 0.2 + 1, 12);
+  });
+
+  it('refuses a hold the BudgetStore recorded with other amounts', async () => {
+    const { budgetStore, server, start } = restart();
+    const a = start({ usd: 1 });
+    const job = await a.batch.submit([
+      { id: 'a', prompt: 'x', executionEstimate: { tokens: 1000, usd: 0.2 } },
+    ]);
+    server.finish(job.id, { a: ok(200, 100) });
+    const held = await budgetStore.usage('org:1');
+    const request = job.requests[0]!;
+    const altered: BatchJob = {
+      ...job,
+      requests: [{ ...request, hold: { ...request.hold!, usd: 0.1 } }],
+    };
+    const b = start({ usd: 1 });
+    await expect(b.batch.collect(altered)).rejects.toMatchObject({
+      name: 'BudgetLedgerError',
+      code: 'reservation_conflict',
+    });
+    expect(b.execution.ledger.get(request.hold!.id)).toBeUndefined();
+    expect(await budgetStore.usage('org:1')).toEqual(held);
+  });
 });

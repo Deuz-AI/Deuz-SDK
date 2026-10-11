@@ -8,6 +8,7 @@
  * through the ledger, which mirrors it into a persistent `BudgetStore` and is
  * idempotent there and in the store, so results can be read again.
  */
+import { adoptReservation } from '../budget-ledger';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import { createTokenEstimator } from '../internal/estimate-tokens';
 import { wireOutputCap } from '../internal/output-cap';
@@ -205,9 +206,11 @@ export const closeForStatus = (status: number | undefined): HoldClose =>
 
 /**
  * Close one request's hold. A hold the ledger does not know (a context that
- * was not restored from its snapshot, after a restart) is first reserved
- * again with the amounts the job recorded: a `BudgetStore` treats that as the
- * same hold, so nothing is counted twice. That needs the job's own scope.
+ * was not restored from its snapshot, after a restart) is first recorded again
+ * with the amounts the job recorded. The provider already ran the request, so
+ * this context's budgets do not refuse it (they count it from then on), while
+ * a `BudgetStore` treats it as the same hold, so nothing is counted twice.
+ * That needs the job's own scope.
  */
 export async function closeHold(
   execution: NativeExecutionContext,
@@ -228,7 +231,7 @@ export async function closeHold(
           `scope ${job.scopeId ?? '(none)'}, not ${execution.scopeId}: settle them through a ` +
           'context of that scope, or one restored from its snapshot.',
       });
-    await ledger.reserve({
+    await adoptReservation(ledger, {
       requestId: hold.id,
       modelId: job.modelId,
       kind: KIND,

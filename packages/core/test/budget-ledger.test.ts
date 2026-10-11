@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
-import { BudgetLedgerError, createBudgetLedger, subtreeLedgerSnapshot } from '../src/budget-ledger';
+import {
+  adoptReservation,
+  BudgetLedgerError,
+  createBudgetLedger,
+  subtreeLedgerSnapshot,
+} from '../src/budget-ledger';
 import type { BudgetLedgerSnapshot } from '../src/budget-ledger';
+import { createInMemoryBudgetStore } from '../src/budget-store';
+import type { PersistentBudgetScope } from '../src/types/budget-store';
 import type { Usage } from '../src/types/usage';
 
 function usage(tokens: number): Usage {
@@ -466,5 +473,93 @@ describe('ledger compaction (2.2)', () => {
     await ledger.compact('b');
     await ledger.compact('a');
     expect(writes).toEqual([1, 2, 3]);
+  });
+});
+
+// 2.3 (W2a S5-1): a batch hold read back by a fresh ledger after a restart was
+// admitted where it was reserved. Its provider request already ran.
+describe('adopting a reservation admitted elsewhere (2.3)', () => {
+  const org: PersistentBudgetScope = { key: 'org:1', limits: { tokens: 100 } };
+
+  it('records it without local admission, and its overage refuses later work', async () => {
+    const ledger = createBudgetLedger({ budget: { tokens: 10, usd: 1, unknownPrice: 'reject' } });
+    await ledger.reserve({ requestId: 'mine', modelId: 'm', tokens: 10, usd: 1 });
+    const adopted = await adoptReservation(ledger, {
+      requestId: 'old',
+      modelId: 'm',
+      kind: 'batch',
+      tokens: 5,
+      usd: 0.5,
+    });
+    expect(adopted).toMatchObject({ state: 'reserved', kind: 'batch', reservation: { tokens: 5 } });
+    // Neither the budget nor its unknownPrice policy refuses it.
+    await adoptReservation(ledger, {
+      requestId: 'unpriced',
+      modelId: 'm',
+      tokens: 1,
+      unpriced: true,
+    });
+    expect(ledger.totals().committed).toEqual({ tokens: 16, usd: 1.5 });
+    await ledger.settle({ requestId: 'old', tokens: 7, usd: 0.7 });
+    await expect(
+      ledger.reserve({ requestId: 'next', modelId: 'm', tokens: 0, usd: 0 }),
+    ).rejects.toMatchObject({ code: 'budget_exceeded' });
+  });
+
+  it('treats an identical repeat as a no-op and a different one as a conflict', async () => {
+    const ledger = createBudgetLedger({ budget: { tokens: 1 } });
+    const input = { requestId: 'old', modelId: 'm', tokens: 5 };
+    const first = await adoptReservation(ledger, input);
+    const revision = ledger.snapshot().revision;
+    expect(await adoptReservation(ledger, input)).toBe(first);
+    expect(ledger.snapshot().revision).toBe(revision);
+    await expect(adoptReservation(ledger, { ...input, tokens: 6 })).rejects.toMatchObject({
+      code: 'reservation_conflict',
+    });
+  });
+
+  it('still goes through the BudgetStore, which counts the same hold once', async () => {
+    const store = createInMemoryBudgetStore();
+    const first = createBudgetLedger({ admission: { store, scopes: [org] } });
+    await first.reserve({ requestId: 'old', modelId: 'm', tokens: 60 });
+    // A fresh ledger after a restart, whose own budget the hold exceeds.
+    const fresh = createBudgetLedger({
+      budget: { tokens: 10 },
+      admission: { store, scopes: [org] },
+    });
+    await adoptReservation(fresh, { requestId: 'old', modelId: 'm', tokens: 60 });
+    expect(await store.usage('org:1')).toEqual({ tokens: 60, usd: 0 });
+    await fresh.settle({ requestId: 'old', tokens: 70, usd: 0 });
+    expect(await store.usage('org:1')).toEqual({ tokens: 70, usd: 0 });
+    // The store recorded other amounts under that id: a conflict, and nothing changes.
+    const other = createBudgetLedger({ admission: { store, scopes: [org] } });
+    await expect(
+      adoptReservation(other, { requestId: 'old', modelId: 'm', tokens: 50 }),
+    ).rejects.toMatchObject({ name: 'BudgetLedgerError', code: 'reservation_conflict' });
+    expect(other.get('old')).toBeUndefined();
+    expect(await store.usage('org:1')).toEqual({ tokens: 70, usd: 0 });
+  });
+
+  it('keeps the store’s refusal when the store no longer knows the hold and is full', async () => {
+    const store = createInMemoryBudgetStore();
+    const ledger = createBudgetLedger({ admission: { store, scopes: [org] } });
+    await ledger.reserve({ requestId: 'new', modelId: 'm', tokens: 100 });
+    await expect(
+      adoptReservation(createBudgetLedger({ admission: { store, scopes: [org] } }), {
+        requestId: 'forgotten',
+        modelId: 'm',
+        tokens: 10,
+      }),
+    ).rejects.toMatchObject({ code: 'budget_exceeded' });
+  });
+
+  it('reserves through a ledger createBudgetLedger did not make', async () => {
+    const ledger = createBudgetLedger({ budget: { tokens: 10 } });
+    const reserve = vi.fn(ledger.reserve);
+    const foreign = { ...ledger, reserve };
+    await expect(
+      adoptReservation(foreign, { requestId: 'old', modelId: 'm', tokens: 50 }),
+    ).rejects.toMatchObject({ code: 'budget_exceeded' });
+    expect(reserve).toHaveBeenCalledTimes(1);
   });
 });
