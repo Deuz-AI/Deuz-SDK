@@ -248,7 +248,7 @@ Tasks live in an `A2ATaskStore` — `load(taskId, scope)` and `save(task, scope)
 The `scope` keeps tasks apart:
 
 - **`tenant`** — the A2A tenant of the request (the JSON-RPC `tenant` param, or the `/{tenant}` path segment over HTTP+JSON). A card interface can name one for its clients.
-- **`owner`** — whatever `options.owner(request)` returns. Return the identity you verified (a session, a checked token); a caller then only ever sees, continues, cancels or subscribes to its own tasks, and the executor gets it as `ctx.owner`. Without the option, every caller shares the tasks and the random task ids are the only key.
+- **`owner`** — whatever `options.owner(request)` returns. Return the identity you verified (a session, a checked token); a caller then only ever sees, continues, cancels or subscribes to its own tasks — given a store that keys tasks by scope, as below — and the executor gets it as `ctx.owner`. Without the option, every caller shares the tasks and the random task ids are the only key.
 
 ```ts
 const handler = createA2AHandler({
@@ -257,6 +257,31 @@ const handler = createA2AHandler({
   owner: async (request) => (await verifySession(request))?.userId,
 });
 ```
+
+<Callout type="warn" title="A task store keys tasks by scope">
+The handler does no ownership check of its own: tenant and owner isolation rest on the store. `load` and `save` must key each task by `scope.tenant`, `scope.owner` and the task id, so a task is found only under the scope it was saved with and a save never replaces another scope's task. A store keyed by the task id alone lets anyone who learns an id — from a shared context, a `referenceTaskIds` entry, a log — read, continue, cancel or subscribe to another caller's task.
+</Callout>
+
+A durable store, keyed that way (`kv` stands for your key-value or SQL storage):
+
+```ts
+import type { A2ATask, A2ATaskScope, A2ATaskStore } from '@deuz-sdk/core/a2a';
+
+const key = (taskId: string, scope: A2ATaskScope) =>
+  JSON.stringify([scope.tenant ?? null, scope.owner ?? null, taskId]);
+
+const taskStore: A2ATaskStore = {
+  load: async (taskId, scope) => {
+    const json = await kv.get(key(taskId, scope));
+    return json ? (JSON.parse(json) as A2ATask) : undefined;
+  },
+  save: async (task, scope) => {
+    await kv.set(key(task.id, scope), JSON.stringify(task));
+  },
+};
+```
+
+`createInMemoryA2ATaskStore` keys tasks the same way. The SDK's test suite runs a conformance fixture against it and against a store like this one; a store of yours should pass the same checks.
 
 ### What the handler answers
 

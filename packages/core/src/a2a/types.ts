@@ -462,7 +462,10 @@ export interface A2AClient {
 
 // --- handler -------------------------------------------------------------------
 
-/** Where a task lives: tasks of different tenants or owners never see each other. */
+/**
+ * Where a task lives. The task store keys tasks by it, so tasks of different
+ * tenants or owners never see each other.
+ */
 export interface A2ATaskScope {
   tenant?: string;
   /** The caller `options.owner` named. */
@@ -471,8 +474,14 @@ export interface A2ATaskScope {
 
 /**
  * Persistence for tasks. The handler loads a task before every change and
- * saves the whole task after it; `load` returns `undefined` for an unknown id.
- * Tasks are plain JSON.
+ * saves the whole task after it. Tasks are plain JSON.
+ *
+ * A store must keep tasks apart by scope: key each task by `scope.tenant`,
+ * `scope.owner` and the task id, so `load` returns `undefined` for an unknown
+ * id and for a task saved under another scope, and a save never replaces
+ * another scope's task. The handler does no ownership check of its own;
+ * tenant and `owner` isolation rest on the store (`createInMemoryA2ATaskStore`
+ * keys tasks this way).
  */
 export interface A2ATaskStore {
   load(taskId: string, scope: A2ATaskScope): A2ATask | undefined | Promise<A2ATask | undefined>;
@@ -599,10 +608,12 @@ export interface A2AHandlerOptions {
   taskStore?: A2ATaskStore;
   /**
    * Who is calling. Tasks are kept per owner (within a tenant), so a caller
-   * only ever sees, continues, cancels or subscribes to its own tasks; the
-   * executor gets it as `owner`. Return an identity you verified — a session,
-   * a checked token — never a header you did not check. Default: no owner,
-   * every caller shares the tasks (their random ids are the only key).
+   * only ever sees, continues, cancels or subscribes to its own tasks —
+   * provided the task store keys tasks by scope, as `A2ATaskStore` requires
+   * and the default store does. The executor gets it as `owner`. Return an
+   * identity you verified — a session, a checked token — never a header you
+   * did not check. Default: no owner, every caller shares the tasks (their
+   * random ids are the only key).
    */
   owner?: (request: Request) => string | undefined | Promise<string | undefined>;
   /** Default `/.well-known/agent-card.json`. */

@@ -4,7 +4,8 @@
 import type { A2ATask, A2ATaskScope, A2ATaskStore } from './types';
 
 /**
- * Tasks in a `Map`, per tenant and owner. Tasks are copied on the way in and out, so
+ * Tasks in a `Map`, keyed by tenant, owner and task id, as every
+ * `A2ATaskStore` must key them. Tasks are copied on the way in and out, so
  * nothing outside the store can change a stored task. Lives as long as the
  * process (or isolate) and keeps every task: use it for development, tests and
  * single-process agents, and bring a durable `A2ATaskStore` when tasks must
