@@ -75,6 +75,7 @@ import {
   setModelGate,
   type ActiveAgentState,
   type CompactionTrigger,
+  type DurableResume,
   type ExecuteExtras,
   type GuardrailLogEntry,
   type HandoffLogEntry,
@@ -90,7 +91,7 @@ import type { UsageCostSnapshot } from '../internal/usage-cost';
  */
 export interface ToolLoopInternal {
   resumeCost?: UsageCostSnapshot;
-  resumeFrom?: { stepIndex: number; usage: Usage };
+  resumeFrom?: DurableResume;
   /**
    * Handoff (2.0): the checkpoint's active agent, re-applied before the first
    * step of a resume leg (`durable.ts` reads it off `AgentCheckpoint.handoff`).
@@ -428,7 +429,11 @@ export async function runToolLoop(
         undefined,
         { ...(active ? { active } : {}), tools: handoffTools },
         // The identity the suspended leg bound its approvals to (2.3).
-        { runId: durable?.runId, step: internal?.resumeFrom?.stepIndex ?? suspendedAt },
+        {
+          runId: durable?.runId,
+          step: internal?.resumeFrom?.stepIndex ?? suspendedAt,
+          approvalRequestCounts: durable?.approvalRequestCounts,
+        },
       );
       if (settled) {
         messages = settled.messages;

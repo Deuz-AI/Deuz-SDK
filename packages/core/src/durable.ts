@@ -16,6 +16,7 @@ import { DeuzError } from './errors';
 import { assertCheckpointVersion } from './internal/checkpoint-version';
 import { runToolLoop } from './inference/tool-loop';
 import { runStreamToolLoop } from './inference/stream-tool-loop';
+import { durableResumeOf } from './inference/loop-shared';
 import { resolveDependencies } from './internal/resolve-deps';
 import {
   createObservationRuntime,
@@ -257,7 +258,7 @@ export async function resumeFromCheckpoint(
   }
   const { checkpoint, observeResume } = loaded;
   return runToolLoop(toResumeCall(checkpoint, store, options), {
-    resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+    resumeFrom: durableResumeOf(checkpoint),
     ...(checkpoint.cost ? { resumeCost: checkpoint.cost } : {}),
     // Handoff (2.0): a run suspended INSIDE a transferred-to agent continues as
     // that agent — the loop re-applies the model/tool overlay before its first
@@ -293,7 +294,7 @@ export function resumeStreamFromCheckpoint(
         const { checkpoint, observeResume } = await observedLoad(store, runId, rt);
         return {
           messages: [...checkpoint.messages] as Message[],
-          resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+          resumeFrom: durableResumeOf(checkpoint),
           ...(checkpoint.cost ? { cost: checkpoint.cost } : {}),
           // Handoff (2.0): carried out of the deferred load (G2 — the load
           // happens inside the pump), where the loop re-applies the overlay.

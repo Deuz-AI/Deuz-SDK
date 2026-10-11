@@ -188,7 +188,10 @@ call it was issued for: the run, the step it suspended at, the tool call ID, the
 name and a digest of the arguments. Answer with the `approvalId` you were given. A
 verdict kept from an earlier gate then never approves a later call, even when a
 provider that sends no call IDs reuses `tool_0` for it. A verdict that names only the
-tool call ID (the 2.2 form) still counts when that ID occurs once in the run's history.
+tool call ID (the 2.2 form) still counts when the run used that ID once: it occurs once
+in the history, and the run issued one approval request under it. The checkpoint keeps
+that count (`approvalRequestCounts`), so a history that compaction or `prepareStep` has
+shortened cannot make a reused ID look unique.
 Client-side tools likewise remain suspended until
 `clientToolResults` supplies every pending call ID; each entry has `toolCallId`,
 `output`, and an optional `isError`. Supplied results pass through the same approval,

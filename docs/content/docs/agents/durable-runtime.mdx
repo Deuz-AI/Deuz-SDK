@@ -85,6 +85,7 @@ interface AgentCheckpoint {
   messages: Message[];                     // full immutable history at the boundary
   usage: Usage;                            // CUMULATIVE across the whole run
   pendingApprovals?: ToolApprovalRequest[]; // set on a 'suspended' approval break
+  approvalRequestCounts?: Record<string, number>; // 2.3: approval requests per tool call id, all legs
   agentPath?: string[];                    // set on sub-agent checkpoints
   createdAt: number;                       // deps.clock.now() at save time
 }

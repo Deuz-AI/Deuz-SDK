@@ -17,7 +17,7 @@ import {
   type StreamToolLoopInternal,
   type StreamToolLoopSnapshot,
 } from './stream-tool-loop';
-import { SubAgentSuspension } from './loop-shared';
+import { SubAgentSuspension, durableResumeOf } from './loop-shared';
 import { readInheritedObserve } from '../internal/observe-runtime';
 import { assertCheckpointVersion } from '../internal/checkpoint-version';
 import { toObservedError } from '../internal/observe-error';
@@ -135,7 +135,7 @@ export function agentTool(def: AgentToolDef): Tool {
           }
           childMessages = [...checkpoint.messages];
           resume = {
-            resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+            resumeFrom: durableResumeOf(checkpoint),
             ...(checkpoint.cost ? { resumeCost: checkpoint.cost } : {}),
             // Handoff (2.0): the CHILD's checkpoint carries the child's own
             // active agent, so a sub-agent that transferred and then suspended
