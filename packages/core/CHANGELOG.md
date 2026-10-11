@@ -38,6 +38,8 @@
 
   **Production stores.** SQLite (`node:sqlite`, or any better-sqlite3-compatible handle you inject), Redis, and Postgres — each implementing the memory, chat, session, and run stores against one shared conformance suite, so a divergence between backends is a test failure rather than a surprise in production.
 
+  _Correction (2.3): the Redis pack implemented the memory, chat, and session stores only. It had no run store until 2.3, where `createRedisStores` returns `runs`._
+
   **MCP you can rely on.** OAuth 2.0 with PKCE, discovery, dynamic registration, and refresh, behind a `TokenStore` seam with file and loopback helpers for Node. Connections reconnect with backoff, report status, and invalidate their tool cache on `tools/list_changed`. Servers can drive sampling through your own model behind an approval gate, and read roots. `options.mcp` connects servers for a call, namespaces their tools, and closes only what it opened.
 
   **Agent controls.** `handoff()` transfers the conversation to another agent — system prompt, tools, and model swap for the rest of the run, and a checkpoint replays it. `guardrails` can pass, block, or rewrite on input, tool calls, and output; a blocked tool call self-heals through the existing denial path instead of ending the run. `runtimeContext` threads a typed value to tools, hooks, and sub-agents.
