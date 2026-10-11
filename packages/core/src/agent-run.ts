@@ -472,8 +472,12 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   let router: import('./internal/native-fallback').ModelRouter | undefined;
   /** The run's memory scope is claimed for its execution until the executor ends (2.3). */
   let releaseMemoryScope: (() => void) | undefined;
-  /** The resume binding held: the stored run is this run (2.3, gates the projection repair). */
-  let bound = false;
+  /**
+   * A resume that found the run ended, or still waiting on its caller (2.3):
+   * it writes nothing of the run's own, but may repair a chat projection left
+   * behind. A resume refused for any reason writes nothing at all.
+   */
+  let repairable = false;
   /** This leg completed the run, so it extracts (2.3); a terminal resume never does. */
   let extractNow = false;
 
@@ -918,7 +922,6 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           throw new TypeError('Native agent binding changed across resume.');
       }
       if (handoffs !== undefined) binding.handoffs = handoffs;
-      bound = true;
       if (nativeFallback)
         router = nativeFallback.createModelRouter(
           options.fallbackModels!,
@@ -931,6 +934,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         const terminal = envelope.result as AgentResult<T>;
         settledOutcome = terminal;
         terminalSaved = true;
+        repairable = true;
         return;
       }
       // MCP (2.3, F01): connected only now, after a terminal run has returned
@@ -1005,6 +1009,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           pendingClientCalls: pendingClients,
         };
         settledOutcome = outcome;
+        repairable = true;
         return;
       }
       // A local tool shadows an MCP tool of the same name, as in the loop's merge.
@@ -1846,7 +1851,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     } finally {
       // Chat projection and extraction (2.3), after the outcome and never in
       // place of it: a failed durable commit publishes neither.
-      if (settledOutcome && bound && !persistFailed) await settleRecords();
+      if (settledOutcome && (admitted || repairable) && !persistFailed) await settleRecords();
       releaseMemoryScope?.();
       await nativeMcp?.close();
       removeLedgerPersistence?.();

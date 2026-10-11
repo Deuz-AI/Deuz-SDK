@@ -264,6 +264,29 @@ describe('native chat projection', () => {
     }
   });
 
+  it('a refused resume writes nothing, not even a repair', async () => {
+    const chat = chatStore();
+    const runs = runStore();
+    const options: Resumable = {
+      model: mocked([{ toolCalls: [{ toolName: 'gate', id: 'g1', args: {} }] }]).model,
+      prompt: 'gated',
+      chat: { store: chat.store, chatId: 'chat-refused', scope: { userId: 'ada' } },
+      session: { store: runs.store, runId: 'refused', scope: 'tenant' },
+      tools: { gate: { parameters, needsApproval: true, execute: () => 'ok' } },
+    };
+    chat.failNext();
+    expect((await runAgent(options)).status).toBe('suspended');
+    const saved = runs.saves.length;
+    // Refused after the binding check: a client result for no pending call.
+    const refused = await resumeAgent({
+      ...options,
+      clientToolResults: [{ toolCallId: 'nope', output: 'x' }],
+    });
+    expect(refused).toMatchObject({ status: 'failed' });
+    expect(runs.saves).toHaveLength(saved);
+    expect(chat.writes).toHaveLength(0);
+  });
+
   it('never overwrites a chat that belongs to another scope', async () => {
     const chat = chatStore();
     const theirs: ChatRecord = {
