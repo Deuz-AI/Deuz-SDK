@@ -7,6 +7,8 @@
  * live-verified.
  */
 import { describe, expect, it, vi } from 'vitest';
+import { createSqliteOpsStore } from '../src/node/ops-sqlite';
+import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../src/agent-run';
 import { createAnthropic } from '../src/anthropic';
 import { createOpenAI } from '../src/openai';
@@ -22,6 +24,14 @@ import {
 } from './fixtures/wire-turns';
 
 const parameters = { type: 'object', properties: {} };
+
+let DatabaseSync: (new (path: string) => SqliteDatabaseLike) | undefined;
+try {
+  DatabaseSync = ((await import('node:sqlite' as string)) as { DatabaseSync: typeof DatabaseSync })
+    .DatabaseSync;
+} catch {
+  /* optional runtime */
+}
 
 function memory() {
   const store = createInMemoryMemoryStore();
@@ -122,6 +132,47 @@ describe('23.4 acceptance', () => {
     expect(envelope.memory?.extraction?.status).toBe('completed');
     expect(envelope.chat).toMatchObject({ status: 'saved', cursor: 7 });
   });
+
+  it.skipIf(!DatabaseSync)(
+    'a durable store keeps a version 2 envelope as it is, with no migration',
+    async () => {
+      const ops = createSqliteOpsStore({ path: ':memory:' });
+      try {
+        const mem = memory();
+        const chats = createInMemoryChatStore();
+        const opus = claude('claude-opus-5-5', [
+          claudeTurn([{ type: 'tool_use', id: 'toolu_1', name: 'gate', json: '{}' }], 'tool_use'),
+          claudeTurn([{ type: 'text', text: 'Done.' }]),
+        ]);
+        const options = (): AgentRunOptions & { session: AgentRunSession } => ({
+          model: opus.model,
+          prompt: 'gate it',
+          memory: { seams: mem.seams, scope: { userId: 'ada' }, extract: false },
+          chat: { store: chats, chatId: 'sqlite', scope: { userId: 'ada' } },
+          session: { store: ops.agentRuns, runId: 'sqlite-run', scope: 'tenant' },
+          tools: { gate: { parameters, needsApproval: true, execute: () => 'ok' } },
+        });
+        const first = await runAgent(options());
+        if (first.status !== 'suspended')
+          throw new Error(`expected suspension, got ${first.status}`);
+        const stored = (await ops.agentRuns.load('sqlite-run'))!;
+        expect(stored.version).toBe(2);
+        expect(stored.memory?.recall.status).toBe('recalled');
+        expect(stored.transcript?.messages).toHaveLength(3);
+        const resumed = await resumeAgent({
+          ...options(),
+          approvalResponses: [
+            { approvalId: first.pendingApprovals[0]!.approvalId, approved: true },
+          ],
+        });
+        expect(resumed.status).toBe('completed');
+        expect((await chats.loadChat('sqlite'))!.messages).toHaveLength(5);
+        expect(mem.search).toHaveBeenCalledTimes(1);
+      } finally {
+        await ops.close();
+      }
+    },
+  );
 
   it('preserved thinking: memory keeps the request prefix byte-identical across steps and a resume', async () => {
     const mem = memory();
