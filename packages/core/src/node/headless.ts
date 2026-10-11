@@ -62,7 +62,7 @@ export type {
 // statically resolving node: (matches node/observe.ts / node/compute.ts).
 interface NodeFs {
   readFile(path: string, encoding: 'utf-8'): Promise<string>;
-  stat(path: string): Promise<unknown>;
+  stat(path: string): Promise<{ isDirectory(): boolean }>;
 }
 interface NodePath {
   resolve(...parts: string[]): string;
@@ -117,7 +117,8 @@ async function gitRoot(fs: NodeFs, path: NodePath, start: string): Promise<strin
  * text nearest `dir` comes last and wins a conflict; files below `dir` are not
  * read, and `@path` imports are not expanded. A file that repeats an earlier
  * one's text is included once. The text is capped at `maxBytes` (32 KiB),
- * keeping the files nearest `dir` whole first.
+ * keeping the files nearest `dir` whole first. Rejects with a TypeError when
+ * `dir` is not a directory.
  */
 export async function loadProjectInstructions(
   dir: string,
@@ -125,6 +126,12 @@ export async function loadProjectInstructions(
 ): Promise<ProjectInstructions> {
   const { fs, path } = await loadFs();
   const start = path.resolve(dir);
+  // A mistyped directory must not quietly read its ancestors' files instead.
+  const found = await fs.stat(start).catch((error: unknown) => {
+    if (isAbsent(error)) return undefined;
+    throw error;
+  });
+  if (!found?.isDirectory()) throw new TypeError(`Not a directory: ${dir}`);
   const root =
     options.root !== undefined
       ? path.resolve(options.root)
@@ -430,8 +437,10 @@ export async function inspectRun(store: AgentRunStore, runId: string): Promise<H
  * `deps.keyProvider` is not called.
  */
 export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
-  const host = options.env === undefined || options.nodeVersion === undefined;
-  const process = host ? await loadProcess() : undefined;
+  const host =
+    options.env === undefined || options.nodeVersion === undefined
+      ? await loadProcess()
+      : undefined;
   const prices = options.deps?.priceProvider ?? createPriceProvider();
   let priced: boolean | undefined;
   let priceError: string | undefined;
@@ -447,8 +456,8 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
     priceError = error instanceof Error ? error.message : String(error);
   }
   return diagnose(options, {
-    env: options.env ?? process!.env,
-    nodeVersion: options.nodeVersion ?? process!.versions.node,
+    env: options.env ?? host!.env,
+    nodeVersion: options.nodeVersion ?? host!.versions.node,
     priced,
     ...(priceError !== undefined ? { priceError } : {}),
   });

@@ -184,7 +184,8 @@ console.log(project.message?.role); // 'system'
   then `CLAUDE.md` (`fileNames` changes the list). The root is the nearest
   directory from `dir` upwards that holds `.git`; outside a repository only
   `dir` itself is read. `root` sets it explicitly (it must be `dir` or an
-  ancestor).
+  ancestor). A `dir` that is not a directory rejects with a `TypeError`, so a
+  mistyped path never reads its ancestors' files instead.
 - **Precedence.** Outer files come first and the files nearest `dir` last; the
   message tells the model to follow the later one where two disagree. Your own
   `instructions` come before all of them, and the skills list after.

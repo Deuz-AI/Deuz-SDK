@@ -124,6 +124,13 @@ describe('loadProjectInstructions', () => {
     expect(loaded).toMatchObject({ files: [] });
     expect(loaded.message).toBeUndefined();
   });
+
+  it('rejects a directory that does not exist, instead of reading its ancestors', async () => {
+    await put('repo/.git/HEAD', 'x');
+    await put('repo/AGENTS.md', 'Root rules.');
+    await expect(loadProjectInstructions(join(base, 'repo/typo'))).rejects.toThrow(TypeError);
+    await expect(loadProjectInstructions(join(base, 'repo/AGENTS.md'))).rejects.toThrow(TypeError);
+  });
 });
 
 describe('runHeadless with project instructions and skills', () => {
