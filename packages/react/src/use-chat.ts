@@ -364,7 +364,7 @@ function nativeSuspension(
     approvals: agent.pendingApprovals,
     clientCalls: agent.pendingClientCalls.map(
       (call) =>
-        cards.find((card) => card.toolCallId === call.toolCallId) ?? {
+        cards.find((card) => card.toolCallId === call.toolCallId && card.input !== undefined) ?? {
           toolCallId: call.toolCallId,
           toolName: call.toolName,
           input: call.input,

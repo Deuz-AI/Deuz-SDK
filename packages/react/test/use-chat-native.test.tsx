@@ -325,6 +325,41 @@ describe('useChat — a native agent route (2.3)', () => {
     expect(result.current.messages.at(-1)?.content).toBe('Both done.');
   });
 
+  it('parks the client call after the verdicts; its answer resumes with both', async () => {
+    const route = nativeRoute(
+      [
+        {
+          toolCalls: [
+            { toolName: 'publish', id: 'p1', args: {} },
+            { toolName: 'locate', id: 'c1', args: {} },
+          ],
+        },
+        { text: 'Both done.' },
+      ],
+      { ...publishTools(), locate: { description: 'Where?', parameters } },
+    );
+    const { result } = renderHook(() => useChat({ api: '/api/agent', fetch: route.fetch }));
+    await act(async () => {
+      await result.current.sendMessage('go');
+    });
+    await waitFor(() => expect(result.current.pendingApprovals).toHaveLength(1));
+    const { approvalId } = result.current.pendingApprovals[0]!;
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId, approved: false, reason: 'no' });
+    });
+    expect(route.bodies).toHaveLength(1); // the run also waits for `locate`
+    expect(result.current.pendingToolCalls.map((c) => c.toolCallId)).toEqual(['c1']);
+    await act(async () => {
+      await result.current.addToolResult({ toolCallId: 'c1', output: 'Paris' });
+    });
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    expect(route.bodies[1]).toMatchObject({
+      runId: 'run-1',
+      approvalResponses: [{ approvalId, approved: false, reason: 'no' }],
+      clientToolResults: [{ toolCallId: 'c1', output: 'Paris' }],
+    });
+  });
+
   it('F06 on the native path: a verdict with nothing pending, or twice, resumes nothing', async () => {
     const route = nativeRoute(
       [{ toolCalls: [{ toolName: 'publish', id: 'p1', args: {} }] }, { text: 'Published.' }],
