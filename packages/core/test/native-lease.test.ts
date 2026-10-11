@@ -583,6 +583,29 @@ describe('runAgent lease (2.3)', () => {
     expect(await leases.acquire({ key, owner: 'b', ttlMs: 300 })).toMatchObject({ owner: 'b' });
   });
 
+  it('gives the key back and writes nothing when the first renewal fails', async () => {
+    const { leases, store, session, key, clock } = setup();
+    const outage: LeaseProvider = {
+      ...leases,
+      renew: async () => {
+        throw new Error('lease provider down');
+      },
+    };
+    const { model, fetch } = counted([{ text: 'done' }]);
+    expect(
+      await runAgent({
+        model,
+        prompt: 'Work.',
+        session: { ...session, store },
+        lease: { provider: outage, owner: 'a', ttlMs: 300 },
+        deps: { clock },
+      }),
+    ).toMatchObject({ status: 'failed', error: { message: 'lease provider down' } });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(await store.list()).toEqual({ runs: [] });
+    expect(await leases.acquire({ key, owner: 'b', ttlMs: 300 })).toMatchObject({ owner: 'b' });
+  });
+
   it('notices a lease another executor took over at its next renewal', async () => {
     const { leases, store, session, key, clock, advance } = setup();
     const parked = parkedTool();
