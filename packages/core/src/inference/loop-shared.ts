@@ -3726,8 +3726,9 @@ function recalledAlready(messages: Message[]): boolean {
  * the false-finish nudge is: the next turn replays it in place, so the prefix
  * every later thinking block is bound to never changes. Recall runs once per
  * user turn: a history whose last user message is already followed by its
- * recall message (a resume leg's checkpoint, an approval continuation, a
- * replayed transcript) recalls nothing.
+ * recall message (an approval continuation, a replayed transcript) recalls
+ * nothing, and neither does a `resumed` leg whose checkpoint holds one — even
+ * when a loop-injected user turn (a false-finish nudge) came after it.
  *
  * Every other model keeps the 2.2 placement: the block is spliced into the
  * leading system turn at the model-call site only, and the transcript stays
@@ -3739,9 +3740,13 @@ export async function planRecall(
   messages: Message[],
   model: LanguageModel,
   ob?: ExecuteExtras['observe'],
+  /** The leg resumes a durable run from its checkpoint. */
+  resumed = false,
 ): Promise<RecallPlan> {
   const stable = bindsThinkingToPrefix(model);
-  if (stable && recalledAlready(messages)) return {};
+  if (stable && (recalledAlready(messages) || (resumed && messages.some(isRecallMessage)))) {
+    return {};
+  }
   const block = await computeRecallBlock(options, deps, messages, ob);
   if (!block) return {};
   if (!stable) return { splice: block };

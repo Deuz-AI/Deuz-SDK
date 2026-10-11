@@ -889,6 +889,7 @@ export function runStreamToolLoop(
         messages,
         active?.model ?? options.model,
         observeCtx,
+        resumeFrom !== undefined,
       );
       const recallBlock = recall.splice;
       // Recall overhead (2.0): a spliced block never enters `messages`, but the

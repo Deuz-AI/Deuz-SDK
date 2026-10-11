@@ -512,6 +512,7 @@ export async function runToolLoop(
       messages,
       active?.model ?? options.model,
       observeCtx,
+      internal?.resumeFrom !== undefined,
     );
     const recallBlock = recall.splice;
     // Recall overhead (2.0): a spliced block never enters `messages`, but the

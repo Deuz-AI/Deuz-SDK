@@ -21,6 +21,8 @@ import { createInMemoryMemoryStore, type MemorySeams } from '../src/memory';
 import { handoff } from '../src/inference/handoff';
 import { promptInjectionGuard, wrapModel } from '../src/middleware';
 import { resolveInputMessages } from '../src/core/normalize';
+import { planRecall } from '../src/inference/loop-shared';
+import { resolveDependencies } from '../src/internal/resolve-deps';
 import type { CommonCallOptions } from '../src/types/config';
 import type { Message } from '../src/types/message';
 import type { ToolSet } from '../src/types/tool';
@@ -1095,5 +1097,47 @@ describe('a tool-set change that names a tool the request no longer declares', (
       role: 'system',
       content: [removal('write')],
     });
+  });
+});
+
+describe('planRecall: the resume rule', () => {
+  const model = scriptedClaude([]).model;
+  const recalled: Message[] = [
+    { role: 'user', content: 'Order me a coffee.' },
+    {
+      role: 'system',
+      content: 'Relevant memories:\n- User prefers dark roast coffee',
+      providerMetadata: { deuz: { memoryRecall: true } },
+    },
+    { role: 'assistant', content: 'Which size?' },
+    // A loop-injected user turn (a false-finish nudge) after the recall.
+    { role: 'user', content: 'That is not finished yet.' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't0', name: 'brew', input: {} }] },
+    { role: 'tool', content: [{ type: 'tool_result', toolUseId: 't0', result: 'ok' }] },
+  ];
+
+  it('a resume leg whose checkpoint already recalled never recalls again', async () => {
+    const seams = await seededSeams();
+    const options = {
+      model,
+      messages: recalled,
+      memory: { seams, scope: { userId: 'u1' } },
+    } as CommonCallOptions;
+    const deps = resolveDependencies({ clock });
+    expect(await planRecall(options, deps, recalled, model, undefined, true)).toEqual({});
+    expect(seams.search).not.toHaveBeenCalled();
+  });
+
+  it('a new call after a user message recalls for it', async () => {
+    const seams = await seededSeams();
+    const options = {
+      model,
+      messages: recalled,
+      memory: { seams, scope: { userId: 'u1' } },
+    } as CommonCallOptions;
+    const deps = resolveDependencies({ clock });
+    const plan = await planRecall(options, deps, recalled, model);
+    expect(plan.message?.role).toBe('system');
+    expect(seams.search).toHaveBeenCalledTimes(1);
   });
 });
