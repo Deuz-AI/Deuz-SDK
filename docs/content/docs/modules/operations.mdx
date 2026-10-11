@@ -476,8 +476,18 @@ console.log(`${handles.length} runs taken over, ${failed.length} could not be re
 | `T:lease:expiry` | Sorted set of lease keys by expiry, 0 once released |
 | `T:run:payload`, `T:run:revision` | Hashes by native run ID |
 | `T:run:terminal` | Sorted set of terminal native runs by their last save |
+| `T:run:ix`, `T:run:ix:ph:<phase>`, `T:run:ix:sc:<scope>`, `T:run:ix:ps:<phase>:<scope>` | The listing indexes of every run, by phase, by scope and by both (the scope as hex code units). Each run has one entry: the server time of its last save, its run ID and its summary, ordered as `agentRuns.list` pages |
+| `T:run:entry` | Hash of each native run's current listing entry, so a save or prune can remove it |
+| `T:run:indexed` | Marks a store whose runs all have a listing entry |
 | `T:claims` | Sorted set of claim keys by the time they were granted; keys are stored as they are |
 | `T:schema` | The layout version, one string per store |
+
+A store created by 2.3 sets `T:run:indexed` on first use. A store written by a
+2.3 pre-release does not have it yet. On such a store, the first
+`agentRuns.list` indexes the runs saved before the listing indexes existed,
+100 per script, and then sets the marker. A terminal run among them is listed
+at its last save, the time `T:run:terminal` holds. Any other is listed at the
+time it was indexed, because nothing recorded its last save.
 
 The budget and swarm stores keep a hash per request, scope and run, with sorted
 sets that index them; their key layouts are listed in the source of
@@ -587,8 +597,10 @@ process at a time, and cancelled from another process.
 `agentRuns.list({ phases?, updatedBefore?, scope?, limit?, cursor? })` returns
 a page of runs, newest save first (then run ID, descending), as summaries
 without their transcripts. The memory store (`createInMemoryAgentRunStore`),
-and the SQLite and Postgres `agentRuns` have it; on SQLite and Postgres it pages
-by the `deuz_agent_runs_updated_at` index. `AgentRunStore.list` is optional, so
+and the SQLite, Postgres and Redis `agentRuns` have it. On SQLite and Postgres
+it pages by the `deuz_agent_runs_updated_at` index. On Redis it reads sorted-set
+indexes that every save and prune keeps up to date (by phase, by scope, or both),
+so no run is loaded; see [Redis](#redis). `AgentRunStore.list` is optional, so
 a store of your own may leave it out.
 
 | Summary field | Meaning |
@@ -596,7 +608,7 @@ a store of your own may leave it out.
 | `runId`, `scope` | The run |
 | `phase` | `'running'`, `'finalizing'` or `'terminal'`, as the envelope records it |
 | `revision` | The envelope's revision; 0 for an envelope written by 2.1 |
-| `updatedAt` | When the run was last saved, epoch ms on the store's clock: the injected clock for memory and SQLite, the database clock for Postgres |
+| `updatedAt` | When the run was last saved, epoch ms on the store's clock: the injected clock for memory and SQLite, the database clock for Postgres, the server's `TIME` for Redis |
 | `status` | The stored result's status: `'suspended'` for a run waiting on approvals or client results (its phase stays `'running'`), the outcome of a terminal run; absent while the run is in progress |
 
 `phases` keeps runs in those phases (an empty list keeps none), `updatedBefore`
