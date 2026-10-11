@@ -69,6 +69,7 @@ import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
 import { assertCheckpointVersion } from './internal/checkpoint-version';
+import { withCapabilityOverride } from './internal/config-symbol';
 // Native run discovery and the run lease (2.3).
 import type { Clock } from './types/deps';
 import { claimNativeRunLease, type NativeRunLease } from './internal/agent-run-lease';
@@ -1023,7 +1024,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             resolveDependencies(options.deps).logger,
           )
         : undefined;
-      const finalModel = finalAgent?.model ?? common.model;
+      // The caller's `capabilities` override follows the target's model (2.3, F26).
+      const finalModel = finalAgent
+        ? withCapabilityOverride(finalAgent.model, common.capabilities)
+        : common.model;
       // Finalization is one more turn of the same conversation (2.3, F15). It
       // keeps the loop's tools on the wire, with `tool_choice: 'none'`, so the
       // request prefix (prompt cache, preserved thinking) is the loop's own. A

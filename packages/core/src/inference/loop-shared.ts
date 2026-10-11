@@ -58,6 +58,7 @@ import type { CallWarning } from '../types/methods';
 // call without `options.mcp` pulls none of that module graph into the bundle.
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import { getCapabilities } from '../core/registry';
+import { withCapabilityOverride } from '../internal/config-symbol';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
 // `resolveTimeouts` is the SINGLE resolution point for every timeout layer
@@ -924,6 +925,11 @@ export async function applyPrepareStep(
     if (ps.activeTools) wire = filterWireTools(fullWire, ps.activeTools, logger, warnings);
     if (ps.toolChoice) wire = { ...wire, toolChoice: ps.toolChoice };
   }
+  // The per-call `capabilities` override follows every model a step resolves to
+  // (2.3, F26): a `prepareStep` model, or a handoff target's, which arrives here
+  // as `options.model`. The root model carries it already; the merge is idempotent.
+  const model = withCapabilityOverride(stepOptions.model, options.capabilities);
+  if (model !== stepOptions.model) stepOptions = { ...stepOptions, model };
   return { options: stepOptions, messages, wire };
 }
 
