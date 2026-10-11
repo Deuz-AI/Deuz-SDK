@@ -104,8 +104,11 @@ export function goalWakeupKey(goalId: string, at: number): string {
 }
 
 /**
- * The event that ends a goal's wakeup wait: dated at the wakeup, answering
- * the wait. Throws `invalid_event` for a goal that waits for no wakeup.
+ * The event that ends a goal's wakeup wait: keyed by the wakeup, not to be
+ * applied before it, and answering the wait. It is dated at the wakeup, or
+ * when the wait began for a wakeup already due then, so that it is never
+ * older than the wait it ends. Throws `invalid_event` for a goal that waits
+ * for no wakeup.
  */
 export function goalWakeupEvent(record: GoalRecord): GoalEvent {
   const goal = readGoal(record);
@@ -117,7 +120,7 @@ export function goalWakeupEvent(record: GoalRecord): GoalEvent {
     goalId: goal.goalId,
     source: { type: 'wakeup' },
     key: goalWakeupKey(goal.goalId, wait.at),
-    at: wait.at,
+    at: Math.max(wait.at, wait.since),
     notBefore: wait.at,
     ...(goal.runId !== undefined ? { runId: goal.runId } : {}),
     correlationId: wait.id,

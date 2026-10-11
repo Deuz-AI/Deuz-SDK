@@ -381,6 +381,23 @@ describe('applying events', () => {
     expect(apply(plain, goalWakeupEvent(plain), T0 + 60_000).record.status).toBe('active');
   });
 
+  it('ends a wakeup wait that was due as it began with its own wakeup event, as a tick does', () => {
+    // A retry-after of 0, or a time computed a moment before the transition.
+    const goal = waiting({ reason: 'wakeup', at: T0 + 5 }, T0 + 10);
+    const wakeup = goalWakeupEvent(goal);
+    expect(wakeup).toMatchObject({
+      key: goalWakeupKey('g', T0 + 5),
+      at: T0 + 10,
+      notBefore: T0 + 5,
+      correlationId: 'g#2',
+    });
+    expect(apply(goal, wakeup, T0 + 11)).toMatchObject({
+      outcome: 'applied',
+      record: { status: 'active' },
+    });
+    expect(transitionGoal(goal, { type: 'tick' }, { now: T0 + 11 }).record.status).toBe('active');
+  });
+
   it('remembers the last 64 event keys, and apart from them the last 64 charge keys', () => {
     let goal = createGoal({ ...target, objective: 'x' }, { now: T0 });
     let now = T0;
