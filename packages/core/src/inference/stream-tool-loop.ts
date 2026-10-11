@@ -63,6 +63,7 @@ import {
   planToolDispatch,
   policyRefusalOf,
   settlePendingApprovals,
+  continueStoredRun,
   saveCheckpoint,
   prepareChatPersistence,
   persistChat,
@@ -710,6 +711,13 @@ export function runStreamToolLoop(
     };
 
     try {
+      // A plain leg of a stored durable run continues its step counter (2.3), so
+      // no approval is bound to a step the run already used. Inside the try: a
+      // strict read failure ends the run as an `error` part (G2).
+      const suspendedAt =
+        durable && resumeFrom === undefined
+          ? await continueStoredRun(durable, options, deps)
+          : undefined;
       // What a mid-run MCP catalog change does (2.3); an unknown value fails the run.
       const catalogPolicy = catalogChangePolicy(options);
       // Zero-config MCP (2.0): connect BEFORE the wire is built so the servers'
@@ -770,7 +778,7 @@ export function runStreamToolLoop(
           },
           { ...(active ? { active } : {}), tools: handoffTools },
           // The identity the suspended leg bound its approvals to (2.3).
-          { runId: durable?.runId, step: resumeFrom?.stepIndex },
+          { runId: durable?.runId, step: resumeFrom?.stepIndex ?? suspendedAt },
         );
         if (settled) {
           const settledMessages = settled.messages.slice(messages.length);

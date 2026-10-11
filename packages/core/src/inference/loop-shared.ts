@@ -185,7 +185,7 @@ export interface DurableRunner {
 /**
  * Build the durable runner when the call carries `session`; otherwise
  * undefined (zero overhead). `resumeFrom` seeds the cross-leg counters on a
- * `resumeFromCheckpoint` leg.
+ * `resumeFromCheckpoint` leg; a plain leg reads them with {@link continueStoredRun}.
  */
 export function setupDurable(
   options: CommonCallOptions,
@@ -199,6 +199,42 @@ export function setupDurable(
     baseUsage: resumeFrom?.usage ?? EMPTY_USAGE,
     stepIndex: resumeFrom?.stepIndex ?? 0,
   };
+}
+
+/**
+ * A plain leg of a stored durable run (2.3): a call that carries the run's
+ * `session` without `resumeFromCheckpoint`. It continues the stored run's step
+ * counter, so the run never saves the same step boundary twice and an approval
+ * bound to a step is never issued again by a later leg. Returns the step the
+ * stored run is suspended at: the step its pending approvals are bound to, which
+ * the leg's settle needs. A run id the caller did not pass has nothing stored.
+ *
+ * A failed read is logged and the leg counts from 0, as before; under
+ * `durability: 'strict'` it fails the call instead.
+ */
+export async function continueStoredRun(
+  runner: DurableRunner,
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+): Promise<number | undefined> {
+  if (options.session?.runId === undefined) return undefined;
+  let stored: AgentCheckpoint | undefined;
+  try {
+    stored = await runner.store.load(runner.runId);
+  } catch (cause) {
+    if (options.session.durability === 'strict') {
+      throw new ExecutionPersistenceError(
+        `Checkpoint of run '${runner.runId}' could not be read.`,
+        cause,
+      );
+    }
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    deps.logger.error(`durable: checkpoint load failed for '${runner.runId}' — ${detail}`);
+    return undefined;
+  }
+  if (!stored || !Number.isSafeInteger(stored.stepIndex) || stored.stepIndex < 0) return undefined;
+  runner.stepIndex = stored.stepIndex;
+  return stored.status === 'suspended' ? stored.stepIndex : undefined;
 }
 
 /** Cumulative run usage (prior legs + this leg) for checkpoints and stop conditions. */
@@ -2323,9 +2359,8 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
  *
  * `approval` (2.3) is the identity the suspended leg bound its requests to: a
  * verdict counts only under the `approvalId` its call was issued with (see
- * {@link approvalIdOf}). A durable leg that does not know its suspension step
- * (a plain call carrying the run's `session`) reads it from the stored
- * checkpoint.
+ * {@link approvalIdOf}). A plain leg of a durable run passes the step its stored
+ * checkpoint is suspended at ({@link continueStoredRun}).
  */
 export async function settlePendingApprovals(
   messages: Message[],
@@ -2383,15 +2418,6 @@ export async function settlePendingApprovals(
     toolName: p.name,
     args: p.input,
   }));
-  let scope: ApprovalScope = approval ?? {};
-  if (scope.runId !== undefined && scope.step === undefined && options.session) {
-    try {
-      const saved = await options.session.store.load(scope.runId);
-      if (saved?.status === 'suspended') scope = { ...scope, step: saved.stepIndex };
-    } catch {
-      // Unreadable: no verdict can match a step-bound id, so gated calls deny.
-    }
-  }
   // The same plan a live step makes (transfers by decision, the re-derived
   // `onToolCall` guardrails, then the gate), here with the leg's verdicts.
   const plan = await planToolDispatch({
@@ -2401,7 +2427,7 @@ export async function settlePendingApprovals(
     messages,
     ...(handoff ? { handoff } : {}),
     verdicts: responses,
-    approval: scope,
+    approval: approval ?? {},
     ...(extras?.deps ? { clock: extras.deps.clock } : {}),
     ...(extras?.observe ? { observe: extras.observe } : {}),
   });

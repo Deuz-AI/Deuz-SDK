@@ -12,7 +12,7 @@
  * Offline: the mock model scripts every turn with the recycled id `tool_0`.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { generateText } from '../src/generate';
+import { generateText, streamChat } from '../src/generate';
 import {
   createApprovalSigner,
   createInMemorySessionStore,
@@ -20,6 +20,7 @@ import {
 } from '../src/durable';
 import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../src/agent-run';
 import { createMockModel, type MockResponse } from '../src/testing';
+import type { CommonCallOptions } from '../src/types/config';
 import type { Message } from '../src/types/message';
 import type { ToolApprovalResponse, ToolSet } from '../src/types/tool';
 
@@ -44,6 +45,20 @@ function payTools() {
 }
 
 const approve = (approvalId: string): ToolApprovalResponse => ({ approvalId, approved: true });
+
+type Entry = 'generateText' | 'streamChat';
+
+/** One call through either entry point: the approval ids it issued. */
+async function leg(entry: Entry, options: CommonCallOptions): Promise<string[]> {
+  if (entry === 'generateText') {
+    return (await generateText(options)).pendingApprovals?.map((r) => r.approvalId) ?? [];
+  }
+  const ids: string[] = [];
+  for await (const part of streamChat(options).fullStream) {
+    if (part.type === 'tool-approval-request') ids.push(part.approvalId);
+  }
+  return ids;
+}
 
 describe('approval identity: a stateless resume (no session)', () => {
   it.each([
@@ -221,6 +236,102 @@ describe('approval identity: a durable resume binds the run and the step', () =>
       approvalResponses: [approve(runA.pendingApprovals![0]!.approvalId)],
     });
     expect(pay).not.toHaveBeenCalled();
+  });
+});
+
+// An app may continue one durable run with plain calls that carry its `session`
+// (no `resumeFromCheckpoint`), reading each turn's history off the checkpoint.
+// Every such leg continues the run's step counter, so a gate is never bound to
+// a step the run already issued an approval for.
+describe('approval identity: plain-call legs of one durable run', () => {
+  it.each(['generateText', 'streamChat'] as const)(
+    '%s: a verdict kept from an earlier turn never approves the identical call of a later one',
+    async (entry) => {
+      const { pay, tools } = payTools();
+      const store = createInMemorySessionStore();
+      const session = { store, runId: `chat-${entry}` };
+      const history = async () => (await store.load(session.runId))!.messages;
+      const model = createMockModel({
+        responses: [call('pay', 5), { text: 'paid' }, call('pay', 5), { text: 'paid again' }],
+      });
+      const base = { model, tools, maxSteps: 4, session };
+
+      const [issued] = await leg(entry, { ...base, messages: [{ role: 'user', content: 'pay' }] });
+      const kept = approve(issued!);
+      await leg(entry, { ...base, messages: await history(), approvalResponses: [kept] });
+      expect(pay).toHaveBeenCalledTimes(1);
+
+      const turn: Message = { role: 'user', content: 'pay again' };
+      const [fresh] = await leg(entry, { ...base, messages: [...(await history()), turn] });
+      expect(fresh).toBeDefined();
+      expect(fresh).not.toBe(kept.approvalId);
+      // The run's boundaries: suspended #1, completed #2, suspended #3.
+      expect((await store.load(session.runId))!.stepId).toBe(`${session.runId}#3`);
+
+      // The client re-sends the verdict it kept from the first gate.
+      await leg(entry, { ...base, messages: await history(), approvalResponses: [kept] });
+      expect(pay).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(['generateText', 'streamChat'] as const)(
+    '%s: the identical call issued again inside the verdict leg gets a new approval id',
+    async (entry) => {
+      const { pay, tools } = payTools();
+      const store = createInMemorySessionStore();
+      const session = { store, runId: `again-${entry}` };
+      const history = async () => (await store.load(session.runId))!.messages;
+      const model = createMockModel({ responses: [call('pay', 5), call('pay', 5), { text: 'x' }] });
+      const base = { model, tools, maxSteps: 4, session };
+
+      const [issued] = await leg(entry, { ...base, messages: [{ role: 'user', content: 'pay' }] });
+      const kept = approve(issued!);
+      // The verdict leg runs the approved call, then the model issues it again.
+      const [again] = await leg(entry, {
+        ...base,
+        messages: await history(),
+        approvalResponses: [kept],
+      });
+      expect(pay).toHaveBeenCalledTimes(1);
+      expect(again).toBeDefined();
+      expect(again).not.toBe(kept.approvalId);
+
+      await leg(entry, { ...base, messages: await history(), approvalResponses: [kept] });
+      expect(pay).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('a kept signed approval of an earlier turn is refused at a later gate', async () => {
+    const { pay, tools } = payTools();
+    const store = createInMemorySessionStore();
+    const session = { store, runId: 'chat-signed' };
+    const history = async () => (await store.load(session.runId))!.messages;
+    const model = createMockModel({
+      responses: [call('pay', 5), { text: 'paid' }, call('pay', 5), { text: 'paid again' }],
+    });
+    const approvalSigner = createApprovalSigner({ secret: 'k' });
+    const base = { model, tools, maxSteps: 4, session, approvalSigner };
+
+    const first = await generateText({ ...base, messages: [{ role: 'user', content: 'pay' }] });
+    const request = first.pendingApprovals![0]!;
+    const kept: ToolApprovalResponse = {
+      approvalId: request.approvalId,
+      approved: true,
+      token: request.token!,
+    };
+    await generateText({ ...base, messages: await history(), approvalResponses: [kept] });
+    expect(pay).toHaveBeenCalledTimes(1);
+
+    const turn: Message = { role: 'user', content: 'pay again' };
+    const next = await generateText({ ...base, messages: [...(await history()), turn] });
+    const fresh = next.pendingApprovals![0]!;
+    // The kept token, re-sent under the new approval id, names the earlier gate.
+    await generateText({
+      ...base,
+      messages: await history(),
+      approvalResponses: [{ ...kept, approvalId: fresh.approvalId }],
+    });
+    expect(pay).toHaveBeenCalledTimes(1);
   });
 });
 
