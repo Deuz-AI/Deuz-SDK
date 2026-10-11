@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — do not hand-edit.
-     regenerate: node .claude/skills/deuz-sdk/scripts/generate-api-index.mjs
+     regenerate: node packages/core/tooling/skills/generate-api-index.mjs --date YYYY-MM-DD
      source: packages/core/{package.json exports, tsup.config.ts} + src walk (export * followed)
      verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd -->
 
