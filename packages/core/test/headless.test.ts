@@ -14,7 +14,7 @@ import {
   resumeHeadless,
   runHeadless,
 } from '../src/node/headless';
-import type { AgentEvent, AgentToolSet } from '../src/types/agent-run';
+import type { AgentEvent, AgentRunStore, AgentToolSet } from '../src/types/agent-run';
 import type { LanguageModel } from '../src/types/model';
 
 /** A mock model answering as `modelId` (the price table keys on the id). */
@@ -173,6 +173,66 @@ describe('runHeadless (headless preview)', () => {
     const again = await resumeHeadless({ model, tools: deployTools, store, runId: 'wait-1' });
     expect(again.outcome).toBe('pending');
     expect(exitCodeFor(again)).toBe(HEADLESS_EXIT_CODES.pending);
+  });
+
+  it('reports a call with an unknown effect as pending, resumed with retryToolCallIds', async () => {
+    const memory = createInMemoryAgentRunStore();
+    // The store goes down right after the call is recorded as started: its
+    // outcome is never saved, so nobody knows whether the charge happened.
+    let down = false;
+    const flaky: AgentRunStore = {
+      load: (runId) => memory.load(runId),
+      save: async (envelope) => {
+        if (down) throw new Error('store unavailable');
+        await memory.save(envelope);
+        if (Object.values(envelope.toolResults ?? {}).some((r) => r.stage === 'executing'))
+          down = true;
+      },
+    };
+    let charges = 0;
+    const tools: AgentToolSet = {
+      charge: {
+        description: 'Charge the card.',
+        parameters: { type: 'object' },
+        execute: () => ++charges,
+      },
+    };
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'charge', args: {} }] }, { text: 'Charged.' }],
+    });
+    const crashed = await runHeadless({
+      model,
+      prompt: 'Charge.',
+      tools,
+      store: flaky,
+      runId: 'pay-1',
+    });
+    expect(crashed.outcome).toBe('failed');
+
+    const stuck = await resumeHeadless({ model, tools, store: memory, runId: 'pay-1' });
+    expect(stuck).toMatchObject({ status: 'stopped', reason: 'tool-reconciliation-required' });
+    expect(stuck.outcome).toBe('pending');
+    expect(stuck.pending).toEqual([
+      expect.objectContaining({
+        kind: 'unknown-effect',
+        toolName: 'charge',
+        resumeWith: 'retryToolCallIds',
+      }),
+    ]);
+    expect(exitCodeFor(stuck)).toBe(HEADLESS_EXIT_CODES.pending);
+
+    // The app checked the effect and chose to run the call again.
+    const effect = stuck.pending[0]!;
+    if (effect.kind !== 'unknown-effect') throw new Error('expected an unknown effect');
+    const done = await resumeHeadless({
+      model,
+      tools,
+      store: memory,
+      runId: 'pay-1',
+      retryToolCallIds: [effect.toolCallId],
+    });
+    expect(done).toMatchObject({ outcome: 'completed', output: 'Charged.' });
+    expect(charges).toBe(2);
   });
 
   it('reports a provider failure with its error code and exit 1', async () => {
