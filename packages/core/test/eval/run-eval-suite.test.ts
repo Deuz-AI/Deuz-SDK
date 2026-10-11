@@ -446,6 +446,21 @@ describe('runEvalSuite: faults and recovery', () => {
           return { status: 'failed', error: { name: 'Error', message: 'gone' } };
         },
       }),
+      task({
+        // The documented outcome of this fault is a stop: accepted, yet the work
+        // did not finish, so it was contained rather than recovered.
+        id: 'contained',
+        fault: { boundary: 'mid-stream', recovery: 'failed-cost-held' },
+        acceptance: [{ name: 'fails as documented', check: (o) => o.status === 'failed' }],
+        run: async (context) => {
+          context.interrupt('mid-stream');
+          return {
+            status: 'failed',
+            error: { name: 'TypeError', message: 'terminated' },
+            recovery: 'failed-cost-held',
+          };
+        },
+      }),
     ]);
     expect(
       report.tasks.map((t) => {
@@ -457,6 +472,7 @@ describe('runEvalSuite: faults and recovery', () => {
       [true, 'rescued', 'reconciled', ['after-effect-before-receipt']],
       [false, 'recovered', 'replayed', ['after-effect-before-receipt']],
       [false, 'failed', undefined, ['mid-stream']],
+      [true, 'contained', 'failed-cost-held', ['mid-stream']],
     ]);
     expect(report.tasks[2]!.attempts[0]!.failures).toEqual([
       'recovery replayed, documented reconciled',
@@ -465,6 +481,7 @@ describe('runEvalSuite: faults and recovery', () => {
       'not-needed': 0,
       recovered: 2,
       rescued: 1,
+      contained: 1,
       failed: 1,
     });
   });

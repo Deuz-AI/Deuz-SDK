@@ -286,10 +286,19 @@ export function harnessFailures(
   return failures;
 }
 
-/** How an attempt came back from its interruptions, if it had any. */
-export function recoveryOf(record: EvalAttemptRecord, accepted: boolean): EvalRecovery {
+/**
+ * How an attempt came back from its interruptions, if it had any. An accepted
+ * outcome that is not `'completed'` (a documented stop or failure) contained
+ * the fault without finishing the work.
+ */
+export function recoveryOf(
+  record: EvalAttemptRecord,
+  outcome: EvalTaskOutcome | undefined,
+  accepted: boolean,
+): EvalRecovery {
   if (record.interruptions.length === 0) return 'not-needed';
   if (!accepted) return 'failed';
+  if (outcome?.status !== 'completed') return 'contained';
   return record.rescues.length > 0 ? 'rescued' : 'recovered';
 }
 
@@ -317,7 +326,7 @@ function emptyAggregate(): EvalAggregate {
     humanRescues: 0,
     requiredApprovals: 0,
     repeatedEffects: 0,
-    recovery: { 'not-needed': 0, recovered: 0, rescued: 0, failed: 0 },
+    recovery: { 'not-needed': 0, recovered: 0, rescued: 0, contained: 0, failed: 0 },
   };
 }
 

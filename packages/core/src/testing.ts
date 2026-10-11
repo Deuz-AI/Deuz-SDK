@@ -617,10 +617,12 @@ export interface EvalTaskContext {
 
 /**
  * How an attempt came back from its interruptions: `'not-needed'` (nothing was
- * interrupted), `'recovered'` (accepted without a human rescue), `'rescued'`
- * (accepted after a human rescue) or `'failed'` (never accepted).
+ * interrupted), `'recovered'` (completed and accepted without a human rescue),
+ * `'rescued'` (completed and accepted after a human rescue), `'contained'`
+ * (accepted, but the documented outcome is a stop or a failure: nothing was
+ * repeated or lost, and the work did not finish) or `'failed'` (not accepted).
  */
-export type EvalRecovery = 'not-needed' | 'recovered' | 'rescued' | 'failed';
+export type EvalRecovery = 'not-needed' | 'recovered' | 'rescued' | 'contained' | 'failed';
 
 export interface EvalAttemptReport {
   /** Zero-based. */
@@ -862,7 +864,7 @@ async function runEvalAttempt(
     requiredApprovals: record.requiredApprovals,
     repeatedEffects: repeatedEffectCount(record.effects),
     toolCalls,
-    recovery: recoveryOf(record, accepted),
+    recovery: recoveryOf(record, outcome, accepted),
     ...(outcome?.recovery !== undefined ? { recoveryPath: outcome.recovery } : {}),
     interruptions: [...record.interruptions],
     ...(Object.keys(record.artifacts).length > 0 ? { artifacts: { ...record.artifacts } } : {}),

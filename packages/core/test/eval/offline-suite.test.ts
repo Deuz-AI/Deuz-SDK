@@ -75,6 +75,7 @@ describe('offline eval tasks (2.3)', () => {
         'not-needed': offlineTasks.length - 1,
         recovered: 1,
         rescued: 0,
+        contained: 0,
         failed: 0,
       },
     });
