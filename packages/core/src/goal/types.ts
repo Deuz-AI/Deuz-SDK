@@ -10,7 +10,8 @@ export type GoalStatus = 'active' | 'waiting' | 'completed' | 'failed' | 'cancel
 /**
  * Why a waiting goal makes no progress: a person, an outside event, other
  * goals or runs, a time, or a spent budget (which only a revision raising the
- * budget, or a cancel, ends).
+ * budget, or a cancel, ends). A budget wait keeps the wait it interrupted,
+ * and a raised budget puts that one back.
  */
 export type GoalWaitReason = 'user' | 'event' | 'dependency' | 'wakeup' | 'budget';
 
@@ -70,6 +71,12 @@ export type GoalWaiting =
       reason: 'budget';
       /** The limit that ran out. */
       limit: 'usd' | 'tokens';
+      /**
+       * The wait the spent budget interrupted, as it was: a raised budget puts
+       * it back, `id` and `since` included. Events that answer it still apply
+       * meanwhile, and one that ends it removes it.
+       */
+      interrupted?: Exclude<GoalWaiting, { reason: 'budget' }>;
     });
 
 type WaitRequestOf<W> = W extends GoalWaiting ? Omit<W, 'id' | 'since'> & { id?: string } : never;

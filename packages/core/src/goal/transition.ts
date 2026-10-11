@@ -84,6 +84,15 @@ function exhausted(record: GoalRecord): 'usd' | 'tokens' | undefined {
   return undefined;
 }
 
+/**
+ * The wait events and time answer: the goal's own, or the one a spent budget
+ * interrupted, which still ends meanwhile. None while the goal is not waiting.
+ */
+function answerable(record: GoalRecord): Exclude<GoalWaiting, { reason: 'budget' }> | undefined {
+  const wait = record.status === 'waiting' ? record.waiting : undefined;
+  return wait?.reason === 'budget' ? wait.interrupted : wait;
+}
+
 const criterionOf = (input: GoalCriterionInput): GoalCriterion => ({
   id: input.id,
   description: input.description,
@@ -254,6 +263,13 @@ class Draft {
     delete record.waiting;
   }
 
+  /** Ends the wait an event or a tick answered; a spent budget still holds the goal. */
+  answer(): void {
+    const record = this.edit();
+    if (record.waiting?.reason === 'budget') delete record.waiting.interrupted;
+    else this.activate();
+  }
+
   end(status: 'completed' | 'failed' | 'cancelled', outcome: GoalRecord['outcome']): void {
     const record = this.edit();
     record.status = status;
@@ -261,7 +277,10 @@ class Draft {
     delete record.waiting;
   }
 
-  /** A spent budget holds a goal that has not ended; a raised one releases it. */
+  /**
+   * A spent budget holds a goal that has not ended, keeping the wait it
+   * interrupts; a raised one releases it, back to that wait if there is one.
+   */
   settleBudget(): void {
     const record = this.current;
     if (isTerminal(record)) return;
@@ -269,14 +288,21 @@ class Draft {
     const budgetWait = record.status === 'waiting' && record.waiting?.reason === 'budget';
     if (limit && !budgetWait) {
       const next = this.edit();
+      const interrupted = answerable(next);
       next.status = 'waiting';
       next.waiting = {
         reason: 'budget',
         id: `${record.goalId}#${this.nextRevision}`,
         since: this.now,
         limit,
+        ...(interrupted ? { interrupted } : {}),
       };
-    } else if (!limit && budgetWait) this.activate();
+    } else if (!limit && budgetWait) {
+      const next = this.edit();
+      const interrupted = answerable(next);
+      if (interrupted) next.waiting = interrupted;
+      else this.activate();
+    }
   }
 
   finish(step: Step): GoalTransition {
@@ -325,8 +351,9 @@ function apply(draft: Draft, command: GoalCommand): Step {
     case 'tick': {
       if (draft.changed) return applied();
       if (isTerminal(goal)) return ignored('terminal');
-      if (goal.waiting?.reason === 'wakeup' && now >= goal.waiting.at) {
-        draft.activate();
+      const wait = answerable(goal);
+      if (wait?.reason === 'wakeup' && now >= wait.at) {
+        draft.answer();
         return applied();
       }
       return ignored('unchanged');
@@ -440,6 +467,7 @@ function waitingOf(request: GoalWaitRequest, fallbackId: string, now: number): G
  * another wait or older than this one, and one the wait is not for are
  * dropped, each with its reason. Otherwise the event ends the wait (a
  * dependency wait once every dependency reported) and its key is remembered.
+ * During a budget wait, the wait is the one the budget interrupted.
  */
 function applyEvent(draft: Draft, event: GoalEvent): Step {
   const goal = draft.current;
@@ -452,8 +480,8 @@ function applyEvent(draft: Draft, event: GoalEvent): Step {
   if (goal.seen.includes(event.key)) return ignored('duplicate');
   if (event.expiresAt !== undefined && draft.now >= event.expiresAt) return ignored('expired');
   if (event.notBefore !== undefined && draft.now < event.notBefore) return ignored('early');
-  const wait = goal.waiting;
-  if (goal.status !== 'waiting' || !wait) return ignored('unmatched');
+  const wait = answerable(goal);
+  if (!wait) return ignored('unmatched');
   if (event.correlationId !== undefined && event.correlationId !== wait.id) return ignored('stale');
   if (event.at < wait.since) return ignored('stale');
   const { source } = event;
@@ -482,17 +510,14 @@ function applyEvent(draft: Draft, event: GoalEvent): Step {
       );
       if (index < 0) return ignored('unmatched');
       draft.remember(event.key);
-      const next = draft.edit();
-      const on = (next.waiting as Extract<GoalWaiting, { reason: 'dependency' }>).on;
+      const { on } = answerable(draft.edit()) as Extract<GoalWaiting, { reason: 'dependency' }>;
       on[index] = { ...on[index]!, settled: true };
-      if (on.every((dependency) => dependency.settled)) draft.activate();
+      if (on.every((dependency) => dependency.settled)) draft.answer();
       return applied();
     }
-    case 'budget':
-      return ignored('unmatched');
   }
   draft.remember(event.key);
-  draft.activate();
+  draft.answer();
   return applied();
 }
 

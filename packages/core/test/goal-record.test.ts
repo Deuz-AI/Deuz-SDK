@@ -109,6 +109,18 @@ describe('GoalRecord serialization', () => {
     expect(parseGoal(JSON.parse(text))).toEqual(goal);
   });
 
+  it('round-trips a budget wait with the wait it interrupted', () => {
+    const spent = transitionGoal(goal, { type: 'charge', tokens: 10 }, { now: T0 + 2 }).record;
+    expect(spent.waiting).toEqual({
+      reason: 'budget',
+      id: 'g#3',
+      since: T0 + 2,
+      limit: 'tokens',
+      interrupted: goal.waiting,
+    });
+    expect(parseGoal(serializeGoal(spent))).toEqual(spent);
+  });
+
   it('loads the version 1 record written by 2.3 as it was written', () => {
     const text = fixture('goal-record-v1.json');
     const loaded = parseGoal(text);
@@ -179,6 +191,34 @@ describe('GoalRecord serialization', () => {
             (copy.results = [
               { criterionId: 'nope', verdict: 'passed', source: 'test', evidence: [], at: T0 },
             ]),
+        ),
+      ],
+      [
+        'waiting.interrupted.reason',
+        mutated(
+          goal,
+          (copy) =>
+            (copy.waiting = {
+              reason: 'budget',
+              id: 'g#3',
+              since: T0 + 2,
+              limit: 'tokens',
+              interrupted: { reason: 'budget', id: 'g#2', since: T0 + 1, limit: 'tokens' },
+            }),
+        ),
+      ],
+      [
+        'waiting.interrupted.id',
+        mutated(
+          goal,
+          (copy) =>
+            (copy.waiting = {
+              reason: 'budget',
+              id: 'g#3',
+              since: T0 + 2,
+              limit: 'tokens',
+              interrupted: { reason: 'user', since: T0 + 1 },
+            }),
         ),
       ],
       ['spent', mutated(goal, (copy) => (copy.spent = { usd: Number.NaN, tokens: 0 }))],

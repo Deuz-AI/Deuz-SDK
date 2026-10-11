@@ -277,7 +277,16 @@ export function checkWaitDetails(check: GoalChecker, wait: Fields, path: string)
   else if (reason === 'wakeup') {
     check.time(wait.at, `${path}.at`);
     check.optionalString(wait.schedule, `${path}.schedule`);
-  } else if (reason === 'budget') check.oneOf(wait.limit, ['usd', 'tokens'], `${path}.limit`);
+  } else if (reason === 'budget') {
+    check.oneOf(wait.limit, ['usd', 'tokens'], `${path}.limit`);
+    // The wait a spent budget interrupted, never itself a budget wait.
+    if (wait.interrupted !== undefined) {
+      const interrupted = check.object(wait.interrupted, `${path}.interrupted`);
+      if (interrupted.reason === 'budget')
+        check.fail(`${path}.interrupted.reason`, 'must not be budget');
+      checkWaiting(check, interrupted, `${path}.interrupted`);
+    }
+  }
 }
 
 function checkWaiting(check: GoalChecker, value: unknown, path: string): GoalWaiting {

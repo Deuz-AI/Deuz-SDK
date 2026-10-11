@@ -114,12 +114,18 @@ is `active` until a command says what it waits for. `waiting.reason` is one of:
 | `'event'` | An outside event from `source` (a type, and an ID when given) | A matching event, or `resume` |
 | `'dependency'` | Other goals or native runs, in `on` | An event from each of them (`goal` or `run` source with its ID), or `resume` |
 | `'wakeup'` | A time, `at`, optionally a schedule's occurrence | A `tick` at or after `at`, an event dated then, or `resume` |
-| `'budget'` | More budget: a charge reached a limit | A `revise` that raises the budget, or a cancel |
+| `'budget'` | More budget: a charge reached a limit | A `revise` that raises the budget, or a cancel; the wait it interrupted comes back |
 
 Every wait has an `id` (by default `<goalId>#<revision>`) and a `since`. An
 event that answers the wait carries the `id` as `correlationId`. A new wait
 replaces the current one, except a budget wait, which only a revision raising
 the budget ends.
+
+A spent budget does not replace the wait it interrupts. The budget wait keeps
+it, as it was, in `interrupted`: events that answer it still apply meanwhile
+(one that ends it removes it), and a revision raising the budget puts it back
+with its `id` and `since`. A goal that waited for a person when a run's charge
+spent its budget still waits for that person once the budget is raised.
 
 ```ts
 import { createGoal, goalEventFromSignal, transitionGoal } from '@deuz-sdk/core/goal';
@@ -218,10 +224,11 @@ criterion, its verdict is dropped; evidence is kept.
 
 `charge` adds what a run spent. When the spend reaches `budget.usd` or
 `budget.tokens`, the goal waits with reason `'budget'` until a `revise` raises
-the limit, which makes it active again. A charge without `usd`, for a model
-without a price, counts its tokens only, as everywhere else in 2.3. Give a
-charge a `key`, such as the run ID, and the same charge again is ignored as a
-duplicate.
+the limit, which makes it active again, or puts back the wait the budget
+interrupted (see [Waiting, explicitly](#waiting-explicitly)). A charge without
+`usd`, for a model without a price, counts its tokens only, as everywhere else
+in 2.3. Give a charge a `key`, such as the run ID, and the same charge again is
+ignored as a duplicate.
 
 ```ts
 import { createGoal, transitionGoal } from '@deuz-sdk/core/goal';
@@ -284,6 +291,9 @@ key; or it reports why it was dropped, checking in this order:
 | `'unmatched'` | The goal is not waiting |
 | `'stale'` | It answers another wait (`correlationId`), or happened before this wait began |
 | `'unmatched'` | The wait is for something else: another source, a dependency not listed, a wakeup not yet due |
+
+During a budget wait, the wait an event must answer is the one the budget
+interrupted; with none, every event is `'unmatched'`.
 
 A goal remembers the keys of its last 64 events and charges. Further back,
 claim the key durably before you apply the event, as `handleSignal` does with
