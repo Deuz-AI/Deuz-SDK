@@ -229,7 +229,12 @@ describe('batch holds at submit', () => {
       },
     })('claude-haiku-5-5');
     const client = createBatchClient({ model: broken, execution, deps: { priceProvider: prices } });
-    await expect(client.submit([{ id: 'a', prompt: 'x' }])).rejects.toThrow('socket hang up');
+    // A failure before any answer is a NetworkError (status 0): not a refusal.
+    await expect(client.submit([{ id: 'a', prompt: 'x' }])).rejects.toMatchObject({
+      name: 'NetworkError',
+      statusCode: 0,
+      cause: expect.objectContaining({ message: 'socket hang up' }),
+    });
     expect(execution.ledger.snapshot().reservations.map((entry) => entry.state)).toEqual([
       'unknown',
     ]);

@@ -170,6 +170,7 @@ export const anthropicBatchDriver: BatchDriver = {
           headers: headers(call, beta ? { 'anthropic-beta': beta } : undefined),
           body,
         }),
+        ctx,
       );
     } catch (error) {
       throw new SubmitFailure(error, true);
@@ -194,7 +195,7 @@ export const anthropicBatchDriver: BatchDriver = {
       `${ctx.call.baseURL}/v1/messages/batches/${encodeURIComponent(id)}`,
       { method: 'GET', headers: headers(ctx.call) },
     );
-    return normalize(id, await readJson(response));
+    return normalize(id, await readJson(response, ctx));
   },
 
   async cancel(id, ctx) {
@@ -204,7 +205,7 @@ export const anthropicBatchDriver: BatchDriver = {
       `${ctx.call.baseURL}/v1/messages/batches/${encodeURIComponent(id)}/cancel`,
       { method: 'POST', headers: headers(ctx.call) },
     );
-    return normalize(id, await readJson(response));
+    return normalize(id, await readJson(response, ctx));
   },
 
   async *outcomes(job, raw, ctx) {
@@ -234,7 +235,7 @@ export const anthropicBatchDriver: BatchDriver = {
       method: 'GET',
       headers: headers(ctx.call, { accept: 'application/binary' }),
     });
-    for await (const line of jsonLines(response)) {
+    for await (const line of jsonLines(response, ctx)) {
       const outcome = outcomeOf(line, ctx.call.provider);
       if (outcome) yield outcome;
     }

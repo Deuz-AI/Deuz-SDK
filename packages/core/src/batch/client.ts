@@ -494,7 +494,7 @@ export function createBatchClient(options: BatchClientOptions): BatchClient {
           wait.onStatus?.(current);
           if (current.ended) return current;
         } catch (error) {
-          // A provider hiccup (429, 5xx) is retried on the next poll.
+          // A provider hiccup (429, 5xx, a network failure) is retried on the next poll.
           const retryable =
             isDeuzError(error) && (error as { isRetryable?: unknown }).isRetryable === true;
           if (!retryable || wait.signal?.aborted) throw error;

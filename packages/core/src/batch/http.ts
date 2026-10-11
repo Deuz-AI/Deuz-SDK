@@ -5,6 +5,7 @@
  * stream so a large result file never sits in memory whole.
  */
 import type { Adapter } from '../adapters/types';
+import { NetworkError } from '../errors';
 import { readErrorBody } from '../internal/media-http';
 import type { ResolvedCall } from '../internal/resolve-call';
 
@@ -15,8 +16,24 @@ export interface BatchCallContext {
 }
 
 /**
+ * A transport failure (DNS, a reset connection, a body that breaks off) as the
+ * retryable `NetworkError` every model call uses, so `wait` polls again. An
+ * abort of the caller's signal keeps its own reason.
+ */
+function transportError(ctx: BatchCallContext, cause: unknown, phase: string): unknown {
+  if (ctx.signal?.aborted) return cause;
+  return new NetworkError({
+    message: `Batch request to provider '${ctx.call.provider}' failed ${phase}.`,
+    provider: ctx.call.provider,
+    upstreamType: cause instanceof Error ? cause.name : typeof cause,
+    cause,
+  });
+}
+
+/**
  * Send one lifecycle request. A non-2xx answer becomes the wire's typed error
- * (`RateLimitError`, `AuthenticationError`, …), exactly as for a model call.
+ * (`RateLimitError`, `AuthenticationError`, …), exactly as for a model call;
+ * a failure before any answer is a `NetworkError`.
  */
 export async function send(
   ctx: BatchCallContext,
@@ -24,10 +41,15 @@ export async function send(
   url: string,
   init: RequestInit,
 ): Promise<Response> {
-  const response = await ctx.call.fetch(url, {
-    ...init,
-    ...(ctx.signal ? { signal: ctx.signal } : {}),
-  });
+  let response: Response;
+  try {
+    response = await ctx.call.fetch(url, {
+      ...init,
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    });
+  } catch (cause) {
+    throw transportError(ctx, cause, 'before a response arrived');
+  }
   if (!response.ok) {
     const body = await readErrorBody(response);
     throw adapter.mapError(response.status, body, response.headers, {
@@ -38,8 +60,13 @@ export async function send(
 }
 
 /** The JSON body of a lifecycle answer; an empty body reads as `{}`. */
-export async function readJson(response: Response): Promise<unknown> {
-  const text = await response.text();
+export async function readJson(response: Response, ctx: BatchCallContext): Promise<unknown> {
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (cause) {
+    throw transportError(ctx, cause, 'while its answer was read');
+  }
   return text.trim() === '' ? {} : (JSON.parse(text) as unknown);
 }
 
@@ -48,7 +75,10 @@ export async function readJson(response: Response): Promise<unknown> {
  * A line that is not JSON yields `undefined` (the caller skips it). Breaking
  * out of the loop cancels the body.
  */
-export async function* jsonLines(response: Response): AsyncGenerator<unknown> {
+export async function* jsonLines(
+  response: Response,
+  ctx: BatchCallContext,
+): AsyncGenerator<unknown> {
   const body = response.body;
   if (!body) return;
   const reader = body.getReader();
@@ -64,7 +94,12 @@ export async function* jsonLines(response: Response): AsyncGenerator<unknown> {
   };
   try {
     while (!done) {
-      const chunk = await reader.read();
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch (cause) {
+        throw transportError(ctx, cause, 'while its results were read');
+      }
       done = chunk.done;
       buffer += chunk.done ? decoder.decode() : decoder.decode(chunk.value, { stream: true });
       let newline = buffer.indexOf('\n');

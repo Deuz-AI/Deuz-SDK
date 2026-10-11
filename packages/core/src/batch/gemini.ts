@@ -144,7 +144,7 @@ async function status(id: string, ctx: BatchCallContext): Promise<DriverStatus> 
     `${ctx.call.baseURL}/v1beta/${path(id, ctx.call.provider)}`,
     { method: 'GET', headers: headers(ctx.call) },
   );
-  return normalize(id, await readJson(response));
+  return normalize(id, await readJson(response, ctx));
 }
 
 export const geminiBatchDriver: BatchDriver = {
@@ -177,6 +177,7 @@ export const geminiBatchDriver: BatchDriver = {
             }),
           },
         ),
+        ctx,
       );
     } catch (error) {
       throw new SubmitFailure(error, true);
@@ -228,7 +229,7 @@ export const geminiBatchDriver: BatchDriver = {
       { method: 'GET', headers: headers(ctx.call) },
     );
     let index = 0;
-    for await (const line of jsonLines(response)) {
+    for await (const line of jsonLines(response, ctx)) {
       const outcome = outcomeOf(line, index++, job);
       if (outcome) yield outcome;
     }

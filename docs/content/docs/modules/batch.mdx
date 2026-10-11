@@ -128,7 +128,7 @@ A `BatchJob` is plain JSON: store it anywhere and hand it to another process. It
 ## Following a batch
 
 - `status(job)` reads where the batch stands with one provider call. `state` is one of `pending`, `running`, `cancelling`, then an ended state: `completed`, `cancelled`, `expired` (the provider's window passed) or `failed` (the batch as a whole failed, such as an OpenAI input file that did not validate). `ended` is true for the last four, `counts` gives the request counts the provider reports, `expiresAt` its expiry and `providerState` its own value. A status the module does not know reads as `running`, never as ended.
-- `wait(job, { intervalMs?, timeoutMs?, onStatus?, signal? })` polls on `deps.clock` until the batch ends (default every 60 seconds). A retryable provider error (a 429, a 5xx) is polled again; `timeoutMs` ends the wait with a `BatchError` of kind `'timeout'`.
+- `wait(job, { intervalMs?, timeoutMs?, onStatus?, signal? })` polls on `deps.clock` until the batch ends (default every 60 seconds). A retryable provider error (a 429, a 5xx) or a network failure is polled again; `timeoutMs` ends the wait with a `BatchError` of kind `'timeout'`.
 - `cancel(job)` asks the provider to stop the batch. Requests already done keep their results; read the results of the cancelled batch to close its holds.
 
 ## Reading the results
@@ -276,7 +276,7 @@ If the job store fails to record a job the provider accepted, `submit` throws a 
 | `provider` | The provider answered something unusable, or reported an error for one request without an HTTP status. |
 | `store` | `pending()` without a store, or the store failed to record a submitted job (`error.job`). |
 
-A failed batch call keeps the wire's own [typed error](/docs/core/errors): an expired key is an `AuthenticationError`, a missing batch a `ModelNotFoundError`, and so on.
+A failed batch call keeps the wire's own [typed error](/docs/core/errors): an expired key is an `AuthenticationError`, a missing batch a `ModelNotFoundError`, and so on. A call that fails before or while its answer arrives (DNS, a reset connection, a result file that breaks off) throws the retryable `NetworkError` (`code: 'network_error'`), as a model call does; an abort of your `signal` keeps its own reason.
 
 ## API at a glance
 
