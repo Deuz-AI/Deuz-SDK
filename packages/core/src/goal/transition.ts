@@ -152,6 +152,7 @@ export function createGoal(input: CreateGoalInput, options: { now: number }): Go
     ...(input.deadline !== undefined ? { deadline: input.deadline } : {}),
     status: 'active',
     seen: [],
+    charged: [],
     createdAt: now,
     updatedAt: now,
     ...(input.meta !== undefined ? { meta: structuredClone(input.meta) } : {}),
@@ -252,9 +253,10 @@ class Draft {
     return this.base.revision + 1;
   }
 
-  remember(key: string): void {
+  /** Remembers an applied key: an event's in `seen`, a charge's apart from them in `charged`. */
+  remember(key: string, window: 'seen' | 'charged' = 'seen'): void {
     const record = this.edit();
-    record.seen = [...record.seen, key].slice(-GOAL_SEEN_LIMIT);
+    record[window] = [...record[window], key].slice(-GOAL_SEEN_LIMIT);
   }
 
   activate(): void {
@@ -361,14 +363,17 @@ function apply(draft: Draft, command: GoalCommand): Step {
     case 'event':
       return applyEvent(draft, command.event);
     case 'charge': {
-      if (command.key !== undefined && goal.seen.includes(command.key)) return ignored('duplicate');
+      // Charge keys are a space of their own: a run's charge and its completion
+      // event may both be keyed by the run ID.
+      if (command.key !== undefined && goal.charged.includes(command.key))
+        return ignored('duplicate');
       const usd = command.usd ?? 0;
       const tokens = command.tokens ?? 0;
       if (usd === 0 && tokens === 0 && command.key === undefined) return ignored('unchanged');
       // A run's spend is recorded even after the goal ended.
       const next = draft.edit();
       next.spent = { usd: next.spent.usd + usd, tokens: next.spent.tokens + tokens };
-      if (command.key !== undefined) draft.remember(command.key);
+      if (command.key !== undefined) draft.remember(command.key, 'charged');
       draft.settleBudget();
       return applied();
     }

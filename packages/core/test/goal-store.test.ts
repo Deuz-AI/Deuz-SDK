@@ -62,7 +62,7 @@ describe('memory goal store', () => {
       revision: 3,
       runId: 'r1',
       spent: { tokens: 10 },
-      seen: ['r1'],
+      charged: ['r1'],
     });
     // The same charge delivered again is a duplicate, and nothing is saved.
     const again = await update(store, 'g', { type: 'charge', tokens: 10, key: 'r1' }, T0 + 3);

@@ -60,7 +60,7 @@ console.log(goal.status, goal.revision); // active 1
 | `evidence`, `results` | References to evidence, append-only; the latest verdict per criterion |
 | `budget`, `spent`, `deadline` | Limits for the goal as a whole, what its runs spent, and when it fails |
 | `status`, `waiting`, `outcome` | `active`, `waiting` (with `waiting`) or ended: `completed`, `failed`, `cancelled` (with `outcome`) |
-| `seen` | The dedupe keys of the last 64 events and charges the goal applied |
+| `seen`, `charged` | The dedupe keys of the last 64 events the goal applied; apart from them, the keys of its last 64 charges |
 | `meta` | Your own data, JSON |
 
 ## Transitions
@@ -228,7 +228,9 @@ the limit, which makes it active again, or puts back the wait the budget
 interrupted (see [Waiting, explicitly](#waiting-explicitly)). A charge without
 `usd`, for a model without a price, counts its tokens only, as everywhere else
 in 2.3. Give a charge a `key`, such as the run ID, and the same charge again is
-ignored as a duplicate.
+ignored as a duplicate. Charge keys are kept apart from event keys, in
+`charged`, so a run's charge and the event that reports its completion can both
+be keyed by the run ID.
 
 ```ts
 import { createGoal, transitionGoal } from '@deuz-sdk/core/goal';
@@ -295,9 +297,10 @@ key; or it reports why it was dropped, checking in this order:
 During a budget wait, the wait an event must answer is the one the budget
 interrupted; with none, every event is `'unmatched'`.
 
-A goal remembers the keys of its last 64 events and charges. Further back,
-claim the key durably before you apply the event, as `handleSignal` does with
-its `dedupe`.
+A goal remembers the keys of its last 64 events in `seen`, and those of its
+last 64 charges apart from them in `charged`. Further back, claim an event's
+key durably before you apply the event, as `handleSignal` does with its
+`dedupe`.
 
 Nothing in 2.3 fires a wakeup by itself. A periodic job of yours finds the due
 ones and ticks them, with a claim so that one process wakes each:

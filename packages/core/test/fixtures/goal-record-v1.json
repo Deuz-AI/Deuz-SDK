@@ -65,6 +65,7 @@
     "nightly@1760054400000",
     "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
   ],
+  "charged": ["release-notes-run-1"],
   "createdAt": 1760090000000,
   "updatedAt": 1760090500000,
   "meta": { "channel": "#releases", "priority": 2 }

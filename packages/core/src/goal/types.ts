@@ -192,8 +192,14 @@ export interface GoalRecord {
   status: GoalStatus;
   waiting?: GoalWaiting;
   outcome?: GoalOutcome;
-  /** Dedupe keys of the last events and charges the goal applied, oldest first (at most 64). */
+  /** Dedupe keys of the last events the goal applied, oldest first (at most 64). */
   seen: string[];
+  /**
+   * Keys of the last charges the goal applied, oldest first (at most 64): a
+   * window of their own, so a charge and an event may share a key, such as a
+   * run ID. A writer may leave it out when empty.
+   */
+  charged: string[];
   createdAt: number;
   updatedAt: number;
   /** Application data, JSON. */

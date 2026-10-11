@@ -57,6 +57,7 @@ describe('createGoal', () => {
       deadline: T0 + 3_600_000,
       status: 'active',
       seen: [],
+      charged: [],
       createdAt: T0,
       updatedAt: T0,
       meta: { owner: 'ops' },
@@ -153,6 +154,7 @@ describe('GoalRecord serialization', () => {
       results: [],
       spent: { usd: 0, tokens: 0 },
       seen: [],
+      charged: [],
     });
   });
 
@@ -224,6 +226,11 @@ describe('GoalRecord serialization', () => {
       ['spent', mutated(goal, (copy) => (copy.spent = { usd: Number.NaN, tokens: 0 }))],
       ['seen', mutated(goal, (copy) => (copy.seen = [7]))],
       ['seen', mutated(goal, (copy) => (copy.seen = Array.from({ length: 65 }, (_, i) => `${i}`)))],
+      ['charged', mutated(goal, (copy) => (copy.charged = ['']))],
+      [
+        'charged',
+        mutated(goal, (copy) => (copy.charged = Array.from({ length: 65 }, (_, i) => `${i}`))),
+      ],
       ['meta', mutated(goal, (copy) => (copy.meta = [1]))],
       ['goalId', mutated(goal, (copy) => (copy.goalId = ''))],
     ];
