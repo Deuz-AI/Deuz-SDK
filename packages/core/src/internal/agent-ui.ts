@@ -245,21 +245,18 @@ export function applyAgentFrame<T>(
       : state;
   const runId = frameRun ?? base.runId;
   const identity = { seq: frame.seq, ...(runId !== undefined ? { runId } : {}) };
+  // Every leg opens with a `run` frame: what an earlier leg left (a
+  // suspension, its drafts) is over.
+  if (frame.kind === 'run') return { status: 'running', ...identity };
   // A leg in progress keeps what the leg has said so far; a new leg after a
   // terminal frame (one whose `run` frame this reader missed) starts clean.
-  const live =
-    base.status === 'running'
-      ? {
-          ...(base.phase !== undefined ? { phase: base.phase } : {}),
-          ...(base.partial !== undefined ? { partial: base.partial } : {}),
-          ...(base.elements !== undefined ? { elements: base.elements } : {}),
-        }
-      : {};
+  const { phase, partial, elements } = base.status === 'running' ? base : ({} as RunningFields);
+  const live: RunningFields = {
+    ...(phase !== undefined ? { phase } : {}),
+    ...(partial !== undefined ? { partial } : {}),
+    ...(elements !== undefined ? { elements } : {}),
+  };
   switch (frame.kind) {
-    case 'run':
-      // Every leg opens with one: what an earlier leg left (a suspension, its
-      // drafts) is over.
-      return { status: 'running', ...identity };
     case 'phase':
       return { status: 'running', ...identity, ...live, phase: frame.phase };
     case 'partial':
@@ -270,11 +267,7 @@ export function applyAgentFrame<T>(
         partial: { attempt: frame.attempt, value: frame.value },
       };
     case 'element': {
-      const current =
-        live.elements !== undefined && live.elements.attempt === frame.attempt
-          ? live.elements.values
-          : [];
-      const values = [...current];
+      const values = elements?.attempt === frame.attempt ? [...elements.values] : [];
       values[frame.index] = frame.value;
       return {
         status: 'running',
@@ -283,38 +276,22 @@ export function applyAgentFrame<T>(
         elements: { attempt: frame.attempt, values },
       };
     }
-    case 'result': {
-      // Drafts end with the run: only `completed` carries an output, and it is
-      // the one the server validated, never the last draft.
-      const terminal = {
+    default: {
+      // A terminal frame maps field for field onto the terminal state. Drafts
+      // end with the run: only `completed` carries an output, and it is the
+      // one the server validated, never the last draft.
+      const { kind: _kind, ...result } = frame;
+      return {
+        ...result,
         ...identity,
-        runId: frame.runId,
-        ...(live.phase !== undefined ? { phase: live.phase } : {}),
-        ...(frame.usage !== undefined ? { usage: frame.usage } : {}),
-        ...(frame.modelSteps !== undefined ? { modelSteps: frame.modelSteps } : {}),
-        ...(frame.verification !== undefined ? { verification: frame.verification } : {}),
-        ...(frame.stopDetails !== undefined ? { stopDetails: frame.stopDetails } : {}),
-      };
-      switch (frame.status) {
-        case 'completed':
-          return { ...terminal, status: 'completed', output: frame.output as T };
-        case 'suspended':
-          return {
-            ...terminal,
-            status: 'suspended',
-            pendingApprovals: frame.pendingApprovals,
-            pendingClientCalls: frame.pendingClientCalls,
-          };
-        case 'stopped':
-          return {
-            ...terminal,
-            status: 'stopped',
-            reason: frame.reason,
-            ...(frame.unknownEffects !== undefined ? { unknownEffects: frame.unknownEffects } : {}),
-          };
-        case 'failed':
-          return { ...terminal, status: 'failed', error: frame.error };
-      }
+        ...(phase !== undefined ? { phase } : {}),
+      } as DeuzAgentState<T>;
     }
   }
 }
+
+/** What a running state keeps between frames. */
+type RunningFields = Pick<
+  Extract<DeuzAgentState, { status: 'running' }>,
+  'phase' | 'partial' | 'elements'
+>;
