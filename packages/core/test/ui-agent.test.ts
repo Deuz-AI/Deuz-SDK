@@ -130,6 +130,17 @@ describe('toDeuzAgentStreamResponse', () => {
     expect(framesOf(parts).map((f) => f.kind)).toEqual(['run', 'phase', 'phase', 'result']);
   });
 
+  it('a stream passed in after it ended still reports its terminal state', async () => {
+    const stream = streamAgent({
+      model: createMockModel({ responses: [{ text: 'late' }] }),
+      prompt: 'x',
+    });
+    await stream.result; // consumed before the serializer subscribed: its events are gone
+    const parts = await collect(toDeuzAgentStreamResponse(stream, { runId: 'late' }));
+    expect(parts.some((p) => p.type === 'text-delta')).toBe(false);
+    expect(agentStateFromParts(parts)).toMatchObject({ status: 'completed', output: 'late' });
+  });
+
   it('suspends with the pending approvals and client calls, then the resumed leg continues the sequence', async () => {
     const agentRuns = createInMemoryAgentRunStore();
     const streams = createInMemoryStreamStateStore();

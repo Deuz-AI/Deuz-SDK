@@ -1109,7 +1109,8 @@ function agentResultFrame(
  *
  * Subscribes to `stream.events` before it returns: pass the stream here before
  * reading its `result` or any other view, and no event is lost. (A stream that
- * already started has no replay of what it emitted.)
+ * already started has no replay of what it emitted; once it ended, only its
+ * terminal frame, read from `stream.result`, still goes out.)
  *
  * The agent frames are wire v2 parts (`data-agent`): a client that negotiated
  * v1 gets the plain chat stream. With `store` and `streamId`, every frame's
@@ -1134,6 +1135,15 @@ export function toDeuzAgentStreamResponse<T>(
       status: 'running',
     });
     let sawError = false;
+    let sawResult = false;
+    const result = (outcome: AgentResult<unknown>): void => {
+      sawResult = true;
+      frame(agentResultFrame(outcome));
+      if (outcome.status === 'failed' && !sawError) {
+        sawError = true;
+        send({ type: 'error', message: redactString(outcome.error.message) });
+      }
+    };
     try {
       for (;;) {
         const step = await events.next();
@@ -1162,17 +1172,16 @@ export function toDeuzAgentStreamResponse<T>(
             });
             break;
           case 'result':
-            frame(agentResultFrame(event.result as AgentResult<unknown>));
-            if (event.result.status === 'failed' && !sawError) {
-              sawError = true;
-              send({ type: 'error', message: redactString(event.result.error.message) });
-            }
+            result(event.result as AgentResult<unknown>);
             break;
           default:
             // `tool-output` (the raw result) stays on the server.
             break;
         }
       }
+      // A stream that had already ended when it was passed in has no events
+      // left; its result still says how the run ended.
+      if (!sawResult) result((await stream.result) as AgentResult<unknown>);
     } catch (err) {
       // The native pump settles failures as a result; this is belt and braces.
       if (!sawError) send({ type: 'error', message: errorMessage(err) });
