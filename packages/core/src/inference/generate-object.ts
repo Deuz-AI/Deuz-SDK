@@ -60,6 +60,8 @@ export const generateObject: GenerateObject = async <T = unknown>(
   const maxAttempts = 2; // initial + one repair retry
   let lastRaw = '';
   let lastError: unknown;
+  // How the last attempt ended (2.3): a refused or cut-off object says why.
+  let lastStop: Pick<NoObjectGeneratedError, 'finishReason' | 'stopDetails'> = {};
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // Observation: each repair attempt is its own run (rare; honest timeline).
@@ -69,6 +71,7 @@ export const generateObject: GenerateObject = async <T = unknown>(
     const finishReason = await result.finishReason;
     const stopDetails = await result.stopDetails;
     lastRaw = raw;
+    lastStop = { finishReason, ...(stopDetails ? { stopDetails } : {}) };
 
     let parsed: unknown;
     try {
@@ -92,6 +95,6 @@ export const generateObject: GenerateObject = async <T = unknown>(
 
   throw new NoObjectGeneratedError(
     `generateObject could not produce a valid object after ${maxAttempts} attempts.`,
-    { text: lastRaw, cause: lastError },
+    { text: lastRaw, cause: lastError, ...lastStop },
   );
 };

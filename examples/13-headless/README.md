@@ -7,15 +7,15 @@ It is a preview: the report shapes and the exit codes can still change. There is
 **Run:** from the repo root, `npm install && npm run build`, then
 
 ```sh
-npm run -s dev -w @deuz-examples/headless -- doctor
-npm run -s dev -w @deuz-examples/headless -- run "Publish the 2.3.0 notes." --run-id notes-1
+npm run -s dev -w @deuz-examples/13-headless -- doctor
+npm run -s dev -w @deuz-examples/13-headless -- run "Publish the 2.3.0 notes." --run-id notes-1
 echo $?   # 3: the run waits for an approval
-npm run -s dev -w @deuz-examples/headless -- inspect notes-1 --json
-npm run -s dev -w @deuz-examples/headless -- resume notes-1 --approve
+npm run -s dev -w @deuz-examples/13-headless -- inspect notes-1 --json
+npm run -s dev -w @deuz-examples/13-headless -- resume notes-1 --approve
 echo $?   # 0: completed
 ```
 
-`-s` keeps npm's own error lines out of the output; the exit code passes through. `node --experimental-strip-types examples/headless/index.ts <command>` runs it directly. No API key needed; Node ≥ 22.6 for the type stripping, and `node:sqlite`, which ships unflagged from Node 22.13 and 23.4. The SQLite file defaults to `deuz-headless-example.sqlite` in the temporary directory; pass `--db <file>` to choose another.
+`-s` keeps npm's own error lines out of the output; the exit code passes through. `node --experimental-strip-types examples/13-headless/index.ts <command>` runs it directly. No API key needed; Node ≥ 22.6 for the type stripping, and `node:sqlite`, which ships unflagged from Node 22.13 and 23.4. The SQLite file defaults to `deuz-headless-example.sqlite` in the temporary directory; pass `--db <file>` to choose another.
 
 | Command | Options |
 | --- | --- |

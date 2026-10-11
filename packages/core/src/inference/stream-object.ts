@@ -112,9 +112,13 @@ export const streamObject: StreamObject = <T = unknown>(
       // so usage/finishReason survive a NoObjectGeneratedError, and a refused
       // request keeps its explanation.
       usageDeferred.resolve(await inner.usage);
-      finishDeferred.resolve(await inner.finishReason);
-      stopDetailsDeferred.resolve(await inner.stopDetails);
+      const finishReason = await inner.finishReason;
+      const stopDetails = await inner.stopDetails;
+      finishDeferred.resolve(finishReason);
+      stopDetailsDeferred.resolve(stopDetails);
       warningsDeferred.resolve(warningSink.list());
+      // A refused or cut-off object says why on its error too (2.3).
+      const stop = { finishReason, ...(stopDetails ? { stopDetails } : {}) };
 
       let parsed: unknown;
       try {
@@ -123,6 +127,7 @@ export const streamObject: StreamObject = <T = unknown>(
         throw new NoObjectGeneratedError('streamObject: final payload is not valid JSON.', {
           text: buf,
           cause: err,
+          ...stop,
         });
       }
       const validation = await validateOutput<T>(options.schema, parsed);
@@ -130,6 +135,7 @@ export const streamObject: StreamObject = <T = unknown>(
         throw new NoObjectGeneratedError('streamObject: final object failed schema validation.', {
           text: buf,
           cause: new Error(validation.issues),
+          ...stop,
         });
       }
 

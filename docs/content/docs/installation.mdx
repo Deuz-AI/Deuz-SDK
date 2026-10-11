@@ -119,7 +119,9 @@ Capabilities use separate subpaths as part of the tree-shaking contract. Every s
 | `@deuz-sdk/core/evolve` | Evolutionary program search: `evolve`, `resumeEvolve` and an in-memory population store (2.2) |
 | `@deuz-sdk/core/evolve/sqlite` | Node-only evolve persistence through `createSqlitePopulationStore` (2.2) |
 | `@deuz-sdk/core/schedule` | Cron schedules and verified webhook signals that start or resume runs (2.2) |
-| `@deuz-sdk/core/testing`      | You are writing tests: `createMockModel`, `runEval`, golden-replay SSE fixtures                                            |
+| `@deuz-sdk/core/goal` | Versioned goal records, waiting reasons, wakeup and event envelopes moved by pure transitions (2.3) |
+| `@deuz-sdk/core/headless` | Node-only run / resume / inspect / doctor with JSON reports and exit codes (2.3 preview) |
+| `@deuz-sdk/core/testing`      | You are writing tests: `createMockModel`, `runEval`, `runEvalSuite` (2.3), golden-replay SSE fixtures                      |
 | `@deuz-sdk/core/middleware`   | You need `wrapModel` + `logging` / `simpleCache` / `redactPII` / `promptInjectionGuard` / `withFallback`                   |
 | `@deuz-sdk/core/guardrails`   | You want the ready-made `promptInjectionGuardrail` / `maxOutputLength` (2.0)                                               |
 | `@deuz-sdk/core/pricing`      | You want token → USD: the 2026 cost table + `createPriceProvider`                                                          |
@@ -148,6 +150,9 @@ Capabilities use separate subpaths as part of the tree-shaking contract. Every s
 | `@deuz-sdk/core/mcp`                           | MCP over HTTP/SSE, edge-safe (`createMcpClient`)                                           |
 | `@deuz-sdk/core/mcp/stdio`                     | MCP over stdio — a local process (Node only)                                               |
 | `@deuz-sdk/core/mcp/node`                      | MCP OAuth on Node: `createFileTokenStore`, `createLoopbackRedirect` (2.0)                  |
+| `@deuz-sdk/core/mcp/server` · `/mcp/server/stdio` | Publish Deuz tools and agents as an MCP server over Streamable HTTP; the stdio half is Node-only (2.3) |
+| `@deuz-sdk/core/a2a` | Agent2Agent v1.0.0: call other agents (`createA2AClient`) and serve your own (`createA2AHandler`), edge-safe (2.3) |
+| `@deuz-sdk/core/batch` | Single-turn requests on the OpenAI, Anthropic and Gemini batch APIs, priced on the batch tier (2.3) |
 | `@deuz-sdk/core/durable`                       | Runs must survive a process restart: checkpoint/resume, signed approvals                   |
 | `@deuz-sdk/core/autonomy`                      | Planner → executor → verifier: `planTasks`, `bestOfN`, `selfConsistency`, `parallelAgents` |
 | `@deuz-sdk/core/runtime`                       | Background runs with a live plan/activity feed + steering (`RunStore`, `createRunManager`) |
@@ -165,12 +170,13 @@ Capabilities use separate subpaths as part of the tree-shaking contract. Every s
 | `@deuz-sdk/core/memory` · `/memory/markdown`                          | mem0-style extract/reconcile/recall; the markdown half is an Obsidian-style vault            |
 | `@deuz-sdk/core/rag` · `/rag/node`                                    | MIME sniff, chunkers, BM25 + RRF hybrid retrieval; the Node half adds PDF/DOCX/XLSX          |
 | `@deuz-sdk/core/stores/sqlite` · `/stores/redis` · `/stores/postgres` | You want memory / chats / sessions / runs in a real database instead of memory (2.0)         |
-| `@deuz-sdk/core/ui`                                                   | The versioned Deuz UI wire: `toDeuzStreamResponse` (server) + `readDeuzStream` (client)      |
+| `@deuz-sdk/core/ui`                                                   | The versioned Deuz UI wire: `toDeuzStreamResponse` (server) + `readDeuzStream` (client); native runs through `toDeuzAgentStreamResponse` (2.3) |
 | `@deuz-sdk/core/react`                                                | Frozen legacy React hooks — prefer `@deuz-sdk/react` for new work                            |
 | `@deuz-sdk/core/observe` · `/observe/node`                            | Local observers, run summaries; the Node half is a bounded JSONL sink                        |
 | `@deuz-sdk/core/otel`                                                 | You already run OpenTelemetry and want spans + events to land there                          |
 | `@deuz-sdk/core/image` · `/midjourney`                                | Synchronous OpenAI-compatible image generation; Midjourney's async submit/poll/action        |
 | `@deuz-sdk/core/speech` · `/transcription` · `/video`                 | Text-to-speech, speech-to-text, async video jobs (2.0)                                       |
+| `@deuz-sdk/core/realtime`                                             | Live speech-to-speech over the OpenAI Realtime and Gemini Live WebSockets, with tools (2.3)  |
 
 ## Verify it works
 

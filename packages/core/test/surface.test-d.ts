@@ -556,6 +556,7 @@ expectTypeOf<Extract<DeuzUIPart, { type: 'tool-state' }>>().toEqualTypeOf<{
   state: ToolRunState;
   denied?: boolean;
   deniedReason?: string;
+  outcome?: ToolCallOutcome;
 }>();
 expectTypeOf<ToolStatePart['denied']>().toEqualTypeOf<boolean | undefined>();
 expectTypeOf<ToolStatePart['deniedReason']>().toEqualTypeOf<string | undefined>();
@@ -715,3 +716,37 @@ expectTypeOf<RedisStores['runs']>().toEqualTypeOf<Required<RunStore>>();
 expectTypeOf<AgentCheckpoint['approvalRequestCounts']>().toEqualTypeOf<
   Record<string, number> | undefined
 >();
+
+// W2b: Redis run listing (R3), the stable prefix (F22, D1), native chat / memory /
+// fail-over (23.4, D2), the native UI bridge and display fields (23.5, G2).
+import type { AgentRunListQuery, AgentRunReconciliation } from '../src/agent';
+import { reconcileAgentRun } from '../src/agent';
+import type { CompactMessagesDeps } from '../src/index';
+import { NoObjectGeneratedError } from '../src/index';
+import type { RememberOptions } from '../src/memory';
+import type { DeuzAgentState } from '../src/ui';
+expectTypeOf<RedisOpsStore['agentRuns']['list']>().toEqualTypeOf<
+  (query?: AgentRunListQuery) => Promise<AgentRunListPage>
+>();
+expectTypeOf<CompactMessagesDeps['model']>().toEqualTypeOf<LanguageModel | undefined>();
+expectTypeOf<AgentRunEnvelope['version']>().toEqualTypeOf<1 | 2>();
+expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['memory']>().toEqualTypeOf<
+  string | undefined
+>();
+expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['chat']>().toEqualTypeOf<
+  string | undefined
+>();
+expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['fallback']>().toEqualTypeOf<
+  string | undefined
+>();
+expectTypeOf<AgentRunOptions['memory']>().toEqualTypeOf<MemoryCallOptions | undefined>();
+expectTypeOf<AgentRunOptions['chat']>().toEqualTypeOf<ChatPersistOptions | undefined>();
+expectTypeOf<AgentRunOptions['fallbackModels']>().toEqualTypeOf<LanguageModel[] | undefined>();
+expectTypeOf<ChatRecord['messageIds']>().toEqualTypeOf<string[] | undefined>();
+expectTypeOf<RememberOptions['metadata']>().toEqualTypeOf<Record<string, unknown> | undefined>();
+expectTypeOf<NoObjectGeneratedError['finishReason']>().toEqualTypeOf<FinishReason | undefined>();
+expectTypeOf<NoObjectGeneratedError['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
+expectTypeOf(reconcileAgentRun).returns.toEqualTypeOf<Promise<AgentRunReconciliation>>();
+expectTypeOf<UIToolCall['outcome']>().toEqualTypeOf<ToolCallOutcome | undefined>();
+expectTypeOf<AssistantTurnState['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
+expectTypeOf<AssistantTurnState['agent']>().toEqualTypeOf<DeuzAgentState | undefined>();

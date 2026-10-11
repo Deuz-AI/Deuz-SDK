@@ -200,7 +200,7 @@ The difference is the wrapping scope, and it cuts both ways:
 Prefer the guardrail for a run-level policy you want to see in the transcript. Keep the middleware when you genuinely want the instruction on literally every request that descriptor makes — including the ones the SDK issues on your behalf.
 </Callout>
 
-Prepends a system message that tells the model to treat user content and tool outputs as untrusted **data**, never as instructions — a lightweight spotlighting defense against prompt injection.
+Prepends a system message that tells the model to treat user content and tool outputs as untrusted **data**, never as instructions — a lightweight spotlighting defense against prompt injection. It adds its notice once (2.3): not again when the leading system run already carries it, so a guarded chat-store conversation keeps one copy.
 
 ```ts
 function promptInjectionGuard(opts?: { policy?: string }): LanguageModelMiddleware;

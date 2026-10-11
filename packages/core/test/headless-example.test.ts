@@ -1,5 +1,5 @@
 /**
- * examples/headless (2.3 preview, 23.8): the command line runs, resumes,
+ * examples/13-headless (2.3 preview, 23.8): the command line runs, resumes,
  * inspects and checks, printing JSON reports and exiting with their codes.
  * The example imports the package by name; here those imports load the
  * sources, so no build is needed. Each command is a fresh import of the
@@ -15,7 +15,7 @@ vi.mock('@deuz-sdk/core/headless', () => import('../src/node/headless'));
 vi.mock('@deuz-sdk/core/ops/sqlite', () => import('../src/node/ops-sqlite'));
 vi.mock('@deuz-sdk/core/testing', () => import('../src/testing'));
 
-const EXAMPLE = new URL('../../../examples/headless/index.ts', import.meta.url).href;
+const EXAMPLE = new URL('../../../examples/13-headless/index.ts', import.meta.url).href;
 
 let dir: string;
 const argv = process.argv;
@@ -47,7 +47,7 @@ async function cli(...args: string[]): Promise<{ code: number; json: Record<stri
   return { code: Number(process.exitCode ?? 0), json: JSON.parse(lines.join('\n')) };
 }
 
-describe('examples/headless', () => {
+describe('examples/13-headless', () => {
   it('runs, waits for an approval (exit 3), and resumes to completion (exit 0)', async () => {
     const doctor = await cli('doctor');
     expect(doctor.code).toBe(0);

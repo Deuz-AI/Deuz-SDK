@@ -30,12 +30,12 @@ A `Message` may also carry an optional `providerMetadata?: Record<string, unknow
 
 | Role | Use |
 | --- | --- |
-| `system` | Instructions. All `system` messages are concatenated (joined by a blank line) and lifted to the provider's top-level system slot. |
+| `system` | Instructions. The leading run of `system` messages is joined (blank line) into the provider's top-level system slot; a `system` message later in the history is a mid-conversation system message, placed per wire (2.3). |
 | `user` | Human input — text and media. |
 | `assistant` | Model output you replay back: text, `reasoning`, and `tool_use` parts. |
 | `tool` | Tool execution results (`tool_result` parts). The agentic loop emits these for you. |
 
-System handling is automatic: adapters that need a top-level system field (Anthropic, Gemini `systemInstruction`) extract it; OpenAI-style wires keep it inline. You just add `system` messages anywhere in the array.
+System handling is automatic: adapters with a top-level system field take the leading system messages; a later one stays in place on Claude 5.x, OpenAI Responses and Chat Completions, and is folded into the top-level instruction on Gemini and older Claude models ([Preserved thinking](/docs/agents/preserved-thinking)). You just add `system` messages anywhere in the array.
 
 ## Parts
 
@@ -261,7 +261,7 @@ Every `tool_use` must be answered by a `tool_result` with a matching `toolUseId`
 ## Normalization rules
 
 - String content → a single `TextPart`. Author order is never reordered: since 2.3 not even reasoning, which keeps its place on every wire.
-- All `system` messages are pulled out and concatenated with blank lines between them.
+- The leading `system` messages are pulled out and joined with blank lines; later ones are placed per wire (2.3).
 - A `tool`-role message is folded into a `user` turn on wires (Anthropic, Gemini) that have no dedicated tool role.
 - Unknown future part kinds are additive — keep a `default` branch when you switch over `Part.type`.
 

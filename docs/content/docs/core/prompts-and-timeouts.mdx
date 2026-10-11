@@ -43,7 +43,7 @@ const res = streamChat({
 
 `instructions` combines with either input shape and is placed **first**. A `system`-role message already in `messages` is **preserved after it** — the option arrives on its own structural field while history may be a replayed or user-supplied transcript, so history content cannot reorder or drop your framing.
 
-The fold is **idempotent**: if the first turn is already a system message whose content is exactly `instructions`, no second copy is prepended. That is what makes persisting the folded history and passing the same `instructions` on the next turn safe — system prompts cannot stack.
+The fold is **idempotent**: if the leading run of system messages already holds one whose content is exactly `instructions` (2.3: the whole run, not only the first message), no second copy is prepended. That is what makes persisting the folded history and passing the same `instructions` on the next turn safe — system prompts cannot stack.
 
 ```ts
 // messages: [{ role: 'system', content: 'You are terse.' }, { role: 'user', … }]

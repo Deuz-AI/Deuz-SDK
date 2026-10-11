@@ -82,6 +82,10 @@ A few feature surfaces genuinely need the filesystem, a child process, or a Node
 | `@deuz-sdk/core/stores/postgres` | lazy `pg` peer (or an injected client) | a TCP client |
 | `@deuz-sdk/core/ops/redis` | lazy `redis` peer (or an injected client) | a TCP client |
 | `@deuz-sdk/core/swarm/redis` | lazy `redis` peer (or an injected client) | a TCP client |
+| `@deuz-sdk/core/swarm/sqlite` · `/ops/sqlite` · `/evolve/sqlite` | lazy `node:sqlite` (or an injected handle) | a database file |
+| `@deuz-sdk/core/swarm/postgres` · `/ops/postgres` | an injected `PgClientLike` | a TCP client |
+| `@deuz-sdk/core/mcp/server/stdio` | lazy `@modelcontextprotocol/server` + `process.stdin` / `process.stdout` | serves MCP over a process's standard streams (2.3) |
+| `@deuz-sdk/core/headless` | lazy `node:fs/promises`, `node:path`, `node:process` | project instructions, skill folders, the doctor's environment and Node version (2.3 preview) |
 
 The edge-safe counterparts of these features stay on the Web-APIs-only path: `@deuz-sdk/core/rag` (text/markdown/CSV parsing in core), `@deuz-sdk/core/skills` (parse `SKILL.md` you already loaded), `@deuz-sdk/core/memory` (the cosine vector backend), and `@deuz-sdk/core/mcp` (HTTP/SSE transport). Use those at the edge and reserve the `…/node` subpaths for your Node server.
 

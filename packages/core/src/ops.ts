@@ -131,8 +131,8 @@ const STALE_SCAN = 10_000;
  * finalizing whose last save is older than `staleMs`, newest change first.
  * Resume each with `resumeAgent` and its session; with the `lease` option a
  * run another process still drives is refused instead of driven twice. Needs
- * a store with `list`, as the memory, SQLite and Postgres stores have. A call
- * examines at most 10 000 runs.
+ * a store with `list`, as the memory, SQLite, Postgres and Redis stores have.
+ * A call examines at most 10 000 runs.
  */
 export async function findStaleAgentRuns(
   store: AgentRunStore,

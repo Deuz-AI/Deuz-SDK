@@ -3,7 +3,7 @@
  * inspect native agent runs from a script or CI job, and check a provider /
  * model / configuration before running it. Node-only: it reads project
  * instruction files and skill folders from disk and the environment. There is
- * no `bin` and no CLI package; `examples/headless` shows a command line built
+ * no `bin` and no CLI package; `examples/13-headless` shows a command line built
  * on it.
  *
  * Every function returns plain JSON — a {@link HeadlessReport} or a

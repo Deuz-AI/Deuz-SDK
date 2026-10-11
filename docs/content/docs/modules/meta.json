@@ -5,10 +5,12 @@
   "pages": [
     "observability",
     "autonomy",
+    "evals",
     "native-agents",
     "native-mcp",
     "swarm",
     "operations",
+    "headless",
     "budgets",
     "schedule",
     "goals",

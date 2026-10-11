@@ -80,7 +80,7 @@ The adapter always sends `stream_options: { include_usage: true }` so the final 
 
 ## Responses API: reasoning
 
-Use `createOpenAIResponses` for GPT-5.x reasoning models. System messages are hoisted to the request's `instructions` field; the remaining turns become the `input` array.
+Use `createOpenAIResponses` for GPT-5.x reasoning models. The leading system messages become the request's `instructions`; a system message later in the history stays in place as a `system` input item (2.3); the remaining turns become the `input` array.
 
 ```ts
 import { generateText } from '@deuz-sdk/core';

@@ -132,7 +132,7 @@ Since 2.3 every block Claude sends is its own `reasoning` part, replayed unchang
 - Thinking between two tool calls stays between them; the adapter no longer moves thinking to the front of the message.
 - Only Claude's own blocks are sent. Reasoning from another provider (an OpenAI encrypted item, a Gemini thought) and a thinking block without a signature are left out of the request. See [Reasoning parts](/docs/core/messages#reasoning-parts).
 
-Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind each thinking block's signature to the conversation before it. On accounts opened from 2026-08-31 a replayed block whose prefix changed (an edited earlier message, a rewritten system prompt) fails the whole request with HTTP 400. Until every Deuz path keeps that prefix stable, a request that sends thinking back to one of these models, or to an unknown `claude-{fable,opus,sonnet,haiku}-5…` id, carries:
+Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind each thinking block's signature to the conversation before it. On accounts opened from 2026-08-31 a replayed block whose prefix changed (an edited earlier message, a rewritten system prompt) fails the whole request with HTTP 400. The agentic loops keep that prefix stable ([Preserved thinking](/docs/agents/preserved-thinking)); as the safety net for a history edited elsewhere, a request that sends thinking back to one of these models, or to an unknown `claude-{fable,opus,sonnet,haiku}-5…` id, carries:
 
 ```json
 {
@@ -318,7 +318,7 @@ Requests go to `${baseURL}/v1/messages` with `x-api-key`, `anthropic-version: 20
 
 Notable mappings:
 
-- System messages are hoisted into the top-level `system` field.
+- The leading system messages become the top-level `system` field; on Claude 5.x a later system message rides in place as a `role: 'system'` message (older models fold it in), and a tool-set change as `tool_removal` / `tool_addition` blocks (betas `mid-conversation-tool-changes-2026-07-01`, `inline-tools-2026-09-15`).
 - `tool` role messages are sent as `user` turns containing `tool_result` blocks.
 - `reasoning` parts keep their place in each content array and are serialized as `thinking` / `redacted_thinking` blocks; only Claude's own signed blocks are sent (since 2.3).
 

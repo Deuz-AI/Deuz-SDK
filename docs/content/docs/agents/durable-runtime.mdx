@@ -133,7 +133,7 @@ for await (const part of result.fullStream) render(part);
 
 The 1.4 limitation is gone — with a durable session, [client-mode approval](/docs/agents/client-tools) works **inside** [`agentTool`](/docs/agents/subagents):
 
-1. A gated tool call inside a sub-agent (no server-mode `approveToolCall` to inherit) suspends the **child** loop, which checkpoints itself under a per-call key (`${parentRunId}::${agentName}#${toolCallId}`).
+1. A gated tool call inside a sub-agent (no server-mode `approveToolCall` to inherit) suspends the **child** loop, which checkpoints itself under a per-call key: `${parentRunId}::${agentName}#${toolCallId}` for an id's first use in a legacy loop, with `~<n>` added for each reuse (2.3, for providers that recycle call ids); a native run keys the child by call id and root model step (`${parentRunId}::${agentName}#${toolCallId}@${modelStep}`), and a child that 2.2 left under the plain key still resumes.
 2. The parent loop suspends too: its result/stream carries the pending approvals **tagged with `agentPath`** (`ToolApprovalRequest.agentPath`, and on the `tool-approval-request` stream part), so your UI can show *which* agent is asking.
 3. You resume the **parent** run with the verdicts, keyed by the same `approvalId`s. The parent re-executes the sub-agent call; the child finds its own suspended checkpoint, settles its pending calls from the forwarded verdicts, and continues where *it* left off — at any nesting depth.
 

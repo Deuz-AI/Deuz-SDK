@@ -80,6 +80,11 @@ const consumers = [
     source: `export { createA2AClient, fetchAgentCard, createA2AHandler, createInMemoryA2ATaskStore,
       a2aText, A2AError } from '@deuz-sdk/core/a2a';`,
   },
+  {
+    name: 'testing',
+    source:
+      "export { createMockModel, runEval, runGradedEval, runEvalSuite } from '@deuz-sdk/core/testing';",
+  },
 ];
 
 function browserBundle(consumer) {
@@ -107,7 +112,7 @@ function nodeOnlyReferences(result) {
   const output = result.outputFiles?.map((file) => file.text).join('\n') ?? '';
   if (forbiddenBuiltins.test(output)) issues.push('bundled output references a node: builtin');
   const nodeOnlyInput = Object.keys(result.metafile?.inputs ?? {}).find((input) =>
-    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/](?:server[\\/])?stdio|swarm[\\/](?:sqlite|postgres|redis)|ops[\\/](?:sqlite|postgres|redis)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|swarm-redis|ops-sqlite|ops-postgres|ops-redis|budget-sqlite|budget-postgres|redis-budget|redis-scripts|evolve-sqlite))/.test(
+    /(?:rag-node|memory-markdown|skills[\\/]node|mcp[\\/](?:server[\\/])?stdio|swarm[\\/](?:sqlite|postgres|redis)|ops[\\/](?:sqlite|postgres|redis)|evolve[\\/]sqlite|node[\\/](?:observe|chat-store|workspace|compute|browser|runtime|vertex-auth|mcp|store-sqlite|store-redis|store-postgres|swarm-sqlite|swarm-postgres|swarm-redis|ops-sqlite|ops-postgres|ops-redis|budget-sqlite|budget-postgres|redis-budget|redis-scripts|evolve-sqlite|headless))/.test(
       input,
     ),
   );
@@ -140,6 +145,7 @@ const nodeOnlyEntries = [
   ['swarm/redis', 'createRedisSwarmStore'],
   ['evolve/sqlite', 'createSqlitePopulationStore'],
   ['mcp/server/stdio', 'serveMcpStdio'],
+  ['headless', 'runHeadless, resumeHeadless, inspectRun, doctor, loadProjectInstructions'],
 ];
 for (const [subpath, names] of nodeOnlyEntries) {
   try {
@@ -168,6 +174,7 @@ for (const entry of [
   'dist/goal.js',
   'dist/batch.js',
   'dist/a2a.js',
+  'dist/testing.js',
 ]) {
   const source = readFileSync(resolve(root, entry), 'utf8');
   if (forbiddenBuiltins.test(source)) failures.push(`${entry}: directly imports a node: builtin`);

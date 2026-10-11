@@ -422,8 +422,8 @@ export interface AgentRunStore {
    * Native run discovery (2.3): a page of the stored runs, newest change first
    * (last save descending, then run ID descending), summarised without their
    * transcripts. Pass a page's `cursor` back for the next one. Optional: the
-   * memory, SQLite and Postgres stores have it. Rejects a malformed query
-   * with a TypeError.
+   * memory, SQLite, Postgres and Redis stores have it. Rejects a malformed
+   * query with a TypeError.
    */
   list?(query?: AgentRunListQuery): Promise<AgentRunListPage>;
 }
@@ -438,7 +438,8 @@ export interface AgentRunListQuery {
   /**
    * Only runs last saved before this time: epoch ms on the store's clock (the
    * injected clock for the memory and SQLite stores, the database clock for
-   * Postgres). Stale-run discovery passes `now - staleMs`.
+   * Postgres, the server's TIME for Redis). Stale-run discovery passes
+   * `now - staleMs`.
    */
   updatedBefore?: number;
   /** Only this scope's runs. */

@@ -24,6 +24,7 @@ import type {
 } from '../types/agent-run';
 import { assertScope } from '../memory';
 import { scopeKey, scopeWithin } from './native-scope';
+import { isRecallMessage, recallMessage } from './stable-prefix';
 
 /** Option shape checks that must fail a run before anything is read or written. */
 export function assertMemoryOptions(memory: MemoryCallOptions): void {
@@ -72,12 +73,6 @@ export function claimMemoryScope(
   return () => {
     if (map.get(execution.scopeId) === scope) map.delete(execution.scopeId);
   };
-}
-
-/** The recall message a run carries, as the legacy loops write it for preserved thinking. */
-export function isRecallMessage(message: Message): boolean {
-  const deuz = message.providerMetadata?.deuz as { memoryRecall?: unknown } | undefined;
-  return message.role === 'system' && deuz?.memoryRecall === true;
 }
 
 /** The index of the last user message, or -1. */
@@ -133,11 +128,7 @@ export async function recallOnce(
     if (!block) return { recall: { status: 'empty' } };
     return {
       recall: { status: 'recalled', count: hits.length },
-      message: {
-        role: 'system',
-        content: block,
-        providerMetadata: { deuz: { memoryRecall: true } },
-      },
+      message: recallMessage(block),
     };
   } catch (error) {
     logger.error('memory recall failed', { error });

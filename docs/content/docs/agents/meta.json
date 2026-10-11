@@ -10,6 +10,7 @@
     "server-tools",
     "subagents",
     "handoffs",
+    "preserved-thinking",
     "guardrails",
     "durable-runtime",
     "unbreakable-chatbot"

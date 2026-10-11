@@ -1,11 +1,11 @@
 # Deuz SDK examples
 
-Twelve runnable apps, each its own npm workspace. Start from the repo root:
+Thirteen runnable apps, each its own npm workspace. Start from the repo root:
 
 ```sh
 npm install
 npm run build            # examples import @deuz-sdk/core by name, so build dist first
-npm run dev -w @deuz-examples/07-native-agent          # 07–12 run without an API key
+npm run dev -w @deuz-examples/07-native-agent          # 07–13 run without an API key
 export ANTHROPIC_API_KEY=sk-ant-…
 npm run dev -w @deuz-examples/01-basic-stream          # 01–06 call Anthropic
 ```
@@ -26,9 +26,10 @@ Or use the convenience script: `npm run example -- @deuz-examples/01-basic-strea
 | [`10-evolve`](./10-evolve) | `evolve` with SEARCH/REPLACE diffs and an evaluator cascade on SQLite, then a zero-call `resumeEvolve` | none |
 | [`11-schedules-and-signals`](./11-schedules-and-signals) | `createScheduler` with a durable SQLite claim, and `handleSignal` with `verifyHmacSignature` | none |
 | [`12-persistent-budgets`](./12-persistent-budgets) | a per-user `createSqliteBudgetStore` scope shared by native runs and a swarm, until it denies | none |
+| [`13-headless`](./13-headless) | `@deuz-sdk/core/headless` (2.3 preview): `run` / `resume` / `inspect` / `doctor` with JSON reports and exit codes, runs kept in SQLite | none |
 
 Examples 01–06 call a real provider: each reads its API key from the environment **at the app layer** and passes it explicitly into the provider factory. Without the key, the Node examples exit with a message and the Next.js route answers `500 ANTHROPIC_API_KEY is not set.` Core never reads `process.env`; that is deliberate, and it is why the same code runs unchanged on Node, Deno, Bun, and the edge.
 
-Examples 07–12 run on `createMockModel` from `@deuz-sdk/core/testing`, a scripted model that needs no key and no network, and print each step as it happens. A comment marked `REAL PROVIDER` in each `index.ts` shows the change that swaps in a real one.
+Examples 07–13 run on `createMockModel` from `@deuz-sdk/core/testing`, a scripted model that needs no key and no network, and print each step as it happens. A comment marked `REAL PROVIDER` in each `index.ts` shows the change that swaps in a real one.
 
-The Node examples (all but `03-next-chat`, which runs `next dev`) run through Node's native TypeScript stripping (`node --experimental-strip-types index.ts`), so they need **Node ≥ 22.6** and no build step or bundler of their own. Examples 09–12 also use `node:sqlite`, which ships unflagged from **Node 22.13** and **23.4**; their database files live in a temporary directory that each example deletes when it finishes.
+The Node examples (all but `03-next-chat`, which runs `next dev`) run through Node's native TypeScript stripping (`node --experimental-strip-types index.ts`), so they need **Node ≥ 22.6** and no build step or bundler of their own. Examples 09–13 also use `node:sqlite`, which ships unflagged from **Node 22.13** and **23.4**. Examples 09–12 keep their database in a temporary directory that each deletes when it finishes; `13-headless` keeps its file between commands, so `run` and `resume` can be separate processes.

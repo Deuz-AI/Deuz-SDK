@@ -46,8 +46,10 @@ import {
   requestCountsOf,
   resumeHandoffState,
   rewriteAssistantText,
+  rootStaticWire,
   sumUsage,
 } from './inference/loop-shared';
+import { bindsThinkingToPrefix } from './internal/stable-prefix';
 import { pickObjectStrategy } from './inference/object-shared';
 import {
   agentJSONSchema,
@@ -1477,17 +1479,22 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         if (finalizeTools !== null) return finalizeTools;
         const wire =
           loopWire ??
-          (hasLoopTools
-            ? filterWireTools(
-                await buildWireTools(
-                  mergeMcpTools(nativeMcp?.runtime, finalAgent?.tools ?? common.tools),
-                  common.toolChoice,
-                  common.maxToolConcurrency,
-                ),
-                common.activeTools,
-                resolveDependencies(options.deps).logger,
-              )
-            : undefined);
+          (!hasLoopTools
+            ? undefined
+            : // On a model that binds thinking to the prefix (2.3, F22) every
+              // loop request carried the root agent's declared tools, and a
+              // handoff rode the transcript as a tool-set change: so does this one.
+              bindsThinkingToPrefix(finalModel)
+              ? await rootStaticWire(common, nativeMcp?.runtime)
+              : filterWireTools(
+                  await buildWireTools(
+                    mergeMcpTools(nativeMcp?.runtime, finalAgent?.tools ?? common.tools),
+                    common.toolChoice,
+                    common.maxToolConcurrency,
+                  ),
+                  common.activeTools,
+                  resolveDependencies(options.deps).logger,
+                ));
         finalizeTools = wire && wire.tools.length > 0 ? { ...wire, toolChoice: 'none' } : undefined;
         return finalizeTools;
       };
