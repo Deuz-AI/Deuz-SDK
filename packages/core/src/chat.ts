@@ -34,9 +34,10 @@ import type { ToolRunState } from './types/stream';
 import type { CallWarning } from './types/methods';
 import type { Usage, FinishReason } from './types/usage';
 import type { MemoryScope } from './memory';
-import type { DeuzUIPart } from './ui';
+import type { DeuzAgentState, DeuzUIPart } from './ui';
 import { imagePart } from './parts';
 import { resolveMedia } from './internal/image';
+import { agentFrameOf, applyAgentFrame, idleAgentState, usageFromWire } from './internal/agent-ui';
 
 export type { MemoryScope } from './memory';
 
@@ -275,6 +276,15 @@ export interface AssistantTurnState {
   steps?: Array<{ step: number; usage: Usage; finishReason: FinishReason }>;
   /** Redacted server error message, when the stream ended in an error part. */
   error?: string;
+  /**
+   * The native run behind the turn (2.3), folded from the `data-agent` frames
+   * of `toDeuzAgentStreamResponse` exactly as `agentStateFromParts` folds them:
+   * its id, status, pending approvals and client calls, drafts, and the
+   * validated output. Absent on a chat route. A valid frame lands here and in
+   * neither `dataParts` nor `message.parts`; an app's own `data-agent` part
+   * whose payload is no agent frame stays a data part.
+   */
+  agent?: DeuzAgentState;
 }
 
 export function createAssistantTurn(id: string): AssistantTurnState {
@@ -285,38 +295,6 @@ export function createAssistantTurn(id: string): AssistantTurnState {
     dataParts: [],
     citations: [],
     activity: [],
-  };
-}
-
-/**
- * Coerce a wire `usage` payload into a real `Usage` (1.9). `applyUIPart` is
- * TOTAL by contract, and this payload crosses a network boundary from a server
- * that may be older, newer, or hostile: `null`, a string, or a partial object
- * (`{ totalTokens: 1 }`) must fold without throwing AND without leaving a field
- * typed `number` holding something else. Non-finite/missing counts read as 0;
- * `totalTokens` falls back to input+output so a token badge always renders.
- */
-function usageFromWire(value: unknown): Usage {
-  const raw = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
-  const optional = (key: string): number | undefined => {
-    const n = raw[key];
-    return typeof n === 'number' && Number.isFinite(n) ? n : undefined;
-  };
-  const count = (key: string): number => optional(key) ?? 0;
-  const inputTokens = count('inputTokens');
-  const outputTokens = count('outputTokens');
-  const audioTokens = optional('audioTokens');
-  const serverToolUses = optional('serverToolUses');
-  return {
-    inputTokens,
-    outputTokens,
-    reasoningTokens: count('reasoningTokens'),
-    cachedReadTokens: count('cachedReadTokens'),
-    cacheWriteTokens: count('cacheWriteTokens'),
-    cacheWrite1hTokens: count('cacheWrite1hTokens'),
-    ...(audioTokens !== undefined ? { audioTokens } : {}),
-    ...(serverToolUses !== undefined ? { serverToolUses } : {}),
-    totalTokens: optional('totalTokens') ?? inputTokens + outputTokens,
   };
 }
 
@@ -828,6 +806,13 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
         ...(turn.subAgents ? { subAgents: sealedSubAgents(turn.subAgents) } : {}),
       };
     default: {
+      // A native run's frame (2.3) folds into `turn.agent`. A frame applied
+      // before (a replay) or older than the state returns the turn itself.
+      const frame = agentFrameOf(part);
+      if (frame) {
+        const agent = applyAgentFrame(turn.agent ?? idleAgentState(), frame);
+        return agent === turn.agent ? turn : { ...turn, agent };
+      }
       if (typeof part.type === 'string' && part.type.startsWith('data-')) {
         const dataPart = part as Extract<DeuzUIPart, { payload: unknown }>;
         const name = dataPart.type.slice('data-'.length);
