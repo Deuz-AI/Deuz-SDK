@@ -34,6 +34,24 @@ export function bindsThinkingToPrefix(model: LanguageModel): boolean {
   return PREFIX_BOUND_MODELS.has(model.modelId) || registryMatch(model) === 'family';
 }
 
+// --- memory recall ---------------------------------------------------------------
+
+/**
+ * The system message a stable-prefix memory recall appends (see `planRecall`
+ * in `inference/loop-shared.ts`). Its marker is how a later leg recognizes the
+ * turn as recalled, and how compaction tells an old recall block (summarized)
+ * from a system message that carries run state (kept).
+ */
+export function recallMessage(block: string): Message {
+  return { role: 'system', content: block, providerMetadata: { deuz: { memoryRecall: true } } };
+}
+
+/** True for a message {@link recallMessage} built. */
+export function isRecallMessage(message: Message): boolean {
+  const deuz = message.providerMetadata?.deuz as { memoryRecall?: unknown } | undefined;
+  return message.role === 'system' && deuz?.memoryRecall === true;
+}
+
 // --- tool-set changes -----------------------------------------------------------
 //
 // The `tools` array is part of the bound prefix too, so a request in

@@ -22,6 +22,8 @@ import {
   type CompactionEvent,
 } from './inference/compaction';
 import { createTokenEstimator } from './internal/estimate-tokens';
+import { bindsThinkingToPrefix } from './internal/stable-prefix';
+import type { LanguageModel } from './types/model';
 
 export type { CompactionEvent };
 
@@ -49,6 +51,16 @@ export interface CompactMessagesDeps {
   contextWindow?: number;
   /** Fired when a layer is skipped (a throwing summarizer, most often). */
   onSkip?: (layer: CompactionLayer, reason: string) => void;
+  /**
+   * The model the compacted history goes to next (2.3). One that binds its
+   * thinking to the transcript prefix — Claude Fable 5.1, Opus 5.5, Sonnet 5.5,
+   * Haiku 5.5 — gets SIMPLE compaction: one summary replaces the whole
+   * conversation (the leading system messages, the system messages after them
+   * and the pending user turn stay), because the keep-tail layers change the
+   * prefix the replayed thinking blocks are bound to. The prune layers do not
+   * run for it. Omitted: the layers as listed.
+   */
+  model?: LanguageModel;
 }
 
 export interface CompactMessagesResult {
@@ -96,6 +108,7 @@ export async function compactMessages(
     estimate: deps?.estimateTokens ?? ((m) => estimator.estimate(m)),
     contextWindow: deps?.contextWindow ?? Number.POSITIVE_INFINITY,
     mode,
+    ...(deps?.model && bindsThinkingToPrefix(deps.model) ? { strategy: 'simple' as const } : {}),
     ...(deps?.summarize ? { summarize: deps.summarize } : {}),
     ...(deps?.onSkip ? { onSkip: deps.onSkip } : {}),
   };

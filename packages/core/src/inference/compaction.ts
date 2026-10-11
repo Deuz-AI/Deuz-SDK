@@ -25,6 +25,7 @@
 import type { Message, Part } from '../types/message';
 import type { LanguageModel } from '../types/model';
 import { isFatalExecutionError } from '../internal/execution-error';
+import { isRecallMessage } from '../internal/stable-prefix';
 
 export type CompactionLayer = 'prune-tool-results' | 'prune-reasoning' | 'summarize';
 
@@ -139,6 +140,13 @@ export interface ApplyCompactionCtx {
    * manual `compactMessages()` API run in, where the fill question is settled.
    */
   mode?: 'threshold' | 'force';
+  /**
+   * `'keep-tail'` (default): the layers above. `'simple'` (2.3, F22): the
+   * history goes to a model that binds thinking to the transcript prefix
+   * (Claude 5.x), which rejects a replayed thinking block whose prefix changed —
+   * and a keep-tail pass changes exactly that prefix. See {@link simpleSummary}.
+   */
+  strategy?: 'keep-tail' | 'simple';
 }
 
 /**
@@ -165,11 +173,22 @@ export async function applyCompaction(
   const target = policy.threshold * (force ? 0.5 : 0.8);
   const events: CompactionEvent[] = [];
   let current = messages;
+  const simple = ctx.strategy === 'simple';
+  // Simple (2.3, F22): the summary is the one boundary that may rewrite the
+  // prefix. The prune layers edit the middle of it, so they never run on their
+  // own; a policy that has nothing else compacts nothing, and says so.
+  const simpleSummarizes = simple && policy.layers.includes('summarize');
   for (const layer of policy.layers) {
+    if (simple && layer !== 'summarize') {
+      if (!simpleSummarizes) ctx.onSkip?.(layer, PREFIX_BOUND_SKIP);
+      continue;
+    }
     const tokensBefore = ctx.estimate(current);
     const messagesBefore = current.length;
     const layerStart = ctx.now?.() ?? 0;
-    const next = await runLayer(layer, current, policy.keepRecentSteps, ctx);
+    const next = simple
+      ? await simpleSummary(current, ctx)
+      : await runLayer(layer, current, policy.keepRecentSteps, ctx);
     if (next !== current) {
       current = next;
       events.push({
@@ -318,6 +337,68 @@ async function summarizeRun(
       content: [{ type: 'text', text: `${SUMMARY_SENTINEL}\n${summary}` }],
     };
     return [...messages.slice(0, start), summaryMessage, ...messages.slice(end)];
+  } catch (err) {
+    if (isFatalExecutionError(err)) throw err;
+    ctx.onSkip?.('summarize', err instanceof Error ? err.message : String(err));
+    return messages;
+  }
+}
+
+/** Why a prune layer did not run in simple mode (the `onSkip` reason). */
+const PREFIX_BOUND_SKIP =
+  'the model binds thinking to the transcript prefix, so only a summary of the whole ' +
+  'conversation may rewrite it (add the summarize layer)';
+
+/** A user turn the model has not answered yet: no tool result, not a summary. */
+function isPendingUserTurn(m: Message): boolean {
+  if (m.role !== 'user' || isSummaryMessage(m)) return false;
+  return typeof m.content === 'string' || !m.content.some((p) => p.type === 'tool_result');
+}
+
+/**
+ * Simple compaction (2.3, F22): ONE summary replaces the whole conversation,
+ * so no thinking from before it is ever replayed — the only client-side
+ * compaction a model that binds thinking to the transcript prefix accepts
+ * (Anthropic API reference, cached 2026-10-06; not live-verified). The result
+ * is the leading system run (the top-level system, untouched), the summary,
+ * every later system message that carries run state — handoff instructions,
+ * tool-set changes, the caller's own — in order, and the pending user turn
+ * with the system messages after it (its recall block). An older recall block
+ * is conversation content: it is summarized with the turns around it. A
+ * history that ends mid tool loop (on a tool result) is summarized whole: a
+ * result cannot stay without the call it answers.
+ *
+ * Rolling like the keep-tail summary: a previous summary is folded, never
+ * summarized again. Nothing new to summarize, or a throwing summarizer
+ * (`onSkip`), leaves the input array as it was.
+ */
+async function simpleSummary(messages: Message[], ctx: ApplyCompactionCtx): Promise<Message[]> {
+  if (!ctx.summarize) return messages;
+  let lead = 0;
+  while (lead < messages.length && messages[lead]!.role === 'system') lead++;
+  let pending = messages.length - 1;
+  while (pending >= lead && messages[pending]!.role === 'system') pending--;
+  const tailStart =
+    pending >= lead && isPendingUserTurn(messages[pending]!) ? pending : messages.length;
+
+  const kept: Message[] = [];
+  const replaced: Message[] = [];
+  for (let i = lead; i < tailStart; i++) {
+    const m = messages[i]!;
+    if (m.role === 'system' && !isRecallMessage(m)) kept.push(m);
+    else replaced.push(m);
+  }
+  const newSlice = replaced.filter((m) => !isSummaryMessage(m));
+  if (newSlice.length === 0) return messages;
+  const prior = replaced.filter(isSummaryMessage);
+  const previousSummary = prior.length > 0 ? prior.map(summaryBody).join('\n') : undefined;
+  try {
+    const summary = await ctx.summarize(newSlice, previousSummary);
+    const summaryMessage: Message = {
+      role: 'user',
+      content: [{ type: 'text', text: `${SUMMARY_SENTINEL}\n${summary}` }],
+    };
+    return [...messages.slice(0, lead), summaryMessage, ...kept, ...messages.slice(tailStart)];
   } catch (err) {
     if (isFatalExecutionError(err)) throw err;
     ctx.onSkip?.('summarize', err instanceof Error ? err.message : String(err));

@@ -60,6 +60,8 @@ import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import { getCapabilities } from '../core/registry';
 import {
   bindsThinkingToPrefix,
+  isRecallMessage,
+  recallMessage,
   toolSetChangeMessage,
   toolSetChangeOf,
 } from '../internal/stable-prefix';
@@ -2060,6 +2062,10 @@ export async function runCompaction(
     estimate: (m) => runner.estimator.estimate(m) + overheadTokens,
     contextWindow: runner.contextWindow,
     mode,
+    // A model that binds thinking to the transcript prefix (2.3, F22) only
+    // accepts a summary of the whole conversation: keep-tail would replay the
+    // recent turns' thinking behind a rewritten prefix.
+    ...(bindsThinkingToPrefix(runner.model) ? { strategy: 'simple' as const } : {}),
     ...(ob ? { now: () => deps.clock.now() } : {}),
     summarize: async (slice, previousSummary) => {
       // Single-turn, tool-free, compaction-free side call — never recurses.
@@ -3699,12 +3705,6 @@ export interface RecallPlan {
   message?: Message;
 }
 
-/** True for the system message a stable-prefix recall appended (see {@link planRecall}). */
-export function isRecallMessage(message: Message): boolean {
-  const deuz = message.providerMetadata?.deuz as { memoryRecall?: unknown } | undefined;
-  return message.role === 'system' && deuz?.memoryRecall === true;
-}
-
 /** True when the history's last user message is already followed by its recall message. */
 function recalledAlready(messages: Message[]): boolean {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -3745,10 +3745,7 @@ export async function planRecall(
   const block = await computeRecallBlock(options, deps, messages, ob);
   if (!block) return {};
   if (!stable) return { splice: block };
-  // The marker is how a later leg recognizes its turn as recalled.
-  return {
-    message: { role: 'system', content: block, providerMetadata: { deuz: { memoryRecall: true } } },
-  };
+  return { message: recallMessage(block) };
 }
 
 /** Splice a system-context block into a NEW message array (no-op without one). */

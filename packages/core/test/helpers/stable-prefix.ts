@@ -30,13 +30,19 @@ export type Block =
 export function claudeTurn(
   blocks: Block[],
   stop = blocks.some((b) => b.type === 'tool_use') ? 'tool_use' : 'end_turn',
+  /** The input tokens the turn reports (what the loop's token estimate calibrates against). */
+  inputTokens = 10,
 ): string {
   const events: { event: string; data: unknown }[] = [
     {
       event: 'message_start',
       data: {
         type: 'message_start',
-        message: { id: 'msg', role: 'assistant', usage: { input_tokens: 10, output_tokens: 1 } },
+        message: {
+          id: 'msg',
+          role: 'assistant',
+          usage: { input_tokens: inputTokens, output_tokens: 1 },
+        },
       },
     },
   ];

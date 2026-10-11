@@ -12,6 +12,8 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import { generateText, streamChat } from '../src/index';
+import { createAnthropic } from '../src/anthropic';
+import { sseResponse } from '../src/testing';
 import { resumeFromCheckpoint } from '../src/durable';
 import { createInMemorySessionStore } from '../src/durable';
 import { createInMemoryChatStore } from '../src/chat';
@@ -26,12 +28,14 @@ import type { McpClient } from '../src/mcp/shared';
 import type { JSONSchema } from '../src/types/schema';
 import type { GenerateTextResult } from '../src/types/methods';
 import {
+  claudeTurn,
   prefixBreak,
   prefixBreaks,
   replaysThinking,
   scriptedClaude,
   thinkThenAnswer,
   thinkThenCall,
+  type Block,
   type ClaudeRequest,
 } from './helpers/stable-prefix';
 
@@ -776,5 +780,138 @@ describe.each(LOOPS)('MCP tools/list_changed on Claude 5.x (%s loop)', (loop) =>
     // The model could call it: it ran through the MCP client.
     const answer = claude.requests[2]!.messages.at(-1)!;
     expect(JSON.stringify(answer)).toContain('mcp:fresh');
+  });
+});
+
+// --- compaction ----------------------------------------------------------------
+
+/** A summarize side call (the loop's own compaction request), by its prompt. */
+const isSummaryCall = (r: ClaudeRequest) =>
+  JSON.stringify(r.messages).includes('Output only the summary') ||
+  JSON.stringify(r.messages).includes('Output only the updated summary');
+
+describe.each(LOOPS)('compaction on Claude 5.x (%s loop)', (loop) => {
+  it('one summary replaces the conversation; no thinking is replayed across the boundary', async () => {
+    const steps: Block[][] = [
+      [
+        { type: 'thinking', signature: 'S0' },
+        { type: 'tool_use', id: 'tu_0', name: 'search' },
+      ],
+      [
+        { type: 'thinking', signature: 'S1' },
+        { type: 'tool_use', id: 'tu_1', name: 'search' },
+      ],
+      [
+        { type: 'thinking', signature: 'S2' },
+        { type: 'tool_use', id: 'tu_2', name: 'search' },
+      ],
+      [
+        { type: 'thinking', signature: 'S3' },
+        { type: 'text', text: 'Done.' },
+      ],
+    ];
+    let step = 0;
+    // Each turn reports the tokens the policy's counter gives its request (100
+    // per message, the top-level system included), so the loop's calibration
+    // leaves the estimate where the counter put it.
+    const claude = scriptedClaude((request) =>
+      isSummaryCall(request)
+        ? thinkThenAnswer('SX', 'CONDENSED.')
+        : claudeTurn(steps[step++]!, undefined, (request.messages.length + 1) * 100),
+    );
+    await run(loop, {
+      model: claude.model,
+      messages: [
+        { role: 'system', content: 'You research.' },
+        { role: 'user', content: 'Research it.' },
+      ],
+      tools: { search: { parameters: OBJ, execute: async () => 'found' } },
+      maxSteps: 6,
+      // One message is "100 tokens" of a 1000-token window: the pass triggers
+      // once the history holds six messages (fill 0.6 > 0.5).
+      capabilities: { contextWindow: 1000 },
+      compaction: { threshold: 0.5, countTokens: (m) => m.length * 100 },
+      deps: { clock },
+    });
+
+    const loopRequests = claude.requests.filter((r) => !isSummaryCall(r));
+    const boundary = loopRequests.findIndex(
+      (r) =>
+        r.messages[0]!.role === 'user' &&
+        JSON.stringify(r.messages[0]).includes('[Earlier conversation summarized]'),
+    );
+    expect(boundary).toBe(2);
+    const before = loopRequests.slice(0, boundary);
+    const after = loopRequests.slice(boundary);
+    // Each side of the boundary is one stable prefix.
+    expect(prefixBreaks(before)).toEqual([]);
+    expect(prefixBreaks(after)).toEqual([]);
+    // The boundary keeps the top-level system and the tools array as they were,
+    expect(after[0]!.system).toBe('You research.');
+    expect(after[0]!.tools).toEqual(before[0]!.tools);
+    // and replays no thinking from before it.
+    expect(after[0]!.messages).toEqual([
+      {
+        role: 'user',
+        content: [{ type: 'text', text: '[Earlier conversation summarized]\nCONDENSED.' }],
+      },
+    ]);
+    expect(replaysThinking(after[0]!)).toBe(false);
+  });
+});
+
+describe('overflow recovery on Claude 5.x', () => {
+  it('runs the same simple pass, without a compaction option', async () => {
+    let first = true;
+    const requests: ClaudeRequest[] = [];
+    const fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init!.body)) as ClaudeRequest;
+      requests.push(request);
+      if (isSummaryCall(request)) return sseResponse([thinkThenAnswer('SX', 'CONDENSED.')]);
+      if (first) {
+        first = false;
+        return new Response(
+          JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              message: 'prompt is too long: 1200000 tokens > 1000000 maximum',
+            },
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return sseResponse([thinkThenAnswer('S9', 'Answered.')]);
+    }) as typeof globalThis.fetch;
+    const history: Message[] = [
+      { role: 'system', content: 'You research.' },
+      { role: 'user', content: 'Long task.' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: '', signature: 'S0', source: 'anthropic' },
+          { type: 'text', text: 'Partial answer.' },
+        ],
+      },
+      { role: 'user', content: 'Go on.' },
+    ];
+    const result = await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-5-5'),
+      messages: history,
+      tools: { search: { parameters: OBJ, execute: async () => 'found' } },
+      maxSteps: 2,
+      deps: { clock },
+    });
+    expect(result.text).toBe('Answered.');
+    const retry = requests.at(-1)!;
+    expect(retry.system).toBe('You research.');
+    expect(retry.messages).toEqual([
+      {
+        role: 'user',
+        content: [{ type: 'text', text: '[Earlier conversation summarized]\nCONDENSED.' }],
+      },
+      { role: 'user', content: [{ type: 'text', text: 'Go on.' }] },
+    ]);
+    expect(replaysThinking(retry)).toBe(false);
   });
 });
