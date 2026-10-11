@@ -631,7 +631,13 @@ export async function runToolLoop(
         prepared.wire,
         messages,
       );
-      if (stepWire.change) messages = [...messages, stepWire.change];
+      if (stepWire.change) {
+        // Conversation content, like the recall message: the next call replays
+        // it where the model saw it.
+        messages = [...messages, stepWire.change];
+        appended.push(stepWire.change);
+        chatMessages = [...chatMessages, stepWire.change];
+      }
       const stepTools = offeredTools(tools, stepWire.offered);
       const estimateAtCall = (): number =>
         (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;

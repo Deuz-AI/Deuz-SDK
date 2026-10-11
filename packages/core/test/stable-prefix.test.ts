@@ -915,3 +915,185 @@ describe('overflow recovery on Claude 5.x', () => {
     expect(replaysThinking(retry)).toBe(false);
   });
 });
+
+// --- acceptance: one conversation through all of it ----------------------------
+
+describe('acceptance: one Claude 5.x conversation across every F22 source', () => {
+  it('recall, the guard, activeTools, a handoff, a suspension and its resume, then the next turn', async () => {
+    const seams = await seededSeams();
+    const store = createInMemorySessionStore();
+    const chatStore = createInMemoryChatStore();
+    const chat = { store: chatStore, chatId: 'c1', scope: { userId: 'u1', chatId: 'c1' } };
+    const claude = scriptedClaude([
+      thinkThenCall('S0', 'tu_0', 'lookup'),
+      thinkThenCall('S1', 'tu_1', 'transfer_to_billing'),
+      thinkThenCall('S2', 'tu_2', 'refund'),
+      thinkThenAnswer('S3', 'Refunded.'),
+      thinkThenAnswer('S4', 'You are welcome.'),
+    ]);
+    const billing = {
+      model: claude.model,
+      instructions: 'You handle billing.',
+      tools: { refund: { parameters: OBJ, execute: async () => 'refunded', needsApproval: true } },
+    };
+    const tools = {
+      ...handoff({ billing }),
+      lookup: { parameters: OBJ, execute: async () => 'order 42' },
+      escalate: { parameters: OBJ, execute: async () => 'escalated' },
+    };
+    const guarded = wrapModel(claude.model, [promptInjectionGuard()]);
+    const common = {
+      instructions: 'You route customers.',
+      tools,
+      maxSteps: 6,
+      memory: { seams, scope: { userId: 'u1' }, extract: false as const },
+      prepareStep: ({ stepIndex }: { stepIndex: number }) =>
+        stepIndex === 0 ? { activeTools: ['lookup', 'transfer_to_billing'] } : {},
+      deps: { clock },
+    };
+
+    // Turn 1: recall, guard, a narrowed first step, a transfer, then a refund
+    // that waits for approval (the durable run suspends).
+    const first = await guarded.generateText({
+      ...common,
+      messages: [{ role: 'user', content: 'Refund my coffee order.' }],
+      chat,
+      session: { store, runId: 'run-1' },
+    });
+    expect(first.pendingApprovals).toHaveLength(1);
+    // The resume leg: the checkpoint carries the recall block, the guard, the
+    // handoff instructions and the tool-set changes.
+    await resumeFromCheckpoint(store, 'run-1', {
+      ...common,
+      model: claude.model,
+      chat,
+      approvalResponses: [{ approvalId: first.pendingApprovals![0]!.approvalId, approved: true }],
+    });
+    // Turn 2 from the chat record.
+    const saved = (await chatStore.loadChat('c1'))!;
+    await guarded.generateText({
+      ...common,
+      messages: [...saved.messages, { role: 'user', content: 'Thanks!' }],
+      chat,
+    });
+
+    expect(claude.requests).toHaveLength(5);
+    // Within the run, across the suspension, every request extends the last.
+    expect(prefixBreaks(claude.requests.slice(0, 4))).toEqual([]);
+    for (const request of claude.requests) {
+      expect(request.system).toBe(claude.requests[0]!.system);
+      expect(request.tools).toEqual(claude.requests[0]!.tools);
+    }
+    expect(seams.search).toHaveBeenCalledTimes(2); // turn 1 once (not on resume), turn 2 once
+    expect(replaysThinking(claude.requests[4]!)).toBe(true);
+    // Across the two calls the one change is the handoff instructions: run
+    // state, kept out of the transcript because the next call starts as the
+    // root agent. Everything the model saw before them (recall, guard, the
+    // first tool-set change) the next call replays from the chat record.
+    expect(prefixBreak(claude.requests[3]!, claude.requests[4]!)).toMatch(
+      /^messages\[8\] changed:\n {2}before: .*You handle billing\./,
+    );
+  });
+
+  it('what may change between requests: max_tokens, effort and tool_choice', async () => {
+    const claude = scriptedClaude([thinkThenAnswer('S0', 'Hi.'), thinkThenAnswer('S1', 'Sure.')]);
+    const history: Message[] = [
+      { role: 'system', content: 'You are terse.' },
+      { role: 'user', content: 'Hello' },
+    ];
+    const tools = { lookup: { parameters: OBJ, execute: async () => 'x' } };
+    const first = await generateText({
+      model: claude.model,
+      messages: history,
+      tools,
+      effort: 'high',
+      maxOutputTokens: 2000,
+      deps: { clock },
+    });
+    await generateText({
+      model: claude.model,
+      messages: [...history, ...first.response.messages, { role: 'user', content: 'More?' }],
+      tools,
+      toolChoice: 'none',
+      effort: 'low',
+      maxOutputTokens: 1000,
+      deps: { clock },
+    });
+    const [a, b] = claude.requests;
+    expect(a!.max_tokens).not.toEqual(b!.max_tokens);
+    expect(a!.output_config).not.toEqual(b!.output_config);
+    expect(a!.tool_choice).not.toEqual(b!.tool_choice);
+    expect(prefixBreaks(claude.requests)).toEqual([]);
+  });
+});
+
+describe.each(LOOPS)('a tool-set change is conversation content (%s loop)', (loop) => {
+  it('the next turn, from the chat record, replays it: the prefix holds across calls', async () => {
+    const chatStore = createInMemoryChatStore();
+    const chat = { store: chatStore, chatId: 'c1', scope: { userId: 'u1', chatId: 'c1' } };
+    const claude = scriptedClaude([
+      thinkThenCall('S0', 'tu_0', 'search'),
+      thinkThenAnswer('S1', 'Found it.'),
+      thinkThenAnswer('S2', 'Sure.'),
+    ]);
+    const options = {
+      model: claude.model,
+      tools: { search: spyTool('search', []), write: spyTool('write', []) },
+      maxSteps: 3,
+      // The first step of every call may only search.
+      prepareStep: ({ stepIndex }: { stepIndex: number }) =>
+        stepIndex === 0 ? { activeTools: ['search'] } : {},
+      chat,
+      deps: { clock },
+    };
+    await run(loop, { ...options, messages: [{ role: 'user', content: 'Find it.' }] });
+    const saved = (await chatStore.loadChat('c1'))!;
+    // The record holds the changes the model saw, where it saw them.
+    expect(saved.messages.map((m) => m.role)).toEqual([
+      'user',
+      'system',
+      'assistant',
+      'tool',
+      'system',
+      'assistant',
+    ]);
+    await run(loop, {
+      ...options,
+      messages: [...saved.messages, { role: 'user', content: 'Thanks.' }],
+    });
+
+    expect(claude.requests).toHaveLength(3);
+    expect(prefixBreaks(claude.requests)).toEqual([]);
+    // The second call narrows its first step again, after its own question.
+    expect(claude.requests[2]!.messages.at(-1)).toEqual({
+      role: 'system',
+      content: [removal('write')],
+    });
+  });
+});
+
+describe('a tool-set change that names a tool the request no longer declares', () => {
+  it('drops the stale removal instead of sending a reference the API cannot resolve', async () => {
+    const claude = scriptedClaude([thinkThenAnswer('S0', 'ok')]);
+    await generateText({
+      model: claude.model,
+      messages: [
+        { role: 'user', content: 'Hi.' },
+        {
+          role: 'system',
+          content: [],
+          providerMetadata: { deuz: { toolChanges: { remove: ['gone', 'write'], add: [] } } },
+        },
+        { role: 'assistant', content: 'Hello.' },
+        { role: 'user', content: 'Again.' },
+      ],
+      tools: { search: spyTool('search', []), write: spyTool('write', []) },
+      maxSteps: 2,
+      deps: { clock },
+    });
+    expect(claude.requests[0]!.messages[1]).toEqual({
+      role: 'system',
+      content: [removal('write')],
+    });
+  });
+});

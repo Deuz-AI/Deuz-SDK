@@ -237,14 +237,24 @@ function toAnthropicTool(t: WireTool): Record<string, unknown> {
       };
 }
 
-/** The blocks of a tool-set change: removals first, then additions, each in its order. */
-function toolChangeBlocks(change: ToolSetChange, declared: WireTool[]): AnthropicBlock[] {
-  const blocks: AnthropicBlock[] = change.remove.map((name) => ({
-    type: 'tool_removal',
-    tool: { type: 'tool_reference', name },
-  }));
+/**
+ * The blocks of a tool-set change: removals first, then additions, each in its
+ * order. A removal can only reference a tool the request declares or an
+ * earlier change defined (`referable`, which this updates); one that names
+ * neither — a change replayed from an earlier call whose tools have since
+ * changed — is left out rather than sent as a reference the API cannot resolve.
+ */
+function toolChangeBlocks(
+  change: ToolSetChange,
+  declared: WireTool[],
+  referable: Set<string>,
+): AnthropicBlock[] {
+  const blocks: AnthropicBlock[] = change.remove
+    .filter((name) => referable.has(name))
+    .map((name) => ({ type: 'tool_removal', tool: { type: 'tool_reference', name } }));
   for (const tool of change.add) {
     const same = declared.find((t) => t.name === tool.name);
+    referable.add(tool.name);
     blocks.push({
       type: 'tool_addition',
       tool:
@@ -292,8 +302,10 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     logger: ctx.logger,
     warnings: ctx.warnings,
   };
-  // The tools the request declares: what a tool-set change may reference.
+  // The tools the request declares: what a tool-set change may reference, with
+  // the ones an earlier change defined inline (in message order, below).
   const declared = ctx.object?.strategy !== 'tool' ? (ctx.tools?.tools ?? []) : [];
+  const referable = new Set(declared.map((t) => t.name));
   // Blocks keep the order the model produced them in (2.3, F21): thinking
   // between tool calls stays there, since a moved block is a modified prefix.
   const wireMessages = rest
@@ -303,7 +315,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
         .filter((b): b is AnthropicBlock => b !== null);
       // A tool-set change rides on a system message (2.3, F22).
       const change = m.role === 'system' ? toolSetChangeOf(m) : undefined;
-      if (change) content.push(...toolChangeBlocks(change, declared));
+      if (change) content.push(...toolChangeBlocks(change, declared, referable));
       return { role: m.role === 'tool' ? 'user' : m.role, content };
     })
     // A mid-conversation system message with nothing to say is not sent.
