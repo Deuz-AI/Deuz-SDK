@@ -582,6 +582,7 @@ expectTypeOf<DeuzChatRequest['rest']>().toEqualTypeOf<Record<string, unknown>>()
 expectTypeOf<ValidateChatOptions>().toEqualTypeOf<{
   maxMessages?: number;
   maxTextBytes?: number;
+  maxOpaqueReasoningBytes?: number;
   rejectSystemRole?: boolean;
   rejectToolResults?: boolean;
   rejectAssistantTurns?: boolean;
@@ -709,3 +710,8 @@ expectTypeOf(createRedisOpsStore).returns.toEqualTypeOf<RedisOpsStore>();
 expectTypeOf(createRedisBudgetStore).returns.toEqualTypeOf<RedisBudgetStore>();
 expectTypeOf(createRedisSwarmStore).returns.toEqualTypeOf<RedisSwarmStore>();
 expectTypeOf<RedisStores['runs']>().toEqualTypeOf<Required<RunStore>>();
+
+// W2a review fixes: the run-wide approval request count on a checkpoint (S1-2).
+expectTypeOf<AgentCheckpoint['approvalRequestCounts']>().toEqualTypeOf<
+  Record<string, number> | undefined
+>();
