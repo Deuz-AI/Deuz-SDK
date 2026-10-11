@@ -13,6 +13,7 @@ import {
   createRedisOpsStore,
   type RedisOpsStoreOptions,
 } from '../src/node/ops-redis';
+import { hexUnits } from '../src/node/redis-scripts';
 import { createRedisSwarmStore } from '../src/node/swarm-redis';
 import { initialSnapshot } from './fixtures/swarm-store-conformance';
 import { leaseProviderContracts } from './fixtures/lease-provider-conformance';
@@ -68,6 +69,12 @@ describe('Redis ops store', () => {
       '{deuz:ops}:lease:owner',
       '{deuz:ops}:lease:signals',
       '{deuz:ops}:lease:token',
+      '{deuz:ops}:run:entry',
+      '{deuz:ops}:run:indexed',
+      '{deuz:ops}:run:ix',
+      '{deuz:ops}:run:ix:ph:terminal',
+      `{deuz:ops}:run:ix:ps:terminal:${hexUnits('tenant')}`,
+      `{deuz:ops}:run:ix:sc:${hexUnits('tenant')}`,
       '{deuz:ops}:run:payload',
       '{deuz:ops}:run:revision',
       '{deuz:ops}:run:terminal',
