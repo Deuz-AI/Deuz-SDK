@@ -202,7 +202,7 @@ const batch = createBatchClient({
 });
 ```
 
-- **One hold per request, all or none.** Each hold is estimated as a native call is (the prompt plus the output cap the wire sends; on Anthropic a cached prompt as a cache write) and priced on the batch tier. When one hold is refused, by a budget or the policy, the holds already made are released and nothing is sent. The holds sit in the ledger as reservations of kind `'batch'` with the id `<scopeId>/batch/<job key>/<request id>`, and in the `BudgetStore` when the context has persistent admission.
+- **One hold per request, all or none.** Each hold is estimated as a native call is (the prompt plus the output cap the wire sends; on Anthropic a cached prompt as a cache write) and priced on the batch tier. The holds are admitted in one ledger step, each against the budgets and the holds before it, so a batch of any size writes one ledger revision and one persisted snapshot. When one hold is refused, by a budget or the policy, the holds admitted before it are released and nothing is sent. The holds sit in the ledger as reservations of kind `'batch'` with the id `<scopeId>/batch/<job key>/<request id>`, and in the `BudgetStore` when the context has persistent admission.
 - **Each result settles its hold** before the result is handed out:
 
   | Outcome | Hold |

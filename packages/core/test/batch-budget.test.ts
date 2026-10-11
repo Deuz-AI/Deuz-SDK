@@ -254,6 +254,99 @@ describe('batch holds at submit', () => {
       'released',
     ]);
   });
+
+  it('releases the holds the BudgetStore admitted when it refuses a later one', async () => {
+    const store = createInMemoryBudgetStore();
+    const scope: PersistentBudgetScope = { key: 'org:1', limits: { tokens: 45_000 } };
+    const execution = createExecutionContext({ admission: { store, scopes: [scope] } });
+    const { server, batch } = setup({ execution });
+    // The first hold (about 30,000 tokens) fits the store's scope; the second does not.
+    await expect(
+      batch.submit([
+        { id: 'a', prompt: 'x', maxOutputTokens: 30_000 },
+        { id: 'b', prompt: 'y', maxOutputTokens: 30_000 },
+      ]),
+    ).rejects.toMatchObject({ code: 'budget_exceeded', message: /org:1/ });
+    expect(server.calls).toHaveLength(0);
+    expect(await store.usage('org:1')).toEqual({ tokens: 0, usd: 0 });
+    expect(execution.ledger.snapshot().reservations.map((entry) => entry.state)).toEqual([
+      'released',
+    ]);
+  });
+});
+
+// W2a S5-2: one ledger reservation per request made submit() quadratic (every
+// reservation walked every record and persisted a full snapshot), so a large
+// batch froze the process. Its holds are now admitted in one ledger step.
+describe('batch holds at scale', () => {
+  const requests = (count: number, prefix = 'r') =>
+    Array.from({ length: count }, (_, index) => ({
+      id: `${prefix}${index}`,
+      prompt: `Question ${index}?`,
+      maxOutputTokens: 100,
+    }));
+
+  /** Counts full passes over a ledger's records: each starts with Map.prototype.values. */
+  function countLedgerPasses() {
+    const values = Map.prototype.values;
+    let passes = 0;
+    const spy = vi.spyOn(Map.prototype, 'values').mockImplementation(function (
+      this: Map<unknown, unknown>,
+    ) {
+      const first: unknown = values.call(this).next().value;
+      if (
+        typeof first === 'object' &&
+        first !== null &&
+        'requestId' in first &&
+        'reservation' in first
+      )
+        passes++;
+      return values.call(this);
+    });
+    return {
+      restore: () => spy.mockRestore(),
+      get passes() {
+        return passes;
+      },
+    };
+  }
+
+  async function submitAtSize(size: number) {
+    const snapshots: number[] = [];
+    const execution = createExecutionContext({
+      budget: { tokens: 1e12, usd: 1e9 },
+      persist: (saved) => void snapshots.push(saved.reservations.length),
+    });
+    const { batch } = setup({ execution });
+    // Earlier work, so every pass over the records has some to walk.
+    await batch.submit(requests(10, 'warm'));
+    const revision = execution.ledger.snapshot().revision;
+    snapshots.length = 0;
+    const counter = countLedgerPasses();
+    try {
+      const job = await batch.submit(requests(size));
+      expect(job.requests.every((request) => request.hold !== undefined)).toBe(true);
+    } finally {
+      counter.restore();
+    }
+    expect(execution.ledger.totals().reserved.tokens).toBeGreaterThan(0);
+    return {
+      passes: counter.passes,
+      revisions: execution.ledger.snapshot().revision - revision,
+      snapshots,
+    };
+  }
+
+  it('admits a batch in one ledger step, whatever its size', async () => {
+    const small = await submitAtSize(100);
+    const large = await submitAtSize(400);
+    expect(small.passes).toBeGreaterThan(0);
+    // The same number of passes over the records for four times the holds.
+    expect(large.passes).toBe(small.passes);
+    // One revision and one persisted snapshot that holds every hold.
+    expect(large.revisions).toBe(1);
+    expect(large.snapshots).toEqual([410]);
+  });
 });
 
 describe('batch settlement', () => {

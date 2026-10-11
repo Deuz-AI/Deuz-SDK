@@ -1,13 +1,20 @@
-import { createBudgetLedger, intersectBudgetLimits } from './budget-ledger';
+import {
+  createBudgetLedger,
+  intersectBudgetLimits,
+  reserveAll,
+  reserveInTurn,
+} from './budget-ledger';
 import type {
   BudgetLedger,
   BudgetLimits,
+  BudgetReservation,
   BudgetScope,
   ExecutionChildOptions,
   ExecutionContextOptions,
   ExecutionContextRestoreOptions,
   ExecutionContextSnapshot,
   ExecutionPolicy,
+  ExecutionReservationInput,
   NativeExecutionContext,
 } from './types/execution';
 
@@ -171,6 +178,31 @@ export function childScopeId(parent: string, child: string): string {
   return `${parent}/${encodeURIComponent(child)}`;
 }
 
+type ReserveMany = (inputs: readonly ExecutionReservationInput[]) => Promise<BudgetReservation[]>;
+
+/** Each context's own `reserve` for many attempts (2.3, batch holds), kept off the public type. */
+const bulk = new WeakMap<NativeExecutionContext, ReserveMany>();
+
+/**
+ * Reserve several attempts in a context as one step (2.3), for a batch's
+ * holds: the policy is checked for every attempt first, then its ledger
+ * admits them all or none under the context's scopes (see `reserveAll`). A
+ * context `createExecutionContext` did not make reserves them one by one
+ * through its own `reserve`.
+ */
+export async function reserveAllInContext(
+  context: NativeExecutionContext,
+  inputs: readonly ExecutionReservationInput[],
+): Promise<BudgetReservation[]> {
+  const own = bulk.get(context);
+  if (own) return own(inputs);
+  return reserveInTurn(
+    (input: ExecutionReservationInput) => context.reserve(input),
+    (requestId) => context.ledger.release(requestId),
+    inputs,
+  );
+}
+
 function scope(id: string, budget: BudgetLimits): BudgetScope {
   if (typeof id !== 'string' || id.length === 0)
     throw new ExecutionPolicyError('invalid_context', 'scopeId must be a nonempty string.');
@@ -230,6 +262,14 @@ function context(
       });
     },
   };
+  bulk.set(current, (inputs) => {
+    for (const input of inputs)
+      assertExecutionPolicy(current, { modelId: input.modelId, now: input.now });
+    return reserveAll(
+      ledger,
+      inputs.map((input) => ({ ...input, scopes })),
+    );
+  });
   return Object.freeze(current);
 }
 

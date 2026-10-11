@@ -10,6 +10,7 @@
  */
 import { adoptReservation } from '../budget-ledger';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
+import { reserveAllInContext } from '../execution-policy';
 import { createTokenEstimator } from '../internal/estimate-tokens';
 import { wireOutputCap } from '../internal/output-cap';
 import { firstRunReport } from '../internal/run-ledger';
@@ -107,10 +108,11 @@ function estimate(model: LanguageModel, request: PreparedRequest): Usage {
 }
 
 /**
- * Reserve one hold per request, all or none: when one is refused (a budget, an
- * unpriced model under `unknownPrice: 'reject'`, the policy), the holds
- * already made are released and the refusal is thrown before anything is sent.
- * A model with no batch price under a USD bound is reported once (decision 4).
+ * Reserve one hold per request in one ledger step, all or none: when one is
+ * refused (a budget, an unpriced model under `unknownPrice: 'reject'`, the
+ * policy), the holds admitted before it are released and the refusal is
+ * thrown before anything is sent. A model with no batch price under a USD
+ * bound is reported once (decision 4).
  */
 export async function reserveHolds(
   prepared: readonly PreparedRequest[],
@@ -126,43 +128,40 @@ export async function reserveHolds(
   const { execution, deps, model } = input;
   const holds: BatchHold[] = [];
   let unpriced = false;
-  try {
-    for (const request of prepared) {
-      const usage = estimate(model, request);
-      const given = request.options.executionEstimate;
-      let usd = given?.usd;
-      let missing = false;
-      if (usd === undefined) {
-        const price = await batchPrice(deps, model.modelId, usage);
-        usd = price.usd;
-        // A lookup that throws is an outage, not a missing price: without an
-        // estimate a USD bound refuses the hold (missing_reservation).
-        missing = usd === undefined && !price.failed;
-      }
-      const tokens = given?.tokens ?? usage.totalTokens;
-      const id = `${execution.scopeId}/batch/${input.key}/${request.id}`;
-      await execution.reserve({
-        requestId: id,
-        modelId: model.modelId,
-        now: deps.clock.now(),
-        kind: KIND,
-        tokens,
-        ...(usd !== undefined ? { usd } : {}),
-        ...(missing ? { unpriced: true } : {}),
-      });
-      holds.push({
-        id,
-        tokens,
-        ...(usd !== undefined ? { usd } : {}),
-        ...(missing ? { unpriced: true as const } : {}),
-      });
-      unpriced ||= missing;
+  for (const request of prepared) {
+    const usage = estimate(model, request);
+    const given = request.options.executionEstimate;
+    let usd = given?.usd;
+    let missing = false;
+    if (usd === undefined) {
+      const price = await batchPrice(deps, model.modelId, usage);
+      usd = price.usd;
+      // A lookup that throws is an outage, not a missing price: without an
+      // estimate a USD bound refuses the hold (missing_reservation).
+      missing = usd === undefined && !price.failed;
     }
-  } catch (error) {
-    for (const hold of holds.reverse())
-      await execution.ledger.release(hold.id).catch(() => undefined);
-    throw error;
+    holds.push({
+      id: `${execution.scopeId}/batch/${input.key}/${request.id}`,
+      tokens: given?.tokens ?? usage.totalTokens,
+      ...(usd !== undefined ? { usd } : {}),
+      ...(missing ? { unpriced: true as const } : {}),
+    });
+    unpriced ||= missing;
   }
+  // One step for the whole batch: one reservation per request made it quadratic.
+  const now = deps.clock.now();
+  await reserveAllInContext(
+    execution,
+    holds.map((hold) => ({
+      requestId: hold.id,
+      modelId: model.modelId,
+      now,
+      kind: KIND,
+      tokens: hold.tokens,
+      ...(hold.usd !== undefined ? { usd: hold.usd } : {}),
+      ...(hold.unpriced ? { unpriced: true } : {}),
+    })),
+  );
   if (unpriced && bounds(execution).usd && firstRunReport(execution.ledger, model.modelId))
     input.report({
       type: 'unpriced-model',
