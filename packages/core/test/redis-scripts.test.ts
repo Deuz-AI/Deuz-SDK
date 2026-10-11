@@ -6,6 +6,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
+  fromHexUnits,
   hexUnits,
   inBatches,
   LUA_HSCAN,
@@ -110,6 +111,13 @@ describe('hexUnits', () => {
       (left, right) => byCodeUnits(left[0], right[0]) || byCodeUnits(left[1], right[1]),
     );
     expect([...tuples].sort((left, right) => byCodeUnits(key(left), key(right)))).toEqual(expected);
+  });
+
+  it('decodes back to the same string, lone surrogates and NULs included', () => {
+    for (const value of ['', 'a', 'a\u0000', 'é', '\ud800', '\udfff x', '😀', '￿', 'a-b{c}'])
+      expect(fromHexUnits(hexUnits(value))).toBe(value);
+    for (const malformed of ['0', '00610', 'zzzz', '0061-'])
+      expect(() => fromHexUnits(malformed), malformed).toThrow(TypeError);
   });
 });
 

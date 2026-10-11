@@ -30,6 +30,7 @@ import { budgetStoreContracts } from './fixtures/budget-store-conformance';
 import { initialSnapshot, swarmStoreContracts } from './fixtures/swarm-store-conformance';
 import { leaseProviderContracts } from './fixtures/lease-provider-conformance';
 import {
+  agentRunListContracts,
   agentRunPruneContracts,
   agentRunStoreContracts,
 } from './fixtures/agent-run-store-conformance';
@@ -124,6 +125,11 @@ agentRunPruneContracts('Redis agent run retention through ioredis keyPrefix', as
   const { server, client } = prefixed();
   const ops = createRedisOpsStore({ client });
   return { store: ops.agentRuns, advance: server.advance, now: server.now };
+});
+agentRunListContracts('Redis agent run listing through ioredis keyPrefix', async () => {
+  const { server, client } = prefixed();
+  const ops = createRedisOpsStore({ client });
+  return { store: ops.agentRuns, advance: server.advance, now: server.now, frozen: true };
 });
 scheduleClaimContracts(
   'Redis claims through ioredis keyPrefix',

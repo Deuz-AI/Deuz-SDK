@@ -155,6 +155,15 @@ export function hexUnits(value: string): string {
   return out;
 }
 
+/** The string {@link hexUnits} encoded, code unit by code unit; a TypeError for anything else. */
+export function fromHexUnits(hex: string): string {
+  if (!/^(?:[0-9a-f]{4})*$/.test(hex)) throw new TypeError(`Malformed hex code units: ${hex}`);
+  let out = '';
+  for (let index = 0; index < hex.length; index += 4)
+    out += String.fromCharCode(parseInt(hex.slice(index, index + 4), 16));
+  return out;
+}
+
 /**
  * A finite number as 16 hex digits whose byte order is the numeric order, so
  * a ZSET of same-score members can range over it with ZRANGEBYLEX: the IEEE
@@ -228,32 +237,36 @@ export function script(
 /** The key layout version the 2.3 Redis stores write. */
 export const REDIS_SCHEMA_VERSION = 1;
 
-// KEYS: the schema marker. ARGV: this build's version. Answers the stored one.
+// KEYS: the schema marker, then the markers a new store starts with. ARGV:
+// this build's version. Answers the stored one.
 const schemaScript = script(`
 local stored = redis.call('GET', KEYS[1])
 if has(stored) then return stored end
 redis.call('SET', KEYS[1], ARGV[1])
+for i = 2, #KEYS do redis.call('SET', KEYS[i], '1') end
 return ARGV[1]
 `);
 
 /**
  * A store's client, once its schema marker `<tag>:schema` reads the version
- * this build writes. The first use stamps it; a different stored version is
- * refused, as the SQL stores refuse a newer schema, so an older build never
- * writes through a newer layout. Checked once per store; a failed check is
- * retried by the next call.
+ * this build writes. The first use stamps it, and sets each of `fresh` to
+ * `'1'`: markers that say a store this build created needs no catching up. A
+ * different stored version is refused, as the SQL stores refuse a newer
+ * schema, so an older build never writes through a newer layout. Checked once
+ * per store; a failed check is retried by the next call.
  */
 export function versionedClient(
   connection: RedisConnection<RedisScriptClient>,
   tag: string,
   store: string,
+  fresh: readonly string[] = [],
 ): () => Promise<RedisScriptClient> {
   let checked: Promise<void> | undefined;
   return async () => {
     const client = await connection.use();
     checked ??= (async () => {
       const stored = replyText(
-        await schemaScript(client, [`${tag}:schema`], [String(REDIS_SCHEMA_VERSION)]),
+        await schemaScript(client, [`${tag}:schema`, ...fresh], [String(REDIS_SCHEMA_VERSION)]),
       );
       if (Number(stored) !== REDIS_SCHEMA_VERSION)
         throw new Error(
@@ -297,6 +310,14 @@ export const arg = (value: number): string => String(value);
  * backlog never holds the server in one long script.
  */
 export const PRUNE_BATCH = 1_000;
+
+/**
+ * The page of runs one script looks at when the ops store indexes the agent
+ * runs saved before its listing index existed (an `HSCAN` COUNT, so a hint:
+ * Redis answers a small hash whole). Small, because each run found unindexed
+ * comes back with its payload.
+ */
+export const BACKFILL_BATCH = 100;
 
 /** Run a batch script of `size` until a batch removes fewer; the total removed. */
 export async function inBatches(
