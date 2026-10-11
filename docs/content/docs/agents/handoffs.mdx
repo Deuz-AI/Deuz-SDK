@@ -210,7 +210,7 @@ A step can end early for reasons that have nothing to do with the transfer: a to
 Concretely, when the step breaks:
 
 1. every transfer `tool_use_id` is answered and the `{ role: 'tool' }` turn is appended, so the provider never sees an unanswerable history on resume;
-2. the swap is applied — active model, tool set, and the rewritten system turn — **before** the checkpoint is written;
+2. the swap is applied — active model, tool set, and the target's system turn (rewritten, or [appended on Claude 5.x](#claude-5x-the-instructions-are-appended-23)) — **before** the checkpoint is written;
 3. `AgentCheckpoint.handoff` records `{ to, count }`, so the resume leg comes back as the target agent, not the root one;
 4. the streaming loop publishes the same `tool-result` / `tool-state` / `handoff` parts the completed path would, so a UI cannot tell the two apart.
 
@@ -238,6 +238,8 @@ The target's own tools are applied **last**, so an agent that deliberately defin
 Zero-config `mcp:` tools are merged on top of whichever agent is active, and the wire lists are rebuilt at the swap. A transfer therefore keeps the run's MCP tools while replacing the *local* half of the set.
 </Callout>
 
+On Claude 5.x (2.3) the request's `tools` array does not change at the swap: it is part of the prefix the model's thinking is bound to. Every request of the run carries the root agent's tools, and the target's set rides as an appended **tool-set change** — the root's tools withdrawn, the target's added — which Claude reads as mid-conversation `tool_removal` / `tool_addition` blocks. A call the target makes to a withdrawn tool is answered like an unknown tool and never runs. See [Preserved thinking](/docs/agents/preserved-thinking#the-tools-array).
+
 ## The system prompt is rewritten, not appended
 
 `instructions` **replaces** the run's leading system turn (one is inserted when the history had none, and removed when the target declares none).
@@ -245,6 +247,14 @@ Zero-config `mcp:` tools are merged on top of whichever agent is active, and the
 A rewrite, not an append — the same discipline compaction follows. The new turn must not enter `response.messages` / `appended` / the chat record, or your response delta and the transcript would grow a system message you never sent. It lives in the effective model history, and therefore in checkpoints, which is exactly where a resume leg needs to find it.
 
 The consequence to plan for: a target with **no** `instructions` strips the run's system prompt entirely for every following step. If you want a specialist to inherit the run's framing, restate it in that target's `instructions`.
+
+### Claude 5.x: the instructions are appended (2.3)
+
+A target whose model binds thinking to the transcript prefix — Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, or an unknown `claude-*-5…` id on the family fallback — gets its `instructions` **appended** instead: one `role: 'system'` message right after the transfer's tool result. The run's leading system turn is part of the prefix every earlier thinking block is bound to, so rewriting it would invalidate all of them ([Preserved thinking](/docs/agents/preserved-thinking)).
+
+- The run's own system prompt stays in force; the target's instructions follow it, from the transfer on. A target with **no** `instructions` appends nothing, so the run's system prompt is what it reads.
+- The message stays out of `response.messages` and the chat record, as the rewritten turn does: the next call starts as the root agent, and a specialist's instructions in its history would steer it. It lives in the run's history and checkpoints, so a resume leg keeps it.
+- The cost of that rule: the next call's first request no longer contains the message, so the thinking of the turns after the transfer is dropped there (the `drop_block` safety net, not an error).
 
 ## `HandoffPart` on the stream
 
@@ -294,11 +304,7 @@ Two things surprise people, and one of them used to be three:
 
 **Compaction, by contrast, follows the active agent** (2.0). At the swap the compaction runner is re-pointed at the target: its `contextWindow` becomes the target's, and the summarize side call uses `policy.summarizeModel ?? the active model` — not the root one. The token estimator is kept across the swap on purpose, because its calibration measures the provider's request framing, which the transfer did not change.
 
-<Callout type="warn" title="Known limit: a resume leg does not re-point compaction">
-Restoring a checkpointed handoff at the start of a resume leg rebuilds the active model and tool set, but it does **not** re-run the compaction retarget. So a durable run that suspended inside agent B and resumes there measures compaction against the **root** model's `contextWindow`, and summarizes with the root model, until the next transfer happens on that leg.
-
-Pin `compaction.summarizeModel` (and, if the two models' windows differ a lot, `capabilities.contextWindow`) when you combine handoffs with durable resume and compaction.
-</Callout>
+A resume leg re-points it too: restoring a checkpointed handoff rebuilds the active model and tool set **and** re-runs the compaction retarget, in both loops, so a durable run that suspended inside agent B measures and summarizes against B when it resumes there. (Earlier versions of this page said it did not; it did.) On Claude 5.x the pass the target gets is [simple compaction](/docs/core/compaction#claude-5x-simple-compaction-23).
 
 ## See also
 

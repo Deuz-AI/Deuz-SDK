@@ -20,7 +20,7 @@ description: compactMessages — the loop's layered compaction as a plain functi
 
 The pass is a small state machine, and the whole of it is worth holding in your head:
 
-1. Estimate the current fill: `estimate(messages) / contextWindow`. The estimate includes the [memory recall block](/docs/modules/memory#recall-options-20) even though that block is not in `messages` — it is spliced in at the model-call site and the provider counts it, so the threshold has to as well.
+1. Estimate the current fill: `estimate(messages) / contextWindow`. The estimate includes the [memory recall block](/docs/modules/memory#recall-options-20) even though that block is not in `messages` — it is spliced in at the model-call site and the provider counts it, so the threshold has to as well. (On Claude 5.x the recall block is a message of its own since 2.3, so it is simply part of `messages`.)
 2. If fill is **at or under** `threshold` (default `0.92`), stop. The input array is returned by reference and no event is emitted.
 3. Otherwise run the policy's layers in order. After each layer, re-estimate; as soon as fill drops to **`threshold × 0.8`** (the *target*, ~0.736 by default) stop early.
 4. Emit one `CompactionEvent` per layer that actually **changed** the history. A layer that ran and changed nothing is silent, and the loop moves to the next one.
@@ -40,6 +40,10 @@ The default order is `['prune-tool-results', 'prune-reasoning', 'summarize']`, a
 So the loop spends free operations first and reaches for the paid one only when the free ones did not get it under target. Reordering `layers` is legal and occasionally right — a run whose tool outputs are the *answer* might use `['prune-reasoning', 'summarize']` — but putting `summarize` first means paying for a model call on every trigger.
 
 `prune-tool-results` is idempotent: an already-stubbed result matches `[pruned N chars]` and is skipped, so a second pass over the same history changes nothing and emits nothing. `prune-reasoning` refuses to empty a message: an assistant turn made *only* of reasoning parts is left intact, because providers reject an empty content array and a fabricated blank text part would corrupt the turn.
+
+### Claude 5.x compacts simple
+
+A pass for a model that binds its thinking to the transcript prefix — Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5 — does not run these layers. One summary replaces the whole conversation, so no thinking from before it is replayed behind a rewritten prefix; the leading system messages, the later system messages that carry run state and the pending user turn stay. The rest of this section describes the layered pass every other model gets; [simple compaction](/docs/core/compaction#claude-5x-simple-compaction-23) has the details.
 
 ### What is never touched, and why
 
@@ -93,6 +97,7 @@ interface CompactMessagesDeps {
   estimateTokens?: (messages: Message[]) => number;
   contextWindow?: number;
   onSkip?: (layer: CompactionLayer, reason: string) => void;
+  model?: LanguageModel; // 2.3: the model the history goes to next
 }
 
 interface CompactMessagesResult {
@@ -108,6 +113,7 @@ interface CompactMessagesResult {
 | `estimateTokens` | Replaces the **whole** estimate, including the calibration multiplier. |
 | `contextWindow` | Decides the gate — see below. |
 | `onSkip` | Fired when a layer is skipped, which in practice means a throwing summarizer. |
+| `model` | 2.3. The model the compacted history goes to next. A model that binds thinking to the transcript prefix (Claude 5.x) gets [simple compaction](/docs/core/compaction#claude-5x-simple-compaction-23): one summary replaces the conversation, and the prune layers do not run. Omitted, or any other model: the layers as listed. |
 
 Two things about `CompactionEvent` here specifically: `durationMs` is always `0` (the manual API injects no clock — this is an edge-safe module and it will not read one ambiently), and the EMA calibration never runs, because there is no provider usage to calibrate against. A `countTokens` on the **policy** is therefore the entire estimate in a manual call, multiplied by a factor that stays pinned at `1.0`.
 
@@ -238,6 +244,7 @@ Details that matter in production:
 - **The target is halfway, not just under.** `threshold × 0.5` instead of `× 0.8`: the window has already overflowed once, so stopping just under the trigger buys exactly one more round-trip before the next rejection.
 - **The recall block's overhead is not added to this estimate.** Force mode has no threshold to clear, and the recovery target is measured against the history the loop actually owns.
 - **The retry re-measures before calibrating.** Feeding the EMA the pre-compaction estimate would teach it the history is far bigger than what was actually sent.
+- **On Claude 5.x the forced pass is simple (2.3).** One summary replaces the conversation, as on every compaction for a model that binds thinking to the transcript prefix; the pending user turn stays, so the retry still asks the same question.
 - **It is a loop feature.** A single-turn `generateText` (no tools, no `chat`, no `memory`) has no step to retry, so a `ContextOverflowError` there is final. Catch it and call [`compactMessages`](#compactmessages--the-manual-api) yourself, as in the example above.
 
 The events this pass emits are labeled `trigger: 'overflow'` on both the `compaction` stream part and the observation event, so a UI can tell "we planned for this" from "we were caught out".

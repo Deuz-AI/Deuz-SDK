@@ -1,0 +1,104 @@
+---
+title: Preserved Thinking on Claude 5.x
+description: How the agentic loops keep the system prompt, the tools array and every earlier message byte-identical for Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5, what may still change between requests, and where a conversation can break the prefix.
+---
+
+Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 keep their thinking from earlier turns, and they **bind each thinking block to the conversation before it**: the top-level `system`, the `tools` array and every earlier message. When a later request replays a block, all three have to reach the API byte-identical, or the block is invalid. On accounts opened from 2026-08-31 an invalid block fails the request with 400; older accounts opt in.
+
+Since 2.3 the agentic loops (`generateText` / `streamChat` with tools, `memory`, `chat` or `guardrails`) keep that prefix stable for these models. The Anthropic wire still asks the API to **drop** a mismatched block instead of failing (`thinking.block_binding.prefix_mismatch_behavior: 'drop_block'`, see [Anthropic](/docs/providers/anthropic)), but that is now the safety net for a history edited elsewhere, not the normal path.
+
+<Callout type="info" title="Not live-verified">
+The request shapes on this page come from the types of `@anthropic-ai/sdk` 0.133.0 (mid-conversation `role: 'system'` messages, the `tool_addition` / `tool_removal` blocks and their betas). Deuz's tests check every request the loops send against them offline; no request reached the API.
+</Callout>
+
+## Which requests this applies to
+
+A request is in **stable-prefix mode** when its model is one of the four above, or an unknown `claude-{fable,opus,sonnet,haiku}-N…` id with N ≥ 5 that the registry answers from the Claude 5.x family fallback, on the Anthropic wire (`createAnthropic`, Claude on Vertex). Every other model, older Claude models included, keeps the 2.2 behaviour described on the pages linked below.
+
+The wire mapping and the tools array follow the model each call goes to (the run's, a handoff target's, or the one `prepareStep` picked). Memory recall follows the model the run starts with, a handoff's instructions the target's model, and compaction the active agent's model.
+
+## What the loops do differently
+
+| Source of change | 2.2 (and every other model) | Claude 5.x since 2.3 |
+| --- | --- | --- |
+| A `system` message in the middle of the history | Folded into the top-level `system` | Sent in place as a `role: 'system'` message; the top-level `system` is the leading run of system messages only |
+| [Memory recall](/docs/modules/memory#recall-on-claude-5x-an-appended-system-message-23) | Spliced into the system prompt at every model call | One appended system message per user turn, kept in the transcript |
+| [Handoff](/docs/agents/handoffs#claude-5x-the-instructions-are-appended-23) instructions | Replace the leading system turn | Appended after the transfer's tool result |
+| `promptInjectionGuard` | Prepended on every call | Prepended once (every model, 2.3): not again when the leading system run already carries it |
+| `prepareStep.activeTools`, a handoff's tool set, an MCP `tools/list_changed` | A different `tools` array | The same array on every request, plus an appended [tool-set change](#the-tools-array) |
+| [Compaction](/docs/core/compaction#claude-5x-simple-compaction-23) and overflow recovery | Layered: prune, prune, keep-tail summary | Simple: one summary replaces the whole conversation |
+
+`instructions` folds once over the whole leading system run (every model, 2.3), so `instructions` plus `promptInjectionGuard` plus a chat store no longer duplicate the system prompt from turn to turn.
+
+## What may change between requests
+
+Everything outside the system prompt, the tools array and the earlier messages:
+
+- **appended messages**, `role: 'system'` ones included — that is how recall, handoff instructions and tool-set changes get in;
+- `max_tokens`, `output_config.effort` and `tool_choice` (a `prepareStep` that sets `toolChoice: 'none'` for the last step is fine);
+- `thinking` (its `block_binding` included), `cache_control`, and the request headers.
+
+## The tools array
+
+Each run leg declares **one** `tools` array — the root agent's tools (its MCP tools merged in) filtered by the call's static `activeTools` — and sends it on every request. A static `activeTools` therefore costs nothing: the array is simply that subset.
+
+A step that offers a different set appends one system message before its request. On the wire it is a `role: 'system'` message of `tool_removal` / `tool_addition` blocks (beta `mid-conversation-tool-changes-2026-07-01`), the shape Anthropic's own tool runner sends. An addition references a tool the request declares by name; any other addition — a handoff target's own tool, a tool an MCP server just announced — carries its definition inline (beta `inline-tools-2026-09-15`). Both betas are added to `anthropic-beta` only when a request carries such a block.
+
+In the canonical history the change is a system message without text, which every other wire skips:
+
+```ts
+{
+  role: 'system',
+  content: [],
+  providerMetadata: { deuz: { toolChanges: { remove: ['write'], add: [/* wire tool definitions */] } } },
+}
+```
+
+A removal is only a hint to the model, so the step's calls are resolved against the set it offered: a call to a withdrawn tool is answered `No such tool: "write". Available tools: …` and never runs. When a replayed change names a tool the request no longer declares (your tool set changed between calls), the stale removal is left out of the request rather than sent as a reference the API cannot resolve.
+
+## Across calls: send back what the model saw
+
+Within one call — every step, and every leg of a durable run resumed from its checkpoint — the prefix holds by itself. Across calls it holds when the next call's `messages` contain what the previous call's model saw:
+
+- **Memory recall messages and tool-set changes are conversation content.** They ride in `response.messages` and in the [chat record](/docs/modules/chat-persistence), so a history built from either replays them in place.
+- **Handoff instructions are run state.** They stay out of the transcript (the next call starts as the root agent), so the first request of the next call drops the thinking of the turns that followed a transfer. That is the `drop_block` safety net working, not an error.
+- **`useChat` does not carry system messages** over the UI wire. A route that wants the prefix to hold across turns loads its history from the chat store rather than from the posted UI messages.
+
+## Compacting a stored history by hand
+
+`compactMessages` takes the model the history goes to next. For a Claude 5.x model it compacts simple; it makes no model call unless you hand it a summarizer:
+
+```ts title="compact-for-claude.ts"
+import { compactMessages, type Message } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const model = createAnthropic({ apiKey: 'unused-here' })('claude-opus-5-5');
+
+const history: Message[] = [
+  { role: 'system', content: 'You research.' },
+  { role: 'user', content: 'Find the 2025 figures.' },
+  { role: 'assistant', content: 'Here they are: …' },
+  { role: 'user', content: 'Now compare them with 2024.' },
+];
+
+const { messages } = await compactMessages(history, 'auto', {
+  model,
+  summarize: async (slice) => `Earlier: ${slice.length} messages about the 2025 figures.`,
+});
+// [system 'You research.', user '[Earlier conversation summarized]\nEarlier: 2 messages …',
+//  user 'Now compare them with 2024.']
+```
+
+## Limits
+
+- **Older Claude models keep the fold.** Whether they accept a mid-conversation `role: 'system'` message is not verified, so Deuz does not send one to them.
+- **Server-side compaction is not used.** Anthropic's beta `compaction` request parameter returns signed `compaction` blocks that must be sent back unchanged; carrying them needs a new canonical part kind, which 2.x does not add.
+- **Gemini, OpenAI and the Chat Completions hosts** are unaffected, apart from two wire changes that apply to every model: OpenAI Responses now sends a system message from the middle of the history in place, as a `system` input item, instead of folding it into `instructions`; and a system message without text is sent by no wire.
+
+## See also
+
+- [Anthropic](/docs/providers/anthropic) — the `block_binding` safety net and its `input_transformations` warning.
+- [Memory](/docs/modules/memory) — the recall message.
+- [Handoffs](/docs/agents/handoffs) — appended instructions and the target's tool set.
+- [Context compaction](/docs/core/compaction) — simple compaction.
+- [Tools](/docs/agents/tools) — `prepareStep` and `activeTools`.

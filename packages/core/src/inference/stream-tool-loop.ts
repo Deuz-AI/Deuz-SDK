@@ -37,6 +37,9 @@ import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
 import {
   buildWireTools,
   filterWireTools,
+  rootStaticWire,
+  stabilizeStepWire,
+  offeredTools,
   applyPrepareStep,
   setupMcp,
   mergeMcpTools,
@@ -68,7 +71,7 @@ import {
   saveCheckpoint,
   prepareChatPersistence,
   persistChat,
-  computeRecallBlock,
+  planRecall,
   withSystemBlock,
   startMemoryExtract,
   durableUsage,
@@ -754,6 +757,10 @@ export function runStreamToolLoop(
       let fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
       let staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
       flushWarnings();
+      // The tools array a request to a model that binds thinking to the prefix
+      // carries on every step of the leg (2.3, F22): the ROOT agent's static
+      // wire, also on a leg that resumes as a handoff target.
+      const declaredWire = active ? await rootStaticWire(options, mcp) : staticWire;
 
       // Resume: settle the previous break's pending approvals BEFORE step 1 —
       // their tool-result parts precede the first step-start. A durable
@@ -869,13 +876,23 @@ export function runStreamToolLoop(
         return;
       }
 
-      // Memory recall (1.7, D1): computed once per call and spliced into the
-      // system context AT THE CALL SITE only — the canonical history (and so
-      // checkpoints + chat persistence) never bakes the recall block in, and
-      // resume legs cannot double-inject it.
+      // Memory recall (1.7, D1): computed once per leg. On a model that binds
+      // thinking to the prefix (2.3, F22) it is one appended system message
+      // (see `planRecall`); elsewhere it is spliced into the system context AT
+      // THE CALL SITE only — the canonical history (and so checkpoints + chat
+      // persistence) never bakes the block in, and resume legs cannot
+      // double-inject it.
       // Its observation parents under the RUN span (no step is open yet).
-      const recallBlock = await computeRecallBlock(options, deps, messages, observeCtx);
-      // Recall overhead (2.0): the block never enters `messages`, but the
+      const recall = await planRecall(
+        options,
+        deps,
+        messages,
+        active?.model ?? options.model,
+        observeCtx,
+        resumeFrom !== undefined,
+      );
+      const recallBlock = recall.splice;
+      // Recall overhead (2.0): a spliced block never enters `messages`, but the
       // provider counts it. Both the compaction threshold and the EMA
       // calibration have to see the same total.
       const recallOverheadTokens =
@@ -921,6 +938,13 @@ export function runStreamToolLoop(
           return;
         }
         messages = guarded.messages;
+      }
+      // The stable-prefix recall message (2.3): after the guardrails, which
+      // judge the caller's input, and before the first model call.
+      if (recall.message) {
+        messages = [...messages, recall.message];
+        appended.push(recall.message);
+        chatMessages = [...chatMessages, recall.message];
       }
 
       // Cost continuity (1.7, D2): resume legs seed prevCostUsd with the prior
@@ -1012,7 +1036,24 @@ export function runStreamToolLoop(
         );
         flushWarnings();
         messages = prepared.messages;
-        lastWire = prepared.wire;
+        // A step that offers another tool set than the one in effect appends
+        // the change instead of sending another tools array (2.3, F22); its
+        // calls resolve against the set it offered.
+        const stepWire = stabilizeStepWire(
+          prepared.options.model,
+          declaredWire,
+          prepared.wire,
+          messages,
+        );
+        if (stepWire.change) {
+          // Conversation content, like the recall message: the next call replays
+          // it where the model saw it.
+          messages = [...messages, stepWire.change];
+          appended.push(stepWire.change);
+          chatMessages = [...chatMessages, stepWire.change];
+        }
+        const stepTools = offeredTools(tools, stepWire.offered);
+        lastWire = stepWire.wire;
         const estimateAtCall = (): number =>
           (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;
         let estimatedAtCall = estimateAtCall();
@@ -1058,7 +1099,7 @@ export function runStreamToolLoop(
               messages: withSystemBlock(messages, recallBlock),
             }),
             {
-              tools: prepared.wire,
+              tools: stepWire.wire,
               warnings: warningSink,
               // stepMs rides in as a FAILURE signal, never as the user's cancel
               // signal: the inner pump reports a TimeoutError instead of
@@ -1454,7 +1495,7 @@ export function runStreamToolLoop(
         // honored.
         const plan = await planToolDispatch({
           calls: toolCalls,
-          tools,
+          tools: stepTools,
           options,
           messages,
           stepIndex,
@@ -1584,13 +1625,13 @@ export function runStreamToolLoop(
           // goes input-complete → error with no 'executing' in between (the
           // resume-settle path reports missing/denied results the same way).
           // A TRANSFER never executes either — it is not in `execCalls` at all.
-          if (!denied.has(c.toolCallId) && !isUnknownTool(tools, c.toolName)) {
+          if (!denied.has(c.toolCallId) && !isUnknownTool(stepTools, c.toolName)) {
             toolState(c.toolCallId, c.toolName, 'executing');
           }
         }
         let toolResults;
         try {
-          toolResults = await executeTools(execCalls, tools, options, messages, denied, extras);
+          toolResults = await executeTools(execCalls, stepTools, options, messages, denied, extras);
         } catch (err) {
           if (!(err instanceof SubAgentSuspension)) throw err;
           // A durable sub-agent suspended: the EXECUTED calls' tool_use stays

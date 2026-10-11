@@ -13,6 +13,9 @@ import type { ObservationRuntime } from '../internal/observe-runtime';
 import {
   buildWireTools,
   filterWireTools,
+  rootStaticWire,
+  stabilizeStepWire,
+  offeredTools,
   applyPrepareStep,
   setupMcp,
   mergeMcpTools,
@@ -42,7 +45,7 @@ import {
   saveCheckpoint,
   prepareChatPersistence,
   persistChat,
-  computeRecallBlock,
+  planRecall,
   withSystemBlock,
   startMemoryExtract,
   durableUsage,
@@ -411,6 +414,10 @@ export async function runToolLoop(
     }
     let fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
     let staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
+    // The tools array a request to a model that binds thinking to the prefix
+    // carries on every step of the leg (2.3, F22): the ROOT agent's static wire,
+    // also on a leg that resumes as a handoff target.
+    const declaredWire = active ? await rootStaticWire(options, mcp) : staticWire;
 
     // Resume: settle the previous break's pending approvals BEFORE the first
     // model call — the new tool message flows into response.messages. A durable
@@ -494,13 +501,23 @@ export async function runToolLoop(
       return done();
     }
 
-    // Memory recall (1.7, D1): computed once, spliced in at the model-call
-    // site only — canonical history/checkpoints/persistence stay recall-free.
+    // Memory recall (1.7, D1): computed once per leg. On a model that binds
+    // thinking to the prefix (2.3, F22) it is one appended system message (see
+    // `planRecall`); elsewhere it is spliced in at the model-call site only and
+    // canonical history/checkpoints/persistence stay recall-free.
     // Its observation parents under the RUN span (no step is open yet).
-    const recallBlock = await computeRecallBlock(options, deps, messages, observeCtx);
-    // Recall overhead (2.0): the block never enters `messages`, but the provider
-    // counts it. Both the compaction threshold and the EMA calibration have to
-    // see the same total, or every step's estimate is short by one block.
+    const recall = await planRecall(
+      options,
+      deps,
+      messages,
+      active?.model ?? options.model,
+      observeCtx,
+      internal?.resumeFrom !== undefined,
+    );
+    const recallBlock = recall.splice;
+    // Recall overhead (2.0): a spliced block never enters `messages`, but the
+    // provider counts it. Both the compaction threshold and the EMA calibration
+    // have to see the same total, or every step's estimate is short by one block.
     const recallOverheadTokens =
       recallBlock && compactionRunner
         ? compactionRunner.estimator.estimate([{ role: 'system', content: recallBlock }])
@@ -526,6 +543,13 @@ export async function runToolLoop(
         return done();
       }
       messages = guarded.messages;
+    }
+    // The stable-prefix recall message (2.3): after the guardrails, which judge
+    // the caller's input, and before the first model call.
+    if (recall.message) {
+      messages = [...messages, recall.message];
+      appended.push(recall.message);
+      chatMessages = [...chatMessages, recall.message];
     }
 
     for (;;) {
@@ -599,6 +623,23 @@ export async function runToolLoop(
         deps.logger,
       );
       messages = prepared.messages;
+      // A step that offers another tool set than the one in effect appends the
+      // change instead of sending another tools array (2.3, F22); its calls
+      // resolve against the set it offered.
+      const stepWire = stabilizeStepWire(
+        prepared.options.model,
+        declaredWire,
+        prepared.wire,
+        messages,
+      );
+      if (stepWire.change) {
+        // Conversation content, like the recall message: the next call replays
+        // it where the model saw it.
+        messages = [...messages, stepWire.change];
+        appended.push(stepWire.change);
+        chatMessages = [...chatMessages, stepWire.change];
+      }
+      const stepTools = offeredTools(tools, stepWire.offered);
       const estimateAtCall = (): number =>
         (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;
       let estimatedAtCall = estimateAtCall();
@@ -634,7 +675,7 @@ export async function runToolLoop(
               messages: withSystemBlock(messages, recallBlock),
             }),
             {
-              tools: prepared.wire,
+              tools: stepWire.wire,
               warnings,
               // stepMs rides in as a FAILURE signal, never as the user's cancel
               // signal: the inner pump reports a TimeoutError instead of resolving
@@ -835,7 +876,7 @@ export async function runToolLoop(
       // honored.
       const plan = await planToolDispatch({
         calls: toolCalls,
-        tools,
+        tools: stepTools,
         options,
         messages,
         stepIndex,
@@ -959,7 +1000,7 @@ export async function runToolLoop(
 
       let toolResults;
       try {
-        toolResults = await executeTools(execCalls, tools, options, messages, denied, extras);
+        toolResults = await executeTools(execCalls, stepTools, options, messages, denied, extras);
       } catch (err) {
         if (!(err instanceof SubAgentSuspension)) throw err;
         // A durable sub-agent suspended: no tool message is appended for the

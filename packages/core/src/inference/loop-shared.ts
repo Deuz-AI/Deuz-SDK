@@ -58,6 +58,13 @@ import type { CallWarning } from '../types/methods';
 // call without `options.mcp` pulls none of that module graph into the bundle.
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import { getCapabilities } from '../core/registry';
+import {
+  bindsThinkingToPrefix,
+  isRecallMessage,
+  recallMessage,
+  toolSetChangeMessage,
+  toolSetChangeOf,
+} from '../internal/stable-prefix';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
 // `resolveTimeouts` is the SINGLE resolution point for every timeout layer
@@ -680,6 +687,105 @@ export function filterWireTools(
     return wire;
   }
   return { ...wire, tools };
+}
+
+// --- The tool set on a stable prefix (2.3, F22) --------------------------------
+//
+// Claude 5.x binds its thinking to the `tools` array as much as to the
+// messages (`internal/stable-prefix.ts`). On such a model a run leg declares
+// ONE array — the root agent's static wire, the same on every leg of the run —
+// and a step that offers another set says so with an appended tool-set change
+// instead of a different array. A removal is only a hint to the model, so the
+// step's calls resolve against the offered set: a withdrawn tool is answered
+// like an unknown one and never runs.
+
+const SILENT_LOGGER: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+
+/**
+ * The wire the ROOT agent offers on every step absent `prepareStep`: the call's
+ * tools (MCP tools merged in) filtered by its static `activeTools`. What a
+ * stable-prefix leg declares; a leg that starts as the root agent already
+ * built it (its static wire). Silent: the loop reported its warnings already.
+ */
+export async function rootStaticWire(
+  options: CommonCallOptions,
+  mcp: ResolvedMcpRuntime | undefined,
+): Promise<WireToolRequest> {
+  return filterWireTools(
+    await buildWireTools(
+      mergeMcpTools(mcp, options.tools),
+      options.toolChoice,
+      options.maxToolConcurrency,
+    ),
+    options.activeTools,
+    SILENT_LOGGER,
+  );
+}
+
+/** What a step sends and dispatches against. */
+export interface StepWire {
+  /** The tool request the model call carries. */
+  wire: WireToolRequest;
+  /** A tool-set change to append to the history before the call. */
+  change?: Message;
+  /** The tool names a call of this step may resolve to; absent: every tool of the run. */
+  offered?: ReadonlySet<string>;
+}
+
+/** Two wire tools are the same tool when they serialize alike. */
+function sameWireTool(a: WireTool, b: WireTool): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** The tools in effect: the declared ones with every change in the history applied, in order. */
+function toolsInEffect(declared: WireTool[], messages: Message[]): Map<string, WireTool> {
+  const effect = new Map(declared.map((t) => [t.name, t]));
+  for (const m of messages) {
+    const change = toolSetChangeOf(m);
+    if (!change) continue;
+    for (const name of change.remove) effect.delete(name);
+    for (const tool of change.add) effect.set(tool.name, tool);
+  }
+  return effect;
+}
+
+/**
+ * Settle the tool request of one step (2.3, F22). On a model that binds
+ * thinking to the prefix the call carries the leg's `declared` array whatever
+ * the step wants, with the step's `toolChoice` and parallel flag (they are
+ * outside the bound prefix); when the step `desired` a set other than the one
+ * in effect, the change is handed back to append to the history first. Any
+ * other model gets the desired wire, as before.
+ */
+export function stabilizeStepWire(
+  model: LanguageModel,
+  declared: WireToolRequest,
+  desired: WireToolRequest,
+  messages: Message[],
+): StepWire {
+  if (!bindsThinkingToPrefix(model)) return { wire: desired };
+  const effect = toolsInEffect(declared.tools, messages);
+  const wanted = new Set(desired.tools.map((t) => t.name));
+  const remove = [...effect.keys()].filter((name) => !wanted.has(name));
+  const add = desired.tools.filter((t) => {
+    const current = effect.get(t.name);
+    return current === undefined || !sameWireTool(current, t);
+  });
+  return {
+    wire: { ...desired, tools: declared.tools },
+    ...(remove.length > 0 || add.length > 0
+      ? { change: toolSetChangeMessage({ remove, add }) }
+      : {}),
+    offered: wanted,
+  };
+}
+
+/** The part of `tools` a step offered (all of it when the step did not narrow). */
+export function offeredTools(tools: ToolSet, offered: ReadonlySet<string> | undefined): ToolSet {
+  if (!offered) return tools;
+  const out: ToolSet = {};
+  for (const [name, tool] of Object.entries(tools)) if (offered.has(name)) out[name] = tool;
+  return out;
 }
 
 // --- Zero-config MCP (2.0): `CommonCallOptions.mcp` -------------------------
@@ -1637,20 +1743,34 @@ export function agentToolSet(handoffTools: ToolSet, target: HandoffTargetMeta): 
 }
 
 /**
- * Replace the run's leading system turn with the incoming agent's instructions
- * (inserting one when the history had none, removing it when the target
- * declares none).
+ * Give the incoming agent its instructions in the run's effective history.
  *
- * A REWRITE, never an append — the same discipline compaction follows: the new
- * turn must not enter `appended`/`chatMessages`, or the caller's response delta
- * and the chat transcript would grow a system message they never sent. It lives
- * in the effective model history (and therefore in checkpoints), which is
- * exactly where a resume leg needs to find it.
+ * By default a REWRITE: the run's leading system turn is replaced by the
+ * instructions (one is inserted when the history had none, and removed when
+ * the target declares none).
+ *
+ * `append` (2.3, F22: the target's model binds thinking to the transcript
+ * prefix) appends them as a `role: 'system'` message after the transfer's tool
+ * result instead, and appends nothing for a target without instructions: the
+ * leading system turn is part of the prefix every earlier thinking block is
+ * bound to, so rewriting it would invalidate them all.
+ *
+ * Either way the new turn must not enter `appended`/`chatMessages`, or the
+ * caller's response delta and the chat transcript would grow a system message
+ * they never sent (the next run starts at the root agent). It lives in the
+ * effective model history (and therefore in checkpoints), which is exactly
+ * where a resume leg needs to find it.
  */
 export function withAgentInstructions(
   messages: Message[],
   instructions: string | undefined,
+  append = false,
 ): Message[] {
+  if (append) {
+    return instructions === undefined
+      ? messages
+      : [...messages, { role: 'system', content: instructions }];
+  }
   const first = messages[0];
   const hasSystem = first !== undefined && first.role === 'system';
   if (instructions === undefined) return hasSystem ? messages.slice(1) : messages;
@@ -1719,7 +1839,17 @@ export function applyHandoffSwap(
     to: meta.name,
     ...(accepted.reason !== undefined ? { reason: accepted.reason } : {}),
   });
-  return { active, messages: withAgentInstructions(messages, meta.def.instructions), entry };
+  return {
+    active,
+    // A target whose model binds thinking to the prefix (2.3, F22) gets its
+    // instructions appended; any other gets the 2.2 rewrite.
+    messages: withAgentInstructions(
+      messages,
+      meta.def.instructions,
+      bindsThinkingToPrefix(meta.def.model),
+    ),
+    entry,
+  };
 }
 
 /**
@@ -1932,6 +2062,10 @@ export async function runCompaction(
     estimate: (m) => runner.estimator.estimate(m) + overheadTokens,
     contextWindow: runner.contextWindow,
     mode,
+    // A model that binds thinking to the transcript prefix (2.3, F22) only
+    // accepts a summary of the whole conversation: keep-tail would replay the
+    // recent turns' thinking behind a rewritten prefix.
+    ...(bindsThinkingToPrefix(runner.model) ? { strategy: 'simple' as const } : {}),
     ...(ob ? { now: () => deps.clock.now() } : {}),
     summarize: async (slice, previousSummary) => {
       // Single-turn, tool-free, compaction-free side call — never recurses.
@@ -3561,6 +3695,64 @@ export async function computeRecallBlock(
   }
 }
 
+/**
+ * What the memory recall of a run leg contributes (2.3, F22): a block the
+ * model-call site splices into the leading system turn (`splice`, the 2.2
+ * placement), or one appended `role: 'system'` message (`message`).
+ */
+export interface RecallPlan {
+  splice?: string;
+  message?: Message;
+}
+
+/** True when the history's last user message is already followed by its recall message. */
+function recalledAlready(messages: Message[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (isRecallMessage(m)) return true;
+    if (m.role === 'user') return false;
+  }
+  return false;
+}
+
+/**
+ * Memory recall for a run leg (1.7, D1; placement 2.3, F22).
+ *
+ * On a model that binds thinking to the transcript prefix (Claude 5.x,
+ * `internal/stable-prefix.ts`) the block is ONE appended `role: 'system'`
+ * message: the loop appends it after the incoming history, before the first
+ * model call, to the effective history (so checkpoints keep it), the response
+ * delta and the chat record. It is part of the conversation the model saw, as
+ * the false-finish nudge is: the next turn replays it in place, so the prefix
+ * every later thinking block is bound to never changes. Recall runs once per
+ * user turn: a history whose last user message is already followed by its
+ * recall message (an approval continuation, a replayed transcript) recalls
+ * nothing, and neither does a `resumed` leg whose checkpoint holds one — even
+ * when a loop-injected user turn (a false-finish nudge) came after it.
+ *
+ * Every other model keeps the 2.2 placement: the block is spliced into the
+ * leading system turn at the model-call site only, and the transcript stays
+ * recall-free.
+ */
+export async function planRecall(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  messages: Message[],
+  model: LanguageModel,
+  ob?: ExecuteExtras['observe'],
+  /** The leg resumes a durable run from its checkpoint. */
+  resumed = false,
+): Promise<RecallPlan> {
+  const stable = bindsThinkingToPrefix(model);
+  if (stable && (recalledAlready(messages) || (resumed && messages.some(isRecallMessage)))) {
+    return {};
+  }
+  const block = await computeRecallBlock(options, deps, messages, ob);
+  if (!block) return {};
+  if (!stable) return { splice: block };
+  return { message: recallMessage(block) };
+}
+
 /** Splice a system-context block into a NEW message array (no-op without one). */
 export function withSystemBlock(messages: Message[], block: string | undefined): Message[] {
   if (!block) return messages;
@@ -3599,7 +3791,10 @@ export function startMemoryExtract(
   if (memory.writePolicy === 'session-end' || memory.writePolicy === 'manual') return undefined;
   const infer = memory.extract === undefined ? true : (memory.extract.infer ?? true);
   const lastUser = [...options.messages].reverse().find((m) => m.role === 'user');
-  const turns = lastUser ? [lastUser, ...newTurns] : newTurns;
+  // System messages are instructions, not facts about the user — and the
+  // recall message (2.3) would write the recalled memories back as new ones.
+  const said = newTurns.filter((m) => m.role !== 'system');
+  const turns = lastUser ? [lastUser, ...said] : said;
   if (turns.length === 0) return Promise.resolve([]);
 
   // Observation (2.0): started fires SYNCHRONOUSLY (the write is in flight from

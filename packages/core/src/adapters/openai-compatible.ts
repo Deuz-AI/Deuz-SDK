@@ -111,6 +111,9 @@ function toOpenAIMessages(
 ): OpenAIMessage[] {
   const out: OpenAIMessage[] = [];
   for (const m of messages) {
+    // A system message without text carries nothing for this wire (2.3, F22:
+    // a Claude 5.x tool-set change rides on one).
+    if (m.role === 'system' && !m.content.some((p) => p.type === 'text')) continue;
     const role =
       m.role === 'system' && useDeveloperRole
         ? 'developer'

@@ -1,4 +1,4 @@
-import type { Adapter, AdapterRequest, BuildContext, ParseContext } from './types';
+import type { Adapter, AdapterRequest, BuildContext, ParseContext, WireTool } from './types';
 import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
 import type { Part } from '../types/message';
@@ -14,7 +14,7 @@ import {
   RateLimitError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
-import { registryMatch, type EffortLevel } from '../core/registry';
+import type { EffortLevel } from '../core/registry';
 import {
   anthropicMaxTokens,
   atMostHigh,
@@ -26,6 +26,11 @@ import {
 } from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
 import { replaysTo } from '../internal/reasoning';
+import {
+  bindsThinkingToPrefix,
+  toolSetChangeOf,
+  type ToolSetChange,
+} from '../internal/stable-prefix';
 import { acceptsDocuments, resolveMedia, warnDroppedDocument } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -152,29 +157,13 @@ function mapAnthropicToolChoice(
 // Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind each thinking block's
 // signature to the conversation before it (Anthropic API reference, cached
 // 2026-10-06). On accounts opened from 2026-08-31 a replayed block whose prefix
-// changed fails the request with 400, and Deuz's transcript prefix is not yet
-// stable (F22: recall, handoff and compaction still rewrite it). A request that
-// sends thinking back to such a model therefore asks the API to drop a
-// mismatched block instead. Shapes from @anthropic-ai/sdk 0.133.0's beta types;
-// not live-verified.
+// changed fails the request with 400. The loops keep the prefix stable (F22,
+// `internal/stable-prefix.ts`); a request that sends thinking back to such a
+// model still asks the API to drop a mismatched block instead, as the safety
+// net for a history edited elsewhere. Shapes from @anthropic-ai/sdk 0.133.0's
+// beta types; not live-verified.
 
 const BLOCK_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
-
-/** The binding models; an unknown 5.x id on the family fallback counts too. */
-const PREFIX_BOUND_MODELS: ReadonlySet<string> = new Set([
-  'claude-fable-5-1',
-  'claude-opus-5-5',
-  'claude-sonnet-5-5',
-  'claude-haiku-5-5',
-]);
-
-function bindsThinkingToPrefix(call: BuildContext['call']): boolean {
-  return (
-    PREFIX_BOUND_MODELS.has(call.modelId) ||
-    registryMatch({ provider: call.provider, modelId: call.modelId, surface: 'anthropic' }) ===
-      'family'
-  );
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -193,14 +182,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function applyBlockBinding(
   ctx: BuildContext,
   body: Record<string, unknown>,
-  replaysThinking: boolean,
+  /** The request replays thinking to a model that binds it to the prefix. */
+  bindsReplay: boolean,
 ): boolean {
   const own = ctx.options.providerOptions?.[ctx.call.provider];
   const caller = isRecord(own?.thinking) ? own.thinking : undefined;
   const explicit = caller !== undefined && Object.hasOwn(caller, 'block_binding');
   const binding = explicit
     ? caller.block_binding
-    : replaysThinking && bindsThinkingToPrefix(ctx.call)
+    : bindsReplay
       ? { prefix_mismatch_behavior: 'drop_block' }
       : undefined;
   if (binding === undefined) return false;
@@ -222,6 +212,60 @@ function applyBlockBinding(
   return true;
 }
 
+// --- tool-set changes (2.3, F22) ---
+//
+// A request to a model that binds thinking to the prefix carries the same
+// `tools` array on every step; a step that offers another set appends a system
+// message whose change renders as `tool_removal` / `tool_addition` blocks
+// (@anthropic-ai/sdk 0.133.0 BetaRequestToolRemovalBlock /
+// BetaRequestToolAdditionBlock, one `role: 'system'` message as the SDK's own
+// tool runner sends them). A tool declared in `tools` with the same definition
+// is referenced by name; any other addition carries its definition inline.
+// Not live-verified.
+
+const TOOL_CHANGES_BETA = 'mid-conversation-tool-changes-2026-07-01';
+const INLINE_TOOLS_BETA = 'inline-tools-2026-09-15';
+
+/** A wire tool as a `tools` entry. */
+function toAnthropicTool(t: WireTool): Record<string, unknown> {
+  return t.provider
+    ? t.provider // provider-executed tool — raw native definition, verbatim
+    : {
+        name: t.name,
+        ...(t.description ? { description: t.description } : {}),
+        input_schema: t.parameters,
+      };
+}
+
+/**
+ * The blocks of a tool-set change: removals first, then additions, each in its
+ * order. A removal can only reference a tool the request declares or an
+ * earlier change defined (`referable`, which this updates); one that names
+ * neither — a change replayed from an earlier call whose tools have since
+ * changed — is left out rather than sent as a reference the API cannot resolve.
+ */
+function toolChangeBlocks(
+  change: ToolSetChange,
+  declared: WireTool[],
+  referable: Set<string>,
+): AnthropicBlock[] {
+  const blocks: AnthropicBlock[] = change.remove
+    .filter((name) => referable.has(name))
+    .map((name) => ({ type: 'tool_removal', tool: { type: 'tool_reference', name } }));
+  for (const tool of change.add) {
+    const same = declared.find((t) => t.name === tool.name);
+    referable.add(tool.name);
+    blocks.push({
+      type: 'tool_addition',
+      tool:
+        same && JSON.stringify(same) === JSON.stringify(tool)
+          ? { type: 'tool_reference', name: tool.name }
+          : { type: 'tool_definition', definition: toAnthropicTool(tool) },
+    });
+  }
+  return blocks;
+}
+
 /** `headers` with `beta` added to `anthropic-beta` (a caller's list is kept). */
 function withBeta(headers: Record<string, string>, beta: string): Record<string, string> {
   const key = Object.keys(headers).find((k) => k.toLowerCase() === 'anthropic-beta');
@@ -239,7 +283,17 @@ function withBeta(headers: Record<string, string>, beta: string): Record<string,
 
 function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options } = ctx;
-  const { system, rest } = extractSystem(messages);
+  // Claude 5.x binds thinking to the transcript prefix (2.3, F22): a system
+  // message appended mid-conversation rides in place as a `role: 'system'`
+  // message (GA `MessageParam`) instead of rewriting the top-level `system`.
+  // Older models keep the 2.2 fold; whether they accept the role is not
+  // live-verified.
+  const bound = bindsThinkingToPrefix({
+    provider: call.provider,
+    modelId: call.modelId,
+    surface: 'anthropic',
+  });
+  const { system, rest } = extractSystem(messages, { inPlace: bound });
 
   const media: MediaContext = {
     caps,
@@ -248,14 +302,24 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     logger: ctx.logger,
     warnings: ctx.warnings,
   };
+  // The tools the request declares: what a tool-set change may reference, with
+  // the ones an earlier change defined inline (in message order, below).
+  const declared = ctx.object?.strategy !== 'tool' ? (ctx.tools?.tools ?? []) : [];
+  const referable = new Set(declared.map((t) => t.name));
   // Blocks keep the order the model produced them in (2.3, F21): thinking
   // between tool calls stays there, since a moved block is a modified prefix.
-  const wireMessages = rest.map((m) => ({
-    role: m.role === 'tool' ? 'user' : m.role,
-    content: m.content
-      .map((p) => partToBlock(p, media))
-      .filter((b): b is AnthropicBlock => b !== null),
-  }));
+  const wireMessages = rest
+    .map((m) => {
+      const content = m.content
+        .map((p) => partToBlock(p, media))
+        .filter((b): b is AnthropicBlock => b !== null);
+      // A tool-set change rides on a system message (2.3, F22).
+      const change = m.role === 'system' ? toolSetChangeOf(m) : undefined;
+      if (change) content.push(...toolChangeBlocks(change, declared, referable));
+      return { role: m.role === 'tool' ? 'user' : m.role, content };
+    })
+    // A mid-conversation system message with nothing to say is not sent.
+    .filter((m) => m.role !== 'system' || m.content.length > 0);
 
   // Opus 4.7+/Sonnet 5/Fable 5/Claude 5.x: budget_tokens returns 400 — effort
   // rides output_config. Every value changed on the way is reported (2.3): see
@@ -370,15 +434,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   // cache, preserved thinking) stays the loop's. The tool strategy forces its
   // own call instead. Not live-verified.
   if (ctx.object?.strategy !== 'tool' && ctx.tools && ctx.tools.tools.length > 0) {
-    body.tools = ctx.tools.tools.map((t) =>
-      t.provider
-        ? t.provider // provider-executed tool — raw native definition, verbatim
-        : {
-            name: t.name,
-            ...(t.description ? { description: t.description } : {}),
-            input_schema: t.parameters,
-          },
-    );
+    body.tools = ctx.tools.tools.map(toAnthropicTool);
     body.tool_choice = mapAnthropicToolChoice(
       ctx,
       ctx.tools.toolChoice,
@@ -402,9 +458,19 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       m.role === 'assistant' &&
       m.content.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking'),
   );
-  const extraHeaders = applyBlockBinding(ctx, body, replaysThinking)
+  let extraHeaders = applyBlockBinding(ctx, body, replaysThinking && bound)
     ? withBeta(call.headers, BLOCK_BINDING_BETA)
     : call.headers;
+  const changeBlocks = wireMessages
+    .filter((m) => m.role === 'system')
+    .flatMap((m) => m.content)
+    .filter((b) => b.type === 'tool_addition' || b.type === 'tool_removal');
+  if (changeBlocks.length > 0) {
+    extraHeaders = withBeta(extraHeaders, TOOL_CHANGES_BETA);
+    if (changeBlocks.some((b) => (b.tool as { type: string }).type === 'tool_definition')) {
+      extraHeaders = withBeta(extraHeaders, INLINE_TOOLS_BETA);
+    }
+  }
 
   applyProviderOptions(body, call.provider, options);
 
