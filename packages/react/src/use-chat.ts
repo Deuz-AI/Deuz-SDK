@@ -924,7 +924,19 @@ export function useChat(options: UseChatOptions): UseChatResult {
       const previous = snapshotRef.current;
       const placed = placedIdRef.current;
       const ui = previous.history.ui;
-      const index = placed === undefined ? -1 : ui.findIndex((m) => m.id === placed);
+      // The LAST message with the id (2.3): the turn's bubble was appended
+      // after every earlier one, and a route that names each response's
+      // message the same ('deuz-msg' without a `messageId`) must not have a
+      // later leg write into an earlier leg's bubble.
+      let index = -1;
+      if (placed !== undefined) {
+        for (let i = ui.length - 1; i >= 0; i--) {
+          if (ui[i]!.id === placed) {
+            index = i;
+            break;
+          }
+        }
+      }
       placedIdRef.current = turn.message.id;
       commit({
         ...previous,

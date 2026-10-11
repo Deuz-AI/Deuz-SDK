@@ -600,8 +600,7 @@ describe('useChat — the history after an approval answers the approved call (2
           messages: body.messages,
           ...(body.approvalResponses ? { approvalResponses: body.approvalResponses as never } : {}),
         }),
-        { messageId: `msg-${bodies.length}` },
-      );
+      ); // no messageId: every response starts the message 'deuz-msg', as the docs route does
     };
     const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: fetchMock }));
     await act(async () => {
@@ -613,6 +612,13 @@ describe('useChat — the history after an approval answers the approved call (2
       await result.current.addToolApprovalResponse({ approvalId, approved: true });
     });
     await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Deleted.'));
+    // Two responses named their message 'deuz-msg': each still fills its own bubble.
+    expect(result.current.messages.map((m) => [m.role, m.content])).toEqual([
+      ['user', 'delete /x'],
+      ['assistant', ''],
+      ['assistant', 'Deleted.'],
+    ]);
+    expect(result.current.messages[1]!.toolCalls?.[0]).toMatchObject({ toolCallId: 't1' });
     await act(async () => {
       await result.current.sendMessage('thanks');
     });
