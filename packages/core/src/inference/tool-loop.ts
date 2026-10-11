@@ -13,6 +13,9 @@ import type { ObservationRuntime } from '../internal/observe-runtime';
 import {
   buildWireTools,
   filterWireTools,
+  rootStaticWire,
+  stabilizeStepWire,
+  offeredTools,
   applyPrepareStep,
   setupMcp,
   mergeMcpTools,
@@ -411,6 +414,10 @@ export async function runToolLoop(
     }
     let fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
     let staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
+    // The tools array a request to a model that binds thinking to the prefix
+    // carries on every step of the leg (2.3, F22): the ROOT agent's static wire,
+    // also on a leg that resumes as a handoff target.
+    const declaredWire = active ? await rootStaticWire(options, mcp) : staticWire;
 
     // Resume: settle the previous break's pending approvals BEFORE the first
     // model call — the new tool message flows into response.messages. A durable
@@ -615,6 +622,17 @@ export async function runToolLoop(
         deps.logger,
       );
       messages = prepared.messages;
+      // A step that offers another tool set than the one in effect appends the
+      // change instead of sending another tools array (2.3, F22); its calls
+      // resolve against the set it offered.
+      const stepWire = stabilizeStepWire(
+        prepared.options.model,
+        declaredWire,
+        prepared.wire,
+        messages,
+      );
+      if (stepWire.change) messages = [...messages, stepWire.change];
+      const stepTools = offeredTools(tools, stepWire.offered);
       const estimateAtCall = (): number =>
         (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;
       let estimatedAtCall = estimateAtCall();
@@ -650,7 +668,7 @@ export async function runToolLoop(
               messages: withSystemBlock(messages, recallBlock),
             }),
             {
-              tools: prepared.wire,
+              tools: stepWire.wire,
               warnings,
               // stepMs rides in as a FAILURE signal, never as the user's cancel
               // signal: the inner pump reports a TimeoutError instead of resolving
@@ -851,7 +869,7 @@ export async function runToolLoop(
       // honored.
       const plan = await planToolDispatch({
         calls: toolCalls,
-        tools,
+        tools: stepTools,
         options,
         messages,
         stepIndex,
@@ -975,7 +993,7 @@ export async function runToolLoop(
 
       let toolResults;
       try {
-        toolResults = await executeTools(execCalls, tools, options, messages, denied, extras);
+        toolResults = await executeTools(execCalls, stepTools, options, messages, denied, extras);
       } catch (err) {
         if (!(err instanceof SubAgentSuspension)) throw err;
         // A durable sub-agent suspended: no tool message is appended for the

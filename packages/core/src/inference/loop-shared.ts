@@ -58,7 +58,11 @@ import type { CallWarning } from '../types/methods';
 // call without `options.mcp` pulls none of that module graph into the bundle.
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import { getCapabilities } from '../core/registry';
-import { bindsThinkingToPrefix } from '../internal/stable-prefix';
+import {
+  bindsThinkingToPrefix,
+  toolSetChangeMessage,
+  toolSetChangeOf,
+} from '../internal/stable-prefix';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
 // `resolveTimeouts` is the SINGLE resolution point for every timeout layer
@@ -681,6 +685,105 @@ export function filterWireTools(
     return wire;
   }
   return { ...wire, tools };
+}
+
+// --- The tool set on a stable prefix (2.3, F22) --------------------------------
+//
+// Claude 5.x binds its thinking to the `tools` array as much as to the
+// messages (`internal/stable-prefix.ts`). On such a model a run leg declares
+// ONE array — the root agent's static wire, the same on every leg of the run —
+// and a step that offers another set says so with an appended tool-set change
+// instead of a different array. A removal is only a hint to the model, so the
+// step's calls resolve against the offered set: a withdrawn tool is answered
+// like an unknown one and never runs.
+
+const SILENT_LOGGER: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+
+/**
+ * The wire the ROOT agent offers on every step absent `prepareStep`: the call's
+ * tools (MCP tools merged in) filtered by its static `activeTools`. What a
+ * stable-prefix leg declares; a leg that starts as the root agent already
+ * built it (its static wire). Silent: the loop reported its warnings already.
+ */
+export async function rootStaticWire(
+  options: CommonCallOptions,
+  mcp: ResolvedMcpRuntime | undefined,
+): Promise<WireToolRequest> {
+  return filterWireTools(
+    await buildWireTools(
+      mergeMcpTools(mcp, options.tools),
+      options.toolChoice,
+      options.maxToolConcurrency,
+    ),
+    options.activeTools,
+    SILENT_LOGGER,
+  );
+}
+
+/** What a step sends and dispatches against. */
+export interface StepWire {
+  /** The tool request the model call carries. */
+  wire: WireToolRequest;
+  /** A tool-set change to append to the history before the call. */
+  change?: Message;
+  /** The tool names a call of this step may resolve to; absent: every tool of the run. */
+  offered?: ReadonlySet<string>;
+}
+
+/** Two wire tools are the same tool when they serialize alike. */
+function sameWireTool(a: WireTool, b: WireTool): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** The tools in effect: the declared ones with every change in the history applied, in order. */
+function toolsInEffect(declared: WireTool[], messages: Message[]): Map<string, WireTool> {
+  const effect = new Map(declared.map((t) => [t.name, t]));
+  for (const m of messages) {
+    const change = toolSetChangeOf(m);
+    if (!change) continue;
+    for (const name of change.remove) effect.delete(name);
+    for (const tool of change.add) effect.set(tool.name, tool);
+  }
+  return effect;
+}
+
+/**
+ * Settle the tool request of one step (2.3, F22). On a model that binds
+ * thinking to the prefix the call carries the leg's `declared` array whatever
+ * the step wants, with the step's `toolChoice` and parallel flag (they are
+ * outside the bound prefix); when the step `desired` a set other than the one
+ * in effect, the change is handed back to append to the history first. Any
+ * other model gets the desired wire, as before.
+ */
+export function stabilizeStepWire(
+  model: LanguageModel,
+  declared: WireToolRequest,
+  desired: WireToolRequest,
+  messages: Message[],
+): StepWire {
+  if (!bindsThinkingToPrefix(model)) return { wire: desired };
+  const effect = toolsInEffect(declared.tools, messages);
+  const wanted = new Set(desired.tools.map((t) => t.name));
+  const remove = [...effect.keys()].filter((name) => !wanted.has(name));
+  const add = desired.tools.filter((t) => {
+    const current = effect.get(t.name);
+    return current === undefined || !sameWireTool(current, t);
+  });
+  return {
+    wire: { ...desired, tools: declared.tools },
+    ...(remove.length > 0 || add.length > 0
+      ? { change: toolSetChangeMessage({ remove, add }) }
+      : {}),
+    offered: wanted,
+  };
+}
+
+/** The part of `tools` a step offered (all of it when the step did not narrow). */
+export function offeredTools(tools: ToolSet, offered: ReadonlySet<string> | undefined): ToolSet {
+  if (!offered) return tools;
+  const out: ToolSet = {};
+  for (const [name, tool] of Object.entries(tools)) if (offered.has(name)) out[name] = tool;
+  return out;
 }
 
 // --- Zero-config MCP (2.0): `CommonCallOptions.mcp` -------------------------

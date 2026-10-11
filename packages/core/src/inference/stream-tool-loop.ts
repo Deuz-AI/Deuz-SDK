@@ -37,6 +37,9 @@ import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
 import {
   buildWireTools,
   filterWireTools,
+  rootStaticWire,
+  stabilizeStepWire,
+  offeredTools,
   applyPrepareStep,
   setupMcp,
   mergeMcpTools,
@@ -754,6 +757,10 @@ export function runStreamToolLoop(
       let fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
       let staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
       flushWarnings();
+      // The tools array a request to a model that binds thinking to the prefix
+      // carries on every step of the leg (2.3, F22): the ROOT agent's static
+      // wire, also on a leg that resumes as a handoff target.
+      const declaredWire = active ? await rootStaticWire(options, mcp) : staticWire;
 
       // Resume: settle the previous break's pending approvals BEFORE step 1 —
       // their tool-result parts precede the first step-start. A durable
@@ -1028,7 +1035,18 @@ export function runStreamToolLoop(
         );
         flushWarnings();
         messages = prepared.messages;
-        lastWire = prepared.wire;
+        // A step that offers another tool set than the one in effect appends
+        // the change instead of sending another tools array (2.3, F22); its
+        // calls resolve against the set it offered.
+        const stepWire = stabilizeStepWire(
+          prepared.options.model,
+          declaredWire,
+          prepared.wire,
+          messages,
+        );
+        if (stepWire.change) messages = [...messages, stepWire.change];
+        const stepTools = offeredTools(tools, stepWire.offered);
+        lastWire = stepWire.wire;
         const estimateAtCall = (): number =>
           (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;
         let estimatedAtCall = estimateAtCall();
@@ -1074,7 +1092,7 @@ export function runStreamToolLoop(
               messages: withSystemBlock(messages, recallBlock),
             }),
             {
-              tools: prepared.wire,
+              tools: stepWire.wire,
               warnings: warningSink,
               // stepMs rides in as a FAILURE signal, never as the user's cancel
               // signal: the inner pump reports a TimeoutError instead of
@@ -1470,7 +1488,7 @@ export function runStreamToolLoop(
         // honored.
         const plan = await planToolDispatch({
           calls: toolCalls,
-          tools,
+          tools: stepTools,
           options,
           messages,
           stepIndex,
@@ -1600,13 +1618,13 @@ export function runStreamToolLoop(
           // goes input-complete → error with no 'executing' in between (the
           // resume-settle path reports missing/denied results the same way).
           // A TRANSFER never executes either — it is not in `execCalls` at all.
-          if (!denied.has(c.toolCallId) && !isUnknownTool(tools, c.toolName)) {
+          if (!denied.has(c.toolCallId) && !isUnknownTool(stepTools, c.toolName)) {
             toolState(c.toolCallId, c.toolName, 'executing');
           }
         }
         let toolResults;
         try {
-          toolResults = await executeTools(execCalls, tools, options, messages, denied, extras);
+          toolResults = await executeTools(execCalls, stepTools, options, messages, denied, extras);
         } catch (err) {
           if (!(err instanceof SubAgentSuspension)) throw err;
           // A durable sub-agent suspended: the EXECUTED calls' tool_use stays

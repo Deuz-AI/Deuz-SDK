@@ -1,4 +1,4 @@
-import type { Adapter, AdapterRequest, BuildContext, ParseContext } from './types';
+import type { Adapter, AdapterRequest, BuildContext, ParseContext, WireTool } from './types';
 import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
 import type { Part } from '../types/message';
@@ -26,7 +26,11 @@ import {
 } from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
 import { replaysTo } from '../internal/reasoning';
-import { bindsThinkingToPrefix } from '../internal/stable-prefix';
+import {
+  bindsThinkingToPrefix,
+  toolSetChangeOf,
+  type ToolSetChange,
+} from '../internal/stable-prefix';
 import { acceptsDocuments, resolveMedia, warnDroppedDocument } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -208,6 +212,50 @@ function applyBlockBinding(
   return true;
 }
 
+// --- tool-set changes (2.3, F22) ---
+//
+// A request to a model that binds thinking to the prefix carries the same
+// `tools` array on every step; a step that offers another set appends a system
+// message whose change renders as `tool_removal` / `tool_addition` blocks
+// (@anthropic-ai/sdk 0.133.0 BetaRequestToolRemovalBlock /
+// BetaRequestToolAdditionBlock, one `role: 'system'` message as the SDK's own
+// tool runner sends them). A tool declared in `tools` with the same definition
+// is referenced by name; any other addition carries its definition inline.
+// Not live-verified.
+
+const TOOL_CHANGES_BETA = 'mid-conversation-tool-changes-2026-07-01';
+const INLINE_TOOLS_BETA = 'inline-tools-2026-09-15';
+
+/** A wire tool as a `tools` entry. */
+function toAnthropicTool(t: WireTool): Record<string, unknown> {
+  return t.provider
+    ? t.provider // provider-executed tool — raw native definition, verbatim
+    : {
+        name: t.name,
+        ...(t.description ? { description: t.description } : {}),
+        input_schema: t.parameters,
+      };
+}
+
+/** The blocks of a tool-set change: removals first, then additions, each in its order. */
+function toolChangeBlocks(change: ToolSetChange, declared: WireTool[]): AnthropicBlock[] {
+  const blocks: AnthropicBlock[] = change.remove.map((name) => ({
+    type: 'tool_removal',
+    tool: { type: 'tool_reference', name },
+  }));
+  for (const tool of change.add) {
+    const same = declared.find((t) => t.name === tool.name);
+    blocks.push({
+      type: 'tool_addition',
+      tool:
+        same && JSON.stringify(same) === JSON.stringify(tool)
+          ? { type: 'tool_reference', name: tool.name }
+          : { type: 'tool_definition', definition: toAnthropicTool(tool) },
+    });
+  }
+  return blocks;
+}
+
 /** `headers` with `beta` added to `anthropic-beta` (a caller's list is kept). */
 function withBeta(headers: Record<string, string>, beta: string): Record<string, string> {
   const key = Object.keys(headers).find((k) => k.toLowerCase() === 'anthropic-beta');
@@ -244,15 +292,20 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     logger: ctx.logger,
     warnings: ctx.warnings,
   };
+  // The tools the request declares: what a tool-set change may reference.
+  const declared = ctx.object?.strategy !== 'tool' ? (ctx.tools?.tools ?? []) : [];
   // Blocks keep the order the model produced them in (2.3, F21): thinking
   // between tool calls stays there, since a moved block is a modified prefix.
   const wireMessages = rest
-    .map((m) => ({
-      role: m.role === 'tool' ? 'user' : m.role,
-      content: m.content
+    .map((m) => {
+      const content = m.content
         .map((p) => partToBlock(p, media))
-        .filter((b): b is AnthropicBlock => b !== null),
-    }))
+        .filter((b): b is AnthropicBlock => b !== null);
+      // A tool-set change rides on a system message (2.3, F22).
+      const change = m.role === 'system' ? toolSetChangeOf(m) : undefined;
+      if (change) content.push(...toolChangeBlocks(change, declared));
+      return { role: m.role === 'tool' ? 'user' : m.role, content };
+    })
     // A mid-conversation system message with nothing to say is not sent.
     .filter((m) => m.role !== 'system' || m.content.length > 0);
 
@@ -369,15 +422,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   // cache, preserved thinking) stays the loop's. The tool strategy forces its
   // own call instead. Not live-verified.
   if (ctx.object?.strategy !== 'tool' && ctx.tools && ctx.tools.tools.length > 0) {
-    body.tools = ctx.tools.tools.map((t) =>
-      t.provider
-        ? t.provider // provider-executed tool — raw native definition, verbatim
-        : {
-            name: t.name,
-            ...(t.description ? { description: t.description } : {}),
-            input_schema: t.parameters,
-          },
-    );
+    body.tools = ctx.tools.tools.map(toAnthropicTool);
     body.tool_choice = mapAnthropicToolChoice(
       ctx,
       ctx.tools.toolChoice,
@@ -401,9 +446,19 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       m.role === 'assistant' &&
       m.content.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking'),
   );
-  const extraHeaders = applyBlockBinding(ctx, body, replaysThinking && bound)
+  let extraHeaders = applyBlockBinding(ctx, body, replaysThinking && bound)
     ? withBeta(call.headers, BLOCK_BINDING_BETA)
     : call.headers;
+  const changeBlocks = wireMessages
+    .filter((m) => m.role === 'system')
+    .flatMap((m) => m.content)
+    .filter((b) => b.type === 'tool_addition' || b.type === 'tool_removal');
+  if (changeBlocks.length > 0) {
+    extraHeaders = withBeta(extraHeaders, TOOL_CHANGES_BETA);
+    if (changeBlocks.some((b) => (b.tool as { type: string }).type === 'tool_definition')) {
+      extraHeaders = withBeta(extraHeaders, INLINE_TOOLS_BETA);
+    }
+  }
 
   applyProviderOptions(body, call.provider, options);
 

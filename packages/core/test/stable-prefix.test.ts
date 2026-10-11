@@ -21,6 +21,8 @@ import { promptInjectionGuard, wrapModel } from '../src/middleware';
 import { resolveInputMessages } from '../src/core/normalize';
 import type { CommonCallOptions } from '../src/types/config';
 import type { Message } from '../src/types/message';
+import type { ToolSet } from '../src/types/tool';
+import type { McpClient } from '../src/mcp/shared';
 import type { JSONSchema } from '../src/types/schema';
 import type { GenerateTextResult } from '../src/types/methods';
 import {
@@ -350,7 +352,8 @@ describe.each(LOOPS)('handoff on Claude 5.x (%s loop)', (loop) => {
     const [first, second] = claude.requests;
     expect(second!.system).toBe('You route customers.');
     expect(prefixBreak(withoutTools(first!), withoutTools(second!))).toBeUndefined();
-    expect(second!.messages.slice(-2)).toEqual([
+    // The target's tool set follows as a tool-set change (see the tool-set block below).
+    expect(second!.messages.slice(-3, -1)).toEqual([
       {
         role: 'user',
         content: [
@@ -379,7 +382,12 @@ describe.each(LOOPS)('handoff on Claude 5.x (%s loop)', (loop) => {
     });
     const second = claude.requests[1]!;
     expect(second.system).toBe('You route customers.');
-    expect(second.messages.at(-1)!.role).toBe('user');
+    const texts = second.messages.filter(
+      (m) =>
+        m.role === 'system' &&
+        (m.content as Array<{ type: string }>).some((b) => b.type === 'text'),
+    );
+    expect(texts).toEqual([]);
   });
 });
 
@@ -498,5 +506,275 @@ describe('`instructions` folds once over the whole leading system run', () => {
       { role: 'system', content: 'You are terse.' },
       ...history,
     ]);
+  });
+});
+
+// --- the tool set --------------------------------------------------------------
+
+const TOOL_CHANGES_BETA = 'mid-conversation-tool-changes-2026-07-01';
+const INLINE_TOOLS_BETA = 'inline-tools-2026-09-15';
+
+/** A tool that records its calls. */
+function spyTool(name: string, calls: string[]) {
+  return { parameters: OBJ, execute: async () => (calls.push(name), `${name}:ok`) };
+}
+
+const toolNames = (r: ClaudeRequest) => (r.tools ?? []).map((t) => t.name);
+const removal = (name: string) => ({
+  type: 'tool_removal',
+  tool: { type: 'tool_reference', name },
+});
+const addition = (name: string) => ({
+  type: 'tool_addition',
+  tool: { type: 'tool_reference', name },
+});
+
+describe.each(LOOPS)('prepareStep.activeTools on Claude 5.x (%s loop)', (loop) => {
+  it('the tools array never changes; each change rides as an appended tool-change message', async () => {
+    const ran: string[] = [];
+    const claude = scriptedClaude([
+      thinkThenCall('S0', 'tu_0', 'search'),
+      thinkThenCall('S1', 'tu_1', 'fetch'),
+      thinkThenAnswer('S2', 'Done.'),
+    ]);
+    await run(loop, {
+      model: claude.model,
+      messages: [{ role: 'user', content: 'Research it.' }],
+      tools: {
+        search: spyTool('search', ran),
+        fetch: spyTool('fetch', ran),
+        write: spyTool('write', ran),
+      },
+      maxSteps: 4,
+      prepareStep: ({ stepIndex }) =>
+        stepIndex === 0
+          ? { activeTools: ['search'] }
+          : stepIndex === 1
+            ? { activeTools: ['search', 'fetch'] }
+            : { toolChoice: 'none' },
+      deps: { clock },
+    });
+
+    const [r0, r1, r2] = claude.requests;
+    expect(claude.requests.map(toolNames)).toEqual([
+      ['search', 'fetch', 'write'],
+      ['search', 'fetch', 'write'],
+      ['search', 'fetch', 'write'],
+    ]);
+    expect(prefixBreaks(claude.requests)).toEqual([]);
+    expect(r0!.messages.at(-1)).toEqual({
+      role: 'system',
+      content: [removal('fetch'), removal('write')],
+    });
+    expect(r1!.messages.at(-1)).toEqual({ role: 'system', content: [addition('fetch')] });
+    expect(r2!.messages.at(-1)).toEqual({ role: 'system', content: [addition('write')] });
+    // tool_choice is outside the bound prefix: it may change freely.
+    expect(r2!.tool_choice).toEqual({ type: 'none' });
+    expect(claude.headers[0]!['anthropic-beta']).toContain(TOOL_CHANGES_BETA);
+    expect(claude.headers[0]!['anthropic-beta']).not.toContain(INLINE_TOOLS_BETA);
+    expect(ran).toEqual(['search', 'fetch']);
+  });
+
+  it('a static activeTools list is the tools array itself: no change message at all', async () => {
+    const claude = scriptedClaude([
+      thinkThenCall('S0', 'tu_0', 'search'),
+      thinkThenAnswer('S1', 'ok'),
+    ]);
+    const ran: string[] = [];
+    await run(loop, {
+      model: claude.model,
+      messages: [{ role: 'user', content: 'Research it.' }],
+      tools: { search: spyTool('search', ran), write: spyTool('write', ran) },
+      activeTools: ['search'],
+      maxSteps: 3,
+      deps: { clock },
+    });
+    expect(claude.requests.map(toolNames)).toEqual([['search'], ['search']]);
+    expect(claude.requests.flatMap((r) => r.messages).some((m) => m.role === 'system')).toBe(false);
+    expect(prefixBreaks(claude.requests)).toEqual([]);
+  });
+
+  it('a call to a withdrawn tool is answered like an unknown tool and never runs', async () => {
+    const ran: string[] = [];
+    const claude = scriptedClaude([
+      thinkThenCall('S0', 'tu_0', 'write'),
+      thinkThenAnswer('S1', 'Sorry.'),
+    ]);
+    await run(loop, {
+      model: claude.model,
+      messages: [{ role: 'user', content: 'Research it.' }],
+      tools: { search: spyTool('search', ran), write: spyTool('write', ran) },
+      maxSteps: 3,
+      prepareStep: () => ({ activeTools: ['search'] }),
+      deps: { clock },
+    });
+    expect(ran).toEqual([]);
+    expect(claude.requests[1]!.messages.at(-1)).toEqual({
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'tu_0',
+          content: 'No such tool: "write". Available tools: search.',
+          is_error: true,
+        },
+      ],
+    });
+  });
+});
+
+describe('a model that does not bind thinking keeps the 2.2 tools array', () => {
+  it('prepareStep.activeTools narrows the wire itself', async () => {
+    const claude = scriptedClaude(
+      [thinkThenCall('S0', 'tu_0', 'search'), thinkThenAnswer('S1', 'ok')],
+      'claude-opus-4-8',
+    );
+    await generateText({
+      model: claude.model,
+      messages: [{ role: 'user', content: 'Research it.' }],
+      tools: { search: spyTool('search', []), write: spyTool('write', []) },
+      maxSteps: 3,
+      prepareStep: ({ stepIndex }) => (stepIndex === 0 ? { activeTools: ['search'] } : {}),
+      deps: { clock },
+    });
+    expect(claude.requests.map(toolNames)).toEqual([['search'], ['search', 'write']]);
+  });
+});
+
+describe.each(LOOPS)('handoff tool set on Claude 5.x (%s loop)', (loop) => {
+  it('the root tools stay on the wire; the target set rides as changes', async () => {
+    const ran: string[] = [];
+    const claude = scriptedClaude([
+      thinkThenCall('S0', 'tu_0', 'transfer_to_billing'),
+      thinkThenCall('S1', 'tu_1', 'refund'),
+      thinkThenAnswer('S2', 'Refunded.'),
+    ]);
+    const billing = {
+      model: claude.model,
+      instructions: 'You handle billing.',
+      tools: { refund: spyTool('refund', ran) },
+    };
+    await run(loop, {
+      model: claude.model,
+      messages: [
+        { role: 'system', content: 'You route customers.' },
+        { role: 'user', content: 'I want a refund.' },
+      ],
+      tools: { ...handoff({ billing }), lookup: spyTool('lookup', ran) },
+      maxSteps: 4,
+      deps: { clock },
+    });
+
+    expect(prefixBreaks(claude.requests)).toEqual([]);
+    expect(claude.requests.map(toolNames)).toEqual([
+      ['transfer_to_billing', 'lookup'],
+      ['transfer_to_billing', 'lookup'],
+      ['transfer_to_billing', 'lookup'],
+    ]);
+    expect(claude.requests[1]!.messages.slice(-2)).toEqual([
+      { role: 'system', content: [{ type: 'text', text: 'You handle billing.' }] },
+      {
+        role: 'system',
+        content: [
+          removal('transfer_to_billing'),
+          removal('lookup'),
+          {
+            type: 'tool_addition',
+            tool: {
+              type: 'tool_definition',
+              definition: { name: 'refund', input_schema: OBJ },
+            },
+          },
+        ],
+      },
+    ]);
+    expect(claude.headers[1]!['anthropic-beta']).toContain(TOOL_CHANGES_BETA);
+    expect(claude.headers[1]!['anthropic-beta']).toContain(INLINE_TOOLS_BETA);
+    expect(ran).toEqual(['refund']);
+  });
+});
+
+// --- MCP catalog refresh ---------------------------------------------------------
+
+/** A hand-written MCP client whose catalog the test swaps (then announces list_changed). */
+function fakeMcp(names: string[]): McpClient & { publish(next: string[]): void } {
+  let current = [...names];
+  const listeners = new Set<() => void>();
+  const unsupported = (): Promise<never> => Promise.reject(new Error('not supported'));
+  return {
+    publish(next: string[]) {
+      current = [...next];
+      for (const listener of [...listeners]) listener();
+    },
+    listTools(namespace?: string) {
+      const set: ToolSet = {};
+      for (const name of current) {
+        set[namespace ? `${namespace}_${name}` : name] = {
+          parameters: OBJ,
+          execute: () => Promise.resolve(`mcp:${name}`),
+        };
+      }
+      return Promise.resolve(set);
+    },
+    callTool: (name: string) => Promise.resolve(`mcp:${name}`),
+    listResources: unsupported,
+    readResource: unsupported,
+    listPrompts: unsupported,
+    getPrompt: unsupported,
+    status: () => 'connected',
+    onToolListChanged(cb: () => void) {
+      listeners.add(cb);
+      return () => {
+        listeners.delete(cb);
+      };
+    },
+    close: () => Promise.resolve(),
+  } as McpClient & { publish(next: string[]): void };
+}
+
+describe.each(LOOPS)('MCP tools/list_changed on Claude 5.x (%s loop)', (loop) => {
+  it('the refreshed catalog rides as a tool-set change; the tools array stays', async () => {
+    const mcp = fakeMcp(['ping']);
+    const claude = scriptedClaude([
+      thinkThenCall('S0', 'tu_0', 'trigger'),
+      thinkThenCall('S1', 'tu_1', 'fresh'),
+      thinkThenAnswer('S2', 'Done.'),
+    ]);
+    await run(loop, {
+      model: claude.model,
+      messages: [{ role: 'user', content: 'Go.' }],
+      mcp: [mcp],
+      tools: {
+        trigger: {
+          parameters: OBJ,
+          execute: async () => {
+            mcp.publish(['ping', 'fresh']);
+            return 'ok';
+          },
+        },
+      },
+      maxSteps: 4,
+      deps: { clock },
+    });
+
+    expect(claude.requests.map(toolNames)).toEqual([
+      ['ping', 'trigger'],
+      ['ping', 'trigger'],
+      ['ping', 'trigger'],
+    ]);
+    expect(prefixBreaks(claude.requests)).toEqual([]);
+    expect(claude.requests[1]!.messages.at(-1)).toEqual({
+      role: 'system',
+      content: [
+        {
+          type: 'tool_addition',
+          tool: { type: 'tool_definition', definition: { name: 'fresh', input_schema: OBJ } },
+        },
+      ],
+    });
+    expect(claude.headers[1]!['anthropic-beta']).toContain(INLINE_TOOLS_BETA);
+    // The model could call it: it ran through the MCP client.
+    const answer = claude.requests[2]!.messages.at(-1)!;
+    expect(JSON.stringify(answer)).toContain('mcp:fresh');
   });
 });
