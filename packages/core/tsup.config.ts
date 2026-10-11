@@ -42,6 +42,7 @@ export default defineConfig({
     realtime: 'src/realtime/index.ts',
     batch: 'src/batch/index.ts',
     a2a: 'src/a2a/index.ts',
+    headless: 'src/node/headless.ts',
     video: 'src/video.ts',
     midjourney: 'src/midjourney.ts',
     yunwu: 'src/yunwu.ts',
