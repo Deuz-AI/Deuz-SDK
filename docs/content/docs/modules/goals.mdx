@@ -81,10 +81,10 @@ revision higher, and says what it did:
 | `'ignored'` | An event, a charge or a no-op the goal dropped; `reason` says why |
 | `'rejected'` | The goal refused the command; `reason` says why |
 
-Time comes first, whatever the outcome: once the deadline passed, the goal fails
-before the command applies, so `changed` can be true on any outcome. A `resume`
-after the deadline is `'rejected'` and an event `'ignored'`, both with reason
-`'terminal'` and the goal now failed. Save whenever `changed` is true, as above.
+Time comes first: once the deadline passed, the goal fails before the command
+applies, so `changed` can be true on any outcome. A `resume` after the deadline
+is `'rejected'` and an event `'ignored'`, both with reason `'terminal'` and the
+goal now failed. Save whenever `changed` is true, as above.
 
 A malformed record or command, an event meant for another goal, and an
 `expectedRevision` the record is not at throw a `GoalError` instead, with a
