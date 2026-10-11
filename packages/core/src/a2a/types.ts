@@ -462,7 +462,10 @@ export interface A2AClient {
 
 // --- handler -------------------------------------------------------------------
 
-/** Where a task lives: tasks of different tenants or owners never see each other. */
+/**
+ * Where a task lives. The task store keys tasks by it, so tasks of different
+ * tenants or owners never see each other.
+ */
 export interface A2ATaskScope {
   tenant?: string;
   /** The caller `options.owner` named. */
@@ -471,8 +474,14 @@ export interface A2ATaskScope {
 
 /**
  * Persistence for tasks. The handler loads a task before every change and
- * saves the whole task after it; `load` returns `undefined` for an unknown id.
- * Tasks are plain JSON.
+ * saves the whole task after it. Tasks are plain JSON.
+ *
+ * A store must keep tasks apart by scope: key each task by `scope.tenant`,
+ * `scope.owner` and the task id, so `load` returns `undefined` for an unknown
+ * id and for a task saved under another scope, and a save never replaces
+ * another scope's task. The handler does no ownership check of its own;
+ * tenant and `owner` isolation rest on the store (`createInMemoryA2ATaskStore`
+ * keys tasks this way).
  */
 export interface A2ATaskStore {
   load(taskId: string, scope: A2ATaskScope): A2ATask | undefined | Promise<A2ATask | undefined>;
@@ -501,14 +510,19 @@ export interface A2AArtifactOptions {
  * interaction has no `task` yet; the task is created by the first status or
  * artifact update (or never, when the executor answers with `reply`). A
  * message to an `INPUT_REQUIRED` or `AUTH_REQUIRED` task starts a new turn of
- * that task, with `task` set.
+ * that task, with `task` set and the message added to its history.
  *
  * The turn ends at `reply`, at a terminal state, at `INPUT_REQUIRED`, or when
  * `execute` settles; updates after that are rejected. If `execute` resolves
  * while the task is `SUBMITTED` or `WORKING` the task is completed; if it
- * throws, the task fails with the error's message — unless it throws an
- * `A2AError` before changing the task, which answers the request with that
- * error instead.
+ * resolves without a reply or an update, a new interaction answers
+ * `INVALID_AGENT_RESPONSE` and a follow-up turn answers with the task as it
+ * waits. If `execute` throws, the task fails with the error's message —
+ * unless it throws an `A2AError` of its own before changing the task, which
+ * answers the request with that error instead and leaves the task as it was
+ * (a follow-up message comes back out of its history). An `A2AError` a
+ * `createA2AClient` call threw is another agent's answer: it fails the task
+ * like any other error.
  */
 export interface A2AExecutionContext {
   /** The message that started this turn, with `taskId` and `contextId` filled in. */
@@ -574,7 +588,10 @@ export interface A2AExecutor {
   /**
    * Called before a task is canceled, whether or not a turn of it is running
    * here (an `INPUT_REQUIRED` task has none). Throw an `A2AError` with reason
-   * `'TASK_NOT_CANCELABLE'` to refuse. Do not wait for `execute` in here.
+   * `'TASK_NOT_CANCELABLE'` to refuse. Whatever it throws leaves the task
+   * uncanceled; anything but an `A2AError` of its own (one a
+   * `createA2AClient` call threw included) answers `INTERNAL_ERROR`. Do not
+   * wait for `execute` in here.
    */
   cancel?(context: A2ACancelContext): void | Promise<void>;
 }
@@ -591,10 +608,12 @@ export interface A2AHandlerOptions {
   taskStore?: A2ATaskStore;
   /**
    * Who is calling. Tasks are kept per owner (within a tenant), so a caller
-   * only ever sees, continues, cancels or subscribes to its own tasks; the
-   * executor gets it as `owner`. Return an identity you verified — a session,
-   * a checked token — never a header you did not check. Default: no owner,
-   * every caller shares the tasks (their random ids are the only key).
+   * only ever sees, continues, cancels or subscribes to its own tasks —
+   * provided the task store keys tasks by scope, as `A2ATaskStore` requires
+   * and the default store does. The executor gets it as `owner`. Return an
+   * identity you verified — a session, a checked token — never a header you
+   * did not check. Default: no owner, every caller shares the tasks (their
+   * random ids are the only key).
    */
   owner?: (request: Request) => string | undefined | Promise<string | undefined>;
   /** Default `/.well-known/agent-card.json`. */

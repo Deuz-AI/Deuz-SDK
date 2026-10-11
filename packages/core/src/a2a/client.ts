@@ -8,7 +8,7 @@
 import { AbortError, InvalidRequestError } from '../errors';
 import { parseSSE } from '../internal/sse';
 import { resolveDependencies } from '../internal/resolve-deps';
-import { A2AError } from './errors';
+import { A2AError, markRemote } from './errors';
 import {
   A2A_CONTENT_TYPE,
   A2A_EXTENSIONS_HEADER,
@@ -117,30 +117,37 @@ function errorMessage(error: Record<string, unknown>): string {
   return typeof error.message === 'string' ? error.message : 'A2A error';
 }
 
-/** A JSON-RPC `error` member as an `A2AError`. */
+/** A JSON-RPC `error` member as an `A2AError`, branded as another agent's. */
 function rpcError(error: Record<string, unknown>, statusCode: number): A2AError {
   const code = typeof error.code === 'number' ? error.code : undefined;
   const info = errorInfo(error.data);
-  return new A2AError({
-    kind: 'protocol',
-    message: errorMessage(error),
-    reason: info.reason ?? (code !== undefined ? reasonForRpcCode(code) : undefined) ?? 'UNKNOWN',
-    ...(code !== undefined ? { rpcCode: code } : {}),
-    statusCode,
-    ...(info.metadata ? { metadata: info.metadata } : {}),
-  });
+  return markRemote(
+    new A2AError({
+      kind: 'protocol',
+      message: errorMessage(error),
+      reason: info.reason ?? (code !== undefined ? reasonForRpcCode(code) : undefined) ?? 'UNKNOWN',
+      ...(code !== undefined ? { rpcCode: code } : {}),
+      statusCode,
+      ...(info.metadata ? { metadata: info.metadata } : {}),
+    }),
+  );
 }
 
-/** The `error` member of an HTTP+JSON error body (`google.rpc.Status`) as an `A2AError`. */
+/**
+ * The `error` member of an HTTP+JSON error body (`google.rpc.Status`) as an
+ * `A2AError`, branded as another agent's.
+ */
 function restError(error: Record<string, unknown>, statusCode: number): A2AError {
   const info = errorInfo(error.details);
-  return new A2AError({
-    kind: 'protocol',
-    message: errorMessage(error),
-    reason: info.reason ?? 'UNKNOWN',
-    statusCode,
-    ...(info.metadata ? { metadata: info.metadata } : {}),
-  });
+  return markRemote(
+    new A2AError({
+      kind: 'protocol',
+      message: errorMessage(error),
+      reason: info.reason ?? 'UNKNOWN',
+      statusCode,
+      ...(info.metadata ? { metadata: info.metadata } : {}),
+    }),
+  );
 }
 
 function isRpcErrorEnvelope(body: unknown): body is { error: Record<string, unknown> } {

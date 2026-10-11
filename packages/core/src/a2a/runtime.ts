@@ -10,7 +10,7 @@
  */
 import { AbortError, InvalidRequestError } from '../errors';
 import type { ResolvedDependencies } from '../types/deps';
-import { A2AError } from './errors';
+import { A2AError, isOwnProtocolError } from './errors';
 import { isTerminalState, toMessage, type A2AErrorReason } from './protocol';
 import type {
   A2AArtifact,
@@ -436,13 +436,33 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
     end(turn);
   }
 
-  /** The executor threw: an A2AError before any change answers the request, anything else fails the task. */
+  /**
+   * A follow-up message the executor refused before any update was never
+   * taken: it comes back out of the history `start` recorded it in.
+   */
+  function takeBack(turn: Turn): Promise<void> {
+    return withLock(turn.key, async () => {
+      if (turn.ended || turn.changed) return;
+      const stored = await store.load(turn.taskId, turn.scope);
+      const history = stored?.history ?? [];
+      const index = history.map((message) => message.messageId).lastIndexOf(turn.message.messageId);
+      if (!stored || index === -1) return;
+      const kept = history.filter((_message, position) => position !== index);
+      await store.save({ ...stored, history: kept }, turn.scope);
+    });
+  }
+
+  /**
+   * The executor threw: an A2AError of its own before any change answers the
+   * request, anything else (another agent's error included) fails the task.
+   */
   async function settleFailure(turn: Turn, error: unknown): Promise<void> {
     if (turn.ended) {
       if (!turn.controller.signal.aborted) report(error);
       return;
     }
-    if (error instanceof A2AError && error.kind === 'protocol' && !turn.changed) {
+    if (isOwnProtocolError(error) && !turn.changed) {
+      if (turn.started !== undefined) await takeBack(turn);
       fail(turn, error);
       return;
     }
@@ -513,6 +533,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
           );
         }
         const message: A2AMessage = { ...incoming, taskId, contextId: task.contextId };
+        // Taken back out (takeBack) if the executor refuses the message before any update.
         const next: A2ATask = { ...task, history: [...(task.history ?? []), message] };
         await store.save(next, scope);
         const continued = createTurn({

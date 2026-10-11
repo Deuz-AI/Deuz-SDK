@@ -12,6 +12,7 @@ import {
   type A2ASendMessageResponse,
   type A2AStreamResponse,
   type A2ATask,
+  type A2ATaskScope,
   type A2ATaskState,
   type A2ATaskStore,
 } from '../src/a2a';
@@ -86,13 +87,16 @@ test('an executor is a function or an object with execute and cancel', () => {
   createA2AHandler({ card });
 });
 
-test('a task store loads and saves plain tasks, synchronously or not', () => {
+test('a task store loads and saves plain tasks by scope, synchronously or not', () => {
   const tasks = new Map<string, A2ATask>();
+  // Keyed by scope and task id: tenant and owner isolation rest on the store.
+  const key = (taskId: string, scope: A2ATaskScope) =>
+    JSON.stringify([scope.tenant ?? null, scope.owner ?? null, taskId]);
   const store: A2ATaskStore = {
-    load: (taskId) => tasks.get(taskId),
+    load: (taskId, scope) => tasks.get(key(taskId, scope)),
     save: async (task, scope) => {
       expectTypeOf(scope.owner).toEqualTypeOf<string | undefined>();
-      tasks.set(task.id, task);
+      tasks.set(key(task.id, scope), task);
     },
   };
   void store;

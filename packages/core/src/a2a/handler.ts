@@ -7,7 +7,7 @@
  */
 import { InvalidRequestError } from '../errors';
 import { resolveDependencies } from '../internal/resolve-deps';
-import { A2AError } from './errors';
+import { isOwnProtocolError, type A2AError } from './errors';
 import {
   A2A_CONTENT_TYPE,
   A2A_ERROR_DOMAIN,
@@ -539,9 +539,12 @@ export function createA2AHandler(options: A2AHandlerOptions): A2AHandler {
     .filter((extension) => extension.required)
     .map((extension) => extension.uri);
 
-  /** A protocol error as itself; anything else is reported and answered as an internal error. */
+  /**
+   * A protocol error raised here as itself; anything else (another agent's
+   * error, say from `executor.cancel`) is reported and answered as an internal error.
+   */
   function asProtocolError(error: unknown): A2AError {
-    if (error instanceof A2AError && error.kind === 'protocol') return error;
+    if (isOwnProtocolError(error)) return error;
     report(error);
     return protocolError('INTERNAL_ERROR', 'The agent could not process the request.');
   }
