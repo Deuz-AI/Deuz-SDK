@@ -3,12 +3,15 @@ import type {
   AgentResult,
   AgentRunEnvelope,
   AgentRunOptions,
+  AgentRunReconcileOptions,
+  AgentRunReconciliation,
   AgentRunSession,
   AgentRunStore,
   AgentStream,
   AgentTool,
   AgentValidation,
 } from './types/agent-run';
+import type { ChatStore } from './chat';
 import type { CommonCallOptions } from './types/config';
 import type { StopDetails } from './types/methods';
 import type { Message } from './types/message';
@@ -35,6 +38,7 @@ import {
   buildWireTools,
   collectHandoffTools,
   durableResumeOf,
+  findHandoffTarget,
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
   filterWireTools,
@@ -69,6 +73,9 @@ import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
 import { assertCheckpointVersion } from './internal/checkpoint-version';
+import { withCapabilityOverride } from './internal/config-symbol';
+// Native chat, memory and fail-over (2.3): loaded on demand by the runs that use them.
+import { scopeKey } from './internal/native-scope';
 // Native run discovery and the run lease (2.3).
 import type { Clock } from './types/deps';
 import { claimNativeRunLease, type NativeRunLease } from './internal/agent-run-lease';
@@ -180,6 +187,33 @@ function assertAccountingContinuity(
   }
 }
 
+/**
+ * The envelope version a save writes (2.3): 2 once the run records state a 2.2
+ * reader would silently ignore (memory, transcript, chat, fail-over), else 1.
+ */
+function envelopeVersion(envelope: AgentRunEnvelope): 1 | 2 {
+  return envelope.memory || envelope.transcript || envelope.chat || envelope.models ? 2 : 1;
+}
+
+/** The chat's part of the native resume binding (2.3). */
+function chatBinding(chat: NonNullable<AgentRunOptions['chat']>): string {
+  return JSON.stringify([chat.chatId, scopeKey(chat.scope)]);
+}
+
+/** Native chat options must name their store, chat and owner before anything runs (2.3). */
+function assertChatOptions(chat: NonNullable<AgentRunOptions['chat']>): void {
+  if (
+    !chat ||
+    typeof chat !== 'object' ||
+    !chat.store ||
+    typeof chat.chatId !== 'string' ||
+    !chat.chatId ||
+    !chat.scope ||
+    typeof chat.scope !== 'object'
+  )
+    throw new TypeError('Native chat requires a store, a non-empty chatId and a scope.');
+}
+
 /** A model's part of the native resume binding. */
 function modelBinding(model: LanguageModel): string {
   return `${model.provider}/${model.surface}/${model.modelId}`;
@@ -275,6 +309,107 @@ export function createInMemoryAgentRunStore(
   };
 }
 
+/**
+ * Settle what a native run left behind after its outcome (2.3): write the chat
+ * projection again when the stored run says it is behind or its last write
+ * failed, and settle an extraction an interruption left pending (or that
+ * failed). An extraction whose records are in the memory store already, under
+ * its operation id, is recorded completed without another memory LLM call;
+ * otherwise it runs now. Only for a run that ended or is suspended: an active
+ * run settles these itself. The `chat` and `memory` scopes must be the run's.
+ * Rejects when the run is unknown, still running, or bound differently, and
+ * when a store write fails.
+ */
+export async function reconcileAgentRun(
+  options: AgentRunReconcileOptions,
+): Promise<AgentRunReconciliation> {
+  const { store, runId, scope } = options.session ?? ({} as Partial<AgentRunSession>);
+  if (!store || !runId || !scope)
+    throw new TypeError('reconcileAgentRun requires a session with a store, runId and scope.');
+  let active = activeNativeRuns.get(store);
+  if (active?.has(runId)) throw new TypeError('This native run already has an active executor.');
+  if (!active) {
+    active = new Set();
+    activeNativeRuns.set(store, active);
+  }
+  active.add(runId);
+  try {
+    const saved = await store.load(runId);
+    if (!saved) throw new TypeError(`Unknown native run: ${runId}`);
+    if (
+      saved.kind !== 'deuz-agent-run' ||
+      (saved.version !== 1 && saved.version !== 2) ||
+      saved.runId !== runId ||
+      saved.scope !== scope
+    )
+      throw new TypeError('Native checkpoint version, identity, or scope mismatch.');
+    if (saved.phase !== 'terminal' && saved.result?.status !== 'suspended')
+      throw new TypeError('reconcileAgentRun settles a run that ended or is suspended.');
+    if (
+      (options.chat && saved.binding?.chat !== chatBinding(options.chat)) ||
+      (options.memory && saved.binding?.memory !== scopeKey(options.memory.scope))
+    )
+      throw new TypeError('Native agent binding changed across resume.');
+    const deps = resolveDependencies(options.deps);
+    const envelope = structuredClone(saved);
+    const save = async (): Promise<void> => {
+      envelope.version = envelopeVersion(envelope);
+      envelope.revision = (envelope.revision ?? 0) + 1;
+      await store.save(structuredClone(envelope));
+    };
+    const outcome: AgentRunReconciliation = { runId };
+    if (options.chat && envelope.transcript) {
+      const nativeChat = await import('./internal/native-chat');
+      if (nativeChat.projectionBehind(envelope.transcript, envelope.chat)) {
+        envelope.chat = await nativeChat.saveProjection(
+          options.chat,
+          runId,
+          envelope.transcript,
+          envelope.chat,
+          Object.values(envelope.toolResults ?? {}),
+          deps.clock,
+        );
+        await save();
+        outcome.chat = envelope.chat.status;
+      } else outcome.chat = 'current';
+    }
+    const extraction = envelope.memory?.extraction;
+    if (options.memory && extraction && envelope.transcript) {
+      if (extraction.status !== 'completed') {
+        const nativeMemory = await import('./internal/native-memory');
+        const wrote = await nativeMemory.operationWrote(options.memory, extraction.operationId);
+        if (wrote > 0)
+          envelope.memory!.extraction = { ...extraction, status: 'completed', mutations: wrote };
+        else {
+          try {
+            const mutations = await nativeMemory.runExtraction(
+              options.memory,
+              nativeMemory.extractionTurns(envelope.transcript),
+              extraction,
+              runId,
+              deps.clock,
+              deps.logger,
+            );
+            envelope.memory!.extraction = { ...extraction, status: 'completed', mutations };
+          } catch (error) {
+            envelope.memory!.extraction = {
+              ...extraction,
+              status: 'failed',
+              error: errorData(error),
+            };
+          }
+        }
+        await save();
+      }
+      outcome.memory = envelope.memory!.extraction!.status;
+    }
+    return outcome;
+  } finally {
+    active.delete(runId);
+    if (active.size === 0) activeNativeRuns.delete(store);
+  }
+}
+
 export function runAgent<T = string>(options: AgentRunOptions<T>): Promise<AgentResult<T>> {
   return streamAgent(options).result;
 }
@@ -330,6 +465,21 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   let writeTail: Promise<void> = Promise.resolve();
   /** The run's MCP servers (2.3, F01), closed on every exit. */
   let nativeMcp: NativeMcp | undefined;
+  /** Chat and memory support (2.3), loaded when the run uses them. */
+  let nativeChat: typeof import('./internal/native-chat') | undefined;
+  let nativeMemory: typeof import('./internal/native-memory') | undefined;
+  /** Model fail-over (2.3): the routing of every model call, once `fallbackModels` is set. */
+  let router: import('./internal/native-fallback').ModelRouter | undefined;
+  /** The run's memory scope is claimed for its execution until the executor ends (2.3). */
+  let releaseMemoryScope: (() => void) | undefined;
+  /**
+   * A resume that found the run ended, or still waiting on its caller (2.3):
+   * it writes nothing of the run's own, but may repair a chat projection left
+   * behind. A resume refused for any reason writes nothing at all.
+   */
+  let repairable = false;
+  /** This leg completed the run, so it extracts (2.3); a terminal resume never does. */
+  let extractNow = false;
 
   let persistedLedger: string | undefined;
   // A child of a caller's shared ledger records only its own slice (2.2): the
@@ -349,6 +499,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     if (common?.execution) envelope.execution = executionSnapshot(common.execution);
     if (!options.session || !admitted) return Promise.resolve();
     persistedLedger = ledgerKey(envelope.execution);
+    envelope.version = envelopeVersion(envelope);
     // Every actual save advances the fence durable stores check (2.2).
     envelope.revision = (envelope.revision ?? 0) + 1;
     const snapshot = structuredClone(envelope);
@@ -363,6 +514,99 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     });
     writeTail.catch(() => {});
     return writeTail;
+  }
+
+  /**
+   * A save after the run's outcome is durable (2.3): the chat projection's
+   * acknowledgement or the extraction's outcome. It never fails the run: the
+   * outcome was committed before, and a lost write leaves the record behind
+   * for the next save or `reconcileAgentRun`. The revision advances only when
+   * the store took the write.
+   */
+  async function saveBookkeeping(): Promise<void> {
+    if (!options.session || persistFailed) return;
+    const snapshot = structuredClone(envelope);
+    snapshot.version = envelopeVersion(snapshot);
+    snapshot.revision = (envelope.revision ?? 0) + 1;
+    const write = writeTail.then(() => {
+      lease?.assertHeld();
+      return options.session!.store.save(snapshot);
+    });
+    writeTail = write.catch(() => {});
+    try {
+      await write;
+      envelope.revision = snapshot.revision;
+    } catch (error) {
+      resolveDependencies(options.deps).logger.error('native run bookkeeping save failed', {
+        runId: envelope.runId,
+        error,
+      });
+    }
+  }
+
+  /** A warning about the run's records (2.3), on the stream and in the log. */
+  function warnRecords(setting: 'chat' | 'memory', message: string, error?: unknown): void {
+    resolveDependencies(options.deps).logger.error(message, { runId: envelope.runId, error });
+    emitPart(
+      { type: 'warning', warning: { type: 'other', setting, message } },
+      envelope.phase === 'running' ? 'running' : 'finalizing',
+    );
+  }
+
+  /**
+   * After the outcome (2.3): project the chat (always after a leg that wrote,
+   * and as a repair when the projection is behind), then run the extraction a
+   * completed leg recorded as pending. Never throws.
+   */
+  async function settleRecords(): Promise<void> {
+    const deps = resolveDependencies(options.deps);
+    if (options.chat && envelope.transcript && nativeChat) {
+      if (admitted || nativeChat.projectionBehind(envelope.transcript, envelope.chat)) {
+        const state = await nativeChat.saveProjection(
+          options.chat,
+          envelope.runId,
+          envelope.transcript,
+          envelope.chat,
+          Object.values(envelope.toolResults ?? {}),
+          deps.clock,
+        );
+        envelope.chat = state;
+        if (state.status === 'failed')
+          warnRecords(
+            'chat',
+            `The chat projection of run ${envelope.runId} could not be saved (${state.error?.message ?? 'unknown error'}); the run's checkpoint is intact and the next save repairs it.`,
+            state.error,
+          );
+        else if (state.status === 'scope-mismatch')
+          warnRecords(
+            'chat',
+            `Chat ${options.chat.chatId} belongs to another scope; run ${envelope.runId} left it untouched.`,
+          );
+        await saveBookkeeping();
+      }
+    }
+    const extraction = envelope.memory?.extraction;
+    if (extractNow && extraction && options.memory && envelope.transcript && nativeMemory) {
+      try {
+        const mutations = await nativeMemory.runExtraction(
+          options.memory,
+          nativeMemory.extractionTurns(envelope.transcript),
+          extraction,
+          envelope.runId,
+          deps.clock,
+          deps.logger,
+        );
+        envelope.memory!.extraction = { ...extraction, status: 'completed', mutations };
+      } catch (error) {
+        envelope.memory!.extraction = { ...extraction, status: 'failed', error: errorData(error) };
+        warnRecords(
+          'memory',
+          `The memory extraction of run ${envelope.runId} failed (${errorData(error).message}); the run's outcome stands.`,
+          error,
+        );
+      }
+      await saveBookkeeping();
+    }
   }
 
   function base() {
@@ -455,24 +699,30 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           'Native runs use verify with verified/rejected/inconclusive; legacy completion hooks are unsupported.',
         );
       }
-      const unsupported = options as AgentRunOptions<T> &
-        Pick<CommonCallOptions, 'chat' | 'memory' | 'fallbackModels'>;
       if (
-        unsupported.chat !== undefined ||
-        unsupported.memory !== undefined ||
-        (unsupported.fallbackModels?.length ?? 0) > 0
-      ) {
-        throw new TypeError(
-          'Native runs do not yet support chat, memory, or fallbackModels; use the legacy APIs for these options.',
-        );
+        options.fallbackModels !== undefined &&
+        (!Array.isArray(options.fallbackModels) ||
+          options.fallbackModels.some((model) => !model || typeof model.modelId !== 'string'))
+      )
+        throw new TypeError('fallbackModels must be an array of models.');
+      const nativeFallback = options.fallbackModels?.length
+        ? await import('./internal/native-fallback')
+        : undefined;
+      // Chat and memory (2.3): their shape is checked before anything is read.
+      if (options.chat !== undefined) assertChatOptions(options.chat);
+      if (options.memory !== undefined) {
+        nativeMemory = await import('./internal/native-memory');
+        nativeMemory.assertMemoryOptions(options.memory);
       }
+      if (options.chat !== undefined || options.memory !== undefined)
+        nativeChat = await import('./internal/native-chat');
       if (resume) {
         if (!options.session) throw new TypeError('resumeAgent requires a native session.');
         const saved = await options.session.store.load(options.session.runId);
         if (!saved) throw new TypeError(`Unknown native run: ${options.session.runId}`);
         if (
           saved.kind !== 'deuz-agent-run' ||
-          saved.version !== 1 ||
+          (saved.version !== 1 && saved.version !== 2) ||
           saved.runId !== options.session.runId ||
           saved.scope !== options.session.scope
         )
@@ -504,6 +754,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           ...(lease ? { signal: lease.signal } : {}),
           tools: undefined,
           session: undefined,
+          // The run handles these itself (2.3); its loops never see them.
+          chat: undefined,
+          memory: undefined,
+          fallbackModels: undefined,
           messages: resume ? envelope.messages : options.messages,
           prompt: resume ? undefined : options.prompt,
           instructions: resume ? undefined : options.instructions,
@@ -546,6 +800,12 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         // The run owns this ledger, so its sub-agents report a warning once too.
         markRunLedger(common.execution.ledger);
       }
+      // A run under another native run's execution may only narrow its memory scope (2.3).
+      if (options.memory)
+        releaseMemoryScope = nativeMemory!.claimMemoryScope(
+          common.execution!,
+          options.memory.scope,
+        );
       // One warning sink for the whole run (2.3): the loop phases and every
       // finalization attempt report and stream each warning once.
       const runWarnings = createWarningSink(resolveDependencies(options.deps).logger);
@@ -605,6 +865,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           receipt.modelStep ??= envelope.modelSteps;
           envelope.toolResults[JSON.stringify([receipt.modelStep, receipt.toolCallId])] = receipt;
           envelope.messages = [...ctx.messages];
+          if (envelope.transcript) nativeChat!.foldHistory(envelope.transcript, envelope.messages);
           // Persist the in-flight tool-call history as well as its receipt so
           // canonical resume can settle that exact ID without another model call.
           const previous = envelope.checkpoints[envelope.runId];
@@ -639,6 +900,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         ),
         output: JSON.stringify(outputSchema ?? null),
         ...(options.bindingId !== undefined ? { revision: options.bindingId } : {}),
+        // The run's memory scope and chat (2.3): a resume may not change, add or drop them.
+        ...(options.memory ? { memory: scopeKey(options.memory.scope) } : {}),
+        ...(options.chat ? { chat: chatBinding(options.chat) } : {}),
+        // So are its fail-over candidates (2.3), in order.
+        ...(nativeFallback
+          ? { fallback: nativeFallback.fallbackBinding(options.fallbackModels!) }
+          : {}),
       };
       // Handoff targets (2.3) are compared on their own, and the MCP catalog
       // below, once the servers are reached: an envelope written before 2.3
@@ -654,12 +922,19 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           throw new TypeError('Native agent binding changed across resume.');
       }
       if (handoffs !== undefined) binding.handoffs = handoffs;
+      if (nativeFallback)
+        router = nativeFallback.createModelRouter(
+          options.fallbackModels!,
+          common.capabilities,
+          envelope.models,
+        );
       if (envelope.phase === 'terminal') {
         if (!envelope.result || envelope.result.status === 'suspended')
           throw new TypeError('Invalid native terminal checkpoint.');
         const terminal = envelope.result as AgentResult<T>;
         settledOutcome = terminal;
         terminalSaved = true;
+        repairable = true;
         return;
       }
       // MCP (2.3, F01): connected only now, after a terminal run has returned
@@ -734,6 +1009,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           pendingClientCalls: pendingClients,
         };
         settledOutcome = outcome;
+        repairable = true;
         return;
       }
       // A local tool shadows an MCP tool of the same name, as in the loop's merge.
@@ -775,6 +1051,30 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         settledOutcome = outcome;
         return;
       }
+      // Chat and memory (2.3). A new run recalls once, here, after every check
+      // and before its first save: the recall becomes part of the history every
+      // step and every resume sends. The transcript starts with the input; every
+      // later save of the history folds in its new turns first, so the stored
+      // transcript never lags the stored history.
+      if (!resume && (options.memory || options.chat)) {
+        const input = envelope.messages.length;
+        const internal: number[] = [];
+        if (options.memory) {
+          const { recall, message } = await nativeMemory!.recallOnce(
+            options.memory,
+            envelope.messages,
+            resolveDependencies(options.deps).logger,
+          );
+          if (message) {
+            recall.index = envelope.messages.length;
+            internal.push(recall.index);
+            envelope.messages = [...envelope.messages, message];
+            common.messages = envelope.messages;
+          }
+          envelope.memory = { scope: structuredClone(options.memory.scope), recall };
+        }
+        envelope.transcript = nativeChat!.createTranscript(envelope.messages, input, internal);
+      }
       admitted = true;
       if (options.execution && options.session) {
         removeLedgerPersistence = options.execution.ledger.addPersistence(() => {
@@ -797,6 +1097,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           if (checkpoint.runId === envelope.runId) {
             envelope.messages = checkpoint.messages;
             envelope.usage = checkpoint.usage;
+            if (envelope.transcript)
+              nativeChat!.foldHistory(envelope.transcript, envelope.messages);
           }
           await persist();
         },
@@ -887,6 +1189,72 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         };
       };
 
+      /**
+       * Fail a model call over (2.3): `failed` is the model the call went to,
+       * `intended` the one the run meant. Only a retryable error before the
+       * call's first content qualifies, and never once the run was cancelled or
+       * ran out of time. Records the fail-over and warns; the caller saves it.
+       */
+      const failOver = (
+        failed: LanguageModel,
+        intended: LanguageModel,
+        error: unknown,
+        phase: 'running' | 'finalizing',
+      ): boolean => {
+        if (!router || !nativeFallback?.failsOver(error)) return false;
+        if ((lease?.signal ?? options.signal)?.aborted) return false;
+        if (common.execution) {
+          try {
+            assertExecutionPolicy(common.execution, {
+              now: resolveDependencies(options.deps).clock.now(),
+            });
+          } catch {
+            return false;
+          }
+        }
+        const attempt = router.fail(failed, intended, errorData(error), envelope.modelSteps, phase);
+        if (!attempt) return false;
+        envelope.models = router.state(common.model);
+        const name = (ref: typeof attempt.model) => `${ref.provider}/${ref.modelId}`;
+        emitPart(
+          {
+            type: 'warning',
+            warning: {
+              type: 'other',
+              setting: 'fallbackModels',
+              message: `${name(attempt.model)} failed (${attempt.error.message}); the call went to ${name(attempt.next)}, which serves the rest of the run in its place.`,
+            },
+          },
+          phase,
+        );
+        return true;
+      };
+      /** A handoff target's model, by the target's name (2.3, for fail-over routing). */
+      const targetModel = (name: string): LanguageModel | undefined =>
+        findHandoffTarget(collectHandoffTools(common.tools ?? {}), name)?.def.model;
+
+      // The run's transcript (2.3) takes each loop leg's raw history: the loop's
+      // own chat persistence, pointed at the envelope. A resume leg starts from
+      // the transcript, so a compacted history never shortens it.
+      const transcriptChat: CommonCallOptions['chat'] = envelope.transcript
+        ? {
+            chatId: envelope.runId,
+            scope: { runId: envelope.runId },
+            store: {
+              loadChat: (chatId) => ({
+                chatId,
+                scope: { runId: envelope.runId },
+                messages: [...envelope.transcript!.messages],
+                updatedAt: 0,
+              }),
+              saveChat: (record) => {
+                envelope.transcript!.messages = [...record.messages];
+                envelope.transcript!.synced = nativeChat!.syncPoint(envelope.messages);
+              },
+            } satisfies ChatStore,
+          }
+        : undefined;
+
       // Structured-only runs go straight to finalization. Runs with tools/MCP
       // traverse the canonical loop first; no tool executor exists here.
       const hasLoopTools = Object.keys(common.tools).length > 0 || (options.mcp?.length ?? 0) > 0;
@@ -922,56 +1290,126 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         } else {
           if (!(await checkLimit())) return;
           events.push({ type: 'phase', phase: 'running' });
+          // A leg whose model call failed over (2.3) runs again from the run's
+          // last checkpoint, so only that call is repeated; without one, from
+          // the history the first leg started with.
+          const legInput = common.messages;
           let snapshot: StreamToolLoopSnapshot | undefined;
-          const before = envelope.modelSteps;
-          const inner = runStreamToolLoop(
-            {
-              ...common,
-              maxSteps: maxSteps - before,
-              guardrails: { ...options.guardrails, onOutput: undefined },
-              session: { store: checkpointStore, runId: envelope.runId, durability: 'strict' },
-              approvalResponses: resume
-                ? (options.approvalResponses ?? [])
-                : options.approvalResponses,
-            },
-            {
-              ...(resume && checkpoint
-                ? {
-                    resumeFrom: durableResumeOf(checkpoint),
-                    resumeHandoff: checkpoint.handoff,
-                  }
-                : {}),
-              onSnapshot: (value) => {
-                snapshot = value;
+          let loop: StreamToolLoopSnapshot;
+          for (;;) {
+            snapshot = undefined;
+            const before = envelope.modelSteps;
+            const legCheckpoint = envelope.checkpoints[envelope.runId];
+            // Fail-over routing (2.3), by the loop's step index: the model each
+            // step meant and the one it went to, and which steps produced
+            // content. The loop runs ahead of this reader, so nothing here may
+            // depend on when a part is read.
+            const routes = new Map<number, { intended: LanguageModel; called: LanguageModel }>();
+            const contentSteps = new Set<number>();
+            let lastStep: number | undefined;
+            let heldError: StreamPart | undefined;
+            // A `prepareStep` model outranks a handoff target's (the loop saves
+            // the active target in each checkpoint), which outranks the root
+            // model; the call goes to that model's routed candidate.
+            const prepareStep: CommonCallOptions['prepareStep'] = router
+              ? async (context) => {
+                  const prepared = common.prepareStep
+                    ? await common.prepareStep(context)
+                    : undefined;
+                  const transfer = envelope.checkpoints[envelope.runId]?.handoff;
+                  const target = transfer ? targetModel(transfer.to) : undefined;
+                  const intended = prepared?.model ?? target ?? common.model;
+                  const routed = router!.route(intended) ?? intended;
+                  routes.set(context.stepIndex, { intended, called: routed });
+                  return routed === intended ? prepared : { ...prepared, model: routed };
+                }
+              : common.prepareStep;
+            const inner = runStreamToolLoop(
+              {
+                ...common,
+                // The root model's routed candidate (2.3) also drives what the
+                // loop calls on its own, such as compaction summaries.
+                ...(router ? { model: router.route(common.model) ?? common.model } : {}),
+                ...(legCheckpoint ? {} : { messages: legInput }),
+                maxSteps: maxSteps - before,
+                guardrails: { ...options.guardrails, onOutput: undefined },
+                session: { store: checkpointStore, runId: envelope.runId, durability: 'strict' },
+                ...(transcriptChat ? { chat: transcriptChat } : {}),
+                ...(prepareStep ? { prepareStep } : {}),
+                approvalResponses: resume
+                  ? (options.approvalResponses ?? [])
+                  : options.approvalResponses,
               },
-              onCheckpoint: (value) => {
-                envelope.loopOutcome = {
-                  finishReason: value.finishReason,
-                  endReason: value.endReason,
-                  stoppedBy: value.stoppedBy,
-                  ...(value.stopDetails ? { stopDetails: value.stopDetails } : {}),
-                };
-                envelope.pendingClientCalls = value.pendingClientCalls;
+              {
+                ...(legCheckpoint
+                  ? {
+                      resumeFrom: durableResumeOf(legCheckpoint),
+                      resumeHandoff: legCheckpoint.handoff,
+                    }
+                  : {}),
+                onSnapshot: (value) => {
+                  snapshot = value;
+                },
+                onCheckpoint: (value) => {
+                  envelope.loopOutcome = {
+                    finishReason: value.finishReason,
+                    endReason: value.endReason,
+                    stoppedBy: value.stoppedBy,
+                    ...(value.stopDetails ? { stopDetails: value.stopDetails } : {}),
+                  };
+                  envelope.pendingClientCalls = value.pendingClientCalls;
+                },
+                ...(nativeMcp
+                  ? { mcp: { runtime: nativeMcp.runtime, refreshed: recordCatalog } }
+                  : {}),
+                warnings: runWarnings,
               },
-              ...(nativeMcp
-                ? { mcp: { runtime: nativeMcp.runtime, refreshed: recordCatalog } }
-                : {}),
-              warnings: runWarnings,
-            },
-          );
-          for await (const part of inner.fullStream) {
-            if (part.type === 'step-start') envelope.modelSteps++;
-            if (part.type === 'step-finish') envelope.usage = sumUsage(envelope.usage, part.usage);
-            emitPart(part, 'running');
+            );
+            for await (const part of inner.fullStream) {
+              if (part.type === 'step-start') {
+                envelope.modelSteps++;
+                lastStep = part.stepIndex;
+              }
+              if (part.type === 'step-finish')
+                envelope.usage = sumUsage(envelope.usage, part.usage);
+              if (
+                lastStep !== undefined &&
+                (part.type === 'text-delta' ||
+                  part.type === 'reasoning-delta' ||
+                  part.type === 'tool-call-delta' ||
+                  part.type === 'tool-call')
+              )
+                contentSteps.add(lastStep);
+              // Held back while a fail-over may still answer it (2.3).
+              if (part.type === 'error' && router) {
+                heldError = part;
+                continue;
+              }
+              emitPart(part, 'running');
+            }
+            await inner.consume?.();
+            if (!snapshot) throw new Error('Canonical loop did not produce a terminal snapshot.');
+            loop = snapshot as StreamToolLoopSnapshot;
+            envelope.messages = loop.messages;
+            envelope.usage = loop.cumulativeUsage;
+            common.messages = loop.messages;
+            currentText = lastAssistantText(loop.messages);
+            if (loop.error === undefined) break;
+            // The failed step is the last one the loop started; a failure
+            // before its model call (no route yet) never fails over.
+            const route = lastStep === undefined ? undefined : routes.get(lastStep);
+            if (
+              route &&
+              !contentSteps.has(lastStep!) &&
+              failOver(route.called, route.intended, loop.error, 'running')
+            ) {
+              await persist();
+              if (!(await checkLimit())) return;
+              continue;
+            }
+            if (heldError) emitPart(heldError, 'running');
+            throw loop.error;
           }
-          await inner.consume?.();
-          if (!snapshot) throw new Error('Canonical loop did not produce a terminal snapshot.');
-          const loop = snapshot as StreamToolLoopSnapshot;
-          envelope.messages = loop.messages;
-          envelope.usage = loop.cumulativeUsage;
-          common.messages = loop.messages;
-          currentText = lastAssistantText(loop.messages);
-          if (loop.error !== undefined) throw loop.error;
           if (loop.pendingApprovals.length || loop.pendingClientCalls.length) {
             envelope.pendingClientCalls = loop.pendingClientCalls;
             await finish({
@@ -1004,6 +1442,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           return;
         }
         envelope.messages = input.messages;
+        // A guardrail may have rewritten the history: the transcript keeps the raw input.
+        if (envelope.transcript)
+          envelope.transcript.synced = nativeChat!.syncPoint(envelope.messages);
       }
 
       envelope.phase = 'finalizing';
@@ -1023,7 +1464,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             resolveDependencies(options.deps).logger,
           )
         : undefined;
-      const finalModel = finalAgent?.model ?? common.model;
+      // The caller's `capabilities` override follows the target's model (2.3, F26).
+      const finalModel = finalAgent
+        ? withCapabilityOverride(finalAgent.model, common.capabilities)
+        : common.model;
       // Finalization is one more turn of the same conversation (2.3, F15). It
       // keeps the loop's tools on the wire, with `tool_choice: 'none'`, so the
       // request prefix (prompt cache, preserved thinking) is the loop's own. A
@@ -1057,8 +1501,12 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           // The request must end with a user turn: one that ends with the
           // assistant's own answer is a prefill, which Claude 5.x models reject.
           // Appended once and persisted below, so a resumed attempt reuses it.
-          if (envelope.messages.at(-1)?.role === 'assistant')
-            envelope.messages = [...envelope.messages, { role: 'user', content: FINALIZE_PROMPT }];
+          if (envelope.messages.at(-1)?.role === 'assistant') {
+            const prompt: Message = { role: 'user', content: FINALIZE_PROMPT };
+            envelope.messages = [...envelope.messages, prompt];
+            if (envelope.transcript)
+              nativeChat!.appendTurn(envelope.transcript, prompt, envelope.messages, true);
+          }
           const attempt = envelope.finalizationAttempts++;
           envelope.outputAttempts = (envelope.outputAttempts ?? 0) + 1;
           envelope.modelSteps++;
@@ -1066,10 +1514,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           // call consumes an attempt; resume never repeats completed tool work.
           await persist();
           const output = options.output;
+          // A model that failed over (2.3) is not called again: the request,
+          // its profile and the object strategy are the routed model's own.
+          const callModel = router?.route(finalModel) ?? finalModel;
           const strategy = output
             ? pickObjectStrategy(
-                { model: finalModel, mode: output.mode, effort: common.effort },
-                getCapabilities(finalModel, undefined, common.capabilities),
+                { model: callModel, mode: output.mode, effort: common.effort },
+                getCapabilities(callModel, undefined, common.capabilities),
               )
             : undefined;
           const toolRequest = await finalizeToolRequest();
@@ -1077,7 +1528,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           const inner = runStream(
             {
               ...common,
-              model: finalModel,
+              model: callModel,
               messages: envelope.messages,
               prompt: undefined,
               instructions: undefined,
@@ -1112,6 +1563,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           let lastDraft: string | undefined;
           let elementCount = 0;
           let streamError: unknown;
+          let heldError: StreamPart | undefined;
+          let content = false;
           let finishMeta: Record<string, unknown> | undefined;
           const publishDraft = async (): Promise<void> => {
             if (!output) return;
@@ -1145,8 +1598,21 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             }
           };
           for await (const part of inner.fullStream) {
+            if (part.type === 'error') {
+              streamError = part.error;
+              // Held back while a fail-over may still answer it (2.3).
+              if (router) {
+                heldError = part;
+                continue;
+              }
+            }
             emitPart(part, 'finalizing');
-            if (part.type === 'error') streamError = part.error;
+            if (
+              part.type === 'text-delta' ||
+              part.type === 'reasoning-delta' ||
+              part.type === 'tool-call-delta'
+            )
+              content = true;
             if (part.type === 'finish') finishMeta = part.providerMetadata;
             if (part.type === 'reasoning-delta') turn.reasoning(part);
             if (part.type === 'text-delta' && strategy !== 'tool') {
@@ -1169,7 +1635,17 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           } catch {
             /* transport error below */
           }
-          if (streamError !== undefined) throw streamError;
+          if (streamError !== undefined) {
+            if (!content && failOver(callModel, finalModel, streamError, 'finalizing')) {
+              // The failed call does not use up a repair attempt; it stays counted
+              // as a model step and a finalization attempt.
+              envelope.outputAttempts = Math.max(0, (envelope.outputAttempts ?? 1) - 1);
+              await persist();
+              continue;
+            }
+            if (heldError) emitPart(heldError, 'finalizing');
+            throw streamError;
+          }
           // A request that rides the loop's tools is a loop-style call, so the
           // per-request cost part is ours to emit: the run's cumulative cost,
           // exactly as the loop reports it after each step.
@@ -1210,7 +1686,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               ? { role: 'assistant', content: buffer }
               : turn.assemble(new Map(), []).assistantMessage;
           if (phase && strategy !== 'tool') answer.providerMetadata = { openai: { phase } };
-          if (!isBlankTurn(answer)) envelope.messages = [...envelope.messages, answer];
+          if (!isBlankTurn(answer)) {
+            envelope.messages = [...envelope.messages, answer];
+            if (envelope.transcript)
+              nativeChat!.appendTurn(envelope.transcript, answer, envelope.messages);
+          }
           await persist();
         }
         currentText = envelope.candidateText;
@@ -1224,10 +1704,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             await stopped('invalid-output');
             return;
           }
-          envelope.messages.push({
+          const repair: Message = {
             role: 'user',
             content: `The final output failed validation: ${errorData(error).message}. Return a corrected final output.`,
-          });
+          };
+          envelope.messages.push(repair);
+          if (envelope.transcript)
+            nativeChat!.appendTurn(envelope.transcript, repair, envelope.messages, true);
           delete envelope.candidateText;
           await persist();
           continue;
@@ -1249,8 +1732,17 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             envelope.messages = isBlankTurn(rewritten)
               ? envelope.messages.slice(0, -1)
               : [...envelope.messages.slice(0, -1), rewritten];
+            if (envelope.transcript)
+              nativeChat!.replaceLastTurn(
+                envelope.transcript,
+                isBlankTurn(rewritten) ? undefined : rewritten,
+                envelope.messages,
+              );
           } else if (currentText) {
-            envelope.messages = [...envelope.messages, { role: 'assistant', content: currentText }];
+            const answer: Message = { role: 'assistant', content: currentText };
+            envelope.messages = [...envelope.messages, answer];
+            if (envelope.transcript)
+              nativeChat!.appendTurn(envelope.transcript, answer, envelope.messages);
           }
           envelope.candidateText = currentText;
         }
@@ -1308,11 +1800,14 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               await stopped('verification-attempts-exhausted');
               return;
             }
-            envelope.messages.push({
+            const feedback: Message = {
               role: 'user',
               content:
                 verdict.feedback ?? 'The output was rejected. Produce a corrected final answer.',
-            });
+            };
+            envelope.messages.push(feedback);
+            if (envelope.transcript)
+              nativeChat!.appendTurn(envelope.transcript, feedback, envelope.messages, true);
             delete envelope.candidateText;
             // Repair budget applies to each verifier candidate, while modelSteps
             // and verificationAttempts remain cumulative and strictly bounded.
@@ -1320,6 +1815,17 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             await persist();
             continue;
           }
+        }
+        // The extraction is recorded as pending in the terminal commit itself
+        // (2.3): nothing is written to memory before the outcome is durable, and
+        // its own outcome follows in a later save.
+        if (options.memory && envelope.memory && nativeMemory!.extracts(options.memory)) {
+          envelope.memory.extraction = {
+            operationId: resolveDependencies(options.deps).generateId(),
+            status: 'pending',
+            infer: nativeMemory!.infers(options.memory),
+          };
+          extractNow = true;
         }
         await finish({ ...base(), status: 'completed', output: accepted });
         return;
@@ -1343,6 +1849,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         settledOutcome = failed;
       }
     } finally {
+      // Chat projection and extraction (2.3), after the outcome and never in
+      // place of it: a failed durable commit publishes neither.
+      if (settledOutcome && (admitted || repairable) && !persistFailed) await settleRecords();
+      releaseMemoryScope?.();
       await nativeMcp?.close();
       removeLedgerPersistence?.();
       // The lease goes back before the in-process claim, so the next executor

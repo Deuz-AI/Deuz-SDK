@@ -488,13 +488,19 @@ describe('native agent execution', () => {
     expect(JSON.stringify(requests()[1])).toContain('prepared context');
   });
 
-  it('fails closed on unsupported native options instead of silently ignoring them', async () => {
+  it('fails closed on malformed memory or chat options instead of silently ignoring them', async () => {
     const { model, fetch } = mocked([{ text: 'unused' }]);
-    const result = await runAgent({ model, prompt: 'x', memory: {} } as unknown as AgentRunOptions);
-    expect(result).toMatchObject({
-      status: 'failed',
-      error: { message: expect.stringContaining('do not yet support') },
-    });
+    for (const malformed of [{ memory: {} }, { chat: { chatId: 'c' } }]) {
+      const result = await runAgent({
+        model,
+        prompt: 'x',
+        ...malformed,
+      } as unknown as AgentRunOptions);
+      expect(result).toMatchObject({
+        status: 'failed',
+        error: { message: expect.stringMatching(/Native (memory|chat) requires/) },
+      });
+    }
     expect(fetch).not.toHaveBeenCalled();
   });
 });

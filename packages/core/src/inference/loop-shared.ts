@@ -48,6 +48,7 @@ import {
   type CompactionEvent,
 } from './compaction';
 import { createTokenEstimator, type TokenEstimator } from '../internal/estimate-tokens';
+import { withCapabilityOverride } from '../internal/config-symbol';
 import { attachClientContext, readClientContext } from '../internal/client-context';
 // Type-only: the sink itself is created by the loop (or not at all), so nothing
 // from internal/warnings.ts is pulled into a bundle that never collects one.
@@ -1030,6 +1031,11 @@ export async function applyPrepareStep(
     if (ps.activeTools) wire = filterWireTools(fullWire, ps.activeTools, logger, warnings);
     if (ps.toolChoice) wire = { ...wire, toolChoice: ps.toolChoice };
   }
+  // The per-call `capabilities` override follows every model a step resolves to
+  // (2.3, F26): a `prepareStep` model, or a handoff target's, which arrives here
+  // as `options.model`. The root model carries it already; the merge is idempotent.
+  const model = withCapabilityOverride(stepOptions.model, options.capabilities);
+  if (model !== stepOptions.model) stepOptions = { ...stepOptions, model };
   return { options: stepOptions, messages, wire };
 }
 

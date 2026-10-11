@@ -4,6 +4,9 @@
  * `isRetryable`. Errors deliberately DO NOT carry raw request headers/bodies and
  * never put a raw `Request`/`Headers` in `cause` — that would leak the API key.
  */
+import type { StopDetails } from './types/methods';
+import type { FinishReason } from './types/usage';
+
 const DEUZ_ERROR_BRAND = Symbol.for('@deuz-sdk/core/DeuzError');
 
 export interface DeuzErrorJSON {
@@ -42,6 +45,7 @@ export abstract class DeuzError extends Error {
       'runId',
       'mime',
       'serverUrl',
+      'finishReason',
     ] as const;
     const self = this as unknown as Record<string, unknown>;
     for (const field of safeFields) {
@@ -261,9 +265,26 @@ export class NoObjectGeneratedError extends DeuzError {
   readonly code = 'no_object_generated';
   /** The raw model text that failed to parse/validate (model output, not secret). */
   readonly text?: string;
-  constructor(message: string, options?: { text?: string; cause?: unknown }) {
+  /**
+   * How the last attempt ended (2.3), e.g. `'content_filter'` when the model
+   * refused or `'length'` when it was cut off: why no object came back.
+   */
+  readonly finishReason?: FinishReason;
+  /** The provider's explanation of the last attempt's stop (2.3), e.g. a refusal's category. */
+  readonly stopDetails?: StopDetails;
+  constructor(
+    message: string,
+    options?: {
+      text?: string;
+      cause?: unknown;
+      finishReason?: FinishReason;
+      stopDetails?: StopDetails;
+    },
+  ) {
     super(message, { cause: options?.cause });
     this.text = options?.text;
+    if (options?.finishReason !== undefined) this.finishReason = options.finishReason;
+    if (options?.stopDetails !== undefined) this.stopDetails = options.stopDetails;
   }
 }
 

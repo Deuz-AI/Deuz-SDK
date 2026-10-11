@@ -1353,6 +1353,13 @@ export interface ChatRecord {
   parentId?: string;
   /** `deps.clock.now()` at save time. */
   updatedAt: number;
+  /**
+   * A stable id per message, aligned with `messages` (2.3). A native run's
+   * projection writes it: a message keeps its id from one run to the next,
+   * and a message of a run is `<runId>:<n>`. Optional: the legacy loops do
+   * not set it, and a store that drops it only loses the ids.
+   */
+  messageIds?: string[];
 }
 
 /**

@@ -15,6 +15,10 @@ import type { BudgetTotals, ExecutionContextSnapshot, NativeExecutionContext } f
 import type { FinishReason } from './usage';
 import type { StopDetails } from './methods';
 import type { LeaseProvider } from './lease';
+import type { LanguageModel, ModelSurface } from './model';
+import type { Dependencies } from './deps';
+import type { ChatPersistOptions } from '../chat';
+import type { MemoryCallOptions, MemoryScope } from '../memory';
 
 /** A validator returns its validated (possibly transformed) value or throws. */
 export type AgentValidator<T> = (value: unknown) => T | Promise<T>;
@@ -146,7 +150,13 @@ export type AgentResult<T = string> = AgentResultBase &
 /** Native persistence is deliberately separate from legacy AgentCheckpoint v1. */
 export interface AgentRunEnvelope {
   kind: 'deuz-agent-run';
-  version: 1;
+  /**
+   * `2` (2.3) when the envelope records run memory, a chat projection or model
+   * fail-over (`memory`, `transcript`, `chat`, `models`): a 2.2 reader knows none
+   * of them, so it refuses the run instead of resuming it without them. Every
+   * other envelope stays `1`. Readers accept both.
+   */
+  version: 1 | 2;
   runId: string;
   /**
    * Increases by one on every save (2.2). Durable stores reject a save that is
@@ -186,6 +196,22 @@ export interface AgentRunEnvelope {
      * before 2.3 and for runs without targets; resume then records them.
      */
     handoffs?: string;
+    /**
+     * The run's memory scope (2.3), as JSON: absent for a run without `memory`.
+     * Resume rejects a changed, added or removed scope.
+     */
+    memory?: string;
+    /**
+     * The run's chat (2.3): its `chatId` and scope, as JSON; absent without
+     * `chat`. Resume rejects a changed, added or removed chat.
+     */
+    chat?: string;
+    /**
+     * The run's `fallbackModels` (2.3), as JSON: each candidate's provider,
+     * protocol and model id, in order; absent without fail-over. Resume rejects
+     * a changed list.
+     */
+    fallback?: string;
   };
   limits?: { maxSteps: number; maxOutputAttempts: number; maxVerifyAttempts: number };
   loopOutcome?: {
@@ -198,6 +224,160 @@ export interface AgentRunEnvelope {
   toolResults?: Record<string, AgentToolReceipt>;
   pendingClientCalls?: ToolCall[];
   result?: AgentResult<unknown>;
+  /** Run memory (2.3): the recall the run was given and its extraction. */
+  memory?: AgentRunMemoryState;
+  /**
+   * The run's user-facing transcript (2.3), kept for `chat` and `memory`: the
+   * caller's input, then the run's assistant and tool turns as they happened.
+   * Append-only, so compaction or a `prepareStep` history never rewrites it.
+   */
+  transcript?: AgentRunTranscript;
+  /** Where the run's chat projection stands (2.3). */
+  chat?: AgentRunChatState;
+  /** Model fail-over (2.3): which models failed and which one the run calls now. */
+  models?: AgentRunModelState;
+}
+
+/** A model a native run called (2.3): who serves it, over which protocol. */
+export interface AgentRunModelRef {
+  provider: string;
+  /** The wire protocol (`LanguageModel.surface`). */
+  protocol: ModelSurface;
+  modelId: string;
+}
+
+/** One fail-over of a native run (2.3): a model call that failed and where it went next. */
+export interface AgentRunModelAttempt {
+  /** 1 for the run's first fail-over, counting up. */
+  attempt: number;
+  /** The model whose call failed; the run never calls it again. */
+  model: AgentRunModelRef;
+  /** The model the call went to instead. */
+  next: AgentRunModelRef;
+  /** The run's model step the failed call was. */
+  modelStep: number;
+  phase: 'running' | 'finalizing';
+  /** The retryable error that triggered it. */
+  error: { name: string; message: string; code?: string };
+}
+
+/** Model fail-over state of a native run (2.3). */
+export interface AgentRunModelState {
+  /**
+   * The fail-over rules the record was written under: `1` (2.3). A call fails
+   * over only on a retryable transport or provider error before its first
+   * content (network, transport timeout, 5xx, 429/529 after the call's own
+   * retries, an open breaker); never on a refusal, a policy, budget or
+   * validation rejection, or after content.
+   */
+  policy: 1;
+  /** The model the run's own calls go to now: `model` until it failed over. */
+  selected: AgentRunModelRef;
+  /** Every fail-over so far, in order. */
+  attempts: AgentRunModelAttempt[];
+}
+
+/** The run's user-facing transcript (2.3); see `AgentRunEnvelope.transcript`. */
+export interface AgentRunTranscript {
+  messages: Message[];
+  /** How many leading messages are the caller's input. */
+  input: number;
+  /**
+   * The turns the SDK wrote among `messages`, by index: the recall message, the
+   * finalization prompt, output-repair and verifier feedback. The chat gets
+   * them like every other turn (the next run replays the exact prefix the
+   * model's thinking is bound to); memory extraction leaves them out.
+   */
+  internal: number[];
+  /**
+   * How far the run's checkpointed history has been folded in: its length and
+   * a fingerprint of its last message. An interrupted leg's turns are folded in
+   * from the checkpoint on resume when the history was not rewritten meanwhile.
+   */
+  synced: { length: number; last?: string };
+}
+
+/** The recall a native run was given (2.3), once, before its first model call. */
+export interface AgentRunRecall {
+  /**
+   * `'recalled'`: memories were found and appended at `index` as a
+   * `role: 'system'` message; `'empty'`: none matched; `'failed'`: the store or
+   * embedder failed and the run went on without (best-effort, as in the legacy
+   * loops); `'skipped'`: `recall: false`, or no user text to query with.
+   */
+  status: 'recalled' | 'empty' | 'failed' | 'skipped';
+  /** The recall message's index in `messages` and in the transcript. */
+  index?: number;
+  /** How many memories it carries. */
+  count?: number;
+}
+
+/**
+ * The extraction of a completed native run (2.3), tracked apart from the run's
+ * own outcome: `'pending'` is written with the terminal commit, before any
+ * memory is written; the outcome follows in a later save.
+ */
+export interface AgentRunMemoryExtraction {
+  /** Unique per extraction; every record it writes carries it (`metadata.deuz.operationId`). */
+  operationId: string;
+  status: 'pending' | 'completed' | 'failed';
+  /** Whether the pass infers facts with the memory LLM (`extract.infer`). */
+  infer: boolean;
+  /** How many store mutations it applied, once completed. */
+  mutations?: number;
+  error?: { name: string; message: string; code?: string };
+}
+
+/** Run memory (2.3); see `AgentRunEnvelope.memory`. */
+export interface AgentRunMemoryState {
+  /** The scope the run recalled in and writes to. */
+  scope: MemoryScope;
+  recall: AgentRunRecall;
+  /** Absent until a completed run hands its turns to extraction. */
+  extraction?: AgentRunMemoryExtraction;
+}
+
+/** One tool invocation in a run's chat projection (2.3). */
+export interface AgentRunChatInvocation {
+  toolCallId: string;
+  /** The run's model step that issued it: the step half of its receipt key. */
+  modelStep?: number;
+  /** The projected message that carries the call. */
+  messageId: string;
+  /** The projected message that carries its result, once there is one. */
+  resultId?: string;
+}
+
+/**
+ * Where a native run's chat projection stands (2.3). The run's checkpoint is
+ * the canonical record and the chat store a projection of it: the two are
+ * written one after the other, never as one transaction. The projection is
+ * saved after the checkpoint and this state after the projection, so a failed
+ * or interrupted projection leaves `cursor` behind the transcript; the next
+ * projection save, a resume or `reconcileAgentRun` writes it again. Each save
+ * replaces the whole record, so a repeat never appends a message twice.
+ */
+export interface AgentRunChatState {
+  chatId: string;
+  /** How many transcript messages the chat store has acknowledged. */
+  cursor: number;
+  /**
+   * The ids of the projected messages, in record order (`ChatRecord.messageIds`):
+   * an input message keeps the id the stored chat gave it, a message of this
+   * run is `<runId>:<transcript index>`.
+   */
+  messageIds: string[];
+  /** The projected assistant turns of the run, by message id, in order. */
+  turns: string[];
+  /** The run's tool invocations and the messages that carry them. */
+  invocations: AgentRunChatInvocation[];
+  /**
+   * The last projection attempt: `'saved'`, `'failed'` (the store threw;
+   * `error` says why), or `'scope-mismatch'` (the stored chat belongs to
+   * another scope, so it was left untouched).
+   */
+  status: 'saved' | 'failed' | 'scope-mismatch';
+  error?: { name: string; message: string; code?: string };
 }
 
 export interface AgentToolReceipt {
@@ -365,6 +545,43 @@ export type AgentRunOptions<T = string> = Omit<
   output?: AgentOutput<T>;
   /** Bump when changing tool implementation or verifier semantics for a durable run. */
   bindingId?: string;
+  /**
+   * Built-in memory in a native run (2.3). The recall runs ONCE, before the
+   * first model call of a new run, and enters the run's history as an appended
+   * `role: 'system'` message, so every step and every resume sends the same
+   * prefix (preserved thinking); a resume never recalls again. Extraction runs
+   * only for a run that completed, after its terminal commit, under an
+   * operation id the checkpoint records as pending first; a terminal resume
+   * never extracts again, and `reconcileAgentRun` settles one an interruption
+   * left pending. `recall: false`, `extract: false`, `writePolicy` and `sweep`
+   * behave as in the legacy loops. The scope is part of the resume binding, and
+   * a run under another native run's execution may only narrow that run's scope.
+   */
+  memory?: MemoryCallOptions;
+  /**
+   * Chat projection (2.3): the run's transcript as the conversation goes on
+   * (the input, then every turn the run appended, raw: before compaction or a
+   * `prepareStep` history; reasoning blocks byte for byte), saved to
+   * `chat.store` after the run's own checkpoint at every suspension and at the
+   * end, with stable `messageIds`. A store failure never fails the run: it is
+   * reported as a `warning` part and repaired by the next save (see
+   * `AgentRunChatState`). A stored chat of another scope is never overwritten.
+   * The chat is part of the resume binding.
+   */
+  chat?: ChatPersistOptions;
+  /**
+   * Model fail-over inside the run (2.3). A model call that fails with a
+   * retryable error before its first content (network, transport timeout, 5xx,
+   * 429/529 after the call's own retries, an open breaker) is repeated on the
+   * next candidate of `[that model, ...fallbackModels]`, within the same run,
+   * budget and checkpoint: completed tool effects are never repeated, and a
+   * refusal, a policy, budget or validation rejection never fails over. The
+   * failed model is skipped for the rest of the run, and the checkpoint records
+   * each fail-over (`AgentRunEnvelope.models`). Each candidate gets the call's
+   * `capabilities` override and its own request profile. Part of the resume
+   * binding.
+   */
+  fallbackModels?: LanguageModel[];
   /** Explicitly reconcile interrupted effects before permitting these call IDs to execute again. */
   retryToolCallIds?: readonly string[];
   /** Results for pending client-side tool calls, supplied only on resume. */
@@ -411,4 +628,27 @@ export interface AgentStream<T = string> {
   >;
   readonly result: Promise<AgentResult<T>>;
   consume(): Promise<AgentResult<T>>;
+}
+
+/** What `reconcileAgentRun` settles (2.3). */
+export interface AgentRunReconcileOptions {
+  session: AgentRunSession;
+  /** Write the chat projection again when the stored run says it is behind or failed. */
+  chat?: ChatPersistOptions;
+  /**
+   * Settle an extraction the run left pending: when records of its operation
+   * already exist it is recorded completed without another memory LLM call;
+   * otherwise it runs now.
+   */
+  memory?: MemoryCallOptions;
+  deps?: Dependencies;
+}
+
+/** What `reconcileAgentRun` did (2.3). */
+export interface AgentRunReconciliation {
+  runId: string;
+  /** The projection's state after the call; `'current'` when nothing was behind. */
+  chat?: AgentRunChatState['status'] | 'current';
+  /** The extraction's state after the call; absent when the run has none. */
+  memory?: AgentRunMemoryExtraction['status'];
 }
