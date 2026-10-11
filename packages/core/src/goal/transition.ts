@@ -385,9 +385,16 @@ function apply(draft: Draft, command: GoalCommand): Step {
   switch (command.type) {
     case 'wait': {
       if (goal.waiting?.reason === 'budget') return rejected('budget-exhausted');
+      const wait = waitingOf(command.wait, `${goal.goalId}#${draft.nextRevision}`, now);
+      // A dependency wait whose every dependency settled is over as it begins.
+      if (wait.reason === 'dependency' && wait.on.every((dependency) => dependency.settled)) {
+        if (goal.status === 'active') return ignored('unchanged');
+        draft.activate();
+        return applied();
+      }
       const next = draft.edit();
       next.status = 'waiting';
-      next.waiting = waitingOf(command.wait, `${goal.goalId}#${draft.nextRevision}`, now);
+      next.waiting = wait;
       return applied();
     }
     case 'resume': {
@@ -449,11 +456,15 @@ function waitingOf(request: GoalWaitRequest, fallbackId: string, now: number): G
         },
       };
     case 'dependency':
-      // A new wait starts with nothing settled.
+      // Settled only where the request says the dependency already finished.
       return {
         reason: 'dependency',
         ...base,
-        on: request.on.map((dependency) => ({ kind: dependency.kind, id: dependency.id })),
+        on: request.on.map((dependency) => ({
+          kind: dependency.kind,
+          id: dependency.id,
+          ...(dependency.settled ? { settled: true } : {}),
+        })),
       };
     case 'wakeup':
       return {
@@ -469,10 +480,11 @@ function waitingOf(request: GoalWaitRequest, fallbackId: string, now: number): G
  * Applies an outside event. In order: an event for another goal throws; a
  * goal that ended, an event already applied, one past its `expiresAt` or
  * before its `notBefore`, one while the goal waits for nothing, one answering
- * another wait or older than this one, and one the wait is not for are
- * dropped, each with its reason. Otherwise the event ends the wait (a
- * dependency wait once every dependency reported) and its key is remembered.
- * During a budget wait, the wait is the one the budget interrupted.
+ * another wait or older than this one (a dependency's completion is never too
+ * old), and one the wait is not for are dropped, each with its reason.
+ * Otherwise the event ends the wait (a dependency wait once every dependency
+ * reported) and its key is remembered. During a budget wait, the wait is the
+ * one the budget interrupted.
  */
 function applyEvent(draft: Draft, event: GoalEvent): Step {
   const goal = draft.current;
@@ -488,7 +500,9 @@ function applyEvent(draft: Draft, event: GoalEvent): Step {
   const wait = answerable(goal);
   if (!wait) return ignored('unmatched');
   if (event.correlationId !== undefined && event.correlationId !== wait.id) return ignored('stale');
-  if (event.at < wait.since) return ignored('stale');
+  // A completion is a state: a dependency that finished just before the wait
+  // began has still finished.
+  if (wait.reason !== 'dependency' && event.at < wait.since) return ignored('stale');
   const { source } = event;
   switch (wait.reason) {
     case 'user':

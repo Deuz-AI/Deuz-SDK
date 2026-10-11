@@ -35,7 +35,7 @@ export interface GoalEventSource {
 export interface GoalDependency {
   kind: 'goal' | 'run';
   id: string;
-  /** Set once an event from it arrived. */
+  /** Set once an event from it arrived, or by the wait request when it already finished. */
   settled?: boolean;
 }
 
@@ -45,7 +45,10 @@ interface GoalWaitBase {
    * `correlationId`; one answering an earlier wait is stale.
    */
   id: string;
-  /** When the goal began waiting, epoch ms. An event older than this cannot end the wait. */
+  /**
+   * When the goal began waiting, epoch ms. An event older than this cannot end
+   * the wait, except one reporting a dependency: a completion is a state.
+   */
   since: number;
   /** What the goal waits for, for people. */
   note?: string;
@@ -84,7 +87,8 @@ type WaitRequestOf<W> = W extends GoalWaiting ? Omit<W, 'id' | 'since'> & { id?:
 /**
  * A wait to enter: `id` defaults to `<goalId>#<revision>`, the revision the
  * wait begins at, and `since` to the transition's time. A budget wait only
- * comes from a `charge`.
+ * comes from a `charge`. A dependency wait whose every dependency is
+ * `settled` is over as it begins: the goal stays, or becomes, active.
  */
 export type GoalWaitRequest = WaitRequestOf<Exclude<GoalWaiting, { reason: 'budget' }>>;
 
@@ -293,7 +297,7 @@ export type GoalCommand =
 export type GoalTransitionReason =
   /** An event or charge whose key the goal already applied. */
   | 'duplicate'
-  /** An event answering an earlier wait, or older than the wait. */
+  /** An event answering an earlier wait, or older than the wait (unless it reports a dependency). */
   | 'stale'
   /** An event applied at or after its `expiresAt`. */
   | 'expired'

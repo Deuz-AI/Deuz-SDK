@@ -291,11 +291,19 @@ key; or it reports why it was dropped, checking in this order:
 | `'expired'` | `now` is at or after `expiresAt` |
 | `'early'` | `now` is before `notBefore`: deliver it again then |
 | `'unmatched'` | The goal is not waiting |
-| `'stale'` | It answers another wait (`correlationId`), or happened before this wait began |
+| `'stale'` | It answers another wait (`correlationId`), or happened before this wait began, unless it reports a dependency |
 | `'unmatched'` | The wait is for something else: another source, a dependency not listed, a wakeup not yet due |
 
 During a budget wait, the wait an event must answer is the one the budget
 interrupted; with none, every event is `'unmatched'`.
+
+A dependency's completion is a state, so it settles a dependency wait whenever
+it happened, even just before the wait began. An event that arrives before the
+goal waits for it is `'unmatched'` and its key is not remembered: deliver it
+again once the goal waits. A host that saw a dependency finish before it
+entered the wait can instead mark it `settled: true` in the wait request; a
+dependency wait with every dependency settled is over as it begins, and the
+goal stays, or becomes, active.
 
 A goal remembers the keys of its last 64 events in `seen`, and those of its
 last 64 charges apart from them in `charged`. Further back, claim an event's
