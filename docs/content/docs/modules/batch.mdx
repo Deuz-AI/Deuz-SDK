@@ -128,7 +128,7 @@ A `BatchJob` is plain JSON: store it anywhere and hand it to another process. It
 ## Following a batch
 
 - `status(job)` reads where the batch stands with one provider call. `state` is one of `pending`, `running`, `cancelling`, then an ended state: `completed`, `cancelled`, `expired` (the provider's window passed) or `failed` (the batch as a whole failed, such as an OpenAI input file that did not validate). `ended` is true for the last four, `counts` gives the request counts the provider reports, `expiresAt` its expiry and `providerState` its own value. A status the module does not know reads as `running`, never as ended.
-- `wait(job, { intervalMs?, timeoutMs?, onStatus?, signal? })` polls on `deps.clock` until the batch ends (default every 60 seconds). A retryable provider error (a 429, a 5xx) is polled again; `timeoutMs` ends the wait with a `BatchError` of kind `'timeout'`.
+- `wait(job, { intervalMs?, timeoutMs?, onStatus?, signal? })` polls on `deps.clock` until the batch ends (default every 60 seconds). A retryable provider error (a 429, a 5xx) or a network failure is polled again; `timeoutMs` ends the wait with a `BatchError` of kind `'timeout'`.
 - `cancel(job)` asks the provider to stop the batch. Requests already done keep their results; read the results of the cancelled batch to close its holds.
 
 ## Reading the results
@@ -202,7 +202,7 @@ const batch = createBatchClient({
 });
 ```
 
-- **One hold per request, all or none.** Each hold is estimated as a native call is (the prompt plus the output cap the wire sends; on Anthropic a cached prompt as a cache write) and priced on the batch tier. When one hold is refused, by a budget or the policy, the holds already made are released and nothing is sent. The holds sit in the ledger as reservations of kind `'batch'` with the id `<scopeId>/batch/<job key>/<request id>`, and in the `BudgetStore` when the context has persistent admission.
+- **One hold per request, all or none.** Each hold is estimated as a native call is (the prompt plus the output cap the wire sends; on Anthropic a cached prompt as a cache write) and priced on the batch tier. The holds are admitted in one ledger step, each against the budgets and the holds before it, so a batch of any size writes one ledger revision and one persisted snapshot. When one hold is refused, by a budget or the policy, the holds admitted before it are released and nothing is sent. The holds sit in the ledger as reservations of kind `'batch'` with the id `<scopeId>/batch/<job key>/<request id>`, and in the `BudgetStore` when the context has persistent admission.
 - **Each result settles its hold** before the result is handed out:
 
   | Outcome | Hold |
@@ -250,7 +250,7 @@ for (const job of await batch.pending()) {
 }
 ```
 
-The holds settle through the client's execution context. A context [restored from its snapshot](/docs/modules/budgets#children-snapshots-and-restore) already knows them. A fresh context of the same scope does not: the client then reserves each hold again with the amounts the job recorded, which a `BudgetStore` treats as the same hold, so nothing is counted twice, and settles it. A job whose holds were reserved under another scope needs a context of that scope. A client without an execution context refuses to read a job that has holds.
+The holds settle through the client's execution context. A context [restored from its snapshot](/docs/modules/budgets#children-snapshots-and-restore) already knows them. A fresh context of the same scope does not: the client then records each hold again with the amounts the job recorded, and settles it. The provider has already run those requests, so the fresh context's budgets never refuse a hold recorded this way, but they count it from then on: an overage leaves no room for new work, as it would in the context that submitted the batch. A `BudgetStore` treats the hold as the same one, so nothing is counted twice. For that the fresh context needs the same persistent scopes and limits: a hold the store recorded with other amounts or limits fails with a `BudgetLedgerError` of code `reservation_conflict`, and such a job is read through a context restored from its snapshot. A job whose holds were reserved under another scope needs a context of that scope. A client without an execution context refuses to read a job that has holds.
 
 If the job store fails to record a job the provider accepted, `submit` throws a `BatchError` of kind `'store'` whose `job` carries the handle.
 
@@ -276,7 +276,7 @@ If the job store fails to record a job the provider accepted, `submit` throws a 
 | `provider` | The provider answered something unusable, or reported an error for one request without an HTTP status. |
 | `store` | `pending()` without a store, or the store failed to record a submitted job (`error.job`). |
 
-A failed batch call keeps the wire's own [typed error](/docs/core/errors): an expired key is an `AuthenticationError`, a missing batch a `ModelNotFoundError`, and so on.
+A failed batch call keeps the wire's own [typed error](/docs/core/errors): an expired key is an `AuthenticationError`, a missing batch a `ModelNotFoundError`, and so on. A call that fails before or while its answer arrives (DNS, a reset connection, a result file that breaks off) throws the retryable `NetworkError` (`code: 'network_error'`), as a model call does; an abort of your `signal` keeps its own reason.
 
 ## API at a glance
 

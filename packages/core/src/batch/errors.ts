@@ -21,7 +21,8 @@ import type { BatchJob } from './types';
  *   handle, so the caller can keep it and read its results.
  *
  * Provider HTTP failures keep their own typed errors (`RateLimitError`,
- * `AuthenticationError`, …), mapped by the model's wire.
+ * `AuthenticationError`, …), mapped by the model's wire; a transport failure
+ * is the retryable `NetworkError`, as on a model call.
  */
 export type BatchErrorKind =
   | 'unsupported'

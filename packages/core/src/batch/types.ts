@@ -249,7 +249,7 @@ export interface BatchClient {
   submit(requests: readonly BatchRequest[], options?: BatchSubmitOptions): Promise<BatchJob>;
   /** Read where the batch stands (one provider call). */
   status(job: BatchJob, options?: BatchCallOptions): Promise<BatchStatus>;
-  /** Poll until the batch ends. */
+  /** Poll until the batch ends; a retryable provider error or a network failure is polled again. */
   wait(job: BatchJob, options?: BatchWaitOptions): Promise<BatchStatus>;
   /**
    * The results of an ended batch, one per request, settling each request's

@@ -5,7 +5,7 @@ import { createBatchClient } from '../src/batch/client';
 import { BatchError } from '../src/batch/errors';
 import { createMemoryBatchJobStore } from '../src/batch/store';
 import type { BatchJob, BatchJobStore } from '../src/batch/types';
-import { NoObjectGeneratedError } from '../src/errors';
+import { NetworkError, NoObjectGeneratedError } from '../src/errors';
 import { createGoogle } from '../src/google';
 import { createOpenAIResponses } from '../src/openai';
 import { fakeAnthropicBatches, fakeOpenAIBatches } from './fixtures/batch-servers';
@@ -147,6 +147,137 @@ describe('wait', () => {
     await time.advance(10);
     controller.abort(new Error('stop now'));
     await failure;
+  });
+});
+
+describe('network failures', () => {
+  /** A body that delivers `text` (when given), then breaks off. */
+  const brokenBody = (text?: string) => {
+    let step = text === undefined ? 1 : 0;
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (step++ === 0) controller.enqueue(new TextEncoder().encode(text));
+        else controller.error(new TypeError('terminated'));
+      },
+    });
+  };
+
+  /** The Message Batches stand-in behind a fetch whose next `failures` GETs fail as `fail` says. */
+  function flakySetup(failures: number, fail: 'connect' | 'body' = 'connect') {
+    const server = fakeAnthropicBatches();
+    let left = failures;
+    const flaky = (async (input: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET' && left-- > 0) {
+        if (fail === 'connect') throw new TypeError('fetch failed');
+        return new Response(brokenBody(), { status: 200 });
+      }
+      return server.fetch(input, init);
+    }) as typeof fetch;
+    const model = createAnthropic({ apiKey: 'k', fetch: flaky })('claude-haiku-5-5');
+    const time = manualClock(0);
+    const batch = createBatchClient({ model, deps: { clock: time.clock } });
+    return { server, time, batch };
+  }
+
+  it('wait() polls again after a connection failure', async () => {
+    const { server, time, batch } = flakySetup(1);
+    const job = await batch.submit([{ id: 'a', prompt: 'x' }]);
+    server.finish(job.id, { a: { type: 'expired' } });
+    const done = batch.wait(job, { intervalMs: 500 });
+    done.catch(() => undefined);
+    await time.advance(0); // the first poll: the connection fails
+    await time.advance(500);
+    await expect(done).resolves.toMatchObject({ state: 'expired', ended: true });
+  });
+
+  it('wait() polls again when a status answer breaks off', async () => {
+    const { server, time, batch } = flakySetup(1, 'body');
+    const job = await batch.submit([{ id: 'a', prompt: 'x' }]);
+    server.finish(job.id, { a: { type: 'expired' } });
+    const done = batch.wait(job, { intervalMs: 500 });
+    done.catch(() => undefined);
+    await time.advance(0);
+    await time.advance(500);
+    await expect(done).resolves.toMatchObject({ state: 'expired', ended: true });
+  });
+
+  it('status() and cancel() fail with a typed, retryable NetworkError', async () => {
+    // Only GETs fail here: the submission (a POST) goes through.
+    const { batch } = flakySetup(1);
+    const job = await batch.submit([{ id: 'a', prompt: 'x' }]);
+    const error = await batch.status(job).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(NetworkError);
+    expect(error).toMatchObject({
+      code: 'network_error',
+      isRetryable: true,
+      provider: 'anthropic',
+      upstreamType: 'TypeError',
+      cause: expect.objectContaining({ message: 'fetch failed' }),
+    });
+
+    const server = fakeAnthropicBatches();
+    const refused = createBatchClient({
+      model: createAnthropic({
+        apiKey: 'k',
+        fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+          if (String(input).endsWith('/cancel')) throw new TypeError('fetch failed');
+          return server.fetch(input, init);
+        }) as typeof fetch,
+      })('claude-haiku-5-5'),
+    });
+    const other = await refused.submit([{ id: 'a', prompt: 'x' }]);
+    await expect(refused.cancel(other)).rejects.toBeInstanceOf(NetworkError);
+  });
+
+  it('results() fails with a NetworkError when the result file breaks off', async () => {
+    const server = fakeAnthropicBatches();
+    const model = createAnthropic({
+      apiKey: 'k',
+      fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).endsWith('/results')) {
+          const line = JSON.stringify({
+            custom_id: 'a',
+            result: { type: 'succeeded', message: message([{ type: 'text', text: 'A' }]) },
+          });
+          return new Response(brokenBody(`${line}\n`), { status: 200 });
+        }
+        return server.fetch(input, init);
+      }) as typeof fetch,
+    })('claude-haiku-5-5');
+    const batch = createBatchClient({ model });
+    const job = await batch.submit([
+      { id: 'a', prompt: 'x' },
+      { id: 'b', prompt: 'y' },
+    ]);
+    server.finish(job.id, {
+      a: { type: 'succeeded', message: message([{ type: 'text', text: 'A' }]) },
+      b: { type: 'expired' },
+    });
+    const seen: string[] = [];
+    const error = await (async () => {
+      for await (const result of batch.results(job)) seen.push(result.id);
+    })().catch((caught: unknown) => caught);
+    // The result read before the break is handed out; reading again starts over.
+    expect(seen).toEqual(['a']);
+    expect(error).toBeInstanceOf(NetworkError);
+  });
+
+  it('an abort keeps its own reason', async () => {
+    const server = fakeAnthropicBatches();
+    const controller = new AbortController();
+    const aborting = (async (input: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') {
+        controller.abort(new Error('stop now'));
+        throw controller.signal.reason;
+      }
+      return server.fetch(input, init);
+    }) as typeof fetch;
+    const model = createAnthropic({ apiKey: 'k', fetch: aborting })('claude-haiku-5-5');
+    const batch = createBatchClient({ model, deps: { clock: manualClock(0).clock } });
+    const job = await batch.submit([{ id: 'a', prompt: 'x' }]);
+    await expect(batch.wait(job, { intervalMs: 500, signal: controller.signal })).rejects.toThrow(
+      'stop now',
+    );
   });
 });
 

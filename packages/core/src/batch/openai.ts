@@ -162,6 +162,7 @@ export const openaiBatchDriver: BatchDriver = {
           headers: headers(call, false),
           body: form,
         }),
+        ctx,
       );
       if (!isObject(file) || typeof file.id !== 'string')
         throw new BatchError({
@@ -187,6 +188,7 @@ export const openaiBatchDriver: BatchDriver = {
             ...(options.displayName ? { metadata: { display_name: options.displayName } } : {}),
           }),
         }),
+        ctx,
       );
     } catch (error) {
       throw new SubmitFailure(error, true);
@@ -216,7 +218,7 @@ export const openaiBatchDriver: BatchDriver = {
       `${ctx.call.baseURL}/batches/${encodeURIComponent(id)}`,
       { method: 'GET', headers: headers(ctx.call, false) },
     );
-    return normalize(id, await readJson(response));
+    return normalize(id, await readJson(response, ctx));
   },
 
   async cancel(id, ctx) {
@@ -226,7 +228,7 @@ export const openaiBatchDriver: BatchDriver = {
       `${ctx.call.baseURL}/batches/${encodeURIComponent(id)}/cancel`,
       { method: 'POST', headers: headers(ctx.call, false) },
     );
-    return normalize(id, await readJson(response));
+    return normalize(id, await readJson(response, ctx));
   },
 
   async *outcomes(_job, raw, ctx: BatchCallContext) {
@@ -239,7 +241,7 @@ export const openaiBatchDriver: BatchDriver = {
         `${ctx.call.baseURL}/files/${encodeURIComponent(file)}/content`,
         { method: 'GET', headers: headers(ctx.call, false) },
       );
-      for await (const line of jsonLines(response)) {
+      for await (const line of jsonLines(response, ctx)) {
         const outcome = outcomeOf(line, ctx.call.provider);
         if (outcome) yield outcome;
       }
