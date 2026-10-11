@@ -29,14 +29,21 @@ import type {
   ToolUsePart,
   ToolResultPart,
 } from './types/message';
-import type { ToolApprovalRequest } from './types/tool';
+import type { ToolApprovalRequest, ToolCallOutcome } from './types/tool';
 import type { ToolRunState } from './types/stream';
-import type { CallWarning } from './types/methods';
+import type { CallWarning, StopDetails } from './types/methods';
 import type { Usage, FinishReason } from './types/usage';
 import type { MemoryScope } from './memory';
-import type { DeuzUIPart } from './ui';
+import type { DeuzAgentState, DeuzUIPart } from './ui';
 import { imagePart } from './parts';
 import { resolveMedia } from './internal/image';
+import {
+  agentFrameOf,
+  applyAgentFrame,
+  idleAgentState,
+  stopDetailsFromWire,
+  usageFromWire,
+} from './internal/agent-ui';
 
 export type { MemoryScope } from './memory';
 
@@ -67,6 +74,14 @@ export interface UIToolCall {
   denied?: boolean;
   /** Why it was declined. Already redacted by the wire (P0) — never re-log it raw. */
   deniedReason?: string;
+  /**
+   * How the call ended (2.3), from the wire's latest `tool-state` or
+   * `tool-result` for it: `'tool-error'`, `'permission-denied'`,
+   * `'approval-denied'`, `'approval-pending'` or `'unknown-effect'`. Absent
+   * while it runs and on success. It names what `denied` alone cannot: a
+   * guardrail block and an approver's no both set `denied`.
+   */
+  outcome?: ToolCallOutcome;
   /**
    * Opaque provider round-trip data for this call (e.g. Gemini's
    * thoughtSignature), carried so `assistantMessageFromTurn` and
@@ -101,6 +116,12 @@ export type UIMessagePart =
       text: string;
       /** 'streaming' until the next part opens or the turn is sealed (`sealAssistantTurn`). */
       state: 'streaming' | 'done';
+      /**
+       * The text's provider round-trip data (2.3), such as a Gemini thought
+       * signature, from the wire's `text-delta` frames or from history. The
+       * canonical projections send it back on the text part. Never display it.
+       */
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: 'reasoning';
@@ -271,10 +292,25 @@ export interface AssistantTurnState {
   usage?: Usage;
   /** Terminal finish reason (1.9) — `'length'` means the answer was truncated. */
   finishReason?: FinishReason;
+  /**
+   * The provider's explanation of the stop (2.3), from the wire's `finish`:
+   * with `finishReason: 'content_filter'`, a refusal's `category` and
+   * `explanation`. Absent when the provider explained nothing.
+   */
+  stopDetails?: StopDetails;
   /** Per-step usage/finish from `step-finish` parts, in arrival order (1.9). */
   steps?: Array<{ step: number; usage: Usage; finishReason: FinishReason }>;
   /** Redacted server error message, when the stream ended in an error part. */
   error?: string;
+  /**
+   * The native run behind the turn (2.3), folded from the `data-agent` frames
+   * of `toDeuzAgentStreamResponse` exactly as `agentStateFromParts` folds them:
+   * its id, status, pending approvals and client calls, drafts, and the
+   * validated output. Absent on a chat route. A valid frame lands here and in
+   * neither `dataParts` nor `message.parts`; an app's own `data-agent` part
+   * whose payload is no agent frame stays a data part.
+   */
+  agent?: DeuzAgentState;
 }
 
 export function createAssistantTurn(id: string): AssistantTurnState {
@@ -285,38 +321,6 @@ export function createAssistantTurn(id: string): AssistantTurnState {
     dataParts: [],
     citations: [],
     activity: [],
-  };
-}
-
-/**
- * Coerce a wire `usage` payload into a real `Usage` (1.9). `applyUIPart` is
- * TOTAL by contract, and this payload crosses a network boundary from a server
- * that may be older, newer, or hostile: `null`, a string, or a partial object
- * (`{ totalTokens: 1 }`) must fold without throwing AND without leaving a field
- * typed `number` holding something else. Non-finite/missing counts read as 0;
- * `totalTokens` falls back to input+output so a token badge always renders.
- */
-function usageFromWire(value: unknown): Usage {
-  const raw = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
-  const optional = (key: string): number | undefined => {
-    const n = raw[key];
-    return typeof n === 'number' && Number.isFinite(n) ? n : undefined;
-  };
-  const count = (key: string): number => optional(key) ?? 0;
-  const inputTokens = count('inputTokens');
-  const outputTokens = count('outputTokens');
-  const audioTokens = optional('audioTokens');
-  const serverToolUses = optional('serverToolUses');
-  return {
-    inputTokens,
-    outputTokens,
-    reasoningTokens: count('reasoningTokens'),
-    cachedReadTokens: count('cachedReadTokens'),
-    cacheWriteTokens: count('cacheWriteTokens'),
-    cacheWrite1hTokens: count('cacheWrite1hTokens'),
-    ...(audioTokens !== undefined ? { audioTokens } : {}),
-    ...(serverToolUses !== undefined ? { serverToolUses } : {}),
-    totalTokens: optional('totalTokens') ?? inputTokens + outputTokens,
   };
 }
 
@@ -369,6 +373,27 @@ function providerMetadataFromWire(value: unknown): Pick<UIToolCall, 'providerMet
  */
 function numberFromWire(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** Every `ToolCallOutcome` (2.3): a value the client does not know is not one. */
+const OUTCOMES: ReadonlySet<unknown> = new Set<ToolCallOutcome>([
+  'success',
+  'tool-error',
+  'permission-denied',
+  'approval-denied',
+  'approval-pending',
+  'unknown-effect',
+]);
+
+/**
+ * The call with the outcome its latest `tool-state` / `tool-result` frame
+ * reported (2.3). A frame without one (the call is running again, or it
+ * succeeded) clears an earlier one: an `'approval-pending'` call that was
+ * approved and ran is no longer pending.
+ */
+function withOutcome(call: UIToolCall, outcome: unknown): UIToolCall {
+  const { outcome: _previous, ...rest } = call;
+  return OUTCOMES.has(outcome) ? { ...rest, outcome: outcome as ToolCallOutcome } : rest;
 }
 
 function withToolCall(
@@ -506,10 +531,28 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
     case 'text-delta': {
       const parts = partsOf(turn.message);
       const tail = parts.at(-1);
+      // The text's round-trip data (2.3, e.g. a Gemini signature on the last,
+      // often empty, chunk) merges onto the text it belongs to, as the
+      // canonical turn content does.
+      const { providerMetadata: meta } = providerMetadataFromWire(
+        (part as { providerMetadata?: unknown }).providerMetadata,
+      );
       const next: UIMessagePart[] =
         tail?.type === 'text' && tail.state === 'streaming'
-          ? [...parts.slice(0, -1), { ...tail, text: tail.text + part.text }]
-          : openPart(parts, { type: 'text', text: part.text, state: 'streaming' });
+          ? [
+              ...parts.slice(0, -1),
+              {
+                ...tail,
+                text: tail.text + part.text,
+                ...(meta ? { providerMetadata: { ...tail.providerMetadata, ...meta } } : {}),
+              },
+            ]
+          : openPart(parts, {
+              type: 'text',
+              text: part.text,
+              state: 'streaming',
+              ...(meta ? { providerMetadata: { ...meta } } : {}),
+            });
       return {
         ...turn,
         // `content` stays the WHOLE turn's text (1.8 semantics, verbatim).
@@ -595,12 +638,17 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
       );
     }
     case 'tool-result': {
-      const next = withToolCall(turn, part.toolCallId, (c) => ({
-        ...c,
-        state: 'result',
-        output: part.output,
-        ...(part.isError ? { isError: true } : {}),
-      }));
+      const next = withToolCall(turn, part.toolCallId, (c) =>
+        withOutcome(
+          {
+            ...c,
+            state: 'result',
+            output: part.output,
+            ...(part.isError ? { isError: true } : {}),
+          },
+          (part as { outcome?: unknown }).outcome,
+        ),
+      );
       return { ...next, serverResults: [...next.serverResults, part.toolCallId] };
     }
     case 'tool-approval-request': {
@@ -641,17 +689,22 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
                 : {}),
             }
           : {};
+      // The dispatch contract's verdict (2.3), read as defensively as the flags.
+      const outcome = (part as { outcome?: unknown }).outcome;
       // `input-streaming` arrives BEFORE the assembled tool-call part — open a
       // placeholder so the lifecycle is visible from the first fragment.
       if (!(turn.message.toolCalls ?? []).some((c) => c.toolCallId === part.toolCallId)) {
-        const placeholder: UIToolCall = {
-          toolCallId: part.toolCallId,
-          toolName: part.toolName ?? '',
-          input: undefined,
-          state: 'call',
-          runState: part.state,
-          ...denial,
-        };
+        const placeholder: UIToolCall = withOutcome(
+          {
+            toolCallId: part.toolCallId,
+            toolName: part.toolName ?? '',
+            input: undefined,
+            state: 'call',
+            runState: part.state,
+            ...denial,
+          },
+          outcome,
+        );
         return withToolPart(
           {
             ...turn,
@@ -663,11 +716,9 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
           part.toolCallId,
         );
       }
-      return withToolCall(turn, part.toolCallId, (c) => ({
-        ...c,
-        runState: part.state,
-        ...denial,
-      }));
+      return withToolCall(turn, part.toolCallId, (c) =>
+        withOutcome({ ...c, runState: part.state, ...denial }, outcome),
+      );
     }
     case 'cost':
       return {
@@ -783,10 +834,15 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
     }
     case 'finish': {
       const finishReason = finishReasonFromWire(part.finishReason);
+      // The provider's explanation (2.3, F16): a refusal's category, kept only
+      // when well formed. Absent, an earlier leg's explanation is not carried.
+      const { stopDetails: _previous, ...rest } = turn;
+      const stopDetails = stopDetailsFromWire((part as { stopDetails?: unknown }).stopDetails);
       return {
-        ...turn,
+        ...rest,
         usage: usageFromWire(part.usage),
         ...(finishReason !== undefined ? { finishReason } : {}),
+        ...(stopDetails ? { stopDetails } : {}),
         // TERMINAL BOUNDARY: nothing can extend the tail after `finish`, so the
         // last text/reasoning part stops being 'streaming' here. A stream that
         // dies WITHOUT a finish (abort, dropped connection) deliberately leaves
@@ -828,6 +884,13 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
         ...(turn.subAgents ? { subAgents: sealedSubAgents(turn.subAgents) } : {}),
       };
     default: {
+      // A native run's frame (2.3) folds into `turn.agent`. A frame applied
+      // before (a replay) or older than the state returns the turn itself.
+      const frame = agentFrameOf(part);
+      if (frame) {
+        const agent = applyAgentFrame(turn.agent ?? idleAgentState(), frame);
+        return agent === turn.agent ? turn : { ...turn, agent };
+      }
       if (typeof part.type === 'string' && part.type.startsWith('data-')) {
         const dataPart = part as Extract<DeuzUIPart, { payload: unknown }>;
         const name = dataPart.type.slice('data-'.length);
@@ -915,22 +978,35 @@ function toolUseFromUI(call: UIToolCall): ToolUsePart {
  * conversation before it), with text and `tool_use` where they came. A plain
  * answer is still a plain string, and a turn with neither text nor a tool call
  * sends no reasoning back: alone it is no answer.
+ *
+ * A card the turn knows only from a `tool-state` or `tool-result` frame (2.3)
+ * has no `input`: its call is one an earlier leg made, such as an approved
+ * call the resumed leg executed, and the history already holds its
+ * `tool_use`. The turn does not send it again (before 2.3 it did, without its
+ * input, which no provider accepts).
  */
 export function assistantMessageFromTurn(turn: AssistantTurnState): Message {
-  const toolCalls = turn.message.toolCalls ?? [];
-  const text = turn.message.content;
-  if (partsOf(turn.message).length > 0) {
-    const ordered = canonicalContentFromUI(turn.message);
+  const cards = turn.message.toolCalls ?? [];
+  const toolCalls = cards.filter((call) => call.input !== undefined);
+  const message = toolCalls.length === cards.length ? turn.message : { ...turn.message, toolCalls };
+  const text = message.content;
+  if (partsOf(message).length > 0) {
+    const ordered = canonicalContentFromUI(message);
     if (typeof ordered === 'string') return { role: 'assistant', content: ordered };
     if (!ordered.some((p) => p.type === 'text' || p.type === 'tool_use')) {
       return { role: 'assistant', content: text };
     }
-    // Text the UI split around a step or data boundary is one run again.
+    // Text the UI split around a step or data boundary is one run again, with
+    // its round-trip data merged as the canonical turn content merges it.
     const content: Part[] = [];
     for (const part of ordered) {
       const last = content.at(-1);
-      if (part.type === 'text' && last?.type === 'text') last.text += part.text;
-      else content.push(part.type === 'text' ? { ...part } : part);
+      if (part.type === 'text' && last?.type === 'text') {
+        last.text += part.text;
+        if (part.providerMetadata) {
+          last.providerMetadata = { ...last.providerMetadata, ...part.providerMetadata };
+        }
+      } else content.push(part.type === 'text' ? { ...part } : part);
     }
     return { role: 'assistant', content };
   }
@@ -1060,7 +1136,12 @@ function uiPartsFromContent(content: string | Part[]): UIMessagePart[] {
   for (const p of content) {
     switch (p.type) {
       case 'text':
-        parts.push({ type: 'text', text: p.text, state: 'done' });
+        parts.push({
+          type: 'text',
+          text: p.text,
+          state: 'done',
+          ...(p.providerMetadata ? { providerMetadata: p.providerMetadata } : {}),
+        });
         break;
       case 'reasoning':
         parts.push({
@@ -1173,7 +1254,13 @@ function canonicalContentFromUI(message: UIMessage): string | Part[] {
       switch (p.type) {
         case 'text':
           // An empty text block 400s some wires — drop it, do not send it.
-          if (p.text) parts.push({ type: 'text', text: p.text });
+          if (p.text) {
+            parts.push({
+              type: 'text',
+              text: p.text,
+              ...(p.providerMetadata ? { providerMetadata: p.providerMetadata } : {}),
+            });
+          }
           break;
         case 'reasoning':
           // A block with empty text is real when it is signed or opaque (2.3,
@@ -1219,9 +1306,12 @@ function canonicalContentFromUI(message: UIMessage): string | Part[] {
   }
   // An all-text result collapses to the plain string form — that is what
   // `textOf`/`uiFromMessages` read back, so a text-only history round-trips
-  // exactly instead of drifting into a one-element array on every pass.
+  // exactly instead of drifting into a one-element array on every pass. Text
+  // that carries round-trip data (2.3) stays a part: a string has no carrier.
   const texts = parts.filter((p): p is TextPart => p.type === 'text');
-  if (texts.length === parts.length) return texts.map((p) => p.text).join('');
+  if (texts.length === parts.length && !texts.some((p) => p.providerMetadata)) {
+    return texts.map((p) => p.text).join('');
+  }
   return parts;
 }
 

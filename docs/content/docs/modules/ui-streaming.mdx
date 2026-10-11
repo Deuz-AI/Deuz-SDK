@@ -14,6 +14,8 @@ import {
   toDeuzStreamResponse, // server: StreamChatResult → SSE Response
   toDeuzTextStreamResponse, // server: StreamChatResult → text/plain, no framing (1.9)
   toDeuzObjectStreamResponse, // server: StreamObjectResult → object-delta SSE
+  toDeuzAgentStreamResponse, // server: streamAgent / resumeStreamAgent → SSE (2.3)
+  agentStateFromParts, // client: data-agent frames → a native run's state (2.3)
   createDeuzStream, // server: same + writeData() for app data parts
   resumeDeuzStreamResponse, // server: replay + live tail from a store
   readDeuzStream, // client: Response → DeuzUIPart iterable
@@ -250,7 +252,7 @@ Takes the `Response` (e.g. from `fetch`) and returns an async generator of `Deuz
 ```ts
 function readDeuzStream(
   response: Response,
-  options?: { onHttpError?: 'error-part' | 'ignore' },
+  options?: { onHttpError?: 'error-part' | 'ignore'; onEventId?: (id: string) => void },
 ): AsyncGenerator<DeuzUIPart>;
 ```
 
@@ -267,6 +269,10 @@ Deuz stream request failed (status 500 Internal Server Error).
 Every consumer inherits the fix with no code change: `useChat` goes to `status: 'error'` with `error` set and fires `onError`, and `useObject` sets `error`.
 
 The response body is deliberately **not** read or echoed — an error page is unbounded markup you do not control. Only `statusText` is included, truncated to 200 characters and passed through the standard secret redaction (P0). Opt back into the pre-1.9 silence with `readDeuzStream(res, { onHttpError: 'ignore' })`, or `useChat({ onHttpError: 'ignore' })`.
+
+### Knowing how far you read: `onEventId` (2.3)
+
+`onEventId` is called with a part's SSE event id right before the part is yielded, once per id. A frame without an id of its own (a [transient](#addressable-and-transient-data-parts-19) data part) reports nothing, and neither does `[DONE]`; a wire v1 body carries no ids at all. A client that also resumes the stream uses it to know where its cursor stands. `useChat` does: when a POST response carries the journal's ids, a later `reconnect()` resumes after what the POST read delivered.
 
 ## Client: `connectDeuzStream`
 
@@ -378,6 +384,88 @@ stream.writeData('progress', 0.4, { transient: true }); // never journaled
 
 **Streaming validation** is opt-in via `dataSchemas` — a [Standard Schema](https://standardschema.dev) per data-part name. `writeData('chart', payload)` validates against `dataSchemas.chart` *before* serialization; an invalid payload is dropped and a redacted `error` part (`"data part 'chart' failed validation."`) is emitted instead — the stream itself keeps going. Names without a schema pass through unvalidated.
 
+## Native agent runs: `toDeuzAgentStreamResponse` (2.3)
+
+A [native agent run](/docs/modules/native-agents) (`streamAgent`, `resumeStreamAgent`) has what a chat stream does not: a durable run id, phases, drafts of a structured output, a typed final output, and a terminal state that can be a suspension waiting for approvals or client results. `toDeuzAgentStreamResponse` serializes such a run to this wire.
+
+```ts
+function toDeuzAgentStreamResponse<T>(
+  stream: AgentStream<T>,
+  options?: ToDeuzAgentStreamOptions, // ToDeuzStreamOptions + { runId?: string }
+): Response;
+```
+
+- **The run's own parts go out exactly as the legacy wire frames them**: text, reasoning blocks, tool calls and results, approval requests, `tool-state`, cost, `finish`. So `applyUIPart` and `useChat` render a native run like any chat stream. A `tool-result` part carries what the model saw (a tool's `toModelOutput` projection); the raw result of a `tool-output` event never leaves the server. The finalization of a structured run streams its candidate JSON as text too, exactly as the native stream does: render the value from the `partial` and `result` frames, and use the `phase` frame to tell the finalization's text from the tool loop's.
+- **`data-agent` parts carry the rest.** They ride the existing `data-{name}` member of `DeuzUIPart`, so no union is widened, and they are wire v2 parts: a client that negotiated v1 gets the plain chat stream.
+- **Subscribe first.** It subscribes to `stream.events` before it returns, so the route can await `stream.result` afterwards and the client still gets every event. Pass the stream here before you touch any of its views: a native stream has no replay of what it emitted before you subscribed. (A stream that already ended still gets its terminal `result` frame, read from `stream.result`.)
+- **Nothing that is the server's alone goes out**: no transcript, no raw tool results, no receipts, no accounting ledger, no provider metadata of a pending call. A failure's message is secret-redacted, and a failed run also gets one `error` part, so a reader that knows nothing of agent frames ends the turn in error.
+
+| Frame (`payload.kind`) | Fields | When |
+| --- | --- | --- |
+| `run` | `seq`, `runId?`, `status: 'running'` | First frame of every leg (a fresh run or a resume). `runId` is the `runId` option: pass the run's `session.runId`, so a client knows the run before the leg ends. |
+| `phase` | `seq`, `phase: 'running' \| 'finalizing'` | The run entered the tool loop or the finalization. |
+| `partial` | `seq`, `attempt`, `value` | A draft of the structured output. Never validated, never `T`. |
+| `element` | `seq`, `attempt`, `index`, `value` | An array element the run's element validator accepted. Still a draft. |
+| `result` | `seq`, `runId`, `status`, `usage`, `modelSteps`, `verification?`, `stopDetails?`, and per status: `output` (`completed`), `pendingApprovals` and `pendingClientCalls` (`suspended`), `reason` and `unknownEffects?` (`stopped`), `error` (`failed`) | The leg's terminal state. A pending client call is `{ toolCallId, toolName, input }`; an unknown effect is `{ toolCallId, toolName, modelStep? }`. |
+
+Each part is `{ type: 'data-agent', id: <kind>, payload }`. The `id` makes a client that knows nothing of agent frames reconcile them in place, so its `dataParts` stays bounded.
+
+### Sequence and replay
+
+Every frame's `seq` is its own SSE event id. With `store` and `streamId` set, the response is journaled like any other, and a continued leg numbers on from the last stored event. So **journal every leg of a run under one `streamId`** (the run id is the natural choice), and `seq` grows across the whole run. That is the cursor contract: `resumeDeuzStreamResponse(store, runId, { lastEventId })` replays everything after a cursor, and a client resumes a run it lost mid-leg with `connectDeuzStream` or `useChat`'s `reconnect()`. Without a `store`, a response numbers from 0 and cannot be replayed; fold each such response into its own state.
+
+### Client: `agentStateFromParts`
+
+```ts
+function agentStateFromParts<T = unknown>(
+  parts: Iterable<DeuzUIPart>,
+  initial?: DeuzAgentState<T>,
+): DeuzAgentState<T>;
+```
+
+It folds the `data-agent` frames among `parts` into a `DeuzAgentState`, a union on `status`:
+
+- `'idle'`: no frame yet.
+- `'running'`: with the latest `partial` draft and the accepted `elements`.
+- `'completed'`: with `output: T`.
+- `'suspended'`: with `pendingApprovals` and `pendingClientCalls`.
+- `'stopped'`: with `reason` (such as `'aborted'`, `'cancelled'` or `'refusal'`) and `stopDetails`.
+- `'failed'`: with `error`.
+
+Every state carries `seq` and, once a frame named it, `runId`. Only `completed` has an `output`: the one the server validated, typed as `T` because the client trusts that validation. A draft is `unknown` and is gone at the end.
+
+It is **idempotent**. A frame whose `seq` is not above the state's is not applied, so a replay that overlaps what the client holds, or a frame that arrives after a later one, changes nothing: you get the same state object back. The state never moves backwards. A frame of another run, later in the sequence, starts that run's state. Every other part, and any malformed frame, is ignored. `applyUIPart` applies the same frames to `AssistantTurnState.agent`; an app's own `data-agent` part whose payload is no agent frame stays an ordinary data part.
+
+```ts title="native-run.ts"
+import { streamAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { agentStateFromParts, readDeuzStream, toDeuzAgentStreamResponse } from '@deuz-sdk/core/ui';
+import type { DeuzUIPart } from '@deuz-sdk/core/ui';
+
+const response = toDeuzAgentStreamResponse(
+  streamAgent<{ answer: number }>({
+    model: createMockModel({ responses: [{ text: '{"answer": 42}' }] }),
+    prompt: 'Return the answer as JSON.',
+    output: {
+      mode: 'json',
+      schema: { type: 'object', properties: { answer: { type: 'number' } }, required: ['answer'] },
+      validate: (value) => value as { answer: number },
+    },
+  }),
+  { runId: 'demo-run' },
+);
+
+const parts: DeuzUIPart[] = [];
+for await (const part of readDeuzStream(response)) parts.push(part);
+
+const state = agentStateFromParts<{ answer: number }>(parts);
+if (state.status === 'completed') console.log(state.output.answer); // 42, typed
+// A replay of the same parts applies nothing twice.
+console.log(agentStateFromParts(parts, state) === state); // true
+```
+
+For a route and a React component, see [Native agents in a UI](/docs/modules/native-agents#native-agents-in-a-ui) and [`useChat` on a native agent route](/docs/modules/react-hooks#native-agent-routes).
+
 ## Wire part types
 
 `DeuzUIPart` is a discriminated union on `type`. Keep a `default` case when switching — the union is additive and may grow. Parts marked **v2** are dropped for a negotiated-v1 client.
@@ -386,12 +474,12 @@ stream.writeData('progress', 0.4, { transient: true }); // never journaled
 | --- | --- | --- |
 | `start` | `messageId: string` | First — always the leading part (not re-emitted on a continued leg). |
 | `step-start` | `step: number` | An agentic loop step begins. |
-| `step-finish` | `step: number`, `finishReason: FinishReason`, `usage: Usage` | A loop step ends. |
-| `text-delta` | `text: string` | A chunk of assistant text. |
+| `step-finish` | `step: number`, `finishReason: FinishReason`, `usage: Usage`, `stopDetails?` **(2.3)** | A loop step ends. `stopDetails` as on `finish`, for that step. |
+| `text-delta` | `text: string`, `providerMetadata?` **(2.3)** | A chunk of assistant text. `providerMetadata` is the text's provider round-trip data (a Gemini thought signature on a plain text part, often on a final chunk with an empty `text`), which a chat client sends back with the text; never display it. |
 | `reasoning-delta` | `text: string`, `signature?: string`, `id?`, `encrypted?`, `redacted?`, `source?`, `data?` **(2.3)** | A chunk of one reasoning block. `id` names the block (deltas of one block share it); `encrypted` / `redacted` mark an opaque payload, which rides `data` with an empty `text`; `source` is the provider family that produced it. |
 | `tool-input-delta` | `toolCallId: string`, `toolName?: string`, `delta: string` | A raw fragment of a tool call's argument JSON. |
 | `tool-call` | `toolCallId: string`, `toolName: string`, `input: unknown`, `providerMetadata?` **(2.3)** | A fully parsed tool call. `providerMetadata` is the call's provider round-trip data (a Gemini function call's `thoughtSignature`), which a chat client sends back with the call; never display it. |
-| `tool-result` | `toolCallId: string`, `toolName: string`, `output: unknown`, `isError?: boolean` | A tool finished executing (`isError: true` on a failed/self-healed tool). |
+| `tool-result` | `toolCallId: string`, `toolName: string`, `output: unknown`, `isError?: boolean`, `outcome?: ToolCallOutcome` **(2.3)** | A tool finished executing (`isError: true` on a failed/self-healed tool). `outcome` says how an error result ended; a successful result carries none. |
 | `tool-approval-request` | `approvalId`, `toolCallId`, `toolName`, `input`, `token?: string` | A gated tool call awaits the user's verdict — the loop broke; resume with `approvalResponses`. `token` is the HMAC-signed approval token when the call carried [`approvalSigner`](/docs/agents/durable-runtime#cryptographic-approval-trail-17) — echo it back on the verdict. |
 | `tool-approval-response` | `approvalId`, `approved: boolean`, `reason?`, `token?` | Client→server direction ONLY (declared for wire symmetry): the verdict travels in the next HTTP request body as `approvalResponses` — the server never serializes this part. `token` echoes the request's signed token (required to APPROVE under `approvalSigner`). |
 | `object-delta` | `object: unknown` | A `streamObject` partial (from `toDeuzObjectStreamResponse`) — each delta REPLACES the previous partial wholesale. |
@@ -400,7 +488,7 @@ stream.writeData('progress', 0.4, { transient: true }); // never journaled
 | `sub-agent` | `agentPath: string[]`, `part: DeuzUIPart` | A sub-agent (`agentTool`) emitted a part, forwarded live with its path. |
 | `data-{name}` **(v2)** | `payload: unknown`, `id?: string` **(1.9)** | App-defined typed data from `writeData(name, payload, { id?, transient? })`. With an `id`, the client reconciles repeat writes of the same `(name, id)` in place. |
 | `citation` **(v2)** | `id`, `sourceId?`, `url?`, `title?`, `snippet?`, `chunkIndex?`, `score?` | RAG provenance for a retrieved chunk. Build from retrieve/rerank hits with `citationsFromHits` (`@deuz-sdk/core/rag`) and send via `writeData` or your own pipeline. |
-| `tool-state` **(v2)** | `toolCallId`, `toolName?`, `state: ToolRunState`, `denied?: boolean` **(1.9)**, `deniedReason?: string` **(1.9)** | Tool lifecycle transition — render live status without re-deriving it from part ordering. States: `input-streaming`, `input-complete`, `awaiting-approval`, `executing`, `complete`, `error`. `denied: true` qualifies a terminal `error` whose cause was an approval **refusal** rather than a thrown tool (see below). |
+| `tool-state` **(v2)** | `toolCallId`, `toolName?`, `state: ToolRunState`, `denied?: boolean` **(1.9)**, `deniedReason?: string` **(1.9)** | Tool lifecycle transition — render live status without re-deriving it from part ordering. States: `input-streaming`, `input-complete`, `awaiting-approval`, `executing`, `complete`, `error`. `denied: true` qualifies a terminal `error` whose cause was an approval **refusal** rather than a thrown tool (see below). `outcome?: ToolCallOutcome` **(2.3)** names the cause on a terminal `error` and is `'approval-pending'` on `awaiting-approval`. |
 | `cost` **(v2)** | `costUsd`, `deltaUsd?`, `cacheSavingsUsd?`, `stepIndex?` | Live cumulative USD cost, one per step when `deps.priceProvider` is injected. See [Pricing](/docs/modules/pricing#live-cost-stream). |
 | `budget-exceeded` **(v2)** | `kind: 'usd' \| 'tokens'`, `limit: number`, `value: number` | The `budget` guardrail tripped — precedes the terminal `finish`. |
 | `plan-update` **(v2, 1.8)** | `goal?`, `tasks: { id, title, status, notes? }[]` | Live plan snapshot from `emitPlanUpdate` — render a to-do panel. See [Autonomy](/docs/modules/autonomy). |
@@ -408,12 +496,20 @@ stream.writeData('progress', 0.4, { transient: true }); // never journaled
 | `verify` **(v2, 1.9)** | `stepIndex`, `attempt`, `ok`, `willRetry`, `feedback?` | A [`verifyStep`](/docs/agents/tool-loop) verdict — render "checking…" / "retrying". Field names mirror the canonical `VerifyPart` exactly. Journaled and replayed on resume like any other part. |
 | `warning` **(v2, 1.9)** | `warning: { type, setting?, message }` | A non-fatal execution notice — a stripped sampling param, an unknown-slug capability fallback, a tool or document the wire could not carry. The payload **is** the canonical `CallWarning`, so the live view and `StreamChatResult.warnings` are one shape. `message` is passed through the secret redactor on the way out. Purely informational: it never ends the stream (that is `error`). `type` is an **open** union — treat an unknown value as `'other'`. |
 | `false-finish` **(v2, 1.9)** | `stepIndex`, `attempt`, `willRetry` | The `doneWhen` guard rejected a natural completion — render "not done yet, continuing". One part per rejection, always before the terminal `finish`; `willRetry: false` spent the `falseFinishGuard` budget, so the run stops anyway. Field names mirror the canonical `FalseFinishPart` exactly. Journaled and replayed like `verify`. |
-| `finish` | `finishReason: FinishReason`, `usage: Usage` | Last meaningful part — the whole turn finished. |
+| `finish` | `finishReason: FinishReason`, `usage: Usage`, `stopDetails?: StopDetails` **(2.3)** | Last meaningful part — the whole turn finished. `stopDetails` is the provider's explanation of an early stop (a refusal's `category` and `explanation`), secret-redacted; absent when the provider explained nothing. |
 | `error` | `message: string` | A stream error occurred; `message` is redacted of secrets. |
 
 `Usage` and `FinishReason` are the canonical types from the core ([usage breakdown](/docs/core/stream-chat)). The `tool-input-delta` fragments accumulate into the `input` you receive on the matching `tool-call` — render the deltas for a live "typing the arguments" effect, then swap to the final `input`.
 
 Since 2.3 the wire's `reasoning-delta` carries the canonical part's `id`, `encrypted`, `redacted` and `source`, so a chat client rebuilds every reasoning block and sends it back unchanged (`useChat` does; see [Reasoning parts](/docs/core/messages#reasoning-parts)). Before 2.3 it carried only `text` and `signature`. The fields ride every wire version, and a client that does not know them ignores them like any unknown key. That is why an opaque block (an OpenAI encrypted item, a Claude `redacted_thinking` block) puts its payload in `data` and sends an empty `text`: a client that predates these fields, such as a 2.2 `@deuz-sdk/react`, the frozen `@deuz-sdk/core/react` hook or your own reader, appends `text` to the reasoning it shows, so it shows nothing for the block instead of the payload. `applyUIPart` reads the payload back from `data`. A reader of your own should skip a frame flagged `encrypted` or `redacted` when it renders reasoning, and keep `data` only to send the block back.
+
+### Refusals, outcomes and thinking display (2.3)
+
+- **A refusal says why.** `finish` and `step-finish` carry `stopDetails`, normalized exactly like `StreamChatResult.stopDetails`. With Claude a refusal ends with `finishReason: 'content_filter'` and `stopDetails: { type: 'refusal', category, explanation }`. `applyUIPart` keeps the `finish` frame's on `AssistantTurnState.stopDetails`, and `useChat` exposes it as `stopDetails`. The `explanation` passes the secret redactor on the way out.
+- **How a tool call ended.** `tool-state` and `tool-result` carry the dispatch contract's `outcome` (see [Outcomes](/docs/modules/native-agents#outcomes)): `'tool-error'`, `'permission-denied'`, `'approval-denied'`, `'approval-pending'` or `'unknown-effect'`. `applyUIPart` keeps the latest one on `UIToolCall.outcome`, so a guardrail block and an approver's no, which both set `denied`, render differently. A frame without one (the call is running again, or it succeeded) clears it.
+- **Claude's thinking display modes.** Under `display: 'omitted'` (the Claude 5.x default) a thinking block streams no text, only its signature. It arrives as a `reasoning-delta` with an empty `text` and stays exactly that: an empty, signed reasoning part, sent back unchanged, adding nothing to the readable `reasoning` text. A renderer can show it as "thinking…" or skip it; nothing is invented for it. Under `display: 'updates'` the block's text is Claude's progress notes, and it renders like any reasoning. Both follow `@anthropic-ai/sdk` 0.133.0's beta types, where `'updates'` (beta `thinking-display-updates-2026-08-18`) changes the text, not the block shape. Not live-verified.
+
+All three are optional fields on parts that already exist, so they ride every wire version and an older client ignores them.
 
 ### Rendering a denial, not a failure
 

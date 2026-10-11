@@ -110,8 +110,56 @@ console.log((await stream.result).text);
 `textStream`, `partialOutputStream` and `elementStream` are additional views.
 Partial output is an `unknown` draft, and array elements belong to an attempt;
 only a completed result validates the entire final value. Native agent streams
-are live streams. Use the [swarm journal](/docs/modules/swarm) for durable control
-events with sequence cursors.
+are live streams. To put a run on the UI wire with a replayable journal, see
+[Native agents in a UI](#native-agents-in-a-ui); for durable control events across a
+DAG, use the [swarm journal](/docs/modules/swarm).
+
+## Native agents in a UI
+
+Since 2.3, `toDeuzAgentStreamResponse` (`@deuz-sdk/core/ui`) serializes a
+`streamAgent` or `resumeStreamAgent` stream to the [Deuz UI wire](/docs/modules/ui-streaming#native-agent-runs-todeuzagentstreamresponse-23).
+The run's parts go out as a chat stream's do, and `data-agent` frames add the run
+id, a sequence, the phases, drafts of the output, and the terminal state: the
+validated output, the pending approvals and client calls, the stop reason with its
+`stopDetails`, or the failure. On the client, `agentStateFromParts` folds the
+frames, and `useChat` from `@deuz-sdk/react` drives the whole loop:
+
+```ts
+import { streamAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { toDeuzAgentStreamResponse } from '@deuz-sdk/core/ui';
+
+export function POST(): Response {
+  const stream = streamAgent({
+    model: createMockModel({ responses: [{ text: 'Hello' }] }),
+    prompt: 'Say hello.',
+  });
+  // Subscribes before it returns: no event is lost, whatever the route does next.
+  return toDeuzAgentStreamResponse(stream, { runId: 'demo' });
+}
+```
+
+What the bridge guarantees:
+
+- **Typed output only from the terminal state.** A draft (`partial`) is never
+  `T`. Only a `completed` state carries `output`, the one the run validated.
+- **Every frame applies once.** Each frame's `seq` is its SSE event id. A reducer
+  applies a frame only when its `seq` is above the state's, so a replay that
+  overlaps the live stream, a duplicate, or a stale frame never applies twice.
+- **Replay needs a journal.** Pass `store` and `streamId` (one per run, such as
+  the run id) and every leg numbers on from the last one, so a client resumes from
+  its cursor through `resumeDeuzStreamResponse`. Without a store, a response
+  cannot be replayed.
+- **Resume in one request.** `resumeStreamAgent` proceeds only with a verdict for
+  every pending approval and a result for every pending client call, so a client
+  sends `runId` with both together. `useChat` does this for you.
+- **Nothing private leaves the server**: no transcript, no raw tool results (the
+  `tool-output` event's `rawResult`), no receipts, no ledger. Failure messages
+  are secret-redacted.
+
+The [`useChat` native route example](/docs/modules/react-hooks#native-agent-routes)
+shows a complete route and component: an approval and a client tool in one
+suspension, resumed with the run id.
 
 ## Strict checkpoints and approval resume
 

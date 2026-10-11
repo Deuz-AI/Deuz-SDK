@@ -456,7 +456,7 @@ describe('useChat — reconnect settles client tools like the POST path (F07)', 
     expect(chargeB).toHaveBeenCalledTimes(1);
   });
 
-  it('a dropped continuation is rebuilt from the cursor, not folded twice into its partial turn', async () => {
+  it('a dropped continuation continues from where its POST read stopped, never folded twice', async () => {
     const wire = journal();
     await wire.leg([parts.toolCall('c1', 'geo', {}), parts.finish()]); // seq 0, 1 (+ done 2)
     // The continuation is journaled whole (the server keeps running), but the
@@ -491,7 +491,9 @@ describe('useChat — reconnect settles client tools like the POST path (F07)', 
     });
     await waitFor(() => expect(result.current.status).toBe('idle'));
     expect(posts).toBe(1); // the reconnect re-read the journal; it did not re-POST
-    expect(wire.cursors).toEqual([undefined, '1']);
+    // Since 2.3 the POST read's event ids move the cursor (the G1 hand-off):
+    // the reconnect asks for what came after 'Hel' and continues that turn.
+    expect(wire.cursors).toEqual([undefined, '3']);
     expect(result.current.error).toBeUndefined();
     expect(result.current.messages.at(-1)?.content).toBe('Hello, Paris.');
     expect(result.current.messages.filter((m) => m.role === 'assistant')).toHaveLength(2);
@@ -768,7 +770,7 @@ describe('useChat — recycled call ids in a replayed turn (2.3)', () => {
     });
   });
 
-  it('runs an identical repeated client call after a reconnect from no cursor', async () => {
+  it('runs an identical repeated client call after a reconnect that follows a dropped POST', async () => {
     // Both legs ask roll({}) as tool_0. Leg 1 is answered; leg 2's stream drops.
     const leg = [parts.toolCall('tool_0', 'roll', {}), parts.finish()];
     const wire = journal();
@@ -794,15 +796,49 @@ describe('useChat — recycled call ids in a replayed turn (2.3)', () => {
     await waitFor(() => expect(result.current.status).toBe('error'));
     expect(onToolCall).toHaveBeenCalledTimes(1);
 
-    // POST reads never advance the cursor, so this replays both legs: two
-    // deliveries of roll({}) against one answer in the history.
+    // The POST reads carried the journal's ids (2.3), so the reconnect asks
+    // for the rest of leg 2 only. Its roll({}) is new, although the history
+    // already answers an identical tool_0 from leg 1.
     await act(async () => {
       await result.current.reconnect();
     });
     await waitFor(() => expect(result.current.status).toBe('idle'));
-    expect(wire.cursors).toEqual([undefined]);
+    expect(wire.cursors).toEqual(['3']);
     expect(onToolCall).toHaveBeenCalledTimes(2);
     expect(posts).toBe(3);
+    expect(result.current.messages.at(-1)?.content).toBe('Rolled twice.');
+  });
+
+  it('runs an identical repeated client call once when a reload replays both legs from no cursor', async () => {
+    // Both legs ask roll({}) as tool_0. The app persisted leg 1 with its
+    // answer; leg 2 was in flight when the page reloaded, and no cursor survived.
+    const leg = [parts.toolCall('tool_0', 'roll', {}), parts.finish()];
+    const wire = journal();
+    await wire.leg(leg);
+    await wire.leg(leg);
+    const route = answeringRoute('Rolled twice.');
+    const onToolCall = vi.fn(async (_call: ToolCallArg) => 4);
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/chat',
+        fetch: route.fetch,
+        onToolCall,
+        resume: { endpoint: wire.endpoint, auto: true },
+        initialMessages: [
+          { role: 'user', content: 'roll twice' },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'tool_0', name: 'roll', input: {} }],
+          },
+          { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'tool_0', result: 4 }] },
+        ],
+      }),
+    );
+    // The replay holds both legs: two deliveries of roll({}) against one answer.
+    await waitFor(() => expect(route.bodies).toHaveLength(1));
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(wire.cursors).toEqual([undefined]);
+    expect(onToolCall).toHaveBeenCalledTimes(1);
     expect(result.current.messages.at(-1)?.content).toBe('Rolled twice.');
   });
 
@@ -832,12 +868,13 @@ describe('useChat — recycled call ids in a replayed turn (2.3)', () => {
     expect(onToolCall).toHaveBeenCalledTimes(1);
 
     // The replay holds leg 2 only. Its roll({}) is new, although the history
-    // already answers an identical tool_0 from leg 1.
+    // already answers an identical tool_0 from leg 1. The cursor is where the
+    // continuation's POST read stopped (2.3).
     await act(async () => {
       await result.current.reconnect();
     });
     await waitFor(() => expect(result.current.status).toBe('idle'));
-    expect(wire.cursors).toEqual([undefined, '1']);
+    expect(wire.cursors).toEqual([undefined, '3']);
     expect(onToolCall).toHaveBeenCalledTimes(2);
     expect(posts).toBe(2);
     // The transcript never ends on an unanswered tool_use.
