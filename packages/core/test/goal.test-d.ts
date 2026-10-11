@@ -35,6 +35,12 @@ describe('goal types (2.3)', () => {
     expectTypeOf<GoalWaiting['reason']>().toEqualTypeOf<GoalWaitReason>();
   });
 
+  it('keeps the wait a spent budget interrupted, never another budget wait', () => {
+    expectTypeOf<Extract<GoalWaiting, { reason: 'budget' }>['interrupted']>().toEqualTypeOf<
+      Exclude<GoalWaiting, { reason: 'budget' }> | undefined
+    >();
+  });
+
   it('enters every wait but a budget one by command', () => {
     expectTypeOf<GoalWaitRequest['reason']>().toEqualTypeOf<
       'user' | 'event' | 'dependency' | 'wakeup'

@@ -23,7 +23,7 @@ import type {
 export const GOAL_RECORD_VERSION = 1;
 /** The GoalEvent format this build writes, and the newest it reads. */
 export const GOAL_EVENT_VERSION = 1;
-/** How many applied event and charge keys a record remembers. */
+/** How many applied event keys a record remembers, and how many charge keys apart from them. */
 export const GOAL_SEEN_LIMIT = 64;
 
 export const GOAL_STATUSES: readonly GoalStatus[] = [
@@ -277,7 +277,16 @@ export function checkWaitDetails(check: GoalChecker, wait: Fields, path: string)
   else if (reason === 'wakeup') {
     check.time(wait.at, `${path}.at`);
     check.optionalString(wait.schedule, `${path}.schedule`);
-  } else if (reason === 'budget') check.oneOf(wait.limit, ['usd', 'tokens'], `${path}.limit`);
+  } else if (reason === 'budget') {
+    check.oneOf(wait.limit, ['usd', 'tokens'], `${path}.limit`);
+    // The wait a spent budget interrupted, never itself a budget wait.
+    if (wait.interrupted !== undefined) {
+      const interrupted = check.object(wait.interrupted, `${path}.interrupted`);
+      if (interrupted.reason === 'budget')
+        check.fail(`${path}.interrupted.reason`, 'must not be budget');
+      checkWaiting(check, interrupted, `${path}.interrupted`);
+    }
+  }
 }
 
 function checkWaiting(check: GoalChecker, value: unknown, path: string): GoalWaiting {
@@ -354,10 +363,12 @@ export function checkGoalRecord(value: unknown): GoalRecord {
     check.time(outcome.at, 'outcome.at');
   } else if (record.outcome !== undefined)
     check.fail('outcome', 'must be absent until the goal ends');
-  const seen = check.array(record.seen, 'seen');
-  if (seen.length > GOAL_SEEN_LIMIT)
-    check.fail('seen', `must hold at most ${GOAL_SEEN_LIMIT} keys`);
-  seen.forEach((key, index) => check.string(key, `seen[${index}]`));
+  for (const window of ['seen', 'charged'] as const) {
+    const keys = check.array(record[window], window);
+    if (keys.length > GOAL_SEEN_LIMIT)
+      check.fail(window, `must hold at most ${GOAL_SEEN_LIMIT} keys`);
+    keys.forEach((key, index) => check.string(key, `${window}[${index}]`));
+  }
   check.time(record.createdAt, 'createdAt');
   check.time(record.updatedAt, 'updatedAt');
   if (record.meta !== undefined) {
@@ -378,6 +389,7 @@ export function withGoalDefaults(value: unknown): unknown {
   if (value.results === undefined) missing.results = [];
   if (value.spent === undefined) missing.spent = { usd: 0, tokens: 0 };
   if (value.seen === undefined) missing.seen = [];
+  if (value.charged === undefined) missing.charged = [];
   return Object.keys(missing).length ? { ...value, ...missing } : value;
 }
 

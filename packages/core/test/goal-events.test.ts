@@ -290,6 +290,78 @@ describe('applying events', () => {
     expect(both.record.status).toBe('active');
   });
 
+  it('settles a dependency that finished just before the wait began', () => {
+    const done = (id: string, at: number, correlationId?: string) =>
+      event({
+        key: `${id}-done`,
+        source: { type: 'run', id },
+        at,
+        ...(correlationId !== undefined ? { correlationId } : {}),
+      });
+    // The host started r1 and r2, then recorded the wait; r1 had finished.
+    const goal = waiting(
+      {
+        reason: 'dependency',
+        on: [
+          { kind: 'run', id: 'r1' },
+          { kind: 'run', id: 'r2' },
+        ],
+      },
+      T0 + 6,
+    );
+    // Delivered before the wait, its completion matched nothing and was not kept.
+    const active = createGoal({ ...target, objective: 'Ship it.' }, { now: T0 });
+    expect(apply(active, done('r1', T0 + 5), T0 + 5)).toMatchObject({ reason: 'unmatched' });
+    // A completion is a state: delivered again once the goal waits, it settles r1.
+    const one = apply(goal, done('r1', T0 + 5), T0 + 7);
+    expect(one).toMatchObject({ outcome: 'applied', record: { status: 'waiting' } });
+    expect(apply(one.record, done('r2', T0 + 8), T0 + 8).record.status).toBe('active');
+    // An answer to another wait is still stale.
+    expect(apply(goal, done('r1', T0 + 5, 'g#1'), T0 + 7)).toMatchObject({ reason: 'stale' });
+  });
+
+  it('keeps a dependency the wait request marks settled', () => {
+    const goal = waiting({
+      reason: 'dependency',
+      on: [
+        { kind: 'run', id: 'r1', settled: true },
+        { kind: 'run', id: 'r2', settled: false },
+      ],
+    });
+    expect(goal.waiting).toEqual(
+      expect.objectContaining({
+        on: [
+          { kind: 'run', id: 'r1', settled: true },
+          { kind: 'run', id: 'r2' },
+        ],
+      }),
+    );
+    const r2 = apply(goal, event({ key: 'r2-done', source: { type: 'run', id: 'r2' } }));
+    expect(r2.record.status).toBe('active');
+  });
+
+  it('leaves a goal active on a dependency wait with nothing left to wait for', () => {
+    const settled = {
+      reason: 'dependency' as const,
+      on: [{ kind: 'goal' as const, id: 'changelog', settled: true }],
+    };
+    const active = createGoal({ ...target, objective: 'Ship it.' }, { now: T0 });
+    expect(transitionGoal(active, { type: 'wait', wait: settled }, { now: T0 + 1 })).toMatchObject({
+      changed: false,
+      outcome: 'ignored',
+      reason: 'unchanged',
+    });
+    // It replaces another wait, and is over as it begins.
+    const replaced = transitionGoal(
+      waiting({ reason: 'user' }),
+      { type: 'wait', wait: settled },
+      { now: T0 + 2 },
+    );
+    expect(replaced).toMatchObject({ changed: true, outcome: 'applied' });
+    expect(replaced.record.status).toBe('active');
+    expect(replaced.record.waiting).toBeUndefined();
+  });
+
   it('ends a wakeup wait with an event dated at or after the wakeup', () => {
     const goal = waiting({ reason: 'wakeup', at: T0 + 60_000, schedule: 'nightly' });
     const occurrence = (id: string, at: number) =>
@@ -309,23 +381,89 @@ describe('applying events', () => {
     expect(apply(plain, goalWakeupEvent(plain), T0 + 60_000).record.status).toBe('active');
   });
 
-  it('remembers the last 64 keys it applied', () => {
+  it('ends a wakeup wait that was due as it began with its own wakeup event, as a tick does', () => {
+    // A retry-after of 0, or a time computed a moment before the transition.
+    const goal = waiting({ reason: 'wakeup', at: T0 + 5 }, T0 + 10);
+    const wakeup = goalWakeupEvent(goal);
+    expect(wakeup).toMatchObject({
+      key: goalWakeupKey('g', T0 + 5),
+      at: T0 + 10,
+      notBefore: T0 + 5,
+      correlationId: 'g#2',
+    });
+    expect(apply(goal, wakeup, T0 + 11)).toMatchObject({
+      outcome: 'applied',
+      record: { status: 'active' },
+    });
+    expect(transitionGoal(goal, { type: 'tick' }, { now: T0 + 11 }).record.status).toBe('active');
+  });
+
+  it('remembers the last 64 event keys, and apart from them the last 64 charge keys', () => {
     let goal = createGoal({ ...target, objective: 'x' }, { now: T0 });
+    let now = T0;
     for (let index = 0; index < 65; index++)
       goal = transitionGoal(
         goal,
         { type: 'charge', tokens: 1, key: `k${index}` },
-        { now: T0 + index + 1 },
+        { now: ++now },
       ).record;
-    expect(goal.seen).toHaveLength(64);
-    expect(goal.seen[0]).toBe('k1');
-    // The oldest key fell out of the window: pair the goal with a durable
-    // claim on the same key to dedupe further back.
+    expect(goal.charged).toHaveLength(64);
+    expect(goal.charged[0]).toBe('k1');
+    expect(goal.seen).toEqual([]);
+    // The oldest key fell out of the window.
     expect(
-      transitionGoal(goal, { type: 'charge', tokens: 1, key: 'k0' }, { now: T0 + 100 }).changed,
+      transitionGoal(goal, { type: 'charge', tokens: 1, key: 'k0' }, { now: ++now }).changed,
     ).toBe(true);
     expect(
-      transitionGoal(goal, { type: 'charge', tokens: 1, key: 'k64' }, { now: T0 + 100 }).reason,
+      transitionGoal(goal, { type: 'charge', tokens: 1, key: 'k64' }, { now: ++now }).reason,
     ).toBe('duplicate');
+    // Events fill a window of their own, and push no charge key out.
+    for (let index = 0; index < 65; index++) {
+      goal = transitionGoal(
+        goal,
+        { type: 'wait', wait: { reason: 'user' } },
+        { now: ++now },
+      ).record;
+      goal = apply(goal, event({ key: `e${index}`, at: now }), ++now).record;
+    }
+    expect(goal.seen).toHaveLength(64);
+    expect(goal.seen[0]).toBe('e1');
+    expect(goal.charged[0]).toBe('k1');
+    // Further back, pair the goal with a durable claim on the event's key.
+    goal = transitionGoal(goal, { type: 'wait', wait: { reason: 'user' } }, { now: ++now }).record;
+    expect(apply(goal, event({ key: 'e0', at: now }), ++now).outcome).toBe('applied');
+  });
+
+  it("keeps a run's charge and its completion event apart, both keyed by the run ID", () => {
+    const goal = waiting({ reason: 'dependency', on: [{ kind: 'run', id: 'run-1' }] });
+    const completed = event({ key: 'run-1', source: { type: 'run', id: 'run-1' }, at: T0 + 3 });
+    const charge = { type: 'charge', usd: 0.5, tokens: 100, key: 'run-1' } as const;
+    // The charge first: the completion still ends the wait.
+    const charged = transitionGoal(goal, charge, { now: T0 + 2 }).record;
+    expect(apply(charged, completed, T0 + 4)).toMatchObject({
+      outcome: 'applied',
+      record: { status: 'active', seen: ['run-1'], charged: ['run-1'] },
+    });
+    // The completion first: the charge still counts.
+    const settled = apply(goal, completed, T0 + 4).record;
+    const counted = transitionGoal(settled, charge, { now: T0 + 5 });
+    expect(counted).toMatchObject({
+      outcome: 'applied',
+      record: { spent: { usd: 0.5, tokens: 100 } },
+    });
+    // Each again is a duplicate of itself.
+    expect(transitionGoal(counted.record, charge, { now: T0 + 6 })).toMatchObject({
+      outcome: 'ignored',
+      reason: 'duplicate',
+    });
+    const again = transitionGoal(
+      counted.record,
+      { type: 'wait', wait: { reason: 'dependency', on: [{ kind: 'run', id: 'run-1' }] } },
+      { now: T0 + 6 },
+    ).record;
+    expect(apply(again, completed, T0 + 7)).toMatchObject({
+      outcome: 'ignored',
+      reason: 'duplicate',
+    });
   });
 });

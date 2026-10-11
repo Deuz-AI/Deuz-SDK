@@ -84,11 +84,33 @@ function exhausted(record: GoalRecord): 'usd' | 'tokens' | undefined {
   return undefined;
 }
 
+/**
+ * The wait events and time answer: the goal's own, or the one a spent budget
+ * interrupted, which still ends meanwhile. None while the goal is not waiting.
+ */
+function answerable(record: GoalRecord): Exclude<GoalWaiting, { reason: 'budget' }> | undefined {
+  const wait = record.status === 'waiting' ? record.waiting : undefined;
+  return wait?.reason === 'budget' ? wait.interrupted : wait;
+}
+
 const criterionOf = (input: GoalCriterionInput): GoalCriterion => ({
   id: input.id,
   description: input.description,
   ...(input.required !== undefined ? { required: input.required } : {}),
 });
+
+/** Criteria that say the same, on the fields this build knows. */
+const sameCriterion = (left: GoalCriterion, right: GoalCriterion): boolean =>
+  left.id === right.id &&
+  left.description === right.description &&
+  left.required === right.required;
+
+/** The fields of a stored criterion this build does not know: a later 2.x release added them. */
+function addedFields(criterion: GoalCriterion | undefined): Record<string, unknown> {
+  if (!criterion) return {};
+  const { id: _id, description: _description, required: _required, ...added } = criterion;
+  return added;
+}
 
 const evidenceOf = (input: GoalEvidenceInput, now: number): GoalEvidence => ({
   id: input.id,
@@ -100,9 +122,14 @@ const evidenceOf = (input: GoalEvidenceInput, now: number): GoalEvidence => ({
   at: input.at ?? now,
 });
 
-/** Evidence that says the same, whenever it was recorded. */
+/**
+ * Evidence that says the same, whenever it was recorded, on the fields this
+ * build knows: what a later 2.x release added to it makes no conflict.
+ */
 const sameEvidence = (left: GoalEvidence, right: GoalEvidence): boolean =>
-  JSON.stringify({ ...left, at: 0 }) === JSON.stringify({ ...right, at: 0 });
+  (['id', 'source', 'ref', 'digest', 'summary', 'runId'] as const).every(
+    (field) => left[field] === right[field],
+  );
 
 /**
  * A new goal (2.3): `active`, at revision 1. Without criteria, the objective
@@ -143,6 +170,7 @@ export function createGoal(input: CreateGoalInput, options: { now: number }): Go
     ...(input.deadline !== undefined ? { deadline: input.deadline } : {}),
     status: 'active',
     seen: [],
+    charged: [],
     createdAt: now,
     updatedAt: now,
     ...(input.meta !== undefined ? { meta: structuredClone(input.meta) } : {}),
@@ -243,15 +271,23 @@ class Draft {
     return this.base.revision + 1;
   }
 
-  remember(key: string): void {
+  /** Remembers an applied key: an event's in `seen`, a charge's apart from them in `charged`. */
+  remember(key: string, window: 'seen' | 'charged' = 'seen'): void {
     const record = this.edit();
-    record.seen = [...record.seen, key].slice(-GOAL_SEEN_LIMIT);
+    record[window] = [...record[window], key].slice(-GOAL_SEEN_LIMIT);
   }
 
   activate(): void {
     const record = this.edit();
     record.status = 'active';
     delete record.waiting;
+  }
+
+  /** Ends the wait an event or a tick answered; a spent budget still holds the goal. */
+  answer(): void {
+    const record = this.edit();
+    if (record.waiting?.reason === 'budget') delete record.waiting.interrupted;
+    else this.activate();
   }
 
   end(status: 'completed' | 'failed' | 'cancelled', outcome: GoalRecord['outcome']): void {
@@ -261,7 +297,10 @@ class Draft {
     delete record.waiting;
   }
 
-  /** A spent budget holds a goal that has not ended; a raised one releases it. */
+  /**
+   * A spent budget holds a goal that has not ended, keeping the wait it
+   * interrupts; a raised one releases it, back to that wait if there is one.
+   */
   settleBudget(): void {
     const record = this.current;
     if (isTerminal(record)) return;
@@ -269,14 +308,21 @@ class Draft {
     const budgetWait = record.status === 'waiting' && record.waiting?.reason === 'budget';
     if (limit && !budgetWait) {
       const next = this.edit();
+      const interrupted = answerable(next);
       next.status = 'waiting';
       next.waiting = {
         reason: 'budget',
         id: `${record.goalId}#${this.nextRevision}`,
         since: this.now,
         limit,
+        ...(interrupted ? { interrupted } : {}),
       };
-    } else if (!limit && budgetWait) this.activate();
+    } else if (!limit && budgetWait) {
+      const next = this.edit();
+      const interrupted = answerable(next);
+      if (interrupted) next.waiting = interrupted;
+      else this.activate();
+    }
   }
 
   finish(step: Step): GoalTransition {
@@ -325,8 +371,9 @@ function apply(draft: Draft, command: GoalCommand): Step {
     case 'tick': {
       if (draft.changed) return applied();
       if (isTerminal(goal)) return ignored('terminal');
-      if (goal.waiting?.reason === 'wakeup' && now >= goal.waiting.at) {
-        draft.activate();
+      const wait = answerable(goal);
+      if (wait?.reason === 'wakeup' && now >= wait.at) {
+        draft.answer();
         return applied();
       }
       return ignored('unchanged');
@@ -334,14 +381,17 @@ function apply(draft: Draft, command: GoalCommand): Step {
     case 'event':
       return applyEvent(draft, command.event);
     case 'charge': {
-      if (command.key !== undefined && goal.seen.includes(command.key)) return ignored('duplicate');
+      // Charge keys are a space of their own: a run's charge and its completion
+      // event may both be keyed by the run ID.
+      if (command.key !== undefined && goal.charged.includes(command.key))
+        return ignored('duplicate');
       const usd = command.usd ?? 0;
       const tokens = command.tokens ?? 0;
       if (usd === 0 && tokens === 0 && command.key === undefined) return ignored('unchanged');
       // A run's spend is recorded even after the goal ended.
       const next = draft.edit();
       next.spent = { usd: next.spent.usd + usd, tokens: next.spent.tokens + tokens };
-      if (command.key !== undefined) draft.remember(command.key);
+      if (command.key !== undefined) draft.remember(command.key, 'charged');
       draft.settleBudget();
       return applied();
     }
@@ -353,9 +403,16 @@ function apply(draft: Draft, command: GoalCommand): Step {
   switch (command.type) {
     case 'wait': {
       if (goal.waiting?.reason === 'budget') return rejected('budget-exhausted');
+      const wait = waitingOf(command.wait, `${goal.goalId}#${draft.nextRevision}`, now);
+      // A dependency wait whose every dependency settled is over as it begins.
+      if (wait.reason === 'dependency' && wait.on.every((dependency) => dependency.settled)) {
+        if (goal.status === 'active') return ignored('unchanged');
+        draft.activate();
+        return applied();
+      }
       const next = draft.edit();
       next.status = 'waiting';
-      next.waiting = waitingOf(command.wait, `${goal.goalId}#${draft.nextRevision}`, now);
+      next.waiting = wait;
       return applied();
     }
     case 'resume': {
@@ -417,11 +474,15 @@ function waitingOf(request: GoalWaitRequest, fallbackId: string, now: number): G
         },
       };
     case 'dependency':
-      // A new wait starts with nothing settled.
+      // Settled only where the request says the dependency already finished.
       return {
         reason: 'dependency',
         ...base,
-        on: request.on.map((dependency) => ({ kind: dependency.kind, id: dependency.id })),
+        on: request.on.map((dependency) => ({
+          kind: dependency.kind,
+          id: dependency.id,
+          ...(dependency.settled ? { settled: true } : {}),
+        })),
       };
     case 'wakeup':
       return {
@@ -437,9 +498,11 @@ function waitingOf(request: GoalWaitRequest, fallbackId: string, now: number): G
  * Applies an outside event. In order: an event for another goal throws; a
  * goal that ended, an event already applied, one past its `expiresAt` or
  * before its `notBefore`, one while the goal waits for nothing, one answering
- * another wait or older than this one, and one the wait is not for are
- * dropped, each with its reason. Otherwise the event ends the wait (a
- * dependency wait once every dependency reported) and its key is remembered.
+ * another wait or older than this one (a dependency's completion is never too
+ * old), and one the wait is not for are dropped, each with its reason.
+ * Otherwise the event ends the wait (a dependency wait once every dependency
+ * reported) and its key is remembered. During a budget wait, the wait is the
+ * one the budget interrupted.
  */
 function applyEvent(draft: Draft, event: GoalEvent): Step {
   const goal = draft.current;
@@ -452,10 +515,12 @@ function applyEvent(draft: Draft, event: GoalEvent): Step {
   if (goal.seen.includes(event.key)) return ignored('duplicate');
   if (event.expiresAt !== undefined && draft.now >= event.expiresAt) return ignored('expired');
   if (event.notBefore !== undefined && draft.now < event.notBefore) return ignored('early');
-  const wait = goal.waiting;
-  if (goal.status !== 'waiting' || !wait) return ignored('unmatched');
+  const wait = answerable(goal);
+  if (!wait) return ignored('unmatched');
   if (event.correlationId !== undefined && event.correlationId !== wait.id) return ignored('stale');
-  if (event.at < wait.since) return ignored('stale');
+  // A completion is a state: a dependency that finished just before the wait
+  // began has still finished.
+  if (wait.reason !== 'dependency' && event.at < wait.since) return ignored('stale');
   const { source } = event;
   switch (wait.reason) {
     case 'user':
@@ -482,17 +547,14 @@ function applyEvent(draft: Draft, event: GoalEvent): Step {
       );
       if (index < 0) return ignored('unmatched');
       draft.remember(event.key);
-      const next = draft.edit();
-      const on = (next.waiting as Extract<GoalWaiting, { reason: 'dependency' }>).on;
+      const { on } = answerable(draft.edit()) as Extract<GoalWaiting, { reason: 'dependency' }>;
       on[index] = { ...on[index]!, settled: true };
-      if (on.every((dependency) => dependency.settled)) draft.activate();
+      if (on.every((dependency) => dependency.settled)) draft.answer();
       return applied();
     }
-    case 'budget':
-      return ignored('unmatched');
   }
   draft.remember(event.key);
-  draft.activate();
+  draft.answer();
   return applied();
 }
 
@@ -577,17 +639,23 @@ function revise(draft: Draft, command: Extract<GoalCommand, { type: 'revise' }>)
   }
   if (command.criteria !== undefined) {
     const criteria = command.criteria.map(criterionOf);
-    if (differs(criteria, goal.criteria)) {
+    const stored = new Map(goal.criteria.map((criterion) => [criterion.id, criterion]));
+    if (
+      criteria.length !== goal.criteria.length ||
+      criteria.some((criterion, index) => !sameCriterion(criterion, goal.criteria[index]!))
+    ) {
       const next = draft.edit();
       // A verdict stands only for a criterion that still says the same.
-      const kept = new Map(
-        goal.criteria.map((criterion) => [criterion.id, JSON.stringify(criterion)]),
-      );
       next.results = next.results.filter((result) => {
-        const criterion = criteria.find((item) => item.id === result.criterionId);
-        return criterion !== undefined && kept.get(criterion.id) === JSON.stringify(criterion);
+        const before = stored.get(result.criterionId);
+        const after = criteria.find((item) => item.id === result.criterionId);
+        return before !== undefined && after !== undefined && sameCriterion(before, after);
       });
-      next.criteria = criteria;
+      // What a later 2.x release added to a criterion stays with it.
+      next.criteria = criteria.map((criterion) => ({
+        ...criterion,
+        ...addedFields(stored.get(criterion.id)),
+      }));
       changed = true;
     }
   }

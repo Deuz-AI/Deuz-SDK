@@ -429,7 +429,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         };
       }
       // Across processes (2.3): the run's lease, taken before the run is read,
-      // so a run another executor drives is refused before anything else.
+      // so a run another executor drives is refused before anything else. It
+      // is renewed at once and on a heartbeat from there: a cancel signalled
+      // after that first renewal stops this run, a new one included.
       if (options.lease !== undefined)
         lease = await claimNativeRunLease(
           options.lease,
@@ -485,8 +487,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       } else if (options.session && (await options.session.store.load(options.session.runId))) {
         throw new TypeError('Native run already exists; use resumeAgent.');
       }
-      // A cancel queued under the run's key stops a stored run that has not
-      // ended before any model call; a new run, or an ended one, drops it.
+      // A cancel the claim found queued under the run's key stops a stored run
+      // that has not ended before any model call; a new run, or an ended one,
+      // drops it. A runAgent that found the run existing threw above, leaving
+      // the cancel queued for that run.
       await lease?.collect(
         !resume ? 'fresh' : envelope.phase === 'terminal' ? 'terminal' : 'active',
       );

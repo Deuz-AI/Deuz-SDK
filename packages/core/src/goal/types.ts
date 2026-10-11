@@ -10,7 +10,8 @@ export type GoalStatus = 'active' | 'waiting' | 'completed' | 'failed' | 'cancel
 /**
  * Why a waiting goal makes no progress: a person, an outside event, other
  * goals or runs, a time, or a spent budget (which only a revision raising the
- * budget, or a cancel, ends).
+ * budget, or a cancel, ends). A budget wait keeps the wait it interrupted,
+ * and a raised budget puts that one back.
  */
 export type GoalWaitReason = 'user' | 'event' | 'dependency' | 'wakeup' | 'budget';
 
@@ -34,7 +35,7 @@ export interface GoalEventSource {
 export interface GoalDependency {
   kind: 'goal' | 'run';
   id: string;
-  /** Set once an event from it arrived. */
+  /** Set once an event from it arrived, or by the wait request when it already finished. */
   settled?: boolean;
 }
 
@@ -44,7 +45,10 @@ interface GoalWaitBase {
    * `correlationId`; one answering an earlier wait is stale.
    */
   id: string;
-  /** When the goal began waiting, epoch ms. An event older than this cannot end the wait. */
+  /**
+   * When the goal began waiting, epoch ms. An event older than this cannot end
+   * the wait, except one reporting a dependency: a completion is a state.
+   */
   since: number;
   /** What the goal waits for, for people. */
   note?: string;
@@ -70,6 +74,13 @@ export type GoalWaiting =
       reason: 'budget';
       /** The limit that ran out. */
       limit: 'usd' | 'tokens';
+      /**
+       * The wait the spent budget interrupted, as it was: a raised budget puts
+       * it back, `id` and `since` included. Events that answer it still apply
+       * meanwhile, as does a tick once its wakeup is due, and what ends it
+       * removes it.
+       */
+      interrupted?: Exclude<GoalWaiting, { reason: 'budget' }>;
     });
 
 type WaitRequestOf<W> = W extends GoalWaiting ? Omit<W, 'id' | 'since'> & { id?: string } : never;
@@ -77,7 +88,8 @@ type WaitRequestOf<W> = W extends GoalWaiting ? Omit<W, 'id' | 'since'> & { id?:
 /**
  * A wait to enter: `id` defaults to `<goalId>#<revision>`, the revision the
  * wait begins at, and `since` to the transition's time. A budget wait only
- * comes from a `charge`.
+ * comes from a `charge`. A dependency wait whose every dependency is
+ * `settled` is over as it begins: the goal stays, or becomes, active.
  */
 export type GoalWaitRequest = WaitRequestOf<Exclude<GoalWaiting, { reason: 'budget' }>>;
 
@@ -185,8 +197,14 @@ export interface GoalRecord {
   status: GoalStatus;
   waiting?: GoalWaiting;
   outcome?: GoalOutcome;
-  /** Dedupe keys of the last events and charges the goal applied, oldest first (at most 64). */
+  /** Dedupe keys of the last events the goal applied, oldest first (at most 64). */
   seen: string[];
+  /**
+   * Keys of the last charges the goal applied, oldest first (at most 64): a
+   * window of their own, so a charge and an event may share a key, such as a
+   * run ID. A writer may leave it out when empty.
+   */
+  charged: string[];
   createdAt: number;
   updatedAt: number;
   /** Application data, JSON. */
@@ -280,7 +298,7 @@ export type GoalCommand =
 export type GoalTransitionReason =
   /** An event or charge whose key the goal already applied. */
   | 'duplicate'
-  /** An event answering an earlier wait, or older than the wait. */
+  /** An event answering an earlier wait, or older than the wait (unless it reports a dependency). */
   | 'stale'
   /** An event applied at or after its `expiresAt`. */
   | 'expired'
@@ -310,9 +328,10 @@ export interface GoalTransition {
   record: GoalRecord;
   changed: boolean;
   /**
-   * `'applied'`: the command or event took effect. `'ignored'`: an event,
-   * charge or no-op left the goal as it was. `'rejected'`: the goal refused
-   * the command. A passed deadline can change the record even then.
+   * `'applied'`: the command or event took effect. `'ignored'`: the goal
+   * dropped an event, a charge or a no-op. `'rejected'`: the goal refused the
+   * command. A passed deadline fails the goal first, so `changed` can be true
+   * on any outcome.
    */
   outcome: 'applied' | 'ignored' | 'rejected';
   reason?: GoalTransitionReason;

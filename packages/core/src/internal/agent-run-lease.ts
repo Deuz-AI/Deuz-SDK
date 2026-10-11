@@ -5,7 +5,9 @@
  * executors hold theirs. Losing it stops every further write; a 'cancel'
  * signalled to the key stops the run. A provider with `ack` keeps a delivered
  * cancel queued until the run's terminal state is durable, so an executor
- * that dies in between cannot lose it. Edge-safe.
+ * that dies in between cannot lose it. The claim renews at once, before the
+ * run is read: what that renewal delivers was queued before the claim, and
+ * every cancel after it concerns the run being driven. Edge-safe.
  */
 import type { AgentRunLeaseOptions } from '../types/agent-run';
 import type { Clock } from '../types/deps';
@@ -59,9 +61,11 @@ export interface NativeRunLease {
   /** Throws `'lease_lost'` once the lease is gone: no write may follow. */
   assertHeld(): void;
   /**
-   * Take the signals queued under the key before the run starts, then renew
-   * on a heartbeat. A cancel may predate this claim: it stops a run that has
+   * Decide, once the run is read, on a cancel the claim's first renewal found
+   * queued under the key, which predates this claim: it stops a run that has
    * not ended; a new run starts clean of it, and an ended run makes it moot.
+   * A run never collected (one that turned out to exist, or not to) leaves it
+   * queued. A cancel any later renewal delivers concerns this run.
    */
   collect(state: NativeRunState): Promise<void>;
   /**
@@ -93,7 +97,9 @@ function assertLeaseOptions(options: AgentRunLeaseOptions): number {
 
 /**
  * Acquire a native run's lease, or throw `'lease_held'` while another owner
- * holds it. Nothing is renewed until `collect`.
+ * holds it, and renew it at once, before the run is read: that first renewal
+ * takes what was queued under the key before the claim, which `collect`
+ * decides on, and the heartbeat starts from it.
  */
 export async function claimNativeRunLease(
   options: AgentRunLeaseOptions,
@@ -111,17 +117,39 @@ export async function claimNativeRunLease(
     ttlMs: ttl,
   });
   if (!acquired) throw new AgentRunLeaseError('lease_held');
-  let held: Lease = acquired;
+
+  // Acknowledged delivery (2.3) where the provider can acknowledge; otherwise
+  // a renewal consumes what it delivers, as in 2.2.
+  const renewOptions: LeaseRenewOptions | undefined =
+    typeof provider.ack === 'function' ? { acknowledge: true } : undefined;
+  // The first renewal, with no other I/O since the claim: a cancel it
+  // delivers was queued before this executor held the key.
+  let first: LeaseRenewal;
+  try {
+    first = await provider.renew(acquired, ttl, renewOptions);
+  } catch (error) {
+    await provider.release(acquired).catch(() => {});
+    throw error;
+  }
+  if (!first.held) throw new AgentRunLeaseError('lease_lost');
+  let held: Lease = first.lease;
+  /**
+   * The cancel the first renewal delivered, if any, until `collect` decides
+   * on it: `'kept'` while the provider keeps it queued, `'consumed'` once it
+   * took it off the queue.
+   */
+  const found: 'kept' | 'consumed' | undefined = first.signals.includes('cancel')
+    ? first.queued?.includes('cancel')
+      ? 'kept'
+      : 'consumed'
+    : undefined;
+  let collected = false;
 
   const controller = new AbortController();
   const follow = (): void => controller.abort(signal?.reason);
   if (signal?.aborted) follow();
   else signal?.addEventListener('abort', follow, { once: true });
 
-  // Acknowledged delivery (2.3) where the provider can acknowledge; otherwise
-  // a renewal consumes what it delivers, as in 2.2.
-  const renewOptions: LeaseRenewOptions | undefined =
-    typeof provider.ack === 'function' ? { acknowledge: true } : undefined;
   let cancelled = false;
   /** A delivered cancel the provider keeps queued until acknowledged. */
   let kept = false;
@@ -143,7 +171,11 @@ export async function claimNativeRunLease(
   };
   const note = (renewal: LeaseRenewal): boolean => {
     if (!renewal.held || !renewal.signals.includes('cancel')) return false;
-    if (renewal.queued?.includes('cancel')) kept = true;
+    const keeps = !!renewal.queued?.includes('cancel');
+    // Until `collect` decides on the cancel the claim found, a provider that
+    // keeps it queued delivers it again: that is still the same cancel.
+    if (keeps && found === 'kept' && !collected) return false;
+    if (keeps) kept = true;
     else consumed = true;
     return true;
   };
@@ -168,6 +200,8 @@ export async function claimNativeRunLease(
     if (!stopped && !lost)
       stopBeat = clock.setTimeout(() => void renew().then(beat), Math.max(1, Math.floor(ttl / 3)));
   };
+  // The heartbeat runs from the first renewal on, while the run is read.
+  beat();
 
   return {
     signal: controller.signal,
@@ -180,26 +214,23 @@ export async function claimNativeRunLease(
     assertHeld() {
       if (lost) throw new AgentRunLeaseError('lease_lost');
     },
-    async collect(state) {
-      const renewal = await provider.renew(held, ttl, renewOptions);
-      if (!renewal.held) {
-        lost = true;
-        throw new AgentRunLeaseError('lease_lost');
-      }
-      held = renewal.lease;
-      if (renewal.signals.includes('cancel')) {
-        const keeps = !!renewal.queued?.includes('cancel');
-        if (state === 'active') {
-          if (keeps) kept = true;
+    collect(state) {
+      // In line with the renewals, so none delivers the cancel meanwhile.
+      const decided = renewals.then(async () => {
+        if (lost) throw new AgentRunLeaseError('lease_lost');
+        collected = true;
+        if (state === 'active' && found) {
+          if (found === 'kept') kept = true;
           else consumed = true;
           cancel();
-        } else if (keeps) {
+        } else if (found === 'kept') {
           // It predates a new run, or a run that already ended: left queued,
           // it would cancel whatever drives this run next.
           await provider.ack!(held, 'cancel');
         }
-      }
-      beat();
+      });
+      renewals = decided.catch(() => {});
+      return decided;
     },
     async release(recorded) {
       stopped = true;
@@ -208,8 +239,10 @@ export async function claimNativeRunLease(
       await renewals;
       if (recorded && kept && !lost) await provider.ack!(held, 'cancel').catch(() => false);
       // A cancel the provider no longer queues and the run did not record goes
-      // back to whoever holds the key next (2.2).
-      else if (!recorded && consumed) await provider.signal(key, 'cancel').catch(() => false);
+      // back to whoever holds the key next (2.2), and so does one the claim
+      // found when no `collect` decided on it.
+      else if (!recorded && (consumed || (!collected && found === 'consumed')))
+        await provider.signal(key, 'cancel').catch(() => false);
       if (!lost) await provider.release(held).catch(() => {});
     },
   };

@@ -60,7 +60,7 @@ console.log(goal.status, goal.revision); // active 1
 | `evidence`, `results` | References to evidence, append-only; the latest verdict per criterion |
 | `budget`, `spent`, `deadline` | Limits for the goal as a whole, what its runs spent, and when it fails |
 | `status`, `waiting`, `outcome` | `active`, `waiting` (with `waiting`) or ended: `completed`, `failed`, `cancelled` (with `outcome`) |
-| `seen` | The dedupe keys of the last 64 events and charges the goal applied |
+| `seen`, `charged` | The dedupe keys of the last 64 events the goal applied; apart from them, the keys of its last 64 charges |
 | `meta` | Your own data, JSON |
 
 ## Transitions
@@ -78,8 +78,13 @@ revision higher, and says what it did:
 | `outcome` | Meaning |
 | --- | --- |
 | `'applied'` | The command or event took effect |
-| `'ignored'` | An event, a charge or a no-op left the goal as it was; `reason` says why |
-| `'rejected'` | The goal refused the command; `reason` says why, and nothing changed |
+| `'ignored'` | An event, a charge or a no-op the goal dropped; `reason` says why |
+| `'rejected'` | The goal refused the command; `reason` says why |
+
+Time comes first: once the deadline passed, the goal fails before the command
+applies, so `changed` can be true on any outcome. A `resume` after the deadline
+is `'rejected'` and an event `'ignored'`, both with reason `'terminal'` and the
+goal now failed. Save whenever `changed` is true, as above.
 
 A malformed record or command, an event meant for another goal, and an
 `expectedRevision` the record is not at throw a `GoalError` instead, with a
@@ -114,12 +119,20 @@ is `active` until a command says what it waits for. `waiting.reason` is one of:
 | `'event'` | An outside event from `source` (a type, and an ID when given) | A matching event, or `resume` |
 | `'dependency'` | Other goals or native runs, in `on` | An event from each of them (`goal` or `run` source with its ID), or `resume` |
 | `'wakeup'` | A time, `at`, optionally a schedule's occurrence | A `tick` at or after `at`, an event dated then, or `resume` |
-| `'budget'` | More budget: a charge reached a limit | A `revise` that raises the budget, or a cancel |
+| `'budget'` | More budget: a charge reached a limit | A `revise` that raises the budget, or a cancel; the wait it interrupted comes back |
 
 Every wait has an `id` (by default `<goalId>#<revision>`) and a `since`. An
 event that answers the wait carries the `id` as `correlationId`. A new wait
 replaces the current one, except a budget wait, which only a revision raising
 the budget ends.
+
+A spent budget does not replace the wait it interrupts: the budget wait keeps
+it, as it was, in `interrupted`. Events that answer it still apply meanwhile,
+and so does a tick once its wakeup is due; what ends it removes it. A revision
+raising the budget puts it back, with its `id` and `since`, or makes the goal
+active when nothing is left to wait for. A goal that waited for a person when a
+run's charge spent its budget still waits for that person once the budget is
+raised.
 
 ```ts
 import { createGoal, goalEventFromSignal, transitionGoal } from '@deuz-sdk/core/goal';
@@ -212,16 +225,20 @@ goal stays open, so the work can go on. To give up, send `fail`. A verdict
 names its criterion and the evidence it rests on; an unknown one is refused
 (`'unknown-criterion'`, `'unknown-evidence'`), and so is evidence under a known
 ID that says something else (`'evidence-conflict'`). When a revision changes a
-criterion, its verdict is dropped; evidence is kept.
+criterion's `description` or `required`, its verdict is dropped; evidence is
+kept. Passing `goal.criteria` back unchanged changes nothing.
 
 ## Budget and deadline
 
 `charge` adds what a run spent. When the spend reaches `budget.usd` or
 `budget.tokens`, the goal waits with reason `'budget'` until a `revise` raises
-the limit, which makes it active again. A charge without `usd`, for a model
-without a price, counts its tokens only, as everywhere else in 2.3. Give a
-charge a `key`, such as the run ID, and the same charge again is ignored as a
-duplicate.
+the limit, which makes it active again, or puts back the wait the budget
+interrupted (see [Waiting, explicitly](#waiting-explicitly)). A charge without
+`usd`, for a model without a price, counts its tokens only, as everywhere else
+in 2.3. Give a charge a `key`, such as the run ID, and the same charge again is
+ignored as a duplicate. Charge keys are kept apart from event keys, in
+`charged`, so a run's charge and the event that reports its completion can both
+be keyed by the run ID.
 
 ```ts
 import { createGoal, transitionGoal } from '@deuz-sdk/core/goal';
@@ -282,40 +299,71 @@ key; or it reports why it was dropped, checking in this order:
 | `'expired'` | `now` is at or after `expiresAt` |
 | `'early'` | `now` is before `notBefore`: deliver it again then |
 | `'unmatched'` | The goal is not waiting |
-| `'stale'` | It answers another wait (`correlationId`), or happened before this wait began |
+| `'stale'` | It answers another wait (`correlationId`), or happened before this wait began, unless it reports a dependency |
 | `'unmatched'` | The wait is for something else: another source, a dependency not listed, a wakeup not yet due |
 
-A goal remembers the keys of its last 64 events and charges. Further back,
-claim the key durably before you apply the event, as `handleSignal` does with
-its `dedupe`.
+During a budget wait, the wait an event must answer is the one the budget
+interrupted; with none, every event is `'unmatched'`.
+
+A dependency's completion is a state, so it settles a dependency wait whenever
+it happened, even just before the wait began. An event that arrives before the
+goal waits for it is `'unmatched'` and its key is not remembered: deliver it
+again once the goal waits. A host that saw a dependency finish before it
+entered the wait can instead mark it `settled: true` in the wait request; a
+dependency wait with every dependency settled is over as it begins, and the
+goal stays, or becomes, active.
+
+A goal remembers the keys of its last 64 events in `seen`, and those of its
+last 64 charges apart from them in `charged`. Further back, claim an event's
+key durably before you apply the event, as `handleSignal` does with its
+`dedupe`.
 
 Nothing in 2.3 fires a wakeup by itself. A periodic job of yours finds the due
-ones and ticks them, with a claim so that one process wakes each:
+ones and ticks them. Several processes can run it at once: the store's revision
+check lets one save win. A pass whose save conflicts, with another pass or with
+a charge that landed since the listing, leaves the goal to the next pass, which
+sees the fresh record. Resume a goal's run only once your save went through:
 
 ```ts
-import { createInMemoryGoalStore, goalWakeupKey, transitionGoal } from '@deuz-sdk/core/goal';
-import { createInMemoryClaim } from '@deuz-sdk/core/schedule';
+import { GoalError, createGoal, createInMemoryGoalStore, transitionGoal } from '@deuz-sdk/core/goal';
 
 const goals = createInMemoryGoalStore();
-const claim = createInMemoryClaim(); // across processes: ops.claims
 
-async function wakeDueGoals(now: number): Promise<void> {
+/** Ticks the goals whose wakeup is due, and returns those this pass woke. */
+async function wakeDueGoals(now: number): Promise<string[]> {
+  const woken: string[] = [];
   let cursor: string | undefined;
   do {
     const page = await goals.list({ statuses: ['waiting'], cursor });
     for (const goal of page.goals) {
       const wait = goal.waiting;
       if (wait?.reason !== 'wakeup' || wait.at > now) continue;
-      if (!(await claim(goalWakeupKey(goal.goalId, wait.at)))) continue;
-      const woken = transitionGoal(goal, { type: 'tick' }, { now });
-      if (woken.changed) await goals.save(woken.record);
-      // Resume the goal's run here.
+      const next = transitionGoal(goal, { type: 'tick' }, { now });
+      if (!next.changed) continue;
+      try {
+        await goals.save(next.record);
+      } catch (error) {
+        // Another writer saved the goal since the listing: the next pass sees it.
+        if (error instanceof GoalError && error.code === 'revision_conflict') continue;
+        throw error;
+      }
+      // This pass woke it: resume the goal's run here (a passed deadline failed it instead).
+      if (next.record.status === 'active') woken.push(goal.goalId);
     }
     cursor = page.cursor;
   } while (cursor);
+  return woken;
 }
 
-await wakeDueGoals(Date.now());
+const start = Date.parse('2026-10-12T09:00:00Z');
+const digest = createGoal(
+  { goalId: 'digest', scope: 'acme', objective: 'Send the weekly digest.' },
+  { now: start },
+);
+await goals.save(digest);
+const hourLater = { type: 'wait', wait: { reason: 'wakeup', at: start + 3_600_000 } } as const;
+await goals.save(transitionGoal(digest, hourLater, { now: start }).record);
+console.log(await wakeDueGoals(start + 3_600_000)); // [ 'digest' ]
 ```
 
 ## Revisions and the persistence boundary
@@ -375,7 +423,9 @@ Records and events carry `kind` and `version`. `serializeGoal` and
   2.3 writes and reads version 1.
 - Within a version, later 2.x releases only add optional fields. A reader keeps
   fields it does not know, through every transition, and fills in the ones a
-  writer may leave out (no evidence, verdicts, spend or keys yet).
+  writer may leave out (no evidence, verdicts, spend or keys yet). It compares
+  criteria and evidence on the fields it knows, so a criterion a revision passes
+  back keeps what a later release added to it, and so does its verdict.
 - Anything JSON would change, such as a `Date`, a function or `NaN` in `meta`,
   is refused (`invalid_goal`).
 

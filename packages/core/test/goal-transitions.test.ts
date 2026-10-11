@@ -5,8 +5,8 @@
  * `now` each transition is given, read from a fake clock.
  */
 import { describe, expect, it } from 'vitest';
-import { GoalError, assessGoal, createGoal, transitionGoal } from '../src/goal';
-import type { GoalCommand, GoalRecord, GoalTransition } from '../src/goal';
+import { GoalError, assessGoal, createGoal, createGoalEvent, transitionGoal } from '../src/goal';
+import type { GoalCommand, GoalEventSource, GoalRecord, GoalTransition } from '../src/goal';
 import { manualClock } from './fixtures/manual-clock';
 
 const T0 = Date.parse('2026-10-10T10:00:00Z');
@@ -40,6 +40,17 @@ function run(record: GoalRecord, ...commands: GoalCommand[]): GoalTransition[] {
   return out;
 }
 const last = (transitions: GoalTransition[]) => transitions.at(-1)!;
+
+/** An event for goal `g` from `source`, keyed `key`, dated `at`, answering `correlationId`. */
+const answer = (source: GoalEventSource, key: string, at: number, correlationId?: string) =>
+  createGoalEvent({
+    scope: 'tenant',
+    goalId: 'g',
+    source,
+    key,
+    at,
+    ...(correlationId !== undefined ? { correlationId } : {}),
+  });
 
 describe('waiting, resume and cancel', () => {
   it('enters a wait with an explicit reason and leaves it on resume', () => {
@@ -362,6 +373,171 @@ describe('budget', () => {
       waiting: { reason: 'budget', limit: 'usd' },
     });
   });
+
+  it('keeps the wait a spent budget interrupted, and puts it back once the budget is raised', () => {
+    const [asked, charged, raised] = run(
+      newGoal({ budget: { usd: 1 } }),
+      { type: 'wait', wait: { reason: 'user', note: 'Approve the deploy.' } },
+      { type: 'charge', usd: 1.5, key: 'run-1' },
+      { type: 'revise', budget: { usd: 5 } },
+    );
+    const question = asked!.record.waiting;
+    expect(question).toMatchObject({ reason: 'user', id: 'g#2', since: T0 + 1 });
+    // The spent budget holds the goal, and keeps what it waited for.
+    expect(charged!.record).toMatchObject({
+      status: 'waiting',
+      waiting: { reason: 'budget', id: 'g#3', limit: 'usd', interrupted: question },
+    });
+    // The person has not answered: the goal still waits for them, under the same wait.
+    expect(raised!.record.status).toBe('waiting');
+    expect(raised!.record.waiting).toEqual(question);
+    expect(
+      transitionGoal(
+        raised!.record,
+        { type: 'event', event: answer({ type: 'user' }, 'reply-1', T0 + 4, 'g#2') },
+        { now: T0 + 5 },
+      ),
+    ).toMatchObject({ outcome: 'applied', record: { status: 'active' } });
+  });
+
+  it('keeps a dependency wait, and what settled in it, across a spent and raised budget', () => {
+    let goal = transitionGoal(
+      newGoal({ budget: { usd: 1 } }),
+      {
+        type: 'wait',
+        wait: {
+          reason: 'dependency',
+          on: [
+            { kind: 'run', id: 'r1' },
+            { kind: 'run', id: 'r2' },
+          ],
+        },
+      },
+      { now: T0 + 1 },
+    ).record;
+    const done = (id: string, at: number) => answer({ type: 'run', id }, `${id}-done`, at);
+    goal = transitionGoal(
+      goal,
+      { type: 'event', event: done('r1', T0 + 2) },
+      { now: T0 + 2 },
+    ).record;
+    // r1's usage is charged as it completes, and spends the budget.
+    goal = transitionGoal(goal, { type: 'charge', usd: 1.5, key: 'r1' }, { now: T0 + 3 }).record;
+    const raised = transitionGoal(
+      goal,
+      { type: 'revise', budget: { usd: 5 } },
+      { now: T0 + 4 },
+    ).record;
+    // r2 has not reported: the goal still waits for it, and its event ends the wait.
+    expect(raised).toMatchObject({
+      status: 'waiting',
+      waiting: {
+        reason: 'dependency',
+        id: 'g#2',
+        since: T0 + 1,
+        on: [
+          { kind: 'run', id: 'r1', settled: true },
+          { kind: 'run', id: 'r2' },
+        ],
+      },
+    });
+    expect(
+      transitionGoal(raised, { type: 'event', event: done('r2', T0 + 5) }, { now: T0 + 5 }),
+    ).toMatchObject({ outcome: 'applied', record: { status: 'active' } });
+  });
+
+  it('applies what answers the interrupted wait while the budget stays spent', () => {
+    const [, spent] = run(
+      newGoal({ budget: { usd: 1 } }),
+      {
+        type: 'wait',
+        wait: {
+          reason: 'dependency',
+          on: [
+            { kind: 'goal', id: 'changelog' },
+            { kind: 'run', id: 'link-check' },
+          ],
+        },
+      },
+      { type: 'charge', usd: 2 },
+    );
+    expect(spent!.record.waiting).toMatchObject({ reason: 'budget', interrupted: { id: 'g#2' } });
+    // One dependency reports while the budget is spent: it settles, and is remembered.
+    const one = transitionGoal(
+      spent!.record,
+      { type: 'event', event: answer({ type: 'goal', id: 'changelog' }, 'changelog-done', T0 + 4) },
+      { now: T0 + 4 },
+    );
+    expect(one).toMatchObject({
+      outcome: 'applied',
+      record: {
+        status: 'waiting',
+        seen: ['changelog-done'],
+        waiting: {
+          reason: 'budget',
+          interrupted: { on: [{ id: 'changelog', settled: true }, { id: 'link-check' }] },
+        },
+      },
+    });
+    // An answer to another wait is stale, and one the wait is not for unmatched.
+    const other = answer({ type: 'run', id: 'link-check' }, 'late', T0 + 5, 'g#1');
+    expect(
+      transitionGoal(one.record, { type: 'event', event: other }, { now: T0 + 5 }),
+    ).toMatchObject({ outcome: 'ignored', reason: 'stale' });
+    const stranger = answer({ type: 'run', id: 'unrelated' }, 'stranger', T0 + 5);
+    expect(
+      transitionGoal(one.record, { type: 'event', event: stranger }, { now: T0 + 5 }),
+    ).toMatchObject({ outcome: 'ignored', reason: 'unmatched' });
+    // The last one ends the interrupted wait; the spent budget still holds the goal.
+    const both = transitionGoal(
+      one.record,
+      { type: 'event', event: answer({ type: 'run', id: 'link-check' }, 'links-done', T0 + 6) },
+      { now: T0 + 6 },
+    );
+    expect(both).toMatchObject({
+      outcome: 'applied',
+      record: { status: 'waiting', waiting: { reason: 'budget', id: 'g#3' } },
+    });
+    expect(both.record.waiting).not.toHaveProperty('interrupted');
+    // Raised, nothing is left to wait for.
+    expect(
+      transitionGoal(both.record, { type: 'revise', budget: { usd: 5 } }, { now: T0 + 7 }).record,
+    ).toMatchObject({ status: 'active' });
+  });
+
+  it('lets a wakeup that came due while the budget was spent pass', () => {
+    const [, spent] = run(
+      newGoal({ budget: { tokens: 10 } }),
+      { type: 'wait', wait: { reason: 'wakeup', at: T0 + 60_000 } },
+      { type: 'charge', tokens: 10 },
+    );
+    expect(transitionGoal(spent!.record, { type: 'tick' }, { now: T0 + 59_999 })).toMatchObject({
+      changed: false,
+      reason: 'unchanged',
+    });
+    const due = transitionGoal(spent!.record, { type: 'tick' }, { now: T0 + 60_000 });
+    expect(due).toMatchObject({
+      outcome: 'applied',
+      record: { status: 'waiting', waiting: { reason: 'budget', limit: 'tokens' } },
+    });
+    expect(due.record.waiting).not.toHaveProperty('interrupted');
+    expect(
+      transitionGoal(due.record, { type: 'revise', budget: { tokens: 20 } }, { now: T0 + 60_001 })
+        .record.status,
+    ).toBe('active');
+  });
+
+  it('drops every event during a budget wait that interrupted nothing', () => {
+    const [spent] = run(newGoal({ budget: { usd: 1 } }), { type: 'charge', usd: 1 });
+    expect(spent!.record.waiting).not.toHaveProperty('interrupted');
+    expect(
+      transitionGoal(
+        spent!.record,
+        { type: 'event', event: answer({ type: 'user' }, 'reply', T0 + 2) },
+        { now: T0 + 2 },
+      ),
+    ).toMatchObject({ outcome: 'ignored', reason: 'unmatched' });
+  });
 });
 
 describe('deadline', () => {
@@ -386,6 +562,16 @@ describe('deadline', () => {
     expect(late).toMatchObject({ changed: true, outcome: 'rejected', reason: 'terminal' });
     expect(late.record).toMatchObject({ status: 'failed', outcome: { reason: 'deadline' } });
     expect(late.record.waiting).toBeUndefined();
+    // An event is dropped, and the goal failed all the same: save on `changed`.
+    const reply = answer({ type: 'user' }, 'reply', T0 + 61_000);
+    expect(
+      transitionGoal(waiting, { type: 'event', event: reply }, { now: T0 + 61_000 }),
+    ).toMatchObject({
+      changed: true,
+      outcome: 'ignored',
+      reason: 'terminal',
+      record: { status: 'failed', outcome: { reason: 'deadline' } },
+    });
   });
 
   it('can be extended or removed before it passes, never set in the past', () => {
