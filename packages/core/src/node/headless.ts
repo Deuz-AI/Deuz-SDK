@@ -24,9 +24,11 @@ import { resumeStreamAgent, streamAgent } from '../agent-run';
 import { createPriceProvider } from '../pricing';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { createWarningSink } from '../internal/warnings';
+import { EMPTY_USAGE } from '../core/metering';
 import { createSkillRegistry, renderSkillCatalog } from '../skills';
 import { nodeSkillSource } from '../skills/node';
 import { reportFromEnvelope, reportFromResult, type HeadlessReport } from '../headless/report';
+import { diagnose, type DoctorOptions, type DoctorReport } from '../headless/doctor';
 import {
   DEFAULT_INSTRUCTION_BYTES,
   DEFAULT_INSTRUCTION_FILES,
@@ -44,7 +46,12 @@ export {
   type HeadlessPendingAction,
   type HeadlessReport,
 } from '../headless/report';
-export type { DoctorFinding, DoctorReport, DoctorSeverity } from '../headless/doctor';
+export type {
+  DoctorFinding,
+  DoctorOptions,
+  DoctorReport,
+  DoctorSeverity,
+} from '../headless/doctor';
 export type {
   ProjectInstructionFile,
   ProjectInstructions,
@@ -64,6 +71,15 @@ interface NodePath {
   relative(from: string, to: string): string;
   isAbsolute(path: string): boolean;
   sep: string;
+}
+
+interface NodeProcess {
+  env: Record<string, string | undefined>;
+  versions: { node: string };
+}
+
+async function loadProcess(): Promise<NodeProcess> {
+  return (await import('node:process' as string)) as unknown as NodeProcess;
 }
 
 async function loadFs(): Promise<{ fs: NodeFs; path: NodePath }> {
@@ -400,4 +416,40 @@ export async function inspectRun(store: AgentRunStore, runId: string): Promise<H
   if (envelope.kind !== 'deuz-agent-run' || envelope.runId !== runId)
     throw new TypeError(`Not a native run record: ${runId}`);
   return reportFromEnvelope(envelope);
+}
+
+/**
+ * A provider / model / configuration report (2.3 preview), before any run and
+ * with no network call: the model's profile and how well the SDK knows it
+ * (`resolveModelProfile`, the registry), how effort, sampling and structured
+ * output reach the wire, whether the model has a price, where the API key
+ * comes from, and whether this Node version is supported. Each problem is a
+ * finding; an `error` finding means the run will not work as configured, and
+ * `exitCodeFor` returns 8 for it. Pass the run's own options. Only a
+ * `deps.priceProvider` you gave is called (once, with a one-token usage); a
+ * `deps.keyProvider` is not called.
+ */
+export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
+  const host = options.env === undefined || options.nodeVersion === undefined;
+  const process = host ? await loadProcess() : undefined;
+  const prices = options.deps?.priceProvider ?? createPriceProvider();
+  let priced: boolean | undefined;
+  let priceError: string | undefined;
+  try {
+    const usd = await prices.priceUsage(options.model.modelId, {
+      ...EMPTY_USAGE,
+      inputTokens: 1,
+      outputTokens: 1,
+      totalTokens: 2,
+    });
+    priced = usd !== undefined;
+  } catch (error) {
+    priceError = error instanceof Error ? error.message : String(error);
+  }
+  return diagnose(options, {
+    env: options.env ?? process!.env,
+    nodeVersion: options.nodeVersion ?? process!.versions.node,
+    priced,
+    ...(priceError !== undefined ? { priceError } : {}),
+  });
 }
