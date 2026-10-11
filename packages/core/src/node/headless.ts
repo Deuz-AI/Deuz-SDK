@@ -433,7 +433,7 @@ export async function inspectRun(store: AgentRunStore, runId: string): Promise<H
  * comes from, and whether this Node version is supported. Each problem is a
  * finding; an `error` finding means the run will not work as configured, and
  * `exitCodeFor` returns 8 for it. Pass the run's own options. Only a
- * `deps.priceProvider` you gave is called (once, with a one-token usage); a
+ * `deps.priceProvider` you gave is called (once, with a two-token usage); a
  * `deps.keyProvider` is not called.
  */
 export async function doctor(options: DoctorOptions): Promise<DoctorReport> {

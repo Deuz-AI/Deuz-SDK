@@ -260,7 +260,7 @@ process.exitCode = exitCodeFor(report); // 8 when a finding is an error
 | `clamped-setting`, `unsupported-setting` | warning | A requested `effort`, `temperature`, `topP`, `toolChoice`, `output.mode` or `promptCaching` is changed or dropped on the way to the wire |
 | `not-live-verified` | info | Always: profiles are checked against documentation, never against the live API |
 
-The doctor calls only a `deps.priceProvider` you gave (once, with a one-token
+The doctor calls only a `deps.priceProvider` you gave (once, with a two-token
 usage); the bundled table is local. The environment defaults to
 `process.env` and the version to `process.versions.node`; `env`,
 `nodeVersion` and `apiKeyEnv` override them.
