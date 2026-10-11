@@ -17,13 +17,24 @@ import type {
   AgentRunSession,
   AgentRunStore,
   AgentStream,
+  AgentToolSet,
 } from '../types/agent-run';
 import type { Dependencies } from '../types/deps';
 import { resumeStreamAgent, streamAgent } from '../agent-run';
 import { createPriceProvider } from '../pricing';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { createWarningSink } from '../internal/warnings';
+import { createSkillRegistry, renderSkillCatalog } from '../skills';
+import { nodeSkillSource } from '../skills/node';
 import { reportFromEnvelope, reportFromResult, type HeadlessReport } from '../headless/report';
+import {
+  DEFAULT_INSTRUCTION_BYTES,
+  DEFAULT_INSTRUCTION_FILES,
+  renderProjectInstructions,
+  type InstructionSource,
+  type ProjectInstructions,
+  type ProjectInstructionsOptions,
+} from '../headless/instructions';
 
 export {
   HEADLESS_EXIT_CODES,
@@ -34,6 +45,171 @@ export {
   type HeadlessReport,
 } from '../headless/report';
 export type { DoctorFinding, DoctorReport, DoctorSeverity } from '../headless/doctor';
+export type {
+  ProjectInstructionFile,
+  ProjectInstructions,
+  ProjectInstructionsOptions,
+} from '../headless/instructions';
+
+// Minimal node shapes; the `as string` specifiers keep tsup's dts builder from
+// statically resolving node: (matches node/observe.ts / node/compute.ts).
+interface NodeFs {
+  readFile(path: string, encoding: 'utf-8'): Promise<string>;
+  stat(path: string): Promise<unknown>;
+}
+interface NodePath {
+  resolve(...parts: string[]): string;
+  join(...parts: string[]): string;
+  dirname(path: string): string;
+  relative(from: string, to: string): string;
+  isAbsolute(path: string): boolean;
+  sep: string;
+}
+
+async function loadFs(): Promise<{ fs: NodeFs; path: NodePath }> {
+  const fs = (await import('node:fs/promises' as string)) as unknown as NodeFs;
+  const path = (await import('node:path' as string)) as unknown as NodePath;
+  return { fs, path };
+}
+
+/** A missing file, or a directory where a file was expected: nothing to read. */
+function isAbsent(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR' || code === 'EISDIR';
+}
+
+/** The nearest directory from `start` upwards that holds a `.git` entry. */
+async function gitRoot(fs: NodeFs, path: NodePath, start: string): Promise<string | undefined> {
+  for (let dir = start; ; ) {
+    try {
+      await fs.stat(path.join(dir, '.git'));
+      return dir;
+    } catch (error) {
+      if (!isAbsent(error)) throw error;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+/**
+ * The project's instruction files as one system message (2.3 preview). Reads
+ * `AGENTS.md`, then `CLAUDE.md`, in every directory from the root down to
+ * `dir`: the root is the nearest directory holding `.git` (only `dir` outside a
+ * repository) unless `options.root` names one. Outer files come first, so the
+ * text nearest `dir` comes last and wins a conflict; files below `dir` are not
+ * read, and `@path` imports are not expanded. A file that repeats an earlier
+ * one's text is included once. The text is capped at `maxBytes` (32 KiB),
+ * keeping the files nearest `dir` whole first.
+ */
+export async function loadProjectInstructions(
+  dir: string,
+  options: ProjectInstructionsOptions = {},
+): Promise<ProjectInstructions> {
+  const { fs, path } = await loadFs();
+  const start = path.resolve(dir);
+  const root =
+    options.root !== undefined
+      ? path.resolve(options.root)
+      : ((await gitRoot(fs, path, start)) ?? start);
+  const below = path.relative(root, start);
+  if (below === '..' || below.startsWith(`..${path.sep}`) || path.isAbsolute(below))
+    throw new TypeError('root must be dir or one of its ancestors.');
+  const dirs = [root];
+  for (const segment of below.split(path.sep).filter(Boolean))
+    dirs.push(path.join(dirs.at(-1)!, segment));
+  const sources: InstructionSource[] = [];
+  for (const directory of dirs) {
+    for (const name of options.fileNames ?? DEFAULT_INSTRUCTION_FILES) {
+      const file = path.join(directory, name);
+      try {
+        sources.push({
+          path: file,
+          relativePath: path.relative(root, file).split(path.sep).join('/'),
+          text: await fs.readFile(file, 'utf-8'),
+        });
+      } catch (error) {
+        if (!isAbsent(error)) throw error;
+      }
+    }
+  }
+  return renderProjectInstructions(root, sources, options.maxBytes ?? DEFAULT_INSTRUCTION_BYTES);
+}
+
+/** The tools a headless run gets for its `skills`. */
+const SKILL_TOOLS = ['load_skill', 'read_skill_resource'] as const;
+
+const decoder = new TextDecoder();
+
+/**
+ * Skills from `dirs` (`<id>/SKILL.md` folders, read by `nodeSkillSource`): the
+ * catalog for the system message, and the tools that load a skill on demand.
+ * The tools are the same whatever the folders hold, so a resume binds to them.
+ */
+async function loadSkills(
+  dirs: readonly string[],
+  tools: AgentToolSet | undefined,
+  withCatalog: boolean,
+): Promise<{ catalog?: string; tools: AgentToolSet }> {
+  for (const name of SKILL_TOOLS) {
+    if (tools && Object.hasOwn(tools, name))
+      throw new TypeError(`The tool name '${name}' is taken by skills; rename your tool.`);
+  }
+  const registry = createSkillRegistry({ source: nodeSkillSource([...dirs]) });
+  // Only an id the catalog lists is read, so an id cannot point outside `dirs`.
+  const listed = async (id: string): Promise<void> => {
+    const catalog = await registry.catalog();
+    if (!catalog.some((skill) => skill.id === id))
+      throw new Error(
+        `Unknown skill '${id}'. Available: ${catalog.map((skill) => skill.id).join(', ') || 'none'}.`,
+      );
+  };
+  const id = { type: 'string', description: 'The skill id from the available skills list.' };
+  const skillTools: AgentToolSet = {
+    load_skill: {
+      description: 'Load the full instructions of a skill, by its id.',
+      parameters: {
+        type: 'object',
+        properties: { id },
+        required: ['id'],
+        additionalProperties: false,
+      },
+      replay: 'idempotent',
+      execute: async ({ id: skill }: { id: string }) => {
+        await listed(skill);
+        return (await registry.trigger(skill)).body;
+      },
+    },
+    read_skill_resource: {
+      description: 'Read a text file bundled with a skill, by the skill id and the file path.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id,
+          path: { type: 'string', description: 'The file path, relative to the skill folder.' },
+        },
+        required: ['id', 'path'],
+        additionalProperties: false,
+      },
+      replay: 'idempotent',
+      execute: async ({ id: skill, path }: { id: string; path: string }) => {
+        await listed(skill);
+        const data = await registry.resource(skill, path);
+        return typeof data === 'string' ? data : decoder.decode(data);
+      },
+    },
+  };
+  const catalog = withCatalog ? renderSkillCatalog(await registry.catalog()) : '';
+  return {
+    ...(catalog
+      ? {
+          catalog: `Skills hold instructions for specific tasks. When a task matches one, call load_skill with its id before you start, and read_skill_resource for a file it names.\n${catalog}`,
+        }
+      : {}),
+    tools: { ...tools, ...skillTools },
+  };
+}
 
 /** Where a headless run is stored, and how its leg is observed (2.3 preview). */
 export interface HeadlessSessionOptions {
@@ -45,6 +221,14 @@ export interface HeadlessSessionOptions {
   store: AgentRunStore;
   /** Application-selected tenant / workflow scope, checked on every resume. Default `'headless'`. */
   scope?: string;
+  /**
+   * Skill folders (`<id>/SKILL.md`, read with `nodeSkillSource`). A run's first
+   * leg lists the skills in its system message, and every leg gets the tools
+   * `load_skill` and `read_skill_resource`, which read a listed skill on
+   * demand. Pass the same folders when resuming: the tools are part of the
+   * run's binding.
+   */
+  skills?: readonly string[];
   /**
    * Every event of the leg as it happens (text deltas, tool states, warnings,
    * the result), for progress output. It must not throw: an error it throws
@@ -61,13 +245,21 @@ export type HeadlessRunOptions<T = string> = AgentRunOptions<T> &
   HeadlessSessionOptions & {
     /** The run's ID. Default: a generated one (`deps.generateId`). */
     runId?: string;
+    /**
+     * Load the project's AGENTS.md / CLAUDE.md files from this directory
+     * ({@link loadProjectInstructions}) into the system message, after
+     * `instructions` and before the skills list.
+     */
+    projectDir?: string;
+    /** How {@link loadProjectInstructions} searches `projectDir`. */
+    projectInstructions?: ProjectInstructionsOptions;
     session?: never;
   };
 
 /**
  * `resumeHeadless` options (2.3 preview): `resumeAgent`'s, with the session
- * made from `store`, `runId` and `scope`. Pass the same model, tools and output
- * as the first leg: the run's binding rejects a change.
+ * made from `store`, `runId` and `scope`. Pass the same model, tools, skills
+ * and output as the first leg: the run's binding rejects a change.
  */
 export type HeadlessResumeOptions<T = string> = AgentRunOptions<T> &
   HeadlessSessionOptions & {
@@ -128,9 +320,10 @@ function split<O extends HeadlessSessionOptions & { runId?: string; deps?: Depen
 ): {
   session: AgentRunSession;
   onEvent: HeadlessSessionOptions['onEvent'];
-  rest: Omit<O, 'store' | 'runId' | 'scope' | 'onEvent'>;
+  skills: HeadlessSessionOptions['skills'];
+  rest: Omit<O, 'store' | 'runId' | 'scope' | 'onEvent' | 'skills'>;
 } {
-  const { store, runId, scope, onEvent, ...rest } = options;
+  const { store, runId, scope, onEvent, skills, ...rest } = options;
   return {
     session: {
       store,
@@ -138,23 +331,38 @@ function split<O extends HeadlessSessionOptions & { runId?: string; deps?: Depen
       scope: scope ?? 'headless',
     },
     onEvent,
+    skills,
     rest,
   };
 }
 
 /**
  * Start a native run (2.3 preview): `streamAgent` with a durable session, its
- * events drained, and a {@link HeadlessReport} of the result. Calls are priced
- * with the bundled table unless `deps.priceProvider` is given. Whatever happens
- * to the run is in the report; it rejects only when `onEvent` threw.
+ * events drained, and a {@link HeadlessReport} of the result. The system
+ * message is `instructions`, then the project instructions of `projectDir`,
+ * then the skills list. Calls are priced with the bundled table unless
+ * `deps.priceProvider` is given. Whatever happens to the run is in the report;
+ * it rejects only when the project files or skills cannot be read, a tool
+ * takes a skill tool's name, or `onEvent` threw.
  */
 export async function runHeadless<T = string>(
   options: HeadlessRunOptions<T>,
 ): Promise<HeadlessReport> {
-  const { session, onEvent, rest } = split(options);
+  const { session, onEvent, skills, rest } = split(options);
+  const { projectDir, projectInstructions, ...agent } = rest;
+  const project =
+    projectDir !== undefined
+      ? await loadProjectInstructions(projectDir, projectInstructions)
+      : undefined;
+  const loaded = skills?.length ? await loadSkills(skills, agent.tools, true) : undefined;
+  const system = [agent.instructions, project?.message?.content, loaded?.catalog]
+    .filter((text): text is string => typeof text === 'string' && text !== '')
+    .join('\n\n');
   const stream = streamAgent({
-    ...(rest as AgentRunOptions<T>),
-    deps: pricedDeps(rest.deps),
+    ...(agent as AgentRunOptions<T>),
+    ...(system ? { instructions: system } : {}),
+    ...(loaded ? { tools: loaded.tools } : {}),
+    deps: pricedDeps(agent.deps),
     session,
   });
   return report(stream as AgentStream<unknown>, session, onEvent);
@@ -168,9 +376,11 @@ export async function runHeadless<T = string>(
 export async function resumeHeadless<T = string>(
   options: HeadlessResumeOptions<T>,
 ): Promise<HeadlessReport> {
-  const { session, onEvent, rest } = split(options);
+  const { session, onEvent, skills, rest } = split(options);
+  const loaded = skills?.length ? await loadSkills(skills, rest.tools, false) : undefined;
   const stream = resumeStreamAgent({
     ...(rest as AgentRunOptions<T>),
+    ...(loaded ? { tools: loaded.tools } : {}),
     deps: pricedDeps(rest.deps),
     session,
   });
