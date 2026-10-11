@@ -1,0 +1,273 @@
+---
+title: Headless (preview)
+description: Run, resume and inspect native agent runs from a script or CI job, with JSON reports and documented exit codes, and check a model and its configuration before running it. Node-only, a 2.3 preview.
+---
+
+`@deuz-sdk/core/headless` (2.3) runs native agents without a UI: from a script,
+a CI job or a cron entry. Every function returns a plain JSON report, and
+`exitCodeFor(report)` maps it to an exit code, so a shell can branch on how a
+run ended. A run that did not complete never exits 0.
+
+<Callout type="warn" title="Preview">
+The headless subpath is a preview, not a stable API: report fields, finding
+codes and exit codes can still change in a 2.x minor. There is no `deuz`
+binary, CLI package, TUI or daemon; [`examples/headless`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/headless)
+shows a command line built on these functions.
+</Callout>
+
+| Function | What it does |
+| --- | --- |
+| `runHeadless(options)` | Start a native run in a durable store and report its result |
+| `resumeHeadless(options)` | Continue a stored run with the answers its report asked for |
+| `inspectRun(store, runId)` | Report a stored run, with no model call |
+| `doctor(options)` | Report why a model or configuration will not work, with no network call |
+| `loadProjectInstructions(dir)` | Read the project's `AGENTS.md` / `CLAUDE.md` files into a system message |
+| `exitCodeFor(report)` | The exit code of a run report or a doctor report |
+
+The subpath is Node-only: it reads instruction files and skill folders from
+disk, and the doctor reads the environment and the Node version. It never
+reaches the edge-safe entries.
+
+## Quick start
+
+`runHeadless` takes `runAgent`'s options plus a `store`, and makes the session
+from it (`runId` defaults to a generated one, `scope` to `'headless'`). This
+runs without a key:
+
+```ts title="headless-quickstart.ts"
+import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
+import { exitCodeFor, runHeadless } from '@deuz-sdk/core/headless';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const report = await runHeadless({
+  model: createMockModel({ responses: [{ text: 'The build is green.' }] }),
+  prompt: 'Check the build.',
+  store: createInMemoryAgentRunStore(),
+  runId: 'nightly-2026-10-11',
+});
+
+console.log(JSON.stringify(report, null, 2));
+process.exitCode = exitCodeFor(report); // 0
+```
+
+For runs that outlive the process, pass a durable `AgentRunStore`. On one
+machine, the SQLite ops store is the default choice (Node 22.13 or 23.4 and
+later, for `node:sqlite`); Postgres and Redis ops stores fit the same way.
+
+```ts
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+
+const ops = createSqliteOpsStore({ path: './runs.sqlite' });
+const store = ops.agentRuns; // pass as `store`; `await ops.close()` when done
+```
+
+Calls are priced with the bundled price table unless `deps.priceProvider` is
+given, so the report can carry the run's cost. `onEvent` receives every event
+of the leg as it happens (text deltas, tool states, warnings), for progress
+output; it must not throw.
+
+## The report
+
+| Field | Meaning |
+| --- | --- |
+| `kind`, `version` | `'deuz-headless-report'`, `1` |
+| `runId`, `scope` | The run |
+| `status` | The result status: `completed`, `suspended`, `stopped`, `failed`; `in-progress` for a stored run with no result yet |
+| `outcome` | How the leg ended, for automation (below) |
+| `phase` | Where the stored run stands after the leg (`running`, `finalizing`, `terminal`); absent when nothing was stored |
+| `reason`, `stopDetails` | A stopped run's reason (`'refusal'`, `'budget.usd'`, …) and the provider's explanation |
+| `error` | A failed run's `name`, `message` and `code` |
+| `pending` | What a pending run waits for, and the resume option that answers each |
+| `usage`, `modelSteps` | Token usage and model calls so far |
+| `cost` | `usd`, `complete`, `unpricedCalls`, `unknownCalls`, from the run's budget ledger |
+| `warnings` | The leg's `CallWarning`s (`inspectRun` reports none) |
+| `output`, `text` | A completed run's accepted output; the final text |
+
+`cost.complete` is `false` when a call had no price or its usage stayed
+unknown; `usd` is then a lower bound. A model without a price under a USD
+budget also shows an `unpriced-model` warning: the budget does not count its
+calls, and token limits still apply. Set `budget.unknownPrice: 'reject'` to
+refuse such a model instead.
+
+### Outcomes and exit codes
+
+| Code | `outcome` | When |
+| --- | --- | --- |
+| 0 | `completed` | The run finished with an accepted output |
+| 1 | `failed` | An error ended it: a provider error, a store failure, a lost lease, a binding that changed on resume |
+| 2 | — | Usage: a command line could not parse its arguments (for your own CLI) |
+| 3 | `pending` | It waits: approvals, client tool results, a decision on calls whose effect is unknown (`tool-reconciliation-required`), or, for a stored run with no result, a resume |
+| 4 | `refused` | The model refused (stop reason `'refusal'`) |
+| 5 | `cancelled` | Aborted or cancelled |
+| 6 | `limit` | A limit you set: `budget.usd`, `budget.tokens`, `maxSteps`, a stop condition on cost, tokens, steps or duration, the execution deadline, a timeout, or `unknownPrice: 'reject'` |
+| 7 | `stopped` | Stopped short for another reason: a guardrail, a verifier that never accepted, an invalid output, a cut-off output (`'length'`), a changed MCP catalog |
+| 8 | — | `doctor` found an error |
+
+The table is `HEADLESS_EXIT_CODES`. A run's leg rejects only when the project
+files or skills cannot be read, a tool takes a skill tool's name, or `onEvent`
+threw; everything that happens to the run itself is in the report.
+
+## Pending runs and resume
+
+Each pending action names the option of `resumeHeadless` that answers it:
+
+| `kind` | Fields | Resume with |
+| --- | --- | --- |
+| `approval` | `approvalId`, `toolCallId`, `toolName`, `input`, `agentPath?`, `token?` | `approvalResponses` (echo a signed approval's `token`) |
+| `client-tool` | `toolCallId`, `toolName`, `input` | `clientToolResults` |
+| `unknown-effect` | `toolCallId`, `toolName`, `input`, `modelStep?` | `retryToolCallIds`, after checking the effect |
+| `resume` | `phase` | a plain resume (the run's executor stopped before it ended) |
+
+```ts title="headless-approval.ts"
+import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
+import type { AgentToolSet } from '@deuz-sdk/core/agent';
+import { exitCodeFor, inspectRun, resumeHeadless, runHeadless } from '@deuz-sdk/core/headless';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const store = createInMemoryAgentRunStore();
+const model = createMockModel({
+  responses: [
+    { toolCalls: [{ toolName: 'deploy', args: { env: 'prod' } }] },
+    { text: 'Deployed to prod.' },
+  ],
+});
+const tools: AgentToolSet = {
+  deploy: {
+    description: 'Deploy the build.',
+    parameters: {
+      type: 'object',
+      properties: { env: { type: 'string' } },
+      required: ['env'],
+    },
+    needsApproval: true,
+    execute: ({ env }: { env: string }) => ({ deployed: env }),
+  },
+};
+
+const first = await runHeadless({ model, prompt: 'Deploy.', tools, store, runId: 'deploy-7' });
+console.log(first.outcome, exitCodeFor(first)); // pending 3
+
+// Later, maybe in another process: read the stored run, decide, resume.
+const waiting = await inspectRun(store, 'deploy-7');
+const approvalResponses = waiting.pending.flatMap((action) =>
+  action.kind === 'approval'
+    ? [{ approvalId: action.approvalId, approved: true, token: action.token }]
+    : [],
+);
+const done = await resumeHeadless({ model, tools, store, runId: 'deploy-7', approvalResponses });
+console.log(done.outcome, done.output, exitCodeFor(done)); // completed Deployed to prod. 0
+```
+
+Resume with the same model, tools, skills and output as the first leg: the
+run's binding rejects a change, and that resume fails (exit 1) without
+touching the stored run.
+
+`inspectRun` reads a run without a model call. A run with no result yet
+reports `status: 'in-progress'` and a pending `resume`, plus each call that
+started without a recorded outcome; that picture is accurate only when no
+executor still drives the run. An unknown run ID rejects with a `TypeError`.
+
+## Project instructions
+
+`projectDir` loads the project's instruction files into the run's system
+message; `loadProjectInstructions(dir, options?)` returns them on their own:
+
+```ts
+import { loadProjectInstructions } from '@deuz-sdk/core/headless';
+
+const project = await loadProjectInstructions(process.cwd());
+console.log(project.files.map((file) => file.relativePath)); // ['AGENTS.md', 'packages/app/CLAUDE.md']
+console.log(project.message?.role); // 'system'
+```
+
+- **Discovery.** In each directory from the root down to `dir`, `AGENTS.md`
+  then `CLAUDE.md` (`fileNames` changes the list). The root is the nearest
+  directory from `dir` upwards that holds `.git`; outside a repository only
+  `dir` itself is read. `root` sets it explicitly (it must be `dir` or an
+  ancestor). A `dir` that is not a directory rejects with a `TypeError`, so a
+  mistyped path never reads its ancestors' files instead.
+- **Precedence.** Outer files come first and the files nearest `dir` last; the
+  message tells the model to follow the later one where two disagree. Your own
+  `instructions` come before all of them, and the skills list after.
+- **Nesting.** Files below `dir` are not read, and `@path` imports are not
+  expanded. A file that repeats an earlier one's text (a `CLAUDE.md` copied
+  from `AGENTS.md`, a symlink) is included once.
+- **Size cap.** At most `maxBytes` (default 32 768) UTF-8 bytes of file text.
+  The files nearest `dir` are kept whole first; an outer file over the cap is
+  cut at a character boundary, with a `[truncated: N more bytes not loaded]`
+  line, or left out. `files[].truncated` and `includedBytes` say which.
+
+Only the first leg loads them: they are part of the stored transcript, so a
+resume does not read them again.
+
+## Skills
+
+`skills` takes folders of [Agent Skills](/docs/modules/skills) (`<id>/SKILL.md`),
+read with `nodeSkillSource`. The first leg lists them in the system message
+(`<available_skills>`), and every leg gets two tools: `load_skill` returns a
+skill's body and `read_skill_resource` a text file bundled with it. Both read
+only skills the list holds, and both are `replay: 'idempotent'`. A tool of your
+own cannot take either name. Pass the same `skills` when resuming: the tools
+are part of the run's binding.
+
+## doctor
+
+`doctor(options)` reports, before any run and with no network call, why a
+configuration will not work. Pass the run's own options; it reads the model,
+`effort`, `temperature`, `topP`, `toolChoice`, `promptCaching`, `budget`,
+`capabilities`, `tools`, `skills`, `output` and `deps`, and ignores the rest.
+
+```ts title="headless-doctor.ts"
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { doctor, exitCodeFor } from '@deuz-sdk/core/headless';
+
+const report = await doctor({
+  model: createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY })('claude-opus-5-5'),
+  effort: 'none',
+  temperature: 0.2,
+  budget: { usd: 2 },
+});
+for (const finding of report.findings) {
+  console.log(finding.severity, finding.code, finding.message);
+}
+process.exitCode = exitCodeFor(report); // 8 when a finding is an error
+```
+
+| Report field | Meaning |
+| --- | --- |
+| `ok` | No finding is an error |
+| `model`, `support` | Provider, model id and protocol; `pinned` (a registry row), `family` (the Claude 5.x family rules) or `unknown` (the conservative fallback) |
+| `profile` | The full [model profile](/docs/modules/model-profiles): effort mapping, thinking, limits, sampling, clamps, sources |
+| `structuredOutput` | The requested `output.mode` and the strategy it takes (`json` or a forced `tool`) |
+| `priced` | The price provider has a price for the model |
+| `apiKey` | Where the key comes from (`factory`, `key-provider`, `keyless`, `missing`), the usual variable and whether it is set; never its value |
+| `node` | The Node version, the required one (`>=22.0.0`) and whether it is supported |
+| `findings` | `{ severity, code, message, setting? }`, in the order checked |
+
+| Code | Severity | Found when |
+| --- | --- | --- |
+| `node-version` | error | Node is older than 22 |
+| `node-sqlite` | warning | Node has no unflagged `node:sqlite` (before 22.13, or 23.0–23.3) |
+| `missing-api-key` | error | The factory has no key, the host needs one and no `deps.keyProvider` is given; the message says whether the usual variable is set (core never reads the environment, so a key there must still reach the factory) |
+| `key-provider` | info | The key comes from `deps.keyProvider`, which the doctor does not call |
+| `unknown-model` | warning | No registry row: the conservative defaults apply |
+| `model-status` | warning | The model is documented as preview or deprecated |
+| `unpriced-model` | info, warning, error | No price: info without a USD budget, a warning with one, an error with `unknownPrice: 'reject'` |
+| `price-lookup-failed` | warning | Your `deps.priceProvider` threw |
+| `tools-unsupported`, `tools-unknown` | error, warning | The run has tools and the model takes none, or that is unknown |
+| `tool-protocol` | error | The model takes tools only on another protocol (e.g. GPT-6.1 Sol on Chat Completions) |
+| `structured-output` | warning | `output` takes the json strategy where native structured output is not known to be supported |
+| `clamped-setting`, `unsupported-setting` | warning | A requested `effort`, `temperature`, `topP`, `toolChoice`, `output.mode` or `promptCaching` is changed or dropped on the way to the wire |
+| `not-live-verified` | info | Always: profiles are checked against documentation, never against the live API |
+
+The doctor calls only a `deps.priceProvider` you gave (once, with a two-token
+usage); the bundled table is local. The environment defaults to
+`process.env` and the version to `process.versions.node`; `env`,
+`nodeVersion` and `apiKeyEnv` override them.
+
+## What it is not
+
+The preview is a library surface. A `deuz` binary, a TUI, a daemon and
+messaging gateways are not part of 2.3; a CLI is planned for 2.4. Provider
+behaviour the doctor reports comes from the model profiles, which are checked
+against provider documentation and are not live-verified.
