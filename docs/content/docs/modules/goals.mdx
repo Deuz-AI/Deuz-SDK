@@ -312,32 +312,51 @@ key durably before you apply the event, as `handleSignal` does with its
 `dedupe`.
 
 Nothing in 2.3 fires a wakeup by itself. A periodic job of yours finds the due
-ones and ticks them, with a claim so that one process wakes each:
+ones and ticks them. Several processes can run it at once: the store's revision
+check lets one save win. A pass whose save conflicts, with another pass or with
+a charge that landed since the listing, leaves the goal to the next pass, which
+sees the fresh record. Resume a goal's run only once your save went through:
 
 ```ts
-import { createInMemoryGoalStore, goalWakeupKey, transitionGoal } from '@deuz-sdk/core/goal';
-import { createInMemoryClaim } from '@deuz-sdk/core/schedule';
+import { GoalError, createGoal, createInMemoryGoalStore, transitionGoal } from '@deuz-sdk/core/goal';
 
 const goals = createInMemoryGoalStore();
-const claim = createInMemoryClaim(); // across processes: ops.claims
 
-async function wakeDueGoals(now: number): Promise<void> {
+/** Ticks the goals whose wakeup is due, and returns those this pass woke. */
+async function wakeDueGoals(now: number): Promise<string[]> {
+  const woken: string[] = [];
   let cursor: string | undefined;
   do {
     const page = await goals.list({ statuses: ['waiting'], cursor });
     for (const goal of page.goals) {
       const wait = goal.waiting;
       if (wait?.reason !== 'wakeup' || wait.at > now) continue;
-      if (!(await claim(goalWakeupKey(goal.goalId, wait.at)))) continue;
-      const woken = transitionGoal(goal, { type: 'tick' }, { now });
-      if (woken.changed) await goals.save(woken.record);
-      // Resume the goal's run here.
+      const next = transitionGoal(goal, { type: 'tick' }, { now });
+      if (!next.changed) continue;
+      try {
+        await goals.save(next.record);
+      } catch (error) {
+        // Another writer saved the goal since the listing: the next pass sees it.
+        if (error instanceof GoalError && error.code === 'revision_conflict') continue;
+        throw error;
+      }
+      // This pass woke it: resume the goal's run here (a passed deadline failed it instead).
+      if (next.record.status === 'active') woken.push(goal.goalId);
     }
     cursor = page.cursor;
   } while (cursor);
+  return woken;
 }
 
-await wakeDueGoals(Date.now());
+const start = Date.parse('2026-10-12T09:00:00Z');
+const digest = createGoal(
+  { goalId: 'digest', scope: 'acme', objective: 'Send the weekly digest.' },
+  { now: start },
+);
+await goals.save(digest);
+const hourLater = { type: 'wait', wait: { reason: 'wakeup', at: start + 3_600_000 } } as const;
+await goals.save(transitionGoal(digest, hourLater, { now: start }).record);
+console.log(await wakeDueGoals(start + 3_600_000)); // [ 'digest' ]
 ```
 
 ## Revisions and the persistence boundary
