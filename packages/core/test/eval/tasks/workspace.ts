@@ -5,7 +5,7 @@
  */
 import { runAgent } from '../../../src/agent-run';
 import type { EvalTaskManifest } from '../../../src/testing';
-import { completes, mockPrices, scripted, workspaceTools } from '../support';
+import { completes, offline, runWith, workspaceTools, type TaskModel } from '../support';
 
 const MOCK = { provider: 'mock', id: 'mock-model', protocol: 'chat_completions' };
 
@@ -69,8 +69,8 @@ export const offByOne: EvalTaskManifest = {
       check: (_outcome, context) => context.store.lastTestRun === 'pass',
     },
   ],
-  async run(context) {
-    const { model } = scripted([
+  run: fixRange(
+    offline([
       { toolCalls: [{ toolName: 'read_file', args: { path: 'src/range.js' } }] },
       { toolCalls: [{ toolName: 'run_tests', args: {} }] },
       {
@@ -80,10 +80,16 @@ export const offByOne: EvalTaskManifest = {
       },
       { toolCalls: [{ toolName: 'run_tests', args: {} }] },
       { text: 'Fixed: the loop ran to n inclusive; it now stops before n. Tests pass.' },
-    ]);
+    ]),
+  ),
+};
+
+/** Run the bug fix on `on`'s model. */
+export function fixRange(on: TaskModel): NonNullable<EvalTaskManifest['run']> {
+  return async (context) => {
     const { read_file, write_file } = workspaceTools(context);
     const result = await runAgent({
-      model,
+      ...runWith(on, context),
       messages: context.messages,
       tools: {
         read_file: read_file!,
@@ -98,8 +104,6 @@ export const offByOne: EvalTaskManifest = {
           },
         },
       },
-      signal: context.signal,
-      deps: { observer: context.observer, priceProvider: mockPrices },
     });
     context.artifact('patch', {
       file: 'src/range.js',
@@ -107,8 +111,8 @@ export const offByOne: EvalTaskManifest = {
       after: context.files['src/range.js']?.split('\n')[3],
     });
     return result;
-  },
-};
+  };
+}
 
 const CONFIGS = {
   'config/app.json': JSON.stringify({ name: 'app', timeout: 30 }, null, 2),
@@ -163,8 +167,8 @@ export const configMigration: EvalTaskManifest = {
         (JSON.parse(context.files['config/worker.json']!) as { retries?: number }).retries === 2,
     },
   ],
-  async run(context) {
-    const { model } = scripted([
+  run: migrateConfigs(
+    offline([
       { toolCalls: [{ toolName: 'list_files', args: { path: 'config/' } }] },
       {
         toolCalls: Object.keys(CONFIGS).map((path) => ({ toolName: 'read_file', args: { path } })),
@@ -176,13 +180,16 @@ export const configMigration: EvalTaskManifest = {
         })),
       },
       { text: 'Migrated config/app.json and config/worker.json to timeoutMs.' },
-    ]);
-    return runAgent({
-      model,
+    ]),
+  ),
+};
+
+/** Run the migration on `on`'s model. */
+export function migrateConfigs(on: TaskModel): NonNullable<EvalTaskManifest['run']> {
+  return (context) =>
+    runAgent({
+      ...runWith(on, context),
       messages: context.messages,
       tools: workspaceTools(context),
-      signal: context.signal,
-      deps: { observer: context.observer, priceProvider: mockPrices },
     });
-  },
-};
+}

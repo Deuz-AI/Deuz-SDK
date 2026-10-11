@@ -5,7 +5,7 @@
  */
 import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../../../src/agent-run';
 import type { EvalTaskContext, EvalTaskManifest, EvalTaskOutcome } from '../../../src/testing';
-import { completes, mockPrices, scripted } from '../support';
+import { completes, offline, runWith, type TaskModel } from '../support';
 
 const MOCK = { provider: 'mock', id: 'mock-model', protocol: 'chat_completions' };
 
@@ -14,46 +14,45 @@ function deployments(context: EvalTaskContext): string[] {
 }
 
 /** Run until the approval gate, let the human decide, resume to the end. */
-async function gatedDeploy(
-  context: EvalTaskContext,
+export function gatedDeploy(
+  on: TaskModel,
   approved: boolean,
-  answer: string,
-): Promise<EvalTaskOutcome> {
-  const { model } = scripted([
-    { toolCalls: [{ toolName: 'deploy', id: 'deploy-1', args: { version: 'v2.3.0' } }] },
-    { text: answer },
-  ]);
-  const options = {
-    model,
-    messages: context.messages,
-    session: { store: createInMemoryAgentRunStore(), runId: 'deploy', scope: 'eval' },
-    tools: {
-      deploy: {
-        description: 'Deploy a version to production.',
-        parameters: {
-          type: 'object' as const,
-          properties: { version: { type: 'string' } },
-          required: ['version'],
-        },
-        needsApproval: true,
-        execute: ({ version }: { version: string }) => {
-          context.effect(`deploy:${version}`);
-          deployments(context).push(version);
-          return `deployed ${version}`;
+): (context: EvalTaskContext) => Promise<EvalTaskOutcome> {
+  return async (context) => {
+    const options = {
+      ...runWith(on, context),
+      messages: context.messages,
+      session: { store: createInMemoryAgentRunStore(), runId: 'deploy', scope: 'eval' },
+      tools: {
+        deploy: {
+          description: 'Deploy a version to production.',
+          parameters: {
+            type: 'object' as const,
+            properties: { version: { type: 'string' } },
+            required: ['version'],
+          },
+          needsApproval: true,
+          execute: ({ version }: { version: string }) => {
+            context.effect(`deploy:${version}`);
+            deployments(context).push(version);
+            return `deployed ${version}`;
+          },
         },
       },
-    },
-    signal: context.signal,
-    deps: { observer: context.observer, priceProvider: mockPrices },
+    };
+    const first = await runAgent(options);
+    if (first.status !== 'suspended') return first;
+    context.store.pending = first.pendingApprovals.map((request) => request.toolName);
+    return resumeAgent({
+      ...options,
+      approvalResponses: context.approve(first.pendingApprovals, approved),
+    });
   };
-  const first = await runAgent(options);
-  if (first.status !== 'suspended') return first;
-  context.store.pending = first.pendingApprovals.map((request) => request.toolName);
-  return resumeAgent({
-    ...options,
-    approvalResponses: context.approve(first.pendingApprovals, approved),
-  });
 }
+
+const deployTurn = {
+  toolCalls: [{ toolName: 'deploy', id: 'deploy-1', args: { version: 'v2.3.0' } }],
+};
 
 const start = { messages: [{ role: 'user' as const, content: 'Ship v2.3.0 to production.' }] };
 
@@ -81,7 +80,7 @@ export const deployApproved: EvalTaskManifest = {
       check: (_outcome, context) => JSON.stringify(deployments(context)) === '["v2.3.0"]',
     },
   ],
-  run: (context) => gatedDeploy(context, true, 'v2.3.0 is live.'),
+  run: gatedDeploy(offline([deployTurn, { text: 'v2.3.0 is live.' }]), true),
 };
 
 export const deployDenied: EvalTaskManifest = {
@@ -111,6 +110,8 @@ export const deployDenied: EvalTaskManifest = {
         JSON.stringify((outcome as { messages?: unknown }).messages ?? []).includes('denied'),
     },
   ],
-  run: (context) =>
-    gatedDeploy(context, false, 'The deployment was denied, so v2.3.0 was not deployed.'),
+  run: gatedDeploy(
+    offline([deployTurn, { text: 'The deployment was denied, so v2.3.0 was not deployed.' }]),
+    false,
+  ),
 };

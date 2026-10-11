@@ -1,7 +1,7 @@
 /** Structured-output tasks: a typed result, and a candidate that fails validation once. */
 import { runAgent } from '../../../src/agent-run';
 import type { EvalTaskManifest } from '../../../src/testing';
-import { completes, mockPrices, scripted } from '../support';
+import { completes, mockPrices, offline, runWith, scripted, type TaskModel } from '../support';
 
 const MOCK = { provider: 'mock', id: 'mock-model', protocol: 'chat_completions' };
 
@@ -80,17 +80,18 @@ export const invoiceExtraction: EvalTaskManifest = {
       check: (outcome) => (outcome.output as Invoice | undefined)?.currency === 'EUR',
     },
   ],
-  async run(context) {
-    const { model } = scripted([{ text: JSON.stringify(VALID) }]);
-    return runAgent<Invoice>({
-      model,
+  run: extractInvoice(offline([{ text: JSON.stringify(VALID) }])),
+};
+
+/** Run the extraction on `on`'s model. */
+export function extractInvoice(on: TaskModel): NonNullable<EvalTaskManifest['run']> {
+  return (context) =>
+    runAgent<Invoice>({
+      ...runWith(on, context),
       messages: context.messages,
       output: invoiceOutput,
-      signal: context.signal,
-      deps: { observer: context.observer, priceProvider: mockPrices },
     });
-  },
-};
+}
 
 export const invoiceRepair: EvalTaskManifest = {
   id: 'structured-output/repair',

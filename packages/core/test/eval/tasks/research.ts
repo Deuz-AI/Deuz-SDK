@@ -4,7 +4,7 @@
  */
 import { runAgent } from '../../../src/agent-run';
 import type { EvalTaskManifest } from '../../../src/testing';
-import { completes, mockPrices, scripted } from '../support';
+import { completes, offline, runWith, type TaskModel } from '../support';
 
 const MOCK = { provider: 'mock', id: 'mock-model', protocol: 'chat_completions' };
 
@@ -27,7 +27,10 @@ const ANSWER =
   'The Danube (2,850 km) is longer than the Rhine (1,230 km). ' +
   'Sources: [1] https://docs.example.org/rivers/danube [2] https://docs.example.org/rivers/rhine';
 
-const urlsIn = (text: string): string[] => text.match(/https:\/\/\S+/g) ?? [];
+/** URLs in an answer, bare or inside a markdown link, without trailing punctuation. */
+const URL_PATTERN = /https:\/\/[^\s)\]>"'`]+/g;
+const urlsIn = (text: string): string[] =>
+  (text.match(URL_PATTERN) ?? []).map((url) => url.replace(/[.,;:]+$/, ''));
 
 export const sourcedAnswer: EvalTaskManifest = {
   id: 'research/sourced-answer',
@@ -62,17 +65,15 @@ export const sourcedAnswer: EvalTaskManifest = {
         const fetched = ((context.store.fetched as string[] | undefined) ?? []).map(
           (url) => PAGES[url]!.body,
         );
-        const figures = (outcome.text ?? '').replace(/https:\/\/\S+/g, '').match(/\d[\d,]*/g);
+        const figures = (outcome.text ?? '').replace(URL_PATTERN, '').match(/\d[\d,]*/g);
         return (figures ?? [])
           .filter((figure) => figure.length > 1)
           .every((figure) => fetched.some((body) => body.includes(figure)));
       },
     },
   ],
-  async run(context) {
-    const fetched: string[] = [];
-    context.store.fetched = fetched;
-    const { model } = scripted([
+  run: researchRivers(
+    offline([
       { toolCalls: [{ toolName: 'search', args: { query: 'Danube Rhine length' } }] },
       {
         toolCalls: [
@@ -81,9 +82,17 @@ export const sourcedAnswer: EvalTaskManifest = {
         ],
       },
       { text: ANSWER },
-    ]);
+    ]),
+  ),
+};
+
+/** Run the research on `on`'s model. */
+export function researchRivers(on: TaskModel): NonNullable<EvalTaskManifest['run']> {
+  return async (context) => {
+    const fetched: string[] = [];
+    context.store.fetched = fetched;
     const result = await runAgent({
-      model,
+      ...runWith(on, context),
       messages: context.messages,
       tools: {
         search: {
@@ -115,10 +124,8 @@ export const sourcedAnswer: EvalTaskManifest = {
           },
         },
       },
-      signal: context.signal,
-      deps: { observer: context.observer, priceProvider: mockPrices },
     });
     context.artifact('citations', urlsIn(result.text));
     return result;
-  },
-};
+  };
+}

@@ -11,6 +11,7 @@ import { createMockModel, type MockResponse } from '../../src/testing';
 import { attachConfig, readConfig } from '../../src/internal/config-symbol';
 import type { AgentToolSet } from '../../src/types/agent-run';
 import type { LanguageModel } from '../../src/types/model';
+import type { PriceProvider } from '../../src/types/deps';
 import type { EvalAcceptance, EvalTaskContext, EvalTaskOutcome } from '../../src/testing';
 
 export const parameters = { type: 'object' as const, properties: {} };
@@ -22,10 +23,43 @@ export const pathParameter = {
 };
 
 /** A per-token price for the mock model, so offline attempts have a cost. */
-export const mockPrices = {
+export const mockPrices: PriceProvider = {
   priceUsage: (_model: string, usage: { inputTokens: number; outputTokens: number }) =>
     (usage.inputTokens * 1 + usage.outputTokens * 4) / 1_000_000,
 };
+
+/**
+ * The model a reusable task runs against: scripted offline, a provider's model
+ * for its real-model twin (test/eval/real-model). The task's start state, tools
+ * and acceptance stay the same.
+ */
+export interface TaskModel {
+  /** A fresh model per attempt (a scripted model starts its script over). */
+  model(context: EvalTaskContext): LanguageModel;
+  prices: PriceProvider;
+  effort?: 'low' | 'medium' | 'high';
+  /** Caps each request, which also bounds what the budget reserves for it. */
+  maxOutputTokens?: number;
+  /** Run under the manifest's budget, so a real provider cannot overspend it. */
+  enforceBudget?: boolean;
+}
+
+/** An offline task model: the mock model on this script, at the mock prices. */
+export function offline(responses: MockResponse[]): TaskModel {
+  return { model: () => scripted(responses).model, prices: mockPrices };
+}
+
+/** The options every native run of a reusable task passes. */
+export function runWith(on: TaskModel, context: EvalTaskContext) {
+  return {
+    model: on.model(context),
+    ...(on.effort !== undefined ? { effort: on.effort } : {}),
+    ...(on.maxOutputTokens !== undefined ? { maxOutputTokens: on.maxOutputTokens } : {}),
+    ...(on.enforceBudget && context.task.budget ? { budget: context.task.budget } : {}),
+    signal: context.signal,
+    deps: { observer: context.observer, priceProvider: on.prices },
+  };
+}
 
 /** The mock model, with a counter of the model calls it served (each one is paid). */
 export function scripted(responses: MockResponse[]): {
