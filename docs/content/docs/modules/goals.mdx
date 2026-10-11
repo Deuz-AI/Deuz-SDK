@@ -126,11 +126,13 @@ event that answers the wait carries the `id` as `correlationId`. A new wait
 replaces the current one, except a budget wait, which only a revision raising
 the budget ends.
 
-A spent budget does not replace the wait it interrupts. The budget wait keeps
-it, as it was, in `interrupted`: events that answer it still apply meanwhile
-(one that ends it removes it), and a revision raising the budget puts it back
-with its `id` and `since`. A goal that waited for a person when a run's charge
-spent its budget still waits for that person once the budget is raised.
+A spent budget does not replace the wait it interrupts: the budget wait keeps
+it, as it was, in `interrupted`. Events that answer it still apply meanwhile,
+and so does a tick once its wakeup is due; what ends it removes it. A revision
+raising the budget puts it back, with its `id` and `since`, or makes the goal
+active when nothing is left to wait for. A goal that waited for a person when a
+run's charge spent its budget still waits for that person once the budget is
+raised.
 
 ```ts
 import { createGoal, goalEventFromSignal, transitionGoal } from '@deuz-sdk/core/goal';

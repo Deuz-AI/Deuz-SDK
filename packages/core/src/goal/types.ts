@@ -77,7 +77,8 @@ export type GoalWaiting =
       /**
        * The wait the spent budget interrupted, as it was: a raised budget puts
        * it back, `id` and `since` included. Events that answer it still apply
-       * meanwhile, and one that ends it removes it.
+       * meanwhile, as does a tick once its wakeup is due, and what ends it
+       * removes it.
        */
       interrupted?: Exclude<GoalWaiting, { reason: 'budget' }>;
     });
