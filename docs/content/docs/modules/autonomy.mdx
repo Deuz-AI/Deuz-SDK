@@ -150,6 +150,8 @@ Also exported: `createMistral`, `createDeepSeek`, `createQwen`, `createKimi` (al
 
 Deterministic agent tests use the published `@deuz-sdk/core/testing` subpath (`createMockModel`, `runEval`, golden-replay fixtures) — no real network required.
 
+For versioned eval tasks with per-attempt metrics (success, false completion, cost, duration, human rescues, repeated effects, recovery), use `runEvalSuite` from the same subpath (2.3). See [Evals](/docs/modules/evals), which also covers the offline tasks and the fault-injection suite of the 2.3 baseline.
+
 ## See also
 
 - [Build your own Manus](/docs/cookbooks/autonomous-agent) — all of the above composed into one autonomous agent.
