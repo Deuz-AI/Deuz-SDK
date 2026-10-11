@@ -29,15 +29,21 @@ import type {
   ToolUsePart,
   ToolResultPart,
 } from './types/message';
-import type { ToolApprovalRequest } from './types/tool';
+import type { ToolApprovalRequest, ToolCallOutcome } from './types/tool';
 import type { ToolRunState } from './types/stream';
-import type { CallWarning } from './types/methods';
+import type { CallWarning, StopDetails } from './types/methods';
 import type { Usage, FinishReason } from './types/usage';
 import type { MemoryScope } from './memory';
 import type { DeuzAgentState, DeuzUIPart } from './ui';
 import { imagePart } from './parts';
 import { resolveMedia } from './internal/image';
-import { agentFrameOf, applyAgentFrame, idleAgentState, usageFromWire } from './internal/agent-ui';
+import {
+  agentFrameOf,
+  applyAgentFrame,
+  idleAgentState,
+  stopDetailsFromWire,
+  usageFromWire,
+} from './internal/agent-ui';
 
 export type { MemoryScope } from './memory';
 
@@ -68,6 +74,14 @@ export interface UIToolCall {
   denied?: boolean;
   /** Why it was declined. Already redacted by the wire (P0) — never re-log it raw. */
   deniedReason?: string;
+  /**
+   * How the call ended (2.3), from the wire's latest `tool-state` or
+   * `tool-result` for it: `'tool-error'`, `'permission-denied'`,
+   * `'approval-denied'`, `'approval-pending'` or `'unknown-effect'`. Absent
+   * while it runs and on success. It names what `denied` alone cannot: a
+   * guardrail block and an approver's no both set `denied`.
+   */
+  outcome?: ToolCallOutcome;
   /**
    * Opaque provider round-trip data for this call (e.g. Gemini's
    * thoughtSignature), carried so `assistantMessageFromTurn` and
@@ -272,6 +286,12 @@ export interface AssistantTurnState {
   usage?: Usage;
   /** Terminal finish reason (1.9) — `'length'` means the answer was truncated. */
   finishReason?: FinishReason;
+  /**
+   * The provider's explanation of the stop (2.3), from the wire's `finish`:
+   * with `finishReason: 'content_filter'`, a refusal's `category` and
+   * `explanation`. Absent when the provider explained nothing.
+   */
+  stopDetails?: StopDetails;
   /** Per-step usage/finish from `step-finish` parts, in arrival order (1.9). */
   steps?: Array<{ step: number; usage: Usage; finishReason: FinishReason }>;
   /** Redacted server error message, when the stream ended in an error part. */
@@ -347,6 +367,27 @@ function providerMetadataFromWire(value: unknown): Pick<UIToolCall, 'providerMet
  */
 function numberFromWire(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** Every `ToolCallOutcome` (2.3): a value the client does not know is not one. */
+const OUTCOMES: ReadonlySet<unknown> = new Set<ToolCallOutcome>([
+  'success',
+  'tool-error',
+  'permission-denied',
+  'approval-denied',
+  'approval-pending',
+  'unknown-effect',
+]);
+
+/**
+ * The call with the outcome its latest `tool-state` / `tool-result` frame
+ * reported (2.3). A frame without one (the call is running again, or it
+ * succeeded) clears an earlier one: an `'approval-pending'` call that was
+ * approved and ran is no longer pending.
+ */
+function withOutcome(call: UIToolCall, outcome: unknown): UIToolCall {
+  const { outcome: _previous, ...rest } = call;
+  return OUTCOMES.has(outcome) ? { ...rest, outcome: outcome as ToolCallOutcome } : rest;
 }
 
 function withToolCall(
@@ -573,12 +614,17 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
       );
     }
     case 'tool-result': {
-      const next = withToolCall(turn, part.toolCallId, (c) => ({
-        ...c,
-        state: 'result',
-        output: part.output,
-        ...(part.isError ? { isError: true } : {}),
-      }));
+      const next = withToolCall(turn, part.toolCallId, (c) =>
+        withOutcome(
+          {
+            ...c,
+            state: 'result',
+            output: part.output,
+            ...(part.isError ? { isError: true } : {}),
+          },
+          (part as { outcome?: unknown }).outcome,
+        ),
+      );
       return { ...next, serverResults: [...next.serverResults, part.toolCallId] };
     }
     case 'tool-approval-request': {
@@ -621,15 +667,20 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
           : {};
       // `input-streaming` arrives BEFORE the assembled tool-call part — open a
       // placeholder so the lifecycle is visible from the first fragment.
+      // The dispatch contract's verdict (2.3), read as defensively as the flags.
+      const outcome = (part as { outcome?: unknown }).outcome;
       if (!(turn.message.toolCalls ?? []).some((c) => c.toolCallId === part.toolCallId)) {
-        const placeholder: UIToolCall = {
-          toolCallId: part.toolCallId,
-          toolName: part.toolName ?? '',
-          input: undefined,
-          state: 'call',
-          runState: part.state,
-          ...denial,
-        };
+        const placeholder: UIToolCall = withOutcome(
+          {
+            toolCallId: part.toolCallId,
+            toolName: part.toolName ?? '',
+            input: undefined,
+            state: 'call',
+            runState: part.state,
+            ...denial,
+          },
+          outcome,
+        );
         return withToolPart(
           {
             ...turn,
@@ -641,11 +692,9 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
           part.toolCallId,
         );
       }
-      return withToolCall(turn, part.toolCallId, (c) => ({
-        ...c,
-        runState: part.state,
-        ...denial,
-      }));
+      return withToolCall(turn, part.toolCallId, (c) =>
+        withOutcome({ ...c, runState: part.state, ...denial }, outcome),
+      );
     }
     case 'cost':
       return {
@@ -761,10 +810,15 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
     }
     case 'finish': {
       const finishReason = finishReasonFromWire(part.finishReason);
+      // The provider's explanation (2.3, F16): a refusal's category, kept only
+      // when well formed. Absent, an earlier leg's explanation is not carried.
+      const { stopDetails: _previous, ...rest } = turn;
+      const stopDetails = stopDetailsFromWire((part as { stopDetails?: unknown }).stopDetails);
       return {
-        ...turn,
+        ...rest,
         usage: usageFromWire(part.usage),
         ...(finishReason !== undefined ? { finishReason } : {}),
+        ...(stopDetails ? { stopDetails } : {}),
         // TERMINAL BOUNDARY: nothing can extend the tail after `finish`, so the
         // last text/reasoning part stops being 'streaming' here. A stream that
         // dies WITHOUT a finish (abort, dropped connection) deliberately leaves

@@ -27,7 +27,7 @@ import type { StreamPart, ToolRunState } from './types/stream';
 import type { Usage, FinishReason } from './types/usage';
 import type { Clock } from './types/deps';
 import type { StandardSchemaV1 } from './types/schema';
-import type { ToolApprovalRequest } from './types/tool';
+import type { ToolApprovalRequest, ToolCallOutcome } from './types/tool';
 import type {
   AgentPartialOutput,
   AgentResult,
@@ -39,6 +39,7 @@ import { redactString } from './internal/redact';
 import { resolveDependencies } from './internal/resolve-deps';
 import { DEFAULT_RETRY, backoffMs, unitFromId } from './core/resilience';
 import { agentFrameOf, applyAgentFrame, idleAgentState } from './internal/agent-ui';
+import { stopDetailsFrom } from './internal/stop-details';
 
 /** The version this SDK emits by default. */
 export const DEUZ_STREAM_VERSION = 'v2';
@@ -66,7 +67,14 @@ export function negotiateDeuzStreamVersion(
 export type DeuzUIPart =
   | { type: 'start'; messageId: string }
   | { type: 'step-start'; step: number }
-  | { type: 'step-finish'; step: number; finishReason: FinishReason; usage: Usage }
+  /** `stopDetails` (2.3 additive): as on `finish`, for this step. */
+  | {
+      type: 'step-finish';
+      step: number;
+      finishReason: FinishReason;
+      usage: Usage;
+      stopDetails?: StopDetails;
+    }
   | { type: 'text-delta'; text: string }
   /**
    * A reasoning delta. 2.3 adds optional fields so a chat client can send
@@ -106,12 +114,18 @@ export type DeuzUIPart =
       input: unknown;
       providerMetadata?: Record<string, unknown>;
     }
+  /**
+   * A tool finished. `outcome` (2.3 additive) says how an error result ended
+   * (`ToolCallOutcome`: a thrown tool, a policy or approval denial, …); a
+   * successful result carries none. It rides every wire version.
+   */
   | {
       type: 'tool-result';
       toolCallId: string;
       toolName: string;
       output: unknown;
       isError?: boolean;
+      outcome?: ToolCallOutcome;
     }
   | { type: 'source'; id: string; url?: string; title?: string }
   | {
@@ -172,6 +186,10 @@ export type DeuzUIPart =
    * `ToolRunState` deliberately gains no 7th member (it is a pinned root export
    * and a new member would break any exhaustive switch), so a 1.8 client keeps
    * rendering exactly the error state it always did.
+   *
+   * `outcome` (2.3 additive) is the dispatch contract's verdict, as on the
+   * canonical `ToolStatePart`: set with a terminal `'error'` and with
+   * `'awaiting-approval'` (`'approval-pending'`), absent otherwise.
    */
   | {
       type: 'tool-state';
@@ -180,6 +198,7 @@ export type DeuzUIPart =
       state: ToolRunState;
       denied?: boolean;
       deniedReason?: string;
+      outcome?: ToolCallOutcome;
     }
   /** Live cumulative USD cost (v2 wire) — feed a CostBadge directly. */
   | {
@@ -235,7 +254,13 @@ export type DeuzUIPart =
       data?: unknown;
       agentPath?: string[];
     }
-  | { type: 'finish'; finishReason: FinishReason; usage: Usage }
+  /**
+   * The whole turn finished. `stopDetails` (2.3 additive) is the provider's
+   * explanation of an early stop, such as a refusal's category, normalized as
+   * `StreamChatResult.stopDetails` and secret-redacted; absent when the provider
+   * explained nothing. It rides every wire version.
+   */
+  | { type: 'finish'; finishReason: FinishReason; usage: Usage; stopDetails?: StopDetails }
   | { type: 'error'; message: string };
 
 // ===================================================================
@@ -511,6 +536,25 @@ function errorMessage(error: unknown): string {
   return redactString(typeof error === 'string' ? error : 'Stream error.');
 }
 
+/**
+ * The provider's stop explanation as the wire may carry it (2.3): the
+ * `explanation` is provider text echoed to a user, so it passes `redactString`
+ * like every other server-supplied string here (P0).
+ */
+function redactedStopDetails(details: StopDetails): StopDetails {
+  return typeof details.explanation === 'string'
+    ? { ...details, explanation: redactString(details.explanation) }
+    : details;
+}
+
+/** `{ stopDetails }` from a finish part's provider metadata, or nothing (2.3). */
+function stopDetailsField(providerMetadata: Record<string, unknown> | undefined): {
+  stopDetails?: StopDetails;
+} {
+  const details = stopDetailsFrom(providerMetadata);
+  return details ? { stopDetails: redactedStopDetails(details) } : {};
+}
+
 /** Map a canonical StreamPart → a Deuz UI part (undefined = drop). */
 function toUIPart(part: StreamPart): DeuzUIPart | undefined {
   switch (part.type) {
@@ -553,6 +597,7 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         toolName: part.toolName,
         output: part.output,
         ...(part.isError ? { isError: true } : {}),
+        ...(part.outcome !== undefined ? { outcome: part.outcome } : {}),
       };
     case 'source':
       return {
@@ -592,6 +637,7 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         step: part.stepIndex,
         finishReason: part.finishReason,
         usage: part.usage,
+        ...stopDetailsField(part.providerMetadata),
       };
     case 'data':
       // Vercel-style DX on the wire: the part name rides the type itself.
@@ -623,6 +669,7 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         ...(part.deniedReason !== undefined
           ? { deniedReason: redactString(part.deniedReason) }
           : {}),
+        ...(part.outcome !== undefined ? { outcome: part.outcome } : {}),
       };
     case 'cost':
       return {
@@ -694,7 +741,12 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         ...(part.agentPath !== undefined ? { agentPath: part.agentPath } : {}),
       };
     case 'finish':
-      return { type: 'finish', finishReason: part.finishReason, usage: part.usage };
+      return {
+        type: 'finish',
+        finishReason: part.finishReason,
+        usage: part.usage,
+        ...stopDetailsField(part.providerMetadata),
+      };
     case 'error':
       return { type: 'error', message: errorMessage(part.error) };
     default:
@@ -972,14 +1024,7 @@ function agentResultFrame(
     modelSteps: result.modelSteps,
     ...(result.verification !== undefined ? { verification: result.verification } : {}),
     ...(result.stopDetails !== undefined
-      ? {
-          stopDetails: {
-            ...result.stopDetails,
-            ...(typeof result.stopDetails.explanation === 'string'
-              ? { explanation: redactString(result.stopDetails.explanation) }
-              : {}),
-          },
-        }
+      ? { stopDetails: redactedStopDetails(result.stopDetails) }
       : {}),
   };
   switch (result.status) {
