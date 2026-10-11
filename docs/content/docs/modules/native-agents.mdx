@@ -115,7 +115,9 @@ events with sequence cursors.
 
 ## Strict checkpoints and approval resume
 
-Native sessions use `AgentRunEnvelope` with `kind: 'deuz-agent-run'` and `version: 1`.
+Native sessions use `AgentRunEnvelope` with `kind: 'deuz-agent-run'` and `version: 1`
+(`version: 2` since 2.3 when the run records [memory, a chat projection or a
+fail-over](#memory-chat-and-model-fail-over-23), which a 2.2 reader would ignore).
 They do not reuse a legacy `AgentCheckpoint` as the top-level envelope; the loop and
 sub-agent checkpoints inside it are `AgentCheckpoint` records. A resume refuses an
 envelope of another version. Since 2.3 it also refuses one holding a checkpoint whose
@@ -399,10 +401,195 @@ every later step, finalization and verifier re-drives included, and its tools pa
 through the same receipts as the root agent's.
 MCP servers in `mcp` cross the same receipt boundary as local tools; see
 [MCP in native runs](/docs/modules/native-mcp).
-The native engine currently rejects `chat`, `memory`, `fallbackModels`, and the
-legacy completion hooks `verifyStep`, `doneWhen`, and `falseFinishGuard`. Use the
-existing generation/agent APIs when those options are needed. Legacy
+The native engine rejects the legacy completion hooks `verifyStep`, `doneWhen`, and
+`falseFinishGuard`; use `verify` instead. `chat`, `memory` and `fallbackModels`
+work in native runs since 2.3, bound to the checkpoint as described below. Legacy
 `generateObject`, `streamChat`, and `createAgent` behavior is unchanged.
+
+## Memory, chat and model fail-over (2.3)
+
+The legacy loops treat these three as best-effort side effects of a call. A
+native run is checkpointed, so each is bound to the run's record instead, and
+each is part of the resume binding: a resume with another memory scope, another
+chat or other `fallbackModels` fails with `Native agent binding changed across
+resume.` before anything is written.
+
+### Memory
+
+The run recalls **once**, before its first model call, with the last user
+message as the query. The memories enter the run's history as one appended
+`role: 'system'` message marked `providerMetadata.deuz.memoryRecall`, the shape
+the legacy loops use for preserved thinking: every step and every resume sends
+the same prefix, and a resume never recalls again. A history that already
+carries a recall after its last user message is not recalled again.
+`AgentRunEnvelope.memory.recall` records what happened; a failing store or
+embedder is logged and the run goes on without memories, as in the legacy loops.
+
+Extraction runs only for a run that **completed**. A stopped, failed, cancelled
+or suspended run never turns its output into memory. The terminal commit
+records the extraction as `pending` under an operation id, nothing is written
+to memory before that commit, and the extraction's outcome (`completed` with its
+mutation count, or `failed`) follows in a later save. The run's result does not
+depend on it. Every record the extraction writes carries
+`metadata.deuz = { runId, operationId }`. The extraction reads the input's last
+user turn and the run's own turns; the recall message, the finalization prompt
+and repair or verifier feedback are left out. `extract: false`, `recall: false`,
+`writePolicy: 'manual' | 'session-end'` and `sweep: 'on-extract'` behave as in
+the legacy loops. The run waits for the extraction before it resolves.
+
+A resume of a run that already ended (a terminal resume) never extracts again
+and never calls a model. When an interruption or a failed save leaves an
+extraction `pending` (or `failed`), `reconcileAgentRun` settles it. When the
+memory store already holds records of that operation, it records the extraction
+as completed without another memory LLM call; otherwise it runs the extraction
+now. Extraction is therefore at least once and never silent; dedup by content
+hash keeps a repeat from writing the same fact twice.
+
+```ts
+import { createInMemoryAgentRunStore, reconcileAgentRun, runAgent } from '@deuz-sdk/core/agent';
+import { createInMemoryMemoryStore } from '@deuz-sdk/core/memory';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+let id = 0;
+const memory = {
+  seams: {
+    store: createInMemoryMemoryStore(),
+    // A real application wraps a model call here.
+    llm: async ({ system }: { system: string; user: string }) =>
+      system.includes('extract')
+        ? '{"facts":["prefers tea"]}'
+        : '{"memory":[{"event":"ADD","text":"prefers tea"}]}',
+    clock: {
+      now: () => Date.now(),
+      setTimeout: (fn: () => void, ms: number) => {
+        const timer = setTimeout(fn, ms);
+        return () => clearTimeout(timer);
+      },
+    },
+    generateId: () => `memory-${id++}`,
+  },
+  scope: { userId: 'ada' },
+};
+const session = { store: createInMemoryAgentRunStore(), runId: 'tea-1', scope: 'tenant-a' };
+
+const result = await runAgent({
+  model: createMockModel({ responses: [{ text: 'Noted: tea.' }] }),
+  prompt: 'I prefer tea.',
+  memory,
+  session,
+});
+const envelope = await session.store.load('tea-1');
+console.log(result.status, envelope?.memory?.extraction?.status); // completed completed
+
+// For a run an interruption left pending; a settled run reports its state.
+console.log(await reconcileAgentRun({ session, memory })); // { runId: 'tea-1', memory: 'completed' }
+```
+
+A run under another native run's execution (a run a tool starts with
+`execution: ctx.execution.child(...)`) may only **narrow** that run's memory
+scope: it may pin more fields, never drop one or change a user, agent or chat.
+A wider scope fails the child run before any call. A sub-agent from `agentTool`
+gets no memory at all.
+
+### Chat projection
+
+With `chat`, the run's checkpoint stays the canonical record and the chat store
+receives a projection of it. The run keeps a transcript: the input, then every
+turn the run appended, raw (before compaction or a `prepareStep` history, with
+reasoning blocks byte for byte). The recall message and the finalization and
+feedback turns are part of it, because the next run replays exactly the prefix
+the model's thinking is bound to. The transcript is saved to the chat store
+**after** the checkpoint at every suspension and at the end of the run, each
+time as a whole record with `ChatRecord.messageIds`. An input message keeps the
+id the stored chat gave it, and a turn of the run gets `<runId>:<n>`.
+`AgentRunEnvelope.chat` records which assistant turn and which tool invocation
+(by `toolCallId` and model step) is which message, and how far the chat store
+has acknowledged the transcript (`cursor`).
+
+The two stores are written one after the other, never as one transaction:
+
+- A chat store that throws never fails the run. The run reports a `warning` part
+  (`setting: 'chat'`), records `status: 'failed'` with the cursor left behind,
+  and keeps its checkpoint intact.
+- The next projection save repairs it: the next suspension, the end of the run,
+  a terminal `resumeAgent`, or `reconcileAgentRun({ session, chat })`. Every save
+  replaces the whole record, so a repeat never appends a message twice.
+- A stored chat of another scope is never overwritten (`status:
+  'scope-mismatch'`). A stored chat that already holds the projection and more,
+  because a later run continued it, is left as it is.
+- A failed checkpoint publishes nothing to the chat.
+
+```ts
+import { createInMemoryAgentRunStore, runAgent } from '@deuz-sdk/core/agent';
+import { createInMemoryChatStore } from '@deuz-sdk/core/chat';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const chats = createInMemoryChatStore();
+await runAgent({
+  model: createMockModel({ responses: [{ text: 'Hello, Ada.' }] }),
+  prompt: 'Hi!',
+  chat: { store: chats, chatId: 'chat-1', scope: { userId: 'ada' } },
+  session: { store: createInMemoryAgentRunStore(), runId: 'hello-1', scope: 'tenant-a' },
+});
+const record = await chats.loadChat('chat-1');
+console.log(record?.messageIds); // ['hello-1:0', 'hello-1:1']
+```
+
+### Model fail-over
+
+`fallbackModels` fails a single model call over, inside the same run. A call
+that fails with a retryable error **before its first content** is repeated on
+the next candidate of `[that model, ...fallbackModels]`: a network error, a
+transport timeout, a 5xx, a 429 or 529 after the call's own retries, or an open
+circuit breaker. A step of the tool loop runs again from the run's last
+checkpoint, so completed tool effects never run again. A failed finalization
+call does not use up a repair attempt. These never fail over:
+
+- a refusal (the run stops with reason `'refusal'`);
+- a policy, budget or validation rejection;
+- an abort, a cancel, or an elapsed deadline;
+- an error after the call produced content.
+
+The failed model is skipped for the rest of the run, also after a resume.
+Routing is by model, so a handoff target's model or a `prepareStep` model fails
+over the same way. The stream carries a `warning` part (`setting:
+'fallbackModels'`) in place of the call's error. `AgentRunEnvelope.models`
+records each fail-over: the attempt number, the failed and the next model with
+their provider and protocol, the model step, the phase and the error. It also
+records the model the run calls now (`selected`) and the version of these rules
+(`policy: 1`).
+
+Every attempt is admitted against the run's execution. A failed attempt's budget
+hold stays counted, so a fallback never exceeds the shared budget, and a child
+run's attempts count in its parent's ledger under its parent's model policy. Each
+candidate gets the call's `capabilities` override and is sent with its own request
+profile and object strategy (a Claude 5.x fallback, for example, drops the
+sampling parameters it rejects). Reasoning crosses models only as each wire
+allows: Claude thinking blocks reach another Claude model unchanged, and another
+provider never receives them.
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+// A primary that is down: every request answers 503.
+const primary = createOpenAI({
+  apiKey: 'demo',
+  fetch: async () => new Response('{"error":{"message":"unavailable"}}', { status: 503 }),
+})('gpt-5.2');
+
+const result = await runAgent({
+  model: primary,
+  fallbackModels: [createMockModel({ responses: [{ text: 'Answered by the fallback.' }] })],
+  maxRetries: 0,
+  prompt: 'Hello?',
+});
+console.log(result.status, result.text); // completed Answered by the fallback.
+```
+
+Provider behavior in this section is derived from the providers' documented
+wire shapes and tested offline; none of it is live-verified.
 
 ## Mandatory policy and shared budgets
 
