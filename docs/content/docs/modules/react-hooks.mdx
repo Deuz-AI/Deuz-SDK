@@ -6,7 +6,7 @@ description: useChat and useObject from @deuz-sdk/react — ordered part renderi
 > **Import from `@deuz-sdk/react`.** The frozen `@deuz-sdk/core/react` subpath still works, but every feature since 1.7 lands in the package. The hooks bind the pure chat engine at [`@deuz-sdk/core/chat`](/docs/modules/chat-persistence) to React state; no business logic lives in them.
 
 <Callout type="warn" title="The 2.3 settlement fixes are not in `@deuz-sdk/core/react`">
-The frozen hook is unchanged, so it still has the bugs 2.3 fixed in `@deuz-sdk/react`. A verdict sent when nothing is pending still POSTs a new round and adds an empty assistant bubble, and a double click sends the continuation twice. It also drops the approval's signed `token`, so it cannot approve calls made with an `approvalSigner`. It has no `reconnect()`, and with no `onToolCall` it drops client tool calls instead of parking them. It sends no reasoning back and drops a tool call's provider metadata, so a Gemini 3 client-tool loop through it can fail with 400 (not live-verified). Migrate to `@deuz-sdk/react` for [verdict matching](#verdicts-answer-the-open-gate) and [resumed client tools](#client-tools-after-a-reconnect).
+The frozen hook is unchanged, so it still has the bugs 2.3 fixed in `@deuz-sdk/react`. A verdict sent when nothing is pending still POSTs a new round and adds an empty assistant bubble, and a double click sends the continuation twice. It also drops the approval's signed `token`, so it cannot approve calls made with an `approvalSigner`. It has no `reconnect()`, and with no `onToolCall` it drops client tool calls instead of parking them. It sends no reasoning back and drops a tool call's provider metadata, so a Gemini 3 client-tool loop through it can fail with 400 (not live-verified). It cannot drive a [native agent route](#native-agent-routes) either: it does not read agent frames, so it never sends a run id back. `@deuz-sdk/core/react` stays frozen; fixes and new features ship in `@deuz-sdk/react` only. Migrate to `@deuz-sdk/react` for [verdict matching](#verdicts-answer-the-open-gate), [resumed client tools](#client-tools-after-a-reconnect) and native agent routes.
 </Callout>
 
 **React is an optional peer** (`^18 || ^19`) — install it yourself; nothing else in the SDK depends on it. The hooks are plain TypeScript (no JSX) and SSR-safe: network runs only inside user-triggered callbacks, never at render time.
@@ -39,6 +39,8 @@ const {
   reconnect,
   usage, // this turn's terminal token usage (1.9)
   finishReason, // 'length' means the answer was truncated (1.9)
+  stopDetails, // a refusal's category and explanation (2.3)
+  agent, // the native agent run behind this turn (2.3)
   steps, // per-step usage/finish (1.9)
   verifications, // verifyStep verdicts (1.9)
   warnings, // CallWarning[] from `warning` parts (1.9)
@@ -311,6 +313,132 @@ The built-in loop sets it for every refusal it settles: a server-mode `approveTo
 
 `state` is unchanged — still exactly `'call' | 'result' | 'approval-requested'`, because these are optional fields, not a fourth state.
 
+Since 2.3 a `UIToolCall` also carries `outcome`, from the latest `tool-state` or `tool-result` frame for it: `'tool-error'`, `'permission-denied'`, `'approval-denied'`, `'approval-pending'` or `'unknown-effect'` (see [Outcomes](/docs/modules/native-agents#outcomes)). It tells apart what `denied` alone cannot: a guardrail block (`'permission-denied'`) and an approver's no (`'approval-denied'`) both set `denied`. It is absent while the call runs and after it succeeds.
+
+## Native agent routes
+
+`useChat` also drives a route that serves a [native agent run](/docs/modules/native-agents) (`streamAgent` / `resumeStreamAgent`) through [`toDeuzAgentStreamResponse`](/docs/modules/ui-streaming#native-agent-runs-todeuzagentstreamresponse-23). Nothing is configured on the client. The route's `data-agent` frames fold into the turn (`agent`), and when the run suspends, the hook resumes it the way `resumeStreamAgent` needs:
+
+- **The run's terminal frame is the authority** on what it waits for. Its approvals pause the chat (`pendingApprovals`); its client calls (tools without `execute` on the server) run through `onToolCall` or park in `pendingToolCalls`.
+- **One request resumes the run**: `{ messages, runId, approvalResponses?, clientToolResults? }`. A native resume proceeds only with a verdict for every pending approval and a result for every pending client call, so after the last verdict the hook runs the client calls first, then sends both together. `clientToolResults` entries are `{ toolCallId, output, isError? }`. The answers also join `history.canonical`, as on a chat route.
+- **The 2.3 settlement rules hold**: a verdict counts only for the open gate ([F06](#verdicts-answer-the-open-gate)), and a replayed client call runs at most once per mounted hook ([F07](#client-tools-after-a-reconnect)). `reconnect()` reads a run's journal like any other.
+- **`agent`** is the run's state for the turn: `runId`, `status` (`'running'`, `'suspended'`, `'completed'`, `'stopped'`, `'failed'`), the latest `partial` draft while it runs, and, only once `completed`, the `output` the server validated. A `stopped` run has a `reason` (`'aborted'`, `'cancelled'`, `'refusal'`, …) and, for a refusal, `stopDetails`. The agent frames stay out of `dataParts` and `onData`.
+- **A chat route is unchanged.** It never sends a frame, so the hook never sends `runId` or `clientToolResults` to it. With a core older than 2.3 there are no agent frames to read, and the hook behaves as before.
+
+The route starts a run for a request without `runId` and resumes the run for one with it:
+
+```ts title="app/api/agent/route.ts"
+import { createInMemoryAgentRunStore, resumeStreamAgent, streamAgent } from '@deuz-sdk/core/agent';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import {
+  createInMemoryStreamStateStore,
+  negotiateDeuzStreamVersion,
+  toDeuzAgentStreamResponse,
+} from '@deuz-sdk/core/ui';
+
+const runs = createInMemoryAgentRunStore(); // a durable store in production
+const streams = createInMemoryStreamStateStore();
+const model = createMockModel({
+  responses: [
+    // One turn asks for both: an approval and a client call.
+    {
+      toolCalls: [
+        { toolName: 'publish', args: { doc: 7 } },
+        { toolName: 'locate', args: {} },
+      ],
+    },
+    { text: 'Published document 7 for Paris.' },
+  ],
+});
+const params = { type: 'object' as const, properties: { doc: { type: 'number' } } };
+const options = {
+  model,
+  bindingId: 'publish-v1',
+  tools: {
+    publish: {
+      description: 'Publish a document.',
+      parameters: params,
+      needsApproval: true,
+      execute: ({ doc }: { doc?: number }) => `published ${doc}`,
+    },
+    // No `execute`: the browser answers it through `onToolCall`.
+    locate: { description: "The user's city.", parameters: params },
+  },
+};
+
+export async function POST(req: Request): Promise<Response> {
+  // `rejectToolResults: false`: the history holds the client's tool answers.
+  const parsed = validateChatRequest(await req.json(), { rejectToolResults: false });
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+  const { rest } = parsed.request;
+  const scope = 'tenant-a'; // the signed-in user's tenant, never a field of the body
+  const resuming = typeof rest.runId === 'string';
+  const runId = resuming ? (rest.runId as string) : crypto.randomUUID();
+  const session = { store: runs, runId, scope };
+  const stream = resuming
+    ? resumeStreamAgent({
+        ...options,
+        session,
+        ...(parsed.request.approvalResponses
+          ? { approvalResponses: parsed.request.approvalResponses }
+          : {}),
+        ...(Array.isArray(rest.clientToolResults)
+          ? { clientToolResults: rest.clientToolResults as { toolCallId: string; output: unknown }[] }
+          : {}),
+      })
+    : streamAgent({ ...options, session, messages: parsed.request.messages });
+  return toDeuzAgentStreamResponse(stream, {
+    runId,
+    store: streams, // every leg of the run in one journal: `seq` grows across them
+    streamId: runId,
+    wireVersion: negotiateDeuzStreamVersion(req),
+  });
+}
+```
+
+A resume reads the run's history from the store, not from the posted `messages`, and `resumeStreamAgent` refuses a `runId` stored under another `scope`, so take the scope from your authentication. A client result passes the same validation and projection path as a server tool's result. To let a client reconnect, serve `resumeDeuzStreamResponse(streams, runId, { lastEventId })` from a GET route (after checking that the user owns `runId`) and point `resume.endpoint` at it.
+
+```tsx title="AgentChat.tsx"
+'use client';
+import { useChat } from '@deuz-sdk/react';
+
+export function AgentChat() {
+  const { messages, status, sendMessage, pendingApprovals, addToolApprovalResponse, agent, stopDetails } =
+    useChat({
+      api: '/api/agent',
+      onToolCall: async ({ toolName }) => (toolName === 'locate' ? { city: 'Paris' } : null),
+    });
+
+  return (
+    <div>
+      {messages.map((m) => (
+        <p key={m.id}>
+          <b>{m.role}:</b> {m.content}
+        </p>
+      ))}
+      {pendingApprovals.map((request) => (
+        <button
+          key={request.approvalId}
+          onClick={() => addToolApprovalResponse({ approvalId: request.approvalId, approved: true })}
+        >
+          Approve {request.toolName}
+        </button>
+      ))}
+      {agent?.status === 'completed' ? <output>{String(agent.output)}</output> : null}
+      {agent?.status === 'stopped' && agent.reason === 'refusal' ? (
+        <p role="alert">Refused: {stopDetails?.category ?? 'no reason given'}</p>
+      ) : null}
+      <button disabled={status === 'streaming'} onClick={() => sendMessage('Publish document 7.')}>
+        Send
+      </button>
+    </div>
+  );
+}
+```
+
+The approval card resumes the run with `runId` and the verdict; `locate` then runs in the browser, and its result goes back with the same verdict in one request.
+
 ## throttleMs
 
 `syncTurn` used to publish up to **seven** `setState` calls per folded wire part; it now builds one snapshot and publishes it once. On top of that, `throttleMs` (default `0` = 1.8 behaviour) coalesces commits on the trailing edge:
@@ -344,7 +472,7 @@ useChat({
 - **A caught-up endpoint is a no-op.** A resume that folds zero parts (an immediate `[DONE]`) changes nothing at all; 1.8 pre-pushed the assistant bubble before reading and left a permanently empty one on screen.
 - **`cursor` is an injectable adapter** — no `localStorage` is hardcoded (that would break SSR and React Native), and a throwing adapter cannot kill a live stream.
 - **A resumed turn settles like a streamed one** (2.3). Its approvals pause the chat, and its client calls reach `onToolCall` or `pendingToolCalls`; see [Client tools after a reconnect](#client-tools-after-a-reconnect). Under `auto` the read stays silent, but a POST it triggers (an `onToolCall` result continuing the chat) reports a failure like any other request.
-- **The cursor advances only on resume reads.** The POST response is read without its `id:` lines, so the cursor records how far the *resume* reads got. A reconnect after a dropped POST stream therefore rebuilds the turn from the cursor; folding the replay into the partial turn would apply the parts it already showed twice. Call `reconnect()` for a turn that is actually in flight. With nothing in flight it appends again whatever the endpoint still replays after the cursor. The replay guard protects side effects, not the transcript.
+- **The cursor follows the POST read too (2.3).** When the POST response carries the journal's `id:` lines (the route passes `store` and `streamId`), they move the hook's in-memory cursor. A `reconnect()` after a settled turn, or after a leg the hook continued with a POST, then resumes after it and appends nothing the history already holds; a reconnect after a dropped POST continues that turn from the last part it showed. Before 2.3 the POST read left the cursor alone, so such a reconnect appended the replayed turn to the history a second time. The persisted cursor (`resume.cursor`) still moves on resume reads only, because a reload mid-turn must replay that turn from its start. After a reload, a replay of a journal that also holds legs the restored history already has (a lost or old cursor) still appends them again: the restored history is all the hook knows. Let the resume endpoint answer 404 when nothing is in flight, and journal one run per `streamId`.
 
 ## Truncated turns
 
