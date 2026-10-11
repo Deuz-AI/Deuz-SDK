@@ -1113,8 +1113,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
       // Its read ended on the cursor: this turn and all before it are behind it now.
       if (replay || cursorRead) behindCursorRef.current = snapshotRef.current.history.canonical;
 
-      // A suspended native run says itself what it waits for (2.3).
+      // A suspended native run says itself what it waits for (2.3). One that
+      // did not suspend waits for nothing: a call its stream showed (a refused
+      // turn's, say) is no client call, and a POST would start a new run.
       const native = nativeSuspension(turn);
+      if (!native && turn.agent !== undefined) return undefined;
       // Client tools: every call no result followed (for a native run, the
       // calls its frame reports) — on a replay, minus what this client already
       // answered or is answering right now. The reducer merges the calls that

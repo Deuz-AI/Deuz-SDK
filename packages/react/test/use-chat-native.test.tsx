@@ -371,6 +371,25 @@ describe('useChat — a native agent route (2.3)', () => {
     expect(result.current.history.canonical).toEqual(history);
   });
 
+  it('a run that ended waits for nothing: a refused turn’s tool call reaches no client', async () => {
+    const route = nativeRoute(
+      [{ toolCalls: [{ toolName: 'locate', id: 'c1', args: {} }], finishReason: 'content_filter' }],
+      { locate: { description: 'Where?', parameters } },
+    );
+    const onToolCall = vi.fn(async () => 'Paris');
+    const { result } = renderHook(() =>
+      useChat({ api: '/api/agent', fetch: route.fetch, onToolCall }),
+    );
+    await act(async () => {
+      await result.current.sendMessage('where?');
+    });
+    await waitFor(() => expect(result.current.agent?.status).toBe('stopped'));
+    expect(result.current.agent).toMatchObject({ reason: 'refusal' });
+    expect(onToolCall).not.toHaveBeenCalled();
+    expect(result.current.pendingToolCalls).toEqual([]);
+    expect(route.bodies).toHaveLength(1);
+  });
+
   it('keeps the agent frames out of onData and dataParts', async () => {
     const route = nativeRoute([{ text: 'Hi.' }], {});
     const onData = vi.fn();
