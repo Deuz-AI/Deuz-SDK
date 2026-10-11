@@ -455,6 +455,20 @@ console.log(`${handles.length} runs taken over, ${failed.length} could not be re
   failover may lack the last writes it had not received. A lost lease write
   costs liveness, which the revision fence covers; a lost budget charge or
   agent run save is lost. Enable AOF for these stores.
+- **Nothing may be evicted.** The stores set no TTL on any key: their keys hold
+  state, not a cache. Run them on a server whose `maxmemory-policy` is
+  `noeviction` (the Redis default) or a `volatile-*` policy, which evicts only
+  keys that have a TTL. An `allkeys-*` policy (`allkeys-lru`, `allkeys-lfu`,
+  `allkeys-random`), usual on a server set up as a cache, drops whole keys
+  under memory pressure without an error, and one key can hold a whole store's
+  leases, claims or runs. An evicted budget scope
+  (`{<prefix>:budget}:scope:<key>`) starts again empty and admits its whole
+  limit again. An evicted `{<prefix>:ops}:lease:expiry` lets a second executor
+  take a lease that is still held. An evicted `{<prefix>:ops}:claims` makes
+  every claim key claimable again, so an occurrence or a delivery can run
+  twice. An evicted `{<prefix>:ops}:run:payload`, or a swarm run's keys, loses
+  those runs. Under `noeviction` a full server refuses writes instead and the
+  stores' calls reject, so leave it room and prune.
 
 | Key (tag `T`) | Holds |
 | --- | --- |
