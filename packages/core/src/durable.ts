@@ -531,7 +531,8 @@ const b64urlDecode = (text: string): Uint8Array => {
  * server before showing it to a user; verify the returned verdict on resume so
  * a forged or replayed `approvalId` cannot authorize a different tool call.
  * (`ToolApprovalRequest.approvalId` was kept distinct from `toolCallId` in 1.3
- * exactly for this scheme — the id contract is unchanged.)
+ * exactly for this scheme. Since 2.3 the id is bound to the call it was issued
+ * for, and a token must name that id.)
  */
 export function createApprovalSigner(options: CreateApprovalSignerOptions): ApprovalSigner {
   if (!options.secret) {

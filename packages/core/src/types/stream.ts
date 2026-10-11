@@ -120,7 +120,10 @@ export interface ToolResultStreamPart {
  */
 export interface ToolApprovalRequestPart {
   type: 'tool-approval-request';
-  /** Equals `toolCallId` today; distinct field for future signed approvals. */
+  /**
+   * The request's identity-bound id (2.3: `toolCallId@<digest>`, see
+   * `ToolApprovalRequest`). Echo it unchanged on the verdict.
+   */
   approvalId: string;
   toolCallId: string;
   toolName: string;
