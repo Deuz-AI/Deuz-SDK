@@ -108,7 +108,8 @@ export type UIMessagePart =
       /**
        * `text` is an OPAQUE encrypted provider payload (OpenAI Responses), not
        * display text — do not render it. Set from history by `uiFromMessages`,
-       * and since 2.3 from the wire's `reasoning-delta` too.
+       * and since 2.3 from the wire's `reasoning-delta` too (whose `data`
+       * carries the payload).
        */
       encrypted?: boolean;
       /** Provider-redacted thinking block: `text` is opaque data, never rendered (as `encrypted`). */
@@ -516,6 +517,11 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
       // cross a network boundary, so only well-typed values are kept.
       const block = reasoningBlockFromWire(part);
       const opaque = block.encrypted === true || block.redacted === true;
+      // An opaque block's payload rides the frame's `data` (2.3), with `text`
+      // left empty for clients that predate the flags; the UI part keeps it in
+      // `text`, as `uiFromMessages` does. A frame without a string `data`
+      // carries its payload in `text`.
+      const text = opaque && typeof part.data === 'string' ? part.data : part.text;
       const continues =
         tail?.type === 'reasoning' &&
         tail.state === 'streaming' &&
@@ -525,10 +531,10 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
         tail.id === block.id &&
         tail.source === block.source;
       const next: UIMessagePart[] = continues
-        ? [...parts.slice(0, -1), { ...tail, text: tail.text + part.text, ...signature }]
+        ? [...parts.slice(0, -1), { ...tail, text: tail.text + text, ...signature }]
         : openPart(parts, {
             type: 'reasoning',
-            text: part.text,
+            text,
             state: 'streaming',
             ...signature,
             ...block,
@@ -538,7 +544,7 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
         message: {
           ...turn.message,
           // The readable bucket: an opaque payload is never display text.
-          ...(opaque ? {} : { reasoning: (turn.message.reasoning ?? '') + part.text }),
+          ...(opaque ? {} : { reasoning: (turn.message.reasoning ?? '') + text }),
           parts: next,
         },
       };

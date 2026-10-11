@@ -10,8 +10,11 @@
  * resumable (`Last-Event-ID` → `resumeDeuzStreamResponse`) and lets any number
  * of clients follow the same stream live through a {@link StreamStateStore}.
  * v1 clients keep working: `id:` lines are invisible to them and unknown part
- * types are skipped (open-union rule). Serializers emit v1 byte-identically
- * when negotiated via {@link negotiateDeuzStreamVersion} / `wireVersion`.
+ * types are skipped (open-union rule). A response negotiated to v1 (via
+ * {@link negotiateDeuzStreamVersion} / `wireVersion`) carries no `id:` lines
+ * and no v2-only part. It is not byte-identical to pre-1.7 output: later
+ * releases added optional fields to v1 parts (the approval `token` in 1.7, the
+ * `reasoning-delta` block fields in 2.3), which an older client ignores.
  */
 import type { CallWarning, StreamChatResult, StreamObjectResult } from './types/methods';
 import type { StreamPart, ToolRunState } from './types/stream';
@@ -52,12 +55,17 @@ export type DeuzUIPart =
   | { type: 'step-finish'; step: number; finishReason: FinishReason; usage: Usage }
   | { type: 'text-delta'; text: string }
   /**
-   * A reasoning delta. 2.3 adds four optional fields, the canonical part's own
-   * (`ReasoningDeltaPart`), so a chat client can send every block back
-   * unchanged: `id` (deltas of one block share it), `encrypted` / `redacted`
-   * (`text` is an opaque payload, never display text) and `source` (the
-   * provider family that produced it). An older client ignores them, as it
-   * ignores any unknown key; they ride every wire version.
+   * A reasoning delta. 2.3 adds optional fields so a chat client can send
+   * every block back unchanged: the canonical part's `id` (deltas of one block
+   * share it), `encrypted` / `redacted` (the block is an opaque provider
+   * payload, never display text) and `source` (the provider family that
+   * produced it), plus `data`. They ride every wire version.
+   *
+   * An opaque block's payload rides `data`, and its `text` is empty. A client
+   * that predates these fields (a 2.2 `@deuz-sdk/react`, the frozen
+   * `@deuz-sdk/core/react` hook, a custom reader) ignores them and appends
+   * `text` to the reasoning it shows, so it shows nothing for the block instead
+   * of the payload. `applyUIPart` reads the payload back from `data`.
    */
   | {
       type: 'reasoning-delta';
@@ -67,6 +75,8 @@ export type DeuzUIPart =
       encrypted?: boolean;
       redacted?: boolean;
       source?: string;
+      /** The payload of an `encrypted` or `redacted` block (2.3); `text` is then empty. */
+      data?: string;
     }
   | { type: 'tool-input-delta'; toolCallId: string; toolName?: string; delta: string }
   | { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown }
@@ -334,16 +344,21 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
   switch (part.type) {
     case 'text-delta':
       return { type: 'text-delta', text: part.text };
-    case 'reasoning-delta':
+    case 'reasoning-delta': {
+      // An opaque payload (2.3) rides `data` and leaves `text` empty: a client
+      // that predates the flags appends `text` to the reasoning it shows.
+      const opaque = Boolean(part.encrypted || part.redacted);
       return {
         type: 'reasoning-delta',
-        text: part.text,
+        text: opaque ? '' : part.text,
         ...(part.signature ? { signature: part.signature } : {}),
         ...(part.id !== undefined ? { id: part.id } : {}),
         ...(part.encrypted ? { encrypted: true } : {}),
         ...(part.redacted ? { redacted: true } : {}),
         ...(part.source !== undefined ? { source: part.source } : {}),
+        ...(opaque ? { data: part.text } : {}),
       };
+    }
     case 'tool-call-delta':
       return {
         type: 'tool-input-delta',
@@ -526,10 +541,12 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
  * which is why they need no version of their own either.
  *
  * 1.9's two NEW parts (`warning`, `false-finish`) join the set for the same
- * reason every other one is in it: a negotiated-v1 response must stay
- * byte-identical to what pre-1.7 emitted, and `readDeuzStream`'s open-union rule
- * means a v1 client would skip them anyway. The information is not lost — it
- * also resolves in bulk on `StreamChatResult.warnings`.
+ * reason every other one is in it: a negotiated-v1 response carries only the
+ * part types pre-1.7 emitted, and `readDeuzStream`'s open-union rule means a v1
+ * client would skip them anyway. The information is not lost — it also
+ * resolves in bulk on `StreamChatResult.warnings`. (Optional FIELDS on a v1
+ * part do ride v1, such as the 2.3 `reasoning-delta` block fields; an older
+ * client ignores them.)
  */
 function isV2OnlyPart(part: DeuzUIPart): boolean {
   if (part.type === 'sub-agent') return isV2OnlyPart(part.part);
@@ -556,7 +573,8 @@ export interface ToDeuzStreamOptions {
   /**
    * Wire version to emit (default 'v2'). Pass
    * `negotiateDeuzStreamVersion(request)` to honor an explicit v1 client.
-   * v1 output is byte-identical to pre-1.7 releases.
+   * v1 output has no `id:` lines and no v2-only parts; optional fields added to
+   * v1 parts since (such as the 2.3 `reasoning-delta` block fields) ride it too.
    */
   wireVersion?: DeuzWireVersion;
   /**

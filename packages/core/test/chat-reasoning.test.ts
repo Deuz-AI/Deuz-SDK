@@ -38,12 +38,15 @@ function fold(parts: DeuzUIPart[]): AssistantTurnState {
   return turn;
 }
 
-/** The acceptance blocks as UI frames, in the shape the 2.3 wire carries them. */
+/**
+ * The acceptance blocks as UI frames, in the shape the 2.3 wire carries them:
+ * an opaque block's payload rides `data`, and its `text` is empty.
+ */
 const FRAMES: DeuzUIPart[] = [
   { type: 'reasoning-delta', text: '', signature: S0, id: '0', source: 'anthropic' },
   { type: 'reasoning-delta', text: 'a', id: '1', source: 'anthropic' },
   { type: 'reasoning-delta', text: '', signature: S1, id: '1', source: 'anthropic' },
-  { type: 'reasoning-delta', text: RED, redacted: true, id: '2', source: 'anthropic' },
+  { type: 'reasoning-delta', text: '', redacted: true, id: '2', source: 'anthropic', data: RED },
   { type: 'text-delta', text: 'Checking.' },
   { type: 'tool-call', toolCallId: 'toolu_1', toolName: 'lookup', input: { q: 'x' } },
 ];
@@ -74,11 +77,12 @@ describe('applyUIPart keeps one UI part per block', () => {
       { type: 'reasoning-delta', text: 'Planning.', id: 'rs_1', source: 'openai' },
       {
         type: 'reasoning-delta',
-        text: 'ENC',
+        text: '',
         signature: 'rs_1',
         encrypted: true,
         id: 'rs_1',
         source: 'openai',
+        data: 'ENC',
       },
       { type: 'text-delta', text: 'Done.' },
     ]);
@@ -116,10 +120,39 @@ describe('applyUIPart keeps one UI part per block', () => {
         redacted: 'yes',
         encrypted: 1,
         source: {},
+        data: 'not opaque, so not read',
       } as unknown as DeuzUIPart,
     ]);
     expect(turn.message.parts).toEqual([{ type: 'reasoning', text: 'x', state: 'streaming' }]);
     expect(turn.message.reasoning).toBe('x');
+  });
+
+  it('reads an opaque payload from `text` when a frame has no string `data`', () => {
+    // A server that put the payload in `text` (as no released Deuz server
+    // did); a non-string `data` reads as absent, like every other wire field.
+    const turn = fold([
+      { type: 'reasoning-delta', text: RED, redacted: true, id: '2', source: 'anthropic' },
+      {
+        type: 'reasoning-delta',
+        text: 'ENC',
+        encrypted: true,
+        id: 'rs_1',
+        source: 'openai',
+        data: 42,
+      } as unknown as DeuzUIPart,
+    ]);
+    expect(turn.message.parts).toEqual([
+      { type: 'reasoning', text: RED, redacted: true, id: '2', source: 'anthropic', state: 'done' },
+      {
+        type: 'reasoning',
+        text: 'ENC',
+        encrypted: true,
+        id: 'rs_1',
+        source: 'openai',
+        state: 'streaming',
+      },
+    ]);
+    expect(turn.message.reasoning).toBeUndefined();
   });
 });
 
@@ -226,17 +259,77 @@ describe('the UI wire carries block identity, flags and source', () => {
     const frames: DeuzUIPart[] = [];
     for await (const frame of readDeuzStream(response)) frames.push(frame);
     expect(frames.filter((f) => f.type === 'reasoning-delta')).toEqual([
-      { type: 'reasoning-delta', text: RED, id: '2', redacted: true, source: 'anthropic' },
       {
         type: 'reasoning-delta',
-        text: 'ENC',
+        text: '',
+        id: '2',
+        redacted: true,
+        source: 'anthropic',
+        data: RED,
+      },
+      {
+        type: 'reasoning-delta',
+        text: '',
         signature: 'rs_1',
         id: 'rs_1',
         encrypted: true,
         source: 'openai',
+        data: 'ENC',
       },
     ]);
   });
+
+  it.each(['v1', 'v2'] as const)(
+    'an opaque payload rides `data`, never `text`, so a reader that predates the flags shows none (%s wire)',
+    async (wireVersion) => {
+      const response = toDeuzStreamResponse(
+        manual([
+          { type: 'reasoning-delta', text: 'think. ', id: '0', source: 'anthropic' },
+          { type: 'reasoning-delta', text: RED, redacted: true, id: '1', source: 'anthropic' },
+          {
+            type: 'reasoning-delta',
+            text: 'ENC',
+            signature: 'rs_1',
+            encrypted: true,
+            id: 'rs_1',
+            source: 'openai',
+          },
+          { type: 'text-delta', text: 'Answer.' },
+        ]),
+        { messageId: 'm1', wireVersion },
+      );
+      const frames: DeuzUIPart[] = [];
+      for await (const frame of readDeuzStream(response)) frames.push(frame);
+      // What a 2.2 reducer, the frozen `@deuz-sdk/core/react` hook or a custom
+      // reader does with a reasoning frame: append its `text`.
+      const shown = frames
+        .filter((f): f is Extract<DeuzUIPart, { type: 'reasoning-delta' }> => {
+          return f.type === 'reasoning-delta';
+        })
+        .map((f) => f.text)
+        .join('');
+      expect(shown).toBe('think. ');
+      // A 2.3 decoder rebuilds both blocks from `data`, unchanged.
+      let turn = createAssistantTurn('m1');
+      for (const frame of frames) turn = applyUIPart(turn, frame);
+      expect(assistantMessageFromTurn(turn)).toEqual({
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'think. ', source: 'anthropic' },
+          { type: 'reasoning', text: RED, redacted: true, source: 'anthropic' },
+          {
+            type: 'reasoning',
+            text: 'ENC',
+            signature: 'rs_1',
+            encrypted: true,
+            source: 'openai',
+          },
+          { type: 'text', text: 'Answer.' },
+        ],
+      });
+      expect(turn.message.reasoning).toBe('think. ');
+    },
+  );
 
   it('a text stream with reasoning never writes opaque payloads', async () => {
     const body = await toDeuzTextStreamResponse(
