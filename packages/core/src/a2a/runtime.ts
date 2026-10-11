@@ -437,6 +437,22 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
   }
 
   /**
+   * A follow-up message the executor refused before any update was never
+   * taken: it comes back out of the history `start` recorded it in.
+   */
+  function takeBack(turn: Turn): Promise<void> {
+    return withLock(turn.key, async () => {
+      if (turn.ended || turn.changed) return;
+      const stored = await store.load(turn.taskId, turn.scope);
+      const history = stored?.history ?? [];
+      const index = history.map((message) => message.messageId).lastIndexOf(turn.message.messageId);
+      if (!stored || index === -1) return;
+      const kept = history.filter((_message, position) => position !== index);
+      await store.save({ ...stored, history: kept }, turn.scope);
+    });
+  }
+
+  /**
    * The executor threw: an A2AError of its own before any change answers the
    * request, anything else (another agent's error included) fails the task.
    */
@@ -446,6 +462,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
       return;
     }
     if (isOwnProtocolError(error) && !turn.changed) {
+      if (turn.started !== undefined) await takeBack(turn);
       fail(turn, error);
       return;
     }
@@ -516,6 +533,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
           );
         }
         const message: A2AMessage = { ...incoming, taskId, contextId: task.contextId };
+        // Taken back out (takeBack) if the executor refuses the message before any update.
         const next: A2ATask = { ...task, history: [...(task.history ?? []), message] };
         await store.save(next, scope);
         const continued = createTurn({

@@ -501,15 +501,19 @@ export interface A2AArtifactOptions {
  * interaction has no `task` yet; the task is created by the first status or
  * artifact update (or never, when the executor answers with `reply`). A
  * message to an `INPUT_REQUIRED` or `AUTH_REQUIRED` task starts a new turn of
- * that task, with `task` set.
+ * that task, with `task` set and the message added to its history.
  *
  * The turn ends at `reply`, at a terminal state, at `INPUT_REQUIRED`, or when
  * `execute` settles; updates after that are rejected. If `execute` resolves
  * while the task is `SUBMITTED` or `WORKING` the task is completed; if it
- * throws, the task fails with the error's message — unless it throws an
- * `A2AError` of its own before changing the task, which answers the request
- * with that error instead. An `A2AError` a `createA2AClient` call threw is
- * another agent's answer: it fails the task like any other error.
+ * resolves without a reply or an update, a new interaction answers
+ * `INVALID_AGENT_RESPONSE` and a follow-up turn answers with the task as it
+ * waits. If `execute` throws, the task fails with the error's message —
+ * unless it throws an `A2AError` of its own before changing the task, which
+ * answers the request with that error instead and leaves the task as it was
+ * (a follow-up message comes back out of its history). An `A2AError` a
+ * `createA2AClient` call threw is another agent's answer: it fails the task
+ * like any other error.
  */
 export interface A2AExecutionContext {
   /** The message that started this turn, with `taskId` and `contextId` filled in. */

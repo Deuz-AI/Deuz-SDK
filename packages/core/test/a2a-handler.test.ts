@@ -540,6 +540,91 @@ describe('createA2AHandler — turns of one task', () => {
     ]);
   });
 
+  it('takes a refused follow-up message back out of the task’s history', async () => {
+    const histories: string[][] = [];
+    const { handler } = handlerWith(async (ctx) => {
+      if (!ctx.task) return ctx.requireInput('Which city?');
+      histories.push((ctx.task.history ?? []).map((message) => message.messageId));
+      if (ctx.message.parts.some((part) => part.text === undefined)) {
+        throw new A2AError({ reason: 'CONTENT_TYPE_NOT_SUPPORTED', message: 'Text only, please.' });
+      }
+      await ctx.complete(`Sunny in ${ctx.message.parts[0]?.text}.`);
+    });
+    const asked = ((await send(handler, 'weather?')).result as { task: A2ATask }).task;
+    const before = (await rpc(handler, 'GetTask', { id: asked.id })).body.result as A2ATask;
+
+    const refused = await rpc(handler, 'SendMessage', {
+      message: {
+        messageId: 'm-picture',
+        role: 'ROLE_USER',
+        parts: [{ url: 'https://example.test/izmir.png' }],
+        taskId: asked.id,
+      },
+    });
+    expect(refused.body.error).toMatchObject({ code: -32005, message: 'Text only, please.' });
+    expect((await rpc(handler, 'GetTask', { id: asked.id })).body.result).toEqual(before);
+
+    const done = ((await send(handler, 'Izmir', { taskId: asked.id })).result as { task: A2ATask })
+      .task;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    // The refused turn saw its own message (ctx.task's history ends with it); the next one does not.
+    expect(histories).toEqual([
+      ['user-weather?', expect.any(String), 'm-picture'],
+      ['user-weather?', expect.any(String), 'user-Izmir'],
+    ]);
+    expect(done.history?.map((message) => message.messageId)).not.toContain('m-picture');
+  });
+
+  it('lets a cancel that came first win over a refusal of the follow-up message', async () => {
+    const waiting = gate();
+    const refuse = gate();
+    const canceling = gate();
+    const allowCancel = gate();
+    const { handler, errors } = handlerWith(() => {}, {
+      executor: {
+        execute: async (ctx) => {
+          if (!ctx.task) return ctx.requireInput('Which city?');
+          waiting.open();
+          await refuse.promise;
+          throw new A2AError({ reason: 'CONTENT_TYPE_NOT_SUPPORTED', message: 'Text only.' });
+        },
+        cancel: () => {
+          canceling.open();
+          return allowCancel.promise;
+        },
+      },
+    });
+    const asked = ((await send(handler, 'weather?')).result as { task: A2ATask }).task;
+    const answer = send(handler, 'Izmir', { taskId: asked.id });
+    await waiting.promise;
+    const canceled = rpc(handler, 'CancelTask', { id: asked.id });
+    await canceling.promise; // the cancel holds the task
+    refuse.open(); // the refusal's take-back now waits behind the cancel
+    await tick();
+    allowCancel.open();
+    expect(((await canceled).body.result as A2ATask).status.state).toBe('TASK_STATE_CANCELED');
+    expect(((await answer).result as { task: A2ATask }).task.status.state).toBe(
+      'TASK_STATE_CANCELED',
+    );
+    const stored = (await rpc(handler, 'GetTask', { id: asked.id })).body.result as A2ATask;
+    expect(stored.status.state).toBe('TASK_STATE_CANCELED');
+    expect(stored.history?.at(-1)?.messageId).toBe('user-Izmir');
+    expect(errors).toEqual([]);
+  });
+
+  it('answers a follow-up turn that makes no update with the waiting task, its message kept', async () => {
+    const { handler } = handlerWith((ctx) => (ctx.task ? undefined : ctx.requireInput('?')));
+    const asked = ((await send(handler, 'weather?')).result as { task: A2ATask }).task;
+    const body = await send(handler, 'Izmir', { taskId: asked.id });
+    expect(body.error).toBeUndefined();
+    const task = (body.result as { task: A2ATask }).task;
+    expect(task.status).toEqual(asked.status);
+    expect(task.history?.map((message) => message.messageId)).toEqual([
+      ...(asked.history ?? []).map((message) => message.messageId),
+      'user-Izmir',
+    ]);
+  });
+
   it('refuses a message to an unknown task with TASK_NOT_FOUND', async () => {
     const { handler } = handlerWith((ctx) => ctx.complete());
     const body = await send(handler, 'hi', { taskId: 'missing' });
@@ -892,8 +977,10 @@ describe('createA2AHandler — SendStreamingMessage', () => {
       id,
       error: { code: -32005, message: 'Text only.' },
     });
+    // The snapshot carried the refused message; the stored task is as it was before it.
     const stored = (await rpc(handler, 'GetTask', { id: task.id })).body.result as A2ATask;
     expect(stored.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    expect(stored).toEqual(task);
   });
 
   it('keeps the task running when the client leaves the stream', async () => {
@@ -1397,5 +1484,7 @@ describe('createA2AHandler — HTTP+JSON binding', () => {
         details: errorInfo('CONTENT_TYPE_NOT_SUPPORTED'),
       },
     });
+    const stored = await (await rest(handler, 'GET', `/tasks/${created.task.id}`)).json();
+    expect(stored).toEqual(created.task);
   });
 });
