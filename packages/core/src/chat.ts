@@ -689,10 +689,10 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
                 : {}),
             }
           : {};
-      // `input-streaming` arrives BEFORE the assembled tool-call part — open a
-      // placeholder so the lifecycle is visible from the first fragment.
       // The dispatch contract's verdict (2.3), read as defensively as the flags.
       const outcome = (part as { outcome?: unknown }).outcome;
+      // `input-streaming` arrives BEFORE the assembled tool-call part — open a
+      // placeholder so the lifecycle is visible from the first fragment.
       if (!(turn.message.toolCalls ?? []).some((c) => c.toolCallId === part.toolCallId)) {
         const placeholder: UIToolCall = withOutcome(
           {
