@@ -83,10 +83,11 @@ run leg starts
   ├─ resume settle · memory recall computed
   ├─ onInput ─────────────────── once. block ⇒ no model call at all
   └─ for each step:
-       ├─ compaction · prepareStep · model call
-       ├─ handoff interception       ← transfers are decided BEFORE guardrails
-       ├─ onToolCall (per call) ──── block/rewrite
-       ├─ approval gate (needsApproval / approveToolCall)
+       ├─ MCP refresh · compaction · prepareStep · model call
+       ├─ execution policy ───────── a forbidden call fails the run, before anyone sees it
+       ├─ onToolCall (per call) ──── block/rewrite, transfers included (2.3)
+       ├─ approval gate (needsApproval / requireApproval / approveToolCall)
+       ├─ handoff decision ───────── among the transfers the steps above cleared
        ├─ executeTools
        ├─ onToolResult (per result) ─ block/rewrite, before the model sees it
        └─ at a natural completion:
@@ -98,12 +99,12 @@ run leg starts
 Each placement is a decision, not an accident:
 
 - **`onInput` runs after the resume settle**, so a durable leg that answers pending approvals is not re-gated on a history the user did not just send. It runs **once per run leg** — not once per step, and not once per sub-agent. It also runs *after* the memory recall block is computed, but that block is spliced in at the model-call site, so an input guardrail does not see it.
-- **`onToolCall` runs immediately before the approval gate**, which is why a rewrite reaches the `needsApproval` predicate, the approval request a human sees, and `execute`. Running it *after* the gate would mean a human approved arguments the loop then changed; running it *before* the handoff interception would mean a routing decision could be blocked as if it were a tool.
+- **`onToolCall` runs immediately before the approval gate**, which is why a rewrite reaches the `needsApproval` predicate, the approval request a human sees, and `execute`. Running it *after* the gate would mean a human approved arguments the loop then changed. It runs after the execution policy, which fails the run on a forbidden call before any rule or human sees the batch, and before the handoff decision, so a transfer is judged like any other call.
 - **`onToolResult` runs once the whole batch has settled**, in call order, before the results are appended to history or streamed. A throwing guardrail therefore propagates out of the run instead of self-healing into a fake tool failure.
 - **`onOutput` runs after `doneWhen` and `verifyStep` have both accepted.** A re-driven round never reaches it, so the text a guardrail sees is the one the run is actually about to return — and it is not re-run per attempt, so an expensive check (a classifier call) is paid for once.
 
-<Callout type="info" title="Handoffs are intercepted before guardrails">
-A `transfer_to_*` call is resolved by the loop deterministically, before `onToolCall`. So an `onToolCall` guardrail never sees a transfer, and a transfer is never queued for approval. Guardrails themselves survive a transfer untouched — they belong to the run, not to the agent. See [Handoffs](/docs/agents/handoffs#the-interception-is-deterministic).
+<Callout type="info" title="A transfer is a call like any other (2.3)">
+A `transfer_to_*` call takes the same path as every call: `onToolCall` sees it and can block it, and a `needsApproval` on the transfer tool or the execution policy's `requireApproval` gates it. The handoff decision comes last, among the transfers that cleared all of that, and is still made by looking at the call, never by executing it. A refused transfer is answered with its denial (a guardrail block reports `outcome: 'permission-denied'`) and the run stays with the current agent; a transfer waiting for a verdict suspends the run, and the resume decides it. Before 2.3 a transfer was decided before the guardrails and never queued for approval, so an allowlist guardrail written then now judges transfers too: let `transfer_to_*` calls pass if it should not block them. Guardrails themselves survive a transfer untouched — they belong to the run, not to the agent. See [Handoffs](/docs/agents/handoffs#the-interception-is-deterministic).
 </Callout>
 
 ## A blocked tool call joins the existing denial machinery
@@ -451,16 +452,16 @@ They compose: use the middleware for the always-on instruction and guardrails fo
 - **`generateObject` / `streamObject` reject `guardrails`** for the same reason — they are single-shot by design and have no such boundary. Passing it is a caller error, not a silent no-op. (`mcp` is refused there too.)
 - **A [handoff](/docs/agents/handoffs) keeps them.** A transfer changes the active agent, not the run, and `guardrails` is a run-level option — so the same rules keep applying after the swap. That is deliberate: a handoff must never silently re-point a defense.
 
-<Callout type="warn" title="Sub-agents do NOT inherit guardrails">
-`agentTool` forwards `runtimeContext`, the approval gate and the abort signal into the sub-agent loop — but **not** `guardrails`, and `AgentToolDef` has no `guardrails` field of its own. A sub-agent therefore runs unguarded, even though the guardrail contexts carry an `agentPath` field for it.
+<Callout type="info" title="Sub-agents inherit the tool guardrails (2.3)">
+`agentTool` forwards `runtimeContext`, the approval gate, the abort signal and, since 2.3, the run's `onToolCall` and `onToolResult` into the sub-agent loop (through `ToolExecuteContext.guardrails`). A sub-agent's own calls and results are judged by the same rules as the parent's, so a sub-agent narrows what the run may do, never widens it. In the sub-agent's loop the contexts carry its `agentPath`, which is how a rule tells the two apart.
 
-If a sub-agent must be constrained today, put the constraint inside it: `needsApproval` on its tools, `stopWhen`, or an `execute` that checks `ctx.runtimeContext` (which *is* inherited). `agentPath` is declared on the contexts for the same reason the other loop hooks carry it — it is where the value would appear — but in 2.0 it is effectively always absent.
+`onInput` and `onOutput` are **not** inherited: they guard the run's own input and final answer, and a sub-agent's answer reaches the parent as a tool result, which the parent's `onToolResult` sees. `AgentToolDef` has no `guardrails` field of its own. Before 2.3 a sub-agent ran with no guardrails at all.
 </Callout>
 
 ## See also
 
 - [Tools](/docs/agents/tools) — `needsApproval`, `prepareStep`, and the budget stop conditions guardrails sit alongside.
 - [Tool loop](/docs/agents/tool-loop) — the denial machinery a blocked call joins.
-- [Handoffs](/docs/agents/handoffs) — intercepted before `onToolCall`, deliberately.
+- [Handoffs](/docs/agents/handoffs) — `onToolCall` sees transfer calls too (2.3).
 - [Middleware](/docs/modules/middleware) — the model-level wrapper, and `promptInjectionGuard`.
 - [Request validation](/docs/modules/request-validation) — the layer *before* this one: reject a hostile POST body before it reaches the loop at all.

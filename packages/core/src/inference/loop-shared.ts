@@ -171,6 +171,13 @@ export interface DurableRunner {
   /** Step boundaries saved so far across ALL legs (monotonic). */
   stepIndex: number;
   /**
+   * Approval requests this loop's gate issued under each tool call id, across
+   * all legs (2.3): `AgentCheckpoint.approvalRequestCounts`. Counted when a
+   * suspension is saved, and carried on every checkpoint. A map, because the
+   * keys are provider call ids.
+   */
+  approvalRequestCounts: Map<string, number>;
+  /**
    * Active-agent transfer state (2.0), set by the loop the moment a handoff is
    * accepted and carried onto EVERY later checkpoint. Held here rather than
    * threaded through `saveCheckpoint`'s argument list because the two loops save
@@ -182,15 +189,41 @@ export interface DurableRunner {
   observe?: { rt: ObservationRuntime; runSpanId: string };
 }
 
+/** The cross-leg counters a resumed leg continues from its checkpoint. */
+export interface DurableResume {
+  stepIndex: number;
+  usage: Usage;
+  /** `AgentCheckpoint.approvalRequestCounts` (2.3), when the checkpoint has one. */
+  approvalRequestCounts?: Record<string, number>;
+}
+
+/** The {@link DurableResume} of a stored checkpoint. */
+export function durableResumeOf(checkpoint: AgentCheckpoint): DurableResume {
+  return {
+    stepIndex: checkpoint.stepIndex,
+    usage: checkpoint.usage,
+    ...(checkpoint.approvalRequestCounts
+      ? { approvalRequestCounts: checkpoint.approvalRequestCounts }
+      : {}),
+  };
+}
+
+/** A checkpoint's `approvalRequestCounts` as a map; empty when it has none. */
+export function requestCountsOf(
+  record: Readonly<Record<string, number>> | undefined,
+): Map<string, number> {
+  return new Map(record ? Object.entries(record) : []);
+}
+
 /**
  * Build the durable runner when the call carries `session`; otherwise
  * undefined (zero overhead). `resumeFrom` seeds the cross-leg counters on a
- * `resumeFromCheckpoint` leg.
+ * `resumeFromCheckpoint` leg; a plain leg reads them with {@link continueStoredRun}.
  */
 export function setupDurable(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
-  resumeFrom?: { stepIndex: number; usage: Usage },
+  resumeFrom?: DurableResume,
 ): DurableRunner | undefined {
   if (!options.session) return undefined;
   return {
@@ -198,7 +231,46 @@ export function setupDurable(
     runId: options.session.runId ?? deps.generateId(),
     baseUsage: resumeFrom?.usage ?? EMPTY_USAGE,
     stepIndex: resumeFrom?.stepIndex ?? 0,
+    approvalRequestCounts: requestCountsOf(resumeFrom?.approvalRequestCounts),
   };
+}
+
+/**
+ * A plain leg of a stored durable run (2.3): a call that carries the run's
+ * `session` without `resumeFromCheckpoint`. It continues the stored run's step
+ * counter and approval-request count, so the run never saves the same step
+ * boundary twice and an approval bound to a step is never issued again by a
+ * later leg. Returns the step the stored run is suspended at: the step its
+ * pending approvals are bound to, which the leg's settle needs. A run id the
+ * caller did not pass has nothing stored.
+ *
+ * A failed read is logged and the leg counts from 0, as before; under
+ * `durability: 'strict'` it fails the call instead.
+ */
+export async function continueStoredRun(
+  runner: DurableRunner,
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+): Promise<number | undefined> {
+  if (options.session?.runId === undefined) return undefined;
+  let stored: AgentCheckpoint | undefined;
+  try {
+    stored = await runner.store.load(runner.runId);
+  } catch (cause) {
+    if (options.session.durability === 'strict') {
+      throw new ExecutionPersistenceError(
+        `Checkpoint of run '${runner.runId}' could not be read.`,
+        cause,
+      );
+    }
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    deps.logger.error(`durable: checkpoint load failed for '${runner.runId}' — ${detail}`);
+    return undefined;
+  }
+  if (!stored || !Number.isSafeInteger(stored.stepIndex) || stored.stepIndex < 0) return undefined;
+  runner.stepIndex = stored.stepIndex;
+  runner.approvalRequestCounts = requestCountsOf(stored.approvalRequestCounts);
+  return stored.status === 'suspended' ? stored.stepIndex : undefined;
 }
 
 /** Cumulative run usage (prior legs + this leg) for checkpoints and stop conditions. */
@@ -223,6 +295,16 @@ export async function saveCheckpoint(
 ): Promise<void> {
   if (runner.cost) await runner.cost.flush();
   runner.stepIndex += 1;
+  // A suspension on this loop's own gate counts each request under its tool
+  // call id (2.3). A sub-agent's requests ride the parent's save too, but they
+  // belong to the child run, and its own checkpoint counts them.
+  if (status === 'suspended') {
+    const counts = runner.approvalRequestCounts;
+    for (const request of pendingApprovals ?? []) {
+      if (!sameApprovalValue(request.agentPath ?? [], options.agentPath ?? [])) continue;
+      counts.set(request.toolCallId, (counts.get(request.toolCallId) ?? 0) + 1);
+    }
+  }
   const checkpoint: AgentCheckpoint = {
     version: 1,
     runId: runner.runId,
@@ -233,6 +315,9 @@ export async function saveCheckpoint(
     usage: withTotal(durableUsage(runner, legUsage)),
     ...(runner.cost ? { cost: runner.cost.snapshot() } : {}),
     ...(pendingApprovals && pendingApprovals.length > 0 ? { pendingApprovals } : {}),
+    ...(runner.approvalRequestCounts.size > 0
+      ? { approvalRequestCounts: Object.fromEntries(runner.approvalRequestCounts) }
+      : {}),
     // Handoff (2.0): absent until a transfer happens, then on every checkpoint
     // of the run — the resume leg re-applies the overlay from it.
     ...(runner.handoff ? { handoff: runner.handoff } : {}),
@@ -297,6 +382,11 @@ export async function saveCheckpoint(
 export interface ApprovalScope {
   runId?: string;
   step?: number;
+  /**
+   * The run's approval-request count per tool call id (its runner's). Not part
+   * of the identity: it tells a settle which ids the 2.2 form can still name.
+   */
+  approvalRequestCounts?: ReadonlyMap<string, number>;
 }
 
 /** Hex digits of the approval digest kept in an `approvalId` (96 bits). */
@@ -378,27 +468,34 @@ export async function toApprovalRequests(
 
 /**
  * Whether `responses` hold a verdict for `request` (2.3): one naming its
- * `approvalId`, or the 2.2 form, its bare tool call id, when that id occurs once
- * in `messages`. The settle applies the same rule (`settleVerdicts`).
+ * `approvalId`, or the 2.2 form, its bare tool call id, when the run used that
+ * id once (see {@link reusedToolCallIds}; `counts` is the run's
+ * approval-request count). The settle applies the same rule (`settleVerdicts`).
  */
 export function answersApproval(
   request: ToolApprovalRequest,
   responses: readonly ToolApprovalResponse[] | undefined,
   messages: Message[],
+  counts?: ReadonlyMap<string, number>,
 ): boolean {
   if (!responses || responses.length === 0) return false;
   if (responses.some((response) => response.approvalId === request.approvalId)) return true;
   return (
     responses.some((response) => response.approvalId === request.toolCallId) &&
-    !reusedToolCallIds(messages).has(request.toolCallId)
+    !reusedToolCallIds(messages, counts).has(request.toolCallId)
   );
 }
 
 /**
- * Tool call ids that occur more than once among the history's `tool_use` parts:
- * a provider without call ids numbers each response's calls from `tool_0`.
+ * Tool call ids the 2.2 verdict form cannot name: ids that occur more than once
+ * among the history's `tool_use` parts (a provider without call ids numbers each
+ * response's calls from `tool_0`), and (2.3) ids the run issued more than one
+ * approval request under (`counts`). The history alone is not enough, because
+ * compaction or a `prepareStep` window drops earlier calls from it; the count
+ * keeps them. A checkpoint written without the count leaves the history to
+ * decide alone.
  */
-function reusedToolCallIds(messages: Message[]): Set<string> {
+function reusedToolCallIds(messages: Message[], counts?: ReadonlyMap<string, number>): Set<string> {
   const seen = new Set<string>();
   const reused = new Set<string>();
   for (const message of messages) {
@@ -409,6 +506,7 @@ function reusedToolCallIds(messages: Message[]): Set<string> {
       seen.add(part.id);
     }
   }
+  for (const [id, count] of counts ?? []) if (count > 1) reused.add(id);
   return reused;
 }
 
@@ -2323,9 +2421,8 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
  *
  * `approval` (2.3) is the identity the suspended leg bound its requests to: a
  * verdict counts only under the `approvalId` its call was issued with (see
- * {@link approvalIdOf}). A durable leg that does not know its suspension step
- * (a plain call carrying the run's `session`) reads it from the stored
- * checkpoint.
+ * {@link approvalIdOf}). A plain leg of a durable run passes the step its stored
+ * checkpoint is suspended at ({@link continueStoredRun}).
  */
 export async function settlePendingApprovals(
   messages: Message[],
@@ -2383,15 +2480,6 @@ export async function settlePendingApprovals(
     toolName: p.name,
     args: p.input,
   }));
-  let scope: ApprovalScope = approval ?? {};
-  if (scope.runId !== undefined && scope.step === undefined && options.session) {
-    try {
-      const saved = await options.session.store.load(scope.runId);
-      if (saved?.status === 'suspended') scope = { ...scope, step: saved.stepIndex };
-    } catch {
-      // Unreadable: no verdict can match a step-bound id, so gated calls deny.
-    }
-  }
   // The same plan a live step makes (transfers by decision, the re-derived
   // `onToolCall` guardrails, then the gate), here with the leg's verdicts.
   const plan = await planToolDispatch({
@@ -2401,7 +2489,7 @@ export async function settlePendingApprovals(
     messages,
     ...(handoff ? { handoff } : {}),
     verdicts: responses,
-    approval: scope,
+    approval: approval ?? {},
     ...(extras?.deps ? { clock: extras.deps.clock } : {}),
     ...(extras?.observe ? { observe: extras.observe } : {}),
   });
@@ -2440,9 +2528,11 @@ export async function settlePendingApprovals(
  *
  * A verdict answers a call only under the `approvalId` the call was issued with
  * (2.3, {@link approvalIdOf}). The 2.2 form, the bare tool call id, still answers
- * a call whose id occurs once in the history (a run suspended before 2.3, or a
- * client that built its verdicts from `toolCallId`); a reused id (`tool_0`) needs
- * the bound one, because the bare id cannot say which of its calls it approves.
+ * a call whose id the run used once (a run suspended before 2.3, or a client that
+ * built its verdicts from `toolCallId`); a reused id (`tool_0`) needs the bound
+ * one, because the bare id cannot say which of its calls it approves. "Once" is
+ * read from the history and from the run's approval-request count, which
+ * survives a rewritten history ({@link reusedToolCallIds}).
  */
 async function settleVerdicts(
   calls: ToolCall[],
@@ -2492,7 +2582,7 @@ async function settleVerdicts(
     }
   }
   // Each call's verdict, under the id it was issued with (or the 2.2 form).
-  const reused = reusedToolCallIds(messages);
+  const reused = reusedToolCallIds(messages, scope.approvalRequestCounts);
   const matched = new Map<string, { verdict: ToolApprovalResponse; approvalId: string }>();
   const boundIds = new Map<string, string>();
   for (const c of calls) {

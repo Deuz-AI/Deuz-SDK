@@ -205,7 +205,8 @@ What you get at the break:
   (since 2.3 `approvalId` is the tool call id followed by a digest that binds
   the approval to its tool and arguments, and in a durable or native run to its
   run and step; echo it back unchanged. A verdict naming only the tool call id
-  still counts when that id is unique in the history). `finishReason` stays `'tool_calls'`.
+  still counts when the run used that id once: it is unique in the history, and
+  a durable run issued one approval request under it). `finishReason` stays `'tool_calls'`.
 - **`streamChat` / the UI wire** emits one `tool-approval-request` part per
   pending call after the `tool-call` parts.
 

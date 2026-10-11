@@ -45,6 +45,8 @@ interface DurableSessionOptions {
 
 When present, the loop saves an `AgentCheckpoint` at every step boundary and the result carries `runId` — `GenerateTextResult.runId` on buffered calls, and synchronously on `StreamChatResult.runId` for streaming (available before the first part arrives). Only agentic calls (with `tools`) checkpoint; a single-turn call has no step boundaries and carries no `runId`.
 
+**A plain call can continue a stored run (2.3).** A call that passes the `runId` of a run already in the store, without `resumeFromCheckpoint` (a chat that continues one run turn by turn), reads that run's latest checkpoint before its first step and continues its step counter. `stepIndex` therefore stays monotonic over every leg, and an approval bound to a step is never issued again by a later leg. Before 2.3 such a call restarted at step 1. The read is best-effort like a save: a failing `load` is logged and the leg counts from 0. With `durability: 'strict'` the call fails instead (an `error` part on a stream).
+
 ## `SessionStore` — the storage seam
 
 ```ts
@@ -83,6 +85,7 @@ interface AgentCheckpoint {
   messages: Message[];                     // full immutable history at the boundary
   usage: Usage;                            // CUMULATIVE across the whole run
   pendingApprovals?: ToolApprovalRequest[]; // set on a 'suspended' approval break
+  approvalRequestCounts?: Record<string, number>; // 2.3: approval requests per tool call id, all legs
   agentPath?: string[];                    // set on sub-agent checkpoints
   createdAt: number;                       // deps.clock.now() at save time
 }

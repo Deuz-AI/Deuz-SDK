@@ -498,7 +498,7 @@ export interface ToolDeniedEvent extends ObserveEventBase {
 
 export interface ApprovalRequestedEvent extends ObserveEventBase {
   type: 'approval.requested';
-  /** Equals toolCallId today; kept distinct for the signed scheme. */
+  /** The request's identity-bound id (2.3: `toolCallId@<digest>`, see `ToolApprovalRequest`). */
   approvalId: string;
   toolCallId: string;
   toolName: string;

@@ -151,9 +151,14 @@ export interface ToolResult {
 
 /**
  * A tool call awaiting user approval (client-mode approval break).
- * `approvalId === toolCallId` today; kept as a distinct field so a future
- * signed-approval scheme stays additive (1.5 ships `createApprovalSigner`
- * for HMAC-signed round-trips — the id contract is unchanged).
+ * `approvalId` is the tool call id followed by a digest that binds the approval
+ * to the call it was issued for (2.3, `toolCallId@<digest>`): the tool, the
+ * arguments and the sub-agent path, and in a durable or native run the run and
+ * the step it suspended at. Echo it unchanged on the verdict
+ * (`ToolApprovalResponse.approvalId`). A verdict that names only the
+ * `toolCallId` (the 2.2 form) counts only when the run used that id once; with a
+ * provider that reuses `tool_0` it answers nothing. `createApprovalSigner` (1.5)
+ * signs the request into `token`.
  */
 export interface ToolApprovalRequest {
   approvalId: string;

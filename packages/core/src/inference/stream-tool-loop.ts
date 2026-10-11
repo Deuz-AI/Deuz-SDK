@@ -63,6 +63,8 @@ import {
   planToolDispatch,
   policyRefusalOf,
   settlePendingApprovals,
+  continueStoredRun,
+  requestCountsOf,
   saveCheckpoint,
   prepareChatPersistence,
   persistChat,
@@ -101,6 +103,7 @@ import {
   type CatalogChangeVerdict,
   type CompactionTrigger,
   type Denial,
+  type DurableResume,
   type DurableRunner,
   type ExecuteExtras,
   type GuardrailLogEntry,
@@ -131,7 +134,7 @@ export interface StreamToolLoopInternal {
   onSnapshot?: (snapshot: StreamToolLoopSnapshot) => void;
   /** Captures the loop outcome in the same native transaction as its checkpoint. */
   onCheckpoint?: (snapshot: StreamToolLoopSnapshot) => void;
-  resumeFrom?: { stepIndex: number; usage: Usage };
+  resumeFrom?: DurableResume;
   /**
    * Handoff (2.0): the checkpoint's active agent, re-applied before the first
    * step of a resume leg. Set directly when the history is already at hand; the
@@ -142,7 +145,7 @@ export interface StreamToolLoopInternal {
   resumeLoad?: (rt?: ObservationRuntime) => Promise<{
     cost?: UsageCostSnapshot;
     messages: Message[];
-    resumeFrom: { stepIndex: number; usage: Usage };
+    resumeFrom: DurableResume;
     /** Handoff (2.0): `AgentCheckpoint.handoff`, when the checkpoint carried one. */
     handoff?: { to: string; count: number };
     /** Observation (1.6): checkpoint correlation for run.started. */
@@ -428,6 +431,7 @@ export function runStreamToolLoop(
             runId,
             baseUsage: resumeFrom?.usage ?? EMPTY_USAGE,
             stepIndex: resumeFrom?.stepIndex ?? 0,
+            approvalRequestCounts: requestCountsOf(resumeFrom?.approvalRequestCounts),
             cost: usageCost,
           }
         : undefined;
@@ -710,6 +714,13 @@ export function runStreamToolLoop(
     };
 
     try {
+      // A plain leg of a stored durable run continues its step counter (2.3), so
+      // no approval is bound to a step the run already used. Inside the try: a
+      // strict read failure ends the run as an `error` part (G2).
+      const suspendedAt =
+        durable && resumeFrom === undefined
+          ? await continueStoredRun(durable, options, deps)
+          : undefined;
       // What a mid-run MCP catalog change does (2.3); an unknown value fails the run.
       const catalogPolicy = catalogChangePolicy(options);
       // Zero-config MCP (2.0): connect BEFORE the wire is built so the servers'
@@ -770,7 +781,11 @@ export function runStreamToolLoop(
           },
           { ...(active ? { active } : {}), tools: handoffTools },
           // The identity the suspended leg bound its approvals to (2.3).
-          { runId: durable?.runId, step: resumeFrom?.stepIndex },
+          {
+            runId: durable?.runId,
+            step: resumeFrom?.stepIndex ?? suspendedAt,
+            approvalRequestCounts: durable?.approvalRequestCounts,
+          },
         );
         if (settled) {
           const settledMessages = settled.messages.slice(messages.length);

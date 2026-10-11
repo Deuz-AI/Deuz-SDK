@@ -34,10 +34,12 @@ import {
   answersApproval,
   buildWireTools,
   collectHandoffTools,
+  durableResumeOf,
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
   filterWireTools,
   mergeMcpTools,
+  requestCountsOf,
   resumeHandoffState,
   rewriteAssistantText,
   sumUsage,
@@ -612,6 +614,10 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             usage: envelope.usage,
             createdAt: resolveDependencies(options.deps).clock.now(),
             ...(previous?.handoff ? { handoff: previous.handoff } : {}),
+            // The run's approval-request count (2.3) outlives every checkpoint.
+            ...(previous?.approvalRequestCounts
+              ? { approvalRequestCounts: previous.approvalRequestCounts }
+              : {}),
           };
           await persist();
         },
@@ -702,9 +708,18 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         resume &&
         pendingCheckpoint?.status === 'suspended' &&
         // A verdict must name the approval it answers (2.3): one kept from an
-        // earlier gate under a reused call id leaves the run suspended.
+        // earlier gate under a reused call id leaves the run suspended. The run's
+        // count covers its own gate's requests; a sub-agent's has its own.
         (pendingApprovals.some(
-          (request) => !answersApproval(request, options.approvalResponses, envelope.messages),
+          (request) =>
+            !answersApproval(
+              request,
+              options.approvalResponses,
+              envelope.messages,
+              request.agentPath?.length
+                ? undefined
+                : requestCountsOf(pendingCheckpoint?.approvalRequestCounts),
+            ),
         ) ||
           pendingClients.some((call) => !clientIds.has(call.toolCallId)))
       ) {
@@ -918,7 +933,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             {
               ...(resume && checkpoint
                 ? {
-                    resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+                    resumeFrom: durableResumeOf(checkpoint),
                     resumeHandoff: checkpoint.handoff,
                   }
                 : {}),

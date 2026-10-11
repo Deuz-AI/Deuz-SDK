@@ -42,7 +42,7 @@ This is the whole point, and it is not a nuance. [`agentTool`](/docs/agents/suba
 | Coming back | Only by transferring again (targets keep each other's transfer tools, including one back). | Automatic — the sub-agent finishes and the parent continues. |
 | Stream signal | `handoff` part | `sub-agent` parts (the child's live stream, forwarded) |
 | Metadata | `providerMetadata.deuz.handoffs` | usage attribution per `agentPath` |
-| Guardrails | **Kept** — they are run-level, and the run did not change. | **Not inherited** by the sub-agent loop. |
+| Guardrails | **Kept** — they are run-level, and the run did not change. | `onToolCall` and `onToolResult` are **inherited** by the sub-agent loop (2.3); `onInput` and `onOutput` are not. |
 | Token cost of the switch | Zero extra calls; the next step just uses a different model. | One nested run per call, with its own steps and usage. |
 
 Pick a **handoff** when the *conversation* should change hands — triage → specialist, sales → support. Pick a **sub-agent** when a *task* should be farmed out and answered — research this, summarize that.

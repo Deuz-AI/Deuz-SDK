@@ -38,6 +38,7 @@ import {
   planToolDispatch,
   settlePendingApprovals,
   setupDurable,
+  continueStoredRun,
   saveCheckpoint,
   prepareChatPersistence,
   persistChat,
@@ -74,6 +75,7 @@ import {
   setModelGate,
   type ActiveAgentState,
   type CompactionTrigger,
+  type DurableResume,
   type ExecuteExtras,
   type GuardrailLogEntry,
   type HandoffLogEntry,
@@ -89,7 +91,7 @@ import type { UsageCostSnapshot } from '../internal/usage-cost';
  */
 export interface ToolLoopInternal {
   resumeCost?: UsageCostSnapshot;
-  resumeFrom?: { stepIndex: number; usage: Usage };
+  resumeFrom?: DurableResume;
   /**
    * Handoff (2.0): the checkpoint's active agent, re-applied before the first
    * step of a resume leg (`durable.ts` reads it off `AgentCheckpoint.handoff`).
@@ -373,6 +375,12 @@ export async function runToolLoop(
       : {};
 
   try {
+    // A plain leg of a stored durable run continues its step counter (2.3), so
+    // no approval is bound to a step the run already used.
+    const suspendedAt =
+      durable && !internal?.resumeFrom
+        ? await continueStoredRun(durable, options, deps)
+        : undefined;
     // What a mid-run MCP catalog change does (2.3); an unknown value fails the call.
     const catalogPolicy = catalogChangePolicy(options);
     // Zero-config MCP (2.0): connect BEFORE the wire is built, so the servers'
@@ -421,7 +429,11 @@ export async function runToolLoop(
         undefined,
         { ...(active ? { active } : {}), tools: handoffTools },
         // The identity the suspended leg bound its approvals to (2.3).
-        { runId: durable?.runId, step: internal?.resumeFrom?.stepIndex },
+        {
+          runId: durable?.runId,
+          step: internal?.resumeFrom?.stepIndex ?? suspendedAt,
+          approvalRequestCounts: durable?.approvalRequestCounts,
+        },
       );
       if (settled) {
         messages = settled.messages;
