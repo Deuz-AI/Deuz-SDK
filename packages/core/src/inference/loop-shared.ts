@@ -1638,20 +1638,34 @@ export function agentToolSet(handoffTools: ToolSet, target: HandoffTargetMeta): 
 }
 
 /**
- * Replace the run's leading system turn with the incoming agent's instructions
- * (inserting one when the history had none, removing it when the target
- * declares none).
+ * Give the incoming agent its instructions in the run's effective history.
  *
- * A REWRITE, never an append — the same discipline compaction follows: the new
- * turn must not enter `appended`/`chatMessages`, or the caller's response delta
- * and the chat transcript would grow a system message they never sent. It lives
- * in the effective model history (and therefore in checkpoints), which is
- * exactly where a resume leg needs to find it.
+ * By default a REWRITE: the run's leading system turn is replaced by the
+ * instructions (one is inserted when the history had none, and removed when
+ * the target declares none).
+ *
+ * `append` (2.3, F22: the target's model binds thinking to the transcript
+ * prefix) appends them as a `role: 'system'` message after the transfer's tool
+ * result instead, and appends nothing for a target without instructions: the
+ * leading system turn is part of the prefix every earlier thinking block is
+ * bound to, so rewriting it would invalidate them all.
+ *
+ * Either way the new turn must not enter `appended`/`chatMessages`, or the
+ * caller's response delta and the chat transcript would grow a system message
+ * they never sent (the next run starts at the root agent). It lives in the
+ * effective model history (and therefore in checkpoints), which is exactly
+ * where a resume leg needs to find it.
  */
 export function withAgentInstructions(
   messages: Message[],
   instructions: string | undefined,
+  append = false,
 ): Message[] {
+  if (append) {
+    return instructions === undefined
+      ? messages
+      : [...messages, { role: 'system', content: instructions }];
+  }
   const first = messages[0];
   const hasSystem = first !== undefined && first.role === 'system';
   if (instructions === undefined) return hasSystem ? messages.slice(1) : messages;
@@ -1720,7 +1734,17 @@ export function applyHandoffSwap(
     to: meta.name,
     ...(accepted.reason !== undefined ? { reason: accepted.reason } : {}),
   });
-  return { active, messages: withAgentInstructions(messages, meta.def.instructions), entry };
+  return {
+    active,
+    // A target whose model binds thinking to the prefix (2.3, F22) gets its
+    // instructions appended; any other gets the 2.2 rewrite.
+    messages: withAgentInstructions(
+      messages,
+      meta.def.instructions,
+      bindsThinkingToPrefix(meta.def.model),
+    ),
+    entry,
+  };
 }
 
 /**

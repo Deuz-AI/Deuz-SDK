@@ -398,6 +398,13 @@ export function redactPII(): LanguageModelMiddleware {
  * Prepend a spotlighting instruction that tells the model to treat user content
  * as data, not commands — a lightweight prompt-injection guard. `policy` lets
  * you supply your own system text.
+ *
+ * Added ONCE (2.3, F22): a history whose leading system run already carries
+ * the policy (a chat record saved by an earlier guarded call, say) is left as
+ * it is. Prepending it again on every call grew the system prompt by one copy
+ * per turn — and the top-level system is part of the prefix Claude 5.x binds
+ * its thinking to, so every earlier thinking block went invalid with it. The
+ * same text first on every call keeps that prefix byte-identical.
  */
 export function promptInjectionGuard(opts: { policy?: string } = {}): LanguageModelMiddleware {
   const policy =
@@ -408,6 +415,10 @@ export function promptInjectionGuard(opts: { policy?: string } = {}): LanguageMo
   return {
     name: 'promptInjectionGuard',
     transformParams(options) {
+      for (const m of options.messages) {
+        if (m.role !== 'system') break;
+        if (m.content === policy) return options;
+      }
       const guard = { role: 'system' as const, content: policy };
       return { ...options, messages: [guard, ...options.messages] } as MiddlewareCallOptions;
     },

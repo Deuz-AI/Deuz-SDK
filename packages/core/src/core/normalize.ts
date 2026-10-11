@@ -74,11 +74,13 @@ export function inputShapeError(input: CallInput, fn: string): InvalidRequestErr
  * the in-history one keeps `instructions` purely additive — no caller loses a
  * system message by adopting the shorthand.
  *
- * The fold is IDEMPOTENT for the round-trip case: when the first turn is already
- * a system message with exactly this text, no second copy is prepended. Without
- * that, `chat` persistence (which stores this folded history) plus the same
- * `instructions` on the next call would duplicate the system prompt on every
- * turn.
+ * The fold is IDEMPOTENT for the round-trip case: when the leading system run
+ * already holds a message with exactly this text, no second copy is prepended.
+ * Without that, `chat` persistence (which stores this folded history) plus the
+ * same `instructions` on the next call would duplicate the system prompt on
+ * every turn. The whole run counts, not just the first message (2.3, F22): a
+ * `promptInjectionGuard` notice saved ahead of it used to defeat the check, and
+ * the duplicate changed the top-level system Claude 5.x binds its thinking to.
  */
 export function resolveInputMessages(input: CallInput): Message[] {
   const base = hasPrompt(input)
@@ -86,8 +88,10 @@ export function resolveInputMessages(input: CallInput): Message[] {
     : (input.messages ?? []);
   const instructions = input.instructions;
   if (instructions === undefined || instructions.length === 0) return base;
-  const first = base[0];
-  if (first && first.role === 'system' && first.content === instructions) return base;
+  for (const m of base) {
+    if (m.role !== 'system') break;
+    if (m.content === instructions) return base;
+  }
   // NEW array — never mutate the caller's (immutable-history invariant).
   return [{ role: 'system', content: instructions }, ...base];
 }
