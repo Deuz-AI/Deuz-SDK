@@ -539,7 +539,12 @@ A run under another native run's execution (a run a tool starts with
 `execution: ctx.execution.child(...)`) may only **narrow** that run's memory
 scope: it may pin more fields, never drop one or change a user, agent or chat.
 A wider scope fails the child run before any call. A sub-agent from `agentTool`
-gets no memory at all.
+gets no memory at all. Runs that share one execution context instead of each
+taking a `.child()` (a tool that hands its own `ctx.execution` to a nested run,
+or concurrent runs given the same context) count as nested too: each may only
+narrow the scope of the latest run still running on that context. Give a run
+with another user's or agent's memory its own child context; a child still
+shares the parent's budget.
 
 ### Chat projection
 
