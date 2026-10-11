@@ -475,7 +475,7 @@ For a route and a React component, see [Native agents in a UI](/docs/modules/nat
 | `start` | `messageId: string` | First — always the leading part (not re-emitted on a continued leg). |
 | `step-start` | `step: number` | An agentic loop step begins. |
 | `step-finish` | `step: number`, `finishReason: FinishReason`, `usage: Usage`, `stopDetails?` **(2.3)** | A loop step ends. `stopDetails` as on `finish`, for that step. |
-| `text-delta` | `text: string` | A chunk of assistant text. |
+| `text-delta` | `text: string`, `providerMetadata?` **(2.3)** | A chunk of assistant text. `providerMetadata` is the text's provider round-trip data (a Gemini thought signature on a plain text part, often on a final chunk with an empty `text`), which a chat client sends back with the text; never display it. |
 | `reasoning-delta` | `text: string`, `signature?: string`, `id?`, `encrypted?`, `redacted?`, `source?`, `data?` **(2.3)** | A chunk of one reasoning block. `id` names the block (deltas of one block share it); `encrypted` / `redacted` mark an opaque payload, which rides `data` with an empty `text`; `source` is the provider family that produced it. |
 | `tool-input-delta` | `toolCallId: string`, `toolName?: string`, `delta: string` | A raw fragment of a tool call's argument JSON. |
 | `tool-call` | `toolCallId: string`, `toolName: string`, `input: unknown`, `providerMetadata?` **(2.3)** | A fully parsed tool call. `providerMetadata` is the call's provider round-trip data (a Gemini function call's `thoughtSignature`), which a chat client sends back with the call; never display it. |

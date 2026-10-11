@@ -116,6 +116,12 @@ export type UIMessagePart =
       text: string;
       /** 'streaming' until the next part opens or the turn is sealed (`sealAssistantTurn`). */
       state: 'streaming' | 'done';
+      /**
+       * The text's provider round-trip data (2.3), such as a Gemini thought
+       * signature, from the wire's `text-delta` frames or from history. The
+       * canonical projections send it back on the text part. Never display it.
+       */
+      providerMetadata?: Record<string, unknown>;
     }
   | {
       type: 'reasoning';
@@ -525,10 +531,28 @@ export function applyUIPart(turn: AssistantTurnState, part: DeuzUIPart): Assista
     case 'text-delta': {
       const parts = partsOf(turn.message);
       const tail = parts.at(-1);
+      // The text's round-trip data (2.3, e.g. a Gemini signature on the last,
+      // often empty, chunk) merges onto the text it belongs to, as the
+      // canonical turn content does.
+      const { providerMetadata: meta } = providerMetadataFromWire(
+        (part as { providerMetadata?: unknown }).providerMetadata,
+      );
       const next: UIMessagePart[] =
         tail?.type === 'text' && tail.state === 'streaming'
-          ? [...parts.slice(0, -1), { ...tail, text: tail.text + part.text }]
-          : openPart(parts, { type: 'text', text: part.text, state: 'streaming' });
+          ? [
+              ...parts.slice(0, -1),
+              {
+                ...tail,
+                text: tail.text + part.text,
+                ...(meta ? { providerMetadata: { ...tail.providerMetadata, ...meta } } : {}),
+              },
+            ]
+          : openPart(parts, {
+              type: 'text',
+              text: part.text,
+              state: 'streaming',
+              ...(meta ? { providerMetadata: { ...meta } } : {}),
+            });
       return {
         ...turn,
         // `content` stays the WHOLE turn's text (1.8 semantics, verbatim).
@@ -964,12 +988,17 @@ export function assistantMessageFromTurn(turn: AssistantTurnState): Message {
     if (!ordered.some((p) => p.type === 'text' || p.type === 'tool_use')) {
       return { role: 'assistant', content: text };
     }
-    // Text the UI split around a step or data boundary is one run again.
+    // Text the UI split around a step or data boundary is one run again, with
+    // its round-trip data merged as the canonical turn content merges it.
     const content: Part[] = [];
     for (const part of ordered) {
       const last = content.at(-1);
-      if (part.type === 'text' && last?.type === 'text') last.text += part.text;
-      else content.push(part.type === 'text' ? { ...part } : part);
+      if (part.type === 'text' && last?.type === 'text') {
+        last.text += part.text;
+        if (part.providerMetadata) {
+          last.providerMetadata = { ...last.providerMetadata, ...part.providerMetadata };
+        }
+      } else content.push(part.type === 'text' ? { ...part } : part);
     }
     return { role: 'assistant', content };
   }
@@ -1099,7 +1128,12 @@ function uiPartsFromContent(content: string | Part[]): UIMessagePart[] {
   for (const p of content) {
     switch (p.type) {
       case 'text':
-        parts.push({ type: 'text', text: p.text, state: 'done' });
+        parts.push({
+          type: 'text',
+          text: p.text,
+          state: 'done',
+          ...(p.providerMetadata ? { providerMetadata: p.providerMetadata } : {}),
+        });
         break;
       case 'reasoning':
         parts.push({
@@ -1212,7 +1246,13 @@ function canonicalContentFromUI(message: UIMessage): string | Part[] {
       switch (p.type) {
         case 'text':
           // An empty text block 400s some wires — drop it, do not send it.
-          if (p.text) parts.push({ type: 'text', text: p.text });
+          if (p.text) {
+            parts.push({
+              type: 'text',
+              text: p.text,
+              ...(p.providerMetadata ? { providerMetadata: p.providerMetadata } : {}),
+            });
+          }
           break;
         case 'reasoning':
           // A block with empty text is real when it is signed or opaque (2.3,
@@ -1258,9 +1298,12 @@ function canonicalContentFromUI(message: UIMessage): string | Part[] {
   }
   // An all-text result collapses to the plain string form — that is what
   // `textOf`/`uiFromMessages` read back, so a text-only history round-trips
-  // exactly instead of drifting into a one-element array on every pass.
+  // exactly instead of drifting into a one-element array on every pass. Text
+  // that carries round-trip data (2.3) stays a part: a string has no carrier.
   const texts = parts.filter((p): p is TextPart => p.type === 'text');
-  if (texts.length === parts.length) return texts.map((p) => p.text).join('');
+  if (texts.length === parts.length && !texts.some((p) => p.providerMetadata)) {
+    return texts.map((p) => p.text).join('');
+  }
   return parts;
 }
 

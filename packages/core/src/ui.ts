@@ -75,7 +75,14 @@ export type DeuzUIPart =
       usage: Usage;
       stopDetails?: StopDetails;
     }
-  | { type: 'text-delta'; text: string }
+  /**
+   * A chunk of assistant text. `providerMetadata` (2.3 additive) is the text's
+   * provider round-trip data, such as a Gemini thought signature on a plain text
+   * part (often on a final chunk whose `text` is empty), so a chat client sends
+   * the text back as the provider produced it (`applyUIPart` keeps it on the UI
+   * text part). Never display it. It rides every wire version.
+   */
+  | { type: 'text-delta'; text: string; providerMetadata?: Record<string, unknown> }
   /**
    * A reasoning delta. 2.3 adds optional fields so a chat client can send
    * every block back unchanged: the canonical part's `id` (deltas of one block
@@ -559,7 +566,11 @@ function stopDetailsField(providerMetadata: Record<string, unknown> | undefined)
 function toUIPart(part: StreamPart): DeuzUIPart | undefined {
   switch (part.type) {
     case 'text-delta':
-      return { type: 'text-delta', text: part.text };
+      return {
+        type: 'text-delta',
+        text: part.text,
+        ...(part.providerMetadata ? { providerMetadata: part.providerMetadata } : {}),
+      };
     case 'reasoning-delta': {
       // An opaque payload (2.3) rides `data` and leaves `text` empty: a client
       // that predates the flags appends `text` to the reasoning it shows.

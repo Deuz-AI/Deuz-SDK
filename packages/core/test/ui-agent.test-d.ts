@@ -2,7 +2,7 @@ import { expectTypeOf } from 'vitest';
 import type { AgentStream } from '../src/types/agent-run';
 import type { StopDetails } from '../src/types/methods';
 import type { ToolApprovalRequest, ToolCallOutcome } from '../src/types/tool';
-import type { AssistantTurnState, UIToolCall } from '../src/chat';
+import type { AssistantTurnState, UIMessagePart, UIToolCall } from '../src/chat';
 import {
   agentStateFromParts,
   toDeuzAgentStreamResponse,
@@ -78,3 +78,11 @@ expectTypeOf<{
   citations: AssistantTurnState['citations'];
   activity: AssistantTurnState['activity'];
 }>().toMatchTypeOf<AssistantTurnState>();
+
+// A text's round-trip data (2.3, a Gemini text signature) rides the wire and the UI part.
+expectTypeOf<Extract<DeuzUIPart, { type: 'text-delta' }>['providerMetadata']>().toEqualTypeOf<
+  Record<string, unknown> | undefined
+>();
+expectTypeOf<Extract<UIMessagePart, { type: 'text' }>['providerMetadata']>().toEqualTypeOf<
+  Record<string, unknown> | undefined
+>();
