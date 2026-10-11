@@ -158,6 +158,12 @@ function helperContracts(name: string, make: () => Promise<RedisScriptClient>) {
       expect(replyList(await run(client, [`{t}:${Math.random()}`], []))).toEqual(['1', '-', '1']);
     });
 
+    it('takes the key base from a declared key, a client prefix included', async () => {
+      const client = await make();
+      const run = script(`return key_base(KEYS[1], 'open')`);
+      expect(await run(client, ['app:{t}:open'], [])).toBe('app:{t}:');
+    });
+
     it('reads the time in whole milliseconds', async () => {
       const client = await make();
       const now = replyNumber(await script('return int(now_ms())')(client, ['{t}:x'], []));

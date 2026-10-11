@@ -12,6 +12,12 @@
  * hash tag, so a Redis Cluster keeps the store in one slot and a script that
  * reaches a key through an index stays atomic and legal there.
  *
+ * Every key a script touches is one it declares or is built from one
+ * (`key_base` strips a declared key's known name to get the store's key base),
+ * never from an argument: a client-side key prefix, such as ioredis
+ * `keyPrefix`, reaches only the declared keys, so a key built from an argument
+ * would miss it.
+ *
  * The scripts run on Redis's Lua 5.1 and on the Lua 5.3 of ioredis-mock
  * (fengari), which the offline tests use. So every number a script computes
  * with is a float (`num`, `floor`: fengari's integers are 32 bits and wrap,
@@ -173,7 +179,8 @@ export function sortableNumber(value: number): string {
 
 /**
  * The helpers every script starts with (see the module note). `now_ms` reads
- * Redis `TIME` in whole milliseconds.
+ * Redis `TIME` in whole milliseconds; `key_base(key, name)` is a declared `key`
+ * without its trailing `name`, the store's key base, prefix included.
  */
 export const LUA_HELPERS = `
 local function num(v) return tonumber(v) + 0.0 end
@@ -190,6 +197,7 @@ local function arr(t)
   for i = #t, 1, -1 do out[i] = t[i] end
   return out
 end
+local function key_base(key, name) return string.sub(key, 1, #key - #name) end
 `;
 
 /** Run one script; `body` is prefixed with {@link LUA_HELPERS}. */

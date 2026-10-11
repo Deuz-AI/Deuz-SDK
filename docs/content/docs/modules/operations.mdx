@@ -437,9 +437,11 @@ console.log(`${handles.length} runs taken over, ${failed.length} could not be re
 - **Clients.** The stores need one method, `eval(script, { keys, arguments })`,
   node-redis's `EVAL` signature, typed `RedisScriptClient`. A connected
   node-redis client (v4, v5 or v6, standalone or cluster) fits as it is; wrap
-  ioredis with `wrapIoredisClient(io)`. `{ url }` instead of `{ client }`
-  imports the optional `redis` peer on first use and connects once; `close()`
-  quits that connection and is final. An injected client is never closed.
+  ioredis with `wrapIoredisClient(io)`. A `keyPrefix` set on the ioredis client
+  applies to every key, because each script builds its keys only from the keys
+  it declares. `{ url }` instead of `{ client }` imports the optional `redis`
+  peer on first use and connects once; `close()` quits that connection and is
+  final. An injected client is never closed.
 - **Batched retention.** `leases.prune`, `agentRuns.prune`, `claims.prune` and
   the budget store's `prune` remove at most 1 000 entries per script and run
   again until a batch comes back short, so a large backlog never holds the

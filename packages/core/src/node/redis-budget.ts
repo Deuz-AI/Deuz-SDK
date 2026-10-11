@@ -139,13 +139,14 @@ local function close_charge(scope, hist, key, bucket, model, dt, du)
 end
 -- Move the reserved request in KEYS[1] (ARGV[1]) to 'state', every charge by
 -- (dt, du), and from the open index to the closed one.
-local function close_request(state, dt, du, scope_prefix, hist_prefix)
+local function close_request(state, dt, du)
   local rec = KEYS[1]
+  local b = key_base(KEYS[2], 'open')
   local r = redis.call('HMGET', rec, 'model', 'n', 'at', 'm')
   for i = 1, num(r[2]) do
     local key = redis.call('HGET', rec, 'k' .. int(i))
     local bucket = num(redis.call('HGET', rec, 'b' .. int(i)))
-    close_charge(scope_prefix .. key, hist_prefix .. key, key, bucket, r[1], dt, du)
+    close_charge(b .. 'scope:' .. key, b .. 'hist:' .. key, key, bucket, r[1], dt, du)
   end
   redis.call('HSET', rec, 'state', state)
   redis.call('HDEL', rec, 'm')
@@ -275,21 +276,21 @@ redis.call('HSET', rec, unpack(fields))
 return arr({'fresh', outcome})
 `);
 
-// KEYS: req, open, closed, held. ARGV: requestId, actual tokens, actual USD,
-// scope prefix, hist prefix. Answers { 'applied' }, { 'missing' }, or the
-// state and actuals of a request that is no longer reserved.
+// KEYS: req, open, closed, held. ARGV: requestId, actual tokens, actual USD.
+// Answers { 'applied' }, { 'missing' }, or the state and actuals of a request
+// that is no longer reserved.
 const settleScript = script(`${BUDGET_HELPERS}
 local state = current_state()
 if not state then return arr({'missing'}) end
 if state[1] ~= 'reserved' then return arr(state) end
 local r = redis.call('HMGET', KEYS[1], 't', 'u')
-close_request('settled', num(ARGV[2]) - num(r[1]), num(ARGV[3]) - num(r[2]), ARGV[4], ARGV[5])
+close_request('settled', num(ARGV[2]) - num(r[1]), num(ARGV[3]) - num(r[2]))
 redis.call('HSET', KEYS[1], 'xt', ARGV[2], 'xu', ARGV[3])
 return arr({'applied'})
 `);
 
-// KEYS: req, open, closed, held. ARGV: requestId, scope prefix, hist prefix.
-// A settled request that cost nothing is released without touching a counter.
+// KEYS: req, open, closed, held. ARGV: requestId. A settled request that cost
+// nothing is released without touching a counter.
 const releaseScript = script(`${BUDGET_HELPERS}
 local state = current_state()
 if not state then return arr({'missing'}) end
@@ -299,7 +300,7 @@ if state[1] == 'settled' and num(state[2]) == 0 and num(state[3]) == 0 then
 end
 if state[1] ~= 'reserved' then return arr(state) end
 local r = redis.call('HMGET', KEYS[1], 't', 'u')
-close_request('released', -num(r[1]), -num(r[2]), ARGV[2], ARGV[3])
+close_request('released', -num(r[1]), -num(r[2]))
 return arr({'applied'})
 `);
 
@@ -313,12 +314,13 @@ for i = 1, #rows do out[#out + 1] = rows[i] end
 return arr(out)
 `);
 
-// KEYS: closed. ARGV: before, batch, req prefix. Deletes the settled,
-// released and denied records reserved before 'before'.
+// KEYS: closed. ARGV: before, batch. Deletes the settled, released and denied
+// records reserved before 'before'.
 const requestPruneScript = script(`
+local b = key_base(KEYS[1], 'closed')
 local found = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', '(' .. real(num(ARGV[1])), 'LIMIT', '0', ARGV[2])
 for i = 1, #found do
-  redis.call('DEL', ARGV[3] .. found[i])
+  redis.call('DEL', b .. 'req:' .. found[i])
   redis.call('ZREM', KEYS[1], found[i])
 end
 return #found
@@ -383,14 +385,15 @@ end
 return folded
 `);
 
-// KEYS: open. ARGV: min, max (ZRANGEBYLEX bounds), limit, req prefix.
+// KEYS: open. ARGV: min, max (ZRANGEBYLEX bounds), limit.
 // Answers { requestId, model, tokens, usd, reservedAt, n, key1..keyn, ... }.
 const holdsScript = script(`
+local b = key_base(KEYS[1], 'open')
 local members = redis.call('ZRANGEBYLEX', KEYS[1], ARGV[1], ARGV[2], 'LIMIT', '0', ARGV[3])
 local out = {}
 for i = 1, #members do
   local id = string.sub(members[i], 17)
-  local rec = ARGV[4] .. id
+  local rec = b .. 'req:' .. id
   local r = redis.call('HMGET', rec, 'model', 't', 'u', 'at', 'n')
   out[#out + 1] = id
   for j = 1, 5 do out[#out + 1] = r[j] end
@@ -532,8 +535,6 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
             requestId,
             arg(settle.tokens),
             arg(settle.usd),
-            scopePrefix,
-            historyPrefix,
           ]),
         { settle },
       );
@@ -542,8 +543,7 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
       assertBudgetKey(requestId);
       await transition(
         requestId,
-        (client) =>
-          releaseScript(client, closing(requestId), [requestId, scopePrefix, historyPrefix]),
+        (client) => releaseScript(client, closing(requestId), [requestId]),
         { release: true },
       );
     },
@@ -575,9 +575,7 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
       const before = assertPruneOptions(pruneOptions);
       const client = await use();
       const requests = await inBatches(PRUNE_BATCH, async (size) =>
-        replyNumber(
-          await requestPruneScript(client, [closed], [arg(before), arg(size), requestPrefix]),
-        ),
+        replyNumber(await requestPruneScript(client, [closed], [arg(before), arg(size)])),
       );
       // Each scope folds in a script of its own, a page of scope keys at a time.
       let buckets = 0;
@@ -612,9 +610,7 @@ export function createRedisBudgetStore(options: RedisBudgetStoreOptions): RedisB
           : `[${padTime(Math.ceil(after.reservedAt))}`;
       }
       const client = await use();
-      const reply = replyList(
-        await holdsScript(client, [open], [min, max, arg(limit), requestPrefix]),
-      );
+      const reply = replyList(await holdsScript(client, [open], [min, max, arg(limit)]));
       const holds: BudgetHold[] = [];
       for (let index = 0; index < reply.length; ) {
         const [requestId, modelId, tokens, usd, reservedAt, count] = reply
