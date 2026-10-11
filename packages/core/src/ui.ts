@@ -1622,6 +1622,14 @@ export interface ReadDeuzStreamOptions {
    * assistant bubble. `'ignore'` restores that pre-1.9 silence.
    */
   onHttpError?: 'error-part' | 'ignore';
+  /**
+   * Called with a part's SSE event id right before the part is yielded (2.3),
+   * once per id: a frame without an id of its own (a transient part) reports
+   * nothing, and neither does `[DONE]`. Wire v1 carries no ids. A client that
+   * also resumes the stream uses it to know how far it has read: `useChat` does,
+   * so a reconnect after a POST read resumes after what that read delivered.
+   */
+  onEventId?: (id: string) => void;
 }
 
 /**
@@ -1651,13 +1659,25 @@ export async function* readDeuzStream(
     return;
   }
   if (!response.body) return;
+  // `parseSSE`'s id is sticky (SSE spec): an id-less frame repeats the last one.
+  let reported: string | undefined;
   for await (const ev of parseSSE(response.body)) {
     if (ev.data === '[DONE]') return;
+    let part: DeuzUIPart;
     try {
-      yield JSON.parse(ev.data) as DeuzUIPart;
+      part = JSON.parse(ev.data) as DeuzUIPart;
     } catch {
-      /* skip malformed line */
+      continue; // skip malformed line
     }
+    if (options.onEventId && ev.id !== undefined && ev.id !== reported) {
+      reported = ev.id;
+      try {
+        options.onEventId(ev.id);
+      } catch {
+        /* consumer callback errors are not transport errors */
+      }
+    }
+    yield part;
   }
 }
 

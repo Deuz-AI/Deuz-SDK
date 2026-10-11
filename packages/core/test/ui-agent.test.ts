@@ -510,3 +510,37 @@ describe('applyUIPart and agent frames', () => {
     expect(turn.dataParts).toEqual([{ name: 'agent', payload: { mood: 'happy' } }]);
   });
 });
+
+describe('readDeuzStream onEventId (2.3)', () => {
+  it('reports the event id of each part before it is yielded, never for [DONE]', async () => {
+    const body = [
+      'id: 4\ndata: {"type":"text-delta","text":"a"}\n\n',
+      'data: {"type":"data-ping","payload":1}\n\n', // a transient frame: no id of its own
+      'id: 5\ndata: {"type":"finish","finishReason":"stop","usage":{}}\n\n',
+      'id: 6\ndata: [DONE]\n\n',
+    ].join('');
+    const seen: string[] = [];
+    const order: string[] = [];
+    for await (const part of readDeuzStream(new Response(body), {
+      onEventId: (id) => {
+        seen.push(id);
+        order.push(`id:${id}`);
+      },
+    })) {
+      order.push(part.type);
+    }
+    expect(seen).toEqual(['4', '5']);
+    expect(order).toEqual(['id:4', 'text-delta', 'data-ping', 'id:5', 'finish']);
+  });
+
+  it('reports nothing for a wire v1 body', async () => {
+    const seen: string[] = [];
+    for await (const _part of readDeuzStream(
+      new Response('data: {"type":"text-delta","text":"a"}\n\ndata: [DONE]\n\n'),
+      { onEventId: (id) => seen.push(id) },
+    )) {
+      /* drain */
+    }
+    expect(seen).toEqual([]);
+  });
+});
