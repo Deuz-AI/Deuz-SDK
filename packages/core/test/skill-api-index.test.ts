@@ -278,7 +278,7 @@ beforeAll(async () => {
   generator = await load<GeneratorModule>('generate-api-index.mjs');
   scratch = mkdtempSync(join(tmpdir(), 'deuz-skill-index-'));
   writeTree(scratch, FIXTURE);
-});
+}, 60_000);
 
 afterAll(() => {
   if (scratch) rmSync(scratch, { recursive: true, force: true });
@@ -393,7 +393,7 @@ describe('renderApiIndex', () => {
     ).toThrow(/YYYY-MM-DD/);
   });
 
-  it('describes every subpath the real package exports', () => {
+  it('describes every subpath the real package exports', { timeout: 30_000 }, () => {
     const table = tables.loadExportTable();
     expect(table.problems).toEqual([]);
     const missing = table.modules

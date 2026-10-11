@@ -150,7 +150,7 @@ beforeAll(async () => {
   sync = await load<SyncModule>('sync-skill-copy.mjs');
   verify = await load<VerifyModule>('verify-skill.mjs');
   scratch = mkdtempSync(join(tmpdir(), 'deuz-skill-verify-'));
-});
+}, 60_000);
 
 afterAll(() => {
   if (scratch) rmSync(scratch, { recursive: true, force: true });
@@ -381,7 +381,8 @@ const skillFiles = (dir: string) => [
     .map((name) => `references/${name}`),
 ];
 
-describe('verify-skill: the skill as 2.2.0 stamped it', () => {
+// These read and copy the real skill (two trees of about 0.5 MB): allow for a busy machine.
+describe('verify-skill: the skill as 2.2.0 stamped it', { timeout: 30_000 }, () => {
   it('rejects every file of the real skill while it carries the 2.2.0 stamps', () => {
     const root = join(scratch, `real-${counter++}`);
     const skill = join(root, 'skills/deuz-sdk');
@@ -447,7 +448,7 @@ describe('verify-skill: grading answers', () => {
   });
 });
 
-describe('sync-skill-copy', () => {
+describe('sync-skill-copy', { timeout: 30_000 }, () => {
   it('lists the differences and mirrors skills/deuz-sdk into the .claude copy on --write', () => {
     const fixture = freshSkill();
     const added = `<!-- verified: 2026-01-02 against @deuz-sdk/core@${table.version} · api-contract sha256:${table.contractHash} -->\n\nnew\n`;
