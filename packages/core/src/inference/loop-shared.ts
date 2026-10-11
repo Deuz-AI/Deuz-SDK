@@ -48,6 +48,7 @@ import {
   type CompactionEvent,
 } from './compaction';
 import { createTokenEstimator, type TokenEstimator } from '../internal/estimate-tokens';
+import { withCapabilityOverride } from '../internal/config-symbol';
 import { attachClientContext, readClientContext } from '../internal/client-context';
 // Type-only: the sink itself is created by the loop (or not at all), so nothing
 // from internal/warnings.ts is pulled into a bundle that never collects one.
@@ -58,7 +59,6 @@ import type { CallWarning } from '../types/methods';
 // call without `options.mcp` pulls none of that module graph into the bundle.
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import { getCapabilities } from '../core/registry';
-import { withCapabilityOverride } from '../internal/config-symbol';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
 // `resolveTimeouts` is the SINGLE resolution point for every timeout layer
