@@ -68,7 +68,7 @@ import {
   saveCheckpoint,
   prepareChatPersistence,
   persistChat,
-  computeRecallBlock,
+  planRecall,
   withSystemBlock,
   startMemoryExtract,
   durableUsage,
@@ -869,13 +869,22 @@ export function runStreamToolLoop(
         return;
       }
 
-      // Memory recall (1.7, D1): computed once per call and spliced into the
-      // system context AT THE CALL SITE only — the canonical history (and so
-      // checkpoints + chat persistence) never bakes the recall block in, and
-      // resume legs cannot double-inject it.
+      // Memory recall (1.7, D1): computed once per leg. On a model that binds
+      // thinking to the prefix (2.3, F22) it is one appended system message
+      // (see `planRecall`); elsewhere it is spliced into the system context AT
+      // THE CALL SITE only — the canonical history (and so checkpoints + chat
+      // persistence) never bakes the block in, and resume legs cannot
+      // double-inject it.
       // Its observation parents under the RUN span (no step is open yet).
-      const recallBlock = await computeRecallBlock(options, deps, messages, observeCtx);
-      // Recall overhead (2.0): the block never enters `messages`, but the
+      const recall = await planRecall(
+        options,
+        deps,
+        messages,
+        active?.model ?? options.model,
+        observeCtx,
+      );
+      const recallBlock = recall.splice;
+      // Recall overhead (2.0): a spliced block never enters `messages`, but the
       // provider counts it. Both the compaction threshold and the EMA
       // calibration have to see the same total.
       const recallOverheadTokens =
@@ -921,6 +930,13 @@ export function runStreamToolLoop(
           return;
         }
         messages = guarded.messages;
+      }
+      // The stable-prefix recall message (2.3): after the guardrails, which
+      // judge the caller's input, and before the first model call.
+      if (recall.message) {
+        messages = [...messages, recall.message];
+        appended.push(recall.message);
+        chatMessages = [...chatMessages, recall.message];
       }
 
       // Cost continuity (1.7, D2): resume legs seed prevCostUsd with the prior

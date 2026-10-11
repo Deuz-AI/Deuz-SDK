@@ -58,6 +58,7 @@ import type { CallWarning } from '../types/methods';
 // call without `options.mcp` pulls none of that module graph into the bundle.
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import { getCapabilities } from '../core/registry';
+import { bindsThinkingToPrefix } from '../internal/stable-prefix';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
 // `resolveTimeouts` is the SINGLE resolution point for every timeout layer
@@ -3561,6 +3562,68 @@ export async function computeRecallBlock(
   }
 }
 
+/**
+ * What the memory recall of a run leg contributes (2.3, F22): a block the
+ * model-call site splices into the leading system turn (`splice`, the 2.2
+ * placement), or one appended `role: 'system'` message (`message`).
+ */
+export interface RecallPlan {
+  splice?: string;
+  message?: Message;
+}
+
+/** True for the system message a stable-prefix recall appended (see {@link planRecall}). */
+export function isRecallMessage(message: Message): boolean {
+  const deuz = message.providerMetadata?.deuz as { memoryRecall?: unknown } | undefined;
+  return message.role === 'system' && deuz?.memoryRecall === true;
+}
+
+/** True when the history's last user message is already followed by its recall message. */
+function recalledAlready(messages: Message[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (isRecallMessage(m)) return true;
+    if (m.role === 'user') return false;
+  }
+  return false;
+}
+
+/**
+ * Memory recall for a run leg (1.7, D1; placement 2.3, F22).
+ *
+ * On a model that binds thinking to the transcript prefix (Claude 5.x,
+ * `internal/stable-prefix.ts`) the block is ONE appended `role: 'system'`
+ * message: the loop appends it after the incoming history, before the first
+ * model call, to the effective history (so checkpoints keep it), the response
+ * delta and the chat record. It is part of the conversation the model saw, as
+ * the false-finish nudge is: the next turn replays it in place, so the prefix
+ * every later thinking block is bound to never changes. Recall runs once per
+ * user turn: a history whose last user message is already followed by its
+ * recall message (a resume leg's checkpoint, an approval continuation, a
+ * replayed transcript) recalls nothing.
+ *
+ * Every other model keeps the 2.2 placement: the block is spliced into the
+ * leading system turn at the model-call site only, and the transcript stays
+ * recall-free.
+ */
+export async function planRecall(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  messages: Message[],
+  model: LanguageModel,
+  ob?: ExecuteExtras['observe'],
+): Promise<RecallPlan> {
+  const stable = bindsThinkingToPrefix(model);
+  if (stable && recalledAlready(messages)) return {};
+  const block = await computeRecallBlock(options, deps, messages, ob);
+  if (!block) return {};
+  if (!stable) return { splice: block };
+  // The marker is how a later leg recognizes its turn as recalled.
+  return {
+    message: { role: 'system', content: block, providerMetadata: { deuz: { memoryRecall: true } } },
+  };
+}
+
 /** Splice a system-context block into a NEW message array (no-op without one). */
 export function withSystemBlock(messages: Message[], block: string | undefined): Message[] {
   if (!block) return messages;
@@ -3599,7 +3662,10 @@ export function startMemoryExtract(
   if (memory.writePolicy === 'session-end' || memory.writePolicy === 'manual') return undefined;
   const infer = memory.extract === undefined ? true : (memory.extract.infer ?? true);
   const lastUser = [...options.messages].reverse().find((m) => m.role === 'user');
-  const turns = lastUser ? [lastUser, ...newTurns] : newTurns;
+  // System messages are instructions, not facts about the user — and the
+  // recall message (2.3) would write the recalled memories back as new ones.
+  const said = newTurns.filter((m) => m.role !== 'system');
+  const turns = lastUser ? [lastUser, ...said] : said;
   if (turns.length === 0) return Promise.resolve([]);
 
   // Observation (2.0): started fires SYNCHRONOUSLY (the write is in flight from
