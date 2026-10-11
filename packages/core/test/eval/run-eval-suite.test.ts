@@ -378,6 +378,36 @@ describe('runEvalSuite: effects, tools, scope, budget and artifacts', () => {
     expect(report.aggregate.offline).toMatchObject({ costUsd: 0.03, tokens: 315 });
   });
 
+  it('counts tokens from the accounting, which spans every leg, before the usage of the last', async () => {
+    const totals = { tokens: 45, usd: 0.0009 };
+    const zero = { tokens: 0, usd: 0 };
+    const report = await runEvalSuite([
+      task({
+        run: async () => ({
+          ...completed(),
+          // A resumed run: the usage covers the replayed step only.
+          usage: {
+            inputTokens: 20,
+            outputTokens: 10,
+            reasoningTokens: 0,
+            cachedReadTokens: 0,
+            cacheWriteTokens: 0,
+            cacheWrite1hTokens: 0,
+            totalTokens: 30,
+          },
+          accounting: {
+            spent: totals,
+            reserved: zero,
+            committed: totals,
+            unknownTokens: 0,
+            unknownUsd: 0,
+          },
+        }),
+      }),
+    ]);
+    expect(report.tasks[0]!.attempts[0]).toMatchObject({ tokens: 45, costUsd: 0.0009 });
+  });
+
   it('keeps the artifacts a task records and fails one it declared but never made', async () => {
     const report = await runEvalSuite([
       task({

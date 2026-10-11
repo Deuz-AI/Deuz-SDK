@@ -215,13 +215,17 @@ export function isEvalOutcome(value: unknown): value is EvalTaskOutcome {
   );
 }
 
-/** Cost and tokens as the outcome reports them: explicit, else from the run's accounting. */
+/**
+ * Cost and tokens as the outcome reports them: an explicit `costUsd`, else the
+ * run's accounting, which spans every leg of a resumed run; the usage, which
+ * may cover only the last leg, counts tokens only without an accounting.
+ */
 export function outcomeCost(outcome: EvalTaskOutcome | undefined): {
   costUsd?: number;
   tokens?: number;
 } {
   const costUsd = outcome?.costUsd ?? outcome?.accounting?.spent.usd;
-  const tokens = outcome?.usage?.totalTokens ?? outcome?.accounting?.spent.tokens;
+  const tokens = outcome?.accounting?.spent.tokens ?? outcome?.usage?.totalTokens;
   return {
     ...(typeof costUsd === 'number' ? { costUsd } : {}),
     ...(typeof tokens === 'number' ? { tokens } : {}),

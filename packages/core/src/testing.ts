@@ -578,9 +578,12 @@ export interface EvalTaskOutcome<O = unknown> {
   text?: string;
   reason?: string;
   error?: { name: string; message: string; code?: string };
-  /** Cumulative over every leg the attempt ran; `totalTokens` is the token metric. */
+  /** `totalTokens` is the token metric when there is no `accounting`. */
   usage?: Usage;
-  /** The run's accounting; `spent.usd` is the cost when `costUsd` is absent. */
+  /**
+   * The run's accounting, across every leg: `spent.usd` is the cost when
+   * `costUsd` is absent, and `spent.tokens` the token metric.
+   */
   accounting?: BudgetTotals;
   costUsd?: number;
   /** The recovery the run took after an interruption, compared with `fault.recovery`. */
@@ -638,7 +641,10 @@ export interface EvalAttemptReport {
   error?: string;
   /** The run claimed `'completed'` and failed acceptance. */
   falseCompleted: boolean;
-  /** A lower bound when calls ran without a price. */
+  /**
+   * Spent, as far as known: a lower bound when calls ran without a price or
+   * with an unknown outcome (those stay held in the outcome's `accounting`).
+   */
   costUsd?: number;
   tokens?: number;
   durationMs: number;
