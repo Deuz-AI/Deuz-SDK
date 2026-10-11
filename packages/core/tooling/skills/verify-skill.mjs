@@ -13,7 +13,8 @@
  *      every quoted or backticked `@deuz-sdk/…` subpath exists; every name the
  *      prose attributes to a subpath (`name` from|on `@deuz-sdk/…`) is exported
  *      there. A bare backticked word is not taken for an API name: options,
- *      fields, methods and other libraries' names share that notation.
+ *      fields, methods and other libraries' names share that notation. Fences
+ *      tagged `no-verify` (deliberate fragments) are skipped.
  *   2. freshness: every file carries a stamp
  *      `@deuz-sdk/core@<version> · api-contract sha256:<12 hex>` naming the
  *      current package version and tooling/api-contract.json hash, so a release
@@ -32,6 +33,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { loadExportTable } from './export-table.mjs';
+import { maskNoVerify } from './fences.mjs';
 import { REGENERATE_COMMAND, renderApiIndex } from './generate-api-index.mjs';
 import { MIRROR_DIR, SKILL_DIR, diffSkillCopies } from './sync-skill-copy.mjs';
 
@@ -51,10 +53,11 @@ function emptyStats() {
 }
 
 /**
- * The name checks over one text. `report(line, message)` receives each
- * failure; `stats` is counted up.
+ * The name checks over one text (no-verify fences skipped). `report(line,
+ * message)` receives each failure; `stats` is counted up.
  */
-function checkNames(text, table, stats, report) {
+function checkNames(source, table, stats, report) {
+  const text = maskNoVerify(source);
   const modules = new Map(table.modules.map((module) => [module.specifier, module.names]));
   const importSpans = [];
 

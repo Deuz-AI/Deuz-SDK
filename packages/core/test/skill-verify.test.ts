@@ -199,6 +199,25 @@ describe('verify-skill: names', () => {
       'skills/deuz-sdk/SKILL.md:8  "createSwarm" is not exported by @deuz-sdk/core/agent',
     ]);
   });
+
+  it('skips a fence tagged no-verify, and only that fence', () => {
+    const fixture = freshSkill();
+    const fences = [
+      '',
+      '```ts no-verify',
+      "import { defineTool } from '@deuz-sdk/core'; // a fragment shown as the wrong way",
+      '```',
+      '',
+      '```ts',
+      "import { createDeuz } from '@deuz-sdk/core';",
+      '```',
+      '',
+    ].join('\n');
+    editBoth(fixture, 'references/core.md', /\n$/, `\n${fences}`);
+    expect(run(fixture).failures).toEqual([
+      'skills/deuz-sdk/references/core.md:19  "createDeuz" is not exported by @deuz-sdk/core',
+    ]);
+  });
 });
 
 describe('verify-skill: freshness stamps', () => {
