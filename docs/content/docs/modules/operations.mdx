@@ -661,9 +661,9 @@ try {
 `lease: { provider, owner?, ttlMs? }`, like `createSwarm`. It requires a
 `session`. The executor acquires the run's key,
 `agentRunLeaseKey({ scope, runId })` (`agent:["<scope>","<runId>"]`), before it
-reads the run, renews it every `ttlMs / 3` (default 30 000) on `deps.clock`, and
-releases it when the run returns, whatever the outcome. `owner` defaults to a
-generated ID per run.
+reads the run, renews it at once and then every `ttlMs / 3` (default 30 000) on
+`deps.clock`, also while it reads the run, and releases it when the run returns,
+whatever the outcome. `owner` defaults to a generated ID per run.
 
 - While another executor holds the key, the run fails at once with an error
   named `AgentRunLeaseError`, code `'lease_held'`. Nothing is read, written or
@@ -688,12 +688,17 @@ cannot save the run, leaves the cancel for the next one. With a provider without
 `ack`, a delivered cancel the run could not save is queued again before the
 lease is released.
 
-When an executor claims a run, a cancel still queued under its key applies
-before any model call: a resumed run that has not ended stops as
-`'cancelled'`. A new run starts clean of a cancel queued for its run ID before
-it existed, and a run that already ended keeps its result. A resume that stops
-before it takes the run up, for pending approvals or a tool call to reconcile,
-leaves the cancel queued until a resume does.
+The renewal an executor makes as soon as it claims a run, before it reads the
+run, collects what was queued under the key before the claim. A cancel found
+there applies before any model call: a resumed run that has not ended stops as
+`'cancelled'`. A new run starts clean of it, a run that already ended keeps its
+result, and a `runAgent` that finds the run ID taken fails and leaves it queued
+for that run. A resume that stops before it takes the run up, for pending
+approvals or a tool call to reconcile, leaves the cancel queued until a resume
+does. A cancel signalled after that first renewal concerns the run being driven,
+a new run included, and stops it at the next renewal. A key queues one cancel
+at a time, so one sent while a cancel from before the claim is still queued
+merges into it and shares its fate.
 
 `signal` returns `false` when no executor holds the run, for example a suspended
 run, and queues nothing. Native runs ignore a `'drain'` signal.

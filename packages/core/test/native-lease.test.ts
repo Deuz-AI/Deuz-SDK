@@ -63,6 +63,36 @@ function parkedTool() {
 
 const toolThenDone = [{ toolCalls: [{ toolName: 'work', args: {} }] }, { text: 'done' }];
 
+/**
+ * A store whose first read waits for the test, as a round trip to a database
+ * does: runAgent's check that the run is new, resumeAgent's load.
+ */
+function slowFirstRead(store: AgentRunStore) {
+  const reading = createDeferred<void>();
+  const answered = createDeferred<void>();
+  let first = true;
+  const view: AgentRunStore = {
+    load: async (runId) => {
+      if (first) {
+        first = false;
+        reading.resolve();
+        await answered.promise;
+      }
+      return store.load(runId);
+    },
+    save: (envelope) => store.save(envelope),
+  };
+  return { store: view, reading: reading.promise, answer: () => answered.resolve() };
+}
+
+/** A 2.2-style view of a provider: a renewal removes every signal it delivers. */
+const withoutAck = (leases: LeaseProvider): LeaseProvider => ({
+  acquire: (request) => leases.acquire(request),
+  renew: (lease, ttlMs) => leases.renew(lease, ttlMs),
+  release: (lease) => leases.release(lease),
+  signal: (k, signal) => leases.signal(k, signal),
+});
+
 function setup() {
   const time = manualClock(0);
   const leases = createInMemoryLeaseProvider({ clock: time.clock });
@@ -279,6 +309,142 @@ describe('runAgent lease (2.3)', () => {
     expect(await leases.renew(next, 300, { acknowledge: true })).toMatchObject({
       signals: [],
     });
+  });
+
+  it('stops a new run cancelled while it checks that the run is new', async () => {
+    const { leases, store, session, key, clock, advance } = setup();
+    const slow = slowFirstRead(store);
+    const parked = parkedTool();
+    const run = runAgent({
+      model: createMockModel({ responses: toolThenDone }),
+      prompt: 'Work.',
+      tools: parked.tools,
+      session: { ...session, store: slow.store },
+      lease: { provider: leases, owner: 'a', ttlMs: 300 },
+      deps: { clock },
+    });
+    await slow.reading;
+    // Another process cancels the run it just started: the key is held, so
+    // the cancel is accepted for the run.
+    expect(await leases.signal(key, 'cancel')).toBe(true);
+    slow.answer();
+    await parked.entered;
+    // The next renewal, one heartbeat later, stops it.
+    await advance(100);
+    parked.release();
+    expect(await run).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+    expect(await store.load('job')).toMatchObject({
+      phase: 'terminal',
+      result: { status: 'stopped', reason: 'cancelled' },
+    });
+    const next = (await leases.acquire({ key, owner: 'b', ttlMs: 300 }))!;
+    expect(await leases.renew(next, 300, { acknowledge: true })).toMatchObject({ signals: [] });
+  });
+
+  it('stops a new run cancelled during a heartbeat before its first read returned', async () => {
+    const { leases, store, session, key, clock, advance } = setup();
+    const slow = slowFirstRead(store);
+    const { model, fetch } = counted([{ text: 'done' }]);
+    const run = runAgent({
+      model,
+      prompt: 'Work.',
+      session: { ...session, store: slow.store },
+      lease: { provider: leases, owner: 'a', ttlMs: 300 },
+      deps: { clock },
+    });
+    await slow.reading;
+    expect(await leases.signal(key, 'cancel')).toBe(true);
+    // The heartbeat delivers it while the run still reads the store.
+    await advance(100);
+    slow.answer();
+    expect(await run).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(await store.load('job')).toMatchObject({
+      phase: 'terminal',
+      result: { status: 'stopped', reason: 'cancelled' },
+    });
+  });
+
+  it('renews the lease from the claim on, through a slow first read of the store', async () => {
+    const { leases, store, session, key, clock, advance } = setup();
+    const slow = slowFirstRead(store);
+    const run = runAgent({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      prompt: 'Work.',
+      session: { ...session, store: slow.store },
+      lease: { provider: leases, owner: 'a', ttlMs: 300 },
+      deps: { clock },
+    });
+    await slow.reading;
+    // The read outlasts the lease: the heartbeat keeps it.
+    await advance(1_000);
+    expect(await leases.acquire({ key, owner: 'b', ttlMs: 300 })).toBeUndefined();
+    slow.answer();
+    expect(await run).toMatchObject({ status: 'completed', output: 'done' });
+  });
+
+  it('starts a new run clean of a cancel queued before it, delivered again while it reads', async () => {
+    const { leases, store, session, key, clock, advance } = setup();
+    await leases.acquire({ key, owner: 'ghost', ttlMs: 300 });
+    await leases.signal(key, 'cancel');
+    await advance(1_000);
+    const slow = slowFirstRead(store);
+    const run = runAgent({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      prompt: 'Do the job.',
+      session: { ...session, store: slow.store },
+      lease: { provider: leases, owner: 'a', ttlMs: 300 },
+      deps: { clock },
+    });
+    await slow.reading;
+    // Each heartbeat during the read delivers the queued cancel again: it is
+    // still the one from before the run.
+    await advance(250);
+    slow.answer();
+    expect(await run).toMatchObject({ status: 'completed', output: 'done' });
+    const next = (await leases.acquire({ key, owner: 'b', ttlMs: 300 }))!;
+    expect(await leases.renew(next, 300, { acknowledge: true })).toMatchObject({ signals: [] });
+  });
+
+  it('leaves a cancel queued for a stored run when runAgent finds the run exists', async () => {
+    for (const acknowledged of [true, false]) {
+      const { leases, store, session, key, clock, advance } = setup();
+      const provider = acknowledged ? leases : withoutAck(leases);
+      await crashedRun(store, session);
+      // One cancel from before the claim, one sent while runAgent reads.
+      await leases.acquire({ key, owner: 'ghost', ttlMs: 300 });
+      expect(await leases.signal(key, 'cancel')).toBe(true);
+      await advance(1_000);
+      const slow = slowFirstRead(store);
+      const run = runAgent({
+        model: createMockModel({ responses: [{ text: 'done' }] }),
+        prompt: 'Do the job.',
+        session: { ...session, store: slow.store },
+        lease: { provider, owner: 'a', ttlMs: 300 },
+        deps: { clock },
+      });
+      await slow.reading;
+      await advance(100);
+      expect(await leases.signal(key, 'cancel')).toBe(true);
+      await advance(100);
+      slow.answer();
+      expect(await run, String(acknowledged)).toMatchObject({
+        status: 'failed',
+        error: { message: 'Native run already exists; use resumeAgent.' },
+      });
+      // The cancel is the stored run's: its next executor applies it before any model call.
+      const { model, fetch } = counted([{ text: 'done' }]);
+      expect(
+        await resumeAgent({
+          model,
+          session: { ...session, store },
+          lease: { provider, owner: 'b', ttlMs: 300 },
+          deps: { clock },
+        }),
+        String(acknowledged),
+      ).toMatchObject({ status: 'stopped', reason: 'cancelled' });
+      expect(fetch).not.toHaveBeenCalled();
+    }
   });
 
   it('keeps a cancel queued for the next executor when the run could not record it', async () => {
