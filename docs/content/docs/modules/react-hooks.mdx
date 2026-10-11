@@ -269,6 +269,8 @@ The round-trip POSTs a `role: 'tool'` message, which [`validateChatRequest`](/do
 
 A `tool-approval-request` part **pauses** the chat: the request lands in `pendingApprovals`, the matching `toolCalls` entry flips to `state: 'approval-requested'`, and nothing is re-POSTed. Record verdicts with `addToolApprovalResponse`; once **every** pending approval has one, the hook resumes with `approvalResponses` in the request body — the [server settles the gated calls](/docs/agents/client-tools#tool-approval-round-trip), the client never fabricates a gated `tool_result`. The request's signed `token` is auto-preserved.
 
+The resumed leg executes the approved call and streams its state and result, not the call itself. Since 2.3 the hook adds that result to `history.canonical` as a `role: 'tool'` message, so the next request answers the call. Before 2.3 the result reached only the screen, and the turn repeated the call in the history without its input, so the next request carried an open `tool_use`.
+
 ```tsx
 {pendingApprovals.map((req) => (
   <ApprovalCard

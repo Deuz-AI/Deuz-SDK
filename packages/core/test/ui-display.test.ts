@@ -297,3 +297,42 @@ describe('thinking display modes', () => {
     );
   });
 });
+
+describe('a resumed leg does not re-emit the calls of the leg before it (2.3)', () => {
+  it('the continuation of an approval projects only its own content', async () => {
+    const model = createMockModel({
+      responses: [
+        { toolCalls: [{ toolName: 'del', id: 't1', args: { p: 1 } }] },
+        { text: 'Deleted.' },
+      ],
+    });
+    const tools = {
+      del: { description: 'd', parameters, needsApproval: true, execute: () => 'ok' },
+    };
+    const messages = [{ role: 'user' as const, content: 'x' }];
+    const first = fold(await wire(toDeuzStreamResponse(streamChat({ model, messages, tools }))));
+    const approvalId = first.approvals[0]!.approvalId;
+    const history = [...messages, assistantMessageFromTurn(first)];
+    const second = fold(
+      await wire(
+        toDeuzStreamResponse(
+          streamChat({
+            model,
+            messages: history,
+            tools,
+            approvalResponses: [{ approvalId, approved: true }],
+          }),
+        ),
+      ),
+    );
+    // The leg streamed t1's state and result, never its call: the card has no input.
+    expect(second.message.toolCalls?.[0]).toMatchObject({
+      toolCallId: 't1',
+      state: 'result',
+      output: 'ok',
+    });
+    expect(second.message.toolCalls?.[0]?.input).toBeUndefined();
+    // Before 2.3 this was [tool_use t1 (no input), text]: a second, invalid tool_use.
+    expect(assistantMessageFromTurn(second)).toEqual({ role: 'assistant', content: 'Deleted.' });
+  });
+});

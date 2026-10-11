@@ -978,12 +978,20 @@ function toolUseFromUI(call: UIToolCall): ToolUsePart {
  * conversation before it), with text and `tool_use` where they came. A plain
  * answer is still a plain string, and a turn with neither text nor a tool call
  * sends no reasoning back: alone it is no answer.
+ *
+ * A card the turn knows only from a `tool-state` or `tool-result` frame (2.3)
+ * has no `input`: its call is one an earlier leg made, such as an approved
+ * call the resumed leg executed, and the history already holds its
+ * `tool_use`. The turn does not send it again (before 2.3 it did, without its
+ * input, which no provider accepts).
  */
 export function assistantMessageFromTurn(turn: AssistantTurnState): Message {
-  const toolCalls = turn.message.toolCalls ?? [];
-  const text = turn.message.content;
-  if (partsOf(turn.message).length > 0) {
-    const ordered = canonicalContentFromUI(turn.message);
+  const cards = turn.message.toolCalls ?? [];
+  const toolCalls = cards.filter((call) => call.input !== undefined);
+  const message = toolCalls.length === cards.length ? turn.message : { ...turn.message, toolCalls };
+  const text = message.content;
+  if (partsOf(message).length > 0) {
+    const ordered = canonicalContentFromUI(message);
     if (typeof ordered === 'string') return { role: 'assistant', content: ordered };
     if (!ordered.some((p) => p.type === 'text' || p.type === 'tool_use')) {
       return { role: 'assistant', content: text };

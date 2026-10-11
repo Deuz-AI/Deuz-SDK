@@ -11,6 +11,7 @@
  */
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
+import { streamChat } from '@deuz-sdk/core';
 import type { Message, StopDetails } from '@deuz-sdk/core';
 import {
   createInMemoryAgentRunStore,
@@ -23,6 +24,7 @@ import {
   createInMemoryStreamStateStore,
   resumeDeuzStreamResponse,
   toDeuzAgentStreamResponse,
+  toDeuzStreamResponse,
 } from '@deuz-sdk/core/ui';
 import type { DeuzAgentState, DeuzUIPart } from '@deuz-sdk/core/ui';
 import { useChat } from '../src/use-chat';
@@ -176,6 +178,55 @@ describe('useChat — a native agent route (2.3)', () => {
       output: 'Published.',
     });
     expect(result.current.messages.at(-1)?.content).toBe('Published.');
+  });
+
+  it('a follow-up turn posts a history whose every tool call is answered', async () => {
+    const route = nativeRoute(
+      [
+        {
+          toolCalls: [
+            { toolName: 'publish', id: 'p1', args: { doc: 7 } },
+            { toolName: 'locate', id: 'c1', args: {} },
+          ],
+        },
+        { text: 'Published.' },
+        { text: 'You are welcome.' },
+      ],
+      { ...publishTools(), locate: { description: 'Where?', parameters } },
+    );
+    const { result } = renderHook(() =>
+      useChat({ api: '/api/agent', fetch: route.fetch, onToolCall: async () => 'Paris' }),
+    );
+    await act(async () => {
+      await result.current.sendMessage('publish doc 7');
+    });
+    await waitFor(() => expect(result.current.pendingApprovals).toHaveLength(1));
+    const { approvalId } = result.current.pendingApprovals[0]!;
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId, approved: true });
+    });
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    await act(async () => {
+      await result.current.sendMessage('thanks');
+    });
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    // The server ran `publish` in the resumed leg; its result reached the client
+    // only as a `tool-result` part, and now answers the call in the history too.
+    expect(route.bodies[2]!.messages).toEqual([
+      { role: 'user', content: 'publish doc 7' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'p1', name: 'publish', input: { doc: 7 } },
+          { type: 'tool_use', id: 'c1', name: 'locate', input: {} },
+        ],
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'c1', result: 'Paris' }] },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'p1', result: 'published' }] },
+      { role: 'assistant', content: 'Published.' },
+      { role: 'user', content: 'thanks' },
+    ]);
+    expect(route.bodies[2]).not.toHaveProperty('runId');
   });
 
   it('answers a client tool through onToolCall and resumes with clientToolResults', async () => {
@@ -522,6 +573,62 @@ describe('useChat — a chat route is unchanged (2.3)', () => {
       denied: true,
       outcome: 'permission-denied',
     });
+  });
+});
+
+describe('useChat — the history after an approval answers the approved call (2.3)', () => {
+  it('on a chat route too: the resumed leg’s result joins the history, the call is not repeated', async () => {
+    const model = createMockModel({
+      responses: [
+        { toolCalls: [{ toolName: 'del', id: 't1', args: { p: '/x' } }] },
+        { text: 'Deleted.' },
+        { text: 'Anytime.' },
+      ],
+    });
+    const tools = {
+      del: { description: 'Delete.', parameters, needsApproval: true, execute: () => 'deleted /x' },
+    };
+    const bodies: Body[] = [];
+    // A real chat route: streamChat with the posted history and verdicts.
+    const fetchMock: typeof fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Body;
+      bodies.push(body);
+      return toDeuzStreamResponse(
+        streamChat({
+          model,
+          tools,
+          messages: body.messages,
+          ...(body.approvalResponses ? { approvalResponses: body.approvalResponses as never } : {}),
+        }),
+        { messageId: `msg-${bodies.length}` },
+      );
+    };
+    const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: fetchMock }));
+    await act(async () => {
+      await result.current.sendMessage('delete /x');
+    });
+    await waitFor(() => expect(result.current.pendingApprovals).toHaveLength(1));
+    const { approvalId } = result.current.pendingApprovals[0]!;
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId, approved: true });
+    });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Deleted.'));
+    await act(async () => {
+      await result.current.sendMessage('thanks');
+    });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Anytime.'));
+    // Before 2.3: [user, assistant(tool_use t1), assistant([tool_use t1 without
+    // input, 'Deleted.']), user]: the call open, and a second, invalid tool_use.
+    expect(bodies[2]!.messages).toEqual([
+      { role: 'user', content: 'delete /x' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'del', input: { p: '/x' } }],
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 't1', result: 'deleted /x' }] },
+      { role: 'assistant', content: 'Deleted.' },
+      { role: 'user', content: 'thanks' },
+    ]);
   });
 });
 

@@ -380,6 +380,27 @@ interface NativeResume {
   approvalResponses?: ToolApprovalResponse[];
 }
 
+/**
+ * The ids of the `tool_use` parts the current exchange (after the last user
+ * message) has not answered yet (2.3). A server-run call that an earlier leg
+ * paused on (an approval) gets its result in a later leg, where it is no
+ * assembled card of the turn: these are the calls such results answer.
+ */
+function unansweredCalls(history: Message[]): Set<string> {
+  const results = new Set<string>();
+  const open = new Set<string>();
+  for (let i = history.length - 1; i >= 0; i--) {
+    const message = history[i]!;
+    if (message.role === 'user') break;
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type === 'tool_result') results.add(part.toolUseId);
+      if (part.type === 'tool_use' && !results.has(part.id)) open.add(part.id);
+    }
+  }
+  return open;
+}
+
 /** Local id fallback — this package is not edge-lint-constrained. */
 const defaultGenerateId = (): string =>
   typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -806,6 +827,16 @@ export function useChat(options: UseChatOptions): UseChatResult {
   /** The native run (and its verdicts) the parked client calls resume (2.3). */
   const parkedNativeRef = useRef<NativeResume | undefined>(undefined);
   /**
+   * The results the current turn streamed for calls of an EARLIER leg (2.3):
+   * a server-run call the chat paused on (an approval) executes in the resumed
+   * leg, which streams its state and result but not the call, so it is no
+   * assembled card of that leg's turn. They answer the history's open
+   * `tool_use`s when the turn settles.
+   */
+  const priorResultsRef = useRef<Array<{ toolCallId: string; result: unknown; isError?: boolean }>>(
+    [],
+  );
+  /**
    * Invocation keys (`invocationKey`) of client calls an `onToolCall` batch is
    * running right now. Parked calls live in `clientToolsRef`; together they are
    * the calls a concurrent replay must not dispatch a second time (2.3, F07).
@@ -985,6 +1016,23 @@ export function useChat(options: UseChatOptions): UseChatResult {
           /* G2: a consumer callback is not a transport error */
         }
       }
+      // A result for a call of an earlier leg (2.3, see `priorResultsRef`): the
+      // turn has no card for it, or only one a `tool-state` frame opened.
+      if (
+        part.type === 'tool-result' &&
+        !(turn.message.toolCalls ?? []).some(
+          (call) => call.toolCallId === part.toolCallId && call.input !== undefined,
+        )
+      ) {
+        priorResultsRef.current = [
+          ...priorResultsRef.current,
+          {
+            toolCallId: part.toolCallId,
+            result: part.output,
+            ...(part.isError ? { isError: true } : {}),
+          },
+        ];
+      }
       return next;
     },
     [options.onData],
@@ -1107,6 +1155,18 @@ export function useChat(options: UseChatOptions): UseChatResult {
       // the turns settled behind that cursor again.
       const history = snapshotRef.current.history.canonical;
       const behind = replay?.ledger.afterCursor ? new Set(behindCursorRef.current) : undefined;
+      // Results for calls an earlier leg paused on (2.3), such as an approved
+      // call the resumed leg executed, answer them first, so a later request's
+      // history leaves no `tool_use` open. Before 2.3 such a result reached the
+      // screen but never the history, and the next request failed on the open call.
+      const open = unansweredCalls(history);
+      const answers = priorResultsRef.current.filter(
+        (entry, index, all) =>
+          open.has(entry.toolCallId) &&
+          all.findIndex((other) => other.toolCallId === entry.toolCallId) === index,
+      );
+      priorResultsRef.current = [];
+      if (answers.length > 0) appendCanonical(clientToolResultMessage(answers));
       // Append the canonical assistant turn (client-tools reconstruction).
       appendCanonical(assistantMessageFromTurn(turn));
       turnRef.current = undefined;
@@ -1129,7 +1189,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
       const parked = new Set(clientToolsRef.current.map(keyOfCall));
       const candidates = native
         ? native.clientCalls
-        : (turn.message.toolCalls ?? []).filter((call) => call.state === 'call');
+        : (turn.message.toolCalls ?? []).filter(
+            // A card without input is a call of an earlier leg, never one to run.
+            (call) => call.state === 'call' && call.input !== undefined,
+          );
       const clientPending = candidates.filter((call) => {
         if (!replay || !answered) return true;
         const key = keyOfCall(call);
@@ -1192,6 +1255,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
 
           let turn = createAssistantTurn(genId());
           turnRef.current = turn;
+          priorResultsRef.current = [];
           placedIdRef.current = undefined; // a fresh turn owns no slot yet
           syncTurn(turn); // appends the bubble AND resets this-turn state
           flush(); // "thinking" feedback must never wait on a throttle window
@@ -1500,6 +1564,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
         let turn = continuing && inFlight ? inFlight : createAssistantTurn(genId());
         turnRef.current = turn;
         cursorTurnRef.current = turn;
+        if (!continuing) priorResultsRef.current = [];
         // A continued turn keeps what its earlier reads saw.
         const ledger = continuing ? cursorLedgerRef.current : newLedger(cursor);
         cursorLedgerRef.current = ledger;
