@@ -153,9 +153,14 @@ function checkIndexEntries(text, table, report) {
     if (!home) return;
     for (const label of home[2].split(', ').map((entry) => entry.replace(/^`|`$/g, ''))) {
       const module = byLabel.get(label);
+      const kind = module?.names.get(home[1]);
       if (!module) report(index + 1, `lists unknown subpath "${label}"`);
-      else if (module.names.get(home[1]) !== 'value') {
-        report(index + 1, `"${home[1]}" is not exported by ${module.specifier}`);
+      else if (!kind) report(index + 1, `"${home[1]}" is not exported by ${module.specifier}`);
+      else if (kind !== 'value') {
+        report(
+          index + 1,
+          `"${home[1]}" is listed as a value of ${module.specifier}, which exports it as a ${kind}`,
+        );
       }
     }
   });

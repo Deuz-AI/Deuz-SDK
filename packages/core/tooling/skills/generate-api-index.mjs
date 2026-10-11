@@ -14,8 +14,10 @@
  * Options:
  *   --date YYYY-MM-DD   stamp date (else SOURCE_DATE_EPOCH, else an error)
  *   --out <file>        write only this file instead of the two skill copies
- *   --core <dir>        read another checkout's packages/core (its react is ../react)
- *   --locale <bcp47>    collation for the name lists (default: en)
+ *   --core <dir>        read another checkout's packages/core (its react is ../react);
+ *                       needs --out
+ *   --locale <bcp47>    collation for the name lists (default: en, which verify-skill
+ *                       expects; `tr` reproduces the order of the 2.2.0 index)
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -269,6 +271,9 @@ function parseArgs(argv) {
 
 function main() {
   const options = parseArgs(process.argv.slice(2));
+  if (options.core && !options.out) {
+    throw new Error("--core needs --out: the default targets are this repository's skill copies");
+  }
   const date = resolveStampDate({ date: options.date });
   const table = loadExportTable(options.core ? { core: resolve(options.core) } : {});
   if (table.problems.length > 0) {

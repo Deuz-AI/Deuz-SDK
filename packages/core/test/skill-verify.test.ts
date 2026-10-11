@@ -294,6 +294,22 @@ describe('verify-skill: the API index', () => {
     );
   });
 
+  it('fails on a type-only name in the reverse lookup of values', () => {
+    const fixture = freshSkill();
+    const index = join(fixture.skill, 'references/api-index.md');
+    const line = readFileSync(index, 'utf8').split('\n').indexOf('- `createSwarm` — `swarm`');
+    expect(line).toBeGreaterThan(0);
+    editBoth(
+      fixture,
+      'references/api-index.md',
+      '- `createSwarm` — `swarm`',
+      '- `createSwarm` — `swarm`\n- `SwarmTask` — `swarm`',
+    );
+    expect(run(fixture).failures).toContainEqual(
+      `skills/deuz-sdk/references/api-index.md:${line + 2}  "SwarmTask" is listed as a value of @deuz-sdk/core/swarm, which exports it as a type`,
+    );
+  });
+
   it('fails when the index is missing', () => {
     const fixture = freshSkill();
     rmSync(join(fixture.skill, 'references/api-index.md'));

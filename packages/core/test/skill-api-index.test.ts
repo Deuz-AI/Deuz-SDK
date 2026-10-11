@@ -439,7 +439,20 @@ describe('generate-api-index CLI', () => {
     expect(result.stderr).toMatch(/--date/);
   });
 
-  it('writes the index for --core to --out', () => {
+  it('never writes another checkout into this repository: --core needs --out', () => {
+    const result = run(['--core', join(scratch, 'core'), '--date', '2026-01-02']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/--core needs --out/);
+  });
+
+  it('reads --core and stops on a subpath it has no description for', () => {
+    const out = join(scratch, 'fixture-core.md');
+    const result = run(['--core', join(scratch, 'core'), '--date', '2026-01-02', '--out', out]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/no description for @deuz-sdk\/core\/alpha/);
+  });
+
+  it('writes the index for the real package to --out', () => {
     const out = join(scratch, 'real-core.md');
     const result = run(['--date', '2026-01-02', '--out', out]);
     expect(result.stderr).toBe('');
