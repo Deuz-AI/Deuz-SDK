@@ -492,7 +492,9 @@ export interface UseChatResumeOptions {
    * got. (Since 2.3 a POST response that carries the journal's `id:` lines
    * moves the hook's in-memory cursor too, so a `reconnect()` within the same
    * mounted hook resumes after what the POST read delivered; it is not saved
-   * here, because a reload mid-turn must replay that turn from its start.)
+   * here, because a reload mid-turn must replay that turn from its start.
+   * `setHistory` drops that in-memory cursor, so a chat switch never sends
+   * one chat's cursor to another chat's endpoint.)
    */
   cursor?: UseChatCursorStore;
 }
@@ -679,7 +681,9 @@ export interface UseChatResult {
    * system prompt and provider round-trip data that the UI view cannot carry.
    *
    * Pending gates (approvals, parked client tool calls) are DROPPED: they were
-   * anchored to the transcript you just replaced.
+   * anchored to the transcript you just replaced. So is the in-memory resume
+   * cursor (2.3), which addresses that transcript's stream: the next
+   * `reconnect()` reads from the persisted cursor or from the start.
    */
   setHistory: (update: ChatHistory | ((prev: ChatHistory) => ChatHistory)) => void;
   /**
@@ -1423,6 +1427,16 @@ export function useChat(options: UseChatOptions): UseChatResult {
         history: { ui: [...next.ui], canonical: [...next.canonical] },
       });
       clearGates();
+      // The in-memory resume cursor (2.3: POST reads move it too) addresses
+      // the stream of the transcript just replaced, like the gates. After a
+      // chat switch it would send the old chat's position to the new chat's
+      // endpoint, so the next reconnect reads from the persisted cursor
+      // (`resume.cursor`) or from the start, as before 2.3. Not in
+      // `clearGates`: a send, regenerate or edit continues the same stream.
+      lastEventIdRef.current = undefined;
+      cursorTurnRef.current = undefined;
+      cursorLedgerRef.current = newLedger();
+      behindCursorRef.current = [];
       flush();
     },
     [commit, clearGates, flush],

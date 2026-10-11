@@ -28,7 +28,12 @@ import {
 } from '@deuz-sdk/core/ui';
 import type { DeuzAgentState, DeuzUIPart } from '@deuz-sdk/core/ui';
 import { useChat } from '../src/use-chat';
-import type { UseChatAgent, UseChatResult, UseChatStopDetails } from '../src/use-chat';
+import type {
+  UseChatAgent,
+  UseChatResult,
+  UseChatResumeOptions,
+  UseChatStopDetails,
+} from '../src/use-chat';
 import { journal, parts, postResponse, recordingFetch, stallingResponse } from './wire';
 
 const parameters = { type: 'object' as const, properties: {} };
@@ -724,6 +729,38 @@ describe('useChat — reconnect never re-appends what the hook holds (G1 hand-of
     expect(wire.cursors).toEqual([undefined, '4']);
     expect(result.current.history).toEqual(settled);
     expect(result.current.history.canonical.filter((m) => m.role === 'assistant')).toHaveLength(2);
+  });
+
+  it('a chat switch through setHistory does not carry the old chat’s cursor', async () => {
+    const a = journal('chat-a');
+    const b = journal('chat-b');
+    // Chat B has a turn in its journal that this hook never read (started elsewhere).
+    await b.leg([parts.start('b-1'), parts.text('B answer.'), parts.finish()]);
+    const fetchA: typeof fetch = async () =>
+      a.respond([parts.start('a'), parts.text('A.'), parts.finish()]);
+    const { result, rerender } = renderHook(
+      ({ endpoint }: { endpoint: UseChatResumeOptions['endpoint'] }) =>
+        useChat({ api: '/api/chat', fetch: fetchA, resume: { endpoint } }),
+      { initialProps: { endpoint: a.endpoint as UseChatResumeOptions['endpoint'] } },
+    );
+    for (const text of ['one', 'two', 'three']) {
+      await act(async () => {
+        await result.current.sendMessage(text);
+      });
+    }
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    // The documented chat switch: the resume endpoint follows the chat, setHistory swaps the views.
+    rerender({ endpoint: b.endpoint });
+    act(() => {
+      result.current.setHistory({ ui: [], canonical: [{ role: 'user', content: 'B question' }] });
+    });
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    // Chat A's POST reads moved the cursor to '10'; chat B is read from its start.
+    expect(b.cursors).toEqual([undefined]);
+    expect(result.current.messages.at(-1)?.content).toBe('B answer.');
   });
 });
 
