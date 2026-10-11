@@ -45,14 +45,15 @@ The default is deliberately conservative: a step budget is a spend budget, and a
 
 ## Anatomy of one step
 
-Both loops run the same sequence. The streaming one additionally frames it with `step-start` / `step-finish` parts.
+Both loops run the same sequence. The streaming one additionally frames it with `step-start` / `step-finish` parts; `step-start` comes after the MCP hot-swap.
 
 ```text
   ── per iteration ─────────────────────────────────────────────────────────
    1. step deadline check      previous step overran `timeout.stepMs`? fail now
    2. arm this step's deadline
-   3. COMPACTION               automatic layered compaction, if enabled
-   4. MCP hot-swap             a server announced tools/list_changed → re-read
+   3. MCP hot-swap             a server announced tools/list_changed → re-read;
+                               onCatalogChange 'stop' ends the run here
+   4. COMPACTION               automatic layered compaction, if enabled
    5. prepareStep              your hook — LAST word on messages/model/tools
    6. MODEL CALL               one turn (retry + ttft/total timeouts inside)
                                ↳ one context-overflow auto-retry per step
@@ -63,28 +64,31 @@ Both loops run the same sequence. The streaming one additionally frames it with 
          10a. output guardrails       may block / rewrite the final text
          11a. checkpoint 'completed'  → LOOP ENDS
    YES →  7b. append assistant turn FIRST (OpenAI ordering)
-          8b. split off handoff calls
-          9b. onToolCall guardrails   block / rewrite arguments
-         10b. approval gate           server mode denies inline; client mode BREAKS
-         11b. client tools present?   BREAK — the caller owns the round-trip
-         12b. executeTools            parallel, capped by maxToolConcurrency
-         13b. step deadline check     tools may have overrun it
-         14b. append ONE tool turn    every tool_use_id answered
-         15b. onStepFinish
-         16b. runaway guard           3 consecutive same-tool errors → hard stop
-         17b. stopWhen / maxSteps / budget
-         18b. checkpoint 'running'    → NEXT ITERATION
+          8b. execution policy        a forbidden call fails the run, for the whole batch
+          9b. onToolCall guardrails   block / rewrite arguments, transfers included
+         10b. approval gate           server mode denies inline; client mode holds the call
+         11b. handoff decision        among the cleared transfers, decided, never executed
+         12b. held or client call?    BREAK — the caller owns the round-trip
+         13b. executeTools            parallel, capped by maxToolConcurrency
+         14b. step deadline check     tools may have overrun it
+         15b. append ONE tool turn    every tool_use_id answered
+         16b. onStepFinish
+         17b. runaway guard           3 consecutive same-tool errors → hard stop
+         18b. stopWhen / maxSteps / budget
+         19b. checkpoint 'running'    → NEXT ITERATION
 ```
 
 Ordering details that are load-bearing:
 
+- **The MCP hot-swap runs first** (2.3), before compaction and, in `streamChat`, before `step-start`. A catalog change that `onCatalogChange: 'stop'` refuses ends the run before a step is counted or any model is offered the new tools.
 - **Compaction runs before `prepareStep`**, so your hook sees — and has the last word on — the compacted history. If it ran after, your rewrite would be silently re-compacted or lost.
 - **The assistant turn is appended before its tool-result turn.** OpenAI's wire rejects the other order.
+- **Every call takes one path** (2.3): the execution policy, then the `onToolCall` guardrails, then the approval gate, then the handoff decision. A `transfer_to_*` call is a call like any other: a guardrail can refuse it and an approval can gate it, and a refused transfer leaves the current agent driving. The resume settle runs the same order.
 - **Guardrails run immediately before the approval gate**, so a rewritten argument reaches the `needsApproval` predicate, the request a human actually sees, and `execute` — while the assistant turn already in history keeps the arguments the *model* issued. What the model said and what ran are both recoverable.
 - **The step deadline is checked twice**: once before starting a step, once after its tools have run. A timer that fires while a tool is executing cannot abort the tool (that is `toolMs` / `Tool.timeoutMs`), so the loop enforces it at its own boundaries rather than feeding results into a model call it can no longer pay for.
 - **A break executes nothing else from the batch.** When a pending approval or a client tool forces a break, the *whole* batch is deferred; the resume call settles all of it. That keeps the "every `tool_use_id` gets a `tool_result`" invariant intact across the suspension.
 
-Before the first iteration, once per run leg: MCP servers connect, the handoff catalog is captured, the tool wires are built and filtered by `activeTools`, any pending approvals from a previous leg are settled, memory recall is computed, and the `onInput` guardrails run.
+Before the first iteration, once per run leg: a durable call that continues a stored run reads its checkpoint (2.3), MCP servers connect, the handoff catalog is captured, the tool wires are built and filtered by `activeTools`, any pending approvals from a previous leg are settled, memory recall is computed, and the `onInput` guardrails run.
 
 ## Loop control options
 
@@ -356,7 +360,7 @@ The lookup uses own keys only, so a model calling `toString` or `constructor` is
 
 ### Approval gates
 
-A tool marked `needsApproval` is gated before it runs, and which mode you get depends only on whether you passed `approveToolCall`:
+A tool marked `needsApproval` is gated before it runs, and so is every call when the execution policy sets `requireApproval`; handoff transfers are gated like any call (2.3). Which mode you get depends only on whether you passed `approveToolCall`:
 
 - **Server mode** — the loop calls your approver per gated call. `false` or a throw denies it; the denial becomes an `is_error` result and **the loop continues**.
 - **Client mode** — the gated call **breaks** the loop and comes back in `result.pendingApprovals` (and as `tool-approval-request` parts). Resume with `approvalResponses`. Any pending call without a matching verdict is **denied by default** — the safe side. With `approvalSigner` configured, an approval without a verifying token is denied too.
