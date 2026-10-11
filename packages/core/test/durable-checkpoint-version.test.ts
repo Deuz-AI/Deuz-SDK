@@ -241,7 +241,10 @@ describe('checkpoint version in native runs (2.3)', () => {
   it('a newer sub-agent checkpoint fails the resume without ending the stored run', async () => {
     const { pay, child, store, options } = delegation('native-child');
     expect((await runAgent(options)).status).toBe('suspended');
-    const childKey = 'native-child::worker#delegate';
+    // A native child is keyed by its call id and root model step (2.3).
+    const childKey = Object.keys((await store.load('native-child'))!.checkpoints).find((key) =>
+      key.startsWith('native-child::worker#delegate@'),
+    )!;
     expect((await store.load('native-child'))?.checkpoints[childKey]).toBeDefined();
     await rewrite(store, 'native-child', (envelope) => {
       (envelope.checkpoints[childKey] as unknown as { version: number }).version = 2;
