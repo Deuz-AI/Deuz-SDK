@@ -133,6 +133,34 @@ describe('native fail-over: one call, same run', () => {
     expect(fallback.wire.calls()).toBe(2);
   });
 
+  it('after a fail-over the loop’s own compaction summaries go to the routed model', async () => {
+    const primary = gpt('gpt-4.1', [
+      openaiTurn({ toolCalls: [{ id: 'c1', name: 'lookup', json: '{}' }] }),
+      openaiTurn({ toolCalls: [{ id: 'c2', name: 'lookup', json: '{}' }] }),
+      openaiTurn({ text: 'summary from A' }),
+      serverError,
+    ]);
+    const fallback = gpt('gpt-5.2', [
+      openaiTurn({ toolCalls: [{ id: 'c3', name: 'lookup', json: '{}' }] }),
+      openaiTurn({ text: 'summary from B' }),
+      openaiTurn({ text: 'final from B' }),
+    ]);
+    const result = await runAgent({
+      model: primary.model,
+      fallbackModels: [fallback.model],
+      maxRetries: 0,
+      prompt: 'look three times',
+      compaction: { threshold: 0, keepRecentSteps: 1, layers: ['summarize'] },
+      session: { store: createInMemoryAgentRunStore(), runId: 'summaries', scope: 'tenant' },
+      tools: { lookup: { parameters, execute: () => 'v' } },
+    });
+    expect(result).toMatchObject({ status: 'completed', output: 'final from B' });
+    // A: two steps, a summary, the failed call. B: a step, the next summary, the answer.
+    expect(primary.wire.calls()).toBe(4);
+    expect(fallback.wire.calls()).toBe(3);
+    expect(JSON.stringify(fallback.wire.bodies[1]!.messages)).toContain('summary from A');
+  });
+
   it('every candidate failing ends the run with the last error', async () => {
     const primary = claude('claude-opus-5-5', [overloaded]);
     const second = gpt('gpt-5.2', [serverError]);

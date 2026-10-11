@@ -1322,6 +1322,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             const inner = runStreamToolLoop(
               {
                 ...common,
+                // The root model's routed candidate (2.3) also drives what the
+                // loop calls on its own, such as compaction summaries.
+                ...(router ? { model: router.route(common.model) ?? common.model } : {}),
                 ...(legCheckpoint ? {} : { messages: legInput }),
                 maxSteps: maxSteps - before,
                 guardrails: { ...options.guardrails, onOutput: undefined },

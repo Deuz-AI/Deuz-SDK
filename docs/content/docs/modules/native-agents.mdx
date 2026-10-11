@@ -412,7 +412,9 @@ The legacy loops treat these three as best-effort side effects of a call. A
 native run is checkpointed, so each is bound to the run's record instead, and
 each is part of the resume binding: a resume with another memory scope, another
 chat or other `fallbackModels` fails with `Native agent binding changed across
-resume.` before anything is written.
+resume.` before anything is written. A run without a `session` has no record:
+it still recalls once, extracts after completing and writes its chat projection,
+but nothing it does can be resumed or reconciled.
 
 ### Memory
 
@@ -552,7 +554,10 @@ call does not use up a repair attempt. These never fail over:
 
 The failed model is skipped for the rest of the run, also after a resume.
 Routing is by model, so a handoff target's model or a `prepareStep` model fails
-over the same way. The stream carries a `warning` part (`setting:
+over the same way, and after the root model failed over, the loop's own
+compaction summaries go to its replacement. A compaction summary call does not
+fail over by itself: when it fails before the step's own call, the step fails as
+before. The stream carries a `warning` part (`setting:
 'fallbackModels'`) in place of the call's error. `AgentRunEnvelope.models`
 records each fail-over: the attempt number, the failed and the next model with
 their provider and protocol, the model step, the phase and the error. It also
