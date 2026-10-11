@@ -231,8 +231,9 @@ describe('checkpoint version in native runs (2.3)', () => {
   it('control: a newer envelope fails the resume and leaves the stored run resumable', async () => {
     const { store, options } = delegation('native-root');
     expect((await runAgent(options)).status).toBe('suspended');
+    // Version 2 is 2.3's (memory, chat, fail-over); 3 is newer than this SDK.
     await rewrite(store, 'native-root', (envelope) => {
-      (envelope as { version: number }).version = 2;
+      (envelope as { version: number }).version = 3;
     });
     expect((await resumeAgent(options)).status).toBe('failed');
     expect((await store.load('native-root'))?.phase).toBe('running');
