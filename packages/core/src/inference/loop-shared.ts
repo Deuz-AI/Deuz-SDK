@@ -238,11 +238,11 @@ export function setupDurable(
 /**
  * A plain leg of a stored durable run (2.3): a call that carries the run's
  * `session` without `resumeFromCheckpoint`. It continues the stored run's step
- * counter, so the run never saves the same step boundary twice and an approval
- * bound to a step is never issued again by a later leg, and its approval-request
- * count. Returns the step the stored run is suspended at: the step its pending
- * approvals are bound to, which the leg's settle needs. A run id the caller did
- * not pass has nothing stored.
+ * counter and approval-request count, so the run never saves the same step
+ * boundary twice and an approval bound to a step is never issued again by a
+ * later leg. Returns the step the stored run is suspended at: the step its
+ * pending approvals are bound to, which the leg's settle needs. A run id the
+ * caller did not pass has nothing stored.
  *
  * A failed read is logged and the leg counts from 0, as before; under
  * `durability: 'strict'` it fails the call instead.
