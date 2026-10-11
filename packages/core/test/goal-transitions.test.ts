@@ -562,6 +562,16 @@ describe('deadline', () => {
     expect(late).toMatchObject({ changed: true, outcome: 'rejected', reason: 'terminal' });
     expect(late.record).toMatchObject({ status: 'failed', outcome: { reason: 'deadline' } });
     expect(late.record.waiting).toBeUndefined();
+    // An event is dropped, and the goal failed all the same: save on `changed`.
+    const reply = answer({ type: 'user' }, 'reply', T0 + 61_000);
+    expect(
+      transitionGoal(waiting, { type: 'event', event: reply }, { now: T0 + 61_000 }),
+    ).toMatchObject({
+      changed: true,
+      outcome: 'ignored',
+      reason: 'terminal',
+      record: { status: 'failed', outcome: { reason: 'deadline' } },
+    });
   });
 
   it('can be extended or removed before it passes, never set in the past', () => {

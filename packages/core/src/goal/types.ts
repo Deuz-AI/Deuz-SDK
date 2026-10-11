@@ -327,9 +327,10 @@ export interface GoalTransition {
   record: GoalRecord;
   changed: boolean;
   /**
-   * `'applied'`: the command or event took effect. `'ignored'`: an event,
-   * charge or no-op left the goal as it was. `'rejected'`: the goal refused
-   * the command. A passed deadline can change the record even then.
+   * `'applied'`: the command or event took effect. `'ignored'`: the goal
+   * dropped an event, a charge or a no-op. `'rejected'`: the goal refused the
+   * command. A passed deadline fails the goal first, so `changed` can be true
+   * on any outcome.
    */
   outcome: 'applied' | 'ignored' | 'rejected';
   reason?: GoalTransitionReason;
