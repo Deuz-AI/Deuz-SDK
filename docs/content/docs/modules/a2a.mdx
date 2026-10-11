@@ -214,7 +214,7 @@ const handler = createA2AHandler({
 
 ### Streaming and subscriptions
 
-`SendStreamingMessage` answers with Server-Sent Events: one `message` event (a `reply`), or the task's lifecycle — the `task` snapshot, then its `statusUpdate` and `artifactUpdate` events — until the turn ends. A refusal found before the first event (an unknown task, an `A2AError` from the executor) is answered as a plain error rather than a stream. A failure after it arrives as a `FAILED` status update, or — when the executor refuses a follow-up message after its snapshot was sent — as an `event: error` carrying the A2A error; that snapshot showed the message in the task's history, the stored task no longer has it.
+`SendStreamingMessage` answers with Server-Sent Events: one `message` event (a `reply`), or the task's lifecycle — the `task` snapshot, then its `statusUpdate` and `artifactUpdate` events — until the turn ends. A refusal found before the first event (an unknown task, an `A2AError` the executor raises itself) is answered as a plain error rather than a stream. A failure after it arrives as a `FAILED` status update, or — when the executor refuses a follow-up message after its snapshot was sent — as an `event: error` carrying the A2A error; that snapshot showed the message in the task's history, the stored task no longer has it.
 
 `SubscribeToTask` re-attaches to a task: the stored snapshot first, then the events of its running turn until that turn ends. A task with no running turn (one waiting for input) yields its snapshot alone; a finished task is refused with `UNSUPPORTED_OPERATION`. A client that disconnects does not stop the task — it can subscribe again, or poll `GetTask`.
 
