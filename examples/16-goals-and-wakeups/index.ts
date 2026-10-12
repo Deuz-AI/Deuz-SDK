@@ -37,6 +37,7 @@ import { createMockModel } from '@deuz-sdk/core/testing';
 // order, across both runs. REAL PROVIDER: replace it with
 //   import { createAnthropic } from '@deuz-sdk/core/anthropic';
 //   const model = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY })('claude-opus-4-8');
+// Keep the goal's budget above what the runs use: a spent budget holds the goal.
 const model = createMockModel({
   responses: [
     // the run the nightly wakeup starts
@@ -166,7 +167,11 @@ async function work(worker: Worker, runId: string): Promise<void> {
   // Keyed by the run, so a repeated charge counts once.
   await update({ type: 'charge', tokens: result.usage.totalTokens, key: runId });
   if (!report) {
-    await update({ type: 'wait', wait: { reason: 'user', note: 'The run checked no links.' } });
+    const wait = await update({
+      type: 'wait',
+      wait: { reason: 'user', note: 'The run checked no links.' },
+    });
+    console.log(`     ${waited(wait, 'a person')}`);
     return;
   }
   // Acceptance rests on the checker's report (source 'tool'). The model saying
@@ -186,9 +191,18 @@ async function work(worker: Worker, runId: string): Promise<void> {
   } else {
     // Another check finds the same links until the fix is deployed: wait for the deploy.
     const source = { type: 'signal', id: 'docs-deploy' } as const;
-    const { record } = await update({ type: 'wait', wait: { reason: 'event', source } });
-    console.log(`     goal ${record.status} for signal ${source.id} (revision ${record.revision})`);
+    const wait = await update({ type: 'wait', wait: { reason: 'event', source } });
+    console.log(`     ${waited(wait, `signal ${source.id}`)}`);
   }
+}
+
+/** What a wait did: applied, or refused, as it is while a spent budget holds the goal. */
+function waited({ outcome, reason, record }: GoalTransition, what: string): string {
+  if (outcome === 'applied')
+    return `goal ${record.status} for ${what} (revision ${record.revision})`;
+  const held = record.waiting ? ` (${record.waiting.reason})` : '';
+  const spent = `spent ${record.spent.tokens} of ${record.budget?.tokens} tokens`;
+  return `wait for ${what} ${outcome} (${reason}): goal ${record.status}${held}, ${spent}`;
 }
 
 /**
@@ -256,7 +270,7 @@ try {
       scope: SCOPE,
       objective: 'No broken links on docs.acme.dev.',
       criteria: [{ id: 'no-broken-links', description: 'The link checker finds no broken link.' }],
-      budget: { tokens: 500 },
+      budget: { tokens: 20_000 }, // every run's usage is charged to it
     },
     { now },
   );

@@ -1,11 +1,13 @@
 /**
  * The keyless 2.3 examples (14-16) run end to end and print what they show,
- * and 17 runs against offline stand-ins for the real providers its README
- * swaps in. The examples import the package by name; here those imports load
- * the sources, so no build is needed. Each run is a fresh import of the example.
+ * and 16 and 17 also run against offline stand-ins for what their REAL
+ * PROVIDER swap changes. The examples import the package by name; here those
+ * imports load the sources, so no build is needed. Each run is a fresh import
+ * of the example.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RealtimeSessionOptions, RealtimeWebSocketFactory } from '../src/realtime/index';
+import type { CreateMockModelOptions } from '../src/testing';
 
 vi.mock('@deuz-sdk/core', () => import('../src/index'));
 vi.mock('@deuz-sdk/core/agent', () => import('../src/agent'));
@@ -17,20 +19,35 @@ vi.mock('@deuz-sdk/core/ops', () => import('../src/ops'));
 vi.mock('@deuz-sdk/core/ops/sqlite', () => import('../src/node/ops-sqlite'));
 vi.mock('@deuz-sdk/core/pricing', () => import('../src/pricing'));
 vi.mock('@deuz-sdk/core/schedule', () => import('../src/schedule'));
-vi.mock('@deuz-sdk/core/testing', () => import('../src/testing'));
 vi.mock('@deuz-sdk/core/ui', () => import('../src/ui'));
 
 /**
- * Example 17's REAL PROVIDER swap, still offline. `serverNamesResponses`: the
- * server picks its own response ids, as the OpenAI Realtime endpoint does; every
- * frame of the scripted socket passes through with only those ids renamed.
- * `gemini`: the session talks to a scripted Gemini Live server instead, where the
+ * Offline stand-ins for what an example's REAL PROVIDER swap changes. `usage`
+ * (16): every scripted reply reports the usage a real tool-enabled call does,
+ * instead of the mock's 10 + 5 tokens. `serverNamesResponses` (17): the server
+ * picks its own response ids, as the OpenAI Realtime endpoint does; every frame
+ * of the scripted socket passes through with only those ids renamed. `gemini`
+ * (17): the session talks to a scripted Gemini Live server instead, where the
  * answer to a tool result continues the tool call's turn or is a turn of its own.
  */
 const provider = vi.hoisted(() => ({
+  usage: undefined as { inputTokens: number; outputTokens: number } | undefined,
   serverNamesResponses: false,
   gemini: undefined as 'same turn' | 'own turn' | undefined,
 }));
+vi.mock('@deuz-sdk/core/testing', async () => {
+  const real = await import('../src/testing');
+  return {
+    ...real,
+    createMockModel: (options: CreateMockModelOptions) =>
+      real.createMockModel({
+        ...options,
+        responses: options.responses.map((response) =>
+          provider.usage ? { ...response, usage: provider.usage } : response,
+        ),
+      }),
+  };
+});
 vi.mock('@deuz-sdk/core/realtime', async () => {
   const real = await import('../src/realtime/index');
   const serverNamed =
@@ -282,6 +299,40 @@ describe('examples/16-goals-and-wakeups', () => {
     expect(later).toContain('event nightly-links@1791943200000: ignored (terminal)');
     expect(later).not.toContain('[tool]');
     expect(later).toContain('worker A: nightly-links@1791943200000 (2026-10-14 02:00) ran');
+  }, 30_000);
+
+  it('fits the usage a real tool-enabled call reports into the goal budget', async () => {
+    // Anthropic adds its tool-use system prompt to every call that has tools.
+    provider.usage = { inputTokens: 430, outputTokens: 45 };
+    try {
+      const lines = await run('16-goals-and-wakeups');
+      const night = section(lines, 2);
+      const deploy = section(lines, 3);
+
+      // The first night's charge leaves budget, so the goal waits for the deploy.
+      expect(night).toContain('run completed');
+      expect(night).toContain('goal waiting for signal docs-deploy');
+      expect(deploy).toContain('event deploy-812: applied, goal active');
+      // Each run's usage is a charge on the goal: two runs of two calls.
+      expect(deploy).toMatch(/goal completed \(accepted\), spent 1900 of \d+ tokens/);
+      expect(section(lines, 4)).toContain('ignored (terminal)');
+    } finally {
+      provider.usage = undefined;
+    }
+  }, 30_000);
+
+  it('prints a spent budget as the hold it is, not as the wait it refuses', async () => {
+    provider.usage = { inputTokens: 900_000, outputTokens: 100_000 };
+    try {
+      const night = section(await run('16-goals-and-wakeups'), 2);
+      expect(night).toContain('run completed');
+      expect(night).toMatch(
+        /wait for signal docs-deploy rejected \(budget-exhausted\): goal waiting \(budget\), spent 2000000 of \d+ tokens/,
+      );
+      expect(night).not.toContain('goal waiting for signal docs-deploy');
+    } finally {
+      provider.usage = undefined;
+    }
   }, 30_000);
 });
 
