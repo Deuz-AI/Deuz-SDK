@@ -215,11 +215,54 @@ describe('inspectRun (headless preview)', () => {
         toolName: 'charge',
         input: { usd: 5 },
         modelStep: 1,
-        resumeWith: 'retryToolCallIds',
+        // Either answers it: run the call again, or record the result that landed.
+        resumeWith: ['retryToolCallIds', 'reconciledToolResults'],
       },
       { kind: 'resume', phase: 'running' },
     ]);
     expect(exitCodeFor(report)).toBe(HEADLESS_EXIT_CODES.pending);
+  });
+
+  it('shows the retry record of a run that failed in transit, and of no other run', async () => {
+    const store = createInMemoryAgentRunStore();
+    const stored = async (
+      runId: string,
+      result: AgentResult<unknown>,
+      retry: unknown,
+    ): Promise<HeadlessReport> => {
+      await store.save(
+        envelope(runId, {
+          result,
+          ...(retry ? { retry: retry as AgentRunEnvelope['retry'] } : {}),
+        }),
+      );
+      return inspectRun(store, runId);
+    };
+    const transient = await stored('r-503', failed('r-503', 'server_error'), {
+      cause: 'model-call',
+      phase: 'finalizing',
+    });
+    expect(transient).toMatchObject({
+      status: 'failed',
+      outcome: 'failed',
+      retry: { cause: 'model-call', phase: 'finalizing', resumeWith: 'retryFailed' },
+      pending: [],
+    });
+    // Still a failure: the exit-code contract does not change.
+    expect(exitCodeFor(transient)).toBe(HEADLESS_EXIT_CODES.failed);
+
+    // No record, a record a resume would refuse, or a record beside another outcome.
+    const others: [string, AgentResult<unknown>, unknown][] = [
+      ['r-401', failed('r-401', 'authentication'), undefined],
+      ['r-bad', failed('r-bad', 'server_error'), { cause: 'model-call', phase: 'terminal' }],
+      [
+        'r-ok',
+        { ...base('r-ok'), status: 'completed', output: 'ok' },
+        { cause: 'model-call', phase: 'running' },
+      ],
+    ];
+    for (const [runId, result, retry] of others)
+      expect((await stored(runId, result, retry)).retry, runId).toBeUndefined();
   });
 
   it('rejects an unknown run', async () => {

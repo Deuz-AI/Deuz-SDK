@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { createInMemoryAgentRunStore } from '../src/agent-run';
+import { BudgetLedgerError } from '../src/budget-ledger';
 import { createMockModel, type MockResponse } from '../src/testing';
 import { createOpenAI } from '../src/openai';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
@@ -13,8 +14,10 @@ import {
   inspectRun,
   resumeHeadless,
   runHeadless,
+  type HeadlessResumeOptions,
 } from '../src/node/headless';
 import type { AgentEvent, AgentRunStore, AgentToolSet } from '../src/types/agent-run';
+import type { BreakerStore } from '../src/types/deps';
 import type { LanguageModel } from '../src/types/model';
 
 /** A mock model answering as `modelId` (the price table keys on the id). */
@@ -216,7 +219,7 @@ describe('runHeadless (headless preview)', () => {
       expect.objectContaining({
         kind: 'unknown-effect',
         toolName: 'charge',
-        resumeWith: 'retryToolCallIds',
+        resumeWith: ['retryToolCallIds', 'reconciledToolResults'],
       }),
     ]);
     expect(exitCodeFor(stuck)).toBe(HEADLESS_EXIT_CODES.pending);
@@ -307,5 +310,256 @@ describe('runHeadless (headless preview)', () => {
     expect(again.error?.message).toMatch(/already exists/);
     expect(again.phase).toBe('terminal');
     expect((await inspectRun(store, 'taken')).outcome).toBe('completed');
+  });
+});
+
+/**
+ * A store that goes down right after a call is recorded as started: the
+ * call's effect lands, and its outcome is never saved.
+ */
+function crashingAfterStart(memory: AgentRunStore): AgentRunStore {
+  let down = false;
+  return {
+    load: (runId) => memory.load(runId),
+    save: async (envelope) => {
+      if (down) throw new Error('store unavailable');
+      await memory.save(envelope);
+      if (Object.values(envelope.toolResults ?? {}).some((r) => r.stage === 'executing'))
+        down = true;
+    },
+  };
+}
+
+/** A circuit breaker that every call finds open: the provider is in an outage. */
+const outage: BreakerStore = {
+  get: () => ({ failures: 5, openedAt: 0, cooldownUntil: Number.MAX_SAFE_INTEGER }),
+  set: () => {},
+};
+
+describe('resumeHeadless with the 2.3 durability options (headless preview)', () => {
+  /** A run stopped on a charge whose effect is unknown, as resumeHeadless reports it. */
+  async function unknownCharge() {
+    const memory = createInMemoryAgentRunStore();
+    const charges: number[] = [];
+    const tools: AgentToolSet = {
+      charge: {
+        description: 'Charge the card.',
+        parameters: { type: 'object' },
+        execute: () => {
+          charges.push(charges.length + 1);
+          return { charged: 5 };
+        },
+      },
+    };
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'charge', args: {} }] }, { text: 'Charged.' }],
+    });
+    const crashed = await runHeadless({
+      model,
+      prompt: 'Charge.',
+      tools,
+      store: crashingAfterStart(memory),
+      runId: 'pay',
+    });
+    expect(crashed.outcome).toBe('failed');
+    const stuck = await resumeHeadless({ model, tools, store: memory, runId: 'pay' });
+    const effect = stuck.pending[0];
+    if (effect?.kind !== 'unknown-effect') throw new Error('expected an unknown effect');
+    return { memory, charges, tools, model, toolCallId: effect.toolCallId };
+  }
+
+  it('records the result that landed with reconciledToolResults, without running the call again', async () => {
+    const { memory, charges, tools, model, toolCallId } = await unknownCharge();
+    expect(charges).toEqual([1]);
+    // The app found the charge in the payment system: it landed.
+    const done = await resumeHeadless({
+      model,
+      tools,
+      store: memory,
+      runId: 'pay',
+      reconciledToolResults: [{ toolCallId, output: { charged: 5 } }],
+    });
+    expect(done).toMatchObject({ status: 'completed', outcome: 'completed', output: 'Charged.' });
+    expect(exitCodeFor(done)).toBe(0);
+    expect(charges).toEqual([1]);
+    expect(await inspectRun(memory, 'pay')).toMatchObject({ outcome: 'completed', pending: [] });
+  });
+
+  it('refuses an answer that does not fit the unknown effects before writing anything', async () => {
+    const { memory, charges, tools, model, toolCallId } = await unknownCharge();
+    const before = await memory.load('pay');
+    const answers: [string, Partial<HeadlessResumeOptions>][] = [
+      [
+        'a call that is not unknown',
+        { reconciledToolResults: [{ toolCallId: 'nope', output: 1 }] },
+      ],
+      [
+        'the same call listed twice',
+        {
+          reconciledToolResults: [
+            { toolCallId, output: 1 },
+            { toolCallId, output: 2 },
+          ],
+        },
+      ],
+      [
+        'a call both run again and recorded',
+        { retryToolCallIds: [toolCallId], reconciledToolResults: [{ toolCallId, output: 1 }] },
+      ],
+      ['not an array', { reconciledToolResults: 'landed' as never }],
+    ];
+    for (const [label, answer] of answers) {
+      const report = await resumeHeadless({ model, tools, store: memory, runId: 'pay', ...answer });
+      expect(report, label).toMatchObject({
+        status: 'failed',
+        outcome: 'failed',
+        error: { name: 'TypeError', message: expect.stringContaining('reconciledToolResults') },
+      });
+      expect(exitCodeFor(report), label).toBe(HEADLESS_EXIT_CODES.failed);
+      expect(await memory.load('pay'), label).toEqual(before);
+    }
+    expect(charges).toEqual([1]);
+    // The run still waits for the decision.
+    expect((await inspectRun(memory, 'pay')).pending).toEqual([
+      expect.objectContaining({ kind: 'unknown-effect', toolCallId }),
+      { kind: 'resume', phase: 'running' },
+    ]);
+  });
+
+  it('reports a run that failed in transit as retryable, and re-enters it with retryFailed', async () => {
+    const store = createInMemoryAgentRunStore();
+    const model = createMockModel({ responses: [{ text: 'Fixed.' }] });
+    const first = await runHeadless({
+      model,
+      prompt: 'Fix the build.',
+      store,
+      runId: 'flaky',
+      deps: { breakerStore: outage },
+    });
+    expect(first).toMatchObject({
+      status: 'failed',
+      outcome: 'failed',
+      error: { code: 'breaker_open' },
+      retry: { cause: 'model-call', phase: 'running', resumeWith: 'retryFailed' },
+      pending: [],
+    });
+    expect(exitCodeFor(first)).toBe(HEADLESS_EXIT_CODES.failed);
+    expect((await inspectRun(store, 'flaky')).retry).toEqual(first.retry);
+
+    // Without the option, a resume returns the stored failure, still retryable.
+    const again = await resumeHeadless({ model, store, runId: 'flaky' });
+    expect(again).toMatchObject({ outcome: 'failed', error: first.error, retry: first.retry });
+
+    const retried = await resumeHeadless({ model, store, runId: 'flaky', retryFailed: true });
+    expect(retried).toMatchObject({ status: 'completed', outcome: 'completed', output: 'Fixed.' });
+    expect(retried.retry).toBeUndefined();
+    expect((await inspectRun(store, 'flaky')).retry).toBeUndefined();
+  });
+
+  it('reports no retry for any other failure, and refuses retryFailed for it before writing', async () => {
+    const store = createInMemoryAgentRunStore();
+    const model = createOpenAI({
+      apiKey: 'k',
+      fetch: (async () =>
+        new Response(JSON.stringify({ error: { message: 'Incorrect API key.' } }), {
+          status: 401,
+          headers: { 'content-type': 'application/json' },
+        })) as typeof fetch,
+    })('gpt-5.5');
+    const failed = await runHeadless({ model, prompt: 'hi', store, runId: 'key', maxRetries: 0 });
+    expect(failed).toMatchObject({ outcome: 'failed', error: { code: 'authentication' } });
+    expect(failed.retry).toBeUndefined();
+    const before = await store.load('key');
+    for (const retryFailed of [true, 'yes' as unknown as boolean]) {
+      const refused = await resumeHeadless({ model, store, runId: 'key', retryFailed });
+      expect(refused, String(retryFailed)).toMatchObject({
+        outcome: 'failed',
+        error: { name: 'TypeError', message: expect.stringContaining('retryFailed') },
+      });
+      expect(refused.retry, String(retryFailed)).toBeUndefined();
+      expect(await store.load('key'), String(retryFailed)).toEqual(before);
+    }
+  });
+
+  it('reports its own error, not the stored retry, for a leg refused before it wrote', async () => {
+    const store = createInMemoryAgentRunStore();
+    const model = createMockModel({ responses: [{ text: 'Fixed.' }] });
+    const first = await runHeadless({
+      model,
+      prompt: 'Fix the build.',
+      store,
+      runId: 'bound',
+      deps: { breakerStore: outage },
+    });
+    expect(first.retry).toBeDefined();
+    const before = await store.load('bound');
+    // A changed binding refuses the resume; a fresh run under the same ID is refused too.
+    const changed = await resumeHeadless({
+      model,
+      store,
+      runId: 'bound',
+      retryFailed: true,
+      tools: deployTools,
+    });
+    expect(changed).toMatchObject({ outcome: 'failed', error: { name: 'TypeError' } });
+    expect(changed.retry).toBeUndefined();
+    const taken = await runHeadless({ model, prompt: 'Again.', store, runId: 'bound' });
+    expect(taken.error?.message).toMatch(/already exists/);
+    expect(taken.retry).toBeUndefined();
+    expect(await store.load('bound')).toEqual(before);
+    expect((await inspectRun(store, 'bound')).retry).toEqual(first.retry);
+  });
+
+  it('asks for retryFailed with the answers when a retried run stops before its first write', async () => {
+    // A fatal budget-store conflict raised inside the tool call, after its
+    // effect: the receipt stays 'executing' and the run fails in transit.
+    const store = createInMemoryAgentRunStore();
+    const effects: string[] = [];
+    const tools: AgentToolSet = {
+      charge: {
+        description: 'Charge the card.',
+        parameters: { type: 'object' },
+        execute: () => {
+          effects.push('charge');
+          if (effects.length === 1)
+            throw new BudgetLedgerError(
+              'admission_failed',
+              'The persistent budget store failed; nothing was changed.',
+              Object.assign(new Error('could not serialize access'), { code: '40001' }),
+            );
+          return 'charged';
+        },
+      },
+    };
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'charge', args: {} }] }, { text: 'Charged.' }],
+    });
+    const options = { model, tools, store, runId: 'contended' };
+    const first = await runHeadless({ ...options, prompt: 'Charge.' });
+    expect(first).toMatchObject({
+      outcome: 'failed',
+      retry: { cause: 'admission', phase: 'running', resumeWith: 'retryFailed' },
+    });
+    const stopped = await resumeHeadless({ ...options, retryFailed: true });
+    // Nothing was written: the stored run still failed, and the next resume
+    // needs retryFailed again, with an answer for the unknown effect.
+    expect(stopped).toMatchObject({
+      status: 'stopped',
+      reason: 'tool-reconciliation-required',
+      outcome: 'pending',
+      phase: 'terminal',
+      retry: first.retry,
+    });
+    const effect = stopped.pending[0];
+    if (effect?.kind !== 'unknown-effect') throw new Error('expected an unknown effect');
+    expect(effect.resumeWith).toEqual(['retryToolCallIds', 'reconciledToolResults']);
+    const done = await resumeHeadless({
+      ...options,
+      retryFailed: true,
+      reconciledToolResults: [{ toolCallId: effect.toolCallId, output: 'charged' }],
+    });
+    expect(done).toMatchObject({ outcome: 'completed', output: 'Charged.' });
+    expect(done.retry).toBeUndefined();
+    expect(effects).toEqual(['charge']);
   });
 });

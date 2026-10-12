@@ -20,6 +20,7 @@ import type {
   HeadlessOutcome,
   HeadlessPendingAction,
   HeadlessReport,
+  HeadlessRetry,
   ProjectInstructions,
   ProjectInstructionsOptions,
 } from '../src/node/headless';
@@ -67,6 +68,27 @@ describe('headless types (2.3 preview)', () => {
     void resumeHeadless({ model, store, runId: 'r', prompt: 'again' });
     // @ts-expect-error a resume names its run
     void resumeHeadless({ model, store });
+  });
+
+  it('answers an unknown effect either way, and retries a run that failed in transit', () => {
+    expectTypeOf<
+      Extract<HeadlessPendingAction, { kind: 'unknown-effect' }>['resumeWith']
+    >().toEqualTypeOf<['retryToolCallIds', 'reconciledToolResults']>();
+    expectTypeOf<HeadlessReport['retry']>().toEqualTypeOf<HeadlessRetry | undefined>();
+    expectTypeOf<HeadlessRetry>().toEqualTypeOf<{
+      cause: 'model-call' | 'admission';
+      phase: 'running' | 'finalizing';
+      resumeWith: 'retryFailed';
+    }>();
+    void resumeHeadless({
+      model,
+      store,
+      runId: 'r',
+      reconciledToolResults: [{ toolCallId: 'call_1', output: { charged: 5 } }],
+    });
+    void resumeHeadless({ model, store, runId: 'r', retryFailed: true });
+    // @ts-expect-error a recorded result names its call
+    void resumeHeadless({ model, store, runId: 'r', reconciledToolResults: [{ output: 1 }] });
   });
 
   it('keeps runAgent typing: a typed output is required', () => {

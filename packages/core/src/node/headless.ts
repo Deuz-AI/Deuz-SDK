@@ -13,6 +13,7 @@
 import type {
   AgentEvent,
   AgentResult,
+  AgentRunEnvelope,
   AgentRunOptions,
   AgentRunSession,
   AgentRunStore,
@@ -47,6 +48,7 @@ export {
   type HeadlessOutcome,
   type HeadlessPendingAction,
   type HeadlessReport,
+  type HeadlessRetry,
 } from '../headless/report';
 export type {
   DoctorFinding,
@@ -405,9 +407,9 @@ async function report(
   }
   const result: AgentResult<unknown> = await stream.result;
   if (callbackError) throw callbackError.error;
-  let phase: HeadlessReport['phase'];
+  let stored: AgentRunEnvelope | undefined;
   try {
-    phase = (await session.store.load(session.runId))?.phase;
+    stored = await session.store.load(session.runId);
   } catch (error) {
     warnings.add(
       {
@@ -419,7 +421,7 @@ async function report(
   }
   return reportFromResult(result, {
     scope: session.scope,
-    ...(phase !== undefined ? { phase } : {}),
+    ...(stored ? { stored } : {}),
     warnings: warnings.list(),
   });
 }
@@ -490,8 +492,14 @@ export async function runHeadless<T = string>(
 
 /**
  * Continue a stored native run (2.3 preview): `resumeStreamAgent` with the
- * verdicts, client results or `retryToolCallIds` the previous report's
- * `pending` asked for, reported like {@link runHeadless}.
+ * answers the previous report asked for, reported like {@link runHeadless}.
+ * Each pending action names its option (`approvalResponses`,
+ * `clientToolResults`, and `retryToolCallIds` or `reconciledToolResults` for
+ * an unknown effect); a report with `retry` takes `retryFailed: true`. An
+ * answer the run cannot take (a call it does not wait on, a call both run
+ * again and recorded, a retry of a failure that was not transient) fails the
+ * leg with a TypeError before anything is written: the stored run stays as
+ * it was.
  */
 export async function resumeHeadless<T = string>(
   options: HeadlessResumeOptions<T>,
