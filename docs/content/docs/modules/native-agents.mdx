@@ -819,8 +819,12 @@ records the model the run calls now (`selected`) and the version of these rules
 (`policy: 1`).
 
 Every attempt is admitted against the run's execution. A failed attempt's budget
-hold stays counted, so a fallback never exceeds the shared budget, and a child
-run's attempts count in its parent's ledger under its parent's model policy. Each
+hold stays counted when the provider may have billed it (a 5xx or 529 answer, a
+network error, a transport timeout), so a fallback never exceeds the shared
+budget; an answer the provider does not bill, such as a 429, releases the hold,
+and an open breaker reserves nothing (see
+[Open holds](/docs/modules/budgets#open-holds)). A child run's attempts count in
+its parent's ledger under its parent's model policy. Each
 candidate gets the call's `capabilities` override and is sent with its own request
 profile and object strategy (a Claude 5.x fallback, for example, drops the
 sampling parameters it rejects). Reasoning crosses models only as each wire
