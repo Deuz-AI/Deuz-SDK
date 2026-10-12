@@ -296,6 +296,65 @@ describe('runHeadless with project instructions and skills', () => {
     expect(text).toContain('Answer in one sentence.');
   });
 
+  it("with role 'user', puts the project instructions in a user message ahead of the prompt", async () => {
+    await put('proj/AGENTS.md', 'Answer in one sentence.');
+    const loaded = await loadProjectInstructions(join(base, 'proj'), { role: 'user' });
+    expect(loaded.message).toEqual({
+      role: 'user',
+      content: (await loadProjectInstructions(join(base, 'proj'))).message!.content,
+    });
+
+    const store = createInMemoryAgentRunStore();
+    const report = await runHeadless({
+      model: createMockModel({ responses: [{ text: 'ok' }] }),
+      instructions: 'You are a release bot.',
+      prompt: 'Ship it.',
+      projectDir: join(base, 'proj'),
+      projectInstructions: { role: 'user' },
+      store,
+      runId: 'as-user',
+    });
+    expect(report.outcome).toBe('completed');
+    const messages = (await store.load('as-user'))!.messages;
+    expect(messages.slice(0, 3)).toEqual([
+      { role: 'system', content: 'You are a release bot.' },
+      loaded.message,
+      { role: 'user', content: 'Ship it.' },
+    ]);
+  });
+
+  it("with role 'user', puts the project instructions ahead of the given messages", async () => {
+    await put('proj/AGENTS.md', 'Answer in one sentence.');
+    const history: Message[] = [
+      { role: 'user', content: 'Plan the release.' },
+      { role: 'assistant', content: 'Tag, build, publish.' },
+      { role: 'user', content: 'Go.' },
+    ];
+    const store = createInMemoryAgentRunStore();
+    await runHeadless({
+      model: createMockModel({ responses: [{ text: 'ok' }] }),
+      messages: history,
+      projectDir: join(base, 'proj'),
+      projectInstructions: { role: 'user' },
+      store,
+      runId: 'as-user-history',
+    });
+    const messages = (await store.load('as-user-history'))!.messages;
+    expect(messages[0]).toMatchObject({ role: 'user' });
+    expect(messages[0]!.content).toContain('Answer in one sentence.');
+    expect(messages.slice(1, 4)).toEqual(history);
+    expect(JSON.stringify(messages.filter((m) => m.role === 'system'))).not.toContain(
+      'Answer in one sentence.',
+    );
+  });
+
+  it('rejects a role other than system or user', async () => {
+    await put('proj/AGENTS.md', 'x');
+    await expect(
+      loadProjectInstructions(join(base, 'proj'), { role: 'assistant' as 'user' }),
+    ).rejects.toThrow(TypeError);
+  });
+
   it('offers the skill catalog and loads a skill body on demand, across a resume', async () => {
     await put(
       'skills/release-notes/SKILL.md',

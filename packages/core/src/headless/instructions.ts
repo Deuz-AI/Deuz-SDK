@@ -1,7 +1,8 @@
 /**
  * Project instructions for headless runs (2.3 preview, 23.8): the text of the
- * project's AGENTS.md / CLAUDE.md files as one system message, under a byte
- * cap. Pure and edge-safe: the Node entry finds and reads the files.
+ * project's AGENTS.md / CLAUDE.md files as one system message (or, opted in,
+ * one user message), under a byte cap. Pure and edge-safe: the Node entry
+ * finds and reads the files.
  */
 
 /** Where `loadProjectInstructions` looks, and how much it reads (2.3 preview). */
@@ -20,6 +21,14 @@ export interface ProjectInstructionsOptions {
   maxBytes?: number;
   /** The files read in each directory, in this order. Default `['AGENTS.md', 'CLAUDE.md']`. */
   fileNames?: readonly string[];
+  /**
+   * The message's role. `'system'` (the default) gives the files the trust of
+   * your own instructions. `'user'` delivers them as user-role context, as
+   * Claude Code and Codex do, which the model weighs below the system message;
+   * `runHeadless` then puts it ahead of the run's input. Neither role makes
+   * the files of a checkout you do not trust safe to load.
+   */
+  role?: 'system' | 'user';
 }
 
 /** One instruction file found (2.3 preview). */
@@ -46,8 +55,8 @@ export interface ProjectInstructions {
    * junction) leads the file, or a directory on its way, outside the root.
    */
   skipped: { path: string; relativePath: string; reason: 'outside-root' }[];
-  /** The system message; absent when no file has text. */
-  message?: { role: 'system'; content: string };
+  /** The message (`options.role`, default `'system'`); absent when no file has text. */
+  message?: { role: 'system' | 'user'; content: string };
 }
 
 export const DEFAULT_INSTRUCTION_FILES: readonly string[] = Object.freeze([
@@ -85,11 +94,19 @@ function cut(bytes: Uint8Array, limit: number): Uint8Array {
 export function renderProjectInstructions(
   root: string,
   sources: readonly InstructionSource[],
-  maxBytes: number,
-  skipped: ProjectInstructions['skipped'] = [],
+  {
+    maxBytes,
+    role = 'system',
+    skipped = [],
+  }: {
+    maxBytes: number;
+    role?: ProjectInstructionsOptions['role'];
+    skipped?: ProjectInstructions['skipped'];
+  },
 ): ProjectInstructions {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1)
     throw new TypeError('maxBytes must be a positive integer.');
+  if (role !== 'system' && role !== 'user') throw new TypeError("role must be 'system' or 'user'.");
   const seen = new Set<string>();
   const kept: { source: InstructionSource; bytes: Uint8Array }[] = [];
   for (const source of sources) {
@@ -125,8 +142,6 @@ export function renderProjectInstructions(
     root,
     files,
     skipped,
-    ...(blocks.length > 0
-      ? { message: { role: 'system' as const, content: [HEADER, ...blocks].join('\n\n') } }
-      : {}),
+    ...(blocks.length > 0 ? { message: { role, content: [HEADER, ...blocks].join('\n\n') } } : {}),
   };
 }

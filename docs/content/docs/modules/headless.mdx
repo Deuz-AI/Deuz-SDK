@@ -201,9 +201,22 @@ console.log(project.message?.role); // 'system'
   The files nearest `dir` are kept whole first; an outer file over the cap is
   cut at a character boundary, with a `[truncated: N more bytes not loaded]`
   line, or left out. `files[].truncated` and `includedBytes` say which.
+- **Role.** `role: 'user'` makes `message` a user message; `runHeadless`
+  (`projectInstructions: { role: 'user' }`) then puts it ahead of the `prompt`
+  or `messages` instead of into the system message.
 
 Only the first leg loads them: they are part of the stored transcript, so a
 resume does not read them again.
+
+<Callout type="warn" title="Untrusted checkouts">
+The files get the trust of the system message, the same as your own
+`instructions`: whoever can change them, a pull request from a fork for
+example, can steer the run and the tools it calls. Before you load a checkout
+you do not trust, review its `AGENTS.md` and `CLAUDE.md` files, or leave
+`projectDir` out. `role: 'user'` delivers them as user-role context instead, as
+Claude Code and Codex do, and the model weighs that below your `instructions`;
+it still reads them, so the role does not make them safe.
+</Callout>
 
 ## Skills
 
@@ -213,8 +226,8 @@ read with `nodeSkillSource`. The first leg lists them in the system message
 skill's body and `read_skill_resource` a text file bundled with it. Both read
 only skills the list holds, and only files whose real path is inside the
 skill's folder: a link that leads out of it is refused. Both are
-`replay: 'idempotent'`. A tool of your own cannot take either name. Pass the same `skills` when resuming: the tools
-are part of the run's binding.
+`replay: 'idempotent'`. A tool of your own cannot take either name. Pass the
+same `skills` when resuming: the tools are part of the run's binding.
 
 ## doctor
 

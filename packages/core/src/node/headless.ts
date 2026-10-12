@@ -20,6 +20,7 @@ import type {
   AgentToolSet,
 } from '../types/agent-run';
 import type { Dependencies } from '../types/deps';
+import type { Message } from '../types/message';
 import type { CallWarning } from '../types/methods';
 import { resumeStreamAgent, streamAgent } from '../agent-run';
 import { createPriceProvider } from '../pricing';
@@ -120,17 +121,25 @@ async function gitRoot(fs: NodeFs, path: NodePath, start: string): Promise<strin
 }
 
 /**
- * The project's instruction files as one system message (2.3 preview). Reads
- * `AGENTS.md`, then `CLAUDE.md`, in every directory from the root down to
- * `dir`: the root is the nearest directory holding `.git` (only `dir` outside a
- * repository) unless `options.root` names one. Outer files come first, so the
- * text nearest `dir` comes last and wins a conflict; files below `dir` are not
- * read, and `@path` imports are not expanded. A file that repeats an earlier
- * one's text is included once. The text is capped at `maxBytes` (32 KiB),
- * keeping the files nearest `dir` whole first. A link (a symlink, a junction)
- * is followed only while it stays inside the root: a file whose real path is
- * outside the root's is not read, and `skipped` lists it. Rejects with a
- * TypeError when `dir` is not a directory.
+ * The project's instruction files as one system message, or a user message
+ * with `role: 'user'` (2.3 preview). Reads `AGENTS.md`, then `CLAUDE.md`, in
+ * every directory from the root down to `dir`: the root is the nearest
+ * directory holding `.git` (only `dir` outside a repository) unless
+ * `options.root` names one. Outer files come first, so the text nearest `dir`
+ * comes last and wins a conflict; files below `dir` are not read, and `@path`
+ * imports are not expanded. A file that repeats an earlier one's text is
+ * included once. The text is capped at `maxBytes` (32 KiB), keeping the files
+ * nearest `dir` whole first. A link (a symlink, a junction) is followed only
+ * while it stays inside the root: a file whose real path is outside the
+ * root's is not read, and `skipped` lists it. Rejects with a TypeError when
+ * `dir` is not a directory.
+ *
+ * Trust: the files get the trust of a system message, like your own
+ * instructions, so whoever can change them (a pull request from a fork) can
+ * steer the run and its tools. Review the AGENTS.md and CLAUDE.md files of a
+ * checkout you do not trust before loading them, or do not load them;
+ * `role: 'user'` lowers them to user-role context, which the model weighs
+ * below the system message, but it does not make them safe.
  */
 export async function loadProjectInstructions(
   dir: string,
@@ -175,12 +184,11 @@ export async function loadProjectInstructions(
       }
     }
   }
-  return renderProjectInstructions(
-    root,
-    sources,
-    options.maxBytes ?? DEFAULT_INSTRUCTION_BYTES,
+  return renderProjectInstructions(root, sources, {
+    maxBytes: options.maxBytes ?? DEFAULT_INSTRUCTION_BYTES,
+    role: options.role,
     skipped,
-  );
+  });
 }
 
 /** The tools a headless run gets for its `skills`. */
@@ -323,11 +331,15 @@ export type HeadlessRunOptions<T = string> = AgentRunOptions<T> &
     /**
      * Load the project's AGENTS.md / CLAUDE.md files from this directory
      * ({@link loadProjectInstructions}) into the system message, after
-     * `instructions` and before the skills list. A file that a link leads
-     * outside the project root is left out and reported in `warnings`.
+     * `instructions` and before the skills list; with
+     * `projectInstructions.role: 'user'`, into a user message ahead of the
+     * input instead. They get that message's trust: see the caveat on
+     * {@link loadProjectInstructions} before loading a checkout you do not
+     * trust. A file that a link leads outside the project root is left out and
+     * reported in `warnings`.
      */
     projectDir?: string;
-    /** How {@link loadProjectInstructions} searches `projectDir`. */
+    /** How {@link loadProjectInstructions} searches `projectDir`, and the message's role. */
     projectInstructions?: ProjectInstructionsOptions;
     session?: never;
   };
@@ -349,6 +361,22 @@ export type HeadlessResumeOptions<T = string> = AgentRunOptions<T> &
 /** Price model calls with the bundled table unless the caller brought a price provider. */
 function pricedDeps(deps: Dependencies | undefined): Dependencies {
   return deps?.priceProvider ? deps : { ...deps, priceProvider: createPriceProvider() };
+}
+
+/**
+ * The run's input with `context` as its first user message, ahead of the
+ * `messages` or the `prompt` (which becomes a user turn of its own). Input
+ * `runAgent` rejects (none, or both) is left as it is, so the run reports it.
+ */
+function withContext(
+  input: { prompt?: string; messages?: Message[] },
+  context: Message,
+): { prompt?: undefined; messages?: Message[] } {
+  const prompt = typeof input.prompt === 'string' && input.prompt !== '';
+  const messages = input.messages !== undefined && input.messages.length > 0;
+  if (prompt === messages) return {};
+  const turns = prompt ? [{ role: 'user', content: input.prompt! } as Message] : input.messages!;
+  return { prompt: undefined, messages: [context, ...turns] };
 }
 
 /**
@@ -421,10 +449,11 @@ function split<O extends HeadlessSessionOptions & { runId?: string; deps?: Depen
  * Start a native run (2.3 preview): `streamAgent` with a durable session, its
  * events drained, and a {@link HeadlessReport} of the result. The system
  * message is `instructions`, then the project instructions of `projectDir`,
- * then the skills list. Calls are priced with the bundled table unless
- * `deps.priceProvider` is given. Whatever happens to the run is in the report;
- * it rejects only when the project files or skills cannot be read, a tool
- * takes a skill tool's name, or `onEvent` threw.
+ * then the skills list; with `projectInstructions.role: 'user'`, the project
+ * instructions are the first user message instead. Calls are priced with the
+ * bundled table unless `deps.priceProvider` is given. Whatever happens to the
+ * run is in the report; it rejects only when the project files or skills
+ * cannot be read, a tool takes a skill tool's name, or `onEvent` threw.
  */
 export async function runHeadless<T = string>(
   options: HeadlessRunOptions<T>,
@@ -436,11 +465,14 @@ export async function runHeadless<T = string>(
       ? await loadProjectInstructions(projectDir, projectInstructions)
       : undefined;
   const loaded = skills?.length ? await loadSkills(skills, agent.tools, true) : undefined;
-  const system = [agent.instructions, project?.message?.content, loaded?.catalog]
+  const message = project?.message;
+  const context = message?.role === 'user' ? message : undefined;
+  const system = [agent.instructions, context ? undefined : message?.content, loaded?.catalog]
     .filter((text): text is string => typeof text === 'string' && text !== '')
     .join('\n\n');
   const stream = streamAgent({
     ...(agent as AgentRunOptions<T>),
+    ...(context ? withContext(agent, context) : {}),
     ...(system ? { instructions: system } : {}),
     ...(loaded ? { tools: loaded.tools } : {}),
     deps: pricedDeps(agent.deps),
