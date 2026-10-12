@@ -4,13 +4,13 @@
  * model fail-over (23.4) and of the UI bridge (23.5).
  */
 import type { EvalTaskManifest } from '../../../src/testing';
+import { compactionPreservedThinking } from './compaction-boundaries';
+import { fallbackBudgetSettlement, providerFallback } from './fallback-boundaries';
 import {
   mcpRefreshListFailure,
   mcpRefreshRecordFailure,
   mcpRefreshRecordFailureAccepted,
 } from './mcp-boundaries';
-import { compactionPreservedThinking } from './compaction-boundaries';
-import { fallbackBudgetSettlement, providerFallback } from './fallback-boundaries';
 import { memoryScopeSharedContext, memoryScopeWidened } from './memory-boundaries';
 import {
   childInitialization,
@@ -38,6 +38,7 @@ import {
   afterReceipt,
   beforeDispatch,
 } from './tool-boundaries';
+import { uiDisconnectReplay } from './ui-boundaries';
 
 export const faultScenarios: readonly EvalTaskManifest[] = [
   beforeDispatch,
@@ -68,4 +69,5 @@ export const faultScenarios: readonly EvalTaskManifest[] = [
   providerFallback,
   fallbackBudgetSettlement,
   compactionPreservedThinking,
+  uiDisconnectReplay,
 ];
