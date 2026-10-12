@@ -165,7 +165,9 @@ const getWeather = tool({
 // REAL PROVIDER: delete `webSocket: scriptedServer` from `deps` and pass a key:
 //   model: createOpenAIRealtime({ apiKey: process.env.OPENAI_API_KEY })('gpt-realtime'),
 // Node >= 22 sends it as a handshake header. A browser connects with an
-// `ephemeralToken` minted on your server instead (see the README).
+// `ephemeralToken` minted on your server instead (see the README). Then give
+// step 2 a real question: its audio is silence, in which a real model hears no
+// question. Append microphone audio (PCM16, 24 kHz, mono), or ask with sendText().
 const session = createRealtimeSession({
   model: createOpenAIRealtime({ apiKey: 'offline' })('gpt-realtime'), // the scripted server ignores it
   instructions: 'You are a terse weather assistant.',
@@ -234,22 +236,42 @@ session.on('*', (event) => console.log(`   ${describe(event)}`));
 async function until(stop: (event: RealtimeEvent) => boolean): Promise<void> {
   for await (const event of session.events()) if (stop(event)) return;
 }
-const responseDone = (id: string) =>
-  until((event) => event.type === 'response-done' && event.responseId === id);
+
+/**
+ * Resolves once the model has answered: on a `response-done` when no tool call
+ * waits for its result and the model has gone on since the last result went
+ * back (in a new response, or later in the same turn). The server names its
+ * responses, so this follows the order of the events, not a response id.
+ */
+function nextAnswer(): Promise<void> {
+  const running = new Set<string>(); // tool calls whose result has not gone back yet
+  let replied = true; // false from a tool result until the model's next response or output
+  return until((event) => {
+    if (event.type === 'tool-call') running.add(event.toolCallId);
+    if (event.type === 'tool-call-cancelled') event.toolCallIds.forEach((id) => running.delete(id));
+    if (event.type === 'tool-result') {
+      running.delete(event.toolCallId);
+      replied = false;
+    }
+    if (['response-started', 'audio-delta', 'text-delta'].includes(event.type)) replied = true;
+    return event.type === 'response-done' && running.size === 0 && replied;
+  });
+}
 
 console.log('1) connect: the session dials the socket and configures the model');
 await session.connect();
 
 console.log('\n2) the user asks out loud: 1.2 s of audio, then commitAudio() and createResponse()');
-const answered = responseDone('resp_2'); // the tool round trip, then the spoken answer
-// A real app streams microphone chunks as they arrive (PCM16, 24 kHz, mono).
+const answered = nextAnswer(); // the tool round trip, then the spoken answer
+// A real app streams microphone chunks as they arrive (PCM16, 24 kHz, mono);
+// this scripted server answers the 1.2 s of silence below as if it were a question.
 for (let chunk = 0; chunk < 3; chunk++) session.appendAudio(new Int16Array(samples(400)));
 session.commitAudio(); // manual turn detection: the app says when the user is done
 session.createResponse();
 await answered;
 
 console.log('\n3) the user types a follow-up: sendText() adds a user turn and asks for an answer');
-const thanked = responseDone('resp_3');
+const thanked = nextAnswer();
 session.sendText('Thanks, that is all.');
 await thanked;
 

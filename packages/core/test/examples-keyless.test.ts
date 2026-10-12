@@ -1,9 +1,11 @@
 /**
- * The keyless 2.3 examples (14-16) run end to end and print what they show.
- * The examples import the package by name; here those imports load the
- * sources, so no build is needed. Each example runs once, on import.
+ * The keyless 2.3 examples (14-16) run end to end and print what they show,
+ * and 17 runs against offline stand-ins for the real providers its README
+ * swaps in. The examples import the package by name; here those imports load
+ * the sources, so no build is needed. Each run is a fresh import of the example.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { RealtimeSessionOptions, RealtimeWebSocketFactory } from '../src/realtime/index';
 
 vi.mock('@deuz-sdk/core', () => import('../src/index'));
 vi.mock('@deuz-sdk/core/agent', () => import('../src/agent'));
@@ -13,22 +15,143 @@ vi.mock('@deuz-sdk/core/memory', () => import('../src/memory'));
 vi.mock('@deuz-sdk/core/openai', () => import('../src/openai'));
 vi.mock('@deuz-sdk/core/ops', () => import('../src/ops'));
 vi.mock('@deuz-sdk/core/ops/sqlite', () => import('../src/node/ops-sqlite'));
+vi.mock('@deuz-sdk/core/pricing', () => import('../src/pricing'));
 vi.mock('@deuz-sdk/core/schedule', () => import('../src/schedule'));
 vi.mock('@deuz-sdk/core/testing', () => import('../src/testing'));
 vi.mock('@deuz-sdk/core/ui', () => import('../src/ui'));
 
+/**
+ * Example 17's REAL PROVIDER swap, still offline. `serverNamesResponses`: the
+ * server picks its own response ids, as the OpenAI Realtime endpoint does; every
+ * frame of the scripted socket passes through with only those ids renamed.
+ * `gemini`: the session talks to a scripted Gemini Live server instead, where the
+ * answer to a tool result continues the tool call's turn or is a turn of its own.
+ */
+const provider = vi.hoisted(() => ({
+  serverNamesResponses: false,
+  gemini: undefined as 'same turn' | 'own turn' | undefined,
+}));
+vi.mock('@deuz-sdk/core/realtime', async () => {
+  const real = await import('../src/realtime/index');
+  const serverNamed =
+    (factory: RealtimeWebSocketFactory): RealtimeWebSocketFactory =>
+    (url, init) => {
+      const socket = factory(url, init);
+      return {
+        get readyState() {
+          return socket.readyState;
+        },
+        send: (data) => socket.send(data),
+        close: (code, reason) => socket.close(code, reason),
+        addEventListener: (type, listener) =>
+          socket.addEventListener(type, (event) =>
+            listener(
+              type === 'message'
+                ? {
+                    data: String((event as { data: unknown }).data).replace(
+                      /"resp_(\d+)"/g,
+                      '"resp_Cq7$1Zk"',
+                    ),
+                  }
+                : event,
+            ),
+          ),
+      };
+    };
+  const geminiServer =
+    (answer: 'same turn' | 'own turn'): RealtimeWebSocketFactory =>
+    () => {
+      const listeners: Record<string, ((event: unknown) => void)[]> = {};
+      const fire = (type: string, event: unknown) => listeners[type]?.forEach((fn) => fn(event));
+      const reply = (...messages: object[]) => {
+        for (const message of messages)
+          setTimeout(() => fire('message', { data: JSON.stringify(message) }));
+      };
+      const turnComplete = { serverContent: { turnComplete: true } };
+      const speak = (text: string) => [
+        {
+          serverContent: {
+            modelTurn: {
+              parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: 'AAAA' } }],
+            },
+          },
+        },
+        { serverContent: { outputTranscription: { text } } },
+        turnComplete,
+      ];
+      const call = {
+        functionCalls: [{ id: 'fc_1', name: 'get_weather', args: { city: 'Istanbul' } }],
+      };
+      setTimeout(() => fire('open', {}));
+      return {
+        readyState: 1,
+        addEventListener: (type, fn) => void (listeners[type] ??= []).push(fn),
+        send(data) {
+          const message = JSON.parse(data) as {
+            setup?: object;
+            clientContent?: { turns?: object[]; turnComplete?: boolean };
+            toolResponse?: object;
+          };
+          if (message.setup) reply({ setupComplete: {} });
+          else if (message.toolResponse) reply(...speak('Sunny and 24 degrees in Istanbul.'));
+          else if (message.clientContent?.turns) reply(...speak('You are welcome!'));
+          else if (message.clientContent?.turnComplete) {
+            reply({ toolCall: call }, ...(answer === 'own turn' ? [turnComplete] : []));
+          }
+        },
+        close: (code = 1000, reason = '') => void setTimeout(() => fire('close', { code, reason })),
+      };
+    };
+  return {
+    ...real,
+    createOpenAIRealtime: (settings: Parameters<typeof real.createOpenAIRealtime>[0]) =>
+      provider.gemini ? real.createGeminiLive(settings) : real.createOpenAIRealtime(settings),
+    createRealtimeSession: (options: RealtimeSessionOptions) => {
+      const scripted = options.deps?.webSocket;
+      const webSocket = provider.gemini
+        ? geminiServer(provider.gemini)
+        : provider.serverNamesResponses && scripted
+          ? serverNamed(scripted)
+          : scripted;
+      return real.createRealtimeSession({ ...options, deps: { ...options.deps, webSocket } });
+    },
+  };
+});
+
 const example = (name: string): string =>
   new URL(`../../../examples/${name}/index.ts`, import.meta.url).href;
 
-/** Run an example once and return what it printed, one entry per console.log call. */
-async function run(name: string): Promise<string[]> {
+/**
+ * Start an example once. `lines` collects what it prints, one entry per
+ * console.log call; `done` settles when its last line has run.
+ */
+function start(name: string): { lines: string[]; done: Promise<unknown> } {
   const lines: string[] = [];
   vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
     lines.push(args.map(String).join(' '));
   });
   vi.resetModules();
-  await import(/* @vite-ignore */ example(name));
+  return { lines, done: import(/* @vite-ignore */ example(name)) };
+}
+
+/** Run an example once and return what it printed, one entry per console.log call. */
+async function run(name: string): Promise<string[]> {
+  const { lines, done } = start(name);
+  await done;
   return lines;
+}
+
+/** Whether an example finished within `ms`, or still waits for something. */
+async function finishes(done: Promise<unknown>, ms: number): Promise<'finished' | 'still waiting'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const waiting = new Promise<'still waiting'>((resolve) => {
+    timer = setTimeout(() => resolve('still waiting'), ms);
+  });
+  try {
+    return await Promise.race([done.then(() => 'finished' as const), waiting]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 afterEach(() => {
@@ -160,4 +283,62 @@ describe('examples/16-goals-and-wakeups', () => {
     expect(later).not.toContain('[tool]');
     expect(later).toContain('worker A: nightly-links@1791943200000 (2026-10-14 02:00) ran');
   }, 30_000);
+});
+
+describe('examples/17-realtime-offline', () => {
+  /** Run 17 against the stand-in for its real provider: it must get to its last step. */
+  async function swapped(): Promise<string[]> {
+    const { lines, done } = start('17-realtime-offline');
+    // Offline it takes well under a second; a wait for an id only the script uses never ends.
+    expect(await finishes(done, 10_000), lines.join('\n')).toBe('finished');
+    return lines;
+  }
+
+  it('waits on the order of events, so a server that names its own responses gets to the end', async () => {
+    provider.serverNamesResponses = true;
+    try {
+      const lines = await swapped();
+      const asked = section(lines, 2);
+      const followUp = section(lines, 3);
+
+      // The tool round trip and the whole spoken answer belong to step 2.
+      expect(asked).toContain('tool-call: get_weather({"city":"Istanbul"})');
+      expect(asked).toContain('[tool] get_weather(Istanbul) runs in this process');
+      expect(asked).toContain('output-transcript-done: "Sunny and 24 degrees in Istanbul."');
+      expect(asked).toMatch(/response-done \(resp_Cq72Zk, completed\)$/);
+      // The follow-up's answer, then the close.
+      expect(followUp).toContain('output-transcript-done: "You are welcome!"');
+      expect(followUp).toMatch(/response-done \(resp_Cq73Zk, completed\)$/);
+      expect(section(lines, 4)).toContain(
+        'session-closed (1000 client closed, closed by the client)',
+      );
+    } finally {
+      provider.serverNamesResponses = false;
+    }
+  }, 30_000);
+
+  it.each([
+    ["continues the tool call's turn", 'same turn'],
+    ['is a turn of its own', 'own turn'],
+  ] as const)(
+    'gets to the end on a Gemini Live wire where the answer to a tool result %s',
+    async (_answer, turn) => {
+      provider.gemini = turn;
+      try {
+        const lines = await swapped();
+        const asked = section(lines, 2);
+        expect(asked).toContain('[tool] get_weather(Istanbul) runs in this process');
+        expect(asked).toMatch(
+          /"Sunny and 24 degrees in Istanbul\."[\s\S]*response-done \(\S+, completed\)$/,
+        );
+        expect(section(lines, 3)).toMatch(
+          /"You are welcome!"[\s\S]*response-done \(\S+, completed\)$/,
+        );
+        expect(section(lines, 4)).toContain('session-closed');
+      } finally {
+        provider.gemini = undefined;
+      }
+    },
+    30_000,
+  );
 });
