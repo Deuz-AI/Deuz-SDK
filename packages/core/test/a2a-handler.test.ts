@@ -625,6 +625,24 @@ describe('createA2AHandler — turns of one task', () => {
     ]);
   });
 
+  // Only a status update ends a turn, as in the official SDK: until the turn
+  // changes the status, the task still shows the previous turn's INPUT_REQUIRED.
+  it('keeps a follow-up turn open when it adds an artifact before changing the status', async () => {
+    const { handler, errors } = handlerWith(async (ctx) => {
+      if (!ctx.task) return ctx.requireInput('Which city?');
+      await ctx.artifact({ artifactId: 'forecast', parts: [{ text: 'Sunny in Izmir.' }] });
+      await ctx.complete('Here is the forecast.');
+    });
+    const asked = ((await send(handler, 'weather?')).result as { task: A2ATask }).task;
+    const done = ((await send(handler, 'Izmir', { taskId: asked.id })).result as { task: A2ATask })
+      .task;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(done.artifacts).toEqual([
+      { artifactId: 'forecast', parts: [{ text: 'Sunny in Izmir.' }] },
+    ]);
+    expect(errors).toEqual([]);
+  });
+
   it('refuses a message to an unknown task with TASK_NOT_FOUND', async () => {
     const { handler } = handlerWith((ctx) => ctx.complete());
     const body = await send(handler, 'hi', { taskId: 'missing' });
@@ -1444,6 +1462,21 @@ describe('createA2AHandler — AUTH_REQUIRED', () => {
         }),
       },
     ]);
+  });
+
+  it('answers a blocking follow-up at a status update, not at an artifact', async () => {
+    const { handler } = handlerWith(async (ctx) => {
+      if (!ctx.task) return ctx.requireAuth('Sign in at https://auth.test');
+      await ctx.artifact({ artifactId: 'profile', parts: [{ text: 'Ada' }] });
+      await ctx.complete('Signed in and done.');
+    });
+    const task = ((await send(handler, 'hello')).result as { task: A2ATask }).task;
+    expect(task.status.state).toBe('TASK_STATE_AUTH_REQUIRED');
+    const done = (
+      (await send(handler, 'signed in', { taskId: task.id })).result as { task: A2ATask }
+    ).task;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(done.artifacts).toEqual([{ artifactId: 'profile', parts: [{ text: 'Ada' }] }]);
   });
 });
 

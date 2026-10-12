@@ -254,7 +254,10 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
 
   /**
    * Applies one change to the task: creates it first (SUBMITTED) when this is
-   * the interaction's first update, then saves and announces both.
+   * the interaction's first update, then saves and announces both. Only a
+   * status update ends or interrupts the turn, as in the official SDK: a
+   * follow-up turn's task shows the previous turn's `INPUT_REQUIRED` until
+   * this turn changes its status.
    */
   function mutate(turn: Turn, change: (task: A2ATask) => A2AStreamResponse): Promise<void> {
     return withLock(turn.key, async () => {
@@ -283,11 +286,13 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
         }
         task = structuredClone(stored);
       }
-      events.push(change(task));
+      const update = change(task);
+      events.push(update);
       await store.save(task, turn.scope);
       turn.task = task;
       turn.changed = true;
       for (const event of events) publish(turn, event);
+      if (update.statusUpdate === undefined) return;
       const state = task.status.state;
       if (isTerminalState(state) || state === 'TASK_STATE_INPUT_REQUIRED') end(turn);
       else if (state === 'TASK_STATE_AUTH_REQUIRED') turn.outcome.resolve(result(turn));
