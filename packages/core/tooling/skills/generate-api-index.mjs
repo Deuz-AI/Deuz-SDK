@@ -105,7 +105,7 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/batch':
     'Provider batch APIs (OpenAI, Anthropic, Gemini): submit, wait, read results, batch-tier pricing and budget holds.',
   '@deuz-sdk/core/a2a':
-    'Agent2Agent v1.0.0: call remote agents and serve your own over JSON-RPC or HTTP+JSON.',
+    'Agent2Agent v1.0.0: call remote agents and serve your own over JSON-RPC or HTTP+JSON, a native agent run as a task included.',
   '@deuz-sdk/core/headless':
     'Headless preview (Node only): run, resume and inspect native agent runs from a script, and check a model and its configuration first.',
   '@deuz-sdk/core/video': 'Video generation: submit, poll, download.',

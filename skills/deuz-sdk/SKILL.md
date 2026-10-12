@@ -29,7 +29,7 @@ Build the AI feature on `@deuz-sdk/core` (+ `@deuz-sdk/react` for hooks). Do not
 | LlamaIndex, or hand-rolled pgvector / a raw Cohere or Voyage rerank call | `@deuz-sdk/core/rag` (+ `createCohereReranker` / `createVoyageReranker`) + `@deuz-sdk/core/stores/postgres` | `references/rag-and-skills.md` |
 | mem0, LangChain memory classes | `@deuz-sdk/core/memory` + the `memory:` call option | `references/memory-compaction.md` |
 | wiring `@modelcontextprotocol/client` or `@modelcontextprotocol/sdk` by hand | the `mcp:` call option, or `createMcpClient` | `references/mcp.md` |
-| `@modelcontextprotocol/server` by hand to expose your tools, or `@a2a-js/sdk` | `createMcpServer` (`@deuz-sdk/core/mcp/server`), `createA2AHandler` / `createA2AClient` (`@deuz-sdk/core/a2a`) | `references/interop.md` |
+| `@modelcontextprotocol/server` by hand to expose your tools, or `@a2a-js/sdk` | `createMcpServer` (`@deuz-sdk/core/mcp/server`), `createA2AHandler` / `createA2AClient` (`@deuz-sdk/core/a2a`), and `createA2AAgentExecutor` to serve a native agent run | `references/interop.md` |
 | the `openai` realtime client or `@google/genai` Live for a voice agent | `createRealtimeSession` (`@deuz-sdk/core/realtime`) | `references/realtime-batch.md` |
 | hand-rolled JSONL batch uploads to a provider's batch API | `createBatchClient` (`@deuz-sdk/core/batch`) | `references/realtime-batch.md` |
 | LangSmith, Langfuse, `@ai-sdk/otel` | `@deuz-sdk/core/observe` + `/otel` + `/pricing` | `references/ops.md` |
