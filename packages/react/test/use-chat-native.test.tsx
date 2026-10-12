@@ -763,6 +763,133 @@ describe('useChat — the history after an approval answers the approved call (2
   });
 });
 
+describe('useChat — a server tool the leg ran is answered in the history (2.3)', () => {
+  /** A multi-step chat route over `streamChat` that records every posted body. */
+  function chatRoute(responses: MockResponse[], tools: Record<string, unknown>) {
+    const model = createMockModel({ responses });
+    const bodies: Body[] = [];
+    const fetchMock: typeof fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Body;
+      bodies.push(body);
+      return toDeuzStreamResponse(
+        streamChat({
+          model,
+          tools: tools as never,
+          maxSteps: 5,
+          messages: body.messages,
+          ...(body.approvalResponses ? { approvalResponses: body.approvalResponses as never } : {}),
+        }),
+      );
+    };
+    return { fetch: fetchMock, bodies };
+  }
+
+  it('on a chat route: the follow-up request carries the call and its result', async () => {
+    const route = chatRoute(
+      [
+        { toolCalls: [{ toolName: 'lookup', id: 'l1', args: { q: 'x' } }] },
+        { text: 'Found it.' },
+        { text: 'Anytime.' },
+      ],
+      { lookup: { description: 'Look up.', parameters, execute: () => 'found' } },
+    );
+    const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: route.fetch }));
+    await act(async () => {
+      await result.current.sendMessage('find x');
+    });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Found it.'));
+    await act(async () => {
+      await result.current.sendMessage('thanks');
+    });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Anytime.'));
+    // Before 2.3 the tool_use went out with no tool_result, which providers reject.
+    expect(route.bodies[1]!.messages).toEqual([
+      { role: 'user', content: 'find x' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'l1', name: 'lookup', input: { q: 'x' } },
+          { type: 'text', text: 'Found it.' },
+        ],
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'l1', result: 'found' }] },
+      { role: 'user', content: 'thanks' },
+    ]);
+  });
+
+  it('on a chat route, an approval continuation does not run that call again', async () => {
+    const lookup = vi.fn(() => 'found');
+    const route = chatRoute(
+      [
+        { toolCalls: [{ toolName: 'lookup', id: 'l1', args: {} }] },
+        { toolCalls: [{ toolName: 'del', id: 'd1', args: {} }] },
+        { text: 'Deleted.' },
+      ],
+      {
+        lookup: { description: 'Look up.', parameters, execute: lookup },
+        del: { description: 'Delete.', parameters, needsApproval: true, execute: () => 'deleted' },
+      },
+    );
+    const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: route.fetch }));
+    await act(async () => {
+      await result.current.sendMessage('look up, then delete');
+    });
+    await waitFor(() => expect(result.current.pendingApprovals).toHaveLength(1));
+    expect(lookup).toHaveBeenCalledTimes(1);
+    const { approvalId } = result.current.pendingApprovals[0]!;
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId, approved: true });
+    });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Deleted.'));
+    // The continuation settles every call its history leaves open: before 2.3
+    // that included `lookup`, which the first leg had run already.
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(route.bodies[1]!.messages.slice(1)).toEqual([
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'l1', name: 'lookup', input: {} },
+          { type: 'tool_use', id: 'd1', name: 'del', input: {} },
+        ],
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'l1', result: 'found' }] },
+    ]);
+  });
+
+  it('on a native route: a follow-up run starts from a history that answers the call', async () => {
+    const route = nativeRoute(
+      [
+        { toolCalls: [{ toolName: 'lookup', id: 'l1', args: {} }] },
+        { text: 'Found it.' },
+        { text: 'Anytime.' },
+      ],
+      { lookup: { description: 'Look up.', parameters, execute: () => 'found' } },
+    );
+    const { result } = renderHook(() => useChat({ api: '/api/agent', fetch: route.fetch }));
+    await act(async () => {
+      await result.current.sendMessage('find x');
+    });
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    await act(async () => {
+      await result.current.sendMessage('thanks');
+    });
+    await waitFor(() => expect(route.bodies).toHaveLength(2));
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    expect(route.bodies[1]!.messages).toEqual([
+      { role: 'user', content: 'find x' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'l1', name: 'lookup', input: {} },
+          { type: 'text', text: 'Found it.' },
+        ],
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'l1', result: 'found' }] },
+      { role: 'user', content: 'thanks' },
+    ]);
+  });
+});
+
 describe('useChat — reconnect never re-appends what the hook holds (G1 hand-off)', () => {
   it('a reconnect after a settled POST leg is caught up, not a second turn', async () => {
     const wire = journal();

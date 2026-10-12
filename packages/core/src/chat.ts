@@ -984,6 +984,13 @@ function toolUseFromUI(call: UIToolCall): ToolUsePart {
  * call the resumed leg executed, and the history already holds its
  * `tool_use`. The turn does not send it again (before 2.3 it did, without its
  * input, which no provider accepts).
+ *
+ * A call the server ran within the turn keeps its `tool_use` here, and its
+ * result is on the card (`state: 'result'`). Follow this message with those
+ * results as a `role: 'tool'` message (`clientToolResultMessage`), as
+ * `canonicalFromUI` and `useChat` (2.3) do: a history that leaves the call
+ * open is one no provider accepts, and an approval continuation settles every
+ * open call, so it would run that call again.
  */
 export function assistantMessageFromTurn(turn: AssistantTurnState): Message {
   const cards = turn.message.toolCalls ?? [];

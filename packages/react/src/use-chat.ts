@@ -1210,6 +1210,25 @@ export function useChat(options: UseChatOptions): UseChatResult {
       if (answers.length > 0) appendCanonical(clientToolResultMessage(answers));
       // Append the canonical assistant turn (client-tools reconstruction).
       appendCanonical(assistantMessageFromTurn(turn));
+      // The calls the server ran within this leg (2.3) keep their `tool_use` in
+      // that message and their result on the card: it answers them right after
+      // it, as `canonicalFromUI` does. Before 2.3 the next request carried them
+      // open: a provider rejects that, and a chat route's approval continuation
+      // ran them again, since it settles every call the history leaves open.
+      const ran = (turn.message.toolCalls ?? []).filter(
+        (call) => call.input !== undefined && call.state === 'result',
+      );
+      if (ran.length > 0) {
+        appendCanonical(
+          clientToolResultMessage(
+            ran.map((call) => ({
+              toolCallId: call.toolCallId,
+              result: call.output,
+              ...(call.isError ? { isError: true } : {}),
+            })),
+          ),
+        );
+      }
       turnRef.current = undefined;
       // Its read ended on the cursor: this turn and all before it are behind it now.
       if (replay || cursorRead) behindCursorRef.current = snapshotRef.current.history.canonical;
