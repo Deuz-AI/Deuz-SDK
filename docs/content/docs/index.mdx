@@ -75,6 +75,8 @@ Pick the row that matches what you are building. Each is two or three pages, not
 | **Something that must not lose state**    | [Persistent stores](/docs/modules/stores) → [Chat persistence](/docs/modules/chat-persistence) → [Durable runtime](/docs/agents/durable-runtime) |
 | **Something users can attack**            | [Request validation](/docs/modules/request-validation) → [Guardrails](/docs/agents/guardrails) → [Client tools](/docs/agents/client-tools)       |
 | **A multi-agent system**                  | [Sub-agents](/docs/agents/subagents) → [Handoffs](/docs/agents/handoffs) → [Durable swarm DAGs](/docs/modules/swarm)                             |
+| **An agent other systems call**           | [MCP server](/docs/modules/mcp-server) → [A2A](/docs/modules/a2a)                                                                                |
+| **A voice agent**                         | [Realtime voice](/docs/modules/realtime) → [Tools](/docs/agents/tools)                                                                           |
 | **A port from another SDK**               | [Migrating from the Vercel AI SDK](/docs/migration/from-vercel-ai-sdk)                                                                           |
 
 Whatever you build, two pages pay for themselves early: [Error handling](/docs/core/errors) (the taxonomy you branch on) and [Dependencies & clients](/docs/core/dependencies) (how you make any of it testable).
@@ -146,28 +148,38 @@ Many AI integrations become hard to test because runtime state, provider-specifi
 | **No vendor lock**     | Our own canonical delta stream and our own versioned UI wire. The SDK never proxies a provider's raw SSE bytes to your client.                                                                                                         |
 | **Secrets never leak** | API keys are masked in every log, error, and span path. This is a regression-tested invariant — see [secret redaction](/docs/core/errors#secret-redaction-p0).                                                                         |
 
-## New in 2.2
+## New in 2.3
 
-2.2 lets swarms grow while they run, moves durable runs between processes, and
-adds persistent budgets, evolutionary search and schedules. The 2.1 APIs remain
+2.3 puts every tool call on one path, gives native runs memory, chat and model
+fail-over, and delivers the integrations 2.2 deferred. The 2.2 APIs remain
 available.
 
-- **Dynamic swarms** — finished tasks spawn tasks atomically, with limits,
-  compensation and per-task timeouts → [Swarm](/docs/modules/swarm)
-- **Blackboards and rounds** — group channels agents read and post to, soft
-  dependencies and explore-consolidate rounds.
-- **Operations** — leases, drain, cross-process cancel and recovery, with SQLite
-  and Postgres backends → [Operations](/docs/modules/operations)
-- **Persistent budgets** — per-user or per-org scopes shared by every run and
-  process → [Budgets](/docs/modules/budgets)
-- **Evolve** — evolutionary program search over islands with a mandatory budget
-  and zero-call resume → [Evolve](/docs/modules/evolve)
-- **Schedules and signals** — cron ticks and verified webhooks that start or
-  resume runs → [Schedules](/docs/modules/schedule)
+- **One path for every tool call** — policy, approval, budget admission and an
+  effect receipt for every call, local or MCP, with opt-in recovery after a
+  failure → [Native agents](/docs/modules/native-agents#one-path-for-every-tool-call)
+- **Native memory, chat and fail-over** — bound to the run's checkpoint and its
+  resume binding, so a resume never recalls or extracts again
+  → [Native agents](/docs/modules/native-agents#memory-chat-and-model-fail-over-23)
+- **MCP 2026-07-28 and an MCP server** — a dual-stack client, and your tools and
+  agents served over Streamable HTTP and stdio → [MCP server](/docs/modules/mcp-server)
+- **A2A, realtime voice and batch** — Agent2Agent 1.0.0 in both directions,
+  OpenAI Realtime and Gemini Live over WebSocket, and the provider batch APIs
+  → [A2A](/docs/modules/a2a) · [Realtime voice](/docs/modules/realtime) ·
+  [Batch requests](/docs/modules/batch)
+- **Redis backends** — leases, native runs, budgets and swarms on Redis
+  → [Operations](/docs/modules/operations#redis)
+- **Prices and models** — usage billed once, models without a price under USD
+  budgets, and a profile of what each model accepts
+  → [Model profiles](/docs/modules/model-profiles)
+- **Goals, evals and a headless preview** — goal records moved by pure
+  transitions, versioned eval suites, and runs from a script or CI job
+  → [Goals](/docs/modules/goals) · [Evals](/docs/modules/evals) ·
+  [Headless](/docs/modules/headless)
 
-Start with [What is new in 2.2](/docs/reference/whats-new-2-2) for upgrade notes and
-operational limits. Previous releases: [2.1](/docs/reference/whats-new-2-1),
-[2.0](/docs/reference/whats-new-2-0) and [1.9](/docs/reference/whats-new-1-9).
+Start with [What is new in 2.3](/docs/reference/whats-new-2-3) for upgrade notes
+and known limits. Previous releases: [2.2](/docs/reference/whats-new-2-2),
+[2.1](/docs/reference/whats-new-2-1), [2.0](/docs/reference/whats-new-2-0) and
+[1.9](/docs/reference/whats-new-1-9).
 
 ## Feature overview
 
@@ -182,18 +194,26 @@ operational limits. Previous releases: [2.1](/docs/reference/whats-new-2-1),
 | Memory                        | mem0 extract/reconcile pipeline over a vector or Obsidian-markdown store                                             | [Memory](/docs/modules/memory)                                                |
 | RAG                           | MIME sniff, chunkers, dense + lexical (BM25) hybrid retrieval                                                        | [RAG](/docs/modules/rag)                                                      |
 | Skills                        | `SKILL.md` parser with progressive disclosure                                                                        | [Skills](/docs/modules/skills)                                                |
-| MCP                           | Zero-config servers in the loop, OAuth 2.0, sampling, roots (HTTP/SSE edge-safe; stdio Node-only)                    | [MCP](/docs/modules/mcp)                                                      |
+| MCP                           | Zero-config servers in the loop, OAuth 2.0, sampling, roots (HTTP/SSE edge-safe; stdio Node-only), MCP 2026-07-28    | [MCP](/docs/modules/mcp)                                                      |
+| MCP server (2.3)              | Publish tools, native agent tools and agents over Streamable HTTP and stdio                                          | [MCP server](/docs/modules/mcp-server)                                        |
+| A2A (2.3)                     | Call other agents and serve your own over Agent2Agent 1.0.0, JSON-RPC or HTTP+JSON                                   | [A2A](/docs/modules/a2a)                                                      |
 | Guardrails (2.0)              | `onInput` / `onToolCall` / `onOutput` — pass, block or rewrite, reported on the stream                               | [Guardrails](/docs/agents/guardrails)                                         |
 | Handoffs (2.0)                | Transfer the run to another agent, history and all                                                                   | [Handoffs](/docs/agents/handoffs)                                             |
 | Persistent stores (2.0)       | SQLite / Redis / Postgres behind the four storage seams                                                              | [Persistent stores](/docs/modules/stores)                                     |
 | Autonomy (1.8)                | Workspace memory, CodeAct sandbox, planner/verifier, browser tools, background runs, live plan/activity feed         | [Autonomy](/docs/modules/autonomy)                                            |
 | Image generation              | Sync OpenAI-compatible generation, async Midjourney, Yunwu relay                                                     | [Image generation](/docs/modules/image-generation)                            |
 | Speech / transcription (2.0)  | `generateSpeech` (OpenAI, ElevenLabs) and `transcribe` (OpenAI, Deepgram)                                            | [Speech](/docs/modules/speech) · [Transcription](/docs/modules/transcription) |
+| Realtime voice (2.3)          | Live speech-to-speech with OpenAI Realtime and Gemini Live over WebSocket, with Deuz tools                           | [Realtime voice](/docs/modules/realtime)                                      |
+| Batch requests (2.3)          | Single-turn requests on the OpenAI, Anthropic and Gemini batch APIs, priced on the batch tier                        | [Batch requests](/docs/modules/batch)                                         |
 | Video (2.0)                   | Async submit → poll → download over the OpenAI Videos shape                                                          | [Video](/docs/modules/video-generation)                                       |
 | UI streaming                  | `toDeuzStreamResponse` (server) and `readDeuzStream` (client)                                                        | [UI streaming](/docs/modules/ui-streaming)                                    |
 | React hooks                   | `useChat` (client-tool round-trips + approval pauses + live `plan`/`activity`) and `useObject` over the Deuz UI wire | [React hooks](/docs/modules/react-hooks)                                      |
 | Middleware                    | `wrapModel` with logging, caching, PII redaction, injection guard                                                    | [Middleware](/docs/modules/middleware)                                        |
 | Pricing                       | Optional token-to-USD cost table                                                                                     | [Pricing](/docs/modules/pricing)                                              |
+| Model profiles (2.3)          | What a model accepts before you call it: capabilities, limits, effort and every value a request changes              | [Model profiles](/docs/modules/model-profiles)                                |
+| Goals (2.3)                   | Versioned goal records with acceptance on evidence, waiting reasons, and wakeup and event envelopes                  | [Goals](/docs/modules/goals)                                                  |
+| Evals (2.3)                   | Versioned eval tasks with per-attempt metrics for success, cost, rescues, repeated effects and recovery              | [Evals](/docs/modules/evals)                                                  |
+| Headless (2.3 preview)        | Run, resume and inspect native runs from a script or CI job, with JSON reports and exit codes (Node-only)            | [Headless](/docs/modules/headless)                                            |
 
 ## Supported providers
 
@@ -217,7 +237,7 @@ That is **29 built-in provider ids** across four chat wires. A provider factory 
 
 ## Quality bar
 
-- **Over 1,800 tests** across 113 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network), plus a separate type-contract lock run with `--typecheck`
+- **Over 5,000 tests** across more than 270 files (vitest with golden-replay SSE fixtures and deterministic mock models — no real network), plus a separate type-contract lock run with `--typecheck`
 - `tsc` strict (`moduleResolution: "Bundler"`, `verbatimModuleSyntax`, `noUncheckedIndexedAccess`)
 - `eslint` with edge-safety enforced, `publint --strict`, and `attw` (Are The Types Wrong) all green
 - Dual **ESM + CJS** build with `.d.ts` for every subpath export
