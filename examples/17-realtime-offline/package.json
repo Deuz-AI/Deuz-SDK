@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/17-realtime-offline",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A realtime voice session on a scripted socket: audio in, a tool call, a spoken answer, usage priced per modality.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
