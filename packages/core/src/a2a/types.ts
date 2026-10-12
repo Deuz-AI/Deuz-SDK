@@ -191,7 +191,12 @@ export interface A2ASendMessageConfiguration {
   taskPushNotificationConfig?: A2ATaskPushNotificationConfig;
   /** At most this many of the most recent history messages in the returned task; 0 for none. */
   historyLength?: number;
-  /** Return as soon as the task exists instead of waiting for a terminal or interrupted state. */
+  /**
+   * Answer at the agent's first update instead of waiting for a terminal or
+   * interrupted state: a new task as soon as it exists, a task the message
+   * continues once the agent has taken the message up. A message the agent
+   * refuses is answered with the error either way.
+   */
   returnImmediately?: boolean;
 }
 
@@ -434,8 +439,8 @@ export interface A2AClient {
   readonly card: A2AAgentCard | undefined;
   /**
    * `SendMessage`: send a message and wait for the answer — a direct
-   * message, or the task once it is terminal or interrupted (or as soon as it
-   * exists with `configuration.returnImmediately`).
+   * message, or the task once it is terminal or interrupted (or at the
+   * agent's first update with `configuration.returnImmediately`).
    */
   sendMessage(
     message: A2AMessageInput,

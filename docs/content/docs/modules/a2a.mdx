@@ -142,6 +142,7 @@ How a turn plays out:
 - **An executor that returns while the task is `SUBMITTED` or `WORKING` completes it.** One that returns while `AUTH_REQUIRED` leaves the task waiting.
 - **An executor that throws fails the task** with the error's message as the status message — so throw errors whose messages are safe to show the client. The exception: an `A2AError` the executor raises itself **before the task changed** answers the request with that error (`CONTENT_TYPE_NOT_SUPPORTED`, `INVALID_PARAMS`, …) and leaves the task as it was — a refused follow-up message is taken back out of the task's history. One a `createA2AClient` call threw is another agent's answer, not a refusal — see [delegating to another agent](#delegating-to-another-agent).
 - **A new interaction** whose executor neither replies nor updates the task answers `INVALID_AGENT_RESPONSE`. A follow-up turn that makes no update answers with the task as it waits, its history now ending with the new message.
+- **`configuration.returnImmediately`** answers a `SendMessage` at the turn's first update rather than at its end: a new interaction once its task exists, a follow-up message once the executor has changed the task (or when its turn ends without a change). Until then the request waits, so an `A2AError` the executor raises first answers it in both cases, and a client never gets a task holding a message the agent then refused.
 
 The executor is stateless across turns, which is what lets any instance serve the next message of a task when the [store](#tasks-tenants-and-owners) is shared.
 
@@ -323,7 +324,7 @@ if (answer.message) {
 
 | Method | A2A method | Returns |
 | --- | --- | --- |
-| `sendMessage(message, options?)` | `SendMessage` | `{ task }` once it is terminal or interrupted (or as soon as it exists with `configuration.returnImmediately`), or `{ message }`. |
+| `sendMessage(message, options?)` | `SendMessage` | `{ task }` once it is terminal or interrupted (or at the agent's first update with `configuration.returnImmediately`), or `{ message }`. |
 | `sendStreamingMessage(message, options?)` | `SendStreamingMessage` | An async generator of stream events; it ends when the agent's turn does. |
 | `getTask(taskId, { historyLength? })` | `GetTask` | The task. |
 | `cancelTask(taskId, { metadata? })` | `CancelTask` | The task after the request. |

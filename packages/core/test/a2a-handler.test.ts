@@ -661,6 +661,100 @@ describe('createA2AHandler — turns of one task', () => {
   });
 });
 
+// A follow-up turn opens with the task's snapshot. A non-blocking SendMessage
+// must not be answered with that snapshot: the executor has not looked at the
+// message yet, and its refusal would then reach nobody (the message is taken
+// back out of the history all the same).
+describe.each(['JSONRPC', 'HTTP+JSON'] as const)(
+  'createA2AHandler — a follow-up sent with returnImmediately (%s)',
+  (binding) => {
+    /** SendMessage over the binding: the task it answered, or the binding's error body. */
+    async function sendOver(
+      handler: (request: Request) => Promise<Response>,
+      message: Record<string, unknown>,
+      configuration?: Record<string, unknown>,
+    ): Promise<{ task?: A2ATask; error?: Record<string, unknown>; status: number }> {
+      const params = { message, ...(configuration ? { configuration } : {}) };
+      if (binding === 'JSONRPC') {
+        const { body, status } = await rpc(handler, 'SendMessage', params);
+        if (body.error) return { error: body.error as Record<string, unknown>, status };
+        return { task: (body.result as { task: A2ATask }).task, status };
+      }
+      const response = await rest(handler, 'POST', '/message:send', params);
+      const body = (await response.json()) as { task?: A2ATask; error?: Record<string, unknown> };
+      return { ...body, status: response.status };
+    }
+
+    async function getOver(handler: (request: Request) => Promise<Response>, id: string) {
+      if (binding === 'JSONRPC')
+        return (await rpc(handler, 'GetTask', { id })).body.result as A2ATask;
+      return (await (await rest(handler, 'GET', `/tasks/${id}`)).json()) as A2ATask;
+    }
+
+    it('answers once the executor first updates the task', async () => {
+      const release = gate();
+      const { handler } = handlerWith(async (ctx) => {
+        if (!ctx.task) return ctx.requireInput('Which city?');
+        await ctx.working('Looking it up…');
+        await release.promise;
+        await ctx.complete('Sunny.');
+      });
+      const asked = (await sendOver(handler, userMessage('weather?'))).task as A2ATask;
+      const answer = await sendOver(handler, userMessage('Izmir', { taskId: asked.id }), {
+        returnImmediately: true,
+      });
+      expect(answer.task?.status.state).toBe('TASK_STATE_WORKING');
+      expect(answer.task?.status.message?.parts).toEqual([{ text: 'Looking it up…' }]);
+      expect(answer.task?.history?.map((message) => message.messageId)).toContain('user-Izmir');
+      release.open();
+      await tick();
+      expect((await getOver(handler, asked.id)).status.state).toBe('TASK_STATE_COMPLETED');
+    });
+
+    it('answers a refused follow-up with the A2A error and leaves the task as it was', async () => {
+      const { handler, errors } = handlerWith(async (ctx) => {
+        if (!ctx.task) return ctx.requireInput('Which city?');
+        throw new A2AError({ reason: 'CONTENT_TYPE_NOT_SUPPORTED', message: 'Text only, please.' });
+      });
+      const asked = (await sendOver(handler, userMessage('weather?'))).task as A2ATask;
+      const before = await getOver(handler, asked.id);
+      const refused = await sendOver(
+        handler,
+        {
+          messageId: 'm-picture',
+          role: 'ROLE_USER',
+          parts: [{ url: 'https://example.test/izmir.png' }],
+          taskId: asked.id,
+        },
+        { returnImmediately: true },
+      );
+      expect(refused.task).toBeUndefined();
+      if (binding === 'JSONRPC') {
+        expect(refused.error).toMatchObject({ code: -32005, message: 'Text only, please.' });
+      } else {
+        expect(refused.status).toBe(400);
+        expect(refused.error).toMatchObject({
+          status: 'INVALID_ARGUMENT',
+          message: 'Text only, please.',
+          details: errorInfo('CONTENT_TYPE_NOT_SUPPORTED'),
+        });
+      }
+      expect(await getOver(handler, asked.id)).toEqual(before);
+      expect(errors).toEqual([]);
+    });
+
+    it('answers a follow-up whose executor makes no update with the waiting task', async () => {
+      const { handler } = handlerWith((ctx) => (ctx.task ? undefined : ctx.requireInput('?')));
+      const asked = (await sendOver(handler, userMessage('weather?'))).task as A2ATask;
+      const answer = await sendOver(handler, userMessage('Izmir', { taskId: asked.id }), {
+        returnImmediately: true,
+      });
+      expect(answer.task?.status).toEqual(asked.status);
+      expect(answer.task?.history?.at(-1)?.messageId).toBe('user-Izmir');
+    });
+  },
+);
+
 describe('createA2AHandler — GetTask and scopes', () => {
   it('returns a stored task and trims its history to historyLength', async () => {
     const { handler } = handlerWith(async (ctx) => {

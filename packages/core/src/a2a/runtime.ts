@@ -189,12 +189,18 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
       : { task: structuredClone(turn.task as A2ATask) };
   }
 
-  function publish(turn: Turn, event: A2AStreamResponse): void {
-    turn.first.resolve(result(turn));
+  /** Sends an event to the streams following the turn. */
+  function announce(turn: Turn, event: A2AStreamResponse): void {
     for (const sink of turn.sinks) {
       if (sink.closed) turn.sinks.delete(sink);
       else sink.event(structuredClone(event));
     }
+  }
+
+  /** An update of the turn: it answers a non-blocking request, then goes to the streams. */
+  function publish(turn: Turn, event: A2AStreamResponse): void {
+    turn.first.resolve(result(turn));
+    announce(turn, event);
   }
 
   function detach(turn: Turn): void {
@@ -546,7 +552,10 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
           sink,
         });
         live.set(key, continued);
-        publish(continued, { task: structuredClone(next) });
+        // Streams open with the snapshot. A non-blocking request is answered at
+        // the executor's first update instead, as a new interaction is, so a
+        // refusal of the message reaches its client as an error.
+        announce(continued, { task: structuredClone(next) });
         return continued;
       });
     } else {
