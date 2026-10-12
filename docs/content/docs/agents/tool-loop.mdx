@@ -200,7 +200,7 @@ interface StepResult {
 | `reasoningText` | Present only when the model emitted reasoning that turn. |
 | `toolCalls` | Parsed tool calls this step made — empty on the terminal text-only step. Reported in the model's own order, with any guardrail rewrite applied. |
 | `toolResults` | Execution results. Each carries `isError` when a tool threw, timed out, was denied, was blocked, had invalid arguments, or did not exist. |
-| `stopDetails` | 2.3. The provider's explanation of the stop, normalized to `{ type, category?, explanation? }` — today Anthropic's `stop_details` on a refusal. A refused step dispatches no tool calls, so it is the terminal step: read it from `result.steps.at(-1)`. |
+| `stopDetails` | 2.3. The provider's explanation of the stop, normalized to `{ type, category?, explanation? }` — Anthropic's `stop_details` on a refusal, or an OpenAI refusal's text as `explanation`. A refused step dispatches no tool calls, so it is the terminal step: read it from `result.steps.at(-1)`. |
 | `usage` | This step alone. The top-level `result.usage` is the sum across all steps, sub-agents included. |
 | `response.messages` | Just the turns this step appended. |
 

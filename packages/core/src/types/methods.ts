@@ -38,9 +38,11 @@ export interface CallWarning {
 
 /**
  * Why the provider stopped a turn early, when it explained it (2.3 additive).
- * Today this is Anthropic's `stop_details` on a refusal (`stop_reason:
- * 'refusal'`, surfaced as `finishReason: 'content_filter'`). The raw provider
- * object also stays on finish parts as `providerMetadata.anthropic.stop_details`.
+ * Anthropic's `stop_details` on a refusal (`stop_reason: 'refusal'`), and an
+ * OpenAI refusal as `{ type: 'refusal', explanation: <the refusal text> }`,
+ * both surfaced as `finishReason: 'content_filter'`. The raw provider data also
+ * stays on finish parts as `providerMetadata.anthropic.stop_details` or
+ * `providerMetadata.openai.refusal`.
  */
 export interface StopDetails {
   /** What the detail explains, e.g. `'refusal'`. Treat unknown values defensively. */

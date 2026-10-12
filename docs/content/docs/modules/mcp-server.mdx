@@ -55,6 +55,8 @@ await client.close();
 await server.close();
 ```
 
+[`examples/19-mcp-server`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/19-mcp-server) goes further, still in process and without a key: Deuz tools and an agent served over MCP 2026-07-28 to the Deuz client, with an elicitation approving a gated tool.
+
 In production the handler goes wherever a `fetch(request)` goes:
 
 ```ts title="worker.ts"

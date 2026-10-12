@@ -35,21 +35,28 @@ const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 `@deuz-sdk/core/edge` re-exports the guaranteed Web-APIs-only subset. Every release bundles representative root, `/edge`, and provider consumers with esbuild's browser platform and fails if the graph reaches a Node-only module. The browser/jsdom suite then exercises the Responses stream with Web Streams and a custom base URL.
 
-It exports exactly:
+It exports exactly these values, and the types named below:
 
 | Export | Kind |
 | --- | --- |
 | `streamChat`, `generateText`, `generateObject`, `streamObject` | functions |
-| `stepCountIs`, `hasToolCall`, `totalTokensExceed`, `costExceeds` | functions (stop conditions) |
-| `createClient`, `resolveDependencies` | functions |
-| `agentTool` | function |
-| `AgentToolDef` | type |
+| `stepCountIs`, `hasToolCall`, `totalTokensExceed`, `costExceeds`, `durationExceeds` | functions (stop conditions) |
+| `tool`, `filePart`, `imagePart` | functions (typed tools and content parts, 1.9) |
+| `agentTool`, `handoff` | functions (sub-agents; handoffs, 2.0) |
+| `promptInjectionGuardrail`, `maxOutputLength`, `maxToolResultLength` | functions (guardrails, 2.0; `maxToolResultLength`, 2.2) |
 | `anthropicWebSearch`, `openaiWebSearch`, `googleSearch` | functions (server tools) |
-| `DeuzClient` | type |
-| `DeuzError`, `NoObjectGeneratedError` | error classes |
-| `createInMemorySessionStore`, `resumeFromCheckpoint`, `resumeStreamFromCheckpoint`, `serializeCheckpoint`, `deserializeCheckpoint`, `createApprovalSigner` | functions ([durable runtime](/docs/agents/durable-runtime), 1.5) |
-| `CheckpointNotFoundError` | error class (1.5) |
-| `ResumeOptions`, `SignedApprovalPayload`, `CreateApprovalSignerOptions`, `ApprovalSigner` | types (1.5) |
+| `createClient`, `resolveDependencies`, `createAgent` | functions (`createAgent`, 1.9) |
+| `getModelCapabilities`, `resolveModelProfile` | functions (the capability registry, 1.9; [model profiles](/docs/modules/model-profiles), 2.3) |
+| `createInMemorySessionStore`, `resumeFromCheckpoint`, `resumeStreamFromCheckpoint`, `resumeDeuzChatResponse`, `serializeCheckpoint`, `deserializeCheckpoint`, `createApprovalSigner` | functions ([durable runtime](/docs/agents/durable-runtime), 1.5 and later) |
+| `createAssistantTurn`, `applyUIPart`, `sealAssistantTurn`, `assistantMessageFromTurn`, `clientToolResultMessage`, `uiFromMessages`, `canonicalFromUI`, `userMessageFromInput`, `filesToImageParts`, `dropTrailingAssistant`, `branchBeforeUserMessage`, `createInMemoryChatStore`, `serializeChatRecord`, `deserializeChatRecord` | functions (the chat engine, 1.7 and later) |
+| `validateChatRequest`, `parseDeuzChatRequest` | functions (chat request validation, 1.9) |
+| `createCallbackObserver`, `createMemoryObserver`, `composeObservers`, `filterObserver`, `summarizeRun` | functions (observation, 1.6) |
+| `createOtelTracer`, `createOtelObserver`, `otelReady` | functions (the OpenTelemetry bridge, 1.9) |
+| `DeuzError`, `isDeuzError`, `NoObjectGeneratedError`, `BreakerOpenError`, `CheckpointNotFoundError`, `CheckpointVersionError`, `UnpricedModelError` | error classes and the `isDeuzError` guard (`CheckpointVersionError` and `UnpricedModelError`, 2.3) |
+| `createInMemoryLeaseProvider`, `agentRunLeaseKey`, `findStaleAgentRuns` | everything `@deuz-sdk/core/ops` exports (2.2; the last two, 2.3) |
+| `evolve`, `resumeEvolve`, `createInMemoryPopulationStore`, `evolveCandidateId`, `parseEvolveBlocks`, `parseSearchReplace`, `applySearchReplace`, `extractFullRewrite`, `buildMutationPrompt`, `EvolvePatchError`, `EvolveConflictError`, `EvolveLeaseError` | everything `@deuz-sdk/core/evolve` exports (2.2) |
+| `createScheduler`, `createInMemoryClaim`, `parseCron`, `nextOccurrence`, `previousOccurrence`, `occurrencesBetween`, `handleSignal`, `verifyGitHubWebhook`, `verifySlackRequest`, `verifyHmacSignature` | everything `@deuz-sdk/core/schedule` exports (2.2) |
+| `AgentToolDef`, `HandoffAgentDef`, `HandoffOptions`, `InferToolInput`, `InferToolOutput`, `ModelCapabilities`, `ModelProfile` and its parts, `DeuzClient`, `AgentDef`, `DeuzAgent`, `AgentCallOptions`, `AgentObjectCallOptions`, `ResumeOptions`, `ResumeDeuzChatOptions`, `SignedApprovalPayload`, `CreateApprovalSignerOptions`, `ApprovalSigner`, `DeuzErrorJSON`, the chat types (`UIMessage`, `ChatRecord`, `ChatStore`, …), `DeuzChatRequest`, `ValidateChatOptions`, `ValidateChatResult`, `MemoryObserver`, `RunSummary`, `OtelTracerOptions`, and the types of `/ops`, `/evolve` and `/schedule` | types |
 | everything from the canonical types (`Message`, `Part`, `Usage`, `StreamPart`, `LanguageModel`, `CommonCallOptions`, `AgentCheckpoint`, `SessionStore`, …) | `export type *` |
 
 ```ts title="edge bundle (guaranteed safe)"

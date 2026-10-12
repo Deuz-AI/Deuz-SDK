@@ -22,6 +22,11 @@ A running supervisor that drives goals on its own, a durable inbox and timezone
 aware wakeups are planned for 2.4. The 2.3 records are the contract they will
 build on.
 
+[`examples/16-goals-and-wakeups`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/16-goals-and-wakeups)
+runs the contract end to end without a key: a goal woken by a schedule
+occurrence and by a webhook event, each claimed once in SQLite, with one leased
+native run per wake supplying the evidence.
+
 ## A goal
 
 `createGoal` returns an `active` record at revision 1. Each criterion is

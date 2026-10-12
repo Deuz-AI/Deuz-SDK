@@ -105,7 +105,7 @@ interface StreamChatResult {
 - **`fullStream`** — the full canonical delta stream of `StreamPart`. Errors surface as an `error` part, not a throw.
 - **`usage`** — resolves once with the final `Usage` breakdown (input / output / reasoning / cache tokens). `totalTokens` is the provider's own total where one exists, not `input + output` — on a thinking model those differ substantially.
 - **`finishReason`** — resolves with `'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error' | 'aborted'`.
-- **`stopDetails`** (2.3) — resolves with the provider's explanation of the stop when it gave one, else `undefined`. Today that is Anthropic's `stop_details` on a refusal (`finishReason: 'content_filter'`), normalized to `{ type, category?, explanation? }`; the raw object also stays on the `finish` part's `providerMetadata`. It settles with `finishReason`: `undefined` when you aborted, rejected when the call failed. A run with `tools` reports its last step's.
+- **`stopDetails`** (2.3) — resolves with the provider's explanation of the stop when it gave one, else `undefined`. That is Anthropic's `stop_details` on a refusal, or an OpenAI refusal (`{ type: 'refusal', explanation }`, the refusal text), both with `finishReason: 'content_filter'` and normalized to `{ type, category?, explanation? }`; the raw data also stays on the `finish` part's `providerMetadata` (`anthropic.stop_details`, `openai.refusal`). It settles with `finishReason`: `undefined` when you aborted, rejected when the call failed. A run with `tools` reports its last step's.
 
 ```ts title="refusal.ts"
 const result = streamChat({ model, prompt: 'Write a port scanner.' });

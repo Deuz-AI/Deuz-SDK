@@ -13,9 +13,12 @@
  * types are skipped (open-union rule). A response negotiated to v1 (via
  * {@link negotiateDeuzStreamVersion} / `wireVersion`) carries no `id:` lines
  * and no v2-only part. It is not byte-identical to pre-1.7 output: later
- * releases added optional fields to v1 parts (the approval `token` in 1.7; the
- * `reasoning-delta` block fields and the `tool-call` provider metadata in
- * 2.3), which an older client ignores.
+ * releases added optional fields to v1 parts, which an older client ignores:
+ * the approval `token` (1.7) and, in 2.3, the `text-delta` and `tool-call`
+ * `providerMetadata`, the `reasoning-delta` block fields, `tool-result.outcome`
+ * and the `stopDetails` of `step-finish` and `finish`. 2.3's additions to
+ * v2-only parts stay on v2: `tool-state.outcome`, the `'unpriced-model'`
+ * warning and the `data-agent` frames of a native run.
  */
 import type {
   CallWarning,
@@ -810,9 +813,11 @@ export interface ToDeuzStreamOptions {
   /**
    * Wire version to emit (default 'v2'). Pass
    * `negotiateDeuzStreamVersion(request)` to honor an explicit v1 client.
-   * v1 output has no `id:` lines and no v2-only parts; optional fields added to
-   * v1 parts since (such as the 2.3 `reasoning-delta` block fields and `tool-call`
-   * provider metadata) ride it too.
+   * v1 output has no `id:` lines and no v2-only parts; the optional fields added
+   * to v1 parts since ride it too (2.3: the `text-delta` and `tool-call`
+   * `providerMetadata`, the `reasoning-delta` block fields, `tool-result.outcome`,
+   * and `step-finish` / `finish` `stopDetails`). `tool-state.outcome`, the
+   * `'unpriced-model'` warning and native `data-agent` frames are v2 only.
    */
   wireVersion?: DeuzWireVersion;
   /**

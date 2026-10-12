@@ -82,10 +82,12 @@ Anthropic rejects a forced `tool_choice` while extended thinking is enabled (HTT
 | `message` | `string` | `"generateObject could not produce a valid object after 2 attempts."` |
 | `text` | `string \| undefined` | The raw model output from the last failed attempt (model text, not a secret). |
 | `cause` | `unknown` | The last parse/validation error. |
+| `finishReason` | `FinishReason \| undefined` | 2.3. How the last attempt ended: `'content_filter'` when the model refused, `'length'` when it was cut off. |
+| `stopDetails` | `StopDetails \| undefined` | 2.3. The provider's explanation of that stop, when it gave one, such as a refusal's category or text. |
 
 A hard transport error (an `error` part on the underlying stream) is thrown immediately and is not wrapped in `NoObjectGeneratedError`.
 
-A refused request (`finishReason: 'content_filter'`, such as Anthropic's `stop_reason: 'refusal'`) rarely returns JSON that matches the schema, so it usually ends in `NoObjectGeneratedError` after the repair attempt, and the error does not carry the refusal's explanation. When you need its category, use [streamObject](/docs/core/stream-object): its `finishReason` and `stopDetails` resolve before validation, even when `object` rejects.
+A refused request (`finishReason: 'content_filter'`, such as Anthropic's `stop_reason: 'refusal'` or an OpenAI `refusal`) rarely returns JSON that matches the schema, so it usually ends in `NoObjectGeneratedError` after the repair attempt. Since 2.3 the error says why: its `finishReason` and `stopDetails` are the last attempt's, so a refusal arrives as `'content_filter'` with the provider's explanation (Anthropic's category and explanation, or the OpenAI refusal text). [streamObject](/docs/core/stream-object) resolves the same `finishReason` and `stopDetails` before validation, even when `object` rejects.
 
 ## Gemini schema conversion
 
