@@ -547,6 +547,11 @@ export function createA2AAgentExecutor<T = string>(
     if (own.length > 0) throw new InvalidRequestError({ message: ownOptionsMessage(own) });
   }
   const lease = options.lease;
+  if (lease !== undefined && typeof lease?.provider?.signal !== 'function') {
+    throw new InvalidRequestError({
+      message: 'createA2AAgentExecutor: lease needs lease.provider, a LeaseProvider.',
+    });
+  }
   const scopeOf = options.scope ?? defaultScope;
   const name = options.artifact?.name ?? 'output';
   const description = options.artifact?.description;

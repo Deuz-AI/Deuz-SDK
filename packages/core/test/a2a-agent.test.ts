@@ -371,6 +371,9 @@ describe('createA2AAgentExecutor — a new task', () => {
     expect(() => createA2AAgentExecutor({ agent: engine, store, run: undefined as never })).toThrow(
       /run/,
     );
+    expect(() =>
+      createA2AAgentExecutor({ agent: engine, store, run, lease: { provider: {} as never } }),
+    ).toThrow(/lease\.provider/);
   });
 });
 
