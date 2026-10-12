@@ -431,7 +431,7 @@ Honest caveats: pick fallbacks whose capabilities cover the call (a tool-heavy c
 
 **The default `deps.logger` is a no-op, and it sees everything the result field does plus one thing it does not.** All four chat calls populate `warnings` — a promise on the streaming pair, a plain array with the key omitted when empty on the buffered pair — and both loops thread one sink through every step, so `unknown-model`, `unsupported-setting`, `clamped-setting` (2.3: every value a request changes, such as an effort level a model lacks or a forced `toolChoice` sent as `auto`), `unpriced-model`, a dropped hosted tool and a dropped document all reach the outer result, each reported once. The exception is the buffered loop's `activeTools` notices, which reach the log only. Without a logger these are silent:
 
-- an unknown Claude id capped at `maxOutput: 4096` (Anthropic requires `max_tokens`; since 2.3 OpenAI Chat Completions/Responses and Gemini native leave the cap off for an unknown model). Check with `getModelCapabilities(model)` (`caps.known === false` means the fallback row) or `resolveModelProfile(model)`;
+- an unknown model on the Anthropic wire capped at `maxOutput: 4096` (Anthropic requires `max_tokens`; an unknown `claude-*-5…` id takes the Claude 5.x family row instead, and since 2.3 OpenAI Chat Completions/Responses and Gemini native leave the cap off for an unknown model). Check with `getModelCapabilities(model)` (`caps.known === false` means no pinned row answered) or `resolveModelProfile(model)` (`match` says which);
 - `costExceeds` inert because no `priceProvider` was injected;
 - the circuit breaker opening, a throwing `priceProvider` skipping a `cost` part, `falseFinishGuard` set without `doneWhen`.
 
