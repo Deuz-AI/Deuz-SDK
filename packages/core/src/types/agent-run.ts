@@ -657,6 +657,20 @@ export interface AgentRunReconcileOptions {
    * otherwise it runs now.
    */
   memory?: MemoryCallOptions;
+  /**
+   * Claim the run's lease first (2.3), as a `runAgent` call with `lease` does,
+   * with the provider the run's executors use. Its key is
+   * `agentRunLeaseKey(session)` from `@deuz-sdk/core/ops`. While an executor
+   * holds it, the call rejects with an error named `AgentRunLeaseError`, code
+   * `'lease_held'`, before reading or writing anything; a call that loses it
+   * saves nothing more to the run and rejects with code `'lease_lost'`. The
+   * lease is renewed while the call settles the run and given back at the
+   * end, however it ends. A cancel queued for the run is handled as by a
+   * resume that does not take the run up: a run that ended drops it, a
+   * suspended run keeps it for its next executor. Without a lease, call
+   * `reconcileAgentRun` only when no executor drives the run.
+   */
+  lease?: AgentRunLeaseOptions;
   deps?: Dependencies;
 }
 

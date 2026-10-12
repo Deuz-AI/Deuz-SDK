@@ -495,6 +495,21 @@ as completed without another memory LLM call; otherwise it runs the extraction
 now. Extraction is therefore at least once and never silent; dedup by content
 hash keeps a repeat from writing the same fact twice.
 
+Call `reconcileAgentRun` only when no executor drives the run. An extraction
+stays `pending` from the terminal commit until its outcome is saved, also while
+the executor that completed the run is still extracting, and a second pass
+would extract again (dedup catches only a fact worded the same way). With a
+`LeaseProvider`, pass `lease` (`{ provider, owner?, ttlMs? }`, as for
+[`runAgent`](/docs/modules/operations#leasing-a-native-run)) with the provider
+the executors use. The call claims `agentRunLeaseKey(session)` before it reads
+the run and, while an executor holds it, rejects with an error named
+`AgentRunLeaseError`, code `'lease_held'`; an executor keeps its lease until its
+extraction is saved. The call renews the lease while it settles the run, saves
+nothing more to the run once it has lost it (`'lease_lost'`), and gives it back
+at the end. A cancel queued for the run is handled as by a resume that does not
+take the run up: a run that ended drops it, and a suspended run keeps it for its
+next executor.
+
 ```ts
 import { createInMemoryAgentRunStore, reconcileAgentRun, runAgent } from '@deuz-sdk/core/agent';
 import { createInMemoryMemoryStore } from '@deuz-sdk/core/memory';
