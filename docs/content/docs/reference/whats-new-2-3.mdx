@@ -850,6 +850,15 @@ do.
 - **A refused or cut-off turn runs none of its tool calls**, and a call whose
   arguments are not a JSON object is answered with an error instead of
   executed. An empty assistant turn is never stored.
+- **A native resume answers a call from its receipt** when the receipt records
+  the call's outcome (stage `executed`, `completed`, `failed`,
+  `validation-failed` or `projection-failed`, one recorded with
+  `reconciledToolResults` included), without gating it for approval again.
+  Such a call that had waited for an approval used to be answered as denied
+  unless the resume passed its verdict again. A verdict passed for it now
+  decides nothing: the resume ignores it and streams a `warning` part
+  (`type: 'other'`, `setting: 'approvalResponses'`) that names the call. No
+  action needed; a call without a recorded outcome is gated as before.
 - **MCP calls in native runs take receipts.** An interrupted MCP call stops the
   resume with `tool-reconciliation-required`; declare
   `replay: 'idempotent'` on the `mcp` entry, per server or per tool, for calls
@@ -865,8 +874,9 @@ do.
 
 - **A native run that ends on a refusal stops with reason `'refusal'`**, not
   `'content_filter'`, with the provider's `stopDetails`. Update a `switch` over
-  `reason`; `'cancelled'` (a lease cancel) and `'mcp-catalog-changed'` are new
-  as well.
+  `reason`; `'cancelled'` (a lease cancel), `'drained'` (a lease drain) and
+  `'mcp-catalog-changed'` are new as well. A `'drained'` run has not ended: it
+  stopped at a step boundary and must be resumed, so do not treat it as final.
 - **An abort during verification stops the run with reason `'aborted'`**, and an
   elapsed deadline fails it with `ExecutionPolicyError`, where the run used to
   complete or report `verification-inconclusive`.
@@ -963,11 +973,12 @@ Exhaustive `switch` statements over these types need a new case:
 | `AgentRunEnvelope.version`  | `2`                |
 
 Native stop reasons and failure codes are strings. New values in 2.3:
-`'refusal'`, `'cancelled'` and `'mcp-catalog-changed'` (stop reasons), and
-`'lease_held'`, `'lease_lost'`, `'unpriced_model'` and
+`'refusal'`, `'cancelled'`, `'drained'` and `'mcp-catalog-changed'` (stop
+reasons), and `'lease_held'`, `'lease_lost'`, `'unpriced_model'` and
 `'checkpoint_version_unsupported'` (failure codes). The loops'
 `providerMetadata.deuz.stoppedBy` marker, also a string, gains
-`'mcp-catalog-changed'`.
+`'mcp-catalog-changed'`, and `'drained'` on the `finish` part of a native run
+that a drain stopped after a step.
 
 ### New members for custom implementations
 
