@@ -41,7 +41,7 @@ export const INDEX_PATHS = [
  */
 export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core':
-    'The six call functions, tool authoring, stop conditions, errors, and every canonical type.',
+    'The six call functions, tool authoring, stop conditions, errors, model profiles, and every canonical type.',
   '@deuz-sdk/core/anthropic': 'Anthropic Messages wire (Claude).',
   '@deuz-sdk/core/openai': 'OpenAI Chat Completions + Responses wires, and OpenAI embeddings.',
   '@deuz-sdk/core/xai': 'xAI Grok over the Chat Completions wire.',
