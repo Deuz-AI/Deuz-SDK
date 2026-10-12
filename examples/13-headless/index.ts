@@ -187,6 +187,24 @@ async function recorded(
   return JSON.parse(await readFile(resolve(here, file), 'utf-8'));
 }
 
+/**
+ * `--approve` / `--deny`: the approvals the stored run waits on. Its report
+ * lists them, except when a leg that answered one failed before its next
+ * checkpoint (in transit, or the process died): the report then shows the
+ * failure or a pending resume, while the stored run, its checkpoint still
+ * suspended, needs the verdict again (with `--retry-failed` after a failure in
+ * transit). Read from the store, with no model call.
+ */
+async function awaitedApprovals(
+  store: AgentRunStore,
+  report: HeadlessReport,
+): Promise<{ approvalId: string; token?: string }[]> {
+  const listed = report.pending.flatMap((action) => (action.kind === 'approval' ? [action] : []));
+  if (listed.length > 0) return listed;
+  const checkpoint = (await store.load(report.runId))?.checkpoints[report.runId];
+  return checkpoint?.status === 'suspended' ? (checkpoint.pendingApprovals ?? []) : [];
+}
+
 // --- OUTPUT -----------------------------------------------------------------
 function print(report: HeadlessReport | DoctorReport): void {
   process.exitCode = exitCodeFor(report);
@@ -289,11 +307,14 @@ if (command === 'doctor') {
           ? { reconciledToolResults: await recorded(values.reconcile) }
           : {};
       const waiting = await inspectRun(ops.agentRuns, argument!);
-      const verdicts = waiting.pending.flatMap((action) =>
-        action.kind === 'approval' && (values.approve || values.deny)
-          ? [{ approvalId: action.approvalId, approved: values.approve, token: action.token }]
-          : [],
-      );
+      const verdicts =
+        values.approve || values.deny
+          ? (await awaitedApprovals(ops.agentRuns, waiting)).map(({ approvalId, token }) => ({
+              approvalId,
+              approved: values.approve,
+              token,
+            }))
+          : [];
       print(
         await resumeHeadless({
           model,

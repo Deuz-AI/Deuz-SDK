@@ -99,7 +99,7 @@ refuse such a model instead.
 | 0 | `completed` | The run finished with an accepted output |
 | 1 | `failed` | An error ended it: a provider error, a store failure, a lost lease, a binding that changed on resume, an answer the resume could not take |
 | 2 | — | Usage: a command line could not parse its arguments (for your own CLI) |
-| 3 | `pending` | It waits: approvals, client tool results, a decision on calls whose effect is unknown (`tool-reconciliation-required`), or, for a stored run with no result, a resume |
+| 3 | `pending` | It waits: approvals, client tool results, a decision on calls whose effect is unknown (`tool-reconciliation-required`), or a resume: a stored run with no result, or a run a lease drain stopped (`'drained'`) |
 | 4 | `refused` | The model refused (stop reason `'refusal'`) |
 | 5 | `cancelled` | Aborted or cancelled |
 | 6 | `limit` | A limit you set: `budget.usd`, `budget.tokens`, `maxSteps`, a stop condition on cost, tokens, steps or duration, the execution deadline, a timeout, or `unknownPrice: 'reject'` |
@@ -124,7 +124,7 @@ Each pending action names the option of `resumeHeadless` that answers it
 | `approval` | `approvalId`, `toolCallId`, `toolName`, `input`, `agentPath?`, `token?` | `approvalResponses` (echo a signed approval's `token`) |
 | `client-tool` | `toolCallId`, `toolName`, `input` | `clientToolResults` |
 | `unknown-effect` | `toolCallId`, `toolName`, `input`, `modelStep?` | after checking the effect: `retryToolCallIds` to run it again, or `reconciledToolResults` with the result that landed |
-| `resume` | `phase` | a plain resume (the run's executor stopped before it ended) |
+| `resume` | `phase` | a plain resume (the run's executor stopped before it ended, or a lease drain stopped it) |
 
 ```ts title="headless-approval.ts"
 import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
@@ -168,14 +168,18 @@ console.log(done.outcome, done.output, exitCodeFor(done)); // completed Deployed
 
 Resume with the same model, tools, skills and output as the first leg: the
 run's binding rejects a change, and that resume fails (exit 1) without
-touching the stored run. So does an answer the resume cannot take: a client
-result or a recorded result (`reconciledToolResults`) for a call the run does
-not wait on, a call listed in both `retryToolCallIds` and
-`reconciledToolResults`, or `retryFailed` for a failure that was not
-transient. The leg fails with a `TypeError` before anything is written. A
-verdict or a `retryToolCallIds` entry that matches no pending call is
-ignored; a resume that answers nothing else leaves the run waiting (exit 3)
-and writes nothing.
+touching the stored run. So does `retryFailed` for a failure that was not
+transient, and, on a run that has not ended, an answer the resume cannot
+take: a client result or a recorded result (`reconciledToolResults`) for a
+call the run does not wait on, or a call listed in both `retryToolCallIds`
+and `reconciledToolResults`. The leg fails with a `TypeError` before anything
+is written. A verdict or a `retryToolCallIds` entry that matches no pending
+call is ignored; a resume that answers nothing else leaves the run waiting
+(exit 3) and writes nothing. A resume of a run that ended (completed, stopped,
+or failed and not retried) returns its stored result and ignores client
+results, recorded results and retry IDs, and `retryFailed` on a run that did
+not fail; a changed binding, and `retryFailed` for a failure that was not
+transient, still fail it.
 
 `inspectRun` reads a run without a model call. A run with no result yet
 reports `status: 'in-progress'` and a pending `resume`, plus each call that
@@ -192,7 +196,9 @@ effect in the system it touched, then answer every listed call in one resume:
 `retryToolCallIds` runs a call again, and `reconciledToolResults` records the
 result that landed (`isError: true` for an error), so the call never runs
 again. A tool marked `replay: 'idempotent'` runs again by itself and is not
-listed. The native rules are in [When the store fails](/docs/modules/native-agents#when-the-store-fails).
+listed, unless its receipt was written before 2.3: such a receipt records no
+replay policy and `inspectRun` cannot see the tools, so the call is listed,
+and `retryToolCallIds` or a plain resume runs it again. The native rules are in [When the store fails](/docs/modules/native-agents#when-the-store-fails).
 
 ```ts title="headless-unknown-effect.ts"
 import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
@@ -274,6 +280,20 @@ console.log(first.outcome, first.retry, exitCodeFor(first));
 const retried = await resumeHeadless({ model, store, runId: 'ticket-9', retryFailed: true });
 console.log(retried.outcome, exitCodeFor(retried)); // completed 0
 ```
+
+### A drained run
+
+A `'drain'` lease signal stops a run that holds a `lease` (passed as to
+`runAgent`) at its next model-step boundary: see
+[Draining a native run](/docs/modules/operations#draining-a-native-run). The run
+has not ended, so its report is `pending` (exit 3), with `reason: 'drained'`
+and a pending `resume` in the phase it stopped in, as `inspectRun` reports the
+stored run; a plain resume on any executor goes on from its last save. A drain
+that reached a resume before it took the run up wrote nothing, so that report
+lists what the run still waits for: the approvals, client results or unknown
+effects to answer again. A run that failed in transit keeps its `retry` there:
+pass `retryFailed: true` again. The list is read from the stored run, so it is
+empty when that could not be read back (a warning says so).
 
 ## Project instructions
 

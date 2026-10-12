@@ -45,7 +45,7 @@ Without `--retry-failed`, a resume returns the stored failure (exit 1). `--retry
 | Command | Options |
 | --- | --- |
 | `run "<prompt>"` | `--run-id <id>`, `--skills <dir>` (repeatable), `--budget-usd <n>`, `--mock approval\|complete\|refusal\|crash\|outage` |
-| `resume <run-id>` | `--approve` or `--deny` answers the pending approval; `--retry-call <call-id>` (repeatable) runs an unknown effect again; `--reconcile <file.json>` records the results that landed; `--retry-failed` re-enters a run that failed in transit; pass the same `--skills` as the run |
+| `resume <run-id>` | `--approve` or `--deny` answers the approval the stored run waits on, even when a failed leg's report does not list it (after a failure in transit, give the verdict again with `--retry-failed`); `--retry-call <call-id>` (repeatable) runs an unknown effect again; `--reconcile <file.json>` records the results that landed; `--retry-failed` re-enters a run that failed in transit; pass the same `--skills` as the run |
 | `inspect <run-id>` | none: no model call |
 | `doctor` | `--budget-usd <n>`, `--model <id>` |
 

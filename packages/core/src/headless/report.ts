@@ -25,8 +25,8 @@ import { createExecutionContext } from '../execution-policy';
  * - `'completed'` — the run finished with an accepted output.
  * - `'failed'` — an error ended it (a provider error, a store failure, a lost lease).
  * - `'pending'` — the run is not over and waits for you: approvals, client tool
- *   results, a decision on calls whose effect is unknown, or (a stored run with
- *   no result yet) a resume.
+ *   results, a decision on calls whose effect is unknown, or a resume (a stored
+ *   run with no result yet, or a run a lease drain stopped).
  * - `'refused'` — the model refused (a `'refusal'` stop, F16).
  * - `'cancelled'` — the run was aborted or cancelled.
  * - `'limit'` — a limit you set stopped it: the USD or token budget, `maxSteps`,
@@ -78,9 +78,10 @@ export const HEADLESS_EXIT_CODES: Readonly<Record<HeadlessOutcome | 'usage' | 'd
 
 /**
  * One thing a pending run waits for, and the resume option that answers it
- * (`resumeWith`; either of two for an unknown effect). `'resume'` is a stored
- * run with no result yet: its executor stopped (or still drives it
- * elsewhere), and a resume continues it.
+ * (`resumeWith`; either of two for an unknown effect). `'resume'` is a run a
+ * resume continues: a stored run with no result yet, whose executor stopped
+ * (or still drives it elsewhere), or a run a lease drain stopped. With the
+ * report's `retry`, the resume passes `retryFailed: true`.
  */
 export type HeadlessPendingAction =
   | {
@@ -175,12 +176,17 @@ export interface HeadlessReport {
    * re-enters it. Set on the report of that failure (its outcome `'failed'`,
    * or `'limit'` for a transport timeout), and of a later leg that ended
    * before its first write (a retried resume that stopped again for an
-   * unknown effect: answer it and pass `retryFailed: true` once more). Absent
-   * for any other failure, including a resume refused before it wrote.
+   * unknown effect, or that a lease drain stopped: answer what it lists and
+   * pass `retryFailed: true` once more). Absent for any other failure,
+   * including a resume refused before it wrote.
    */
   retry?: HeadlessRetry;
   stopDetails?: StopDetails;
-  /** What the run waits for; empty unless the outcome is `'pending'`. */
+  /**
+   * What the run waits for; empty unless the outcome is `'pending'`. For a run
+   * a lease drain stopped it is read from the stored run, so it is empty when
+   * that could not be read back (a warning says so).
+   */
   pending: HeadlessPendingAction[];
   usage: Usage;
   modelSteps: number;
@@ -217,7 +223,9 @@ export function outcomeOf(result: AgentResult<unknown>): HeadlessOutcome {
     case 'stopped':
       if (result.reason === 'refusal') return 'refused';
       if (result.reason === 'aborted' || result.reason === 'cancelled') return 'cancelled';
-      if (result.reason === 'tool-reconciliation-required') return 'pending';
+      // A drain (2.3) ends nothing: a resume goes on from the run's last save.
+      if (result.reason === 'tool-reconciliation-required' || result.reason === 'drained')
+        return 'pending';
       return LIMIT_REASONS.has(result.reason) ? 'limit' : 'stopped';
     case 'failed': {
       const code = result.error.code;
@@ -246,7 +254,10 @@ export function costOf(totals: BudgetTotals | undefined): HeadlessCost | undefin
   };
 }
 
-function pendingOf(result: AgentResult<unknown>): HeadlessPendingAction[] {
+function pendingOf(
+  result: AgentResult<unknown>,
+  stored?: AgentRunEnvelope,
+): HeadlessPendingAction[] {
   if (result.status === 'suspended') {
     return [
       ...result.pendingApprovals.map(
@@ -272,8 +283,41 @@ function pendingOf(result: AgentResult<unknown>): HeadlessPendingAction[] {
       ),
     ];
   }
+  if (result.status === 'stopped' && result.reason === 'drained') return drainedPending(stored);
   if (result.status === 'stopped') return (result.unknownEffects ?? []).map(unknownEffect);
   return [];
+}
+
+/**
+ * What a run a lease drain stopped waits for (2.3), read from the stored run
+ * as the leg left it. The drain committed no outcome, so a resume goes on from
+ * the run's last save, as for a stored run with no result. A drain that
+ * reached a resume before it took the run up wrote nothing: the run still
+ * waits for the approvals and client results it was suspended on, or, failed
+ * in transit, for a resume with `retryFailed`.
+ */
+function drainedPending(stored: AgentRunEnvelope | undefined): HeadlessPendingAction[] {
+  if (!stored) return [];
+  if (stored.result?.status === 'suspended') return pendingOf(stored.result);
+  return awaitingResume(stored);
+}
+
+/**
+ * What a stored run that has not ended (or failed in transit) waits for: a
+ * resume, after an answer for each interrupted call that is not idempotent.
+ */
+function awaitingResume(envelope: AgentRunEnvelope): HeadlessPendingAction[] {
+  const unknown = Object.values(envelope.toolResults ?? {}).filter(
+    (receipt) => receipt.stage === 'executing' && receipt.idempotent !== true,
+  );
+  // A run that failed in transit is re-entered in the phase it failed in.
+  const phase =
+    envelope.phase !== 'terminal'
+      ? envelope.phase
+      : envelope.retry?.phase === 'finalizing'
+        ? 'finalizing'
+        : 'running';
+  return [...unknown.map(unknownEffect), { kind: 'resume', phase }];
 }
 
 function unknownEffect(receipt: {
@@ -324,7 +368,8 @@ function plain<T>(value: T): T {
 
 /**
  * The report of a native result. `stored` is the stored run as the leg left it,
- * when it could be read: its phase, and the retry its failure allows.
+ * when it could be read: its phase, the retry its failure allows, and what a
+ * drained run waits for.
  */
 export function reportFromResult(
   result: AgentResult<unknown>,
@@ -344,7 +389,7 @@ export function reportFromResult(
     ...(result.status === 'failed' ? { error: { ...result.error } } : {}),
     ...(retry ? { retry } : {}),
     ...(result.stopDetails ? { stopDetails: { ...result.stopDetails } } : {}),
-    pending: pendingOf(result),
+    pending: pendingOf(result, context.stored),
     usage: { ...result.usage },
     modelSteps: result.modelSteps,
     ...(result.accounting ? { cost: costOf(result.accounting) } : {}),
@@ -384,12 +429,8 @@ export function reportFromEnvelope(envelope: AgentRunEnvelope): HeadlessReport {
   if (envelope.result) {
     return reportFromResult(envelope.result, { scope: envelope.scope, stored: envelope });
   }
-  // No result: the run is in progress, or its executor stopped before it ended.
-  // An interrupted call that is not idempotent needs a decision before resume.
-  const unknown = Object.values(envelope.toolResults ?? {}).filter(
-    (receipt) => receipt.stage === 'executing' && receipt.idempotent !== true,
-  );
-  const phase = envelope.phase === 'terminal' ? 'running' : envelope.phase;
+  // No result: the run is in progress, or its executor stopped before it ended
+  // (a drained run too). It waits for a resume, after its unknown effects.
   const cost = costOf(savedTotals(envelope));
   const report: HeadlessReport = {
     kind: 'deuz-headless-report',
@@ -399,7 +440,7 @@ export function reportFromEnvelope(envelope: AgentRunEnvelope): HeadlessReport {
     status: 'in-progress',
     outcome: 'pending',
     phase: envelope.phase,
-    pending: [...unknown.map(unknownEffect), { kind: 'resume', phase }],
+    pending: awaitingResume(envelope),
     usage: { ...envelope.usage },
     modelSteps: envelope.modelSteps,
     ...(cost ? { cost } : {}),
