@@ -8,14 +8,17 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { streamChat } from '../src';
-import { runAgent } from '../src/agent-run';
+import { createInMemoryAgentRunStore, runAgent } from '../src/agent-run';
 import { generateText } from '../src/generate';
 import { agentTool } from '../src/inference/agent-tool';
 import { handoff } from '../src/inference/handoff';
+import { hasToolCall, stepCountIs } from '../src/inference/stop';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
+import { exitCodeFor, runHeadless } from '../src/node/headless';
 import { createOtelObserver, createOtelTracer } from '../src/otel';
 import { createPriceProvider, PRICES_2026, type PriceTable } from '../src/pricing';
 import { createMockModel, type MockResponse } from '../src/testing';
+import type { AgentToolSet } from '../src/types/agent-run';
 import type { LanguageModel } from '../src/types/model';
 import type { ToolExecuteContext } from '../src/types/tool';
 import type { Usage } from '../src/types/usage';
@@ -313,4 +316,50 @@ describe('migrate-from-ai-sdk rules: runtimeContext, typed tool context, OTel (W
     expect(row).not.toMatch(/no equivalent/i);
     expect(row).toMatch(/createOtelTracer[^\n]*'@deuz-sdk\/core\/otel'/);
   });
+});
+
+describe('headless.md: which stop conditions exit 6 (W3 review V5-5)', () => {
+  const tools: AgentToolSet = {
+    ping: {
+      description: 'Ping.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      execute: () => 'pong',
+    },
+  };
+  const run = (runId: string, stopWhen: Parameters<typeof runHeadless>[0]['stopWhen']) =>
+    runHeadless({
+      model: createMockModel({
+        responses: [{ toolCalls: [{ toolName: 'ping', args: {} }] }, { text: 'done' }],
+      }),
+      prompt: 'Ping once.',
+      tools,
+      store: createInMemoryAgentRunStore(),
+      runId,
+      stopWhen,
+    });
+
+  it('hasToolCall and a custom predicate exit 7; a step, token, cost or time bound exits 6', async () => {
+    const byTool = await run('by-tool', hasToolCall('ping'));
+    expect(byTool).toMatchObject({ status: 'stopped', reason: 'hasToolCall', outcome: 'stopped' });
+    expect(exitCodeFor(byTool)).toBe(7);
+    const custom = await run('custom', ({ steps }) => steps.length >= 1);
+    expect(custom).toMatchObject({ status: 'stopped', reason: 'custom', outcome: 'stopped' });
+    expect(exitCodeFor(custom)).toBe(7);
+    const bySteps = await run('by-steps', stepCountIs(1));
+    expect(bySteps).toMatchObject({ reason: 'stepCountIs', outcome: 'limit' });
+    expect(exitCodeFor(bySteps)).toBe(6);
+  });
+
+  it.each(bothCopies('references/headless.md'))(
+    '%s puts only the bounds under exit 6 and the other stop conditions under 7',
+    (path) => {
+      const rows = read(path).split('\n');
+      const row = (code: number) => rows.find((line) => line.startsWith(`| ${code} |`)) ?? '';
+      // "a stop condition" alone would claim hasToolCall and custom stops too.
+      expect(row(6)).not.toMatch(/a stop condition,/);
+      for (const name of ['costExceeds', 'totalTokensExceed', 'stepCountIs', 'durationExceeds'])
+        expect(row(6)).toContain(`\`${name}\``);
+      expect(row(7)).toContain('`hasToolCall`');
+    },
+  );
 });

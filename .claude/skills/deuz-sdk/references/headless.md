@@ -65,8 +65,8 @@ console.log(done.outcome, done.output, exitCodeFor(done)); // completed Deployed
 | 3 | `pending` | It waits: approvals, client tool results, calls whose effect is unknown, or (a stored run with no result) a resume |
 | 4 | `refused` | The model refused (stop reason `'refusal'`) |
 | 5 | `cancelled` | Aborted or cancelled |
-| 6 | `limit` | A limit you set: `budget.usd` / `budget.tokens`, `maxSteps`, a stop condition, the execution deadline, a timeout, or `unknownPrice: 'reject'` |
-| 7 | `stopped` | Stopped short for another reason: a guardrail, a verifier that never accepted, a cut-off output, a changed MCP catalog |
+| 6 | `limit` | A limit you set: `budget.usd` / `budget.tokens`, `maxSteps`, a stop condition on cost, tokens, steps or duration (`costExceeds`, `totalTokensExceed`, `stepCountIs`, `durationExceeds`), the execution deadline, a timeout, or `unknownPrice: 'reject'` |
+| 7 | `stopped` | Stopped short for another reason: a `hasToolCall` or custom `stopWhen` condition, a guardrail, a verifier that never accepted, an invalid output, a cut-off output, a changed MCP catalog |
 | 8 | — | `doctor` found an error |
 
 A run that did not complete never exits 0. `process.exitCode = exitCodeFor(report)` is the whole contract for a shell.
