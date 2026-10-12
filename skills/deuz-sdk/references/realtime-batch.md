@@ -72,7 +72,10 @@ A browser cannot set WebSocket headers and must never hold a key. Your server mi
 // app/api/voice-token/route.ts (server)
 import { createOpenAIClientSecret, createOpenAIRealtime } from '@deuz-sdk/core/realtime';
 
-export async function POST(): Promise<Response> {
+declare function requireUser(req: Request): Promise<{ id: string }>; // your auth: rejects anonymous callers
+
+export async function POST(req: Request): Promise<Response> {
+  await requireUser(req); // before minting: each token is a credential on your account
   const { token, expiresAt } = await createOpenAIClientSecret({
     model: createOpenAIRealtime({ apiKey: process.env.OPENAI_API_KEY! })('gpt-realtime'),
     instructions: 'You are a friendly receptionist.',
@@ -95,6 +98,8 @@ const session = createRealtimeSession({
 });
 await session.connect();
 ```
+
+**The token route spends your key.** Authenticate the caller before minting, and rate-limit the route per user: each token opens sessions billed to your account (on OpenAI its configuration is only a default the browser can change), and no budget applies inside a session.
 
 `createOpenAIClientSecret` (`expiresInSeconds` 10–7200) attaches the configuration as a **default** the browser's own `session.update` can change. `createGeminiAuthToken` (`uses`, `expiresInSeconds`, `newSessionExpiresInSeconds`) **locks** it by default (`lockConfig: true`; `false`, or a list of setup field paths to lock only those). Both take the session configuration options (`instructions`, `voice`, `tools`, …) and resolve `{ token, expiresAt, raw }`; HTTP failures map onto the usual error taxonomy.
 
@@ -197,7 +202,7 @@ The holds settle through the client's execution context. A context restored from
 
 ## Sharp edges
 
-- A browser session needs `ephemeralToken`; a browser asked to send the key header fails with `kind: 'connect-failed'`, and the key must never reach the client.
+- A browser session needs `ephemeralToken`; a browser asked to send the key header fails with `kind: 'connect-failed'`, and the key must never reach the client. The route that mints tokens must authenticate its caller: an open one lets anyone open sessions on your account.
 - Realtime sessions are single-use and enforce no budget; batch has no tools.
 - Realtime and OpenAI / Gemini batch requests are unpriced until you add rows: under a USD budget they warn and run, they are not refused (unless `unknownPrice: 'reject'`).
 - Read a batch's results to settle its holds; a sweep that runs before `holdUntil` closes them at their estimate.

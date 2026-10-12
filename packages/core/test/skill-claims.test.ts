@@ -17,6 +17,7 @@ import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import { exitCodeFor, runHeadless } from '../src/node/headless';
 import { createOtelObserver, createOtelTracer } from '../src/otel';
 import { createPriceProvider, PRICES_2026, type PriceTable } from '../src/pricing';
+import { createOpenAIClientSecret, createOpenAIRealtime } from '../src/realtime';
 import { createMockModel, type MockResponse } from '../src/testing';
 import type { AgentToolSet } from '../src/types/agent-run';
 import type { LanguageModel } from '../src/types/model';
@@ -360,6 +361,49 @@ describe('headless.md: which stop conditions exit 6 (W3 review V5-5)', () => {
       for (const name of ['costExceeds', 'totalTokensExceed', 'stepCountIs', 'durationExceeds'])
         expect(row(6)).toContain(`\`${name}\``);
       expect(row(7)).toContain('`hasToolCall`');
+    },
+  );
+});
+
+describe('realtime-batch.md: the voice-token route (W3 review V5-6)', () => {
+  it('minting spends the server key for whoever calls the route', async () => {
+    const auth: string[] = [];
+    let n = 0;
+    const fetchImpl = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      auth.push(new Headers(init?.headers).get('authorization') ?? '');
+      n += 1;
+      return Response.json({ value: `ek_${n}`, expires_at: 1_900_000_000 });
+    }) as typeof fetch;
+    // The route the skill showed before 2.3's fix round: it takes no request at all.
+    async function POST(): Promise<Response> {
+      const { token, expiresAt } = await createOpenAIClientSecret({
+        model: createOpenAIRealtime({ apiKey: 'sk-server' })('gpt-realtime'),
+        instructions: 'You are a friendly receptionist.',
+        expiresInSeconds: 120,
+        deps: { fetch: fetchImpl },
+      });
+      return Response.json({ token, expiresAt });
+    }
+    const first = (await (await POST()).json()) as { token: string };
+    const second = (await (await POST()).json()) as { token: string };
+    expect([first.token, second.token]).toEqual(['ek_1', 'ek_2']);
+    expect(auth).toEqual(['Bearer sk-server', 'Bearer sk-server']);
+  });
+
+  it.each(bothCopies('references/realtime-batch.md'))(
+    '%s authenticates the caller before minting, and says to rate-limit the route',
+    (path) => {
+      const text = read(path);
+      const start = text.indexOf('### Browser sessions: ephemeral tokens');
+      expect(start).toBeGreaterThan(0);
+      const section = text.slice(start, text.indexOf('\n## ', start));
+      expect(section).toMatch(/authenticate the caller/i);
+      expect(section).toMatch(/rate-limit/i);
+      const route = section.slice(section.indexOf('// app/api/voice-token/route.ts'));
+      expect(route).toContain('export async function POST(req: Request)');
+      const check = route.indexOf('await requireUser(req)');
+      expect(check).toBeGreaterThan(0);
+      expect(check).toBeLessThan(route.indexOf('createOpenAIClientSecret({'));
     },
   );
 });
