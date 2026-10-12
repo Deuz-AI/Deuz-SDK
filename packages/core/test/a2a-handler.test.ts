@@ -625,6 +625,24 @@ describe('createA2AHandler — turns of one task', () => {
     ]);
   });
 
+  // Only a status update ends a turn, as in the official SDK: until the turn
+  // changes the status, the task still shows the previous turn's INPUT_REQUIRED.
+  it('keeps a follow-up turn open when it adds an artifact before changing the status', async () => {
+    const { handler, errors } = handlerWith(async (ctx) => {
+      if (!ctx.task) return ctx.requireInput('Which city?');
+      await ctx.artifact({ artifactId: 'forecast', parts: [{ text: 'Sunny in Izmir.' }] });
+      await ctx.complete('Here is the forecast.');
+    });
+    const asked = ((await send(handler, 'weather?')).result as { task: A2ATask }).task;
+    const done = ((await send(handler, 'Izmir', { taskId: asked.id })).result as { task: A2ATask })
+      .task;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(done.artifacts).toEqual([
+      { artifactId: 'forecast', parts: [{ text: 'Sunny in Izmir.' }] },
+    ]);
+    expect(errors).toEqual([]);
+  });
+
   it('refuses a message to an unknown task with TASK_NOT_FOUND', async () => {
     const { handler } = handlerWith((ctx) => ctx.complete());
     const body = await send(handler, 'hi', { taskId: 'missing' });
@@ -660,6 +678,100 @@ describe('createA2AHandler — turns of one task', () => {
     release.open();
   });
 });
+
+// A follow-up turn opens with the task's snapshot. A non-blocking SendMessage
+// must not be answered with that snapshot: the executor has not looked at the
+// message yet, and its refusal would then reach nobody (the message is taken
+// back out of the history all the same).
+describe.each(['JSONRPC', 'HTTP+JSON'] as const)(
+  'createA2AHandler — a follow-up sent with returnImmediately (%s)',
+  (binding) => {
+    /** SendMessage over the binding: the task it answered, or the binding's error body. */
+    async function sendOver(
+      handler: (request: Request) => Promise<Response>,
+      message: Record<string, unknown>,
+      configuration?: Record<string, unknown>,
+    ): Promise<{ task?: A2ATask; error?: Record<string, unknown>; status: number }> {
+      const params = { message, ...(configuration ? { configuration } : {}) };
+      if (binding === 'JSONRPC') {
+        const { body, status } = await rpc(handler, 'SendMessage', params);
+        if (body.error) return { error: body.error as Record<string, unknown>, status };
+        return { task: (body.result as { task: A2ATask }).task, status };
+      }
+      const response = await rest(handler, 'POST', '/message:send', params);
+      const body = (await response.json()) as { task?: A2ATask; error?: Record<string, unknown> };
+      return { ...body, status: response.status };
+    }
+
+    async function getOver(handler: (request: Request) => Promise<Response>, id: string) {
+      if (binding === 'JSONRPC')
+        return (await rpc(handler, 'GetTask', { id })).body.result as A2ATask;
+      return (await (await rest(handler, 'GET', `/tasks/${id}`)).json()) as A2ATask;
+    }
+
+    it('answers once the executor first updates the task', async () => {
+      const release = gate();
+      const { handler } = handlerWith(async (ctx) => {
+        if (!ctx.task) return ctx.requireInput('Which city?');
+        await ctx.working('Looking it up…');
+        await release.promise;
+        await ctx.complete('Sunny.');
+      });
+      const asked = (await sendOver(handler, userMessage('weather?'))).task as A2ATask;
+      const answer = await sendOver(handler, userMessage('Izmir', { taskId: asked.id }), {
+        returnImmediately: true,
+      });
+      expect(answer.task?.status.state).toBe('TASK_STATE_WORKING');
+      expect(answer.task?.status.message?.parts).toEqual([{ text: 'Looking it up…' }]);
+      expect(answer.task?.history?.map((message) => message.messageId)).toContain('user-Izmir');
+      release.open();
+      await tick();
+      expect((await getOver(handler, asked.id)).status.state).toBe('TASK_STATE_COMPLETED');
+    });
+
+    it('answers a refused follow-up with the A2A error and leaves the task as it was', async () => {
+      const { handler, errors } = handlerWith(async (ctx) => {
+        if (!ctx.task) return ctx.requireInput('Which city?');
+        throw new A2AError({ reason: 'CONTENT_TYPE_NOT_SUPPORTED', message: 'Text only, please.' });
+      });
+      const asked = (await sendOver(handler, userMessage('weather?'))).task as A2ATask;
+      const before = await getOver(handler, asked.id);
+      const refused = await sendOver(
+        handler,
+        {
+          messageId: 'm-picture',
+          role: 'ROLE_USER',
+          parts: [{ url: 'https://example.test/izmir.png' }],
+          taskId: asked.id,
+        },
+        { returnImmediately: true },
+      );
+      expect(refused.task).toBeUndefined();
+      if (binding === 'JSONRPC') {
+        expect(refused.error).toMatchObject({ code: -32005, message: 'Text only, please.' });
+      } else {
+        expect(refused.status).toBe(400);
+        expect(refused.error).toMatchObject({
+          status: 'INVALID_ARGUMENT',
+          message: 'Text only, please.',
+          details: errorInfo('CONTENT_TYPE_NOT_SUPPORTED'),
+        });
+      }
+      expect(await getOver(handler, asked.id)).toEqual(before);
+      expect(errors).toEqual([]);
+    });
+
+    it('answers a follow-up whose executor makes no update with the waiting task', async () => {
+      const { handler } = handlerWith((ctx) => (ctx.task ? undefined : ctx.requireInput('?')));
+      const asked = (await sendOver(handler, userMessage('weather?'))).task as A2ATask;
+      const answer = await sendOver(handler, userMessage('Izmir', { taskId: asked.id }), {
+        returnImmediately: true,
+      });
+      expect(answer.task?.status).toEqual(asked.status);
+      expect(answer.task?.history?.at(-1)?.messageId).toBe('user-Izmir');
+    });
+  },
+);
 
 describe('createA2AHandler — GetTask and scopes', () => {
   it('returns a stored task and trims its history to historyLength', async () => {
@@ -1003,6 +1115,137 @@ describe('createA2AHandler — SendStreamingMessage', () => {
   });
 });
 
+describe('createA2AHandler — drafts', () => {
+  it('streams a draft to the turn’s streams and stores only the artifact that replaces it', async () => {
+    const drafted = gate();
+    const release = gate();
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.working();
+      const id = await ctx.draft({ artifactId: 'answer', parts: [{ text: 'Hel' }] });
+      await ctx.draft({ artifactId: id, parts: [{ text: 'lo' }] }, { append: true });
+      drafted.open();
+      await release.promise;
+      await ctx.artifact({ artifactId: id, parts: [{ text: 'Hello.' }] }, { lastChunk: true });
+      await ctx.complete();
+    });
+    const { id, response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: userMessage('hello'),
+    });
+    const reader = sseReader(response);
+    const task = ((await reader.next())?.data.result as { task: A2ATask }).task;
+    await drafted.promise;
+    // Nothing of the draft is stored: GetTask (and a blocking SendMessage) never see it.
+    const working = (await rpc(handler, 'GetTask', { id: task.id })).body.result as A2ATask;
+    expect(working.status.state).toBe('TASK_STATE_WORKING');
+    expect(working.artifacts ?? []).toEqual([]);
+    release.open();
+    const events = (await reader.rest()).map(({ data }) => {
+      expect(data).toMatchObject({ jsonrpc: '2.0', id });
+      return data.result;
+    });
+    expect(events).toEqual([
+      {
+        statusUpdate: expect.objectContaining({
+          status: expect.objectContaining({ state: 'TASK_STATE_WORKING' }),
+        }),
+      },
+      {
+        artifactUpdate: {
+          taskId: task.id,
+          contextId: task.contextId,
+          artifact: { artifactId: 'answer', parts: [{ text: 'Hel' }] },
+        },
+      },
+      {
+        artifactUpdate: {
+          taskId: task.id,
+          contextId: task.contextId,
+          artifact: { artifactId: 'answer', parts: [{ text: 'lo' }] },
+          append: true,
+        },
+      },
+      {
+        artifactUpdate: {
+          taskId: task.id,
+          contextId: task.contextId,
+          artifact: { artifactId: 'answer', parts: [{ text: 'Hello.' }] },
+          lastChunk: true,
+        },
+      },
+      {
+        statusUpdate: expect.objectContaining({
+          status: expect.objectContaining({ state: 'TASK_STATE_COMPLETED' }),
+        }),
+      },
+    ]);
+    const done = (await rpc(handler, 'GetTask', { id: task.id })).body.result as A2ATask;
+    expect(done.artifacts).toEqual([{ artifactId: 'answer', parts: [{ text: 'Hello.' }] }]);
+  });
+
+  it('streams drafts to a client that subscribed while the turn runs', async () => {
+    const release = gate();
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.working();
+      await release.promise;
+      await ctx.draft({ artifactId: 'answer', parts: [{ text: 'draft' }] });
+      await ctx.complete();
+    });
+    const task = (
+      (await send(handler, 'hello', {}, { returnImmediately: true })).result as { task: A2ATask }
+    ).task;
+    const { response } = await rpcStream(handler, 'SubscribeToTask', { id: task.id });
+    const reader = sseReader(response);
+    await reader.next(); // the snapshot
+    release.open();
+    const events = (await reader.rest()).map(({ data }) => data.result);
+    expect(events[0]).toEqual({
+      artifactUpdate: {
+        taskId: task.id,
+        contextId: task.contextId,
+        artifact: { artifactId: 'answer', parts: [{ text: 'draft' }] },
+      },
+    });
+  });
+
+  it('needs the task and at least one part, and generates an id when none is given', async () => {
+    const outcomes: unknown[] = [];
+    const { handler } = handlerWith(async (ctx) => {
+      outcomes.push(
+        await ctx.draft({ parts: [{ text: 'too early' }] }).catch((error: unknown) => error),
+      );
+      await ctx.working();
+      outcomes.push(await ctx.draft({ parts: [] }).catch((error: unknown) => error));
+      outcomes.push(await ctx.draft({ parts: [{ text: 'ok' }] }));
+      await ctx.complete();
+    });
+    await send(handler, 'hello');
+    expect(outcomes[0]).toBeInstanceOf(InvalidRequestError);
+    expect(outcomes[1]).toBeInstanceOf(InvalidRequestError);
+    expect(outcomes[2]).toEqual(expect.any(String));
+  });
+
+  it('rejects a draft once the turn ended', async () => {
+    let late: Promise<unknown> | undefined;
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.complete();
+      late = ctx.draft({ parts: [{ text: 'late' }] }).catch((error: unknown) => error);
+    });
+    await send(handler, 'hello');
+    expect(await late).toMatchObject({ reason: 'UNSUPPORTED_OPERATION' });
+  });
+
+  it('does not answer a non-blocking follow-up: a refusal after a draft still reaches the client', async () => {
+    const { handler } = handlerWith(async (ctx) => {
+      if (!ctx.task) return ctx.requireInput('Which city?');
+      await ctx.draft({ artifactId: 'answer', parts: [{ text: 'thinking' }] });
+      throw new A2AError({ reason: 'INVALID_PARAMS', message: 'Name a city.' });
+    });
+    const asked = ((await send(handler, 'weather?')).result as { task: A2ATask }).task;
+    const refused = await send(handler, '42', { taskId: asked.id }, { returnImmediately: true });
+    expect(refused.error).toMatchObject({ code: -32602, message: 'Name a city.' });
+  });
+});
+
 describe('createA2AHandler — SubscribeToTask', () => {
   it('streams a running task from a snapshot to the end of its turn', async () => {
     const release = gate();
@@ -1219,6 +1462,21 @@ describe('createA2AHandler — AUTH_REQUIRED', () => {
         }),
       },
     ]);
+  });
+
+  it('answers a blocking follow-up at a status update, not at an artifact', async () => {
+    const { handler } = handlerWith(async (ctx) => {
+      if (!ctx.task) return ctx.requireAuth('Sign in at https://auth.test');
+      await ctx.artifact({ artifactId: 'profile', parts: [{ text: 'Ada' }] });
+      await ctx.complete('Signed in and done.');
+    });
+    const task = ((await send(handler, 'hello')).result as { task: A2ATask }).task;
+    expect(task.status.state).toBe('TASK_STATE_AUTH_REQUIRED');
+    const done = (
+      (await send(handler, 'signed in', { taskId: task.id })).result as { task: A2ATask }
+    ).task;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(done.artifacts).toEqual([{ artifactId: 'profile', parts: [{ text: 'Ada' }] }]);
   });
 });
 

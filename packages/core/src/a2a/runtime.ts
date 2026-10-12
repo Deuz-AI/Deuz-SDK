@@ -189,12 +189,18 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
       : { task: structuredClone(turn.task as A2ATask) };
   }
 
-  function publish(turn: Turn, event: A2AStreamResponse): void {
-    turn.first.resolve(result(turn));
+  /** Sends an event to the streams following the turn. */
+  function announce(turn: Turn, event: A2AStreamResponse): void {
     for (const sink of turn.sinks) {
       if (sink.closed) turn.sinks.delete(sink);
       else sink.event(structuredClone(event));
     }
+  }
+
+  /** An update of the turn: it answers a non-blocking request, then goes to the streams. */
+  function publish(turn: Turn, event: A2AStreamResponse): void {
+    turn.first.resolve(result(turn));
+    announce(turn, event);
   }
 
   function detach(turn: Turn): void {
@@ -248,7 +254,10 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
 
   /**
    * Applies one change to the task: creates it first (SUBMITTED) when this is
-   * the interaction's first update, then saves and announces both.
+   * the interaction's first update, then saves and announces both. Only a
+   * status update ends or interrupts the turn, as in the official SDK: a
+   * follow-up turn's task shows the previous turn's `INPUT_REQUIRED` until
+   * this turn changes its status.
    */
   function mutate(turn: Turn, change: (task: A2ATask) => A2AStreamResponse): Promise<void> {
     return withLock(turn.key, async () => {
@@ -277,11 +286,13 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
         }
         task = structuredClone(stored);
       }
-      events.push(change(task));
+      const update = change(task);
+      events.push(update);
       await store.save(task, turn.scope);
       turn.task = task;
       turn.changed = true;
       for (const event of events) publish(turn, event);
+      if (update.statusUpdate === undefined) return;
       const state = task.status.state;
       if (isTerminalState(state) || state === 'TASK_STATE_INPUT_REQUIRED') end(turn);
       else if (state === 'TASK_STATE_AUTH_REQUIRED') turn.outcome.resolve(result(turn));
@@ -368,6 +379,40 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
     return mutate(turn, change).then(() => artifactId);
   }
 
+  /**
+   * An artifact update for the streams following the turn alone: never
+   * stored, so it neither answers a request nor shows in the task.
+   */
+  function draft(
+    turn: Turn,
+    input: A2AArtifactInput,
+    draftOptions: { append?: boolean } = {},
+  ): Promise<string> {
+    if (!Array.isArray(input?.parts) || input.parts.length === 0) {
+      return Promise.reject(
+        new InvalidRequestError({ message: 'A draft needs at least one part.' }),
+      );
+    }
+    const artifactId = input.artifactId ?? deps.generateId();
+    return withLock(turn.key, async () => {
+      if (turn.ended) throw turnOver(turn);
+      if (turn.task === undefined) {
+        throw new InvalidRequestError({
+          message: 'A draft needs the task: make a status or artifact update first.',
+        });
+      }
+      announce(turn, {
+        artifactUpdate: {
+          taskId: turn.taskId,
+          contextId: turn.contextId,
+          artifact: structuredClone({ ...input, artifactId }),
+          ...(draftOptions.append ? { append: true } : {}),
+        },
+      });
+      return artifactId;
+    });
+  }
+
   function reply(turn: Turn, input: A2AMessageInput): Promise<void> {
     return withLock(turn.key, async () => {
       if (turn.ended) throw turnOver(turn);
@@ -406,6 +451,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
       reply: (message) => reply(turn, message),
       working: status('TASK_STATE_WORKING'),
       artifact: (artifact, artifactOptions) => addArtifact(turn, artifact, artifactOptions),
+      draft: (artifact, draftOptions) => draft(turn, artifact, draftOptions),
       requireInput: status('TASK_STATE_INPUT_REQUIRED'),
       requireAuth: status('TASK_STATE_AUTH_REQUIRED'),
       complete: status('TASK_STATE_COMPLETED'),
@@ -546,7 +592,10 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
           sink,
         });
         live.set(key, continued);
-        publish(continued, { task: structuredClone(next) });
+        // Streams open with the snapshot. A non-blocking request is answered at
+        // the executor's first update instead, as a new interaction is, so a
+        // refusal of the message reaches its client as an error.
+        announce(continued, { task: structuredClone(next) });
         return continued;
       });
     } else {

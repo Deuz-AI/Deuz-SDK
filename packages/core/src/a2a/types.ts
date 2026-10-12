@@ -191,7 +191,12 @@ export interface A2ASendMessageConfiguration {
   taskPushNotificationConfig?: A2ATaskPushNotificationConfig;
   /** At most this many of the most recent history messages in the returned task; 0 for none. */
   historyLength?: number;
-  /** Return as soon as the task exists instead of waiting for a terminal or interrupted state. */
+  /**
+   * Answer at the agent's first update instead of waiting for a terminal or
+   * interrupted state: a new task as soon as it exists, a task the message
+   * continues once the agent has taken the message up. A message the agent
+   * refuses is answered with the error either way.
+   */
   returnImmediately?: boolean;
 }
 
@@ -434,8 +439,8 @@ export interface A2AClient {
   readonly card: A2AAgentCard | undefined;
   /**
    * `SendMessage`: send a message and wait for the answer — a direct
-   * message, or the task once it is terminal or interrupted (or as soon as it
-   * exists with `configuration.returnImmediately`).
+   * message, or the task once it is terminal or interrupted (or at the
+   * agent's first update with `configuration.returnImmediately`).
    */
   sendMessage(
     message: A2AMessageInput,
@@ -512,12 +517,14 @@ export interface A2AArtifactOptions {
  * message to an `INPUT_REQUIRED` or `AUTH_REQUIRED` task starts a new turn of
  * that task, with `task` set and the message added to its history.
  *
- * The turn ends at `reply`, at a terminal state, at `INPUT_REQUIRED`, or when
- * `execute` settles; updates after that are rejected. If `execute` resolves
- * while the task is `SUBMITTED` or `WORKING` the task is completed; if it
- * resolves without a reply or an update, a new interaction answers
- * `INVALID_AGENT_RESPONSE` and a follow-up turn answers with the task as it
- * waits. If `execute` throws, the task fails with the error's message —
+ * The turn ends at `reply`, at a status update to a terminal state or to
+ * `INPUT_REQUIRED`, or when `execute` settles; updates after that are
+ * rejected. A follow-up turn's task keeps the previous turn's state until a
+ * status update of this turn, so an artifact added first ends nothing. If
+ * `execute` resolves while the task is `SUBMITTED` or `WORKING` the task is
+ * completed; if it resolves without a reply or an update, a new interaction
+ * answers `INVALID_AGENT_RESPONSE` and a follow-up turn answers with the task
+ * as it waits. If `execute` throws, the task fails with the error's message —
  * unless it throws an `A2AError` of its own before changing the task, which
  * answers the request with that error instead and leaves the task as it was
  * (a follow-up message comes back out of its history). An `A2AError` a
@@ -549,6 +556,17 @@ export interface A2AExecutionContext {
   working(message?: A2AMessageInput, options?: A2AStatusOptions): Promise<void>;
   /** Add an artifact, or extend one (`append`). Resolves with the artifact's id. */
   artifact(artifact: A2AArtifactInput, options?: A2AArtifactOptions): Promise<string>;
+  /**
+   * Stream an artifact update to the clients following this turn without
+   * storing it (2.3): a preview, such as text while a model writes it, sent as
+   * an `artifactUpdate` (with `append`, it extends the previewed artifact).
+   * `GetTask`, a blocking `SendMessage` and a later `SubscribeToTask` never
+   * see it, and it does not answer a `returnImmediately` request. Store the
+   * finished content with `artifact` under the same `artifactId` to replace
+   * the preview. Needs the task, so make an update first. Resolves with the
+   * artifact's id.
+   */
+  draft(artifact: A2AArtifactInput, options?: { append?: boolean }): Promise<string>;
   /** `TASK_STATE_INPUT_REQUIRED`: ask the client; its next message starts a new turn. Ends the turn. */
   requireInput(message?: A2AMessageInput, options?: A2AStatusOptions): Promise<void>;
   /** `TASK_STATE_AUTH_REQUIRED`. The turn stays open, so the executor may continue once authorized. */
