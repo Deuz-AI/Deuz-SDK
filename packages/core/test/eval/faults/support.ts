@@ -10,12 +10,20 @@
  * The recovery label a scenario returns is derived from what it observed, never
  * hard-coded, so the harness's comparison with `fault.recovery` means something.
  */
-import { createMockModel, type EvalAcceptance, type MockResponse } from '../../../src/testing';
+import {
+  createMockModel,
+  sseResponse,
+  type EvalAcceptance,
+  type MockResponse,
+} from '../../../src/testing';
 import { attachConfig, readConfig } from '../../../src/internal/config-symbol';
+import { createAnthropic } from '../../../src/anthropic';
+import { createOpenAI } from '../../../src/openai';
 import type { AgentRunEnvelope, AgentRunStore } from '../../../src/types/agent-run';
 import type { LanguageModel } from '../../../src/types/model';
+import { openaiTurn, scriptedFetch, type ScriptStep } from '../../fixtures/wire-turns';
 
-export { mockPrices, parameters, scripted } from '../support';
+export { memoryRecord, mockPrices, parameters, scripted, watchedMemory } from '../support';
 
 /** What one default mock turn bills: 10 input + 5 output tokens at the mock prices. */
 export const TURN = { tokens: 15, usd: (10 * 1 + 5 * 4) / 1_000_000 };
@@ -98,4 +106,40 @@ export function breakingOnce(responses: MockResponse[]): {
     return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
   }) as typeof globalThis.fetch;
   return { model: attachConfig({ ...base }, { ...config, fetch }), calls: () => calls };
+}
+
+/** A Claude model on the scripted Anthropic wire; `wire` keeps every request body. */
+export function claudeOn(modelId: string, script: ScriptStep[]) {
+  const wire = scriptedFetch(script);
+  return { model: createAnthropic({ apiKey: 'offline', fetch: wire.fetch })(modelId), wire };
+}
+
+/** An OpenAI-compatible model on the scripted Chat Completions wire. */
+export function openaiOn(modelId: string, script: ScriptStep[]) {
+  const wire = scriptedFetch(script);
+  return { model: createOpenAI({ apiKey: 'offline', fetch: wire.fetch })(modelId), wire };
+}
+
+/**
+ * An OpenAI-compatible model that answers each request from its body, as a
+ * model answers from the history it is sent: a step replayed after a crash
+ * gets the same answer again.
+ */
+export function openaiAnswering(modelId: string, answer: (body: string) => string) {
+  const bodies: string[] = [];
+  const fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const body = String(init?.body ?? '');
+    bodies.push(body);
+    return sseResponse([answer(body)]);
+  }) as typeof globalThis.fetch;
+  return {
+    model: createOpenAI({ apiKey: 'offline', fetch })(modelId),
+    calls: () => bodies.length,
+    bodies: () => [...bodies],
+  };
+}
+
+/** A Chat Completions turn that bills what a mock turn bills: 10 input + 5 output tokens. */
+export function gptTurn(turn: Parameters<typeof openaiTurn>[0]): string {
+  return openaiTurn(turn, { prompt_tokens: 10, completion_tokens: 5 });
 }

@@ -9,6 +9,13 @@
  */
 import { createMockModel, type MockResponse } from '../../src/testing';
 import { attachConfig, readConfig } from '../../src/internal/config-symbol';
+import {
+  createInMemoryMemoryStore,
+  type MemoryQuery,
+  type MemoryRecord,
+  type MemorySeams,
+  type MemoryStore,
+} from '../../src/memory';
 import type { AgentToolSet } from '../../src/types/agent-run';
 import type { LanguageModel } from '../../src/types/model';
 import type { PriceProvider } from '../../src/types/deps';
@@ -61,19 +68,27 @@ export function runWith(on: TaskModel, context: EvalTaskContext) {
   };
 }
 
-/** The mock model, with a counter of the model calls it served (each one is paid). */
+/**
+ * The mock model, with a counter of the model calls it served (each one is
+ * paid) and the request bodies it was sent.
+ */
 export function scripted(responses: MockResponse[]): {
   model: LanguageModel;
   calls: () => number;
+  bodies: () => string[];
 } {
   const base = createMockModel({ responses });
   const config = readConfig(base)!;
-  let calls = 0;
+  const bodies: string[] = [];
   const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    calls += 1;
+    bodies.push(String(init?.body ?? ''));
     return config.fetch!(input, init);
   }) as typeof globalThis.fetch;
-  return { model: attachConfig({ ...base }, { ...config, fetch }), calls: () => calls };
+  return {
+    model: attachConfig({ ...base }, { ...config, fetch }),
+    calls: () => bodies.length,
+    bodies: () => [...bodies],
+  };
 }
 
 /**
@@ -146,3 +161,45 @@ export function observedTools(context: EvalTaskContext): string[] {
 
 /** A native result carries its cumulative usage and accounting already. */
 export type Outcome = EvalTaskOutcome;
+
+/**
+ * Memory seams on an in-memory store seeded with `seed`, recording every
+ * search and every write. Its LLM extracts `facts` and adds each of them.
+ */
+export async function watchedMemory(seed: MemoryRecord[], facts: string[] = []) {
+  const inner = createInMemoryMemoryStore();
+  await inner.upsert(seed);
+  const searches: MemoryQuery[] = [];
+  const writes: MemoryRecord[] = [];
+  let llmCalls = 0;
+  const store: MemoryStore = {
+    ...inner,
+    search: (query) => {
+      searches.push(structuredClone(query));
+      return inner.search(query);
+    },
+    upsert: (records) => {
+      writes.push(...structuredClone(records));
+      return inner.upsert(records);
+    },
+  };
+  let ids = 0;
+  const seams: MemorySeams = {
+    store,
+    llm: async ({ system }) => {
+      llmCalls += 1;
+      return system.includes('extract')
+        ? JSON.stringify({ facts })
+        : JSON.stringify({ memory: facts.map((text) => ({ event: 'ADD', text })) });
+    },
+    clock: { now: () => 5_000, setTimeout: (fn: () => void) => (fn(), () => {}) },
+    generateId: () => `memory-${ids++}`,
+    hashFn: async (text) => `h:${text}`,
+  };
+  return { seams, store: inner, searches, writes, llmCalls: () => llmCalls };
+}
+
+/** One seeded memory record. */
+export function memoryRecord(id: string, text: string, scope: MemoryRecord['scope']): MemoryRecord {
+  return { id, text, hash: `h:${text}`, kind: 'semantic', scope, createdAt: 1, updatedAt: 1 };
+}

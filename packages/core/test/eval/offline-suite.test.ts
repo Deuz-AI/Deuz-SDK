@@ -33,6 +33,9 @@ beforeAll(async () => {
   await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
   await import('@modelcontextprotocol/sdk/server/index.js');
   await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
+  // And the v2 lines the MCP server task runs on.
+  await import('@modelcontextprotocol/client');
+  await import('@modelcontextprotocol/server');
   report = await suite();
 }, 120_000);
 
@@ -68,12 +71,13 @@ describe('offline eval tasks (2.3)', () => {
       successRate: 1,
       falseCompleted: 0,
       humanRescues: 0,
-      // deploy-approved, deploy-denied and the sub-agent payment.
-      requiredApprovals: 3,
+      // deploy-approved, deploy-denied, the sub-agent payment and the UI approval.
+      requiredApprovals: 4,
       repeatedEffects: 0,
+      // The interrupted run and the overloaded primary recover by themselves.
       recovery: {
-        'not-needed': offlineTasks.length - 1,
-        recovered: 1,
+        'not-needed': offlineTasks.length - 2,
+        recovered: 2,
         rescued: 0,
         contained: 0,
         failed: 0,
