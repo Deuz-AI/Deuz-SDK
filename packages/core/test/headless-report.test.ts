@@ -250,6 +250,16 @@ describe('inspectRun (headless preview)', () => {
     });
     // Still a failure: the exit-code contract does not change.
     expect(exitCodeFor(transient)).toBe(HEADLESS_EXIT_CODES.failed);
+    // A stalled stream is a timeout you set (a limit, exit 6), and transient too.
+    const stalled = await stored('r-chunk', failed('r-chunk', 'timeout'), {
+      cause: 'model-call',
+      phase: 'running',
+    });
+    expect(stalled).toMatchObject({
+      outcome: 'limit',
+      retry: { cause: 'model-call', phase: 'running', resumeWith: 'retryFailed' },
+    });
+    expect(exitCodeFor(stalled)).toBe(HEADLESS_EXIT_CODES.limit);
 
     // No record, a record a resume would refuse, or a record beside another outcome.
     const others: [string, AgentResult<unknown>, unknown][] = [

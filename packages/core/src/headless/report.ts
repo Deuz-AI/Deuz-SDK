@@ -23,9 +23,7 @@ import { createExecutionContext } from '../execution-policy';
  * ({@link HEADLESS_EXIT_CODES}):
  *
  * - `'completed'` — the run finished with an accepted output.
- * - `'failed'` — an error ended it (a provider error, a store failure, a lost
- *   lease). When the failure was transient, the report's `retry` says so: a
- *   resume with `retryFailed: true` goes on from the run's last checkpoint.
+ * - `'failed'` — an error ended it (a provider error, a store failure, a lost lease).
  * - `'pending'` — the run is not over and waits for you: approvals, client tool
  *   results, a decision on calls whose effect is unknown, or (a stored run with
  *   no result yet) a resume.
@@ -35,6 +33,9 @@ import { createExecutionContext } from '../execution-policy';
  *   the execution deadline, a timeout, or a strict budget refusing an unpriced model.
  * - `'stopped'` — it stopped short for another reason: a guardrail, a verifier
  *   that never accepted, a cut-off output, a changed MCP catalog.
+ *
+ * A failure whose cause was transient (`'failed'`, or `'limit'` for a
+ * transport timeout) also carries the report's `retry`.
  */
 export type HeadlessOutcome =
   | 'completed'
@@ -127,8 +128,9 @@ export type HeadlessPendingAction =
 export interface HeadlessRetry {
   /**
    * `'model-call'`: a model call failed in transit (a network or provider
-   * error, an open circuit breaker, a stream that broke off). `'admission'`:
-   * the persistent budget store refused a call with a serialization conflict.
+   * error, a transport timeout, an open circuit breaker, a stream that broke
+   * off). `'admission'`: the persistent budget store refused a call with a
+   * serialization conflict.
    */
   cause: AgentRunRetry['cause'];
   /** The phase the run failed in, where the retry re-enters it. */
@@ -160,15 +162,19 @@ export interface HeadlessReport {
   /** The run's result status; `'in-progress'` for a stored run with no result yet. */
   status: AgentResult['status'] | 'in-progress';
   outcome: HeadlessOutcome;
-  /** Where the stored run stands; absent when nothing was stored. */
+  /**
+   * Where the stored run stands; absent when nothing was stored, or when it
+   * could not be read back after the leg (a warning says so).
+   */
   phase?: AgentRunPhase;
   /** A stopped run's reason, e.g. `'refusal'` or `'budget.usd'`. */
   reason?: string;
   error?: { name: string; message: string; code?: string };
   /**
    * The stored run failed in transit, and a resume with `retryFailed: true`
-   * re-enters it. Set on the report of that failure, and of a later leg that
-   * ended before its first write (a retried resume that stopped again for an
+   * re-enters it. Set on the report of that failure (its outcome `'failed'`,
+   * or `'limit'` for a transport timeout), and of a later leg that ended
+   * before its first write (a retried resume that stopped again for an
    * unknown effect: answer it and pass `retryFailed: true` once more). Absent
    * for any other failure, including a resume refused before it wrote.
    */
@@ -180,6 +186,7 @@ export interface HeadlessReport {
   modelSteps: number;
   /** Absent when the run has no budget ledger to read it from. */
   cost?: HeadlessCost;
+  /** The verifier's last verdict, when the run has a `verify` that ran. */
   verification?: AgentVerification['status'];
   /** The warnings this leg reported (`inspectRun` reports none: no call was made). */
   warnings: CallWarning[];

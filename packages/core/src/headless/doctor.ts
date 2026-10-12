@@ -53,7 +53,10 @@ export interface DoctorOptions {
   skills?: readonly string[];
   /** The run asks for structured output, in this mode. */
   output?: { mode?: 'auto' | 'json' | 'tool' };
-  /** `keyProvider` and `priceProvider` are consulted as the run would. */
+  /**
+   * `priceProvider` prices the model (once, as the run would); a
+   * `keyProvider` counts as the key's source and is not called.
+   */
   deps?: Dependencies;
   /** Where to look for the API key. Default: this process's environment. */
   env?: Readonly<Record<string, string | undefined>>;

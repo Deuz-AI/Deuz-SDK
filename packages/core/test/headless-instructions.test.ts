@@ -355,6 +355,24 @@ describe('runHeadless with project instructions and skills', () => {
     ).rejects.toThrow(TypeError);
   });
 
+  it('rejects, storing nothing, when the project instructions cannot be loaded', async () => {
+    await put('proj/AGENTS.md', 'x');
+    const store = createInMemoryAgentRunStore();
+    const start = (extra: object) =>
+      runHeadless({
+        model: createMockModel({ responses: [{ text: 'ok' }] }),
+        prompt: 'go',
+        store,
+        runId: 'no-project',
+        ...extra,
+      });
+    await expect(start({ projectDir: join(base, 'typo') })).rejects.toThrow(TypeError);
+    await expect(
+      start({ projectDir: join(base, 'proj'), projectInstructions: { maxBytes: 0 } }),
+    ).rejects.toThrow(TypeError);
+    expect(await store.load('no-project')).toBeUndefined();
+  });
+
   it('offers the skill catalog and loads a skill body on demand, across a resume', async () => {
     await put(
       'skills/release-notes/SKILL.md',

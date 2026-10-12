@@ -48,7 +48,10 @@ export interface ProjectInstructionFile {
 export interface ProjectInstructions {
   /** The root the search started from. */
   root: string;
-  /** The files in message order, outermost first. A file that repeats an earlier one's text is not listed. */
+  /**
+   * The files in message order, outermost first. A file that is empty, or
+   * repeats an earlier one's text, is not listed.
+   */
   files: ProjectInstructionFile[];
   /**
    * Files found but not read: `'outside-root'` when a link (a symlink, a
