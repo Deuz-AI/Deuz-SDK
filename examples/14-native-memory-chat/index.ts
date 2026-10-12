@@ -138,7 +138,8 @@ const support: AgentRunOptions = {
 };
 
 /**
- * One native run, printing the fail-over and record warnings it streams as they
+ * One native run. `runAgent(options)` is `streamAgent(options).result`; the
+ * stream is read here to print the fail-over and record warnings as they
  * happen. (The scripted model also warns that the model registry does not know
  * it; a real model does not.)
  */
