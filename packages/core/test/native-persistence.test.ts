@@ -8,10 +8,20 @@
  * outcome unknown: a resume never repeats it blindly.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../src/agent-run';
+import {
+  createInMemoryAgentRunStore,
+  resumeAgent,
+  resumeStreamAgent,
+  runAgent,
+} from '../src/agent-run';
 import { createMockModel, type MockResponse } from '../src/testing';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
-import type { AgentRunEnvelope, AgentRunStore, AgentToolSet } from '../src/types/agent-run';
+import type {
+  AgentEvent,
+  AgentRunEnvelope,
+  AgentRunStore,
+  AgentToolSet,
+} from '../src/types/agent-run';
 
 const parameters = { type: 'object' as const, properties: {} };
 
@@ -189,6 +199,41 @@ describe('a landed effect is recorded with reconciledToolResults (2.3)', () => {
       }),
     ).toEqual(resumed);
     expect(effects).toHaveLength(1);
+  });
+
+  it('streams the recorded result like one the tool reported', async () => {
+    const { effects, options, session } = await interrupted();
+    const stream = resumeStreamAgent({
+      ...options,
+      session,
+      reconciledToolResults: [{ toolCallId: 'c1', output: 'charged' }],
+    });
+    const events: AgentEvent[] = [];
+    for await (const event of stream.events) events.push(event);
+    expect(await stream.result).toMatchObject({ status: 'completed', output: 'done' });
+    expect(effects).toHaveLength(1);
+    expect(events).toContainEqual({
+      type: 'tool-output',
+      toolCallId: 'c1',
+      toolName: 'charge',
+      rawResult: 'charged',
+      modelOutput: 'charged',
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'part',
+        part: expect.objectContaining({ type: 'tool-result', toolCallId: 'c1', output: 'charged' }),
+      }),
+    );
+    // Settled, so no longer an unknown effect.
+    expect(
+      events.some(
+        (event) =>
+          event.type === 'part' &&
+          event.part.type === 'tool-state' &&
+          event.part.outcome === 'unknown-effect',
+      ),
+    ).toBe(false);
   });
 
   it("validates and projects the result like the tool's own", async () => {

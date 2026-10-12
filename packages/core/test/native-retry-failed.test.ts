@@ -10,7 +10,12 @@
  * checkpoint. Every other failure is refused before anything is written.
  */
 import { describe, expect, it } from 'vitest';
-import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../src/agent-run';
+import {
+  createInMemoryAgentRunStore,
+  resumeAgent,
+  resumeStreamAgent,
+  runAgent,
+} from '../src/agent-run';
 import { BudgetLedgerError } from '../src/budget-ledger';
 import { createInMemoryBudgetStore } from '../src/budget-store';
 import {
@@ -209,6 +214,25 @@ describe('retryFailed (2.3): a run that failed in transit goes on', () => {
     // A run that did not fail ignores the option.
     expect(await resumeAgent({ ...options, retryFailed: true })).toEqual(retried);
     expect(calls()).toBe(3);
+  });
+
+  it('re-enters through resumeStreamAgent too, streaming only the retried leg', async () => {
+    const store = createInMemoryAgentRunStore();
+    const effects: string[] = [];
+    const { model } = faulty([chargeCall, chargeCall, { text: 'done' }], { 1: 'break' });
+    const options = {
+      model,
+      prompt: 'charge',
+      tools: charging(effects),
+      session: { store, runId: 's', scope: 't' },
+    };
+    expect((await runAgent(options)).status).toBe('failed');
+    const stream = resumeStreamAgent({ ...options, retryFailed: true });
+    const texts: string[] = [];
+    for await (const chunk of stream.textStream) texts.push(chunk);
+    expect(await stream.result).toMatchObject({ status: 'completed', output: 'done' });
+    expect(texts.join('')).toBe('done');
+    expect(effects).toEqual(['charge']);
   });
 
   it('never repeats the steps that completed before the failure', async () => {
