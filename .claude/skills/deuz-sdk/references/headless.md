@@ -51,7 +51,7 @@ console.log(done.outcome, done.output, exitCodeFor(done)); // completed Deployed
 
 - **Options.** `runHeadless` takes `runAgent`'s options plus `store` (any durable `AgentRunStore`; the SQLite ops store's `agentRuns` is the default choice on one machine, Postgres and Redis fit the same way), `runId` (default: generated), `scope` (default `'headless'`), `skills`, `projectDir`, `projectInstructions` and `onEvent` (every event of the leg, for progress output; it must not throw). `resumeHeadless` takes `resumeAgent`'s options with the same session fields and no `prompt` / `messages` / `instructions`. Resume with the same model, tools, skills and output: the binding rejects a change, and that resume fails (exit 1) without touching the stored run.
 - **Pricing.** Calls are priced with the bundled table unless `deps.priceProvider` is given, so the report carries the run's cost.
-- **Rejections.** A leg rejects only when the project instructions or the skills cannot be loaded (an invalid option included), a tool takes a skill tool's name, or `onEvent` threw. Everything that happens to the run itself is in the report.
+- **Rejections.** A leg rejects only when the project instructions cannot be loaded (`projectDir` is not a directory, an invalid `projectInstructions` option), a tool takes a skill tool's name, or `onEvent` threw; a skill folder that does not exist adds no skills. Everything that happens to the run itself is in the report.
 
 ## The report
 
