@@ -1,0 +1,18 @@
+{
+  "name": "@deuz-examples/19-mcp-server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Deuz tools and an agent served over MCP, called in process by the Deuz MCP client (MCP 2026-07-28).",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.2.0",
+    "@modelcontextprotocol/client": "^2.3.1",
+    "@modelcontextprotocol/server": "^2.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
