@@ -6,7 +6,7 @@ description: Agent2Agent v1.0.0 — call other agents with createA2AClient and s
 `@deuz-sdk/core/a2a` (2.3) speaks the [Agent2Agent (A2A) protocol](https://a2a-protocol.org/v1.0.0/specification/), version **1.0.0**: the open protocol agents use to discover each other through an **agent card**, hand each other **messages**, and track the work as **tasks** that move through states (`WORKING`, `INPUT_REQUIRED`, `COMPLETED`, …) and produce **artifacts**. The module has both halves:
 
 - **`createA2AClient`** calls any A2A 1.0 agent — another team's, a partner's, one built on the official SDK — over the **JSON-RPC** or the **HTTP+JSON** binding, with streaming over SSE.
-- **`createA2AHandler`** serves your own agent as a fetch-style handler (`Request` in, `Response` out — Workers, Deno, Bun, route handlers), with the task lifecycle, streaming, re-subscription and cancellation done for you. You write the **executor**: what the agent does with a message.
+- **`createA2AHandler`** serves your own agent as a fetch-style handler (`Request` in, `Response` out — Workers, Deno, Bun, route handlers), with the task lifecycle, streaming, re-subscription and cancellation done for you. You write the **executor**: what the agent does with a message. To serve a [native agent](#serving-a-native-agent) run, `createA2AAgentExecutor` is that executor.
 
 | Export | What it is |
 | --- | --- |
