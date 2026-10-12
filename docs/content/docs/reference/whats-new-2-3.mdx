@@ -808,8 +808,9 @@ do.
   (the 2.2 form) still counts when the run used that id once.
 - **A plain call that continues a stored durable run** (its `session.runId`,
   without `resumeFromCheckpoint`) continues the run's step counter instead of
-  starting again at 1. Under `durability: 'strict'` a failed read of the
-  checkpoint fails the call.
+  starting again at 1, so `AgentCheckpoint.stepIndex` is monotonic over every
+  leg; do not expect a leg to count from 1. Under `durability: 'strict'` a
+  failed read of the checkpoint fails the call.
 - **Handoff transfers are gated like any call.** `onToolCall` guardrails see
   them, `requireApproval` and a transfer tool's `needsApproval` gate them, and
   an `allowedTools` allowlist must name the transfer tool.
