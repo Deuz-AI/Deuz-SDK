@@ -13,20 +13,19 @@
 import { describe, expect, it, vi } from 'vitest';
 import { generateText, streamChat } from '../src/index';
 import { createGoogleNative } from '../src/google';
+import { createOpenAIResponses } from '../src/openai';
 import { runAgent } from '../src/agent-run';
 import { mockFetchSequence, sseResponse } from './fixtures/sse';
-import { GEMINI_CALL, geminiTurn } from './fixtures/provider-finish';
+import { GEMINI_CALL, geminiTurn, responsesTurn } from './fixtures/provider-finish';
 import type { LanguageModel } from '../src/types/model';
 import type { Message } from '../src/types/message';
-import type { StreamPart } from '../src/types/stream';
+import type { StreamPart, ToolCallDeltaPart } from '../src/types/stream';
 
 interface Wire {
   /** A turn that streams a `get_weather` call, then is stopped by the provider's filter. */
   filtered: string;
   /** A plain answer the loop must never get to ask for. */
   answer: string;
-  /** The id the streamed call carries on this wire. */
-  callId: (parts: StreamPart[]) => string | undefined;
   model: (fetch: typeof globalThis.fetch) => LanguageModel;
 }
 
@@ -34,13 +33,19 @@ const WIRES: Record<string, Wire> = {
   'Gemini native (SAFETY)': {
     filtered: geminiTurn('SAFETY', [GEMINI_CALL]),
     answer: geminiTurn('STOP', [{ text: 'done' }]),
-    callId: (parts) =>
-      parts.find((p): p is Extract<StreamPart, { type: 'tool-call-delta' }> => {
-        return p.type === 'tool-call-delta';
-      })?.id,
     model: (fetch) => createGoogleNative({ apiKey: 'AIza-k', fetch })('gemini-2.5-flash'),
   },
+  'OpenAI Responses (incomplete: content_filter)': {
+    filtered: responsesTurn({ call: { args: '{"city": "Ro' }, incomplete: 'content_filter' }),
+    answer: responsesTurn({ text: 'done' }),
+    model: (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.4'),
+  },
 };
+
+/** The id of the first call the stream started. */
+function firstCallId(parts: StreamPart[]): string | undefined {
+  return parts.find((p): p is ToolCallDeltaPart => p.type === 'tool-call-delta')?.id;
+}
 
 function scripted(wire: Wire) {
   const sequence = mockFetchSequence(
@@ -92,7 +97,7 @@ describe.each(Object.entries(WIRES))('finish-reason gate on the %s wire', (_name
     expect(execute).not.toHaveBeenCalled();
     expect(calls).toHaveLength(1);
     expect(parts.some((p) => p.type === 'tool-call' || p.type === 'tool-result')).toBe(false);
-    const id = wire.callId(parts);
+    const id = firstCallId(parts);
     expect(id).toBeDefined();
     expect(
       parts.flatMap((p) => (p.type === 'tool-state' && p.toolCallId === id ? [p.state] : [])),

@@ -226,6 +226,24 @@ describe('parseReply: OpenAI Responses', () => {
     expect(parseReply('responses', response(filtered)).finishReason).toBe('content_filter');
   });
 
+  it.each([undefined, 'max_output_tokens', 'content_filter', 'max_messages', 'steered'])(
+    'maps incomplete reason %s exactly as the streaming adapter does, with or without a call',
+    async (reason) => {
+      const status = reason === undefined ? 'completed' : 'incomplete';
+      const incomplete_details = reason === undefined ? null : { reason };
+      const item = { type: 'function_call', id: 'fc_1', call_id: 'c1', name: 'json_output' };
+      for (const withCall of [false, true]) {
+        const stream = await streamFinish(openaiResponsesAdapter, [
+          ...(withCall ? [{ data: { type: 'response.output_item.added', item } }] : []),
+          { data: { type: `response.${status}`, response: { status, incomplete_details } } },
+        ]);
+        const output = withCall ? [{ ...item, arguments: '{}' }] : response().output;
+        const reply = parseReply('responses', response({ status, incomplete_details, output }));
+        expect(reply.finishReason, `call: ${withCall}`).toBe(stream.finishReason);
+      }
+    },
+  );
+
   it('returns function calls with their argument text and finishes as tool_calls', () => {
     const reply = parseReply(
       'responses',

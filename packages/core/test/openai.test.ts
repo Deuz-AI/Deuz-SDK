@@ -8,6 +8,7 @@ import { getCapabilities } from '../src/core/registry';
 import { withCapabilityOverride } from '../src/internal/config-symbol';
 import { InvalidRequestError } from '../src/errors';
 import { sseResponse, sseEvents, mockFetch, mockFetchSequence } from './fixtures/sse';
+import { responsesTurn, type ResponsesTurn } from './fixtures/provider-finish';
 import type { JSONSchema } from '../src/types/schema';
 import type { Logger } from '../src/types/deps';
 import type { LanguageModel } from '../src/types/model';
@@ -629,4 +630,37 @@ describe('Responses is stateless by default (2.3, F20 — retention behaviour no
       summary: [],
     });
   });
+});
+
+// ===================================================================
+// 2.3 (K4) — how a streamed Responses turn ends. The `incomplete_details`
+// reasons come from openai 7.32's types; not live-verified.
+// ===================================================================
+
+describe('Responses finish reasons (2.3, K4)', () => {
+  async function finishOf(turn: ResponsesTurn): Promise<string> {
+    const { fetch } = consume([responsesTurn(turn)]);
+    const result = streamChat({
+      model: createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.4'),
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    for await (const _ of result.fullStream) void _;
+    return result.finishReason;
+  }
+  const call = { args: '{"city": "Ro' };
+
+  it.each([
+    [undefined, 'stop', 'tool_calls'],
+    ['max_output_tokens', 'length', 'length'],
+    ['content_filter', 'content_filter', 'content_filter'],
+    // Undocumented beyond the name in openai 7.32, and WebSocket-only: as before.
+    ['max_messages', 'stop', 'tool_calls'],
+    ['steered', 'stop', 'tool_calls'],
+  ] as const)(
+    'incomplete %s ends a turn with %s, or %s after a call',
+    async (incomplete, plain, afterCall) => {
+      expect(await finishOf({ text: 'Partial', incomplete })).toBe(plain);
+      expect(await finishOf({ call, incomplete })).toBe(afterCall);
+    },
+  );
 });

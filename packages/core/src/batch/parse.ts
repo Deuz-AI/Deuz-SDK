@@ -14,7 +14,11 @@
 import { mapAnthropicUsage, type AnthropicUsage } from '../adapters/anthropic';
 import { mapGeminiFinishReason, mapGeminiUsage } from '../adapters/google-native';
 import { mapOpenAIUsage } from '../adapters/openai-compatible';
-import { mapResponsesUsage, type ResponsesUsage } from '../adapters/openai-responses';
+import {
+  mapResponsesFinishReason,
+  mapResponsesUsage,
+  type ResponsesUsage,
+} from '../adapters/openai-responses';
 import type { StopDetails } from '../types/methods';
 import type { ModelSurface } from '../types/model';
 import type { FinishReason, Usage } from '../types/usage';
@@ -171,16 +175,7 @@ function parseResponse(body: Json): ParsedReply {
   }
   const usage = isObject(body.usage) ? (body.usage as ResponsesUsage) : undefined;
   const reason = isObject(body.incomplete_details) ? body.incomplete_details.reason : undefined;
-  // The streaming adapter knows max_output_tokens only; the final body also
-  // says when a content filter cut the reply off.
-  const finishReason: FinishReason =
-    reason === 'max_output_tokens'
-      ? 'length'
-      : reason === 'content_filter'
-        ? 'content_filter'
-        : toolCalls.length > 0
-          ? 'tool_calls'
-          : 'stop';
+  const finishReason = mapResponsesFinishReason(reason, toolCalls.length > 0);
   const openai: Json = {
     ...(phase ? { phase } : {}),
     ...(refusal ? { refusal } : {}),

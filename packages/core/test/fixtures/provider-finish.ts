@@ -51,3 +51,47 @@ export function geminiTurn(finishReason: string, parts: unknown[] = [{ text: 'Pa
     },
   ]);
 }
+
+/** What one streamed Responses turn carries, in this order. */
+export interface ResponsesTurn {
+  /** `response.output_text.delta` text. */
+  text?: string;
+  /** A `get_weather` function call and its (possibly cut-off) argument text. */
+  call?: { args: string };
+  /** `incomplete_details.reason` of a final `response.incomplete`; absent: `response.completed`. */
+  incomplete?: string;
+}
+
+/** One streamed OpenAI Responses turn (openai 7.32 `ResponseStreamEvent` shapes). */
+export function responsesTurn(turn: ResponsesTurn): string {
+  const events: { event: string; data: Record<string, unknown> }[] = [];
+  const push = (type: string, data: Record<string, unknown>): void => {
+    events.push({ event: type, data: { type, sequence_number: events.length, ...data } });
+  };
+  let output = 0;
+  if (turn.text !== undefined) {
+    const at = { item_id: 'msg_1', output_index: output++, content_index: 0 };
+    push('response.output_text.delta', { ...at, delta: turn.text });
+  }
+  if (turn.call) {
+    const item = { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' };
+    push('response.output_item.added', {
+      output_index: output,
+      item: { ...item, arguments: '', status: 'in_progress' },
+    });
+    push('response.function_call_arguments.delta', {
+      item_id: 'fc_1',
+      output_index: output++,
+      delta: turn.call.args,
+    });
+  }
+  const status = turn.incomplete !== undefined ? 'incomplete' : 'completed';
+  push(`response.${status}`, {
+    response: {
+      status,
+      incomplete_details: turn.incomplete !== undefined ? { reason: turn.incomplete } : null,
+      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+    },
+  });
+  return sseEvents(events);
+}

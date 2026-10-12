@@ -328,6 +328,23 @@ export function mapResponsesUsage(u: ResponsesUsage | undefined): Usage {
   };
 }
 
+/**
+ * A Responses turn's finish reason, shared with the batch parser. The final
+ * response says why it is incomplete: its output limit, or its content filter
+ * (2.3; 'stop', or 'tool_calls' after a call, before), which the finish-reason
+ * gate must see to hold back a call the turn streamed. `max_messages` and
+ * `steered` (openai 7.32) end it as a complete response would: their meaning
+ * is undocumented beyond the name, and steering needs the WebSocket transport.
+ */
+export function mapResponsesFinishReason(
+  incompleteReason: unknown,
+  sawFunctionCall: boolean,
+): FinishReason {
+  if (incompleteReason === 'max_output_tokens') return 'length';
+  if (incompleteReason === 'content_filter') return 'content_filter';
+  return sawFunctionCall ? 'tool_calls' : 'stop';
+}
+
 async function* parseStream(
   body: ReadableStream<Uint8Array>,
   ctx: ParseContext,
@@ -409,10 +426,10 @@ async function* parseStream(
             typeof data.response.usage.output_tokens === 'number',
         );
         usage = mapResponsesUsage(data.response?.usage);
-        if (data.response?.incomplete_details?.reason === 'max_output_tokens')
-          finishReason = 'length';
-        else if (sawFunctionCall) finishReason = 'tool_calls';
-        else finishReason = 'stop';
+        finishReason = mapResponsesFinishReason(
+          data.response?.incomplete_details?.reason,
+          sawFunctionCall,
+        );
         break;
       case 'error':
       case 'response.failed':
