@@ -497,7 +497,10 @@ describe('reproduction', () => {
     'reproduces the index that shipped with 2.2.0 from the v2.2.0 sources',
     () => {
       const dir = mkdtempSync(join(tmpdir(), 'deuz-skill-v220-'));
+      const live = generator.SUBPATH_DESCRIPTIONS['@deuz-sdk/core/react']!;
       try {
+        // A blurb edited after 2.2 (SK3 rewrites this one) must not move the reproduction.
+        generator.SUBPATH_DESCRIPTIONS['@deuz-sdk/core/react'] = 'Edited after 2.2.';
         materialize(
           'v2.2.0',
           [
@@ -518,20 +521,31 @@ describe('reproduction', () => {
           core: join(dir, 'packages/core'),
           react: join(dir, 'packages/react'),
         });
+        // The blurbs are prose that moves on after 2.2: render with the ones 2.2.0 shipped (the
+        // line under each module heading), so this pins the export walk and the format.
+        const descriptions = Object.fromEntries(
+          [...shipped.matchAll(/^## `(@deuz-sdk\/[^`]+)`\n\n(.+)$/gm)].map((m) => [m[1]!, m[2]!]),
+        );
+        expect(Object.keys(descriptions)).toEqual(table.modules.map((module) => module.specifier));
         // The 2.2.0 file was sorted in a tr-TR default locale; its regenerate line named the
         // untracked scripts/ directory this tooling replaces. Everything else is byte-identical.
-        const rendered = generator.renderApiIndex(table, { date: '2026-09-26', locale: 'tr' });
+        const rendered = generator.renderApiIndex(table, {
+          date: '2026-09-26',
+          locale: 'tr',
+          descriptions,
+        });
         const expected = shipped.replace(
           'regenerate: node .claude/skills/deuz-sdk/scripts/generate-api-index.mjs',
           'regenerate: node packages/core/tooling/skills/generate-api-index.mjs --date YYYY-MM-DD',
         );
         expect(rendered).toBe(expected);
         // With the pinned default collation, the only other change is one swapped pair.
-        const english = generator.renderApiIndex(table, { date: '2026-09-26' });
+        const english = generator.renderApiIndex(table, { date: '2026-09-26', descriptions });
         expect(english).toBe(
           expected.replace('InvalidRequestError, imagePart', 'imagePart, InvalidRequestError'),
         );
       } finally {
+        generator.SUBPATH_DESCRIPTIONS['@deuz-sdk/core/react'] = live;
         rmSync(dir, { recursive: true, force: true });
       }
     },
