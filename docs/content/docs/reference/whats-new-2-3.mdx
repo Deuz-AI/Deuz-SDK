@@ -693,8 +693,9 @@ resume, and the defaults that change below.
   would answer an approved call `Tool call denied. Reason: No approval
   response.`, never run the tool, and go on to the end of the run. A native run
   that waits on an approval is therefore saved as version 2, which 2.2 refuses,
-  and so is one whose resume took approved calls up and stopped before it saved
-  their answers. A legacy durable run (`generateText` or `streamChat` with a
+  and so is one stopped while a call is open whose ID its approval gate issued a
+  request under, such as a resume that took approved calls up and stopped before
+  it saved their answers. A legacy durable run (`generateText` or `streamChat` with a
   `session`) keeps checkpoint `version: 1`, and 2.2's `resumeFromCheckpoint`
   honours only the bare tool call ID there: it denies a call answered with the
   2.3 `approvalId`. Answer pending approvals on 2.3 before a rollback, and send

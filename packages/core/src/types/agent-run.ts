@@ -158,11 +158,12 @@ export interface AgentRunEnvelope {
    * fail-over (`memory`, `transcript`, `chat`, `models`): a 2.2 reader knows none
    * of them, so it refuses the run instead of resuming it without them. Also
    * while the stored turn has an open call a 2.2 resume would answer wrongly:
-   * the run waits on an approval, or a resume took approved calls up (2.2
-   * cannot match a 2.3 `approvalId`), an open call's receipt records `failed`
-   * or `suspended`, or it is a client call a resume took up and still waits
-   * on. Every other envelope stays `1`, and one of those again once a
-   * checkpoint answers the call. Readers accept both.
+   * the run waits on an approval, or it stopped mid-step with an open call
+   * whose ID the run's approval gate issued a request under (2.2 cannot match
+   * a 2.3 `approvalId`), an open call's receipt records `failed` or
+   * `suspended`, or it is a client call a resume took up and still waits on.
+   * Every other envelope stays `1`, and one of those again once a checkpoint
+   * answers the call. Readers accept both.
    */
   version: 1 | 2;
   runId: string;
