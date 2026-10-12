@@ -240,6 +240,27 @@ export interface AgentRunEnvelope {
   chat?: AgentRunChatState;
   /** Model fail-over (2.3): which models failed and which one the run calls now. */
   models?: AgentRunModelState;
+  /**
+   * A failure a resume may retry (2.3): written with a `failed` result whose
+   * cause was transient, and only then. `retryFailed` re-enters the run from
+   * its last checkpoint. A reader that does not know it (2.2) returns the
+   * failed result, as before.
+   */
+  retry?: AgentRunRetry;
+}
+
+/** A transient failure of a native run (2.3); see `AgentRunOptions.retryFailed`. */
+export interface AgentRunRetry {
+  /**
+   * `'model-call'`: a model call failed with a retryable transport or provider
+   * error (network, transport timeout, 5xx, 429/529 after the call's own
+   * retries, an open breaker) or its stream broke off. `'admission'`: the
+   * persistent budget store refused to admit a call with a serialization
+   * conflict (40001 or 40P01) after its own retries, so nothing was admitted.
+   */
+  cause: 'model-call' | 'admission';
+  /** The phase the run failed in; a retry re-enters it there. */
+  phase: 'running' | 'finalizing';
 }
 
 /** A model a native run called (2.3): who serves it, over which protocol. */
@@ -617,6 +638,19 @@ export type AgentRunOptions<T = string> = Omit<
    * an unknown effect unsettled stops again and records nothing.
    */
   reconciledToolResults?: readonly { toolCallId: string; output: unknown; isError?: boolean }[];
+  /**
+   * Re-enter a run that failed in transit (2.3), on resume. A failed run stays
+   * failed, and a resume returns its stored result. With `retryFailed: true`, a
+   * run whose envelope records a transient cause (`AgentRunEnvelope.retry`: a
+   * model call that failed with a retryable transport or provider error or
+   * whose stream broke off, or a budget admission refused with a serialization
+   * conflict) goes on from its last checkpoint, in the phase it failed in, with
+   * every check of a resume. The failed call stays counted, as a model step and,
+   * while its outcome is unknown, in the accounting at its estimate; the retried
+   * call is reserved anew. Any other failure fails the resume with a TypeError
+   * before anything is written. Ignored for a run that did not fail.
+   */
+  retryFailed?: boolean;
   /** Results for pending client-side tool calls, supplied only on resume. */
   clientToolResults?: readonly { toolCallId: string; output: unknown; isError?: boolean }[];
   verify?: (context: AgentVerifyContext<T>) => AgentVerification | Promise<AgentVerification>;

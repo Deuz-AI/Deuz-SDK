@@ -5,6 +5,7 @@ import type {
   AgentRunOptions,
   AgentRunReconcileOptions,
   AgentRunReconciliation,
+  AgentRunRetry,
   AgentRunSession,
   AgentRunStore,
   AgentStream,
@@ -76,6 +77,7 @@ import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
 import { assertCheckpointVersion } from './internal/checkpoint-version';
+import { retryableCause } from './internal/native-retry';
 import { withCapabilityOverride } from './internal/config-symbol';
 // Native chat, memory and fail-over (2.3): loaded on demand by the runs that use them.
 import { scopeKey } from './internal/native-scope';
@@ -518,6 +520,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   let repairable = false;
   /** This leg completed the run, so it extracts (2.3); a terminal resume never does. */
   let extractNow = false;
+  /**
+   * This resume re-enters a run that failed in transit (2.3, `retryFailed`):
+   * until its first write it writes nothing, the stored run stays failed.
+   */
+  let retrying = false;
+  /** The model call whose failure ended the run (2.3), and whether it broke off. */
+  let callFailure: { error: unknown; brokeOff: boolean } | undefined;
 
   let persistedLedger: string | undefined;
   // A child of a caller's shared ledger records only its own slice (2.2): the
@@ -680,6 +689,29 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     if (part.type === 'text-delta') text.push(part.text);
   }
 
+  /**
+   * The transient cause of the run's failure (2.3), recorded so `retryFailed`
+   * may go on from it. Never once the run lost its lease, was cancelled or ran
+   * out of time, as for a fail-over.
+   */
+  function transientCause(error: unknown): AgentRunRetry['cause'] | undefined {
+    if (lease && lease.failure(error) !== error) return undefined;
+    if ((lease?.signal ?? options.signal)?.aborted) return undefined;
+    if (common?.execution) {
+      try {
+        assertExecutionPolicy(common.execution, {
+          now: resolveDependencies(options.deps).clock.now(),
+        });
+      } catch {
+        return undefined;
+      }
+    }
+    return retryableCause(
+      error,
+      callFailure !== undefined && callFailure.error === error && callFailure.brokeOff,
+    );
+  }
+
   async function pump(): Promise<void> {
     try {
       envelope.runId ||= resolveDependencies(options.deps).generateId();
@@ -690,6 +722,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const catalogPolicy = options.onCatalogChange ?? 'stop';
       if (catalogPolicy !== 'stop' && catalogPolicy !== 'accept')
         throw new TypeError("onCatalogChange must be 'stop' or 'accept'.");
+      if (options.retryFailed !== undefined && typeof options.retryFailed !== 'boolean')
+        throw new TypeError('retryFailed must be a boolean.');
       if (options.session && (!options.session.runId || !options.session.scope)) {
         throw new TypeError('Native sessions require non-empty runId and scope.');
       }
@@ -772,6 +806,25 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           assertCheckpointVersion(checkpoint, runId);
         envelope = structuredClone(saved);
         currentText = envelope.candidateText ?? lastAssistantText(envelope.messages);
+        // A run that failed in transit (2.3) goes on when the caller asks: in the
+        // phase it failed in, from its last checkpoint, after every check of a
+        // resume. Its first write drops the failed result; until then nothing
+        // is written. Any other failure stays final.
+        if (
+          options.retryFailed &&
+          envelope.phase === 'terminal' &&
+          envelope.result?.status === 'failed'
+        ) {
+          const { name, code, message } = envelope.result.error;
+          if (!envelope.retry)
+            throw new TypeError(
+              `retryFailed: run ${envelope.runId} did not fail in transit (${code ?? name}: ${message}); only a model call that failed in transit or a budget admission refused with a serialization conflict is retried.`,
+            );
+          if (envelope.retry.phase !== 'running' && envelope.retry.phase !== 'finalizing')
+            throw new TypeError('Invalid native retry record.');
+          envelope.phase = envelope.retry.phase;
+          retrying = true;
+        }
       } else if (options.session && (await options.session.store.load(options.session.runId))) {
         throw new TypeError('Native run already exists; use resumeAgent.');
       }
@@ -1085,7 +1138,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           pendingClientCalls: pendingClients,
         };
         settledOutcome = outcome;
-        repairable = true;
+        // A failed run being re-entered (2.3) is still failed in the store.
+        repairable = !retrying;
         return;
       }
       if (
@@ -1191,6 +1245,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         });
       }
       delete envelope.result;
+      delete envelope.retry;
       await persist();
 
       const checkpointStore: SessionStore = {
@@ -1222,6 +1277,24 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             now: resolveDependencies(options.deps).clock.now(),
           });
         return true;
+      };
+
+      /** The requests on the run's ledger now (2.3, for `retryFailed`). */
+      const ledgerRequests = (): ReadonlySet<string> =>
+        new Set(common.execution!.ledger.snapshot().reservations.map((entry) => entry.requestId));
+      /**
+       * Whether the model call that just failed broke off (2.3): the run's own
+       * last call since `before`, sent, and left with an unknown outcome. Such a
+       * call fails with whatever error the runtime raises for a broken stream.
+       */
+      const brokeOff = (before: ReadonlySet<string>): boolean => {
+        const { ledger, scopeId } = common.execution!;
+        const own = ledger
+          .snapshot()
+          .reservations.filter(
+            (entry) => entry.scopes.at(-1)?.id === scopeId && !before.has(entry.requestId),
+          );
+        return own.at(-1)?.state === 'unknown';
       };
 
       const checkLimit = async (): Promise<boolean> => {
@@ -1402,6 +1475,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           for (;;) {
             snapshot = undefined;
             const before = envelope.modelSteps;
+            const legRequests = ledgerRequests();
             const legCheckpoint = envelope.checkpoints[envelope.runId];
             // Fail-over routing (2.3), by the loop's step index: the model each
             // step meant and the one it went to, and which steps produced
@@ -1511,6 +1585,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               continue;
             }
             if (heldError) emitPart(heldError, 'running');
+            callFailure = { error: loop.error, brokeOff: brokeOff(legRequests) };
             throw loop.error;
           }
           if (loop.pendingApprovals.length || loop.pendingClientCalls.length) {
@@ -1633,6 +1708,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             : undefined;
           const toolRequest = await finalizeToolRequest();
           const spentBefore = common.execution!.ledger.totals(common.execution!.scopeId).spent.usd;
+          const attemptRequests = ledgerRequests();
           const inner = runStream(
             {
               ...common,
@@ -1752,6 +1828,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               continue;
             }
             if (heldError) emitPart(heldError, 'finalizing');
+            callFailure = { error: streamError, brokeOff: brokeOff(attemptRequests) };
             throw streamError;
           }
           // A request that rides the loop's tools is a loop-style call, so the
@@ -1948,6 +2025,14 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       // A failed durable commit must never publish a successful completion.
       // Keep the last persisted recovery point rather than overwriting it.
       if (!persistFailed && common && admitted) {
+        // A transient cause (2.3) is recorded with the failure, additively, so
+        // `retryFailed` may go on from the run's last checkpoint.
+        const cause = transientCause(error);
+        if (cause)
+          envelope.retry = {
+            cause,
+            phase: envelope.phase === 'finalizing' ? 'finalizing' : 'running',
+          };
         try {
           await finish(failed);
         } catch {

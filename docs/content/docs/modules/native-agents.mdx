@@ -383,6 +383,49 @@ and it lists every call the store still holds as unknown. A call that waited for
 an approval is gated again on resume, as for a retry: pass the verdict you stored
 with it, or the call is answered as denied.
 
+### When a model call fails
+
+A run that fails stays failed: a resume returns its stored result without a
+model call. Since 2.3 the failed envelope also records, additively, whether the
+cause was transient (`AgentRunEnvelope.retry`, which a 2.2 reader ignores):
+
+- a model call that failed with a retryable transport or provider error: network,
+  transport timeout, 5xx, 429/529 after the call's own retries, an open breaker
+  (the errors [model fail-over](#model-fail-over) acts on);
+- a model call whose response stream broke off;
+- a budget admission the persistent store refused with a serialization conflict
+  (40001 or 40P01) after its own retries.
+
+A run that was cancelled, lost its lease or ran out of time records none. Resume
+a run with a transient cause with `retryFailed: true` and it goes on from its
+last checkpoint, in the phase it failed in, after every check of a resume:
+completed calls answer from their receipts and never run again, and an unknown
+effect still stops it for reconciliation. The failed call stays counted, as a
+model step (and a finalization attempt when it was the final answer) and, while
+its outcome is unknown, in the accounting at its estimate. The retried call is
+reserved on its own, so nothing is counted twice. For any other failure a resume
+with `retryFailed` fails with a `TypeError` and writes nothing; for a run that
+did not fail the option is ignored.
+
+```ts
+import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const options = {
+  model: createMockModel({ responses: [{ text: 'Summary ready.' }] }),
+  prompt: 'Summarize ticket 9.',
+  session: { store: createInMemoryAgentRunStore(), runId: 'ticket-9', scope: 'tenant-a' },
+};
+
+const first = await runAgent(options);
+if (first.status === 'failed') {
+  // Once the provider answers again. A failure that was not transient is
+  // refused, and the stored run stays as it was.
+  const retried = await resumeAgent({ ...options, retryFailed: true });
+  console.log(retried.status);
+}
+```
+
 ## One path for every tool call
 
 Since 2.3 every tool call of a run takes one path, in this order (roadmap 23.2):
@@ -435,7 +478,7 @@ Each way a call can end is distinguishable, on results and on stream parts:
 | `'approval-denied'` | the same places: the approver said no, or the resume had no valid verdict for the call |
 | `'approval-pending'` | the `awaiting-approval` `tool-state` part; the run suspends with `pendingApprovals` |
 | `'unknown-effect'` | a resume that stops with `tool-reconciliation-required` lists the receipts in `unknownEffects` and streams a `tool-state` part for each; `retryToolCallIds` or `reconciledToolResults` settles them |
-| model error | the run fails (`status: 'failed'`, the provider error's `name` and `code`); the stream ends with an `error` part |
+| model error | the run fails (`status: 'failed'`, the provider error's `name` and `code`); the stream ends with an `error` part. A transient one can be retried with `retryFailed` ([When a model call fails](#when-a-model-call-fails)) |
 | refusal | the run stops with reason `'refusal'`; `stopDetails` carries the provider's explanation |
 
 A successful result carries no `outcome`, as before 2.3.

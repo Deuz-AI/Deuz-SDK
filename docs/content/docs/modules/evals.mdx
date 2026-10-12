@@ -11,7 +11,7 @@ needs: success, false completion, cost, duration, human rescues, repeated
 effects and recovery.
 
 2.3 ships a baseline, not a benchmark. The repository's test suite runs 16
-offline tasks and 21 fault-injection scenarios on every `npm test`. Five
+offline tasks and 23 fault-injection scenarios on every `npm test`. Five
 real-model tasks are defined but were not run for 2.3, so there are no
 real-model results. This page ranks nothing and makes no claim about other SDKs.
 
@@ -261,6 +261,7 @@ accounting, and the documented recovery:
 | The same, reconciled | The application finds the charge in the payment system and resumes with `reconciledToolResults`: the step goes on from the recorded outcome, and the charge never runs again | Recovered |
 | After the receipt, before the checkpoint | A resume replays the recorded result; the tool does not run again | Recovered |
 | Mid model stream | No tool call from the broken turn runs; the run fails, and the call stays held at its estimate | Contained |
+| The same, resumed with `retryFailed` | The run goes on from its last checkpoint; the broken call stays held, and the retried turn charges once | Recovered |
 | Verifier abort | The run stops as `aborted`, never `completed`; a resume neither verifies nor calls the model again | Contained |
 | Verifier deadline | The run fails on the elapsed deadline instead of completing | Contained |
 | Child initialization | A sub-agent's provider refuses its first request; the delegation is a known failure the parent model is told about | Recovered |
@@ -268,6 +269,7 @@ accounting, and the documented recovery:
 | Lease loss | The executor stops writing; the next one resumes, and an idempotent tool runs again under its identity | Recovered |
 | Lease renew failure | The first renewal fails: nothing is written and no model is called; the next executor runs it | Recovered |
 | Admission store failure (40001) | The run fails closed with `admission_failed` before the next call; no hold is left behind | Contained |
+| The same, resumed with `retryFailed` | The call is admitted again and the run completes; the store holds the two settled calls and nothing else | Recovered |
 | Settle failure | The ledger retries the settlement until the hold closes at the actual usage | Recovered |
 | Spawn commit failure | A `replay: 'safe'` parent runs again and its child is spawned once | Recovered |
 | MCP hot refresh, listing fails | The run keeps the catalog it had | Recovered |
@@ -275,14 +277,17 @@ accounting, and the documented recovery:
 | The same, resumed with `onCatalogChange: 'accept'` | The resume's first write records the servers' new catalog, before its first model call, and the run completes | Recovered |
 | Refusal or `max_tokens` with a tool call | The call is never dispatched; the run stops with reason `refusal` or `length` | Contained |
 
-Contained is not a defect in itself: it is the documented safe outcome. Two
-of these cases leave work for a person. A mid-stream transport failure and an
-admission store failure end the native run as `failed`, and a resume returns
-that result, so the work starts again as a new run. After an unknown outcome
-the run stops for reconciliation until someone checks the payment system; once
-the application records what it found with `reconciledToolResults`, the run
-recovers without a person and without running the charge again. A crash
-between a hot refresh and its record is contained under the default
+Contained is not a defect in itself: it is the documented safe outcome. A
+cancel, an elapsed deadline, a refusal and a turn cut off by `max_tokens` end
+the work by design. The other contained cases have an opt-in way on in 2.3,
+each shown by the recovered scenario under it. A mid-stream transport failure and an admission store
+failure end the native run as `failed`, and a plain resume returns that
+result; a resume with `retryFailed` goes on from the last checkpoint. After an
+unknown outcome the run stops for reconciliation, and in the contained
+scenario a person checks the payment system; when the application checks it
+and records what it found with `reconciledToolResults`, the run recovers
+without a person and without running the charge again. A crash between a hot
+refresh and its record stays contained under the default
 `onCatalogChange: 'stop'`; a resume with `'accept'` records the servers' new
 catalog and recovers.
 

@@ -290,7 +290,8 @@ export const admissionStoreFailure: EvalTaskManifest = {
       ...options,
       execution: createExecutionContext({ scopeId: 'j', admission: { store, scopes } }),
     });
-    // The failure is recorded as the run's terminal result: a resume returns it.
+    // The failure is recorded as the run's terminal result: a resume returns
+    // it, unless it asks for a retry (fault/admission-store-failure-retried).
     const saved = (await runs.load('j'))!;
     const resumed = await resumeAgent({
       ...options,
@@ -408,6 +409,76 @@ export const spawnCommitFailure: EvalTaskManifest = {
       status: outcome.run.status === 'completed' ? 'completed' : 'failed',
       output: outcome.tasks.map((task) => `${task.task.id}:${task.status}`),
       recovery: crashed && plans === 2 ? 'safe-replay' : 'other',
+    };
+  },
+};
+
+export const admissionStoreFailureRetried: EvalTaskManifest = {
+  id: 'fault/admission-store-failure-retried',
+  version: 1,
+  title: 'The same refused admission (40001), resumed with retryFailed: the run goes on',
+  tags: ['fault', 'native', 'budget'],
+  model: MOCK,
+  start: { messages: [{ role: 'user', content: 'Archive T-9, then confirm.' }] },
+  // Documented (native-agents.mdx): a serialization conflict is transient, so
+  // the failed envelope records it and a resume with retryFailed admits the
+  // call again; the refused admission left no hold behind.
+  fault: { boundary: 'admission-store-failure', recovery: 'retried-from-checkpoint' },
+  acceptance: [
+    { name: 'completes', check: (outcome) => outcome.status === 'completed' },
+    ranOnce('archive:T-9'),
+    {
+      name: 'the store holds the two settled calls and nothing else',
+      check: (_outcome, context) =>
+        (context.store.storeUsage as { tokens?: number } | undefined)?.tokens === 30,
+    },
+    costKept,
+  ],
+  async run(context) {
+    const { store, inner } = failingStore('reserve', 2, () =>
+      context.interrupt('admission-store-failure'),
+    );
+    const effects: string[] = [];
+    context.store.effects = effects;
+    const { model, calls } = scripted([
+      { toolCalls: [{ toolName: 'archive', args: {} }] },
+      { text: 'Archived.' },
+    ]);
+    const runs = createInMemoryAgentRunStore();
+    const options = {
+      model,
+      messages: context.messages,
+      session: { store: runs, runId: 'j', scope: 'eval' },
+      tools: {
+        archive: {
+          parameters,
+          execute: () => {
+            context.effect('archive:T-9');
+            effects.push('archive:T-9');
+            return 'archived';
+          },
+        },
+      },
+      deps: { observer: context.observer, priceProvider: mockPrices },
+    };
+    const first = await runAgent({
+      ...options,
+      execution: createExecutionContext({ scopeId: 'j', admission: { store, scopes } }),
+    });
+    const saved = (await runs.load('j'))!;
+    const resumed = await resumeAgent({
+      ...options,
+      retryFailed: true,
+      execution: createExecutionContext({ snapshot: saved.execution!, admission: { store } }),
+    });
+    context.store.storeUsage = await inner.usage('user:1');
+    context.store.billedCalls = calls();
+    return {
+      ...resumed,
+      recovery:
+        first.status === 'failed' && resumed.status === 'completed' && calls() === 2
+          ? 'retried-from-checkpoint'
+          : 'other',
     };
   },
 };
