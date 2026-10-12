@@ -54,7 +54,7 @@ In the canonical history the change is a system message without text, which ever
 }
 ```
 
-A removal is only a hint to the model, so the step's calls are resolved against the set it offered: a call to a withdrawn tool is answered `No such tool: "write". Available tools: …` and never runs. When a replayed change names a tool the request no longer declares (your tool set changed between calls), the stale removal is left out of the request rather than sent as a reference the API cannot resolve.
+A removal is only a hint to the model, so the step's calls are resolved against the set it offered: a call to a withdrawn tool is answered `No such tool: "write". Available tools: …` and never runs. The same holds when the step stops for an approval and its calls are settled later: the resume (durable, or a call that continues from `response.messages` with `approvalResponses`) resolves them against the set that step offered, not against the whole run. When a replayed change names a tool the request no longer declares (your tool set changed between calls), the stale removal is left out of the request rather than sent as a reference the API cannot resolve.
 
 ## Across calls: send back what the model saw
 

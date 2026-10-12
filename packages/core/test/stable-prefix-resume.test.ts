@@ -18,6 +18,7 @@ import { handoff } from '../src/inference/handoff';
 import { PROMPT_INJECTION_POLICY, promptInjectionGuardrail } from '../src/guardrails';
 import type { CommonCallOptions } from '../src/types/config';
 import type { JSONSchema } from '../src/types/schema';
+import type { StreamPart } from '../src/types/stream';
 import {
   claudeTurn,
   prefixBreaks,
@@ -31,25 +32,28 @@ const OBJ: JSONSchema = { type: 'object', properties: {} };
 const clock = { now: () => 1_700_000_000_000, setTimeout: () => () => {} };
 const LOOPS = ['buffered', 'streaming'] as const;
 
-/** Resume a suspended durable run through either loop; counts the guardrail verdicts the leg reported. */
+/**
+ * Resume a suspended durable run through either loop. Reports the guardrail
+ * verdicts the leg reported, and every part of a streamed leg.
+ */
 async function resume(
   loop: (typeof LOOPS)[number],
   store: ReturnType<typeof createInMemorySessionStore>,
   runId: string,
   options: Omit<CommonCallOptions, 'messages'>,
-): Promise<{ guardrails: number }> {
+): Promise<{ guardrails: number; parts: StreamPart[] }> {
   if (loop === 'buffered') {
     const result = await resumeFromCheckpoint(store, runId, options);
     const deuz = result.providerMetadata?.deuz as { guardrails?: unknown[] } | undefined;
-    return { guardrails: deuz?.guardrails?.length ?? 0 };
+    return { guardrails: deuz?.guardrails?.length ?? 0, parts: [] };
   }
   const result = resumeStreamFromCheckpoint(store, runId, options);
-  let guardrails = 0;
+  const parts: StreamPart[] = [];
   for await (const part of result.fullStream) {
     if (part.type === 'error') throw part.error;
-    if (part.type === 'guardrail') guardrails++;
+    parts.push(part);
   }
-  return { guardrails };
+  return { guardrails: parts.filter((p) => p.type === 'guardrail').length, parts };
 }
 
 /** Every `tool_use_id` a request answers. */
@@ -61,6 +65,17 @@ function answeredIds(request: ClaudeRequest): string[] {
       if (b.type === 'tool_result') ids.push(b.tool_use_id!);
   }
   return ids;
+}
+
+/** The content of each `tool_result` a request carries, by `tool_use_id`. */
+function toolResults(request: ClaudeRequest): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const m of request.messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const b of m.content as Array<{ type: string; tool_use_id?: string; content?: unknown }>)
+      if (b.type === 'tool_result') out[b.tool_use_id!] = b.content;
+  }
+  return out;
 }
 
 // --- a break that commits a handoff ------------------------------------------
@@ -263,6 +278,204 @@ describe('a native run: a transfer and a gated call in one step on Claude 5.x', 
     expect(prefixBreaks(claude.requests)).toEqual([]);
   });
 });
+
+// --- the tools a pending call resolves against ---------------------------------
+
+describe('a tool the step withdrew, called next to a gated one (Claude 5.x)', () => {
+  const MODES = ['durable buffered', 'durable streaming', 'non-durable'] as const;
+
+  function setup() {
+    const ran: string[] = [];
+    const claude = scriptedClaude([
+      claudeTurn([
+        { type: 'thinking', signature: 'S0' },
+        { type: 'tool_use', id: 'tu_a', name: 'approveMe' },
+        { type: 'tool_use', id: 'tu_w', name: 'wipe' },
+      ]),
+      thinkThenAnswer('S1', 'Done.'),
+    ]);
+    const tool = (name: string, needsApproval = false) => ({
+      parameters: OBJ,
+      needsApproval,
+      execute: async () => {
+        ran.push(name);
+        return `${name} ran`;
+      },
+    });
+    const common = {
+      model: claude.model,
+      tools: { approveMe: tool('approveMe', true), wipe: tool('wipe') },
+      maxSteps: 4,
+      // Step 0 withdraws `wipe`: on Claude 5.x the array still declares it.
+      prepareStep: ({ stepIndex }: { stepIndex: number }) =>
+        stepIndex === 0 ? { activeTools: ['approveMe'] } : {},
+      deps: { clock },
+    };
+    return { ran, claude, common };
+  }
+
+  it.each(MODES)('%s: the settle answers it like an unknown tool', async (mode) => {
+    const { ran, claude, common } = setup();
+    const input = [{ role: 'user' as const, content: 'Go.' }];
+    const store = createInMemorySessionStore();
+    const first = await generateText({
+      ...common,
+      messages: input,
+      ...(mode === 'non-durable' ? {} : { session: { store, runId: 'run-1' } }),
+    });
+    expect(first.pendingApprovals).toHaveLength(1);
+    const approvalResponses = [
+      { approvalId: first.pendingApprovals![0]!.approvalId, approved: true },
+    ];
+    let parts: StreamPart[] = [];
+    if (mode === 'non-durable') {
+      await generateText({
+        ...common,
+        messages: [...input, ...first.response.messages],
+        approvalResponses,
+      });
+    } else {
+      ({ parts } = await resume(
+        mode === 'durable buffered' ? 'buffered' : 'streaming',
+        store,
+        'run-1',
+        { ...common, approvalResponses },
+      ));
+    }
+
+    expect(ran).toEqual(['approveMe']);
+    expect(toolResults(claude.requests[1]!)).toEqual({
+      tu_a: 'approveMe ran',
+      tu_w: 'No such tool: "wipe". Available tools: approveMe.',
+    });
+    expect(prefixBreaks(claude.requests)).toEqual([]);
+    // Nothing reports it as running either.
+    const states = parts.flatMap((p) =>
+      p.type === 'tool-state' && p.toolCallId === 'tu_w' ? [p.state] : [],
+    );
+    expect(states).toEqual(mode === 'durable streaming' ? ['error'] : []);
+  });
+
+  it('a native resumeAgent leg never runs it', async () => {
+    const { ran, claude, common } = setup();
+    const options = {
+      ...common,
+      prompt: 'Go.',
+      session: { store: createInMemoryAgentRunStore(), runId: 'native-1', scope: 'tenant' },
+    };
+    const first = await runAgent(options);
+    expect(first.status).toBe('suspended');
+    const resumed = await resumeAgent({
+      ...options,
+      approvalResponses: [
+        {
+          approvalId: first.status === 'suspended' ? first.pendingApprovals[0]!.approvalId : '',
+          approved: true,
+        },
+      ],
+    });
+    expect(resumed.status).toBe('completed');
+    expect(ran).toEqual(['approveMe']);
+    expect(toolResults(claude.requests[1]!).tu_w).toBe(
+      'No such tool: "wipe". Available tools: approveMe.',
+    );
+  });
+
+  it.each(LOOPS)('%s loop: a transfer the step withdrew is not decided either', async (loop) => {
+    const transfers: string[] = [];
+    const claude = scriptedClaude([
+      claudeTurn([
+        { type: 'thinking', signature: 'S0' },
+        { type: 'tool_use', id: 'tu_a', name: 'approveMe' },
+        { type: 'tool_use', id: 'tu_t', name: 'transfer_to_billing' },
+      ]),
+      thinkThenAnswer('S1', 'Done.'),
+    ]);
+    const billing = { model: claude.model, instructions: 'You handle billing.' };
+    const common = {
+      model: claude.model,
+      tools: {
+        ...handoff({ billing }, { onHandoff: ({ to }) => transfers.push(to) }),
+        approveMe: { parameters: OBJ, execute: async () => 'approved', needsApproval: true },
+      },
+      maxSteps: 4,
+      prepareStep: ({ stepIndex }: { stepIndex: number }) =>
+        stepIndex === 0 ? { activeTools: ['approveMe'] } : {},
+      deps: { clock },
+    };
+    const store = createInMemorySessionStore();
+    const first = await generateText({
+      ...common,
+      messages: [{ role: 'user', content: 'Go.' }],
+      session: { store, runId: 'run-1' },
+    });
+    expect(first.pendingApprovals).toHaveLength(1);
+    await resume(loop, store, 'run-1', {
+      ...common,
+      approvalResponses: [{ approvalId: first.pendingApprovals![0]!.approvalId, approved: true }],
+    });
+
+    expect(transfers).toEqual([]);
+    expect(toolResults(claude.requests[1]!)).toEqual({
+      tu_a: 'approved',
+      tu_t: 'No such tool: "transfer_to_billing". Available tools: approveMe.',
+    });
+    expect(JSON.stringify(claude.requests[1]!.messages)).not.toContain('You handle billing.');
+  });
+});
+
+describe.each(LOOPS)(
+  'a handoff target’s own gated tool on its resumed leg (Claude 5.x, %s loop)',
+  (loop) => {
+    it('settles against the set the target was offered', async () => {
+      const ran: string[] = [];
+      const claude = scriptedClaude([
+        thinkThenCall('S0', 'tu_0', 'transfer_to_billing'),
+        thinkThenCall('S1', 'tu_1', 'refund'),
+        thinkThenAnswer('S2', 'Refunded.'),
+      ]);
+      const billing = {
+        model: claude.model,
+        instructions: 'You handle billing.',
+        tools: {
+          refund: {
+            parameters: OBJ,
+            needsApproval: true,
+            execute: async () => {
+              ran.push('refund');
+              return 'refunded';
+            },
+          },
+        },
+      };
+      const common = {
+        model: claude.model,
+        tools: {
+          ...handoff({ billing }),
+          search: { parameters: OBJ, execute: async () => 'found' },
+        },
+        maxSteps: 4,
+        deps: { clock },
+      };
+      const store = createInMemorySessionStore();
+      const first = await generateText({
+        ...common,
+        messages: [{ role: 'user', content: 'Refund my order.' }],
+        session: { store, runId: 'run-1' },
+      });
+      expect(first.pendingApprovals).toHaveLength(1);
+      await resume(loop, store, 'run-1', {
+        ...common,
+        approvalResponses: [{ approvalId: first.pendingApprovals![0]!.approvalId, approved: true }],
+      });
+
+      // `refund` is no root tool: the tool-set change before the target's turn offered it.
+      expect(ran).toEqual(['refund']);
+      expect(toolResults(claude.requests[2]!).tu_1).toBe('refunded');
+      expect(prefixBreaks(claude.requests)).toEqual([]);
+    });
+  },
+);
 
 // --- the onInput guardrail on a resumed leg ------------------------------------
 

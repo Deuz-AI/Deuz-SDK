@@ -441,6 +441,9 @@ export async function runToolLoop(
           step: internal?.resumeFrom?.stepIndex ?? suspendedAt,
           approvalRequestCounts: durable?.approvalRequestCounts,
         },
+        // On a stable prefix (2.3, F22) a pending call resolves against the set
+        // its step offered, as it would have in the step.
+        { model: active?.model ?? options.model, tools: declaredWire.tools },
       );
       if (settled) {
         messages = settled.messages;
