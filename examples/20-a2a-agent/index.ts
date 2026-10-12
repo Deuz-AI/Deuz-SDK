@@ -104,6 +104,10 @@ const card: A2AAgentCard = {
 };
 
 const runs = createInMemoryAgentRunStore(); // durable: createSqliteOpsStore({ path }).agentRuns
+// The handler checks the protocol, not the caller. Served for real, authenticate
+// every request (and answer CORS preflights) in front of it, and name the
+// verified caller, so callers reach only their own tasks and approvals:
+//   owner: async (request) => (await verifySession(request))?.userId,
 const handler = createA2AHandler({
   card,
   executor: createA2AAgentExecutor<Booking>({
