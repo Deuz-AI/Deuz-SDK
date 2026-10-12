@@ -705,6 +705,10 @@ whatever the outcome. `owner` defaults to a generated ID per run.
 - The revision check stays the fence: a paused executor whose lease lapsed
   cannot overwrite a newer save.
 
+`reconcileAgentRun` takes the same `lease` (2.3): it claims the key before it
+reads the run, rejects with `'lease_held'` while an executor holds it, and gives
+it back at the end. See [Memory](/docs/modules/native-agents#memory).
+
 ### Cancelling a native run from another process
 
 `leases.signal(agentRunLeaseKey({ scope, runId }), 'cancel')` reaches the

@@ -269,9 +269,9 @@ export const runtime = 'edge';
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 export async function POST(req: Request): Promise<Response> {
-  // A client-tool route MUST allow `role: 'tool'` turns — that is the round-trip.
+  // Since 2.3 the default accepts the round-trip's `role: 'tool'` answers.
   // Read what that accepts: /docs/modules/request-validation#client-tools-need-rejecttoolresults-false
-  const parsed = validateChatRequest(await req.json(), { rejectToolResults: false });
+  const parsed = validateChatRequest(await req.json());
   if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
 
   const result = streamChat({

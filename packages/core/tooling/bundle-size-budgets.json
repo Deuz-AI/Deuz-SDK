@@ -238,7 +238,13 @@
     "loads them:",
     "  native-chat      3041 / 1414 -> 3300 / 1550",
     "  native-memory   13025 / 5364 -> 13800 / 5700",
-    "  native-fallback   833 /  501 -> 1000 /  600"
+    "  native-fallback   833 /  501 -> 1000 /  600",
+    "",
+    "RAISED FOR 2.3 (W2b review fixes). Measured on feat/2.3 after the six fix lanes, same pipeline:",
+    "  native-mcp lazy  24298 B raw / 9105 gzip -> 24700 / 9250 (edge, native-agent, native-swarm)",
+    "What grew: inference/native-mcp.ts +0.5 KB raw / +0.2 KB gzip, the resume that accepts a drifted",
+    "catalog under onCatalogChange: accept and refuses one while an MCP call of the last turn has no",
+    "answer (Z3, F-EV1-1). Every other bundle still fits its W2b limit."
   ],
   "bundles": {
     "core": {
@@ -303,8 +309,8 @@
         },
         "native-mcp": {
           "entryPoint": "native-mcp",
-          "maxRawBytes": 24200,
-          "maxGzipBytes": 9000
+          "maxRawBytes": 24700,
+          "maxGzipBytes": 9250
         },
         "native-chat": {
           "entryPoint": "native-chat",
@@ -368,8 +374,8 @@
         },
         "native-mcp": {
           "entryPoint": "native-mcp",
-          "maxRawBytes": 24200,
-          "maxGzipBytes": 9000
+          "maxRawBytes": 24700,
+          "maxGzipBytes": 9250
         },
         "native-chat": {
           "entryPoint": "native-chat",
@@ -419,8 +425,8 @@
         },
         "native-mcp": {
           "entryPoint": "native-mcp",
-          "maxRawBytes": 24200,
-          "maxGzipBytes": 9000
+          "maxRawBytes": 24700,
+          "maxGzipBytes": 9250
         },
         "native-chat": {
           "entryPoint": "native-chat",

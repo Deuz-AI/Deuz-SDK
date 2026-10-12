@@ -584,6 +584,7 @@ expectTypeOf<ValidateChatOptions>().toEqualTypeOf<{
   maxMessages?: number;
   maxTextBytes?: number;
   maxOpaqueReasoningBytes?: number;
+  maxProviderMetadataBytes?: number;
   rejectSystemRole?: boolean;
   rejectToolResults?: boolean;
   rejectAssistantTurns?: boolean;
@@ -750,3 +751,31 @@ expectTypeOf(reconcileAgentRun).returns.toEqualTypeOf<Promise<AgentRunReconcilia
 expectTypeOf<UIToolCall['outcome']>().toEqualTypeOf<ToolCallOutcome | undefined>();
 expectTypeOf<AssistantTurnState['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
 expectTypeOf<AssistantTurnState['agent']>().toEqualTypeOf<DeuzAgentState | undefined>();
+
+// W2b review fixes: reconcileAgentRun's lease and the 'superseded' chat state (Z2), the
+// durability options (Z3), the provider-metadata cap (Z4), project instructions (Z6).
+import type { AgentRunChatState, AgentRunReconcileOptions, AgentRunRetry } from '../src/agent';
+import type { ProjectInstructions, ProjectInstructionsOptions } from '../src/node/headless';
+expectTypeOf<AgentRunReconcileOptions['lease']>().toEqualTypeOf<AgentRunLeaseOptions | undefined>();
+expectTypeOf<AgentRunChatState['status']>().toEqualTypeOf<
+  'saved' | 'failed' | 'scope-mismatch' | 'superseded'
+>();
+expectTypeOf<AgentRunChatState['found']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<AgentRunOptions['reconciledToolResults']>().toEqualTypeOf<
+  readonly { toolCallId: string; output: unknown; isError?: boolean }[] | undefined
+>();
+expectTypeOf<AgentRunOptions['retryFailed']>().toEqualTypeOf<boolean | undefined>();
+expectTypeOf<AgentToolReceipt['reconciled']>().toEqualTypeOf<boolean | undefined>();
+expectTypeOf<AgentRunEnvelope['retry']>().toEqualTypeOf<AgentRunRetry | undefined>();
+expectTypeOf<AgentRunRetry>().toEqualTypeOf<{
+  cause: 'model-call' | 'admission';
+  phase: 'running' | 'finalizing';
+}>();
+expectTypeOf<ValidateChatOptions['maxProviderMetadataBytes']>().toEqualTypeOf<number | undefined>();
+expectTypeOf<ProjectInstructions['skipped']>().toEqualTypeOf<
+  { path: string; relativePath: string; reason: 'outside-root' }[]
+>();
+expectTypeOf<ProjectInstructionsOptions['role']>().toEqualTypeOf<'system' | 'user' | undefined>();
+expectTypeOf<NonNullable<ProjectInstructions['message']>['role']>().toEqualTypeOf<
+  'system' | 'user'
+>();

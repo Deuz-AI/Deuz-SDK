@@ -257,10 +257,14 @@ Client-side tools likewise remain suspended until
 validation and model-projection path as server tools.
 
 Use one executor for a given native run. Concurrent starts or resumes through the
-same `AgentRunStore` object are rejected within one JavaScript process. The native
-store interface has no compare-and-swap or distributed lease: an application must
-serialize ownership across processes and across different wrappers for the same
-database. The in-process guard does not make a custom store transactional.
+same `AgentRunStore` object are rejected within one JavaScript process. Across
+processes, the shipped durable stores reject a save whose `revision` is not the
+stored one plus one, so an executor that lost the run cannot overwrite a newer save;
+that fence does not stop two executors from running the same step. Pass `lease`
+(2.3) to hold the run across processes, see
+[Leasing a native run](/docs/modules/operations#leasing-a-native-run); without it an
+application must serialize ownership itself. The in-process guard does not make a
+custom store transactional.
 
 Tool receipts distinguish `executing`, a known child-agent `suspended` state,
 `executed`, `failed` (execute threw; the model got the error, and a resume replays

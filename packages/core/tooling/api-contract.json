@@ -375,6 +375,7 @@
       "AgentRunRecall",
       "AgentRunReconcileOptions",
       "AgentRunReconciliation",
+      "AgentRunRetry",
       "AgentRunSession",
       "AgentRunStore",
       "AgentRunSummary",
