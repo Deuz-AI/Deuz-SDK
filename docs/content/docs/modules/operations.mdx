@@ -590,7 +590,7 @@ runs stay in the store until `agentRuns.prune` removes them; see
 ## Listing, leasing and cancelling native runs
 
 Since 2.3 a native run can be listed, found when its executor died, held by one
-process at a time, and cancelled from another process.
+process at a time, and cancelled or drained from another process.
 
 ### Listing native runs
 
@@ -734,7 +734,7 @@ at a time, so one sent while a cancel from before the claim is still queued
 merges into it and shares its fate.
 
 `signal` returns `false` when no executor holds the run, for example a suspended
-run, and queues nothing. Native runs ignore a `'drain'` signal.
+run, and queues nothing.
 
 ```ts
 import { createInMemoryAgentRunStore, runAgent } from '@deuz-sdk/core/agent';
@@ -776,4 +776,87 @@ await working;
 console.log(await leases.signal(agentRunLeaseKey(session), 'cancel')); // true
 const result = await run;
 console.log(result.status, result.status === 'stopped' && result.reason); // stopped cancelled
+```
+
+### Draining a native run
+
+Since 2.3 a `'drain'` signal stops a leased native run at its next model-step
+boundary, for example to move the run to another process during a deploy:
+`leases.signal(agentRunLeaseKey({ scope, runId }), 'drain')`. The executor
+picks it up at its next renewal. Nothing in progress is interrupted: the step's
+model call and tool calls finish, and the run stops before it calls the model
+again. Its result is `stopped` with reason `'drained'`; on a stream, the
+`finish` part of a run that stopped after a step names it too
+(`providerMetadata.deuz.stoppedBy: 'drained'`).
+
+A drained run has not ended. No outcome is committed: the run stays as its last
+save left it, like a run whose executor died after that save, and a run that
+stopped after a step is stored exactly as after any other step. Only a run with
+`chat` saves its chat projection, as after any leg. Resume it on any executor
+and it goes on from there; nothing that ran runs again.
+`findStaleAgentRuns` finds it once `staleMs` has passed, as it finds a run whose
+executor died; to take it up at once, resume it by its run ID. Unlike a drained
+swarm, which settles as `'suspended'`, a drained native run keeps its phase,
+`'running'` or `'finalizing'`.
+
+Where the run stops depends on where the drain finds it:
+
+- **During a step.** At the boundary after the step's tool calls. A model call
+  that fails and [fails over](/docs/modules/native-agents#model-fail-over) goes
+  to the next model first, as part of the step.
+- **Before a final answer.** A run with `output` stops before its final answer
+  call, and before a new one after an invalid answer or a rejected verdict.
+- **A new run** stops before its first model call, once it is saved.
+- **A resume** that the drain reaches before it takes the run up stops before
+  its first write: the stored run stays as it was, so resume it again with the
+  same options, the verdicts or client results you passed included. A resume
+  that already took the run up goes on to its first step boundary, so what you
+  passed is applied and saved first.
+
+Any other stop at the same point comes first: a run that reached `maxSteps` or
+its budget stops for that reason, and a cancel, or an abort of the run's
+`signal`, stops it as `'cancelled'` or `'aborted'` even when a drain arrived
+too. A run with no model call left completes as usual. As for a swarm
+([Drain](#drain)), the signal concerns the executor that holds the run when it
+is sent: it is dropped when the run changes hands or the lease is released.
+
+```ts
+import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '@deuz-sdk/core/agent';
+import { agentRunLeaseKey, createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const leases = createInMemoryLeaseProvider();
+const session = { store: createInMemoryAgentRunStore(), runId: 'report', scope: 'tenant-a' };
+
+let started!: () => void;
+const working = new Promise<void>((resolve) => (started = resolve));
+const options = {
+  model: createMockModel({
+    responses: [{ toolCalls: [{ toolName: 'crunch', args: {} }] }, { text: 'done' }],
+  }),
+  prompt: 'Crunch the numbers.',
+  tools: {
+    crunch: {
+      description: 'Takes a while.',
+      parameters: { type: 'object' as const, properties: {} },
+      execute: () =>
+        new Promise((resolve) => {
+          started();
+          setTimeout(() => resolve('crunched'), 1_000);
+        }),
+    },
+  },
+  session,
+};
+
+const run = runAgent({ ...options, lease: { provider: leases, owner: 'worker-1', ttlMs: 300 } });
+await working;
+// A deploy moves the run: the crunch finishes, and no model call follows it.
+await leases.signal(agentRunLeaseKey(session), 'drain');
+const drained = await run;
+console.log(drained.status, drained.status === 'stopped' && drained.reason); // stopped drained
+
+// Another executor goes on from the step boundary; crunch does not run again.
+const resumed = await resumeAgent({ ...options, lease: { provider: leases, owner: 'worker-2' } });
+console.log(resumed.status); // completed
 ```

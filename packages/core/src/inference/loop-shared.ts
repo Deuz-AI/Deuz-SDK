@@ -2362,6 +2362,17 @@ export interface ToolDispatchPlan {
   clientCalls: ToolCall[];
   /** The transfer verdict, when the batch held a transfer. */
   handoff?: HandoffDecision;
+  /**
+   * Settle mode (2.3): the verdicts the leg passed for calls their receipts
+   * answer (see {@link ToolDispatchInput.recorded}). They decided nothing.
+   */
+  ignoredVerdicts?: IgnoredVerdict[];
+}
+
+/** A verdict for a call that a receipt answers instead (2.3). */
+export interface IgnoredVerdict {
+  call: ToolCall;
+  approved: boolean;
 }
 
 /** One batch for {@link planToolDispatch}. */
@@ -2386,6 +2397,13 @@ export interface ToolDispatchInput {
    * gated calls go to `approveToolCall` or suspend the run.
    */
   verdicts?: readonly ToolApprovalResponse[];
+  /**
+   * Settle mode (2.3): whether a native effect receipt already records the
+   * outcome of a call. Such a call ran, so the gate never holds it again: it
+   * goes on like a call no gate holds and is answered from its receipt, and a
+   * verdict for it decides nothing.
+   */
+  recorded?: (call: ToolCall) => boolean;
   /** What the batch's approvals are bound to besides the calls (see {@link ApprovalScope}). */
   approval?: ApprovalScope;
   /** The injected clock: the execution policy's deadline is checked against it. */
@@ -2447,8 +2465,9 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
   let pendingApproval: ToolCall[] = [];
   let requests: ToolApprovalRequest[] = [];
   let clientCalls: ToolCall[] = [];
+  let ignoredVerdicts: IgnoredVerdict[] = [];
   if (settle) {
-    ({ denied, gated } = await settleVerdicts(
+    ({ denied, gated, ignoredVerdicts } = await settleVerdicts(
       calls,
       verdicts,
       gateTools,
@@ -2456,6 +2475,7 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
       messages,
       observe,
       scope,
+      input.recorded,
     ));
   } else {
     // A blocked call never reaches the approval gate: it already has a verdict,
@@ -2528,6 +2548,7 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
     requests,
     clientCalls,
     ...(handoff ? { handoff } : {}),
+    ...(ignoredVerdicts.length > 0 ? { ignoredVerdicts } : {}),
   };
 }
 
@@ -2577,6 +2598,14 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
  * the declared tools with every tool-set change before the turn applied. A
  * pending call to a tool the step withdrew, a transfer included, is answered
  * like an unknown tool and never runs, as it would have been in the step.
+ *
+ * `recorded` (2.3) says whether a native run's effect receipt already records
+ * the outcome of a pending call: the run stopped after the receipt and before
+ * the step checkpoint that answers the call, or a sub-agent beside it
+ * suspended, or `reconciledToolResults` recorded it. Such a call ran. It is
+ * not gated again: it goes through `executeTools` like a call no gate holds,
+ * and its receipt answers it without running the tool. A verdict passed for it
+ * decides nothing and is reported in `warnings`.
  */
 export async function settlePendingApprovals(
   messages: Message[],
@@ -2593,6 +2622,7 @@ export async function settlePendingApprovals(
   handoff?: { active?: ActiveAgentState; tools: ToolSet },
   approval?: ApprovalScope,
   declared?: { model: LanguageModel; tools: WireTool[] },
+  recorded?: (call: ToolCall) => boolean,
 ): Promise<{
   messages: Message[];
   /** The appended `{role:'tool'}` turn (not necessarily the last message of `messages`). */
@@ -2604,6 +2634,8 @@ export async function settlePendingApprovals(
   guardrails: GuardrailPart[];
   /** Present when a transfer was among the unanswered ids. */
   handoff?: HandoffDecision;
+  /** One per verdict passed for a call its receipt answered (2.3). */
+  warnings: CallWarning[];
 } | null> {
   // An EMPTY array still settles (default-deny the gated rest) — that is how a
   // durable resume without verdicts answers pending calls on the safe side.
@@ -2662,6 +2694,7 @@ export async function settlePendingApprovals(
     messages,
     ...(catalog ? { handoff: catalog } : {}),
     verdicts: responses,
+    ...(recorded ? { recorded } : {}),
     approval: approval ?? {},
     ...(extras?.deps ? { clock: extras.deps.clock } : {}),
     ...(extras?.observe ? { observe: extras.observe } : {}),
@@ -2691,6 +2724,11 @@ export async function settlePendingApprovals(
     denied: plan.denied,
     guardrails: plan.guardrails,
     ...(plan.handoff ? { handoff: plan.handoff } : {}),
+    warnings: (plan.ignoredVerdicts ?? []).map(({ call, approved }) => ({
+      type: 'other',
+      setting: 'approvalResponses',
+      message: `Tool call ${call.toolCallId} (${call.toolName}) already ran, so its recorded outcome answers it; the ${approved ? 'approval' : 'denial'} passed for it was ignored.`,
+    })),
   };
 }
 
@@ -2707,6 +2745,11 @@ export async function settlePendingApprovals(
  * one, because the bare id cannot say which of its calls it approves. "Once" is
  * read from the history and from the run's approval-request count, which
  * survives a rewritten history ({@link reusedToolCallIds}).
+ *
+ * A call whose receipt already records its outcome (2.3, `recorded`) is neither
+ * gated nor decided by a verdict: it ran. A verdict that names it is returned in
+ * `ignoredVerdicts`. A client tool keeps its rule: it has no executor that
+ * could answer from a receipt.
  */
 async function settleVerdicts(
   calls: ToolCall[],
@@ -2716,7 +2759,8 @@ async function settleVerdicts(
   messages: Message[],
   ob: ExecuteExtras['observe'] | undefined,
   scope: ApprovalScope,
-): Promise<{ denied: DenialMap; gated: Set<string> }> {
+  recorded?: (call: ToolCall) => boolean,
+): Promise<{ denied: DenialMap; gated: Set<string>; ignoredVerdicts: IgnoredVerdict[] }> {
   const signer = options.approvalSigner;
   const expectedRunId = options.session?.runId;
   const payloads = new Map<ToolApprovalResponse, SignedApprovalPayload | null>();
@@ -2755,6 +2799,12 @@ async function settleVerdicts(
       seen.add(response.approvalId);
     }
   }
+  // The calls a receipt answers (2.3): they ran, so no gate holds them again.
+  const answered = new Set<string>();
+  if (recorded)
+    for (const c of calls)
+      if (!isClientTool(tools, c.toolName) && recorded(c)) answered.add(c.toolCallId);
+  const ignoredVerdicts: IgnoredVerdict[] = [];
   // Each call's verdict, under the id it was issued with (or the 2.2 form).
   const reused = reusedToolCallIds(messages, scope.approvalRequestCounts);
   const matched = new Map<string, { verdict: ToolApprovalResponse; approvalId: string }>();
@@ -2763,11 +2813,17 @@ async function settleVerdicts(
     const bound = await approvalIdOf(c, options.agentPath, scope);
     boundIds.set(c.toolCallId, bound);
     const exact = byId.get(bound);
-    if (exact) matched.set(c.toolCallId, { verdict: exact, approvalId: bound });
-    else if (!reused.has(c.toolCallId) && byId.has(c.toolCallId))
-      matched.set(c.toolCallId, { verdict: byId.get(c.toolCallId)!, approvalId: c.toolCallId });
+    const entry = exact
+      ? { verdict: exact, approvalId: bound }
+      : !reused.has(c.toolCallId) && byId.has(c.toolCallId)
+        ? { verdict: byId.get(c.toolCallId)!, approvalId: c.toolCallId }
+        : undefined;
+    if (!entry) continue;
+    if (answered.has(c.toolCallId))
+      ignoredVerdicts.push({ call: c, approved: entry.verdict.approved });
+    else matched.set(c.toolCallId, entry);
   }
-  const noVerdict = calls.filter((c) => !matched.has(c.toolCallId));
+  const noVerdict = calls.filter((c) => !matched.has(c.toolCallId) && !answered.has(c.toolCallId));
   const gated = await findApprovalNeeded(noVerdict, tools, options, messages);
 
   const denied: DenialMap = new Map();
@@ -2867,7 +2923,7 @@ async function settleVerdicts(
       });
     }
   }
-  return { denied, gated };
+  return { denied, gated, ignoredVerdicts };
 }
 
 /** Signed JSON values compare structurally, independent of object key order. */

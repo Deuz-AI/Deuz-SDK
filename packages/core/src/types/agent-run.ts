@@ -426,6 +426,10 @@ export interface AgentToolReceipt {
    * `executing` means the outcome is unknown, so a resume stops for
    * reconciliation. `failed` (2.3) means `execute` threw and the model was given
    * the error; a replay reports the recorded `error` and runs nothing again.
+   * A stage that records an outcome (`executed`, `completed`, `failed`,
+   * `validation-failed`, `projection-failed`) answers its call when a resume
+   * finds the call unanswered (2.3), without the approval gate; a client
+   * tool's call is answered only from `clientToolResults`.
    */
   stage:
     | 'executing'
@@ -590,7 +594,9 @@ export type AgentRunOptions<T = string> = Omit<
    * loses it stops writing and fails with `'lease_lost'`, leaving the run as
    * its last save had it for the next executor. A `'cancel'` signalled to the
    * key stops the run with reason `'cancelled'`, and is acknowledged once that
-   * is saved. Requires `session`.
+   * is saved. A `'drain'` (2.3) stops it with reason `'drained'` at its next
+   * model-step boundary, before another model call; the run stays as its
+   * last save had it, and a resume goes on from there. Requires `session`.
    */
   lease?: AgentRunLeaseOptions;
   output?: AgentOutput<T>;
@@ -633,7 +639,11 @@ export type AgentRunOptions<T = string> = Omit<
    * binding.
    */
   fallbackModels?: LanguageModel[];
-  /** Explicitly reconcile interrupted effects before permitting these call IDs to execute again. */
+  /**
+   * Explicitly reconcile interrupted effects before permitting these call IDs to
+   * execute again. A listed call that waited for an approval is gated again:
+   * pass its verdict, or it is answered as denied.
+   */
   retryToolCallIds?: readonly string[];
   /**
    * Record the outcome of an effect that landed (2.3), supplied only on
@@ -646,7 +656,10 @@ export type AgentRunOptions<T = string> = Omit<
    * JSON for any other value). Only the run's unknown effects are accepted,
    * each once and never also in `retryToolCallIds`; anything else fails the
    * resume with a TypeError before anything is written. A resume that leaves
-   * an unknown effect unsettled stops again and records nothing.
+   * an unknown effect unsettled stops again and records nothing. A call that
+   * waited for an approval needs no verdict: the recorded outcome answers it,
+   * like every call whose receipt records an outcome, and a verdict passed for
+   * it is ignored with a `warning` part (`setting: 'approvalResponses'`).
    */
   reconciledToolResults?: readonly { toolCallId: string; output: unknown; isError?: boolean }[];
   /**
