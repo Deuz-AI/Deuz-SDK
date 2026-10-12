@@ -283,6 +283,23 @@ receipts can reuse their result. These receipts do
 not provide exactly-once execution across an external service and the local
 checkpoint transaction.
 
+A receipt is saved before the step checkpoint that answers its call, so a run can
+stop in between: the process dies during the next model call, a store write fails,
+or a sub-agent called in the same step suspends on its own approval. The next resume
+then finds the call unanswered. Since 2.3 a call whose receipt records an outcome
+(`executed`, `completed`, `failed`, or a validation or projection failure, an
+outcome recorded with `reconciledToolResults` included) is answered from that
+receipt, exactly like a call that needs no approval. The tool does not run again,
+and the approval gate does not hold the call again, whether `needsApproval` or the
+execution policy's `requireApproval` gated it, so the resume needs no verdict for
+it. A verdict you pass for it anyway decides nothing: the resume ignores it and
+streams a `warning` part (`setting: 'approvalResponses'`) that names the call.
+Before 2.3 such a call was answered `Tool call denied. Reason: No approval
+response.` unless the resume passed its verdict again, although its effect had
+landed. A call without a recorded outcome is gated as before: one that never
+started, one in `executing` that `retryToolCallIds` runs again, and a sub-agent call
+in `suspended`. Without its verdict the resume answers such a call as denied.
+
 ### Idempotent tools
 
 Some effects are safe to repeat because the tool writes under a key it derives
@@ -342,7 +359,9 @@ What a resume does depends on where the store failed:
   `reconciledToolResults` for the calls that landed. A `replay: 'idempotent'`
   tool runs again by itself, under the same `[modelStep, toolCallId]` identity.
 - **After the completed receipt** (the step checkpoint). A resume replays the
-  recorded result; the tool does not run again.
+  recorded result; the tool does not run again. Since 2.3 this holds for a call
+  that waited for an approval too: the recorded result answers it without its
+  verdict.
 
 ```ts
 import { createInMemoryAgentRunStore, resumeAgent } from '@deuz-sdk/core/agent';
@@ -392,9 +411,10 @@ for any other value). Only the calls in `unknownEffects` are accepted, each once
 never also in `retryToolCallIds`; anything else fails the resume with a
 `TypeError` before anything is written. Settle every listed call in the same
 resume: a call left unsettled stops the resume again, that stop records nothing,
-and it lists every call the store still holds as unknown. A call that waited for
-an approval is gated again on resume, as for a retry: pass the verdict you stored
-with it, or the call is answered as denied.
+and it lists every call the store still holds as unknown. A reconciled call that
+waited for an approval needs no verdict: the outcome you record answers it.
+A call in `retryToolCallIds` that waited for an approval runs again only with its
+verdict: pass the verdict you stored with it, or the call is answered as denied.
 
 ### When a model call fails
 
@@ -468,7 +488,9 @@ tools, the calls of spawned swarm tasks and of sub-agents, and, for the model ca
 they make, evolve mutations and MCP sampling requests. A tool that `prepareStep`
 puts on the wire, or that an MCP refresh brings in, is gated like any other. The
 resume settle takes the same path as a live step: it re-runs the policy before it
-executes an approved call.
+executes an approved call. A call whose receipt already records its outcome skips
+the approval step, because it ran; its receipt answers it (see
+[Strict checkpoints and approval resume](#strict-checkpoints-and-approval-resume)).
 
 A transfer is gated like any call. A guardrail, `requireApproval`, or a
 `needsApproval` on the transfer tool can refuse it; the refused transfer is answered

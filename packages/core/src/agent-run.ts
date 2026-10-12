@@ -167,6 +167,19 @@ function positiveInteger(value: number, name: string): number {
 type ReconciledOutcome = NonNullable<AgentRunOptions['reconciledToolResults']>[number];
 
 /**
+ * The receipt stages that record a call's outcome (2.3): its effect ran, and its
+ * result or error is known. `executing` (unknown) and `suspended` (a child
+ * agent waits) record none.
+ */
+const OUTCOME_STAGES: ReadonlySet<AgentToolReceipt['stage']> = new Set([
+  'executed',
+  'completed',
+  'failed',
+  'validation-failed',
+  'projection-failed',
+]);
+
+/**
  * The outcomes `reconciledToolResults` records (2.3), by call ID: only for the
  * run's unknown effects, each once, and never for a call `retryToolCallIds`
  * runs again. Anything else is a TypeError, raised before anything is written.
@@ -1579,6 +1592,12 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                   ? { mcp: { runtime: nativeMcp.runtime, refreshed: recordCatalog } }
                   : {}),
                 warnings: runWarnings,
+                // A pending call whose receipt records its outcome ran (2.3): the
+                // resume settle answers it from the receipt, never gating it again.
+                recorded: (call) => {
+                  const receipt = receipts.load(call.toolCallId);
+                  return receipt !== undefined && OUTCOME_STAGES.has(receipt.stage);
+                },
               },
             );
             for await (const part of inner.fullStream) {

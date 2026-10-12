@@ -181,6 +181,12 @@ export interface StreamToolLoopInternal {
    * once.
    */
   warnings?: WarningSink;
+  /**
+   * Native runs (2.3): whether the run's effect receipt already records the
+   * outcome of a pending call. The resume settle answers such a call from its
+   * receipt and never gates it again (see `settlePendingApprovals`).
+   */
+  recorded?: (call: ToolCall) => boolean;
 }
 
 export interface StreamToolLoopSnapshot {
@@ -797,8 +803,13 @@ export function runStreamToolLoop(
           // On a stable prefix (2.3, F22) a pending call resolves against the set
           // its step offered, as it would have in the step.
           { model: active?.model ?? options.model, tools: declaredWire.tools },
+          // A native run's receipts answer the calls whose outcome they record (2.3).
+          internal?.recorded,
         );
         if (settled) {
+          // A verdict for a call its receipt answered decided nothing (2.3).
+          for (const warning of settled.warnings) warningSink.add(warning);
+          flushWarnings();
           // Not the tail of `settled.messages`: a break that committed a handoff
           // may have left the target's instructions after it (2.3, F22).
           appended.push(settled.toolMessage);

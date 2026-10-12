@@ -287,7 +287,7 @@ describe('a landed effect is recorded with reconciledToolResults (2.3)', () => {
     ]);
   });
 
-  it('takes the stored verdict again for a call that waited for an approval', async () => {
+  it('needs no verdict for a call that waited for an approval, and ignores a stored one', async () => {
     const inner = createInMemoryAgentRunStore();
     const effects: string[] = [];
     const tools: AgentToolSet = {
@@ -318,17 +318,31 @@ describe('a landed effect is recorded with reconciledToolResults (2.3)', () => {
       approvalResponses,
     });
     expect(stages(await inner.load('g'))).toEqual(['c1:executing']);
-    // As for a retry, the gate answers the call again on resume: with the verdict
-    // the application stored, the recorded outcome answers it.
-    const resumed = await resumeAgent({
+    // The recorded outcome answers the call (2.3): the gate does not hold it
+    // again, so the verdict the application stored decides nothing, and the
+    // stream says it was ignored.
+    const stream = resumeStreamAgent({
       ...options,
       session,
       approvalResponses,
       reconciledToolResults: [{ toolCallId: 'c1', output: 'charged' }],
     });
-    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    const events: AgentEvent[] = [];
+    for await (const event of stream.events) events.push(event);
+    expect(await stream.result).toMatchObject({ status: 'completed', output: 'done' });
     expect(effects).toEqual(['charge']);
     expect(toolMessages(fetch, 1)).toEqual(['charged']);
+    expect(events).toContainEqual({
+      type: 'part',
+      phase: 'running',
+      part: {
+        type: 'warning',
+        warning: expect.objectContaining({
+          setting: 'approvalResponses',
+          message: expect.stringContaining('the approval passed for it was ignored'),
+        }),
+      },
+    });
   });
 
   it('refuses anything but the unknown effects, before writing anything', async () => {
