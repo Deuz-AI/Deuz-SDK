@@ -42,6 +42,7 @@ import type { MemoryMutation, MemoryScorer } from '../memory';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
   applyCompaction,
+  isSummaryMessage,
   normalizeCompaction,
   type ApplyCompactionCtx,
   type NormalizedCompaction,
@@ -3652,6 +3653,10 @@ function contentText(content: Message['content']): string {
  * (`withSystemBlock`) — never into the canonical history, so checkpoints and
  * chat persistence stay recall-free and resume legs cannot double-inject.
  * Best-effort: a failing store/embedder logs and the call proceeds bare.
+ *
+ * A compaction summary is not a user message here (2.3): it carries the user
+ * role but is the conversation, not a question, so the query is the last user
+ * message before it, or there is none.
  */
 export async function computeRecallBlock(
   options: CommonCallOptions,
@@ -3661,7 +3666,7 @@ export async function computeRecallBlock(
 ): Promise<string | undefined> {
   const memory = options.memory;
   if (!memory || memory.recall === false) return undefined;
-  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user' && !isSummaryMessage(m));
   const text = lastUser ? contentText(lastUser.content) : '';
   // Nothing to query with: no retrieval happened, so no operation is reported
   // either — an operation.started with no matching terminal would be a lie.
@@ -3767,7 +3772,10 @@ function recalledAlready(messages: Message[]): boolean {
  * user turn: a history whose last user message is already followed by its
  * recall message (an approval continuation, a replayed transcript) recalls
  * nothing, and neither does a `resumed` leg whose checkpoint holds one — even
- * when a loop-injected user turn (a false-finish nudge) came after it.
+ * when a loop-injected user turn (a false-finish nudge) came after it — or
+ * holds a compaction summary: a resumed leg continues the turn its first leg
+ * recalled for, and a summary taken inside the tool loop folded that turn's
+ * recall message in with the rest of the turn.
  *
  * Every other model keeps the 2.2 placement: the block is spliced into the
  * leading system turn at the model-call site only, and the transcript stays
@@ -3789,7 +3797,11 @@ export async function planRecall(
   resumed = false,
 ): Promise<RecallPlan> {
   const stable = bindsThinkingToPrefix(model);
-  if (stable && (recalledAlready(messages) || (resumed && messages.some(isRecallMessage)))) {
+  if (
+    stable &&
+    (recalledAlready(messages) ||
+      (resumed && messages.some((m) => isRecallMessage(m) || isSummaryMessage(m))))
+  ) {
     return {};
   }
   const block = await computeRecallBlock(options, deps, messages, ob);

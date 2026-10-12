@@ -660,3 +660,83 @@ describe.each(LOOPS)(
     });
   },
 );
+
+/** A summarize side call (the loop's own compaction request), by its prompt. */
+const isSummaryCall = (r: ClaudeRequest) =>
+  JSON.stringify(r.messages).includes('Output only the summary') ||
+  JSON.stringify(r.messages).includes('Output only the updated summary');
+
+describe.each(LOOPS)('recall after a compaction inside the tool loop (%s loop)', (loop) => {
+  /**
+   * Searches until the history holds a summary, then a gated deploy; the run
+   * suspends there and resumes with the approval. Returns each recall query.
+   */
+  async function compactSuspendResume(
+    modelId: string,
+    compaction: CommonCallOptions['compaction'],
+  ): Promise<{ queries: unknown[]; requests: ClaudeRequest[] }> {
+    const seams = await seededSeams();
+    let n = 0;
+    const claude = scriptedClaude((request) => {
+      const body = JSON.stringify(request.messages);
+      if (isSummaryCall(request)) return thinkThenAnswer('SX', 'CONDENSED.');
+      if (body.includes('"tool_use_id":"tu_g"')) return thinkThenAnswer('SD', 'Deployed.');
+      if (body.includes('[Earlier conversation summarized]'))
+        return thinkThenCall('SG', 'tu_g', 'deploy');
+      return thinkThenCall(`S${n}`, `tu_${n++}`, 'search');
+    }, modelId);
+    const store = createInMemorySessionStore();
+    const common = {
+      model: claude.model,
+      tools: {
+        search: { parameters: OBJ, execute: async () => 'found' },
+        deploy: { parameters: OBJ, execute: async () => 'deployed', needsApproval: true },
+      },
+      maxSteps: 8,
+      // 100 "tokens" a message in a 1000-token window: the pass runs in the
+      // middle of the tool loop, before the deploy.
+      capabilities: { contextWindow: 1000 },
+      compaction,
+      memory: { seams, scope: { userId: 'u1' }, extract: false as const },
+      deps: { clock },
+    };
+    const first = await generateText({
+      ...common,
+      messages: [
+        { role: 'system', content: 'You research.' },
+        { role: 'user', content: 'Research my coffee.' },
+      ],
+      session: { store, runId: 'run-1' },
+    });
+    expect(first.pendingApprovals).toHaveLength(1);
+    await resume(loop, store, 'run-1', {
+      ...common,
+      approvalResponses: [{ approvalId: first.pendingApprovals![0]!.approvalId, approved: true }],
+    });
+    const queries = seams.search.mock.calls.map(([q]) => (q as { text?: unknown }).text);
+    return { queries, requests: claude.requests.filter((r) => !isSummaryCall(r)) };
+  }
+
+  it('Claude 5.x: the resumed leg does not recall the summarized turn again', async () => {
+    const { queries, requests } = await compactSuspendResume('claude-opus-5-5', {
+      threshold: 0.5,
+      countTokens: (m) => m.length * 100,
+    });
+    // The first leg's one recall, which the summary folded in with its turn.
+    expect(queries).toEqual(['Research my coffee.']);
+    const resumed = requests.at(-1)!;
+    expect(JSON.stringify(resumed.messages)).toContain('[Earlier conversation summarized]');
+    expect(occurrences(resumed, MEMORY)).toBe(0);
+  });
+
+  it('an older model recalls on the resumed leg with the question, never the summary', async () => {
+    const { queries } = await compactSuspendResume('claude-opus-4-8', {
+      threshold: 0.5,
+      keepRecentSteps: 1,
+      countTokens: (m) => m.length * 100,
+    });
+    // The splice placement recalls on every leg (2.2); the query is the user's
+    // question, not the summary that now sits after it.
+    expect(queries).toEqual(['Research my coffee.', 'Research my coffee.']);
+  });
+});
