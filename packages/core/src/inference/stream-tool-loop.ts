@@ -200,6 +200,13 @@ export interface StreamToolLoopInternal {
     usage: Usage;
     handoff?: { to: string; count: number };
   }) => Promise<void>;
+  /**
+   * Native runs (2.3): tools only the resume settle sees, over the leg's own.
+   * The runner passes its client tools here with an executor that answers a
+   * call from the result the resume supplied or a receipt recorded; the loop's
+   * steps keep them without one, so a later call still suspends.
+   */
+  settleTools?: ToolSet;
 }
 
 export interface StreamToolLoopSnapshot {
@@ -785,14 +792,17 @@ export function runStreamToolLoop(
       // their tool-result parts precede the first step-start. A durable
       // sub-agent that re-suspends here suspends THIS run again immediately.
       try {
+        // The pending calls were issued BEFORE the transfer, by an agent whose
+        // tools the overlay above has already replaced. Settling them against
+        // the active set alone would report a human-APPROVED call as a
+        // hallucinated name, so the settle — and only the settle — also sees
+        // the set the call came in with.
+        const settleSet = active
+          ? mergeMcpTools(mcp, { ...(options.tools ?? {}), ...active.tools })
+          : tools;
         const settled = await settlePendingApprovals(
           messages,
-          // The pending calls were issued BEFORE the transfer, by an agent whose
-          // tools the overlay above has already replaced. Settling them against
-          // the active set alone would report a human-APPROVED call as a
-          // hallucinated name, so the settle — and only the settle — also sees
-          // the set the call came in with.
-          active ? mergeMcpTools(mcp, { ...(options.tools ?? {}), ...active.tools }) : tools,
+          internal?.settleTools ? { ...settleSet, ...internal.settleTools } : settleSet,
           options,
           extras,
           {

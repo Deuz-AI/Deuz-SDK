@@ -973,7 +973,6 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const outputSchema = options.output ? await agentJSONSchema(options.output) : undefined;
       if (options.output?.element)
         assertAgentValidation(options.output.element, 'Agent array element');
-      const nativeTools = { ...options.tools };
       const savedClients =
         envelope.pendingClientCalls ??
         (envelope.result?.status === 'suspended' ? envelope.result.pendingClientCalls : []);
@@ -982,33 +981,6 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const clientValues = new Map(
         (options.clientToolResults ?? []).map((item) => [item.toolCallId, item]),
       );
-      const clientNames = new Set(
-        savedClients
-          .filter((call) => clientValues.has(call.toolCallId))
-          .map((call) => call.toolName),
-      );
-      for (const name of clientNames) {
-        const original = nativeTools[name];
-        if (!original || original.execute) continue;
-        nativeTools[name] = {
-          ...original,
-          execute: (_args, ctx) => {
-            const provided = clientValues.get(ctx.toolCallId);
-            if (!provided) throw new TypeError('No result supplied for this client call.');
-            clientValues.delete(ctx.toolCallId);
-            if (
-              !savedClients.some(
-                (call) => call.toolName === name && clientValues.has(call.toolCallId),
-              )
-            ) {
-              // Later calls of this tool must suspend again as client-side calls.
-              if (common.tools?.[name]) common.tools[name]!.execute = undefined;
-            }
-            if (provided.isError) throw new Error(String(provided.output));
-            return provided.output;
-          },
-        };
-      }
       const onToolOutput = (output: NativeToolOutput): void => {
         events.push({ type: 'tool-output', ...output });
       };
@@ -1057,11 +1029,64 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         },
       };
       common.tools = await prepareAgentTools(
-        nativeTools,
+        options.tools,
         options.toolsContext,
         onToolOutput,
         receipts,
       );
+      // Client calls (2.3): a call of one of the run's own tools without
+      // `execute`. The settle applies a result a resume supplies through the
+      // call's receipt, so a later resume answers the call from that record,
+      // for example after the process died before the step was saved. Only the
+      // settle gets an executor for them: the loop's own tools keep none, so a
+      // later call of the same tool suspends as a client call again.
+      const isClientTool = (name: string): boolean =>
+        options.tools !== undefined &&
+        Object.hasOwn(options.tools, name) &&
+        !options.tools[name]!.execute;
+      /** The open turn's client calls whose receipt records their result, by call ID. */
+      const recordedClients = new Map(
+        Object.values(envelope.toolResults ?? {})
+          .filter(
+            (receipt) =>
+              receipt.modelStep === envelope.modelSteps &&
+              OUTCOME_STAGES.has(receipt.stage) &&
+              isClientTool(receipt.toolName),
+          )
+          .map((receipt) => [receipt.toolCallId, receipt]),
+      );
+      const settledClients = new Set(
+        [
+          ...savedClients.filter((call) => clientValues.has(call.toolCallId)),
+          ...recordedClients.values(),
+        ]
+          .map((call) => call.toolName)
+          .filter(isClientTool),
+      );
+      const settleTools =
+        settledClients.size > 0
+          ? await prepareAgentTools(
+              Object.fromEntries(
+                [...settledClients].map((name) => [
+                  name,
+                  {
+                    ...options.tools![name]!,
+                    // A recorded result is replayed before this runs.
+                    execute: (_args: unknown, ctx: { toolCallId: string }) => {
+                      const provided = clientValues.get(ctx.toolCallId);
+                      if (!provided)
+                        throw new TypeError('No result supplied for this client call.');
+                      if (provided.isError) throw new Error(String(provided.output));
+                      return provided.output;
+                    },
+                  },
+                ]),
+              ),
+              options.toolsContext,
+              onToolOutput,
+              receipts,
+            )
+          : undefined;
       const binding: NonNullable<AgentRunEnvelope['binding']> = {
         model: modelBinding(common.model),
         tools: JSON.stringify(
@@ -1192,22 +1217,26 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       );
       if (
         resume &&
-        pendingCheckpoint?.status === 'suspended' &&
-        // A verdict must name the approval it answers (2.3): one kept from an
-        // earlier gate under a reused call id leaves the run suspended. The run's
-        // count covers its own gate's requests; a sub-agent's has its own.
-        (pendingApprovals.some(
-          (request) =>
-            !answersApproval(
-              request,
-              options.approvalResponses,
-              envelope.messages,
-              request.agentPath?.length
-                ? undefined
-                : requestCountsOf(pendingCheckpoint?.approvalRequestCounts),
-            ),
-        ) ||
-          pendingClients.some((call) => !clientIds.has(call.toolCallId)))
+        ((pendingCheckpoint?.status === 'suspended' &&
+          // A verdict must name the approval it answers (2.3): one kept from an
+          // earlier gate under a reused call id leaves the run suspended. The
+          // run's count covers its own gate's requests; a sub-agent's has its own.
+          pendingApprovals.some(
+            (request) =>
+              !answersApproval(
+                request,
+                options.approvalResponses,
+                envelope.messages,
+                request.agentPath?.length
+                  ? undefined
+                  : requestCountsOf(pendingCheckpoint?.approvalRequestCounts),
+              ),
+          )) ||
+          // A client call waits for its result until one is recorded (2.3), also
+          // once a call beside it moved the stored step on.
+          pendingClients.some(
+            (call) => !clientIds.has(call.toolCallId) && !recordedClients.has(call.toolCallId),
+          ))
       ) {
         const outcome: AgentResult<T> = {
           ...base(),
@@ -1297,7 +1326,18 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           return persist();
         });
       }
-      if (clientResults.length) envelope.pendingClientCalls = [];
+      // The pending client calls stay listed until the settle's answers are saved
+      // (2.3): a resume that dies before then accepts their results again. One
+      // whose result a receipt already records is answered from that record.
+      for (const id of clientIds) {
+        const receipt = recordedClients.get(id);
+        if (receipt)
+          runWarnings.add({
+            type: 'other',
+            setting: 'clientToolResults',
+            message: `Tool call ${id} (${receipt.toolName}) already has a recorded result, which answers it; the result passed for it was ignored.`,
+          });
+      }
       // A reconciled effect (2.3) landed: its receipt takes the outcome the
       // caller found, so the step goes on from it as from a recorded raw result
       // (validated and projected like the tool's own) and the call never runs
@@ -1671,8 +1711,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                 // run's current model step, where its receipts are found.
                 settled: async ({ messages, usage, handoff }) => {
                   envelope.usage = usage;
+                  envelope.pendingClientCalls = [];
                   await saveInFlight(messages, handoff);
                 },
+                // Client calls answered from a supplied or recorded result (2.3).
+                ...(settleTools ? { settleTools } : {}),
               },
             );
             for await (const part of inner.fullStream) {

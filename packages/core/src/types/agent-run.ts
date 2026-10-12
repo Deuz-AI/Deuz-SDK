@@ -428,8 +428,8 @@ export interface AgentToolReceipt {
    * the error; a replay reports the recorded `error` and runs nothing again.
    * A stage that records an outcome (`executed`, `completed`, `failed`,
    * `validation-failed`, `projection-failed`) answers its call when a resume
-   * finds the call unanswered (2.3), without the approval gate; a client
-   * tool's call is answered only from `clientToolResults`.
+   * finds the call unanswered (2.3), without the approval gate. For a client
+   * tool's call it records the result a resume supplied.
    */
   stage:
     | 'executing'
@@ -676,7 +676,14 @@ export type AgentRunOptions<T = string> = Omit<
    * is written. Ignored for a run that did not fail.
    */
   retryFailed?: boolean;
-  /** Results for pending client-side tool calls, supplied only on resume. */
+  /**
+   * Results for pending client-side tool calls, supplied only on resume. The
+   * resume records each one in the call's receipt as it applies it (2.3). The
+   * calls stay pending until the resume saved its answers, so a resume that
+   * died first accepts the same results again; a recorded result answers its
+   * call on the next resume without being supplied again (one passed again is
+   * ignored with a `warning` part, `setting: 'clientToolResults'`).
+   */
   clientToolResults?: readonly { toolCallId: string; output: unknown; isError?: boolean }[];
   verify?: (context: AgentVerifyContext<T>) => AgentVerification | Promise<AgentVerification>;
   /** Total candidate validation attempts, including the first. Default 2. */

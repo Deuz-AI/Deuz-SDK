@@ -740,50 +740,231 @@ describe('a call without a recorded outcome is gated as before', () => {
   });
 });
 
-describe('a client tool keeps its rule', () => {
-  it('answers a client call only from clientToolResults, also once its result was recorded', async () => {
+describe('a client result a resume was given is never lost (2.3)', () => {
+  const ask = { ask: { description: 'Ask the user.', parameters } };
+  const NO_RESULT = 'No result provided for this client tool';
+  const blue = [{ toolCallId: 'a1', output: 'blue' }];
+
+  /** A run suspended on the client call `a1`; `responses` follow the first turn. */
+  async function waitingOnAsk(runId: string, responses: MockResponse[]) {
     const store = createInMemoryAgentRunStore();
     const { model, fetch } = counted([
       { toolCalls: [{ toolName: 'ask', id: 'a1', args: {} }] },
+      ...responses,
+    ]);
+    const options = { model, prompt: 'ask', tools: ask };
+    const session = { store, runId, scope: 't' };
+    expect((await runAgent({ ...options, session })).status).toBe('suspended');
+    return { store, fetch, options, session };
+  }
+
+  /** The resume applies `blue` and dies at the save after the one recording `stage`. */
+  async function appliedThenCrashed(runId: string, stage: string) {
+    const run = await waitingOnAsk(runId, [{ text: 'done' }]);
+    const crashed = await resumeAgent({
+      ...run.options,
+      session: { ...run.session, store: failingAfter(run.store, stage) },
+      clientToolResults: blue,
+    });
+    expect(crashed.status).toBe('failed');
+    return run;
+  }
+
+  it('answers the call from the result an interrupted resume recorded', async () => {
+    const { store, fetch, options, session } = await appliedThenCrashed('recorded', 'a1:completed');
+    // The result is in the call's receipt; the turn is still open.
+    expect(stages(await store.load('recorded'))).toEqual(['a1:completed']);
+    expect((await store.load('recorded'))!.messages.at(-1)?.role).toBe('assistant');
+    const resumed = await resumeAgent({ ...options, session });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(toolMessages(fetch, 1)).toEqual(['blue']);
+  });
+
+  it('answers it from the recorded result through resumeStreamAgent too', async () => {
+    const { fetch, options, session } = await appliedThenCrashed('streamed', 'a1:completed');
+    const { result, parts } = await collect(resumeStreamAgent({ ...options, session }));
+    expect(result).toMatchObject({ status: 'completed', output: 'done' });
+    expect(toolMessages(fetch, 1)).toEqual(['blue']);
+    expect(parts).toContainEqual({
+      type: 'tool-result',
+      toolCallId: 'a1',
+      toolName: 'ask',
+      output: 'blue',
+    });
+  });
+
+  it('keeps the run waiting for a result the interrupted resume never recorded', async () => {
+    const { store, fetch, options, session } = await waitingOnAsk('lost', [{ text: 'done' }]);
+    const crashed = await resumeAgent({
+      ...options,
+      session: {
+        ...session,
+        store: {
+          load: (id) => store.load(id),
+          save(envelope) {
+            if (stages(envelope).includes('a1:executing')) throw new Error('process died');
+            return store.save(envelope);
+          },
+        },
+      },
+      clientToolResults: blue,
+    });
+    expect(crashed.status).toBe('failed');
+    expect(stages(await store.load('lost'))).toEqual([]);
+    // Without the result the run is still suspended on the call, and says so.
+    expect(await resumeAgent({ ...options, session })).toMatchObject({
+      status: 'suspended',
+      pendingClientCalls: [{ toolCallId: 'a1', toolName: 'ask' }],
+    });
+    // The same result is accepted again, and answers the call.
+    const resumed = await resumeAgent({ ...options, session, clientToolResults: blue });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(toolMessages(fetch, 1)).toEqual(['blue']);
+  });
+
+  it('keeps it waiting when a call beside it recorded its outcome first', async () => {
+    const effects: string[] = [];
+    const store = createInMemoryAgentRunStore();
+    const { model, fetch } = counted([
+      {
+        toolCalls: [
+          { toolName: 'ship', id: 's1', args: {} },
+          { toolName: 'ask', id: 'a1', args: {} },
+        ],
+      },
       { text: 'done' },
     ]);
     const options = {
       model,
-      prompt: 'ask',
-      tools: { ask: { description: 'Ask the user.', parameters } },
+      prompt: 'ship and ask',
+      maxToolConcurrency: 1,
+      tools: {
+        ...ask,
+        ship: {
+          parameters,
+          execute: () => {
+            effects.push('ship');
+            return 'shipped';
+          },
+        },
+      },
     };
-    const session = { store, runId: 'client', scope: 't' };
+    const session = { store, runId: 'beside', scope: 't' };
     expect((await runAgent({ ...options, session })).status).toBe('suspended');
-    // The resume applies the client's result, and the process dies before the
-    // step that answers the call is checkpointed.
+    // The ship call records its outcome; the process dies before the client
+    // result is recorded. The stored step is running, no longer suspended.
     const crashed = await resumeAgent({
       ...options,
-      session: { ...session, store: failingAfter(store, 'a1:completed') },
-      clientToolResults: [{ toolCallId: 'a1', output: 'blue' }],
+      session: { ...session, store: failingAfter(store, 's1:completed') },
+      clientToolResults: blue,
     });
     expect(crashed.status).toBe('failed');
-    expect(stages(await store.load('client'))).toEqual(['a1:completed']);
-    // The resume that took it up cleared the run's pending client calls, so the
-    // result cannot be supplied again: that resume fails and writes nothing.
-    const before = await store.load('client');
-    expect(
-      await resumeAgent({
+    expect(stages(await store.load('beside'))).toEqual(['s1:completed']);
+    expect((await store.load('beside'))!.checkpoints.beside!.status).toBe('running');
+    expect(await resumeAgent({ ...options, session })).toMatchObject({
+      status: 'suspended',
+      pendingClientCalls: [{ toolCallId: 'a1' }],
+    });
+    const resumed = await resumeAgent({ ...options, session, clientToolResults: blue });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(toolMessages(fetch, 1)).toEqual(['shipped', 'blue']);
+    expect(effects).toEqual(['ship']);
+  });
+
+  it('answers with the recorded result when the result is passed again, and says so', async () => {
+    const { fetch, options, session } = await appliedThenCrashed('again', 'a1:completed');
+    const { result, parts } = await collect(
+      resumeStreamAgent({
         ...options,
         session,
-        clientToolResults: [{ toolCallId: 'a1', output: 'blue' }],
+        clientToolResults: [{ toolCallId: 'a1', output: 'red' }],
       }),
-    ).toMatchObject({
-      status: 'failed',
-      error: {
-        name: 'TypeError',
-        message: 'Client tool results must match unique pending call IDs on resume.',
+    );
+    expect(result).toMatchObject({ status: 'completed', output: 'done' });
+    expect(toolMessages(fetch, 1)).toEqual(['blue']);
+    expect(
+      parts.flatMap((part) =>
+        part.type === 'warning' && part.warning.setting === 'clientToolResults'
+          ? [part.warning]
+          : [],
+      ),
+    ).toEqual([
+      {
+        type: 'other',
+        setting: 'clientToolResults',
+        message:
+          'Tool call a1 (ask) already has a recorded result, which answers it; the result passed for it was ignored.',
       },
-    });
-    expect(await store.load('client')).toEqual(before);
-    const resumed = await resumeAgent({ ...options, session });
-    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
-    expect(toolMessages(fetch, 1)).toEqual([
-      'Tool call denied. Reason: No result provided for this client tool.',
     ]);
+  });
+
+  it('keeps a result applied beside a sub-agent that suspended on its own approval', async () => {
+    const effects: string[] = [];
+    const child = counted([
+      { toolCalls: [{ toolName: 'pay', id: 'p1', args: {} }] },
+      { text: 'paid' },
+    ]);
+    const parent = counted([
+      {
+        toolCalls: [
+          { toolName: 'ask', id: 'a1', args: {} },
+          { toolName: 'worker', id: 'w1', args: { prompt: 'pay' } },
+        ],
+      },
+      { text: 'done' },
+    ]);
+    const options = {
+      model: parent.model,
+      prompt: 'ask and pay',
+      maxToolConcurrency: 1,
+      tools: {
+        ...ask,
+        worker: agentTool({
+          name: 'worker',
+          description: 'Pays.',
+          model: child.model,
+          tools: {
+            pay: {
+              parameters,
+              needsApproval: true,
+              execute: () => {
+                effects.push('pay');
+                return 'paid';
+              },
+            },
+          },
+        }),
+      },
+      session: { store: createInMemoryAgentRunStore(), runId: 'beside-child', scope: 't' },
+    };
+    expect((await runAgent(options)).status).toBe('suspended');
+    // The client's result is applied; the worker's child then waits for its approval.
+    const second = await resumeAgent({ ...options, clientToolResults: blue });
+    expect(second).toMatchObject({ status: 'suspended', pendingClientCalls: [] });
+    // The caller answers what the run waits for now: the child's approval only.
+    const resumed = await resumeAgent({ ...options, approvalResponses: approveAll(second) });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(effects).toEqual(['pay']);
+    expect(toolMessages(parent.fetch, 1)).toEqual(['blue', 'paid']);
+  });
+
+  it('suspends again on a later call of the same client tool', async () => {
+    const { fetch, options, session } = await waitingOnAsk('later', [
+      { toolCalls: [{ toolName: 'ask', id: 'a2', args: {} }] },
+      { text: 'done' },
+    ]);
+    const second = await resumeAgent({ ...options, session, clientToolResults: blue });
+    expect(second).toMatchObject({
+      status: 'suspended',
+      pendingClientCalls: [{ toolCallId: 'a2', toolName: 'ask' }],
+    });
+    const resumed = await resumeAgent({
+      ...options,
+      session,
+      clientToolResults: [{ toolCallId: 'a2', output: 'green' }],
+    });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(toolMessages(fetch, 2)).toEqual(['blue', 'green']);
+    expect(JSON.stringify(toolMessages(fetch, 2))).not.toContain(NO_RESULT);
   });
 });

@@ -274,7 +274,13 @@ shortened cannot make a reused ID look unique.
 Client-side tools likewise remain suspended until
 `clientToolResults` supplies every pending call ID; each entry has `toolCallId`,
 `output`, and an optional `isError`. Supplied results pass through the same approval,
-validation and model-projection path as server tools.
+validation and model-projection path as server tools. Since 2.3 a supplied result is
+never lost to an interrupted resume. The run keeps listing the calls as pending
+until the resume has saved its answers, so a resume that dies before it recorded a
+result accepts that result again, and a resume without it stays suspended on the
+call. A result the resume did record (in the call's receipt) answers the call on
+the next resume, which needs no result for it; one passed for it anyway is ignored
+with a `warning` part (`setting: 'clientToolResults'`).
 
 Use one executor for a given native run. Concurrent starts or resumes through the
 same `AgentRunStore` object are rejected within one JavaScript process. Across
@@ -320,10 +326,9 @@ response.` unless the resume passed its verdict again, although its effect had
 landed. A call without a recorded outcome is gated as before: one that never
 started, one in `executing` that `retryToolCallIds` runs again, and a sub-agent call
 in `suspended`. Without its verdict the resume answers such a call as denied. A
-client tool's call keeps its own rule: a resume answers it only from the
-`clientToolResults` it is given for the run's pending calls, so a client call
-whose result an interrupted resume had already recorded is answered
-`Tool call denied. Reason: No result provided for this client tool.`
+client tool's call is answered from the result a resume supplied: from the receipt
+that recorded it, or, when none did, from `clientToolResults`, which the run then
+still waits for (see above).
 
 A resume saves what its settle answered (each call's result, error, denial or
 client result) as the run's checkpoint before its first model call (2.3). A
