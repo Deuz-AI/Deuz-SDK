@@ -200,6 +200,30 @@ describe('verify-skill: names', () => {
     ]);
   });
 
+  it('fails on a mention of a @deuz-sdk package that does not exist (only core and react do)', () => {
+    const fixture = freshSkill();
+    editBoth(fixture, 'references/core.md', '`@deuz-sdk/core/ui`', '`@deuz-sdk/ui`');
+    expect(run(fixture).failures).toEqual([
+      'skills/deuz-sdk/references/core.md:11  mentions unknown subpath "@deuz-sdk/ui"',
+    ]);
+  });
+
+  it('fails on a name attributed to a package that does not exist, once', () => {
+    const fixture = freshSkill();
+    editBoth(fixture, 'SKILL.md', '`@deuz-sdk/core/agent`', '`@deuz-sdk/agent`');
+    expect(run(fixture).failures).toEqual([
+      'skills/deuz-sdk/SKILL.md:8  mentions unknown subpath "@deuz-sdk/agent"',
+    ]);
+  });
+
+  it('fails on a name attributed to a specifier no module can have', () => {
+    const fixture = freshSkill();
+    editBoth(fixture, 'SKILL.md', '`@deuz-sdk/core/agent`', '`@deuz-sdk/core/agent@2.3.0`');
+    expect(run(fixture).failures).toEqual([
+      'skills/deuz-sdk/SKILL.md:8  attributes "runAgent" to unknown subpath "@deuz-sdk/core/agent@2.3.0"',
+    ]);
+  });
+
   it('skips a fence tagged no-verify, and only that fence', () => {
     const fixture = freshSkill();
     const fences = [
@@ -446,6 +470,26 @@ describe('verify-skill: grading answers', () => {
       'route.ts:1  "toStreamResponse" is not exported by @deuz-sdk/core/ui',
     ]);
   });
+
+  it('reports invented @deuz-sdk packages however an answer names them', () => {
+    const answers = join(scratch, `answers-${counter++}`);
+    writeTree(answers, {
+      'mention.md': 'Install `@deuz-sdk/headless` and run it.\n',
+      'dynamic.ts': "const cli = await import('@deuz-sdk/headless');\n",
+      'require.cjs': "const { runHeadless } = require('@deuz-sdk/cli');\n",
+      'attribution.md': 'Use `runHeadless` from `@deuz-sdk/cli`.\n',
+      'control.md':
+        'See `@deuz-sdk/core/headles`, or `runHeadless` from `@deuz-sdk/core/headless`.\n',
+      'versions.md': 'Pin `@deuz-sdk/core@2.3.0` and `@deuz-sdk/react@2.3.0`.\n',
+    });
+    expect(verify.verifyAnswers(answers, { table }).failures).toEqual([
+      'attribution.md:1  mentions unknown subpath "@deuz-sdk/cli"',
+      'control.md:1  mentions unknown subpath "@deuz-sdk/core/headles"',
+      'dynamic.ts:1  mentions unknown subpath "@deuz-sdk/headless"',
+      'mention.md:1  mentions unknown subpath "@deuz-sdk/headless"',
+      'require.cjs:1  mentions unknown subpath "@deuz-sdk/cli"',
+    ]);
+  });
 });
 
 describe('sync-skill-copy', { timeout: 30_000 }, () => {
@@ -474,6 +518,19 @@ describe('sync-skill-copy', { timeout: 30_000 }, () => {
     expect(
       sync.diffSkillCopies(join(REPO, 'skills/deuz-sdk'), join(REPO, '.claude/skills/deuz-sdk')),
     ).toEqual([]);
+  });
+
+  it('refuses a source that is not a skill, and deletes nothing from the mirror', () => {
+    const fixture = freshSkill();
+    const mirrored = readdirSync(fixture.mirror, { recursive: true }).sort();
+    // A typo, and the folder above the skill: neither holds a SKILL.md.
+    for (const source of [join(fixture.root, 'skill/deuz-sdk'), join(fixture.root, 'skills')]) {
+      expect(() => sync.writeSkillMirror(source, fixture.mirror)).toThrow(
+        /no skill at .*SKILL\.md/,
+      );
+    }
+    expect(readdirSync(fixture.mirror, { recursive: true }).sort()).toEqual(mirrored);
+    expect(sync.diffSkillCopies(fixture.skill, fixture.mirror)).toEqual([]);
   });
 });
 
@@ -514,5 +571,21 @@ describe('command line', { timeout: 30_000 }, () => {
     const write = node('sync-skill-copy.mjs', [...args, '--write']);
     expect(write.status).toBe(0);
     expect(node('sync-skill-copy.mjs', args).status).toBe(0);
+  });
+
+  it('sync-skill-copy exits 1 on a mistyped --skill and deletes nothing, with or without --write', () => {
+    const fixture = freshSkill();
+    const args = ['--skill', join(fixture.root, 'skill/deuz-sdk'), '--mirror', fixture.mirror];
+    for (const result of [
+      node('sync-skill-copy.mjs', [...args, '--write']),
+      node('sync-skill-copy.mjs', args),
+    ]) {
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/no skill at .*SKILL\.md/);
+      expect(result.stdout).toBe('');
+    }
+    expect(existsSync(join(fixture.mirror, 'SKILL.md'))).toBe(true);
+    expect(existsSync(join(fixture.mirror, 'references/core.md'))).toBe(true);
+    expect(sync.diffSkillCopies(fixture.skill, fixture.mirror)).toEqual([]);
   });
 });

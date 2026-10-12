@@ -21,6 +21,7 @@ import type {
   HeadlessPendingAction,
   HeadlessReport,
   ProjectInstructions,
+  ProjectInstructionsOptions,
 } from '../src/node/headless';
 
 const model = createMockModel({ responses: [] });
@@ -43,6 +44,15 @@ describe('headless types (2.3 preview)', () => {
     >();
     expectTypeOf<HeadlessPendingAction['kind']>().toEqualTypeOf<
       'approval' | 'client-tool' | 'unknown-effect' | 'resume'
+    >();
+    expectTypeOf<ProjectInstructions['skipped']>().toEqualTypeOf<
+      { path: string; relativePath: string; reason: 'outside-root' }[]
+    >();
+    expectTypeOf<ProjectInstructionsOptions['role']>().toEqualTypeOf<
+      'system' | 'user' | undefined
+    >();
+    expectTypeOf<NonNullable<ProjectInstructions['message']>['role']>().toEqualTypeOf<
+      'system' | 'user'
     >();
   });
 
