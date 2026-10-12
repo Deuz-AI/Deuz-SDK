@@ -227,10 +227,15 @@ authentication mechanism. Native store run IDs must be unique within that store.
 Resume requires the original run ID and scope. Keep `bindingId` stable for the
 same implementation and bump it when tool or verifier semantics change. Stored
 model/tool/output schemas and persisted limits are checked on resume, and since 2.3
-so is each handoff target's model, instructions and tool schemas. Function
+so is each handoff target's model, instructions and tool schemas, and the MCP
+servers' tool catalog (a resume with `onCatalogChange: 'accept'` records a catalog
+that changed instead of failing: see
+[MCP in native runs](/docs/modules/native-mcp#a-change-the-run-missed)). Function
 bodies cannot be fingerprinted reliably: changing a validator, approval predicate,
 tool implementation or verifier requires a new `bindingId`. A
-completed native envelope returns its stored result without another model call.
+completed native envelope returns its stored result without another model call; a
+failed one does too, unless a resume asks for a retry of a transient failure
+([When a model call fails](#when-a-model-call-fails)).
 
 Resuming without all pending approval verdicts keeps the run suspended. An absent
 verdict is not a denial. Since 2.3 a pending approval's `approvalId` is bound to the
