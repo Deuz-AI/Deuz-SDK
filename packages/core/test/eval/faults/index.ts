@@ -9,6 +9,7 @@ import {
   mcpRefreshRecordFailure,
   mcpRefreshRecordFailureAccepted,
 } from './mcp-boundaries';
+import { fallbackBudgetSettlement, providerFallback } from './fallback-boundaries';
 import { memoryScopeSharedContext, memoryScopeWidened } from './memory-boundaries';
 import {
   childInitialization,
@@ -63,4 +64,6 @@ export const faultScenarios: readonly EvalTaskManifest[] = [
   maxTokensMidToolCall,
   memoryScopeWidened,
   memoryScopeSharedContext,
+  providerFallback,
+  fallbackBudgetSettlement,
 ];

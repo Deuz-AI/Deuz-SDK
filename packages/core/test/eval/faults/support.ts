@@ -10,7 +10,12 @@
  * The recovery label a scenario returns is derived from what it observed, never
  * hard-coded, so the harness's comparison with `fault.recovery` means something.
  */
-import { createMockModel, type EvalAcceptance, type MockResponse } from '../../../src/testing';
+import {
+  createMockModel,
+  sseResponse,
+  type EvalAcceptance,
+  type MockResponse,
+} from '../../../src/testing';
 import { attachConfig, readConfig } from '../../../src/internal/config-symbol';
 import { createAnthropic } from '../../../src/anthropic';
 import { createOpenAI } from '../../../src/openai';
@@ -120,6 +125,25 @@ export function claudeOn(modelId: string, script: ScriptStep[]) {
 export function openaiOn(modelId: string, script: ScriptStep[]) {
   const wire = scriptedFetch(script);
   return { model: createOpenAI({ apiKey: 'offline', fetch: wire.fetch })(modelId), wire };
+}
+
+/**
+ * An OpenAI-compatible model that answers each request from its body, as a
+ * model answers from the history it is sent: a step replayed after a crash
+ * gets the same answer again.
+ */
+export function openaiAnswering(modelId: string, answer: (body: string) => string) {
+  const bodies: string[] = [];
+  const fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const body = String(init?.body ?? '');
+    bodies.push(body);
+    return sseResponse([answer(body)]);
+  }) as typeof globalThis.fetch;
+  return {
+    model: createOpenAI({ apiKey: 'offline', fetch })(modelId),
+    calls: () => bodies.length,
+    bodies: () => [...bodies],
+  };
 }
 
 /** A Chat Completions turn that bills what a mock turn bills: 10 input + 5 output tokens. */
