@@ -12,7 +12,7 @@
  * exactly as the streamed reply would; `test/batch-parse.test.ts` pins it.
  */
 import { mapAnthropicUsage, type AnthropicUsage } from '../adapters/anthropic';
-import { mapGeminiUsage } from '../adapters/google-native';
+import { mapGeminiFinishReason, mapGeminiUsage } from '../adapters/google-native';
 import { mapOpenAIUsage } from '../adapters/openai-compatible';
 import { mapResponsesUsage, type ResponsesUsage } from '../adapters/openai-responses';
 import type { StopDetails } from '../types/methods';
@@ -246,14 +246,6 @@ function parseCompletion(body: Json): ParsedReply {
 
 // --- Gemini generateContent ---
 
-const GEMINI_FILTERED = new Set([
-  'SAFETY',
-  'RECITATION',
-  'BLOCKLIST',
-  'PROHIBITED_CONTENT',
-  'IMAGE_SAFETY',
-]);
-
 function parseGenerateContent(body: Json): ParsedReply {
   const candidate = list(body.candidates).find(isObject);
   const content = candidate && isObject(candidate.content) ? candidate.content : {};
@@ -270,16 +262,12 @@ function parseGenerateContent(body: Json): ParsedReply {
   const blocked =
     isObject(body.promptFeedback) && typeof body.promptFeedback.blockReason === 'string';
   const reason = candidate?.finishReason;
-  // The streaming adapter's STOP-bug guard: a function call finishes as 'STOP'.
-  const finishReason: FinishReason = blocked
-    ? 'content_filter'
-    : toolCalls.length > 0
-      ? 'tool_calls'
-      : reason === 'MAX_TOKENS'
-        ? 'length'
-        : typeof reason === 'string' && GEMINI_FILTERED.has(reason)
-          ? 'content_filter'
-          : 'stop';
+  // The streaming adapter's own mapping, its STOP-bug guard included.
+  const finishReason = mapGeminiFinishReason(
+    typeof reason === 'string' ? reason : undefined,
+    toolCalls.length > 0,
+    blocked,
+  );
   const usage = isObject(body.usageMetadata) ? body.usageMetadata : undefined;
   return {
     text: out,

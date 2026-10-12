@@ -8,6 +8,7 @@ import { parseReply } from '../src/batch/parse';
 import type { ModelCapabilities } from '../src/core/registry';
 import type { StreamPart } from '../src/types/stream';
 import { sseEvents } from './fixtures/sse';
+import { GEMINI_CALL, GEMINI_FINISH_REASONS } from './fixtures/provider-finish';
 
 // BA2: batch results arrive as FINAL (non-streaming) JSON bodies. The batch
 // parsers normalize them to the same contract the streaming adapters produce —
@@ -412,6 +413,24 @@ describe('parseReply: Gemini generateContent', () => {
       ).finishReason,
     ).toBe('length');
   });
+
+  // 2.3 (K4): every value of @google/genai 2.28's FinishReason, the same as on the stream.
+  it.each(GEMINI_FINISH_REASONS)('maps finish reason %s to %s', (finishReason, expected) => {
+    const candidates = [{ content: { parts: [{ text: 'x' }] }, finishReason }];
+    expect(parseReply('native', response([], { candidates })).finishReason).toBe(expected);
+  });
+
+  it.each([...GEMINI_FINISH_REASONS.map(([wire]) => wire), 'A_LATER_REASON'])(
+    'maps %s exactly as the streaming adapter does, with or without a call',
+    async (finishReason) => {
+      for (const parts of [[{ text: 'x' }], [GEMINI_CALL]]) {
+        const candidates = [{ content: { role: 'model', parts }, finishReason }];
+        const stream = await streamFinish(googleNativeAdapter, [{ data: { candidates } }]);
+        const reply = parseReply('native', response(parts, { candidates }));
+        expect(reply.finishReason, JSON.stringify(parts)).toBe(stream.finishReason);
+      }
+    },
+  );
 
   it('bills usage exactly as the streaming adapter does', async () => {
     const usageMetadata = {
