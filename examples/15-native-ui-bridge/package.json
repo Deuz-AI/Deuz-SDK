@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/15-native-ui-bridge",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A native run on the Deuz UI wire: an approval as a pending action, a one-request resume and the typed output, read back in the same process.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
