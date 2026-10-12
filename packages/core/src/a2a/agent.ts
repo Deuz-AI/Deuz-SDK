@@ -130,6 +130,15 @@ export interface A2AAgentExecutorOptions<T = string> {
   /** The output artifact's `name` (default `'output'`) and `description`. */
   artifact?: { name?: string; description?: string };
   /**
+   * Stream the text of a string output to the task's streams as unstored
+   * drafts of the output artifact, while the model writes it. A draft is the
+   * model's text before `guardrails.onOutput` rewrites or blocks it, so by
+   * default a leg whose run has `guardrails.onOutput` sends none, and any
+   * other leg does. `true` sends them anyway, `false` never. A typed output
+   * is never drafted.
+   */
+  drafts?: boolean;
+  /**
    * The text of a failed task's status message, and of a refused resume,
    * from the run's whole error. Default: a fixed text that names the error
    * by its `code`, or its `name`; the error's message, which can name a
@@ -590,7 +599,9 @@ function outputPart(output: unknown, typed: boolean): A2APart {
  * - A new message starts a run on it (`streamAgent`); a message to a task
  *   whose run waits resumes it (`resumeStreamAgent`). The task goes
  *   `WORKING` once the run's leg runs, and the text of a string output
- *   streams as unstored `draft` updates of the output artifact.
+ *   streams as unstored `draft` updates of the output artifact: the model's
+ *   text before `guardrails.onOutput`, so a run with output guardrails
+ *   drafts nothing unless `drafts` asks.
  * - `completed`: the output artifact (`'output'`), the run's validated
  *   output only, as a text part (a string output) or a data part (a typed
  *   one); then `COMPLETED`.
@@ -648,6 +659,9 @@ export function createA2AAgentExecutor<T = string>(
     throw new InvalidRequestError({
       message: 'createA2AAgentExecutor: lease needs lease.provider, a LeaseProvider.',
     });
+  }
+  if (options.drafts !== undefined && typeof options.drafts !== 'boolean') {
+    throw new InvalidRequestError({ message: 'createA2AAgentExecutor: drafts is a boolean.' });
   }
   const scopeOf = options.scope ?? defaultScope;
   const name = options.artifact?.name ?? 'output';
@@ -784,6 +798,11 @@ export function createA2AAgentExecutor<T = string>(
     if (ctx.signal.aborted) stop();
     else ctx.signal.addEventListener('abort', stop, { once: true });
     const typed = leg.output !== undefined;
+    // Only a string output streams, as drafts of the output artifact: a typed
+    // one is shown once validated, never in part. A draft is the model's text
+    // before an output guardrail rewrites or blocks it: sent only when asked.
+    const drafting =
+      !typed && (options.drafts ?? [leg.guardrails?.onOutput ?? []].flat().length === 0);
     const stream = open(controller.signal);
     let changed = false;
     try {
@@ -801,9 +820,7 @@ export function createA2AAgentExecutor<T = string>(
           }
           continue;
         }
-        // Only a string output streams, as drafts of the output artifact: a
-        // typed one is shown once validated, never in part.
-        if (event.type !== 'part' || !changed || typed) continue;
+        if (event.type !== 'part' || !changed || !drafting) continue;
         if (event.part.type === 'step-start') fresh = true;
         else if (event.part.type === 'text-delta' && event.part.text !== '') {
           await ctx.draft(

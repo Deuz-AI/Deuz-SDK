@@ -129,7 +129,7 @@ const handler = createA2AHandler({
 | `reply(message)` | Answer with a single message and **no task** — a new interaction only, before any update. |
 | `working(message?)` | `TASK_STATE_WORKING`, with an optional progress message. |
 | `artifact(artifact, { append?, lastChunk? })` | Add an artifact, or extend one with `append`; resolves with the artifact's id. |
-| `draft(artifact, { append? })` | Stream an artifact update to the clients following the turn **without storing it**: a preview, such as text while a model writes it. `GetTask`, a blocking `SendMessage` and a later subscription never see it. Store the finished content with `artifact` under the same `artifactId`; it replaces the preview. |
+| `draft(artifact, { append? })` | Stream an artifact update to the clients following the turn **without storing it**: a preview, such as text while a model writes it. `GetTask`, a blocking `SendMessage` and a later subscription never see it. Store the finished content with `artifact` under the same `artifactId`; it replaces the preview. Nothing checks a draft before it goes out: preview only what the client may read. |
 | `requireInput(message?)` | `TASK_STATE_INPUT_REQUIRED`: ask the client. Its next message starts the next turn. |
 | `requireAuth(message?)` | `TASK_STATE_AUTH_REQUIRED`. The turn stays open, so the executor may carry on once authorized. |
 | `complete`, `fail`, `reject` (`message?`) | The terminal states `COMPLETED`, `FAILED`, `REJECTED`. |
@@ -414,7 +414,7 @@ How a run maps onto its task:
 | The run | The task |
 | --- | --- |
 | A new message | Starts the run with the message as its one user message: text parts as text, data parts as JSON text, `raw` or `url` parts with an `image/*` media type as images. Any other file is refused with `CONTENT_TYPE_NOT_SUPPORTED`, and a message without parts with `INVALID_PARAMS`, before a task exists. A `run` that gives `prompt` or `messages` itself builds the input from the turn's message instead. |
-| Its leg runs | `WORKING`. The text of a string output streams as unstored [`draft`](#the-executor) updates of the output artifact. |
+| Its leg runs | `WORKING`. The text of a string output streams as unstored [`draft`](#the-executor) updates of the output artifact, unless the run has `guardrails.onOutput` (see [streaming and cancellation](#streaming-and-cancellation)). |
 | `completed` | The output artifact (`artifactId: 'output'`) with the run's validated output only: a text part for a string output, a data part (`application/json`) for a typed one. Then `COMPLETED`. |
 | `suspended` | `INPUT_REQUIRED`. The status message has a text part and a data part `{ type: 'pending-actions', actions }`. |
 | `stopped` | `INPUT_REQUIRED`, with a data part `{ type: 'stopped', reason, stopDetails?, unknownEffects? }`. A drained run goes on at the next message; at any other stop a person must look at the run (see [stopped and failed runs](#stopped-and-failed-runs)). A stop a cancellation caused (`'aborted'`, `'cancelled'`) cancels the task instead. |
@@ -464,6 +464,7 @@ What the client reads never carries an error's message, which can name a provide
 | `lease` | Claim every run through a `LeaseProvider` (`{ provider, owner?, ttlMs? }`), as `runAgent`'s `lease` does. |
 | `scope` | The run's scope from the task's `{ tenant, owner }`. Default: the JSON of `['a2a', tenant, owner]`. |
 | `artifact` | The output artifact's `name` (default `'output'`) and `description`. |
+| `drafts` | Stream the text of a string output as unstored drafts of the output artifact. Default: yes, unless the run has `guardrails.onOutput`. `true` sends them anyway, `false` never. |
 | `failureMessage` | What a client reads of a failed run or a refused resume, from the run's whole error (`{ name, message, code? }`). Default: a text that names the error by its code, or its name. |
 
 ### Identity and several instances
@@ -474,7 +475,11 @@ To serve tasks from several instances, share a durable task store and a durable 
 
 ### Streaming and cancellation
 
-`SendStreamingMessage` and `SubscribeToTask` carry the run as it goes: the `task` snapshot, `WORKING` once the leg runs, the text of a string output as drafts of the output artifact, each model step afresh, then the stored artifact and the final status. A typed output is never sent in part. A draft is a preview: only a completed run's artifact is stored, and a run that stops, fails or suspends leaves no artifact, whatever it previewed. With `configuration.returnImmediately`, a follow-up is answered once its leg runs (at `WORKING`), or with the refusal of answers that do not fit.
+`SendStreamingMessage` and `SubscribeToTask` carry the run as it goes: the `task` snapshot, `WORKING` once the leg runs, the text of a string output as drafts of the output artifact, each model step afresh, then the stored artifact and the final status. A typed output is never sent in part. A draft is a preview: only a completed run's artifact is stored, and a run that stops, fails or suspends leaves no artifact, whatever it previewed.
+
+A draft is also the model's text before `guardrails.onOutput` rewrites or blocks it, as on every native stream, and a client that read it keeps it. So a run with output guardrails sends no drafts: its client reads only what the guardrails let through. Pass `drafts: true` to send them anyway (your guardrail then only guards what is stored), or `drafts: false` to send none for any run. A card without `capabilities.streaming` serves no stream, so it sends no drafts either.
+
+With `configuration.returnImmediately`, a follow-up is answered once its leg runs (at `WORKING`), or with the refusal of answers that do not fit.
 
 `CancelTask` aborts a run whose turn runs on this instance; the run stops with reason `'aborted'`. With `lease`, canceling a task whose turn runs on another instance signals the run's lease, which stops the run there with reason `'cancelled'`, and a [lease cancel](/docs/modules/operations#cancelling-a-native-run-from-another-process) from outside A2A (`leases.signal(agentRunLeaseKey({ scope, runId }), 'cancel')`, with `agentRunLeaseKey` from `@deuz-sdk/core/ops`) cancels the task. A task waiting for input has no running turn: canceling it leaves its run in the store as it is, suspended or drained, and no message resumes it. A drained run has not ended, so [`findStaleAgentRuns`](/docs/modules/operations#finding-runs-that-lost-their-executor) lists it like a run whose executor died: a sweeper that resumes stale runs must skip the runs of canceled tasks.
 

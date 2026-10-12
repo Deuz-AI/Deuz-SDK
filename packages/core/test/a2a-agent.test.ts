@@ -39,6 +39,7 @@ import { createApprovalSigner } from '../src/durable';
 import { createOpenAI } from '../src/openai';
 import { agentRunLeaseKey, createInMemoryLeaseProvider, type LeaseProvider } from '../src/ops';
 import { createMockModel, type MockResponse } from '../src/testing';
+import type { OutputGuardrail } from '../src/types/guardrails';
 
 const RPC_URL = 'https://agent.test/a2a/jsonrpc';
 const REST_URL = 'https://agent.test/a2a/rest';
@@ -374,6 +375,9 @@ describe('createA2AAgentExecutor — a new task', () => {
     expect(() =>
       createA2AAgentExecutor({ agent: engine, store, run, lease: { provider: {} as never } }),
     ).toThrow(/lease\.provider/);
+    expect(() =>
+      createA2AAgentExecutor({ agent: engine, store, run, drafts: 'no' as never }),
+    ).toThrow(/drafts is a boolean/);
   });
 });
 
@@ -1519,6 +1523,79 @@ describe('createA2AAgentExecutor — drafts of the output', () => {
     const task = await client.getTask(events[0]?.task?.id as string);
     expect(task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
     expect(task.artifacts ?? []).toEqual([]);
+  });
+
+  describe('of a run with guardrails.onOutput', () => {
+    const SSN = '123-45-6789';
+    const redact: OutputGuardrail = ({ text }) => ({
+      action: 'rewrite',
+      text: text.replaceAll(SSN, '[redacted]'),
+    });
+    const refuse: OutputGuardrail = () => ({
+      action: 'block',
+      reason: 'PII',
+      replacement: 'I cannot share that.',
+    });
+    const answering = (onOutput: OutputGuardrail | OutputGuardrail[]) => ({
+      model: createMockModel({ responses: [{ text: `The customer SSN is ${SSN}.` }] }),
+      guardrails: { onOutput },
+    });
+    /** The text the drafts of a stream previewed. */
+    const drafted = (events: A2AStreamResponse[]) =>
+      events
+        .filter((event) => event.artifactUpdate !== undefined && !event.artifactUpdate.lastChunk)
+        .map((event) => a2aText(event.artifactUpdate?.artifact))
+        .join('');
+
+    it('sends none: a draft is the text before the guardrail rewrites it', async () => {
+      const { client } = serve(answering(redact));
+      const events = await collect(client.sendStreamingMessage('Who is the customer?'));
+      expect(drafted(events)).toBe('');
+      expect(JSON.stringify(events)).not.toContain(SSN);
+      expect(a2aText(events.at(-2)?.artifactUpdate?.artifact)).toBe(
+        'The customer SSN is [redacted].',
+      );
+      expect(events.at(-1)?.statusUpdate?.status.state).toBe('TASK_STATE_COMPLETED');
+    });
+
+    it('sends none of an answer the guardrail blocks', async () => {
+      const { client } = serve(answering([refuse]));
+      const events = await collect(client.sendStreamingMessage('Who is the customer?'));
+      expect(JSON.stringify(events)).not.toContain(SSN);
+      expect(events.at(-1)?.statusUpdate?.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    });
+
+    it('sends them with drafts: true; an empty list guards nothing', async () => {
+      const opted = serve(answering(redact), { drafts: true });
+      const events = await collect(opted.client.sendStreamingMessage('Who is the customer?'));
+      expect(drafted(events)).toBe(`The customer SSN is ${SSN}.`);
+      // Only the stored artifact is the guarded text.
+      expect(a2aText(events.at(-2)?.artifactUpdate?.artifact)).toBe(
+        'The customer SSN is [redacted].',
+      );
+
+      const unguarded = serve(answering([]));
+      const plain = await collect(unguarded.client.sendStreamingMessage('Who is the customer?'));
+      expect(drafted(plain)).toBe(`The customer SSN is ${SSN}.`);
+    });
+  });
+
+  it('sends no drafts with drafts: false', async () => {
+    const { client } = serve(
+      { model: createMockModel({ responses: [{ text: 'Paris.' }] }) },
+      { drafts: false },
+    );
+    const events = await collect(client.sendStreamingMessage('Capital of France?'));
+    expect(events.map((event) => Object.keys(event)[0])).toEqual([
+      'task',
+      'statusUpdate',
+      'artifactUpdate',
+      'statusUpdate',
+    ]);
+    expect(events[2]?.artifactUpdate).toMatchObject({
+      artifact: { parts: [{ text: 'Paris.' }] },
+      lastChunk: true,
+    });
   });
 });
 
