@@ -9,7 +9,8 @@ import { sseEvents } from './sse';
 
 /**
  * Every value of `@google/genai` 2.28's `FinishReason`, with the finish reason
- * a turn that ends on it gets in Deuz.
+ * a turn that ends on it gets in Deuz. The finish part names the value itself
+ * as `providerMetadata.google.finishReason`.
  */
 export const GEMINI_FINISH_REASONS: readonly (readonly [string, FinishReason])[] = [
   ['FINISH_REASON_UNSPECIFIED', 'stop'],
@@ -24,14 +25,29 @@ export const GEMINI_FINISH_REASONS: readonly (readonly [string, FinishReason])[]
   ['IMAGE_SAFETY', 'content_filter'],
   ['IMAGE_PROHIBITED_CONTENT', 'content_filter'],
   ['IMAGE_RECITATION', 'content_filter'],
-  ['LANGUAGE', 'error'],
-  ['OTHER', 'error'],
-  ['MALFORMED_FUNCTION_CALL', 'error'],
-  ['UNEXPECTED_TOOL_CALL', 'error'],
-  ['TOO_MANY_TOOL_CALLS', 'error'],
-  ['NO_IMAGE', 'error'],
-  ['IMAGE_OTHER', 'error'],
+  ['LANGUAGE', 'stop'],
+  ['OTHER', 'stop'],
+  ['MALFORMED_FUNCTION_CALL', 'stop'],
+  ['UNEXPECTED_TOOL_CALL', 'stop'],
+  ['TOO_MANY_TOOL_CALLS', 'stop'],
+  ['NO_IMAGE', 'stop'],
+  ['IMAGE_OTHER', 'stop'],
 ];
+
+/**
+ * The Gemini stops that leave no usable answer. They end a turn with 'stop',
+ * or 'tool_calls' after a call, as in 2.2 (K4 review V7-2): only the raw value
+ * tells them from `STOP`.
+ */
+export const GEMINI_STOPS_WITHOUT_ANSWER = [
+  'LANGUAGE',
+  'OTHER',
+  'MALFORMED_FUNCTION_CALL',
+  'UNEXPECTED_TOOL_CALL',
+  'TOO_MANY_TOOL_CALLS',
+  'NO_IMAGE',
+  'IMAGE_OTHER',
+] as const;
 
 /** A Gemini part that calls `get_weather`, complete as the Gemini API sends it. */
 export const GEMINI_CALL = { functionCall: { name: 'get_weather', args: { city: 'Rome' } } };

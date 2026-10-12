@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { streamChat, generateText } from '../src/index';
 import { createGoogleNative } from '../src/google';
 import { toGeminiSchema } from '../src/schema/gemini';
@@ -6,8 +6,14 @@ import { runStream } from '../src/core/inference';
 import { getCapabilities } from '../src/core/registry';
 import type { CommonCallOptions } from '../src/types/config';
 import type { CallWarning } from '../src/types/methods';
+import type { FinishStreamPart } from '../src/types/stream';
 import { sseResponse, sseEvents, mockFetch } from './fixtures/sse';
-import { GEMINI_CALL, GEMINI_FINISH_REASONS, geminiTurn } from './fixtures/provider-finish';
+import {
+  GEMINI_CALL,
+  GEMINI_FINISH_REASONS,
+  GEMINI_STOPS_WITHOUT_ANSWER,
+  geminiTurn,
+} from './fixtures/provider-finish';
 
 function consume(chunks: string[]) {
   return mockFetch(() => sseResponse(chunks));
@@ -365,14 +371,20 @@ describe('unknown native model output cap (2.3, F08)', () => {
 // not live-verified.
 // ===================================================================
 
-async function streamedFinish(fixture: string): Promise<string> {
+/** One streamed turn: its finish reason and its `finish` part. */
+async function streamedTurn(fixture: string) {
   const { fetch } = consume([fixture]);
   const result = streamChat({
     model: createGoogleNative({ apiKey: 'AIza-k', fetch })('gemini-2.5-flash'),
     messages: [{ role: 'user', content: 'hi' }],
   });
-  for await (const _ of result.fullStream) void _;
-  return result.finishReason;
+  let finish: FinishStreamPart | undefined;
+  for await (const part of result.fullStream) if (part.type === 'finish') finish = part;
+  return { finishReason: await result.finishReason, finish };
+}
+
+async function streamedFinish(fixture: string): Promise<string> {
+  return (await streamedTurn(fixture)).finishReason;
 }
 
 describe('Gemini finish reasons (2.3, K4)', () => {
@@ -397,4 +409,70 @@ describe('Gemini finish reasons (2.3, K4)', () => {
       expect(await streamedFinish(geminiTurn(wire, [GEMINI_CALL]))).toBe(expected);
     },
   );
+});
+
+// ===================================================================
+// K4 review V7-2 — the stops that leave no usable answer end with 'stop', as
+// in 2.2 (K4 had mapped them to 'error'). The raw value rides the finish part
+// as `providerMetadata.google.finishReason`, so a caller tells `OTHER` from
+// `STOP`. Not live-verified.
+// ===================================================================
+
+describe('the raw Gemini finish reason', () => {
+  it.each(GEMINI_STOPS_WITHOUT_ANSWER)(
+    '%s ends the turn with stop and names itself',
+    async (wire) => {
+      const { finishReason, finish } = await streamedTurn(geminiTurn(wire));
+      expect(finishReason).toBe('stop');
+      expect(finish?.providerMetadata).toEqual({ google: { finishReason: wire } });
+    },
+  );
+
+  it.each([...GEMINI_FINISH_REASONS.map(([wire]) => wire), 'A_LATER_REASON'])(
+    'the finish part carries %s as providerMetadata.google.finishReason, with or without a call',
+    async (wire) => {
+      for (const parts of [[{ text: 'Partial' }], [GEMINI_CALL]]) {
+        const { finish } = await streamedTurn(geminiTurn(wire, parts));
+        expect(finish?.providerMetadata, JSON.stringify(parts)).toEqual({
+          google: { finishReason: wire },
+        });
+      }
+    },
+  );
+
+  it('a stream that reported no finish reason carries none', async () => {
+    const blocked = sseEvents([
+      {
+        data: {
+          promptFeedback: { blockReason: 'SAFETY' },
+          usageMetadata: { promptTokenCount: 5, totalTokenCount: 5 },
+        },
+      },
+    ]);
+    const { finishReason, finish } = await streamedTurn(blocked);
+    expect(finishReason).toBe('content_filter');
+    expect(finish).not.toHaveProperty('providerMetadata');
+  });
+
+  it('a streaming loop step names the stop on step-finish and finish', async () => {
+    const { fetch } = consume([geminiTurn('MALFORMED_FUNCTION_CALL', [])]);
+    const execute = vi.fn(() => ({ temp: 20 }));
+    const parameters = { type: 'object' as const, properties: { city: { type: 'string' } } };
+    const result = streamChat({
+      model: createGoogleNative({ apiKey: 'AIza-k', fetch })('gemini-2.5-flash'),
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: { get_weather: { parameters, execute } },
+    });
+    const ends: unknown[] = [];
+    for await (const part of result.fullStream) {
+      if (part.type === 'step-finish' || part.type === 'finish')
+        ends.push([part.type, part.finishReason, part.providerMetadata]);
+    }
+    const raw = { google: { finishReason: 'MALFORMED_FUNCTION_CALL' } };
+    expect(ends).toEqual([
+      ['step-finish', 'stop', raw],
+      ['finish', 'stop', raw],
+    ]);
+    expect(execute).not.toHaveBeenCalled();
+  });
 });
