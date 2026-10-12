@@ -56,6 +56,12 @@ export function geminiTurn(finishReason: string, parts: unknown[] = [{ text: 'Pa
 export interface ResponsesTurn {
   /** `response.output_text.delta` text. */
   text?: string;
+  /** A refusal content part: its `response.refusal.delta` pieces. */
+  refusal?: string[];
+  /** The text `response.refusal.done` finalizes; absent: the pieces joined. */
+  refusalDone?: string;
+  /** The refusal message item's `phase`. */
+  phase?: string;
   /** A `get_weather` function call and its (possibly cut-off) argument text. */
   call?: { args: string };
   /** `incomplete_details.reason` of a final `response.incomplete`; absent: `response.completed`. */
@@ -72,6 +78,28 @@ export function responsesTurn(turn: ResponsesTurn): string {
   if (turn.text !== undefined) {
     const at = { item_id: 'msg_1', output_index: output++, content_index: 0 };
     push('response.output_text.delta', { ...at, delta: turn.text });
+  }
+  if (turn.refusal) {
+    const message = {
+      type: 'message',
+      id: 'msg_2',
+      role: 'assistant',
+      ...(turn.phase !== undefined ? { phase: turn.phase } : {}),
+    };
+    const at = { item_id: 'msg_2', output_index: output, content_index: 0 };
+    push('response.output_item.added', {
+      output_index: output,
+      item: { ...message, status: 'in_progress', content: [] },
+    });
+    push('response.content_part.added', { ...at, part: { type: 'refusal', refusal: '' } });
+    for (const delta of turn.refusal) push('response.refusal.delta', { ...at, delta });
+    const refusal = turn.refusalDone ?? turn.refusal.join('');
+    push('response.refusal.done', { ...at, refusal });
+    push('response.content_part.done', { ...at, part: { type: 'refusal', refusal } });
+    push('response.output_item.done', {
+      output_index: output++,
+      item: { ...message, status: 'completed', content: [{ type: 'refusal', refusal }] },
+    });
   }
   if (turn.call) {
     const item = { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' };
@@ -100,6 +128,8 @@ export function responsesTurn(turn: ResponsesTurn): string {
 export interface ChatTurn {
   /** `delta.content` text. */
   text?: string;
+  /** `delta.refusal` pieces. */
+  refusal?: string[];
   /** A `get_weather` tool call and its (possibly cut-off) argument text. */
   call?: { args: string };
   /** The last choice's `finish_reason`. */
@@ -119,6 +149,7 @@ export function chatTurn(turn: ChatTurn): string {
     chunk([{ index: 0, delta: value, finish_reason }]);
   const events: { data: unknown }[] = [delta({ role: 'assistant', content: '', refusal: null })];
   if (turn.text !== undefined) events.push(delta({ content: turn.text, refusal: null }));
+  for (const refusal of turn.refusal ?? []) events.push(delta({ refusal }));
   if (turn.call) {
     const fn = { name: 'get_weather', arguments: '' };
     events.push(

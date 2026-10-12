@@ -287,6 +287,9 @@ interface ResponsesEvent {
   type?: string;
   delta?: string;
   item_id?: string;
+  content_index?: number;
+  /** `response.refusal.done`: the refusal text, final. */
+  refusal?: string;
   item?: {
     type?: string;
     id?: string;
@@ -332,16 +335,18 @@ export function mapResponsesUsage(u: ResponsesUsage | undefined): Usage {
  * A Responses turn's finish reason, shared with the batch parser. The final
  * response says why it is incomplete: its output limit, or its content filter
  * (2.3; 'stop', or 'tool_calls' after a call, before), which the finish-reason
- * gate must see to hold back a call the turn streamed. `max_messages` and
- * `steered` (openai 7.32) end it as a complete response would: their meaning
- * is undocumented beyond the name, and steering needs the WebSocket transport.
+ * gate must see to hold back a call the turn streamed. A turn that carried the
+ * model's refusal is refused the same way (2.3). `max_messages` and `steered`
+ * (openai 7.32) end it as a complete response would: their meaning is
+ * undocumented beyond the name, and steering needs the WebSocket transport.
  */
 export function mapResponsesFinishReason(
   incompleteReason: unknown,
   sawFunctionCall: boolean,
+  refused = false,
 ): FinishReason {
   if (incompleteReason === 'max_output_tokens') return 'length';
-  if (incompleteReason === 'content_filter') return 'content_filter';
+  if (incompleteReason === 'content_filter' || refused) return 'content_filter';
   return sawFunctionCall ? 'tool_calls' : 'stop';
 }
 
@@ -354,6 +359,11 @@ async function* parseStream(
   let usage: Usage | undefined;
   let finishReason: FinishReason = 'stop';
   let phase: string | undefined; // last assistant message item's phase — round-trips on replay
+  // The model's refusal (2.3), per content part as the official accumulator
+  // builds it: deltas append, `response.refusal.done` sets the final text.
+  // Kept for the caller, never streamed as answer text.
+  const refusals = new Map<string, string>();
+  const refusalText = (): string => [...refusals.values()].join('');
 
   for await (const ev of parseSSE(body)) {
     let data: ResponsesEvent;
@@ -408,6 +418,14 @@ async function* parseStream(
         yield { type: 'tool-call-delta', id, argsTextDelta: data.delta ?? '' };
         break;
       }
+      case 'response.refusal.delta': {
+        const key = refusalKey(data);
+        refusals.set(key, (refusals.get(key) ?? '') + (data.delta ?? ''));
+        break;
+      }
+      case 'response.refusal.done':
+        if (typeof data.refusal === 'string') refusals.set(refusalKey(data), data.refusal);
+        break;
       case 'response.output_text.annotation.added':
         // Hosted web_search citations arrive as url_citation annotations.
         if (data.annotation?.type === 'url_citation' && data.annotation.url) {
@@ -429,6 +447,7 @@ async function* parseStream(
         finishReason = mapResponsesFinishReason(
           data.response?.incomplete_details?.reason,
           sawFunctionCall,
+          refusalText() !== '',
         );
         break;
       case 'error':
@@ -443,12 +462,20 @@ async function* parseStream(
     }
   }
 
+  // The refusal rides the batch parser's key: `stopDetailsFrom` reads it as the stop's explanation.
+  const refusal = refusalText();
+  const openai = { ...(phase ? { phase } : {}), ...(refusal ? { refusal } : {}) };
   yield {
     type: 'finish',
     usage: usage ?? mapResponsesUsage(undefined),
     finishReason,
-    ...(phase ? { providerMetadata: { openai: { phase } } } : {}),
+    ...(Object.keys(openai).length > 0 ? { providerMetadata: { openai } } : {}),
   };
+}
+
+/** One refusal content part: its message item and its index in that item. */
+function refusalKey(data: ResponsesEvent): string {
+  return `${data.item_id ?? ''}:${data.content_index ?? 0}`;
 }
 
 // Error envelope is identical to Chat Completions — reuse its mapping.

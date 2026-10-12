@@ -6,6 +6,7 @@ import { openaiResponsesAdapter } from '../src/adapters/openai-responses';
 import type { Adapter } from '../src/adapters/types';
 import { parseReply } from '../src/batch/parse';
 import type { ModelCapabilities } from '../src/core/registry';
+import { stopDetailsFrom } from '../src/internal/stop-details';
 import type { StreamPart } from '../src/types/stream';
 import { sseEvents } from './fixtures/sse';
 import { GEMINI_CALL, GEMINI_FINISH_REASONS } from './fixtures/provider-finish';
@@ -274,6 +275,27 @@ describe('parseReply: OpenAI Responses', () => {
     expect(failed.error).toEqual({ code: 'server_error', message: 'Boom.' });
   });
 
+  // 2.3 (K4): a refusal ends the reply as it ends the streamed turn.
+  it.each([undefined, 'max_output_tokens', 'content_filter'])(
+    'maps a refusal with incomplete reason %s exactly as the streaming adapter does',
+    async (reason) => {
+      const status = reason === undefined ? 'completed' : 'incomplete';
+      const incomplete_details = reason === undefined ? null : { reason };
+      const at = { item_id: 'msg_1', output_index: 0, content_index: 0 };
+      const stream = await streamFinish(openaiResponsesAdapter, [
+        { data: { type: 'response.refusal.delta', ...at, delta: 'No.' } },
+        { data: { type: 'response.refusal.done', ...at, refusal: 'No.' } },
+        { data: { type: `response.${status}`, response: { status, incomplete_details } } },
+      ]);
+      const content = [{ type: 'refusal', refusal: 'No.' }];
+      const output = [{ type: 'message', id: 'msg_1', role: 'assistant', content }];
+      const reply = parseReply('responses', response({ status, incomplete_details, output }));
+      expect(reply.finishReason).toBe(stream.finishReason);
+      expect(reply.providerMetadata).toEqual(stream.providerMetadata);
+      expect(reply.stopDetails).toEqual(stopDetailsFrom(stream.providerMetadata));
+    },
+  );
+
   it.each([
     ['plain', { input_tokens: 100, output_tokens: 1000, total_tokens: 1100 }],
     [
@@ -377,6 +399,23 @@ describe('parseReply: Chat Completions', () => {
       const choices = [{ index: 0, message: { role: 'assistant', content: 'x' }, finish_reason }];
       const reply = parseReply('chat_completions', completion({}, { choices }));
       expect(reply.finishReason).toBe(stream.finishReason);
+    },
+  );
+
+  // 2.3 (K4): a refusal ends the reply as it ends the streamed turn.
+  it.each(['stop', 'length', 'tool_calls', 'content_filter'])(
+    'maps a refusal with finish reason %s exactly as the streaming adapter does',
+    async (finish_reason) => {
+      const stream = await streamFinish(openaiCompatibleAdapter, [
+        { data: { choices: [{ index: 0, delta: { refusal: 'No.' }, finish_reason }] } },
+        { data: '[DONE]' },
+      ]);
+      const message = { role: 'assistant', content: null, refusal: 'No.' };
+      const choices = [{ index: 0, message, finish_reason }];
+      const reply = parseReply('chat_completions', completion({}, { choices }));
+      expect(reply.finishReason).toBe(stream.finishReason);
+      expect(reply.providerMetadata).toEqual(stream.providerMetadata);
+      expect(reply.stopDetails).toEqual(stopDetailsFrom(stream.providerMetadata));
     },
   );
 
