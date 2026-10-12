@@ -54,14 +54,14 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/providers':
     'Every provider factory re-exported, plus the OpenAI-compatible host presets and the registry.',
   '@deuz-sdk/core/testing':
-    'Deterministic mock models, SSE fixtures, fetch mocks, and eval runners for YOUR tests.',
+    'Deterministic mock models, SSE fixtures, fetch mocks, eval runners and versioned eval suites for YOUR tests.',
   '@deuz-sdk/core/workspace':
     'A file-tree seam agents use as externalized memory, plus the tools that drive it.',
   '@deuz-sdk/core/workspace/node': 'Real-filesystem workspace (Node only).',
   '@deuz-sdk/core/compute': 'CodeAct: let the model act by writing code; sandbox seam and shell tool.',
   '@deuz-sdk/core/compute/node': 'Node child-process sandbox for the compute tools.',
   '@deuz-sdk/core/agent':
-    'Native run/stream/resume, validated outputs, execution policies, shared and persistent budgets; also createAgent templates and handoff.',
+    'Native run/stream/resume/reconcile, validated outputs, execution policies, shared and persistent budgets; also createAgent templates and handoff.',
   '@deuz-sdk/core/swarm':
     'Bounded agent/reducer DAGs, runtime spawning, blackboards, rounds, leases, drain and recovery, atomic snapshots and cursor events.',
   '@deuz-sdk/core/swarm/sqlite':
@@ -71,11 +71,11 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/swarm/redis':
     'Node-only Redis swarm store: revision-gated commits as Lua scripts (Redis 7+).',
   '@deuz-sdk/core/ops':
-    'Leases for cross-process runs: the LeaseProvider contract and an in-memory provider.',
+    'Leases for cross-process runs: the LeaseProvider contract, an in-memory provider, native run lease keys and stale-run discovery.',
   '@deuz-sdk/core/ops/sqlite':
-    'Node-only SQLite leases, native agent run store and persistent budget store.',
+    'Node-only SQLite leases, native agent run store, schedule claims and persistent budget store.',
   '@deuz-sdk/core/ops/postgres':
-    'Node-only Postgres leases, native agent run store and persistent budget store.',
+    'Node-only Postgres leases, native agent run store, schedule claims and persistent budget store.',
   '@deuz-sdk/core/ops/redis':
     'Node-only Redis leases, native agent run store, schedule claims and persistent budget store.',
   '@deuz-sdk/core/evolve':
@@ -93,7 +93,7 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/browser': 'Browser-control tools over a pluggable controller seam.',
   '@deuz-sdk/core/browser/node': 'Playwright-backed browser controller (Node only).',
   '@deuz-sdk/core/pricing':
-    'USD cost accounting: bundled price table, price provider, cache savings.',
+    'USD cost accounting: bundled price table and aliases, price provider, batch tier, cache savings.',
   '@deuz-sdk/core/middleware':
     'Removable model layers: logging, caching, PII redaction, fallback, injection guard.',
   '@deuz-sdk/core/guardrails': 'Built-in input/tool-call/tool-result/output guardrails.',
@@ -107,7 +107,7 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/a2a':
     'Agent2Agent v1.0.0: call remote agents and serve your own over JSON-RPC or HTTP+JSON.',
   '@deuz-sdk/core/headless':
-    'Headless preview: run, resume, inspect and check native agent runs from a script (Node only).',
+    'Headless preview (Node only): run, resume and inspect native agent runs from a script, and check a model and its configuration first.',
   '@deuz-sdk/core/video': 'Video generation: submit, poll, download.',
   '@deuz-sdk/core/midjourney': 'Midjourney submit/poll/action flow.',
   '@deuz-sdk/core/yunwu':
@@ -126,7 +126,7 @@ export const SUBPATH_DESCRIPTIONS = {
     'Claude and Gemini through Vertex AI; edge-safe service-account JWT signing.',
   '@deuz-sdk/core/vertex/node': 'Vertex Application Default Credentials (Node only).',
   '@deuz-sdk/core/mcp':
-    'MCP client over HTTP/SSE, connection pool, OAuth provider, tool conversion.',
+    'MCP client over HTTP/SSE on either SDK line (2026-07-28 with the v2 SDK), connection pool, OAuth provider, tool conversion.',
   '@deuz-sdk/core/mcp/stdio': 'MCP over stdio — spawn a local server process (Node only).',
   '@deuz-sdk/core/mcp/node': 'Node OAuth helpers for MCP: file token store, loopback redirect.',
   '@deuz-sdk/core/mcp/server':
@@ -134,7 +134,8 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/mcp/server/stdio': 'The same MCP server over stdio (Node only).',
   '@deuz-sdk/core/stores/sqlite':
     'One factory for memory + chat + session + run stores on node:sqlite.',
-  '@deuz-sdk/core/stores/redis': 'The same four store seams on Redis.',
+  '@deuz-sdk/core/stores/redis':
+    'The same four store seams on Redis (runs since 2.3), over node-redis or a wrapped ioredis client.',
   '@deuz-sdk/core/stores/postgres':
     'The same four store seams on Postgres (pgvector when available).',
   '@deuz-sdk/core/durable': 'Checkpoints, resume-after-crash, and HMAC-signed tool approvals.',
@@ -144,8 +145,9 @@ export const SUBPATH_DESCRIPTIONS = {
   '@deuz-sdk/core/observe/node': 'JSONL persistence for observation events (Node only).',
   '@deuz-sdk/core/edge': 'A curated re-export subset guaranteed to contain nothing Node-only.',
   '@deuz-sdk/core/ui':
-    'The Deuz UI wire: SSE responses, resumable streams, and the client-side reader.',
-  '@deuz-sdk/core/react': 'Legacy in-core React hooks — prefer the @deuz-sdk/react package.',
+    'The Deuz UI wire: SSE responses (native agent runs included), resumable streams, and the client-side reader.',
+  '@deuz-sdk/core/react':
+    'Legacy in-core React hooks, frozen at 2.2: no 2.3 verdict matching or resumed-turn settlement, drops approval tokens, and drops client calls without onToolCall. Prefer the @deuz-sdk/react package.',
   '@deuz-sdk/core/chat':
     'The pure chat state engine plus validateChatRequest — the gate in front of client history.',
   '@deuz-sdk/core/chat/node': 'File-backed chat store (Node only).',
