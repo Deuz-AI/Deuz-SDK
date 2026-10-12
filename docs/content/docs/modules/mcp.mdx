@@ -747,7 +747,7 @@ const mcp = await createMcpClient({
 
 Return `{ action: 'accept', content? }`, `{ action: 'decline' }`, or `{ action: 'cancel' }`. Form-mode `content` must match `requestedSchema`. URL mode exists for sensitive flows (OAuth, payment, API keys) that must not pass through the client — treat the URL as untrusted, display the full host, and let the user decide.
 
-Requests without a `mode` are form mode (spec back-compat). On an MCP 2026-07-28 connection the same handler answers the server's `input_required` elicitations, and a URL-mode request carries no `elicitationId` (it is `''`). The lower-level `registerElicitation(client, handler)` is exported for attaching a handler to an already-connected raw v1 MCP client; it throws on a peer older than `^1.29.0`.
+Requests without a `mode` are form mode (spec back-compat). On an MCP 2026-07-28 connection the same handler answers the server's `input_required` elicitations, and a URL-mode request carries no `elicitationId` (it is `''`). The lower-level `registerElicitation(client, handler)` is exported for a raw v1 MCP `Client` you build yourself. It must run **before** `connect()`, on a client whose constructor declares the capability (`capabilities: { elicitation: { form: {}, url: {} } }`), as `createMcpClient` does for every connection and reconnect; it cannot add elicitation to a client that is already connected. It throws on a peer older than `^1.29.0`.
 
 ---
 
