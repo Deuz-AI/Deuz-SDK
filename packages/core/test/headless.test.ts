@@ -552,6 +552,66 @@ describe('resumeHeadless with the 2.3 durability options (headless preview)', ()
     expect((await inspectRun(store, 'bound')).retry).toEqual(first.retry);
   });
 
+  it('returns the stored result of a run that ended, ignoring the answers; a changed binding still fails', async () => {
+    const store = createInMemoryAgentRunStore();
+    const tools: AgentToolSet = {
+      lookup: {
+        description: 'Look something up.',
+        parameters: { type: 'object', properties: {} },
+        execute: () => ({ found: true }),
+      },
+    };
+    const model = createMockModel({ responses: [{ text: 'Done.' }] });
+    expect(
+      (await runHeadless({ model, prompt: 'Go.', tools, store, runId: 'ended' })).outcome,
+    ).toBe('completed');
+    const before = await store.load('ended');
+    const stray = [{ toolCallId: 'call_9', output: 'x' }];
+    const answers: [string, Partial<HeadlessResumeOptions>][] = [
+      ['a verdict', { approvalResponses: [{ approvalId: 'call_9', approved: true }] }],
+      ['a client result', { clientToolResults: stray }],
+      ['a recorded result', { reconciledToolResults: stray }],
+      [
+        'a call both run again and recorded',
+        { retryToolCallIds: ['call_9'], reconciledToolResults: stray },
+      ],
+      ['retryFailed on a run that did not fail', { retryFailed: true }],
+    ];
+    for (const [label, answer] of answers) {
+      const leg = await resumeHeadless({ model, tools, store, runId: 'ended', ...answer });
+      expect(leg, label).toMatchObject({
+        status: 'completed',
+        outcome: 'completed',
+        output: 'Done.',
+      });
+      expect(leg.error, label).toBeUndefined();
+      expect(exitCodeFor(leg), label).toBe(0);
+    }
+    const changed = await resumeHeadless({ model, store, runId: 'ended' });
+    expect(changed).toMatchObject({ outcome: 'failed', error: { name: 'TypeError' } });
+    expect(await store.load('ended')).toEqual(before);
+
+    // A failed run, not retried: its stored failure comes back, still retryable.
+    const failed = await runHeadless({
+      model,
+      prompt: 'Go.',
+      tools,
+      store,
+      runId: 'down',
+      deps: { breakerStore: outage },
+    });
+    const stuck = await store.load('down');
+    const again = await resumeHeadless({
+      model,
+      tools,
+      store,
+      runId: 'down',
+      clientToolResults: stray,
+    });
+    expect(again).toMatchObject({ outcome: 'failed', error: failed.error, retry: failed.retry });
+    expect(await store.load('down')).toEqual(stuck);
+  });
+
   it('asks for retryFailed with the answers when a retried run stops before its first write', async () => {
     // A fatal budget-store conflict raised inside the tool call, after its
     // effect: the receipt stays 'executing' and the run fails in transit.

@@ -168,14 +168,18 @@ console.log(done.outcome, done.output, exitCodeFor(done)); // completed Deployed
 
 Resume with the same model, tools, skills and output as the first leg: the
 run's binding rejects a change, and that resume fails (exit 1) without
-touching the stored run. So does an answer the resume cannot take: a client
-result or a recorded result (`reconciledToolResults`) for a call the run does
-not wait on, a call listed in both `retryToolCallIds` and
-`reconciledToolResults`, or `retryFailed` for a failure that was not
-transient. The leg fails with a `TypeError` before anything is written. A
-verdict or a `retryToolCallIds` entry that matches no pending call is
-ignored; a resume that answers nothing else leaves the run waiting (exit 3)
-and writes nothing.
+touching the stored run. So does `retryFailed` for a failure that was not
+transient, and, on a run that has not ended, an answer the resume cannot
+take: a client result or a recorded result (`reconciledToolResults`) for a
+call the run does not wait on, or a call listed in both `retryToolCallIds`
+and `reconciledToolResults`. The leg fails with a `TypeError` before anything
+is written. A verdict or a `retryToolCallIds` entry that matches no pending
+call is ignored; a resume that answers nothing else leaves the run waiting
+(exit 3) and writes nothing. A resume of a run that ended (completed, stopped,
+or failed and not retried) returns its stored result and ignores client
+results, recorded results and retry IDs, and `retryFailed` on a run that did
+not fail; a changed binding, and `retryFailed` for a failure that was not
+transient, still fail it.
 
 `inspectRun` reads a run without a model call. A run with no result yet
 reports `status: 'in-progress'` and a pending `resume`, plus each call that
