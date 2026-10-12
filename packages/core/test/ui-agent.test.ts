@@ -273,7 +273,7 @@ describe('toDeuzAgentStreamResponse', () => {
     expect(parts.some((p) => p.type === 'error')).toBe(false);
   });
 
-  it('reports a failure as a failed frame and one redacted error part', async () => {
+  it('reports a failure as a failed frame and one error part', async () => {
     const parts = await collect(
       toDeuzAgentStreamResponse(
         streamAgent({
@@ -290,6 +290,37 @@ describe('toDeuzAgentStreamResponse', () => {
     expect(parts.filter((p) => p.type === 'error')).toEqual([
       { type: 'error', message: 'maxSteps must be a positive integer.' },
     ]);
+  });
+
+  it('redacts a credential in the failed frame and in the error part', async () => {
+    const secret = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789';
+    const { fetch } = mockFetch(
+      () =>
+        new Response(
+          JSON.stringify({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: `invalid x-api-key ${secret}` },
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        ),
+    );
+    const parts = await collect(
+      toDeuzAgentStreamResponse(
+        streamAgent({
+          model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-5-5'),
+          prompt: 'x',
+        }),
+      ),
+    );
+    const state = agentStateFromParts(parts);
+    if (state.status !== 'failed') throw new Error(`expected a failed run, got ${state.status}`);
+    // Masked, not dropped: the message still says what failed.
+    expect(state.error.message).toContain('invalid x-api-key');
+    expect(state.error.message).not.toContain(secret);
+    const errors = parts.filter((p) => p.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(JSON.stringify(errors)).toContain('invalid x-api-key');
+    expect(JSON.stringify(parts)).not.toContain(secret);
   });
 
   it('shows a refusal with its stop details', async () => {
