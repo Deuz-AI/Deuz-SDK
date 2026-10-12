@@ -524,6 +524,92 @@ describe('createA2AAgentExecutor — a suspended run', () => {
     expect(published).toEqual([{}]);
   });
 
+  describe('signed approvals (approvalSigner)', () => {
+    /** A task waiting for two signed approvals, and verdicts on both with the given tokens. */
+    async function twoSigned() {
+      const published: unknown[] = [];
+      const served = serve({
+        ...publisher(
+          [
+            {
+              toolCalls: [
+                { toolName: 'publish', args: { text: 'one' } },
+                { toolName: 'publish', args: { text: 'two' } },
+              ],
+            },
+            { text: 'Done.' },
+          ],
+          published,
+        ),
+        approvalSigner: createApprovalSigner({ secret: 'a2a-test-secret' }),
+      });
+      const asked = (await served.client.sendMessage('Publish two posts.')).task as A2ATask;
+      const actions = actionsOf(asked) as Extract<A2AAgentAction, { kind: 'approval' }>[];
+      const verdicts = (tokens: (string | undefined)[], approved = true): A2APart[] => [
+        {
+          data: {
+            approvalResponses: actions.map((action, index) => ({
+              approvalId: action.approvalId,
+              approved,
+              ...(tokens[index] !== undefined ? { token: tokens[index] } : {}),
+            })),
+          },
+        },
+      ];
+      return {
+        ...served,
+        asked,
+        published,
+        tokens: actions.map((action) => action.token),
+        verdicts,
+      };
+    }
+
+    it('refuses an approval without its own token, before anything is written', async () => {
+      const { client, store, asked, published, tokens, verdicts } = await twoSigned();
+      const [first, second] = tokens;
+      expect(first).toMatch(/^v1\./);
+      expect(second).toMatch(/^v1\./);
+      const before = await client.getTask(asked.id);
+      const run = await store.load(asked.id);
+
+      const refusals: [string, A2APart[]][] = [
+        ['no tokens', verdicts([undefined, undefined])],
+        ['one token left out', verdicts([first, undefined])],
+        ['swapped tokens', verdicts([second, first])],
+      ];
+      for (const [label, parts] of refusals) {
+        const message = await client.sendMessage(parts, { taskId: asked.id }).then(
+          () => 'taken',
+          (error: A2AError) => `${error.reason}: ${error.message}`,
+        );
+        expect(message, label).toMatch(
+          /^INVALID_PARAMS: The approval of publish \(call_\d\) must echo its action's token\.$/,
+        );
+      }
+      expect(await client.getTask(asked.id)).toEqual(before);
+      expect(await store.load(asked.id)).toEqual(run);
+      expect(published).toEqual([]);
+
+      // The same approvals with their own tokens go through.
+      const done = (await client.sendMessage(verdicts(tokens), { taskId: asked.id }))
+        .task as A2ATask;
+      expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+      expect(published).toEqual([{ text: 'one' }, { text: 'two' }]);
+    });
+
+    it('takes a denial without a token', async () => {
+      const { client, asked, published, verdicts } = await twoSigned();
+      const done = (
+        await client.sendMessage(verdicts([undefined, undefined], false), {
+          taskId: asked.id,
+        })
+      ).task as A2ATask;
+      expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+      expect(published).toEqual([]);
+    });
+  });
+
   it('refuses answers that do not fit, leaving the task and the run as they were', async () => {
     const { client, store } = serve(publisher([BOTH_CALLS, { text: 'Done.' }]));
     const asked = (await client.sendMessage('Publish "hi" and read my page.')).task as A2ATask;

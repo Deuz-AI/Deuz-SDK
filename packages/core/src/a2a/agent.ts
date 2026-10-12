@@ -147,7 +147,10 @@ export type A2AAgentAction =
       toolName: string;
       /** The call's arguments, for display. */
       input: unknown;
-      /** The signed approval token (`approvalSigner`): echo it on the verdict. */
+      /**
+       * The signed approval token (`approvalSigner`): echo it on the verdict.
+       * An approval without it is refused with `INVALID_PARAMS`.
+       */
       token?: string;
       /** The sub-agent the call belongs to. */
       agentPath?: string[];
@@ -417,10 +420,12 @@ function checkAnswers(
   const calls = new Map(result.pendingClientCalls.map((call) => [call.toolCallId, call]));
   const approved = new Set<string>();
   const returned = new Set<string>();
-  for (const { approvalId } of answers.approvals) {
+  for (const verdict of answers.approvals) {
+    const approvalId = verdict.approvalId;
     if (approved.has(approvalId))
       throw invalidParams(`approvalResponses answers '${approvalId}' twice.`);
-    if (!approvals.has(approvalId)) {
+    const request = approvals.get(approvalId);
+    if (!request) {
       const call = calls.get(approvalId);
       if (call) {
         throw invalidParams(
@@ -434,6 +439,13 @@ function checkAnswers(
         );
       }
       throw invalidParams(`'${approvalId}' is not an approval task ${taskId} waits for.`);
+    }
+    // A signed approval (approvalSigner) without its own token would reach
+    // the run as a denial. A denial needs none. The token is never echoed.
+    if (verdict.approved && request.token !== undefined && verdict.token !== request.token) {
+      throw invalidParams(
+        `The approval of ${request.toolName} (${request.toolCallId}) must echo its action's token.`,
+      );
     }
     approved.add(approvalId);
   }

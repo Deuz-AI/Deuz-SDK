@@ -397,8 +397,11 @@ console.log(asked.status.state); // 'TASK_STATE_INPUT_REQUIRED'
 const { actions } = asked.status.message!.parts[1]!.data as { actions: A2AAgentAction[] };
 // [{ kind: 'approval', approvalId: 'call_1@…', toolCallId: 'call_1', toolName: 'book', input: { guests: 2 } }]
 
+// A signed approval (`approvalSigner`) carries a token: echo it.
 const approvalResponses = actions.flatMap((action) =>
-  action.kind === 'approval' ? [{ approvalId: action.approvalId, approved: true }] : [],
+  action.kind === 'approval'
+    ? [{ approvalId: action.approvalId, approved: true, token: action.token }]
+    : [],
 );
 const done = (await client.sendMessage([{ data: { approvalResponses } }], { taskId: asked.id }))
   .task!;
@@ -430,6 +433,7 @@ The client answers every action in one message, in data parts `{ approvalRespons
 
 - answers nothing, or leaves an action open;
 - names an action the run does not wait for, answers one twice, or with the wrong kind: a result for an approval, an approval for a client tool, an approval named by its tool call id;
+- approves a signed approval without echoing its action's `token` (a missing token, or another action's), which the run would take as a denial; a denial needs no token;
 - carries a data part other than `{ approvalResponses?, clientToolResults? }`, a malformed entry, or a file.
 
 The answer's text parts stay in the task's history, but the run gets only the answers: a resumed run takes no new user message. A message with answers for a run that waits for none is refused too.
