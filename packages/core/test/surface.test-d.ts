@@ -796,3 +796,7 @@ expectTypeOf<HeadlessRetry>().toEqualTypeOf<{
 expectTypeOf<
   Extract<HeadlessPendingAction, { kind: 'unknown-effect' }>['resumeWith']
 >().toEqualTypeOf<['retryToolCallIds', 'reconciledToolResults']>();
+
+// W3 review fixes: the A2A executor sends no drafts under guardrails.onOutput unless asked (V2-3).
+import type { A2AAgentExecutorOptions } from '../src/a2a';
+expectTypeOf<A2AAgentExecutorOptions['drafts']>().toEqualTypeOf<boolean | undefined>();

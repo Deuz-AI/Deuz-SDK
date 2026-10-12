@@ -251,7 +251,15 @@
     "             createA2AAgentExecutor (src/a2a/agent.ts); the native engine is passed in, so it stays",
     "             out of the graph. a2a without the adapter grew 35445 / 11949 -> 36026 / 12050 (ctx.draft",
     "             and the follow-up answer rule) and still fits its limit, as do the native bundles after",
-    "             the receipt settle and the native drain (RS3)."
+    "             the receipt settle and the native drain (RS3).",
+    "",
+    "RAISED FOR 2.3 (W3 fix rounds). Measured on feat/2.3 after fix lanes K4, B1-B6 and C1:",
+    "  native-agent     254661 B raw / 79782 gzip -> 257500 / 80400",
+    "  native-swarm     260648 B raw / 81688 gzip -> 263500 / 82500",
+    "  mcp-server lazy  281325 B raw / 90338 gzip -> 285000 / 91200",
+    "What grew: agent-run.ts +1.4 KB raw (B1: the settle record before a resume's first model call, the",
+    "client-result settle tools, the 2.2 envelope-version rule, the reconcilable-receipt filter), the",
+    "loops +0.2 KB (internal hooks), the adapters +0.4 KB (K4/C1: Gemini finish reasons, OpenAI refusals)."
   ],
   "bundles": {
     "core": {
@@ -353,8 +361,8 @@
         "createInMemoryBudgetStore",
         "BudgetStoreError"
       ],
-      "maxRawBytes": 255000,
-      "maxGzipBytes": 79600,
+      "maxRawBytes": 257500,
+      "maxGzipBytes": 80400,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -404,8 +412,8 @@
     "native-swarm": {
       "from": "@deuz-sdk/core/swarm",
       "exports": ["createSwarm", "createInMemorySwarmStore", "SwarmConflictError"],
-      "maxRawBytes": 261000,
-      "maxGzipBytes": 81700,
+      "maxRawBytes": 263500,
+      "maxGzipBytes": 82500,
       "maxLazyRawBytes": 22500,
       "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
@@ -575,8 +583,8 @@
       "exports": ["createMcpServer"],
       "maxRawBytes": 17150,
       "maxGzipBytes": 6570,
-      "maxLazyRawBytes": 283000,
-      "maxLazyGzipBytes": 90600
+      "maxLazyRawBytes": 285000,
+      "maxLazyGzipBytes": 91200
     },
     "realtime": {
       "from": "@deuz-sdk/core/realtime",
