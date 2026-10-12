@@ -1,7 +1,7 @@
 <!-- GENERATED FILE — do not hand-edit.
      regenerate: node packages/core/tooling/skills/generate-api-index.mjs --date YYYY-MM-DD
      source: packages/core/{package.json exports, tsup.config.ts} + src walk (export * followed)
-     verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697 -->
+     verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:d0398bbef8c4 -->
 
 # API index — every subpath, every export
 
@@ -341,11 +341,11 @@ Provider batch APIs (OpenAI, Anthropic, Gemini): submit, wait, read results, bat
 
 ## `@deuz-sdk/core/a2a`
 
-Agent2Agent v1.0.0: call remote agents and serve your own over JSON-RPC or HTTP+JSON.
+Agent2Agent v1.0.0: call remote agents and serve your own over JSON-RPC or HTTP+JSON, a native agent run as a task included.
 
-**Values** (6): A2AError, a2aText, createA2AClient, createA2AHandler, createInMemoryA2ATaskStore, fetchAgentCard
+**Values** (7): A2AError, a2aText, createA2AAgentExecutor, createA2AClient, createA2AHandler, createInMemoryA2ATaskStore, fetchAgentCard
 
-**Types** (57): A2AAgentCapabilities, A2AAgentCard, A2AAgentCardSignature, A2AAgentExtension, A2AAgentInterface, A2AAgentProvider, A2AAgentSkill, A2AArtifact, A2AArtifactInput, A2AArtifactOptions, A2ABinding, A2ACallOptions, A2ACancelContext, A2ACancelTaskOptions, A2ACancelTaskRequest, A2AClient, A2AClientOptions, A2ADataPart, A2AErrorKind, A2AErrorOptions, A2AErrorReason, A2AExecuteFunction, A2AExecutionContext, A2AExecutor, A2AFetchAgentCardOptions, A2AGetTaskOptions, A2AGetTaskRequest, A2AHandler, A2AHandlerOptions, A2AHeaders, A2AMessage, A2AMessageDraft, A2AMessageInput, A2AOAuthFlows, A2APart, A2AProtocolBinding, A2ARawPart, A2ARole, A2ASecurityRequirement, A2ASecurityScheme, A2ASendMessageConfiguration, A2ASendMessageOptions, A2ASendMessageRequest, A2ASendMessageResponse, A2AStatusOptions, A2AStreamResponse, A2ASubscribeToTaskRequest, A2ATask, A2ATaskArtifactUpdateEvent, A2ATaskPushNotificationConfig, A2ATaskScope, A2ATaskState, A2ATaskStatus, A2ATaskStatusUpdateEvent, A2ATaskStore, A2ATextPart, A2AUrlPart
+**Types** (66): A2AAgentAction, A2AAgentAnswers, A2AAgentCapabilities, A2AAgentCard, A2AAgentCardSignature, A2AAgentEngine, A2AAgentExecutorOptions, A2AAgentExtension, A2AAgentFailed, A2AAgentInterface, A2AAgentPendingActions, A2AAgentProvider, A2AAgentRunContext, A2AAgentRunOptions, A2AAgentSkill, A2AAgentStopped, A2AArtifact, A2AArtifactInput, A2AArtifactOptions, A2ABinding, A2ACallOptions, A2ACancelContext, A2ACancelTaskOptions, A2ACancelTaskRequest, A2AClient, A2AClientOptions, A2ADataPart, A2AErrorKind, A2AErrorOptions, A2AErrorReason, A2AExecuteFunction, A2AExecutionContext, A2AExecutor, A2AFetchAgentCardOptions, A2AGetTaskOptions, A2AGetTaskRequest, A2AHandler, A2AHandlerOptions, A2AHeaders, A2AMessage, A2AMessageDraft, A2AMessageInput, A2AOAuthFlows, A2APart, A2AProtocolBinding, A2ARawPart, A2ARole, A2ASecurityRequirement, A2ASecurityScheme, A2ASendMessageConfiguration, A2ASendMessageOptions, A2ASendMessageRequest, A2ASendMessageResponse, A2AStatusOptions, A2AStreamResponse, A2ASubscribeToTaskRequest, A2ATask, A2ATaskArtifactUpdateEvent, A2ATaskPushNotificationConfig, A2ATaskScope, A2ATaskState, A2ATaskStatus, A2ATaskStatusUpdateEvent, A2ATaskStore, A2ATextPart, A2AUrlPart
 
 ## `@deuz-sdk/core/headless`
 
@@ -353,7 +353,7 @@ Headless preview (Node only): run, resume and inspect native agent runs from a s
 
 **Values** (7): doctor, exitCodeFor, HEADLESS_EXIT_CODES, inspectRun, loadProjectInstructions, resumeHeadless, runHeadless
 
-**Types** (14): DoctorFinding, DoctorOptions, DoctorReport, DoctorSeverity, HeadlessCost, HeadlessOutcome, HeadlessPendingAction, HeadlessReport, HeadlessResumeOptions, HeadlessRunOptions, HeadlessSessionOptions, ProjectInstructionFile, ProjectInstructions, ProjectInstructionsOptions
+**Types** (15): DoctorFinding, DoctorOptions, DoctorReport, DoctorSeverity, HeadlessCost, HeadlessOutcome, HeadlessPendingAction, HeadlessReport, HeadlessResumeOptions, HeadlessRetry, HeadlessRunOptions, HeadlessSessionOptions, ProjectInstructionFile, ProjectInstructions, ProjectInstructionsOptions
 
 ## `@deuz-sdk/core/video`
 
@@ -635,6 +635,7 @@ Reverse lookup for "which subpath do I import this from?". Root exports are omit
 - `connectDeuzStream` — `ui`
 - `cosineSimilarity` — `memory`, `rag`
 - `CostBadge` — `@deuz-sdk/react`
+- `createA2AAgentExecutor` — `a2a`
 - `createA2AClient` — `a2a`
 - `createA2AHandler` — `a2a`
 - `createAdcKeyProvider` — `vertex/node`

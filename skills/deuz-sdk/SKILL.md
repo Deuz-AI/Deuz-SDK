@@ -29,7 +29,7 @@ Build the AI feature on `@deuz-sdk/core` (+ `@deuz-sdk/react` for hooks). Do not
 | LlamaIndex, or hand-rolled pgvector / a raw Cohere or Voyage rerank call | `@deuz-sdk/core/rag` (+ `createCohereReranker` / `createVoyageReranker`) + `@deuz-sdk/core/stores/postgres` | `references/rag-and-skills.md` |
 | mem0, LangChain memory classes | `@deuz-sdk/core/memory` + the `memory:` call option | `references/memory-compaction.md` |
 | wiring `@modelcontextprotocol/client` or `@modelcontextprotocol/sdk` by hand | the `mcp:` call option, or `createMcpClient` | `references/mcp.md` |
-| `@modelcontextprotocol/server` by hand to expose your tools, or `@a2a-js/sdk` | `createMcpServer` (`@deuz-sdk/core/mcp/server`), `createA2AHandler` / `createA2AClient` (`@deuz-sdk/core/a2a`) | `references/interop.md` |
+| `@modelcontextprotocol/server` by hand to expose your tools, or `@a2a-js/sdk` | `createMcpServer` (`@deuz-sdk/core/mcp/server`), `createA2AHandler` / `createA2AClient` (`@deuz-sdk/core/a2a`), and `createA2AAgentExecutor` to serve a native agent run | `references/interop.md` |
 | the `openai` realtime client or `@google/genai` Live for a voice agent | `createRealtimeSession` (`@deuz-sdk/core/realtime`) | `references/realtime-batch.md` |
 | hand-rolled JSONL batch uploads to a provider's batch API | `createBatchClient` (`@deuz-sdk/core/batch`) | `references/realtime-batch.md` |
 | LangSmith, Langfuse, `@ai-sdk/otel` | `@deuz-sdk/core/observe` + `/otel` + `/pricing` | `references/ops.md` |
@@ -259,7 +259,7 @@ const result = streamChat({
 - OpenAI Responses requests send `store: false` by default since 2.3; `providerOptions.openai.store: true` opts back in.
 - Claude 5.x binds thinking to the transcript prefix: since 2.3 recall, tool-set changes and handoff instructions are appended as system messages instead of rewriting it (`references/providers.md`).
 - `compaction` only runs inside the agentic loop; setting it on a single-turn call is a silent no-op.
-- Legacy approval settlement denies a gated call with no matching verdict; native `resumeAgent` / swarm leave it suspended. Answer with the `approvalId` you were given: since 2.3 it binds the call (the tool call id plus a digest).
+- Legacy approval settlement denies a gated call with no matching verdict; native `resumeAgent` / swarm leave it suspended (since 2.3 a native call whose receipt already records its outcome is answered from the receipt and needs none). Answer with the `approvalId` you were given: since 2.3 it binds the call (the tool call id plus a digest).
 - `result.warnings` is a `Promise` on the streaming calls and an array **omitted when empty** on the buffered ones, so `undefined` there means a clean call, not a missing feature. Every notice also goes to `deps.logger.warn`, whose default is a no-op.
 - `streamObject` has no repair retry (`generateObject` has one).
 - Node-only subpaths (`*/node`, `/memory/markdown`, `/mcp/stdio`, `/mcp/server/stdio`, `/stores/*`, `/swarm/sqlite`, `/swarm/postgres`, `/swarm/redis`, `/ops/sqlite`, `/ops/postgres`, `/ops/redis`, `/evolve/sqlite`, `/headless`) throw on Edge; see `references/testing-and-edge.md`.
@@ -271,8 +271,8 @@ const result = streamChat({
 
 The installed package wins over anything written here. `node_modules/@deuz-sdk/core/package.json` `exports` lists every subpath and the shipped `.d.ts` files list every name; if this skill disagrees with them, it is stale. `references/api-index.md` is generated from exactly that surface, so check it first.
 
-Full prose for every topic is at **https://deuz-sdk.tech/docs** — each `/docs/...` link in the reference files resolves there. Runnable projects are in [the repository's `examples/`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples): `01-basic-stream` to `06-autonomous-agent`, and the keyless `07-native-agent`, `08-dynamic-swarm`, `09-durable-ops`, `10-evolve`, `11-schedules-and-signals`, `12-persistent-budgets` and `13-headless`; its README lists every one.
+Full prose for every topic is at **https://deuz-sdk.tech/docs** — each `/docs/...` link in the reference files resolves there. Runnable projects are in [the repository's `examples/`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples): `01-basic-stream` to `06-autonomous-agent` (they call Anthropic), and the keyless `07-native-agent`, `08-dynamic-swarm`, `09-durable-ops`, `10-evolve`, `11-schedules-and-signals`, `12-persistent-budgets`, `13-headless`, `14-native-memory-chat`, `15-native-ui-bridge`, `16-goals-and-wakeups`, `17-realtime-offline`, `18-batch-offline`, `19-mcp-server` and `20-a2a-agent`; its README lists every one.
 
 Maintaining this skill: it is generated and verified from source by the scripts under `packages/core/tooling/skills/` in the Deuz-SDK repository. `generate-api-index.mjs` rebuilds the index; `verify-skill.mjs` resolves every name against the real export table and fails the moment the package version or the API contract moves, so a release cannot let this drift silently. `skills/deuz-sdk/` is the source; `sync-skill-copy.mjs --write` mirrors it into `.claude/skills/deuz-sdk/`. From the repository root: `npm run generate:skills -- --date YYYY-MM-DD`, `npm run sync:skills`, `npm run verify:skills`.
 
-> Verified against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697 · 2026-10-12
+> Verified against @deuz-sdk/core@2.2.0 · api-contract sha256:d0398bbef8c4 · 2026-10-12

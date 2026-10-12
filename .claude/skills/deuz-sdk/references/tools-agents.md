@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:d0398bbef8c4
      sources: packages/core/src/types/{tool,config,guardrails,stream,message,methods}.ts, packages/core/src/{tool,agent,server-tools}.ts,
      packages/core/src/inference/{agent-tool,handoff,stop,loop-shared,tool-loop,stream-tool-loop}.ts,
      packages/core/src/internal/{usage-cost,stable-prefix}.ts, docs/content/docs/reference/whats-new-2-0.mdx,
@@ -160,7 +160,7 @@ interface PrepareStepResult {
 
 Because `messages` persists forward, `prepareStep` doubles as a user-controlled compaction and system-prompt-rewrite hook: rewrite the system-role message inside `messages`, there is no separate `system` field here. Typical use is cheap exploration steps on a small model with `activeTools: ['search']`, then a strong model for the final synthesis. A throw fails the call — it is your code and is never swallowed.
 
-`runtimeContext?: unknown` is threaded **untouched** into `ToolExecuteContext.runtimeContext`, `prepareStep`, `verifyStep`, `doneWhen` and all three guardrail hooks; sub-agents inherit it. The SDK never reads, copies or serializes it, so it never reaches a checkpoint, chat record or observation event — a live DB handle or a secret is safe there. Define your `ToolSet` once at module scope and pass the tenant per call instead of rebuilding the tool set per request. It is `unknown` on purpose: cast it once at the top of each consumer.
+`runtimeContext?: unknown` is threaded **untouched** into `ToolExecuteContext.runtimeContext`, `prepareStep`, `verifyStep`, `doneWhen` and the four guardrail hooks (`onInput`, `onToolCall`, `onToolResult`, `onOutput`); sub-agents inherit it. The SDK never reads, copies or serializes it, so it never reaches a checkpoint, chat record or observation event — a live DB handle or a secret is safe there. Define your `ToolSet` once at module scope and pass the tenant per call instead of rebuilding the tool set per request. It is `unknown` on purpose: cast it once at the top of each consumer.
 
 ## Client tools — the loop hands the call back
 

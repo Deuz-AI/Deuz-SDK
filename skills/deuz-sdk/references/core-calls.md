@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:d0398bbef8c4
      sources: packages/core/src/types/config.ts, packages/core/src/types/methods.ts,
      packages/core/src/internal/{fallback,stable-prefix,warnings}.ts, packages/core/src/adapters/*.ts,
      packages/core/src/types/stream.ts, packages/core/src/types/message.ts,
@@ -126,7 +126,7 @@ console.log(text, finishReason, usage.totalTokens, response.messages.length);
 
 `GenerateTextResult`: `text`, `usage`, `finishReason`, `response.messages` always; `stopDetails` (2.3) when the provider explained its stop, e.g. a refusal's `category` and `explanation` (each `steps` entry carries its own); `steps` / `toolCalls` / `toolResults` only with tools (`steps === undefined` is how you tell a single-turn result apart); `pendingApprovals` on a client-mode approval break; `providerMetadata.deuz` for `stoppedBy` / `verified` / `guardrails` / `handoffs`; `runId` with `session`; `memory`, `observation`, `warnings` as above. `usage.totalTokens` is the provider's own total where one exists, not `inputTokens + outputTokens`. Since 2.3 `outputTokens` includes reasoning on every wire and `reasoningTokens` is its share.
 
-**Refused and cut-off turns (2.3).** A turn that ends with `content_filter` (Anthropic `stop_reason: 'refusal'`) or `length` (`max_tokens`) never dispatches its tool calls, in `generateText`, `streamChat` and native runs, because their arguments can be truncated JSON; a tool call whose arguments are not a JSON object self-heals into an `is_error` result. An empty assistant turn is never stored or sent back. Read why from `stopDetails`; the raw provider object also stays on the `finish` part as `providerMetadata.anthropic.stop_details`.
+**Refused and cut-off turns (2.3).** A turn that ends with `content_filter` (Anthropic `stop_reason: 'refusal'`, an OpenAI refusal, a Gemini safety or recitation filter, a Responses turn its content filter cut off) or `length` (`max_tokens`) never dispatches its tool calls, in `generateText`, `streamChat` and native runs, because their arguments can be truncated JSON; a tool call whose arguments are not a JSON object self-heals into an `is_error` result. An empty assistant turn is never stored or sent back. Read why from `stopDetails`; the raw provider object also stays on the `finish` part as `providerMetadata.anthropic.stop_details`, and an OpenAI refusal's text as `providerMetadata.openai.refusal`, whose `stopDetails` is `{ type: 'refusal', explanation }` (no `category`). A refused OpenAI turn ends with `content_filter` unless the provider reported `length` or `content_filter` itself, and the refusal never becomes answer text: `text` stays empty. Not live-verified.
 
 ## `generateObject` and `streamObject`
 
@@ -205,7 +205,7 @@ console.log(docs.embeddings.length, query.embedding.length, query.usage.inputTok
 | `reasoning-delta` | `text`, `signature?`, `encrypted?`, `id?`, `redacted?`, `source?` | Thinking fragment. When `encrypted` or `redacted`, `text` is an opaque payload — do not render it. Deltas with one `id` build one block (2.3); `source` is the provider family. |
 | `tool-call-delta` | `id`, `name?`, `argsTextDelta`, `providerMetadata?` | Raw args JSON fragment. Accumulate as a **string**, parse once at block end. |
 | `source` | `id`, `url?`, `title?` | Grounding source from a provider-executed search. |
-| `finish` | `usage`, `finishReason`, `providerMetadata?` | Terminal. In a loop `usage` is summed across steps; `providerMetadata.deuz.stoppedBy` names a budget/stop-condition end; the provider's stop detail (e.g. `anthropic.stop_details`) rides here too. |
+| `finish` | `usage`, `finishReason`, `providerMetadata?` | Terminal. In a loop `usage` is summed across steps; `providerMetadata.deuz.stoppedBy` names a budget/stop-condition end; the provider's stop detail (`anthropic.stop_details`, or an OpenAI refusal's text as `openai.refusal`, 2.3) rides here too. |
 | `error` | `error` | Failure. The stream ends after it; `usage`/`finishReason` reject. |
 | `step-start` | `stepIndex` | Loop step began — normally the first part of any loop run. |
 | `step-finish` | `stepIndex`, `finishReason`, `usage`, `providerMetadata?` | That step's usage alone, and (2.3) its provider finish detail. |
