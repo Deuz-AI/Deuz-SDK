@@ -1142,6 +1142,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
             output: answer.result,
             ...(answer.isError ? { isError: true } : {}),
           });
+          // The settled turn's own bubble (2.3): a reconnect while the chat
+          // waited (a caught-up read) unplaces the slot, and `syncTurn` would
+          // append the turn a second time.
+          placedIdRef.current = turn.message.id;
           syncTurn(turn);
         }
         appendCanonical(clientToolResultMessage(results));
@@ -1519,6 +1523,8 @@ export function useChat(options: UseChatOptions): UseChatResult {
           ...(result.isError ? { isError: true } : {}),
         });
         parkedTurnRef.current = next;
+        // Into the parked turn's own bubble, as `settleClientCalls` does (2.3).
+        placedIdRef.current = next.message.id;
         syncTurn(next);
         flush(); // a user action, not a stream delta — show it now
       }

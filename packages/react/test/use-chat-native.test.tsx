@@ -847,6 +847,76 @@ describe('useChat — reconnect never re-appends what the hook holds (G1 hand-of
     expect(b.cursors).toEqual([undefined]);
     expect(result.current.messages.at(-1)?.content).toBe('B answer.');
   });
+
+  it('a caught-up reconnect while a native gate is open: the client result fills the gate’s bubble', async () => {
+    const route = nativeRoute(
+      [
+        {
+          toolCalls: [
+            { toolName: 'publish', id: 'p1', args: {} },
+            { toolName: 'locate', id: 'c1', args: {} },
+          ],
+        },
+        { text: 'Both done.' },
+      ],
+      { ...publishTools(), locate: { description: 'Where?', parameters } },
+    );
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/agent',
+        fetch: route.fetch,
+        onToolCall: async () => 'Paris',
+        resume: { endpoint: '/api/resume' },
+      }),
+    );
+    await act(async () => {
+      await result.current.sendMessage('go');
+    });
+    await waitFor(() => expect(result.current.pendingApprovals).toHaveLength(1));
+    // For example on an `online` event: the endpoint is caught up.
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.pendingApprovals).toHaveLength(1);
+    const { approvalId } = result.current.pendingApprovals[0]!;
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId, approved: true });
+    });
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    // One bubble for the suspended leg (its card shows the client result), one for leg 2.
+    expect(result.current.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'assistant']);
+    const gate = result.current.messages.filter((m) => m.id === 'msg-1');
+    expect(gate).toHaveLength(1);
+    expect(gate[0]!.toolCalls?.find((call) => call.toolCallId === 'c1')).toMatchObject({
+      state: 'result',
+      output: 'Paris',
+    });
+  });
+
+  it('a caught-up reconnect while a call is parked: its answer fills the parked turn’s bubble', async () => {
+    const route = nativeRoute(
+      [{ toolCalls: [{ toolName: 'sign', id: 's1', args: { eth: 1 } }] }, { text: 'Signed.' }],
+      { sign: { description: 'Sign.', parameters } },
+    );
+    const { result } = renderHook(() =>
+      useChat({ api: '/api/agent', fetch: route.fetch, resume: { endpoint: '/api/resume' } }),
+    );
+    await act(async () => {
+      await result.current.sendMessage('sign it');
+    });
+    await waitFor(() => expect(result.current.pendingToolCalls).toHaveLength(1));
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    await act(async () => {
+      await result.current.addToolResult({ toolCallId: 's1', output: '0xabc' });
+    });
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    expect(result.current.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'assistant']);
+    expect(result.current.messages.filter((m) => m.id === 'msg-1')).toHaveLength(1);
+  });
 });
 
 describe('useChat — native readout types', () => {
