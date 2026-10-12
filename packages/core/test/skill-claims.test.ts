@@ -1,7 +1,8 @@
 /**
  * Claims the Agent Skills make (skills/deuz-sdk, its .claude mirror, skills/migrate-from-ai-sdk),
- * each held against the code it describes (W3 review V5-1 .. V5-6). A block pins the behaviour
- * first, then checks that the skill text says so, in every copy that carries the claim.
+ * each held against the code it describes (W3 review V5-1 .. V5-6; the examples list, K6). A
+ * block pins the behaviour first, then checks that the skill text says so, in every copy that
+ * carries the claim.
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -406,4 +407,23 @@ describe('realtime-batch.md: the voice-token route (W3 review V5-6)', () => {
       expect(check).toBeLessThan(route.indexOf('createOpenAIClientSecret({'));
     },
   );
+});
+
+describe('SKILL.md: the runnable examples (W3 K6)', () => {
+  it.each(bothCopies('SKILL.md'))('%s names every example directory', (path) => {
+    const sentence = read(path)
+      .split('\n')
+      .find((line) => line.includes('Runnable projects are in'));
+    expect(sentence).toBeDefined();
+    // Named one by one, or inside a "`01-…` to `06-…`" range.
+    const named = new Set([...sentence!.matchAll(/`(\d\d)-[\w-]+`/g)].map((m) => m[1]!));
+    for (const m of sentence!.matchAll(/`(\d\d)-[\w-]+` to `(\d\d)-[\w-]+`/g))
+      for (let n = Number(m[1]); n <= Number(m[2]); n++) named.add(String(n).padStart(2, '0'));
+    const examples = readdirSync(join(REPO, 'examples'), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^\d\d-/.test(entry.name))
+      .map((entry) => entry.name);
+    expect(examples.length).toBeGreaterThan(0);
+    expect(examples.filter((name) => !named.has(name.slice(0, 2)))).toEqual([]);
+    for (const m of sentence!.matchAll(/`(\d\d-[\w-]+)`/g)) expect(examples).toContain(m[1]);
+  });
 });
