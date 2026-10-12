@@ -40,44 +40,44 @@ const siteDescriptions: Record<Locale, string> = {
 
 const bannerCopy: Record<Locale, { text: string; link: string }> = {
   en: {
-    text: 'Deuz SDK 2.2 is out — dynamic swarms, cross-process operations, persistent budgets and evolve.',
-    link: 'What is new in 2.2',
+    text: 'Deuz SDK 2.3 is out — an MCP server, A2A, realtime voice, batch requests and Redis backends.',
+    link: 'What is new in 2.3',
   },
   de: {
-    text: 'Deuz SDK 2.2 ist da — dynamische Swarms, prozessübergreifender Betrieb, dauerhafte Budgets und Evolve.',
-    link: 'Neu in 2.2',
+    text: 'Deuz SDK 2.3 ist da — MCP-Server, A2A, Echtzeit-Sprache, Batch-Anfragen und Redis-Backends.',
+    link: 'Neu in 2.3',
   },
   tr: {
-    text: 'Deuz SDK 2.2 çıktı — dinamik swarm’lar, süreçler arası operasyon, kalıcı bütçeler ve evolve.',
-    link: '2.2’de neler yeni',
+    text: 'Deuz SDK 2.3 çıktı — MCP sunucusu, A2A, gerçek zamanlı ses, toplu istekler ve Redis backend’leri.',
+    link: '2.3’te neler yeni',
   },
   fr: {
-    text: 'Deuz SDK 2.2 est sorti — swarms dynamiques, opérations multi-processus, budgets persistants et evolve.',
-    link: 'Nouveautés de la 2.2',
+    text: 'Deuz SDK 2.3 est sorti — serveur MCP, A2A, voix en temps réel, requêtes par lots et backends Redis.',
+    link: 'Nouveautés de la 2.3',
   },
   it: {
-    text: 'Deuz SDK 2.2 è uscito — swarm dinamici, operazioni tra processi, budget persistenti ed evolve.',
-    link: 'Novità della 2.2',
+    text: 'Deuz SDK 2.3 è uscito — server MCP, A2A, voce in tempo reale, richieste batch e backend Redis.',
+    link: 'Novità della 2.3',
   },
   es: {
-    text: 'Deuz SDK 2.2 ya está aquí — swarms dinámicos, operaciones entre procesos, presupuestos persistentes y evolve.',
-    link: 'Novedades de 2.2',
+    text: 'Deuz SDK 2.3 ya está aquí — servidor MCP, A2A, voz en tiempo real, solicitudes por lotes y backends de Redis.',
+    link: 'Novedades de 2.3',
   },
   ru: {
-    text: 'Вышел Deuz SDK 2.2 — динамические swarms, работа между процессами, постоянные бюджеты и evolve.',
-    link: 'Что нового в 2.2',
+    text: 'Вышел Deuz SDK 2.3 — MCP-сервер, A2A, голос в реальном времени, пакетные запросы и бэкенды Redis.',
+    link: 'Что нового в 2.3',
   },
   ja: {
-    text: 'Deuz SDK 2.2 リリース — 動的なスウォーム、プロセス間の運用、永続的な予算、Evolve。',
-    link: '2.2 の新機能',
+    text: 'Deuz SDK 2.3 リリース — MCP サーバー、A2A、リアルタイム音声、バッチリクエスト、Redis バックエンド。',
+    link: '2.3 の新機能',
   },
   ko: {
-    text: 'Deuz SDK 2.2 출시 — 동적 스웜, 프로세스 간 운영, 영속 예산, Evolve.',
-    link: '2.2의 새로운 점',
+    text: 'Deuz SDK 2.3 출시 — MCP 서버, A2A, 실시간 음성, 배치 요청, Redis 백엔드.',
+    link: '2.3의 새로운 점',
   },
   zh: {
-    text: 'Deuz SDK 2.2 已发布 — 动态 swarm、跨进程运行、持久化预算与 Evolve。',
-    link: '2.2 新特性',
+    text: 'Deuz SDK 2.3 已发布 — MCP 服务器、A2A、实时语音、批量请求与 Redis 后端。',
+    link: '2.3 新特性',
   },
 };
 
@@ -112,10 +112,10 @@ export default async function Layout({ params, children }: LayoutProps<'/[lang]'
     >
       <body className="flex min-h-screen flex-col">
         <RootProvider i18n={i18nProvider(translations, lang)}>
-          <Banner id="deuz-sdk-2-2">
+          <Banner id="deuz-sdk-2-3">
             {banner.text}{' '}
             <Link
-              href={localePath(locale, '/docs/reference/whats-new-2-2')}
+              href={localePath(locale, '/docs/reference/whats-new-2-3')}
               className="font-medium underline underline-offset-4"
             >
               {banner.link}
