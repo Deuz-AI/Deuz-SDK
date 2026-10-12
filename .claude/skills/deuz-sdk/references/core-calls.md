@@ -205,7 +205,7 @@ console.log(docs.embeddings.length, query.embedding.length, query.usage.inputTok
 | `reasoning-delta` | `text`, `signature?`, `encrypted?`, `id?`, `redacted?`, `source?` | Thinking fragment. When `encrypted` or `redacted`, `text` is an opaque payload — do not render it. Deltas with one `id` build one block (2.3); `source` is the provider family. |
 | `tool-call-delta` | `id`, `name?`, `argsTextDelta`, `providerMetadata?` | Raw args JSON fragment. Accumulate as a **string**, parse once at block end. |
 | `source` | `id`, `url?`, `title?` | Grounding source from a provider-executed search. |
-| `finish` | `usage`, `finishReason`, `providerMetadata?` | Terminal. In a loop `usage` is summed across steps; `providerMetadata.deuz.stoppedBy` names a budget/stop-condition end; the provider's stop detail (`anthropic.stop_details`, or an OpenAI refusal's text as `openai.refusal`, 2.3) rides here too. |
+| `finish` | `usage`, `finishReason`, `providerMetadata?` | Terminal. In a loop `usage` is summed across steps; `providerMetadata.deuz.stoppedBy` names a budget/stop-condition end; the provider's stop detail (`anthropic.stop_details`, or an OpenAI refusal's text as `openai.refusal`, 2.3) rides here too, and so does Gemini's own finish reason (`google.finishReason`, 2.3). |
 | `error` | `error` | Failure. The stream ends after it; `usage`/`finishReason` reject. |
 | `step-start` | `stepIndex` | Loop step began — normally the first part of any loop run. |
 | `step-finish` | `stepIndex`, `finishReason`, `usage`, `providerMetadata?` | That step's usage alone, and (2.3) its provider finish detail. |
