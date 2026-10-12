@@ -1,6 +1,7 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
      sources: docs/content/docs/modules/{observability,pricing,middleware,budgets}.mdx,
      packages/core/src/{budget-ledger,budget-store}.ts, packages/core/src/types/{execution,budget-store}.ts,
+     packages/core/src/internal/{native-request,usage-cost,unpriced,unpriced-error}.ts, packages/core/src/node/ops-redis.ts,
      docs/content/docs/reference/observe-events.mdx, docs/content/docs/advanced/resilience.mdx,
      skills/deuz-sdk/rules/pitfalls.md, packages/core/src/{observe,otel,pricing,middleware,errors}.ts,
      packages/core/src/node/observe.ts, packages/core/src/inference/stop.ts,
@@ -13,7 +14,7 @@
 
 Everything here is local-first and injected. There is no hosted service, no account, no data leaving your process, and core imports none of it — you wire it through the one `Dependencies` seam on `deps` (per call) or `createClient({ deps })` (per app). A per-call `deps` field overrides the client's.
 
-For native 2.1 inherited policy and cumulative pre-dispatch reservations, read `references/native-execution.md`. Its shared ledger persists unknown usage and fails bounded USD admission without pricing or an explicit estimate. The legacy stop conditions below retain their existing semantics.
+For native 2.1 inherited policy and cumulative pre-dispatch reservations, read `references/native-execution.md`. Its shared ledger persists unknown usage. Since 2.3 a model with no price runs under a USD bound with one `unpriced-model` warning per model (its tokens are still reserved and bounded); `budget.unknownPrice: 'reject'` restores the fail-closed refusal, and a price lookup that throws still fails a USD bound closed. The legacy stop conditions below retain their existing semantics.
 
 ## The ops seams on `Dependencies`
 
@@ -226,10 +227,12 @@ export function ask(question: string): StreamChatResult {
 The core never bills; it returns a token breakdown (`Usage`) and nothing else. `@deuz-sdk/core/pricing` is fully optional.
 
 - `PRICES_2026` is a pinned `PriceTable` of 2026 list prices. **It is not authoritative** — list prices drift and enterprise/Vertex/Bedrock rates differ. Treat it as a starting point and override per deployment.
-- `priceUsage(model, usage, table?)` → `number | undefined`. `undefined` for an unknown model — never a wrong charge, never a throw. Lookup is tolerant: exact slug, then a stripped date stamp / `vendor/` prefix, then the longest known prefix.
-- Buckets: `inputTokens` → `input`; `outputTokens` **and** `reasoningTokens` → `output`; `cachedReadTokens` → `cachedRead` (default `0.1 × input`); `cacheWriteTokens` → `cacheWrite` (`1.25 × input`); `cacheWrite1hTokens` → `cacheWrite1h` (`2 × input`); `audioTokens` → `audio` (`input`). A row may carry `over200k` for long-context tiers. **`serverToolUses` is not priced** — provider-executed tools bill per call; add that yourself.
-- `cacheSavings(model, usage, table?)` → what cache reads saved versus the full input rate. Cache *writes* are the investment side and are not netted.
-- `createPriceProvider({ table?, margin? })` builds the `PriceProvider` for `deps.priceProvider`. `table` is shallow-merged per model over `PRICES_2026`; `margin` multiplies every result (default 1). It performs no I/O and reads no globals, so it is edge-safe, and it implements the optional `cacheSavings` seam out of the box.
+- `priceUsage(model, usage, table?, options?)` → `number | undefined`. `undefined` for an unknown model — never a wrong charge, never a throw. Lookup is explicit (2.3): exact row, then `PRICE_ALIASES`, then both again after dropping one `vendor/` prefix (any case) and a trailing snapshot date. There is no family-prefix fallback: a new or invented id stays unpriced until you add a row or an alias.
+- Buckets (2.3 usage contract, each token billed once): `inputTokens` → `input`; `outputTokens` (reasoning included; `reasoningTokens` is its share and is never billed again) → `output`; `cachedReadTokens` → `cachedRead` (default `0.1 × input`); `cacheWriteTokens` → `cacheWrite` (`1.25 × input`); `cacheWrite1hTokens` → `cacheWrite1h` (`2 × input`). `audioTokens` is a share of the input/output buckets; a row's `audio` rate re-prices it from `input`. Long-context cards go in `tiers` (`{ above, input, output, … }`; the highest threshold the whole prompt exceeds prices the whole call) beside the fixed `over200k` / `over272k`. **`serverToolUses` is not priced**: provider-executed tools bill per call, so add that yourself.
+- `cacheSavings(model, usage, table?, options?)` → what cache reads saved versus the full input rate. Cache *writes* are the investment side and are not netted.
+- `createPriceProvider({ table?, aliases?, margin? })` builds the `PriceProvider` for `deps.priceProvider`. `table` is shallow-merged per model over `PRICES_2026`; `aliases` (your id → a row id) merges over `PRICE_ALIASES`; `margin` multiplies every result (default 1). It performs no I/O and reads no globals, so it is edge-safe, and it implements the optional `cacheSavings` seam out of the box.
+- **Service tiers (2.3).** `PriceProvider.priceUsage(model, usage, { tier: 'batch' })` (and the fourth argument of the free functions) prices a row's `ModelPrice.batch` card, a complete rate card of its own. Only rates a primary source states are carded: the bundled table has batch cards for the Claude rows Anthropic lists (50% of standard), none for OpenAI or Gemini, so their batch requests are unpriced until you add a card through `table`. A `PriceProvider` written before 2.3 ignores the tier and prices batch usage at standard rates. `@deuz-sdk/core/batch` is the caller (`references/realtime-batch.md`).
+- **Unpriced models (2.3).** A model is unpriced when no `deps.priceProvider` is set or it returns `undefined`. Under a USD budget the call still runs: its tokens are reserved and bounded, its cost adds nothing to the USD totals, and the run reports `CallWarning` `'unpriced-model'` once per model. `budget.unknownPrice: 'reject'` (on the loop's `budget`, or on `BudgetLimits` for contexts, swarms, evolve and persistent scopes; `'reject'` wins when budgets intersect) refuses it before the call: `UnpricedModelError` (code `unpriced_model`, fatal to the run) in the legacy loop, `BudgetLedgerError` code `unpriced_model` in native runs.
 
 Injecting `deps.priceProvider` also turns on two loop features: a canonical `cost` stream part (`{ type: 'cost', costUsd, deltaUsd?, cacheSavingsUsd?, stepIndex? }`, one after every step, `costUsd` cumulative across the whole run including durable resume legs) and the `budget` call option. A `budget` trip emits `{ type: 'budget-exceeded', kind: 'usd' | 'tokens', limit, value }` right before the terminal `finish`.
 
@@ -266,12 +269,13 @@ export async function research(prompt: string): Promise<number> {
 
 Sharp edges:
 
-- **`costExceeds(usd)` and `budget.usd` are inert without `deps.priceProvider`** — the loop logs one warning (through the no-op default logger, so you will not see it) and the condition never fires. `totalTokensExceed(n)` and `budget.tokens` read provider-reported usage and need nothing.
+- **`costExceeds(usd)` and `budget.usd` count only priced calls.** Without `deps.priceProvider` nothing is priced: `costExceeds` logs one warning (through the no-op default logger, so you will not see it) and never fires, and `budget.usd` reports `unpriced-model` per model on `warnings` and never trips. With a provider, a model it has no price for adds nothing while the priced calls keep counting (2.2 switched the USD bound off for the rest of the run after one unpriced call). `totalTokensExceed(n)` and `budget.tokens` read provider-reported usage and need nothing; pair them with a USD bound whenever a model may be unpriced.
+- **A call whose usage the provider did not report has an unknown cost (2.3)**, never $0: `UsageMeta.usageAvailable` is `false` for it, and the loop's `cost` parts and `budget.usd` / `costExceeds` wait instead of counting on.
 - **A budget stop does not change `finishReason`.** Read `result.providerMetadata?.deuz?.stoppedBy` — `'budget.usd'`, `'budget.tokens'`, or the condition name (`'costExceeds'`, `'totalTokensExceed'`, `'durationExceeds'`, `'stepCountIs'`, `'hasToolCall'`).
 - Budgets are evaluated at **step boundaries**; an in-flight step always finishes. On a durable run they see the whole run's cumulative usage — a resume leg cannot reset the meter.
 - A budget stop is not an error: the turn finishes cleanly with partial work and full history, so the natural UX is a "continue anyway" button that re-sends the same conversation with a raised budget.
-- No `priceProvider`, or an unknown model → no `cost` parts and no errors. A throwing provider logs a warning and the part is skipped.
-- `UsageMeta` carries no dollars, by design: `{ model, reason: 'finished' | 'aborted' | 'error', ttftMs?, agentPath? }`. Compute cost inside your own `onUsage`.
+- No `priceProvider` → no `cost` parts and no errors. With one, an unpriced model adds nothing and the `cost` part keeps showing the priced sum. A throwing provider logs a warning and the part is skipped.
+- `UsageMeta` carries no dollars, by design: `{ model, reason: 'finished' | 'aborted' | 'error', ttftMs?, agentPath?, usageAvailable? }`. Compute cost inside your own `onUsage`.
 
 ### Budgets that outlive a run (2.2)
 
@@ -282,7 +286,9 @@ import { createExecutionContext, createInMemoryBudgetStore, runAgent } from '@de
 import { createMockModel } from '@deuz-sdk/core/testing';
 
 const model = createMockModel({ responses: [{ text: 'done' }] });
-const store = createInMemoryBudgetStore(); // createSqliteBudgetStore (/ops/sqlite) or createPostgresBudgetStore (/ops/postgres) across processes
+// Across processes: createSqliteBudgetStore (/ops/sqlite), createPostgresBudgetStore (/ops/postgres)
+// or createRedisBudgetStore (/ops/redis, 2.3).
+const store = createInMemoryBudgetStore();
 
 const result = await runAgent({
   model,
@@ -299,17 +305,19 @@ const result = await runAgent({
       onWarning: (w) => console.warn(`${w.key} at ${Math.round(w.percent)}% of ${w.dimension}`),
     },
   }),
-  executionEstimate: { tokens: 100, usd: 0.1 }, // a bounded dimension needs an estimate
-  deps: { priceProvider: { priceUsage: () => 0.01 } }, // a USD scope needs prices or the USD estimate stays held
+  executionEstimate: { tokens: 100, usd: 0.1 }, // optional: replaces the computed per-call estimate
+  deps: { priceProvider: { priceUsage: () => 0.01 } }, // without a price the call is unpriced (see Cost)
 });
 console.log(result.status, await store.usage('user:42'));
 ```
 
-- Settlement and release are mirrored; **unknown usage keeps the full hold**, except that a call reserved without a USD estimate settles its known tokens even when unpriced. Requests are idempotent by request ID. A store failure is `admission_failed` and changes nothing locally.
+- Settlement and release are mirrored; **unknown usage keeps the full hold**. An unpriced call (2.3) settles its token hold to the actual usage and holds no USD; one reserved with a caller `executionEstimate.usd` for a model that turns out to have no price settles that estimate as its charge. Requests are idempotent by request ID. A store failure is `admission_failed` and changes nothing locally; a settlement or release the store fails is tried three times, then once more by the native request, and the final error carries `requestId` (and `settlement`, which `ledger.settle(error.settlement)` replays once the store is back).
 - Swarms refuse pre-bound execution contexts, so pass `admission` to `createSwarm` instead: every task's model calls are admitted, the run records the scopes, and resuming needs the store again.
-- A scope that bounds a dimension needs an estimate for it (`missing_reservation` otherwise). The first request fixes a key's `window`; a different window later is rejected.
+- A scope that bounds a dimension needs an estimate for it (`missing_reservation` otherwise); native calls compute one from the prompt and the output cap the wire sends, priced when the model has a price. The first request fixes a key's `window`; a different window later is rejected.
 - `snapshot()` then records the scopes (execution snapshot version 2, which 2.1 refuses). Restoring needs the store again: `createExecutionContext({ snapshot, admission: { store } })`; scopes passed on restore can only add or tighten.
-- A crash-leaked hold stays charged to a lifetime budget and leaves a windowed one with its bucket — fail-closed by design. SQLite windows use the store `clock` (share one across processes); Postgres uses database time. Stores never prune history.
+- A crash-leaked hold stays charged to a lifetime budget and leaves a windowed one with its bucket: fail-closed by design. Since 2.3, `holds({ before })` lists open holds and `sweep({ before, resolve })` closes them (by default it settles at the estimate; or release them, or pass actual amounts); `prune({ before })` deletes finished request records and folds old history without changing usage or admission. Choose `before` well past your longest call, and past a batch job's `holdUntil`. `BudgetStoreMaintenance` names the three; the memory, SQLite, Postgres and Redis stores have them.
+- Clocks: SQLite windows use the store `clock` (share one across processes); Postgres uses database time; Redis (2.3) uses the server's `TIME`.
+- **Redis (2.3).** `createRedisBudgetStore({ client | url, prefix? })` from `@deuz-sdk/core/ops/redis` admits, settles and refuses exactly like the others, each operation one Lua script (Redis 7+). It needs a server that never evicts its keys (`maxmemory-policy noeviction` or a `volatile-*` policy; the store sets no TTL): an evicted budget scope admits its whole limit again. An ioredis client fits through `wrapIoredisClient(client)`, its `keyPrefix` included.
 
 ## Middleware
 
@@ -322,7 +330,7 @@ console.log(result.status, await store.usage('user:42'));
 | `logging({ logger?, label? })` | `transformParams`, `wrapGenerate` | `debug` on the way in, `info` with `finishReason`/`totalTokens` on the way out. **No console fallback** — no logger means no output. |
 | `simpleCache({ ttlMs?, now?, keyFn? })` | `wrapGenerate` | In-memory cache for buffered calls; `ttlMs` default 300 000. Default key = provider, modelId, messages, temperature, maxOutputTokens, topP, responseFormat. **Streaming passes through unchanged.** |
 | `redactPII()` | `transformParams` | Masks secret-looking substrings (`sk-`, `sk-ant-`, `AIza`, `Bearer`, known auth headers) in a deep copy. Best-effort hygiene, not a PII detector. |
-| `promptInjectionGuard({ policy? })` | `transformParams` | Prepends a spotlighting system message. Deprecated in 2.0 in favour of `promptInjectionGuardrail()` (`@deuz-sdk/core/guardrails`), which applies the identical policy text once per run instead of on every model call. |
+| `promptInjectionGuard({ policy? })` | `transformParams` | Prepends a spotlighting system message, once: since 2.3 a history whose leading system messages already carry the policy text is left as it is. Deprecated in 2.0 in favour of `promptInjectionGuardrail()` (`@deuz-sdk/core/guardrails`), which applies the identical policy text once per run instead of on every model call. |
 | `withFallback(models, { shouldFallback?, onFallback? })` | `wrapGenerate`, `wrapStream` | Cross-provider failover — see the next section. |
 
 ```ts
@@ -382,7 +390,7 @@ An explicit `0` disables a layer — that is how you drop the 300s ceiling a 25s
 
 **Cross-provider failover.** Because the whole conversation is canonical, the next candidate receives the identical request. Two equivalent surfaces: the `fallbackModels` call option, or the `withFallback` middleware (which additionally gives you `shouldFallback` and `onFallback`). Streaming hops only **pre-first-content**; buffered calls hop on any fallback-worthy rejection. What hops by default: `BreakerOpenError`, `NetworkError`, transport-layer `TimeoutError` (not `'step'`/`'tool'`, which are caller budgets), and retryable/5xx `APICallError`. Client errors never hop — they would fail identically everywhere. Each candidate keeps its own retry budget; failover engages after a candidate's final failure. The winner carries `providerMetadata.deuz.failedOver = { from, to, reason }`.
 
-> **`consume()` is `undefined` on the `fallbackModels` and `withFallback` paths.** Always call it as `result.consume?.()`. On a serverless runtime that means terminal effects (chat persistence, checkpoints, `onFinish`, memory extraction) do not run on those paths unless you drain `fullStream` yourself in the `after` / `waitUntil` callback.
+> **`consume()` works on the fail-over paths too.** Since 1.9 `streamChat({ fallbackModels })` and the `withFallback` middleware forward the winner's drain, so `after(() => result.consume?.())` still runs terminal effects (chat persistence, checkpoints, `onFinish`, memory extraction). Keep the optional call: `consume` is optional on the `StreamChatResult` type, so a hand-written result may lack it.
 
 **The circuit breaker** runs per `provider:model` in `deps.breakerStore`. Five consecutive countable failures open it for 30s; while open, calls fail immediately — before any network request — with `BreakerOpenError` (`code: 'breaker_open'`, carrying `provider`, `modelId`, `cooldownUntil`). Only provider-health failures count (network, timeout, 5xx/overload/retryable); 4xx client errors and a `BreakerOpenError` itself never do, and failures the retry budget absorbs don't either. The first byte of any response resets the counter to 0. After `cooldownUntil` the next call goes through as a half-open probe. A throwing `breakerStore` is ignored, never fatal. This is the breaker/failover synergy: an open breaker fails fast, so the hop is instant.
 
@@ -421,10 +429,10 @@ Honest caveats: pick fallbacks whose capabilities cover the call (a tool-heavy c
 
 ## Wire a real logger
 
-**The default `deps.logger` is a no-op, and it sees everything the result field does plus one thing it does not.** All four chat calls populate `warnings` — a promise on the streaming pair, a plain array with the key omitted when empty on the buffered pair — and both loops thread one sink through every step, so `unknown-model`, `unsupported-setting`, a dropped hosted tool and a dropped document all reach the outer result. The exception is the buffered loop's `activeTools` notices, which reach the log only. Without a logger these are silent:
+**The default `deps.logger` is a no-op, and it sees everything the result field does plus one thing it does not.** All four chat calls populate `warnings` — a promise on the streaming pair, a plain array with the key omitted when empty on the buffered pair — and both loops thread one sink through every step, so `unknown-model`, `unsupported-setting`, `clamped-setting` (2.3: every value a request changes, such as an effort level a model lacks or a forced `toolChoice` sent as `auto`), `unpriced-model`, a dropped hosted tool and a dropped document all reach the outer result, each reported once. The exception is the buffered loop's `activeTools` notices, which reach the log only. Without a logger these are silent:
 
-- an unknown model slug silently capped at `maxOutput: 4096` (check with `getModelCapabilities(model)`; `caps.known === false` means the fallback row);
-- `costExceeds` / `budget.usd` inert because no `priceProvider` was injected;
+- an unknown Claude id capped at `maxOutput: 4096` (Anthropic requires `max_tokens`; since 2.3 OpenAI Chat Completions/Responses and Gemini native leave the cap off for an unknown model). Check with `getModelCapabilities(model)` (`caps.known === false` means the fallback row) or `resolveModelProfile(model)`;
+- `costExceeds` inert because no `priceProvider` was injected;
 - the circuit breaker opening, a throwing `priceProvider` skipping a `cost` part, `falseFinishGuard` set without `doneWhen`.
 
 `CallWarning.type` is an **open** union with `'other'` as the escape hatch — do not switch on it exhaustively.
@@ -434,7 +442,8 @@ Honest caveats: pick fallbacks whose capabilities cover the call (a tool-heavy c
 - [/docs/modules/observability](/docs/modules/observability) — observers, capture, composition, the tracer bridge and `tracerMode`.
 - [/docs/reference/observe-events](/docs/reference/observe-events) — the full event catalog, `ObservedError`, canonical orderings.
 - [/docs/modules/pricing](/docs/modules/pricing) — `Usage` anatomy, `onUsage`, the price table, the live cost stream and the budget guardrail.
-- [/docs/modules/budgets](/docs/modules/budgets) — persistent `BudgetStore` scopes, rolling windows, warnings, SQLite and Postgres stores.
+- [/docs/modules/budgets](/docs/modules/budgets) — persistent `BudgetStore` scopes, rolling windows, warnings, SQLite, Postgres and Redis stores, holds and sweeps.
+- [/docs/modules/batch](/docs/modules/batch) — the batch tier: `ModelPrice.batch`, budget holds per request, `holdMs` and sweeps.
 - [/docs/modules/middleware](/docs/modules/middleware) — `wrapModel`, the hook interface, every bundled layer, writing your own.
 - [/docs/advanced/resilience](/docs/advanced/resilience) — retry policy, timeout layers, the circuit breaker, cross-provider failover.
 - [/docs/core/prompts-and-timeouts](/docs/core/prompts-and-timeouts) — the `timeout` option's scopes in prose.
