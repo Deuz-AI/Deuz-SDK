@@ -52,7 +52,7 @@ Everything else needs a subpath:
 | `import { MockLanguageModelV4 } from 'ai/test'` | `import { createMockModel } from '@deuz-sdk/core/testing'` |
 | `import { anthropic } from '@ai-sdk/anthropic'` | `import { createAnthropic } from '@deuz-sdk/core/anthropic'` + pass `apiKey` |
 | `import { openai } from '@ai-sdk/openai'` | `import { createOpenAI } from '@deuz-sdk/core/openai'` (or `createOpenAIResponses`) |
-| `import { registerTelemetry } from 'ai'` + `@ai-sdk/otel` | no equivalent — `rules/telemetry.md` |
+| `import { registerTelemetry } from 'ai'` + `@ai-sdk/otel` | `import { createOtelTracer, createOtelObserver } from '@deuz-sdk/core/otel'`, threaded through `deps` (no global registration) — `rules/telemetry.md` |
 
 Note Deuz exports a lowercase no-key singleton per provider too (`anthropic`, `openai`, `google`, …) for use with `createClient({ apiKeys })` or `deps.keyProvider`. It is NOT the same as the AI SDK's env-reading singleton — it carries no key at all.
 

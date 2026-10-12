@@ -13,9 +13,11 @@ import { generateText } from '../src/generate';
 import { agentTool } from '../src/inference/agent-tool';
 import { handoff } from '../src/inference/handoff';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
+import { createOtelObserver, createOtelTracer } from '../src/otel';
 import { createPriceProvider, PRICES_2026, type PriceTable } from '../src/pricing';
 import { createMockModel, type MockResponse } from '../src/testing';
 import type { LanguageModel } from '../src/types/model';
+import type { ToolExecuteContext } from '../src/types/tool';
 import type { Usage } from '../src/types/usage';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -260,4 +262,55 @@ describe('migration.md: typed per-tool context and runtimeContext (W3 review V5-
       expect(lines.filter((line) => !/native `runAgent`/.test(line))).toEqual([]);
     },
   );
+});
+
+describe('migrate-from-ai-sdk rules: runtimeContext, typed tool context, OTel (W3 review V5-4)', () => {
+  it('runtimeContext reaches a legacy tool by reference, and the OTel bridge exists', async () => {
+    const seen: unknown[] = [];
+    const tenant = { id: 'acme' };
+    await generateText({
+      model: createMockModel({
+        responses: [{ toolCalls: [{ toolName: 'probe', args: {} }] }, { text: 'done' }],
+      }),
+      prompt: 'go',
+      maxSteps: 3,
+      runtimeContext: tenant,
+      tools: {
+        probe: {
+          parameters,
+          execute: async (_args: unknown, ctx: ToolExecuteContext) => {
+            seen.push(ctx.runtimeContext);
+            return 'ok';
+          },
+        },
+      },
+    });
+    expect(seen).toEqual([tenant]);
+    expect(seen[0]).toBe(tenant);
+    expect(typeof createOtelTracer).toBe('function');
+    expect(typeof createOtelObserver).toBe('function');
+  });
+
+  it('no skill lists runtimeContext or typed tool context as having no equivalent', () => {
+    const stale = skillMarkdown().flatMap((path) =>
+      read(path)
+        .split('\n')
+        .filter(
+          (line) =>
+            /`runtimeContext` — close over what the tool needs/.test(line) ||
+            /Typed per-tool context injection of any kind/.test(line),
+        )
+        .map((line) => `${path}: ${line.slice(0, 80)}`),
+    );
+    expect(stale).toEqual([]);
+  });
+
+  it('rules/imports.md maps registerTelemetry + @ai-sdk/otel to @deuz-sdk/core/otel', () => {
+    const row = read('skills/migrate-from-ai-sdk/rules/imports.md')
+      .split('\n')
+      .find((line) => line.includes('registerTelemetry'));
+    expect(row).toBeDefined();
+    expect(row).not.toMatch(/no equivalent/i);
+    expect(row).toMatch(/createOtelTracer[^\n]*'@deuz-sdk\/core\/otel'/);
+  });
 });

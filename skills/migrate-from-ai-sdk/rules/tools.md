@@ -41,6 +41,7 @@ interface ToolExecuteContext {             // was ToolExecutionOptions / ToolCal
   toolCallId: string;
   messages: Message[];                     // immutable snapshot — read, never mutate
   signal?: AbortSignal;
+  runtimeContext?: unknown;                // 2.0: the call's opaque per-request value
   // plus agentPath inside a sub-agent
 }
 ```
@@ -150,7 +151,7 @@ The parent's server-mode `approveToolCall` is inherited to every depth. The sub-
 
 **It IS renderable in a `useChat` UI (1.9):** `applyUIPart` folds each `sub-agent` part into `turn.subAgents` — `Array<{ agentPath: string[]; afterPart: number; turn: AssistantTurnState }>`, one frame per path — and `useChat` exposes it as `subAgents`. `frame.turn` is a full turn folded by the same reducer, so render it with the SAME part component; indent by `agentPath.length` and splice at `afterPart` (the parent's ordered-element count at the handoff). No hand-rolled `readDeuzStream` needed. It is deliberately NOT merged into the parent's bubble or its canonical history: that would misattribute the child's prose and emit the child's `tool_use` without a `tool_result`.
 
-## No equivalent
+## Tool context: `runtimeContext`, and typed context on native runs
 
-- `contextSchema` / `toolsContext` / `runtimeContext` — close over what the tool needs, or read `ctx.messages`.
-- Typed per-tool context injection of any kind. `ToolExecuteContext` is fixed.
+- **`runtimeContext` (2.0) is a real call option** (`CommonCallOptions.runtimeContext`): an opaque per-call value forwarded untouched into `ToolExecuteContext.runtimeContext`, `prepareStep`, `verifyStep`, `doneWhen`, the four guardrail hooks and sub-agents. It never reaches a checkpoint, a chat record or an observation event, so a DB handle or a secret is safe there. Define the `ToolSet` once and pass the tenant per call.
+- **Typed per-tool context (`contextSchema` / `toolsContext`) exists on native `runAgent` tools** (`@deuz-sdk/core/agent`, 2.1): a tool declares `contextSchema` or `validateContext`, the run passes `toolsContext` by tool name, and each tool receives only its own validated value as `context` (the second argument of its `execute`), never sent to the provider. A legacy `ToolExecuteContext` is a fixed shape: on `generateText` / `streamChat`, read `runtimeContext` or close over what the tool needs.
