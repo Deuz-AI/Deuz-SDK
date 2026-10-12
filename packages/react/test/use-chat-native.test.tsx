@@ -330,6 +330,91 @@ describe('useChat — a native agent route (2.3)', () => {
     expect(result.current.messages.at(-1)?.content).toBe('Both done.');
   });
 
+  describe('a gate’s client calls run as part of the resume round', () => {
+    const gateRoute = () =>
+      nativeRoute(
+        [
+          {
+            toolCalls: [
+              { toolName: 'publish', id: 'p1', args: {} },
+              { toolName: 'locate', id: 'c1', args: {} },
+            ],
+          },
+          { text: 'Both done.' },
+          { text: 'Second run.' },
+        ],
+        { ...publishTools(), locate: { description: 'Where?', parameters } },
+      );
+
+    /** Approve the gate while `onToolCall` hangs; resolves once the call is running. */
+    async function approveWhileCalling() {
+      const route = gateRoute();
+      let resolveCall!: (value: unknown) => void;
+      const pending = new Promise<unknown>((resolve) => {
+        resolveCall = resolve;
+      });
+      const onToolCall = vi.fn(() => pending);
+      const hook = renderHook(() => useChat({ api: '/api/agent', fetch: route.fetch, onToolCall }));
+      await act(async () => {
+        await hook.result.current.sendMessage('go');
+      });
+      await waitFor(() => expect(hook.result.current.pendingApprovals).toHaveLength(1));
+      const { approvalId } = hook.result.current.pendingApprovals[0]!;
+      let approving: Promise<void> | undefined;
+      act(() => {
+        approving = hook.result.current.addToolApprovalResponse({ approvalId, approved: true });
+      });
+      await waitFor(() => expect(onToolCall).toHaveBeenCalledTimes(1));
+      return { route, hook, approving: approving!, resolveCall };
+    }
+
+    it('status is streaming while onToolCall runs after the last verdict', async () => {
+      const { hook, approving, resolveCall } = await approveWhileCalling();
+      // The Send button of the docs component is disabled while the round runs.
+      expect(hook.result.current.status).toBe('streaming');
+      await act(async () => {
+        resolveCall('Paris');
+        await approving;
+      });
+      await waitFor(() => expect(hook.result.current.agent?.status).toBe('completed'));
+      expect(hook.result.current.status).toBe('idle');
+    });
+
+    it('stop() while onToolCall runs cancels the resume POST', async () => {
+      const { route, hook, approving, resolveCall } = await approveWhileCalling();
+      act(() => {
+        hook.result.current.stop();
+      });
+      await act(async () => {
+        resolveCall('Paris');
+        await approving;
+      });
+      expect(route.bodies).toHaveLength(1);
+      expect(hook.result.current.status).toBe('idle');
+      expect(hook.result.current.error).toBeUndefined();
+    });
+
+    it('a message sent while onToolCall runs drops the gate: no stray result, no second resume', async () => {
+      const { route, hook, approving, resolveCall } = await approveWhileCalling();
+      await act(async () => {
+        await hook.result.current.sendMessage('something else');
+      });
+      await act(async () => {
+        resolveCall('Paris');
+        await approving;
+      });
+      await waitFor(() => expect(hook.result.current.status).toBe('idle'));
+      // The late result joins nothing, and run-1 is not resumed.
+      expect(route.bodies.filter((body) => body.runId === 'run-1')).toHaveLength(0);
+      expect(hook.result.current.history.canonical.map((m) => m.role)).toEqual([
+        'user',
+        'assistant',
+        'user',
+        'assistant',
+      ]);
+    });
+  });
+
   it('parks the client call after the verdicts; its answer resumes with both', async () => {
     const route = nativeRoute(
       [

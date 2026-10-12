@@ -381,6 +381,16 @@ interface NativeResume {
 }
 
 /**
+ * A native gate whose last verdict landed (2.3): its client calls run as the
+ * first step of the round that resumes the run with their results.
+ */
+interface NativeGateRound {
+  turn: AssistantTurnState;
+  clientCalls: UIToolCall[];
+  resume: NativeResume;
+}
+
+/**
  * The ids of the `tool_use` parts the current exchange (after the last user
  * message) has not answered yet (2.3). A server-run call that an earlier leg
  * paused on (an approval) gets its result in a later leg, where it is no
@@ -538,7 +548,9 @@ export interface UseChatOptions {
   /**
    * Client-tool executor: called for every streamed tool call the SERVER did
    * not execute. The return value is appended as its tool_result and the chat
-   * auto-continues; a throw self-heals as an is_error result.
+   * auto-continues; a throw self-heals as an is_error result. A result that
+   * lands after the chat moved on (a new message, a regenerate, a replaced
+   * history) is dropped (2.3).
    *
    * OMIT it to drive client tools from outside the hook instead: the
    * round-trip PARKS, the calls appear in `pendingToolCalls`, and
@@ -831,6 +843,12 @@ export function useChat(options: UseChatOptions): UseChatResult {
   /** The native run (and its verdicts) the parked client calls resume (2.3). */
   const parkedNativeRef = useRef<NativeResume | undefined>(undefined);
   /**
+   * Bumped by `clearGates` (2.3). An `onToolCall` batch that started under an
+   * older value belongs to a gate that was dropped meanwhile (a new message, a
+   * regenerate, a replaced transcript): its results join nothing.
+   */
+  const gateGenerationRef = useRef(0);
+  /**
    * The results the current turn streamed for calls of an EARLIER leg (2.3):
    * a server-run call the chat paused on (an approval) executes in the resumed
    * leg, which streams its state and result but not the call, so it is no
@@ -1000,6 +1018,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
 
   /** Drop every parked gate — the turn they belonged to is no longer current. */
   const clearGates = useCallback((): void => {
+    gateGenerationRef.current++;
     approvalsRef.current = [];
     verdictsRef.current = [];
     nativeGateRef.current = undefined;
@@ -1071,7 +1090,11 @@ export function useChat(options: UseChatOptions): UseChatResult {
    *
    * `native` resumes a native run: its id, and the verdicts that must ride
    * the same request. Resolves the next POST's continuation, or `undefined`
-   * when the chat is done or parked.
+   * when the chat is done or parked, or when the gate was dropped while the
+   * calls ran (2.3: a new message, a regenerate or a replaced transcript).
+   * Such a batch folds and appends nothing: its results answer a turn that is
+   * no longer current, and a `role: 'tool'` message after the new exchange
+   * would make the next request invalid.
    */
   const settleClientCalls = useCallback(
     async (
@@ -1092,35 +1115,33 @@ export function useChat(options: UseChatOptions): UseChatResult {
         setPendingToolCalls(pending);
         return undefined;
       }
+      const generation = gateGenerationRef.current;
       const running = pending.map(keyOfCall);
       for (const key of running) executingRef.current.add(key);
       try {
         const results: Array<{ toolCallId: string; result: unknown; isError?: boolean }> = [];
         for (const call of pending) {
+          let answer: { toolCallId: string; result: unknown; isError?: boolean };
           try {
             const out = await options.onToolCall({
               toolCallId: call.toolCallId,
               toolName: call.toolName,
               input: call.input,
             });
-            results.push({ toolCallId: call.toolCallId, result: out });
-            turn = applyUIPart(turn, {
-              type: 'tool-result',
-              toolCallId: call.toolCallId,
-              toolName: call.toolName,
-              output: out,
-            });
+            answer = { toolCallId: call.toolCallId, result: out };
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            results.push({ toolCallId: call.toolCallId, result: message, isError: true });
-            turn = applyUIPart(turn, {
-              type: 'tool-result',
-              toolCallId: call.toolCallId,
-              toolName: call.toolName,
-              output: message,
-              isError: true,
-            });
+            answer = { toolCallId: call.toolCallId, result: message, isError: true };
           }
+          if (gateGenerationRef.current !== generation) return undefined;
+          results.push(answer);
+          turn = applyUIPart(turn, {
+            type: 'tool-result',
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            output: answer.result,
+            ...(answer.isError ? { isError: true } : {}),
+          });
           syncTurn(turn);
         }
         appendCanonical(clientToolResultMessage(results));
@@ -1239,13 +1260,21 @@ export function useChat(options: UseChatOptions): UseChatResult {
   );
 
   const run = useCallback(
-    async (initial?: Continuation): Promise<void> => {
+    async (initial?: Continuation, gate?: NativeGateRound): Promise<void> => {
       const controller = new AbortController();
       abortRef.current = controller;
       setStatus('streaming');
       setError(undefined);
       let continuation = initial;
       try {
+        if (gate) {
+          // A native gate's client calls (2.3) run as this round's first step,
+          // under its controller and while it is 'streaming': a `stop()` while
+          // they run cancels the resume POST, as a stop between the rounds of
+          // a chat route does, and a gate dropped meanwhile resumes nothing.
+          continuation = await settleClientCalls(gate.turn, gate.clientCalls, gate.resume);
+          if (!continuation || controller.signal.aborted) return;
+        }
         // One iteration per model round; client-tool results loop back in.
         for (;;) {
           const doFetch = options.fetch ?? fetch;
@@ -1347,7 +1376,10 @@ export function useChat(options: UseChatOptions): UseChatResult {
         options.onError?.(e);
         return;
       } finally {
-        setStatus((s) => (s === 'error' ? s : 'idle'));
+        // Only the current round ends the streaming status (2.3): a round a
+        // newer one replaced, such as a gate's whose client calls were still
+        // running when a message was sent, must not flip that stream to idle.
+        if (abortRef.current === controller) setStatus((s) => (s === 'error' ? s : 'idle'));
         flush(); // every exit path publishes the last frame
       }
     },
@@ -1363,6 +1395,7 @@ export function useChat(options: UseChatOptions): UseChatResult {
       options.resume,
       fold,
       flush,
+      settleClientCalls,
       settleTurn,
       syncTurn,
     ],
@@ -1541,20 +1574,21 @@ export function useChat(options: UseChatOptions): UseChatResult {
       verdictsRef.current = [];
       setPendingApprovals([]);
       // A native run (2.3) resumes only with every verdict AND every client
-      // result in one request: its client calls run (or park) first.
+      // result in one request: its client calls run (or park) first, inside
+      // the round that resumes it.
       const native = nativeGateRef.current;
       nativeGateRef.current = undefined;
       if (native) {
-        const next = await settleClientCalls(native.turn, native.clientCalls, {
-          runId: native.runId,
-          approvalResponses: verdicts,
+        await run(undefined, {
+          turn: native.turn,
+          clientCalls: native.clientCalls,
+          resume: { runId: native.runId, approvalResponses: verdicts },
         });
-        if (next) await run(next);
         return;
       }
       await run({ approvalResponses: verdicts });
     },
-    [run, settleClientCalls],
+    [run],
   );
 
   /**
