@@ -199,9 +199,12 @@ A run whose stored turn leaves calls unanswered (the run waits on them, or its
 process stopped while they ran) is also saved as version 2 while an open call's
 receipt records `failed`, a stage 2.2 does not know and would answer with no result,
 or `suspended`, a sub-agent 2.2 would start over, and while a resume that took the
-turn up still waits on a client call's result, which 2.2 would deny. The envelope is
-version 1 again once a checkpoint answers the calls: 2.2 never reads their receipts
-after that.
+turn up still waits on a client call's result, which 2.2 would deny. A run that waits
+on an approval is version 2 too, and so is one whose resume took approved calls up
+and stopped before it saved their answers: 2.3 issues `approvalId` as the tool call
+ID, `@` and a digest, and 2.2 looks a verdict up by the bare tool call ID, so it
+would deny the call. The envelope is version 1 again once a checkpoint answers the
+calls: 2.2 never reads their receipts after that.
 
 A resume refuses an envelope of a version it does not read (2.3 reads 1 and 2).
 Since 2.3 it also refuses one holding a checkpoint whose version is not 1, with

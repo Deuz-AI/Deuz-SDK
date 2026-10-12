@@ -180,6 +180,96 @@ describe('native envelope versions for a 2.2 reader (2.3)', () => {
     expect((await store.load('client'))!.version).toBe(1);
   });
 
+  it('writes a run that waits on an approval as version 2 (W3 review V4-1)', async () => {
+    const store = createInMemoryAgentRunStore();
+    const effects: string[] = [];
+    const options = {
+      model: createMockModel({ responses: [chargeCall, { text: 'charged' }] }),
+      prompt: 'charge',
+      tools: {
+        charge: {
+          parameters,
+          needsApproval: true,
+          execute: () => {
+            effects.push('charge');
+            return 'ok';
+          },
+        },
+      },
+      session: { store, runId: 'approval', scope: 't' },
+    };
+    const first = await runAgent(options);
+    // 2.2 would accept the verdict at its gate, then settle by the bare call ID
+    // and deny the call: 2.3 issued `<toolCallId>@<digest>`.
+    if (first.status !== 'suspended') throw new Error(`expected a suspension, got ${first.status}`);
+    expect(first.pendingApprovals[0]!.approvalId).toMatch(/^c1@[0-9a-f]{24}$/);
+    expect((await store.load('approval'))!.version).toBe(2);
+    const resumed = await resumeAgent({ ...options, approvalResponses: approveAll(first) });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'charged' });
+    expect(effects).toEqual(['charge']);
+    expect((await store.load('approval'))!.version).toBe(1);
+  });
+
+  it('keeps a turn of approved calls version 2 while a resume settles it', async () => {
+    const store = createInMemoryAgentRunStore();
+    const tools: AgentToolSet = {
+      charge: { parameters, needsApproval: true, execute: () => 'ok' },
+    };
+    const options = {
+      model: createMockModel({
+        responses: [
+          {
+            toolCalls: [
+              { toolName: 'charge', id: 'c1', args: {} },
+              { toolName: 'charge', id: 'c2', args: {} },
+            ],
+          },
+          { text: 'done' },
+        ],
+      }),
+      prompt: 'charge twice',
+      tools,
+      maxToolConcurrency: 1,
+    };
+    const session = { store, runId: 'settling', scope: 't' };
+    const first = await runAgent({ ...options, session });
+    // c1 runs; the process dies before c2 starts. The step is running again,
+    // and both calls wait on verdicts that only 2.3 can match.
+    const crashed = await resumeAgent({
+      ...options,
+      session: { ...session, store: failingAfter(store, 'c1:completed') },
+      approvalResponses: approveAll(first),
+    });
+    expect(crashed.status).toBe('failed');
+    const open = (await store.load('settling'))!;
+    expect(open.checkpoints.settling!.status).toBe('running');
+    expect(stages(open)).toEqual(['c1:completed']);
+    expect(open.version).toBe(2);
+  });
+
+  it('keeps version 1 for a terminal run whatever its last checkpoint holds', async () => {
+    const store = createInMemoryAgentRunStore();
+    const options = {
+      model: createMockModel({ responses: [chargeCall] }),
+      prompt: 'charge',
+      tools: { charge: { parameters, needsApproval: true, execute: () => 'ok' } },
+      session: { store, runId: 'ended', scope: 't' },
+    };
+    const first = await runAgent({ ...options, maxSteps: 1 });
+    expect(first.status).toBe('suspended');
+    // The resume stops at its step limit before the settle: the run ends while
+    // its checkpoint still holds the approval. A 2.2 resume only returns it.
+    const ended = await resumeAgent({
+      ...options,
+      maxSteps: 1,
+      approvalResponses: approveAll(first),
+    });
+    expect(ended).toMatchObject({ status: 'stopped', reason: 'max-steps' });
+    const stored = (await store.load('ended'))!;
+    expect(stored.checkpoints.ended!.status).toBe('suspended');
+    expect(stored).toMatchObject({ phase: 'terminal', version: 1 });
+  });
+
   it('keeps version 1 for an open turn a 2.2 resume settles the same way', async () => {
     const store = createInMemoryAgentRunStore();
     const effects: string[] = [];

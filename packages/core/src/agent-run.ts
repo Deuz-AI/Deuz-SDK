@@ -289,24 +289,32 @@ function openCalls(messages: readonly Message[]): string[] {
 /**
  * Whether a 2.2 resume would answer the stored turn's open calls wrongly
  * (2.3). Such a turn is the one a resume settles next, until a checkpoint
- * answers it; a terminal run is only read back. An open call is misread when
- * its receipt records `failed` (2.2 does not know the stage and answers the
- * call with no result), when its receipt is `suspended` (2.2 looks the
- * sub-agent's checkpoint up under its own key and starts the sub-agent over),
- * and, once a resume took the turn up, when it is a client call still pending
- * (2.2 waits for a client result only while the run is suspended).
+ * answers it; a terminal run is only read back. 2.3 binds each approval to an
+ * `approvalId` that 2.2 cannot match: 2.2 accepts the verdict at its resume
+ * gate, then settles by the bare call ID and answers the call `No approval
+ * response.`, so a run that waits on an approval is misread, and so is, once a
+ * resume took the turn up, an open call the run's gate held. An open call is
+ * also misread when its receipt records `failed` (2.2 does not know the stage
+ * and answers the call with no result), when its receipt is `suspended` (2.2
+ * looks the sub-agent's checkpoint up under its own key and starts the
+ * sub-agent over), and, once a resume took the turn up, when it is a client
+ * call still pending (2.2 waits for a client result only while the run is
+ * suspended).
  */
 function openTurnMisreadBy22(envelope: AgentRunEnvelope): boolean {
   if (envelope.phase === 'terminal') return false;
   const checkpoint = envelope.checkpoints[envelope.runId];
   if (!checkpoint || checkpoint.status === 'completed') return false;
+  if (checkpoint.status === 'suspended' && (checkpoint.pendingApprovals?.length ?? 0) > 0)
+    return true;
   const waiting = new Set((envelope.pendingClientCalls ?? []).map((call) => call.toolCallId));
+  const gated = checkpoint.approvalRequestCounts ?? {};
   return openCalls(checkpoint.messages).some((id) => {
     const stage = envelope.toolResults?.[JSON.stringify([envelope.modelSteps, id])]?.stage;
     return (
       stage === 'failed' ||
       stage === 'suspended' ||
-      (checkpoint.status === 'running' && waiting.has(id))
+      (checkpoint.status === 'running' && (waiting.has(id) || Object.hasOwn(gated, id)))
     );
   });
 }

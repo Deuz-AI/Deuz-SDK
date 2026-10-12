@@ -567,7 +567,9 @@ describe('native memory: envelope versions', () => {
       tools: { gate: { parameters, needsApproval: true, execute: () => 'ok' } },
     };
     const first = await runAgent(plain);
-    expect((await store.load('plain'))?.version).toBe(1);
+    // Waiting on a 2.3 approval is 2.3 state too (a 2.2 resume cannot match its
+    // approvalId): version 2 until the approval is answered.
+    expect((await store.load('plain'))?.version).toBe(2);
     const resumed = await resumeAgent({
       ...plain,
       approvalResponses: [
