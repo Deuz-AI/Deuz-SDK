@@ -56,6 +56,36 @@ export function failingOnce(
 }
 
 /**
+ * A process that dies during the model call after the save recording `stage`
+ * (`<id>:<stage>`): that call's budget reservation, the first save at a later
+ * model step, lands, and every save after it fails. `onFail` runs once, at the
+ * first write the dead process could not make.
+ */
+export function diesDuringNextModelCall(
+  inner: AgentRunStore,
+  stage: string,
+  onFail: () => void = () => {},
+): AgentRunStore {
+  let step: number | undefined;
+  let dead = false;
+  let failed = false;
+  return {
+    load: (runId) => inner.load(runId),
+    save(envelope) {
+      if (dead) {
+        if (!failed) onFail();
+        failed = true;
+        throw new Error('process died');
+      }
+      if (step === undefined) {
+        if (stages(envelope).includes(stage)) step = envelope.modelSteps;
+      } else if (envelope.modelSteps > step) dead = true;
+      return inner.save(envelope);
+    },
+  };
+}
+
+/**
  * No lost cost: the run's accounting commits at least what every billed model
  * call cost (`store.billedCalls`, counted at the model). A call whose outcome is
  * unknown stays held at its estimate, which is never below its actual cost.
