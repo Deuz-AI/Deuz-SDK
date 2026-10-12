@@ -17,6 +17,7 @@ const BOUNDARIES = [
   'memory-scope',
   'provider-fallback',
   'fallback-budget-settlement',
+  'compaction-boundary',
   'before-dispatch',
   'after-approval',
   'after-effect-before-receipt',
@@ -106,6 +107,7 @@ describe('fault injection (2.3)', () => {
       'fault/memory-scope-shared-context': 'contained',
       'fault/provider-fallback': 'recovered',
       'fault/fallback-budget-settlement': 'recovered',
+      'fault/compaction-preserved-thinking': 'recovered',
     });
     expect(report.aggregate.offline).toMatchObject({
       tasks: faultScenarios.length,
@@ -115,7 +117,7 @@ describe('fault injection (2.3)', () => {
       // A person checked the payment system after the unknown charge.
       humanRescues: 1,
       requiredApprovals: 1,
-      recovery: { 'not-needed': 0, recovered: 17, rescued: 0, contained: 10, failed: 0 },
+      recovery: { 'not-needed': 0, recovered: 18, rescued: 0, contained: 10, failed: 0 },
     });
   });
 });
