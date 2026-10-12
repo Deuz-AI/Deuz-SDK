@@ -78,7 +78,8 @@ export const midStream: EvalTaskManifest = {
     const first = await runAgent(options);
     if (context.observer.events().some((event) => event.type === 'model.failed'))
       context.interrupt('mid-model-stream');
-    // The failed result is terminal: a resume returns it without a model call.
+    // The failed result is terminal: a resume returns it without a model call,
+    // unless it asks for a retry (fault/mid-model-stream-retried).
     const resumed = await resumeAgent(options);
     context.store.billedCalls = calls();
     return {
@@ -329,6 +330,54 @@ export const childInitialization: EvalTaskManifest = {
       recovery:
         result.status === 'completed' && childRequests === 1 && parent.calls() === 2
           ? 'parent-told'
+          : 'other',
+    };
+  },
+};
+
+export const midStreamRetried: EvalTaskManifest = {
+  id: 'fault/mid-model-stream-retried',
+  version: 1,
+  title: 'The same broken stream, resumed with retryFailed: the run goes on from its checkpoint',
+  tags: ['fault', 'native', 'model'],
+  model: MOCK,
+  start: { messages: prompt },
+  // Documented (native-agents.mdx): the failed envelope records the transient
+  // cause, and a resume with retryFailed re-enters the run from its last
+  // checkpoint; the broken call stays held, the retried turn runs once.
+  fault: { boundary: 'mid-model-stream', recovery: 'retried-from-checkpoint' },
+  acceptance: [
+    { name: 'completes', check: (outcome) => outcome.status === 'completed' },
+    {
+      name: 'the retried turn charged',
+      check: (_outcome, context) => context.store.charged === true,
+    },
+    costKept,
+    {
+      name: 'the broken call stays held as unknown, not dropped',
+      check: (outcome) => (outcome.accounting?.unknownTokens ?? 0) >= 1,
+    },
+  ],
+  async run(context) {
+    const store = createInMemoryAgentRunStore();
+    const { model, calls } = breakingOnce([chargeCall, chargeCall, { text: 'Charged.' }]);
+    const options = {
+      model,
+      messages: context.messages,
+      tools: chargeTool(context),
+      session: { store, runId: 'r', scope: 'eval' },
+      deps: { observer: context.observer, priceProvider: mockPrices },
+    };
+    const first = await runAgent(options);
+    if (context.observer.events().some((event) => event.type === 'model.failed'))
+      context.interrupt('mid-model-stream');
+    const resumed = await resumeAgent({ ...options, retryFailed: true });
+    context.store.billedCalls = calls();
+    return {
+      ...resumed,
+      recovery:
+        first.status === 'failed' && resumed.status === 'completed' && calls() === 3
+          ? 'retried-from-checkpoint'
           : 'other',
     };
   },

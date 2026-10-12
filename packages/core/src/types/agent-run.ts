@@ -140,7 +140,10 @@ export type AgentResult<T = string> = AgentResultBase &
          * calls whose effect is unknown — each started (stage `'executing'`) and
          * its outcome was never recorded. Check each effect in the system it
          * touched, then resume with `retryToolCallIds` for the ones to run
-         * again; a tool declared `replay: 'idempotent'` runs again by itself.
+         * again and `reconciledToolResults` for the ones that landed; a tool
+         * declared `replay: 'idempotent'` runs again by itself. Every call the
+         * store still holds as unknown is listed, also one the stopped resume
+         * tried to settle: settle them all in one resume.
          */
         unknownEffects?: AgentToolReceipt[];
       }
@@ -185,7 +188,8 @@ export interface AgentRunEnvelope {
     revision?: string;
     /**
      * The MCP servers' tool catalog (2.3): `fingerprintTools` JSON. Resume
-     * rejects a catalog that drifted from it; a hot refresh records the new one.
+     * rejects a catalog that drifted from it unless `onCatalogChange` is
+     * `'accept'`; a hot refresh, or an accepting resume, records the new one.
      * Absent before 2.3 and for runs without MCP; resume then records the catalog.
      */
     mcp?: string;
@@ -236,6 +240,27 @@ export interface AgentRunEnvelope {
   chat?: AgentRunChatState;
   /** Model fail-over (2.3): which models failed and which one the run calls now. */
   models?: AgentRunModelState;
+  /**
+   * A failure a resume may retry (2.3): written with a `failed` result whose
+   * cause was transient, and only then. `retryFailed` re-enters the run from
+   * its last checkpoint. A reader that does not know it (2.2) returns the
+   * failed result, as before.
+   */
+  retry?: AgentRunRetry;
+}
+
+/** A transient failure of a native run (2.3); see `AgentRunOptions.retryFailed`. */
+export interface AgentRunRetry {
+  /**
+   * `'model-call'`: a model call failed with a retryable transport or provider
+   * error (network, transport timeout, 5xx, 429/529 after the call's own
+   * retries, an open breaker) or its stream broke off. `'admission'`: the
+   * persistent budget store refused to admit a call with a serialization
+   * conflict (40001 or 40P01) after its own retries, so nothing was admitted.
+   */
+  cause: 'model-call' | 'admission';
+  /** The phase the run failed in; a retry re-enters it there. */
+  phase: 'running' | 'finalizing';
 }
 
 /** A model a native run called (2.3): who serves it, over which protocol. */
@@ -417,6 +442,12 @@ export interface AgentToolReceipt {
    * none; its tool is then looked up by name.
    */
   idempotent?: boolean;
+  /**
+   * The outcome was recorded by `reconciledToolResults` (2.3): the caller found
+   * it in the system the effect touched after the run lost track of it; the
+   * tool itself never reported it.
+   */
+  reconciled?: boolean;
   rawResult?: unknown;
   modelOutput?: unknown;
   error?: string;
@@ -539,6 +570,14 @@ export type AgentRunOptions<T = string> = Omit<
    * `'accept'` records the new catalog as the run's binding and carries on. Both
    * report the change as a `warning` part (`setting: 'mcp'`); an announcement
    * that changed nothing does neither.
+   *
+   * On resume, a catalog that differs from the recorded one fails the resume
+   * under `'stop'`. Under `'accept'` the resume's first write records it as a
+   * new binding revision, before any model call, with the same warning; it
+   * still fails while a call the model made against the recorded catalog is
+   * in flight (an MCP receipt in stage `'executing'`, or a call of the last
+   * turn that waits for its verdict or never started), and when the resume
+   * dropped the `mcp` entries.
    */
   onCatalogChange?: AgentMcpCatalogChange;
   toolsContext?: Record<string, unknown>;
@@ -596,6 +635,34 @@ export type AgentRunOptions<T = string> = Omit<
   fallbackModels?: LanguageModel[];
   /** Explicitly reconcile interrupted effects before permitting these call IDs to execute again. */
   retryToolCallIds?: readonly string[];
+  /**
+   * Record the outcome of an effect that landed (2.3), supplied only on
+   * resume: for each call the run stopped on with reason
+   * `'tool-reconciliation-required'` that you checked in the system it touched.
+   * The receipt takes `output` as the call's raw result (marked `reconciled`),
+   * and the step goes on from it exactly as from a recorded result: validated
+   * and projected like the tool's own, and the call never runs again. With
+   * `isError` the call is answered with `output` as its error (a string, or
+   * JSON for any other value). Only the run's unknown effects are accepted,
+   * each once and never also in `retryToolCallIds`; anything else fails the
+   * resume with a TypeError before anything is written. A resume that leaves
+   * an unknown effect unsettled stops again and records nothing.
+   */
+  reconciledToolResults?: readonly { toolCallId: string; output: unknown; isError?: boolean }[];
+  /**
+   * Re-enter a run that failed in transit (2.3), on resume. A failed run stays
+   * failed, and a resume returns its stored result. With `retryFailed: true`, a
+   * run whose envelope records a transient cause (`AgentRunEnvelope.retry`: a
+   * model call that failed with a retryable transport or provider error or
+   * whose stream broke off, or a budget admission refused with a serialization
+   * conflict) goes on from its last checkpoint, in the phase it failed in, with
+   * every check of a resume. The failed call stays counted, as a model step (a
+   * final answer also as one of `maxOutputAttempts`) and, while its outcome is
+   * unknown, in the accounting at its estimate; the retried call is reserved
+   * anew. Any other failure fails the resume with a TypeError before anything
+   * is written. Ignored for a run that did not fail.
+   */
+  retryFailed?: boolean;
   /** Results for pending client-side tool calls, supplied only on resume. */
   clientToolResults?: readonly { toolCallId: string; output: unknown; isError?: boolean }[];
   verify?: (context: AgentVerifyContext<T>) => AgentVerification | Promise<AgentVerification>;

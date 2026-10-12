@@ -127,7 +127,8 @@ MCP tool catalog changed across resume (added: refund; changed: charge).
 
 Dropping the `mcp` entries of a run that recorded a catalog is the same kind of
 change (`removed: ...`). The stored run is left untouched, so it can still be
-resumed once the servers serve the recorded catalog again.
+resumed once the servers serve the recorded catalog again, or by a resume that
+accepts the change (below).
 
 The connection is opened only after a terminal run (completed, stopped or
 failed) has returned its stored result, so such a run never reconnects. On a
@@ -180,6 +181,47 @@ for await (const event of stream.events) {
 `generateText` and `streamChat` default to `'accept'`: they carry on with the new
 catalog and report the change as a warning. With `onCatalogChange: 'stop'` they end
 with `providerMetadata.deuz.stoppedBy: 'mcp-catalog-changed'` instead.
+
+### A change the run missed
+
+A server can change its catalog while the run is down, and a run can die between
+a hot refresh and the save that records the refreshed catalog. Either way the
+resume finds a catalog that differs from the record. Under `'stop'` it fails as
+described [above](#the-catalog-in-the-resume-binding). A resume with
+`onCatalogChange: 'accept'` (2.3) treats the change like the hot refresh it
+missed: its first write records the servers' catalog as a new binding revision,
+before its first model call, and it reports the same `warning` part:
+
+```text
+MCP tool catalog changed across resume (added: refund); the run's resume binding now records the new catalog.
+```
+
+```ts
+import { resumeAgent } from '@deuz-sdk/core/agent';
+import type { AgentRunStore } from '@deuz-sdk/core/agent';
+import type { McpClient } from '@deuz-sdk/core/mcp';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+declare const store: AgentRunStore;
+declare const orders: McpClient; // its catalog changed while the run was down
+
+const result = await resumeAgent({
+  model: createMockModel({ responses: [{ text: 'Done.' }] }),
+  mcp: [orders],
+  onCatalogChange: 'accept',
+  session: { store, runId: 'order-7', scope: 'tenant-a' },
+});
+console.log(result.status);
+```
+
+Such a resume still fails, and leaves the run untouched, while a call the model
+made against the recorded catalog is in flight: an MCP call whose receipt says
+`executing`, or one of the last turn's calls that waits for its approval or never
+started. Settling that call would run the server's new tool in place of the one
+the model chose. It also fails when the resume has dropped the `mcp` entries. A
+resume that writes nothing (one that stays suspended, or stops for
+reconciliation) records nothing and reports nothing; the resume that goes on does
+both.
 
 ## Name collisions
 

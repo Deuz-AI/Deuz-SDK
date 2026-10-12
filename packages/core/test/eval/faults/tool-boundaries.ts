@@ -292,3 +292,68 @@ export const afterReceipt: EvalTaskManifest = {
     };
   },
 };
+
+export const afterEffectReconciled: EvalTaskManifest = {
+  id: 'fault/after-effect-before-receipt-reconciled',
+  version: 1,
+  title: 'The same fault, reconciled: the charge landed, and its outcome is recorded',
+  tags: ['fault', 'native', 'receipts', 'reconciliation'],
+  model: MOCK,
+  start: { messages: prompt },
+  fault: { boundary: 'after-effect-before-receipt', recovery: 'reconciled-result' },
+  acceptance: [
+    { name: 'completes', check: (outcome) => outcome.status === 'completed' },
+    ranOnce('charge:order-7'),
+    {
+      name: 'the receipt keeps the reconciled outcome',
+      check: (_outcome, context) => context.store.receipt === 'c1:completed:reconciled',
+    },
+    costKept,
+  ],
+  async run(context) {
+    const durable = createInMemoryAgentRunStore();
+    const { model, calls } = scripted([charge, answer]);
+    const options = {
+      model,
+      messages: context.messages,
+      tools: chargeTool(context),
+      deps: { observer: context.observer, priceProvider: mockPrices },
+    };
+    const store = failingOnce(
+      durable,
+      () => ((context.store.effects as string[] | undefined) ?? []).length > 0,
+      () => context.interrupt('after-effect-before-receipt'),
+    );
+    await runAgent({ ...options, session: { store, runId: 'r', scope: 'eval' } });
+    const session = { store: durable, runId: 'r', scope: 'eval' };
+    const stopped = await resumeAgent({ ...options, session });
+    const unknown = stopped.status === 'stopped' ? (stopped.unknownEffects ?? []) : [];
+    // The application looks the order up in the payment system, which keeps
+    // its own record of each charge: this one landed, so its outcome is
+    // recorded and nothing runs again. No person is involved.
+    const landed = ((context.store.effects as string[] | undefined) ?? []).includes(
+      'charge:order-7',
+    );
+    const resumed = await resumeAgent({
+      ...options,
+      session,
+      reconciledToolResults: unknown
+        .filter(() => landed)
+        .map((receipt) => ({ toolCallId: receipt.toolCallId, output: 'charged' })),
+    });
+    const receipt = Object.values((await durable.load('r'))?.toolResults ?? {})[0];
+    context.store.receipt = receipt
+      ? `${receipt.toolCallId}:${receipt.stage}${receipt.reconciled ? ':reconciled' : ''}`
+      : undefined;
+    context.store.billedCalls = calls();
+    return {
+      ...resumed,
+      recovery:
+        stopped.status === 'stopped' &&
+        stopped.reason === 'tool-reconciliation-required' &&
+        calls() === 2
+          ? 'reconciled-result'
+          : 'other',
+    };
+  },
+};

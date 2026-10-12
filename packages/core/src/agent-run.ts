@@ -5,10 +5,12 @@ import type {
   AgentRunOptions,
   AgentRunReconcileOptions,
   AgentRunReconciliation,
+  AgentRunRetry,
   AgentRunSession,
   AgentRunStore,
   AgentStream,
   AgentTool,
+  AgentToolReceipt,
   AgentValidation,
 } from './types/agent-run';
 import type { ChatStore } from './chat';
@@ -75,6 +77,7 @@ import { intersectBudgetLimits, subtreeLedgerSnapshot } from './budget-ledger';
 import { toJSONSchema } from './schema/bridge';
 import { assertEnvelopeRevision } from './internal/ops-validate';
 import { assertCheckpointVersion } from './internal/checkpoint-version';
+import { retryableCause } from './internal/native-retry';
 import { withCapabilityOverride } from './internal/config-symbol';
 // Native chat, memory and fail-over (2.3): loaded on demand by the runs that use them.
 import { scopeKey } from './internal/native-scope';
@@ -158,6 +161,41 @@ function positiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1)
     throw new TypeError(`${name} must be a positive integer.`);
   return value;
+}
+
+/** An outcome a caller found for a call whose effect was unknown (2.3). */
+type ReconciledOutcome = NonNullable<AgentRunOptions['reconciledToolResults']>[number];
+
+/**
+ * The outcomes `reconciledToolResults` records (2.3), by call ID: only for the
+ * run's unknown effects, each once, and never for a call `retryToolCallIds`
+ * runs again. Anything else is a TypeError, raised before anything is written.
+ */
+function reconciledOutcomes(
+  entries: unknown,
+  unknownEffects: readonly AgentToolReceipt[],
+  retryToolCallIds: readonly string[] | undefined,
+): Map<string, ReconciledOutcome> {
+  const outcomes = new Map<string, ReconciledOutcome>();
+  if (entries === undefined) return outcomes;
+  if (!Array.isArray(entries))
+    throw new TypeError('reconciledToolResults must be an array of { toolCallId, output }.');
+  for (const entry of entries as unknown[]) {
+    const id = (entry as { toolCallId?: unknown } | null)?.toolCallId;
+    if (typeof id !== 'string' || !id)
+      throw new TypeError('reconciledToolResults: every entry needs a non-empty toolCallId.');
+    if (outcomes.has(id)) throw new TypeError(`reconciledToolResults lists ${id} more than once.`);
+    if (retryToolCallIds?.includes(id))
+      throw new TypeError(
+        `reconciledToolResults and retryToolCallIds both list ${id}: a call is either recorded or run again.`,
+      );
+    if (!unknownEffects.some((receipt) => receipt.toolCallId === id))
+      throw new TypeError(
+        `reconciledToolResults: ${id} is not a call of this run whose effect is unknown.`,
+      );
+    outcomes.set(id, entry as ReconciledOutcome);
+  }
+  return outcomes;
 }
 
 /** Newer shared ledgers are valid; replacing persisted accounting with fresh counters is not. */
@@ -513,6 +551,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
   let repairable = false;
   /** This leg completed the run, so it extracts (2.3); a terminal resume never does. */
   let extractNow = false;
+  /**
+   * This resume re-enters a run that failed in transit (2.3, `retryFailed`):
+   * until its first write it writes nothing, the stored run stays failed.
+   */
+  let retrying = false;
+  /** The model call whose failure ended the run (2.3), and whether it broke off. */
+  let callFailure: { error: unknown; brokeOff: boolean } | undefined;
 
   let persistedLedger: string | undefined;
   // A child of a caller's shared ledger records only its own slice (2.2): the
@@ -683,6 +728,29 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     if (part.type === 'text-delta') text.push(part.text);
   }
 
+  /**
+   * The transient cause of the run's failure (2.3), recorded so `retryFailed`
+   * may go on from it. Never once the run lost its lease, was cancelled or ran
+   * out of time, as for a fail-over.
+   */
+  function transientCause(error: unknown): AgentRunRetry['cause'] | undefined {
+    if (lease && lease.failure(error) !== error) return undefined;
+    if ((lease?.signal ?? options.signal)?.aborted) return undefined;
+    if (common?.execution) {
+      try {
+        assertExecutionPolicy(common.execution, {
+          now: resolveDependencies(options.deps).clock.now(),
+        });
+      } catch {
+        return undefined;
+      }
+    }
+    return retryableCause(
+      error,
+      callFailure !== undefined && callFailure.error === error && callFailure.brokeOff,
+    );
+  }
+
   async function pump(): Promise<void> {
     try {
       envelope.runId ||= resolveDependencies(options.deps).generateId();
@@ -693,6 +761,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const catalogPolicy = options.onCatalogChange ?? 'stop';
       if (catalogPolicy !== 'stop' && catalogPolicy !== 'accept')
         throw new TypeError("onCatalogChange must be 'stop' or 'accept'.");
+      if (options.retryFailed !== undefined && typeof options.retryFailed !== 'boolean')
+        throw new TypeError('retryFailed must be a boolean.');
       if (options.session && (!options.session.runId || !options.session.scope)) {
         throw new TypeError('Native sessions require non-empty runId and scope.');
       }
@@ -775,6 +845,25 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           assertCheckpointVersion(checkpoint, runId);
         envelope = structuredClone(saved);
         currentText = envelope.candidateText ?? lastAssistantText(envelope.messages);
+        // A run that failed in transit (2.3) goes on when the caller asks: in the
+        // phase it failed in, from its last checkpoint, after every check of a
+        // resume. Its first write drops the failed result; until then nothing
+        // is written. Any other failure stays final.
+        if (
+          options.retryFailed &&
+          envelope.phase === 'terminal' &&
+          envelope.result?.status === 'failed'
+        ) {
+          const { name, code, message } = envelope.result.error;
+          if (!envelope.retry)
+            throw new TypeError(
+              `retryFailed: run ${envelope.runId} did not fail in transit (${code ?? name}: ${message}); only a model call that failed in transit or a budget admission refused with a serialization conflict is retried.`,
+            );
+          if (envelope.retry.phase !== 'running' && envelope.retry.phase !== 'finalizing')
+            throw new TypeError('Invalid native retry record.');
+          envelope.phase = envelope.retry.phase;
+          retrying = true;
+        }
       } else if (options.session && (await options.session.store.load(options.session.runId))) {
         throw new TypeError('Native run already exists; use resumeAgent.');
       }
@@ -982,6 +1071,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       // and before anything is persisted, so an unreachable server fails a fresh
       // run cleanly and a resume checks the servers' catalog before it writes. The
       // tools pass through the same receipts as local tools.
+      /** A drifted catalog this resume accepts (2.3): its first write records it. */
+      let acceptedCatalog: { catalog: string; drift: string } | undefined;
       if ((options.mcp?.length ?? 0) > 0 || recordedCatalog !== undefined) {
         const native = await import('./inference/native-mcp');
         if (options.mcp?.length) {
@@ -997,8 +1088,24 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           binding.mcp = await nativeMcp.catalog();
         }
         const drift = native.catalogDrift(recordedCatalog, binding.mcp);
-        // Rejected like a changed local tool set; the stored run stays intact.
-        if (drift) throw new TypeError(`MCP tool catalog changed across resume (${drift}).`);
+        if (drift) {
+          // Rejected like a changed local tool set; the stored run stays intact.
+          // Under `onCatalogChange: 'accept'` (2.3) the servers' new catalog
+          // opens a new binding revision instead, as the hot refresh it missed
+          // would have, unless the servers are gone or a call the model made
+          // against the recorded catalog is still in flight.
+          if (
+            catalogPolicy !== 'accept' ||
+            !nativeMcp ||
+            native.mcpCallInFlight(envelope.messages, envelope.toolResults, [
+              recordedCatalog,
+              binding.mcp,
+            ])
+          )
+            throw new TypeError(`MCP tool catalog changed across resume (${drift}).`);
+          acceptedCatalog = { catalog: binding.mcp!, drift };
+          binding.mcp = recordedCatalog;
+        }
       }
       envelope.binding = binding;
       if (envelope.limits) {
@@ -1024,6 +1131,26 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         }
         clientIds.add(clientResult.toolCallId);
       }
+      // A local tool shadows an MCP tool of the same name, as in the loop's merge.
+      const replayOf = (name: string): AgentTool['replay'] =>
+        options.tools && Object.hasOwn(options.tools, name)
+          ? options.tools[name]!.replay
+          : nativeMcp?.replayOf(name);
+      // The calls whose effect is unknown: each started and its outcome was
+      // never recorded. The policy the receipt recorded (2.3) is that of the tool
+      // that ran the call, a handoff target's own included. Older receipts have
+      // none. An idempotent call simply runs again.
+      const unknownEffects = Object.values(envelope.toolResults ?? {}).filter(
+        (receipt) =>
+          receipt.stage === 'executing' &&
+          !(receipt.idempotent ?? replayOf(receipt.toolName) === 'idempotent'),
+      );
+      // The outcomes the caller found in the systems those effects touched (2.3).
+      const reconciled = reconciledOutcomes(
+        options.reconciledToolResults,
+        unknownEffects,
+        options.retryToolCallIds,
+      );
       if (
         resume &&
         pendingCheckpoint?.status === 'suspended' &&
@@ -1050,28 +1177,26 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           pendingClientCalls: pendingClients,
         };
         settledOutcome = outcome;
-        repairable = true;
+        // A failed run being re-entered (2.3) is still failed in the store.
+        repairable = !retrying;
         return;
       }
-      // A local tool shadows an MCP tool of the same name, as in the loop's merge.
-      const replayOf = (name: string): AgentTool['replay'] =>
-        options.tools && Object.hasOwn(options.tools, name)
-          ? options.tools[name]!.replay
-          : nativeMcp?.replayOf(name);
-      const unreconciled = Object.values(envelope.toolResults ?? {}).filter(
-        (receipt) =>
-          receipt.stage === 'executing' &&
-          // The policy the receipt recorded (2.3) is that of the tool that ran
-          // the call, a handoff target's own included. Older receipts have none.
-          !(receipt.idempotent ?? replayOf(receipt.toolName) === 'idempotent') &&
-          !options.retryToolCallIds?.includes(receipt.toolCallId),
-      );
-      if (resume && unreconciled.length) {
+      if (
+        resume &&
+        unknownEffects.some(
+          (receipt) =>
+            !options.retryToolCallIds?.includes(receipt.toolCallId) &&
+            !reconciled.has(receipt.toolCallId),
+        )
+      ) {
         // This is a recoverable interruption, so do not replace the checkpoint
         // with a terminal record that would prevent an explicit reconciliation.
         // Which calls are unknown is part of the result (2.3), and each is
-        // reported on the stream as an unknown effect.
-        for (const receipt of unreconciled) {
+        // reported on the stream as an unknown effect. A stop writes nothing,
+        // so it names every call the store still holds as unknown, also those
+        // this resume would have retried or reconciled: the next resume must
+        // settle them all.
+        for (const receipt of unknownEffects) {
           emitPart(
             {
               type: 'tool-state',
@@ -1087,7 +1212,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           ...base(),
           status: 'stopped',
           reason: 'tool-reconciliation-required',
-          unknownEffects: structuredClone(unreconciled),
+          unknownEffects: structuredClone(unknownEffects),
         };
         settledOutcome = outcome;
         return;
@@ -1128,7 +1253,38 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         });
       }
       if (clientResults.length) envelope.pendingClientCalls = [];
+      // A reconciled effect (2.3) landed: its receipt takes the outcome the
+      // caller found, so the step goes on from it as from a recorded raw result
+      // (validated and projected like the tool's own) and the call never runs
+      // again. One that failed there answers the call with its error.
+      for (const [key, receipt] of Object.entries(envelope.toolResults ?? {})) {
+        const found =
+          receipt.stage === 'executing' ? reconciled.get(receipt.toolCallId) : undefined;
+        if (!found) continue;
+        envelope.toolResults![key] = found.isError
+          ? {
+              ...receipt,
+              stage: 'failed',
+              error:
+                typeof found.output === 'string'
+                  ? found.output
+                  : (JSON.stringify(found.output) ?? String(found.output)),
+              reconciled: true,
+            }
+          : { ...receipt, stage: 'executed', rawResult: found.output, reconciled: true };
+      }
+      // An accepted catalog change (2.3) is recorded by this first write,
+      // before any model call, and reported like a hot refresh's.
+      if (acceptedCatalog) {
+        envelope.binding.mcp = acceptedCatalog.catalog;
+        runWarnings.add({
+          type: 'other',
+          setting: 'mcp',
+          message: `MCP tool catalog changed across resume (${acceptedCatalog.drift}); the run's resume binding now records the new catalog.`,
+        });
+      }
       delete envelope.result;
+      delete envelope.retry;
       await persist();
 
       const checkpointStore: SessionStore = {
@@ -1160,6 +1316,24 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             now: resolveDependencies(options.deps).clock.now(),
           });
         return true;
+      };
+
+      /** The requests on the run's ledger now (2.3, for `retryFailed`). */
+      const ledgerRequests = (): ReadonlySet<string> =>
+        new Set(common.execution!.ledger.snapshot().reservations.map((entry) => entry.requestId));
+      /**
+       * Whether the model call that just failed broke off (2.3): the run's own
+       * last call since `before`, sent, and left with an unknown outcome. Such a
+       * call fails with whatever error the runtime raises for a broken stream.
+       */
+      const brokeOff = (before: ReadonlySet<string>): boolean => {
+        const { ledger, scopeId } = common.execution!;
+        const own = ledger
+          .snapshot()
+          .reservations.filter(
+            (entry) => entry.scopes.at(-1)?.id === scopeId && !before.has(entry.requestId),
+          );
+        return own.at(-1)?.state === 'unknown';
       };
 
       const checkLimit = async (): Promise<boolean> => {
@@ -1340,6 +1514,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           for (;;) {
             snapshot = undefined;
             const before = envelope.modelSteps;
+            const legRequests = ledgerRequests();
             const legCheckpoint = envelope.checkpoints[envelope.runId];
             // Fail-over routing (2.3), by the loop's step index: the model each
             // step meant and the one it went to, and which steps produced
@@ -1449,6 +1624,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               continue;
             }
             if (heldError) emitPart(heldError, 'running');
+            callFailure = { error: loop.error, brokeOff: brokeOff(legRequests) };
             throw loop.error;
           }
           if (loop.pendingApprovals.length || loop.pendingClientCalls.length) {
@@ -1571,6 +1747,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             : undefined;
           const toolRequest = await finalizeToolRequest();
           const spentBefore = common.execution!.ledger.totals(common.execution!.scopeId).spent.usd;
+          const attemptRequests = ledgerRequests();
           const inner = runStream(
             {
               ...common,
@@ -1690,6 +1867,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               continue;
             }
             if (heldError) emitPart(heldError, 'finalizing');
+            callFailure = { error: streamError, brokeOff: brokeOff(attemptRequests) };
             throw streamError;
           }
           // A request that rides the loop's tools is a loop-style call, so the
@@ -1886,6 +2064,14 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       // A failed durable commit must never publish a successful completion.
       // Keep the last persisted recovery point rather than overwriting it.
       if (!persistFailed && common && admitted) {
+        // A transient cause (2.3) is recorded with the failure, additively, so
+        // `retryFailed` may go on from the run's last checkpoint.
+        const cause = transientCause(error);
+        if (cause)
+          envelope.retry = {
+            cause,
+            phase: envelope.phase === 'finalizing' ? 'finalizing' : 'running',
+          };
         try {
           await finish(failed);
         } catch {

@@ -22,7 +22,8 @@ import type { ToolSet } from '../types/tool';
 import type { McpLoopEntry } from '../types/config';
 import type { ResolvedDependencies } from '../types/deps';
 import type { CallWarning } from '../types/methods';
-import type { AgentMcpEntry, AgentMcpReplay } from '../types/agent-run';
+import type { Message } from '../types/message';
+import type { AgentMcpEntry, AgentMcpReplay, AgentToolReceipt } from '../types/agent-run';
 import { resolveMcpForLoop, type ResolvedMcpRuntime } from '../mcp/resolve';
 import { detectToolDrift, fingerprintTools, type ToolFingerprints } from '../mcp/shared';
 
@@ -152,6 +153,14 @@ export async function resolveNativeMcp(
   }
 }
 
+/** A catalog from `AgentRunEnvelope.binding.mcp`. */
+function parseCatalog(text: string): ToolFingerprints {
+  const value = JSON.parse(text) as Partial<ToolFingerprints> | null;
+  if (!value || typeof value.tools !== 'object' || value.tools === null)
+    throw new TypeError('Invalid MCP tool catalog in the native binding.');
+  return value as ToolFingerprints;
+}
+
 /**
  * How the catalog the run recorded differs from the servers' current one, as
  * text for an error or warning; `undefined` when it does not. Nothing recorded
@@ -164,18 +173,56 @@ export function catalogDrift(
   current: string | undefined,
 ): string | undefined {
   if (recorded === undefined) return undefined;
-  const parse = (text: string): ToolFingerprints => {
-    const value = JSON.parse(text) as Partial<ToolFingerprints> | null;
-    if (!value || typeof value.tools !== 'object' || value.tools === null)
-      throw new TypeError('Invalid MCP tool catalog in the native binding.');
-    return value as ToolFingerprints;
-  };
-  const before = parse(recorded);
+  const before = parseCatalog(recorded);
   const after: ToolFingerprints =
-    current === undefined ? { algorithm: 'sha-256', tools: {}, fingerprint: '' } : parse(current);
+    current === undefined
+      ? { algorithm: 'sha-256', tools: {}, fingerprint: '' }
+      : parseCatalog(current);
   const drift = detectToolDrift(before, after);
   const parts = (['added', 'removed', 'changed'] as const)
     .filter((kind) => drift[kind].length > 0)
     .map((kind) => `${kind}: ${drift[kind].join(', ')}`);
   return parts.length > 0 ? parts.join('; ') : undefined;
+}
+
+/**
+ * Whether one of the run's calls to an MCP tool is still in flight (2.3): its
+ * receipt says `executing` (its outcome is unknown), or the run's last
+ * assistant turn made it and nothing has answered it (it waits for a verdict,
+ * or never started). The model made such a call against the catalog the run
+ * recorded, so a resume never accepts a changed catalog under it: settling the
+ * call would run the server's new tool in its place. A tool counts as an MCP
+ * tool when either catalog lists it, a local tool of the same name included.
+ */
+export function mcpCallInFlight(
+  messages: readonly Message[],
+  receipts: Readonly<Record<string, AgentToolReceipt>> | undefined,
+  catalogs: readonly (string | undefined)[],
+): boolean {
+  const names = new Set(
+    catalogs.flatMap((catalog) =>
+      catalog === undefined ? [] : Object.keys(parseCatalog(catalog).tools),
+    ),
+  );
+  if (
+    Object.values(receipts ?? {}).some(
+      (receipt) => receipt.stage === 'executing' && names.has(receipt.toolName),
+    )
+  )
+    return true;
+  // The last assistant turn; only tool messages may follow it.
+  const answered = new Set<string>();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const { role, content } = messages[i]!;
+    if (role === 'tool') {
+      if (Array.isArray(content))
+        for (const part of content) if (part.type === 'tool_result') answered.add(part.toolUseId);
+      continue;
+    }
+    if (role !== 'assistant' || !Array.isArray(content)) return false;
+    return content.some(
+      (part) => part.type === 'tool_use' && names.has(part.name) && !answered.has(part.id),
+    );
+  }
+  return false;
 }

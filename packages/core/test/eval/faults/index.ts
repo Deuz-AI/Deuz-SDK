@@ -5,17 +5,23 @@
  * projection or memory write, fallback attempt and its settlement).
  */
 import type { EvalTaskManifest } from '../../../src/testing';
-import { mcpRefreshListFailure, mcpRefreshRecordFailure } from './mcp-boundaries';
+import {
+  mcpRefreshListFailure,
+  mcpRefreshRecordFailure,
+  mcpRefreshRecordFailureAccepted,
+} from './mcp-boundaries';
 import {
   childInitialization,
   maxTokensMidToolCall,
   midStream,
+  midStreamRetried,
   refusalMidToolCall,
   verifierAbort,
   verifierDeadline,
 } from './model-boundaries';
 import {
   admissionStoreFailure,
+  admissionStoreFailureRetried,
   leaseLoss,
   leaseRenewFailure,
   settleFailure,
@@ -26,6 +32,7 @@ import {
   afterApproval,
   afterEffect,
   afterEffectIdempotent,
+  afterEffectReconciled,
   afterReceipt,
   beforeDispatch,
 } from './tool-boundaries';
@@ -35,8 +42,10 @@ export const faultScenarios: readonly EvalTaskManifest[] = [
   afterApproval,
   afterEffect,
   afterEffectIdempotent,
+  afterEffectReconciled,
   afterReceipt,
   midStream,
+  midStreamRetried,
   verifierAbort,
   verifierDeadline,
   childInitialization,
@@ -44,10 +53,12 @@ export const faultScenarios: readonly EvalTaskManifest[] = [
   leaseLoss,
   leaseRenewFailure,
   admissionStoreFailure,
+  admissionStoreFailureRetried,
   settleFailure,
   spawnCommitFailure,
   mcpRefreshListFailure,
   mcpRefreshRecordFailure,
+  mcpRefreshRecordFailureAccepted,
   refusalMidToolCall,
   maxTokensMidToolCall,
 ];
