@@ -50,6 +50,49 @@ for await (const part of result.fullStream) {
 | `tool-state.denied` / `.deniedReason` | An approval **refused** a gated call | Optional fields qualifying a terminal `state: 'error'` whose cause was a verdict, not a thrown tool. Set by the streaming loop at both terminal sites; `deniedReason` is the denier's own words (absent for a server-mode `approveToolCall`, whose verdict is a bare boolean). `ToolRunState` deliberately gains no 7th member, so exhaustive switches keep compiling. |
 | `data.id` | `writeData(name, payload, { id })` | Reconciliation key. The wire stays strictly append-only; last-write-wins is the client's job. |
 
-**Wire v1 output is unchanged in every byte.** The `tool-state` fields and the data-part `id` ride carriers a v1 client already drops wholesale, and the two brand-new part types are v2-only — including when they sit inside a `sub-agent` frame, which is filtered recursively.
+**1.9 left wire v1 output unchanged in every byte.** The `tool-state` fields and the data-part `id` ride carriers a v1 client already drops wholesale, and the two brand-new part types are v2-only — including when they sit inside a `sub-agent` frame, which is filtered recursively. 2.3 does not keep that property; see [Wire versions in 2.3](#wire-versions-in-23).
+
+### Additive fields in 2.3
+
+2.3 adds no member to `StreamPart` or to `DeuzUIPart`. It adds optional fields to parts that already exist, and `toDeuzStreamResponse` (and `toDeuzAgentStreamResponse`, which frames a native run's parts the same way) forwards them on the [UI wire](/docs/modules/ui-streaming#wire-part-types). A field that is absent means what it meant in 2.2.
+
+| Wire frame and field | Canonical source on `fullStream` | Wire versions | Notes |
+| --- | --- | --- | --- |
+| `text-delta.providerMetadata` | `TextDeltaPart.providerMetadata` (new) | v1 and v2 | The text's provider round-trip data, such as a Gemini `thoughtSignature` on a plain text part. It often arrives on a final chunk whose `text` is empty. `applyUIPart` merges it onto the UI text part, and `assistantMessageFromTurn` and `canonicalFromUI` send it back with the text. Never display it. |
+| `reasoning-delta.id`, `.encrypted`, `.redacted`, `.source`, `.data` | `ReasoningDeltaPart.id`, `.redacted`, `.source` (new) and `.encrypted` (older; the wire dropped it before 2.3) | v1 and v2 | `id` names the block, and deltas of one block share it. `encrypted` (OpenAI) and `redacted` (Anthropic `redacted_thinking`) mark an opaque payload: the frame carries it in `data` and sends an empty `text`, so a reader that predates these fields and appends `text` shows nothing for the block. `source` is the provider family that produced the block. `applyUIPart` keeps one UI part per block: a new `id` opens the next block, an opaque block is always a part of its own, and the payload is read back from `data`. |
+| `tool-call.providerMetadata` | `ToolCallPart.providerMetadata` (new) | v1 and v2 | The `providerMetadata` of the call's `tool_use` part, such as a Gemini function call's `thoughtSignature`. `applyUIPart` keeps it on `UIToolCall.providerMetadata` when it is a plain object, so the history a chat client posts sends the call back as the provider produced it. Never display it. |
+| `tool-result.outcome` | `ToolResultStreamPart.outcome` (new) | v1 and v2 | The `ToolCallOutcome` of an error result: `'tool-error'`, `'permission-denied'` or `'approval-denied'`. A successful result carries none. |
+| `tool-state.outcome` | `ToolStatePart.outcome` (new) | v2 only | Set with a terminal `state: 'error'` (`'unknown-effect'` for each call a native resume stops on for reconciliation) and with `'awaiting-approval'` (`'approval-pending'`). `tool-state` is a v2 part, so a v1 client never sees it. `applyUIPart` keeps the latest `tool-state` or `tool-result` value on `UIToolCall.outcome`: a frame without one clears it, and a value the client does not know is ignored. |
+| `step-finish.stopDetails` | `StepFinishPart.providerMetadata` (new), read as on `finish` | v1 and v2 | The step's `StopDetails`. `applyUIPart` does not keep it: `AssistantTurnState.steps` holds usage and finish reason only. |
+| `finish.stopDetails` | `FinishStreamPart.providerMetadata` (`anthropic.stop_details`) | v1 and v2 | The provider's explanation of an early stop, normalized like `StreamChatResult.stopDetails`: `{ type, category?, explanation? }`, today from Claude's refusal (`finishReason: 'content_filter'`). The `explanation` passes the secret redactor. Absent when the provider explained nothing. `applyUIPart` keeps it on `AssistantTurnState.stopDetails`. |
+| `tool-approval-request.approvalId` | `ToolApprovalRequestPart.approvalId` | v1 and v2 | A changed value, not a new field: the tool call id, `@`, and 24 hex digits of a digest that binds the approval to the call it was issued for (the tool, the arguments and the sub-agent path, and in a durable or native run the run and the step it suspended at). Treat it as opaque and send it back unchanged on the verdict. A verdict that names only the tool call id still counts when the run used that id once ([approval binding](/docs/modules/native-agents#strict-checkpoints-and-approval-resume)). |
+| `warning.warning.type: 'unpriced-model'` | `WarningPart.warning` | v2 only | A new value of the open `CallWarning['type']` union: a model without a price ran under a USD budget. Reported once per model per run. |
+
+`useChat` (`@deuz-sdk/react`) reads these fields; the frozen `@deuz-sdk/core/react` hook ignores them.
+
+### Wire versions in 2.3
+
+A response negotiated to v1 still has no `id:` lines and no v2-only part. It is not byte-identical to 2.2 output any more: the fields above marked "v1 and v2" ride parts a v1 client already receives (`text-delta`, `reasoning-delta`, `tool-call`, `tool-result`, `step-finish`, `finish`), and `approvalId` has its new form. A client that does not know a key ignores it, so a 2.2 reader keeps working. `tool-state.outcome`, the `'unpriced-model'` warning and the native agent frames below ride v2-only parts.
+
+### Native agent frames (2.3)
+
+`toDeuzAgentStreamResponse` serializes a native run (`streamAgent`, `resumeStreamAgent`). Its ordinary parts go out as above. What only a native run has goes out as `data-agent` parts on the existing `data-${string}` member: `{ type: 'data-agent', id: <kind>, payload: { kind, seq, … } }`. The `id` is the frame's kind, so a reader that knows nothing of agent frames reconciles each kind in place.
+
+| `payload.kind` | Fields | When |
+| --- | --- | --- |
+| `run` | `seq`, `runId?`, `status: 'running'` | The first frame of every leg, fresh or resumed. `runId` is the serializer's `runId` option. |
+| `phase` | `seq`, `phase: 'running' \| 'finalizing'` | The run entered the tool loop or the finalization. |
+| `partial` | `seq`, `attempt`, `value` | A draft of the structured output. Never validated. |
+| `element` | `seq`, `attempt`, `index`, `value` | An array element the run's element validator accepted. Still a draft. |
+| `result` | `seq`, `runId`, `status`, `usage?`, `modelSteps?`, `verification?`, `stopDetails?`, and per status `output` (`completed`), `pendingApprovals` and `pendingClientCalls` (`suspended`), `reason` and `unknownEffects?` (`stopped`), or `error` (`failed`) | The leg's terminal state. It never carries the transcript, a raw tool result, a receipt or the accounting ledger. A failure's message is secret-redacted, and a failed run also gets one `error` part. |
+
+- **`seq` is the frame's own SSE event id**, the number on its `id:` line. With `store` and `streamId`, every leg journaled under that `streamId` numbers on from the last stored event, so `seq` grows across the whole run and is the cursor a replay resumes after. Without a store, each response numbers from 0.
+- **v2 only.** `data-*` parts are v2 parts, so a client that negotiated v1 gets the run's ordinary parts and no frame.
+- **A refused leg is detached.** A leg the run refuses before it begins (another executor holds the run, another scope, an unknown run, invalid options) goes out on its own response with no `id:` lines and is not journaled. Its frames still number from 0, and fold on their own.
+- **Folding.** `agentStateFromParts` and `applyUIPart` (into `AssistantTurnState.agent`) apply a frame only when its `seq` is above the state's, so a replay or an out-of-order frame applies nothing twice. A malformed frame is ignored, and an app's own `data-agent` part whose payload is no agent frame stays an ordinary data part.
+
+See [Native agent runs](/docs/modules/ui-streaming#native-agent-runs-todeuzagentstreamresponse-23) for the route and client code.
+
+The 2.3 wire fields are pinned by `test/ui-display.test.ts`, `test/chat-reasoning.test.ts`, `test/ui-text-signature.test.ts` and `test/ui-agent.test.ts` in `packages/core`.
 
 Run the focused protocol suite with `npm run test:protocol`.
