@@ -500,10 +500,11 @@ export async function runHeadless<T = string>(
  * Each pending action names its option (`approvalResponses`,
  * `clientToolResults`, and `retryToolCallIds` or `reconciledToolResults` for
  * an unknown effect); a report with `retry` takes `retryFailed: true`. An
- * answer the run cannot take (a call it does not wait on, a call both run
- * again and recorded, a retry of a failure that was not transient) fails the
- * leg with a TypeError before anything is written: the stored run stays as
- * it was.
+ * answer the run cannot take (a client or recorded result for a call it does
+ * not wait on, a call both run again and recorded, a retry of a failure that
+ * was not transient) fails the leg with a TypeError before anything is
+ * written: the stored run stays as it was. A verdict or a retry ID that
+ * matches no pending call is ignored.
  */
 export async function resumeHeadless<T = string>(
   options: HeadlessResumeOptions<T>,

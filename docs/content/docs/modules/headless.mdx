@@ -81,7 +81,7 @@ output; it must not throw.
 | `retry` | The stored run failed in transit and a resume can re-enter it: `cause`, `phase`, `resumeWith: 'retryFailed'` ([below](#a-run-that-failed-in-transit)) |
 | `pending` | What a pending run waits for, and the resume option that answers each |
 | `usage`, `modelSteps` | Token usage and model calls so far |
-| `cost` | `usd`, `complete`, `unpricedCalls`, `unknownCalls`, from the run's budget ledger; absent when there is no ledger to read (a leg refused before it started) |
+| `cost` | `usd`, `complete`, `unpricedCalls`, `unknownCalls`, from the run's budget ledger; absent when there is none to read (a leg refused before it read the run's ledger, such as a fresh run under a run ID that is taken) |
 | `verification` | The verifier's last verdict (`verified`, `rejected`, `inconclusive`), when the run has a `verify` that ran |
 | `warnings` | The leg's `CallWarning`s (`inspectRun` reports none) |
 | `output`, `text` | A completed run's accepted output; the final text |
@@ -168,10 +168,14 @@ console.log(done.outcome, done.output, exitCodeFor(done)); // completed Deployed
 
 Resume with the same model, tools, skills and output as the first leg: the
 run's binding rejects a change, and that resume fails (exit 1) without
-touching the stored run. So does an answer the resume cannot take: a call the
-run does not wait on, a call listed in both `retryToolCallIds` and
+touching the stored run. So does an answer the resume cannot take: a client
+result or a recorded result (`reconciledToolResults`) for a call the run does
+not wait on, a call listed in both `retryToolCallIds` and
 `reconciledToolResults`, or `retryFailed` for a failure that was not
-transient. The leg fails with a `TypeError` before anything is written.
+transient. The leg fails with a `TypeError` before anything is written. A
+verdict or a `retryToolCallIds` entry that matches no pending call is
+ignored; a resume that answers nothing else leaves the run waiting (exit 3)
+and writes nothing.
 
 `inspectRun` reads a run without a model call. A run with no result yet
 reports `status: 'in-progress'` and a pending `resume`, plus each call that
@@ -360,6 +364,7 @@ process.exitCode = exitCodeFor(report); // 8 when a finding is an error
 
 | Report field | Meaning |
 | --- | --- |
+| `kind`, `version` | `'deuz-headless-doctor'`, `1` |
 | `ok` | No finding is an error |
 | `model`, `support` | Provider, model id and protocol; `pinned` (a registry row), `family` (the Claude 5.x family rules) or `unknown` (the conservative fallback) |
 | `profile` | The full [model profile](/docs/modules/model-profiles): effort mapping, thinking, limits, sampling, clamps, sources |

@@ -309,6 +309,8 @@ describe('runHeadless (headless preview)', () => {
     expect(again.outcome).toBe('failed');
     expect(again.error?.message).toMatch(/already exists/);
     expect(again.phase).toBe('terminal');
+    // Refused before it read the run's ledger: the leg has no cost of its own.
+    expect(again.cost).toBeUndefined();
     expect((await inspectRun(store, 'taken')).outcome).toBe('completed');
   });
 });
@@ -424,6 +426,42 @@ describe('resumeHeadless with the 2.3 durability options (headless preview)', ()
       expect.objectContaining({ kind: 'unknown-effect', toolCallId }),
       { kind: 'resume', phase: 'running' },
     ]);
+  });
+
+  it('ignores a verdict or a retry that matches no pending call: the run waits on, unchanged', async () => {
+    // A verdict for an approval the run does not wait on answers nothing.
+    const store = createInMemoryAgentRunStore();
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'deploy', args: { env: 'prod' } }] }],
+    });
+    await runHeadless({ model, prompt: 'Deploy.', tools: deployTools, store, runId: 'stray' });
+    const suspended = await store.load('stray');
+    const verdict = await resumeHeadless({
+      model,
+      tools: deployTools,
+      store,
+      runId: 'stray',
+      approvalResponses: [{ approvalId: 'nope', approved: true }],
+    });
+    expect(verdict).toMatchObject({ status: 'suspended', outcome: 'pending' });
+    expect(verdict.pending).toEqual([expect.objectContaining({ kind: 'approval' })]);
+    expect(exitCodeFor(verdict)).toBe(HEADLESS_EXIT_CODES.pending);
+    expect(await store.load('stray')).toEqual(suspended);
+
+    // Nor does a retry of a call whose effect is not unknown: the run stops again.
+    const { memory, charges, tools, model: payModel } = await unknownCharge();
+    const stuck = await memory.load('pay');
+    const retry = await resumeHeadless({
+      model: payModel,
+      tools,
+      store: memory,
+      runId: 'pay',
+      retryToolCallIds: ['nope'],
+    });
+    expect(retry).toMatchObject({ reason: 'tool-reconciliation-required', outcome: 'pending' });
+    expect(exitCodeFor(retry)).toBe(HEADLESS_EXIT_CODES.pending);
+    expect(await memory.load('pay')).toEqual(stuck);
+    expect(charges).toEqual([1]);
   });
 
   it('reports a run that failed in transit as retryable, and re-enters it with retryFailed', async () => {
