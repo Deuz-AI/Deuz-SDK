@@ -1,0 +1,995 @@
+---
+title: What is new in 2.3
+description: One path for every tool call, native memory, chat and model fail-over, usage billed once and models without a price, Claude 5.x request rules and preserved thinking, the MCP 2026-07-28 client and an MCP server, A2A, realtime voice, batch requests, Redis backends, goals, evals and a headless preview, with the release's upgrade notes and known limits.
+---
+
+2.3 completes the native runtime and delivers what the 2.2 notes deferred.
+Every tool call now takes one path through policy, approval, budget admission
+and an effect receipt, and native runs gain memory, a chat projection and model
+fail-over. Usage is billed once, a model without a price no longer breaks a USD
+budget, and requests follow each model's documented rules, Claude 5.x preserved
+thinking included. The MCP 2026-07-28 client, an MCP server, A2A, realtime
+voice, provider batch APIs and Redis backends ship, and goals, versioned evals
+and a headless preview are new.
+
+Every change to the public API is additive, so 2.2 code compiles against 2.3,
+except an exhaustive `switch` over one of the [widened unions](#widened-unions)
+and a hand-built `RedisStores`. Some defaults and request shapes change on
+purpose, and some data that 2.3 writes needs 2.3 to resume: read
+[Upgrading from 2.2](#upgrading-from-22) before you deploy.
+
+<Callout type="info" title="Verified offline">
+Nothing in 2.3 was run against a model provider or a third-party service.
+Provider and protocol behaviour comes from the providers' documentation and the
+types of their official SDK packages, and is tested offline: against scripted
+models and sockets, in-memory stand-ins of the provider APIs, and the official
+MCP and A2A SDKs in-process. Where this page or a module page says **not
+live-verified**, make one real call before you depend on it.
+</Callout>
+
+## Install and choose an entry
+
+```bash
+npm install @deuz-sdk/core@2.3.0
+```
+
+`@deuz-sdk/react` 2.3.0 ships with it. Its peer range still accepts core 2.0
+and later; its native-route features need core 2.3. No runtime dependency is
+added. Two optional peers are new and one is wider:
+`@modelcontextprotocol/client` (`^2.3.1`, the MCP 2026-07-28 client line),
+`@modelcontextprotocol/server` (`^2.3.1`, the MCP server), and `redis`, which
+now also accepts node-redis 6.
+
+| Entry                             | New surface                                                                                                                                     | Runtime   |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| `@deuz-sdk/core/mcp/server`       | `createMcpServer`                                                                                                                               | Edge-safe |
+| `@deuz-sdk/core/mcp/server/stdio` | `serveMcpStdio`                                                                                                                                 | Node      |
+| `@deuz-sdk/core/a2a`              | `fetchAgentCard`, `createA2AClient`, `createA2AHandler`, `createInMemoryA2ATaskStore`, `a2aText`, `A2AError`                                    | Edge-safe |
+| `@deuz-sdk/core/realtime`         | `createRealtimeSession`, `createOpenAIRealtime`, `createGeminiLive`, `createOpenAIClientSecret`, `createGeminiAuthToken`, `realtimePriceTable` | Edge-safe |
+| `@deuz-sdk/core/batch`            | `createBatchClient`, `createMemoryBatchJobStore`, `BatchError`                                                                                  | Edge-safe |
+| `@deuz-sdk/core/ops/redis`        | `createRedisOpsStore`, `createRedisBudgetStore`, `wrapIoredisClient`                                                                            | Node      |
+| `@deuz-sdk/core/swarm/redis`      | `createRedisSwarmStore`                                                                                                                         | Node      |
+| `@deuz-sdk/core/goal`             | `createGoal`, `transitionGoal`, `assessGoal`, the event builders, `createInMemoryGoalStore`                                                     | Edge-safe |
+| `@deuz-sdk/core/headless`         | `runHeadless`, `resumeHeadless`, `inspectRun`, `doctor`, `loadProjectInstructions` (preview)                                                    | Node      |
+
+`resolveModelProfile`, `PRICE_ALIASES` and `UnpricedModelError` join the root
+entry. `reconcileAgentRun` joins `@deuz-sdk/core/agent`, `findStaleAgentRuns`
+and `agentRunLeaseKey` join `@deuz-sdk/core/ops`, `toDeuzAgentStreamResponse`
+and `agentStateFromParts` join `@deuz-sdk/core/ui`, `runEvalSuite` joins
+`@deuz-sdk/core/testing`, `CheckpointVersionError` joins
+`@deuz-sdk/core/durable`, and `wrapIoredisClient` joins
+`@deuz-sdk/core/stores/redis`. In `@deuz-sdk/react`, `useChat` returns `agent`
+and `stopDetails`.
+
+## One path for every tool call
+
+Every tool call of a run now passes the same gates in the same order: the
+finish-reason gate, the execution policy, the approval gate, budget admission,
+the effect receipt, execution, `onToolResult` and the step checkpoint. The
+buffered loop, the streaming loop and the settle of a resume share one
+implementation of everything before execution. The path serves local tools,
+MCP tools, handoff transfers, swarm blackboard tools, the calls of spawned
+swarm tasks and of sub-agents, and the model calls of evolve mutations and MCP
+sampling requests. See
+[One path for every tool call](/docs/modules/native-agents#one-path-for-every-tool-call).
+
+- **Refused and cut-off turns dispatch nothing.** A turn the provider refused
+  (`content_filter`, Anthropic `refusal`) or cut off (`length`, `max_tokens`)
+  no longer runs its tool calls, whose arguments can be truncated JSON. The
+  provider's explanation is `stopDetails` on the results of `generateText`,
+  `streamChat`, `generateObject`, `streamObject` and native runs, and a native
+  run that ends on a refusal stops with reason `'refusal'`.
+- **Every ending has a name.** `ToolCallOutcome` (`'tool-error'`,
+  `'permission-denied'`, `'approval-denied'`, `'approval-pending'`,
+  `'unknown-effect'`) marks error results and tool-state parts; a successful
+  result carries none. A resume that stops for reconciliation lists the open
+  calls in `AgentResult.unknownEffects`.
+- **Approvals bind to their call.** `approvalId` is the tool call id followed by
+  a digest of the run, the step, the sub-agent path, the call, the tool and its
+  arguments, so a verdict kept from one gate never approves another call.
+- **MCP tools in native runs** take effect receipts, and the servers' tool
+  catalog is part of the resume binding. A catalog that changes mid-run stops a
+  native run by default. See [MCP in native runs](/docs/modules/native-mcp).
+- **Handoffs work in native runs.** Native tool preparation used to drop the
+  transfer marker. A transfer now hands the run over and takes the policy and
+  the approval gate, and the target's tools carry receipts.
+- **Going on after a failure is opt-in.** A resume can record an effect that
+  landed (`reconciledToolResults`), retry a run that failed in transit
+  (`retryFailed: true`), and accept a catalog change it missed
+  (`onCatalogChange: 'accept'`). See
+  [When the store fails](/docs/modules/native-agents#when-the-store-fails) and
+  [When a model call fails](/docs/modules/native-agents#when-a-model-call-fails).
+- **Leases and listing.** `runAgent`, `streamAgent` and their resume functions
+  take `lease: { provider, owner?, ttlMs? }`, so two processes never drive one
+  run, and a `'cancel'` signalled to the run's key stops it with reason
+  `'cancelled'`. `AgentRunStore.list` pages through stored runs, and
+  `findStaleAgentRuns` finds those whose executor is gone. See
+  [Listing, leasing and cancelling native runs](/docs/modules/operations#listing-leasing-and-cancelling-native-runs).
+- **Cancellation after verification.** Native runs check cancellation and the
+  deadline again after output validation, guardrails and the verifier, so an
+  abort during verification stops the run with reason `'aborted'`.
+
+{/* W3:RS3 */}
+
+A native resume settles a call whose receipt already holds an outcome (a
+completed receipt, or one recorded with `reconciledToolResults`) from that
+receipt: the recorded result reaches the model, the tool does not run again, and
+the call is not gated for approval again.
+
+{/* /W3:RS3 */}
+
+## Memory, chat and model fail-over in native runs
+
+`runAgent`, `streamAgent`, `resumeAgent` and `resumeStreamAgent` take `memory`,
+`chat` and `fallbackModels`, which 2.2 rejected. Each is bound to the run's
+checkpoint and to its resume binding, so a resume with another memory scope,
+another chat or other fallback models fails before anything is written.
+
+- **Memory.** A new run recalls once, before its first model call, and the
+  memories enter its history as one appended system message, so every step and
+  every resume sends the same prefix. Extraction runs only for a run that
+  completed, after its terminal commit.
+- **Chat.** The run keeps an append-only transcript and writes it to
+  `chat.store` after its own checkpoint, at every suspension and at the end. A
+  chat store failure never fails the run: the next save, a terminal resume or
+  `reconcileAgentRun` repairs it, and a chat that moved on without the run is
+  not overwritten.
+- **Fail-over.** A model call that fails with a retryable error before its
+  first content (network, transport timeout, 5xx, 429 or 529 after its own
+  retries, an open breaker) runs again on the next candidate of
+  `[model, ...fallbackModels]`, inside the same run, budget and checkpoint.
+  Completed tool effects never run again. A refusal, a policy or budget
+  rejection, a cancel, an elapsed deadline or an error after content never
+  fails over.
+
+```ts title="native-fail-over.ts"
+import { createInMemoryAgentRunStore, runAgent } from '@deuz-sdk/core/agent';
+import { createInMemoryChatStore } from '@deuz-sdk/core/chat';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+// A primary that is down: every request answers 503.
+const primary = createOpenAI({
+  apiKey: 'demo',
+  fetch: async () => new Response('{"error":{"message":"unavailable"}}', { status: 503 }),
+})('gpt-5.2');
+
+const store = createInMemoryAgentRunStore();
+const chats = createInMemoryChatStore();
+
+const result = await runAgent({
+  model: primary,
+  fallbackModels: [createMockModel({ responses: [{ text: 'Answered by the fallback.' }] })],
+  maxRetries: 0,
+  prompt: 'Hello?',
+  chat: { store: chats, chatId: 'chat-1', scope: { userId: 'ada' } },
+  session: { store, runId: 'hello-1', scope: 'tenant-a' },
+});
+console.log(result.status, result.text); // completed Answered by the fallback.
+
+const envelope = await store.load('hello-1');
+console.log(envelope?.version, envelope?.models?.attempts.length); // 2 1
+console.log((await chats.loadChat('chat-1'))?.messageIds); // ['hello-1:0', 'hello-1:1']
+```
+
+An envelope that records memory, a transcript, a chat projection or fail-over
+state is written as version 2, which 2.2 refuses to resume.
+`reconcileAgentRun` settles what a run that ended or is suspended left behind:
+a chat projection that is behind, and an extraction that is pending or failed.
+See
+[Memory, chat and model fail-over](/docs/modules/native-agents#memory-chat-and-model-fail-over-23).
+
+## Usage, prices and budgets
+
+- **Every token is billed once.** All four model wires report `outputTokens`
+  with reasoning included and `reasoningTokens` as its share, and `priceUsage`
+  no longer adds reasoning on top. An OpenAI Responses turn with 100 input and
+  1,000 output tokens, 800 of them reasoning, at $2/$10 now costs $0.0102
+  instead of $0.0182. `audioTokens` is a share of the input and output buckets
+  as well.
+- **Price lookup is explicit.** An exact row, then `PRICE_ALIASES`, then both
+  again after dropping one vendor prefix and a trailing snapshot date. The
+  longest-prefix fallback is gone, so an id the table does not know has no
+  price; map your own with `createPriceProvider({ aliases })`.
+- **New and corrected prices**, checked against Anthropic's Claude API
+  reference on 2026-10-06: `claude-opus-5-5` ($4/$20), `claude-sonnet-5-5`
+  ($2/$10) and `claude-haiku-5-5` ($0.10/$0.50 up to 100K prompt tokens,
+  $0.50/$2.50 above); `claude-sonnet-5` moves from $3/$15 to $2/$10.
+  `ModelPrice.tiers` takes any number of long-context cards.
+- **Models without a price** run under a USD budget: their tokens are still
+  reserved and settled, their cost stays out of the USD totals, and the run
+  reports one `unpriced-model` warning per model.
+  `budget.unknownPrice: 'reject'` refuses them before they are sent.
+- **Reservations cover what the provider can bill.** A native reservation
+  prices the output cap the request sends, reasoning included, so parallel
+  calls cannot spend far past a USD budget.
+- **A call whose usage the provider did not report** has an unknown cost on
+  every path, never $0; `UsageMeta.usageAvailable` is `false` for it.
+- **Holds can be found and closed.** `BudgetStore.holds` lists the open holds,
+  `sweep` closes them, and `prune` folds closed history. A failing settlement is
+  retried, and a final failure carries the settlement to replay.
+- **Service tiers.** `priceUsage` takes `{ tier: 'batch' }`. The bundled Claude
+  rows that Anthropic's reference lists carry its batch rates, half the
+  standard ones; other rows have no batch price.
+
+```ts title="unpriced.ts"
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+// This table knows one model; the mock model is not in it.
+const priceProvider = {
+  priceUsage: (model: string) => (model === 'gpt-5.4' ? 0.01 : undefined),
+};
+
+const run = await runAgent({
+  model: createMockModel({ responses: [{ text: 'done' }] }),
+  prompt: 'Summarise the ticket.',
+  budget: { usd: 1 },
+  deps: { priceProvider },
+});
+console.log(run.status); // 'completed'
+console.log(run.accounting?.unpriced); // 1: a call the USD budget could not count
+
+const strict = await runAgent({
+  model: createMockModel({ responses: [{ text: 'done' }] }),
+  prompt: 'Summarise the ticket.',
+  budget: { usd: 1, unknownPrice: 'reject' },
+  deps: { priceProvider },
+});
+if (strict.status === 'failed') console.log(strict.error.code); // 'unpriced_model'
+```
+
+See [Models without a price](/docs/modules/budgets#models-without-a-price),
+[Open holds](/docs/modules/budgets#open-holds) and
+[Model lookup](/docs/modules/pricing#model-lookup).
+
+## Models and requests
+
+`resolveModelProfile(model)` reports what Deuz knows about a model before you
+call it: each capability as supported, unsupported or unknown, the context
+window and output limits, the effort levels and what `'none'` becomes, the
+sampling rules, and every value a request changes, with the warning it
+reports. It makes no network call, and `liveVerified` is always `false`.
+
+```ts title="profile.ts"
+import { resolveModelProfile } from '@deuz-sdk/core';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+
+const anthropic = createAnthropic({ apiKey: 'unused-here' });
+
+const profile = resolveModelProfile(anthropic('claude-opus-5-5'));
+console.log(profile.match, profile.effort.field); // exact output_config.effort
+console.log(profile.limits); // { contextWindow: 1000000, maxOutput: 128000, defaultOutputCap: 128000 }
+
+// An id the registry has no row for gets the Claude 5.x family rules.
+console.log(resolveModelProfile(anthropic('claude-sonnet-6')).match); // family
+```
+
+- **Claude 5.x.** `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`,
+  `claude-haiku-5-5` and `claude-opus-5` are registry rows. Effort rides
+  `output_config.effort`, `temperature` and `top_p` are never sent, structured
+  output uses `output_config.format`, and a forced `toolChoice` is sent as
+  `auto` on Fable 5.1, Opus 5.5 and Sonnet 5.5. An unknown
+  `claude-{fable,opus,sonnet,haiku}-N` id with N ≥ 5 gets the same rules.
+- **More rows** (research-dated, not live-verified): `gpt-6.1-sol`,
+  `gpt-6-astra`, `gpt-6-luna`, `gemini-3.8-flash`, `deepseek-flash`,
+  `kimi-k3`, `kimi-k2.7-code`, `glm-5.3` and `Qwen/Qwen3-Coder-Next`, plus
+  rows for priced models the registry did not know, such as the GPT-5 and
+  GPT-5.6 families, `claude-opus-4-5` and `claude-sonnet-4-5`.
+- **No value changes in silence.** Every value a request changes is reported
+  as a `clamped-setting` or `unsupported-setting` warning.
+- **Output caps.** An unknown model, or a row whose output limit is
+  undocumented, no longer gets a 4,096-token cap on OpenAI and Gemini native;
+  the provider's own default applies.
+- **OpenAI Responses is stateless by default.** Every request sends
+  `store: false`, and a reasoning model always asks for its encrypted reasoning,
+  so the next turn can replay it.
+- **Structured output keeps the conversation's tools** on the Anthropic and both
+  OpenAI wires, beside the output format.
+
+See [Model profiles](/docs/modules/model-profiles).
+
+## Preserved thinking on Claude 5.x
+
+Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind each thinking block
+to the conversation before it. The top-level system prompt, the tools array and
+every earlier message have to reach the API byte-identical on every later
+request, or the replayed block is invalid; on accounts opened from 2026-08-31
+that is a 400. The agentic loops now keep that prefix stable for these models:
+
+| Source of change                                       | 2.2, and every other model                    | Claude 5.x in 2.3                                  |
+| ------------------------------------------------------ | --------------------------------------------- | -------------------------------------------------- |
+| A system message in the middle of the history          | Folded into the top-level system prompt       | Sent in place                                      |
+| Memory recall                                          | Spliced into the system prompt at every call  | One appended system message per user turn          |
+| Handoff instructions                                   | Replace the leading system turn               | Appended after the transfer's tool result          |
+| A step that offers other tools                         | A different `tools` array                     | The same array, plus an appended tool-set change   |
+| Compaction and overflow recovery                       | Layered: prune, prune, summary                | One summary replaces the conversation              |
+
+A request that replays thinking to these models also asks the API to drop a
+mismatched block instead of failing (`block_binding` with
+`prefix_mismatch_behavior: 'drop_block'`), so that is the safety net rather
+than the normal path. Reasoning blocks round-trip intact on every model: each
+block is its own `reasoning` part, two consecutive thinking blocks stay two
+parts with their own signatures, `redacted_thinking` is kept, and each wire
+replays only the reasoning of its own provider family. DeepSeek and Kimi get
+their `reasoning_content` back on tool-call turns. Not live-verified. See
+[Preserved thinking](/docs/agents/preserved-thinking) and
+[One part per block](/docs/core/messages#one-part-per-block-23).
+
+## MCP: the 2026-07-28 client and an MCP server
+
+**The client speaks MCP 2026-07-28.** That revision ships only in the v2
+TypeScript SDK, so the client is dual-stack over two optional peers:
+`@modelcontextprotocol/client` (v2) and `@modelcontextprotocol/sdk` (v1, the
+2.2 line). `sdk: 'auto'`, the default, picks v2 when its package can be
+imported. The v2 line asks `server/discover` and falls back to the 2025-era
+`initialize` handshake. HTTP, SSE and stdio, OAuth, sampling, roots,
+elicitation, reconnect, keepalive and hot refresh work on both lines, and
+`listTools()` now reads every page of a paginated catalog. See
+[SDK lines and protocol revisions](/docs/modules/mcp#sdk-lines-and-protocol-revisions-23).
+
+**An MCP server.** `createMcpServer` publishes a `ToolSet`, native agent tools
+and whole agents. `server.fetch` is a fetch-native Streamable HTTP handler, and
+`serveMcpStdio` serves the same handle over stdio. A served call runs the
+loop's pipeline in the loop's order: the schema check, `onToolCall`, the
+approval gate (by default an elicitation the client's user answers),
+`execute` and `onToolResult`. One definition answers 2026-07-28 clients and,
+through a stateless fallback, 2025-era ones.
+
+```ts title="mcp-server.ts"
+import { tool } from '@deuz-sdk/core';
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+import { createMcpServer } from '@deuz-sdk/core/mcp/server';
+
+const forecast = tool({
+  description: 'Tomorrow’s forecast for a city.',
+  parameters: {
+    type: 'object',
+    properties: { city: { type: 'string' } },
+    required: ['city'],
+    additionalProperties: false,
+  },
+  execute: async (args) => ({ city: (args as { city: string }).city, highC: 24 }),
+});
+
+const server = createMcpServer({ name: 'weather', version: '1.0.0', tools: { forecast } });
+
+// The client talks straight into server.fetch: no socket, no key.
+const client = await createMcpClient({
+  transport: {
+    type: 'http',
+    url: 'http://weather.local/mcp',
+    fetch: (input, init) => server.fetch(new Request(input, init)),
+  },
+});
+console.log(client.sdk?.(), client.protocolVersion?.()); // v2 2026-07-28
+console.log(await client.callTool('forecast', { city: 'Izmir' })); // { city: 'Izmir', highC: 24 }
+await client.close();
+await server.close();
+```
+
+The sample needs `@modelcontextprotocol/server` and
+`@modelcontextprotocol/client` installed. See
+[MCP server](/docs/modules/mcp-server).
+
+## A2A
+
+`@deuz-sdk/core/a2a` speaks Agent2Agent 1.0.0 over its JSON-RPC and HTTP+JSON
+bindings, in both directions, with no dependencies and on the edge.
+`createA2AClient` calls an agent found through its card (`fetchAgentCard`):
+send, stream over SSE, get, cancel and subscribe. `createA2AHandler` serves your
+own agent as a fetch-style handler (`Request` in, `Response` out) with the
+card, the task lifecycle, streaming, re-subscription and cancellation; you write
+the executor that handles each message. Tasks live in an `A2ATaskStore`, kept
+apart per tenant and per caller. See [A2A](/docs/modules/a2a).
+
+{/* W3:AA3 */}
+
+A native agent can serve as the executor: an A2A task maps to a native run, a
+suspended run to `INPUT_REQUIRED` with its pending approvals and client calls,
+cancellation to an abort, and the validated output to the task's artifacts. A
+follow-up message sent with `configuration.returnImmediately` that the executor
+refuses is no longer lost: the client can see the refusal.
+
+{/* /W3:AA3 */}
+
+## Realtime voice
+
+`createRealtimeSession` in `@deuz-sdk/core/realtime` opens a live
+speech-to-speech session with OpenAI Realtime (`createOpenAIRealtime`) or
+Gemini Live (`createGeminiLive`) over WebSocket, behind one event model:
+session lifecycle, input audio, output audio, transcripts, text, tool calls,
+interruption, turn end, errors and usage. A server connects with its API key; a
+browser connects with an ephemeral token minted on your server by
+`createOpenAIClientSecret` or `createGeminiAuthToken`. Tools are ordinary Deuz
+tools, validated and approval-gated. Usage is split by modality and priced
+through `deps.priceProvider` (`realtimePriceTable` builds the rows; no realtime
+prices ship). Not live-verified; WebRTC is planned for 2.4. See
+[Realtime voice](/docs/modules/realtime).
+
+## Batch requests
+
+`createBatchClient` in `@deuz-sdk/core/batch` sends single-turn requests to the
+OpenAI Batch API, Anthropic Message Batches and Gemini batch mode, follows them
+(`submit`, `status`, `wait`, `cancel`, `results`, `collect`) and reads one
+normalized `BatchResult` per request. Every request body is built by the
+model's own wire adapter, so a batch request follows the same rules as
+`generateText`. With an execution context, every request reserves its budget
+when the batch is submitted, priced on the batch tier, and each result settles
+its hold. A `BatchJob` is plain JSON, so a new process can resume it. Not
+live-verified. See [Batch requests](/docs/modules/batch).
+
+## Redis backends
+
+`@deuz-sdk/core/ops/redis` adds `createRedisOpsStore` (leases, native agent
+runs with `list`, schedule claims) and `createRedisBudgetStore`, and
+`@deuz-sdk/core/swarm/redis` adds `createRedisSwarmStore`, with the semantics
+of the SQLite and Postgres stores. Every operation is one Lua script, so it is
+atomic on the server; lease, claim and budget-window time is the server's
+`TIME`; and all keys of a store share one hash tag, so a Redis Cluster keeps the
+store in one slot. They need Redis 7 or later. `createRedisStores` now also
+returns `runs`, and `wrapIoredisClient` fits an ioredis client to the seam. See
+[Redis](/docs/modules/operations#redis) and
+[Runs](/docs/modules/stores#runs-23).
+
+## Goals, wakeups and events
+
+`@deuz-sdk/core/goal` is the data contract for work that outlives one model
+call. It is edge-safe and pure: nothing in it runs a model, a timer or a
+service. A `GoalRecord` holds an objective, acceptance criteria, evidence, a
+budget, a deadline and a lifecycle with an explicit waiting reason, and
+`transitionGoal` is the one way it changes. A goal completes only when every
+required criterion passed on evidence that did not come from the working model
+alone. A `GoalEvent` is the wakeup and event envelope; its dedupe key shares
+one space with schedule occurrences and webhook deliveries.
+
+```ts title="goal.ts"
+import { assessGoal, createGoal, transitionGoal } from '@deuz-sdk/core/goal';
+
+const now = Date.parse('2026-10-12T12:00:00Z');
+const goal = createGoal(
+  {
+    goalId: 'fix-nightly',
+    scope: 'acme',
+    objective: 'Make the nightly build green.',
+    criteria: [{ id: 'build', description: 'The nightly build passes.' }],
+  },
+  { now },
+);
+
+// The working model's own claim never passes a criterion.
+const claimed = transitionGoal(
+  goal,
+  {
+    type: 'evaluate',
+    evidence: [{ id: 'answer', source: 'model', ref: 'run:fix-nightly-1' }],
+    results: [{ criterionId: 'build', verdict: 'passed', source: 'model', evidence: ['answer'] }],
+  },
+  { now: now + 1 },
+);
+console.log(claimed.acceptance?.verdict); // inconclusive
+
+// A CI run's verdict does.
+const tested = transitionGoal(
+  claimed.record,
+  {
+    type: 'evaluate',
+    evidence: [{ id: 'ci-812', source: 'test', ref: 'https://ci.example.com/runs/812' }],
+    results: [{ criterionId: 'build', verdict: 'passed', source: 'test', evidence: ['ci-812'] }],
+  },
+  { now: now + 2 },
+);
+console.log(assessGoal(tested.record).verdict); // passed
+const done = transitionGoal(tested.record, { type: 'complete' }, { now: now + 3 });
+console.log(done.record.status, done.record.revision); // completed 4
+```
+
+A running supervisor, a durable inbox and timezone-aware wakeups are planned for
+2.4. See [Goals](/docs/modules/goals).
+
+## Native agents in a UI
+
+`toDeuzAgentStreamResponse` in `@deuz-sdk/core/ui` serializes a `streamAgent` or
+`resumeStreamAgent` run to the Deuz UI wire. The run's parts go out as
+`toDeuzStreamResponse` frames them, and `data-agent` frames add what only a
+native run has: a frame opening each leg, the phases, structured-output drafts
+and array elements, and a terminal `result` frame with the status, the validated
+output, the pending approvals and client calls, or the stop reason. Every
+frame's `seq` is its SSE event id, so a client resumes after its cursor.
+`agentStateFromParts` folds the frames into a `DeuzAgentState` and applies each
+frame once.
+
+`useChat` from `@deuz-sdk/react` drives a native agent route with no new
+option: it pauses on the run's approvals, runs or parks its client calls, and
+resumes the run in one request. On every route, a verdict counts only when it
+answers the gate the chat is paused on, a turn read back through `reconnect()`
+hands its client tool calls to `onToolCall` once, and the history the hook
+posts answers every call the server ran or approved. `validateChatRequest`
+accepts that history by default. The wire also carries the provider's
+`stopDetails`, each tool call's `outcome`, and Gemini thought signatures on
+text. See
+[Native agent runs](/docs/modules/ui-streaming#native-agent-runs-todeuzagentstreamresponse-23)
+and [Native agent routes](/docs/modules/react-hooks#native-agent-routes).
+
+## Evals
+
+`runEvalSuite` in `@deuz-sdk/core/testing` runs versioned eval tasks. A task
+(`EvalTaskManifest`) has an id and a version, a start snapshot, acceptance
+criteria, the tools it may call and the files it may change, a budget, a
+timeout and repeats. Every attempt reports success, score, false completion,
+cost and tokens across every leg, duration, human rescues, repeated effects and
+how it recovered from an interruption. Offline and real-model tasks are never
+aggregated together, and the JSON report is written only on request.
+
+{/* W3:EV3 */}
+
+The repository's baseline runs 16 offline tasks and 23 fault-injection
+scenarios (15 recovered, 8 contained) on every `npm test`. Five real-model tasks
+are defined but were not run, so there are no real-model results.
+
+{/* /W3:EV3 */}
+
+It is a baseline, not a ranking. See [Evals](/docs/modules/evals).
+
+## Headless (preview)
+
+`@deuz-sdk/core/headless` runs, resumes and inspects native runs from a script,
+a CI job or a cron entry, and checks a model and its configuration before
+running it. `runHeadless` returns a plain-JSON report: the status and outcome,
+the actions a pending run waits for with the resume option that answers each,
+usage, cost, warnings and output. `exitCodeFor` maps it to an exit code: 0
+completed, 1 failed, 2 usage, 3 pending, 4 refused, 5 cancelled, 6 a limit, 7
+stopped for another reason, and 8 when the doctor found an error. `doctor`
+explains why a configuration will not work, with no network call, and
+`loadProjectInstructions` reads `AGENTS.md` and `CLAUDE.md`.
+
+{/* W3:HL3 */}
+
+The report and `resumeHeadless` support the durability options of a native
+resume: an unknown effect is a pending action that a retry
+(`retryToolCallIds`) or a recorded result (`reconciledToolResults`) answers,
+and a run that failed in transit is reported as retryable with `retryFailed`.
+
+{/* /W3:HL3 */}
+
+The module is Node-only and a preview: report fields, finding codes and exit
+codes can still change in a 2.x minor, and there is no binary.
+`examples/13-headless` is a small command line built on it. See
+[Headless](/docs/modules/headless).
+
+## Smaller changes
+
+- **Node I/O.** `createNodeSandbox` no longer takes the host process down when
+  a child stops reading a large stdin, and a child started without `stdin` gets
+  the null device. `runShell` takes `stdin` too. `createFileWorkspace` accepts
+  names that start with two dots, such as `..notes`, and no longer writes
+  through a dangling link or junction.
+- **Leases and stores.** A lease renewal can acknowledge a delivered cancel
+  (`renew(lease, { acknowledge: true })` and `ack`), so a cancel survives a
+  holder that dies before recording it. The Postgres stores retry a write that
+  met a serialization failure or a deadlock, up to five attempts, and upgrade
+  an older schema in place. Lease, budget, swarm, native run and claim stores
+  gain `prune`. A swarm executor whose start-up commit fails gives back its
+  ownership, lease and heartbeat.
+- **Results.** `StreamChatResult`, `StreamObjectResult`, `GenerateObjectResult`
+  and `StepResult` gain `stopDetails`, and `NoObjectGeneratedError` gains
+  `finishReason` and `stopDetails`. `streamObject`'s `warnings` resolves when the
+  call fails instead of hanging.
+- **Model switches.** The call's `capabilities` override follows a `prepareStep`
+  model, a handoff target and a fail-over candidate.
+- **Sub-agents.** `agentTool` child sessions no longer collide when a provider
+  reuses a tool-call id.
+- **Memory and UI.** `remember()` takes base `metadata`, and `readDeuzStream`
+  takes `onEventId`.
+- **Documentation.** The 2.0 notes said the Redis store pack had a run store; it
+  gains one only in 2.3, and both changelogs carry a correction. The Agent
+  Skill's generator and verifier are in the repository
+  (`npm run generate:skills`, `npm run verify:skills`).
+
+{/* W3:SK3 */}
+
+The `deuz-sdk` Agent Skill covers the 2.3 surface: the MCP 2026-07-28 client
+and server, A2A, realtime, batch, goals, the Redis stores, native memory, chat
+and fail-over, the native UI bridge, evals, headless, model profiles and the
+unknown-price policy. See [Agent Skills](/docs/reference/agent-skills).
+
+{/* /W3:SK3 */}
+
+## Examples
+
+{/* W3:EX3A */}
+
+`examples/14-native-memory-chat`, `examples/15-native-ui-bridge` and
+`examples/16-goals-and-wakeups` run on `createMockModel`, without a key: a
+native run with memory, a chat projection and a fail-over, repaired by
+`reconcileAgentRun`; a native run served with `toDeuzAgentStreamResponse` and
+folded with `agentStateFromParts` through an approval; and a goal woken by a
+schedule and an event.
+
+{/* /W3:EX3A */}
+
+{/* W3:EX3B */}
+
+`examples/17-realtime-offline`, `examples/18-batch-offline` and
+`examples/19-mcp-server` run the realtime, batch and MCP server modules without
+a key or network: a realtime session on a scripted WebSocket with a tool call, a
+batch submitted, collected and settled on a fake transport, and an MCP server
+called in-process by the Deuz client.
+
+{/* /W3:EX3B */}
+
+{/* W3:AA3 */}
+
+`examples/20-a2a-agent` serves a native agent over A2A in-process: the client
+answers an approval, and the typed result arrives as an artifact.
+
+{/* /W3:AA3 */}
+
+## What 2.2 deferred, and where it landed
+
+The 2.2 notes deferred seven items to 2.3. All seven ship:
+
+| Deferred in 2.2                                      | In 2.3                                                                                           | Docs                                                                                                                         | How it is verified                                                                                                                                                         |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The MCP 2026-07-28 client                            | Shipped: a dual-stack client, the v2 line on `@modelcontextprotocol/client`                      | [MCP](/docs/modules/mcp#sdk-lines-and-protocol-revisions-23)                                                                 | Offline against the official v1 and v2 SDK servers, in-process and over a real stdio child process; not live-verified against hosted servers                              |
+| An MCP server                                        | Shipped: `createMcpServer`, `serveMcpStdio`                                                      | [MCP server](/docs/modules/mcp-server)                                                                                       | Offline against the Deuz client on both SDK lines and the official v1 and v2 SDK clients, over HTTP and a real stdio child; not live-verified against hosted clients     |
+| A2A                                                  | Shipped: a v1.0.0 client and handler over JSON-RPC and HTTP+JSON                                 | [A2A](/docs/modules/a2a)                                                                                                     | Offline against `@a2a-js/sdk` 1.3.0 in both directions, in-process and over HTTP+JSON on 127.0.0.1; not live-verified against third-party agents                        |
+| Realtime voice                                       | Shipped over WebSocket: OpenAI Realtime and Gemini Live                                          | [Realtime voice](/docs/modules/realtime)                                                                                     | Shapes from the `openai` 7.32 and `@google/genai` 2.28 types; tested on a scripted socket and a local WebSocket server; not live-verified                                  |
+| Provider batch APIs                                  | Shipped: OpenAI, Anthropic and Gemini                                                            | [Batch requests](/docs/modules/batch)                                                                                        | Shapes from the providers' SDK types; tested against in-memory stand-ins of each API; not live-verified                                                                  |
+| Redis swarm and ops backends                         | Shipped: `ops/redis` (leases, native runs, claims, budgets), `swarm/redis`, and the pack's `runs` | [Operations](/docs/modules/operations#redis), [Persistent stores](/docs/modules/stores#runs-23)                               | The shared conformance suites on ioredis-mock, which runs the same Lua scripts, and on a real Redis 7 when `DEUZ_TEST_REDIS_URL` is set, as in the CI integration job |
+| `chat`, `memory` and `fallbackModels` in native runs | Shipped                                                                                          | [Native agents](/docs/modules/native-agents#memory-chat-and-model-fail-over-23)                                              | Offline with scripted models and stores; provider behaviour not live-verified                                                                                             |
+
+Parts of these areas stay outside 2.3: realtime over WebRTC (planned for 2.4),
+and the items listed under [Known limits](#known-limits).
+
+{/* W3:DR3 */}
+
+The verification level of every model family and protocol, kept apart as
+documented, fixture-tested and live-verified, is in the
+[support matrix](/docs/reference/provider-conformance).
+
+{/* /W3:DR3 */}
+
+## Upgrading from 2.2
+
+Code upgrades in place. Two things need a plan: native runs that only 2.3 can
+resume, and the defaults that change below.
+
+### Data that 2.2 cannot read
+
+- **Version 2 native envelopes.** A run that records memory, a transcript, a
+  chat projection or fail-over state is saved as version 2, and 2.2 refuses to
+  resume it. Runs without those features stay version 1.
+- **Envelopes with an MCP catalog or a failed receipt.** A native envelope that
+  records the servers' tool catalog (`binding.mcp`) or a receipt in stage
+  `'failed'` needs 2.3 or later to resume.
+
+Apart from these, 2.3 keeps the formats 2.2 reads: legacy checkpoints keep
+`version: 1` (2.2 ignores the new `approvalRequestCounts`), ledger snapshots
+gain only optional fields, a failed envelope's new `retry` record is ignored,
+and stored lease signals keep their 2.2 format. Roll a native fleet back to 2.2
+only when no 2.2 process has to resume a run that 2.3 saved with the features
+above.
+
+### Sharing a database with 2.2 processes
+
+- **No store changes its schema version.** On first use the SQL stores add
+  indexes that 2.2 ignores: `deuz_claims_claimed_at`,
+  `deuz_agent_runs_updated_at`, `deuz_budget_requests_state`, and on SQLite
+  `deuz_swarm_runs_settled`. On a large Postgres table, create them beforehand
+  with `CREATE INDEX CONCURRENTLY` under the same names.
+- **SQLite budget totals.** The SQLite budget store keeps lifetime totals in
+  `deuz_budget_totals`, through triggers that a 2.2 process sharing the file
+  fires too.
+- **Unpriced entries.** A 2.2 process that restores a ledger snapshot holding
+  unpriced entries keeps failing a USD bound closed on them.
+- **Checkpoint versions.** `deserializeCheckpoint`, `resumeFromCheckpoint` and
+  `resumeStreamFromCheckpoint` refuse a checkpoint whose `version` is not 1 with
+  `CheckpointVersionError`, and `resumeAgent` refuses an envelope holding such a
+  checkpoint before it writes anything, so the run stays resumable by the SDK
+  that wrote it.
+
+### Behaviour changes
+
+Each change below is intended. Where it needs action, the entry says what to
+do.
+
+#### Requests and models
+
+- **OpenAI Responses requests send `store: false`**, and a reasoning model
+  always asks for `reasoning.encrypted_content`. To keep server-side storage,
+  pass `providerOptions: { openai: { store: true } }`; a caller-supplied
+  `include` list is merged.
+- **On OpenAI Responses, a system message from the middle of the history stays
+  in place** as a `system` input item instead of moving into `instructions`. To
+  keep it in the instructions, put it at the start of `messages`.
+- **Claude 5.x requests follow the documented rules**: no `temperature` or
+  `top_p`, a forced `toolChoice` sent as `auto` on Fable 5.1, Opus 5.5 and
+  Sonnet 5.5, `effort: 'none'` mapped per model, and `output_config.effort`
+  `low` on Opus 5. Each change is a warning on `warnings`; read them there
+  instead of expecting the value you passed.
+- **The GPT-5 family and other priced models gained rows**: `effort` now reaches
+  the wire, `promptCaching` takes effect on `claude-opus-4-5` and
+  `claude-sonnet-4-5`, `temperature` is no longer sent to GPT-5 reasoning
+  models, and `gpt-5.5` and `gpt-5.5-pro` on Chat Completions send
+  `max_completion_tokens`. A value outside a row's effort levels is changed
+  with a warning.
+- **No 4,096-token default cap** on OpenAI Chat Completions, OpenAI Responses or
+  Gemini native for an unknown model or a row with an undocumented output
+  limit. Set `maxOutputTokens` if you relied on the cap; Anthropic still sends
+  4,096 for an unknown Claude id.
+- **A structured-output request keeps its tools** beside the output format on
+  the Anthropic and both OpenAI wires, which the finalization of a native run
+  with tools and `output` uses. If an OpenAI-compatible host rejects a format and
+  tools in one request, use `output.mode: 'tool'`, which sends only the forced
+  output tool.
+- **DeepSeek V4 and `gpt-6.1-sol`.** DeepSeek V4 drops `effort: 'none'` and
+  sends a forced `toolChoice` as `auto`, with warnings; a tool request to
+  `gpt-6.1-sol` on Chat Completions throws `InvalidRequestError`. Use the
+  Responses API for Sol's tools.
+
+#### Usage, prices and budgets
+
+- **`outputTokens` includes reasoning**, and `reasoningTokens` is its share, on
+  all four wires; `audioTokens` is a share of input and output. If you add
+  `reasoningTokens` to `outputTokens` yourself, stop. Costs of reasoning turns
+  drop accordingly.
+- **Price lookup no longer matches the longest prefix** or strips `-latest`,
+  `-preview`, `-fast`, `-exp` or `-all`. An id that priced through a prefix is
+  now unpriced; add it with `createPriceProvider({ aliases })`.
+- **`claude-sonnet-5` costs $2/$10**, not $3/$15. Expect lower recorded costs
+  for Sonnet 5. The OpenAI rows drop their cache-write rates, which OpenAI usage
+  never reports; their prices are unchanged.
+- **A model without a price runs under a USD budget.** Native runs, calls with
+  an execution context, swarms, `evolve` and `BudgetStore` admission used to
+  refuse it with `missing_reservation`; they now run it and report an
+  `unpriced-model` warning. Set `budget.unknownPrice: 'reject'` to keep failing
+  closed; the call then fails with code `unpriced_model` (`BudgetLedgerError`,
+  or `UnpricedModelError` in the agentic loop without an execution context).
+- **Reservations are larger**, because they price the output cap the request
+  sends. A call without `maxOutputTokens` on a large-output model can now be
+  refused with `budget_exceeded` under a small USD budget; set
+  `maxOutputTokens` to fit the budget.
+- **Under a token or USD bound, a row without a documented output limit** sends
+  its 4,096-token placeholder as `maxOutputTokens` and reports a
+  `clamped-setting` warning, so its reservation stays a bound. Pass a larger
+  `maxOutputTokens` for longer answers.
+- **In the agentic loop without an execution context**, a call whose usage the
+  provider did not report no longer counts as $0: the loop emits no further
+  `cost` parts, and `budget.usd` and `costExceeds` wait instead of counting on.
+  Unpriced calls no longer switch those stops off for the rest of the run; they
+  add nothing, and the priced calls keep counting.
+- **Each warning is logged once.** A logger-backed sink used to log some
+  warnings twice and one past its 50-entry cap not at all. No action needed.
+
+#### Tool calls and approvals
+
+- **The execution policy decides first, for the whole batch.** A call it
+  forbids fails the run with `ExecutionPolicyError` before anyone is asked to
+  approve it and before any sibling starts. `toolCallId` names the call, and
+  `streamChat` and native runs report a `tool-state` part for it before the
+  `error` part.
+- **`approvalId` is bound to its call.** Answer with the `approvalId` you were
+  given, as the docs always showed. A verdict that names only the tool call id
+  (the 2.2 form) still counts when the run used that id once.
+- **A plain call that continues a stored durable run** (its `session.runId`,
+  without `resumeFromCheckpoint`) continues the run's step counter instead of
+  starting again at 1. Under `durability: 'strict'` a failed read of the
+  checkpoint fails the call.
+- **Handoff transfers are gated like any call.** `onToolCall` guardrails see
+  them, `requireApproval` and a transfer tool's `needsApproval` gate them, and
+  an `allowedTools` allowlist must name the transfer tool.
+- **A sub-agent inherits the parent's `onToolCall` and `onToolResult`
+  guardrails.** Write those guardrails for the sub-agent's tools as well.
+- **A refused or cut-off turn runs none of its tool calls**, and a call whose
+  arguments are not a JSON object is answered with an error instead of
+  executed. An empty assistant turn is never stored.
+- **MCP calls in native runs take receipts.** An interrupted MCP call stops the
+  resume with `tool-reconciliation-required`; declare
+  `replay: 'idempotent'` on the `mcp` entry, per server or per tool, for calls
+  that are safe to run again.
+- **A changed MCP catalog stops a native run** (`onCatalogChange` defaults to
+  `'stop'`, reason `'mcp-catalog-changed'`); pass `onCatalogChange: 'accept'` to
+  carry on. `generateText` and `streamChat` keep accepting the change and now
+  report a `warning`.
+- **Name collisions between MCP tools**, or between a local and an MCP tool, are
+  reported as `unsupported-tool` warnings instead of passing silently.
+
+#### Native runs
+
+- **A native run that ends on a refusal stops with reason `'refusal'`**, not
+  `'content_filter'`, with the provider's `stopDetails`. Update a `switch` over
+  `reason`; `'cancelled'` (a lease cancel) and `'mcp-catalog-changed'` are new
+  as well.
+- **An abort during verification stops the run with reason `'aborted'`**, and an
+  elapsed deadline fails it with `ExecutionPolicyError`, where the run used to
+  complete or report `verification-inconclusive`.
+- **The finalization of a native run with tools and `output`** ends with a user
+  turn instead of the loop's last assistant answer, and asks with the loop's
+  tools and `tool_choice: 'none'`. The turn is persisted once, so the transcript
+  stays append-only. No action needed: Claude 5.x models reject the old prefill
+  with a 400 (inferred from Anthropic's documented rules, not live-verified).
+
+#### Transcripts on Claude 5.x
+
+- **The stable-prefix rules apply to Claude 5.x** (the table in
+  [Preserved thinking](#preserved-thinking-on-claude-5x)). `response.messages`
+  and the chat record now hold the memory recall message and tool-set change
+  messages, and a handoff no longer replaces the run's system prompt. A route
+  that wants the prefix to hold across turns loads its history from the chat
+  store, since `useChat` does not post system messages.
+- **Compaction on Claude 5.x is one summary.** A prune-only policy compacts
+  nothing on these models and reports each skipped layer; list `summarize` to
+  compact.
+- **The prompt-injection notice is added once, on every model.**
+  `promptInjectionGuard()` and `instructions` no longer stack copies across
+  turns, and the `promptInjectionGuardrail()` input guardrail passes on a
+  resumed leg that already carries the policy, so that leg reports no
+  `guardrail` part for it. If you counted that part per leg, expect it on the
+  first leg only.
+- **Thinking blocks keep their boundaries.** Two consecutive thinking blocks
+  stay two parts, the Anthropic request keeps thinking where it arrived, and
+  reasoning reaches only the provider family that produced it. Code that read
+  one merged reasoning part per turn reads every part instead.
+
+#### Chat UI and request validation
+
+- **`validateChatRequest` accepts the tool results `useChat` posts** with the
+  default `rejectToolResults: true`: `role: 'tool'` messages right after an
+  assistant turn that answer its calls, each once. A client-tool route no
+  longer needs `rejectToolResults: false`. The validator cannot tell a forged
+  result in that shape from a real one, so a route that must not trust the
+  client's history keeps it server-side. See
+  [Request validation](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false).
+- **`validateChatRequest` counts more.** Its byte walks count object keys as
+  well as values, opaque reasoning counts against `maxOpaqueReasoningBytes`, and
+  provider metadata and reasoning signatures against `maxProviderMetadataBytes`
+  (both 1,000,000 bytes per message by default). Raise them for long
+  multi-step turns at high effort.
+- **`assistantMessageFromTurn` follows the ordered parts**, reasoning blocks
+  included, and leaves out a call the turn knows only from a `tool-state` or
+  `tool-result` frame. `useChat` adds each result the wire carried as a
+  `role: 'tool'` message, so the history it posts answers every call.
+- **Reasoning frames carry opaque payloads in `data`.** An encrypted or redacted
+  block arrives with empty `text`, also on wire v1, whose reasoning frames are
+  therefore no longer byte-identical to output from before 1.7. A renderer that
+  draws `parts` must skip `encrypted` and `redacted` reasoning parts.
+- **`useChat` matches verdicts to the open gate.** A verdict for nothing pending,
+  a double click or a stale card sends nothing; an `onToolCall` result that
+  lands after the chat moved on is dropped; and a POST response with journal
+  `id:` lines moves the in-memory resume cursor, so `reconnect()` no longer
+  appends a settled turn twice.
+
+#### MCP
+
+- **With `@modelcontextprotocol/client` installed, the client speaks the v2
+  line.** Pass `sdk: 'v1'` to keep the 2.2 handshake. Over stdio the v2 line's
+  `'auto'` probe starts the server a second time per connect; pass
+  `versionNegotiation: 'legacy'` for a server with side effects at startup.
+- **`listTools()` reads every page.** A paginated server's later tools, which
+  2.2 dropped, now reach the model. Check that you want to offer them.
+
+#### Node I/O
+
+- **`createFileWorkspace` rejects illegal paths everywhere.** `exists()` and
+  `delete()` reject an illegal or escaping path, as `read()` and `write()` do,
+  `delete()` rejects when it cannot remove what is there, `exists()` surfaces
+  filesystem errors other than a missing path, and `list(prefix)` rejects an
+  illegal prefix. Catch these where you probed paths with `exists()`.
+- **A sandbox child started without `stdin` gets the null device**, so a program
+  that reads to end of input finishes at once. Pass `stdin: ''` for an empty
+  pipe.
+
+### Widened unions
+
+Exhaustive `switch` statements over these types need a new case:
+
+| Type                        | New members        |
+| --------------------------- | ------------------ |
+| `CallWarning['type']`       | `'unpriced-model'` |
+| `BudgetLedgerErrorCode`     | `'unpriced_model'` |
+| `AgentToolReceipt['stage']` | `'failed'`         |
+| `AgentRunEnvelope.version`  | `2`                |
+
+Native stop reasons and failure codes are strings. New values in 2.3:
+`'refusal'`, `'cancelled'` and `'mcp-catalog-changed'` (stop reasons), and
+`'lease_held'`, `'lease_lost'` and `'unpriced_model'` (failure codes). The loops'
+`stoppedBy` marker gains `'mcp-catalog-changed'`.
+
+### New members for custom implementations
+
+Calling code is unaffected. Code that implements these interfaces itself:
+
+- **`RedisStores`** gains the required `runs`. A hand-built double must add it.
+- **A custom `AgentRunStore`** that checks `envelope.version === 1` must accept
+  `2`.
+- **A `PriceProvider` written before 2.3** ignores the new `options.tier` and
+  prices batch usage at its standard rates. Read `options?.tier` to price batch
+  requests.
+- **The other new members are optional**: `LeaseProvider.ack` and `prune`,
+  `BudgetStore.prune`, `holds` and `sweep`, `SwarmStore.prune`,
+  `AgentRunStore.list`, `RedisClientLike.eval`, and `McpClient.protocolVersion`
+  and `sdk`. A store without them keeps working; the features that use them
+  need them.
+
+## Known limits
+
+- **Not live-verified.** Every provider and protocol behaviour in 2.3 was
+  verified offline only, among them the Claude 5.x request rules, block binding
+  and tool-set change messages, the research-dated model rows, OpenAI's
+  retention behaviour, the DeepSeek and Kimi `reasoning_content` round trip,
+  Gemini thought signatures, realtime, batch, and A2A and MCP against
+  third-party hosts.
+- **Realtime** runs over WebSocket only; WebRTC is planned for 2.4. Vertex AI
+  Live and OpenAI transcription-only sessions are not covered, and no realtime
+  prices ship.
+- **Anthropic features that are not wired**: server-side compaction (the beta
+  `compaction` parameter, whose signed blocks would need a new canonical part
+  kind, which 2.x does not add), and the `clear_at` and per-message
+  `output_config` betas for mid-conversation system messages.
+- **The frozen `@deuz-sdk/core/react` hook** gets none of 2.3's fixes: no verdict
+  matching, no reasoning or tool-call metadata sent back (a Gemini 3 client-tool
+  loop through it can fail), and no native agent routes. Use `@deuz-sdk/react`.
+  See [React hooks](/docs/modules/react-hooks).
+- **Preserved thinking across calls.** Handoff instructions are run state, so
+  the first request of the next call drops the thinking of the turns after a
+  transfer (the `drop_block` safety net, no error). Older Claude models keep the
+  2.2 fold of mid-conversation system messages.
+- **Chat repairs.** `ChatStore` has no conditional write, so a save that lands
+  between a repair's read and its write is overwritten. After a reload with a
+  lost or old resume cursor, a replay can append legs the restored history
+  already has.
+- **Native runs.** A lease key queues one cancel at a time, so a cancel sent
+  while one from before the claim is still queued merges into it. Concurrent
+  runs that share one execution context with different memory scopes fail
+  closed; give each its own `.child()` context.
+
+{/* W3:RS3 */}
+
+- **Approvals on resume.** A call that waited for an approval is gated again on
+  resume, also when its receipt already holds an outcome: pass the stored
+  verdict in `approvalResponses` along with `reconciledToolResults` or
+  `retryToolCallIds`.
+- **Drain.** Native runs ignore a lease `'drain'` signal; only `'cancel'` stops
+  them.
+
+{/* /W3:RS3 */}
+
+- **A2A** has no gRPC binding, no A2A 0.3, no push notifications, `ListTasks` or
+  extended card, and does not verify signed cards.
+- **MCP.** The v2 client's response-cache controls, cached-discovery reuse,
+  resource subscriptions and list-change notifications for prompts and
+  resources are not exposed. The MCP server serves tools only, with a catalog
+  fixed at construction, and reports no usage to the client.
+- **Batch** is single-turn: tools and other loop options are refused. Models on
+  Vertex AI, Bedrock, Azure and the other OpenAI-compatible hosts get a
+  `BatchError` of kind `'unsupported'`, and the OpenAI and Gemini rows have no
+  batch price.
+- **Redis** stores need Redis 7 or later on a server that never evicts their
+  keys (`noeviction` or a `volatile-*` policy).
+- **Goals** are a data contract. Nothing in 2.3 drives them on its own.
+- **Headless** is a preview without a binary. Project instructions get the
+  trust of the system message by default: review the files of a checkout you do
+  not trust.
+- **Budgets.** Admission is an estimate against holds, not a cap the provider
+  enforces.
+- **Sandbox.** After a timeout, a program the shell started that still holds
+  the output pipes is not killed.
+
+## Next: 2.4
+
+These are the roadmap's targets for 2.4, not commitments:
+
+- a `deuz` CLI on top of the headless preview, a control server and a local
+  daemon;
+- a running supervisor for goals, a durable inbox and timezone-aware wakeups,
+  on top of the 2.3 goal records;
+- realtime voice over WebRTC;
+- a persistent scheduler service, a messaging connector, and dynamic agent
+  tasks with a durable mailbox;
+- isolated runners and background process sessions;
+- transcript search, lazy tool search and a local plugin lifecycle.
+
+Previous releases remain documented in
+[What is new in 2.2](/docs/reference/whats-new-2-2) and the
+[Changelog](/docs/changelog).
