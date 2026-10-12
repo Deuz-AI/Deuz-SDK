@@ -187,12 +187,13 @@ const OUTCOME_STAGES: ReadonlySet<AgentToolReceipt['stage']> = new Set([
 
 /**
  * The outcomes `reconciledToolResults` records (2.3), by call ID: only for the
- * run's unknown effects, each once, and never for a call `retryToolCallIds`
- * runs again. Anything else is a TypeError, raised before anything is written.
+ * run's interrupted calls in `reconcilable`, each once, and never for a call
+ * `retryToolCallIds` runs again. Anything else is a TypeError, raised before
+ * anything is written.
  */
 function reconciledOutcomes(
   entries: unknown,
-  unknownEffects: readonly AgentToolReceipt[],
+  reconcilable: readonly AgentToolReceipt[],
   retryToolCallIds: readonly string[] | undefined,
 ): Map<string, ReconciledOutcome> {
   const outcomes = new Map<string, ReconciledOutcome>();
@@ -208,7 +209,7 @@ function reconciledOutcomes(
       throw new TypeError(
         `reconciledToolResults and retryToolCallIds both list ${id}: a call is either recorded or run again.`,
       );
-    if (!unknownEffects.some((receipt) => receipt.toolCallId === id))
+    if (!reconcilable.some((receipt) => receipt.toolCallId === id))
       throw new TypeError(
         `reconciledToolResults: ${id} is not a call of this run whose effect is unknown.`,
       );
@@ -1275,9 +1276,16 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           !(receipt.idempotent ?? replayOf(receipt.toolName) === 'idempotent'),
       );
       // The outcomes the caller found in the systems those effects touched (2.3).
+      // An outcome is accepted for every call a report on the stored run lists as
+      // unknown (`inspectRun`, which cannot see the tools): the unknown effects,
+      // and an interrupted call of an idempotent tool whose receipt was written
+      // before 2.3, which records no replay policy. That call would run again by
+      // itself; its recorded outcome answers it instead.
       const reconciled = reconciledOutcomes(
         options.reconciledToolResults,
-        unknownEffects,
+        Object.values(envelope.toolResults ?? {}).filter(
+          (receipt) => receipt.stage === 'executing' && receipt.idempotent !== true,
+        ),
         options.retryToolCallIds,
       );
       if (

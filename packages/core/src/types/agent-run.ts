@@ -658,9 +658,11 @@ export type AgentRunOptions<T = string> = Omit<
    * and the step goes on from it exactly as from a recorded result: validated
    * and projected like the tool's own, and the call never runs again. With
    * `isError` the call is answered with `output` as its error (a string, or
-   * JSON for any other value). Only the run's unknown effects are accepted,
-   * each once and never also in `retryToolCallIds`; anything else fails the
-   * resume with a TypeError before anything is written. A resume that leaves
+   * JSON for any other value). Only the run's interrupted calls are accepted:
+   * its unknown effects, and a call of an idempotent tool whose receipt was
+   * written before 2.3 (it records no replay policy, so `inspectRun` lists it
+   * too). Each is accepted once and never also in `retryToolCallIds`; anything
+   * else fails the resume with a TypeError before anything is written. A resume that leaves
    * an unknown effect unsettled stops again and records nothing. A call that
    * waited for an approval needs no verdict: the recorded outcome answers it,
    * like every call whose receipt records an outcome, and a verdict passed for

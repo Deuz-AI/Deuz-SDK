@@ -464,9 +464,13 @@ A call listed in `reconciledToolResults` (2.3) never runs again. Its receipt tak
 from it exactly as from a result the tool recorded: through the tool's
 `outputSchema`, `validateResult` and `toModelOutput`, to the model. With
 `isError: true` the call is answered with `output` as its error (a string, or JSON
-for any other value). Only the calls in `unknownEffects` are accepted, each once and
-never also in `retryToolCallIds`; anything else fails the resume with a
-`TypeError` before anything is written. Settle every listed call in the same
+for any other value). Only the run's interrupted calls are accepted: the calls in
+`unknownEffects`, and a call of a `replay: 'idempotent'` tool whose receipt was
+written before 2.3. Such a receipt records no replay policy, so a report on the
+stored run (`inspectRun`) lists it too; the call would run again by itself, and an
+outcome you record answers it instead. Each call is accepted once and never also in
+`retryToolCallIds`; anything else fails the resume with a `TypeError` before
+anything is written. Settle every listed call in the same
 resume: a call left unsettled stops the resume again, that stop records nothing,
 and it lists every call the store still holds as unknown. A reconciled call that
 waited for an approval needs no verdict: the outcome you record answers it.
