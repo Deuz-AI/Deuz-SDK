@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-20 against @deuz-sdk/core@2.2.0 · api-contract sha256:c301da6ab500
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
      sources: packages/core/src/image.ts, packages/core/src/speech.ts, packages/core/src/transcription.ts,
      packages/core/src/video.ts, packages/core/src/midjourney.ts, packages/core/src/yunwu.ts,
      packages/core/src/adapters/transcription.ts, packages/core/src/client.ts,
@@ -10,7 +10,7 @@
 
 # Images, speech, transcription and video
 
-**Load when:** generating an image or a video clip, synthesizing speech, transcribing an audio file, driving Midjourney, wiring a voice turn (mic → text → answer → audio), or deciding whether audio belongs in a chat message or in a dedicated modality call.
+**Load when:** generating an image or a video clip, synthesizing speech, transcribing an audio file, driving Midjourney, wiring a voice turn (mic → text → answer → audio), or deciding whether audio belongs in a chat message or in a dedicated modality call. For a **live** spoken conversation over one WebSocket (speech in, speech out, tools mid-conversation; OpenAI Realtime, Gemini Live, 2.3), read `references/realtime-batch.md` instead: these modules are one request, one answer.
 
 ## One rule explains the whole surface
 
