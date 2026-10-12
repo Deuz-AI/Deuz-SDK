@@ -591,6 +591,11 @@ resume.` before anything is written. A run without a `session` has no record:
 it still recalls once, extracts after completing and writes its chat projection,
 but nothing it does can be resumed or reconciled.
 
+[`examples/14-native-memory-chat`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/14-native-memory-chat)
+runs all three without a key: a native run with `memory`, a `chat` projection
+and `fallbackModels`, then `reconcileAgentRun` repairing a chat write that
+failed.
+
 ### Memory
 
 The run recalls **once**, before its first model call, with the last user

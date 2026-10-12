@@ -90,6 +90,8 @@ for await (const result of batch.results(job)) {
 
 `0.000135` is 1,200 input and 300 output tokens at Claude Haiku 5.5's batch rates ($0.05 / $0.25 per million), half its standard rates.
 
+[`examples/18-batch-offline`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/18-batch-offline) runs a fuller batch on the same kind of scripted Message Batches API: budget holds at submit, `wait` polling, settlement per result at batch rates, and an `unpriced-model` warning.
+
 ## Submitting a batch
 
 `createBatchClient({ model })` binds a client to one model: OpenAI and Gemini batches run on a single model, so every request of a batch does. The model's factory supplies the key, base URL, `fetch` and headers, as for any call; `headers` adds more to every batch call, and `capabilities` overrides the registry row as it does for a call.

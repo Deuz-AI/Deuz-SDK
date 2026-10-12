@@ -466,7 +466,7 @@ if (state.status === 'completed') console.log(state.output.answer); // 42, typed
 console.log(agentStateFromParts(parts, state) === state); // true
 ```
 
-For a route and a React component, see [Native agents in a UI](/docs/modules/native-agents#native-agents-in-a-ui) and [`useChat` on a native agent route](/docs/modules/react-hooks#native-agent-routes).
+For a route and a React component, see [Native agents in a UI](/docs/modules/native-agents#native-agents-in-a-ui) and [`useChat` on a native agent route](/docs/modules/react-hooks#native-agent-routes). [`examples/15-native-ui-bridge`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/15-native-ui-bridge) runs the bridge without a framework or a key: `readDeuzStream`, `agentStateFromParts` and `applyUIPart` through an approval, a one-request `resumeStreamAgent` and the typed output, then a journal replay.
 
 ## Wire part types
 

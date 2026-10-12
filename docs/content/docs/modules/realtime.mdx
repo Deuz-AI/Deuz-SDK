@@ -122,6 +122,8 @@ session total: $0.00608
 
 Delete the `webSocket` line and pass a real key, and the same code talks to OpenAI.
 
+[`examples/17-realtime-offline`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/17-realtime-offline) is a runnable session on the same kind of scripted socket: audio in, a tool call bridged to a Deuz tool, a spoken answer, and usage priced per modality.
+
 ## Server side (Node.js)
 
 On a server, the model factory holds the API key and the session sends it as a handshake header. The runtime's global `WebSocket` does that in Node.js 22 and later (undici accepts `new WebSocket(url, { protocols, headers })` — the test suite drives the real one), and Bun and Deno 2.5+ document the same option.
