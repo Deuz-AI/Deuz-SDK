@@ -198,7 +198,8 @@ result that landed (`isError: true` for an error), so the call never runs
 again. A tool marked `replay: 'idempotent'` runs again by itself and is not
 listed, unless its receipt was written before 2.3: such a receipt records no
 replay policy and `inspectRun` cannot see the tools, so the call is listed,
-and `retryToolCallIds` or a plain resume runs it again. The native rules are in [When the store fails](/docs/modules/native-agents#when-the-store-fails).
+and either answer, or a plain resume, settles it: `reconciledToolResults`
+records its result, and `retryToolCallIds` or a plain resume runs it again. The native rules are in [When the store fails](/docs/modules/native-agents#when-the-store-fails).
 
 ```ts title="headless-unknown-effect.ts"
 import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
