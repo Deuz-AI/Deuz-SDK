@@ -519,6 +519,19 @@ describe('sync-skill-copy', { timeout: 30_000 }, () => {
       sync.diffSkillCopies(join(REPO, 'skills/deuz-sdk'), join(REPO, '.claude/skills/deuz-sdk')),
     ).toEqual([]);
   });
+
+  it('refuses a source that is not a skill, and deletes nothing from the mirror', () => {
+    const fixture = freshSkill();
+    const mirrored = readdirSync(fixture.mirror, { recursive: true }).sort();
+    // A typo, and the folder above the skill: neither holds a SKILL.md.
+    for (const source of [join(fixture.root, 'skill/deuz-sdk'), join(fixture.root, 'skills')]) {
+      expect(() => sync.writeSkillMirror(source, fixture.mirror)).toThrow(
+        /no skill at .*SKILL\.md/,
+      );
+    }
+    expect(readdirSync(fixture.mirror, { recursive: true }).sort()).toEqual(mirrored);
+    expect(sync.diffSkillCopies(fixture.skill, fixture.mirror)).toEqual([]);
+  });
 });
 
 // Each case starts node, which loads the TypeScript parser: allow for a slow CI runner.
@@ -558,5 +571,21 @@ describe('command line', { timeout: 30_000 }, () => {
     const write = node('sync-skill-copy.mjs', [...args, '--write']);
     expect(write.status).toBe(0);
     expect(node('sync-skill-copy.mjs', args).status).toBe(0);
+  });
+
+  it('sync-skill-copy exits 1 on a mistyped --skill and deletes nothing, with or without --write', () => {
+    const fixture = freshSkill();
+    const args = ['--skill', join(fixture.root, 'skill/deuz-sdk'), '--mirror', fixture.mirror];
+    for (const result of [
+      node('sync-skill-copy.mjs', [...args, '--write']),
+      node('sync-skill-copy.mjs', args),
+    ]) {
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/no skill at .*SKILL\.md/);
+      expect(result.stdout).toBe('');
+    }
+    expect(existsSync(join(fixture.mirror, 'SKILL.md'))).toBe(true);
+    expect(existsSync(join(fixture.mirror, 'references/core.md'))).toBe(true);
+    expect(sync.diffSkillCopies(fixture.skill, fixture.mirror)).toEqual([]);
   });
 });

@@ -12,7 +12,8 @@
  *
  * `--write` overwrites changed files and deletes files the source does not
  * have, so an edit made directly in the .claude copy is lost: check first.
- * `--skill <dir>` / `--mirror <dir>` point at other copies.
+ * `--skill <dir>` / `--mirror <dir>` point at other copies; a source without
+ * a SKILL.md (a mistyped `--skill`) is refused in both modes.
  */
 import {
   copyFileSync,
@@ -68,8 +69,21 @@ export function diffSkillCopies(source = SKILL_DIR, mirror = MIRROR_DIR) {
   return differences.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
+/**
+ * Throws unless `source` is a skill (holds SKILL.md): a mistyped or missing
+ * source reads as an empty skill, and mirroring that deletes the whole mirror.
+ */
+function assertSkillSource(source, mirror) {
+  if (!existsSync(join(source, 'SKILL.md'))) {
+    throw new Error(
+      `no skill at ${source} (no SKILL.md there); mirroring it would delete every file of ${mirror}, so nothing was changed`,
+    );
+  }
+}
+
 /** Makes `mirror` match `source` (its own TESTING.md kept). Returns what it changed. */
 export function writeSkillMirror(source = SKILL_DIR, mirror = MIRROR_DIR) {
+  assertSkillSource(source, mirror);
   const differences = diffSkillCopies(source, mirror);
   for (const { path, kind } of differences) {
     const target = join(mirror, path);
@@ -98,6 +112,8 @@ function main() {
       options[args[i].slice(2)] = resolve(args[++i]);
     } else throw new Error(`unknown argument "${args[i]}"`);
   }
+  // The check would list every mirror file as extra; say what is wrong instead.
+  assertSkillSource(options.skill, options.mirror);
   if (options.write) {
     const changed = writeSkillMirror(options.skill, options.mirror);
     for (const { path, kind } of changed) {
