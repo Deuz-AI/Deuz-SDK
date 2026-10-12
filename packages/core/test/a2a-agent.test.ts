@@ -697,6 +697,36 @@ describe('createA2AAgentExecutor — stopped and failed runs', () => {
     ).rejects.toMatchObject({ reason: 'UNSUPPORTED_OPERATION' });
   });
 
+  const twoSteps = (): MockResponse[] => [
+    { toolCalls: [{ toolName: 'noop', args: {} }] },
+    { toolCalls: [{ toolName: 'noop', args: {} }] },
+    { text: 'Done.' },
+  ];
+  const noop = { noop: { description: 'Do nothing.', parameters, execute: () => 'ok' } };
+  it.each([
+    [
+      'budget.tokens',
+      {
+        model: createMockModel({ responses: twoSteps() }),
+        tools: noop,
+        budget: { tokens: 20 },
+        executionEstimate: { tokens: 1 },
+      },
+    ],
+    ['max-steps', { model: createMockModel({ responses: twoSteps() }), tools: noop, maxSteps: 1 }],
+  ])('treats a %s stop as final: a person must look at it', async (reason, run) => {
+    const { client } = serve(run);
+    const stopped = (await client.sendMessage('Go.')).task as A2ATask;
+    expect(stopped.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    expect(dataOf(stopped, 'stopped')).toEqual({ type: 'stopped', reason });
+    expect(a2aText(stopped.status.message)).toBe(
+      `The run stopped (${reason}): a person must look at it. The run cannot go on; cancel the task or start a new one.`,
+    );
+    await expect(client.sendMessage('Go on.', { taskId: stopped.id })).rejects.toMatchObject({
+      reason: 'UNSUPPORTED_OPERATION',
+    });
+  });
+
   it('lists the effects to reconcile, and picks the run up once a person settled them', async () => {
     const published: unknown[] = [];
     const options = publisher(
