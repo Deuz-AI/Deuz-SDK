@@ -10,8 +10,8 @@ that come a start snapshot, repeats, a timeout and the metrics an agent harness
 needs: success, false completion, cost, duration, human rescues, repeated
 effects and recovery.
 
-2.3 ships a baseline, not a benchmark. The repository's test suite runs 16
-offline tasks and 23 fault-injection scenarios on every `npm test`. Five
+2.3 ships a baseline, not a benchmark. The repository's test suite runs 22
+offline tasks and 32 fault-injection scenarios on every `npm test`. Eleven
 real-model tasks are defined but were not run for 2.3, so there are no
 real-model results. This page ranks nothing and makes no claim about other SDKs.
 
@@ -227,12 +227,17 @@ const report = await runEvalSuite(tasks, {
 console.log(report.aggregate['real-model']?.skipped);
 ```
 
-The repository defines five real-model tasks: the bug fix, the migration, the
-sourced research, the invoice extraction and the approved deploy, each on a
-model from the SDK's registry and price table, under a USD budget, with three
-attempts. They reuse the offline tasks' start state, tools and acceptance. They
-run only through `npm run test:live`, never in `npm test` or CI. They are not
-live-verified: no run against a provider was made for 2.3.
+The repository defines eleven real-model tasks, each the twin of an offline
+task: the bug fix, the migration, the sourced research, the invoice
+extraction, the approved deploy, the run with memory and a chat, the fail-over
+(to a real fallback, behind a primary that stays offline), the approval
+through the UI bridge, the goal's run, the lookup on an MCP server, and the
+batch. Each runs on a model from the SDK's registry and price table, under a
+USD budget, with three attempts, and reuses its offline twin's start state,
+tools and acceptance. The first ten run only through `npm run test:live`,
+never in `npm test` or CI. The batch is defined apart, with its skip reason: a
+provider can take up to 24 hours to end a batch, so no runner submits it. None
+of them is live-verified: no run against a provider was made for 2.3.
 
 ## The 2.3 baseline
 
@@ -245,15 +250,24 @@ migration, sourced research against a mock search index, an approval granted
 and one denied, a nested agent and a sub-agent approval, an interrupted and
 resumed run, an MCP hot refresh against the in-process MCP server, a client-side
 tool, a verifier retry, and a runaway loop that must stop instead of claiming
-success. All 16 succeed, with no false completion, no repeated effect and no
-human rescue; the three approvals are required ones.
+success. Six more cover what 2.3 added: a native run that continues a stored
+chat and acts on a preference it recalls from memory, a fail-over from a
+primary that answers 529, an approval given through the UI bridge, a goal
+woken by its schedule and completed on a tool's evidence, a batch submitted
+and collected on an in-memory stand-in of a batch API, and a tool that
+`createMcpServer` serves to an in-process client. All 22 succeed, with no
+false completion, no repeated effect and no human rescue; the four approvals
+are required ones, and the two interrupted tasks, the resumed run and the
+fail-over, recover by themselves.
 
 The fault-injection suite (`packages/core/test/eval/faults/`) injects one fault
 per scenario through the same hooks the regression tests use: a store that
 fails one write, a lease provider whose renewal fails, a budget store that
-fails a reserve or a settle, a model stream that breaks off. Every scenario
-asserts that no effect ran twice, that no billed call is missing from the
-accounting, and the documented recovery:
+fails a reserve or a settle, a model stream that breaks off, a provider that
+answers 529, a chat store that is down, a client that hangs up, and a nested
+run that asks for memory outside its scope. Every scenario asserts that no
+effect ran twice, that no billed call is missing from the accounting, and the
+documented recovery:
 
 | Boundary | What happens | Recovery |
 | --- | --- | --- |
@@ -279,11 +293,22 @@ accounting, and the documented recovery:
 | MCP hot refresh, crash before the record | A resume under the default `onCatalogChange: 'stop'` fails on the catalog drift and leaves the stored run untouched | Contained |
 | The same, resumed with `onCatalogChange: 'accept'` | The resume's first write records the servers' new catalog, before its first model call, and the run completes | Recovered |
 | Refusal or `max_tokens` with a tool call | The call is never dispatched; the run stops with reason `refusal` or `length` | Contained |
+| Memory scope, on a child context | A nested run on a `.child()` of its parent's execution asks for a wider memory scope: it fails before any memory read or write, model call or save, and the parent completes and is told why | Contained |
+| Memory scope, on the parent's own context | A nested run handed its parent's execution context asks for another user's memory: the same refusal, and nothing crosses scopes | Contained |
+| Provider fallback | Claude Opus 5.5 answers 529 after a tool effect; the fail-over is checkpointed, and the process dies once the fallback's call is admitted. The resume calls the recorded fallback, never the failed model, and the effect ran once | Recovered |
+| Fallback attempt and budget settlement | The same fail-over under a USD budget with persistent admission, to a fallback without a price, then a crash on a later receipt: the fallback warns once (`unpriced-model`) and runs, every answered call is counted once at its usage, the failed attempt stays held at its estimate, and the budget store agrees with the ledger | Recovered |
+| Compaction boundary, preserved thinking | A Claude Opus 5.5 run with memory compacts inside its tool loop, then the process dies. The resume replays the compacted history without a second summary; every request extends the one before it except across the compaction; recall ran once, with the user's question | Recovered |
+| Chat projection | The chat store fails the projection after the run completed: the run completes and records the failure, and `reconcileAgentRun` writes the whole transcript once | Recovered |
+| The same, after the chat moved on | A later run went on from the stored chat without this one: the late repair reports `superseded` and overwrites nothing, and the run's turns stay in its checkpoint | Contained |
+| Memory write | The extraction's write lands, then the save that records it fails: a terminal resume neither calls a model nor extracts again, and `reconcileAgentRun` records the extraction without a memory LLM call; the fact is written once | Recovered |
+| UI disconnect and replay | The client of a journaled native stream drops while a tool runs. A second tab's resume is refused on its own response, without event ids, and the journal stays as it was; the client reconnects with its cursor while the leg still runs and gets every frame once, in order | Recovered |
 
 Contained is not a defect in itself: it is the documented safe outcome. A
-cancel, an elapsed deadline, a refusal and a turn cut off by `max_tokens` end
-the work by design. The other contained cases have an opt-in way on in 2.3,
-each shown by the recovered scenario under it. A mid-stream transport failure and an admission store
+cancel, an elapsed deadline, a refusal, a turn cut off by `max_tokens`, a
+nested run that asks for memory outside the scope of the run it serves, and a
+chat repair that would overwrite a newer chat end the work by design. The
+other contained cases have an opt-in way on in 2.3, each shown by the
+recovered scenario under it. A mid-stream transport failure and an admission store
 failure end the native run as `failed`, and a plain resume returns that
 result; a resume with `retryFailed` goes on from the last checkpoint. After an
 unknown outcome the run stops for reconciliation, and in the contained
@@ -294,13 +319,19 @@ refresh and its record stays contained under the default
 `onCatalogChange: 'stop'`; a resume with `'accept'` records the servers' new
 catalog and recovers.
 
+The recovered fail-over scenarios keep what a fail-over leaves behind by
+design: the failed attempt stays held at its estimate, in the ledger and, with
+persistent admission, as an open hold in the budget store, so a fallback never
+spends past the shared budget. The budget scenario's crash comes after its
+calls settled. A process that dies after a call's hold was admitted and before
+its settlement was saved leaves that hold open where the settlement did not
+land (a `reserved` entry in the last persisted ledger snapshot, an open hold in
+the budget store, or both), to settle or release as
+[When a settlement fails](/docs/modules/budgets#when-a-settlement-fails) and
+[Open holds](/docs/modules/budgets#open-holds) describe.
+
 Set `DEUZ_EVAL_REPORT=<path>` or `DEUZ_FAULT_REPORT=<path>` when running the
 core tests to write either suite's JSON report.
-
-The boundaries that depend on native memory, chat and fallback and on the UI
-bridge (a compaction boundary with preserved thinking, UI disconnect and
-replay, chat projection or memory write, a fallback attempt and its budget
-settlement) are not in the 2.3 suite yet.
 
 ## See also
 
