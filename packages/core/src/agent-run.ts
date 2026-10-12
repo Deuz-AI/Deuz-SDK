@@ -248,10 +248,67 @@ function assertAccountingContinuity(
 
 /**
  * The envelope version a save writes (2.3): 2 once the run records state a 2.2
- * reader would silently ignore (memory, transcript, chat, fail-over), else 1.
+ * reader would silently ignore (memory, transcript, chat, fail-over), and
+ * while its stored turn has open calls a 2.2 resume would answer wrongly; else
+ * 1. A 2.2 process refuses version 2 before it writes anything.
  */
 function envelopeVersion(envelope: AgentRunEnvelope): 1 | 2 {
-  return envelope.memory || envelope.transcript || envelope.chat || envelope.models ? 2 : 1;
+  return envelope.memory ||
+    envelope.transcript ||
+    envelope.chat ||
+    envelope.models ||
+    openTurnMisreadBy22(envelope)
+    ? 2
+    : 1;
+}
+
+/**
+ * The tool call IDs the history's last assistant turn leaves unanswered. Only
+ * tool messages may follow that turn, then the system messages a transfer
+ * appended (as the resume settle reads it).
+ */
+function openCalls(messages: readonly Message[]): string[] {
+  let end = messages.length;
+  while (end > 0 && messages[end - 1]!.role === 'system') end--;
+  const answered = new Set<string>();
+  for (let i = end - 1; i >= 0; i--) {
+    const { role, content } = messages[i]!;
+    if (role === 'tool') {
+      if (Array.isArray(content))
+        for (const part of content) if (part.type === 'tool_result') answered.add(part.toolUseId);
+      continue;
+    }
+    if (role !== 'assistant' || !Array.isArray(content)) return [];
+    return content.flatMap((part) =>
+      part.type === 'tool_use' && !answered.has(part.id) ? [part.id] : [],
+    );
+  }
+  return [];
+}
+
+/**
+ * Whether a 2.2 resume would answer the stored turn's open calls wrongly
+ * (2.3). Such a turn is the one a resume settles next, until a checkpoint
+ * answers it; a terminal run is only read back. An open call is misread when
+ * its receipt records `failed` (2.2 does not know the stage and answers the
+ * call with no result), when its receipt is `suspended` (2.2 looks the
+ * sub-agent's checkpoint up under its own key and starts the sub-agent over),
+ * and, once a resume took the turn up, when it is a client call still pending
+ * (2.2 waits for a client result only while the run is suspended).
+ */
+function openTurnMisreadBy22(envelope: AgentRunEnvelope): boolean {
+  if (envelope.phase === 'terminal') return false;
+  const checkpoint = envelope.checkpoints[envelope.runId];
+  if (!checkpoint || checkpoint.status === 'completed') return false;
+  const waiting = new Set((envelope.pendingClientCalls ?? []).map((call) => call.toolCallId));
+  return openCalls(checkpoint.messages).some((id) => {
+    const stage = envelope.toolResults?.[JSON.stringify([envelope.modelSteps, id])]?.stage;
+    return (
+      stage === 'failed' ||
+      stage === 'suspended' ||
+      (checkpoint.status === 'running' && waiting.has(id))
+    );
+  });
 }
 
 /** The chat's part of the native resume binding (2.3). */

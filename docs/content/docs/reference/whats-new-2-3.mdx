@@ -671,7 +671,8 @@ resume, and the defaults that change below.
 
 - **Version 2 native envelopes.** A run that records memory, a transcript, a
   chat projection or fail-over state is saved as version 2, and 2.2 refuses to
-  resume it. Runs without those features stay version 1.
+  resume it. Runs without those features stay version 1, except for the moments
+  below.
 - **Envelopes with a 2.3 resume binding.** 2.2 compares the whole resume
   binding, so it fails with `Native agent binding changed across resume.` on an
   envelope, of either version, whose binding records a key 2.3 added: the
@@ -680,9 +681,13 @@ resume, and the defaults that change below.
   (`binding.memory`, `binding.chat`, `binding.fallback`). Once 2.3 saved a
   native run that uses `mcp`, handoffs, `memory`, `chat` or `fallbackModels`,
   only 2.3 resumes it.
-- **Envelopes with a failed receipt.** A receipt in stage `'failed'` needs 2.3
-  or later to resume; 2.2 does not know the stage and does not replay the
-  recorded error.
+- **Runs stopped with a call left open.** A run whose stored turn leaves a call
+  unanswered is saved as version 2 while the call's receipt records `'failed'`
+  (2.2 does not know the stage and would answer the call with no result) or
+  `'suspended'` (2.2 would start the sub-agent over), and while a resume that
+  took the turn up waits on a client call's result (2.2 would deny the call).
+  The envelope is version 1 again once a checkpoint answers the call; a
+  `'failed'` receipt of an answered call is never read again.
 
 Apart from these, 2.3 keeps the formats 2.2 reads: legacy checkpoints keep
 `version: 1` (2.2 ignores the new `approvalRequestCounts`), ledger snapshots

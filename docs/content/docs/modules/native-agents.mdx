@@ -170,11 +170,12 @@ suspension, resumed with the run id.
 Native sessions use `AgentRunEnvelope` with `kind: 'deuz-agent-run'`. They do not
 reuse a legacy `AgentCheckpoint` as the top-level envelope; the loop and sub-agent
 checkpoints inside it are `AgentCheckpoint` records. Since 2.3 `version` is `1 | 2`.
-A save writes `2` only when the envelope records `memory`, `transcript`, `chat` or
-`models`, state a 2.2 reader would silently ignore, so a 2.2 process refuses that
-envelope instead of resuming the run without it. Every other envelope stays `1`, and
-a 2.3 resume reads both. The fields 2.3 adds are optional, and absent from a run that
-does not use the feature:
+A save writes `2` when the envelope records `memory`, `transcript`, `chat` or
+`models`, state a 2.2 reader would silently ignore, and while the stored turn has an
+open call that a 2.2 resume would answer wrongly (see below), so a 2.2 process
+refuses that envelope instead of resuming the run without that state. Every other
+envelope stays `1`, and a 2.3 resume reads both. The fields 2.3 adds are optional,
+and absent from a run that does not use the feature:
 
 | Field | What it records |
 | --- | --- |
@@ -186,10 +187,21 @@ does not use the feature:
 | `binding.memory`, `binding.chat`, `binding.fallback` | The resume binding of the memory scope, of the `chatId` with its scope, and of the `fallbackModels` (each candidate's provider, protocol and model id, in order), as JSON. A resume that changes, adds or removes one fails before anything is written. `binding.mcp` and `binding.handoffs`, also new in 2.3, pin the MCP tool catalog and the handoff targets (see the paragraphs below the example). |
 | `reconciled` on a receipt (`AgentToolReceipt`) | `true` when the receipt's outcome came from `reconciledToolResults` rather than from the tool. See [When the store fails](#when-the-store-fails). |
 
-Only the first four make an envelope version 2. A 2.2 reader ignores `retry` (it
-returns a failed run's stored result, as before) and `reconciled`. It refuses an
-envelope whose `binding` records any of the 2.3 keys (`mcp`, `handoffs`, `memory`,
-`chat`, `fallback`), because its binding check compares the whole binding.
+Of these fields only the first four make an envelope version 2. A 2.2 reader
+ignores `retry` (it returns a failed run's stored result, as before) and
+`reconciled`. It refuses an envelope of either version whose `binding` records any
+of the 2.3 keys (`mcp`, `handoffs`, `memory`, `chat`, `fallback`) with `Native agent
+binding changed across resume.`, because its binding check compares the whole
+binding. Once 2.3 saved a run that uses `mcp`, handoffs, `memory`, `chat` or
+`fallbackModels`, only 2.3 resumes it.
+
+A run whose stored turn leaves calls unanswered (the run waits on them, or its
+process stopped while they ran) is also saved as version 2 while an open call's
+receipt records `failed`, a stage 2.2 does not know and would answer with no result,
+or `suspended`, a sub-agent 2.2 would start over, and while a resume that took the
+turn up still waits on a client call's result, which 2.2 would deny. The envelope is
+version 1 again once a checkpoint answers the calls: 2.2 never reads their receipts
+after that.
 
 A resume refuses an envelope of a version it does not read (2.3 reads 1 and 2).
 Since 2.3 it also refuses one holding a checkpoint whose version is not 1, with

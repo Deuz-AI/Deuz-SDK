@@ -156,8 +156,11 @@ export interface AgentRunEnvelope {
   /**
    * `2` (2.3) when the envelope records run memory, a chat projection or model
    * fail-over (`memory`, `transcript`, `chat`, `models`): a 2.2 reader knows none
-   * of them, so it refuses the run instead of resuming it without them. Every
-   * other envelope stays `1`. Readers accept both.
+   * of them, so it refuses the run instead of resuming it without them. Also
+   * while the stored turn has an open call a 2.2 resume would answer wrongly:
+   * its receipt records `failed` or `suspended`, or it is a client call a
+   * resume took up and still waits on. Every other envelope stays `1`, and one
+   * of those again once a checkpoint answers the call. Readers accept both.
    */
   version: 1 | 2;
   runId: string;
