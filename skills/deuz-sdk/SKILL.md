@@ -259,7 +259,7 @@ const result = streamChat({
 - OpenAI Responses requests send `store: false` by default since 2.3; `providerOptions.openai.store: true` opts back in.
 - Claude 5.x binds thinking to the transcript prefix: since 2.3 recall, tool-set changes and handoff instructions are appended as system messages instead of rewriting it (`references/providers.md`).
 - `compaction` only runs inside the agentic loop; setting it on a single-turn call is a silent no-op.
-- Legacy approval settlement denies a gated call with no matching verdict; native `resumeAgent` / swarm leave it suspended. Answer with the `approvalId` you were given: since 2.3 it binds the call (the tool call id plus a digest).
+- Legacy approval settlement denies a gated call with no matching verdict; native `resumeAgent` / swarm leave it suspended (since 2.3 a native call whose receipt already records its outcome is answered from the receipt and needs none). Answer with the `approvalId` you were given: since 2.3 it binds the call (the tool call id plus a digest).
 - `result.warnings` is a `Promise` on the streaming calls and an array **omitted when empty** on the buffered ones, so `undefined` there means a clean call, not a missing feature. Every notice also goes to `deps.logger.warn`, whose default is a no-op.
 - `streamObject` has no repair retry (`generateObject` has one).
 - Node-only subpaths (`*/node`, `/memory/markdown`, `/mcp/stdio`, `/mcp/server/stdio`, `/stores/*`, `/swarm/sqlite`, `/swarm/postgres`, `/swarm/redis`, `/ops/sqlite`, `/ops/postgres`, `/ops/redis`, `/evolve/sqlite`, `/headless`) throw on Edge; see `references/testing-and-edge.md`.
