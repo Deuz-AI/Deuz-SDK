@@ -87,8 +87,9 @@ await server.ready(); // load the MCP SDK and prepare every tool now, not on the
 
 // --- THE CLIENT -------------------------------------------------------------------
 // The Deuz MCP client, wired into `server.fetch` instead of the network. In
-// production, serve `server.fetch` from a route handler (or the server over
-// stdio with `serveMcpStdio`) and drop `fetch` here: the client then dials `url`.
+// production, serve `server.fetch` from a route handler and drop `fetch` here:
+// the client then dials `url`. A server on stdio (`serveMcpStdio`, see the
+// README) is launched by its client instead, with `createStdioMcpClient`.
 const userAnswers: McpElicitationResult[] = [
   { action: 'accept', content: { approve: true } }, // the first refund: yes
   { action: 'decline' }, // the second: no
