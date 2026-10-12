@@ -11,7 +11,7 @@ needs: success, false completion, cost, duration, human rescues, repeated
 effects and recovery.
 
 2.3 ships a baseline, not a benchmark. The repository's test suite runs 22
-offline tasks and 32 fault-injection scenarios on every `npm test`. Eleven
+offline tasks and 33 fault-injection scenarios on every `npm test`. Eleven
 real-model tasks are defined but were not run for 2.3, so there are no
 real-model results. This page ranks nothing and makes no claim about other SDKs.
 
@@ -277,6 +277,7 @@ documented recovery:
 | The same, for a `replay: 'idempotent'` tool | The call runs again under the same `[modelStep, toolCallId]` identity | Recovered |
 | The same, reconciled | The application finds the charge in the payment system and resumes with `reconciledToolResults`: the step goes on from the recorded outcome, and the charge never runs again | Recovered |
 | After the receipt, before the checkpoint | A resume replays the recorded result; the tool does not run again | Recovered |
+| The same, for an approved call on resume | The approved charge runs in the resume's settle; the process dies during the next model call, after its budget reservation was saved. The next resume passes no verdict: it goes on from the answers the settle saved, the charge does not run again, the model gets its recorded result, and nothing is denied | Recovered |
 | Mid model stream | No tool call from the broken turn runs; the run fails, and the call stays held at its estimate | Contained |
 | The same, resumed with `retryFailed` | The run goes on from its last checkpoint; the broken call stays held, and the retried turn charges once | Recovered |
 | Verifier abort | The run stops as `aborted`, never `completed`; a resume neither verifies nor calls the model again | Contained |

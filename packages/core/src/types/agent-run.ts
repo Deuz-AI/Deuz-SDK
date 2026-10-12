@@ -156,8 +156,14 @@ export interface AgentRunEnvelope {
   /**
    * `2` (2.3) when the envelope records run memory, a chat projection or model
    * fail-over (`memory`, `transcript`, `chat`, `models`): a 2.2 reader knows none
-   * of them, so it refuses the run instead of resuming it without them. Every
-   * other envelope stays `1`. Readers accept both.
+   * of them, so it refuses the run instead of resuming it without them. Also
+   * while the stored turn has an open call a 2.2 resume would answer wrongly:
+   * the run waits on an approval, or it stopped mid-step with an open call
+   * whose ID the run's approval gate issued a request under (2.2 cannot match
+   * a 2.3 `approvalId`), an open call's receipt records `failed` or
+   * `suspended`, or it is a client call a resume took up and still waits on.
+   * Every other envelope stays `1`, and one of those again once a checkpoint
+   * answers the call. Readers accept both.
    */
   version: 1 | 2;
   runId: string;
@@ -428,8 +434,8 @@ export interface AgentToolReceipt {
    * the error; a replay reports the recorded `error` and runs nothing again.
    * A stage that records an outcome (`executed`, `completed`, `failed`,
    * `validation-failed`, `projection-failed`) answers its call when a resume
-   * finds the call unanswered (2.3), without the approval gate; a client
-   * tool's call is answered only from `clientToolResults`.
+   * finds the call unanswered (2.3), without the approval gate. For a client
+   * tool's call it records the result a resume supplied.
    */
   stage:
     | 'executing'
@@ -653,9 +659,11 @@ export type AgentRunOptions<T = string> = Omit<
    * and the step goes on from it exactly as from a recorded result: validated
    * and projected like the tool's own, and the call never runs again. With
    * `isError` the call is answered with `output` as its error (a string, or
-   * JSON for any other value). Only the run's unknown effects are accepted,
-   * each once and never also in `retryToolCallIds`; anything else fails the
-   * resume with a TypeError before anything is written. A resume that leaves
+   * JSON for any other value). Only the run's interrupted calls are accepted:
+   * its unknown effects, and a call of an idempotent tool whose receipt was
+   * written before 2.3 (it records no replay policy, so `inspectRun` lists it
+   * too). Each is accepted once and never also in `retryToolCallIds`; anything
+   * else fails the resume with a TypeError before anything is written. A resume that leaves
    * an unknown effect unsettled stops again and records nothing. A call that
    * waited for an approval needs no verdict: the recorded outcome answers it,
    * like every call whose receipt records an outcome, and a verdict passed for
@@ -676,7 +684,14 @@ export type AgentRunOptions<T = string> = Omit<
    * is written. Ignored for a run that did not fail.
    */
   retryFailed?: boolean;
-  /** Results for pending client-side tool calls, supplied only on resume. */
+  /**
+   * Results for pending client-side tool calls, supplied only on resume. The
+   * resume records each one in the call's receipt as it applies it (2.3). The
+   * calls stay pending until the resume saved its answers, so a resume that
+   * died first accepts the same results again; a recorded result answers its
+   * call on the next resume without being supplied again (one passed again is
+   * ignored with a `warning` part, `setting: 'clientToolResults'`).
+   */
   clientToolResults?: readonly { toolCallId: string; output: unknown; isError?: boolean }[];
   verify?: (context: AgentVerifyContext<T>) => AgentVerification | Promise<AgentVerification>;
   /** Total candidate validation attempts, including the first. Default 2. */

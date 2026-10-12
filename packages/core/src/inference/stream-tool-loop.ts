@@ -187,6 +187,32 @@ export interface StreamToolLoopInternal {
    * receipt and never gates it again (see `settlePendingApprovals`).
    */
   recorded?: (call: ToolCall) => boolean;
+  /**
+   * Native runs (2.3): records what the resume settle answered, before the
+   * leg's first model call. Called once the settle answered the pending calls
+   * (and applied a transfer among them), with the history, the run's usage and
+   * its active handoff; the runner saves them as the run's checkpoint. A
+   * denial, a client result or an answer from a receipt then survives a failure
+   * of that call, and no later resume settles the turn again.
+   */
+  settled?: (state: {
+    messages: Message[];
+    usage: Usage;
+    handoff?: { to: string; count: number };
+  }) => Promise<void>;
+  /**
+   * Native runs (2.3): whether a stop condition that fired leaves the run to go
+   * on (a lease drain). Its checkpoint is saved as the running step boundary it
+   * is, not as a completed loop, so `checkpoint.saved` reports what is stored.
+   */
+  resumableStop?: (stoppedBy: string | undefined) => boolean;
+  /**
+   * Native runs (2.3): tools only the resume settle sees, over the leg's own.
+   * The runner passes its client tools here with an executor that answers a
+   * call from the result the resume supplied or a receipt recorded; the loop's
+   * steps keep them without one, so a later call still suspends.
+   */
+  settleTools?: ToolSet;
 }
 
 export interface StreamToolLoopSnapshot {
@@ -772,14 +798,17 @@ export function runStreamToolLoop(
       // their tool-result parts precede the first step-start. A durable
       // sub-agent that re-suspends here suspends THIS run again immediately.
       try {
+        // The pending calls were issued BEFORE the transfer, by an agent whose
+        // tools the overlay above has already replaced. Settling them against
+        // the active set alone would report a human-APPROVED call as a
+        // hallucinated name, so the settle — and only the settle — also sees
+        // the set the call came in with.
+        const settleSet = active
+          ? mergeMcpTools(mcp, { ...(options.tools ?? {}), ...active.tools })
+          : tools;
         const settled = await settlePendingApprovals(
           messages,
-          // The pending calls were issued BEFORE the transfer, by an agent whose
-          // tools the overlay above has already replaced. Settling them against
-          // the active set alone would report a human-APPROVED call as a
-          // hallucinated name, so the settle — and only the settle — also sees
-          // the set the call came in with.
-          active ? mergeMcpTools(mcp, { ...(options.tools ?? {}), ...active.tools }) : tools,
+          internal?.settleTools ? { ...settleSet, ...internal.settleTools } : settleSet,
           options,
           extras,
           {
@@ -854,6 +883,12 @@ export function runStreamToolLoop(
               (r) => !settled.deniedIds.has(r.toolCallId) && !handoffIds.has(r.toolCallId),
             ),
           );
+          // A native run records the answers before its first model call (2.3).
+          await internal?.settled?.({
+            messages,
+            usage: withTotal(durableUsage(durable, totalUsage)),
+            ...(durable?.handoff ? { handoff: durable.handoff } : {}),
+          });
         }
       } catch (err) {
         if (!(err instanceof SubAgentSuspension)) throw err;
@@ -1815,7 +1850,14 @@ export function runStreamToolLoop(
             });
           }
           if (durable) {
-            await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+            await saveCheckpoint(
+              durable,
+              deps,
+              options,
+              internal?.resumableStop?.(stop.stoppedBy) ? 'running' : 'completed',
+              messages,
+              totalUsage,
+            );
           }
           break;
         }

@@ -10,6 +10,7 @@ import type { EvalTaskContext, EvalTaskManifest } from '../../../src/testing';
 import {
   MOCK,
   costKept,
+  diesDuringNextModelCall,
   failingOnce,
   mockPrices,
   parameters,
@@ -290,6 +291,69 @@ export const afterReceipt: EvalTaskManifest = {
         JSON.stringify(recorded) === '["c1:completed"]' && calls() === 2
           ? 'replay-recorded-result'
           : 'other',
+    };
+  },
+};
+
+export const afterReceiptApproved: EvalTaskManifest = {
+  id: 'fault/after-receipt-approved',
+  version: 1,
+  title: 'An approved charge ran on resume; the process dies during the next model call',
+  tags: ['fault', 'native', 'receipts', 'approval'],
+  model: MOCK,
+  start: { messages: prompt },
+  approvals: ['charge'],
+  fault: { boundary: 'after-receipt-before-checkpoint', recovery: 'answered-without-verdict' },
+  acceptance: [
+    { name: 'completes', check: (outcome) => outcome.status === 'completed' },
+    ranOnce('charge:order-7'),
+    costKept,
+    {
+      name: 'the model is given the recorded result, and nothing is denied',
+      check: (_outcome, context) => context.store.answer === '["charged"]',
+    },
+    {
+      name: 'the human decided once',
+      check: (_outcome, context) => context.store.decisions === 1,
+    },
+  ],
+  async run(context) {
+    const durable = createInMemoryAgentRunStore();
+    const { model, calls, bodies } = scripted([charge, answer, answer]);
+    const options = {
+      model,
+      messages: context.messages,
+      tools: chargeTool(context, { needsApproval: true }),
+      deps: { observer: context.observer, priceProvider: mockPrices },
+    };
+    const session = { store: durable, runId: 'r', scope: 'eval' };
+    const first = await runAgent({ ...options, session });
+    if (first.status !== 'suspended') return first;
+    const verdicts = context.approve(first.pendingApprovals);
+    context.store.decisions = verdicts.length;
+    // The approved charge runs in the resume's settle and records its outcome.
+    // The process then dies during the next model call, once that call's
+    // budget reservation is saved, before the step checkpoint.
+    const store = diesDuringNextModelCall(durable, 'c1:completed', () =>
+      context.interrupt('after-receipt-before-checkpoint'),
+    );
+    const crashed = await resumeAgent({
+      ...options,
+      session: { ...session, store },
+      approvalResponses: verdicts,
+    });
+    // The resume after it passes no verdict: what the settle answered goes on.
+    const resumed = await resumeAgent({ ...options, session });
+    const last = JSON.parse(bodies().at(-1) ?? '{}') as {
+      messages?: { role: string; content: unknown }[];
+    };
+    context.store.answer = JSON.stringify(
+      (last.messages ?? []).filter((m) => m.role === 'tool').map((m) => m.content),
+    );
+    context.store.billedCalls = calls();
+    return {
+      ...resumed,
+      recovery: crashed.status === 'failed' && calls() === 3 ? 'answered-without-verdict' : 'other',
     };
   },
 };

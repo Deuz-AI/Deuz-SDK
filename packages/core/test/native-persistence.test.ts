@@ -16,6 +16,7 @@ import {
 } from '../src/agent-run';
 import { createMockModel, type MockResponse } from '../src/testing';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
+import { inspectRun } from '../src/node/headless';
 import type {
   AgentEvent,
   AgentRunEnvelope,
@@ -414,6 +415,42 @@ describe('a landed effect is recorded with reconciledToolResults (2.3)', () => {
       }),
     ).toMatchObject({ status: 'failed', error: { name: 'TypeError' } });
     expect(await fresh.load('new')).toBeUndefined();
+  });
+
+  it('records the outcome of an interrupted call a receipt from before 2.3 holds', async () => {
+    // A receipt that 2.2 wrote has no `idempotent`. inspectRun cannot see the
+    // tools, so it lists such a receipt as an unknown effect, even for a tool
+    // declared `replay: 'idempotent'`, and offers reconciledToolResults for it.
+    const store = createInMemoryAgentRunStore();
+    const { effects, tools } = charging('idempotent');
+    const { model, fetch } = counted([chargeCall, { text: 'done' }]);
+    const options = { model, prompt: 'charge', tools };
+    const session = { store, runId: 'old', scope: 't' };
+    await runAgent({
+      ...options,
+      session: { ...session, store: failingOnce(store, () => effects.length > 0) },
+    });
+    const stored = (await store.load('old'))!;
+    for (const receipt of Object.values(stored.toolResults!)) delete receipt.idempotent;
+    await store.save({ ...stored, revision: (stored.revision ?? 0) + 1 });
+    const report = await inspectRun(store, 'old');
+    const offered = report.pending.flatMap((action) =>
+      action.kind === 'unknown-effect' ? [action.toolCallId] : [],
+    );
+    expect(offered).toEqual(['c1']);
+    // The resume takes every answer the report offers: the outcome is recorded,
+    // and the call never runs again.
+    const resumed = await resumeAgent({
+      ...options,
+      session,
+      reconciledToolResults: offered.map((toolCallId) => ({ toolCallId, output: 'charged' })),
+    });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(effects).toHaveLength(1);
+    expect(toolMessages(fetch, 1)).toEqual(['charged']);
+    expect(Object.values((await store.load('old'))!.toolResults!)).toEqual([
+      expect.objectContaining({ toolCallId: 'c1', stage: 'completed', reconciled: true }),
+    ]);
   });
 
   it('settles every unknown effect of a turn in one resume, or stops and records nothing', async () => {

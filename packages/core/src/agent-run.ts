@@ -187,12 +187,13 @@ const OUTCOME_STAGES: ReadonlySet<AgentToolReceipt['stage']> = new Set([
 
 /**
  * The outcomes `reconciledToolResults` records (2.3), by call ID: only for the
- * run's unknown effects, each once, and never for a call `retryToolCallIds`
- * runs again. Anything else is a TypeError, raised before anything is written.
+ * run's interrupted calls in `reconcilable`, each once, and never for a call
+ * `retryToolCallIds` runs again. Anything else is a TypeError, raised before
+ * anything is written.
  */
 function reconciledOutcomes(
   entries: unknown,
-  unknownEffects: readonly AgentToolReceipt[],
+  reconcilable: readonly AgentToolReceipt[],
   retryToolCallIds: readonly string[] | undefined,
 ): Map<string, ReconciledOutcome> {
   const outcomes = new Map<string, ReconciledOutcome>();
@@ -208,7 +209,7 @@ function reconciledOutcomes(
       throw new TypeError(
         `reconciledToolResults and retryToolCallIds both list ${id}: a call is either recorded or run again.`,
       );
-    if (!unknownEffects.some((receipt) => receipt.toolCallId === id))
+    if (!reconcilable.some((receipt) => receipt.toolCallId === id))
       throw new TypeError(
         `reconciledToolResults: ${id} is not a call of this run whose effect is unknown.`,
       );
@@ -248,10 +249,75 @@ function assertAccountingContinuity(
 
 /**
  * The envelope version a save writes (2.3): 2 once the run records state a 2.2
- * reader would silently ignore (memory, transcript, chat, fail-over), else 1.
+ * reader would silently ignore (memory, transcript, chat, fail-over), and
+ * while its stored turn has open calls a 2.2 resume would answer wrongly; else
+ * 1. A 2.2 process refuses version 2 before it writes anything.
  */
 function envelopeVersion(envelope: AgentRunEnvelope): 1 | 2 {
-  return envelope.memory || envelope.transcript || envelope.chat || envelope.models ? 2 : 1;
+  return envelope.memory ||
+    envelope.transcript ||
+    envelope.chat ||
+    envelope.models ||
+    openTurnMisreadBy22(envelope)
+    ? 2
+    : 1;
+}
+
+/**
+ * The tool call IDs the history's last assistant turn leaves unanswered. Only
+ * tool messages may follow that turn, then the system messages a transfer
+ * appended (as the resume settle reads it).
+ */
+function openCalls(messages: readonly Message[]): string[] {
+  let end = messages.length;
+  while (end > 0 && messages[end - 1]!.role === 'system') end--;
+  const answered = new Set<string>();
+  for (let i = end - 1; i >= 0; i--) {
+    const { role, content } = messages[i]!;
+    if (role === 'tool') {
+      if (Array.isArray(content))
+        for (const part of content) if (part.type === 'tool_result') answered.add(part.toolUseId);
+      continue;
+    }
+    if (role !== 'assistant' || !Array.isArray(content)) return [];
+    return content.flatMap((part) =>
+      part.type === 'tool_use' && !answered.has(part.id) ? [part.id] : [],
+    );
+  }
+  return [];
+}
+
+/**
+ * Whether a 2.2 resume would answer the stored turn's open calls wrongly
+ * (2.3). Such a turn is the one a resume settles next, until a checkpoint
+ * answers it; a terminal run is only read back. 2.3 binds each approval to an
+ * `approvalId` that 2.2 cannot match: 2.2 accepts the verdict at its resume
+ * gate, then settles by the bare call ID and answers the call `No approval
+ * response.`, so a run that waits on an approval is misread, and so is, once a
+ * resume took the turn up, an open call the run's gate held. An open call is
+ * also misread when its receipt records `failed` (2.2 does not know the stage
+ * and answers the call with no result), when its receipt is `suspended` (2.2
+ * looks the sub-agent's checkpoint up under its own key and starts the
+ * sub-agent over), and, once a resume took the turn up, when it is a client
+ * call still pending (2.2 waits for a client result only while the run is
+ * suspended).
+ */
+function openTurnMisreadBy22(envelope: AgentRunEnvelope): boolean {
+  if (envelope.phase === 'terminal') return false;
+  const checkpoint = envelope.checkpoints[envelope.runId];
+  if (!checkpoint || checkpoint.status === 'completed') return false;
+  if (checkpoint.status === 'suspended' && (checkpoint.pendingApprovals?.length ?? 0) > 0)
+    return true;
+  const waiting = new Set((envelope.pendingClientCalls ?? []).map((call) => call.toolCallId));
+  const gated = checkpoint.approvalRequestCounts ?? {};
+  return openCalls(checkpoint.messages).some((id) => {
+    const stage = envelope.toolResults?.[JSON.stringify([envelope.modelSteps, id])]?.stage;
+    return (
+      stage === 'failed' ||
+      stage === 'suspended' ||
+      (checkpoint.status === 'running' && (waiting.has(id) || Object.hasOwn(gated, id)))
+    );
+  });
 }
 
 /** The chat's part of the native resume binding (2.3). */
@@ -973,7 +1039,6 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const outputSchema = options.output ? await agentJSONSchema(options.output) : undefined;
       if (options.output?.element)
         assertAgentValidation(options.output.element, 'Agent array element');
-      const nativeTools = { ...options.tools };
       const savedClients =
         envelope.pendingClientCalls ??
         (envelope.result?.status === 'suspended' ? envelope.result.pendingClientCalls : []);
@@ -982,35 +1047,37 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const clientValues = new Map(
         (options.clientToolResults ?? []).map((item) => [item.toolCallId, item]),
       );
-      const clientNames = new Set(
-        savedClients
-          .filter((call) => clientValues.has(call.toolCallId))
-          .map((call) => call.toolName),
-      );
-      for (const name of clientNames) {
-        const original = nativeTools[name];
-        if (!original || original.execute) continue;
-        nativeTools[name] = {
-          ...original,
-          execute: (_args, ctx) => {
-            const provided = clientValues.get(ctx.toolCallId);
-            if (!provided) throw new TypeError('No result supplied for this client call.');
-            clientValues.delete(ctx.toolCallId);
-            if (
-              !savedClients.some(
-                (call) => call.toolName === name && clientValues.has(call.toolCallId),
-              )
-            ) {
-              // Later calls of this tool must suspend again as client-side calls.
-              if (common.tools?.[name]) common.tools[name]!.execute = undefined;
-            }
-            if (provided.isError) throw new Error(String(provided.output));
-            return provided.output;
-          },
-        };
-      }
       const onToolOutput = (output: NativeToolOutput): void => {
         events.push({ type: 'tool-output', ...output });
+      };
+      /**
+       * Save `messages`, the history of the step in flight, as the run's
+       * running checkpoint at its current step index, so a resume settles the
+       * step's open calls from there without another model call.
+       */
+      const saveInFlight = async (
+        messages: Message[],
+        handoff = envelope.checkpoints[envelope.runId]?.handoff,
+      ): Promise<void> => {
+        envelope.messages = [...messages];
+        if (envelope.transcript) nativeChat!.foldHistory(envelope.transcript, envelope.messages);
+        const previous = envelope.checkpoints[envelope.runId];
+        envelope.checkpoints[envelope.runId] = {
+          version: 1,
+          runId: envelope.runId,
+          stepId: `${envelope.runId}#${previous?.stepIndex ?? 0}`,
+          stepIndex: previous?.stepIndex ?? 0,
+          status: 'running',
+          messages: envelope.messages,
+          usage: envelope.usage,
+          createdAt: resolveDependencies(options.deps).clock.now(),
+          ...(handoff ? { handoff } : {}),
+          // The run's approval-request count (2.3) outlives every checkpoint.
+          ...(previous?.approvalRequestCounts
+            ? { approvalRequestCounts: previous.approvalRequestCounts }
+            : {}),
+        };
+        await persist();
       };
       // One receipt boundary for every tool the run can execute: local, handoff
       // targets and (2.3, F01) MCP tools, refreshed catalogs included.
@@ -1022,35 +1089,70 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           envelope.toolResults ??= {};
           receipt.modelStep ??= envelope.modelSteps;
           envelope.toolResults[JSON.stringify([receipt.modelStep, receipt.toolCallId])] = receipt;
-          envelope.messages = [...ctx.messages];
-          if (envelope.transcript) nativeChat!.foldHistory(envelope.transcript, envelope.messages);
           // Persist the in-flight tool-call history as well as its receipt so
           // canonical resume can settle that exact ID without another model call.
-          const previous = envelope.checkpoints[envelope.runId];
-          envelope.checkpoints[envelope.runId] = {
-            version: 1,
-            runId: envelope.runId,
-            stepId: `${envelope.runId}#${previous?.stepIndex ?? 0}`,
-            stepIndex: previous?.stepIndex ?? 0,
-            status: 'running',
-            messages: envelope.messages,
-            usage: envelope.usage,
-            createdAt: resolveDependencies(options.deps).clock.now(),
-            ...(previous?.handoff ? { handoff: previous.handoff } : {}),
-            // The run's approval-request count (2.3) outlives every checkpoint.
-            ...(previous?.approvalRequestCounts
-              ? { approvalRequestCounts: previous.approvalRequestCounts }
-              : {}),
-          };
-          await persist();
+          await saveInFlight(ctx.messages);
         },
       };
       common.tools = await prepareAgentTools(
-        nativeTools,
+        options.tools,
         options.toolsContext,
         onToolOutput,
         receipts,
       );
+      // Client calls (2.3): a call of one of the run's own tools without
+      // `execute`. The settle applies a result a resume supplies through the
+      // call's receipt, so a later resume answers the call from that record,
+      // for example after the process died before the step was saved. Only the
+      // settle gets an executor for them: the loop's own tools keep none, so a
+      // later call of the same tool suspends as a client call again.
+      const isClientTool = (name: string): boolean =>
+        options.tools !== undefined &&
+        Object.hasOwn(options.tools, name) &&
+        !options.tools[name]!.execute;
+      /** The open turn's client calls whose receipt records their result, by call ID. */
+      const recordedClients = new Map(
+        Object.values(envelope.toolResults ?? {})
+          .filter(
+            (receipt) =>
+              receipt.modelStep === envelope.modelSteps &&
+              OUTCOME_STAGES.has(receipt.stage) &&
+              isClientTool(receipt.toolName),
+          )
+          .map((receipt) => [receipt.toolCallId, receipt]),
+      );
+      const settledClients = new Set(
+        [
+          ...savedClients.filter((call) => clientValues.has(call.toolCallId)),
+          ...recordedClients.values(),
+        ]
+          .map((call) => call.toolName)
+          .filter(isClientTool),
+      );
+      const settleTools =
+        settledClients.size > 0
+          ? await prepareAgentTools(
+              Object.fromEntries(
+                [...settledClients].map((name) => [
+                  name,
+                  {
+                    ...options.tools![name]!,
+                    // A recorded result is replayed before this runs.
+                    execute: (_args: unknown, ctx: { toolCallId: string }) => {
+                      const provided = clientValues.get(ctx.toolCallId);
+                      if (!provided)
+                        throw new TypeError('No result supplied for this client call.');
+                      if (provided.isError) throw new Error(String(provided.output));
+                      return provided.output;
+                    },
+                  },
+                ]),
+              ),
+              options.toolsContext,
+              onToolOutput,
+              receipts,
+            )
+          : undefined;
       const binding: NonNullable<AgentRunEnvelope['binding']> = {
         model: modelBinding(common.model),
         tools: JSON.stringify(
@@ -1174,29 +1276,40 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           !(receipt.idempotent ?? replayOf(receipt.toolName) === 'idempotent'),
       );
       // The outcomes the caller found in the systems those effects touched (2.3).
+      // An outcome is accepted for every call a report on the stored run lists as
+      // unknown (`inspectRun`, which cannot see the tools): the unknown effects,
+      // and an interrupted call of an idempotent tool whose receipt was written
+      // before 2.3, which records no replay policy. That call would run again by
+      // itself; its recorded outcome answers it instead.
       const reconciled = reconciledOutcomes(
         options.reconciledToolResults,
-        unknownEffects,
+        Object.values(envelope.toolResults ?? {}).filter(
+          (receipt) => receipt.stage === 'executing' && receipt.idempotent !== true,
+        ),
         options.retryToolCallIds,
       );
       if (
         resume &&
-        pendingCheckpoint?.status === 'suspended' &&
-        // A verdict must name the approval it answers (2.3): one kept from an
-        // earlier gate under a reused call id leaves the run suspended. The run's
-        // count covers its own gate's requests; a sub-agent's has its own.
-        (pendingApprovals.some(
-          (request) =>
-            !answersApproval(
-              request,
-              options.approvalResponses,
-              envelope.messages,
-              request.agentPath?.length
-                ? undefined
-                : requestCountsOf(pendingCheckpoint?.approvalRequestCounts),
-            ),
-        ) ||
-          pendingClients.some((call) => !clientIds.has(call.toolCallId)))
+        ((pendingCheckpoint?.status === 'suspended' &&
+          // A verdict must name the approval it answers (2.3): one kept from an
+          // earlier gate under a reused call id leaves the run suspended. The
+          // run's count covers its own gate's requests; a sub-agent's has its own.
+          pendingApprovals.some(
+            (request) =>
+              !answersApproval(
+                request,
+                options.approvalResponses,
+                envelope.messages,
+                request.agentPath?.length
+                  ? undefined
+                  : requestCountsOf(pendingCheckpoint?.approvalRequestCounts),
+              ),
+          )) ||
+          // A client call waits for its result until one is recorded (2.3), also
+          // once a call beside it moved the stored step on.
+          pendingClients.some(
+            (call) => !clientIds.has(call.toolCallId) && !recordedClients.has(call.toolCallId),
+          ))
       ) {
         const outcome: AgentResult<T> = {
           ...base(),
@@ -1286,7 +1399,18 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           return persist();
         });
       }
-      if (clientResults.length) envelope.pendingClientCalls = [];
+      // The pending client calls stay listed until the settle's answers are saved
+      // (2.3): a resume that dies before then accepts their results again. One
+      // whose result a receipt already records is answered from that record.
+      for (const id of clientIds) {
+        const receipt = recordedClients.get(id);
+        if (receipt)
+          runWarnings.add({
+            type: 'other',
+            setting: 'clientToolResults',
+            message: `Tool call ${id} (${receipt.toolName}) already has a recorded result, which answers it; the result passed for it was ignored.`,
+          });
+      }
       // A reconciled effect (2.3) landed: its receipt takes the outcome the
       // caller found, so the step goes on from it as from a recorded raw result
       // (validated and projected like the tool's own) and the call never runs
@@ -1328,14 +1452,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       let drainStopped = false;
       const checkpointStore: SessionStore = {
         load: (runId) => envelope.checkpoints[runId],
-        save: async (saved) => {
-          // The loop records a stop as a completed checkpoint. A drain's is the
-          // boundary the loop stopped at, so it is stored as the running one a
-          // resume goes on from, as the loop would have saved it (2.3).
-          const checkpoint =
-            drainStopped && saved.runId === envelope.runId && saved.status === 'completed'
-              ? { ...saved, status: 'running' as const }
-              : saved;
+        save: async (checkpoint) => {
           envelope.checkpoints[checkpoint.runId] = structuredClone(checkpoint);
           if (checkpoint.runId === envelope.runId) {
             envelope.messages = checkpoint.messages;
@@ -1631,6 +1748,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                 onSnapshot: (value) => {
                   snapshot = value;
                 },
+                // A drain's stop (2.3) leaves the run to go on: the loop saves its
+                // checkpoint as the running step boundary it is.
+                resumableStop: (stoppedBy) => drainStopped && stoppedBy === DRAINED,
                 onCheckpoint: (value) => {
                   // A drain's stop (2.3) is no outcome of the loop, which goes on
                   // on resume: recorded as the step boundary it is.
@@ -1653,6 +1773,18 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                   const receipt = receipts.load(call.toolCallId);
                   return receipt !== undefined && OUTCOME_STAGES.has(receipt.stage);
                 },
+                // What the resume settle answered (2.3) is saved before the leg's
+                // first model call, at the same step: a denial or a client result
+                // survives a failure of that call, and the turn is never settled
+                // again. A stored turn left open is therefore always one of the
+                // run's current model step, where its receipts are found.
+                settled: async ({ messages, usage, handoff }) => {
+                  envelope.usage = usage;
+                  envelope.pendingClientCalls = [];
+                  await saveInFlight(messages, handoff);
+                },
+                // Client calls answered from a supplied or recorded result (2.3).
+                ...(settleTools ? { settleTools } : {}),
               },
             );
             for await (const part of inner.fullStream) {
@@ -1695,8 +1827,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             ) {
               await persist();
               // A drain (2.3) waits for the step boundary: the retried call is
-              // part of the step in flight, and only that step's checkpoint
-              // records the calls a resumed leg settled before it.
+              // part of the step in flight.
               if (!(await checkLimit())) return;
               continue;
             }

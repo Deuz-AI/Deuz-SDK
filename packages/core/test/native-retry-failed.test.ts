@@ -316,6 +316,71 @@ describe('retryFailed (2.3): a run that failed in transit goes on', () => {
     expect(await inner.usage('user:1')).toMatchObject({ tokens: 30 });
   });
 
+  it('keeps a denial the failed leg settled: the retry needs no verdict', async () => {
+    const store = createInMemoryAgentRunStore();
+    const effects: string[] = [];
+    const { model, calls } = faulty([chargeCall, { text: 'lost' }, { text: 'not charged' }], {
+      2: 'break',
+    });
+    const options = {
+      model,
+      prompt: 'charge',
+      tools: { charge: { ...charging(effects).charge!, needsApproval: true } },
+      session: { store, runId: 'deny', scope: 't' },
+    };
+    const first = await runAgent(options);
+    if (first.status !== 'suspended') throw new Error(`expected a suspension, got ${first.status}`);
+    const denied = await resumeAgent({
+      ...options,
+      approvalResponses: first.pendingApprovals.map((request) => ({
+        approvalId: request.approvalId,
+        approved: false,
+      })),
+    });
+    // The model call after the denial broke off.
+    expect(denied).toMatchObject({ status: 'failed', error: { message: 'terminated' } });
+    expect((await store.load('deny'))!.retry).toEqual({ cause: 'model-call', phase: 'running' });
+    // The denial was recorded before that call: the retry does not wait for the
+    // approval again, and it never asks the model about the call twice.
+    const retried = await resumeAgent({ ...options, retryFailed: true });
+    expect(retried).toMatchObject({ status: 'completed', output: 'not charged' });
+    expect(effects).toEqual([]);
+    expect(calls()).toBe(3);
+    expect(
+      retried.messages.filter((message) => message.role === 'tool').map((m) => m.content),
+    ).toEqual([[expect.objectContaining({ toolUseId: 'c1', result: 'Tool call denied.' })]]);
+  });
+
+  it('keeps a client result the failed leg applied: the retry answers the call with it', async () => {
+    const store = createInMemoryAgentRunStore();
+    const { model, calls } = faulty(
+      [
+        { toolCalls: [{ toolName: 'ask', id: 'a1', args: {} }] },
+        { text: 'lost' },
+        { text: 'blue' },
+      ],
+      { 2: 'break' },
+    );
+    const options = {
+      model,
+      prompt: 'ask',
+      tools: { ask: { description: 'Ask the user.', parameters } },
+      session: { store, runId: 'client', scope: 't' },
+    };
+    expect((await runAgent(options)).status).toBe('suspended');
+    const applied = await resumeAgent({
+      ...options,
+      clientToolResults: [{ toolCallId: 'a1', output: 'blue' }],
+    });
+    expect(applied).toMatchObject({ status: 'failed', error: { message: 'terminated' } });
+    const retried = await resumeAgent({ ...options, retryFailed: true });
+    expect(retried).toMatchObject({ status: 'completed', output: 'blue' });
+    expect(calls()).toBe(3);
+    expect(
+      retried.messages.filter((message) => message.role === 'tool').map((m) => m.content),
+    ).toEqual([[expect.objectContaining({ toolUseId: 'a1', result: 'blue' })]]);
+  });
+
   it('records the cause again when a retry fails in transit too', async () => {
     const store = createInMemoryAgentRunStore();
     const effects: string[] = [];

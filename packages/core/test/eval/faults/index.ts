@@ -41,6 +41,7 @@ import {
   afterEffectIdempotent,
   afterEffectReconciled,
   afterReceipt,
+  afterReceiptApproved,
   beforeDispatch,
 } from './tool-boundaries';
 import { uiDisconnectReplay } from './ui-boundaries';
@@ -52,6 +53,7 @@ export const faultScenarios: readonly EvalTaskManifest[] = [
   afterEffectIdempotent,
   afterEffectReconciled,
   afterReceipt,
+  afterReceiptApproved,
   midStream,
   midStreamRetried,
   verifierAbort,

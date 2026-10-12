@@ -671,7 +671,8 @@ resume, and the defaults that change below.
 
 - **Version 2 native envelopes.** A run that records memory, a transcript, a
   chat projection or fail-over state is saved as version 2, and 2.2 refuses to
-  resume it. Runs without those features stay version 1.
+  resume it. Runs without those features stay version 1, except for the moments
+  below.
 - **Envelopes with a 2.3 resume binding.** 2.2 compares the whole resume
   binding, so it fails with `Native agent binding changed across resume.` on an
   envelope, of either version, whose binding records a key 2.3 added: the
@@ -680,16 +681,32 @@ resume, and the defaults that change below.
   (`binding.memory`, `binding.chat`, `binding.fallback`). Once 2.3 saved a
   native run that uses `mcp`, handoffs, `memory`, `chat` or `fallbackModels`,
   only 2.3 resumes it.
-- **Envelopes with a failed receipt.** A receipt in stage `'failed'` needs 2.3
-  or later to resume; 2.2 does not know the stage and does not replay the
-  recorded error.
+- **Runs stopped with a call left open.** A run whose stored turn leaves a call
+  unanswered is saved as version 2 while the call's receipt records `'failed'`
+  (2.2 does not know the stage and would answer the call with no result) or
+  `'suspended'` (2.2 would start the sub-agent over), and while a resume that
+  took the turn up waits on a client call's result (2.2 would deny the call).
+  The envelope is version 1 again once a checkpoint answers the call; a
+  `'failed'` receipt of an answered call is never read again.
+- **Runs waiting on an approval.** 2.3 issues `approvalId` as the tool call ID,
+  `@` and a digest, and 2.2 looks a verdict up by the bare tool call ID, so it
+  would answer an approved call `Tool call denied. Reason: No approval
+  response.`, never run the tool, and go on to the end of the run. A native run
+  that waits on an approval is therefore saved as version 2, which 2.2 refuses,
+  and so is one stopped while a call is open whose ID its approval gate issued a
+  request under, such as a resume that took approved calls up and stopped before
+  it saved their answers. A legacy durable run (`generateText` or `streamChat` with a
+  `session`) keeps checkpoint `version: 1`, and 2.2's `resumeFromCheckpoint`
+  honours only the bare tool call ID there: it denies a call answered with the
+  2.3 `approvalId`. Answer pending approvals on 2.3 before a rollback, and send
+  approval answers only to 2.3 processes while both versions share a store.
 
 Apart from these, 2.3 keeps the formats 2.2 reads: legacy checkpoints keep
 `version: 1` (2.2 ignores the new `approvalRequestCounts`), ledger snapshots
 gain only optional fields, a failed envelope's new `retry` record is ignored
 (2.2 returns the stored failed result), and stored lease signals keep their 2.2
-format. Roll a native fleet back to 2.2 only when no 2.2 process has to resume
-a run that 2.3 saved with the features above.
+format. Roll a fleet back to 2.2 only when no 2.2 process has to resume a run
+that 2.3 saved with the features above, or one that waits on an approval.
 
 ### Sharing a database with 2.2 processes
 
