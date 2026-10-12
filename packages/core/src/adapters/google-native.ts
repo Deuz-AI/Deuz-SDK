@@ -308,23 +308,58 @@ export function mapGeminiUsage(u: GeminiUsageMetadata | undefined): Usage {
   return usage;
 }
 
-function mapFinishReason(reason: string | undefined, sawFunctionCall: boolean): FinishReason {
-  // STOP-BUG guard: a tool turn finishes as 'STOP' — override when a call was seen.
-  if (sawFunctionCall) return 'tool_calls';
+/** Every `FinishReason` value of @google/genai 2.28, mapped on purpose (2.3). Not live-verified. */
+function geminiFinish(reason: string | undefined): FinishReason {
   switch (reason) {
+    case 'STOP':
+    // The enum's unset value: nothing says the turn ended early.
+    case 'FINISH_REASON_UNSPECIFIED':
+      return 'stop';
     case 'MAX_TOKENS':
+    // The per-request token limit cut the answer off (Deuz sends no continuation token).
+    case 'CONTINUATION':
       return 'length';
+    // The filters: SPII and the image filters ended a turn with 'stop' before 2.3.
     case 'SAFETY':
     case 'RECITATION':
     case 'BLOCKLIST':
     case 'PROHIBITED_CONTENT':
+    case 'SPII':
     case 'IMAGE_SAFETY':
+    case 'IMAGE_PROHIBITED_CONTENT':
+    case 'IMAGE_RECITATION':
       return 'content_filter';
-    case 'STOP':
-      return 'stop';
+    // Stopped without a usable answer: an invalid or unexpected call, too many
+    // calls in a row, no image, an unsupported language, or a reason Gemini
+    // does not name ('stop' before 2.3).
+    case 'MALFORMED_FUNCTION_CALL':
+    case 'UNEXPECTED_TOOL_CALL':
+    case 'TOO_MANY_TOOL_CALLS':
+    case 'NO_IMAGE':
+    case 'LANGUAGE':
+    case 'OTHER':
+    case 'IMAGE_OTHER':
+      return 'error';
     default:
       return 'stop'; // enum evolves — handle defensively
   }
+}
+
+/**
+ * A Gemini turn's finish reason, shared with the batch parser. A blocked
+ * prompt is filtered. STOP-BUG guard: a tool turn finishes as 'STOP', so a
+ * turn that carried a call ends with 'tool_calls' — unless a filter or a limit
+ * stopped it (2.3), which the finish-reason gate must see to hold the call back.
+ */
+export function mapGeminiFinishReason(
+  reason: string | undefined,
+  sawFunctionCall: boolean,
+  blocked = false,
+): FinishReason {
+  if (blocked) return 'content_filter';
+  const mapped = geminiFinish(reason);
+  if (sawFunctionCall && mapped !== 'content_filter' && mapped !== 'length') return 'tool_calls';
+  return mapped;
 }
 
 interface GeminiStreamEvent {
@@ -404,7 +439,7 @@ async function* parseStream(
     }
   }
 
-  const finishReason = blocked ? 'content_filter' : mapFinishReason(lastFinish, sawFunctionCall);
+  const finishReason = mapGeminiFinishReason(lastFinish, sawFunctionCall, blocked !== undefined);
   ctx.usageAvailable?.(
     typeof lastUsage?.promptTokenCount === 'number' &&
       typeof lastUsage.candidatesTokenCount === 'number',

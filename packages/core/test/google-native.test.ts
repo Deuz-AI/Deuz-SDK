@@ -7,6 +7,7 @@ import { getCapabilities } from '../src/core/registry';
 import type { CommonCallOptions } from '../src/types/config';
 import type { CallWarning } from '../src/types/methods';
 import { sseResponse, sseEvents, mockFetch } from './fixtures/sse';
+import { GEMINI_CALL, GEMINI_FINISH_REASONS, geminiTurn } from './fixtures/provider-finish';
 
 function consume(chunks: string[]) {
   return mockFetch(() => sseResponse(chunks));
@@ -356,4 +357,44 @@ describe('unknown native model output cap (2.3, F08)', () => {
     const known = await geminiRequest('gemini-2.5-flash');
     expect(known.body.generationConfig.maxOutputTokens).toBe(64_000);
   });
+});
+
+// ===================================================================
+// 2.3 (K4) — every finish reason `@google/genai` 2.28 lists is mapped on
+// purpose, on the streamed wire. Fixtures follow the packed 2.28.0 types;
+// not live-verified.
+// ===================================================================
+
+async function streamedFinish(fixture: string): Promise<string> {
+  const { fetch } = consume([fixture]);
+  const result = streamChat({
+    model: createGoogleNative({ apiKey: 'AIza-k', fetch })('gemini-2.5-flash'),
+    messages: [{ role: 'user', content: 'hi' }],
+  });
+  for await (const _ of result.fullStream) void _;
+  return result.finishReason;
+}
+
+describe('Gemini finish reasons (2.3, K4)', () => {
+  it.each(GEMINI_FINISH_REASONS)('%s ends a streamed turn with %s', async (wire, expected) => {
+    expect(await streamedFinish(geminiTurn(wire))).toBe(expected);
+  });
+
+  it('every filter of 2.28 ends the turn with content_filter, SPII and the image filters too', async () => {
+    for (const wire of ['SPII', 'IMAGE_PROHIBITED_CONTENT', 'IMAGE_RECITATION']) {
+      expect(await streamedFinish(geminiTurn(wire)), wire).toBe('content_filter');
+    }
+  });
+
+  it('a value 2.28 does not list ends the turn with stop, as before', async () => {
+    expect(await streamedFinish(geminiTurn('A_LATER_REASON'))).toBe('stop');
+  });
+
+  it.each(GEMINI_FINISH_REASONS)(
+    '%s after a streamed call: a filter or a limit is never hidden by the STOP guard',
+    async (wire, mapped) => {
+      const expected = mapped === 'content_filter' || mapped === 'length' ? mapped : 'tool_calls';
+      expect(await streamedFinish(geminiTurn(wire, [GEMINI_CALL]))).toBe(expected);
+    },
+  );
 });

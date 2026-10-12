@@ -417,6 +417,8 @@ interface OpenAIChunk {
   choices?: {
     delta?: {
       content?: string;
+      /** The model's refusal text, streamed like content (openai 7.32: `string | null`). */
+      refusal?: string | null;
       reasoning_content?: string;
       tool_calls?: {
         index?: number;
@@ -430,17 +432,23 @@ interface OpenAIChunk {
   usage?: OpenAIUsage | null;
 }
 
-function mapFinish(reason: string | null | undefined): FinishReason {
+/**
+ * A Chat Completions turn's finish reason, shared with the batch parser. A
+ * turn that carried the model's refusal text is a refused one (2.3; it ended
+ * with 'stop' or 'tool_calls' before): it ends with 'content_filter', so the
+ * finish-reason gate holds back its calls, unless the provider reported a limit.
+ */
+export function mapChatFinishReason(reason: unknown, refused = false): FinishReason {
   switch (reason) {
     case 'length':
       return 'length';
-    case 'tool_calls':
-    case 'function_call':
-      return 'tool_calls';
     case 'content_filter':
       return 'content_filter';
+    case 'tool_calls':
+    case 'function_call':
+      return refused ? 'content_filter' : 'tool_calls';
     default:
-      return 'stop';
+      return refused ? 'content_filter' : 'stop';
   }
 }
 
@@ -488,7 +496,9 @@ async function* parseStream(
   _ctx: ParseContext,
 ): AsyncGenerator<StreamPart> {
   let lastUsage: OpenAIUsage | null | undefined;
-  let finishReason: FinishReason = 'stop';
+  let finish: string | undefined;
+  // The model's refusal (2.3): kept for the caller, never streamed as answer text.
+  let refusal = '';
   const toolIdByIndex = new Map<number, string>();
 
   for await (const ev of parseSSE(body)) {
@@ -505,6 +515,7 @@ async function* parseStream(
     if (!choice) continue;
     const delta = choice.delta;
     if (delta?.content) yield { type: 'text-delta', text: delta.content };
+    if (typeof delta?.refusal === 'string') refusal += delta.refusal;
     // The host's own reasoning, marked so only that host ever gets it back (2.3).
     if (delta?.reasoning_content) {
       yield { type: 'reasoning-delta', text: delta.reasoning_content, source: _ctx.provider };
@@ -524,13 +535,19 @@ async function* parseStream(
         };
       }
     }
-    if (choice.finish_reason) finishReason = mapFinish(choice.finish_reason);
+    if (choice.finish_reason) finish = choice.finish_reason;
   }
 
   _ctx.usageAvailable?.(
     typeof lastUsage?.prompt_tokens === 'number' && typeof lastUsage.completion_tokens === 'number',
   );
-  yield { type: 'finish', usage: mapOpenAIUsage(lastUsage), finishReason };
+  yield {
+    type: 'finish',
+    usage: mapOpenAIUsage(lastUsage),
+    finishReason: mapChatFinishReason(finish, refusal !== ''),
+    // The batch parser's key: `stopDetailsFrom` reads it as the stop's explanation.
+    ...(refusal ? { providerMetadata: { openai: { refusal } } } : {}),
+  };
 }
 
 // --- error mapping ---

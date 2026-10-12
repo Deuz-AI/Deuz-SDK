@@ -6,8 +6,10 @@ import { openaiResponsesAdapter } from '../src/adapters/openai-responses';
 import type { Adapter } from '../src/adapters/types';
 import { parseReply } from '../src/batch/parse';
 import type { ModelCapabilities } from '../src/core/registry';
+import { stopDetailsFrom } from '../src/internal/stop-details';
 import type { StreamPart } from '../src/types/stream';
 import { sseEvents } from './fixtures/sse';
+import { GEMINI_CALL, GEMINI_FINISH_REASONS } from './fixtures/provider-finish';
 
 // BA2: batch results arrive as FINAL (non-streaming) JSON bodies. The batch
 // parsers normalize them to the same contract the streaming adapters produce —
@@ -225,6 +227,24 @@ describe('parseReply: OpenAI Responses', () => {
     expect(parseReply('responses', response(filtered)).finishReason).toBe('content_filter');
   });
 
+  it.each([undefined, 'max_output_tokens', 'content_filter', 'max_messages', 'steered'])(
+    'maps incomplete reason %s exactly as the streaming adapter does, with or without a call',
+    async (reason) => {
+      const status = reason === undefined ? 'completed' : 'incomplete';
+      const incomplete_details = reason === undefined ? null : { reason };
+      const item = { type: 'function_call', id: 'fc_1', call_id: 'c1', name: 'json_output' };
+      for (const withCall of [false, true]) {
+        const stream = await streamFinish(openaiResponsesAdapter, [
+          ...(withCall ? [{ data: { type: 'response.output_item.added', item } }] : []),
+          { data: { type: `response.${status}`, response: { status, incomplete_details } } },
+        ]);
+        const output = withCall ? [{ ...item, arguments: '{}' }] : response().output;
+        const reply = parseReply('responses', response({ status, incomplete_details, output }));
+        expect(reply.finishReason, `call: ${withCall}`).toBe(stream.finishReason);
+      }
+    },
+  );
+
   it('returns function calls with their argument text and finishes as tool_calls', () => {
     const reply = parseReply(
       'responses',
@@ -254,6 +274,27 @@ describe('parseReply: OpenAI Responses', () => {
     );
     expect(failed.error).toEqual({ code: 'server_error', message: 'Boom.' });
   });
+
+  // 2.3 (K4): a refusal ends the reply as it ends the streamed turn.
+  it.each([undefined, 'max_output_tokens', 'content_filter'])(
+    'maps a refusal with incomplete reason %s exactly as the streaming adapter does',
+    async (reason) => {
+      const status = reason === undefined ? 'completed' : 'incomplete';
+      const incomplete_details = reason === undefined ? null : { reason };
+      const at = { item_id: 'msg_1', output_index: 0, content_index: 0 };
+      const stream = await streamFinish(openaiResponsesAdapter, [
+        { data: { type: 'response.refusal.delta', ...at, delta: 'No.' } },
+        { data: { type: 'response.refusal.done', ...at, refusal: 'No.' } },
+        { data: { type: `response.${status}`, response: { status, incomplete_details } } },
+      ]);
+      const content = [{ type: 'refusal', refusal: 'No.' }];
+      const output = [{ type: 'message', id: 'msg_1', role: 'assistant', content }];
+      const reply = parseReply('responses', response({ status, incomplete_details, output }));
+      expect(reply.finishReason).toBe(stream.finishReason);
+      expect(reply.providerMetadata).toEqual(stream.providerMetadata);
+      expect(reply.stopDetails).toEqual(stopDetailsFrom(stream.providerMetadata));
+    },
+  );
 
   it.each([
     ['plain', { input_tokens: 100, output_tokens: 1000, total_tokens: 1100 }],
@@ -347,6 +388,37 @@ describe('parseReply: Chat Completions', () => {
     }
   });
 
+  // 2.3 (K4): the values of openai 7.32's `finish_reason`, the same as on the stream.
+  it.each(['stop', 'length', 'tool_calls', 'content_filter', 'function_call'])(
+    'maps finish reason %s exactly as the streaming adapter does',
+    async (finish_reason) => {
+      const stream = await streamFinish(openaiCompatibleAdapter, [
+        { data: { choices: [{ index: 0, delta: { content: 'x' }, finish_reason }] } },
+        { data: '[DONE]' },
+      ]);
+      const choices = [{ index: 0, message: { role: 'assistant', content: 'x' }, finish_reason }];
+      const reply = parseReply('chat_completions', completion({}, { choices }));
+      expect(reply.finishReason).toBe(stream.finishReason);
+    },
+  );
+
+  // 2.3 (K4): a refusal ends the reply as it ends the streamed turn.
+  it.each(['stop', 'length', 'tool_calls', 'content_filter'])(
+    'maps a refusal with finish reason %s exactly as the streaming adapter does',
+    async (finish_reason) => {
+      const stream = await streamFinish(openaiCompatibleAdapter, [
+        { data: { choices: [{ index: 0, delta: { refusal: 'No.' }, finish_reason }] } },
+        { data: '[DONE]' },
+      ]);
+      const message = { role: 'assistant', content: null, refusal: 'No.' };
+      const choices = [{ index: 0, message, finish_reason }];
+      const reply = parseReply('chat_completions', completion({}, { choices }));
+      expect(reply.finishReason).toBe(stream.finishReason);
+      expect(reply.providerMetadata).toEqual(stream.providerMetadata);
+      expect(reply.stopDetails).toEqual(stopDetailsFrom(stream.providerMetadata));
+    },
+  );
+
   it('bills usage exactly as the streaming adapter does', async () => {
     const usage = {
       prompt_tokens: 100,
@@ -412,6 +484,24 @@ describe('parseReply: Gemini generateContent', () => {
       ).finishReason,
     ).toBe('length');
   });
+
+  // 2.3 (K4): every value of @google/genai 2.28's FinishReason, the same as on the stream.
+  it.each(GEMINI_FINISH_REASONS)('maps finish reason %s to %s', (finishReason, expected) => {
+    const candidates = [{ content: { parts: [{ text: 'x' }] }, finishReason }];
+    expect(parseReply('native', response([], { candidates })).finishReason).toBe(expected);
+  });
+
+  it.each([...GEMINI_FINISH_REASONS.map(([wire]) => wire), 'A_LATER_REASON'])(
+    'maps %s exactly as the streaming adapter does, with or without a call',
+    async (finishReason) => {
+      for (const parts of [[{ text: 'x' }], [GEMINI_CALL]]) {
+        const candidates = [{ content: { role: 'model', parts }, finishReason }];
+        const stream = await streamFinish(googleNativeAdapter, [{ data: { candidates } }]);
+        const reply = parseReply('native', response(parts, { candidates }));
+        expect(reply.finishReason, JSON.stringify(parts)).toBe(stream.finishReason);
+      }
+    },
+  );
 
   it('bills usage exactly as the streaming adapter does', async () => {
     const usageMetadata = {

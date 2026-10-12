@@ -10,11 +10,19 @@
  *
  * Usage goes through each wire's own adapter mapper, so a batch reply bills
  * exactly as the streamed reply would; `test/batch-parse.test.ts` pins it.
+ * The OpenAI and Gemini finish reasons go through the adapters' mappers too
+ * (2.3, K4), and an OpenAI refusal's stop details through the normalizer
+ * every result shares.
  */
 import { mapAnthropicUsage, type AnthropicUsage } from '../adapters/anthropic';
-import { mapGeminiUsage } from '../adapters/google-native';
-import { mapOpenAIUsage } from '../adapters/openai-compatible';
-import { mapResponsesUsage, type ResponsesUsage } from '../adapters/openai-responses';
+import { mapGeminiFinishReason, mapGeminiUsage } from '../adapters/google-native';
+import { mapChatFinishReason, mapOpenAIUsage } from '../adapters/openai-compatible';
+import {
+  mapResponsesFinishReason,
+  mapResponsesUsage,
+  type ResponsesUsage,
+} from '../adapters/openai-responses';
+import { stopDetailsFrom } from '../internal/stop-details';
 import type { StopDetails } from '../types/methods';
 import type { ModelSurface } from '../types/model';
 import type { FinishReason, Usage } from '../types/usage';
@@ -171,20 +179,12 @@ function parseResponse(body: Json): ParsedReply {
   }
   const usage = isObject(body.usage) ? (body.usage as ResponsesUsage) : undefined;
   const reason = isObject(body.incomplete_details) ? body.incomplete_details.reason : undefined;
-  // The streaming adapter knows max_output_tokens only; the final body also
-  // says when a content filter cut the reply off.
-  const finishReason: FinishReason =
-    reason === 'max_output_tokens'
-      ? 'length'
-      : reason === 'content_filter'
-        ? 'content_filter'
-        : toolCalls.length > 0
-          ? 'tool_calls'
-          : 'stop';
+  const finishReason = mapResponsesFinishReason(reason, toolCalls.length > 0, refusal !== '');
   const openai: Json = {
     ...(phase ? { phase } : {}),
     ...(refusal ? { refusal } : {}),
   };
+  const stopDetails = stopDetailsFrom({ openai });
   const failure = isObject(body.error) ? body.error : undefined;
   return {
     text: out,
@@ -194,6 +194,7 @@ function parseResponse(body: Json): ParsedReply {
     usage: mapResponsesUsage(usage),
     usageAvailable:
       typeof usage?.input_tokens === 'number' && typeof usage.output_tokens === 'number',
+    ...(stopDetails ? { stopDetails } : {}),
     ...(Object.keys(openai).length > 0 ? { providerMetadata: { openai } } : {}),
     ...(failure
       ? {
@@ -208,20 +209,6 @@ function parseResponse(body: Json): ParsedReply {
 
 // --- OpenAI Chat Completions ---
 
-function chatFinish(reason: unknown): FinishReason {
-  switch (reason) {
-    case 'length':
-      return 'length';
-    case 'tool_calls':
-    case 'function_call':
-      return 'tool_calls';
-    case 'content_filter':
-      return 'content_filter';
-    default:
-      return 'stop';
-  }
-}
-
 function parseCompletion(body: Json): ParsedReply {
   const choice = list(body.choices).find(isObject);
   const message = choice && isObject(choice.message) ? choice.message : {};
@@ -232,27 +219,22 @@ function parseCompletion(body: Json): ParsedReply {
   }
   const usage = isObject(body.usage) ? body.usage : undefined;
   const refusal = text(message.refusal);
+  const providerMetadata = refusal ? { openai: { refusal } } : undefined;
+  const stopDetails = stopDetailsFrom(providerMetadata);
   return {
     text: text(message.content),
     reasoning: text(message.reasoning_content),
     toolCalls,
-    finishReason: chatFinish(choice?.finish_reason),
+    finishReason: mapChatFinishReason(choice?.finish_reason, refusal !== ''),
     usage: mapOpenAIUsage(usage as Parameters<typeof mapOpenAIUsage>[0]),
     usageAvailable:
       typeof usage?.prompt_tokens === 'number' && typeof usage.completion_tokens === 'number',
-    ...(refusal ? { providerMetadata: { openai: { refusal } } } : {}),
+    ...(stopDetails ? { stopDetails } : {}),
+    ...(providerMetadata ? { providerMetadata } : {}),
   };
 }
 
 // --- Gemini generateContent ---
-
-const GEMINI_FILTERED = new Set([
-  'SAFETY',
-  'RECITATION',
-  'BLOCKLIST',
-  'PROHIBITED_CONTENT',
-  'IMAGE_SAFETY',
-]);
 
 function parseGenerateContent(body: Json): ParsedReply {
   const candidate = list(body.candidates).find(isObject);
@@ -270,16 +252,12 @@ function parseGenerateContent(body: Json): ParsedReply {
   const blocked =
     isObject(body.promptFeedback) && typeof body.promptFeedback.blockReason === 'string';
   const reason = candidate?.finishReason;
-  // The streaming adapter's STOP-bug guard: a function call finishes as 'STOP'.
-  const finishReason: FinishReason = blocked
-    ? 'content_filter'
-    : toolCalls.length > 0
-      ? 'tool_calls'
-      : reason === 'MAX_TOKENS'
-        ? 'length'
-        : typeof reason === 'string' && GEMINI_FILTERED.has(reason)
-          ? 'content_filter'
-          : 'stop';
+  // The streaming adapter's own mapping, its STOP-bug guard included.
+  const finishReason = mapGeminiFinishReason(
+    typeof reason === 'string' ? reason : undefined,
+    toolCalls.length > 0,
+    blocked,
+  );
   const usage = isObject(body.usageMetadata) ? body.usageMetadata : undefined;
   return {
     text: out,
