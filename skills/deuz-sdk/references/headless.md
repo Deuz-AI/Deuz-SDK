@@ -1,13 +1,13 @@
 <!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
      sources: packages/core/src/node/headless.ts, packages/core/src/headless/{report,doctor,instructions}.ts,
-     packages/core/src/model-profile.ts, examples/13-headless/index.ts,
+     packages/core/src/{model-profile,agent-run}.ts, examples/13-headless/{index.ts,README.md},
      docs/content/docs/modules/headless.mdx -->
 
 # Headless runs (2.3 preview)
 
 **Load when:** running a native agent from a script, a CI job or a cron entry with no UI, branching a shell on how the run ended, resuming a stored run with the answers it waits for, loading a repository's `AGENTS.md` / `CLAUDE.md` into a run, giving a run Agent Skills from disk, or checking a model and its configuration before spending a call.
 
-`@deuz-sdk/core/headless` is a **preview**, not a stable API: report fields, finding codes and exit codes can still change in a 2.x minor. It is **Node only** (it reads files, the environment and the Node version) and never reaches the edge-safe entries. There is no `deuz` binary, CLI package, TUI or daemon in 2.3; `examples/13-headless` is a small command line built on these functions (`run`, `resume`, `inspect`, `doctor`, keyless with its mock scenarios).
+`@deuz-sdk/core/headless` is a **preview**, not a stable API: report fields, finding codes and exit codes can still change in a 2.x minor. It is **Node only** (it reads files, the environment and the Node version) and never reaches the edge-safe entries. There is no `deuz` binary, CLI package, TUI or daemon in 2.3; `examples/13-headless` is a small command line built on these functions (`run`, `inspect`, `doctor`, and `resume` with `--approve` / `--deny`, `--retry-call <id>`, `--reconcile <file.json>` and `--retry-failed`), keyless with its `--mock` scenarios, among them `crash` (a call whose effect is unknown) and `outage` (a failure in transit).
 
 | Function | What it does |
 | --- | --- |
@@ -55,12 +55,12 @@ console.log(done.outcome, done.output, exitCodeFor(done)); // completed Deployed
 
 ## The report
 
-`HeadlessReport` is plain JSON: `kind: 'deuz-headless-report'`, `version: 1`, `runId`, `scope`, `status` (the result status, or `'in-progress'` for a stored run with no result yet), `outcome`, `phase?` (where the stored run stands after the leg), `reason?` and `stopDetails?` (a stopped run's reason and the provider's explanation), `error?`, `pending` (what a pending run waits for), `usage`, `modelSteps`, `cost?` (`{ usd, complete, unpricedCalls, unknownCalls }` from the run's budget ledger; `usd` is a lower bound while `complete` is `false`), `verification?`, `warnings` (the leg's `CallWarning`s; `inspectRun` reports none), `output?` (a completed run's accepted output) and `text`.
+`HeadlessReport` is plain JSON: `kind: 'deuz-headless-report'`, `version: 1`, `runId`, `scope`, `status` (the result status, or `'in-progress'` for a stored run with no result yet), `outcome`, `phase?` (where the stored run stands after the leg), `reason?` and `stopDetails?` (a stopped run's reason and the provider's explanation), `error?`, `pending` (what a pending run waits for), `usage`, `modelSteps`, `cost?` (`{ usd, complete, unpricedCalls, unknownCalls }` from the run's budget ledger; `usd` is a lower bound while `complete` is `false`), `retry?` (`HeadlessRetry`, `{ cause: 'model-call' | 'admission', phase: 'running' | 'finalizing', resumeWith: 'retryFailed' }`: the stored run failed in transit, see below), `verification?`, `warnings` (the leg's `CallWarning`s; `inspectRun` reports none), `output?` (a completed run's accepted output) and `text`.
 
 | Code | `outcome` | When |
 | --- | --- | --- |
 | 0 | `completed` | The run finished with an accepted output (or a doctor report without errors) |
-| 1 | `failed` | An error ended it: a provider error, a store failure, a lost lease, a binding changed on resume |
+| 1 | `failed` | An error ended it: a provider error, a store failure, a lost lease, a binding changed on resume, answers the resume could not take |
 | 2 | — | Usage: your own command line could not parse its arguments |
 | 3 | `pending` | It waits: approvals, client tool results, calls whose effect is unknown, or (a stored run with no result) a resume |
 | 4 | `refused` | The model refused (stop reason `'refusal'`) |
@@ -71,7 +71,13 @@ console.log(done.outcome, done.output, exitCodeFor(done)); // completed Deployed
 
 A run that did not complete never exits 0. `process.exitCode = exitCodeFor(report)` is the whole contract for a shell.
 
-**Pending actions** each name the `resumeHeadless` option that answers them: `approval` (`approvalId`, `toolCallId`, `toolName`, `input`, `agentPath?`, `token?`; answer with `approvalResponses`, echoing a signed approval's `token`), `client-tool` (`clientToolResults`), `unknown-effect` (`toolCallId`, `toolName`, `input`, `modelStep?`; check the effect in the system it touched, then `retryToolCallIds` to run it again, or `reconciledToolResults` to record the result that landed) and `resume` (`phase`: the executor stopped before the run ended; a plain resume continues it). A failed run whose stored envelope records a transient cause (`AgentRunEnvelope.retry`) can be resumed with `retryFailed: true` (`references/native-execution.md`). `inspectRun` reports a run with no result as `in-progress` with a pending `resume`, plus any call whose outcome was never recorded; that picture is accurate only when no executor still drives the run. An unknown run ID rejects with a `TypeError`.
+**Pending actions** each name the `resumeHeadless` option that answers them (`resumeWith`): `approval` (`approvalId`, `toolCallId`, `toolName`, `input`, `agentPath?`, `token?`; `'approvalResponses'`, echoing a signed approval's `token`), `client-tool` (`'clientToolResults'`), `unknown-effect` (`toolCallId`, `toolName`, `input`, `modelStep?`; `resumeWith: ['retryToolCallIds', 'reconciledToolResults']`: check the effect in the system it touched, then list the call in `retryToolCallIds` to run it again, or give the result that landed in `reconciledToolResults` so it never runs again; every unknown effect of the run needs an answer in the same resume) and `resume` (`phase`: the executor stopped before the run ended; a plain resume continues it).
+
+**A failure in transit.** A report's `retry` says the stored run failed in transit (a model call with a retryable network or provider error, a transport timeout, an open breaker or a stream that broke off; a budget admission refused with a serialization conflict). The outcome keeps its code, `failed` (1), or `limit` (6) for a transport timeout, and `inspectRun` shows `retry` too. Resume with `retryFailed: true` to go on from the run's last checkpoint; completed calls do not run again (`references/native-execution.md`). A retried resume that stops again before its first write keeps `retry`: answer what it waits for and pass `retryFailed: true` once more.
+
+**Answers a resume refuses.** On a run that has not ended, a resume that cannot take its answers fails before anything is written, with the `TypeError` in the report's `error` (exit 1, no `retry`): a client result or a recorded result (`reconciledToolResults`) for a call the run does not wait on, or a call listed in both `retryToolCallIds` and `reconciledToolResults`. A changed binding, and `retryFailed` for a failure that was not transient, are refused the same way on any run. A resume of a run that ended, and is not retried, returns its stored result and ignores the other answers. A verdict or a `retryToolCallIds` entry that matches no pending call is ignored; a resume that answers nothing else leaves the run waiting (exit 3) and writes nothing.
+
+`inspectRun` reports a run with no result as `in-progress` with a pending `resume`, plus any call whose outcome was never recorded; that picture is accurate only when no executor still drives the run. An unknown run ID rejects with a `TypeError`.
 
 ## Project instructions
 
