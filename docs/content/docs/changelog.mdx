@@ -30,7 +30,8 @@ provider behaviour is verified offline and labelled not live-verified.
   `AgentRunStore.list`, `findStaleAgentRuns`, and the opt-in
   `reconciledToolResults` and `retryFailed` resume options. A resume answers a
   call whose receipt records its outcome from that receipt, without gating it
-  for approval again.
+  for approval again, saves what its settle answered before its first model
+  call, and keeps the client results it was given across a crash.
   → [Native agents](/docs/modules/native-agents#one-path-for-every-tool-call)
 - **Native memory, chat and fail-over** — `memory`, `chat` and `fallbackModels`
   in `runAgent` and `streamAgent`, bound to the checkpoint and the resume
@@ -58,7 +59,11 @@ provider behaviour is verified offline and labelled not live-verified.
   Streamable HTTP and stdio. → [MCP server](/docs/modules/mcp-server)
 - **A2A** (`/a2a`) — an edge-safe, dependency-free A2A 1.0.0 client and handler
   over JSON-RPC and HTTP+JSON, and `createA2AAgentExecutor`, which serves a
-  native agent run as the handler's executor. → [A2A](/docs/modules/a2a)
+  native agent run as the handler's executor: answers are checked against the
+  run before anything is written (a signed approval echoes its token), a
+  drained run goes on at the next message, a failed task names only the
+  error's code or name, and a run with output guardrails streams no drafts
+  unless `drafts: true`. → [A2A](/docs/modules/a2a)
 - **Realtime voice** (`/realtime`) — OpenAI Realtime and Gemini Live over
   WebSocket, with Deuz tools, ephemeral browser tokens and per-modality usage.
   → [Realtime voice](/docs/modules/realtime)
@@ -78,13 +83,15 @@ provider behaviour is verified offline and labelled not live-verified.
   → [UI streaming](/docs/modules/ui-streaming#native-agent-runs-todeuzagentstreamresponse-23)
 - **Evals** (`runEvalSuite` on `/testing`) — versioned tasks with per-attempt
   metrics for success, false completion, cost, rescues, repeated effects and
-  recovery. The baseline runs 22 offline tasks and 32 fault-injection
-  scenarios on every `npm test`. → [Evals](/docs/modules/evals)
+  recovery. The baseline runs 22 offline tasks and 33 fault-injection
+  scenarios (22 recovered, 11 contained) on every `npm test`.
+  → [Evals](/docs/modules/evals)
 - **Headless preview** (`/headless`, Node-only) — `runHeadless`,
   `resumeHeadless`, `inspectRun`, `doctor`, project instructions and documented
-  exit codes; no binary. A report names both answers to an unknown effect and
-  marks a failure in transit as retryable (`retry`), and `resumeHeadless` takes
-  `reconciledToolResults` and `retryFailed`. → [Headless](/docs/modules/headless)
+  exit codes; no binary. A report names both answers to an unknown effect,
+  marks a failure in transit as retryable (`retry`) and reports a drained run
+  as pending (exit 3), and `resumeHeadless` takes `reconciledToolResults` and
+  `retryFailed`. → [Headless](/docs/modules/headless)
 - **Examples** — seven new keyless examples (14–20): native memory, chat and
   fail-over, the native UI bridge, goals and wakeups, realtime and batch on
   scripted wires, an MCP server, and a native agent served over A2A.
@@ -98,15 +105,23 @@ start-up commit fails releases its lease and heartbeat. The Postgres stores
 retry serialization failures and deadlocks. `streamObject`'s `warnings` no
 longer hangs on a failed call, and `agentTool` child sessions no longer collide
 when a provider reuses a call id. Every Gemini finish reason is mapped on
-purpose (a Gemini filter no longer ends a turn with `stop`), an OpenAI
-Responses turn that its content filter cut off ends with `content_filter`, and
-an OpenAI refusal is kept as `stopDetails` instead of being dropped.
+purpose (a Gemini filter no longer ends a turn with `stop`; the stops without a
+usable answer still end it with `stop`, and the `finish` part keeps Gemini's
+own value as `providerMetadata.google.finishReason`), an OpenAI Responses turn
+that its content filter cut off ends with `content_filter`, and an OpenAI
+refusal is kept as `stopDetails` instead of being dropped.
 
 A native run that 2.3 saved with `mcp`, handoffs, `memory`, `chat` or
-`fallbackModels` (its resume binding records them; memory, a chat projection or
-fail-over state also make the envelope version 2), or with a failed receipt,
-needs 2.3 to resume. OpenAI Responses requests send `store: false`, and
-`validateChatRequest` accepts the tool results `useChat` posts.
+`fallbackModels` needs 2.3 to resume: its resume binding records them, and
+memory, a chat projection or fail-over state also make the envelope version 2.
+So does a run that waits on an approval (2.2 looks a verdict up by the bare
+tool call ID, so it would answer the approved call as denied), and a run
+stopped with an open call 2.2 would answer wrongly (a `failed` or `suspended`
+receipt, a client call a resume took up and still waits on, a call the
+approval gate issued a request for), until a checkpoint answers the call: such
+an envelope is version 2 as well. OpenAI Responses requests send
+`store: false`, and `validateChatRequest` accepts the tool results `useChat`
+posts.
 `CallWarning['type']`, `BudgetLedgerErrorCode`, `AgentToolReceipt['stage']` and
 `AgentRunEnvelope.version` are widened.
 
