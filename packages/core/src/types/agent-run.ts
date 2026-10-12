@@ -645,10 +645,11 @@ export type AgentRunOptions<T = string> = Omit<
    * model call that failed with a retryable transport or provider error or
    * whose stream broke off, or a budget admission refused with a serialization
    * conflict) goes on from its last checkpoint, in the phase it failed in, with
-   * every check of a resume. The failed call stays counted, as a model step and,
-   * while its outcome is unknown, in the accounting at its estimate; the retried
-   * call is reserved anew. Any other failure fails the resume with a TypeError
-   * before anything is written. Ignored for a run that did not fail.
+   * every check of a resume. The failed call stays counted, as a model step (a
+   * final answer also as one of `maxOutputAttempts`) and, while its outcome is
+   * unknown, in the accounting at its estimate; the retried call is reserved
+   * anew. Any other failure fails the resume with a TypeError before anything
+   * is written. Ignored for a run that did not fail.
    */
   retryFailed?: boolean;
   /** Results for pending client-side tool calls, supplied only on resume. */

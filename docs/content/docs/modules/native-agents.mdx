@@ -406,8 +406,9 @@ a run with a transient cause with `retryFailed: true` and it goes on from its
 last checkpoint, in the phase it failed in, after every check of a resume:
 completed calls answer from their receipts and never run again, and an unknown
 effect still stops it for reconciliation. The failed call stays counted, as a
-model step (and a finalization attempt when it was the final answer) and, while
-its outcome is unknown, in the accounting at its estimate. The retried call is
+model step (and, when it was the final answer, as one of the run's
+`maxOutputAttempts`, as after a crash) and, while its outcome is unknown, in the
+accounting at its estimate. The retried call is
 reserved on its own, so nothing is counted twice. For any other failure a resume
 with `retryFailed` fails with a `TypeError` and writes nothing; for a run that
 did not fail the option is ignored.
