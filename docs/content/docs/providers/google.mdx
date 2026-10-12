@@ -235,3 +235,17 @@ const { object } = await generateObject({
 ```
 
 See [generateObject](/docs/core/generate-object) for the strategy picker and repair retry.
+
+## Finish reasons
+
+The native wire maps every `FinishReason` value of `@google/genai` 2.28 onto `finishReason` (2.3):
+
+| Gemini `finishReason` | `finishReason` |
+| --- | --- |
+| `STOP`, `FINISH_REASON_UNSPECIFIED` | `'stop'` |
+| `MAX_TOKENS`, `CONTINUATION` (Deuz sends no continuation token) | `'length'` |
+| `SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`, and a blocked prompt (`promptFeedback.blockReason`) | `'content_filter'` |
+| `LANGUAGE`, `OTHER`, `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`, `NO_IMAGE`, `IMAGE_OTHER`: the turn stopped without a usable answer | `'error'` |
+| A value 2.28 does not list | `'stop'` |
+
+Gemini finishes a turn that called a function with `STOP`, so a turn that streamed a call ends with `'tool_calls'`, unless a filter or a limit stopped it. Such a turn ends with `'content_filter'` or `'length'`, and none of its calls runs. Before 2.3 `SPII`, the two image filters, `CONTINUATION` and the stops in the `'error'` row ended a turn with `'stop'`, and a call won over every reason. A Gemini stop carries no `stopDetails`: the candidate's `finishMessage` is not read. Batch results map the same values. The OpenAI-compat surface (`createGoogle`) reads the endpoint's Chat Completions `finish_reason` instead. The shapes follow `@google/genai` 2.28's types; not live-verified.

@@ -223,3 +223,28 @@ The request hits `<baseURL>/chat/completions`. Because unknown slugs fall back t
 ## Tools and structured output
 
 Both surfaces support tools (function calling) and structured output. Pass `tools` to [`streamChat`](/docs/core/stream-chat) / [`generateText`](/docs/core/generate-text) for the agentic loop, or use [`generateObject`](/docs/core/generate-object) for schema-validated output. On Chat Completions, JSON mode emits a `json_schema` `response_format`; on Responses it emits `text.format`. The Responses surface keys streamed tool-call argument fragments by `item_id`, while Chat Completions keys them by `index` — both accumulate fragments as strings and parse the JSON once.
+
+## Finish reasons and refusals
+
+Chat Completions' `finish_reason` maps one to one onto `finishReason` (`stop`, `length`, `tool_calls`, `content_filter`; the deprecated `function_call` is `tool_calls`). A Responses turn ends with `length` when the response is incomplete because of `max_output_tokens`, and with `content_filter` when its content filter cut it off (2.3; it ended with `'stop'`, or `'tool_calls'` after a function call, before). Otherwise it ends with `tool_calls` after a function call and with `stop` without one.
+
+When the model refuses, OpenAI sends its refusal text in place of an answer: `delta.refusal` on Chat Completions, a `refusal` content part (`response.refusal.delta`, `response.refusal.done`) on Responses. Since 2.3 such a turn ends with `finishReason: 'content_filter'`, unless the provider reported `length` or `content_filter` itself, and the text is the stop's explanation:
+
+```ts title="openai-refusal.ts"
+import { generateText } from '@deuz-sdk/core';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+const result = await generateText({
+  model: openai('gpt-5.5'),
+  messages: [{ role: 'user', content: 'Summarize this contract.' }],
+});
+
+if (result.finishReason === 'content_filter') {
+  // A refusal: stopDetails is { type: 'refusal', explanation: <the refusal text> }.
+  console.log(result.stopDetails?.explanation);
+}
+```
+
+The refusal never becomes answer text: `text` stays empty. Every result that reports [`stopDetails`](/docs/reference/support-matrix#protocols) carries it, and the `finish` part keeps the text as `providerMetadata.openai.refusal`. A refused turn dispatches none of its tool calls, a native run stops with reason `'refusal'`, and `generateObject` fails with a `NoObjectGeneratedError` whose `stopDetails` holds the explanation. Batch results end the same way. Before 2.3 the refusal was dropped and the turn ended with `'stop'`, so a refused answer looked like an empty one. The shapes follow `openai` 7.32's types; not live-verified.
