@@ -515,6 +515,59 @@ describe('runEvalSuite: faults and recovery', () => {
       failed: 1,
     });
   });
+
+  it('never calls an attempt that repeated an effect recovered, rescued or contained', async () => {
+    const charged = (context: EvalTaskContext) => {
+      context.interrupt('after-effect-before-receipt');
+      context.effect('charge:order-7');
+      context.effect('charge:order-7');
+    };
+    const report = await runEvalSuite([
+      task({
+        id: 'completed-twice',
+        fault,
+        run: async (context) => {
+          charged(context);
+          return { ...completed(), recovery: 'reconciled' };
+        },
+      }),
+      task({
+        id: 'rescued-twice',
+        fault,
+        run: async (context) => {
+          charged(context);
+          context.rescue('chose retryToolCallIds');
+          return { ...completed(), recovery: 'reconciled' };
+        },
+      }),
+      task({
+        id: 'stopped-twice',
+        fault: { boundary: 'after-effect-before-receipt', recovery: 'stopped' },
+        acceptance: [{ name: 'stops as documented', check: (o) => o.status === 'stopped' }],
+        run: async (context) => {
+          charged(context);
+          return { status: 'stopped', recovery: 'stopped' };
+        },
+      }),
+    ]);
+    expect(
+      report.tasks.map((t) => {
+        const a = t.attempts[0]!;
+        return [a.success, a.recovery, a.repeatedEffects, a.failures];
+      }),
+    ).toEqual([
+      [false, 'failed', 1, ['repeated effect: charge:order-7']],
+      [false, 'failed', 1, ['repeated effect: charge:order-7']],
+      [false, 'failed', 1, ['repeated effect: charge:order-7']],
+    ]);
+    expect(report.aggregate.offline!.recovery).toEqual({
+      'not-needed': 0,
+      recovered: 0,
+      rescued: 0,
+      contained: 0,
+      failed: 3,
+    });
+  });
 });
 
 describe('runEvalSuite: tiers, skips and validation', () => {

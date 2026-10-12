@@ -212,8 +212,10 @@ local function key_base(key, name) return string.sub(key, 1, #key - #name) end
 /**
  * `hscan(key, cursor, count)`: one `HSCAN` page, as its next cursor (`'0'` once
  * the scan is done) and a list of field, value, field, value. Redis hands the
- * nested list over 1-indexed and ioredis-mock (fengari) 0-indexed, so it is
- * read either way. Only the scripts that scan include it.
+ * nested list over as a 1-indexed table and ioredis-mock (fengari) as a
+ * JavaScript array, 0-indexed, whose `#` is its length (not its last index,
+ * as for a Lua table), so it is read either way. Only the scripts that scan
+ * include it.
  */
 export const LUA_HSCAN = `
 local function hscan(key, cursor, count)

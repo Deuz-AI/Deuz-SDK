@@ -189,6 +189,21 @@ describe('Redis agent run listing', () => {
     await ops.agentRuns.save(envelope('odd', 2));
     expect(ids(await ops.agentRuns.list())).toEqual(['odd']);
   });
+
+  it('leaves a run in an unknown phase out of a listing that names every phase, as the SQL stores do', async () => {
+    const { ops } = fresh();
+    const every = ['running', 'finalizing', 'terminal'] as const;
+    await ops.agentRuns.save(envelope('ok', 1));
+    await ops.agentRuns.save(envelope('odd', 1, { phase: 'paused' as 'running' }));
+    await ops.agentRuns.save(envelope('near', 1, { phase: 'paused' as 'running', scope: 'other' }));
+    // Every known phase, named in one list or split over two, is the same filter.
+    expect(ids(await ops.agentRuns.list({ phases: ['running', 'finalizing'] }))).toEqual(['ok']);
+    expect(ids(await ops.agentRuns.list({ phases: [...every] }))).toEqual(['ok']);
+    expect(ids(await ops.agentRuns.list({ phases: [...every], scope: 'tenant' }))).toEqual(['ok']);
+    expect(ids(await ops.agentRuns.list({ phases: [...every], scope: 'other' }))).toEqual([]);
+    // Without a phase filter the listing still refuses the unknown phase.
+    await expect(ops.agentRuns.list()).rejects.toThrow(/has an unknown phase/);
+  });
 });
 
 describe('findStaleAgentRuns on the Redis ops store', () => {

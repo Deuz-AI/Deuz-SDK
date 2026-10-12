@@ -213,6 +213,30 @@ it('serves the mock clock to now_ms', async () => {
   expect(replyNumber(await read(server.client, ['{t}:x'], []))).toBe(1_700_000_002_000);
 });
 
+it("reads ioredis-mock's 0-indexed HSCAN reply whole, its last value included", async () => {
+  const client = mockRedisServer().client;
+  // The nested list is a JavaScript array: element 0 is the first field, and
+  // its Lua length is the array's length, not the last index.
+  const run = script(`${LUA_HSCAN}
+    for i = 1, num(ARGV[1]) do redis.call('HSET', KEYS[1], 'f' .. int(i), 'v' .. int(i)) end
+    local list = redis.call('HSCAN', KEYS[1], '0', 'COUNT', '100')[2]
+    local first = '1'
+    if list[0] ~= nil then first = '0' end
+    local cursor, rows = hscan(KEYS[1], '0', '100')
+    local out = {first, int(#list), cursor}
+    for i = 1, #rows do out[#out + 1] = rows[i] end
+    return arr(out)`);
+  for (const size of [1, 2, 5]) {
+    const pairs = Array.from({ length: size }, (_, i) => [`f${i + 1}`, `v${i + 1}`]).flat();
+    expect(replyList(await run(client, [`{t}:${size}`], [String(size)])).map(replyText)).toEqual([
+      '0',
+      String(2 * size),
+      '0',
+      ...pairs,
+    ]);
+  }
+});
+
 describe.skipIf(!liveRedisUrl)('live Redis', () => {
   let server: Awaited<ReturnType<typeof liveRedisServer>>;
   beforeAll(async () => {

@@ -447,9 +447,10 @@ function entriesBelow(at: number, runId?: string): string | undefined {
 /** The indexes holding exactly the runs a listing asks for. */
 function runIndexes(ix: string, plan: AgentRunListPlan): string[] {
   const scope = plan.scope === undefined ? undefined : hexUnits(plan.scope);
-  // The plan's phases are distinct: three of them are every phase.
-  if (plan.phases === undefined || plan.phases.length === 3)
-    return [scope === undefined ? ix : `${ix}:sc:${scope}`];
+  // Even all three phases are read phase by phase: the every-run index also
+  // holds a run whose envelope records an unknown phase, which a phase list
+  // leaves out, as the SQL stores' `phase IN (...)` does.
+  if (plan.phases === undefined) return [scope === undefined ? ix : `${ix}:sc:${scope}`];
   return plan.phases.map((phase) =>
     scope === undefined ? `${ix}:ph:${phase}` : `${ix}:ps:${phase}:${scope}`,
   );
