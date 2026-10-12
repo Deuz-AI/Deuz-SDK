@@ -1063,7 +1063,8 @@ reference, and the error classes 2.3 adds, with their codes, in
   not trust.
 - **Budgets.** Admission is an estimate against holds, not a cap the provider
   enforces. The hold of a model call that failed over stays counted against the
-  shared execution.
+  shared execution, and with persistent admission it stays an open hold until
+  a [sweep](/docs/modules/budgets#open-holds) closes it.
 - **Sandbox.** After a timeout, a program the shell started that still holds
   the output pipes is not killed.
 

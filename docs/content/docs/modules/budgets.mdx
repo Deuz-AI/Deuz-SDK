@@ -107,14 +107,19 @@ price table. Under the USD budget of an execution context (`runAgent`, swarms,
 `evolve`, or an `execution` passed to `generateText` and `streamChat`), such a
 call runs by default:
 
-- its tokens are still reserved, bounded and settled;
+- its tokens are still reserved and bounded, and the tokens it used are
+  recorded. Once the call reports its usage, its ledger entry ends in state
+  `'unknown'`, not `'settled'`: the tokens are known (`actual.tokens`), the
+  dollars are not (`actual.usd` stays undefined);
 - its cost is left out of every USD total, so `spent.usd` counts the priced
-  calls only. `accounting.unpriced` counts the unpriced ones, which also stay in
+  calls only. The ledger's totals count the unpriced calls in `unpriced`
+  (`accounting.unpriced` on a run's result), and they also stay in
   `unknownUsd` because their cost is unknown;
-- each run reports one `unpriced-model` warning per model through
+- each leg of a run reports one `unpriced-model` warning per model through
   `deps.logger`, and an agentic loop also on its result's `warnings` and as a
-  `warning` part on its stream. Runs that share an execution context each
-  report it; a swarm or `evolve` run reports it once for all its tasks.
+  `warning` part on its stream. A resumed run is a new leg, so it reports the
+  warning again. Runs that share an execution context each report it; a swarm
+  or `evolve` run reports it once for all its tasks in each leg.
 
 ```ts
 import { runAgent } from '@deuz-sdk/core/agent';
@@ -382,10 +387,20 @@ until you [prune](#retention) them.
 ## Open holds
 
 A hold stays open when its caller never settles or releases it: the process
-crashed after reserving, or every attempt to settle failed. An open hold keeps
-its estimate charged. In a windowed budget it leaves with its bucket; in a
-lifetime budget it stays until you close it. Since 2.3 the memory, SQLite,
-Postgres and Redis stores list and close open holds:
+crashed after reserving, or every attempt to settle failed. It also stays open,
+by design, when a model call fails without reporting its usage (a network
+error, a transport timeout, a 5xx or 529 answer, a stream that broke off), since
+nothing says what the provider billed. That includes the failed attempt of a
+call that [failed over](/docs/modules/native-agents#model-fail-over) to the
+next of its `fallbackModels`: the attempt stays held at its estimate, in the
+ledger as an entry in state `'unknown'` and, with persistent admission, in the
+store as an open hold, so a fallback never spends past the shared budget. An
+answer the provider does not bill (400, 401, 403, 404, 422 or 429) releases
+the attempt's hold instead.
+
+An open hold keeps its estimate charged. In a windowed budget it leaves with
+its bucket; in a lifetime budget it stays until you close it. Since 2.3 the
+memory, SQLite, Postgres and Redis stores list and close open holds:
 
 - `holds({ before, limit?, after? })` lists the holds reserved before a time,
   oldest first, a page at a time: request ID, model, held estimates, the time it

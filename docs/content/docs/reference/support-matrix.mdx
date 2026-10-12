@@ -19,7 +19,7 @@ The test files below are named without their `.test.ts` suffix and live in `pack
 
 ## Models
 
-Every row here is new in 2.3 or got new rules in 2.3. The request rules each row applies are on [Model profiles](/docs/modules/model-profiles); prices are on [Pricing](/docs/modules/pricing). A model without a bundled price still runs: under a USD budget it reports one `unpriced-model` warning, or is refused with `unknownPrice: 'reject'` ([Models without a price](/docs/modules/budgets#models-without-a-price)).
+Every row here is new in 2.3 or got new rules in 2.3. The request rules each row applies are on [Model profiles](/docs/modules/model-profiles); prices are on [Pricing](/docs/modules/pricing). A model without a bundled price still runs: under a USD budget it reports an `unpriced-model` warning, or is refused with `unknownPrice: 'reject'` ([Models without a price](/docs/modules/budgets#models-without-a-price)).
 
 | Models | Wire | Documented | Fixture-tested | Bundled price | Live |
 | --- | --- | --- | --- | --- | --- |
