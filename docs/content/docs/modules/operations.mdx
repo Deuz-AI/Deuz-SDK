@@ -799,6 +799,14 @@ executor died; to take it up at once, resume it by its run ID. Unlike a drained
 swarm, which settles as `'suspended'`, a drained native run keeps its phase,
 `'running'` or `'finalizing'`.
 
+A run served over A2A
+([`createA2AAgentExecutor`](/docs/modules/a2a#stopped-and-failed-runs)) is
+drained the same way: its task asks for input with a
+`{ type: 'stopped', reason: 'drained' }` part, and the client's next message
+resumes the run. When the drain stopped a resume before it took the message's
+answers up, the task lists the pending actions again instead, for the client to
+answer once more.
+
 Where the run stops depends on where the drain finds it:
 
 - **During a step.** At the boundary after the step's tool calls. A model call
