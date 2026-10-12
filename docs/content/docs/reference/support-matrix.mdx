@@ -12,7 +12,7 @@ A model in the registry, or a protocol in a module, is not a promise that it wor
 | **Live-verified** | Checked against the provider's real API with a real key. |
 
 <Callout type="warn" title="Nothing in 2.3 is live-verified">
-No model row and no protocol 2.3 added was run against a live provider, so the live column below is "no" everywhere, and `resolveModelProfile(model).liveVerified` is always `false`. The repository's opt-in live smoke tests (`packages/core/test/live`, `npm run test:live -w @deuz-sdk/core`, keys in `.env.smoke`) date from before 2.3: they call DeepSeek `deepseek-v4-flash`, Gemini `gemini-3.6-flash` and xAI `grok-4.5`. 2.3 added five [real-model eval tasks](/docs/modules/evals#real-model-tasks) to the same command; they are defined but have never run. None of these ran for 2.3.
+No model row and no protocol 2.3 added was run against a live provider, so the live column below is "no" everywhere, and `resolveModelProfile(model).liveVerified` is always `false`. The repository's opt-in live smoke tests (`packages/core/test/live`, `npm run test:live -w @deuz-sdk/core`, keys in `.env.smoke`) date from before 2.3: they call DeepSeek `deepseek-v4-flash`, Gemini `gemini-3.6-flash` and xAI `grok-4.5`. 2.3 added ten [real-model eval tasks](/docs/modules/evals#real-model-tasks) to the same command, and defines an eleventh, the batch twin, that no runner submits; they are defined but have never run. None of these ran for 2.3.
 </Callout>
 
 The test files below are named without their `.test.ts` suffix and live in `packages/core/test`.
