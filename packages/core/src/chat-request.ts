@@ -91,6 +91,15 @@ export interface ValidateChatOptions {
    */
   maxOpaqueReasoningBytes?: number;
   /**
+   * Per-message budget in UTF-8 bytes for provider round-trip data (2.3): the
+   * `providerMetadata` of the message and of each of its parts (a Gemini
+   * function call's or text's thought signature, OpenAI's `phase`), and every
+   * reasoning `signature` (Claude). Default 1_000_000. `useChat` posts all of
+   * it back, and none of it counts against `maxTextBytes`; before 2.3 nothing
+   * bounded it at all.
+   */
+  maxProviderMetadataBytes?: number;
+  /**
    * Reject `role: 'system'` inside the client's messages. Default TRUE — this
    * is the live vector. Opt out only if the client legitimately owns the system
    * prompt (a local playground, never a multi-tenant deployment).
@@ -140,6 +149,9 @@ const DEFAULT_MAX_TEXT_BYTES = 100_000;
 
 /** Default per-message cap on opaque reasoning payloads (`maxOpaqueReasoningBytes`): 1 MB. */
 const DEFAULT_MAX_OPAQUE_REASONING_BYTES = 1_000_000;
+
+/** Default per-message cap on provider round-trip data (`maxProviderMetadataBytes`): 1 MB. */
+const DEFAULT_MAX_PROVIDER_METADATA_BYTES = 1_000_000;
 
 /**
  * Issue budget. A 1000-message hostile body must not amplify into 1000 strings
@@ -263,7 +275,8 @@ interface Walk {
  * `tool_use.input` with 40 levels of nesting around a 50 MB string is an obvious
  * attempt to hide volume from the cap, and "I could not measure this" must never
  * read as "this is small". Typed-array payloads count as 0 rather than walking a
- * megabyte of numbers one element at a time.
+ * megabyte of numbers one element at a time. An object's keys count like its
+ * values (2.3): before, a 40 MB key name passed every cap.
  */
 function countTextBytes(value: unknown, budget: number, depth: number, walk: Walk): number {
   if (typeof value === 'string') {
@@ -278,7 +291,8 @@ function countTextBytes(value: unknown, budget: number, depth: number, walk: Wal
   }
   walk.seen.add(value);
   let total = 0;
-  for (const entry of Array.isArray(value) ? value : Object.values(value)) {
+  const entries = Array.isArray(value) ? value : Object.entries(value).flat();
+  for (const entry of entries) {
     total += countTextBytes(entry, Math.max(0, budget - total), depth + 1, walk);
     if (total > budget) return total;
   }
@@ -313,23 +327,36 @@ function isOpaqueReasoning(part: Record<string, unknown>): boolean {
  * this pure validator cannot do for you. Opaque reasoning (2.3, see
  * `isOpaqueReasoning`) is provider state, not prose, and `useChat` posts every
  * block of a turn back, so it is counted on its own, against `opaqueBudget`.
+ * So is provider round-trip data (2.3): every `providerMetadata` and every
+ * reasoning `signature`, against `metadataBudget`.
  */
 function messageTextBytes(
   message: Record<string, unknown>,
   budget: number,
   opaqueBudget: number,
-): { bytes: number; opaqueBytes: number; tooDeep: boolean } {
+  metadataBudget: number,
+): { bytes: number; opaqueBytes: number; metadataBytes: number; tooDeep: boolean } {
   const walk: Walk = { seen: new WeakSet<object>(), tooDeep: false };
+  let metadata = 0;
+  const countMetadata = (value: unknown): void => {
+    if (value === undefined || metadata > metadataBudget) return;
+    metadata += countTextBytes(value, Math.max(0, metadataBudget - metadata), 0, walk);
+  };
+  countMetadata(message.providerMetadata);
   const content = message.content;
   if (typeof content === 'string') {
     const bytes = countTextBytes(content, budget, 0, walk);
-    return { bytes, opaqueBytes: 0, tooDeep: walk.tooDeep };
+    return { bytes, opaqueBytes: 0, metadataBytes: metadata, tooDeep: walk.tooDeep };
   }
-  if (!Array.isArray(content)) return { bytes: 0, opaqueBytes: 0, tooDeep: false };
+  if (!Array.isArray(content)) {
+    return { bytes: 0, opaqueBytes: 0, metadataBytes: metadata, tooDeep: walk.tooDeep };
+  }
   let total = 0;
   let opaque = 0;
   for (const part of content) {
     if (!isRecord(part)) continue;
+    countMetadata(part.providerMetadata);
+    if (part.type === 'reasoning') countMetadata(part.signature);
     if (isOpaqueReasoning(part)) {
       opaque += countTextBytes(part.text, Math.max(0, opaqueBudget - opaque), 0, walk);
       if (opaque > opaqueBudget) break;
@@ -347,7 +374,7 @@ function messageTextBytes(
     total += countTextBytes(payload, Math.max(0, budget - total), 0, walk);
     if (total > budget) break;
   }
-  return { bytes: total, opaqueBytes: opaque, tooDeep: walk.tooDeep };
+  return { bytes: total, opaqueBytes: opaque, metadataBytes: metadata, tooDeep: walk.tooDeep };
 }
 
 // ===================================================================
@@ -361,6 +388,7 @@ interface Gates {
   rejectAssistantTurns: boolean;
   maxTextBytes: number;
   maxOpaqueReasoningBytes: number;
+  maxProviderMetadataBytes: number;
 }
 
 type Fail = (issue: string) => void;
@@ -534,7 +562,12 @@ function validateMessage(
       `${path}.providerMetadata must be an object when present; got ${typeOf(value.providerMetadata)}.`,
     );
   }
-  const size = messageTextBytes(value, gates.maxTextBytes, gates.maxOpaqueReasoningBytes);
+  const size = messageTextBytes(
+    value,
+    gates.maxTextBytes,
+    gates.maxOpaqueReasoningBytes,
+    gates.maxProviderMetadataBytes,
+  );
   if (size.tooDeep) {
     fail(
       `${path} has a content payload nested deeper than ${MAX_WALK_DEPTH} levels — its size cannot be accounted for, so it is refused.`,
@@ -546,6 +579,10 @@ function validateMessage(
   } else if (size.opaqueBytes > gates.maxOpaqueReasoningBytes) {
     fail(
       `${path} carries more than ${gates.maxOpaqueReasoningBytes} bytes of encrypted or redacted reasoning.`,
+    );
+  } else if (size.metadataBytes > gates.maxProviderMetadataBytes) {
+    fail(
+      `${path} carries more than ${gates.maxProviderMetadataBytes} bytes of provider metadata (providerMetadata and reasoning signatures).`,
     );
   }
 }
@@ -567,6 +604,8 @@ export function validateChatRequest(
     rejectAssistantTurns: options.rejectAssistantTurns ?? false,
     maxTextBytes: options.maxTextBytes ?? DEFAULT_MAX_TEXT_BYTES,
     maxOpaqueReasoningBytes: options.maxOpaqueReasoningBytes ?? DEFAULT_MAX_OPAQUE_REASONING_BYTES,
+    maxProviderMetadataBytes:
+      options.maxProviderMetadataBytes ?? DEFAULT_MAX_PROVIDER_METADATA_BYTES,
   };
 
   const issues: string[] = [];

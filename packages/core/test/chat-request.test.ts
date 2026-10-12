@@ -489,6 +489,81 @@ describe('volume limits', () => {
     ]);
   });
 
+  it('bounds provider metadata by its own per-message cap, maxProviderMetadataBytes (2.3)', () => {
+    const big = (bytes: number) => ({ google: { thoughtSignature: 's'.repeat(bytes) } });
+    const turn = (
+      parts: Array<Record<string, unknown>>,
+      providerMetadata?: Record<string, unknown>,
+    ) => ({
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          content: parts,
+          ...(providerMetadata ? { providerMetadata } : {}),
+        },
+      ],
+    });
+    const call = (id: string, bytes: number) => ({
+      type: 'tool_use',
+      id,
+      name: 'x',
+      input: {},
+      providerMetadata: big(bytes),
+    });
+    const ISSUE =
+      'messages[1] carries more than 1000000 bytes of provider metadata (providerMetadata and reasoning signatures).';
+    // Before 2.3 none of it counted: megabytes rode along under every default.
+    expect(
+      issues(validateChatRequest(turn([{ type: 'text', text: 'ok' }], big(2_000_000)))),
+    ).toEqual([ISSUE]);
+    expect(
+      issues(
+        validateChatRequest(turn([{ type: 'text', text: 'ok', providerMetadata: big(2_000_000) }])),
+      ),
+    ).toEqual([ISSUE]);
+    expect(issues(validateChatRequest(turn([call('c1', 2_000_000)])))).toEqual([ISSUE]);
+    // A reasoning block's signature is round-trip data too.
+    expect(
+      issues(
+        validateChatRequest(
+          turn([{ type: 'reasoning', text: 'r', signature: 'g'.repeat(2_000_000) }]),
+        ),
+      ),
+    ).toEqual([ISSUE]);
+    // Summed over the message: many signed calls fit, an unbounded payload does not.
+    expect(validateChatRequest(turn([call('c1', 400_000), call('c2', 400_000)])).ok).toBe(true);
+    expect(issues(validateChatRequest(turn([call('c1', 600_000), call('c2', 600_000)])))).toEqual([
+      ISSUE,
+    ]);
+    // Configurable, and apart from the text budget.
+    const small = { maxProviderMetadataBytes: 100, maxTextBytes: 100 };
+    expect(validateChatRequest(turn([call('c1', 50)]), small).ok).toBe(true);
+    expect(joined(validateChatRequest(turn([call('c1', 200)]), small))).toContain(
+      'more than 100 bytes of provider metadata',
+    );
+  });
+
+  it('counts object keys too, so a payload cannot hide its volume in key names (2.3)', () => {
+    const key = 'k'.repeat(200_000);
+    const input = validateChatRequest({
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'c1', name: 'x', input: { [key]: 1 } }],
+        },
+      ],
+    });
+    expect(joined(input)).toContain('messages[0] carries more than 100000 text bytes');
+    const metadata = validateChatRequest(
+      { messages: [{ role: 'user', content: 'hi', providerMetadata: { [key]: 1 } }] },
+      { maxProviderMetadataBytes: 100_000 },
+    );
+    expect(joined(metadata)).toContain(
+      'messages[0] carries more than 100000 bytes of provider metadata',
+    );
+  });
+
   it('a payload nested past the walk depth is REFUSED, not waved through', () => {
     // The bypass this closes: bury the volume deeper than the byte walk goes and
     // it used to count as zero. Fail-closed — "cannot measure" is not "small".
