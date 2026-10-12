@@ -1,4 +1,4 @@
-<!-- verified: 2026-09-20 against @deuz-sdk/core@2.2.0 · api-contract sha256:c301da6ab500
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
      sources: skills/migrate-from-ai-sdk/SKILL.md, skills/migrate-from-ai-sdk/rules/{imports,streaming,tools,ui,telemetry,providers}.md,
      docs/content/docs/migration/from-vercel-ai-sdk.mdx, docs/content/docs/reference/whats-new-2-0.mdx,
      packages/core/src/types/{config,guardrails}.ts, packages/core/src/{autonomy,rag,memory,middleware,durable,runtime}.ts,
@@ -86,7 +86,7 @@ Mapping tables written before 2.0 list these as "absent" — including older cop
 | AI SDK feature | Status |
 | --- | --- |
 | `useCompletion`; Svelte / Vue / Angular bindings | No equivalent. Use `useChat` against a single-turn route, or drive `readDeuzStream` yourself. Only `@deuz-sdk/react` ships — the wire is plain SSE, so another binding is writable, but nothing ships one. |
-| `Output.array()` / element streaming | `streamObject` streams growing partials of **one** object; there is no per-element stream. |
+| `Output.array()` / element streaming | `streamObject` streams growing partials of **one** object, with no per-element stream. The native `streamAgent` does have one: with an array `output` and an `output.element` validator, `elementStream` yields each completed top-level element once it validates (`references/native-execution.md`). |
 | `contextSchema` / `toolsContext` (typed per-tool context) | `ToolExecuteContext` is a fixed shape. Use `runtimeContext` (untyped, per call) or close over what the tool needs. |
 | Codemods (`@ai-sdk/codemod`) | None. This file and the `migrate-from-ai-sdk` skill are the replacement. |
 | Hosted gateway / plain string model ids | Deliberately absent. `createProviderRegistry` is a local descriptor lookup with zero network. |
