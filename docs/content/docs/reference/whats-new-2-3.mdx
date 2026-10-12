@@ -301,13 +301,13 @@ every earlier message have to reach the API byte-identical on every later
 request, or the replayed block is invalid; on accounts opened from 2026-08-31
 that is a 400. The agentic loops now keep that prefix stable for these models:
 
-| Source of change                              | 2.2, and the other models in 2.3                                                 | Claude 5.x in 2.3                                |
-| --------------------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------ |
-| A system message in the middle of the history | Folded into the top-level system prompt on Gemini and older Claude models        | Sent in place                                    |
-| Memory recall                                 | Spliced into the system prompt at every call                                     | One appended system message per user turn        |
-| Handoff instructions                          | Replace the leading system turn                                                  | Appended after the transfer's tool result        |
-| A step that offers other tools                | A different `tools` array                                                        | The same array, plus an appended tool-set change |
-| Compaction and overflow recovery              | Layered: prune old tool results, prune old reasoning, summarize the oldest slice | One summary replaces the conversation            |
+| Source of change                              | 2.2, and the other models in 2.3                                                 | Claude 5.x in 2.3                                                                                                    |
+| --------------------------------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| A system message in the middle of the history | Folded into the top-level system prompt on Gemini and older Claude models        | Sent in place                                                                                                        |
+| Memory recall                                 | Spliced into the system prompt at every call                                     | One appended system message per user turn                                                                            |
+| Handoff instructions                          | Replace the leading system turn                                                  | Appended after the transfer's tool result                                                                            |
+| A step that offers other tools                | A different `tools` array                                                        | The same array, plus an appended tool-set change                                                                     |
+| Compaction and overflow recovery              | Layered: prune old tool results, prune old reasoning, summarize the oldest slice | One summary replaces the turns; the leading system messages, the run-state system messages and the pending turn stay |
 
 Chat Completions already sent a mid-conversation system message in place, and
 OpenAI Responses now does too, on every model (see
