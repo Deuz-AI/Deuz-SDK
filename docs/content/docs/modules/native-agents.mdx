@@ -408,10 +408,10 @@ completed calls answer from their receipts and never run again, and an unknown
 effect still stops it for reconciliation. The failed call stays counted, as a
 model step (and, when it was the final answer, as one of the run's
 `maxOutputAttempts`, as after a crash) and, while its outcome is unknown, in the
-accounting at its estimate. The retried call is
-reserved on its own, so nothing is counted twice. For any other failure a resume
-with `retryFailed` fails with a `TypeError` and writes nothing; for a run that
-did not fail the option is ignored.
+accounting at its estimate. The retried call is reserved on its own, so nothing
+is counted twice. For any other failure a resume with `retryFailed` fails with a
+`TypeError` and writes nothing; for a run that did not fail the option is
+ignored.
 
 ```ts
 import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '@deuz-sdk/core/agent';
