@@ -41,17 +41,17 @@ added. Two optional peers are new and one is wider:
 `@modelcontextprotocol/server` (`^2.3.1`, the MCP server), and `redis`, which
 now also accepts node-redis 6.
 
-| Entry                             | New surface                                                                                                                                     | Runtime   |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
-| `@deuz-sdk/core/mcp/server`       | `createMcpServer`                                                                                                                               | Edge-safe |
-| `@deuz-sdk/core/mcp/server/stdio` | `serveMcpStdio`                                                                                                                                 | Node      |
-| `@deuz-sdk/core/a2a`              | `fetchAgentCard`, `createA2AClient`, `createA2AHandler`, `createInMemoryA2ATaskStore`, `a2aText`, `A2AError`                                    | Edge-safe |
-| `@deuz-sdk/core/realtime`         | `createRealtimeSession`, `createOpenAIRealtime`, `createGeminiLive`, `createOpenAIClientSecret`, `createGeminiAuthToken`, `realtimePriceTable` | Edge-safe |
-| `@deuz-sdk/core/batch`            | `createBatchClient`, `createMemoryBatchJobStore`, `BatchError`                                                                                  | Edge-safe |
-| `@deuz-sdk/core/ops/redis`        | `createRedisOpsStore`, `createRedisBudgetStore`, `wrapIoredisClient`                                                                            | Node      |
-| `@deuz-sdk/core/swarm/redis`      | `createRedisSwarmStore`                                                                                                                         | Node      |
-| `@deuz-sdk/core/goal`             | `createGoal`, `transitionGoal`, `assessGoal`, the event builders, `createInMemoryGoalStore`                                                     | Edge-safe |
-| `@deuz-sdk/core/headless`         | `runHeadless`, `resumeHeadless`, `inspectRun`, `doctor`, `loadProjectInstructions` (preview)                                                    | Node      |
+| Entry                             | New surface                                                                                                                                                     | Runtime   |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| `@deuz-sdk/core/mcp/server`       | `createMcpServer`                                                                                                                                               | Edge-safe |
+| `@deuz-sdk/core/mcp/server/stdio` | `serveMcpStdio`                                                                                                                                                 | Node      |
+| `@deuz-sdk/core/a2a`              | `fetchAgentCard`, `createA2AClient`, `createA2AHandler`, `createA2AAgentExecutor`, `createInMemoryA2ATaskStore`, `a2aText`, `A2AError`                          | Edge-safe |
+| `@deuz-sdk/core/realtime`         | `createRealtimeSession`, `createOpenAIRealtime`, `createGeminiLive`, `createOpenAIClientSecret`, `createGeminiAuthToken`, `realtimePriceTable`, `RealtimeError` | Edge-safe |
+| `@deuz-sdk/core/batch`            | `createBatchClient`, `createMemoryBatchJobStore`, `BatchError`                                                                                                  | Edge-safe |
+| `@deuz-sdk/core/ops/redis`        | `createRedisOpsStore`, `createRedisBudgetStore`, `wrapIoredisClient`                                                                                            | Node      |
+| `@deuz-sdk/core/swarm/redis`      | `createRedisSwarmStore`, `wrapIoredisClient`                                                                                                                    | Node      |
+| `@deuz-sdk/core/goal`             | `createGoal`, `transitionGoal`, `assessGoal`, `createInMemoryGoalStore`, the event builders, the parsers and serializers, `GoalError`                           | Edge-safe |
+| `@deuz-sdk/core/headless`         | `runHeadless`, `resumeHeadless`, `inspectRun`, `doctor`, `exitCodeFor`, `HEADLESS_EXIT_CODES`, `loadProjectInstructions` (preview)                              | Node      |
 
 `resolveModelProfile`, `PRICE_ALIASES` and `UnpricedModelError` join the root
 entry. `reconcileAgentRun` joins `@deuz-sdk/core/agent`, `findStaleAgentRuns`
