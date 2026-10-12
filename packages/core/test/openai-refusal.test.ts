@@ -151,6 +151,16 @@ describe.each(Object.entries(WIRES))('a %s refusal', (_name, wire) => {
     expect(result).toMatchObject({ status: 'stopped', reason: 'refusal', stopDetails: REFUSAL });
   });
 
+  it('a native run refused at finalization stops the same way, with no output', async () => {
+    const { model, calls } = scripted(wire, wire.refused, wire.answer);
+    const validate = vi.fn((value: unknown) => value);
+    const result = await runAgent({ model, prompt: 'x', output: { schema: OBJ, validate } });
+    expect(result).toMatchObject({ status: 'stopped', reason: 'refusal', stopDetails: REFUSAL });
+    expect(result).not.toHaveProperty('output');
+    expect(validate).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(1);
+  });
+
   it('the UI wire carries the explanation to the turn', async () => {
     const result = streamChat({ model: scripted(wire, wire.refused).model, messages });
     const parts: DeuzUIPart[] = [];
