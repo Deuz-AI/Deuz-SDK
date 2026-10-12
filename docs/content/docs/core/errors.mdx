@@ -1,9 +1,9 @@
 ---
 title: Error Handling
-description: The typed DeuzError taxonomy, the never-throw streaming contract, retry semantics, the four timeout layers, and the secret-redaction guarantee.
+description: The typed DeuzError taxonomy, the runtime and module errors, the never-throw streaming contract, retry semantics, the timeout layers, and the secret-redaction guarantee.
 ---
 
-Provider, transport, and orchestration failures use the typed `DeuzError` contract rather than exposing a raw `Response` or a provider payload. Each wire adapter normalizes its provider's error envelope into the same set of classes, so retry, routing and fallback logic branches on `err.code` regardless of which provider produced the failure. Every error class is exported from the package root.
+Provider, transport, and orchestration failures use the typed `DeuzError` contract rather than exposing a raw `Response` or a provider payload. Each wire adapter normalizes its provider's error envelope into the same set of classes, so retry, routing and fallback logic branches on `err.code` regardless of which provider produced the failure. The provider taxonomy is exported from the package root. The errors of the agent runtime, its stores and the modules are exported from their own subpaths: see [Runtime and module errors](#runtime-and-module-errors).
 
 ```ts
 import { DeuzError, isDeuzError, RateLimitError, AuthenticationError } from '@deuz-sdk/core';
@@ -24,7 +24,7 @@ import { DeuzError, isDeuzError, RateLimitError, AuthenticationError } from '@de
 | Class | `code` | Status | Retried by the SDK | What you should do |
 | --- | --- | --- | --- | --- |
 | `APICallError` | `api_call_error` | mapped | when `>= 500` | Log `provider` / `statusCode` / `requestId` and treat as transient. Base class — also used directly for generic 5xx. |
-| `NetworkError` | `network_error` | `0` | ✅ | DNS/TLS/transport died before an HTTP response. Nothing to fix in your request; check egress, proxies, and the base URL. |
+| `NetworkError` | `network_error` | `0` | ✅ | DNS/TLS/transport died before an HTTP response. Nothing to fix in your request; check egress, proxies, and the base URL. Since 2.3 a [batch](/docs/modules/batch#errors) lifecycle call throws it too, also when its answer or a results file breaks off mid-read, and `wait` polls again after it. |
 | `RateLimitError` | `rate_limit` | 429 | ✅ | Read `retryAfterMs` and back off at *your* layer too — the SDK only retries within one call. Long term: lower concurrency or shard keys. |
 | `OverloadedError` | `overloaded` | 529 | ✅ | Provider-side capacity, not you. This is the classic case for `fallbackModels` / `withFallback` to a second provider. |
 | `AuthenticationError` | `authentication` | 401 (also 403) | ❌ | A bad, missing, expired or under-permissioned key. **Never retry.** Check the [G1 resolution order](/docs/core/dependencies) — a `deps.keyProvider` outranks factory config, which outranks `createClient`'s `apiKeys`. |
@@ -53,9 +53,9 @@ These extend `DeuzError` directly (no `statusCode` / `isRetryable`):
 
 | Class | `code` | Extra fields | What you should do |
 | --- | --- | --- | --- |
-| `TimeoutError` | `timeout` | `layer: 'connect' \| 'ttft' \| 'total' \| 'step' \| 'tool'` | Branch on `layer`: `'ttft'`/`'total'` means the provider was slow, `'step'` means *your agent* ran long. Always a failure, never retried. See [the four layers](#the-four-timeout-layers). |
+| `TimeoutError` | `timeout` | `layer: 'connect' \| 'ttft' \| 'total' \| 'step' \| 'tool' \| 'chunk'` | Branch on `layer`: `'ttft'`/`'total'` means the provider was slow, `'chunk'` (2.2) that a stream went silent after content started, `'step'` that *your agent* ran long. Always a failure, never retried. See [the timeout layers](#the-timeout-layers). |
 | `AbortError` | `aborted` | — | Caller-initiated cancellation. Never retried, never falls back. In a stream this normally does not reach you at all — the run resolves `finishReason: 'aborted'` instead. |
-| `NoObjectGeneratedError` | `no_object_generated` | `text?: string` | `generateObject` could not produce a valid object after one repair. Inspect `.text` (the raw model output) — usually the schema is too strict or the model too small. |
+| `NoObjectGeneratedError` | `no_object_generated` | `text?: string`, `finishReason?` (2.3), `stopDetails?` (2.3) | `generateObject` could not produce a valid object after one repair; `streamObject`'s `object` promise rejects with it too. Inspect `.text` (the raw model output) — usually the schema is too strict or the model too small. Since 2.3 `finishReason` and `stopDetails` say how the last attempt ended: `'content_filter'` with a refusal's category when the model refused, `'length'` when it was cut off. A structured [batch result](/docs/modules/batch#reading-the-results) whose object does not parse or validate carries one as its `error` (2.3), without `finishReason` or `stopDetails`. |
 | `UnsupportedCapabilityError` | `unsupported_capability` | `provider`, `capability`, `modelId?` | A model lacks a requested capability (e.g. embeddings on a chat-only provider). Thrown **before** any network call, so it costs nothing. Pick a different model, or override the belief with [`capabilities`](/docs/core/prompts-and-timeouts#capabilities). |
 | `BreakerOpenError` | `breaker_open` | `provider`, `modelId`, `cooldownUntil` | The per-model circuit breaker is open — the SDK is failing fast without a request. Route to a fallback model, or wait until `cooldownUntil` (a `deps.clock.now()` timestamp). See [the breaker](#the-circuit-breaker). |
 | `McpAuthorizationRequiredError` | `mcp_authorization_required` | `serverUrl`, `authorizationUrl?` | Step **one** of an OAuth flow, not a dead end. Send the user to `authorizationUrl`, then reconnect with `authorizationCode` set to the `?code=` you get back. See [MCP](/docs/modules/mcp). |
@@ -66,6 +66,48 @@ These extend `DeuzError` directly (no `statusCode` / `isRetryable`):
 <Callout title="`authorizationUrl` is deliberately absent from `toJSON()`">
 A live authorization request carries `state` and `code_challenge`, which do not belong in every log line. Read it off the instance, not off the serialized error.
 </Callout>
+
+## Runtime and module errors
+
+The agent runtime, its stores and the modules raise errors of their own, each exported from the subpath that raises it. They come in two kinds:
+
+- **`DeuzError` subclasses** (`UnpricedModelError`, `CheckpointNotFoundError`, `CheckpointVersionError`, `RagError`, `A2AError`, `BatchError`, `RealtimeError`) carry a `code` and the secret-safe `toJSON()`, and `isDeuzError` recognizes them.
+- **Plain `Error` subclasses** (the budget, policy, persistence, lease, swarm, evolve and goal errors) carry a `name` and, all but `SwarmConflictError` and `EvolveConflictError`, a `code`. `isDeuzError` returns `false` for them: branch on `instanceof`, or on `name` and `code`.
+
+A native run never rejects with these: `runAgent`, `resumeAgent` and the `result` of `streamAgent` resolve with `status: 'failed'` and `error: { name, message, code? }`, so read `result.error.name` and `result.error.code` there. The budget ledger, policy, persistence, lease, unpriced-model and checkpoint-version errors end the run even when they are raised inside a tool (an `agentTool` sub-agent, for example) or a compaction summary: they never become a tool error the model could retry, or a skipped compaction layer.
+
+### Agent runtime
+
+| Class | Import from | `code` | Raised when |
+| --- | --- | --- | --- |
+| `UnpricedModelError` (2.3) | `@deuz-sdk/core`, `/edge` | `unpriced_model` | The agentic loop of `generateText` or `streamChat`, without an `execution` context, under `budget: { usd, unknownPrice: 'reject' }` is about to call a model that has no price: the loop's own model, a compaction `summarizeModel`, or an `agentTool` sub-agent's model. The run fails before that call. `modelId` names the model; a `cause` means the price lookup itself threw. Under an execution context (a native run, or an `execution` passed to `generateText` or `streamChat`) the same call is refused with `BudgetLedgerError` code `unpriced_model`. See [Models without a price](/docs/modules/budgets#models-without-a-price). |
+| `BudgetLedgerError` | `/agent` | `invalid_budget`, `budget_exceeded`, `missing_reservation`, `reservation_conflict`, `unknown_request`, `invalid_snapshot`, `persistence_failed`, `admission_failed`, `unpriced_model` (2.3) | An execution context's budget ledger refused a call or could not record it: a call that does not fit the budget (`budget_exceeded`), a persistent `BudgetStore` that failed (`admission_failed`; since 2.3 it carries `requestId` and, for a settlement, `settlement` to replay), an unpriced model under `unknownPrice: 'reject'` (`unpriced_model`, 2.3). See [How admission works](/docs/modules/budgets#how-admission-works) and [When a settlement fails](/docs/modules/budgets#when-a-settlement-fails). |
+| `BudgetStoreError` | `/agent` | `invalid_request`, `reservation_conflict`, `window_conflict` | A `BudgetStore` refused a request: malformed input, a request id that conflicts with the hold the store recorded, or a scope key reused with another window. The ledger reports a failing store as `BudgetLedgerError` code `admission_failed`. |
+| `ExecutionPolicyError` | `/agent` | `invalid_policy`, `invalid_context`, `tool_not_allowed`, `model_not_allowed`, `depth_exceeded`, `deadline_exceeded` | The execution policy refused: a tool or a model outside its allowlist, a sub-agent nested past `maxDepth`, a deadline that passed, or a malformed policy or context. Since 2.3 `toolCallId` names the refused call, and the policy decides a whole batch before any approval is asked for ([One path for every tool call](/docs/modules/native-agents#one-path-for-every-tool-call)). |
+| `ExecutionPersistenceError` | `/agent` | `execution_persistence_error` | Under `session.durability: 'strict'`, a legacy loop could not commit a checkpoint, or (2.3) could not read the run's stored checkpoint before its first step. |
+| `AgentRunLeaseError` (2.3, not exported) | — | `lease_held`, `lease_lost` | A native run with `lease` found another executor holding it (`lease_held`, before anything is read or written), or lost the lease while it ran (`lease_lost`, after which it writes nothing more). It arrives as a failed result's `error.name` and `error.code`; `reconcileAgentRun` with `lease` rejects with it. See [Leasing a native run](/docs/modules/operations#leasing-a-native-run). |
+| `CheckpointNotFoundError` | `/durable`, `/edge` | `checkpoint_not_found` | `resumeFromCheckpoint` rejects with it, and `resumeStreamFromCheckpoint` reports it as an `error` part, when the `SessionStore` holds no checkpoint for the `runId`. |
+| `CheckpointVersionError` (2.3) | `/durable`, `/edge` | `checkpoint_version_unsupported` | A stored loop checkpoint has a `version` other than 1, so a newer SDK probably wrote it: `deserializeCheckpoint`, `resumeFromCheckpoint`, `resumeStreamFromCheckpoint` and the store packs' `sessions.load` refuse it, and `resumeAgent` refuses an envelope that holds one, before anything is written. `version` and `runId` say which. See [Strict checkpoints and approval resume](/docs/modules/native-agents#strict-checkpoints-and-approval-resume). |
+
+### Stores and executors
+
+| Class | Import from | `code` | Raised when |
+| --- | --- | --- | --- |
+| `SwarmConflictError` | `/swarm` | — | A swarm store refused a commit: another writer moved the run's revision, or the run already exists. `swarm.resume` rejects with it too when the run is not at the `expectedRevision` or `expectedStatus` (2.2) the caller passed. Since 2.3 the Postgres store raises it once its retries of a serialization failure run out, with the driver error as `cause`. |
+| `SwarmLeaseError` | `/swarm` | `held`, `lost` | A swarm executor found the run held by another executor, or lost its lease. See [Swarm leases](/docs/modules/operations#swarm-leases). |
+| `EvolvePatchError` | `/evolve`, `/edge` | `invalid_markers`, `no_blocks`, `malformed_diff`, `empty_search`, `marker_in_replace`, `not_found`, `outside_evolve_block`, `ambiguous`, `empty_rewrite`, `frozen_changed` | A source's evolve blocks cannot be parsed, or a proposed patch cannot be applied to them. See [Evolve blocks and patches](/docs/modules/evolve#evolve-blocks-and-patches). |
+| `EvolveConflictError` | `/evolve`, `/edge` | — | A population store refused a write: the run already exists, a candidate conflicts, or another writer committed the generation. |
+| `EvolveLeaseError` | `/evolve`, `/edge` | `held`, `lost` | An `evolve` executor found the run held by another executor, or lost its lease. See [Leases](/docs/modules/evolve#leases). |
+
+### Modules
+
+| Class | Import from | `code` | Raised when |
+| --- | --- | --- | --- |
+| `A2AError` (2.3) | `/a2a` | `a2a_error` | A failed `fetchAgentCard` or A2A client call, with a `kind`: `protocol` (the agent answered with an A2A error; `reason`, `rpcCode`), `http`, `network` or `invalid-response`. An aborted `signal` rejects with `AbortError` instead, and a URL or card the client cannot use throws `InvalidRequestError`. An executor of `createA2AHandler` throws an `A2AError` with a `reason` to answer a request with that A2A error. See [A2A errors](/docs/modules/a2a#errors). |
+| `BatchError` (2.3) | `/batch` | `batch_error` | A batch the client cannot send, follow or read, with a `kind`: `unsupported`, `invalid-request`, `invalid-job`, `not-ended`, `timeout`, `provider` or `store`. Provider HTTP failures keep their own classes, and a transport failure is a `NetworkError`. See [Batch errors](/docs/modules/batch#errors). |
+| `RealtimeError` (2.3) | `/realtime` | `realtime_error` | A realtime session failure, with a `kind` (`connect-failed`, `connect-timeout`, `no-websocket`, `provider`, `transport`, `closed`, `not-connected`, `invalid-message`, `tool`): `connect()` rejects with it, and once a socket exists a failure also arrives as an `error` event. A send on a session that is not open (`not-connected`) and a `sendToolResult` for a call that is not waiting (`tool`) throw it. See [Lifecycle and errors](/docs/modules/realtime#lifecycle-and-errors). |
+| `GoalError` (2.3) | `/goal` | `invalid_goal`, `invalid_event`, `invalid_command`, `unsupported_version`, `revision_conflict`, `scope_mismatch` | A goal function refused its input: a malformed record, event or command, a version from a newer build, an `expectedRevision` or a store save that another writer overtook, or an event for another goal. What a goal decides itself (a duplicate event, a completion without evidence) is a transition result, never an error. See [Transitions](/docs/modules/goals#transitions). |
+| `RagError` | `/rag` | `rag_unsupported_legacy_doc`, `rag_unsupported_mime`, `rag_empty_text_layer`, `rag_parser_not_registered`, `rag_extension_mime_mismatch` | `parse` could not turn a document into text. `mime` is the detected type. See [Typed errors](/docs/modules/rag#typed-errors). |
 
 ## Two failure channels, one rule
 
@@ -162,6 +204,8 @@ try {
   if (err instanceof NoObjectGeneratedError) {
     // The raw model text that failed to parse/validate is on `.text`.
     console.error('No valid object. Raw output:', err.text);
+    // 2.3: how the last attempt ended, e.g. 'content_filter' with a refusal's category.
+    console.error(err.finishReason, err.stopDetails?.category);
   }
 }
 ```
@@ -256,7 +300,7 @@ Retries protect one call. The breaker protects the *next* ones from a provider t
 
 `fallbackModels` and the `withFallback` middleware treat `BreakerOpenError` as an immediate fail-over signal, which is the point: the fast failure is what makes fail-over cheap. Full detail on [Resilience](/docs/advanced/resilience).
 
-## The four timeout layers
+## The timeout layers
 
 Each layer answers a different question, so each has its own scope. All are settable per call via [`timeout`](/docs/core/prompts-and-timeouts#timeout), and every timer is scheduled through `deps.clock` — never an ambient host timer — so tests stay deterministic.
 
@@ -264,6 +308,7 @@ Each layer answers a different question, so each has its own scope. All are sett
 | --- | --- | --- | --- | --- |
 | `ttftMs` | one model call | `60_000` | the first content delta has not arrived in time | the first `text-delta`, `reasoning-delta` **or** `tool-call-delta` — a tool-call-first response counts as content |
 | `totalMs` | one model call | `300_000` | that whole response takes too long | the call completing |
+| `chunkMs` (2.2) | one model call, once content is flowing | unbounded | the stream goes silent between two parts for longer than this (`layer: 'chunk'`) | every stream part re-arms it |
 | `stepMs` | one agentic step end-to-end — the model call **plus** the tool executions it triggered | unbounded | the step overruns | the step ending |
 | `toolMs` | one tool `execute` (per call, not per step) | unbounded | that execution overruns; `Tool.timeoutMs` overrides it for a single tool | the execution returning |
 
@@ -276,7 +321,7 @@ Notes that save debugging time:
 - **A tool timeout is self-healing, not fatal.** The execution is abandoned (its `signal` is aborted, so a well-behaved tool passing it to `fetch` stops working), and the model receives an `is_error` `tool_result` — `Tool 'x' timed out after 30000ms and was abandoned.` Every `tool_use_id` still gets a result. Tool timeouts **do** count toward the runaway-tool guard.
 
 <Callout title="`layer` values you will actually see">
-The union declares five members, but only three are constructed today: `'ttft'`, `'total'` and `'step'`. `'connect'` is reserved, and a **per-tool** timeout currently reports `layer: 'total'` with a `Tool execution exceeded …ms` message rather than `'tool'`. Match on the message or on the surrounding `tool-result` if you need to tell those apart; treat the union as open.
+The union declares six members. Model calls and the agentic loops construct `'ttft'`, `'total'`, `'chunk'` (2.2) and `'step'`. `'connect'` is reserved, and a **per-tool** timeout in the loops reports `layer: 'total'` with a `Tool execution exceeded …ms` message rather than `'tool'`. The only `'tool'` timeout (2.3) is the abort reason a [realtime session](/docs/modules/realtime#tools) gives a tool's `signal` when the tool runs out of time. Match on the message or on the surrounding `tool-result` if you need to tell those apart; treat the union as open.
 </Callout>
 
 ## Abort is not a timeout
@@ -299,7 +344,7 @@ The SDK goes out of its way to keep this true even when a transport misbehaves: 
 API keys must never appear in any log, error message, tracer attribute, observation event, or `cause` chain. This is a regression-tested invariant, not a best effort.
 
 - `DeuzError` deliberately carries **no raw request headers or body**, and never places a raw `Request`/`Headers` in `cause`.
-- `error.toJSON()` returns only `name`, `code`, `message`, and an allowlist of scalar diagnostic fields (`statusCode`, `isRetryable`, `retryAfterMs`, `provider`, `requestId`, `upstreamType`, `layer`, `toolName`, `toolCallId`, `modelId`, `capability`, `runId`, `mime`, `serverUrl`). `cause` and model output are excluded.
+- `error.toJSON()` returns only `name`, `code`, `message`, and an allowlist of scalar diagnostic fields (`statusCode`, `isRetryable`, `retryAfterMs`, `provider`, `requestId`, `upstreamType`, `layer`, `toolName`, `toolCallId`, `modelId`, `capability`, `runId`, `mime`, `serverUrl`, and since 2.3 `finishReason`). `A2AError` adds its `kind`, `reason` and `rpcCode`, `BatchError` its `kind` and `batchId`, and `RealtimeError` its `kind` and `closeCode`. `cause` and model output are excluded.
 - Anything that flows into a logger, error, or span first passes through the redaction helpers. Secret-looking header values (`authorization`, `x-api-key`, `x-goog-api-key`, `api-key`) and token shapes (`sk-ant-…`, `sk-…`, `AIza…`, `Bearer …`) are masked to their **last four characters** — `****AB12`.
 - Opt-in observation content capture passes through a second, stricter `[REDACTED]` profile before an event is emitted.
 
@@ -323,4 +368,4 @@ try {
 - [generateObject](/docs/core/generate-object) — structured output and the repair retry.
 - [Resilience](/docs/advanced/resilience) — retry, breaker and fail-over in depth.
 - [The Tool Loop](/docs/agents/tool-loop) — how tool failures self-heal instead of throwing.
-- [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts) — configuring the four layers.
+- [Prompts, instructions & timeouts](/docs/core/prompts-and-timeouts) — configuring the timeout layers.

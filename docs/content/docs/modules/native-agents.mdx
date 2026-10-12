@@ -167,17 +167,37 @@ suspension, resumed with the run id.
 
 ## Strict checkpoints and approval resume
 
-Native sessions use `AgentRunEnvelope` with `kind: 'deuz-agent-run'` and `version: 1`
-(`version: 2` since 2.3 when the run records [memory, a chat projection or a
-fail-over](#memory-chat-and-model-fail-over-23), which a 2.2 reader would ignore).
-They do not reuse a legacy `AgentCheckpoint` as the top-level envelope; the loop and
-sub-agent checkpoints inside it are `AgentCheckpoint` records. A resume refuses an
-envelope of another version. Since 2.3 it also refuses one holding a checkpoint whose
-version is not 1, with `CheckpointVersionError` (code `checkpoint_version_unsupported`).
-Both refusals happen before anything is written, so the stored run stays resumable by
-the SDK that wrote it. An `AgentRunStore` implements `load(runId)` and
-`save(envelope)`. `save` must finish its durable write before resolving; a rejected
-write stops further execution.
+Native sessions use `AgentRunEnvelope` with `kind: 'deuz-agent-run'`. They do not
+reuse a legacy `AgentCheckpoint` as the top-level envelope; the loop and sub-agent
+checkpoints inside it are `AgentCheckpoint` records. Since 2.3 `version` is `1 | 2`.
+A save writes `2` only when the envelope records `memory`, `transcript`, `chat` or
+`models`, state a 2.2 reader would silently ignore, so a 2.2 process refuses that
+envelope instead of resuming the run without it. Every other envelope stays `1`, and
+a 2.3 resume reads both. The fields 2.3 adds are optional, and absent from a run that
+does not use the feature:
+
+| Field | What it records |
+| --- | --- |
+| `memory` (`AgentRunMemoryState`) | The run's memory scope, the one recall it was given (`recall.status`, with the message's `index` and `count`), and, once the run completed, its extraction: an `operationId` recorded `pending` with the terminal commit, then `completed` or `failed`. See [Memory](#memory). |
+| `transcript` (`AgentRunTranscript`) | The run's user-facing transcript, kept for `chat` and `memory`: the caller's input, then the run's turns as they happened. Append-only, so compaction or a `prepareStep` history never rewrites it. See [Chat projection](#chat-projection). |
+| `chat` (`AgentRunChatState`) | Where the chat projection stands: the `cursor` of acknowledged messages, the projected `messageIds`, which assistant turn and tool invocation is which message, and the last attempt's `status` (`'saved'`, `'failed'`, `'scope-mismatch'` or `'superseded'`). See [Chat projection](#chat-projection). |
+| `models` (`AgentRunModelState`) | Written at the first fail-over: the model the run's calls go to now, each fail-over so far (the failed model, the next one, the model step, the phase and the error) and the rules' version. See [Model fail-over](#model-fail-over). |
+| `retry` (`AgentRunRetry`) | Written with a `failed` result whose cause was transient: `{ cause: 'model-call' \| 'admission', phase }`, which `retryFailed: true` resumes from. See [When a model call fails](#when-a-model-call-fails). |
+| `binding.memory`, `binding.chat`, `binding.fallback` | The resume binding of the memory scope, of the `chatId` with its scope, and of the `fallbackModels` (each candidate's provider, protocol and model id, in order), as JSON. A resume that changes, adds or removes one fails before anything is written. `binding.mcp` and `binding.handoffs`, also new in 2.3, pin the MCP tool catalog and the handoff targets (see the paragraphs below the example). |
+| `reconciled` on a receipt (`AgentToolReceipt`) | `true` when the receipt's outcome came from `reconciledToolResults` rather than from the tool. See [When the store fails](#when-the-store-fails). |
+
+Only the first four make an envelope version 2. A 2.2 reader ignores `retry` (it
+returns a failed run's stored result, as before) and `reconciled`. It refuses an
+envelope whose `binding` records any of the 2.3 keys (`mcp`, `handoffs`, `memory`,
+`chat`, `fallback`), because its binding check compares the whole binding.
+
+A resume refuses an envelope of a version it does not read (2.3 reads 1 and 2).
+Since 2.3 it also refuses one holding a checkpoint whose version is not 1, with
+`CheckpointVersionError` (code `checkpoint_version_unsupported`). Both refusals
+happen before anything is written, so the stored run stays resumable by the SDK
+that wrote it. An `AgentRunStore` implements `load(runId)` and `save(envelope)`.
+`save` must finish its durable write before resolving; a rejected write stops
+further execution.
 
 The following complete approval example uses a volatile store for demonstration.
 The tool returns a string and has no external effect. In an application, obtain

@@ -304,7 +304,7 @@ Two things surprise people, and one of them used to be three:
 
 **Compaction, by contrast, follows the active agent** (2.0). At the swap the compaction runner is re-pointed at the target: its `contextWindow` becomes the target's, and the summarize side call uses `policy.summarizeModel ?? the active model` — not the root one. The token estimator is kept across the swap on purpose, because its calibration measures the provider's request framing, which the transfer did not change.
 
-A resume leg re-points it too: restoring a checkpointed handoff rebuilds the active model and tool set **and** re-runs the compaction retarget, in both loops, so a durable run that suspended inside agent B measures and summarizes against B when it resumes there. (Earlier versions of this page said it did not; it did.) On Claude 5.x the pass the target gets is [simple compaction](/docs/core/compaction#claude-5x-simple-compaction-23).
+A resume leg re-points it too: restoring a checkpointed handoff rebuilds the active model and tool set **and** re-runs the compaction retarget, in both loops, so a durable run that suspended inside agent B measures and summarizes against B when it resumes there. This holds since 2.1. In 2.0 a resume leg kept the root model's `contextWindow`, and the root model as the summarizer when no `summarizeModel` was set, until the next transfer; the 2.1 and 2.2 versions of this page still listed that as a known limit. On Claude 5.x the pass the target gets is [simple compaction](/docs/core/compaction#claude-5x-simple-compaction-23).
 
 ## See also
 
