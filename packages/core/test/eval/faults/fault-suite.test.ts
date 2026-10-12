@@ -12,8 +12,9 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { runEvalSuite, type EvalSuiteReport } from '../../../src/testing';
 import { faultScenarios } from './index';
 
-/** Roadmap 23.7's fault boundaries that exist in 2.3 part 1. */
+/** Roadmap 23.7's fault boundaries, with the native memory and fail-over ones of 23.4. */
 const BOUNDARIES = [
+  'memory-scope',
   'before-dispatch',
   'after-approval',
   'after-effect-before-receipt',
@@ -99,6 +100,8 @@ describe('fault injection (2.3)', () => {
       'fault/mcp-refresh-record-failure-accepted': 'recovered',
       'fault/refusal-mid-tool-call': 'contained',
       'fault/max-tokens-mid-tool-call': 'contained',
+      'fault/memory-scope-widened': 'contained',
+      'fault/memory-scope-shared-context': 'contained',
     });
     expect(report.aggregate.offline).toMatchObject({
       tasks: faultScenarios.length,
@@ -108,7 +111,7 @@ describe('fault injection (2.3)', () => {
       // A person checked the payment system after the unknown charge.
       humanRescues: 1,
       requiredApprovals: 1,
-      recovery: { 'not-needed': 0, recovered: 15, rescued: 0, contained: 8, failed: 0 },
+      recovery: { 'not-needed': 0, recovered: 15, rescued: 0, contained: 10, failed: 0 },
     });
   });
 });

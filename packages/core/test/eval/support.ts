@@ -61,19 +61,27 @@ export function runWith(on: TaskModel, context: EvalTaskContext) {
   };
 }
 
-/** The mock model, with a counter of the model calls it served (each one is paid). */
+/**
+ * The mock model, with a counter of the model calls it served (each one is
+ * paid) and the request bodies it was sent.
+ */
 export function scripted(responses: MockResponse[]): {
   model: LanguageModel;
   calls: () => number;
+  bodies: () => string[];
 } {
   const base = createMockModel({ responses });
   const config = readConfig(base)!;
-  let calls = 0;
+  const bodies: string[] = [];
   const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    calls += 1;
+    bodies.push(String(init?.body ?? ''));
     return config.fetch!(input, init);
   }) as typeof globalThis.fetch;
-  return { model: attachConfig({ ...base }, { ...config, fetch }), calls: () => calls };
+  return {
+    model: attachConfig({ ...base }, { ...config, fetch }),
+    calls: () => bodies.length,
+    bodies: () => [...bodies],
+  };
 }
 
 /**

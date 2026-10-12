@@ -1,8 +1,7 @@
 /**
- * The fault-injection scenarios of 2.3 (roadmap 23.7, part 1): one or more per
- * boundary, in dispatch order. Part 2 adds the boundaries that depend on native
- * memory/chat/fallback and the UI bridge (compaction, UI replay, chat
- * projection or memory write, fallback attempt and its settlement).
+ * The fault-injection scenarios of 2.3 (roadmap 23.7): one or more per
+ * boundary, in dispatch order, then the boundaries of native memory, chat and
+ * model fail-over (23.4) and of the UI bridge (23.5).
  */
 import type { EvalTaskManifest } from '../../../src/testing';
 import {
@@ -10,6 +9,7 @@ import {
   mcpRefreshRecordFailure,
   mcpRefreshRecordFailureAccepted,
 } from './mcp-boundaries';
+import { memoryScopeSharedContext, memoryScopeWidened } from './memory-boundaries';
 import {
   childInitialization,
   maxTokensMidToolCall,
@@ -61,4 +61,6 @@ export const faultScenarios: readonly EvalTaskManifest[] = [
   mcpRefreshRecordFailureAccepted,
   refusalMidToolCall,
   maxTokensMidToolCall,
+  memoryScopeWidened,
+  memoryScopeSharedContext,
 ];
