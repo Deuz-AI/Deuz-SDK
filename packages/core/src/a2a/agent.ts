@@ -196,6 +196,8 @@ const HOW_TO_ANSWER =
   'Answer every action in one message, with a data part { approvalResponses, clientToolResults }.';
 
 type Suspended = Extract<AgentResult<unknown>, { status: 'suspended' }>;
+/** What a run waits for: its pending approvals and client tool calls. */
+type Pending = Pick<Suspended, 'pendingApprovals' | 'pendingClientCalls'>;
 type Stopped = Extract<AgentResult<unknown>, { status: 'stopped' }>;
 type RunError = Extract<AgentResult<unknown>, { status: 'failed' }>['error'];
 type ClientToolResult = NonNullable<A2AAgentAnswers['clientToolResults']>[number];
@@ -256,8 +258,28 @@ function waitsFor(actions: readonly A2AAgentAction[]): string {
     : `waits for ${actions.length} actions: ${actions.map(describeAction).join('; ')}`;
 }
 
-/** What a suspended run waits for: its approvals, then its client tool calls. */
-function pendingActions(result: Suspended): A2AAgentAction[] {
+/**
+ * What a stored run waits for, read as its resume reads it: the approvals of
+ * its suspended checkpoint, and its pending client calls. Not its stored
+ * result, which a resume's first write drops before the run takes the
+ * answers up. `undefined` for a run that does not wait for answers.
+ */
+function pendingOf(saved: AgentRunEnvelope): Pending | undefined {
+  const checkpoint = saved.checkpoints[saved.runId];
+  if (saved.phase === 'terminal' || checkpoint?.status !== 'suspended') return undefined;
+  const pending: Pending = {
+    pendingApprovals: checkpoint.pendingApprovals ?? [],
+    pendingClientCalls:
+      saved.pendingClientCalls ??
+      (saved.result?.status === 'suspended' ? saved.result.pendingClientCalls : []),
+  };
+  return pending.pendingApprovals.length > 0 || pending.pendingClientCalls.length > 0
+    ? pending
+    : undefined;
+}
+
+/** What a run waits for, as actions: its approvals, then its client tool calls. */
+function pendingActions(result: Pending): A2AAgentAction[] {
   return [
     ...result.pendingApprovals.map(
       (request): A2AAgentAction => ({
@@ -358,14 +380,14 @@ function readAnswers(message: A2AMessage): {
 }
 
 /**
- * Answers fit a suspended run when they answer each of its pending actions
+ * Answers fit a waiting run when they answer each of its pending actions
  * once, each with the kind of answer it waits for, and nothing else: the
  * run's resume keeps no partial answer.
  */
 function checkAnswers(
   taskId: string,
   answers: { approvals: ToolApprovalResponse[]; results: ClientToolResult[] },
-  result: Suspended,
+  result: Pending,
 ): void {
   const actions = pendingActions(result);
   if (answers.approvals.length === 0 && answers.results.length === 0) {
@@ -750,8 +772,9 @@ export function createA2AAgentExecutor<T = string>(
     }
     const answers = readAnswers(ctx.message);
     const result = saved.result;
-    if (saved.phase !== 'terminal' && result?.status === 'suspended') {
-      checkAnswers(ctx.taskId, answers, result);
+    const pending = pendingOf(saved);
+    if (pending) {
+      checkAnswers(ctx.taskId, answers, pending);
     } else if (answers.approvals.length > 0 || answers.results.length > 0) {
       throw invalidParams(`Task ${ctx.taskId} is not waiting for answers.`);
     } else if (

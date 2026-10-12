@@ -666,6 +666,71 @@ describe('createA2AAgentExecutor — a suspended run', () => {
     ).task as A2ATask;
     expect(done.status.state).toBe('TASK_STATE_COMPLETED');
   });
+
+  it('takes the answers again after a resume leg died past its first write', async () => {
+    const published: unknown[] = [];
+    // One database behind both stores; it goes away right after the resume's first write.
+    const runs = createInMemoryAgentRunStore();
+    let runWritesLeft = Infinity;
+    const store: AgentRunStore = {
+      load: (runId) => runs.load(runId),
+      save: async (envelope) => {
+        if (runWritesLeft <= 0) throw new Error('database unavailable');
+        runWritesLeft--;
+        await runs.save(envelope);
+      },
+    };
+    const tasks = createInMemoryA2ATaskStore();
+    let tasksDown = false;
+    const taskStore: A2ATaskStore = {
+      load: (taskId, scope) => tasks.load(taskId, scope),
+      save: (task, scope) => {
+        const state = task.status.state;
+        if (tasksDown && (state === 'TASK_STATE_WORKING' || state === 'TASK_STATE_FAILED')) {
+          throw new Error('database unavailable');
+        }
+        return tasks.save(task, scope);
+      },
+    };
+    const { client } = serve(
+      publisher(
+        [{ toolCalls: [{ toolName: 'publish', args: { text: 'hi' } }] }, { text: 'Done.' }],
+        published,
+      ),
+      { store },
+      { taskStore },
+    );
+    const asked = (await client.sendMessage('Publish "hi".')).task as A2ATask;
+    const answer: A2APart[] = [
+      { data: { approvalResponses: [{ approvalId: approvalIdOf(asked), approved: true }] } },
+    ];
+
+    runWritesLeft = 1;
+    tasksDown = true;
+    await expect(client.sendMessage(answer, { taskId: asked.id })).rejects.toMatchObject({
+      reason: 'INTERNAL_ERROR',
+    });
+    runWritesLeft = Infinity;
+    tasksDown = false;
+
+    // The task still lists the approval. The resume's first write dropped the
+    // stored result, but the run's checkpoint still waits for the approval.
+    const now = await client.getTask(asked.id);
+    expect(now.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    expect(actionsOf(now)).toEqual([
+      expect.objectContaining({ kind: 'approval', approvalId: approvalIdOf(asked) }),
+    ]);
+    const stored = await runs.load(asked.id);
+    expect(stored?.phase).toBe('running');
+    expect(stored?.result).toBeUndefined();
+    expect(stored?.checkpoints[asked.id]?.status).toBe('suspended');
+    expect(published).toEqual([]);
+
+    // The client sends the approval again, and the run goes on.
+    const done = (await client.sendMessage(answer, { taskId: asked.id })).task as A2ATask;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(published).toEqual([{ text: 'hi' }]);
+  });
 });
 
 describe('createA2AAgentExecutor — stopped and failed runs', () => {
