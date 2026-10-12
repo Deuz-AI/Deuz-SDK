@@ -2,16 +2,17 @@
  * capabilities-follow-model.test.ts (2.3, F26) — the caller's per-call
  * `capabilities` override describes the run's models, so it follows every model
  * switch: a `prepareStep` model and a handoff target, in the legacy loops and in
- * a native run (whose finalization answers with the target's model). Before,
- * the switched-to model fell back to its registry row (Anthropic's 4096-token
- * placeholder `max_tokens` for an unknown slug).
+ * a native run (whose finalization answers with the target's model), and a
+ * legacy `fallbackModels` candidate. Before, the switched-to model fell back to
+ * its registry row (Anthropic's 4096-token placeholder `max_tokens` for an
+ * unknown slug).
  */
 import { describe, expect, it } from 'vitest';
-import { generateText, streamChat } from '../src/index';
+import { generateText, streamChat, withFallback, wrapModel } from '../src/index';
 import { runAgent } from '../src/agent-run';
 import { createAnthropic } from '../src/anthropic';
 import { handoff } from '../src/inference/handoff';
-import { claudeTurn, scriptedFetch, type ScriptStep } from './fixtures/wire-turns';
+import { claudeTurn, scriptedFetch, serverError, type ScriptStep } from './fixtures/wire-turns';
 
 const capabilities = { maxOutput: 32_000 };
 
@@ -84,5 +85,46 @@ describe('F26: the capabilities override follows a model switch', () => {
     expect(result.status).toBe('completed');
     expect(expert.wire.bodies).toHaveLength(2);
     expect(expert.wire.bodies.map((body) => body.max_tokens)).toEqual([32_000, 32_000]);
+  });
+
+  it('a legacy fallbackModels candidate gets the override (generateText)', async () => {
+    const primary = claude('claude-custom-a', [serverError]);
+    const fallback = claude('claude-custom-b', [answer]);
+    const result = await generateText({
+      model: primary.model,
+      capabilities,
+      prompt: 'go',
+      maxRetries: 0,
+      fallbackModels: [fallback.model],
+    });
+    expect(result.text).toBe('done');
+    expect(primary.wire.bodies[0]!.max_tokens).toBe(32_000);
+    expect(fallback.wire.bodies[0]!.max_tokens).toBe(32_000);
+  });
+
+  it('a legacy fallbackModels candidate gets the override (streamChat)', async () => {
+    const primary = claude('claude-custom-a', [serverError]);
+    const fallback = claude('claude-custom-b', [answer]);
+    const result = streamChat({
+      model: primary.model,
+      capabilities,
+      prompt: 'go',
+      maxRetries: 0,
+      fallbackModels: [fallback.model],
+    });
+    await result.consume?.();
+    expect(fallback.wire.bodies).toHaveLength(1);
+    expect(primary.wire.bodies[0]!.max_tokens).toBe(32_000);
+    expect(fallback.wire.bodies[0]!.max_tokens).toBe(32_000);
+  });
+
+  it('a withFallback candidate gets the override', async () => {
+    const primary = claude('claude-custom-a', [serverError]);
+    const fallback = claude('claude-custom-b', [answer]);
+    const wrapped = wrapModel(primary.model, [withFallback([fallback.model])]);
+    const result = await wrapped.generateText({ capabilities, prompt: 'go', maxRetries: 0 });
+    expect(result.text).toBe('done');
+    expect(primary.wire.bodies[0]!.max_tokens).toBe(32_000);
+    expect(fallback.wire.bodies[0]!.max_tokens).toBe(32_000);
   });
 });

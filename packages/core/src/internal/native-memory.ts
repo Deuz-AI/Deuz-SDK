@@ -37,15 +37,19 @@ export function assertMemoryOptions(memory: MemoryCallOptions): void {
  * The memory scope of each native run that is running now, per shared ledger
  * and execution scope id. A child context's scope id extends its parent's
  * (`<parent>/<child>`), so the nearest registered prefix is the closest
- * ancestor run that has memory.
+ * ancestor run that has memory. Runs that share one context (a tool that hands
+ * its own `ctx.execution` to a nested run) each hold their own claim under the
+ * same id, innermost last.
  */
-const runningScopes = new WeakMap<BudgetLedger, Map<string, MemoryScope>>();
+const runningScopes = new WeakMap<BudgetLedger, Map<string, { scope: MemoryScope }[]>>();
 
 /**
  * Register a run's memory scope for its execution, after checking it against
- * the closest ancestor run that has one: a child may narrow it (pin more
- * fields), never widen it or step into another user, agent or chat. Returns
- * the release, called when the run's executor ends.
+ * the closest run that has one: the latest run on the same execution context,
+ * else the closest ancestor. A run may narrow that scope (pin more fields),
+ * never widen it or step into another user, agent or chat. Returns the
+ * release, called when the run's executor ends; it drops only this run's
+ * claim.
  */
 export function claimMemoryScope(
   execution: NativeExecutionContext,
@@ -53,25 +57,34 @@ export function claimMemoryScope(
 ): () => void {
   const running = runningScopes.get(execution.ledger);
   if (scope && running) {
-    let parent: MemoryScope | undefined;
+    let parent: { scope: MemoryScope } | undefined;
     let depth = -1;
-    for (const [id, owned] of running) {
-      if (execution.scopeId.startsWith(`${id}/`) && id.length > depth) {
-        parent = owned;
+    for (const [id, claims] of running) {
+      if (
+        (id === execution.scopeId || execution.scopeId.startsWith(`${id}/`)) &&
+        id.length > depth
+      ) {
+        parent = claims.at(-1);
         depth = id.length;
       }
     }
-    if (parent && !scopeWithin(scope, parent))
+    if (parent && !scopeWithin(scope, parent.scope))
       throw new TypeError(
-        `This run's memory scope ${scopeKey(scope)} widens its parent run's ${scopeKey(parent)}; a child may only narrow it.`,
+        `This run's memory scope ${scopeKey(scope)} widens its parent run's ${scopeKey(parent.scope)}; a child may only narrow it.`,
       );
   }
   if (!scope) return () => {};
-  const map = running ?? new Map<string, MemoryScope>();
+  const map = running ?? new Map<string, { scope: MemoryScope }[]>();
   if (!running) runningScopes.set(execution.ledger, map);
-  map.set(execution.scopeId, scope);
+  const claims = map.get(execution.scopeId) ?? [];
+  map.set(execution.scopeId, claims);
+  // A fresh token per run: equal scopes of two runs are still two claims.
+  const claim = { scope };
+  claims.push(claim);
   return () => {
-    if (map.get(execution.scopeId) === scope) map.delete(execution.scopeId);
+    const index = claims.indexOf(claim);
+    if (index >= 0) claims.splice(index, 1);
+    if (claims.length === 0 && map.get(execution.scopeId) === claims) map.delete(execution.scopeId);
   };
 }
 

@@ -489,6 +489,72 @@ describe('native memory: scopes and binding', () => {
     expect(String(outputs[1])).toMatch(/failed: .*memory scope/);
     expect(String(outputs[2])).toMatch(/failed: .*memory scope/);
   });
+
+  describe('a nested run on the parent run’s own execution context', () => {
+    type Execution = ReturnType<typeof createExecutionContext>;
+    const nested = (
+      memory: ReturnType<typeof memorySeams>,
+      scope: MemoryRecord['scope'],
+      pick: (execution: Execution) => Execution,
+    ) =>
+      ({
+        parameters,
+        execute: async (_args: unknown, ctx: { execution?: Execution }) => {
+          const run = await runAgent({
+            model: mocked([{ text: 'child done' }]).model,
+            prompt: 'child',
+            execution: pick(ctx.execution!),
+            memory: { seams: memory.seams, scope, recall: false, extract: false },
+          });
+          return run.status === 'failed' ? `failed: ${run.error.message}` : run.status;
+        },
+      }) as const;
+    const outputs = (messages: Message[]) =>
+      messages
+        .flatMap((message) => (typeof message.content === 'string' ? [] : message.content))
+        .filter((part) => part.type === 'tool_result')
+        .map((part) => String((part as { result: unknown }).result));
+
+    it('may not step into another user', async () => {
+      const memory = memorySeams();
+      const result = await runAgent({
+        model: mocked([
+          { toolCalls: [{ toolName: 'other', id: 'o', args: {} }] },
+          { text: 'parent done' },
+        ]).model,
+        prompt: 'delegate',
+        execution: createExecutionContext(),
+        memory: { seams: memory.seams, scope: { userId: 'ada' }, extract: false, recall: false },
+        tools: { other: nested(memory, { userId: 'bob' }, (execution) => execution) },
+      });
+      expect(result.status).toBe('completed');
+      expect(outputs(result.messages)[0]).toMatch(/failed: .*memory scope/);
+    });
+
+    it('does not drop the parent’s registration when it ends', async () => {
+      const memory = memorySeams();
+      const result = await runAgent({
+        model: mocked([
+          { toolCalls: [{ toolName: 'same', id: 's', args: {} }] },
+          { toolCalls: [{ toolName: 'wide', id: 'w', args: {} }] },
+          { text: 'parent done' },
+        ]).model,
+        prompt: 'delegate',
+        execution: createExecutionContext(),
+        memory: { seams: memory.seams, scope: { userId: 'ada' }, extract: false, recall: false },
+        tools: {
+          same: nested(memory, { userId: 'ada' }, (execution) => execution),
+          wide: nested(memory, { userId: 'bob' }, (execution) =>
+            execution.child({ scopeId: 'kid' }),
+          ),
+        },
+      });
+      expect(result.status).toBe('completed');
+      const [same, wide] = outputs(result.messages);
+      expect(same).toBe('completed');
+      expect(wide).toMatch(/failed: .*memory scope/);
+    });
+  });
 });
 
 describe('native memory: envelope versions', () => {

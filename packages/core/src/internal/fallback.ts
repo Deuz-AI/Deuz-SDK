@@ -34,6 +34,7 @@ import type { Dependencies } from '../types/deps';
 import type { MemoryMutation } from '../memory';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from './async-iter';
 import { resolveDependencies, noopTracer } from './resolve-deps';
+import { withCapabilityOverride } from './config-symbol';
 import { APICallError, BreakerOpenError, NetworkError, TimeoutError } from '../errors';
 
 export interface FallbackHooks {
@@ -91,7 +92,11 @@ export async function runGenerateWithFallback(
   for (let i = 0; i < candidates.length; i++) {
     const model = candidates[i]!;
     try {
-      const result = await run({ ...options, model });
+      // The caller's `capabilities` override describes every candidate (2.3, F26).
+      const result = await run({
+        ...options,
+        model: withCapabilityOverride(model, options.capabilities),
+      });
       if (i > 0) {
         const deuz = (result.providerMetadata?.deuz ?? {}) as Record<string, unknown>;
         result.providerMetadata = {
@@ -224,7 +229,11 @@ export function runStreamWithFallback(
     try {
       for (let i = 0; i < candidates.length; i++) {
         const model = candidates[i]!;
-        const attempt = run({ ...callOptions, model });
+        // The caller's `capabilities` override describes every candidate (2.3, F26).
+        const attempt = run({
+          ...callOptions,
+          model: withCapabilityOverride(model, callOptions.capabilities),
+        });
         const iterator = attempt.fullStream[Symbol.asyncIterator]();
         const buffered: StreamPart[] = [];
         let failure: unknown;

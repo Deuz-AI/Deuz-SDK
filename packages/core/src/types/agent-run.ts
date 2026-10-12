@@ -373,11 +373,22 @@ export interface AgentRunChatState {
   invocations: AgentRunChatInvocation[];
   /**
    * The last projection attempt: `'saved'`, `'failed'` (the store threw;
-   * `error` says why), or `'scope-mismatch'` (the stored chat belongs to
-   * another scope, so it was left untouched).
+   * `error` says why), `'scope-mismatch'` (the stored chat belongs to
+   * another scope, so it was left untouched), or `'superseded'`: a late
+   * repair (a resume of a run whose leg is not running, `reconcileAgentRun`)
+   * found that the chat moved on without this run. The stored record is
+   * neither the one the run's last failed write found nor one this transcript
+   * continues, so another writer saved (or deleted) it since. That record is
+   * left as it is, and no later repair writes this projection again.
    */
-  status: 'saved' | 'failed' | 'scope-mismatch';
+  status: 'saved' | 'failed' | 'scope-mismatch' | 'superseded';
   error?: { name: string; message: string; code?: string };
+  /**
+   * A fingerprint of the stored record the last failed write found (absent
+   * when it found none), kept until a write lands: a late repair may still
+   * replace that record, which the failed write would have replaced.
+   */
+  found?: string;
 }
 
 export interface AgentToolReceipt {
@@ -634,7 +645,11 @@ export interface AgentStream<T = string> {
 /** What `reconcileAgentRun` settles (2.3). */
 export interface AgentRunReconcileOptions {
   session: AgentRunSession;
-  /** Write the chat projection again when the stored run says it is behind or failed. */
+  /**
+   * Write the chat projection again when the stored run says it is behind or
+   * failed. A stored chat that moved on without the run since its last
+   * attempt is left as it is (`'superseded'`, see `AgentRunChatState`).
+   */
   chat?: ChatPersistOptions;
   /**
    * Settle an extraction the run left pending: when records of its operation
@@ -642,6 +657,20 @@ export interface AgentRunReconcileOptions {
    * otherwise it runs now.
    */
   memory?: MemoryCallOptions;
+  /**
+   * Claim the run's lease first (2.3), as a `runAgent` call with `lease` does,
+   * with the provider the run's executors use. Its key is
+   * `agentRunLeaseKey(session)` from `@deuz-sdk/core/ops`. While an executor
+   * holds it, the call rejects with an error named `AgentRunLeaseError`, code
+   * `'lease_held'`, before reading or writing anything; a call that loses it
+   * saves nothing more to the run and rejects with code `'lease_lost'`. The
+   * lease is renewed while the call settles the run and given back at the
+   * end, however it ends. A cancel queued for the run is handled as by a
+   * resume that does not take the run up: a run that ended drops it, a
+   * suspended run keeps it for its next executor. Without a lease, call
+   * `reconcileAgentRun` only when no executor drives the run.
+   */
+  lease?: AgentRunLeaseOptions;
   deps?: Dependencies;
 }
 

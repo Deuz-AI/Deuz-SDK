@@ -314,13 +314,21 @@ export function createInMemoryAgentRunStore(
 /**
  * Settle what a native run left behind after its outcome (2.3): write the chat
  * projection again when the stored run says it is behind or its last write
- * failed, and settle an extraction an interruption left pending (or that
- * failed). An extraction whose records are in the memory store already, under
- * its operation id, is recorded completed without another memory LLM call;
- * otherwise it runs now. Only for a run that ended or is suspended: an active
- * run settles these itself. The `chat` and `memory` scopes must be the run's.
- * Rejects when the run is unknown, still running, or bound differently, and
- * when a store write fails.
+ * failed (never over a chat that moved on without the run: `'superseded'`, see
+ * `AgentRunChatState`), and settle an extraction an interruption left pending
+ * (or that failed). An extraction whose records are in the memory store
+ * already, under its operation id, is recorded completed without another
+ * memory LLM call; otherwise it runs now. Only for a run that ended or is
+ * suspended: an active run settles these itself. The `chat` and `memory`
+ * scopes must be the run's. Rejects when the run is unknown, still running, or
+ * bound differently, and when a store write fails.
+ *
+ * Call it only when no executor drives the run. An extraction stays pending
+ * from the terminal commit until its outcome is saved, also while the
+ * executor that completed the run is still extracting, and a second pass
+ * would extract again. With a `LeaseProvider`, pass `lease`: the call then
+ * claims the run as an executor does and rejects with `'lease_held'` while
+ * one holds it (an executor keeps its lease until its extraction is saved).
  */
 export async function reconcileAgentRun(
   options: AgentRunReconcileOptions,
@@ -335,7 +343,17 @@ export async function reconcileAgentRun(
     activeNativeRuns.set(store, active);
   }
   active.add(runId);
+  /** The run's cross-process claim (2.3, `lease`), released on every exit. */
+  let lease: NativeRunLease | undefined;
+  /** The run ended, so a cancel queued for it is moot. */
+  let ended = false;
   try {
+    const deps = resolveDependencies(options.deps);
+    // Across processes (2.3): taken before the run is read, as an executor
+    // takes it, so a run another executor drives (one still extracting, say)
+    // is refused before anything else.
+    if (options.lease !== undefined)
+      lease = await claimNativeRunLease(options.lease, options.session, deps, undefined);
     const saved = await store.load(runId);
     if (!saved) throw new TypeError(`Unknown native run: ${runId}`);
     if (
@@ -352,9 +370,14 @@ export async function reconcileAgentRun(
       (options.memory && saved.binding?.memory !== scopeKey(options.memory.scope))
     )
       throw new TypeError('Native agent binding changed across resume.');
-    const deps = resolveDependencies(options.deps);
+    // A cancel the claim found queued, as a resume that does not take the run
+    // up decides on it: an ended run drops it, a suspended one keeps it.
+    ended = saved.phase === 'terminal';
+    await lease?.collect(ended ? 'terminal' : 'active');
     const envelope = structuredClone(saved);
     const save = async (): Promise<void> => {
+      // A call that lost the lease saves nothing more to the run.
+      lease?.assertHeld();
       envelope.version = envelopeVersion(envelope);
       envelope.revision = (envelope.revision ?? 0) + 1;
       await store.save(structuredClone(envelope));
@@ -363,6 +386,7 @@ export async function reconcileAgentRun(
     if (options.chat && envelope.transcript) {
       const nativeChat = await import('./internal/native-chat');
       if (nativeChat.projectionBehind(envelope.transcript, envelope.chat)) {
+        lease?.assertHeld();
         envelope.chat = await nativeChat.saveProjection(
           options.chat,
           runId,
@@ -370,6 +394,7 @@ export async function reconcileAgentRun(
           envelope.chat,
           Object.values(envelope.toolResults ?? {}),
           deps.clock,
+          true,
         );
         await save();
         outcome.chat = envelope.chat.status;
@@ -383,6 +408,7 @@ export async function reconcileAgentRun(
         if (wrote > 0)
           envelope.memory!.extraction = { ...extraction, status: 'completed', mutations: wrote };
         else {
+          lease?.assertHeld();
           try {
             const mutations = await nativeMemory.runExtraction(
               options.memory,
@@ -406,7 +432,12 @@ export async function reconcileAgentRun(
       outcome.memory = envelope.memory!.extraction!.status;
     }
     return outcome;
+  } catch (error) {
+    // A lost lease is the reason, however the loss surfaced.
+    throw lease ? lease.failure(error) : error;
   } finally {
+    // The lease goes back before the in-process claim, as an executor's does.
+    await lease?.release(ended);
     active.delete(runId);
     if (active.size === 0) activeNativeRuns.delete(store);
   }
@@ -564,6 +595,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     const deps = resolveDependencies(options.deps);
     if (options.chat && envelope.transcript && nativeChat) {
       if (admitted || nativeChat.projectionBehind(envelope.transcript, envelope.chat)) {
+        // A leg that did not run (a terminal or still-suspended resume) only
+        // repairs: it never replaces a chat that moved on without the run.
         const state = await nativeChat.saveProjection(
           options.chat,
           envelope.runId,
@@ -571,6 +604,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           envelope.chat,
           Object.values(envelope.toolResults ?? {}),
           deps.clock,
+          !admitted,
         );
         envelope.chat = state;
         if (state.status === 'failed')
@@ -583,6 +617,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           warnRecords(
             'chat',
             `Chat ${options.chat.chatId} belongs to another scope; run ${envelope.runId} left it untouched.`,
+          );
+        else if (state.status === 'superseded')
+          warnRecords(
+            'chat',
+            `Chat ${options.chat.chatId} moved on without run ${envelope.runId}; its projection was not written.`,
           );
         await saveBookkeeping();
       }

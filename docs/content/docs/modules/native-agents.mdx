@@ -495,6 +495,21 @@ as completed without another memory LLM call; otherwise it runs the extraction
 now. Extraction is therefore at least once and never silent; dedup by content
 hash keeps a repeat from writing the same fact twice.
 
+Call `reconcileAgentRun` only when no executor drives the run. An extraction
+stays `pending` from the terminal commit until its outcome is saved, also while
+the executor that completed the run is still extracting, and a second pass
+would extract again (dedup catches only a fact worded the same way). With a
+`LeaseProvider`, pass `lease` (`{ provider, owner?, ttlMs? }`, as for
+[`runAgent`](/docs/modules/operations#leasing-a-native-run)) with the provider
+the executors use. The call claims `agentRunLeaseKey(session)` before it reads
+the run and, while an executor holds it, rejects with an error named
+`AgentRunLeaseError`, code `'lease_held'`; an executor keeps its lease until its
+extraction is saved. The call renews the lease while it settles the run, saves
+nothing more to the run once it has lost it (`'lease_lost'`), and gives it back
+at the end. A cancel queued for the run is handled as by a resume that does not
+take the run up: a run that ended drops it, and a suspended run keeps it for its
+next executor.
+
 ```ts
 import { createInMemoryAgentRunStore, reconcileAgentRun, runAgent } from '@deuz-sdk/core/agent';
 import { createInMemoryMemoryStore } from '@deuz-sdk/core/memory';
@@ -539,7 +554,12 @@ A run under another native run's execution (a run a tool starts with
 `execution: ctx.execution.child(...)`) may only **narrow** that run's memory
 scope: it may pin more fields, never drop one or change a user, agent or chat.
 A wider scope fails the child run before any call. A sub-agent from `agentTool`
-gets no memory at all.
+gets no memory at all. Runs that share one execution context instead of each
+taking a `.child()` (a tool that hands its own `ctx.execution` to a nested run,
+or concurrent runs given the same context) count as nested too: each may only
+narrow the scope of the latest run still running on that context. Give a run
+with another user's or agent's memory its own child context; a child still
+shares the parent's budget.
 
 ### Chat projection
 
@@ -567,6 +587,20 @@ The two stores are written one after the other, never as one transaction:
 - A stored chat of another scope is never overwritten (`status:
   'scope-mismatch'`). A stored chat that already holds the projection and more,
   because a later run continued it, is left as it is.
+- A late repair never overwrites a chat that moved on **without** the run. A
+  resume of a run that ended or is still waiting, and `reconcileAgentRun`, only
+  finish the write the run's last attempt meant: over the record that failed
+  write found (or where none is stored, if it found none), or over one the
+  run's transcript continues (its input, or an earlier projection of it). Any
+  other record was saved or deleted since, for example by another run that went
+  on from what the chat store held, and stays as it is: the run records
+  `status: 'superseded'`, a resume reports a `warning` part, and
+  `reconcileAgentRun` returns `chat: 'superseded'`. The run's turns stay in its
+  checkpoint (`AgentRunEnvelope.transcript`), and no later repair tries again.
+  The check reads the record right before the write, and `ChatStore` has no
+  conditional write, so a save that lands in between is still overwritten. A
+  leg that runs (a resume that continues the run) writes its whole projection,
+  and the last writer wins, as in the legacy loops.
 - A failed checkpoint publishes nothing to the chat.
 
 ```ts
