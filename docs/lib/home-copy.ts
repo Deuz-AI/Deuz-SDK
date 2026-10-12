@@ -29,22 +29,22 @@ export type HomeCopy = {
 
 export const homeCopy: Record<Locale, HomeCopy> = {
   en: {
-    badge: 'v2.2.0 — Dynamic swarms, cross-process operations, persistent budgets & evolve',
+    badge: 'v2.3.0 — MCP server, A2A, realtime voice, batch requests & Redis backends',
     titleA: 'One canonical wire for',
     titleB: 'every AI provider',
     lead: 'Pure · Web-first · Multi-provider AI SDK for TypeScript',
     description:
       '29 providers behind one StreamPart delta stream. Zero runtime dependencies — SQLite, Redis and Postgres packs, guardrails and handoffs in the loop, MCP that connects itself. Runs anywhere fetch runs.',
     ctaDocs: 'Get started',
-    ctaWhatsNew: 'What is new in 2.2',
+    ctaWhatsNew: 'What is new in 2.3',
     worksWith: 'One API surface across',
     providersMore:
       'Each mark opens its guide. Any other OpenAI-compatible host works through createOpenAICompatible.',
     stats: [
       { value: '29', label: 'provider ids' },
-      { value: '62', label: 'subpaths' },
+      { value: '71', label: 'subpaths' },
       { value: '3', label: 'database packs' },
-      { value: '2.1 → 2.2', label: 'mostly additive' },
+      { value: '2.2 → 2.3', label: 'mostly additive' },
     ],
     features: {
       stream: {
@@ -53,7 +53,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       agents: {
         title: 'Native agents and durable swarms',
-        body: 'Opt-in runAgent with validated results, shared and persistent budgets. Swarms that spawn tasks at runtime, share a blackboard and move between processes with leases, on memory, SQLite or Postgres.',
+        body: 'Opt-in runAgent with validated results, shared and persistent budgets. Swarms that spawn tasks at runtime, share a blackboard and move between processes with leases, on memory, SQLite, Postgres or Redis.',
       },
       stores: {
         title: 'Point persistence at a database',
@@ -93,25 +93,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Documentation UI',
     footerDocs: 'Documentation',
     footerChangelog: 'Changelog',
-    footerWhatsNew: 'What is new in 2.2',
+    footerWhatsNew: 'What is new in 2.3',
   },
   de: {
-    badge: 'v2.2.0 — Dynamische Swarms, prozessübergreifender Betrieb, dauerhafte Budgets und Evolve',
+    badge: 'v2.3.0 — MCP-Server, A2A, Echtzeit-Sprache, Batch-Anfragen und Redis-Backends',
     titleA: 'Ein kanonisches Protokoll für',
     titleB: 'jeden KI-Provider',
     lead: 'Pures · Web-first · Multi-Provider AI SDK für TypeScript',
     description:
       '29 Provider hinter einem StreamPart-Delta-Stream. Keine Runtime-Abhängigkeiten — SQLite-, Redis- und Postgres-Packs, Guardrails und Handoffs im Loop, MCP das sich selbst verbindet. Läuft überall, wo fetch läuft.',
     ctaDocs: 'Loslegen',
-    ctaWhatsNew: 'Neu in 2.2',
+    ctaWhatsNew: 'Neu in 2.3',
     worksWith: 'Eine API-Oberfläche für',
     providersMore:
       'Jedes Zeichen öffnet seine Anleitung. Jeder andere OpenAI-kompatible Host läuft über createOpenAICompatible.',
     stats: [
       { value: '29', label: 'Provider-IDs' },
-      { value: '62', label: 'Subpfade' },
+      { value: '71', label: 'Subpfade' },
       { value: '3', label: 'Datenbank-Packs' },
-      { value: '2.1 → 2.2', label: 'größtenteils additiv' },
+      { value: '2.2 → 2.3', label: 'größtenteils additiv' },
     ],
     features: {
       stream: {
@@ -120,7 +120,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       agents: {
         title: 'Native Agenten und persistente Swarms',
-        body: 'Optionale native Agenten mit validierten Ergebnissen, gemeinsamen und dauerhaften Budgets. Swarms, die zur Laufzeit Aufgaben erzeugen, ein Blackboard teilen und per Lease zwischen Prozessen wandern, auf Memory, SQLite oder Postgres.',
+        body: 'Optionale native Agenten mit validierten Ergebnissen, gemeinsamen und dauerhaften Budgets. Swarms, die zur Laufzeit Aufgaben erzeugen, ein Blackboard teilen und per Lease zwischen Prozessen wandern, auf Memory, SQLite, Postgres oder Redis.',
       },
       stores: {
         title: 'Persistenz auf eine Datenbank zeigen',
@@ -160,25 +160,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Dokumentations-UI',
     footerDocs: 'Dokumentation',
     footerChangelog: 'Changelog',
-    footerWhatsNew: 'Neu in 2.2',
+    footerWhatsNew: 'Neu in 2.3',
   },
   tr: {
-    badge: 'v2.2.0 — Dinamik swarm’lar, süreçler arası operasyon, kalıcı bütçeler ve evolve',
+    badge: 'v2.3.0 — MCP sunucusu, A2A, gerçek zamanlı ses, toplu istekler ve Redis backend’leri',
     titleA: 'Tüm yapay zeka sağlayıcıları için',
     titleB: 'tek kanonik protokol',
     lead: 'Saf · Web öncelikli · Çok sağlayıcılı TypeScript AI SDK',
     description:
       '29 sağlayıcı, tek bir StreamPart delta akışının arkasında. Sıfır çalışma zamanı bağımlılığı — SQLite, Redis ve Postgres paketleri, döngüde guardrail ve handoff, kendini bağlayan MCP. fetch’in çalıştığı her yerde çalışır.',
     ctaDocs: 'Başla',
-    ctaWhatsNew: '2.2’de neler yeni',
+    ctaWhatsNew: '2.3’te neler yeni',
     worksWith: 'Tek API yüzeyi:',
     providersMore:
       'Her işaret kendi rehberini açar. Diğer OpenAI uyumlu her sunucu createOpenAICompatible ile çalışır.',
     stats: [
       { value: '29', label: 'sağlayıcı kimliği' },
-      { value: '62', label: 'alt yol' },
+      { value: '71', label: 'alt yol' },
       { value: '3', label: 'veritabanı paketi' },
-      { value: '2.1 → 2.2', label: 'çoğunlukla eklemeli' },
+      { value: '2.2 → 2.3', label: 'çoğunlukla eklemeli' },
     ],
     features: {
       stream: {
@@ -187,7 +187,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       agents: {
         title: 'Native ajanlar ve kalıcı swarm',
-        body: 'İsteğe bağlı native ajanlar: doğrulanmış çıktılar, ortak ve kalıcı bütçeler. Çalışırken görev üreten, ortak pano kullanan ve lease ile süreçler arasında taşınan swarm’lar; bellek, SQLite veya Postgres üzerinde.',
+        body: 'İsteğe bağlı native ajanlar: doğrulanmış çıktılar, ortak ve kalıcı bütçeler. Çalışırken görev üreten, ortak pano kullanan ve lease ile süreçler arasında taşınan swarm’lar; bellek, SQLite, Postgres veya Redis üzerinde.',
       },
       stores: {
         title: 'Kalıcılığı bir veritabanına bağla',
@@ -227,25 +227,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Dokümantasyon arayüzü',
     footerDocs: 'Dokümantasyon',
     footerChangelog: 'Sürüm notları',
-    footerWhatsNew: '2.2’de neler yeni',
+    footerWhatsNew: '2.3’te neler yeni',
   },
   fr: {
-    badge: 'v2.2.0 — Swarms dynamiques, opérations multi-processus, budgets persistants et evolve',
+    badge: 'v2.3.0 — Serveur MCP, A2A, voix en temps réel, requêtes par lots et backends Redis',
     titleA: 'Un protocole canonique pour',
     titleB: 'chaque fournisseur d’IA',
     lead: 'SDK IA TypeScript pur · web-first · multi-fournisseur',
     description:
       '29 fournisseurs derrière un seul flux delta StreamPart. Zéro dépendance runtime — packs SQLite, Redis et Postgres, guardrails et handoffs dans la boucle, MCP qui se connecte tout seul. Fonctionne partout où fetch fonctionne.',
     ctaDocs: 'Commencer',
-    ctaWhatsNew: 'Nouveautés de la 2.2',
+    ctaWhatsNew: 'Nouveautés de la 2.3',
     worksWith: 'Une seule surface d’API pour',
     providersMore:
       'Chaque marque ouvre son guide. Tout autre hôte compatible OpenAI passe par createOpenAICompatible.',
     stats: [
       { value: '29', label: 'ids de fournisseur' },
-      { value: '62', label: 'sous-chemins' },
+      { value: '71', label: 'sous-chemins' },
       { value: '3', label: 'packs base de données' },
-      { value: '2.1 → 2.2', label: 'surtout additif' },
+      { value: '2.2 → 2.3', label: 'surtout additif' },
     ],
     features: {
       stream: {
@@ -254,7 +254,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       agents: {
         title: 'Agents natifs et swarms persistants',
-        body: 'Agents natifs optionnels, résultats validés, budgets partagés et persistants. Des swarms qui créent des tâches en cours d’exécution, partagent un tableau et passent d’un processus à l’autre grâce aux baux, en mémoire, SQLite ou Postgres.',
+        body: 'Agents natifs optionnels, résultats validés, budgets partagés et persistants. Des swarms qui créent des tâches en cours d’exécution, partagent un tableau et passent d’un processus à l’autre grâce aux baux, en mémoire, SQLite, Postgres ou Redis.',
       },
       stores: {
         title: 'Pointer la persistance vers une base',
@@ -294,25 +294,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Interface de la documentation',
     footerDocs: 'Documentation',
     footerChangelog: 'Journal des modifications',
-    footerWhatsNew: 'Nouveautés de la 2.2',
+    footerWhatsNew: 'Nouveautés de la 2.3',
   },
   it: {
-    badge: 'v2.2.0 — Swarm dinamici, operazioni tra processi, budget persistenti ed evolve',
+    badge: 'v2.3.0 — Server MCP, A2A, voce in tempo reale, richieste batch e backend Redis',
     titleA: 'Un protocollo canonico per',
     titleB: 'ogni provider di IA',
     lead: 'SDK IA TypeScript puro · web-first · multi-provider',
     description:
       '29 provider dietro un unico stream delta StreamPart. Zero dipendenze runtime — pack SQLite, Redis e Postgres, guardrail e handoff nel loop, MCP che si connette da solo. Funziona ovunque funzioni fetch.',
     ctaDocs: 'Inizia',
-    ctaWhatsNew: 'Novità della 2.2',
+    ctaWhatsNew: 'Novità della 2.3',
     worksWith: 'Un’unica superficie API per',
     providersMore:
       'Ogni marchio apre la sua guida. Qualsiasi altro host compatibile con OpenAI passa da createOpenAICompatible.',
     stats: [
       { value: '29', label: 'id provider' },
-      { value: '62', label: 'sottopath' },
+      { value: '71', label: 'sottopath' },
       { value: '3', label: 'pack database' },
-      { value: '2.1 → 2.2', label: 'per lo più additivo' },
+      { value: '2.2 → 2.3', label: 'per lo più additivo' },
     ],
     features: {
       stream: {
@@ -321,7 +321,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       agents: {
         title: 'Agenti nativi e swarm persistenti',
-        body: 'Agenti nativi opzionali, risultati validati, budget condivisi e persistenti. Swarm che creano attività durante l’esecuzione, condividono una lavagna e passano tra processi con i lease, in memoria, SQLite o Postgres.',
+        body: 'Agenti nativi opzionali, risultati validati, budget condivisi e persistenti. Swarm che creano attività durante l’esecuzione, condividono una lavagna e passano tra processi con i lease, in memoria, SQLite, Postgres o Redis.',
       },
       stores: {
         title: 'Punta la persistenza a un database',
@@ -361,25 +361,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Interfaccia della documentazione',
     footerDocs: 'Documentazione',
     footerChangelog: 'Changelog',
-    footerWhatsNew: 'Novità della 2.2',
+    footerWhatsNew: 'Novità della 2.3',
   },
   es: {
-    badge: 'v2.2.0 — Swarms dinámicos, operaciones entre procesos, presupuestos persistentes y evolve',
+    badge: 'v2.3.0 — Servidor MCP, A2A, voz en tiempo real, solicitudes por lotes y backends de Redis',
     titleA: 'Un protocolo canónico para',
     titleB: 'cada proveedor de IA',
     lead: 'SDK de IA para TypeScript puro · web-first · multiproveedor',
     description:
       '29 proveedores detrás de un único stream delta StreamPart. Cero dependencias en tiempo de ejecución — packs SQLite, Redis y Postgres, guardrails y handoffs en el bucle, MCP que se conecta solo. Funciona dondequiera que funcione fetch.',
     ctaDocs: 'Empezar',
-    ctaWhatsNew: 'Novedades de 2.2',
+    ctaWhatsNew: 'Novedades de 2.3',
     worksWith: 'Una sola superficie de API para',
     providersMore:
       'Cada marca abre su guía. Cualquier otro host compatible con OpenAI funciona mediante createOpenAICompatible.',
     stats: [
       { value: '29', label: 'ids de proveedor' },
-      { value: '62', label: 'subrutas' },
+      { value: '71', label: 'subrutas' },
       { value: '3', label: 'packs de base de datos' },
-      { value: '2.1 → 2.2', label: 'casi todo aditivo' },
+      { value: '2.2 → 2.3', label: 'casi todo aditivo' },
     ],
     features: {
       stream: {
@@ -388,7 +388,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       agents: {
         title: 'Agentes nativos y swarms persistentes',
-        body: 'Agentes nativos opcionales, resultados validados, presupuestos compartidos y persistentes. Swarms que crean tareas en ejecución, comparten una pizarra y pasan entre procesos con leases, en memoria, SQLite o Postgres.',
+        body: 'Agentes nativos opcionales, resultados validados, presupuestos compartidos y persistentes. Swarms que crean tareas en ejecución, comparten una pizarra y pasan entre procesos con leases, en memoria, SQLite, Postgres o Redis.',
       },
       stores: {
         title: 'Apunta la persistencia a una base',
@@ -428,25 +428,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Interfaz de la documentación',
     footerDocs: 'Documentación',
     footerChangelog: 'Registro de cambios',
-    footerWhatsNew: 'Novedades de 2.2',
+    footerWhatsNew: 'Novedades de 2.3',
   },
   ru: {
-    badge: 'v2.2.0 — Динамические swarm, работа между процессами, постоянные бюджеты и evolve',
+    badge: 'v2.3.0 — MCP-сервер, A2A, голос в реальном времени, пакетные запросы и бэкенды Redis',
     titleA: 'Один канонический протокол для',
     titleB: 'каждого ИИ-провайдера',
     lead: 'Чистый · web-first · мультипровайдерный TypeScript AI SDK',
     description:
       '29 провайдеров за одним дельта-потоком StreamPart. Ноль runtime-зависимостей — пакеты SQLite, Redis и Postgres, guardrail и handoff в цикле, MCP, который подключается сам. Работает везде, где работает fetch.',
     ctaDocs: 'Начать',
-    ctaWhatsNew: 'Что нового в 2.2',
+    ctaWhatsNew: 'Что нового в 2.3',
     worksWith: 'Единая поверхность API для',
     providersMore:
       'Каждый знак открывает своё руководство. Любой другой OpenAI-совместимый хост работает через createOpenAICompatible.',
     stats: [
       { value: '29', label: 'id провайдеров' },
-      { value: '62', label: 'подпутей' },
+      { value: '71', label: 'подпутей' },
       { value: '3', label: 'пакета БД' },
-      { value: '2.1 → 2.2', label: 'в основном аддитивно' },
+      { value: '2.2 → 2.3', label: 'в основном аддитивно' },
     ],
     features: {
       stream: {
@@ -455,7 +455,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       agents: {
         title: 'Нативные агенты и сохраняемые swarm',
-        body: 'Опциональные нативные агенты с проверкой результатов, общими и постоянными бюджетами. Swarm, которые создают задачи во время работы, делят общую доску и переходят между процессами по lease, в памяти, SQLite или Postgres.',
+        body: 'Опциональные нативные агенты с проверкой результатов, общими и постоянными бюджетами. Swarm, которые создают задачи во время работы, делят общую доску и переходят между процессами по lease, в памяти, SQLite, Postgres или Redis.',
       },
       stores: {
         title: 'Направьте персистентность в базу',
@@ -495,25 +495,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'Интерфейс документации',
     footerDocs: 'Документация',
     footerChangelog: 'История изменений',
-    footerWhatsNew: 'Что нового в 2.2',
+    footerWhatsNew: 'Что нового в 2.3',
   },
   ja: {
-    badge: 'v2.2.0 — 動的な Swarm、プロセス間の運用、永続的な予算、Evolve',
+    badge: 'v2.3.0 — MCP サーバー、A2A、リアルタイム音声、バッチリクエスト、Redis バックエンド',
     titleA: 'すべての AI プロバイダーを',
     titleB: 'ひとつの正規プロトコルで',
     lead: 'ピュア · ウェブファースト · マルチプロバイダー TypeScript AI SDK',
     description:
       '29 のプロバイダーを単一の StreamPart デルタストリームの背後に統合。ランタイム依存ゼロ — SQLite / Redis / Postgres パック、ループ内のガードレールとハンドオフ、自分で接続する MCP。fetch が動くところならどこでも動きます。',
     ctaDocs: 'はじめる',
-    ctaWhatsNew: '2.2 の新機能',
+    ctaWhatsNew: '2.3 の新機能',
     worksWith: '単一の API サーフェスで',
     providersMore:
       '各マークをクリックするとガイドが開きます。その他の OpenAI 互換ホストは createOpenAICompatible で利用できます。',
     stats: [
       { value: '29', label: 'プロバイダー ID' },
-      { value: '62', label: 'サブパス' },
+      { value: '71', label: 'サブパス' },
       { value: '3', label: 'データベースパック' },
-      { value: '2.1 → 2.2', label: 'ほぼ加算的' },
+      { value: '2.2 → 2.3', label: 'ほぼ加算的' },
     ],
     features: {
       stream: {
@@ -522,7 +522,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       agents: {
         title: 'ネイティブエージェントと永続 Swarm',
-        body: '任意で使えるネイティブエージェントで出力を検証し、予算を共有・永続化。実行中にタスクを生成し、ブラックボードを共有し、リースでプロセス間を移動する Swarm を、メモリ・SQLite・Postgres で動かせます。',
+        body: '任意で使えるネイティブエージェントで出力を検証し、予算を共有・永続化。実行中にタスクを生成し、ブラックボードを共有し、リースでプロセス間を移動する Swarm を、メモリ・SQLite・Postgres・Redis で動かせます。',
       },
       stores: {
         title: '永続化をデータベースへ',
@@ -562,25 +562,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: 'ドキュメント UI',
     footerDocs: 'ドキュメント',
     footerChangelog: '変更履歴',
-    footerWhatsNew: '2.2 の新機能',
+    footerWhatsNew: '2.3 の新機能',
   },
   ko: {
-    badge: 'v2.2.0 — 동적 Swarm, 프로세스 간 운영, 영속 예산, Evolve',
+    badge: 'v2.3.0 — MCP 서버, A2A, 실시간 음성, 배치 요청, Redis 백엔드',
     titleA: '모든 AI 프로바이더를 위한',
     titleB: '단 하나의 정규 프로토콜',
     lead: '순수 · 웹 우선 · 멀티 프로바이더 TypeScript AI SDK',
     description:
       '29개 프로바이더를 하나의 StreamPart 델타 스트림 뒤에 둡니다. 런타임 의존성 제로 — SQLite, Redis, Postgres 팩, 루프 안의 가드레일과 핸드오프, 스스로 연결하는 MCP. fetch가 동작하는 곳이라면 어디서든 실행됩니다.',
     ctaDocs: '시작하기',
-    ctaWhatsNew: '2.2의 새로운 점',
+    ctaWhatsNew: '2.3의 새로운 점',
     worksWith: '단일 API 표면:',
     providersMore:
       '각 마크를 누르면 안내 문서가 열립니다. 그 밖의 OpenAI 호환 호스트는 createOpenAICompatible로 사용할 수 있습니다.',
     stats: [
       { value: '29', label: '프로바이더 id' },
-      { value: '62', label: '서브패스' },
+      { value: '71', label: '서브패스' },
       { value: '3', label: '데이터베이스 팩' },
-      { value: '2.1 → 2.2', label: '대부분 가산적' },
+      { value: '2.2 → 2.3', label: '대부분 가산적' },
     ],
     features: {
       stream: {
@@ -589,7 +589,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       agents: {
         title: '네이티브 에이전트와 영속 Swarm',
-        body: '선택형 네이티브 에이전트로 결과를 검증하고 예산을 공유·영속화합니다. 실행 중에 작업을 만들고 블랙보드를 공유하며 리스로 프로세스 간을 옮겨 다니는 Swarm을 메모리, SQLite, Postgres에서 실행합니다.',
+        body: '선택형 네이티브 에이전트로 결과를 검증하고 예산을 공유·영속화합니다. 실행 중에 작업을 만들고 블랙보드를 공유하며 리스로 프로세스 간을 옮겨 다니는 Swarm을 메모리, SQLite, Postgres, Redis에서 실행합니다.',
       },
       stores: {
         title: '영속성을 데이터베이스에 연결',
@@ -629,25 +629,25 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: '문서 UI',
     footerDocs: '문서',
     footerChangelog: '변경 이력',
-    footerWhatsNew: '2.2의 새로운 점',
+    footerWhatsNew: '2.3의 새로운 점',
   },
   zh: {
-    badge: 'v2.2.0 — 动态 Swarm、跨进程运行、持久化预算与 Evolve',
+    badge: 'v2.3.0 — MCP 服务器、A2A、实时语音、批量请求与 Redis 后端',
     titleA: '为每一个 AI 提供商',
     titleB: '提供同一条规范协议',
     lead: '纯净 · Web 优先 · 多提供商 TypeScript AI SDK',
     description:
       '29 个提供商统一在同一条 StreamPart 增量流之后。零运行时依赖 — SQLite、Redis、Postgres 包，循环内的护栏与交接，会自己连接的 MCP。fetch 能运行的地方就能运行。',
     ctaDocs: '快速开始',
-    ctaWhatsNew: '2.2 新特性',
+    ctaWhatsNew: '2.3 新特性',
     worksWith: '同一套 API 表面覆盖',
     providersMore:
       '点击任一标识即可打开对应指南。其他 OpenAI 兼容主机可通过 createOpenAICompatible 使用。',
     stats: [
       { value: '29', label: '提供商 id' },
-      { value: '62', label: '子路径' },
+      { value: '71', label: '子路径' },
       { value: '3', label: '数据库包' },
-      { value: '2.1 → 2.2', label: '几乎全部是加法' },
+      { value: '2.2 → 2.3', label: '几乎全部是加法' },
     ],
     features: {
       stream: {
@@ -656,7 +656,7 @@ export const homeCopy: Record<Locale, HomeCopy> = {
       },
       agents: {
         title: '原生智能体与持久化 Swarm',
-        body: '按需启用原生智能体，验证结果并共享、持久化预算。Swarm 可在运行时派生任务、共享黑板，并通过租约在进程间迁移，支持内存、SQLite 或 Postgres。',
+        body: '按需启用原生智能体，验证结果并共享、持久化预算。Swarm 可在运行时派生任务、共享黑板，并通过租约在进程间迁移，支持内存、SQLite、Postgres 或 Redis。',
       },
       stores: {
         title: '把持久化指向数据库',
@@ -693,6 +693,6 @@ export const homeCopy: Record<Locale, HomeCopy> = {
     languagesLabel: '文档界面',
     footerDocs: '文档',
     footerChangelog: '更新日志',
-    footerWhatsNew: '2.2 新特性',
+    footerWhatsNew: '2.3 新特性',
   },
 };

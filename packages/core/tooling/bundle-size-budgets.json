@@ -244,7 +244,14 @@
     "  native-mcp lazy  24298 B raw / 9105 gzip -> 24700 / 9250 (edge, native-agent, native-swarm)",
     "What grew: inference/native-mcp.ts +0.5 KB raw / +0.2 KB gzip, the resume that accepts a drifted",
     "catalog under onCatalogChange: accept and refuses one while an MCP call of the last turn has no",
-    "answer (Z3, F-EV1-1). Every other bundle still fits its W2b limit."
+    "answer (Z3, F-EV1-1). Every other bundle still fits its W2b limit.",
+    "",
+    "ADDED FOR 2.3 (wave 3). Measured on feat/2.3 after the nine W3 lanes:",
+    "  a2a-agent  46927 B raw / 15582 gzip -> 50500 / 16800 (~8%): the a2a client and handler plus",
+    "             createA2AAgentExecutor (src/a2a/agent.ts); the native engine is passed in, so it stays",
+    "             out of the graph. a2a without the adapter grew 35445 / 11949 -> 36026 / 12050 (ctx.draft",
+    "             and the follow-up answer rule) and still fits its limit, as do the native bundles after",
+    "             the receipt settle and the native drain (RS3)."
   ],
   "bundles": {
     "core": {
@@ -624,6 +631,20 @@
       ],
       "maxRawBytes": 38600,
       "maxGzipBytes": 13000
+    },
+    "a2a-agent": {
+      "from": "@deuz-sdk/core/a2a",
+      "exports": [
+        "createA2AClient",
+        "fetchAgentCard",
+        "createA2AHandler",
+        "createInMemoryA2ATaskStore",
+        "a2aText",
+        "A2AError",
+        "createA2AAgentExecutor"
+      ],
+      "maxRawBytes": 50500,
+      "maxGzipBytes": 16800
     }
   }
 }

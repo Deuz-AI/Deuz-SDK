@@ -755,7 +755,13 @@ expectTypeOf<AssistantTurnState['agent']>().toEqualTypeOf<DeuzAgentState | undef
 // W2b review fixes: reconcileAgentRun's lease and the 'superseded' chat state (Z2), the
 // durability options (Z3), the provider-metadata cap (Z4), project instructions (Z6).
 import type { AgentRunChatState, AgentRunReconcileOptions, AgentRunRetry } from '../src/agent';
-import type { ProjectInstructions, ProjectInstructionsOptions } from '../src/node/headless';
+import type {
+  HeadlessPendingAction,
+  HeadlessReport,
+  HeadlessRetry,
+  ProjectInstructions,
+  ProjectInstructionsOptions,
+} from '../src/node/headless';
 expectTypeOf<AgentRunReconcileOptions['lease']>().toEqualTypeOf<AgentRunLeaseOptions | undefined>();
 expectTypeOf<AgentRunChatState['status']>().toEqualTypeOf<
   'saved' | 'failed' | 'scope-mismatch' | 'superseded'
@@ -779,3 +785,14 @@ expectTypeOf<ProjectInstructionsOptions['role']>().toEqualTypeOf<'system' | 'use
 expectTypeOf<NonNullable<ProjectInstructions['message']>['role']>().toEqualTypeOf<
   'system' | 'user'
 >();
+
+// W3: headless reports a failure in transit and both answers for an unknown effect (HL3).
+expectTypeOf<HeadlessReport['retry']>().toEqualTypeOf<HeadlessRetry | undefined>();
+expectTypeOf<HeadlessRetry>().toEqualTypeOf<{
+  cause: 'model-call' | 'admission';
+  phase: 'running' | 'finalizing';
+  resumeWith: 'retryFailed';
+}>();
+expectTypeOf<
+  Extract<HeadlessPendingAction, { kind: 'unknown-effect' }>['resumeWith']
+>().toEqualTypeOf<['retryToolCallIds', 'reconciledToolResults']>();

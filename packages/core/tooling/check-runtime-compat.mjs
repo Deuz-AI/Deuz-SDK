@@ -78,7 +78,7 @@ const consumers = [
   {
     name: 'a2a',
     source: `export { createA2AClient, fetchAgentCard, createA2AHandler, createInMemoryA2ATaskStore,
-      a2aText, A2AError } from '@deuz-sdk/core/a2a';`,
+      createA2AAgentExecutor, a2aText, A2AError } from '@deuz-sdk/core/a2a';`,
   },
   {
     name: 'testing',

@@ -42,6 +42,6 @@ describe.skipIf(runnable.length === 0)('real-model eval tasks — live', () => {
       expect(report.aggregate.offline).toBeUndefined();
       expect(report.aggregate['real-model']!.attempts).toBe(runnable.length * 3);
     },
-    30 * 60_000,
+    90 * 60_000,
   );
 });
