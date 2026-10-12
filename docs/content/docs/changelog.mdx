@@ -25,11 +25,12 @@ provider behaviour is verified offline and labelled not live-verified.
   order, for local and MCP tools, handoff transfers, blackboard tools, spawned
   tasks and sub-agents. Refused or cut-off turns dispatch nothing; `stopDetails`
   and `ToolCallOutcome` name how a turn and a call ended; approvals are bound to
-  their call; native runs take MCP tools behind receipts, a native `lease`,
+  their call; native runs take MCP tools behind receipts, a native `lease`
+  that another process can signal to cancel or drain the run,
   `AgentRunStore.list`, `findStaleAgentRuns`, and the opt-in
-  `reconciledToolResults` and `retryFailed` resume options.
-  {/* W3:RS3 */}A resume settles a call whose receipt holds an outcome from that
-  receipt, without asking for its approval again.{/* /W3:RS3 */}
+  `reconciledToolResults` and `retryFailed` resume options. A resume answers a
+  call whose receipt records its outcome from that receipt, without gating it
+  for approval again.
   → [Native agents](/docs/modules/native-agents#one-path-for-every-tool-call)
 - **Native memory, chat and fail-over** — `memory`, `chat` and `fallbackModels`
   in `runAgent` and `streamAgent`, bound to the checkpoint and the resume
@@ -56,9 +57,8 @@ provider behaviour is verified offline and labelled not live-verified.
   `createMcpServer` publishing tools, native agent tools and agents over
   Streamable HTTP and stdio. → [MCP server](/docs/modules/mcp-server)
 - **A2A** (`/a2a`) — an edge-safe, dependency-free A2A 1.0.0 client and handler
-  over JSON-RPC and HTTP+JSON.
-  {/* W3:AA3 */}A native agent can serve as the handler's executor.{/* /W3:AA3 */}
-  → [A2A](/docs/modules/a2a)
+  over JSON-RPC and HTTP+JSON, and `createA2AAgentExecutor`, which serves a
+  native agent run as the handler's executor. → [A2A](/docs/modules/a2a)
 - **Realtime voice** (`/realtime`) — OpenAI Realtime and Gemini Live over
   WebSocket, with Deuz tools, ephemeral browser tokens and per-modality usage.
   → [Realtime voice](/docs/modules/realtime)
@@ -78,16 +78,17 @@ provider behaviour is verified offline and labelled not live-verified.
   → [UI streaming](/docs/modules/ui-streaming#native-agent-runs-todeuzagentstreamresponse-23)
 - **Evals** (`runEvalSuite` on `/testing`) — versioned tasks with per-attempt
   metrics for success, false completion, cost, rescues, repeated effects and
-  recovery.
-  {/* W3:EV3 */}The baseline runs 16 offline tasks and 23 fault-injection
-  scenarios on every `npm test`.{/* /W3:EV3 */}
-  → [Evals](/docs/modules/evals)
+  recovery. The baseline runs 22 offline tasks and 32 fault-injection
+  scenarios on every `npm test`. → [Evals](/docs/modules/evals)
 - **Headless preview** (`/headless`, Node-only) — `runHeadless`,
   `resumeHeadless`, `inspectRun`, `doctor`, project instructions and documented
-  exit codes; no binary.
-  {/* W3:HL3 */}Reports and resumes support `reconciledToolResults` and
-  `retryFailed`.{/* /W3:HL3 */}
-  → [Headless](/docs/modules/headless)
+  exit codes; no binary. A report names both answers to an unknown effect and
+  marks a failure in transit as retryable (`retry`), and `resumeHeadless` takes
+  `reconciledToolResults` and `retryFailed`. → [Headless](/docs/modules/headless)
+- **Examples** — seven new keyless examples (14–20): native memory, chat and
+  fail-over, the native UI bridge, goals and wakeups, realtime and batch on
+  scripted wires, an MCP server, and a native agent served over A2A.
+  → [Examples](/docs/reference/whats-new-2-3#examples)
 
 Fixed: `createNodeSandbox` no longer takes the host process down when a child
 stops reading its stdin, and `createFileWorkspace` accepts names such as
@@ -96,7 +97,10 @@ in native runs. MCP `listTools()` reads every page. A swarm executor whose
 start-up commit fails releases its lease and heartbeat. The Postgres stores
 retry serialization failures and deadlocks. `streamObject`'s `warnings` no
 longer hangs on a failed call, and `agentTool` child sessions no longer collide
-when a provider reuses a call id.
+when a provider reuses a call id. Every Gemini finish reason is mapped on
+purpose (a Gemini filter no longer ends a turn with `stop`), an OpenAI
+Responses turn that its content filter cut off ends with `content_filter`, and
+an OpenAI refusal is kept as `stopDetails` instead of being dropped.
 
 A native run that 2.3 saved with `mcp`, handoffs, `memory`, `chat` or
 `fallbackModels` (its resume binding records them; memory, a chat projection or
