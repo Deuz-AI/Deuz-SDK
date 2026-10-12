@@ -1,7 +1,7 @@
 <!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
      sources: skills/migrate-from-ai-sdk/SKILL.md, skills/migrate-from-ai-sdk/rules/{imports,streaming,tools,ui,telemetry,providers}.md,
      docs/content/docs/migration/from-vercel-ai-sdk.mdx, docs/content/docs/reference/whats-new-2-0.mdx,
-     packages/core/src/types/{config,guardrails}.ts, packages/core/src/{autonomy,rag,memory,middleware,durable,runtime}.ts,
+     packages/core/src/types/{config,guardrails}.ts, packages/core/src/{autonomy,rag,memory,middleware,durable,runtime,pricing}.ts,
      packages/core/src/inference/{handoff,agent-tool}.ts, packages/core/src/node/store-sqlite.ts -->
 
 # Porting from the AI SDK, LangChain, LangGraph or LlamaIndex
@@ -337,7 +337,7 @@ Sharp edges when porting LangGraph:
 - **Sub-agents do not inherit `guardrails`** (`agentTool` forwards `runtimeContext`, the approver and the signal — not the hooks). A `handoff` *does* keep them, because it changes the active agent, not the run.
 - **Only agentic calls checkpoint** (a single-turn call has no step boundaries), and **nothing finishes unless someone drains the stream**: on `streamChat`, checkpoints, persistence and `onFinish` run off the lazy pump — `after(() => result.consume?.())` on Next.js, `ctx.waitUntil(...)` on Workers.
 - **`stopWhen` does not change `finishReason`** — read `providerMetadata.deuz.stoppedBy` (also `'guardrail:input'` / `'guardrail:output'` / `'false-finish'` / `'budget.usd'`).
-- **`costExceeds` needs `deps.priceProvider`** (`createPriceProvider(PRICES_2026)`); without one it warns once and then never fires. After a handoff, cost is still priced against the root model — bound such a run with `budget.tokens` too.
+- **`costExceeds` needs `deps.priceProvider`** (`createPriceProvider()`, the bundled 2026 table); without one it warns once and then never fires. After a handoff, cost is still priced against the root model — bound such a run with `budget.tokens` too.
 
 ---
 
@@ -362,10 +362,10 @@ Observability vendors map to the same seam, not to a hosted service:
 | a hosted trace UI | `createMemoryObserver` / `createJsonlObserver` + `summarizeRun` + `renderRunReport` (one self-contained HTML file) |
 | OTLP export to a vendor | `createOtelTracer()` **or** `createOtelObserver()` — pick one, both together double-span the run |
 | callback handlers | `createCallbackObserver(fn)`, composed with `composeObservers` / `filterObserver` |
-| token-cost dashboards | `createPriceProvider(PRICES_2026)` + `priceUsage` + `cacheSavings` (`@deuz-sdk/core/pricing`) |
+| token-cost dashboards | `createPriceProvider()` (your own rates: `createPriceProvider({ table })`) + `priceUsage` + `cacheSavings` (`@deuz-sdk/core/pricing`) |
 
 ```ts
-import { createClient, createPriceProvider, PRICES_2026 } from '@deuz-sdk/core';
+import { createClient, createPriceProvider } from '@deuz-sdk/core';
 import { composeObservers, createMemoryObserver, summarizeRun } from '@deuz-sdk/core/observe';
 import { createOtelTracer, otelReady } from '@deuz-sdk/core/otel';
 
@@ -377,7 +377,9 @@ export const ai = createClient({
   deps: {
     observer: composeObservers(memory),
     tracer,
-    priceProvider: createPriceProvider(PRICES_2026), // costExceeds / budget.usd need this
+    // costExceeds / budget.usd need this. The bundled 2026 table is the default; your own
+    // rates go in the options object: createPriceProvider({ table: { ...rows } }).
+    priceProvider: createPriceProvider(),
     // The default logger is a NO-OP — without one, dropped settings are silent.
     logger: { debug() {}, info() {}, warn: console.warn, error: console.error },
   },
