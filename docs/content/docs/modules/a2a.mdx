@@ -418,7 +418,7 @@ How a run maps onto its task:
 | `completed` | The output artifact (`artifactId: 'output'`) with the run's validated output only: a text part for a string output, a data part (`application/json`) for a typed one. Then `COMPLETED`. |
 | `suspended` | `INPUT_REQUIRED`. The status message has a text part and a data part `{ type: 'pending-actions', actions }`. |
 | `stopped` | `INPUT_REQUIRED`, with a data part `{ type: 'stopped', reason, stopDetails?, unknownEffects? }`. A drained run goes on at the next message; at any other stop a person must look at the run (see [stopped and failed runs](#stopped-and-failed-runs)). A stop a cancellation caused (`'aborted'`, `'cancelled'`) cancels the task instead. |
-| `failed` | `FAILED`, with the run's error message, secret-redacted (or what `failureMessage` returns), and a data part `{ type: 'failed', error: { name, code? } }`. |
+| `failed` | `FAILED`, with a text that names the run's error by its code, or its name (`The agent run failed (rate_limit).`), or what `failureMessage` returns, and a data part `{ type: 'failed', error: { name, code? } }`. The error's message stays on the server. |
 
 ### Answering what the run waits for
 
@@ -448,7 +448,9 @@ A stopped run puts its task in `INPUT_REQUIRED`. What the client does next depen
 - **`'tool-reconciliation-required'`**: the outcome of the tool calls in `unknownEffects` is unknown, and the run stays resumable. A person checks each effect in the system it touched and settles it with `resumeAgent` and `reconciledToolResults` or `retryToolCallIds` on the task's run, whose run id is the task id and whose scope is [the task's](#identity-and-several-instances) (see [when the store fails](/docs/modules/native-agents#when-the-store-fails)). The client's next message then picks the run up from there: it resumes the run, or, when the person's resume left the run suspended on new approvals or client-tool calls, lists them as `pending-actions`. Until then, every message finds it stopped again.
 - **Every other stop** (`'max-steps'`, `'budget.usd'`, `'refusal'`, `'mcp-catalog-changed'`, …) is final for the run: a person (the agent's operator) must look at it. Messages are refused with `UNSUPPORTED_OPERATION`; cancel the task, or start a new one.
 
-A failed run fails the task. A resume that fails before it begins, having written nothing, refuses the message instead, and the task keeps waiting: `UNSUPPORTED_OPERATION` while another executor holds the run's [lease](#identity-and-several-instances), `INTERNAL_ERROR` otherwise (the run's definition changed, or its store could not be read).
+A failed run fails the task. A resume that fails before it begins, having written nothing, refuses the message instead, and the task keeps waiting: `UNSUPPORTED_OPERATION` while another executor holds the run's [lease](#identity-and-several-instances) (send the message again later), `INTERNAL_ERROR` otherwise (the run's definition changed, or its store could not be read).
+
+What the client reads never carries an error's message, which can name a provider account, a database host or a user: a failed task's text and a refusal's name the error by its code, or its name, and a task store that fails an update fails the task with `The agent could not update the task.` To word the first two yourself, from the whole error, pass `failureMessage`.
 
 ### The run's options
 
@@ -462,7 +464,7 @@ A failed run fails the task. A resume that fails before it begins, having writte
 | `lease` | Claim every run through a `LeaseProvider` (`{ provider, owner?, ttlMs? }`), as `runAgent`'s `lease` does. |
 | `scope` | The run's scope from the task's `{ tenant, owner }`. Default: the JSON of `['a2a', tenant, owner]`. |
 | `artifact` | The output artifact's `name` (default `'output'`) and `description`. |
-| `failureMessage` | What a client reads of a failed run or a refused resume. Default: the run's error message, secret-redacted. |
+| `failureMessage` | What a client reads of a failed run or a refused resume, from the run's whole error (`{ name, message, code? }`). Default: a text that names the error by its code, or its name. |
 
 ### Identity and several instances
 

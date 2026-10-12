@@ -130,9 +130,11 @@ export interface A2AAgentExecutorOptions<T = string> {
   /** The output artifact's `name` (default `'output'`) and `description`. */
   artifact?: { name?: string; description?: string };
   /**
-   * The text of a failed task's status message, and of a refused resume.
-   * Default: the run's error message, secret-redacted. Return only what the
-   * client may read.
+   * The text of a failed task's status message, and of a refused resume,
+   * from the run's whole error. Default: a fixed text that names the error
+   * by its `code`, or its `name`; the error's message, which can name a
+   * provider account, a database host or a user, stays on the server.
+   * Return only what the client may read.
    */
   failureMessage?: (error: { name: string; message: string; code?: string }) => string;
 }
@@ -225,6 +227,18 @@ type ClientToolResult = NonNullable<A2AAgentAnswers['clientToolResults']>[number
 
 function invalidParams(message: string): A2AError {
   return new A2AError({ reason: 'INVALID_PARAMS', message });
+}
+
+/**
+ * A task update that failed, most likely in the task store, whose message
+ * may name its hosts or users. The handler shows the client the message of
+ * what the executor throws, so this gets a fixed one, with the error as its
+ * cause. An A2A error stays as it is.
+ */
+function updateFailure(error: unknown): unknown {
+  return error instanceof A2AError
+    ? error
+    : new Error('The agent could not update the task.', { cause: error });
 }
 
 /** The executor's own run options that `run` sets, by name. */
@@ -639,8 +653,15 @@ export function createA2AAgentExecutor<T = string>(
   const name = options.artifact?.name ?? 'output';
   const description = options.artifact?.description;
   const about = { name, ...(description !== undefined ? { description } : {}) };
-  const errorText = (error: RunError, fallback: string) =>
-    options.failureMessage?.(error) ?? `${fallback}: ${redactString(error.message)}`;
+  // A run's error message can name a provider's account, a database host or
+  // a user: the client reads its code or name, unless failureMessage words it.
+  const failureText = (error: RunError) =>
+    options.failureMessage?.(error) ?? `The agent run failed (${error.code ?? error.name}).`;
+  const refusalText = (error: RunError, taskId: string) =>
+    options.failureMessage?.(error) ??
+    (error.code === 'lease_held'
+      ? `Another executor is driving the run of task ${taskId}; send the message again later.`
+      : `The run of task ${taskId} could not be resumed (${error.code ?? error.name}).`);
 
   async function runOptions(ctx: A2AExecutionContext): Promise<A2AAgentRunOptions<T>> {
     const value: unknown =
@@ -731,7 +752,7 @@ export function createA2AAgentExecutor<T = string>(
         if (resuming && !changed && !(await failureRecorded(ctx.taskId))) {
           throw new A2AError({
             reason: result.error.code === 'lease_held' ? 'UNSUPPORTED_OPERATION' : 'INTERNAL_ERROR',
-            message: errorText(result.error, `The run of task ${ctx.taskId} could not be resumed`),
+            message: refusalText(result.error, ctx.taskId),
           });
         }
         const data: A2AAgentFailed = {
@@ -742,7 +763,7 @@ export function createA2AAgentExecutor<T = string>(
           },
         };
         await ctx.fail([
-          { text: errorText(result.error, 'The agent run failed') },
+          { text: failureText(result.error) },
           { data, mediaType: 'application/json' },
         ]);
         return;
@@ -801,7 +822,7 @@ export function createA2AAgentExecutor<T = string>(
       if (!ctx.signal.aborted) {
         controller.abort(error);
         await stream.result;
-        throw error;
+        throw updateFailure(error);
       }
     } finally {
       ctx.signal.removeEventListener('abort', stop);
@@ -811,7 +832,7 @@ export function createA2AAgentExecutor<T = string>(
     try {
       await settle(ctx, result, typed, resuming, changed);
     } catch (error) {
-      if (!ctx.signal.aborted) throw error;
+      if (!ctx.signal.aborted) throw updateFailure(error);
     }
   }
 
@@ -868,7 +889,11 @@ export function createA2AAgentExecutor<T = string>(
         answers.results.length === 0 &&
         !listsActions(ctx.task, actions)
       ) {
-        await ctx.requireInput(pendingMessage(actions));
+        try {
+          await ctx.requireInput(pendingMessage(actions));
+        } catch (error) {
+          throw updateFailure(error);
+        }
         return;
       }
       checkAnswers(ctx.taskId, answers, pending);

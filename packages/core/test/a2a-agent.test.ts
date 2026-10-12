@@ -1050,17 +1050,97 @@ describe('createA2AAgentExecutor — stopped and failed runs', () => {
     });
     const task = (await client.sendMessage('hello')).task as A2ATask;
     expect(task.status.state).toBe('TASK_STATE_FAILED');
-    const text = a2aText(task.status.message);
-    expect(text).toMatch(/^The agent run failed: /);
-    expect(text).not.toContain(secret);
-    expect(JSON.stringify(task)).not.toContain(secret);
     const run = await store.load(task.id);
     expect(run?.result?.status).toBe('failed');
     const error = run?.result?.status === 'failed' ? run.result.error : undefined;
+    // The client reads the error's code (or name); its message stays on the server.
+    expect(a2aText(task.status.message)).toBe(
+      `The agent run failed (${error?.code ?? error?.name}).`,
+    );
+    expect(JSON.stringify(task)).not.toContain('Bad request');
+    expect(JSON.stringify(task)).not.toContain(secret);
     expect(dataOf(task, 'failed')).toEqual({
       type: 'failed',
       error: { name: error?.name, ...(error?.code !== undefined ? { code: error.code } : {}) },
     });
+  });
+
+  it('keeps a provider’s error message on the server', async () => {
+    const message =
+      'Rate limit reached for gpt-5.2 in organization org-AbCdEf123456 on tokens per min (TPM): Limit 30000, Used 29000.';
+    const model = createOpenAI({
+      apiKey: 'demo',
+      fetch: async () =>
+        new Response(
+          JSON.stringify({ error: { message, type: 'tokens', code: 'rate_limit_exceeded' } }),
+          { status: 429, headers: { 'Content-Type': 'application/json' } },
+        ),
+    })('gpt-5.2');
+    const { client } = serve({ model, maxRetries: 0 });
+    const task = (await client.sendMessage('hello')).task as A2ATask;
+    expect(task.status.state).toBe('TASK_STATE_FAILED');
+    expect(a2aText(task.status.message)).toBe('The agent run failed (rate_limit).');
+    expect(dataOf(task, 'failed')).toEqual({
+      type: 'failed',
+      error: { name: 'RateLimitError', code: 'rate_limit' },
+    });
+    expect(JSON.stringify(task)).not.toContain('org-AbCdEf123456');
+  });
+
+  /** What a database client might say when it cannot reach its server. */
+  const INTERNAL =
+    'connect ECONNREFUSED 10.20.30.40:5432 (password authentication failed for user "deuz_runs")';
+
+  it('keeps a run store’s error message on the server', async () => {
+    const inner = createInMemoryAgentRunStore();
+    const store: AgentRunStore = {
+      load: (runId) => inner.load(runId),
+      save: async (envelope) => {
+        // The database goes away when the run records its first tool receipt.
+        if (Object.keys(envelope.toolResults ?? {}).length > 0) throw new Error(INTERNAL);
+        await inner.save(envelope);
+      },
+    };
+    const { client } = serve(
+      {
+        model: createMockModel({
+          responses: [{ toolCalls: [{ toolName: 'noop', args: {} }] }, { text: 'ok' }],
+        }),
+        tools: { noop: { description: 'Do nothing.', parameters, execute: () => 'ok' } },
+      },
+      { store },
+    );
+    const task = (await client.sendMessage('hello')).task as A2ATask;
+    expect(task.status.state).toBe('TASK_STATE_FAILED');
+    expect(a2aText(task.status.message)).toBe('The agent run failed (ToolReceiptError).');
+    expect(JSON.stringify(task)).not.toContain('10.20.30.40');
+    expect(JSON.stringify(task)).not.toContain('deuz_runs');
+  });
+
+  it('keeps a task store’s error message on the server', async () => {
+    const tasks = createInMemoryA2ATaskStore();
+    let down = true;
+    const taskStore: A2ATaskStore = {
+      load: (taskId, scope) => tasks.load(taskId, scope),
+      save: (task, scope) => {
+        // One failed write: the leg's WORKING update.
+        if (down && task.status.state === 'TASK_STATE_WORKING') {
+          down = false;
+          throw new Error(INTERNAL);
+        }
+        return tasks.save(task, scope);
+      },
+    };
+    const { client } = serve(
+      { model: createMockModel({ responses: [{ text: 'ok' }] }) },
+      {},
+      { taskStore },
+    );
+    const task = (await client.sendMessage('hello')).task as A2ATask;
+    expect(task.status.state).toBe('TASK_STATE_FAILED');
+    expect(a2aText(task.status.message)).toBe('The agent could not update the task.');
+    expect(JSON.stringify(task)).not.toContain('10.20.30.40');
+    expect(JSON.stringify(task)).not.toContain('deuz_runs');
   });
 
   it('lets failureMessage word what the client sees', async () => {
@@ -1098,9 +1178,7 @@ describe('createA2AAgentExecutor — stopped and failed runs', () => {
     });
     await expect(client.sendMessage(answers, { taskId: asked.id })).rejects.toMatchObject({
       reason: 'UNSUPPORTED_OPERATION',
-      message: expect.stringMatching(
-        /could not be resumed: Another executor holds this native run/,
-      ),
+      message: `Another executor is driving the run of task ${asked.id}; send the message again later.`,
     });
     expect(await client.getTask(asked.id)).toEqual(asked);
     expect(await store.load(asked.id)).toEqual(run);
@@ -1131,10 +1209,44 @@ describe('createA2AAgentExecutor — stopped and failed runs', () => {
       ),
     ).rejects.toMatchObject({
       reason: 'INTERNAL_ERROR',
-      message: expect.stringMatching(/could not be resumed: Native agent binding changed/),
+      message: `The run of task ${asked.id} could not be resumed (TypeError).`,
     });
     expect(await client.getTask(asked.id)).toEqual(asked);
     expect(await store.load(asked.id)).toEqual(run);
+  });
+
+  it('lets failureMessage word a refused resume too, from the whole error', async () => {
+    const seen: unknown[] = [];
+    const original = publisher([BOTH_CALLS, { text: 'Done.' }]);
+    const { client } = serve(
+      (context) => (context.task ? { ...original, bindingId: 'publisher-v2' } : original),
+      {
+        failureMessage: (error) => {
+          seen.push(error);
+          return 'This agent was updated: start a new task.';
+        },
+      },
+    );
+    const asked = (await client.sendMessage('Publish "hi" and read my page.')).task as A2ATask;
+    await expect(
+      client.sendMessage(
+        [
+          {
+            data: {
+              approvalResponses: [{ approvalId: approvalIdOf(asked), approved: true }],
+              clientToolResults: [{ toolCallId: 'call_2', output: 'page' }],
+            },
+          },
+        ],
+        { taskId: asked.id },
+      ),
+    ).rejects.toMatchObject({
+      reason: 'INTERNAL_ERROR',
+      message: 'This agent was updated: start a new task.',
+    });
+    expect(seen).toEqual([
+      { name: 'TypeError', message: 'Native agent binding changed across resume.' },
+    ]);
   });
 });
 
