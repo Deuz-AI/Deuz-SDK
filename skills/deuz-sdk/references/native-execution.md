@@ -63,7 +63,7 @@ if (result.status === 'completed') console.log(result.output.answer);
 else console.log(result.status); // suspended, stopped or failed; no accepted output
 ```
 
-`output` accepts a Standard Schema or raw JSON Schema **with** a `validate(value)` function that returns the validated value or throws. Supplying a generic `T` or JSON Schema alone does not validate data. Draft `partialOutputStream` values are `unknown`; array elements need the independent `output.element` validator, and do not certify the entire array. Subscribe to needed streams before starting `result` if you require their complete history.
+`output` accepts a Standard Schema or raw JSON Schema **with** a `validate(value)` function that returns the validated value or throws. Supplying a generic `T` or JSON Schema alone does not validate data. Draft `partialOutputStream` values are `unknown`; for an array output, `elementStream` yields each completed top-level element (`{ attempt, index, value }`) only once the independent `output.element` validator accepts it (a rejected element is left out), and those elements do not certify the entire array. Subscribe to needed streams before starting `result` if you require their complete history.
 
 Native `AgentTool` also supports `contextSchema` / `validateContext`, `outputSchema` / `validateResult` and `toModelOutput`. Supply private context by tool name in `toolsContext`; a tool receives only its own validated `context`. Provider history gets `toModelOutput`'s projection, while `tool-output` events retain the raw result. Treat those events and durable receipts as sensitive application data. Legacy `Tool.outputSchema` alone is metadata; this validation behavior belongs to native tools.
 
