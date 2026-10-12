@@ -441,10 +441,15 @@ export async function runToolLoop(
           step: internal?.resumeFrom?.stepIndex ?? suspendedAt,
           approvalRequestCounts: durable?.approvalRequestCounts,
         },
+        // On a stable prefix (2.3, F22) a pending call resolves against the set
+        // its step offered, as it would have in the step.
+        { model: active?.model ?? options.model, tools: declaredWire.tools },
       );
       if (settled) {
         messages = settled.messages;
-        const toolMessage = settled.messages.at(-1)!;
+        // Not `messages.at(-1)`: a break that committed a handoff may have left
+        // the target's instructions after it (2.3, F22).
+        const toolMessage = settled.toolMessage;
         appended.push(toolMessage);
         chatMessages = [...chatMessages, toolMessage];
         logGuardrailParts(guardrailLog, settled.guardrails);
@@ -504,13 +509,15 @@ export async function runToolLoop(
     // Memory recall (1.7, D1): computed once per leg. On a model that binds
     // thinking to the prefix (2.3, F22) it is one appended system message (see
     // `planRecall`); elsewhere it is spliced in at the model-call site only and
-    // canonical history/checkpoints/persistence stay recall-free.
+    // canonical history/checkpoints/persistence stay recall-free. The run's
+    // first model decides which, on every leg: a leg that resumes as a handoff
+    // target reads its recall where the first leg put it.
     // Its observation parents under the RUN span (no step is open yet).
     const recall = await planRecall(
       options,
       deps,
       messages,
-      active?.model ?? options.model,
+      options.model,
       observeCtx,
       internal?.resumeFrom !== undefined,
     );

@@ -370,7 +370,9 @@ The default policy text is `PROMPT_INJECTION_POLICY` (also exported from `@deuz-
 
 It adds a separate leading system turn rather than merging into an existing one, so your own system prompt stays byte-identical, which is what keeps prompt caching on the rest of the history intact.
 
-It always returns a `rewrite`, so it always emits one `guardrail` part per run. And it is what it says on the tin — a prompt, not a filter. It raises the cost of an injection; it does not make one impossible.
+It adds that turn once per run (2.3). A history whose leading system messages already carry the policy text passes unchanged: every leg of a durable run after the first (a native run's too) finds the policy in its checkpoint, and a history that already went through the guard is not given a second copy. So the run's first leg emits the one `guardrail` part (a `rewrite`) and a resumed leg emits none. Before 2.3 every resumed leg prepended another copy, which on Claude 5.x changed the top-level system that every earlier thinking block is bound to ([Preserved thinking](/docs/agents/preserved-thinking)).
+
+And it is what it says on the tin — a prompt, not a filter. It raises the cost of an injection; it does not make one impossible.
 
 ### `maxOutputLength(n, opts?)`
 
@@ -437,7 +439,7 @@ Both can defend a call, and they wrap different things. Neither replaces the oth
 | Reported as | `guardrail` parts + `deuz.guardrails` | nothing (it is transparent) |
 | Attached at | the call site (`guardrails: {…}`) | the model descriptor (so it travels with the model) |
 
-Concretely: `promptInjectionGuard()` (middleware) re-applies its system turn on **every** step *and* on side calls such as compaction summaries, because it wraps the model. `promptInjectionGuardrail()` applies it **once**, at the start of the run, and reports itself as a `guardrail` part.
+Concretely: `promptInjectionGuard()` (middleware) re-applies its system turn on **every** step *and* on side calls such as compaction summaries, because it wraps the model. `promptInjectionGuardrail()` applies it **once per run**: the first leg prepends it and reports itself as a `guardrail` part, and a leg resumed from the checkpoint finds it there and passes.
 
 Which to pick:
 

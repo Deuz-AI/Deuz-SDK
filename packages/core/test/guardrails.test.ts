@@ -803,6 +803,29 @@ describe('built-in guardrails', () => {
     expect(body).not.toContain('untrusted DATA');
   });
 
+  it('promptInjectionGuardrail adds its turn once: a leading system run that carries it passes (2.3)', () => {
+    const guard = promptInjectionGuardrail();
+    const policy: Message = { role: 'system', content: PROMPT_INJECTION_POLICY };
+    const own: Message = { role: 'system', content: 'You brew.' };
+    const user: Message = { role: 'user', content: 'hi' };
+    // Anywhere in the leading run: the history already went through the guard
+    // (a leg resumed from its checkpoint).
+    expect(guard({ messages: [policy, own, user] })).toEqual({ action: 'pass' });
+    expect(guard({ messages: [own, policy, user] })).toEqual({ action: 'pass' });
+    // Only the leading run counts, as for the middleware.
+    expect(guard({ messages: [own, user, policy] })).toEqual({
+      action: 'rewrite',
+      messages: [policy, own, user, policy],
+    });
+    // A custom policy looks for its own text.
+    expect(
+      promptInjectionGuardrail({ policy: 'MY OWN RULES' })({ messages: [policy, user] }),
+    ).toEqual({
+      action: 'rewrite',
+      messages: [{ role: 'system', content: 'MY OWN RULES' }, policy, user],
+    });
+  });
+
   it('maxOutputLength truncates by default and passes below the cap', async () => {
     const long = await generateText({
       model: createMockModel({ responses: [{ text: 'abcdefghij' }] }),

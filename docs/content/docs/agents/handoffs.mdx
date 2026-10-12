@@ -216,7 +216,7 @@ Concretely, when the step breaks:
 
 The one asymmetry: the *executed* tools of that batch are **not** answered on a sub-agent suspension. Their `tool_use` ids stay open and the resume leg's settle re-runs them (which is what resumes the child's checkpoint). The transfer is not one of them — it never executes, so deferring it would leave a `tool_use` no producer could ever answer.
 
-On the resume leg the order is: restore the checkpointed agent → settle pending approvals → *then* the first model call. A transfer that was left unanswered by the previous leg is applied during that settle, and from that point the leg is the target agent.
+On the resume leg the order is: restore the checkpointed agent → settle pending approvals → *then* the first model call. A transfer that was left unanswered by the previous leg is applied during that settle, and from that point the leg is the target agent. On a Claude 5.x target the settle's answers go in right after the transfer's tool result, ahead of the appended instructions: the model never saw those instructions, so the turn it wrote is answered first and nothing it already read moves.
 
 ## The `maxHandoffs` loop guard
 

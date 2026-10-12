@@ -42,6 +42,7 @@ import type { MemoryMutation, MemoryScorer } from '../memory';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
   applyCompaction,
+  isSummaryMessage,
   normalizeCompaction,
   type ApplyCompactionCtx,
   type NormalizedCompaction,
@@ -2563,6 +2564,19 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
  * verdict counts only under the `approvalId` its call was issued with (see
  * {@link approvalIdOf}). A plain leg of a durable run passes the step its stored
  * checkpoint is suspended at ({@link continueStoredRun}).
+ *
+ * The answers go right after the turn's other answers (2.3, F22): a break that
+ * committed a transfer to a Claude 5.x target appended the target's
+ * instructions after the transfer's tool result, and those system messages
+ * were never sent to the model, so the settle's tool message lands before them
+ * and no prefix a thinking block is bound to moves.
+ *
+ * `declared` (2.3, F22) is the model the leg runs on and the tools array the
+ * leg declares. On a model that binds thinking to the prefix a step's calls
+ * resolve against the set the step offered, and so do they when they settle:
+ * the declared tools with every tool-set change before the turn applied. A
+ * pending call to a tool the step withdrew, a transfer included, is answered
+ * like an unknown tool and never runs, as it would have been in the step.
  */
 export async function settlePendingApprovals(
   messages: Message[],
@@ -2570,13 +2584,19 @@ export async function settlePendingApprovals(
   options: CommonCallOptions,
   extras?: ExecuteExtras,
   lifecycle?: {
-    /** Called after denials are known but before approved/server calls execute. */
-    beforeExecute?: (calls: ToolCall[], deniedIds: ReadonlySet<string>) => void;
+    /**
+     * Called after denials are known but before approved/server calls execute,
+     * with the set the calls resolve against (a name outside it never executes).
+     */
+    beforeExecute?: (calls: ToolCall[], deniedIds: ReadonlySet<string>, tools: ToolSet) => void;
   },
   handoff?: { active?: ActiveAgentState; tools: ToolSet },
   approval?: ApprovalScope,
+  declared?: { model: LanguageModel; tools: WireTool[] },
 ): Promise<{
   messages: Message[];
+  /** The appended `{role:'tool'}` turn (not necessarily the last message of `messages`). */
+  toolMessage: Message;
   results: ToolResult[];
   deniedIds: Set<string>;
   denied: DenialMap;
@@ -2590,9 +2610,13 @@ export async function settlePendingApprovals(
   const responses = options.approvalResponses;
   if (!responses) return null;
 
-  // Locate the last assistant turn; only tool messages may follow it.
+  // Locate the last assistant turn; only tool messages may follow it, then the
+  // system messages a break appended for the next leg (see above). The settle's
+  // answers go in at `insertAt`, after the last tool message.
+  let insertAt = messages.length;
+  while (insertAt > 0 && messages[insertAt - 1]!.role === 'system') insertAt--;
   let assistantIndex = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
+  for (let i = insertAt - 1; i >= 0; i--) {
     const role = messages[i]!.role;
     if (role === 'assistant') {
       assistantIndex = i;
@@ -2605,7 +2629,7 @@ export async function settlePendingApprovals(
   if (!Array.isArray(content)) return null;
 
   const answered = new Set<string>();
-  for (let i = assistantIndex + 1; i < messages.length; i++) {
+  for (let i = assistantIndex + 1; i < insertAt; i++) {
     const parts = messages[i]!.content;
     if (!Array.isArray(parts)) continue;
     for (const p of parts) if (p.type === 'tool_result') answered.add(p.toolUseId);
@@ -2620,14 +2644,23 @@ export async function settlePendingApprovals(
     toolName: p.name,
     args: p.input,
   }));
+  // The set the turn was offered on a stable prefix (see `declared` above); the
+  // transfer catalog the plan merges in is narrowed with it.
+  let offered = tools;
+  let catalog = handoff;
+  if (declared && bindsThinkingToPrefix(declared.model)) {
+    const names = new Set(toolsInEffect(declared.tools, messages.slice(0, assistantIndex)).keys());
+    offered = offeredTools(tools, names);
+    if (handoff) catalog = { ...handoff, tools: offeredTools(handoff.tools, names) };
+  }
   // The same plan a live step makes (transfers by decision, the re-derived
   // `onToolCall` guardrails, then the gate), here with the leg's verdicts.
   const plan = await planToolDispatch({
     calls: issued,
-    tools,
+    tools: offered,
     options,
     messages,
-    ...(handoff ? { handoff } : {}),
+    ...(catalog ? { handoff: catalog } : {}),
     verdicts: responses,
     approval: approval ?? {},
     ...(extras?.deps ? { clock: extras.deps.clock } : {}),
@@ -2635,10 +2668,10 @@ export async function settlePendingApprovals(
   });
 
   const deniedIds = new Set(plan.denied.keys());
-  lifecycle?.beforeExecute?.(plan.execCalls, deniedIds);
+  lifecycle?.beforeExecute?.(plan.execCalls, deniedIds, offered);
   const executed = await executeTools(
     plan.execCalls,
-    tools,
+    offered,
     options,
     messages,
     plan.denied,
@@ -2651,7 +2684,8 @@ export async function settlePendingApprovals(
     : executed;
   const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
   return {
-    messages: [...messages, toolMessage],
+    messages: [...messages.slice(0, insertAt), toolMessage, ...messages.slice(insertAt)],
+    toolMessage,
     results,
     deniedIds,
     denied: plan.denied,
@@ -3619,6 +3653,10 @@ function contentText(content: Message['content']): string {
  * (`withSystemBlock`) — never into the canonical history, so checkpoints and
  * chat persistence stay recall-free and resume legs cannot double-inject.
  * Best-effort: a failing store/embedder logs and the call proceeds bare.
+ *
+ * A compaction summary is not a user message here (2.3): it carries the user
+ * role but is the conversation, not a question, so the query is the last user
+ * message before it, or there is none.
  */
 export async function computeRecallBlock(
   options: CommonCallOptions,
@@ -3628,7 +3666,7 @@ export async function computeRecallBlock(
 ): Promise<string | undefined> {
   const memory = options.memory;
   if (!memory || memory.recall === false) return undefined;
-  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user' && !isSummaryMessage(m));
   const text = lastUser ? contentText(lastUser.content) : '';
   // Nothing to query with: no retrieval happened, so no operation is reported
   // either — an operation.started with no matching terminal would be a lie.
@@ -3734,23 +3772,36 @@ function recalledAlready(messages: Message[]): boolean {
  * user turn: a history whose last user message is already followed by its
  * recall message (an approval continuation, a replayed transcript) recalls
  * nothing, and neither does a `resumed` leg whose checkpoint holds one — even
- * when a loop-injected user turn (a false-finish nudge) came after it.
+ * when a loop-injected user turn (a false-finish nudge) came after it — or
+ * holds a compaction summary: a resumed leg continues the turn its first leg
+ * recalled for, and a summary taken inside the tool loop folded that turn's
+ * recall message in with the rest of the turn.
  *
  * Every other model keeps the 2.2 placement: the block is spliced into the
  * leading system turn at the model-call site only, and the transcript stays
  * recall-free.
+ *
+ * `model` is the one the run starts with, on every leg (2.3): a leg that
+ * resumes as a handoff target keeps the first leg's placement, so the target
+ * reads its recall where it did before the break — the splice in its system,
+ * or the one message already in the history — and no leg holds both.
  */
 export async function planRecall(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
   messages: Message[],
+  /** The run's first model (`options.model`), not the active agent's. */
   model: LanguageModel,
   ob?: ExecuteExtras['observe'],
   /** The leg resumes a durable run from its checkpoint. */
   resumed = false,
 ): Promise<RecallPlan> {
   const stable = bindsThinkingToPrefix(model);
-  if (stable && (recalledAlready(messages) || (resumed && messages.some(isRecallMessage)))) {
+  if (
+    stable &&
+    (recalledAlready(messages) ||
+      (resumed && messages.some((m) => isRecallMessage(m) || isSummaryMessage(m))))
+  ) {
     return {};
   }
   const block = await computeRecallBlock(options, deps, messages, ob);

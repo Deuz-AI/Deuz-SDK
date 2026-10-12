@@ -777,10 +777,11 @@ export function runStreamToolLoop(
           options,
           extras,
           {
-            beforeExecute: (calls, deniedIds) => {
+            beforeExecute: (calls, deniedIds, offered) => {
               for (const call of calls) {
                 // Unknown names never execute either (1.9) — no 'executing' state.
-                if (!deniedIds.has(call.toolCallId) && !isUnknownTool(tools, call.toolName)) {
+                // Nor does a tool the step withdrew (2.3, F22).
+                if (!deniedIds.has(call.toolCallId) && !isUnknownTool(offered, call.toolName)) {
                   toolState(call.toolCallId, call.toolName, 'executing');
                 }
               }
@@ -793,11 +794,15 @@ export function runStreamToolLoop(
             step: resumeFrom?.stepIndex ?? suspendedAt,
             approvalRequestCounts: durable?.approvalRequestCounts,
           },
+          // On a stable prefix (2.3, F22) a pending call resolves against the set
+          // its step offered, as it would have in the step.
+          { model: active?.model ?? options.model, tools: declaredWire.tools },
         );
         if (settled) {
-          const settledMessages = settled.messages.slice(messages.length);
-          appended.push(...settledMessages);
-          chatMessages = [...chatMessages, ...settledMessages];
+          // Not the tail of `settled.messages`: a break that committed a handoff
+          // may have left the target's instructions after it (2.3, F22).
+          appended.push(settled.toolMessage);
+          chatMessages = [...chatMessages, settled.toolMessage];
           messages = settled.messages;
           emitGuardrails(settled.guardrails);
           for (const r of settled.results) {
@@ -881,13 +886,15 @@ export function runStreamToolLoop(
       // (see `planRecall`); elsewhere it is spliced into the system context AT
       // THE CALL SITE only — the canonical history (and so checkpoints + chat
       // persistence) never bakes the block in, and resume legs cannot
-      // double-inject it.
+      // double-inject it. The run's first model decides which, on every leg: a
+      // leg that resumes as a handoff target reads its recall where the first
+      // leg put it.
       // Its observation parents under the RUN span (no step is open yet).
       const recall = await planRecall(
         options,
         deps,
         messages,
-        active?.model ?? options.model,
+        options.model,
         observeCtx,
         resumeFrom !== undefined,
       );
