@@ -39,6 +39,7 @@ import { createApprovalSigner } from '../src/durable';
 import { createOpenAI } from '../src/openai';
 import { agentRunLeaseKey, createInMemoryLeaseProvider, type LeaseProvider } from '../src/ops';
 import { createMockModel, type MockResponse } from '../src/testing';
+import type { OutputGuardrail } from '../src/types/guardrails';
 
 const RPC_URL = 'https://agent.test/a2a/jsonrpc';
 const REST_URL = 'https://agent.test/a2a/rest';
@@ -374,6 +375,9 @@ describe('createA2AAgentExecutor — a new task', () => {
     expect(() =>
       createA2AAgentExecutor({ agent: engine, store, run, lease: { provider: {} as never } }),
     ).toThrow(/lease\.provider/);
+    expect(() =>
+      createA2AAgentExecutor({ agent: engine, store, run, drafts: 'no' as never }),
+    ).toThrow(/drafts is a boolean/);
   });
 });
 
@@ -524,6 +528,92 @@ describe('createA2AAgentExecutor — a suspended run', () => {
     expect(published).toEqual([{}]);
   });
 
+  describe('signed approvals (approvalSigner)', () => {
+    /** A task waiting for two signed approvals, and verdicts on both with the given tokens. */
+    async function twoSigned() {
+      const published: unknown[] = [];
+      const served = serve({
+        ...publisher(
+          [
+            {
+              toolCalls: [
+                { toolName: 'publish', args: { text: 'one' } },
+                { toolName: 'publish', args: { text: 'two' } },
+              ],
+            },
+            { text: 'Done.' },
+          ],
+          published,
+        ),
+        approvalSigner: createApprovalSigner({ secret: 'a2a-test-secret' }),
+      });
+      const asked = (await served.client.sendMessage('Publish two posts.')).task as A2ATask;
+      const actions = actionsOf(asked) as Extract<A2AAgentAction, { kind: 'approval' }>[];
+      const verdicts = (tokens: (string | undefined)[], approved = true): A2APart[] => [
+        {
+          data: {
+            approvalResponses: actions.map((action, index) => ({
+              approvalId: action.approvalId,
+              approved,
+              ...(tokens[index] !== undefined ? { token: tokens[index] } : {}),
+            })),
+          },
+        },
+      ];
+      return {
+        ...served,
+        asked,
+        published,
+        tokens: actions.map((action) => action.token),
+        verdicts,
+      };
+    }
+
+    it('refuses an approval without its own token, before anything is written', async () => {
+      const { client, store, asked, published, tokens, verdicts } = await twoSigned();
+      const [first, second] = tokens;
+      expect(first).toMatch(/^v1\./);
+      expect(second).toMatch(/^v1\./);
+      const before = await client.getTask(asked.id);
+      const run = await store.load(asked.id);
+
+      const refusals: [string, A2APart[]][] = [
+        ['no tokens', verdicts([undefined, undefined])],
+        ['one token left out', verdicts([first, undefined])],
+        ['swapped tokens', verdicts([second, first])],
+      ];
+      for (const [label, parts] of refusals) {
+        const message = await client.sendMessage(parts, { taskId: asked.id }).then(
+          () => 'taken',
+          (error: A2AError) => `${error.reason}: ${error.message}`,
+        );
+        expect(message, label).toMatch(
+          /^INVALID_PARAMS: The approval of publish \(call_\d\) must echo its action's token\.$/,
+        );
+      }
+      expect(await client.getTask(asked.id)).toEqual(before);
+      expect(await store.load(asked.id)).toEqual(run);
+      expect(published).toEqual([]);
+
+      // The same approvals with their own tokens go through.
+      const done = (await client.sendMessage(verdicts(tokens), { taskId: asked.id }))
+        .task as A2ATask;
+      expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+      expect(published).toEqual([{ text: 'one' }, { text: 'two' }]);
+    });
+
+    it('takes a denial without a token', async () => {
+      const { client, asked, published, verdicts } = await twoSigned();
+      const done = (
+        await client.sendMessage(verdicts([undefined, undefined], false), {
+          taskId: asked.id,
+        })
+      ).task as A2ATask;
+      expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+      expect(published).toEqual([]);
+    });
+  });
+
   it('refuses answers that do not fit, leaving the task and the run as they were', async () => {
     const { client, store } = serve(publisher([BOTH_CALLS, { text: 'Done.' }]));
     const asked = (await client.sendMessage('Publish "hi" and read my page.')).task as A2ATask;
@@ -666,6 +756,71 @@ describe('createA2AAgentExecutor — a suspended run', () => {
     ).task as A2ATask;
     expect(done.status.state).toBe('TASK_STATE_COMPLETED');
   });
+
+  it('takes the answers again after a resume leg died past its first write', async () => {
+    const published: unknown[] = [];
+    // One database behind both stores; it goes away right after the resume's first write.
+    const runs = createInMemoryAgentRunStore();
+    let runWritesLeft = Infinity;
+    const store: AgentRunStore = {
+      load: (runId) => runs.load(runId),
+      save: async (envelope) => {
+        if (runWritesLeft <= 0) throw new Error('database unavailable');
+        runWritesLeft--;
+        await runs.save(envelope);
+      },
+    };
+    const tasks = createInMemoryA2ATaskStore();
+    let tasksDown = false;
+    const taskStore: A2ATaskStore = {
+      load: (taskId, scope) => tasks.load(taskId, scope),
+      save: (task, scope) => {
+        const state = task.status.state;
+        if (tasksDown && (state === 'TASK_STATE_WORKING' || state === 'TASK_STATE_FAILED')) {
+          throw new Error('database unavailable');
+        }
+        return tasks.save(task, scope);
+      },
+    };
+    const { client } = serve(
+      publisher(
+        [{ toolCalls: [{ toolName: 'publish', args: { text: 'hi' } }] }, { text: 'Done.' }],
+        published,
+      ),
+      { store },
+      { taskStore },
+    );
+    const asked = (await client.sendMessage('Publish "hi".')).task as A2ATask;
+    const answer: A2APart[] = [
+      { data: { approvalResponses: [{ approvalId: approvalIdOf(asked), approved: true }] } },
+    ];
+
+    runWritesLeft = 1;
+    tasksDown = true;
+    await expect(client.sendMessage(answer, { taskId: asked.id })).rejects.toMatchObject({
+      reason: 'INTERNAL_ERROR',
+    });
+    runWritesLeft = Infinity;
+    tasksDown = false;
+
+    // The task still lists the approval. The resume's first write dropped the
+    // stored result, but the run's checkpoint still waits for the approval.
+    const now = await client.getTask(asked.id);
+    expect(now.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    expect(actionsOf(now)).toEqual([
+      expect.objectContaining({ kind: 'approval', approvalId: approvalIdOf(asked) }),
+    ]);
+    const stored = await runs.load(asked.id);
+    expect(stored?.phase).toBe('running');
+    expect(stored?.result).toBeUndefined();
+    expect(stored?.checkpoints[asked.id]?.status).toBe('suspended');
+    expect(published).toEqual([]);
+
+    // The client sends the approval again, and the run goes on.
+    const done = (await client.sendMessage(answer, { taskId: asked.id })).task as A2ATask;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(published).toEqual([{ text: 'hi' }]);
+  });
 });
 
 describe('createA2AAgentExecutor — stopped and failed runs', () => {
@@ -806,6 +961,91 @@ describe('createA2AAgentExecutor — stopped and failed runs', () => {
     expect(errors).toEqual([]);
   });
 
+  it('lists what the run waits for once a person’s resume left it suspended again', async () => {
+    const published: unknown[] = [];
+    const options = {
+      ...publisher(
+        [
+          { toolCalls: [{ toolName: 'publish', args: { text: 'one' } }] },
+          { toolCalls: [{ toolName: 'publish', args: { text: 'two' } }] },
+          { text: 'Both published.' },
+        ],
+        published,
+      ),
+      approvalSigner: createApprovalSigner({ secret: 'a2a-test-secret' }),
+    };
+    const { client, store, errors } = serve(options);
+    const asked = (await client.sendMessage('Publish two posts.')).task as A2ATask;
+    const [first] = actionsOf(asked) as Extract<A2AAgentAction, { kind: 'approval' }>[];
+    const session = { store, runId: asked.id, scope: ANONYMOUS };
+
+    // A process dies between the effect and its receipt.
+    const dying: AgentRunStore = {
+      load: (runId) => store.load(runId),
+      save: async (envelope) => {
+        const receipt = Object.values(envelope.toolResults ?? {})[0];
+        if (receipt?.stage === 'completed' || receipt?.stage === 'executed') {
+          throw new Error('the process died');
+        }
+        await store.save(envelope);
+      },
+    };
+    const crashed = await resumeAgent({
+      ...options,
+      session: { ...session, store: dying },
+      approvalResponses: [{ approvalId: first!.approvalId, approved: true, token: first!.token }],
+    });
+    expect(crashed.status).toBe('failed');
+    const stopped = (await client.sendMessage('Is it done?', { taskId: asked.id })).task as A2ATask;
+    expect(dataOf(stopped, 'stopped')).toMatchObject({ reason: 'tool-reconciliation-required' });
+
+    // A person settles the effect; the run goes on and waits for a new approval.
+    const settled = await resumeAgent({
+      ...options,
+      session,
+      reconciledToolResults: [{ toolCallId: 'call_1', output: 'published' }],
+    });
+    expect(settled.status).toBe('suspended');
+    const run = await store.load(asked.id);
+
+    // The client's next message learns what the run waits for now; no leg runs.
+    const now = (await client.sendMessage('And now?', { taskId: asked.id })).task as A2ATask;
+    expect(now.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    const [second] = actionsOf(now) as Extract<A2AAgentAction, { kind: 'approval' }>[];
+    expect(actionsOf(now)).toEqual([
+      expect.objectContaining({ kind: 'approval', toolCallId: 'call_2', token: second?.token }),
+    ]);
+    expect(second?.token).toMatch(/^v1\./);
+    expect(a2aText(now.history?.at(-2))).toBe('And now?');
+    expect(await store.load(asked.id)).toEqual(run);
+
+    // Now that the task lists it, a message that does not answer it is refused...
+    await expect(client.sendMessage('Well?', { taskId: asked.id })).rejects.toMatchObject({
+      reason: 'INVALID_PARAMS',
+      message: expect.stringMatching(/waits for approval of publish \(call_2\)/),
+    });
+    expect(await client.getTask(asked.id)).toEqual(now);
+    // ...and its answer completes the run.
+    const done = (
+      await client.sendMessage(
+        [
+          {
+            data: {
+              approvalResponses: [
+                { approvalId: second!.approvalId, approved: true, token: second!.token },
+              ],
+            },
+          },
+        ],
+        { taskId: asked.id },
+      )
+    ).task as A2ATask;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(a2aText(done.artifacts?.[0])).toBe('Both published.');
+    expect(published).toEqual([{ text: 'one' }, { text: 'two' }]);
+    expect(errors).toEqual([]);
+  });
+
   it('fails the task with a safe message when the run fails', async () => {
     const secret = 'sk-ant-api03-SECRETSECRETSECRET';
     const { client, store } = serve({
@@ -814,17 +1054,97 @@ describe('createA2AAgentExecutor — stopped and failed runs', () => {
     });
     const task = (await client.sendMessage('hello')).task as A2ATask;
     expect(task.status.state).toBe('TASK_STATE_FAILED');
-    const text = a2aText(task.status.message);
-    expect(text).toMatch(/^The agent run failed: /);
-    expect(text).not.toContain(secret);
-    expect(JSON.stringify(task)).not.toContain(secret);
     const run = await store.load(task.id);
     expect(run?.result?.status).toBe('failed');
     const error = run?.result?.status === 'failed' ? run.result.error : undefined;
+    // The client reads the error's code (or name); its message stays on the server.
+    expect(a2aText(task.status.message)).toBe(
+      `The agent run failed (${error?.code ?? error?.name}).`,
+    );
+    expect(JSON.stringify(task)).not.toContain('Bad request');
+    expect(JSON.stringify(task)).not.toContain(secret);
     expect(dataOf(task, 'failed')).toEqual({
       type: 'failed',
       error: { name: error?.name, ...(error?.code !== undefined ? { code: error.code } : {}) },
     });
+  });
+
+  it('keeps a provider’s error message on the server', async () => {
+    const message =
+      'Rate limit reached for gpt-5.2 in organization org-AbCdEf123456 on tokens per min (TPM): Limit 30000, Used 29000.';
+    const model = createOpenAI({
+      apiKey: 'demo',
+      fetch: async () =>
+        new Response(
+          JSON.stringify({ error: { message, type: 'tokens', code: 'rate_limit_exceeded' } }),
+          { status: 429, headers: { 'Content-Type': 'application/json' } },
+        ),
+    })('gpt-5.2');
+    const { client } = serve({ model, maxRetries: 0 });
+    const task = (await client.sendMessage('hello')).task as A2ATask;
+    expect(task.status.state).toBe('TASK_STATE_FAILED');
+    expect(a2aText(task.status.message)).toBe('The agent run failed (rate_limit).');
+    expect(dataOf(task, 'failed')).toEqual({
+      type: 'failed',
+      error: { name: 'RateLimitError', code: 'rate_limit' },
+    });
+    expect(JSON.stringify(task)).not.toContain('org-AbCdEf123456');
+  });
+
+  /** What a database client might say when it cannot reach its server. */
+  const INTERNAL =
+    'connect ECONNREFUSED 10.20.30.40:5432 (password authentication failed for user "deuz_runs")';
+
+  it('keeps a run store’s error message on the server', async () => {
+    const inner = createInMemoryAgentRunStore();
+    const store: AgentRunStore = {
+      load: (runId) => inner.load(runId),
+      save: async (envelope) => {
+        // The database goes away when the run records its first tool receipt.
+        if (Object.keys(envelope.toolResults ?? {}).length > 0) throw new Error(INTERNAL);
+        await inner.save(envelope);
+      },
+    };
+    const { client } = serve(
+      {
+        model: createMockModel({
+          responses: [{ toolCalls: [{ toolName: 'noop', args: {} }] }, { text: 'ok' }],
+        }),
+        tools: { noop: { description: 'Do nothing.', parameters, execute: () => 'ok' } },
+      },
+      { store },
+    );
+    const task = (await client.sendMessage('hello')).task as A2ATask;
+    expect(task.status.state).toBe('TASK_STATE_FAILED');
+    expect(a2aText(task.status.message)).toBe('The agent run failed (ToolReceiptError).');
+    expect(JSON.stringify(task)).not.toContain('10.20.30.40');
+    expect(JSON.stringify(task)).not.toContain('deuz_runs');
+  });
+
+  it('keeps a task store’s error message on the server', async () => {
+    const tasks = createInMemoryA2ATaskStore();
+    let down = true;
+    const taskStore: A2ATaskStore = {
+      load: (taskId, scope) => tasks.load(taskId, scope),
+      save: (task, scope) => {
+        // One failed write: the leg's WORKING update.
+        if (down && task.status.state === 'TASK_STATE_WORKING') {
+          down = false;
+          throw new Error(INTERNAL);
+        }
+        return tasks.save(task, scope);
+      },
+    };
+    const { client } = serve(
+      { model: createMockModel({ responses: [{ text: 'ok' }] }) },
+      {},
+      { taskStore },
+    );
+    const task = (await client.sendMessage('hello')).task as A2ATask;
+    expect(task.status.state).toBe('TASK_STATE_FAILED');
+    expect(a2aText(task.status.message)).toBe('The agent could not update the task.');
+    expect(JSON.stringify(task)).not.toContain('10.20.30.40');
+    expect(JSON.stringify(task)).not.toContain('deuz_runs');
   });
 
   it('lets failureMessage word what the client sees', async () => {
@@ -862,9 +1182,7 @@ describe('createA2AAgentExecutor — stopped and failed runs', () => {
     });
     await expect(client.sendMessage(answers, { taskId: asked.id })).rejects.toMatchObject({
       reason: 'UNSUPPORTED_OPERATION',
-      message: expect.stringMatching(
-        /could not be resumed: Another executor holds this native run/,
-      ),
+      message: `Another executor is driving the run of task ${asked.id}; send the message again later.`,
     });
     expect(await client.getTask(asked.id)).toEqual(asked);
     expect(await store.load(asked.id)).toEqual(run);
@@ -895,10 +1213,162 @@ describe('createA2AAgentExecutor — stopped and failed runs', () => {
       ),
     ).rejects.toMatchObject({
       reason: 'INTERNAL_ERROR',
-      message: expect.stringMatching(/could not be resumed: Native agent binding changed/),
+      message: `The run of task ${asked.id} could not be resumed (TypeError).`,
     });
     expect(await client.getTask(asked.id)).toEqual(asked);
     expect(await store.load(asked.id)).toEqual(run);
+  });
+
+  it('lets failureMessage word a refused resume too, from the whole error', async () => {
+    const seen: unknown[] = [];
+    const original = publisher([BOTH_CALLS, { text: 'Done.' }]);
+    const { client } = serve(
+      (context) => (context.task ? { ...original, bindingId: 'publisher-v2' } : original),
+      {
+        failureMessage: (error) => {
+          seen.push(error);
+          return 'This agent was updated: start a new task.';
+        },
+      },
+    );
+    const asked = (await client.sendMessage('Publish "hi" and read my page.')).task as A2ATask;
+    await expect(
+      client.sendMessage(
+        [
+          {
+            data: {
+              approvalResponses: [{ approvalId: approvalIdOf(asked), approved: true }],
+              clientToolResults: [{ toolCallId: 'call_2', output: 'page' }],
+            },
+          },
+        ],
+        { taskId: asked.id },
+      ),
+    ).rejects.toMatchObject({
+      reason: 'INTERNAL_ERROR',
+      message: 'This agent was updated: start a new task.',
+    });
+    expect(seen).toEqual([
+      { name: 'TypeError', message: 'Native agent binding changed across resume.' },
+    ]);
+  });
+});
+
+describe('createA2AAgentExecutor — a drained run', () => {
+  it('tells the client a drained run goes on, and the next message resumes it', async () => {
+    const inner = createInMemoryLeaseProvider();
+    const delivered = gate();
+    // Opens once a renewal hands the drain to the executor.
+    const leases: LeaseProvider = {
+      ...inner,
+      renew: async (...args: Parameters<LeaseProvider['renew']>) => {
+        const renewal = await inner.renew(...args);
+        if (renewal.held && renewal.signals.includes('drain')) delivered.open();
+        return renewal;
+      },
+    };
+    const started = gate();
+    const release = gate();
+    let runs = 0;
+    const run = {
+      model: createMockModel({
+        responses: [{ toolCalls: [{ toolName: 'wait', args: {} }] }, { text: 'All set.' }],
+      }),
+      tools: {
+        wait: {
+          description: 'Wait for the go-ahead.',
+          parameters,
+          execute: async () => {
+            runs++;
+            started.open();
+            await release.promise;
+            return 'ready';
+          },
+        },
+      },
+    };
+    const { client, store, errors } = serve(run, { lease: { provider: leases, ttlMs: 30 } });
+    const task = (
+      await client.sendMessage('Wait for me.', { configuration: { returnImmediately: true } })
+    ).task as A2ATask;
+    await started.promise;
+    // A rolling deploy drains the run while its turn runs (operations.mdx).
+    expect(
+      await leases.signal(agentRunLeaseKey({ scope: ANONYMOUS, runId: task.id }), 'drain'),
+    ).toBe(true);
+    await delivered.promise;
+    release.open();
+    await vi.waitFor(
+      async () =>
+        expect((await client.getTask(task.id)).status.state).toBe('TASK_STATE_INPUT_REQUIRED'),
+      { timeout: 5000 },
+    );
+    const drained = await client.getTask(task.id);
+    expect(a2aText(drained.status.message)).toBe(
+      'The run stopped (drained): it was moved off its executor before it finished, and has not ended. Send a message to go on.',
+    );
+    expect(dataOf(drained, 'stopped')).toEqual({ type: 'stopped', reason: 'drained' });
+    // The run did not end: nothing was committed.
+    const stored = await store.load(task.id);
+    expect(stored?.phase).toBe('running');
+    expect(stored?.result).toBeUndefined();
+
+    // The next message picks the run up at its last step boundary: the tool does not run again.
+    const done = (await client.sendMessage('Go on.', { taskId: task.id })).task as A2ATask;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(a2aText(done.artifacts?.[0])).toBe('All set.');
+    expect(runs).toBe(1);
+    expect(errors).toEqual([]);
+  });
+
+  it('lists the actions again when a drain stops a resume before it took the answers up', async () => {
+    const inner = createInMemoryLeaseProvider();
+    let drainNextClaim = false;
+    // A deploy's drain reaches the executor right after a resume claimed the run.
+    const leases: LeaseProvider = {
+      ...inner,
+      acquire: async (request) => {
+        const lease = await inner.acquire(request);
+        if (lease && drainNextClaim) {
+          drainNextClaim = false;
+          await inner.signal(request.key, 'drain');
+        }
+        return lease;
+      },
+    };
+    const published: unknown[] = [];
+    const { client, store, errors } = serve(
+      publisher(
+        [{ toolCalls: [{ toolName: 'publish', args: { text: 'hi' } }] }, { text: 'Done.' }],
+        published,
+      ),
+      { lease: { provider: leases, ttlMs: 30 } },
+    );
+    const asked = (await client.sendMessage('Publish "hi".')).task as A2ATask;
+    const answer: A2APart[] = [
+      { data: { approvalResponses: [{ approvalId: approvalIdOf(asked), approved: true }] } },
+    ];
+    const run = await store.load(asked.id);
+
+    drainNextClaim = true;
+    const after = (await client.sendMessage(answer, { taskId: asked.id })).task as A2ATask;
+    // Nothing was written: the run still waits for the approval, and the task says so.
+    expect(await store.load(asked.id)).toEqual(run);
+    expect(published).toEqual([]);
+    expect(after.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    expect(a2aText(after.status.message)).toBe(
+      'The run was moved off its executor (drained) before it took the answers up. ' +
+        'The agent waits for approval of publish (call_1). ' +
+        'Answer every action in one message, with a data part { approvalResponses, clientToolResults }.',
+    );
+    expect(actionsOf(after)).toEqual(actionsOf(asked));
+    expect(dataOf(after, 'stopped')).toBeUndefined();
+
+    // The client answers again, and the run goes on.
+    const done = (await client.sendMessage(answer, { taskId: asked.id })).task as A2ATask;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(published).toEqual([{ text: 'hi' }]);
+    expect(errors).toEqual([]);
   });
 });
 
@@ -1053,6 +1523,79 @@ describe('createA2AAgentExecutor — drafts of the output', () => {
     const task = await client.getTask(events[0]?.task?.id as string);
     expect(task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
     expect(task.artifacts ?? []).toEqual([]);
+  });
+
+  describe('of a run with guardrails.onOutput', () => {
+    const SSN = '123-45-6789';
+    const redact: OutputGuardrail = ({ text }) => ({
+      action: 'rewrite',
+      text: text.replaceAll(SSN, '[redacted]'),
+    });
+    const refuse: OutputGuardrail = () => ({
+      action: 'block',
+      reason: 'PII',
+      replacement: 'I cannot share that.',
+    });
+    const answering = (onOutput: OutputGuardrail | OutputGuardrail[]) => ({
+      model: createMockModel({ responses: [{ text: `The customer SSN is ${SSN}.` }] }),
+      guardrails: { onOutput },
+    });
+    /** The text the drafts of a stream previewed. */
+    const drafted = (events: A2AStreamResponse[]) =>
+      events
+        .filter((event) => event.artifactUpdate !== undefined && !event.artifactUpdate.lastChunk)
+        .map((event) => a2aText(event.artifactUpdate?.artifact))
+        .join('');
+
+    it('sends none: a draft is the text before the guardrail rewrites it', async () => {
+      const { client } = serve(answering(redact));
+      const events = await collect(client.sendStreamingMessage('Who is the customer?'));
+      expect(drafted(events)).toBe('');
+      expect(JSON.stringify(events)).not.toContain(SSN);
+      expect(a2aText(events.at(-2)?.artifactUpdate?.artifact)).toBe(
+        'The customer SSN is [redacted].',
+      );
+      expect(events.at(-1)?.statusUpdate?.status.state).toBe('TASK_STATE_COMPLETED');
+    });
+
+    it('sends none of an answer the guardrail blocks', async () => {
+      const { client } = serve(answering([refuse]));
+      const events = await collect(client.sendStreamingMessage('Who is the customer?'));
+      expect(JSON.stringify(events)).not.toContain(SSN);
+      expect(events.at(-1)?.statusUpdate?.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    });
+
+    it('sends them with drafts: true; an empty list guards nothing', async () => {
+      const opted = serve(answering(redact), { drafts: true });
+      const events = await collect(opted.client.sendStreamingMessage('Who is the customer?'));
+      expect(drafted(events)).toBe(`The customer SSN is ${SSN}.`);
+      // Only the stored artifact is the guarded text.
+      expect(a2aText(events.at(-2)?.artifactUpdate?.artifact)).toBe(
+        'The customer SSN is [redacted].',
+      );
+
+      const unguarded = serve(answering([]));
+      const plain = await collect(unguarded.client.sendStreamingMessage('Who is the customer?'));
+      expect(drafted(plain)).toBe(`The customer SSN is ${SSN}.`);
+    });
+  });
+
+  it('sends no drafts with drafts: false', async () => {
+    const { client } = serve(
+      { model: createMockModel({ responses: [{ text: 'Paris.' }] }) },
+      { drafts: false },
+    );
+    const events = await collect(client.sendStreamingMessage('Capital of France?'));
+    expect(events.map((event) => Object.keys(event)[0])).toEqual([
+      'task',
+      'statusUpdate',
+      'artifactUpdate',
+      'statusUpdate',
+    ]);
+    expect(events[2]?.artifactUpdate).toMatchObject({
+      artifact: { parts: [{ text: 'Paris.' }] },
+      lastChunk: true,
+    });
   });
 });
 

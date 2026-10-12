@@ -563,8 +563,9 @@ export interface A2AExecutionContext {
    * `GetTask`, a blocking `SendMessage` and a later `SubscribeToTask` never
    * see it, and it does not answer a `returnImmediately` request. Store the
    * finished content with `artifact` under the same `artifactId` to replace
-   * the preview. Needs the task, so make an update first. Resolves with the
-   * artifact's id.
+   * the preview. Needs the task, so make an update first. Nothing checks a
+   * draft before it goes out, so preview only what the client may read.
+   * Resolves with the artifact's id.
    */
   draft(artifact: A2AArtifactInput, options?: { append?: boolean }): Promise<string>;
   /** `TASK_STATE_INPUT_REQUIRED`: ask the client; its next message starts a new turn. Ends the turn. */

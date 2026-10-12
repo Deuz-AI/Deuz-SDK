@@ -28,7 +28,14 @@ import type { StopDetails } from '../types/methods';
 import type { ToolApprovalResponse } from '../types/tool';
 import { A2AError } from './errors';
 import { isRecord } from './protocol';
-import type { A2AExecutionContext, A2AExecutor, A2AMessage, A2APart, A2ATaskScope } from './types';
+import type {
+  A2AExecutionContext,
+  A2AExecutor,
+  A2AMessage,
+  A2APart,
+  A2ATask,
+  A2ATaskScope,
+} from './types';
 
 /**
  * The native agent engine: `{ streamAgent, resumeStreamAgent }` from
@@ -123,9 +130,21 @@ export interface A2AAgentExecutorOptions<T = string> {
   /** The output artifact's `name` (default `'output'`) and `description`. */
   artifact?: { name?: string; description?: string };
   /**
-   * The text of a failed task's status message, and of a refused resume.
-   * Default: the run's error message, secret-redacted. Return only what the
-   * client may read.
+   * Stream the text of a string output to the task's streams as unstored
+   * drafts of the output artifact, while the model writes it. A draft is the
+   * model's text before `guardrails.onOutput` rewrites or blocks it, so by
+   * default a leg whose run has `guardrails.onOutput` sends none, and any
+   * other leg does. `true` sends them anyway, `false` never. A typed output
+   * is never drafted.
+   */
+  drafts?: boolean;
+  /**
+   * The text of a failed task's status message, and of a refused resume,
+   * from the run's whole error. Default: a fixed text that names the error
+   * by its `code`, or its `name` (a resume refused while another executor
+   * holds the run says so); the error's message, which can name a provider
+   * account, a database host or a user, stays on the server. Return only
+   * what the client may read.
    */
   failureMessage?: (error: { name: string; message: string; code?: string }) => string;
 }
@@ -140,7 +159,10 @@ export type A2AAgentAction =
       toolName: string;
       /** The call's arguments, for display. */
       input: unknown;
-      /** The signed approval token (`approvalSigner`): echo it on the verdict. */
+      /**
+       * The signed approval token (`approvalSigner`): echo it on the verdict.
+       * An approval without it is refused with `INVALID_PARAMS`.
+       */
       token?: string;
       /** The sub-agent the call belongs to. */
       agentPath?: string[];
@@ -160,10 +182,15 @@ export interface A2AAgentPendingActions {
   actions: A2AAgentAction[];
 }
 
-/** The data part of an `INPUT_REQUIRED` status whose run stopped: a person must look at it. */
+/**
+ * The data part of an `INPUT_REQUIRED` status whose run stopped. A drained
+ * run (`'drained'`) goes on at the next message, one stopped for
+ * reconciliation once a person settled its unknown effects; at any other stop
+ * a person must look at the run.
+ */
 export interface A2AAgentStopped {
   type: 'stopped';
-  /** The run's stop reason: `'max-steps'`, `'budget.usd'`, `'refusal'`, `'tool-reconciliation-required'`, … */
+  /** The run's stop reason: `'max-steps'`, `'budget.usd'`, `'refusal'`, `'drained'`, `'tool-reconciliation-required'`, … */
   reason: string;
   /** The provider's explanation of the stop, its `explanation` secret-redacted. */
   stopDetails?: StopDetails;
@@ -195,13 +222,33 @@ const ANSWER_FIELDS: ReadonlySet<string> = new Set(['approvalResponses', 'client
 const HOW_TO_ANSWER =
   'Answer every action in one message, with a data part { approvalResponses, clientToolResults }.';
 
+/**
+ * The stop reason of a run a lease drain stopped, as in a deploy: the run has
+ * not ended, and a resume goes on from its last save.
+ */
+const DRAINED = 'drained';
+
 type Suspended = Extract<AgentResult<unknown>, { status: 'suspended' }>;
+/** What a run waits for: its pending approvals and client tool calls. */
+type Pending = Pick<Suspended, 'pendingApprovals' | 'pendingClientCalls'>;
 type Stopped = Extract<AgentResult<unknown>, { status: 'stopped' }>;
 type RunError = Extract<AgentResult<unknown>, { status: 'failed' }>['error'];
 type ClientToolResult = NonNullable<A2AAgentAnswers['clientToolResults']>[number];
 
 function invalidParams(message: string): A2AError {
   return new A2AError({ reason: 'INVALID_PARAMS', message });
+}
+
+/**
+ * A task update that failed, most likely in the task store, whose message
+ * may name its hosts or users. The handler shows the client the message of
+ * what the executor throws, so this gets a fixed one, with the error as its
+ * cause. An A2A error stays as it is.
+ */
+function updateFailure(error: unknown): unknown {
+  return error instanceof A2AError
+    ? error
+    : new Error('The agent could not update the task.', { cause: error });
 }
 
 /** The executor's own run options that `run` sets, by name. */
@@ -256,8 +303,28 @@ function waitsFor(actions: readonly A2AAgentAction[]): string {
     : `waits for ${actions.length} actions: ${actions.map(describeAction).join('; ')}`;
 }
 
-/** What a suspended run waits for: its approvals, then its client tool calls. */
-function pendingActions(result: Suspended): A2AAgentAction[] {
+/**
+ * What a stored run waits for, read as its resume reads it: the approvals of
+ * its suspended checkpoint, and its pending client calls. Not its stored
+ * result, which a resume's first write drops before the run takes the
+ * answers up. `undefined` for a run that does not wait for answers.
+ */
+function pendingOf(saved: AgentRunEnvelope): Pending | undefined {
+  const checkpoint = saved.checkpoints[saved.runId];
+  if (saved.phase === 'terminal' || checkpoint?.status !== 'suspended') return undefined;
+  const pending: Pending = {
+    pendingApprovals: checkpoint.pendingApprovals ?? [],
+    pendingClientCalls:
+      saved.pendingClientCalls ??
+      (saved.result?.status === 'suspended' ? saved.result.pendingClientCalls : []),
+  };
+  return pending.pendingApprovals.length > 0 || pending.pendingClientCalls.length > 0
+    ? pending
+    : undefined;
+}
+
+/** What a run waits for, as actions: its approvals, then its client tool calls. */
+function pendingActions(result: Pending): A2AAgentAction[] {
   return [
     ...result.pendingApprovals.map(
       (request): A2AAgentAction => ({
@@ -358,14 +425,14 @@ function readAnswers(message: A2AMessage): {
 }
 
 /**
- * Answers fit a suspended run when they answer each of its pending actions
+ * Answers fit a waiting run when they answer each of its pending actions
  * once, each with the kind of answer it waits for, and nothing else: the
  * run's resume keeps no partial answer.
  */
 function checkAnswers(
   taskId: string,
   answers: { approvals: ToolApprovalResponse[]; results: ClientToolResult[] },
-  result: Suspended,
+  result: Pending,
 ): void {
   const actions = pendingActions(result);
   if (answers.approvals.length === 0 && answers.results.length === 0) {
@@ -377,10 +444,12 @@ function checkAnswers(
   const calls = new Map(result.pendingClientCalls.map((call) => [call.toolCallId, call]));
   const approved = new Set<string>();
   const returned = new Set<string>();
-  for (const { approvalId } of answers.approvals) {
+  for (const verdict of answers.approvals) {
+    const approvalId = verdict.approvalId;
     if (approved.has(approvalId))
       throw invalidParams(`approvalResponses answers '${approvalId}' twice.`);
-    if (!approvals.has(approvalId)) {
+    const request = approvals.get(approvalId);
+    if (!request) {
       const call = calls.get(approvalId);
       if (call) {
         throw invalidParams(
@@ -394,6 +463,13 @@ function checkAnswers(
         );
       }
       throw invalidParams(`'${approvalId}' is not an approval task ${taskId} waits for.`);
+    }
+    // A signed approval (approvalSigner) without its own token would reach
+    // the run as a denial. A denial needs none. The token is never echoed.
+    if (verdict.approved && request.token !== undefined && verdict.token !== request.token) {
+      throw invalidParams(
+        `The approval of ${request.toolName} (${request.toolCallId}) must echo its action's token.`,
+      );
     }
     approved.add(approvalId);
   }
@@ -425,10 +501,32 @@ function checkAnswers(
   }
 }
 
-function pendingMessage(actions: A2AAgentAction[]): A2APart[] {
+/** What a client answers an action by: its kind and ids, and the token it must echo. */
+function actionKey(action: A2AAgentAction): string {
+  return JSON.stringify(
+    action.kind === 'approval'
+      ? [action.kind, action.approvalId, action.toolCallId, action.token ?? null]
+      : [action.kind, action.toolCallId],
+  );
+}
+
+/** The task's status lists exactly these actions: its client has what it needs to answer them. */
+function listsActions(task: A2ATask | undefined, actions: readonly A2AAgentAction[]): boolean {
+  const listed = task?.status.message?.parts.find(
+    (part) => isRecord(part.data) && part.data.type === 'pending-actions',
+  )?.data;
+  if (!isRecord(listed) || !Array.isArray(listed.actions) || !listed.actions.every(isRecord)) {
+    return false;
+  }
+  const keys = (list: readonly A2AAgentAction[]) => JSON.stringify(list.map(actionKey).sort());
+  return keys(listed.actions as A2AAgentAction[]) === keys(actions);
+}
+
+/** The status of a run that waits for answers; `lead` says why it asks again. */
+function pendingMessage(actions: A2AAgentAction[], lead?: string): A2APart[] {
   const data: A2AAgentPendingActions = { type: 'pending-actions', actions };
   return [
-    { text: `The agent ${waitsFor(actions)}. ${HOW_TO_ANSWER}` },
+    { text: `${lead ? `${lead} ` : ''}The agent ${waitsFor(actions)}. ${HOW_TO_ANSWER}` },
     { data, mediaType: 'application/json' },
   ];
 }
@@ -458,7 +556,8 @@ function stoppedMessage(result: Stopped): A2APart[] {
       : {}),
   };
   const unknown = data.unknownEffects ?? [];
-  // Only a reconciliation stop leaves the run resumable; any other stop is final.
+  // A drained run goes on at the next message, a reconciliation stop once a
+  // person settled its unknown effects; any other stop is final.
   const text =
     result.reason === 'tool-reconciliation-required'
       ? `The run stopped (${result.reason}): the outcome of ${
@@ -468,7 +567,9 @@ function stoppedMessage(result: Stopped): A2APart[] {
               ? `${unknown.length} tool calls`
               : 'a tool call'
         } is unknown. A person must settle ${unknown.length > 1 ? 'them' : 'it'} before the run can go on; send a message once that is done.`
-      : `The run stopped (${result.reason}): a person must look at it. The run cannot go on; cancel the task or start a new one.`;
+      : result.reason === DRAINED
+        ? `The run stopped (${DRAINED}): it was moved off its executor before it finished, and has not ended. Send a message to go on.`
+        : `The run stopped (${result.reason}): a person must look at it. The run cannot go on; cancel the task or start a new one.`;
   return [{ text }, { data, mediaType: 'application/json' }];
 }
 
@@ -499,18 +600,26 @@ function outputPart(output: unknown, typed: boolean): A2APart {
  * - A new message starts a run on it (`streamAgent`); a message to a task
  *   whose run waits resumes it (`resumeStreamAgent`). The task goes
  *   `WORKING` once the run's leg runs, and the text of a string output
- *   streams as unstored `draft` updates of the output artifact.
+ *   streams as unstored `draft` updates of the output artifact: the model's
+ *   text before `guardrails.onOutput`, so a run with output guardrails
+ *   drafts nothing unless `drafts` asks.
  * - `completed`: the output artifact (`'output'`), the run's validated
  *   output only, as a text part (a string output) or a data part (a typed
  *   one); then `COMPLETED`.
  * - `suspended`: `INPUT_REQUIRED`, with a data part `{ type:
  *   'pending-actions', actions }`. The next message answers every action in
  *   data parts `{ approvalResponses, clientToolResults }`; answers that do
- *   not fit are refused with `INVALID_PARAMS` before anything is written.
+ *   not fit are refused with `INVALID_PARAMS` before anything is written. So
+ *   is a message without answers, unless the task's status does not list
+ *   what the run waits for (a person resumed the run, and it suspended
+ *   again): the task then lists it, and no leg runs.
  * - `stopped`: `INPUT_REQUIRED` with a data part `{ type: 'stopped', reason
- *   }`: a person must look at the run. A run stopped for reconciliation goes
- *   on at the next message once a person settled its unknown effects; a
- *   message to any other stopped run is refused with
+ *   }`. A drained run (`'drained'`: a lease drain, as in a deploy) has not
+ *   ended, and the next message resumes it; a drain that stopped a resume
+ *   before it took the answers up leaves the run waiting for them, and the
+ *   task lists them again. A run stopped for reconciliation goes on at the
+ *   next message once a person settled its unknown effects. At any other
+ *   stop a person must look at the run, and a message is refused with
  *   `UNSUPPORTED_OPERATION`. A stop a cancellation caused (`'aborted'`,
  *   `'cancelled'`) cancels the task.
  * - `failed`: `FAILED`, with a safe message (see `failureMessage`). A resume
@@ -552,12 +661,22 @@ export function createA2AAgentExecutor<T = string>(
       message: 'createA2AAgentExecutor: lease needs lease.provider, a LeaseProvider.',
     });
   }
+  if (options.drafts !== undefined && typeof options.drafts !== 'boolean') {
+    throw new InvalidRequestError({ message: 'createA2AAgentExecutor: drafts is a boolean.' });
+  }
   const scopeOf = options.scope ?? defaultScope;
   const name = options.artifact?.name ?? 'output';
   const description = options.artifact?.description;
   const about = { name, ...(description !== undefined ? { description } : {}) };
-  const errorText = (error: RunError, fallback: string) =>
-    options.failureMessage?.(error) ?? `${fallback}: ${redactString(error.message)}`;
+  // A run's error message can name a provider's account, a database host or
+  // a user: the client reads its code or name, unless failureMessage words it.
+  const failureText = (error: RunError) =>
+    options.failureMessage?.(error) ?? `The agent run failed (${error.code ?? error.name}).`;
+  const refusalText = (error: RunError, taskId: string) =>
+    options.failureMessage?.(error) ??
+    (error.code === 'lease_held'
+      ? `Another executor is driving the run of task ${taskId}; send the message again later.`
+      : `The run of task ${taskId} could not be resumed (${error.code ?? error.name}).`);
 
   async function runOptions(ctx: A2AExecutionContext): Promise<A2AAgentRunOptions<T>> {
     const value: unknown =
@@ -582,9 +701,18 @@ export function createA2AAgentExecutor<T = string>(
     return value as A2AAgentRunOptions<T>;
   }
 
+  /** The stored run, or `undefined` when the store cannot give it. */
+  async function storedRun(runId: string): Promise<AgentRunEnvelope | undefined> {
+    try {
+      return await store.load(runId);
+    } catch {
+      return undefined;
+    }
+  }
+
   /** The run's failure is in the store: not a leg that was refused before it began. */
   async function failureRecorded(runId: string): Promise<boolean> {
-    const stored = await Promise.resolve(store.load(runId)).catch(() => undefined);
+    const stored = await storedRun(runId);
     return stored?.phase === 'terminal' && stored.result?.status === 'failed';
   }
 
@@ -615,6 +743,21 @@ export function createA2AAgentExecutor<T = string>(
           await ctx.setStatus('TASK_STATE_CANCELED', `The run was ${result.reason}.`);
           return;
         }
+        // A drain stopped the run, unended. One that stopped a resume before
+        // it took the answers up left the run waiting for them: ask again.
+        if (result.reason === DRAINED) {
+          const stored = await storedRun(ctx.taskId);
+          const pending = stored && pendingOf(stored);
+          if (pending) {
+            await ctx.requireInput(
+              pendingMessage(
+                pendingActions(pending),
+                `The run was moved off its executor (${DRAINED}) before it took the answers up.`,
+              ),
+            );
+            return;
+          }
+        }
         await ctx.requireInput(stoppedMessage(result));
         return;
       case 'failed': {
@@ -624,7 +767,7 @@ export function createA2AAgentExecutor<T = string>(
         if (resuming && !changed && !(await failureRecorded(ctx.taskId))) {
           throw new A2AError({
             reason: result.error.code === 'lease_held' ? 'UNSUPPORTED_OPERATION' : 'INTERNAL_ERROR',
-            message: errorText(result.error, `The run of task ${ctx.taskId} could not be resumed`),
+            message: refusalText(result.error, ctx.taskId),
           });
         }
         const data: A2AAgentFailed = {
@@ -635,7 +778,7 @@ export function createA2AAgentExecutor<T = string>(
           },
         };
         await ctx.fail([
-          { text: errorText(result.error, 'The agent run failed') },
+          { text: failureText(result.error) },
           { data, mediaType: 'application/json' },
         ]);
         return;
@@ -656,6 +799,11 @@ export function createA2AAgentExecutor<T = string>(
     if (ctx.signal.aborted) stop();
     else ctx.signal.addEventListener('abort', stop, { once: true });
     const typed = leg.output !== undefined;
+    // Only a string output streams, as drafts of the output artifact: a typed
+    // one is shown once validated, never in part. A draft is the model's text
+    // before an output guardrail rewrites or blocks it: sent only when asked.
+    const drafting =
+      !typed && (options.drafts ?? [leg.guardrails?.onOutput ?? []].flat().length === 0);
     const stream = open(controller.signal);
     let changed = false;
     try {
@@ -673,9 +821,7 @@ export function createA2AAgentExecutor<T = string>(
           }
           continue;
         }
-        // Only a string output streams, as drafts of the output artifact: a
-        // typed one is shown once validated, never in part.
-        if (event.type !== 'part' || !changed || typed) continue;
+        if (event.type !== 'part' || !changed || !drafting) continue;
         if (event.part.type === 'step-start') fresh = true;
         else if (event.part.type === 'text-delta' && event.part.text !== '') {
           await ctx.draft(
@@ -694,7 +840,7 @@ export function createA2AAgentExecutor<T = string>(
       if (!ctx.signal.aborted) {
         controller.abort(error);
         await stream.result;
-        throw error;
+        throw updateFailure(error);
       }
     } finally {
       ctx.signal.removeEventListener('abort', stop);
@@ -704,7 +850,7 @@ export function createA2AAgentExecutor<T = string>(
     try {
       await settle(ctx, result, typed, resuming, changed);
     } catch (error) {
-      if (!ctx.signal.aborted) throw error;
+      if (!ctx.signal.aborted) throw updateFailure(error);
     }
   }
 
@@ -750,8 +896,25 @@ export function createA2AAgentExecutor<T = string>(
     }
     const answers = readAnswers(ctx.message);
     const result = saved.result;
-    if (saved.phase !== 'terminal' && result?.status === 'suspended') {
-      checkAnswers(ctx.taskId, answers, result);
+    const pending = pendingOf(saved);
+    if (pending) {
+      const actions = pendingActions(pending);
+      // The task's status may not show what the run waits for: a person's
+      // resume left the run suspended again. A message without answers then
+      // learns it, and no leg runs.
+      if (
+        answers.approvals.length === 0 &&
+        answers.results.length === 0 &&
+        !listsActions(ctx.task, actions)
+      ) {
+        try {
+          await ctx.requireInput(pendingMessage(actions));
+        } catch (error) {
+          throw updateFailure(error);
+        }
+        return;
+      }
+      checkAnswers(ctx.taskId, answers, pending);
     } else if (answers.approvals.length > 0 || answers.results.length > 0) {
       throw invalidParams(`Task ${ctx.taskId} is not waiting for answers.`);
     } else if (

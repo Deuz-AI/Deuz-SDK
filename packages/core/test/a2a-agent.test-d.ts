@@ -5,6 +5,7 @@ import {
   type A2AAgentAction,
   type A2AAgentAnswers,
   type A2AAgentEngine,
+  type A2AAgentExecutorOptions,
   type A2AAgentFailed,
   type A2AAgentPendingActions,
   type A2AAgentRunContext,
@@ -71,6 +72,13 @@ test('run is the options, or a function of the turn that gives them', () => {
       return { model, prompt: `Answer: ${context.message.parts.length}` };
     },
   });
+});
+
+test('drafts is an optional boolean', () => {
+  expectTypeOf<A2AAgentExecutorOptions['drafts']>().toEqualTypeOf<boolean | undefined>();
+  createA2AAgentExecutor({ agent, store, run: { model }, drafts: true });
+  // @ts-expect-error drafts is on or off
+  createA2AAgentExecutor({ agent, store, run: { model }, drafts: 'auto' });
 });
 
 test('the options the executor sets on every leg are not run options', () => {
