@@ -189,10 +189,11 @@ async function recorded(
 
 /**
  * `--approve` / `--deny`: the approvals the stored run waits on. Its report
- * lists them, except when a leg that answered one failed (in transit, say)
- * before its next checkpoint: the report then shows the failure, while the
- * stored run, its checkpoint still suspended, needs the verdict again, on the
- * `--retry-failed` resume too. Read from the store, with no model call.
+ * lists them, except when a leg that answered one failed before its next
+ * checkpoint (in transit, or the process died): the report then shows the
+ * failure or a pending resume, while the stored run, its checkpoint still
+ * suspended, needs the verdict again (with `--retry-failed` after a failure in
+ * transit). Read from the store, with no model call.
  */
 async function awaitedApprovals(
   store: AgentRunStore,

@@ -78,9 +78,10 @@ export const HEADLESS_EXIT_CODES: Readonly<Record<HeadlessOutcome | 'usage' | 'd
 
 /**
  * One thing a pending run waits for, and the resume option that answers it
- * (`resumeWith`; either of two for an unknown effect). `'resume'` is a stored
- * run with no result yet: its executor stopped (or still drives it
- * elsewhere), or a lease drain stopped it, and a resume continues it.
+ * (`resumeWith`; either of two for an unknown effect). `'resume'` is a run a
+ * resume continues: a stored run with no result yet, whose executor stopped
+ * (or still drives it elsewhere), or a run a lease drain stopped. With the
+ * report's `retry`, the resume passes `retryFailed: true`.
  */
 export type HeadlessPendingAction =
   | {
