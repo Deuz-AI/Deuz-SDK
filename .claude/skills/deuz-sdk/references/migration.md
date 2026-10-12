@@ -334,10 +334,10 @@ console.log(merged.text, picked.best, res.text);
 Sharp edges when porting LangGraph:
 
 - **A gated tool call with no verdict on resume is DENIED**, not left pending. Send a verdict for every `approvalId`; unknown ids are ignored (replay-safe). Client-mode approval inside a sub-agent is unsupported — pass `approveToolCall` on the outermost call instead.
-- **Sub-agents do not inherit `guardrails`** (`agentTool` forwards `runtimeContext`, the approver and the signal — not the hooks). A `handoff` *does* keep them, because it changes the active agent, not the run.
+- **Sub-agents inherit the parent's tool guardrails (2.3).** `agentTool` forwards `runtimeContext`, the approver, the signal and the run's `onToolCall` / `onToolResult` guardrails (`ToolExecuteContext.guardrails`), so a sub-agent's own calls stay inside the parent's tool policy; `onInput` / `onOutput` stay with the parent. A `handoff` keeps all of them, because it changes the active agent, not the run.
 - **Only agentic calls checkpoint** (a single-turn call has no step boundaries), and **nothing finishes unless someone drains the stream**: on `streamChat`, checkpoints, persistence and `onFinish` run off the lazy pump — `after(() => result.consume?.())` on Next.js, `ctx.waitUntil(...)` on Workers.
 - **`stopWhen` does not change `finishReason`** — read `providerMetadata.deuz.stoppedBy` (also `'guardrail:input'` / `'guardrail:output'` / `'false-finish'` / `'budget.usd'`).
-- **`costExceeds` needs `deps.priceProvider`** (`createPriceProvider()`, the bundled 2026 table); without one it warns once and then never fires. After a handoff, cost is still priced against the root model — bound such a run with `budget.tokens` too.
+- **`costExceeds` needs `deps.priceProvider`** (`createPriceProvider()`, the bundled 2026 table); without one it warns once and then never fires. Each call is priced at the model that ran it, a handoff target's included.
 
 ---
 
