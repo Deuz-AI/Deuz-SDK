@@ -509,13 +509,15 @@ export async function runToolLoop(
     // Memory recall (1.7, D1): computed once per leg. On a model that binds
     // thinking to the prefix (2.3, F22) it is one appended system message (see
     // `planRecall`); elsewhere it is spliced in at the model-call site only and
-    // canonical history/checkpoints/persistence stay recall-free.
+    // canonical history/checkpoints/persistence stay recall-free. The run's
+    // first model decides which, on every leg: a leg that resumes as a handoff
+    // target reads its recall where the first leg put it.
     // Its observation parents under the RUN span (no step is open yet).
     const recall = await planRecall(
       options,
       deps,
       messages,
-      active?.model ?? options.model,
+      options.model,
       observeCtx,
       internal?.resumeFrom !== undefined,
     );

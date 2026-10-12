@@ -5,7 +5,7 @@
  * memory recall rule across legs. Scripted Claude endpoint, offline; not
  * live-verified.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { generateText } from '../src/index';
 import {
   createInMemorySessionStore,
@@ -16,11 +16,14 @@ import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../src/agent
 import { agentTool } from '../src/inference/agent-tool';
 import { handoff } from '../src/inference/handoff';
 import { PROMPT_INJECTION_POLICY, promptInjectionGuardrail } from '../src/guardrails';
+import { createInMemoryMemoryStore, type MemorySeams } from '../src/memory';
 import type { CommonCallOptions } from '../src/types/config';
+import type { LanguageModel } from '../src/types/model';
 import type { JSONSchema } from '../src/types/schema';
 import type { StreamPart } from '../src/types/stream';
 import {
   claudeTurn,
+  prefixBreak,
   prefixBreaks,
   scriptedClaude,
   thinkThenAnswer,
@@ -544,3 +547,116 @@ describe('promptInjectionGuardrail on a resumed leg (Claude 5.x)', () => {
     expect(prefixBreaks(claude.requests)).toEqual([]);
   });
 });
+
+// --- memory recall across legs -------------------------------------------------
+
+/** A memory store holding one fact, its `search` spied on. */
+async function seededSeams(): Promise<MemorySeams & { search: ReturnType<typeof vi.fn> }> {
+  const store = createInMemoryMemoryStore();
+  const search = vi.fn(store.search.bind(store));
+  let id = 0;
+  const seams = {
+    store: { ...store, search },
+    // Extraction is off in these runs; recall never calls the LLM.
+    llm: async () => '{"facts": []}',
+    clock,
+    generateId: () => `mem-${id++}`,
+    hashFn: async (t: string) => `h:${t}`,
+    search,
+  };
+  await seams.store.upsert([
+    {
+      id: 'm-0',
+      text: 'User prefers dark roast coffee',
+      hash: 'h:coffee',
+      kind: 'semantic',
+      scope: { userId: 'u1' },
+      createdAt: 1,
+      updatedAt: 1,
+      validAt: 1,
+    },
+  ]);
+  return seams;
+}
+
+const MEMORY = 'User prefers dark roast coffee';
+
+/** How often `text` occurs in `value`, serialized. */
+function occurrences(value: unknown, text: string): number {
+  return JSON.stringify(value ?? null).split(text).length - 1;
+}
+
+describe.each(LOOPS)(
+  'memory recall follows the run’s first model on every leg (%s loop)',
+  (loop) => {
+    /** Transfer, then a gated refund in the target, resumed with the approval. */
+    async function transferAndResume(
+      root: LanguageModel,
+      target: LanguageModel,
+      seams: MemorySeams,
+    ): Promise<void> {
+      const billing = {
+        model: target,
+        tools: {
+          refund: { parameters: OBJ, execute: async () => 'refunded', needsApproval: true },
+        },
+      };
+      const store = createInMemorySessionStore();
+      const common = {
+        model: root,
+        tools: handoff({ billing }),
+        maxSteps: 4,
+        memory: { seams, scope: { userId: 'u1' }, extract: false as const },
+        deps: { clock },
+      };
+      const first = await generateText({
+        ...common,
+        messages: [
+          { role: 'system', content: 'You route.' },
+          { role: 'user', content: 'Refund my coffee order.' },
+        ],
+        session: { store, runId: 'run-1' },
+      });
+      expect(first.pendingApprovals).toHaveLength(1);
+      await resume(loop, store, 'run-1', {
+        ...common,
+        approvalResponses: [{ approvalId: first.pendingApprovals![0]!.approvalId, approved: true }],
+      });
+    }
+
+    const turns = () => [
+      thinkThenCall('S0', 'tu_0', 'transfer_to_billing'),
+      thinkThenCall('S1', 'tu_1', 'refund'),
+      thinkThenAnswer('S2', 'Refunded.'),
+    ];
+
+    it('a run that starts on another model splices the block on a Claude 5.x target’s resumed leg too', async () => {
+      const seams = await seededSeams();
+      const claude = scriptedClaude(turns());
+      await transferAndResume(claude.model2('claude-opus-4-8'), claude.model, seams);
+
+      expect(claude.requests).toHaveLength(3);
+      const [, targetLeg1, targetLeg2] = claude.requests;
+      // The target's system reads the block on both legs, so its thinking holds.
+      expect(occurrences(targetLeg1!.system, MEMORY)).toBe(1);
+      expect(targetLeg2!.system).toEqual(targetLeg1!.system);
+      expect(prefixBreak(targetLeg1!, targetLeg2!)).toBeUndefined();
+      // The splice keeps the transcript recall-free; each leg recalls, as in 2.2.
+      expect(occurrences(targetLeg2!.messages, MEMORY)).toBe(0);
+      expect(seams.search).toHaveBeenCalledTimes(2);
+    });
+
+    it('a Claude 5.x run keeps its one recall message when an older-model target resumes', async () => {
+      const seams = await seededSeams();
+      const claude = scriptedClaude(turns());
+      await transferAndResume(claude.model, claude.model2('claude-opus-4-8'), seams);
+
+      expect(claude.requests).toHaveLength(3);
+      const [, targetLeg1, targetLeg2] = claude.requests;
+      // Folded into the older model's system on both legs, and only once.
+      expect(occurrences(targetLeg2!.system, MEMORY)).toBe(1);
+      expect(targetLeg2!.system).toEqual(targetLeg1!.system);
+      expect(seams.search).toHaveBeenCalledTimes(1);
+    });
+  },
+);

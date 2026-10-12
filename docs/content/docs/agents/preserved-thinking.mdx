@@ -15,7 +15,7 @@ The request shapes on this page come from the types of `@anthropic-ai/sdk` 0.133
 
 A request is in **stable-prefix mode** when its model is one of the four above, or an unknown `claude-{fable,opus,sonnet,haiku}-N…` id with N ≥ 5 that the registry answers from the Claude 5.x family fallback, on the Anthropic wire (`createAnthropic`, Claude on Vertex). Every other model, older Claude models included, keeps the 2.2 behaviour described on the pages linked below.
 
-The wire mapping and the tools array follow the model each call goes to (the run's, a handoff target's, or the one `prepareStep` picked). Memory recall follows the model the run starts with, a handoff's instructions the target's model, and compaction the active agent's model.
+The wire mapping and the tools array follow the model each call goes to (the run's, a handoff target's, or the one `prepareStep` picked). Memory recall follows the model the run starts with, on every leg: a leg that resumes as a handoff target reads the recall where the first leg put it, so its system prompt stays the one its earlier thinking is bound to. A handoff's instructions follow the target's model, and compaction the active agent's model.
 
 ## What the loops do differently
 

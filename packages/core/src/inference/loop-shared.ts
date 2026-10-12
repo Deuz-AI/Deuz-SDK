@@ -3772,11 +3772,17 @@ function recalledAlready(messages: Message[]): boolean {
  * Every other model keeps the 2.2 placement: the block is spliced into the
  * leading system turn at the model-call site only, and the transcript stays
  * recall-free.
+ *
+ * `model` is the one the run starts with, on every leg (2.3): a leg that
+ * resumes as a handoff target keeps the first leg's placement, so the target
+ * reads its recall where it did before the break — the splice in its system,
+ * or the one message already in the history — and no leg holds both.
  */
 export async function planRecall(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
   messages: Message[],
+  /** The run's first model (`options.model`), not the active agent's. */
   model: LanguageModel,
   ob?: ExecuteExtras['observe'],
   /** The leg resumes a durable run from its checkpoint. */

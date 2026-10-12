@@ -886,13 +886,15 @@ export function runStreamToolLoop(
       // (see `planRecall`); elsewhere it is spliced into the system context AT
       // THE CALL SITE only — the canonical history (and so checkpoints + chat
       // persistence) never bakes the block in, and resume legs cannot
-      // double-inject it.
+      // double-inject it. The run's first model decides which, on every leg: a
+      // leg that resumes as a handoff target reads its recall where the first
+      // leg put it.
       // Its observation parents under the RUN span (no step is open yet).
       const recall = await planRecall(
         options,
         deps,
         messages,
-        active?.model ?? options.model,
+        options.model,
         observeCtx,
         resumeFrom !== undefined,
       );
