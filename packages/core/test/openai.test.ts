@@ -8,7 +8,12 @@ import { getCapabilities } from '../src/core/registry';
 import { withCapabilityOverride } from '../src/internal/config-symbol';
 import { InvalidRequestError } from '../src/errors';
 import { sseResponse, sseEvents, mockFetch, mockFetchSequence } from './fixtures/sse';
-import { responsesTurn, type ResponsesTurn } from './fixtures/provider-finish';
+import {
+  chatTurn,
+  responsesTurn,
+  type ChatTurn,
+  type ResponsesTurn,
+} from './fixtures/provider-finish';
 import type { JSONSchema } from '../src/types/schema';
 import type { Logger } from '../src/types/deps';
 import type { LanguageModel } from '../src/types/model';
@@ -663,4 +668,39 @@ describe('Responses finish reasons (2.3, K4)', () => {
       expect(await finishOf({ call, incomplete })).toBe(afterCall);
     },
   );
+});
+
+// ===================================================================
+// 2.3 (K4) — how a streamed Chat Completions turn ends. The mapping predates
+// 2.3 and had no fixture; the `finish_reason` values come from openai 7.32's
+// `ChatCompletionChunk`. Not live-verified.
+// ===================================================================
+
+describe('Chat Completions finish reasons (2.3, K4)', () => {
+  async function finishOf(turn: ChatTurn): Promise<string> {
+    const { fetch } = consume([chatTurn(turn)]);
+    const result = streamChat({
+      model: createOpenAI({ apiKey: 'k', fetch })('gpt-5.5'),
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    for await (const _ of result.fullStream) void _;
+    return result.finishReason;
+  }
+
+  it.each([
+    ['stop', 'stop'],
+    ['length', 'length'],
+    ['content_filter', 'content_filter'],
+    ['tool_calls', 'tool_calls'],
+    // Deprecated in openai 7.32: still a call.
+    ['function_call', 'tool_calls'],
+  ] as const)('finish_reason %s ends a streamed turn with %s', async (finish, expected) => {
+    expect(await finishOf({ text: 'Partial', finish })).toBe(expected);
+  });
+
+  it('a call the filter or the output limit cut off is not hidden behind tool_calls', async () => {
+    const call = { args: '{"city": "Ro' };
+    expect(await finishOf({ call, finish: 'content_filter' })).toBe('content_filter');
+    expect(await finishOf({ call, finish: 'length' })).toBe('length');
+  });
 });

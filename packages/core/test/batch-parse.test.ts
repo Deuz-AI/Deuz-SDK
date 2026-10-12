@@ -366,6 +366,20 @@ describe('parseReply: Chat Completions', () => {
     }
   });
 
+  // 2.3 (K4): the values of openai 7.32's `finish_reason`, the same as on the stream.
+  it.each(['stop', 'length', 'tool_calls', 'content_filter', 'function_call'])(
+    'maps finish reason %s exactly as the streaming adapter does',
+    async (finish_reason) => {
+      const stream = await streamFinish(openaiCompatibleAdapter, [
+        { data: { choices: [{ index: 0, delta: { content: 'x' }, finish_reason }] } },
+        { data: '[DONE]' },
+      ]);
+      const choices = [{ index: 0, message: { role: 'assistant', content: 'x' }, finish_reason }];
+      const reply = parseReply('chat_completions', completion({}, { choices }));
+      expect(reply.finishReason).toBe(stream.finishReason);
+    },
+  );
+
   it('bills usage exactly as the streaming adapter does', async () => {
     const usage = {
       prompt_tokens: 100,

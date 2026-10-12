@@ -95,3 +95,40 @@ export function responsesTurn(turn: ResponsesTurn): string {
   });
   return sseEvents(events);
 }
+
+/** What one streamed Chat Completions turn carries, in this order. */
+export interface ChatTurn {
+  /** `delta.content` text. */
+  text?: string;
+  /** A `get_weather` tool call and its (possibly cut-off) argument text. */
+  call?: { args: string };
+  /** The last choice's `finish_reason`. */
+  finish: string;
+}
+
+/**
+ * One streamed Chat Completions turn (openai 7.32 `ChatCompletionChunk`). The
+ * content deltas carry `refusal: null`, which the type allows; the usage chunk
+ * comes last (`stream_options.include_usage`).
+ */
+export function chatTurn(turn: ChatTurn): string {
+  const chunk = (choices: unknown[], extra: Record<string, unknown> = {}) => ({
+    data: { id: 'chatcmpl-1', object: 'chat.completion.chunk', created: 0, choices, ...extra },
+  });
+  const delta = (value: Record<string, unknown>, finish_reason: string | null = null) =>
+    chunk([{ index: 0, delta: value, finish_reason }]);
+  const events: { data: unknown }[] = [delta({ role: 'assistant', content: '', refusal: null })];
+  if (turn.text !== undefined) events.push(delta({ content: turn.text, refusal: null }));
+  if (turn.call) {
+    const fn = { name: 'get_weather', arguments: '' };
+    events.push(
+      delta({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: fn }] }),
+    );
+    events.push(delta({ tool_calls: [{ index: 0, function: { arguments: turn.call.args } }] }));
+  }
+  events.push(delta({}, turn.finish));
+  events.push(chunk([], { usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }), {
+    data: '[DONE]',
+  });
+  return sseEvents(events);
+}

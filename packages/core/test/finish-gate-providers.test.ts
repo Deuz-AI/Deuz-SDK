@@ -1,22 +1,23 @@
 /**
  * finish-gate-providers.test.ts (2.3, K4) — the finish-reason gate on the
- * Gemini native and OpenAI Responses wires. A turn that streamed a tool call
- * and was then stopped by the provider's filter must end with
- * `content_filter`, so neither loop and no native run dispatches the call
+ * Gemini native, OpenAI Responses and Chat Completions wires. A turn that
+ * streamed a tool call and was then stopped by the provider's filter must end
+ * with `content_filter`, so neither loop and no native run dispatches the call
  * (`finish-gate.test.ts` covers the Anthropic wire).
  *
  * Before K4, a Gemini call masked its turn's SAFETY stop (the STOP-bug guard
  * won), and a Responses turn cut off by its content filter ended with
- * `'tool_calls'`: the gate let the call run. Wire shapes follow
- * `@google/genai` 2.28.0 and `openai` 7.32.0 types; not live-verified.
+ * `'tool_calls'`: the gate let the call run. Chat Completions' `content_filter`
+ * was already mapped, without a fixture. Wire shapes follow `@google/genai`
+ * 2.28.0 and `openai` 7.32.0 types; not live-verified.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { generateText, streamChat } from '../src/index';
 import { createGoogleNative } from '../src/google';
-import { createOpenAIResponses } from '../src/openai';
+import { createOpenAI, createOpenAIResponses } from '../src/openai';
 import { runAgent } from '../src/agent-run';
 import { mockFetchSequence, sseResponse } from './fixtures/sse';
-import { GEMINI_CALL, geminiTurn, responsesTurn } from './fixtures/provider-finish';
+import { GEMINI_CALL, chatTurn, geminiTurn, responsesTurn } from './fixtures/provider-finish';
 import type { LanguageModel } from '../src/types/model';
 import type { Message } from '../src/types/message';
 import type { StreamPart, ToolCallDeltaPart } from '../src/types/stream';
@@ -39,6 +40,11 @@ const WIRES: Record<string, Wire> = {
     filtered: responsesTurn({ call: { args: '{"city": "Ro' }, incomplete: 'content_filter' }),
     answer: responsesTurn({ text: 'done' }),
     model: (fetch) => createOpenAIResponses({ apiKey: 'k', fetch })('gpt-5.4'),
+  },
+  'OpenAI Chat Completions (finish_reason: content_filter)': {
+    filtered: chatTurn({ call: { args: '{"city": "Ro' }, finish: 'content_filter' }),
+    answer: chatTurn({ text: 'done', finish: 'stop' }),
+    model: (fetch) => createOpenAI({ apiKey: 'k', fetch })('gpt-5.5'),
   },
 };
 
