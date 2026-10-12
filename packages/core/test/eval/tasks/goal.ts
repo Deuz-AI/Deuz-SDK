@@ -77,7 +77,7 @@ export function digestGoal(on: TaskModel): NonNullable<EvalTaskManifest['run']> 
     wakeups.push(early.reason ?? early.outcome);
     // Two processes run the schedule, each with its own in-memory claim, so
     // both deliver the 09:00 occurrence: the goal's dedupe keeps one.
-    for (const process of ['a', 'b']) {
+    for (const worker of ['a', 'b']) {
       const scheduler = createScheduler({
         schedules: [
           {
@@ -101,7 +101,7 @@ export function digestGoal(on: TaskModel): NonNullable<EvalTaskManifest['run']> 
         ],
       });
       const ticked = await scheduler.tick(DUE + 1_000);
-      context.store[`process-${process}`] = ticked.occurrences.map((entry) => entry.status);
+      context.store[`worker-${worker}`] = ticked.occurrences.map((entry) => entry.status);
     }
     context.store.wakeups = wakeups;
 
@@ -250,8 +250,8 @@ export const scheduledDigest: EvalTaskManifest = {
       check: (_outcome, context) =>
         JSON.stringify(context.store.wakeups) ===
           JSON.stringify(['unchanged', 'applied', 'duplicate']) &&
-        JSON.stringify(context.store['process-a']) === JSON.stringify(['ran']) &&
-        JSON.stringify(context.store['process-b']) === JSON.stringify(['ran']),
+        JSON.stringify(context.store['worker-a']) === JSON.stringify(['ran']) &&
+        JSON.stringify(context.store['worker-b']) === JSON.stringify(['ran']),
     },
     {
       name: 'the digest went to #team once, from the run the goal links',
