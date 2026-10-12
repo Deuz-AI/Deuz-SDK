@@ -6,6 +6,9 @@
  * - `createA2AHandler` serves an agent: `Request` in, `Response` out, with a
  *   task store (`createInMemoryA2ATaskStore` by default) and an executor that
  *   drives each task.
+ * - `createA2AAgentExecutor` is that executor for a native agent run
+ *   (`@deuz-sdk/core/agent`, passed in): a task is a run, `INPUT_REQUIRED` a
+ *   suspended run, a cancellation an abort, the artifact its validated output.
  * - `a2aText` reads the text out of a message or an artifact.
  *
  * Edge-safe (Web APIs only), zero dependencies. NOT LIVE-VERIFIED against
@@ -16,6 +19,18 @@
 export { createA2AClient, fetchAgentCard } from './client';
 export { createA2AHandler } from './handler';
 export { createInMemoryA2ATaskStore } from './task-store';
+export { createA2AAgentExecutor } from './agent';
+export type {
+  A2AAgentEngine,
+  A2AAgentRunOptions,
+  A2AAgentRunContext,
+  A2AAgentExecutorOptions,
+  A2AAgentAction,
+  A2AAgentPendingActions,
+  A2AAgentStopped,
+  A2AAgentFailed,
+  A2AAgentAnswers,
+} from './agent';
 export { a2aText } from './protocol';
 export { A2AError } from './errors';
 export type { A2AErrorKind, A2AErrorOptions } from './errors';
