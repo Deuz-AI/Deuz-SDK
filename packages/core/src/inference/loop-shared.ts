@@ -2563,6 +2563,12 @@ export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDi
  * verdict counts only under the `approvalId` its call was issued with (see
  * {@link approvalIdOf}). A plain leg of a durable run passes the step its stored
  * checkpoint is suspended at ({@link continueStoredRun}).
+ *
+ * The answers go right after the turn's other answers (2.3, F22): a break that
+ * committed a transfer to a Claude 5.x target appended the target's
+ * instructions after the transfer's tool result, and those system messages
+ * were never sent to the model, so the settle's tool message lands before them
+ * and no prefix a thinking block is bound to moves.
  */
 export async function settlePendingApprovals(
   messages: Message[],
@@ -2577,6 +2583,8 @@ export async function settlePendingApprovals(
   approval?: ApprovalScope,
 ): Promise<{
   messages: Message[];
+  /** The appended `{role:'tool'}` turn (not necessarily the last message of `messages`). */
+  toolMessage: Message;
   results: ToolResult[];
   deniedIds: Set<string>;
   denied: DenialMap;
@@ -2590,9 +2598,13 @@ export async function settlePendingApprovals(
   const responses = options.approvalResponses;
   if (!responses) return null;
 
-  // Locate the last assistant turn; only tool messages may follow it.
+  // Locate the last assistant turn; only tool messages may follow it, then the
+  // system messages a break appended for the next leg (see above). The settle's
+  // answers go in at `insertAt`, after the last tool message.
+  let insertAt = messages.length;
+  while (insertAt > 0 && messages[insertAt - 1]!.role === 'system') insertAt--;
   let assistantIndex = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
+  for (let i = insertAt - 1; i >= 0; i--) {
     const role = messages[i]!.role;
     if (role === 'assistant') {
       assistantIndex = i;
@@ -2605,7 +2617,7 @@ export async function settlePendingApprovals(
   if (!Array.isArray(content)) return null;
 
   const answered = new Set<string>();
-  for (let i = assistantIndex + 1; i < messages.length; i++) {
+  for (let i = assistantIndex + 1; i < insertAt; i++) {
     const parts = messages[i]!.content;
     if (!Array.isArray(parts)) continue;
     for (const p of parts) if (p.type === 'tool_result') answered.add(p.toolUseId);
@@ -2651,7 +2663,8 @@ export async function settlePendingApprovals(
     : executed;
   const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
   return {
-    messages: [...messages, toolMessage],
+    messages: [...messages.slice(0, insertAt), toolMessage, ...messages.slice(insertAt)],
+    toolMessage,
     results,
     deniedIds,
     denied: plan.denied,

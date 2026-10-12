@@ -795,9 +795,10 @@ export function runStreamToolLoop(
           },
         );
         if (settled) {
-          const settledMessages = settled.messages.slice(messages.length);
-          appended.push(...settledMessages);
-          chatMessages = [...chatMessages, ...settledMessages];
+          // Not the tail of `settled.messages`: a break that committed a handoff
+          // may have left the target's instructions after it (2.3, F22).
+          appended.push(settled.toolMessage);
+          chatMessages = [...chatMessages, settled.toolMessage];
           messages = settled.messages;
           emitGuardrails(settled.guardrails);
           for (const r of settled.results) {

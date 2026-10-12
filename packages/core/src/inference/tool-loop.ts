@@ -444,7 +444,9 @@ export async function runToolLoop(
       );
       if (settled) {
         messages = settled.messages;
-        const toolMessage = settled.messages.at(-1)!;
+        // Not `messages.at(-1)`: a break that committed a handoff may have left
+        // the target's instructions after it (2.3, F22).
+        const toolMessage = settled.toolMessage;
         appended.push(toolMessage);
         chatMessages = [...chatMessages, toolMessage];
         logGuardrailParts(guardrailLog, settled.guardrails);
