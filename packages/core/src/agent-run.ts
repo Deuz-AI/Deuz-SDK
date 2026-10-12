@@ -1012,6 +1012,35 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       const onToolOutput = (output: NativeToolOutput): void => {
         events.push({ type: 'tool-output', ...output });
       };
+      /**
+       * Save `messages`, the history of the step in flight, as the run's
+       * running checkpoint at its current step index, so a resume settles the
+       * step's open calls from there without another model call.
+       */
+      const saveInFlight = async (
+        messages: Message[],
+        handoff = envelope.checkpoints[envelope.runId]?.handoff,
+      ): Promise<void> => {
+        envelope.messages = [...messages];
+        if (envelope.transcript) nativeChat!.foldHistory(envelope.transcript, envelope.messages);
+        const previous = envelope.checkpoints[envelope.runId];
+        envelope.checkpoints[envelope.runId] = {
+          version: 1,
+          runId: envelope.runId,
+          stepId: `${envelope.runId}#${previous?.stepIndex ?? 0}`,
+          stepIndex: previous?.stepIndex ?? 0,
+          status: 'running',
+          messages: envelope.messages,
+          usage: envelope.usage,
+          createdAt: resolveDependencies(options.deps).clock.now(),
+          ...(handoff ? { handoff } : {}),
+          // The run's approval-request count (2.3) outlives every checkpoint.
+          ...(previous?.approvalRequestCounts
+            ? { approvalRequestCounts: previous.approvalRequestCounts }
+            : {}),
+        };
+        await persist();
+      };
       // One receipt boundary for every tool the run can execute: local, handoff
       // targets and (2.3, F01) MCP tools, refreshed catalogs included.
       const receipts: NativeToolReceipts = {
@@ -1022,27 +1051,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           envelope.toolResults ??= {};
           receipt.modelStep ??= envelope.modelSteps;
           envelope.toolResults[JSON.stringify([receipt.modelStep, receipt.toolCallId])] = receipt;
-          envelope.messages = [...ctx.messages];
-          if (envelope.transcript) nativeChat!.foldHistory(envelope.transcript, envelope.messages);
           // Persist the in-flight tool-call history as well as its receipt so
           // canonical resume can settle that exact ID without another model call.
-          const previous = envelope.checkpoints[envelope.runId];
-          envelope.checkpoints[envelope.runId] = {
-            version: 1,
-            runId: envelope.runId,
-            stepId: `${envelope.runId}#${previous?.stepIndex ?? 0}`,
-            stepIndex: previous?.stepIndex ?? 0,
-            status: 'running',
-            messages: envelope.messages,
-            usage: envelope.usage,
-            createdAt: resolveDependencies(options.deps).clock.now(),
-            ...(previous?.handoff ? { handoff: previous.handoff } : {}),
-            // The run's approval-request count (2.3) outlives every checkpoint.
-            ...(previous?.approvalRequestCounts
-              ? { approvalRequestCounts: previous.approvalRequestCounts }
-              : {}),
-          };
-          await persist();
+          await saveInFlight(ctx.messages);
         },
       };
       common.tools = await prepareAgentTools(
@@ -1653,6 +1664,15 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                   const receipt = receipts.load(call.toolCallId);
                   return receipt !== undefined && OUTCOME_STAGES.has(receipt.stage);
                 },
+                // What the resume settle answered (2.3) is saved before the leg's
+                // first model call, at the same step: a denial or a client result
+                // survives a failure of that call, and the turn is never settled
+                // again. A stored turn left open is therefore always one of the
+                // run's current model step, where its receipts are found.
+                settled: async ({ messages, usage, handoff }) => {
+                  envelope.usage = usage;
+                  await saveInFlight(messages, handoff);
+                },
               },
             );
             for await (const part of inner.fullStream) {
@@ -1695,8 +1715,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             ) {
               await persist();
               // A drain (2.3) waits for the step boundary: the retried call is
-              // part of the step in flight, and only that step's checkpoint
-              // records the calls a resumed leg settled before it.
+              // part of the step in flight.
               if (!(await checkLimit())) return;
               continue;
             }

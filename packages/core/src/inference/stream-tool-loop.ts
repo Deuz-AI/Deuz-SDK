@@ -187,6 +187,19 @@ export interface StreamToolLoopInternal {
    * receipt and never gates it again (see `settlePendingApprovals`).
    */
   recorded?: (call: ToolCall) => boolean;
+  /**
+   * Native runs (2.3): records what the resume settle answered, before the
+   * leg's first model call. Called once the settle answered the pending calls
+   * (and applied a transfer among them), with the history, the run's usage and
+   * its active handoff; the runner saves them as the run's checkpoint. A
+   * denial, a client result or an answer from a receipt then survives a failure
+   * of that call, and no later resume settles the turn again.
+   */
+  settled?: (state: {
+    messages: Message[];
+    usage: Usage;
+    handoff?: { to: string; count: number };
+  }) => Promise<void>;
 }
 
 export interface StreamToolLoopSnapshot {
@@ -854,6 +867,12 @@ export function runStreamToolLoop(
               (r) => !settled.deniedIds.has(r.toolCallId) && !handoffIds.has(r.toolCallId),
             ),
           );
+          // A native run records the answers before its first model call (2.3).
+          await internal?.settled?.({
+            messages,
+            usage: withTotal(durableUsage(durable, totalUsage)),
+            ...(durable?.handoff ? { handoff: durable.handoff } : {}),
+          });
         }
       } catch (err) {
         if (!(err instanceof SubAgentSuspension)) throw err;

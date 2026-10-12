@@ -2,14 +2,19 @@
  * native-receipt-settle.test.ts (2.3) — a resume answers a pending call whose
  * effect receipt already records its outcome from that receipt.
  *
- * A native run writes a call's receipt before the step checkpoint that answers
- * the call. When the run stops in between (the process dies during the next
- * model call, a store write fails, or a sub-agent beside the call suspends),
+ * A native run writes a call's receipt before the checkpoint that answers the
+ * call. When the run stops in between (the process dies while other calls of
+ * the step run, a store write fails, or a sub-agent beside the call suspends),
  * the next resume finds the call unanswered in the history and settles it
  * again. That settle ran the approval gate again: a call that had waited for
  * an approval was answered "Tool call denied. Reason: No approval response."
  * unless the caller passed the stored verdict again, although its effect had
  * landed and its result was recorded.
+ *
+ * A resume also saves what its settle answered before its next model call, so
+ * a process that dies during that call leaves nothing to settle again (W3
+ * review V1-1): the stored run's model step has moved on by then, and the
+ * receipts of the settled calls are keyed by the step that issued them.
  */
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -131,7 +136,8 @@ async function approvedThenCrashed(
     session: { ...session, store: failingAfter(store, stage) },
     approvalResponses: verdicts,
   });
-  // The save that fails is the budget reservation of the next model call.
+  // The save that fails is the one that records the settle's answers, before
+  // the next model call: the process dies inside the resume's settle.
   expect(crashed.status).toBe('failed');
   expect(stages(await store.load('r'))).toEqual([stage]);
   // The stored history still ends on the call, unanswered.
@@ -436,6 +442,196 @@ describe('a pending call whose receipt holds an outcome settles from it (2.3)', 
           'Tool call c1 (charge) already ran, so its recorded outcome answers it; the denial passed for it was ignored.',
       },
     ]);
+  });
+});
+
+/**
+ * The process dies during the model call that follows the save recording
+ * `stage` (`<id>:<stage>`; without one, the leg's first save): that call's
+ * budget reservation, the first save at a later model step, lands, and every
+ * save after it fails.
+ */
+function diesDuringNextModelCall(inner: AgentRunStore, stage?: string): AgentRunStore {
+  let step: number | undefined;
+  let dead = false;
+  return {
+    load: (id) => inner.load(id),
+    save(envelope) {
+      if (dead) throw new Error('process died');
+      if (step === undefined) {
+        if (stage === undefined || stages(envelope).includes(stage)) step = envelope.modelSteps;
+      } else if (envelope.modelSteps > step) dead = true;
+      return inner.save(envelope);
+    },
+  };
+}
+
+describe('the resume settle is recorded before the next model call (2.3)', () => {
+  /** An approved `charge` runs in the resume's settle; the process dies during the next model call. */
+  async function approvedThenDiedMidCall() {
+    const store = createInMemoryAgentRunStore();
+    const effects: string[] = [];
+    const tools: AgentToolSet = {
+      charge: {
+        parameters,
+        needsApproval: true,
+        execute: () => {
+          effects.push('charge');
+          return 'charged';
+        },
+      },
+    };
+    const { model, fetch } = counted([chargeCall, { text: 'done' }, { text: 'done' }]);
+    const options = { model, prompt: 'charge', tools };
+    const session = { store, runId: 'mid-call', scope: 't' };
+    const first = await runAgent({ ...options, session });
+    expect(first.status).toBe('suspended');
+    const verdicts = approveAll(first);
+    const crashed = await resumeAgent({
+      ...options,
+      session: { ...session, store: diesDuringNextModelCall(store, 'c1:completed') },
+      approvalResponses: verdicts,
+    });
+    expect(crashed.status).toBe('failed');
+    // The leg reached its next model call, and the stored run is at that step.
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect((await store.load('mid-call'))!.modelSteps).toBe(2);
+    expect(effects).toEqual(['charge']);
+    return { effects, fetch, options, session, verdicts };
+  }
+
+  it('answers an approved call with its recorded result, without the verdict', async () => {
+    const { effects, fetch, options, session } = await approvedThenDiedMidCall();
+    const resumed = await resumeAgent({ ...options, session });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(toolMessages(fetch, 2)).toEqual(['charged']);
+    expect(effects).toEqual(['charge']);
+  });
+
+  it('never runs the approved call again when its verdict is passed again', async () => {
+    const { effects, fetch, options, session, verdicts } = await approvedThenDiedMidCall();
+    const resumed = await resumeAgent({ ...options, session, approvalResponses: verdicts });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(toolMessages(fetch, 2)).toEqual(['charged']);
+    expect(effects).toEqual(['charge']);
+  });
+
+  it('never runs an ungated call that waited beside a client call again', async () => {
+    const store = createInMemoryAgentRunStore();
+    const effects: string[] = [];
+    const tools: AgentToolSet = {
+      ship: {
+        parameters,
+        execute: () => {
+          effects.push('ship');
+          return 'shipped';
+        },
+      },
+      ask: { parameters },
+    };
+    const { model, fetch } = counted([
+      {
+        toolCalls: [
+          { toolName: 'ship', id: 's1', args: {} },
+          { toolName: 'ask', id: 'a1', args: {} },
+        ],
+      },
+      { text: 'done' },
+      { text: 'done' },
+    ]);
+    const options = { model, prompt: 'go', tools };
+    const session = { store, runId: 'ungated', scope: 't' };
+    // The server call waits for the batch's client call: it runs on the resume.
+    expect((await runAgent({ ...options, session })).status).toBe('suspended');
+    expect(effects).toEqual([]);
+    const crashed = await resumeAgent({
+      ...options,
+      session: { ...session, store: diesDuringNextModelCall(store, 's1:completed') },
+      clientToolResults: [{ toolCallId: 'a1', output: 'yes' }],
+    });
+    expect(crashed.status).toBe('failed');
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(effects).toEqual(['ship']);
+    const resumed = await resumeAgent({ ...options, session });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(toolMessages(fetch, 2)).toEqual(['shipped', 'yes']);
+    expect(effects).toEqual(['ship']);
+  });
+
+  it('keeps the model step an idempotent tool keys its write by', async () => {
+    const store = createInMemoryAgentRunStore();
+    const board = new Map<string, string>();
+    const tools: AgentToolSet = {
+      note: {
+        parameters,
+        needsApproval: true,
+        replay: 'idempotent',
+        execute: (_args, context) => {
+          board.set(`${context.toolCallId}@${context.modelStep}`, 'noted');
+          return 'noted';
+        },
+      },
+    };
+    const { model } = counted([
+      { toolCalls: [{ toolName: 'note', id: 'n1', args: {} }] },
+      { text: 'done' },
+      { text: 'done' },
+    ]);
+    const options = { model, prompt: 'note', tools };
+    const session = { store, runId: 'keyed', scope: 't' };
+    const first = await runAgent({ ...options, session });
+    const crashed = await resumeAgent({
+      ...options,
+      session: { ...session, store: diesDuringNextModelCall(store, 'n1:completed') },
+      approvalResponses: approveAll(first),
+    });
+    expect(crashed.status).toBe('failed');
+    const resumed = await resumeAgent({
+      ...options,
+      session,
+      approvalResponses: approveAll(first),
+    });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect([...board.keys()]).toEqual(['n1@1']);
+  });
+
+  it('keeps a denial, so the next resume goes on from it without the verdict', async () => {
+    const store = createInMemoryAgentRunStore();
+    const effects: string[] = [];
+    const tools: AgentToolSet = {
+      charge: {
+        parameters,
+        needsApproval: true,
+        execute: () => {
+          effects.push('charge');
+          return 'charged';
+        },
+      },
+    };
+    const { model, fetch } = counted([chargeCall, { text: 'lost' }, { text: 'not charged' }]);
+    const options = { model, prompt: 'charge', tools };
+    const session = { store, runId: 'denied', scope: 't' };
+    const first = await runAgent({ ...options, session });
+    expect(first.status).toBe('suspended');
+    // The denial executes nothing, so no receipt records it: the settle's own
+    // save does, before the next model call, during which the process dies.
+    const crashed = await resumeAgent({
+      ...options,
+      session: { ...session, store: diesDuringNextModelCall(store) },
+      approvalResponses: approveAll(first).map((verdict) => ({ ...verdict, approved: false })),
+    });
+    expect(crashed.status).toBe('failed');
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const stored = (await store.load('denied'))!;
+    expect(stored.checkpoints.denied).toMatchObject({ status: 'running' });
+    expect(stored.checkpoints.denied!.pendingApprovals).toBeUndefined();
+    // No verdict now: the run neither waits for one nor denies the call again.
+    const resumed = await resumeAgent({ ...options, session });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'not charged' });
+    expect(effects).toEqual([]);
+    const denials = JSON.stringify(toolMessages(fetch, 2));
+    expect(denials).toContain('Tool call denied.');
+    expect(denials).not.toContain(DENIED);
   });
 });
 

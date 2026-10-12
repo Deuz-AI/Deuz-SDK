@@ -303,10 +303,11 @@ receipts can reuse their result. These receipts do
 not provide exactly-once execution across an external service and the local
 checkpoint transaction.
 
-A receipt is saved before the step checkpoint that answers its call, so a run can
-stop in between: the process dies during the next model call, a store write fails,
-or a sub-agent called in the same step suspends on its own approval. The next resume
-then finds the call unanswered. Since 2.3 a call whose receipt records an outcome
+A receipt is saved before the checkpoint that answers its call, so a run can stop
+in between: the process dies while other calls of the step still run, the store
+fails the write that records the step, or a sub-agent called in the same step
+suspends on its own approval. The next resume then finds the call unanswered.
+Since 2.3 a call whose receipt records an outcome
 (`executed`, `completed`, `failed`, or a validation or projection failure, an
 outcome recorded with `reconciledToolResults` included) is answered from that
 receipt, exactly like a call that needs no approval. The tool does not run again,
@@ -323,6 +324,15 @@ client tool's call keeps its own rule: a resume answers it only from the
 `clientToolResults` it is given for the run's pending calls, so a client call
 whose result an interrupted resume had already recorded is answered
 `Tool call denied. Reason: No result provided for this client tool.`
+
+A resume saves what its settle answered (each call's result, error, denial or
+client result) as the run's checkpoint before its first model call (2.3). A
+failure of that model call, or of any later write, then never leaves the same
+calls to settle again: the next resume, a `retryFailed` one included, goes on
+from those answers and needs no verdict or client result again. Before 2.3 a
+process that died during that model call left the calls unanswered: the next
+resume denied an approved call that had run, or ran it again, and ran a call
+that needs no approval again.
 
 ### Idempotent tools
 
@@ -386,6 +396,9 @@ What a resume does depends on where the store failed:
   recorded result; the tool does not run again. Since 2.3 this holds for a call
   that waited for an approval too: the recorded result answers it without its
   verdict.
+- **After a resume settled the calls** (the next model call or a later save).
+  Since 2.3 the settle's answers are saved before that model call, so the next
+  resume goes on from them: nothing is settled, run or denied again.
 
 ```ts
 import { createInMemoryAgentRunStore, resumeAgent } from '@deuz-sdk/core/agent';
@@ -457,7 +470,9 @@ A run that was cancelled, lost its lease or ran out of time records none. Resume
 a run with a transient cause with `retryFailed: true` and it goes on from its
 last checkpoint, in the phase it failed in, after every check of a resume:
 completed calls answer from their receipts and never run again, and an unknown
-effect still stops it for reconciliation. The failed call stays counted, as a
+effect still stops it for reconciliation. The verdicts and client results that
+the failed leg applied before the call are part of that checkpoint, so the retry
+needs none of them again. The failed call stays counted, as a
 model step (and, when it was the final answer, as one of the run's
 `maxOutputAttempts`, as after a crash) and, while its outcome is unknown, in the
 accounting at its estimate. The retried call is reserved on its own, so nothing
