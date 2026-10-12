@@ -9,6 +9,7 @@ import type {
   AgentRunStore,
   AgentStream,
   AgentTool,
+  AgentToolReceipt,
   AgentValidation,
 } from './types/agent-run';
 import type { ChatStore } from './chat';
@@ -158,6 +159,41 @@ function positiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1)
     throw new TypeError(`${name} must be a positive integer.`);
   return value;
+}
+
+/** An outcome a caller found for a call whose effect was unknown (2.3). */
+type ReconciledOutcome = NonNullable<AgentRunOptions['reconciledToolResults']>[number];
+
+/**
+ * The outcomes `reconciledToolResults` records (2.3), by call ID: only for the
+ * run's unknown effects, each once, and never for a call `retryToolCallIds`
+ * runs again. Anything else is a TypeError, raised before anything is written.
+ */
+function reconciledOutcomes(
+  entries: unknown,
+  unknownEffects: readonly AgentToolReceipt[],
+  retryToolCallIds: readonly string[] | undefined,
+): Map<string, ReconciledOutcome> {
+  const outcomes = new Map<string, ReconciledOutcome>();
+  if (entries === undefined) return outcomes;
+  if (!Array.isArray(entries))
+    throw new TypeError('reconciledToolResults must be an array of { toolCallId, output }.');
+  for (const entry of entries as unknown[]) {
+    const id = (entry as { toolCallId?: unknown } | null)?.toolCallId;
+    if (typeof id !== 'string' || !id)
+      throw new TypeError('reconciledToolResults: every entry needs a non-empty toolCallId.');
+    if (outcomes.has(id)) throw new TypeError(`reconciledToolResults lists ${id} more than once.`);
+    if (retryToolCallIds?.includes(id))
+      throw new TypeError(
+        `reconciledToolResults and retryToolCallIds both list ${id}: a call is either recorded or run again.`,
+      );
+    if (!unknownEffects.some((receipt) => receipt.toolCallId === id))
+      throw new TypeError(
+        `reconciledToolResults: ${id} is not a call of this run whose effect is unknown.`,
+      );
+    outcomes.set(id, entry as ReconciledOutcome);
+  }
+  return outcomes;
 }
 
 /** Newer shared ledgers are valid; replacing persisted accounting with fresh counters is not. */
@@ -1003,6 +1039,26 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         }
         clientIds.add(clientResult.toolCallId);
       }
+      // A local tool shadows an MCP tool of the same name, as in the loop's merge.
+      const replayOf = (name: string): AgentTool['replay'] =>
+        options.tools && Object.hasOwn(options.tools, name)
+          ? options.tools[name]!.replay
+          : nativeMcp?.replayOf(name);
+      // The calls whose effect is unknown: each started and its outcome was
+      // never recorded. The policy the receipt recorded (2.3) is that of the tool
+      // that ran the call, a handoff target's own included. Older receipts have
+      // none. An idempotent call simply runs again.
+      const unknownEffects = Object.values(envelope.toolResults ?? {}).filter(
+        (receipt) =>
+          receipt.stage === 'executing' &&
+          !(receipt.idempotent ?? replayOf(receipt.toolName) === 'idempotent'),
+      );
+      // The outcomes the caller found in the systems those effects touched (2.3).
+      const reconciled = reconciledOutcomes(
+        options.reconciledToolResults,
+        unknownEffects,
+        options.retryToolCallIds,
+      );
       if (
         resume &&
         pendingCheckpoint?.status === 'suspended' &&
@@ -1032,25 +1088,22 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         repairable = true;
         return;
       }
-      // A local tool shadows an MCP tool of the same name, as in the loop's merge.
-      const replayOf = (name: string): AgentTool['replay'] =>
-        options.tools && Object.hasOwn(options.tools, name)
-          ? options.tools[name]!.replay
-          : nativeMcp?.replayOf(name);
-      const unreconciled = Object.values(envelope.toolResults ?? {}).filter(
-        (receipt) =>
-          receipt.stage === 'executing' &&
-          // The policy the receipt recorded (2.3) is that of the tool that ran
-          // the call, a handoff target's own included. Older receipts have none.
-          !(receipt.idempotent ?? replayOf(receipt.toolName) === 'idempotent') &&
-          !options.retryToolCallIds?.includes(receipt.toolCallId),
-      );
-      if (resume && unreconciled.length) {
+      if (
+        resume &&
+        unknownEffects.some(
+          (receipt) =>
+            !options.retryToolCallIds?.includes(receipt.toolCallId) &&
+            !reconciled.has(receipt.toolCallId),
+        )
+      ) {
         // This is a recoverable interruption, so do not replace the checkpoint
         // with a terminal record that would prevent an explicit reconciliation.
         // Which calls are unknown is part of the result (2.3), and each is
-        // reported on the stream as an unknown effect.
-        for (const receipt of unreconciled) {
+        // reported on the stream as an unknown effect. A stop writes nothing,
+        // so it names every call the store still holds as unknown, also those
+        // this resume would have retried or reconciled: the next resume must
+        // settle them all.
+        for (const receipt of unknownEffects) {
           emitPart(
             {
               type: 'tool-state',
@@ -1066,7 +1119,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           ...base(),
           status: 'stopped',
           reason: 'tool-reconciliation-required',
-          unknownEffects: structuredClone(unreconciled),
+          unknownEffects: structuredClone(unknownEffects),
         };
         settledOutcome = outcome;
         return;
@@ -1107,6 +1160,26 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         });
       }
       if (clientResults.length) envelope.pendingClientCalls = [];
+      // A reconciled effect (2.3) landed: its receipt takes the outcome the
+      // caller found, so the step goes on from it as from a recorded raw result
+      // (validated and projected like the tool's own) and the call never runs
+      // again. One that failed there answers the call with its error.
+      for (const [key, receipt] of Object.entries(envelope.toolResults ?? {})) {
+        const found =
+          receipt.stage === 'executing' ? reconciled.get(receipt.toolCallId) : undefined;
+        if (!found) continue;
+        envelope.toolResults![key] = found.isError
+          ? {
+              ...receipt,
+              stage: 'failed',
+              error:
+                typeof found.output === 'string'
+                  ? found.output
+                  : (JSON.stringify(found.output) ?? String(found.output)),
+              reconciled: true,
+            }
+          : { ...receipt, stage: 'executed', rawResult: found.output, reconciled: true };
+      }
       // An accepted catalog change (2.3) is recorded by this first write,
       // before any model call, and reported like a hot refresh's.
       if (acceptedCatalog) {

@@ -140,7 +140,10 @@ export type AgentResult<T = string> = AgentResultBase &
          * calls whose effect is unknown — each started (stage `'executing'`) and
          * its outcome was never recorded. Check each effect in the system it
          * touched, then resume with `retryToolCallIds` for the ones to run
-         * again; a tool declared `replay: 'idempotent'` runs again by itself.
+         * again and `reconciledToolResults` for the ones that landed; a tool
+         * declared `replay: 'idempotent'` runs again by itself. Every call the
+         * store still holds as unknown is listed, also one the stopped resume
+         * tried to settle: settle them all in one resume.
          */
         unknownEffects?: AgentToolReceipt[];
       }
@@ -407,6 +410,12 @@ export interface AgentToolReceipt {
    * none; its tool is then looked up by name.
    */
   idempotent?: boolean;
+  /**
+   * The outcome was recorded by `reconciledToolResults` (2.3): the caller found
+   * it in the system the effect touched after the run lost track of it; the
+   * tool itself never reported it.
+   */
+  reconciled?: boolean;
   rawResult?: unknown;
   modelOutput?: unknown;
   error?: string;
@@ -594,6 +603,20 @@ export type AgentRunOptions<T = string> = Omit<
   fallbackModels?: LanguageModel[];
   /** Explicitly reconcile interrupted effects before permitting these call IDs to execute again. */
   retryToolCallIds?: readonly string[];
+  /**
+   * Record the outcome of an effect that landed (2.3), supplied only on
+   * resume: for each call the run stopped on with reason
+   * `'tool-reconciliation-required'` that you checked in the system it touched.
+   * The receipt takes `output` as the call's raw result (marked `reconciled`),
+   * and the step goes on from it exactly as from a recorded result: validated
+   * and projected like the tool's own, and the call never runs again. With
+   * `isError` the call is answered with `output` as its error (a string, or
+   * JSON for any other value). Only the run's unknown effects are accepted,
+   * each once and never also in `retryToolCallIds`; anything else fails the
+   * resume with a TypeError before anything is written. A resume that leaves
+   * an unknown effect unsettled stops again and records nothing.
+   */
+  reconciledToolResults?: readonly { toolCallId: string; output: unknown; isError?: boolean }[];
   /** Results for pending client-side tool calls, supplied only on resume. */
   clientToolResults?: readonly { toolCallId: string; output: unknown; isError?: boolean }[];
   verify?: (context: AgentVerifyContext<T>) => AgentVerification | Promise<AgentVerification>;

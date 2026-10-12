@@ -11,7 +11,7 @@ needs: success, false completion, cost, duration, human rescues, repeated
 effects and recovery.
 
 2.3 ships a baseline, not a benchmark. The repository's test suite runs 16
-offline tasks and 20 fault-injection scenarios on every `npm test`. Five
+offline tasks and 21 fault-injection scenarios on every `npm test`. Five
 real-model tasks are defined but were not run for 2.3, so there are no
 real-model results. This page ranks nothing and makes no claim about other SDKs.
 
@@ -258,6 +258,7 @@ accounting, and the documented recovery:
 | After approval | The process dies before the approved call runs; the run waits for the approval again, and the stored verdict answers it | Recovered |
 | After the effect, before the receipt | A resume stops with `tool-reconciliation-required` and names the call; a person checks the system it touched | Contained |
 | The same, for a `replay: 'idempotent'` tool | The call runs again under the same `[modelStep, toolCallId]` identity | Recovered |
+| The same, reconciled | The application finds the charge in the payment system and resumes with `reconciledToolResults`: the step goes on from the recorded outcome, and the charge never runs again | Recovered |
 | After the receipt, before the checkpoint | A resume replays the recorded result; the tool does not run again | Recovered |
 | Mid model stream | No tool call from the broken turn runs; the run fails, and the call stays held at its estimate | Contained |
 | Verifier abort | The run stops as `aborted`, never `completed`; a resume neither verifies nor calls the model again | Contained |
@@ -277,10 +278,11 @@ accounting, and the documented recovery:
 Contained is not a defect in itself: it is the documented safe outcome. Two
 of these cases leave work for a person. A mid-stream transport failure and an
 admission store failure end the native run as `failed`, and a resume returns
-that result, so the work starts again as a new run. A charge that did land
-after an unknown outcome cannot be recorded as completed: the run stays
-stopped, or `retryToolCallIds` runs the call again. A crash between a hot
-refresh and its record is contained under the default
+that result, so the work starts again as a new run. After an unknown outcome
+the run stops for reconciliation until someone checks the payment system; once
+the application records what it found with `reconciledToolResults`, the run
+recovers without a person and without running the charge again. A crash
+between a hot refresh and its record is contained under the default
 `onCatalogChange: 'stop'`; a resume with `'accept'` records the servers' new
 catalog and recovers.
 

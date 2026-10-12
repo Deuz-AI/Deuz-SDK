@@ -80,6 +80,7 @@ describe('fault injection (2.3)', () => {
       'fault/after-approval': 'recovered',
       'fault/after-effect-before-receipt': 'contained',
       'fault/after-effect-before-receipt-idempotent': 'recovered',
+      'fault/after-effect-before-receipt-reconciled': 'recovered',
       'fault/after-receipt-before-checkpoint': 'recovered',
       'fault/mid-model-stream': 'contained',
       'fault/verifier-abort': 'contained',
@@ -105,7 +106,7 @@ describe('fault injection (2.3)', () => {
       // A person checked the payment system after the unknown charge.
       humanRescues: 1,
       requiredApprovals: 1,
-      recovery: { 'not-needed': 0, recovered: 12, rescued: 0, contained: 8, failed: 0 },
+      recovery: { 'not-needed': 0, recovered: 13, rescued: 0, contained: 8, failed: 0 },
     });
   });
 });

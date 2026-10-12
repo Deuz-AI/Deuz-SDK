@@ -262,8 +262,9 @@ turn does not retrieve an unrelated result. Raw results are committed before
 validation/projection; a projection can be retried without repeating the effect.
 An interrupted `executing` receipt cannot establish whether an external system
 accepted the effect. Resume returns `tool-reconciliation-required` until the
-application reconciles that effect and explicitly authorizes the relevant
-`retryToolCallIds`; since 2.3 the stopped result lists those receipts in
+application reconciles that effect: it explicitly authorizes the relevant
+`retryToolCallIds`, or since 2.3 records the outcome it found with
+`reconciledToolResults`. Since 2.3 the stopped result lists those receipts in
 `unknownEffects` (see [When the store fails](#when-the-store-fails)). Completed
 receipts can reuse their result. These receipts do
 not provide exactly-once execution across an external service and the local
@@ -324,9 +325,9 @@ What a resume does depends on where the store failed:
 - **Between the effect and its completed receipt.** The outcome is unknown. The
   resume stops with `tool-reconciliation-required`, writes nothing, and lists the
   receipts in `unknownEffects`. Check each effect in the system it touched, then
-  resume with `retryToolCallIds` for the calls to run again. A
-  `replay: 'idempotent'` tool runs again by itself, under the same
-  `[modelStep, toolCallId]` identity.
+  resume with `retryToolCallIds` for the calls to run again and, since 2.3,
+  `reconciledToolResults` for the calls that landed. A `replay: 'idempotent'`
+  tool runs again by itself, under the same `[modelStep, toolCallId]` identity.
 - **After the completed receipt** (the step checkpoint). A resume replays the
   recorded result; the tool does not run again.
 
@@ -347,17 +348,40 @@ const options = {
   session: { store: createInMemoryAgentRunStore(), runId: 'order-7', scope: 'tenant-a' },
 };
 
+// The payment system keeps its own record of each charge.
+declare const payments: { charged(orderId: string): Promise<boolean> };
+
 // A run interrupted between the effect and its receipt (not shown) resumes here.
 const resumed = await resumeAgent(options);
 if (resumed.status === 'stopped' && resumed.reason === 'tool-reconciliation-required') {
   // Decide per call, from the system the effect touched.
-  const lost = (resumed.unknownEffects ?? []).filter((receipt) => receipt.toolName === 'charge');
-  await resumeAgent({ ...options, retryToolCallIds: lost.map((receipt) => receipt.toolCallId) });
+  const calls = (resumed.unknownEffects ?? []).map((receipt) => receipt.toolCallId);
+  if (await payments.charged('order-7')) {
+    // It landed: record what the tool would have returned. Nothing runs again.
+    const reconciledToolResults = calls.map((toolCallId) => ({ toolCallId, output: 'charged' }));
+    await resumeAgent({ ...options, reconciledToolResults });
+  } else {
+    // It never arrived: run the call once more.
+    await resumeAgent({ ...options, retryToolCallIds: calls });
+  }
 }
 ```
 
 A call that is listed in `retryToolCallIds` runs once more; a completed run never
 runs it again.
+
+A call listed in `reconciledToolResults` (2.3) never runs again. Its receipt takes
+`output` as the call's raw result, marked `reconciled: true`, and the step goes on
+from it exactly as from a result the tool recorded: through the tool's
+`outputSchema`, `validateResult` and `toModelOutput`, to the model. With
+`isError: true` the call is answered with `output` as its error (a string, or JSON
+for any other value). Only the calls in `unknownEffects` are accepted, each once and
+never also in `retryToolCallIds`; anything else fails the resume with a
+`TypeError` before anything is written. Settle every listed call in the same
+resume: a call left unsettled stops the resume again, that stop records nothing,
+and it lists every call the store still holds as unknown. A call that waited for
+an approval is gated again on resume, as for a retry: pass the verdict you stored
+with it, or the call is answered as denied.
 
 ## One path for every tool call
 
@@ -410,7 +434,7 @@ Each way a call can end is distinguishable, on results and on stream parts:
 | `'permission-denied'` | the same places: an `onToolCall` guardrail or the handoff budget refused the call, or `onToolResult` withheld its output. A call the execution policy forbids fails the run; a `tool-state` part names it first |
 | `'approval-denied'` | the same places: the approver said no, or the resume had no valid verdict for the call |
 | `'approval-pending'` | the `awaiting-approval` `tool-state` part; the run suspends with `pendingApprovals` |
-| `'unknown-effect'` | a resume that stops with `tool-reconciliation-required` lists the receipts in `unknownEffects` and streams a `tool-state` part for each |
+| `'unknown-effect'` | a resume that stops with `tool-reconciliation-required` lists the receipts in `unknownEffects` and streams a `tool-state` part for each; `retryToolCallIds` or `reconciledToolResults` settles them |
 | model error | the run fails (`status: 'failed'`, the provider error's `name` and `code`); the stream ends with an `error` part |
 | refusal | the run stops with reason `'refusal'`; `stopDetails` carries the provider's explanation |
 

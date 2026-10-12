@@ -30,6 +30,7 @@ import {
   afterApproval,
   afterEffect,
   afterEffectIdempotent,
+  afterEffectReconciled,
   afterReceipt,
   beforeDispatch,
 } from './tool-boundaries';
@@ -39,6 +40,7 @@ export const faultScenarios: readonly EvalTaskManifest[] = [
   afterApproval,
   afterEffect,
   afterEffectIdempotent,
+  afterEffectReconciled,
   afterReceipt,
   midStream,
   verifierAbort,
