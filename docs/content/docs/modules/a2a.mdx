@@ -434,11 +434,13 @@ The client answers every action in one message, in data parts `{ approvalRespons
 
 The answer's text parts stay in the task's history, but the run gets only the answers: a resumed run takes no new user message. A message with answers for a run that waits for none is refused too.
 
+A message without answers is refused only while the task's status lists what the run waits for. When it does not — a person resumed the run outside A2A (see [stopped and failed runs](#stopped-and-failed-runs)) and it suspended again — the message is taken, no leg runs, and the task asks for input again with a `pending-actions` part listing what the run waits for now.
+
 ### Stopped and failed runs
 
 A stopped run puts its task in `INPUT_REQUIRED`, because a person (the agent's operator) must look at it:
 
-- **`'tool-reconciliation-required'`**: the outcome of the tool calls in `unknownEffects` is unknown, and the run stays resumable. A person checks each effect in the system it touched and settles it with `resumeAgent` and `reconciledToolResults` or `retryToolCallIds` on the task's run, whose run id is the task id and whose scope is [the task's](#identity-and-several-instances) (see [when the store fails](/docs/modules/native-agents#when-the-store-fails)). The client's next message then picks the run up from there; until then, every message finds it stopped again.
+- **`'tool-reconciliation-required'`**: the outcome of the tool calls in `unknownEffects` is unknown, and the run stays resumable. A person checks each effect in the system it touched and settles it with `resumeAgent` and `reconciledToolResults` or `retryToolCallIds` on the task's run, whose run id is the task id and whose scope is [the task's](#identity-and-several-instances) (see [when the store fails](/docs/modules/native-agents#when-the-store-fails)). The client's next message then picks the run up from there: it resumes the run, or, when the person's resume left the run suspended on new approvals or client-tool calls, lists them as `pending-actions`. Until then, every message finds it stopped again.
 - **Every other stop** (`'max-steps'`, `'budget.usd'`, `'refusal'`, `'mcp-catalog-changed'`, …) is final for the run. Messages are refused with `UNSUPPORTED_OPERATION`; cancel the task, or start a new one.
 
 A failed run fails the task. A resume that fails before it begins, having written nothing, refuses the message instead, and the task keeps waiting: `UNSUPPORTED_OPERATION` while another executor holds the run's [lease](#identity-and-several-instances), `INTERNAL_ERROR` otherwise (the run's definition changed, or its store could not be read).

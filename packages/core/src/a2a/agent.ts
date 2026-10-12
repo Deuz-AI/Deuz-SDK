@@ -28,7 +28,14 @@ import type { StopDetails } from '../types/methods';
 import type { ToolApprovalResponse } from '../types/tool';
 import { A2AError } from './errors';
 import { isRecord } from './protocol';
-import type { A2AExecutionContext, A2AExecutor, A2AMessage, A2APart, A2ATaskScope } from './types';
+import type {
+  A2AExecutionContext,
+  A2AExecutor,
+  A2AMessage,
+  A2APart,
+  A2ATask,
+  A2ATaskScope,
+} from './types';
 
 /**
  * The native agent engine: `{ streamAgent, resumeStreamAgent }` from
@@ -447,6 +454,27 @@ function checkAnswers(
   }
 }
 
+/** What a client answers an action by: its kind and ids, and the token it must echo. */
+function actionKey(action: A2AAgentAction): string {
+  return JSON.stringify(
+    action.kind === 'approval'
+      ? [action.kind, action.approvalId, action.toolCallId, action.token ?? null]
+      : [action.kind, action.toolCallId],
+  );
+}
+
+/** The task's status lists exactly these actions: its client has what it needs to answer them. */
+function listsActions(task: A2ATask | undefined, actions: readonly A2AAgentAction[]): boolean {
+  const listed = task?.status.message?.parts.find(
+    (part) => isRecord(part.data) && part.data.type === 'pending-actions',
+  )?.data;
+  if (!isRecord(listed) || !Array.isArray(listed.actions) || !listed.actions.every(isRecord)) {
+    return false;
+  }
+  const keys = (list: readonly A2AAgentAction[]) => JSON.stringify(list.map(actionKey).sort());
+  return keys(listed.actions as A2AAgentAction[]) === keys(actions);
+}
+
 function pendingMessage(actions: A2AAgentAction[]): A2APart[] {
   const data: A2AAgentPendingActions = { type: 'pending-actions', actions };
   return [
@@ -528,7 +556,10 @@ function outputPart(output: unknown, typed: boolean): A2APart {
  * - `suspended`: `INPUT_REQUIRED`, with a data part `{ type:
  *   'pending-actions', actions }`. The next message answers every action in
  *   data parts `{ approvalResponses, clientToolResults }`; answers that do
- *   not fit are refused with `INVALID_PARAMS` before anything is written.
+ *   not fit are refused with `INVALID_PARAMS` before anything is written. So
+ *   is a message without answers, unless the task's status does not list
+ *   what the run waits for (a person resumed the run, and it suspended
+ *   again): the task then lists it, and no leg runs.
  * - `stopped`: `INPUT_REQUIRED` with a data part `{ type: 'stopped', reason
  *   }`: a person must look at the run. A run stopped for reconciliation goes
  *   on at the next message once a person settled its unknown effects; a
@@ -774,6 +805,18 @@ export function createA2AAgentExecutor<T = string>(
     const result = saved.result;
     const pending = pendingOf(saved);
     if (pending) {
+      const actions = pendingActions(pending);
+      // The task's status may not show what the run waits for: a person's
+      // resume left the run suspended again. A message without answers then
+      // learns it, and no leg runs.
+      if (
+        answers.approvals.length === 0 &&
+        answers.results.length === 0 &&
+        !listsActions(ctx.task, actions)
+      ) {
+        await ctx.requireInput(pendingMessage(actions));
+        return;
+      }
       checkAnswers(ctx.taskId, answers, pending);
     } else if (answers.approvals.length > 0 || answers.results.length > 0) {
       throw invalidParams(`Task ${ctx.taskId} is not waiting for answers.`);

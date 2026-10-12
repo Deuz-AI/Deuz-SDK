@@ -871,6 +871,91 @@ describe('createA2AAgentExecutor — stopped and failed runs', () => {
     expect(errors).toEqual([]);
   });
 
+  it('lists what the run waits for once a person’s resume left it suspended again', async () => {
+    const published: unknown[] = [];
+    const options = {
+      ...publisher(
+        [
+          { toolCalls: [{ toolName: 'publish', args: { text: 'one' } }] },
+          { toolCalls: [{ toolName: 'publish', args: { text: 'two' } }] },
+          { text: 'Both published.' },
+        ],
+        published,
+      ),
+      approvalSigner: createApprovalSigner({ secret: 'a2a-test-secret' }),
+    };
+    const { client, store, errors } = serve(options);
+    const asked = (await client.sendMessage('Publish two posts.')).task as A2ATask;
+    const [first] = actionsOf(asked) as Extract<A2AAgentAction, { kind: 'approval' }>[];
+    const session = { store, runId: asked.id, scope: ANONYMOUS };
+
+    // A process dies between the effect and its receipt.
+    const dying: AgentRunStore = {
+      load: (runId) => store.load(runId),
+      save: async (envelope) => {
+        const receipt = Object.values(envelope.toolResults ?? {})[0];
+        if (receipt?.stage === 'completed' || receipt?.stage === 'executed') {
+          throw new Error('the process died');
+        }
+        await store.save(envelope);
+      },
+    };
+    const crashed = await resumeAgent({
+      ...options,
+      session: { ...session, store: dying },
+      approvalResponses: [{ approvalId: first!.approvalId, approved: true, token: first!.token }],
+    });
+    expect(crashed.status).toBe('failed');
+    const stopped = (await client.sendMessage('Is it done?', { taskId: asked.id })).task as A2ATask;
+    expect(dataOf(stopped, 'stopped')).toMatchObject({ reason: 'tool-reconciliation-required' });
+
+    // A person settles the effect; the run goes on and waits for a new approval.
+    const settled = await resumeAgent({
+      ...options,
+      session,
+      reconciledToolResults: [{ toolCallId: 'call_1', output: 'published' }],
+    });
+    expect(settled.status).toBe('suspended');
+    const run = await store.load(asked.id);
+
+    // The client's next message learns what the run waits for now; no leg runs.
+    const now = (await client.sendMessage('And now?', { taskId: asked.id })).task as A2ATask;
+    expect(now.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    const [second] = actionsOf(now) as Extract<A2AAgentAction, { kind: 'approval' }>[];
+    expect(actionsOf(now)).toEqual([
+      expect.objectContaining({ kind: 'approval', toolCallId: 'call_2', token: second?.token }),
+    ]);
+    expect(second?.token).toMatch(/^v1\./);
+    expect(a2aText(now.history?.at(-2))).toBe('And now?');
+    expect(await store.load(asked.id)).toEqual(run);
+
+    // Now that the task lists it, a message that does not answer it is refused...
+    await expect(client.sendMessage('Well?', { taskId: asked.id })).rejects.toMatchObject({
+      reason: 'INVALID_PARAMS',
+      message: expect.stringMatching(/waits for approval of publish \(call_2\)/),
+    });
+    expect(await client.getTask(asked.id)).toEqual(now);
+    // ...and its answer completes the run.
+    const done = (
+      await client.sendMessage(
+        [
+          {
+            data: {
+              approvalResponses: [
+                { approvalId: second!.approvalId, approved: true, token: second!.token },
+              ],
+            },
+          },
+        ],
+        { taskId: asked.id },
+      )
+    ).task as A2ATask;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(a2aText(done.artifacts?.[0])).toBe('Both published.');
+    expect(published).toEqual([{ text: 'one' }, { text: 'two' }]);
+    expect(errors).toEqual([]);
+  });
+
   it('fails the task with a safe message when the run fails', async () => {
     const secret = 'sk-ant-api03-SECRETSECRETSECRET';
     const { client, store } = serve({
