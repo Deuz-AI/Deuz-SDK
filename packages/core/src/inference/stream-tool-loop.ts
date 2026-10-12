@@ -201,6 +201,12 @@ export interface StreamToolLoopInternal {
     handoff?: { to: string; count: number };
   }) => Promise<void>;
   /**
+   * Native runs (2.3): whether a stop condition that fired leaves the run to go
+   * on (a lease drain). Its checkpoint is saved as the running step boundary it
+   * is, not as a completed loop, so `checkpoint.saved` reports what is stored.
+   */
+  resumableStop?: (stoppedBy: string | undefined) => boolean;
+  /**
    * Native runs (2.3): tools only the resume settle sees, over the leg's own.
    * The runner passes its client tools here with an executor that answers a
    * call from the result the resume supplied or a receipt recorded; the loop's
@@ -1844,7 +1850,14 @@ export function runStreamToolLoop(
             });
           }
           if (durable) {
-            await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+            await saveCheckpoint(
+              durable,
+              deps,
+              options,
+              internal?.resumableStop?.(stop.stoppedBy) ? 'running' : 'completed',
+              messages,
+              totalUsage,
+            );
           }
           break;
         }

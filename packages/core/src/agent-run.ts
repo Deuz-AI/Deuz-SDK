@@ -1452,14 +1452,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       let drainStopped = false;
       const checkpointStore: SessionStore = {
         load: (runId) => envelope.checkpoints[runId],
-        save: async (saved) => {
-          // The loop records a stop as a completed checkpoint. A drain's is the
-          // boundary the loop stopped at, so it is stored as the running one a
-          // resume goes on from, as the loop would have saved it (2.3).
-          const checkpoint =
-            drainStopped && saved.runId === envelope.runId && saved.status === 'completed'
-              ? { ...saved, status: 'running' as const }
-              : saved;
+        save: async (checkpoint) => {
           envelope.checkpoints[checkpoint.runId] = structuredClone(checkpoint);
           if (checkpoint.runId === envelope.runId) {
             envelope.messages = checkpoint.messages;
@@ -1755,6 +1748,9 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                 onSnapshot: (value) => {
                   snapshot = value;
                 },
+                // A drain's stop (2.3) leaves the run to go on: the loop saves its
+                // checkpoint as the running step boundary it is.
+                resumableStop: (stoppedBy) => drainStopped && stoppedBy === DRAINED,
                 onCheckpoint: (value) => {
                   // A drain's stop (2.3) is no outcome of the loop, which goes on
                   // on resume: recorded as the step boundary it is.

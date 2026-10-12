@@ -15,6 +15,7 @@ import { createSqliteOpsStore } from '../src/node/ops-sqlite';
 import { createAnthropic } from '../src/anthropic';
 import { createOpenAI } from '../src/openai';
 import { createInMemoryChatStore } from '../src/chat';
+import { createMemoryObserver } from '../src/observe';
 import { createMockModel, type MockResponse } from '../src/testing';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
 import { createDeferred } from '../src/internal/async-iter';
@@ -161,6 +162,35 @@ describe('a drain signal stops a leased native run at its next step boundary (2.
     expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(parked.runs()).toBe(1);
+  });
+
+  it('reports the boundary checkpoint as the running one the store keeps (W3 review V1-3)', async () => {
+    const { leases, store, session, key, clock, advance } = setup();
+    const parked = parkedTool();
+    const observer = createMemoryObserver();
+    const run = runAgent({
+      model: createMockModel({ responses: [...workThenDone] }),
+      prompt: 'Work.',
+      tools: parked.tools,
+      session: { ...session, store },
+      lease: { provider: leases, owner: 'a', ttlMs: 300 },
+      deps: { clock, observer },
+    });
+    await parked.entered;
+    expect(await leases.signal(key, 'drain')).toBe(true);
+    await advance(100);
+    parked.release();
+    expect(await run).toMatchObject({ status: 'stopped', reason: 'drained' });
+    const stored = (await store.load('job'))!.checkpoints.job!;
+    expect(stored.status).toBe('running');
+    const saved = observer
+      .events()
+      .filter((event) => event.type === 'checkpoint.saved' && event.stepId === stored.stepId);
+    expect(saved).toEqual([expect.objectContaining({ checkpointStatus: 'running' })]);
+    // The run's own end still says why it stopped.
+    expect(observer.events()).toContainEqual(
+      expect.objectContaining({ type: 'run.completed', stoppedBy: 'drained' }),
+    );
   });
 
   it('stops a new run that a drain reaches as it starts, before any model call', async () => {
