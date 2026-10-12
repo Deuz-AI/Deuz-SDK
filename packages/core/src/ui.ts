@@ -1149,8 +1149,11 @@ export function toDeuzAgentStreamResponse<T>(
     ahead = undefined;
     return step;
   };
-  // A refused run emits its failed result before anything else, while an
-  // admitted one starts with a phase: only that first event tells them apart.
+  // A run refused before it began emits its failed result before anything
+  // else; a run that began starts with a phase, and one that stopped or
+  // suspended before its first model call is journaled as before. Only the
+  // first event tells them apart. (A run whose execution deadline had passed
+  // also fails first; its terminal state is the stored run's to report.)
   const journaled = async (): Promise<boolean> => {
     ahead = events.next();
     try {
