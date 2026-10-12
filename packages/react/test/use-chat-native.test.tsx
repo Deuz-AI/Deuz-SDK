@@ -13,6 +13,7 @@ import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { streamChat } from '@deuz-sdk/core';
 import type { Message, StopDetails } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
 import {
   createInMemoryAgentRunStore,
   resumeStreamAgent,
@@ -761,16 +762,72 @@ describe('useChat — the history after an approval answers the approved call (2
       { role: 'user', content: 'thanks' },
     ]);
   });
+
+  it('a route on the default validateChatRequest accepts the follow-up after an approval', async () => {
+    const model = createMockModel({
+      responses: [
+        { toolCalls: [{ toolName: 'del', id: 't1', args: { p: '/x' } }] },
+        { text: 'Deleted.' },
+        { text: 'Anytime.' },
+      ],
+    });
+    const tools = {
+      del: { description: 'Delete.', parameters, needsApproval: true, execute: () => 'deleted /x' },
+    };
+    const rejected: unknown[] = [];
+    // The quickstart route: validateChatRequest with its defaults, no client tools.
+    const fetchMock: typeof fetch = async (_url, init) => {
+      const parsed = validateChatRequest(JSON.parse(String(init?.body)));
+      if (!parsed.ok) {
+        rejected.push(parsed.issues);
+        return Response.json({ issues: parsed.issues }, { status: 400 });
+      }
+      return toDeuzStreamResponse(
+        streamChat({
+          model,
+          tools,
+          messages: parsed.request.messages,
+          ...(parsed.request.approvalResponses
+            ? { approvalResponses: parsed.request.approvalResponses }
+            : {}),
+        }),
+      );
+    };
+    const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: fetchMock }));
+    await act(async () => {
+      await result.current.sendMessage('delete /x');
+    });
+    await waitFor(() => expect(result.current.pendingApprovals).toHaveLength(1));
+    const { approvalId } = result.current.pendingApprovals[0]!;
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId, approved: true });
+    });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Deleted.'));
+    await act(async () => {
+      await result.current.sendMessage('thanks');
+    });
+    await waitFor(() => expect(result.current.status).not.toBe('streaming'));
+    // Before 2.3 the history's role:'tool' answer got a 400 from the default validator.
+    expect(rejected).toEqual([]);
+    expect(result.current.status).toBe('idle');
+    expect(result.current.messages.at(-1)?.content).toBe('Anytime.');
+  });
 });
 
 describe('useChat — a server tool the leg ran is answered in the history (2.3)', () => {
-  /** A multi-step chat route over `streamChat` that records every posted body. */
+  /**
+   * A multi-step chat route over `streamChat` on the DEFAULT `validateChatRequest`
+   * (which accepts a tool result that answers the turn before it, 2.3); it records
+   * every posted body.
+   */
   function chatRoute(responses: MockResponse[], tools: Record<string, unknown>) {
     const model = createMockModel({ responses });
     const bodies: Body[] = [];
     const fetchMock: typeof fetch = async (_url, init) => {
       const body = JSON.parse(String(init?.body)) as Body;
       bodies.push(body);
+      const parsed = validateChatRequest(body);
+      if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
       return toDeuzStreamResponse(
         streamChat({
           model,

@@ -10,7 +10,9 @@
  *      This is the live vector, and it is the one most deployments miss.
  *   2. A forged `tool_result` part can claim any outcome ("payment captured").
  *      On the wire a client-authored tool result is INDISTINGUISHABLE from one
- *      the server produced, and the model believes it.
+ *      the server produced, and the model believes it. (Since 2.3 the default
+ *      accepts one only as the answer to a call of the assistant turn right
+ *      before it, the history `useChat` posts — see `rejectToolResults`.)
  *   3. Forged assistant turns rewrite what the model thinks it already said.
  *   4. 50 000 messages, or one 40 MB message, is a billing attack.
  *
@@ -98,11 +100,17 @@ export interface ValidateChatOptions {
    * Reject client-authored `tool_result` parts (and `role: 'tool'` messages,
    * where the role itself is the claim). Default TRUE.
    *
-   * CLIENT TOOLS NEED THIS OFF. `useChat`'s `onToolCall` round-trip POSTs
-   * `clientToolResultMessage(...)` output, so set `rejectToolResults: false`
-   * there — and understand what you are accepting: this validator cannot tell a
-   * real client tool result from a forged one, because the same client authored
-   * the assistant turn it pairs with. The only real fix is to stop trusting the
+   * Since 2.3 the default ACCEPTS one shape: a `role: 'tool'` message, or a
+   * run of them, right after an assistant turn, holding only `tool_result`
+   * parts that each answer a different call of that turn. That is the history
+   * `useChat` posts after a client tool (`onToolCall` / `addToolResult`), an
+   * approval, and a server tool the leg ran, so a default route keeps working.
+   * Any other tool result is rejected as before, including one inside a
+   * `user` turn. `false` accepts every tool result.
+   *
+   * Understand what an accepted result is: this validator cannot tell a real
+   * tool result from a forged one, because the same client authored the
+   * assistant turn it pairs with. The only real fix is to stop trusting the
    * history: persist it server-side (`ChatStore` + `chatId`) and treat the
    * client's copy as a rendering cache.
    */
@@ -358,10 +366,62 @@ interface Gates {
 type Fail = (issue: string) => void;
 
 /**
+ * The assistant turn a run of `role: 'tool'` messages follows (2.3): the ids
+ * of its calls, and the ones a message of the run answered already.
+ */
+interface ToolRun {
+  calls: Set<string>;
+  answered: Set<string>;
+}
+
+/** The calls of an assistant turn, for the tool messages that may follow it. */
+function toolRunOf(message: Record<string, unknown>): ToolRun {
+  const calls = new Set<string>();
+  if (Array.isArray(message.content)) {
+    for (const part of message.content) {
+      if (isRecord(part) && part.type === 'tool_use' && isNonEmptyString(part.id)) {
+        calls.add(part.id);
+      }
+    }
+  }
+  return { calls, answered: new Set() };
+}
+
+/**
+ * Whether a `role: 'tool'` message answers the turn its run follows (2.3):
+ * only `tool_result` parts, each for a different call of that turn that no
+ * earlier message of the run answered. That is the shape `useChat` posts. A
+ * message that does is recorded on `run`, so a call is answered once.
+ */
+function answersRun(message: Record<string, unknown>, run: ToolRun | undefined): boolean {
+  const content = message.content;
+  if (!run || !Array.isArray(content) || content.length === 0) return false;
+  const ids = new Set<string>();
+  for (const part of content) {
+    if (!isRecord(part) || part.type !== 'tool_result') return false;
+    const id = part.toolUseId;
+    if (!isNonEmptyString(id) || !run.calls.has(id) || run.answered.has(id) || ids.has(id)) {
+      return false;
+    }
+    ids.add(id);
+  }
+  for (const id of ids) run.answered.add(id);
+  return true;
+}
+
+/**
  * One content part. `Object.hasOwn`, never `in`: `{ type: 'constructor' }` is a
  * hostile payload that `in` would happily accept off `Object.prototype`.
+ * `answers` marks a part of a `role: 'tool'` message that answers the turn
+ * before it (see `answersRun`), whose results the default accepts.
  */
-function validatePart(value: unknown, path: string, gates: Gates, fail: Fail): void {
+function validatePart(
+  value: unknown,
+  path: string,
+  gates: Gates,
+  fail: Fail,
+  answers = false,
+): void {
   if (!isRecord(value)) {
     fail(`${path} must be an object; got ${typeOf(value)}.`);
     return;
@@ -400,7 +460,7 @@ function validatePart(value: unknown, path: string, gates: Gates, fail: Fail): v
       // Checked at the PART level as well as the role level: a `tool_result`
       // smuggled inside a `role: 'user'` message is the obvious way around a
       // role-only gate, and adapters serialize it just the same.
-      if (gates.rejectToolResults) {
+      if (gates.rejectToolResults && !answers) {
         fail(
           `${path} is a client-authored tool_result — the server cannot tell it from a real one (set rejectToolResults: false to allow it).`,
         );
@@ -416,8 +476,18 @@ function validatePart(value: unknown, path: string, gates: Gates, fail: Fail): v
   }
 }
 
-/** One message. A gate rejection stops here — the turn is refused, its content is moot. */
-function validateMessage(value: unknown, path: string, gates: Gates, fail: Fail): void {
+/**
+ * One message. A gate rejection stops here — the turn is refused, its content
+ * is moot. `answers` marks a `role: 'tool'` message that answers the turn
+ * before it (see `answersRun`).
+ */
+function validateMessage(
+  value: unknown,
+  path: string,
+  gates: Gates,
+  fail: Fail,
+  answers = false,
+): void {
   if (!isRecord(value)) {
     fail(`${path} must be an object; got ${typeOf(value)}.`);
     return;
@@ -439,11 +509,12 @@ function validateMessage(value: unknown, path: string, gates: Gates, fail: Fail)
     );
     return;
   }
-  if (role === 'tool' && gates.rejectToolResults) {
+  if (role === 'tool' && gates.rejectToolResults && !answers) {
     // The ROLE is the claim here, whatever the content shape: a `role: 'tool'`
-    // message asserts "a tool ran and produced this".
+    // message asserts "a tool ran and produced this". Since 2.3 the default
+    // accepts it only as the answer to the assistant turn right before it.
     fail(
-      `${path}.role is 'tool' — a client may not author tool results (set rejectToolResults: false to allow it).`,
+      `${path}.role is 'tool' but answers no call of the assistant turn before it — a client may not author any other tool result (set rejectToolResults: false to allow it).`,
     );
     return;
   }
@@ -455,7 +526,7 @@ function validateMessage(value: unknown, path: string, gates: Gates, fail: Fail)
   }
   if (Array.isArray(content)) {
     for (let i = 0; i < content.length; i++) {
-      validatePart(content[i], `${path}.content[${i}]`, gates, fail);
+      validatePart(content[i], `${path}.content[${i}]`, gates, fail, answers);
     }
   }
   if (value.providerMetadata !== undefined && !isRecord(value.providerMetadata)) {
@@ -535,8 +606,15 @@ export function validateChatRequest(
     fail(`messages has ${rawMessages.length} entries; the limit is ${maxMessages}.`);
   } else {
     checked = rawMessages as readonly unknown[];
+    // The assistant turn the current run of `role: 'tool'` messages answers.
+    let run: ToolRun | undefined;
     for (let i = 0; i < checked.length; i++) {
-      validateMessage(checked[i], `messages[${i}]`, gates, fail);
+      const message = checked[i];
+      const role = isRecord(message) ? message.role : undefined;
+      const answers = role === 'tool' && answersRun(message as Record<string, unknown>, run);
+      validateMessage(message, `messages[${i}]`, gates, fail, answers);
+      if (role === 'assistant') run = toolRunOf(message as Record<string, unknown>);
+      else if (role !== 'tool') run = undefined;
     }
   }
 

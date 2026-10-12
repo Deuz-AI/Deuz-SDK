@@ -261,15 +261,15 @@ A replay can re-deliver calls this client already handled. The endpoint replays 
 
 That evidence is the canonical history. It survives a reload only if you persist `history.canonical` and restore it through `initialMessages`. A call whose result was not saved before the page went away is dispatched again after the reload, because the hook cannot know it ran. So this is at-most-once within a mounted hook, not exactly-once across reloads. Make such tools idempotent, or omit `onToolCall` and confirm parked calls yourself. A tab that only watches a stream another tab drives should omit `onToolCall` too, or it runs that tab's calls.
 
-<Callout type="warn" title="A client-tool route needs `rejectToolResults: false`">
-The round-trip POSTs a `role: 'tool'` message, which [`validateChatRequest`](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false) rejects by default. Pass `{ rejectToolResults: false }` — and read what that accepts.
+<Callout type="warn" title="The history holds tool results the client posts">
+The round-trip POSTs a `role: 'tool'` message, and so does the history after an approval or a server tool the leg ran. Since 2.3 the default [`validateChatRequest`](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false) accepts it, because it answers calls of the assistant turn right before it; before 2.3 a route had to pass `{ rejectToolResults: false }`. Read what the validator cannot tell apart: a forged result in that shape passes too.
 </Callout>
 
 ## Tool approvals
 
 A `tool-approval-request` part **pauses** the chat: the request lands in `pendingApprovals`, the matching `toolCalls` entry flips to `state: 'approval-requested'`, and nothing is re-POSTed. Record verdicts with `addToolApprovalResponse`; once **every** pending approval has one, the hook resumes with `approvalResponses` in the request body — the [server settles the gated calls](/docs/agents/client-tools#tool-approval-round-trip), the client never fabricates a gated `tool_result`. The request's signed `token` is auto-preserved.
 
-The resumed leg executes the approved call and streams its state and result, not the call itself. Since 2.3 the hook adds that result to `history.canonical` as a `role: 'tool'` message, so the next request answers the call. Before 2.3 the result reached only the screen, and the turn repeated the call in the history without its input, so the next request carried an open `tool_use`.
+The resumed leg executes the approved call and streams its state and result, not the call itself. Since 2.3 the hook adds that result to `history.canonical` as a `role: 'tool'` message, so the next request answers the call. Before 2.3 the result reached only the screen, and the turn repeated the call in the history without its input, so the next request carried an open `tool_use`. The default `validateChatRequest` accepts that message since 2.3, because it answers a call of the assistant turn right before it; see [what that accepts](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false).
 
 ```tsx
 {pendingApprovals.map((req) => (
@@ -370,8 +370,8 @@ const options = {
 };
 
 export async function POST(req: Request): Promise<Response> {
-  // `rejectToolResults: false`: the history holds the client's tool answers.
-  const parsed = validateChatRequest(await req.json(), { rejectToolResults: false });
+  // The defaults accept the history useChat posts: each tool result answers the turn before it.
+  const parsed = validateChatRequest(await req.json());
   if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
   const { rest } = parsed.request;
   const scope = 'tenant-a'; // the signed-in user's tenant, never a field of the body
