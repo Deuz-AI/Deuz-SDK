@@ -3,7 +3,7 @@ title: What is new in 2.3
 description: One path for every tool call, native memory, chat and model fail-over, usage billed once and models without a price, Claude 5.x request rules and preserved thinking, the MCP 2026-07-28 client and an MCP server, A2A, realtime voice, batch requests, Redis backends, goals, evals and a headless preview, with the release's upgrade notes and known limits.
 ---
 
-2.3 completes the native runtime and delivers what the 2.2 notes deferred.
+2.3 closes the gaps in native runs and delivers what the 2.2 notes deferred.
 Every tool call now takes one path through policy, approval, budget admission
 and an effect receipt, and native runs gain memory, a chat projection and model
 fail-over. Usage is billed once, a model without a price no longer breaks a USD
@@ -23,8 +23,9 @@ Nothing in 2.3 was run against a model provider or a third-party service.
 Provider and protocol behaviour comes from the providers' documentation and the
 types of their official SDK packages, and is tested offline: against scripted
 models and sockets, in-memory stand-ins of the provider APIs, and the official
-MCP and A2A SDKs in-process. Where this page or a module page says **not
-live-verified**, make one real call before you depend on it.
+MCP and A2A SDKs, in-process or over a local child process or loopback socket.
+Where this page or a module page says **not live-verified**, make one real call
+before you depend on it.
 </Callout>
 
 ## Install and choose an entry
@@ -79,11 +80,11 @@ sampling requests. See
   provider's explanation is `stopDetails` on the results of `generateText`,
   `streamChat`, `generateObject`, `streamObject` and native runs, and a native
   run that ends on a refusal stops with reason `'refusal'`.
-- **Every ending has a name.** `ToolCallOutcome` (`'tool-error'`,
+- **Every ending has a name.** `ToolCallOutcome` (`'success'`, `'tool-error'`,
   `'permission-denied'`, `'approval-denied'`, `'approval-pending'`,
-  `'unknown-effect'`) marks error results and tool-state parts; a successful
-  result carries none. A resume that stops for reconciliation lists the open
-  calls in `AgentResult.unknownEffects`.
+  `'unknown-effect'`) names how a call ended. Error results and tool-state
+  parts carry it; a successful result carries none, as before. A resume that
+  stops for reconciliation lists the open calls in `AgentResult.unknownEffects`.
 - **Approvals bind to their call.** `approvalId` is the tool call id followed by
   a digest of the run, the step, the sub-agent path, the call, the tool and its
   arguments, so a verdict kept from one gate never approves another call.
@@ -103,7 +104,8 @@ sampling requests. See
   take `lease: { provider, owner?, ttlMs? }`, so two processes never drive one
   run, and a `'cancel'` signalled to the run's key stops it with reason
   `'cancelled'`. `AgentRunStore.list` pages through stored runs, and
-  `findStaleAgentRuns` finds those whose executor is gone. See
+  `findStaleAgentRuns` finds runs still running or finalizing whose last save
+  is older than `staleMs`, for a worker to resume. See
   [Listing, leasing and cancelling native runs](/docs/modules/operations#listing-leasing-and-cancelling-native-runs).
 - **Cancellation after verification.** Native runs check cancellation and the
   deadline again after output validation, guardrails and the verifier, so an
@@ -201,8 +203,10 @@ See
   reports one `unpriced-model` warning per model.
   `budget.unknownPrice: 'reject'` refuses them before they are sent.
 - **Reservations cover what the provider can bill.** A native reservation
-  prices the output cap the request sends, reasoning included, so parallel
-  calls cannot spend far past a USD budget.
+  prices the output cap the request sends, reasoning included. It used to
+  reserve `maxOutputTokens ?? 4096` output tokens, while the request could ask
+  for the model's full output limit, so parallel calls could spend far past a
+  USD budget.
 - **A call whose usage the provider did not report** has an unknown cost on
   every path, never $0; `UsageMeta.usageAvailable` is `false` for it.
 - **Holds can be found and closed.** `BudgetStore.holds` lists the open holds,
@@ -280,7 +284,7 @@ console.log(resolveModelProfile(anthropic('claude-sonnet-6')).match); // family
   as a `clamped-setting` or `unsupported-setting` warning.
 - **Output caps.** An unknown model, or a row whose output limit is
   undocumented, no longer gets a 4,096-token cap on OpenAI and Gemini native;
-  the provider's own default applies.
+  the provider's own default applies, unless a token or USD bound needs a cap.
 - **OpenAI Responses is stateless by default.** Every request sends
   `store: false`, and a reasoning model always asks for its encrypted reasoning,
   so the next turn can replay it.
@@ -297,22 +301,25 @@ every earlier message have to reach the API byte-identical on every later
 request, or the replayed block is invalid; on accounts opened from 2026-08-31
 that is a 400. The agentic loops now keep that prefix stable for these models:
 
-| Source of change                                       | 2.2, and every other model                    | Claude 5.x in 2.3                                  |
-| ------------------------------------------------------ | --------------------------------------------- | -------------------------------------------------- |
-| A system message in the middle of the history          | Folded into the top-level system prompt       | Sent in place                                      |
-| Memory recall                                          | Spliced into the system prompt at every call  | One appended system message per user turn          |
-| Handoff instructions                                   | Replace the leading system turn               | Appended after the transfer's tool result          |
-| A step that offers other tools                         | A different `tools` array                     | The same array, plus an appended tool-set change   |
-| Compaction and overflow recovery                       | Layered: prune, prune, summary                | One summary replaces the conversation              |
+| Source of change                              | 2.2, and the other models in 2.3                                                 | Claude 5.x in 2.3                                |
+| --------------------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------ |
+| A system message in the middle of the history | Folded into the top-level system prompt on Gemini and older Claude models        | Sent in place                                    |
+| Memory recall                                 | Spliced into the system prompt at every call                                     | One appended system message per user turn        |
+| Handoff instructions                          | Replace the leading system turn                                                  | Appended after the transfer's tool result        |
+| A step that offers other tools                | A different `tools` array                                                        | The same array, plus an appended tool-set change |
+| Compaction and overflow recovery              | Layered: prune old tool results, prune old reasoning, summarize the oldest slice | One summary replaces the conversation            |
 
-A request that replays thinking to these models also asks the API to drop a
-mismatched block instead of failing (`block_binding` with
-`prefix_mismatch_behavior: 'drop_block'`), so that is the safety net rather
-than the normal path. Reasoning blocks round-trip intact on every model: each
-block is its own `reasoning` part, two consecutive thinking blocks stay two
-parts with their own signatures, `redacted_thinking` is kept, and each wire
-replays only the reasoning of its own provider family. DeepSeek and Kimi get
-their `reasoning_content` back on tool-call turns. Not live-verified. See
+Chat Completions already sent a mid-conversation system message in place, and
+OpenAI Responses now does too, on every model (see
+[Requests and models](#requests-and-models)). A request that replays thinking
+to these Claude models also asks the API to drop a mismatched block instead of
+failing (`block_binding` with `prefix_mismatch_behavior: 'drop_block'`, under
+the `thinking-binding-controls-2026-08-01` beta), so that is the safety net
+rather than the normal path. Reasoning blocks round-trip intact on every
+model: each block is its own `reasoning` part, two consecutive thinking blocks
+stay two parts with their own signatures, `redacted_thinking` is kept, and each
+wire replays only the reasoning of its own provider family. DeepSeek and Kimi
+get their `reasoning_content` back on tool-call turns. Not live-verified. See
 [Preserved thinking](/docs/agents/preserved-thinking) and
 [One part per block](/docs/core/messages#one-part-per-block-23).
 
@@ -325,7 +332,10 @@ TypeScript SDK, so the client is dual-stack over two optional peers:
 imported. The v2 line asks `server/discover` and falls back to the 2025-era
 `initialize` handshake. HTTP, SSE and stdio, OAuth, sampling, roots,
 elicitation, reconnect, keepalive and hot refresh work on both lines, and
-`listTools()` now reads every page of a paginated catalog. See
+`listTools()` now reads every page of a paginated catalog. `McpHttpTransport`
+takes a `fetch` that every request goes through, and OAuth against an RFC 9207
+authorization server forwards the redirect's `iss` (`authorizationIss`,
+`completeAuth(code, iss)`). See
 [SDK lines and protocol revisions](/docs/modules/mcp#sdk-lines-and-protocol-revisions-23).
 
 **An MCP server.** `createMcpServer` publishes a `ToolSet`, native agent tools
@@ -439,9 +449,10 @@ call. It is edge-safe and pure: nothing in it runs a model, a timer or a
 service. A `GoalRecord` holds an objective, acceptance criteria, evidence, a
 budget, a deadline and a lifecycle with an explicit waiting reason, and
 `transitionGoal` is the one way it changes. A goal completes only when every
-required criterion passed on evidence that did not come from the working model
-alone. A `GoalEvent` is the wakeup and event envelope; its dedupe key shares
-one space with schedule occurrences and webhook deliveries.
+required criterion passed, and a passed verdict counts only when something
+other than the working model reached it, on evidence from outside the model. A
+`GoalEvent` is the wakeup and event envelope; its dedupe key shares one space
+with schedule occurrences and webhook deliveries.
 
 ```ts title="goal.ts"
 import { assessGoal, createGoal, transitionGoal } from '@deuz-sdk/core/goal';
@@ -495,9 +506,10 @@ A running supervisor, a durable inbox and timezone-aware wakeups are planned for
 native run has: a frame opening each leg, the phases, structured-output drafts
 and array elements, and a terminal `result` frame with the status, the validated
 output, the pending approvals and client calls, or the stop reason. Every
-frame's `seq` is its SSE event id, so a client resumes after its cursor.
-`agentStateFromParts` folds the frames into a `DeuzAgentState` and applies each
-frame once.
+frame's `seq` is its SSE event id; with a `store` and a `streamId` the sequence
+grows across every leg of the run, and a client resumes after its cursor
+through `resumeDeuzStreamResponse`. `agentStateFromParts` folds the frames into
+a `DeuzAgentState` and applies each frame once.
 
 `useChat` from `@deuz-sdk/react` drives a native agent route with no new
 option: it pauses on the run's approvals, runs or parks its client calls, and
@@ -629,15 +641,15 @@ answers an approval, and the typed result arrives as an artifact.
 
 The 2.2 notes deferred seven items to 2.3. All seven ship:
 
-| Deferred in 2.2                                      | In 2.3                                                                                           | Docs                                                                                                                         | How it is verified                                                                                                                                                         |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The MCP 2026-07-28 client                            | Shipped: a dual-stack client, the v2 line on `@modelcontextprotocol/client`                      | [MCP](/docs/modules/mcp#sdk-lines-and-protocol-revisions-23)                                                                 | Offline against the official v1 and v2 SDK servers, in-process and over a real stdio child process; not live-verified against hosted servers                              |
-| An MCP server                                        | Shipped: `createMcpServer`, `serveMcpStdio`                                                      | [MCP server](/docs/modules/mcp-server)                                                                                       | Offline against the Deuz client on both SDK lines and the official v1 and v2 SDK clients, over HTTP and a real stdio child; not live-verified against hosted clients     |
-| A2A                                                  | Shipped: a v1.0.0 client and handler over JSON-RPC and HTTP+JSON                                 | [A2A](/docs/modules/a2a)                                                                                                     | Offline against `@a2a-js/sdk` 1.3.0 in both directions, in-process and over HTTP+JSON on 127.0.0.1; not live-verified against third-party agents                        |
-| Realtime voice                                       | Shipped over WebSocket: OpenAI Realtime and Gemini Live                                          | [Realtime voice](/docs/modules/realtime)                                                                                     | Shapes from the `openai` 7.32 and `@google/genai` 2.28 types; tested on a scripted socket and a local WebSocket server; not live-verified                                  |
-| Provider batch APIs                                  | Shipped: OpenAI, Anthropic and Gemini                                                            | [Batch requests](/docs/modules/batch)                                                                                        | Shapes from the providers' SDK types; tested against in-memory stand-ins of each API; not live-verified                                                                  |
-| Redis swarm and ops backends                         | Shipped: `ops/redis` (leases, native runs, claims, budgets), `swarm/redis`, and the pack's `runs` | [Operations](/docs/modules/operations#redis), [Persistent stores](/docs/modules/stores#runs-23)                               | The shared conformance suites on ioredis-mock, which runs the same Lua scripts, and on a real Redis 7 when `DEUZ_TEST_REDIS_URL` is set, as in the CI integration job |
-| `chat`, `memory` and `fallbackModels` in native runs | Shipped                                                                                          | [Native agents](/docs/modules/native-agents#memory-chat-and-model-fail-over-23)                                              | Offline with scripted models and stores; provider behaviour not live-verified                                                                                             |
+| Deferred in 2.2                                      | In 2.3                                                                                            | Docs                                                                                            | How it is verified                                                                                                                                                                           |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The MCP 2026-07-28 client                            | Shipped: a dual-stack client, the v2 line on `@modelcontextprotocol/client`                       | [MCP](/docs/modules/mcp#sdk-lines-and-protocol-revisions-23)                                    | Offline against the official v1 and v2 SDK servers, in-process and over a real stdio child process; not live-verified against hosted servers                                                 |
+| An MCP server                                        | Shipped: `createMcpServer`, `serveMcpStdio`                                                       | [MCP server](/docs/modules/mcp-server)                                                          | Offline against the Deuz client on both SDK lines and the official v1 and v2 SDK clients, in-process over HTTP and over a real stdio child process; not live-verified against hosted clients |
+| A2A                                                  | Shipped: a v1.0.0 client and handler over JSON-RPC and HTTP+JSON                                  | [A2A](/docs/modules/a2a)                                                                        | Offline against `@a2a-js/sdk` 1.3.0 in both directions, in-process and over HTTP+JSON on 127.0.0.1; not live-verified against third-party agents                                             |
+| Realtime voice                                       | Shipped over WebSocket: OpenAI Realtime and Gemini Live                                           | [Realtime voice](/docs/modules/realtime)                                                        | Shapes from the `openai` 7.32 and `@google/genai` 2.28 types; tested on a scripted socket and a local WebSocket server; not live-verified                                                    |
+| Provider batch APIs                                  | Shipped: OpenAI, Anthropic and Gemini                                                             | [Batch requests](/docs/modules/batch)                                                           | Shapes from the `openai` 7.32, `@anthropic-ai/sdk` 0.133 and `@google/genai` 2.28 types; tested against in-memory stand-ins of each API; not live-verified                                   |
+| Redis swarm and ops backends                         | Shipped: `ops/redis` (leases, native runs, claims, budgets), `swarm/redis`, and the pack's `runs` | [Operations](/docs/modules/operations#redis), [Persistent stores](/docs/modules/stores#runs-23) | The shared conformance suites, offline on ioredis-mock, which runs the same Lua scripts; the same suites run against a real Redis 7 in the CI integration job (`DEUZ_TEST_REDIS_URL`)        |
+| `chat`, `memory` and `fallbackModels` in native runs | Shipped                                                                                           | [Native agents](/docs/modules/native-agents#memory-chat-and-model-fail-over-23)                 | Offline with scripted models and stores; provider behaviour not live-verified                                                                                                                |
 
 Parts of these areas stay outside 2.3: realtime over WebRTC (planned for 2.4),
 and the items listed under [Known limits](#known-limits).
@@ -660,16 +672,24 @@ resume, and the defaults that change below.
 - **Version 2 native envelopes.** A run that records memory, a transcript, a
   chat projection or fail-over state is saved as version 2, and 2.2 refuses to
   resume it. Runs without those features stay version 1.
-- **Envelopes with an MCP catalog or a failed receipt.** A native envelope that
-  records the servers' tool catalog (`binding.mcp`) or a receipt in stage
-  `'failed'` needs 2.3 or later to resume.
+- **Envelopes with a 2.3 resume binding.** 2.2 compares the whole resume
+  binding, so it fails with `Native agent binding changed across resume.` on an
+  envelope, of either version, whose binding records a key 2.3 added: the
+  servers' MCP tool catalog (`binding.mcp`), the handoff targets
+  (`binding.handoffs`), or the memory scope, chat or fallback models
+  (`binding.memory`, `binding.chat`, `binding.fallback`). Once 2.3 saved a
+  native run that uses `mcp`, handoffs, `memory`, `chat` or `fallbackModels`,
+  only 2.3 resumes it.
+- **Envelopes with a failed receipt.** A receipt in stage `'failed'` needs 2.3
+  or later to resume; 2.2 does not know the stage and does not replay the
+  recorded error.
 
 Apart from these, 2.3 keeps the formats 2.2 reads: legacy checkpoints keep
 `version: 1` (2.2 ignores the new `approvalRequestCounts`), ledger snapshots
-gain only optional fields, a failed envelope's new `retry` record is ignored,
-and stored lease signals keep their 2.2 format. Roll a native fleet back to 2.2
-only when no 2.2 process has to resume a run that 2.3 saved with the features
-above.
+gain only optional fields, a failed envelope's new `retry` record is ignored
+(2.2 returns the stored failed result), and stored lease signals keep their 2.2
+format. Roll a native fleet back to 2.2 only when no 2.2 process has to resume
+a run that 2.3 saved with the features above.
 
 ### Sharing a database with 2.2 processes
 
@@ -702,17 +722,25 @@ do.
   `include` list is merged.
 - **On OpenAI Responses, a system message from the middle of the history stays
   in place** as a `system` input item instead of moving into `instructions`. To
-  keep it in the instructions, put it at the start of `messages`.
+  keep it in the instructions, put it at the start of `messages`. A system
+  message without text is sent by no wire.
 - **Claude 5.x requests follow the documented rules**: no `temperature` or
   `top_p`, a forced `toolChoice` sent as `auto` on Fable 5.1, Opus 5.5 and
-  Sonnet 5.5, `effort: 'none'` mapped per model, and `output_config.effort`
-  `low` on Opus 5. Each change is a warning on `warnings`; read them there
-  instead of expecting the value you passed.
+  Sonnet 5.5, and `effort: 'none'` mapped per model (Opus 5's request then also
+  sends `output_config.effort: 'low'`). Each change is a warning on `warnings`;
+  read them there instead of expecting the value you passed.
+- **Replayed thinking on Claude 5.x carries `block_binding`** with
+  `prefix_mismatch_behavior: 'drop_block'` and the
+  `anthropic-beta: thinking-binding-controls-2026-08-01` header, merged into an
+  `anthropic-beta` header you pass. `providerOptions.anthropic.thinking.block_binding`
+  overrides it; `null` sends none. A thinking block without a signature is
+  never sent to Claude.
 - **The GPT-5 family and other priced models gained rows**: `effort` now reaches
   the wire, `promptCaching` takes effect on `claude-opus-4-5` and
   `claude-sonnet-4-5`, `temperature` is no longer sent to GPT-5 reasoning
-  models, and `gpt-5.5` and `gpt-5.5-pro` on Chat Completions send
-  `max_completion_tokens`. A value outside a row's effort levels is changed
+  models, `gpt-5.5` and `gpt-5.5-pro` on Chat Completions send
+  `max_completion_tokens`, and `gemini-3.1-pro` on the Gemini native wire sends
+  its 64,000-token output cap. A value outside a row's effort levels is changed
   with a warning.
 - **No 4,096-token default cap** on OpenAI Chat Completions, OpenAI Responses or
   Gemini native for an unknown model or a row with an undocumented output
@@ -733,7 +761,13 @@ do.
 - **`outputTokens` includes reasoning**, and `reasoningTokens` is its share, on
   all four wires; `audioTokens` is a share of input and output. If you add
   `reasoningTokens` to `outputTokens` yourself, stop. Costs of reasoning turns
-  drop accordingly.
+  drop accordingly. The Chat Completions wire also reads DeepSeek's
+  `prompt_cache_hit_tokens` and Moonshot's top-level `cached_tokens` as cached
+  reads.
+- **Anthropic usage that reports `usage.iterations`** (server-side fallback,
+  compaction, server tool loops) keeps `serverToolUses` and the
+  `reasoningTokens` share. A `priceProvider` that bills server tool calls per
+  call charges them again.
 - **Price lookup no longer matches the longest prefix** or strips `-latest`,
   `-preview`, `-fast`, `-exp` or `-all`. An id that priced through a prefix is
   now unpriced; add it with `createPriceProvider({ aliases })`.
@@ -859,6 +893,11 @@ do.
   lands after the chat moved on is dropped; and a POST response with journal
   `id:` lines moves the in-memory resume cursor, so `reconnect()` no longer
   appends a settled turn twice.
+- **A turn read back through `reconnect()` or `resume.auto` runs its client
+  calls.** Its unresolved client tool calls reach `onToolCall` (and the chat
+  continues with a POST) or park in `pendingToolCalls`, as for a turn read from
+  the POST; a replayed call runs at most once per mounted hook. Two responses
+  that share a message id (a route without `messageId`) now fill a bubble each.
 
 #### MCP
 
@@ -893,8 +932,10 @@ Exhaustive `switch` statements over these types need a new case:
 
 Native stop reasons and failure codes are strings. New values in 2.3:
 `'refusal'`, `'cancelled'` and `'mcp-catalog-changed'` (stop reasons), and
-`'lease_held'`, `'lease_lost'` and `'unpriced_model'` (failure codes). The loops'
-`stoppedBy` marker gains `'mcp-catalog-changed'`.
+`'lease_held'`, `'lease_lost'`, `'unpriced_model'` and
+`'checkpoint_version_unsupported'` (failure codes). The loops'
+`providerMetadata.deuz.stoppedBy` marker, also a string, gains
+`'mcp-catalog-changed'`.
 
 ### New members for custom implementations
 
@@ -948,39 +989,48 @@ classes 2.3 adds, with their codes, in [Error handling](/docs/core/errors).
   lost or old resume cursor, a replay can append legs the restored history
   already has.
 - **Native runs.** A lease key queues one cancel at a time, so a cancel sent
-  while one from before the claim is still queued merges into it. Concurrent
-  runs that share one execution context with different memory scopes fail
-  closed; give each its own `.child()` context.
+  while one from before the claim is still queued merges into it. Runs that
+  share one execution context count as nested: each may only narrow the memory
+  scope of the latest run still running on it, so give a run with another
+  user's memory its own `.child()` context.
 
 {/* W3:RS3 */}
 
-- **Approvals on resume.** A call that waited for an approval is gated again on
-  resume, also when its receipt already holds an outcome: pass the stored
-  verdict in `approvalResponses` along with `reconciledToolResults` or
-  `retryToolCallIds`.
+- **Retries on resume.** A call that waited for an approval and is retried with
+  `retryToolCallIds` is gated again on resume: pass the stored verdict in
+  `approvalResponses` with it.
 - **Drain.** Native runs ignore a lease `'drain'` signal; only `'cancel'` stops
   them.
 
 {/* /W3:RS3 */}
 
+- **Structured output with tools on Gemini native** sends the JSON schema
+  alone, because `@google/genai` documents no request that combines function
+  declarations with a response schema. A callable tool it drops is reported as
+  an `unsupported-tool` warning.
 - **A2A** has no gRPC binding, no A2A 0.3, no push notifications, `ListTasks` or
   extended card, and does not verify signed cards.
 - **MCP.** The v2 client's response-cache controls, cached-discovery reuse,
   resource subscriptions and list-change notifications for prompts and
-  resources are not exposed. The MCP server serves tools only, with a catalog
-  fixed at construction, and reports no usage to the client.
+  resources are not exposed, and on a 2026-07-28 connection a URL-mode
+  elicitation carries no `elicitationId` (it is `''`). The MCP server serves
+  tools only, with a catalog fixed at construction, and reports no usage to the
+  client.
 - **Batch** is single-turn: tools and other loop options are refused. Models on
   Vertex AI, Bedrock, Azure and the other OpenAI-compatible hosts get a
   `BatchError` of kind `'unsupported'`, and the OpenAI and Gemini rows have no
   batch price.
 - **Redis** stores need Redis 7 or later on a server that never evicts their
-  keys (`noeviction` or a `volatile-*` policy).
+  keys (`noeviction` or a `volatile-*` policy). Redis acknowledges a write from
+  memory, so what survives a crash depends on the server's persistence; enable
+  AOF for these stores.
 - **Goals** are a data contract. Nothing in 2.3 drives them on its own.
 - **Headless** is a preview without a binary. Project instructions get the
   trust of the system message by default: review the files of a checkout you do
   not trust.
 - **Budgets.** Admission is an estimate against holds, not a cap the provider
-  enforces.
+  enforces. The hold of a model call that failed over stays counted against the
+  shared execution.
 - **Sandbox.** After a timeout, a program the shell started that still holds
   the output pipes is not killed.
 
@@ -988,15 +1038,16 @@ classes 2.3 adds, with their codes, in [Error handling](/docs/core/errors).
 
 These are the roadmap's targets for 2.4, not commitments:
 
-- a `deuz` CLI on top of the headless preview, a control server and a local
+- a CLI and TUI on top of the headless preview, a control server and a local
   daemon;
 - a running supervisor for goals, a durable inbox and timezone-aware wakeups,
   on top of the 2.3 goal records;
 - realtime voice over WebRTC;
-- a persistent scheduler service, a messaging connector, and dynamic agent
-  tasks with a durable mailbox;
+- a persistent scheduler and webhook service and a messaging connector;
+- dynamic agent tasks with a durable mailbox, and a worktree integrator;
 - isolated runners and background process sessions;
-- transcript search, lazy tool search and a local plugin lifecycle.
+- transcript search, lazy tool search and a local plugin lifecycle;
+- an optional LSP or ACP preview.
 
 Previous releases remain documented in
 [What is new in 2.2](/docs/reference/whats-new-2-2) and the
