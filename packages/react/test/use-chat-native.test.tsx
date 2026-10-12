@@ -13,6 +13,7 @@ import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { streamChat } from '@deuz-sdk/core';
 import type { Message, StopDetails } from '@deuz-sdk/core';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
 import {
   createInMemoryAgentRunStore,
   resumeStreamAgent,
@@ -28,7 +29,12 @@ import {
 } from '@deuz-sdk/core/ui';
 import type { DeuzAgentState, DeuzUIPart } from '@deuz-sdk/core/ui';
 import { useChat } from '../src/use-chat';
-import type { UseChatAgent, UseChatResult, UseChatStopDetails } from '../src/use-chat';
+import type {
+  UseChatAgent,
+  UseChatResult,
+  UseChatResumeOptions,
+  UseChatStopDetails,
+} from '../src/use-chat';
 import { journal, parts, postResponse, recordingFetch, stallingResponse } from './wire';
 
 const parameters = { type: 'object' as const, properties: {} };
@@ -323,6 +329,91 @@ describe('useChat — a native agent route (2.3)', () => {
       clientToolResults: [{ toolCallId: 'c1', output: 'Paris' }],
     });
     expect(result.current.messages.at(-1)?.content).toBe('Both done.');
+  });
+
+  describe('a gate’s client calls run as part of the resume round', () => {
+    const gateRoute = () =>
+      nativeRoute(
+        [
+          {
+            toolCalls: [
+              { toolName: 'publish', id: 'p1', args: {} },
+              { toolName: 'locate', id: 'c1', args: {} },
+            ],
+          },
+          { text: 'Both done.' },
+          { text: 'Second run.' },
+        ],
+        { ...publishTools(), locate: { description: 'Where?', parameters } },
+      );
+
+    /** Approve the gate while `onToolCall` hangs; resolves once the call is running. */
+    async function approveWhileCalling() {
+      const route = gateRoute();
+      let resolveCall!: (value: unknown) => void;
+      const pending = new Promise<unknown>((resolve) => {
+        resolveCall = resolve;
+      });
+      const onToolCall = vi.fn(() => pending);
+      const hook = renderHook(() => useChat({ api: '/api/agent', fetch: route.fetch, onToolCall }));
+      await act(async () => {
+        await hook.result.current.sendMessage('go');
+      });
+      await waitFor(() => expect(hook.result.current.pendingApprovals).toHaveLength(1));
+      const { approvalId } = hook.result.current.pendingApprovals[0]!;
+      let approving: Promise<void> | undefined;
+      act(() => {
+        approving = hook.result.current.addToolApprovalResponse({ approvalId, approved: true });
+      });
+      await waitFor(() => expect(onToolCall).toHaveBeenCalledTimes(1));
+      return { route, hook, approving: approving!, resolveCall };
+    }
+
+    it('status is streaming while onToolCall runs after the last verdict', async () => {
+      const { hook, approving, resolveCall } = await approveWhileCalling();
+      // The Send button of the docs component is disabled while the round runs.
+      expect(hook.result.current.status).toBe('streaming');
+      await act(async () => {
+        resolveCall('Paris');
+        await approving;
+      });
+      await waitFor(() => expect(hook.result.current.agent?.status).toBe('completed'));
+      expect(hook.result.current.status).toBe('idle');
+    });
+
+    it('stop() while onToolCall runs cancels the resume POST', async () => {
+      const { route, hook, approving, resolveCall } = await approveWhileCalling();
+      act(() => {
+        hook.result.current.stop();
+      });
+      await act(async () => {
+        resolveCall('Paris');
+        await approving;
+      });
+      expect(route.bodies).toHaveLength(1);
+      expect(hook.result.current.status).toBe('idle');
+      expect(hook.result.current.error).toBeUndefined();
+    });
+
+    it('a message sent while onToolCall runs drops the gate: no stray result, no second resume', async () => {
+      const { route, hook, approving, resolveCall } = await approveWhileCalling();
+      await act(async () => {
+        await hook.result.current.sendMessage('something else');
+      });
+      await act(async () => {
+        resolveCall('Paris');
+        await approving;
+      });
+      await waitFor(() => expect(hook.result.current.status).toBe('idle'));
+      // The late result joins nothing, and run-1 is not resumed.
+      expect(route.bodies.filter((body) => body.runId === 'run-1')).toHaveLength(0);
+      expect(hook.result.current.history.canonical.map((m) => m.role)).toEqual([
+        'user',
+        'assistant',
+        'user',
+        'assistant',
+      ]);
+    });
   });
 
   it('parks the client call after the verdicts; its answer resumes with both', async () => {
@@ -671,6 +762,189 @@ describe('useChat — the history after an approval answers the approved call (2
       { role: 'user', content: 'thanks' },
     ]);
   });
+
+  it('a route on the default validateChatRequest accepts the follow-up after an approval', async () => {
+    const model = createMockModel({
+      responses: [
+        { toolCalls: [{ toolName: 'del', id: 't1', args: { p: '/x' } }] },
+        { text: 'Deleted.' },
+        { text: 'Anytime.' },
+      ],
+    });
+    const tools = {
+      del: { description: 'Delete.', parameters, needsApproval: true, execute: () => 'deleted /x' },
+    };
+    const rejected: unknown[] = [];
+    // The quickstart route: validateChatRequest with its defaults, no client tools.
+    const fetchMock: typeof fetch = async (_url, init) => {
+      const parsed = validateChatRequest(JSON.parse(String(init?.body)));
+      if (!parsed.ok) {
+        rejected.push(parsed.issues);
+        return Response.json({ issues: parsed.issues }, { status: 400 });
+      }
+      return toDeuzStreamResponse(
+        streamChat({
+          model,
+          tools,
+          messages: parsed.request.messages,
+          ...(parsed.request.approvalResponses
+            ? { approvalResponses: parsed.request.approvalResponses }
+            : {}),
+        }),
+      );
+    };
+    const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: fetchMock }));
+    await act(async () => {
+      await result.current.sendMessage('delete /x');
+    });
+    await waitFor(() => expect(result.current.pendingApprovals).toHaveLength(1));
+    const { approvalId } = result.current.pendingApprovals[0]!;
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId, approved: true });
+    });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Deleted.'));
+    await act(async () => {
+      await result.current.sendMessage('thanks');
+    });
+    await waitFor(() => expect(result.current.status).not.toBe('streaming'));
+    // Before 2.3 the history's role:'tool' answer got a 400 from the default validator.
+    expect(rejected).toEqual([]);
+    expect(result.current.status).toBe('idle');
+    expect(result.current.messages.at(-1)?.content).toBe('Anytime.');
+  });
+});
+
+describe('useChat — a server tool the leg ran is answered in the history (2.3)', () => {
+  /**
+   * A multi-step chat route over `streamChat` on the DEFAULT `validateChatRequest`
+   * (which accepts a tool result that answers the turn before it, 2.3); it records
+   * every posted body.
+   */
+  function chatRoute(responses: MockResponse[], tools: Record<string, unknown>) {
+    const model = createMockModel({ responses });
+    const bodies: Body[] = [];
+    const fetchMock: typeof fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Body;
+      bodies.push(body);
+      const parsed = validateChatRequest(body);
+      if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+      return toDeuzStreamResponse(
+        streamChat({
+          model,
+          tools: tools as never,
+          maxSteps: 5,
+          messages: body.messages,
+          ...(body.approvalResponses ? { approvalResponses: body.approvalResponses as never } : {}),
+        }),
+      );
+    };
+    return { fetch: fetchMock, bodies };
+  }
+
+  it('on a chat route: the follow-up request carries the call and its result', async () => {
+    const route = chatRoute(
+      [
+        { toolCalls: [{ toolName: 'lookup', id: 'l1', args: { q: 'x' } }] },
+        { text: 'Found it.' },
+        { text: 'Anytime.' },
+      ],
+      { lookup: { description: 'Look up.', parameters, execute: () => 'found' } },
+    );
+    const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: route.fetch }));
+    await act(async () => {
+      await result.current.sendMessage('find x');
+    });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Found it.'));
+    await act(async () => {
+      await result.current.sendMessage('thanks');
+    });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Anytime.'));
+    // Before 2.3 the tool_use went out with no tool_result, which providers reject.
+    expect(route.bodies[1]!.messages).toEqual([
+      { role: 'user', content: 'find x' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'l1', name: 'lookup', input: { q: 'x' } },
+          { type: 'text', text: 'Found it.' },
+        ],
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'l1', result: 'found' }] },
+      { role: 'user', content: 'thanks' },
+    ]);
+  });
+
+  it('on a chat route, an approval continuation does not run that call again', async () => {
+    const lookup = vi.fn(() => 'found');
+    const route = chatRoute(
+      [
+        { toolCalls: [{ toolName: 'lookup', id: 'l1', args: {} }] },
+        { toolCalls: [{ toolName: 'del', id: 'd1', args: {} }] },
+        { text: 'Deleted.' },
+      ],
+      {
+        lookup: { description: 'Look up.', parameters, execute: lookup },
+        del: { description: 'Delete.', parameters, needsApproval: true, execute: () => 'deleted' },
+      },
+    );
+    const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: route.fetch }));
+    await act(async () => {
+      await result.current.sendMessage('look up, then delete');
+    });
+    await waitFor(() => expect(result.current.pendingApprovals).toHaveLength(1));
+    expect(lookup).toHaveBeenCalledTimes(1);
+    const { approvalId } = result.current.pendingApprovals[0]!;
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId, approved: true });
+    });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe('Deleted.'));
+    // The continuation settles every call its history leaves open: before 2.3
+    // that included `lookup`, which the first leg had run already.
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(route.bodies[1]!.messages.slice(1)).toEqual([
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'l1', name: 'lookup', input: {} },
+          { type: 'tool_use', id: 'd1', name: 'del', input: {} },
+        ],
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'l1', result: 'found' }] },
+    ]);
+  });
+
+  it('on a native route: a follow-up run starts from a history that answers the call', async () => {
+    const route = nativeRoute(
+      [
+        { toolCalls: [{ toolName: 'lookup', id: 'l1', args: {} }] },
+        { text: 'Found it.' },
+        { text: 'Anytime.' },
+      ],
+      { lookup: { description: 'Look up.', parameters, execute: () => 'found' } },
+    );
+    const { result } = renderHook(() => useChat({ api: '/api/agent', fetch: route.fetch }));
+    await act(async () => {
+      await result.current.sendMessage('find x');
+    });
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    await act(async () => {
+      await result.current.sendMessage('thanks');
+    });
+    await waitFor(() => expect(route.bodies).toHaveLength(2));
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    expect(route.bodies[1]!.messages).toEqual([
+      { role: 'user', content: 'find x' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'l1', name: 'lookup', input: {} },
+          { type: 'text', text: 'Found it.' },
+        ],
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'l1', result: 'found' }] },
+      { role: 'user', content: 'thanks' },
+    ]);
+  });
 });
 
 describe('useChat — reconnect never re-appends what the hook holds (G1 hand-off)', () => {
@@ -724,6 +998,108 @@ describe('useChat — reconnect never re-appends what the hook holds (G1 hand-of
     expect(wire.cursors).toEqual([undefined, '4']);
     expect(result.current.history).toEqual(settled);
     expect(result.current.history.canonical.filter((m) => m.role === 'assistant')).toHaveLength(2);
+  });
+
+  it('a chat switch through setHistory does not carry the old chat’s cursor', async () => {
+    const a = journal('chat-a');
+    const b = journal('chat-b');
+    // Chat B has a turn in its journal that this hook never read (started elsewhere).
+    await b.leg([parts.start('b-1'), parts.text('B answer.'), parts.finish()]);
+    const fetchA: typeof fetch = async () =>
+      a.respond([parts.start('a'), parts.text('A.'), parts.finish()]);
+    const { result, rerender } = renderHook(
+      ({ endpoint }: { endpoint: UseChatResumeOptions['endpoint'] }) =>
+        useChat({ api: '/api/chat', fetch: fetchA, resume: { endpoint } }),
+      { initialProps: { endpoint: a.endpoint as UseChatResumeOptions['endpoint'] } },
+    );
+    for (const text of ['one', 'two', 'three']) {
+      await act(async () => {
+        await result.current.sendMessage(text);
+      });
+    }
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    // The documented chat switch: the resume endpoint follows the chat, setHistory swaps the views.
+    rerender({ endpoint: b.endpoint });
+    act(() => {
+      result.current.setHistory({ ui: [], canonical: [{ role: 'user', content: 'B question' }] });
+    });
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    // Chat A's POST reads moved the cursor to '10'; chat B is read from its start.
+    expect(b.cursors).toEqual([undefined]);
+    expect(result.current.messages.at(-1)?.content).toBe('B answer.');
+  });
+
+  it('a caught-up reconnect while a native gate is open: the client result fills the gate’s bubble', async () => {
+    const route = nativeRoute(
+      [
+        {
+          toolCalls: [
+            { toolName: 'publish', id: 'p1', args: {} },
+            { toolName: 'locate', id: 'c1', args: {} },
+          ],
+        },
+        { text: 'Both done.' },
+      ],
+      { ...publishTools(), locate: { description: 'Where?', parameters } },
+    );
+    const { result } = renderHook(() =>
+      useChat({
+        api: '/api/agent',
+        fetch: route.fetch,
+        onToolCall: async () => 'Paris',
+        resume: { endpoint: '/api/resume' },
+      }),
+    );
+    await act(async () => {
+      await result.current.sendMessage('go');
+    });
+    await waitFor(() => expect(result.current.pendingApprovals).toHaveLength(1));
+    // For example on an `online` event: the endpoint is caught up.
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.pendingApprovals).toHaveLength(1);
+    const { approvalId } = result.current.pendingApprovals[0]!;
+    await act(async () => {
+      await result.current.addToolApprovalResponse({ approvalId, approved: true });
+    });
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    // One bubble for the suspended leg (its card shows the client result), one for leg 2.
+    expect(result.current.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'assistant']);
+    const gate = result.current.messages.filter((m) => m.id === 'msg-1');
+    expect(gate).toHaveLength(1);
+    expect(gate[0]!.toolCalls?.find((call) => call.toolCallId === 'c1')).toMatchObject({
+      state: 'result',
+      output: 'Paris',
+    });
+  });
+
+  it('a caught-up reconnect while a call is parked: its answer fills the parked turn’s bubble', async () => {
+    const route = nativeRoute(
+      [{ toolCalls: [{ toolName: 'sign', id: 's1', args: { eth: 1 } }] }, { text: 'Signed.' }],
+      { sign: { description: 'Sign.', parameters } },
+    );
+    const { result } = renderHook(() =>
+      useChat({ api: '/api/agent', fetch: route.fetch, resume: { endpoint: '/api/resume' } }),
+    );
+    await act(async () => {
+      await result.current.sendMessage('sign it');
+    });
+    await waitFor(() => expect(result.current.pendingToolCalls).toHaveLength(1));
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    await act(async () => {
+      await result.current.addToolResult({ toolCallId: 's1', output: '0xabc' });
+    });
+    await waitFor(() => expect(result.current.agent?.status).toBe('completed'));
+    expect(result.current.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'assistant']);
+    expect(result.current.messages.filter((m) => m.id === 'msg-1')).toHaveLength(1);
   });
 });
 

@@ -10,7 +10,9 @@
  *      This is the live vector, and it is the one most deployments miss.
  *   2. A forged `tool_result` part can claim any outcome ("payment captured").
  *      On the wire a client-authored tool result is INDISTINGUISHABLE from one
- *      the server produced, and the model believes it.
+ *      the server produced, and the model believes it. (Since 2.3 the default
+ *      accepts one only as the answer to a call of the assistant turn right
+ *      before it, the history `useChat` posts — see `rejectToolResults`.)
  *   3. Forged assistant turns rewrite what the model thinks it already said.
  *   4. 50 000 messages, or one 40 MB message, is a billing attack.
  *
@@ -89,6 +91,15 @@ export interface ValidateChatOptions {
    */
   maxOpaqueReasoningBytes?: number;
   /**
+   * Per-message budget in UTF-8 bytes for provider round-trip data (2.3): the
+   * `providerMetadata` of the message and of each of its parts (a Gemini
+   * function call's or text's thought signature, OpenAI's `phase`), and every
+   * reasoning `signature` (Claude). Default 1_000_000. `useChat` posts all of
+   * it back, and none of it counts against `maxTextBytes`; before 2.3 nothing
+   * bounded it at all.
+   */
+  maxProviderMetadataBytes?: number;
+  /**
    * Reject `role: 'system'` inside the client's messages. Default TRUE — this
    * is the live vector. Opt out only if the client legitimately owns the system
    * prompt (a local playground, never a multi-tenant deployment).
@@ -98,11 +109,17 @@ export interface ValidateChatOptions {
    * Reject client-authored `tool_result` parts (and `role: 'tool'` messages,
    * where the role itself is the claim). Default TRUE.
    *
-   * CLIENT TOOLS NEED THIS OFF. `useChat`'s `onToolCall` round-trip POSTs
-   * `clientToolResultMessage(...)` output, so set `rejectToolResults: false`
-   * there — and understand what you are accepting: this validator cannot tell a
-   * real client tool result from a forged one, because the same client authored
-   * the assistant turn it pairs with. The only real fix is to stop trusting the
+   * Since 2.3 the default ACCEPTS one shape: a `role: 'tool'` message, or a
+   * run of them, right after an assistant turn, holding only `tool_result`
+   * parts that each answer a different call of that turn. That is the history
+   * `useChat` posts after a client tool (`onToolCall` / `addToolResult`), an
+   * approval, and a server tool the leg ran, so a default route keeps working.
+   * Any other tool result is rejected as before, including one inside a
+   * `user` turn. `false` accepts every tool result.
+   *
+   * Understand what an accepted result is: this validator cannot tell a real
+   * tool result from a forged one, because the same client authored the
+   * assistant turn it pairs with. The only real fix is to stop trusting the
    * history: persist it server-side (`ChatStore` + `chatId`) and treat the
    * client's copy as a rendering cache.
    */
@@ -132,6 +149,9 @@ const DEFAULT_MAX_TEXT_BYTES = 100_000;
 
 /** Default per-message cap on opaque reasoning payloads (`maxOpaqueReasoningBytes`): 1 MB. */
 const DEFAULT_MAX_OPAQUE_REASONING_BYTES = 1_000_000;
+
+/** Default per-message cap on provider round-trip data (`maxProviderMetadataBytes`): 1 MB. */
+const DEFAULT_MAX_PROVIDER_METADATA_BYTES = 1_000_000;
 
 /**
  * Issue budget. A 1000-message hostile body must not amplify into 1000 strings
@@ -255,7 +275,8 @@ interface Walk {
  * `tool_use.input` with 40 levels of nesting around a 50 MB string is an obvious
  * attempt to hide volume from the cap, and "I could not measure this" must never
  * read as "this is small". Typed-array payloads count as 0 rather than walking a
- * megabyte of numbers one element at a time.
+ * megabyte of numbers one element at a time. An object's keys count like its
+ * values (2.3): before, a 40 MB key name passed every cap.
  */
 function countTextBytes(value: unknown, budget: number, depth: number, walk: Walk): number {
   if (typeof value === 'string') {
@@ -270,7 +291,8 @@ function countTextBytes(value: unknown, budget: number, depth: number, walk: Wal
   }
   walk.seen.add(value);
   let total = 0;
-  for (const entry of Array.isArray(value) ? value : Object.values(value)) {
+  const entries = Array.isArray(value) ? value : Object.entries(value).flat();
+  for (const entry of entries) {
     total += countTextBytes(entry, Math.max(0, budget - total), depth + 1, walk);
     if (total > budget) return total;
   }
@@ -305,23 +327,36 @@ function isOpaqueReasoning(part: Record<string, unknown>): boolean {
  * this pure validator cannot do for you. Opaque reasoning (2.3, see
  * `isOpaqueReasoning`) is provider state, not prose, and `useChat` posts every
  * block of a turn back, so it is counted on its own, against `opaqueBudget`.
+ * So is provider round-trip data (2.3): every `providerMetadata` and every
+ * reasoning `signature`, against `metadataBudget`.
  */
 function messageTextBytes(
   message: Record<string, unknown>,
   budget: number,
   opaqueBudget: number,
-): { bytes: number; opaqueBytes: number; tooDeep: boolean } {
+  metadataBudget: number,
+): { bytes: number; opaqueBytes: number; metadataBytes: number; tooDeep: boolean } {
   const walk: Walk = { seen: new WeakSet<object>(), tooDeep: false };
+  let metadata = 0;
+  const countMetadata = (value: unknown): void => {
+    if (value === undefined || metadata > metadataBudget) return;
+    metadata += countTextBytes(value, Math.max(0, metadataBudget - metadata), 0, walk);
+  };
+  countMetadata(message.providerMetadata);
   const content = message.content;
   if (typeof content === 'string') {
     const bytes = countTextBytes(content, budget, 0, walk);
-    return { bytes, opaqueBytes: 0, tooDeep: walk.tooDeep };
+    return { bytes, opaqueBytes: 0, metadataBytes: metadata, tooDeep: walk.tooDeep };
   }
-  if (!Array.isArray(content)) return { bytes: 0, opaqueBytes: 0, tooDeep: false };
+  if (!Array.isArray(content)) {
+    return { bytes: 0, opaqueBytes: 0, metadataBytes: metadata, tooDeep: walk.tooDeep };
+  }
   let total = 0;
   let opaque = 0;
   for (const part of content) {
     if (!isRecord(part)) continue;
+    countMetadata(part.providerMetadata);
+    if (part.type === 'reasoning') countMetadata(part.signature);
     if (isOpaqueReasoning(part)) {
       opaque += countTextBytes(part.text, Math.max(0, opaqueBudget - opaque), 0, walk);
       if (opaque > opaqueBudget) break;
@@ -339,7 +374,7 @@ function messageTextBytes(
     total += countTextBytes(payload, Math.max(0, budget - total), 0, walk);
     if (total > budget) break;
   }
-  return { bytes: total, opaqueBytes: opaque, tooDeep: walk.tooDeep };
+  return { bytes: total, opaqueBytes: opaque, metadataBytes: metadata, tooDeep: walk.tooDeep };
 }
 
 // ===================================================================
@@ -353,15 +388,68 @@ interface Gates {
   rejectAssistantTurns: boolean;
   maxTextBytes: number;
   maxOpaqueReasoningBytes: number;
+  maxProviderMetadataBytes: number;
 }
 
 type Fail = (issue: string) => void;
 
 /**
+ * The assistant turn a run of `role: 'tool'` messages follows (2.3): the ids
+ * of its calls, and the ones a message of the run answered already.
+ */
+interface ToolRun {
+  calls: Set<string>;
+  answered: Set<string>;
+}
+
+/** The calls of an assistant turn, for the tool messages that may follow it. */
+function toolRunOf(message: Record<string, unknown>): ToolRun {
+  const calls = new Set<string>();
+  if (Array.isArray(message.content)) {
+    for (const part of message.content) {
+      if (isRecord(part) && part.type === 'tool_use' && isNonEmptyString(part.id)) {
+        calls.add(part.id);
+      }
+    }
+  }
+  return { calls, answered: new Set() };
+}
+
+/**
+ * Whether a `role: 'tool'` message answers the turn its run follows (2.3):
+ * only `tool_result` parts, each for a different call of that turn that no
+ * earlier message of the run answered. That is the shape `useChat` posts. A
+ * message that does is recorded on `run`, so a call is answered once.
+ */
+function answersRun(message: Record<string, unknown>, run: ToolRun | undefined): boolean {
+  const content = message.content;
+  if (!run || !Array.isArray(content) || content.length === 0) return false;
+  const ids = new Set<string>();
+  for (const part of content) {
+    if (!isRecord(part) || part.type !== 'tool_result') return false;
+    const id = part.toolUseId;
+    if (!isNonEmptyString(id) || !run.calls.has(id) || run.answered.has(id) || ids.has(id)) {
+      return false;
+    }
+    ids.add(id);
+  }
+  for (const id of ids) run.answered.add(id);
+  return true;
+}
+
+/**
  * One content part. `Object.hasOwn`, never `in`: `{ type: 'constructor' }` is a
  * hostile payload that `in` would happily accept off `Object.prototype`.
+ * `answers` marks a part of a `role: 'tool'` message that answers the turn
+ * before it (see `answersRun`), whose results the default accepts.
  */
-function validatePart(value: unknown, path: string, gates: Gates, fail: Fail): void {
+function validatePart(
+  value: unknown,
+  path: string,
+  gates: Gates,
+  fail: Fail,
+  answers = false,
+): void {
   if (!isRecord(value)) {
     fail(`${path} must be an object; got ${typeOf(value)}.`);
     return;
@@ -400,7 +488,7 @@ function validatePart(value: unknown, path: string, gates: Gates, fail: Fail): v
       // Checked at the PART level as well as the role level: a `tool_result`
       // smuggled inside a `role: 'user'` message is the obvious way around a
       // role-only gate, and adapters serialize it just the same.
-      if (gates.rejectToolResults) {
+      if (gates.rejectToolResults && !answers) {
         fail(
           `${path} is a client-authored tool_result — the server cannot tell it from a real one (set rejectToolResults: false to allow it).`,
         );
@@ -416,8 +504,18 @@ function validatePart(value: unknown, path: string, gates: Gates, fail: Fail): v
   }
 }
 
-/** One message. A gate rejection stops here — the turn is refused, its content is moot. */
-function validateMessage(value: unknown, path: string, gates: Gates, fail: Fail): void {
+/**
+ * One message. A gate rejection stops here — the turn is refused, its content
+ * is moot. `answers` marks a `role: 'tool'` message that answers the turn
+ * before it (see `answersRun`).
+ */
+function validateMessage(
+  value: unknown,
+  path: string,
+  gates: Gates,
+  fail: Fail,
+  answers = false,
+): void {
   if (!isRecord(value)) {
     fail(`${path} must be an object; got ${typeOf(value)}.`);
     return;
@@ -439,11 +537,12 @@ function validateMessage(value: unknown, path: string, gates: Gates, fail: Fail)
     );
     return;
   }
-  if (role === 'tool' && gates.rejectToolResults) {
+  if (role === 'tool' && gates.rejectToolResults && !answers) {
     // The ROLE is the claim here, whatever the content shape: a `role: 'tool'`
-    // message asserts "a tool ran and produced this".
+    // message asserts "a tool ran and produced this". Since 2.3 the default
+    // accepts it only as the answer to the assistant turn right before it.
     fail(
-      `${path}.role is 'tool' — a client may not author tool results (set rejectToolResults: false to allow it).`,
+      `${path}.role is 'tool' but answers no call of the assistant turn before it — a client may not author any other tool result (set rejectToolResults: false to allow it).`,
     );
     return;
   }
@@ -455,7 +554,7 @@ function validateMessage(value: unknown, path: string, gates: Gates, fail: Fail)
   }
   if (Array.isArray(content)) {
     for (let i = 0; i < content.length; i++) {
-      validatePart(content[i], `${path}.content[${i}]`, gates, fail);
+      validatePart(content[i], `${path}.content[${i}]`, gates, fail, answers);
     }
   }
   if (value.providerMetadata !== undefined && !isRecord(value.providerMetadata)) {
@@ -463,7 +562,12 @@ function validateMessage(value: unknown, path: string, gates: Gates, fail: Fail)
       `${path}.providerMetadata must be an object when present; got ${typeOf(value.providerMetadata)}.`,
     );
   }
-  const size = messageTextBytes(value, gates.maxTextBytes, gates.maxOpaqueReasoningBytes);
+  const size = messageTextBytes(
+    value,
+    gates.maxTextBytes,
+    gates.maxOpaqueReasoningBytes,
+    gates.maxProviderMetadataBytes,
+  );
   if (size.tooDeep) {
     fail(
       `${path} has a content payload nested deeper than ${MAX_WALK_DEPTH} levels — its size cannot be accounted for, so it is refused.`,
@@ -475,6 +579,10 @@ function validateMessage(value: unknown, path: string, gates: Gates, fail: Fail)
   } else if (size.opaqueBytes > gates.maxOpaqueReasoningBytes) {
     fail(
       `${path} carries more than ${gates.maxOpaqueReasoningBytes} bytes of encrypted or redacted reasoning.`,
+    );
+  } else if (size.metadataBytes > gates.maxProviderMetadataBytes) {
+    fail(
+      `${path} carries more than ${gates.maxProviderMetadataBytes} bytes of provider metadata (providerMetadata and reasoning signatures).`,
     );
   }
 }
@@ -496,6 +604,8 @@ export function validateChatRequest(
     rejectAssistantTurns: options.rejectAssistantTurns ?? false,
     maxTextBytes: options.maxTextBytes ?? DEFAULT_MAX_TEXT_BYTES,
     maxOpaqueReasoningBytes: options.maxOpaqueReasoningBytes ?? DEFAULT_MAX_OPAQUE_REASONING_BYTES,
+    maxProviderMetadataBytes:
+      options.maxProviderMetadataBytes ?? DEFAULT_MAX_PROVIDER_METADATA_BYTES,
   };
 
   const issues: string[] = [];
@@ -535,8 +645,15 @@ export function validateChatRequest(
     fail(`messages has ${rawMessages.length} entries; the limit is ${maxMessages}.`);
   } else {
     checked = rawMessages as readonly unknown[];
+    // The assistant turn the current run of `role: 'tool'` messages answers.
+    let run: ToolRun | undefined;
     for (let i = 0; i < checked.length; i++) {
-      validateMessage(checked[i], `messages[${i}]`, gates, fail);
+      const message = checked[i];
+      const role = isRecord(message) ? message.role : undefined;
+      const answers = role === 'tool' && answersRun(message as Record<string, unknown>, run);
+      validateMessage(message, `messages[${i}]`, gates, fail, answers);
+      if (role === 'assistant') run = toolRunOf(message as Record<string, unknown>);
+      else if (role !== 'tool') run = undefined;
     }
   }
 

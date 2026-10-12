@@ -29,6 +29,7 @@ import type { Clock } from './types/deps';
 import type { StandardSchemaV1 } from './types/schema';
 import type { ToolApprovalRequest, ToolCallOutcome } from './types/tool';
 import type {
+  AgentEvent,
   AgentPartialOutput,
   AgentResult,
   AgentStream,
@@ -837,6 +838,12 @@ interface SendOptions {
  * The shared SSE shell of the serializers. `nextSeq` is the event id the next
  * journaled part will get, so a part can name its own id (the agent frames'
  * `seq`, 2.3) when it is built right before its `send`.
+ *
+ * `journaled` (2.3) is asked, when a `store` is set, before the leg sends or
+ * stores anything: whether this leg belongs in the journal. A leg it keeps out
+ * is DETACHED: it goes out on this response only, with no `id:` lines, and
+ * leaves the journal untouched (no record, no `done` sentinel). Its parts are
+ * still numbered from 0 for `nextSeq`, so its frames fold on their own.
  */
 function deuzSSEResponse(
   label: string,
@@ -845,6 +852,7 @@ function deuzSSEResponse(
     send: (part: DeuzUIPart, sendOptions?: SendOptions) => void,
     nextSeq: () => number,
   ) => Promise<void>,
+  journaled?: () => Promise<boolean>,
 ): Response {
   const encoder = new TextEncoder();
   const version: DeuzWireVersion = options.wireVersion ?? 'v2';
@@ -853,7 +861,7 @@ function deuzSSEResponse(
   if (store && !streamId) {
     throw new Error(`${label}: \`streamId\` is required when \`store\` is set.`);
   }
-  const writer =
+  let writer =
     store && streamId ? createStoreWriter(store, streamId, options.onStoreError) : undefined;
 
   // The client can vanish mid-stream (refresh, tab close, network drop) — the
@@ -871,9 +879,15 @@ function deuzSSEResponse(
           clientGone = true;
         }
       };
+      // A detached leg (see `journaled`) carries no journal coordinates.
+      let ids = version === 'v2';
+      if (writer && journaled && !(await journaled())) {
+        writer = undefined;
+        ids = false;
+      }
       let seq = 0;
       let resumed = false;
-      if (store && streamId) {
+      if (writer && store && streamId) {
         try {
           const last = await lastStoredSeq(store, streamId);
           if (last >= 0) {
@@ -924,7 +938,7 @@ function deuzSSEResponse(
         // Store BEFORE wire: a part in flight during a disconnect must still
         // land in the log even though its enqueue never happens.
         writer?.append(seq, part);
-        enqueue(`${version === 'v2' ? `id: ${seq}\n` : ''}data: ${JSON.stringify(part)}\n\n`);
+        enqueue(`${ids ? `id: ${seq}\n` : ''}data: ${JSON.stringify(part)}\n\n`);
         seq++;
       };
       if (!resumed) {
@@ -936,7 +950,7 @@ function deuzSSEResponse(
       // suspended-for-approval). Replay treats it as terminal only when
       // nothing was appended after it, so a continued run stays reachable.
       writer?.append(seq, { type: 'done' });
-      enqueue(`${version === 'v2' ? `id: ${seq}\n` : ''}data: [DONE]\n\n`);
+      enqueue(`${ids ? `id: ${seq}\n` : ''}data: [DONE]\n\n`);
       // Flush pending appends before closing so replay never misses the tail
       // (matters on serverless runtimes that freeze after the response ends).
       if (writer) await writer.settled();
@@ -1116,77 +1130,108 @@ function agentResultFrame(
  * v1 gets the plain chat stream. With `store` and `streamId`, every frame's
  * `seq` is its event id in the journal, so a client resumes through
  * {@link resumeDeuzStreamResponse} and the sequence grows across every leg
- * journaled under that `streamId` — use one per run, such as the run id.
+ * journaled under that `streamId` — use one per run, such as the run id. A
+ * stream has one writer at a time: a leg the run REFUSED before it began
+ * (another executor holds the run, the run id is stored under another scope,
+ * an unknown run, invalid options) goes out on its own response only, with
+ * its failed result and error part but no event ids, and writes nothing to
+ * the journal, where its frames would take the seqs of the leg that does run.
  */
 export function toDeuzAgentStreamResponse<T>(
   stream: AgentStream<T>,
   options: ToDeuzAgentStreamOptions = {},
 ): Response {
   const events = stream.events[Symbol.asyncIterator]();
-  return deuzSSEResponse('toDeuzAgentStreamResponse', options, async (send, nextSeq) => {
-    // Built right before its `send`, so the frame's `seq` is its own event id.
-    const frame = (payload: DistributiveOmit<DeuzAgentFrame, 'seq'>): void => {
-      const { kind, ...rest } = payload;
-      send({ type: 'data-agent', id: kind, payload: { kind, seq: nextSeq(), ...rest } });
-    };
-    frame({
-      kind: 'run',
-      ...(options.runId !== undefined ? { runId: options.runId } : {}),
-      status: 'running',
-    });
-    let sawError = false;
-    let sawResult = false;
-    const result = (outcome: AgentResult<unknown>): void => {
-      sawResult = true;
-      frame(agentResultFrame(outcome));
-      if (outcome.status === 'failed' && !sawError) {
-        sawError = true;
-        send({ type: 'error', message: redactString(outcome.error.message) });
-      }
-    };
+  // The run's first event, when the journal question below read it ahead.
+  let ahead: Promise<IteratorResult<AgentEvent<T>>> | undefined;
+  const next = (): Promise<IteratorResult<AgentEvent<T>>> => {
+    const step = ahead ?? events.next();
+    ahead = undefined;
+    return step;
+  };
+  // A run refused before it began emits its failed result before anything
+  // else; a run that began starts with a phase, and one that stopped or
+  // suspended before its first model call is journaled as before. Only the
+  // first event tells them apart. (A run whose execution deadline had passed
+  // also fails first; its terminal state is the stored run's to report.)
+  const journaled = async (): Promise<boolean> => {
+    ahead = events.next();
     try {
-      for (;;) {
-        const step = await events.next();
-        if (step.done) break;
-        const event = step.value;
-        switch (event.type) {
-          case 'part': {
-            const ui = toUIPart(event.part);
-            if (!ui) break;
-            if (ui.type === 'error') sawError = true;
-            send(ui);
-            break;
-          }
-          case 'phase':
-            frame({ kind: 'phase', phase: event.phase });
-            break;
-          case 'partial-output':
-            frame({ kind: 'partial', attempt: event.attempt, value: event.value });
-            break;
-          case 'array-element':
-            frame({
-              kind: 'element',
-              attempt: event.attempt,
-              index: event.index,
-              value: event.value,
-            });
-            break;
-          case 'result':
-            result(event.result as AgentResult<unknown>);
-            break;
-          default:
-            // `tool-output` (the raw result) stays on the server.
-            break;
-        }
-      }
-      // A stream that had already ended when it was passed in has no events
-      // left; its result still says how the run ended.
-      if (!sawResult) result((await stream.result) as AgentResult<unknown>);
-    } catch (err) {
-      // The native pump settles failures as a result; this is belt and braces.
-      if (!sawError) send({ type: 'error', message: errorMessage(err) });
+      const step = await ahead;
+      return step.done || step.value.type !== 'result' || step.value.result.status !== 'failed';
+    } catch {
+      return true; // the read fails again in `produce`, which reports it
     }
-  });
+  };
+  return deuzSSEResponse(
+    'toDeuzAgentStreamResponse',
+    options,
+    async (send, nextSeq) => {
+      // Built right before its `send`, so the frame's `seq` is its own event id.
+      const frame = (payload: DistributiveOmit<DeuzAgentFrame, 'seq'>): void => {
+        const { kind, ...rest } = payload;
+        send({ type: 'data-agent', id: kind, payload: { kind, seq: nextSeq(), ...rest } });
+      };
+      frame({
+        kind: 'run',
+        ...(options.runId !== undefined ? { runId: options.runId } : {}),
+        status: 'running',
+      });
+      let sawError = false;
+      let sawResult = false;
+      const result = (outcome: AgentResult<unknown>): void => {
+        sawResult = true;
+        frame(agentResultFrame(outcome));
+        if (outcome.status === 'failed' && !sawError) {
+          sawError = true;
+          send({ type: 'error', message: redactString(outcome.error.message) });
+        }
+      };
+      try {
+        for (;;) {
+          const step = await next();
+          if (step.done) break;
+          const event = step.value;
+          switch (event.type) {
+            case 'part': {
+              const ui = toUIPart(event.part);
+              if (!ui) break;
+              if (ui.type === 'error') sawError = true;
+              send(ui);
+              break;
+            }
+            case 'phase':
+              frame({ kind: 'phase', phase: event.phase });
+              break;
+            case 'partial-output':
+              frame({ kind: 'partial', attempt: event.attempt, value: event.value });
+              break;
+            case 'array-element':
+              frame({
+                kind: 'element',
+                attempt: event.attempt,
+                index: event.index,
+                value: event.value,
+              });
+              break;
+            case 'result':
+              result(event.result as AgentResult<unknown>);
+              break;
+            default:
+              // `tool-output` (the raw result) stays on the server.
+              break;
+          }
+        }
+        // A stream that had already ended when it was passed in has no events
+        // left; its result still says how the run ended.
+        if (!sawResult) result((await stream.result) as AgentResult<unknown>);
+      } catch (err) {
+        // The native pump settles failures as a result; this is belt and braces.
+        if (!sawError) send({ type: 'error', message: errorMessage(err) });
+      }
+    },
+    journaled,
+  );
 }
 
 // ===================================================================

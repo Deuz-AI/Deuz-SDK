@@ -320,6 +320,54 @@ describe('useChat', () => {
     expect(result.current.error).toBeUndefined();
   });
 
+  it('a message sent while onToolCall runs drops its late result: no stray tool turn, no continuation (2.3)', async () => {
+    const bodies: Array<{ messages: Array<{ role: string; content: unknown }> }> = [];
+    const fetchMock: typeof fetch = async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as (typeof bodies)[number]);
+      return sseResponseOf(
+        bodies.length === 1
+          ? [
+              JSON.stringify({ type: 'tool-call', toolCallId: 't1', toolName: 'geo', input: {} }),
+              finishPart,
+              '[DONE]',
+            ]
+          : [JSON.stringify({ type: 'text-delta', text: 'Sure.' }), finishPart, '[DONE]'],
+      );
+    };
+    let calls = 0;
+    let resolveCall!: (value: unknown) => void;
+    const onToolCall = () => {
+      calls++;
+      return new Promise<unknown>((resolve) => {
+        resolveCall = resolve;
+      });
+    };
+    const { result } = renderHook(() =>
+      useChat({ api: '/api/chat', fetch: fetchMock, onToolCall }),
+    );
+    let first: Promise<void> | undefined;
+    act(() => {
+      first = result.current.sendMessage('where am i?');
+    });
+    await waitFor(() => expect(calls).toBe(1));
+    await act(async () => {
+      await result.current.sendMessage('never mind');
+    });
+    await act(async () => {
+      resolveCall({ lat: 48.85 });
+      await first;
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    // Before 2.3 the result was appended after the new exchange and POSTed again.
+    expect(bodies).toHaveLength(2);
+    expect(result.current.history.canonical.map((m) => m.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+      'assistant',
+    ]);
+  });
+
   it('regenerate drops the trailing assistant turn (core dropTrailingAssistant)', async () => {
     const bodies: Array<{ messages: unknown[] }> = [];
     const fetchMock: typeof fetch = async (_url, init) => {

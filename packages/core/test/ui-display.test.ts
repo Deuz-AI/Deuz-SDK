@@ -23,7 +23,9 @@ import {
   assistantMessageFromTurn,
   canonicalFromUI,
   createAssistantTurn,
+  uiFromMessages,
   type AssistantTurnState,
+  type UIMessage,
 } from '../src/chat';
 import { createMockModel } from '../src/testing';
 import { readDeuzStream, toDeuzStreamResponse, type DeuzUIPart } from '../src/ui';
@@ -334,5 +336,72 @@ describe('a resumed leg does not re-emit the calls of the leg before it (2.3)', 
     expect(second.message.toolCalls?.[0]?.input).toBeUndefined();
     // Before 2.3 this was [tool_use t1 (no input), text]: a second, invalid tool_use.
     expect(assistantMessageFromTurn(second)).toEqual({ role: 'assistant', content: 'Deleted.' });
+    // `canonicalFromUI` (setMessages, a restored UI) re-derives the history useChat
+    // keeps: the result follows the call it answers, and the call is not repeated.
+    const ui = [...uiFromMessages(messages, () => 'u'), first.message, second.message];
+    expect(canonicalFromUI(ui)).toEqual([
+      { role: 'user', content: 'x' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'del', input: { p: 1 } }],
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 't1', result: 'ok' }] },
+      { role: 'assistant', content: 'Deleted.' },
+    ]);
+  });
+
+  it('canonicalFromUI places a later leg’s result after the call it answers, never as an orphan', () => {
+    const gate: UIMessage = {
+      id: 'a1',
+      role: 'assistant',
+      content: '',
+      toolCalls: [
+        { toolCallId: 'p1', toolName: 'publish', input: { doc: 7 }, state: 'approval-requested' },
+        { toolCallId: 'c1', toolName: 'locate', input: {}, state: 'result', output: 'Paris' },
+      ],
+      parts: [
+        { type: 'tool', toolCallId: 'p1' },
+        { type: 'tool', toolCallId: 'c1' },
+      ],
+    };
+    const resumed: UIMessage = {
+      id: 'a2',
+      role: 'assistant',
+      content: 'Published.',
+      toolCalls: [
+        {
+          toolCallId: 'p1',
+          toolName: 'publish',
+          input: undefined,
+          state: 'result',
+          output: 'done',
+        },
+      ],
+      parts: [
+        { type: 'tool', toolCallId: 'p1' },
+        { type: 'text', text: 'Published.', state: 'done' },
+      ],
+    };
+    const user: UIMessage = { id: 'u', role: 'user', content: 'go' };
+    // The native follow-up shape useChat posts (see use-chat-native.test.tsx).
+    expect(canonicalFromUI([user, gate, resumed])).toEqual([
+      { role: 'user', content: 'go' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'p1', name: 'publish', input: { doc: 7 } },
+          { type: 'tool_use', id: 'c1', name: 'locate', input: {} },
+        ],
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'c1', result: 'Paris' }] },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'p1', result: 'done' }] },
+      { role: 'assistant', content: 'Published.' },
+    ]);
+    // With the call gone (the app deleted that turn), its result would answer
+    // nothing: an orphan tool_result is refused by every provider, so none is sent.
+    expect(canonicalFromUI([user, resumed])).toEqual([
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'Published.' },
+    ]);
   });
 });

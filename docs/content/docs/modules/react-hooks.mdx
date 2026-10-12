@@ -81,7 +81,7 @@ It is not re-adopted when the prop changes: apps pass an inline array literal, s
 The hook keeps **two** views of the conversation and publishes them in a **single** state commit, so no render can ever see one a frame behind the other:
 
 - `messages` — the render-friendly `UIMessage[]` (accumulated `content`, `reasoning`, `toolCalls` with live `state`, and ordered `parts`).
-- `history.canonical` — the canonical `Message[]` it POSTs, reconstructing each assistant turn from the streamed parts in arrival order. Since 2.3 that includes every reasoning block, unchanged and in place, and each tool call's provider metadata (a Gemini function call's `thoughtSignature`, without which Gemini 3 rejects the next request; not live-verified), so a Claude, Gemini or OpenAI tool loop continues with its reasoning (see [Reasoning parts](/docs/core/messages#reasoning-parts)). Since 2.3 the signature Gemini can put on a plain text part makes the trip too: the `text-delta` frame carries it, the UI text part keeps it as `providerMetadata`, and the canonical turn sends it back on that text (such a text stays a part instead of collapsing to a string). Gemini does not enforce text signatures, but its reasoning may degrade without them (not live-verified).
+- `history.canonical` — the canonical `Message[]` it POSTs, reconstructing each assistant turn from the streamed parts in arrival order. Since 2.3 that includes every reasoning block, unchanged and in place, and each tool call's provider metadata (a Gemini function call's `thoughtSignature`, without which Gemini 3 rejects the next request; not live-verified), so a Claude, Gemini or OpenAI tool loop continues with its reasoning (see [Reasoning parts](/docs/core/messages#reasoning-parts)). Since 2.3 the signature Gemini can put on a plain text part makes the trip too: the `text-delta` frame carries it, the UI text part keeps it as `providerMetadata`, and the canonical turn sends it back on that text (such a text stays a part instead of collapsing to a string). Gemini does not enforce text signatures, but its reasoning may degrade without them (not live-verified). Since 2.3 a call the server ran within a turn is answered right after it: the hook adds the call's result, the one the model saw, as a `role: 'tool'` message after the assistant turn, as `canonicalFromUI` does. Before 2.3 the next request carried that `tool_use` open, which providers reject, and a chat route's approval continuation ran the call a second time, because it settles every call the history leaves open.
 
 `history` exposes the pair the hook already holds, so **persisting a chat should persist `history.canonical`** rather than round-tripping through the lossy `canonicalFromUI`. Its identity is stable until a view changes. History is immutable — new arrays on every update.
 
@@ -199,8 +199,8 @@ setHistory({ ui: [], canonical: [{ role: 'system', content: SYS }] }); // switch
 ```
 
 - **`setHistory(update)`** replaces both views in one commit — the honest primitive, because only the canonical one is POSTable. Use it to switch chats, hydrate after mount, or edit a rendered message while keeping a system prompt and provider round-trip data the UI view cannot carry.
-- **`setMessages(update)`** is sugar over it: the canonical view is re-derived with `canonicalFromUI`, which is **lossy** — `system` messages, `Message.providerMetadata` and UI-only state do not survive, and a message without ordered `parts` loses its attachments entirely. Drive `setHistory` directly when your history has any of those.
-- **Both drop pending approvals and parked tool calls** — they were anchored to the transcript you just replaced. They do **not** reset the turn readouts (cost, citations, …); the next turn does, exactly as `sendMessage` already did.
+- **`setMessages(update)`** is sugar over it: the canonical view is re-derived with `canonicalFromUI`, which is **lossy** — `system` messages, `Message.providerMetadata` and UI-only state do not survive, and a message without ordered `parts` loses its attachments entirely. Drive `setHistory` directly when your history has any of those. Since 2.3 it re-derives the leg that resumed an approval the way the hook's history holds it: the approved call's result goes right after the call it answers, and the resumed turn does not repeat the call. Before 2.3 it sent the call a second time without its input, which no provider accepts.
+- **Both drop pending approvals and parked tool calls** — they were anchored to the transcript you just replaced. Since 2.3 they also drop the in-memory resume cursor, which addresses that transcript's stream: after a chat switch, the next `reconnect()` reads the new chat from the persisted cursor (`resume.cursor`) or from its start, never from the old chat's position. They do **not** reset the turn readouts (cost, citations, …); the next turn does, exactly as `sendMessage` already did.
 - **`clearError()`** dismisses the error (`status: 'error'` → `'idle'`) and leaves a live stream alone.
 
 The streaming turn is located in `ui` **by id** rather than by overwriting the trailing element, so a mid-stream `setMessages` can no longer have its result clobbered.
@@ -230,7 +230,7 @@ A bare string stays a **plain string** `content`, byte-identical to 1.8, so a pr
 
 When the server streams a `tool-call` it did not execute (a client tool — a **registered key with no `execute`**), the hook has two modes:
 
-**With `onToolCall`** — the executor runs, the result is appended to the canonical history, and the hook **re-POSTs automatically**, looping until a round has no pending client calls. A throwing `onToolCall` self-heals as an `is_error` result, mirroring the server loop.
+**With `onToolCall`** — the executor runs, the result is appended to the canonical history, and the hook **re-POSTs automatically**, looping until a round has no pending client calls. A throwing `onToolCall` self-heals as an `is_error` result, mirroring the server loop. Since 2.3 a result that lands after the chat moved on (a new message, `regenerate`, `editAndResend`, `setHistory` or `setMessages` while the call ran) is dropped: it answers a turn that is no longer current. Before, it was appended after the new exchange and POSTed again.
 
 **Without `onToolCall`** — the round-trip **parks**: the calls appear in `pendingToolCalls`, `status` goes idle, and nothing is re-POSTed. Answer each from outside the hook:
 
@@ -261,15 +261,15 @@ A replay can re-deliver calls this client already handled. The endpoint replays 
 
 That evidence is the canonical history. It survives a reload only if you persist `history.canonical` and restore it through `initialMessages`. A call whose result was not saved before the page went away is dispatched again after the reload, because the hook cannot know it ran. So this is at-most-once within a mounted hook, not exactly-once across reloads. Make such tools idempotent, or omit `onToolCall` and confirm parked calls yourself. A tab that only watches a stream another tab drives should omit `onToolCall` too, or it runs that tab's calls.
 
-<Callout type="warn" title="A client-tool route needs `rejectToolResults: false`">
-The round-trip POSTs a `role: 'tool'` message, which [`validateChatRequest`](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false) rejects by default. Pass `{ rejectToolResults: false }` — and read what that accepts.
+<Callout type="warn" title="The history holds tool results the client posts">
+The round-trip POSTs a `role: 'tool'` message, and so does the history after an approval or a server tool the leg ran. Since 2.3 the default [`validateChatRequest`](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false) accepts it, because it answers calls of the assistant turn right before it; before 2.3 a route had to pass `{ rejectToolResults: false }`. Read what the validator cannot tell apart: a forged result in that shape passes too.
 </Callout>
 
 ## Tool approvals
 
 A `tool-approval-request` part **pauses** the chat: the request lands in `pendingApprovals`, the matching `toolCalls` entry flips to `state: 'approval-requested'`, and nothing is re-POSTed. Record verdicts with `addToolApprovalResponse`; once **every** pending approval has one, the hook resumes with `approvalResponses` in the request body — the [server settles the gated calls](/docs/agents/client-tools#tool-approval-round-trip), the client never fabricates a gated `tool_result`. The request's signed `token` is auto-preserved.
 
-The resumed leg executes the approved call and streams its state and result, not the call itself. Since 2.3 the hook adds that result to `history.canonical` as a `role: 'tool'` message, so the next request answers the call. Before 2.3 the result reached only the screen, and the turn repeated the call in the history without its input, so the next request carried an open `tool_use`.
+The resumed leg executes the approved call and streams its state and result, not the call itself. Since 2.3 the hook adds that result to `history.canonical` as a `role: 'tool'` message, so the next request answers the call. Before 2.3 the result reached only the screen, and the turn repeated the call in the history without its input, so the next request carried an open `tool_use`. The default `validateChatRequest` accepts that message since 2.3, because it answers a call of the assistant turn right before it; see [what that accepts](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false).
 
 ```tsx
 {pendingApprovals.map((req) => (
@@ -322,7 +322,7 @@ Since 2.3 a `UIToolCall` also carries `outcome`, from the latest `tool-state` or
 `useChat` also drives a route that serves a [native agent run](/docs/modules/native-agents) (`streamAgent` / `resumeStreamAgent`) through [`toDeuzAgentStreamResponse`](/docs/modules/ui-streaming#native-agent-runs-todeuzagentstreamresponse-23). Nothing is configured on the client. The route's `data-agent` frames fold into the turn (`agent`), and when the run suspends, the hook resumes it the way `resumeStreamAgent` needs:
 
 - **The run's terminal frame is the authority** on what it waits for. Its approvals pause the chat (`pendingApprovals`); its client calls (tools without `execute` on the server) run through `onToolCall` or park in `pendingToolCalls`.
-- **One request resumes the run**: `{ messages, runId, approvalResponses?, clientToolResults? }`. A native resume proceeds only with a verdict for every pending approval and a result for every pending client call, so after the last verdict the hook runs the client calls first, then sends both together. `clientToolResults` entries are `{ toolCallId, output, isError? }`. The answers also join `history.canonical`, as on a chat route.
+- **One request resumes the run**: `{ messages, runId, approvalResponses?, clientToolResults? }`. A native resume proceeds only with a verdict for every pending approval and a result for every pending client call, so after the last verdict the hook runs the client calls first, then sends both together. The calls run inside that round: `status` is `'streaming'` from the last verdict on, `stop()` while they run cancels the request, and a message sent meanwhile drops the gate, so the run is not resumed. `clientToolResults` entries are `{ toolCallId, output, isError? }`. The answers also join `history.canonical`, as on a chat route.
 - **The 2.3 settlement rules hold**: a verdict counts only for the open gate ([F06](#verdicts-answer-the-open-gate)), and a replayed client call runs at most once per mounted hook ([F07](#client-tools-after-a-reconnect)). `reconnect()` reads a run's journal like any other.
 - **`agent`** is the run's state for the turn: `runId`, `status` (`'running'`, `'suspended'`, `'completed'`, `'stopped'`, `'failed'`), the latest `partial` draft while it runs, and, only once `completed`, the `output` the server validated. A `stopped` run has a `reason` (`'aborted'`, `'cancelled'`, `'refusal'`, …) and, for a refusal, `stopDetails`. The agent frames stay out of `dataParts` and `onData`.
 - **A chat route is unchanged.** It never sends a frame, so the hook never sends `runId` or `clientToolResults` to it. With a core older than 2.3 there are no agent frames to read, and the hook behaves as before.
@@ -370,13 +370,20 @@ const options = {
 };
 
 export async function POST(req: Request): Promise<Response> {
-  // `rejectToolResults: false`: the history holds the client's tool answers.
-  const parsed = validateChatRequest(await req.json(), { rejectToolResults: false });
+  // The defaults accept the history useChat posts: each tool result answers the turn before it.
+  const parsed = validateChatRequest(await req.json());
   if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
   const { rest } = parsed.request;
   const scope = 'tenant-a'; // the signed-in user's tenant, never a field of the body
   const resuming = typeof rest.runId === 'string';
   const runId = resuming ? (rest.runId as string) : crypto.randomUUID();
+  if (resuming) {
+    // Only this user's run, and only while it waits for answers: another tenant's
+    // runId, a second tab or a double submit is refused before a leg starts.
+    const stored = await runs.load(runId);
+    if (stored?.scope !== scope) return new Response('Unknown run', { status: 404 });
+    if (stored.result?.status !== 'suspended') return new Response('Not waiting', { status: 409 });
+  }
   const session = { store: runs, runId, scope };
   const stream = resuming
     ? resumeStreamAgent({
@@ -399,7 +406,7 @@ export async function POST(req: Request): Promise<Response> {
 }
 ```
 
-A resume reads the run's history from the store, not from the posted `messages`, and `resumeStreamAgent` refuses a `runId` stored under another `scope`, so take the scope from your authentication. A client result passes the same validation and projection path as a server tool's result. To let a client reconnect, serve `resumeDeuzStreamResponse(streams, runId, { lastEventId })` from a GET route (after checking that the user owns `runId`) and point `resume.endpoint` at it.
+A resume reads the run's history from the store, not from the posted `messages`, and `resumeStreamAgent` refuses a `runId` stored under another `scope`, so take the scope from your authentication. The route checks both before it resumes: a run is stored without a `result` while a leg executes, so a second tab or a double submit gets a 409, and `useChat` shows it as an error. A request that gets past the check anyway (two arriving at once) is refused by the run itself, and `toDeuzAgentStreamResponse` keeps such a [refused leg out of the journal](/docs/modules/ui-streaming#sequence-and-replay): its client sees the failure, and the leg that runs keeps its event ids. A client result passes the same validation and projection path as a server tool's result. To let a client reconnect, serve `resumeDeuzStreamResponse(streams, runId, { lastEventId })` from a GET route (after checking that the user owns `runId`) and point `resume.endpoint` at it.
 
 ```tsx title="AgentChat.tsx"
 'use client';
@@ -474,7 +481,7 @@ useChat({
 - **A caught-up endpoint is a no-op.** A resume that folds zero parts (an immediate `[DONE]`) changes nothing at all; 1.8 pre-pushed the assistant bubble before reading and left a permanently empty one on screen.
 - **`cursor` is an injectable adapter** — no `localStorage` is hardcoded (that would break SSR and React Native), and a throwing adapter cannot kill a live stream.
 - **A resumed turn settles like a streamed one** (2.3). Its approvals pause the chat, and its client calls reach `onToolCall` or `pendingToolCalls`; see [Client tools after a reconnect](#client-tools-after-a-reconnect). Under `auto` the read stays silent, but a POST it triggers (an `onToolCall` result continuing the chat) reports a failure like any other request.
-- **The cursor follows the POST read too (2.3).** When the POST response carries the journal's `id:` lines (the route passes `store` and `streamId`), they move the hook's in-memory cursor. A `reconnect()` after a settled turn, or after a leg the hook continued with a POST, then resumes after it and appends nothing the history already holds; a reconnect after a dropped POST continues that turn from the last part it showed. Before 2.3 the POST read left the cursor alone, so such a reconnect appended the replayed turn to the history a second time. The persisted cursor (`resume.cursor`) still moves on resume reads only, because a reload mid-turn must replay that turn from its start. After a reload, a replay of a journal that also holds legs the restored history already has (a lost or old cursor) still appends them again: the restored history is all the hook knows. Let the resume endpoint answer 404 when nothing is in flight, and journal one run per `streamId`.
+- **The cursor follows the POST read too (2.3).** When the POST response carries the journal's `id:` lines (the route passes `store` and `streamId`), they move the hook's in-memory cursor. A `reconnect()` after a settled turn, or after a leg the hook continued with a POST, then resumes after it and appends nothing the history already holds; a reconnect after a dropped POST continues that turn from the last part it showed. Before 2.3 the POST read left the cursor alone, so such a reconnect appended the replayed turn to the history a second time. The persisted cursor (`resume.cursor`) still moves on resume reads only, because a reload mid-turn must replay that turn from its start. `setHistory` and `setMessages` drop the in-memory cursor, so after a chat switch the new chat is read from its persisted cursor or its start. After a reload, a replay of a journal that also holds legs the restored history already has (a lost or old cursor) still appends them again: the restored history is all the hook knows. Let the resume endpoint answer 404 when nothing is in flight, and journal one run per `streamId`.
 
 ## Truncated turns
 

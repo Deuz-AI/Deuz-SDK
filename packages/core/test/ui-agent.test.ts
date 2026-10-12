@@ -273,7 +273,7 @@ describe('toDeuzAgentStreamResponse', () => {
     expect(parts.some((p) => p.type === 'error')).toBe(false);
   });
 
-  it('reports a failure as a failed frame and one redacted error part', async () => {
+  it('reports a failure as a failed frame and one error part', async () => {
     const parts = await collect(
       toDeuzAgentStreamResponse(
         streamAgent({
@@ -290,6 +290,37 @@ describe('toDeuzAgentStreamResponse', () => {
     expect(parts.filter((p) => p.type === 'error')).toEqual([
       { type: 'error', message: 'maxSteps must be a positive integer.' },
     ]);
+  });
+
+  it('redacts a credential in the failed frame and in the error part', async () => {
+    const secret = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789';
+    const { fetch } = mockFetch(
+      () =>
+        new Response(
+          JSON.stringify({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: `invalid x-api-key ${secret}` },
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        ),
+    );
+    const parts = await collect(
+      toDeuzAgentStreamResponse(
+        streamAgent({
+          model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-5-5'),
+          prompt: 'x',
+        }),
+      ),
+    );
+    const state = agentStateFromParts(parts);
+    if (state.status !== 'failed') throw new Error(`expected a failed run, got ${state.status}`);
+    // Masked, not dropped: the message still says what failed.
+    expect(state.error.message).toContain('invalid x-api-key');
+    expect(state.error.message).not.toContain(secret);
+    const errors = parts.filter((p) => p.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(JSON.stringify(errors)).toContain('invalid x-api-key');
+    expect(JSON.stringify(parts)).not.toContain(secret);
   });
 
   it('shows a refusal with its stop details', async () => {
@@ -379,6 +410,138 @@ describe('toDeuzAgentStreamResponse', () => {
     expect(events.some((e) => e.id !== undefined)).toBe(false);
     expect(partsOf(events).some((p) => p.type.startsWith('data-'))).toBe(false);
     expect(partsOf(events).map((p) => p.type)).toContain('text-delta');
+  });
+});
+
+describe('toDeuzAgentStreamResponse — a refused leg stays off the journal', () => {
+  /** A run suspended on one approval, journaled under its run id. */
+  async function suspendedRun(execute: () => unknown, scope = 'tenant-a') {
+    const runs = createInMemoryAgentRunStore();
+    const streams = createInMemoryStreamStateStore();
+    const options = {
+      model: createMockModel({
+        responses: [
+          { toolCalls: [{ toolName: 'publish', id: 'p1', args: {} }] },
+          { text: 'Published.' },
+        ],
+      }),
+      prompt: 'publish',
+      session: { store: runs, runId: 'run-r', scope },
+      tools: { publish: { parameters, needsApproval: true, execute } },
+    };
+    const wire = { store: streams, streamId: 'run-r', runId: 'run-r' };
+    const suspended = agentStateFromParts(
+      await collect(toDeuzAgentStreamResponse(streamAgent(options), wire)),
+    );
+    if (suspended.status !== 'suspended') throw new Error('not suspended');
+    const approvalResponses = [
+      { approvalId: suspended.pendingApprovals[0]!.approvalId, approved: true },
+    ];
+    return { runs, streams, options, wire, suspended, approvalResponses };
+  }
+
+  const seqsOf = async (streams: ReturnType<typeof createInMemoryStreamStateStore>) => {
+    const seqs: number[] = [];
+    for await (const record of streams.read('run-r')) seqs.push(record.seq);
+    return seqs;
+  };
+
+  it('a second resume while the run executes is refused on its own response, not in the journal', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const executing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const run = await suspendedRun(async () => {
+      entered();
+      await gate;
+      return 'published';
+    });
+    const resume = () =>
+      toDeuzAgentStreamResponse(
+        resumeStreamAgent({ ...run.options, approvalResponses: run.approvalResponses }),
+        run.wire,
+      );
+    // One tab resumes the run; its tool is running.
+    const live = collect(resume());
+    await executing;
+    const before = await seqsOf(run.streams);
+    // Another tab (or a double submit) resumes the same run.
+    const refused = await sseOf(resume());
+    // The client sees the refusal: a failed run and one error part, with no event ids,
+    // so its resume cursor stays where the journal is.
+    expect(refused.every((event) => event.id === undefined)).toBe(true);
+    const parts = partsOf(refused);
+    expect(agentStateFromParts(parts)).toMatchObject({
+      status: 'failed',
+      error: { message: 'This native run already has an active executor.' },
+    });
+    expect(parts.filter((p) => p.type === 'error')).toHaveLength(1);
+    expect(await seqsOf(run.streams)).toEqual(before);
+    release();
+    expect(agentStateFromParts(await live)).toMatchObject({ status: 'completed' });
+    // Every seq of the journal belongs to one record, and the live leg's frames line up with them.
+    const seqs = await seqsOf(run.streams);
+    expect(new Set(seqs).size).toBe(seqs.length);
+    expect(seqs).toEqual(seqs.map((_, index) => index));
+  });
+
+  it("another tenant's refused resume never reaches the owner's replay", async () => {
+    const run = await suspendedRun(() => 'published');
+    const cursor = (await seqsOf(run.streams)).at(-1)!;
+    const attacker = await collect(
+      toDeuzAgentStreamResponse(
+        resumeStreamAgent({
+          ...run.options,
+          session: { ...run.options.session, scope: 'tenant-b' },
+          approvalResponses: run.approvalResponses,
+        }),
+        run.wire,
+      ),
+    );
+    expect(agentStateFromParts(attacker).status).toBe('failed');
+    expect((await run.runs.load('run-r'))?.result?.status).toBe('suspended');
+    expect((await seqsOf(run.streams)).at(-1)).toBe(cursor);
+    const replay = await collect(
+      resumeDeuzStreamResponse(run.streams, 'run-r', {
+        lastEventId: String(cursor),
+        idleTimeoutMs: 50,
+      }),
+    );
+    expect(agentStateFromParts(replay, run.suspended).status).toBe('suspended');
+  });
+
+  it('a fresh run refused before it began journals nothing, not even its start', async () => {
+    const streams = createInMemoryStreamStateStore();
+    const parts = await collect(
+      toDeuzAgentStreamResponse(
+        streamAgent({ model: createMockModel({ responses: [] }), prompt: 'x', maxSteps: 0 }),
+        { store: streams, streamId: 'fresh', runId: 'fresh', messageId: 'msg-1' },
+      ),
+    );
+    expect(parts[0]).toEqual({ type: 'start', messageId: 'msg-1' });
+    expect(agentStateFromParts(parts).status).toBe('failed');
+    expect(streams.lastSeq('fresh')).toBeUndefined();
+  });
+
+  it('an admitted leg is journaled as before, its frames numbered by the journal', async () => {
+    const run = await suspendedRun(() => 'published');
+    const before = (await seqsOf(run.streams)).at(-1)!;
+    const events = await sseOf(
+      toDeuzAgentStreamResponse(
+        resumeStreamAgent({ ...run.options, approvalResponses: run.approvalResponses }),
+        run.wire,
+      ),
+    );
+    expect(events[0]!.id).toBe(before + 1);
+    expect(agentStateFromParts(partsOf(events), run.suspended)).toMatchObject({
+      status: 'completed',
+      output: 'Published.',
+    });
+    expect((await seqsOf(run.streams)).at(-1)).toBe(events.at(-1)!.id);
   });
 });
 
