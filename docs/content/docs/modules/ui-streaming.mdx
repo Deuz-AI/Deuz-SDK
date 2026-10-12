@@ -29,8 +29,8 @@ import {
 
 The version an SSE response speaks is stamped in its `x-deuz-stream` response header. `DEUZ_STREAM_VERSION` is `'v2'` (the default emitted); `DEUZ_STREAM_VERSIONS` is `['v1', 'v2']`.
 
-- **v2** frames each event as `id: <seq>\ndata: <json>\n\n` and may carry the v2-only part types (`data-{name}`, `citation`, `tool-state`, `cost`, `budget-exceeded`, `plan-update`, `activity`).
-- **v1** output has no `id:` lines, and v2-only parts are dropped entirely (recursively — a v2-only part inside a `sub-agent` frame is just as invisible). It is not byte-identical to pre-1.7 output: optional fields that later releases added to v1 parts (the approval `token` in 1.7; the `reasoning-delta` block fields and the `tool-call` provider metadata in 2.3) ride it too, and an older client ignores them.
+- **v2** frames each event as `id: <seq>\ndata: <json>\n\n` and may carry the v2-only part types (`data-{name}`, a native run's `data-agent` frames included, `citation`, `tool-state`, `cost`, `budget-exceeded`, `verify`, `warning`, `false-finish`, `plan-update`, `activity`).
+- **v1** output has no `id:` lines, and v2-only parts are dropped entirely (recursively — a v2-only part inside a `sub-agent` frame is just as invisible). It is not byte-identical to pre-1.7 output: optional fields that later releases added to v1 parts ride it too, and an older client ignores them. They are the approval `token` (1.7) and, in 2.3, the `providerMetadata` of `text-delta` and `tool-call`, the `reasoning-delta` block fields (`id`, `encrypted`, `redacted`, `source`, `data`), the `outcome` of `tool-result`, and the `stopDetails` of `step-finish` and `finish`. What 2.3 adds to v2-only parts stays on v2: the `outcome` of `tool-state`, the `'unpriced-model'` warning, and a native run's `data-agent` frames.
 
 `negotiateDeuzStreamVersion(source)` picks the version from the client's `x-deuz-stream` *request* header: only an explicit `v1` downgrades — anything else, including no header at all, gets v2 (v1 clients never sent the header, and v2's additions are invisible to them). It accepts a `Request`, `Headers`, the raw header string, or `null`.
 
@@ -511,7 +511,7 @@ Since 2.3 the wire's `reasoning-delta` carries the canonical part's `id`, `encry
 - **How a tool call ended.** `tool-state` and `tool-result` carry the dispatch contract's `outcome` (see [Outcomes](/docs/modules/native-agents#outcomes)): `'tool-error'`, `'permission-denied'`, `'approval-denied'`, `'approval-pending'` or `'unknown-effect'`. `applyUIPart` keeps the latest one on `UIToolCall.outcome`, so a guardrail block and an approver's no, which both set `denied`, render differently. A frame without one (the call is running again, or it succeeded) clears it.
 - **Claude's thinking display modes.** Under `display: 'omitted'` (the Claude 5.x default) a thinking block streams no text, only its signature. It arrives as a `reasoning-delta` with an empty `text` and stays exactly that: an empty, signed reasoning part, sent back unchanged, adding nothing to the readable `reasoning` text. A renderer can show it as "thinking…" or skip it; nothing is invented for it. Under `display: 'updates'` the block's text is Claude's progress notes, and it renders like any reasoning. Both follow `@anthropic-ai/sdk` 0.133.0's beta types, where `'updates'` (beta `thinking-display-updates-2026-08-18`) changes the text, not the block shape. Not live-verified.
 
-All three are optional fields on parts that already exist, so they ride every wire version and an older client ignores them.
+All three are optional fields on parts that already exist, so an older client ignores them. They ride every wire version, except the `outcome` of a `tool-state` part, which is a v2-only part: a client that negotiated v1 reads a call's `outcome` from its `tool-result` only, so it never sees `'approval-pending'` or `'unknown-effect'`.
 
 ### Rendering a denial, not a failure
 
