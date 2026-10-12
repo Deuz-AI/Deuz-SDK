@@ -70,16 +70,28 @@ export const PROMPT_INJECTION_POLICY =
  * `./middleware`, which keeps working and is unchanged. Prefer this one: a
  * middleware wraps the MODEL (so it re-applies on every step and on side calls
  * such as compaction summaries), while a guardrail wraps the RUN.
+ *
+ * Once per run (2.3), like the middleware: a history whose leading system run
+ * already carries the policy passes as it is. That is every leg of a durable
+ * run after the first, resumed from a checkpoint the first leg's rewrite went
+ * into; one more copy there would change the top-level system that Claude
+ * 5.x binds every earlier thinking block to.
  */
 export function promptInjectionGuardrail(opts: { policy?: string } = {}): InputGuardrail {
   const policy = opts.policy ?? PROMPT_INJECTION_POLICY;
-  const guard = (ctx: InputGuardrailContext): InputGuardrailResult => ({
-    action: 'rewrite',
-    // A separate leading system turn (the middleware's shape), never a merge
-    // into an existing one: the caller's own system prompt stays byte-identical,
-    // which is what keeps prompt caching on the rest of the history intact.
-    messages: [{ role: 'system', content: policy }, ...ctx.messages],
-  });
+  const guard = (ctx: InputGuardrailContext): InputGuardrailResult => {
+    for (const m of ctx.messages) {
+      if (m.role !== 'system') break;
+      if (m.content === policy) return { action: 'pass' };
+    }
+    return {
+      action: 'rewrite',
+      // A separate leading system turn (the middleware's shape), never a merge
+      // into an existing one: the caller's own system prompt stays byte-identical,
+      // which is what keeps prompt caching on the rest of the history intact.
+      messages: [{ role: 'system', content: policy }, ...ctx.messages],
+    };
+  };
   return named<InputGuardrail>(guard, 'promptInjectionGuardrail');
 }
 

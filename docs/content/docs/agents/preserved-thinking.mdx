@@ -24,7 +24,7 @@ The wire mapping and the tools array follow the model each call goes to (the run
 | A `system` message in the middle of the history | Folded into the top-level `system` | Sent in place as a `role: 'system'` message; the top-level `system` is the leading run of system messages only |
 | [Memory recall](/docs/modules/memory#recall-on-claude-5x-an-appended-system-message-23) | Spliced into the system prompt at every model call | One appended system message per user turn, kept in the transcript |
 | [Handoff](/docs/agents/handoffs#claude-5x-the-instructions-are-appended-23) instructions | Replace the leading system turn | Appended after the transfer's tool result |
-| `promptInjectionGuard` | Prepended on every call | Prepended once (every model, 2.3): not again when the leading system run already carries it |
+| `promptInjectionGuard` and `promptInjectionGuardrail()` | Prepended on every call; the guardrail also on every resumed leg | Prepended once (every model, 2.3): not again when the leading system run already carries it |
 | `prepareStep.activeTools`, a handoff's tool set, an MCP `tools/list_changed` | A different `tools` array | The same array on every request, plus an appended [tool-set change](#the-tools-array) |
 | [Compaction](/docs/core/compaction#claude-5x-simple-compaction-23) and overflow recovery | Layered: prune, prune, keep-tail summary | Simple: one summary replaces the whole conversation |
 

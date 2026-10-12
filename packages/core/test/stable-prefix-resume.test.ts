@@ -15,6 +15,7 @@ import {
 import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '../src/agent-run';
 import { agentTool } from '../src/inference/agent-tool';
 import { handoff } from '../src/inference/handoff';
+import { PROMPT_INJECTION_POLICY, promptInjectionGuardrail } from '../src/guardrails';
 import type { CommonCallOptions } from '../src/types/config';
 import type { JSONSchema } from '../src/types/schema';
 import {
@@ -30,19 +31,25 @@ const OBJ: JSONSchema = { type: 'object', properties: {} };
 const clock = { now: () => 1_700_000_000_000, setTimeout: () => () => {} };
 const LOOPS = ['buffered', 'streaming'] as const;
 
-/** Resume a suspended durable run through either loop. */
+/** Resume a suspended durable run through either loop; counts the guardrail verdicts the leg reported. */
 async function resume(
   loop: (typeof LOOPS)[number],
   store: ReturnType<typeof createInMemorySessionStore>,
   runId: string,
   options: Omit<CommonCallOptions, 'messages'>,
-): Promise<void> {
+): Promise<{ guardrails: number }> {
   if (loop === 'buffered') {
-    await resumeFromCheckpoint(store, runId, options);
-    return;
+    const result = await resumeFromCheckpoint(store, runId, options);
+    const deuz = result.providerMetadata?.deuz as { guardrails?: unknown[] } | undefined;
+    return { guardrails: deuz?.guardrails?.length ?? 0 };
   }
   const result = resumeStreamFromCheckpoint(store, runId, options);
-  for await (const part of result.fullStream) if (part.type === 'error') throw part.error;
+  let guardrails = 0;
+  for await (const part of result.fullStream) {
+    if (part.type === 'error') throw part.error;
+    if (part.type === 'guardrail') guardrails++;
+  }
+  return { guardrails };
 }
 
 /** Every `tool_use_id` a request answers. */
@@ -253,6 +260,74 @@ describe('a native run: a transfer and a gated call in one step on Claude 5.x', 
     expect(resumed.status).toBe('completed');
     expect(ran).toBe(1);
     expect(answeredIds(claude.requests[1]!).sort()).toEqual(['tu_a', 'tu_t']);
+    expect(prefixBreaks(claude.requests)).toEqual([]);
+  });
+});
+
+// --- the onInput guardrail on a resumed leg ------------------------------------
+
+describe('promptInjectionGuardrail on a resumed leg (Claude 5.x)', () => {
+  const brew = { parameters: OBJ, execute: async () => 'brewed', needsApproval: true };
+  const SYSTEM = `${PROMPT_INJECTION_POLICY}\n\nYou brew.`;
+
+  it.each(LOOPS)('%s loop: the policy the checkpoint holds rides once', async (loop) => {
+    const claude = scriptedClaude([
+      thinkThenCall('S0', 'tu_0', 'brew'),
+      thinkThenAnswer('S1', 'Brewed.'),
+    ]);
+    const store = createInMemorySessionStore();
+    const common = {
+      model: claude.model,
+      instructions: 'You brew.',
+      tools: { brew },
+      maxSteps: 3,
+      guardrails: { onInput: promptInjectionGuardrail() },
+      deps: { clock },
+    };
+    const first = await generateText({
+      ...common,
+      messages: [{ role: 'user', content: 'Brew me a coffee.' }],
+      session: { store, runId: 'run-1' },
+    });
+    expect(first.pendingApprovals).toHaveLength(1);
+    const leg = await resume(loop, store, 'run-1', {
+      ...common,
+      approvalResponses: [{ approvalId: first.pendingApprovals![0]!.approvalId, approved: true }],
+    });
+
+    expect(claude.requests).toHaveLength(2);
+    expect(claude.requests.map((r) => r.system)).toEqual([SYSTEM, SYSTEM]);
+    expect(prefixBreaks(claude.requests)).toEqual([]);
+    // Nothing to add, nothing to report: the first leg reported the rewrite.
+    expect(leg.guardrails).toBe(0);
+  });
+
+  it('a native resumeAgent leg keeps one copy', async () => {
+    const claude = scriptedClaude([
+      thinkThenCall('S0', 'tu_0', 'brew'),
+      thinkThenAnswer('S1', 'Brewed.'),
+    ]);
+    const options = {
+      model: claude.model,
+      instructions: 'You brew.',
+      prompt: 'Brew me a coffee.',
+      tools: { brew },
+      guardrails: { onInput: promptInjectionGuardrail() },
+      session: { store: createInMemoryAgentRunStore(), runId: 'native-1', scope: 'tenant' },
+    };
+    const first = await runAgent(options);
+    expect(first.status).toBe('suspended');
+    const resumed = await resumeAgent({
+      ...options,
+      approvalResponses: [
+        {
+          approvalId: first.status === 'suspended' ? first.pendingApprovals[0]!.approvalId : '',
+          approved: true,
+        },
+      ],
+    });
+    expect(resumed.status).toBe('completed');
+    expect(claude.requests.map((r) => r.system)).toEqual([SYSTEM, SYSTEM]);
     expect(prefixBreaks(claude.requests)).toEqual([]);
   });
 });
