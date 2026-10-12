@@ -44,6 +44,9 @@ describe('headless types (2.3 preview)', () => {
     expectTypeOf<HeadlessPendingAction['kind']>().toEqualTypeOf<
       'approval' | 'client-tool' | 'unknown-effect' | 'resume'
     >();
+    expectTypeOf<ProjectInstructions['skipped']>().toEqualTypeOf<
+      { path: string; relativePath: string; reason: 'outside-root' }[]
+    >();
   });
 
   it('makes the session from store, runId and scope', () => {

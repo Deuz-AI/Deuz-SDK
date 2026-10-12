@@ -3,7 +3,7 @@
  * (2.3 preview, 23.8), discovered in temporary directories.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInMemoryAgentRunStore } from '../src/agent-run';
@@ -130,6 +130,151 @@ describe('loadProjectInstructions', () => {
     await put('repo/AGENTS.md', 'Root rules.');
     await expect(loadProjectInstructions(join(base, 'repo/typo'))).rejects.toThrow(TypeError);
     await expect(loadProjectInstructions(join(base, 'repo/AGENTS.md'))).rejects.toThrow(TypeError);
+  });
+});
+
+/**
+ * Links a checkout can carry: a directory link is a junction on Windows (no
+ * privilege needed) and a symlink on POSIX; a file symlink needs developer mode
+ * on Windows, so those cases skip there when it is off.
+ */
+async function linkDir(target: string, path: string): Promise<void> {
+  await symlink(join(base, target), join(base, path), 'junction');
+}
+
+async function linkFile(target: string, path: string): Promise<boolean> {
+  try {
+    await symlink(join(base, target), join(base, path), 'file');
+    return true;
+  } catch (error) {
+    if ((error as { code?: string }).code === 'EPERM') return false;
+    throw error;
+  }
+}
+
+describe('loadProjectInstructions and links out of the root', () => {
+  it('does not read through a linked directory that leads outside the repository', async () => {
+    await put('repo/.git/HEAD', 'ref: refs/heads/main\n');
+    await put('repo/AGENTS.md', 'Run npm test.');
+    await put('outside/AGENTS.md', 'SECRET OUTSIDE THE REPOSITORY');
+    await linkDir('outside', 'repo/sub');
+
+    const loaded = await loadProjectInstructions(join(base, 'repo/sub'));
+    expect(loaded.message!.content).toContain('Run npm test.');
+    expect(loaded.message!.content).not.toContain('SECRET OUTSIDE THE REPOSITORY');
+    expect(loaded.files.map((file) => file.relativePath)).toEqual(['AGENTS.md']);
+    expect(loaded.skipped).toEqual([
+      {
+        path: join(base, 'repo/sub/AGENTS.md'),
+        relativePath: 'sub/AGENTS.md',
+        reason: 'outside-root',
+      },
+    ]);
+  });
+
+  it('does not read a symlinked AGENTS.md whose target is outside the repository', async (ctx) => {
+    await put('repo/.git/HEAD', 'ref: refs/heads/main\n');
+    await put('secret.txt', 'AWS_SECRET_ACCESS_KEY=abc');
+    if (!(await linkFile('secret.txt', 'repo/AGENTS.md'))) return ctx.skip();
+
+    const loaded = await loadProjectInstructions(join(base, 'repo'));
+    expect(loaded.message).toBeUndefined();
+    expect(loaded.files).toEqual([]);
+    expect(loaded.skipped).toEqual([
+      expect.objectContaining({ relativePath: 'AGENTS.md', reason: 'outside-root' }),
+    ]);
+  });
+
+  it('follows a link that stays inside the root, and a root reached through a link', async () => {
+    await put('repo/.git/HEAD', 'x');
+    await put('repo/AGENTS.md', 'Root rules.');
+    await put('repo/real/AGENTS.md', 'Real rules.');
+    await linkDir('repo/real', 'repo/alias');
+    await linkDir('repo', 'checkout');
+
+    const inner = await loadProjectInstructions(join(base, 'repo/alias'));
+    expect(inner.files.map((file) => file.relativePath)).toEqual(['AGENTS.md', 'alias/AGENTS.md']);
+    expect(inner.skipped).toEqual([]);
+
+    // The root is a link itself (macOS /var, a junction): both sides resolve.
+    const viaLink = await loadProjectInstructions(join(base, 'checkout/real'));
+    expect(viaLink.root).toBe(join(base, 'checkout'));
+    expect(viaLink.message!.content).toContain('Root rules.');
+    expect(viaLink.message!.content).toContain('Real rules.');
+    expect(viaLink.skipped).toEqual([]);
+  });
+
+  it('follows CLAUDE.md symlinked to the AGENTS.md beside it', async (ctx) => {
+    await put('p/AGENTS.md', 'Shared rules.');
+    if (!(await linkFile('p/AGENTS.md', 'p/CLAUDE.md'))) return ctx.skip();
+    const loaded = await loadProjectInstructions(join(base, 'p'));
+    expect(loaded.files.map((file) => file.relativePath)).toEqual(['AGENTS.md']);
+    expect(loaded.skipped).toEqual([]);
+  });
+
+  it('runHeadless leaves the file out and reports it as a warning', async () => {
+    await put('repo/.git/HEAD', 'x');
+    await put('repo/AGENTS.md', 'Run npm test.');
+    await put('outside/AGENTS.md', 'SECRET OUTSIDE THE REPOSITORY');
+    await linkDir('outside', 'repo/sub');
+    const store = createInMemoryAgentRunStore();
+    const report = await runHeadless({
+      model: createMockModel({ responses: [{ text: 'ok' }] }),
+      prompt: 'go',
+      projectDir: join(base, 'repo/sub'),
+      store,
+      runId: 'linked',
+    });
+    expect(report.outcome).toBe('completed');
+    expect(report.warnings).toContainEqual(
+      expect.objectContaining({ type: 'other', message: expect.stringContaining('sub/AGENTS.md') }),
+    );
+    const text = systemText((await store.load('linked'))!.messages);
+    expect(text).toContain('Run npm test.');
+    expect(text).not.toContain('SECRET OUTSIDE THE REPOSITORY');
+  });
+});
+
+describe('skill tools and links out of the skill folder', () => {
+  /** One run whose model makes `calls`, then the stored transcript. */
+  async function transcriptOf(calls: { toolName: string; args: object }[]): Promise<string> {
+    const store = createInMemoryAgentRunStore();
+    const report = await runHeadless({
+      model: createMockModel({ responses: [{ toolCalls: calls }, { text: 'done' }] }),
+      prompt: 'go',
+      skills: [join(base, 'skills')],
+      store,
+      runId: 'skill-links',
+    });
+    expect(report.outcome).toBe('completed');
+    return JSON.stringify((await store.load('skill-links'))!.messages);
+  }
+
+  it('read_skill_resource does not read through a linked directory that leaves the folder', async () => {
+    await put('skills/a/SKILL.md', '---\nname: a\ndescription: A.\n---\nA body.');
+    await put('skills/a/docs/guide.md', 'GUIDE TEXT');
+    await put('outside/secret.md', 'SECRET OUTSIDE THE SKILL');
+    await linkDir('outside', 'skills/a/shared');
+    await linkDir('skills/a/docs', 'skills/a/manual');
+
+    const transcript = await transcriptOf([
+      { toolName: 'read_skill_resource', args: { id: 'a', path: 'shared/secret.md' } },
+      { toolName: 'read_skill_resource', args: { id: 'a', path: 'manual/guide.md' } },
+    ]);
+    expect(transcript).not.toContain('SECRET OUTSIDE THE SKILL');
+    expect(transcript).toContain('a link leads it outside the skill folder');
+    // A link that stays inside the folder is followed.
+    expect(transcript).toContain('GUIDE TEXT');
+  });
+
+  it('load_skill does not read a SKILL.md linked to a file outside the folder', async (ctx) => {
+    await put('outside/SKILL.md', '---\nname: a\ndescription: A.\n---\nSECRET SKILL BODY');
+    await mkdir(join(base, 'skills/a'), { recursive: true });
+    if (!(await linkFile('outside/SKILL.md', 'skills/a/SKILL.md'))) return ctx.skip();
+
+    const transcript = await transcriptOf([{ toolName: 'load_skill', args: { id: 'a' } }]);
+    expect(transcript).not.toContain('SECRET SKILL BODY');
+    expect(transcript).toContain('a link leads it outside the skill folder');
   });
 });
 

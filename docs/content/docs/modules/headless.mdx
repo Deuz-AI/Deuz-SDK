@@ -192,6 +192,11 @@ console.log(project.message?.role); // 'system'
 - **Nesting.** Files below `dir` are not read, and `@path` imports are not
   expanded. A file that repeats an earlier one's text (a `CLAUDE.md` copied
   from `AGENTS.md`, a symlink) is included once.
+- **Links.** A symlink or junction is followed only while it stays inside the
+  root. A file whose real path is outside it (an `AGENTS.md` linked to
+  `~/.npmrc`, a linked directory that leads out of the repository) is not
+  read: `skipped` lists it with the reason `'outside-root'`, and `runHeadless`
+  reports it as a warning.
 - **Size cap.** At most `maxBytes` (default 32 768) UTF-8 bytes of file text.
   The files nearest `dir` are kept whole first; an outer file over the cap is
   cut at a character boundary, with a `[truncated: N more bytes not loaded]`
@@ -206,8 +211,9 @@ resume does not read them again.
 read with `nodeSkillSource`. The first leg lists them in the system message
 (`<available_skills>`), and every leg gets two tools: `load_skill` returns a
 skill's body and `read_skill_resource` a text file bundled with it. Both read
-only skills the list holds, and both are `replay: 'idempotent'`. A tool of your
-own cannot take either name. Pass the same `skills` when resuming: the tools
+only skills the list holds, and only files whose real path is inside the
+skill's folder: a link that leads out of it is refused. Both are
+`replay: 'idempotent'`. A tool of your own cannot take either name. Pass the same `skills` when resuming: the tools
 are part of the run's binding.
 
 ## doctor

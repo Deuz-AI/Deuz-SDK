@@ -20,12 +20,13 @@ import type {
   AgentToolSet,
 } from '../types/agent-run';
 import type { Dependencies } from '../types/deps';
+import type { CallWarning } from '../types/methods';
 import { resumeStreamAgent, streamAgent } from '../agent-run';
 import { createPriceProvider } from '../pricing';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { createWarningSink } from '../internal/warnings';
 import { EMPTY_USAGE } from '../core/metering';
-import { createSkillRegistry, renderSkillCatalog } from '../skills';
+import { createSkillRegistry, normalizeResourcePath, renderSkillCatalog } from '../skills';
 import { nodeSkillSource } from '../skills/node';
 import { reportFromEnvelope, reportFromResult, type HeadlessReport } from '../headless/report';
 import { diagnose, type DoctorOptions, type DoctorReport } from '../headless/doctor';
@@ -63,6 +64,7 @@ export type {
 interface NodeFs {
   readFile(path: string, encoding: 'utf-8'): Promise<string>;
   stat(path: string): Promise<{ isDirectory(): boolean }>;
+  realpath(path: string): Promise<string>;
 }
 interface NodePath {
   resolve(...parts: string[]): string;
@@ -94,6 +96,14 @@ function isAbsent(error: unknown): boolean {
   return code === 'ENOENT' || code === 'ENOTDIR' || code === 'EISDIR';
 }
 
+/**
+ * `rel`, a `path.relative` result, leaves the directory it is relative to. An
+ * absolute result means another drive or share, which `..` never reaches.
+ */
+function leaves(path: NodePath, rel: string): boolean {
+  return rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+}
+
 /** The nearest directory from `start` upwards that holds a `.git` entry. */
 async function gitRoot(fs: NodeFs, path: NodePath, start: string): Promise<string | undefined> {
   for (let dir = start; ; ) {
@@ -117,8 +127,10 @@ async function gitRoot(fs: NodeFs, path: NodePath, start: string): Promise<strin
  * text nearest `dir` comes last and wins a conflict; files below `dir` are not
  * read, and `@path` imports are not expanded. A file that repeats an earlier
  * one's text is included once. The text is capped at `maxBytes` (32 KiB),
- * keeping the files nearest `dir` whole first. Rejects with a TypeError when
- * `dir` is not a directory.
+ * keeping the files nearest `dir` whole first. A link (a symlink, a junction)
+ * is followed only while it stays inside the root: a file whose real path is
+ * outside the root's is not read, and `skipped` lists it. Rejects with a
+ * TypeError when `dir` is not a directory.
  */
 export async function loadProjectInstructions(
   dir: string,
@@ -137,27 +149,38 @@ export async function loadProjectInstructions(
       ? path.resolve(options.root)
       : ((await gitRoot(fs, path, start)) ?? start);
   const below = path.relative(root, start);
-  if (below === '..' || below.startsWith(`..${path.sep}`) || path.isAbsolute(below))
-    throw new TypeError('root must be dir or one of its ancestors.');
+  if (leaves(path, below)) throw new TypeError('root must be dir or one of its ancestors.');
   const dirs = [root];
   for (const segment of below.split(path.sep).filter(Boolean))
     dirs.push(path.join(dirs.at(-1)!, segment));
+  // A checkout can carry a link to any file on the machine (AGENTS.md ->
+  // ~/.npmrc): only a real path inside the root's real path is read. Both sides
+  // are resolved, so a root reached through a link (macOS /var) still counts.
+  const realRoot = await fs.realpath(root);
   const sources: InstructionSource[] = [];
+  const skipped: ProjectInstructions['skipped'] = [];
   for (const directory of dirs) {
     for (const name of options.fileNames ?? DEFAULT_INSTRUCTION_FILES) {
       const file = path.join(directory, name);
+      const relativePath = path.relative(root, file).split(path.sep).join('/');
       try {
-        sources.push({
-          path: file,
-          relativePath: path.relative(root, file).split(path.sep).join('/'),
-          text: await fs.readFile(file, 'utf-8'),
-        });
+        const real = await fs.realpath(file);
+        if (leaves(path, path.relative(realRoot, real))) {
+          skipped.push({ path: file, relativePath, reason: 'outside-root' });
+          continue;
+        }
+        sources.push({ path: file, relativePath, text: await fs.readFile(real, 'utf-8') });
       } catch (error) {
         if (!isAbsent(error)) throw error;
       }
     }
   }
-  return renderProjectInstructions(root, sources, options.maxBytes ?? DEFAULT_INSTRUCTION_BYTES);
+  return renderProjectInstructions(
+    root,
+    sources,
+    options.maxBytes ?? DEFAULT_INSTRUCTION_BYTES,
+    skipped,
+  );
 }
 
 /** The tools a headless run gets for its `skills`. */
@@ -179,6 +202,7 @@ async function loadSkills(
     if (tools && Object.hasOwn(tools, name))
       throw new TypeError(`The tool name '${name}' is taken by skills; rename your tool.`);
   }
+  const { fs, path } = await loadFs();
   const registry = createSkillRegistry({ source: nodeSkillSource([...dirs]) });
   // Only an id the catalog lists is read, so an id cannot point outside `dirs`.
   const listed = async (id: string): Promise<void> => {
@@ -187,6 +211,31 @@ async function loadSkills(
       throw new Error(
         `Unknown skill '${id}'. Available: ${catalog.map((skill) => skill.id).join(', ') || 'none'}.`,
       );
+  };
+  // A link in a skill folder can point at any file on the machine, so a file
+  // is read only when its real path is inside `<real dir>/<id>`. The folder is
+  // the one nodeSkillSource reads: the first of `dirs` holding `<id>/SKILL.md`.
+  const inFolder = async (id: string, file: string): Promise<void> => {
+    for (const dir of dirs) {
+      const folder = path.join(dir, id);
+      try {
+        await fs.stat(path.join(folder, 'SKILL.md'));
+      } catch {
+        continue; // not in this folder
+      }
+      let real: string;
+      try {
+        real = await fs.realpath(path.join(folder, file));
+      } catch (error) {
+        if (isAbsent(error)) return; // the read reports the missing file
+        throw error;
+      }
+      if (leaves(path, path.relative(path.join(await fs.realpath(dir), id), real)))
+        throw new Error(
+          `'${file}' of skill '${id}' is not read: a link leads it outside the skill folder.`,
+        );
+      return;
+    }
   };
   const id = { type: 'string', description: 'The skill id from the available skills list.' };
   const skillTools: AgentToolSet = {
@@ -201,6 +250,7 @@ async function loadSkills(
       replay: 'idempotent',
       execute: async ({ id: skill }: { id: string }) => {
         await listed(skill);
+        await inFolder(skill, 'SKILL.md');
         return (await registry.trigger(skill)).body;
       },
     },
@@ -216,9 +266,10 @@ async function loadSkills(
         additionalProperties: false,
       },
       replay: 'idempotent',
-      execute: async ({ id: skill, path }: { id: string; path: string }) => {
+      execute: async ({ id: skill, path: file }: { id: string; path: string }) => {
         await listed(skill);
-        const data = await registry.resource(skill, path);
+        await inFolder(skill, normalizeResourcePath(file));
+        const data = await registry.resource(skill, file);
         return typeof data === 'string' ? data : decoder.decode(data);
       },
     },
@@ -248,8 +299,9 @@ export interface HeadlessSessionOptions {
    * Skill folders (`<id>/SKILL.md`, read with `nodeSkillSource`). A run's first
    * leg lists the skills in its system message, and every leg gets the tools
    * `load_skill` and `read_skill_resource`, which read a listed skill on
-   * demand. Pass the same folders when resuming: the tools are part of the
-   * run's binding.
+   * demand; neither reads a file that a link leads outside its skill folder.
+   * Pass the same folders when resuming: the tools are part of the run's
+   * binding.
    */
   skills?: readonly string[];
   /**
@@ -271,7 +323,8 @@ export type HeadlessRunOptions<T = string> = AgentRunOptions<T> &
     /**
      * Load the project's AGENTS.md / CLAUDE.md files from this directory
      * ({@link loadProjectInstructions}) into the system message, after
-     * `instructions` and before the skills list.
+     * `instructions` and before the skills list. A file that a link leads
+     * outside the project root is left out and reported in `warnings`.
      */
     projectDir?: string;
     /** How {@link loadProjectInstructions} searches `projectDir`. */
@@ -298,13 +351,18 @@ function pricedDeps(deps: Dependencies | undefined): Dependencies {
   return deps?.priceProvider ? deps : { ...deps, priceProvider: createPriceProvider() };
 }
 
-/** Drain one leg's events, then report its result with the stored run's phase. */
+/**
+ * Drain one leg's events, then report its result with the stored run's phase.
+ * `before` holds the warnings found before the leg started.
+ */
 async function report(
   stream: AgentStream<unknown>,
   session: AgentRunSession,
   onEvent: HeadlessSessionOptions['onEvent'],
+  before: readonly CallWarning[] = [],
 ): Promise<HeadlessReport> {
   const warnings = createWarningSink();
+  for (const warning of before) warnings.add(warning, { mirror: false });
   let callbackError: { error: unknown } | undefined;
   for await (const event of stream.events) {
     if (event.type === 'part' && event.part.type === 'warning')
@@ -388,7 +446,14 @@ export async function runHeadless<T = string>(
     deps: pricedDeps(agent.deps),
     session,
   });
-  return report(stream as AgentStream<unknown>, session, onEvent);
+  const unread = (project?.skipped ?? []).map(
+    (file): CallWarning => ({
+      type: 'other',
+      setting: 'projectDir',
+      message: `The project instruction file ${file.relativePath} was not read: a link leads it outside the project root.`,
+    }),
+  );
+  return report(stream as AgentStream<unknown>, session, onEvent, unread);
 }
 
 /**

@@ -41,6 +41,11 @@ export interface ProjectInstructions {
   root: string;
   /** The files in message order, outermost first. A file that repeats an earlier one's text is not listed. */
   files: ProjectInstructionFile[];
+  /**
+   * Files found but not read: `'outside-root'` when a link (a symlink, a
+   * junction) leads the file, or a directory on its way, outside the root.
+   */
+  skipped: { path: string; relativePath: string; reason: 'outside-root' }[];
   /** The system message; absent when no file has text. */
   message?: { role: 'system'; content: string };
 }
@@ -81,6 +86,7 @@ export function renderProjectInstructions(
   root: string,
   sources: readonly InstructionSource[],
   maxBytes: number,
+  skipped: ProjectInstructions['skipped'] = [],
 ): ProjectInstructions {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1)
     throw new TypeError('maxBytes must be a positive integer.');
@@ -118,6 +124,7 @@ export function renderProjectInstructions(
   return {
     root,
     files,
+    skipped,
     ...(blocks.length > 0
       ? { message: { role: 'system' as const, content: [HEADER, ...blocks].join('\n\n') } }
       : {}),
