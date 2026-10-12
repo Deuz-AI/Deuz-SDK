@@ -646,8 +646,9 @@ export interface CommonCallOptions {
   /**
    * Opaque per-call context (2.0 additive) threaded, UNTOUCHED, into every hook
    * that can act on it: `ToolExecuteContext.runtimeContext`, `prepareStep`,
-   * `verifyStep`, `doneWhen`, and all three guardrail hooks. Sub-agents
-   * (`agentTool`) inherit it.
+   * `verifyStep`, `doneWhen`, and the four guardrail hooks (`onInput`,
+   * `onToolCall`, `onToolResult`, `onOutput`). Sub-agents (`agentTool`)
+   * inherit it.
    *
    * It exists so the request-scoped facts a tool needs — the tenant, the signed-
    * in user, a DB handle, a trace id — travel with the CALL instead of being
