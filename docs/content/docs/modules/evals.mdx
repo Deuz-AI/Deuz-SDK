@@ -159,8 +159,11 @@ Each attempt in the report carries:
 `recovery` is `'not-needed'` when nothing was interrupted. After an
 interruption it is `'recovered'` (completed and accepted without a rescue),
 `'rescued'` (completed and accepted after a rescue), `'contained'` (accepted,
-but the documented outcome is a stop or a failure: nothing was repeated or lost,
-and the work did not finish) or `'failed'` (not accepted).
+but the documented outcome is a stop or a failure: the work did not finish) or
+`'failed'` (not accepted, or an effect ran twice). An attempt that repeated an
+effect is never recovered, rescued or contained. The other checks below, a
+recovery path other than `fault.recovery` included, fail `success` but leave
+`recovery` as acceptance decides it.
 
 Beyond its acceptance, an attempt fails when it:
 

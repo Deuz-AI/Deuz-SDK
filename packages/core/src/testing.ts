@@ -622,8 +622,11 @@ export interface EvalTaskContext {
  * How an attempt came back from its interruptions: `'not-needed'` (nothing was
  * interrupted), `'recovered'` (completed and accepted without a human rescue),
  * `'rescued'` (completed and accepted after a human rescue), `'contained'`
- * (accepted, but the documented outcome is a stop or a failure: nothing was
- * repeated or lost, and the work did not finish) or `'failed'` (not accepted).
+ * (accepted, but the documented outcome is a stop or a failure: the work did
+ * not finish) or `'failed'` (not accepted, or an effect ran twice). An attempt
+ * that repeated an effect is never `'recovered'`, `'rescued'` or `'contained'`.
+ * The other harness checks, a recovery path other than `fault.recovery`
+ * included, fail the attempt's `success` but leave its class alone.
  */
 export type EvalRecovery = 'not-needed' | 'recovered' | 'rescued' | 'contained' | 'failed';
 

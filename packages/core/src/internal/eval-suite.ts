@@ -293,7 +293,8 @@ export function harnessFailures(
 /**
  * How an attempt came back from its interruptions, if it had any. An accepted
  * outcome that is not `'completed'` (a documented stop or failure) contained
- * the fault without finishing the work.
+ * the fault without finishing the work. An attempt that executed an effect
+ * twice did not come back from it, whatever its acceptance says.
  */
 export function recoveryOf(
   record: EvalAttemptRecord,
@@ -301,7 +302,7 @@ export function recoveryOf(
   accepted: boolean,
 ): EvalRecovery {
   if (record.interruptions.length === 0) return 'not-needed';
-  if (!accepted) return 'failed';
+  if (!accepted || repeatedEffectCount(record.effects) > 0) return 'failed';
   if (outcome?.status !== 'completed') return 'contained';
   return record.rescues.length > 0 ? 'rescued' : 'recovered';
 }
