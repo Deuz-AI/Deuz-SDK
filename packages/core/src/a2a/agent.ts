@@ -167,10 +167,15 @@ export interface A2AAgentPendingActions {
   actions: A2AAgentAction[];
 }
 
-/** The data part of an `INPUT_REQUIRED` status whose run stopped: a person must look at it. */
+/**
+ * The data part of an `INPUT_REQUIRED` status whose run stopped. A drained
+ * run (`'drained'`) goes on at the next message, one stopped for
+ * reconciliation once a person settled its unknown effects; at any other stop
+ * a person must look at the run.
+ */
 export interface A2AAgentStopped {
   type: 'stopped';
-  /** The run's stop reason: `'max-steps'`, `'budget.usd'`, `'refusal'`, `'tool-reconciliation-required'`, … */
+  /** The run's stop reason: `'max-steps'`, `'budget.usd'`, `'refusal'`, `'drained'`, `'tool-reconciliation-required'`, … */
   reason: string;
   /** The provider's explanation of the stop, its `explanation` secret-redacted. */
   stopDetails?: StopDetails;
@@ -201,6 +206,12 @@ const ANSWER_FIELDS: ReadonlySet<string> = new Set(['approvalResponses', 'client
 
 const HOW_TO_ANSWER =
   'Answer every action in one message, with a data part { approvalResponses, clientToolResults }.';
+
+/**
+ * The stop reason of a run a lease drain stopped, as in a deploy: the run has
+ * not ended, and a resume goes on from its last save.
+ */
+const DRAINED = 'drained';
 
 type Suspended = Extract<AgentResult<unknown>, { status: 'suspended' }>;
 /** What a run waits for: its pending approvals and client tool calls. */
@@ -475,10 +486,11 @@ function listsActions(task: A2ATask | undefined, actions: readonly A2AAgentActio
   return keys(listed.actions as A2AAgentAction[]) === keys(actions);
 }
 
-function pendingMessage(actions: A2AAgentAction[]): A2APart[] {
+/** The status of a run that waits for answers; `lead` says why it asks again. */
+function pendingMessage(actions: A2AAgentAction[], lead?: string): A2APart[] {
   const data: A2AAgentPendingActions = { type: 'pending-actions', actions };
   return [
-    { text: `The agent ${waitsFor(actions)}. ${HOW_TO_ANSWER}` },
+    { text: `${lead ? `${lead} ` : ''}The agent ${waitsFor(actions)}. ${HOW_TO_ANSWER}` },
     { data, mediaType: 'application/json' },
   ];
 }
@@ -508,7 +520,8 @@ function stoppedMessage(result: Stopped): A2APart[] {
       : {}),
   };
   const unknown = data.unknownEffects ?? [];
-  // Only a reconciliation stop leaves the run resumable; any other stop is final.
+  // A drained run goes on at the next message, a reconciliation stop once a
+  // person settled its unknown effects; any other stop is final.
   const text =
     result.reason === 'tool-reconciliation-required'
       ? `The run stopped (${result.reason}): the outcome of ${
@@ -518,7 +531,9 @@ function stoppedMessage(result: Stopped): A2APart[] {
               ? `${unknown.length} tool calls`
               : 'a tool call'
         } is unknown. A person must settle ${unknown.length > 1 ? 'them' : 'it'} before the run can go on; send a message once that is done.`
-      : `The run stopped (${result.reason}): a person must look at it. The run cannot go on; cancel the task or start a new one.`;
+      : result.reason === DRAINED
+        ? `The run stopped (${DRAINED}): it was moved off its executor before it finished, and has not ended. Send a message to go on.`
+        : `The run stopped (${result.reason}): a person must look at it. The run cannot go on; cancel the task or start a new one.`;
   return [{ text }, { data, mediaType: 'application/json' }];
 }
 
@@ -561,9 +576,12 @@ function outputPart(output: unknown, typed: boolean): A2APart {
  *   what the run waits for (a person resumed the run, and it suspended
  *   again): the task then lists it, and no leg runs.
  * - `stopped`: `INPUT_REQUIRED` with a data part `{ type: 'stopped', reason
- *   }`: a person must look at the run. A run stopped for reconciliation goes
- *   on at the next message once a person settled its unknown effects; a
- *   message to any other stopped run is refused with
+ *   }`. A drained run (`'drained'`: a lease drain, as in a deploy) has not
+ *   ended, and the next message resumes it; a drain that stopped a resume
+ *   before it took the answers up leaves the run waiting for them, and the
+ *   task lists them again. A run stopped for reconciliation goes on at the
+ *   next message once a person settled its unknown effects. At any other
+ *   stop a person must look at the run, and a message is refused with
  *   `UNSUPPORTED_OPERATION`. A stop a cancellation caused (`'aborted'`,
  *   `'cancelled'`) cancels the task.
  * - `failed`: `FAILED`, with a safe message (see `failureMessage`). A resume
@@ -635,9 +653,18 @@ export function createA2AAgentExecutor<T = string>(
     return value as A2AAgentRunOptions<T>;
   }
 
+  /** The stored run, or `undefined` when the store cannot give it. */
+  async function storedRun(runId: string): Promise<AgentRunEnvelope | undefined> {
+    try {
+      return await store.load(runId);
+    } catch {
+      return undefined;
+    }
+  }
+
   /** The run's failure is in the store: not a leg that was refused before it began. */
   async function failureRecorded(runId: string): Promise<boolean> {
-    const stored = await Promise.resolve(store.load(runId)).catch(() => undefined);
+    const stored = await storedRun(runId);
     return stored?.phase === 'terminal' && stored.result?.status === 'failed';
   }
 
@@ -667,6 +694,21 @@ export function createA2AAgentExecutor<T = string>(
         if (isCancellation(result.reason)) {
           await ctx.setStatus('TASK_STATE_CANCELED', `The run was ${result.reason}.`);
           return;
+        }
+        // A drain stopped the run, unended. One that stopped a resume before
+        // it took the answers up left the run waiting for them: ask again.
+        if (result.reason === DRAINED) {
+          const stored = await storedRun(ctx.taskId);
+          const pending = stored && pendingOf(stored);
+          if (pending) {
+            await ctx.requireInput(
+              pendingMessage(
+                pendingActions(pending),
+                `The run was moved off its executor (${DRAINED}) before it took the answers up.`,
+              ),
+            );
+            return;
+          }
         }
         await ctx.requireInput(stoppedMessage(result));
         return;

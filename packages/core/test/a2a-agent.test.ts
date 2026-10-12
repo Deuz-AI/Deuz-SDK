@@ -1052,6 +1052,124 @@ describe('createA2AAgentExecutor — stopped and failed runs', () => {
   });
 });
 
+describe('createA2AAgentExecutor — a drained run', () => {
+  it('tells the client a drained run goes on, and the next message resumes it', async () => {
+    const inner = createInMemoryLeaseProvider();
+    const delivered = gate();
+    // Opens once a renewal hands the drain to the executor.
+    const leases: LeaseProvider = {
+      ...inner,
+      renew: async (...args: Parameters<LeaseProvider['renew']>) => {
+        const renewal = await inner.renew(...args);
+        if (renewal.held && renewal.signals.includes('drain')) delivered.open();
+        return renewal;
+      },
+    };
+    const started = gate();
+    const release = gate();
+    let runs = 0;
+    const run = {
+      model: createMockModel({
+        responses: [{ toolCalls: [{ toolName: 'wait', args: {} }] }, { text: 'All set.' }],
+      }),
+      tools: {
+        wait: {
+          description: 'Wait for the go-ahead.',
+          parameters,
+          execute: async () => {
+            runs++;
+            started.open();
+            await release.promise;
+            return 'ready';
+          },
+        },
+      },
+    };
+    const { client, store, errors } = serve(run, { lease: { provider: leases, ttlMs: 30 } });
+    const task = (
+      await client.sendMessage('Wait for me.', { configuration: { returnImmediately: true } })
+    ).task as A2ATask;
+    await started.promise;
+    // A rolling deploy drains the run while its turn runs (operations.mdx).
+    expect(
+      await leases.signal(agentRunLeaseKey({ scope: ANONYMOUS, runId: task.id }), 'drain'),
+    ).toBe(true);
+    await delivered.promise;
+    release.open();
+    await vi.waitFor(
+      async () =>
+        expect((await client.getTask(task.id)).status.state).toBe('TASK_STATE_INPUT_REQUIRED'),
+      { timeout: 5000 },
+    );
+    const drained = await client.getTask(task.id);
+    expect(a2aText(drained.status.message)).toBe(
+      'The run stopped (drained): it was moved off its executor before it finished, and has not ended. Send a message to go on.',
+    );
+    expect(dataOf(drained, 'stopped')).toEqual({ type: 'stopped', reason: 'drained' });
+    // The run did not end: nothing was committed.
+    const stored = await store.load(task.id);
+    expect(stored?.phase).toBe('running');
+    expect(stored?.result).toBeUndefined();
+
+    // The next message picks the run up at its last step boundary: the tool does not run again.
+    const done = (await client.sendMessage('Go on.', { taskId: task.id })).task as A2ATask;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(a2aText(done.artifacts?.[0])).toBe('All set.');
+    expect(runs).toBe(1);
+    expect(errors).toEqual([]);
+  });
+
+  it('lists the actions again when a drain stops a resume before it took the answers up', async () => {
+    const inner = createInMemoryLeaseProvider();
+    let drainNextClaim = false;
+    // A deploy's drain reaches the executor right after a resume claimed the run.
+    const leases: LeaseProvider = {
+      ...inner,
+      acquire: async (request) => {
+        const lease = await inner.acquire(request);
+        if (lease && drainNextClaim) {
+          drainNextClaim = false;
+          await inner.signal(request.key, 'drain');
+        }
+        return lease;
+      },
+    };
+    const published: unknown[] = [];
+    const { client, store, errors } = serve(
+      publisher(
+        [{ toolCalls: [{ toolName: 'publish', args: { text: 'hi' } }] }, { text: 'Done.' }],
+        published,
+      ),
+      { lease: { provider: leases, ttlMs: 30 } },
+    );
+    const asked = (await client.sendMessage('Publish "hi".')).task as A2ATask;
+    const answer: A2APart[] = [
+      { data: { approvalResponses: [{ approvalId: approvalIdOf(asked), approved: true }] } },
+    ];
+    const run = await store.load(asked.id);
+
+    drainNextClaim = true;
+    const after = (await client.sendMessage(answer, { taskId: asked.id })).task as A2ATask;
+    // Nothing was written: the run still waits for the approval, and the task says so.
+    expect(await store.load(asked.id)).toEqual(run);
+    expect(published).toEqual([]);
+    expect(after.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    expect(a2aText(after.status.message)).toBe(
+      'The run was moved off its executor (drained) before it took the answers up. ' +
+        'The agent waits for approval of publish (call_1). ' +
+        'Answer every action in one message, with a data part { approvalResponses, clientToolResults }.',
+    );
+    expect(actionsOf(after)).toEqual(actionsOf(asked));
+    expect(dataOf(after, 'stopped')).toBeUndefined();
+
+    // The client answers again, and the run goes on.
+    const done = (await client.sendMessage(answer, { taskId: asked.id })).task as A2ATask;
+    expect(done.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(published).toEqual([{ text: 'hi' }]);
+    expect(errors).toEqual([]);
+  });
+});
+
 describe.each(BINDINGS)('createA2AAgentExecutor — streaming (%s)', (binding) => {
   it('streams WORKING, the text as unstored drafts, then the output artifact', async () => {
     const { clientOf } = serve({ model: createMockModel({ responses: [{ text: 'Paris.' }] }) });

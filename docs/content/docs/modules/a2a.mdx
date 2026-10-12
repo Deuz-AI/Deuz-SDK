@@ -414,7 +414,7 @@ How a run maps onto its task:
 | Its leg runs | `WORKING`. The text of a string output streams as unstored [`draft`](#the-executor) updates of the output artifact. |
 | `completed` | The output artifact (`artifactId: 'output'`) with the run's validated output only: a text part for a string output, a data part (`application/json`) for a typed one. Then `COMPLETED`. |
 | `suspended` | `INPUT_REQUIRED`. The status message has a text part and a data part `{ type: 'pending-actions', actions }`. |
-| `stopped` | `INPUT_REQUIRED`, with a data part `{ type: 'stopped', reason, stopDetails?, unknownEffects? }`: a person must look at the run (see [stopped and failed runs](#stopped-and-failed-runs)). A stop a cancellation caused (`'aborted'`, `'cancelled'`) cancels the task instead. |
+| `stopped` | `INPUT_REQUIRED`, with a data part `{ type: 'stopped', reason, stopDetails?, unknownEffects? }`. A drained run goes on at the next message; at any other stop a person must look at the run (see [stopped and failed runs](#stopped-and-failed-runs)). A stop a cancellation caused (`'aborted'`, `'cancelled'`) cancels the task instead. |
 | `failed` | `FAILED`, with the run's error message, secret-redacted (or what `failureMessage` returns), and a data part `{ type: 'failed', error: { name, code? } }`. |
 
 ### Answering what the run waits for
@@ -438,10 +438,11 @@ A message without answers is refused only while the task's status lists what the
 
 ### Stopped and failed runs
 
-A stopped run puts its task in `INPUT_REQUIRED`, because a person (the agent's operator) must look at it:
+A stopped run puts its task in `INPUT_REQUIRED`. What the client does next depends on the reason:
 
+- **`'drained'`**: a [drain](/docs/modules/operations#draining-a-native-run) (a `'drain'` signal on the run's lease, as in a rolling deploy) took the run off its executor before it finished. The run has not ended and needs no person: the client's next message resumes it from its last save, on whichever instance takes the message, and nothing that ran runs again. A drain that stopped a resume before it took the message's answers up leaves the run waiting for them: the task lists them again as `pending-actions`, and the client answers again.
 - **`'tool-reconciliation-required'`**: the outcome of the tool calls in `unknownEffects` is unknown, and the run stays resumable. A person checks each effect in the system it touched and settles it with `resumeAgent` and `reconciledToolResults` or `retryToolCallIds` on the task's run, whose run id is the task id and whose scope is [the task's](#identity-and-several-instances) (see [when the store fails](/docs/modules/native-agents#when-the-store-fails)). The client's next message then picks the run up from there: it resumes the run, or, when the person's resume left the run suspended on new approvals or client-tool calls, lists them as `pending-actions`. Until then, every message finds it stopped again.
-- **Every other stop** (`'max-steps'`, `'budget.usd'`, `'refusal'`, `'mcp-catalog-changed'`, …) is final for the run. Messages are refused with `UNSUPPORTED_OPERATION`; cancel the task, or start a new one.
+- **Every other stop** (`'max-steps'`, `'budget.usd'`, `'refusal'`, `'mcp-catalog-changed'`, …) is final for the run: a person (the agent's operator) must look at it. Messages are refused with `UNSUPPORTED_OPERATION`; cancel the task, or start a new one.
 
 A failed run fails the task. A resume that fails before it begins, having written nothing, refuses the message instead, and the task keeps waiting: `UNSUPPORTED_OPERATION` while another executor holds the run's [lease](#identity-and-several-instances), `INTERNAL_ERROR` otherwise (the run's definition changed, or its store could not be read).
 
@@ -469,7 +470,7 @@ To serve tasks from several instances, share a durable task store and a durable 
 
 `SendStreamingMessage` and `SubscribeToTask` carry the run as it goes: the `task` snapshot, `WORKING` once the leg runs, the text of a string output as drafts of the output artifact, each model step afresh, then the stored artifact and the final status. A typed output is never sent in part. A draft is a preview: only a completed run's artifact is stored, and a run that stops, fails or suspends leaves no artifact, whatever it previewed. With `configuration.returnImmediately`, a follow-up is answered once its leg runs (at `WORKING`), or with the refusal of answers that do not fit.
 
-`CancelTask` aborts a run whose turn runs on this instance; the run stops with reason `'aborted'`. With `lease`, canceling a task whose turn runs on another instance signals the run's lease, which stops the run there with reason `'cancelled'`, and a [lease cancel](/docs/modules/operations#cancelling-a-native-run-from-another-process) from outside A2A (`leases.signal(agentRunLeaseKey({ scope, runId }), 'cancel')`, with `agentRunLeaseKey` from `@deuz-sdk/core/ops`) cancels the task. A task waiting for input has no running turn: canceling it leaves its suspended run in the store as it is, and no message resumes it.
+`CancelTask` aborts a run whose turn runs on this instance; the run stops with reason `'aborted'`. With `lease`, canceling a task whose turn runs on another instance signals the run's lease, which stops the run there with reason `'cancelled'`, and a [lease cancel](/docs/modules/operations#cancelling-a-native-run-from-another-process) from outside A2A (`leases.signal(agentRunLeaseKey({ scope, runId }), 'cancel')`, with `agentRunLeaseKey` from `@deuz-sdk/core/ops`) cancels the task. A task waiting for input has no running turn: canceling it leaves its run in the store as it is, suspended or drained, and no message resumes it. A drained run has not ended, so [`findStaleAgentRuns`](/docs/modules/operations#finding-runs-that-lost-their-executor) lists it like a run whose executor died: a sweeper that resumes stale runs must skip the runs of canceled tasks.
 
 ## Calling an agent
 
