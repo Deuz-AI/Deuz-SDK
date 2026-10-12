@@ -543,3 +543,51 @@ describe('a call without a recorded outcome is gated as before', () => {
     expect(toolMessages(withVerdict.fetch, 1)).toEqual(['charged']);
   });
 });
+
+describe('a client tool keeps its rule', () => {
+  it('answers a client call only from clientToolResults, also once its result was recorded', async () => {
+    const store = createInMemoryAgentRunStore();
+    const { model, fetch } = counted([
+      { toolCalls: [{ toolName: 'ask', id: 'a1', args: {} }] },
+      { text: 'done' },
+    ]);
+    const options = {
+      model,
+      prompt: 'ask',
+      tools: { ask: { description: 'Ask the user.', parameters } },
+    };
+    const session = { store, runId: 'client', scope: 't' };
+    expect((await runAgent({ ...options, session })).status).toBe('suspended');
+    // The resume applies the client's result, and the process dies before the
+    // step that answers the call is checkpointed.
+    const crashed = await resumeAgent({
+      ...options,
+      session: { ...session, store: failingAfter(store, 'a1:completed') },
+      clientToolResults: [{ toolCallId: 'a1', output: 'blue' }],
+    });
+    expect(crashed.status).toBe('failed');
+    expect(stages(await store.load('client'))).toEqual(['a1:completed']);
+    // The resume that took it up cleared the run's pending client calls, so the
+    // result cannot be supplied again: that resume fails and writes nothing.
+    const before = await store.load('client');
+    expect(
+      await resumeAgent({
+        ...options,
+        session,
+        clientToolResults: [{ toolCallId: 'a1', output: 'blue' }],
+      }),
+    ).toMatchObject({
+      status: 'failed',
+      error: {
+        name: 'TypeError',
+        message: 'Client tool results must match unique pending call IDs on resume.',
+      },
+    });
+    expect(await store.load('client')).toEqual(before);
+    const resumed = await resumeAgent({ ...options, session });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(toolMessages(fetch, 1)).toEqual([
+      'Tool call denied. Reason: No result provided for this client tool.',
+    ]);
+  });
+});

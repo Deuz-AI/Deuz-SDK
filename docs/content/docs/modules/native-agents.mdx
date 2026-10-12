@@ -298,7 +298,11 @@ Before 2.3 such a call was answered `Tool call denied. Reason: No approval
 response.` unless the resume passed its verdict again, although its effect had
 landed. A call without a recorded outcome is gated as before: one that never
 started, one in `executing` that `retryToolCallIds` runs again, and a sub-agent call
-in `suspended`. Without its verdict the resume answers such a call as denied.
+in `suspended`. Without its verdict the resume answers such a call as denied. A
+client tool's call keeps its own rule: a resume answers it only from the
+`clientToolResults` it is given for the run's pending calls, so a client call
+whose result an interrupted resume had already recorded is answered
+`Tool call denied. Reason: No result provided for this client tool.`
 
 ### Idempotent tools
 

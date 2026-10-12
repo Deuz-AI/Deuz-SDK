@@ -428,7 +428,8 @@ export interface AgentToolReceipt {
    * the error; a replay reports the recorded `error` and runs nothing again.
    * A stage that records an outcome (`executed`, `completed`, `failed`,
    * `validation-failed`, `projection-failed`) answers its call when a resume
-   * finds the call unanswered (2.3), without the approval gate.
+   * finds the call unanswered (2.3), without the approval gate; a client
+   * tool's call is answered only from `clientToolResults`.
    */
   stage:
     | 'executing'
