@@ -195,6 +195,8 @@ describe('examples/14-native-memory-chat', () => {
     expect(first).toContain('[primary] 503');
     expect(first).toMatch(/\[warning: fallbackModels\] openai\/gpt-5\.2 failed/);
     expect(first).toContain('status: completed');
+    // Nothing is stored yet, so the first run recalls nothing.
+    expect(first).toContain('recall: empty');
     // Extraction after completion: one fact, written under the run's id.
     expect(first).toContain('extraction: completed, mutations: 1');
     expect(first).toContain(`memory: "Ada's order A-17 arrived broken." (written by run ada-1)`);
@@ -245,6 +247,10 @@ describe('examples/15-native-ui-bridge', () => {
     expect(resume).toContain('[server] refund(A-17, $42) executed');
     expect(resume).toMatch(/\[agent\] seq \d+: running, phase finalizing/);
     expect(resume).toMatch(/\[agent\] seq \d+: completed/);
+    // The finalization streams drafts of the output, before the terminal frame.
+    expect(resume).toMatch(
+      /phase finalizing\n(?:.*\n)*?.*\[agent\] seq \d+: running, draft \{.*\n(?:.*\n)*?.*\[agent\] seq \d+: completed/,
+    );
     expect(resume).toContain('output: {"orderId":"A-17","refundedUsd":42,"status":"refunded"}');
     expect(resume).toContain('receipt: $42.00 refunded on order A-17');
 
@@ -257,8 +263,10 @@ describe('examples/15-native-ui-bridge', () => {
     expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
     expect(new Set(seqs).size).toBe(seqs.length);
 
-    // A replay of the journal rebuilds the state, and applies nothing twice.
-    expect(replay).toContain('a fresh client folds it into: completed');
+    // A replay of the journal rebuilds the terminal state, output included, and applies nothing twice.
+    expect(replay).toContain(
+      'a fresh client folds it into: completed {"orderId":"A-17","refundedUsd":42,"status":"refunded"}',
+    );
     expect(replay).toContain('the state this client holds comes back unchanged: true');
   }, 30_000);
 });
