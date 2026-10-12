@@ -107,7 +107,7 @@ Tables are `deuz_memory`, `deuz_chats`, `deuz_sessions`, `deuz_runs` (+ `deuz_me
 
 Postgres specifics worth planning around: since 2.3 every single-statement write of the pack runs again on a serialization failure or deadlock (40001 / 40P01), up to five attempts. `migrate()` is idempotent and memoized, a *failed* attempt is not cached, and the whole DDL batch is one multi-statement query wrapped in `BEGIN … COMMIT` (a separate `query('BEGIN')` can land on a different pooled connection). `CREATE SCHEMA` and `CREATE EXTENSION vector` are **never** issued — the app connection needs `CREATE` on the schema, `SELECT` on `pg_extension`, and ordinary DML. A `deuz_meta.schema_version` newer than the SDK understands makes `migrate()` refuse with `InvalidRequestError` instead of corrupting rows during a rolling deploy. `dimensions` is checked against `pg_attribute` and a mismatch refuses to migrate rather than "succeeding" and failing every write; changing the embedding model later means an `ALTER COLUMN … TYPE vector(D)` **and** re-embedding every row.
 
-Redis has no migration story at all: `prefix` is the entire isolation boundary, changing it migrates nothing (old keys stay, invisible), and no key carries a TTL.
+The Redis store pack has no migration story at all: `prefix` is the entire isolation boundary, changing it migrates nothing (old keys stay, invisible), and no key carries a TTL. (The 2.3 Redis ops, budget and swarm stores do stamp a key layout version; see below.)
 
 ## Native, swarm and ops backends (2.2)
 
