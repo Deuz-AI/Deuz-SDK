@@ -593,7 +593,9 @@ export type AgentRunOptions<T = string> = Omit<
    * loses it stops writing and fails with `'lease_lost'`, leaving the run as
    * its last save had it for the next executor. A `'cancel'` signalled to the
    * key stops the run with reason `'cancelled'`, and is acknowledged once that
-   * is saved. Requires `session`.
+   * is saved. A `'drain'` (2.3) stops it with reason `'drained'` at its next
+   * model-step boundary, before another model call; the run stays as its
+   * last save had it, and a resume goes on from there. Requires `session`.
    */
   lease?: AgentRunLeaseOptions;
   output?: AgentOutput<T>;

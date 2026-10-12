@@ -3,11 +3,15 @@
  * option. One lease per run, keyed `agent:["scope","runId"]`, held while an
  * executor drives the run and renewed every ttlMs / 3, as the swarm and evolve
  * executors hold theirs. Losing it stops every further write; a 'cancel'
- * signalled to the key stops the run. A provider with `ack` keeps a delivered
+ * signalled to the key stops the run, and a 'drain' (2.3) stops it at its
+ * next model-step boundary, resumable. A provider with `ack` keeps a delivered
  * cancel queued until the run's terminal state is durable, so an executor
  * that dies in between cannot lose it. The claim renews at once, before the
- * run is read: what that renewal delivers was queued before the claim, and
- * every cancel after it concerns the run being driven. Edge-safe.
+ * run is read: a cancel that renewal delivers was queued before the claim, and
+ * every cancel after it concerns the run being driven. A drain concerns the
+ * holder it reaches: one queued for an earlier holder went with its lease, so
+ * whatever drain a renewal delivers, the first included, was sent to this one.
+ * Edge-safe.
  */
 import type { AgentRunLeaseOptions } from '../types/agent-run';
 import type { Clock } from '../types/deps';
@@ -52,6 +56,12 @@ export interface NativeRunLease {
   readonly signal: AbortSignal;
   /** A cancel reached this executor: the run stops with reason 'cancelled'. */
   readonly cancelled: boolean;
+  /**
+   * A drain reached this executor (2.3): the run stops at its next model-step
+   * boundary with reason 'drained', and stays resumable. Unlike a cancel, it
+   * aborts nothing.
+   */
+  readonly draining: boolean;
   /**
    * The error a run that failed reports: `'lease_lost'` once the lease is
    * gone, whatever error the loss surfaced as (an aborted call, a refused
@@ -151,6 +161,8 @@ export async function claimNativeRunLease(
   else signal?.addEventListener('abort', follow, { once: true });
 
   let cancelled = false;
+  /** A drain is meant for the holder that receives it, so the claim's renewal counts too (2.3). */
+  let draining = first.signals.includes('drain');
   /** A delivered cancel the provider keeps queued until acknowledged. */
   let kept = false;
   /** A delivered cancel the provider took off the queue. */
@@ -190,6 +202,7 @@ export async function claimNativeRunLease(
         if (stopped) return;
         if (!renewal.held) return lose();
         held = renewal.lease;
+        if (renewal.signals.includes('drain')) draining = true;
         if (delivered) cancel();
       } catch {
         // A provider outage is survivable until the lease could have lapsed.
@@ -207,6 +220,9 @@ export async function claimNativeRunLease(
     signal: controller.signal,
     get cancelled() {
       return cancelled;
+    },
+    get draining() {
+      return draining;
     },
     failure(error) {
       return lost ? new AgentRunLeaseError('lease_lost') : error;

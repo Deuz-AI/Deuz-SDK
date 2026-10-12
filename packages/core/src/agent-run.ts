@@ -18,7 +18,7 @@ import type { CommonCallOptions } from './types/config';
 import type { StopDetails } from './types/methods';
 import type { Message } from './types/message';
 import type { LanguageModel } from './types/model';
-import type { ToolSet } from './types/tool';
+import type { StopCondition, ToolSet } from './types/tool';
 import type { WireToolRequest } from './adapters/types';
 import type { SessionStore } from './types/session';
 import type { StreamPart } from './types/stream';
@@ -149,6 +149,12 @@ function stopReasonOf(finishReason: string): string {
  */
 const FINALIZE_PROMPT =
   'Now provide the final output in the required format, based on the work above.';
+
+/**
+ * The stop reason of a run a `'drain'` lease signal stopped at a model-step
+ * boundary (2.3). Such a run did not end: its last save is where a resume goes on.
+ */
+const DRAINED = 'drained';
 
 /** A turn with nothing in it: never stored, because no provider accepts one back. */
 function isBlankTurn(message: Message): boolean {
@@ -736,6 +742,15 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       reason: reason === 'aborted' && lease?.cancelled ? 'cancelled' : reason,
       ...(stopDetails ? { stopDetails } : {}),
     });
+  /**
+   * A drain (2.3) stops the run where it stands, unended: no outcome is
+   * committed, so the run's last save stays the point a resume goes on from.
+   */
+  const drained = (): void => {
+    settledOutcome = { ...base(), status: 'stopped', reason: DRAINED };
+  };
+  /** A drain reached this executor's lease (2.3). A cancel or abort outranks it. */
+  const drainDue = (): boolean => lease !== undefined && lease.draining && !lease.signal.aborted;
   function emitPart(part: StreamPart, phase: 'running' | 'finalizing'): void {
     events.push({ type: 'part', part, phase });
     if (part.type === 'text-delta') text.push(part.text);
@@ -1230,6 +1245,12 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         settledOutcome = outcome;
         return;
       }
+      // A drain (2.3) that reached this executor before the resume took the run
+      // up stops it here, before its first write: the stored run stays as it was.
+      if (resume && drainDue()) {
+        drained();
+        return;
+      }
       // Chat and memory (2.3). A new run recalls once, here, after every check
       // and before its first save: the recall becomes part of the history every
       // step and every resume sends. The transcript starts with the input; every
@@ -1300,9 +1321,21 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       delete envelope.retry;
       await persist();
 
+      /**
+       * A drain (2.3) stopped the loop at a step boundary: the loop's last stop
+       * condition fired after a step's tool calls ran, before another model call.
+       */
+      let drainStopped = false;
       const checkpointStore: SessionStore = {
         load: (runId) => envelope.checkpoints[runId],
-        save: async (checkpoint) => {
+        save: async (saved) => {
+          // The loop records a stop as a completed checkpoint. A drain's is the
+          // boundary the loop stopped at, so it is stored as the running one a
+          // resume goes on from, as the loop would have saved it (2.3).
+          const checkpoint =
+            drainStopped && saved.runId === envelope.runId && saved.status === 'completed'
+              ? { ...saved, status: 'running' as const }
+              : saved;
           envelope.checkpoints[checkpoint.runId] = structuredClone(checkpoint);
           if (checkpoint.runId === envelope.runId) {
             envelope.messages = checkpoint.messages;
@@ -1517,11 +1550,29 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             envelope.candidateText = currentText = finalTurnText(envelope.messages);
         } else {
           if (!(await checkLimit())) return;
+          // A drain (2.3) stops a new run before its first model call. A resume
+          // goes on to its first step boundary, so what it was given (verdicts,
+          // client results) is applied and saved before it stops.
+          if (!resume && drainDue()) {
+            drained();
+            return;
+          }
           events.push({ type: 'phase', phase: 'running' });
           // A leg whose model call failed over (2.3) runs again from the run's
           // last checkpoint, so only that call is repeated; without one, from
           // the history the first leg started with.
           const legInput = common.messages;
+          // A drain (2.3) stops the loop after a step's tool calls ran, before
+          // another model call. It is the loop's last stop condition, so every
+          // other stop at the same boundary outranks it.
+          const stopWhen: CommonCallOptions['stopWhen'] = lease
+            ? [
+                ...(common.stopWhen === undefined ? [] : [common.stopWhen].flat()),
+                Object.assign((): boolean => (drainStopped = drainDue()), {
+                  conditionName: DRAINED,
+                }) satisfies StopCondition,
+              ]
+            : common.stopWhen;
           let snapshot: StreamToolLoopSnapshot | undefined;
           let loop: StreamToolLoopSnapshot;
           for (;;) {
@@ -1561,6 +1612,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                 ...(router ? { model: router.route(common.model) ?? common.model } : {}),
                 ...(legCheckpoint ? {} : { messages: legInput }),
                 maxSteps: maxSteps - before,
+                stopWhen,
                 guardrails: { ...options.guardrails, onOutput: undefined },
                 session: { store: checkpointStore, runId: envelope.runId, durability: 'strict' },
                 ...(transcriptChat ? { chat: transcriptChat } : {}),
@@ -1580,10 +1632,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
                   snapshot = value;
                 },
                 onCheckpoint: (value) => {
+                  // A drain's stop (2.3) is no outcome of the loop, which goes on
+                  // on resume: recorded as the step boundary it is.
+                  const drain = drainStopped && value.stoppedBy === DRAINED;
                   envelope.loopOutcome = {
                     finishReason: value.finishReason,
-                    endReason: value.endReason,
-                    stoppedBy: value.stoppedBy,
+                    endReason: drain ? 'natural' : value.endReason,
+                    stoppedBy: drain ? undefined : value.stoppedBy,
                     ...(value.stopDetails ? { stopDetails: value.stopDetails } : {}),
                   };
                   envelope.pendingClientCalls = value.pendingClientCalls;
@@ -1639,12 +1694,21 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               failOver(route.called, route.intended, loop.error, 'running')
             ) {
               await persist();
+              // A drain (2.3) waits for the step boundary: the retried call is
+              // part of the step in flight, and only that step's checkpoint
+              // records the calls a resumed leg settled before it.
               if (!(await checkLimit())) return;
               continue;
             }
             if (heldError) emitPart(heldError, 'running');
             callFailure = { error: loop.error, brokeOff: brokeOff(legRequests) };
             throw loop.error;
+          }
+          // A drain (2.3) stopped the loop at a step boundary, which its last
+          // checkpoint holds: the run stops there, unended.
+          if (drainStopped) {
+            drained();
+            return;
           }
           if (loop.pendingApprovals.length || loop.pendingClientCalls.length) {
             envelope.pendingClientCalls = loop.pendingClientCalls;
@@ -1732,6 +1796,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         finalizeTools = wire && wire.tools.length > 0 ? { ...wire, toolChoice: 'none' } : undefined;
         return finalizeTools;
       };
+      /** The last final-answer call failed over (2.3): its retry is still that call. */
+      let failedOver = false;
       for (;;) {
         if (envelope.candidateText === undefined) {
           if (!(await checkLimit())) return;
@@ -1739,6 +1805,13 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
             await stopped('output-attempts-exhausted');
             return;
           }
+          // A drain (2.3) stops the run before a final answer call, a repair
+          // of one included; a call that failed over goes to the next model first.
+          if (!failedOver && drainDue()) {
+            drained();
+            return;
+          }
+          failedOver = false;
           // The request must end with a user turn: one that ends with the
           // assistant's own answer is a prefill, which Claude 5.x models reject.
           // Appended once and persisted below, so a resumed attempt reuses it.
@@ -1883,6 +1956,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
               // as a model step and a finalization attempt.
               envelope.outputAttempts = Math.max(0, (envelope.outputAttempts ?? 1) - 1);
               await persist();
+              failedOver = true;
               continue;
             }
             if (heldError) emitPart(heldError, 'finalizing');
