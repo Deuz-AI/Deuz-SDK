@@ -97,11 +97,13 @@ retry serialization failures and deadlocks. `streamObject`'s `warnings` no
 longer hangs on a failed call, and `agentTool` child sessions no longer collide
 when a provider reuses a call id.
 
-Native envelopes that record memory, a chat projection or fail-over state
-(version 2), an MCP catalog or a failed receipt need 2.3 to resume. OpenAI
-Responses requests send `store: false`, and `validateChatRequest` accepts the
-tool results `useChat` posts. `CallWarning['type']`, `BudgetLedgerErrorCode`,
-`AgentToolReceipt['stage']` and `AgentRunEnvelope.version` are widened.
+A native run that 2.3 saved with `mcp`, handoffs, `memory`, `chat` or
+`fallbackModels` (its resume binding records them; memory, a chat projection or
+fail-over state also make the envelope version 2), or with a failed receipt,
+needs 2.3 to resume. OpenAI Responses requests send `store: false`, and
+`validateChatRequest` accepts the tool results `useChat` posts.
+`CallWarning['type']`, `BudgetLedgerErrorCode`, `AgentToolReceipt['stage']` and
+`AgentRunEnvelope.version` are widened.
 
 ## 2.2.0
 
