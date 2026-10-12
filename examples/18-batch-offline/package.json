@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/18-batch-offline",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A provider batch on a scripted API: budget holds at submit, polling, and per-result settlement at batch rates.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
