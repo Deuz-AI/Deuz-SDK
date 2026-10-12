@@ -99,7 +99,7 @@ refuse such a model instead.
 | 0 | `completed` | The run finished with an accepted output |
 | 1 | `failed` | An error ended it: a provider error, a store failure, a lost lease, a binding that changed on resume, an answer the resume could not take |
 | 2 | — | Usage: a command line could not parse its arguments (for your own CLI) |
-| 3 | `pending` | It waits: approvals, client tool results, a decision on calls whose effect is unknown (`tool-reconciliation-required`), or, for a stored run with no result, a resume |
+| 3 | `pending` | It waits: approvals, client tool results, a decision on calls whose effect is unknown (`tool-reconciliation-required`), or a resume: a stored run with no result, or a run a lease drain stopped (`'drained'`) |
 | 4 | `refused` | The model refused (stop reason `'refusal'`) |
 | 5 | `cancelled` | Aborted or cancelled |
 | 6 | `limit` | A limit you set: `budget.usd`, `budget.tokens`, `maxSteps`, a stop condition on cost, tokens, steps or duration, the execution deadline, a timeout, or `unknownPrice: 'reject'` |
@@ -124,7 +124,7 @@ Each pending action names the option of `resumeHeadless` that answers it
 | `approval` | `approvalId`, `toolCallId`, `toolName`, `input`, `agentPath?`, `token?` | `approvalResponses` (echo a signed approval's `token`) |
 | `client-tool` | `toolCallId`, `toolName`, `input` | `clientToolResults` |
 | `unknown-effect` | `toolCallId`, `toolName`, `input`, `modelStep?` | after checking the effect: `retryToolCallIds` to run it again, or `reconciledToolResults` with the result that landed |
-| `resume` | `phase` | a plain resume (the run's executor stopped before it ended) |
+| `resume` | `phase` | a plain resume (the run's executor stopped before it ended, or a lease drain stopped it) |
 
 ```ts title="headless-approval.ts"
 import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
@@ -274,6 +274,20 @@ console.log(first.outcome, first.retry, exitCodeFor(first));
 const retried = await resumeHeadless({ model, store, runId: 'ticket-9', retryFailed: true });
 console.log(retried.outcome, exitCodeFor(retried)); // completed 0
 ```
+
+### A drained run
+
+A `'drain'` lease signal stops a run that holds a `lease` (passed as to
+`runAgent`) at its next model-step boundary: see
+[Draining a native run](/docs/modules/operations#draining-a-native-run). The run
+has not ended, so its report is `pending` (exit 3), with `reason: 'drained'`
+and a pending `resume` in the phase it stopped in, as `inspectRun` reports the
+stored run; a plain resume on any executor goes on from its last save. A drain
+that reached a resume before it took the run up wrote nothing, so that report
+lists what the run still waits for: the approvals, client results or unknown
+effects to answer again. A run that failed in transit keeps its `retry` there:
+pass `retryFailed: true` again. The list is read from the stored run, so it is
+empty when that could not be read back (a warning says so).
 
 ## Project instructions
 

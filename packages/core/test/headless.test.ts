@@ -7,7 +7,9 @@ import { createInMemoryAgentRunStore } from '../src/agent-run';
 import { BudgetLedgerError } from '../src/budget-ledger';
 import { createMockModel, type MockResponse } from '../src/testing';
 import { createOpenAI } from '../src/openai';
+import { agentRunLeaseKey, createInMemoryLeaseProvider } from '../src/ops';
 import { attachConfig, readConfig } from '../src/internal/config-symbol';
+import { createDeferred } from '../src/internal/async-iter';
 import {
   HEADLESS_EXIT_CODES,
   exitCodeFor,
@@ -18,7 +20,9 @@ import {
 } from '../src/node/headless';
 import type { AgentEvent, AgentRunStore, AgentToolSet } from '../src/types/agent-run';
 import type { BreakerStore } from '../src/types/deps';
+import type { LeaseProvider } from '../src/types/lease';
 import type { LanguageModel } from '../src/types/model';
+import { manualClock } from './fixtures/manual-clock';
 
 /** A mock model answering as `modelId` (the price table keys on the id). */
 function mockAs(modelId: string, responses: MockResponse[]): LanguageModel {
@@ -598,6 +602,257 @@ describe('resumeHeadless with the 2.3 durability options (headless preview)', ()
     });
     expect(done).toMatchObject({ outcome: 'completed', output: 'Charged.' });
     expect(done.retry).toBeUndefined();
+    expect(effects).toEqual(['charge']);
+  });
+});
+
+/** Leases and a store on one manual clock: the heartbeat that delivers a signal runs on demand. */
+function leased() {
+  const time = manualClock(0);
+  return {
+    ...time,
+    leases: createInMemoryLeaseProvider({ clock: time.clock }),
+    store: createInMemoryAgentRunStore({ clock: time.clock }),
+  };
+}
+
+/** A provider on which a drain reaches the holder right after it claims a key. */
+const drainingOnClaim = (leases: LeaseProvider): LeaseProvider => ({
+  acquire: async (request) => {
+    const lease = await leases.acquire(request);
+    if (lease) await leases.signal(request.key, 'drain');
+    return lease;
+  },
+  renew: (lease, ttlMs, options) => leases.renew(lease, ttlMs, options),
+  release: (lease) => leases.release(lease),
+  signal: (key, signal) => leases.signal(key, signal),
+  ack: (lease, signal) => leases.ack!(lease, signal),
+});
+
+describe('a run a lease drain stopped (headless preview, 2.3)', () => {
+  it('reports it as pending a resume (exit 3), and a resume goes on from its last save', async () => {
+    const { leases, store, clock, advance } = leased();
+    const entered = createDeferred<void>();
+    const released = createDeferred<void>();
+    let runs = 0;
+    const tools: AgentToolSet = {
+      work: {
+        description: 'Long work.',
+        parameters: { type: 'object', properties: {} },
+        async execute() {
+          runs += 1;
+          entered.resolve();
+          await released.promise;
+          return 'worked';
+        },
+      },
+    };
+    const model = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'work', id: 'w1', args: {} }] }, { text: 'done' }],
+    });
+    const run = { model, tools, store, runId: 'job', scope: 'ops', deps: { clock } };
+    const leg = runHeadless({
+      ...run,
+      prompt: 'Work.',
+      lease: { provider: leases, owner: 'a', ttlMs: 300 },
+    });
+    await entered.promise;
+    expect(await leases.signal(agentRunLeaseKey({ runId: 'job', scope: 'ops' }), 'drain')).toBe(
+      true,
+    );
+    // The next heartbeat delivers it; the step in flight finishes first.
+    await advance(100);
+    released.resolve();
+    const drained = await leg;
+    expect(drained).toMatchObject({
+      status: 'stopped',
+      reason: 'drained',
+      outcome: 'pending',
+      phase: 'running',
+      pending: [{ kind: 'resume', phase: 'running' }],
+    });
+    expect(drained.retry).toBeUndefined();
+    expect(exitCodeFor(drained)).toBe(HEADLESS_EXIT_CODES.pending);
+    // No outcome was committed: the stored run waits for the same resume.
+    expect((await inspectRun(store, 'job')).pending).toEqual(drained.pending);
+
+    const resumed = await resumeHeadless({
+      ...run,
+      lease: { provider: leases, owner: 'b', ttlMs: 300 },
+    });
+    expect(resumed).toMatchObject({ outcome: 'completed', output: 'done' });
+    expect(exitCodeFor(resumed)).toBe(0);
+    expect(runs).toBe(1);
+  });
+
+  it('names the phase the run goes on in: a drain before the final answer call', async () => {
+    const { leases, store, clock } = leased();
+    const run = {
+      model: createMockModel({ responses: [{ text: '{"answer":42}' }] }),
+      output: {
+        schema: {
+          type: 'object' as const,
+          properties: { answer: { type: 'number' as const } },
+          required: ['answer'],
+        },
+        mode: 'json' as const,
+        validate: (value: unknown) => value as { answer: number },
+      },
+      store,
+      runId: 'answer',
+      scope: 'ops',
+      deps: { clock },
+    };
+    const drained = await runHeadless({
+      ...run,
+      prompt: 'Answer.',
+      lease: { provider: drainingOnClaim(leases), owner: 'a' },
+    });
+    expect(drained).toMatchObject({
+      reason: 'drained',
+      outcome: 'pending',
+      phase: 'finalizing',
+      pending: [{ kind: 'resume', phase: 'finalizing' }],
+    });
+    expect((await inspectRun(store, 'answer')).pending).toEqual(drained.pending);
+    const resumed = await resumeHeadless({ ...run, lease: { provider: leases, owner: 'b' } });
+    expect(resumed).toMatchObject({ outcome: 'completed', output: { answer: 42 } });
+  });
+
+  it('lists nothing, with a warning, when the stored run cannot be read back', async () => {
+    const { leases, store, clock } = leased();
+    // The store goes away once the leg's result is out, before the report reads it.
+    let gone = false;
+    const vanishing: AgentRunStore = {
+      load: async (runId) => {
+        if (gone) throw new Error('the store went away');
+        return store.load(runId);
+      },
+      save: (envelope) => store.save(envelope),
+    };
+    const drained = await runHeadless({
+      model: createMockModel({ responses: [{ text: 'ok' }] }),
+      prompt: 'Work.',
+      store: vanishing,
+      runId: 'lost',
+      scope: 'ops',
+      deps: { clock },
+      lease: { provider: drainingOnClaim(leases), owner: 'a' },
+      onEvent: (event) => {
+        if (event.type === 'result') gone = true;
+      },
+    });
+    expect(drained).toMatchObject({ reason: 'drained', outcome: 'pending', pending: [] });
+    expect(drained.phase).toBeUndefined();
+    expect(drained.warnings).toEqual([
+      expect.objectContaining({ message: expect.stringContaining('could not be read back') }),
+    ]);
+    expect(exitCodeFor(drained)).toBe(HEADLESS_EXIT_CODES.pending);
+    // What it waits for is still there to inspect.
+    expect((await inspectRun(store, 'lost')).pending).toEqual([
+      { kind: 'resume', phase: 'running' },
+    ]);
+  });
+
+  it('lists the approvals again when the drain reached a resume before it took the run up', async () => {
+    const { leases, store, clock } = leased();
+    const run = {
+      model: createMockModel({
+        responses: [
+          { toolCalls: [{ toolName: 'deploy', args: { env: 'prod' } }] },
+          { text: 'Deployed to prod.' },
+        ],
+      }),
+      tools: deployTools,
+      store,
+      runId: 'deploy',
+      scope: 'ops',
+      deps: { clock },
+    };
+    const first = await runHeadless({ ...run, prompt: 'Deploy.' });
+    const approval = first.pending[0];
+    if (approval?.kind !== 'approval') throw new Error('expected an approval');
+    const approvalResponses = [{ approvalId: approval.approvalId, approved: true }];
+    const before = await store.load('deploy');
+    const drained = await resumeHeadless({
+      ...run,
+      approvalResponses,
+      lease: { provider: drainingOnClaim(leases), owner: 'a' },
+    });
+    // Nothing was written, so the verdict is still owed: the report asks for it.
+    expect(drained).toMatchObject({ status: 'stopped', reason: 'drained', outcome: 'pending' });
+    expect(drained.pending).toEqual(first.pending);
+    expect(exitCodeFor(drained)).toBe(HEADLESS_EXIT_CODES.pending);
+    expect(await store.load('deploy')).toEqual(before);
+    const done = await resumeHeadless({
+      ...run,
+      approvalResponses,
+      lease: { provider: leases, owner: 'b' },
+    });
+    expect(done).toMatchObject({ outcome: 'completed', output: 'Deployed to prod.' });
+  });
+
+  it('keeps retry and the unknown effect when the drain reached a retried resume first', async () => {
+    const { leases, store, clock } = leased();
+    // A fatal budget-store conflict raised inside the tool call, after its
+    // effect: the run fails in transit, the call's outcome unknown.
+    const effects: string[] = [];
+    const tools: AgentToolSet = {
+      charge: {
+        description: 'Charge the card.',
+        parameters: { type: 'object' },
+        execute: () => {
+          effects.push('charge');
+          if (effects.length === 1)
+            throw new BudgetLedgerError(
+              'admission_failed',
+              'The persistent budget store failed; nothing was changed.',
+              Object.assign(new Error('could not serialize access'), { code: '40001' }),
+            );
+          return 'charged';
+        },
+      },
+    };
+    const run = {
+      model: createMockModel({
+        responses: [
+          { toolCalls: [{ toolName: 'charge', id: 'c1', args: {} }] },
+          { text: 'Charged.' },
+        ],
+      }),
+      tools,
+      store,
+      runId: 'contended',
+      scope: 'ops',
+      deps: { clock },
+    };
+    const first = await runHeadless({ ...run, prompt: 'Charge.' });
+    expect(first.retry).toMatchObject({ cause: 'admission', phase: 'running' });
+    const answers = {
+      retryFailed: true,
+      reconciledToolResults: [{ toolCallId: 'c1', output: 'charged' }],
+    };
+    const before = await store.load('contended');
+    const drained = await resumeHeadless({
+      ...run,
+      ...answers,
+      lease: { provider: drainingOnClaim(leases), owner: 'a' },
+    });
+    // Nothing was written: the run still failed in transit, the effect still
+    // unknown. The next resume answers it, with retryFailed again.
+    expect(drained).toMatchObject({
+      reason: 'drained',
+      outcome: 'pending',
+      phase: 'terminal',
+      retry: first.retry,
+      pending: [
+        expect.objectContaining({ kind: 'unknown-effect', toolCallId: 'c1' }),
+        { kind: 'resume', phase: 'running' },
+      ],
+    });
+    expect(await store.load('contended')).toEqual(before);
+    const done = await resumeHeadless({ ...run, ...answers });
+    expect(done).toMatchObject({ outcome: 'completed', output: 'Charged.' });
     expect(effects).toEqual(['charge']);
   });
 });

@@ -8,6 +8,7 @@ import { createInMemoryAgentRunStore } from '../src/agent-run';
 import { EMPTY_USAGE } from '../src/core/metering';
 import { HEADLESS_EXIT_CODES, exitCodeFor, inspectRun } from '../src/node/headless';
 import type { HeadlessReport } from '../src/node/headless';
+import { reportFromResult } from '../src/headless/report';
 import type { AgentResult, AgentRunEnvelope, AgentToolReceipt } from '../src/types/agent-run';
 
 const usage = { ...EMPTY_USAGE, inputTokens: 12, outputTokens: 8, totalTokens: 20 };
@@ -273,6 +274,27 @@ describe('inspectRun (headless preview)', () => {
     ];
     for (const [runId, result, retry] of others)
       expect((await stored(runId, result, retry)).retry, runId).toBeUndefined();
+  });
+
+  it('reports a drained leg as pending a resume in the phase the stored run goes on in', () => {
+    // A drain stopped a retried resume before it took the run up: the stored
+    // run still failed in transit, while finalizing (2.3).
+    const report = reportFromResult(stopped('r-drained', 'drained'), {
+      scope: 'ci',
+      stored: envelope('r-drained', {
+        result: failed('r-drained', 'server_error'),
+        retry: { cause: 'model-call', phase: 'finalizing' },
+      }),
+    });
+    expect(report).toMatchObject({
+      status: 'stopped',
+      reason: 'drained',
+      outcome: 'pending',
+      phase: 'terminal',
+      retry: { cause: 'model-call', phase: 'finalizing', resumeWith: 'retryFailed' },
+      pending: [{ kind: 'resume', phase: 'finalizing' }],
+    });
+    expect(exitCodeFor(report)).toBe(HEADLESS_EXIT_CODES.pending);
   });
 
   it('rejects an unknown run', async () => {
