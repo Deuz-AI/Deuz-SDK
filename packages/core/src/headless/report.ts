@@ -8,6 +8,7 @@ import type {
   AgentResult,
   AgentRunEnvelope,
   AgentRunPhase,
+  AgentRunRetry,
   AgentVerification,
 } from '../types/agent-run';
 import type { BudgetTotals } from '../types/execution';
@@ -32,6 +33,9 @@ import { createExecutionContext } from '../execution-policy';
  *   the execution deadline, a timeout, or a strict budget refusing an unpriced model.
  * - `'stopped'` — it stopped short for another reason: a guardrail, a verifier
  *   that never accepted, a cut-off output, a changed MCP catalog.
+ *
+ * A failure whose cause was transient (`'failed'`, or `'limit'` for a
+ * transport timeout) also carries the report's `retry`.
  */
 export type HeadlessOutcome =
   | 'completed'
@@ -73,9 +77,10 @@ export const HEADLESS_EXIT_CODES: Readonly<Record<HeadlessOutcome | 'usage' | 'd
   });
 
 /**
- * One thing a pending run waits for, and the resume option that answers it.
- * `'resume'` is a stored run with no result yet: its executor stopped (or
- * still drives it elsewhere), and a resume continues it.
+ * One thing a pending run waits for, and the resume option that answers it
+ * (`resumeWith`; either of two for an unknown effect). `'resume'` is a stored
+ * run with no result yet: its executor stopped (or still drives it
+ * elsewhere), and a resume continues it.
  */
 export type HeadlessPendingAction =
   | {
@@ -100,17 +105,38 @@ export type HeadlessPendingAction =
   | {
       /**
        * A call that started and whose outcome was never recorded. Check the
-       * effect in the system it touched; list the call in `retryToolCallIds`
-       * to run it again.
+       * effect in the system it touched, then answer with either option: list
+       * the call in `retryToolCallIds` to run it again, or give the result that
+       * landed in `reconciledToolResults` (`isError` for an error) so it never
+       * runs again. Every unknown effect of the run needs an answer in the
+       * same resume.
        */
       kind: 'unknown-effect';
       toolCallId: string;
       toolName: string;
       input: unknown;
       modelStep?: number;
-      resumeWith: 'retryToolCallIds';
+      resumeWith: ['retryToolCallIds', 'reconciledToolResults'];
     }
   | { kind: 'resume'; phase: Exclude<AgentRunPhase, 'terminal'> };
+
+/**
+ * A failed run a resume can re-enter (2.3 preview): its failure was transient,
+ * and the stored run records why (`AgentRunEnvelope.retry`). Resume with
+ * `retryFailed: true` to go on from the run's last checkpoint.
+ */
+export interface HeadlessRetry {
+  /**
+   * `'model-call'`: a model call failed in transit (a network or provider
+   * error, a transport timeout, an open circuit breaker, a stream that broke
+   * off). `'admission'`: the persistent budget store refused a call with a
+   * serialization conflict.
+   */
+  cause: AgentRunRetry['cause'];
+  /** The phase the run failed in, where the retry re-enters it. */
+  phase: AgentRunRetry['phase'];
+  resumeWith: 'retryFailed';
+}
 
 /** What a run's model calls cost (2.3 preview), from its budget ledger. */
 export interface HeadlessCost {
@@ -136,11 +162,23 @@ export interface HeadlessReport {
   /** The run's result status; `'in-progress'` for a stored run with no result yet. */
   status: AgentResult['status'] | 'in-progress';
   outcome: HeadlessOutcome;
-  /** Where the stored run stands; absent when nothing was stored. */
+  /**
+   * Where the stored run stands; absent when nothing was stored, or when it
+   * could not be read back after the leg (a warning says so).
+   */
   phase?: AgentRunPhase;
   /** A stopped run's reason, e.g. `'refusal'` or `'budget.usd'`. */
   reason?: string;
   error?: { name: string; message: string; code?: string };
+  /**
+   * The stored run failed in transit, and a resume with `retryFailed: true`
+   * re-enters it. Set on the report of that failure (its outcome `'failed'`,
+   * or `'limit'` for a transport timeout), and of a later leg that ended
+   * before its first write (a retried resume that stopped again for an
+   * unknown effect: answer it and pass `retryFailed: true` once more). Absent
+   * for any other failure, including a resume refused before it wrote.
+   */
+  retry?: HeadlessRetry;
   stopDetails?: StopDetails;
   /** What the run waits for; empty unless the outcome is `'pending'`. */
   pending: HeadlessPendingAction[];
@@ -148,6 +186,7 @@ export interface HeadlessReport {
   modelSteps: number;
   /** Absent when the run has no budget ledger to read it from. */
   cost?: HeadlessCost;
+  /** The verifier's last verdict, when the run has a `verify` that ran. */
   verification?: AgentVerification['status'];
   /** The warnings this leg reported (`inspectRun` reports none: no call was made). */
   warnings: CallWarning[];
@@ -249,8 +288,33 @@ function unknownEffect(receipt: {
     toolName: receipt.toolName,
     input: receipt.input,
     ...(receipt.modelStep !== undefined ? { modelStep: receipt.modelStep } : {}),
-    resumeWith: 'retryToolCallIds',
+    resumeWith: ['retryToolCallIds', 'reconciledToolResults'],
   };
+}
+
+type ResultError = { name: string; message: string; code?: string };
+
+function sameError(a: ResultError, b: ResultError): boolean {
+  return a.name === b.name && a.message === b.message && a.code === b.code;
+}
+
+/**
+ * The retry a resume can make of the stored run (`retryFailed`): the run's
+ * record of a transient failure, when the resume would take it (its result
+ * failed, in a phase it can re-enter). A leg that failed on its own, such as
+ * a resume refused before it wrote or a fresh run under a taken ID, is not
+ * that failure and gets none.
+ */
+function retryOf(
+  result: AgentResult<unknown>,
+  stored: AgentRunEnvelope | undefined,
+): HeadlessRetry | undefined {
+  const record = stored?.retry;
+  const failure = stored?.phase === 'terminal' ? stored.result : undefined;
+  if (!record || failure?.status !== 'failed') return undefined;
+  if (record.phase !== 'running' && record.phase !== 'finalizing') return undefined;
+  if (result.status === 'failed' && !sameError(result.error, failure.error)) return undefined;
+  return { cause: record.cause, phase: record.phase, resumeWith: 'retryFailed' };
 }
 
 /** Round-trip through JSON: the report holds plain data only. */
@@ -258,11 +322,16 @@ function plain<T>(value: T): T {
   return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
 }
 
-/** The report of a native result. `phase` is the stored run's, when known. */
+/**
+ * The report of a native result. `stored` is the stored run as the leg left it,
+ * when it could be read: its phase, and the retry its failure allows.
+ */
 export function reportFromResult(
   result: AgentResult<unknown>,
-  context: { scope: string; phase?: AgentRunPhase; warnings?: readonly CallWarning[] },
+  context: { scope: string; stored?: AgentRunEnvelope; warnings?: readonly CallWarning[] },
 ): HeadlessReport {
+  const phase = context.stored?.phase;
+  const retry = retryOf(result, context.stored);
   const report: HeadlessReport = {
     kind: 'deuz-headless-report',
     version: 1,
@@ -270,9 +339,10 @@ export function reportFromResult(
     scope: context.scope,
     status: result.status,
     outcome: outcomeOf(result),
-    ...(context.phase !== undefined ? { phase: context.phase } : {}),
+    ...(phase !== undefined ? { phase } : {}),
     ...(result.status === 'stopped' ? { reason: result.reason } : {}),
     ...(result.status === 'failed' ? { error: { ...result.error } } : {}),
+    ...(retry ? { retry } : {}),
     ...(result.stopDetails ? { stopDetails: { ...result.stopDetails } } : {}),
     pending: pendingOf(result),
     usage: { ...result.usage },
@@ -312,7 +382,7 @@ function savedTotals(envelope: AgentRunEnvelope): BudgetTotals | undefined {
 /** The report of a stored run (`inspectRun`): no model call, no warnings. */
 export function reportFromEnvelope(envelope: AgentRunEnvelope): HeadlessReport {
   if (envelope.result) {
-    return reportFromResult(envelope.result, { scope: envelope.scope, phase: envelope.phase });
+    return reportFromResult(envelope.result, { scope: envelope.scope, stored: envelope });
   }
   // No result: the run is in progress, or its executor stopped before it ended.
   // An interrupted call that is not idempotent needs a decision before resume.

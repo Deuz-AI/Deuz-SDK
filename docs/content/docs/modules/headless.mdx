@@ -4,9 +4,10 @@ description: Run, resume and inspect native agent runs from a script or CI job, 
 ---
 
 `@deuz-sdk/core/headless` (2.3) runs native agents without a UI: from a script,
-a CI job or a cron entry. Every function returns a plain JSON report, and
-`exitCodeFor(report)` maps it to an exit code, so a shell can branch on how a
-run ended. A run that did not complete never exits 0.
+a CI job or a cron entry. `runHeadless`, `resumeHeadless`, `inspectRun` and
+`doctor` return a plain JSON report, and `exitCodeFor(report)` maps it to an
+exit code, so a shell can branch on how a run ended. A run that did not
+complete never exits 0.
 
 <Callout type="warn" title="Preview">
 The headless subpath is a preview, not a stable API: report fields, finding
@@ -21,7 +22,7 @@ shows a command line built on these functions.
 | `resumeHeadless(options)` | Continue a stored run with the answers its report asked for |
 | `inspectRun(store, runId)` | Report a stored run, with no model call |
 | `doctor(options)` | Report why a model or configuration will not work, with no network call |
-| `loadProjectInstructions(dir)` | Read the project's `AGENTS.md` / `CLAUDE.md` files into a system message |
+| `loadProjectInstructions(dir)` | Read the project's `AGENTS.md` / `CLAUDE.md` files into one system message (or a user message, with `role: 'user'`) |
 | `exitCodeFor(report)` | The exit code of a run report or a doctor report |
 
 The subpath is Node-only: it reads instruction files and skill folders from
@@ -74,12 +75,14 @@ output; it must not throw.
 | `runId`, `scope` | The run |
 | `status` | The result status: `completed`, `suspended`, `stopped`, `failed`; `in-progress` for a stored run with no result yet |
 | `outcome` | How the leg ended, for automation (below) |
-| `phase` | Where the stored run stands after the leg (`running`, `finalizing`, `terminal`); absent when nothing was stored |
+| `phase` | Where the stored run stands after the leg (`running`, `finalizing`, `terminal`); absent when nothing was stored, or when the stored run could not be read back (a warning says so) |
 | `reason`, `stopDetails` | A stopped run's reason (`'refusal'`, `'budget.usd'`, …) and the provider's explanation |
 | `error` | A failed run's `name`, `message` and `code` |
+| `retry` | The stored run failed in transit and a resume can re-enter it: `cause`, `phase`, `resumeWith: 'retryFailed'` ([below](#a-run-that-failed-in-transit)) |
 | `pending` | What a pending run waits for, and the resume option that answers each |
 | `usage`, `modelSteps` | Token usage and model calls so far |
-| `cost` | `usd`, `complete`, `unpricedCalls`, `unknownCalls`, from the run's budget ledger |
+| `cost` | `usd`, `complete`, `unpricedCalls`, `unknownCalls`, from the run's budget ledger; absent when there is none to read (a leg refused before it read the run's ledger, such as a fresh run under a run ID that is taken) |
+| `verification` | The verifier's last verdict (`verified`, `rejected`, `inconclusive`), when the run has a `verify` that ran |
 | `warnings` | The leg's `CallWarning`s (`inspectRun` reports none) |
 | `output`, `text` | A completed run's accepted output; the final text |
 
@@ -94,7 +97,7 @@ refuse such a model instead.
 | Code | `outcome` | When |
 | --- | --- | --- |
 | 0 | `completed` | The run finished with an accepted output |
-| 1 | `failed` | An error ended it: a provider error, a store failure, a lost lease, a binding that changed on resume |
+| 1 | `failed` | An error ended it: a provider error, a store failure, a lost lease, a binding that changed on resume, an answer the resume could not take |
 | 2 | — | Usage: a command line could not parse its arguments (for your own CLI) |
 | 3 | `pending` | It waits: approvals, client tool results, a decision on calls whose effect is unknown (`tool-reconciliation-required`), or, for a stored run with no result, a resume |
 | 4 | `refused` | The model refused (stop reason `'refusal'`) |
@@ -103,19 +106,24 @@ refuse such a model instead.
 | 7 | `stopped` | Stopped short for another reason: a guardrail, a verifier that never accepted, an invalid output, a cut-off output (`'length'`), a changed MCP catalog |
 | 8 | — | `doctor` found an error |
 
-The table is `HEADLESS_EXIT_CODES`. A run's leg rejects only when the project
-files or skills cannot be read, a tool takes a skill tool's name, or `onEvent`
-threw; everything that happens to the run itself is in the report.
+The table is `HEADLESS_EXIT_CODES`. A failure whose cause was transient keeps
+its outcome (`failed`, or `limit` for a transport timeout) and also carries
+`retry` ([below](#a-run-that-failed-in-transit)). A run's leg rejects only when
+the project instructions cannot be loaded (`projectDir` is not a directory, an
+invalid `projectInstructions` option, a read error), a tool takes a skill
+tool's name, or `onEvent` threw; everything that happens to the run itself is
+in the report.
 
 ## Pending runs and resume
 
-Each pending action names the option of `resumeHeadless` that answers it:
+Each pending action names the option of `resumeHeadless` that answers it
+(`resumeWith`; an unknown effect takes either of two):
 
 | `kind` | Fields | Resume with |
 | --- | --- | --- |
 | `approval` | `approvalId`, `toolCallId`, `toolName`, `input`, `agentPath?`, `token?` | `approvalResponses` (echo a signed approval's `token`) |
 | `client-tool` | `toolCallId`, `toolName`, `input` | `clientToolResults` |
-| `unknown-effect` | `toolCallId`, `toolName`, `input`, `modelStep?` | `retryToolCallIds`, after checking the effect |
+| `unknown-effect` | `toolCallId`, `toolName`, `input`, `modelStep?` | after checking the effect: `retryToolCallIds` to run it again, or `reconciledToolResults` with the result that landed |
 | `resume` | `phase` | a plain resume (the run's executor stopped before it ended) |
 
 ```ts title="headless-approval.ts"
@@ -160,17 +168,118 @@ console.log(done.outcome, done.output, exitCodeFor(done)); // completed Deployed
 
 Resume with the same model, tools, skills and output as the first leg: the
 run's binding rejects a change, and that resume fails (exit 1) without
-touching the stored run.
+touching the stored run. So does an answer the resume cannot take: a client
+result or a recorded result (`reconciledToolResults`) for a call the run does
+not wait on, a call listed in both `retryToolCallIds` and
+`reconciledToolResults`, or `retryFailed` for a failure that was not
+transient. The leg fails with a `TypeError` before anything is written. A
+verdict or a `retryToolCallIds` entry that matches no pending call is
+ignored; a resume that answers nothing else leaves the run waiting (exit 3)
+and writes nothing.
 
 `inspectRun` reads a run without a model call. A run with no result yet
 reports `status: 'in-progress'` and a pending `resume`, plus each call that
 started without a recorded outcome; that picture is accurate only when no
 executor still drives the run. An unknown run ID rejects with a `TypeError`.
 
+### Unknown effects
+
+A call with an unknown effect started, and its outcome was never recorded: the
+process or the store went down between the tool's effect and its receipt. A
+resume stops on it with the reason `tool-reconciliation-required` (exit 3) and
+writes nothing; `inspectRun` lists it beside the pending `resume`. Check the
+effect in the system it touched, then answer every listed call in one resume:
+`retryToolCallIds` runs a call again, and `reconciledToolResults` records the
+result that landed (`isError: true` for an error), so the call never runs
+again. A tool marked `replay: 'idempotent'` runs again by itself and is not
+listed. The native rules are in [When the store fails](/docs/modules/native-agents#when-the-store-fails).
+
+```ts title="headless-unknown-effect.ts"
+import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
+import type { AgentToolSet } from '@deuz-sdk/core/agent';
+import { exitCodeFor, inspectRun, resumeHeadless } from '@deuz-sdk/core/headless';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const store = createInMemoryAgentRunStore();
+const model = createMockModel({ responses: [{ text: 'Charged.' }] });
+const tools: AgentToolSet = {
+  charge: {
+    description: 'Charge the order once.',
+    parameters: { type: 'object', properties: {} },
+    execute: () => ({ charged: true }),
+  },
+};
+
+// The payment system keeps its own record of each charge.
+declare const payments: { charged(orderId: string): Promise<boolean> };
+
+// A run whose charge started and whose outcome was never recorded (not shown).
+const stuck = await inspectRun(store, 'order-7');
+const calls = stuck.pending.flatMap((action) =>
+  action.kind === 'unknown-effect' ? [action.toolCallId] : [],
+);
+const done = (await payments.charged('order-7'))
+  ? // It landed: record what the tool returned. The call never runs again.
+    await resumeHeadless({
+      model,
+      tools,
+      store,
+      runId: 'order-7',
+      reconciledToolResults: calls.map((toolCallId) => ({ toolCallId, output: { charged: true } })),
+    })
+  : // It never arrived: run the call once more.
+    await resumeHeadless({ model, tools, store, runId: 'order-7', retryToolCallIds: calls });
+console.log(done.outcome, exitCodeFor(done)); // completed 0
+```
+
+### A run that failed in transit
+
+A failed run stays failed: a resume returns the stored failure. When the cause
+was transient (a model call that failed with a network or provider error, a
+transport timeout or an open circuit breaker, a response stream that broke
+off, a budget admission refused with a serialization conflict), the stored run
+records it and the report carries `retry`, with the `cause` and the `phase` the
+run failed in. The outcome does not change: `failed` (exit 1), or `limit`
+(exit 6) for a transport timeout. Resume with `retryFailed: true` to go on from
+the run's last checkpoint; completed tool calls do not run again. A retried
+resume that stops again before its first write, on an unknown effect for
+example, keeps `retry`: answer the pending actions and pass `retryFailed: true`
+once more. The native rules are in [When a model call fails](/docs/modules/native-agents#when-a-model-call-fails).
+
+```ts title="headless-retry.ts"
+import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
+import { exitCodeFor, resumeHeadless, runHeadless } from '@deuz-sdk/core/headless';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const store = createInMemoryAgentRunStore();
+const model = createMockModel({ responses: [{ text: 'Summary ready.' }] });
+
+// An outage: the circuit breaker the workers share reports the provider down,
+// so the model call fails before it is sent.
+const outage = {
+  get: () => ({ failures: 5, cooldownUntil: Date.now() + 60_000 }),
+  set: () => {},
+};
+const first = await runHeadless({
+  model,
+  prompt: 'Summarize ticket 9.',
+  store,
+  runId: 'ticket-9',
+  deps: { breakerStore: outage },
+});
+console.log(first.outcome, first.retry, exitCodeFor(first));
+// failed { cause: 'model-call', phase: 'running', resumeWith: 'retryFailed' } 1
+
+// Later, once the provider answers again:
+const retried = await resumeHeadless({ model, store, runId: 'ticket-9', retryFailed: true });
+console.log(retried.outcome, exitCodeFor(retried)); // completed 0
+```
+
 ## Project instructions
 
 `projectDir` loads the project's instruction files into the run's system
-message; `loadProjectInstructions(dir, options?)` returns them on their own:
+message (a user message with `role: 'user'`, below);
+`loadProjectInstructions(dir, options?)` returns them on their own:
 
 ```ts
 import { loadProjectInstructions } from '@deuz-sdk/core/headless';
@@ -226,8 +335,9 @@ read with `nodeSkillSource`. The first leg lists them in the system message
 skill's body and `read_skill_resource` a text file bundled with it. Both read
 only skills the list holds, and only files whose real path is inside the
 skill's folder: a link that leads out of it is refused. Both are
-`replay: 'idempotent'`. A tool of your own cannot take either name. Pass the
-same `skills` when resuming: the tools are part of the run's binding.
+`replay: 'idempotent'`. A tool of your own cannot take either name. A folder
+that does not exist adds no skills. Pass the same `skills` when resuming: the
+tools are part of the run's binding.
 
 ## doctor
 
@@ -254,6 +364,7 @@ process.exitCode = exitCodeFor(report); // 8 when a finding is an error
 
 | Report field | Meaning |
 | --- | --- |
+| `kind`, `version` | `'deuz-headless-doctor'`, `1` |
 | `ok` | No finding is an error |
 | `model`, `support` | Provider, model id and protocol; `pinned` (a registry row), `family` (the Claude 5.x family rules) or `unknown` (the conservative fallback) |
 | `profile` | The full [model profile](/docs/modules/model-profiles): effort mapping, thinking, limits, sampling, clamps, sources |
@@ -271,13 +382,13 @@ process.exitCode = exitCodeFor(report); // 8 when a finding is an error
 | `key-provider` | info | The key comes from `deps.keyProvider`, which the doctor does not call |
 | `unknown-model` | warning | No registry row: the conservative defaults apply |
 | `model-status` | warning | The model is documented as preview or deprecated |
-| `unpriced-model` | info, warning, error | No price: info without a USD budget, a warning with one, an error with `unknownPrice: 'reject'` |
+| `unpriced-model` | info, warning, error | No price: info without a USD budget, a warning with one, an error when that budget sets `unknownPrice: 'reject'` |
 | `price-lookup-failed` | warning | Your `deps.priceProvider` threw |
 | `tools-unsupported`, `tools-unknown` | error, warning | The run has tools and the model takes none, or that is unknown |
 | `tool-protocol` | error | The model takes tools only on another protocol (e.g. GPT-6.1 Sol on Chat Completions) |
 | `structured-output` | warning | `output` takes the json strategy where native structured output is not known to be supported |
 | `clamped-setting`, `unsupported-setting` | warning | A requested `effort`, `temperature`, `topP`, `toolChoice`, `output.mode` or `promptCaching` is changed or dropped on the way to the wire |
-| `not-live-verified` | info | Always: profiles are checked against documentation, never against the live API |
+| `not-live-verified` | info | Always: no profile is verified against the live API; the message says whether it comes from documentation, and the date it was checked |
 
 The doctor calls only a `deps.priceProvider` you gave (once, with a two-token
 usage); the bundled table is local. The environment defaults to

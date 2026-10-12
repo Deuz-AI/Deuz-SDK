@@ -6,13 +6,15 @@
  * no `bin` and no CLI package; `examples/13-headless` shows a command line built
  * on it.
  *
- * Every function returns plain JSON — a {@link HeadlessReport} or a
- * {@link DoctorReport} — and {@link exitCodeFor} maps it to a documented exit
- * code, so a run that did not complete never exits 0.
+ * `runHeadless`, `resumeHeadless`, `inspectRun` and `doctor` return plain JSON
+ * — a {@link HeadlessReport} or a {@link DoctorReport} — and
+ * {@link exitCodeFor} maps it to a documented exit code, so a run that did not
+ * complete never exits 0.
  */
 import type {
   AgentEvent,
   AgentResult,
+  AgentRunEnvelope,
   AgentRunOptions,
   AgentRunSession,
   AgentRunStore,
@@ -47,6 +49,7 @@ export {
   type HeadlessOutcome,
   type HeadlessPendingAction,
   type HeadlessReport,
+  type HeadlessRetry,
 } from '../headless/report';
 export type {
   DoctorFinding,
@@ -132,7 +135,8 @@ async function gitRoot(fs: NodeFs, path: NodePath, start: string): Promise<strin
  * nearest `dir` whole first. A link (a symlink, a junction) is followed only
  * while it stays inside the root: a file whose real path is outside the
  * root's is not read, and `skipped` lists it. Rejects with a TypeError when
- * `dir` is not a directory.
+ * `dir` is not a directory or an option is invalid (a `root` that is not `dir`
+ * or an ancestor, a `maxBytes` that is not a positive integer, another `role`).
  *
  * Trust: the files get the trust of a system message, like your own
  * instructions, so whoever can change them (a pull request from a fork) can
@@ -405,9 +409,9 @@ async function report(
   }
   const result: AgentResult<unknown> = await stream.result;
   if (callbackError) throw callbackError.error;
-  let phase: HeadlessReport['phase'];
+  let stored: AgentRunEnvelope | undefined;
   try {
-    phase = (await session.store.load(session.runId))?.phase;
+    stored = await session.store.load(session.runId);
   } catch (error) {
     warnings.add(
       {
@@ -419,7 +423,7 @@ async function report(
   }
   return reportFromResult(result, {
     scope: session.scope,
-    ...(phase !== undefined ? { phase } : {}),
+    ...(stored ? { stored } : {}),
     warnings: warnings.list(),
   });
 }
@@ -452,8 +456,10 @@ function split<O extends HeadlessSessionOptions & { runId?: string; deps?: Depen
  * then the skills list; with `projectInstructions.role: 'user'`, the project
  * instructions are the first user message instead. Calls are priced with the
  * bundled table unless `deps.priceProvider` is given. Whatever happens to the
- * run is in the report; it rejects only when the project files or skills
- * cannot be read, a tool takes a skill tool's name, or `onEvent` threw.
+ * run is in the report; it rejects only when the project instructions cannot
+ * be loaded (`projectDir` is not a directory, an invalid `projectInstructions`
+ * option, a read error), a tool takes a skill tool's name, or `onEvent` threw.
+ * A skill folder that does not exist adds no skills.
  */
 export async function runHeadless<T = string>(
   options: HeadlessRunOptions<T>,
@@ -490,8 +496,15 @@ export async function runHeadless<T = string>(
 
 /**
  * Continue a stored native run (2.3 preview): `resumeStreamAgent` with the
- * verdicts, client results or `retryToolCallIds` the previous report's
- * `pending` asked for, reported like {@link runHeadless}.
+ * answers the previous report asked for, reported like {@link runHeadless}.
+ * Each pending action names its option (`approvalResponses`,
+ * `clientToolResults`, and `retryToolCallIds` or `reconciledToolResults` for
+ * an unknown effect); a report with `retry` takes `retryFailed: true`. An
+ * answer the run cannot take (a client or recorded result for a call it does
+ * not wait on, a call both run again and recorded, a retry of a failure that
+ * was not transient) fails the leg with a TypeError before anything is
+ * written: the stored run stays as it was. A verdict or a retry ID that
+ * matches no pending call is ignored.
  */
 export async function resumeHeadless<T = string>(
   options: HeadlessResumeOptions<T>,
