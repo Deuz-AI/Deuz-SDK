@@ -206,6 +206,27 @@ describe('MCP tools in native runs (F01)', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it('records the landed outcome of an MCP call instead of calling the server again', async () => {
+    const effects: string[] = [];
+    const inner = createInMemoryAgentRunStore();
+    const { model, fetch } = counted([chargeCall, { text: 'done' }]);
+    const options = { model, prompt: 'charge 5', mcp: [fakeMcp(effects)] };
+    await runAgent({
+      ...options,
+      session: { store: failingAfterEffect(inner, effects), runId: 'landed', scope: 't' },
+    });
+    const resumed = await resumeAgent({
+      ...options,
+      session: { store: inner, runId: 'landed', scope: 't' },
+      // The server's own record says the charge went through.
+      reconciledToolResults: [{ toolCallId: 'charge-1', output: 'charge {"amount":5}' }],
+    });
+    expect(resumed).toMatchObject({ status: 'completed', output: 'done' });
+    expect(effects).toEqual(['charge']);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(receiptsOf(await inner.load('landed'))).toEqual(['charge/charge-1/step1:completed']);
+  });
+
   it.each([
     ['for the whole server', 'idempotent' as const],
     ['for one tool by its server name', { charge: 'idempotent' as const }],
