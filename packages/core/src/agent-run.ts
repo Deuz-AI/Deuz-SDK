@@ -314,13 +314,14 @@ export function createInMemoryAgentRunStore(
 /**
  * Settle what a native run left behind after its outcome (2.3): write the chat
  * projection again when the stored run says it is behind or its last write
- * failed, and settle an extraction an interruption left pending (or that
- * failed). An extraction whose records are in the memory store already, under
- * its operation id, is recorded completed without another memory LLM call;
- * otherwise it runs now. Only for a run that ended or is suspended: an active
- * run settles these itself. The `chat` and `memory` scopes must be the run's.
- * Rejects when the run is unknown, still running, or bound differently, and
- * when a store write fails.
+ * failed (never over a chat that moved on without the run: `'superseded'`, see
+ * `AgentRunChatState`), and settle an extraction an interruption left pending
+ * (or that failed). An extraction whose records are in the memory store
+ * already, under its operation id, is recorded completed without another
+ * memory LLM call; otherwise it runs now. Only for a run that ended or is
+ * suspended: an active run settles these itself. The `chat` and `memory`
+ * scopes must be the run's. Rejects when the run is unknown, still running, or
+ * bound differently, and when a store write fails.
  */
 export async function reconcileAgentRun(
   options: AgentRunReconcileOptions,
@@ -370,6 +371,7 @@ export async function reconcileAgentRun(
           envelope.chat,
           Object.values(envelope.toolResults ?? {}),
           deps.clock,
+          true,
         );
         await save();
         outcome.chat = envelope.chat.status;
@@ -564,6 +566,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
     const deps = resolveDependencies(options.deps);
     if (options.chat && envelope.transcript && nativeChat) {
       if (admitted || nativeChat.projectionBehind(envelope.transcript, envelope.chat)) {
+        // A leg that did not run (a terminal or still-suspended resume) only
+        // repairs: it never replaces a chat that moved on without the run.
         const state = await nativeChat.saveProjection(
           options.chat,
           envelope.runId,
@@ -571,6 +575,7 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           envelope.chat,
           Object.values(envelope.toolResults ?? {}),
           deps.clock,
+          !admitted,
         );
         envelope.chat = state;
         if (state.status === 'failed')
@@ -583,6 +588,11 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           warnRecords(
             'chat',
             `Chat ${options.chat.chatId} belongs to another scope; run ${envelope.runId} left it untouched.`,
+          );
+        else if (state.status === 'superseded')
+          warnRecords(
+            'chat',
+            `Chat ${options.chat.chatId} moved on without run ${envelope.runId}; its projection was not written.`,
           );
         await saveBookkeeping();
       }

@@ -572,6 +572,20 @@ The two stores are written one after the other, never as one transaction:
 - A stored chat of another scope is never overwritten (`status:
   'scope-mismatch'`). A stored chat that already holds the projection and more,
   because a later run continued it, is left as it is.
+- A late repair never overwrites a chat that moved on **without** the run. A
+  resume of a run that ended or is still waiting, and `reconcileAgentRun`, only
+  finish the write the run's last attempt meant: over the record that failed
+  write found (or where none is stored, if it found none), or over one the
+  run's transcript continues (its input, or an earlier projection of it). Any
+  other record was saved or deleted since, for example by another run that went
+  on from what the chat store held, and stays as it is: the run records
+  `status: 'superseded'`, a resume reports a `warning` part, and
+  `reconcileAgentRun` returns `chat: 'superseded'`. The run's turns stay in its
+  checkpoint (`AgentRunEnvelope.transcript`), and no later repair tries again.
+  The check reads the record right before the write, and `ChatStore` has no
+  conditional write, so a save that lands in between is still overwritten. A
+  leg that runs (a resume that continues the run) writes its whole projection,
+  and the last writer wins, as in the legacy loops.
 - A failed checkpoint publishes nothing to the chat.
 
 ```ts

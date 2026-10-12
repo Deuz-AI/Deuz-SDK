@@ -10,6 +10,7 @@ import {
   createInMemoryAgentRunStore,
   reconcileAgentRun,
   resumeAgent,
+  resumeStreamAgent,
   runAgent,
   streamAgent,
 } from '../src/agent-run';
@@ -78,6 +79,15 @@ function runStore() {
 }
 
 const roles = (messages: Message[]) => messages.map((message) => message.role);
+const texts = (messages: Message[]) =>
+  messages.map((message) =>
+    typeof message.content === 'string'
+      ? message.content
+      : message.content
+          .filter((part) => part.type === 'text')
+          .map((part) => (part as { text: string }).text)
+          .join(''),
+  );
 const approval = (result: Awaited<ReturnType<typeof runAgent>>) =>
   result.status === 'suspended' ? result.pendingApprovals[0]!.approvalId : '';
 
@@ -262,6 +272,148 @@ describe('native chat projection', () => {
       });
       expect(chat.writes).toHaveLength(1);
     }
+  });
+
+  for (const repair of ['reconcile', 'resume'] as const)
+    it(`a late repair leaves alone a chat that a later run moved on with (${repair})`, async () => {
+      const chat = chatStore();
+      const runs = runStore();
+      const options: Resumable = {
+        model: mocked([{ text: 'answer A' }]).model,
+        prompt: 'question A',
+        chat: { store: chat.store, chatId: 'chat-moved', scope: { userId: 'ada' } },
+        session: { store: runs.store, runId: 'run-a', scope: 'tenant' },
+      };
+      chat.failNext();
+      expect((await runAgent(options)).status).toBe('completed');
+      expect((await runs.inner.load('run-a'))!.chat?.status).toBe('failed');
+
+      // The conversation goes on from what the chat store holds, without run A.
+      const b = await runAgent({
+        model: mocked([{ text: 'answer B' }]).model,
+        messages: [
+          ...((await chat.inner.loadChat('chat-moved'))?.messages ?? []),
+          { role: 'user', content: 'question B' },
+        ],
+        chat: options.chat,
+        session: { store: runs.store, runId: 'run-b', scope: 'tenant' },
+      });
+      expect(b.status).toBe('completed');
+      const moved = (await chat.inner.loadChat('chat-moved'))!;
+      expect(texts(moved.messages)).toEqual(['question B', 'answer B']);
+      const writes = chat.writes.length;
+
+      if (repair === 'reconcile')
+        expect(await reconcileAgentRun({ session: options.session, chat: options.chat })).toEqual({
+          runId: 'run-a',
+          chat: 'superseded',
+        });
+      else {
+        const stream = resumeStreamAgent(options);
+        const events: AgentEvent[] = [];
+        for await (const event of stream.events) events.push(event as AgentEvent);
+        expect((await stream.result).status).toBe('completed');
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: 'part',
+            part: {
+              type: 'warning',
+              warning: {
+                type: 'other',
+                setting: 'chat',
+                message: expect.stringContaining('moved on without run run-a'),
+              },
+            },
+          }),
+        );
+      }
+      // Run B's acknowledged turns stand; run A records why it wrote nothing.
+      expect(chat.writes).toHaveLength(writes);
+      expect(await chat.inner.loadChat('chat-moved')).toEqual(moved);
+      expect((await runs.inner.load('run-a'))!.chat).toMatchObject({
+        status: 'superseded',
+        cursor: 0,
+      });
+      // Settled: a later repair neither retries nor writes.
+      expect(await reconcileAgentRun({ session: options.session, chat: options.chat })).toEqual({
+        runId: 'run-a',
+        chat: 'current',
+      });
+      expect(chat.writes).toHaveLength(writes);
+    });
+
+  it('a late repair still writes over the record its failed write found', async () => {
+    const chat = chatStore();
+    const runs = runStore();
+    await chat.inner.saveChat({
+      chatId: 'chat-found',
+      scope: { userId: 'ada' },
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+      ],
+      updatedAt: 1,
+    });
+    // The run goes on from the client's copy of the history, which is not the
+    // stored record byte for byte, so its transcript does not continue it.
+    const options: Resumable = {
+      model: mocked([{ text: 'fine' }]).model,
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello' },
+        { role: 'user', content: 'how are you' },
+      ],
+      chat: { store: chat.store, chatId: 'chat-found', scope: { userId: 'ada' } },
+      session: { store: runs.store, runId: 'found', scope: 'tenant' },
+    };
+    chat.failNext();
+    expect((await runAgent(options)).status).toBe('completed');
+    expect((await runs.inner.load('found'))!.chat).toMatchObject({
+      status: 'failed',
+      found: expect.any(String),
+    });
+    // Nothing was written since: the repair finishes the write the run meant.
+    expect(await reconcileAgentRun({ session: options.session, chat: options.chat })).toEqual({
+      runId: 'found',
+      chat: 'saved',
+    });
+    expect(texts((await chat.inner.loadChat('chat-found'))!.messages)).toEqual([
+      'hi',
+      'hello',
+      'how are you',
+      'fine',
+    ]);
+    expect((await runs.inner.load('found'))!.chat).not.toHaveProperty('found');
+  });
+
+  it('a late repair never brings back a chat deleted after its failed write', async () => {
+    const chat = chatStore();
+    const runs = runStore();
+    const earlier: Message[] = [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello' },
+    ];
+    await chat.inner.saveChat({
+      chatId: 'chat-deleted',
+      scope: { userId: 'ada' },
+      messages: earlier,
+      updatedAt: 1,
+    });
+    const options: Resumable = {
+      model: mocked([{ text: 'fine' }]).model,
+      messages: [...earlier, { role: 'user', content: 'how are you' }],
+      chat: { store: chat.store, chatId: 'chat-deleted', scope: { userId: 'ada' } },
+      session: { store: runs.store, runId: 'deleted', scope: 'tenant' },
+    };
+    chat.failNext();
+    expect((await runAgent(options)).status).toBe('completed');
+    await chat.inner.deleteChat('chat-deleted');
+    expect(await reconcileAgentRun({ session: options.session, chat: options.chat })).toEqual({
+      runId: 'deleted',
+      chat: 'superseded',
+    });
+    expect(await chat.inner.loadChat('chat-deleted')).toBeUndefined();
+    expect(chat.writes).toHaveLength(0);
   });
 
   it('a refused resume writes nothing, not even a repair', async () => {

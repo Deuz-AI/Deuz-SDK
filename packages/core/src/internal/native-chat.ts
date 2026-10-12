@@ -30,10 +30,13 @@ import type {
 } from '../types/agent-run';
 import { scopeKey } from './native-scope';
 
-/** FNV-1a over a message's JSON: a sync anchor, not a security boundary. */
-export function fingerprint(message: Message | undefined): string | undefined {
-  if (message === undefined) return undefined;
-  const text = JSON.stringify(message);
+/**
+ * FNV-1a over a message's (or a stored chat record's) JSON: a sync anchor, not
+ * a security boundary.
+ */
+export function fingerprint(value: Message | ChatRecord | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const text = JSON.stringify(value);
   let hash = 0x811c9dc5;
   for (let index = 0; index < text.length; index++) {
     hash ^= text.charCodeAt(index);
@@ -204,6 +207,15 @@ function isPrefix(prefix: readonly Message[], messages: readonly Message[]): boo
  * stored chat of another scope as `'scope-mismatch'` (left untouched, as in
  * the legacy loops). A stored chat that already holds this projection and
  * more (a later run continued it) is not overwritten.
+ *
+ * `repair`: a late write for a run whose leg is not running (a terminal or
+ * still-suspended resume, `reconcileAgentRun`). It only finishes the write the
+ * run's last attempt meant, so it replaces the record that attempt found (no
+ * record, when it found none) or one this transcript continues (its input, or
+ * an earlier projection of it). Any other record was saved or deleted after
+ * that attempt: the chat moved on without the run, so it comes back as
+ * `'superseded'` and is left as it is. A running leg keeps last-writer-wins,
+ * as the legacy loops do.
  */
 export async function saveProjection(
   chat: ChatPersistOptions,
@@ -212,6 +224,7 @@ export async function saveProjection(
   previous: AgentRunChatState | undefined,
   receipts: readonly AgentToolReceipt[],
   clock: Clock,
+  repair: boolean,
 ): Promise<AgentRunChatState> {
   const behind = {
     chatId: chat.chatId,
@@ -220,22 +233,28 @@ export async function saveProjection(
     turns: previous?.turns ?? [],
     invocations: previous?.invocations ?? [],
   };
+  // The record a failed write found stays known until a write lands.
+  const found = previous?.found !== undefined ? { found: previous.found } : {};
   let stored: ChatRecord | undefined;
   try {
     stored = await chat.store.loadChat(chat.chatId);
   } catch (error) {
     // Writing over a chat whose owner could not be checked could overwrite
     // another tenant's history: the projection waits for the next save.
-    return { ...behind, status: 'failed', error: errorOf(error) };
+    return { ...behind, ...found, status: 'failed', error: errorOf(error) };
   }
   if (stored && (stored.chatId !== chat.chatId || scopeKey(stored.scope) !== scopeKey(chat.scope)))
-    return { ...behind, status: 'scope-mismatch' };
+    return { ...behind, ...found, status: 'scope-mismatch' };
   const projection = project(runId, transcript, previous, stored, receipts);
   const messages = transcript.messages;
   const ahead =
     stored !== undefined &&
     stored.messages.length > messages.length &&
     isPrefix(messages, stored.messages);
+  const moved = stored
+    ? !ahead && !isPrefix(stored.messages, messages) && fingerprint(stored) !== previous?.found
+    : previous?.found !== undefined;
+  if (repair && moved) return { ...behind, status: 'superseded' };
   if (!ahead) {
     try {
       await chat.store.saveChat({
@@ -247,16 +266,27 @@ export async function saveProjection(
         updatedAt: clock.now(),
       });
     } catch (error) {
-      return { ...behind, status: 'failed', error: errorOf(error) };
+      // A late repair may still replace the record this write found.
+      return {
+        ...behind,
+        ...(stored ? { found: fingerprint(stored)! } : {}),
+        status: 'failed',
+        error: errorOf(error),
+      };
     }
   }
   return { chatId: chat.chatId, cursor: messages.length, ...projection, status: 'saved' };
 }
 
-/** Whether the chat store is behind the transcript, or its last write failed. */
+/**
+ * Whether the chat store is behind the transcript, or its last write failed.
+ * A projection the chat moved on from (`'superseded'`) is settled: no repair
+ * writes it again.
+ */
 export function projectionBehind(
   transcript: AgentRunTranscript,
   state: AgentRunChatState | undefined,
 ): boolean {
+  if (state?.status === 'superseded') return false;
   return state?.status !== 'saved' || state.cursor !== transcript.messages.length;
 }
