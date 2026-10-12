@@ -25,6 +25,7 @@ import type {
 const RATE = 24_000; // OpenAI Realtime audio: PCM16, 24 kHz, mono, in both directions
 const samples = (ms: number) => (RATE * ms) / 1000;
 const msOf = (bytes: number) => (bytes / 2 / RATE) * 1000; // 2 bytes per sample
+const usd = (value: number | undefined) => (value === undefined ? 'unpriced' : `$${value}`);
 
 // --- THE SCRIPTED SERVER ------------------------------------------------------
 // A stand-in for the OpenAI Realtime endpoint. It has the part of the WHATWG
@@ -209,7 +210,7 @@ function describe(event: RealtimeEvent): string {
       const { text, audio } = event.tokens;
       return (
         `usage (${event.responseId}): text ${text.input} in / ${text.output} out, ` +
-        `audio ${audio.input} in / ${audio.output} out = $${event.costUsd}`
+        `audio ${audio.input} in / ${audio.output} out = ${usd(event.costUsd)}`
       );
     }
     case 'response-done':
@@ -226,7 +227,10 @@ function describe(event: RealtimeEvent): string {
 }
 session.on('*', (event) => console.log(`   ${describe(event)}`));
 
-/** Resolves on the first event `stop` accepts (or when the session closes). Start it before you send. */
+/**
+ * Resolves on the first event `stop` accepts, or when the session closes.
+ * Call it before you send, so no event is missed.
+ */
 async function until(stop: (event: RealtimeEvent) => boolean): Promise<void> {
   for await (const event of session.events()) if (stop(event)) return;
 }
@@ -253,6 +257,6 @@ console.log('\n4) close the session');
 await session.close();
 const totals = session.usage;
 console.log(
-  `   session total: ${totals.usage.totalTokens} tokens (${totals.usage.audioTokens} audio), ` +
-    `$${totals.costUsd}`,
+  `   session total: ${totals.usage.totalTokens} tokens (${totals.usage.audioTokens ?? 0} audio), ` +
+    usd(totals.costUsd),
 );
