@@ -1360,31 +1360,70 @@ function canonicalContentFromUI(message: UIMessage): string | Part[] {
  *   `tool_result` — the exact shape that 400s the next request.
  * - a tool call still awaiting its result stays a bare `tool_use` — resume it
  *   through the approval/client-tool flow, not by POSTing this.
+ *
+ * A card without `input` (2.3) is a call an earlier leg made, such as an
+ * approved call the resumed leg executed: as in `assistantMessageFromTurn`,
+ * the turn does not repeat it, and its result goes right before the turn, after
+ * the call it answers, which is how `useChat`'s history holds it. A result that
+ * answers no open call of the exchange (that call's turn was deleted) is left
+ * out, since an orphan `tool_result` is refused by every provider.
  */
 export function canonicalFromUI(ui: UIMessage[]): Message[] {
   const out: Message[] = [];
   for (const message of ui) {
-    const content = canonicalContentFromUI(message);
     if (message.role === 'user') {
-      out.push({ role: 'user', content });
+      out.push({ role: 'user', content: canonicalContentFromUI(message) });
       continue;
     }
-    out.push({ role: 'assistant', content });
+    const cards = message.toolCalls ?? [];
+    const own = cards.filter((c) => c.input !== undefined);
+    const open = openToolUses(out);
+    const earlier = cards.filter(
+      (c, index) =>
+        c.input === undefined &&
+        c.state === 'result' &&
+        open.has(c.toolCallId) &&
+        cards.findIndex((other) => other.toolCallId === c.toolCallId) === index,
+    );
+    if (earlier.length > 0) out.push(toolResultsOf(earlier));
+    out.push({
+      role: 'assistant',
+      content: canonicalContentFromUI(
+        own.length === cards.length ? message : { ...message, toolCalls: own },
+      ),
+    });
     // `uiFromMessages` folded the `role: 'tool'` message INTO the turn; unfold it.
-    const executed = (message.toolCalls ?? []).filter((c) => c.state === 'result');
-    if (executed.length > 0) {
-      out.push(
-        clientToolResultMessage(
-          executed.map((c) => ({
-            toolCallId: c.toolCallId,
-            result: c.output,
-            ...(c.isError ? { isError: true } : {}),
-          })),
-        ),
-      );
-    }
+    const executed = own.filter((c) => c.state === 'result');
+    if (executed.length > 0) out.push(toolResultsOf(executed));
   }
   return out;
+}
+
+/** The executed cards' results as one `role: 'tool'` message. */
+function toolResultsOf(cards: UIToolCall[]): Message {
+  return clientToolResultMessage(
+    cards.map((c) => ({
+      toolCallId: c.toolCallId,
+      result: c.output,
+      ...(c.isError ? { isError: true } : {}),
+    })),
+  );
+}
+
+/** The `tool_use` ids of the current exchange (after the last user message) no result answers yet. */
+function openToolUses(history: Message[]): Set<string> {
+  const answered = new Set<string>();
+  const open = new Set<string>();
+  for (let i = history.length - 1; i >= 0; i--) {
+    const message = history[i]!;
+    if (message.role === 'user') break;
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type === 'tool_result') answered.add(part.toolUseId);
+      if (part.type === 'tool_use' && !answered.has(part.id)) open.add(part.id);
+    }
+  }
+  return open;
 }
 
 /** A UI + canonical history pair — the two views a chat binding maintains. */
