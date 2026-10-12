@@ -160,7 +160,7 @@ interface PrepareStepResult {
 
 Because `messages` persists forward, `prepareStep` doubles as a user-controlled compaction and system-prompt-rewrite hook: rewrite the system-role message inside `messages`, there is no separate `system` field here. Typical use is cheap exploration steps on a small model with `activeTools: ['search']`, then a strong model for the final synthesis. A throw fails the call — it is your code and is never swallowed.
 
-`runtimeContext?: unknown` is threaded **untouched** into `ToolExecuteContext.runtimeContext`, `prepareStep`, `verifyStep`, `doneWhen` and all three guardrail hooks; sub-agents inherit it. The SDK never reads, copies or serializes it, so it never reaches a checkpoint, chat record or observation event — a live DB handle or a secret is safe there. Define your `ToolSet` once at module scope and pass the tenant per call instead of rebuilding the tool set per request. It is `unknown` on purpose: cast it once at the top of each consumer.
+`runtimeContext?: unknown` is threaded **untouched** into `ToolExecuteContext.runtimeContext`, `prepareStep`, `verifyStep`, `doneWhen` and the four guardrail hooks (`onInput`, `onToolCall`, `onToolResult`, `onOutput`); sub-agents inherit it. The SDK never reads, copies or serializes it, so it never reaches a checkpoint, chat record or observation event — a live DB handle or a secret is safe there. Define your `ToolSet` once at module scope and pass the tenant per call instead of rebuilding the tool set per request. It is `unknown` on purpose: cast it once at the top of each consumer.
 
 ## Client tools — the loop hands the call back
 

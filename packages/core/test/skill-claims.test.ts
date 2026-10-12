@@ -8,6 +8,7 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { streamChat } from '../src';
+import { runAgent } from '../src/agent-run';
 import { generateText } from '../src/generate';
 import { agentTool } from '../src/inference/agent-tool';
 import { handoff } from '../src/inference/handoff';
@@ -163,6 +164,100 @@ describe('migration.md, LangGraph sharp edges (W3 review V5-2)', () => {
     '%s says sub-agents inherit onToolCall and onToolResult',
     (path) => {
       expect(read(path)).toMatch(/[Ss]ub-agents inherit[^\n]*`onToolCall`[^\n]*`onToolResult`/);
+    },
+  );
+});
+
+describe('migration.md: typed per-tool context and runtimeContext (W3 review V5-3)', () => {
+  it('a native tool receives only its own validated context, never sent to the provider', async () => {
+    const base = createMockModel({
+      responses: [{ toolCalls: [{ toolName: 'lookup', id: 'l1', args: {} }] }, { text: 'done' }],
+    });
+    const config = readConfig(base)!;
+    const bodies: string[] = [];
+    const model = attachConfig(
+      { ...base },
+      {
+        ...config,
+        fetch: ((input: RequestInfo | URL, init?: RequestInit) => {
+          bodies.push(String(init!.body));
+          return config.fetch!(input, init);
+        }) as typeof fetch,
+      },
+    );
+    const seen: unknown[] = [];
+    const result = await runAgent({
+      model,
+      prompt: 'look it up',
+      toolsContext: { lookup: { tenant: 'tenant-7f3a' }, other: { tenant: 'not-yours' } },
+      tools: {
+        lookup: {
+          parameters,
+          validateContext: (value: unknown) => {
+            const tenant = (value as { tenant?: unknown } | undefined)?.tenant;
+            if (typeof tenant !== 'string') throw new TypeError('tenant required');
+            return { tenant };
+          },
+          execute: (_args, context) => {
+            seen.push(context.context);
+            return 'ok';
+          },
+        },
+        other: { parameters, execute: () => 'unused' },
+      },
+    });
+    expect(result.status).toBe('completed');
+    expect(seen).toEqual([{ tenant: 'tenant-7f3a' }]);
+    expect(bodies.length).toBeGreaterThan(0);
+    expect(bodies.join('\n')).not.toContain('tenant-7f3a');
+  });
+
+  it('runtimeContext reaches all four guardrail hooks', async () => {
+    const tenant = { id: 'acme' };
+    const seen: Record<string, unknown> = {};
+    await generateText({
+      model: createMockModel({
+        responses: [{ toolCalls: [{ toolName: 'probe', args: {} }] }, { text: 'done' }],
+      }),
+      prompt: 'go',
+      maxSteps: 3,
+      runtimeContext: tenant,
+      tools: { probe: { parameters, execute: async () => 'ok' } },
+      guardrails: {
+        onInput: (ctx) => void (seen.onInput = ctx.runtimeContext),
+        onToolCall: (ctx) => void (seen.onToolCall = ctx.runtimeContext),
+        onToolResult: (ctx) => void (seen.onToolResult = ctx.runtimeContext),
+        onOutput: (ctx) => void (seen.onOutput = ctx.runtimeContext),
+      },
+    });
+    expect(seen).toEqual({
+      onInput: tenant,
+      onToolCall: tenant,
+      onToolResult: tenant,
+      onOutput: tenant,
+    });
+  });
+
+  it('no skill says typed per-tool context still has no equivalent, or counts three guardrail hooks', () => {
+    const stale = skillMarkdown().flatMap((path) =>
+      read(path)
+        .split('\n')
+        .filter(
+          (line) => /still have no equivalent/.test(line) || /all three guardrail hooks/.test(line),
+        )
+        .map((line) => `${path}: ${line.slice(0, 80)}`),
+    );
+    expect(stale).toEqual([]);
+  });
+
+  it.each(bothCopies('references/migration.md'))(
+    '%s points every toolsContext mention at the native runAgent tools that have it',
+    (path) => {
+      const lines = read(path)
+        .split('\n')
+        .filter((line) => line.includes('`toolsContext`'));
+      expect(lines.length).toBeGreaterThan(0);
+      expect(lines.filter((line) => !/native `runAgent`/.test(line))).toEqual([]);
     },
   );
 });
