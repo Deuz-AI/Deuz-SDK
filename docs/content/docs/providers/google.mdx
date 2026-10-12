@@ -238,14 +238,40 @@ See [generateObject](/docs/core/generate-object) for the strategy picker and rep
 
 ## Finish reasons
 
-The native wire maps every `FinishReason` value of `@google/genai` 2.28 onto `finishReason` (2.3):
+The native wire maps every `FinishReason` value of `@google/genai` 2.28 onto `finishReason` (2.3), and the `finish` part keeps Gemini's own value as `providerMetadata.google.finishReason`:
 
 | Gemini `finishReason` | `finishReason` |
 | --- | --- |
 | `STOP`, `FINISH_REASON_UNSPECIFIED` | `'stop'` |
 | `MAX_TOKENS`, `CONTINUATION` (Deuz sends no continuation token) | `'length'` |
 | `SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`, and a blocked prompt (`promptFeedback.blockReason`) | `'content_filter'` |
-| `LANGUAGE`, `OTHER`, `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`, `NO_IMAGE`, `IMAGE_OTHER`: the turn stopped without a usable answer | `'error'` |
+| `LANGUAGE`, `OTHER`, `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`, `NO_IMAGE`, `IMAGE_OTHER`: the turn stopped without a usable answer | `'stop'`, as before 2.3; only `providerMetadata.google.finishReason` tells them from `STOP` |
 | A value 2.28 does not list | `'stop'` |
 
-Gemini finishes a turn that called a function with `STOP`, so a turn that streamed a call ends with `'tool_calls'`, unless a filter or a limit stopped it. Such a turn ends with `'content_filter'` or `'length'`, and none of its calls runs. Before 2.3 `SPII`, the two image filters, `CONTINUATION` and the stops in the `'error'` row ended a turn with `'stop'`, and a call won over every reason. A Gemini stop carries no `stopDetails`: the candidate's `finishMessage` is not read. Batch results map the same values. The OpenAI-compat surface (`createGoogle`) reads the endpoint's Chat Completions `finish_reason` instead. The shapes follow `@google/genai` 2.28's types; not live-verified.
+Gemini finishes a turn that called a function with `STOP`, so a turn that streamed a call ends with `'tool_calls'`, unless a filter or a limit stopped it. Such a turn ends with `'content_filter'` or `'length'`, and none of its calls runs. Before 2.3 `SPII`, the two image filters and `CONTINUATION` ended a turn with `'stop'`, and a call won over every reason.
+
+A stop without a usable answer ends the turn as `STOP` does, as before 2.3. A native run with `output` goes on to finalization and re-asks through output repair when the answer is empty or invalid; a run without `output` completes with whatever text the turn had. To tell such a stop apart, read Gemini's value off the `finish` part on `fullStream` (or the streaming loop's `step-finish` part). It is there whenever the response reported a finish reason, so a prompt blocked before any candidate has none:
+
+```ts title="gemini-finish-reason.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createGoogleNative } from '@deuz-sdk/core/google';
+
+const google = createGoogleNative({ apiKey: process.env.GEMINI_API_KEY! });
+
+const result = streamChat({
+  model: google('gemini-2.5-flash'),
+  messages: [{ role: 'user', content: 'Plan a three-day trip to Rome.' }],
+});
+
+for await (const part of result.fullStream) {
+  if (part.type !== 'finish') continue;
+  const raw = (part.providerMetadata?.google as { finishReason?: string } | undefined)
+    ?.finishReason;
+  // finishReason is 'stop' for STOP and for OTHER alike: the raw value tells them apart.
+  if (part.finishReason === 'stop' && raw !== undefined && raw !== 'STOP') {
+    console.warn(`Gemini stopped with ${raw}`);
+  }
+}
+```
+
+Batch results map the same values and carry the same `providerMetadata.google.finishReason`. A Gemini stop carries no `stopDetails`: the candidate's `finishMessage` is not read. The OpenAI-compat surface (`createGoogle`) reads the endpoint's Chat Completions `finish_reason` instead. The shapes follow `@google/genai` 2.28's types; not live-verified.

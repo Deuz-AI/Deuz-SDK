@@ -10,14 +10,24 @@
  * `'tool_calls'`: the gate let the call run. Chat Completions' `content_filter`
  * was already mapped, without a fixture. Wire shapes follow `@google/genai`
  * 2.28.0 and `openai` 7.32.0 types; not live-verified.
+ *
+ * The Gemini stops that leave no usable answer (`OTHER`,
+ * `MALFORMED_FUNCTION_CALL`, ...) are not gated: they end with 'stop', or
+ * 'tool_calls' after a call, as in 2.2 (K4 review V7-2).
  */
 import { describe, expect, it, vi } from 'vitest';
 import { generateText, streamChat } from '../src/index';
 import { createGoogleNative } from '../src/google';
 import { createOpenAI, createOpenAIResponses } from '../src/openai';
-import { runAgent } from '../src/agent-run';
+import { runAgent, streamAgent } from '../src/agent-run';
 import { mockFetchSequence, sseResponse } from './fixtures/sse';
-import { GEMINI_CALL, chatTurn, geminiTurn, responsesTurn } from './fixtures/provider-finish';
+import {
+  GEMINI_CALL,
+  GEMINI_STOPS_WITHOUT_ANSWER,
+  chatTurn,
+  geminiTurn,
+  responsesTurn,
+} from './fixtures/provider-finish';
 import type { LanguageModel } from '../src/types/model';
 import type { Message } from '../src/types/message';
 import type { StreamPart, ToolCallDeltaPart } from '../src/types/stream';
@@ -125,5 +135,85 @@ describe.each(Object.entries(WIRES))('finish-reason gate on the %s wire', (_name
     expect(execute).not.toHaveBeenCalled();
     expect(calls).toHaveLength(1);
     expect(toolUseCount(result.messages)).toBe(0);
+  });
+});
+
+// K4 review V7-2: K4 had mapped these stops to 'error', so a native run
+// stopped with reason 'error' after one request, without an error part, where
+// 2.2 went on through output repair or finalization. 2.3 keeps 2.2's mapping.
+describe('a Gemini stop without a usable answer is not gated', () => {
+  const OBJ = {
+    type: 'object',
+    properties: { answer: { type: 'string' } },
+    required: ['answer'],
+    additionalProperties: false,
+  } as const;
+  const ANSWER = geminiTurn('STOP', [{ text: '{"answer":"ok"}' }]);
+
+  /** A Gemini model answering `turns` in order. */
+  function gemini(...turns: string[]) {
+    const sequence = mockFetchSequence(turns.map((turn) => () => sseResponse([turn])));
+    return {
+      model: createGoogleNative({ apiKey: 'AIza-k', fetch: sequence.fetch })('gemini-2.5-flash'),
+      calls: sequence.calls,
+    };
+  }
+
+  function output() {
+    const validate = vi.fn((value: unknown) => {
+      if (typeof (value as { answer?: unknown })?.answer !== 'string') throw new Error('no answer');
+      return value as { answer: string };
+    });
+    return { schema: OBJ, validate };
+  }
+
+  it.each(GEMINI_STOPS_WITHOUT_ANSWER)(
+    '%s after a call: the turn ends with tool_calls and the call runs, as in 2.2',
+    async (reason) => {
+      const { model, calls } = gemini(geminiTurn(reason, [GEMINI_CALL]), ANSWER);
+      const { execute, tools } = weatherTool();
+      const result = await generateText({ model, prompt: 'x', tools, maxSteps: 3 });
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(calls).toHaveLength(2);
+      expect(result.steps?.map((s) => s.finishReason)).toEqual(['tool_calls', 'stop']);
+    },
+  );
+
+  it.each(GEMINI_STOPS_WITHOUT_ANSWER)(
+    '%s at finalization: the structured run re-asks through output repair and completes',
+    async (reason) => {
+      const { model, calls } = gemini(geminiTurn(reason, []), ANSWER);
+      const result = await runAgent({ model, prompt: 'x', output: output() });
+      expect(result).toMatchObject({ status: 'completed', output: { answer: 'ok' } });
+      expect(calls).toHaveLength(2);
+      expect(String(calls[1]!.init!.body)).toContain('The final output failed validation');
+    },
+  );
+
+  it('a loop turn that ends OTHER ends the loop, and finalization answers', async () => {
+    const { model, calls } = gemini(geminiTurn('OTHER', []), ANSWER);
+    const { execute, tools } = weatherTool();
+    const result = await runAgent({ model, prompt: 'x', tools, output: output() });
+    expect(result).toMatchObject({ status: 'completed', output: { answer: 'ok' } });
+    expect(execute).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(2);
+  });
+
+  it('streamAgent carries no error part, and each finish part names its stop', async () => {
+    const { model } = gemini(geminiTurn('OTHER', []), ANSWER);
+    const stream = streamAgent({ model, prompt: 'x', output: output() });
+    const types: string[] = [];
+    const raw: unknown[] = [];
+    for await (const event of stream.events) {
+      if (event.type !== 'part') continue;
+      types.push(event.part.type);
+      if (event.part.type === 'finish') raw.push(event.part.providerMetadata);
+    }
+    expect(types).not.toContain('error');
+    expect(raw).toEqual([
+      { google: { finishReason: 'OTHER' } },
+      { google: { finishReason: 'STOP' } },
+    ]);
+    expect(await stream.result).toMatchObject({ status: 'completed', output: { answer: 'ok' } });
   });
 });

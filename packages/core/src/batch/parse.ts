@@ -251,13 +251,9 @@ function parseGenerateContent(body: Json): ParsedReply {
   }
   const blocked =
     isObject(body.promptFeedback) && typeof body.promptFeedback.blockReason === 'string';
-  const reason = candidate?.finishReason;
+  const reason = typeof candidate?.finishReason === 'string' ? candidate.finishReason : undefined;
   // The streaming adapter's own mapping, its STOP-bug guard included.
-  const finishReason = mapGeminiFinishReason(
-    typeof reason === 'string' ? reason : undefined,
-    toolCalls.length > 0,
-    blocked,
-  );
+  const finishReason = mapGeminiFinishReason(reason, toolCalls.length > 0, blocked);
   const usage = isObject(body.usageMetadata) ? body.usageMetadata : undefined;
   return {
     text: out,
@@ -267,5 +263,7 @@ function parseGenerateContent(body: Json): ParsedReply {
     usage: mapGeminiUsage(usage as Parameters<typeof mapGeminiUsage>[0]),
     usageAvailable:
       typeof usage?.promptTokenCount === 'number' && typeof usage.candidatesTokenCount === 'number',
+    // The raw value under the streaming adapter's key (2.3).
+    ...(reason ? { providerMetadata: { google: { finishReason: reason } } } : {}),
   };
 }

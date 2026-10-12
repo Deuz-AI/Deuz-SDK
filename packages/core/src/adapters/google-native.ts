@@ -331,7 +331,9 @@ function geminiFinish(reason: string | undefined): FinishReason {
       return 'content_filter';
     // Stopped without a usable answer: an invalid or unexpected call, too many
     // calls in a row, no image, an unsupported language, or a reason Gemini
-    // does not name ('stop' before 2.3).
+    // does not name. 'stop', as before 2.3, so a native run re-asks through
+    // output repair or goes on to finalization, as after an empty answer; the
+    // finish part names the value itself.
     case 'MALFORMED_FUNCTION_CALL':
     case 'UNEXPECTED_TOOL_CALL':
     case 'TOO_MANY_TOOL_CALLS':
@@ -339,7 +341,7 @@ function geminiFinish(reason: string | undefined): FinishReason {
     case 'LANGUAGE':
     case 'OTHER':
     case 'IMAGE_OTHER':
-      return 'error';
+      return 'stop';
     default:
       return 'stop'; // enum evolves — handle defensively
   }
@@ -444,7 +446,14 @@ async function* parseStream(
     typeof lastUsage?.promptTokenCount === 'number' &&
       typeof lastUsage.candidatesTokenCount === 'number',
   );
-  yield { type: 'finish', usage: mapGeminiUsage(lastUsage), finishReason };
+  yield {
+    type: 'finish',
+    usage: mapGeminiUsage(lastUsage),
+    finishReason,
+    // Gemini's own value (2.3), the batch parser's key too: several values end
+    // with 'stop', so it is how a caller tells `OTHER` from `STOP`.
+    ...(lastFinish ? { providerMetadata: { google: { finishReason: lastFinish } } } : {}),
+  };
 }
 
 // --- error mapping ---

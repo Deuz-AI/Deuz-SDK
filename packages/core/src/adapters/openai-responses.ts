@@ -464,6 +464,9 @@ async function* parseStream(
 
   // The refusal rides the batch parser's key: `stopDetailsFrom` reads it as the stop's explanation.
   const refusal = refusalText();
+  // A refusal stays a refusal when the stream ended without its terminal event,
+  // as on the Chat wire: only a limit the provider reported outranks it.
+  if (refusal !== '' && finishReason !== 'length') finishReason = 'content_filter';
   const openai = { ...(phase ? { phase } : {}), ...(refusal ? { refusal } : {}) };
   yield {
     type: 'finish',

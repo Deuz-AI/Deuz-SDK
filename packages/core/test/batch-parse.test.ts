@@ -499,9 +499,26 @@ describe('parseReply: Gemini generateContent', () => {
         const stream = await streamFinish(googleNativeAdapter, [{ data: { candidates } }]);
         const reply = parseReply('native', response(parts, { candidates }));
         expect(reply.finishReason, JSON.stringify(parts)).toBe(stream.finishReason);
+        expect(reply.providerMetadata, JSON.stringify(parts)).toEqual(stream.providerMetadata);
       }
     },
   );
+
+  // K4 review V7-2: the raw value under the streaming adapter's key, so a
+  // caller tells a stop without a usable answer (`OTHER`, ...) from `STOP`.
+  it('keeps the raw finish reason as providerMetadata.google.finishReason', () => {
+    for (const finishReason of ['STOP', 'OTHER', 'MALFORMED_FUNCTION_CALL', 'SAFETY']) {
+      const candidates = [{ content: { parts: [{ text: 'x' }] }, finishReason }];
+      expect(parseReply('native', response([], { candidates })).providerMetadata).toEqual({
+        google: { finishReason },
+      });
+    }
+    const blocked = {
+      promptFeedback: { blockReason: 'SAFETY' },
+      usageMetadata: { promptTokenCount: 4 },
+    };
+    expect(parseReply('native', blocked)).not.toHaveProperty('providerMetadata');
+  });
 
   it('bills usage exactly as the streaming adapter does', async () => {
     const usageMetadata = {
