@@ -4,6 +4,11 @@
  * model fail-over (23.4) and of the UI bridge (23.5).
  */
 import type { EvalTaskManifest } from '../../../src/testing';
+import {
+  chatProjectionRepair,
+  chatProjectionSuperseded,
+  memoryWriteCheckpointFailure,
+} from './chat-memory-boundaries';
 import { compactionPreservedThinking } from './compaction-boundaries';
 import { fallbackBudgetSettlement, providerFallback } from './fallback-boundaries';
 import {
@@ -69,5 +74,8 @@ export const faultScenarios: readonly EvalTaskManifest[] = [
   providerFallback,
   fallbackBudgetSettlement,
   compactionPreservedThinking,
+  chatProjectionRepair,
+  chatProjectionSuperseded,
+  memoryWriteCheckpointFailure,
   uiDisconnectReplay,
 ];
