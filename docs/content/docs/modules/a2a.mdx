@@ -12,6 +12,7 @@ description: Agent2Agent v1.0.0 — call other agents with createA2AClient and s
 | --- | --- |
 | `fetchAgentCard`, `createA2AClient` | Discover and call an agent. |
 | `createA2AHandler`, `createInMemoryA2ATaskStore` | Serve an agent; the default task store. |
+| `createA2AAgentExecutor` | Serve a [native agent](#serving-a-native-agent) run through `createA2AHandler`. |
 | `a2aText` | The text of a message, an artifact or a list of parts. |
 | `A2AError` | Every A2A failure, on either side of the wire. |
 
@@ -170,7 +171,7 @@ A message for a task that is still working (`SUBMITTED`, `WORKING`, or `AUTH_REQ
 
 ### Backed by a model
 
-The executor is ordinary code, so a Deuz model call, a [native agent](/docs/modules/native-agents) run or a tool loop fits in it. Pass `ctx.signal` along so a cancellation stops the model call:
+The executor is ordinary code, so a Deuz model call or a tool loop fits in it; a [native agent](/docs/modules/native-agents) run, with its approvals, client tools and durable resume, has an executor of its own (see [serving a native agent](#serving-a-native-agent)). Pass `ctx.signal` along so a cancellation stops the model call:
 
 ```ts title="model-agent.ts"
 import { generateText } from '@deuz-sdk/core';
@@ -304,6 +305,170 @@ HTTP+JSON routes may start with a `/{tenant}` segment. `historyLength` (in `GetT
 
 Errors follow the bindings: a JSON-RPC error object with the A2A code (`-32001` `TASK_NOT_FOUND`, `-32002` `TASK_NOT_CANCELABLE`, …) and a `google.rpc.ErrorInfo` detail naming the reason, sent with HTTP 200 (500 for internal errors); over HTTP+JSON, a `google.rpc.Status` body (`{ error: { code, status, message, details } }`) with the binding's HTTP status (404 for `TASK_NOT_FOUND`, 400 for most others). An unknown route is 404, a wrong method 405.
 
+## Serving a native agent
+
+`createA2AAgentExecutor` serves a [native agent](/docs/modules/native-agents) run as the executor of `createA2AHandler`. Each task is one run, kept in an `AgentRunStore` under the task's id:
+
+- a new message starts the run (`streamAgent`);
+- a suspended run, waiting for approvals or client-tool results, is an `INPUT_REQUIRED` task whose status message lists what it waits for, and the client's next message answers it (`resumeStreamAgent`);
+- the run's validated output becomes the task's artifact;
+- `CancelTask` aborts the run.
+
+You pass the engine in (`agent: { streamAgent, resumeStreamAgent }` from `@deuz-sdk/core/agent`), so `@deuz-sdk/core/a2a` stays small and edge-safe for an app that only calls agents.
+
+This example needs no key and no network. A booking agent asks for an approval, the client gives it, and the typed result arrives as an artifact:
+
+```ts title="native-a2a.ts"
+import { createInMemoryAgentRunStore, resumeStreamAgent, streamAgent } from '@deuz-sdk/core/agent';
+import {
+  createA2AAgentExecutor,
+  createA2AClient,
+  createA2AHandler,
+  type A2AAgentAction,
+  type A2AAgentCard,
+} from '@deuz-sdk/core/a2a';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const card: A2AAgentCard = {
+  name: 'Bookings',
+  description: 'Books tables, with your approval.',
+  version: '1.0.0',
+  supportedInterfaces: [
+    { url: 'https://bookings.example.com/a2a', protocolBinding: 'JSONRPC', protocolVersion: '1.0' },
+  ],
+  capabilities: { streaming: true },
+  defaultInputModes: ['text/plain', 'application/json'],
+  defaultOutputModes: ['application/json'],
+  skills: [{ id: 'book', name: 'Book', description: 'Books a table.', tags: ['booking'] }],
+};
+
+type Booking = { booking: string };
+
+const handler = createA2AHandler({
+  card,
+  executor: createA2AAgentExecutor<Booking>({
+    agent: { streamAgent, resumeStreamAgent },
+    store: createInMemoryAgentRunStore(), // a durable AgentRunStore in production
+    run: {
+      model: createMockModel({
+        responses: [
+          { toolCalls: [{ toolName: 'book', args: { guests: 2 } }] },
+          { text: '{"booking":"B-42"}' },
+        ],
+      }),
+      bindingId: 'bookings-v1',
+      tools: {
+        book: {
+          description: 'Book a table.',
+          parameters: {
+            type: 'object',
+            properties: { guests: { type: 'number' } },
+            required: ['guests'],
+          },
+          needsApproval: true,
+          execute: () => 'booked',
+        },
+      },
+      output: {
+        mode: 'json',
+        schema: {
+          type: 'object',
+          properties: { booking: { type: 'string' } },
+          required: ['booking'],
+          additionalProperties: false,
+        },
+        validate: (value) => {
+          const booking = (value as { booking?: unknown } | null)?.booking;
+          if (typeof booking !== 'string') throw new Error('Expected a booking reference');
+          return { booking };
+        },
+      },
+    },
+  }),
+});
+
+// In production the client uses the global fetch; here it calls the handler directly.
+const fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+  handler(new Request(input, init))) as typeof globalThis.fetch;
+const client = createA2AClient({ card, deps: { fetch } });
+
+const asked = (await client.sendMessage('A table for two, please.')).task!;
+console.log(asked.status.state); // 'TASK_STATE_INPUT_REQUIRED'
+const { actions } = asked.status.message!.parts[1]!.data as { actions: A2AAgentAction[] };
+// [{ kind: 'approval', approvalId: 'call_1@…', toolCallId: 'call_1', toolName: 'book', input: { guests: 2 } }]
+
+const approvalResponses = actions.flatMap((action) =>
+  action.kind === 'approval' ? [{ approvalId: action.approvalId, approved: true }] : [],
+);
+const done = (await client.sendMessage([{ data: { approvalResponses } }], { taskId: asked.id }))
+  .task!;
+console.log(done.status.state); // 'TASK_STATE_COMPLETED'
+console.log(done.artifacts?.[0]?.parts); // [{ data: { booking: 'B-42' }, mediaType: 'application/json' }]
+```
+
+How a run maps onto its task:
+
+| The run | The task |
+| --- | --- |
+| A new message | Starts the run with the message as its one user message: text parts as text, data parts as JSON text, `raw` or `url` parts with an `image/*` media type as images. Any other file is refused with `CONTENT_TYPE_NOT_SUPPORTED`, and a message without parts with `INVALID_PARAMS`, before a task exists. A `run` that gives `prompt` or `messages` itself builds the input from the turn's message instead. |
+| Its leg runs | `WORKING`. The text of a string output streams as unstored [`draft`](#the-executor) updates of the output artifact. |
+| `completed` | The output artifact (`artifactId: 'output'`) with the run's validated output only: a text part for a string output, a data part (`application/json`) for a typed one. Then `COMPLETED`. |
+| `suspended` | `INPUT_REQUIRED`. The status message has a text part and a data part `{ type: 'pending-actions', actions }`. |
+| `stopped` | `INPUT_REQUIRED`, with a data part `{ type: 'stopped', reason, stopDetails?, unknownEffects? }`: a person must look at the run (see [stopped and failed runs](#stopped-and-failed-runs)). A stop a cancellation caused (`'aborted'`, `'cancelled'`) cancels the task instead. |
+| `failed` | `FAILED`, with the run's error message, secret-redacted (or what `failureMessage` returns), and a data part `{ type: 'failed', error: { name, code? } }`. |
+
+### Answering what the run waits for
+
+The `pending-actions` data part lists every action the run waits for:
+
+| `kind` | Fields | Answered in |
+| --- | --- | --- |
+| `'approval'` | `approvalId`, `toolCallId`, `toolName`, `input` (the call's arguments, for display), `token?` (a signed approval: echo it), `agentPath?` (a sub-agent's call) | `approvalResponses`: `{ approvalId, approved, reason?, token? }` |
+| `'client-tool'` | `toolCallId`, `toolName`, `input` (what the client runs the tool with) | `clientToolResults`: `{ toolCallId, output, isError? }` |
+
+The client answers every action in one message, in data parts `{ approvalResponses?, clientToolResults? }`: the names and shapes `resumeAgent` takes, in one part or several. A resume keeps no partial answer, so the executor checks the answers against the run before anything is written. It refuses with `INVALID_PARAMS`, leaving the task and the run as they were and the message out of the task's history, a message that:
+
+- answers nothing, or leaves an action open;
+- names an action the run does not wait for, answers one twice, or with the wrong kind: a result for an approval, an approval for a client tool, an approval named by its tool call id;
+- carries a data part other than `{ approvalResponses?, clientToolResults? }`, a malformed entry, or a file.
+
+The answer's text parts stay in the task's history, but the run gets only the answers: a resumed run takes no new user message. A message with answers for a run that waits for none is refused too.
+
+### Stopped and failed runs
+
+A stopped run puts its task in `INPUT_REQUIRED`, because a person (the agent's operator) must look at it:
+
+- **`'tool-reconciliation-required'`**: the outcome of the tool calls in `unknownEffects` is unknown, and the run stays resumable. A person checks each effect in the system it touched and settles it with `resumeAgent` and `reconciledToolResults` or `retryToolCallIds` on the task's run, whose run id is the task id and whose scope is [the task's](#identity-and-several-instances) (see [when the store fails](/docs/modules/native-agents#when-the-store-fails)). The client's next message then picks the run up from there; until then, every message finds it stopped again.
+- **Every other stop** (`'max-steps'`, `'budget.usd'`, `'refusal'`, `'mcp-catalog-changed'`, …) is final for the run. Messages are refused with `UNSUPPORTED_OPERATION`; cancel the task, or start a new one.
+
+A failed run fails the task. A resume that fails before it begins, having written nothing, refuses the message instead, and the task keeps waiting: `UNSUPPORTED_OPERATION` while another executor holds the run's [lease](#identity-and-several-instances), `INTERNAL_ERROR` otherwise (the run's definition changed, or its store could not be read).
+
+### The run's options
+
+`run` gives the run's options: an object, or a function of the turn (its message, task, tenant, owner, signal, …) that returns them. It is called on every turn, and the later turns must give the definition the run started with: the run's resume binding checks the model, tools and output, and `bindingId` covers the rest. A function may throw an `A2AError` to refuse a message. The executor sets `session`, `lease`, `signal` and `abortSignal` itself, and the answers (`approvalResponses`, `clientToolResults`, `retryToolCallIds`, `reconciledToolResults`, `retryFailed`), so a run that sets one is refused: an object when the executor is created (`InvalidRequestError`), a function's options when it returns them, which fails the task.
+
+| Option | What it does |
+| --- | --- |
+| `agent` | The native engine: `{ streamAgent, resumeStreamAgent }` from `@deuz-sdk/core/agent`. |
+| `store` | The `AgentRunStore`. A task's run id is its task id. |
+| `run` | The run's options, or a function that returns them for the turn. |
+| `lease` | Claim every run through a `LeaseProvider` (`{ provider, owner?, ttlMs? }`), as `runAgent`'s `lease` does. |
+| `scope` | The run's scope from the task's `{ tenant, owner }`. Default: the JSON of `['a2a', tenant, owner]`. |
+| `artifact` | The output artifact's `name` (default `'output'`) and `description`. |
+| `failureMessage` | What a client reads of a failed run or a refused resume. Default: the run's error message, secret-redacted. |
+
+### Identity and several instances
+
+The run's scope comes from the task's tenant and owner, so a run is resumed only in the scope that created its task. Another caller's message finds no task: `TASK_NOT_FOUND` from the task store, and from the run's scope as well, should a task store not keep scopes apart.
+
+To serve tasks from several instances, share a durable task store and a durable `AgentRunStore`, and pass `lease`. Each leg then claims the run's [lease](/docs/modules/operations#leasing-a-native-run), so two instances never drive a run at once: a message whose resume finds the run held elsewhere is refused with `UNSUPPORTED_OPERATION`, and the task keeps waiting.
+
+### Streaming and cancellation
+
+`SendStreamingMessage` and `SubscribeToTask` carry the run as it goes: the `task` snapshot, `WORKING` once the leg runs, the text of a string output as drafts of the output artifact, each model step afresh, then the stored artifact and the final status. A typed output is never sent in part. A draft is a preview: only a completed run's artifact is stored, and a run that stops, fails or suspends leaves no artifact, whatever it previewed. With `configuration.returnImmediately`, a follow-up is answered once its leg runs (at `WORKING`), or with the refusal of answers that do not fit.
+
+`CancelTask` aborts a run whose turn runs on this instance; the run stops with reason `'aborted'`. With `lease`, canceling a task whose turn runs on another instance signals the run's lease, which stops the run there with reason `'cancelled'`, and a [lease cancel](/docs/modules/operations#cancelling-a-native-run-from-another-process) from outside A2A (`leases.signal(agentRunLeaseKey({ scope, runId }), 'cancel')`, with `agentRunLeaseKey` from `@deuz-sdk/core/ops`) cancels the task. A task waiting for input has no running turn: canceling it leaves its suspended run in the store as it is, and no message resumes it.
+
 ## Calling an agent
 
 `fetchAgentCard(url)` reads `/.well-known/agent-card.json` at the URL's origin — or the URL itself when it ends in `.json`, or `path` resolved against it. `createA2AClient({ card })` then talks to the first `JSONRPC` or `HTTP+JSON` interface the card declares for A2A 1.x (`binding` picks one), with the interface's `tenant`. Or skip the card: `createA2AClient({ url, binding })`.
@@ -366,7 +531,8 @@ A card without a usable interface, and a `binding` other than `'JSONRPC'` or `'H
 - **Push notifications**, **`ListTasks`** and the **extended agent card**: answered as unsupported by the handler, not offered by the client.
 - **Signed agent cards** (JWS): a card's `signatures` are carried, not verified.
 - **Keep-alive comments** on long, silent streams: a turn that stays quiet longer than a proxy's idle timeout should report progress with `working(…)`.
-- **A `runAgent` adapter** — tasks as native runs, `INPUT_REQUIRED` as a suspended run, cancellation as an abort, artifacts as typed output — is planned; the executor interface is built for it.
+- **A task whose instance died mid-turn** stays `WORKING`, since the handler refuses messages to a task it believes is being worked on. A native run behind it can be recovered with [`findStaleAgentRuns`](/docs/modules/operations#finding-runs-that-lost-their-executor) and `resumeAgent`; the task does not learn of it, so cancel it.
+- **Settling a native run's unknown effects over A2A**: a person with access to the run store does it with `resumeAgent`, not the client with a message.
 
 ## API at a glance
 
@@ -376,12 +542,13 @@ A card without a usable interface, and a `binding` other than `'JSONRPC'` or `'H
 | `createA2AClient(options)` | A client for one agent endpoint (`A2AClient`). |
 | `createA2AHandler(options)` | Serve an agent: `(request: Request) => Promise<Response>`. |
 | `createInMemoryA2ATaskStore()` | The default task store. |
+| `createA2AAgentExecutor(options)` | The executor of a native agent run (`A2AExecutor`). |
 | `a2aText(value)` | The text parts of a message, an artifact or a list of parts, concatenated. |
 | `A2AError` | `kind`, `reason`, `rpcCode`, `statusCode`. |
-| Types | `A2AAgentCard`, `A2AMessage`, `A2APart`, `A2ATask`, `A2AArtifact`, `A2AStreamResponse`, `A2ASendMessageResponse`, `A2AClientOptions`, `A2AHandlerOptions`, `A2AExecutor`, `A2AExecutionContext`, `A2ATaskStore`, `A2ATaskScope`, `A2AErrorReason`, … |
+| Types | `A2AAgentCard`, `A2AMessage`, `A2APart`, `A2ATask`, `A2AArtifact`, `A2AStreamResponse`, `A2ASendMessageResponse`, `A2AClientOptions`, `A2AHandlerOptions`, `A2AExecutor`, `A2AExecutionContext`, `A2ATaskStore`, `A2ATaskScope`, `A2AErrorReason`, `A2AAgentExecutorOptions`, `A2AAgentRunOptions`, `A2AAgentAction`, `A2AAgentPendingActions`, `A2AAgentStopped`, `A2AAgentFailed`, `A2AAgentAnswers`, … |
 
 ## See also
 
 - [MCP server](/docs/modules/mcp-server) — serve tools (rather than an agent) to MCP clients.
-- [Native agents](/docs/modules/native-agents) — `runAgent`, a natural executor for a long task.
+- [Native agents](/docs/modules/native-agents) — `runAgent` and its sessions, which `createA2AAgentExecutor` serves.
 - [Dependencies](/docs/core/dependencies) — `deps.fetch`, `generateId` and `clock`.
