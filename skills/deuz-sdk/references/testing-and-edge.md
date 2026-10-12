@@ -1,13 +1,13 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd
-     sources: packages/core/src/testing.ts, src/types/{config,deps,methods,stream,tool}.ts, src/internal/resolve-call.ts,
-     src/core/resilience.ts, src/inference/tool-loop.ts, src/{openai,anthropic}.ts, tooling/check-runtime-compat.mjs,
-     packages/core/test/{testing,tool-loop}.test.ts, docs/content/docs/advanced/edge.mdx,
-     docs/content/docs/reference/compatibility.mdx, docs/content/docs/core/{dependencies,stream-chat}.mdx,
-     skills/deuz-sdk/rules/pitfalls.md -->
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
+     sources: packages/core/src/testing.ts, src/internal/eval-suite.ts, src/types/{config,deps,methods,stream,tool}.ts,
+     src/internal/resolve-call.ts, src/core/resilience.ts, src/inference/tool-loop.ts, src/{openai,anthropic,edge}.ts,
+     tooling/check-runtime-compat.mjs, packages/core/package.json (exports), packages/core/test/{testing,tool-loop}.test.ts,
+     docs/content/docs/advanced/edge.mdx, docs/content/docs/modules/evals.mdx,
+     docs/content/docs/reference/compatibility.mdx, docs/content/docs/core/{dependencies,stream-chat}.mdx -->
 
 # Testing your AI code, and deploying to the edge
 
-**Load when:** writing tests for code that calls a model, faking a provider deterministically, scripting a tool loop or an approval pause, scoring a prompt change with an eval, or shipping a route to Cloudflare Workers, Vercel Edge, Deno or Bun.
+**Load when:** writing tests for code that calls a model, faking a provider deterministically, scripting a tool loop or an approval pause, scoring a prompt change with an eval, measuring an agent with versioned eval tasks and fault scenarios (`runEvalSuite`, 2.3), or shipping a route to Cloudflare Workers, Vercel Edge, Deno or Bun.
 
 ## Part 1 — Testing
 
@@ -24,7 +24,7 @@ Four rules before any code:
 | tool loops, `maxSteps`, `stopWhen`, approvals, agents, handoffs, guardrails | `createMockModel` | drives the REAL adapter + loop over synthesized OpenAI Chat Completions SSE, zero network |
 | what the SDK actually put on the wire (URL, headers, body), retries, HTTP error mapping | `mockFetch` / `mockFetchSequence` + `sseResponse` / `sseEvents` | you own the `Response` and every recorded request |
 | timeouts, retry backoff, generated ids | `deps.clock`, `deps.generateId` | core never calls an ambient timer or `crypto.randomUUID` |
-| legacy cost stops, `budget.usd`, `cost` parts | `deps.priceProvider` | legacy `costExceeds`/`budget.usd` are inert without one; native bounded USD admission requires pricing or an explicit estimate |
+| legacy cost stops, `budget.usd`, `cost` parts | `deps.priceProvider` | without one nothing is priced: `costExceeds` never fires, and since 2.3 a USD `budget` (legacy or native) reports `unpriced-model` and runs, unless `unknownPrice: 'reject'` |
 | warnings and degradations | `deps.logger` | the default logger is a **no-op**; `deps.logger.warn` is the complete channel |
 | embeddings, image/speech/video | factory `fetch` on that provider | `createMockModel` returns a `LanguageModel`; `embed` only accepts an `EmbeddingModel` |
 
@@ -196,7 +196,7 @@ export async function retriesA429ThenAssertsTheRequest(): Promise<void> {
 
 Client-mode approval = a tool with `needsApproval` and **no** `approveToolCall`. The loop breaks *before* executing anything in that batch: `generateText` returns `pendingApprovals: ToolApprovalRequest[]`, `streamChat` emits a `tool-approval-request` part per gated call and then `finish`. Resume by calling again with the pending assistant turn in the history plus `approvalResponses`.
 
-Legacy sharp edges to pin in the test (native resume keeps missing verdicts suspended; see `references/native-execution.md`): a pending call with **no matching verdict is DENIED**, not left pending; unknown `approvalId`s are ignored (replay-safe); a denied call gets an `is_error` tool_result and the loop continues; under `approvalSigner` an approval must echo the request's `token` or it is denied.
+Legacy sharp edges to pin in the test (native resume keeps missing verdicts suspended; see `references/native-execution.md`): a pending call with **no matching verdict is DENIED**, not left pending; unknown `approvalId`s are ignored (replay-safe); a denied call gets an `is_error` tool_result and the loop continues; under `approvalSigner` an approval must echo the request's `token` or it is denied. Answer with the `approvalId` you were given: since 2.3 it binds the call (the tool call id plus a digest), so a test that builds verdicts from `toolCallId` passes only while the run used that id once.
 
 ```ts
 import { generateText } from '@deuz-sdk/core';
@@ -254,7 +254,7 @@ export async function pausesForApprovalThenResumes(): Promise<void> {
 
 For a durable pause (`session: { store, runId }`), the same break also writes a `'suspended'` checkpoint carrying `pendingApprovals`; resume with `resumeFromCheckpoint` / `resumeStreamFromCheckpoint` (`@deuz-sdk/core/durable`) instead of rebuilding the history yourself, and assert the persisted checkpoint through `createInMemorySessionStore`.
 
-### Evals: `runEval` and `runGradedEval`
+### Evals: `runEval`, `runGradedEval` and `runEvalSuite`
 
 Both are sequential and deterministic (no timers, no logging) and neither judges anything — you supply `check`. For an LLM judge, call `generateObject` inside a `check`.
 
@@ -292,6 +292,56 @@ export async function gradeSummaries(): Promise<number> {
 }
 ```
 
+### Versioned eval tasks: `runEvalSuite` (2.3)
+
+`runEvalSuite(tasks, options?)` runs `EvalTaskManifest`s and measures every attempt. A task has a stable `id` and a `version` you bump whenever its start state, acceptance or grading changes (two versions are never compared as one task), named `acceptance` checks graded the way `runGradedEval` grades a case, and a `run` that performs one attempt and returns an `EvalTaskOutcome`, which a native `AgentResult` already is.
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel, runEvalSuite, type EvalTaskManifest } from '@deuz-sdk/core/testing';
+
+const countOrders: EvalTaskManifest = {
+  id: 'orders/count',
+  version: 1,
+  start: { messages: [{ role: 'user', content: 'How many orders does ada@example.com have?' }] },
+  tools: { allowed: ['list_orders'] },
+  acceptance: [
+    { name: 'completes', check: (outcome) => outcome.status === 'completed' },
+    { name: 'answers 3', check: (outcome) => (outcome.text ?? '').includes('3 orders') },
+  ],
+  run: (context) =>
+    runAgent({
+      model: createMockModel({
+        responses: [
+          { toolCalls: [{ toolName: 'list_orders', args: { email: 'ada@example.com' } }] },
+          { text: 'ada@example.com has 3 orders.' },
+        ],
+      }),
+      messages: context.messages, // the attempt's own copy of the start snapshot
+      tools: {
+        list_orders: {
+          description: 'List the orders of a customer.',
+          parameters: { type: 'object', properties: { email: { type: 'string' } }, required: ['email'] },
+          execute: () => ['o-1', 'o-2', 'o-3'],
+        },
+      },
+      signal: context.signal, // aborted when the attempt times out
+      deps: { observer: context.observer }, // feeds the allowed-tools check
+    }),
+};
+
+const report = await runEvalSuite([countOrders], { repeats: 3 });
+console.log(report.aggregate.offline?.successRate); // 1
+```
+
+- **Manifest fields**: `tier` (`'offline'` default, or `'real-model'`), `start` (`messages`, workspace `files`, JSON `store`; every attempt gets a deep copy), `acceptance` (at least one; success needs all), `grade` (optional partial credit 0..1), `tools` (`allowed`, and `scope`, the path prefix of `files` it may change), `model` (descriptive), `budget` (`usd`, `tokens`), `timeoutMs`, `repeats`, `artifacts`, `approvals` (tools whose approval is part of the task), `fault` (`{ boundary, recovery }` for a fault scenario) and `env` (keys a real-model task needs).
+- **The attempt's context**: copies of the snapshot, an in-memory `observer` (pass it as `deps.observer`), `signal`, and recorders: `effect(key)` (an external effect by its real-world identity; a key recorded twice is a repeated effect), `approve(requests, approved?)` (returns the verdicts for `approvalResponses`, tokens echoed), `rescue(reason)`, `interrupt(boundary)` and `artifact(name, value)`.
+- **Metrics per attempt**: `success`, `score`, `falseCompleted` (the run claimed `'completed'` and failed acceptance), `costUsd` and `tokens` (from the outcome's accounting, across every leg), `durationMs` (on `options.clock`), `humanRescues` (rescues and approvals the task did not list) apart from `requiredApprovals`, `repeatedEffects`, `toolCalls`, `recovery` (`'not-needed'`, `'recovered'`, `'rescued'`, `'contained'` or `'failed'`; an attempt that ran an effect twice is `'failed'`) and `failures`.
+- **Harness checks** fail an attempt beyond its acceptance: an effect recorded twice, a tool outside `tools.allowed`, a file changed outside `tools.scope`, a budget overrun, a missing artifact, and a fault that never fired or recovered another way than `fault.recovery` says. A run that throws or times out is a failed attempt, never a crash; a malformed suite throws a `TypeError` before any task runs.
+- **The report** (`EvalSuiteReport`, `format: 'deuz-eval-suite'`, version 1) is returned, and written only when `options.report` names a file path (through `node:fs`, loaded only then, so the subpath stays edge-safe) or a callback. `aggregate` is per tier: offline and real-model results are separate experiments and never added together. `options.skip(task)` returns a reason to list a task without running it (a missing key).
+
+The repository ships a baseline of offline tasks and fault-injection scenarios (a receipt write that fails, a lost lease, a broken model stream, a refused or cut-off turn with a tool call, …) that run on every `npm test`, and real-model tasks that are defined but not run: a baseline, not a ranking. See [/docs/modules/evals](/docs/modules/evals).
+
 ### Other determinism knobs
 
 `deps.generateId` pins request ids, tool-call fallback ids **and retry jitter** (backoff derives from it). `deps.clock` pins timeouts and backoff. `resolveDependencies(partial)` returns the same `ResolvedDependencies` the inference layer builds, if you want to assert defaults. `deps.observer` (`createMemoryObserver` from `@deuz-sdk/core/observe`) gives a full typed event log to assert a run's shape without touching the stream — await `result.observation?.settled` first.
@@ -300,19 +350,19 @@ export async function gradeSummaries(): Promise<number> {
 
 ### What "edge-safe" buys you
 
-The core touches only APIs that exist in every modern JS runtime: `fetch`, Web Streams, `TextEncoder`/`TextDecoder`, WebCrypto, timers, `atob`/`btoa`. There are no `node:*` imports, no `Buffer`, no `process` — including no `process.env`. Everything stateful is a `Dependencies` seam with a Web-API default: `deps.clock` instead of ambient `Date.now`/`setTimeout`, `deps.generateId` instead of `crypto.randomUUID`, `deps.logger` instead of `console`. The same build ships to Node 22+, Cloudflare Workers, Vercel Edge, Deno, Bun and the browser; every release bundles root, `/edge`, provider, native `/agent`, `/swarm`, `/ops`, `/evolve` and `/schedule` consumers with esbuild's browser platform and fails if the graph reaches a Node-only module.
+The core touches only APIs that exist in every modern JS runtime: `fetch`, Web Streams, `TextEncoder`/`TextDecoder`, WebCrypto, timers, `atob`/`btoa`. There are no `node:*` imports, no `Buffer`, no `process` — including no `process.env`. Everything stateful is a `Dependencies` seam with a Web-API default: `deps.clock` instead of ambient `Date.now`/`setTimeout`, `deps.generateId` instead of `crypto.randomUUID`, `deps.logger` instead of `console`. The same build ships to Node 22+, Cloudflare Workers, Vercel Edge, Deno, Bun and the browser; every release bundles root, `/edge`, provider, native `/agent`, `/swarm`, `/ops`, `/evolve` and `/schedule` consumers, and since 2.3 `/goal`, `/mcp/server`, `/realtime`, `/batch`, `/a2a` and `/testing`, with esbuild's browser platform and fails if the graph reaches a Node-only module.
 
 Consequence you must design for: **you read the key, core never does.** Pass it to the factory (`createAnthropic({ apiKey })`), to `createClient({ apiKeys })`, or resolve it per call with `deps.keyProvider` (async and refreshing — the Vertex OAuth case).
 
 ### The `@deuz-sdk/core/edge` subpath
 
-A curated re-export subset with a contractual promise: nothing Node-only can ever be in it, so a bundler failure is a build error rather than a 3 a.m. production throw. It carries `streamChat`, `generateText`, `generateObject`, `streamObject` (no `embed`/`embedMany`), `tool`, `agentTool`, `createAgent`, `handoff`, the stop conditions (`stepCountIs`, `hasToolCall`, `totalTokensExceed`, `costExceeds`), the request gate and chat engine (`validateChatRequest`, `parseDeuzChatRequest`, `uiFromMessages`, `applyUIPart`, `createInMemoryChatStore`, …), durable resume (`resumeFromCheckpoint`, `resumeStreamFromCheckpoint`, `resumeDeuzChatResponse`, `createInMemorySessionStore`, `createApprovalSigner`), observation (`createMemoryObserver`, `createCallbackObserver`, `composeObservers`, `filterObserver`, `summarizeRun`) and the OTel bridge, the guardrail built-ins (`promptInjectionGuardrail`, `maxOutputLength`, `maxToolResultLength`), the hosted search tools, and every canonical type.
+A curated re-export subset with a contractual promise: nothing Node-only can ever be in it, so a bundler failure is a build error rather than a 3 a.m. production throw. It carries `streamChat`, `generateText`, `generateObject`, `streamObject` (no `embed`/`embedMany`), `tool`, `agentTool`, `createAgent`, `handoff`, the stop conditions (`stepCountIs`, `hasToolCall`, `totalTokensExceed`, `costExceeds`), the request gate and chat engine (`validateChatRequest`, `parseDeuzChatRequest`, `uiFromMessages`, `applyUIPart`, `createInMemoryChatStore`, …), durable resume (`resumeFromCheckpoint`, `resumeStreamFromCheckpoint`, `resumeDeuzChatResponse`, `createInMemorySessionStore`, `createApprovalSigner`), observation (`createMemoryObserver`, `createCallbackObserver`, `composeObservers`, `filterObserver`, `summarizeRun`) and the OTel bridge, the guardrail built-ins (`promptInjectionGuardrail`, `maxOutputLength`, `maxToolResultLength`), the hosted search tools, every canonical type, everything `@deuz-sdk/core/ops`, `@deuz-sdk/core/evolve` and `@deuz-sdk/core/schedule` export (2.2; through them 2.3 adds `agentRunLeaseKey` and `findStaleAgentRuns`), and since 2.3 `resolveModelProfile` with the profile types, `UnpricedModelError` and `CheckpointVersionError`.
 
-Deliberately **not** on `/edge`, though each is itself edge-safe — import from its own subpath: the provider factories (`@deuz-sdk/core/anthropic`, …), `embed`/`embedMany` and the error subclasses (`RateLimitError`, `TimeoutError`, …) from the root, `toDeuzStreamResponse` and friends from `@deuz-sdk/core/ui`, plus the native APIs on `@deuz-sdk/core/agent`, `@deuz-sdk/core/swarm`, and (2.2) `@deuz-sdk/core/ops`, `@deuz-sdk/core/evolve`, `@deuz-sdk/core/schedule`, then `@deuz-sdk/core/pricing`, `@deuz-sdk/core/middleware`, `@deuz-sdk/core/rag`, `@deuz-sdk/core/memory`, `@deuz-sdk/core/skills`, `@deuz-sdk/core/mcp`, `@deuz-sdk/core/guardrails`, `@deuz-sdk/core/image`, `@deuz-sdk/core/speech`, `@deuz-sdk/core/transcription`, `@deuz-sdk/core/video`. The root entry is edge-safe too; `/edge` is the narrower locked promise.
+Deliberately **not** on `/edge`, though each is itself edge-safe — import from its own subpath: the provider factories (`@deuz-sdk/core/anthropic`, …), `embed`/`embedMany` and the error subclasses (`RateLimitError`, `TimeoutError`, …) from the root, `toDeuzStreamResponse` and friends from `@deuz-sdk/core/ui`, plus the native APIs on `@deuz-sdk/core/agent` (only `createAgent` is on `/edge`) and `@deuz-sdk/core/swarm`, then `@deuz-sdk/core/pricing`, `@deuz-sdk/core/middleware`, `@deuz-sdk/core/rag`, `@deuz-sdk/core/memory`, `@deuz-sdk/core/skills`, `@deuz-sdk/core/mcp`, `@deuz-sdk/core/guardrails`, `@deuz-sdk/core/image`, `@deuz-sdk/core/speech`, `@deuz-sdk/core/transcription`, `@deuz-sdk/core/video`, and the 2.3 subpaths `@deuz-sdk/core/goal`, `@deuz-sdk/core/realtime`, `@deuz-sdk/core/batch`, `@deuz-sdk/core/a2a` and `@deuz-sdk/core/mcp/server`. The root entry is edge-safe too; `/edge` is the narrower locked promise.
 
 ### The complete list of Node-only subpaths
 
-These twenty reach the filesystem, a database driver, a child process, or a Node-only peer. Never import them from an edge runtime. Their `node:*` imports are **lazy**, so the module often imports fine and throws at the first call — a Worker bundle can build and fail in production (Cloudflare's bundler fails earlier when `nodejs_compat` is off). The two injected-client store packs still import a Node-only module path even when you hand them a client; the seams (`RedisClientLike`, `PgClientLike`) are plain objects, so an HTTP-driver-backed store reaches the edge only when the implementation lives in **your** module.
+These twenty-four reach the filesystem, a database driver, a child process, the process's own stdio, or a Node-only peer. Never import them from an edge runtime. Their `node:*` imports are **lazy**, so the module often imports fine and throws at the first call — a Worker bundle can build and fail in production (Cloudflare's bundler fails earlier when `nodejs_compat` is off). The two injected-client store packs still import a Node-only module path even when you hand them a client; the seams (`RedisClientLike`, `PgClientLike`) are plain objects, so an HTTP-driver-backed store reaches the edge only when the implementation lives in **your** module.
 
 | Node-only subpath | Needs | Edge-safe counterpart |
 | --- | --- | --- |
@@ -325,16 +375,20 @@ These twenty reach the filesystem, a database driver, a child process, or a Node
 | `@deuz-sdk/core/workspace/node` | `node:fs/promises` | `createInMemoryWorkspace` (`@deuz-sdk/core/workspace`) |
 | `@deuz-sdk/core/compute/node` | child process | none — implement the `ComputeSandbox` seam against a remote sandbox |
 | `@deuz-sdk/core/browser/node` | `playwright` | none — implement the `BrowserController` seam against a remote browser |
-| `@deuz-sdk/core/mcp/stdio` | child process + `@modelcontextprotocol/sdk` | `@deuz-sdk/core/mcp` (HTTP / SSE transport) |
+| `@deuz-sdk/core/mcp/stdio` | child process + an MCP client SDK peer (v2 `@modelcontextprotocol/client` or v1 `@modelcontextprotocol/sdk`) | `@deuz-sdk/core/mcp` (HTTP / SSE transport) |
+| `@deuz-sdk/core/mcp/server/stdio` (2.3) | the process's stdin/stdout + `@modelcontextprotocol/server` | `server.fetch` from `@deuz-sdk/core/mcp/server` (Streamable HTTP) |
 | `@deuz-sdk/core/mcp/node` | `node:fs` (0600 token file), `node:http` (loopback redirect) | `inMemoryTokenStore`, or your own `TokenStore` |
 | `@deuz-sdk/core/vertex/node` | Application Default Credentials | `createServiceAccountKeyProvider` (`@deuz-sdk/core/vertex`, edge-safe JWT signing) |
 | `@deuz-sdk/core/swarm/sqlite` | `node:sqlite` (or an injected database) | `createInMemorySwarmStore` or your own atomic `SwarmStore` |
 | `@deuz-sdk/core/swarm/postgres` (2.2) | an injected `PgClientLike` | `createInMemorySwarmStore` or your own atomic `SwarmStore` |
 | `@deuz-sdk/core/ops/sqlite` (2.2) | `node:sqlite` (or an injected database) | `createInMemoryLeaseProvider` (`/ops`), `createInMemoryAgentRunStore`, `createInMemoryBudgetStore` (`/agent`) |
 | `@deuz-sdk/core/ops/postgres` (2.2) | an injected `PgClientLike` | the same in-memory implementations, or your own seams |
+| `@deuz-sdk/core/ops/redis` (2.3) | `redis` peer (or an injected `RedisScriptClient`; ioredis via `wrapIoredisClient`) | the same in-memory implementations, or your own seams |
+| `@deuz-sdk/core/swarm/redis` (2.3) | `redis` peer (or an injected `RedisScriptClient`) | `createInMemorySwarmStore` or your own atomic `SwarmStore` |
 | `@deuz-sdk/core/evolve/sqlite` (2.2) | `node:sqlite` (or an injected database) | `createInMemoryPopulationStore` (`/evolve`) |
+| `@deuz-sdk/core/headless` (2.3 preview) | `node:fs` (instruction files, skills), the environment and the Node version | none — call `runAgent` / `resumeAgent` (`/agent`) directly |
 | `@deuz-sdk/core/stores/sqlite` | `node:sqlite` (or an injected `SqliteDatabaseLike`) | implement the four store seams yourself |
-| `@deuz-sdk/core/stores/redis` | `redis` peer (or an injected `RedisClientLike`) | implement `RedisClientLike` over an HTTP driver, in your own module |
+| `@deuz-sdk/core/stores/redis` | `redis` peer (or an injected `RedisClientLike`; ioredis via `wrapIoredisClient`, 2.3) | implement `RedisClientLike` over an HTTP driver, in your own module |
 | `@deuz-sdk/core/stores/postgres` | `pg` peer (or an injected `PgClientLike`) | implement `PgClientLike` over an HTTP driver, in your own module |
 
 ### Per-runtime notes
@@ -398,6 +452,7 @@ The Vercel Edge shape is the identical route with `export const runtime = 'edge'
 ## Deep dive
 
 - [/docs/advanced/edge](/docs/advanced/edge) — the Web-APIs-only contract, the `/edge` guarantee, Node-only subpaths, per-runtime notes and a full Worker example.
+- [/docs/modules/evals](/docs/modules/evals) — `runEvalSuite`: manifests, the attempt context, metrics, the report, real-model tasks and the 2.3 fault-injection baseline.
 - [/docs/reference/compatibility](/docs/reference/compatibility) — supported runtimes, ESM/CJS targets, custom `baseURL` rules, and the local `verify:runtime` / `verify:package` gates.
 - [/docs/core/dependencies](/docs/core/dependencies) — the `Dependencies` seam, G1 key precedence, and the deterministic-test recipes (`clock`, `generateId`, custom `fetch`).
 - [/docs/core/stream-chat](/docs/core/stream-chat) — the lazy pump, the never-throw contract, and `consume()` in full.

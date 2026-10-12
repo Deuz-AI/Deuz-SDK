@@ -113,12 +113,13 @@ The default logger is a **no-op**, which is why these situations look silent out
 Deuz meters real provider-reported usage and can price it locally — there is no hosted billing view to replace.
 
 ```ts
-import { createPriceProvider, PRICES_2026 } from '@deuz-sdk/core';
+import { createPriceProvider } from '@deuz-sdk/core';
 
-const deps = { priceProvider: createPriceProvider(PRICES_2026) };
+// The bundled table; { table, aliases, margin } extend it.
+const deps = { priceProvider: createPriceProvider() };
 ```
 
-With a `priceProvider` you get `cost` parts on the wire (feed them straight into a badge), `budget: { usd, tokens }` guardrails, and the `costExceeds(usd)` stop condition. **Without one, `costExceeds` warns ONCE and then never fires** — a silent no-op that is easy to mistake for "the budget was never reached".
+With a `priceProvider` you get `cost` parts on the wire (feed them straight into a badge), `budget: { usd, tokens }` guardrails, and the `costExceeds(usd)` stop condition. **Without one, `costExceeds` warns ONCE and then never fires** — a silent no-op that is easy to mistake for "the budget was never reached". Since 2.3 a model the provider has no price for (or any model, without a provider) runs under a USD `budget` with one `unpriced-model` warning and adds nothing to the cost; pair the budget with `budget.tokens`, or set `budget.unknownPrice: 'reject'` to refuse such a model.
 
 A budget stop does **not** change `finishReason` (the union is locked). Read `result.providerMetadata?.deuz?.stoppedBy` (or the `finish` part's `providerMetadata`) instead.
 

@@ -427,26 +427,6 @@ describe('verify-skill: the skill as 2.2.0 stamped it', { timeout: 30_000 }, () 
       );
     }
   });
-
-  // feat/2.3 before wave 3: the texts still carry 2.2's stamps (SK3 rewrites them). Once they
-  // are restamped this no longer applies and the permanent test above keeps the guarantee.
-  const realSkill = readFileSync(join(REPO, 'skills/deuz-sdk/SKILL.md'), 'utf8');
-  it.runIf(realSkill.includes('api-contract sha256:c025621e10fd'))(
-    'rejects the repository skill as it stands before the 2.3 text update',
-    () => {
-      const failures = verify.verifySkill({ table }).failures;
-      expect(failures).toContainEqual(
-        expect.stringMatching(
-          /^skills\/deuz-sdk\/SKILL\.md:\d+ {2}stamp names api-contract sha256:c025621e10fd/,
-        ),
-      );
-      expect(failures).toContainEqual(
-        expect.stringMatching(/^skills\/deuz-sdk\/references\/api-index\.md:\d+ {2}is stale/),
-      );
-      // The copies are in step today; only the texts are behind.
-      expect(failures.filter((failure) => failure.includes('sync-skill-copy'))).toEqual([]);
-    },
-  );
 });
 
 describe('verify-skill: grading answers', () => {

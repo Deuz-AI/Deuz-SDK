@@ -1,12 +1,13 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
      sources: packages/core/src/{autonomy,plan,verify,workspace,compute,browser,runtime,evolve,schedule}.ts,
-     packages/core/src/evolve/*.ts, packages/core/src/schedule/*.ts, docs/content/docs/modules/{evolve,schedule}.mdx,
+     packages/core/src/evolve/*.ts, packages/core/src/schedule/*.ts, packages/core/src/goal/*.ts,
+     docs/content/docs/modules/{evolve,schedule,goals}.mdx,
      packages/core/src/node/{workspace,compute,browser,runtime}.ts, packages/core/src/inference/agent-tool.ts,
      packages/core/src/types/{config,workspace,compute,browser,runtime,stream,tool}.ts, docs/content/docs/modules/autonomy.mdx, docs/content/docs/cookbooks/{autonomous-agent,coding-agent}.mdx -->
 
 # Autonomous agents: plan, act, verify
 
-**Load when:** building an agent that runs for many steps without a human in the turn — it decomposes its own goal, executes code or drives a browser, decides whether it is finished, keeps state outside the context window, or runs in the background and needs to survive a crash. Also: evolutionary search over a program (`evolve`, 2.2) and starting runs from cron or webhooks (`/schedule`, 2.2).
+**Load when:** building an agent that runs for many steps without a human in the turn — it decomposes its own goal, executes code or drives a browser, decides whether it is finished, keeps state outside the context window, or runs in the background and needs to survive a crash. Also: evolutionary search over a program (`evolve`, 2.2), starting runs from cron or webhooks (`/schedule`, 2.2), and goals that wait for people, events or wakeups and complete only on evidence (`/goal`, 2.3).
 
 ## The shape
 
@@ -25,6 +26,7 @@ There is no agent class and no second runtime. An autonomous run is the ordinary
 | Quality bought with tokens | `bestOfN`, `selfConsistency`, `parallelAgents` | `/autonomy` |
 | Searching for a better program (2.2) | `evolve`, `resumeEvolve`, a `PopulationStore` | `/evolve`, `/evolve/sqlite` |
 | Starting work from time or a webhook (2.2) | `createScheduler`, `handleSignal`, webhook verifiers | `/schedule` |
+| A goal that outlives its runs: waits, wakeups, evidence-based completion (2.3) | `createGoal`, `transitionGoal`, `GoalStore` | `/goal` |
 
 ## Finishing: `doneWhen` runs before `verifyStep`
 
@@ -180,8 +182,8 @@ while (task) {
 `Workspace` is a small path-addressed store: `read`, `write`, `exists`, `list(prefix?)`, `delete`, plus optional `readBytes` / `writeBytes` for binaries. Three backends: `createInMemoryWorkspace({ now? })` (anywhere, edge-safe, deterministic — `modifiedAt` only when you pass `now`), `createFileWorkspace({ root })` (Node only, a sandboxed directory created on first write, throws on Edge), or your own — any KV/object store satisfies the six methods.
 
 - `normalizeWorkspacePath(rel)` is the guard every backend shares: it folds backslashes, strips a leading `./`, and throws `InvalidRequestError` on an absolute path, a `..` segment, a Windows drive letter, a UNC path, or a NUL byte. Call it first if you write your own backend — the model supplies these paths.
-- `createFileWorkspace` adds two more layers: lexical containment under `root`, and a `realpath` check so a symlink or NTFS junction inside the root cannot escape it.
-- `read` / `readBytes` **throw** on a missing path (filesystem semantics) — guard with `exists`. `delete` on a missing path is a no-op. `write` overwrites; there is no append.
+- `createFileWorkspace` adds two more layers: lexical containment under `root`, and a `realpath` check so a symlink or NTFS junction inside the root cannot escape it. A write never goes through a link that does not resolve (a dangling symlink or junction).
+- `read` / `readBytes` **throw** on a missing path (filesystem semantics) — guard with `exists`. `delete` on a missing path is a no-op. `write` overwrites; there is no append. An illegal path rejects from **every** method, `exists` and `delete` included (2.3: `createFileWorkspace` used to answer `false` / do nothing), and `createFileWorkspace` also rejects other filesystem errors (deleting a directory, `ELOOP`). Names that merely start with two dots (`..notes`, `...`) are ordinary files.
 - `createWorkspaceTools(workspace, { readOnly?, approveWrites? })` returns `readFile`, `writeFile`, `listFiles`, `deleteFile`. `readOnly: true` returns only `readFile` + `listFiles` (a research agent that must not mutate); `approveWrites: true` marks `writeFile` and `deleteFile` `needsApproval`. Parameters are raw JSON Schema — no zod peer needed.
 
 ## Compute / CodeAct — acting by writing code
@@ -198,6 +200,7 @@ The reliable way to make an agent *act* rather than describe an action is to let
 - A thrown sandbox becomes a self-healing `is_error` tool result the loop feeds back, so the model can switch strategy (Python missing → shell). Do not catch it yourself.
 - Only artifact **metadata** (`path`, `mime`) reaches the model; raw bytes never enter context. `stdout`/`stderr` are capped at `maxOutputChars` each with a visible truncation marker.
 - A sandbox without `runShell` makes `shellTool` report the limitation to the model as an error result rather than throwing out of the loop.
+- `stdin` (both methods) is written as UTF-8 and then closed; omitted, the process reads EOF at once (`createNodeSandbox` attaches the null device). There is no interactive input. On timeout/abort `createNodeSandbox` settles within ~0.5 s of the kill even if a grandchild still holds stdout; the grandchild is not killed.
 - `createNodeSandbox` built-ins: `python`/`python3` → `python3 -c`, `bash`/`sh`/`shell`, `javascript`/`js`/`node` → `node -e`. Override or extend via `interpreters`.
 
 > **`createNodeSandbox` is a reference, not a security sandbox.** It spawns model-authored code as a child process of the host, with the host's permissions — whatever the model writes, your machine runs, including deleting files, reading credentials, and opening outbound connections. `inheritEnv: false` (the default) keeps your API keys out of the child, `allowedLanguages` and `allowedCommands` (matched on the first shell token) bound what it may start, and `maxOutputBytes` bounds what comes back — those shrink the blast radius, they are not isolation. `needsApproval` gates *whether* a call runs, never *what it can reach* once allowed. For untrusted input or production, implement `ComputeSandbox` against Docker, E2B, Daytona, a microVM or a remote runner: the same two methods, a different backend, no other code changes.
@@ -418,7 +421,7 @@ console.log(result.status, result.reason, result.best?.id, result.best?.score); 
 - **Search.** `selection` (`'weighted'` default, `'power-law'`, `'beam'`, `{ boltzmann }`), `population` (`size`, `archiveSize`, `eliteRatio`, `exploreRatio`), `islands` (`{ count, migrationEvery, migrationRate, resetWeakestEvery? }`, ring migration), `novelty` (`{ embed, maxCosine = 0.99, judge? }`), `concurrency` (default 4). Several `models` are picked by a UCB1 bandit; `weight: 0` never picks one. Every draw is seeded: same `seed` + store + evaluators replays identically.
 - **Stops.** `budget` → `reason: 'budget'` (each mutation runs under a child execution scope named after its candidate, compacted per generation), `stopWhen.targetScore` → `'target'`, `stopWhen.plateau` → `'plateau'`, `handle.drain()` → `'drained'`, `handle.cancel()` / `signal` → `'cancelled'`, else `'generations'`.
 - **Resume.** Candidate IDs are `g{generation}-i{island}-s{slot}`, writes are idempotent and generations commit with a compare-and-set, so `resumeEvolve(sameOptions)` replays stored slots with **zero model calls** (`result.modelCalls`), and can extend a finished run with more `generations`. Resume refuses a changed `initial`, island count, `mutationsPerGeneration` or model count, and can only tighten the budget.
-- **Leases.** `lease: { provider, owner?, ttlMs? }` (a `LeaseProvider` from `/ops` or `/ops/sqlite`) keeps a second process off a run: it fails with `EvolveLeaseError` `code: 'held'`; an executor that loses its lease stops before its next write (`code: 'lost'`) without marking the run failed. Provider `cancel`/`drain` signals act like `handle.cancel()`/`drain()`.
+- **Leases.** `lease: { provider, owner?, ttlMs? }` (a `LeaseProvider` from `/ops`, `/ops/sqlite`, `/ops/postgres` or `/ops/redis`) keeps a second process off a run: it fails with `EvolveLeaseError` `code: 'held'`; an executor that loses its lease stops before its next write (`code: 'lost'`) without marking the run failed. Provider `cancel`/`drain` signals act like `handle.cancel()`/`drain()`.
 - **Safety.** The controller never executes a candidate; your evaluators do. Sandbox them (worker, container, remote runtime) — the code is model-written.
 
 ## Schedules and signals: starting work without a user (2.2)
@@ -458,9 +461,73 @@ export async function POST(request: Request): Promise<Response> {
 ```
 
 - `tick` never throws for your code: a failing `run` / `claim` is `{ status: 'failed', phase }` for that occurrence; a claim answering `false` is `'duplicate'`.
-- **Dedupe across processes needs a durable `claim`.** The default is an in-memory set (one process only). `createSqliteOpsStore(...).claims` and `createPostgresOpsStore(...).claims` are durable claims (a unique-insert table whose keys accumulate). A durable run store also works: use `occurrence.key` as the swarm `runId` and treat `SwarmConflictError` as "already claimed", with `claim: () => true`. A claim may carry `release(key)`: `handleSignal` calls it when `dispatch` throws, so the sender's retry is dispatched instead of dropped; the scheduler keeps a failed occurrence's claim (call `claim.release(occurrence.key)` in `run`'s catch to allow a retry).
+- **Dedupe across processes needs a durable `claim`.** The default is an in-memory set (one process only). `createSqliteOpsStore(...).claims`, `createPostgresOpsStore(...).claims` and (2.3) `createRedisOpsStore(...).claims` are durable claims whose keys accumulate until `claims.prune(before)` (2.3) deletes old ones, which can then be claimed again. A durable run store also works: use `occurrence.key` as the swarm `runId` and treat `SwarmConflictError` as "already claimed", with `claim: () => true`. A claim may carry `release(key)`: `handleSignal` calls it when `dispatch` throws, so the sender's retry is dispatched instead of dropped; the scheduler keeps a failed occurrence's claim (call `claim.release(occurrence.key)` in `run`'s catch to allow a retry).
 - `catchUp`: `'latest'` (default, newest due only), `'all'` (oldest first, capped by `maxCatchUp` = 100), `'none'` (newest only if within `graceMs`). A restarted process only sees `lookbackMs` (default 60 000); raise it together with a durable claim to recover missed occurrences.
 - Verifiers (`verifyGitHubWebhook`, `verifySlackRequest(req, secret, { now, toleranceSeconds })`, `verifyHmacSignature`) read the body once, use WebCrypto and constant-time comparison, and answer `{ ok: true, body }` or `{ ok: false, reason }`. `handleSignal` claims the key **before** dispatch: keep `dispatch` short (enqueue, or start a run whose `runId` is the key).
+
+## Goals, wakeups and events (2.3)
+
+`@deuz-sdk/core/goal` (edge-safe, pure) is the data contract for work that outlives one run: a versioned `GoalRecord` holding an objective, acceptance criteria, evidence, verdicts, a budget with what was spent, a deadline, and an explicit reason while it waits. Nothing in it runs a model, a timer or a service. You keep the records and move them with `transitionGoal(record, command, { now, expectedRevision? })`, the only way a record changes: it returns a new record one revision higher and never touches the one it was given.
+
+```ts
+import {
+  createGoal,
+  createInMemoryGoalStore,
+  goalEventFromSignal,
+  transitionGoal,
+} from '@deuz-sdk/core/goal';
+import type { GoalCommand, GoalRecord } from '@deuz-sdk/core/goal';
+
+const goals = createInMemoryGoalStore(); // your own GoalStore in production
+const t0 = Date.parse('2026-10-12T09:00:00Z');
+
+async function apply(goal: GoalRecord, command: GoalCommand, now: number): Promise<GoalRecord> {
+  const next = transitionGoal(goal, command, { now });
+  if (next.changed) await goals.save(next.record); // only the stored revision + 1 commits
+  return next.record;
+}
+
+let goal = createGoal(
+  {
+    goalId: 'fix-nightly',
+    scope: 'acme',
+    objective: 'Make the nightly build green.',
+    criteria: [{ id: 'build', description: 'The nightly build passes.' }],
+    budget: { usd: 5 },
+  },
+  { now: t0 },
+);
+await goals.save(goal); // revision 1
+
+const ci = { type: 'signal', id: 'ci' } as const;
+goal = await apply(goal, { type: 'wait', wait: { reason: 'event', source: ci } }, t0 + 1);
+// handleSignal's dispatch turns the CI delivery into an event with the same dedupe key.
+const event = goalEventFromSignal(
+  { key: 'delivery-812' },
+  { scope: 'acme', goalId: 'fix-nightly', name: 'ci', at: t0 + 60_000 },
+);
+goal = await apply(goal, { type: 'event', event }, t0 + 60_000); // active again
+
+goal = await apply(
+  goal,
+  {
+    type: 'evaluate',
+    evidence: [{ id: 'ci-812', source: 'test', ref: 'https://ci.example.com/runs/812' }],
+    results: [{ criterionId: 'build', verdict: 'passed', source: 'test', evidence: ['ci-812'] }],
+  },
+  t0 + 61_000,
+);
+goal = await apply(goal, { type: 'complete' }, t0 + 62_000);
+console.log(goal.status, goal.outcome?.reason); // completed accepted
+```
+
+- **Commands.** `wait`, `resume`, `event`, `evidence`, `evaluate`, `complete`, `fail`, `cancel`, `charge` (`{ usd?, tokens?, key? }`, what a run spent — its `accounting.spent`), `revise` (`null` removes the budget, the deadline or `meta`), `link-run` and `tick` (time alone). The result is `{ record, changed, outcome: 'applied' | 'ignored' | 'rejected', reason?, acceptance? }`; save when `changed`. A goal's own decisions (a duplicate event, a completion without evidence) come back as an outcome with a `reason`; a malformed record or command, an event for another goal or scope and a wrong `expectedRevision` throw `GoalError` (`invalid_goal`, `invalid_command`, `invalid_event`, `scope_mismatch`, `revision_conflict`, `unsupported_version`).
+- **Done only on evidence.** A `passed` verdict counts only when its `source` is not `'model'` and it rests on evidence whose source is not `'model'` (`test`, `artifact`, `human`, `verifier`, `tool`, `external`). The working model's own claim is recorded as `inconclusive`, and `complete` is refused with `'acceptance-not-passed'` until every required criterion passed that way. `assessGoal(record)` reports acceptance per criterion and overall.
+- **Waiting is explicit.** `waiting.reason` is `user`, `event`, `dependency`, `wakeup` or `budget`. Every wait has an `id` (default `<goalId>#<revision>`) and a `since`; an event answers it by carrying the `id` as `correlationId`, and an event answering an earlier wait, or older than this one, is `'stale'`. A dependency's completion is never stale by time, and a wait request may mark dependencies `settled: true` (a dependency wait whose dependencies have all settled leaves the goal active).
+- **Budget and deadline.** A `charge` that reaches a limit makes the goal wait with reason `budget`, keeping the wait it interrupted as `interrupted`: events, and a tick at a due wakeup, still answer that one, and a `revise` that raises the budget restores it with its `id` and `since`. The first transition at or after `deadline` fails the goal (`outcome.reason: 'deadline'`).
+- **Keys and dedupe.** A `GoalEvent`'s `key` shares one space with schedule occurrence keys (`<id>@<at>`) and `handleSignal` keys (a delivery ID or `sha256:<hex>` of the body): `goalEventFromOccurrence`, `goalEventFromSignal`, `goalWakeupEvent` (keyed `goalWakeupKey(goalId, at)`, `goal:<goalId>@<at>`) and `createGoalEvent` build them. A goal remembers its last 64 event keys in `seen` and its last 64 charge keys apart from them in `charged`, so a run's charge and its completion event may both be keyed by the run ID. Further back, claim the key durably before applying the event (the ops stores' `claims`).
+- **Persistence.** `GoalStore` is `{ load, save, list? }`: a save commits only at the stored revision plus one (1 for a new goal) and otherwise rejects with `revision_conflict`; `createInMemoryGoalStore()` is the reference. `parseGoal` / `serializeGoal` and `parseGoalEvent` / `serializeGoalEvent` read every version up to their own, keep fields a later 2.x release adds, and refuse a newer version with `unsupported_version`.
+- **Nothing fires a wakeup in 2.3.** A periodic job of yours lists waiting goals (`goals.list({ statuses: ['waiting'] })`), ticks the ones whose `waiting.at` is due and saves them. The revision-fenced save is the only coordination it needs: of several processes running the job at once, one save wins and the others get `revision_conflict` and leave the goal to the next pass. Resume the goal's run only after your own save went through. A running supervisor, a durable inbox and timezone-aware wakeups are 2.4 work.
 
 ## How the two cookbooks compose this
 
@@ -481,3 +548,4 @@ The **autonomous agent** keeps that skeleton and swaps in the autonomy seams: `p
 - [/docs/modules/react-hooks](/docs/modules/react-hooks) — `plan`, `activity`, `verifications` and `falseFinishes` in `useChat`.
 - [/docs/modules/evolve](/docs/modules/evolve) — patches, the evaluation cascade, islands, novelty, budget, durable resume.
 - [/docs/modules/schedule](/docs/modules/schedule) — cron syntax, catch-up, durable dedupe with a swarm run, webhook verification.
+- [/docs/modules/goals](/docs/modules/goals) — goal records, transitions, waiting reasons, acceptance on evidence, wakeup and event envelopes, the store contract.
