@@ -1377,15 +1377,16 @@ export function canonicalFromUI(ui: UIMessage[]): Message[] {
     }
     const cards = message.toolCalls ?? [];
     const own = cards.filter((c) => c.input !== undefined);
-    const open = openToolUses(out);
-    const earlier = cards.filter(
-      (c, index) =>
-        c.input === undefined &&
-        c.state === 'result' &&
-        open.has(c.toolCallId) &&
-        cards.findIndex((other) => other.toolCallId === c.toolCallId) === index,
-    );
-    if (earlier.length > 0) out.push(toolResultsOf(earlier));
+    const answering = cards.filter((c) => c.input === undefined && c.state === 'result');
+    if (answering.length > 0) {
+      const open = openToolUses(out);
+      const earlier = answering.filter(
+        (c, index) =>
+          open.has(c.toolCallId) &&
+          answering.findIndex((other) => other.toolCallId === c.toolCallId) === index,
+      );
+      if (earlier.length > 0) out.push(toolResultsOf(earlier));
+    }
     out.push({
       role: 'assistant',
       content: canonicalContentFromUI(
