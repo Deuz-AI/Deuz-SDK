@@ -554,6 +554,17 @@ export interface A2AExecutionContext {
   working(message?: A2AMessageInput, options?: A2AStatusOptions): Promise<void>;
   /** Add an artifact, or extend one (`append`). Resolves with the artifact's id. */
   artifact(artifact: A2AArtifactInput, options?: A2AArtifactOptions): Promise<string>;
+  /**
+   * Stream an artifact update to the clients following this turn without
+   * storing it (2.3): a preview, such as text while a model writes it, sent as
+   * an `artifactUpdate` (with `append`, it extends the previewed artifact).
+   * `GetTask`, a blocking `SendMessage` and a later `SubscribeToTask` never
+   * see it, and it does not answer a `returnImmediately` request. Store the
+   * finished content with `artifact` under the same `artifactId` to replace
+   * the preview. Needs the task, so make an update first. Resolves with the
+   * artifact's id.
+   */
+  draft(artifact: A2AArtifactInput, options?: { append?: boolean }): Promise<string>;
   /** `TASK_STATE_INPUT_REQUIRED`: ask the client; its next message starts a new turn. Ends the turn. */
   requireInput(message?: A2AMessageInput, options?: A2AStatusOptions): Promise<void>;
   /** `TASK_STATE_AUTH_REQUIRED`. The turn stays open, so the executor may continue once authorized. */

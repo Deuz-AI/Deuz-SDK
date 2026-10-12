@@ -374,6 +374,40 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
     return mutate(turn, change).then(() => artifactId);
   }
 
+  /**
+   * An artifact update for the streams following the turn alone: never
+   * stored, so it neither answers a request nor shows in the task.
+   */
+  function draft(
+    turn: Turn,
+    input: A2AArtifactInput,
+    draftOptions: { append?: boolean } = {},
+  ): Promise<string> {
+    if (!Array.isArray(input?.parts) || input.parts.length === 0) {
+      return Promise.reject(
+        new InvalidRequestError({ message: 'A draft needs at least one part.' }),
+      );
+    }
+    const artifactId = input.artifactId ?? deps.generateId();
+    return withLock(turn.key, async () => {
+      if (turn.ended) throw turnOver(turn);
+      if (turn.task === undefined) {
+        throw new InvalidRequestError({
+          message: 'A draft needs the task: make a status or artifact update first.',
+        });
+      }
+      announce(turn, {
+        artifactUpdate: {
+          taskId: turn.taskId,
+          contextId: turn.contextId,
+          artifact: structuredClone({ ...input, artifactId }),
+          ...(draftOptions.append ? { append: true } : {}),
+        },
+      });
+      return artifactId;
+    });
+  }
+
   function reply(turn: Turn, input: A2AMessageInput): Promise<void> {
     return withLock(turn.key, async () => {
       if (turn.ended) throw turnOver(turn);
@@ -412,6 +446,7 @@ export function createTaskRuntime(options: TaskRuntimeOptions) {
       reply: (message) => reply(turn, message),
       working: status('TASK_STATE_WORKING'),
       artifact: (artifact, artifactOptions) => addArtifact(turn, artifact, artifactOptions),
+      draft: (artifact, draftOptions) => draft(turn, artifact, draftOptions),
       requireInput: status('TASK_STATE_INPUT_REQUIRED'),
       requireAuth: status('TASK_STATE_AUTH_REQUIRED'),
       complete: status('TASK_STATE_COMPLETED'),

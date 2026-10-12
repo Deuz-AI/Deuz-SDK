@@ -1097,6 +1097,137 @@ describe('createA2AHandler — SendStreamingMessage', () => {
   });
 });
 
+describe('createA2AHandler — drafts', () => {
+  it('streams a draft to the turn’s streams and stores only the artifact that replaces it', async () => {
+    const drafted = gate();
+    const release = gate();
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.working();
+      const id = await ctx.draft({ artifactId: 'answer', parts: [{ text: 'Hel' }] });
+      await ctx.draft({ artifactId: id, parts: [{ text: 'lo' }] }, { append: true });
+      drafted.open();
+      await release.promise;
+      await ctx.artifact({ artifactId: id, parts: [{ text: 'Hello.' }] }, { lastChunk: true });
+      await ctx.complete();
+    });
+    const { id, response } = await rpcStream(handler, 'SendStreamingMessage', {
+      message: userMessage('hello'),
+    });
+    const reader = sseReader(response);
+    const task = ((await reader.next())?.data.result as { task: A2ATask }).task;
+    await drafted.promise;
+    // Nothing of the draft is stored: GetTask (and a blocking SendMessage) never see it.
+    const working = (await rpc(handler, 'GetTask', { id: task.id })).body.result as A2ATask;
+    expect(working.status.state).toBe('TASK_STATE_WORKING');
+    expect(working.artifacts ?? []).toEqual([]);
+    release.open();
+    const events = (await reader.rest()).map(({ data }) => {
+      expect(data).toMatchObject({ jsonrpc: '2.0', id });
+      return data.result;
+    });
+    expect(events).toEqual([
+      {
+        statusUpdate: expect.objectContaining({
+          status: expect.objectContaining({ state: 'TASK_STATE_WORKING' }),
+        }),
+      },
+      {
+        artifactUpdate: {
+          taskId: task.id,
+          contextId: task.contextId,
+          artifact: { artifactId: 'answer', parts: [{ text: 'Hel' }] },
+        },
+      },
+      {
+        artifactUpdate: {
+          taskId: task.id,
+          contextId: task.contextId,
+          artifact: { artifactId: 'answer', parts: [{ text: 'lo' }] },
+          append: true,
+        },
+      },
+      {
+        artifactUpdate: {
+          taskId: task.id,
+          contextId: task.contextId,
+          artifact: { artifactId: 'answer', parts: [{ text: 'Hello.' }] },
+          lastChunk: true,
+        },
+      },
+      {
+        statusUpdate: expect.objectContaining({
+          status: expect.objectContaining({ state: 'TASK_STATE_COMPLETED' }),
+        }),
+      },
+    ]);
+    const done = (await rpc(handler, 'GetTask', { id: task.id })).body.result as A2ATask;
+    expect(done.artifacts).toEqual([{ artifactId: 'answer', parts: [{ text: 'Hello.' }] }]);
+  });
+
+  it('streams drafts to a client that subscribed while the turn runs', async () => {
+    const release = gate();
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.working();
+      await release.promise;
+      await ctx.draft({ artifactId: 'answer', parts: [{ text: 'draft' }] });
+      await ctx.complete();
+    });
+    const task = (
+      (await send(handler, 'hello', {}, { returnImmediately: true })).result as { task: A2ATask }
+    ).task;
+    const { response } = await rpcStream(handler, 'SubscribeToTask', { id: task.id });
+    const reader = sseReader(response);
+    await reader.next(); // the snapshot
+    release.open();
+    const events = (await reader.rest()).map(({ data }) => data.result);
+    expect(events[0]).toEqual({
+      artifactUpdate: {
+        taskId: task.id,
+        contextId: task.contextId,
+        artifact: { artifactId: 'answer', parts: [{ text: 'draft' }] },
+      },
+    });
+  });
+
+  it('needs the task and at least one part, and generates an id when none is given', async () => {
+    const outcomes: unknown[] = [];
+    const { handler } = handlerWith(async (ctx) => {
+      outcomes.push(
+        await ctx.draft({ parts: [{ text: 'too early' }] }).catch((error: unknown) => error),
+      );
+      await ctx.working();
+      outcomes.push(await ctx.draft({ parts: [] }).catch((error: unknown) => error));
+      outcomes.push(await ctx.draft({ parts: [{ text: 'ok' }] }));
+      await ctx.complete();
+    });
+    await send(handler, 'hello');
+    expect(outcomes[0]).toBeInstanceOf(InvalidRequestError);
+    expect(outcomes[1]).toBeInstanceOf(InvalidRequestError);
+    expect(outcomes[2]).toEqual(expect.any(String));
+  });
+
+  it('rejects a draft once the turn ended', async () => {
+    let late: Promise<unknown> | undefined;
+    const { handler } = handlerWith(async (ctx) => {
+      await ctx.complete();
+      late = ctx.draft({ parts: [{ text: 'late' }] }).catch((error: unknown) => error);
+    });
+    await send(handler, 'hello');
+    expect(await late).toMatchObject({ reason: 'UNSUPPORTED_OPERATION' });
+  });
+
+  it('does not answer a non-blocking follow-up: a refusal after a draft still reaches the client', async () => {
+    const { handler } = handlerWith(async (ctx) => {
+      if (!ctx.task) return ctx.requireInput('Which city?');
+      await ctx.draft({ artifactId: 'answer', parts: [{ text: 'thinking' }] });
+      throw new A2AError({ reason: 'INVALID_PARAMS', message: 'Name a city.' });
+    });
+    const asked = ((await send(handler, 'weather?')).result as { task: A2ATask }).task;
+    const refused = await send(handler, '42', { taskId: asked.id }, { returnImmediately: true });
+    expect(refused.error).toMatchObject({ code: -32602, message: 'Name a city.' });
+  });
+});
+
 describe('createA2AHandler — SubscribeToTask', () => {
   it('streams a running task from a snapshot to the end of its turn', async () => {
     const release = gate();

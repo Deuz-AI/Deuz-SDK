@@ -128,6 +128,7 @@ const handler = createA2AHandler({
 | `reply(message)` | Answer with a single message and **no task** — a new interaction only, before any update. |
 | `working(message?)` | `TASK_STATE_WORKING`, with an optional progress message. |
 | `artifact(artifact, { append?, lastChunk? })` | Add an artifact, or extend one with `append`; resolves with the artifact's id. |
+| `draft(artifact, { append? })` | Stream an artifact update to the clients following the turn **without storing it**: a preview, such as text while a model writes it. `GetTask`, a blocking `SendMessage` and a later subscription never see it. Store the finished content with `artifact` under the same `artifactId`; it replaces the preview. |
 | `requireInput(message?)` | `TASK_STATE_INPUT_REQUIRED`: ask the client. Its next message starts the next turn. |
 | `requireAuth(message?)` | `TASK_STATE_AUTH_REQUIRED`. The turn stays open, so the executor may carry on once authorized. |
 | `complete`, `fail`, `reject` (`message?`) | The terminal states `COMPLETED`, `FAILED`, `REJECTED`. |
@@ -216,6 +217,8 @@ const handler = createA2AHandler({
 ### Streaming and subscriptions
 
 `SendStreamingMessage` answers with Server-Sent Events: one `message` event (a `reply`), or the task's lifecycle — the `task` snapshot, then its `statusUpdate` and `artifactUpdate` events — until the turn ends. A refusal found before the first event (an unknown task, an `A2AError` the executor raises itself) is answered as a plain error rather than a stream. A failure after it arrives as a `FAILED` status update, or — when the executor refuses a follow-up message after its snapshot was sent — as an `event: error` carrying the A2A error; that snapshot showed the message in the task's history, the stored task no longer has it.
+
+A `draft` goes only to the streams attached when it is sent; it is never part of the stored task.
 
 `SubscribeToTask` re-attaches to a task: the stored snapshot first, then the events of its running turn until that turn ends. A task with no running turn (one waiting for input) yields its snapshot alone; a finished task is refused with `UNSUPPORTED_OPERATION`. A client that disconnects does not stop the task — it can subscribe again, or poll `GetTask`.
 
