@@ -195,8 +195,8 @@ export const fallbackBudgetSettlement: EvalTaskManifest = {
   // Documented (native-agents.mdx, Model fail-over; budgets.mdx, Models
   // without a price and Open holds): every attempt is admitted against the run's
   // execution; the failed one stays held at its estimate; a fallback with no
-  // price warns once and runs, its tokens counted and its cost left out; each
-  // call is settled once, and a resume reserves its calls anew.
+  // price warns (once per leg) and runs, its tokens counted and its cost left
+  // out; each call is settled once, and a resume reserves its calls anew.
   fault: { boundary: 'fallback-budget-settlement', recovery: 'settled-across-resume' },
   acceptance: [
     { name: 'completes', check: (outcome) => outcome.status === 'completed' },
@@ -231,10 +231,14 @@ export const fallbackBudgetSettlement: EvalTaskManifest = {
         ]),
     },
     {
-      name: 'the fallback without a price warned once and went on',
+      // The warning sink lives with the leg: the resumed leg reports it again.
+      name: 'the fallback without a price warned once in each leg and went on',
       check: (outcome, context) =>
         JSON.stringify(context.store.unpricedWarnings) ===
-          JSON.stringify(['budget.usd: acme-local-7b']) &&
+          JSON.stringify({
+            first: ['budget.usd: acme-local-7b'],
+            resumed: ['budget.usd: acme-local-7b'],
+          }) &&
         outcome.accounting?.unpriced === (context.store.calls as { fallback: number }).fallback,
     },
     {
@@ -322,8 +326,10 @@ export const fallbackBudgetSettlement: EvalTaskManifest = {
       warnings
         .filter((warning) => warning.type === 'unpriced-model')
         .map((warning) => `${warning.setting}: ${warning.message.split(' ')[0]}`);
-    context.store.unpricedWarnings = unpriced(first.warnings);
-    context.artifact('resumedLegUnpricedWarnings', unpriced(resumed.warnings));
+    context.store.unpricedWarnings = {
+      first: unpriced(first.warnings),
+      resumed: unpriced(resumed.warnings),
+    };
     context.store.calls = { primary: primary.wire.calls(), fallback: fallback.calls() };
     context.store.ledger = ((await durable.load('r'))?.execution?.ledger.reservations ?? []).map(
       (entry) => ({
