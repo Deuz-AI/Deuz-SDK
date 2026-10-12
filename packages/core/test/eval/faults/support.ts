@@ -19,18 +19,11 @@ import {
 import { attachConfig, readConfig } from '../../../src/internal/config-symbol';
 import { createAnthropic } from '../../../src/anthropic';
 import { createOpenAI } from '../../../src/openai';
-import {
-  createInMemoryMemoryStore,
-  type MemoryQuery,
-  type MemoryRecord,
-  type MemorySeams,
-  type MemoryStore,
-} from '../../../src/memory';
 import type { AgentRunEnvelope, AgentRunStore } from '../../../src/types/agent-run';
 import type { LanguageModel } from '../../../src/types/model';
 import { openaiTurn, scriptedFetch, type ScriptStep } from '../../fixtures/wire-turns';
 
-export { mockPrices, parameters, scripted } from '../support';
+export { memoryRecord, mockPrices, parameters, scripted, watchedMemory } from '../support';
 
 /** What one default mock turn bills: 10 input + 5 output tokens at the mock prices. */
 export const TURN = { tokens: 15, usd: (10 * 1 + 5 * 4) / 1_000_000 };
@@ -149,46 +142,4 @@ export function openaiAnswering(modelId: string, answer: (body: string) => strin
 /** A Chat Completions turn that bills what a mock turn bills: 10 input + 5 output tokens. */
 export function gptTurn(turn: Parameters<typeof openaiTurn>[0]): string {
   return openaiTurn(turn, { prompt_tokens: 10, completion_tokens: 5 });
-}
-
-/**
- * Memory seams on an in-memory store seeded with `seed`, recording every
- * search and every write. Its LLM extracts `facts` and adds each of them.
- */
-export async function watchedMemory(seed: MemoryRecord[], facts: string[] = []) {
-  const inner = createInMemoryMemoryStore();
-  await inner.upsert(seed);
-  const searches: MemoryQuery[] = [];
-  const writes: MemoryRecord[] = [];
-  let llmCalls = 0;
-  const store: MemoryStore = {
-    ...inner,
-    search: (query) => {
-      searches.push(structuredClone(query));
-      return inner.search(query);
-    },
-    upsert: (records) => {
-      writes.push(...structuredClone(records));
-      return inner.upsert(records);
-    },
-  };
-  let ids = 0;
-  const seams: MemorySeams = {
-    store,
-    llm: async ({ system }) => {
-      llmCalls += 1;
-      return system.includes('extract')
-        ? JSON.stringify({ facts })
-        : JSON.stringify({ memory: facts.map((text) => ({ event: 'ADD', text })) });
-    },
-    clock: { now: () => 5_000, setTimeout: (fn: () => void) => (fn(), () => {}) },
-    generateId: () => `memory-${ids++}`,
-    hashFn: async (text) => `h:${text}`,
-  };
-  return { seams, store: inner, searches, writes, llmCalls: () => llmCalls };
-}
-
-/** One seeded memory record. */
-export function memoryRecord(id: string, text: string, scope: MemoryRecord['scope']): MemoryRecord {
-  return { id, text, hash: `h:${text}`, kind: 'semantic', scope, createdAt: 1, updatedAt: 1 };
 }
