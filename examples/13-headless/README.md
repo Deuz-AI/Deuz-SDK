@@ -59,7 +59,7 @@ Every command also takes `--json` and `--db <file>`.
 | 3 | pending: waiting for an approval, a client tool result, a decision on an unknown effect, or a resume |
 | 4 | refused by the model |
 | 5 | cancelled |
-| 6 | a budget, step, deadline or timeout limit stopped it |
+| 6 | a budget, step, deadline or timeout limit stopped it (a transport timeout also carries `retry`, like a failure in transit) |
 | 7 | stopped short for another reason (a guardrail, the verifier, a cut-off output) |
 | 8 | `doctor` found errors |
 

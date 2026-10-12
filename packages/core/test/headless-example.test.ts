@@ -117,6 +117,17 @@ describe('examples/13-headless', () => {
     const missing = await cli('resume', 'tag-1', '--reconcile', join(dir, 'missing.json'));
     expect(missing.code).toBe(2);
     expect((await cli('inspect', 'tag-1')).code).toBe(3);
+    // JSON that holds no answers is passed on, so the resume refuses it (exit 1)
+    // instead of quietly resuming without them; nothing is written.
+    const empty = join(dir, 'null.json');
+    await writeFile(empty, 'null');
+    const refused = await cli('resume', 'tag-1', '--reconcile', empty);
+    expect(refused.code).toBe(1);
+    expect(refused.json).toMatchObject({
+      outcome: 'failed',
+      error: { name: 'TypeError', message: expect.stringContaining('reconciledToolResults') },
+    });
+    expect((await cli('inspect', 'tag-1')).code).toBe(3);
 
     const landed = join(dir, 'landed.json');
     await writeFile(landed, JSON.stringify([{ toolCallId: 'call_1', output: { tag: 'v2.3.0' } }]));

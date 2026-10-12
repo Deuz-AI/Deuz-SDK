@@ -183,7 +183,7 @@ const outage: BreakerStore = {
 async function recorded(
   file: string,
 ): Promise<{ toolCallId: string; output: unknown; isError?: boolean }[]> {
-  // The resume checks every entry against the run before it writes anything.
+  // Passed on as it is: the resume checks it against the run before it writes anything.
   return JSON.parse(await readFile(resolve(here, file), 'utf-8'));
 }
 
@@ -284,7 +284,10 @@ if (command === 'doctor') {
     } else {
       // The answers: verdicts for the approvals the stored run waits for, calls
       // to run again, results that landed, a retry of a failure in transit.
-      const reconciled = values.reconcile ? await recorded(values.reconcile) : undefined;
+      const reconciled =
+        values.reconcile !== undefined
+          ? { reconciledToolResults: await recorded(values.reconcile) }
+          : {};
       const waiting = await inspectRun(ops.agentRuns, argument!);
       const verdicts = waiting.pending.flatMap((action) =>
         action.kind === 'approval' && (values.approve || values.deny)
@@ -302,7 +305,7 @@ if (command === 'doctor') {
           ...(skills ? { skills } : {}),
           approvalResponses: verdicts,
           ...(values['retry-call'] ? { retryToolCallIds: values['retry-call'] } : {}),
-          ...(reconciled ? { reconciledToolResults: reconciled } : {}),
+          ...reconciled,
           ...(values['retry-failed'] ? { retryFailed: true } : {}),
           onEvent,
         }),
