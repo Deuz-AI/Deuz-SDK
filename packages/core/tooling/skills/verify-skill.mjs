@@ -10,11 +10,13 @@
  * `tooling/verify-docs.mjs` builds), it checks SKILL.md and references/*.md:
  *
  *   1. names: every `import { … } from '@deuz-sdk/…'` resolves name by name;
- *      every quoted or backticked `@deuz-sdk/…` subpath exists; every name the
- *      prose attributes to a subpath (`name` from|on `@deuz-sdk/…`) is exported
- *      there. A bare backticked word is not taken for an API name: options,
- *      fields, methods and other libraries' names share that notation. Fences
- *      tagged `no-verify` (deliberate fragments) are skipped.
+ *      every quoted or backticked `@deuz-sdk/<package>[/<subpath>]` exists, so
+ *      a package other than core and react, or a dynamic `import('…')` of
+ *      one, fails too; every name the prose attributes to a subpath (`name`
+ *      from|on `@deuz-sdk/…`) is exported there. A bare backticked word is not
+ *      taken for an API name: options, fields, methods and other libraries'
+ *      names share that notation. Fences tagged `no-verify` (deliberate
+ *      fragments) are skipped.
  *   2. freshness: every file carries a stamp
  *      `@deuz-sdk/core@<version> · api-contract sha256:<12 hex>` naming the
  *      current package version and tooling/api-contract.json hash, so a release
@@ -41,7 +43,10 @@ const SYNC_COMMAND = 'node packages/core/tooling/skills/sync-skill-copy.mjs --wr
 const STAMP = /@deuz-sdk\/core@([^\s·`]+)\s*·\s*api-contract sha256:([0-9a-f]+)/g;
 const STAMP_SHAPE = '"@deuz-sdk/core@<version> · api-contract sha256:<12 hex>"';
 const IMPORT = /\b(?:import|export)\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"](@deuz-sdk\/[^'"]+)['"]/g;
-const MENTION = /(['"`])(@deuz-sdk\/(?:core|react)(?:\/[\w./-]+)?)\1/g;
+/** Any package of the scope; a version (`@deuz-sdk/core@2.3.0`) never matches. */
+const MENTION = /(['"`])(@deuz-sdk\/[\w.-]+(?:\/[\w./-]+)?)\1/g;
+/** The specifiers MENTION reads, whole. */
+const SPECIFIER = /^@deuz-sdk\/[\w.-]+(?:\/[\w./-]+)?$/;
 const ATTRIBUTION = /`([A-Za-z_$][\w$]*)(?:\([^`]*\))?`\s+\(?(?:from|on)\s+`(@deuz-sdk\/[^`\s]+)`/g;
 /** Specifiers the package serves that are not modules. */
 const NON_MODULES = new Set(['@deuz-sdk/core/package.json', '@deuz-sdk/react/package.json']);
@@ -93,7 +98,13 @@ function checkNames(source, table, stats, report) {
 
   for (const m of text.matchAll(ATTRIBUTION)) {
     const names = modules.get(m[2]);
-    if (!names) continue; // an unknown subpath is reported as a mention above
+    if (!names) {
+      // A specifier of MENTION's shape was reported as a mention above.
+      if (!SPECIFIER.test(m[2])) {
+        report(lineAt(text, m.index), `attributes "${m[1]}" to unknown subpath "${m[2]}"`);
+      }
+      continue;
+    }
     stats.attributions++;
     if (!names.has(m[1])) report(lineAt(text, m.index), `"${m[1]}" is not exported by ${m[2]}`);
   }

@@ -200,6 +200,30 @@ describe('verify-skill: names', () => {
     ]);
   });
 
+  it('fails on a mention of a @deuz-sdk package that does not exist (only core and react do)', () => {
+    const fixture = freshSkill();
+    editBoth(fixture, 'references/core.md', '`@deuz-sdk/core/ui`', '`@deuz-sdk/ui`');
+    expect(run(fixture).failures).toEqual([
+      'skills/deuz-sdk/references/core.md:11  mentions unknown subpath "@deuz-sdk/ui"',
+    ]);
+  });
+
+  it('fails on a name attributed to a package that does not exist, once', () => {
+    const fixture = freshSkill();
+    editBoth(fixture, 'SKILL.md', '`@deuz-sdk/core/agent`', '`@deuz-sdk/agent`');
+    expect(run(fixture).failures).toEqual([
+      'skills/deuz-sdk/SKILL.md:8  mentions unknown subpath "@deuz-sdk/agent"',
+    ]);
+  });
+
+  it('fails on a name attributed to a specifier no module can have', () => {
+    const fixture = freshSkill();
+    editBoth(fixture, 'SKILL.md', '`@deuz-sdk/core/agent`', '`@deuz-sdk/core/agent@2.3.0`');
+    expect(run(fixture).failures).toEqual([
+      'skills/deuz-sdk/SKILL.md:8  attributes "runAgent" to unknown subpath "@deuz-sdk/core/agent@2.3.0"',
+    ]);
+  });
+
   it('skips a fence tagged no-verify, and only that fence', () => {
     const fixture = freshSkill();
     const fences = [
@@ -444,6 +468,26 @@ describe('verify-skill: grading answers', () => {
       'nested/bad.md:2  "defineTool" is not exported by @deuz-sdk/core',
       'nested/bad.md:3  imports from unknown subpath "@deuz-sdk/core/client"',
       'route.ts:1  "toStreamResponse" is not exported by @deuz-sdk/core/ui',
+    ]);
+  });
+
+  it('reports invented @deuz-sdk packages however an answer names them', () => {
+    const answers = join(scratch, `answers-${counter++}`);
+    writeTree(answers, {
+      'mention.md': 'Install `@deuz-sdk/headless` and run it.\n',
+      'dynamic.ts': "const cli = await import('@deuz-sdk/headless');\n",
+      'require.cjs': "const { runHeadless } = require('@deuz-sdk/cli');\n",
+      'attribution.md': 'Use `runHeadless` from `@deuz-sdk/cli`.\n',
+      'control.md':
+        'See `@deuz-sdk/core/headles`, or `runHeadless` from `@deuz-sdk/core/headless`.\n',
+      'versions.md': 'Pin `@deuz-sdk/core@2.3.0` and `@deuz-sdk/react@2.3.0`.\n',
+    });
+    expect(verify.verifyAnswers(answers, { table }).failures).toEqual([
+      'attribution.md:1  mentions unknown subpath "@deuz-sdk/cli"',
+      'control.md:1  mentions unknown subpath "@deuz-sdk/core/headles"',
+      'dynamic.ts:1  mentions unknown subpath "@deuz-sdk/headless"',
+      'mention.md:1  mentions unknown subpath "@deuz-sdk/headless"',
+      'require.cjs:1  mentions unknown subpath "@deuz-sdk/cli"',
     ]);
   });
 });
