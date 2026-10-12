@@ -99,7 +99,8 @@ function checkNames(source, table, stats, report) {
   for (const m of text.matchAll(ATTRIBUTION)) {
     const names = modules.get(m[2]);
     if (!names) {
-      // A specifier of MENTION's shape was reported as a mention above.
+      // MENTION checked a specifier of its shape above (and reported it unless it is
+      // a non-module); any other specifier is reported here, so none passes unchecked.
       if (!SPECIFIER.test(m[2])) {
         report(lineAt(text, m.index), `attributes "${m[1]}" to unknown subpath "${m[2]}"`);
       }
