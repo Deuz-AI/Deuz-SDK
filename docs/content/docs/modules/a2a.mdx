@@ -450,7 +450,7 @@ A stopped run puts its task in `INPUT_REQUIRED`. What the client does next depen
 
 A failed run fails the task. A resume that fails before it begins, having written nothing, refuses the message instead, and the task keeps waiting: `UNSUPPORTED_OPERATION` while another executor holds the run's [lease](#identity-and-several-instances) (send the message again later), `INTERNAL_ERROR` otherwise (the run's definition changed, or its store could not be read).
 
-What the client reads never carries an error's message, which can name a provider account, a database host or a user. A failed task's text names the error by its code, or its name (`The agent run failed (rate_limit).`); a refused resume says that another executor drives the run, or names the error the same way; and a task store that fails an update fails the task with `The agent could not update the task.` To word the first two yourself, from the whole error, pass `failureMessage`.
+By default, what the client reads never carries an error's message, which can name a provider account, a database host or a user. A failed task's text names the error by its code, or its name (`The agent run failed (rate_limit).`); a refused resume says that another executor drives the run, or names the error the same way; and a task store that fails an update fails the task with `The agent could not update the task.` To word the first two yourself, from the whole error, pass `failureMessage`.
 
 ### The run's options
 
