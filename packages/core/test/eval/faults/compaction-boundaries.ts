@@ -37,7 +37,8 @@ const isSummary = (request: ClaudeRequest) =>
   JSON.stringify(request.messages).includes('Output only the summary') ||
   JSON.stringify(request.messages).includes('Output only the updated summary');
 
-const signatures = (request: ClaudeRequest) =>
+/** The thinking signatures a request replays, as they appear in its body. */
+const signatures = (request: ClaudeRequest): string[] =>
   JSON.stringify(request.messages).match(/"signature":"[^"]+"/g) ?? [];
 
 export const compactionPreservedThinking: EvalTaskManifest = {
