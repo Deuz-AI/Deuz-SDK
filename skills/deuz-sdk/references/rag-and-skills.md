@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:d0398bbef8c4
      sources: packages/core/src/{rag.ts, rag-node.ts, skills.ts, skills/node.ts, parts.ts, ui.ts, voyage.ts, node/store-postgres.ts},
      packages/core/src/internal/rerank-http.ts, packages/core/src/node/headless.ts,
      packages/core/src/types/{tool.ts, stream.ts, methods.ts, message.ts},

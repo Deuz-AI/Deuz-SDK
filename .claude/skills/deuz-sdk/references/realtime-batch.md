@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:3b9611faf697
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:d0398bbef8c4
      sources: packages/core/src/realtime/{index,session,types,models,tokens,tools,usage,errors,websocket}.ts,
      packages/core/src/batch/{index,client,types,budget,store,errors,prepare,parse}.ts, packages/core/src/pricing.ts,
      docs/content/docs/modules/{realtime,batch,pricing,budgets}.mdx -->
