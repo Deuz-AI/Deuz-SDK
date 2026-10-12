@@ -27,7 +27,7 @@ import { runAgent } from '../src/agent-run';
 import { parseReply } from '../src/batch/parse';
 import { applyUIPart, createAssistantTurn, type AssistantTurnState } from '../src/chat';
 import { readDeuzStream, toDeuzStreamResponse, type DeuzUIPart } from '../src/ui';
-import { mockFetchSequence, sseResponse } from './fixtures/sse';
+import { mockFetchSequence, sseEvents, sseResponse } from './fixtures/sse';
 import { chatTurn, responsesTurn } from './fixtures/provider-finish';
 import type { LanguageModel } from '../src/types/model';
 import type { StreamPart } from '../src/types/stream';
@@ -216,15 +216,17 @@ describe('what is and is not a refusal', () => {
   });
 
   it('a limit the provider reported stays: a refusal cut off by length ends with length', async () => {
-    const chat = chatTurn({ refusal: ['I can’t'], finish: 'length' });
-    const result = await generateText({
-      model: scripted(WIRES['Chat Completions']!, chat).model,
-      messages,
-    });
-    expect(result).toMatchObject({
-      finishReason: 'length',
-      stopDetails: { type: 'refusal', explanation: 'I can’t' },
-    });
+    const cases: [Wire, string][] = [
+      [WIRES['Chat Completions']!, chatTurn({ refusal: ['I can’t'], finish: 'length' })],
+      [WIRES.Responses!, responsesTurn({ refusal: ['I can’t'], incomplete: 'max_output_tokens' })],
+    ];
+    for (const [wire, turn] of cases) {
+      const result = await generateText({ model: scripted(wire, turn).model, messages });
+      expect(result).toMatchObject({
+        finishReason: 'length',
+        stopDetails: { type: 'refusal', explanation: 'I can’t' },
+      });
+    }
   });
 
   it('Responses keeps the message phase beside the refusal', async () => {
@@ -234,6 +236,88 @@ describe('what is and is not a refusal', () => {
     expect(finish).toMatchObject({
       providerMetadata: { openai: { phase: 'final_answer', refusal: TEXT } },
     });
+  });
+});
+
+// A refusal whose stream closes cleanly before its end, as a proxy may close
+// it (K4 review V7-1): Chat Completions without a `finish_reason`, Responses
+// without its terminal `response.completed` or `response.incomplete`. The
+// refusal is known all the same, so the turn ends with `content_filter`.
+describe('a refusal the stream cuts off before its end', () => {
+  /** A Chat Completions refusal cut off: no `finish_reason`, no usage chunk, no `[DONE]`. */
+  const chatCut = sseEvents(
+    [{ role: 'assistant', content: '', refusal: null }, { refusal: TEXT }].map((delta) => ({
+      data: {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        created: 0,
+        choices: [{ index: 0, delta, finish_reason: null }],
+      },
+    })),
+  );
+
+  /** The Responses turn without its last event, the terminal `response.completed`. */
+  function cutBeforeTerminal(turn: string): string {
+    const at = turn.lastIndexOf('event: response.completed');
+    expect(at).toBeGreaterThan(0);
+    return turn.slice(0, at);
+  }
+
+  it('ends with content_filter and the explanation on both wires', async () => {
+    const cases: [string, Wire, string][] = [
+      ['Chat Completions', WIRES['Chat Completions']!, chatCut],
+      ['Responses', WIRES.Responses!, cutBeforeTerminal(responsesTurn({ refusal: [TEXT] }))],
+    ];
+    const seen: Record<string, unknown> = {};
+    for (const [name, wire, turn] of cases) {
+      const result = streamChat({ model: scripted(wire, turn).model, messages });
+      const parts = await collect(result.fullStream);
+      seen[name] = {
+        finishReason: await result.finishReason,
+        stopDetails: await result.stopDetails,
+        text: parts.some((p) => p.type === 'text-delta' && p.text !== ''),
+      };
+    }
+    expect(seen).toEqual({
+      'Chat Completions': { finishReason: 'content_filter', stopDetails: REFUSAL, text: false },
+      Responses: { finishReason: 'content_filter', stopDetails: REFUSAL, text: false },
+    });
+  });
+
+  it('Responses: the refused turn dispatches none of its calls', async () => {
+    const wire = WIRES.Responses!;
+    const turn = cutBeforeTerminal(
+      responsesTurn({ refusal: [TEXT], call: { args: '{"city": "Rome"}' } }),
+    );
+    const execute = vi.fn(() => ({ temp: 20 }));
+    const parameters = { type: 'object' as const, properties: { city: { type: 'string' } } };
+    const { model, calls } = scripted(wire, turn, wire.answer);
+    const result = await generateText({
+      model,
+      messages,
+      tools: { get_weather: { parameters, execute } },
+      maxSteps: 3,
+    });
+    expect({
+      executed: execute.mock.calls.length,
+      requests: calls.length,
+      finishReason: result.finishReason,
+      steps: result.steps?.map((s) => [s.finishReason, s.stopDetails?.type]),
+    }).toEqual({
+      executed: 0,
+      requests: 1,
+      finishReason: 'content_filter',
+      steps: [['content_filter', 'refusal']],
+    });
+  });
+
+  it('Responses: a native run stops with reason refusal instead of completing', async () => {
+    const wire = WIRES.Responses!;
+    const turn = cutBeforeTerminal(responsesTurn({ refusal: [TEXT] }));
+    const { model, calls } = scripted(wire, turn, wire.answer);
+    const result = await runAgent({ model, prompt: 'x' });
+    expect(result).toMatchObject({ status: 'stopped', reason: 'refusal', stopDetails: REFUSAL });
+    expect(calls).toHaveLength(1);
   });
 });
 
