@@ -150,6 +150,10 @@ What the bridge guarantees:
   the run id) and every leg numbers on from the last one, so a client resumes from
   its cursor through `resumeDeuzStreamResponse`. Without a store, a response
   cannot be replayed.
+- **One writer per stream.** A run has one executor at a time. A leg the run
+  refuses before it begins (a second resume while it executes, a run id stored
+  under another scope, an unknown run) goes out on its own response only, without
+  event ids: its client sees the failure, and the run's journal stays as it was.
 - **Resume in one request.** `resumeStreamAgent` proceeds only with a verdict for
   every pending approval and a result for every pending client call, so a client
   sends `runId` with both together. `useChat` does this for you.

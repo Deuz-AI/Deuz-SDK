@@ -377,6 +377,13 @@ export async function POST(req: Request): Promise<Response> {
   const scope = 'tenant-a'; // the signed-in user's tenant, never a field of the body
   const resuming = typeof rest.runId === 'string';
   const runId = resuming ? (rest.runId as string) : crypto.randomUUID();
+  if (resuming) {
+    // Only this user's run, and only while it waits for answers: another tenant's
+    // runId, a second tab or a double submit is refused before a leg starts.
+    const stored = await runs.load(runId);
+    if (stored?.scope !== scope) return new Response('Unknown run', { status: 404 });
+    if (stored.result?.status !== 'suspended') return new Response('Not waiting', { status: 409 });
+  }
   const session = { store: runs, runId, scope };
   const stream = resuming
     ? resumeStreamAgent({
@@ -399,7 +406,7 @@ export async function POST(req: Request): Promise<Response> {
 }
 ```
 
-A resume reads the run's history from the store, not from the posted `messages`, and `resumeStreamAgent` refuses a `runId` stored under another `scope`, so take the scope from your authentication. A client result passes the same validation and projection path as a server tool's result. To let a client reconnect, serve `resumeDeuzStreamResponse(streams, runId, { lastEventId })` from a GET route (after checking that the user owns `runId`) and point `resume.endpoint` at it.
+A resume reads the run's history from the store, not from the posted `messages`, and `resumeStreamAgent` refuses a `runId` stored under another `scope`, so take the scope from your authentication. The route checks both before it resumes: a run is stored without a `result` while a leg executes, so a second tab or a double submit gets a 409, and `useChat` shows it as an error. A request that gets past the check anyway (two arriving at once) is refused by the run itself, and `toDeuzAgentStreamResponse` keeps such a [refused leg out of the journal](/docs/modules/ui-streaming#sequence-and-replay): its client sees the failure, and the leg that runs keeps its event ids. A client result passes the same validation and projection path as a server tool's result. To let a client reconnect, serve `resumeDeuzStreamResponse(streams, runId, { lastEventId })` from a GET route (after checking that the user owns `runId`) and point `resume.endpoint` at it.
 
 ```tsx title="AgentChat.tsx"
 'use client';
