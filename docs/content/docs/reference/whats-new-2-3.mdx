@@ -75,11 +75,15 @@ sampling requests. See
 [One path for every tool call](/docs/modules/native-agents#one-path-for-every-tool-call).
 
 - **Refused and cut-off turns dispatch nothing.** A turn the provider refused
-  (`content_filter`, Anthropic `refusal`) or cut off (`length`, `max_tokens`)
-  no longer runs its tool calls, whose arguments can be truncated JSON. The
-  provider's explanation is `stopDetails` on the results of `generateText`,
+  (`content_filter`, an Anthropic or OpenAI refusal) or cut off (`length`,
+  `max_tokens`) no longer runs its tool calls, whose arguments can be truncated
+  JSON. The provider's explanation (Anthropic's `stop_details`, or an OpenAI
+  refusal's text) is `stopDetails` on the results of `generateText`,
   `streamChat`, `generateObject`, `streamObject` and native runs, and a native
-  run that ends on a refusal stops with reason `'refusal'`.
+  run that ends on a refusal stops with reason `'refusal'`. Every Gemini finish
+  reason is mapped on purpose, and an OpenAI Responses turn its content filter
+  stopped ends with `content_filter`, so their filters and limits hold a call
+  back too.
 - **Every ending has a name.** `ToolCallOutcome` (`'success'`, `'tool-error'`,
   `'permission-denied'`, `'approval-denied'`, `'approval-pending'`,
   `'unknown-effect'`) names how a call ended. Error results and tool-state
@@ -102,23 +106,29 @@ sampling requests. See
   [When a model call fails](/docs/modules/native-agents#when-a-model-call-fails).
 - **Leases and listing.** `runAgent`, `streamAgent` and their resume functions
   take `lease: { provider, owner?, ttlMs? }`, so two processes never drive one
-  run, and a `'cancel'` signalled to the run's key stops it with reason
-  `'cancelled'`. `AgentRunStore.list` pages through stored runs, and
+  run. A `'cancel'` signalled to the run's key stops it with reason
+  `'cancelled'`, and a `'drain'` stops it at its next model-step boundary with
+  reason `'drained'`, for example to move it to another process during a
+  deploy: a drained run has not ended, and a resume on any executor goes on
+  from its last save. `AgentRunStore.list` pages through stored runs, and
   `findStaleAgentRuns` finds runs still running or finalizing whose last save
   is older than `staleMs`, for a worker to resume. See
-  [Listing, leasing and cancelling native runs](/docs/modules/operations#listing-leasing-and-cancelling-native-runs).
+  [Listing, leasing and cancelling native runs](/docs/modules/operations#listing-leasing-and-cancelling-native-runs)
+  and [Draining a native run](/docs/modules/operations#draining-a-native-run).
 - **Cancellation after verification.** Native runs check cancellation and the
   deadline again after output validation, guardrails and the verifier, so an
   abort during verification stops the run with reason `'aborted'`.
-
-{/* W3:RS3 */}
-
-A native resume settles a call whose receipt already holds an outcome (a
-completed receipt, or one recorded with `reconciledToolResults`) from that
-receipt: the recorded result reaches the model, the tool does not run again, and
-the call is not gated for approval again.
-
-{/* /W3:RS3 */}
+- **A resume answers a call from its receipt.** A receipt is saved before the
+  step checkpoint that answers its call, so a run can stop in between. A native
+  resume now answers a call whose receipt records its outcome (stage
+  `executed`, `completed`, `failed`, `validation-failed` or
+  `projection-failed`, one recorded with `reconciledToolResults` included) from
+  that receipt, like a call that needs no approval: the policy and the
+  `onToolCall` guardrails still apply, the tool does not run again, and the
+  resume needs no verdict for it. A verdict passed for it anyway is ignored and
+  named in a `warning` part. Before 2.3 a call that had waited for an approval
+  was answered as denied unless the resume passed its verdict again. See
+  [Strict checkpoints and approval resume](/docs/modules/native-agents#strict-checkpoints-and-approval-resume).
 
 ## Memory, chat and model fail-over in native runs
 
@@ -199,9 +209,9 @@ See
   $0.50/$2.50 above); `claude-sonnet-5` moves from $3/$15 to $2/$10.
   `ModelPrice.tiers` takes any number of long-context cards.
 - **Models without a price** run under a USD budget: their tokens are still
-  reserved and settled, their cost stays out of the USD totals, and the run
-  reports one `unpriced-model` warning per model.
-  `budget.unknownPrice: 'reject'` refuses them before they are sent.
+  reserved and settled, their cost stays out of the USD totals, and each leg of
+  a run reports one `unpriced-model` warning per model (a resumed leg reports
+  it again). `budget.unknownPrice: 'reject'` refuses them before they are sent.
 - **Reservations cover what the provider can bill.** A native reservation
   prices the output cap the request sends, reasoning included. It used to
   reserve `maxOutputTokens ?? 4096` output tokens, while the request could ask
@@ -393,15 +403,19 @@ card, the task lifecycle, streaming, re-subscription and cancellation; you write
 the executor that handles each message. Tasks live in an `A2ATaskStore`, kept
 apart per tenant and per caller. See [A2A](/docs/modules/a2a).
 
-{/* W3:AA3 */}
-
-A native agent can serve as the executor: an A2A task maps to a native run, a
-suspended run to `INPUT_REQUIRED` with its pending approvals and client calls,
-cancellation to an abort, and the validated output to the task's artifacts. A
-follow-up message sent with `configuration.returnImmediately` that the executor
-refuses is no longer lost: the client can see the refusal.
-
-{/* /W3:AA3 */}
+`createA2AAgentExecutor` serves a [native agent](/docs/modules/native-agents)
+run as the handler's executor. Each task is one run: the task id is the run id,
+and the task's tenant and owner name the run's scope. A new message starts the
+run. A suspended run is an `INPUT_REQUIRED` task whose status message lists the
+pending approvals and client-tool calls; the client answers them in its next
+message, and the answers are checked against the run before anything is
+written. The run's validated output becomes the task's artifact, and
+`CancelTask` aborts the run, on another instance too when the executor claims
+runs through a `lease`. You pass the engine in
+(`agent: { streamAgent, resumeStreamAgent }`), so the entry stays edge-safe for
+an app that only calls agents. An executor of your own can stream a preview of
+an artifact with `ctx.draft`, which is never stored. See
+[Serving a native agent](/docs/modules/a2a#serving-a-native-agent).
 
 ## Realtime voice
 
@@ -533,13 +547,12 @@ cost and tokens across every leg, duration, human rescues, repeated effects and
 how it recovered from an interruption. Offline and real-model tasks are never
 aggregated together, and the JSON report is written only on request.
 
-{/* W3:EV3 */}
-
-The repository's baseline runs 16 offline tasks and 23 fault-injection
-scenarios (15 recovered, 8 contained) on every `npm test`. Five real-model tasks
-are defined but were not run, so there are no real-model results.
-
-{/* /W3:EV3 */}
+The repository's baseline runs 22 offline tasks and 32 fault-injection
+scenarios (21 recovered, 11 contained) on every `npm test`, with no false
+completion and no repeated effect. Six of the tasks and nine of the scenarios
+exercise what 2.3 added: native memory, chat and fail-over, the UI bridge,
+goals, batches and the MCP server. Eleven real-model tasks are defined but were
+not run, so there are no real-model results.
 
 It is a baseline, not a ranking. See [Evals](/docs/modules/evals).
 
@@ -555,14 +568,13 @@ stopped for another reason, and 8 when the doctor found an error. `doctor`
 explains why a configuration will not work, with no network call, and
 `loadProjectInstructions` reads `AGENTS.md` and `CLAUDE.md`.
 
-{/* W3:HL3 */}
-
-The report and `resumeHeadless` support the durability options of a native
-resume: an unknown effect is a pending action that a retry
-(`retryToolCallIds`) or a recorded result (`reconciledToolResults`) answers,
-and a run that failed in transit is reported as retryable with `retryFailed`.
-
-{/* /W3:HL3 */}
+Reports and `resumeHeadless` take the durability options of a native resume.
+The pending action for a call whose effect is unknown names both answers,
+`resumeWith: ['retryToolCallIds', 'reconciledToolResults']`: run the call again,
+or record the result that landed. The report of a run that failed in transit
+carries `retry` (`HeadlessRetry`), also in `inspectRun`: resume it with
+`retryFailed: true` to go on from its last checkpoint. Its outcome stays
+`failed` (exit 1), or `limit` (exit 6) for a transport timeout.
 
 The module is Node-only and a preview: report fields, finding codes and exit
 codes can still change in a 2.x minor, and there is no binary.
@@ -597,70 +609,67 @@ codes can still change in a 2.x minor, and there is no binary.
   gains one only in 2.3, and both changelogs carry a correction. The Agent
   Skill's generator and verifier are in the repository
   (`npm run generate:skills`, `npm run verify:skills`).
-
-{/* W3:SK3 */}
-
-The `deuz-sdk` Agent Skill covers the 2.3 surface: the MCP 2026-07-28 client
-and server, A2A, realtime, batch, goals, the Redis stores, native memory, chat
-and fail-over, the native UI bridge, evals, headless, model profiles and the
-unknown-price policy. See [Agent Skills](/docs/reference/agent-skills).
-
-{/* /W3:SK3 */}
+- **Agent Skill.** The `deuz-sdk` skill gains three references, `interop` (the
+  MCP server and A2A), `realtime-batch` (realtime voice and provider batches)
+  and `headless`, and its other references cover the rest of 2.3: the MCP
+  2026-07-28 client, goals, the Redis stores, native memory, chat and
+  fail-over, the native UI bridge, evals, model profiles and the unknown-price
+  policy. See [Agent Skills](/docs/reference/agent-skills).
 
 ## Examples
 
-{/* W3:EX3A */}
+Seven new [examples](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples) run
+without a key or network. Each prints its steps as it goes, and a comment marked
+`REAL PROVIDER` shows the change that swaps in a real model:
 
-`examples/14-native-memory-chat`, `examples/15-native-ui-bridge` and
-`examples/16-goals-and-wakeups` run on `createMockModel`, without a key: a
-native run with memory, a chat projection and a fail-over, repaired by
-`reconcileAgentRun`; a native run served with `toDeuzAgentStreamResponse` and
-folded with `agentStateFromParts` through an approval; and a goal woken by a
-schedule and an event.
+- [`14-native-memory-chat`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/14-native-memory-chat):
+  a native run with `memory`, a `chat` projection and `fallbackModels`, then
+  `reconcileAgentRun` repairing a failed chat write.
+- [`15-native-ui-bridge`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/15-native-ui-bridge):
+  `toDeuzAgentStreamResponse` without a framework, folded with
+  `agentStateFromParts` and `applyUIPart` through an approval, a one-request
+  `resumeStreamAgent` and the typed output, then a journal replay.
+- [`16-goals-and-wakeups`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/16-goals-and-wakeups):
+  a goal woken by a schedule occurrence and a webhook event, each claimed once
+  in SQLite, with one leased native run per wake supplying the evidence.
+- [`17-realtime-offline`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/17-realtime-offline):
+  a realtime session on a scripted OpenAI Realtime socket, with audio in, a tool
+  call bridged to a Deuz tool, a spoken answer and usage priced per modality.
+- [`18-batch-offline`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/18-batch-offline):
+  a batch on a scripted Message Batches API, with budget holds at submit, `wait`
+  polling, settlement per result at batch rates and an `unpriced-model` warning.
+- [`19-mcp-server`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/19-mcp-server):
+  Deuz tools and an agent served over MCP 2026-07-28 to the Deuz MCP client in
+  process, with an elicitation approving a gated tool.
+- [`20-a2a-agent`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/20-a2a-agent):
+  a native run served over A2A with `createA2AHandler` and
+  `createA2AAgentExecutor`; an in-process client answers its approval and gets
+  the typed result as an artifact.
 
-{/* /W3:EX3A */}
-
-{/* W3:EX3B */}
-
-`examples/17-realtime-offline`, `examples/18-batch-offline` and
-`examples/19-mcp-server` run the realtime, batch and MCP server modules without
-a key or network: a realtime session on a scripted WebSocket with a tool call, a
-batch submitted, collected and settled on a fake transport, and an MCP server
-called in-process by the Deuz client.
-
-{/* /W3:EX3B */}
-
-{/* W3:AA3 */}
-
-`examples/20-a2a-agent` serves a native agent over A2A in-process: the client
-answers an approval, and the typed result arrives as an artifact.
-
-{/* /W3:AA3 */}
+`examples/13-headless` gains the resume flags `--retry-call`, `--reconcile` and
+`--retry-failed`, and two keyless scenarios that need them, `--mock crash` and
+`--mock outage`.
 
 ## What 2.2 deferred, and where it landed
 
 The 2.2 notes deferred seven items to 2.3. All seven ship:
 
-| Deferred in 2.2                                      | In 2.3                                                                                            | Docs                                                                                            | How it is verified                                                                                                                                                                           |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The MCP 2026-07-28 client                            | Shipped: a dual-stack client, the v2 line on `@modelcontextprotocol/client`                       | [MCP](/docs/modules/mcp#sdk-lines-and-protocol-revisions-23)                                    | Offline against the official v1 and v2 SDK servers, in-process and over a real stdio child process; not live-verified against hosted servers                                                 |
-| An MCP server                                        | Shipped: `createMcpServer`, `serveMcpStdio`                                                       | [MCP server](/docs/modules/mcp-server)                                                          | Offline against the Deuz client on both SDK lines and the official v1 and v2 SDK clients, in-process over HTTP and over a real stdio child process; not live-verified against hosted clients |
-| A2A                                                  | Shipped: a v1.0.0 client and handler over JSON-RPC and HTTP+JSON                                  | [A2A](/docs/modules/a2a)                                                                        | Offline against `@a2a-js/sdk` 1.3.0 in both directions, in-process and over HTTP+JSON on 127.0.0.1; not live-verified against third-party agents                                             |
-| Realtime voice                                       | Shipped over WebSocket: OpenAI Realtime and Gemini Live                                           | [Realtime voice](/docs/modules/realtime)                                                        | Shapes from the `openai` 7.32 and `@google/genai` 2.28 types; tested on a scripted socket and a local WebSocket server; not live-verified                                                    |
-| Provider batch APIs                                  | Shipped: OpenAI, Anthropic and Gemini                                                             | [Batch requests](/docs/modules/batch)                                                           | Shapes from the `openai` 7.32, `@anthropic-ai/sdk` 0.133 and `@google/genai` 2.28 types; tested against in-memory stand-ins of each API; not live-verified                                   |
-| Redis swarm and ops backends                         | Shipped: `ops/redis` (leases, native runs, claims, budgets), `swarm/redis`, and the pack's `runs` | [Operations](/docs/modules/operations#redis), [Persistent stores](/docs/modules/stores#runs-23) | The shared conformance suites, offline on ioredis-mock, which runs the same Lua scripts; the same suites run against a real Redis 7 in the CI integration job (`DEUZ_TEST_REDIS_URL`)        |
-| `chat`, `memory` and `fallbackModels` in native runs | Shipped                                                                                           | [Native agents](/docs/modules/native-agents#memory-chat-and-model-fail-over-23)                 | Offline with scripted models and stores; provider behaviour not live-verified                                                                                                                |
+| Deferred in 2.2                                      | In 2.3                                                                                                                      | Docs                                                                                            | How it is verified                                                                                                                                                                                                                |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The MCP 2026-07-28 client                            | Shipped: a dual-stack client, the v2 line on `@modelcontextprotocol/client`                                                 | [MCP](/docs/modules/mcp#sdk-lines-and-protocol-revisions-23)                                    | Offline against the official v1 and v2 SDK servers, in-process and over a real stdio child process; not live-verified against hosted servers                                                                                      |
+| An MCP server                                        | Shipped: `createMcpServer`, `serveMcpStdio`                                                                                 | [MCP server](/docs/modules/mcp-server)                                                          | Offline against the Deuz client on both SDK lines and the official v1 and v2 SDK clients, in-process over HTTP and over a real stdio child process; not live-verified against hosted clients                                      |
+| A2A                                                  | Shipped: a v1.0.0 client and handler over JSON-RPC and HTTP+JSON, and `createA2AAgentExecutor`, which serves a native agent | [A2A](/docs/modules/a2a)                                                                        | Offline against `@a2a-js/sdk` 1.3.0 in both directions, in-process and over HTTP+JSON on 127.0.0.1; its client also drives the native-agent executor over both bindings, in-process; not live-verified against third-party agents |
+| Realtime voice                                       | Shipped over WebSocket: OpenAI Realtime and Gemini Live                                                                     | [Realtime voice](/docs/modules/realtime)                                                        | Shapes from the `openai` 7.32 and `@google/genai` 2.28 types; tested on a scripted socket and a local WebSocket server; not live-verified                                                                                         |
+| Provider batch APIs                                  | Shipped: OpenAI, Anthropic and Gemini                                                                                       | [Batch requests](/docs/modules/batch)                                                           | Shapes from the `openai` 7.32, `@anthropic-ai/sdk` 0.133 and `@google/genai` 2.28 types; tested against in-memory stand-ins of each API; not live-verified                                                                        |
+| Redis swarm and ops backends                         | Shipped: `ops/redis` (leases, native runs, claims, budgets), `swarm/redis`, and the pack's `runs`                           | [Operations](/docs/modules/operations#redis), [Persistent stores](/docs/modules/stores#runs-23) | The shared conformance suites, offline on ioredis-mock, which runs the same Lua scripts; the same suites run against a real Redis 7 in the CI integration job (`DEUZ_TEST_REDIS_URL`)                                             |
+| `chat`, `memory` and `fallbackModels` in native runs | Shipped                                                                                                                     | [Native agents](/docs/modules/native-agents#memory-chat-and-model-fail-over-23)                 | Offline with scripted models and stores; provider behaviour not live-verified                                                                                                                                                     |
 
 Parts of these areas stay outside 2.3: realtime over WebRTC (planned for 2.4),
 and the items listed under [Known limits](#known-limits).
 
-{/* W3:DR3 */}
-
-The verification level of every model family and protocol, kept apart as
-documented, fixture-tested and live-verified, is in the
-[support matrix](/docs/reference/provider-conformance).
-
-{/* /W3:DR3 */}
+The verification level of every model row and protocol 2.3 added, kept apart
+as documented, fixture-tested and live-verified, with the test files behind
+each, is in the [support matrix](/docs/reference/support-matrix).
 
 ## Upgrading from 2.2
 
@@ -755,6 +764,28 @@ do.
   sends a forced `toolChoice` as `auto`, with warnings; a tool request to
   `gpt-6.1-sol` on Chat Completions throws `InvalidRequestError`. Use the
   Responses API for Sol's tools.
+- **Every Gemini finish reason is mapped on purpose**, on the native wire and
+  in batch results. `SPII`, `IMAGE_PROHIBITED_CONTENT` and `IMAGE_RECITATION`
+  end a turn with `content_filter` instead of `stop`, and `CONTINUATION` with
+  `length`. The stops that leave no usable answer (`LANGUAGE`, `OTHER`,
+  `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`,
+  `NO_IMAGE`, `IMAGE_OTHER`) end it with `error`, so a native run stops with
+  reason `'error'` instead of completing with an empty answer. A turn that
+  streamed a call and was then filtered or cut off ends with `content_filter`
+  or `length` instead of `tool_calls`, and its call no longer runs.
+- **An OpenAI Responses turn that its content filter cut off**
+  (`incomplete_details.reason: 'content_filter'`) ends with `content_filter`
+  instead of `stop`, or `tool_calls` when it streamed a call, which no longer
+  runs.
+- **OpenAI refusals are kept.** Both OpenAI wires dropped the refusal text, so
+  a refused answer looked like an empty one that ended with `stop`. A refused
+  turn now ends with `content_filter`, unless the provider reported `length` or
+  `content_filter` itself, and carries the text as
+  `stopDetails: { type: 'refusal', explanation }`; the `finish` part keeps it as
+  `providerMetadata.openai.refusal`, and a native run stops with reason
+  `'refusal'`. The text never becomes answer text, and the turn runs none of
+  its tool calls. An OpenAI-compatible host that sends a refusal on the Chat
+  Completions wire gets the same.
 
 #### Usage, prices and budgets
 
@@ -954,13 +985,11 @@ Calling code is unaffected. Code that implements these interfaces itself:
   and `sdk`. A store without them keeps working; the features that use them
   need them.
 
-{/* W3:DR3 */}
-
-The fields 2.3 adds to the Deuz UI wire are listed in the
-[stream protocol](/docs/reference/stream-protocol) reference, and the error
-classes 2.3 adds, with their codes, in [Error handling](/docs/core/errors).
-
-{/* /W3:DR3 */}
+The fields 2.3 adds to the Deuz UI wire, and the wire versions that carry
+each, are listed in the
+[stream protocol](/docs/reference/stream-protocol#additive-fields-in-23)
+reference, and the error classes 2.3 adds, with their codes, in
+[Error handling](/docs/core/errors).
 
 ## Known limits
 
@@ -994,17 +1023,9 @@ classes 2.3 adds, with their codes, in [Error handling](/docs/core/errors).
   share one execution context count as nested: each may only narrow the memory
   scope of the latest run still running on it, so give a run with another
   user's memory its own `.child()` context.
-
-{/* W3:RS3 */}
-
 - **Retries on resume.** A call that waited for an approval and is retried with
   `retryToolCallIds` is gated again on resume: pass the stored verdict in
   `approvalResponses` with it.
-- **Drain.** Native runs ignore a lease `'drain'` signal; only `'cancel'` stops
-  them.
-
-{/* /W3:RS3 */}
-
 - **Structured output with tools on Gemini native** sends the JSON schema
   alone, because `@google/genai` documents no request that combines function
   declarations with a response schema. A callable tool it drops is reported as
