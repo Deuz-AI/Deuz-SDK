@@ -185,7 +185,8 @@ export interface AgentRunEnvelope {
     revision?: string;
     /**
      * The MCP servers' tool catalog (2.3): `fingerprintTools` JSON. Resume
-     * rejects a catalog that drifted from it; a hot refresh records the new one.
+     * rejects a catalog that drifted from it unless `onCatalogChange` is
+     * `'accept'`; a hot refresh, or an accepting resume, records the new one.
      * Absent before 2.3 and for runs without MCP; resume then records the catalog.
      */
     mcp?: string;
@@ -528,6 +529,14 @@ export type AgentRunOptions<T = string> = Omit<
    * `'accept'` records the new catalog as the run's binding and carries on. Both
    * report the change as a `warning` part (`setting: 'mcp'`); an announcement
    * that changed nothing does neither.
+   *
+   * On resume, a catalog that differs from the recorded one fails the resume
+   * under `'stop'`. Under `'accept'` the resume's first write records it as a
+   * new binding revision, before any model call, with the same warning; it
+   * still fails while a call the model made against the recorded catalog is
+   * in flight (an MCP receipt in stage `'executing'`, or a call of the last
+   * turn that waits for its verdict or never started), and when the resume
+   * dropped the `mcp` entries.
    */
   onCatalogChange?: AgentMcpCatalogChange;
   toolsContext?: Record<string, unknown>;

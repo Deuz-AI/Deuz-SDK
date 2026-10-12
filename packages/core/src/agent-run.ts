@@ -943,6 +943,8 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
       // and before anything is persisted, so an unreachable server fails a fresh
       // run cleanly and a resume checks the servers' catalog before it writes. The
       // tools pass through the same receipts as local tools.
+      /** A drifted catalog this resume accepts (2.3): its first write records it. */
+      let acceptedCatalog: { catalog: string; drift: string } | undefined;
       if ((options.mcp?.length ?? 0) > 0 || recordedCatalog !== undefined) {
         const native = await import('./inference/native-mcp');
         if (options.mcp?.length) {
@@ -958,8 +960,24 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
           binding.mcp = await nativeMcp.catalog();
         }
         const drift = native.catalogDrift(recordedCatalog, binding.mcp);
-        // Rejected like a changed local tool set; the stored run stays intact.
-        if (drift) throw new TypeError(`MCP tool catalog changed across resume (${drift}).`);
+        if (drift) {
+          // Rejected like a changed local tool set; the stored run stays intact.
+          // Under `onCatalogChange: 'accept'` (2.3) the servers' new catalog
+          // opens a new binding revision instead, as the hot refresh it missed
+          // would have, unless the servers are gone or a call the model made
+          // against the recorded catalog is still in flight.
+          if (
+            catalogPolicy !== 'accept' ||
+            !nativeMcp ||
+            native.mcpCallInFlight(envelope.messages, envelope.toolResults, [
+              recordedCatalog,
+              binding.mcp,
+            ])
+          )
+            throw new TypeError(`MCP tool catalog changed across resume (${drift}).`);
+          acceptedCatalog = { catalog: binding.mcp!, drift };
+          binding.mcp = recordedCatalog;
+        }
       }
       envelope.binding = binding;
       if (envelope.limits) {
@@ -1089,6 +1107,16 @@ function makeAgentStream<T>(options: AgentRunOptions<T>, resume: boolean): Agent
         });
       }
       if (clientResults.length) envelope.pendingClientCalls = [];
+      // An accepted catalog change (2.3) is recorded by this first write,
+      // before any model call, and reported like a hot refresh's.
+      if (acceptedCatalog) {
+        envelope.binding.mcp = acceptedCatalog.catalog;
+        runWarnings.add({
+          type: 'other',
+          setting: 'mcp',
+          message: `MCP tool catalog changed across resume (${acceptedCatalog.drift}); the run's resume binding now records the new catalog.`,
+        });
+      }
       delete envelope.result;
       await persist();
 

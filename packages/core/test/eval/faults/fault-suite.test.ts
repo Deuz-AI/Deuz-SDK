@@ -93,6 +93,7 @@ describe('fault injection (2.3)', () => {
       'fault/spawn-commit-failure': 'recovered',
       'fault/mcp-refresh-list-failure': 'recovered',
       'fault/mcp-refresh-record-failure': 'contained',
+      'fault/mcp-refresh-record-failure-accepted': 'recovered',
       'fault/refusal-mid-tool-call': 'contained',
       'fault/max-tokens-mid-tool-call': 'contained',
     });
@@ -104,7 +105,7 @@ describe('fault injection (2.3)', () => {
       // A person checked the payment system after the unknown charge.
       humanRescues: 1,
       requiredApprovals: 1,
-      recovery: { 'not-needed': 0, recovered: 11, rescued: 0, contained: 8, failed: 0 },
+      recovery: { 'not-needed': 0, recovered: 12, rescued: 0, contained: 8, failed: 0 },
     });
   });
 });

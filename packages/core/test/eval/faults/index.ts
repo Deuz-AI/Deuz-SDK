@@ -5,7 +5,11 @@
  * projection or memory write, fallback attempt and its settlement).
  */
 import type { EvalTaskManifest } from '../../../src/testing';
-import { mcpRefreshListFailure, mcpRefreshRecordFailure } from './mcp-boundaries';
+import {
+  mcpRefreshListFailure,
+  mcpRefreshRecordFailure,
+  mcpRefreshRecordFailureAccepted,
+} from './mcp-boundaries';
 import {
   childInitialization,
   maxTokensMidToolCall,
@@ -48,6 +52,7 @@ export const faultScenarios: readonly EvalTaskManifest[] = [
   spawnCommitFailure,
   mcpRefreshListFailure,
   mcpRefreshRecordFailure,
+  mcpRefreshRecordFailureAccepted,
   refusalMidToolCall,
   maxTokensMidToolCall,
 ];

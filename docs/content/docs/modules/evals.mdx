@@ -11,7 +11,7 @@ needs: success, false completion, cost, duration, human rescues, repeated
 effects and recovery.
 
 2.3 ships a baseline, not a benchmark. The repository's test suite runs 16
-offline tasks and 19 fault-injection scenarios on every `npm test`. Five
+offline tasks and 20 fault-injection scenarios on every `npm test`. Five
 real-model tasks are defined but were not run for 2.3, so there are no
 real-model results. This page ranks nothing and makes no claim about other SDKs.
 
@@ -270,18 +270,19 @@ accounting, and the documented recovery:
 | Settle failure | The ledger retries the settlement until the hold closes at the actual usage | Recovered |
 | Spawn commit failure | A `replay: 'safe'` parent runs again and its child is spawned once | Recovered |
 | MCP hot refresh, listing fails | The run keeps the catalog it had | Recovered |
-| MCP hot refresh, crash before the record | Every resume fails on the catalog drift and leaves the stored run untouched | Contained |
+| MCP hot refresh, crash before the record | A resume under the default `onCatalogChange: 'stop'` fails on the catalog drift and leaves the stored run untouched | Contained |
+| The same, resumed with `onCatalogChange: 'accept'` | The resume's first write records the servers' new catalog, before its first model call, and the run completes | Recovered |
 | Refusal or `max_tokens` with a tool call | The call is never dispatched; the run stops with reason `refusal` or `length` | Contained |
 
-Contained is not a defect in itself: it is the documented safe outcome. Three
+Contained is not a defect in itself: it is the documented safe outcome. Two
 of these cases leave work for a person. A mid-stream transport failure and an
 admission store failure end the native run as `failed`, and a resume returns
 that result, so the work starts again as a new run. A charge that did land
 after an unknown outcome cannot be recorded as completed: the run stays
-stopped, or `retryToolCallIds` runs the call again. And with
-`onCatalogChange: 'accept'`, a crash between a hot refresh and its record
-leaves a run that resumes only once the server's catalog matches the record
-again.
+stopped, or `retryToolCallIds` runs the call again. A crash between a hot
+refresh and its record is contained under the default
+`onCatalogChange: 'stop'`; a resume with `'accept'` records the servers' new
+catalog and recovers.
 
 Set `DEUZ_EVAL_REPORT=<path>` or `DEUZ_FAULT_REPORT=<path>` when running the
 core tests to write either suite's JSON report.
