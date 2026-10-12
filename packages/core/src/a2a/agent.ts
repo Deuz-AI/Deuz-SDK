@@ -141,9 +141,10 @@ export interface A2AAgentExecutorOptions<T = string> {
   /**
    * The text of a failed task's status message, and of a refused resume,
    * from the run's whole error. Default: a fixed text that names the error
-   * by its `code`, or its `name`; the error's message, which can name a
-   * provider account, a database host or a user, stays on the server.
-   * Return only what the client may read.
+   * by its `code`, or its `name` (a resume refused while another executor
+   * holds the run says so); the error's message, which can name a provider
+   * account, a database host or a user, stays on the server. Return only
+   * what the client may read.
    */
   failureMessage?: (error: { name: string; message: string; code?: string }) => string;
 }

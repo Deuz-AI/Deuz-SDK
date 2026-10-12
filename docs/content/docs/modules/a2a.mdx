@@ -450,7 +450,7 @@ A stopped run puts its task in `INPUT_REQUIRED`. What the client does next depen
 
 A failed run fails the task. A resume that fails before it begins, having written nothing, refuses the message instead, and the task keeps waiting: `UNSUPPORTED_OPERATION` while another executor holds the run's [lease](#identity-and-several-instances) (send the message again later), `INTERNAL_ERROR` otherwise (the run's definition changed, or its store could not be read).
 
-What the client reads never carries an error's message, which can name a provider account, a database host or a user: a failed task's text and a refusal's name the error by its code, or its name, and a task store that fails an update fails the task with `The agent could not update the task.` To word the first two yourself, from the whole error, pass `failureMessage`.
+What the client reads never carries an error's message, which can name a provider account, a database host or a user. A failed task's text names the error by its code, or its name (`The agent run failed (rate_limit).`); a refused resume says that another executor drives the run, or names the error the same way; and a task store that fails an update fails the task with `The agent could not update the task.` To word the first two yourself, from the whole error, pass `failureMessage`.
 
 ### The run's options
 
@@ -465,7 +465,7 @@ What the client reads never carries an error's message, which can name a provide
 | `scope` | The run's scope from the task's `{ tenant, owner }`. Default: the JSON of `['a2a', tenant, owner]`. |
 | `artifact` | The output artifact's `name` (default `'output'`) and `description`. |
 | `drafts` | Stream the text of a string output as unstored drafts of the output artifact. Default: yes, unless the run has `guardrails.onOutput`. `true` sends them anyway, `false` never. |
-| `failureMessage` | What a client reads of a failed run or a refused resume, from the run's whole error (`{ name, message, code? }`). Default: a text that names the error by its code, or its name. |
+| `failureMessage` | What a client reads of a failed run or a refused resume, from the run's whole error (`{ name, message, code? }`). Default: a fixed text without the error's message (see [stopped and failed runs](#stopped-and-failed-runs)). |
 
 ### Identity and several instances
 
@@ -479,7 +479,7 @@ To serve tasks from several instances, share a durable task store and a durable 
 
 A draft is also the model's text before `guardrails.onOutput` rewrites or blocks it, as on every native stream, and a client that read it keeps it. So a run with output guardrails sends no drafts: its client reads only what the guardrails let through. Pass `drafts: true` to send them anyway (your guardrail then only guards what is stored), or `drafts: false` to send none for any run. A card without `capabilities.streaming` serves no stream, so it sends no drafts either.
 
-With `configuration.returnImmediately`, a follow-up is answered once its leg runs (at `WORKING`), or with the refusal of answers that do not fit.
+With `configuration.returnImmediately`, a follow-up is answered at the turn's first update — `WORKING` once its leg runs, otherwise the status the turn ends on — or with the refusal of answers that do not fit.
 
 `CancelTask` aborts a run whose turn runs on this instance; the run stops with reason `'aborted'`. With `lease`, canceling a task whose turn runs on another instance signals the run's lease, which stops the run there with reason `'cancelled'`, and a [lease cancel](/docs/modules/operations#cancelling-a-native-run-from-another-process) from outside A2A (`leases.signal(agentRunLeaseKey({ scope, runId }), 'cancel')`, with `agentRunLeaseKey` from `@deuz-sdk/core/ops`) cancels the task. A task waiting for input has no running turn: canceling it leaves its run in the store as it is, suspended or drained, and no message resumes it. A drained run has not ended, so [`findStaleAgentRuns`](/docs/modules/operations#finding-runs-that-lost-their-executor) lists it like a run whose executor died: a sweeper that resumes stale runs must skip the runs of canceled tasks.
 
