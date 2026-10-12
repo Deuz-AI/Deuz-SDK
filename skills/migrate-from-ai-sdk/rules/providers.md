@@ -69,7 +69,7 @@ Core reads no env vars, so there is no `OPENAI_BASE_URL`-style fallback — pass
 
 `core/registry.ts` is the single source of truth for per-model behaviour: the capability matrix (`vision`, `tools`, `reasoning`, `structuredOutput`, `caching`, `nativePdf`, `audio`, `contextWindow`, `maxOutput`) plus quirk flags.
 
-An unknown slug does **not** throw. It falls back to a conservative `(provider, surface)` row — `maxOutput: 4096`, `reasoning: false`, `structuredOutput: false` — and logs a warning through the (no-op by default) logger. So a ported app on a brand-new slug can be silently capped at 4096 output tokens, lose `effort`, and be pushed onto the tool strategy for structured output.
+An unknown slug does **not** throw. It falls back to a conservative `(provider, surface)` row — `reasoning: false`, `structuredOutput: false`, a `maxOutput: 4096` placeholder — and reports an `unknown-model` warning (on `warnings`, and through the no-op-by-default logger). So a ported app on a brand-new slug can lose `effort` and be pushed onto the tool strategy for structured output. Since 2.3 the 4096 cap reaches the wire only on Anthropic, which requires `max_tokens` (an unknown `claude-*-5…` id takes the Claude 5.x rules instead); OpenAI and Gemini leave the cap off. `resolveModelProfile(model)` reports what the SDK knows about a model.
 
 Fix it without waiting for a registry release:
 
@@ -105,7 +105,7 @@ const model = registry.model('mistral:mistral-large-latest'); // zero network
 | bundled middleware | `logging`, `simpleCache`, `redactPII`, `promptInjectionGuard`, `withFallback` |
 | — | `fallbackModels: [...]` on the call: hop to the next model on a pre-first-byte failure with the IDENTICAL canonical history |
 
-`fallbackModels` marks the winner via `providerMetadata.deuz.failedOver = { from, to, reason }`. Note that both `fallbackModels` and the `withFallback` middleware return `consume: undefined`, so `res.consume?.()` is a silent no-op on those paths.
+`fallbackModels` marks the winner via `providerMetadata.deuz.failedOver = { from, to, reason }`. Both forward the winner's `consume()` (since 1.9), so `res.consume?.()` runs terminal effects on those paths too.
 
 ## Embeddings are a separate kind
 

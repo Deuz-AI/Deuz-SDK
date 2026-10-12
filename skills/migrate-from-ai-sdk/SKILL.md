@@ -46,8 +46,8 @@ Work in this order; each step leaves the app compiling.
 3. **Tools** — `inputSchema` → `parameters`, `ToolCallOptions`/`ToolExecutionOptions` → `ToolExecuteContext`. `rules/tools.md`
 4. **Agents** — `ToolLoopAgent` → `createAgent`; `WorkflowAgent` → `session` + `resumeFromCheckpoint`. `rules/tools.md`
 5. **Routes + client together** — `toUIMessageStreamResponse` → `toDeuzStreamResponse`, and add `validateChatRequest`. `rules/ui.md`
-6. **Telemetry** — `@ai-sdk/otel` has no Deuz package; write a `deps.tracer` adapter. `rules/telemetry.md`
-7. **Remove `ai` and `@ai-sdk/*`** from `package.json`. Deuz has zero runtime deps; install only the optional peers you use (`zod` + `@standard-community/standard-json` for Standard Schema, `@modelcontextprotocol/sdk` for MCP).
+6. **Telemetry** — `@ai-sdk/otel` + `registerTelemetry()` → `createOtelTracer` / `createOtelObserver` from `@deuz-sdk/core/otel`, threaded through `deps` (no global registration). `rules/telemetry.md`
+7. **Remove `ai` and `@ai-sdk/*`** from `package.json`. Deuz has zero runtime deps; install only the optional peers you use (`zod` + `@standard-community/standard-json` for Standard Schema, `@modelcontextprotocol/client` (MCP 2026-07-28) or `@modelcontextprotocol/sdk` (2025-11-25) for MCP).
 
 ## Headline mapping
 
@@ -85,16 +85,15 @@ Tell the user up front if their app uses any of these; there is no Deuz replacem
 
 | AI SDK feature | Status |
 | --- | --- |
-| `transcribe`, `generateSpeech` | Absent. No audio entry point exists (audio *tokens* are metered, that is all). |
-| `experimental_generateVideo` | Absent as a function. |
 | `useCompletion` | Absent. Use `useChat` against a single-turn route. |
 | Svelte / Vue / Angular bindings | Absent. Only `@deuz-sdk/react` ships; the wire is plain SSE. |
-| `@ai-sdk/devtools` (local web UI) | Absent. Nearest: `deps.observer` + `createJsonlObserver` (`@deuz-sdk/core/observe/node`) + `summarizeRun`. |
-| `@ai-sdk/otel` / `registerTelemetry()` | No package. Write a `deps.tracer` adapter — `rules/telemetry.md`. |
-| `Output.array()` / element streaming | Absent. `streamObject` streams partials of ONE object. |
-| `contextSchema` / `toolsContext` / `runtimeContext` | Absent. Close over what a tool needs, or read `ctx.messages`. |
+| `@ai-sdk/devtools` (local web UI) | No server. Nearest: `renderRunReport(events)` (`@deuz-sdk/core/observe`), one self-contained HTML document, and `writeRunReport` (`@deuz-sdk/core/observe/node`) over a `createJsonlObserver` file. |
+| `Output.array()` / element streaming | `streamObject` streams partials of ONE object. A native `streamAgent` with an array `output` and an `output.element` validator has `elementStream`. |
+| `contextSchema` / `toolsContext` on a legacy call | The legacy loop has the untyped per-call `runtimeContext`; typed per-tool context (`contextSchema` / `validateContext` and the run's `toolsContext`) exists on native `runAgent` tools. |
 | Codemods | Absent. This skill is the replacement. |
 | Hosted gateway / plain string model ids | Deliberately absent. |
+
+Tables written before 2.0, older copies of this one included, also listed `transcribe`, `generateSpeech`, `experimental_generateVideo` and `@ai-sdk/otel` as absent. They exist: `transcribe` (`@deuz-sdk/core/transcription`), `generateSpeech` (`@deuz-sdk/core/speech`), `generateVideo` (`@deuz-sdk/core/video`), and `createOtelTracer` / `createOtelObserver` (`@deuz-sdk/core/otel`).
 
 ## `result.warnings` maps, but in two shapes
 

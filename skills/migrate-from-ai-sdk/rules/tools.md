@@ -91,13 +91,13 @@ If the ported app relied on the old behaviour to catch hallucinations, that logi
 `toolApproval` (AI SDK 7; `needsApproval` before that) maps to `needsApproval` **on the tool**, plus one of two modes on the call:
 
 - **Server mode** — pass `approveToolCall: (call, { messages }) => boolean | Promise<boolean>`. Awaited per gated call; `false` or a throw becomes an `is_error` `'Tool call denied.'` result and the loop continues. Denials never trip the runaway guard.
-- **Client mode** — omit `approveToolCall`; gated calls break the loop. `generateText` returns `pendingApprovals: [{ approvalId, toolCallId, toolName, input }]`; streaming emits `tool-approval-request` parts. Resume with `approvalResponses: [{ approvalId, approved, reason?, token? }]`.
+- **Client mode** — omit `approveToolCall`; gated calls break the loop. `generateText` returns `pendingApprovals: [{ approvalId, toolCallId, toolName, input, agentPath?, token? }]`; streaming emits `tool-approval-request` parts. Resume with `approvalResponses: [{ approvalId, approved, reason?, token? }]`, echoing the `approvalId` you were given: since 2.3 it is the tool call id plus a digest that binds the call, so a kept verdict never approves another tool, other arguments or a later step (the bare tool call id still counts when the run used that id once).
 
 Sharp edges to carry into the port:
 
 - **No verdict = DENIED.** A gated call with no matching response on resume is denied (safe side); it does not stay pending. Send a verdict for every `approvalId`. Unknown ids are ignored (replay-safe).
 - **`createApprovalSigner`** (`@deuz-sdk/core/durable`) issues an HMAC-signed `token` on the request part; echo it back to approve.
-- **Denial does not reach the UI as a denial.** `tool-state.denied` / `UIToolCall.denied` exist but no built-in producer sets them, so a declined call renders as a plain tool error unless your server emits its own `tool-state` part. Do not build a denial UI on those fields yet.
+- **Denial reaches the UI as a denial.** The streaming loop's `tool-state` part carries `denied: true` (and `deniedReason` when the denier gave one), kept on `UIToolCall.denied`; since 2.3 `outcome` names the cause (`'approval-denied'`, `'permission-denied'`, …) on `tool-state` and `tool-result`, kept on `UIToolCall.outcome`. A thrown tool gains no denial fields.
 - Client-mode approval **inside a sub-agent** is not supported; pass `approveToolCall` on the outermost call if any sub-agent tool is gated.
 
 ## `ToolLoopAgent` -> `createAgent`
