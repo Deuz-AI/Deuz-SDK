@@ -115,7 +115,7 @@ On **Chat Completions** (GPT-5.4+ ships `reasoning_effort` there, so `gpt-5.5`/`
 
 That is the default mapping. Since 2.3, a model whose registry row lists its own effort levels uses those instead, on both surfaces, and reports every changed value as a `clamped-setting` warning. For example, `gpt-6.1-sol` sends `'max'` as `'max'`, `gpt-5` sends `'none'` as `'low'` because it has no `'none'`, and `gpt-5-pro` sends every level as `'high'`. [Model profiles](/docs/modules/model-profiles#effort-and-what-none-becomes) lists the levels of each model.
 
-Reasoning models on the Responses surface have `samplingRestrictions` set, so `temperature` and `topP` are dropped for those models. `maxOutputTokens` maps to `max_output_tokens` (falling back to the model's registry `maxOutput`).
+Reasoning models on the Responses surface have `samplingRestrictions` set, so `temperature` and `topP` are dropped for those models. `maxOutputTokens` maps to `max_output_tokens` (falling back to the model's registry `maxOutput` when the row documents one; since 2.3 a model without a documented limit gets no cap, so OpenAI's default applies, unless the call runs under an execution context's token or USD budget).
 
 Reasoning tokens surface on `usage.reasoningTokens` (from the response's `output_tokens_details.reasoning_tokens`). On the streaming side, reasoning summary/text deltas arrive as `reasoning-delta` parts on `fullStream`.
 
@@ -137,7 +137,7 @@ for await (const part of result.fullStream) {
 }
 ```
 
-Since 1.2.0, when a Responses call includes tools on a reasoning model, the adapter automatically requests `include: ["reasoning.encrypted_content"]` with `store: false`, and replays the encrypted reasoning items verbatim (ahead of their `function_call`) on later loop steps — stateless multi-step tool use stays coherent without server-side storage. `reasoning-delta` parts with `encrypted: true` carry the opaque payload; skip them when rendering. Replayed assistant messages preserve the `phase` field (`commentary`/`final_answer`) via `Message.providerMetadata.openai.phase`.
+The adapter replays encrypted reasoning items verbatim (ahead of their `function_call`) on later loop steps, so stateless multi-step tool use stays coherent without server-side storage. Since 2.3 every Responses request sends `store: false`, and a reasoning model always asks for `include: ["reasoning.encrypted_content"]`, with or without tools; from 1.2.0 to 2.2 the adapter set both only for a call with tools on a reasoning model. Pass `providerOptions: { openai: { store: true } }` to opt back in to server-side storage; a caller-supplied `include` list is merged. See [OpenAI Responses is stateless by default](/docs/modules/model-profiles#openai-responses-is-stateless-by-default); OpenAI's retention behaviour is not live-verified. `reasoning-delta` parts with `encrypted: true` carry the opaque payload; skip them when rendering. Replayed assistant messages preserve the `phase` field (`commentary`/`final_answer`) via `Message.providerMetadata.openai.phase`.
 
 Since 2.3 each reasoning item is its own block (`id` = the item id) and its parts carry `source: 'openai'`. The encrypted item rides back only to the Responses wire: a fallback to Claude or Gemini leaves it out of the request instead of sending it as a thinking block or a thought signature, as earlier versions did. See [Reasoning parts](/docs/core/messages#reasoning-parts).
 

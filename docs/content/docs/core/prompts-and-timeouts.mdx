@@ -120,7 +120,7 @@ const res = streamChat({ model, prompt, abortSignal: controller.signal }); // ho
 
 Override what the SDK believes about a model it does not know yet.
 
-An unknown model slug does not throw; it falls back to a conservative registry row whose `maxOutput` is `4096`. So a brand-new Together / Groq / OpenRouter slug was **silently truncated** at 4096 output tokens, `reasoning: false` dropped `effort`, and `structuredOutput: false` pushed `generateObject` onto the tool strategy.
+An unknown model slug does not throw; it falls back to a conservative registry row whose `maxOutput` is a `4096` placeholder. Before 2.3 a brand-new Together / Groq / OpenRouter slug was therefore **silently truncated** at 4096 output tokens. Since 2.3 the OpenAI and Gemini wires leave the cap off for a placeholder, so the provider's own default applies; Anthropic, which requires `max_tokens`, still sends it, and so does any call under an execution context's token or USD budget. `reasoning: false` still drops `effort`, and `structuredOutput: false` still pushes `generateObject` onto the tool strategy.
 
 ```ts title="capabilities.ts"
 await generateText({
