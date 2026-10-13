@@ -1,12 +1,13 @@
 /**
- * store-redis.ts — one Redis-backed pack of the three storage seams (2.0):
- * `MemoryStore` + `ChatStore` + `SessionStore`. Ships as
- * `@deuz-sdk/core/stores/redis`.
+ * store-redis.ts — one Redis-backed pack of the storage seams (2.0):
+ * `MemoryStore` + `ChatStore` + `SessionStore`, and since 2.3 `RunStore`.
+ * Ships as `@deuz-sdk/core/stores/redis`.
  *
  * A PACK rather than one object, for a hard reason: `MemoryStore.delete(ids[])`
  * and `SessionStore.delete(runId)` are different methods with the same name, so
  * a single value cannot implement both interfaces. `createRedisStores` returns
- * `{ memory, chats, sessions }` sharing one connection and one key namespace.
+ * `{ memory, chats, sessions, runs }` sharing one connection and one key
+ * namespace.
  *
  * ZERO hard dependency, by construction: this talks to a STRUCTURAL seam
  * ({@link RedisClientLike} — eleven commands, spelled exactly as node-redis v4/v5
@@ -33,6 +34,9 @@
  * P:chat:ix             SET     chat ids
  * P:sess:rec:<runId>    STRING  serializeCheckpoint (binary-safe)
  * P:sess:ix             SET     run ids
+ * P:run:rec:<runId>     STRING  JSON RunRecord (2.3)
+ * P:run:ix              ZSET    score = createdAt, member = runId
+ * P:run:st:<status>     ZSET      the same, one per status (list({ status }))
  * ```
  *
  * NO MULTI IN v1 — stated plainly because it is a real, bounded weakness. A
@@ -50,8 +54,10 @@ import { serializeChatRecord, deserializeChatRecord } from '../chat';
 import type { MemoryHit, MemoryRecord, MemoryScope, MemoryStore } from '../memory';
 import { matchesScope } from '../memory';
 import type { AgentCheckpoint, SessionStore } from '../types/session';
-import { serializeCheckpoint, deserializeCheckpoint } from '../durable';
+import type { RunRecord, RunStatus, RunStore } from '../types/runtime';
+import { serializeCheckpoint, deserializeCheckpoint, CheckpointVersionError } from '../durable';
 import { cosineSimilarity } from '../internal/vector';
+import { redisConnection } from './redis-scripts';
 
 // ===================================================================
 // The client seam
@@ -65,9 +71,9 @@ export interface RedisZMember {
 
 /**
  * The SLICE of a Redis client this store uses. Deliberately tiny and spelled in
- * node-redis's camelCase, so a real `RedisClientType` (v4 or v5) is assignable
- * with no wrapper, no adapter and no `as` — and so a test (or ioredis, or a
- * cluster proxy) can satisfy it with a plain object.
+ * node-redis's camelCase, so a real `RedisClientType` (v4, v5 or v6) is
+ * assignable with no wrapper, no adapter and no `as` — and so a test, a
+ * cluster proxy or ioredis (through {@link wrapIoredisClient}) can satisfy it.
  *
  * Return types are as loose as the store's own needs: it reads `get`/`mGet`
  * strings, `sMembers`/`sInter`/`zRangeByScore` string arrays, and IGNORES what
@@ -86,16 +92,74 @@ export interface RedisClientLike {
   zAdd(key: string, members: RedisZMember | RedisZMember[]): Promise<unknown>;
   zRem(key: string, members: string | string[]): Promise<unknown>;
   zRangeByScore(key: string, min: number | string, max: number | string): Promise<string[]>;
+  /**
+   * Run a Lua script atomically (2.3), in node-redis's `EVAL` signature. This
+   * pack never calls it; the ops, budget and swarm stores of
+   * `@deuz-sdk/core/ops/redis` and `@deuz-sdk/core/swarm/redis` need nothing
+   * else (see {@link RedisScriptClient}).
+   */
+  eval?(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
 }
 
-/** What the `{ url }` path opens for itself — the seam plus its lifecycle. */
-interface ManagedRedisClient extends RedisClientLike {
-  connect(): Promise<unknown>;
-  quit(): Promise<unknown>;
+/**
+ * The client the 2.3 Redis stores take: one that runs Lua scripts (2.3). Every
+ * read and write of those stores is one script, atomic on the server, so a
+ * connected node-redis client (v4, v5 or v6) or cluster client fits as it is;
+ * wrap ioredis with {@link wrapIoredisClient}. The scripts need Redis 7 or
+ * later.
+ */
+export type RedisScriptClient = Required<Pick<RedisClientLike, 'eval'>>;
+
+/**
+ * The lowercase ioredis commands {@link wrapIoredisClient} calls (2.3). An
+ * ioredis `Redis` or `Cluster` client satisfies it structurally; ioredis is not
+ * a dependency of this package.
+ */
+export interface IoredisClientLike {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<unknown>;
+  del(...keys: string[]): Promise<unknown>;
+  sadd(key: string, ...members: string[]): Promise<unknown>;
+  srem(key: string, ...members: string[]): Promise<unknown>;
+  smembers(key: string): Promise<string[]>;
+  sinter(...keys: string[]): Promise<string[]>;
+  mget(...keys: string[]): Promise<Array<string | null>>;
+  zadd(key: string, ...scoresAndMembers: Array<number | string>): Promise<unknown>;
+  zrem(key: string, ...members: string[]): Promise<unknown>;
+  zrangebyscore(key: string, min: number | string, max: number | string): Promise<string[]>;
+  eval(script: string, numKeys: number, ...keysAndArguments: string[]): Promise<unknown>;
 }
 
-interface RedisModule {
-  createClient(options: { url: string }): ManagedRedisClient;
+const list = (value: string | string[]): string[] => (Array.isArray(value) ? value : [value]);
+
+/**
+ * Fit an ioredis client to the seam (2.3): the store pack's eleven commands
+ * and `eval`, so it serves `createRedisStores` and the ops, budget and swarm
+ * stores alike. ioredis spells commands in lowercase and takes `EVAL`'s key
+ * count positionally; this maps one onto the other and nothing more, so the
+ * connection, its retries and its shutdown stay yours. An empty batch answers
+ * locally, because Redis rejects `MGET` or `DEL` with no key.
+ */
+export function wrapIoredisClient(client: IoredisClientLike): Required<RedisClientLike> {
+  return {
+    get: (key) => client.get(key),
+    set: (key, value) => client.set(key, value),
+    del: async (keys) => (list(keys).length ? client.del(...list(keys)) : 0),
+    sAdd: async (key, members) => (list(members).length ? client.sadd(key, ...list(members)) : 0),
+    sRem: async (key, members) => (list(members).length ? client.srem(key, ...list(members)) : 0),
+    sMembers: (key) => client.smembers(key),
+    sInter: async (keys) => (list(keys).length ? client.sinter(...list(keys)) : []),
+    mGet: async (keys) => (keys.length ? client.mget(...keys) : []),
+    zAdd: async (key, members) => {
+      const entries = Array.isArray(members) ? members : [members];
+      if (!entries.length) return 0;
+      return client.zadd(key, ...entries.flatMap((entry) => [entry.score, entry.value]));
+    },
+    zRem: async (key, members) => (list(members).length ? client.zrem(key, ...list(members)) : 0),
+    zRangeByScore: (key, min, max) => client.zrangebyscore(key, min, max),
+    eval: (script, options) =>
+      client.eval(script, options.keys.length, ...options.keys, ...options.arguments),
+  };
 }
 
 export type RedisStoreOptions =
@@ -112,20 +176,27 @@ export type RedisStoreOptions =
   | {
       /**
        * Connection string for the convenience path. `redis` (node-redis
-       * `^4.6.0 || ^5.0.0`) is an OPTIONAL peer, imported lazily on the first
-       * command — construction itself never touches it — and `close()` quits
-       * exactly this client, because the store opened it.
+       * `^4.6.0 || ^5.0.0 || ^6.0.0`) is an OPTIONAL peer, imported lazily on the
+       * first command — construction itself never touches it — and `close()`
+       * quits exactly this client, because the store opened it.
        */
       url: string;
       prefix?: string;
     };
 
-/** The three seams plus the two operations that belong to the pack, not to a seam. */
+/** The four seams plus the two operations that belong to the pack, not to a seam. */
 export interface RedisStores {
   /** Full `MemoryStore`, including the 2.0 `findByHash` / `deleteExpired` fast paths. */
   memory: Required<MemoryStore>;
   chats: Required<ChatStore>;
   sessions: Required<SessionStore>;
+  /**
+   * Background-run metadata (2.3), as in the SQLite and Postgres packs. One
+   * ZSET per status keeps `list({ status })` an index read; listings come
+   * oldest `createdAt` first. A run has one writer, its worker, which is what
+   * makes `update`'s read-modify-write safe.
+   */
+  runs: Required<RunStore>;
   /**
    * TTL garbage collection: hard-delete every memory whose `expiresAt` is at or
    * before `now` and return how many went. Backed by the `P:mem:expiry` ZSET, so
@@ -186,6 +257,9 @@ function keyspace(prefix: string): {
   chatIndex: string;
   sessionRecord: (runId: string) => string;
   sessionIndex: string;
+  runRecord: (runId: string) => string;
+  runIndex: string;
+  runStatus: (status: string) => string;
 } {
   return {
     memRecord: (id) => `${prefix}:mem:rec:${seg(id)}`,
@@ -197,8 +271,20 @@ function keyspace(prefix: string): {
     chatIndex: `${prefix}:chat:ix`,
     sessionRecord: (runId) => `${prefix}:sess:rec:${seg(runId)}`,
     sessionIndex: `${prefix}:sess:ix`,
+    runRecord: (runId) => `${prefix}:run:rec:${seg(runId)}`,
+    runIndex: `${prefix}:run:ix`,
+    runStatus: (status) => `${prefix}:run:st:${seg(status)}`,
   };
 }
+
+/** Every `RunStatus`: `runs.delete` clears the run from each status index. */
+const RUN_STATUSES: readonly RunStatus[] = [
+  'queued',
+  'running',
+  'suspended',
+  'completed',
+  'failed',
+];
 
 // ===================================================================
 // Pure decoding helpers (a corrupt value is SKIPPED, never thrown)
@@ -223,10 +309,23 @@ function parseChat(json: string): ChatRecord | undefined {
   }
 }
 
+function parseRun(json: string): RunRecord | undefined {
+  try {
+    const value: unknown = JSON.parse(json);
+    if (!value || typeof value !== 'object') return undefined;
+    const record = value as RunRecord;
+    return typeof record.runId === 'string' ? record : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function parseCheckpoint(json: string): AgentCheckpoint | undefined {
   try {
     return deserializeCheckpoint(json);
-  } catch {
+  } catch (error) {
+    // A newer SDK's checkpoint is not a missing one (2.3).
+    if (error instanceof CheckpointVersionError) throw error;
     return undefined;
   }
 }
@@ -260,23 +359,6 @@ function matchesMetadataFilter(
   );
 }
 
-async function openClient(url: string): Promise<ManagedRedisClient> {
-  let mod: RedisModule;
-  try {
-    // `as string` keeps tsup's dts builder from statically resolving the
-    // optional peer (matches node/browser.ts and rag-node.ts).
-    mod = (await import('redis' as string)) as unknown as RedisModule;
-  } catch (err) {
-    throw new Error(
-      'createRedisStores({ url }) requires the optional peer `redis` (node-redis v4 or v5). Install it with `npm i redis`, or pass a client you connected yourself: createRedisStores({ client }).',
-      { cause: err },
-    );
-  }
-  const client = mod.createClient({ url });
-  await client.connect();
-  return client;
-}
-
 // ===================================================================
 // The pack
 // ===================================================================
@@ -299,33 +381,12 @@ async function openClient(url: string): Promise<ManagedRedisClient> {
  */
 export function createRedisStores(options: RedisStoreOptions): RedisStores {
   const k = keyspace(options.prefix ?? DEFAULT_PREFIX);
-  let opened: Promise<ManagedRedisClient> | undefined;
-  let closed = false;
-
+  const connection = redisConnection<RedisClientLike>(options, {
+    factory: 'createRedisStores',
+    noun: 'store pack',
+  });
   /** The client for the next command (injected as-is, or lazily opened ONCE). */
-  const use = async (): Promise<RedisClientLike> => {
-    if ('client' in options) return options.client;
-    if (closed) {
-      throw new Error(
-        'createRedisStores({ url }): this store pack is closed. close() quit the connection it ' +
-          'opened, and a closed pack does not reconnect — silently opening a second connection ' +
-          'nobody will ever quit is how a long-lived process runs out of them. Build a new pack ' +
-          'with createRedisStores({ url }), or inject a client whose lifecycle you own: ' +
-          'createRedisStores({ client }).',
-      );
-    }
-    const pending = opened ?? openClient(options.url);
-    if (pending !== opened) {
-      opened = pending;
-      // A failed connect must not poison the pack for its whole life: forget
-      // the rejected promise so the next call retries instead of replaying it.
-      // Guarded by identity, so a later successful connection is never dropped.
-      pending.catch(() => {
-        if (opened === pending) opened = undefined;
-      });
-    }
-    return pending;
-  };
+  const use = connection.use;
 
   // --- memory plumbing ------------------------------------------------------
 
@@ -622,20 +683,82 @@ export function createRedisStores(options: RedisStoreOptions): RedisStores {
     },
   };
 
+  // --- runs (2.3) -----------------------------------------------------------
+
+  const readRun = async (runId: string): Promise<RunRecord | undefined> => {
+    const client = await use();
+    const json = await client.get(k.runRecord(runId));
+    return typeof json === 'string' ? parseRun(json) : undefined;
+  };
+
+  /**
+   * The new status index first, the record, then the stale status index: a
+   * crash between them leaves a membership the record contradicts, which
+   * `list({ status })` filters out, and never a run its own status cannot find.
+   */
+  const writeRun = async (record: RunRecord, previous: RunRecord | undefined): Promise<void> => {
+    const client = await use();
+    const member: RedisZMember = { score: record.createdAt, value: record.runId };
+    await client.zAdd(k.runIndex, member);
+    await client.zAdd(k.runStatus(record.status), member);
+    await client.set(k.runRecord(record.runId), JSON.stringify(record));
+    if (previous && previous.status !== record.status)
+      await client.zRem(k.runStatus(previous.status), record.runId);
+  };
+
+  const runs: Required<RunStore> = {
+    async create(record: RunRecord) {
+      // A second create under the same runId replaces the run, as in SQLite and Postgres.
+      await writeRun(record, await readRun(record.runId));
+    },
+
+    async update(runId, patch) {
+      const existing = await readRun(runId);
+      if (!existing) return; // unknown run — the same no-op as every RunStore
+      await writeRun({ ...existing, ...patch, runId }, existing);
+    },
+
+    get: readRun,
+
+    async list(filter) {
+      const client = await use();
+      const status = filter?.status;
+      const ids = await client.zRangeByScore(
+        status ? k.runStatus(status) : k.runIndex,
+        '-inf',
+        '+inf',
+      );
+      if (ids.length === 0) return [];
+      const rows = await client.mGet(ids.map((id) => k.runRecord(id)));
+      const out: RunRecord[] = [];
+      for (const json of rows) {
+        if (typeof json !== 'string') continue;
+        const record = parseRun(json);
+        // The record's own status decides, never the membership that led here.
+        if (record && (!status || record.status === status)) out.push(record);
+      }
+      return out;
+    },
+
+    async delete(runId) {
+      const client = await use();
+      const existing = await readRun(runId);
+      await client.del(k.runRecord(runId));
+      // Unconditional, like the other seams' deletes: an orphan membership left
+      // by a crashed write is reachable from the runId alone.
+      await client.zRem(k.runIndex, runId);
+      const statuses = new Set<string>(RUN_STATUSES);
+      if (existing) statuses.add(existing.status);
+      for (const status of statuses) await client.zRem(k.runStatus(status), runId);
+    },
+  };
+
   return {
     memory,
     chats,
     sessions,
+    runs,
     sweepExpiredMemories: (now = Date.now()) => deleteExpiredRecords(now),
-    async close() {
-      // Marked before the await: `use()` reads this flag, so a call racing the
-      // quit must not slip through and re-open behind it.
-      closed = true;
-      const pending = opened;
-      opened = undefined;
-      if (!pending) return; // injected client, or never connected — not ours
-      const client = await pending.catch(() => undefined);
-      await client?.quit();
-    },
+    close: connection.close,
   };
 }

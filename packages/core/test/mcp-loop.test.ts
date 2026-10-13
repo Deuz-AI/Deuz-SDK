@@ -31,6 +31,7 @@ import {
   type McpPoolOptions,
 } from '../src/mcp/resolve';
 import type { McpClient } from '../src/mcp/shared';
+import type { McpHttpLoopConfig } from '../src/types/config';
 import type { Logger } from '../src/types/deps';
 import type { JSONSchema } from '../src/types/schema';
 import type { StreamPart } from '../src/types/stream';
@@ -696,6 +697,24 @@ describe('resolveMcpForLoop — closeOwned()', () => {
     expect(runtime.changed()).toBe(false);
     await runtime.closeOwned();
   });
+
+  it('forwards an entry’s sdk and versionNegotiation to the connection it opens (2.3)', async () => {
+    const server = await startServer();
+    const { logger } = captureLogger();
+    const v1: McpHttpLoopConfig = { url: server.url, sdk: 'v1' };
+    const v2: McpHttpLoopConfig = { url: server.url, sdk: 'v2', versionNegotiation: 'legacy' };
+
+    const runtime = await resolveMcpForLoop([v1, v2], { logger });
+    try {
+      expect(runtime.clients.map((c) => c.sdk?.())).toEqual(['v1', 'v2']);
+      expect(runtime.clients.map((c) => c.protocolVersion?.())).toEqual([
+        '2025-11-25',
+        '2025-11-25',
+      ]);
+    } finally {
+      await runtime.closeOwned();
+    }
+  }, 20_000);
 
   it('rejects with an actionable message when a server is unreachable', async () => {
     const dead = await startTestMcpServer();

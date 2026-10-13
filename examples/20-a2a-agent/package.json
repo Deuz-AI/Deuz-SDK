@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/20-a2a-agent",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A native agent run served over A2A: an in-process client answers its approval and gets the typed result as an artifact.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

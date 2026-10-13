@@ -26,6 +26,15 @@ import {
 import { applyProviderOptions } from '../internal/provider-options';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
+import {
+  assertToolSurface,
+  describeToolChoice,
+  effortWire,
+  isForcedToolChoice,
+  optionalOutputCap,
+  planEffort,
+  reportClamp,
+} from '../core/request-rules';
 
 // --- request building ---
 
@@ -47,8 +56,34 @@ type OpenAIContentBlock =
 interface OpenAIMessage {
   role: string;
   content: string | OpenAIContentBlock[] | null;
+  /** DeepSeek / Kimi: the turn's own reasoning, sent back with its tool calls (2.3). */
+  reasoning_content?: string;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
+}
+
+/**
+ * Hosts whose `reasoning_content` must ride back on an assistant tool-call
+ * message (2.3, F21): DeepSeek's thinking mode and Kimi's reasoning models keep
+ * reasoning across a tool conversation. Matches the model profile's
+ * `'reasoning-content'` replay. Researched 2026-10-09, not live-verified.
+ */
+const REASONING_CONTENT_HOSTS: ReadonlySet<string> = new Set(['deepseek', 'moonshot']);
+
+/**
+ * The reasoning `provider` itself produced on this turn, joined as its
+ * `reasoning_content`; empty for any other host, and for another family's
+ * reasoning, which is never replayed.
+ */
+function ownReasoningContent(content: Part[], provider: string): string {
+  if (!REASONING_CONTENT_HOSTS.has(provider)) return '';
+  return content
+    .filter(
+      (p): p is Extract<Part, { type: 'reasoning' }> =>
+        p.type === 'reasoning' && p.source === provider && !p.encrypted && !p.redacted,
+    )
+    .map((p) => p.text)
+    .join('');
 }
 
 /**
@@ -76,6 +111,9 @@ function toOpenAIMessages(
 ): OpenAIMessage[] {
   const out: OpenAIMessage[] = [];
   for (const m of messages) {
+    // A system message without text carries nothing for this wire (2.3, F22:
+    // a Claude 5.x tool-set change rides on one).
+    if (m.role === 'system' && !m.content.some((p) => p.type === 'text')) continue;
     const role =
       m.role === 'system' && useDeveloperRole
         ? 'developer'
@@ -106,9 +144,11 @@ function toOpenAIMessages(
       .join('');
 
     if (toolUses.length > 0) {
+      const reasoning = ownReasoningContent(m.content, media.provider);
       out.push({
         role: 'assistant',
         content: text || null,
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
         tool_calls: toolUses.map((t) => ({
           id: t.id,
           type: 'function',
@@ -178,7 +218,8 @@ function toOpenAIMessages(
         if (blocks.some((b) => b.type !== 'text')) out.push({ role, content: blocks });
         else out.push({ role, content: text });
       } else {
-        // Reasoning parts have no Chat Completions round-trip — dropped here.
+        // Reasoning rides back only on a tool-call turn (above); a text turn
+        // carries none.
         out.push({ role, content: text });
       }
     }
@@ -186,10 +227,25 @@ function toOpenAIMessages(
   return out;
 }
 
-/** Map canonical tool choice → OpenAI. undefined ⇒ omit (provider default 'auto'). */
-function mapOpenAIToolChoice(choice: ToolChoice | undefined): string | object | undefined {
+/**
+ * Map canonical tool choice → OpenAI. undefined ⇒ omit (provider default
+ * 'auto'). A forced choice the row says the model rejects is omitted too —
+ * reported as a `clamped-setting` (2.3).
+ */
+function mapOpenAIToolChoice(
+  ctx: BuildContext,
+  choice: ToolChoice | undefined,
+): string | object | undefined {
   if (!choice || choice === 'auto') return undefined;
   if (choice === 'none') return 'none';
+  if (ctx.caps.forcedToolChoice === false && isForcedToolChoice(choice)) {
+    reportClamp(
+      ctx,
+      'toolChoice',
+      `toolChoice ${describeToolChoice(choice)} was sent as 'auto': ${ctx.call.modelId} rejects a forced tool_choice.`,
+    );
+    return undefined;
+  }
   if (choice === 'required') return 'required';
   if (typeof choice === 'object' && choice.type === 'tool') {
     return { type: 'function', function: { name: choice.toolName } };
@@ -199,8 +255,9 @@ function mapOpenAIToolChoice(choice: ToolChoice | undefined): string | object | 
 
 function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options, object, tools, logger, warnings } = ctx;
-  const reasoning = caps.reasoning;
   const restricted = caps.samplingRestrictions;
+  // A model that takes tools only on another wire fails here, before any I/O.
+  assertToolSurface(ctx, 'chat_completions');
 
   const body: Record<string, unknown> = {
     model: call.modelId,
@@ -214,20 +271,24 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     stream: true,
   };
 
-  // Reasoning models use max_completion_tokens and reject sampling params.
-  const maxTokens = options.maxOutputTokens ?? caps.maxOutput;
+  // Reasoning models use max_completion_tokens and reject sampling params. An
+  // unknown model's placeholder cap is left off (2.3) — the host's own default
+  // bounds it instead of the SDK's 4096 guess.
+  const maxTokens = optionalOutputCap(caps, options);
   if (restricted) {
-    body.max_completion_tokens = maxTokens;
+    if (maxTokens !== undefined) body.max_completion_tokens = maxTokens;
   } else {
-    body.max_tokens = maxTokens;
+    if (maxTokens !== undefined) body.max_tokens = maxTokens;
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.topP !== undefined) body.top_p = options.topP;
   }
   if (options.stopSequences) body.stop = options.stopSequences;
-  if (reasoning && options.effort !== undefined) {
-    // OpenAI accepts 'none' as a real value; 'max' is Anthropic-only → clamp.
-    body.reasoning_effort = options.effort === 'max' ? 'xhigh' : options.effort;
-  }
+  // OpenAI accepts 'none' as a real value; 'max' reaches the wire only for a
+  // model that lists it (2.3), elsewhere it clamps to xhigh — reported. An
+  // always-reasoning model (DeepSeek v4) never gets 'none'.
+  const effort = planEffort(ctx, effortWire('chat_completions', caps, call.modelId));
+  if (effort.none) body.reasoning_effort = 'none';
+  else if (effort.level !== undefined) body.reasoning_effort = effort.level;
 
   // Stream-usage opt-in. Despite docs claiming Gemini-compat emits usage on
   // every chunk regardless, in practice it stays silent without this flag — so
@@ -254,7 +315,13 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       ];
       body.tool_choice = { type: 'function', function: { name } };
     }
-  } else if (tools && tools.tools.length > 0) {
+  }
+  // A json-strategy object request keeps the call's tools and their tool_choice
+  // beside `response_format` (2.3, F15): runAgent's finalization asks with the
+  // loop's tools and `toolChoice: 'none'`, so its request prefix stays the
+  // loop's. The tool strategy forces its own call instead. Not live-verified,
+  // and a compatible host may not accept the combination.
+  if (object?.strategy !== 'tool' && tools && tools.tools.length > 0) {
     // Chat Completions has no hosted tools — provider-executed entries are
     // dropped. The drop MUST be loud: ~15 provider ids ride this wire, and a
     // silently removed `openaiWebSearch()` looks exactly like a model that
@@ -289,10 +356,10 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
           parameters: t.parameters,
         },
       }));
-    const tc = mapOpenAIToolChoice(tools.toolChoice);
+    const tc = mapOpenAIToolChoice(ctx, tools.toolChoice);
     if (tc !== undefined) body.tool_choice = tc;
     if (tools.allowParallel === false) body.parallel_tool_calls = false;
-  } else if (options.responseFormat === 'json') {
+  } else if (!object && options.responseFormat === 'json') {
     body.response_format = { type: 'json_object' };
   }
 
@@ -340,12 +407,18 @@ interface OpenAIUsage {
   total_tokens?: number;
   prompt_tokens_details?: { cached_tokens?: number; audio_tokens?: number };
   completion_tokens_details?: { reasoning_tokens?: number; audio_tokens?: number };
+  /** DeepSeek: the cached share of `prompt_tokens`. */
+  prompt_cache_hit_tokens?: number;
+  /** Moonshot: the cached share of `prompt_tokens`, reported top-level. */
+  cached_tokens?: number;
 }
 
 interface OpenAIChunk {
   choices?: {
     delta?: {
       content?: string;
+      /** The model's refusal text, streamed like content (openai 7.32: `string | null`). */
+      refusal?: string | null;
       reasoning_content?: string;
       tool_calls?: {
         index?: number;
@@ -359,35 +432,60 @@ interface OpenAIChunk {
   usage?: OpenAIUsage | null;
 }
 
-function mapFinish(reason: string | null | undefined): FinishReason {
+/**
+ * A Chat Completions turn's finish reason, shared with the batch parser. A
+ * turn that carried the model's refusal text is a refused one (2.3; it ended
+ * with 'stop' or 'tool_calls' before): it ends with 'content_filter', so the
+ * finish-reason gate holds back its calls, unless the provider reported a limit.
+ */
+export function mapChatFinishReason(reason: unknown, refused = false): FinishReason {
   switch (reason) {
     case 'length':
       return 'length';
-    case 'tool_calls':
-    case 'function_call':
-      return 'tool_calls';
     case 'content_filter':
       return 'content_filter';
+    case 'tool_calls':
+    case 'function_call':
+      return refused ? 'content_filter' : 'tool_calls';
     default:
-      return 'stop';
+      return refused ? 'content_filter' : 'stop';
   }
 }
 
+/**
+ * Chat Completions usage → the canonical contract (`outputTokens` includes
+ * reasoning; `inputTokens` excludes cached reads). OpenAI's completion_tokens
+ * already include reasoning_tokens. Hosts that count reasoning beside the
+ * completion (xAI's shape) give themselves away: their total is prompt +
+ * completion + reasoning, or the reasoning exceeds the completion; reasoning is
+ * then folded into the output. Cache hits are read from whichever counter the
+ * host reports. Host shapes beyond OpenAI's are not live-verified.
+ */
 export function mapOpenAIUsage(u: OpenAIUsage | null | undefined): Usage {
   const prompt = u?.prompt_tokens ?? 0;
-  const cached = u?.prompt_tokens_details?.cached_tokens ?? 0;
+  // One hit may appear in several fields; never count it twice.
+  const cached = Math.max(
+    u?.prompt_tokens_details?.cached_tokens ?? 0,
+    u?.prompt_cache_hit_tokens ?? 0,
+    u?.cached_tokens ?? 0,
+  );
   const completion = u?.completion_tokens ?? 0;
+  const reasoning = u?.completion_tokens_details?.reasoning_tokens ?? 0;
+  const reasoningApart =
+    reasoning > 0 &&
+    (reasoning > completion || u?.total_tokens === prompt + completion + reasoning);
+  const output = reasoningApart ? completion + reasoning : completion;
   const audio =
     (u?.prompt_tokens_details?.audio_tokens ?? 0) +
     (u?.completion_tokens_details?.audio_tokens ?? 0);
   const usage: Usage = {
     inputTokens: Math.max(0, prompt - cached),
-    outputTokens: completion,
-    reasoningTokens: u?.completion_tokens_details?.reasoning_tokens ?? 0,
+    outputTokens: output,
+    reasoningTokens: reasoning,
     cachedReadTokens: cached,
-    cacheWriteTokens: 0,
+    cacheWriteTokens: 0, // no cache-write counter in Chat Completions usage
     cacheWrite1hTokens: 0,
-    totalTokens: u?.total_tokens ?? prompt + completion,
+    totalTokens: u?.total_tokens ?? prompt + output,
   };
   if (audio > 0) usage.audioTokens = audio;
   return usage;
@@ -398,7 +496,9 @@ async function* parseStream(
   _ctx: ParseContext,
 ): AsyncGenerator<StreamPart> {
   let lastUsage: OpenAIUsage | null | undefined;
-  let finishReason: FinishReason = 'stop';
+  let finish: string | undefined;
+  // The model's refusal (2.3): kept for the caller, never streamed as answer text.
+  let refusal = '';
   const toolIdByIndex = new Map<number, string>();
 
   for await (const ev of parseSSE(body)) {
@@ -415,7 +515,11 @@ async function* parseStream(
     if (!choice) continue;
     const delta = choice.delta;
     if (delta?.content) yield { type: 'text-delta', text: delta.content };
-    if (delta?.reasoning_content) yield { type: 'reasoning-delta', text: delta.reasoning_content };
+    if (typeof delta?.refusal === 'string') refusal += delta.refusal;
+    // The host's own reasoning, marked so only that host ever gets it back (2.3).
+    if (delta?.reasoning_content) {
+      yield { type: 'reasoning-delta', text: delta.reasoning_content, source: _ctx.provider };
+    }
     if (delta?.tool_calls) {
       for (const tc of delta.tool_calls) {
         const index = tc.index ?? 0;
@@ -431,13 +535,19 @@ async function* parseStream(
         };
       }
     }
-    if (choice.finish_reason) finishReason = mapFinish(choice.finish_reason);
+    if (choice.finish_reason) finish = choice.finish_reason;
   }
 
   _ctx.usageAvailable?.(
     typeof lastUsage?.prompt_tokens === 'number' && typeof lastUsage.completion_tokens === 'number',
   );
-  yield { type: 'finish', usage: mapOpenAIUsage(lastUsage), finishReason };
+  yield {
+    type: 'finish',
+    usage: mapOpenAIUsage(lastUsage),
+    finishReason: mapChatFinishReason(finish, refusal !== ''),
+    // The batch parser's key: `stopDetailsFrom` reads it as the stop's explanation.
+    ...(refusal ? { providerMetadata: { openai: { refusal } } } : {}),
+  };
 }
 
 // --- error mapping ---

@@ -7,6 +7,7 @@ import type {
   ToolSet,
   ToolChoice,
   ToolCall,
+  ToolCallOutcome,
   ToolResult,
   ToolExecuteContext,
   ToolApprovalRequest,
@@ -41,21 +42,31 @@ import type { MemoryMutation, MemoryScorer } from '../memory';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import {
   applyCompaction,
+  isSummaryMessage,
   normalizeCompaction,
   type ApplyCompactionCtx,
   type NormalizedCompaction,
   type CompactionEvent,
 } from './compaction';
 import { createTokenEstimator, type TokenEstimator } from '../internal/estimate-tokens';
+import { withCapabilityOverride } from '../internal/config-symbol';
 import { attachClientContext, readClientContext } from '../internal/client-context';
 // Type-only: the sink itself is created by the loop (or not at all), so nothing
 // from internal/warnings.ts is pulled into a bundle that never collects one.
 import type { WarningSink } from '../internal/warnings';
+import type { CallWarning } from '../types/methods';
 // Type-only for the same reason as `mcp/shared` in types/config.ts: the MCP
 // runtime is reached through a LITERAL dynamic import in `setupMcp` below, so a
 // call without `options.mcp` pulls none of that module graph into the bundle.
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
 import { getCapabilities } from '../core/registry';
+import {
+  bindsThinkingToPrefix,
+  isRecallMessage,
+  recallMessage,
+  toolSetChangeMessage,
+  toolSetChangeOf,
+} from '../internal/stable-prefix';
 import { toJSONSchema, validateOutput } from '../schema/bridge';
 import { mapWithConcurrency } from '../internal/p-limit';
 // `resolveTimeouts` is the SINGLE resolution point for every timeout layer
@@ -99,6 +110,29 @@ export function preserveClientContext<O extends object>(source: object, cloned: 
 /** Denial message fed back to the model as an is_error tool_result. */
 export const TOOL_DENIED = 'Tool call denied.';
 
+/** The `is_error` answer a denied call gets (the model reads the reason, when there is one). */
+function deniedResult(call: ToolCall, denial: Denial): ToolResult {
+  return {
+    toolCallId: call.toolCallId,
+    toolName: call.toolName,
+    result: denial.reason ? `${TOOL_DENIED} Reason: ${denial.reason}` : TOOL_DENIED,
+    isError: true,
+    outcome: denial.outcome,
+  };
+}
+
+/**
+ * The tool call an execution-policy refusal names (2.3), when `error` is one:
+ * the run fails, and the loop reports that call as `'permission-denied'` first.
+ * Read structurally, so the eager loop bundle does not load the policy module.
+ */
+export function policyRefusalOf(error: unknown): string | undefined {
+  const e = error as { name?: unknown; toolCallId?: unknown } | null;
+  return e && e.name === 'ExecutionPolicyError' && typeof e.toolCallId === 'string'
+    ? e.toolCallId
+    : undefined;
+}
+
 /**
  * A denial verdict for one tool call. `reason` is the free-text fed back to
  * the model (unchanged strings); `cause` is the machine-readable origin for
@@ -107,6 +141,12 @@ export const TOOL_DENIED = 'Tool call denied.';
 export interface Denial {
   cause: ToolDeniedEvent['cause'];
   reason?: string;
+  /**
+   * What the result reports (2.3): which step of the dispatch contract refused
+   * the call. `cause` cannot say it: a guardrail block reports `'server-denied'`
+   * like an approver's no, because the observe union is locked.
+   */
+  outcome: ToolCallOutcome;
 }
 export type DenialMap = Map<string, Denial>;
 
@@ -140,6 +180,13 @@ export interface DurableRunner {
   /** Step boundaries saved so far across ALL legs (monotonic). */
   stepIndex: number;
   /**
+   * Approval requests this loop's gate issued under each tool call id, across
+   * all legs (2.3): `AgentCheckpoint.approvalRequestCounts`. Counted when a
+   * suspension is saved, and carried on every checkpoint. A map, because the
+   * keys are provider call ids.
+   */
+  approvalRequestCounts: Map<string, number>;
+  /**
    * Active-agent transfer state (2.0), set by the loop the moment a handoff is
    * accepted and carried onto EVERY later checkpoint. Held here rather than
    * threaded through `saveCheckpoint`'s argument list because the two loops save
@@ -151,15 +198,41 @@ export interface DurableRunner {
   observe?: { rt: ObservationRuntime; runSpanId: string };
 }
 
+/** The cross-leg counters a resumed leg continues from its checkpoint. */
+export interface DurableResume {
+  stepIndex: number;
+  usage: Usage;
+  /** `AgentCheckpoint.approvalRequestCounts` (2.3), when the checkpoint has one. */
+  approvalRequestCounts?: Record<string, number>;
+}
+
+/** The {@link DurableResume} of a stored checkpoint. */
+export function durableResumeOf(checkpoint: AgentCheckpoint): DurableResume {
+  return {
+    stepIndex: checkpoint.stepIndex,
+    usage: checkpoint.usage,
+    ...(checkpoint.approvalRequestCounts
+      ? { approvalRequestCounts: checkpoint.approvalRequestCounts }
+      : {}),
+  };
+}
+
+/** A checkpoint's `approvalRequestCounts` as a map; empty when it has none. */
+export function requestCountsOf(
+  record: Readonly<Record<string, number>> | undefined,
+): Map<string, number> {
+  return new Map(record ? Object.entries(record) : []);
+}
+
 /**
  * Build the durable runner when the call carries `session`; otherwise
  * undefined (zero overhead). `resumeFrom` seeds the cross-leg counters on a
- * `resumeFromCheckpoint` leg.
+ * `resumeFromCheckpoint` leg; a plain leg reads them with {@link continueStoredRun}.
  */
 export function setupDurable(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
-  resumeFrom?: { stepIndex: number; usage: Usage },
+  resumeFrom?: DurableResume,
 ): DurableRunner | undefined {
   if (!options.session) return undefined;
   return {
@@ -167,7 +240,46 @@ export function setupDurable(
     runId: options.session.runId ?? deps.generateId(),
     baseUsage: resumeFrom?.usage ?? EMPTY_USAGE,
     stepIndex: resumeFrom?.stepIndex ?? 0,
+    approvalRequestCounts: requestCountsOf(resumeFrom?.approvalRequestCounts),
   };
+}
+
+/**
+ * A plain leg of a stored durable run (2.3): a call that carries the run's
+ * `session` without `resumeFromCheckpoint`. It continues the stored run's step
+ * counter and approval-request count, so the run never saves the same step
+ * boundary twice and an approval bound to a step is never issued again by a
+ * later leg. Returns the step the stored run is suspended at: the step its
+ * pending approvals are bound to, which the leg's settle needs. A run id the
+ * caller did not pass has nothing stored.
+ *
+ * A failed read is logged and the leg counts from 0, as before; under
+ * `durability: 'strict'` it fails the call instead.
+ */
+export async function continueStoredRun(
+  runner: DurableRunner,
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+): Promise<number | undefined> {
+  if (options.session?.runId === undefined) return undefined;
+  let stored: AgentCheckpoint | undefined;
+  try {
+    stored = await runner.store.load(runner.runId);
+  } catch (cause) {
+    if (options.session.durability === 'strict') {
+      throw new ExecutionPersistenceError(
+        `Checkpoint of run '${runner.runId}' could not be read.`,
+        cause,
+      );
+    }
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    deps.logger.error(`durable: checkpoint load failed for '${runner.runId}' — ${detail}`);
+    return undefined;
+  }
+  if (!stored || !Number.isSafeInteger(stored.stepIndex) || stored.stepIndex < 0) return undefined;
+  runner.stepIndex = stored.stepIndex;
+  runner.approvalRequestCounts = requestCountsOf(stored.approvalRequestCounts);
+  return stored.status === 'suspended' ? stored.stepIndex : undefined;
 }
 
 /** Cumulative run usage (prior legs + this leg) for checkpoints and stop conditions. */
@@ -192,6 +304,16 @@ export async function saveCheckpoint(
 ): Promise<void> {
   if (runner.cost) await runner.cost.flush();
   runner.stepIndex += 1;
+  // A suspension on this loop's own gate counts each request under its tool
+  // call id (2.3). A sub-agent's requests ride the parent's save too, but they
+  // belong to the child run, and its own checkpoint counts them.
+  if (status === 'suspended') {
+    const counts = runner.approvalRequestCounts;
+    for (const request of pendingApprovals ?? []) {
+      if (!sameApprovalValue(request.agentPath ?? [], options.agentPath ?? [])) continue;
+      counts.set(request.toolCallId, (counts.get(request.toolCallId) ?? 0) + 1);
+    }
+  }
   const checkpoint: AgentCheckpoint = {
     version: 1,
     runId: runner.runId,
@@ -202,6 +324,9 @@ export async function saveCheckpoint(
     usage: withTotal(durableUsage(runner, legUsage)),
     ...(runner.cost ? { cost: runner.cost.snapshot() } : {}),
     ...(pendingApprovals && pendingApprovals.length > 0 ? { pendingApprovals } : {}),
+    ...(runner.approvalRequestCounts.size > 0
+      ? { approvalRequestCounts: Object.fromEntries(runner.approvalRequestCounts) }
+      : {}),
     // Handoff (2.0): absent until a transfer happens, then on every checkpoint
     // of the run — the resume leg re-applies the overlay from it.
     ...(runner.handoff ? { handoff: runner.handoff } : {}),
@@ -256,18 +381,142 @@ export async function saveCheckpoint(
   }
 }
 
-/** Tag pending approvals with the loop's sub-agent path (root loops pass undefined). */
-export function toApprovalRequests(
+/**
+ * What an approval is bound to besides the call itself (2.3): the durable run,
+ * and the step it suspended at — the `stepIndex` of its suspended checkpoint.
+ * Both are absent on a call without a `session`: it has no run, and a chat UI
+ * folds each request's steps into one assistant turn, so no step survives the
+ * round trip. Such an approval binds the call id, the tool and the arguments.
+ */
+export interface ApprovalScope {
+  runId?: string;
+  step?: number;
+  /**
+   * The run's approval-request count per tool call id (its runner's). Not part
+   * of the identity: it tells a settle which ids the 2.2 form can still name.
+   */
+  approvalRequestCounts?: ReadonlyMap<string, number>;
+}
+
+/** Hex digits of the approval digest kept in an `approvalId` (96 bits). */
+const APPROVAL_DIGEST_HEX = 24;
+
+/** JSON with object keys sorted, so key order never changes an approval digest. */
+function canonicalJson(value: unknown): string {
+  const sorted = (item: unknown): unknown => {
+    const plain =
+      item !== null &&
+      typeof item === 'object' &&
+      typeof (item as { toJSON?: unknown }).toJSON === 'function'
+        ? (item as { toJSON(): unknown }).toJSON()
+        : item;
+    if (Array.isArray(plain)) return plain.map(sorted);
+    if (plain === null || typeof plain !== 'object') return plain;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(plain).sort()) {
+      out[key] = sorted((plain as Record<string, unknown>)[key]);
+    }
+    return out;
+  };
+  try {
+    return JSON.stringify(sorted(value)) ?? 'undefined';
+  } catch {
+    // Arguments come from JSON; only a guardrail's rewrite can be unserializable.
+    return String(value);
+  }
+}
+
+/**
+ * The `approvalId` a gated call is issued under (2.3): its tool call id, then a
+ * digest of everything the approval covers — the run, the step, the sub-agent
+ * path, the call id, the tool and the arguments. A verdict names it, so one kept
+ * from an earlier gate never approves what the model issues later under the same
+ * provider call id (`tool_0` again): another tool, other arguments, or the same
+ * call at another step.
+ */
+export async function approvalIdOf(
+  call: ToolCall,
+  agentPath: string[] | undefined,
+  scope: ApprovalScope,
+): Promise<string> {
+  const identity = JSON.stringify([
+    'deuz.approval.v1',
+    scope.runId ?? null,
+    scope.step ?? null,
+    agentPath ?? [],
+    call.toolCallId,
+    call.toolName,
+    canonicalJson(call.args),
+  ]);
+  const digest = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity)),
+  );
+  let hex = '';
+  for (const byte of digest.subarray(0, APPROVAL_DIGEST_HEX / 2)) {
+    hex += byte.toString(16).padStart(2, '0');
+  }
+  return `${call.toolCallId}@${hex}`;
+}
+
+/** Pending approvals, bound to their identity and tagged with the loop's sub-agent path. */
+export async function toApprovalRequests(
   calls: ToolCall[],
   agentPath: string[] | undefined,
-): ToolApprovalRequest[] {
-  return calls.map((c) => ({
-    approvalId: c.toolCallId,
-    toolCallId: c.toolCallId,
-    toolName: c.toolName,
-    input: c.args,
-    ...(agentPath && agentPath.length > 0 ? { agentPath } : {}),
-  }));
+  scope: ApprovalScope,
+): Promise<ToolApprovalRequest[]> {
+  return Promise.all(
+    calls.map(async (c) => ({
+      approvalId: await approvalIdOf(c, agentPath, scope),
+      toolCallId: c.toolCallId,
+      toolName: c.toolName,
+      input: c.args,
+      ...(agentPath && agentPath.length > 0 ? { agentPath } : {}),
+    })),
+  );
+}
+
+/**
+ * Whether `responses` hold a verdict for `request` (2.3): one naming its
+ * `approvalId`, or the 2.2 form, its bare tool call id, when the run used that
+ * id once (see {@link reusedToolCallIds}; `counts` is the run's
+ * approval-request count). The settle applies the same rule (`settleVerdicts`).
+ */
+export function answersApproval(
+  request: ToolApprovalRequest,
+  responses: readonly ToolApprovalResponse[] | undefined,
+  messages: Message[],
+  counts?: ReadonlyMap<string, number>,
+): boolean {
+  if (!responses || responses.length === 0) return false;
+  if (responses.some((response) => response.approvalId === request.approvalId)) return true;
+  return (
+    responses.some((response) => response.approvalId === request.toolCallId) &&
+    !reusedToolCallIds(messages, counts).has(request.toolCallId)
+  );
+}
+
+/**
+ * Tool call ids the 2.2 verdict form cannot name: ids that occur more than once
+ * among the history's `tool_use` parts (a provider without call ids numbers each
+ * response's calls from `tool_0`), and (2.3) ids the run issued more than one
+ * approval request under (`counts`). The history alone is not enough, because
+ * compaction or a `prepareStep` window drops earlier calls from it; the count
+ * keeps them. A checkpoint written without the count leaves the history to
+ * decide alone.
+ */
+function reusedToolCallIds(messages: Message[], counts?: ReadonlyMap<string, number>): Set<string> {
+  const seen = new Set<string>();
+  const reused = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== 'tool_use') continue;
+      if (seen.has(part.id)) reused.add(part.id);
+      seen.add(part.id);
+    }
+  }
+  for (const [id, count] of counts ?? []) if (count > 1) reused.add(id);
+  return reused;
 }
 
 /**
@@ -361,7 +610,7 @@ export async function resolveServerApprovals(
         } catch {
           ok = false;
         }
-        if (!ok) denied.set(c.toolCallId, { cause: 'server-denied' });
+        if (!ok) denied.set(c.toolCallId, { cause: 'server-denied', outcome: 'approval-denied' });
       }),
   );
   return denied;
@@ -442,6 +691,105 @@ export function filterWireTools(
   return { ...wire, tools };
 }
 
+// --- The tool set on a stable prefix (2.3, F22) --------------------------------
+//
+// Claude 5.x binds its thinking to the `tools` array as much as to the
+// messages (`internal/stable-prefix.ts`). On such a model a run leg declares
+// ONE array — the root agent's static wire, the same on every leg of the run —
+// and a step that offers another set says so with an appended tool-set change
+// instead of a different array. A removal is only a hint to the model, so the
+// step's calls resolve against the offered set: a withdrawn tool is answered
+// like an unknown one and never runs.
+
+const SILENT_LOGGER: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+
+/**
+ * The wire the ROOT agent offers on every step absent `prepareStep`: the call's
+ * tools (MCP tools merged in) filtered by its static `activeTools`. What a
+ * stable-prefix leg declares; a leg that starts as the root agent already
+ * built it (its static wire). Silent: the loop reported its warnings already.
+ */
+export async function rootStaticWire(
+  options: CommonCallOptions,
+  mcp: ResolvedMcpRuntime | undefined,
+): Promise<WireToolRequest> {
+  return filterWireTools(
+    await buildWireTools(
+      mergeMcpTools(mcp, options.tools),
+      options.toolChoice,
+      options.maxToolConcurrency,
+    ),
+    options.activeTools,
+    SILENT_LOGGER,
+  );
+}
+
+/** What a step sends and dispatches against. */
+export interface StepWire {
+  /** The tool request the model call carries. */
+  wire: WireToolRequest;
+  /** A tool-set change to append to the history before the call. */
+  change?: Message;
+  /** The tool names a call of this step may resolve to; absent: every tool of the run. */
+  offered?: ReadonlySet<string>;
+}
+
+/** Two wire tools are the same tool when they serialize alike. */
+function sameWireTool(a: WireTool, b: WireTool): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** The tools in effect: the declared ones with every change in the history applied, in order. */
+function toolsInEffect(declared: WireTool[], messages: Message[]): Map<string, WireTool> {
+  const effect = new Map(declared.map((t) => [t.name, t]));
+  for (const m of messages) {
+    const change = toolSetChangeOf(m);
+    if (!change) continue;
+    for (const name of change.remove) effect.delete(name);
+    for (const tool of change.add) effect.set(tool.name, tool);
+  }
+  return effect;
+}
+
+/**
+ * Settle the tool request of one step (2.3, F22). On a model that binds
+ * thinking to the prefix the call carries the leg's `declared` array whatever
+ * the step wants, with the step's `toolChoice` and parallel flag (they are
+ * outside the bound prefix); when the step `desired` a set other than the one
+ * in effect, the change is handed back to append to the history first. Any
+ * other model gets the desired wire, as before.
+ */
+export function stabilizeStepWire(
+  model: LanguageModel,
+  declared: WireToolRequest,
+  desired: WireToolRequest,
+  messages: Message[],
+): StepWire {
+  if (!bindsThinkingToPrefix(model)) return { wire: desired };
+  const effect = toolsInEffect(declared.tools, messages);
+  const wanted = new Set(desired.tools.map((t) => t.name));
+  const remove = [...effect.keys()].filter((name) => !wanted.has(name));
+  const add = desired.tools.filter((t) => {
+    const current = effect.get(t.name);
+    return current === undefined || !sameWireTool(current, t);
+  });
+  return {
+    wire: { ...desired, tools: declared.tools },
+    ...(remove.length > 0 || add.length > 0
+      ? { change: toolSetChangeMessage({ remove, add }) }
+      : {}),
+    offered: wanted,
+  };
+}
+
+/** The part of `tools` a step offered (all of it when the step did not narrow). */
+export function offeredTools(tools: ToolSet, offered: ReadonlySet<string> | undefined): ToolSet {
+  if (!offered) return tools;
+  const out: ToolSet = {};
+  for (const [name, tool] of Object.entries(tools)) if (offered.has(name)) out[name] = tool;
+  return out;
+}
+
 // --- Zero-config MCP (2.0): `CommonCallOptions.mcp` -------------------------
 
 /**
@@ -462,6 +810,8 @@ export function filterWireTools(
 export async function setupMcp(
   options: CommonCallOptions,
   deps: ResolvedDependencies,
+  /** Where a collision between two servers is reported (2.3): the loop's warning sink. */
+  warn?: (warning: CallWarning) => void,
 ): Promise<ResolvedMcpRuntime | undefined> {
   const entries = options.mcp;
   if (!entries || entries.length === 0) return undefined;
@@ -472,6 +822,7 @@ export async function setupMcp(
     // an MCP connection opened by the loop must not schedule ambient timers.
     clock: deps.clock,
     ...(deps.mcpPool ? { mcpPool: deps.mcpPool } : {}),
+    ...(warn ? { warn } : {}),
   });
 }
 
@@ -480,13 +831,30 @@ export async function setupMcp(
  * Explicit tools always win a name collision — they were written by hand at the
  * call site, and a remote server must never be able to shadow a local tool by
  * exporting the same name.
+ *
+ * The collision is no longer silent (2.3): each MCP tool a local one shadows is
+ * reported through `warn` as an `unsupported-tool` warning with `setting: 'mcp'`
+ * — the server's tool is not offered, and its owner should know.
  */
 export function mergeMcpTools(
   mcp: ResolvedMcpRuntime | undefined,
   tools: ToolSet | undefined,
+  warn?: (warning: CallWarning) => void,
 ): ToolSet {
   const own = tools ?? {};
-  return mcp ? { ...mcp.tools, ...own } : own;
+  if (!mcp) return own;
+  if (warn) {
+    for (const name of Object.keys(mcp.tools)) {
+      if (Object.prototype.hasOwnProperty.call(own, name)) {
+        warn({
+          type: 'unsupported-tool',
+          setting: 'mcp',
+          message: `mcp: the local tool '${name}' shadows the MCP tool of the same name — the server's tool is not offered`,
+        });
+      }
+    }
+  }
+  return { ...mcp.tools, ...own };
 }
 
 /**
@@ -509,13 +877,96 @@ export async function refreshMcpTools(
   mcp: ResolvedMcpRuntime,
   own: ToolSet,
   deps: ResolvedDependencies,
+  warn?: (warning: CallWarning) => void,
 ): Promise<ToolSet> {
   try {
     await mcp.refresh();
   } catch (error) {
     deps.logger.warn('mcp: tool-list refresh failed — keeping the previous catalog', { error });
   }
-  return mergeMcpTools(mcp, own);
+  return mergeMcpTools(mcp, own, warn);
+}
+
+/** `providerMetadata.deuz.stoppedBy` (and a native stop reason) for a mid-run catalog change. */
+export const MCP_CATALOG_CHANGED_STOPPED_BY = 'mcp-catalog-changed';
+
+/** What a run does when an MCP server changes its tool catalog mid-run (2.3). */
+export type CatalogChangePolicy = 'stop' | 'accept';
+
+/**
+ * A call's `onCatalogChange` (2.3). Native runs declare it on `AgentRunOptions`
+ * and decide it in the runner (default `'stop'`); the legacy loops read it here,
+ * default `'accept'`. An unknown value is refused.
+ */
+export function catalogChangePolicy(options: CommonCallOptions): CatalogChangePolicy {
+  const value = (options as { onCatalogChange?: unknown }).onCatalogChange;
+  if (value === undefined) return 'accept';
+  if (value === 'stop' || value === 'accept') return value;
+  throw new TypeError("onCatalogChange must be 'stop' or 'accept'.");
+}
+
+/** A tool's part of a catalog comparison: its description and schemas. */
+function catalogEntry(tool: Tool): string {
+  return JSON.stringify([tool.description ?? null, tool.parameters, tool.outputSchema ?? null]);
+}
+
+/**
+ * How an MCP catalog changed across a refresh (2.3), as `added: …; removed: …;
+ * changed: …` text; `undefined` when nothing did — servers may announce
+ * `tools/list_changed` without a change.
+ */
+export function mcpCatalogDiff(before: ToolSet, after: ToolSet): string | undefined {
+  const added = Object.keys(after).filter((name) => !Object.hasOwn(before, name));
+  const removed = Object.keys(before).filter((name) => !Object.hasOwn(after, name));
+  const changed = Object.keys(after).filter(
+    (name) =>
+      Object.hasOwn(before, name) && catalogEntry(before[name]!) !== catalogEntry(after[name]!),
+  );
+  const parts = (
+    [
+      ['added', added],
+      ['removed', removed],
+      ['changed', changed],
+    ] as const
+  )
+    .filter(([, names]) => names.length > 0)
+    .map(([kind, names]) => `${kind}: ${names.join(', ')}`);
+  return parts.length > 0 ? parts.join('; ') : undefined;
+}
+
+/** A refresh's verdict: the warnings to report, and whether the run stops. */
+export interface CatalogChangeVerdict {
+  warnings: CallWarning[];
+  stop: boolean;
+}
+
+/**
+ * What a legacy loop does with a catalog that changed mid-run (2.3): `'accept'`
+ * (the default) carries on with it and reports the change; `'stop'` ends the run
+ * before the model is offered the new catalog (`stoppedBy:
+ * 'mcp-catalog-changed'`).
+ */
+export function legacyCatalogVerdict(
+  before: ToolSet,
+  after: ToolSet,
+  policy: CatalogChangePolicy,
+): CatalogChangeVerdict {
+  const drift = mcpCatalogDiff(before, after);
+  if (!drift) return { warnings: [], stop: false };
+  const outcome =
+    policy === 'stop'
+      ? "the run stopped before offering it (onCatalogChange: 'stop')"
+      : 'the run continues with the new catalog';
+  return {
+    warnings: [
+      {
+        type: 'other',
+        setting: 'mcp',
+        message: `MCP tool catalog changed mid-run (${drift}); ${outcome}.`,
+      },
+    ],
+    stop: policy === 'stop',
+  };
 }
 
 /**
@@ -581,6 +1032,11 @@ export async function applyPrepareStep(
     if (ps.activeTools) wire = filterWireTools(fullWire, ps.activeTools, logger, warnings);
     if (ps.toolChoice) wire = { ...wire, toolChoice: ps.toolChoice };
   }
+  // The per-call `capabilities` override follows every model a step resolves to
+  // (2.3, F26): a `prepareStep` model, or a handoff target's, which arrives here
+  // as `options.model`. The root model carries it already; the merge is idempotent.
+  const model = withCapabilityOverride(stepOptions.model, options.capabilities);
+  if (model !== stepOptions.model) stepOptions = { ...stepOptions, model };
   return { options: stepOptions, messages, wire };
 }
 
@@ -944,6 +1400,7 @@ export async function applyToolCallGuardrails(
           // it reports as 'server-denied' and the reason string carries the rest.
           cause: 'server-denied',
           reason: guardrailDenialReason(guardrailName(guard), verdict.reason),
+          outcome: 'permission-denied',
         });
         denied = true;
         break;
@@ -1027,6 +1484,8 @@ export async function applyToolResultGuardrails(
           toolName: original.toolName,
           result: guardrailDenialReason(guardrailName(guard), verdict.reason),
           isError: true,
+          // The call ran; the policy withheld its output from the model.
+          outcome: 'permission-denied',
         };
         break;
       }
@@ -1044,11 +1503,11 @@ export async function applyToolResultGuardrails(
 }
 
 /**
- * Return a COPY of an assistant turn whose text is `text` — the shape
- * `assembleAssistant` would have produced had the model said that. Reasoning and
- * `tool_use` parts survive untouched and stay in canonical order; an EMPTY
- * `text` removes the text part entirely, exactly as `assembleAssistant` omits
- * one for an empty answer.
+ * Return a COPY of an assistant turn whose text is `text` — the turn the model
+ * would have produced had it said that. Reasoning and `tool_use` parts survive
+ * untouched and keep their places; the new text takes the first text part's
+ * place (or goes before the first `tool_use`), and an EMPTY `text` removes the
+ * text part entirely, as a turn assembles none for an empty answer.
  *
  * Never mutates: the immutable-history invariant means the loop replaces the
  * last element of each array with this copy rather than editing in place.
@@ -1214,6 +1673,7 @@ export function decideHandoff(
         toolName: call.toolName,
         result: `Handoff limit (${max}) reached; continue yourself.`,
         isError: true,
+        outcome: 'permission-denied',
       });
     }
     return { results };
@@ -1232,6 +1692,7 @@ export function decideHandoff(
       toolName: call.toolName,
       result: `Ignored: already transferred to '${to}' this step.`,
       isError: true,
+      outcome: 'permission-denied',
     });
   }
   return {
@@ -1289,20 +1750,34 @@ export function agentToolSet(handoffTools: ToolSet, target: HandoffTargetMeta): 
 }
 
 /**
- * Replace the run's leading system turn with the incoming agent's instructions
- * (inserting one when the history had none, removing it when the target
- * declares none).
+ * Give the incoming agent its instructions in the run's effective history.
  *
- * A REWRITE, never an append — the same discipline compaction follows: the new
- * turn must not enter `appended`/`chatMessages`, or the caller's response delta
- * and the chat transcript would grow a system message they never sent. It lives
- * in the effective model history (and therefore in checkpoints), which is
- * exactly where a resume leg needs to find it.
+ * By default a REWRITE: the run's leading system turn is replaced by the
+ * instructions (one is inserted when the history had none, and removed when
+ * the target declares none).
+ *
+ * `append` (2.3, F22: the target's model binds thinking to the transcript
+ * prefix) appends them as a `role: 'system'` message after the transfer's tool
+ * result instead, and appends nothing for a target without instructions: the
+ * leading system turn is part of the prefix every earlier thinking block is
+ * bound to, so rewriting it would invalidate them all.
+ *
+ * Either way the new turn must not enter `appended`/`chatMessages`, or the
+ * caller's response delta and the chat transcript would grow a system message
+ * they never sent (the next run starts at the root agent). It lives in the
+ * effective model history (and therefore in checkpoints), which is exactly
+ * where a resume leg needs to find it.
  */
 export function withAgentInstructions(
   messages: Message[],
   instructions: string | undefined,
+  append = false,
 ): Message[] {
+  if (append) {
+    return instructions === undefined
+      ? messages
+      : [...messages, { role: 'system', content: instructions }];
+  }
   const first = messages[0];
   const hasSystem = first !== undefined && first.role === 'system';
   if (instructions === undefined) return hasSystem ? messages.slice(1) : messages;
@@ -1371,7 +1846,17 @@ export function applyHandoffSwap(
     to: meta.name,
     ...(accepted.reason !== undefined ? { reason: accepted.reason } : {}),
   });
-  return { active, messages: withAgentInstructions(messages, meta.def.instructions), entry };
+  return {
+    active,
+    // A target whose model binds thinking to the prefix (2.3, F22) gets its
+    // instructions appended; any other gets the 2.2 rewrite.
+    messages: withAgentInstructions(
+      messages,
+      meta.def.instructions,
+      bindsThinkingToPrefix(meta.def.model),
+    ),
+    entry,
+  };
 }
 
 /**
@@ -1453,8 +1938,10 @@ function renderTranscript(messages: Message[]): string {
     const parts: string[] = [];
     for (const p of m.content) {
       if (p.type === 'text') parts.push(p.text);
-      else if (p.type === 'reasoning') parts.push(`(thinking) ${p.text}`);
-      else if (p.type === 'tool_use') parts.push(`[calls ${p.name}(${safeText(p.input)})]`);
+      else if (p.type === 'reasoning') {
+        // Encrypted and redacted blocks are opaque provider state, not text to summarize.
+        if (!p.encrypted && !p.redacted) parts.push(`(thinking) ${p.text}`);
+      } else if (p.type === 'tool_use') parts.push(`[calls ${p.name}(${safeText(p.input)})]`);
       else if (p.type === 'tool_result') parts.push(`[tool result: ${safeText(p.result)}]`);
       else if (p.type === 'image') parts.push('[image]');
       else parts.push('[content]');
@@ -1529,6 +2016,27 @@ export function retargetCompaction(
 export type CompactionTrigger = 'threshold' | 'overflow';
 
 /**
+ * A legacy loop's unknown-price gate (2.3, decision 4): what its
+ * `budget.unknownPrice`, and that of the loop whose tool started it, say before
+ * a model is called. The loop keeps it on its resolved `deps`, so compaction
+ * asks it before a summary, and the `deps` its tools receive carry it on to an
+ * `agentTool` sub-agent, which asks it before each of its own model calls.
+ */
+export type ModelGate = (modelId: string) => Promise<void>;
+
+const MODEL_GATE = Symbol('deuz.model-gate');
+
+/** The gate `deps` carries: its loop's own, or the one a parent loop handed down. */
+export function modelGate(deps: object | undefined): ModelGate | undefined {
+  return deps ? (deps as Record<symbol, ModelGate | undefined>)[MODEL_GATE] : undefined;
+}
+
+/** Put `gate` on `deps`: an enumerable property, so every copy of `deps` keeps it. */
+export function setModelGate(deps: object, gate: ModelGate | undefined): void {
+  if (gate) (deps as Record<symbol, ModelGate>)[MODEL_GATE] = gate;
+}
+
+/**
  * Run compaction before a model step. `addUsage` folds the summarize call's
  * usage into the loop total (so it counts toward budget stops); `onEvent`
  * surfaces each layer (stream part / log line) together with the `trigger` that
@@ -1561,18 +2069,25 @@ export async function runCompaction(
     estimate: (m) => runner.estimator.estimate(m) + overheadTokens,
     contextWindow: runner.contextWindow,
     mode,
+    // A model that binds thinking to the transcript prefix (2.3, F22) only
+    // accepts a summary of the whole conversation: keep-tail would replay the
+    // recent turns' thinking behind a rewritten prefix.
+    ...(bindsThinkingToPrefix(runner.model) ? { strategy: 'simple' as const } : {}),
     ...(ob ? { now: () => deps.clock.now() } : {}),
     summarize: async (slice, previousSummary) => {
       // Single-turn, tool-free, compaction-free side call — never recurses.
       // The slice is rendered to a transcript inside ONE user message so the
       // request is user-first (valid on every wire, incl. Anthropic). With a
       // previous summary in hand the call FOLDS instead of re-summarizing.
+      // The ACTIVE agent's model after a handoff (2.0) — `runner.model`, not
+      // `options.model`, which is whoever STARTED the run.
+      const model = runner.policy.summarizeModel ?? runner.model;
+      // A model call like any other (2.3): the loop's unknown-price gate first.
+      await modelGate(deps)?.(model.modelId);
       const step = await runOneStep(
         preserveClientContext(options, {
           ...options,
-          // The ACTIVE agent's model after a handoff (2.0) — `runner.model`, not
-          // `options.model`, which is whoever STARTED the run.
-          model: runner.policy.summarizeModel ?? runner.model,
+          model,
           messages: [
             {
               role: 'user',
@@ -1732,7 +2247,9 @@ export function toStepResult(
   index: number,
   toolResultMessage?: Message,
 ): StepResult {
-  const messages: Message[] = [step.assistantMessage];
+  // An empty turn is never appended to the history (2.3), so the step does not
+  // report one either.
+  const messages: Message[] = isEmptyTurn(step.assistantMessage) ? [] : [step.assistantMessage];
   if (toolResultMessage) messages.push(toolResultMessage);
   return {
     stepType: index === 0 ? 'initial' : 'tool-result',
@@ -1741,6 +2258,7 @@ export function toStepResult(
     toolCalls,
     toolResults,
     finishReason: step.finishReason,
+    ...(step.stopDetails ? { stopDetails: step.stopDetails } : {}),
     usage: step.usage,
     response: { messages },
   };
@@ -1807,6 +2325,233 @@ export function pendingClientCalls(
   return toolCalls.filter((c) => isClientTool(tools, c.toolName) && !blocked?.has(c.toolCallId));
 }
 
+// --- The dispatch contract (2.3, roadmap 23.2) -------------------------------
+//
+// Every tool call of a run takes ONE path, in this order: the finish-reason gate
+// (`run-step.ts`: a refused or cut-off turn dispatches nothing), the policy (the
+// execution policy, then the run's `onToolCall` guardrails), the approval gate,
+// then `executeTools` (admission, the native effect receipt, execution,
+// `onToolResult`) and the step checkpoint. `planToolDispatch` is everything BEFORE `executeTools`, and it
+// is the only implementation of it: the buffered loop's step, the streaming
+// loop's step and the resume settle (`settlePendingApprovals`) all call it, so a
+// rule added here holds for every family that reaches a loop.
+
+/** What a batch of tool calls is cleared to do, decided before anything executes. */
+export interface ToolDispatchPlan {
+  /**
+   * The batch as REPORTED (`StepResult.toolCalls`): the model's own order,
+   * transfers included, with a guardrail's rewrite applied.
+   */
+  calls: ToolCall[];
+  /** What `executeTools` receives: every call but the transfers. Denied calls ride along. */
+  execCalls: ToolCall[];
+  /** Every "this call does not run" verdict: guardrail blocks and approval denials. */
+  denied: DenialMap;
+  /** The verdicts of the `onToolCall` guardrails. */
+  guardrails: GuardrailPart[];
+  /** Ids of the calls the approval gate held. */
+  gated: ReadonlySet<string>;
+  /** A live step's calls waiting for a client verdict. Non-empty: the step suspends. */
+  pendingApproval: ToolCall[];
+  /**
+   * The approval requests for {@link pendingApproval}, bound to their identity
+   * (unsigned: the loop signs them when it suspends).
+   */
+  requests: ToolApprovalRequest[];
+  /** A live step's client tools waiting on the caller. Non-empty: the step suspends. */
+  clientCalls: ToolCall[];
+  /** The transfer verdict, when the batch held a transfer. */
+  handoff?: HandoffDecision;
+  /**
+   * Settle mode (2.3): the verdicts the leg passed for calls their receipts
+   * answer (see {@link ToolDispatchInput.recorded}). They decided nothing.
+   */
+  ignoredVerdicts?: IgnoredVerdict[];
+}
+
+/** A verdict for a call that a receipt answers instead (2.3). */
+export interface IgnoredVerdict {
+  call: ToolCall;
+  approved: boolean;
+}
+
+/** One batch for {@link planToolDispatch}. */
+export interface ToolDispatchInput {
+  /** The calls, in the model's emission order. */
+  calls: ToolCall[];
+  /** The effective tool set the calls resolve against. */
+  tools: ToolSet;
+  options: CommonCallOptions;
+  messages: Message[];
+  /** The step the calls belong to; absent on the settle of a resume leg. */
+  stepIndex?: number;
+  /**
+   * The run's transfer catalog and its active agent (handoff, 2.0). A live step
+   * reads transfers off `tools`; a settle also off the catalog, because the agent
+   * that issued a pending call may no longer be driving.
+   */
+  handoff?: { tools: ToolSet; active?: ActiveAgentState };
+  /**
+   * The resume leg's verdicts. Present: SETTLE mode (verdicts decide, a gated
+   * call without one is denied, nothing suspends). Absent: a live step, whose
+   * gated calls go to `approveToolCall` or suspend the run.
+   */
+  verdicts?: readonly ToolApprovalResponse[];
+  /**
+   * Settle mode (2.3): whether a native effect receipt already records the
+   * outcome of a call. Such a call ran, so the gate never holds it again: it
+   * goes on like a call no gate holds and is answered from its receipt, and a
+   * verdict for it decides nothing.
+   */
+  recorded?: (call: ToolCall) => boolean;
+  /** What the batch's approvals are bound to besides the calls (see {@link ApprovalScope}). */
+  approval?: ApprovalScope;
+  /** The injected clock: the execution policy's deadline is checked against it. */
+  clock?: Clock;
+  observe?: ExecuteExtras['observe'];
+}
+
+/**
+ * Decide what a batch of tool calls may do, in the contract's order: the
+ * execution policy, the `onToolCall` guardrails, then the approval gate, for
+ * every call (2.3, transfers included), and last the transfer decision among the
+ * transfers they cleared (decided, never executed). Nothing executes here; the caller hands
+ * {@link ToolDispatchPlan.execCalls} and {@link ToolDispatchPlan.denied} to
+ * `executeTools`, or suspends when the plan holds pending approvals or client
+ * calls.
+ */
+export async function planToolDispatch(input: ToolDispatchInput): Promise<ToolDispatchPlan> {
+  const { calls: issued, tools, options, messages, stepIndex, verdicts, observe } = input;
+  const settle = verdicts !== undefined;
+  // Policy first (2.3): the run's execution policy refuses a call it forbids
+  // before anything else happens to the batch — no guardrail runs on it, no
+  // human is asked to approve it, no sibling starts, no receipt is written. A
+  // refusal is fatal (`ExecutionPolicyError`, naming the call), as before 2.3;
+  // only its place in the order moved. Transfers and client tools are calls too.
+  if (options.execution) {
+    const { assertExecutionPolicy } = await import('../internal/native-request');
+    for (const call of issued) {
+      assertExecutionPolicy(options.execution, {
+        toolName: call.toolName,
+        toolCallId: call.toolCallId,
+        now: input.clock?.now(),
+      });
+    }
+  }
+  // Policy: the run's `onToolCall` guardrails, over EVERY call of the batch —
+  // transfers included (2.3): a transfer hands the run to another agent, so a
+  // rule that may refuse a call may refuse that one too. It runs BEFORE the
+  // approval gate, so a rewrite reaches `needsApproval` and the request a human
+  // sees.
+  const guarded = await applyToolCallGuardrails(options, issued, messages, stepIndex);
+  const calls = guarded.calls;
+  const catalog = input.handoff?.tools;
+  // The transfers among them are decided, never executed. A settle also reads
+  // the run's whole transfer catalog: an agent never carries a transfer to
+  // itself, so the tool that produced a pending id may be missing from the set
+  // of the agent driving now.
+  const transferSet =
+    catalog && hasHandoffTools(catalog) ? (settle ? { ...tools, ...catalog } : tools) : undefined;
+  const { handoffCalls, normalCalls } = transferSet
+    ? splitHandoffCalls(calls, transferSet)
+    : { handoffCalls: NO_HANDOFF_CALLS, normalCalls: calls };
+  const execCalls = normalCalls;
+  // The gate reads a transfer's `needsApproval` off the same set.
+  const gateTools = settle && transferSet ? transferSet : tools;
+
+  const scope = input.approval ?? {};
+  let denied: DenialMap;
+  let gated: Set<string>;
+  let pendingApproval: ToolCall[] = [];
+  let requests: ToolApprovalRequest[] = [];
+  let clientCalls: ToolCall[] = [];
+  let ignoredVerdicts: IgnoredVerdict[] = [];
+  if (settle) {
+    ({ denied, gated, ignoredVerdicts } = await settleVerdicts(
+      calls,
+      verdicts,
+      gateTools,
+      options,
+      messages,
+      observe,
+      scope,
+      input.recorded,
+    ));
+  } else {
+    // A blocked call never reaches the approval gate: it already has a verdict,
+    // and gating it would suspend the run on a call that will not run anyway.
+    const candidates =
+      guarded.blocked.size > 0 ? calls.filter((c) => !guarded.blocked.has(c.toolCallId)) : calls;
+    // Server mode denies inline; without `approveToolCall` the gated calls
+    // break the loop like client tools (client mode).
+    gated = await findApprovalNeeded(candidates, gateTools, options, messages);
+    denied = options.approveToolCall
+      ? await resolveServerApprovals(gated, candidates, options, messages)
+      : new Map<string, Denial>();
+    pendingApproval = options.approveToolCall
+      ? []
+      : candidates.filter((c) => gated.has(c.toolCallId));
+    requests = await toApprovalRequests(pendingApproval, options.agentPath, scope);
+    if (observe && gated.size > 0) {
+      const gatedCalls = calls.filter((c) => gated.has(c.toolCallId));
+      const ids = new Map(requests.map((r) => [r.toolCallId, r.approvalId]));
+      for (const c of gatedCalls) {
+        if (!ids.has(c.toolCallId)) {
+          ids.set(c.toolCallId, await approvalIdOf(c, options.agentPath, scope));
+        }
+      }
+      observeApprovalRequests(
+        observe,
+        options,
+        gatedCalls,
+        options.approveToolCall ? 'server' : 'client',
+        ids,
+      );
+      if (options.approveToolCall) {
+        observeServerResolutions(observe, options, gatedCalls, denied, ids);
+      }
+    }
+    // Client tools a guardrail BLOCKED are not pending on anyone (see
+    // pendingClientCalls): they fall through to `executeTools` instead.
+    clientCalls = pendingClientCalls(calls, tools, guarded.blocked);
+  }
+  // LAST, so a guardrail block outranks every other verdict: an approved call a
+  // rule refuses must report the rule, not the approval.
+  for (const [id, denial] of guarded.blocked) denied.set(id, denial);
+
+  // The transfer verdict, among the transfers the policy and the gate cleared.
+  // One still waiting for a verdict defers them all to the resume's settle, so
+  // the model's first transfer keeps its precedence.
+  let handoff: HandoffDecision | undefined;
+  const waiting = new Set(pendingApproval.map((c) => c.toolCallId));
+  if (handoffCalls.length > 0 && !handoffCalls.some((h) => waiting.has(h.call.toolCallId))) {
+    const cleared = handoffCalls.filter((h) => !denied.has(h.call.toolCallId));
+    const decision = cleared.length > 0 ? decideHandoff(cleared, input.handoff?.active) : undefined;
+    const decided = new Map(decision?.results.map((r) => [r.toolCallId, r]) ?? []);
+    handoff = {
+      // One answer per transfer id, in the model's order.
+      results: handoffCalls.map(
+        ({ call }) =>
+          decided.get(call.toolCallId) ?? deniedResult(call, denied.get(call.toolCallId)!),
+      ),
+      ...(decision?.accepted ? { accepted: decision.accepted } : {}),
+    };
+  }
+
+  return {
+    calls,
+    execCalls,
+    denied,
+    guardrails: guarded.parts,
+    gated,
+    pendingApproval,
+    requests,
+    clientCalls,
+    ...(handoff ? { handoff } : {}),
+    ...(ignoredVerdicts.length > 0 ? { ignoredVerdicts } : {}),
+  };
+}
+
 /**
  * Settle the trailing assistant turn's un-answered tool_use ids on a resume
  * call (`approvalResponses` provided). Verdicts: approved → execute; denied →
@@ -1835,6 +2580,32 @@ export function pendingClientCalls(
  * A transfer is a decision, never an execution (`handoff.ts`'s `execute` throws
  * on purpose), so it is answered from {@link decideHandoff} and the accepted
  * swap is handed back for the caller to apply.
+ *
+ * `approval` (2.3) is the identity the suspended leg bound its requests to: a
+ * verdict counts only under the `approvalId` its call was issued with (see
+ * {@link approvalIdOf}). A plain leg of a durable run passes the step its stored
+ * checkpoint is suspended at ({@link continueStoredRun}).
+ *
+ * The answers go right after the turn's other answers (2.3, F22): a break that
+ * committed a transfer to a Claude 5.x target appended the target's
+ * instructions after the transfer's tool result, and those system messages
+ * were never sent to the model, so the settle's tool message lands before them
+ * and no prefix a thinking block is bound to moves.
+ *
+ * `declared` (2.3, F22) is the model the leg runs on and the tools array the
+ * leg declares. On a model that binds thinking to the prefix a step's calls
+ * resolve against the set the step offered, and so do they when they settle:
+ * the declared tools with every tool-set change before the turn applied. A
+ * pending call to a tool the step withdrew, a transfer included, is answered
+ * like an unknown tool and never runs, as it would have been in the step.
+ *
+ * `recorded` (2.3) says whether a native run's effect receipt already records
+ * the outcome of a pending call: the run stopped after the receipt and before
+ * the step checkpoint that answers the call, or a sub-agent beside it
+ * suspended, or `reconciledToolResults` recorded it. Such a call ran. It is
+ * not gated again: it goes through `executeTools` like a call no gate holds,
+ * and its receipt answers it without running the tool. A verdict passed for it
+ * decides nothing and is reported in `warnings`.
  */
 export async function settlePendingApprovals(
   messages: Message[],
@@ -1842,12 +2613,20 @@ export async function settlePendingApprovals(
   options: CommonCallOptions,
   extras?: ExecuteExtras,
   lifecycle?: {
-    /** Called after denials are known but before approved/server calls execute. */
-    beforeExecute?: (calls: ToolCall[], deniedIds: ReadonlySet<string>) => void;
+    /**
+     * Called after denials are known but before approved/server calls execute,
+     * with the set the calls resolve against (a name outside it never executes).
+     */
+    beforeExecute?: (calls: ToolCall[], deniedIds: ReadonlySet<string>, tools: ToolSet) => void;
   },
   handoff?: { active?: ActiveAgentState; tools: ToolSet },
+  approval?: ApprovalScope,
+  declared?: { model: LanguageModel; tools: WireTool[] },
+  recorded?: (call: ToolCall) => boolean,
 ): Promise<{
   messages: Message[];
+  /** The appended `{role:'tool'}` turn (not necessarily the last message of `messages`). */
+  toolMessage: Message;
   results: ToolResult[];
   deniedIds: Set<string>;
   denied: DenialMap;
@@ -1855,15 +2634,21 @@ export async function settlePendingApprovals(
   guardrails: GuardrailPart[];
   /** Present when a transfer was among the unanswered ids. */
   handoff?: HandoffDecision;
+  /** One per verdict passed for a call its receipt answered (2.3). */
+  warnings: CallWarning[];
 } | null> {
   // An EMPTY array still settles (default-deny the gated rest) — that is how a
   // durable resume without verdicts answers pending calls on the safe side.
   const responses = options.approvalResponses;
   if (!responses) return null;
 
-  // Locate the last assistant turn; only tool messages may follow it.
+  // Locate the last assistant turn; only tool messages may follow it, then the
+  // system messages a break appended for the next leg (see above). The settle's
+  // answers go in at `insertAt`, after the last tool message.
+  let insertAt = messages.length;
+  while (insertAt > 0 && messages[insertAt - 1]!.role === 'system') insertAt--;
   let assistantIndex = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
+  for (let i = insertAt - 1; i >= 0; i--) {
     const role = messages[i]!.role;
     if (role === 'assistant') {
       assistantIndex = i;
@@ -1876,7 +2661,7 @@ export async function settlePendingApprovals(
   if (!Array.isArray(content)) return null;
 
   const answered = new Set<string>();
-  for (let i = assistantIndex + 1; i < messages.length; i++) {
+  for (let i = assistantIndex + 1; i < insertAt; i++) {
     const parts = messages[i]!.content;
     if (!Array.isArray(parts)) continue;
     for (const p of parts) if (p.type === 'tool_result') answered.add(p.toolUseId);
@@ -1891,23 +2676,91 @@ export async function settlePendingApprovals(
     toolName: p.name,
     args: p.input,
   }));
-  // Transfers are resolved by DECISION, never by executing them. The lookup
-  // spans the run's whole transfer catalog, not just the active agent's set: an
-  // agent never carries a transfer to itself, so the tool that produced the
-  // pending id may well be missing from `tools` on this leg.
-  const catalog = handoff?.tools;
-  const { handoffCalls, normalCalls } =
-    catalog && hasHandoffTools(catalog)
-      ? splitHandoffCalls(issued, { ...tools, ...catalog })
-      : { handoffCalls: NO_HANDOFF_CALLS, normalCalls: issued };
-  const decision =
-    handoffCalls.length > 0 ? decideHandoff(handoffCalls, handoff?.active) : undefined;
+  // The set the turn was offered on a stable prefix (see `declared` above); the
+  // transfer catalog the plan merges in is narrowed with it.
+  let offered = tools;
+  let catalog = handoff;
+  if (declared && bindsThinkingToPrefix(declared.model)) {
+    const names = new Set(toolsInEffect(declared.tools, messages.slice(0, assistantIndex)).keys());
+    offered = offeredTools(tools, names);
+    if (handoff) catalog = { ...handoff, tools: offeredTools(handoff.tools, names) };
+  }
+  // The same plan a live step makes (transfers by decision, the re-derived
+  // `onToolCall` guardrails, then the gate), here with the leg's verdicts.
+  const plan = await planToolDispatch({
+    calls: issued,
+    tools: offered,
+    options,
+    messages,
+    ...(catalog ? { handoff: catalog } : {}),
+    verdicts: responses,
+    ...(recorded ? { recorded } : {}),
+    approval: approval ?? {},
+    ...(extras?.deps ? { clock: extras.deps.clock } : {}),
+    ...(extras?.observe ? { observe: extras.observe } : {}),
+  });
 
-  // The run's own execution-side defense, re-derived on this leg (see the note
-  // above). It runs BEFORE the approval gate so a rewrite reaches
-  // `needsApproval` exactly as it did on the leg that suspended.
-  const guarded = await applyToolCallGuardrails(options, normalCalls, messages);
-  const calls = guarded.calls;
+  const deniedIds = new Set(plan.denied.keys());
+  lifecycle?.beforeExecute?.(plan.execCalls, deniedIds, offered);
+  const executed = await executeTools(
+    plan.execCalls,
+    offered,
+    options,
+    messages,
+    plan.denied,
+    extras,
+  );
+  // Back into the order the MODEL issued them, transfers included — the turn
+  // has to read the way it was written.
+  const results = plan.handoff
+    ? mergeResultsInCallOrder(issued, executed, plan.handoff.results)
+    : executed;
+  const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
+  return {
+    messages: [...messages.slice(0, insertAt), toolMessage, ...messages.slice(insertAt)],
+    toolMessage,
+    results,
+    deniedIds,
+    denied: plan.denied,
+    guardrails: plan.guardrails,
+    ...(plan.handoff ? { handoff: plan.handoff } : {}),
+    warnings: (plan.ignoredVerdicts ?? []).map(({ call, approved }) => ({
+      type: 'other',
+      setting: 'approvalResponses',
+      message: `Tool call ${call.toolCallId} (${call.toolName}) already ran, so its recorded outcome answers it; the ${approved ? 'approval' : 'denial'} passed for it was ignored.`,
+    })),
+  };
+}
+
+/**
+ * The settle half of the approval gate: turn a resume leg's verdicts into
+ * denials. Approved calls run; denied ones get the verdict's reason; a gated call
+ * with no verdict and a client tool with no result are denied (safe side).
+ * Signed approvals must echo a token that verifies and is bound to this call.
+ *
+ * A verdict answers a call only under the `approvalId` the call was issued with
+ * (2.3, {@link approvalIdOf}). The 2.2 form, the bare tool call id, still answers
+ * a call whose id the run used once (a run suspended before 2.3, or a client that
+ * built its verdicts from `toolCallId`); a reused id (`tool_0`) needs the bound
+ * one, because the bare id cannot say which of its calls it approves. "Once" is
+ * read from the history and from the run's approval-request count, which
+ * survives a rewritten history ({@link reusedToolCallIds}).
+ *
+ * A call whose receipt already records its outcome (2.3, `recorded`) is neither
+ * gated nor decided by a verdict: it ran. A verdict that names it is returned in
+ * `ignoredVerdicts`. A client tool keeps its rule: it has no executor that
+ * could answer from a receipt.
+ */
+async function settleVerdicts(
+  calls: ToolCall[],
+  responses: readonly ToolApprovalResponse[],
+  tools: ToolSet,
+  options: CommonCallOptions,
+  messages: Message[],
+  ob: ExecuteExtras['observe'] | undefined,
+  scope: ApprovalScope,
+  recorded?: (call: ToolCall) => boolean,
+): Promise<{ denied: DenialMap; gated: Set<string>; ignoredVerdicts: IgnoredVerdict[] }> {
   const signer = options.approvalSigner;
   const expectedRunId = options.session?.runId;
   const payloads = new Map<ToolApprovalResponse, SignedApprovalPayload | null>();
@@ -1946,20 +2799,50 @@ export async function settlePendingApprovals(
       seen.add(response.approvalId);
     }
   }
-  const noVerdict = calls.filter((c) => !byId.has(c.toolCallId));
+  // The calls a receipt answers (2.3): they ran, so no gate holds them again.
+  const answered = new Set<string>();
+  if (recorded)
+    for (const c of calls)
+      if (!isClientTool(tools, c.toolName) && recorded(c)) answered.add(c.toolCallId);
+  const ignoredVerdicts: IgnoredVerdict[] = [];
+  // Each call's verdict, under the id it was issued with (or the 2.2 form).
+  const reused = reusedToolCallIds(messages, scope.approvalRequestCounts);
+  const matched = new Map<string, { verdict: ToolApprovalResponse; approvalId: string }>();
+  const boundIds = new Map<string, string>();
+  for (const c of calls) {
+    const bound = await approvalIdOf(c, options.agentPath, scope);
+    boundIds.set(c.toolCallId, bound);
+    const exact = byId.get(bound);
+    const entry = exact
+      ? { verdict: exact, approvalId: bound }
+      : !reused.has(c.toolCallId) && byId.has(c.toolCallId)
+        ? { verdict: byId.get(c.toolCallId)!, approvalId: c.toolCallId }
+        : undefined;
+    if (!entry) continue;
+    if (answered.has(c.toolCallId))
+      ignoredVerdicts.push({ call: c, approved: entry.verdict.approved });
+    else matched.set(c.toolCallId, entry);
+  }
+  const noVerdict = calls.filter((c) => !matched.has(c.toolCallId) && !answered.has(c.toolCallId));
   const gated = await findApprovalNeeded(noVerdict, tools, options, messages);
 
   const denied: DenialMap = new Map();
   for (const c of calls) {
-    const verdict = byId.get(c.toolCallId);
-    if (verdict) {
-      if (duplicateVerdicts.has(c.toolCallId)) {
+    const entry = matched.get(c.toolCallId);
+    const verdict = entry?.verdict;
+    if (entry && verdict) {
+      if (duplicateVerdicts.has(entry.approvalId)) {
         denied.set(c.toolCallId, {
           cause: 'response-denied',
           reason: 'Duplicate approval verdicts.',
+          outcome: 'approval-denied',
         });
       } else if (!verdict.approved) {
-        denied.set(c.toolCallId, { cause: 'response-denied', reason: verdict.reason });
+        denied.set(c.toolCallId, {
+          cause: 'response-denied',
+          reason: verdict.reason,
+          outcome: 'approval-denied',
+        });
       } else if (signer) {
         // Signed-approval enforcement (1.7, D4): an APPROVAL must echo a token
         // that verifies, matches this approvalId, and — on durable runs —
@@ -1976,14 +2859,17 @@ export async function settlePendingApprovals(
                 )
                 .catch(() => null)
             : null;
+        // The token names the approval it was issued for: the id the verdict
+        // matched, or this call's bound id (a 2.2-form verdict echoing a 2.3 token).
         const valid =
           payload !== null &&
-          payload.approvalId === c.toolCallId &&
+          (payload.approvalId === entry.approvalId ||
+            payload.approvalId === boundIds.get(c.toolCallId)) &&
           (expectedRunId === undefined ||
             payload.runId === undefined ||
             payload.runId === expectedRunId) &&
           (!options.execution ||
-            (!duplicateVerdicts.has(c.toolCallId) &&
+            (!duplicateVerdicts.has(entry.approvalId) &&
               payload.runId === expectedRunId &&
               payload.toolCallId === c.toolCallId &&
               payload.toolName === c.toolName &&
@@ -1993,6 +2879,7 @@ export async function settlePendingApprovals(
           denied.set(c.toolCallId, {
             cause: 'response-denied',
             reason: 'Approval token missing, invalid, expired, or bound to another run.',
+            outcome: 'approval-denied',
           });
         }
       }
@@ -2000,24 +2887,26 @@ export async function settlePendingApprovals(
       denied.set(c.toolCallId, {
         cause: 'client-tool-no-result',
         reason: 'No result provided for this client tool.',
+        outcome: 'tool-error',
       });
       // A HALLUCINATED name is not a client tool (1.9): no denial is recorded so
       // it reaches executeTools and gets the actionable unknown-tool is_error.
     } else if (gated.has(c.toolCallId)) {
-      denied.set(c.toolCallId, { cause: 'no-response', reason: 'No approval response.' });
+      denied.set(c.toolCallId, {
+        cause: 'no-response',
+        reason: 'No approval response.',
+        outcome: 'approval-denied',
+      });
     }
   }
-  // LAST, so a guardrail block outranks every other verdict: an approved call a
-  // rule refuses must report the rule, not the approval.
-  for (const [id, denial] of guarded.blocked) denied.set(id, denial);
 
   // Observation (1.6): resume-leg approval resolutions. Explicit verdicts
   // resolve as 'client-response'; verdict-less gated calls as 'default-deny'.
   // Client tools without a result are not approvals (tool.denied covers them).
-  const ob = extras?.observe;
   if (ob) {
     for (const c of calls) {
-      const verdict = byId.get(c.toolCallId);
+      const entry = matched.get(c.toolCallId);
+      const verdict = entry?.verdict;
       const defaultDenied = !verdict && gated.has(c.toolCallId);
       if (!verdict && !defaultDenied) continue;
       ob.rt.emit({
@@ -2025,7 +2914,7 @@ export async function settlePendingApprovals(
         spanId: ob.rt.startSpan().spanId,
         parentSpanId: ob.parentSpanId,
         agentPath: options.agentPath,
-        approvalId: c.toolCallId,
+        approvalId: entry?.approvalId ?? boundIds.get(c.toolCallId) ?? c.toolCallId,
         toolCallId: c.toolCallId,
         toolName: c.toolName,
         approved: verdict?.approved === true,
@@ -2034,22 +2923,7 @@ export async function settlePendingApprovals(
       });
     }
   }
-
-  const deniedIds = new Set(denied.keys());
-  lifecycle?.beforeExecute?.(calls, deniedIds);
-  const executed = await executeTools(calls, tools, options, messages, denied, extras);
-  // Back into the order the MODEL issued them, transfers included — the turn
-  // has to read the way it was written.
-  const results = decision ? mergeResultsInCallOrder(issued, executed, decision.results) : executed;
-  const toolMessage: Message = { role: 'tool', content: results.map(toToolResultPart) };
-  return {
-    messages: [...messages, toolMessage],
-    results,
-    deniedIds,
-    denied,
-    guardrails: guarded.parts,
-    ...(decision ? { handoff: decision } : {}),
-  };
+  return { denied, gated, ignoredVerdicts };
 }
 
 /** Signed JSON values compare structurally, independent of object key order. */
@@ -2117,6 +2991,8 @@ export function observeApprovalRequests(
   options: CommonCallOptions,
   gatedCalls: ToolCall[],
   mode: 'server' | 'client',
+  /** Each call's identity-bound approval id (2.3), by tool call id. */
+  ids: ReadonlyMap<string, string>,
 ): void {
   for (const call of gatedCalls) {
     ob.rt.emit({
@@ -2125,7 +3001,7 @@ export function observeApprovalRequests(
       parentSpanId: ob.parentSpanId,
       stepIndex: ob.stepIndex,
       agentPath: options.agentPath,
-      approvalId: call.toolCallId, // === toolCallId today (toApprovalRequests contract)
+      approvalId: ids.get(call.toolCallId) ?? call.toolCallId,
       toolCallId: call.toolCallId,
       toolName: call.toolName,
       mode,
@@ -2140,6 +3016,8 @@ export function observeServerResolutions(
   options: CommonCallOptions,
   gatedCalls: ToolCall[],
   denied: DenialMap,
+  /** Each call's identity-bound approval id (2.3), by tool call id. */
+  ids: ReadonlyMap<string, string>,
 ): void {
   for (const call of gatedCalls) {
     ob.rt.emit({
@@ -2148,7 +3026,7 @@ export function observeServerResolutions(
       parentSpanId: ob.parentSpanId,
       stepIndex: ob.stepIndex,
       agentPath: options.agentPath,
-      approvalId: call.toolCallId,
+      approvalId: ids.get(call.toolCallId) ?? call.toolCallId,
       toolCallId: call.toolCallId,
       toolName: call.toolName,
       approved: !denied.has(call.toolCallId),
@@ -2246,6 +3124,16 @@ export async function executeTools(
   // allocation-free.
   const executed =
     guardrailList(options.guardrails?.onToolResult).length > 0 ? new Set<string>() : undefined;
+  // The tool-call and tool-result hooks a sub-agent inherits (2.3); undefined
+  // when the run has neither, so a plain tool's context is unchanged.
+  const { onToolCall, onToolResult } = options.guardrails ?? {};
+  const inheritedGuardrails =
+    onToolCall !== undefined || onToolResult !== undefined
+      ? {
+          ...(onToolCall !== undefined ? { onToolCall } : {}),
+          ...(onToolResult !== undefined ? { onToolResult } : {}),
+        }
+      : undefined;
   if (nativeBatch)
     options = { ...options, signal: combineSignals([options.signal, nativeBatch.signal]) };
   const results = mapWithConcurrency(
@@ -2258,6 +3146,7 @@ export async function executeTools(
       if (options.execution) {
         nativePolicy!.assertExecutionPolicy(options.execution, {
           toolName: call.toolName,
+          toolCallId: call.toolCallId,
           now: extras?.deps?.clock.now(),
         });
         if (options.signal?.aborted)
@@ -2318,12 +3207,7 @@ export async function executeTools(
               ...(denial.reason ? { reason: denial.reason } : {}),
             });
           }
-          return settle({
-            toolCallId: call.toolCallId,
-            toolName: call.toolName,
-            result: denial.reason ? `${TOOL_DENIED} Reason: ${denial.reason}` : TOOL_DENIED,
-            isError: true,
-          });
+          return settle(deniedResult(call, denial));
         }
         if (!tool) {
           // Hallucinated tool name (1.9): self-heal like every other tool failure —
@@ -2343,6 +3227,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: message,
             isError: true,
+            outcome: 'tool-error',
           });
         }
         if (!tool.execute) {
@@ -2352,6 +3237,26 @@ export async function executeTools(
             toolName: call.toolName,
             result: 'No server-side executor.',
             isError: true,
+            outcome: 'tool-error',
+          });
+        }
+        // Arguments that never parsed reach here as their raw JSON text (2.3,
+        // F16): a call cut off mid-stream, a malformed one, or one read back from
+        // an older checkpoint. Arguments that parsed to null, an array or a number
+        // fit no provider's tool schema either. A raw JSON Schema performs no
+        // validation, so the value would otherwise reach `execute` verbatim. It
+        // self-heals instead.
+        if (call.args === null || typeof call.args !== 'object' || Array.isArray(call.args)) {
+          const message = `Invalid arguments: the tool input is not a JSON object${
+            typeof call.args === 'string' ? ' (it may have been cut off)' : ''
+          }. The call was not executed.`;
+          emitToolFailed(new Error(message), true);
+          return settle({
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            result: message,
+            isError: true,
+            outcome: 'tool-error',
           });
         }
         const validation = await validateOutput(tool.parameters, call.args);
@@ -2362,6 +3267,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: `Invalid arguments: ${validation.issues}`,
             isError: true,
+            outcome: 'tool-error',
           });
         }
         // Per-execution cap (1.9): the tool's OWN `timeoutMs` outranks the call's
@@ -2383,7 +3289,9 @@ export async function executeTools(
             : requestedCap !== undefined && requestedCap > 0
               ? Math.min(requestedCap, deadlineMs)
               : deadlineMs;
-        const timed = capMs !== undefined && capMs > 0 && clock !== undefined;
+        // Infinity means no cap: a host setTimeout clamps it to 1ms (2.3).
+        const timed =
+          capMs !== undefined && capMs > 0 && Number.isFinite(capMs) && clock !== undefined;
         const expiry = timed ? new AbortController() : undefined;
         try {
           // Sub-agent inheritance: a per-call deps clone carries the runtime +
@@ -2418,11 +3326,14 @@ export async function executeTools(
             ...(extras?.reportUsage ? { reportUsage: extras.reportUsage } : {}),
             ...(extras?.session ? { session: extras.session } : {}),
             ...(extras?.approvalResponses ? { approvalResponses: extras.approvalResponses } : {}),
+            // A sub-agent's calls stay under this run's tool policy (2.3).
+            ...(inheritedGuardrails ? { guardrails: inheritedGuardrails } : {}),
           };
           const invoke = async (): Promise<unknown> => {
             if (options.execution) {
               nativePolicy!.assertExecutionPolicy(options.execution, {
                 toolName: call.toolName,
+                toolCallId: call.toolCallId,
                 now: clock?.now(),
               });
               if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('Execution cancelled.');
@@ -2462,6 +3373,7 @@ export async function executeTools(
               toolName: call.toolName,
               result: message,
               isError: true,
+              outcome: 'tool-error',
             });
           }
           const out = outcome.value;
@@ -2494,6 +3406,7 @@ export async function executeTools(
             toolName: call.toolName,
             result: err.message,
             isError: true,
+            outcome: 'tool-error',
           });
         }
       } catch (cause) {
@@ -2796,6 +3709,10 @@ function contentText(content: Message['content']): string {
  * (`withSystemBlock`) — never into the canonical history, so checkpoints and
  * chat persistence stay recall-free and resume legs cannot double-inject.
  * Best-effort: a failing store/embedder logs and the call proceeds bare.
+ *
+ * A compaction summary is not a user message here (2.3): it carries the user
+ * role but is the conversation, not a question, so the query is the last user
+ * message before it, or there is none.
  */
 export async function computeRecallBlock(
   options: CommonCallOptions,
@@ -2805,7 +3722,7 @@ export async function computeRecallBlock(
 ): Promise<string | undefined> {
   const memory = options.memory;
   if (!memory || memory.recall === false) return undefined;
-  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user' && !isSummaryMessage(m));
   const text = lastUser ? contentText(lastUser.content) : '';
   // Nothing to query with: no retrieval happened, so no operation is reported
   // either — an operation.started with no matching terminal would be a lie.
@@ -2878,6 +3795,77 @@ export async function computeRecallBlock(
   }
 }
 
+/**
+ * What the memory recall of a run leg contributes (2.3, F22): a block the
+ * model-call site splices into the leading system turn (`splice`, the 2.2
+ * placement), or one appended `role: 'system'` message (`message`).
+ */
+export interface RecallPlan {
+  splice?: string;
+  message?: Message;
+}
+
+/** True when the history's last user message is already followed by its recall message. */
+function recalledAlready(messages: Message[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (isRecallMessage(m)) return true;
+    if (m.role === 'user') return false;
+  }
+  return false;
+}
+
+/**
+ * Memory recall for a run leg (1.7, D1; placement 2.3, F22).
+ *
+ * On a model that binds thinking to the transcript prefix (Claude 5.x,
+ * `internal/stable-prefix.ts`) the block is ONE appended `role: 'system'`
+ * message: the loop appends it after the incoming history, before the first
+ * model call, to the effective history (so checkpoints keep it), the response
+ * delta and the chat record. It is part of the conversation the model saw, as
+ * the false-finish nudge is: the next turn replays it in place, so the prefix
+ * every later thinking block is bound to never changes. Recall runs once per
+ * user turn: a history whose last user message is already followed by its
+ * recall message (an approval continuation, a replayed transcript) recalls
+ * nothing, and neither does a `resumed` leg whose checkpoint holds one — even
+ * when a loop-injected user turn (a false-finish nudge) came after it — or
+ * holds a compaction summary: a resumed leg continues the turn its first leg
+ * recalled for, and a summary taken inside the tool loop folded that turn's
+ * recall message in with the rest of the turn.
+ *
+ * Every other model keeps the 2.2 placement: the block is spliced into the
+ * leading system turn at the model-call site only, and the transcript stays
+ * recall-free.
+ *
+ * `model` is the one the run starts with, on every leg (2.3): a leg that
+ * resumes as a handoff target keeps the first leg's placement, so the target
+ * reads its recall where it did before the break — the splice in its system,
+ * or the one message already in the history — and no leg holds both.
+ */
+export async function planRecall(
+  options: CommonCallOptions,
+  deps: ResolvedDependencies,
+  messages: Message[],
+  /** The run's first model (`options.model`), not the active agent's. */
+  model: LanguageModel,
+  ob?: ExecuteExtras['observe'],
+  /** The leg resumes a durable run from its checkpoint. */
+  resumed = false,
+): Promise<RecallPlan> {
+  const stable = bindsThinkingToPrefix(model);
+  if (
+    stable &&
+    (recalledAlready(messages) ||
+      (resumed && messages.some((m) => isRecallMessage(m) || isSummaryMessage(m))))
+  ) {
+    return {};
+  }
+  const block = await computeRecallBlock(options, deps, messages, ob);
+  if (!block) return {};
+  if (!stable) return { splice: block };
+  return { message: recallMessage(block) };
+}
+
 /** Splice a system-context block into a NEW message array (no-op without one). */
 export function withSystemBlock(messages: Message[], block: string | undefined): Message[] {
   if (!block) return messages;
@@ -2916,7 +3904,10 @@ export function startMemoryExtract(
   if (memory.writePolicy === 'session-end' || memory.writePolicy === 'manual') return undefined;
   const infer = memory.extract === undefined ? true : (memory.extract.infer ?? true);
   const lastUser = [...options.messages].reverse().find((m) => m.role === 'user');
-  const turns = lastUser ? [lastUser, ...newTurns] : newTurns;
+  // System messages are instructions, not facts about the user — and the
+  // recall message (2.3) would write the recalled memories back as new ones.
+  const said = newTurns.filter((m) => m.role !== 'system');
+  const turns = lastUser ? [lastUser, ...said] : said;
   if (turns.length === 0) return Promise.resolve([]);
 
   // Observation (2.0): started fires SYNCHRONOUSLY (the write is in flight from

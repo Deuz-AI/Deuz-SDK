@@ -69,6 +69,12 @@ export interface TestToolSpec {
    */
   inputSchema?: unknown;
   /**
+   * Raw JSON Schema, listed as the tool's `outputSchema` VERBATIM (2.3). The
+   * server never checks a result against it: that is the client SDK's job, and
+   * a handler that breaks its own schema is how a test proves the check ran.
+   */
+  outputSchema?: unknown;
+  /**
    * Runs on `tools/call`. The return value is mapped to a `CallToolResult`:
    * a string becomes one text block; a plain object becomes `structuredContent`
    * plus its JSON serialization as text; `undefined` becomes empty content.
@@ -109,6 +115,13 @@ export interface TestMcpServerOptions {
   name?: string;
   /** `serverInfo.version`. */
   version?: string;
+  /**
+   * Paginate `tools/list` (2.3): at most this many tools per page, with an
+   * opaque `nextCursor` until the catalog is exhausted. Unset = one page, the
+   * shape most servers send. A client that reads only the first page sees just
+   * the first `toolsPageSize` tools — the bug this option exists to pin.
+   */
+  toolsPageSize?: number;
 }
 
 export interface TestMcpServerHandle {
@@ -295,16 +308,29 @@ export async function startTestMcpServer(
       { capabilities: { tools: { listChanged: true } } },
     );
 
-    server.setRequestHandler(ListToolsRequestSchema, () => ({
-      tools: [...tools.values()].map((spec) => {
+    server.setRequestHandler(ListToolsRequestSchema, (request) => {
+      const all = [...tools.values()].map((spec) => {
         const tool: Tool = {
           name: spec.name,
           inputSchema: (spec.inputSchema ?? EMPTY_INPUT_SCHEMA) as Tool['inputSchema'],
         };
         if (spec.description !== undefined) tool.description = spec.description;
+        if (spec.outputSchema !== undefined) {
+          tool.outputSchema = spec.outputSchema as Tool['outputSchema'];
+        }
         return tool;
-      }),
-    }));
+      });
+      const size = opts.toolsPageSize;
+      if (size === undefined) return { tools: all };
+      // The cursor is an opaque string to the client; here it is an offset.
+      const cursor = request.params?.cursor;
+      const start = cursor === undefined ? 0 : Number(cursor.replace(/^page-/, ''));
+      const end = start + size;
+      return {
+        tools: all.slice(start, end),
+        ...(end < all.length ? { nextCursor: `page-${end}` } : {}),
+      };
+    });
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;

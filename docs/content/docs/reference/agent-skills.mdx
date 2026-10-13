@@ -23,14 +23,18 @@ A build guide over the whole surface, not an API dump. `SKILL.md` is the part th
 | `providers` | Every factory subpath, the compat hosts, the capability registry, key precedence |
 | `streaming-ui` | The Deuz UI wire, `validateChatRequest`, the chat engine, `useChat` / `useObject`, correct part rendering |
 | `tools-agents` | Tools, the loop contract, approvals, `createAgent`, sub-agents, handoffs, guardrails |
+| `native-execution` | Native `runAgent` / `streamAgent` with validated output, strict resume and approval recovery, MCP, memory, chat and model fail-over in a run, shared policies and budgets, swarms, and leases across processes |
 | `memory-compaction` | Cross-session memory, the recall pipeline, compaction layers, overflow recovery |
 | `rag-and-skills` | Parsing, chunking, hybrid retrieval, citations, and the SDK's own skills module |
 | `persistence-durable` | The four store seams, the SQLite/Redis/Postgres packs, checkpoints and resume |
-| `mcp` | Zero-config servers, OAuth, stdio, sampling, roots |
-| `autonomy-workspace` | Plan/verify, ensembles, workspace memory, CodeAct, browser control, background runs |
+| `mcp` | The MCP client on both SDK lines (2026-07-28 and 2025-11-25), zero-config servers, OAuth, stdio, sampling, roots, elicitation |
+| `interop` | Serving tools and agents over MCP (`createMcpServer`), and A2A agents, serving and calling (2.3) |
+| `autonomy-workspace` | Plan/verify, ensembles, workspace memory, CodeAct, browser control, background runs, evolve, schedules and signals, goals and wakeups |
 | `media` | Image, speech, transcription, video |
+| `realtime-batch` | Live voice sessions over OpenAI Realtime and Gemini Live, and provider batch jobs at batch prices (2.3) |
 | `ops` | Observation events, the OTel bridge, pricing and budgets, middleware, resilience |
 | `testing-and-edge` | Mock models, evals, the edge-safety rules and the Node-only subpath list |
+| `headless` | Running native agents from a script or CI with JSON reports and exit codes, and `doctor` (2.3 preview) |
 | `migration` | Porting from the Vercel AI SDK, LangChain, LangGraph or LlamaIndex |
 | `api-index` | Generated from source: every subpath, every export, marked value or type |
 
@@ -53,12 +57,14 @@ They were also written test-first. Nine build tasks — streaming, a chat route,
 
 ## Keeping them current
 
-The skills are maintained inside this repository, verified by the scripts under `.claude/skills/deuz-sdk/scripts/`:
+The skills are maintained inside this repository. `deuz-sdk` is generated and verified by the scripts under `packages/core/tooling/skills/`, which read the package's source and `package.json` directly, so no build is needed:
 
 ```sh
-npm run build -w @deuz-sdk/core
-node .claude/skills/deuz-sdk/scripts/generate-api-index.mjs   # rebuild the index from source
-node .claude/skills/deuz-sdk/scripts/verify-skill.mjs         # resolve every name, check freshness
+node packages/core/tooling/skills/generate-api-index.mjs --date 2026-10-20  # rebuild the index from source
+node packages/core/tooling/skills/verify-skill.mjs                          # resolve every name, check freshness
+node packages/core/tooling/skills/sync-skill-copy.mjs --write               # mirror skills/deuz-sdk into .claude/
 ```
 
-The same content lives twice — once where Claude Code loads it for work inside this repository, once under `skills/` where `npx skills add` distributes it — and the verifier fails if the two ever diverge.
+The index stamp takes its date from `--date` or `SOURCE_DATE_EPOCH`, never from the clock, so the same sources always regenerate the same file.
+
+The same content lives twice — once where Claude Code loads it for work inside this repository, once under `skills/` where `npx skills add` distributes it. `skills/deuz-sdk` is the source: edit it there and mirror it with `sync-skill-copy.mjs --write`. The verifier fails if the two ever diverge.

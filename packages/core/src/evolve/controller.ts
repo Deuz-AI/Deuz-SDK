@@ -18,6 +18,7 @@ import { childScopeId, createExecutionContext } from '../execution-policy';
 import { isFatalExecutionError } from '../internal/execution-error';
 import { mapWithConcurrency } from '../internal/p-limit';
 import { resolveDependencies } from '../internal/resolve-deps';
+import { markRunLedger } from '../internal/run-ledger';
 import { cosineSimilarity } from '../internal/vector';
 import type { BudgetLedgerSnapshot, NativeExecutionContext } from '../types/execution';
 import { applySearchReplace, EvolvePatchError, extractFullRewrite } from './patch';
@@ -32,7 +33,7 @@ import {
   updateArchive,
 } from './selection';
 import { EvolveLeaseError, evolveCandidateId, validateEvolveKey } from './store';
-import type { Lease } from '../types/lease';
+import type { Lease, LeaseRenewal } from '../types/lease';
 import type {
   EvolveArtifacts,
   EvolveCandidate,
@@ -375,10 +376,19 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
     let beating = true;
     let stopBeat: (() => void) | undefined;
     let renewing: Promise<void> | undefined;
-    // A renewal delivered a cancel for this run (2.2). Unless the run completes
-    // or stops as cancelled, it is queued again before the lease is let go.
+    // A renewal delivered a cancel for this run and took it off the queue
+    // (2.2). Unless the run completes or stops as cancelled, it is queued again
+    // before the lease is let go.
     let cancelDelivered = false;
+    // A renewal delivered a cancel the provider keeps queued (2.3): it is
+    // acknowledged once the run completes or stops as cancelled, and otherwise
+    // stays queued for the next executor.
+    let cancelKept = false;
     let cancelMoot = false;
+    const renewOptions =
+      typeof leasing?.provider.ack === 'function' ? { acknowledge: true } : undefined;
+    const keepsCancel = (renewal: LeaseRenewal): boolean =>
+      renewal.held && renewal.signals.includes('cancel') && !!renewal.queued?.includes('cancel');
     const lose = () => {
       leaseLost = true;
       writeFailure ??= new EvolveLeaseError('lost');
@@ -387,9 +397,12 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
     const renewLease = async (): Promise<void> => {
       if (!beating || !held) return;
       try {
-        const renewal = await leasing!.provider.renew(held, leaseTtl);
-        // Noted even after the run stopped: the release queues it again.
-        if (renewal.held && renewal.signals.includes('cancel')) cancelDelivered = true;
+        const renewal = await leasing!.provider.renew(held, leaseTtl, renewOptions);
+        // Noted even after the run stopped: the end queues it again or acknowledges it.
+        if (renewal.held && renewal.signals.includes('cancel')) {
+          if (keepsCancel(renewal)) cancelKept = true;
+          else cancelDelivered = true;
+        }
         if (!beating) return;
         if (!renewal.held) return lose();
         held = renewal.lease;
@@ -975,18 +988,25 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
         // claim does: a 'cancel' outlives the holder it was sent to. One that
         // lost the race to the run's end, or found it stopped as cancelled
         // already, is dropped; any other stops the run before a model call.
-        const renewal = await leasing.provider.renew(held, leaseTtl);
+        const renewal = await leasing.provider.renew(held, leaseTtl, renewOptions);
         if (!renewal.held) throw new EvolveLeaseError('held');
         held = renewal.lease;
         if (renewal.signals.includes('drain')) draining = true;
-        if (
-          renewal.signals.includes('cancel') &&
-          run.status !== 'completed' &&
-          !(run.status === 'stopped' && run.reason === 'cancelled')
-        ) {
-          cancelDelivered = true;
-          stopReason ??= 'cancelled';
-          controller.abort(new Error('Evolve cancelled'));
+        if (renewal.signals.includes('cancel')) {
+          const kept = keepsCancel(renewal);
+          if (
+            run.status === 'completed' ||
+            (run.status === 'stopped' && run.reason === 'cancelled')
+          ) {
+            // A kept one is dropped by acknowledging it (2.3): left queued, it
+            // would stop the run this executor extends.
+            if (kept) await leasing.provider.ack!(held, 'cancel');
+          } else {
+            if (kept) cancelKept = true;
+            else cancelDelivered = true;
+            stopReason ??= 'cancelled';
+            controller.abort(new Error('Evolve cancelled'));
+          }
         }
         beat();
       }
@@ -1006,6 +1026,8 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
             policy: options.policy,
             persist,
           });
+      // One evolve run owns this ledger: its mutations report an unpriced model once in all.
+      markRunLedger(execution.ledger);
 
       const seedId = evolveCandidateId(0, 0, 0);
       if (run.generation >= 0) {
@@ -1125,8 +1147,11 @@ function start(options: EvolveOptions, mode: 'create' | 'resume'): EvolveHandle 
       stopBeat?.();
       // A delivered cancel the run did not end on, including one a renewal
       // still in flight brings, goes back in the queue before the lease is let
-      // go (2.2), so the next executor still applies it.
+      // go (2.2), so the next executor still applies it. One the provider kept
+      // queued (2.3) stays there, and leaves once the run ended on it.
       await renewing;
+      if (held && cancelKept && cancelMoot)
+        await leasing!.provider.ack!(held, 'cancel').catch(() => false);
       if (held && cancelDelivered && !cancelMoot)
         await leasing!.provider.signal(leaseKey, 'cancel').catch(() => false);
       if (held && !leaseLost) await leasing!.provider.release(held).catch(() => {});

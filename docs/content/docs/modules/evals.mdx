@@ -1,0 +1,342 @@
+---
+title: Evals
+description: Versioned eval tasks run by runEvalSuite from @deuz-sdk/core/testing, with per-attempt metrics for success, false completion, cost, duration, human rescues, repeated effects and recovery, plus the offline tasks and fault-injection suite that make up the 2.3 baseline.
+---
+
+`runEvalSuite` (2.3) in `@deuz-sdk/core/testing` runs versioned eval tasks and
+measures every attempt. It builds on `runEval` and `runGradedEval`: a task's
+acceptance criteria are graded the way `runGradedEval` grades a case. On top of
+that come a start snapshot, repeats, a timeout and the metrics an agent harness
+needs: success, false completion, cost, duration, human rescues, repeated
+effects and recovery.
+
+2.3 ships a baseline, not a benchmark. The repository's test suite runs 22
+offline tasks and 33 fault-injection scenarios on every `npm test`. Eleven
+real-model tasks are defined but were not run for 2.3, so there are no
+real-model results. This page ranks nothing and makes no claim about other SDKs.
+
+## A task
+
+A task manifest has a stable `id` and a `version` you bump whenever its start
+state, acceptance or grading changes, so two versions are never compared as one
+task. `run` performs one attempt and returns its outcome. A native
+`AgentResult` is an outcome as it stands, so a task can return `runAgent(...)`
+directly.
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel, runEvalSuite, type EvalTaskManifest } from '@deuz-sdk/core/testing';
+
+const countOrders: EvalTaskManifest = {
+  id: 'orders/count',
+  version: 1,
+  start: { messages: [{ role: 'user', content: 'How many orders does ada@example.com have?' }] },
+  tools: { allowed: ['list_orders'] },
+  acceptance: [
+    { name: 'completes', check: (outcome) => outcome.status === 'completed' },
+    { name: 'answers 3', check: (outcome) => (outcome.text ?? '').includes('3 orders') },
+  ],
+  run: (context) =>
+    runAgent({
+      model: createMockModel({
+        responses: [
+          { toolCalls: [{ toolName: 'list_orders', args: { email: 'ada@example.com' } }] },
+          { text: 'ada@example.com has 3 orders.' },
+        ],
+      }),
+      messages: context.messages,
+      tools: {
+        list_orders: {
+          description: 'List the orders of a customer.',
+          parameters: {
+            type: 'object',
+            properties: { email: { type: 'string' } },
+            required: ['email'],
+          },
+          execute: () => ['o-1', 'o-2', 'o-3'],
+        },
+      },
+      signal: context.signal,
+      // The observer feeds the allowed-tools check.
+      deps: { observer: context.observer },
+    }),
+};
+
+const report = await runEvalSuite([countOrders], { repeats: 3 });
+console.log(report.aggregate.offline?.successRate); // 1
+```
+
+| Field | What it is |
+| --- | --- |
+| `id`, `version` | The task's name for good, and a positive integer bumped on every change of meaning |
+| `tier` | `'offline'` (default) or `'real-model'`; the two are aggregated apart |
+| `start` | The snapshot an attempt starts from: `messages`, workspace `files` and JSON `store` state. Every attempt gets its own deep copy |
+| `acceptance` | Named checks, at least one. Success needs all of them; a check that throws is a failed check |
+| `grade` | Optional partial credit in 0..1. Default: the weighted share of the acceptance checks that held |
+| `tools` | `allowed`, the tools the run may call, and `scope`, the path prefix of `start.files` it may change |
+| `model` | The provider, model ID, protocol and effort the task is meant for (descriptive; `run` builds the model) |
+| `budget` | `usd` and `tokens`, checked against what the outcome reports |
+| `timeoutMs`, `repeats` | Per attempt, and how many attempts. Defaults come from the suite options |
+| `artifacts` | Names every attempt must record through `context.artifact` |
+| `approvals` | The tools whose approval is part of the task |
+| `fault` | For a fault scenario: the boundary it injects at and the recovery the documentation promises |
+| `env` | The keys a real-model task needs |
+
+## What an attempt gets
+
+`run` receives a context for one attempt:
+
+- `messages`, `files` and `store`: copies of the start snapshot. Changes stay in
+  this attempt, and the scope check compares `files` with the start.
+- `observer`: an in-memory observer. Pass it as `deps.observer`; its
+  `tool.started` events are the tool calls the allowed-tools check reads.
+- `signal`: aborted when the attempt times out.
+- `effect(key)`: record one execution of an external effect by its real-world
+  identity, such as `charge:order-7`. A key recorded twice is a repeated effect.
+- `approve(requests, approved?)`: a human answers approval requests. It returns
+  the verdicts for `approvalResponses`, with signed tokens echoed back.
+- `rescue(reason)`: a human stepped in where the task needed no one.
+- `interrupt(boundary)`: the injected fault fired.
+- `artifact(name, value)`: keep a JSON value in the report.
+
+A required approval is not a rescue. Approving a tool the manifest lists in
+`approvals` counts as a required approval; approving any other tool, or calling
+`rescue`, counts as a human rescue:
+
+```ts
+import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel, type EvalTaskManifest } from '@deuz-sdk/core/testing';
+
+const deploy: EvalTaskManifest = {
+  id: 'deploy/approved',
+  version: 1,
+  approvals: ['deploy'],
+  acceptance: [{ name: 'completes', check: (outcome) => outcome.status === 'completed' }],
+  async run(context) {
+    const options = {
+      model: createMockModel({
+        responses: [{ toolCalls: [{ toolName: 'deploy', args: {} }] }, { text: 'Live.' }],
+      }),
+      prompt: 'Ship v2.3.0.',
+      session: { store: createInMemoryAgentRunStore(), runId: 'deploy', scope: 'eval' },
+      tools: {
+        deploy: {
+          parameters: { type: 'object' as const, properties: {} },
+          needsApproval: true,
+          execute: () => {
+            context.effect('deploy:v2.3.0');
+            return 'deployed';
+          },
+        },
+      },
+      deps: { observer: context.observer },
+    };
+    const first = await runAgent(options);
+    if (first.status !== 'suspended') return first;
+    return resumeAgent({ ...options, approvalResponses: context.approve(first.pendingApprovals) });
+  },
+};
+```
+
+## Metrics
+
+Each attempt in the report carries:
+
+| Metric | Meaning |
+| --- | --- |
+| `success` | Every acceptance check held and no harness check failed |
+| `score` | 0..1, from `grade` or the acceptance checks |
+| `falseCompleted` | The run claimed `'completed'` and failed acceptance |
+| `costUsd`, `tokens` | From the outcome's `accounting`, which spans every leg of a resumed run (`costUsd` on the outcome wins). Spent as far as known: calls without a price, or with an unknown outcome, stay held in the accounting |
+| `durationMs` | On the suite's `clock` (default `Date.now`) |
+| `humanRescues` | Rescues and approvals the task did not list |
+| `requiredApprovals` | Approvals of the tools in `approvals` |
+| `repeatedEffects` | Effect executions beyond the first per key |
+| `toolCalls` | Tool names in call order, as the observer saw them |
+| `recovery` | How the attempt came back from an interruption (below) |
+| `failures` | The failed acceptance checks, then the failed harness checks |
+
+`recovery` is `'not-needed'` when nothing was interrupted. After an
+interruption it is `'recovered'` (completed and accepted without a rescue),
+`'rescued'` (completed and accepted after a rescue), `'contained'` (accepted,
+but the documented outcome is a stop or a failure: the work did not finish) or
+`'failed'` (not accepted, or an effect ran twice). An attempt that repeated an
+effect is never recovered, rescued or contained. The other checks below, a
+recovery path other than `fault.recovery` included, fail `success` but leave
+`recovery` as acceptance decides it.
+
+Beyond its acceptance, an attempt fails when it:
+
+- recorded one effect key twice;
+- called a tool outside `tools.allowed`;
+- changed a file outside `tools.scope`;
+- went over `budget`;
+- did not record a declared artifact;
+- declared a `fault` that never fired, or recovered another way than
+  `fault.recovery` says.
+
+A run that throws is an `'error'` attempt and a run that outlives its timeout a
+`'timeout'` attempt; neither stops the suite. A malformed suite (a duplicate id,
+a version that is not a positive integer, a task without acceptance or without
+a runner) throws a `TypeError` before any task runs.
+
+## The report
+
+`runEvalSuite` returns the report and writes nothing unless you ask. Pass
+`report` as a file path (written as JSON with `node:fs`, its directory created)
+or as a callback:
+
+```ts
+import { runEvalSuite, type EvalTaskManifest } from '@deuz-sdk/core/testing';
+
+declare const tasks: EvalTaskManifest[];
+
+await runEvalSuite(tasks, {
+  name: 'nightly',
+  timeoutMs: 60_000,
+  report: (report) => {
+    for (const task of report.tasks)
+      console.log(task.id, task.version, `${task.metrics.successes}/${task.metrics.attempts}`);
+  },
+});
+```
+
+The report has `format: 'deuz-eval-suite'` and `version: 1`, the tasks in suite
+order with their attempts and metrics, and an `aggregate` per tier.
+Offline and real-model numbers are separate experiments, so they are never
+added together. A path needs a runtime with `node:fs` (Node, Bun or Deno);
+elsewhere, use a callback.
+
+## Real-model tasks
+
+A task with `tier: 'real-model'` is meant for a real provider. List its keys in
+`env` and skip it when one is missing; a skipped task appears in the report
+with its reason and no attempts:
+
+```ts
+import { runEvalSuite, type EvalTaskManifest } from '@deuz-sdk/core/testing';
+
+declare const tasks: EvalTaskManifest[];
+
+const report = await runEvalSuite(tasks, {
+  skip: (task) => {
+    const missing = (task.env ?? []).filter((name) => !process.env[name]);
+    return missing.length > 0 ? `no ${missing.join(', ')}` : undefined;
+  },
+});
+console.log(report.aggregate['real-model']?.skipped);
+```
+
+The repository defines eleven real-model tasks, each the twin of an offline
+task: the bug fix, the migration, the sourced research, the invoice
+extraction, the approved deploy, the run with memory and a chat, the fail-over
+(to a real fallback, behind a primary that stays offline), the approval
+through the UI bridge, the goal's run, the lookup on an MCP server, and the
+batch. Each runs on a model from the SDK's registry and price table, under a
+USD budget, with three attempts, and reuses its offline twin's start state,
+tools and acceptance. The first ten run only through `npm run test:live`,
+never in `npm test` or CI. The batch is defined apart, with its skip reason: a
+provider can take up to 24 hours to end a batch, so no runner submits it. None
+of them is live-verified: no run against a provider was made for 2.3.
+
+## The 2.3 baseline
+
+`npm test` runs the offline tasks under `packages/core/test/eval/`. Their models
+are scripted, so they measure the SDK rather than a model: that the loop,
+receipts, approvals, resume and accounting carry a known plan to an accepted
+result, exactly once. They cover a tool loop (parallel and chained calls),
+structured output and its repair, a bug fix judged by hidden tests, a config
+migration, sourced research against a mock search index, an approval granted
+and one denied, a nested agent and a sub-agent approval, an interrupted and
+resumed run, an MCP hot refresh against the in-process MCP server, a client-side
+tool, a verifier retry, and a runaway loop that must stop instead of claiming
+success. Six more cover what 2.3 added: a native run that continues a stored
+chat and acts on a preference it recalls from memory, a fail-over from a
+primary that answers 529, an approval given through the UI bridge, a goal
+woken by its schedule and completed on a tool's evidence, a batch submitted
+and collected on an in-memory stand-in of a batch API, and a tool that
+`createMcpServer` serves to an in-process client. All 22 succeed, with no
+false completion, no repeated effect and no human rescue; the four approvals
+are required ones, and the two interrupted tasks, the resumed run and the
+fail-over, recover by themselves.
+
+The fault-injection suite (`packages/core/test/eval/faults/`) injects one fault
+per scenario through the same hooks the regression tests use: a store that
+fails one write, a lease provider whose renewal fails, a budget store that
+fails a reserve or a settle, a model stream that breaks off, a provider that
+answers 529, a chat store that is down, a client that hangs up, and a nested
+run that asks for memory outside its scope. Every scenario asserts that no
+effect ran twice, that no billed call is missing from the accounting, and the
+documented recovery:
+
+| Boundary | What happens | Recovery |
+| --- | --- | --- |
+| Before dispatch | The `executing` receipt cannot be written, so the tool never ran; a resume replays the step | Recovered |
+| After approval | The process dies before the approved call runs; the run waits for the approval again, and the stored verdict answers it | Recovered |
+| After the effect, before the receipt | A resume stops with `tool-reconciliation-required` and names the call; a person checks the system it touched | Contained |
+| The same, for a `replay: 'idempotent'` tool | The call runs again under the same `[modelStep, toolCallId]` identity | Recovered |
+| The same, reconciled | The application finds the charge in the payment system and resumes with `reconciledToolResults`: the step goes on from the recorded outcome, and the charge never runs again | Recovered |
+| After the receipt, before the checkpoint | A resume replays the recorded result; the tool does not run again | Recovered |
+| The same, for an approved call on resume | The approved charge runs in the resume's settle; the process dies during the next model call, after its budget reservation was saved. The next resume passes no verdict: it goes on from the answers the settle saved, the charge does not run again, the model gets its recorded result, and nothing is denied | Recovered |
+| Mid model stream | No tool call from the broken turn runs; the run fails, and the call stays held at its estimate | Contained |
+| The same, resumed with `retryFailed` | The run goes on from its last checkpoint; the broken call stays held, and the retried turn charges once | Recovered |
+| Verifier abort | The run stops as `aborted`, never `completed`; a resume neither verifies nor calls the model again | Contained |
+| Verifier deadline | The run fails on the elapsed deadline instead of completing | Contained |
+| Child initialization | A sub-agent's provider refuses its first request; the delegation is a known failure the parent model is told about | Recovered |
+| Swarm cancel commit | The failed executor lets go of the run, so a resume is not blocked | Recovered |
+| Lease loss | The executor stops writing; the next one resumes, and an idempotent tool runs again under its identity | Recovered |
+| Lease renew failure | The first renewal fails: nothing is written and no model is called; the next executor runs it | Recovered |
+| Admission store failure (40001) | The run fails closed with `admission_failed` before the next call; no hold is left behind | Contained |
+| The same, resumed with `retryFailed` | The call is admitted again and the run completes; the store holds the two settled calls and nothing else | Recovered |
+| Settle failure | The ledger retries the settlement until the hold closes at the actual usage | Recovered |
+| Spawn commit failure | A `replay: 'safe'` parent runs again and its child is spawned once | Recovered |
+| MCP hot refresh, listing fails | The run keeps the catalog it had | Recovered |
+| MCP hot refresh, crash before the record | A resume under the default `onCatalogChange: 'stop'` fails on the catalog drift and leaves the stored run untouched | Contained |
+| The same, resumed with `onCatalogChange: 'accept'` | The resume's first write records the servers' new catalog, before its first model call, and the run completes | Recovered |
+| Refusal or `max_tokens` with a tool call | The call is never dispatched; the run stops with reason `refusal` or `length` | Contained |
+| Memory scope, on a child context | A nested run on a `.child()` of its parent's execution asks for a wider memory scope: it fails before any memory read or write, model call or save, and the parent completes and is told why | Contained |
+| Memory scope, on the parent's own context | A nested run handed its parent's execution context asks for another user's memory: the same refusal, and nothing crosses scopes | Contained |
+| Provider fallback | Claude Opus 5.5 answers 529 after a tool effect; the fail-over is checkpointed, and the process dies once the fallback's call is admitted. The resume calls the recorded fallback, never the failed model, and the effect ran once | Recovered |
+| Fallback attempt and budget settlement | The same fail-over under a USD budget with persistent admission, to a fallback without a price, then a crash on a later receipt: the fallback warns with `unpriced-model` once in each leg and runs, every answered call is counted once at its usage, the failed attempt stays held at its estimate, and the budget store agrees with the ledger | Recovered |
+| Compaction boundary, preserved thinking | A Claude Opus 5.5 run with memory compacts inside its tool loop, then the process dies. The resume replays the compacted history without a second summary; every request extends the one before it except across the compaction; recall ran once, with the user's question | Recovered |
+| Chat projection | The chat store fails the projection after the run completed: the run completes and records the failure, and `reconcileAgentRun` writes the whole transcript once | Recovered |
+| The same, after the chat moved on | A later run went on from the stored chat without this one: the late repair reports `superseded` and overwrites nothing, and the run's turns stay in its checkpoint | Contained |
+| Memory write | The extraction's write lands, then the save that records it fails: a terminal resume neither calls a model nor extracts again, and `reconcileAgentRun` records the extraction without a memory LLM call; the fact is written once | Recovered |
+| UI disconnect and replay | The client of a journaled native stream drops while a tool runs. A second tab's resume is refused on its own response, without event ids, and the journal stays as it was; the client reconnects with its cursor while the leg still runs and gets every frame once, in order | Recovered |
+
+Contained is not a defect in itself: it is the documented safe outcome. A
+cancel, an elapsed deadline, a refusal, a turn cut off by `max_tokens`, a
+nested run that asks for memory outside the scope of the run it serves, and a
+chat repair that would overwrite a newer chat end the work by design. The
+other contained cases have an opt-in way on in 2.3, each shown by the
+recovered scenario under it. A mid-stream transport failure and an admission store
+failure end the native run as `failed`, and a plain resume returns that
+result; a resume with `retryFailed` goes on from the last checkpoint. After an
+unknown outcome the run stops for reconciliation, and in the contained
+scenario a person checks the payment system; when the application checks it
+and records what it found with `reconciledToolResults`, the run recovers
+without a person and without running the charge again. A crash between a hot
+refresh and its record stays contained under the default
+`onCatalogChange: 'stop'`; a resume with `'accept'` records the servers' new
+catalog and recovers.
+
+The recovered fail-over scenarios keep what a fail-over leaves behind by
+design: the failed attempt stays held at its estimate, in the ledger and, with
+persistent admission, as an open hold in the budget store, so a fallback never
+spends past the shared budget. The budget scenario's crash comes after its
+calls settled. A process that dies after a call's hold was admitted and before
+its settlement was saved leaves that hold open where the settlement did not
+land (a `reserved` entry in the last persisted ledger snapshot, an open hold in
+the budget store, or both), to settle or release as
+[When a settlement fails](/docs/modules/budgets#when-a-settlement-fails) and
+[Open holds](/docs/modules/budgets#open-holds) describe.
+
+Set `DEUZ_EVAL_REPORT=<path>` or `DEUZ_FAULT_REPORT=<path>` when running the
+core tests to write either suite's JSON report.
+
+## See also
+
+- [Autonomy: Testing](/docs/modules/autonomy#testing): `createMockModel`, `runEval` and the golden-replay helpers.
+- [Native agents: When the store fails](/docs/modules/native-agents#when-the-store-fails): the receipt boundaries the fault suite injects at.
+- [Budgets](/docs/modules/budgets): reservations, settlement and persistent admission.
+- [Observability](/docs/modules/observability): the events behind `context.observer`.

@@ -26,11 +26,15 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { createHash } from 'node:crypto';
-import { createMcpClient, type McpClientOptions } from '../src/mcp/index';
+import { createMcpClient, type McpClientOptions, type McpSdkLine } from '../src/mcp/index';
 import { createOAuthProvider } from '../src/mcp/auth';
 import { McpAuthorizationRequiredError } from '../src/errors';
 import type { TokenStore } from '../src/types/config';
-import { startFakeAuthServer, type FakeAuthServerHandle } from './helpers/mcp-oauth-server';
+import {
+  startFakeAuthServer,
+  type FakeAuthServerHandle,
+  type FakeAuthServerOptions,
+} from './helpers/mcp-oauth-server';
 import {
   startTestMcpServer,
   type TestMcpServerHandle,
@@ -71,6 +75,9 @@ function keyFor(namespace: string, serverUrl: string): string {
   return `${namespace}:${new URL(serverUrl).href}`;
 }
 
+/** Both SDK lines (2.3): the whole OAuth flow runs once per line. */
+const SDK_LINES: McpSdkLine[] = ['v1', 'v2'];
+
 const authServers: FakeAuthServerHandle[] = [];
 const mcpServers: TestMcpServerHandle[] = [];
 const clients: ConnectedMcpClient[] = [];
@@ -97,8 +104,11 @@ interface Fixture {
  * server issued, and whose 401 points at its own RFC 9728 document naming it.
  * That indirection is the entire discovery half of the flow.
  */
-async function startFixture(mcpOptions: TestMcpServerOptions = {}): Promise<Fixture> {
-  const as = await startFakeAuthServer();
+async function startFixture(
+  mcpOptions: TestMcpServerOptions = {},
+  asOptions: FakeAuthServerOptions = {},
+): Promise<Fixture> {
+  const as = await startFakeAuthServer(asOptions);
   authServers.push(as);
   // A test that pins its own gate (e.g. `requireBearer`) keeps it; otherwise the
   // resource server defers to the AS, which is what makes a refreshed token work.
@@ -115,18 +125,19 @@ async function startFixture(mcpOptions: TestMcpServerOptions = {}): Promise<Fixt
   return { as, mcp, transport: { type: 'http', url: mcp.url } };
 }
 
-async function connect(options: McpClientOptions): Promise<ConnectedMcpClient> {
-  const client = await createMcpClient(options);
+async function connect(sdk: McpSdkLine, options: McpClientOptions): Promise<ConnectedMcpClient> {
+  const client = await createMcpClient({ sdk, ...options });
   clients.push(client);
   return client;
 }
 
 /** Run step one of the flow and hand back the error it is supposed to reject with. */
 async function expectAuthorizationRequired(
+  sdk: McpSdkLine,
   options: McpClientOptions,
 ): Promise<McpAuthorizationRequiredError> {
   try {
-    clients.push(await createMcpClient(options));
+    clients.push(await createMcpClient({ sdk, ...options }));
   } catch (err) {
     if (err instanceof McpAuthorizationRequiredError) return err;
     throw err;
@@ -134,355 +145,433 @@ async function expectAuthorizationRequired(
   throw new Error('Expected createMcpClient to reject with McpAuthorizationRequiredError.');
 }
 
-describe('step 1 — an unauthorized server produces an authorization URL', () => {
-  it('rejects with McpAuthorizationRequiredError carrying a PKCE + DCR authorization URL', async () => {
-    // `requireBearer` with a token this AS will never mint: no bearer can pass,
-    // so the 401 → discovery path is the only thing under test here.
-    const { as, mcp, transport } = await startFixture({ requireBearer: 'never-issued' });
-    const store = recordingStore();
-    const redirects: URL[] = [];
-    const provider = createOAuthProvider({
-      redirectUri: REDIRECT_URI,
-      scope: 'mcp:tools',
-      store,
-      onRedirect: (url) => {
-        redirects.push(url);
-      },
-    });
+describe.each(SDK_LINES)('MCP OAuth [%s SDK]', (sdk) => {
+  describe('step 1 — an unauthorized server produces an authorization URL', () => {
+    it('rejects with McpAuthorizationRequiredError carrying a PKCE + DCR authorization URL', async () => {
+      // `requireBearer` with a token this AS will never mint: no bearer can pass,
+      // so the 401 → discovery path is the only thing under test here.
+      const { as, mcp, transport } = await startFixture({ requireBearer: 'never-issued' });
+      const store = recordingStore();
+      const redirects: URL[] = [];
+      const provider = createOAuthProvider({
+        redirectUri: REDIRECT_URI,
+        scope: 'mcp:tools',
+        store,
+        onRedirect: (url) => {
+          redirects.push(url);
+        },
+      });
 
-    const err = await expectAuthorizationRequired({ transport, auth: provider });
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
 
-    expect(err.serverUrl).toBe(mcp.url);
-    expect(err.code).toBe('mcp_authorization_required');
-    expect(err.message).toMatch(/authorizationUrl/);
-    expect(err.authorizationUrl).toBeDefined();
-    // The library NEVER opens a browser — it hands the URL to the host, and the
-    // string on the error is the same one `onRedirect` saw.
-    expect(redirects.map(String)).toEqual([err.authorizationUrl]);
+      expect(err.serverUrl).toBe(mcp.url);
+      expect(err.code).toBe('mcp_authorization_required');
+      expect(err.message).toMatch(/authorizationUrl/);
+      expect(err.authorizationUrl).toBeDefined();
+      // The library NEVER opens a browser — it hands the URL to the host, and the
+      // string on the error is the same one `onRedirect` saw.
+      expect(redirects.map(String)).toEqual([err.authorizationUrl]);
 
-    const url = new URL(err.authorizationUrl!);
-    expect(url.origin).toBe(as.url);
-    expect(url.pathname).toBe('/authorize');
-    const q = url.searchParams;
-    expect(q.get('response_type')).toBe('code');
-    expect(q.get('code_challenge_method')).toBe('S256');
-    expect(q.get('redirect_uri')).toBe(REDIRECT_URI);
-    expect(q.get('scope')).toBe('mcp:tools');
-    // RFC 8707: the audience comes from the resource server's own metadata.
-    expect(q.get('resource')).toBe(mcp.url);
-    // The client id was minted by dynamic registration moments ago.
-    expect(q.get('client_id')).toBe('client-1');
+      const url = new URL(err.authorizationUrl!);
+      expect(url.origin).toBe(as.url);
+      expect(url.pathname).toBe('/authorize');
+      const q = url.searchParams;
+      expect(q.get('response_type')).toBe('code');
+      expect(q.get('code_challenge_method')).toBe('S256');
+      expect(q.get('redirect_uri')).toBe(REDIRECT_URI);
+      expect(q.get('scope')).toBe('mcp:tools');
+      // RFC 8707: the audience comes from the resource server's own metadata.
+      expect(q.get('resource')).toBe(mcp.url);
+      // The client id was minted by dynamic registration moments ago.
+      expect(q.get('client_id')).toBe('client-1');
 
-    expect(as.registrations).toHaveLength(1);
-    expect(as.registrations[0]!.request).toMatchObject({
-      client_name: 'Deuz SDK',
-      redirect_uris: [REDIRECT_URI],
-      grant_types: ['authorization_code', 'refresh_token'],
-      response_types: ['code'],
-      token_endpoint_auth_method: 'none',
-      scope: 'mcp:tools',
-    });
+      expect(as.registrations).toHaveLength(1);
+      expect(as.registrations[0]!.request).toMatchObject({
+        client_name: 'Deuz SDK',
+        redirect_uris: [REDIRECT_URI],
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+        scope: 'mcp:tools',
+      });
 
-    // Nothing was exchanged: this is a redirect, not a failed login.
-    expect(as.tokenRequests).toEqual([]);
-    expect(await provider.tokens()).toBeUndefined();
-  }, 20_000);
+      // Nothing was exchanged: this is a redirect, not a failed login.
+      expect(as.tokenRequests).toEqual([]);
+      expect(await provider.tokens()).toBeUndefined();
+    }, 20_000);
 
-  it('persists exactly the client info and the PKCE verifier the next step needs', async () => {
-    const { as, mcp, transport } = await startFixture({ requireBearer: 'never-issued' });
-    const store = recordingStore();
-    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
+    it('persists exactly the client info and the PKCE verifier the next step needs', async () => {
+      const { as, mcp, transport } = await startFixture({ requireBearer: 'never-issued' });
+      const store = recordingStore();
+      const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
 
-    const err = await expectAuthorizationRequired({ transport, auth: provider });
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
 
-    // No token key yet, and every secret is namespaced by the server it belongs to.
-    expect([...store.entries.keys()].sort()).toEqual([
-      keyFor('client-info', mcp.url),
-      keyFor('code-verifier', mcp.url),
-      'server-url',
-    ]);
-    expect(store.entries.get('server-url')).toBe(new URL(mcp.url).href);
-    expect(JSON.parse(store.entries.get(keyFor('client-info', mcp.url))!)).toMatchObject({
-      client_id: 'client-1',
-      client_secret: 'secret-1',
-    });
+      // No token key yet, and every secret is namespaced by the server it belongs to.
+      expect([...store.entries.keys()].sort()).toEqual([
+        keyFor('client-info', mcp.url),
+        keyFor('code-verifier', mcp.url),
+        'server-url',
+      ]);
+      expect(store.entries.get('server-url')).toBe(new URL(mcp.url).href);
+      expect(JSON.parse(store.entries.get(keyFor('client-info', mcp.url))!)).toMatchObject({
+        client_id: 'client-1',
+        client_secret: 'secret-1',
+      });
 
-    // The stored verifier is the pre-image of the challenge that just went out:
-    // a provider that saved the wrong string would still "work" until /token.
-    const verifier = store.entries.get(keyFor('code-verifier', mcp.url))!;
-    expect(verifier.length).toBeGreaterThanOrEqual(43);
-    expect(s256(verifier)).toBe(new URL(err.authorizationUrl!).searchParams.get('code_challenge'));
-    expect(as.registrations).toHaveLength(1);
-  }, 20_000);
+      // The stored verifier is the pre-image of the challenge that just went out:
+      // a provider that saved the wrong string would still "work" until /token.
+      const verifier = store.entries.get(keyFor('code-verifier', mcp.url))!;
+      expect(verifier.length).toBeGreaterThanOrEqual(43);
+      expect(s256(verifier)).toBe(
+        new URL(err.authorizationUrl!).searchParams.get('code_challenge'),
+      );
+      expect(as.registrations).toHaveLength(1);
+    }, 20_000);
+  });
+
+  describe('step 2 — spending the authorization code', () => {
+    it('connects with `authorizationCode` and the MCP tools work over the bearer token', async () => {
+      const { as, mcp, transport } = await startFixture();
+      const store = recordingStore();
+      const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
+
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+      const verifier = store.entries.get(keyFor('code-verifier', mcp.url))!;
+
+      const code = as.simulateUserAuthorization(err.authorizationUrl!);
+      expect(code).toBe('code-1');
+      expect(as.authorizations[0]!.codeChallenge).toBe(s256(verifier));
+
+      const client = await connect(sdk, { transport, auth: provider, authorizationCode: code });
+
+      const exchange = as.tokenRequests.find((r) => r.grantType === 'authorization_code');
+      expect(exchange).toBeDefined();
+      expect(exchange!.status).toBe(200);
+      expect(exchange!.params.code).toBe('code-1');
+      // The verifier that reaches /token is the one that was stored — the AS
+      // hashes it and rejects a mismatch with `invalid_grant`.
+      expect(exchange!.params.code_verifier).toBe(verifier);
+      expect(exchange!.params.redirect_uri).toBe(REDIRECT_URI);
+      expect(exchange!.params.client_id).toBe('client-1');
+      expect(exchange!.params.client_secret).toBe('secret-1');
+      expect(exchange!.params.resource).toBe(mcp.url);
+
+      expect(as.issued.map((t) => t.accessToken)).toEqual(['at-1']);
+      expect(await provider.tokens()).toMatchObject({
+        access_token: 'at-1',
+        refresh_token: 'rt-1',
+        token_type: 'Bearer',
+      });
+      expect(JSON.parse(store.entries.get(keyFor('tokens', mcp.url))!)).toMatchObject({
+        access_token: 'at-1',
+      });
+
+      // The point of all of the above: a real tool call over the authorized session.
+      expect(Object.keys(await client.listTools())).toEqual(['echo', 'add', 'boom']);
+      expect(await client.callTool('echo', { value: 'hi' })).toBe('echo:hi');
+      expect(mcp.calls).toEqual([{ name: 'echo', args: { value: 'hi' } }]);
+    }, 20_000);
+
+    it('completeAuth(code) is the imperative twin — the next connect needs no code', async () => {
+      const { as, mcp, transport } = await startFixture();
+      const store = recordingStore();
+      const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
+
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+      const code = as.simulateUserAuthorization(err.authorizationUrl!);
+
+      // Exchanged out of band (a CLI that caught the loopback redirect), against
+      // the server URL the first attempt bound and persisted.
+      await provider.completeAuth(code);
+      expect(await provider.tokens()).toMatchObject({ access_token: 'at-1' });
+      expect(store.entries.get('server-url')).toBe(new URL(mcp.url).href);
+
+      const client = await connect(sdk, { transport, auth: provider });
+      expect(await client.callTool('echo', { value: 'imperative' })).toBe('echo:imperative');
+
+      // One exchange total: the connect reused the stored tokens instead of
+      // starting a second authorization.
+      expect(as.tokenRequests.filter((r) => r.grantType === 'authorization_code')).toHaveLength(1);
+      expect(as.authorizations).toHaveLength(1);
+    }, 20_000);
+
+    it('accepts the options form too — the STORE carries the flow, not the provider instance', async () => {
+      const { as, mcp, transport } = await startFixture();
+      const store = recordingStore();
+      // Same options object twice: `createMcpClient` builds a fresh provider each
+      // time, exactly like a second process would. Only the store is shared.
+      const auth = { redirectUri: REDIRECT_URI, store };
+
+      const err = await expectAuthorizationRequired(sdk, { transport, auth });
+      const code = as.simulateUserAuthorization(err.authorizationUrl!);
+
+      const client = await connect(sdk, { transport, auth, authorizationCode: code });
+
+      expect(as.tokenRequests.find((r) => r.grantType === 'authorization_code')!.params.code).toBe(
+        code,
+      );
+      expect(await client.callTool('add', { a: 2, b: 3 })).toEqual({ sum: 5 });
+      expect(JSON.parse(store.entries.get(keyFor('tokens', mcp.url))!)).toMatchObject({
+        access_token: 'at-1',
+      });
+    }, 20_000);
+  });
+
+  describe('RFC 9207 — an authorization server that names itself on the redirect', () => {
+    // Keycloak and node-oidc-provider advertise
+    // `authorization_response_iss_parameter_supported` and redirect back with
+    // `?code=…&iss=…`. The v2 SDK refuses to redeem such a code without its `iss`,
+    // so the redirect's `iss` must reach the SDK on both roads to an exchange.
+    // Per RFC 9207 §2 it is the AS's issuer identifier: here, its origin.
+    it('createMcpClient({ authorizationCode, authorizationIss }) connects', async () => {
+      const { as, transport } = await startFixture({}, { issParameterSupported: true });
+      const provider = createOAuthProvider({ redirectUri: REDIRECT_URI });
+
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+      const code = as.simulateUserAuthorization(err.authorizationUrl!);
+
+      const client = await connect(sdk, {
+        transport,
+        auth: provider,
+        authorizationCode: code,
+        authorizationIss: as.url,
+      });
+      expect(as.tokenRequests.find((r) => r.grantType === 'authorization_code')?.status).toBe(200);
+      expect(await client.callTool('echo', { value: 'rfc9207' })).toBe('echo:rfc9207');
+    }, 20_000);
+
+    it('provider.completeAuth(code, iss) exchanges the code; the next connect needs none', async () => {
+      const { as, transport } = await startFixture({}, { issParameterSupported: true });
+      const provider = createOAuthProvider({ redirectUri: REDIRECT_URI });
+
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+      const code = as.simulateUserAuthorization(err.authorizationUrl!);
+
+      await provider.completeAuth(code, as.url);
+      expect(await provider.tokens()).toMatchObject({ access_token: 'at-1' });
+      const client = await connect(sdk, { transport, auth: provider });
+      expect(await client.callTool('echo', { value: 'imperative' })).toBe('echo:imperative');
+    }, 20_000);
+  });
+
+  describe('refresh', () => {
+    it('a stale access token is refreshed in place — no second trip through consent', async () => {
+      const { as, mcp, transport } = await startFixture();
+      const store = recordingStore();
+      const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
+
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+      const first = await connect(sdk, {
+        transport,
+        auth: provider,
+        authorizationCode: as.simulateUserAuthorization(err.authorizationUrl!),
+      });
+      await first.close();
+
+      // Seed the state a restarted process reads off disk: an access token the
+      // resource server no longer honours, next to a refresh token that is still
+      // good. (The AS only ever issued `rt-1`, so the grant has to be genuine.)
+      store.entries.set(
+        keyFor('tokens', mcp.url),
+        JSON.stringify({
+          access_token: 'at-stale',
+          token_type: 'Bearer',
+          expires_in: 1,
+          refresh_token: 'rt-1',
+        }),
+      );
+
+      const client = await connect(sdk, { transport, auth: provider });
+
+      const refreshes = as.tokenRequests.filter((r) => r.grantType === 'refresh_token');
+      expect(refreshes).toHaveLength(1);
+      expect(refreshes[0]!.params.refresh_token).toBe('rt-1');
+      expect(refreshes[0]!.status).toBe(200);
+      expect(refreshes[0]!.params.client_id).toBe('client-1');
+
+      expect(await provider.tokens()).toMatchObject({
+        access_token: 'at-2',
+        // The AS did not rotate it, and the SDK preserves the one it presented.
+        refresh_token: 'rt-1',
+      });
+      expect(await client.callTool('echo', { value: 'refreshed' })).toBe('echo:refreshed');
+
+      // The user was never sent anywhere a second time, and no new client was registered.
+      expect(as.authorizations).toHaveLength(1);
+      expect(as.registrations).toHaveLength(1);
+    }, 20_000);
+
+    it('a rejected refresh token falls back to a fresh authorization', async () => {
+      const { as, mcp, transport } = await startFixture();
+      const store = recordingStore();
+      const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
+
+      // Authorize once for real, so the store holds the registration and the
+      // server binding that a later process would read back off disk.
+      const first = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+      const before = await connect(sdk, {
+        transport,
+        auth: provider,
+        authorizationCode: as.simulateUserAuthorization(first.authorizationUrl!),
+      });
+      await before.close();
+
+      // What a revoked session leaves behind: an access token the resource server
+      // rejects, next to a refresh token the AS has never heard of. `/token`
+      // answers `400 invalid_grant`, which is the ONLY thing the SDK retries.
+      store.entries.set(
+        keyFor('tokens', mcp.url),
+        JSON.stringify({
+          access_token: 'at-revoked',
+          token_type: 'Bearer',
+          expires_in: 1,
+          refresh_token: 'rt-dead',
+        }),
+      );
+
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+
+      // The dead grant is presented ONCE. Without `invalidateCredentials` the
+      // SDK's invalid_grant retry re-reads the same stored pair and sends it a
+      // second time, which can only fail again — and the raw `InvalidGrantError`
+      // escapes instead of the actionable error above.
+      const refreshes = as.tokenRequests.filter((r) => r.grantType === 'refresh_token');
+      expect(refreshes.map((r) => r.params.refresh_token)).toEqual(['rt-dead']);
+      expect(refreshes[0]!.status).toBe(400);
+      expect(refreshes[0]!.error).toBe('invalid_grant');
+
+      // A REDIRECT, not a dead end: the retry reached a fresh authorization.
+      expect(err.authorizationUrl).toBeDefined();
+      expect(err.authorizationUrl).not.toBe(first.authorizationUrl);
+      expect(new URL(err.authorizationUrl!).searchParams.get('client_id')).toBe('client-1');
+
+      // The dead pair is gone from the store, so nothing has to be cleared by
+      // hand before the next attempt. The registration is not what the server
+      // rejected, so it survives and no second client was minted.
+      expect(await provider.tokens()).toBeUndefined();
+      expect(store.entries.has(keyFor('tokens', mcp.url))).toBe(false);
+      expect(store.entries.has(keyFor('client-info', mcp.url))).toBe(true);
+      expect(as.registrations).toHaveLength(1);
+
+      // And the offered URL really works — the lockout is over, not just quieter.
+      const after = await connect(sdk, {
+        transport,
+        auth: provider,
+        authorizationCode: as.simulateUserAuthorization(err.authorizationUrl!),
+      });
+      expect(await after.callTool('echo', { value: 'recovered' })).toBe('echo:recovered');
+      expect(await provider.tokens()).toMatchObject({ access_token: 'at-2' });
+    }, 20_000);
+  });
+
+  describe('pre-provisioned clients', () => {
+    it('a configured clientId skips /register entirely and authenticates as a public client', async () => {
+      const { as, mcp, transport } = await startFixture();
+      const store = recordingStore();
+      const provider = createOAuthProvider({
+        redirectUri: REDIRECT_URI,
+        clientId: 'preprovisioned-1',
+        store,
+      });
+
+      const err = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+
+      expect(as.registrations).toEqual([]);
+      expect(store.entries.has(keyFor('client-info', mcp.url))).toBe(false);
+      expect(new URL(err.authorizationUrl!).searchParams.get('client_id')).toBe('preprovisioned-1');
+
+      const client = await connect(sdk, {
+        transport,
+        auth: provider,
+        authorizationCode: as.simulateUserAuthorization(err.authorizationUrl!),
+      });
+
+      const exchange = as.tokenRequests.find((r) => r.grantType === 'authorization_code')!;
+      expect(exchange.status).toBe(200);
+      expect(exchange.params.client_id).toBe('preprovisioned-1');
+      // No secret was configured, so this stays a public PKCE client.
+      expect(exchange.params.client_secret).toBeUndefined();
+      expect(exchange.authorizationHeader).toBeUndefined();
+      expect(as.registrations).toEqual([]);
+
+      expect(await client.callTool('echo', { value: 'static' })).toBe('echo:static');
+    }, 20_000);
+  });
+
+  describe('invalidate()', () => {
+    it('drops the tokens and restarts the flow, keeping the dynamic registration', async () => {
+      const { as, mcp, transport } = await startFixture();
+      const store = recordingStore();
+      const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
+
+      const first = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+      const before = await connect(sdk, {
+        transport,
+        auth: provider,
+        authorizationCode: as.simulateUserAuthorization(first.authorizationUrl!),
+      });
+      expect(await before.callTool('echo', { value: 'before' })).toBe('echo:before');
+      await before.close();
+
+      await provider.invalidate();
+      expect(await provider.tokens()).toBeUndefined();
+      expect(store.entries.has(keyFor('tokens', mcp.url))).toBe(false);
+      expect(store.entries.has(keyFor('code-verifier', mcp.url))).toBe(false);
+      // The registration is not a credential the server rejected — it survives.
+      expect(store.entries.has(keyFor('client-info', mcp.url))).toBe(true);
+
+      const second = await expectAuthorizationRequired(sdk, { transport, auth: provider });
+      expect(second.authorizationUrl).toBeDefined();
+      // A fresh PKCE pair, so the URL cannot be the old one.
+      expect(second.authorizationUrl).not.toBe(first.authorizationUrl);
+      expect(new URL(second.authorizationUrl!).searchParams.get('client_id')).toBe('client-1');
+      expect(as.registrations).toHaveLength(1);
+
+      const secondCode = as.simulateUserAuthorization(second.authorizationUrl!);
+      expect(secondCode).toBe('code-2');
+      const after = await connect(sdk, {
+        transport,
+        auth: provider,
+        authorizationCode: secondCode,
+      });
+
+      expect(await after.callTool('echo', { value: 'after' })).toBe('echo:after');
+      expect(as.issued.map((t) => t.accessToken)).toEqual(['at-1', 'at-2']);
+      expect(as.tokenRequests.filter((r) => r.grantType === 'authorization_code')).toHaveLength(2);
+    }, 20_000);
+  });
 });
 
-describe('step 2 — spending the authorization code', () => {
-  it('connects with `authorizationCode` and the MCP tools work over the bearer token', async () => {
-    const { as, mcp, transport } = await startFixture();
-    const store = recordingStore();
-    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
-
-    const err = await expectAuthorizationRequired({ transport, auth: provider });
-    const verifier = store.entries.get(keyFor('code-verifier', mcp.url))!;
-
+describe('MCP OAuth against an RFC 9207 authorization server — what differs per line', () => {
+  it('v2: a redirect whose iss names another server is refused before the code is spent', async () => {
+    const { as, transport } = await startFixture({}, { issParameterSupported: true });
+    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI });
+    const err = await expectAuthorizationRequired('v2', { transport, auth: provider });
     const code = as.simulateUserAuthorization(err.authorizationUrl!);
-    expect(code).toBe('code-1');
-    expect(as.authorizations[0]!.codeChallenge).toBe(s256(verifier));
 
-    const client = await connect({ transport, auth: provider, authorizationCode: code });
-
-    const exchange = as.tokenRequests.find((r) => r.grantType === 'authorization_code');
-    expect(exchange).toBeDefined();
-    expect(exchange!.status).toBe(200);
-    expect(exchange!.params.code).toBe('code-1');
-    // The verifier that reaches /token is the one that was stored — the AS
-    // hashes it and rejects a mismatch with `invalid_grant`.
-    expect(exchange!.params.code_verifier).toBe(verifier);
-    expect(exchange!.params.redirect_uri).toBe(REDIRECT_URI);
-    expect(exchange!.params.client_id).toBe('client-1');
-    expect(exchange!.params.client_secret).toBe('secret-1');
-    expect(exchange!.params.resource).toBe(mcp.url);
-
-    expect(as.issued.map((t) => t.accessToken)).toEqual(['at-1']);
-    expect(await provider.tokens()).toMatchObject({
-      access_token: 'at-1',
-      refresh_token: 'rt-1',
-      token_type: 'Bearer',
-    });
-    expect(JSON.parse(store.entries.get(keyFor('tokens', mcp.url))!)).toMatchObject({
-      access_token: 'at-1',
-    });
-
-    // The point of all of the above: a real tool call over the authorized session.
-    expect(Object.keys(await client.listTools())).toEqual(['echo', 'add', 'boom']);
-    expect(await client.callTool('echo', { value: 'hi' })).toBe('echo:hi');
-    expect(mcp.calls).toEqual([{ name: 'echo', args: { value: 'hi' } }]);
+    // The mix-up defense RFC 9207 exists for: the code came back labelled with
+    // somebody else's issuer, so it must never reach this server's /token.
+    await expect(
+      connect('v2', {
+        transport,
+        auth: provider,
+        authorizationCode: code,
+        authorizationIss: 'https://attacker.example',
+      }),
+    ).rejects.toThrow(/issuer/i);
+    expect(as.tokenRequests.filter((r) => r.grantType === 'authorization_code')).toEqual([]);
   }, 20_000);
 
-  it('completeAuth(code) is the imperative twin — the next connect needs no code', async () => {
-    const { as, mcp, transport } = await startFixture();
-    const store = recordingStore();
-    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
-
-    const err = await expectAuthorizationRequired({ transport, auth: provider });
+  it('v1: a provider bound through a v1 client keeps the 2.2 exchange — completeAuth(code) needs no iss', async () => {
+    const { as, transport } = await startFixture({}, { issParameterSupported: true });
+    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI });
+    const err = await expectAuthorizationRequired('v1', { transport, auth: provider });
     const code = as.simulateUserAuthorization(err.authorizationUrl!);
 
-    // Exchanged out of band (a CLI that caught the loopback redirect), against
-    // the server URL the first attempt bound and persisted.
+    // 2.2 code, with the v2 package installed: `sdk: 'v1'` promises the v1
+    // exchange, which has no RFC 9207 check — completeAuth must run on that line.
     await provider.completeAuth(code);
     expect(await provider.tokens()).toMatchObject({ access_token: 'at-1' });
-    expect(store.entries.get('server-url')).toBe(new URL(mcp.url).href);
-
-    const client = await connect({ transport, auth: provider });
-    expect(await client.callTool('echo', { value: 'imperative' })).toBe('echo:imperative');
-
-    // One exchange total: the connect reused the stored tokens instead of
-    // starting a second authorization.
-    expect(as.tokenRequests.filter((r) => r.grantType === 'authorization_code')).toHaveLength(1);
-    expect(as.authorizations).toHaveLength(1);
-  }, 20_000);
-
-  it('accepts the options form too — the STORE carries the flow, not the provider instance', async () => {
-    const { as, mcp, transport } = await startFixture();
-    const store = recordingStore();
-    // Same options object twice: `createMcpClient` builds a fresh provider each
-    // time, exactly like a second process would. Only the store is shared.
-    const auth = { redirectUri: REDIRECT_URI, store };
-
-    const err = await expectAuthorizationRequired({ transport, auth });
-    const code = as.simulateUserAuthorization(err.authorizationUrl!);
-
-    const client = await connect({ transport, auth, authorizationCode: code });
-
-    expect(as.tokenRequests.find((r) => r.grantType === 'authorization_code')!.params.code).toBe(
-      code,
-    );
-    expect(await client.callTool('add', { a: 2, b: 3 })).toEqual({ sum: 5 });
-    expect(JSON.parse(store.entries.get(keyFor('tokens', mcp.url))!)).toMatchObject({
-      access_token: 'at-1',
-    });
-  }, 20_000);
-});
-
-describe('refresh', () => {
-  it('a stale access token is refreshed in place — no second trip through consent', async () => {
-    const { as, mcp, transport } = await startFixture();
-    const store = recordingStore();
-    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
-
-    const err = await expectAuthorizationRequired({ transport, auth: provider });
-    const first = await connect({
-      transport,
-      auth: provider,
-      authorizationCode: as.simulateUserAuthorization(err.authorizationUrl!),
-    });
-    await first.close();
-
-    // Seed the state a restarted process reads off disk: an access token the
-    // resource server no longer honours, next to a refresh token that is still
-    // good. (The AS only ever issued `rt-1`, so the grant has to be genuine.)
-    store.entries.set(
-      keyFor('tokens', mcp.url),
-      JSON.stringify({
-        access_token: 'at-stale',
-        token_type: 'Bearer',
-        expires_in: 1,
-        refresh_token: 'rt-1',
-      }),
-    );
-
-    const client = await connect({ transport, auth: provider });
-
-    const refreshes = as.tokenRequests.filter((r) => r.grantType === 'refresh_token');
-    expect(refreshes).toHaveLength(1);
-    expect(refreshes[0]!.params.refresh_token).toBe('rt-1');
-    expect(refreshes[0]!.status).toBe(200);
-    expect(refreshes[0]!.params.client_id).toBe('client-1');
-
-    expect(await provider.tokens()).toMatchObject({
-      access_token: 'at-2',
-      // The AS did not rotate it, and the SDK preserves the one it presented.
-      refresh_token: 'rt-1',
-    });
-    expect(await client.callTool('echo', { value: 'refreshed' })).toBe('echo:refreshed');
-
-    // The user was never sent anywhere a second time, and no new client was registered.
-    expect(as.authorizations).toHaveLength(1);
-    expect(as.registrations).toHaveLength(1);
-  }, 20_000);
-
-  it('a rejected refresh token falls back to a fresh authorization', async () => {
-    const { as, mcp, transport } = await startFixture();
-    const store = recordingStore();
-    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
-
-    // Authorize once for real, so the store holds the registration and the
-    // server binding that a later process would read back off disk.
-    const first = await expectAuthorizationRequired({ transport, auth: provider });
-    const before = await connect({
-      transport,
-      auth: provider,
-      authorizationCode: as.simulateUserAuthorization(first.authorizationUrl!),
-    });
-    await before.close();
-
-    // What a revoked session leaves behind: an access token the resource server
-    // rejects, next to a refresh token the AS has never heard of. `/token`
-    // answers `400 invalid_grant`, which is the ONLY thing the SDK retries.
-    store.entries.set(
-      keyFor('tokens', mcp.url),
-      JSON.stringify({
-        access_token: 'at-revoked',
-        token_type: 'Bearer',
-        expires_in: 1,
-        refresh_token: 'rt-dead',
-      }),
-    );
-
-    const err = await expectAuthorizationRequired({ transport, auth: provider });
-
-    // The dead grant is presented ONCE. Without `invalidateCredentials` the
-    // SDK's invalid_grant retry re-reads the same stored pair and sends it a
-    // second time, which can only fail again — and the raw `InvalidGrantError`
-    // escapes instead of the actionable error above.
-    const refreshes = as.tokenRequests.filter((r) => r.grantType === 'refresh_token');
-    expect(refreshes.map((r) => r.params.refresh_token)).toEqual(['rt-dead']);
-    expect(refreshes[0]!.status).toBe(400);
-    expect(refreshes[0]!.error).toBe('invalid_grant');
-
-    // A REDIRECT, not a dead end: the retry reached a fresh authorization.
-    expect(err.authorizationUrl).toBeDefined();
-    expect(err.authorizationUrl).not.toBe(first.authorizationUrl);
-    expect(new URL(err.authorizationUrl!).searchParams.get('client_id')).toBe('client-1');
-
-    // The dead pair is gone from the store, so nothing has to be cleared by
-    // hand before the next attempt. The registration is not what the server
-    // rejected, so it survives and no second client was minted.
-    expect(await provider.tokens()).toBeUndefined();
-    expect(store.entries.has(keyFor('tokens', mcp.url))).toBe(false);
-    expect(store.entries.has(keyFor('client-info', mcp.url))).toBe(true);
-    expect(as.registrations).toHaveLength(1);
-
-    // And the offered URL really works — the lockout is over, not just quieter.
-    const after = await connect({
-      transport,
-      auth: provider,
-      authorizationCode: as.simulateUserAuthorization(err.authorizationUrl!),
-    });
-    expect(await after.callTool('echo', { value: 'recovered' })).toBe('echo:recovered');
-    expect(await provider.tokens()).toMatchObject({ access_token: 'at-2' });
-  }, 20_000);
-});
-
-describe('pre-provisioned clients', () => {
-  it('a configured clientId skips /register entirely and authenticates as a public client', async () => {
-    const { as, mcp, transport } = await startFixture();
-    const store = recordingStore();
-    const provider = createOAuthProvider({
-      redirectUri: REDIRECT_URI,
-      clientId: 'preprovisioned-1',
-      store,
-    });
-
-    const err = await expectAuthorizationRequired({ transport, auth: provider });
-
-    expect(as.registrations).toEqual([]);
-    expect(store.entries.has(keyFor('client-info', mcp.url))).toBe(false);
-    expect(new URL(err.authorizationUrl!).searchParams.get('client_id')).toBe('preprovisioned-1');
-
-    const client = await connect({
-      transport,
-      auth: provider,
-      authorizationCode: as.simulateUserAuthorization(err.authorizationUrl!),
-    });
-
-    const exchange = as.tokenRequests.find((r) => r.grantType === 'authorization_code')!;
-    expect(exchange.status).toBe(200);
-    expect(exchange.params.client_id).toBe('preprovisioned-1');
-    // No secret was configured, so this stays a public PKCE client.
-    expect(exchange.params.client_secret).toBeUndefined();
-    expect(exchange.authorizationHeader).toBeUndefined();
-    expect(as.registrations).toEqual([]);
-
-    expect(await client.callTool('echo', { value: 'static' })).toBe('echo:static');
-  }, 20_000);
-});
-
-describe('invalidate()', () => {
-  it('drops the tokens and restarts the flow, keeping the dynamic registration', async () => {
-    const { as, mcp, transport } = await startFixture();
-    const store = recordingStore();
-    const provider = createOAuthProvider({ redirectUri: REDIRECT_URI, store });
-
-    const first = await expectAuthorizationRequired({ transport, auth: provider });
-    const before = await connect({
-      transport,
-      auth: provider,
-      authorizationCode: as.simulateUserAuthorization(first.authorizationUrl!),
-    });
-    expect(await before.callTool('echo', { value: 'before' })).toBe('echo:before');
-    await before.close();
-
-    await provider.invalidate();
-    expect(await provider.tokens()).toBeUndefined();
-    expect(store.entries.has(keyFor('tokens', mcp.url))).toBe(false);
-    expect(store.entries.has(keyFor('code-verifier', mcp.url))).toBe(false);
-    // The registration is not a credential the server rejected — it survives.
-    expect(store.entries.has(keyFor('client-info', mcp.url))).toBe(true);
-
-    const second = await expectAuthorizationRequired({ transport, auth: provider });
-    expect(second.authorizationUrl).toBeDefined();
-    // A fresh PKCE pair, so the URL cannot be the old one.
-    expect(second.authorizationUrl).not.toBe(first.authorizationUrl);
-    expect(new URL(second.authorizationUrl!).searchParams.get('client_id')).toBe('client-1');
-    expect(as.registrations).toHaveLength(1);
-
-    const secondCode = as.simulateUserAuthorization(second.authorizationUrl!);
-    expect(secondCode).toBe('code-2');
-    const after = await connect({ transport, auth: provider, authorizationCode: secondCode });
-
-    expect(await after.callTool('echo', { value: 'after' })).toBe('echo:after');
-    expect(as.issued.map((t) => t.accessToken)).toEqual(['at-1', 'at-2']);
-    expect(as.tokenRequests.filter((r) => r.grantType === 'authorization_code')).toHaveLength(2);
   }, 20_000);
 });

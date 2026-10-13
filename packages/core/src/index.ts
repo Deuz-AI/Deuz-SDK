@@ -54,6 +54,24 @@ export { filePart, imagePart } from './parts';
 // instead of hard-coding slug lists. Returns a frozen copy; never throws.
 export { getModelCapabilities } from './core/registry';
 export type { ModelCapabilities } from './core/registry';
+// Model profiles (2.3): what each model accepts, and every value a request changes.
+export type { EffortLevel, EffortNoneMapping, RegistryMatch } from './core/registry';
+export type { EffortField } from './core/request-rules';
+export { resolveModelProfile } from './model-profile';
+export type {
+  ModelProfile,
+  ModelProfileEffort,
+  ModelProfileThinking,
+  ModelProfileLimits,
+  ModelProfileSampling,
+  ModelProfileUsage,
+  ModelProfileCache,
+  ModelProfileClamp,
+  ProfileSupport,
+  ProfileCapability,
+  ModelStatus,
+  AnthropicThinkingType,
+} from './model-profile';
 
 // Optional convenience client + dependency resolution.
 export { createClient, resolveDependencies } from './client';
@@ -80,10 +98,12 @@ export {
   McpAuthorizationRequiredError,
 } from './errors';
 export type { APICallErrorOptions, DeuzErrorJSON } from './errors';
+// A legacy loop's `budget.unknownPrice: 'reject'` refusal (2.3).
+export { UnpricedModelError } from './internal/unpriced-error';
 
 // Optional cost estimation (token breakdown → USD). App injects via deps.priceProvider.
-export { createPriceProvider, priceUsage, PRICES_2026 } from './pricing';
-export type { ModelPrice, PriceTable, CreatePriceProviderOptions } from './pricing';
+export { createPriceProvider, priceUsage, PRICES_2026, PRICE_ALIASES } from './pricing';
+export type { ModelPrice, PriceTable, PriceTier, CreatePriceProviderOptions } from './pricing';
 
 // Provider-executed (server-side) tool factories — web search phase 1.
 export { anthropicWebSearch, openaiWebSearch, googleSearch } from './server-tools';

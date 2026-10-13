@@ -1,9 +1,9 @@
-<!-- verified: 2026-09-20 against @deuz-sdk/core@2.2.0 · api-contract sha256:c301da6ab500
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.3.0 · api-contract sha256:d0398bbef8c4
      sources: packages/core/src/{memory.ts, memory-markdown.ts, compaction.ts, chat-request.ts,
-     inference/compaction.ts, inference/loop-shared.ts, types/config.ts, types/methods.ts,
-     types/message.ts, node/store-sqlite.ts}, docs/content/docs/modules/{memory.mdx, compaction.mdx},
-     docs/content/docs/core/compaction.mdx, docs/content/docs/reference/whats-new-2-0.mdx,
-     skills/deuz-sdk/rules/{modules.md, pitfalls.md} -->
+     inference/compaction.ts, inference/loop-shared.ts, internal/stable-prefix.ts, internal/native-memory.ts,
+     types/config.ts, types/methods.ts, types/message.ts, node/store-sqlite.ts},
+     docs/content/docs/modules/{memory.mdx, compaction.mdx}, docs/content/docs/core/compaction.mdx,
+     docs/content/docs/agents/preserved-thinking.mdx, docs/content/docs/reference/whats-new-2-0.mdx -->
 
 # Memory across sessions, and surviving long conversations
 
@@ -110,10 +110,12 @@ Set `memory` on any `streamChat` / `generateText` call and the loop recalls befo
 
 Contracts worth knowing before you rely on them:
 
-- **Recall is a call-site splice, never history.** Computed once per run from the **last user message**, appended to the leading `system` message (or prepended as a new one), and only at the model-call site — checkpoints and `chat` persistence stay recall-free, and resume legs cannot double-inject. No user message with text ⇒ no query at all.
-- **Extract is non-blocking.** It starts when the run completes. `result.memory` is a `Promise<MemoryMutation[]>` that **never rejects** and resolves `[]` on suspension, on a blocked input guardrail, or on error. The extract turns are the last user message plus the assistant/tool turns this run appended — never the whole history.
+- **Recall is a call-site splice, never history** — on every model but Claude 5.x. Computed once per run from the **last user message**, appended to the leading `system` message (or prepended as a new one), and only at the model-call site — checkpoints and `chat` persistence stay recall-free, and resume legs cannot double-inject. No user message with text ⇒ no query at all. A compaction summary is never the recall query, on any model (2.3): the query is the last user message before it.
+- **On Claude 5.x the recall is history (2.3).** Splicing it into the system prompt would change the prefix Claude binds its thinking to, so a run that **starts** on Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5 (or an unknown `claude-*-5…` id) recalls once per user turn into one appended `role: 'system'` message right after the question (after the `onInput` guardrails, before the first model call), marked `providerMetadata: { deuz: { memoryRecall: true } }`. It rides in the run's history, checkpoints, `response.messages` and the chat record, so the next turn sends it back where the model saw it. A history whose last user message is already followed by its recall message recalls nothing: a durable resume leg (also once a compaction in the tool loop folded the turn's recall into its summary), an approval continuation built from `response.messages`, a replayed transcript. The model the run starts with decides the placement on every leg, so a leg resumed as a handoff target on another model keeps it. `uiFromMessages` does not render system messages and `useChat` does not post them, so a route that wants the prefix to hold across turns loads its history from its chat store.
+- **Native runs** recall once per run into the same appended message on every model, and extract only for a completed run (`references/native-execution.md`).
+- **Extract is non-blocking.** It starts when the run completes. `result.memory` is a `Promise<MemoryMutation[]>` that **never rejects** and resolves `[]` on suspension, on a blocked input guardrail, or on error. The extract turns are the last user message plus the assistant/tool turns this run appended — never the whole history — and system messages are left out, so a recall message is never written back as a fact (2.3).
 - **Both halves are best-effort.** A failing store/embedder/LLM logs through `deps.logger.error` and the chat proceeds. The default logger is a no-op, so wire one or the failure is invisible.
-- **The recall block's size is added to the compaction fill estimate**, because the provider counts it even though `messages` does not contain it. Observation: `operation.*` events under subsystem `'memory'`, operations `memory.recall` and `memory.extract`, parented under the run span.
+- **The spliced recall block's size is added to the compaction fill estimate**, because the provider counts it even though `messages` does not contain it (the Claude 5.x recall message is in `messages` already). Observation: `operation.*` events under subsystem `'memory'`, operations `memory.recall` and `memory.extract`, parented under the run span.
 
 ```ts
 // app/api/chat/route.ts — Web-standard handler; adapt keepAlive to your platform.
@@ -162,7 +164,7 @@ export async function POST(req: Request): Promise<Response> {
 
 ## Manual control: `remember`, `recall`, `createMemoryTools`
 
-Use the functions directly for batch ingestion, custom recall placement (mid-prompt, or as a tool result), synchronous writes, or a query that is not "the last user message". `RememberOptions`: `infer` (default `true`), `apply` (`true`), `topK` (`5`), `supersede` (`'hard' | 'soft'`), `ttlMs`, `kind`, `customInstructions`, `customExtract`, `links`. `recall(query, seams, opts?)` opts: `scorer`, `dropExpired` (default `true`), `expandLinks` — and `MemoryQuery.asOf` / `.filter` are passed to `store.search` untouched, with no meaning of their own (both reference backends ignore them).
+Use the functions directly for batch ingestion, custom recall placement (mid-prompt, or as a tool result), synchronous writes, or a query that is not "the last user message". `RememberOptions`: `infer` (default `true`), `apply` (`true`), `topK` (`5`), `supersede` (`'hard' | 'soft'`), `ttlMs`, `kind`, `customInstructions`, `customExtract`, `links`, and `metadata` (2.3: base metadata every record the pass writes carries; an updated record's own metadata wins; a native run stamps `metadata.deuz = { runId, operationId }` this way). `recall(query, seams, opts?)` opts: `scorer`, `dropExpired` (default `true`), `expandLinks` — and `MemoryQuery.asOf` / `.filter` are passed to `store.search` untouched, with no meaning of their own (both reference backends ignore them).
 
 ```ts
 // manual-memory.ts — recall on every turn, write once when the session closes.
@@ -257,7 +259,7 @@ A pass runs at the top of **every** step including the first, so an already-over
 
 The order is by price, not by saving; reordering is legal, but putting `summarize` first means paying on every trigger.
 
-**Never touched, by any layer, in any mode — including forced overflow recovery:** every `system` message; the **first** `user` message; the **last** message; and everything from the `keepRecentSteps`-th-from-last **assistant** message onward (assistant messages, not loop steps — a contiguous tail, tool results included). `summarize` additionally needs at least two unprotected messages *and* a contiguous unprotected run of two, so it never orphans a `tool_use`/`tool_result` pair.
+**Never touched, by any layer, in any mode — including forced overflow recovery** (Claude 5.x compacts differently, below)**:** every `system` message; the **first** `user` message; the **last** message; and everything from the `keepRecentSteps`-th-from-last **assistant** message onward (assistant messages, not loop steps — a contiguous tail, tool results included). `summarize` additionally needs at least two unprotected messages *and* a contiguous unprotected run of two, so it never orphans a `tool_use`/`tool_result` pair.
 
 `streamChat` emits one `compaction` `StreamPart` per layer that actually changed the history (`layer`, `tokensBefore`, `tokensAfter`, optional `trigger: 'threshold' | 'manual' | 'overflow'`); `generateText` logs the same through `deps.logger.info`. `response.messages` is never a compacted rewrite — compaction acts on the effective model history only, and `prepareStep` runs *after* it, so you always get the last word.
 
@@ -266,6 +268,10 @@ The order is by price, not by saving; reordering is legal, but putting `summariz
 On pass 2 the unprotected run already **begins with** the previous summary. It is pulled out, handed to the summarizer as `previousSummary`, and only the genuinely new messages are summarized — then both are replaced by one folded result. **At most one summary block ever sits in the history**; summaries never stack and a summary is never re-summarized. The slice is flattened into a single plain-text `user` message before it goes out (a slice can start with an assistant turn, which is a 400 on Anthropic), and the side call is stripped of tools, `maxSteps`, `stopWhen`, `prepareStep`, approval hooks and compaction itself so it cannot recurse. Your `onUsage` still fires — the summary really does spend tokens.
 
 The summary is a `user` message on purpose: it splices in immediately before a protected **assistant** turn, two adjacent assistant messages merge on the wire, and that breaks Anthropic's "thinking block leads the turn" rule in a way that is very hard to trace back. A later pass recognizes it by prefix alone (user role, one text part, prefix match) — the sentinel string is internal, so do not hard-code it.
+
+### Claude 5.x: one summary, nothing pruned (2.3)
+
+For Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 (and an unknown `claude-*-5…` id) a pruned history would replay thinking behind a rewritten prefix, so compaction is **simple**: one summary replaces the conversation. The leading system messages, the later system messages that carry run state (handoff instructions, tool-set changes, your own) and the pending user turn with its recall message stay; an older recall message is summarized with its turns. The prune layers never run on their own: with `'auto'` or any policy that lists `summarize` they fold into the summary, and a prune-only policy compacts nothing and reports each skipped layer. Overflow recovery runs the same simple pass, and `compactMessages` does too when `deps.model` is such a model. Anthropic's server-side compaction is not used.
 
 ## Automatic overflow recovery
 
@@ -290,11 +296,11 @@ When a step's request is rejected as too long, the adapter maps it to `ContextOv
 function compactMessages(
   messages: Message[],
   policy?: CompactionOption,   // default 'auto'
-  deps?: CompactMessagesDeps,  // { summarize?, estimateTokens?, contextWindow?, onSkip? }
+  deps?: CompactMessagesDeps,  // { summarize?, estimateTokens?, contextWindow?, onSkip?, model? (2.3) }
 ): Promise<CompactMessagesResult>;  // { messages, events, trigger: 'manual' | 'threshold' }
 ```
 
-**With no `summarize` dep it makes no network call at all** — the summarize layer is skipped and the two pruning layers do their work for free. The one behavioral fork is `contextWindow`: supplied ⇒ threshold mode (loop semantics, early stop at `threshold × 0.8`, `trigger: 'threshold'`); omitted ⇒ **force** mode, where every layer runs exactly once with no early stop, including the paid one if you supplied a summarizer (`trigger: 'manual'`). Pass a `contextWindow` whenever you know it. It never throws (a failing summarizer skips its layer and calls `onSkip`), untouched messages keep reference equality so a React state or prompt cache survives, `events` only reports layers that **changed** something, `durationMs` is always `0` (this module injects no clock), and the EMA calibration never runs — a policy `countTokens` is the entire estimate, multiplied by a factor pinned at `1.0`.
+**With no `summarize` dep it makes no network call at all** — the summarize layer is skipped and the two pruning layers do their work for free. The one behavioral fork is `contextWindow`: supplied ⇒ threshold mode (loop semantics, early stop at `threshold × 0.8`, `trigger: 'threshold'`); omitted ⇒ **force** mode, where every layer runs exactly once with no early stop, including the paid one if you supplied a summarizer (`trigger: 'manual'`). Pass a `contextWindow` whenever you know it, and `model` (2.3), the model the history goes to next: a Claude 5.x model gets the simple pass above. It never throws (a failing summarizer skips its layer and calls `onSkip`), untouched messages keep reference equality so a React state or prompt cache survives, `events` only reports layers that **changed** something, `durationMs` is always `0` (this module injects no clock), and the EMA calibration never runs — a policy `countTokens` is the entire estimate, multiplied by a factor pinned at `1.0`.
 
 ```ts
 // own-your-history.ts — one turn at a time, no loop, so you own both jobs.
@@ -387,13 +393,14 @@ export async function research(): Promise<string> {
 | `compactMessages` summarized far more than expected | No `contextWindow` ⇒ force mode: every layer runs once, no early stop | Pass `contextWindow` |
 | A `ContextOverflowError` still escaped | Second overflow in the same step, every layer declined, a single-turn call, or the Gemini `native` wire | Set `compaction` explicitly; lower `threshold`; catch and `compactMessages` |
 | Usage jumped with no extra visible step | The `summarize` side call is metered into the run total and budget stops | Pin `summarizeModel` to a cheap model |
-| Cost after a handoff looks wrong | Compaction re-points at the active agent, but cost is still priced against the root `model.modelId` | Bound with `budget.tokens` too |
+| A prune-only policy does nothing on Claude 5.x | Those models compact only by summary (2.3) | List `summarize`, or use `'auto'` |
 
 ## Deep dive
 
 - [/docs/modules/memory](/docs/modules/memory) — the whole memory module: pipeline, seams, scope, stores, tools, markdown vault, pitfalls.
 - [/docs/modules/compaction](/docs/modules/compaction) — `compactMessages`, the rolling summary, overflow recovery, `countTokens`.
 - [/docs/core/compaction](/docs/core/compaction) — the `compaction` call option, the three layers, protection rules, the stream part.
+- [/docs/agents/preserved-thinking](/docs/agents/preserved-thinking) — why Claude 5.x needs the appended recall and the summary-only compaction (2.3).
 - [/docs/modules/stores](/docs/modules/stores) — SQLite / Redis / Postgres `MemoryStore` implementations and their trade-offs.
 - [/docs/core/embeddings](/docs/core/embeddings) — `embed` / `embedMany`, the engine behind `createEmbedder`.
 - [/docs/reference/whats-new-2-0](/docs/reference/whats-new-2-0) — sections 5 and 7, plus the stated overflow and token-counting limits.

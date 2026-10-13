@@ -7,10 +7,17 @@
  */
 import type { SqliteDatabaseLike, SqliteStatementLike } from './store-sqlite';
 import { ensureBusyTimeout } from './sqlite-open';
-import type { AgentRunEnvelope, AgentRunStore } from '../types/agent-run';
+import type {
+  AgentRunEnvelope,
+  AgentRunListPage,
+  AgentRunListQuery,
+  AgentRunStore,
+} from '../types/agent-run';
 import type { Clock } from '../types/deps';
 import type { Lease, LeaseProvider, LeaseRenewal, LeaseSignal } from '../types/lease';
 import { assertEnvelopeRevision, assertLeaseRequest } from '../internal/ops-validate';
+import { assertRetentionTime } from '../internal/ops-retention';
+import { agentRunListPage, planAgentRunList, summarizeAgentRun } from '../internal/agent-run-list';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { decodeSwarm, encodeSwarm } from '../swarm/store';
 
@@ -32,16 +39,39 @@ export interface SqliteOpsStoreOptions {
 }
 
 export interface SqliteOpsStore {
-  leases: LeaseProvider;
-  agentRuns: AgentRunStore;
+  /** Has `ack` and, for retention (2.3), `prune`. */
+  leases: LeaseProvider & Required<Pick<LeaseProvider, 'ack' | 'prune'>>;
+  agentRuns: AgentRunStore & {
+    /**
+     * Retention (2.3): delete the terminal runs (completed, stopped or failed)
+     * last saved before `before`, epoch ms on the store's clock, and return how
+     * many. Running, finalizing and suspended runs stay; a pruned run can no
+     * longer be resumed or inspected, and its ID is free again.
+     */
+    prune(before: number): Promise<number>;
+    /**
+     * Native run discovery (2.3): a page of runs, newest save first, by the
+     * `deuz_agent_runs_updated_at` index. Times are on the store's clock.
+     */
+    list(query?: AgentRunListQuery): Promise<AgentRunListPage>;
+  };
   /**
    * A durable claim for `createScheduler({ claim })` and `handleSignal({ dedupe })`:
    * a key is granted once across every process sharing the file, until
    * `release(key)` gives it back. Granted keys stay in `deuz_claims` (with
-   * `claimed_at`, epoch ms on the store's clock) until you delete them; a key
-   * over 512 characters or holding a NUL is stored as `sha256:<hex>` of it.
+   * `claimed_at`, epoch ms on the store's clock) until released or pruned; a
+   * key over 512 characters or holding a NUL is stored as `sha256:<hex>` of it.
    */
-  claims: { (key: string): Promise<boolean>; release(key: string): Promise<void> };
+  claims: {
+    (key: string): Promise<boolean>;
+    release(key: string): Promise<void>;
+    /**
+     * Retention (2.3): delete the keys granted before `before`, epoch ms on the
+     * store's clock, and return how many. A pruned key can be claimed again, so
+     * keep every key an occurrence or delivery may still repeat.
+     */
+    prune(before: number): Promise<number>;
+  };
   close(): Promise<void>;
 }
 
@@ -131,6 +161,9 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
           db!.exec(
             'CREATE TABLE IF NOT EXISTS deuz_claims (key TEXT PRIMARY KEY, claimed_at INTEGER NOT NULL)',
           );
+          // 2.3, for retention: additions a 2.2 process ignores, so version 1 stays.
+          db!.exec(`CREATE INDEX IF NOT EXISTS deuz_claims_claimed_at ON deuz_claims(claimed_at);
+            CREATE INDEX IF NOT EXISTS deuz_agent_runs_updated_at ON deuz_agent_runs(updated_at);`);
         });
         return db;
       } catch (error) {
@@ -161,8 +194,21 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
     ) as LeaseRow | undefined;
   const view = (key: string, owner: string, token: number, expiresAt: number): Lease =>
     Object.freeze({ key, owner, token: Number(token), expiresAt: Number(expiresAt) });
+  /** Deletes the rows `where` matches (2.3), in one transaction, and counts them. */
+  const prune = (db: SqliteDatabaseLike, table: string, where: string, before: number) =>
+    transaction(db, () => {
+      const pruned = Number(
+        (
+          statement(db, `SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`).get(before) as {
+            n: number;
+          }
+        ).n,
+      );
+      if (pruned) statement(db, `DELETE FROM ${table} WHERE ${where}`).run(before);
+      return pruned;
+    });
 
-  const leases: LeaseProvider = {
+  const leases: SqliteOpsStore['leases'] = {
     async acquire({ key, owner, ttlMs }) {
       assertLeaseRequest(key, owner, ttlMs);
       return use((db) =>
@@ -183,7 +229,7 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
         }),
       );
     },
-    async renew(lease, ttlMs): Promise<LeaseRenewal> {
+    async renew(lease, ttlMs, options = {}): Promise<LeaseRenewal> {
       assertLeaseRequest(lease.key, lease.owner, ttlMs);
       return use((db) =>
         transaction(db, (): LeaseRenewal => {
@@ -196,14 +242,20 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
           )
             return { held: false };
           const expiresAt = clock.now() + ttlMs;
-          statement(db, `UPDATE deuz_leases SET expires_at=?, signals='[]' WHERE key=?`).run(
+          const signals = JSON.parse(row.signals) as LeaseSignal[];
+          // Acknowledged delivery (2.3): the cancel stays queued until ack().
+          const queued: LeaseSignal[] =
+            options.acknowledge && signals.includes('cancel') ? ['cancel'] : [];
+          statement(db, 'UPDATE deuz_leases SET expires_at=?, signals=? WHERE key=?').run(
             expiresAt,
+            JSON.stringify(queued),
             lease.key,
           );
           return {
             held: true,
             lease: view(lease.key, lease.owner, lease.token, expiresAt),
-            signals: JSON.parse(row.signals) as LeaseSignal[],
+            signals,
+            ...(options.acknowledge ? { queued } : {}),
           };
         }),
       );
@@ -234,9 +286,41 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
         }),
       );
     },
+    async ack(lease, signal) {
+      if (signal !== 'cancel')
+        throw new TypeError(`Only a cancel is acknowledged: ${String(signal)}`);
+      return use((db) =>
+        transaction(db, () => {
+          const row = readLease(db, lease.key);
+          // Fenced by the token: once the key changed hands, the cancel is the new holder's.
+          if (!row || Number(row.token) !== lease.token || row.owner !== lease.owner) return false;
+          const signals = (JSON.parse(row.signals) as LeaseSignal[]).filter(
+            (queued) => queued !== 'cancel',
+          );
+          statement(db, 'UPDATE deuz_leases SET signals=? WHERE key=?').run(
+            JSON.stringify(signals),
+            lease.key,
+          );
+          return true;
+        }),
+      );
+    },
+    async prune(before) {
+      assertRetentionTime(before);
+      // Nobody holds the key, and no cancel waits for its run's next executor.
+      // The cutoff stops at the store's time: a lease expiring later is held.
+      return use((db) =>
+        prune(
+          db,
+          'deuz_leases',
+          `(expires_at = 0 OR expires_at < ?) AND instr(signals, '"cancel"') = 0`,
+          Math.min(before, clock.now()),
+        ),
+      );
+    },
   };
 
-  const agentRuns: AgentRunStore = {
+  const agentRuns: SqliteOpsStore['agentRuns'] = {
     async load(runId) {
       return use((db) => {
         const row = statement(db, 'SELECT payload FROM deuz_agent_runs WHERE run_id=?').get(
@@ -263,6 +347,71 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
         }),
       );
     },
+    async prune(before) {
+      assertRetentionTime(before);
+      return use((db) =>
+        prune(
+          db,
+          'deuz_agent_runs',
+          `updated_at < ? AND json_extract(payload, '$.phase') = 'terminal'`,
+          before,
+        ),
+      );
+    },
+    async list(query) {
+      const plan = planAgentRunList(query);
+      if (plan.phases?.length === 0) return { runs: [] };
+      const where: string[] = [];
+      const params: (string | number)[] = [];
+      if (plan.scope !== undefined) {
+        where.push('scope=?');
+        params.push(plan.scope);
+      }
+      if (plan.updatedBefore !== undefined) {
+        where.push('updated_at<?');
+        params.push(plan.updatedBefore);
+      }
+      if (plan.after !== undefined) {
+        // Strictly after the cursor in the ORDER BY below.
+        where.push('(updated_at<? OR (updated_at=? AND run_id<?))');
+        params.push(plan.after.updatedAt, plan.after.updatedAt, plan.after.runId);
+      }
+      if (plan.phases !== undefined) {
+        where.push(`json_extract(payload, '$.phase') IN (${plan.phases.map(() => '?').join(',')})`);
+        params.push(...plan.phases);
+      }
+      const rows = await use(
+        (db) =>
+          statement(
+            db,
+            `SELECT run_id, scope, revision, updated_at,
+             json_extract(payload, '$.phase') AS phase,
+             json_extract(payload, '$.result.status') AS status
+             FROM deuz_agent_runs${where.length ? ` WHERE ${where.join(' AND ')}` : ''}
+             ORDER BY updated_at DESC, run_id DESC LIMIT ?`,
+          ).all(...params, plan.limit + 1) as {
+            run_id: string;
+            scope: string;
+            revision: number;
+            updated_at: number;
+            phase: unknown;
+            status: unknown;
+          }[],
+      );
+      return agentRunListPage(
+        rows.map((row) =>
+          summarizeAgentRun({
+            runId: row.run_id,
+            scope: row.scope,
+            revision: row.revision,
+            updatedAt: row.updated_at,
+            phase: row.phase,
+            status: row.status,
+          }),
+        ),
+        plan.limit,
+      );
+    },
   };
 
   const claims: SqliteOpsStore['claims'] = Object.assign(
@@ -283,6 +432,10 @@ export function createSqliteOpsStore(options: SqliteOpsStoreOptions): SqliteOpsS
       async release(key: string): Promise<void> {
         const row = await claimRowKey(key);
         await use((db) => statement(db, 'DELETE FROM deuz_claims WHERE key=?').run(row));
+      },
+      async prune(before: number): Promise<number> {
+        assertRetentionTime(before);
+        return use((db) => prune(db, 'deuz_claims', 'claimed_at < ?', before));
       },
     },
   );

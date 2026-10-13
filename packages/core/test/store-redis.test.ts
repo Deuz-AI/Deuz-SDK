@@ -25,6 +25,7 @@ import {
 import type { ChatRecord } from '../src/chat';
 import type { MemoryRecord, MemoryStore } from '../src/memory';
 import type { AgentCheckpoint } from '../src/types/session';
+import type { RunRecord } from '../src/types/runtime';
 import {
   assertMemoryStoreContract,
   assertPersistentMemoryStoreContract,
@@ -739,6 +740,73 @@ describe('createRedisStores — sessions', () => {
   });
 });
 
+describe('createRedisStores — runs (2.3)', () => {
+  const run = (runId: string, extra: Partial<RunRecord> = {}): RunRecord => ({
+    runId,
+    status: 'running',
+    goal: `goal ${runId}`,
+    createdAt: T0,
+    updatedAt: T0,
+    ...extra,
+  });
+
+  it('stores a run under run:rec, the run:ix ZSET and its status ZSET', async () => {
+    const { client, stores } = pack();
+
+    await stores.runs.create(run('a:b', { createdAt: T0 + 7 }));
+
+    expect(client.keys()).toEqual(['deuz:run:ix', 'deuz:run:rec:a%3Ab', 'deuz:run:st:running']);
+    expect(client.zsets.get('deuz:run:ix')!.get('a:b')).toBe(T0 + 7);
+    expect(client.zsets.get('deuz:run:st:running')!.get('a:b')).toBe(T0 + 7);
+    expect(JSON.parse(client.strings.get('deuz:run:rec:a%3Ab')!)).toEqual(
+      run('a:b', { createdAt: T0 + 7 }),
+    );
+  });
+
+  it('moves a run between status ZSETs, oldest createdAt first', async () => {
+    const { client, stores } = pack();
+    await stores.runs.create(run('late', { createdAt: T0 + 2 }));
+    await stores.runs.create(run('early', { createdAt: T0 + 1 }));
+
+    await stores.runs.update('late', { status: 'completed' });
+
+    // The new status first, the record, then the stale status.
+    expect(commandNames(client).slice(-4)).toEqual(['zAdd', 'zAdd', 'set', 'zRem']);
+    expect([...client.zsets.get('deuz:run:st:running')!.keys()]).toEqual(['early']);
+    expect([...client.zsets.get('deuz:run:st:completed')!.keys()]).toEqual(['late']);
+    expect((await stores.runs.list()).map((record) => record.runId)).toEqual(['early', 'late']);
+  });
+
+  it('lists a run under the status its record holds after a crash between index writes', async () => {
+    const { client, stores } = pack();
+    await stores.runs.create(run('r1'));
+    // The process died after adding the new status, before writing the record.
+    client.zsets.set('deuz:run:st:failed', new Map([['r1', T0]]));
+    expect(await stores.runs.list({ status: 'failed' })).toEqual([]);
+    expect((await stores.runs.list({ status: 'running' })).map((r) => r.runId)).toEqual(['r1']);
+
+    // And after writing the record, before dropping the old status.
+    await stores.runs.update('r1', { status: 'completed' });
+    client.zsets.set('deuz:run:st:running', new Map([['r1', T0]]));
+    expect(await stores.runs.list({ status: 'running' })).toEqual([]);
+    expect((await stores.runs.list({ status: 'completed' })).map((r) => r.runId)).toEqual(['r1']);
+  });
+
+  it('skips an index entry whose record is gone, and delete sweeps it', async () => {
+    const { client, stores } = pack();
+    await stores.runs.create(run('r1'));
+    client.zsets.get('deuz:run:ix')!.set('orphan', T0);
+    client.zsets.get('deuz:run:st:running')!.set('orphan', T0);
+
+    expect((await stores.runs.list()).map((record) => record.runId)).toEqual(['r1']);
+    expect((await stores.runs.list({ status: 'running' })).map((r) => r.runId)).toEqual(['r1']);
+
+    await stores.runs.delete('orphan');
+    await stores.runs.delete('r1');
+    expect(client.keys()).toEqual([]);
+  });
+});
+
 // ===================================================================
 // Connection lifecycle
 // ===================================================================
@@ -802,7 +870,7 @@ describe('createRedisStores — connection lifecycle', () => {
     const stores = create({ url: 'redis://localhost:6379' });
 
     await expect(stores.memory.list({ userId: 'user-a' })).rejects.toThrow(
-      /optional peer `redis` \(node-redis v4 or v5\).*npm i redis/s,
+      /optional peer `redis` \(node-redis v4, v5 or v6\).*npm i redis/s,
     );
     // Every seam funnels through the same accessor, so the message is the same
     // whichever one the caller reached for first.

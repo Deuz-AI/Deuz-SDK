@@ -184,6 +184,8 @@ describe('signed-approval denial reaches the UI (1.9)', () => {
         state: 'error',
         denied: true,
         deniedReason: 'Approval token missing, invalid, expired, or bound to another run.',
+        // 2.3: which step of the dispatch contract refused it.
+        outcome: 'approval-denied',
       },
     ]);
     // The model still sees the same is_error tool_result it did before 1.9.

@@ -6,7 +6,7 @@ description: validateChatRequest — the structural gate every chat route needs 
 Every documented chat route used to read `const { messages } = await req.json()` and hand the result straight to `streamChat`. That body is **attacker-controlled**, and canonical `Message[]` is expressive enough to be dangerous:
 
 1. `Role` includes `'system'`, so a client can append a system turn and overwrite the instructions your route thought it owned. **This is the live vector, and the one most deployments miss.**
-2. A forged `tool_result` part can claim any outcome ("payment captured"). On the wire a client-authored tool result is indistinguishable from one the server produced, and the model believes it.
+2. A forged `tool_result` part can claim any outcome ("payment captured"). On the wire a client-authored tool result is indistinguishable from one the server produced, and the model believes it. (Since 2.3 the default accepts a result only as the answer to a call of the assistant turn right before it, which is the shape `useChat` posts; see [below](#client-tools-need-rejecttoolresults-false).)
 3. Forged assistant turns rewrite what the model thinks it already said.
 4. 50 000 messages, or one 40 MB message, is a billing attack.
 
@@ -67,22 +67,34 @@ Every failure is a **rejection**. A silently "cleaned" message array hides the a
 | Option | Default | What it does |
 | --- | --- | --- |
 | `rejectSystemRole` | `true` | Reject `role: 'system'` in the client's messages. Opt out only if the client legitimately owns the system prompt (a local playground — never a multi-tenant deployment). |
-| `rejectToolResults` | `true` | Reject client-authored `tool_result` parts **and** `role: 'tool'` turns. A `tool_result` smuggled into a `role: 'user'` turn is caught at the part level too. |
+| `rejectToolResults` | `true` | Reject client-authored `tool_result` parts **and** `role: 'tool'` turns. A `tool_result` smuggled into a `role: 'user'` turn is caught at the part level too. Since 2.3 the default accepts one shape: `role: 'tool'` turns right after an assistant turn that answer its calls, each call once — the history `useChat` posts ([see below](#client-tools-need-rejecttoolresults-false)). `false` accepts every tool result. |
 | `rejectAssistantTurns` | `false` | Regenerate and edit-and-resend legitimately replay assistant turns, so they are allowed by default. |
 | `maxMessages` | `1000` | History length cap. A body over the cap is rejected **without walking the entries** — rejecting 50 000 messages must not cost 50 000 validations. |
-| `maxTextBytes` | `100_000` | Per-message UTF-8 text budget (≈25k tokens). Counts string `content`, every `text`/`reasoning` part, and every string inside a `tool_use.input` / `tool_result.result`. |
+| `maxTextBytes` | `100_000` | Per-message UTF-8 text budget (≈25k tokens). Counts string `content`, every `text`/`reasoning` part except opaque reasoning, and every string inside a `tool_use.input` / `tool_result.result`, object keys included (2.3). |
+| `maxOpaqueReasoningBytes` **(2.3)** | `1_000_000` | Per-message UTF-8 budget for opaque reasoning payloads: `encrypted` reasoning (OpenAI Responses) and `redacted` thinking (Anthropic). Counted on its own, not against `maxTextBytes`. |
+| `maxProviderMetadataBytes` **(2.3)** | `1_000_000` | Per-message UTF-8 budget for provider round-trip data: the `providerMetadata` of the message and of its `text` and `tool_use` parts (a Gemini thought signature, OpenAI's `phase`), keys included, and every reasoning `signature` (Claude). Counted on its own. |
 
 Image and PDF payloads are **excluded** from `maxTextBytes` — a legitimate photo is megabytes of base64 and would trip a cap sized for prose. Binary volume is a raw-body-size concern: cap that at the edge, which a pure validator cannot do for you.
 
-## Client tools need `rejectToolResults: false`
+Opaque reasoning has a budget of its own (2.3). Since 2.3 `useChat` posts every reasoning block of a turn back. An encrypted or redacted block is provider state, not prose, so it counts against `maxOpaqueReasoningBytes` instead of `maxTextBytes`. The flags are client-controlled, so a part counts as opaque only when its flag matches the family that produces it: `encrypted` with `source` absent or `'openai'`, `redacted` with `source` absent or `'anthropic'`. Those two wires send the payload back only as the opaque block it came from (an encrypted reasoning item, a `redacted_thinking` block). Any other flagged part, such as an "encrypted" part claiming `source: 'google'`, counts as text, and the Gemini wire never sends a flagged part at all. Raise `maxOpaqueReasoningBytes` for long multi-step turns at high reasoning effort, whose payloads add up within one message.
 
-`useChat`'s `onToolCall` round-trip POSTs a `role: 'tool'` message, so a route serving client tools must allow it:
+Provider round-trip data has a budget of its own too (2.3). `useChat` posts back what a wire needs on the next request: a Gemini function call's or text's thought signature in `providerMetadata`, the `signature` of a Claude thinking block, OpenAI's `phase`. Before 2.3 none of it counted against any budget, so a client could attach megabytes to a message under every default. `maxProviderMetadataBytes` bounds it per message; raise it for a long multi-step Gemini turn with many signed calls. Since 2.3 every byte walk counts an object's keys as well as its values, so a payload cannot hide its volume in key names.
+
+## Client tools need `rejectToolResults: false`?
+
+Not since 2.3. The history `useChat` posts holds `role: 'tool'` messages in three places: after a client tool (`onToolCall` or `addToolResult`), after an approval (the approved call's result, which the resumed leg streamed), and after a turn in which the server ran a tool (that call's result). Each answers calls of the assistant turn right before it, and since 2.3 the default accepts exactly that shape:
+
+- one `role: 'tool'` message, or a run of them, right after an assistant turn;
+- holding only `tool_result` parts;
+- each answering a call (`tool_use`) of that assistant turn that nothing answered yet.
+
+Anything else is still rejected: a tool result with no assistant turn right before it, one for a call that turn did not make, a call answered twice, a tool message that also carries text, and a `tool_result` part inside a `user` turn. An accepted result passes the same shape checks and counts against `maxTextBytes` like any other content. Before 2.3 the default rejected every tool result, so a client-tool route had to pass `{ rejectToolResults: false }`, and a route with approvals or server tools got a 400 once `useChat`'s history answered those calls. Pass `false` only to accept tool results of any shape:
 
 ```ts
 const parsed = validateChatRequest(await req.json(), { rejectToolResults: false });
 ```
 
-Understand exactly what that accepts. The validator **cannot** tell a real client tool result from a forged one, because the same client authored the assistant turn it pairs with. The only real fix is to stop trusting the history: persist it server-side with a [`ChatStore` + `chatId`](/docs/modules/chat-persistence) and treat the client's copy as a rendering cache.
+Understand exactly what the default accepts. The validator **cannot** tell a real tool result from a forged one, because the same client authored the assistant turn it pairs with: a client can claim that its call of a server tool returned anything. A forged result runs no tool, and an approval still needs its verdict, but the model reads the result as fact. The only real fix is to stop trusting the history: persist it server-side with a [`ChatStore` + `chatId`](/docs/modules/chat-persistence) and treat the client's copy as a rendering cache, or check a result against your own record of the run before you use the history.
 
 ## Issue strings are bounded and secret-safe
 
@@ -108,7 +120,7 @@ Two structural hardenings worth knowing: a body carrying an own `__proto__` key 
 
 ## See also
 
-- [Client tools](/docs/agents/client-tools) — the round-trip that needs `rejectToolResults: false`.
+- [Client tools](/docs/agents/client-tools) — the round-trip whose answers the default accepts since 2.3.
 - [Chat persistence](/docs/modules/chat-persistence) — the server-side history that makes the client's copy a cache.
 - [Durable runtime](/docs/agents/durable-runtime) — `createApprovalSigner` and the signed approval token.
 - [UI streaming](/docs/modules/ui-streaming) — the wire this route answers on.

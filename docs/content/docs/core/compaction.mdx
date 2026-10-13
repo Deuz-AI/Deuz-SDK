@@ -97,6 +97,19 @@ Regardless of policy, no layer ever touches:
 - the **last** message in history (the pending question — critical when no assistant turn exists yet),
 - the last `keepRecentSteps` assistant turns and everything after them.
 
+## Claude 5.x: simple compaction (2.3)
+
+Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind every thinking block to the conversation before it: the top-level system, the tools array and every earlier message have to reach the API byte-identical, or the replayed block is invalid ([Preserved thinking](/docs/agents/preserved-thinking)). The layers above edit exactly that prefix: `summarize` replaces the oldest turns and then replays the recent turns with their thinking behind the new summary, and the prune layers rewrite messages in the middle of it.
+
+So when the model being compacted for is one of these (or an unknown `claude-*-5…` id on the family fallback), a pass runs **simple** compaction instead:
+
+- **One summary replaces the whole conversation.** No assistant turn survives the boundary, so no thinking from before it is ever replayed with a changed prefix. The summary is the same rolling `user` message (`[Earlier conversation summarized]`), folded into on the next pass.
+- **What stays:** the leading `system` messages (the top-level system, untouched), every later system message that carries run state (handoff instructions, tool-set changes, your own), in order, and the pending user turn after the last assistant message together with its memory-recall message. An older recall block is conversation content: it is summarized with the turns around it. A history that ends mid tool loop (on a tool result) is summarized whole.
+- **The prune layers never run on their own.** The summary is the one declared boundary at which the prefix may change. With `'auto'` (or any policy that lists `summarize`) they simply fold into it; a policy that lists only prune layers compacts nothing on these models and reports each skipped layer through the usual skip warning.
+- **Overflow recovery follows the same rule**: a provider rejection forces one simple pass and a retry.
+
+The other models keep the three layers exactly as described above. Anthropic's server-side compaction (the beta `compaction` request parameter and its signed `compaction` blocks) is not used: it needs a new canonical part kind, which 2.x does not add. Not live-verified.
+
 ## Invariants
 
 - **Immutable, cache-stable history.** Compaction builds new arrays; it never mutates a prior message, and untouched messages keep reference equality so provider prompt-cache hits survive. `response.messages` — what the loop appended — is never affected by compaction; it only ever reflects what happened, not a compacted rewrite. The `summarize` layer does break the cache once (a new message replaces a run of old ones), but the history re-stabilizes from that point on.

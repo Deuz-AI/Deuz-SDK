@@ -16,6 +16,7 @@ const result = streamObject<T>(options); // NOT awaited — returns synchronousl
 //   object: Promise<T>;
 //   usage: Promise<Usage>;
 //   finishReason: Promise<FinishReason>;
+//   stopDetails?: Promise<StopDetails | undefined>; // 2.3 — the provider's stop explanation
 //   consume?: (options?: { onError?: (e: unknown) => void }) => Promise<void>; // 1.9
 //   warnings?: Promise<CallWarning[]>;   // resolves with the run's notices, `[]` when clean
 // }
@@ -65,7 +66,7 @@ Strategy selection is identical to `generateObject` (capability-driven `auto`, s
 
 - `object` rejects with `NoObjectGeneratedError` (its `.text` carries the raw payload),
 - iterating `partialObjectStream` rejects (mirroring `textStream`'s throw-on-error),
-- `usage` and `finishReason` still **resolve** — the tokens were spent either way.
+- `usage`, `finishReason` and `stopDetails` (2.3) still **resolve** — the tokens were spent either way, and a refused request keeps its explanation.
 
 If you need the repair retry, use `generateObject`; if you need progressive rendering, use `streamObject` and handle the rejection.
 
@@ -73,11 +74,17 @@ If you need the repair retry, use `generateObject`; if you need progressive rend
 try {
   const value = await result.object;
 } catch (err) {
-  if (err instanceof NoObjectGeneratedError) console.error('raw payload:', err.text);
+  if (!(err instanceof NoObjectGeneratedError)) throw err; // a transport failure
+  if ((await result.finishReason) === 'content_filter') {
+    const details = await result.stopDetails; // e.g. { type: 'refusal', category: 'cyber' }
+    console.error('refused:', details?.category ?? 'no category');
+  } else {
+    console.error('raw payload:', err.text);
+  }
 }
 ```
 
-Transport errors (bad key, HTTP 4xx/5xx, timeout) reject all three promises and the stream.
+Transport errors (bad key, HTTP 4xx/5xx, timeout) reject `object`, `usage`, `finishReason`, `stopDetails` and the stream; `warnings` still resolves with what was collected before the failure.
 
 ## To the browser
 

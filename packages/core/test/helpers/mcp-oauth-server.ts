@@ -97,6 +97,13 @@ export interface FakeAuthServerOptions {
   resource?: string;
   /** Answer `/register` with this status instead of 201 (DCR failure paths). */
   registrationStatus?: number;
+  /**
+   * RFC 9207 (2.3): advertise `authorization_response_iss_parameter_supported`
+   * and add `iss` (this server's issuer, i.e. `url`) to the `/authorize`
+   * redirect, as Keycloak does. The v2 client SDK then refuses to redeem a code
+   * that arrives without that `iss`.
+   */
+  issParameterSupported?: boolean;
 }
 
 export interface FakeAuthServerHandle {
@@ -185,6 +192,7 @@ export async function startFakeAuthServer(
       token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic', 'none'],
     };
     if (opts.scopesSupported) doc.scopes_supported = opts.scopesSupported;
+    if (opts.issParameterSupported) doc.authorization_response_iss_parameter_supported = true;
     return doc;
   }
 
@@ -433,6 +441,7 @@ export async function startFakeAuthServer(
       const back = new URL(grant.redirectUri);
       back.searchParams.set('code', grant.code);
       if (grant.state) back.searchParams.set('state', grant.state);
+      if (opts.issParameterSupported) back.searchParams.set('iss', origin());
       res.writeHead(302, { location: back.toString() });
       res.end();
       return;

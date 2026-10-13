@@ -44,6 +44,16 @@ export interface AgentCheckpoint {
   cost?: UsageCostSnapshot;
   /** Set when `status` is 'suspended' on a client-mode approval break. */
   pendingApprovals?: ToolApprovalRequest[];
+  /**
+   * How many approval requests the run has issued under each tool call id,
+   * over all its legs (2.3 additive), carried on every later checkpoint. A
+   * verdict that names only a tool call id (the 2.2 form) answers a request only
+   * when the run issued one request under that id. `messages` cannot tell once
+   * compaction or `prepareStep` has rewritten it; this count can. Absent until
+   * the run issues a request, and on checkpoints written without it, where the
+   * history decides alone.
+   */
+  approvalRequestCounts?: Record<string, number>;
   /** Sub-agent path of the checkpointed loop (absent at the root). */
   agentPath?: string[];
   /**

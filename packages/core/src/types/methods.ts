@@ -17,13 +17,40 @@ import type { MemoryMutation } from '../memory';
  *
  * `type` is an OPEN string union in spirit — 'other' is the escape hatch, so
  * treat unknown members defensively rather than switching exhaustively.
+ *
+ * `unpriced-model` (2.3): the model has no price, so a USD budget could not be
+ * applied to that call. The call still runs and token limits still apply; set
+ * `unknownPrice: 'reject'` to refuse unpriced models instead.
  */
 export interface CallWarning {
-  type: 'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other';
+  type:
+    | 'unsupported-setting'
+    | 'clamped-setting'
+    | 'unknown-model'
+    | 'unsupported-tool'
+    | 'unpriced-model'
+    | 'other';
   /** The option that triggered it, when there is one (e.g. 'topP', 'effort'). */
   setting?: string;
   /** Human-readable explanation. Never contains secrets (P0 redaction). */
   message: string;
+}
+
+/**
+ * Why the provider stopped a turn early, when it explained it (2.3 additive).
+ * Anthropic's `stop_details` on a refusal (`stop_reason: 'refusal'`), and an
+ * OpenAI refusal as `{ type: 'refusal', explanation: <the refusal text> }`,
+ * both surfaced as `finishReason: 'content_filter'`. The raw provider data also
+ * stays on finish parts as `providerMetadata.anthropic.stop_details` or
+ * `providerMetadata.openai.refusal`.
+ */
+export interface StopDetails {
+  /** What the detail explains, e.g. `'refusal'`. Treat unknown values defensively. */
+  type: string;
+  /** Provider category, when given (Anthropic refusal categories such as `'cyber'`). */
+  category?: string | null;
+  /** Provider explanation, when given. */
+  explanation?: string | null;
 }
 
 // --- streamChat ---
@@ -37,6 +64,14 @@ export interface StreamChatResult {
   /** Resolves once the stream finishes. */
   usage: Promise<Usage>;
   finishReason: Promise<FinishReason>;
+  /**
+   * The provider's explanation of the stop (2.3 additive), when it gave one —
+   * e.g. a refusal's category. Resolves together with `finishReason`, with
+   * `undefined` when the provider explained nothing or the caller aborted, and
+   * rejects when the call failed. The raw provider object also stays on the
+   * `finish` part's `providerMetadata`. See {@link StopDetails}.
+   */
+  stopDetails?: Promise<StopDetails | undefined>;
   /**
    * Durable run id — present only when the call carried `session` (or came
    * from `resumeStreamFromCheckpoint`). Known synchronously. Additive (1.5).
@@ -100,6 +135,11 @@ export interface GenerateTextResult {
   /** Total usage summed across all agentic steps. */
   usage: Usage;
   finishReason: FinishReason;
+  /**
+   * The provider's explanation of the last turn's stop (2.3 additive), when it
+   * gave one — e.g. a refusal's category. See {@link StopDetails}.
+   */
+  stopDetails?: StopDetails;
   /** Messages to append to history (assistant + tool turns across all steps). */
   response: { messages: Message[] };
   /** Per-step breakdown (present when `tools` were used). Additive. */
@@ -162,6 +202,11 @@ export interface GenerateObjectResult<T = unknown> {
   usage: Usage;
   finishReason: FinishReason;
   /**
+   * The provider's explanation of the stop (2.3 additive), when it gave one —
+   * e.g. a refusal's category. See {@link StopDetails}.
+   */
+  stopDetails?: StopDetails;
+  /**
    * Non-fatal execution notices (1.9 additive) — e.g. an unknown slug forcing
    * the 'tool' strategy because the fallback row reports no native structured
    * output. See {@link CallWarning}.
@@ -199,6 +244,14 @@ export interface StreamObjectResult<T = unknown> {
   /** Resolve even when final validation fails (the tokens were still spent). */
   usage: Promise<Usage>;
   finishReason: Promise<FinishReason>;
+  /**
+   * The provider's explanation of the stop (2.3 additive), e.g. a refusal's
+   * category. Resolves together with `usage` and `finishReason`, before the
+   * final validation, so a refused request is explained even when `object`
+   * rejects; `undefined` when the provider explained nothing. Rejects when the
+   * call failed. See {@link StopDetails}.
+   */
+  stopDetails?: Promise<StopDetails | undefined>;
   /**
    * Non-fatal execution notices (1.9 additive). Resolves together with `usage`
    * and `finishReason`; never rejects. See {@link CallWarning}.

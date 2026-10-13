@@ -10,18 +10,40 @@
  * resumable (`Last-Event-ID` → `resumeDeuzStreamResponse`) and lets any number
  * of clients follow the same stream live through a {@link StreamStateStore}.
  * v1 clients keep working: `id:` lines are invisible to them and unknown part
- * types are skipped (open-union rule). Serializers emit v1 byte-identically
- * when negotiated via {@link negotiateDeuzStreamVersion} / `wireVersion`.
+ * types are skipped (open-union rule). A response negotiated to v1 (via
+ * {@link negotiateDeuzStreamVersion} / `wireVersion`) carries no `id:` lines
+ * and no v2-only part. It is not byte-identical to pre-1.7 output: later
+ * releases added optional fields to v1 parts, which an older client ignores:
+ * the approval `token` (1.7) and, in 2.3, the `text-delta` and `tool-call`
+ * `providerMetadata`, the `reasoning-delta` block fields, `tool-result.outcome`
+ * and the `stopDetails` of `step-finish` and `finish`. 2.3's additions to
+ * v2-only parts stay on v2: `tool-state.outcome`, the `'unpriced-model'`
+ * warning and the `data-agent` frames of a native run.
  */
-import type { CallWarning, StreamChatResult, StreamObjectResult } from './types/methods';
+import type {
+  CallWarning,
+  StopDetails,
+  StreamChatResult,
+  StreamObjectResult,
+} from './types/methods';
 import type { StreamPart, ToolRunState } from './types/stream';
 import type { Usage, FinishReason } from './types/usage';
 import type { Clock } from './types/deps';
 import type { StandardSchemaV1 } from './types/schema';
+import type { ToolApprovalRequest, ToolCallOutcome } from './types/tool';
+import type {
+  AgentEvent,
+  AgentPartialOutput,
+  AgentResult,
+  AgentStream,
+  AgentVerification,
+} from './types/agent-run';
 import { parseSSE } from './internal/sse';
 import { redactString } from './internal/redact';
 import { resolveDependencies } from './internal/resolve-deps';
 import { DEFAULT_RETRY, backoffMs, unitFromId } from './core/resilience';
+import { agentFrameOf, applyAgentFrame, idleAgentState } from './internal/agent-ui';
+import { stopDetailsFrom } from './internal/stop-details';
 
 /** The version this SDK emits by default. */
 export const DEUZ_STREAM_VERSION = 'v2';
@@ -49,17 +71,72 @@ export function negotiateDeuzStreamVersion(
 export type DeuzUIPart =
   | { type: 'start'; messageId: string }
   | { type: 'step-start'; step: number }
-  | { type: 'step-finish'; step: number; finishReason: FinishReason; usage: Usage }
-  | { type: 'text-delta'; text: string }
-  | { type: 'reasoning-delta'; text: string; signature?: string }
+  /** `stopDetails` (2.3 additive): as on `finish`, for this step. */
+  | {
+      type: 'step-finish';
+      step: number;
+      finishReason: FinishReason;
+      usage: Usage;
+      stopDetails?: StopDetails;
+    }
+  /**
+   * A chunk of assistant text. `providerMetadata` (2.3 additive) is the text's
+   * provider round-trip data, such as a Gemini thought signature on a plain text
+   * part (often on a final chunk whose `text` is empty), so a chat client sends
+   * the text back as the provider produced it (`applyUIPart` keeps it on the UI
+   * text part). Never display it. It rides every wire version.
+   */
+  | { type: 'text-delta'; text: string; providerMetadata?: Record<string, unknown> }
+  /**
+   * A reasoning delta. 2.3 adds optional fields so a chat client can send
+   * every block back unchanged: the canonical part's `id` (deltas of one block
+   * share it), `encrypted` / `redacted` (the block is an opaque provider
+   * payload, never display text) and `source` (the provider family that
+   * produced it), plus `data`. They ride every wire version.
+   *
+   * An opaque block's payload rides `data`, and its `text` is empty. A client
+   * that predates these fields (a 2.2 `@deuz-sdk/react`, the frozen
+   * `@deuz-sdk/core/react` hook, a custom reader) ignores them and appends
+   * `text` to the reasoning it shows, so it shows nothing for the block instead
+   * of the payload. `applyUIPart` reads the payload back from `data`.
+   */
+  | {
+      type: 'reasoning-delta';
+      text: string;
+      signature?: string;
+      id?: string;
+      encrypted?: boolean;
+      redacted?: boolean;
+      source?: string;
+      /** The payload of an `encrypted` or `redacted` block (2.3); `text` is then empty. */
+      data?: string;
+    }
   | { type: 'tool-input-delta'; toolCallId: string; toolName?: string; delta: string }
-  | { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown }
+  /**
+   * A fully parsed tool call. `providerMetadata` (2.3 additive) is the call's
+   * provider round-trip data, such as a Gemini function call's thought
+   * signature, so a chat client sends the `tool_use` back as the provider
+   * produced it (`applyUIPart` keeps it on the UI call). Never display it.
+   */
+  | {
+      type: 'tool-call';
+      toolCallId: string;
+      toolName: string;
+      input: unknown;
+      providerMetadata?: Record<string, unknown>;
+    }
+  /**
+   * A tool finished. `outcome` (2.3 additive) says how an error result ended
+   * (`ToolCallOutcome`: a thrown tool, a policy or approval denial, …); a
+   * successful result carries none. It rides every wire version.
+   */
   | {
       type: 'tool-result';
       toolCallId: string;
       toolName: string;
       output: unknown;
       isError?: boolean;
+      outcome?: ToolCallOutcome;
     }
   | { type: 'source'; id: string; url?: string; title?: string }
   | {
@@ -120,6 +197,10 @@ export type DeuzUIPart =
    * `ToolRunState` deliberately gains no 7th member (it is a pinned root export
    * and a new member would break any exhaustive switch), so a 1.8 client keeps
    * rendering exactly the error state it always did.
+   *
+   * `outcome` (2.3 additive) is the dispatch contract's verdict, as on the
+   * canonical `ToolStatePart`: set with a terminal `'error'` and with
+   * `'awaiting-approval'` (`'approval-pending'`), absent otherwise.
    */
   | {
       type: 'tool-state';
@@ -128,6 +209,7 @@ export type DeuzUIPart =
       state: ToolRunState;
       denied?: boolean;
       deniedReason?: string;
+      outcome?: ToolCallOutcome;
     }
   /** Live cumulative USD cost (v2 wire) — feed a CostBadge directly. */
   | {
@@ -183,8 +265,160 @@ export type DeuzUIPart =
       data?: unknown;
       agentPath?: string[];
     }
-  | { type: 'finish'; finishReason: FinishReason; usage: Usage }
+  /**
+   * The whole turn finished. `stopDetails` (2.3 additive) is the provider's
+   * explanation of an early stop, such as a refusal's category, normalized as
+   * `StreamChatResult.stopDetails` and secret-redacted; absent when the provider
+   * explained nothing. It rides every wire version.
+   */
+  | { type: 'finish'; finishReason: FinishReason; usage: Usage; stopDetails?: StopDetails }
   | { type: 'error'; message: string };
+
+// ===================================================================
+// Native agent frames (2.3) — the `data-agent` part of the wire
+// ===================================================================
+
+/** A client tool call a suspended native run waits on, as the UI receives it (2.3). */
+export interface DeuzAgentClientCall {
+  toolCallId: string;
+  toolName: string;
+  /** The model's arguments (`ToolCall.args` on the server). */
+  input: unknown;
+}
+
+/** A call whose effect is unknown, from a run stopped for reconciliation (2.3). */
+export interface DeuzAgentUnknownEffect {
+  toolCallId: string;
+  toolName: string;
+  modelStep?: number;
+}
+
+/** The fields every terminal frame (and terminal state) may carry (2.3). */
+interface DeuzAgentTerminalFields {
+  usage?: Usage;
+  modelSteps?: number;
+  verification?: AgentVerification['status'];
+  /** The provider's explanation of an early stop, such as a refusal's category (secret-redacted). */
+  stopDetails?: StopDetails;
+}
+
+/**
+ * The terminal frame of a leg (2.3): the run's result as the UI may see it. It
+ * never carries the transcript, raw tool results, receipts' inputs or the
+ * accounting ledger, and a failure's message is secret-redacted.
+ */
+export type DeuzAgentResultFrame = {
+  kind: 'result';
+  seq: number;
+  runId: string;
+} & DeuzAgentTerminalFields &
+  (
+    | { status: 'completed'; output: unknown }
+    | {
+        status: 'suspended';
+        pendingApprovals: ToolApprovalRequest[];
+        pendingClientCalls: DeuzAgentClientCall[];
+      }
+    | { status: 'stopped'; reason: string; unknownEffects?: DeuzAgentUnknownEffect[] }
+    | { status: 'failed'; error: { name: string; message: string; code?: string } }
+  );
+
+/**
+ * The payload of one `data-agent` part (2.3), written by
+ * {@link toDeuzAgentStreamResponse} and read by {@link agentStateFromParts}.
+ *
+ * `seq` is the frame's own SSE event id. Every leg of a run journaled to one
+ * `StreamStateStore` stream (its `streamId`, for example the run id) numbers
+ * on from the last stored event, so `seq` grows across the whole run and is
+ * the cursor a replay resumes after. A response without a `store` numbers from
+ * 0 and cannot be replayed: fold each such response into its own state.
+ *
+ * - `run`: the first frame of every leg (a fresh run or a resume).
+ * - `phase`: the run entered the tool loop or the finalization.
+ * - `partial`: a draft of the structured output. Never validated, never `T`.
+ * - `element`: an array element the run's element validator accepted. Still a
+ *   draft: the whole output is validated only at the end.
+ * - `result`: the leg's terminal state ({@link DeuzAgentResultFrame}).
+ */
+export type DeuzAgentFrame =
+  | { kind: 'run'; seq: number; runId?: string; status: 'running' }
+  | { kind: 'phase'; seq: number; phase: 'running' | 'finalizing' }
+  | { kind: 'partial'; seq: number; attempt: number; value: unknown }
+  | { kind: 'element'; seq: number; attempt: number; index: number; value: unknown }
+  | DeuzAgentResultFrame;
+
+interface DeuzAgentStateBase {
+  /** The highest frame `seq` applied; -1 before the first frame. */
+  seq: number;
+  /** The run's id, once a frame carried it (the terminal frame always does). */
+  runId?: string;
+  /** The phase the run was last reported in. */
+  phase?: 'running' | 'finalizing';
+}
+
+/**
+ * A native run as the client sees it (2.3), folded from `data-agent` frames by
+ * {@link agentStateFromParts}. Discriminated on `status`: `output` exists only
+ * on `completed`, where it is the output the server validated, typed as `T`
+ * (the client trusts the server's validation; it does not repeat it). While
+ * the run is `running`, `partial` holds the latest draft, which is never `T`.
+ */
+export type DeuzAgentState<T = unknown> = DeuzAgentStateBase &
+  (
+    | { status: 'idle' }
+    | {
+        status: 'running';
+        /** The latest draft of the output. Unvalidated, replaced by every draft, gone at the end. */
+        partial?: AgentPartialOutput;
+        /** The array elements accepted so far, for the draft attempt that produced them. */
+        elements?: { attempt: number; values: unknown[] };
+      }
+    | (DeuzAgentTerminalFields & { status: 'completed'; output: T })
+    | (DeuzAgentTerminalFields & {
+        status: 'suspended';
+        pendingApprovals: ToolApprovalRequest[];
+        pendingClientCalls: DeuzAgentClientCall[];
+      })
+    | (DeuzAgentTerminalFields & {
+        status: 'stopped';
+        /** Why it stopped: `'aborted'`, `'cancelled'`, `'refusal'`, `'tool-reconciliation-required'`, … */
+        reason: string;
+        unknownEffects?: DeuzAgentUnknownEffect[];
+      })
+    | (DeuzAgentTerminalFields & {
+        status: 'failed';
+        error: { name: string; message: string; code?: string };
+      })
+  );
+
+/** The `status` of a {@link DeuzAgentState} (2.3). */
+export type DeuzAgentStatus = DeuzAgentState['status'];
+
+/**
+ * Fold the `data-agent` frames among `parts` into a native run's state (2.3).
+ * Pure; every other part is ignored, and so is a malformed frame.
+ *
+ * Idempotent: a frame whose `seq` is not above the state's `seq` is not
+ * applied, so a replay that overlaps what the client already holds, or a
+ * frame that arrives after a later one, changes nothing (the same state object
+ * comes back). Pass the previous state as `initial` to continue it, for
+ * example with the parts of a resume read. A frame of another run, later in
+ * the sequence, starts that run's state.
+ *
+ * `applyUIPart` (`@deuz-sdk/core/chat`) applies the same frames to
+ * `AssistantTurnState.agent`.
+ */
+export function agentStateFromParts<T = unknown>(
+  parts: Iterable<DeuzUIPart>,
+  initial?: DeuzAgentState<T>,
+): DeuzAgentState<T> {
+  let state = initial ?? idleAgentState<T>();
+  for (const part of parts) {
+    const frame = agentFrameOf(part);
+    if (frame) state = applyAgentFrame(state, frame);
+  }
+  return state;
+}
 
 // ===================================================================
 // StreamStateStore — the resumability seam (wire v2)
@@ -313,17 +547,49 @@ function errorMessage(error: unknown): string {
   return redactString(typeof error === 'string' ? error : 'Stream error.');
 }
 
+/**
+ * The provider's stop explanation as the wire may carry it (2.3): the
+ * `explanation` is provider text echoed to a user, so it passes `redactString`
+ * like every other server-supplied string here (P0).
+ */
+function redactedStopDetails(details: StopDetails): StopDetails {
+  return typeof details.explanation === 'string'
+    ? { ...details, explanation: redactString(details.explanation) }
+    : details;
+}
+
+/** `{ stopDetails }` from a finish part's provider metadata, or nothing (2.3). */
+function stopDetailsField(providerMetadata: Record<string, unknown> | undefined): {
+  stopDetails?: StopDetails;
+} {
+  const details = stopDetailsFrom(providerMetadata);
+  return details ? { stopDetails: redactedStopDetails(details) } : {};
+}
+
 /** Map a canonical StreamPart → a Deuz UI part (undefined = drop). */
 function toUIPart(part: StreamPart): DeuzUIPart | undefined {
   switch (part.type) {
     case 'text-delta':
-      return { type: 'text-delta', text: part.text };
-    case 'reasoning-delta':
+      return {
+        type: 'text-delta',
+        text: part.text,
+        ...(part.providerMetadata ? { providerMetadata: part.providerMetadata } : {}),
+      };
+    case 'reasoning-delta': {
+      // An opaque payload (2.3) rides `data` and leaves `text` empty: a client
+      // that predates the flags appends `text` to the reasoning it shows.
+      const opaque = Boolean(part.encrypted || part.redacted);
       return {
         type: 'reasoning-delta',
-        text: part.text,
+        text: opaque ? '' : part.text,
         ...(part.signature ? { signature: part.signature } : {}),
+        ...(part.id !== undefined ? { id: part.id } : {}),
+        ...(part.encrypted ? { encrypted: true } : {}),
+        ...(part.redacted ? { redacted: true } : {}),
+        ...(part.source !== undefined ? { source: part.source } : {}),
+        ...(opaque ? { data: part.text } : {}),
       };
+    }
     case 'tool-call-delta':
       return {
         type: 'tool-input-delta',
@@ -337,6 +603,7 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         toolCallId: part.toolCallId,
         toolName: part.toolName,
         input: part.input,
+        ...(part.providerMetadata ? { providerMetadata: part.providerMetadata } : {}),
       };
     case 'tool-result':
       return {
@@ -345,6 +612,7 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         toolName: part.toolName,
         output: part.output,
         ...(part.isError ? { isError: true } : {}),
+        ...(part.outcome !== undefined ? { outcome: part.outcome } : {}),
       };
     case 'source':
       return {
@@ -384,6 +652,7 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         step: part.stepIndex,
         finishReason: part.finishReason,
         usage: part.usage,
+        ...stopDetailsField(part.providerMetadata),
       };
     case 'data':
       // Vercel-style DX on the wire: the part name rides the type itself.
@@ -415,6 +684,7 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         ...(part.deniedReason !== undefined
           ? { deniedReason: redactString(part.deniedReason) }
           : {}),
+        ...(part.outcome !== undefined ? { outcome: part.outcome } : {}),
       };
     case 'cost':
       return {
@@ -486,7 +756,12 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
         ...(part.agentPath !== undefined ? { agentPath: part.agentPath } : {}),
       };
     case 'finish':
-      return { type: 'finish', finishReason: part.finishReason, usage: part.usage };
+      return {
+        type: 'finish',
+        finishReason: part.finishReason,
+        usage: part.usage,
+        ...stopDetailsField(part.providerMetadata),
+      };
     case 'error':
       return { type: 'error', message: errorMessage(part.error) };
     default:
@@ -506,10 +781,12 @@ function toUIPart(part: StreamPart): DeuzUIPart | undefined {
  * which is why they need no version of their own either.
  *
  * 1.9's two NEW parts (`warning`, `false-finish`) join the set for the same
- * reason every other one is in it: a negotiated-v1 response must stay
- * byte-identical to what pre-1.7 emitted, and `readDeuzStream`'s open-union rule
- * means a v1 client would skip them anyway. The information is not lost — it
- * also resolves in bulk on `StreamChatResult.warnings`.
+ * reason every other one is in it: a negotiated-v1 response carries only the
+ * part types pre-1.7 emitted, and `readDeuzStream`'s open-union rule means a v1
+ * client would skip them anyway. The information is not lost — it also
+ * resolves in bulk on `StreamChatResult.warnings`. (Optional FIELDS on a v1
+ * part do ride v1, such as the 2.3 `reasoning-delta` block fields and
+ * `tool-call` provider metadata; an older client ignores them.)
  */
 function isV2OnlyPart(part: DeuzUIPart): boolean {
   if (part.type === 'sub-agent') return isV2OnlyPart(part.part);
@@ -536,7 +813,11 @@ export interface ToDeuzStreamOptions {
   /**
    * Wire version to emit (default 'v2'). Pass
    * `negotiateDeuzStreamVersion(request)` to honor an explicit v1 client.
-   * v1 output is byte-identical to pre-1.7 releases.
+   * v1 output has no `id:` lines and no v2-only parts; the optional fields added
+   * to v1 parts since ride it too (2.3: the `text-delta` and `tool-call`
+   * `providerMetadata`, the `reasoning-delta` block fields, `tool-result.outcome`,
+   * and `step-finish` / `finish` `stopDetails`). `tool-state.outcome`, the
+   * `'unpriced-model'` warning and native `data-agent` frames are v2 only.
    */
   wireVersion?: DeuzWireVersion;
   /**
@@ -558,11 +839,25 @@ interface SendOptions {
   transient?: boolean;
 }
 
-/** The shared SSE shell of both serializers. */
+/**
+ * The shared SSE shell of the serializers. `nextSeq` is the event id the next
+ * journaled part will get, so a part can name its own id (the agent frames'
+ * `seq`, 2.3) when it is built right before its `send`.
+ *
+ * `journaled` (2.3) is asked, when a `store` is set, before the leg sends or
+ * stores anything: whether this leg belongs in the journal. A leg it keeps out
+ * is DETACHED: it goes out on this response only, with no `id:` lines, and
+ * leaves the journal untouched (no record, no `done` sentinel). Its parts are
+ * still numbered from 0 for `nextSeq`, so its frames fold on their own.
+ */
 function deuzSSEResponse(
   label: string,
   options: ToDeuzStreamOptions,
-  produce: (send: (part: DeuzUIPart, sendOptions?: SendOptions) => void) => Promise<void>,
+  produce: (
+    send: (part: DeuzUIPart, sendOptions?: SendOptions) => void,
+    nextSeq: () => number,
+  ) => Promise<void>,
+  journaled?: () => Promise<boolean>,
 ): Response {
   const encoder = new TextEncoder();
   const version: DeuzWireVersion = options.wireVersion ?? 'v2';
@@ -571,7 +866,7 @@ function deuzSSEResponse(
   if (store && !streamId) {
     throw new Error(`${label}: \`streamId\` is required when \`store\` is set.`);
   }
-  const writer =
+  let writer =
     store && streamId ? createStoreWriter(store, streamId, options.onStoreError) : undefined;
 
   // The client can vanish mid-stream (refresh, tab close, network drop) — the
@@ -589,9 +884,15 @@ function deuzSSEResponse(
           clientGone = true;
         }
       };
+      // A detached leg (see `journaled`) carries no journal coordinates.
+      let ids = version === 'v2';
+      if (writer && journaled && !(await journaled())) {
+        writer = undefined;
+        ids = false;
+      }
       let seq = 0;
       let resumed = false;
-      if (store && streamId) {
+      if (writer && store && streamId) {
         try {
           const last = await lastStoredSeq(store, streamId);
           if (last >= 0) {
@@ -642,19 +943,19 @@ function deuzSSEResponse(
         // Store BEFORE wire: a part in flight during a disconnect must still
         // land in the log even though its enqueue never happens.
         writer?.append(seq, part);
-        enqueue(`${version === 'v2' ? `id: ${seq}\n` : ''}data: ${JSON.stringify(part)}\n\n`);
+        enqueue(`${ids ? `id: ${seq}\n` : ''}data: ${JSON.stringify(part)}\n\n`);
         seq++;
       };
       if (!resumed) {
         const messageId = options.messageId ?? options.generateId?.() ?? 'deuz-msg';
         send({ type: 'start', messageId });
       }
-      await produce(send);
+      await produce(send, () => seq);
       // Leg-end sentinel: appended for EVERY ended leg (complete, errored, or
       // suspended-for-approval). Replay treats it as terminal only when
       // nothing was appended after it, so a continued run stays reachable.
       writer?.append(seq, { type: 'done' });
-      enqueue(`${version === 'v2' ? `id: ${seq}\n` : ''}data: [DONE]\n\n`);
+      enqueue(`${ids ? `id: ${seq}\n` : ''}data: [DONE]\n\n`);
       // Flush pending appends before closing so replay never misses the tail
       // (matters on serverless runtimes that freeze after the response ends).
       if (writer) await writer.settled();
@@ -724,6 +1025,218 @@ export function toDeuzObjectStreamResponse(
       send({ type: 'error', message: errorMessage(err) });
     }
   });
+}
+
+// ===================================================================
+// Native agent runs (2.3) — streamAgent / resumeStreamAgent on the wire
+// ===================================================================
+
+/** `Omit` over each member of a union (plain `Omit` collapses the union first). */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+export interface ToDeuzAgentStreamOptions extends ToDeuzStreamOptions {
+  /**
+   * The run's id, carried by the first frame of the leg so a client knows which
+   * run to resume before the leg ends (pass the run's `session.runId`). The
+   * terminal frame always carries the id the run reports.
+   */
+  runId?: string;
+}
+
+/** The terminal frame for a run result: only what a UI may show (see `DeuzAgentResultFrame`). */
+function agentResultFrame(
+  result: AgentResult<unknown>,
+): DistributiveOmit<DeuzAgentResultFrame, 'seq'> {
+  const common = {
+    kind: 'result' as const,
+    runId: result.runId,
+    usage: result.usage,
+    modelSteps: result.modelSteps,
+    ...(result.verification !== undefined ? { verification: result.verification } : {}),
+    ...(result.stopDetails !== undefined
+      ? { stopDetails: redactedStopDetails(result.stopDetails) }
+      : {}),
+  };
+  switch (result.status) {
+    case 'completed':
+      return { ...common, status: 'completed', output: result.output };
+    case 'suspended':
+      return {
+        ...common,
+        status: 'suspended',
+        pendingApprovals: result.pendingApprovals.map((request) => ({
+          approvalId: request.approvalId,
+          toolCallId: request.toolCallId,
+          toolName: request.toolName,
+          input: request.input,
+          ...(request.token !== undefined ? { token: request.token } : {}),
+          ...(request.agentPath !== undefined ? { agentPath: request.agentPath } : {}),
+        })),
+        // The call's provider metadata stays on the server: the client only runs it.
+        pendingClientCalls: result.pendingClientCalls.map((call) => ({
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          input: call.args,
+        })),
+      };
+    case 'stopped':
+      return {
+        ...common,
+        status: 'stopped',
+        reason: result.reason,
+        // Which calls to reconcile, never what they returned or were given.
+        ...(result.unknownEffects !== undefined
+          ? {
+              unknownEffects: result.unknownEffects.map((receipt) => ({
+                toolCallId: receipt.toolCallId,
+                toolName: receipt.toolName,
+                ...(receipt.modelStep !== undefined ? { modelStep: receipt.modelStep } : {}),
+              })),
+            }
+          : {}),
+      };
+    case 'failed':
+      return {
+        ...common,
+        status: 'failed',
+        error: {
+          name: result.error.name,
+          message: redactString(result.error.message),
+          ...(result.error.code !== undefined ? { code: result.error.code } : {}),
+        },
+      };
+  }
+}
+
+/**
+ * Serialize a native run (`streamAgent` / `resumeStreamAgent`) to the Deuz UI
+ * wire (2.3). Edge-safe.
+ *
+ * The run's parts go out exactly as {@link toDeuzStreamResponse} frames them,
+ * so `useChat` and `applyUIPart` render a native run like any chat stream. On
+ * top, `data-agent` parts carry what only a native run has
+ * ({@link DeuzAgentFrame}): a `run` frame opening every leg, the phases,
+ * drafts of the structured output, and the terminal `result` — the run id,
+ * pending approvals and client calls, the validated output, the stop reason
+ * and its `stopDetails`, or the failure. `agentStateFromParts` folds them.
+ *
+ * Nothing that is the server's alone goes out: the transcript, the raw tool
+ * results of `tool-output` events (a `tool-result` part carries what the model
+ * saw, as on the legacy wire), receipts and the accounting ledger. A failure's
+ * message is secret-redacted, and a failed run also gets one `error` part, so a
+ * reader that knows nothing of agent frames ends the turn in error.
+ *
+ * Subscribes to `stream.events` before it returns: pass the stream here before
+ * reading its `result` or any other view, and no event is lost. (A stream that
+ * already started has no replay of what it emitted; once it ended, only its
+ * terminal frame, read from `stream.result`, still goes out.)
+ *
+ * The agent frames are wire v2 parts (`data-agent`): a client that negotiated
+ * v1 gets the plain chat stream. With `store` and `streamId`, every frame's
+ * `seq` is its event id in the journal, so a client resumes through
+ * {@link resumeDeuzStreamResponse} and the sequence grows across every leg
+ * journaled under that `streamId` — use one per run, such as the run id. A
+ * stream has one writer at a time: a leg the run REFUSED before it began
+ * (another executor holds the run, the run id is stored under another scope,
+ * an unknown run, invalid options) goes out on its own response only, with
+ * its failed result and error part but no event ids, and writes nothing to
+ * the journal, where its frames would take the seqs of the leg that does run.
+ */
+export function toDeuzAgentStreamResponse<T>(
+  stream: AgentStream<T>,
+  options: ToDeuzAgentStreamOptions = {},
+): Response {
+  const events = stream.events[Symbol.asyncIterator]();
+  // The run's first event, when the journal question below read it ahead.
+  let ahead: Promise<IteratorResult<AgentEvent<T>>> | undefined;
+  const next = (): Promise<IteratorResult<AgentEvent<T>>> => {
+    const step = ahead ?? events.next();
+    ahead = undefined;
+    return step;
+  };
+  // A run refused before it began emits its failed result before anything
+  // else; a run that began starts with a phase, and one that stopped or
+  // suspended before its first model call is journaled as before. Only the
+  // first event tells them apart. (A run whose execution deadline had passed
+  // also fails first; its terminal state is the stored run's to report.)
+  const journaled = async (): Promise<boolean> => {
+    ahead = events.next();
+    try {
+      const step = await ahead;
+      return step.done || step.value.type !== 'result' || step.value.result.status !== 'failed';
+    } catch {
+      return true; // the read fails again in `produce`, which reports it
+    }
+  };
+  return deuzSSEResponse(
+    'toDeuzAgentStreamResponse',
+    options,
+    async (send, nextSeq) => {
+      // Built right before its `send`, so the frame's `seq` is its own event id.
+      const frame = (payload: DistributiveOmit<DeuzAgentFrame, 'seq'>): void => {
+        const { kind, ...rest } = payload;
+        send({ type: 'data-agent', id: kind, payload: { kind, seq: nextSeq(), ...rest } });
+      };
+      frame({
+        kind: 'run',
+        ...(options.runId !== undefined ? { runId: options.runId } : {}),
+        status: 'running',
+      });
+      let sawError = false;
+      let sawResult = false;
+      const result = (outcome: AgentResult<unknown>): void => {
+        sawResult = true;
+        frame(agentResultFrame(outcome));
+        if (outcome.status === 'failed' && !sawError) {
+          sawError = true;
+          send({ type: 'error', message: redactString(outcome.error.message) });
+        }
+      };
+      try {
+        for (;;) {
+          const step = await next();
+          if (step.done) break;
+          const event = step.value;
+          switch (event.type) {
+            case 'part': {
+              const ui = toUIPart(event.part);
+              if (!ui) break;
+              if (ui.type === 'error') sawError = true;
+              send(ui);
+              break;
+            }
+            case 'phase':
+              frame({ kind: 'phase', phase: event.phase });
+              break;
+            case 'partial-output':
+              frame({ kind: 'partial', attempt: event.attempt, value: event.value });
+              break;
+            case 'array-element':
+              frame({
+                kind: 'element',
+                attempt: event.attempt,
+                index: event.index,
+                value: event.value,
+              });
+              break;
+            case 'result':
+              result(event.result as AgentResult<unknown>);
+              break;
+            default:
+              // `tool-output` (the raw result) stays on the server.
+              break;
+          }
+        }
+        // A stream that had already ended when it was passed in has no events
+        // left; its result still says how the run ended.
+        if (!sawResult) result((await stream.result) as AgentResult<unknown>);
+      } catch (err) {
+        // The native pump settles failures as a result; this is belt and braces.
+        if (!sawError) send({ type: 'error', message: errorMessage(err) });
+      }
+    },
+    journaled,
+  );
 }
 
 // ===================================================================
@@ -797,9 +1310,15 @@ export function toDeuzTextStreamResponse(
         for await (const part of result.fullStream) {
           if (part.type === 'text-delta') {
             enqueue(part.text);
-          } else if (includeReasoning && part.type === 'reasoning-delta' && !part.encrypted) {
-            // `encrypted` reasoning is an opaque provider payload (OpenAI
-            // Responses), not display text — never write it to a text body.
+          } else if (
+            includeReasoning &&
+            part.type === 'reasoning-delta' &&
+            !part.encrypted &&
+            !part.redacted
+          ) {
+            // `encrypted` reasoning (OpenAI Responses) and `redacted` thinking
+            // (Anthropic) are opaque provider payloads, not display text —
+            // never write them to a text body.
             enqueue(part.text);
           }
           // Everything else — tool calls, steps, citations, and notably the
@@ -1173,6 +1692,14 @@ export interface ReadDeuzStreamOptions {
    * assistant bubble. `'ignore'` restores that pre-1.9 silence.
    */
   onHttpError?: 'error-part' | 'ignore';
+  /**
+   * Called with a part's SSE event id right before the part is yielded (2.3),
+   * once per id: a frame without an id of its own (a transient part) reports
+   * nothing, and neither does `[DONE]`. Wire v1 carries no ids. A client that
+   * also resumes the stream uses it to know how far it has read: `useChat` does,
+   * so a reconnect after a POST read resumes after what that read delivered.
+   */
+  onEventId?: (id: string) => void;
 }
 
 /**
@@ -1202,13 +1729,25 @@ export async function* readDeuzStream(
     return;
   }
   if (!response.body) return;
+  // `parseSSE`'s id is sticky (SSE spec): an id-less frame repeats the last one.
+  let reported: string | undefined;
   for await (const ev of parseSSE(response.body)) {
     if (ev.data === '[DONE]') return;
+    let part: DeuzUIPart;
     try {
-      yield JSON.parse(ev.data) as DeuzUIPart;
+      part = JSON.parse(ev.data) as DeuzUIPart;
     } catch {
-      /* skip malformed line */
+      continue; // skip malformed line
     }
+    if (options.onEventId && ev.id !== undefined && ev.id !== reported) {
+      reported = ev.id;
+      try {
+        options.onEventId(ev.id);
+      } catch {
+        /* consumer callback errors are not transport errors */
+      }
+    }
+    yield part;
   }
 }
 

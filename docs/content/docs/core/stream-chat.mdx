@@ -56,7 +56,7 @@ Adding `tools` is not enough to get a multi-step agent. The step budget defaults
 | `abortSignal` | `AbortSignal` | — | 1.9, **deprecated** alias for `signal` (migration ergonomics). `signal` wins if both are set. |
 | `maxRetries` | `number` | `2` | Flaky upstream. Pre-first-byte only. See [Retries](#retries). |
 | `timeout` | `number \| { ttftMs?, totalMs?, stepMs?, toolMs? }` | ttft 60s / total 300s | Your platform budget is tighter than the SDK defaults. A bare number is `{ totalMs }`; an explicit `0` disables a layer. See [Timeouts](/docs/core/prompts-and-timeouts#timeout). |
-| `capabilities` | `Partial<ModelCapabilities>` | — | 1.9. The registry does not know your slug yet and its conservative fallback (notably `maxOutput: 4096`) is truncating you. |
+| `capabilities` | `Partial<ModelCapabilities>` | — | 1.9. The registry does not know your slug yet and its conservative fallback is limiting you (`reasoning: false` drops `effort`; the `maxOutput: 4096` placeholder still truncates on the Anthropic wire). |
 | `headers` | `Record<string, string>` | — | A gateway needs a custom header. |
 | `deps` | `Dependencies` | in-memory defaults | Tests, custom `fetch`, tracing, pricing, a shared circuit breaker. See [Dependencies](/docs/core/dependencies). |
 | `onUsage` | `(usage: Usage, meta: UsageMeta) => void` | — | Per-model-call metering. `meta.reason` is `'finished'`, `'aborted'`, or `'error'`; `meta.ttftMs` is time-to-first-token. |
@@ -86,6 +86,8 @@ interface StreamChatResult {
   fullStream: AsyncIterable<StreamPart>;
   usage: Promise<Usage>;
   finishReason: Promise<FinishReason>;
+  /** 2.3 — the provider's explanation of the stop. Settles with `finishReason`. */
+  stopDetails?: Promise<StopDetails | undefined>;
   /** 1.9 — drain the stream so terminal effects run. Optional; see below. */
   consume?: (options?: { onError?: (error: unknown) => void }) => Promise<void>;
   /** 1.9 — non-fatal notices. Settles with `usage`; never rejects. */
@@ -103,6 +105,16 @@ interface StreamChatResult {
 - **`fullStream`** — the full canonical delta stream of `StreamPart`. Errors surface as an `error` part, not a throw.
 - **`usage`** — resolves once with the final `Usage` breakdown (input / output / reasoning / cache tokens). `totalTokens` is the provider's own total where one exists, not `input + output` — on a thinking model those differ substantially.
 - **`finishReason`** — resolves with `'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error' | 'aborted'`.
+- **`stopDetails`** (2.3) — resolves with the provider's explanation of the stop when it gave one, else `undefined`. That is Anthropic's `stop_details` on a refusal, or an OpenAI refusal (`{ type: 'refusal', explanation }`, the refusal text), both with `finishReason: 'content_filter'` and normalized to `{ type, category?, explanation? }`; the raw data also stays on the `finish` part's `providerMetadata` (`anthropic.stop_details`, `openai.refusal`). It settles with `finishReason`: `undefined` when you aborted, rejected when the call failed. A run with `tools` reports its last step's.
+
+```ts title="refusal.ts"
+const result = streamChat({ model, prompt: 'Write a port scanner.' });
+for await (const chunk of result.textStream) process.stdout.write(chunk);
+if ((await result.finishReason) === 'content_filter') {
+  const details = await result.stopDetails;
+  console.warn(`\nrefused (${details?.category ?? 'no category'})`, details?.explanation ?? '');
+}
+```
 
 There is no `response.messages` on a streaming result. If you need the canonical turns to append to history, either reconstruct them from the stream or use the [chat](/docs/modules/chat-persistence) layer, which does it for you.
 
@@ -202,8 +214,8 @@ Both may be consumed at the same time — see [Multiple consumers](#multiple-con
 
 | `type` | Shape | Emitted |
 | --- | --- | --- |
-| `text-delta` | `{ text }` | Assistant text fragment. |
-| `reasoning-delta` | `{ text, signature?, encrypted? }` | Extended-thinking / reasoning fragment. When `encrypted` is true, `text` is an opaque payload (OpenAI Responses) — do **not** render it as thinking text. |
+| `text-delta` | `{ text, providerMetadata? }` | Assistant text fragment. `providerMetadata` (2.3) carries round-trip data such as a Gemini text part's `thoughtSignature`. |
+| `reasoning-delta` | `{ text, signature?, encrypted?, id?, redacted?, source? }` | Extended-thinking / reasoning fragment of one block: deltas sharing an `id` (2.3) build one block, a new `id` opens the next. When `encrypted` or `redacted` is true, `text` is an opaque payload (an OpenAI encrypted item, an Anthropic redacted thinking block) — do **not** render it as thinking text. `source` (2.3) is the provider family that produced it. See [Reasoning parts](/docs/core/messages#reasoning-parts). |
 | `tool-call-delta` | `{ id, name?, argsTextDelta, providerMetadata? }` | Raw tool-args JSON fragment — accumulate as a string, parse once at block end. For live "the agent is typing arguments" UIs. |
 | `source` | `{ id, url?, title? }` | Citation / grounding source from a provider-executed search. |
 | `finish` | `{ usage, finishReason }` | Terminal part. In a loop, usage is summed across all steps. |

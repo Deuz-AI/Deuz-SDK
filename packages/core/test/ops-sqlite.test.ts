@@ -5,7 +5,12 @@ import { join } from 'node:path';
 import { createSqliteOpsStore } from '../src/node/ops-sqlite';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import { leaseProviderContracts } from './fixtures/lease-provider-conformance';
-import { agentRunStoreContracts, envelope } from './fixtures/agent-run-store-conformance';
+import {
+  agentRunListContracts,
+  agentRunPruneContracts,
+  agentRunStoreContracts,
+  envelope,
+} from './fixtures/agent-run-store-conformance';
 import { manualClock } from './fixtures/manual-clock';
 
 let DatabaseSync: (new (path: string) => SqliteDatabaseLike) | undefined;
@@ -33,13 +38,27 @@ describe.skipIf(!DatabaseSync)('SQLite ops store', () => {
     const { clock, advance } = manualClock();
     const ops = createSqliteOpsStore({ path: ':memory:', clock });
     cleanup.push(() => ops.close());
-    return { provider: ops.leases, advance, ttl: 1_000 };
+    return { provider: ops.leases, advance, ttl: 1_000, now: () => clock.now() };
   });
 
   agentRunStoreContracts('SQLite agent run store', () => {
     const ops = createSqliteOpsStore({ path: ':memory:' });
     cleanup.push(() => ops.close());
     return ops.agentRuns;
+  });
+
+  agentRunPruneContracts('SQLite agent run retention', async () => {
+    const { clock, advance } = manualClock();
+    const ops = createSqliteOpsStore({ path: ':memory:', clock });
+    cleanup.push(() => ops.close());
+    return { store: ops.agentRuns, advance, now: () => clock.now() };
+  });
+
+  agentRunListContracts('SQLite agent run listing', async () => {
+    const { clock, advance } = manualClock();
+    const ops = createSqliteOpsStore({ path: ':memory:', clock });
+    cleanup.push(() => ops.close());
+    return { store: ops.agentRuns, advance, now: () => clock.now(), frozen: true };
   });
 
   it('keeps two connections on one file consistent', async () => {
@@ -66,6 +85,21 @@ describe.skipIf(!DatabaseSync)('SQLite ops store', () => {
     await b.agentRuns.save(envelope('run', 2, { modelSteps: 5 }));
     await expect(Promise.resolve(a.agentRuns.save(envelope('run', 2)))).rejects.toThrow(/revision/);
     expect(await a.agentRuns.load('run')).toMatchObject({ revision: 2, modelSteps: 5 });
+  });
+
+  it('stores a cancel awaiting acknowledgement as 2.2 stores a queued cancel', async () => {
+    const db = new DatabaseSync!(':memory:');
+    const { clock } = manualClock();
+    const ops = createSqliteOpsStore({ path: ':memory:', database: db, clock });
+    cleanup.push(() => ops.close());
+    const lease = (await ops.leases.acquire({ key: 'run', owner: 'a', ttlMs: 1_000 }))!;
+    await ops.leases.signal('run', 'drain');
+    await ops.leases.signal('run', 'cancel');
+    await ops.leases.renew(lease, 1_000, { acknowledge: true });
+    // A 2.2 process sharing the file reads the same queued cancel.
+    expect(db.prepare('SELECT signals FROM deuz_leases').get()).toEqual({ signals: '["cancel"]' });
+    await ops.leases.ack!(lease, 'cancel');
+    expect(db.prepare('SELECT signals FROM deuz_leases').get()).toEqual({ signals: '[]' });
   });
 
   it('refuses an unsupported ops schema version and a closed store', async () => {

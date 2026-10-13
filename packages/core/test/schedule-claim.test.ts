@@ -10,7 +10,12 @@ import { createSqliteOpsStore } from '../src/node/ops-sqlite';
 import { createPostgresOpsStore } from '../src/node/ops-postgres';
 import type { SqliteDatabaseLike } from '../src/node/store-sqlite';
 import type { PgClientLike } from '../src/node/store-postgres';
-import { incompressibleKey, scheduleClaimContracts } from './fixtures/schedule-claim-conformance';
+import {
+  incompressibleKey,
+  scheduleClaimContracts,
+  scheduleClaimPruneContracts,
+} from './fixtures/schedule-claim-conformance';
+import { manualClock } from './fixtures/manual-clock';
 
 const sha256 = (text: string) =>
   `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`;
@@ -90,6 +95,12 @@ describe.skipIf(!DatabaseSync)('SQLite ops store claims', () => {
     'SQLite claim on a handle whose run() reports nothing',
     () => sqliteOps(':memory:', quietHandle(new DatabaseSync!(':memory:'))).claims,
   );
+  scheduleClaimPruneContracts('SQLite claim retention', async () => {
+    const { clock, advance } = manualClock();
+    const ops = createSqliteOpsStore({ path: ':memory:', clock });
+    cleanup.push(() => ops.close());
+    return { claim: ops.claims, advance, now: () => clock.now() };
+  });
 
   it('shares claims between two connections on one file and keeps them across a reopen', async () => {
     const path = await tempFile();
@@ -111,7 +122,7 @@ describe.skipIf(!DatabaseSync)('SQLite ops store claims', () => {
     const reopened = sqliteOps(path);
     expect(await reopened.claims('digest@1')).toBe(false);
     expect(await reopened.claims('race')).toBe(false);
-  });
+  }, 30_000); // two connections and a reopen on one file: slow on a hosted Windows runner
 
   it('stores a key over 512 characters or holding a NUL as its SHA-256', async () => {
     const db = new DatabaseSync!(':memory:');
@@ -142,6 +153,12 @@ describe('Postgres ops store claims (PGlite)', () => {
     'Postgres claim',
     async () => createPostgresOpsStore({ client, schema: await freshSchema() }).claims,
   );
+  scheduleClaimPruneContracts('Postgres claim retention (database time)', async () => ({
+    claim: createPostgresOpsStore({ client, schema: await freshSchema() }).claims,
+    advance: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    // PGlite runs in this process, so the database clock is the host clock.
+    now: () => Date.now(),
+  }));
 
   it('shares claims between two store instances on one schema', async () => {
     const schema = await freshSchema();

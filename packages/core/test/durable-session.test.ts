@@ -11,7 +11,9 @@ import {
 import type { AgentCheckpoint, SessionStore } from '../src/types/session';
 import type { StreamPart } from '../src/types/stream';
 import type { Logger } from '../src/types/deps';
+import type { CommonCallOptions } from '../src/types/config';
 import { createAnthropic } from '../src/anthropic';
+import { createMockModel, type MockResponse } from '../src/testing';
 import type { JSONSchema } from '../src/types/schema';
 import { sseResponse, sseEvents, mockFetchSequence } from './fixtures/sse';
 
@@ -208,7 +210,8 @@ describe('durable checkpoints — buffered loop (generateText)', () => {
     expect(cp.stepIndex).toBe(1);
     expect(cp.pendingApprovals).toEqual([
       {
-        approvalId: 'toolu_1',
+        // Bound to the run, the suspended checkpoint's step and the call (2.3).
+        approvalId: expect.stringMatching(/^toolu_1@[0-9a-f]{24}$/),
         toolCallId: 'toolu_1',
         toolName: 'getWeather',
         input: { city: 'Paris' },
@@ -308,6 +311,93 @@ describe('durable checkpoints — streaming loop (streamChat)', () => {
     const cp = saves.at(-1)!;
     expect(cp.status).toBe('suspended');
     expect(cp.pendingApprovals).toHaveLength(1);
+  });
+});
+
+describe('durable checkpoints — a plain call that continues a stored run (2.3)', () => {
+  const tools = { getWeather: { parameters: SCHEMA, execute: async () => ({ temp: 22 }) } };
+  const turn = (): MockResponse[] => [
+    { toolCalls: [{ toolName: 'getWeather', args: { city: 'Paris' } }] },
+    { text: 'Sunny.' },
+  ];
+  const run = async (entry: 'generateText' | 'streamChat', options: CommonCallOptions) => {
+    if (entry === 'generateText') await generateText(options);
+    else await streamChat(options).consume!();
+  };
+
+  it.each(['generateText', 'streamChat'] as const)(
+    '%s: a call that reuses the runId continues the step counter',
+    async (entry) => {
+      const { store, saves } = recordingStore();
+      const call = {
+        model: createMockModel({ responses: [...turn(), ...turn()] }),
+        tools,
+        maxSteps: 4,
+        session: { store, runId: 'run-p' },
+      };
+      await run(entry, { ...call, messages: [{ role: 'user', content: 'weather?' }] });
+      const history = (await store.load('run-p'))!.messages;
+      await run(entry, { ...call, messages: [...history, { role: 'user', content: 'and now?' }] });
+      expect(saves.map((s) => s.stepId)).toEqual(['run-p#1', 'run-p#2', 'run-p#3', 'run-p#4']);
+    },
+  );
+
+  it('an unreadable store is logged and the leg counts from 0 (best-effort)', async () => {
+    const errors: string[] = [];
+    const logger: Logger = {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: (m) => {
+        errors.push(m);
+      },
+    };
+    const { store: recorded, saves } = recordingStore();
+    const store: SessionStore = {
+      ...recorded,
+      load: () => {
+        throw new Error('store down');
+      },
+    };
+    const res = await generateText({
+      model: createMockModel({ responses: turn() }),
+      messages: [{ role: 'user', content: 'weather?' }],
+      tools,
+      maxSteps: 4,
+      session: { store, runId: 'run-b' },
+      deps: { logger },
+    });
+    expect(res.text).toBe('Sunny.');
+    expect(errors.some((m) => m.includes("checkpoint load failed for 'run-b'"))).toBe(true);
+    expect(saves[0]!.stepId).toBe('run-b#1');
+  });
+
+  it("an unreadable store fails the call under durability 'strict', through both entry points", async () => {
+    const save = vi.fn();
+    const store: SessionStore = {
+      save,
+      load: async () => {
+        throw new Error('store down');
+      },
+    };
+    const call = {
+      messages: [{ role: 'user', content: 'weather?' }] as CommonCallOptions['messages'],
+      tools,
+      maxSteps: 4,
+      session: { store, runId: 'run-strict', durability: 'strict' as const },
+    };
+    await expect(
+      generateText({ ...call, model: createMockModel({ responses: turn() }) }),
+    ).rejects.toMatchObject({ name: 'ExecutionPersistenceError' });
+
+    // Streaming: an `error` part and rejected promises, never a throw (G2).
+    const result = streamChat({ ...call, model: createMockModel({ responses: turn() }) });
+    const types: StreamPart['type'][] = [];
+    for await (const part of result.fullStream) types.push(part.type);
+    expect(types).not.toContain('step-start');
+    expect(types.at(-1)).toBe('error');
+    await expect(result.usage).rejects.toThrow(/could not be read/);
+    expect(save).not.toHaveBeenCalled();
   });
 });
 

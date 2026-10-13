@@ -1,0 +1,21 @@
+{
+  "kind": "deuz-goal-event",
+  "version": 1,
+  "id": "delivery-72d7a0e2",
+  "source": { "type": "signal", "id": "github" },
+  "scope": "tenant-a",
+  "goalId": "release-notes",
+  "runId": "link-check-run",
+  "key": "delivery-72d7a0e2",
+  "at": 1760090600000,
+  "notBefore": 1760090600000,
+  "expiresAt": 1760177000000,
+  "payload": {
+    "ref": "blob://signals/delivery-72d7a0e2.json",
+    "digest": "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+    "mediaType": "application/json",
+    "bytes": 1832
+  },
+  "correlationId": "release-notes#7",
+  "causationId": "push-1288"
+}

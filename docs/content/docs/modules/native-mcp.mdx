@@ -1,0 +1,275 @@
+---
+title: MCP in native runs
+description: How runAgent and streamAgent put MCP tools behind effect receipts, pin the servers' tool catalog in the resume binding, and replay idempotent MCP calls (2.3).
+---
+
+A native run (`runAgent`, `streamAgent`, `resumeAgent`) accepts the same `mcp`
+entries as the [tool loop](/docs/modules/mcp#zero-config-mcp). Since 2.3, an MCP
+tool crosses the same effect boundary as a local tool:
+
+- Each call leaves a [tool receipt](/docs/modules/native-agents#strict-checkpoints-and-approval-resume)
+  keyed by the root model turn and the provider call ID, and emits a native
+  `tool-output` event.
+- An interrupted call stops a later resume with `tool-reconciliation-required`
+  instead of running the server's tool a second time.
+- The servers' tool catalog is part of the run's resume binding, so a catalog
+  that changed between checkpoint and resume is detected.
+
+Before 2.3 the loop merged the raw MCP tools after the receipts were prepared.
+An interrupted MCP call therefore left no receipt, and a resume repeated both
+its effect and the paid model turn.
+
+## An MCP tool behind a receipt
+
+This example needs no server and no API key. The hand-written client stands in
+for a connected server; `createMcpClient` or a `{ url }` entry works the same way.
+
+```ts
+import { createInMemoryAgentRunStore, runAgent } from '@deuz-sdk/core/agent';
+import type { McpClient } from '@deuz-sdk/core/mcp';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const charges: number[] = [];
+// A stand-in for a connected MCP server with one tool.
+const billing: McpClient = {
+  listTools: async () => ({
+    charge: {
+      description: 'Charge the card on file.',
+      parameters: {
+        type: 'object',
+        properties: { amount: { type: 'number' } },
+        required: ['amount'],
+      },
+      execute: async (args) => {
+        const { amount } = args as { amount: number };
+        charges.push(amount);
+        return `charged ${amount}`;
+      },
+    },
+  }),
+  callTool: async () => undefined,
+  listResources: async () => [],
+  readResource: async () => [],
+  listPrompts: async () => [],
+  getPrompt: async () => ({ messages: [] }),
+  status: () => 'connected',
+  onToolListChanged: () => () => {},
+  close: async () => {},
+};
+
+const store = createInMemoryAgentRunStore();
+const result = await runAgent({
+  model: createMockModel({
+    responses: [
+      { toolCalls: [{ toolName: 'charge', args: { amount: 5 } }] },
+      { text: 'Charged 5.' },
+    ],
+  }),
+  prompt: 'Charge 5.',
+  mcp: [billing],
+  session: { store, runId: 'charge-demo', scope: 'tenant-a' },
+});
+
+const envelope = await store.load('charge-demo');
+console.log(result.status, charges); // completed [ 5 ]
+console.log(Object.values(envelope?.toolResults ?? {}).map((receipt) => receipt.stage)); // [ 'completed' ]
+```
+
+The receipt stages are those of local tools. `executing` is written before the
+server is called, so a crash after that point leaves an unknown outcome:
+resume returns `tool-reconciliation-required` until the application checks the
+server and authorizes the call ID through `retryToolCallIds`. A call the server
+answered with an error (`isError`) is recorded as `failed` with its error text,
+and a replay reports that error without calling the server again.
+
+<Callout type="warn">
+  Receipts do not give exactly-once execution. A server can apply an effect and
+  lose the connection before it answers; only the server's own idempotency, or
+  your reconciliation, can settle that case.
+</Callout>
+
+## Declaring idempotent MCP tools
+
+Some servers make a repeated call harmless, for example by keying the write on
+an idempotency key. Declare that on the entry, for the whole server or per tool,
+and an interrupted call of that tool runs again on resume without
+`retryToolCallIds`:
+
+```ts
+import type { AgentMcpEntry } from '@deuz-sdk/core/agent';
+
+const mcp: AgentMcpEntry[] = [
+  // Every tool of this server is safe to repeat.
+  { url: 'https://search.example.com/mcp', replay: 'idempotent' },
+  // Only `lookup_order` is; `refund` still stops for reconciliation.
+  { url: 'https://orders.example.com/mcp', namespace: 'orders', replay: { lookup_order: 'idempotent' } },
+];
+```
+
+A per-tool map names each tool as its server does, before the `namespace`
+prefix: `lookup_order` above reaches the model as `orders_lookup_order`. The
+declaration is native-run bookkeeping only. It is removed before connecting, so
+it never changes which pooled connection an entry uses. As with
+`AgentTool.replay`, bump `bindingId` when you change it on a durable run.
+
+## The catalog in the resume binding
+
+When a native run with `mcp` entries is admitted, its binding records the
+servers' catalog: the [`fingerprintTools`](/docs/modules/mcp#detecting-tool-drift-22)
+JSON of the merged, namespaced tools, in `AgentRunEnvelope.binding.mcp`. A
+resume connects to the servers and compares their catalog with the record before
+it writes anything. An added, removed or changed tool fails the resume, exactly
+as a changed local tool set does:
+
+```text
+MCP tool catalog changed across resume (added: refund; changed: charge).
+```
+
+Dropping the `mcp` entries of a run that recorded a catalog is the same kind of
+change (`removed: ...`). The stored run is left untouched, so it can still be
+resumed once the servers serve the recorded catalog again, or by a resume that
+accepts the change (below).
+
+The connection is opened only after a terminal run (completed, stopped or
+failed) has returned its stored result, so such a run never reconnects. On a
+fresh run it is opened before
+the first checkpoint: an unreachable server fails the run before anything is
+persisted or any model call is made.
+
+A run checkpointed before 2.3, or one that had no MCP servers, has no recorded
+catalog. Resuming it records the catalog it is resumed with.
+
+## Hot refresh and `onCatalogChange`
+
+A server that announces `tools/list_changed` is re-read before the next step, as
+in the tool loop. When its catalog really changed, the run's `onCatalogChange`
+decides what happens (2.3):
+
+- `'stop'`, the default: the run stops with reason `'mcp-catalog-changed'` before
+  the model is offered the new catalog. Its binding keeps the catalog the run was
+  bound to, and no step is counted for the stop.
+- `'accept'`: the refreshed catalog opens a new binding revision. It is persisted
+  before the model is offered it, so a later resume compares against it, and the
+  tools that arrive this way carry receipts like every other tool.
+
+Either way the change is reported as a `warning` part with `setting: 'mcp'`. An
+announcement that changed nothing does neither. A server rewriting a tool's
+description in the middle of a run is a change too; the
+[drift guide](/docs/modules/mcp#detecting-tool-drift-22) explains why that matters.
+
+```ts
+import { streamAgent } from '@deuz-sdk/core/agent';
+import type { McpClient } from '@deuz-sdk/core/mcp';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+declare const orders: McpClient; // a connected server that may change its tools
+
+const stream = streamAgent({
+  model: createMockModel({ responses: [{ text: 'Done.' }] }),
+  prompt: 'Process the order.',
+  mcp: [orders],
+  onCatalogChange: 'accept', // the default 'stop' ends the run instead
+});
+for await (const event of stream.events) {
+  if (event.type === 'part' && event.part.type === 'warning' && event.part.warning.setting === 'mcp') {
+    console.warn(event.part.warning.message);
+    // MCP tool catalog changed mid-run (added: refund); the run's resume binding now records the new catalog.
+  }
+}
+```
+
+`generateText` and `streamChat` default to `'accept'`: they carry on with the new
+catalog and report the change as a warning. With `onCatalogChange: 'stop'` they end
+with `providerMetadata.deuz.stoppedBy: 'mcp-catalog-changed'` instead.
+
+### A change the run missed
+
+A server can change its catalog while the run is down, and a run can die between
+a hot refresh and the save that records the refreshed catalog. Either way the
+resume finds a catalog that differs from the record. Under `'stop'` it fails as
+described [above](#the-catalog-in-the-resume-binding). A resume with
+`onCatalogChange: 'accept'` (2.3) treats the change like the hot refresh it
+missed: its first write records the servers' catalog as a new binding revision,
+before its first model call, and it reports the same `warning` part:
+
+```text
+MCP tool catalog changed across resume (added: refund); the run's resume binding now records the new catalog.
+```
+
+```ts
+import { resumeAgent } from '@deuz-sdk/core/agent';
+import type { AgentRunStore } from '@deuz-sdk/core/agent';
+import type { McpClient } from '@deuz-sdk/core/mcp';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+declare const store: AgentRunStore;
+declare const orders: McpClient; // its catalog changed while the run was down
+
+const result = await resumeAgent({
+  model: createMockModel({ responses: [{ text: 'Done.' }] }),
+  mcp: [orders],
+  onCatalogChange: 'accept',
+  session: { store, runId: 'order-7', scope: 'tenant-a' },
+});
+console.log(result.status);
+```
+
+Such a resume still fails, and leaves the run untouched, while a call the model
+made against the recorded catalog is in flight: an MCP call whose receipt says
+`executing`, or one of the last turn's calls that waits for its approval or never
+started. Settling that call would run the server's new tool in place of the one
+the model chose. It also fails when the resume has dropped the `mcp` entries. A
+resume that writes nothing (one that stays suspended, or stops for
+reconciliation) records nothing and reports nothing; the resume that goes on does
+both.
+
+## Name collisions
+
+A local tool wins over an MCP tool of the same name, and of two servers that expose
+the same (namespaced) name the later one wins. Since 2.3 neither is silent: each is
+a typed warning (`type: 'unsupported-tool'`, `setting: 'mcp'`) on the call's
+`warnings` and as a `warning` part, in native runs and in the tool loop. Set a
+`namespace` on an entry to keep both servers' tools.
+
+## Sampling requests
+
+A server can ask the client to run a model call for it (MCP sampling). Pass the
+run's execution context as `sampling.execution` and the request takes the same
+path as a tool call: the context's policy decides first (`allowedModels`, the
+deadline), then your `approve` gate, and the call is reserved on the context's
+ledger like the run's own model calls, so a server cannot spend past the run's
+budget. Pass a child of the run's context to account for sampling on its own.
+
+```ts
+import { createExecutionContext } from '@deuz-sdk/core/agent';
+import { createMcpClient } from '@deuz-sdk/core/mcp';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const execution = createExecutionContext({ budget: { tokens: 20_000 } });
+const client = await createMcpClient({
+  transport: { type: 'http', url: 'https://tools.example.com/mcp' },
+  sampling: {
+    model: createMockModel({ responses: [{ text: 'A short summary.' }] }),
+    execution,
+    approve: (request) => request.maxTokens <= 1_000,
+  },
+});
+```
+
+## Output schemas
+
+An MCP tool's `outputSchema` is its server's raw JSON Schema. A native run keeps
+it as metadata, as on every `Tool`, and does not validate the result a second
+time. The official MCP SDK behind `createMcpClient` already rejects a result
+whose `structuredContent` is missing or does not match the schema; that error
+reaches the model as a failed tool call. A hand-written `McpClient` is
+responsible for its own validation. Receipts and `tool-output` events keep the
+result the client returned.
+
+## Connections
+
+A native run opens the connections for config entries (`{ url }`,
+`{ command }`) and closes them when it ends, whatever the outcome. A live client
+you pass in, bare or as `{ client }`, is borrowed: the run releases its
+`tools/list_changed` subscription and never closes it. With `deps.mcpPool`, the
+pool owns the connection, as in the tool loop.

@@ -224,7 +224,9 @@ type UIMessagePart =
       text: string;
       signature?: string;
       encrypted?: boolean; // opaque provider payload — do NOT render
-      redacted?: boolean;
+      redacted?: boolean; // opaque provider payload — do NOT render
+      id?: string; // the model block it came from (2.3, streamed turns only)
+      source?: string; // the provider family that produced it (2.3)
       state: 'streaming' | 'done';
     }
   | { type: 'tool'; toolCallId: string } // a REFERENCE into UIMessage.toolCalls
@@ -248,8 +250,8 @@ for (const part of message.parts ?? []) {
       drawProse(part.text, part.state === 'streaming');
       break;
     case 'reasoning':
-      // `encrypted` text is an opaque provider payload, not thinking text.
-      if (!part.encrypted) drawThinking(part.text);
+      // `encrypted` / `redacted` text is an opaque provider payload, not thinking text.
+      if (!part.encrypted && !part.redacted) drawThinking(part.text);
       break;
     case 'tool': {
       const call = message.toolCalls?.find((c) => c.toolCallId === part.toolCallId);
@@ -269,7 +271,8 @@ What the union encodes, in the order people get it wrong:
 
 - **`parts` is optional and absent until the first element exists.** `createAssistantTurn`'s shape is public surface, so the key is never invented; render `parts` when present, the buckets otherwise.
 - **`step-start` is normally `parts[0]`** of a real streamed turn, because the streaming loop pushes one at the top of every iteration. A renderer without a case for it hits its `default` on the very first element.
-- **Skip `reasoning` parts flagged `encrypted`** — the text is an opaque encrypted provider payload (OpenAI Responses), not display text; `redacted` marks a provider-redacted thinking block. Neither flag can appear on a *streamed* turn (the wire's `reasoning-delta` carries no such field) — they arrive on history projected by `uiFromMessages`.
+- **Skip `reasoning` parts flagged `encrypted` or `redacted`** — the text is an opaque provider payload (an OpenAI encrypted item, an Anthropic redacted thinking block), not display text. Since 2.3 both flags arrive on a *streamed* turn too: the wire's `reasoning-delta` carries them, with the payload in its `data` field, and `applyUIPart` keeps that payload in the part's `text` (as `uiFromMessages` does) and out of the `reasoning` bucket.
+- **One reasoning element per model block (2.3).** A delta with a new block `id` opens a new element, so two consecutive thinking blocks are two elements, each with its own signature; a block's text can be empty (the model omitted its thinking display), and it is still a block.
 - **A text/reasoning element is `'streaming'` only while it is the newest thing in the turn.** Opening anything else seals it, which is what makes a text delta arriving *after* a tool call a new paragraph instead of silently re-opening the one the tool interrupted.
 - **A `tool` element is a reference, not a copy** — a call's state (input → approval → result → denial) changes over the turn's life, and two copies of it would drift.
 - **A `file` element carries the canonical `ImagePart.image` value verbatim** (bytes stay bytes). `url` is set only when the value is already a renderable `data:` / `http(s):` src; for bytes, build one yourself. See [Files & PDFs](/docs/core/files).
@@ -288,7 +291,7 @@ It is idempotent and returns the **same object** when there is nothing to seal (
 
 ### Back to canonical history
 
-- `assistantMessageFromTurn(turn)` — the canonical assistant `Message` for the request history: text plus `tool_use` parts, exactly as the wire streamed them (the client-tools reconstruction).
+- `assistantMessageFromTurn(turn)` — the canonical assistant `Message` for the request history, exactly as the wire streamed it (the client-tools reconstruction). Since 2.3 it follows the ordered `parts`: every reasoning block rides back unchanged and in place next to the text and `tool_use` parts, where it used to drop all reasoning. A plain answer is still a string, and a turn with neither text nor a tool call sends no reasoning back. Each `tool_use` carries the provider metadata the wire's `tool-call` frame brought (a Gemini function call's `thoughtSignature`, since 2.3). A Gemini signature on a plain *text* part is not on the wire, so the rebuilt text carries none (Gemini does not enforce it; not live-verified).
 - `clientToolResultMessage(results)` — the canonical `role: 'tool'` message for client-executed tool results.
 - `uiFromMessages(messages, generateId)` — the reverse projection: a canonical history (e.g. a chat loaded from a `ChatStore`) into render-friendly `UIMessage`s. `tool` messages merge their results into the preceding assistant turn; `system` messages are not rendered; `generateId` supplies stable ids (inject `deps.generateId`, or scripted ids in tests). Since 1.9 each message also carries the ordered `parts` projection, in canonical array order — which is what makes attachments visible instead of rendering as an empty bubble.
 - `canonicalFromUI(ui)` — the inverse of `uiFromMessages` (1.9), for a binding that lets the app **replace** history (`setMessages`): the two views must stay coherent, and only the canonical one is POSTable.
@@ -302,7 +305,7 @@ const ui = record ? uiFromMessages(record.messages, () => crypto.randomUUID()) :
 
 `canonicalFromUI` prefers the ordered `parts` over the buckets, and it is **lossy on purpose** — where it loses matters:
 
-- **Survives** (with `parts` present): the interleave, `ImagePart` attachments with their media type (carrier verbatim), reasoning `signature` / `encrypted` / `redacted`, `tool_use.providerMetadata` (Gemini's `thoughtSignature` — a dropped one 400s the next request), and executed tool calls re-emitted as the `role: 'tool'` message that follows the turn, because [every `tool_use` must get a `tool_result`](/docs/agents/tool-loop).
+- **Survives** (with `parts` present): the interleave, `ImagePart` attachments with their media type (carrier verbatim), reasoning `signature` / `encrypted` / `redacted` / `source` with one part per block (a signed block with empty text included, since 2.3), `tool_use.providerMetadata` (Gemini's `thoughtSignature` — a dropped one 400s the next request), and executed tool calls re-emitted as the `role: 'tool'` message that follows the turn, because [every `tool_use` must get a `tool_result`](/docs/agents/tool-loop).
 - **Does not survive:** `system` messages (`uiFromMessages` never rendered them, so nothing here can bring them back — re-prepend your own), message-level `providerMetadata`, consecutive text parts (they merge into one block, which is what makes a text-only history round-trip exactly), UI-only bookkeeping (`runState`, denial, pending approvals, `data-*` parts, citations, step boundaries), and a call still awaiting its result, which stays a bare `tool_use`.
 - **Without `parts`** — a hand-built turn, or one restored from a pre-1.9 store — it collapses to bucket order (one reasoning block, then one text block, then every `tool_use`) and attachments are gone entirely, because `UIMessage.content` is a plain string. That result is a *plausible* history, not the original one.
 

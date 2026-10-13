@@ -470,7 +470,8 @@ describe('tool approval — client mode (no approveToolCall)', () => {
     expect(weather).not.toHaveBeenCalled();
     expect(res.pendingApprovals).toEqual([
       {
-        approvalId: 'toolu_1',
+        // Bound to the call it was issued for (2.3): the call id, then a digest.
+        approvalId: expect.stringMatching(/^toolu_1@[0-9a-f]{24}$/),
         toolCallId: 'toolu_1',
         toolName: 'getWeather',
         input: { city: 'Paris' },
@@ -519,7 +520,7 @@ describe('tool approval — client mode (no approveToolCall)', () => {
     expect(types.at(-1)).toBe('finish');
     const approval = parts.find((p) => p.type === 'tool-approval-request');
     expect(approval).toMatchObject({
-      approvalId: 'toolu_1',
+      approvalId: expect.stringMatching(/^toolu_1@[0-9a-f]{24}$/),
       toolCallId: 'toolu_1',
       toolName: 'getWeather',
       input: { city: 'Paris' },
@@ -1004,7 +1005,7 @@ describe('hallucinated tool names (unknown name ≠ client tool)', () => {
     expect(res.steps).toHaveLength(1);
     expect(res.pendingApprovals).toEqual([
       {
-        approvalId: 'call_1',
+        approvalId: expect.stringMatching(/^call_1@[0-9a-f]{24}$/),
         toolCallId: 'call_1',
         toolName: 'askUser',
         input: { q: 'ok?' },
@@ -1220,6 +1221,34 @@ describe('per-tool timeout (self-healing, clock-driven)', () => {
     fire(25);
     const res = await run;
     expect(String(res.steps![0]!.toolResults[0]!.result)).toContain('timed out after 25ms');
+  });
+
+  it('an Infinity cap arms no timer: a host clamps it to 1ms (2.3)', async () => {
+    const { clock, timers } = fakeClock();
+    const model = createMockModel({
+      responses: [
+        { toolCalls: [{ toolName: 'own', args: {} }] },
+        { toolCalls: [{ toolName: 'call', args: {} }] },
+        { text: 'done' },
+      ],
+    });
+    const res = await generateText({
+      model,
+      prompt: 'go',
+      tools: {
+        own: { parameters: EMPTY, timeoutMs: Infinity, execute: async () => 'own ok' },
+        call: { parameters: EMPTY, execute: async () => 'call ok' },
+      },
+      maxSteps: 3,
+      timeout: { toolMs: Infinity },
+      deps: { clock },
+    });
+    expect(timers.some((t) => !Number.isFinite(t.ms))).toBe(false);
+    expect(res.steps!.map((s) => s.toolResults[0]?.result)).toEqual([
+      'own ok',
+      'call ok',
+      undefined,
+    ]);
   });
 
   it('no cap = 1.8 behaviour: the caller’s signal passes through untouched', async () => {

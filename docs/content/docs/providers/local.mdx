@@ -146,7 +146,7 @@ The [model registry](/docs/advanced/model-registry) pins capabilities for flagsh
 - one `unknown-model` warning (a `logger.warn` line plus a typed entry in `result.warnings`), and
 - the conservative fallback row: `tools: false`, `reasoning: false`, `structuredOutput: false`, `maxOutput: 4096`.
 
-Nothing throws, and the call works. But `maxOutput: 4096` becomes the request's `max_tokens`, so a long answer gets silently truncated.
+Nothing throws, and the call works. Since 2.3 the `maxOutput: 4096` placeholder does not reach the wire: the request carries no `max_tokens`, so the server's own limit applies. The exception is a call under an execution context's token or USD budget, which sends the placeholder as its output cap with a `clamped-setting` warning. Before 2.3 the placeholder always became the request's `max_tokens`, so a long answer was silently truncated.
 
 ### The cure: `capabilities`
 
@@ -165,7 +165,7 @@ export const ollama = createOllama({
 
 | Field | Why you would set it |
 | --- | --- |
-| `maxOutput` | Stops the 4096-token truncation. The single most valuable one. |
+| `maxOutput` | Sends the model's real output limit as `max_tokens`. Without it, 2.3 sends no cap, except under an execution context's token or USD budget, where the 4096 placeholder is sent. |
 | `tools` | Reported by `getModelCapabilities` for your own UI gating. No adapter reads it — tool calling works either way. |
 | `contextWindow` | Feeds compaction sizing, so the history is summarized at the right threshold. |
 | `vision` / `reasoning` / `structuredOutput` | Whatever the model you loaded actually supports. |
@@ -247,7 +247,7 @@ Three things this generic path gets you that pointing an unrelated cloud factory
 | `TypeError: fetch failed` / `ECONNREFUSED` | The server is not running, or is on another port. `curl {baseURL}/models` first — the SDK adds no networking of its own. |
 | `ModelNotFoundError` (404) | The slug is not loaded. Ollama: the tag is part of the name (`llama3.2` ≠ `llama3.2:3b`). LM Studio: only the currently-loaded model exists. |
 | `AuthenticationError` from a *local* host | You used `createOpenAICompatible` without `apiKeyOptional`, or a factory that never had it. `createOllama`/`createLMStudio` cannot produce this without a proxy in front. |
-| Answer stops mid-sentence | `maxOutput: 4096` from the fallback row became `max_tokens`. Set [`capabilities.maxOutput`](#the-cure-capabilities). |
+| Answer stops mid-sentence | The server's own output limit, since 2.3 sends no `max_tokens` for a model without a known limit; or, under an execution context's token or USD budget, the 4096 placeholder. Set [`capabilities.maxOutput`](#the-cure-capabilities) or `maxOutputTokens`, and check the server's settings. |
 | `TimeoutError` on the very first call | Weights loading. Raise `timeout.ttftMs` (default 60 s). |
 | Tools are never called | Not the SDK — `caps.tools` is read by no adapter, so the tool array is sent regardless. The model simply is not tool-trained, or the server's template drops the tool block. |
 | Streaming arrives in one lump at the end | A proxy buffering SSE. Check the reverse proxy, not the SDK. |

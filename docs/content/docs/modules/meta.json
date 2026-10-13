@@ -5,11 +5,15 @@
   "pages": [
     "observability",
     "autonomy",
+    "evals",
     "native-agents",
+    "native-mcp",
     "swarm",
     "operations",
+    "headless",
     "budgets",
     "schedule",
+    "goals",
     "evolve",
     "memory",
     "stores",
@@ -18,14 +22,19 @@
     "rag",
     "skills",
     "mcp",
+    "mcp-server",
+    "a2a",
     "image-generation",
     "speech",
     "transcription",
+    "realtime",
+    "batch",
     "video-generation",
     "ui-streaming",
     "react-hooks",
     "request-validation",
     "middleware",
-    "pricing"
+    "pricing",
+    "model-profiles"
   ]
 }

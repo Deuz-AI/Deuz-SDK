@@ -29,6 +29,24 @@ export { filePart, imagePart } from './parts';
 // table plus a Symbol read; nothing it touches leaves the Web API surface.
 export { getModelCapabilities } from './core/registry';
 export type { ModelCapabilities } from './core/registry';
+// Model profiles (2.3): what each model accepts, and every value a request changes.
+export type { EffortLevel, EffortNoneMapping, RegistryMatch } from './core/registry';
+export type { EffortField } from './core/request-rules';
+export { resolveModelProfile } from './model-profile';
+export type {
+  ModelProfile,
+  ModelProfileEffort,
+  ModelProfileThinking,
+  ModelProfileLimits,
+  ModelProfileSampling,
+  ModelProfileUsage,
+  ModelProfileCache,
+  ModelProfileClamp,
+  ProfileSupport,
+  ProfileCapability,
+  ModelStatus,
+  AnthropicThinkingType,
+} from './model-profile';
 export { anthropicWebSearch, openaiWebSearch, googleSearch } from './server-tools';
 export { createClient, resolveDependencies } from './client';
 export type { DeuzClient } from './client';
@@ -43,6 +61,7 @@ export {
   deserializeCheckpoint,
   createApprovalSigner,
   CheckpointNotFoundError,
+  CheckpointVersionError,
 } from './durable';
 export type {
   ResumeOptions,
@@ -53,6 +72,8 @@ export type {
 } from './durable';
 export { DeuzError, isDeuzError, NoObjectGeneratedError, BreakerOpenError } from './errors';
 export type { DeuzErrorJSON } from './errors';
+// A legacy loop's `budget.unknownPrice: 'reject'` refusal (2.3).
+export { UnpricedModelError } from './internal/unpriced-error';
 // Chat engine (1.7 additive, P2+P6) — pure reducers + ChatStore seam.
 // 1.9 adds the inverse projection (canonicalFromUI), the tail seal, and the
 // multimodal input primitives; `filesToImageParts` reads a Blob through

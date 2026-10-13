@@ -2,6 +2,12 @@
 import { describe, it, expect } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useObject, useChat } from '../src/react';
+import { streamChat } from '../src/index';
+import { createAnthropic } from '../src/anthropic';
+import { toDeuzStreamResponse, type DeuzWireVersion } from '../src/ui';
+import { mockFetch, sseEvents, sseResponse } from '../src/testing';
+import type { StreamChatResult } from '../src/types/methods';
+import type { StreamPart } from '../src/types/stream';
 
 /** Build a Deuz-wire SSE Response from raw data lines (jsdom's Blob lacks .stream()). */
 function sseResponseOf(lines: string[]): Response {
@@ -210,5 +216,128 @@ describe('useChat', () => {
     });
     expect(result.current.status).toBe('idle'); // abort is not an error
     expect(result.current.error).toBeUndefined();
+  });
+});
+
+describe('useChat and opaque reasoning on the 2.3 wire (W2a review S2-2)', () => {
+  // This hook predates the 2.3 reasoning flags: it appends every reasoning
+  // delta's `text` to `message.reasoning`. Since 2.3 the Anthropic parser
+  // streams a `redacted_thinking` block's opaque `data`, so the wire must carry
+  // an opaque payload in the frame's `data`, never in its `text`.
+  const RED = 'EmwKAhgBEgy3va3pzix0LafPsQ0aDOPAQUEREDACTEDPAYLOAD';
+
+  const claudeTurn = (): string =>
+    sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 5, output_tokens: 1 } } },
+      },
+      {
+        event: 'content_block_start',
+        data: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'redacted_thinking', data: RED },
+        },
+      },
+      { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
+      {
+        event: 'content_block_start',
+        data: { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } },
+      },
+      {
+        event: 'content_block_delta',
+        data: {
+          type: 'content_block_delta',
+          index: 1,
+          delta: { type: 'text_delta', text: 'Hello' },
+        },
+      },
+      { event: 'content_block_stop', data: { type: 'content_block_stop', index: 1 } },
+      {
+        event: 'message_delta',
+        data: {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 3 },
+        },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+
+  /** jsdom's Blob lacks .stream(): re-wrap a served response's bytes (see `sseResponseOf`). */
+  async function rewrap(res: Response): Promise<Response> {
+    const bytes = new TextEncoder().encode(await res.text());
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+      { headers: res.headers },
+    );
+  }
+
+  it.each(['v1', 'v2'] as const)(
+    'never shows redacted thinking data as reasoning (%s wire)',
+    async (wireVersion: DeuzWireVersion) => {
+      const provider = mockFetch(() => sseResponse([claudeTurn()]));
+      const model = createAnthropic({ apiKey: 'k', fetch: provider.fetch })('claude-opus-5-5');
+      // A real core route: streamChat -> toDeuzStreamResponse.
+      const route: typeof fetch = async (_url, init) => {
+        const { messages } = JSON.parse(String(init?.body)) as { messages: never[] };
+        return rewrap(toDeuzStreamResponse(streamChat({ model, messages }), { wireVersion }));
+      };
+      const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: route }));
+      await act(async () => {
+        await result.current.sendMessage('hi');
+      });
+      await waitFor(() => expect(result.current.status).toBe('idle'));
+      expect(result.current.error).toBeUndefined();
+      const assistant = result.current.messages[1]!;
+      expect(assistant.content).toBe('Hello');
+      expect(assistant.reasoning ?? '').not.toContain(RED);
+    },
+  );
+
+  it('never shows an OpenAI encrypted reasoning item as reasoning either', async () => {
+    const ENC = 'gAAAAABpENCRYPTEDREASONINGITEM';
+    const parts: StreamPart[] = [
+      { type: 'reasoning-delta', text: 'Planning.', id: 'rs_1', source: 'openai' },
+      {
+        type: 'reasoning-delta',
+        text: ENC,
+        signature: 'rs_1',
+        encrypted: true,
+        id: 'rs_1',
+        source: 'openai',
+      },
+      { type: 'text-delta', text: 'Done.' },
+    ];
+    const result$: StreamChatResult = {
+      fullStream: (async function* () {
+        yield* parts;
+      })(),
+      textStream: (async function* () {})(),
+      usage: Promise.resolve({
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cachedReadTokens: 0,
+        cacheWriteTokens: 0,
+        cacheWrite1hTokens: 0,
+        totalTokens: 0,
+      }),
+      finishReason: Promise.resolve('stop' as const),
+    };
+    const route: typeof fetch = async () => rewrap(toDeuzStreamResponse(result$));
+    const { result } = renderHook(() => useChat({ api: '/api/chat', fetch: route }));
+    await act(async () => {
+      await result.current.sendMessage('hi');
+    });
+    await waitFor(() => expect(result.current.status).toBe('idle'));
+    expect(result.current.messages[1]!.content).toBe('Done.');
+    expect(result.current.messages[1]!.reasoning).toBe('Planning.');
   });
 });

@@ -72,7 +72,7 @@ result.warnings; // [{ type: 'unknown-model', message: "Unknown model 'some-new-
 
 | Field | Fallback value | What it costs you |
 | --- | --- | --- |
-| `maxOutput` | `4096` | **This is the one that matters.** It becomes the request's `max_tokens`, so a long answer is truncated. |
+| `maxOutput` | `4096` | A placeholder. Since 2.3 the Chat Completions wire leaves the cap off for it, so the host's own default applies; under an execution context's token or USD budget it is sent as the output cap, with a `clamped-setting` warning. Before 2.3 it became the request's `max_tokens`, so a long answer was truncated. |
 | `contextWindow` | `128_000` | Feeds compaction sizing — too small truncates history early, too large summarizes too late. |
 | `tools` | `false` | Reported only. No adapter reads it; tool calling works regardless. |
 | `reasoning` | `false` | `effort` is dropped rather than sent. A reasoning model behaves as its own default. |
@@ -116,7 +116,7 @@ const result = await generateText({
 Reasoning arrives as `reasoning-delta` parts, never spliced into `textStream` — the two channels stay apart.
 
 <Callout type="warn">
-  **`generateObject` does not work on V4.** It has two strategies and V4 rejects both: `json` sends `response_format: json_schema`, which V4 answers with *"This response_format type is unavailable now"*, and `tool` forces `tool_choice`, which it answers with *"Thinking mode does not support this tool_choice"*.
+  **`generateObject` does not work on V4.** It has two strategies and V4 rejects both: `json` sends `response_format: json_schema`, which V4 answers with *"This response_format type is unavailable now"*, and `tool` forces `tool_choice`, which it answers with *"Thinking mode does not support this tool_choice"*. Since 2.3 the V4 rows record the second rejection, so the SDK never forces a tool there: a forced `toolChoice` is sent as `auto` with a `clamped-setting` warning, and `generateObject` takes the `json` strategy, reporting an explicit `mode: 'tool'`. That request still fails on the first rejection.
 
   Ordinary (unforced) tool calling is unaffected, so the agentic loop works normally — only the forced-coercion path is closed. Until a `json_object` strategy exists, ask for the shape in the prompt:
 
@@ -131,6 +131,10 @@ Reasoning arrives as `reasoning-delta` parts, never spliced into `textStream` �
 </Callout>
 
 The wire accepts `max_tokens` up to 65,536, but the registry keeps the default at 8,192: one runaway thinking pass at the ceiling is a real bill. Raise it per call when an answer needs the room.
+
+### Reasoning round-trips on DeepSeek and Kimi (2.3)
+
+`reasoning_content` from any Chat Completions host becomes a `reasoning` part marked with that host's provider id as its `source` (`'deepseek'`, `'moonshot'`, …). On `createDeepSeek` and `createKimi` (provider `moonshot`) it rides back as `reasoning_content` on the assistant message that carries the turn's `tool_calls`, so a multi-step tool conversation keeps its reasoning. A text-only turn sends none, other hosts send none, and reasoning from another provider (a Claude thinking block, an OpenAI encrypted item) is never sent. Both hosts document keeping `reasoning_content` across a tool conversation; the round trip is not live-verified.
 
 ### Perplexity Sonar does no client tool calling
 

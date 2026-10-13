@@ -1,4 +1,4 @@
-import type { Adapter, AdapterRequest, BuildContext, ParseContext } from './types';
+import type { Adapter, AdapterRequest, BuildContext, ParseContext, WireTool } from './types';
 import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
 import type { Part } from '../types/message';
@@ -14,7 +14,23 @@ import {
   RateLimitError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
+import type { EffortLevel } from '../core/registry';
+import {
+  anthropicMaxTokens,
+  atMostHigh,
+  describeToolChoice,
+  effortWire,
+  planEffort,
+  reportClamp,
+  reportDrop,
+} from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
+import { replaysTo } from '../internal/reasoning';
+import {
+  bindsThinkingToPrefix,
+  toolSetChangeOf,
+  type ToolSetChange,
+} from '../internal/stable-prefix';
 import { acceptsDocuments, resolveMedia, warnDroppedDocument } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -38,7 +54,10 @@ interface MediaContext {
   warnings: BuildContext['warnings'];
 }
 
-/** Returns null when the part cannot be carried and was dropped (warned). */
+/**
+ * Returns null when the part cannot be carried: a dropped document (warned),
+ * or reasoning this wire must not replay (see the `reasoning` case).
+ */
 function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
   switch (part.type) {
     case 'text':
@@ -53,13 +72,15 @@ function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
         ...(part.isError ? { is_error: true } : {}),
       };
     case 'reasoning':
-      return part.redacted
-        ? { type: 'redacted_thinking', data: part.text }
-        : {
-            type: 'thinking',
-            thinking: part.text,
-            ...(part.signature ? { signature: part.signature } : {}),
-          };
+      // Claude's own blocks ride back exactly as they came (2.3, F21), between
+      // Claude models too: the API drops the ones the model cannot read.
+      // Another provider's reasoning is never a thinking block (an OpenAI
+      // encrypted item used to go out as one), and a thinking block without
+      // its signature is always rejected.
+      if (!replaysTo(part, 'anthropic')) return null;
+      if (part.redacted) return { type: 'redacted_thinking', data: part.text };
+      if (!part.signature) return null;
+      return { type: 'thinking', thinking: part.text, signature: part.signature };
     case 'image': {
       // `ImagePart` carries documents too (the Part union is locked until 2.0)
       // — a PDF must become a `document` block, never an `image` one: /v1/messages
@@ -98,30 +119,32 @@ function partToBlock(part: Part, media: MediaContext): AnthropicBlock | null {
   }
 }
 
-/** Reasoning/thinking blocks MUST come first in an Anthropic content array. */
-function orderReasoningFirst(blocks: AnthropicBlock[]): AnthropicBlock[] {
-  const thinking = blocks.filter((b) => b.type === 'thinking' || b.type === 'redacted_thinking');
-  const rest = blocks.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
-  return [...thinking, ...rest];
-}
-
-const THINKING_BUDGET: Record<'low' | 'medium' | 'high' | 'xhigh' | 'max', number> = {
-  low: 4_000,
-  medium: 10_000,
-  high: 24_000,
-  xhigh: 48_000,
-  max: 48_000,
-};
-
-/** Map canonical tool choice → Anthropic. Forced choice is illegal with thinking → fall back to auto. */
+/**
+ * Map canonical tool choice → Anthropic. A forced choice the model cannot take
+ * (`forcedOk` false: the row says so, or extended thinking is on) falls back
+ * to auto — reported as a `clamped-setting`, never silent (2.3).
+ */
 function mapAnthropicToolChoice(
+  ctx: BuildContext,
   choice: ToolChoice | undefined,
-  thinkingOn: boolean,
+  forcedOk: boolean,
   allowParallel: boolean | undefined,
 ): Record<string, unknown> {
   const dp = allowParallel === false ? { disable_parallel_tool_use: true } : {};
   if (choice === 'none') return { type: 'none' };
-  if (!choice || choice === 'auto' || thinkingOn) return { type: 'auto', ...dp };
+  if (!choice || choice === 'auto') return { type: 'auto', ...dp };
+  if (!forcedOk) {
+    const why =
+      ctx.caps.forcedToolChoice === false
+        ? 'rejects a forced tool_choice'
+        : 'rejects a forced tool_choice while extended thinking is on';
+    reportClamp(
+      ctx,
+      'toolChoice',
+      `toolChoice ${describeToolChoice(choice)} was sent as 'auto': ${ctx.call.modelId} ${why}.`,
+    );
+    return { type: 'auto', ...dp };
+  }
   if (choice === 'required') return { type: 'any', ...dp };
   if (typeof choice === 'object' && choice.type === 'tool') {
     return { type: 'tool', name: choice.toolName, ...dp };
@@ -129,9 +152,148 @@ function mapAnthropicToolChoice(
   return { type: 'auto', ...dp };
 }
 
+// --- thinking block binding (2.3, F21 with F22) ---
+//
+// Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind each thinking block's
+// signature to the conversation before it (Anthropic API reference, cached
+// 2026-10-06). On accounts opened from 2026-08-31 a replayed block whose prefix
+// changed fails the request with 400. The loops keep the prefix stable (F22,
+// `internal/stable-prefix.ts`); a request that sends thinking back to such a
+// model still asks the API to drop a mismatched block instead, as the safety
+// net for a history edited elsewhere. Shapes from @anthropic-ai/sdk 0.133.0's
+// beta types; not live-verified.
+
+const BLOCK_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Set `thinking.block_binding` on `body`; returns whether the request carries
+ * one (and so needs the beta header). The default is `drop_block` when the
+ * request replays thinking to a binding model. `providerOptions.<provider>
+ * .thinking.block_binding` replaces it: an object is sent as given, `null`
+ * sends none. Only `adaptive` and `enabled` thinking can carry a binding, so a
+ * request that turned thinking off (`effort: 'none'`) carries none. The
+ * caller's other `thinking` fields ride along when the request sets no thinking
+ * of its own; when it does, its own wins, as for every provider option.
+ */
+function applyBlockBinding(
+  ctx: BuildContext,
+  body: Record<string, unknown>,
+  /** The request replays thinking to a model that binds it to the prefix. */
+  bindsReplay: boolean,
+): boolean {
+  const own = ctx.options.providerOptions?.[ctx.call.provider];
+  const caller = isRecord(own?.thinking) ? own.thinking : undefined;
+  const explicit = caller !== undefined && Object.hasOwn(caller, 'block_binding');
+  const binding = explicit
+    ? caller.block_binding
+    : bindsReplay
+      ? { prefix_mismatch_behavior: 'drop_block' }
+      : undefined;
+  if (binding === undefined) return false;
+  const adapter = isRecord(body.thinking) ? body.thinking : undefined;
+  if (!isRecord(binding)) {
+    // An explicit "no binding": strip the field from the caller's thinking.
+    // A key left without a value keeps the raw option off the wire (it is not
+    // re-merged, and JSON drops it) when nothing else of it remains.
+    if (!adapter && caller) {
+      const { block_binding: _none, ...rest } = caller;
+      body.thinking = Object.keys(rest).length > 0 ? rest : undefined;
+    }
+    return false;
+  }
+  const base = adapter ?? caller ?? {};
+  const type = base.type ?? 'adaptive';
+  if (type !== 'adaptive' && type !== 'enabled') return false;
+  body.thinking = { ...base, type, block_binding: binding };
+  return true;
+}
+
+// --- tool-set changes (2.3, F22) ---
+//
+// A request to a model that binds thinking to the prefix carries the same
+// `tools` array on every step; a step that offers another set appends a system
+// message whose change renders as `tool_removal` / `tool_addition` blocks
+// (@anthropic-ai/sdk 0.133.0 BetaRequestToolRemovalBlock /
+// BetaRequestToolAdditionBlock, one `role: 'system'` message as the SDK's own
+// tool runner sends them). A tool declared in `tools` with the same definition
+// is referenced by name; any other addition carries its definition inline.
+// Not live-verified.
+
+const TOOL_CHANGES_BETA = 'mid-conversation-tool-changes-2026-07-01';
+const INLINE_TOOLS_BETA = 'inline-tools-2026-09-15';
+
+/** A wire tool as a `tools` entry. */
+function toAnthropicTool(t: WireTool): Record<string, unknown> {
+  return t.provider
+    ? t.provider // provider-executed tool — raw native definition, verbatim
+    : {
+        name: t.name,
+        ...(t.description ? { description: t.description } : {}),
+        input_schema: t.parameters,
+      };
+}
+
+/**
+ * The blocks of a tool-set change: removals first, then additions, each in its
+ * order. A removal can only reference a tool the request declares or an
+ * earlier change defined (`referable`, which this updates); one that names
+ * neither — a change replayed from an earlier call whose tools have since
+ * changed — is left out rather than sent as a reference the API cannot resolve.
+ */
+function toolChangeBlocks(
+  change: ToolSetChange,
+  declared: WireTool[],
+  referable: Set<string>,
+): AnthropicBlock[] {
+  const blocks: AnthropicBlock[] = change.remove
+    .filter((name) => referable.has(name))
+    .map((name) => ({ type: 'tool_removal', tool: { type: 'tool_reference', name } }));
+  for (const tool of change.add) {
+    const same = declared.find((t) => t.name === tool.name);
+    referable.add(tool.name);
+    blocks.push({
+      type: 'tool_addition',
+      tool:
+        same && JSON.stringify(same) === JSON.stringify(tool)
+          ? { type: 'tool_reference', name: tool.name }
+          : { type: 'tool_definition', definition: toAnthropicTool(tool) },
+    });
+  }
+  return blocks;
+}
+
+/** `headers` with `beta` added to `anthropic-beta` (a caller's list is kept). */
+function withBeta(headers: Record<string, string>, beta: string): Record<string, string> {
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === 'anthropic-beta');
+  const listed = key
+    ? headers[key]!.split(',')
+        .map((v) => v.trim())
+        .filter(Boolean)
+    : [];
+  if (listed.includes(beta)) return headers;
+  const next = { ...headers };
+  if (key) delete next[key];
+  next[key ?? 'anthropic-beta'] = [...listed, beta].join(',');
+  return next;
+}
+
 function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options } = ctx;
-  const { system, rest } = extractSystem(messages);
+  // Claude 5.x binds thinking to the transcript prefix (2.3, F22): a system
+  // message appended mid-conversation rides in place as a `role: 'system'`
+  // message (GA `MessageParam`) instead of rewriting the top-level `system`.
+  // Older models keep the 2.2 fold; whether they accept the role is not
+  // live-verified.
+  const bound = bindsThinkingToPrefix({
+    provider: call.provider,
+    modelId: call.modelId,
+    surface: 'anthropic',
+  });
+  const { system, rest } = extractSystem(messages, { inPlace: bound });
 
   const media: MediaContext = {
     caps,
@@ -140,34 +302,97 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     logger: ctx.logger,
     warnings: ctx.warnings,
   };
-  const wireMessages = rest.map((m) => ({
-    role: m.role === 'tool' ? 'user' : m.role,
-    content: orderReasoningFirst(
-      m.content.map((p) => partToBlock(p, media)).filter((b): b is AnthropicBlock => b !== null),
-    ),
-  }));
+  // The tools the request declares: what a tool-set change may reference, with
+  // the ones an earlier change defined inline (in message order, below).
+  const declared = ctx.object?.strategy !== 'tool' ? (ctx.tools?.tools ?? []) : [];
+  const referable = new Set(declared.map((t) => t.name));
+  // Blocks keep the order the model produced them in (2.3, F21): thinking
+  // between tool calls stays there, since a moved block is a modified prefix.
+  const wireMessages = rest
+    .map((m) => {
+      const content = m.content
+        .map((p) => partToBlock(p, media))
+        .filter((b): b is AnthropicBlock => b !== null);
+      // A tool-set change rides on a system message (2.3, F22).
+      const change = m.role === 'system' ? toolSetChangeOf(m) : undefined;
+      if (change) content.push(...toolChangeBlocks(change, declared, referable));
+      return { role: m.role === 'tool' ? 'user' : m.role, content };
+    })
+    // A mid-conversation system message with nothing to say is not sent.
+    .filter((m) => m.role !== 'system' || m.content.length > 0);
 
-  const effortOn = caps.reasoning && options.effort !== undefined && options.effort !== 'none';
-  // Opus 4.7+/Sonnet 5/Fable 5: budget_tokens returns 400 — effort rides output_config.
-  const useOutputConfig = caps.effortWire === 'output_config';
-  const thinkingOn = effortOn && !useOutputConfig;
-  const maxTokens = options.maxOutputTokens ?? caps.maxOutput;
+  // Opus 4.7+/Sonnet 5/Fable 5/Claude 5.x: budget_tokens returns 400 — effort
+  // rides output_config. Every value changed on the way is reported (2.3): see
+  // core/request-rules.ts.
+  const wire = effortWire('anthropic', caps, call.modelId);
+  const useOutputConfig = wire.field === 'output_config.effort';
+  const effort = planEffort(ctx, wire);
+  let budget: number | undefined;
+  let outputEffort: EffortLevel | undefined;
+  let thinking: Record<string, unknown> | undefined;
+  if (effort.thinkingOff) {
+    // `effort: 'none'` on a model that can turn thinking off. That is only
+    // allowed at effort ≤ high: a documented default within the limit is left
+    // alone, any other is pinned to the lowest effort — and reported (F26).
+    thinking = { type: effort.thinkingOff };
+    if (useOutputConfig && !atMostHigh(caps.effortDefault)) {
+      outputEffort = 'low';
+      const why =
+        caps.effortDefault === undefined
+          ? 'documents no default effort'
+          : `defaults to effort '${caps.effortDefault}'`;
+      reportClamp(
+        ctx,
+        'effort',
+        `effort 'none' was sent as thinking.type '${effort.thinkingOff}' with output_config.effort ` +
+          `'low': ${call.modelId} turns thinking off only at effort high or below, and ${why}.`,
+      );
+    }
+  } else if (effort.level !== undefined) {
+    if (useOutputConfig) {
+      outputEffort = effort.level;
+    } else {
+      budget = effort.budget;
+      thinking = { type: 'enabled', budget_tokens: budget };
+    }
+  }
+  // Adaptive thinking runs whenever an effort level rides output_config.
+  const thinkingOn = budget !== undefined || (useOutputConfig && effort.level !== undefined);
+
+  // `max_tokens` is REQUIRED on this wire, so an unknown model's placeholder is
+  // still sent; the registry's `unknown-model` warning names that default and
+  // the two ways to raise it (2.3).
+  const requested = options.maxOutputTokens;
+  const maxTokens = anthropicMaxTokens(caps, requested, budget);
+  if (requested !== undefined && maxTokens !== requested) {
+    reportClamp(
+      ctx,
+      'maxOutputTokens',
+      `maxOutputTokens ${requested} was raised to ${maxTokens}: thinking.budget_tokens ` +
+        `${budget} needs room for the answer (${call.modelId}).`,
+    );
+  }
 
   const body: Record<string, unknown> = {
     model: call.modelId,
-    max_tokens: thinkingOn
-      ? Math.max(maxTokens, THINKING_BUDGET[options.effort as keyof typeof THINKING_BUDGET] + 1_024)
-      : maxTokens,
+    max_tokens: maxTokens,
     messages: wireMessages,
     stream: true,
   };
   if (system) body.system = system;
-  if (thinkingOn) {
-    body.thinking = {
-      type: 'enabled',
-      budget_tokens: THINKING_BUDGET[options.effort as keyof typeof THINKING_BUDGET],
-    };
-    // Anthropic requires temperature unset (=1) when thinking is enabled.
+  if (thinking) body.thinking = thinking;
+  if (budget !== undefined) {
+    // Anthropic requires temperature unset (=1) when thinking is enabled. A
+    // restricted row already reported the drop (core/inference.ts).
+    if (!caps.samplingRestrictions) {
+      const why = `extended thinking (thinking.budget_tokens) on ${call.modelId} runs at the default`;
+      if (options.temperature !== undefined) {
+        reportClamp(ctx, 'temperature', `temperature was dropped from the request: ${why}.`);
+      }
+      if (options.topP !== undefined) {
+        reportClamp(ctx, 'topP', `topP was dropped from the request: ${why}.`);
+      }
+    }
   } else if (!caps.samplingRestrictions) {
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.topP !== undefined) body.top_p = options.topP;
@@ -179,6 +404,13 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       type: 'ephemeral',
       ...(options.promptCaching === 'auto-1h' ? { ttl: '1h' } : {}),
     };
+  } else if (options.promptCaching) {
+    reportDrop(
+      ctx,
+      'promptCaching',
+      `promptCaching was dropped from the request: ${call.modelId} has no prompt-caching ` +
+        'capability in the registry (pass capabilities: { caching: true } if it does).',
+    );
   }
 
   if (ctx.object) {
@@ -195,30 +427,49 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       ];
       body.tool_choice = { type: 'tool', name: toolName };
     }
-  } else if (ctx.tools && ctx.tools.tools.length > 0) {
-    body.tools = ctx.tools.tools.map((t) =>
-      t.provider
-        ? t.provider // provider-executed tool — raw native definition, verbatim
-        : {
-            name: t.name,
-            ...(t.description ? { description: t.description } : {}),
-            input_schema: t.parameters,
-          },
-    );
+  }
+  // A json-strategy object request keeps the call's tools and their tool_choice
+  // beside `output_config.format` (2.3, F15): runAgent's finalization asks with
+  // the loop's tools and `toolChoice: 'none'`, so its request prefix (prompt
+  // cache, preserved thinking) stays the loop's. The tool strategy forces its
+  // own call instead. Not live-verified.
+  if (ctx.object?.strategy !== 'tool' && ctx.tools && ctx.tools.tools.length > 0) {
+    body.tools = ctx.tools.tools.map(toAnthropicTool);
     body.tool_choice = mapAnthropicToolChoice(
+      ctx,
       ctx.tools.toolChoice,
-      thinkingOn || (effortOn && useOutputConfig),
+      // The row's word wins; otherwise the historical rule: no forcing while thinking.
+      caps.forcedToolChoice ?? !thinkingOn,
       ctx.tools.allowParallel,
     );
   }
 
   // Effort rides output_config on adaptive-thinking models; merge with the
   // json-strategy `output_config.format` set above when both are present.
-  if (effortOn && useOutputConfig) {
+  if (outputEffort !== undefined) {
     body.output_config = {
       ...(body.output_config as Record<string, unknown> | undefined),
-      effort: options.effort,
+      effort: outputEffort,
     };
+  }
+
+  const replaysThinking = wireMessages.some(
+    (m) =>
+      m.role === 'assistant' &&
+      m.content.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking'),
+  );
+  let extraHeaders = applyBlockBinding(ctx, body, replaysThinking && bound)
+    ? withBeta(call.headers, BLOCK_BINDING_BETA)
+    : call.headers;
+  const changeBlocks = wireMessages
+    .filter((m) => m.role === 'system')
+    .flatMap((m) => m.content)
+    .filter((b) => b.type === 'tool_addition' || b.type === 'tool_removal');
+  if (changeBlocks.length > 0) {
+    extraHeaders = withBeta(extraHeaders, TOOL_CHANGES_BETA);
+    if (changeBlocks.some((b) => (b.tool as { type: string }).type === 'tool_definition')) {
+      extraHeaders = withBeta(extraHeaders, INLINE_TOOLS_BETA);
+    }
   }
 
   applyProviderOptions(body, call.provider, options);
@@ -235,7 +486,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
         headers: {
           'content-type': 'application/json',
           authorization: `Bearer ${call.apiKey}`,
-          ...call.headers,
+          ...extraHeaders,
         },
         body: JSON.stringify(body),
       },
@@ -250,7 +501,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
         'content-type': 'application/json',
         'x-api-key': call.apiKey,
         'anthropic-version': ANTHROPIC_VERSION,
-        ...call.headers,
+        ...extraHeaders,
       },
       body: JSON.stringify(body),
     },
@@ -259,7 +510,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
 
 // --- stream parsing ---
 
-interface AnthropicUsage {
+export interface AnthropicUsage {
   input_tokens?: number;
   output_tokens?: number;
   cache_read_input_tokens?: number;
@@ -271,16 +522,32 @@ interface AnthropicUsage {
   iterations?: AnthropicUsage[];
 }
 
+/** One `input_transformations` entry (beta thinking-binding-controls-2026-08-01). */
+interface AnthropicInputTransformation {
+  /** `thinking_dropped` | `thinking_mismatch_allowed`; more may be added. */
+  type?: string;
+  /** `messages.{i}.content.{j}` of the request. */
+  path?: string;
+  reason?: string;
+}
+
 interface AnthropicEvent {
   type?: string;
   index?: number;
-  message?: { usage?: AnthropicUsage };
+  message?: { usage?: AnthropicUsage; input_transformations?: unknown };
+  /** Final `message_delta` only, after a mid-stream server-side model fallback. */
+  input_transformations?: unknown;
   content_block?: {
     type?: string;
     id?: string;
     name?: string;
     tool_use_id?: string;
     content?: unknown;
+    /** `thinking` blocks: the text and signature so far (both empty when streamed). */
+    thinking?: string;
+    signature?: string;
+    /** `redacted_thinking` blocks: the opaque payload, complete in the start event. */
+    data?: string;
   };
   delta?: {
     type?: string;
@@ -297,6 +564,84 @@ interface AnthropicEvent {
   error?: { type?: string; message?: string };
 }
 
+/** `count` thinking block(s), worded. */
+function blocks(count: number): string {
+  return `${count} thinking block${count === 1 ? '' : 's'}`;
+}
+
+/** `reason at path, path; reason at path` — at most five paths per reason. */
+function describeTransformations(entries: AnthropicInputTransformation[]): string {
+  const byReason = new Map<string, string[]>();
+  for (const entry of entries) {
+    const reason = typeof entry.reason === 'string' ? entry.reason : 'unknown reason';
+    const paths = byReason.get(reason) ?? [];
+    if (typeof entry.path === 'string') paths.push(entry.path);
+    byReason.set(reason, paths);
+  }
+  return [...byReason]
+    .map(([reason, paths]) => {
+      if (paths.length === 0) return reason;
+      const shown = paths.slice(0, 5).join(', ');
+      return `${reason} at ${shown}${paths.length > 5 ? ` and ${paths.length - 5} more` : ''}`;
+    })
+    .join('; ');
+}
+
+/**
+ * The response's `input_transformations` (2.3) as ONE typed warning: blocks the
+ * API removed before the model saw them, and blocks that failed the
+ * conversation check but were shown anyway. The raw entries ride the finish
+ * part as `providerMetadata.anthropic.input_transformations`.
+ */
+function transformationWarning(
+  entries: AnthropicInputTransformation[] | undefined,
+): StreamPart | undefined {
+  if (!entries || entries.length === 0) return undefined;
+  const dropped = entries.filter((e) => e.type === 'thinking_dropped');
+  const allowed = entries.filter((e) => e.type === 'thinking_mismatch_allowed');
+  const other = entries.filter(
+    (e) => e.type !== 'thinking_dropped' && e.type !== 'thinking_mismatch_allowed',
+  );
+  const said: string[] = [];
+  if (dropped.length > 0) {
+    said.push(
+      `removed ${blocks(dropped.length)} from the request (${describeTransformations(dropped)}), ` +
+        'so the model did not see that reasoning',
+    );
+  }
+  if (allowed.length > 0) {
+    said.push(
+      `${blocks(allowed.length)} failed the conversation check ` +
+        `(${describeTransformations(allowed)}) and ${allowed.length === 1 ? 'was' : 'were'} ` +
+        'shown to the model anyway, because the check is not enforced for this request',
+    );
+  }
+  if (other.length > 0) {
+    const kinds = [...new Set(other.map((e) => (typeof e.type === 'string' ? e.type : '?')))];
+    said.push(`made ${other.length} other change(s) (${kinds.join(', ')})`);
+  }
+  return {
+    type: 'warning',
+    warning: {
+      type: 'other',
+      setting: 'thinking.block_binding',
+      message:
+        `Anthropic changed the request's input: ${said.join('; ')}. ` +
+        'See providerMetadata.anthropic.input_transformations.',
+    },
+  };
+}
+
+/**
+ * Block identity for a reasoning delta (2.3, F21): the content block index
+ * keeps consecutive thinking blocks apart (each has its own signature, and a
+ * merged block is a modified one), and the source marks the family whose API
+ * signed it, so no other provider is ever sent it.
+ */
+function reasoningBlock(index: number): { id: string; source: 'anthropic' } {
+  return { id: String(index), source: 'anthropic' };
+}
+
 function mapStopReason(reason: string | null): FinishReason {
   switch (reason) {
     case 'max_tokens':
@@ -310,21 +655,35 @@ function mapStopReason(reason: string | null): FinishReason {
   }
 }
 
-function buildUsage(input: AnthropicUsage, outputTokens: number): Usage {
+export function mapAnthropicUsage(input: AnthropicUsage, outputTokens: number): Usage {
   // Fallbacks/compaction report per-attempt usage in `iterations` while the
   // top-level usage covers only the serving attempt — sum iterations instead.
+  // An entry carries token counters only (@anthropic-ai/sdk 0.133.0,
+  // `BetaIterationsUsage`): the server tool requests and the thinking-token
+  // detail are reported at the top level alone, so they are kept from there.
   if (input.iterations && input.iterations.length > 0) {
-    return input.iterations
-      .map((it) => buildUsage({ ...it, iterations: undefined }, it.output_tokens ?? 0))
-      .reduce((acc, u) => ({
-        inputTokens: acc.inputTokens + u.inputTokens,
-        outputTokens: acc.outputTokens + u.outputTokens,
-        reasoningTokens: acc.reasoningTokens + u.reasoningTokens,
-        cachedReadTokens: acc.cachedReadTokens + u.cachedReadTokens,
-        cacheWriteTokens: acc.cacheWriteTokens + u.cacheWriteTokens,
-        cacheWrite1hTokens: acc.cacheWrite1hTokens + u.cacheWrite1hTokens,
-        totalTokens: acc.totalTokens + u.totalTokens,
-      }));
+    const top = mapAnthropicUsage({ ...input, iterations: undefined }, outputTokens);
+    const attempts = input.iterations.map((it) =>
+      mapAnthropicUsage({ ...it, iterations: undefined }, it.output_tokens ?? 0),
+    );
+    const sum = (count: (u: Usage) => number): number =>
+      attempts.reduce((total, u) => total + count(u), 0);
+    const output = sum((u) => u.outputTokens);
+    const reasoning = sum((u) => u.reasoningTokens);
+    const toolUses = sum((u) => u.serverToolUses ?? 0);
+    // Whichever view is the more complete one, so nothing is counted twice.
+    const serverTools = Math.max(toolUses, top.serverToolUses ?? 0);
+    return {
+      inputTokens: sum((u) => u.inputTokens),
+      outputTokens: output,
+      // A share of the summed output, never more than it.
+      reasoningTokens: Math.min(output, Math.max(reasoning, top.reasoningTokens)),
+      cachedReadTokens: sum((u) => u.cachedReadTokens),
+      cacheWriteTokens: sum((u) => u.cacheWriteTokens),
+      cacheWrite1hTokens: sum((u) => u.cacheWrite1hTokens),
+      ...(serverTools > 0 ? { serverToolUses: serverTools } : {}),
+      totalTokens: sum((u) => u.totalTokens),
+    };
   }
   const cacheRead = input.cache_read_input_tokens ?? 0;
   const cacheWriteTotal = input.cache_creation_input_tokens ?? 0;
@@ -336,7 +695,8 @@ function buildUsage(input: AnthropicUsage, outputTokens: number): Usage {
   return {
     inputTokens,
     outputTokens,
-    // Thinking tokens bill inside output_tokens; the detail field breaks them out.
+    // Thinking tokens bill inside output_tokens; the detail field breaks them out
+    // as a subset, so it is never priced on top of outputTokens.
     reasoningTokens: input.output_tokens_details?.thinking_tokens ?? 0,
     cachedReadTokens: cacheRead,
     cacheWriteTokens: Math.max(0, cacheWriteTotal - cacheWrite1h),
@@ -355,6 +715,8 @@ async function* parseStream(
   let stopReason: string | null = null;
   let stopDetails: unknown;
   let contextManagement: unknown;
+  /** What the API changed in the request's input (block binding, 2.3); `[]` when nothing. */
+  let inputTransformations: AnthropicInputTransformation[] | undefined;
   const toolIds = new Map<number, string>();
   let finishEmitted = false;
 
@@ -363,6 +725,7 @@ async function* parseStream(
     const anthropic: Record<string, unknown> = {
       ...(stopDetails ? { stop_details: stopDetails } : {}),
       ...(contextManagement !== undefined ? { contextManagement } : {}),
+      ...(inputTransformations?.length ? { input_transformations: inputTransformations } : {}),
     };
     return Object.keys(anthropic).length > 0 ? { providerMetadata: { anthropic } } : {};
   };
@@ -382,10 +745,35 @@ async function* parseStream(
         inputUsage = data.message.usage;
         outputTokens = data.message.usage.output_tokens ?? 0;
       }
+      // Final here when streaming (beta thinking-binding-controls-2026-08-01).
+      if (Array.isArray(data.message?.input_transformations)) {
+        inputTransformations = data.message.input_transformations.filter(
+          isRecord,
+        ) as AnthropicInputTransformation[];
+      }
     } else if (type === 'content_block_start') {
       const idx = data.index ?? 0;
       const block = data.content_block;
-      if (block?.type === 'tool_use' && block.id) {
+      if (block?.type === 'thinking') {
+        // A streamed block starts empty; its text and signature follow as
+        // deltas. Anything the start already carries is part of the block.
+        if (block.thinking || block.signature) {
+          yield {
+            type: 'reasoning-delta',
+            text: block.thinking ?? '',
+            ...(block.signature ? { signature: block.signature } : {}),
+            ...reasoningBlock(idx),
+          };
+        }
+      } else if (block?.type === 'redacted_thinking') {
+        // Complete in the start event: opaque data that rides back unchanged.
+        yield {
+          type: 'reasoning-delta',
+          text: block.data ?? '',
+          redacted: true,
+          ...reasoningBlock(idx),
+        };
+      } else if (block?.type === 'tool_use' && block.id) {
         toolIds.set(idx, block.id);
         yield { type: 'tool-call-delta', id: block.id, name: block.name, argsTextDelta: '' };
       } else if (block?.type === 'web_search_tool_result') {
@@ -409,9 +797,14 @@ async function* parseStream(
       if (d?.type === 'text_delta' && d.text !== undefined) {
         yield { type: 'text-delta', text: d.text };
       } else if (d?.type === 'thinking_delta' && d.thinking !== undefined) {
-        yield { type: 'reasoning-delta', text: d.thinking };
+        yield { type: 'reasoning-delta', text: d.thinking, ...reasoningBlock(idx) };
       } else if (d?.type === 'signature_delta' && d.signature !== undefined) {
-        yield { type: 'reasoning-delta', text: '', signature: d.signature };
+        yield {
+          type: 'reasoning-delta',
+          text: '',
+          signature: d.signature,
+          ...reasoningBlock(idx),
+        };
       } else if (d?.type === 'input_json_delta') {
         // Only blocks registered as client tool_use stream tool-call deltas;
         // server_tool_use argument deltas are skipped (provider executes them).
@@ -424,6 +817,13 @@ async function* parseStream(
       if (data.delta?.stop_reason) stopReason = data.delta.stop_reason;
       if (data.delta?.stop_details) stopDetails = data.delta.stop_details;
       if (data.context_management !== undefined) contextManagement = data.context_management;
+      // Present only after a mid-stream server-side model fallback: the
+      // serving model's report replaces message_start's.
+      if (Array.isArray(data.input_transformations)) {
+        inputTransformations = data.input_transformations.filter(
+          isRecord,
+        ) as AnthropicInputTransformation[];
+      }
       if (data.usage) {
         if (data.usage.output_tokens !== undefined) outputTokens = data.usage.output_tokens;
         // The final message_delta carries output_tokens_details / iterations;
@@ -439,9 +839,11 @@ async function* parseStream(
       _ctx.usageAvailable?.(
         typeof inputUsage.input_tokens === 'number' && typeof inputUsage.output_tokens === 'number',
       );
+      const notice = transformationWarning(inputTransformations);
+      if (notice) yield notice;
       yield {
         type: 'finish',
-        usage: buildUsage(inputUsage, outputTokens),
+        usage: mapAnthropicUsage(inputUsage, outputTokens),
         finishReason: mapStopReason(stopReason),
         ...finishMeta(),
       };
@@ -453,9 +855,11 @@ async function* parseStream(
 
   if (!finishEmitted) {
     _ctx.usageAvailable?.(false);
+    const notice = transformationWarning(inputTransformations);
+    if (notice) yield notice;
     yield {
       type: 'finish',
-      usage: buildUsage(inputUsage, outputTokens),
+      usage: mapAnthropicUsage(inputUsage, outputTokens),
       finishReason: mapStopReason(stopReason),
       ...finishMeta(),
     };

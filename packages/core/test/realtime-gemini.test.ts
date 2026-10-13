@@ -1,0 +1,845 @@
+import { describe, it, expect, vi } from 'vitest';
+import {
+  createRealtimeSession,
+  createGeminiLive,
+  realtimePriceTable,
+  RealtimeError,
+  type RealtimeEvent,
+  type RealtimeSessionOptions,
+} from '../src/realtime';
+import { createPriceProvider } from '../src/pricing';
+import { tool } from '../src/tool';
+import type { JSONSchema } from '../src/types/schema';
+import {
+  fakeRealtimeServer,
+  geminiHandshake,
+  flush,
+  type FakeRealtimeSocket,
+} from './fixtures/realtime-socket';
+
+const MODEL = 'gemini-live-2.5-flash-preview';
+const CITY: JSONSchema = {
+  type: 'object',
+  properties: { city: { type: 'string' } },
+  required: ['city'],
+};
+
+async function openSession(options: Partial<RealtimeSessionOptions> = {}): Promise<{
+  session: ReturnType<typeof createRealtimeSession>;
+  socket: FakeRealtimeSocket;
+  events: RealtimeEvent[];
+  sent: () => Record<string, unknown>[];
+}> {
+  const server = fakeRealtimeServer((socket) => geminiHandshake(socket));
+  const session = createRealtimeSession({
+    model: createGeminiLive({ apiKey: 'g-key' })(MODEL),
+    ...options,
+    deps: { webSocket: server.webSocket, ...options.deps },
+  });
+  const events: RealtimeEvent[] = [];
+  session.on('*', (event) => events.push(event));
+  await session.connect();
+  const socket = server.socket;
+  const baseline = socket.sent.length;
+  return { session, socket, events, sent: () => socket.messages.slice(baseline) };
+}
+
+const ofType = <T extends RealtimeEvent['type']>(events: RealtimeEvent[], type: T) =>
+  events.filter((event): event is Extract<RealtimeEvent, { type: T }> => event.type === type);
+
+const audioPart = (data: string) => ({
+  serverContent: {
+    modelTurn: {
+      role: 'model',
+      parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data } }],
+    },
+  },
+});
+
+describe('Gemini Live — connect', () => {
+  it('dials BidiGenerateContent with the key in a header and sends setup first', async () => {
+    const server = fakeRealtimeServer((socket) => geminiHandshake(socket, 'live-1'));
+    const session = createRealtimeSession({
+      model: createGeminiLive({ apiKey: 'g-key' })(MODEL),
+      instructions: 'Be brief.',
+      voice: 'Kore',
+      outputModality: 'audio',
+      inputTranscription: { language: 'tr-TR' },
+      outputTranscription: true,
+      maxOutputTokens: 256,
+      tools: { get_weather: tool({ description: 'Weather for a city', parameters: CITY }) },
+      providerOptions: { realtimeInputConfig: { activityHandling: 'NO_INTERRUPTION' } },
+      deps: { webSocket: server.webSocket },
+    });
+    const events: RealtimeEvent[] = [];
+    session.on('*', (event) => events.push(event));
+    await session.connect();
+
+    const socket = server.socket;
+    expect(socket.url).toBe(
+      'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent',
+    );
+    expect(socket.init.headers).toEqual({ 'x-goog-api-key': 'g-key' });
+    expect(socket.messages[0]).toEqual({
+      setup: {
+        model: `models/${MODEL}`,
+        generationConfig: {
+          responseModalities: ['AUDIO'],
+          maxOutputTokens: 256,
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
+        },
+        systemInstruction: { parts: [{ text: 'Be brief.' }] },
+        tools: [
+          {
+            functionDeclarations: [
+              {
+                name: 'get_weather',
+                description: 'Weather for a city',
+                parameters: {
+                  type: 'OBJECT',
+                  properties: { city: { type: 'STRING' } },
+                  propertyOrdering: ['city'],
+                  required: ['city'],
+                },
+              },
+            ],
+          },
+        ],
+        inputAudioTranscription: { languageCodes: ['tr-TR'] },
+        outputAudioTranscription: {},
+        realtimeInputConfig: { activityHandling: 'NO_INTERRUPTION' },
+      },
+    });
+    expect(session.sessionId).toBe('live-1');
+    expect(events).toEqual([{ type: 'session-ready', sessionId: 'live-1' }]);
+    expect(session.audioFormat.input).toMatchObject({ encoding: 'pcm16', sampleRate: 16000 });
+    expect(session.audioFormat.output).toMatchObject({ encoding: 'pcm16', sampleRate: 24000 });
+  });
+
+  it('can carry the key in the query string for sockets that cannot send headers', async () => {
+    const server = fakeRealtimeServer((socket) => geminiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createGeminiLive({ apiKey: 'g key/1', apiKeyLocation: 'query' })(MODEL),
+      deps: { webSocket: server.webSocket },
+    });
+    await session.connect();
+    expect(server.socket.url).toBe(
+      'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=g%20key%2F1',
+    );
+    expect(server.socket.init.headers).toBeUndefined();
+  });
+
+  it('uses the constrained v1alpha endpoint with an ephemeral auth token', async () => {
+    const server = fakeRealtimeServer((socket) => geminiHandshake(socket));
+    const session = createRealtimeSession({
+      model: createGeminiLive()(MODEL),
+      ephemeralToken: 'auth_tokens/abc123',
+      deps: { webSocket: server.webSocket },
+    });
+    await session.connect();
+    expect(server.socket.url).toBe(
+      'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token=auth_tokens%2Fabc123',
+    );
+    expect(server.socket.init.headers).toBeUndefined();
+    expect(server.socket.init.protocols ?? []).toEqual([]);
+  });
+
+  it('turns a close before setupComplete into a rejected connect carrying the close reason', async () => {
+    const server = fakeRealtimeServer((socket) => {
+      queueMicrotask(() => socket.accept());
+      socket.onClientMessage = (_message, self) =>
+        self.drop(1008, 'API key not valid. Please pass a valid API key.');
+    });
+    const session = createRealtimeSession({
+      model: createGeminiLive({ apiKey: 'bad' })(MODEL),
+      deps: { webSocket: server.webSocket },
+    });
+    const failure = await session.connect().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RealtimeError);
+    expect(failure).toMatchObject({ kind: 'closed', closeCode: 1008 });
+    expect((failure as Error).message).toContain('API key not valid');
+    expect(session.status).toBe('closed');
+  });
+});
+
+describe('Gemini Live — audio, transcripts and text', () => {
+  it('streams PCM16 input with its rate and plays back 24 kHz output deltas', async () => {
+    const { session, socket, events, sent } = await openSession({ inputSampleRate: 24000 });
+    session.appendAudio(new Uint8Array([1, 2, 3, 250]));
+    session.commitAudio();
+    expect(sent()).toEqual([
+      { realtimeInput: { audio: { data: 'AQID+g==', mimeType: 'audio/pcm;rate=24000' } } },
+      { realtimeInput: { audioStreamEnd: true } },
+    ]);
+
+    socket.push(audioPart('BAUG'));
+    socket.push(audioPart('Bwg='));
+    socket.push({ serverContent: { generationComplete: true } });
+    socket.push({ serverContent: { turnComplete: true } });
+    await flush();
+
+    const started = ofType(events, 'response-started');
+    expect(started).toHaveLength(1);
+    const responseId = started[0]!.responseId;
+    expect(typeof responseId).toBe('string');
+    expect(events.slice(1)).toEqual([
+      { type: 'input-audio-committed' },
+      { type: 'response-started', responseId },
+      { type: 'audio-delta', responseId, audio: new Uint8Array([4, 5, 6]) },
+      { type: 'audio-delta', responseId, audio: new Uint8Array([7, 8]) },
+      { type: 'audio-done', responseId },
+      { type: 'response-done', responseId, status: 'completed' },
+    ]);
+  });
+
+  it('brackets audio with activityStart/activityEnd when turn detection is manual', async () => {
+    const { session, socket, sent } = await openSession({ turnDetection: 'manual' });
+    expect((socket.messages[0]!.setup as Record<string, unknown>).realtimeInputConfig).toEqual({
+      automaticActivityDetection: { disabled: true },
+    });
+    const chunk = new Uint8Array([0, 0]);
+    session.appendAudio(chunk);
+    session.appendAudio(chunk);
+    session.commitAudio();
+    session.appendAudio(chunk);
+    const audio = { realtimeInput: { audio: { data: 'AAA=', mimeType: 'audio/pcm;rate=16000' } } };
+    expect(sent()).toEqual([
+      { realtimeInput: { activityStart: {} } },
+      audio,
+      audio,
+      { realtimeInput: { activityEnd: {} } },
+      { realtimeInput: { activityStart: {} } },
+      audio,
+    ]);
+  });
+
+  it('maps input/output transcription and text parts, flushing open transcripts at turn end', async () => {
+    const { socket, events } = await openSession();
+    socket.push({ serverContent: { inputTranscription: { text: 'Mer' } } });
+    socket.push({ serverContent: { inputTranscription: { text: 'haba', finished: true } } });
+    socket.push({ serverContent: { outputTranscription: { text: 'Hi ' } } });
+    socket.push({ serverContent: { outputTranscription: { text: 'there' } } });
+    socket.push({
+      serverContent: {
+        modelTurn: { parts: [{ text: 'planning…', thought: true }, { text: 'Hey' }] },
+      },
+    });
+    socket.push({ serverContent: { turnComplete: true } });
+    await flush();
+
+    const responseId = ofType(events, 'response-started')[0]!.responseId;
+    expect(events.slice(1)).toEqual([
+      { type: 'input-transcript-delta', delta: 'Mer' },
+      { type: 'input-transcript-delta', delta: 'haba' },
+      { type: 'input-transcript-done', transcript: 'Merhaba' },
+      { type: 'response-started', responseId },
+      { type: 'output-transcript-delta', responseId, delta: 'Hi ' },
+      { type: 'output-transcript-delta', responseId, delta: 'there' },
+      { type: 'text-delta', responseId, delta: 'Hey' },
+      { type: 'output-transcript-done', responseId, transcript: 'Hi there' },
+      { type: 'text-done', responseId, text: 'Hey' },
+      { type: 'response-done', responseId, status: 'completed' },
+    ]);
+  });
+
+  it('sends text as an ordered client turn', async () => {
+    const { session, sent } = await openSession();
+    session.sendText('Hello');
+    session.sendText('Context only', { respond: false });
+    session.createResponse();
+    expect(sent()).toEqual([
+      {
+        clientContent: {
+          turns: [{ role: 'user', parts: [{ text: 'Hello' }] }],
+          turnComplete: true,
+        },
+      },
+      {
+        clientContent: {
+          turns: [{ role: 'user', parts: [{ text: 'Context only' }] }],
+          turnComplete: false,
+        },
+      },
+      { clientContent: { turnComplete: true } },
+    ]);
+  });
+
+  it('decodes binary frames, including Blobs, without reordering them', async () => {
+    const { socket, events } = await openSession();
+    const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
+    socket.push(new Blob([encode({ serverContent: { outputTranscription: { text: 'one ' } } })]));
+    socket.push(encode({ serverContent: { outputTranscription: { text: 'two ' } } }).buffer);
+    socket.push({ serverContent: { outputTranscription: { text: 'three' } } });
+    await flush();
+    expect(ofType(events, 'output-transcript-delta').map((event) => event.delta)).toEqual([
+      'one ',
+      'two ',
+      'three',
+    ]);
+  });
+});
+
+describe('Gemini Live — tool calls', () => {
+  it('executes a toolCall and answers with a matching functionResponse', async () => {
+    const execute = vi.fn(async (args: unknown) => ({ ...(args as object), tempC: 21 }));
+    const { socket, events, sent } = await openSession({
+      tools: { get_weather: tool({ parameters: CITY, execute }) },
+    });
+    socket.push({
+      toolCall: { functionCalls: [{ id: 'fc_1', name: 'get_weather', args: { city: 'Paris' } }] },
+    });
+    await flush();
+
+    expect(execute.mock.calls[0]![0]).toEqual({ city: 'Paris' });
+    expect(sent()).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [
+            { id: 'fc_1', name: 'get_weather', response: { output: { city: 'Paris', tempC: 21 } } },
+          ],
+        },
+      },
+    ]);
+    // A function call is the model's turn: it opens a response like audio would.
+    const responseId = ofType(events, 'response-started')[0]!.responseId;
+    expect(ofType(events, 'tool-call')).toEqual([
+      {
+        type: 'tool-call',
+        toolCallId: 'fc_1',
+        toolName: 'get_weather',
+        args: { city: 'Paris' },
+        responseId,
+      },
+    ]);
+    expect(ofType(events, 'tool-result')).toEqual([
+      {
+        type: 'tool-result',
+        toolCallId: 'fc_1',
+        toolName: 'get_weather',
+        result: { city: 'Paris', tempC: 21 },
+      },
+    ]);
+  });
+
+  it('answers every call of a parallel batch in one toolResponse, errors under "error"', async () => {
+    const { socket, sent } = await openSession({
+      tools: {
+        get_weather: tool({ parameters: CITY, execute: async () => 'sunny' }),
+        broken: tool({
+          parameters: { type: 'object' },
+          execute: () => {
+            throw new Error('boom');
+          },
+        }),
+      },
+    });
+    socket.push({
+      toolCall: {
+        functionCalls: [
+          { id: 'a', name: 'get_weather', args: { city: 'Rome' } },
+          { id: 'b', name: 'broken', args: {} },
+        ],
+      },
+    });
+    await flush();
+    expect(sent()).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [
+            { id: 'a', name: 'get_weather', response: { output: 'sunny' } },
+            { id: 'b', name: 'broken', response: { error: 'boom' } },
+          ],
+        },
+      },
+    ]);
+  });
+
+  it('aborts a call the server cancels and never answers it', async () => {
+    let signal: AbortSignal | undefined;
+    let finish: (value: string) => void = () => {};
+    const { socket, events, sent } = await openSession({
+      tools: {
+        slow: tool({
+          parameters: { type: 'object' },
+          execute: (_args, ctx) => {
+            signal = ctx.signal;
+            return new Promise<string>((resolve) => (finish = resolve));
+          },
+        }),
+      },
+    });
+    socket.push({ toolCall: { functionCalls: [{ id: 'fc_2', name: 'slow', args: {} }] } });
+    await flush();
+    socket.push({ toolCallCancellation: { ids: ['fc_2'] } });
+    await flush();
+    expect(signal?.aborted).toBe(true);
+    finish('late');
+    await flush();
+    expect(sent()).toEqual([]);
+    expect(ofType(events, 'tool-call-cancelled')).toEqual([
+      { type: 'tool-call-cancelled', toolCallIds: ['fc_2'], reason: 'provider' },
+    ]);
+    expect(ofType(events, 'tool-result')).toEqual([]);
+  });
+
+  it('answers a result JSON cannot encode with an error and keeps its siblings', async () => {
+    const { session, socket, events, sent } = await openSession({
+      tools: {
+        get_row: tool({ parameters: { type: 'object' }, execute: async () => ({ id: 10n }) }),
+        get_weather: tool({ parameters: CITY, execute: async () => 'sunny' }),
+      },
+    });
+    socket.push({
+      toolCall: {
+        functionCalls: [
+          { id: 'a', name: 'get_row', args: {} },
+          { id: 'b', name: 'get_weather', args: { city: 'Rome' } },
+        ],
+      },
+    });
+    await flush();
+    expect(sent()).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [
+            {
+              id: 'a',
+              name: 'get_row',
+              response: { error: "The result of tool 'get_row' could not be JSON-encoded." },
+            },
+            { id: 'b', name: 'get_weather', response: { output: 'sunny' } },
+          ],
+        },
+      },
+    ]);
+    // The app hears it too: its tool broke the JSON contract.
+    const [error] = ofType(events, 'error');
+    expect(error).toMatchObject({ fatal: false, error: { kind: 'tool' } });
+    expect(error!.error.message).toContain("'get_row'");
+    expect(session.status).toBe('open');
+  });
+
+  it('answers a circular client-tool result with an error instead of dropping it', async () => {
+    const { session, socket, events, sent } = await openSession({
+      tools: { lookup: tool({ parameters: { type: 'object' } }) }, // a client tool
+    });
+    socket.push({ toolCall: { functionCalls: [{ id: 'c', name: 'lookup', args: {} }] } });
+    await flush();
+    const circular: Record<string, unknown> = { name: 'row' };
+    circular.self = circular;
+    session.sendToolResult('c', circular);
+    await flush();
+    expect(sent()).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [
+            {
+              id: 'c',
+              name: 'lookup',
+              response: { error: "The result of tool 'lookup' could not be JSON-encoded." },
+            },
+          ],
+        },
+      },
+    ]);
+    expect(ofType(events, 'error')).toHaveLength(1);
+  });
+});
+
+describe('Gemini Live — interruption, lifecycle and errors', () => {
+  it('surfaces barge-in and ends the turn as cancelled', async () => {
+    const { session, socket, events, sent } = await openSession();
+    socket.push(audioPart('AAA='));
+    socket.push({ serverContent: { interrupted: true } });
+    socket.push({ serverContent: { turnComplete: true } });
+    await flush();
+    const responseId = ofType(events, 'response-started')[0]!.responseId;
+    expect(events.slice(2)).toEqual([
+      { type: 'audio-delta', responseId, audio: new Uint8Array([0, 0]) },
+      { type: 'interrupted', responseId },
+      { type: 'audio-done', responseId },
+      { type: 'response-done', responseId, status: 'cancelled', reason: 'interrupted' },
+    ]);
+
+    // Gemini Live has no client-side cancel: interrupt() warns and sends nothing.
+    session.interrupt();
+    await flush();
+    expect(sent()).toEqual([]);
+    expect(ofType(events, 'warning')[0]!.warning).toMatchObject({
+      type: 'unsupported-setting',
+      setting: 'interrupt',
+    });
+  });
+
+  it('maps voice activity, goAway and session resumption updates', async () => {
+    const { socket, events } = await openSession();
+    socket.push({ voiceActivity: { voiceActivityType: 'ACTIVITY_START' } });
+    socket.push({ voiceActivity: { voiceActivityType: 'ACTIVITY_END' } });
+    socket.push({ goAway: { timeLeft: '9.5s' } });
+    socket.push({ sessionResumptionUpdate: { newHandle: 'h-1', resumable: true } });
+    await flush();
+    expect(events.slice(1)).toEqual([
+      { type: 'speech-started' },
+      { type: 'speech-stopped' },
+      { type: 'go-away', timeLeftMs: 9500 },
+      { type: 'session-resumption', handle: 'h-1', resumable: true },
+    ]);
+  });
+
+  it('reports an abnormal close after setup as a fatal error', async () => {
+    const { session, socket, events } = await openSession();
+    socket.drop(1011, 'Internal error encountered.');
+    await flush();
+    expect(events.slice(1)).toEqual([
+      {
+        type: 'error',
+        fatal: true,
+        error: expect.objectContaining({ kind: 'closed', closeCode: 1011 }),
+      },
+      {
+        type: 'session-closed',
+        code: 1011,
+        reason: 'Internal error encountered.',
+        initiator: 'server',
+      },
+    ]);
+    expect(session.status).toBe('closed');
+  });
+});
+
+describe('Gemini Live — usage and pricing', () => {
+  const usageMetadata = {
+    promptTokenCount: 1000,
+    promptTokensDetails: [
+      { modality: 'TEXT', tokenCount: 100 },
+      { modality: 'AUDIO', tokenCount: 900 },
+    ],
+    responseTokenCount: 600,
+    responseTokensDetails: [
+      { modality: 'AUDIO', tokenCount: 500 },
+      { modality: 'TEXT', tokenCount: 100 },
+    ],
+    thoughtsTokenCount: 50,
+    totalTokenCount: 1650,
+  };
+  const priceProvider = createPriceProvider({
+    table: realtimePriceTable({
+      [MODEL]: { text: { input: 0.5, output: 2 }, audio: { input: 3, output: 12 } },
+    }),
+  });
+
+  it('commits the last usageMetadata of a turn once, priced by modality', async () => {
+    const { session, socket, events } = await openSession({ deps: { priceProvider } });
+    socket.push(audioPart('AAA='));
+    // An early, partial report in the same turn must not be double counted.
+    socket.push({ usageMetadata: { promptTokenCount: 10, totalTokenCount: 10 } });
+    socket.push({ serverContent: { turnComplete: true }, usageMetadata });
+    await flush();
+
+    const usage = ofType(events, 'usage');
+    expect(usage).toHaveLength(1);
+    expect(usage[0]).toMatchObject({
+      tokens: {
+        text: { input: 100, cachedInput: 0, output: 150 },
+        audio: { input: 900, cachedInput: 0, output: 500 },
+        image: { input: 0, cachedInput: 0, output: 0 },
+      },
+      usage: {
+        inputTokens: 1000,
+        outputTokens: 650,
+        reasoningTokens: 50,
+        cachedReadTokens: 0,
+        audioTokens: 1400,
+        totalTokens: 1650,
+      },
+      // 100×0.5 + 150×2 (text, thoughts bill as output) + 900×3 + 500×12 (audio), per 1M.
+      costUsd: 0.00905,
+    });
+    expect(usage[0]!.responseId).toBe(ofType(events, 'response-started')[0]!.responseId);
+    expect(session.usage.costUsd).toBe(0.00905);
+  });
+
+  it('still counts usage that arrives after the turn completed', async () => {
+    const { socket, events } = await openSession({ deps: { priceProvider } });
+    socket.push(audioPart('AAA='));
+    socket.push({ serverContent: { turnComplete: true } });
+    socket.push({ usageMetadata });
+    await flush();
+    expect(ofType(events, 'usage')).toHaveLength(1);
+    expect(ofType(events, 'usage')[0]!.costUsd).toBe(0.00905);
+    // As the docs' event table says: after its response-done, with the same responseId.
+    const types = events.map((event) => event.type);
+    expect(types.indexOf('usage')).toBeGreaterThan(types.indexOf('response-done'));
+    expect(ofType(events, 'usage')[0]!.responseId).toBe(
+      ofType(events, 'response-done')[0]!.responseId,
+    );
+  });
+
+  it('attributes cached and unspecified-modality tokens without losing any', async () => {
+    const { socket, events } = await openSession();
+    socket.push({
+      usageMetadata: {
+        promptTokenCount: 500,
+        promptTokensDetails: [{ modality: 'AUDIO', tokenCount: 300 }],
+        cachedContentTokenCount: 120,
+        cacheTokensDetails: [{ modality: 'AUDIO', tokenCount: 100 }],
+        responseTokenCount: 40,
+        toolUsePromptTokenCount: 30,
+        totalTokenCount: 570,
+      },
+    });
+    socket.push({ serverContent: { turnComplete: true } });
+    await flush();
+    const [usage] = ofType(events, 'usage');
+    // 200 unlabelled prompt tokens + 30 tool-result tokens are text; 20 of the 120
+    // cached tokens carry no modality, so they are text too.
+    expect(usage!.tokens.text).toEqual({ input: 210, cachedInput: 20, output: 40 });
+    expect(usage!.tokens.audio).toEqual({ input: 200, cachedInput: 100, output: 0 });
+    expect(usage!.usage).toMatchObject({
+      inputTokens: 410,
+      cachedReadTokens: 120,
+      outputTokens: 40,
+    });
+    expect(usage!.costUsd).toBeUndefined();
+  });
+});
+
+describe('Gemini Live — configuration and edge cases', () => {
+  it('asks for text output, and warns about settings Gemini Live cannot carry', async () => {
+    const { socket, events } = await openSession({
+      outputModality: 'text',
+      toolChoice: 'required',
+      inputTranscription: { model: 'whisper-1', language: 'en-US' },
+    });
+    const setup = socket.messages[0]!.setup as Record<string, unknown>;
+    expect(setup.generationConfig).toEqual({ responseModalities: ['TEXT'] });
+    expect(setup.inputAudioTranscription).toEqual({ languageCodes: ['en-US'] });
+    expect(setup).not.toHaveProperty('toolConfig');
+    expect(ofType(events, 'warning').map((event) => event.warning.setting)).toEqual([
+      'toolChoice',
+      'inputTranscription',
+    ]);
+  });
+
+  it('flushes an unfinished input transcript at turn end and reports a blocked turn as incomplete', async () => {
+    const { socket, events } = await openSession();
+    socket.push({ serverContent: { inputTranscription: { text: 'Merhaba' } } });
+    socket.push(audioPart('AAA='));
+    socket.push({
+      serverContent: { turnComplete: true, turnCompleteReason: 'PROHIBITED_INPUT_CONTENT' },
+    });
+    await flush();
+    const responseId = ofType(events, 'response-started')[0]!.responseId;
+    expect(events.slice(1)).toEqual([
+      { type: 'input-transcript-delta', delta: 'Merhaba' },
+      { type: 'response-started', responseId },
+      { type: 'audio-delta', responseId, audio: new Uint8Array([0, 0]) },
+      { type: 'input-transcript-done', transcript: 'Merhaba' },
+      { type: 'audio-done', responseId },
+      {
+        type: 'response-done',
+        responseId,
+        status: 'incomplete',
+        reason: 'PROHIBITED_INPUT_CONTENT',
+      },
+    ]);
+  });
+
+  it('emits a finished output transcript once', async () => {
+    const { socket, events } = await openSession();
+    socket.push({ serverContent: { outputTranscription: { text: 'Hi', finished: true } } });
+    socket.push({ serverContent: { turnComplete: true } });
+    await flush();
+    expect(events.slice(1).map((event) => event.type)).toEqual([
+      'response-started',
+      'output-transcript-delta',
+      'output-transcript-done',
+      'response-done',
+    ]);
+  });
+
+  it('answers a call that came without an id by name only', async () => {
+    let ids = 0;
+    const { socket, events, sent } = await openSession({
+      tools: { get_weather: tool({ parameters: CITY, execute: async () => 'cold' }) },
+      deps: { generateId: () => `gen_${++ids}` },
+    });
+    socket.push({
+      toolCall: { functionCalls: [{ name: 'get_weather', args: { city: 'Oslo' } }] },
+    });
+    await flush();
+    expect(sent()).toEqual([
+      {
+        toolResponse: {
+          functionResponses: [{ name: 'get_weather', response: { output: 'cold' } }],
+        },
+      },
+    ]);
+    expect(ofType(events, 'tool-call')[0]!.toolCallId).toMatch(/^gen_/);
+  });
+
+  it('sends nothing for a manual commit without speech', async () => {
+    const { session, events, sent } = await openSession({ turnDetection: 'manual' });
+    session.commitAudio();
+    expect(sent()).toEqual([]);
+    expect(ofType(events, 'input-audio-committed')).toEqual([]);
+  });
+
+  it('reports a barge-in once per turn even when the flag repeats', async () => {
+    const { socket, events } = await openSession();
+    socket.push(audioPart('AAA='));
+    socket.push({ serverContent: { interrupted: true } });
+    socket.push({ serverContent: { interrupted: true } });
+    socket.push({ serverContent: { turnComplete: true } });
+    await flush();
+    expect(ofType(events, 'interrupted')).toHaveLength(1);
+  });
+
+  it('reports a barge-in that arrives with no open turn', async () => {
+    const { socket, events } = await openSession();
+    socket.push({ serverContent: { interrupted: true } });
+    await flush();
+    expect(events.slice(1)).toEqual([{ type: 'interrupted' }]);
+  });
+});
+
+describe('Gemini Live — output transcript chunks after turnComplete', () => {
+  // The output transcription is not ordered with the model turn (LiveServerContent
+  // docs in @google/genai): a chunk can follow the turnComplete of its turn.
+  const transcript = (text: string, finished?: boolean) => ({
+    serverContent: { outputTranscription: { text, ...(finished ? { finished } : {}) } },
+  });
+  const turnComplete = { serverContent: { turnComplete: true } };
+  const deterministic = () => {
+    let ids = 0;
+    return { generateId: () => `turn_${++ids}` };
+  };
+  const shape = (events: RealtimeEvent[]) =>
+    events.slice(1).map((event) => {
+      const { type, responseId, delta, transcript } = event as Record<string, unknown>;
+      return [type, responseId, delta ?? transcript].filter((part) => part !== undefined);
+    });
+
+  it('belongs to the turn that just ended and opens no new turn', async () => {
+    const { socket, events } = await openSession({ deps: deterministic() });
+    socket.push(audioPart('AAA='));
+    socket.push(transcript('Hello'));
+    socket.push(turnComplete);
+    socket.push(transcript(' there.'));
+    socket.push(audioPart('AAA='));
+    socket.push(transcript('Bye.'));
+    socket.push(turnComplete);
+    await flush();
+    expect(shape(events)).toEqual([
+      ['response-started', 'turn_1'],
+      ['audio-delta', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', 'Hello'],
+      ['audio-done', 'turn_1'],
+      ['output-transcript-done', 'turn_1', 'Hello'],
+      ['response-done', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', ' there.'],
+      // The whole transcript once the next turn starts.
+      ['output-transcript-done', 'turn_1', 'Hello there.'],
+      ['response-started', 'turn_2'],
+      ['audio-delta', 'turn_2'],
+      ['output-transcript-delta', 'turn_2', 'Bye.'],
+      ['audio-done', 'turn_2'],
+      ['output-transcript-done', 'turn_2', 'Bye.'],
+      ['response-done', 'turn_2'],
+    ]);
+  });
+
+  it('does not lose the usage report of the ended turn that follows a late chunk', async () => {
+    const { session, socket, events } = await openSession({ deps: deterministic() });
+    const usage = (total: number) => ({
+      promptTokenCount: total - 10,
+      responseTokenCount: 10,
+      totalTokenCount: total,
+    });
+    socket.push(audioPart('AAA='));
+    socket.push(turnComplete);
+    socket.push(transcript('tail'));
+    socket.push({ usageMetadata: usage(150) }); // the first turn's report, after turnComplete
+    socket.push(audioPart('AAA='));
+    socket.push({ ...turnComplete, usageMetadata: usage(260) });
+    await flush();
+    expect(session.usage.usage.totalTokens).toBe(410);
+    expect(
+      ofType(events, 'usage').map((event) => [event.responseId, event.usage.totalTokens]),
+    ).toEqual([
+      ['turn_1', 150],
+      ['turn_2', 260],
+    ]);
+    expect(ofType(events, 'response-started')).toHaveLength(2);
+  });
+
+  it('closes the late transcript on finished; a chunk after that starts a new turn', async () => {
+    const { socket, events } = await openSession({ deps: deterministic() });
+    socket.push(audioPart('AAA='));
+    socket.push(transcript('Hi'));
+    socket.push(turnComplete);
+    socket.push(transcript(' there', true));
+    socket.push(transcript('Next'));
+    await flush();
+    expect(shape(events).slice(-5)).toEqual([
+      ['response-done', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', ' there'],
+      ['output-transcript-done', 'turn_1', 'Hi there'],
+      ['response-started', 'turn_2'],
+      ['output-transcript-delta', 'turn_2', 'Next'],
+    ]);
+  });
+
+  it('ends a transcript that arrived wholly after turnComplete, at the latest on close', async () => {
+    const { session, socket, events } = await openSession({ deps: deterministic() });
+    socket.push(audioPart('AAA='));
+    socket.push(turnComplete);
+    socket.push(transcript('Sure.'));
+    await flush();
+    await session.close();
+    expect(shape(events).slice(-4)).toEqual([
+      ['response-done', 'turn_1'],
+      ['output-transcript-delta', 'turn_1', 'Sure.'],
+      ['output-transcript-done', 'turn_1', 'Sure.'],
+      ['session-closed'],
+    ]);
+  });
+});
+
+describe('Gemini Live — usage reports across turn boundaries', () => {
+  const report = (prompt: number, response: number) => ({
+    promptTokenCount: prompt,
+    promptTokensDetails: [{ modality: 'AUDIO', tokenCount: prompt }],
+    responseTokenCount: response,
+    responseTokensDetails: [{ modality: 'AUDIO', tokenCount: response }],
+    totalTokenCount: prompt + response,
+  });
+
+  it('commits only the growth of a report that follows a committed one', async () => {
+    const { session, socket, events } = await openSession();
+    socket.push(audioPart('AAA='));
+    socket.push({ serverContent: { turnComplete: true }, usageMetadata: report(100, 40) });
+    socket.push({ usageMetadata: report(100, 60) });
+    socket.push({ usageMetadata: report(100, 60) });
+    await flush();
+    expect(ofType(events, 'usage').map((event) => event.tokens.audio)).toEqual([
+      { input: 100, cachedInput: 0, output: 40 },
+      { input: 0, cachedInput: 0, output: 20 },
+    ]);
+    expect(session.usage.tokens.audio).toEqual({ input: 100, cachedInput: 0, output: 60 });
+  });
+
+  it('still bills the report of a turn that the close cut short', async () => {
+    const onUsage = vi.fn();
+    const { session, socket, events } = await openSession({ deps: { onUsage } });
+    socket.push(audioPart('AAA='));
+    socket.push({ usageMetadata: report(80, 10) });
+    await flush();
+    expect(ofType(events, 'usage')).toEqual([]);
+
+    await session.close();
+    const types = events.map((event) => event.type);
+    expect(types.slice(-2)).toEqual(['usage', 'session-closed']);
+    expect(onUsage.mock.calls[0]![1]).toEqual({ model: MODEL, reason: 'aborted' });
+  });
+});

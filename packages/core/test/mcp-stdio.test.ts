@@ -15,7 +15,7 @@ import { describe, it, expect, beforeAll, afterEach, afterAll, vi } from 'vitest
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createStdioMcpClient, type McpClient } from '../src/mcp/stdio';
+import { createStdioMcpClient, type McpClient, type McpSdkLine } from '../src/mcp/stdio';
 
 /**
  * A minimal MCP stdio server: newline-delimited JSON-RPC on stdin/stdout (the
@@ -133,7 +133,12 @@ beforeAll(async () => {
   // billed to whichever test happens to run first.
   await import('@modelcontextprotocol/sdk/client/index.js');
   await import('@modelcontextprotocol/sdk/client/stdio.js');
+  await import('@modelcontextprotocol/client');
+  await import('@modelcontextprotocol/client/stdio');
 }, 60_000);
+
+/** Both SDK lines (2.3): the real-child suite runs once per line. */
+const SDK_LINES: McpSdkLine[] = ['v1', 'v2'];
 
 afterEach(async () => {
   while (spawned.length > 0) {
@@ -152,9 +157,11 @@ afterAll(async () => {
 
 /** Connect to the fixture server; the client is auto-closed in afterEach. */
 async function connect(
+  sdk: McpSdkLine,
   over: Partial<Parameters<typeof createStdioMcpClient>[0]> = {},
 ): Promise<McpClient> {
   const client = await createStdioMcpClient({
+    sdk,
     command: process.execPath,
     args: [serverPath],
     ...over,
@@ -163,9 +170,9 @@ async function connect(
   return client;
 }
 
-describe('createStdioMcpClient — real spawned stdio server', () => {
+describe.each(SDK_LINES)('createStdioMcpClient — real spawned stdio server [%s SDK]', (sdk) => {
   it('listTools() returns a canonical ToolSet: JSON Schema parameters, outputSchema as metadata', async () => {
-    const client = await connect();
+    const client = await connect(sdk);
     const tools = await client.listTools();
 
     expect(Object.keys(tools)).toEqual(['echo', 'weather', 'boom', 'handshake', 'readEnv']);
@@ -189,7 +196,7 @@ describe('createStdioMcpClient — real spawned stdio server', () => {
   });
 
   it('execute() round-trips through the child: text, structuredContent, and is_error self-heal', async () => {
-    const client = await connect();
+    const client = await connect(sdk);
     const tools = await client.listTools();
     const ctx = { toolCallId: 'call_1', messages: [] };
 
@@ -202,7 +209,7 @@ describe('createStdioMcpClient — real spawned stdio server', () => {
   });
 
   it('namespaces tool names when combining servers', async () => {
-    const client = await connect();
+    const client = await connect(sdk);
     const tools = await client.listTools('fixture');
     expect(Object.keys(tools)).toEqual([
       'fixture_echo',
@@ -218,13 +225,13 @@ describe('createStdioMcpClient — real spawned stdio server', () => {
   });
 
   it('callTool() reaches the server directly and rejects on an unknown tool', async () => {
-    const client = await connect();
+    const client = await connect(sdk);
     expect(await client.callTool('echo', { value: 'direct' })).toBe('echo:direct');
     await expect(client.callTool('nope', {})).rejects.toThrow(/unknown tool nope/);
   });
 
   it('sends the default clientInfo and NO elicitation capability without a handler', async () => {
-    const client = await connect();
+    const client = await connect(sdk);
     const raw = (await client.callTool('handshake', {})) as string;
     const handshake = JSON.parse(raw) as {
       clientInfo: { name: string; version: string };
@@ -236,7 +243,7 @@ describe('createStdioMcpClient — real spawned stdio server', () => {
   });
 
   it('forwards name/version and declares elicitation when a handler is passed', async () => {
-    const client = await connect({
+    const client = await connect(sdk, {
       name: 'deuz-test',
       version: '1.9.0',
       onElicitationRequest: () => ({ action: 'decline' }),
@@ -250,14 +257,14 @@ describe('createStdioMcpClient — real spawned stdio server', () => {
   });
 
   it('forwards env to the child process', async () => {
-    const withEnv = await connect({ env: { DEUZ_FIXTURE_TOKEN: 'fixture-token-42' } });
+    const withEnv = await connect(sdk, { env: { DEUZ_FIXTURE_TOKEN: 'fixture-token-42' } });
     expect(await withEnv.callTool('readEnv', {})).toBe('token:fixture-token-42');
-    const withoutEnv = await connect();
+    const withoutEnv = await connect(sdk);
     expect(await withoutEnv.callTool('readEnv', {})).toBe('token:unset');
   });
 
   it('close() tears the child down; later calls reject instead of hanging', async () => {
-    const client = await connect();
+    const client = await connect(sdk);
     await client.listTools();
     await client.close();
     await expect(client.callTool('echo', { value: 'x' })).rejects.toThrow();
@@ -271,20 +278,32 @@ describe('createStdioMcpClient — real spawned stdio server', () => {
 });
 
 describe('createStdioMcpClient — optional peer missing', () => {
+  const notInstalled = (name: string) => (): never => {
+    throw new Error(`Cannot find module '${name}'`);
+  };
+
   afterEach(() => {
     vi.doUnmock('@modelcontextprotocol/sdk/client/index.js');
     vi.doUnmock('@modelcontextprotocol/sdk/client/stdio.js');
+    vi.doUnmock('@modelcontextprotocol/client');
+    vi.doUnmock('@modelcontextprotocol/client/stdio');
     vi.resetModules();
   });
 
-  it('raises the actionable install error (InvalidRequestError) when the SDK is absent', async () => {
-    const notInstalled = (): never => {
-      throw new Error("Cannot find module '@modelcontextprotocol/sdk'");
-    };
-    // The peer is imported lazily through a variable specifier, so mock both
-    // entry points and re-import the module under the mock registry.
-    vi.doMock('@modelcontextprotocol/sdk/client/index.js', notInstalled);
-    vi.doMock('@modelcontextprotocol/sdk/client/stdio.js', notInstalled);
+  it('raises the actionable install error (InvalidRequestError) when no SDK is installed', async () => {
+    // The peers are imported lazily through variable specifiers, so mock every
+    // entry point of BOTH lines (2.3: `auto` would otherwise pick the one left)
+    // and re-import the module under the mock registry.
+    vi.doMock(
+      '@modelcontextprotocol/sdk/client/index.js',
+      notInstalled('@modelcontextprotocol/sdk'),
+    );
+    vi.doMock(
+      '@modelcontextprotocol/sdk/client/stdio.js',
+      notInstalled('@modelcontextprotocol/sdk'),
+    );
+    vi.doMock('@modelcontextprotocol/client', notInstalled('@modelcontextprotocol/client'));
+    vi.doMock('@modelcontextprotocol/client/stdio', notInstalled('@modelcontextprotocol/client'));
     vi.resetModules();
     const { createStdioMcpClient: fresh } = await import('../src/mcp/stdio');
 
@@ -292,9 +311,21 @@ describe('createStdioMcpClient — optional peer missing', () => {
     // — a bogus command proves that (and fails loudly if the mock misses).
     const promise = fresh({ command: 'never-spawned' });
     await expect(promise).rejects.toThrow(/npm i @modelcontextprotocol\/sdk/);
+    await expect(promise).rejects.toThrow(/npm i @modelcontextprotocol\/client/);
     await expect(promise).rejects.toMatchObject({
       name: 'InvalidRequestError',
       code: 'invalid_request',
     });
+  });
+
+  it("names the v2 package when sdk: 'v2' is pinned without it — and spawns nothing", async () => {
+    vi.doMock('@modelcontextprotocol/client', notInstalled('@modelcontextprotocol/client'));
+    vi.doMock('@modelcontextprotocol/client/stdio', notInstalled('@modelcontextprotocol/client'));
+    vi.resetModules();
+    const { createStdioMcpClient: fresh } = await import('../src/mcp/stdio');
+
+    const promise = fresh({ command: 'never-spawned', sdk: 'v2' });
+    await expect(promise).rejects.toThrow(/npm i @modelcontextprotocol\/client/);
+    await expect(promise).rejects.toMatchObject({ name: 'InvalidRequestError' });
   });
 });

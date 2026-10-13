@@ -98,6 +98,7 @@ export {
   streamAgent,
   resumeAgent,
   resumeStreamAgent,
+  reconcileAgentRun,
   createInMemoryAgentRunStore,
 } from './agent-run';
 export type * from './types/agent-run';

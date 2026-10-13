@@ -1,6 +1,6 @@
 ---
 title: Budgets
-description: Persistent token and USD budgets per user, thread or organisation, shared by every run and process, with rolling windows and warnings.
+description: Persistent token and USD budgets per user, thread or organisation, shared by every run and process, with rolling windows, warnings, hold recovery and retention.
 ---
 
 An execution context's ledger bounds one run. A `BudgetStore` bounds usage that
@@ -51,20 +51,174 @@ ledger's queue:
    denial in one scope charges nothing to the others.
 
 Settlement and release are mirrored to the store. When the provider reports no
-usage, the store keeps the full estimate held. When the tokens are known but no
-price is, a call reserved with a USD estimate keeps its full hold too, because
-its cost is still unknown; a call reserved without one settles its tokens at
-once. Give native runs a `priceProvider` when a scope bounds USD, or every call
-keeps its estimate.
+usage, the store keeps the full estimate held. When the tokens are known but the
+model has no price (see [Models without a price](#models-without-a-price)), the
+tokens settle at once: a call reserved with a USD estimate settles that estimate
+as its charge, and a call reserved without one holds no USD. A price lookup that
+throws is an outage, not a missing price, so that call keeps its full hold.
 
 Every request is idempotent by its request ID. Repeating an identical
 reservation returns the recorded outcome, a denial included; repeating it with
 different amounts throws.
 
-A persistent scope that bounds a dimension needs an estimate for it. A context
-with a USD scope but no USD estimate fails closed with `missing_reservation`.
-When the store itself fails, the attempt fails with `admission_failed` and
-nothing changes locally.
+A persistent scope that bounds a dimension needs an estimate for it. A call
+whose USD estimate is missing because its model has no price follows the
+budget's `unknownPrice` policy; any other missing estimate fails closed with
+`missing_reservation`. When the store itself fails, the attempt fails with
+`admission_failed` and nothing changes locally.
+
+### What a reservation holds
+
+Before each attempt, a native request reserves its worst case: the prompt,
+estimated from its characters, plus the output cap the request actually sends.
+That cap is `maxOutputTokens` or, without it, the model's `maxOutput` from the
+registry (128 000 tokens for several current models). Anthropic raises it to the
+thinking budget plus 1 024 while extended thinking runs, even over an explicit
+`maxOutputTokens`. Reasoning tokens are part of the output, so the cap covers
+them. A prompt the call caches with `promptCaching` is priced at the cache-write
+rate on Anthropic, the only wire that writes a cache. The other wires bill it as
+input, so it is priced as input there, long-context tiers included.
+
+Some rows document no output limit: a model the registry does not know, and
+models whose limit is not published, such as `gpt-6-astra`, `gpt-5.6` and
+`gpt-5-pro`. OpenAI Chat Completions, OpenAI Responses and Gemini native then
+leave the cap off, and the provider's own default applies. When a token or USD
+bound applies to the call, in the context's budget or in a persistent scope's
+limits, the request sends the row's placeholder, 4 096 tokens, as
+`maxOutputTokens` instead and reserves exactly that, so the reservation still
+bounds what the provider can bill. The run reports it once as a
+`clamped-setting` warning on `maxOutputTokens`; pass `maxOutputTokens` to raise
+the cap. A call with no token or USD bound keeps the cap off.
+
+The ledger therefore admits on estimates; it is not a limit the provider
+enforces. The prompt estimate can be low, and an actual overage is still
+recorded and blocks later admission.
+
+Set `maxOutputTokens` when a USD budget is small. Without it, one call to a
+large-output model can reserve more than the whole budget and is refused with
+`budget_exceeded` before it is sent. 2.2 reserved 4 096 output tokens instead,
+which let parallel calls spend past the budget.
+
+## Models without a price
+
+A model has no price when no `deps.priceProvider` is configured, or when the
+provider returns `undefined` for it, for example a model released after your
+price table. Under the USD budget of an execution context (`runAgent`, swarms,
+`evolve`, or an `execution` passed to `generateText` and `streamChat`), such a
+call runs by default:
+
+- its tokens are still reserved and bounded, and the tokens it used are
+  recorded. Once the call reports its usage, its ledger entry ends in state
+  `'unknown'`, not `'settled'`: the tokens are known (`actual.tokens`), the
+  dollars are not (`actual.usd` stays undefined);
+- its cost is left out of every USD total, so `spent.usd` counts the priced
+  calls only. The ledger's totals count the unpriced calls in `unpriced`
+  (`accounting.unpriced` on a run's result), and they also stay in
+  `unknownUsd` because their cost is unknown;
+- each leg of a run reports one `unpriced-model` warning per model through
+  `deps.logger`, and an agentic loop also on its result's `warnings` and as a
+  `warning` part on its stream. A resumed run is a new leg, so it reports the
+  warning again. Runs that share an execution context each report it; a swarm
+  or `evolve` run reports it once for all its tasks in each leg.
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+// This table knows one model; the mock model is not in it.
+const priceProvider = {
+  priceUsage: (model: string) => (model === 'gpt-5.4' ? 0.01 : undefined),
+};
+
+const run = await runAgent({
+  model: createMockModel({ responses: [{ text: 'done' }] }),
+  prompt: 'Summarise the ticket.',
+  budget: { usd: 1 },
+  deps: { priceProvider },
+});
+console.log(run.status); // 'completed'
+console.log(run.accounting?.unpriced); // 1: a call the USD budget could not count
+```
+
+Set `unknownPrice: 'reject'` to refuse unpriced models instead. The call fails
+before it is sent, with a `BudgetLedgerError` whose code is `unpriced_model`:
+
+```ts
+import { createExecutionContext, runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const execution = createExecutionContext({ budget: { usd: 1, unknownPrice: 'reject' } });
+const run = await runAgent({
+  model: createMockModel({ responses: [{ text: 'done' }] }),
+  prompt: 'Summarise the ticket.',
+  execution,
+  deps: { priceProvider: { priceUsage: () => undefined } },
+});
+if (run.status === 'failed') console.log(run.error.code); // 'unpriced_model'
+```
+
+The policy lives on the budget, so it applies wherever a budget does: an
+execution context and its children, `runAgent`, swarm, task and reducer budgets,
+`evolve`, and persistent scope limits such as
+`{ key: 'org:7', limits: { usd: 50, unknownPrice: 'reject' } }`. Budgets
+intersect, and `'reject'` always wins: a child, task or restored budget can
+tighten the policy but never loosen it. A persistent scope refuses an unpriced
+call when its own limits or any budget of the run say `'reject'`. Without a USD
+bound the policy has nothing to protect, so it neither warns nor refuses.
+
+A price lookup that throws is an outage, not a missing price: under a USD bound
+that call still fails closed with `missing_reservation`, as in 2.2.
+
+The agentic loop of `generateText` and `streamChat` without an execution context
+counts the same way for its `budget.usd` stop: calls to an unpriced model add
+nothing to the cost, so the priced calls still stop the loop. In 2.2 a single
+unpriced call switched that stop off for the rest of the run. Its `budget`
+applies the same policy to every model the loop calls: a compaction summary's
+`summarizeModel` and an `agentTool` sub-agent's model are checked before they
+are called, too. Under `'reject'` the run fails with an `UnpricedModelError`,
+whose code is also `unpriced_model`. A call whose usage the provider did not
+report is different: its cost is unknown, not zero, so from then on
+`budget.usd` waits instead of stopping the loop, as after a price lookup that
+fails (see [the budget guardrail](/docs/modules/pricing#the-budget-guardrail)).
+
+## When a settlement fails
+
+A billed attempt is settled after the call, and a refused one is released.
+Both are idempotent in the store, so the ledger tries a failing settlement or
+release three times. When the store stays down, the call fails with
+`admission_failed` as before, and nothing changed locally: the hold stays at its
+estimate, which is the safe direction. A store that answers with a
+`reservation_conflict` has already closed the hold, usually through a
+[sweep](#open-holds): that is not a failure, so it is neither retried nor
+reported, and the local entry closes. The error now names the attempt in
+`error.requestId`, and for a settlement `error.settlement` replays it exactly.
+Settle it once the store answers again, in the same ledger or in one restored
+from its durable snapshot:
+
+```ts
+import { BudgetLedgerError } from '@deuz-sdk/core/agent';
+import type { NativeExecutionContext } from '@deuz-sdk/core/agent';
+
+export async function settleLater(
+  error: unknown,
+  execution: NativeExecutionContext,
+): Promise<void> {
+  if (!(error instanceof BudgetLedgerError) || !error.settlement) throw error;
+  await execution.ledger.settle(error.settlement);
+}
+```
+
+The native request forgets an attempt's request ID only after the ledger
+accepted its settlement. A settlement that still fails after the ledger's three
+attempts gets one more round of three before the call fails, and when that
+round closes the hold, the call completes normally.
+
+A process that dies between a call and its settlement leaves the same kind of
+hold: its request ID is a `reserved` entry in the last persisted ledger snapshot.
+Restore the context from that snapshot with its store, then settle the request,
+or release it when the call was never billed. A replay that a sweep has
+overtaken closes the entry the same way, and the store keeps what the sweep
+billed.
 
 ## Scopes and rolling windows
 
@@ -96,9 +250,9 @@ const execution = createExecutionContext({
 
 A hold is charged to the bucket of its reservation time. A hold leaked by a crash
 therefore leaves a windowed budget with its bucket. In a lifetime budget it stays
-charged; that is the fail-closed outcome, not a leak to repair automatically. A
-settlement that arrives after its bucket left the window updates history but not
-the current window.
+charged, the fail-closed outcome, until you close it: see
+[Open holds](#open-holds). A settlement that arrives after its bucket left the
+window updates history but not the current window.
 
 ## Warnings
 
@@ -179,31 +333,141 @@ await handle.result;
 
 ## Durable stores
 
-The in-memory store is for tests and single-process deployments. Two durable
+The in-memory store is for tests and single-process deployments. Three durable
 stores implement the same contract and pass the same conformance suite:
 
 ```ts
 import { createSqliteBudgetStore } from '@deuz-sdk/core/ops/sqlite';
 import { createPostgresBudgetStore } from '@deuz-sdk/core/ops/postgres';
+import { createRedisBudgetStore } from '@deuz-sdk/core/ops/redis';
 import pg from 'pg';
+import { createClient } from 'redis';
 
 // Processes on one machine: one database file, BEGIN IMMEDIATE per change.
 const local = createSqliteBudgetStore({ path: './budgets.sqlite' });
 
 // Many machines: every admission is one statement that locks the scope rows.
 const shared = createPostgresBudgetStore({ client: new pg.Pool(), schema: 'public' });
+
+// Many machines on Redis 7+: every admission is one Lua script (2.3).
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+const onRedis = createRedisBudgetStore({ client: redis });
 ```
 
 - **SQLite** keeps its tables and its own schema version under `deuz_budget_*`.
   Windows use the store's `clock` (the host clock by default), so processes
-  sharing a file should share a clock.
+  sharing a file should share a clock. A lifetime scope is admitted from a
+  running total (2.3), kept by triggers on the history table, so its cost does
+  not grow with history, and 2.2 processes sharing the file keep the total
+  right.
 - **Postgres** takes any `PgClientLike` (`pg.Pool`, `pg.Client`, a serverless
   driver). Admission, settlement and release are each one statement, so a
   pooled client never splits them across connections. Windows use database
   time, never host clocks. The schema must exist; the tables are created on
   first use, and concurrent first uses queue on an advisory lock.
+- **Redis** (2.3, `@deuz-sdk/core/ops/redis`) takes a client that runs Lua
+  scripts: a connected node-redis client as it is, or ioredis through
+  `wrapIoredisClient`. Admission, settlement and release are each one script,
+  atomic on the server, and windows use the server's `TIME`, never host clocks.
+  It keeps the Postgres store's model (a ring of window slots per scope, history
+  per model) under keys that share the hash tag `{<prefix>:budget}`, so a Redis
+  Cluster keeps them in one slot. Needs Redis 7 or later. `{ url }` instead of
+  `{ client }` imports the optional `redis` peer on first use, and `close()` then
+  quits that connection. The server must never evict these keys: an evicted
+  scope starts again empty and admits its whole limit again. Use
+  `maxmemory-policy noeviction` or a `volatile-*` policy, and AOF; see
+  [Redis](/docs/modules/operations#redis) in Operations.
 
 `usage(key, { since, byModel })` reports committed usage (settled amounts plus
 held estimates) over the key's history, or since a point in time; a bucket that
-straddles `since` counts whole. The stores keep history and request records;
-they do not prune them.
+straddles `since` counts whole. The stores keep history and request records
+until you [prune](#retention) them.
+
+## Open holds
+
+A hold stays open when its caller never settles or releases it: the process
+crashed after reserving, or every attempt to settle failed. It also stays open,
+by design, when a model call fails without reporting its usage (a network
+error, a transport timeout, a 5xx or 529 answer, a stream that broke off), since
+nothing says what the provider billed. That includes the failed attempt of a
+call that [failed over](/docs/modules/native-agents#model-fail-over) to the
+next of its `fallbackModels`: the attempt stays held at its estimate, in the
+ledger as an entry in state `'unknown'` and, with persistent admission, in the
+store as an open hold, so a fallback never spends past the shared budget. An
+answer the provider does not bill (400, 401, 403, 404, 422 or 429) releases
+the attempt's hold instead.
+
+An open hold keeps its estimate charged. In a windowed budget it leaves with
+its bucket; in a lifetime budget it stays until you close it. Since 2.3 the
+memory, SQLite, Postgres and Redis stores list and close open holds:
+
+- `holds({ before, limit?, after? })` lists the holds reserved before a time,
+  oldest first, a page at a time: request ID, model, held estimates, the time it
+  was reserved and the scope keys it is charged to.
+- `sweep({ before, resolve?, limit? })` closes them through the store's own
+  `settle` and `release`. By default it settles each at its estimate, so the
+  budget keeps the charge: the fail-closed choice for a call that may have run.
+  `resolve: 'release'` frees them, for calls you know never reached the
+  provider. A function decides per hold, and may return the actual amounts from
+  your own records, or `'keep'`. A hold its caller closed while the sweep ran is
+  skipped. `limit` caps how many holds one call examines (default 1 000).
+
+Choose `before` well past your longest call and its settlement retries. A sweep
+that closes a hold its caller is about to settle wins: the store keeps the
+sweep's amounts, and the ledger accepts the caller's settlement or release as
+already closed, without retrying it or failing the call. The ledger records
+the call's actual usage, so for that call it and the store disagree.
+
+```ts
+import { createSqliteBudgetStore } from '@deuz-sdk/core/ops/sqlite';
+
+const store = createSqliteBudgetStore({ path: './budgets.sqlite' });
+
+/** Run every few minutes: close the holds of calls whose process died. */
+async function closeStaleHolds(
+  usedBy: (requestId: string) => { tokens: number; usd: number } | undefined,
+) {
+  return store.sweep({
+    before: Date.now() - 15 * 60_000,
+    // Bill what the call really used when you know it, its estimate otherwise.
+    resolve: (hold) => usedBy(hold.requestId) ?? 'settle',
+  });
+}
+```
+
+`sweep` resolves to `{ settled, released, skipped }`. To recover a lifetime
+budget from a hold leaked by a crash, sweep it: with its real usage when your
+records have it, with `'release'` when the call never ran.
+
+## Retention
+
+`prune({ before })` (2.3) removes what admission no longer needs:
+
+- It deletes the settled, released and denied request records created before
+  `before`. A pruned request is forgotten: repeating its reservation admits it
+  anew, and a late settlement of it is ignored, so prune only records older
+  than any retry could be.
+- It folds history. Per scope and model, the buckets that closed a whole bucket
+  length before both `before` and now, and that admission no longer counts, are
+  summed into the newest of them. Usage totals and every admission decision stay
+  the same; `usage(key, { since })` counts a folded amount at the bucket it was
+  folded into.
+- A hold that is still open keeps its record and its bucket, so sweep stale
+  holds first.
+
+It resolves to `{ requests, buckets }`: the records deleted and the history rows
+folded away.
+
+```ts
+import { createInMemoryBudgetStore } from '@deuz-sdk/core/agent';
+
+const store = createInMemoryBudgetStore();
+const scope = { key: 'org:acme', limits: { tokens: 1_000_000 } };
+await store.reserve({ requestId: 'call-1', modelId: 'm', tokens: 500, scopes: [scope] });
+await store.settle('call-1', { tokens: 420, usd: 0 });
+
+const result = await store.prune({ before: Date.now() + 1 });
+console.log(result.requests); // 1: the settled record of call-1
+console.log(await store.usage('org:acme')); // { tokens: 420, usd: 0 }: history is kept
+```

@@ -11,11 +11,11 @@ then targets those failures specifically.
 
 ```bash
 # names — sub-second, run after every edit
-node .claude/skills/deuz-sdk/scripts/verify-skill.mjs
+node packages/core/tooling/skills/verify-skill.mjs
 
 # shapes — extracts every fenced example and compiles it against the real built package
 npm run build -w @deuz-sdk/core
-node .claude/skills/deuz-sdk/scripts/extract-examples.mjs <scratch>/src
+node packages/core/tooling/skills/extract-examples.mjs <scratch>/src
 cd <scratch> && npx tsc -p tsconfig.json
 ```
 
@@ -102,7 +102,7 @@ The nine prompts are in the workflow script under the session's `workflows/scrip
 and point the name gate at the directory:
 
 ```bash
-node .claude/skills/deuz-sdk/scripts/verify-skill.mjs <dir-of-answers>
+node packages/core/tooling/skills/verify-skill.mjs <dir-of-answers>
 ```
 
 A skilled run should report zero unresolved names. That is the machine half; the rubric half is

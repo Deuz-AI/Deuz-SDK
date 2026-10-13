@@ -301,13 +301,13 @@ describe('fail-over result shape (1.9): consume / warnings / observation', () =>
     const b = mockFetch(() => sseResponse([OPENAI_OK]));
     const bare = streamChat({
       model: createAnthropic({ apiKey: 'ka', fetch: a.fetch })('claude-opus-4-8'),
-      fallbackModels: [createOpenAI({ apiKey: 'kb', fetch: b.fetch })('gpt-5.2')],
+      fallbackModels: [createOpenAI({ apiKey: 'kb', fetch: b.fetch })('gpt-unlisted-1')],
       messages: [{ role: 'user', content: 'go' }],
       maxRetries: 0,
     });
     expect(bare.observation).toBeUndefined(); // no observer, no tracer
     await bare.consume?.();
-    // The winning candidate is the UNKNOWN slug `gpt-5.2`, so the fail-over shell
+    // The winning candidate is the UNKNOWN slug `gpt-unlisted-1`, so the fail-over shell
     // forwards a real warning now that emitters exist (1.9). Before, this was []
     // only because nothing ever produced one.
     expect((await bare.warnings)?.map((w) => w.type)).toEqual(['unknown-model']);
@@ -317,7 +317,7 @@ describe('fail-over result shape (1.9): consume / warnings / observation', () =>
     const b2 = mockFetch(() => sseResponse([OPENAI_OK]));
     const observed = streamChat({
       model: createAnthropic({ apiKey: 'ka', fetch: a2.fetch })('claude-opus-4-8'),
-      fallbackModels: [createOpenAI({ apiKey: 'kb', fetch: b2.fetch })('gpt-5.2')],
+      fallbackModels: [createOpenAI({ apiKey: 'kb', fetch: b2.fetch })('gpt-unlisted-1')],
       messages: [{ role: 'user', content: 'go' }],
       maxRetries: 0,
       deps: { observer: { emit: (event) => void events.push(event.type) } },

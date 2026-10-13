@@ -1,0 +1,292 @@
+---
+title: Batch requests
+description: createBatchClient — send single-turn requests to the OpenAI, Anthropic and Gemini batch APIs, read one result per request, price them on the batch tier and hold their budget until each result settles it.
+---
+
+`@deuz-sdk/core/batch` (2.3) sends many **single-turn requests** to a provider's **batch API** and reads the answers back hours later, at the provider's batch rates. It suits work nobody waits on: evaluations, backfills, classification of a whole table, nightly summaries. A batch request is what `generateText` or [`generateObject`](/docs/core/generate-object) would send, without tools: there is no tool loop and no MCP.
+
+Three batch APIs ship, behind one client:
+
+| Provider | Model factory | Batch API | Endpoint the requests run on |
+| --- | --- | --- | --- |
+| OpenAI | `createOpenAIResponses`, `createOpenAI` | Files (`purpose: 'batch'`) + Batches, 24-hour window | `/v1/responses` or `/v1/chat/completions` |
+| Anthropic | `createAnthropic` | Message Batches | `/v1/messages` |
+| Google Gemini | `createGoogleNative` | Batch mode (`batchGenerateContent`), Developer API | `generateContent` |
+
+Every request body is built by the model's own wire adapter, exactly as the same direct call builds it, and then made non-streaming. A batch request therefore follows the same request rules as `generateText`: effort mapping, sampling restrictions, output caps, structured output, and `store: false` on OpenAI Responses. The module is edge-safe (Web APIs only: `fetch`, `FormData`, `Blob`), and every timer and id comes from the injected [`deps`](/docs/core/dependencies).
+
+<Callout type="warn" title="Not live-verified">
+None of the three batch APIs has been exercised against the real endpoints. The request and response shapes were derived from the providers' official SDK type definitions (`openai` 7.32, `@anthropic-ai/sdk` 0.133, `@google/genai` 2.28), and the module is tested offline against in-memory stand-ins of each API. OpenAI's per-line JSONL format is not in its SDK types; it follows the Batch guide those types link to. Submit a small batch before you rely on a large one.
+</Callout>
+
+Batch APIs on Vertex AI, Amazon Bedrock and Azure OpenAI, Gemini through its OpenAI-compatible endpoint, and the other OpenAI-compatible hosts are not covered: `createBatchClient` refuses those models with a `BatchError` of kind `'unsupported'`.
+
+## Run it offline
+
+This example plugs a scripted stand-in for the Message Batches API into the model's `fetch`: no key, no network. It submits two requests, waits for the batch to end and reads both results, priced on the batch tier.
+
+```ts title="offline-batch.ts"
+import { createBatchClient } from '@deuz-sdk/core/batch';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+
+const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
+
+// A scripted stand-in for the Message Batches API: it accepts the batch,
+// ends it on the first status read and answers every request.
+let ids: string[] = [];
+const scriptedAnthropic = (async (input: string | URL | Request, init?: RequestInit) => {
+  const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+  if (init?.method === 'POST' && path === '/v1/messages/batches') {
+    const { requests } = JSON.parse(String(init.body)) as { requests: { custom_id: string }[] };
+    ids = requests.map((request) => request.custom_id);
+    return json({ id: 'msgbatch_demo', processing_status: 'in_progress' });
+  }
+  if (path === '/v1/messages/batches/msgbatch_demo') {
+    return json({
+      id: 'msgbatch_demo',
+      processing_status: 'ended',
+      request_counts: { processing: 0, succeeded: ids.length, errored: 0, canceled: 0, expired: 0 },
+      results_url: 'https://api.anthropic.com/v1/messages/batches/msgbatch_demo/results',
+    });
+  }
+  if (path === '/v1/messages/batches/msgbatch_demo/results') {
+    const lines = ids.map((id) => ({
+      custom_id: id,
+      result: {
+        type: 'succeeded',
+        message: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: `Answer to ${id}` }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1200, output_tokens: 300 },
+        },
+      },
+    }));
+    return new Response(lines.map((line) => JSON.stringify(line)).join('\n'));
+  }
+  return json({ type: 'error', error: { type: 'not_found_error', message: path } }, 404);
+}) as typeof fetch;
+
+const batch = createBatchClient({
+  model: createAnthropic({ apiKey: 'offline', fetch: scriptedAnthropic })('claude-haiku-5-5'),
+  deps: { priceProvider: createPriceProvider() },
+});
+
+const job = await batch.submit([
+  { id: 'q1', prompt: 'What is a batch API?' },
+  { id: 'q2', instructions: 'Answer in one line.', prompt: 'Why is it cheaper?' },
+]);
+console.log(job.id); // 'msgbatch_demo'
+
+await batch.wait(job, { intervalMs: 1_000 });
+for await (const result of batch.results(job)) {
+  console.log(result.id, result.status, result.text, result.costUsd);
+}
+// q1 succeeded Answer to q1 0.000135
+// q2 succeeded Answer to q2 0.000135
+```
+
+`0.000135` is 1,200 input and 300 output tokens at Claude Haiku 5.5's batch rates ($0.05 / $0.25 per million), half its standard rates.
+
+[`examples/18-batch-offline`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/18-batch-offline) runs a fuller batch on the same kind of scripted Message Batches API: budget holds at submit, `wait` polling, settlement per result at batch rates, and an `unpriced-model` warning.
+
+## Submitting a batch
+
+`createBatchClient({ model })` binds a client to one model: OpenAI and Gemini batches run on a single model, so every request of a batch does. The model's factory supplies the key, base URL, `fetch` and headers, as for any call; `headers` adds more to every batch call, and `capabilities` overrides the registry row as it does for a call.
+
+`submit(requests, { displayName?, signal? })` takes the requests and returns a `BatchJob`. Each request has:
+
+- `id`: 1 to 64 letters, digits, `_` or `-`, unique in the batch. Results carry it, and providers return results in any order.
+- `prompt` or `messages`, and `instructions`, as for `generateText`.
+- `temperature`, `maxOutputTokens`, `topP`, `stopSequences`, `effort`, `responseFormat`, `providerOptions`, `promptCaching` and `executionEstimate`, with their usual meaning.
+- `schema`, `schemaName`, `schemaDescription` and `mode` for structured output, as for `generateObject`.
+
+A request with tools, MCP servers or another agentic-loop option is refused with a `BatchError` of kind `'invalid-request'`, as are an empty batch, a missing or repeated `id` and a request with both `prompt` and `messages`. A batch over the provider's documented request limit is refused before any request is built.
+
+Anything the wire drops or clamps (a sampling parameter a reasoning model rejects, an effort level it lacks) is reported once per batch in `job.warnings`, as `generateText` reports it on its result.
+
+### The job handle
+
+A `BatchJob` is plain JSON: store it anywhere and hand it to another process. It never holds a credential.
+
+```ts
+{
+  version: 1,
+  id: 'msgbatch_013a…',          // OpenAI 'batch_…', Gemini 'batches/…'
+  protocol: 'anthropic',
+  provider: 'anthropic',
+  modelId: 'claude-haiku-5-5',
+  surface: 'anthropic',
+  submittedAt: 1760054400000,
+  expiresAt: 1760140800000,     // when the provider says
+  holdUntil: 1760144400000,     // submittedAt + holdMs
+  requests: [{ id: 'q1', hold: { id: 'root/batch/…/q1', tokens: 128012, usd: 0.032 } }],
+  scopeId: 'root',              // with an execution context
+}
+```
+
+## Following a batch
+
+- `status(job)` reads where the batch stands with one provider call. `state` is one of `pending`, `running`, `cancelling`, then an ended state: `completed`, `cancelled`, `expired` (the provider's window passed) or `failed` (the batch as a whole failed, such as an OpenAI input file that did not validate). `ended` is true for the last four, `counts` gives the request counts the provider reports, `expiresAt` its expiry and `providerState` its own value. A status the module does not know reads as `running`, never as ended.
+- `wait(job, { intervalMs?, timeoutMs?, onStatus?, signal? })` polls on `deps.clock` until the batch ends (default every 60 seconds). A retryable provider error (a 429, a 5xx) or a network failure is polled again; `timeoutMs` ends the wait with a `BatchError` of kind `'timeout'`.
+- `cancel(job)` asks the provider to stop the batch. Requests already done keep their results; read the results of the cancelled batch to close its holds.
+
+## Reading the results
+
+`results(job)` yields one `BatchResult` per request once the batch has ended; before that it throws a `BatchError` of kind `'not-ended'`. Results stream in the provider's order as the result file is read: OpenAI's output file before its error file, Anthropic's results in any order, Gemini's in request order. `collect(job)` gathers them into an array.
+
+| Field | What it holds |
+| --- | --- |
+| `id` | The request's `id`. |
+| `status` | `'succeeded'`, `'errored'`, `'cancelled'` or `'expired'`: what the provider did with the request. |
+| `text`, `reasoning` | The reply's text (`''` when there is none) and its readable reasoning. |
+| `object` | A structured request's object, parsed and, for a Standard Schema, validated. |
+| `finishReason`, `usage` | As for `generateText`; usage follows the 2.3 contract (`outputTokens` includes reasoning, `inputTokens` excludes cache reads). |
+| `usageAvailable` | `false` when the provider reported no usage: the cost is unknown. |
+| `costUsd` | The cost on the batch tier, when `deps.priceProvider` has a batch price for the model. |
+| `error` | Why there is no usable output: the provider's error for the request (a typed `InvalidRequestError`, `RateLimitError`, `OverloadedError`, …) or a `NoObjectGeneratedError`. |
+| `stopDetails`, `providerMetadata` | A refusal's details and the provider metadata, as on a direct call. |
+
+A structured request whose object does not parse or validate keeps `status: 'succeeded'`, because it ran and was billed, and carries a `NoObjectGeneratedError`. There is no repair attempt: resubmit it in the next batch. A request the provider never answered comes back with `status: 'cancelled'` or `'expired'` when the batch was cancelled or expired, and as `'errored'` otherwise.
+
+The client keeps the schemas of the batches it submitted in memory until their results were read once. A later read, or a new process, passes them to `results(job, { schemas: { q1: LabelSchema } })`; without one the object is parsed but not validated.
+
+## Pricing on the batch tier
+
+Batch requests are priced on the provider's batch tier. Price lookups take an optional third argument, `priceProvider.priceUsage(model, usage, { tier: 'batch' })` (2.3, additive; `'standard'` is the default), and [`createPriceProvider`](/docs/modules/pricing) prices it from a row's `batch` card:
+
+```ts
+import { createPriceProvider, PRICES_2026, priceUsage } from '@deuz-sdk/core/pricing';
+
+const usage = {
+  inputTokens: 1_000_000,
+  outputTokens: 1_000_000,
+  reasoningTokens: 0,
+  cachedReadTokens: 0,
+  cacheWriteTokens: 0,
+  cacheWrite1hTokens: 0,
+  totalTokens: 2_000_000,
+};
+priceUsage('claude-opus-5-5', usage); // 24: $4 in + $20 out
+priceUsage('claude-opus-5-5', usage, PRICES_2026, { tier: 'batch' }); // 12
+priceUsage('gpt-5.6-sol', usage, PRICES_2026, { tier: 'batch' }); // undefined: no batch card
+
+// Your own batch rates, for a row the table does not card:
+const prices = createPriceProvider({
+  table: { 'gpt-5.6-sol': { ...PRICES_2026['gpt-5.6-sol'], batch: { input: 2, output: 10 } } },
+});
+```
+
+`ModelPrice.batch` holds only rates a primary source states. The bundled table cards the Claude models listed in Anthropic's Claude API reference (cached 2026-10-06), which prices Message Batches at 50% of standard prices, cache reads and writes included: Claude Fable 5.1 and 5, Opus 5.5, 5, 4.8, 4.7 and 4.6, Sonnet 5.5, 5 and 4.6, and Haiku 5.5 and 4.5. No OpenAI or Gemini row has a batch card, because no primary source for those rates was available offline, so their batch requests are **unpriced** until you add one. A batch card is complete on its own: nothing falls back to the standard rates, so list its long-context cards too.
+
+A `PriceProvider` written before 2.3 ignores the tier and prices a batch request at its standard rate, which overstates the cost when the provider discounts batches.
+
+## Budgets
+
+Give the client an execution context and every request reserves a **hold** when the batch is submitted, before the provider sees anything:
+
+```ts
+import { createBatchClient } from '@deuz-sdk/core/batch';
+import { createExecutionContext, createInMemoryBudgetStore } from '@deuz-sdk/core/agent';
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { createPriceProvider } from '@deuz-sdk/core/pricing';
+
+const execution = createExecutionContext({
+  budget: { usd: 20 },
+  admission: { store: createInMemoryBudgetStore(), scopes: [{ key: 'org:acme', limits: { usd: 500 } }] },
+});
+const batch = createBatchClient({
+  model: createAnthropic()('claude-haiku-5-5'),
+  execution,
+  deps: { priceProvider: createPriceProvider() },
+});
+```
+
+- **One hold per request, all or none.** Each hold is estimated as a native call is (the prompt plus the output cap the wire sends; on Anthropic a cached prompt as a cache write) and priced on the batch tier. The holds are admitted in one ledger step, each against the budgets and the holds before it, so a batch of any size writes one ledger revision and one persisted snapshot. When one hold is refused, by a budget or the policy, the holds admitted before it are released and nothing is sent. The holds sit in the ledger as reservations of kind `'batch'` with the id `<scopeId>/batch/<job key>/<request id>`, and in the `BudgetStore` when the context has persistent admission.
+- **Each result settles its hold** before the result is handed out:
+
+  | Outcome | Hold |
+  | --- | --- |
+  | Succeeded, with usage | Settled with the usage, priced on the batch tier |
+  | No usage reported | Kept, unknown: the cost is unknown |
+  | Cancelled, expired, or never run because the batch failed validation | Released: never billed |
+  | Errored with 400, 401, 403, 404, 422 or 429 | Released: refused without running |
+  | Any other error, or no result from a completed batch | Kept, unknown: it may have been billed |
+
+- **Settlement is idempotent.** Reading the results again changes nothing in the ledger or the store, so an interrupted read can simply start over. When the store cannot take a settlement (a `BudgetLedgerError` with code `admission_failed`, after the ledger's retries), `results` throws at that request; read the results again once the store answers. `results` hands out every result it settled before that, while `collect` rejects as a whole.
+- **A submission that fails** releases the holds when no batch can exist (validation, an OpenAI input upload) or the provider refused the batch call, and keeps them unknown otherwise.
+- **Unpriced models** follow the [same rule as everywhere](/docs/modules/budgets#models-without-a-price): under a USD budget a model with no batch price runs, its holds count tokens but no dollars, and the job carries one `unpriced-model` warning; `budget.unknownPrice: 'reject'` refuses the batch before anything is sent.
+
+### Holds last as long as the batch
+
+A batch hold stays open for up to a day, so `holdMs` (default 25 hours: the 24-hour batch window and an hour to read the results) sets `job.holdUntil`. A [`BudgetStore` sweep](/docs/modules/budgets#open-holds) must not close those holds first: pick a `before` older than `holdMs`, or keep the batch holds explicitly.
+
+```ts
+await store.sweep({
+  before: Date.now() - 15 * 60_000,
+  // Batch holds live until their results are read.
+  resolve: (hold) =>
+    hold.requestId.includes('/batch/') && hold.reservedAt > Date.now() - 25 * 3_600_000
+      ? 'keep'
+      : 'settle',
+});
+```
+
+## Resuming after a restart
+
+Pass a `store` and every submitted job is recorded; `pending()` lists the jobs whose results were not all read, oldest first, and a job is marked closed (`closedAt`) once every result was read: its holds are then settled, released, or left unknown for a sweep. `createMemoryBatchJobStore()` keeps them in memory; any `BatchJobStore` (`put`, `get`, `list`, `delete`) keeps them in your database, one JSON row per `job.id`.
+
+```ts
+import { createBatchClient, createMemoryBatchJobStore } from '@deuz-sdk/core/batch';
+
+const jobs = createMemoryBatchJobStore(); // your database in production
+const batch = createBatchClient({ model, execution, store: jobs });
+
+// In a worker that runs every few minutes:
+for (const job of await batch.pending()) {
+  const status = await batch.status(job);
+  if (!status.ended) continue;
+  for await (const result of batch.results(job, { schemas })) save(result);
+}
+```
+
+The holds settle through the client's execution context. A context [restored from its snapshot](/docs/modules/budgets#children-snapshots-and-restore) already knows them. A fresh context of the same scope does not: the client then records each hold again with the amounts the job recorded, and settles it. The provider has already run those requests, so the fresh context's budgets never refuse a hold recorded this way, but they count it from then on: an overage leaves no room for new work, as it would in the context that submitted the batch. A `BudgetStore` treats the hold as the same one, so nothing is counted twice. For that the fresh context needs the same persistent scopes and limits: a hold the store recorded with other amounts or limits fails with a `BudgetLedgerError` of code `reservation_conflict`, and such a job is read through a context restored from its snapshot. A job whose holds were reserved under another scope needs a context of that scope. A client without an execution context refuses to read a job that has holds.
+
+If the job store fails to record a job the provider accepted, `submit` throws a `BatchError` of kind `'store'` whose `job` carries the handle.
+
+## Provider notes
+
+**OpenAI.** The requests go up as one JSON Lines file (`custom_id`, `method`, `url`, `body` per line) through the Files API with `purpose: 'batch'`, then `POST /batches` runs it with `completion_window: '24h'`, the only window the API takes. A batch takes at most 50,000 requests and a 200 MB input file. Results come from the batch's output file and error file; a line OpenAI marks `batch_expired` or `batch_cancelled` comes back as `'expired'` or `'cancelled'`. The uploaded input file stays in your Files storage. `displayName` is sent as `metadata.display_name`.
+
+**Anthropic.** `POST /v1/messages/batches` with `{ custom_id, params }` requests: at most 100,000 requests or 256 MB, processed within 24 hours, and the results stay available for 29 days. Results are read from the batch's `results_url` when it is on your configured base URL's host; on another host its path is read through your base URL instead, so the key only goes to the host you configured. `anthropic-beta` values the requests carry (from factory or call headers) are sent on the batch call, each once. Anthropic has no batch label, so `displayName` is not sent.
+
+**Gemini.** `POST /v1beta/models/<model>:batchGenerateContent` with the requests inlined as `{ request, metadata: { key } }`; the batch is named `displayName` (default `'deuz-batch'`). The job id is the batch name, `batches/…`. Results are read from the responses inlined in the finished job, by their `metadata.key` and otherwise in request order, or from its responses file. The inline form has a size limit that Google documents and this module does not check: split very large batches.
+
+## Errors
+
+`BatchError` (`code: 'batch_error'`) carries a `kind`:
+
+| `kind` | When |
+| --- | --- |
+| `unsupported` | The model has no batch API here. |
+| `invalid-request` | The batch cannot be sent as given, or exceeds a documented provider limit. |
+| `invalid-job` | A malformed job handle, one from another provider, or holds this client cannot settle. |
+| `not-ended` | Results read before the batch ended. |
+| `timeout` | `wait` passed its `timeoutMs`. |
+| `provider` | The provider answered something unusable, or reported an error for one request without an HTTP status. |
+| `store` | `pending()` without a store, or the store failed to record a submitted job (`error.job`). |
+
+A failed batch call keeps the wire's own [typed error](/docs/core/errors): an expired key is an `AuthenticationError`, a missing batch a `ModelNotFoundError`, and so on. A call that fails before or while its answer arrives (DNS, a reset connection, a result file that breaks off) throws the retryable `NetworkError` (`code: 'network_error'`), as a model call does; an abort of your `signal` keeps its own reason.
+
+## API at a glance
+
+| Export | What it is |
+| --- | --- |
+| `createBatchClient(options)` | A `BatchClient` for one model: `submit`, `status`, `wait`, `results`, `collect`, `cancel`, `pending`. |
+| `createMemoryBatchJobStore()` | An in-memory `BatchJobStore`. |
+| `BatchError` | The batch failure, with `kind`, `batchId` and, for `store`, `job`. |
+| `BatchRequest`, `BatchJob`, `BatchStatus`, `BatchResult` | The request, the job handle, a status read and one result. |
+| `BatchClientOptions` | `model`, `deps`, `execution`, `store`, `holdMs`, `headers`, `capabilities`. |
+| `ServiceTier`, `PriceUsageOptions` (`@deuz-sdk/core/pricing`) | The `{ tier: 'batch' }` argument of price lookups. |

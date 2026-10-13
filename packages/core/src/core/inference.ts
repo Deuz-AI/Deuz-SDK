@@ -1,7 +1,8 @@
 import type { CommonCallOptions } from '../types/config';
-import type { CallWarning, StreamChatResult } from '../types/methods';
+import type { CallWarning, StopDetails, StreamChatResult } from '../types/methods';
 import type { StreamPart } from '../types/stream';
 import type { Usage, FinishReason } from '../types/usage';
+import type { UsageMeta } from '../types/deps';
 import type { ModelSurface } from '../types/model';
 import type { Adapter, BuildContext, ObjectRequest, WireToolRequest } from '../adapters/types';
 import { APICallError, BreakerOpenError, NetworkError, TimeoutError } from '../errors';
@@ -17,6 +18,7 @@ import { toObservedError } from '../internal/observe-error';
 import type { RunStartedEvent, ObservedError } from '../types/observe';
 import { readClientContext } from '../internal/client-context';
 import { createWarningSink, unsupportedSetting, type WarningSink } from '../internal/warnings';
+import { stopDetailsFrom } from '../internal/stop-details';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
 import { normalizeMessages } from './normalize';
 import { getCapabilities } from './registry';
@@ -126,7 +128,7 @@ export interface InternalRunOptions {
    * degradation (a stripped `temperature`, an unknown slug) is discovered again
    * each time. Passing one sink for the whole run makes it a single report: the
    * sink dedupes by (type, setting, message), and this pump only emits `warning`
-   * parts for entries that were not already in it when the step started.
+   * parts for entries no stream has carried yet (`WarningSink.take`, 2.3).
    *
    * Absent (a bare `streamChat`/`generateText`) → the pump owns a fresh sink for
    * the single call.
@@ -151,6 +153,8 @@ export function runStream(
   const broadcaster = createBroadcaster<StreamPart>();
   const usageDeferred = createDeferred<Usage>();
   const finishDeferred = createDeferred<FinishReason>();
+  // The provider's stop explanation (2.3): settles with `finishReason`.
+  const stopDetailsDeferred = createDeferred<StopDetails | undefined>();
   // Warnings (1.9): the sink is CALL-SCOPED — a module-level one would leak
   // across concurrent calls on an edge isolate. It is created here rather than
   // inside pump() so `warnings` can settle from the pump's `finally` (below) and
@@ -218,35 +222,37 @@ export function runStream(
     let ttftMs: number | undefined;
     let finalUsage: Usage | undefined;
     let finalFinish: FinishReason | undefined;
+    let finalStopDetails: StopDetails | undefined;
     let native: ReturnType<typeof createNativeRequest> | undefined;
     let usageAvailable = false;
     const settleReservation = async (): Promise<void> => {
       await native?.settle(finalUsage, usageAvailable);
     };
+    /**
+     * F02 (2.3): `onUsage` says when the usage is not the provider's (none was
+     * reported, or the stream ended first), so every path counts that call's
+     * cost as unknown, as native settlement does.
+     */
+    const availability = (): Pick<UsageMeta, 'usageAvailable'> =>
+      finalUsage !== undefined && usageAvailable ? {} : { usageAvailable: false };
 
     // --- warnings (1.9) ---
-    // Cursor into the sink: everything before it has already been emitted as a
-    // `warning` part. An INHERITED sink starts at its current length, because the
-    // enclosing loop's earlier steps already put those parts on the same stream.
-    let emittedWarnings = internal.warnings ? internal.warnings.list().length : 0;
-    /** Emit a canonical `warning` part for each newly discovered warning. */
+    /**
+     * Emit a canonical `warning` part for each warning no stream carried yet. An
+     * INHERITED sink is shared with the enclosing loop, which forwards these
+     * parts and streams the rest itself: the sink hands each one out once (2.3).
+     */
     const flushWarnings = (): void => {
-      const all = warnings.list();
-      for (let i = emittedWarnings; i < all.length; i++) {
-        broadcaster.push({ type: 'warning', warning: all[i]! });
-      }
-      emittedWarnings = all.length;
+      for (const warning of warnings.take()) broadcaster.push({ type: 'warning', warning });
     };
     /**
      * Record a warning discovered HERE (a site with no pre-1.9 log line of its
-     * own) and mirror it to the logger, so a log-only workflow sees it too. The
-     * mirror is gated on the sink actually having accepted the entry, so the
-     * dedupe covers the log as well as the list.
+     * own) and log it, so a log-only workflow sees it too. The line is written
+     * here, once, when the sink reports the entry as new: never also through a
+     * logger the sink carries (2.3), and still past the sink's list cap.
      */
     const addWarning = (warning: CallWarning): void => {
-      const before = warnings.list().length;
-      warnings.add(warning);
-      if (warnings.list().length === before) return;
+      if (!warnings.add(warning, { mirror: false })) return;
       deps.logger.warn(warning.message, {
         warning: warning.type,
         ...(warning.setting !== undefined ? { setting: warning.setting } : {}),
@@ -413,6 +419,21 @@ export function runStream(
           ),
         );
       }
+      // generateObject / streamObject asked for the forced-tool strategy but the
+      // model cannot be forced (2.3, F26): `pickObjectStrategy` switched to the
+      // json one, because the row rejects a forced tool_choice or Anthropic's
+      // thinking is on. The call's own options carry the requested `mode`.
+      if ((options as { mode?: unknown }).mode === 'tool' && internal.object?.strategy === 'json') {
+        addWarning({
+          type: 'clamped-setting',
+          setting: 'mode',
+          message:
+            `mode 'tool' was sent as the json strategy (native structured output): ${modelId} ` +
+            (caps.forcedToolChoice === false
+              ? 'rejects a forced tool_choice.'
+              : 'thinks on this request, and a forced tool_choice does not combine with thinking.'),
+        });
+      }
       if (options.execution) {
         native = (await import('../internal/native-request')).createNativeRequest(
           options,
@@ -422,6 +443,8 @@ export function runStream(
           userSignal,
         );
         native.assert();
+        // F12 (2.3): a bounded call may carry an output cap the caller did not set.
+        if (native.warning) addWarning(native.warning);
       }
       const adapter = getAdapter(options.model.surface);
       const startedAt = deps.clock.now();
@@ -433,7 +456,8 @@ export function runStream(
         call,
         messages,
         caps,
-        options,
+        // Native admission's options: the output cap it reserves rides the wire.
+        options: native?.options ?? options,
         generateId: deps.generateId,
         object: internal.object,
         tools:
@@ -452,8 +476,9 @@ export function runStream(
       };
       const { url, init } = adapter.buildRequest(buildCtx);
       // Every warning site of a call runs before the first byte (capability
-      // resolution + request building), so one flush here puts them on the
-      // stream ahead of the model's own parts.
+      // resolution, request building and, below, native admission), so this
+      // flush and the one after each reservation put them on the stream ahead
+      // of the model's own parts.
       flushWarnings();
 
       // --- pre-first-byte retry loop with 3-layer timeout ---
@@ -465,7 +490,11 @@ export function runStream(
       let res!: Response;
       let timeout!: TimeoutHandle;
       for (let attempt = 0; ; attempt++) {
-        if (native) await native.reserve();
+        if (native) {
+          await native.reserve();
+          // Admission may report the model as unpriced (2.3).
+          flushWarnings();
+        }
         retries = attempt; // retries performed so far (attempt 0 = first try)
         const remaining = native?.remaining();
         timeout = createTimeout(
@@ -605,7 +634,8 @@ export function runStream(
               if (rt.capture.outputText) capturedText = (capturedText ?? '') + part.text;
             } else if (part.type === 'reasoning-delta') {
               reasoningLength += part.text.length;
-              if (rt.capture.reasoning && !part.encrypted) {
+              // Encrypted and redacted payloads are opaque provider state, not reasoning text.
+              if (rt.capture.reasoning && !part.encrypted && !part.redacted) {
                 capturedReasoning = (capturedReasoning ?? '') + part.text;
               }
             } else if (part.type === 'tool-call-delta') {
@@ -617,6 +647,7 @@ export function runStream(
             broadcaster.push(part);
             usageDeferred.reject(part.error);
             finishDeferred.reject(part.error);
+            stopDetailsDeferred.reject(part.error);
             // mid-stream error is final — the bridge fails the invoke span
             emitFailure(part.error);
             broadcaster.close();
@@ -625,11 +656,13 @@ export function runStream(
           if (part.type === 'finish') {
             finalUsage = part.usage;
             finalFinish = part.finishReason;
+            finalStopDetails = stopDetailsFrom(part.providerMetadata);
             await settleReservation();
             // Live cost (1.7, D2): single-turn calls price the finish usage
             // inline; loop-driven calls (internal.tools set) leave it to the
-            // loop's cumulative per-step part.
-            if (!internal.tools && deps.priceProvider) {
+            // loop's cumulative per-step part. Usage the provider did not
+            // report has no known cost, so it gets no part (2.3, F02).
+            if (!internal.tools && deps.priceProvider && usageAvailable) {
               try {
                 const priced = withTotal(part.usage);
                 const costUsd = await deps.priceProvider.priceUsage(modelId, priced);
@@ -649,7 +682,13 @@ export function runStream(
               }
             }
           }
-          broadcaster.push(part);
+          // A wire's own notice about the response (2.3: Anthropic's
+          // input_transformations) joins the call's warnings, so the result's
+          // `warnings` carries it too; the stream gets it once, from the sink.
+          if (part.type === 'warning') {
+            addWarning(part.warning);
+            flushWarnings();
+          } else broadcaster.push(part);
           // 2.2: once content flows, a silence longer than `chunkMs` before the next
           // part fails the call. A finished answer is never timed out while it closes.
           if (firstContent && part.type !== 'finish') timeout.chunk();
@@ -663,7 +702,13 @@ export function runStream(
       const finishReason = finalFinish ?? 'stop';
       usageDeferred.resolve(usage);
       finishDeferred.resolve(finishReason);
-      fireUsage(options, deps, usage, { model: options.model.modelId, reason: 'finished', ttftMs });
+      stopDetailsDeferred.resolve(finalStopDetails);
+      fireUsage(options, deps, usage, {
+        model: options.model.modelId,
+        reason: 'finished',
+        ttftMs,
+        ...availability(),
+      });
       // G12 (1.9): `onFinish` belongs to the RUN, so only the run's owner fires
       // it. A STEP of an agentic loop (`internal.tools` set — the same
       // "loop-driven call" test the cost part above uses) leaves it to the loop,
@@ -732,10 +777,13 @@ export function runStream(
         const usage = withTotal(finalUsage ?? EMPTY_USAGE);
         usageDeferred.resolve(usage);
         finishDeferred.resolve('aborted');
+        // An abort is the caller's stop, not one the provider explained.
+        stopDetailsDeferred.resolve(undefined);
         fireUsage(options, deps, usage, {
           model: options.model.modelId,
           reason: 'aborted',
           ttftMs,
+          ...availability(),
         });
         if (rt) {
           // Same rule for events: the model call COMPLETED with 'aborted'
@@ -793,6 +841,7 @@ export function runStream(
       broadcaster.push({ type: 'error', error: err });
       usageDeferred.reject(err);
       finishDeferred.reject(err);
+      stopDetailsDeferred.reject(err);
       emitFailure(err);
       broadcaster.close();
     }
@@ -869,6 +918,10 @@ export function runStream(
     get finishReason() {
       ensureStarted();
       return finishDeferred.promise;
+    },
+    get stopDetails() {
+      ensureStarted();
+      return stopDetailsDeferred.promise;
     },
     get warnings() {
       // Starts the pump like `usage`/`finishReason` do: the set is only known

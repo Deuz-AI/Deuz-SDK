@@ -42,7 +42,7 @@ This is the whole point, and it is not a nuance. [`agentTool`](/docs/agents/suba
 | Coming back | Only by transferring again (targets keep each other's transfer tools, including one back). | Automatic — the sub-agent finishes and the parent continues. |
 | Stream signal | `handoff` part | `sub-agent` parts (the child's live stream, forwarded) |
 | Metadata | `providerMetadata.deuz.handoffs` | usage attribution per `agentPath` |
-| Guardrails | **Kept** — they are run-level, and the run did not change. | **Not inherited** by the sub-agent loop. |
+| Guardrails | **Kept** — they are run-level, and the run did not change. | `onToolCall` and `onToolResult` are **inherited** by the sub-agent loop (2.3); `onInput` and `onOutput` are not. |
 | Token cost of the switch | Zero extra calls; the next step just uses a different model. | One nested run per call, with its own steps and usage. |
 
 Pick a **handoff** when the *conversation* should change hands — triage → specialist, sales → support. Pick a **sub-agent** when a *task* should be farmed out and answered — research this, summarize that.
@@ -191,7 +191,7 @@ Each transfer tool is an ordinary tool with one optional parameter:
 
 A transfer is decided by the loop **before any tool executes**, by looking at the call — never by a control-flow exception thrown out of an `execute`. The transfer tools carry a hidden, non-enumerable marker that the loop reads; `Object.keys`, `JSON.stringify` and every wire builder never see it.
 
-Order within a step: **handoff interception → guardrails → approval gate → `executeTools`**. So an `onToolCall` [guardrail](/docs/agents/guardrails) never sees a transfer call, and a transfer is never queued for human approval.
+Order within a step (2.3): **execution policy → `onToolCall` guardrails → approval gate → handoff decision → `executeTools`**. A transfer call takes the same policy and gate as any call: an `onToolCall` [guardrail](/docs/agents/guardrails) sees it and can block it, and `requireApproval` (or a `needsApproval` you set on a transfer tool) gates it. A refused transfer is answered with its denial and the run stays with the current agent; a transfer waiting for a verdict suspends the run and the resume decides it. The decision is still deterministic: a cleared transfer is decided by looking at the call, never by executing it.
 
 Consequences worth stating:
 
@@ -210,13 +210,13 @@ A step can end early for reasons that have nothing to do with the transfer: a to
 Concretely, when the step breaks:
 
 1. every transfer `tool_use_id` is answered and the `{ role: 'tool' }` turn is appended, so the provider never sees an unanswerable history on resume;
-2. the swap is applied — active model, tool set, and the rewritten system turn — **before** the checkpoint is written;
+2. the swap is applied — active model, tool set, and the target's system turn (rewritten, or [appended on Claude 5.x](#claude-5x-the-instructions-are-appended-23)) — **before** the checkpoint is written;
 3. `AgentCheckpoint.handoff` records `{ to, count }`, so the resume leg comes back as the target agent, not the root one;
 4. the streaming loop publishes the same `tool-result` / `tool-state` / `handoff` parts the completed path would, so a UI cannot tell the two apart.
 
 The one asymmetry: the *executed* tools of that batch are **not** answered on a sub-agent suspension. Their `tool_use` ids stay open and the resume leg's settle re-runs them (which is what resumes the child's checkpoint). The transfer is not one of them — it never executes, so deferring it would leave a `tool_use` no producer could ever answer.
 
-On the resume leg the order is: restore the checkpointed agent → settle pending approvals → *then* the first model call. A transfer that was left unanswered by the previous leg is applied during that settle, and from that point the leg is the target agent.
+On the resume leg the order is: restore the checkpointed agent → settle pending approvals → *then* the first model call. A transfer that was left unanswered by the previous leg is applied during that settle, and from that point the leg is the target agent. On a Claude 5.x target the settle's answers go in right after the transfer's tool result, ahead of the appended instructions: the model never saw those instructions, so the turn it wrote is answered first and nothing it already read moves.
 
 ## The `maxHandoffs` loop guard
 
@@ -238,6 +238,8 @@ The target's own tools are applied **last**, so an agent that deliberately defin
 Zero-config `mcp:` tools are merged on top of whichever agent is active, and the wire lists are rebuilt at the swap. A transfer therefore keeps the run's MCP tools while replacing the *local* half of the set.
 </Callout>
 
+On Claude 5.x (2.3) the request's `tools` array does not change at the swap: it is part of the prefix the model's thinking is bound to. Every request of the run carries the root agent's tools, and the target's set rides as an appended **tool-set change** — the root's tools withdrawn, the target's added — which Claude reads as mid-conversation `tool_removal` / `tool_addition` blocks. A call the target makes to a withdrawn tool is answered like an unknown tool and never runs. See [Preserved thinking](/docs/agents/preserved-thinking#the-tools-array).
+
 ## The system prompt is rewritten, not appended
 
 `instructions` **replaces** the run's leading system turn (one is inserted when the history had none, and removed when the target declares none).
@@ -245,6 +247,14 @@ Zero-config `mcp:` tools are merged on top of whichever agent is active, and the
 A rewrite, not an append — the same discipline compaction follows. The new turn must not enter `response.messages` / `appended` / the chat record, or your response delta and the transcript would grow a system message you never sent. It lives in the effective model history, and therefore in checkpoints, which is exactly where a resume leg needs to find it.
 
 The consequence to plan for: a target with **no** `instructions` strips the run's system prompt entirely for every following step. If you want a specialist to inherit the run's framing, restate it in that target's `instructions`.
+
+### Claude 5.x: the instructions are appended (2.3)
+
+A target whose model binds thinking to the transcript prefix — Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5, or an unknown `claude-*-5…` id on the family fallback — gets its `instructions` **appended** instead: one `role: 'system'` message right after the transfer's tool result. The run's leading system turn is part of the prefix every earlier thinking block is bound to, so rewriting it would invalidate all of them ([Preserved thinking](/docs/agents/preserved-thinking)).
+
+- The run's own system prompt stays in force; the target's instructions follow it, from the transfer on. A target with **no** `instructions` appends nothing, so the run's system prompt is what it reads.
+- The message stays out of `response.messages` and the chat record, as the rewritten turn does: the next call starts as the root agent, and a specialist's instructions in its history would steer it. It lives in the run's history and checkpoints, so a resume leg keeps it.
+- The cost of that rule: the next call's first request no longer contains the message, so the thinking of the turns after the transfer is dropped there (the `drop_block` safety net, not an error).
 
 ## `HandoffPart` on the stream
 
@@ -294,17 +304,13 @@ Two things surprise people, and one of them used to be three:
 
 **Compaction, by contrast, follows the active agent** (2.0). At the swap the compaction runner is re-pointed at the target: its `contextWindow` becomes the target's, and the summarize side call uses `policy.summarizeModel ?? the active model` — not the root one. The token estimator is kept across the swap on purpose, because its calibration measures the provider's request framing, which the transfer did not change.
 
-<Callout type="warn" title="Known limit: a resume leg does not re-point compaction">
-Restoring a checkpointed handoff at the start of a resume leg rebuilds the active model and tool set, but it does **not** re-run the compaction retarget. So a durable run that suspended inside agent B and resumes there measures compaction against the **root** model's `contextWindow`, and summarizes with the root model, until the next transfer happens on that leg.
-
-Pin `compaction.summarizeModel` (and, if the two models' windows differ a lot, `capabilities.contextWindow`) when you combine handoffs with durable resume and compaction.
-</Callout>
+A resume leg re-points it too: restoring a checkpointed handoff rebuilds the active model and tool set **and** re-runs the compaction retarget, in both loops, so a durable run that suspended inside agent B measures and summarizes against B when it resumes there. This holds since 2.1. In 2.0 a resume leg kept the root model's `contextWindow`, and the root model as the summarizer when no `summarizeModel` was set, until the next transfer; the 2.1 and 2.2 versions of this page still listed that as a known limit. On Claude 5.x the pass the target gets is [simple compaction](/docs/core/compaction#claude-5x-simple-compaction-23).
 
 ## See also
 
 - [Sub-agents](/docs/agents/subagents) — `agentTool`, the delegation counterpart.
 - [createAgent](/docs/agents/create-agent) — agents as frozen values, usable directly as handoff targets.
-- [Guardrails](/docs/agents/guardrails) — the hooks a transfer is deliberately intercepted *before*.
+- [Guardrails](/docs/agents/guardrails) — `onToolCall` sees transfer calls too (2.3).
 - [Tool loop](/docs/agents/tool-loop) — step boundaries, the runaway guard, and denial handling.
 - [Durable runtime](/docs/agents/durable-runtime) — checkpoints and `resumeFromCheckpoint`.
 - [Compaction](/docs/modules/compaction) — the summarize layer a transfer re-points.

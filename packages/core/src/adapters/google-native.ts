@@ -14,7 +14,18 @@ import {
   RateLimitError,
 } from '../errors';
 import { extractSystem } from '../core/normalize';
+import {
+  assertToolSurface,
+  describeToolChoice,
+  effortWire,
+  isForcedToolChoice,
+  optionalOutputCap,
+  planEffort,
+  reportClamp,
+  reportRequestWarning,
+} from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
+import { replaysTo } from '../internal/reasoning';
 import { resolveMedia } from '../internal/image';
 import { parseSSE } from '../internal/sse';
 import { parseRetryAfterMs } from '../internal/http';
@@ -51,46 +62,39 @@ interface GeminiUsageMetadata {
 
 // --- request building ---
 
-/** gemini-3* uses thinkingLevel; gemini-2.5* uses thinkingBudget (never both → 400). */
-function usesThinkingLevel(modelId: string): boolean {
-  return /^gemini-3/.test(modelId);
-}
-
 /** gemini-3* accepts the fuller responseJsonSchema; 2.5 uses the restricted responseSchema. */
 function usesJsonSchema(modelId: string): boolean {
   return /^gemini-3/.test(modelId);
 }
 
-const BUDGET_MAP: Record<string, number> = {
-  low: 4096,
-  medium: 12288,
-  high: 24576,
-  xhigh: 32768,
-  max: 32768,
-};
-
-/** Pro-tier Gemini 3 models accept only low/high thinking levels. */
-function levelOnlyLowHigh(modelId: string): boolean {
-  return /^gemini-3(\.\d+)?-pro/.test(modelId);
+/**
+ * The thinking config for `options.effort` — never both a level AND a budget
+ * (400): gemini-3* takes `thinkingLevel`, gemini-2.5* `thinkingBudget`. The
+ * level wire's accepted set comes from the row when it lists one, else from
+ * the family (Pro: low/high, others low/medium/high); every clamp on the way
+ * is reported (2.3, F26). The table lives in core/request-rules.ts.
+ */
+function thinkingConfigFor(ctx: BuildContext): Record<string, unknown> | undefined {
+  const effort = planEffort(ctx, effortWire('native', ctx.caps, ctx.call.modelId));
+  if (effort.level === undefined) return undefined;
+  return effort.budget !== undefined
+    ? { includeThoughts: true, thinkingBudget: effort.budget }
+    : { includeThoughts: true, thinkingLevel: effort.level };
 }
 
-function thinkingLevelFor(modelId: string, effort: string): string {
-  const full: Record<string, string> = {
-    low: 'low',
-    medium: 'medium',
-    high: 'high',
-    xhigh: 'high',
-    max: 'high',
-  };
-  const level = full[effort] ?? 'low';
-  if (levelOnlyLowHigh(modelId)) return level === 'high' ? 'high' : 'low';
-  return level;
+/** A Gemini thought signature carried in canonical provider metadata, if any. */
+function thoughtSignatureOf(meta: Record<string, unknown> | undefined): string | undefined {
+  const google = meta?.google as { thoughtSignature?: unknown } | undefined;
+  return typeof google?.thoughtSignature === 'string' ? google.thoughtSignature : undefined;
 }
 
 function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart | null {
   switch (part.type) {
-    case 'text':
-      return { text: part.text };
+    case 'text': {
+      // Gemini can sign a plain text part too (2.3, F21): echo it back on it.
+      const sig = thoughtSignatureOf(part.providerMetadata);
+      return sig ? { text: part.text, thoughtSignature: sig } : { text: part.text };
+    }
     case 'image': {
       // This wire already carries documents correctly: inlineData/fileData pass
       // the mimeType straight through, so an `ImagePart` holding a PDF (the
@@ -117,6 +121,12 @@ function partToGemini(part: Part, toolNameById: Map<string, string>): GeminiPart
     }
     case 'reasoning': {
       // Echo thought summary; carry the signature so multi-step tool use round-trips.
+      // Only Gemini's own thoughts (2.3, F21): an OpenAI encrypted item or a
+      // Claude signature is no thought signature (they used to ride as one).
+      // Gemini never produces an encrypted or redacted part, and it reads
+      // thought text as free text, so a flagged part is never sent, whatever
+      // its `source` claims.
+      if (part.encrypted || part.redacted || !replaysTo(part, 'google')) return null;
       const gp: GeminiPart = { text: part.text, thought: true };
       if (part.signature) gp.thoughtSignature = part.signature;
       return gp;
@@ -155,9 +165,18 @@ function toGeminiContents(messages: NormalizedMessage[]): {
   };
 }
 
-function mapToolChoice(choice: ToolChoice | undefined): unknown {
+function mapToolChoice(ctx: BuildContext, choice: ToolChoice | undefined): unknown {
   if (!choice || choice === 'auto') return { functionCallingConfig: { mode: 'AUTO' } };
   if (choice === 'none') return { functionCallingConfig: { mode: 'NONE' } };
+  // A forced choice the row says the model rejects goes out as AUTO, reported (2.3).
+  if (ctx.caps.forcedToolChoice === false && isForcedToolChoice(choice)) {
+    reportClamp(
+      ctx,
+      'toolChoice',
+      `toolChoice ${describeToolChoice(choice)} was sent as 'auto': ${ctx.call.modelId} rejects a forced tool_choice.`,
+    );
+    return { functionCallingConfig: { mode: 'AUTO' } };
+  }
   if (choice === 'required') return { functionCallingConfig: { mode: 'ANY' } };
   if (typeof choice === 'object' && choice.type === 'tool') {
     return { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [choice.toolName] } };
@@ -166,30 +185,22 @@ function mapToolChoice(choice: ToolChoice | undefined): unknown {
 }
 
 function buildRequest(ctx: BuildContext): AdapterRequest {
-  const { call, messages, caps, options, object, tools } = ctx;
+  const { call, messages, options, object, tools } = ctx;
   const { systemInstruction, contents } = toGeminiContents(messages);
+  assertToolSurface(ctx, 'native');
 
-  const generationConfig: Record<string, unknown> = {
-    maxOutputTokens: options.maxOutputTokens ?? caps.maxOutput,
-  };
+  // An unknown model's placeholder cap is left off (2.3): Gemini's own default
+  // (the model's maximum) applies instead of a guess.
+  const maxOutput = optionalOutputCap(ctx.caps, options);
+  const generationConfig: Record<string, unknown> =
+    maxOutput !== undefined ? { maxOutputTokens: maxOutput } : {};
   if (options.temperature !== undefined) generationConfig.temperature = options.temperature;
   if (options.topP !== undefined) generationConfig.topP = options.topP;
   if (options.stopSequences) generationConfig.stopSequences = options.stopSequences;
 
   // Thinking (gate strictly by model family — never send both level AND budget).
-  if (caps.reasoning && options.effort && options.effort !== 'none') {
-    if (usesThinkingLevel(call.modelId)) {
-      generationConfig.thinkingConfig = {
-        includeThoughts: true,
-        thinkingLevel: thinkingLevelFor(call.modelId, options.effort),
-      };
-    } else {
-      generationConfig.thinkingConfig = {
-        includeThoughts: true,
-        thinkingBudget: BUDGET_MAP[options.effort] ?? 12288,
-      };
-    }
-  }
+  const thinkingConfig = thinkingConfigFor(ctx);
+  if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
 
   // Structured output (json strategy → responseSchema / responseJsonSchema).
   if (object) {
@@ -206,7 +217,23 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
   const body: Record<string, unknown> = { contents, generationConfig };
   if (systemInstruction) body.systemInstruction = systemInstruction;
 
-  if (tools && tools.tools.length > 0 && !object) {
+  if (tools && tools.tools.length > 0 && object) {
+    // A structured-output request does not carry the call's tools on this wire
+    // (2.3, F15): @google/genai 2.28.0 documents no request that combines
+    // function declarations with a JSON response schema (not live-verified).
+    // runAgent's finalization sends `toolChoice: 'none'`, which the API defines
+    // as behaving like a request without declarations, so nothing is lost
+    // there; any other drop of callable tools is reported.
+    if (tools.toolChoice !== 'none') {
+      reportRequestWarning(ctx, {
+        type: 'unsupported-tool',
+        message:
+          `Dropped ${tools.tools.length} tool(s) (${tools.tools.map((t) => t.name).join(', ')}): ` +
+          'the Gemini native wire sends no tools with a structured-output request, so ' +
+          `${call.provider}/${call.modelId} will answer without them.`,
+      });
+    }
+  } else if (tools && tools.tools.length > 0) {
     const fns = tools.tools.filter((t) => !t.provider);
     const providerTools = tools.tools.filter((t) => t.provider).map((t) => t.provider!);
     const entries: unknown[] = [];
@@ -221,7 +248,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
     }
     entries.push(...providerTools); // e.g. { google_search: {} } — separate array members
     body.tools = entries;
-    if (fns.length > 0) body.toolConfig = mapToolChoice(tools.toolChoice);
+    if (fns.length > 0) body.toolConfig = mapToolChoice(ctx, tools.toolChoice);
   }
 
   // Opaque explicit-cache passthrough (the cacheStore seam creates it elsewhere).
@@ -260,40 +287,81 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
 export function mapGeminiUsage(u: GeminiUsageMetadata | undefined): Usage {
   const prompt = u?.promptTokenCount ?? 0;
   const cached = u?.cachedContentTokenCount ?? 0;
+  // Gemini counts thoughts beside the candidates; the contract folds them into
+  // outputTokens (both bill at the output rate) and keeps reasoningTokens a subset.
+  const thoughts = u?.thoughtsTokenCount ?? 0;
+  const output = (u?.candidatesTokenCount ?? 0) + thoughts;
   const audio = (u?.promptTokensDetails ?? [])
     .concat(u?.candidatesTokensDetails ?? [])
     .filter((d) => d.modality === 'AUDIO')
     .reduce((sum, d) => sum + (d.tokenCount ?? 0), 0);
   const usage: Usage = {
     inputTokens: Math.max(0, prompt - cached),
-    outputTokens: u?.candidatesTokenCount ?? 0,
-    reasoningTokens: u?.thoughtsTokenCount ?? 0,
+    outputTokens: output,
+    reasoningTokens: thoughts,
     cachedReadTokens: cached,
     cacheWriteTokens: 0, // Gemini has no per-request cache-write counter
     cacheWrite1hTokens: 0,
-    totalTokens: u?.totalTokenCount ?? prompt + (u?.candidatesTokenCount ?? 0),
+    totalTokens: u?.totalTokenCount ?? prompt + output,
   };
   if (audio > 0) usage.audioTokens = audio;
   return usage;
 }
 
-function mapFinishReason(reason: string | undefined, sawFunctionCall: boolean): FinishReason {
-  // STOP-BUG guard: a tool turn finishes as 'STOP' — override when a call was seen.
-  if (sawFunctionCall) return 'tool_calls';
+/** Every `FinishReason` value of @google/genai 2.28, mapped on purpose (2.3). Not live-verified. */
+function geminiFinish(reason: string | undefined): FinishReason {
   switch (reason) {
+    case 'STOP':
+    // The enum's unset value: nothing says the turn ended early.
+    case 'FINISH_REASON_UNSPECIFIED':
+      return 'stop';
     case 'MAX_TOKENS':
+    // The per-request token limit cut the answer off (Deuz sends no continuation token).
+    case 'CONTINUATION':
       return 'length';
+    // The filters: SPII and the image filters ended a turn with 'stop' before 2.3.
     case 'SAFETY':
     case 'RECITATION':
     case 'BLOCKLIST':
     case 'PROHIBITED_CONTENT':
+    case 'SPII':
     case 'IMAGE_SAFETY':
+    case 'IMAGE_PROHIBITED_CONTENT':
+    case 'IMAGE_RECITATION':
       return 'content_filter';
-    case 'STOP':
+    // Stopped without a usable answer: an invalid or unexpected call, too many
+    // calls in a row, no image, an unsupported language, or a reason Gemini
+    // does not name. 'stop', as before 2.3, so a native run re-asks through
+    // output repair or goes on to finalization, as after an empty answer; the
+    // finish part names the value itself.
+    case 'MALFORMED_FUNCTION_CALL':
+    case 'UNEXPECTED_TOOL_CALL':
+    case 'TOO_MANY_TOOL_CALLS':
+    case 'NO_IMAGE':
+    case 'LANGUAGE':
+    case 'OTHER':
+    case 'IMAGE_OTHER':
       return 'stop';
     default:
       return 'stop'; // enum evolves — handle defensively
   }
+}
+
+/**
+ * A Gemini turn's finish reason, shared with the batch parser. A blocked
+ * prompt is filtered. STOP-BUG guard: a tool turn finishes as 'STOP', so a
+ * turn that carried a call ends with 'tool_calls' — unless a filter or a limit
+ * stopped it (2.3), which the finish-reason gate must see to hold the call back.
+ */
+export function mapGeminiFinishReason(
+  reason: string | undefined,
+  sawFunctionCall: boolean,
+  blocked = false,
+): FinishReason {
+  if (blocked) return 'content_filter';
+  const mapped = geminiFinish(reason);
+  if (sawFunctionCall && mapped !== 'content_filter' && mapped !== 'length') return 'tool_calls';
+  return mapped;
 }
 
 interface GeminiStreamEvent {
@@ -350,9 +418,18 @@ async function* parseStream(
           type: 'reasoning-delta',
           text: part.text ?? '',
           ...(part.thoughtSignature ? { signature: part.thoughtSignature } : {}),
+          source: 'google',
         };
       } else if (typeof part.text === 'string') {
-        yield { type: 'text-delta', text: part.text };
+        // A plain text part can carry the signature too, often in a final chunk
+        // whose text is empty (2.3, F21): it rides on the text it belongs to.
+        yield {
+          type: 'text-delta',
+          text: part.text,
+          ...(part.thoughtSignature
+            ? { providerMetadata: { google: { thoughtSignature: part.thoughtSignature } } }
+            : {}),
+        };
       }
     }
 
@@ -364,12 +441,19 @@ async function* parseStream(
     }
   }
 
-  const finishReason = blocked ? 'content_filter' : mapFinishReason(lastFinish, sawFunctionCall);
+  const finishReason = mapGeminiFinishReason(lastFinish, sawFunctionCall, blocked !== undefined);
   ctx.usageAvailable?.(
     typeof lastUsage?.promptTokenCount === 'number' &&
       typeof lastUsage.candidatesTokenCount === 'number',
   );
-  yield { type: 'finish', usage: mapGeminiUsage(lastUsage), finishReason };
+  yield {
+    type: 'finish',
+    usage: mapGeminiUsage(lastUsage),
+    finishReason,
+    // Gemini's own value (2.3), the batch parser's key too: several values end
+    // with 'stop', so it is how a caller tells `OTHER` from `STOP`.
+    ...(lastFinish ? { providerMetadata: { google: { finishReason: lastFinish } } } : {}),
+  };
 }
 
 // --- error mapping ---

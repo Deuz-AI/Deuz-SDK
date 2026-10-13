@@ -1,10 +1,18 @@
 import type { CommonCallOptions } from '../types/config';
-import type { CallWarning, StreamChatResult } from '../types/methods';
+import type { CallWarning, StopDetails, StreamChatResult } from '../types/methods';
 import type { GuardrailPart, StreamPart, ToolRunState } from '../types/stream';
 import type { Message } from '../types/message';
 import type { Usage, FinishReason } from '../types/usage';
-import type { ToolCall, ToolSet, StepResult, ToolApprovalRequest } from '../types/tool';
+import type {
+  ToolCall,
+  ToolCallOutcome,
+  ToolResult,
+  ToolSet,
+  StepResult,
+  ToolApprovalRequest,
+} from '../types/tool';
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
+import type { WireToolRequest } from '../adapters/types';
 import { runStream } from '../core/inference';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { resolveSignal } from '../internal/resolve-call';
@@ -16,17 +24,29 @@ import {
 } from '../internal/observe-runtime';
 import { toObservedError } from '../internal/observe-error';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from '../internal/async-iter';
-import { createWarningSink } from '../internal/warnings';
+import { createWarningSink, type WarningSink } from '../internal/warnings';
 import type { MemoryMutation } from '../memory';
-import { assembleAssistant, type ToolArgMap, type EncryptedReasoning } from './run-step';
+import {
+  blocksToolDispatch,
+  createTurnContent,
+  stopDetailsFrom,
+  type ToolArgMap,
+  type TurnContent,
+} from './run-step';
 import { EMPTY_USAGE, withTotal, fireFinish } from '../core/metering';
 import {
   buildWireTools,
   filterWireTools,
+  rootStaticWire,
+  stabilizeStepWire,
+  offeredTools,
   applyPrepareStep,
   setupMcp,
   mergeMcpTools,
   refreshMcpTools,
+  catalogChangePolicy,
+  legacyCatalogVerdict,
+  MCP_CATALOG_CHANGED_STOPPED_BY,
   closeMcp,
   setupCompaction,
   runCompaction,
@@ -37,32 +57,30 @@ import {
   executeTools,
   toToolResultPart,
   toStepResult,
-  pendingClientCalls,
   isUnknownTool,
   bumpErrorGuard,
   normalizeStop,
   needsCost,
   shouldStop,
   sumUsage,
-  findApprovalNeeded,
-  resolveServerApprovals,
+  planToolDispatch,
+  policyRefusalOf,
   settlePendingApprovals,
+  continueStoredRun,
+  requestCountsOf,
   saveCheckpoint,
   prepareChatPersistence,
   persistChat,
-  computeRecallBlock,
+  planRecall,
   withSystemBlock,
   startMemoryExtract,
   durableUsage,
-  toApprovalRequests,
   signApprovalRequests,
   preserveClientContext,
   beginLoopObserve,
   endLoopObserve,
   emitStepStarted,
   emitStepCompleted,
-  observeApprovalRequests,
-  observeServerResolutions,
   evaluateVerifyStep,
   verifyFeedbackMessage,
   evaluateDoneWhen,
@@ -71,7 +89,6 @@ import {
   FALSE_FINISH_STOPPED_BY,
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
-  applyToolCallGuardrails,
   logGuardrailParts,
   rewriteAssistantText,
   isEmptyTurn,
@@ -79,20 +96,23 @@ import {
   GUARDRAIL_OUTPUT_STOPPED_BY,
   collectHandoffTools,
   hasHandoffTools,
-  splitHandoffCalls,
-  decideHandoff,
   mergeResultsInCallOrder,
   applyHandoffSwap,
   resumeHandoffState,
   SubAgentSuspension,
+  modelGate,
+  setModelGate,
   type ActiveAgentState,
+  type CatalogChangeVerdict,
   type CompactionTrigger,
   type Denial,
+  type DurableResume,
   type DurableRunner,
   type ExecuteExtras,
   type GuardrailLogEntry,
   type HandoffLogEntry,
   type LoopOutcome,
+  type ModelGate,
 } from './loop-shared';
 import type { CompactionEvent } from './compaction';
 import type { UsageCostSnapshot } from '../internal/usage-cost';
@@ -117,7 +137,7 @@ export interface StreamToolLoopInternal {
   onSnapshot?: (snapshot: StreamToolLoopSnapshot) => void;
   /** Captures the loop outcome in the same native transaction as its checkpoint. */
   onCheckpoint?: (snapshot: StreamToolLoopSnapshot) => void;
-  resumeFrom?: { stepIndex: number; usage: Usage };
+  resumeFrom?: DurableResume;
   /**
    * Handoff (2.0): the checkpoint's active agent, re-applied before the first
    * step of a resume leg. Set directly when the history is already at hand; the
@@ -128,7 +148,7 @@ export interface StreamToolLoopInternal {
   resumeLoad?: (rt?: ObservationRuntime) => Promise<{
     cost?: UsageCostSnapshot;
     messages: Message[];
-    resumeFrom: { stepIndex: number; usage: Usage };
+    resumeFrom: DurableResume;
     /** Handoff (2.0): `AgentCheckpoint.handoff`, when the checkpoint carried one. */
     handoff?: { to: string; count: number };
     /** Observation (1.6): checkpoint correlation for run.started. */
@@ -138,6 +158,61 @@ export interface StreamToolLoopInternal {
   observeResume?: { stepId: string; stepIndex: number; checkpointAgeMs?: number };
   /** Observation (1.6): sub-agent — share the parent runtime, emit no run.* events. */
   observeInherited?: { runtime: ObservationRuntime; parentSpanId?: string };
+  /**
+   * Native runs (2.3, F01): the MCP runtime the native runner resolved before it
+   * admitted the run, because the servers' catalog is part of its resume
+   * binding. The loop uses it in place of connecting `options.mcp`, and never
+   * closes it: the runner does. Its tools already pass through the runner's
+   * effect receipts, and so does every catalog a hot refresh brings.
+   */
+  mcp?: {
+    runtime: ResolvedMcpRuntime;
+    /**
+     * Called after each hot refresh, before the refreshed catalog reaches the
+     * wire. The runner applies its `onCatalogChange` (2.3): it records an
+     * accepted catalog, or stops the run; its warnings go out as `warning` parts.
+     */
+    refreshed(): Promise<CatalogChangeVerdict>;
+  };
+  /**
+   * The warning sink of a run this loop is one part of (2.3), in place of the
+   * loop's own: a runner that drives several loops and model calls for one run
+   * passes the same sink to each, so the run reports and streams every warning
+   * once.
+   */
+  warnings?: WarningSink;
+  /**
+   * Native runs (2.3): whether the run's effect receipt already records the
+   * outcome of a pending call. The resume settle answers such a call from its
+   * receipt and never gates it again (see `settlePendingApprovals`).
+   */
+  recorded?: (call: ToolCall) => boolean;
+  /**
+   * Native runs (2.3): records what the resume settle answered, before the
+   * leg's first model call. Called once the settle answered the pending calls
+   * (and applied a transfer among them), with the history, the run's usage and
+   * its active handoff; the runner saves them as the run's checkpoint. A
+   * denial, a client result or an answer from a receipt then survives a failure
+   * of that call, and no later resume settles the turn again.
+   */
+  settled?: (state: {
+    messages: Message[];
+    usage: Usage;
+    handoff?: { to: string; count: number };
+  }) => Promise<void>;
+  /**
+   * Native runs (2.3): whether a stop condition that fired leaves the run to go
+   * on (a lease drain). Its checkpoint is saved as the running step boundary it
+   * is, not as a completed loop, so `checkpoint.saved` reports what is stored.
+   */
+  resumableStop?: (stoppedBy: string | undefined) => boolean;
+  /**
+   * Native runs (2.3): tools only the resume settle sees, over the leg's own.
+   * The runner passes its client tools here with an executor that answers a
+   * call from the result the resume supplied or a receipt recorded; the loop's
+   * steps keep them without one, so a later call still suspends.
+   */
+  settleTools?: ToolSet;
 }
 
 export interface StreamToolLoopSnapshot {
@@ -151,6 +226,14 @@ export interface StreamToolLoopSnapshot {
   pendingApprovals: ToolApprovalRequest[];
   pendingClientCalls: ToolCall[];
   verified?: boolean;
+  /** The provider's stop explanation for the last step (2.3), e.g. a refusal's category. */
+  stopDetails?: StopDetails;
+  /**
+   * The tool request the last model call carried (2.3). Native finalization
+   * sends the same tools (with `tool_choice: 'none'`), so the conversation's
+   * tool definitions stay byte-identical up to the final answer.
+   */
+  wire?: WireToolRequest;
   error?: unknown;
   handoff?: { to: string; count: number };
 }
@@ -173,6 +256,8 @@ export function runStreamToolLoop(
   const broadcaster = createBroadcaster<StreamPart>();
   const usageDeferred = createDeferred<Usage>();
   const finishDeferred = createDeferred<FinishReason>();
+  // The last step's stop explanation (2.3): settles with `finishReason`.
+  const stopDetailsDeferred = createDeferred<StopDetails | undefined>();
   const fullSub = broadcaster.subscribe();
   const textSub = broadcaster.subscribe();
   // Memory extraction settlement (1.7, D1) — synchronous field, resolved by
@@ -185,8 +270,13 @@ export function runStreamToolLoop(
   // every iteration is reported once. It ALWAYS mirrors to `deps.logger.warn`
   // (internal/warnings.ts), which is why log-only callers see no change — the
   // readout is additive. Unconditional, like `fallback.ts`'s twin: `warnings` is
-  // a declared always-present readout, never an opt-in.
-  const warningSink = createWarningSink(deps.logger);
+  // a declared always-present readout, never an opt-in. A runner that owns
+  // the whole run may hand in its own sink (2.3).
+  const warningSink = internal?.warnings ?? createWarningSink(deps.logger);
+  /** MCP name collisions (2.3) reach the same sink. */
+  const warn = (warning: CallWarning): void => {
+    warningSink.add(warning);
+  };
   const warningsDeferred = createDeferred<CallWarning[]>();
 
   let started = false;
@@ -313,6 +403,7 @@ export function runStreamToolLoop(
         broadcaster.push({ type: 'error', error: err });
         usageDeferred.reject(err);
         finishDeferred.reject(err);
+        stopDetailsDeferred.reject(err);
         if (preRt) {
           // run.started never fired — the leg dies at load (checkpoint.failed
           // was emitted by the closure); report the run failure once.
@@ -339,12 +430,16 @@ export function runStreamToolLoop(
       internal?.resumeFrom !== undefined || internal?.resumeLoad !== undefined,
     );
     let chatMessages = chatPersistence.messages;
+    // A USD budget needs the accumulator even without a price provider (2.3):
+    // every model is then unpriced, and `budget.unknownPrice` decides.
     const usageCost =
-      !options.execution && (deps.priceProvider || resumeCost)
+      !options.execution && (deps.priceProvider || resumeCost || options.budget?.usd !== undefined)
         ? (await import('../internal/usage-cost')).createUsageCostAccumulator({
             priceProvider: deps.priceProvider,
             snapshot: resumeCost,
             unpricedBaseUsage: !resumeCost && (resumeFrom?.usage.totalTokens ?? 0) > 0,
+            budget: options.budget,
+            warnings: warningSink,
           })
         : undefined;
     if (usageCost)
@@ -352,6 +447,18 @@ export function runStreamToolLoop(
         ...options,
         onUsage: usageCost.wrap(options.onUsage ?? deps.onUsage),
       });
+    // Decision 4 (2.3): every model this run calls, compaction summaries
+    // included, passes its own unknown-price gate and that of the loop whose
+    // `agentTool` started it. Kept on `deps`, so the tools' copy carries it on.
+    const parentGate = modelGate(deps);
+    const admitModel: ModelGate | undefined =
+      usageCost || parentGate
+        ? async (modelId) => {
+            await usageCost?.admit(modelId);
+            await parentGate?.(modelId);
+          }
+        : undefined;
+    setModelGate(deps, admitModel);
     const durable: DurableRunner | undefined =
       options.session && runId !== undefined
         ? {
@@ -359,6 +466,7 @@ export function runStreamToolLoop(
             runId,
             baseUsage: resumeFrom?.usage ?? EMPTY_USAGE,
             stepIndex: resumeFrom?.stepIndex ?? 0,
+            approvalRequestCounts: requestCountsOf(resumeFrom?.approvalRequestCounts),
             cost: usageCost,
           }
         : undefined;
@@ -394,6 +502,14 @@ export function runStreamToolLoop(
     let snapshotApprovals: ToolApprovalRequest[] = [];
     let snapshotClientCalls: ToolCall[] = [];
     let lastFinish: FinishReason = 'stop';
+    /**
+     * The last step's provider finish detail (2.3) — carried onto the loop's
+     * `finish` part exactly as a single-turn stream carries it, so a refusal's
+     * `stop_details` survives the loop.
+     */
+    let lastFinishMeta: Record<string, unknown> | undefined;
+    /** The tool request of the last model call (2.3), for native finalization. */
+    let lastWire: WireToolRequest | undefined;
     let stoppedBy: string | undefined;
     let prevCostUsd = 0;
     let stepIndex = resumeFrom?.stepIndex ?? 0;
@@ -433,7 +549,8 @@ export function runStreamToolLoop(
      */
     const handoffLog: HandoffLogEntry[] = [];
     if (durable && internal?.onCheckpoint) {
-      durable.beforeSave = (checkpoint) =>
+      durable.beforeSave = (checkpoint) => {
+        const stopDetails = stopDetailsFrom(lastFinishMeta);
         internal.onCheckpoint!({
           messages: checkpoint.messages,
           steps: [...steps],
@@ -445,8 +562,10 @@ export function runStreamToolLoop(
           pendingApprovals: checkpoint.pendingApprovals ?? [],
           pendingClientCalls: snapshotClientCalls,
           verified,
+          ...(stopDetails ? { stopDetails } : {}),
           ...(checkpoint.handoff ? { handoff: checkpoint.handoff } : {}),
         });
+      };
     }
 
     // Mutated per iteration so tool events parent under the current step span;
@@ -508,9 +627,18 @@ export function runStreamToolLoop(
      */
     const failRun = async (error: unknown): Promise<void> => {
       terminalError = error;
+      // What the run collected still reaches the stream (2.3).
+      flushWarnings();
+      // A call the execution policy refused ends the run; the stream still says
+      // which call it was, and why (2.3), before the error.
+      const refused = policyRefusalOf(error);
+      if (refused !== undefined) {
+        toolState(refused, toolNames.get(refused), 'error', undefined, 'permission-denied');
+      }
       broadcaster.push({ type: 'error', error });
       usageDeferred.reject(error);
       finishDeferred.reject(error);
+      stopDetailsDeferred.reject(error);
       if (lo) {
         endLoopObserve(lo, deps, options, {
           finishReason: 'error',
@@ -552,18 +680,13 @@ export function runStreamToolLoop(
     };
 
     /**
-     * Push whatever the sink recorded since the last flush as live `warning`
-     * parts (1.9). Driven off `list()` rather than `add`'s return so the sink
-     * stays the single owner of dedup and of the 50-entry cap: an entry it
-     * dropped or collapsed never reaches the stream twice.
+     * Push what the sink recorded and no stream carried yet as live `warning`
+     * parts (1.9). The sink stays the single owner of dedup, of the 50-entry
+     * cap and of what was carried (`take`, 2.3): a warning a step's own stream
+     * already carried, and this loop forwarded, never goes out twice.
      */
-    let warningsEmitted = 0;
     const flushWarnings = (): void => {
-      const all = warningSink.list();
-      for (let i = warningsEmitted; i < all.length; i++) {
-        broadcaster.push({ type: 'warning', warning: all[i]! });
-      }
-      warningsEmitted = all.length;
+      for (const warning of warningSink.take()) broadcaster.push({ type: 'warning', warning });
     };
 
     const emitApprovalRequests = (requests: ToolApprovalRequest[]): void => {
@@ -589,11 +712,15 @@ export function runStreamToolLoop(
     // call a human refused. It changes ONLY what the UI is told — the model
     // still receives the same is_error tool_result it always did, and the
     // reason is the one the denier supplied (never invented here).
+    //
+    // `outcome` (2.3) names what the dispatch contract decided — set with a
+    // terminal 'error' and with 'awaiting-approval'.
     const toolState = (
       toolCallId: string,
       toolName: string | undefined,
       state: ToolRunState,
       denial?: Denial,
+      outcome?: ToolCallOutcome,
     ): void => {
       broadcaster.push({
         type: 'tool-state',
@@ -603,16 +730,40 @@ export function runStreamToolLoop(
         ...(denial
           ? { denied: true, ...(denial.reason ? { deniedReason: denial.reason } : {}) }
           : {}),
+        ...(outcome ? { outcome } : {}),
       });
+    };
+    /** The tool name behind each streamed `tool-call` id (a policy refusal names only the id). */
+    const toolNames = new Map<string, string>();
+    /** The `tool-result` part and terminal `tool-state` part for one settled call. */
+    const publishResult = (r: ToolResult, denial?: Denial): void => {
+      broadcaster.push({
+        type: 'tool-result',
+        toolCallId: r.toolCallId,
+        toolName: r.toolName,
+        output: r.result,
+        ...(r.isError ? { isError: true } : {}),
+        ...(r.outcome ? { outcome: r.outcome } : {}),
+      });
+      toolState(r.toolCallId, r.toolName, r.isError ? 'error' : 'complete', denial, r.outcome);
     };
 
     try {
+      // A plain leg of a stored durable run continues its step counter (2.3), so
+      // no approval is bound to a step the run already used. Inside the try: a
+      // strict read failure ends the run as an `error` part (G2).
+      const suspendedAt =
+        durable && resumeFrom === undefined
+          ? await continueStoredRun(durable, options, deps)
+          : undefined;
+      // What a mid-run MCP catalog change does (2.3); an unknown value fails the run.
+      const catalogPolicy = catalogChangePolicy(options);
       // Zero-config MCP (2.0): connect BEFORE the wire is built so the servers'
       // tools ride the very first model call. Inside the try on purpose — an
       // unreachable server rejects here, and the pump's catch turns that into an
       // `error` part with rejected promises, which is what keeps G2 intact.
-      mcp = await setupMcp(options, deps);
-      tools = mergeMcpTools(mcp, ownTools);
+      mcp = internal?.mcp ? internal.mcp.runtime : await setupMcp(options, deps, warn);
+      tools = mergeMcpTools(mcp, ownTools, warn);
       // Handoff (2.0): the transfer catalog is read from the ROOT set, ONCE — an
       // agent's own set never carries a transfer to itself, so re-deriving it
       // later would lose targets one by one.
@@ -631,64 +782,75 @@ export function runStreamToolLoop(
           deps.logger,
         );
         ownTools = active.tools;
-        tools = mergeMcpTools(mcp, ownTools);
+        tools = mergeMcpTools(mcp, ownTools, warn);
         if (durable) durable.handoff = resumeHandoff;
         retargetCompaction(compactionRunner, options, deps, active.model);
       }
       let fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
       let staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
       flushWarnings();
+      // The tools array a request to a model that binds thinking to the prefix
+      // carries on every step of the leg (2.3, F22): the ROOT agent's static
+      // wire, also on a leg that resumes as a handoff target.
+      const declaredWire = active ? await rootStaticWire(options, mcp) : staticWire;
 
       // Resume: settle the previous break's pending approvals BEFORE step 1 —
       // their tool-result parts precede the first step-start. A durable
       // sub-agent that re-suspends here suspends THIS run again immediately.
       try {
+        // The pending calls were issued BEFORE the transfer, by an agent whose
+        // tools the overlay above has already replaced. Settling them against
+        // the active set alone would report a human-APPROVED call as a
+        // hallucinated name, so the settle — and only the settle — also sees
+        // the set the call came in with.
+        const settleSet = active
+          ? mergeMcpTools(mcp, { ...(options.tools ?? {}), ...active.tools })
+          : tools;
         const settled = await settlePendingApprovals(
           messages,
-          // The pending calls were issued BEFORE the transfer, by an agent whose
-          // tools the overlay above has already replaced. Settling them against
-          // the active set alone would report a human-APPROVED call as a
-          // hallucinated name, so the settle — and only the settle — also sees
-          // the set the call came in with.
-          active ? mergeMcpTools(mcp, { ...(options.tools ?? {}), ...active.tools }) : tools,
+          internal?.settleTools ? { ...settleSet, ...internal.settleTools } : settleSet,
           options,
           extras,
           {
-            beforeExecute: (calls, deniedIds) => {
+            beforeExecute: (calls, deniedIds, offered) => {
               for (const call of calls) {
                 // Unknown names never execute either (1.9) — no 'executing' state.
-                if (!deniedIds.has(call.toolCallId) && !isUnknownTool(tools, call.toolName)) {
+                // Nor does a tool the step withdrew (2.3, F22).
+                if (!deniedIds.has(call.toolCallId) && !isUnknownTool(offered, call.toolName)) {
                   toolState(call.toolCallId, call.toolName, 'executing');
                 }
               }
             },
           },
           { ...(active ? { active } : {}), tools: handoffTools },
+          // The identity the suspended leg bound its approvals to (2.3).
+          {
+            runId: durable?.runId,
+            step: resumeFrom?.stepIndex ?? suspendedAt,
+            approvalRequestCounts: durable?.approvalRequestCounts,
+          },
+          // On a stable prefix (2.3, F22) a pending call resolves against the set
+          // its step offered, as it would have in the step.
+          { model: active?.model ?? options.model, tools: declaredWire.tools },
+          // A native run's receipts answer the calls whose outcome they record (2.3).
+          internal?.recorded,
         );
         if (settled) {
-          const settledMessages = settled.messages.slice(messages.length);
-          appended.push(...settledMessages);
-          chatMessages = [...chatMessages, ...settledMessages];
+          // A verdict for a call its receipt answered decided nothing (2.3).
+          for (const warning of settled.warnings) warningSink.add(warning);
+          flushWarnings();
+          // Not the tail of `settled.messages`: a break that committed a handoff
+          // may have left the target's instructions after it (2.3, F22).
+          appended.push(settled.toolMessage);
+          chatMessages = [...chatMessages, settled.toolMessage];
           messages = settled.messages;
           emitGuardrails(settled.guardrails);
           for (const r of settled.results) {
-            broadcaster.push({
-              type: 'tool-result',
-              toolCallId: r.toolCallId,
-              toolName: r.toolName,
-              output: r.result,
-              ...(r.isError ? { isError: true } : {}),
-            });
             // The resume leg's verdicts (explicit `approvalResponses` denial,
             // default-deny, an unverifiable signed approval, a client tool the
             // caller never answered) carry the reason the CLIENT supplied — it
             // reaches the UI here or nowhere.
-            toolState(
-              r.toolCallId,
-              r.toolName,
-              r.isError ? 'error' : 'complete',
-              settled.denied.get(r.toolCallId),
-            );
+            publishResult(r, settled.denied.get(r.toolCallId));
           }
           // A transfer left unanswered by an earlier leg is applied HERE: from
           // this point the resume leg is the target agent.
@@ -705,7 +867,7 @@ export function runStreamToolLoop(
             handoffLog.push(swap.entry);
             broadcaster.push({ type: 'handoff', ...swap.entry });
             ownTools = active.tools;
-            tools = mergeMcpTools(mcp, ownTools);
+            tools = mergeMcpTools(mcp, ownTools, warn);
             fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
             staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
             flushWarnings();
@@ -721,6 +883,12 @@ export function runStreamToolLoop(
               (r) => !settled.deniedIds.has(r.toolCallId) && !handoffIds.has(r.toolCallId),
             ),
           );
+          // A native run records the answers before its first model call (2.3).
+          await internal?.settled?.({
+            messages,
+            usage: withTotal(durableUsage(durable, totalUsage)),
+            ...(durable?.handoff ? { handoff: durable.handoff } : {}),
+          });
         }
       } catch (err) {
         if (!(err instanceof SubAgentSuspension)) throw err;
@@ -744,9 +912,11 @@ export function runStreamToolLoop(
           ...checkpointRef(),
         };
         const usage = withTotal(totalUsage);
+        flushWarnings();
         broadcaster.push({ type: 'finish', usage, finishReason: lastFinish });
         usageDeferred.resolve(usage);
         finishDeferred.resolve(lastFinish);
+        stopDetailsDeferred.resolve(stopDetailsFrom(lastFinishMeta));
         fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
         observeEnd();
         broadcaster.close();
@@ -757,13 +927,25 @@ export function runStreamToolLoop(
         return;
       }
 
-      // Memory recall (1.7, D1): computed once per call and spliced into the
-      // system context AT THE CALL SITE only — the canonical history (and so
-      // checkpoints + chat persistence) never bakes the recall block in, and
-      // resume legs cannot double-inject it.
+      // Memory recall (1.7, D1): computed once per leg. On a model that binds
+      // thinking to the prefix (2.3, F22) it is one appended system message
+      // (see `planRecall`); elsewhere it is spliced into the system context AT
+      // THE CALL SITE only — the canonical history (and so checkpoints + chat
+      // persistence) never bakes the block in, and resume legs cannot
+      // double-inject it. The run's first model decides which, on every leg: a
+      // leg that resumes as a handoff target reads its recall where the first
+      // leg put it.
       // Its observation parents under the RUN span (no step is open yet).
-      const recallBlock = await computeRecallBlock(options, deps, messages, observeCtx);
-      // Recall overhead (2.0): the block never enters `messages`, but the
+      const recall = await planRecall(
+        options,
+        deps,
+        messages,
+        options.model,
+        observeCtx,
+        resumeFrom !== undefined,
+      );
+      const recallBlock = recall.splice;
+      // Recall overhead (2.0): a spliced block never enters `messages`, but the
       // provider counts it. Both the compaction threshold and the EMA
       // calibration have to see the same total.
       const recallOverheadTokens =
@@ -789,6 +971,7 @@ export function runStreamToolLoop(
           }
           const usage = withTotal(totalUsage);
           const deuzMeta = finishMeta();
+          flushWarnings();
           broadcaster.push({
             type: 'finish',
             usage,
@@ -797,6 +980,7 @@ export function runStreamToolLoop(
           });
           usageDeferred.resolve(usage);
           finishDeferred.resolve(lastFinish);
+          stopDetailsDeferred.resolve(stopDetailsFrom(lastFinishMeta));
           fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
           observeEnd();
           broadcaster.close();
@@ -807,6 +991,13 @@ export function runStreamToolLoop(
           return;
         }
         messages = guarded.messages;
+      }
+      // The stable-prefix recall message (2.3): after the guardrails, which
+      // judge the caller's input, and before the first model call.
+      if (recall.message) {
+        messages = [...messages, recall.message];
+        appended.push(recall.message);
+        chatMessages = [...chatMessages, recall.message];
       }
 
       // Cost continuity (1.7, D2): resume legs seed prevCostUsd with the prior
@@ -821,6 +1012,35 @@ export function runStreamToolLoop(
         assertStepDeadline();
         stepTimeout?.clear();
         stepTimeout = createStepTimeout(deps.clock, timeouts.stepMs);
+        // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
+        // the last step is re-read HERE, before the step starts, so the new
+        // catalog is on the wire from the very next call. Both wires are rebuilt
+        // so `activeTools` still applies to the refreshed set; `prepareStep`
+        // below keeps the last word. A catalog that really changed is reported,
+        // or ends the run before any model sees it (2.3, `onCatalogChange`): a
+        // native run decides that itself and records the catalog it accepts.
+        if (mcp?.changed()) {
+          const before = mcp.tools;
+          // `ownTools`, not `options.tools`: after a handoff the local half of
+          // the set belongs to the ACTIVE agent, and re-merging the caller's
+          // would silently undo the transfer.
+          tools = await refreshMcpTools(mcp, ownTools, deps, warn);
+          const verdict = internal?.mcp
+            ? await internal.mcp.refreshed()
+            : legacyCatalogVerdict(before, mcp.tools, catalogPolicy);
+          for (const warning of verdict.warnings) warningSink.add(warning);
+          if (verdict.stop) {
+            stoppedBy = MCP_CATALOG_CHANGED_STOPPED_BY;
+            endReason = 'stop-condition';
+            if (durable) {
+              await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+            }
+            break;
+          }
+          fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+          staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
+          flushWarnings();
+        }
         broadcaster.push({ type: 'step-start', stepIndex });
         const stepSpan = lo?.rt.startSpan();
         if (observeCtx && stepSpan) {
@@ -856,19 +1076,6 @@ export function runStreamToolLoop(
             recallOverheadTokens,
           );
         }
-        // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
-        // the last step is re-read HERE, so the new catalog is on the wire from
-        // the very next call. Both wires are rebuilt so `activeTools` still
-        // applies to the refreshed set; `prepareStep` below keeps the last word.
-        if (mcp?.changed()) {
-          // `ownTools`, not `options.tools`: after a handoff the local half of
-          // the set belongs to the ACTIVE agent, and re-merging the caller's
-          // would silently undo the transfer.
-          tools = await refreshMcpTools(mcp, ownTools, deps);
-          fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
-          staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
-          flushWarnings();
-        }
         const prepared = await applyPrepareStep(
           // Handoff (2.0): the active agent's model drives every step after the
           // transfer — and `prepareStep` still has the LAST word, because it
@@ -882,6 +1089,24 @@ export function runStreamToolLoop(
         );
         flushWarnings();
         messages = prepared.messages;
+        // A step that offers another tool set than the one in effect appends
+        // the change instead of sending another tools array (2.3, F22); its
+        // calls resolve against the set it offered.
+        const stepWire = stabilizeStepWire(
+          prepared.options.model,
+          declaredWire,
+          prepared.wire,
+          messages,
+        );
+        if (stepWire.change) {
+          // Conversation content, like the recall message: the next call replays
+          // it where the model saw it.
+          messages = [...messages, stepWire.change];
+          appended.push(stepWire.change);
+          chatMessages = [...chatMessages, stepWire.change];
+        }
+        const stepTools = offeredTools(tools, stepWire.offered);
+        lastWire = stepWire.wire;
         const estimateAtCall = (): number =>
           (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;
         let estimatedAtCall = estimateAtCall();
@@ -899,20 +1124,26 @@ export function runStreamToolLoop(
           );
         }
         let text = '';
-        let reasoningText = '';
-        let reasoningSignature: string | undefined;
-        let encryptedReasoning: EncryptedReasoning = [];
+        // Every reasoning block, text run and tool call in arrival order (2.3, F21).
+        let turn: TurnContent = createTurnContent();
         let toolArgs: ToolArgMap = new Map();
         let toolOrder: string[] = [];
         let stepUsage: Usage = EMPTY_USAGE;
         let stepFinish: FinishReason = 'stop';
         let stepPhase: string | undefined;
+        /** The provider's finish detail for this step (2.3), e.g. refusal `stop_details`. */
+        let stepFinishMeta: Record<string, unknown> | undefined;
         // Overflow auto-recovery (2.0): ONE retry per step. G2 turns the
         // provider's rejection into an `error` PART, not a throw, so the retry
         // gate lives inside the consumption loop rather than around a try.
         // A ContextOverflowError is always pre-first-byte, so nothing of this
         // step has reached the consumer yet and the attempt restarts cleanly.
         let overflowRetried = false;
+        // A model with no price under a USD budget (2.3): reported once, ahead
+        // of the step's output, or refused before the call with
+        // `budget.unknownPrice: 'reject'`.
+        await admitModel?.(prepared.options.model.modelId);
+        flushWarnings();
 
         attempts: for (;;) {
           const inner = runStream(
@@ -921,7 +1152,7 @@ export function runStreamToolLoop(
               messages: withSystemBlock(messages, recallBlock),
             }),
             {
-              tools: prepared.wire,
+              tools: stepWire.wire,
               warnings: warningSink,
               // stepMs rides in as a FAILURE signal, never as the user's cancel
               // signal: the inner pump reports a TimeoutError instead of
@@ -933,14 +1164,13 @@ export function runStreamToolLoop(
             },
           );
           text = '';
-          reasoningText = '';
-          reasoningSignature = undefined;
-          encryptedReasoning = [];
+          turn = createTurnContent();
           toolArgs = new Map();
           toolOrder = [];
           stepUsage = EMPTY_USAGE;
           stepFinish = 'stop';
           stepPhase = undefined;
+          stepFinishMeta = undefined;
           /** Set instead of failing when the rejection is a recoverable overflow. */
           let overflow: unknown;
 
@@ -948,16 +1178,11 @@ export function runStreamToolLoop(
             switch (part.type) {
               case 'text-delta':
                 text += part.text;
+                turn.text(part);
                 broadcaster.push(part);
                 break;
               case 'reasoning-delta':
-                if (part.encrypted) {
-                  encryptedReasoning.push({ text: part.text, signature: part.signature });
-                  broadcaster.push(part);
-                  break;
-                }
-                reasoningText += part.text;
-                if (part.signature) reasoningSignature = part.signature;
+                turn.reasoning(part);
                 broadcaster.push(part);
                 break;
               case 'tool-call-delta': {
@@ -966,6 +1191,7 @@ export function runStreamToolLoop(
                   entry = { name: part.name, args: '' };
                   toolArgs.set(part.id, entry);
                   toolOrder.push(part.id);
+                  turn.tool(part.id);
                   toolState(part.id, part.name, 'input-streaming');
                 }
                 if (part.name && !entry.name) entry.name = part.name;
@@ -982,6 +1208,7 @@ export function runStreamToolLoop(
                 stepFinish = part.finishReason;
                 stepPhase = (part.providerMetadata?.openai as { phase?: string } | undefined)
                   ?.phase;
+                stepFinishMeta = part.providerMetadata;
                 break; // re-framed as step-finish below
               case 'error':
                 // Recoverable overflow: hold the error instead of publishing it —
@@ -1000,9 +1227,18 @@ export function runStreamToolLoop(
               // case they die at the loop boundary and only the bulk `warnings`
               // promise ever sees them — the exact silent gap Sprint 1 had to fix
               // for `verify`.
-              case 'warning':
-                broadcaster.push(part);
+              case 'warning': {
+                // The step's pump records every warning in the run's sink (2.3:
+                // a wire's own notice, such as Anthropic's input_transformations,
+                // included) and streams it from there, so a warning the sink
+                // already holds is forwarded as is. One it has not seen is
+                // recorded and streamed from the sink, once; anything the sink
+                // has nothing new for (past its cap) is forwarded as before.
+                const fresh = warningSink.add(part.warning) ? warningSink.take() : [];
+                if (fresh.length === 0) broadcaster.push(part);
+                for (const warning of fresh) broadcaster.push({ type: 'warning', warning });
                 break;
+              }
               default:
                 break;
             }
@@ -1034,11 +1270,13 @@ export function runStreamToolLoop(
         totalUsage = sumUsage(totalUsage, stepUsage);
         calibrateCompaction(compactionRunner, estimatedAtCall, stepUsage);
         lastFinish = stepFinish;
+        lastFinishMeta = stepFinishMeta;
         broadcaster.push({
           type: 'step-finish',
           stepIndex,
           finishReason: stepFinish,
           usage: stepUsage,
+          ...(stepFinishMeta ? { providerMetadata: stepFinishMeta } : {}),
         });
         // Live cumulative cost (1.7, D2): one part per step whenever a
         // priceProvider is injected — cross-leg cumulative on durable resumes.
@@ -1046,13 +1284,19 @@ export function runStreamToolLoop(
           try {
             const accounting = options.execution?.ledger.totals(options.execution.scopeId);
             const priced = await usageCost?.flush();
-            if (priced && priced.unknownCalls > 0)
-              deps.logger.warn('cost part skipped — per-call pricing unavailable');
+            // A model the provider has no price for adds nothing (2.3): the cost
+            // is the priced sum. Only a failed lookup or an unknown settlement
+            // hides it. Without a provider nothing is priced, so the cost is
+            // unknown and no part is streamed, as in 2.2.
             const costUsd = accounting
-              ? accounting.unknownUsd === 0
+              ? accounting.unknownUsd === 0 ||
+                (deps.priceProvider !== undefined &&
+                  accounting.unknownUsd === (accounting.unpriced ?? 0))
                 ? accounting.spent.usd
                 : undefined
               : priced?.costUsd;
+            if (costUsd === undefined && priced && priced.unknownCalls > 0)
+              deps.logger.warn('cost part skipped — per-call pricing unavailable');
             if (typeof costUsd === 'number') {
               const savings = priced?.cacheSavingsUsd;
               broadcaster.push({
@@ -1069,22 +1313,23 @@ export function runStreamToolLoop(
           }
         }
 
-        const { assistantMessage, toolUseParts } = assembleAssistant(
-          text,
-          reasoningText,
-          reasoningSignature,
-          toolArgs,
-          toolOrder,
-          encryptedReasoning,
-        );
+        // Finish-reason gate (2.3, F16): a refused or cut-off turn keeps its text
+        // and reasoning, never its tool calls — their arguments may be truncated.
+        const cutOff = blocksToolDispatch(stepFinish);
+        const { assistantMessage, toolUseParts } = turn.assemble(toolArgs, cutOff ? [] : toolOrder);
         if (stepPhase) assistantMessage.providerMetadata = { openai: { phase: stepPhase } };
+        // A UI already shows these calls as `input-streaming`; close each one,
+        // since no `tool-call` or `tool-result` will ever follow.
+        if (cutOff) for (const id of toolOrder) toolState(id, toolArgs.get(id)?.name, 'error');
 
+        const stepStopDetails = stopDetailsFrom(stepFinishMeta);
         const stepData = {
           text,
-          reasoningText,
+          reasoningText: turn.reasoningText,
           toolUseParts,
           usage: stepUsage,
           finishReason: stepFinish,
+          ...(stepStopDetails ? { stopDetails: stepStopDetails } : {}),
           assistantMessage,
         };
 
@@ -1124,23 +1369,30 @@ export function runStreamToolLoop(
             );
           }
           // Rebase effective model history for the completed checkpoint; the
-          // raw ChatStore history is tracked separately.
-          messages = [...messages, assistantMessage];
-          appended.push(assistantMessage);
-          chatMessages = [...chatMessages, assistantMessage];
+          // raw ChatStore history is tracked separately. An empty turn is not
+          // recorded: no provider accepts `content: []` back.
+          const stored = !isEmptyTurn(assistantMessage);
+          if (stored) {
+            messages = [...messages, assistantMessage];
+            appended.push(assistantMessage);
+            chatMessages = [...chatMessages, assistantMessage];
+          }
 
           // False-finish guard (1.9, N2): consulted BEFORE verifyStep at this
           // same natural-completion boundary — it is the cheaper, narrower
           // question, and a rejection that re-drives SHORT-CIRCUITS verification
           // for this round (nothing worth verifying in an answer the caller
           // already calls incomplete). The two retry budgets never mix.
-          const completion = await evaluateDoneWhen(options, {
-            stepIndex,
-            attempt: falseFinishRetries,
-            text,
-            messages,
-            usage: durableUsage(durable, totalUsage),
-          });
+          // Neither hook re-drives a refused or cut-off turn (2.3).
+          const completion = cutOff
+            ? undefined
+            : await evaluateDoneWhen(options, {
+                stepIndex,
+                attempt: falseFinishRetries,
+                text,
+                messages,
+                usage: durableUsage(durable, totalUsage),
+              });
           if (completion) {
             if (completion.done) {
               // A later round genuinely finished: an earlier give-up must not
@@ -1173,13 +1425,15 @@ export function runStreamToolLoop(
 
           // Verified generation (1.8): emit a verify part; on a rejected
           // verdict, feed feedback back as a user turn and re-drive the loop.
-          const verification = await evaluateVerifyStep(options, {
-            stepIndex,
-            attempt: verifyAttempts,
-            text,
-            messages,
-            usage: durableUsage(durable, totalUsage),
-          });
+          const verification = cutOff
+            ? undefined
+            : await evaluateVerifyStep(options, {
+                stepIndex,
+                attempt: verifyAttempts,
+                text,
+                messages,
+                usage: durableUsage(durable, totalUsage),
+              });
           if (verification) {
             verified = verification.verdict.ok;
             broadcaster.push({
@@ -1231,12 +1485,19 @@ export function runStreamToolLoop(
             // content array is not a message any wire accepts (see isEmptyTurn)
             // — so the turn is DROPPED rather than persisted unsendable.
             const drop = isEmptyTurn(rewritten);
-            messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
-            chatMessages = drop
-              ? chatMessages.slice(0, -1)
-              : [...chatMessages.slice(0, -1), rewritten];
-            if (drop) appended.pop();
-            else appended[appended.length - 1] = rewritten;
+            if (stored) {
+              messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
+              chatMessages = drop
+                ? chatMessages.slice(0, -1)
+                : [...chatMessages.slice(0, -1), rewritten];
+              if (drop) appended.pop();
+              else appended[appended.length - 1] = rewritten;
+            } else if (!drop) {
+              // A replacement gives an empty turn something to say: record it now.
+              messages = [...messages, rewritten];
+              appended.push(rewritten);
+              chatMessages = [...chatMessages, rewritten];
+            }
             // The SAME step must agree — `stopWhen` conditions read `steps[]`.
             steps[steps.length - 1] = {
               ...sr,
@@ -1260,67 +1521,60 @@ export function runStreamToolLoop(
         // an execution-side substitution, and it announces itself with its own
         // `guardrail` part a moment later rather than by silently editing the
         // call a UI already rendered.
-        for (const c of toolCalls) {
+        for (const [index, c] of toolCalls.entries()) {
+          // The call's round-trip data rides with it (2.3): a chat client that
+          // sends the turn back must echo it (a Gemini function call's signature).
+          const providerMetadata = toolUseParts[index]!.providerMetadata;
           broadcaster.push({
             type: 'tool-call',
             toolCallId: c.toolCallId,
             toolName: c.toolName,
             input: c.args,
+            ...(providerMetadata ? { providerMetadata } : {}),
           });
           toolState(c.toolCallId, c.toolName, 'input-complete');
+          toolNames.set(c.toolCallId, c.toolName);
         }
         messages = [...messages, assistantMessage];
         appended.push(assistantMessage);
         chatMessages = [...chatMessages, assistantMessage];
 
-        // Handoff (2.0): the DETERMINISTIC interception — before guardrails, the
-        // approval gate and `executeTools`. A transfer is decided by looking at
-        // the call, never by an exception thrown out of an `execute`. Everything
-        // ELSE in the batch runs completely normally: a model that calls
-        // `search` and `transfer_to_billing` in one step gets both honored.
-        const { handoffCalls, normalCalls } = hasHandoffTools(handoffTools)
-          ? splitHandoffCalls(toolCalls, tools)
-          : { handoffCalls: [], normalCalls: toolCalls };
-
-        // Tool-call guardrails (2.0): evaluated IMMEDIATELY before the approval
-        // gate, so a rewrite reaches the `needsApproval` predicate, the approval
-        // request a human sees, and `execute` — while the assistant turn
-        // appended just above keeps the arguments the MODEL issued.
-        const guardedCalls = await applyToolCallGuardrails(
+        // The dispatch contract (2.3): ONE plan for the batch, shared with the
+        // buffered loop and the resume settle — the execution policy, the
+        // `onToolCall` guardrails and the approval gate for every call, then the
+        // transfer decision (made by looking at the call, never by an exception out
+        // of an `execute`). Everything ELSE in the batch runs completely normally: a
+        // model that calls `search` and `transfer_to_billing` in one step gets both
+        // honored.
+        const plan = await planToolDispatch({
+          calls: toolCalls,
+          tools: stepTools,
           options,
-          normalCalls,
           messages,
           stepIndex,
-        );
-        emitGuardrails(guardedCalls.parts);
-        /** What actually reaches the gate + `executeTools` (transfers excluded). */
-        const execCalls = guardedCalls.calls;
+          ...(hasHandoffTools(handoffTools)
+            ? { handoff: { tools: handoffTools, ...(active ? { active } : {}) } }
+            : {}),
+          // An approval is bound to the run and to the checkpoint its suspension
+          // writes next (2.3); a call without a session binds neither.
+          approval: { runId: durable?.runId, step: durable ? durable.stepIndex + 1 : undefined },
+          clock: deps.clock,
+          ...(observeCtx ? { observe: observeCtx } : {}),
+        });
+        emitGuardrails(plan.guardrails);
+        /** What actually reaches `executeTools` (transfers excluded). */
+        const execCalls = plan.execCalls;
         // The REPORTED calls stay in the model's own order and include the
         // transfers, so `StepResult.toolCalls` describes the step the model
-        // took — with any guardrail rewrite applied, exactly as before.
-        toolCalls =
-          handoffCalls.length === 0
-            ? execCalls
-            : (() => {
-                const rewritten = new Map(execCalls.map((c) => [c.toolCallId, c]));
-                return toolCalls.map((c) => rewritten.get(c.toolCallId) ?? c);
-              })();
-        // A blocked call never reaches the approval gate: it already has a
-        // verdict, and gating it would suspend the run on a call that is not
-        // going to run either way.
-        const gateCandidates =
-          guardedCalls.blocked.size > 0
-            ? execCalls.filter((c) => !guardedCalls.blocked.has(c.toolCallId))
-            : execCalls;
+        // took — with any guardrail rewrite applied.
+        toolCalls = plan.calls;
 
-        // The transfer verdict is computed HERE — before the approval gate and
-        // before `executeTools`, both of which can leave the step early. A break
-        // that left a transfer's `tool_use` id unanswered would hand the
-        // provider an unanswerable turn on the next request AND silently drop
-        // the routing decision, so it is decided once and committed on every
-        // exit.
-        const handoffDecision =
-          handoffCalls.length > 0 ? decideHandoff(handoffCalls, active) : undefined;
+        // The transfer verdict is part of the plan — made before the approval
+        // gate and `executeTools` can leave the step early. A break that left a
+        // transfer's `tool_use` id unanswered would hand the provider an
+        // unanswerable turn on the next request AND silently drop the routing
+        // decision, so it is decided once and committed on every exit.
+        const handoffDecision = plan.handoff;
         /**
          * Apply the transfer on a path that executes NOTHING else. Publishes the
          * same `tool-result`/`tool-state`/`handoff` parts the completed path
@@ -1329,16 +1583,7 @@ export function runStreamToolLoop(
          */
         const commitHandoffOnBreak = (): Message | undefined => {
           if (!handoffDecision) return undefined;
-          for (const r of handoffDecision.results) {
-            broadcaster.push({
-              type: 'tool-result',
-              toolCallId: r.toolCallId,
-              toolName: r.toolName,
-              output: r.result,
-              ...(r.isError ? { isError: true } : {}),
-            });
-            toolState(r.toolCallId, r.toolName, r.isError ? 'error' : 'complete');
-          }
+          for (const r of handoffDecision.results) publishResult(r);
           const message: Message = {
             role: 'tool',
             content: handoffDecision.results.map(toToolResultPart),
@@ -1367,47 +1612,21 @@ export function runStreamToolLoop(
           return message;
         };
 
-        // Approval gate: server mode denies inline; without approveToolCall the
-        // gated calls break the loop like client tools (client mode).
-        const gated = await findApprovalNeeded(gateCandidates, tools, options, messages);
-        const denied = options.approveToolCall
-          ? await resolveServerApprovals(gated, gateCandidates, options, messages)
-          : new Map<string, Denial>();
-        // Guardrail blocks JOIN the approval flow's denial map — one machinery
-        // for every "this call does not run" verdict.
-        for (const [id, denial] of guardedCalls.blocked) denied.set(id, denial);
-        const pendingApproval = options.approveToolCall
-          ? []
-          : gateCandidates.filter((c) => gated.has(c.toolCallId));
-        if (observeCtx && gated.size > 0) {
-          const gatedCalls = toolCalls.filter((c) => gated.has(c.toolCallId));
-          observeApprovalRequests(
-            observeCtx,
-            options,
-            gatedCalls,
-            options.approveToolCall ? 'server' : 'client',
-          );
-          if (options.approveToolCall) {
-            observeServerResolutions(observeCtx, options, gatedCalls, denied);
-          }
-        }
-
-        // Client tools a guardrail BLOCKED are not pending on anyone (see
-        // pendingClientCalls) — they fall through to `executeTools` instead.
-        const clientCalls = pendingClientCalls(toolCalls, tools, guardedCalls.blocked);
+        // Guardrail blocks and approval denials share ONE denial map — one
+        // machinery for every "this call does not run" verdict.
+        const denied = plan.denied;
+        const pendingApproval = plan.pendingApproval;
+        const clientCalls = plan.clientCalls;
         snapshotClientCalls = clientCalls;
 
         // Pending approvals and client tools break together: ONE break, nothing
         // from the batch executes; the resume call settles the deferred rest.
         if (pendingApproval.length > 0 || clientCalls.length > 0) {
-          const requests = await signApprovalRequests(
-            toApprovalRequests(pendingApproval, options.agentPath),
-            options,
-            deps,
-            durable?.runId,
-          );
+          const requests = await signApprovalRequests(plan.requests, options, deps, durable?.runId);
           const handoffMessage = commitHandoffOnBreak();
-          for (const c of pendingApproval) toolState(c.toolCallId, c.toolName, 'awaiting-approval');
+          for (const c of pendingApproval) {
+            toolState(c.toolCallId, c.toolName, 'awaiting-approval', undefined, 'approval-pending');
+          }
           if (options.session?.durability !== 'strict') emitApprovalRequests(requests);
           const sr = toStepResult(
             stepData,
@@ -1459,13 +1678,13 @@ export function runStreamToolLoop(
           // goes input-complete → error with no 'executing' in between (the
           // resume-settle path reports missing/denied results the same way).
           // A TRANSFER never executes either — it is not in `execCalls` at all.
-          if (!denied.has(c.toolCallId) && !isUnknownTool(tools, c.toolName)) {
+          if (!denied.has(c.toolCallId) && !isUnknownTool(stepTools, c.toolName)) {
             toolState(c.toolCallId, c.toolName, 'executing');
           }
         }
         let toolResults;
         try {
-          toolResults = await executeTools(execCalls, tools, options, messages, denied, extras);
+          toolResults = await executeTools(execCalls, stepTools, options, messages, denied, extras);
         } catch (err) {
           if (!(err instanceof SubAgentSuspension)) throw err;
           // A durable sub-agent suspended: the EXECUTED calls' tool_use stays
@@ -1530,22 +1749,10 @@ export function runStreamToolLoop(
           toolResults = mergeResultsInCallOrder(toolCalls, toolResults, handoffDecision.results);
         }
         for (const r of toolResults) {
-          broadcaster.push({
-            type: 'tool-result',
-            toolCallId: r.toolCallId,
-            toolName: r.toolName,
-            output: r.result,
-            ...(r.isError ? { isError: true } : {}),
-          });
           // Server mode: `approveToolCall` said no (or threw). The verdict is a
-          // boolean, so there is no reason string to relay — `denied: true`
-          // alone is what separates "refused" from "failed".
-          toolState(
-            r.toolCallId,
-            r.toolName,
-            r.isError ? 'error' : 'complete',
-            denied.get(r.toolCallId),
-          );
+          // boolean, so there is no reason string to relay — `denied: true` and
+          // the outcome are what separate "refused" from "failed".
+          publishResult(r, denied.get(r.toolCallId));
         }
         const toolResultMessage: Message = {
           role: 'tool',
@@ -1573,7 +1780,7 @@ export function runStreamToolLoop(
           handoffLog.push(swap.entry);
           broadcaster.push({ type: 'handoff', ...swap.entry });
           ownTools = active.tools;
-          tools = mergeMcpTools(mcp, ownTools);
+          tools = mergeMcpTools(mcp, ownTools, warn);
           fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
           staticWire = filterWireTools(fullWire, options.activeTools, deps.logger, warningSink);
           flushWarnings();
@@ -1602,8 +1809,9 @@ export function runStreamToolLoop(
         // guard. A refused HANDOFF (budget spent, or a sibling transfer in the
         // same batch) is the same kind of verdict, so it is excluded too: the
         // model is being told to carry on, not failing at anything.
-        const handoffIds =
-          handoffCalls.length > 0 ? new Set(handoffCalls.map((h) => h.call.toolCallId)) : undefined;
+        const handoffIds = handoffDecision
+          ? new Set(handoffDecision.results.map((r) => r.toolCallId))
+          : undefined;
         if (
           bumpErrorGuard(
             errorCounters,
@@ -1642,7 +1850,14 @@ export function runStreamToolLoop(
             });
           }
           if (durable) {
-            await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+            await saveCheckpoint(
+              durable,
+              deps,
+              options,
+              internal?.resumableStop?.(stop.stoppedBy) ? 'running' : 'completed',
+              messages,
+              totalUsage,
+            );
           }
           break;
         }
@@ -1654,14 +1869,21 @@ export function runStreamToolLoop(
 
       const usage = withTotal(totalUsage);
       const deuzMeta = finishMeta();
+      const providerMetadata: Record<string, unknown> = {
+        ...lastFinishMeta,
+        ...(deuzMeta ? { deuz: deuzMeta } : {}),
+      };
+      // Whatever the run recorded since the last step's flush goes out before it ends.
+      flushWarnings();
       broadcaster.push({
         type: 'finish',
         usage,
         finishReason: lastFinish,
-        ...(deuzMeta ? { providerMetadata: { deuz: deuzMeta } } : {}),
+        ...(Object.keys(providerMetadata).length > 0 ? { providerMetadata } : {}),
       });
       usageDeferred.resolve(usage);
       finishDeferred.resolve(lastFinish);
+      stopDetailsDeferred.resolve(stopDetailsFrom(lastFinishMeta));
       fireFinish(options, deps, { model: options.model.modelId, finishReason: lastFinish });
       observeEnd();
       broadcaster.close();
@@ -1678,8 +1900,10 @@ export function runStreamToolLoop(
       // site that covers every pump exit — the finish path, the suspension
       // `return`s, the mid-stream `failRun` return and the outer catch — so it
       // lands right after the same post-terminal bookkeeping (settleMemory /
-      // persistChat) each of those paths already performed. Never throws.
-      await closeMcp(mcp, deps);
+      // persistChat) each of those paths already performed. Never throws. A
+      // runtime a native runner handed in is the runner's to close (2.3).
+      if (!internal?.mcp) await closeMcp(mcp, deps);
+      const stopDetails = stopDetailsFrom(lastFinishMeta);
       internal?.onSnapshot?.({
         messages,
         steps,
@@ -1691,6 +1915,8 @@ export function runStreamToolLoop(
         pendingApprovals: snapshotApprovals,
         pendingClientCalls: snapshotClientCalls,
         verified,
+        ...(stopDetails ? { stopDetails } : {}),
+        ...(lastWire ? { wire: lastWire } : {}),
         ...(terminalError !== undefined ? { error: terminalError } : {}),
         ...(durable?.handoff ? { handoff: durable.handoff } : {}),
       });
@@ -1773,6 +1999,10 @@ export function runStreamToolLoop(
     get finishReason() {
       ensureStarted();
       return finishDeferred.promise;
+    },
+    get stopDetails() {
+      ensureStarted();
+      return stopDetailsDeferred.promise;
     },
     // Unconditional (1.9), like `usage`/`finishReason`: the readout is declared
     // as always present on a full StreamChatResult, and it resolves with the

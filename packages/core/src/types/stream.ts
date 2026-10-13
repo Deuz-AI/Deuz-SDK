@@ -1,6 +1,7 @@
 import type { Usage, FinishReason } from './usage';
 import type { CompactionLayer } from './config';
 import type { CallWarning } from './methods';
+import type { ToolCallOutcome } from './tool';
 
 /**
  * Canonical streaming delta. Open discriminated union — consumers should keep a
@@ -10,6 +11,12 @@ import type { CallWarning } from './methods';
 export interface TextDeltaPart {
   type: 'text-delta';
   text: string;
+  /**
+   * Provider round-trip data for the text this delta belongs to (2.3
+   * additive), e.g. a Gemini `{ google: { thoughtSignature } }` on a plain
+   * text part. Echoed back on the next turn; never display content.
+   */
+  providerMetadata?: Record<string, unknown>;
 }
 
 export interface ReasoningDeltaPart {
@@ -18,6 +25,24 @@ export interface ReasoningDeltaPart {
   signature?: string;
   /** True when `text` is an opaque encrypted reasoning payload (OpenAI Responses) — not display text. */
   encrypted?: boolean;
+  /**
+   * The reasoning block this delta belongs to (2.3 additive), unique within
+   * one model response. Deltas with the same `id` build one block; a new `id`
+   * opens the next one, so consecutive blocks are never merged. Absent: the
+   * delta extends the current block (the 2.2 behaviour).
+   */
+  id?: string;
+  /**
+   * True when `text` is the opaque `data` of a provider-redacted block
+   * (Anthropic `redacted_thinking`, 2.3 additive) — not display text.
+   */
+  redacted?: boolean;
+  /**
+   * The provider family that produced the block (2.3 additive), recorded on the
+   * canonical part as `ReasoningPart.source`: `'anthropic'`, `'openai'`,
+   * `'google'`, or the Chat Completions host's provider id.
+   */
+  source?: string;
 }
 
 export interface ToolCallDeltaPart {
@@ -41,7 +66,11 @@ export interface FinishStreamPart {
   type: 'finish';
   usage: Usage;
   finishReason: FinishReason;
-  /** Provider-specific finish detail (e.g. `{ anthropic: { stop_details } }`). Additive, optional. */
+  /**
+   * Provider-specific finish detail, e.g. `{ anthropic: { stop_details } }`, an
+   * OpenAI refusal `{ openai: { refusal } }`, or Gemini's own finish reason
+   * `{ google: { finishReason } }` (2.3). Additive, optional.
+   */
   providerMetadata?: Record<string, unknown>;
 }
 
@@ -62,6 +91,11 @@ export interface StepFinishPart {
   stepIndex: number;
   finishReason: FinishReason;
   usage: Usage;
+  /**
+   * The step's provider finish detail, exactly as on {@link FinishStreamPart}
+   * (e.g. `{ anthropic: { stop_details } }` on a refusal). 2.3 additive.
+   */
+  providerMetadata?: Record<string, unknown>;
 }
 
 /** Final, parsed tool call (emitted after `tool-call-delta` fragments complete). */
@@ -70,6 +104,13 @@ export interface ToolCallPart {
   toolCallId: string;
   toolName: string;
   input: unknown;
+  /**
+   * The call's provider round-trip data (2.3 additive): its `tool_use` part's
+   * `providerMetadata`, e.g. Gemini's `{ google: { thoughtSignature } }`, which
+   * the next request must echo back. A chat client keeps it so the `tool_use`
+   * it sends back is the one the provider produced. Never display content.
+   */
+  providerMetadata?: Record<string, unknown>;
 }
 
 /** Result of executing a `tool-call`, emitted after server-side execution. */
@@ -79,6 +120,8 @@ export interface ToolResultStreamPart {
   toolName: string;
   output: unknown;
   isError?: boolean;
+  /** Why the call ended in an error (2.3, `ToolCallOutcome`); absent on success. */
+  outcome?: ToolCallOutcome;
 }
 
 /**
@@ -88,7 +131,10 @@ export interface ToolResultStreamPart {
  */
 export interface ToolApprovalRequestPart {
   type: 'tool-approval-request';
-  /** Equals `toolCallId` today; distinct field for future signed approvals. */
+  /**
+   * The request's identity-bound id (2.3: `toolCallId@<digest>`, see
+   * `ToolApprovalRequest`). Echo it unchanged on the verdict.
+   */
   approvalId: string;
   toolCallId: string;
   toolName: string;
@@ -289,6 +335,14 @@ export interface ToolStatePart {
    */
   denied?: boolean;
   deniedReason?: string;
+  /**
+   * What the dispatch contract decided (2.3): set with `state: 'error'` (a tool
+   * error, a policy or approval denial, an unknown effect) and with
+   * `'awaiting-approval'` (`'approval-pending'`); absent on success. It names the
+   * cause `denied` alone cannot: a guardrail block and an approver's no both set
+   * `denied`, but report `'permission-denied'` and `'approval-denied'`.
+   */
+  outcome?: ToolCallOutcome;
 }
 
 /**

@@ -25,14 +25,20 @@ export function pickObjectStrategy(
           ? 'json'
           : 'tool';
 
+  // The tool strategy IS a forced tool_choice, so a model that rejects forcing
+  // (2.3: `forcedToolChoice: false`, e.g. Claude Fable 5.1 / Opus 5.5 / Sonnet
+  // 5.5 and the Claude 5.x family fallback) always takes the json strategy.
+  if (strategy === 'tool' && caps.forcedToolChoice === false) return 'json';
+
   // G3: Anthropic rejects forced tool_choice while extended thinking is enabled
   // (HTTP 400) → never pick the tool strategy in that case; use native json mode.
   // Adaptive-thinking models (effortWire 'output_config') can't disable thinking,
-  // so they always take the json strategy.
+  // so they always take the json strategy. Keyed on the WIRE, so Claude on
+  // Vertex (provider 'vertex-anthropic') is covered too.
   const thinkingOn =
     caps.effortWire === 'output_config' ||
     (caps.reasoning && options.effort !== undefined && options.effort !== 'none');
-  if (strategy === 'tool' && options.model.provider === 'anthropic' && thinkingOn) {
+  if (strategy === 'tool' && options.model.surface === 'anthropic' && thinkingOn) {
     strategy = 'json';
   }
 

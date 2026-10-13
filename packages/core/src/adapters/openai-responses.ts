@@ -6,7 +6,17 @@ import type { ToolChoice } from '../types/tool';
 import type { NormalizedMessage } from '../core/normalize';
 import type { DeuzError } from '../errors';
 import { extractSystem } from '../core/normalize';
+import {
+  assertToolSurface,
+  describeToolChoice,
+  effortWire,
+  isForcedToolChoice,
+  optionalOutputCap,
+  planEffort,
+  reportClamp,
+} from '../core/request-rules';
 import { applyProviderOptions } from '../internal/provider-options';
+import { replaysTo } from '../internal/reasoning';
 import {
   acceptsDocuments,
   documentFilename,
@@ -36,9 +46,10 @@ function toResponsesInput(messages: NormalizedMessage[], media: MediaContext): I
   const items: InputItem[] = [];
   for (const m of messages) {
     for (const part of m.content) {
-      if (part.type === 'reasoning' && part.encrypted) {
+      if (part.type === 'reasoning' && part.encrypted && replaysTo(part, 'openai')) {
         // Encrypted reasoning round-trip: replay the item verbatim BEFORE its
-        // function_call (signature carries the original item id).
+        // function_call (signature carries the original item id). Only
+        // OpenAI's own items (2.3, F21); summaries are display text only.
         items.push({
           type: 'reasoning',
           ...(part.signature ? { id: part.signature } : {}),
@@ -126,10 +137,24 @@ function toResponsesInput(messages: NormalizedMessage[], media: MediaContext): I
   return items;
 }
 
-/** Map canonical tool choice → Responses API (flat function form). */
-function mapResponsesToolChoice(choice: ToolChoice | undefined): string | object | undefined {
+/**
+ * Map canonical tool choice → Responses API (flat function form). A forced
+ * choice the row says the model rejects goes out as auto, reported (2.3).
+ */
+function mapResponsesToolChoice(
+  ctx: BuildContext,
+  choice: ToolChoice | undefined,
+): string | object | undefined {
   if (!choice || choice === 'auto') return undefined;
   if (choice === 'none') return 'none';
+  if (ctx.caps.forcedToolChoice === false && isForcedToolChoice(choice)) {
+    reportClamp(
+      ctx,
+      'toolChoice',
+      `toolChoice ${describeToolChoice(choice)} was sent as 'auto': ${ctx.call.modelId} rejects a forced tool_choice.`,
+    );
+    return undefined;
+  }
   if (choice === 'required') return 'required';
   if (typeof choice === 'object' && choice.type === 'tool') {
     return { type: 'function', name: choice.toolName };
@@ -137,10 +162,26 @@ function mapResponsesToolChoice(choice: ToolChoice | undefined): string | object
   return undefined;
 }
 
+/** The include list: the caller's entries (if any) plus the encrypted reasoning blob. */
+function withEncryptedReasoning(include: unknown): string[] {
+  const extra = Array.isArray(include)
+    ? include.filter((v): v is string => typeof v === 'string')
+    : [];
+  return [...new Set(['reasoning.encrypted_content', ...extra])];
+}
+
 function buildRequest(ctx: BuildContext): AdapterRequest {
   const { call, messages, caps, options, object, tools } = ctx;
-  const { system, rest } = extractSystem(messages);
+  // The leading system run is `instructions`; a system message later in the
+  // history stays in place as a `system` input item (2.3, F22), which
+  // `EasyInputMessage` types next to `developer`. 2.2 folded it into
+  // `instructions`.
+  const { system, rest } = extractSystem(messages, { inPlace: true });
+  assertToolSurface(ctx, 'responses');
 
+  // An unknown model's placeholder cap is left off (2.3): the provider's own
+  // default bounds it instead of the SDK's 4096 guess.
+  const maxOutput = optionalOutputCap(caps, options);
   const body: Record<string, unknown> = {
     model: call.modelId,
     input: toResponsesInput(rest, {
@@ -151,18 +192,22 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       warnings: ctx.warnings,
     }),
     stream: true,
-    max_output_tokens: options.maxOutputTokens ?? caps.maxOutput,
+    ...(maxOutput !== undefined ? { max_output_tokens: maxOutput } : {}),
   };
   if (system) body.instructions = system;
-  if (caps.reasoning && options.effort !== undefined) {
-    // 'none' is a real OpenAI value (disables reasoning); 'max' clamps to xhigh.
-    body.reasoning = { effort: options.effort === 'max' ? 'xhigh' : options.effort };
-  }
-  if (tools && caps.reasoning) {
-    // Stateless multi-step tool use: get encrypted reasoning back and replay it.
-    body.include = ['reasoning.encrypted_content'];
-    body.store = false;
-  }
+  // 'none' is a real OpenAI value (disables reasoning). 'max' is sent only to a
+  // model that lists it (gpt-6.1-sol); elsewhere it clamps to xhigh — reported.
+  const effort = planEffort(ctx, effortWire('responses', caps, call.modelId));
+  if (effort.none) body.reasoning = { effort: 'none' };
+  else if (effort.level !== undefined) body.reasoning = { effort: effort.level };
+  // F20 (2.3): every Responses request is stateless unless the caller opts in
+  // with `providerOptions.<provider>.store: true`. A reasoning model always
+  // gets its encrypted reasoning back so the next turn can replay it — with or
+  // without tools — which also keeps zero-data-retention organisations working.
+  // OpenAI's retention behaviour itself is not live-verified.
+  const own = options.providerOptions?.[call.provider];
+  body.store = own?.store === true;
+  if (caps.reasoning) body.include = withEncryptedReasoning(own?.include);
   if (!caps.samplingRestrictions) {
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.topP !== undefined) body.top_p = options.topP;
@@ -190,7 +235,12 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
       ];
       body.tool_choice = { type: 'function', name };
     }
-  } else if (tools && tools.tools.length > 0) {
+  }
+  // A json-strategy object request keeps the call's tools and their tool_choice
+  // beside `text.format` (2.3, F15): runAgent's finalization asks with the
+  // loop's tools and `toolChoice: 'none'`, so its request prefix stays the
+  // loop's. The tool strategy forces its own call instead. Not live-verified.
+  if (object?.strategy !== 'tool' && tools && tools.tools.length > 0) {
     body.tools = tools.tools.map((t) =>
       t.provider
         ? t.provider // hosted tool (web_search, …) — raw native definition, verbatim
@@ -201,9 +251,9 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
             parameters: t.parameters,
           },
     );
-    const tc = mapResponsesToolChoice(tools.toolChoice);
+    const tc = mapResponsesToolChoice(ctx, tools.toolChoice);
     if (tc !== undefined) body.tool_choice = tc;
-  } else if (options.responseFormat === 'json') {
+  } else if (!object && options.responseFormat === 'json') {
     body.text = { format: { type: 'json_object' } };
   }
 
@@ -225,7 +275,7 @@ function buildRequest(ctx: BuildContext): AdapterRequest {
 
 // --- stream parsing ---
 
-interface ResponsesUsage {
+export interface ResponsesUsage {
   input_tokens?: number;
   output_tokens?: number;
   total_tokens?: number;
@@ -237,6 +287,9 @@ interface ResponsesEvent {
   type?: string;
   delta?: string;
   item_id?: string;
+  content_index?: number;
+  /** `response.refusal.done`: the refusal text, final. */
+  refusal?: string;
   item?: {
     type?: string;
     id?: string;
@@ -254,19 +307,47 @@ interface ResponsesEvent {
   error?: { message?: string; code?: string };
 }
 
-function mapResponsesUsage(u: ResponsesUsage | undefined): Usage {
+// output_tokens already includes reasoning_tokens and input_tokens includes the
+// cached reads (OpenAI token counting), which is the canonical contract once the
+// cached share is split out. A Responses-shaped host that counts reasoning beside
+// the output (its total is input + output + reasoning, or the reasoning exceeds
+// the output) has it folded in; not live-verified. No cache-write counter exists.
+export function mapResponsesUsage(u: ResponsesUsage | undefined): Usage {
   const input = u?.input_tokens ?? 0;
   const cached = u?.input_tokens_details?.cached_tokens ?? 0;
-  const output = u?.output_tokens ?? 0;
+  const reported = u?.output_tokens ?? 0;
+  const reasoning = u?.output_tokens_details?.reasoning_tokens ?? 0;
+  const reasoningApart =
+    reasoning > 0 && (reasoning > reported || u?.total_tokens === input + reported + reasoning);
+  const output = reasoningApart ? reported + reasoning : reported;
   return {
     inputTokens: Math.max(0, input - cached),
     outputTokens: output,
-    reasoningTokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
+    reasoningTokens: reasoning,
     cachedReadTokens: cached,
     cacheWriteTokens: 0,
     cacheWrite1hTokens: 0,
     totalTokens: u?.total_tokens ?? input + output,
   };
+}
+
+/**
+ * A Responses turn's finish reason, shared with the batch parser. The final
+ * response says why it is incomplete: its output limit, or its content filter
+ * (2.3; 'stop', or 'tool_calls' after a call, before), which the finish-reason
+ * gate must see to hold back a call the turn streamed. A turn that carried the
+ * model's refusal is refused the same way (2.3). `max_messages` and `steered`
+ * (openai 7.32) end it as a complete response would: their meaning is
+ * undocumented beyond the name, and steering needs the WebSocket transport.
+ */
+export function mapResponsesFinishReason(
+  incompleteReason: unknown,
+  sawFunctionCall: boolean,
+  refused = false,
+): FinishReason {
+  if (incompleteReason === 'max_output_tokens') return 'length';
+  if (incompleteReason === 'content_filter' || refused) return 'content_filter';
+  return sawFunctionCall ? 'tool_calls' : 'stop';
 }
 
 async function* parseStream(
@@ -278,6 +359,11 @@ async function* parseStream(
   let usage: Usage | undefined;
   let finishReason: FinishReason = 'stop';
   let phase: string | undefined; // last assistant message item's phase — round-trips on replay
+  // The model's refusal (2.3), per content part as the official accumulator
+  // builds it: deltas append, `response.refusal.done` sets the final text.
+  // Kept for the caller, never streamed as answer text.
+  const refusals = new Map<string, string>();
+  const refusalText = (): string => [...refusals.values()].join('');
 
   for await (const ev of parseSSE(body)) {
     let data: ResponsesEvent;
@@ -294,7 +380,15 @@ async function* parseStream(
         break;
       case 'response.reasoning_summary_text.delta':
       case 'response.reasoning_text.delta':
-        if (data.delta) yield { type: 'reasoning-delta', text: data.delta };
+        // One block per reasoning item (2.3, F21), marked as OpenAI's own.
+        if (data.delta) {
+          yield {
+            type: 'reasoning-delta',
+            text: data.delta,
+            ...(data.item_id ? { id: data.item_id } : {}),
+            source: 'openai',
+          };
+        }
         break;
       case 'response.output_item.added':
         if (data.item?.type === 'function_call') {
@@ -313,6 +407,8 @@ async function* parseStream(
             text: data.item.encrypted_content,
             signature: data.item.id,
             encrypted: true,
+            ...(data.item.id ? { id: data.item.id } : {}),
+            source: 'openai',
           };
         }
         if (data.item?.type === 'message' && data.item.phase) phase = data.item.phase;
@@ -322,6 +418,14 @@ async function* parseStream(
         yield { type: 'tool-call-delta', id, argsTextDelta: data.delta ?? '' };
         break;
       }
+      case 'response.refusal.delta': {
+        const key = refusalKey(data);
+        refusals.set(key, (refusals.get(key) ?? '') + (data.delta ?? ''));
+        break;
+      }
+      case 'response.refusal.done':
+        if (typeof data.refusal === 'string') refusals.set(refusalKey(data), data.refusal);
+        break;
       case 'response.output_text.annotation.added':
         // Hosted web_search citations arrive as url_citation annotations.
         if (data.annotation?.type === 'url_citation' && data.annotation.url) {
@@ -340,10 +444,11 @@ async function* parseStream(
             typeof data.response.usage.output_tokens === 'number',
         );
         usage = mapResponsesUsage(data.response?.usage);
-        if (data.response?.incomplete_details?.reason === 'max_output_tokens')
-          finishReason = 'length';
-        else if (sawFunctionCall) finishReason = 'tool_calls';
-        else finishReason = 'stop';
+        finishReason = mapResponsesFinishReason(
+          data.response?.incomplete_details?.reason,
+          sawFunctionCall,
+          refusalText() !== '',
+        );
         break;
       case 'error':
       case 'response.failed':
@@ -357,12 +462,23 @@ async function* parseStream(
     }
   }
 
+  // The refusal rides the batch parser's key: `stopDetailsFrom` reads it as the stop's explanation.
+  const refusal = refusalText();
+  // A refusal stays a refusal when the stream ended without its terminal event,
+  // as on the Chat wire: only a limit the provider reported outranks it.
+  if (refusal !== '' && finishReason !== 'length') finishReason = 'content_filter';
+  const openai = { ...(phase ? { phase } : {}), ...(refusal ? { refusal } : {}) };
   yield {
     type: 'finish',
     usage: usage ?? mapResponsesUsage(undefined),
     finishReason,
-    ...(phase ? { providerMetadata: { openai: { phase } } } : {}),
+    ...(Object.keys(openai).length > 0 ? { providerMetadata: { openai } } : {}),
   };
+}
+
+/** One refusal content part: its message item and its index in that item. */
+function refusalKey(data: ResponsesEvent): string {
+  return `${data.item_id ?? ''}:${data.content_index ?? 0}`;
 }
 
 // Error envelope is identical to Chat Completions — reuse its mapping.

@@ -5,6 +5,10 @@ description: useChat and useObject from @deuz-sdk/react — ordered part renderi
 
 > **Import from `@deuz-sdk/react`.** The frozen `@deuz-sdk/core/react` subpath still works, but every feature since 1.7 lands in the package. The hooks bind the pure chat engine at [`@deuz-sdk/core/chat`](/docs/modules/chat-persistence) to React state; no business logic lives in them.
 
+<Callout type="warn" title="The 2.3 settlement fixes are not in `@deuz-sdk/core/react`">
+The frozen hook is unchanged, so it still has the bugs 2.3 fixed in `@deuz-sdk/react`. A verdict sent when nothing is pending still POSTs a new round and adds an empty assistant bubble, and a double click sends the continuation twice. It also drops the approval's signed `token`, so it cannot approve calls made with an `approvalSigner`. It has no `reconnect()`, and with no `onToolCall` it drops client tool calls instead of parking them. It sends no reasoning back and drops a tool call's provider metadata, so a Gemini 3 client-tool loop through it can fail with 400 (not live-verified). It cannot drive a [native agent route](#native-agent-routes) either: it does not read agent frames, so it never sends a run id back. `@deuz-sdk/core/react` stays frozen; fixes and new features ship in `@deuz-sdk/react` only. Migrate to `@deuz-sdk/react` for [verdict matching](#verdicts-answer-the-open-gate), [resumed client tools](#client-tools-after-a-reconnect) and native agent routes.
+</Callout>
+
 **React is an optional peer** (`^18 || ^19`) — install it yourself; nothing else in the SDK depends on it. The hooks are plain TypeScript (no JSX) and SSR-safe: network runs only inside user-triggered callbacks, never at render time.
 
 ```bash
@@ -35,6 +39,8 @@ const {
   reconnect,
   usage, // this turn's terminal token usage (1.9)
   finishReason, // 'length' means the answer was truncated (1.9)
+  stopDetails, // why the provider stopped early, e.g. a refusal's explanation (2.3)
+  agent, // the native agent run behind this turn (2.3)
   steps, // per-step usage/finish (1.9)
   verifications, // verifyStep verdicts (1.9)
   warnings, // CallWarning[] from `warning` parts (1.9)
@@ -75,7 +81,7 @@ It is not re-adopted when the prop changes: apps pass an inline array literal, s
 The hook keeps **two** views of the conversation and publishes them in a **single** state commit, so no render can ever see one a frame behind the other:
 
 - `messages` — the render-friendly `UIMessage[]` (accumulated `content`, `reasoning`, `toolCalls` with live `state`, and ordered `parts`).
-- `history.canonical` — the canonical `Message[]` it POSTs, reconstructing each assistant `tool_use` turn from the streamed `tool-call` parts.
+- `history.canonical` — the canonical `Message[]` it POSTs, reconstructing each assistant turn from the streamed parts in arrival order. Since 2.3 that includes every reasoning block, unchanged and in place, and each tool call's provider metadata (a Gemini function call's `thoughtSignature`, without which Gemini 3 rejects the next request; not live-verified), so a Claude, Gemini or OpenAI tool loop continues with its reasoning (see [Reasoning parts](/docs/core/messages#reasoning-parts)). Since 2.3 the signature Gemini can put on a plain text part makes the trip too: the `text-delta` frame carries it, the UI text part keeps it as `providerMetadata`, and the canonical turn sends it back on that text (such a text stays a part instead of collapsing to a string). Gemini does not enforce text signatures, but its reasoning may degrade without them (not live-verified). Since 2.3 a call the server ran within a turn is answered right after it: the hook adds the call's result, the one the model saw, as a `role: 'tool'` message after the assistant turn, as `canonicalFromUI` does. Before 2.3 the next request carried that `tool_use` open, which providers reject, and a chat route's approval continuation ran the call a second time, because it settles every call the history leaves open.
 
 `history` exposes the pair the hook already holds, so **persisting a chat should persist `history.canonical`** rather than round-tripping through the lossy `canonicalFromUI`. Its identity is stable until a view changes. History is immutable — new arrays on every update.
 
@@ -106,8 +112,8 @@ export function Turn({ message }: { message: UIMessage }) {
           case 'text':
             return <Prose key={i} text={part.text} streaming={part.state === 'streaming'} />;
           case 'reasoning':
-            // `encrypted` text is an opaque provider payload, not thinking text.
-            return part.encrypted ? null : <Thinking key={i} text={part.text} />;
+            // `encrypted` / `redacted` text is an opaque provider payload, not thinking text.
+            return part.encrypted || part.redacted ? null : <Thinking key={i} text={part.text} />;
           case 'tool': {
             const call = byId(message.toolCalls, part.toolCallId);
             return call ? <ToolCard key={i} call={call} /> : null;
@@ -131,7 +137,7 @@ Rules that are easy to get wrong:
 
 - **`parts` is optional and absent until the first element exists.** `createAssistantTurn`'s shape is public surface, and a `UIMessage` restored from pre-1.9 storage legitimately has none. Render `parts` when present, the buckets otherwise.
 - **`step-start` is normally `parts[0]`** of a real streamed turn, because the streaming loop pushes one at the top of every iteration. A renderer without a case for it will hit its `default` on the very first element.
-- **Skip `reasoning` parts flagged `encrypted`** — the text is an opaque encrypted provider payload (OpenAI Responses), not display text. `redacted` marks a provider-redacted thinking block. Neither flag can appear on a *streamed* turn (the wire's `reasoning-delta` carries no such field); they arrive on history projected by `uiFromMessages`.
+- **Skip `reasoning` parts flagged `encrypted` or `redacted`** — the text is an opaque provider payload (an OpenAI encrypted item, an Anthropic redacted thinking block), not display text. Since 2.3 both flags arrive on a *streamed* turn too, and each model block is its own part (a thinking block can have empty text when the model omits its thinking display). The `reasoning` bucket holds the readable text only.
 - **A `tool` element carries only `{ type, toolCallId }`** — a reference into `toolCalls`, not a copy, because a call's state mutates over the turn's life and two copies would drift.
 - **A `file` element carries the canonical value verbatim.** `url` is set only when `data` is already a renderable `data:` / `http(s):` src; for bytes, build one yourself. See [Files](/docs/core/files).
 - **A `citation` element is the same object** already pushed into `turn.citations` — one object, no drift.
@@ -193,8 +199,8 @@ setHistory({ ui: [], canonical: [{ role: 'system', content: SYS }] }); // switch
 ```
 
 - **`setHistory(update)`** replaces both views in one commit — the honest primitive, because only the canonical one is POSTable. Use it to switch chats, hydrate after mount, or edit a rendered message while keeping a system prompt and provider round-trip data the UI view cannot carry.
-- **`setMessages(update)`** is sugar over it: the canonical view is re-derived with `canonicalFromUI`, which is **lossy** — `system` messages, `Message.providerMetadata` and UI-only state do not survive, and a message without ordered `parts` loses its attachments entirely. Drive `setHistory` directly when your history has any of those.
-- **Both drop pending approvals and parked tool calls** — they were anchored to the transcript you just replaced. They do **not** reset the turn readouts (cost, citations, …); the next turn does, exactly as `sendMessage` already did.
+- **`setMessages(update)`** is sugar over it: the canonical view is re-derived with `canonicalFromUI`, which is **lossy** — `system` messages, `Message.providerMetadata` and UI-only state do not survive, and a message without ordered `parts` loses its attachments entirely. Drive `setHistory` directly when your history has any of those. Since 2.3 it re-derives the leg that resumed an approval the way the hook's history holds it: the approved call's result goes right after the call it answers, and the resumed turn does not repeat the call. Before 2.3 it sent the call a second time without its input, which no provider accepts.
+- **Both drop pending approvals and parked tool calls** — they were anchored to the transcript you just replaced. Since 2.3 they also drop the in-memory resume cursor, which addresses that transcript's stream: after a chat switch, the next `reconnect()` reads the new chat from the persisted cursor (`resume.cursor`) or from its start, never from the old chat's position. They do **not** reset the turn readouts (cost, citations, …); the next turn does, exactly as `sendMessage` already did.
 - **`clearError()`** dismisses the error (`status: 'error'` → `'idle'`) and leaves a live stream alone.
 
 The streaming turn is located in `ui` **by id** rather than by overwriting the trailing element, so a mid-stream `setMessages` can no longer have its result clobbered.
@@ -224,7 +230,7 @@ A bare string stays a **plain string** `content`, byte-identical to 1.8, so a pr
 
 When the server streams a `tool-call` it did not execute (a client tool — a **registered key with no `execute`**), the hook has two modes:
 
-**With `onToolCall`** — the executor runs, the result is appended to the canonical history, and the hook **re-POSTs automatically**, looping until a round has no pending client calls. A throwing `onToolCall` self-heals as an `is_error` result, mirroring the server loop.
+**With `onToolCall`** — the executor runs, the result is appended to the canonical history, and the hook **re-POSTs automatically**, looping until a round has no pending client calls. A throwing `onToolCall` self-heals as an `is_error` result, mirroring the server loop. Since 2.3 a result that lands after the chat moved on (a new message, `regenerate`, `editAndResend`, `setHistory` or `setMessages` while the call ran) is dropped: it answers a turn that is no longer current. Before, it was appended after the new exchange and POSTed again.
 
 **Without `onToolCall`** — the round-trip **parks**: the calls appear in `pendingToolCalls`, `status` goes idle, and nothing is re-POSTed. Answer each from outside the hook:
 
@@ -242,13 +248,28 @@ When the server streams a `tool-call` it did not execute (a client tool — a **
 
 Parking is new in 1.9. Before it, a turn producing client tool calls with no executor abandoned the round-trip and left a `tool_use` with no `tool_result`.
 
-<Callout type="warn" title="A client-tool route needs `rejectToolResults: false`">
-The round-trip POSTs a `role: 'tool'` message, which [`validateChatRequest`](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false) rejects by default. Pass `{ rejectToolResults: false }` — and read what that accepts.
+### Client tools after a reconnect
+
+Since 2.3, a turn read back through `reconnect()` or `resume.auto` settles exactly like one read from the POST. Its unresolved client calls reach `onToolCall`, and the hook then re-POSTs, or they park in `pendingToolCalls`. Before 2.3 the resume path only restored approvals. Such a call reached neither, and the transcript kept a `tool_use` nobody would answer.
+
+A replay can re-deliver calls this client already handled. The endpoint replays everything after the hook's cursor, and a journal that spans several legs holds the earlier legs too. So the hook dispatches a replayed call **at most once per mounted hook**:
+
+- **A call whose result is in the replay** ran on the server. It never reaches the client. A result answers only the call, or the approval request, that came before it: an OpenAI-compatible server that omits call ids gets `tool_0`, `tool_1`, … in every model response, so a later call or gate under the same id stays open, in a replay and on the POST alike.
+- **A call the canonical history already answers** is not dispatched again. That means a `tool_use` followed by its `tool_result` in the current exchange; key order inside the input does not matter. One answer covers one delivery: when a provider without call ids asks the identical call again in a later leg (`tool_0` with the same input), a replay that delivers it twice against one answer dispatches it. A replay that resumes after a cursor this hook's own reads reached leaves out the answers to the calls behind it. After a reload the hook cannot tell which answers those are, so it counts them all and never runs a call twice.
+- **A call that is parked, or whose `onToolCall` is still running,** is not dispatched a second time.
+- **A `stop()` during the read settles nothing.** A call the read had already delivered does not run, and the next `reconnect()` continues the same turn from the cursor.
+
+That evidence is the canonical history. It survives a reload only if you persist `history.canonical` and restore it through `initialMessages`. A call whose result was not saved before the page went away is dispatched again after the reload, because the hook cannot know it ran. So this is at-most-once within a mounted hook, not exactly-once across reloads. Make such tools idempotent, or omit `onToolCall` and confirm parked calls yourself. A tab that only watches a stream another tab drives should omit `onToolCall` too, or it runs that tab's calls.
+
+<Callout type="warn" title="The history holds tool results the client posts">
+The round-trip POSTs a `role: 'tool'` message, and so does the history after an approval or a server tool the leg ran. Since 2.3 the default [`validateChatRequest`](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false) accepts it, because it answers calls of the assistant turn right before it; before 2.3 a route had to pass `{ rejectToolResults: false }`. Read what the validator cannot tell apart: a forged result in that shape passes too.
 </Callout>
 
 ## Tool approvals
 
 A `tool-approval-request` part **pauses** the chat: the request lands in `pendingApprovals`, the matching `toolCalls` entry flips to `state: 'approval-requested'`, and nothing is re-POSTed. Record verdicts with `addToolApprovalResponse`; once **every** pending approval has one, the hook resumes with `approvalResponses` in the request body — the [server settles the gated calls](/docs/agents/client-tools#tool-approval-round-trip), the client never fabricates a gated `tool_result`. The request's signed `token` is auto-preserved.
+
+The resumed leg executes the approved call and streams its state and result, not the call itself. Since 2.3 the hook adds that result to `history.canonical` as a `role: 'tool'` message, so the next request answers the call. Before 2.3 the result reached only the screen, and the turn repeated the call in the history without its input, so the next request carried an open `tool_use`. The default `validateChatRequest` accepts that message since 2.3, because it answers a call of the assistant turn right before it; see [what that accepts](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false).
 
 ```tsx
 {pendingApprovals.map((req) => (
@@ -261,6 +282,22 @@ A `tool-approval-request` part **pauses** the chat: the request lands in `pendin
   />
 ))}
 ```
+
+### Verdicts answer the open gate
+
+A verdict counts only if it answers an approval in `pendingApprovals`, the gate the chat is paused on. It must name that approval's `approvalId`. If it carries a `token`, it must be that request's token: a token is minted per run and per call, so a different one means the verdict was issued for another run. **Anything else is a no-op** since 2.3. Nothing is sent, no state changes, and the promise resolves. That is the same contract as `addToolResult`.
+
+| Verdict | Before 2.3 | Since 2.3 |
+| --- | --- | --- |
+| Nothing is pending | A new POST and an empty assistant bubble | No-op |
+| A repeat of one already sent (a double click) | The continuation is sent twice | No-op |
+| Left over from an earlier turn or a replaced transcript | A new POST, or sent along with the next gate's verdicts | No-op |
+| An `approvalId` the gate does not hold | Sent along with the gate's verdicts | No-op |
+| Another run's `token` for a pending `approvalId` | Accepted, and sent with the wrong token | No-op |
+
+Until the last verdict arrives you can change your mind: answering an approval again replaces its verdict. Once every pending approval has one, the hook sends `approvalResponses` **once** and closes the gate. A repeated `tool-approval-request` frame is one entry in `pendingApprovals`, not two. Denials, reasons and tokens are sent exactly as before.
+
+Without a token, the `approvalId` is all a verdict has. Since 2.3 core binds it to the call it was issued for: the tool call id followed by a digest of the tool and its arguments (and, for a durable or native run, of the run and the step). An OpenAI-compatible server that omits call ids gets `tool_0`, `tool_1`, … from the adapter, so a later gate can reuse an earlier gate's call id, but a verdict from a card that still holds the earlier request no longer answers a new gate with another tool or other arguments. To tie each verdict to the exact request it was shown for, sign approvals with [`createApprovalSigner`](/docs/agents/durable-runtime#hmac-signed-approvals) and echo the token: `addToolApprovalResponse({ approvalId: req.approvalId, approved, token: req.token })`. A stale card then carries a stale token, and its verdict is a no-op.
 
 A refused call carries `denied` on the `UIToolCall`, so it stops rendering as "getWeather failed":
 
@@ -277,6 +314,139 @@ A refused call carries `denied` on the `UIToolCall`, so it stops rendering as "g
 The built-in loop sets it for every refusal it settles: a server-mode `approveToolCall` returning `false` (`denied: true`, no reason — the hook's verdict is a bare boolean), an `approvalResponses` verdict (its own `reason`, verbatim), a gated call left unanswered, an unanswered client tool, and a token `approvalSigner` rejected. A tool that **threw** gains no denial fields at all, which is the whole point. `deniedReason` arrives already secret-redacted.
 
 `state` is unchanged — still exactly `'call' | 'result' | 'approval-requested'`, because these are optional fields, not a fourth state.
+
+Since 2.3 a `UIToolCall` also carries `outcome`, from the latest `tool-state` or `tool-result` frame for it: `'tool-error'`, `'permission-denied'`, `'approval-denied'`, `'approval-pending'` or `'unknown-effect'` (see [Outcomes](/docs/modules/native-agents#outcomes)). It tells apart what `denied` alone cannot: a guardrail block (`'permission-denied'`) and an approver's no (`'approval-denied'`) both set `denied`. It is absent while the call runs and after it succeeds.
+
+## Native agent routes
+
+`useChat` also drives a route that serves a [native agent run](/docs/modules/native-agents) (`streamAgent` / `resumeStreamAgent`) through [`toDeuzAgentStreamResponse`](/docs/modules/ui-streaming#native-agent-runs-todeuzagentstreamresponse-23). Nothing is configured on the client. The route's `data-agent` frames fold into the turn (`agent`), and when the run suspends, the hook resumes it the way `resumeStreamAgent` needs:
+
+- **The run's terminal frame is the authority** on what it waits for. Its approvals pause the chat (`pendingApprovals`); its client calls (tools without `execute` on the server) run through `onToolCall` or park in `pendingToolCalls`.
+- **One request resumes the run**: `{ messages, runId, approvalResponses?, clientToolResults? }`. A native resume proceeds only with a verdict for every pending approval and a result for every pending client call, so after the last verdict the hook runs the client calls first, then sends both together. The calls run inside that round: `status` is `'streaming'` from the last verdict on, `stop()` while they run cancels the request, and a message sent meanwhile drops the gate, so the run is not resumed. `clientToolResults` entries are `{ toolCallId, output, isError? }`. The answers also join `history.canonical`, as on a chat route.
+- **The 2.3 settlement rules hold**: a verdict counts only for the open gate ([F06](#verdicts-answer-the-open-gate)), and a replayed client call runs at most once per mounted hook ([F07](#client-tools-after-a-reconnect)). `reconnect()` reads a run's journal like any other.
+- **`agent`** is the run's state for the turn: `runId`, `status` (`'running'`, `'suspended'`, `'completed'`, `'stopped'`, `'failed'`), the latest `partial` draft while it runs, and, only once `completed`, the `output` the server validated. A `stopped` run has a `reason` (`'aborted'`, `'cancelled'`, `'refusal'`, …) and, for a refusal, `stopDetails`. The agent frames stay out of `dataParts` and `onData`.
+- **A chat route is unchanged.** It never sends a frame, so the hook never sends `runId` or `clientToolResults` to it. With a core older than 2.3 there are no agent frames to read, and the hook behaves as before.
+
+The route starts a run for a request without `runId` and resumes the run for one with it:
+
+```ts title="app/api/agent/route.ts"
+import { createInMemoryAgentRunStore, resumeStreamAgent, streamAgent } from '@deuz-sdk/core/agent';
+import { validateChatRequest } from '@deuz-sdk/core/chat';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import {
+  createInMemoryStreamStateStore,
+  negotiateDeuzStreamVersion,
+  toDeuzAgentStreamResponse,
+} from '@deuz-sdk/core/ui';
+
+const runs = createInMemoryAgentRunStore(); // a durable store in production
+const streams = createInMemoryStreamStateStore();
+const model = createMockModel({
+  responses: [
+    // One turn asks for both: an approval and a client call.
+    {
+      toolCalls: [
+        { toolName: 'publish', args: { doc: 7 } },
+        { toolName: 'locate', args: {} },
+      ],
+    },
+    { text: 'Published document 7 for Paris.' },
+  ],
+});
+const params = { type: 'object' as const, properties: { doc: { type: 'number' } } };
+const options = {
+  model,
+  bindingId: 'publish-v1',
+  tools: {
+    publish: {
+      description: 'Publish a document.',
+      parameters: params,
+      needsApproval: true,
+      execute: ({ doc }: { doc?: number }) => `published ${doc}`,
+    },
+    // No `execute`: the browser answers it through `onToolCall`.
+    locate: { description: "The user's city.", parameters: params },
+  },
+};
+
+export async function POST(req: Request): Promise<Response> {
+  // The defaults accept the history useChat posts: each tool result answers the turn before it.
+  const parsed = validateChatRequest(await req.json());
+  if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
+  const { rest } = parsed.request;
+  const scope = 'tenant-a'; // the signed-in user's tenant, never a field of the body
+  const resuming = typeof rest.runId === 'string';
+  const runId = resuming ? (rest.runId as string) : crypto.randomUUID();
+  if (resuming) {
+    // Only this user's run, and only while it waits for answers: another tenant's
+    // runId, a second tab or a double submit is refused before a leg starts.
+    const stored = await runs.load(runId);
+    if (stored?.scope !== scope) return new Response('Unknown run', { status: 404 });
+    if (stored.result?.status !== 'suspended') return new Response('Not waiting', { status: 409 });
+  }
+  const session = { store: runs, runId, scope };
+  const stream = resuming
+    ? resumeStreamAgent({
+        ...options,
+        session,
+        ...(parsed.request.approvalResponses
+          ? { approvalResponses: parsed.request.approvalResponses }
+          : {}),
+        ...(Array.isArray(rest.clientToolResults)
+          ? { clientToolResults: rest.clientToolResults as { toolCallId: string; output: unknown }[] }
+          : {}),
+      })
+    : streamAgent({ ...options, session, messages: parsed.request.messages });
+  return toDeuzAgentStreamResponse(stream, {
+    runId,
+    store: streams, // every leg of the run in one journal: `seq` grows across them
+    streamId: runId,
+    wireVersion: negotiateDeuzStreamVersion(req),
+  });
+}
+```
+
+A resume reads the run's history from the store, not from the posted `messages`, and `resumeStreamAgent` refuses a `runId` stored under another `scope`, so take the scope from your authentication. The route checks both before it resumes: a run is stored without a `result` while a leg executes, so a second tab or a double submit gets a 409, and `useChat` shows it as an error. A request that gets past the check anyway (two arriving at once) is refused by the run itself, and `toDeuzAgentStreamResponse` keeps such a [refused leg out of the journal](/docs/modules/ui-streaming#sequence-and-replay): its client sees the failure, and the leg that runs keeps its event ids. A client result passes the same validation and projection path as a server tool's result. To let a client reconnect, serve `resumeDeuzStreamResponse(streams, runId, { lastEventId })` from a GET route (after checking that the user owns `runId`) and point `resume.endpoint` at it.
+
+```tsx title="AgentChat.tsx"
+'use client';
+import { useChat } from '@deuz-sdk/react';
+
+export function AgentChat() {
+  const { messages, status, sendMessage, pendingApprovals, addToolApprovalResponse, agent, stopDetails } =
+    useChat({
+      api: '/api/agent',
+      onToolCall: async ({ toolName }) => (toolName === 'locate' ? { city: 'Paris' } : null),
+    });
+
+  return (
+    <div>
+      {messages.map((m) => (
+        <p key={m.id}>
+          <b>{m.role}:</b> {m.content}
+        </p>
+      ))}
+      {pendingApprovals.map((request) => (
+        <button
+          key={request.approvalId}
+          onClick={() => addToolApprovalResponse({ approvalId: request.approvalId, approved: true })}
+        >
+          Approve {request.toolName}
+        </button>
+      ))}
+      {agent?.status === 'completed' ? <output>{String(agent.output)}</output> : null}
+      {agent?.status === 'stopped' && agent.reason === 'refusal' ? (
+        <p role="alert">Refused: {stopDetails?.category ?? 'no reason given'}</p>
+      ) : null}
+      <button disabled={status === 'streaming'} onClick={() => sendMessage('Publish document 7.')}>
+        Send
+      </button>
+    </div>
+  );
+}
+```
+
+The approval card resumes the run with `runId` and the verdict; `locate` then runs in the browser, and its result goes back with the same verdict in one request.
 
 ## throttleMs
 
@@ -310,6 +480,8 @@ useChat({
 - **A failing automatic attempt is silent**: no `error`, no `status: 'error'`, no `onError`. The user did not ask for it, and every cold load of an app whose resume endpoint answers 404 would otherwise paint a permanent error. `reconnect()` called by hand keeps 1.8's exact error semantics.
 - **A caught-up endpoint is a no-op.** A resume that folds zero parts (an immediate `[DONE]`) changes nothing at all; 1.8 pre-pushed the assistant bubble before reading and left a permanently empty one on screen.
 - **`cursor` is an injectable adapter** — no `localStorage` is hardcoded (that would break SSR and React Native), and a throwing adapter cannot kill a live stream.
+- **A resumed turn settles like a streamed one** (2.3). Its approvals pause the chat, and its client calls reach `onToolCall` or `pendingToolCalls`; see [Client tools after a reconnect](#client-tools-after-a-reconnect). Under `auto` the read stays silent, but a POST it triggers (an `onToolCall` result continuing the chat) reports a failure like any other request.
+- **The cursor follows the POST read too (2.3).** When the POST response carries the journal's `id:` lines (the route passes `store` and `streamId`), they move the hook's in-memory cursor. A `reconnect()` after a settled turn, or after a leg the hook continued with a POST, then resumes after it and appends nothing the history already holds; a reconnect after a dropped POST continues that turn from the last part it showed. Before 2.3 the POST read left the cursor alone, so such a reconnect appended the replayed turn to the history a second time. The persisted cursor (`resume.cursor`) still moves on resume reads only, because a reload mid-turn must replay that turn from its start. `setHistory` and `setMessages` drop the in-memory cursor, so after a chat switch the new chat is read from its persisted cursor or its start. After a reload, a replay of a journal that also holds legs the restored history already has (a lost or old cursor) still appends them again: the restored history is all the hook knows. Let the resume endpoint answer 404 when nothing is in flight, and journal one run per `streamId`.
 
 ## Truncated turns
 

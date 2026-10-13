@@ -1,5 +1,6 @@
 import type {
   GenerateObjectOptions,
+  StopDetails,
   StreamObject,
   StreamObjectResult,
   DeepPartial,
@@ -34,6 +35,7 @@ export const streamObject: StreamObject = <T = unknown>(
   const objectDeferred = createDeferred<T>();
   const usageDeferred = createDeferred<Usage>();
   const finishDeferred = createDeferred<FinishReason>();
+  const stopDetailsDeferred = createDeferred<StopDetails | undefined>();
   const warningsDeferred = createDeferred<CallWarning[]>();
   const warningSink = createWarningSink(resolveDependencies(options.deps).logger);
   // Eager subscription BEFORE the lazy start so no part can be missed (G2).
@@ -107,10 +109,16 @@ export const streamObject: StreamObject = <T = unknown>(
       }
 
       // Resolve BEFORE parse/validation — the tokens were spent either way,
-      // so usage/finishReason survive a NoObjectGeneratedError.
+      // so usage/finishReason survive a NoObjectGeneratedError, and a refused
+      // request keeps its explanation.
       usageDeferred.resolve(await inner.usage);
-      finishDeferred.resolve(await inner.finishReason);
+      const finishReason = await inner.finishReason;
+      const stopDetails = await inner.stopDetails;
+      finishDeferred.resolve(finishReason);
+      stopDetailsDeferred.resolve(stopDetails);
       warningsDeferred.resolve(warningSink.list());
+      // A refused or cut-off object says why on its error too (2.3).
+      const stop = { finishReason, ...(stopDetails ? { stopDetails } : {}) };
 
       let parsed: unknown;
       try {
@@ -119,6 +127,7 @@ export const streamObject: StreamObject = <T = unknown>(
         throw new NoObjectGeneratedError('streamObject: final payload is not valid JSON.', {
           text: buf,
           cause: err,
+          ...stop,
         });
       }
       const validation = await validateOutput<T>(options.schema, parsed);
@@ -126,6 +135,7 @@ export const streamObject: StreamObject = <T = unknown>(
         throw new NoObjectGeneratedError('streamObject: final object failed schema validation.', {
           text: buf,
           cause: new Error(validation.issues),
+          ...stop,
         });
       }
 
@@ -141,6 +151,10 @@ export const streamObject: StreamObject = <T = unknown>(
       objectDeferred.reject(err);
       usageDeferred.reject(err);
       finishDeferred.reject(err);
+      stopDetailsDeferred.reject(err);
+      // Never rejects (the declared contract): a failed call still reports
+      // the notices collected before it failed.
+      warningsDeferred.resolve(warningSink.list());
       // fail(), not close(): consumers of the partial stream must see the
       // failure, not a clean end-of-stream.
       broadcaster.fail(err);
@@ -199,6 +213,10 @@ export const streamObject: StreamObject = <T = unknown>(
     get finishReason() {
       ensureStarted();
       return finishDeferred.promise;
+    },
+    get stopDetails() {
+      ensureStarted();
+      return stopDetailsDeferred.promise;
     },
     get warnings() {
       ensureStarted();

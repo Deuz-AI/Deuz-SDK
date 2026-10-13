@@ -3,12 +3,14 @@ import type { BudgetScopeUsage, PersistentBudgetScope } from './types/budget-sto
 import type {
   BudgetAdmission,
   BudgetAggregate,
+  BudgetAmounts,
   BudgetCompaction,
   BudgetLedger,
   BudgetLedgerOptions,
   BudgetLedgerSnapshot,
   BudgetLimits,
   BudgetReservation,
+  BudgetReservationInput,
   BudgetScope,
   BudgetSettlement,
   BudgetTotals,
@@ -23,19 +25,41 @@ export type BudgetLedgerErrorCode =
   | 'unknown_request'
   | 'invalid_snapshot'
   | 'persistence_failed'
-  /** The persistent `BudgetStore` failed; nothing was admitted or changed locally (2.2). */
-  | 'admission_failed';
+  /**
+   * The persistent `BudgetStore` failed; nothing was admitted or changed
+   * locally (2.2). A settlement or release is tried three times first and the
+   * error then carries `requestId` and, for a settlement, `settlement` (2.3).
+   */
+  | 'admission_failed'
+  /** A model with no price was refused under a USD bound with `unknownPrice: 'reject'` (2.3). */
+  | 'unpriced_model';
+
+/** Attempts at closing a hold (settle, release) in the persistent store (2.3, F17). */
+const CLOSE_ATTEMPTS = 3;
 
 export class BudgetLedgerError extends Error {
   readonly name = 'BudgetLedgerError';
   readonly fatalExecution = true;
+  // `declare`: only errors that carry them get these properties.
+  /**
+   * The attempt whose hold a failed store call left in place (2.3). Settle or
+   * release it again once the store answers.
+   */
+  declare readonly requestId?: string;
+  /** For a failed settlement: `ledger.settle(settlement)` replays it (2.3). */
+  declare readonly settlement?: BudgetSettlement;
 
   constructor(
     readonly code: BudgetLedgerErrorCode,
     message: string,
     cause?: unknown,
+    details?: { readonly requestId: string; readonly settlement?: BudgetSettlement },
   ) {
     super(message, cause === undefined ? undefined : { cause });
+    if (details) {
+      this.requestId = details.requestId;
+      if (details.settlement) this.settlement = details.settlement;
+    }
   }
 }
 
@@ -53,7 +77,8 @@ function amount(value: number | undefined, label: string, integer = false): void
   }
 }
 
-function limits(value: BudgetLimits = {}): BudgetLimits {
+/** Token and USD amounts only: estimates and actual usage carry no policy. */
+function amounts(value: BudgetLimits = {}): BudgetLimits {
   if (value === null || typeof value !== 'object') {
     throw new BudgetLedgerError('invalid_budget', 'Budget must be an object.');
   }
@@ -65,7 +90,20 @@ function limits(value: BudgetLimits = {}): BudgetLimits {
   });
 }
 
-/** Omitted child limits inherit; supplied limits can only tighten the parent. */
+/** A budget: its bounds plus how its `usd` bound treats unpriced models (2.3). */
+function limits(value: BudgetLimits = {}): BudgetLimits {
+  const bounds = amounts(value);
+  const policy = value.unknownPrice;
+  if (policy === undefined) return bounds;
+  if (policy !== 'warn' && policy !== 'reject')
+    throw new BudgetLedgerError('invalid_budget', "unknownPrice must be 'warn' or 'reject'.");
+  return Object.freeze({ ...bounds, unknownPrice: policy });
+}
+
+/**
+ * Omitted child limits inherit; supplied limits can only tighten the parent.
+ * `unknownPrice: 'reject'` on either side wins (2.3).
+ */
 export function intersectBudgetLimits(
   parent: BudgetLimits = {},
   child: BudgetLimits = {},
@@ -74,7 +112,14 @@ export function intersectBudgetLimits(
   const b = limits(child);
   const min = (left: number | undefined, right: number | undefined) =>
     left === undefined ? right : right === undefined ? left : Math.min(left, right);
-  return limits({ tokens: min(a.tokens, b.tokens), usd: min(a.usd, b.usd) });
+  return limits({
+    tokens: min(a.tokens, b.tokens),
+    usd: min(a.usd, b.usd),
+    unknownPrice:
+      a.unknownPrice === 'reject' || b.unknownPrice === 'reject'
+        ? 'reject'
+        : (a.unknownPrice ?? b.unknownPrice),
+  });
 }
 
 function identifier(value: string, label: string): void {
@@ -138,7 +183,10 @@ function record(input: BudgetReservation): BudgetReservation {
   if (!['reserved', 'settled', 'unknown', 'released'].includes(input.state)) {
     throw new BudgetLedgerError('invalid_snapshot', 'Invalid reservation state.');
   }
-  const actual = limits(input.actual);
+  if (input.unpriced !== undefined && input.unpriced !== true) {
+    throw new BudgetLedgerError('invalid_snapshot', 'Invalid unpriced marker.');
+  }
+  const actual = amounts(input.actual);
   const usage = input.usage === undefined ? undefined : copyUsage(input.usage);
   if (usage && usage.totalTokens !== actual.tokens) {
     throw new BudgetLedgerError('invalid_snapshot', 'Usage and actual token totals disagree.');
@@ -162,12 +210,84 @@ function record(input: BudgetReservation): BudgetReservation {
     requestId: input.requestId,
     modelId: input.modelId,
     kind: input.kind,
-    reservation: limits(input.reservation),
+    reservation: amounts(input.reservation),
     actual,
     scopes: copyScopes(input.scopes),
     state: input.state,
     ...(usage ? { usage } : {}),
+    ...(input.unpriced ? { unpriced: true as const } : {}),
   });
+}
+
+/** The USD of this attempt is unknown because its model has no price (2.3). */
+const unpricedUsd = (item: BudgetReservation): boolean =>
+  item.unpriced === true && item.actual.usd === undefined;
+
+/** A live attempt with no estimate for `dimension`: a bound on it fails closed. */
+const holdsNoEstimate = (item: BudgetReservation, dimension: 'tokens' | 'usd'): boolean =>
+  item.state !== 'released' &&
+  item.actual[dimension] === undefined &&
+  item.reservation[dimension] === undefined &&
+  !(dimension === 'usd' && unpricedUsd(item));
+
+/** Folded attempts with no estimate for `dimension` (2.2). */
+const foldsNoEstimate = (item: BudgetAggregate, dimension: 'tokens' | 'usd'): boolean =>
+  (dimension === 'tokens'
+    ? item.unestimatedTokens
+    : item.unestimatedUsd - (item.unpricedUsd ?? 0)) > 0;
+
+/**
+ * Admit `candidate` under one bound's `cap`, given what the bound commits and
+ * whether an attempt charged to it holds no estimate for a dimension.
+ */
+function fits(
+  candidate: BudgetReservation,
+  cap: BudgetLimits,
+  committed: BudgetAmounts,
+  unreserved: (dimension: 'tokens' | 'usd') => boolean,
+  scopeId?: string,
+): void {
+  for (const dimension of dimensions) {
+    const maximum = cap[dimension];
+    if (maximum === undefined) continue;
+    let estimate = candidate.reservation[dimension];
+    if (dimension === 'usd' && estimate === undefined && candidate.unpriced) {
+      // Decision 4 (2.3): a model with no price adds nothing to the USD total
+      // (the run warns) unless this bound refuses unpriced models.
+      if (cap.unknownPrice === 'reject')
+        throw new BudgetLedgerError(
+          'unpriced_model',
+          `${candidate.modelId} has no price, so the usd budget${scopeId ? ` of ${scopeId}` : ''} cannot admit it (unknownPrice: 'reject').`,
+        );
+      estimate = 0;
+    }
+    if (estimate === undefined || unreserved(dimension)) {
+      throw new BudgetLedgerError(
+        'missing_reservation',
+        `Known ${dimension} reservations are required for bounded admission${scopeId ? ` in ${scopeId}` : ''}.`,
+      );
+    }
+    if (committed[dimension] + estimate > maximum) {
+      throw new BudgetLedgerError(
+        'budget_exceeded',
+        `${dimension} budget exceeded${scopeId ? ` in ${scopeId}` : ''}.`,
+      );
+    }
+  }
+}
+
+/** One bound (the ledger, or one scope) as a step of admissions in turn sees it (2.3). */
+interface Standing {
+  readonly committed: { tokens: number; usd: number };
+  readonly unreserved: { tokens: boolean; usd: boolean };
+}
+
+/** Count an admitted attempt in a bound: it holds its estimates and has spent nothing. */
+function charge(standing: Standing, candidate: BudgetReservation): void {
+  for (const dimension of dimensions) {
+    standing.committed[dimension] += candidate.reservation[dimension] ?? 0;
+    if (holdsNoEstimate(candidate, dimension)) standing.unreserved[dimension] = true;
+  }
 }
 
 function count(value: number, label: string): number {
@@ -176,8 +296,8 @@ function count(value: number, label: string): number {
   return value;
 }
 
-function known(value: BudgetLimits, label: string): Required<BudgetLimits> {
-  const copy = limits(value);
+function known(value: BudgetLimits, label: string): BudgetAmounts {
+  const copy = amounts(value);
   if (copy.tokens === undefined || copy.usd === undefined)
     throw new BudgetLedgerError('invalid_snapshot', `${label} requires token and USD amounts.`);
   return Object.freeze({ tokens: copy.tokens, usd: copy.usd });
@@ -191,11 +311,14 @@ function aggregate(input: BudgetAggregate): BudgetAggregate {
   const unknownUsd = count(input.unknownUsd, 'Aggregate unknownUsd');
   const unestimatedTokens = count(input.unestimatedTokens, 'Aggregate unestimatedTokens');
   const unestimatedUsd = count(input.unestimatedUsd, 'Aggregate unestimatedUsd');
+  const unpriced =
+    input.unpricedUsd === undefined ? 0 : count(input.unpricedUsd, 'Aggregate unpricedUsd');
   if (
     unknownTokens > folded ||
     unknownUsd > folded ||
     unestimatedTokens > unknownTokens ||
-    unestimatedUsd > unknownUsd
+    unestimatedUsd > unknownUsd ||
+    unpriced > unestimatedUsd
   )
     throw new BudgetLedgerError('invalid_snapshot', 'Budget aggregate counts are inconsistent.');
   return Object.freeze({
@@ -207,6 +330,7 @@ function aggregate(input: BudgetAggregate): BudgetAggregate {
     unknownUsd,
     unestimatedTokens,
     unestimatedUsd,
+    ...(unpriced ? { unpricedUsd: unpriced } : {}),
   });
 }
 
@@ -349,6 +473,7 @@ function fold(
     unknownUsd: previous?.unknownUsd ?? 0,
     unestimatedTokens: previous?.unestimatedTokens ?? 0,
     unestimatedUsd: previous?.unestimatedUsd ?? 0,
+    unpricedUsd: previous?.unpricedUsd ?? 0,
   };
   if (item) {
     next.count++;
@@ -366,6 +491,8 @@ function fold(
       } else {
         next.unknownUsd++;
         if (estimate === undefined) next.unestimatedUsd++;
+        // Still unpriced after folding (2.3): it never fails a later USD cap closed.
+        if (item.unpriced) next.unpricedUsd++;
       }
     }
   }
@@ -394,6 +521,116 @@ export function subtreeLedgerSnapshot(
 
 function same(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** The reservation an input asks for, validated and copied. */
+function reservationOf(input: BudgetReservationInput): BudgetReservation {
+  if (input.unpriced !== undefined && typeof input.unpriced !== 'boolean')
+    throw new BudgetLedgerError('invalid_budget', 'unpriced must be boolean.');
+  if (input.unpriced && input.usd !== undefined)
+    throw new BudgetLedgerError(
+      'invalid_budget',
+      'An unpriced reservation carries no usd estimate.',
+    );
+  return record({
+    requestId: input.requestId,
+    modelId: input.modelId,
+    kind: input.kind ?? 'model',
+    reservation: amounts(input),
+    actual: {},
+    scopes: input.scopes ?? [],
+    state: 'reserved',
+    ...(input.unpriced ? { unpriced: true as const } : {}),
+  });
+}
+
+/** True when a recorded reservation is the one `candidate` asks for again. */
+function sameReservation(existing: BudgetReservation, candidate: BudgetReservation): boolean {
+  return (
+    existing.modelId === candidate.modelId &&
+    existing.kind === candidate.kind &&
+    same(existing.reservation, candidate.reservation) &&
+    same(existing.scopes, candidate.scopes) &&
+    existing.unpriced === candidate.unpriced
+  );
+}
+
+const conflicting = (requestId: string) =>
+  new BudgetLedgerError('reservation_conflict', `Conflicting reservation for ${requestId}.`);
+
+/**
+ * Ledger operations batch holds need (2.3), kept off the public
+ * `BudgetLedger` type: each ledger `createBudgetLedger` makes registers its own.
+ */
+interface LedgerInternals {
+  adopt(input: BudgetReservationInput): Promise<BudgetReservation>;
+  reserveMany(inputs: readonly BudgetReservationInput[]): Promise<BudgetReservation[]>;
+}
+
+const internals = new WeakMap<BudgetLedger, LedgerInternals>();
+
+/**
+ * Reserve several attempts in one step (2.3), for a batch's holds: each is
+ * admitted as `reserve` admits it, against the budgets and the attempts
+ * admitted before it, but the records are read once and written in one
+ * revision and one persisted snapshot, so the step grows with the number of
+ * attempts rather than its square. All or none: when one is refused, the ones
+ * admitted before it are left released, as reserving and releasing them one
+ * by one would leave them (the `BudgetStore` takes back the holds it made),
+ * and the refusal is thrown. A repeat keeps its record; a conflicting repeat
+ * or a repeated id is refused before anything is admitted. A ledger
+ * `createBudgetLedger` did not make reserves them one by one.
+ */
+export async function reserveAll(
+  ledger: BudgetLedger,
+  inputs: readonly BudgetReservationInput[],
+): Promise<BudgetReservation[]> {
+  const own = internals.get(ledger);
+  if (own) return own.reserveMany(inputs);
+  return reserveInTurn(
+    (input: BudgetReservationInput) => ledger.reserve(input),
+    (requestId) => ledger.release(requestId),
+    inputs,
+  );
+}
+
+/**
+ * Reserve attempts one after another, all or none: when one is refused, the
+ * ones made are released (a release that fails leaves its hold) and the
+ * refusal is thrown.
+ */
+export async function reserveInTurn<T>(
+  reserve: (input: T) => Promise<BudgetReservation>,
+  release: (requestId: string) => Promise<unknown>,
+  inputs: readonly T[],
+): Promise<BudgetReservation[]> {
+  const made: BudgetReservation[] = [];
+  try {
+    for (const input of inputs) made.push(await reserve(input));
+  } catch (error) {
+    for (const item of [...made].reverse()) await release(item.requestId).catch(() => undefined);
+    throw error;
+  }
+  return made;
+}
+
+/**
+ * Record a reservation another ledger already admitted (2.3): a batch hold a
+ * fresh context reads back after a restart, whose provider request has run.
+ * This ledger's budgets, its scope budgets and their `unknownPrice` policies
+ * do not refuse it (refusing would only hide the spend); its amounts count
+ * against them from then on, as an overage settled by the first ledger does.
+ * A persistent `BudgetStore` is still asked, where an identical repeat is the
+ * same hold; a store or ledger record of that request with other amounts or
+ * scope limits is a `reservation_conflict`. A ledger `createBudgetLedger` did
+ * not make reserves it instead.
+ */
+export function adoptReservation(
+  ledger: BudgetLedger,
+  input: BudgetReservationInput,
+): Promise<BudgetReservation> {
+  const own = internals.get(ledger);
+  return own ? own.adopt(input) : ledger.reserve(input);
 }
 
 /**
@@ -462,29 +699,63 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
     });
   }
 
-  /** Run a store call; a failure changes nothing locally and admits nothing. */
-  async function mirror<T>(call: () => Promise<T>): Promise<T> {
-    try {
-      return await call();
-    } catch (error) {
-      throw new BudgetLedgerError(
-        'admission_failed',
-        'The persistent budget store failed; nothing was changed.',
-        error,
-      );
+  /**
+   * Run a store call; a failure changes nothing locally and admits nothing. A
+   * call that closes a hold (settle, release) is repeated, since both are
+   * idempotent in the store, and its final failure names the request and what
+   * it still owes, so the hold can be closed later (2.3, F17). A conflict is
+   * not a failure: the store already closed that hold, typically a sweep that
+   * got there first, so it keeps its own amounts and the caller's local
+   * transition goes ahead without a retry.
+   */
+  function mirror<T>(call: () => Promise<T>): Promise<T>;
+  function mirror(
+    call: () => Promise<void>,
+    closing: { readonly requestId: string; readonly settlement?: BudgetSettlement },
+  ): Promise<void>;
+  async function mirror<T>(
+    call: () => Promise<T>,
+    closing?: { readonly requestId: string; readonly settlement?: BudgetSettlement },
+  ): Promise<T | void> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await call();
+      } catch (error) {
+        if (closing && (error as { code?: unknown } | null)?.code === 'reservation_conflict')
+          return;
+        if (closing && attempt < CLOSE_ATTEMPTS) continue;
+        throw new BudgetLedgerError(
+          'admission_failed',
+          closing
+            ? `The persistent budget store failed to close ${closing.requestId}; nothing was changed and its hold stays.`
+            : 'The persistent budget store failed; nothing was changed.',
+          error,
+          closing,
+        );
+      }
     }
   }
 
   /** Second gate (2.2): all-or-nothing admission in the shared store. */
-  async function admitPersistent(candidate: BudgetReservation): Promise<void> {
+  async function admitPersistent(candidate: BudgetReservation, strict: boolean): Promise<void> {
     if (!admission) return;
     for (const scope of admission.scopes) {
       for (const dimension of dimensions) {
-        if (scope.limits[dimension] !== undefined && candidate.reservation[dimension] === undefined)
-          throw new BudgetLedgerError(
-            'missing_reservation',
-            `Known ${dimension} reservations are required by persistent scope ${scope.key}.`,
-          );
+        if (scope.limits[dimension] === undefined || candidate.reservation[dimension] !== undefined)
+          continue;
+        if (dimension === 'usd' && candidate.unpriced) {
+          // Decision 4 (2.3): the run's policy or the scope's own can refuse it.
+          if (strict || scope.limits.unknownPrice === 'reject')
+            throw new BudgetLedgerError(
+              'unpriced_model',
+              `${candidate.modelId} has no price, so persistent scope ${scope.key} cannot admit it under its usd limit (unknownPrice: 'reject').`,
+            );
+          continue;
+        }
+        throw new BudgetLedgerError(
+          'missing_reservation',
+          `Known ${dimension} reservations are required by persistent scope ${scope.key}.`,
+        );
       }
     }
     const store = admission.store;
@@ -493,9 +764,11 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
         requestId: candidate.requestId,
         modelId: candidate.modelId,
         ...candidate.reservation,
+        // An unpriced call holds no USD; a usd-bounded scope still needs an amount.
+        ...(candidate.unpriced ? { usd: 0 } : {}),
         scopes: admission.scopes.map((scope) => ({
           key: scope.key,
-          limits: scope.limits,
+          limits: amounts(scope.limits),
           ...(scope.window ? { window: scope.window } : {}),
         })),
       }),
@@ -562,8 +835,18 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
   ): Promise<void> | undefined {
     if (!admission || !settledInStore(next) || settledInStore(previous)) return undefined;
     const store = admission.store;
-    return mirror(() =>
-      store.settle(next.requestId, { tokens: next.actual.tokens!, usd: next.actual.usd ?? 0 }),
+    return mirror(
+      () =>
+        store.settle(next.requestId, { tokens: next.actual.tokens!, usd: next.actual.usd ?? 0 }),
+      {
+        requestId: next.requestId,
+        // `ledger.settle(settlement)` replays exactly this transition.
+        settlement: {
+          requestId: next.requestId,
+          ...(next.usage ? { usage: next.usage } : { tokens: next.actual.tokens! }),
+          ...(next.actual.usd !== undefined ? { usd: next.actual.usd } : {}),
+        },
+      },
     );
   }
 
@@ -579,6 +862,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
     const reserved = { tokens: 0, usd: 0 };
     let unknownTokens = 0;
     let unknownUsd = 0;
+    let unpriced = 0;
     for (const item of entries.values()) {
       if (
         item.state === 'released' ||
@@ -594,6 +878,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
           else unknownUsd++;
         }
       }
+      if (unpricedUsd(item)) unpriced++;
     }
     for (const item of aggregates.values()) {
       if (!inScope(item.scopes, scopeId)) continue;
@@ -603,6 +888,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
       }
       unknownTokens += item.unknownTokens;
       unknownUsd += item.unknownUsd;
+      unpriced += item.unpricedUsd ?? 0;
     }
     return Object.freeze({
       spent: Object.freeze(spent),
@@ -613,6 +899,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
       }),
       unknownTokens,
       unknownUsd,
+      ...(unpriced ? { unpriced } : {}),
     });
   }
 
@@ -652,6 +939,8 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
   }
 
   async function persistSnapshot(): Promise<void> {
+    // Without a sink, skip copying every record (2.3: a batch settles one per result).
+    if (!persistenceSinks.size) return;
     try {
       const saved = snapshot();
       for (const sink of [...persistenceSinks]) {
@@ -676,36 +965,28 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
 
   function admit(candidate: BudgetReservation, cap: BudgetLimits, scopeId?: string): void {
     const current = totals(scopeId);
-    for (const dimension of dimensions) {
-      const maximum = cap[dimension];
-      if (maximum === undefined) continue;
-      const estimate = candidate.reservation[dimension];
-      const unreserved =
-        [...entries.values()].some(
-          (item) =>
-            item.state !== 'released' &&
-            inScope(item.scopes, scopeId) &&
-            item.actual[dimension] === undefined &&
-            item.reservation[dimension] === undefined,
-        ) ||
-        [...aggregates.values()].some(
-          (item) =>
-            inScope(item.scopes, scopeId) &&
-            (dimension === 'tokens' ? item.unestimatedTokens : item.unestimatedUsd) > 0,
-        );
-      if (estimate === undefined || unreserved) {
-        throw new BudgetLedgerError(
-          'missing_reservation',
-          `Known ${dimension} reservations are required for bounded admission${scopeId ? ` in ${scopeId}` : ''}.`,
-        );
-      }
-      if (current.committed[dimension] + estimate > maximum) {
-        throw new BudgetLedgerError(
-          'budget_exceeded',
-          `${dimension} budget exceeded${scopeId ? ` in ${scopeId}` : ''}.`,
-        );
-      }
-    }
+    fits(candidate, cap, current.committed, (dimension) => unreserved(dimension, scopeId), scopeId);
+  }
+
+  /** Whether an attempt charged to the bound holds no estimate for `dimension`. */
+  function unreserved(dimension: 'tokens' | 'usd', scopeId?: string): boolean {
+    return (
+      [...entries.values()].some(
+        (item) => inScope(item.scopes, scopeId) && holdsNoEstimate(item, dimension),
+      ) ||
+      [...aggregates.values()].some(
+        (item) => inScope(item.scopes, scopeId) && foldsNoEstimate(item, dimension),
+      )
+    );
+  }
+
+  /** A bound as the records leave it, read once for a step of admissions in turn. */
+  function standing(scopeId?: string): Standing {
+    const { committed } = totals(scopeId);
+    return {
+      committed: { tokens: committed.tokens, usd: committed.usd },
+      unreserved: { tokens: unreserved('tokens', scopeId), usd: unreserved('usd', scopeId) },
+    };
   }
 
   function applySettlement(input: BudgetSettlement): BudgetReservation {
@@ -750,6 +1031,145 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
     });
   }
 
+  /** See `adoptReservation`: `reserve` without this ledger's own admission. */
+  function adopt(input: BudgetReservationInput): Promise<BudgetReservation> {
+    const candidate = reservationOf(input);
+    return enqueue(async () => {
+      const existing = entries.get(candidate.requestId);
+      if (existing) {
+        if (!sameReservation(existing, candidate)) throw conflicting(candidate.requestId);
+        return save(existing);
+      }
+      if (admission) {
+        try {
+          // Not strict: this ledger's unknownPrice policy is local admission too.
+          await admitPersistent(candidate, false);
+        } catch (error) {
+          // The store's own record of this request has other amounts or scope limits.
+          const cause = error instanceof BudgetLedgerError ? error.cause : undefined;
+          if ((cause as { code?: unknown } | undefined)?.code === 'reservation_conflict')
+            throw new BudgetLedgerError(
+              'reservation_conflict',
+              `The persistent budget store records ${candidate.requestId} with other amounts or scope limits.`,
+              cause,
+            );
+          throw error;
+        }
+      }
+      return save(candidate);
+    });
+  }
+
+  /** See `reserveAll`: `reserve` for each attempt in turn, as one step. */
+  function reserveMany(inputs: readonly BudgetReservationInput[]): Promise<BudgetReservation[]> {
+    // Copy before queueing so caller mutation cannot change admission.
+    const candidates = inputs.map(reservationOf);
+    const ids = new Set<string>();
+    for (const { requestId } of candidates) {
+      if (ids.has(requestId))
+        throw new BudgetLedgerError('invalid_budget', `Duplicate request ID: ${requestId}.`);
+      ids.add(requestId);
+    }
+    return enqueue(async () => {
+      const fresh: BudgetReservation[] = [];
+      const reserved = candidates.map((candidate) => {
+        const existing = entries.get(candidate.requestId);
+        if (!existing) fresh.push(candidate);
+        else if (!sameReservation(existing, candidate)) throw conflicting(candidate.requestId);
+        return existing ?? candidate;
+      });
+      // Every bound the attempts meet, and each scope's effective budget, read once.
+      const all = standing();
+      const scoped = new Map<string, Standing>();
+      const effective = new Map<string, BudgetLimits>();
+      for (const candidate of fresh)
+        for (const scope of candidate.scopes)
+          if (!scoped.has(scope.id)) {
+            scoped.set(scope.id, standing(scope.id));
+            effective.set(scope.id, {});
+          }
+      for (const existing of [...entries.values(), ...aggregates.values()])
+        for (const scope of existing.scopes) {
+          const bound = effective.get(scope.id);
+          if (bound) effective.set(scope.id, intersectBudgetLimits(bound, scope.budget));
+        }
+      // Each attempt in turn, as `reserve` admits it after the ones before it.
+      const strict: boolean[] = [];
+      try {
+        for (const candidate of fresh) {
+          fits(candidate, budget, all.committed, (dimension) => all.unreserved[dimension]);
+          let refusesUnpriced = budget.unknownPrice === 'reject';
+          const bounds = candidate.scopes.map((scope) => {
+            const bound = intersectBudgetLimits(effective.get(scope.id), scope.budget);
+            const state = scoped.get(scope.id)!;
+            fits(
+              candidate,
+              bound,
+              state.committed,
+              (dimension) => state.unreserved[dimension],
+              scope.id,
+            );
+            if (bound.unknownPrice === 'reject') refusesUnpriced = true;
+            return bound;
+          });
+          // Admitted: it counts for the attempts after it.
+          for (const [index, scope] of candidate.scopes.entries()) {
+            effective.set(scope.id, bounds[index]!);
+            charge(scoped.get(scope.id)!, candidate);
+          }
+          charge(all, candidate);
+          strict.push(refusesUnpriced);
+        }
+      } catch (error) {
+        await withdraw(fresh.slice(0, strict.length));
+        throw error;
+      }
+      if (admission) {
+        const store = admission.store;
+        for (const [index, candidate] of fresh.entries()) {
+          try {
+            await admitPersistent(candidate, strict[index]!);
+          } catch (error) {
+            // The store takes back the holds it made; one it keeps stays held here too.
+            const kept = new Set<BudgetReservation>();
+            for (const made of fresh.slice(0, index).reverse())
+              await mirror(() => store.release(made.requestId), {
+                requestId: made.requestId,
+              }).catch(() => kept.add(made));
+            await withdraw(fresh.slice(0, index), kept);
+            throw error;
+          }
+        }
+      }
+      for (const candidate of fresh) entries.set(candidate.requestId, candidate);
+      if (fresh.length) revision++;
+      // Idempotent recovery still awaits persistence before a caller proceeds.
+      await persistSnapshot();
+      return reserved;
+    });
+  }
+
+  /**
+   * After a refused step, record the attempts admitted before the refusal as
+   * released (the `kept` ones as reserved), as one by one would leave them.
+   */
+  async function withdraw(
+    admitted: readonly BudgetReservation[],
+    kept: ReadonlySet<BudgetReservation> = new Set(),
+  ): Promise<void> {
+    if (!admitted.length) return;
+    for (const candidate of admitted)
+      entries.set(
+        candidate.requestId,
+        kept.has(candidate)
+          ? candidate
+          : record({ ...candidate, state: 'released', actual: {}, usage: undefined }),
+      );
+    revision++;
+    // The refusal is what the caller needs; a failed write has poisoned the ledger.
+    await persistSnapshot().catch(() => undefined);
+  }
+
   const ledger: BudgetLedger = {
     budget,
     addPersistence(persist) {
@@ -769,32 +1189,16 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
     },
     reserve(input) {
       // Copy before queueing so caller mutation cannot change admission.
-      const candidate = record({
-        requestId: input.requestId,
-        modelId: input.modelId,
-        kind: input.kind ?? 'model',
-        reservation: limits(input),
-        actual: {},
-        scopes: input.scopes ?? [],
-        state: 'reserved',
-      });
+      const candidate = reservationOf(input);
       return enqueue(async () => {
         const existing = entries.get(candidate.requestId);
         if (existing) {
-          if (
-            existing.modelId !== candidate.modelId ||
-            existing.kind !== candidate.kind ||
-            !same(existing.reservation, candidate.reservation) ||
-            !same(existing.scopes, candidate.scopes)
-          ) {
-            throw new BudgetLedgerError(
-              'reservation_conflict',
-              `Conflicting reservation for ${candidate.requestId}.`,
-            );
-          }
+          if (!sameReservation(existing, candidate)) throw conflicting(candidate.requestId);
           return save(existing);
         }
         admit(candidate, budget);
+        // A persistent scope refuses an unpriced model when any budget of the run does.
+        let strict = budget.unknownPrice === 'reject';
         for (const scope of candidate.scopes) {
           let effective = scope.budget;
           for (const existing of [...entries.values(), ...aggregates.values()]) {
@@ -802,8 +1206,9 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
             if (previous) effective = intersectBudgetLimits(effective, previous.budget);
           }
           admit(candidate, effective, scope.id);
+          if (effective.unknownPrice === 'reject') strict = true;
         }
-        if (admission) await admitPersistent(candidate);
+        if (admission) await admitPersistent(candidate, strict);
         return save(candidate);
       });
     },
@@ -822,17 +1227,30 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
         // Validate before consulting an external price source.
         const partial = applySettlement({ requestId, usage: copied });
         let usd = existing.actual.usd;
+        let unpriced = existing.unpriced === true;
         if (usd === undefined && priceProvider) {
           try {
-            const priced = await priceProvider.priceUsage(existing.modelId, copied);
-            amount(priced, 'priced USD');
-            usd = priced;
+            const priced = (await priceProvider.priceUsage(existing.modelId, copied)) ?? undefined;
+            if (priced === undefined) {
+              // No price (2.3): a USD estimate held for the call becomes its charge,
+              // which closes the hold; without one its cost stays out of every total.
+              unpriced = true;
+              usd = existing.reservation.usd;
+            } else {
+              amount(priced, 'priced USD');
+              usd = priced;
+              unpriced = false;
+            }
           } catch {
             // A billing outage is not evidence of zero cost. Preserve the hold.
           }
         }
-        const next =
+        const settled =
           usd === undefined ? partial : applySettlement({ requestId, usage: copied, usd });
+        const next =
+          (settled.unpriced === true) === unpriced
+            ? settled
+            : record({ ...settled, unpriced: unpriced ? true : undefined });
         const mirrored = mirrorSettlement(existing, next);
         if (mirrored) await mirrored;
         return save(next);
@@ -859,7 +1277,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
           save(record({ ...current, state: 'released', actual: {}, usage: undefined }));
         if (!admission || current.state === 'released') return released();
         const store = admission.store;
-        return mirror(() => store.release(requestId)).then(released);
+        return mirror(() => store.release(requestId), { requestId }).then(released);
       });
     },
     get: (requestId) => entries.get(requestId),
@@ -904,6 +1322,7 @@ export function createBudgetLedger(options: BudgetLedgerOptions = {}): BudgetLed
     },
     snapshot,
   };
+  internals.set(ledger, { adopt, reserveMany });
   return Object.freeze(ledger);
 }
 
@@ -911,6 +1330,7 @@ export type {
   BudgetAdmission,
   BudgetAdmissionRestore,
   BudgetAggregate,
+  BudgetAmounts,
   BudgetCompaction,
   BudgetLedger,
   BudgetLedgerOptions,
@@ -922,4 +1342,5 @@ export type {
   BudgetSettlement,
   BudgetTotals,
   BudgetWarning,
+  UnknownPricePolicy,
 } from './types/execution';

@@ -1,6 +1,7 @@
 import type { ToolSet, Tool } from '../types/tool';
 import type { JSONSchema } from '../types/schema';
-import type { Clock } from '../types/deps';
+import type { Clock, Dependencies } from '../types/deps';
+import type { NativeExecutionContext } from '../types/execution';
 import type { ImagePart, Message, TextPart } from '../types/message';
 import type { LanguageModel } from '../types/model';
 import { resolveDependencies } from '../internal/resolve-deps';
@@ -20,7 +21,15 @@ import { generateText } from '../generate';
 export interface RawMcpClient {
   connect(transport: unknown): Promise<void>;
   callTool(req: { name: string; arguments: unknown }): Promise<McpCallResult>;
-  listTools(): Promise<{ tools: McpToolDef[] }>;
+  /**
+   * One `tools/list` page (2.3: the cursor). Without `params` the v1 SDK answers
+   * with the first page plus `nextCursor`; the v2 SDK walks every page itself and
+   * answers with none. `wrapMcpClient` follows `nextCursor` either way, so an
+   * implementation that ignores `params` and never sets `nextCursor` stays valid.
+   * After a walk of more than one page it hands the merged catalog to a v1
+   * client's `cacheToolMetadata`, which each page call replaced.
+   */
+  listTools(params?: { cursor?: string }): Promise<{ tools: McpToolDef[]; nextCursor?: string }>;
   close(): Promise<void>;
   /** SDK request-handler registration (used for elicitation/create). */
   setRequestHandler?(
@@ -38,6 +47,8 @@ export interface RawMcpClient {
   ping?(): Promise<unknown>;
   /** Server `Implementation` block from the handshake (namespace derivation). */
   getServerVersion?(): { name?: string; version?: string } | undefined;
+  /** The protocol revision the handshake settled on (2.3), e.g. `'2026-07-28'`. */
+  getNegotiatedProtocolVersion?(): string | undefined;
   /** Fired when the session ends — expected after `close()`, a DROP otherwise. */
   onclose?: (() => void) | undefined;
   /**
@@ -417,6 +428,37 @@ export function detectToolDrift(previous: ToolFingerprints, current: ToolFingerp
   const removed = Object.keys(previous.tools).filter((name) => !has(current.tools, name));
   return { added: added.sort(), removed: removed.sort(), changed: changed.sort() };
 }
+
+// --- SDK lines (2.3) ----------------------------------------------------------
+
+/**
+ * Which MCP TypeScript SDK drives a client (2.3). MCP 2026-07-28 ships only in
+ * the v2 SDK (`@modelcontextprotocol/client`); the v1 package
+ * (`@modelcontextprotocol/sdk`) stays on 2025-11-25. `'auto'` prefers v2 when its
+ * package can be imported and otherwise uses v1; `'v1'`/`'v2'` pin a line and
+ * fail with an install hint when it is missing.
+ */
+export type McpSdkSelection = 'auto' | 'v1' | 'v2';
+
+/** The SDK line a client actually runs on — what `'auto'` resolved to. */
+export type McpSdkLine = 'v1' | 'v2';
+
+/**
+ * Protocol-version negotiation on the v2 line (2.3), mirroring the v2 SDK's
+ * `versionNegotiation.mode`:
+ *
+ * - `'auto'` (the default) probes `server/discover` and speaks 2026-07-28 to a
+ *   server that offers it, otherwise falls back to the 2025-era `initialize`
+ *   handshake. Over stdio the v2 SDK runs that probe on a short-lived sibling
+ *   process, so the server command starts twice per connect.
+ * - `'legacy'` skips the probe: the plain 2025-11-25 handshake, as v1 does.
+ * - `{ pin: '2026-07-28' }` requires exactly that revision and fails loudly
+ *   against anything else.
+ *
+ * The v1 line only ever speaks 2025-era revisions: `'auto'` and `'legacy'` are
+ * the same handshake there, and a `pin` is rejected.
+ */
+export type McpVersionNegotiation = 'auto' | 'legacy' | { pin: string };
 
 // --- Connection lifecycle (2.0) ---------------------------------------------
 
@@ -859,6 +901,16 @@ export interface McpClient {
    */
   serverInfo?(): { name: string; version?: string } | undefined;
   /**
+   * The protocol revision the handshake negotiated (2.3): `'2026-07-28'` when a
+   * v2 client reached the modern era, `'2025-11-25'` (or an older 2025-era
+   * revision) on the `initialize` handshake. Read through the CURRENT session,
+   * so a reconnect that lands on an upgraded server reports the new value.
+   * Optional so a hand-written `McpClient` stays valid.
+   */
+  protocolVersion?(): string | undefined;
+  /** The SDK line behind this client (2.3) — what `sdk: 'auto'` resolved to. Optional, as above. */
+  sdk?(): McpSdkLine | undefined;
+  /**
    * Fires when the server's tool list is invalidated (`tools/list_changed`, or a
    * reconnect landing on a possibly-different server). The next `listTools()`
    * refetches; returns an unsubscribe.
@@ -868,15 +920,35 @@ export interface McpClient {
 }
 
 /**
+ * Hand a multi-page catalog back to the v1 SDK client. Each of its
+ * `listTools()` calls REPLACES the tool metadata it caches — the compiled
+ * `outputSchema` validators `callTool` checks structured results with, and the
+ * task-support sets — with that one page's, so after a cursor walk only the
+ * last page would be checked. `cacheToolMetadata` is a plain runtime method of
+ * the v1 `Client` (private only in its `.d.ts`); the v2 client walks the pages
+ * itself and has none, so this is a no-op there. The items are the SDK's own
+ * tool objects, so nothing the SDK caches (`execution` included) is lost.
+ */
+function primeToolMetadata(client: RawMcpClient, tools: McpToolDef[]): void {
+  const prime = (client as { cacheToolMetadata?: (tools: McpToolDef[]) => void }).cacheToolMetadata;
+  if (typeof prime === 'function') prime.call(client, tools);
+}
+
+/**
  * Wrap a connected raw SDK client in our `McpClient`.
  *
  * With a `managed` connection every call routes through `managed.raw()`, so the
  * wrapper (and every `ToolSet` it produced) follows the session across
  * reconnects, and `listTools()` is served from a cache that only invalidation
  * clears. Without one the wrapper is the 1.x pass-through, plus inert
- * `status()`/`onToolListChanged()` stubs.
+ * `status()`/`onToolListChanged()` stubs. `meta.sdk` names the SDK line the
+ * transports built the raw client on (2.3), for `McpClient.sdk()`.
  */
-export function wrapMcpClient(raw: RawMcpClient, managed?: ManagedMcp): McpClient {
+export function wrapMcpClient(
+  raw: RawMcpClient,
+  managed?: ManagedMcp,
+  meta: { sdk?: McpSdkLine } = {},
+): McpClient {
   const current = (): RawMcpClient => managed?.raw() ?? raw;
   const caller: McpToolCaller = { callTool: (req) => current().callTool(req) };
 
@@ -891,7 +963,16 @@ export function wrapMcpClient(raw: RawMcpClient, managed?: ManagedMcp): McpClien
     async listTools(namespace) {
       if (!cachedTools) {
         const gen = cacheGeneration;
-        const { tools } = await current().listTools();
+        const c = current();
+        // Every page, not the first one (2.3): a paginated catalog used to lose
+        // everything past page one. Same cursor walk and cap as resources/prompts.
+        let pages = 0;
+        const tools = await paginate(async (cursor) => {
+          pages++;
+          const page = await c.listTools(cursor ? { cursor } : undefined);
+          return { items: page.tools, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
+        });
+        if (pages > 1) primeToolMetadata(c, tools);
         // Invalidated while in flight → serve this list but do not cache it.
         if (gen === cacheGeneration) cachedTools = tools;
         return mcpToolsToToolSet(caller, tools, namespace);
@@ -939,6 +1020,10 @@ export function wrapMcpClient(raw: RawMcpClient, managed?: ManagedMcp): McpClien
         ? { name: info.name, ...(info.version !== undefined ? { version: info.version } : {}) }
         : undefined;
     },
+    // Through `current()` for the same reason as `serverInfo`: the server a
+    // reconnect lands on may negotiate a different revision.
+    protocolVersion: () => current().getNegotiatedProtocolVersion?.(),
+    sdk: () => meta.sdk,
     onToolListChanged: (cb) => managed?.onToolListChanged(cb) ?? (() => {}),
     close: () => (managed ? managed.close() : raw.close()),
   };
@@ -994,6 +1079,17 @@ export interface McpSamplingOptions {
    * back to the server, so a refusal costs nothing and is visible upstream.
    */
   approve?: (req: McpSamplingRequest) => boolean | Promise<boolean>;
+  /**
+   * The execution context sampling requests run under (2.3): a request takes the
+   * dispatch contract's path like a tool call. Its policy is checked first
+   * (`allowedModels`, the deadline), before `approve` asks anyone, and the call
+   * is reserved on its ledger like any model call of the run, so the server
+   * cannot spend past the run's budget. Pass a child of the run's context to
+   * account for sampling separately. Omitted: no policy and no budget, as before.
+   */
+  execution?: NativeExecutionContext;
+  /** Dependencies of the sampling call (2.3): its clock, `priceProvider` and transport. */
+  deps?: Dependencies;
 }
 
 /** The `sampling/createMessage` result, in MCP's shape (always one text block). */
@@ -1081,9 +1177,19 @@ export function buildSamplingHandler(
         ? { modelPreferences: p.modelPreferences as Record<string, unknown> }
         : {}),
     };
-    // The gate runs FIRST, so a refused request never reaches the provider. A
-    // throwing `approve` propagates verbatim — its message is more useful to the
-    // server than one we would invent for it.
+    // The run's policy comes first (2.3, the dispatch contract's order): a
+    // request it forbids is refused before `approve` asks anyone.
+    if (opts.execution) {
+      // The chunk the loops already load for native policy checks (no new split point).
+      const { assertExecutionPolicy } = await import('../internal/native-request');
+      assertExecutionPolicy(opts.execution, {
+        modelId: opts.model.modelId,
+        now: resolveDependencies(opts.deps).clock.now(),
+      });
+    }
+    // The gate runs before the model, so a refused request never reaches the
+    // provider. A throwing `approve` propagates verbatim — its message is more
+    // useful to the server than one we would invent for it.
     if (opts.approve && !(await opts.approve(request))) {
       throw new InvalidRequestError({
         message: 'The MCP sampling request was declined by the client.',
@@ -1096,6 +1202,9 @@ export function buildSamplingHandler(
       maxOutputTokens: request.maxTokens,
       ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
       ...(request.stopSequences ? { stopSequences: request.stopSequences } : {}),
+      // Reserved on the run's ledger like its own model calls (2.3).
+      ...(opts.execution ? { execution: opts.execution } : {}),
+      ...(opts.deps ? { deps: opts.deps } : {}),
     });
     return {
       role: 'assistant',

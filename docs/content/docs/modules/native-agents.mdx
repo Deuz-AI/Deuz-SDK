@@ -63,7 +63,8 @@ failure; it never reports completion before the terminal write succeeds. That
 failure result may itself be unpersisted, so recover from the last committed envelope.
 
 With tools, native execution uses the existing tool loop and then a separate
-finalization request with application tools disabled. Without tools, structured
+finalization request that offers the loop's tools with `tool_choice: 'none'`, so the
+model cannot call them (details below). Without tools, structured
 output can begin directly in finalization. `maxSteps` covers the root tool-loop
 turns and finalization/repair turns; the execution ledger also accounts for
 auxiliary and descendant model requests. `maxOutputAttempts` bounds schema repair
@@ -71,8 +72,19 @@ for each verifier candidate, and `maxVerifyAttempts` bounds verifier invocations
 
 Verification has three outcomes: `verified` accepts, `rejected` requests another
 candidate within the attempt limit, and `inconclusive` stops without certifying
-the answer. Exceptions from the verifier are inconclusive. Schema validation and
+the answer. Exceptions from the verifier are inconclusive, unless the run was
+cancelled (it stops with reason `aborted`) or the execution deadline elapsed (it
+fails with `ExecutionPolicyError`). Cancellation and the deadline are checked again
+after the verifier returns, and they outrank its verdict. Schema validation and
 verification are distinct checks; a valid JSON shape does not prove the answer.
+
+If the write that follows a verdict fails, the run stays in `finalizing`. Resuming
+it runs the verifier again on the same candidate, without a model call. The repeat
+counts as a new attempt toward `maxVerifyAttempts`; when none is left, the resume
+stops with `verification-attempts-exhausted` instead. Verifiers must therefore be
+idempotent: a repeated verdict on the same candidate must have no further effect.
+Key any side effect on the run and the candidate's `text`, not on `attempt`, which
+differs on the repeat.
 
 ## Streaming
 
@@ -98,15 +110,110 @@ console.log((await stream.result).text);
 `textStream`, `partialOutputStream` and `elementStream` are additional views.
 Partial output is an `unknown` draft, and array elements belong to an attempt;
 only a completed result validates the entire final value. Native agent streams
-are live streams. Use the [swarm journal](/docs/modules/swarm) for durable control
-events with sequence cursors.
+are live streams. To put a run on the UI wire with a replayable journal, see
+[Native agents in a UI](#native-agents-in-a-ui); for durable control events across a
+DAG, use the [swarm journal](/docs/modules/swarm).
+
+## Native agents in a UI
+
+Since 2.3, `toDeuzAgentStreamResponse` (`@deuz-sdk/core/ui`) serializes a
+`streamAgent` or `resumeStreamAgent` stream to the [Deuz UI wire](/docs/modules/ui-streaming#native-agent-runs-todeuzagentstreamresponse-23).
+The run's parts go out as a chat stream's do, and `data-agent` frames add the run
+id, a sequence, the phases, drafts of the output, and the terminal state: the
+validated output, the pending approvals and client calls, the stop reason with its
+`stopDetails`, or the failure. On the client, `agentStateFromParts` folds the
+frames, and `useChat` from `@deuz-sdk/react` drives the whole loop:
+
+```ts
+import { streamAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { toDeuzAgentStreamResponse } from '@deuz-sdk/core/ui';
+
+export function POST(): Response {
+  const stream = streamAgent({
+    model: createMockModel({ responses: [{ text: 'Hello' }] }),
+    prompt: 'Say hello.',
+  });
+  // Subscribes before it returns: no event is lost, whatever the route does next.
+  return toDeuzAgentStreamResponse(stream, { runId: 'demo' });
+}
+```
+
+What the bridge guarantees:
+
+- **Typed output only from the terminal state.** A draft (`partial`) is never
+  `T`. Only a `completed` state carries `output`, the one the run validated.
+- **Every frame applies once.** Each frame's `seq` is its SSE event id. A reducer
+  applies a frame only when its `seq` is above the state's, so a replay that
+  overlaps the live stream, a duplicate, or a stale frame never applies twice.
+- **Replay needs a journal.** Pass `store` and `streamId` (one per run, such as
+  the run id) and every leg numbers on from the last one, so a client resumes from
+  its cursor through `resumeDeuzStreamResponse`. Without a store, a response
+  cannot be replayed.
+- **One writer per stream.** A run has one executor at a time. A leg the run
+  refuses before it begins (a second resume while it executes, a run id stored
+  under another scope, an unknown run) goes out on its own response only, without
+  event ids: its client sees the failure, and the run's journal stays as it was.
+- **Resume in one request.** `resumeStreamAgent` proceeds only with a verdict for
+  every pending approval and a result for every pending client call, so a client
+  sends `runId` with both together. `useChat` does this for you.
+- **Nothing private leaves the server**: no transcript, no raw tool results (the
+  `tool-output` event's `rawResult`), no receipts, no ledger. Failure messages
+  are secret-redacted.
+
+The [`useChat` native route example](/docs/modules/react-hooks#native-agent-routes)
+shows a complete route and component: an approval and a client tool in one
+suspension, resumed with the run id.
 
 ## Strict checkpoints and approval resume
 
-Native sessions use `AgentRunEnvelope` with `kind: 'deuz-agent-run'` and `version: 1`.
-They do not reuse a legacy `AgentCheckpoint` as the top-level envelope. An
-`AgentRunStore` implements `load(runId)` and `save(envelope)`. `save` must finish
-its durable write before resolving; a rejected write stops further execution.
+Native sessions use `AgentRunEnvelope` with `kind: 'deuz-agent-run'`. They do not
+reuse a legacy `AgentCheckpoint` as the top-level envelope; the loop and sub-agent
+checkpoints inside it are `AgentCheckpoint` records. Since 2.3 `version` is `1 | 2`.
+A save writes `2` when the envelope records `memory`, `transcript`, `chat` or
+`models`, state a 2.2 reader would silently ignore, and while the stored turn has an
+open call that a 2.2 resume would answer wrongly (see below), so a 2.2 process
+refuses that envelope instead of resuming the run without that state. Every other
+envelope stays `1`, and a 2.3 resume reads both. The fields 2.3 adds are optional,
+and absent from a run that does not use the feature:
+
+| Field | What it records |
+| --- | --- |
+| `memory` (`AgentRunMemoryState`) | The run's memory scope, the one recall it was given (`recall.status`, with the message's `index` and `count`), and, once the run completed, its extraction: an `operationId` recorded `pending` with the terminal commit, then `completed` or `failed`. See [Memory](#memory). |
+| `transcript` (`AgentRunTranscript`) | The run's user-facing transcript, kept for `chat` and `memory`: the caller's input, then the run's turns as they happened. Append-only, so compaction or a `prepareStep` history never rewrites it. See [Chat projection](#chat-projection). |
+| `chat` (`AgentRunChatState`) | Where the chat projection stands: the `cursor` of acknowledged messages, the projected `messageIds`, which assistant turn and tool invocation is which message, and the last attempt's `status` (`'saved'`, `'failed'`, `'scope-mismatch'` or `'superseded'`). See [Chat projection](#chat-projection). |
+| `models` (`AgentRunModelState`) | Written at the first fail-over: the model the run's calls go to now, each fail-over so far (the failed model, the next one, the model step, the phase and the error) and the rules' version. See [Model fail-over](#model-fail-over). |
+| `retry` (`AgentRunRetry`) | Written with a `failed` result whose cause was transient: `{ cause: 'model-call' \| 'admission', phase }`, which `retryFailed: true` resumes from. See [When a model call fails](#when-a-model-call-fails). |
+| `binding.memory`, `binding.chat`, `binding.fallback` | The resume binding of the memory scope, of the `chatId` with its scope, and of the `fallbackModels` (each candidate's provider, protocol and model id, in order), as JSON. A resume that changes, adds or removes one fails before anything is written. `binding.mcp` and `binding.handoffs`, also new in 2.3, pin the MCP tool catalog and the handoff targets (see the paragraphs below the example). |
+| `reconciled` on a receipt (`AgentToolReceipt`) | `true` when the receipt's outcome came from `reconciledToolResults` rather than from the tool. See [When the store fails](#when-the-store-fails). |
+
+Of these fields only the first four make an envelope version 2. A 2.2 reader
+ignores `retry` (it returns a failed run's stored result, as before) and
+`reconciled`. It refuses an envelope of either version whose `binding` records any
+of the 2.3 keys (`mcp`, `handoffs`, `memory`, `chat`, `fallback`) with `Native agent
+binding changed across resume.`, because its binding check compares the whole
+binding. Once 2.3 saved a run that uses `mcp`, handoffs, `memory`, `chat` or
+`fallbackModels`, only 2.3 resumes it.
+
+A run whose stored turn leaves calls unanswered (the run waits on them, or its
+process stopped while they ran) is also saved as version 2 while an open call's
+receipt records `failed`, a stage 2.2 does not know and would answer with no result,
+or `suspended`, a sub-agent 2.2 would start over, and while a resume that took the
+turn up still waits on a client call's result, which 2.2 would deny. A run that waits
+on an approval is version 2 too, and so is a run stopped while a call is open whose
+ID the run's approval gate issued a request under, such as a resume that took
+approved calls up and stopped before it saved their answers: 2.3 issues `approvalId`
+as the tool call ID, `@` and a digest, and 2.2 looks a verdict up by the bare tool
+call ID, so it would deny the call. The envelope is version 1 again once a
+checkpoint answers the calls: 2.2 never reads their receipts after that.
+
+A resume refuses an envelope of a version it does not read (2.3 reads 1 and 2).
+Since 2.3 it also refuses one holding a checkpoint whose version is not 1, with
+`CheckpointVersionError` (code `checkpoint_version_unsupported`). Both refusals
+happen before anything is written, so the stored run stays resumable by the SDK
+that wrote it. An `AgentRunStore` implements `load(runId)` and `save(envelope)`.
+`save` must finish its durable write before resolving; a rejected write stops
+further execution.
 
 The following complete approval example uses a volatile store for demonstration.
 The tool returns a string and has no external effect. In an application, obtain
@@ -159,43 +266,105 @@ authentication mechanism. Native store run IDs must be unique within that store.
 
 Resume requires the original run ID and scope. Keep `bindingId` stable for the
 same implementation and bump it when tool or verifier semantics change. Stored
-model/tool/output schemas and persisted limits are checked on resume. Function
+model/tool/output schemas and persisted limits are checked on resume, and since 2.3
+so is each handoff target's model, instructions and tool schemas, and the MCP
+servers' tool catalog (a resume with `onCatalogChange: 'accept'` records a catalog
+that changed instead of failing: see
+[MCP in native runs](/docs/modules/native-mcp#a-change-the-run-missed)). Function
 bodies cannot be fingerprinted reliably: changing a validator, approval predicate,
 tool implementation or verifier requires a new `bindingId`. A
-completed native envelope returns its stored result without another model call.
+completed native envelope returns its stored result without another model call; a
+failed one does too, unless a resume asks for a retry of a transient failure
+([When a model call fails](#when-a-model-call-fails)).
 
 Resuming without all pending approval verdicts keeps the run suspended. An absent
-verdict is not a denial. Client-side tools likewise remain suspended until
+verdict is not a denial. Since 2.3 a pending approval's `approvalId` is bound to the
+call it was issued for: the run, the step it suspended at, the tool call ID, the tool
+name and a digest of the arguments. Answer with the `approvalId` you were given. A
+verdict kept from an earlier gate then never approves a later call, even when a
+provider that sends no call IDs reuses `tool_0` for it. A verdict that names only the
+tool call ID (the 2.2 form) still counts when the run used that ID once: it occurs once
+in the history, and the run issued one approval request under it. The checkpoint keeps
+that count (`approvalRequestCounts`), so a history that compaction or `prepareStep` has
+shortened cannot make a reused ID look unique.
+Client-side tools likewise remain suspended until
 `clientToolResults` supplies every pending call ID; each entry has `toolCallId`,
 `output`, and an optional `isError`. Supplied results pass through the same approval,
-validation and model-projection path as server tools.
+validation and model-projection path as server tools. Since 2.3 a supplied result is
+never lost to an interrupted resume. The run keeps listing the calls as pending
+until the resume has saved its answers, so a resume that dies before it recorded a
+result accepts that result again, and a resume without it stays suspended on the
+call. A result the resume did record (in the call's receipt) answers the call on
+the next resume, which needs no result for it; one passed for it anyway is ignored
+with a `warning` part (`setting: 'clientToolResults'`).
 
 Use one executor for a given native run. Concurrent starts or resumes through the
-same `AgentRunStore` object are rejected within one JavaScript process. The native
-store interface has no compare-and-swap or distributed lease: an application must
-serialize ownership across processes and across different wrappers for the same
-database. The in-process guard does not make a custom store transactional.
+same `AgentRunStore` object are rejected within one JavaScript process. Across
+processes, the shipped durable stores reject a save whose `revision` is not the
+stored one plus one, so an executor that lost the run cannot overwrite a newer save;
+that fence does not stop two executors from running the same step. Pass `lease`
+(2.3) to hold the run across processes, see
+[Leasing a native run](/docs/modules/operations#leasing-a-native-run); without it an
+application must serialize ownership itself. The in-process guard does not make a
+custom store transactional.
 
 Tool receipts distinguish `executing`, a known child-agent `suspended` state,
-`executed`, validation/projection failures, and completed projection. They are
+`executed`, `failed` (execute threw; the model got the error, and a resume replays
+it without running the tool again), validation/projection failures, and completed
+projection. They are
 scoped to a root model turn plus the provider call ID, so an ID reused in a later
 turn does not retrieve an unrelated result. Raw results are committed before
 validation/projection; a projection can be retried without repeating the effect.
 An interrupted `executing` receipt cannot establish whether an external system
 accepted the effect. Resume returns `tool-reconciliation-required` until the
-application reconciles that effect and explicitly authorizes the relevant
-`retryToolCallIds`. Completed receipts can reuse their result. These receipts do
+application reconciles that effect: it explicitly authorizes the relevant
+`retryToolCallIds`, or since 2.3 records the outcome it found with
+`reconciledToolResults`. Since 2.3 the stopped result lists those receipts in
+`unknownEffects` (see [When the store fails](#when-the-store-fails)). Completed
+receipts can reuse their result. These receipts do
 not provide exactly-once execution across an external service and the local
 checkpoint transaction.
+
+A receipt is saved before the checkpoint that answers its call, so a run can stop
+in between: the process dies while other calls of the step still run, the store
+fails the write that records the step, or a sub-agent called in the same step
+suspends on its own approval. The next resume then finds the call unanswered.
+Since 2.3 a call whose receipt records an outcome
+(`executed`, `completed`, `failed`, or a validation or projection failure, an
+outcome recorded with `reconciledToolResults` included) is answered from that
+receipt, exactly like a call that needs no approval. The tool does not run again,
+and the approval gate does not hold the call again, whether `needsApproval` or the
+execution policy's `requireApproval` gated it, so the resume needs no verdict for
+it. A verdict you pass for it anyway decides nothing: the resume ignores it and
+streams a `warning` part (`setting: 'approvalResponses'`) that names the call.
+Before 2.3 such a call was answered `Tool call denied. Reason: No approval
+response.` unless the resume passed its verdict again, although its effect had
+landed. A call without a recorded outcome is gated as before: one that never
+started, one in `executing` that `retryToolCallIds` runs again, and a sub-agent call
+in `suspended`. Without its verdict the resume answers such a call as denied. A
+client tool's call is answered from the result a resume supplied: from the receipt
+that recorded it, or, when none did, from `clientToolResults`, which the run then
+still waits for (see above).
+
+A resume saves what its settle answered (each call's result, error, denial or
+client result) as the run's checkpoint before its first model call (2.3). A
+failure of that model call, or of any later write, then never leaves the same
+calls to settle again: the next resume, a `retryFailed` one included, goes on
+from those answers and needs no verdict or client result again. Before 2.3 a
+process that died during that model call left the calls unanswered: the next
+resume denied an approved call that had run, or ran it again, and ran a call
+that needs no approval again.
 
 ### Idempotent tools
 
 Some effects are safe to repeat because the tool writes under a key it derives
 from the call itself. Mark such a tool `replay: 'idempotent'` (2.2). An interrupted
 call of that tool runs again on resume without `retryToolCallIds`; plain tools
-still stop for reconciliation. Every native tool also receives `ctx.modelStep`,
-the root model turn that issued the call. Together with `ctx.toolCallId` it is
-stable across resume, so it can key the write:
+still stop for reconciliation. Since 2.3 each receipt records the flag of the tool
+that ran the call (`AgentToolReceipt.idempotent`), so a handoff target's own tool is
+judged by its own flag, never by a root tool of the same name. Every native tool
+also receives `ctx.modelStep`, the root model turn that issued the call. Together
+with `ctx.toolCallId` it is stable across resume, so it can key the write:
 
 ```ts
 import { runAgent } from '@deuz-sdk/core/agent';
@@ -232,6 +401,188 @@ console.log(result.status, board.size);
 Only mark a tool idempotent when repeating it truly has no further effect, and
 bump `bindingId` when you change the flag on a durable run.
 
+### When the store fails
+
+What a resume does depends on where the store failed:
+
+- **Before the effect.** The `executing` receipt could not be written, so the tool
+  never ran. The run fails; a resume replays the step from its last checkpoint.
+- **Between the effect and its completed receipt.** The outcome is unknown. The
+  resume stops with `tool-reconciliation-required`, writes nothing, and lists the
+  receipts in `unknownEffects`. Check each effect in the system it touched, then
+  resume with `retryToolCallIds` for the calls to run again and, since 2.3,
+  `reconciledToolResults` for the calls that landed. A `replay: 'idempotent'`
+  tool runs again by itself, under the same `[modelStep, toolCallId]` identity.
+- **After the completed receipt** (the step checkpoint). A resume replays the
+  recorded result; the tool does not run again. Since 2.3 this holds for a call
+  that waited for an approval too: the recorded result answers it without its
+  verdict.
+- **After a resume settled the calls** (the next model call or a later save).
+  Since 2.3 the settle's answers are saved before that model call, so the next
+  resume goes on from them: nothing is settled, run or denied again.
+
+```ts
+import { createInMemoryAgentRunStore, resumeAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const options = {
+  model: createMockModel({ responses: [{ text: 'Charged.' }] }),
+  prompt: 'Charge the order.',
+  tools: {
+    charge: {
+      description: 'Charge the order once.',
+      parameters: { type: 'object' as const, properties: {} },
+      execute: () => 'charged',
+    },
+  },
+  session: { store: createInMemoryAgentRunStore(), runId: 'order-7', scope: 'tenant-a' },
+};
+
+// The payment system keeps its own record of each charge.
+declare const payments: { charged(orderId: string): Promise<boolean> };
+
+// A run interrupted between the effect and its receipt (not shown) resumes here.
+const resumed = await resumeAgent(options);
+if (resumed.status === 'stopped' && resumed.reason === 'tool-reconciliation-required') {
+  // Decide per call, from the system the effect touched.
+  const calls = (resumed.unknownEffects ?? []).map((receipt) => receipt.toolCallId);
+  if (await payments.charged('order-7')) {
+    // It landed: record what the tool would have returned. Nothing runs again.
+    const reconciledToolResults = calls.map((toolCallId) => ({ toolCallId, output: 'charged' }));
+    await resumeAgent({ ...options, reconciledToolResults });
+  } else {
+    // It never arrived: run the call once more.
+    await resumeAgent({ ...options, retryToolCallIds: calls });
+  }
+}
+```
+
+A call that is listed in `retryToolCallIds` runs once more; a completed run never
+runs it again.
+
+A call listed in `reconciledToolResults` (2.3) never runs again. Its receipt takes
+`output` as the call's raw result, marked `reconciled: true`, and the step goes on
+from it exactly as from a result the tool recorded: through the tool's
+`outputSchema`, `validateResult` and `toModelOutput`, to the model. With
+`isError: true` the call is answered with `output` as its error (a string, or JSON
+for any other value). Only the run's interrupted calls are accepted: the calls in
+`unknownEffects`, and a call of a `replay: 'idempotent'` tool whose receipt was
+written before 2.3. Such a receipt records no replay policy, so a report on the
+stored run (`inspectRun`) lists it too; the call would run again by itself, and an
+outcome you record answers it instead. Each call is accepted once and never also in
+`retryToolCallIds`; anything else fails the resume with a `TypeError` before
+anything is written. Settle every listed call in the same
+resume: a call left unsettled stops the resume again, that stop records nothing,
+and it lists every call the store still holds as unknown. A reconciled call that
+waited for an approval needs no verdict: the outcome you record answers it.
+A call in `retryToolCallIds` that waited for an approval runs again only with its
+verdict: pass the verdict you stored with it, or the call is answered as denied.
+
+### When a model call fails
+
+A run that fails stays failed: a resume returns its stored result without a
+model call. Since 2.3 the failed envelope also records, additively, whether the
+cause was transient (`AgentRunEnvelope.retry`, which a 2.2 reader ignores):
+
+- a model call that failed with a retryable transport or provider error: network,
+  transport timeout, 5xx, 429/529 after the call's own retries, an open breaker
+  (the errors [model fail-over](#model-fail-over) acts on);
+- a model call whose response stream broke off;
+- a budget admission the persistent store refused with a serialization conflict
+  (40001 or 40P01) after its own retries.
+
+A run that was cancelled, lost its lease or ran out of time records none. Resume
+a run with a transient cause with `retryFailed: true` and it goes on from its
+last checkpoint, in the phase it failed in, after every check of a resume:
+completed calls answer from their receipts and never run again, and an unknown
+effect still stops it for reconciliation. The verdicts and client results that
+the failed leg applied before the call are part of that checkpoint, so the retry
+needs none of them again. The failed call stays counted, as a
+model step (and, when it was the final answer, as one of the run's
+`maxOutputAttempts`, as after a crash) and, while its outcome is unknown, in the
+accounting at its estimate. The retried call is reserved on its own, so nothing
+is counted twice. For any other failure a resume with `retryFailed` fails with a
+`TypeError` and writes nothing; for a run that did not fail the option is
+ignored.
+
+```ts
+import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const options = {
+  model: createMockModel({ responses: [{ text: 'Summary ready.' }] }),
+  prompt: 'Summarize ticket 9.',
+  session: { store: createInMemoryAgentRunStore(), runId: 'ticket-9', scope: 'tenant-a' },
+};
+
+const first = await runAgent(options);
+if (first.status === 'failed') {
+  // Once the provider answers again. A failure that was not transient is
+  // refused, and the stored run stays as it was.
+  const retried = await resumeAgent({ ...options, retryFailed: true });
+  console.log(retried.status);
+}
+```
+
+## One path for every tool call
+
+Since 2.3 every tool call of a run takes one path, in this order (roadmap 23.2):
+
+1. **Finish-reason gate.** A refused or cut-off turn (`content_filter`, `length`)
+   dispatches none of its calls.
+2. **Policy.** The execution policy decides first, for the whole batch: a call it
+   forbids fails the run with `ExecutionPolicyError` (`code: 'tool_not_allowed'`,
+   `toolCallId` names the call) before any guardrail runs on the batch, any human is
+   asked to approve it, or any sibling starts. Then the `onToolCall` guardrails block
+   or rewrite.
+3. **Approval.** `needsApproval`, `requireApproval`, and `approveToolCall` or a
+   client-mode suspension.
+4. **Admission.** The deadline and cancellation are checked again right before the
+   effect. A model call reserves its budget here.
+5. **Effect identity.** `[modelStep, toolCallId]`, and the receipt `executing`.
+6. **Execution.**
+7. **Receipt `completed`, and `onToolResult`.** The receipt keeps the raw result and
+   the tool's own projection. `onToolResult` changes only the copy the model sees,
+   and runs again on a replayed receipt.
+8. **Checkpoint.**
+
+The same path serves local tools, MCP tools (at connect, after a hot refresh, with
+an `outputSchema`), [handoff](/docs/agents/handoffs) transfers, swarm blackboard
+tools, the calls of spawned swarm tasks and of sub-agents, and, for the model calls
+they make, evolve mutations and MCP sampling requests. A tool that `prepareStep`
+puts on the wire, or that an MCP refresh brings in, is gated like any other. The
+resume settle takes the same path as a live step: it re-runs the policy before it
+executes an approved call. A call whose receipt already records its outcome skips
+the approval step, because it ran; its receipt answers it (see
+[Strict checkpoints and approval resume](#strict-checkpoints-and-approval-resume)).
+
+A transfer is gated like any call. A guardrail, `requireApproval`, or a
+`needsApproval` on the transfer tool can refuse it; the refused transfer is answered
+with its denial, and the run stays with the current agent. A transfer waiting for a
+verdict suspends the run like any gated call.
+
+A child only narrows the run. A sub-agent (`agentTool`) runs under a child of the
+run's execution context (allowlists, deadline, budget, cancellation) and inherits
+its approver and its `onToolCall` / `onToolResult` guardrails. A handoff target's
+model and tools are held to the run's allowlists and spend from its ledger. A
+spawned swarm task runs under the swarm's policy and budget.
+
+### Outcomes
+
+Each way a call can end is distinguishable, on results and on stream parts:
+
+| Outcome | Where it shows |
+| --- | --- |
+| `'tool-error'` | `ToolResult.outcome`, the `tool-result` part and the terminal `tool-state` part: the tool threw, timed out, got invalid input, has no executor, or does not exist |
+| `'permission-denied'` | the same places: an `onToolCall` guardrail or the handoff budget refused the call, or `onToolResult` withheld its output. A call the execution policy forbids fails the run; a `tool-state` part names it first |
+| `'approval-denied'` | the same places: the approver said no, or the resume had no valid verdict for the call |
+| `'approval-pending'` | the `awaiting-approval` `tool-state` part; the run suspends with `pendingApprovals` |
+| `'unknown-effect'` | a resume that stops with `tool-reconciliation-required` lists the receipts in `unknownEffects` and streams a `tool-state` part for each; `retryToolCallIds` or `reconciledToolResults` settles them |
+| model error | the run fails (`status: 'failed'`, the provider error's `name` and `code`); the stream ends with an `error` part. A transient one can be retried with `retryFailed` ([When a model call fails](#when-a-model-call-fails)) |
+| refusal | the run stops with reason `'refusal'`; `stopDetails` carries the provider's explanation |
+
+A successful result carries no `outcome`, as before 2.3.
+
 ## Tool context and supported options
 
 `toolsContext` supplies data by tool name. A tool can declare `contextSchema` and
@@ -249,12 +600,259 @@ while receipts and `tool-output` events retain the raw result. Application code
 must decide which raw result fields belong in a user interface.
 
 Native options support the canonical tool-loop controls, including preparation,
-compaction, approval gates and guardrails. Loop hooks apply to the tool-loop phase;
-the finalization phase disables application tools and validates its own output.
-The native engine currently rejects `chat`, `memory`, `fallbackModels`, and the
-legacy completion hooks `verifyStep`, `doneWhen`, and `falseFinishGuard`. Use the
-existing generation/agent APIs when those options are needed. Legacy
+compaction, approval gates and guardrails. Loop hooks apply to the tool-loop phase.
+Finalization is one more turn of the same conversation: it ends with a user turn,
+offers the loop's tools with `tool_choice: 'none'`, and validates its own output.
+With `output` in the json strategy, the Anthropic, OpenAI Chat Completions and
+OpenAI Responses wires (2.3) send those tools unchanged beside the output format
+(`output_config.format`, `response_format`, `text.format`), so the request prefix
+stays the loop's for the prompt cache and preserved thinking. Gemini's native wire
+sends the JSON schema alone: `@google/genai` documents no request that combines
+function declarations with a response schema, and with `'none'` the model could not
+call them anyway. The tool strategy sends only its own forced output tool
+(`json_output` unless `output.name` is set). None of this is live-verified.
+After a [handoff](/docs/agents/handoffs), the target agent's model and tools drive
+every later step, finalization and verifier re-drives included, and its tools pass
+through the same receipts as the root agent's.
+MCP servers in `mcp` cross the same receipt boundary as local tools; see
+[MCP in native runs](/docs/modules/native-mcp).
+The native engine rejects the legacy completion hooks `verifyStep`, `doneWhen`, and
+`falseFinishGuard`; use `verify` instead. `chat`, `memory` and `fallbackModels`
+work in native runs since 2.3, bound to the checkpoint as described below. Legacy
 `generateObject`, `streamChat`, and `createAgent` behavior is unchanged.
+
+## Memory, chat and model fail-over (2.3)
+
+The legacy loops treat these three as best-effort side effects of a call. A
+native run is checkpointed, so each is bound to the run's record instead, and
+each is part of the resume binding: a resume with another memory scope, another
+chat or other `fallbackModels` fails with `Native agent binding changed across
+resume.` before anything is written. A run without a `session` has no record:
+it still recalls once, extracts after completing and writes its chat projection,
+but nothing it does can be resumed or reconciled.
+
+[`examples/14-native-memory-chat`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/14-native-memory-chat)
+runs all three without a key: a native run with `memory`, a `chat` projection
+and `fallbackModels`, then `reconcileAgentRun` repairing a chat write that
+failed.
+
+### Memory
+
+The run recalls **once**, before its first model call, with the last user
+message as the query. The memories enter the run's history as one appended
+`role: 'system'` message marked `providerMetadata.deuz.memoryRecall`, the shape
+the legacy loops use for preserved thinking: every step and every resume sends
+the same prefix, and a resume never recalls again. A history that already
+carries a recall after its last user message is not recalled again.
+`AgentRunEnvelope.memory.recall` records what happened; a failing store or
+embedder is logged and the run goes on without memories, as in the legacy loops.
+
+Extraction runs only for a run that **completed**. A stopped, failed, cancelled
+or suspended run never turns its output into memory. The terminal commit
+records the extraction as `pending` under an operation id, nothing is written
+to memory before that commit, and the extraction's outcome (`completed` with its
+mutation count, or `failed`) follows in a later save. The run's result does not
+depend on it. Every record the extraction writes carries
+`metadata.deuz = { runId, operationId }`. The extraction reads the input's last
+user turn and the run's own turns; the recall message, the finalization prompt
+and repair or verifier feedback are left out. `extract: false`, `recall: false`,
+`writePolicy: 'manual' | 'session-end'` and `sweep: 'on-extract'` behave as in
+the legacy loops. The run waits for the extraction before it resolves.
+
+A resume of a run that already ended (a terminal resume) never extracts again
+and never calls a model. When an interruption or a failed save leaves an
+extraction `pending` (or `failed`), `reconcileAgentRun` settles it. When the
+memory store already holds records of that operation, it records the extraction
+as completed without another memory LLM call; otherwise it runs the extraction
+now. Extraction is therefore at least once and never silent; dedup by content
+hash keeps a repeat from writing the same fact twice.
+
+Call `reconcileAgentRun` only when no executor drives the run. An extraction
+stays `pending` from the terminal commit until its outcome is saved, also while
+the executor that completed the run is still extracting, and a second pass
+would extract again (dedup catches only a fact worded the same way). With a
+`LeaseProvider`, pass `lease` (`{ provider, owner?, ttlMs? }`, as for
+[`runAgent`](/docs/modules/operations#leasing-a-native-run)) with the provider
+the executors use. The call claims `agentRunLeaseKey(session)` before it reads
+the run and, while an executor holds it, rejects with an error named
+`AgentRunLeaseError`, code `'lease_held'`; an executor keeps its lease until its
+extraction is saved. The call renews the lease while it settles the run, saves
+nothing more to the run once it has lost it (`'lease_lost'`), and gives it back
+at the end. A cancel queued for the run is handled as by a resume that does not
+take the run up: a run that ended drops it, and a suspended run keeps it for its
+next executor.
+
+```ts
+import { createInMemoryAgentRunStore, reconcileAgentRun, runAgent } from '@deuz-sdk/core/agent';
+import { createInMemoryMemoryStore } from '@deuz-sdk/core/memory';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+let id = 0;
+const memory = {
+  seams: {
+    store: createInMemoryMemoryStore(),
+    // A real application wraps a model call here.
+    llm: async ({ system }: { system: string; user: string }) =>
+      system.includes('extract')
+        ? '{"facts":["prefers tea"]}'
+        : '{"memory":[{"event":"ADD","text":"prefers tea"}]}',
+    clock: {
+      now: () => Date.now(),
+      setTimeout: (fn: () => void, ms: number) => {
+        const timer = setTimeout(fn, ms);
+        return () => clearTimeout(timer);
+      },
+    },
+    generateId: () => `memory-${id++}`,
+  },
+  scope: { userId: 'ada' },
+};
+const session = { store: createInMemoryAgentRunStore(), runId: 'tea-1', scope: 'tenant-a' };
+
+const result = await runAgent({
+  model: createMockModel({ responses: [{ text: 'Noted: tea.' }] }),
+  prompt: 'I prefer tea.',
+  memory,
+  session,
+});
+const envelope = await session.store.load('tea-1');
+console.log(result.status, envelope?.memory?.extraction?.status); // completed completed
+
+// For a run an interruption left pending; a settled run reports its state.
+console.log(await reconcileAgentRun({ session, memory })); // { runId: 'tea-1', memory: 'completed' }
+```
+
+A run under another native run's execution (a run a tool starts with
+`execution: ctx.execution.child(...)`) may only **narrow** that run's memory
+scope: it may pin more fields, never drop one or change a user, agent or chat.
+A wider scope fails the child run before any call. A sub-agent from `agentTool`
+gets no memory at all. Runs that share one execution context instead of each
+taking a `.child()` (a tool that hands its own `ctx.execution` to a nested run,
+or concurrent runs given the same context) count as nested too: each may only
+narrow the scope of the latest run still running on that context. Give a run
+with another user's or agent's memory its own child context; a child still
+shares the parent's budget.
+
+### Chat projection
+
+With `chat`, the run's checkpoint stays the canonical record and the chat store
+receives a projection of it. The run keeps a transcript: the input, then every
+turn the run appended, raw (before compaction or a `prepareStep` history, with
+reasoning blocks byte for byte). The recall message and the finalization and
+feedback turns are part of it, because the next run replays exactly the prefix
+the model's thinking is bound to. The transcript is saved to the chat store
+**after** the checkpoint at every suspension and at the end of the run, each
+time as a whole record with `ChatRecord.messageIds`. An input message keeps the
+id the stored chat gave it, and a turn of the run gets `<runId>:<n>`.
+`AgentRunEnvelope.chat` records which assistant turn and which tool invocation
+(by `toolCallId` and model step) is which message, and how far the chat store
+has acknowledged the transcript (`cursor`).
+
+The two stores are written one after the other, never as one transaction:
+
+- A chat store that throws never fails the run. The run reports a `warning` part
+  (`setting: 'chat'`), records `status: 'failed'` with the cursor left behind,
+  and keeps its checkpoint intact.
+- The next projection save repairs it: the next suspension, the end of the run,
+  a terminal `resumeAgent`, or `reconcileAgentRun({ session, chat })`. Every save
+  replaces the whole record, so a repeat never appends a message twice.
+- A stored chat of another scope is never overwritten (`status:
+  'scope-mismatch'`). A stored chat that already holds the projection and more,
+  because a later run continued it, is left as it is.
+- A late repair never overwrites a chat that moved on **without** the run. A
+  resume of a run that ended or is still waiting, and `reconcileAgentRun`, only
+  finish the write the run's last attempt meant: over the record that failed
+  write found (or where none is stored, if it found none), or over one the
+  run's transcript continues (its input, or an earlier projection of it). Any
+  other record was saved or deleted since, for example by another run that went
+  on from what the chat store held, and stays as it is: the run records
+  `status: 'superseded'`, a resume reports a `warning` part, and
+  `reconcileAgentRun` returns `chat: 'superseded'`. The run's turns stay in its
+  checkpoint (`AgentRunEnvelope.transcript`), and no later repair tries again.
+  The check reads the record right before the write, and `ChatStore` has no
+  conditional write, so a save that lands in between is still overwritten. A
+  leg that runs (a resume that continues the run) writes its whole projection,
+  and the last writer wins, as in the legacy loops.
+- A failed checkpoint publishes nothing to the chat.
+
+```ts
+import { createInMemoryAgentRunStore, runAgent } from '@deuz-sdk/core/agent';
+import { createInMemoryChatStore } from '@deuz-sdk/core/chat';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const chats = createInMemoryChatStore();
+await runAgent({
+  model: createMockModel({ responses: [{ text: 'Hello, Ada.' }] }),
+  prompt: 'Hi!',
+  chat: { store: chats, chatId: 'chat-1', scope: { userId: 'ada' } },
+  session: { store: createInMemoryAgentRunStore(), runId: 'hello-1', scope: 'tenant-a' },
+});
+const record = await chats.loadChat('chat-1');
+console.log(record?.messageIds); // ['hello-1:0', 'hello-1:1']
+```
+
+### Model fail-over
+
+`fallbackModels` fails a single model call over, inside the same run. A call
+that fails with a retryable error **before its first content** is repeated on
+the next candidate of `[that model, ...fallbackModels]`: a network error, a
+transport timeout, a 5xx, a 429 or 529 after the call's own retries, or an open
+circuit breaker. A step of the tool loop runs again from the run's last
+checkpoint, so completed tool effects never run again. A failed finalization
+call does not use up a repair attempt. These never fail over:
+
+- a refusal (the run stops with reason `'refusal'`);
+- a policy, budget or validation rejection;
+- an abort, a cancel, or an elapsed deadline;
+- an error after the call produced content.
+
+The failed model is skipped for the rest of the run, also after a resume.
+Routing is by model, so a handoff target's model or a `prepareStep` model fails
+over the same way, and after the root model failed over, the loop's own
+compaction summaries go to its replacement. A compaction summary call does not
+fail over by itself: when it fails before the step's own call, the step fails as
+before. The stream carries a `warning` part (`setting:
+'fallbackModels'`) in place of the call's error. `AgentRunEnvelope.models`
+records each fail-over: the attempt number, the failed and the next model with
+their provider and protocol, the model step, the phase and the error. It also
+records the model the run calls now (`selected`) and the version of these rules
+(`policy: 1`).
+
+Every attempt is admitted against the run's execution. A failed attempt's budget
+hold stays counted when the provider may have billed it (a 5xx or 529 answer, a
+network error, a transport timeout), so a fallback never exceeds the shared
+budget; an answer the provider does not bill, such as a 429, releases the hold,
+and an open breaker reserves nothing (see
+[Open holds](/docs/modules/budgets#open-holds)). A child run's attempts count in
+its parent's ledger under its parent's model policy. Each
+candidate gets the call's `capabilities` override and is sent with its own request
+profile and object strategy (a Claude 5.x fallback, for example, drops the
+sampling parameters it rejects). Reasoning crosses models only as each wire
+allows: Claude thinking blocks reach another Claude model unchanged, and another
+provider never receives them.
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createOpenAI } from '@deuz-sdk/core/openai';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+// A primary that is down: every request answers 503.
+const primary = createOpenAI({
+  apiKey: 'demo',
+  fetch: async () => new Response('{"error":{"message":"unavailable"}}', { status: 503 }),
+})('gpt-5.2');
+
+const result = await runAgent({
+  model: primary,
+  fallbackModels: [createMockModel({ responses: [{ text: 'Answered by the fallback.' }] })],
+  maxRetries: 0,
+  prompt: 'Hello?',
+});
+console.log(result.status, result.text); // completed Answered by the fallback.
+```
+
+Provider behavior in this section is derived from the providers' documented
+wire shapes and tested offline; none of it is live-verified.
 
 ## Mandatory policy and shared budgets
 

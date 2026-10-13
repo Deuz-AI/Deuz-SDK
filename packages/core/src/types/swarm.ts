@@ -219,6 +219,25 @@ export interface SwarmStore {
   readEvents(key: SwarmKey, afterSequence: number, limit: number): Promise<SwarmEvent[]>;
   /** Run records matching a query (2.2); needs the 'list' capability. */
   listRuns?(query: SwarmRunQuery): Promise<SwarmRunRecord[]>;
+  /**
+   * Retention (2.3): delete up to `limit` runs that settled as completed,
+   * partial or cancelled with an `updatedAt` before `before`, oldest first,
+   * with their tasks, events and blackboard notes, and return how many.
+   * Running and suspended runs stay; a pruned run can no longer be resumed,
+   * read or replayed, and its key is free again. Optional: the memory, SQLite,
+   * Postgres and Redis stores have it.
+   */
+  prune?(options: SwarmPruneOptions): Promise<number>;
+}
+
+/** What `SwarmStore.prune` may delete (2.3). */
+export interface SwarmPruneOptions {
+  /** Settled runs whose `updatedAt` (epoch ms, as the run recorded it) is before this. */
+  before: number;
+  /** Only this scope's runs. */
+  scope?: string;
+  /** The most runs one call deletes: 1..1000, default 100. */
+  limit?: number;
 }
 
 export interface SwarmAgentBinding {

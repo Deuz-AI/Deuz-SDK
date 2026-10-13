@@ -4,9 +4,12 @@ import * as ops from '../src/ops';
 import { assertEnvelopeRevision, assertLeaseRequest } from '../src/internal/ops-validate';
 
 describe('the public ops surface', () => {
-  it('publishes the lease provider but not the stores’ validation helpers', () => {
+  it('publishes the lease provider and run discovery but not the stores’ validation helpers', () => {
     for (const entry of [ops, edge]) {
       expect(entry).toHaveProperty('createInMemoryLeaseProvider');
+      // Native run discovery and the run lease (2.3, F2).
+      expect(entry).toHaveProperty('findStaleAgentRuns');
+      expect(entry).toHaveProperty('agentRunLeaseKey');
       expect(entry).not.toHaveProperty('assertLeaseRequest');
       expect(entry).not.toHaveProperty('assertEnvelopeRevision');
     }

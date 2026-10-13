@@ -45,6 +45,8 @@ interface DurableSessionOptions {
 
 When present, the loop saves an `AgentCheckpoint` at every step boundary and the result carries `runId` — `GenerateTextResult.runId` on buffered calls, and synchronously on `StreamChatResult.runId` for streaming (available before the first part arrives). Only agentic calls (with `tools`) checkpoint; a single-turn call has no step boundaries and carries no `runId`.
 
+**A plain call can continue a stored run (2.3).** A call that passes the `runId` of a run already in the store, without `resumeFromCheckpoint` (a chat that continues one run turn by turn), reads that run's latest checkpoint before its first step and continues its step counter. `stepIndex` therefore stays monotonic over every leg, and an approval bound to a step is never issued again by a later leg. Before 2.3 such a call restarted at step 1. The read is best-effort like a save: a failing `load` is logged and the leg counts from 0. With `durability: 'strict'` the call fails instead (an `error` part on a stream).
+
 ## `SessionStore` — the storage seam
 
 ```ts
@@ -83,6 +85,7 @@ interface AgentCheckpoint {
   messages: Message[];                     // full immutable history at the boundary
   usage: Usage;                            // CUMULATIVE across the whole run
   pendingApprovals?: ToolApprovalRequest[]; // set on a 'suspended' approval break
+  approvalRequestCounts?: Record<string, number>; // 2.3: approval requests per tool call id, all legs
   agentPath?: string[];                    // set on sub-agent checkpoints
   createdAt: number;                       // deps.clock.now() at save time
 }
@@ -130,7 +133,7 @@ for await (const part of result.fullStream) render(part);
 
 The 1.4 limitation is gone — with a durable session, [client-mode approval](/docs/agents/client-tools) works **inside** [`agentTool`](/docs/agents/subagents):
 
-1. A gated tool call inside a sub-agent (no server-mode `approveToolCall` to inherit) suspends the **child** loop, which checkpoints itself under a per-call key (`${parentRunId}::${agentName}#${toolCallId}`).
+1. A gated tool call inside a sub-agent (no server-mode `approveToolCall` to inherit) suspends the **child** loop, which checkpoints itself under a per-call key: `${parentRunId}::${agentName}#${toolCallId}` for an id's first use in a legacy loop, with `~<n>` added for each reuse (2.3, for providers that recycle call ids); a native run keys the child by call id and root model step (`${parentRunId}::${agentName}#${toolCallId}@${modelStep}`), and a child that 2.2 left under the plain key still resumes.
 2. The parent loop suspends too: its result/stream carries the pending approvals **tagged with `agentPath`** (`ToolApprovalRequest.agentPath`, and on the `tool-approval-request` stream part), so your UI can show *which* agent is asking.
 3. You resume the **parent** run with the verdicts, keyed by the same `approvalId`s. The parent re-executes the sub-agent call; the child finds its own suspended checkpoint, settles its pending calls from the forwarded verdicts, and continues where *it* left off — at any nesting depth.
 
@@ -181,7 +184,7 @@ if (!payload || payload.runId !== 'run-42') reject();
 - `verify` returns the payload on a valid MAC, else `null` — a garbled, forged, or expired token is a verdict of `null`, never a thrown exception. A token whose age is ≥ `maxAgeMs` is expired; omit `maxAgeMs` for no expiry.
 - The clock is injectable (`clock`) for deterministic tests; the secret stays server-side.
 
-`approvalId` was kept distinct from `toolCallId` in the 1.3 type exactly so this scheme could stay additive — the id contract is unchanged.
+`approvalId` was kept distinct from `toolCallId` in the 1.3 type exactly so this scheme could stay additive. Since 2.3 `approvalId` is bound to the call it was issued for (the run, the suspended step, the call id, the tool and a digest of the arguments), and a signed token must name it.
 
 ## Cryptographic approval trail (1.7)
 

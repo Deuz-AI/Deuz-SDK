@@ -365,7 +365,7 @@ export async function POST(req: Request): Promise<Response> {
 }
 ```
 
-There is no `convertToModelMessages` step: `useChat` from `@deuz-sdk/react` already keeps the canonical `Message[]` alongside the render view and POSTs that. If your route serves client tools (a `useChat` with `onToolCall`), the browser POSTs a `role: 'tool'` message, so pass `validateChatRequest(body, { rejectToolResults: false })` — and read [what that accepts](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false).
+There is no `convertToModelMessages` step: `useChat` from `@deuz-sdk/react` already keeps the canonical `Message[]` alongside the render view and POSTs that. If your route serves client tools (a `useChat` with `onToolCall`), the browser POSTs a `role: 'tool'` message. Since 2.3 the default `validateChatRequest(body)` accepts it, because it answers a call of the assistant turn right before it; read [what that accepts](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false).
 
 ## Code: reading the stream without React
 

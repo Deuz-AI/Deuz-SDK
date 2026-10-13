@@ -226,7 +226,7 @@ describe('Deuz UI wire', () => {
     );
     expect(approval).toEqual({
       type: 'tool-approval-request',
-      approvalId: 'toolu_1',
+      approvalId: expect.stringMatching(/^toolu_1@[0-9a-f]{24}$/),
       toolCallId: 'toolu_1',
       toolName: 'getWeather',
       input: { city: 'Paris' },

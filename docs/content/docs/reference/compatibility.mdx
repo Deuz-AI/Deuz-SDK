@@ -11,8 +11,39 @@ description: Supported runtimes, package formats, browser/edge guarantees, and t
 | ESM (`import`) | Every exported JavaScript target is imported from the built package |
 | CommonJS (`require`) | Every exported CJS target is required from the built package |
 | TypeScript bundler / Node resolution | Checked by publint and Are the Types Wrong |
-| Browser / edge bundlers | Root, `/edge`, and provider consumers bundle with esbuild `platform: 'browser'` |
+| Browser / edge bundlers | Consumers of the root, `/edge`, the Anthropic and OpenAI factories, `/agent`, `/swarm`, `/ops`, `/goal`, `/evolve`, `/schedule`, `/mcp/server`, `/realtime`, `/batch`, `/a2a` and `/testing` bundle with esbuild `platform: 'browser'`; the swarm, ops and evolve store entries, `/mcp/server/stdio` and `/headless` must fail that boundary |
+| React 18 / 19 | `@deuz-sdk/react` and the frozen `@deuz-sdk/core/react` hook are typechecked and tested on React 19 in every check run, and on React 18 in a CI job of their own (2.3) |
+| Redis 7 / Postgres 16 | The Redis stores and the Postgres stores run against real servers in a CI job (2.3); without a server those tests skip |
 | Windows / Linux | Runtime suite runs on both operating systems |
+
+## What changed in 2.3
+
+`engines` is still `node >= 22`, every 2.2 subpath is still exported, and the package still has no runtime `dependencies`.
+
+**New subpaths.** Five are edge-safe and four are Node-only. The release gate bundles each edge-safe one for the browser, and checks that each Node-only one fails that boundary. [Edge & Runtimes](/docs/advanced/edge#node-only-subpaths) lists what every Node-only subpath needs.
+
+| Subpath | Runtime | Needs |
+| --- | --- | --- |
+| [`@deuz-sdk/core/goal`](/docs/modules/goals) | edge-safe | nothing |
+| [`@deuz-sdk/core/realtime`](/docs/modules/realtime) | edge-safe | the runtime's `WebSocket`, or `deps.webSocket` |
+| [`@deuz-sdk/core/batch`](/docs/modules/batch) | edge-safe | nothing |
+| [`@deuz-sdk/core/a2a`](/docs/modules/a2a) | edge-safe | nothing |
+| [`@deuz-sdk/core/mcp/server`](/docs/modules/mcp-server) | edge-safe | the optional peer `@modelcontextprotocol/server`, loaded by `ready()` or the first request |
+| [`@deuz-sdk/core/mcp/server/stdio`](/docs/modules/mcp-server#stdio) | Node-only | `@modelcontextprotocol/server`, `process.stdin` and `process.stdout` |
+| [`@deuz-sdk/core/ops/redis`](/docs/modules/operations#redis) | Node-only | the optional peer `redis`, or a client you pass in |
+| [`@deuz-sdk/core/swarm/redis`](/docs/modules/swarm#redis-persistence) | Node-only | the optional peer `redis`, or a client you pass in |
+| [`@deuz-sdk/core/headless`](/docs/modules/headless) | Node-only, a 2.3 preview | `node:fs/promises`, `node:path` and `node:process` |
+
+**Optional peers.** Every peer is still declared optional, so a package manager installs none of them for you.
+
+- `@modelcontextprotocol/client` `^2.3.1` (new) is the SDK of MCP 2026-07-28. With `sdk: 'auto'`, the default, the MCP client runs on it when it can be imported and on `@modelcontextprotocol/sdk` (2025-11-25) otherwise, so either one is enough for a client.
+- `@modelcontextprotocol/server` `^2.3.1` (new) serves `/mcp/server` and `/mcp/server/stdio`.
+- Both MCP 2026-07-28 packages declare Node 20 or later and bring Zod 4 as their own dependency.
+- `redis` accepts `^6.0.0` too (`^4.6.0 || ^5.0.0 || ^6.0.0`), and now also backs `/ops/redis` and `/swarm/redis`. The Redis ops, budget and swarm stores need Redis 7 or later.
+
+**React 18 in CI.** Both React bindings declare `react: ^18.0.0 || ^19.0.0`, as before, but until 2.3 CI installed only React 19. A CI job now puts one React 18 under the whole repository and runs the typecheck of both packages, the `@deuz-sdk/react` tests and the frozen hook's tests on it. `@deuz-sdk/react` keeps its `@deuz-sdk/core: ^2.0.0` peer range and imports nothing a 2.2 core lacks, but the 2.3 [wire fields](/docs/reference/stream-protocol#additive-fields-in-23) reach `useChat` through core's `applyUIPart`, so they need `@deuz-sdk/core` 2.3.
+
+**Redis and Postgres in CI.** A CI job runs the Redis ops, runs, budget and swarm stores against Redis 7, and the Postgres stores against Postgres 16, including concurrent writers. These tests read `DEUZ_TEST_REDIS_URL` or `DEUZ_TEST_POSTGRES_URL` and skip without them, so the check runs stay offline.
 
 ## Custom provider base URLs
 

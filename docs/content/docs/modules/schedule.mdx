@@ -133,11 +133,13 @@ console.log(ran.length); // 4
 The default claim is an in-memory set: it dedupes overlapping ticks inside one
 process, not across processes or isolates. On a serverless host every tick may
 run in a fresh isolate, so give the scheduler a claim backed by storage all of
-them share. The SQLite and Postgres ops stores carry one: `claims` grants a key
-once across every process on the same file or database, in one statement
-(`INSERT … ON CONFLICT DO NOTHING RETURNING`: the key is granted when the row
-comes back, so an injected SQLite driver need not report a change count), and
-`claims.release(key)` gives it back. On a Postgres session that defaults to
+them share. The SQLite and Postgres ops stores carry one, and since 2.3 so does
+the Redis ops store (`createRedisOpsStore` from `@deuz-sdk/core/ops/redis`):
+`claims` grants a key once across every process on the same file, database or
+Redis key prefix, and `claims.release(key)` gives it back. On SQLite and
+Postgres the grant is one statement (`INSERT … ON CONFLICT DO NOTHING
+RETURNING`: the key is granted when the row comes back, so an injected SQLite
+driver need not report a change count); on Redis it is one Lua script. On a Postgres session that defaults to
 `REPEATABLE READ` or `SERIALIZABLE`, the loser of a race meets a serialization
 failure (40001); the store runs the statement again, and it answers `false`.
 
@@ -168,10 +170,13 @@ The same `ops.claims` is a `dedupe` for `handleSignal`, [below](#turn-a-signal-i
   `deuz_claims` keeps one row per granted key (`key`, and `claimed_at` in epoch milliseconds: the
   store's clock on SQLite, the database clock on Postgres). A key longer than 512 characters (too
   long for a Postgres index) or holding a NUL (which Postgres text rejects) is kept as `sha256:`
-  plus its hex SHA-256 on both stores, and still claims and releases exactly. Only `release`
-  removes a row. Prune old rows on your own schedule, keeping every key a tick could still look back
-  to (`lookbackMs`) and every delivery id a sender could still redeliver:
-  `DELETE FROM deuz_claims WHERE claimed_at < $cutoff`.
+  plus its hex SHA-256 on both stores, and still claims and releases exactly. `release` removes a
+  row, and since 2.3 so does `claims.prune(before)`, which deletes the keys granted before `before`
+  and returns how many. A pruned key can be claimed again, so prune on your own schedule and keep
+  every key a tick could still look back to (`lookbackMs`) and every delivery id a sender could
+  still redeliver: `await ops.claims.prune(cutoff)`. The Redis ops store keeps its keys in one
+  sorted set, by the server time they were granted, and prunes them the same way. See
+  [Retention](/docs/modules/operations#retention).
 </Callout>
 
 ## Dedupe with a swarm run
@@ -189,7 +194,7 @@ import { createMockModel } from '@deuz-sdk/core/testing';
 const writer = createAgent({ model: createMockModel({ responses: [{ text: 'report' }] }) });
 const swarm = createSwarm({
   agents: { writer: { agent: writer, version: 'writer-v1' } },
-  store: createInMemorySwarmStore(), // shared by every process: SQLite or Postgres in production
+  store: createInMemorySwarmStore(), // shared by every process: SQLite, Postgres or Redis in production
 });
 
 const schedules: ScheduleDefinition[] = [

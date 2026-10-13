@@ -6,6 +6,125 @@ icon: History
 
 All notable changes to `@deuz-sdk/core`. The package follows semver: minor versions are additive, the locked 1.0 type surface only changes in a major.
 
+## 2.3.0
+
+Released 2026-10-13.
+
+**One path for every tool call, the 2.2 deferrals delivered, and a headless
+preview.** Native runs gain memory, a chat projection and model fail-over;
+usage is billed once; a model without a price runs under a USD budget with a
+warning; requests follow each model's documented rules; nine new subpaths.
+Call sites from 2.2 keep working, but some defaults change, and native runs
+that record the new state need 2.3 to resume. Upgrade notes, behaviour changes
+and known limits are on [What is new in 2.3](/docs/reference/whats-new-2-3).
+Nothing in this release was run against a provider or a third-party service;
+provider behaviour is verified offline and labelled not live-verified.
+
+- **One path for every tool call** — the finish-reason gate, policy, approval,
+  admission, effect receipt, execution, `onToolResult` and checkpoint, in that
+  order, for local and MCP tools, handoff transfers, blackboard tools, spawned
+  tasks and sub-agents. Refused or cut-off turns dispatch nothing; `stopDetails`
+  and `ToolCallOutcome` name how a turn and a call ended; approvals are bound to
+  their call; native runs take MCP tools behind receipts, a native `lease`
+  that another process can signal to cancel or drain the run,
+  `AgentRunStore.list`, `findStaleAgentRuns`, and the opt-in
+  `reconciledToolResults` and `retryFailed` resume options. A resume answers a
+  call whose receipt records its outcome from that receipt, without gating it
+  for approval again, saves what its settle answered before its first model
+  call, and keeps the client results it was given across a crash.
+  → [Native agents](/docs/modules/native-agents#one-path-for-every-tool-call)
+- **Native memory, chat and fail-over** — `memory`, `chat` and `fallbackModels`
+  in `runAgent` and `streamAgent`, bound to the checkpoint and the resume
+  binding (envelope version 2), and `reconcileAgentRun` for what a run left
+  behind.
+  → [Native agents](/docs/modules/native-agents#memory-chat-and-model-fail-over-23)
+- **Usage, prices and budgets** — every token billed once (`outputTokens`
+  includes reasoning), explicit price lookup with `PRICE_ALIASES`, Claude 5.5
+  prices, unpriced models under USD budgets with an `unpriced-model` warning
+  (`unknownPrice: 'reject'` is the strict mode), reservations at the output cap
+  the request sends, `BudgetStore` `holds` / `sweep` / `prune`, and a batch
+  price tier. → [Budgets](/docs/modules/budgets)
+- **Models and requests** — `resolveModelProfile`, Claude 5.x rows and request
+  rules, research-dated rows for new models, a warning for every value a
+  request changes, OpenAI Responses `store: false` by default, and structured
+  output that keeps the conversation's tools.
+  → [Model profiles](/docs/modules/model-profiles)
+- **Preserved thinking** — a byte-stable prefix for Claude 5.x in the agentic
+  loops, `block_binding` drop as the safety net, one reasoning part per block,
+  and reasoning kept within its provider family.
+  → [Preserved thinking](/docs/agents/preserved-thinking)
+- **MCP 2026-07-28 and an MCP server** (`/mcp`, `/mcp/server`,
+  `/mcp/server/stdio`) — a dual-stack client over the v1 and v2 SDKs, and
+  `createMcpServer` publishing tools, native agent tools and agents over
+  Streamable HTTP and stdio. → [MCP server](/docs/modules/mcp-server)
+- **A2A** (`/a2a`) — an edge-safe, dependency-free A2A 1.0.0 client and handler
+  over JSON-RPC and HTTP+JSON, and `createA2AAgentExecutor`, which serves a
+  native agent run as the handler's executor: answers are checked against the
+  run before anything is written (a signed approval echoes its token), a
+  drained run goes on at the next message, a failed task names only the
+  error's code or name, and a run with output guardrails streams no drafts
+  unless `drafts: true`. → [A2A](/docs/modules/a2a)
+- **Realtime voice** (`/realtime`) — OpenAI Realtime and Gemini Live over
+  WebSocket, with Deuz tools, ephemeral browser tokens and per-modality usage.
+  → [Realtime voice](/docs/modules/realtime)
+- **Batch requests** (`/batch`) — the OpenAI, Anthropic and Gemini batch APIs,
+  priced on the batch tier, with budget holds settled per result and jobs a
+  new process can resume. → [Batch requests](/docs/modules/batch)
+- **Redis backends** (`/ops/redis`, `/swarm/redis`) — leases, native runs,
+  claims, budgets and swarms in atomic Lua scripts, and `runs` in the Redis
+  store pack. → [Operations](/docs/modules/operations#redis)
+- **Goals** (`/goal`) — versioned goal records moved by pure transitions,
+  acceptance on evidence, explicit waiting reasons, and wakeup and event
+  envelopes. → [Goals](/docs/modules/goals)
+- **Native agents in a UI** — `toDeuzAgentStreamResponse` and
+  `agentStateFromParts` on `/ui`, and `useChat` (`@deuz-sdk/react`) driving
+  native agent routes, with verdicts matched to the open gate and replay-safe
+  client tools.
+  → [UI streaming](/docs/modules/ui-streaming#native-agent-runs-todeuzagentstreamresponse-23)
+- **Evals** (`runEvalSuite` on `/testing`) — versioned tasks with per-attempt
+  metrics for success, false completion, cost, rescues, repeated effects and
+  recovery. The baseline runs 22 offline tasks and 33 fault-injection
+  scenarios (22 recovered, 11 contained) on every `npm test`.
+  → [Evals](/docs/modules/evals)
+- **Headless preview** (`/headless`, Node-only) — `runHeadless`,
+  `resumeHeadless`, `inspectRun`, `doctor`, project instructions and documented
+  exit codes; no binary. A report names both answers to an unknown effect,
+  marks a failure in transit as retryable (`retry`) and reports a drained run
+  as pending (exit 3), and `resumeHeadless` takes `reconciledToolResults` and
+  `retryFailed`. → [Headless](/docs/modules/headless)
+- **Examples** — seven new keyless examples (14–20): native memory, chat and
+  fail-over, the native UI bridge, goals and wakeups, realtime and batch on
+  scripted wires, an MCP server, and a native agent served over A2A.
+  → [Examples](/docs/reference/whats-new-2-3#examples)
+
+Fixed: `createNodeSandbox` no longer takes the host process down when a child
+stops reading its stdin, and `createFileWorkspace` accepts names such as
+`..notes` and no longer writes through a dangling link. Handoff transfers work
+in native runs. MCP `listTools()` reads every page. A swarm executor whose
+start-up commit fails releases its lease and heartbeat. The Postgres stores
+retry serialization failures and deadlocks. `streamObject`'s `warnings` no
+longer hangs on a failed call, and `agentTool` child sessions no longer collide
+when a provider reuses a call id. Every Gemini finish reason is mapped on
+purpose (a Gemini filter no longer ends a turn with `stop`; the stops without a
+usable answer still end it with `stop`, and the `finish` part keeps Gemini's
+own value as `providerMetadata.google.finishReason`), an OpenAI Responses turn
+that its content filter cut off ends with `content_filter`, and an OpenAI
+refusal is kept as `stopDetails` instead of being dropped.
+
+A native run that 2.3 saved with `mcp`, handoffs, `memory`, `chat` or
+`fallbackModels` needs 2.3 to resume: its resume binding records them, and
+memory, a chat projection or fail-over state also make the envelope version 2.
+So does a run that waits on an approval (2.2 looks a verdict up by the bare
+tool call ID, so it would answer the approved call as denied), and a run
+stopped with an open call 2.2 would answer wrongly (a `failed` or `suspended`
+receipt, a client call a resume took up and still waits on, a call the
+approval gate issued a request for), until a checkpoint answers the call: such
+an envelope is version 2 as well. OpenAI Responses requests send
+`store: false`, and `validateChatRequest` accepts the tool results `useChat`
+posts.
+`CallWarning['type']`, `BudgetLedgerErrorCode`, `AgentToolReceipt['stage']` and
+`AgentRunEnvelope.version` are widened.
+
 ## 2.2.0
 
 **Dynamic swarms, durable operations and evolve.** Swarms grow at runtime,
@@ -102,7 +221,7 @@ separate from the existing UI wire and legacy checkpoint contracts.
 
 **The things you used to build yourself.** Eight new subpaths, three new modalities, real databases behind the four storage seams, guardrails and handoffs in the loop, and MCP that connects itself. The 1.9 call surface still compiles and every stored checkpoint still loads. Four loud breaks — `NotImplementedError` removed, two unions grew a member, `compaction.trigger` is always present, structured output now refuses `mcp` / `guardrails` / `doneWhen` — plus the two recovering behaviour changes, are on [What is new in 2.0](/docs/reference/whats-new-2-0).
 
-- **Persistent stores** (`/stores/sqlite`, `/stores/redis`, `/stores/postgres`) — one factory per backend returning `MemoryStore` / `ChatStore` / `SessionStore` / `RunStore` on one connection. SQLite: FTS5 + vector hybrid over `node:sqlite`, zero dependencies. Postgres: pgvector HNSW with an `embedding_json` fallback and a one-statement upgrade. Redis: a structural client seam, no package dependency. → [Persistent stores](/docs/modules/stores)
+- **Persistent stores** (`/stores/sqlite`, `/stores/redis`, `/stores/postgres`) — one factory per backend returning `MemoryStore` / `ChatStore` / `SessionStore` / `RunStore` on one connection. SQLite: FTS5 + vector hybrid over `node:sqlite`, zero dependencies. Postgres: pgvector HNSW with an `embedding_json` fallback and a one-statement upgrade. Redis: a structural client seam, no package dependency. Correction (2.3): the Redis pack had no `RunStore` until 2.3, where `createRedisStores` returns `runs`. → [Persistent stores](/docs/modules/stores)
 - **Guardrails** (`/guardrails`, `guardrails` call option) — `onInput` / `onToolCall` / `onOutput`, each pass / block / rewrite. A blocked tool call joins the existing denial machinery and does not count toward the runaway guard; a blocked input or output is a graceful `stoppedBy` stop. → [Guardrails](/docs/agents/guardrails)
 - **Handoffs** (`handoff()`) — transfer the run to another agent: system prompt, tools and model change, history travels. Deterministic interception, `maxHandoffs` loop guard, `handoff` stream part, durable resume. → [Handoffs](/docs/agents/handoffs)
 - **Zero-config MCP** (`mcp` call option) plus **OAuth 2.0** (`TokenStore`, `createOAuthProvider`, `/mcp/node` file store + loopback listener), **sampling**, **roots**, `ping()`-verified reconnect, `status()`, `keepAliveMs`, and `deps.mcpPool`. → [MCP](/docs/modules/mcp)

@@ -314,6 +314,8 @@ Two options on `CommonCallOptions` give you per-step control over the loop — b
 
 `activeTools?: string[]` is a **static** filter: only these `tools` keys are sent to the model, on every step. An unknown name logs a warning and is ignored; if the whole list ends up matching nothing, it fails **open** (the full tool set is sent) rather than silently starving the model of tools.
 
+On Claude 5.x the tools array stays the root agent's static set on every request, and a per-step `activeTools` rides as an appended tool-set change; a call to a tool the step did not offer is answered like an unknown tool ([Preserved thinking](/docs/agents/preserved-thinking#the-tools-array)).
+
 ```ts
 const result = await generateText({
   model: anthropic('claude-opus-4-8'),

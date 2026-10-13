@@ -26,8 +26,9 @@
  *   const authorize = new URL(err.authorizationUrl);
  *   if (loopback.state) authorize.searchParams.set('state', loopback.state);
  *   showTheUser(authorize.toString());                     // the HOST decides how
- *   const authorizationCode = await loopback.waitForCode();
- *   client = await createMcpClient({ transport, auth, authorizationCode });
+ *   // `iss` (RFC 9207) when the authorization server names itself on the redirect.
+ *   const { code, iss } = await loopback.waitForCallback();
+ *   client = await createMcpClient({ transport, auth, authorizationCode: code, authorizationIss: iss });
  * } finally {
  *   await loopback.close();
  * }
@@ -220,6 +221,12 @@ export interface LoopbackRedirect {
   readonly state: string | undefined;
   /** The `?code=` from the redirect. Rejects on `?error=`, or when the wait times out. */
   waitForCode(): Promise<string>;
+  /**
+   * The `?code=` together with the redirect's `?iss=` (RFC 9207, 2.3), when it
+   * carries one — hand both to `createMcpClient({ authorizationCode,
+   * authorizationIss })` or `completeAuth(code, iss)`. Settles like `waitForCode`.
+   */
+  waitForCallback(): Promise<{ code: string; iss?: string }>;
   /** Stop listening. Idempotent; safe to call from a `finally`. */
   close(): Promise<void>;
 }
@@ -231,7 +238,8 @@ const REDIRECT_PAGE = (heading: string, detail: string): string =>
 /**
  * A SINGLE-SHOT loopback listener on 127.0.0.1 — the desktop/CLI half of an
  * OAuth redirect. It answers exactly one authorization result, hands the code
- * to `waitForCode()` and stops.
+ * (and the redirect's RFC 9207 `iss`, if any) to `waitForCode()` /
+ * `waitForCallback()` and stops.
  *
  * 127.0.0.1 rather than `localhost`: the name can resolve to `::1` first, and an
  * authorization server that registered the IPv4 literal would then redirect
@@ -269,12 +277,13 @@ export async function createLoopbackRedirect(
     return nodeCrypto.timingSafeEqual(digest(received), digest(expectedState));
   };
 
-  let settle: ((code: string) => void) | undefined;
+  let settle: ((result: { code: string; iss?: string }) => void) | undefined;
   let fail: ((err: Error) => void) | undefined;
-  const code = new Promise<string>((resolve, reject) => {
+  const callback = new Promise<{ code: string; iss?: string }>((resolve, reject) => {
     settle = resolve;
     fail = reject;
   });
+  const code = callback.then((result) => result.code);
   // Nobody may be awaiting yet when the timeout fires — keep Node from
   // reporting the rejection as unhandled.
   void code.catch(() => undefined);
@@ -306,7 +315,8 @@ export async function createLoopbackRedirect(
       res.end(
         REDIRECT_PAGE('Authorized', 'You can close this window and return to your terminal.'),
       );
-      settle?.(received);
+      const iss = url.searchParams.get('iss');
+      settle?.({ code: received, ...(iss !== null ? { iss } : {}) });
       return;
     }
     res.writeHead(400, { 'content-type': 'text/html; charset=utf-8', connection: 'close' });
@@ -381,6 +391,7 @@ export async function createLoopbackRedirect(
     redirectUri,
     state: expectedState,
     waitForCode: () => code,
+    waitForCallback: () => callback,
     close() {
       // An explicit close is a HARD stop — nothing is waiting on that page any
       // more, so a still-open socket must not keep the process alive.

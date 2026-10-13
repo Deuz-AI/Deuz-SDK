@@ -1,10 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { streamChat, generateText } from '../src/index';
+import { streamChat, generateText, generateObject, streamObject } from '../src/index';
 import { createAnthropic } from '../src/anthropic';
-import { createOpenAI } from '../src/openai';
+import { createOpenAI, createOpenAIResponses } from '../src/openai';
 import { createGoogleNative } from '../src/google';
 import { filePart } from '../src/parts';
 import { runStream } from '../src/core/inference';
+import { runStreamToolLoop } from '../src/inference/stream-tool-loop';
 import { createWarningSink } from '../src/internal/warnings';
 import { sseResponse, sseEvents, mockFetch } from './fixtures/sse';
 import type { StreamPart } from '../src/types/stream';
@@ -143,9 +144,10 @@ describe('unsupported-setting', () => {
     });
     await drain(result.fullStream);
     expect(await result.warnings!).toEqual([]);
-    // gpt-5.5 is not sampling-restricted, so it keeps `max_tokens`; the point of
-    // the assertion is that the value REACHED the wire, so warning would be a lie.
-    expect(body(calls[0]!).max_tokens).toBe(555);
+    // 2.3: gpt-5.5 is a reasoning row (not live-verified), so the restricted wire
+    // RENAMES the cap to `max_completion_tokens`; the point of the assertion is
+    // that the value REACHED the wire, so a warning would be a lie.
+    expect(body(calls[0]!).max_completion_tokens).toBe(555);
   });
 
   it('effort on a model with no reasoning capability is reported', async () => {
@@ -522,5 +524,219 @@ describe('surfacing', () => {
     // pass) to carry them onto the RESULT; the emission itself is asserted here.
     expect(logger.warn).toHaveBeenCalledTimes(1);
     expect(logger.warn.mock.calls[0]![1]).toMatchObject({ setting: 'temperature' });
+  });
+});
+
+// ===================================================================
+// One report per warning (2.3): the sink says what is new, and the log and
+// the stream each carry a warning once
+// ===================================================================
+
+describe('the sink reports what is new', () => {
+  it('add() is true for a new warning, also past the list cap, and false for a repeat', () => {
+    const sink = createWarningSink();
+    for (let i = 0; i < 50; i++) expect(sink.add({ type: 'other', message: `w${i}` })).toBe(true);
+    expect(sink.add({ type: 'other', message: 'w0' })).toBe(false);
+    // Past the cap a new warning is counted as omitted, and is still new.
+    expect(sink.add({ type: 'other', message: 'late' })).toBe(true);
+    expect(sink.add({ type: 'other', message: 'late' })).toBe(false);
+    expect(sink.list()).toHaveLength(51);
+    expect(sink.list()[50]!.message).toContain('1 further warning(s) omitted');
+  });
+
+  it('take() hands each warning to one stream, and the omitted notice once', () => {
+    const sink = createWarningSink();
+    sink.add({ type: 'other', message: 'a' });
+    expect(sink.take().map((w) => w.message)).toEqual(['a']);
+    expect(sink.take()).toEqual([]);
+    for (let i = 0; i < 60; i++) sink.add({ type: 'other', message: `w${i}` });
+    const taken = sink.take();
+    expect(taken).toHaveLength(50);
+    expect(taken.at(-1)!.message).toContain('omitted');
+    sink.add({ type: 'other', message: 'later' });
+    expect(sink.take()).toEqual([]);
+  });
+
+  it('a clamp is still logged once the run has passed the 50-warning list cap', async () => {
+    const RESP_DONE = sseEvents([
+      {
+        event: 'response.completed',
+        data: { type: 'response.completed', response: { status: 'completed', usage: {} } },
+      },
+    ]);
+    // A long loop's sink that already holds 50 warnings.
+    const sink = createWarningSink();
+    for (let i = 0; i < 50; i++) sink.add({ type: 'other', message: `earlier warning ${i}` });
+    const logger = makeLogger();
+    for (const id of ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano']) {
+      const { fetch, calls } = mockFetch(() => sseResponse([RESP_DONE]));
+      const result = runStream(
+        {
+          model: createOpenAIResponses({ apiKey: 'k', fetch })(id),
+          messages: [{ role: 'user', content: 'hi' }],
+          effort: 'max',
+          deps: { logger },
+        },
+        { warnings: sink },
+      );
+      await drain(result.fullStream);
+      expect(body(calls[0]!).reasoning).toEqual({ effort: 'xhigh' });
+    }
+    // Before: one line, then the list length stopped moving and every later
+    // clamp looked like a repeat.
+    const lines = logger.warn.mock.calls.filter((c) =>
+      String(c[0]).includes("effort 'max' was sent as 'xhigh'"),
+    );
+    expect(lines).toHaveLength(3);
+  });
+});
+
+describe('a pump-level warning is logged once through a logger-backed sink', () => {
+  const claudeText = (text: string): string =>
+    sseEvents([
+      {
+        event: 'message_start',
+        data: { type: 'message_start', message: { usage: { input_tokens: 2, output_tokens: 1 } } },
+      },
+      {
+        event: 'content_block_start',
+        data: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      },
+      {
+        event: 'content_block_delta',
+        data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
+      },
+      { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
+      {
+        event: 'message_delta',
+        data: {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 1 },
+        },
+      },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+  const lines = (logger: ReturnType<typeof makeLogger>, needle: string): number =>
+    logger.warn.mock.calls.filter((c) => String(c[0]).includes(needle)).length;
+  const SCHEMA = {
+    type: 'object',
+    properties: { a: { type: 'string' } },
+    required: ['a'],
+    additionalProperties: false,
+  } as const;
+
+  it('generateObject: the mode clamp and the temperature drop log one line each', async () => {
+    const logger = makeLogger();
+    const { fetch } = mockFetch(() => sseResponse([claudeText('{"a":"x"}')]));
+    const result = await generateObject({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-5-5'),
+      prompt: 'hi',
+      schema: SCHEMA,
+      mode: 'tool',
+      temperature: 0.3,
+      deps: { logger },
+    });
+    expect(result.object).toEqual({ a: 'x' });
+    expect(lines(logger, "mode 'tool' was sent as the json strategy")).toBe(1);
+    expect(lines(logger, 'temperature was dropped')).toBe(1);
+  });
+
+  it('streamObject: the mode clamp logs one line', async () => {
+    const logger = makeLogger();
+    const { fetch } = mockFetch(() => sseResponse([claudeText('{"a":"x"}')]));
+    const result = streamObject({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-5-5'),
+      prompt: 'hi',
+      schema: SCHEMA,
+      mode: 'tool',
+      deps: { logger },
+    });
+    await result.object;
+    expect(lines(logger, "mode 'tool' was sent as the json strategy")).toBe(1);
+  });
+
+  it('generateText with tools: the temperature drop logs one line', async () => {
+    const logger = makeLogger();
+    const { fetch } = mockFetch(() => sseResponse([claudeText('done')]));
+    await generateText({
+      model: createAnthropic({ apiKey: 'k', fetch })('claude-opus-5-5'),
+      prompt: 'hi',
+      temperature: 0.2,
+      tools: {
+        echo: {
+          description: 'echo',
+          parameters: { type: 'object', properties: {} },
+          execute: () => 'ok',
+        },
+      },
+      deps: { logger },
+    });
+    expect(lines(logger, 'temperature was dropped')).toBe(1);
+  });
+});
+
+describe('a loop streams each warning once', () => {
+  it('an unknown model over two steps: one unknown-model part, before the first output', async () => {
+    let call = 0;
+    const { fetch } = mockFetch(() =>
+      sseResponse([
+        call++ === 0
+          ? sseEvents([
+              {
+                data: {
+                  choices: [
+                    {
+                      delta: {
+                        tool_calls: [
+                          {
+                            index: 0,
+                            id: 'c1',
+                            type: 'function',
+                            function: { name: 'noop', arguments: '{}' },
+                          },
+                        ],
+                      },
+                      finish_reason: 'tool_calls',
+                    },
+                  ],
+                },
+              },
+              { data: '[DONE]' },
+            ])
+          : CC_DONE,
+      ]),
+    );
+    const result = streamChat({
+      model: createOpenAI({ apiKey: 'k', fetch })('gpt-unreleased-9'),
+      prompt: 'hi',
+      maxSteps: 3,
+      tools: { noop: { parameters: { type: 'object', properties: {} }, execute: () => 'ok' } },
+    });
+    const parts = await drain(result.fullStream);
+    // Before: the loop re-pushed what the first step's stream had already carried.
+    expect(warningParts(parts).map((w) => w.type)).toEqual(['unknown-model']);
+    expect(parts.findIndex((p) => p.type === 'warning')).toBeLessThan(
+      parts.findIndex((p) => p.type === 'tool-call-delta'),
+    );
+  });
+
+  it('a runner that owns the run can share one sink across its loop runs', async () => {
+    const { fetch } = mockFetch(() => sseResponse([CC_DONE]));
+    const sink = createWarningSink();
+    const loop = () =>
+      runStreamToolLoop(
+        {
+          model: createOpenAI({ apiKey: 'k', fetch })('gpt-unreleased-9'),
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: { noop: { parameters: { type: 'object', properties: {} }, execute: () => 'ok' } },
+        },
+        { warnings: sink },
+      );
+    const first = await drain(loop().fullStream);
+    const second = await drain(loop().fullStream);
+    expect(warningParts(first).map((w) => w.type)).toEqual(['unknown-model']);
+    expect(warningParts(second)).toEqual([]);
+    expect(sink.list().map((w) => w.type)).toEqual(['unknown-model']);
   });
 });

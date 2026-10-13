@@ -7,10 +7,11 @@ import {
 } from '../execution-policy';
 import { intersectBudgetLimits } from '../budget-ledger';
 import { resolveDependencies } from '../internal/resolve-deps';
+import { markRunLedger } from '../internal/run-ledger';
 import type { DeuzAgent } from '../agent';
 import type { AgentRunOptions, AgentRunStore, AgentToolSet } from '../types/agent-run';
 import type { NativeExecutionContext } from '../types/execution';
-import type { Lease, LeaseSignal } from '../types/lease';
+import type { Lease, LeaseRenewal, LeaseRenewOptions, LeaseSignal } from '../types/lease';
 import type {
   Swarm,
   SwarmCancelRequest,
@@ -184,19 +185,32 @@ export function createSwarm(options: SwarmOptions): Swarm {
   const unclaim = async (lease: Lease | undefined): Promise<void> => {
     if (lease) await leasing!.provider.release(lease).catch(() => {});
   };
+  // Acknowledged delivery (2.3): a provider that can acknowledge keeps a
+  // delivered cancel queued until this executor recorded it, so a crash in
+  // between cannot lose it. Others consume what they deliver, as in 2.2.
+  const renewOptions: LeaseRenewOptions | undefined =
+    typeof leasing?.provider.ack === 'function' ? { acknowledge: true } : undefined;
+  /** Whether a renewal delivered a cancel that stays queued until acknowledged (2.3). */
+  const keepsCancel = (renewal: LeaseRenewal): boolean =>
+    renewal.held && renewal.signals.includes('cancel') && !!renewal.queued?.includes('cancel');
+  /** Remove a cancel this executor recorded, or found moot, from the queue (2.3). */
+  const acknowledge = async (lease: Lease | undefined): Promise<void> => {
+    if (lease) await leasing!.provider.ack!(lease, 'cancel');
+  };
   /**
    * Take the signals queued under a fresh claim (2.2). A 'cancel' outlives the
-   * holder it was sent to, so it may predate this claim.
+   * holder it was sent to, so it may predate this claim. `kept` (2.3): the
+   * provider keeps that cancel queued until it is acknowledged.
    */
   const collect = async (
     lease: Lease | undefined,
-  ): Promise<{ lease: Lease | undefined; signals: readonly LeaseSignal[] }> => {
-    if (!lease) return { lease, signals: [] };
-    const renewal = await leasing!.provider.renew(lease, leaseTtl);
+  ): Promise<{ lease: Lease | undefined; signals: readonly LeaseSignal[]; kept: boolean }> => {
+    if (!lease) return { lease, signals: [], kept: false };
+    const renewal = await leasing!.provider.renew(lease, leaseTtl, renewOptions);
     if (!renewal.held) throw new SwarmLeaseError('held');
-    return { lease: renewal.lease, signals: renewal.signals };
+    return { lease: renewal.lease, signals: renewal.signals, kept: keepsCancel(renewal) };
   };
-  /** A claim that fails after collecting queues its cancel again before letting go. */
+  /** A claim that fails after taking a cancel off the queue puts it back before letting go. */
   const restore = async (key: SwarmKey, signals: readonly LeaseSignal[]): Promise<void> => {
     if (signals.includes('cancel'))
       await leasing!.provider.signal(leaseKey(key), 'cancel').catch(() => false);
@@ -291,32 +305,6 @@ export function createSwarm(options: SwarmOptions): Swarm {
         run: { executionState: { ...execution.snapshot(), ledger }, updatedAt: deps.clock.now() },
       }));
     };
-    let contextReady = false;
-    try {
-      execution = initial.run.executionState
-        ? createExecutionContext({
-            snapshot: initial.run.executionState,
-            policy: options.policy,
-            budget: options.budget,
-            persist,
-            admission: options.admission,
-          })
-        : createExecutionContext({
-            scopeId: id,
-            policy: options.policy,
-            budget: options.budget,
-            persist,
-            admission: options.admission,
-          });
-      contextReady = true;
-      // Policy/scope state is durable before the first dispatch or reservation.
-      await mutate(() => ({ run: { executionState: execution.snapshot() } }));
-    } catch (error) {
-      owned.delete(id);
-      await unclaim(lease);
-      // Saved execution state this process cannot restore is the run's own failure.
-      throw contextReady ? error : tagFailure(error, 'run');
-    }
 
     const cancel = async () => {
       if (!owned.has(id)) return;
@@ -340,11 +328,15 @@ export function createSwarm(options: SwarmOptions): Swarm {
     let lost: SwarmLeaseError | undefined;
     // Drain (2.2): no new dispatch; in-flight tasks finish and the run settles.
     let draining = drainSignalled;
-    // The durable commit of the last cancel a renewal delivered.
+    // The durable commit of the first cancel a renewal delivered.
     let cancelling: Promise<void> | undefined;
-    // A renewal delivered a cancel (2.2). One no commit made durable is queued
-    // again before the lease is let go, so the next executor still applies it.
+    // A renewal delivered a cancel and took it off the queue (2.2). One no
+    // commit made durable is queued again before the lease is let go, so the
+    // next executor still applies it.
     let delivered = false;
+    // A renewal delivered a cancel the provider keeps queued (2.3). It leaves
+    // the queue only once the run recorded it or settled past it.
+    let awaitingAck = false;
     let stopBeat: (() => void) | undefined;
     const lose = () => {
       lost ??= new SwarmLeaseError('lost');
@@ -358,14 +350,19 @@ export function createSwarm(options: SwarmOptions): Swarm {
       (renewals = renewals.then(async () => {
         if (stopped || !held || lost) return;
         try {
-          const renewal = await leasing!.provider.renew(held, leaseTtl);
-          // Noted even after this executor stopped: the release queues it again.
-          if (renewal.held && renewal.signals.includes('cancel')) delivered = true;
+          const renewal = await leasing!.provider.renew(held, leaseTtl, renewOptions);
+          // Noted even after this executor stopped: the teardown queues it
+          // again or acknowledges it.
+          if (renewal.held && renewal.signals.includes('cancel')) {
+            if (keepsCancel(renewal)) awaitingAck = true;
+            else delivered = true;
+          }
           if (stopped) return;
           if (!renewal.held) return lose();
           held = renewal.lease;
           if (renewal.signals.includes('drain')) draining = true;
-          if (renewal.signals.includes('cancel')) cancelling = cancel().catch(() => {});
+          // A kept cancel comes back with every renewal until it is acknowledged.
+          if (renewal.signals.includes('cancel')) cancelling ??= cancel().catch(() => {});
         } catch {
           // A provider outage is survivable until the lease could have lapsed.
           if (!stopped && deps.clock.now() >= held.expiresAt) lose();
@@ -378,15 +375,71 @@ export function createSwarm(options: SwarmOptions): Swarm {
           Math.max(1, Math.floor(leaseTtl / 3)),
         );
     };
-    beat();
+    /**
+     * Give back everything this executor took on: the heartbeat, the abort
+     * listener, the lease and the run's in-process ownership. Shared by a
+     * start that fails and by the end of drive() (2.3).
+     */
+    const teardown = async (): Promise<void> => {
+      stopped = true;
+      stopBeat?.();
+      signal?.removeEventListener('abort', abort);
+      // A delivered cancel that no commit made durable, including one a
+      // renewal still in flight brings, goes back in the queue while this
+      // executor holds the lease (2.2), unless the run settled past it. One
+      // the provider kept queued (2.3) needs no help to stay there; it is
+      // acknowledged once the run recorded it or settled past it.
+      await renewals;
+      await cancelling;
+      const past =
+        snapshot.run.cancelRequested ||
+        snapshot.run.status === 'completed' ||
+        snapshot.run.status === 'partial';
+      if (past && awaitingAck) await acknowledge(held).catch(() => {});
+      else if (!past && delivered) await restore(key, ['cancel']);
+      // A stale token is ignored, so this is safe after a takeover too.
+      await unclaim(held);
+      owned.delete(id);
+      active.delete(id);
+    };
+    // Every step after the ownership check shares one cleanup (2.3): a failed
+    // commit here must not leave the run owned, leased and heartbeating.
+    let contextReady = false;
+    try {
+      execution = initial.run.executionState
+        ? createExecutionContext({
+            snapshot: initial.run.executionState,
+            policy: options.policy,
+            budget: options.budget,
+            persist,
+            admission: options.admission,
+          })
+        : createExecutionContext({
+            scopeId: id,
+            policy: options.policy,
+            budget: options.budget,
+            persist,
+            admission: options.admission,
+          });
+      // One swarm run owns this ledger: its tasks report an unpriced model once in all.
+      markRunLedger(execution.ledger);
+      contextReady = true;
+      // Policy/scope state is durable before the first dispatch or reservation.
+      await mutate(() => ({ run: { executionState: execution.snapshot() } }));
+      beat();
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted || snapshot.run.cancelRequested) await cancel();
+    } catch (error) {
+      await teardown();
+      // Saved execution state this process cannot restore is the run's own failure.
+      throw contextReady ? error : tagFailure(error, 'run');
+    }
     // Every task runs under the same child scope ID its execution context uses.
     const compactTask = async (taskId: string): Promise<void> => {
       await execution.ledger.compact(
         childScopeId(execution.scopeId, JSON.stringify([key.scope, key.runId, taskId])),
       );
     };
-    signal?.addEventListener('abort', abort, { once: true });
-    if (signal?.aborted || snapshot.run.cancelRequested) await cancel();
 
     // A v2 run's persisted limits, tightened by this process's options (2.2).
     const limits = initial.run.dynamic ? tightenLimits(initial.run.dynamic, dynamic) : undefined;
@@ -798,25 +851,7 @@ export function createSwarm(options: SwarmOptions): Swarm {
           await renewLease();
         throw lost ?? error;
       } finally {
-        stopped = true;
-        stopBeat?.();
-        signal?.removeEventListener('abort', abort);
-        // A delivered cancel that no commit made durable, including one a
-        // renewal still in flight brings, goes back in the queue while this
-        // executor holds the lease (2.2), unless the run settled past it.
-        await renewals;
-        await cancelling;
-        if (
-          delivered &&
-          !snapshot.run.cancelRequested &&
-          snapshot.run.status !== 'completed' &&
-          snapshot.run.status !== 'partial'
-        )
-          await restore(key, ['cancel']);
-        // A stale token is ignored, so this is safe after a takeover too.
-        await unclaim(held);
-        owned.delete(id);
-        active.delete(id);
+        await teardown();
       }
     }
     const result = drive();
@@ -972,16 +1007,21 @@ export function createSwarm(options: SwarmOptions): Swarm {
         ),
       };
       let lease = await claim(key);
-      let queued: readonly LeaseSignal[] = [];
+      // What this claim took off the key's queue.
+      let taken: readonly LeaseSignal[] = [];
       try {
-        // A new run starts clean: whatever its key still queues predates it.
-        ({ lease, signals: queued } = await collect(lease));
+        // A new run starts clean: whatever its key still queues predates it,
+        // so a cancel the provider keeps is acknowledged before the run exists.
+        const collected = await collect(lease);
+        lease = collected.lease;
+        if (collected.kept) await acknowledge(lease);
+        taken = collected.signals;
         snapshot.run = await options.store.create(snapshot, [
           { type: 'run.started', timestamp: now },
         ]);
       } catch (error) {
         // The key may belong to an existing run, whose queued cancel stays queued.
-        await restore(key, queued);
+        await restore(key, taken);
         await unclaim(lease);
         throw error;
       }
@@ -995,6 +1035,10 @@ export function createSwarm(options: SwarmOptions): Swarm {
       // still active a moment ago.
       let lease = await claim(input);
       let queued: readonly LeaseSignal[] = [];
+      // What this claim took off the key's queue.
+      let taken: readonly LeaseSignal[] = [];
+      // A kept cancel the resume commit records (2.3).
+      let recording = false;
       let snapshot: SwarmSnapshot;
       try {
         const loaded = await options.store.load(input);
@@ -1006,7 +1050,10 @@ export function createSwarm(options: SwarmOptions): Swarm {
         }
         snapshot = prepared.snapshot;
         const { changes, controlEvents } = prepared;
-        ({ lease, signals: queued } = await collect(lease));
+        const collected = await collect(lease);
+        lease = collected.lease;
+        queued = collected.signals;
+        if (!collected.kept) taken = queued;
         // A cancel whose holder stopped before reading it applies here, before
         // any dispatch; one that lost the race to the run's end changes nothing.
         const cancelNow =
@@ -1014,6 +1061,13 @@ export function createSwarm(options: SwarmOptions): Swarm {
           !snapshot.run.cancelRequested &&
           snapshot.run.status !== 'completed' &&
           snapshot.run.status !== 'partial';
+        if (collected.kept && cancelNow) recording = true;
+        else if (collected.kept) {
+          // A moot one leaves the queue before the claim commits (2.3): kept,
+          // it would cancel the run this resume drives again.
+          await acknowledge(lease);
+          taken = queued;
+        }
         const now = deps.clock.now();
         snapshot.run = await options.store.commit({
           scope: input.scope,
@@ -1032,10 +1086,13 @@ export function createSwarm(options: SwarmOptions): Swarm {
           ],
         });
       } catch (error) {
-        await restore(input, queued);
+        await restore(input, taken);
         await unclaim(lease);
         throw error;
       }
+      // The commit recorded the cancel, so it can leave the queue (2.3). If it
+      // cannot yet, the executor's next renewal brings it back to acknowledge.
+      if (recording) await acknowledge(lease).catch(() => {});
       return start(snapshot, input, lease, queued.includes('drain'));
     },
     async requestCancel(key): Promise<SwarmCancelRequest> {

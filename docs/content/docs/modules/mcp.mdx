@@ -1,6 +1,6 @@
 ---
 title: MCP
-description: Model Context Protocol — zero-config servers in the loop, OAuth 2.0, sampling, roots, reconnect, and a connection pool.
+description: Model Context Protocol — a dual-stack client for MCP 2026-07-28 and 2025-11-25, zero-config servers in the loop, OAuth 2.0, sampling, roots, reconnect, and a connection pool.
 ---
 
 The MCP module connects to a [Model Context Protocol](https://modelcontextprotocol.io) server, lists its tools, and maps them into a canonical `ToolSet`. Tool execution proxies transparently to the server — when the model calls an MCP tool, the SDK invokes it over the live connection and feeds the result back into the loop.
@@ -20,15 +20,16 @@ const { text } = await generateText({
 
 The loop connects, lists the tools, merges them into `tools`, hot-refreshes on a `tools/list_changed` notification, and closes what it opened when the run ends.
 
-Beyond tools, a client exposes the server's **resources** and **prompts**, answers server-initiated **elicitation** and **sampling** requests, and advertises **roots** (all per the 2025-11-25 MCP revision).
+Beyond tools, a client exposes the server's **resources** and **prompts**, answers server-initiated **elicitation** and **sampling** requests, and advertises **roots** — on MCP **2026-07-28** and on the 2025-11-25 revision alike (see [the two SDK lines](#sdk-lines-and-protocol-revisions-23)). To *publish* tools over MCP instead, see the [MCP server](/docs/modules/mcp-server).
 
-`@modelcontextprotocol/sdk` is a **lazy optional peer** (`^1.29.0`): imported with a dynamic `import()` only when you actually connect, so the edge bundle never pulls it in unless you use MCP. Install it yourself:
+The client is **dual-stack** (2.3). Two official SDKs exist, and both are **lazy optional peers** — imported with a dynamic `import()` only when you actually connect, so the edge bundle never pulls either in unless you use MCP. Install one:
 
 ```bash
-npm i @modelcontextprotocol/sdk
+npm i @modelcontextprotocol/client   # v2 SDK — MCP 2026-07-28 (and 2025-era servers)
+npm i @modelcontextprotocol/sdk      # v1 SDK — MCP 2025-11-25
 ```
 
-If it is missing at runtime, the call rejects with an `InvalidRequestError` telling you to install it.
+With both installed the v2 line is used. If neither is installed, connecting rejects with an `InvalidRequestError` naming both packages.
 
 ## Which path do I want?
 
@@ -58,7 +59,45 @@ Start at the top of the table and move down only when a row's limitation actuall
 
 Use `http` for remote servers — it is the current Streamable HTTP transport. `sse` is the legacy fallback some servers (e.g. Firecrawl's `/v2/sse`) still expose. The stdio transport spawns a local command (`npx -y firecrawl-mcp`) and talks over stdin/stdout, so it only works in Node and lives on its own subpath to keep the edge core free of Node builtins.
 
+`transport.fetch` (2.3) replaces the runtime's global `fetch` for every request on both SDK lines — a proxy, a Cloudflare service binding (`env.MCP.fetch`), or an in-process server's own handler (`(input, init) => server.fetch(new Request(input, init))`, no socket at all).
+
 There is **no WebSocket transport**. A WebSocket server needs a custom `McpClient` implementation.
+
+## SDK lines and protocol revisions (2.3)
+
+MCP **2026-07-28** is implemented only by the v2 TypeScript SDK (`@modelcontextprotocol/client`); the v1 package (`@modelcontextprotocol/sdk`) stays on 2025-11-25. Both sit behind the same internal seam, so every feature on this page — transports, OAuth, sampling, roots, elicitation, reconnect, hot refresh, tool fingerprints — works on both.
+
+```ts title="sdk-lines.ts"
+const client = await createMcpClient({
+  transport: { type: 'http', url },
+  sdk: 'auto',                 // default: v2 when importable, else v1
+  versionNegotiation: 'auto',  // default (v2 line): 2026-07-28 when the server offers it
+});
+client.sdk?.();               // 'v2'
+client.protocolVersion?.();   // '2026-07-28', or '2025-11-25' against an older server
+```
+
+| `sdk` | Line |
+| --- | --- |
+| `'auto'` (default) | v2 when `@modelcontextprotocol/client` can be imported, else v1. |
+| `'v2'` / `'v1'` | That line; a missing package rejects with its install command. |
+
+| `versionNegotiation` (v2 line) | Handshake |
+| --- | --- |
+| `'auto'` (default) | Probes `server/discover`: 2026-07-28 with a server that offers it, the 2025-era `initialize` otherwise. |
+| `'legacy'` | No probe — the plain 2025-11-25 handshake, as the v1 line does. |
+| `{ pin: '2026-07-28' }` | Exactly that revision; anything else fails loudly. Rejected on the v1 line, which cannot speak it. |
+
+What changes on a 2026-07-28 connection, and what Deuz does about it:
+
+- **Server→client requests are gone.** Elicitation, sampling and roots arrive as `input_required` results; the SDK fulfils them through the **same** `onElicitationRequest`, `sampling` and `roots` handlers and retries the call. Nothing to change on your side.
+- **`ping` is gone.** The `keepAliveMs` heartbeat and the [dead-session probe](#how-a-dead-http-session-is-detected) ask `server/discover` instead, so liveness checks keep working.
+- **`tools/list_changed` travels only on a `subscriptions/listen` stream.** The client opens it after connecting (when the server advertises `tools.listChanged`) and re-opens it every time it is cut (a gateway capping how long a response may stay open, a rolling restart), dropping the tool cache, since a change may have been lost meanwhile. Only a stream that keeps ending within seconds of opening is given up, once three quick re-opens have ended the same way: the error goes to the [dead-session probe](#how-a-dead-http-session-is-detected), and a session the probe keeps gets no further push invalidation until it reconnects.
+- **`notifications/roots/list_changed` is gone.** `setRoots()` sends nothing; the server reads the current roots on its next request.
+- **URL-mode elicitations carry no `elicitationId`** on 2026-07-28 (it is `''`); correlate on the server's own state.
+- **stdio:** `versionNegotiation: 'auto'` runs the probe on a short-lived **sibling process** spawned from the same command, so the server starts twice per connect. Pass `'legacy'` for a server with side effects at startup.
+
+Not exposed by Deuz (use the SDK directly if you need them): the v2 client's response cache controls and cached-discovery reuse (`prior`), resource subscriptions, `prompts`/`resources` list-change notifications, and the deprecated 2026-07-28 surfaces (logging and sampling `tool_use` content, SEP-2577). The 2026-07-28 behavior is verified offline against the SDK's own servers, in-process; it is not live-verified against third-party hosted servers.
 
 ---
 
@@ -126,7 +165,7 @@ A server that cannot be reached **rejects the whole call** rather than quietly r
 
 ### Hot refresh
 
-Every client — borrowed ones included — is subscribed to `tools/list_changed`. At the next step boundary the loop re-reads the catalogs and rebuilds the wire tool lists. A failed `tools/list` re-arms the dirty flag and keeps the previous catalog: one failed refresh must not end a healthy run.
+Every client — borrowed ones included — is subscribed to `tools/list_changed` (on an MCP 2026-07-28 connection, through the `subscriptions/listen` stream the client opens). At the next step boundary the loop re-reads the catalogs and rebuilds the wire tool lists. A failed `tools/list` re-arms the dirty flag and keeps the previous catalog: one failed refresh must not end a healthy run.
 
 Config-based connections default to `reconnect: true`, because an agentic run outlives a single request and a dropped session in the middle of step 4 would otherwise fail every remaining tool call. A client **you** built keeps whatever lifecycle you chose.
 
@@ -177,18 +216,22 @@ const client = await createMcpClient(options);
 | `transport.type` | `'http' \| 'sse'` | — | `http` = Streamable HTTP; `sse` = legacy fallback. |
 | `transport.url` | `string` | — | The server endpoint. |
 | `transport.headers` | `Record<string, string>` | — | Sent on every request. |
+| `transport.fetch` | `(input, init?) => Promise<Response>` | global `fetch` | 2.3. Every request goes through it — a proxy, a service binding, an in-process handler. |
+| `sdk` | `'auto' \| 'v1' \| 'v2'` | `'auto'` | 2.3. [Which SDK line](#sdk-lines-and-protocol-revisions-23) drives the client. |
+| `versionNegotiation` | `'auto' \| 'legacy' \| { pin }` | `'auto'` | 2.3, v2 line. How the protocol revision is negotiated. |
 | `name` / `version` | `string` | `'deuz'` / `'0.0.0'` | Advertised to the server in the handshake. |
 | `onElicitationRequest` | `McpElicitationHandler` | — | [Elicitation](#elicitation). Declares the capability. |
 | `auth` | `McpOAuthOptions \| DeuzOAuthProvider` | — | [OAuth 2.0](#oauth-20). |
 | `authorizationCode` | `string` | — | The `?code=` from the redirect — exchanged **before** connecting. Requires `auth`. |
+| `authorizationIss` | `string` | — | 2.3. The `?iss=` from the same redirect ([RFC 9207](#forward-the-redirects-iss-rfc-9207-23)), when it carries one. |
 | `sampling` | `McpSamplingOptions` | — | [Sampling](#sampling). Declares the capability. |
 | `roots` | `McpRootsOption` | — | [Roots](#roots). Declares the capability. |
 | `reconnect` | `boolean \| McpReconnectPolicy` | off | [Reconnect](#reconnect-status-and-keepalive). |
 | `onStatusChange` | `(status, info?) => void` | — | Observe every transition. A throwing callback is swallowed. |
-| `keepAliveMs` | `number` | off | Chained `ping()` heartbeat. A rejected ping counts as a drop. |
+| `keepAliveMs` | `number` | off | Chained `ping()` heartbeat (`server/discover` on 2026-07-28, which removed `ping`). A rejected probe counts as a drop. |
 | `clock` | `Clock` | host clock | Time source for backoff + keepalive (edge-safety: never ambient). |
 
-`createStdioMcpClient` (`@deuz-sdk/core/mcp/stdio`) takes the same lifecycle options plus `command` / `args` / `env`, and supports `onElicitationRequest`, `sampling` and `roots` identically. A reconnect **respawns the child process** — the old one died with the pipe.
+`createStdioMcpClient` (`@deuz-sdk/core/mcp/stdio`) takes the same lifecycle options plus `command` / `args` / `env`, and supports `onElicitationRequest`, `sampling`, `roots`, `sdk` and `versionNegotiation` identically. A reconnect **respawns the child process** — the old one died with the pipe.
 
 <Callout type="warn" title="Capabilities are declared at construction, so handlers register before connect">
 `onElicitationRequest`, `sampling` and `roots` each declare a client capability in the constructor and register their handler before `connect()`. Declaring a capability without a handler would lie to servers, so there is no way to attach one afterwards on a managed connection — a reconnect builds a **new** client, and only what the factory registers comes back with it.
@@ -208,6 +251,8 @@ interface McpClient {
   getPrompt(name: string, args?: Record<string, string>): Promise<McpGetPromptResult>;
   status(): McpConnectionStatus;
   serverInfo?(): { name: string; version?: string } | undefined;
+  protocolVersion?(): string | undefined;   // 2.3
+  sdk?(): 'v1' | 'v2' | undefined;          // 2.3
   onToolListChanged(cb: () => void): () => void;
   close(): Promise<void>;
 }
@@ -219,11 +264,13 @@ Both factories return `McpRootsClient` — the above plus `setRoots(roots: strin
 | --- | --- |
 | `listTools(namespace?)` | Maps the server's tools into canonical `Tool`s. Served from a cache that only invalidation clears. |
 | `callTool(name, args)` | Direct invocation. The loop never needs it — each mapped tool's `execute` calls it. |
-| `listResources()` / `listPrompts()` | Auto-paginated (cursor handled for you, capped at 100 pages against endless cursors). |
+| `listResources()` / `listPrompts()` | Auto-paginated (cursor handled for you, capped at 100 pages against endless cursors). `listTools()` walks every page the same way (2.3 — it used to read only the first). |
 | `readResource(uri)` | Contents array: entries carry `text` or base64 `blob` plus `mimeType`. |
 | `getPrompt(name, args?)` | Messages come back in **MCP's own shape**, not canonical `Message` — map them yourself. |
 | `status()` | `'connecting' \| 'connected' \| 'reconnecting' \| 'closed' \| 'error'`. Always `'connected'` for an unmanaged client. |
 | `serverInfo?()` | The handshake `Implementation` block. Read through the *current* session, so a reconnect onto a redeployed server reports the new name. Optional, so a hand-written client stays valid. |
+| `protocolVersion?()` | 2.3. The revision the handshake settled on — `'2026-07-28'` or a 2025-era one. Read through the current session, like `serverInfo`. |
+| `sdk?()` | 2.3. The SDK line behind the client — what `sdk: 'auto'` resolved to. |
 | `onToolListChanged(cb)` | Fires on `tools/list_changed` **or** a reconnect landing on a possibly-different server. Returns an unsubscribe. |
 | `close()` | Closes the connection / terminates the child process. Always call it when you own the client. |
 
@@ -303,11 +350,12 @@ Connecting is **two `createMcpClient` calls with a human in between**. Nothing i
    │  (a web app 302s to it · a CLI prints it · a desktop shell launches it)
    │  the library NEVER opens a browser
    ▼
-   the user consents; the authorization server redirects to your `redirectUri?code=…`
+   the user consents; the authorization server redirects to your
+   `redirectUri?code=…` (plus `&iss=…` from an RFC 9207 server)
 
-③ createMcpClient({ transport, auth, authorizationCode: code })
-   │  transport.finishAuth(code) exchanges it BEFORE connect, using the stored
-   │  verifier, and saves `tokens:<serverUrl>`
+③ createMcpClient({ transport, auth, authorizationCode: code, authorizationIss: iss })
+   │  transport.finishAuth(code, iss) exchanges it BEFORE connect, using the
+   │  stored verifier, and saves `tokens:<serverUrl>`
    └──────────────────────────────────────────────────────────────► connected ✓
 ```
 
@@ -327,10 +375,15 @@ try {
 
   // The SDK already ran discovery + registration, so the URL exists.
   redirect(err.authorizationUrl!);            // your host decides HOW
-  const authorizationCode = await waitForCallbackCode();
+  const query = await waitForRedirectQuery(); // URLSearchParams of the redirect
 
   // 2nd attempt — the code is exchanged BEFORE connecting.
-  client = await createMcpClient({ transport, auth, authorizationCode });
+  client = await createMcpClient({
+    transport,
+    auth,
+    authorizationCode: query.get('code')!,
+    authorizationIss: query.get('iss') ?? undefined, // RFC 9207, when sent
+  });
 }
 ```
 
@@ -342,6 +395,10 @@ Facts that decide whether your flow works:
 - **The PKCE verifier lives in your `TokenStore`.** Steps ① and ③ must therefore see the *same* store. `inMemoryTokenStore()` is fine within one process and cannot possibly work across two.
 - **Passing `auth` as plain options mints a fresh provider per call.** That is safe precisely because all the state is in the store — but it also means `provider.authorizationUrl()` is not something you can read back later; take the URL off the error.
 - **`onRedirect` does not replace the throw.** It is a notification, delivered the moment the SDK produces the URL. The connect still rejects with `McpAuthorizationRequiredError` (carrying the same URL string), so a `catch` is required either way.
+
+### Forward the redirect's `iss` (RFC 9207, 2.3)
+
+An authorization server that advertises `authorization_response_iss_parameter_supported` (Keycloak does, for one) redirects back with `?code=…&iss=…`, naming itself. The v2 SDK checks that `iss` against the issuer it discovered **before** it redeems the code — the defense against an authorization-server mix-up — and refuses the exchange (an `IssuerMismatchError`) when `iss` is missing or names another server. So whenever the redirect carries an `iss`, pass it on: `authorizationIss` next to `authorizationCode`, `completeAuth(code, iss)`, and `waitForCallback()` on [the loopback listener](#node-cli-a-loopback-redirect-and-a-file-store). The v1 SDK has no RFC 9207 check and ignores it, so passing it is always safe.
 
 ### Or: `completeAuth(code)`
 
@@ -359,8 +416,8 @@ const provider = createOAuthProvider({
 try {
   client = await createMcpClient({ transport, auth: provider });
 } catch (err) {
-  const code = await waitForCallbackCode();
-  await provider.completeAuth(code);      // exchange + persist
+  const query = await waitForRedirectQuery(); // URLSearchParams of the redirect
+  await provider.completeAuth(query.get('code')!, query.get('iss') ?? undefined); // exchange + persist
   client = await createMcpClient({ transport, auth: provider });
 }
 ```
@@ -371,13 +428,15 @@ One provider can serve **many** servers: every stored key is namespaced by serve
 interface DeuzOAuthProvider {
   readonly provider: unknown;              // the SDK-side OAuthClientProvider — pass it through, do not inspect it
   authorizationUrl(): URL | undefined;
-  completeAuth(code: string): Promise<void>;
+  completeAuth(code: string, iss?: string): Promise<void>; // iss: the redirect's RFC 9207 ?iss= (2.3)
   tokens(): Promise<Record<string, unknown> | undefined>;
   invalidate(): Promise<void>;             // drop tokens → next connect re-authorizes
 }
 ```
 
 `completeAuth` needs to know *which* server it is finishing an exchange for. `createMcpClient` binds that for you on the first attempt (and persists it as `server-url`); a provider that has never been handed to a client rejects with an actionable error instead of guessing.
+
+It also runs the exchange on the **SDK line** of the client that bound it (2.3), so a provider handed to an `sdk: 'v1'` client keeps the 2.2 exchange. A fresh provider that only found `server-url` in the store — a second process, a callback route — uses the v2 SDK when it is installed, so forward the redirect's `iss` there.
 
 `invalidate()` drops the tokens and the verifier but deliberately **keeps the dynamic client registration** — it is not a credential the server rejected, and re-registering on every expiry would litter the authorization server with dead clients.
 
@@ -448,8 +507,8 @@ try {
   if (loopback.state) authorize.searchParams.set('state', loopback.state);
 
   console.log('Open this URL to authorize:\n' + authorize.toString());
-  const authorizationCode = await loopback.waitForCode();
-  client = await createMcpClient({ transport, auth, authorizationCode });
+  const { code, iss } = await loopback.waitForCallback();   // iss: RFC 9207, when sent
+  client = await createMcpClient({ transport, auth, authorizationCode: code, authorizationIss: iss });
 } finally {
   await loopback.close();
 }
@@ -461,7 +520,7 @@ try {
 Hand it a value you already minted with `state: '…'`, or turn the check off with `state: false` **only** when the authorization request genuinely cannot carry `state`.
 </Callout>
 
-`createLoopbackRedirect({ port?, path?, timeoutMs?, state? })` is a **single-shot** listener bound to `127.0.0.1` — not `localhost` (which can resolve to `::1` first, leaving an IPv4 redirect with nothing listening) and never `0.0.0.0` (a wildcard would take an authorization code off the LAN). The timeout defaults to **5 minutes**, measured from **creation** rather than from `waitForCode()`, because the redirect URI is live the moment it resolves. `close()` is idempotent and safe in a `finally`; a bind failure on an explicit `port` rejects instead of hanging.
+`createLoopbackRedirect({ port?, path?, timeoutMs?, state? })` is a **single-shot** listener bound to `127.0.0.1` — not `localhost` (which can resolve to `::1` first, leaving an IPv4 redirect with nothing listening) and never `0.0.0.0` (a wildcard would take an authorization code off the LAN). `waitForCallback()` (2.3) resolves with `{ code, iss? }`, the redirect's `iss` included when it carries one; `waitForCode()` resolves with the code alone. The timeout defaults to **5 minutes**, measured from **creation** rather than from the wait, because the redirect URI is live the moment it resolves. `close()` is idempotent and safe in a `finally`; a bind failure on an explicit `port` rejects instead of hanging.
 
 `createFileTokenStore` writes one JSON file, created `0600`, through a temp file and a rename — a crash mid-write can never tear the existing tokens. Every operation is chained onto the previous one, because `set` is a read-modify-write and the SDK's token save and verifier save race routinely. A file that is missing, unreadable or invalid JSON reads as **empty** rather than throwing: re-authorizing is recoverable, crashing a run on a half-written file is not.
 
@@ -505,12 +564,15 @@ export async function chat(req: Request, env: Env, userId: string) {
   }
 }
 
-// GET /oauth/callback?code=… — step ③, in a completely different request.
+// GET /oauth/callback?code=…[&iss=…] — step ③, in a completely different request.
 export async function callback(req: Request, env: Env, userId: string) {
-  const code = new URL(req.url).searchParams.get('code')!;
+  const params = new URL(req.url).searchParams;
   // The KV already holds this user's `code-verifier:` and `server-url`, so a
   // fresh provider can finish the exchange without reconnecting to anything.
-  await createOAuthProvider(authOptions(env, userId)).completeAuth(code);
+  await createOAuthProvider(authOptions(env, userId)).completeAuth(
+    params.get('code')!,
+    params.get('iss') ?? undefined, // RFC 9207: required by the v2 SDK when the AS sends it
+  );
   return Response.redirect(`${env.APP_URL}/chat`, 302);
 }
 ```
@@ -615,6 +677,8 @@ interface McpSamplingRequest {
 }
 ```
 
+`execution` (2.3): pass the run's execution context and a sampling request takes the dispatch contract's path. The policy decides first (`allowedModels`, deadline), then `approve`, and the call is reserved on the context's ledger. `deps` supplies its clock, priceProvider and transport. See [native MCP](/docs/modules/native-mcp#sampling-requests).
+
 <Callout type="warn" title="Sampling drives your model and spends your money">
 Configuring `sampling` hands a remote server the ability to run inference on your key, with your credits, inside your rate limits — and the prompt is written entirely by that server. `approve` and the `maxTokens` ceiling exist for exactly that reason: they are the only two things standing between a compromised or greedy server and your bill. A server you do not fully control should have both.
 
@@ -624,7 +688,7 @@ The blast radius is bounded but not zero: the sample runs as a plain single-turn
 Facts worth pinning:
 
 - **The capability is declared only when you configure `sampling`.** A server cannot ask a client that never advertised it.
-- **`approve` is the HITL gate and it runs first**, so a refused request never reaches the provider. Returning `false` — or throwing — refuses it; the SDK turns either into a JSON-RPC error back to the server, so a refusal costs nothing and is visible upstream. A throw propagates verbatim, because its message is more useful to the server than one we would invent.
+- **`approve` is the HITL gate and it runs first** (after the execution policy, when you pass `execution`), so a refused request never reaches the provider. Returning `false` — or throwing — refuses it; the SDK turns either into a JSON-RPC error back to the server, so a refusal costs nothing and is visible upstream. A throw propagates verbatim, because its message is more useful to the server than one we would invent.
 - **The request is reviewed in canonical shape.** An approval gate that had to re-parse the MCP wire shape would be one more place to get the mapping wrong.
 - **Your model always wins.** `modelPreferences` is forwarded into the request object for your `approve` to read; it never selects a model.
 - **`maxTokens` is a clamp, never a raise.** A server that omits it gets a 1024-token default — never sample unbounded.
@@ -656,6 +720,7 @@ Notes:
 - A **function** form is re-read on every `roots/list` request, so a dynamic list needs no re-registration. Its entries are validated at read time (the array form is validated at construction, so a bad literal rejects `createMcpClient()` outright).
 - `setRoots()` throws when the client was created **without** a `roots` option: the capability is declared at construction, and announcing a change to something never advertised would lie to the server. It validates before swapping, so a refused call leaves the server's view untouched.
 - With a managed connection, `setRoots` notifies the **current** session, so it survives a reconnect.
+- On an MCP 2026-07-28 connection there is no `roots/list_changed` notification: `setRoots` swaps the list and the server reads it on its next request.
 - Roots are a **declaration, not a sandbox.** The server decides what to do with them; nothing here confines a server that ignores the list.
 
 ## Elicitation
@@ -682,7 +747,7 @@ const mcp = await createMcpClient({
 
 Return `{ action: 'accept', content? }`, `{ action: 'decline' }`, or `{ action: 'cancel' }`. Form-mode `content` must match `requestedSchema`. URL mode exists for sensitive flows (OAuth, payment, API keys) that must not pass through the client — treat the URL as untrusted, display the full host, and let the user decide.
 
-Requests without a `mode` are form mode (spec back-compat). The lower-level `registerElicitation(client, handler)` is exported for attaching a handler to an already-connected raw MCP client; it throws on a peer older than `^1.29.0`.
+Requests without a `mode` are form mode (spec back-compat). On an MCP 2026-07-28 connection the same handler answers the server's `input_required` elicitations, and a URL-mode request carries no `elicitationId` (it is `''`). The lower-level `registerElicitation(client, handler)` is exported for a raw v1 MCP `Client` you build yourself. It must run **before** `connect()`, on a client whose constructor declares the capability (`capabilities: { elicitation: { form: {}, url: {} } }`), as `createMcpClient` does for every connection and reconnect; it cannot add elicitation to a client that is already connected. It throws on a peer older than `^1.29.0`.
 
 ---
 
@@ -758,13 +823,16 @@ If the server returns an error result, `callTool` throws — mirroring `execute`
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `InvalidRequestError: MCP support needs the optional peer …` | `@modelcontextprotocol/sdk` is not installed. It is a *peer*, never bundled. | `npm i @modelcontextprotocol/sdk` |
+| `InvalidRequestError: MCP support needs an MCP SDK …` | Neither SDK is installed. They are *peers*, never bundled. | `npm i @modelcontextprotocol/client` (2026-07-28) or `npm i @modelcontextprotocol/sdk` (2025-11-25). |
+| `Pinning MCP revision … needs the v2 SDK line` | `versionNegotiation: { pin }` on the v1 line, which speaks 2025-era revisions only. | Install `@modelcontextprotocol/client` and use `sdk: 'auto'` or `'v2'`. |
+| A stdio server starts twice per connect | The v2 line's `'auto'` negotiation probes on a sibling process. | `versionNegotiation: 'legacy'` for a server with side effects at startup. |
 | An edge/browser build fails resolving `node:child_process` | Something imported `@deuz-sdk/core/mcp/stdio` or `/mcp/node`. Both are Node-only by construction. | Use `{ url }` entries on edge; keep stdio behind a Node route. |
 | Tools silently renamed after adding a second server | Namespace rule 2 ("a single entry gets no prefix") stopped applying. | Set an explicit `namespace` per entry. |
 | `mcp: duplicate tool name '…'` in the log | Two servers export the same final name; the later entry won. | Give at least one of them a `namespace`. |
 | The pool opens a connection per request | The config's `auth` / `onElicitationRequest` is a fresh object each call, so the key falls back to identity. | Hoist the provider/handler to module scope (per **user**, not per request). Pass `createMcpPool({ logger })` to hear it once. |
 | A CLI OAuth redirect shows *"Authorization rejected"* | The authorization URL did not carry `loopback.state`. | Forward it — see [the Node CLI recipe](/docs/modules/mcp#node-cli-a-loopback-redirect-and-a-file-store). |
 | `No PKCE code verifier is stored …` | Steps ① and ③ used different stores, or an in-memory store across two processes. | Use one persistent `TokenStore` for the whole flow. |
+| `IssuerMismatchError: … (RFC 9207): expected "…", received undefined` | The authorization server sends `iss` on the redirect, and the v2 SDK will not redeem the code without it. | Forward it — [`authorizationIss`, `completeAuth(code, iss)` or `waitForCallback()`](#forward-the-redirects-iss-rfc-9207-23). |
 | A stdio server keeps running after the request | The client was built by hand and never closed. | `await client.close()` in a `finally` — or hand a `{ command }` config to `mcp` and let the run own it. |
 | `generateObject` throws about ignored loop options | `mcp` (and `guardrails`) are refused there by design. | Use `generateText` / `streamChat`, or drop the option. |
 | A tool call fails mid-run with a closed session | A pooled entry was evicted by `maxSize` while the run still held it. | Raise `maxSize` above the number of distinct servers in flight. |
@@ -776,6 +844,7 @@ Two more that produce no error at all:
 
 ## See also
 
+- [MCP server](/docs/modules/mcp-server) — publish your own tools and agents over MCP.
 - [generateText](/docs/core/generate-text) · [streamChat](/docs/core/stream-chat) — the loops these tools plug into.
 - [Tool loop](/docs/agents/tool-loop) — parallel execution, self-healing, and the runaway guard.
 - [Dependencies](/docs/core/dependencies) — `deps.mcpPool` and the injection seam.

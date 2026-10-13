@@ -21,6 +21,39 @@ export function incompressibleKey(seed: number, length = 8000): string {
   return key;
 }
 
+/** A durable claim that also drops old keys (2.3): the ops stores' `claims`. */
+export interface PrunableClaim extends ReleasableClaim {
+  prune(before: number): Promise<number>;
+}
+
+/**
+ * Claim retention (2.3), shared by the SQLite and Postgres ops stores:
+ * `prune` deletes the keys granted before a time, which can then be claimed
+ * again. `advance` moves the store's time forward and `now` reads it.
+ */
+export function scheduleClaimPruneContracts(
+  name: string,
+  make: () => Promise<{ claim: PrunableClaim; advance(ms: number): Promise<void>; now(): number }>,
+): void {
+  describe(name, () => {
+    it('prunes the keys granted before a time, and only those', async () => {
+      const { claim, advance, now } = await make();
+      const old = ['nightly@1', 'nightly@2', 'delivery\u0000a', incompressibleKey(3)];
+      for (const key of old) expect(await claim(key)).toBe(true);
+      await advance(50);
+      const cut = now();
+      await advance(50);
+      expect(await claim('nightly@3')).toBe(true);
+      expect(await claim.prune(cut)).toBe(4);
+      // A pruned key can be claimed again; a newer one is still taken.
+      for (const key of old) expect(await claim(key)).toBe(true);
+      expect(await claim('nightly@3')).toBe(false);
+      expect(await claim.prune(cut)).toBe(0);
+      await expect(claim.prune(Number.NaN)).rejects.toThrow(TypeError);
+    });
+  });
+}
+
 /**
  * The schedule claim contract (2.2), shared by the in-memory claim and the
  * SQLite and Postgres ops stores: a key is granted once, to exactly one of any

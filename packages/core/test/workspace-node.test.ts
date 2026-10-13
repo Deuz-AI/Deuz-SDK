@@ -19,10 +19,11 @@
  * rather than a silent pass.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, stat, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createFileWorkspace } from '../src/node/workspace';
+import { createInMemoryWorkspace } from '../src/workspace';
 import type { Workspace } from '../src/types/workspace';
 
 const SECRET = 'TOP SECRET';
@@ -158,15 +159,29 @@ describe('createFileWorkspace — sandbox escape guard', () => {
     expect(await outsideFiles()).toEqual(['secret.txt']);
   });
 
-  it('exists() and delete() fail CLOSED on a hostile path (false / no-op, no throw)', async () => {
-    // Both call resolveInside INSIDE their try/catch, so the guard error is
-    // swallowed. That is safe — nothing outside the root is ever stat'ed or
-    // unlinked — but callers must not rely on a throw here.
-    expect(await ws.exists(join(outside, 'secret.txt'))).toBe(false);
-    expect(await ws.exists('../x')).toBe(false);
-    await ws.delete('../../etc/passwd');
-    await ws.delete(join(outside, 'secret.txt'));
+  it('exists() and delete() refuse a hostile path the way read() and write() do', async () => {
+    // Until 2.3 both swallowed the guard's error: exists() said `false` and
+    // delete() "succeeded" while nothing happened, unlike every other method and
+    // unlike createInMemoryWorkspace. Still fail-closed: nothing outside the root
+    // is stat'ed or unlinked.
+    await expect(ws.exists('../x')).rejects.toMatchObject({ name: 'InvalidRequestError' });
+    await expect(ws.exists(join(outside, 'secret.txt'))).rejects.toThrow(
+      /escapes the sandbox root|Illegal workspace path/,
+    );
+    await expect(ws.delete('../../etc/passwd')).rejects.toMatchObject({
+      name: 'InvalidRequestError',
+    });
+    await expect(ws.delete(join(outside, 'secret.txt'))).rejects.toThrow(
+      /escapes the sandbox root|Illegal workspace path/,
+    );
     expect(await readFile(join(outside, 'secret.txt'), 'utf-8')).toBe(SECRET);
+  });
+
+  it('list() refuses a hostile prefix even when the workspace is empty', async () => {
+    // The prefix used to be checked per entry, so an empty root never checked it.
+    await expect(ws.list('../')).rejects.toMatchObject({ name: 'InvalidRequestError' });
+    await ws.write('inside.txt', 'x');
+    await expect(ws.list('../')).rejects.toMatchObject({ name: 'InvalidRequestError' });
   });
 
   it('list() never reports anything outside the root', async () => {
@@ -192,11 +207,11 @@ describe('createFileWorkspace — sandbox escape guard', () => {
  */
 const linkKinds = isWin ? (['dir', 'junction'] as const) : (['dir'] as const);
 
-/** Plant a link at <root>/escape → <outside>. Returns the kind that worked. */
-async function plantLink(): Promise<'dir' | 'junction' | undefined> {
+/** Plant a link at <root>/escape → `target` (default <outside>). Returns the kind that worked. */
+async function plantLink(target = outside): Promise<'dir' | 'junction' | undefined> {
   for (const kind of linkKinds) {
     try {
-      await symlink(outside, join(root, 'escape'), kind);
+      await symlink(target, join(root, 'escape'), kind);
       return kind;
     } catch {
       /* EPERM without Developer Mode / admin — try the next kind */
@@ -221,6 +236,36 @@ describe('createFileWorkspace — symlink / junction escape (FIXED, layer 3)', (
     const kind = await plantLink();
     if (!kind) throw new Error('SKIPPED: this platform refuses to create a link unprivileged.');
     await expect(ws.read('escape/secret.txt')).rejects.toThrow(/escapes the sandbox root/);
+  });
+
+  it('exists() and delete() through such a link reject too, and touch nothing outside', async () => {
+    const kind = await plantLink();
+    if (!kind) throw new Error('SKIPPED: this platform refuses to create a link unprivileged.');
+    await expect(ws.exists('escape/secret.txt')).rejects.toThrow(/escapes the sandbox root/);
+    await expect(ws.delete('escape/secret.txt')).rejects.toThrow(/escapes the sandbox root/);
+    expect(await readFile(join(outside, 'secret.txt'), 'utf-8')).toBe(SECRET);
+  });
+
+  it('refuses to write through a DANGLING link, one whose target does not exist yet', async () => {
+    // realpath() cannot resolve such a link, so the check took it for a path that
+    // "does not exist yet" and the write FOLLOWED it to the far side: open() with
+    // O_CREAT creates the missing target FILE outside the root on POSIX, and on
+    // Windows writing through a dangling junction created the target DIRECTORY
+    // outside (needs no privilege). Nothing outside the root may be created.
+    const kind = await plantLink(join(outside, 'planted'));
+    if (!kind) throw new Error('SKIPPED: this platform refuses to create a link unprivileged.');
+    await expect(ws.write('escape', MARKER)).rejects.toThrow(/link that does not resolve/);
+    await expect(ws.writeBytes!('escape', new Uint8Array([1]))).rejects.toThrow(
+      /link that does not resolve/,
+    );
+    await expect(ws.write('escape/pwned.txt', MARKER)).rejects.toThrow(
+      /link that does not resolve/,
+    );
+    expect(await outsideFiles()).toEqual(['secret.txt']);
+    // Reading through it creates nothing and simply finds nothing there.
+    await expect(ws.read('escape')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await ws.exists('escape')).toBe(false);
+    expect(await outsideFiles()).toEqual(['secret.txt']);
   });
 });
 
@@ -329,5 +374,139 @@ describe('createFileWorkspace — happy path', () => {
     await ws.write('shared.txt', 'persisted');
     const second = createFileWorkspace({ root });
     expect(await second.read('shared.txt')).toBe('persisted');
+  });
+});
+
+/**
+ * F11 (2.3): the backend's own checks (layer 2 on the lexical path, layer 3 on
+ * the real path) tested `startsWith('..')`, so a NAME that merely begins with
+ * two dots read as a parent traversal: `..notes`, `...` and `..notes/x.txt` were
+ * refused although layer 1 accepts them. Fixing layer 2 alone let `write`
+ * through and then failed `read` with a misleading "(via a link)". Both now look
+ * for a real `..` segment: two dots followed by a separator or the end.
+ */
+describe('createFileWorkspace — names that start with ".." are not traversal (F11)', () => {
+  it.each([
+    ['..notes', '..notes'],
+    ['..notes/x.txt', '..notes/x.txt'],
+    ['...', '...'],
+    ['./..notes', '..notes'],
+    ['a/..b.txt', 'a/..b.txt'],
+    ['..a/..b/..c.txt', '..a/..b/..c.txt'],
+  ])('%j works with every method and stays under the root', async (rel, stored) => {
+    await ws.write(rel, 'hello');
+    expect(await readFile(join(root, ...stored.split('/')), 'utf-8')).toBe('hello');
+    expect(await ws.read(rel)).toBe('hello');
+    expect(new TextDecoder().decode(await ws.readBytes!(rel))).toBe('hello');
+    expect(await ws.exists(rel)).toBe(true);
+    expect((await ws.list()).map((e) => e.path)).toEqual([stored]);
+    expect((await ws.list(stored)).map((e) => e.path)).toEqual([stored]);
+    await ws.delete(rel);
+    expect(await ws.exists(rel)).toBe(false);
+    expect(await outsideFiles()).toEqual(['secret.txt']);
+  });
+
+  it('a "..name" file put there by another process is read, found and REALLY deleted', async () => {
+    // 2.2: list() showed the file, read() refused it, exists() said false and
+    // delete() reported success while the file stayed on disk.
+    await mkdir(join(root, '..notes2'), { recursive: true });
+    await writeFile(join(root, '..notes2', 'x.txt'), 'made on disk');
+    await writeFile(join(root, '...2'), 'made on disk');
+    expect((await ws.list()).map((e) => e.path)).toEqual(['...2', '..notes2/x.txt']);
+    for (const rel of ['..notes2/x.txt', '...2']) {
+      expect(await ws.read(rel)).toBe('made on disk');
+      expect(await ws.exists(rel)).toBe(true);
+      await ws.delete(rel);
+      await expect(stat(join(root, ...rel.split('/')))).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+    expect(await ws.list()).toEqual([]);
+  });
+
+  it.each(['..', '../x', '..\\x', './..', 'a/..', 'a/../../x', 'a\\..\\..\\x', '../..notes'])(
+    'a real ".." segment is still refused by every method (%j)',
+    async (bad) => {
+      await expect(ws.read(bad)).rejects.toMatchObject({ name: 'InvalidRequestError' });
+      await expect(ws.write(bad, MARKER)).rejects.toMatchObject({ name: 'InvalidRequestError' });
+      await expect(ws.exists(bad)).rejects.toMatchObject({ name: 'InvalidRequestError' });
+      await expect(ws.delete(bad)).rejects.toMatchObject({ name: 'InvalidRequestError' });
+      expect(await outsideFiles()).toEqual(['secret.txt']);
+    },
+  );
+
+  it.each(['.. /x.txt', '..  /x.txt', '... /x.txt', '.. ', '..notes /x.txt'])(
+    'a ".." look-alike Windows path normalization could trim (%j) never lands outside',
+    async (rel) => {
+      // Win32 normalization trims trailing dots and spaces from a segment. The
+      // backend no longer refuses every name that starts with '..', so pin the
+      // invariant itself: refused, or written under the root — never outside.
+      await writeAndAssertContained(rel);
+    },
+  );
+});
+
+/**
+ * One error contract for every backend (2.3): an illegal path rejects from EVERY
+ * method, exists() and delete() included, and only a missing path is soft
+ * (exists → false, delete → no-op). createInMemoryWorkspace always behaved this
+ * way; createFileWorkspace used to swallow every error in exists() and delete().
+ */
+describe.each([
+  ['createInMemoryWorkspace', (): Workspace => createInMemoryWorkspace()],
+  ['createFileWorkspace', (): Workspace => ws],
+])('%s — the shared error contract', (_name, make) => {
+  it.each(['../x', 'a/../../x', '/abs', 'C:/x', 'a\0b', ''])(
+    'an illegal path (%j) rejects from every method',
+    async (bad) => {
+      const w = make();
+      await expect(w.read(bad)).rejects.toMatchObject({ name: 'InvalidRequestError' });
+      await expect(w.write(bad, MARKER)).rejects.toMatchObject({ name: 'InvalidRequestError' });
+      await expect(w.exists(bad)).rejects.toMatchObject({ name: 'InvalidRequestError' });
+      await expect(w.delete(bad)).rejects.toMatchObject({ name: 'InvalidRequestError' });
+      if (bad !== '') {
+        await expect(w.list(bad)).rejects.toMatchObject({ name: 'InvalidRequestError' });
+      }
+    },
+  );
+
+  it('a missing path: exists() is false, delete() is a no-op, read() rejects', async () => {
+    const w = make();
+    expect(await w.exists('nope.txt')).toBe(false);
+    await expect(w.delete('nope.txt')).resolves.toBeUndefined();
+    await expect(w.delete('nope/deeper.txt')).resolves.toBeUndefined();
+    await expect(w.read('nope.txt')).rejects.toThrow();
+  });
+});
+
+describe('createFileWorkspace — exists() and delete() do not hide a filesystem failure', () => {
+  it('deleting a directory rejects and leaves the directory alone', async () => {
+    // EISDIR on Linux, EPERM on Windows and macOS. It used to resolve.
+    await ws.write('dir/a.txt', 'x');
+    await expect(ws.delete('dir')).rejects.toThrow();
+    expect(await ws.read('dir/a.txt')).toBe('x');
+  });
+
+  it('exists() surfaces an I/O error (a link that points at itself) instead of answering false', async () => {
+    // ELOOP for stat and read alike: only a missing path is "false".
+    const loop = join(root, 'loop');
+    let made = false;
+    for (const kind of linkKinds) {
+      try {
+        await symlink(loop, loop, kind);
+        made = true;
+        break;
+      } catch {
+        /* EPERM without Developer Mode / admin — try the next kind */
+      }
+    }
+    if (!made) throw new Error('SKIPPED: this platform refuses to create a link unprivileged.');
+    await expect(ws.read('loop')).rejects.toMatchObject({ code: 'ELOOP' });
+    await expect(ws.exists('loop')).rejects.toMatchObject({ code: 'ELOOP' });
+  });
+
+  it('a path below a FILE is just missing (ENOTDIR is not an error)', async () => {
+    await ws.write('a.txt', 'x');
+    expect(await ws.exists('a.txt/b')).toBe(false);
+    await ws.delete('a.txt/b');
+    expect(await ws.read('a.txt')).toBe('x');
   });
 });

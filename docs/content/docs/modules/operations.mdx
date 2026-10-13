@@ -1,6 +1,6 @@
 ---
 title: Operations
-description: Leases, drain, recovery and cross-process cancellation for durable swarms, with SQLite and Postgres backends and fenced native agent runs.
+description: Leases, drain, recovery and cross-process cancellation for durable swarms, with SQLite, Postgres and Redis backends, fenced native agent runs, retention and schema versions.
 ---
 
 A durable swarm or native agent run can outlive the process that started it.
@@ -20,10 +20,12 @@ Two mechanisms keep this safe:
 
 | Entry | Contents | Runtime |
 | --- | --- | --- |
-| `@deuz-sdk/core/ops` | `createInMemoryLeaseProvider`, lease types | Edge-safe |
+| `@deuz-sdk/core/ops` | `createInMemoryLeaseProvider`, lease types, `findStaleAgentRuns`, `agentRunLeaseKey` | Edge-safe |
 | `@deuz-sdk/core/ops/sqlite` | `createSqliteOpsStore`: leases, agent runs and schedule claims | Node |
 | `@deuz-sdk/core/ops/postgres` | `createPostgresOpsStore`: leases, agent runs and schedule claims | Node |
 | `@deuz-sdk/core/swarm/postgres` | `createPostgresSwarmStore` | Node |
+| `@deuz-sdk/core/ops/redis` | `createRedisOpsStore`: leases, agent runs and schedule claims; `createRedisBudgetStore` (2.3) | Node |
+| `@deuz-sdk/core/swarm/redis` | `createRedisSwarmStore` (2.3) | Node |
 
 ## Leases
 
@@ -37,6 +39,15 @@ holds the key and reports whether anyone did.
 A queued `'cancel'` concerns the run, not the holder: it stays queued when the
 key changes hands or is released, until some holder's renewal delivers it. A
 queued `'drain'` concerns the current holder and is dropped with its lease.
+
+Since 2.3 a holder can ask for acknowledged delivery:
+`renew(lease, ttlMs, { acknowledge: true })` keeps a delivered `'cancel'`
+queued, reports it on every later renewal and hands it to the next holder,
+until the holder records it durably and calls `ack(lease, 'cancel')`. The
+renewal reports what stays queued in `queued`. `ack` is fenced by the lease: it
+returns `false` and removes nothing once the key changed hands. The memory,
+SQLite, Postgres and Redis providers support both; a provider without `ack`
+ignores the option and removes every signal it delivers, as in 2.2.
 
 ```ts
 import { createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
@@ -53,7 +64,7 @@ await leases.release(lease!);
 ```
 
 The in-memory provider suits tests and single-process deployments; its leases
-die with the process. Use the SQLite or Postgres provider when several
+die with the process. Use the SQLite, Postgres or Redis provider when several
 processes share runs.
 
 ## Swarm leases
@@ -142,11 +153,21 @@ A signalled cancel is not lost when its holder stops first. If the holder
 crashes before reading it, or the cancel arrives just after the holder's last
 check and the run settles `'suspended'`, the `'cancel'` stays queued under the
 run's key, and the next executor to claim the run cancels it before
-dispatching anything. A holder that reads the cancel but fails before recording
-it, for example because that commit hits a store error, queues it again before
-it lets the lease go; only a process that dies between reading and recording it
-loses it. A run that completed or became partial before the cancel reached it
-keeps its status.
+dispatching anything.
+
+Since 2.3 it is not lost after the holder reads it either. With a provider that
+has `ack`, as the memory, SQLite, Postgres and Redis providers do, the executor renews
+with acknowledged delivery: the cancel stays queued until the commit that
+records it, or until the run's end makes it moot, and only then is it
+acknowledged. A holder that reads the cancel and dies, or whose cancel commit
+fails, leaves it for the next executor, even if its lease lapsed meanwhile.
+With a provider without `ack`, the 2.2 behaviour applies: the holder queues a
+cancel it failed to record again before it lets the lease go, which needs it to
+still hold the key, and a process that dies between reading and recording the
+cancel loses it.
+
+A run that completed or became partial before the cancel reached it keeps its
+status.
 
 Without a lease provider, a request against a run that another process drives
 is recorded, and that executor's next commit then fails its revision check.
@@ -166,7 +187,7 @@ throws on an acquire, `recover` stops at once; after three failures in a row of
 any other kind, such as a store that went down after the listing, it stops too.
 Either way it returns the executors it already started, and `failed` ends with
 the run that stopped it. `recover` needs the `lease` option and a store with the
-`'list'` capability; the memory, SQLite and Postgres stores have it.
+`'list'` capability; the memory, SQLite, Postgres and Redis stores have it.
 
 Heartbeats do not write to the swarm store, so a healthy run can keep an old
 `updatedAt` and sort ahead of a crashed one. `recover` therefore pages through
@@ -230,6 +251,69 @@ async function runningRuns(store: SwarmStore): Promise<SwarmRunRecord[]> {
 console.log((await runningRuns(createInMemorySwarmStore())).length); // 0
 ```
 
+## Retention
+
+The ops and swarm stores keep their rows until you prune them (2.3). Each
+prune deletes only rows that nothing can still need and returns how many it
+deleted; call them from a periodic job. Times are epoch milliseconds on the
+store's clock: the injected `clock` for the memory and SQLite stores, the
+database clock for Postgres, the server's `TIME` for Redis. Budget stores have
+their own [`prune`](/docs/modules/budgets#retention).
+
+| Call | Deletes | Keeps |
+| --- | --- | --- |
+| `leases.prune(before)` | Keys nobody holds: released, or expired before `before` | Held keys, and keys that queue a `'cancel'` for their run's next executor |
+| `agentRuns.prune(before)` | Terminal native runs (completed, stopped or failed) last saved before `before` | Running, finalizing and suspended runs |
+| `claims.prune(before)` | Claim keys granted before `before` | Newer keys |
+| `prune({ before, scope?, limit? })` on a swarm store | Up to `limit` (1 to 1000, default 100) completed, partial or cancelled runs whose `updatedAt` is before `before`, oldest first, with their tasks, events and blackboard notes | Running and suspended runs |
+
+`leases.prune` is part of `LeaseProvider` (optional, like `ack`), and
+`prune` of `SwarmStore`; the memory, SQLite, Postgres and Redis implementations
+have both. `agentRuns.prune` and `claims.prune` belong to the SQLite, Postgres
+and Redis ops stores.
+
+What a prune deletes is gone:
+
+- The next holder of a pruned lease key starts again at token 1, and a holder
+  whose lease expired before `before` finds it lost when it renews. Choose
+  `before` well past any pause an executor could survive. A lease that has not
+  expired yet is never pruned: a `before` later than the store's clock, such as
+  a host clock running ahead of the database, is cut back to the store's time.
+- A pruned agent run can no longer be resumed or inspected, and its run ID is
+  free again.
+- A pruned claim key can be claimed again. Keep every key that an occurrence or
+  a delivery may still repeat: the scheduler's `lookbackMs` and catch-up
+  window, and your webhook provider's retry period.
+- A pruned swarm run can no longer be resumed, read or replayed, and its key is
+  free again.
+
+```ts
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+import { createSqliteSwarmStore } from '@deuz-sdk/core/swarm/sqlite';
+
+const day = 86_400_000;
+const ops = createSqliteOpsStore({ path: './runs.sqlite' });
+const swarms = createSqliteSwarmStore({ path: './runs.sqlite' });
+
+try {
+  const now = Date.now();
+  const leases = await ops.leases.prune(now - day);
+  const agentRuns = await ops.agentRuns.prune(now - 30 * day);
+  const claims = await ops.claims.prune(now - 7 * day);
+  // A swarm prune deletes a page of runs per call: repeat while a page is full.
+  let swarmRuns = 0;
+  for (;;) {
+    const page = await swarms.prune({ before: now - 30 * day, limit: 100 });
+    swarmRuns += page;
+    if (page < 100) break;
+  }
+  console.log({ leases, agentRuns, claims, swarmRuns });
+} finally {
+  await swarms.close();
+  await ops.close();
+}
+```
+
 ## SQLite ops store
 
 `createSqliteOpsStore({ path, database?, wal?, clock? })` returns `leases`,
@@ -277,16 +361,202 @@ moved the run first, nothing is written and the commit rejects with
 `SwarmConflictError`. Postgres leases use the database clock, so host clock skew
 does not matter.
 
-The stores expect `READ COMMITTED`, Postgres's default. Under a
-`REPEATABLE READ` or `SERIALIZABLE` session default, table creation and claims
-run their statement again after a serialization failure (40001), but another
-contended write, such as a lease acquire, an agent run save or a swarm commit,
-can reject with it.
+The stores are built for `READ COMMITTED`, Postgres's default, and also run
+under a `REPEATABLE READ` or `SERIALIZABLE` session default. There a contended
+write can fail with a serialization failure (40001), and any write can be
+chosen as a deadlock victim (40P01). Postgres rolls such a statement back
+whole, so since 2.3 every store sends it again, up to five attempts in all:
+
+| Store | Writes that run again |
+| --- | --- |
+| Ops (`createPostgresOpsStore`) | Lease acquire, renew, release, signal and ack; agent run saves; claims and their release; every prune |
+| Swarm (`createPostgresSwarmStore`) | Run creation, commits and prune |
+| Budget (`createPostgresBudgetStore`) | Reserve, settle, release and prune |
+| Store pack (`createPostgresStores`) | Memory, chat, session and run upserts, updates and deletes |
+
+Table creation runs again on the same codes. When the attempts run out, a swarm
+create or commit rejects with `SwarmConflictError`, whose `cause` is the driver
+error, so `resume`, `recover` and `requestCancel` treat it like any other
+conflict. Every other write rejects with the driver error, whose `code` is
+`'40001'` or `'40P01'`; a budget admission reports it as `admission_failed`.
+Each write's checks run inside its statement, so running it again cannot
+double-apply it: a retried agent run save whose revision moved on is rejected as
+a revision conflict, for example. Concurrency under `REPEATABLE READ` is
+covered by tests that inject these failures, and by a suite that runs the
+stores' contracts and races of concurrent writers on a real Postgres, through a
+pool of several connections that all default to `REPEATABLE READ`. That suite
+runs when `DEUZ_TEST_POSTGRES_URL` names a database, as in the repository's CI.
+
+## Redis
+
+`createRedisOpsStore({ client | url, prefix? })` (2.3) returns `leases`,
+`agentRuns`, `claims` and `close()`, like the SQLite and Postgres ops stores.
+The same entry has `createRedisBudgetStore`, the
+[budget store](/docs/modules/budgets#durable-stores), and
+`@deuz-sdk/core/swarm/redis` has `createRedisSwarmStore`, the swarm store. All
+three are Node-only and need Redis 7 or later.
+
+```ts
+import { createClient } from 'redis';
+import { createSwarm } from '@deuz-sdk/core/swarm';
+import { createRedisSwarmStore } from '@deuz-sdk/core/swarm/redis';
+import { createRedisOpsStore } from '@deuz-sdk/core/ops/redis';
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+const ops = createRedisOpsStore({ client: redis, prefix: 'jobs' });
+const swarm = createSwarm({
+  agents: {},
+  reducers: { total: { execute: () => 42 } },
+  store: createRedisSwarmStore({ client: redis, prefix: 'jobs' }),
+  lease: { provider: ops.leases },
+});
+
+const { handles, failed } = await swarm.recover();
+console.log(`${handles.length} runs taken over, ${failed.length} could not be resumed`);
+```
+
+- **One Lua script per operation.** Redis runs a script atomically, so a lease
+  changes hands at most once, an agent run save is a compare-and-set on its
+  revision, a claim key is granted once and a budget admission never admits
+  past a limit. A swarm commit reads what its validation needs in one script
+  and writes in another that runs only while the run is still at the revision
+  and generation it read: a concurrent writer gets `SwarmConflictError` and
+  nothing of its commit is written, and a run pruned and created again under the
+  same key never takes a write meant for the old one. There is no `WATCH` or
+  `MULTI`: on a shared node-redis connection a watch is not isolated from the
+  other commands in flight, and an optimistic transaction needs a retry loop
+  under contention.
+- **Server time.** Lease expiry, claim and agent run times and budget windows
+  come from Redis `TIME`, read inside the scripts, so host clock skew does not
+  matter.
+- **One hash tag per store.** Every key starts with `{<prefix>:ops}`,
+  `{<prefix>:budget}` or `{<prefix>:swarm}` (the prefix defaults to `deuz`), so
+  a Redis Cluster keeps each store in one slot, where every script stays atomic.
+  A prefix holding `{` or `}` is refused.
+- **Clients.** The stores need one method, `eval(script, { keys, arguments })`,
+  node-redis's `EVAL` signature, typed `RedisScriptClient`. A connected
+  node-redis client (v4, v5 or v6, standalone or cluster) fits as it is; wrap
+  ioredis with `wrapIoredisClient(io)`. A `keyPrefix` set on the ioredis client
+  applies to every key, because each script builds its keys only from the keys
+  it declares. `{ url }` instead of `{ client }` imports the optional `redis`
+  peer on first use and connects once; `close()` quits that connection and is
+  final. An injected client is never closed.
+- **Batched retention.** `leases.prune`, `agentRuns.prune`, `claims.prune` and
+  the budget store's `prune` remove at most 1 000 entries per script and run
+  again until a batch comes back short, and the budget store folds each scope's
+  history a page of about 1 000 rows per script (`HSCAN`), so a large backlog
+  never holds the server in one long script. A swarm prune deletes up to its
+  `limit` in one script.
+- **Durability is your server's.** Redis acknowledges a write from memory. What
+  survives a crash depends on its persistence: with AOF and
+  `appendfsync everysec` up to about a second of writes can be lost, and with
+  snapshots alone everything since the last one. A replica promoted after a
+  failover may lack the last writes it had not received. A lost lease write
+  costs liveness, which the revision fence covers; a lost budget charge or
+  agent run save is lost. Enable AOF for these stores.
+- **Nothing may be evicted.** The stores set no TTL on any key: their keys hold
+  state, not a cache. Run them on a server whose `maxmemory-policy` is
+  `noeviction` (the Redis default) or a `volatile-*` policy, which evicts only
+  keys that have a TTL. An `allkeys-*` policy (`allkeys-lru`, `allkeys-lfu`,
+  `allkeys-random`), usual on a server set up as a cache, drops whole keys
+  under memory pressure without an error, and one key can hold a whole store's
+  leases, claims or runs. An evicted budget scope
+  (`{<prefix>:budget}:scope:<key>`) starts again empty and admits its whole
+  limit again. An evicted `{<prefix>:ops}:lease:expiry` lets a second executor
+  take a lease that is still held. An evicted `{<prefix>:ops}:claims` makes
+  every claim key claimable again, so an occurrence or a delivery can run
+  twice. An evicted `{<prefix>:ops}:run:payload`, or a swarm run's keys, loses
+  those runs. Under `noeviction` a full server refuses writes instead and the
+  stores' calls reject, so leave it room and prune.
+
+| Key (tag `T`) | Holds |
+| --- | --- |
+| `T:lease:owner`, `T:lease:token`, `T:lease:signals` | Hashes by lease key |
+| `T:lease:expiry` | Sorted set of lease keys by expiry, 0 once released |
+| `T:run:payload`, `T:run:revision` | Hashes by native run ID |
+| `T:run:terminal` | Sorted set of terminal native runs by their last save |
+| `T:run:ix`, `T:run:ix:ph:<phase>`, `T:run:ix:sc:<scope>`, `T:run:ix:ps:<phase>:<scope>` | The listing indexes of every run, by phase, by scope and by both (the scope as hex code units). Each run has one entry: the server time of its last save, its run ID and its summary, ordered as `agentRuns.list` pages |
+| `T:run:entry` | Hash of each native run's current listing entry, so a save or prune can remove it |
+| `T:run:indexed` | Marks a store whose runs all have a listing entry |
+| `T:claims` | Sorted set of claim keys by the time they were granted; keys are stored as they are |
+| `T:schema` | The layout version, one string per store |
+
+A store created by 2.3 sets `T:run:indexed` on first use. A store written by a
+2.3 pre-release does not have it yet. On such a store, the first
+`agentRuns.list` indexes the runs saved before the listing indexes existed,
+about 100 per script, and then sets the marker. A terminal run among them is listed
+at its last save, the time `T:run:terminal` holds. Any other is listed at the
+time it was indexed, because nothing recorded its last save.
+
+The budget and swarm stores keep a hash per request, scope and run, with sorted
+sets that index them; their key layouts are listed in the source of
+`node/redis-budget.ts` and `node/swarm-redis.ts`. The stores' contracts run
+offline against ioredis-mock, which runs the same Lua scripts, and against a
+real Redis 7 in the repository's CI when `DEUZ_TEST_REDIS_URL` names one,
+including races of concurrent writers on two connections.
+
+## Schema versions and upgrades
+
+Every durable store keeps its own schema version in a table of its own,
+separate from the versions of the records it stores. A store refuses a schema
+version newer than it reads, with an error such as `Unsupported Postgres ops
+schema version 2; this build reads version 1`, so an older process never writes
+through a newer layout.
+
+| Store | Version table | Version in 2.2 and 2.3 |
+| --- | --- | --- |
+| SQLite swarm (`createSqliteSwarmStore`) | `deuz_swarm_schema` | 2. A 2.1 file (version 1) is upgraded in place on first open, and 2.1 then refuses it |
+| Postgres swarm (`createPostgresSwarmStore`) | `deuz_swarm_pg_schema` | 1, the same layout as SQLite's 2 |
+| SQLite and Postgres ops (`createSqliteOpsStore`, `createPostgresOpsStore`) | `deuz_ops_schema` | 1 |
+| SQLite and Postgres budget (`createSqliteBudgetStore`, `createPostgresBudgetStore`) | `deuz_budget_schema` | 1 |
+| SQLite evolve (`createSqlitePopulationStore`) | `deuz_evolve_schema` | 1 |
+| Redis ops, budget and swarm (`createRedisOpsStore`, `createRedisBudgetStore`, `createRedisSwarmStore`) | the key `{<prefix>:<store>}:schema`, stamped on first use | 1 (new in 2.3) |
+| Store packs (`createSqliteStores`, `createPostgresStores`) | `PRAGMA user_version`, `deuz_meta` | 1; see [Stores](/docs/modules/stores#migrations-and-schema-ownership) |
+
+The records inside carry versions of their own:
+
+| Record | Versions |
+| --- | --- |
+| Legacy loop checkpoint (`AgentCheckpoint.version`) | 1. Since 2.3, `deserializeCheckpoint` and `resumeFromCheckpoint` refuse any other version with `CheckpointVersionError` (code `checkpoint_version_unsupported`); a checkpoint without a version reads as 1 |
+| Native run envelope (`AgentRunEnvelope.version`) | 1; a resume refuses any other, and since 2.3 also an envelope holding a loop or sub-agent checkpoint whose version is not 1 (`CheckpointVersionError`), before anything is written. Its `revision` is the write fence, not a format version |
+| Swarm run (`SwarmRunRecord.version`) | 1 for a fixed DAG, 2 for a dynamic run (2.2), which 2.1 refuses |
+| Execution snapshot (`ExecutionContextSnapshot.version`) | 1, or 2 when it carries persistent admission (2.2), which 2.1 refuses |
+| Ledger snapshot (`BudgetLedgerSnapshot.version`) | 1, or 2 when it carries folded aggregates or persistent admission (2.2), which 2.1 refuses |
+
+No store changes its schema version in 2.3. On first use the stores add only
+objects that 2.2 ignores, so 2.2 and 2.3 processes can share a database during a
+rolling deploy:
+
+| Store | Added on first 2.3 use |
+| --- | --- |
+| SQLite and Postgres ops | Indexes `deuz_claims_claimed_at` and `deuz_agent_runs_updated_at` |
+| SQLite and Postgres budget | Index `deuz_budget_requests_state`. SQLite also adds `deuz_budget_totals`, kept by three triggers on the history table, which 2.2 processes fire too, and fills it from the history |
+| SQLite swarm | Index `deuz_swarm_runs_settled` |
+
+Building an index blocks writes to its table until it is built. On a large
+Postgres table, create the index beforehand without blocking writes, under the
+same name in the store's schema, and the store finds it in place:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS deuz_claims_claimed_at ON public.deuz_claims (claimed_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS deuz_agent_runs_updated_at ON public.deuz_agent_runs (updated_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS deuz_budget_requests_state ON public.deuz_budget_requests (state, created_at);
+```
+
+A later change that older builds cannot work with will raise a store's version.
+The Postgres stores then upgrade a schema forward on first use: the steps from
+its stored version to the current one run in order, followed by any new tables
+and indexes, in the one statement that holds the store's advisory lock. A
+failure leaves the schema as it was, and processes starting together upgrade it
+once. Processes with an older build then refuse the schema, so upgrade every
+process that shares it, and back the database up first if you may need to roll
+back.
 
 ## Native agent run revisions
 
-`AgentRunEnvelope.revision` increases by one on every save. The SQLite and
-Postgres `agentRuns` stores, and `createInMemoryAgentRunStore`, reject any save
+`AgentRunEnvelope.revision` increases by one on every save. The SQLite,
+Postgres and Redis `agentRuns` stores, and `createInMemoryAgentRunStore`, reject any save
 that is not the stored revision plus one. An envelope written by 2.1 has no
 revision and counts as 0. An executor whose save is rejected stops, and its run
 result reports the failure.
@@ -309,6 +579,292 @@ try {
 }
 ```
 
-Native runs have no lease of their own: the revision check already stops a
-second executor from overwriting the first. Swarm tasks keep their agent state
-inside the swarm run, which the swarm's lease and revision protect.
+The revision check stops a second executor from overwriting the first, but not
+from running: both may still call the model and tools until one save fails.
+Since 2.3 the `lease` option keeps a second process from driving the run at
+all; see [below](#leasing-a-native-run). Swarm tasks keep their agent state
+inside the swarm run, which the swarm's lease and revision protect. Terminal
+runs stay in the store until `agentRuns.prune` removes them; see
+[Retention](#retention).
+
+## Listing, leasing and cancelling native runs
+
+Since 2.3 a native run can be listed, found when its executor died, held by one
+process at a time, and cancelled or drained from another process.
+
+### Listing native runs
+
+`agentRuns.list({ phases?, updatedBefore?, scope?, limit?, cursor? })` returns
+a page of runs, newest save first (then run ID, descending), as summaries
+without their transcripts. The memory store (`createInMemoryAgentRunStore`),
+and the SQLite, Postgres and Redis `agentRuns` have it. On SQLite and Postgres
+it pages by the `deuz_agent_runs_updated_at` index. On Redis it reads sorted-set
+indexes that every save and prune keeps up to date (by phase, by scope, or both),
+so no run is loaded; see [Redis](#redis). `AgentRunStore.list` is optional, so
+a store of your own may leave it out.
+
+| Summary field | Meaning |
+| --- | --- |
+| `runId`, `scope` | The run |
+| `phase` | `'running'`, `'finalizing'` or `'terminal'`, as the envelope records it |
+| `revision` | The envelope's revision; 0 for an envelope written by 2.1 |
+| `updatedAt` | When the run was last saved, epoch ms on the store's clock: the injected clock for memory and SQLite, the database clock for Postgres, the server's `TIME` for Redis |
+| `status` | The stored result's status: `'suspended'` for a run waiting on approvals or client results (its phase stays `'running'`), the outcome of a terminal run; absent while the run is in progress |
+
+`phases` keeps runs in those phases (an empty list keeps none), `updatedBefore`
+those last saved before a time, and `scope` one scope's. `limit` is 1 to 1000,
+default 100. A page carries a `cursor` only while more runs follow; pass it back
+for the next page. A run saved while you page moves ahead of the cursor, so a
+traversal never returns a run twice, but can miss one saved meanwhile. A
+malformed query rejects with a `TypeError`.
+
+A store of your own that implements `list` keeps the same contract: it records
+the time of each save on its own clock, reads `phase` and `status` from the
+saved envelope (`phase`, and `result.status` when there is a result), orders by
+that time and then run ID, both descending, and treats its cursor as its own
+opaque string naming the last run returned.
+
+```ts
+import { runAgent } from '@deuz-sdk/core/agent';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+
+const ops = createSqliteOpsStore({ path: ':memory:' });
+try {
+  for (const runId of ['a', 'b', 'c'])
+    await runAgent({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      prompt: 'Work.',
+      session: { store: ops.agentRuns, runId, scope: 'tenant-a' },
+    });
+  let cursor: string | undefined;
+  do {
+    const page = await ops.agentRuns.list({ phases: ['terminal'], limit: 2, cursor });
+    for (const run of page.runs) console.log(run.runId, run.status); // c completed, b completed, a completed
+    cursor = page.cursor;
+  } while (cursor);
+} finally {
+  await ops.close();
+}
+```
+
+### Finding runs that lost their executor
+
+`findStaleAgentRuns(store, { staleMs?, scope?, includeSuspended?, limit?, clock? })`
+from `@deuz-sdk/core/ops` returns the runs still running or finalizing whose
+last save is more than `staleMs` (default 60 000) before the clock's time,
+newest change first, up to `limit` (1 to 1000, default 100). Suspended runs
+wait for a person rather than an executor, so they are left out unless
+`includeSuspended` is set. It needs a store with `list`, rejects one without,
+and examines at most 10 000 runs per call.
+
+A native run saves at every step, not on a heartbeat: a run in a long tool call
+or model turn looks stale too. Resume what it finds with the `lease` option, so
+a run whose executor is alive is refused instead of driven twice:
+
+```ts
+import { resumeAgent } from '@deuz-sdk/core/agent';
+import { findStaleAgentRuns } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+
+const ops = createSqliteOpsStore({ path: './runs.sqlite' });
+try {
+  for (const run of await findStaleAgentRuns(ops.agentRuns, { staleMs: 5 * 60_000 })) {
+    const result = await resumeAgent({
+      model: createMockModel({ responses: [{ text: 'done' }] }),
+      session: { store: ops.agentRuns, runId: run.runId, scope: run.scope },
+      lease: { provider: ops.leases, owner: 'worker-1' },
+    });
+    if (result.status === 'failed' && result.error.code === 'lease_held') continue; // still alive
+    console.log(run.runId, result.status);
+  }
+} finally {
+  await ops.close();
+}
+```
+
+### Leasing a native run
+
+`runAgent`, `streamAgent`, `resumeAgent` and `resumeStreamAgent` take
+`lease: { provider, owner?, ttlMs? }`, like `createSwarm`. It requires a
+`session`. The executor acquires the run's key,
+`agentRunLeaseKey({ scope, runId })` (`agent:["<scope>","<runId>"]`), before it
+reads the run, renews it at once and then every `ttlMs / 3` (default 30 000) on
+`deps.clock`, also while it reads the run, and releases it when the run returns,
+whatever the outcome. `owner` defaults to a generated ID per run.
+
+- While another executor holds the key, the run fails at once with an error
+  named `AgentRunLeaseError`, code `'lease_held'`. Nothing is read, written or
+  sent to a model.
+- An executor whose renewal reports the lease gone aborts the run and writes
+  nothing more. Its result fails with code `'lease_lost'`; the stored run stays
+  as its last save left it, for the next executor.
+- A renewal that throws, for example during a database outage, counts as lost
+  only once the lease could have expired.
+- The revision check stays the fence: a paused executor whose lease lapsed
+  cannot overwrite a newer save.
+
+`reconcileAgentRun` takes the same `lease` (2.3): it claims the key before it
+reads the run, rejects with `'lease_held'` while an executor holds it, and gives
+it back at the end. See [Memory](/docs/modules/native-agents#memory).
+
+### Cancelling a native run from another process
+
+`leases.signal(agentRunLeaseKey({ scope, runId }), 'cancel')` reaches the
+executor that holds the run and returns `true`. At its next renewal the
+executor aborts the run, which stops with reason `'cancelled'`. With a provider
+that has `ack`, as the memory, SQLite, Postgres and Redis providers do, the executor
+renews with acknowledged delivery: the cancel stays queued until the stopped run
+is saved, and only then is it acknowledged. An executor that dies in between, or
+cannot save the run, leaves the cancel for the next one. With a provider without
+`ack`, a delivered cancel the run could not save is queued again before the
+lease is released.
+
+The renewal an executor makes as soon as it claims a run, before it reads the
+run, collects what was queued under the key before the claim. A cancel found
+there applies before any model call: a resumed run that has not ended stops as
+`'cancelled'`. A new run starts clean of it, a run that already ended keeps its
+result, and a `runAgent` that finds the run ID taken fails and leaves it queued
+for that run. A resume that stops before it takes the run up, for pending
+approvals or a tool call to reconcile, leaves the cancel queued until a resume
+does. A cancel signalled after that first renewal concerns the run being driven,
+a new run included, and stops it at the next renewal. A key queues one cancel
+at a time, so one sent while a cancel from before the claim is still queued
+merges into it and shares its fate.
+
+`signal` returns `false` when no executor holds the run, for example a suspended
+run, and queues nothing.
+
+```ts
+import { createInMemoryAgentRunStore, runAgent } from '@deuz-sdk/core/agent';
+import { agentRunLeaseKey, createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const leases = createInMemoryLeaseProvider();
+const store = createInMemoryAgentRunStore();
+const session = { store, runId: 'report', scope: 'tenant-a' };
+
+let started!: () => void;
+const working = new Promise<void>((resolve) => (started = resolve));
+const run = runAgent({
+  model: createMockModel({
+    responses: [{ toolCalls: [{ toolName: 'crunch', args: {} }] }, { text: 'done' }],
+  }),
+  prompt: 'Crunch the numbers.',
+  tools: {
+    crunch: {
+      description: 'Takes a while.',
+      parameters: { type: 'object', properties: {} },
+      execute: (_args, { signal }) =>
+        new Promise((resolve, reject) => {
+          started();
+          const timer = setTimeout(() => resolve('crunched'), 60_000);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(new Error('cancelled'));
+          });
+        }),
+    },
+  },
+  session,
+  lease: { provider: leases, ttlMs: 300 },
+});
+
+await working;
+// Elsewhere, another process with the same lease provider:
+console.log(await leases.signal(agentRunLeaseKey(session), 'cancel')); // true
+const result = await run;
+console.log(result.status, result.status === 'stopped' && result.reason); // stopped cancelled
+```
+
+### Draining a native run
+
+Since 2.3 a `'drain'` signal stops a leased native run at its next model-step
+boundary, for example to move the run to another process during a deploy:
+`leases.signal(agentRunLeaseKey({ scope, runId }), 'drain')`. The executor
+picks it up at its next renewal. Nothing in progress is interrupted: the step's
+model call and tool calls finish, and the run stops before it calls the model
+again. Its result is `stopped` with reason `'drained'`; on a stream, the
+`finish` part of a run that stopped after a step names it too
+(`providerMetadata.deuz.stoppedBy: 'drained'`).
+
+A drained run has not ended. No outcome is committed: the run stays as its last
+save left it, like a run whose executor died after that save, and a run that
+stopped after a step is stored exactly as after any other step. Only a run with
+`chat` saves its chat projection, as after any leg. Resume it on any executor
+and it goes on from there; nothing that ran runs again.
+`findStaleAgentRuns` finds it once `staleMs` has passed, as it finds a run whose
+executor died; to take it up at once, resume it by its run ID. Unlike a drained
+swarm, which settles as `'suspended'`, a drained native run keeps its phase,
+`'running'` or `'finalizing'`.
+
+A run served over A2A
+([`createA2AAgentExecutor`](/docs/modules/a2a#stopped-and-failed-runs)) is
+drained the same way: its task asks for input with a
+`{ type: 'stopped', reason: 'drained' }` part, and the client's next message
+resumes the run. When the drain stopped a resume before it took the message's
+answers up, the task lists the pending actions again instead, for the client to
+answer once more.
+
+Where the run stops depends on where the drain finds it:
+
+- **During a step.** At the boundary after the step's tool calls. A model call
+  that fails and [fails over](/docs/modules/native-agents#model-fail-over) goes
+  to the next model first, as part of the step.
+- **Before a final answer.** A run with `output` stops before its final answer
+  call, and before a new one after an invalid answer or a rejected verdict.
+- **A new run** stops before its first model call, once it is saved.
+- **A resume** that the drain reaches before it takes the run up stops before
+  its first write: the stored run stays as it was, so resume it again with the
+  same options, the verdicts or client results you passed included. A resume
+  that already took the run up goes on to its first step boundary, so what you
+  passed is applied and saved first.
+
+Any other stop at the same point comes first: a run that reached `maxSteps` or
+its budget stops for that reason, and a cancel, or an abort of the run's
+`signal`, stops it as `'cancelled'` or `'aborted'` even when a drain arrived
+too. A run with no model call left completes as usual. As for a swarm
+([Drain](#drain)), the signal concerns the executor that holds the run when it
+is sent: it is dropped when the run changes hands or the lease is released.
+
+```ts
+import { createInMemoryAgentRunStore, resumeAgent, runAgent } from '@deuz-sdk/core/agent';
+import { agentRunLeaseKey, createInMemoryLeaseProvider } from '@deuz-sdk/core/ops';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const leases = createInMemoryLeaseProvider();
+const session = { store: createInMemoryAgentRunStore(), runId: 'report', scope: 'tenant-a' };
+
+let started!: () => void;
+const working = new Promise<void>((resolve) => (started = resolve));
+const options = {
+  model: createMockModel({
+    responses: [{ toolCalls: [{ toolName: 'crunch', args: {} }] }, { text: 'done' }],
+  }),
+  prompt: 'Crunch the numbers.',
+  tools: {
+    crunch: {
+      description: 'Takes a while.',
+      parameters: { type: 'object' as const, properties: {} },
+      execute: () =>
+        new Promise((resolve) => {
+          started();
+          setTimeout(() => resolve('crunched'), 1_000);
+        }),
+    },
+  },
+  session,
+};
+
+const run = runAgent({ ...options, lease: { provider: leases, owner: 'worker-1', ttlMs: 300 } });
+await working;
+// A deploy moves the run: the crunch finishes, and no model call follows it.
+await leases.signal(agentRunLeaseKey(session), 'drain');
+const drained = await run;
+console.log(drained.status, drained.status === 'stopped' && drained.reason); // stopped drained
+
+// Another executor goes on from the step boundary; crunch does not run again.
+const resumed = await resumeAgent({ ...options, lease: { provider: leases, owner: 'worker-2' } });
+console.log(resumed.status); // completed
+```

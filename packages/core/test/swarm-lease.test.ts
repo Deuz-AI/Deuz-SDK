@@ -853,6 +853,131 @@ describe('swarm requestCancel', () => {
     expect(calls.count).toBe(1);
   });
 
+  it('cancels a run whose holder died between receiving a cancel and recording it', async () => {
+    const time = manualClock();
+    const frozen = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const store = createInMemorySwarmStore();
+    let received = false;
+    // A dies while it records the cancel: that commit never returns.
+    const dying: SwarmStore = {
+      ...store,
+      commit(change) {
+        if (!change.run?.cancelRequested) return store.commit(change);
+        received = true;
+        return new Promise(() => {});
+      },
+    };
+    const release = gate();
+    const calls = { count: 0 };
+    // A's own timers never fire, so only its check before the settle renews.
+    const a = swarmOn({
+      store: dying,
+      clock: frozen.clock,
+      provider,
+      owner: 'a',
+      work: slow(release.promise, calls),
+    });
+    await a.run({ ...key, tasks });
+    await until(() => calls.count === 1);
+    const b = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      provider,
+      owner: 'b',
+      work: slow(Promise.resolve(), calls),
+    });
+    expect(await b.requestCancel(key)).toBe('signalled');
+    release.resolve();
+    await until(() => received);
+    // A's lease lapses; the cancel it received is still queued for B.
+    await time.advance(10_000);
+    const outcome = await (await b.resume(key)).result;
+    expect(outcome.run).toMatchObject({ status: 'cancelled', cancelRequested: true });
+    expect(calls.count).toBe(1);
+    // B recorded it, so it left the queue.
+    const next = (await provider.acquire({ key: leaseKey, owner: 'x', ttlMs: 3_000 }))!;
+    expect(await provider.renew(next, 3_000, { acknowledge: true })).toMatchObject({
+      signals: [],
+    });
+  });
+
+  it('acknowledges a cancel its heartbeat delivered once the cancellation is recorded', async () => {
+    const time = manualClock();
+    const provider = createInMemoryLeaseProvider({ clock: time.clock });
+    const acks: number[] = [];
+    const counting: LeaseProvider = {
+      ...provider,
+      ack: (lease, signal) => (acks.push(lease.token), provider.ack!(lease, signal)),
+    };
+    const store = createInMemorySwarmStore();
+    const calls = { count: 0 };
+    const a = swarmOn({
+      store,
+      clock: time.clock,
+      provider: counting,
+      owner: 'a',
+      work: slow(gate().promise, calls),
+    });
+    const handle = await a.run({ ...key, tasks });
+    await until(() => calls.count === 1);
+    expect(await provider.signal(leaseKey, 'cancel')).toBe(true);
+    await time.advance(1_000);
+    expect((await handle.result).run.status).toBe('cancelled');
+    expect(acks).toEqual([1]);
+    const next = (await provider.acquire({ key: leaseKey, owner: 'x', ttlMs: 3_000 }))!;
+    expect(await provider.renew(next, 3_000, { acknowledge: true })).toMatchObject({
+      signals: [],
+    });
+  });
+
+  it('queues a cancel again itself with a provider that cannot acknowledge (2.2)', async () => {
+    const time = manualClock();
+    const inner = createInMemoryLeaseProvider({ clock: time.clock });
+    // A 2.2 provider: four methods, every renewal consumes what it delivers.
+    const provider: LeaseProvider = {
+      acquire: (request) => inner.acquire(request),
+      renew: (lease, ttlMs) => inner.renew(lease, ttlMs),
+      release: (lease) => inner.release(lease),
+      signal: (signalKey, signal) => inner.signal(signalKey, signal),
+    };
+    const store = createInMemorySwarmStore();
+    let refuse = true;
+    const flaky: SwarmStore = {
+      ...store,
+      async commit(change) {
+        if (refuse && change.run?.cancelRequested) {
+          refuse = false;
+          throw new Error('transient store error');
+        }
+        return store.commit(change);
+      },
+    };
+    const calls = { count: 0 };
+    const a = swarmOn({
+      store: flaky,
+      clock: time.clock,
+      provider,
+      owner: 'a',
+      work: slow(gate().promise, calls),
+    });
+    const handle = await a.run({ ...key, tasks });
+    await until(() => calls.count === 1);
+    expect(await provider.signal(leaseKey, 'cancel')).toBe(true);
+    await time.advance(1_000);
+    await expect(handle.result).rejects.toThrow('transient store error');
+    const b = swarmOn({
+      store: connection(store),
+      clock: time.clock,
+      provider,
+      owner: 'b',
+      work: slow(Promise.resolve(), calls),
+    });
+    const outcome = await (await b.resume(key)).result;
+    expect(outcome.run).toMatchObject({ status: 'cancelled', cancelRequested: true });
+    expect(calls.count).toBe(1);
+  });
+
   it('starts a new run clean even when its key still queues a cancel', async () => {
     const time = manualClock();
     const provider = createInMemoryLeaseProvider({ clock: time.clock });

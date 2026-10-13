@@ -1,11 +1,11 @@
 import type { CommonCallOptions } from '../types/config';
 import { createWarningSink } from '../internal/warnings';
-import type { GenerateTextResult } from '../types/methods';
+import type { CallWarning, GenerateTextResult } from '../types/methods';
 import type { Message } from '../types/message';
 import type { Usage } from '../types/usage';
 import type { ToolCall, ToolSet, StepResult, ToolApprovalRequest } from '../types/tool';
 import type { ResolvedMcpRuntime } from '../mcp/resolve';
-import { runOneStep, type OneStep } from './run-step';
+import { runOneStep, blocksToolDispatch, type OneStep } from './run-step';
 import { EMPTY_USAGE, withTotal } from '../core/metering';
 import { resolveDependencies } from '../internal/resolve-deps';
 import { createStepTimeout, resolveTimeouts, type StepTimeoutHandle } from '../core/timeout';
@@ -13,10 +13,16 @@ import type { ObservationRuntime } from '../internal/observe-runtime';
 import {
   buildWireTools,
   filterWireTools,
+  rootStaticWire,
+  stabilizeStepWire,
+  offeredTools,
   applyPrepareStep,
   setupMcp,
   mergeMcpTools,
   refreshMcpTools,
+  catalogChangePolicy,
+  legacyCatalogVerdict,
+  MCP_CATALOG_CHANGED_STOPPED_BY,
   closeMcp,
   setupCompaction,
   runCompaction,
@@ -27,32 +33,28 @@ import {
   executeTools,
   toToolResultPart,
   toStepResult,
-  pendingClientCalls,
   bumpErrorGuard,
   normalizeStop,
   needsCost,
   shouldStop,
   sumUsage,
-  findApprovalNeeded,
-  resolveServerApprovals,
+  planToolDispatch,
   settlePendingApprovals,
   setupDurable,
+  continueStoredRun,
   saveCheckpoint,
   prepareChatPersistence,
   persistChat,
-  computeRecallBlock,
+  planRecall,
   withSystemBlock,
   startMemoryExtract,
   durableUsage,
-  toApprovalRequests,
   signApprovalRequests,
   preserveClientContext,
   beginLoopObserve,
   endLoopObserve,
   emitStepStarted,
   emitStepCompleted,
-  observeApprovalRequests,
-  observeServerResolutions,
   evaluateVerifyStep,
   evaluateDoneWhen,
   falseFinishMessage,
@@ -61,7 +63,6 @@ import {
   verifyFeedbackMessage,
   evaluateInputGuardrails,
   evaluateOutputGuardrails,
-  applyToolCallGuardrails,
   logGuardrailParts,
   rewriteAssistantText,
   isEmptyTurn,
@@ -69,19 +70,20 @@ import {
   GUARDRAIL_OUTPUT_STOPPED_BY,
   collectHandoffTools,
   hasHandoffTools,
-  splitHandoffCalls,
-  decideHandoff,
   mergeResultsInCallOrder,
   applyHandoffSwap,
   resumeHandoffState,
   SubAgentSuspension,
+  modelGate,
+  setModelGate,
   type ActiveAgentState,
   type CompactionTrigger,
-  type Denial,
+  type DurableResume,
   type ExecuteExtras,
   type GuardrailLogEntry,
   type HandoffLogEntry,
   type LoopOutcome,
+  type ModelGate,
 } from './loop-shared';
 import type { CompactionEvent } from './compaction';
 import type { UsageCostSnapshot } from '../internal/usage-cost';
@@ -92,7 +94,7 @@ import type { UsageCostSnapshot } from '../internal/usage-cost';
  */
 export interface ToolLoopInternal {
   resumeCost?: UsageCostSnapshot;
-  resumeFrom?: { stepIndex: number; usage: Usage };
+  resumeFrom?: DurableResume;
   /**
    * Handoff (2.0): the checkpoint's active agent, re-applied before the first
    * step of a resume leg (`durable.ts` reads it off `AgentCheckpoint.handoff`).
@@ -128,13 +130,26 @@ export async function runToolLoop(
    */
   let ownTools: ToolSet = options.tools ?? {};
   const deps = resolveDependencies(options.deps);
+  // ONE sink per RUN (1.9): the loop re-derives capabilities every step, so a
+  // per-step sink would report a single stripped setting once per step. The
+  // sink's own dedupe only works if every step shares it.
+  const warnings = createWarningSink(deps.logger);
+  /** MCP name collisions (2.3) reach the same sink. */
+  const warn = (warning: CallWarning): void => {
+    warnings.add(warning);
+  };
+  // A USD budget needs the accumulator even without a price provider (2.3):
+  // every model is then unpriced, and `budget.unknownPrice` decides.
   const usageCost =
-    !options.execution && (deps.priceProvider || internal?.resumeCost)
+    !options.execution &&
+    (deps.priceProvider || internal?.resumeCost || options.budget?.usd !== undefined)
       ? (await import('../internal/usage-cost')).createUsageCostAccumulator({
           priceProvider: deps.priceProvider,
           snapshot: internal?.resumeCost,
           unpricedBaseUsage:
             !internal?.resumeCost && (internal?.resumeFrom?.usage.totalTokens ?? 0) > 0,
+          budget: options.budget,
+          warnings,
         })
       : undefined;
   if (usageCost)
@@ -142,6 +157,18 @@ export async function runToolLoop(
       ...options,
       onUsage: usageCost.wrap(options.onUsage ?? deps.onUsage),
     });
+  // Decision 4 (2.3): every model this run calls, compaction summaries
+  // included, passes its own unknown-price gate and that of the loop whose
+  // `agentTool` started it. Kept on `deps`, so the tools' copy carries it on.
+  const parentGate = modelGate(deps);
+  const admitModel: ModelGate | undefined =
+    usageCost || parentGate
+      ? async (modelId) => {
+          await usageCost?.admit(modelId);
+          await parentGate?.(modelId);
+        }
+      : undefined;
+  setModelGate(deps, admitModel);
   /**
    * The run's MCP connections (2.0), resolved inside the try below so a failure
    * still reports run.failed. Declared out here because the `finally` has to
@@ -213,10 +240,6 @@ export async function runToolLoop(
   // Verified generation (1.8): attempt counter + final verdict for metadata.
   let verifyAttempts = 0;
   let verified: boolean | undefined;
-  // ONE sink per RUN (1.9): the loop re-derives capabilities every step, so a
-  // per-step sink would report a single stripped setting once per step. The
-  // sink's own dedupe only works if every step shares it.
-  const warnings = createWarningSink(deps.logger);
   let falseFinishRetries = 0;
   let falseFinishAccepted = false;
   // Guardrails (2.0): the buffered loop has no stream, so every non-pass verdict
@@ -282,6 +305,7 @@ export async function runToolLoop(
       text: guardrailText ?? lastStep?.text ?? '',
       usage: withTotal(totalUsage),
       finishReason: lastStep?.finishReason ?? 'stop',
+      ...(lastStep?.stopDetails ? { stopDetails: lastStep.stopDetails } : {}),
       response: { messages: appended },
       steps,
       ...(warnings.list().length ? { warnings: warnings.list() } : {}),
@@ -354,11 +378,19 @@ export async function runToolLoop(
       : {};
 
   try {
+    // A plain leg of a stored durable run continues its step counter (2.3), so
+    // no approval is bound to a step the run already used.
+    const suspendedAt =
+      durable && !internal?.resumeFrom
+        ? await continueStoredRun(durable, options, deps)
+        : undefined;
+    // What a mid-run MCP catalog change does (2.3); an unknown value fails the call.
+    const catalogPolicy = catalogChangePolicy(options);
     // Zero-config MCP (2.0): connect BEFORE the wire is built, so the servers'
     // tools are part of the very first model call. Explicit `tools` are merged
     // LAST and always win a name collision.
-    mcp = await setupMcp(options, deps);
-    tools = mergeMcpTools(mcp, ownTools);
+    mcp = await setupMcp(options, deps, warn);
+    tools = mergeMcpTools(mcp, ownTools, warn);
     // Handoff (2.0): the transfer catalog is read from the ROOT set, ONCE — an
     // agent's own set never carries a transfer to itself, so re-deriving it
     // later would lose targets one by one.
@@ -376,12 +408,16 @@ export async function runToolLoop(
         deps.logger,
       );
       ownTools = active.tools;
-      tools = mergeMcpTools(mcp, ownTools);
+      tools = mergeMcpTools(mcp, ownTools, warn);
       if (durable) durable.handoff = internal.resumeHandoff;
       retargetCompaction(compactionRunner, options, deps, active.model);
     }
     let fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
     let staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
+    // The tools array a request to a model that binds thinking to the prefix
+    // carries on every step of the leg (2.3, F22): the ROOT agent's static wire,
+    // also on a leg that resumes as a handoff target.
+    const declaredWire = active ? await rootStaticWire(options, mcp) : staticWire;
 
     // Resume: settle the previous break's pending approvals BEFORE the first
     // model call — the new tool message flows into response.messages. A durable
@@ -399,10 +435,21 @@ export async function runToolLoop(
         extras,
         undefined,
         { ...(active ? { active } : {}), tools: handoffTools },
+        // The identity the suspended leg bound its approvals to (2.3).
+        {
+          runId: durable?.runId,
+          step: internal?.resumeFrom?.stepIndex ?? suspendedAt,
+          approvalRequestCounts: durable?.approvalRequestCounts,
+        },
+        // On a stable prefix (2.3, F22) a pending call resolves against the set
+        // its step offered, as it would have in the step.
+        { model: active?.model ?? options.model, tools: declaredWire.tools },
       );
       if (settled) {
         messages = settled.messages;
-        const toolMessage = settled.messages.at(-1)!;
+        // Not `messages.at(-1)`: a break that committed a handoff may have left
+        // the target's instructions after it (2.3, F22).
+        const toolMessage = settled.toolMessage;
         appended.push(toolMessage);
         chatMessages = [...chatMessages, toolMessage];
         logGuardrailParts(guardrailLog, settled.guardrails);
@@ -420,7 +467,7 @@ export async function runToolLoop(
           messages = swap.messages;
           handoffLog.push(swap.entry);
           ownTools = active.tools;
-          tools = mergeMcpTools(mcp, ownTools);
+          tools = mergeMcpTools(mcp, ownTools, warn);
           fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
           staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
           retargetCompaction(compactionRunner, options, deps, active.model);
@@ -459,13 +506,25 @@ export async function runToolLoop(
       return done();
     }
 
-    // Memory recall (1.7, D1): computed once, spliced in at the model-call
-    // site only — canonical history/checkpoints/persistence stay recall-free.
+    // Memory recall (1.7, D1): computed once per leg. On a model that binds
+    // thinking to the prefix (2.3, F22) it is one appended system message (see
+    // `planRecall`); elsewhere it is spliced in at the model-call site only and
+    // canonical history/checkpoints/persistence stay recall-free. The run's
+    // first model decides which, on every leg: a leg that resumes as a handoff
+    // target reads its recall where the first leg put it.
     // Its observation parents under the RUN span (no step is open yet).
-    const recallBlock = await computeRecallBlock(options, deps, messages, observeCtx);
-    // Recall overhead (2.0): the block never enters `messages`, but the provider
-    // counts it. Both the compaction threshold and the EMA calibration have to
-    // see the same total, or every step's estimate is short by one block.
+    const recall = await planRecall(
+      options,
+      deps,
+      messages,
+      options.model,
+      observeCtx,
+      internal?.resumeFrom !== undefined,
+    );
+    const recallBlock = recall.splice;
+    // Recall overhead (2.0): a spliced block never enters `messages`, but the
+    // provider counts it. Both the compaction threshold and the EMA calibration
+    // have to see the same total, or every step's estimate is short by one block.
     const recallOverheadTokens =
       recallBlock && compactionRunner
         ? compactionRunner.estimator.estimate([{ role: 'system', content: recallBlock }])
@@ -492,6 +551,13 @@ export async function runToolLoop(
       }
       messages = guarded.messages;
     }
+    // The stable-prefix recall message (2.3): after the guardrails, which judge
+    // the caller's input, and before the first model call.
+    if (recall.message) {
+      messages = [...messages, recall.message];
+      appended.push(recall.message);
+      chatMessages = [...chatMessages, recall.message];
+    }
 
     for (;;) {
       // Previous step overran its budget? Fail before starting another one.
@@ -513,6 +579,32 @@ export async function runToolLoop(
       const logCompaction = (e: CompactionEvent, trigger: CompactionTrigger): void => {
         deps.logger.info(`compaction[${trigger}]: ${e.layer} ${e.tokensBefore}->${e.tokensAfter}`);
       };
+      // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
+      // the last step gets re-read HERE, first thing in the step, so the new
+      // catalog is on the wire from the very next call. Rebuilding both wires
+      // (not just the full one) keeps `activeTools` applied to the refreshed
+      // set, and `prepareStep` below still has the last word. A catalog that
+      // really changed is reported, or ends the run before any model sees it
+      // (2.3, `onCatalogChange: 'stop'`).
+      if (mcp?.changed()) {
+        const before = mcp.tools;
+        // `ownTools`, not `options.tools`: after a handoff the local half of the
+        // set belongs to the ACTIVE agent, and re-merging the caller's would
+        // silently undo the transfer.
+        tools = await refreshMcpTools(mcp, ownTools, deps, warn);
+        const verdict = legacyCatalogVerdict(before, mcp.tools, catalogPolicy);
+        for (const warning of verdict.warnings) warnings.add(warning);
+        if (verdict.stop) {
+          stoppedBy = MCP_CATALOG_CHANGED_STOPPED_BY;
+          endReason = 'stop-condition';
+          if (durable) {
+            await saveCheckpoint(durable, deps, options, 'completed', messages, totalUsage);
+          }
+          break;
+        }
+        fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
+        staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
+      }
       // Compaction first, so prepareStep sees (and has the last word on) the
       // compacted history.
       if (compactionRunner) {
@@ -527,19 +619,6 @@ export async function runToolLoop(
           recallOverheadTokens,
         );
       }
-      // MCP hot-swap (2.0): a server that announced `tools/list_changed` since
-      // the last step gets re-read HERE, so the new catalog is on the wire from
-      // the very next call. Rebuilding both wires (not just the full one) keeps
-      // `activeTools` applied to the refreshed set, and `prepareStep` below
-      // still has the last word.
-      if (mcp?.changed()) {
-        // `ownTools`, not `options.tools`: after a handoff the local half of the
-        // set belongs to the ACTIVE agent, and re-merging the caller's would
-        // silently undo the transfer.
-        tools = await refreshMcpTools(mcp, ownTools, deps);
-        fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
-        staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
-      }
       const prepared = await applyPrepareStep(
         // Handoff (2.0): the active agent's model drives every step after the
         // transfer — and `prepareStep` still has the LAST word, because it runs
@@ -551,6 +630,23 @@ export async function runToolLoop(
         deps.logger,
       );
       messages = prepared.messages;
+      // A step that offers another tool set than the one in effect appends the
+      // change instead of sending another tools array (2.3, F22); its calls
+      // resolve against the set it offered.
+      const stepWire = stabilizeStepWire(
+        prepared.options.model,
+        declaredWire,
+        prepared.wire,
+        messages,
+      );
+      if (stepWire.change) {
+        // Conversation content, like the recall message: the next call replays
+        // it where the model saw it.
+        messages = [...messages, stepWire.change];
+        appended.push(stepWire.change);
+        chatMessages = [...chatMessages, stepWire.change];
+      }
+      const stepTools = offeredTools(tools, stepWire.offered);
       const estimateAtCall = (): number =>
         (compactionRunner?.estimator.estimate(messages) ?? 0) + recallOverheadTokens;
       let estimatedAtCall = estimateAtCall();
@@ -567,6 +663,9 @@ export async function runToolLoop(
           durableUsage(durable, totalUsage),
         );
       }
+      // A model with no price under a USD budget (2.3): reported once, or
+      // refused before the call with `budget.unknownPrice: 'reject'`.
+      await admitModel?.(prepared.options.model.modelId);
       // Overflow auto-recovery (2.0): ONE retry per step. The provider rejected
       // the request as too long, so force a compaction pass and re-run the same
       // step against the shrunk history — recall block included, exactly as the
@@ -583,7 +682,7 @@ export async function runToolLoop(
               messages: withSystemBlock(messages, recallBlock),
             }),
             {
-              tools: prepared.wire,
+              tools: stepWire.wire,
               warnings,
               // stepMs rides in as a FAILURE signal, never as the user's cancel
               // signal: the inner pump reports a TimeoutError instead of resolving
@@ -620,7 +719,10 @@ export async function runToolLoop(
       calibrateCompaction(compactionRunner, estimatedAtCall, step.usage);
 
       // *** GEMINI GUARD: continue on tool_use parts, NOT finishReason ***
+      // A refused or cut-off turn arrives here too (2.3, F16): `runOneStep`
+      // already dropped its tool_use parts, so nothing of it is dispatched.
       if (step.toolUseParts.length === 0) {
+        const cutOff = blocksToolDispatch(step.finishReason);
         const sr = toStepResult(step, [], [], steps.length);
         steps.push(sr);
         if (lo && stepSpan) {
@@ -635,10 +737,14 @@ export async function runToolLoop(
           );
         }
         // Rebase effective model history for the completed checkpoint; the
-        // raw ChatStore history and response delta are tracked separately.
-        messages = [...messages, step.assistantMessage];
-        appended.push(step.assistantMessage);
-        chatMessages = [...chatMessages, step.assistantMessage];
+        // raw ChatStore history and response delta are tracked separately. An
+        // empty turn is not recorded: no provider accepts `content: []` back.
+        const stored = !isEmptyTurn(step.assistantMessage);
+        if (stored) {
+          messages = [...messages, step.assistantMessage];
+          appended.push(step.assistantMessage);
+          chatMessages = [...chatMessages, step.assistantMessage];
+        }
 
         // False-finish guard (1.9, N2): consulted BEFORE verifyStep at this same
         // natural-completion boundary — the cheaper, narrower question — and a
@@ -646,13 +752,16 @@ export async function runToolLoop(
         // (nothing worth verifying in an answer the caller calls incomplete).
         // The two retry budgets never mix. Mirrors the streaming loop exactly;
         // the buffered path has no stream, so there is no `false-finish` part.
-        const completion = await evaluateDoneWhen(options, {
-          stepIndex,
-          attempt: falseFinishRetries,
-          text: step.text,
-          messages,
-          usage: durableUsage(durable, totalUsage),
-        });
+        // Neither hook re-drives a refused or cut-off turn (2.3).
+        const completion = cutOff
+          ? undefined
+          : await evaluateDoneWhen(options, {
+              stepIndex,
+              attempt: falseFinishRetries,
+              text: step.text,
+              messages,
+              usage: durableUsage(durable, totalUsage),
+            });
         if (completion) {
           if (completion.done) {
             // A later round genuinely finished: an earlier give-up must not mark
@@ -679,13 +788,15 @@ export async function runToolLoop(
 
         // Verified generation (1.8): a rejected verdict feeds feedback back as
         // a user turn and re-drives the loop (bounded by maxVerifyAttempts).
-        const verification = await evaluateVerifyStep(options, {
-          stepIndex,
-          attempt: verifyAttempts,
-          text: step.text,
-          messages,
-          usage: durableUsage(durable, totalUsage),
-        });
+        const verification = cutOff
+          ? undefined
+          : await evaluateVerifyStep(options, {
+              stepIndex,
+              attempt: verifyAttempts,
+              text: step.text,
+              messages,
+              usage: durableUsage(durable, totalUsage),
+            });
         if (verification) {
           verified = verification.verdict.ok;
           if (verification.retry) {
@@ -726,12 +837,19 @@ export async function runToolLoop(
           // content array is not a message any wire accepts (see isEmptyTurn) —
           // so the turn is DROPPED rather than persisted in an unsendable shape.
           const drop = isEmptyTurn(rewritten);
-          messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
-          chatMessages = drop
-            ? chatMessages.slice(0, -1)
-            : [...chatMessages.slice(0, -1), rewritten];
-          if (drop) appended.pop();
-          else appended[appended.length - 1] = rewritten;
+          if (stored) {
+            messages = drop ? messages.slice(0, -1) : [...messages.slice(0, -1), rewritten];
+            chatMessages = drop
+              ? chatMessages.slice(0, -1)
+              : [...chatMessages.slice(0, -1), rewritten];
+            if (drop) appended.pop();
+            else appended[appended.length - 1] = rewritten;
+          } else if (!drop) {
+            // A replacement gives an empty turn something to say: record it now.
+            messages = [...messages, rewritten];
+            appended.push(rewritten);
+            chatMessages = [...chatMessages, rewritten];
+          }
           // The SAME step must agree: a consumer auditing `steps[]` would
           // otherwise still read the text the guardrail removed.
           steps[steps.length - 1] = {
@@ -756,48 +874,42 @@ export async function runToolLoop(
       appended.push(step.assistantMessage);
       chatMessages = [...chatMessages, step.assistantMessage];
 
-      // Handoff (2.0): the DETERMINISTIC interception — before guardrails, the
-      // approval gate and `executeTools`. A transfer is decided by looking at
-      // the call, never by an exception thrown out of an `execute`. Everything
-      // ELSE in the batch runs completely normally: a model that calls `search`
-      // and `transfer_to_billing` in one step gets both honored.
-      const { handoffCalls, normalCalls } = hasHandoffTools(handoffTools)
-        ? splitHandoffCalls(toolCalls, tools)
-        : { handoffCalls: [], normalCalls: toolCalls };
-
-      // Tool-call guardrails (2.0): evaluated IMMEDIATELY before the approval
-      // gate, so a rewrite reaches the `needsApproval` predicate, the approval
-      // request a human sees, and `execute` — while the assistant turn appended
-      // just above keeps the arguments the MODEL issued.
-      const guardedCalls = await applyToolCallGuardrails(options, normalCalls, messages, stepIndex);
-      logGuardrailParts(guardrailLog, guardedCalls.parts);
-      /** What actually reaches the gate + `executeTools` (transfers excluded). */
-      const execCalls = guardedCalls.calls;
+      // The dispatch contract (2.3): ONE plan for the batch, shared with the
+      // streaming loop and the resume settle — the execution policy, the
+      // `onToolCall` guardrails and the approval gate for every call, then the
+      // transfer decision (made by looking at the call, never by an exception out
+      // of an `execute`). Everything ELSE in the batch runs completely normally: a
+      // model that calls `search` and `transfer_to_billing` in one step gets both
+      // honored.
+      const plan = await planToolDispatch({
+        calls: toolCalls,
+        tools: stepTools,
+        options,
+        messages,
+        stepIndex,
+        ...(hasHandoffTools(handoffTools)
+          ? { handoff: { tools: handoffTools, ...(active ? { active } : {}) } }
+          : {}),
+        // An approval is bound to the run and to the checkpoint its suspension
+        // writes next (2.3); a call without a session binds neither.
+        approval: { runId: durable?.runId, step: durable ? durable.stepIndex + 1 : undefined },
+        clock: deps.clock,
+        ...(observeCtx ? { observe: observeCtx } : {}),
+      });
+      logGuardrailParts(guardrailLog, plan.guardrails);
+      /** What actually reaches `executeTools` (transfers excluded). */
+      const execCalls = plan.execCalls;
       // The REPORTED calls stay in the model's own order and include the
       // transfers, so `StepResult.toolCalls` describes the step the model took —
-      // with any guardrail rewrite applied, exactly as before.
-      toolCalls =
-        handoffCalls.length === 0
-          ? execCalls
-          : (() => {
-              const rewritten = new Map(execCalls.map((c) => [c.toolCallId, c]));
-              return toolCalls.map((c) => rewritten.get(c.toolCallId) ?? c);
-            })();
-      // A blocked call never reaches the approval gate: it already has a
-      // verdict, and gating it would suspend the run on a call that is not
-      // going to run either way.
-      const gateCandidates =
-        guardedCalls.blocked.size > 0
-          ? execCalls.filter((c) => !guardedCalls.blocked.has(c.toolCallId))
-          : execCalls;
+      // with any guardrail rewrite applied.
+      toolCalls = plan.calls;
 
-      // The transfer verdict is computed HERE — before the approval gate and
-      // before `executeTools`, both of which can leave the step early. A break
-      // that left a transfer's `tool_use` id unanswered would hand the provider
-      // an unanswerable turn on the next request AND silently drop the routing
+      // The transfer verdict is part of the plan — made before the approval
+      // gate and `executeTools` can leave the step early. A break that left a
+      // transfer's `tool_use` id unanswered would hand the provider an
+      // unanswerable turn on the next request AND silently drop the routing
       // decision, so the decision is made once and committed on every exit.
-      const handoffDecision =
-        handoffCalls.length > 0 ? decideHandoff(handoffCalls, active) : undefined;
+      const handoffDecision = plan.handoff;
       /**
        * Apply the transfer on a path that executes NOTHING else. Returns the
        * `{role:'tool'}` turn that answers the transfer ids so the caller can
@@ -832,41 +944,18 @@ export async function runToolLoop(
         return message;
       };
 
-      // Approval gate: server mode denies inline; without approveToolCall the
-      // gated calls break the loop like client tools (client mode).
-      const gated = await findApprovalNeeded(gateCandidates, tools, options, messages);
-      const denied = options.approveToolCall
-        ? await resolveServerApprovals(gated, gateCandidates, options, messages)
-        : new Map<string, Denial>();
-      // Guardrail blocks JOIN the approval flow's denial map — one machinery for
-      // every "this call does not run" verdict.
-      for (const [id, denial] of guardedCalls.blocked) denied.set(id, denial);
-      const pendingApproval = options.approveToolCall
-        ? []
-        : gateCandidates.filter((c) => gated.has(c.toolCallId));
-      if (observeCtx && gated.size > 0) {
-        const gatedCalls = toolCalls.filter((c) => gated.has(c.toolCallId));
-        observeApprovalRequests(
-          observeCtx,
-          options,
-          gatedCalls,
-          options.approveToolCall ? 'server' : 'client',
-        );
-        if (options.approveToolCall) {
-          observeServerResolutions(observeCtx, options, gatedCalls, denied);
-        }
-      }
-
-      // Client tools a guardrail BLOCKED are not pending on anyone (see
-      // pendingClientCalls) — they fall through to `executeTools` instead.
-      const clientCalls = pendingClientCalls(toolCalls, tools, guardedCalls.blocked);
+      // Guardrail blocks and approval denials share ONE denial map — one
+      // machinery for every "this call does not run" verdict.
+      const denied = plan.denied;
+      const pendingApproval = plan.pendingApproval;
+      const clientCalls = plan.clientCalls;
 
       // Pending approvals and client tools (no execute) can't be auto-continued —
       // ONE break, executing nothing from the batch; the resume settles the rest.
       if (pendingApproval.length > 0 || clientCalls.length > 0) {
         if (pendingApproval.length > 0) {
           pendingApprovals = await signApprovalRequests(
-            toApprovalRequests(pendingApproval, options.agentPath),
+            plan.requests,
             options,
             deps,
             durable?.runId,
@@ -918,7 +1007,7 @@ export async function runToolLoop(
 
       let toolResults;
       try {
-        toolResults = await executeTools(execCalls, tools, options, messages, denied, extras);
+        toolResults = await executeTools(execCalls, stepTools, options, messages, denied, extras);
       } catch (err) {
         if (!(err instanceof SubAgentSuspension)) throw err;
         // A durable sub-agent suspended: no tool message is appended for the
@@ -1004,7 +1093,7 @@ export async function runToolLoop(
         messages = swap.messages;
         handoffLog.push(swap.entry);
         ownTools = active.tools;
-        tools = mergeMcpTools(mcp, ownTools);
+        tools = mergeMcpTools(mcp, ownTools, warn);
         fullWire = await buildWireTools(tools, options.toolChoice, options.maxToolConcurrency);
         staticWire = filterWireTools(fullWire, options.activeTools, deps.logger);
         // Compaction is measured against — and summarized by — whoever is
@@ -1032,8 +1121,9 @@ export async function runToolLoop(
       // guard. A refused HANDOFF (budget spent, or a sibling transfer in the
       // same batch) is the same kind of verdict, so it is excluded too: the
       // model is being told to carry on, not failing at anything.
-      const handoffIds =
-        handoffCalls.length > 0 ? new Set(handoffCalls.map((h) => h.call.toolCallId)) : undefined;
+      const handoffIds = handoffDecision
+        ? new Set(handoffDecision.results.map((r) => r.toolCallId))
+        : undefined;
       if (
         bumpErrorGuard(
           errorCounters,

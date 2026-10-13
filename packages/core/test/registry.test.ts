@@ -3,8 +3,11 @@ import {
   getCapabilities,
   getEmbeddingCapabilities,
   getModelCapabilities,
+  isMaxOutputPlaceholder,
+  registryMatch,
   type ModelCapabilities,
 } from '../src/core/registry';
+import { resolveModelProfile } from '../src/model-profile';
 import { generateText } from '../src/generate';
 import {
   createOpenAICompatible,
@@ -69,6 +72,131 @@ describe('registry: 2026-07 Anthropic catalog', () => {
   });
 });
 
+// ===================================================================
+// 2.3 (F14) — Claude 5.x rows. Verified against Anthropic's API reference
+// (cached 2026-10-06), NOT live-verified: these pin what the SDK sends.
+// ===================================================================
+
+describe('registry: Claude 5.x (2.3, F14)', () => {
+  const CLAUDE_5 = ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
+
+  it('the four current ids are known rows with the Claude 5.x request rules', () => {
+    for (const id of CLAUDE_5) {
+      const caps = getCapabilities(anthropic(id));
+      expect(caps.known, id).toBe(true);
+      expect(caps, id).toMatchObject({
+        effortWire: 'output_config',
+        samplingRestrictions: true,
+        structuredOutput: true,
+        caching: true,
+        vision: true,
+        reasoning: true,
+        contextWindow: 1_000_000,
+        maxOutput: 128_000,
+      });
+      expect(caps.effortLevels, id).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    }
+  });
+
+  it('forced tool_choice: rejected by Fable 5.1 / Opus 5.5 / Sonnet 5.5, accepted by Haiku 5.5', () => {
+    for (const id of ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5']) {
+      expect(getCapabilities(anthropic(id)).forcedToolChoice, id).toBe(false);
+    }
+    expect(getCapabilities(anthropic('claude-haiku-5-5')).forcedToolChoice).toBe(true);
+  });
+
+  it("effort 'none' maps per model; documented defaults are recorded", () => {
+    expect(getCapabilities(anthropic('claude-fable-5-1')).effortNone).toBe('lowest');
+    expect(getCapabilities(anthropic('claude-opus-5-5'))).toMatchObject({
+      effortNone: 'lowest',
+      effortDefault: 'medium',
+    });
+    expect(getCapabilities(anthropic('claude-sonnet-5-5'))).toMatchObject({
+      effortNone: 'thinking-between-tools',
+      effortDefault: 'high',
+    });
+    expect(getCapabilities(anthropic('claude-haiku-5-5'))).toMatchObject({
+      effortNone: 'thinking-disabled',
+      effortDefault: 'medium',
+    });
+  });
+
+  it('claude-opus-5 is now a known row (thinking can be disabled at effort <= high)', () => {
+    const caps = getCapabilities(anthropic('claude-opus-5'));
+    expect(caps.known).toBe(true);
+    expect(caps).toMatchObject({
+      effortWire: 'output_config',
+      samplingRestrictions: true,
+      contextWindow: 1_000_000,
+      maxOutput: 128_000,
+      effortNone: 'thinking-disabled',
+    });
+  });
+
+  it('family fallback: an unknown claude-{fable,opus,sonnet,haiku}-N (N >= 5) gets the 5.x rules', () => {
+    const logger: Logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    for (const id of [
+      'claude-opus-9-9',
+      'claude-sonnet-6',
+      'claude-haiku-5-7',
+      'claude-fable-5-2',
+    ]) {
+      const caps = getCapabilities(anthropic(id), logger);
+      expect(caps.known, id).toBe(false); // still a fallback — the unknown-model warning fires
+      expect(caps, id).toMatchObject({
+        effortWire: 'output_config',
+        samplingRestrictions: true,
+        structuredOutput: true,
+        caching: true,
+        reasoning: true,
+        forcedToolChoice: false,
+        effortNone: 'lowest',
+        contextWindow: 1_000_000,
+        maxOutput: 128_000,
+      });
+    }
+    expect(logger.warn).toHaveBeenCalledTimes(4);
+    expect(String((logger.warn as ReturnType<typeof vi.fn>).mock.calls[0]![0])).toContain(
+      'Claude 5.x',
+    );
+  });
+
+  it('the family fallback stays narrow: 4.x, other names and other wires keep the old fallback', () => {
+    expect(getCapabilities(anthropic('claude-opus-4-9')).effortWire).toBe('budget_tokens');
+    expect(getCapabilities(anthropic('claude-zeta-9-9')).effortWire).toBe('budget_tokens');
+    expect(getCapabilities(anthropic('claude-opus-5x')).effortWire).toBe('budget_tokens');
+    // The 5.x rules are Messages-wire rules: a chat_completions proxy keeps its own fallback.
+    const viaProxy = getCapabilities({
+      provider: 'openrouter',
+      modelId: 'claude-opus-9-9',
+      surface: 'chat_completions',
+    });
+    expect(viaProxy.samplingRestrictions).toBe(false);
+  });
+
+  it('the capabilities override cannot re-enable budget_tokens or sampling for the 5.x family', () => {
+    for (const id of ['claude-opus-5-5', 'claude-opus-9-9']) {
+      const caps = getCapabilities(anthropic(id), undefined, {
+        reasoning: true,
+        effortWire: 'budget_tokens',
+        samplingRestrictions: false,
+      });
+      expect(caps.effortWire, id).toBe('output_config');
+      expect(caps.samplingRestrictions, id).toBe(true);
+      expect(caps.reasoning, id).toBe(true);
+    }
+    // A plain `{ reasoning: true }` (the documented cure) keeps the 5.x wire too.
+    expect(
+      getCapabilities(anthropic('claude-opus-9-9'), undefined, { reasoning: true }).effortWire,
+    ).toBe('output_config');
+    // Older families are untouched: an override is still a claim the SDK does not check.
+    expect(
+      getCapabilities(anthropic('claude-opus-4-6'), undefined, { samplingRestrictions: true })
+        .samplingRestrictions,
+    ).toBe(true);
+  });
+});
+
 describe('registry: 2026-07 OpenAI catalog', () => {
   it('gpt-5.5 exposes reasoning (effort ships on both OpenAI wires)', () => {
     const caps = getCapabilities({
@@ -115,6 +243,16 @@ describe('registry: 2026-07 Google catalog', () => {
       surface: 'native',
     });
     expect(caps.known).toBe(true);
+  });
+  it('gemini-3.1-pro, the GA id, is known on both wires: natively it shares the preview row', () => {
+    const on = (modelId: string, surface: 'native' | 'chat_completions') =>
+      getCapabilities({ provider: 'google', modelId, surface });
+    const ga = on('gemini-3.1-pro', 'native');
+    expect(ga).toEqual(on('gemini-3.1-pro-preview', 'native'));
+    expect(ga.known).toBe(true);
+    // A documented limit, not the fallback's placeholder: the native wire sends it.
+    expect(isMaxOutputPlaceholder(ga)).toBe(false);
+    expect(on('gemini-3.1-pro', 'chat_completions').known).toBe(true);
   });
 });
 
@@ -206,7 +344,7 @@ const maxTokensOf = (body: unknown): number =>
   (JSON.parse(String(body)) as { max_tokens: number }).max_tokens;
 
 describe('registry: capability overrides (1.9)', () => {
-  it('THE BUG: an unknown slug truncates at 4096 unless overridden — the override reaches the wire', async () => {
+  it('THE BUG: an unknown slug is no longer truncated at 4096 — and the override still reaches the wire', async () => {
     const { fetch, calls } = ccReplay();
     const together = createOpenAICompatible({
       id: 'together',
@@ -216,8 +354,12 @@ describe('registry: capability overrides (1.9)', () => {
     });
     const model = together(UNKNOWN_SLUG);
 
+    // 2.3 (F08, deliberate): the 4096 placeholder used to reach the wire and
+    // silently truncate. Chat Completions' cap is optional, so it is now left
+    // off and the host's own default applies.
     await generateText({ model, prompt: 'hi' });
-    expect(maxTokensOf(calls[0]!.init!.body)).toBe(4_096); // the silent truncation
+    expect(JSON.parse(String(calls[0]!.init!.body))).not.toHaveProperty('max_tokens');
+    expect(getModelCapabilities(model).maxOutput).toBe(4_096); // still the reported placeholder
 
     await generateText({ model, prompt: 'hi', capabilities: { maxOutput: 32_000 } });
     expect(maxTokensOf(calls[1]!.init!.body)).toBe(32_000);
@@ -347,4 +489,25 @@ describe('registry: 2026-07 embedding catalog', () => {
     });
     expect(caps.known).toBe(false);
   });
+});
+
+describe('registry lookups read own rows only (2.3)', () => {
+  it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])(
+    '%s is an unknown model, not an inherited object member',
+    (modelId) => {
+      for (const surface of ['anthropic', 'chat_completions', 'responses', 'native'] as const) {
+        expect(registryMatch({ provider: 'x', surface, modelId }), surface).toBe('fallback');
+        const caps = getModelCapabilities({ provider: 'x', surface, modelId });
+        expect(caps.known, surface).toBe(false);
+        expect(caps.maxOutput, surface).toBeGreaterThan(0);
+      }
+      expect(
+        getEmbeddingCapabilities({ provider: 'openai', surface: 'openai-embeddings', modelId })
+          .known,
+      ).toBe(false);
+      expect(resolveModelProfile({ provider: 'x', surface: 'responses', modelId }).match).toBe(
+        'fallback',
+      );
+    },
+  );
 });

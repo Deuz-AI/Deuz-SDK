@@ -39,7 +39,7 @@ after(() => res.consume?.());   // next/server; ctx.waitUntil(...) on Workers
 return response;
 ```
 
-`consume()` takes its own subscription (safe alongside iteration), is memoized, and NEVER rejects — failures go to `consume({ onError })`. Write `res.consume?.()`: it is `undefined` on two paths (`streamChat({ fallbackModels })` and the `withFallback` middleware).
+`consume()` takes its own subscription (safe alongside iteration), is memoized, and NEVER rejects — failures go to `consume({ onError })`. Write `res.consume?.()`: the type marks it optional, so a hand-written result may lack it. Every result core builds has it, `streamChat({ fallbackModels })` and the `withFallback` middleware included (since 1.9).
 
 ## Timeouts
 
@@ -107,7 +107,7 @@ const result = streamChat({ model, prompt, temperature: 0.7 });
 for (const w of (await result.warnings) ?? []) console.warn(w.type, w.setting, w.message);
 ```
 
-`CallWarning` is `{ type: 'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other'; setting?: string; message: string }` — an OPEN union, so treat an unknown `type` as `'other'`. (`clamped-setting` has no producer yet.)
+`CallWarning` is `{ type: 'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'unpriced-model' | 'other'; setting?: string; message: string }` — an OPEN union, so treat an unknown `type` as `'other'`. Since 2.3 `clamped-setting` reports every value a request changes (an effort level a model lacks, a forced `toolChoice` sent as `auto`, sampling dropped while thinking is on), and `unpriced-model` a model with no price under a USD budget.
 
 Where it differs from the AI SDK:
 
@@ -151,7 +151,7 @@ const { object } = await generateObject({ model, schema, prompt: `Structure this
 
 ## Unknown model slugs
 
-Deuz never throws on an unrecognized slug — it falls back to a conservative row (`maxOutput: 4096`, `reasoning: false`, `structuredOutput: false`) and logs a warning. So a port using a brand-new slug can be **silently truncated at 4096 output tokens**. Fix it per call:
+Deuz never throws on an unrecognized slug — it falls back to a conservative row (`reasoning: false`, `structuredOutput: false`, a `maxOutput: 4096` placeholder) with an `unknown-model` warning. On the Anthropic wire, which requires `max_tokens`, a port using a brand-new slug is **truncated at 4096 output tokens**; since 2.3 OpenAI and Gemini leave the cap off. Fix it per call:
 
 ```ts
 capabilities: { maxOutput: 32_000, reasoning: true, structuredOutput: true }

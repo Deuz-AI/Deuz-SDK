@@ -110,6 +110,10 @@
     "Adding one here takes the gate red for every bundle, including the ones it was protecting.",
     "Their edge-safety guard is `tooling/check-runtime-compat.mjs` instead, whose node-only input",
     "regex names all four: it fails if a browser/edge consumer can so much as REACH them.",
+    "The same holds for the 2.3 Redis stores `./ops/redis` and `./swarm/redis` (lazy `redis` peer),",
+    "which the runtime check lists as Node-only entries and negative controls.",
+    "`./headless` (2.3 preview) is Node-only too (lazy node:fs/promises, node:path, node:process) and is",
+    "listed there as a Node-only entry, not budgeted here.",
     "",
     "core/edge/lazy are untouched by the 2.0 publication surface. The new barrel exports (handoff,",
     "the built-in guardrails, compactMessages on the root; handoff + guardrails on edge) tree-shake",
@@ -155,58 +159,188 @@
     "evolve is large because its mutation step runs generateText (the full inference path) — measured,",
     "not accidental. Its lazy chunks are the same optional features as native-agent and carry the same",
     "limits; MCP keeps the shared 18500/7050 allowance. core (152083/47486) and edge (141290/43952)",
-    "stay inside their 2.0 limits: the new edge.ts re-exports tree-shake out of the measured set."
+    "stay inside their 2.0 limits: the new edge.ts re-exports tree-shake out of the measured set.",
+    "",
+    "RAISED FOR 2.3 (wave 1). Measured on feat/2.3 after the nine W1 lanes, same pipeline (base = 2.2.0",
+    "stubs a1dd464):",
+    "  core          164412 B raw / 50825 gzip  (base 152083 / 47485)  -> 172000 / 53300",
+    "  edge          153610 B raw / 47410 gzip  (base 141290 / 43955)  -> 161000 / 49700",
+    "  native-agent  212166 B raw / 65965 gzip                          -> 222000 / 69000",
+    "  native-swarm  220888 B raw / 68690 gzip                          -> 231000 / 71900",
+    "  ops             2389 B raw /  1084 gzip  (F24 ack, F25 prune)    ->   2500 /  1150",
+    "What grew in core (src attribution, minified): core/registry.ts +4.6 KB and core/request-rules.ts",
+    "+3.3 KB (2.3 model rows, effort/cap rules and the reported clamps, F08/F14/F19/F26), the four",
+    "adapters +1.7 KB, the loops +1.5 KB (refusal/length gate F16, unpriced admission F13), the",
+    "legacy UnpricedModelError. resolveModelProfile shares a dist chunk with createClient, so its",
+    "facts tables are built by /* @__PURE__ */ calls: without that the core entry carried them",
+    "(+6.1 KB) although nothing reached them.",
+    "Lazy groups: mcp 22500 / 8450 (native runs fingerprint MCP catalogs, F01; dual-stack MCP client);",
+    "native-request 4300 / 1950 in core, 3400 / 1650 elsewhere (wire-cap reservation F12, unpriced",
+    "policy, settlement retries F17); usage-cost 3200 / 1400 (unpriced counters, admit, F13); new",
+    "optional chunks sdk-v2 (MCP 2026-07-28 client) 13100 / 5300 and native-mcp (MCP receipts in",
+    "native runs) 24200 / 9000.",
+    "New bundles: mcp-server 15697 / 6031 eager -> 17150 / 6570, lazy 227815 / 72870 (the native",
+    "agent machinery, loaded only when agents or agentTools are served) -> 239000 / 76500; realtime",
+    "44443 / 15343 -> 48700 / 16800. ./mcp/server/stdio is Node-only and not budgeted.",
+    "Raised again after the W1 review fixes: native-request 4004 / 1837 measured in core (the F12 cap",
+    "sent under a bound, the F17 conflict handling and decision 4's per-run reporting).",
+    "evolve 189775 B raw after the W1 review fixes (run-ledger marking, per-run warnings) -> 199000 / 63100.",
+    "",
+    "RAISED FOR 2.3 (wave 2a). Measured on feat/2.3 after the seven W2a lanes and their wiring, same",
+    "pipeline (base = W1 close 9f453cd):",
+    "  core          177134 B raw / 54855 gzip  -> 185000 / 57300",
+    "  edge          166401 B raw / 51428 gzip  -> 174000 / 53800",
+    "  native-agent  231588 B raw / 72166 gzip  -> 242000 / 75400",
+    "  native-swarm  238057 B raw / 74316 gzip  -> 249000 / 77700",
+    "  evolve        200845 B raw / 63130 gzip  -> 210000 / 66000",
+    "  chat           17323 B raw /  5606 gzip  ->  18200 /  5900",
+    "  mcp-server lazy 248580 B raw / 79731 gzip -> 260000 / 83300 (follows native-agent)",
+    "What grew (src attribution, minified, core +11.4 KB): inference/loop-shared.ts +5.2 KB, the single",
+    "dispatch path (policy, guardrails, approval, handoff, client calls), identity-bound approval ids,",
+    "ToolCallOutcome, onCatalogChange and typed MCP name-collision warnings (A2, 23.2);",
+    "adapters/anthropic.ts +3.1 KB, thinking-block identity, redacted_thinking, the block_binding",
+    "default and its input_transformations warning (D1A, F21/F22) and tools beside a json strategy",
+    "(A2H, F15); inference/run-step.ts +1.2 KB, createTurnContent (arrival-order turns, F21); the other",
+    "adapters +1.0 KB (own-family reasoning replay, reasoning_content, F15); stop-details and reasoning",
+    "helpers +0.5 KB. native-agent and native-swarm also carry the run lease (+2.1 KB) and the",
+    "in-memory AgentRunStore.list (+1.9 KB, F2 23.6). chat: reasoning frames keep their block id,",
+    "opaque flags and source (D1A). Nothing here is a retained table: every delta is reachable code.",
+    "New bundles, no lazy chunks, ~10% headroom:",
+    "  goal     22435 / 7097  -> 24700 / 7800   (records, transitions, events, in-memory store)",
+    "  batch    92288 / 27257 -> 101500 / 30000 (carries the four wire adapters and the registry to",
+    "           build each request body, as the core entry does)",
+    "  a2a      35057 / 11808 -> 38600 / 13000  (client alone 14755 / 5384)",
+    "  ops       3295 / 1511  ->  3650 / 1700   (findStaleAgentRuns and agentRunLeaseKey measured too)",
+    "",
+    "RAISED FOR 2.3 (wave 2b). Measured on feat/2.3 after the seven W2b lanes and their wiring, same",
+    "pipeline (base = W2a close 5c84318):",
+    "  core          182880 B raw / 56932 gzip  -> 188500 / 58600 (fit before; ~3% forward headroom)",
+    "  edge          172853 B raw / 53493 gzip  -> 178000 / 55100 (fit before; ~3% forward headroom)",
+    "  native-agent  247178 B raw / 77159 gzip  -> 255000 / 79600",
+    "  native-swarm  253112 B raw / 79256 gzip  -> 261000 / 81700",
+    "  evolve        208449 B raw / 65595 gzip  -> 216000 / 68000",
+    "  chat           22279 B raw /  7117 gzip  ->  24500 /  7850",
+    "  ui             17189 B raw /  6096 gzip  ->  18900 /  6700 (exports now include",
+    "                 toDeuzAgentStreamResponse and agentStateFromParts; without them 10944 / 4342)",
+    "  mcp-server lazy 272767 B raw / 87357 gzip -> 283000 / 90600 (follows native-agent plus the three",
+    "                 new lazy chunks below)",
+    "What grew (src attribution, minified): core +4.6 KB, all F22 stable-prefix work (D1):",
+    "inference/loop-shared.ts +1.3 KB (leading-system extraction, recall once per turn, tool-set change",
+    "carriers, step-offered dispatch), inference/compaction.ts +1.0 KB (simple compaction for Claude 5.x),",
+    "adapters/anthropic.ts +0.7 KB (in-place system messages, tool_addition/tool_removal blocks),",
+    "internal/stable-prefix.ts +0.6 KB (new), the two loops +0.5 KB, NoObjectGeneratedError",
+    "finishReason/stopDetails +0.3 KB. native-agent +10.5 KB: the core growth plus agent-run.ts +5.4 KB",
+    "(native chat, memory and fail-over orchestration, envelope version 2, reconcileAgentRun; D2 23.4),",
+    "inference/agent-tool.ts +0.4 KB (recycled-id child keys), internal/native-scope.ts +0.2 KB. chat",
+    "+4.4 KB: internal/agent-ui.ts, the data-agent frame reducer applyUIPart folds into",
+    "AssistantTurnState.agent, plus stopDetails/outcome display fields (G2 23.5).",
+    "New lazy chunks (edge, native-agent, native-swarm), ~8% headroom; a run without the option never",
+    "loads them:",
+    "  native-chat      3041 / 1414 -> 3300 / 1550",
+    "  native-memory   13025 / 5364 -> 13800 / 5700",
+    "  native-fallback   833 /  501 -> 1000 /  600",
+    "",
+    "RAISED FOR 2.3 (W2b review fixes). Measured on feat/2.3 after the six fix lanes, same pipeline:",
+    "  native-mcp lazy  24298 B raw / 9105 gzip -> 24700 / 9250 (edge, native-agent, native-swarm)",
+    "What grew: inference/native-mcp.ts +0.5 KB raw / +0.2 KB gzip, the resume that accepts a drifted",
+    "catalog under onCatalogChange: accept and refuses one while an MCP call of the last turn has no",
+    "answer (Z3, F-EV1-1). Every other bundle still fits its W2b limit.",
+    "",
+    "ADDED FOR 2.3 (wave 3). Measured on feat/2.3 after the nine W3 lanes:",
+    "  a2a-agent  46927 B raw / 15582 gzip -> 50500 / 16800 (~8%): the a2a client and handler plus",
+    "             createA2AAgentExecutor (src/a2a/agent.ts); the native engine is passed in, so it stays",
+    "             out of the graph. a2a without the adapter grew 35445 / 11949 -> 36026 / 12050 (ctx.draft",
+    "             and the follow-up answer rule) and still fits its limit, as do the native bundles after",
+    "             the receipt settle and the native drain (RS3).",
+    "",
+    "RAISED FOR 2.3 (W3 fix rounds). Measured on feat/2.3 after fix lanes K4, B1-B6 and C1:",
+    "  native-agent     254661 B raw / 79782 gzip -> 257500 / 80400",
+    "  native-swarm     260648 B raw / 81688 gzip -> 263500 / 82500",
+    "  mcp-server lazy  281325 B raw / 90338 gzip -> 285000 / 91200",
+    "What grew: agent-run.ts +1.4 KB raw (B1: the settle record before a resume's first model call, the",
+    "client-result settle tools, the 2.2 envelope-version rule, the reconcilable-receipt filter), the",
+    "loops +0.2 KB (internal hooks), the adapters +0.4 KB (K4/C1: Gemini finish reasons, OpenAI refusals)."
   ],
   "bundles": {
     "core": {
       "from": "@deuz-sdk/core",
       "exports": ["streamChat", "generateText", "generateObject", "createClient"],
-      "maxRawBytes": 156500,
-      "maxGzipBytes": 49200,
-      "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050,
+      "maxRawBytes": 188500,
+      "maxGzipBytes": 58600,
+      "maxLazyRawBytes": 22500,
+      "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 2550,
-          "maxGzipBytes": 1200
+          "maxRawBytes": 4300,
+          "maxGzipBytes": 1950
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
-          "maxRawBytes": 1500,
-          "maxGzipBytes": 675
+          "maxRawBytes": 3200,
+          "maxGzipBytes": 1400
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
           "maxGzipBytes": 4750
+        },
+        "sdk-v2": {
+          "entryPoint": "sdk-v2",
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5300
         }
       }
     },
     "edge": {
       "from": "@deuz-sdk/core/edge",
       "exports": ["streamChat", "generateText", "generateObject", "createApprovalSigner"],
-      "maxRawBytes": 143800,
-      "maxGzipBytes": 45400,
-      "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050,
+      "maxRawBytes": 178000,
+      "maxGzipBytes": 55100,
+      "maxLazyRawBytes": 22500,
+      "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 2550,
-          "maxGzipBytes": 1200
+          "maxRawBytes": 3400,
+          "maxGzipBytes": 1650
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
-          "maxRawBytes": 1500,
-          "maxGzipBytes": 675
+          "maxRawBytes": 3200,
+          "maxGzipBytes": 1400
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
           "maxGzipBytes": 4750
+        },
+        "sdk-v2": {
+          "entryPoint": "sdk-v2",
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5300
+        },
+        "native-mcp": {
+          "entryPoint": "native-mcp",
+          "maxRawBytes": 24700,
+          "maxGzipBytes": 9250
+        },
+        "native-chat": {
+          "entryPoint": "native-chat",
+          "maxRawBytes": 3300,
+          "maxGzipBytes": 1550
+        },
+        "native-memory": {
+          "entryPoint": "native-memory",
+          "maxRawBytes": 13800,
+          "maxGzipBytes": 5700
+        },
+        "native-fallback": {
+          "entryPoint": "native-fallback",
+          "maxRawBytes": 1000,
+          "maxGzipBytes": 600
         }
       }
     },
@@ -227,60 +361,110 @@
         "createInMemoryBudgetStore",
         "BudgetStoreError"
       ],
-      "maxRawBytes": 209800,
-      "maxGzipBytes": 65250,
-      "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050,
+      "maxRawBytes": 257500,
+      "maxGzipBytes": 80400,
+      "maxLazyRawBytes": 22500,
+      "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 1550,
-          "maxGzipBytes": 825
+          "maxRawBytes": 3400,
+          "maxGzipBytes": 1650
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
-          "maxRawBytes": 1500,
-          "maxGzipBytes": 675
+          "maxRawBytes": 3200,
+          "maxGzipBytes": 1400
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
           "maxGzipBytes": 4750
+        },
+        "sdk-v2": {
+          "entryPoint": "sdk-v2",
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5300
+        },
+        "native-mcp": {
+          "entryPoint": "native-mcp",
+          "maxRawBytes": 24700,
+          "maxGzipBytes": 9250
+        },
+        "native-chat": {
+          "entryPoint": "native-chat",
+          "maxRawBytes": 3300,
+          "maxGzipBytes": 1550
+        },
+        "native-memory": {
+          "entryPoint": "native-memory",
+          "maxRawBytes": 13800,
+          "maxGzipBytes": 5700
+        },
+        "native-fallback": {
+          "entryPoint": "native-fallback",
+          "maxRawBytes": 1000,
+          "maxGzipBytes": 600
         }
       }
     },
     "native-swarm": {
       "from": "@deuz-sdk/core/swarm",
       "exports": ["createSwarm", "createInMemorySwarmStore", "SwarmConflictError"],
-      "maxRawBytes": 219300,
-      "maxGzipBytes": 68400,
-      "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050,
+      "maxRawBytes": 263500,
+      "maxGzipBytes": 82500,
+      "maxLazyRawBytes": 22500,
+      "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 1550,
-          "maxGzipBytes": 825
+          "maxRawBytes": 3400,
+          "maxGzipBytes": 1650
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
-          "maxRawBytes": 1500,
-          "maxGzipBytes": 675
+          "maxRawBytes": 3200,
+          "maxGzipBytes": 1400
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
           "maxGzipBytes": 4750
+        },
+        "sdk-v2": {
+          "entryPoint": "sdk-v2",
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5300
+        },
+        "native-mcp": {
+          "entryPoint": "native-mcp",
+          "maxRawBytes": 24700,
+          "maxGzipBytes": 9250
+        },
+        "native-chat": {
+          "entryPoint": "native-chat",
+          "maxRawBytes": 3300,
+          "maxGzipBytes": 1550
+        },
+        "native-memory": {
+          "entryPoint": "native-memory",
+          "maxRawBytes": 13800,
+          "maxGzipBytes": 5700
+        },
+        "native-fallback": {
+          "entryPoint": "native-fallback",
+          "maxRawBytes": 1000,
+          "maxGzipBytes": 600
         }
       }
     },
     "ops": {
       "from": "@deuz-sdk/core/ops",
-      "exports": ["createInMemoryLeaseProvider"],
-      "maxRawBytes": 2200,
-      "maxGzipBytes": 1070
+      "exports": ["createInMemoryLeaseProvider", "findStaleAgentRuns", "agentRunLeaseKey"],
+      "maxRawBytes": 3650,
+      "maxGzipBytes": 1700
     },
     "schedule": {
       "from": "@deuz-sdk/core/schedule",
@@ -305,34 +489,39 @@
         "applySearchReplace",
         "parseEvolveBlocks"
       ],
-      "maxRawBytes": 189600,
-      "maxGzipBytes": 60100,
-      "maxLazyRawBytes": 18500,
-      "maxLazyGzipBytes": 7050,
+      "maxRawBytes": 216000,
+      "maxGzipBytes": 68000,
+      "maxLazyRawBytes": 22500,
+      "maxLazyGzipBytes": 8450,
       "legacyLazyEntryPoint": "resolve",
       "lazyFeatures": {
         "native-request": {
           "entryPoint": "native-request",
-          "maxRawBytes": 1550,
-          "maxGzipBytes": 825
+          "maxRawBytes": 3400,
+          "maxGzipBytes": 1650
         },
         "usage-cost": {
           "entryPoint": "usage-cost",
-          "maxRawBytes": 1500,
-          "maxGzipBytes": 675
+          "maxRawBytes": 3200,
+          "maxGzipBytes": 1400
         },
         "memory-pipeline": {
           "entryPoint": "memory-pipeline",
           "maxRawBytes": 11350,
           "maxGzipBytes": 4750
+        },
+        "sdk-v2": {
+          "entryPoint": "sdk-v2",
+          "maxRawBytes": 13100,
+          "maxGzipBytes": 5300
         }
       }
     },
     "chat": {
       "from": "@deuz-sdk/core/chat",
       "exports": ["applyUIPart", "uiFromMessages", "canonicalFromUI", "validateChatRequest"],
-      "maxRawBytes": 17000,
-      "maxGzipBytes": 5500
+      "maxRawBytes": 24500,
+      "maxGzipBytes": 7850
     },
     "ui": {
       "from": "@deuz-sdk/core/ui",
@@ -340,10 +529,12 @@
         "toDeuzStreamResponse",
         "readDeuzStream",
         "createDeuzStream",
-        "connectDeuzStream"
+        "connectDeuzStream",
+        "toDeuzAgentStreamResponse",
+        "agentStateFromParts"
       ],
-      "maxRawBytes": 10600,
-      "maxGzipBytes": 4350
+      "maxRawBytes": 18900,
+      "maxGzipBytes": 6700
     },
     "otel": {
       "from": "@deuz-sdk/core/otel",
@@ -386,6 +577,82 @@
       "exports": ["createOpenAI", "createOpenAIResponses"],
       "maxRawBytes": 1000,
       "maxGzipBytes": 600
+    },
+    "mcp-server": {
+      "from": "@deuz-sdk/core/mcp/server",
+      "exports": ["createMcpServer"],
+      "maxRawBytes": 17150,
+      "maxGzipBytes": 6570,
+      "maxLazyRawBytes": 285000,
+      "maxLazyGzipBytes": 91200
+    },
+    "realtime": {
+      "from": "@deuz-sdk/core/realtime",
+      "exports": [
+        "createRealtimeSession",
+        "createOpenAIRealtime",
+        "createGeminiLive",
+        "createOpenAIClientSecret",
+        "createGeminiAuthToken",
+        "realtimePriceTable",
+        "RealtimeError"
+      ],
+      "maxRawBytes": 48700,
+      "maxGzipBytes": 16800
+    },
+    "goal": {
+      "from": "@deuz-sdk/core/goal",
+      "exports": [
+        "createGoal",
+        "transitionGoal",
+        "assessGoal",
+        "parseGoal",
+        "serializeGoal",
+        "parseGoalEvent",
+        "serializeGoalEvent",
+        "createGoalEvent",
+        "goalEventFromOccurrence",
+        "goalEventFromSignal",
+        "goalWakeupEvent",
+        "goalWakeupKey",
+        "createInMemoryGoalStore",
+        "GoalError"
+      ],
+      "maxRawBytes": 24700,
+      "maxGzipBytes": 7800
+    },
+    "batch": {
+      "from": "@deuz-sdk/core/batch",
+      "exports": ["createBatchClient", "createMemoryBatchJobStore", "BatchError"],
+      "maxRawBytes": 101500,
+      "maxGzipBytes": 30000
+    },
+    "a2a": {
+      "from": "@deuz-sdk/core/a2a",
+      "exports": [
+        "createA2AClient",
+        "fetchAgentCard",
+        "createA2AHandler",
+        "createInMemoryA2ATaskStore",
+        "a2aText",
+        "A2AError"
+      ],
+      "maxRawBytes": 38600,
+      "maxGzipBytes": 13000
+    },
+    "a2a-agent": {
+      "from": "@deuz-sdk/core/a2a",
+      "exports": [
+        "createA2AClient",
+        "fetchAgentCard",
+        "createA2AHandler",
+        "createInMemoryA2ATaskStore",
+        "a2aText",
+        "A2AError",
+        "createA2AAgentExecutor"
+      ],
+      "maxRawBytes": 50500,
+      "maxGzipBytes": 16800
     }
   }
 }

@@ -13,6 +13,8 @@ export type {
   UseChatBudgetExceeded,
   UseChatResumeOptions,
   UseChatCursorStore,
+  UseChatAgent,
+  UseChatStopDetails,
 } from './use-chat';
 
 export { useObject } from './use-object';

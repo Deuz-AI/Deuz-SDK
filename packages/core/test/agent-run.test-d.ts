@@ -40,9 +40,9 @@ test('native schema and array-element inference preserve validated output types'
   void invalid;
   // @ts-expect-error A non-text result type needs a validating output contract.
   void runAgent<number>({ model, prompt: 'x' });
-  // @ts-expect-error Unsupported native options remain on the legacy API only.
-  const unsupported: AgentRunOptions = { model, prompt: 'x', memory: {} };
-  void unsupported;
+  // @ts-expect-error Native memory (2.3) needs its seams and a scope.
+  const partial: AgentRunOptions = { model, prompt: 'x', memory: {} };
+  void partial;
 });
 
 test('only the completed discriminant permits access to output', () => {

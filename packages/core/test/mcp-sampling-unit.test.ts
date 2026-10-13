@@ -44,7 +44,10 @@ function fakeModel(opts: { text?: string; finish?: string } = {}) {
   const { fetch, calls } = mockFetch(() =>
     sseResponse([ccDone(opts.text ?? 'sampled reply', opts.finish ?? 'stop')]),
   );
-  return { model: createOpenAI({ apiKey: 'k', fetch })('gpt-5.5'), calls };
+  // A NON-reasoning chat slug on purpose: these tests pin the MCP → call-option
+  // mapping (max_tokens, temperature, the system turn), which a reasoning row —
+  // gpt-5.5 since 2.3 — renames (max_completion_tokens) or strips.
+  return { model: createOpenAI({ apiKey: 'k', fetch })('gpt-4.1'), calls };
 }
 
 /** Parse a recorded request body — every assertion below is on the wire shape. */
@@ -104,7 +107,7 @@ describe('buildSamplingHandler', () => {
     expect(result).toEqual({
       role: 'assistant',
       content: { type: 'text', text: 'the answer' },
-      model: 'gpt-5.5',
+      model: 'gpt-4.1',
       stopReason: 'endTurn',
     });
     // The systemPrompt folds into the leading system turn at the call boundary.
@@ -117,7 +120,7 @@ describe('buildSamplingHandler', () => {
     expect(sent.temperature).toBe(0.2);
     expect(sent.stop).toEqual(['\n\n']);
     // modelPreferences are hints only — the configured model always wins.
-    expect(sent.model).toBe('gpt-5.5');
+    expect(sent.model).toBe('gpt-4.1');
   });
 
   it('carries an image block onto the wire as a data: URL', async () => {

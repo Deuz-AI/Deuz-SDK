@@ -1,8 +1,8 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.3.0 · api-contract sha256:d0398bbef8c4
      sources: packages/core/src/{rag.ts, rag-node.ts, skills.ts, skills/node.ts, parts.ts, ui.ts, voyage.ts, node/store-postgres.ts},
-     packages/core/src/internal/rerank-http.ts,
+     packages/core/src/internal/rerank-http.ts, packages/core/src/node/headless.ts,
      packages/core/src/types/{tool.ts, stream.ts, methods.ts, message.ts},
-     docs/content/docs/modules/{rag.mdx, skills.mdx}, skills/deuz-sdk/rules/modules.md -->
+     docs/content/docs/modules/{rag.mdx, skills.mdx} -->
 
 # RAG pipelines, and giving an agent skills
 
@@ -333,7 +333,7 @@ Matchers prune, they do not route. `lexicalMatcher` is zero-dep token overlap ov
 
 ## Wiring a registry into a run
 
-Render the pruned catalog into a `role: 'system'` message (there is no `system` option on a call), and expose Level 2/3 as tools so the model pulls what it needs.
+Render the pruned catalog into a `role: 'system'` message (there is no `system` option on a call), and expose Level 2/3 as tools so the model pulls what it needs. A headless run (2.3 preview) does this wiring for you from skill folders on disk (`skills`: the catalog in the first leg's system message, and `load_skill` / `read_skill_resource` tools that read only listed skills and never follow a link out of a skill's folder): `references/headless.md`.
 
 ```ts
 import { generateText, tool, type ToolSet } from '@deuz-sdk/core';

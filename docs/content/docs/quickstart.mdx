@@ -136,7 +136,7 @@ export async function POST(req: Request): Promise<Response> {
 }
 ```
 
-[`validateChatRequest`](/docs/modules/request-validation) is a pure structural gate: it never repairs, and it rejects an injected `role: 'system'` turn, a forged `tool_result`, and an oversized history. A route serving **client tools** must pass `{ rejectToolResults: false }`, because the browser legitimately POSTs a `role: 'tool'` message.
+[`validateChatRequest`](/docs/modules/request-validation) is a pure structural gate: it never repairs, and it rejects an injected `role: 'system'` turn, a tool result that answers no call of the assistant turn right before it, and an oversized history. A route serving **client tools**, approvals or server tools works on the defaults: since 2.3 the default accepts the `role: 'tool'` messages the browser posts, because they answer calls of the assistant turn right before them. Read [what that accepts](/docs/modules/request-validation#client-tools-need-rejecttoolresults-false).
 
 `toDeuzStreamResponse(result, options?)` accepts an optional second argument:
 

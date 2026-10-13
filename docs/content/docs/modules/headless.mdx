@@ -1,0 +1,424 @@
+---
+title: Headless (preview)
+description: Run, resume and inspect native agent runs from a script or CI job, with JSON reports and documented exit codes, and check a model and its configuration before running it. Node-only, a 2.3 preview.
+---
+
+`@deuz-sdk/core/headless` (2.3) runs native agents without a UI: from a script,
+a CI job or a cron entry. `runHeadless`, `resumeHeadless`, `inspectRun` and
+`doctor` return a plain JSON report, and `exitCodeFor(report)` maps it to an
+exit code, so a shell can branch on how a run ended. A run that did not
+complete never exits 0.
+
+<Callout type="warn" title="Preview">
+The headless subpath is a preview, not a stable API: report fields, finding
+codes and exit codes can still change in a 2.x minor. There is no `deuz`
+binary, CLI package, TUI or daemon; [`examples/13-headless`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/13-headless)
+shows a command line built on these functions.
+</Callout>
+
+| Function | What it does |
+| --- | --- |
+| `runHeadless(options)` | Start a native run in a durable store and report its result |
+| `resumeHeadless(options)` | Continue a stored run with the answers its report asked for |
+| `inspectRun(store, runId)` | Report a stored run, with no model call |
+| `doctor(options)` | Report why a model or configuration will not work, with no network call |
+| `loadProjectInstructions(dir)` | Read the project's `AGENTS.md` / `CLAUDE.md` files into one system message (or a user message, with `role: 'user'`) |
+| `exitCodeFor(report)` | The exit code of a run report or a doctor report |
+
+The subpath is Node-only: it reads instruction files and skill folders from
+disk, and the doctor reads the environment and the Node version. It never
+reaches the edge-safe entries.
+
+## Quick start
+
+`runHeadless` takes `runAgent`'s options plus a `store`, and makes the session
+from it (`runId` defaults to a generated one, `scope` to `'headless'`). This
+runs without a key:
+
+```ts title="headless-quickstart.ts"
+import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
+import { exitCodeFor, runHeadless } from '@deuz-sdk/core/headless';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const report = await runHeadless({
+  model: createMockModel({ responses: [{ text: 'The build is green.' }] }),
+  prompt: 'Check the build.',
+  store: createInMemoryAgentRunStore(),
+  runId: 'nightly-2026-10-11',
+});
+
+console.log(JSON.stringify(report, null, 2));
+process.exitCode = exitCodeFor(report); // 0
+```
+
+For runs that outlive the process, pass a durable `AgentRunStore`. On one
+machine, the SQLite ops store is the default choice (Node 22.13 or 23.4 and
+later, for `node:sqlite`); Postgres and Redis ops stores fit the same way.
+
+```ts
+import { createSqliteOpsStore } from '@deuz-sdk/core/ops/sqlite';
+
+const ops = createSqliteOpsStore({ path: './runs.sqlite' });
+const store = ops.agentRuns; // pass as `store`; `await ops.close()` when done
+```
+
+Calls are priced with the bundled price table unless `deps.priceProvider` is
+given, so the report can carry the run's cost. `onEvent` receives every event
+of the leg as it happens (text deltas, tool states, warnings), for progress
+output; it must not throw.
+
+## The report
+
+| Field | Meaning |
+| --- | --- |
+| `kind`, `version` | `'deuz-headless-report'`, `1` |
+| `runId`, `scope` | The run |
+| `status` | The result status: `completed`, `suspended`, `stopped`, `failed`; `in-progress` for a stored run with no result yet |
+| `outcome` | How the leg ended, for automation (below) |
+| `phase` | Where the stored run stands after the leg (`running`, `finalizing`, `terminal`); absent when nothing was stored, or when the stored run could not be read back (a warning says so) |
+| `reason`, `stopDetails` | A stopped run's reason (`'refusal'`, `'budget.usd'`, …) and the provider's explanation |
+| `error` | A failed run's `name`, `message` and `code` |
+| `retry` | The stored run failed in transit and a resume can re-enter it: `cause`, `phase`, `resumeWith: 'retryFailed'` ([below](#a-run-that-failed-in-transit)) |
+| `pending` | What a pending run waits for, and the resume option that answers each |
+| `usage`, `modelSteps` | Token usage and model calls so far |
+| `cost` | `usd`, `complete`, `unpricedCalls`, `unknownCalls`, from the run's budget ledger; absent when there is none to read (a leg refused before it read the run's ledger, such as a fresh run under a run ID that is taken) |
+| `verification` | The verifier's last verdict (`verified`, `rejected`, `inconclusive`), when the run has a `verify` that ran |
+| `warnings` | The leg's `CallWarning`s (`inspectRun` reports none) |
+| `output`, `text` | A completed run's accepted output; the final text |
+
+`cost.complete` is `false` when a call had no price or its usage stayed
+unknown; `usd` is then a lower bound. A model without a price under a USD
+budget also shows an `unpriced-model` warning: the budget does not count its
+calls, and token limits still apply. Set `budget.unknownPrice: 'reject'` to
+refuse such a model instead.
+
+### Outcomes and exit codes
+
+| Code | `outcome` | When |
+| --- | --- | --- |
+| 0 | `completed` | The run finished with an accepted output |
+| 1 | `failed` | An error ended it: a provider error, a store failure, a lost lease, a binding that changed on resume, an answer the resume could not take |
+| 2 | — | Usage: a command line could not parse its arguments (for your own CLI) |
+| 3 | `pending` | It waits: approvals, client tool results, a decision on calls whose effect is unknown (`tool-reconciliation-required`), or a resume: a stored run with no result, or a run a lease drain stopped (`'drained'`) |
+| 4 | `refused` | The model refused (stop reason `'refusal'`) |
+| 5 | `cancelled` | Aborted or cancelled |
+| 6 | `limit` | A limit you set: `budget.usd`, `budget.tokens`, `maxSteps`, a stop condition on cost, tokens, steps or duration, the execution deadline, a timeout, or `unknownPrice: 'reject'` |
+| 7 | `stopped` | Stopped short for another reason: a guardrail, a verifier that never accepted, an invalid output, a cut-off output (`'length'`), a changed MCP catalog |
+| 8 | — | `doctor` found an error |
+
+The table is `HEADLESS_EXIT_CODES`. A failure whose cause was transient keeps
+its outcome (`failed`, or `limit` for a transport timeout) and also carries
+`retry` ([below](#a-run-that-failed-in-transit)). A run's leg rejects only when
+the project instructions cannot be loaded (`projectDir` is not a directory, an
+invalid `projectInstructions` option, a read error), a tool takes a skill
+tool's name, or `onEvent` threw; everything that happens to the run itself is
+in the report.
+
+## Pending runs and resume
+
+Each pending action names the option of `resumeHeadless` that answers it
+(`resumeWith`; an unknown effect takes either of two):
+
+| `kind` | Fields | Resume with |
+| --- | --- | --- |
+| `approval` | `approvalId`, `toolCallId`, `toolName`, `input`, `agentPath?`, `token?` | `approvalResponses` (echo a signed approval's `token`) |
+| `client-tool` | `toolCallId`, `toolName`, `input` | `clientToolResults` |
+| `unknown-effect` | `toolCallId`, `toolName`, `input`, `modelStep?` | after checking the effect: `retryToolCallIds` to run it again, or `reconciledToolResults` with the result that landed |
+| `resume` | `phase` | a plain resume (the run's executor stopped before it ended, or a lease drain stopped it) |
+
+```ts title="headless-approval.ts"
+import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
+import type { AgentToolSet } from '@deuz-sdk/core/agent';
+import { exitCodeFor, inspectRun, resumeHeadless, runHeadless } from '@deuz-sdk/core/headless';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const store = createInMemoryAgentRunStore();
+const model = createMockModel({
+  responses: [
+    { toolCalls: [{ toolName: 'deploy', args: { env: 'prod' } }] },
+    { text: 'Deployed to prod.' },
+  ],
+});
+const tools: AgentToolSet = {
+  deploy: {
+    description: 'Deploy the build.',
+    parameters: {
+      type: 'object',
+      properties: { env: { type: 'string' } },
+      required: ['env'],
+    },
+    needsApproval: true,
+    execute: ({ env }: { env: string }) => ({ deployed: env }),
+  },
+};
+
+const first = await runHeadless({ model, prompt: 'Deploy.', tools, store, runId: 'deploy-7' });
+console.log(first.outcome, exitCodeFor(first)); // pending 3
+
+// Later, maybe in another process: read the stored run, decide, resume.
+const waiting = await inspectRun(store, 'deploy-7');
+const approvalResponses = waiting.pending.flatMap((action) =>
+  action.kind === 'approval'
+    ? [{ approvalId: action.approvalId, approved: true, token: action.token }]
+    : [],
+);
+const done = await resumeHeadless({ model, tools, store, runId: 'deploy-7', approvalResponses });
+console.log(done.outcome, done.output, exitCodeFor(done)); // completed Deployed to prod. 0
+```
+
+Resume with the same model, tools, skills and output as the first leg: the
+run's binding rejects a change, and that resume fails (exit 1) without
+touching the stored run. So does `retryFailed` for a failure that was not
+transient, and, on a run that has not ended, an answer the resume cannot
+take: a client result or a recorded result (`reconciledToolResults`) for a
+call the run does not wait on, or a call listed in both `retryToolCallIds`
+and `reconciledToolResults`. The leg fails with a `TypeError` before anything
+is written. A verdict or a `retryToolCallIds` entry that matches no pending
+call is ignored; a resume that answers nothing else leaves the run waiting
+(exit 3) and writes nothing. A resume of a run that ended (completed, stopped,
+or failed and not retried) returns its stored result and ignores client
+results, recorded results and retry IDs, and `retryFailed` on a run that did
+not fail; a changed binding, and `retryFailed` for a failure that was not
+transient, still fail it.
+
+`inspectRun` reads a run without a model call. A run with no result yet
+reports `status: 'in-progress'` and a pending `resume`, plus each call that
+started without a recorded outcome; that picture is accurate only when no
+executor still drives the run. An unknown run ID rejects with a `TypeError`.
+
+### Unknown effects
+
+A call with an unknown effect started, and its outcome was never recorded: the
+process or the store went down between the tool's effect and its receipt. A
+resume stops on it with the reason `tool-reconciliation-required` (exit 3) and
+writes nothing; `inspectRun` lists it beside the pending `resume`. Check the
+effect in the system it touched, then answer every listed call in one resume:
+`retryToolCallIds` runs a call again, and `reconciledToolResults` records the
+result that landed (`isError: true` for an error), so the call never runs
+again. A tool marked `replay: 'idempotent'` runs again by itself and is not
+listed, unless its receipt was written before 2.3: such a receipt records no
+replay policy and `inspectRun` cannot see the tools, so the call is listed,
+and either answer, or a plain resume, settles it: `reconciledToolResults`
+records its result, and `retryToolCallIds` or a plain resume runs it again. The native rules are in [When the store fails](/docs/modules/native-agents#when-the-store-fails).
+
+```ts title="headless-unknown-effect.ts"
+import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
+import type { AgentToolSet } from '@deuz-sdk/core/agent';
+import { exitCodeFor, inspectRun, resumeHeadless } from '@deuz-sdk/core/headless';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const store = createInMemoryAgentRunStore();
+const model = createMockModel({ responses: [{ text: 'Charged.' }] });
+const tools: AgentToolSet = {
+  charge: {
+    description: 'Charge the order once.',
+    parameters: { type: 'object', properties: {} },
+    execute: () => ({ charged: true }),
+  },
+};
+
+// The payment system keeps its own record of each charge.
+declare const payments: { charged(orderId: string): Promise<boolean> };
+
+// A run whose charge started and whose outcome was never recorded (not shown).
+const stuck = await inspectRun(store, 'order-7');
+const calls = stuck.pending.flatMap((action) =>
+  action.kind === 'unknown-effect' ? [action.toolCallId] : [],
+);
+const done = (await payments.charged('order-7'))
+  ? // It landed: record what the tool returned. The call never runs again.
+    await resumeHeadless({
+      model,
+      tools,
+      store,
+      runId: 'order-7',
+      reconciledToolResults: calls.map((toolCallId) => ({ toolCallId, output: { charged: true } })),
+    })
+  : // It never arrived: run the call once more.
+    await resumeHeadless({ model, tools, store, runId: 'order-7', retryToolCallIds: calls });
+console.log(done.outcome, exitCodeFor(done)); // completed 0
+```
+
+### A run that failed in transit
+
+A failed run stays failed: a resume returns the stored failure. When the cause
+was transient (a model call that failed with a network or provider error, a
+transport timeout or an open circuit breaker, a response stream that broke
+off, a budget admission refused with a serialization conflict), the stored run
+records it and the report carries `retry`, with the `cause` and the `phase` the
+run failed in. The outcome does not change: `failed` (exit 1), or `limit`
+(exit 6) for a transport timeout. Resume with `retryFailed: true` to go on from
+the run's last checkpoint; completed tool calls do not run again. A retried
+resume that stops again before its first write, on an unknown effect for
+example, keeps `retry`: answer the pending actions and pass `retryFailed: true`
+once more. The native rules are in [When a model call fails](/docs/modules/native-agents#when-a-model-call-fails).
+
+```ts title="headless-retry.ts"
+import { createInMemoryAgentRunStore } from '@deuz-sdk/core/agent';
+import { exitCodeFor, resumeHeadless, runHeadless } from '@deuz-sdk/core/headless';
+import { createMockModel } from '@deuz-sdk/core/testing';
+
+const store = createInMemoryAgentRunStore();
+const model = createMockModel({ responses: [{ text: 'Summary ready.' }] });
+
+// An outage: the circuit breaker the workers share reports the provider down,
+// so the model call fails before it is sent.
+const outage = {
+  get: () => ({ failures: 5, cooldownUntil: Date.now() + 60_000 }),
+  set: () => {},
+};
+const first = await runHeadless({
+  model,
+  prompt: 'Summarize ticket 9.',
+  store,
+  runId: 'ticket-9',
+  deps: { breakerStore: outage },
+});
+console.log(first.outcome, first.retry, exitCodeFor(first));
+// failed { cause: 'model-call', phase: 'running', resumeWith: 'retryFailed' } 1
+
+// Later, once the provider answers again:
+const retried = await resumeHeadless({ model, store, runId: 'ticket-9', retryFailed: true });
+console.log(retried.outcome, exitCodeFor(retried)); // completed 0
+```
+
+### A drained run
+
+A `'drain'` lease signal stops a run that holds a `lease` (passed as to
+`runAgent`) at its next model-step boundary: see
+[Draining a native run](/docs/modules/operations#draining-a-native-run). The run
+has not ended, so its report is `pending` (exit 3), with `reason: 'drained'`
+and a pending `resume` in the phase it stopped in, as `inspectRun` reports the
+stored run; a plain resume on any executor goes on from its last save. A drain
+that reached a resume before it took the run up wrote nothing, so that report
+lists what the run still waits for: the approvals, client results or unknown
+effects to answer again. A run that failed in transit keeps its `retry` there:
+pass `retryFailed: true` again. The list is read from the stored run, so it is
+empty when that could not be read back (a warning says so).
+
+## Project instructions
+
+`projectDir` loads the project's instruction files into the run's system
+message (a user message with `role: 'user'`, below);
+`loadProjectInstructions(dir, options?)` returns them on their own:
+
+```ts
+import { loadProjectInstructions } from '@deuz-sdk/core/headless';
+
+const project = await loadProjectInstructions(process.cwd());
+console.log(project.files.map((file) => file.relativePath)); // ['AGENTS.md', 'packages/app/CLAUDE.md']
+console.log(project.message?.role); // 'system'
+```
+
+- **Discovery.** In each directory from the root down to `dir`, `AGENTS.md`
+  then `CLAUDE.md` (`fileNames` changes the list). The root is the nearest
+  directory from `dir` upwards that holds `.git`; outside a repository only
+  `dir` itself is read. `root` sets it explicitly (it must be `dir` or an
+  ancestor). A `dir` that is not a directory rejects with a `TypeError`, so a
+  mistyped path never reads its ancestors' files instead.
+- **Precedence.** Outer files come first and the files nearest `dir` last; the
+  message tells the model to follow the later one where two disagree. Your own
+  `instructions` come before all of them, and the skills list after.
+- **Nesting.** Files below `dir` are not read, and `@path` imports are not
+  expanded. A file that repeats an earlier one's text (a `CLAUDE.md` copied
+  from `AGENTS.md`, a symlink) is included once.
+- **Links.** A symlink or junction is followed only while it stays inside the
+  root. A file whose real path is outside it (an `AGENTS.md` linked to
+  `~/.npmrc`, a linked directory that leads out of the repository) is not
+  read: `skipped` lists it with the reason `'outside-root'`, and `runHeadless`
+  reports it as a warning.
+- **Size cap.** At most `maxBytes` (default 32 768) UTF-8 bytes of file text.
+  The files nearest `dir` are kept whole first; an outer file over the cap is
+  cut at a character boundary, with a `[truncated: N more bytes not loaded]`
+  line, or left out. `files[].truncated` and `includedBytes` say which.
+- **Role.** `role: 'user'` makes `message` a user message; `runHeadless`
+  (`projectInstructions: { role: 'user' }`) then puts it ahead of the `prompt`
+  or `messages` instead of into the system message.
+
+Only the first leg loads them: they are part of the stored transcript, so a
+resume does not read them again.
+
+<Callout type="warn" title="Untrusted checkouts">
+The files get the trust of the system message, the same as your own
+`instructions`: whoever can change them, a pull request from a fork for
+example, can steer the run and the tools it calls. Before you load a checkout
+you do not trust, review its `AGENTS.md` and `CLAUDE.md` files, or leave
+`projectDir` out. `role: 'user'` delivers them as user-role context instead, as
+Claude Code and Codex do, and the model weighs that below your `instructions`;
+it still reads them, so the role does not make them safe.
+</Callout>
+
+## Skills
+
+`skills` takes folders of [Agent Skills](/docs/modules/skills) (`<id>/SKILL.md`),
+read with `nodeSkillSource`. The first leg lists them in the system message
+(`<available_skills>`), and every leg gets two tools: `load_skill` returns a
+skill's body and `read_skill_resource` a text file bundled with it. Both read
+only skills the list holds, and only files whose real path is inside the
+skill's folder: a link that leads out of it is refused. Both are
+`replay: 'idempotent'`. A tool of your own cannot take either name. A folder
+that does not exist adds no skills. Pass the same `skills` when resuming: the
+tools are part of the run's binding.
+
+## doctor
+
+`doctor(options)` reports, before any run and with no network call, why a
+configuration will not work. Pass the run's own options; it reads the model,
+`effort`, `temperature`, `topP`, `toolChoice`, `promptCaching`, `budget`,
+`capabilities`, `tools`, `skills`, `output` and `deps`, and ignores the rest.
+
+```ts title="headless-doctor.ts"
+import { createAnthropic } from '@deuz-sdk/core/anthropic';
+import { doctor, exitCodeFor } from '@deuz-sdk/core/headless';
+
+const report = await doctor({
+  model: createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY })('claude-opus-5-5'),
+  effort: 'none',
+  temperature: 0.2,
+  budget: { usd: 2 },
+});
+for (const finding of report.findings) {
+  console.log(finding.severity, finding.code, finding.message);
+}
+process.exitCode = exitCodeFor(report); // 8 when a finding is an error
+```
+
+| Report field | Meaning |
+| --- | --- |
+| `kind`, `version` | `'deuz-headless-doctor'`, `1` |
+| `ok` | No finding is an error |
+| `model`, `support` | Provider, model id and protocol; `pinned` (a registry row), `family` (the Claude 5.x family rules) or `unknown` (the conservative fallback) |
+| `profile` | The full [model profile](/docs/modules/model-profiles): effort mapping, thinking, limits, sampling, clamps, sources |
+| `structuredOutput` | The requested `output.mode` and the strategy it takes (`json` or a forced `tool`) |
+| `priced` | The price provider has a price for the model |
+| `apiKey` | Where the key comes from (`factory`, `key-provider`, `keyless`, `missing`), the usual variable and whether it is set; never its value |
+| `node` | The Node version, the required one (`>=22.0.0`) and whether it is supported |
+| `findings` | `{ severity, code, message, setting? }`, in the order checked |
+
+| Code | Severity | Found when |
+| --- | --- | --- |
+| `node-version` | error | Node is older than 22 |
+| `node-sqlite` | warning | Node has no unflagged `node:sqlite` (before 22.13, or 23.0–23.3) |
+| `missing-api-key` | error | The factory has no key, the host needs one and no `deps.keyProvider` is given; the message says whether the usual variable is set (core never reads the environment, so a key there must still reach the factory) |
+| `key-provider` | info | The key comes from `deps.keyProvider`, which the doctor does not call |
+| `unknown-model` | warning | No registry row: the conservative defaults apply |
+| `model-status` | warning | The model is documented as preview or deprecated |
+| `unpriced-model` | info, warning, error | No price: info without a USD budget, a warning with one, an error when that budget sets `unknownPrice: 'reject'` |
+| `price-lookup-failed` | warning | Your `deps.priceProvider` threw |
+| `tools-unsupported`, `tools-unknown` | error, warning | The run has tools and the model takes none, or that is unknown |
+| `tool-protocol` | error | The model takes tools only on another protocol (e.g. GPT-6.1 Sol on Chat Completions) |
+| `structured-output` | warning | `output` takes the json strategy where native structured output is not known to be supported |
+| `clamped-setting`, `unsupported-setting` | warning | A requested `effort`, `temperature`, `topP`, `toolChoice`, `output.mode` or `promptCaching` is changed or dropped on the way to the wire |
+| `not-live-verified` | info | Always: no profile is verified against the live API; the message says whether it comes from documentation, and the date it was checked |
+
+The doctor calls only a `deps.priceProvider` you gave (once, with a two-token
+usage); the bundled table is local. The environment defaults to
+`process.env` and the version to `process.versions.node`; `env`,
+`nodeVersion` and `apiKeyEnv` override them.
+
+## What it is not
+
+The preview is a library surface. A `deuz` binary, a TUI, a daemon and
+messaging gateways are not part of 2.3; a CLI is planned for 2.4. Provider
+behaviour the doctor reports comes from the model profiles, which are checked
+against provider documentation and are not live-verified.

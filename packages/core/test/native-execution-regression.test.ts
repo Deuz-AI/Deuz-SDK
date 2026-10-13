@@ -281,7 +281,10 @@ describe('native execution cross-feature regressions', () => {
       session: { store, runId: 'siblings', durability: 'strict' },
     });
     expect(first.pendingApprovals).toHaveLength(2);
-    expect(first.pendingApprovals?.map((request) => request.approvalId)).toEqual(['same', 'same']);
+    // Each sibling's approval is bound to its own child run (2.3), so the ids differ.
+    const ids = first.pendingApprovals!.map((request) => request.approvalId);
+    expect(ids).toEqual([expect.stringMatching(/^same@/), expect.stringMatching(/^same@/)]);
+    expect(new Set(ids).size).toBe(2);
     await resumeFromCheckpoint(store, 'siblings', {
       model: parent.model,
       tools,

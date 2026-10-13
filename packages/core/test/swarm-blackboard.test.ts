@@ -59,7 +59,12 @@ describe('swarm blackboard (2.2)', () => {
     expect(bRead?.rawResult).toEqual([{ sequence: 1, from: 'a', text: 'blowup at t=1' }]);
     const cReads = receipts(outcome.tasks[2]);
     expect(cReads.map((receipt) => receipt.rawResult)).toEqual([[], undefined]);
-    expect(cReads[1]?.stage).toBe('executing');
+    // The refused read threw and was answered with that error, so its receipt
+    // records a known failure (2.3) rather than an unknown `executing` outcome.
+    expect(cReads[1]).toMatchObject({
+      stage: 'failed',
+      error: 'Channel euler is not readable by this agent',
+    });
     const events = [];
     for await (const event of swarm.events(outcome.run)) events.push(event.type);
     expect(events.filter((type) => type === 'channel.posted')).toHaveLength(1);

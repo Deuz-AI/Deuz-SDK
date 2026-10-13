@@ -1,5 +1,6 @@
-<!-- verified: 2026-09-26 against @deuz-sdk/core@2.2.0 · api-contract sha256:c025621e10fd
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.3.0 · api-contract sha256:d0398bbef8c4
      sources: packages/core/src/types/config.ts, packages/core/src/types/methods.ts,
+     packages/core/src/internal/{fallback,stable-prefix,warnings}.ts, packages/core/src/adapters/*.ts,
      packages/core/src/types/stream.ts, packages/core/src/types/message.ts,
      packages/core/src/types/deps.ts, packages/core/src/types/model.ts,
      packages/core/src/types/usage.ts, packages/core/src/errors.ts, packages/core/src/parts.ts,
@@ -37,6 +38,7 @@ interface StreamChatResult {
   fullStream: AsyncIterable<StreamPart>;  // the canonical event stream
   usage: Promise<Usage>;
   finishReason: Promise<FinishReason>;
+  stopDetails?: Promise<StopDetails | undefined>; // 2.3: settles with finishReason
   consume?: (options?: { onError?: (error: unknown) => void }) => Promise<void>;
   warnings?: Promise<CallWarning[]>;
   runId?: string;                          // only with `session`
@@ -47,9 +49,9 @@ interface StreamChatResult {
 
 **G2 — it returns synchronously and never throws.** The call body resolves no key, opens no socket, reads no clock. Do not `await` it and do not make your wrapper `async`. A `try`/`catch` around the *call* catches nothing; put it around the `for await`.
 
-**Lazy pump, one broadcaster.** The request starts on first access of `textStream`, `fullStream`, `usage`, `finishReason` or `warnings`. Reading `result.consume` does **not** start it (it is a method, not a getter). All outputs are branches of a single pump fanned out by a broadcaster, with subscriptions registered before the pump starts — so `await result.usage` first and iterate later without losing a chunk. Each branch buffers independently: a branch you never drain holds its queue until the end, so do not open `fullStream` "just in case" when you only render text.
+**Lazy pump, one broadcaster.** The request starts on first access of `textStream`, `fullStream`, `usage`, `finishReason`, `stopDetails` or `warnings`. Reading `result.consume` does **not** start it (it is a method, not a getter). All outputs are branches of a single pump fanned out by a broadcaster, with subscriptions registered before the pump starts — so `await result.usage` first and iterate later without losing a chunk. Each branch buffers independently: a branch you never drain holds its queue until the end, so do not open `fullStream` "just in case" when you only render text.
 
-**Nobody reading = nothing finishes.** No consumer means no request, no `onFinish`, no `chat` persistence, no `session` checkpoint, no memory extraction. `consume()` drains it: memoized, takes its own subscription (safe alongside iteration), **never rejects** — failures go to `consume({ onError })`. Always call it with `?.` — it is absent on the `fallbackModels` / `withFallback` paths and on hand-written result objects.
+**Nobody reading = nothing finishes.** No consumer means no request, no `onFinish`, no `chat` persistence, no `session` checkpoint, no memory extraction. `consume()` drains it: memoized, takes its own subscription (safe alongside iteration), **never rejects** — failures go to `consume({ onError })`. Call it with `?.`: it is optional on the type, so a hand-written result may lack it. Every result core builds has it, the `fallbackModels` and `withFallback` paths included (since 1.9).
 
 ```ts
 import { streamChat } from '@deuz-sdk/core';
@@ -96,7 +98,7 @@ export async function POST(req: Request): Promise<Response> {
 
 **Retry is pre-first-byte only.** `maxRetries` defaults to `2`, exponential backoff with full jitter (base 500ms, cap 30s), `Retry-After` honoured. Retryable = `NetworkError`, `RateLimitError`, `OverloadedError`, `APICallError` with status ≥ 500. Once a byte is out, a mid-stream failure is final — and so is cross-model fail-over.
 
-**Warnings.** In 2.0 all four chat calls populate `warnings`; on the streaming pair it is a promise that settles with `usage` and **never rejects**, and each notice also arrives on `fullStream` as a `warning` part *ahead of* the model's output. Deduped by `(type, setting, message)`, capped at 50. Producers: `unknown-model` (unregistered slug → conservative fallback row), `unsupported-setting` (`temperature`/`topP`/`effort` a wire strips), `unsupported-tool`, `other` (a dropped document). `CallWarning.type` is an **open** union — never switch exhaustively. Every notice is also exactly one `deps.logger.warn` line, and **the default logger is a no-op**. One gap: the buffered loop's `activeTools` notices are logged but never recorded, so a typo'd name reaches the log and not `GenerateTextResult.warnings` (`tool-loop.ts` calls `filterWireTools` and `applyPrepareStep` without the sink); the streaming loop records them. `clamped-setting` has no producer at all.
+**Warnings.** In 2.0 all four chat calls populate `warnings`; on the streaming pair it is a promise that settles with `usage` and **never rejects** (2.3: `streamObject`'s no longer hangs when the call fails), and each notice also arrives on `fullStream` as a `warning` part *ahead of* the model's output. Deduped by `(type, setting, message)`, capped at 50. Producers: `unknown-model` (unregistered slug → conservative fallback row), `unsupported-setting` (`temperature`/`topP`/`effort` a wire strips), `clamped-setting` (2.3: every value a request changes, such as OpenAI `max` → `xhigh`, a forced `toolChoice` sent as `auto`, `temperature`/`topP` dropped while thinking is on, a raised `maxOutputTokens`, an explicit object `mode: 'tool'` run as json), `unsupported-tool` (also MCP name collisions, `setting: 'mcp'`), `unpriced-model` (2.3, a model with no price under a USD budget), `other` (a dropped document). `CallWarning.type` is an **open** union — never switch exhaustively. Every notice is also exactly one `deps.logger.warn` line, and **the default logger is a no-op**. One gap: the buffered loop's `activeTools` notices are logged but never recorded, so a typo'd name reaches the log and not `GenerateTextResult.warnings` (`tool-loop.ts` calls `filterWireTools` and `applyPrepareStep` without the sink); the streaming loop records them.
 
 ## `generateText`
 
@@ -122,7 +124,9 @@ const { text, usage, finishReason, response } = await generateText({
 console.log(text, finishReason, usage.totalTokens, response.messages.length);
 ```
 
-`GenerateTextResult`: `text`, `usage`, `finishReason`, `response.messages` always; `steps` / `toolCalls` / `toolResults` only with tools (`steps === undefined` is how you tell a single-turn result apart); `pendingApprovals` on a client-mode approval break; `providerMetadata.deuz` for `stoppedBy` / `verified` / `guardrails` / `handoffs`; `runId` with `session`; `memory`, `observation`, `warnings` as above. `usage.totalTokens` is the provider's own total where one exists, not `inputTokens + outputTokens`.
+`GenerateTextResult`: `text`, `usage`, `finishReason`, `response.messages` always; `stopDetails` (2.3) when the provider explained its stop, e.g. a refusal's `category` and `explanation` (each `steps` entry carries its own); `steps` / `toolCalls` / `toolResults` only with tools (`steps === undefined` is how you tell a single-turn result apart); `pendingApprovals` on a client-mode approval break; `providerMetadata.deuz` for `stoppedBy` / `verified` / `guardrails` / `handoffs`; `runId` with `session`; `memory`, `observation`, `warnings` as above. `usage.totalTokens` is the provider's own total where one exists, not `inputTokens + outputTokens`. Since 2.3 `outputTokens` includes reasoning on every wire and `reasoningTokens` is its share.
+
+**Refused and cut-off turns (2.3).** A turn that ends with `content_filter` (Anthropic `stop_reason: 'refusal'`, an OpenAI refusal, a Gemini safety or recitation filter, a Responses turn its content filter cut off) or `length` (`max_tokens`) never dispatches its tool calls, in `generateText`, `streamChat` and native runs, because their arguments can be truncated JSON; a tool call whose arguments are not a JSON object self-heals into an `is_error` result. An empty assistant turn is never stored or sent back. Read why from `stopDetails`; the raw provider object also stays on the `finish` part as `providerMetadata.anthropic.stop_details`, and an OpenAI refusal's text as `providerMetadata.openai.refusal`, whose `stopDetails` is `{ type: 'refusal', explanation }` (no `category`). A refused OpenAI turn ends with `content_filter` unless the provider reported `length` or `content_filter` itself, and the refusal never becomes answer text: `text` stays empty. Not live-verified.
 
 ## `generateObject` and `streamObject`
 
@@ -136,9 +140,9 @@ Both take `GenerateObjectOptions<T>` = `CommonCallOptions` plus `schema`, `schem
 | `'json'` | native json mode (`json_schema` / `output_config` / `responseSchema`) |
 | `'tool'` | a forced tool call whose arguments are the object |
 
-**G3:** Anthropic rejects a forced `tool_choice` while extended thinking is on, so a would-be `tool` strategy is auto-overridden to `json` there — when `effort` is set to anything but `'none'`, and unconditionally on adaptive-thinking flagships (`effortWire: 'output_config'`). Do not set `mode` for this yourself.
+**G3:** Anthropic rejects a forced `tool_choice` while extended thinking is on, so a would-be `tool` strategy is auto-overridden to `json` there — when `effort` is set to anything but `'none'`, and unconditionally on adaptive-thinking flagships (`effortWire: 'output_config'`). Since 2.3 the same holds for every model that refuses a forced tool choice (Claude Fable 5.1, Opus 5.5 and Sonnet 5.5, DeepSeek V4): an explicit `mode: 'tool'` runs as json and reports a `clamped-setting` warning. Do not set `mode` for this yourself.
 
-**Repair retry.** `generateObject` makes at most **two** attempts — the initial call plus one repair — when the payload fails `JSON.parse` or Standard Schema validation; both failing throws `NoObjectGeneratedError` (`.text` is the raw model output, `.cause` the last parse error). A hard transport error is thrown immediately, unwrapped. **`streamObject` has NO repair retry** — partials were already emitted and cannot be un-streamed. On a bad final payload its `object` rejects with `NoObjectGeneratedError` and `partialObjectStream` rejects, while `usage` and `finishReason` still **resolve** (the tokens were spent).
+**Repair retry.** `generateObject` makes at most **two** attempts — the initial call plus one repair — when the payload fails `JSON.parse` or Standard Schema validation; both failing throws `NoObjectGeneratedError` (`.text` is the raw model output, `.cause` the last parse error, and since 2.3 `.finishReason` and `.stopDetails` of the last attempt, so a refused or cut-off request says why). A hard transport error is thrown immediately, unwrapped. **`streamObject` has NO repair retry** — partials were already emitted and cannot be un-streamed. On a bad final payload its `object` rejects with `NoObjectGeneratedError` and `partialObjectStream` rejects, while `usage`, `finishReason` and `stopDetails` (2.3, settled before the final validation) still **resolve** (the tokens were spent). `GenerateObjectResult` carries `stopDetails` too.
 
 **They refuse loop options.** These are single-turn by construction, so passing any of `tools`, `toolChoice`, `maxSteps > 1`, `stopWhen`, `budget`, `maxToolConcurrency`, `onStepFinish`, `prepareStep`, `activeTools`, `verifyStep`, `maxVerifyAttempts`, `doneWhen`, `falseFinishGuard`, `compaction`, `approveToolCall`, `approvalResponses`, `session`, `chat`, `memory`, `fallbackModels`, `approvalSigner`, `approvalMaxAgeMs`, `mcp` or `guardrails` is an `InvalidRequestError` **before any network request**. Empty collections, `tools: {}` and `maxSteps: 1` pass. Honoured normally: `signal`, `maxRetries`, `timeout`, `capabilities`, `headers`, `deps`, `onUsage`, `onFinish`, sampling params, `effort`, `responseFormat`, `providerOptions`, `promptCaching`, `runtimeContext`, `agentPath`. To combine tools with structure, use the optional native `runAgent({ tools, output })` described in `references/native-execution.md`, or retain the two-call `generateText` then `generateObject` composition.
 
@@ -197,17 +201,17 @@ console.log(docs.embeddings.length, query.embedding.length, query.usage.inputTok
 
 | `type` | Fields | What it means to a consumer |
 | --- | --- | --- |
-| `text-delta` | `text` | Assistant text fragment — the only thing `textStream` yields. |
-| `reasoning-delta` | `text`, `signature?`, `encrypted?` | Thinking fragment. When `encrypted`, `text` is an opaque payload — do not render it. |
+| `text-delta` | `text`, `providerMetadata?` | Assistant text fragment — the only thing `textStream` yields. `providerMetadata` (2.3) is round-trip data such as a Gemini text signature, never display content. |
+| `reasoning-delta` | `text`, `signature?`, `encrypted?`, `id?`, `redacted?`, `source?` | Thinking fragment. When `encrypted` or `redacted`, `text` is an opaque payload — do not render it. Deltas with one `id` build one block (2.3); `source` is the provider family. |
 | `tool-call-delta` | `id`, `name?`, `argsTextDelta`, `providerMetadata?` | Raw args JSON fragment. Accumulate as a **string**, parse once at block end. |
 | `source` | `id`, `url?`, `title?` | Grounding source from a provider-executed search. |
-| `finish` | `usage`, `finishReason`, `providerMetadata?` | Terminal. In a loop `usage` is summed across steps; `providerMetadata.deuz.stoppedBy` names a budget/stop-condition end. |
+| `finish` | `usage`, `finishReason`, `providerMetadata?` | Terminal. In a loop `usage` is summed across steps; `providerMetadata.deuz.stoppedBy` names a budget/stop-condition end; the provider's stop detail (`anthropic.stop_details`, or an OpenAI refusal's text as `openai.refusal`, 2.3) rides here too, and so does Gemini's own finish reason (`google.finishReason`, 2.3). |
 | `error` | `error` | Failure. The stream ends after it; `usage`/`finishReason` reject. |
 | `step-start` | `stepIndex` | Loop step began — normally the first part of any loop run. |
-| `step-finish` | `stepIndex`, `finishReason`, `usage` | That step's usage alone. |
-| `tool-call` | `toolCallId`, `toolName`, `input` | Final parsed call, after the deltas complete. |
-| `tool-result` | `toolCallId`, `toolName`, `output`, `isError?` | Execution result. A thrown tool arrives here with `isError`, not as a stream failure. |
-| `tool-state` | `toolCallId`, `toolName?`, `state`, `denied?`, `deniedReason?` | Lifecycle: `input-streaming`→`input-complete`→`awaiting-approval`→`executing`→`complete`\|`error`. A refusal is `state: 'error'` **and** `denied: true`, not a 7th state. |
+| `step-finish` | `stepIndex`, `finishReason`, `usage`, `providerMetadata?` | That step's usage alone, and (2.3) its provider finish detail. |
+| `tool-call` | `toolCallId`, `toolName`, `input`, `providerMetadata?` | Final parsed call, after the deltas complete. `providerMetadata` (2.3) is the call's round-trip data, echoed back with it. |
+| `tool-result` | `toolCallId`, `toolName`, `output`, `isError?`, `outcome?` | Execution result. A thrown tool arrives here with `isError`, not as a stream failure. `outcome` (2.3, `ToolCallOutcome`) says why an error result is one; a success carries none. |
+| `tool-state` | `toolCallId`, `toolName?`, `state`, `denied?`, `deniedReason?`, `outcome?` | Lifecycle: `input-streaming`→`input-complete`→`awaiting-approval`→`executing`→`complete`\|`error`. A refusal is `state: 'error'` **and** `denied: true`, not a 7th state. `outcome` (2.3): `'tool-error'`, `'permission-denied'`, `'approval-denied'`, `'unknown-effect'` on `error`; `'approval-pending'` on `awaiting-approval`. |
 | `tool-approval-request` | `approvalId`, `toolCallId`, `toolName`, `input`, `agentPath?`, `token?` | A gated call; the loop breaks after emitting these. Resume with `approvalResponses`. |
 | `compaction` | `layer`, `tokensBefore`, `tokensAfter`, `trigger?` | Automatic compaction ran before a step. Token counts are estimates; `trigger` is `'threshold' \| 'manual' \| 'overflow'`. |
 | `sub-agent` | `agentPath`, `part` | A sub-agent's own canonical part, forwarded live. **Single-wrapped** — depth 2 is `agentPath.length === 2`, never a nested `sub-agent`. |
@@ -238,7 +242,8 @@ for await (const part of result.fullStream) {
       process.stdout.write(part.text);
       break;
     case 'reasoning-delta':
-      if (!part.encrypted) process.stdout.write(part.text); // encrypted = opaque, not display text
+      // encrypted / redacted = an opaque provider payload, not display text
+      if (!part.encrypted && !part.redacted) process.stdout.write(part.text);
       break;
     case 'error':
       if (part.error instanceof DeuzError) console.error(part.error.code, part.error.message);
@@ -254,17 +259,21 @@ for await (const part of result.fullStream) {
 
 ## Messages, parts, and binary media
 
-`Message` is `{ role, content, providerMetadata? }` where `role` is `'system' | 'user' | 'assistant' | 'tool'` and `content` is a `string` (coerced to one `TextPart`) or a `Part[]`. All `system` messages are concatenated and lifted to the wire's system slot; a `tool`-role message is folded into a user turn on wires without a tool role.
+`Message` is `{ role, content, providerMetadata? }` where `role` is `'system' | 'user' | 'assistant' | 'tool'` and `content` is a `string` (coerced to one `TextPart`) or a `Part[]`. A `tool`-role message is folded into a user turn on wires without a tool role.
+
+**System messages (2.3).** The wire's system slot is the leading run of `system` messages. A system message after the first non-system message is a mid-conversation system message: Claude 5.x receives it in place as a `role: 'system'` message, OpenAI Responses as a `system` input item in place (a behaviour change for every Responses model: it used to move into `instructions`), Chat Completions in place as before, and Gemini and the older Claude models keep the 2.2 fold into the top-level instruction. A system message without text is sent by no wire.
 
 `Part` is a five-member locked union — keep a `default` branch when you switch on it:
 
 | `type` | Fields | Direction |
 | --- | --- | --- |
-| `text` | `text` | in / out |
+| `text` | `text`, `providerMetadata?` | in / out (2.3: a Gemini text signature rides `providerMetadata`) |
 | `image` | `image: string \| Uint8Array`, `mediaType?` | in — **also the carrier for every non-image file** |
-| `reasoning` | `text`, `signature?`, `encrypted?`, `redacted?` | out, replayed back in |
+| `reasoning` | `text`, `signature?`, `encrypted?`, `redacted?`, `source?` | out, replayed back in |
 | `tool_use` | `id`, `name`, `input`, `providerMetadata?` | out, replayed back in |
 | `tool_result` | `toolUseId`, `result`, `isError?` | in |
+
+**Reasoning blocks round-trip intact (2.3).** Every block a provider sends is its own `reasoning` part, kept where it arrived (a thinking block between two tool calls stays there) and replayed unchanged, in both loops, native runs, checkpoints and `useChat`. A signed Claude thinking block with empty text (Claude 5.x's default `display: 'omitted'`) is kept, and two consecutive blocks stay two parts, each with its own signature. `source` (`'anthropic'`, `'openai'`, `'google'`, or the Chat Completions host's id) keeps reasoning with the family that produced it: each wire replays only its own family's reasoning, so a fail-over to another provider never receives it, while Claude models forward each other's blocks unchanged. A part written before 2.3 has no `source` and replays as before, except `encrypted` parts (OpenAI only) and `redacted` parts (Anthropic only).
 
 There is **no `file` part kind**. A PDF, audio or video is an `image` part with a non-`image/*` `mediaType`, which each adapter maps to that wire's document block (Anthropic `document`, OpenAI Responses `input_file`, Chat Completions `file`, Gemini `inlineData`/`fileData`). Use the constructors rather than remembering that: `filePart({ data, mediaType })` (mediaType **required**) and `imagePart({ data, mediaType? })`. `data` may be raw bytes, base64, a `data:` URL or an `https:` URL.
 
@@ -292,7 +301,7 @@ const { text } = await generateText({
 console.log(text);
 ```
 
-Documents are gated on the resolved capability row (`nativePdf || vision`). A model that fails the gate has the part **dropped** with a `deps.logger.warn` (and a `warning`) — a message can carry fewer blocks than parts. An unknown slug takes the conservative fallback row, which is not vision-capable, so fix it with a per-call `capabilities` override. Chat Completions additionally drops an `https:`-URL document: pass bytes or base64 there. `reasoning` parts must round-trip in a multi-step loop (Anthropic `signature`, Gemini `thoughtSignature` on `tool_use.providerMetadata`, OpenAI encrypted reasoning) — the loop preserves them for you; never strip `providerMetadata`.
+Documents are gated on the resolved capability row (`nativePdf || vision`). A model that fails the gate has the part **dropped** with a `deps.logger.warn` (and a `warning`) — a message can carry fewer blocks than parts. An unknown slug takes the conservative fallback row, which is not vision-capable, so fix it with a per-call `capabilities` override. Chat Completions additionally drops an `https:`-URL document: pass bytes or base64 there. `reasoning` parts must round-trip in a multi-step loop (Anthropic `signature`, Gemini `thoughtSignature` on `tool_use.providerMetadata` and, since 2.3, on text parts, OpenAI encrypted reasoning, DeepSeek/Kimi `reasoning_content`) — the loop preserves them for you; never strip `providerMetadata`.
 
 ## The `DeuzError` taxonomy
 
@@ -308,13 +317,16 @@ Every error extends the abstract `DeuzError` and carries a stable string `code`.
 | `InvalidRequestError` | `invalid_request` | 400/422/413, plus SDK-side guards (`prompt`+`messages`, loop options on an object call) | ❌ |
 | `ModelNotFoundError` | `model_not_found` | 404 — wrong slug/region/deployment | ❌ |
 | `ContextOverflowError` | `context_overflow` | history too long; inside the loop it self-heals once per step by force-compacting | ❌ |
-| `TimeoutError` | `timeout` | a `timeout` layer expired; `layer` is `'connect'\|'ttft'\|'total'\|'step'\|'tool'` | ❌ never |
+| `TimeoutError` | `timeout` | a `timeout` layer expired; `layer` is `'connect'\|'ttft'\|'total'\|'step'\|'tool'\|'chunk'` | ❌ never |
 | `AbortError` | `aborted` | caller cancellation; in a stream you normally see `finishReason: 'aborted'` instead | ❌ never |
-| `NoObjectGeneratedError` | `no_object_generated` | `generateObject` after its repair, or `streamObject` on final validation; `.text` is the raw output | ❌ |
+| `NoObjectGeneratedError` | `no_object_generated` | `generateObject` after its repair, or `streamObject` on final validation; `.text` is the raw output, `.finishReason` / `.stopDetails` (2.3) say why | ❌ |
+| `UnpricedModelError` | `unpriced_model` | 2.3: `budget.unknownPrice: 'reject'` and a model with no price, before the call; fatal to the run, also from a compaction summary or a sub-agent | ❌ |
 | `UnsupportedCapabilityError` | `unsupported_capability` | a model lacks the requested capability — **before** any network call | ❌ |
 | `BreakerOpenError` | `breaker_open` | the per-`provider:modelId` circuit breaker is open (5 consecutive health failures, 30s cooldown); `cooldownUntil` is a `deps.clock.now()` stamp | ❌ — fail over instead |
 | `McpAuthorizationRequiredError` | `mcp_authorization_required` | an MCP server needs OAuth; step one of a flow, not a dead end | ❌ |
 | `ToolExecutionError` | `tool_execution` | a tool `execute` threw — **constructed but not thrown** by the loop; it becomes an `is_error` `tool_result` | ❌ |
+
+2.3 adds `DeuzError` subclasses on subpaths: `BatchError` (`@deuz-sdk/core/batch`), `RealtimeError` (`@deuz-sdk/core/realtime`) and `A2AError` (`@deuz-sdk/core/a2a`), each with a `kind` to branch on, and `CheckpointVersionError` (`@deuz-sdk/core/durable`, code `checkpoint_version_unsupported`: a checkpoint written by a newer SDK). `GoalError` (`@deuz-sdk/core/goal`) is a plain `Error` with a `code`.
 
 Prefer `isDeuzError(value)` (a `Symbol.for` brand check) over `instanceof DeuzError` at package boundaries — `instanceof` breaks across duplicate copies and realms. Use `instanceof` for the *specific* subclasses when you need their fields. `err.toJSON()` is the secret-free projection (`name`, `code`, `message`, plus an allowlist of scalar details); `cause` and raw headers are never carried, so logging a `DeuzError` verbatim is safe.
 

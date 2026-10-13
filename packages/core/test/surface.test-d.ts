@@ -216,8 +216,9 @@ import type { CostPart, BudgetExceededPart } from '../src/index';
 import { durationExceeds as durationExceedsRoot } from '../src/index';
 expectTypeOf<CostPart>().toMatchTypeOf<{ type: 'cost'; costUsd: number }>();
 expectTypeOf<BudgetExceededPart['kind']>().toEqualTypeOf<'usd' | 'tokens'>();
+// 2.3: `unknownPrice` decides what a model with no price does under `usd`.
 expectTypeOf<CommonCallOptions['budget']>().toEqualTypeOf<
-  { usd?: number; tokens?: number } | undefined
+  { usd?: number; tokens?: number; unknownPrice?: 'warn' | 'reject' } | undefined
 >();
 expectTypeOf(durationExceedsRoot).returns.toBeFunction();
 // PriceProvider.cacheSavings stays OPTIONAL (additive seam extension).
@@ -407,9 +408,15 @@ expectTypeOf<StreamObjectResult<{ a: string }>['consume']>().toEqualTypeOf<
 
 // --- Warnings channel. The TYPES are locked here even though no collector
 // populates them yet (Sprint 2 shipped the channel, not the emitters), so the
-// shape cannot drift before the producers land. ---
+// shape cannot drift before the producers land. 2.3 widens the union with
+// 'unpriced-model' (a USD budget could not be applied to that call). ---
 expectTypeOf<CallWarning['type']>().toEqualTypeOf<
-  'unsupported-setting' | 'clamped-setting' | 'unknown-model' | 'unsupported-tool' | 'other'
+  | 'unsupported-setting'
+  | 'clamped-setting'
+  | 'unknown-model'
+  | 'unsupported-tool'
+  | 'unpriced-model'
+  | 'other'
 >();
 expectTypeOf<CallWarning['message']>().toEqualTypeOf<string>();
 expectTypeOf<CallWarning['setting']>().toEqualTypeOf<string | undefined>();
@@ -549,6 +556,7 @@ expectTypeOf<Extract<DeuzUIPart, { type: 'tool-state' }>>().toEqualTypeOf<{
   state: ToolRunState;
   denied?: boolean;
   deniedReason?: string;
+  outcome?: ToolCallOutcome;
 }>();
 expectTypeOf<ToolStatePart['denied']>().toEqualTypeOf<boolean | undefined>();
 expectTypeOf<ToolStatePart['deniedReason']>().toEqualTypeOf<string | undefined>();
@@ -575,6 +583,8 @@ expectTypeOf<DeuzChatRequest['rest']>().toEqualTypeOf<Record<string, unknown>>()
 expectTypeOf<ValidateChatOptions>().toEqualTypeOf<{
   maxMessages?: number;
   maxTextBytes?: number;
+  maxOpaqueReasoningBytes?: number;
+  maxProviderMetadataBytes?: number;
   rejectSystemRole?: boolean;
   rejectToolResults?: boolean;
   rejectAssistantTurns?: boolean;
@@ -602,3 +612,191 @@ expectTypeOf(edgeValidateChatRequest).toEqualTypeOf<typeof validateChatRequest>(
 expectTypeOf(edgeParseDeuzChatRequest).toEqualTypeOf<typeof parseDeuzChatRequest>();
 expectTypeOf<EdgeUIMessagePart>().toEqualTypeOf<UIMessagePart>();
 expectTypeOf<EdgeChatInput>().toEqualTypeOf<ChatInput>();
+
+// --- 2.3 additive surface. ---
+import type { CodeExecutionRequest, ShellExecutionRequest } from '../src/compute';
+// runShell takes stdin exactly like runCode (F10).
+expectTypeOf<ShellExecutionRequest>().toHaveProperty('stdin');
+expectTypeOf<ShellExecutionRequest['stdin']>().toEqualTypeOf<CodeExecutionRequest['stdin']>();
+
+// Unknown prices (decision 4): one policy spelling on every budget.
+import { type BudgetLimits, BudgetLedgerError } from '../src/agent';
+import {
+  UnpricedModelError,
+  PRICE_ALIASES,
+  resolveModelProfile,
+  type ModelProfile,
+  type PriceTier,
+  type StopDetails,
+} from '../src/index';
+expectTypeOf<BudgetLimits['unknownPrice']>().toEqualTypeOf<'warn' | 'reject' | undefined>();
+expectTypeOf<'unpriced_model'>().toMatchTypeOf<BudgetLedgerError['code']>();
+expectTypeOf<UnpricedModelError['code']>().toEqualTypeOf<'unpriced_model'>();
+expectTypeOf(PRICE_ALIASES).toEqualTypeOf<Readonly<Record<string, string>>>();
+expectTypeOf<PriceTier>().toHaveProperty('above');
+
+// Model profiles: never claim a live check.
+expectTypeOf(resolveModelProfile).toBeCallableWith({} as LanguageModel);
+expectTypeOf(resolveModelProfile).returns.toEqualTypeOf<ModelProfile>();
+expectTypeOf<ModelProfile['liveVerified']>().toEqualTypeOf<false>();
+
+// Native dispatch: failed receipts, MCP entries, the catalog binding, stop details.
+import type { AgentToolReceipt, AgentMcpEntry, AgentRunEnvelope, AgentResult } from '../src/agent';
+expectTypeOf<'failed'>().toMatchTypeOf<AgentToolReceipt['stage']>();
+expectTypeOf<AgentMcpEntry>().not.toBeNever();
+expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['mcp']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['handoffs']>().toEqualTypeOf<
+  string | undefined
+>();
+expectTypeOf<AgentToolReceipt['idempotent']>().toEqualTypeOf<boolean | undefined>();
+expectTypeOf<GenerateTextResult['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
+expectTypeOf<AgentResult['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
+
+// The 2.3 edge re-exports are the same values as their modules'.
+import {
+  resolveModelProfile as edgeResolveModelProfile,
+  UnpricedModelError as EdgeUnpricedModelError,
+  CheckpointVersionError as EdgeCheckpointVersionError,
+} from '../src/edge';
+import { CheckpointVersionError } from '../src/durable';
+expectTypeOf(edgeResolveModelProfile).toEqualTypeOf<typeof resolveModelProfile>();
+expectTypeOf(EdgeUnpricedModelError).toEqualTypeOf<typeof UnpricedModelError>();
+expectTypeOf(EdgeCheckpointVersionError).toEqualTypeOf<typeof CheckpointVersionError>();
+
+// W2a: native run discovery and the run lease (23.6).
+import { createInMemoryAgentRunStore, ExecutionPolicyError } from '../src/agent';
+import type {
+  AgentRunStore,
+  AgentRunListPage,
+  AgentRunLeaseOptions,
+  AgentRunOptions,
+} from '../src/agent';
+expectTypeOf<ReturnType<NonNullable<AgentRunStore['list']>>>().toEqualTypeOf<
+  Promise<AgentRunListPage>
+>();
+expectTypeOf<AgentRunOptions['lease']>().toEqualTypeOf<AgentRunLeaseOptions | undefined>();
+expectTypeOf(createInMemoryAgentRunStore).returns.toEqualTypeOf<
+  AgentRunStore & Required<Pick<AgentRunStore, 'list'>>
+>();
+
+// W2a: one dispatch contract (23.2): outcomes, catalog changes, inherited guardrails.
+import type {
+  ToolCallOutcome,
+  ToolResult,
+  ToolResultStreamPart,
+  ToolExecuteContext,
+} from '../src/index';
+expectTypeOf<ToolResult['outcome']>().toEqualTypeOf<ToolCallOutcome | undefined>();
+expectTypeOf<ToolStatePart['outcome']>().toEqualTypeOf<ToolCallOutcome | undefined>();
+expectTypeOf<ToolResultStreamPart['outcome']>().toEqualTypeOf<ToolCallOutcome | undefined>();
+expectTypeOf<AgentRunOptions['onCatalogChange']>().toEqualTypeOf<'stop' | 'accept' | undefined>();
+expectTypeOf<CommonCallOptions['onCatalogChange']>().toEqualTypeOf<'stop' | 'accept' | undefined>();
+expectTypeOf<Extract<AgentResult, { status: 'stopped' }>['unknownEffects']>().toEqualTypeOf<
+  AgentToolReceipt[] | undefined
+>();
+expectTypeOf<ToolExecuteContext>().toHaveProperty('guardrails');
+expectTypeOf<ExecutionPolicyError['toolCallId']>().toEqualTypeOf<string | undefined>();
+
+// W2a: the Redis backends.
+import type { RedisClientLike, RedisStores } from '../src/node/store-redis';
+import type { RunStore } from '../src/runtime';
+import {
+  createRedisOpsStore,
+  createRedisBudgetStore,
+  type RedisOpsStore,
+  type RedisBudgetStore,
+} from '../src/node/ops-redis';
+import { createRedisSwarmStore, type RedisSwarmStore } from '../src/node/swarm-redis';
+expectTypeOf<undefined>().toMatchTypeOf<RedisClientLike['eval']>();
+expectTypeOf(createRedisOpsStore).returns.toEqualTypeOf<RedisOpsStore>();
+expectTypeOf(createRedisBudgetStore).returns.toEqualTypeOf<RedisBudgetStore>();
+expectTypeOf(createRedisSwarmStore).returns.toEqualTypeOf<RedisSwarmStore>();
+expectTypeOf<RedisStores['runs']>().toEqualTypeOf<Required<RunStore>>();
+
+// W2a review fixes: the run-wide approval request count on a checkpoint (S1-2).
+expectTypeOf<AgentCheckpoint['approvalRequestCounts']>().toEqualTypeOf<
+  Record<string, number> | undefined
+>();
+
+// W2b: Redis run listing (R3), the stable prefix (F22, D1), native chat / memory /
+// fail-over (23.4, D2), the native UI bridge and display fields (23.5, G2).
+import type { AgentRunListQuery, AgentRunReconciliation } from '../src/agent';
+import { reconcileAgentRun } from '../src/agent';
+import type { CompactMessagesDeps } from '../src/index';
+import { NoObjectGeneratedError } from '../src/index';
+import type { RememberOptions } from '../src/memory';
+import type { DeuzAgentState } from '../src/ui';
+expectTypeOf<RedisOpsStore['agentRuns']['list']>().toEqualTypeOf<
+  (query?: AgentRunListQuery) => Promise<AgentRunListPage>
+>();
+expectTypeOf<CompactMessagesDeps['model']>().toEqualTypeOf<LanguageModel | undefined>();
+expectTypeOf<AgentRunEnvelope['version']>().toEqualTypeOf<1 | 2>();
+expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['memory']>().toEqualTypeOf<
+  string | undefined
+>();
+expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['chat']>().toEqualTypeOf<
+  string | undefined
+>();
+expectTypeOf<NonNullable<AgentRunEnvelope['binding']>['fallback']>().toEqualTypeOf<
+  string | undefined
+>();
+expectTypeOf<AgentRunOptions['memory']>().toEqualTypeOf<MemoryCallOptions | undefined>();
+expectTypeOf<AgentRunOptions['chat']>().toEqualTypeOf<ChatPersistOptions | undefined>();
+expectTypeOf<AgentRunOptions['fallbackModels']>().toEqualTypeOf<LanguageModel[] | undefined>();
+expectTypeOf<ChatRecord['messageIds']>().toEqualTypeOf<string[] | undefined>();
+expectTypeOf<RememberOptions['metadata']>().toEqualTypeOf<Record<string, unknown> | undefined>();
+expectTypeOf<NoObjectGeneratedError['finishReason']>().toEqualTypeOf<FinishReason | undefined>();
+expectTypeOf<NoObjectGeneratedError['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
+expectTypeOf(reconcileAgentRun).returns.toEqualTypeOf<Promise<AgentRunReconciliation>>();
+expectTypeOf<UIToolCall['outcome']>().toEqualTypeOf<ToolCallOutcome | undefined>();
+expectTypeOf<AssistantTurnState['stopDetails']>().toEqualTypeOf<StopDetails | undefined>();
+expectTypeOf<AssistantTurnState['agent']>().toEqualTypeOf<DeuzAgentState | undefined>();
+
+// W2b review fixes: reconcileAgentRun's lease and the 'superseded' chat state (Z2), the
+// durability options (Z3), the provider-metadata cap (Z4), project instructions (Z6).
+import type { AgentRunChatState, AgentRunReconcileOptions, AgentRunRetry } from '../src/agent';
+import type {
+  HeadlessPendingAction,
+  HeadlessReport,
+  HeadlessRetry,
+  ProjectInstructions,
+  ProjectInstructionsOptions,
+} from '../src/node/headless';
+expectTypeOf<AgentRunReconcileOptions['lease']>().toEqualTypeOf<AgentRunLeaseOptions | undefined>();
+expectTypeOf<AgentRunChatState['status']>().toEqualTypeOf<
+  'saved' | 'failed' | 'scope-mismatch' | 'superseded'
+>();
+expectTypeOf<AgentRunChatState['found']>().toEqualTypeOf<string | undefined>();
+expectTypeOf<AgentRunOptions['reconciledToolResults']>().toEqualTypeOf<
+  readonly { toolCallId: string; output: unknown; isError?: boolean }[] | undefined
+>();
+expectTypeOf<AgentRunOptions['retryFailed']>().toEqualTypeOf<boolean | undefined>();
+expectTypeOf<AgentToolReceipt['reconciled']>().toEqualTypeOf<boolean | undefined>();
+expectTypeOf<AgentRunEnvelope['retry']>().toEqualTypeOf<AgentRunRetry | undefined>();
+expectTypeOf<AgentRunRetry>().toEqualTypeOf<{
+  cause: 'model-call' | 'admission';
+  phase: 'running' | 'finalizing';
+}>();
+expectTypeOf<ValidateChatOptions['maxProviderMetadataBytes']>().toEqualTypeOf<number | undefined>();
+expectTypeOf<ProjectInstructions['skipped']>().toEqualTypeOf<
+  { path: string; relativePath: string; reason: 'outside-root' }[]
+>();
+expectTypeOf<ProjectInstructionsOptions['role']>().toEqualTypeOf<'system' | 'user' | undefined>();
+expectTypeOf<NonNullable<ProjectInstructions['message']>['role']>().toEqualTypeOf<
+  'system' | 'user'
+>();
+
+// W3: headless reports a failure in transit and both answers for an unknown effect (HL3).
+expectTypeOf<HeadlessReport['retry']>().toEqualTypeOf<HeadlessRetry | undefined>();
+expectTypeOf<HeadlessRetry>().toEqualTypeOf<{
+  cause: 'model-call' | 'admission';
+  phase: 'running' | 'finalizing';
+  resumeWith: 'retryFailed';
+}>();
+expectTypeOf<
+  Extract<HeadlessPendingAction, { kind: 'unknown-effect' }>['resumeWith']
+>().toEqualTypeOf<['retryToolCallIds', 'reconciledToolResults']>();
+
+// W3 review fixes: the A2A executor sends no drafts under guardrails.onOutput unless asked (V2-3).
+import type { A2AAgentExecutorOptions } from '../src/a2a';
+expectTypeOf<A2AAgentExecutorOptions['drafts']>().toEqualTypeOf<boolean | undefined>();

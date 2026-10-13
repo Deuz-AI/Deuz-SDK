@@ -1,12 +1,15 @@
-<!-- verified: 2026-09-20 against @deuz-sdk/core@2.2.0 · api-contract sha256:c301da6ab500
-     sources: packages/core/src/{providers-compat,providers,openai,anthropic,google,xai,azure,bedrock,vertex,voyage,yunwu}.ts,
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.3.0 · api-contract sha256:d0398bbef8c4
+     sources: packages/core/src/{providers-compat,providers,openai,anthropic,google,xai,azure,bedrock,vertex,voyage,yunwu,model-profile}.ts,
+     packages/core/src/adapters/{anthropic,openai-responses,openai-compatible,google-native}.ts,
+     packages/core/src/internal/{stable-prefix,stop-details}.ts, packages/core/src/core/request-rules.ts,
      packages/core/src/node/vertex-auth.ts, packages/core/src/types/{config,model,deps}.ts,
      packages/core/src/core/registry.ts, packages/core/src/internal/resolve-call.ts,
-     docs/content/docs/providers/*.mdx, docs/content/docs/advanced/model-registry.mdx -->
+     docs/content/docs/providers/*.mdx, docs/content/docs/advanced/model-registry.mdx,
+     docs/content/docs/modules/model-profiles.mdx, docs/content/docs/agents/preserved-thinking.mdx -->
 
 # Providers and models
 
-**Load when:** picking or wiring a provider, choosing between two wires of the same vendor (OpenAI Chat vs Responses, Gemini compat vs native), reaching a self-hosted or internal OpenAI-shaped host, authenticating Vertex/Azure/Bedrock, debugging `AuthenticationError` or a silently truncated answer, or building a string-keyed model router.
+**Load when:** picking or wiring a provider, choosing between two wires of the same vendor (OpenAI Chat vs Responses, Gemini compat vs native), reaching a self-hosted or internal OpenAI-shaped host, authenticating Vertex/Azure/Bedrock, debugging `AuthenticationError`, a silently truncated answer or a Claude 5.x 400, asking what the SDK knows about a model (`resolveModelProfile`, 2.3), or building a string-keyed model router.
 
 ## The factory pattern
 
@@ -47,7 +50,25 @@ Nothing is dialed at factory time — a `Provider` is a pure descriptor builder.
 
 `createAnthropic(settings?: AnthropicSettings)` → `Provider` (surface `anthropic`); singleton `anthropic`. Settings: `apiKey` (sent as `x-api-key`), `baseURL` (adapter appends `/v1/messages`), `fetch`, `headers`.
 
-Use it for Claude with vision, extended thinking, prompt caching and tools. Reasoning is the canonical `effort` option; the adapter picks the wire from the registry row's `effortWire` — `output_config.effort` on Opus 4.7+/Sonnet 5/Fable 5 (manual `thinking.budget_tokens` 400s there), `thinking.budget_tokens` on Opus 4.6 and older. Those flagship rows also set `samplingRestrictions`, so `temperature`/`topP` are dropped rather than sent. `promptCaching: 'auto'` (or `'auto-1h'`) is the one-flag cache write; other providers cache implicitly and ignore it. Forced `toolChoice` is illegal alongside thinking — the adapter downgrades it to `'auto'`.
+Use it for Claude with vision, extended thinking, prompt caching and tools. Reasoning is the canonical `effort` option; the adapter picks the wire from the registry row's `effortWire` — `output_config.effort` on Opus 4.7+/Sonnet 5/Fable 5 (manual `thinking.budget_tokens` 400s there), `thinking.budget_tokens` on Opus 4.6 and older. Those flagship rows also set `samplingRestrictions`, so `temperature`/`topP` are dropped rather than sent. `promptCaching: 'auto'` (or `'auto-1h'`) is the one-flag cache write; other providers cache implicitly and ignore it. Forced `toolChoice` is illegal alongside thinking — the adapter downgrades it to `'auto'`. Every value a request changes this way is reported as a `clamped-setting` or `unsupported-setting` warning (2.3).
+
+Usage that reports `usage.iterations` (server-side fallback, compaction, server tool loops) is summed over the iterations, while `serverToolUses` and the `reasoningTokens` share come from the top-level usage (2.3), so a `priceProvider` that bills server tool calls per call sees them.
+
+### Claude 5.x request rules (2.3)
+
+`claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` and `claude-opus-5` are registry rows, and an unknown `claude-{fable,opus,sonnet,haiku}-N` with N ≥ 5 takes the strictest of their rules instead of the generic fallback. Effort rides `output_config.effort`, `temperature` and `top_p` are never sent, structured output uses `output_config.format`, prompt caching and vision are on, with a 1M-token context and 128K output. A forced `toolChoice` is sent as `auto` (with a `clamped-setting` warning) on Fable 5.1, Opus 5.5 and Sonnet 5.5, and `generateObject` / `streamObject` never take the forced-tool strategy there. `effort: 'none'` maps per model: `thinking.type` `between_tools` on Sonnet 5.5, `disabled` on Haiku 5.5 and Opus 5, and `low` with a warning on Fable 5.1 and Opus 5.5, which cannot turn thinking off. A `capabilities` override cannot put `budget_tokens` or sampling parameters on the wire for this family. Verified against Anthropic's API reference (cached 2026-10-06), not live-verified.
+
+### Preserved thinking: a stable prefix (2.3)
+
+Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind every thinking block to the conversation before it: the top-level `system`, the `tools` array and every earlier message have to reach the API byte-identical on every later request, or the replayed block is invalid (a 400 on accounts opened from 2026-08-31). For these models, and an unknown `claude-*-5…` id on the family fallback, the loops append instead of rewriting:
+
+- **System messages.** The top-level slot is the leading run of `system` messages; a system message after the first non-system one is sent in place as a `role: 'system'` message (other wires: see `references/core-calls.md`). `instructions` folds once over the whole leading run, `promptInjectionGuard()` adds its notice once per history, and `promptInjectionGuardrail()` once per run (a durable or native resumed leg finds it in the checkpoint and passes); these three hold for every model.
+- **Memory recall** is one appended `role: 'system'` message (`providerMetadata.deuz.memoryRecall`), recalled once per user turn right after the question, and kept in the history, `response.messages` and the chat record so the next turn sends it back where the model saw it. The model a run starts with decides the placement on every leg. Details: `references/memory-compaction.md`.
+- **Tools.** The `tools` array stays the same for a run leg: the root agent's tools (MCP tools merged in) filtered by the static `activeTools`. A step that offers another set (`prepareStep.activeTools`, a handoff target's tools, an MCP `tools/list_changed`) appends one system message carrying the change (`providerMetadata.deuz.toolChanges`), sent as `tool_removal` / `tool_addition` blocks under the beta `mid-conversation-tool-changes-2026-07-01`, plus `inline-tools-2026-09-15` when a definition rides inline. A step's tool calls resolve against the set it offered: a call to a withdrawn tool or transfer is answered like an unknown tool and never runs, also when an approval settle resolves the step's pending calls.
+- **Handoffs** append the target's `instructions` as a system message after the transfer's tool result instead of rewriting the system prompt (a target without `instructions` appends nothing). The message lives in the run's history and checkpoints, not in `response.messages`, so the first request of the next call drops the thinking of the turns after the transfer (the safety net below, no error).
+- **Compaction** is summary-only: one summary replaces the conversation, keeping the leading system messages, the system messages that carry run state and the pending user turn with its recall. A prune-only policy compacts nothing and reports each skipped layer; `compactMessages` does the same when `deps.model` is such a model.
+
+The safety net: a request that replays thinking to these models sends `thinking.block_binding: { prefix_mismatch_behavior: 'drop_block' }` with the header `anthropic-beta: thinking-binding-controls-2026-08-01` (merged into an `anthropic-beta` header you pass), so a mismatched block is dropped instead of failing the request. `providerOptions.anthropic.thinking.block_binding` overrides it: an object is sent as given, `null` sends none; `effort: 'none'` carries none. The response's `input_transformations` ride the finish part as `providerMetadata.anthropic.input_transformations` and surface as one warning (`type: 'other'`, `setting: 'thinking.block_binding'`). Every block, redacted ones included, is its own `reasoning` part with `source: 'anthropic'` and replays unchanged, to Claude only. Request shapes follow `@anthropic-ai/sdk` 0.133.0; not live-verified.
 
 ## OpenAI — `@deuz-sdk/core/openai`
 
@@ -59,7 +80,13 @@ Three factories, one settings type (`OpenAISettings`: `apiKey`, `baseURL`, `fetc
 | `createOpenAIResponses` | `Provider` | `responses` | GPT-5.x / `o`-series reasoning (`gpt-5.4`, `o4-mini`), hosted `openaiWebSearch()`, encrypted reasoning replay across tool steps. |
 | `createOpenAIEmbedding` | `EmbeddingProvider` | `openai-embeddings` | `text-embedding-3-small` (1536) / `-large` (3072). |
 
-Singletons: `openai`, `openaiResponses`, `openaiEmbedding`. Chat Completions is the default for plain chat. Move to Responses when you need reasoning models: their registry rows carry `samplingRestrictions` (temperature/topP dropped), `maxOutputTokens` maps to `max_output_tokens`, and a Responses call with tools on a reasoning model automatically requests `include: ["reasoning.encrypted_content"]` with `store: false` and replays the encrypted items on later steps — stateless multi-step tool use stays coherent. Hosted provider tools (`openaiWebSearch`) exist on Responses only; they are dropped on the Chat Completions wire.
+Singletons: `openai`, `openaiResponses`, `openaiEmbedding`. Chat Completions is the default for plain chat. Move to Responses when you need reasoning models: their registry rows carry `samplingRestrictions` (temperature/topP dropped), `maxOutputTokens` maps to `max_output_tokens`, and the encrypted reasoning items are replayed on later steps — stateless multi-step tool use stays coherent. Hosted provider tools (`openaiWebSearch`) exist on Responses only; they are dropped on the Chat Completions wire.
+
+**Responses is stateless by default (2.3).** Every Responses request sends `store: false`, and a reasoning model always asks for `include: ["reasoning.encrypted_content"]`, with or without tools, so its reasoning round-trips on the next turn. `providerOptions.openai.store: true` opts back in to server-side storage; a caller `include` list is merged. A `system` message from the middle of the history stays where it is, as a `system` input item (2.3 behaviour change: it used to move into `instructions`). Retention itself is not live-verified.
+
+**Finish reasons and refusals (2.3).** Chat Completions' `finish_reason` maps one to one (`function_call` is `tool_calls`). A Responses turn ends with `length` when `max_output_tokens` cut it off and with `content_filter` when its content filter did (it ended with `stop`, or `tool_calls` after a call, before 2.3), so the call it streamed is held back. A refusal (Chat `delta.refusal`, Responses `response.refusal.delta` / `.done`) is kept now: the turn ends with `content_filter` unless the provider reported `length` or `content_filter` itself, `stopDetails` is `{ type: 'refusal', explanation: <the refusal text> }`, the `finish` part carries the text as `providerMetadata.openai.refusal`, and it never becomes answer text; a native run stops with reason `'refusal'`. Any host on `createOpenAI` that sends `delta.refusal` gets the same. Shapes follow `openai` 7.32's types; not live-verified.
+
+`gpt-5.5` and `gpt-5.5-pro` are reasoning rows on Chat Completions too (`max_completion_tokens`, no `temperature` / `topP`). `gpt-6.1-sol` takes tools only on Responses: a tool request on Chat Completions throws `InvalidRequestError`. The GPT-5 snapshots take the effort levels OpenAI publishes; any other value is changed with a warning. These rows are research-dated, not live-verified.
 
 ```ts
 import { generateText, openaiWebSearch } from '@deuz-sdk/core';
@@ -93,7 +120,9 @@ console.log(res.text, res.usage.reasoningTokens);
 
 Singletons `google`, `googleNative`, `googleEmbedding`; `createGoogleNative(s)` is exactly `createGoogle({ ...s, surface: 'native' })`. **Default to native.** The compat surface exists for drop-in OpenAI-shaped interop and is capability-limited by design. Its two wire quirks (usage re-emitted on every chunk; every streamed tool-call fragment arriving with `index=0`) are already normalized by the adapter from registry flags — do not dedupe usage or re-key tool fragments yourself, and do not add your own `finishReason` checks: the loop counts accumulated `tool_use` precisely because Gemini can emit `finish: stop` with calls still pending.
 
-`effort` maps per family on the native wire: `gemini-3*` → `thinkingConfig.thinkingLevel`, `gemini-2.5*` → `thinkingConfig.thinkingBudget`. Structured output goes through Gemini's restricted OpenAPI subset — `$ref` / `oneOf` / `anyOf` / `allOf` / `additionalProperties` are **stripped**, so flatten unions and recursion before passing a schema.
+**Finish reasons on the native wire (2.3).** Every Gemini `finishReason` is mapped on purpose, in streams and batch results alike: the filters (`SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`, a blocked prompt) end a turn with `content_filter`; `MAX_TOKENS` and `CONTINUATION` with `length`; `STOP`, `FINISH_REASON_UNSPECIFIED`, unlisted values and the stops that leave no usable answer (`LANGUAGE`, `OTHER`, `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`, `NO_IMAGE`, `IMAGE_OTHER`) with `stop`, as in 2.2. A turn that streamed a call ends with `tool_calls` only when nothing filtered or cut it: a filtered or cut-off one keeps its finish reason and none of its calls runs, while a no-answer stop after a call still ends with `tool_calls` and the call runs. The native wire keeps Gemini's own finish reason on the finish part as `providerMetadata.google.finishReason` (2.3; a batch result carries the same key): `OTHER`, `MALFORMED_FUNCTION_CALL` and the other stops without a usable answer end with `finishReason: 'stop'`, and only the raw value tells them from `STOP`. Read it from `fullStream`'s `finish` part (or the loop's `step-finish` part); `generateText` results and the UI wire do not carry it, and a prompt blocked before any candidate has none. Gemini stops carry no `stopDetails` (`finishMessage` is not read). The compat surface reads the endpoint's Chat Completions `finish_reason` instead. Shapes follow `@google/genai` 2.28's types; not live-verified.
+
+`effort` maps per family on the native wire: `gemini-3*` → `thinkingConfig.thinkingLevel`, `gemini-2.5*` → `thinkingConfig.thinkingBudget`. Structured output goes through Gemini's restricted OpenAPI subset — `$ref` / `oneOf` / `anyOf` / `allOf` / `additionalProperties` are **stripped**, so flatten unions and recursion before passing a schema. A structured-output request sends the JSON schema alone: the call's tools are not sent with it (no documented request combines them), and dropping callable tools is reported as an `unsupported-tool` warning (2.3). A thought signature on a plain text part is kept as `providerMetadata.google.thoughtSignature` and sent back on that text, also through the UI wire and `useChat` (2.3; Gemini does not enforce text signatures, not live-verified).
 
 ### `@deuz-sdk/core/google/extras`
 
@@ -229,7 +258,9 @@ All of these speak Chat Completions and take the same `CompatSettings`: `apiKey`
 
 **The keyless two.** `createOllama` and `createLMStudio` set `apiKeyOptional` internally: when the whole G1 chain comes up empty the resolver substitutes a placeholder bearer token instead of throwing. That is the only change — a real key from any link still wins (useful behind an authenticating reverse proxy). No cloud factory inherits this; `createPerplexity()` with no key still throws `AuthenticationError`.
 
-**DeepSeek V4 always thinks.** `deepseek-v4-flash` / `-pro` reason on every call with no switch, and reasoning shares the output budget — a `maxOutputTokens` sized for the visible reply returns an **empty string**, not an error. Give it room (512+). `generateObject` does not work on V4 at all: it rejects both the `json_schema` and the forced-`tool_choice` strategies. Ask for the shape in the prompt and `JSON.parse` the text; ordinary unforced tool calling is unaffected.
+**DeepSeek V4 always thinks.** `deepseek-v4-flash` / `-pro` reason on every call with no switch, and reasoning shares the output budget — a `maxOutputTokens` sized for the visible reply returns an **empty string**, not an error. Give it room (512+). `effort: 'none'` is dropped with a warning instead of being sent (2.3). `generateObject` does not work on V4 at all: it rejects both the `json_schema` and the forced-`tool_choice` strategies. Since 2.3 the SDK never forces a tool on V4: a forced `toolChoice` is sent as `auto` with a `clamped-setting` warning, and `generateObject` takes the json strategy (an explicit `mode: 'tool'` is reported), which V4 still rejects. Ask for the shape in the prompt and `JSON.parse` the text; ordinary unforced tool calling is unaffected.
+
+**DeepSeek and Kimi reasoning round-trips (2.3).** `createDeepSeek` and `createKimi` get their own reasoning back as `reasoning_content` on the assistant message that carries the turn's tool calls; other Chat Completions hosts send none. Each wire replays only its own family's reasoning (`ReasoningPart.source`), so a fallback to another provider never receives it. Not live-verified.
 
 **The registry is keyed by slug alone, not by (provider, slug).** Two hosts serving the same string share one row. That is usually right on an aggregator (`openrouter('kimi-k2')` inherits the Moonshot row) and occasionally wrong: `together('gpt-5.5')` would pick up the OpenAI row. A per-factory `capabilities` override fixes it, because the merge happens after the row is chosen.
 
@@ -294,14 +325,14 @@ A descriptor carries no capabilities. Everything about *how* to talk to a model 
 
 | Field | Fallback | What it costs |
 | --- | --- | --- |
-| `maxOutput` | `4096` | **The one that matters.** It becomes the request's `max_tokens` — long answers are silently truncated mid-sentence |
+| `maxOutput` | `4096` | A placeholder. Since 2.3 it reaches the wire only as Anthropic's required `max_tokens` (long answers truncate there); OpenAI Chat Completions/Responses and Gemini native leave the cap off. Under a token or USD budget a native call sends it as `maxOutputTokens` so its reservation stays a bound, with a `clamped-setting` warning |
 | `contextWindow` | `128_000` | Feeds compaction sizing |
 | `tools` | `false` | Reported only; **no adapter reads it**, tool calling works regardless |
 | `reasoning` | `false` | `effort` is dropped rather than sent |
 | `structuredOutput` | `false` | `generateObject` uses the tool strategy instead of `json_schema` |
 | `vision`, `caching`, `nativePdf`, `audio` | `false` | Reported only |
 
-The `native` (Gemini) surface is the exception: its fallback is fully ON (`contextWindow: 1_000_000`, `maxOutput: 64_000`) because that wire is uniform across generations.
+The `native` (Gemini) surface is the exception: its fallback is fully ON (`contextWindow: 1_000_000`, a `maxOutput: 64_000` placeholder the native wire omits) because that wire is uniform across generations. On the Anthropic wire an unknown `claude-{fable,opus,sonnet,haiku}-N` with N ≥ 5 takes the Claude 5.x family row (128 000 output) instead of this fallback; any other unknown id there sends the 4096 placeholder as `max_tokens`, and the `unknown-model` warning names `maxOutputTokens` and `capabilities: { maxOutput }` as the ways to raise it.
 
 Fix it without waiting for a registry release. `capabilities` is shallow-merged over the resolved row; the **per-call** value wins over the factory one.
 
@@ -329,6 +360,20 @@ console.log(text);
 ```
 
 `getModelCapabilities(model)` returns the effective row plus any factory override as a **frozen copy**. It never throws and never emits a warning, so it is safe to call from UI gating code (`caps.vision` → show the image upload, `caps.known === false` → show a "new model" hint). Mutating the result is a no-op.
+
+**Model profiles (2.3).** `resolveModelProfile(model)` (root and `/edge`) returns a `ModelProfile`: how the registry answered (`match`: `'exact'`, `'family'` or `'fallback'`), each capability as `'supported'`, `'unsupported'` or `'unknown'`, lifecycle `status`, the documented alias target, `limits` (`contextWindow`, the provider's `maxOutput` and the `defaultOutputCap` a request carries, a number or `'omitted'`), `effort` (wire field, levels that reach the wire as asked, default, what `'none'` becomes), `thinking` (mode, and how reasoning state replays), `sampling`, `forcedToolChoice`, `prefill`, `usage` and `cache` semantics, `refusal`, every `clamps` entry (setting, from, to, the warning it reports), `sourceUrl`, `checkedAt` and `notes`. A value no source states is `'unknown'`, never the row's conservative default, and `liveVerified` is always `false`. It is pure: no network call, no logging, never the API key. `ModelCapabilities` gains the optional `forcedToolChoice`, `effortLevels`, `effortDefault`, `effortNone` and `toolSurfaces` fields (types `EffortLevel`, `EffortNoneMapping`) that the profile reads. `doctor` from `@deuz-sdk/core/headless` turns a profile into findings before a run (`references/headless.md`).
+
+```ts
+import { resolveModelProfile } from '@deuz-sdk/core';
+import { anthropic } from '@deuz-sdk/core/anthropic';
+
+// Pure: no key, no network. The singleton descriptor is enough.
+const profile = resolveModelProfile(anthropic('claude-sonnet-5-5'));
+console.log(profile.match, profile.limits.defaultOutputCap, profile.effort.none, profile.forcedToolChoice);
+for (const clamp of profile.clamps) {
+  console.log(`${clamp.setting}: ${clamp.from} → ${clamp.to} (${clamp.warning})${clamp.when ? `, ${clamp.when}` : ''}`);
+}
+```
 
 Two things `capabilities` is not. It overrides what the SDK **believes**, never what the provider does — `capabilities.tools` is read by no adapter, so setting it neither enables nor disables tool calling. And nothing is validated: an override is a claim about your model. Be especially careful with `structuredOutput: true` on a local model — it switches `generateObject` from the tool strategy to `response_format: { type: 'json_schema' }`, which a small fine-tune will happily ignore and answer with prose.
 
@@ -379,7 +424,7 @@ Do not try to "fix" the ordering by passing client-level keys as a keyProvider �
 
 ## Sharp edges
 
-- An unknown slug is **silently capped at 4096 output tokens**, and the only signal is a `logger.warn` — and the default logger is a no-op. Wire a real `deps.logger` or you will never see it.
+- On the Anthropic wire an unknown slug is **capped at 4096 output tokens** (`max_tokens` is required there); since 2.3 the other wires leave the cap off. The signal is the `unknown-model` warning on `warnings` and one `logger.warn`, and the default logger is a no-op. Wire a real `deps.logger`, or check `resolveModelProfile(model).limits`.
 - `result.warnings` carries the `unknown-model` notice on every call shape, tool-carrying ones included — as a promise on `streamChat` / `streamObject`, as a plain array on `generateText` / `generateObject` with the key omitted when empty.
 - Node-only provider auth: `/vertex/node` (`createAdcKeyProvider`) throws on Edge; `/vertex` (`createServiceAccountKeyProvider`) is edge-safe. And pointing `createOpenAI` at a Gemini endpoint works on the wire but skips the Gemini quirk flags — use `createGoogle` / `createGoogleNative`.
 - A local embedding server has no keyless escape: point `createOpenAIEmbedding({ baseURL, apiKey: 'anything' })` at it, and accept that the descriptor's provider id stays `'openai'` for pricing and logs.
@@ -396,4 +441,6 @@ Do not try to "fix" the ordering by passing client-level keys as a keyProvider �
 - [/docs/providers/voyage](/docs/providers/voyage), [/docs/providers/yunwu](/docs/providers/yunwu)
 - [/docs/providers/compat](/docs/providers/compat), [/docs/providers/local](/docs/providers/local)
 - [/docs/advanced/model-registry](/docs/advanced/model-registry)
+- [/docs/modules/model-profiles](/docs/modules/model-profiles) — `resolveModelProfile`, what each field means, the clamp table.
+- [/docs/agents/preserved-thinking](/docs/agents/preserved-thinking) — the Claude 5.x stable prefix, block binding and its known limits.
 - [/docs/core/dependencies](/docs/core/dependencies)

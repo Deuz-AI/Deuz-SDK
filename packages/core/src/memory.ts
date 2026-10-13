@@ -622,6 +622,12 @@ export interface RememberOptions {
   apply?: boolean;
   /** Swap the LLM extraction step entirely. */
   customExtract?: (messages: Message[]) => Promise<MemoryFact[]> | MemoryFact[];
+  /**
+   * Base metadata every record this pass writes carries (2.3): a native run
+   * stamps `{ deuz: { runId, operationId } }`, so a write can be traced to the
+   * run and extraction that made it. An updated record's own metadata wins.
+   */
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -769,6 +775,7 @@ export async function remember(
           hash: p.hash,
           kind: opts.kind ?? 'episodic',
           scope,
+          ...(opts.metadata ? { metadata: { ...opts.metadata } } : {}),
           createdAt: now,
           updatedAt: now,
           validAt: now,
@@ -849,6 +856,7 @@ export async function remember(
     kind: opts.kind,
     embeddings,
     embeddingModelId,
+    ...(opts.metadata ? { metadata: opts.metadata } : {}),
   });
 
   if (apply && mutations.length) await applyMutations(seams.store, mutations);

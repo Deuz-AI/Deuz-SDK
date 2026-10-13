@@ -1,10 +1,20 @@
 /**
  * fallback.ts — the cross-provider fail-over engine (1.7, D6). Because the
  * WHOLE history is canonical (`Message[]`/`Part[]`), a conversation can hop
- * providers mid-chat: the next candidate receives the identical request the
- * failed one got. Streaming semantics are strict pre-first-byte: an attempt
- * may fail over only while it has produced NO content — once the first
- * content part arrived, a mid-stream error is final (the existing rule).
+ * providers mid-chat: the next candidate receives the identical canonical
+ * request the failed one got. Streaming semantics are strict pre-first-byte:
+ * an attempt may fail over only while it has produced NO content — once the
+ * first content part arrived, a mid-stream error is final (the existing rule).
+ *
+ * Reasoning is the one part a hop does not carry across families (2.3, F21):
+ * an Anthropic signature, an OpenAI encrypted item or a Gemini thought
+ * signature can only be read back by the API that produced it. Each part
+ * records its `source`, and each wire replays only its own family's reasoning
+ * (`internal/reasoning.ts`), so a candidate of another family never receives
+ * the failed provider's blocks — an OpenAI item used to reach Claude as a
+ * `thinking` block — while a hop between Claude models forwards them unchanged
+ * and the API drops what the new model cannot read. Nothing is filtered here:
+ * the same rule holds for every model switch, fail-over or not.
  *
  * Shared by `withFallback` (the middleware) and the `fallbackModels` call
  * option — this module deliberately imports NO orchestrators (no cycles).
@@ -14,6 +24,7 @@ import type {
   CallWarning,
   GenerateTextOptions,
   GenerateTextResult,
+  StopDetails,
   StreamChatOptions,
   StreamChatResult,
 } from '../types/methods';
@@ -23,6 +34,7 @@ import type { Dependencies } from '../types/deps';
 import type { MemoryMutation } from '../memory';
 import { createBroadcaster, createDeferred, lazyAsyncIterable } from './async-iter';
 import { resolveDependencies, noopTracer } from './resolve-deps';
+import { withCapabilityOverride } from './config-symbol';
 import { APICallError, BreakerOpenError, NetworkError, TimeoutError } from '../errors';
 
 export interface FallbackHooks {
@@ -80,7 +92,11 @@ export async function runGenerateWithFallback(
   for (let i = 0; i < candidates.length; i++) {
     const model = candidates[i]!;
     try {
-      const result = await run({ ...options, model });
+      // The caller's `capabilities` override describes every candidate (2.3, F26).
+      const result = await run({
+        ...options,
+        model: withCapabilityOverride(model, options.capabilities),
+      });
       if (i > 0) {
         const deuz = (result.providerMetadata?.deuz ?? {}) as Record<string, unknown>;
         result.providerMetadata = {
@@ -156,6 +172,8 @@ export function runStreamWithFallback(
   const broadcaster = createBroadcaster<StreamPart>();
   const usageDeferred = createDeferred<Usage>();
   const finishDeferred = createDeferred<FinishReason>();
+  // The winner's stop explanation (2.3), settled with `finishReason`.
+  const stopDetailsDeferred = createDeferred<StopDetails | undefined>();
   const fullSub = broadcaster.subscribe();
   const textSub = broadcaster.subscribe();
   const memoryDeferred =
@@ -211,7 +229,11 @@ export function runStreamWithFallback(
     try {
       for (let i = 0; i < candidates.length; i++) {
         const model = candidates[i]!;
-        const attempt = run({ ...callOptions, model });
+        // The caller's `capabilities` override describes every candidate (2.3, F26).
+        const attempt = run({
+          ...callOptions,
+          model: withCapabilityOverride(model, callOptions.capabilities),
+        });
         const iterator = attempt.fullStream[Symbol.asyncIterator]();
         const buffered: StreamPart[] = [];
         let failure: unknown;
@@ -256,6 +278,7 @@ export function runStreamWithFallback(
           // Pre-first-content failure — this attempt may fail over.
           attempt.usage.catch(() => {});
           attempt.finishReason.catch(() => {});
+          void attempt.stopDetails?.catch(() => {});
           void attempt.memory?.catch(() => {});
           lastError = failure;
           if (i < candidates.length - 1 && should(failure)) {
@@ -267,6 +290,7 @@ export function runStreamWithFallback(
           broadcaster.push({ type: 'error', error: failure });
           usageDeferred.reject(failure);
           finishDeferred.reject(failure);
+          stopDetailsDeferred.reject(failure);
           memoryDeferred?.resolve([]);
           broadcaster.close();
           return;
@@ -295,6 +319,7 @@ export function runStreamWithFallback(
               broadcaster.push({ type: 'error', error });
               usageDeferred.reject(error);
               finishDeferred.reject(error);
+              stopDetailsDeferred.reject(error);
               memoryDeferred?.resolve([]);
               broadcaster.close();
               return;
@@ -313,6 +338,11 @@ export function runStreamWithFallback(
         } catch (error) {
           finishDeferred.reject(error);
         }
+        try {
+          stopDetailsDeferred.resolve(await attempt.stopDetails);
+        } catch (error) {
+          stopDetailsDeferred.reject(error);
+        }
         if (memoryDeferred) {
           if (attempt.memory) {
             void attempt.memory.then((mutations) => memoryDeferred.resolve(mutations));
@@ -328,6 +358,7 @@ export function runStreamWithFallback(
       broadcaster.push({ type: 'error', error });
       usageDeferred.reject(error);
       finishDeferred.reject(error);
+      stopDetailsDeferred.reject(error);
       memoryDeferred?.resolve([]);
       broadcaster.close();
     }
@@ -430,6 +461,10 @@ export function runStreamWithFallback(
     get finishReason() {
       ensureStarted();
       return finishDeferred.promise;
+    },
+    get stopDetails() {
+      ensureStarted();
+      return stopDetailsDeferred.promise;
     },
     get warnings() {
       ensureStarted();

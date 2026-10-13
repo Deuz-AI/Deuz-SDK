@@ -43,16 +43,22 @@ export interface ResolvedTimeouts extends Required<TimeoutConfig> {
  * `{ totalMs }` shorthand. An explicit `0` disables that layer — `createTimeout`
  * only arms timers for positive values — which is how a caller opts out of the
  * 300s total ceiling that a 25-30s serverless function budget makes meaningless.
+ * `Infinity` disables a layer too (2.3): a host `setTimeout` clamps it to 1ms.
  */
 export function resolveTimeouts(timeout: CommonCallOptions['timeout']): ResolvedTimeouts {
   if (timeout === undefined) return { ...DEFAULT_TIMEOUTS };
   const config = typeof timeout === 'number' ? { totalMs: timeout } : timeout;
+  const ms = (value: number | undefined): number | undefined =>
+    value === undefined || Number.isFinite(value) ? value : 0;
+  const stepMs = ms(config.stepMs);
+  const toolMs = ms(config.toolMs);
+  const chunkMs = ms(config.chunkMs);
   return {
-    ttftMs: config.ttftMs ?? DEFAULT_TIMEOUTS.ttftMs,
-    totalMs: config.totalMs ?? DEFAULT_TIMEOUTS.totalMs,
-    ...(config.stepMs !== undefined ? { stepMs: config.stepMs } : {}),
-    ...(config.toolMs !== undefined ? { toolMs: config.toolMs } : {}),
-    ...(config.chunkMs !== undefined ? { chunkMs: config.chunkMs } : {}),
+    ttftMs: ms(config.ttftMs) ?? DEFAULT_TIMEOUTS.ttftMs,
+    totalMs: ms(config.totalMs) ?? DEFAULT_TIMEOUTS.totalMs,
+    ...(stepMs !== undefined ? { stepMs } : {}),
+    ...(toolMs !== undefined ? { toolMs } : {}),
+    ...(chunkMs !== undefined ? { chunkMs } : {}),
   };
 }
 

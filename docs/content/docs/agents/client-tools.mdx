@@ -202,8 +202,11 @@ What you get at the break:
 
 - **`generateText`** returns `pendingApprovals: ToolApprovalRequest[]` —
   `{ approvalId, toolCallId, toolName, input }` per pending call
-  (`approvalId === toolCallId` today; the field is separate so signed approvals
-  can land additively). `finishReason` stays `'tool_calls'`.
+  (since 2.3 `approvalId` is the tool call id followed by a digest that binds
+  the approval to its tool and arguments, and in a durable or native run to its
+  run and step; echo it back unchanged. A verdict naming only the tool call id
+  still counts when the run used that id once: it is unique in the history, and
+  a durable run issued one approval request under it). `finishReason` stays `'tool_calls'`.
 - **`streamChat` / the UI wire** emits one `tool-approval-request` part per
   pending call after the `tool-call` parts.
 
@@ -266,9 +269,9 @@ export const runtime = 'edge';
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 
 export async function POST(req: Request): Promise<Response> {
-  // A client-tool route MUST allow `role: 'tool'` turns — that is the round-trip.
+  // Since 2.3 the default accepts the round-trip's `role: 'tool'` answers.
   // Read what that accepts: /docs/modules/request-validation#client-tools-need-rejecttoolresults-false
-  const parsed = validateChatRequest(await req.json(), { rejectToolResults: false });
+  const parsed = validateChatRequest(await req.json());
   if (!parsed.ok) return Response.json({ issues: parsed.issues }, { status: 400 });
 
   const result = streamChat({

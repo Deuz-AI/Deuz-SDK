@@ -20,6 +20,7 @@
  */
 import { InvalidRequestError } from '../errors';
 import type { TokenStore, McpOAuthOptions, DeuzOAuthProvider } from '../types/config';
+import type { McpSdkLine } from './shared';
 
 export type { TokenStore, McpOAuthOptions, DeuzOAuthProvider } from '../types/config';
 
@@ -41,7 +42,8 @@ type SdkInvalidationScope = 'all' | 'client' | 'tokens' | 'verifier' | 'discover
 interface SdkOAuthClientProvider {
   readonly redirectUrl: string;
   readonly clientMetadata: Record<string, unknown>;
-  clientInformation(): Promise<Record<string, unknown> | undefined>;
+  /** v2 passes the resolved authorization server's `issuer` (SEP-2352); v1 passes nothing. */
+  clientInformation(ctx?: { issuer?: string }): Promise<Record<string, unknown> | undefined>;
   saveClientInformation(info: Record<string, unknown>): Promise<void>;
   tokens(): Promise<Record<string, unknown> | undefined>;
   saveTokens(tokens: Record<string, unknown>): Promise<void>;
@@ -51,45 +53,83 @@ interface SdkOAuthClientProvider {
   invalidateCredentials(scope: SdkInvalidationScope): Promise<void>;
 }
 
-/** The slice of `@modelcontextprotocol/sdk/client/auth.js` we drive. */
+/**
+ * The slice of the SDK's auth module we drive — `@modelcontextprotocol/client`
+ * (v2) and `@modelcontextprotocol/sdk/client/auth.js` (v1) export the same two
+ * names with the same shape.
+ */
 interface SdkAuthModule {
   auth(
     provider: SdkOAuthClientProvider,
     options: {
       serverUrl: string | URL;
       authorizationCode?: string;
+      /** The redirect's `iss` (RFC 9207). v2 checks it; v1 has no such option. */
+      iss?: string;
       scope?: string;
     },
   ): Promise<'AUTHORIZED' | 'REDIRECT'>;
   UnauthorizedError: new (message?: string) => Error;
 }
 
-async function loadAuthModule(): Promise<SdkAuthModule> {
-  try {
-    const spec: string = '@modelcontextprotocol/sdk/client/auth.js';
-    return (await import(spec)) as SdkAuthModule;
-  } catch (err) {
-    throw new InvalidRequestError({
-      message:
-        'MCP OAuth needs the optional peer "@modelcontextprotocol/sdk". Install it: npm i @modelcontextprotocol/sdk',
-      cause: err,
-    });
+/** Where each SDK line keeps its OAuth machinery — v2 first, as `sdk: 'auto'` prefers. */
+const AUTH_MODULES: ReadonlyArray<{ line: McpSdkLine; spec: string }> = [
+  { line: 'v2', spec: '@modelcontextprotocol/client' },
+  { line: 'v1', spec: '@modelcontextprotocol/sdk/client/auth.js' },
+];
+
+/** Every installed line's auth module, in preference order (2.3). */
+async function loadAuthModules(): Promise<{
+  modules: Array<{ line: McpSdkLine; module: SdkAuthModule }>;
+  cause?: unknown;
+}> {
+  const modules: Array<{ line: McpSdkLine; module: SdkAuthModule }> = [];
+  let cause: unknown;
+  for (const candidate of AUTH_MODULES) {
+    try {
+      const spec: string = candidate.spec;
+      const mod = (await import(spec)) as Partial<SdkAuthModule>;
+      if (typeof mod.auth === 'function' && typeof mod.UnauthorizedError === 'function') {
+        modules.push({ line: candidate.line, module: mod as SdkAuthModule });
+      }
+    } catch (err) {
+      cause ??= err;
+    }
   }
+  return { modules, cause };
+}
+
+/**
+ * The OAuth machinery (2.3): the line the provider was bound through when there
+ * is one — its transport started this flow, so its exchange finishes it, and
+ * `sdk: 'v1'` keeps the 2.2 exchange — else whichever line is installed, v2
+ * first. The provider below is the same object for both: the v2
+ * `OAuthClientProvider` only ADDED optional members (an `issuer` context
+ * argument, DPoP, discovery-state caching) that this provider leaves unset.
+ */
+async function loadAuthModule(line: McpSdkLine | undefined): Promise<SdkAuthModule> {
+  const { modules, cause } = await loadAuthModules();
+  const preferred = modules.find((candidate) => candidate.line === line) ?? modules[0];
+  if (preferred) return preferred.module;
+  throw new InvalidRequestError({
+    message:
+      'MCP OAuth needs an MCP SDK — install the MCP 2026-07-28 client (npm i @modelcontextprotocol/client) or the 2025-11-25 one (npm i @modelcontextprotocol/sdk).',
+    cause,
+  });
 }
 
 /**
  * Recognize the SDK's `UnauthorizedError` — the signal that a server wants
- * OAuth. `instanceof` first (correct across the SDK's own subclasses), falling
- * back to the name because the thrown instance may come from a DIFFERENT copy
- * of the SDK than the one we just imported (transports carry their own).
+ * OAuth. `instanceof` against EVERY installed line's class (2.3: the client may
+ * run on either, and the v1 class sets no distinctive `name`), falling back to
+ * the name because the thrown instance may come from a DIFFERENT copy of the
+ * SDK than the one we just imported (transports carry their own).
  */
 export async function isUnauthorizedError(value: unknown): Promise<boolean> {
   if (!value || typeof value !== 'object') return false;
-  try {
-    const { UnauthorizedError } = await loadAuthModule();
-    if (value instanceof UnauthorizedError) return true;
-  } catch {
-    /* peer missing — the name check below still identifies it */
+  const { modules } = await loadAuthModules();
+  for (const { module } of modules) {
+    if (value instanceof module.UnauthorizedError) return true;
   }
   return (value as Error).name === 'UnauthorizedError';
 }
@@ -130,7 +170,7 @@ function normalizeServerUrl(url: string): string {
 
 /** Bookkeeping a bound provider needs; `bindOAuthServer` is the only writer. */
 interface ProviderBinding {
-  bind(serverUrl: string): Promise<void>;
+  bind(serverUrl: string, line: McpSdkLine | undefined): Promise<void>;
 }
 
 const bindings = new WeakMap<DeuzOAuthProvider, ProviderBinding>();
@@ -141,6 +181,8 @@ const bindings = new WeakMap<DeuzOAuthProvider, ProviderBinding>();
  * `createMcpClient` — has to say so before the transport starts; every store key
  * is namespaced by it, and `completeAuth` needs it to pick the right exchange.
  * Binding is idempotent and re-binding is allowed (one provider, many servers).
+ * `line` (2.3) is the SDK line that transport runs on: `completeAuth` on this
+ * provider object finishes the exchange on the same line.
  *
  * Awaited rather than fire-and-forget because the `server-url` record is what
  * lets a SECOND process (the CLI run that carries the `?code=` back) know which
@@ -149,8 +191,9 @@ const bindings = new WeakMap<DeuzOAuthProvider, ProviderBinding>();
 export async function bindOAuthServer(
   provider: DeuzOAuthProvider,
   serverUrl: string,
+  line?: McpSdkLine,
 ): Promise<void> {
-  await bindings.get(provider)?.bind(serverUrl);
+  await bindings.get(provider)?.bind(serverUrl, line);
 }
 
 /** Accept either shape of `McpHttpLoopConfig.auth`, always yielding a provider. */
@@ -179,6 +222,8 @@ export function toOAuthProvider(auth: McpOAuthOptions | DeuzOAuthProvider): Deuz
 export function createOAuthProvider(options: McpOAuthOptions): DeuzOAuthProvider {
   const store = options.store ?? inMemoryTokenStore();
   let serverUrl: string | undefined;
+  /** The SDK line of the last binding — in memory only, like `serverUrl` itself. */
+  let boundLine: McpSdkLine | undefined;
   let authorizationUrl: URL | undefined;
 
   const key = (namespace: string): string => `${namespace}:${serverUrl ?? UNBOUND_SERVER}`;
@@ -225,19 +270,27 @@ export function createOAuthProvider(options: McpOAuthOptions): DeuzOAuthProvider
       };
     },
 
-    async clientInformation() {
+    async clientInformation(ctx) {
       // A configured `clientId` short-circuits dynamic registration entirely:
       // the SDK skips the registration request when this resolves.
       if (options.clientId) {
         return {
           client_id: options.clientId,
           ...(options.clientSecret ? { client_secret: options.clientSecret } : {}),
+          // The v2 SDK (SEP-2352) binds client info to an authorization server
+          // by an `issuer` stamp and WRITES BACK an unstamped value to stamp it —
+          // which would copy a configured secret into the token store, and warn
+          // on every call. A configured client is meant for whichever server
+          // this provider was bound to, so it carries the issuer being asked about.
+          ...(ctx?.issuer ? { issuer: ctx.issuer } : {}),
         };
       }
       return readJson('client-info');
     },
 
     async saveClientInformation(info) {
+      // Configuration, not state: a configured client is never persisted.
+      if (options.clientId) return;
       await store.set(key('client-info'), JSON.stringify(info));
     },
 
@@ -293,12 +346,15 @@ export function createOAuthProvider(options: McpOAuthOptions): DeuzOAuthProvider
     provider,
     authorizationUrl: () => authorizationUrl,
 
-    async completeAuth(code) {
+    async completeAuth(code, iss) {
       const target = await requireServerUrl();
-      const { auth } = await loadAuthModule();
+      // A fresh provider (a second process, a callback route) was never bound,
+      // so it takes the installed line — v2 first, which wants the `iss`.
+      const { auth } = await loadAuthModule(boundLine);
       await auth(provider, {
         serverUrl: target,
         authorizationCode: code,
+        ...(iss !== undefined ? { iss } : {}),
         ...(options.scope ? { scope: options.scope } : {}),
       });
     },
@@ -316,8 +372,9 @@ export function createOAuthProvider(options: McpOAuthOptions): DeuzOAuthProvider
   };
 
   bindings.set(deuzProvider, {
-    async bind(url) {
+    async bind(url, line) {
       serverUrl = normalizeServerUrl(url);
+      boundLine = line;
       await store.set(SERVER_URL_KEY, serverUrl);
     },
   });

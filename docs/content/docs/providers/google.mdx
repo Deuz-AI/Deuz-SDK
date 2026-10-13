@@ -70,7 +70,9 @@ for await (const part of result.fullStream) {
 }
 ```
 
-Reasoning models emit a `thoughtSignature` on reasoning and tool-call parts. The adapter carries it through `providerMetadata.google.thoughtSignature` and replays it on the next turn, so the agentic [tool loop](/docs/agents/tool-loop) round-trips multi-step thinking correctly. Keep the message history immutable — the signature lives on the prior turn's parts.
+Reasoning models emit a `thoughtSignature` on reasoning, tool-call and plain text parts. The adapter keeps a thought's signature on its `reasoning` part (with `source: 'google'`) and a tool call's or text part's in `providerMetadata.google.thoughtSignature`, and replays each on the next turn, so the agentic [tool loop](/docs/agents/tool-loop) round-trips multi-step thinking correctly. Keep the message history immutable — the signature lives on the prior turn's parts.
+
+Since 2.3 a signature on a plain text part is kept too, including one streamed in a final chunk whose text is empty: it rides back on that text part. Gemini does not enforce text signatures, but drops in reasoning quality without them (not live-verified). Only Gemini's own thoughts are replayed here: reasoning another provider produced (a Claude thinking block, an OpenAI encrypted item) never becomes a `thoughtSignature`.
 
 ## Google Search grounding
 
@@ -216,6 +218,7 @@ A `fileData` Part is produced from an `image` Part whose `image` is a URL string
 - `propertyOrdering` is injected from object key order so output is deterministic.
 - A nullable union like `['string', 'null']` becomes `{ type: 'STRING', nullable: true }`.
 - Enum values keep their declared JSON type; integer enums are not coerced to strings.
+- A structured request sends no tools on this wire. `@google/genai` (2.28.0) documents no request that combines function declarations with a JSON response schema, so a `runAgent` finalization, which offers the loop's tools with `tool_choice: 'none'`, sends the schema alone here; with `'none'` the model could not call them anyway. Any other drop of callable tools is reported as an `unsupported-tool` warning (2.3; not live-verified).
 
 ```ts
 import { generateObject } from '@deuz-sdk/core';
@@ -232,3 +235,43 @@ const { object } = await generateObject({
 ```
 
 See [generateObject](/docs/core/generate-object) for the strategy picker and repair retry.
+
+## Finish reasons
+
+The native wire maps every `FinishReason` value of `@google/genai` 2.28 onto `finishReason` (2.3), and the `finish` part keeps Gemini's own value as `providerMetadata.google.finishReason`:
+
+| Gemini `finishReason` | `finishReason` |
+| --- | --- |
+| `STOP`, `FINISH_REASON_UNSPECIFIED` | `'stop'` |
+| `MAX_TOKENS`, `CONTINUATION` (Deuz sends no continuation token) | `'length'` |
+| `SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`, and a blocked prompt (`promptFeedback.blockReason`) | `'content_filter'` |
+| `LANGUAGE`, `OTHER`, `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`, `NO_IMAGE`, `IMAGE_OTHER`: the turn stopped without a usable answer | `'stop'`, as before 2.3; only `providerMetadata.google.finishReason` tells them from `STOP` |
+| A value 2.28 does not list | `'stop'` |
+
+Gemini finishes a turn that called a function with `STOP`, so a turn that streamed a call ends with `'tool_calls'`, unless a filter or a limit stopped it. Such a turn ends with `'content_filter'` or `'length'`, and none of its calls runs. Before 2.3 `SPII`, the two image filters and `CONTINUATION` ended a turn with `'stop'`, and a call won over every reason.
+
+A stop without a usable answer ends the turn as `STOP` does, as before 2.3. A native run with `output` goes on to finalization and re-asks through output repair when the answer is empty or invalid; a run without `output` completes with whatever text the turn had. To tell such a stop apart, read Gemini's value off the `finish` part on `fullStream` (or the streaming loop's `step-finish` part). It is there whenever the response reported a finish reason, so a prompt blocked before any candidate has none:
+
+```ts title="gemini-finish-reason.ts"
+import { streamChat } from '@deuz-sdk/core';
+import { createGoogleNative } from '@deuz-sdk/core/google';
+
+const google = createGoogleNative({ apiKey: process.env.GEMINI_API_KEY! });
+
+const result = streamChat({
+  model: google('gemini-2.5-flash'),
+  messages: [{ role: 'user', content: 'Plan a three-day trip to Rome.' }],
+});
+
+for await (const part of result.fullStream) {
+  if (part.type !== 'finish') continue;
+  const raw = (part.providerMetadata?.google as { finishReason?: string } | undefined)
+    ?.finishReason;
+  // finishReason is 'stop' for STOP and for OTHER alike: the raw value tells them apart.
+  if (part.finishReason === 'stop' && raw !== undefined && raw !== 'STOP') {
+    console.warn(`Gemini stopped with ${raw}`);
+  }
+}
+```
+
+Batch results map the same values and carry the same `providerMetadata.google.finishReason`. A Gemini stop carries no `stopDetails`: the candidate's `finishMessage` is not read. The OpenAI-compat surface (`createGoogle`) reads the endpoint's Chat Completions `finish_reason` instead. The shapes follow `@google/genai` 2.28's types; not live-verified.

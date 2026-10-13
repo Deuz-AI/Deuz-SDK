@@ -113,6 +113,26 @@ describe('createLoopbackRedirect', () => {
     }
   });
 
+  it("waitForCallback() hands back the redirect's iss with the code (RFC 9207)", async () => {
+    const named = await createLoopbackRedirect();
+    const plain = await createLoopbackRedirect();
+    try {
+      await (await fetch(callback(named, 'code=c-9207&iss=https%3A%2F%2Fas.example.com'))).text();
+      expect(await named.waitForCallback()).toEqual({
+        code: 'c-9207',
+        iss: 'https://as.example.com',
+      });
+      expect(await named.waitForCode()).toBe('c-9207');
+
+      // A redirect without `iss` leaves the key out, so it spreads cleanly.
+      await (await fetch(callback(plain, 'code=c-plain'))).text();
+      expect(await plain.waitForCallback()).toEqual({ code: 'c-plain' });
+    } finally {
+      await named.close();
+      await plain.close();
+    }
+  });
+
   it('honours an explicit path and 404s anything else', async () => {
     const loopback = await createLoopbackRedirect({ path: '/oauth/done' });
     try {

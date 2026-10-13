@@ -43,7 +43,7 @@ const res = streamChat({
 
 `instructions` combines with either input shape and is placed **first**. A `system`-role message already in `messages` is **preserved after it** — the option arrives on its own structural field while history may be a replayed or user-supplied transcript, so history content cannot reorder or drop your framing.
 
-The fold is **idempotent**: if the first turn is already a system message whose content is exactly `instructions`, no second copy is prepended. That is what makes persisting the folded history and passing the same `instructions` on the next turn safe — system prompts cannot stack.
+The fold is **idempotent**: if the leading run of system messages already holds one whose content is exactly `instructions` (2.3: the whole run, not only the first message), no second copy is prepended. That is what makes persisting the folded history and passing the same `instructions` on the next turn safe — system prompts cannot stack.
 
 ```ts
 // messages: [{ role: 'system', content: 'You are terse.' }, { role: 'user', … }]
@@ -120,7 +120,7 @@ const res = streamChat({ model, prompt, abortSignal: controller.signal }); // ho
 
 Override what the SDK believes about a model it does not know yet.
 
-An unknown model slug does not throw; it falls back to a conservative registry row whose `maxOutput` is `4096`. So a brand-new Together / Groq / OpenRouter slug was **silently truncated** at 4096 output tokens, `reasoning: false` dropped `effort`, and `structuredOutput: false` pushed `generateObject` onto the tool strategy.
+An unknown model slug does not throw; it falls back to a conservative registry row whose `maxOutput` is a `4096` placeholder. Before 2.3 a brand-new Together / Groq / OpenRouter slug was therefore **silently truncated** at 4096 output tokens. Since 2.3 the OpenAI and Gemini wires leave the cap off for a placeholder, so the provider's own default applies; Anthropic, which requires `max_tokens`, still sends it, and so does any call under an execution context's token or USD budget. `reasoning: false` still drops `effort`, and `structuredOutput: false` still pushes `generateObject` onto the tool strategy.
 
 ```ts title="capabilities.ts"
 await generateText({

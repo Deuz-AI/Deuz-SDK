@@ -6,7 +6,13 @@
  * server-mode `approveToolCall` (which AI SDK's subagents cannot do). No new
  * runtime: `execute` just drives the existing streaming loop one level down.
  */
-import type { Tool, ToolSet, StopCondition, ToolApprovalRequest } from '../types/tool';
+import type {
+  Tool,
+  ToolSet,
+  StopCondition,
+  ToolApprovalRequest,
+  ToolExecuteContext,
+} from '../types/tool';
 import type { CompactionOption } from '../types/config';
 import type { LanguageModel } from '../types/model';
 import type { Message } from '../types/message';
@@ -17,8 +23,9 @@ import {
   type StreamToolLoopInternal,
   type StreamToolLoopSnapshot,
 } from './stream-tool-loop';
-import { SubAgentSuspension } from './loop-shared';
+import { SubAgentSuspension, durableResumeOf } from './loop-shared';
 import { readInheritedObserve } from '../internal/observe-runtime';
+import { assertCheckpointVersion } from '../internal/checkpoint-version';
 import { toObservedError } from '../internal/observe-error';
 
 export interface AgentToolDef {
@@ -57,6 +64,48 @@ const delegationExecutors = new WeakSet<NonNullable<Tool['execute']>>();
 /** Internal native adapter guard: scoped public contexts cannot carry delegation internals. */
 export function isAgentDelegationTool(tool: Tool): boolean {
   return tool.execute !== undefined && delegationExecutors.has(tool.execute);
+}
+
+/**
+ * How many EARLIER parent turns issued this tool-call id (2.3). Providers that
+ * number their calls per response (`tool_0`, `tool_1`, …) hand out the same id
+ * again at a later step; the turn that issued THIS call is the last one
+ * carrying it.
+ */
+function earlierIssues(messages: readonly Message[], toolCallId: string): number {
+  let issued = 0;
+  for (const message of messages) {
+    if (
+      message.role === 'assistant' &&
+      typeof message.content !== 'string' &&
+      message.content.some((part) => part.type === 'tool_use' && part.id === toolCallId)
+    )
+      issued++;
+  }
+  return Math.max(0, issued - 1);
+}
+
+/**
+ * The durable child run of one delegation. The 2.2 key (`<run>::<name>#<call>`)
+ * named the call id only, so a recycled id at a later parent step found the
+ * first delegation's child (2.3 fix):
+ * - a native run's call carries its root `modelStep`, the step half of its
+ *   effect receipt key, so the child key carries it too; a child a 2.2 run left
+ *   under the plain key is still resumed while the id is the first of its kind;
+ * - a legacy loop numbers the id's reuses instead: the first call keeps the
+ *   2.2 key, each later one adds `~<n>`.
+ */
+async function childRunId(
+  store: NonNullable<ToolExecuteContext['session']>['store'],
+  base: string,
+  ctx: ToolExecuteContext,
+): Promise<string> {
+  const reused = earlierIssues(ctx.messages, ctx.toolCallId);
+  const modelStep = (ctx as ToolExecuteContext & { modelStep?: unknown }).modelStep;
+  if (typeof modelStep !== 'number') return reused === 0 ? base : `${base}~${reused}`;
+  const stepped = `${base}@${modelStep}`;
+  if (reused > 0 || (await store.load(stepped))) return stepped;
+  return (await store.load(base)) ? base : stepped;
 }
 
 // Returns a plain `Tool` (unknown/unknown) so it drops straight into a
@@ -102,11 +151,16 @@ export function agentTool(def: AgentToolDef): Tool {
       // starting over, settling its pending calls from the forwarded
       // `approvalResponses`. The key includes `ctx.toolCallId` — the model-
       // issued tool_use id, stable across resume legs because it lives in the
-      // parent history — so parallel same-name sub-agents never collide.
+      // parent history — so parallel same-name sub-agents never collide, and
+      // (2.3) the parent step when a provider reuses the id (`childRunId`).
       const childSession = ctx.session
         ? {
             store: ctx.session.store,
-            runId: `${ctx.session.runId}::${def.name}#${ctx.toolCallId}`,
+            runId: await childRunId(
+              ctx.session.store,
+              `${ctx.session.runId}::${def.name}#${ctx.toolCallId}`,
+              ctx,
+            ),
             ...(ctx.session.durability ? { durability: ctx.session.durability } : {}),
           }
         : undefined;
@@ -118,6 +172,8 @@ export function agentTool(def: AgentToolDef): Tool {
       ];
       if (childSession) {
         const checkpoint = await childSession.store.load(childSession.runId);
+        // A child checkpoint a newer SDK wrote is never resumed as if understood (2.3).
+        if (checkpoint) assertCheckpointVersion(checkpoint, childSession.runId);
         if (checkpoint && (checkpoint.status === 'suspended' || ctx.execution)) {
           if (ctx.execution && checkpoint.status === 'completed') {
             const last = [...checkpoint.messages].reverse().find((m) => m.role === 'assistant');
@@ -132,7 +188,7 @@ export function agentTool(def: AgentToolDef): Tool {
           }
           childMessages = [...checkpoint.messages];
           resume = {
-            resumeFrom: { stepIndex: checkpoint.stepIndex, usage: checkpoint.usage },
+            resumeFrom: durableResumeOf(checkpoint),
             ...(checkpoint.cost ? { resumeCost: checkpoint.cost } : {}),
             // Handoff (2.0): the CHILD's checkpoint carries the child's own
             // active agent, so a sub-agent that transferred and then suspended
@@ -188,6 +244,10 @@ export function agentTool(def: AgentToolDef): Tool {
           ...(ctx.runtimeContext !== undefined ? { runtimeContext: ctx.runtimeContext } : {}),
           // Inherit the parent's server-mode approver so sub-agent calls stay gated.
           ...(ctx.approveToolCall ? { approveToolCall: ctx.approveToolCall } : {}),
+          // And the parent run's tool policy (2.3): its `onToolCall` /
+          // `onToolResult` guardrails judge the sub-agent's calls too. A child
+          // narrows what the run may do, never widens it.
+          ...(ctx.guardrails ? { guardrails: ctx.guardrails } : {}),
           ...(ctx.approvalSigner ? { approvalSigner: ctx.approvalSigner } : {}),
           ...(ctx.execution
             ? {

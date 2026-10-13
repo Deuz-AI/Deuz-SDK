@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/14-native-memory-chat",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A native run with memory, a chat projection and model fail-over, and reconcileAgentRun repairing a chat write that failed.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

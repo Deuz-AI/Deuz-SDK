@@ -117,15 +117,15 @@ describe.skipIf(!apiKey)(`deepseek — live (${MODEL})`, () => {
    *   tool → forced `tool_choice` → 400 "Thinking mode does not support this
    *          tool_choice" (v4 always thinks; it cannot be turned off)
    *
-   * `pickObjectStrategy` already avoids the tool strategy for a thinking model,
-   * but the guard is scoped to `provider === 'anthropic'`, and even lifting that
-   * would land on the json strategy, which v4 also refuses.
+   * Since 2.3 the v4 rows state the second rejection (`forcedToolChoice: false`),
+   * so the SDK never sends the forced choice: `mode: 'tool'` runs the json
+   * strategy with a `clamped-setting` warning, and lands on the first rejection.
    *
    * Until a `json_object` strategy exists, the honest workaround is plain
    * `generateText` with the schema in the prompt — asserted below, so the docs'
    * recommendation is executable rather than aspirational.
    */
-  it('rejects generateObject on both strategies — the documented v4 gap', async () => {
+  it('rejects generateObject on both modes — the documented v4 gap', async () => {
     const schema = {
       type: 'object',
       properties: { capital: { type: 'string' } },
@@ -135,7 +135,7 @@ describe.skipIf(!apiKey)(`deepseek — live (${MODEL})`, () => {
 
     await expect(
       generateObject({ model, prompt: 'Return the capital of Turkey.', schema, mode: 'tool' }),
-    ).rejects.toThrow(/thinking mode does not support this tool_choice/i);
+    ).rejects.toThrow(/response_format type is unavailable/i);
 
     await expect(
       generateObject({ model, prompt: 'Return the capital of Turkey.', schema, mode: 'json' }),

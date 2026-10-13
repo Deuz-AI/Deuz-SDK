@@ -34,16 +34,17 @@ const WEATHER: JSONSchema = {
 describe.skipIf(!apiKey)(`google native — live (${MODEL})`, () => {
   const model = createGoogleNative({ apiKey })(MODEL);
 
-  it('round-trips text and counts thinking tokens separately from the answer', async () => {
+  it('round-trips text and counts thinking tokens inside the output', async () => {
     const result = await generateText({ model, prompt: 'Reply with one word: pong' });
 
     expect(result.text.toLowerCase()).toContain('pong');
     expect(result.usage.inputTokens).toBeGreaterThan(0);
-    // The assertion that matters: `thoughtsTokenCount` reached `reasoningTokens`,
-    // and `totalTokens` is the provider's own total rather than input+output —
-    // which for a thinking model is most of the bill.
+    // The assertion that matters: `thoughtsTokenCount` reached `reasoningTokens`
+    // and, under the 2.3 usage contract, sits inside `outputTokens` — which for
+    // a thinking model is most of the bill. The total still covers every bucket.
     expect(result.usage.reasoningTokens).toBeGreaterThan(0);
-    expect(result.usage.totalTokens).toBeGreaterThan(
+    expect(result.usage.outputTokens).toBeGreaterThan(result.usage.reasoningTokens);
+    expect(result.usage.totalTokens).toBeGreaterThanOrEqual(
       result.usage.inputTokens + result.usage.outputTokens,
     );
     // eslint-disable-next-line no-console

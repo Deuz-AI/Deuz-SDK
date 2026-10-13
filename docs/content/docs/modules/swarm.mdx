@@ -140,7 +140,7 @@ relies on the signal alone, because its native run saves its policy and a
 changed deadline would stop it from resuming.
 
 A dynamic run has version 2 and needs a store whose `capabilities` include
-`'spawn'`; the memory and SQLite stores do. A store without it is refused
+`'spawn'`; the memory, SQLite, Postgres and Redis stores do. A store without it is refused
 because it would drop spawned tasks from its commits. A run created without
 `dynamic` cannot spawn, and 2.1 cannot resume a version 2 run. The journal
 records a `task.spawned` event per child, with the parent ID in `detail`.
@@ -184,8 +184,8 @@ idempotent: a post is keyed by a hash of task, model step and tool call, so
 resuming an interrupted post never adds a second note. At the task
 level an interrupted agent task still follows the usual rule and waits in
 `needs_reconciliation` unless it is declared `replay: 'safe'` or retried. A
-blackboard binding needs a store with the `'channels'` capability; the memory
-and SQLite stores have it.
+blackboard binding needs a store with the `'channels'` capability; the memory,
+SQLite, Postgres and Redis stores have it.
 
 ## Soft dependencies
 
@@ -315,8 +315,65 @@ its last stored sequence.
 
 Between pages, an event reader checks whether the run is still running. A store
 can implement the optional `head(key)` (2.2) to return the run record alone; the
-memory and SQLite stores do. Without it the reader falls back to `load`, which
+memory, SQLite, Postgres and Redis stores do. Without it the reader falls back to `load`, which
 reads every task, so a custom store for large runs should provide `head`.
+
+A settled run stays in the store until you prune it (2.3).
+`store.prune({ before, scope?, limit? })` deletes up to `limit` (default 100)
+completed, partial or cancelled runs whose `updatedAt` is before `before`,
+oldest first, with their tasks, events and blackboard notes, and returns how
+many it deleted. Running and suspended runs stay. A pruned run can no longer be
+resumed, read or replayed. The memory, SQLite, Postgres and Redis stores have
+it; see [Retention](/docs/modules/operations#retention).
+
+## Redis persistence
+
+`@deuz-sdk/core/swarm/redis` (2.3), a Node-only entry, persists runs on Redis 7
+or later: `createRedisSwarmStore({ client | url, prefix? })` takes a client that
+runs Lua scripts, such as a connected node-redis client, or ioredis through
+`wrapIoredisClient`. It has every capability above (`'spawn'`, `'channels'`,
+`'list'`), `head` and `prune`. A commit is one script that writes only while the
+run is still at the revision its validation read, so a concurrent writer gets
+`SwarmConflictError` and nothing of its commit is written. Its keys share the
+hash tag `{<prefix>:swarm}`, so a Redis Cluster keeps the store in one slot.
+The server must keep them: an evicted key loses a run, or hides it from
+`listRuns` and `recover()`. Use `maxmemory-policy noeviction` or a `volatile-*`
+policy, and AOF; see [Redis](/docs/modules/operations#redis) in Operations.
+
+```ts
+import { createClient } from 'redis';
+import { createSwarm } from '@deuz-sdk/core/swarm';
+import { createRedisSwarmStore } from '@deuz-sdk/core/swarm/redis';
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+const swarm = createSwarm({
+  agents: {},
+  reducers: {
+    one: { execute: () => 1 },
+    sum: {
+      execute: (results) =>
+        Object.values(results).reduce((total, result) => total + Number(result.output), 0),
+    },
+  },
+  store: createRedisSwarmStore({ client: redis, prefix: 'jobs' }),
+});
+const handle = await swarm.run({
+  scope: 'tenant-a',
+  tasks: [
+    { id: 'a', reducer: 'one' },
+    { id: 'b', reducer: 'one' },
+    { id: 'total', reducer: 'sum', dependsOn: ['a', 'b'] },
+  ],
+});
+const outcome = await handle.result;
+console.log(outcome.run.status); // 'completed'
+console.log(outcome.tasks.find((task) => task.task.id === 'total')?.result?.output); // 2
+await redis.quit();
+```
+
+See [Operations](/docs/modules/operations#redis) for leases, budgets and
+retention on the same server.
 
 ## Suspension, reconciliation and cancellation
 
@@ -433,12 +490,13 @@ executor's `run` or `resume` fails with `SwarmLeaseError` code `'held'`, and an
 executor that loses its lease stops before its next write. `handle.drain()`,
 `swarm.recover()` and `swarm.requestCancel(key)` drain a run for a deploy, take
 over runs whose executor died, and cancel a run from any process. See
-[Operations](/docs/modules/operations) for leases, the SQLite and Postgres
-backends (`@deuz-sdk/core/ops/sqlite`, `@deuz-sdk/core/swarm/postgres`) and
-their clock requirements. Without a lease provider, do not drive one run from
-several processes.
+[Operations](/docs/modules/operations) for leases, the SQLite, Postgres and
+Redis backends (`@deuz-sdk/core/ops/sqlite`, `@deuz-sdk/core/swarm/postgres`,
+`@deuz-sdk/core/ops/redis`, `@deuz-sdk/core/swarm/redis`) and their clock
+requirements. Without a lease provider, do not drive one run from several
+processes.
 
-The in-memory store is volatile. SQLite and Postgres atomically commit task
+The in-memory store is volatile. SQLite, Postgres and Redis atomically commit task
 changes, run state and journal events, and fail closed on write errors or
 unsupported schema versions. These transactions do not include external APIs.
 Exactly-once external effects still require the service's idempotency mechanism

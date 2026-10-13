@@ -1,0 +1,16 @@
+{
+  "name": "@deuz-examples/16-goals-and-wakeups",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A goal that a schedule and a webhook wake: each wake claimed once in SQLite, with one leased native run that feeds the goal its evidence.",
+  "scripts": {
+    "dev": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "@deuz-sdk/core": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}

@@ -35,6 +35,7 @@ swarmStoreContracts('Postgres swarm store (PGlite)', () => freshStore(), {
   spawn: true,
   channels: true,
   list: true,
+  prune: true,
 });
 
 describe('Postgres swarm store', () => {
