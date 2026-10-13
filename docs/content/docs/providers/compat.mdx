@@ -72,7 +72,7 @@ result.warnings; // [{ type: 'unknown-model', message: "Unknown model 'some-new-
 
 | Field | Fallback value | What it costs you |
 | --- | --- | --- |
-| `maxOutput` | `4096` | **This is the one that matters.** It becomes the request's `max_tokens`, so a long answer is truncated. |
+| `maxOutput` | `4096` | A placeholder. Since 2.3 the Chat Completions wire leaves the cap off for it, so the host's own default applies; under an execution context's token or USD budget it is sent as the output cap, with a `clamped-setting` warning. Before 2.3 it became the request's `max_tokens`, so a long answer was truncated. |
 | `contextWindow` | `128_000` | Feeds compaction sizing — too small truncates history early, too large summarizes too late. |
 | `tools` | `false` | Reported only. No adapter reads it; tool calling works regardless. |
 | `reasoning` | `false` | `effort` is dropped rather than sent. A reasoning model behaves as its own default. |

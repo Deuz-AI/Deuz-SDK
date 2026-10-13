@@ -56,7 +56,7 @@ Adding `tools` is not enough to get a multi-step agent. The step budget defaults
 | `abortSignal` | `AbortSignal` | — | 1.9, **deprecated** alias for `signal` (migration ergonomics). `signal` wins if both are set. |
 | `maxRetries` | `number` | `2` | Flaky upstream. Pre-first-byte only. See [Retries](#retries). |
 | `timeout` | `number \| { ttftMs?, totalMs?, stepMs?, toolMs? }` | ttft 60s / total 300s | Your platform budget is tighter than the SDK defaults. A bare number is `{ totalMs }`; an explicit `0` disables a layer. See [Timeouts](/docs/core/prompts-and-timeouts#timeout). |
-| `capabilities` | `Partial<ModelCapabilities>` | — | 1.9. The registry does not know your slug yet and its conservative fallback (notably `maxOutput: 4096`) is truncating you. |
+| `capabilities` | `Partial<ModelCapabilities>` | — | 1.9. The registry does not know your slug yet and its conservative fallback is limiting you (`reasoning: false` drops `effort`; the `maxOutput: 4096` placeholder still truncates on the Anthropic wire). |
 | `headers` | `Record<string, string>` | — | A gateway needs a custom header. |
 | `deps` | `Dependencies` | in-memory defaults | Tests, custom `fetch`, tracing, pricing, a shared circuit breaker. See [Dependencies](/docs/core/dependencies). |
 | `onUsage` | `(usage: Usage, meta: UsageMeta) => void` | — | Per-model-call metering. `meta.reason` is `'finished'`, `'aborted'`, or `'error'`; `meta.ttftMs` is time-to-first-token. |

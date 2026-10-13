@@ -348,7 +348,7 @@ An `ADD` whose content hash is already spoken for is **dropped before it is writ
 
 A dropped `ADD` leaves **no trace**: emitting a `NOOP` would tell you a record was inspected when none was. `UPDATE` / `DELETE` / `NOOP` pass through untouched — an `UPDATE` is addressed by id, so its hash colliding is convergence, not duplication.
 
-Without `findByHash` the store-level check is skipped entirely rather than scanning every record of every scope on every turn, which would cost more than the duplicate row it saves. A backend that wants dedup implements the method; SQLite and Postgres do.
+Without `findByHash` the store-level check is skipped entirely rather than scanning every record of every scope on every turn, which would cost more than the duplicate row it saves. A backend that wants dedup implements the method; the in-memory store and the SQLite, Redis and Postgres packs do, the markdown vault does not.
 
 <Callout type="warn" title="Hash dedup is byte-exact, and that is all it is">
 `defaultHashFn` is SHA-256 over the fact string. "User lives in Berlin." and "User lives in Berlin" are two different hashes and two different records. Deduplicating *paraphrases* is the reconciliation pass's job — and it can only see the top-K records it retrieved, so a near-duplicate outside that window survives. If your store is filling with restatements, raise `RememberOptions.topK` before you blame the hash.

@@ -714,7 +714,7 @@ it back at the end. See [Memory](/docs/modules/native-agents#memory).
 `leases.signal(agentRunLeaseKey({ scope, runId }), 'cancel')` reaches the
 executor that holds the run and returns `true`. At its next renewal the
 executor aborts the run, which stops with reason `'cancelled'`. With a provider
-that has `ack`, as the memory, SQLite and Postgres providers do, the executor
+that has `ack`, as the memory, SQLite, Postgres and Redis providers do, the executor
 renews with acknowledged delivery: the cancel stays queued until the stopped run
 is saved, and only then is it acknowledged. An executor that dies in between, or
 cannot save the run, leaves the cancel for the next one. With a provider without

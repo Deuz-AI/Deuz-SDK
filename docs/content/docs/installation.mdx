@@ -57,7 +57,7 @@ The browser guarantee is checked, not asserted: a release-gate step (`tooling/ch
   build step.
 </Callout>
 
-Node-only capabilities (filesystem skill sources, document parsers, the markdown memory vault, MCP stdio transport, the stdio MCP server, file workspace, compute sandbox, Playwright browser, JSONL run store, database store packs, swarm SQLite and the headless preview) live behind dedicated subpaths and never leak `node:*` imports into the edge-safe core.
+Node-only capabilities (filesystem skill sources, document parsers, the markdown memory vault, MCP stdio transport, the stdio MCP server, file workspace, compute sandbox, Playwright browser, JSONL run store, database store packs, the swarm and ops stores on SQLite, Postgres and Redis, evolve's SQLite store and the headless preview) live behind dedicated subpaths and never leak `node:*` imports into the edge-safe core.
 
 ## Optional peer dependencies
 
