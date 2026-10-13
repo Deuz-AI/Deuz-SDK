@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:d0398bbef8c4
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.3.0 · api-contract sha256:d0398bbef8c4
      sources: packages/core/src/image.ts, packages/core/src/speech.ts, packages/core/src/transcription.ts,
      packages/core/src/video.ts, packages/core/src/midjourney.ts, packages/core/src/yunwu.ts,
      packages/core/src/adapters/transcription.ts, packages/core/src/client.ts,

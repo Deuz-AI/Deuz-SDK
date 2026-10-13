@@ -1,4 +1,4 @@
-<!-- verified: 2026-10-12 against @deuz-sdk/core@2.2.0 · api-contract sha256:d0398bbef8c4
+<!-- verified: 2026-10-12 against @deuz-sdk/core@2.3.0 · api-contract sha256:d0398bbef8c4
      sources: packages/core/src/ui.ts, packages/core/src/chat.ts, packages/core/src/chat-request.ts,
      packages/core/src/types/methods.ts, packages/core/src/types/tool.ts, packages/core/src/types/stream.ts,
      packages/react/src/index.ts, packages/react/src/use-chat.ts, packages/react/src/use-object.ts,
