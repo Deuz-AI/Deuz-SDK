@@ -129,6 +129,28 @@ sampling requests. See
   named in a `warning` part. Before 2.3 a call that had waited for an approval
   was answered as denied unless the resume passed its verdict again. See
   [Strict checkpoints and approval resume](/docs/modules/native-agents#strict-checkpoints-and-approval-resume).
+- **A resume saves its answers before its first model call.** What a native
+  resume's settle answered (each call's result or error, a denial, a client
+  result) is saved as the run's checkpoint before the resume calls the model.
+  Before, nothing recorded it until the step after that call was saved, so a
+  process that died during the call left the calls unanswered: the next resume
+  denied an approved call that had run, or ran it again when its verdict was
+  passed again, and ran a call that needs no approval again. The next resume, a
+  `retryFailed` one included, now goes on from the saved answers and needs no
+  verdict or client result again.
+- **Client results survive an interrupted resume.** A resume used to clear the
+  run's pending client calls as it took the run up, so a resume that died
+  before the step that answers them was saved lost their results: the next
+  resume answered each call `Tool call denied. Reason: No result provided for
+  this client tool.`, and a result passed again failed that resume with
+  `Client tool results must match unique pending call IDs on resume.` The same
+  denial followed, without a crash, when a sub-agent called in the same step
+  suspended on its own approval. The calls now stay pending until the resume
+  has saved its answers: a resume that died before it recorded a result
+  accepts that result again, and a resume without it stays suspended on the
+  call. A result the resume recorded in the call's receipt answers the call on
+  the next resume; one passed for it anyway is ignored with a `warning` part
+  (`setting: 'clientToolResults'`) that names the call.
 
 ## Memory, chat and model fail-over in native runs
 
@@ -185,7 +207,9 @@ console.log((await chats.loadChat('chat-1'))?.messageIds); // ['hello-1:0', 'hel
 ```
 
 An envelope that records memory, a transcript, a chat projection or fail-over
-state is written as version 2, which 2.2 refuses to resume.
+state is written as version 2, which 2.2 refuses to resume; so is a run that
+waits on an approval, or whose stored turn has an open call a 2.2 resume would
+answer wrongly (see [Data that 2.2 cannot read](#data-that-22-cannot-read)).
 `reconcileAgentRun` settles what a run that ended or is suspended left behind:
 a chat projection that is behind, and an extraction that is pending or failed.
 See
@@ -407,15 +431,33 @@ apart per tenant and per caller. See [A2A](/docs/modules/a2a).
 run as the handler's executor. Each task is one run: the task id is the run id,
 and the task's tenant and owner name the run's scope. A new message starts the
 run. A suspended run is an `INPUT_REQUIRED` task whose status message lists the
-pending approvals and client-tool calls; the client answers them in its next
-message, and the answers are checked against the run before anything is
-written. The run's validated output becomes the task's artifact, and
-`CancelTask` aborts the run, on another instance too when the executor claims
-runs through a `lease`. You pass the engine in
-(`agent: { streamAgent, resumeStreamAgent }`), so the entry stays edge-safe for
-an app that only calls agents. An executor of your own can stream a preview of
-an artifact with `ctx.draft`, which is never stored. See
-[Serving a native agent](/docs/modules/a2a#serving-a-native-agent).
+pending approvals and client-tool calls. The client answers all of them in its
+next message, and the answers are checked against the run before anything is
+written: an approval of a signed action must echo the action's `token`. A
+message without answers gets the actions listed again when the task's status
+does not list them, for example after a person resumed the run outside A2A.
+The run's validated output becomes the task's artifact, and `CancelTask` aborts
+the run, on another instance too when the executor claims runs through a
+`lease`.
+
+- **Stops.** A run a lease drain stopped (`'drained'`) has not ended, and the
+  client's next message resumes it; when the drain stopped a resume before it
+  took the answers up, the task lists the pending actions again. After
+  `tool-reconciliation-required` the run goes on once a person settled its
+  unknown effects; at any other stop a person must look at the run.
+- **Failures.** A failed run fails the task with a text that names the error's
+  code or name (`The agent run failed (rate_limit).`). By default the client
+  never reads the error's message, which can name a provider account or a
+  host; `failureMessage` words the text from the whole error.
+- **Drafts.** The text of a string output streams as unstored drafts of the
+  artifact. A draft is the model's text before `guardrails.onOutput` judges it,
+  so a run with output guardrails sends none, unless the `drafts` option says
+  `true`; `false` sends none for any run.
+
+You pass the engine in (`agent: { streamAgent, resumeStreamAgent }`), so the
+entry stays edge-safe for an app that only calls agents. An executor of your
+own can stream a preview of an artifact with `ctx.draft`, which is never
+stored. See [Serving a native agent](/docs/modules/a2a#serving-a-native-agent).
 
 ## Realtime voice
 
@@ -547,11 +589,15 @@ cost and tokens across every leg, duration, human rescues, repeated effects and
 how it recovered from an interruption. Offline and real-model tasks are never
 aggregated together, and the JSON report is written only on request.
 
-The repository's baseline runs 22 offline tasks and 32 fault-injection
-scenarios (21 recovered, 11 contained) on every `npm test`, with no false
+The repository's baseline runs 22 offline tasks and 33 fault-injection
+scenarios (22 recovered, 11 contained) on every `npm test`, with no false
 completion and no repeated effect. Six of the tasks and nine of the scenarios
 exercise what 2.3 added: native memory, chat and fail-over, the UI bridge,
-goals, batches and the MCP server. Eleven real-model tasks are defined but were
+goals, batches and the MCP server. One more scenario,
+`fault/after-receipt-approved`, covers a native resume's settle: the process
+dies during the model call after the settle ran an approved charge, and the
+next resume, given no verdict, goes on from the saved answers, so the charge
+runs once and nothing is denied. Eleven real-model tasks are defined but were
 not run, so there are no real-model results.
 
 It is a baseline, not a ranking. See [Evals](/docs/modules/evals).
@@ -574,7 +620,9 @@ The pending action for a call whose effect is unknown names both answers,
 or record the result that landed. The report of a run that failed in transit
 carries `retry` (`HeadlessRetry`), also in `inspectRun`: resume it with
 `retryFailed: true` to go on from its last checkpoint. Its outcome stays
-`failed` (exit 1), or `limit` (exit 6) for a transport timeout.
+`failed` (exit 1), or `limit` (exit 6) for a transport timeout. A run that a
+lease drain stopped (reason `'drained'`) has not ended: its report is `pending`
+(exit 3) with a pending `resume`, as `inspectRun` reports the stored run.
 
 The module is Node-only and a preview: report fields, finding codes and exit
 codes can still change in a 2.x minor, and there is no binary.
@@ -729,6 +777,10 @@ that 2.3 saved with the features above, or one that waits on an approval.
   fires too.
 - **Unpriced entries.** A 2.2 process that restores a ledger snapshot holding
   unpriced entries keeps failing a USD bound closed on them.
+- **Approval answers.** Send them to 2.3 processes only. A 2.2 process refuses
+  a native run that waits on an approval (its envelope is version 2), and on a
+  legacy checkpoint it answers a call approved under its 2.3 `approvalId` as
+  denied (see [Data that 2.2 cannot read](#data-that-22-cannot-read)).
 - **Checkpoint versions.** `deserializeCheckpoint`, `resumeFromCheckpoint` and
   `resumeStreamFromCheckpoint` refuse a checkpoint whose `version` is not 1 with
   `CheckpointVersionError`, and `resumeAgent` refuses an envelope holding such a
@@ -784,12 +836,15 @@ do.
 - **Every Gemini finish reason is mapped on purpose**, on the native wire and
   in batch results. `SPII`, `IMAGE_PROHIBITED_CONTENT` and `IMAGE_RECITATION`
   end a turn with `content_filter` instead of `stop`, and `CONTINUATION` with
-  `length`. The stops that leave no usable answer (`LANGUAGE`, `OTHER`,
+  `length`. A turn that streamed a call and was then filtered or cut off ends
+  with `content_filter` or `length` instead of `tool_calls`, and its call no
+  longer runs. The stops that leave no usable answer (`LANGUAGE`, `OTHER`,
   `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`,
-  `NO_IMAGE`, `IMAGE_OTHER`) end it with `error`, so a native run stops with
-  reason `'error'` instead of completing with an empty answer. A turn that
-  streamed a call and was then filtered or cut off ends with `content_filter`
-  or `length` instead of `tool_calls`, and its call no longer runs.
+  `NO_IMAGE`, `IMAGE_OTHER`) still end it with `stop`, or `tool_calls` when it
+  carried a call, as in 2.2. New and additive: the `finish` part (and so the
+  streaming loop's `step-finish` part) and a batch result keep Gemini's own
+  value as `providerMetadata.google.finishReason`, which tells those stops from
+  `STOP`.
 - **An OpenAI Responses turn that its content filter cut off**
   (`incomplete_details.reason: 'content_filter'`) ends with `content_filter`
   instead of `stop`, or `tool_calls` when it streamed a call, which no longer
@@ -1080,8 +1135,9 @@ reference, and the error classes 2.3 adds, with their codes, in
   not trust.
 - **Budgets.** Admission is an estimate against holds, not a cap the provider
   enforces. The hold of a model call that failed over stays counted against the
-  shared execution, and with persistent admission it stays an open hold until
-  a [sweep](/docs/modules/budgets#open-holds) closes it.
+  shared execution, unless the provider answered with a status it does not
+  bill (such as a 429), and with persistent admission it stays an open hold
+  until a [sweep](/docs/modules/budgets#open-holds) closes it.
 - **Sandbox.** After a timeout, a program the shell started that still holds
   the output pipes is not killed.
 

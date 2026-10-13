@@ -409,6 +409,8 @@ console.log(done.status.state); // 'TASK_STATE_COMPLETED'
 console.log(done.artifacts?.[0]?.parts); // [{ data: { booking: 'B-42' }, mediaType: 'application/json' }]
 ```
 
+[`examples/20-a2a-agent`](https://github.com/Deuz-AI/Deuz-SDK/tree/main/examples/20-a2a-agent) goes further, still in process and without a key: a native run served over A2A with `createA2AHandler` and `createA2AAgentExecutor`, whose client streams the request, has an answer that does not fit refused, answers the approval in a data part, and gets the typed result as an artifact.
+
 How a run maps onto its task:
 
 | The run | The task |

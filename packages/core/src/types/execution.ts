@@ -6,8 +6,9 @@ import type { Usage } from './usage';
  * How a USD budget treats a call whose model has no price (2.3): no
  * `deps.priceProvider`, or one that returns `undefined` for the model.
  * - `'warn'` (default): the call runs. Its tokens are still reserved, settled
- *   and bounded; its unknown cost is left out of every USD total, and the run
- *   reports one `unpriced-model` warning per model.
+ *   and bounded; its unknown cost is left out of every USD total, and each leg
+ *   of a run reports one `unpriced-model` warning per model (a resumed leg
+ *   reports it again).
  * - `'reject'`: the call is refused before it is sent (code `unpriced_model`).
  *
  * A price lookup that throws is an outage, not a missing price: a USD bound

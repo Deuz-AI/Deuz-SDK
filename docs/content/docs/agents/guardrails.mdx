@@ -217,7 +217,7 @@ interface ToolResultGuardrailContext extends GuardrailBaseContext {
 
 ### `runtimeContext`
 
-`runtimeContext` (2.0) is an opaque per-call value threaded, untouched, into every hook that can act on it: `ToolExecuteContext.runtimeContext`, `prepareStep`, `verifyStep`, `doneWhen`, and all three guardrail hooks. Sub-agents inherit it.
+`runtimeContext` (2.0) is an opaque per-call value threaded, untouched, into every hook that can act on it: `ToolExecuteContext.runtimeContext`, `prepareStep`, `verifyStep`, `doneWhen`, and the four guardrail hooks (`onInput`, `onToolCall`, `onToolResult`, `onOutput`). Sub-agents inherit it.
 
 It exists so the request-scoped facts a guardrail needs — the tenant, the signed-in user, a DB handle, a feature flag — travel with the **call** instead of being captured in a closure, which is what otherwise forces you to rebuild the whole `ToolSet` (and every guardrail) per request.
 

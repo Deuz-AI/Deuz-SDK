@@ -66,7 +66,11 @@ export interface FinishStreamPart {
   type: 'finish';
   usage: Usage;
   finishReason: FinishReason;
-  /** Provider-specific finish detail (e.g. `{ anthropic: { stop_details } }`). Additive, optional. */
+  /**
+   * Provider-specific finish detail, e.g. `{ anthropic: { stop_details } }`, an
+   * OpenAI refusal `{ openai: { refusal } }`, or Gemini's own finish reason
+   * `{ google: { finishReason } }` (2.3). Additive, optional.
+   */
   providerMetadata?: Record<string, unknown>;
 }
 

@@ -170,7 +170,10 @@ A browser cannot set WebSocket handshake headers, so it cannot authenticate with
 ```ts title="app/api/voice-token/route.ts (server)"
 import { createOpenAIClientSecret, createOpenAIRealtime } from '@deuz-sdk/core/realtime';
 
-export async function POST() {
+declare function requireUser(req: Request): Promise<{ id: string }>; // your auth: rejects anonymous callers
+
+export async function POST(req: Request) {
+  await requireUser(req); // before minting: each token is a credential on your account
   const { token, expiresAt } = await createOpenAIClientSecret({
     model: createOpenAIRealtime({ apiKey: process.env.OPENAI_API_KEY })('gpt-realtime'),
     instructions: 'You are a friendly receptionist.',
@@ -192,6 +195,8 @@ const session = createRealtimeSession({
 });
 await session.connect();
 ```
+
+**The token route spends your key.** Authenticate the caller before minting, and rate-limit the route per user: each token opens sessions billed to your account (on OpenAI its configuration is only a default the browser can change), and no budget applies inside a session.
 
 `ephemeralToken` takes a string or a function; the function runs inside `connect()`, and the [connect timeout](#session-options) covers it. On OpenAI the secret rides in the subprotocol list (`['realtime', 'openai-insecure-api-key.ek_…']`, what the official SDK sends); on Gemini it goes in `?access_token=` on the `v1alpha` `BidiGenerateContentConstrained` endpoint.
 
