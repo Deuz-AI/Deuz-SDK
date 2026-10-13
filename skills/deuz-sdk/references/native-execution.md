@@ -306,7 +306,7 @@ const model = createMockModel({ responses: [{ text: 'done' }] });
 
 const swarm = createSwarm({
   agents: { worker: createAgent({ model }) },
-  store: createInMemorySwarmStore(), // the SQLite or Postgres store when processes share runs
+  store: createInMemorySwarmStore(), // the SQLite, Postgres or Redis store when processes share runs
   lease: { provider: createInMemoryLeaseProvider(), owner: 'worker-1', ttlMs: 30_000 },
 });
 
