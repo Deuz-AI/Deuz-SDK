@@ -212,6 +212,8 @@ describe.skipIf(!liveRedisUrl)('Redis budget store on a live server', () => {
     store: createRedisBudgetStore({ client: server.client, prefix: server.prefix() }),
     advance: wait,
     now: () => Date.now() + server.skew,
+    // `now` estimates the Redis TIME clock across a network round trip.
+    slack: 25,
   }));
 
   it('never overspends with reservations racing on two connections', async () => {

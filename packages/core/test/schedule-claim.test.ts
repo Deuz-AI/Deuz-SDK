@@ -122,7 +122,7 @@ describe.skipIf(!DatabaseSync)('SQLite ops store claims', () => {
     const reopened = sqliteOps(path);
     expect(await reopened.claims('digest@1')).toBe(false);
     expect(await reopened.claims('race')).toBe(false);
-  });
+  }, 30_000); // two connections and a reopen on one file: slow on a hosted Windows runner
 
   it('stores a key over 512 characters or holding a NUL as its SHA-256', async () => {
     const db = new DatabaseSync!(':memory:');

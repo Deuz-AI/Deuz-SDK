@@ -160,6 +160,8 @@ describe.skipIf(!url)('Postgres stores on a live server (REPEATABLE READ, pooled
     store: createPostgresBudgetStore({ client, schema: await freshSchema() }),
     advance: wait,
     now,
+    // `now` estimates the database clock across a network round trip.
+    slack: 25,
   }));
   swarmStoreContracts('swarm store', () => freshSwarmStore(), {
     spawn: true,

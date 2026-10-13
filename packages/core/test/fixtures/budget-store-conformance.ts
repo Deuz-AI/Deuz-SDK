@@ -7,6 +7,12 @@ export interface BudgetStoreHarness {
   advance(ms: number): Promise<void>;
   /** The store's current time in epoch milliseconds. */
   now(): number;
+  /**
+   * How far `now()` may be off the store's own clock, in ms: a live database's clock is
+   * estimated across a round trip. The time-cut contracts leave this much room on each
+   * side of a cut. Defaults to 0 (a manual clock).
+   */
+  slack?: number;
 }
 
 export interface BudgetStoreContractOptions {
@@ -407,7 +413,7 @@ export function budgetStoreContracts(
     );
 
     it('lists the holds still open before a time, oldest first, a page at a time (2.3)', async () => {
-      const { store, advance, now } = await make();
+      const { store, advance, now, slack = 0 } = await make();
       const scope = user(1_000, { key: 'user:h' });
       const org = { key: 'org:h', limits: { tokens: 10_000 } };
       await store.reserve({
@@ -424,8 +430,9 @@ export function budgetStoreContracts(
       expect(
         await store.reserve({ requestId: 'denied', modelId: 'm', tokens: 5_000, scopes: [scope] }),
       ).toMatchObject({ admitted: false });
-      await advance(10);
+      await advance(10 + slack);
       const cut = now();
+      await advance(slack);
       await store.reserve({ requestId: 'late', modelId: 'm', tokens: 1, scopes: [scope] });
 
       const holds = await store.holds!({ before: cut });
@@ -455,23 +462,23 @@ export function budgetStoreContracts(
         (await store.holds!({ before: cut, limit: 1, after: first })).map((hold) => hold.requestId),
       ).toEqual(['a']);
       expect(await store.holds!({ before: cut, after: holds[1] })).toEqual([]);
-      expect((await store.holds!({ before: now() + 1 })).map((hold) => hold.requestId)).toEqual([
-        'b',
-        'a',
-        'late',
-      ]);
+      expect(
+        (await store.holds!({ before: now() + slack + 1 })).map((hold) => hold.requestId),
+      ).toEqual(['b', 'a', 'late']);
       await expect(store.holds!({ before: Number.NaN })).rejects.toThrow(/before/);
       await expect(store.holds!({ before: cut, limit: 0 })).rejects.toThrow(/limit/);
     });
 
     it('sweeps stale holds: settles their estimate by default, or as a resolver says (2.3)', async () => {
-      const { store, advance, now } = await make();
+      const { store, advance, now, slack = 0 } = await make();
       const scope = user(1_000, { key: 'user:s' });
       for (const requestId of ['crashed', 'unsent', 'known']) {
         await store.reserve({ requestId, modelId: 'm', tokens: 30, scopes: [scope] });
         await advance(10);
       }
+      await advance(slack);
       const cut = now();
+      await advance(slack);
       await store.reserve({ requestId: 'fresh', modelId: 'm', tokens: 10, scopes: [scope] });
       const seen: string[] = [];
       expect(
@@ -486,17 +493,17 @@ export function budgetStoreContracts(
       ).toEqual({ settled: 2, released: 1, skipped: 0 });
       expect(seen).toEqual(['crashed', 'unsent', 'known']);
       expect(await store.usage('user:s')).toEqual({ tokens: 30 + 12 + 10, usd: 0 });
-      expect((await store.holds!({ before: now() + 1 })).map((hold) => hold.requestId)).toEqual([
-        'fresh',
-      ]);
+      expect(
+        (await store.holds!({ before: now() + slack + 1 })).map((hold) => hold.requestId),
+      ).toEqual(['fresh']);
       expect(await store.sweep!({ before: cut })).toEqual({ settled: 0, released: 0, skipped: 0 });
-      expect(await store.sweep!({ before: now() + 1 })).toEqual({
+      expect(await store.sweep!({ before: now() + slack + 1 })).toEqual({
         settled: 1,
         released: 0,
         skipped: 0,
       });
       expect(await store.usage('user:s')).toEqual({ tokens: 52, usd: 0 });
-      expect(await store.holds!({ before: now() + 1 })).toEqual([]);
+      expect(await store.holds!({ before: now() + slack + 1 })).toEqual([]);
     });
 
     it('recovers a lifetime budget from a hold leaked by a crash (2.3)', async () => {

@@ -176,7 +176,7 @@ describe('SQLite budget store', () => {
     } finally {
       after.close();
     }
-  });
+  }, 30_000); // a SQLite file opened, migrated and reopened: slow on a hosted Windows runner
 
   it('agrees with the memory store, and keeps its running totals, through any sequence', async () => {
     const { clock, advance, now } = manualClock();
