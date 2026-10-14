@@ -56,6 +56,18 @@ interface ChildProcessModule {
 interface NodeProcess {
   env: Record<string, string | undefined>;
   platform: string;
+  cwd(): string;
+}
+
+/** Minimal `node:path` / `node:fs/promises` shapes for the cwd check (H3). */
+interface NodePath {
+  resolve(...segments: string[]): string;
+  relative(from: string, to: string): string;
+  isAbsolute(path: string): boolean;
+  sep: string;
+}
+interface NodeFs {
+  realpath(path: string): Promise<string>;
 }
 
 async function loadSpawn(): Promise<ChildProcessModule['spawn']> {
@@ -73,8 +85,57 @@ async function loadSpawn(): Promise<ChildProcessModule['spawn']> {
 let cachedProcess: NodeProcess | undefined;
 async function loadProcess(): Promise<NodeProcess> {
   if (cachedProcess) return cachedProcess;
-  cachedProcess = (await import('node:process' as string)) as unknown as NodeProcess;
+  const mod = (await import('node:process' as string)) as unknown as {
+    default?: NodeProcess;
+  } & NodeProcess;
+  // The default export is `process` itself, so its methods keep their receiver.
+  cachedProcess = mod.default ?? mod;
   return cachedProcess;
+}
+
+async function loadPathAndFs(): Promise<{ path: NodePath; fs: NodeFs }> {
+  const [path, fs] = await Promise.all([
+    import('node:path' as string) as Promise<NodePath>,
+    import('node:fs/promises' as string) as Promise<NodeFs>,
+  ]);
+  return { path, fs };
+}
+
+/** Whether `target` is `root` or below it (both absolute, same flavour). */
+function isWithin(path: NodePath, root: string, target: string): boolean {
+  const rel = path.relative(root, target);
+  return !(rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel));
+}
+
+/**
+ * Resolves a `runShell` cwd against the sandbox root (H3, 2.4): a relative
+ * path is taken from the root, an absolute one must lie inside it, and the
+ * real path (symlinks and junctions followed) must stay inside the real root.
+ * Returns the directory to spawn in, or the refusal to report.
+ */
+async function resolveShellCwd(
+  root: string,
+  requested: string,
+): Promise<{ cwd: string } | { refusal: string }> {
+  const { path, fs } = await loadPathAndFs();
+  const base = path.resolve(root);
+  const target = path.resolve(base, requested);
+  const outside = `Working directory '${requested}' is outside the sandbox root (${base}).`;
+  if (!isWithin(path, base, target)) return { refusal: outside };
+  let realBase: string;
+  let realTarget: string;
+  try {
+    realBase = await fs.realpath(base);
+  } catch {
+    return { refusal: `The sandbox root (${base}) does not exist.` };
+  }
+  try {
+    realTarget = await fs.realpath(target);
+  } catch {
+    return { refusal: `Working directory '${requested}' does not exist in the sandbox root.` };
+  }
+  if (!isWithin(path, realBase, realTarget)) return { refusal: outside };
+  return { cwd: realTarget };
 }
 
 /** language id → how to invoke an interpreter with an inline program. */
@@ -327,6 +388,11 @@ async function execProcess(
  * kills the spawned process and settles within a short grace period even when a
  * program it started still holds the output pipes; that program is NOT killed
  * (one more reason this is not an isolation boundary).
+ *
+ * `runShell`'s `cwd` is confined to the sandbox root, `options.cwd` or else the
+ * host's working directory (H3, 2.4): relative paths resolve against it, and a
+ * path that leaves it (`..`, an absolute path elsewhere, a symlink or junction
+ * pointing out) is refused without running the command (`exitCode: null`).
  */
 export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSandbox {
   const interpreters = { ...DEFAULT_INTERPRETERS, ...options.interpreters };
@@ -379,7 +445,14 @@ export function createNodeSandbox(options: NodeSandboxOptions = {}): ComputeSand
       const isWindows = proc.platform === 'win32';
       const shellCommand = isWindows ? 'cmd.exe' : 'bash';
       const shellArgs = isWindows ? ['/c', request.command] : ['-c', request.command];
-      const cwd = request.cwd ?? options.cwd;
+      let cwd = options.cwd;
+      if (request.cwd !== undefined) {
+        // H3 (2.4): the cwd is confined to the sandbox root, as the shell tool
+        // promises the model; before 2.4 any path was handed to spawn as given.
+        const resolved = await resolveShellCwd(options.cwd ?? proc.cwd(), request.cwd);
+        if ('refusal' in resolved) return { stdout: '', stderr: resolved.refusal, exitCode: null };
+        cwd = resolved.cwd;
+      }
       return execProcess(spawn, {
         command: shellCommand,
         args: shellArgs,

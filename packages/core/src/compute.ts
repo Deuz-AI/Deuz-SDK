@@ -132,7 +132,11 @@ export function shellTool(sandbox: ComputeSandbox, options: ShellToolOptions = {
     type: 'object',
     properties: {
       command: { type: 'string', description: 'Shell command line to run.' },
-      cwd: { type: 'string', description: 'Working directory (relative to the sandbox root).' },
+      cwd: {
+        type: 'string',
+        description:
+          'Working directory relative to the sandbox root; paths outside it are refused.',
+      },
     },
     required: ['command'],
     additionalProperties: false,

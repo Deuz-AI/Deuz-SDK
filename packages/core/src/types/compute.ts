@@ -69,7 +69,12 @@ export interface CodeExecutionResult {
 export interface ShellExecutionRequest {
   /** The command line to run (interpreted by the backend's shell). */
   command: string;
-  /** Working directory, relative to the sandbox root. */
+  /**
+   * Working directory, relative to the sandbox root. A path that leaves the
+   * root (`..`, an absolute path elsewhere, a symlink pointing out) is refused
+   * by the 2.4 Node and Docker sandboxes; before 2.4 the Node sandbox ran the
+   * command wherever the path pointed.
+   */
   cwd?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
