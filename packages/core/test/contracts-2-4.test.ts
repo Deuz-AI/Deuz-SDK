@@ -214,9 +214,6 @@ describe('2.4 Node stores on their entries', () => {
     expectStub('createSqliteConditionalChatStore', () =>
       storesSqlite.createSqliteConditionalChatStore(any),
     );
-    expectStub('createSqliteDurableStreamStateStore', () =>
-      storesSqlite.createSqliteDurableStreamStateStore(any),
-    );
     expectStub('createPostgresConditionalChatStore', () =>
       storesPostgres.createPostgresConditionalChatStore(any),
     );
@@ -231,6 +228,12 @@ describe('2.4 Node stores on their entries', () => {
       opsPostgres.createPostgresAgentRunStoreV3(any),
     );
     expectStub('createInMemoryAgentRunStoreV3', () => createInMemoryAgentRunStoreV3());
+  });
+
+  it('reach the durable stream state stores (implemented by L7b) through the /stores entries', async () => {
+    const sqlite = storesSqlite.createSqliteDurableStreamStateStore({ path: ':memory:' });
+    expect(sqlite.durable).toBe(true);
+    await sqlite.close();
   });
 
   it('keep the existing entry factories exported as before', () => {
