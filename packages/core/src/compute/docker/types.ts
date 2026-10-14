@@ -41,7 +41,16 @@ export interface DockerSandboxOptions {
   image: string;
   /** The Docker CLI, run with `shell: false`. Default `'docker'`. */
   dockerPath?: string;
-  /** `uid:gid`. Default `'10001:10001'`. */
+  /**
+   * Global CLI arguments placed before every subcommand, e.g.
+   * `['--context', 'build-box']` or `['--host', 'ssh://runner']` (2.4).
+   * Default none: the CLI's environment and config decide.
+   */
+  dockerArgs?: readonly string[];
+  /**
+   * `uid:gid` (or `uid`), numeric: staged files are owned by it. Default
+   * `'10001:10001'`.
+   */
   user?: string;
   limits?: DockerLimits;
   /** The container network. Default `'none'`. */
@@ -59,7 +68,11 @@ export interface DockerSandboxOptions {
   maxArtifactBytes?: number;
   /** The output tail kept per stream. Default 1 MiB; beyond it `truncated` is set. */
   maxOutputBytes?: number;
-  /** The workspace path inside the container. Default `'/workspace'`. */
+  /**
+   * The workspace path inside the container, absolute. Default
+   * `'/workspace'`. Its parent must exist in the image (`docker create`
+   * makes the workspace itself).
+   */
   workdir?: string;
   /** Files copied into the container workspace through a controlled staging archive. */
   workspace?: Workspace;
@@ -222,7 +235,11 @@ export interface ProcessOperationStore {
     record: Omit<ProcessOperationRecord, 'revision' | 'createdAt' | 'updatedAt'>,
   ): Promise<{ status: 'created' | 'existing'; record: ProcessOperationRecord }>;
   get(scope: string, operationId: string): Promise<ProcessOperationRecord | undefined>;
-  /** Applies `changes` only at `expectedRevision`. */
+  /**
+   * Applies `changes` only at `expectedRevision`. A key set to `undefined`
+   * removes that field; `createdAt` never changes and `updatedAt` is the
+   * store's clock.
+   */
   update(
     scope: string,
     operationId: string,

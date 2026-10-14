@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -138,6 +138,42 @@ describe('createNodeSandbox (reference; spawns real node)', () => {
   });
 });
 
+describe('createNodeSandbox — output cut at maxOutputBytes says so (H4)', () => {
+  // Before 2.4 the bytes past maxOutputBytes were dropped silently: a caller
+  // could not tell a 10-byte program from a 10 MB one.
+  it('flags the stream that was cut and keeps the head of it', async () => {
+    const res = await createNodeSandbox({ maxOutputBytes: 10 }).runCode({
+      language: 'node',
+      code: "process.stdout.write('x'.repeat(50)); process.stderr.write('short')",
+      timeoutMs: 5_000,
+    });
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe('x'.repeat(10));
+    expect(res.stderr).toBe('short');
+    expect(res.truncated).toEqual({ stdout: true, stderr: false });
+  });
+
+  it('flags stderr alone when only stderr overflows', async () => {
+    const res = await createNodeSandbox({ maxOutputBytes: 4 }).runCode({
+      language: 'node',
+      code: "process.stdout.write('ok'); process.stderr.write('e'.repeat(9))",
+      timeoutMs: 5_000,
+    });
+    expect(res.stderr).toBe('eeee');
+    expect(res.truncated).toEqual({ stdout: false, stderr: true });
+  });
+
+  it('leaves the field off when nothing was cut, as in 2.3', async () => {
+    const res = await createNodeSandbox({ maxOutputBytes: 10 }).runCode({
+      language: 'node',
+      code: "process.stdout.write('x'.repeat(10))",
+      timeoutMs: 5_000,
+    });
+    expect(res.stdout).toBe('x'.repeat(10));
+    expect(res).not.toHaveProperty('truncated');
+  });
+});
+
 /** Reads stdin to EOF, then prints `eof <byteCount>`. */
 const WAIT_FOR_EOF =
   "let n=0;process.stdin.on('data',d=>n+=d.length);process.stdin.on('end',()=>process.stdout.write('eof '+n))";
@@ -203,14 +239,15 @@ describe('createNodeSandbox — stdin when none (or an empty one) is given (F10)
       stdin: 'b\na\nçğ 😀\n',
       timeoutMs: 3_000,
     };
-    const res = await createNodeSandbox().runShell!(request);
+    // H3 (2.4): an absolute cwd must lie inside the sandbox root.
+    const res = await createNodeSandbox({ cwd: scripts }).runShell!(request);
     expect(res.timedOut).not.toBe(true);
     expect(res.exitCode).toBe(0);
     expect(res.stdout).toBe('b\na\nçğ 😀\n');
   });
 
   it('runShell without stdin: a command that reads to EOF finishes', async () => {
-    const res = await createNodeSandbox().runShell!({
+    const res = await createNodeSandbox({ cwd: scripts }).runShell!({
       command: 'node wait-eof.cjs',
       cwd: scripts,
       timeoutMs: 3_000,
@@ -231,7 +268,11 @@ describe('createNodeSandbox — timeout and abort stay bounded when a grandchild
 
   it('a timeout settles promptly instead of waiting for the grandchild', async () => {
     const t0 = Date.now();
-    const res = await createNodeSandbox().runShell!({ command, cwd: scripts, timeoutMs: 1_000 });
+    const res = await createNodeSandbox({ cwd: scripts }).runShell!({
+      command,
+      cwd: scripts,
+      timeoutMs: 1_000,
+    });
     expect(res.timedOut).toBe(true);
     expect(res.exitCode).toBeNull();
     expect(Date.now() - t0).toBeLessThan(5_000);
@@ -241,7 +282,7 @@ describe('createNodeSandbox — timeout and abort stay bounded when a grandchild
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 1_000);
     const t0 = Date.now();
-    const res = await createNodeSandbox().runShell!({
+    const res = await createNodeSandbox({ cwd: scripts }).runShell!({
       command,
       cwd: scripts,
       timeoutMs: 20_000,
@@ -251,6 +292,133 @@ describe('createNodeSandbox — timeout and abort stay bounded when a grandchild
     expect(res.exitCode).toBeNull();
     expect(Date.now() - t0).toBeLessThan(5_000);
   }, 15_000);
+});
+
+describe('createNodeSandbox — a timeout or abort kills the whole process tree (2.4)', () => {
+  // Before 2.4 only the direct child got SIGKILL: a program the shell (or the
+  // code) had started lived on and kept doing things after the run "ended".
+  // Now POSIX kills the child's process group and Windows runs taskkill /T /F.
+  let dir: string;
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'deuz-tree-'));
+    // Writes `marker` after 1.5 s unless it is killed first.
+    await writeFile(
+      join(dir, 'late.cjs'),
+      "setTimeout(()=>require('fs').writeFileSync(require('path').join(__dirname,'marker'),'x'),1500)",
+    );
+  });
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
+  });
+  beforeEach(async () => {
+    await rm(join(dir, 'marker'), { force: true });
+  });
+
+  const markerWritten = async (): Promise<boolean> => {
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    return stat(join(dir, 'marker')).then(
+      () => true,
+      () => false,
+    );
+  };
+
+  it('runShell: the program the shell started dies with it', async () => {
+    const res = await createNodeSandbox({ cwd: dir }).runShell!({
+      command: 'node late.cjs && echo done',
+      timeoutMs: 500,
+    });
+    expect(res.timedOut).toBe(true);
+    expect(await markerWritten()).toBe(false);
+  }, 15_000);
+
+  // On Windows libuv already ends a node child's own children with it (a
+  // kill-on-close job object), so this one discriminates on POSIX; the runShell
+  // case above, where cmd.exe starts the program, discriminates on both.
+  it('runCode: a child the code spawned dies with it on abort', async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 500);
+    const res = await createNodeSandbox({ cwd: dir }).runCode({
+      language: 'node',
+      code: "require('child_process').spawn(process.execPath,['late.cjs'],{stdio:'inherit'});setInterval(()=>{},1000)",
+      timeoutMs: 20_000,
+      signal: controller.signal,
+    });
+    expect(res.timedOut).toBe(true);
+    expect(await markerWritten()).toBe(false);
+  }, 15_000);
+});
+
+describe('createNodeSandbox — runShell cwd stays inside the sandbox root (H3)', () => {
+  // The shell tool tells the model `cwd` is "relative to the sandbox root";
+  // before 2.4 it was handed to spawn as given, so `..` or any absolute path
+  // ran the command anywhere on the host. A STATED BEHAVIOUR CHANGE in 2.4.
+  let root: string;
+  let outside: string;
+  beforeAll(async () => {
+    root = await mkdtemp(join(tmpdir(), 'deuz-root-'));
+    outside = await mkdtemp(join(tmpdir(), 'deuz-outside-'));
+    await mkdir(join(root, 'sub'));
+    // `node pwd.cjs` with no quotes means the same to `cmd.exe /c` and `bash -c`.
+    for (const dir of [root, join(root, 'sub')])
+      await writeFile(join(dir, 'pwd.cjs'), 'process.stdout.write(process.cwd())');
+    await writeFile(
+      join(root, 'touch.cjs'),
+      "require('fs').writeFileSync(require('path').join(__dirname, 'touched'), 'x')",
+    );
+    // A junction on Windows (no privilege needed), a directory symlink elsewhere.
+    await symlink(outside, join(root, 'escape'), 'junction');
+  });
+  afterAll(async () => {
+    for (const dir of [root, outside])
+      await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
+  });
+
+  const pwd = async (cwd: string | undefined, sandboxRoot = root) =>
+    createNodeSandbox({ cwd: sandboxRoot }).runShell!({
+      command: 'node pwd.cjs',
+      ...(cwd !== undefined ? { cwd } : {}),
+      timeoutMs: 5_000,
+    });
+
+  it('resolves a relative cwd against the root', async () => {
+    const res = await pwd('sub');
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe(await realpath(join(root, 'sub')));
+  });
+
+  it('keeps the root when no cwd is given, and accepts an absolute path inside it', async () => {
+    expect((await pwd(undefined)).stdout).toBe(await realpath(root));
+    expect((await pwd(join(root, 'sub'))).stdout).toBe(await realpath(join(root, 'sub')));
+  });
+
+  it.each([
+    ['a .. escape', () => '..'],
+    ['a nested .. escape', () => 'sub/../..'],
+    ['an absolute path elsewhere', () => outside],
+    ['a symlink or junction that points out', () => 'escape'],
+  ])('refuses %s without running the command', async (_label, cwd) => {
+    const res = await createNodeSandbox({ cwd: root }).runShell!({
+      command: 'node touch.cjs',
+      cwd: cwd(),
+      timeoutMs: 5_000,
+    });
+    expect(res.exitCode).toBeNull();
+    expect(res.stdout).toBe('');
+    expect(res.stderr).toMatch(/outside the sandbox root/);
+    await expect(stat(join(root, 'touched'))).rejects.toThrow();
+  });
+
+  it('refuses a cwd that does not exist under the root', async () => {
+    const res = await pwd('missing');
+    expect(res.exitCode).toBeNull();
+    expect(res.stderr).toMatch(/does not exist/);
+  });
+
+  it('uses the host working directory as the root when the sandbox has no cwd', async () => {
+    const res = await createNodeSandbox().runShell!({ command: 'echo hi', cwd: '..' });
+    expect(res.exitCode).toBeNull();
+    expect(res.stderr).toMatch(/outside the sandbox root/);
+  });
 });
 
 /**
