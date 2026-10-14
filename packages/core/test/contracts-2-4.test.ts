@@ -133,9 +133,8 @@ describe('/goal/runtime skeleton', () => {
     expectStub('createDurableScheduler', () => goalRuntime.createDurableScheduler(any));
     expectStub('createWebhookHandler', () => goalRuntime.createWebhookHandler(any));
     expectStub('toNodeHandler', () => goalRuntime.toNodeHandler(any));
-    expectStub('createInMemoryGoalRuntimeStore', () =>
-      goalRuntime.createInMemoryGoalRuntimeStore(),
-    );
+    // Implemented by L4a.
+    expect(await goalRuntime.createInMemoryGoalRuntimeStore().load('g')).toBeUndefined();
     await expectAsyncStub('verifyGoalAcceptance', () => goalRuntime.verifyGoalAcceptance(any));
   });
 
@@ -265,11 +264,14 @@ describe('2.4 Node stores on their entries', () => {
     });
     expect(typeof postgres.commit).toBe('function');
     await postgres.close();
-    expectStub('createSqliteGoalRuntimeStore', () =>
-      goalRuntimeSqlite.createSqliteGoalRuntimeStore(any),
-    );
-    expectStub('createPostgresGoalRuntimeStore', () =>
-      goalRuntimePostgres.createPostgresGoalRuntimeStore(any),
-    );
+    // Implemented by L4a: they open lazily, so building one throws nothing.
+    const goals = goalRuntimeSqlite.createSqliteGoalRuntimeStore({ path: ':memory:' });
+    expect(await goals.load('g')).toBeUndefined();
+    await goals.close();
+    const pgGoals = goalRuntimePostgres.createPostgresGoalRuntimeStore({
+      connectionString: 'postgres://unused',
+    });
+    expect(typeof pgGoals.migrate).toBe('function');
+    await pgGoals.close();
   });
 });

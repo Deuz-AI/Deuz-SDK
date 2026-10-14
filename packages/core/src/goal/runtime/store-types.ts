@@ -17,6 +17,15 @@
  * - Nothing is deleted in the background: retention is the `prune*` calls.
  * - New tables with their own schema version table (`deuz_goal_runtime_schema`);
  *   no existing schema version changes.
+ * - A record that names a goal (a runtime state, an inbox entry, a schedule,
+ *   an intent, a watermark) names a goal stored in its own scope, or one saved
+ *   in the same write; otherwise the write is refused as `'scope-mismatch'`
+ *   (`GoalError` `scope_mismatch` where a method has no conflict result). A
+ *   goal never changes scope.
+ * - Malformed input throws a `TypeError` (a goal record `invalid_goal`, an
+ *   event `invalid_event`) before anything is read or written.
+ * - Ids are compared and listed in code point order (UTF-8 byte order) on
+ *   every adapter.
  */
 import type { Sha256Digest } from '../../internal/digest';
 import type { ScheduleCatchUp } from '../../schedule/scheduler';
@@ -194,7 +203,10 @@ export interface GoalInboxQuery {
   goalId?: string;
   /** Default: `['pending']`. */
   dispositions?: readonly GoalInboxDisposition[];
-  /** Only pending entries whose `notBefore` is absent or at or before this time. */
+  /**
+   * Leaves out pending entries whose event `notBefore` is after this time;
+   * entries of other dispositions are not affected.
+   */
   dueBy?: number;
   /** 1..1000. Default 100. Oldest first. */
   limit?: number;
@@ -318,6 +330,21 @@ export type ScheduleAdvanceResult =
   | { status: 'advanced'; schedule: DurableSchedule; enqueued: number; duplicates: number }
   /** The revision or cursor moved, or the schedule is no longer active: nothing written. */
   | { status: 'conflict'; schedule?: DurableSchedule };
+
+/** Which occurrence records to list (2.4). */
+export interface ScheduleOccurrenceQuery {
+  scope: string;
+  scheduleId?: string;
+  /** 1..1000. Default 100. Oldest occurrence first. */
+  limit?: number;
+  cursor?: string;
+}
+
+/** A page of occurrence records, by occurrence time, then occurrence id. */
+export interface ScheduleOccurrencePage {
+  occurrences: ScheduleOccurrenceRecord[];
+  cursor?: string;
+}
 
 /** Which schedules to list. */
 export interface DurableScheduleQuery {
@@ -452,7 +479,10 @@ export type GoalRuntimeCommitResult =
 
 /** Retention options; times are epoch ms on the store's clock. */
 export interface GoalRuntimePruneOptions {
-  /** Delete before this time. */
+  /**
+   * Delete before this time: an entry's `settledAt`, an occurrence record's
+   * `recordedAt`, an intent's `updatedAt`.
+   */
   before: number;
   scope?: string;
 }
@@ -468,7 +498,10 @@ export interface GoalRuntimeStore extends GoalStore {
    * undefined too (its existence is not disclosed).
    */
   load(goalId: string, options?: { scope?: string }): Promise<GoalRecord | undefined>;
-  /** Commits only at the stored revision plus one (1 for a new goal), else `revision_conflict`. */
+  /**
+   * Commits only at the stored revision plus one (1 for a new goal), else
+   * `revision_conflict`; the id of a goal of another scope, `scope_mismatch`.
+   */
   save(record: GoalRecord): Promise<void>;
   list(query?: GoalListQuery): Promise<GoalListPage>;
 
@@ -477,64 +510,122 @@ export interface GoalRuntimeStore extends GoalStore {
     /**
      * Saves at the stored revision plus one (1 for a new state). With `goal`,
      * also saves the goal at its stored revision plus one, in the same
-     * transaction (a command, `updatePolicy`, a cancel request).
+     * transaction (a command, `updatePolicy`, a cancel request). Checked in
+     * this order: scope, the state's revision, the goal's. A save never
+     * withdraws or rewrites a recorded cancel request, nor the `appliedAt` it
+     * took effect at: that throws a `TypeError`, so a cancel is never lost.
      */
     save(state: GoalRuntimeState, goal?: GoalRecord): Promise<GoalRuntimeCommitResult>;
   };
 
   inbox: {
-    /** Queues a delivery once per entry id; see `GoalInboxEnqueueResult`. */
+    /**
+     * Queues a delivery once per entry id; see `GoalInboxEnqueueResult`. The
+     * same digest for the same goal is a duplicate; another digest or another
+     * target goal under the id is a conflict. Only a goal stored in the
+     * delivery's scope receives deliveries (`GoalError` `scope_mismatch`).
+     */
     enqueue(delivery: GoalInboxEnqueue): Promise<GoalInboxEnqueueResult>;
-    /** Settles an entry with its goal, runtime state and intent, atomically. */
+    /**
+     * Settles an entry with its goal, runtime state and intent, atomically.
+     * Checked in this order: scope (an unknown entry, or one of another goal,
+     * is `'scope-mismatch'`), the entry still pending, the goal's revision, the
+     * state's, the intent id new.
+     */
     apply(application: GoalInboxApplication): Promise<GoalRuntimeCommitResult>;
     get(scope: string, entryId: string): Promise<GoalInboxEntry | undefined>;
     list(query: GoalInboxQuery): Promise<GoalInboxPage>;
   };
 
+  /**
+   * Schedules are keyed by scope and schedule id. Only `advance` moves a
+   * schedule's cursor, and it keeps the revision: the cursor is its own fence.
+   * Every other change makes a new revision and keeps the cursor. A cancelled
+   * schedule takes no further change.
+   */
   schedules: {
-    /** Creates (revision 1) or changes a schedule at `expectedRevision`; a change sets `effectiveFrom`. */
+    /**
+     * Creates (revision 1, `expectedRevision` 0, its cursor at
+     * `effectiveFrom`) or changes a schedule at `expectedRevision`; a change
+     * sets `effectiveFrom` and keeps its status and cursor. The target goal
+     * must be stored in the schedule's scope (`GoalError` `scope_mismatch`).
+     */
     put(
       schedule: DurableScheduleInput,
       options: { expectedRevision: number; effectiveFrom: number },
     ): Promise<{ status: 'committed'; schedule: DurableSchedule } | { status: 'conflict' }>;
     get(scope: string, scheduleId: string): Promise<DurableSchedule | undefined>;
     list(query?: DurableScheduleQuery): Promise<DurableSchedulePage>;
-    /** Stops new scans; pending deliveries already in the inbox stay. */
+    /**
+     * Stops new scans of an active schedule (any other status conflicts);
+     * pending deliveries already in the inbox stay.
+     */
     pause(
       scope: string,
       scheduleId: string,
       options: { expectedRevision: number },
     ): Promise<{ status: 'committed'; schedule: DurableSchedule } | { status: 'conflict' }>;
+    /** Makes a paused schedule active again from `effectiveFrom` (any other status conflicts). */
     resume(
       scope: string,
       scheduleId: string,
       options: { expectedRevision: number; effectiveFrom: number },
     ): Promise<{ status: 'committed'; schedule: DurableSchedule } | { status: 'conflict' }>;
-    /** Ends the schedule and disposes its still-pending deliveries as `'cancelled'`. */
+    /**
+     * Ends the schedule and disposes its still-pending deliveries as
+     * `'cancelled'`: the entries of its scope under namespace
+     * `schedule:<scheduleId>` or named by its occurrence records.
+     */
     cancel(
       scope: string,
       scheduleId: string,
       options: { expectedRevision: number },
     ): Promise<{ status: 'committed'; schedule: DurableSchedule } | { status: 'conflict' }>;
-    /** Moves the cursor and commits the occurrences into the inbox atomically. */
+    /**
+     * Moves the cursor and commits the occurrences into the inbox atomically.
+     * An occurrence already recorded is kept as it was; a delivery whose entry
+     * id is already queued counts as a duplicate whatever its digest (the
+     * first delivery stands). Occurrences outside `(fromCursor, toCursor]`, of
+     * another schedule or goal, or delivered without a delivery throw a
+     * `TypeError`.
+     */
     advance(advance: ScheduleAdvance): Promise<ScheduleAdvanceResult>;
+    /**
+     * The occurrence records the scheduler wrote, oldest occurrence first. Optional in
+     * the interface; the in-memory, SQLite and PostgreSQL stores all have it.
+     */
+    occurrences?(query: ScheduleOccurrenceQuery): Promise<ScheduleOccurrencePage>;
   };
 
   intents: {
-    /** Records a new intent (`'intent-exists'` for a known id). */
-    record(intent: GoalRunIntentInput): Promise<GoalRuntimeCommitResult>;
+    /**
+     * Records a new intent (`'intent-exists'` for a known id). With `runtime`
+     * (and `goal`), saves them in the same transaction at their stored
+     * revisions plus one, so a supervisor whose view is stale cannot record a
+     * retry or a command's run (the second argument is a 2.4 addition).
+     */
+    record(
+      intent: GoalRunIntentInput,
+      options?: { runtime?: GoalRuntimeState; goal?: GoalRecord },
+    ): Promise<GoalRuntimeCommitResult>;
     get(scope: string, intentId: string): Promise<GoalRunIntent | undefined>;
     /**
      * Claims a pending intent (or one claimed under a lower token) for an
      * executor at `expectedRevision`; a fresh claim with a higher token fences
-     * the old executor out of `launched` and `complete`.
+     * the old executor out of `launched` and `complete`. A launched intent can
+     * be taken over the same way and stays launched: its run exists and is
+     * resumed, never started again. A finished intent cannot be claimed.
      */
     claim(
       scope: string,
       intentId: string,
       claim: { owner: string; token: number; expectedRevision: number },
     ): Promise<{ status: 'committed'; intent: GoalRunIntent } | { status: 'conflict' }>;
-    /** Marks the run launched (its first native checkpoint exists). */
+    /**
+     * Marks the run launched (its first native checkpoint exists). Needs the
+     * claim's exact token at `expectedRevision` (else `'intent-revision'`);
+     * an unknown intent is `'scope-mismatch'`.
+     */
     launched(
       scope: string,
       intentId: string,
@@ -542,7 +633,9 @@ export interface GoalRuntimeStore extends GoalStore {
     ): Promise<GoalRuntimeCommitResult>;
     /**
      * Records the run's outcome. With `runtime` (and `goal`), saves them in the
-     * same transaction at their stored revisions plus one.
+     * same transaction at their stored revisions plus one. Needs a claimed or
+     * launched intent held under the claim's exact token at
+     * `expectedRevision` (else `'intent-revision'`).
      */
     complete(
       scope: string,
@@ -561,13 +654,19 @@ export interface GoalRuntimeStore extends GoalStore {
 
   watermarks: {
     get(scope: string, goalId: string, runId: string): Promise<GoalLedgerWatermark | undefined>;
-    /** Advances the watermark and saves the charged goal, atomically. */
+    /**
+     * Advances the watermark and saves the charged goal, atomically. A repeat
+     * of an advance that committed conflicts (`'watermark-revision'`), so a
+     * difference is charged once; `tokens` and `usd` never go back (a
+     * `TypeError`), reservations may be released.
+     */
     advance(advance: GoalWatermarkAdvance): Promise<GoalRuntimeCommitResult>;
   };
 
   /**
    * Replaces the payloads of entries settled before `before` with content-free
-   * tombstones (`payloadPruned`); ids stay, so dedupe holds. Returns how many.
+   * tombstones (`payloadPruned`); ids stay, so dedupe holds. Returns how many
+   * payloads it dropped. The host passes `now - policy.retainPayloadMs`.
    */
   prunePayloads(options: GoalRuntimePruneOptions): Promise<number>;
   /**
