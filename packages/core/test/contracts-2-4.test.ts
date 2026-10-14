@@ -189,9 +189,7 @@ describe('/compute/docker (Node-only, implemented by L6)', () => {
     expectStub('createDockerSandbox', () => docker.createDockerSandbox(any));
     expectStub('createDockerProcessRunner', () => docker.createDockerProcessRunner(any));
     expect(docker.createInMemoryProcessOperationStore()).toHaveProperty('create');
-    expectStub('createSqliteProcessOperationStore', () =>
-      docker.createSqliteProcessOperationStore(any),
-    );
+    expect(docker.createSqliteProcessOperationStore({ path: ':memory:' })).toHaveProperty('close');
     expect(docker.OperationConflictError).toBe(errors.OperationConflictError);
   });
 

@@ -358,9 +358,12 @@ export function createTarParser(handlers: TarParserHandlers): TarParser {
     }
   };
 
+  // A function, so the check reads the state step() left, not a narrowed copy.
+  const ended = (): boolean => state === 'done';
+
   return {
     write(chunk) {
-      if (state === 'done') return false;
+      if (ended()) return false;
       const merged = new Uint8Array(buffer.byteLength + chunk.byteLength);
       merged.set(buffer, 0);
       merged.set(chunk, buffer.byteLength);
@@ -368,7 +371,7 @@ export function createTarParser(handlers: TarParserHandlers): TarParser {
       while (step()) {
         /* keep consuming */
       }
-      return state !== 'done';
+      return !ended();
     },
     finish() {
       if (state === 'done') return;
