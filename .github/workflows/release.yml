@@ -14,8 +14,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  ci:
+    # The tag commit passes every job a pull request does (the Linux and Windows
+    # check legs, React 18, the real Postgres, Redis and Docker legs, the docs
+    # build) before anything is published (2.4 spec §5.3).
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   publish:
     name: Verify and publish npm packages
+    needs: ci
     runs-on: ubuntu-latest
     environment: npm
     steps:
@@ -38,6 +48,7 @@ jobs:
         run: test "$(npm --version)" = "11.18.0"
         shell: bash
       - name: Publish with provenance
+        id: publish
         shell: bash
         # Publishes every workspace package whose version is not on npm yet
         # (@deuz-sdk/core + @deuz-sdk/react, fixed version group).
@@ -53,6 +64,44 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: 'true'
+      - name: Confirm both packages are on npm at the tag's version
+        # `changeset publish` publishes the packages in parallel, and in 2.3.0 react
+        # reached npm while core did not. The job goes green only when both are
+        # there. This also runs when the publish step failed, to say which package
+        # is missing and how to finish the release. The registry lags behind a
+        # publish, so it looks again for a few minutes.
+        if: ${{ !cancelled() && steps.publish.outcome != 'skipped' }}
+        shell: bash
+        env:
+          ATTEMPTS: 20
+          DELAY_SECONDS: 15
+          # Look the way any user would: anonymously, without the token in the
+          # .npmrc setup-node wrote.
+          NPM_CONFIG_USERCONFIG: /dev/null
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          missing=()
+          for attempt in $(seq 1 "${ATTEMPTS}"); do
+            missing=()
+            for package in @deuz-sdk/core @deuz-sdk/react; do
+              # npm 11 exits 1 (E404) for a version the registry does not have (yet).
+              found="$(npm view --prefer-online "${package}@${version}" version 2>/dev/null || true)"
+              if [ "${found}" != "${version}" ]; then
+                missing+=("${package}@${version}")
+              fi
+            done
+            if [ "${#missing[@]}" -eq 0 ]; then
+              echo "@deuz-sdk/core@${version} and @deuz-sdk/react@${version} are on npm."
+              exit 0
+            fi
+            echo "Attempt ${attempt}/${ATTEMPTS}: not on npm yet: ${missing[*]}"
+            if [ "${attempt}" -lt "${ATTEMPTS}" ]; then
+              sleep "${DELAY_SECONDS}"
+            fi
+          done
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "::error title=Release incomplete::Not on npm after ${ATTEMPTS} checks: ${missing[*]}. The publish step's log says why. To finish the release, re-run the failed jobs of this run (gh run rerun ${GITHUB_RUN_ID} --failed, or Re-run failed jobs on ${run_url}): changeset publish skips what is already on npm and publishes only what is missing."
+          exit 1
       - name: Create GitHub release (skip when it already exists)
         shell: bash
         run: |

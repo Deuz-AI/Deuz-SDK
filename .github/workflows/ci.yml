@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # release.yml calls this workflow on a version tag and publishes only once every
+  # job below has passed on the tag commit (2.4 spec §5.3).
+  workflow_call:
 
 permissions:
   contents: read
@@ -127,7 +130,9 @@ jobs:
     # and runs stores (2.3) against redis:7, and the Postgres stores' concurrent
     # legs (F23) against postgres:16. A test that needs a server reads
     # DEUZ_TEST_REDIS_URL or DEUZ_TEST_POSTGRES_URL and skips without it, so the
-    # `check` legs stay offline.
+    # `check` legs stay offline. Here DEUZ_TEST_REQUIRE_SERVICES=1 turns that
+    # skip into a failure: a server that did not come up, or a URL that went
+    # missing, cannot pass as green.
     name: Integration (Redis 7, Postgres 16)
     runs-on: ubuntu-latest
     services:
@@ -149,6 +154,7 @@ jobs:
     env:
       DEUZ_TEST_REDIS_URL: redis://localhost:6379
       DEUZ_TEST_POSTGRES_URL: postgres://postgres:deuz@localhost:5432/deuz
+      DEUZ_TEST_REQUIRE_SERVICES: '1'
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -158,6 +164,80 @@ jobs:
       - run: npm ci
       - run: npm run build -w @deuz-sdk/core
       - run: npm run test -w @deuz-sdk/core
+
+  docker:
+    # The Linux leg with every real backend (2.4 spec §5.3): SQLite, Postgres 16,
+    # Redis 7 and Docker, which GitHub's ubuntu runners ship. DEUZ_TEST_DOCKER=1
+    # opts the Docker runner tests in, and DEUZ_TEST_REQUIRE_SERVICES=1 makes a
+    # missing daemon or server fail instead of skipping. That is why this job
+    # carries the same two service containers as `integration`: until the 2.4
+    # Docker tests land it runs the whole core suite, and once they do it can
+    # narrow to them.
+    name: Docker (ubuntu-latest, Node 22)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s
+          --health-retries 10
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: deuz
+          POSTGRES_DB: deuz
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s
+          --health-retries 10
+    env:
+      DEUZ_TEST_REDIS_URL: redis://localhost:6379
+      DEUZ_TEST_POSTGRES_URL: postgres://postgres:deuz@localhost:5432/deuz
+      DEUZ_TEST_DOCKER: '1'
+      DEUZ_TEST_REQUIRE_SERVICES: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      # Fails here, once, if the runner has no usable Docker daemon.
+      - run: docker version
+      - run: npm ci
+      - run: npm run build -w @deuz-sdk/core
+      - run: npm run test -w @deuz-sdk/core
+
+  # rollback:
+  #   # TODO(W2 R1): uncomment once packages/core/package.json has a `test:rollback`
+  #   # script. The rollback rule (2.4 spec §4.2, §5.3): @deuz-sdk/core@2.3.0, which
+  #   # that script installs from npm into a scratch directory, still opens and
+  #   # uses the SQLite and Postgres databases 2.4 wrote. test/release-pipeline.test.ts
+  #   # fails while the script exists and this job is still commented out.
+  #   name: Rollback (2.3.0 opens what 2.4 wrote)
+  #   runs-on: ubuntu-latest
+  #   services:
+  #     postgres:
+  #       image: postgres:16
+  #       env:
+  #         POSTGRES_PASSWORD: deuz
+  #         POSTGRES_DB: deuz
+  #       ports: ['5432:5432']
+  #       options: >-
+  #         --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s
+  #         --health-retries 10
+  #   env:
+  #     DEUZ_TEST_POSTGRES_URL: postgres://postgres:deuz@localhost:5432/deuz
+  #     DEUZ_TEST_REQUIRE_SERVICES: '1'
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #     - uses: actions/setup-node@v5
+  #       with:
+  #         node-version: 22
+  #         cache: npm
+  #     - run: npm ci
+  #     - run: npm run build -w @deuz-sdk/core
+  #     - run: npm run test:rollback -w @deuz-sdk/core
 
   docs:
     name: Documentation build
