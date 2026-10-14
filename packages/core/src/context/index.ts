@@ -7,12 +7,11 @@
  * every package comes with a manifest of what was selected and why. Off
  * unless configured. Edge-safe.
  */
-import { notImplemented } from '../internal/not-implemented';
-import type { ContextCompiler, CreateContextCompilerOptions } from './types';
-
 export type * from './types';
 export * from './working-memory';
 export { compileContext } from './compile';
+export { createContextCompiler, contextPackageBlob, contextWarnings } from './compiler';
+export type { ContextPackageBlob } from './compiler';
 export { DEFAULT_CONTEXT_BUDGET, DEFAULT_CONTEXT_REFRESH } from './defaults';
 export {
   ANTHROPIC_TOOL_FRAMING_TOKENS,
@@ -42,18 +41,3 @@ export type {
 export { createTokenEstimator } from '../internal/estimate-tokens';
 export type { TokenEstimator, TokenEstimatorOptions } from '../internal/estimate-tokens';
 export { ContextBudgetExceededError } from '../errors';
-
-/**
- * A stateful context compiler for the native loop (2.4, preview). Implements
- * `ContextLoopHooks`: refreshes retrieval on the first call, an active-task
- * change or `requestRefresh()`, at least `minSteps` model steps apart and at
- * most `maxPasses` times per run (then reusing the last package, with
- * `fallback: 'pass-limit'` in the manifest); a failing optional source is a
- * `context-source-failed` warning, a failing required one stops the call.
- * Reports `deuz.context.compile` spans. A restored `state` compiles the same
- * context again; refusing a legacy durable session for adaptive use is the
- * loop's job.
- */
-export function createContextCompiler(_options: CreateContextCompilerOptions): ContextCompiler {
-  return notImplemented('createContextCompiler');
-}
