@@ -8,14 +8,12 @@
  * and PostgreSQL stores live at `/memory/versioned/sqlite` and `/postgres`.
  */
 import type { AgentToolSet } from '../../types/agent-run';
-import type { Dependencies } from '../../types/deps';
 import { notImplemented } from '../../internal/not-implemented';
 import type {
   CreateMemorySessionOptions,
   ImportLegacyMemoryOptions,
   ImportLegacyMemoryResult,
   MemorySession,
-  VersionedMemoryStore,
   VersionedMemoryToolsOptions,
 } from './types';
 
@@ -35,6 +33,7 @@ export {
   RevisionConflictError,
 } from '../../errors';
 export { defineAccountedMemoryLLM, isAccounted } from '../../internal/accounting';
+export { createInMemoryVersionedMemoryStore } from './store';
 
 /**
  * A memory session over one scope and one store (2.4).
@@ -77,17 +76,6 @@ export function createVersionedMemoryTools(
   _options?: VersionedMemoryToolsOptions,
 ): AgentToolSet {
   return notImplemented('createVersionedMemoryTools');
-}
-
-/**
- * The in-memory `VersionedMemoryStore` (2.4): the reference for tests and one
- * process. Copies in and out, real receipts, compare-and-set and replay, and
- * simple text matching plus cosine over the active generation's vectors.
- */
-export function createInMemoryVersionedMemoryStore(_options?: {
-  deps?: Dependencies;
-}): VersionedMemoryStore {
-  return notImplemented('createInMemoryVersionedMemoryStore');
 }
 
 /**
