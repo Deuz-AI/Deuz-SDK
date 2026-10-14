@@ -271,6 +271,27 @@ describe('createDockerSandbox', () => {
     expect(error).toMatchObject({ code: 'docker_unavailable' });
   });
 
+  it('takes custom limits, the writable-layer size and extra labels', async () => {
+    const fake = await fakeDocker(bundle);
+    const sandbox = createDockerSandbox({
+      image: FAKE_IMAGE,
+      limits: { cpus: 0.5, memoryBytes: 256 * 1024 * 1024, pids: 64, storageBytes: 1024 ** 3 },
+      labels: { team: 'agents' },
+      scope: 'tenant-x',
+      ...fake.cli,
+    });
+    await sandbox.runCode({ language: 'sh', code: 'echo ok' });
+    const create = callOf(fake.calls(), 'create')!;
+    expect(valueOf(create, '--cpus')).toBe('0.5');
+    expect(valueOf(create, '--memory')).toBe(String(256 * 1024 * 1024));
+    expect(valueOf(create, '--memory-swap')).toBe(String(256 * 1024 * 1024));
+    expect(valueOf(create, '--pids-limit')).toBe('64');
+    expect(valueOf(create, '--storage-opt')).toBe(`size=${1024 ** 3}`);
+    expect(valuesOf(create, '--label')).toEqual(
+      expect.arrayContaining(['team=agents', 'deuz.scope=tenant-x']),
+    );
+  });
+
   it('validates its options at creation', () => {
     expect(() => createDockerSandbox({} as never)).toThrow(TypeError);
     expect(() => createDockerSandbox({ image: FAKE_IMAGE, labels: { 'deuz.scope': 'x' } })).toThrow(
