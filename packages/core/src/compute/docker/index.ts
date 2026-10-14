@@ -11,9 +11,13 @@ import type { Dependencies } from '../../types/deps';
 import { notImplemented } from '../../internal/not-implemented';
 import type { DockerSandboxOptions, ProcessOperationStore, ProcessRunner } from './types';
 import { createInMemoryProcessOperationStore as createMemoryStore } from './memory-store';
+import { resolveDockerOptions } from './engine';
+import { createDockerSandboxFromOptions } from './sandbox';
 
 export type * from './types';
 export { OperationConflictError } from '../../errors';
+export { DockerSandboxError } from './errors';
+export type { DockerErrorCode } from './errors';
 export { createSqliteProcessOperationStore } from '../../node/process-ops-sqlite';
 export type { SqliteProcessOperationStoreOptions } from '../../node/process-ops-sqlite';
 
@@ -32,6 +36,8 @@ export const DEFAULT_DOCKER_SANDBOX = {
   maxOutputBytes: 1024 * 1024,
   /** Between stop and kill on cancel. */
   cancelGraceMs: 2_000,
+  /** A sandbox run's timeout when the request names none (2.4 addition). */
+  runTimeoutMs: 30_000,
 } as const;
 
 /**
@@ -42,8 +48,8 @@ export const DEFAULT_DOCKER_SANDBOX = {
  * workspace (outside it refused), output a bounded tail with `truncated`,
  * and the container removed afterwards.
  */
-export function createDockerSandbox(_options: DockerSandboxOptions): ComputeSandbox {
-  return notImplemented('createDockerSandbox');
+export function createDockerSandbox(options: DockerSandboxOptions): ComputeSandbox {
+  return createDockerSandboxFromOptions(resolveDockerOptions(options, DEFAULT_DOCKER_SANDBOX));
 }
 
 /**

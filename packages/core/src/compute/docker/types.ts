@@ -41,6 +41,12 @@ export interface DockerSandboxOptions {
   image: string;
   /** The Docker CLI, run with `shell: false`. Default `'docker'`. */
   dockerPath?: string;
+  /**
+   * Global CLI arguments placed before every subcommand, e.g.
+   * `['--context', 'build-box']` or `['--host', 'ssh://runner']` (2.4).
+   * Default none: the CLI's environment and config decide.
+   */
+  dockerArgs?: readonly string[];
   /** `uid:gid`. Default `'10001:10001'`. */
   user?: string;
   limits?: DockerLimits;
