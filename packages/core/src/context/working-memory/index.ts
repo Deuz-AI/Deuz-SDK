@@ -5,6 +5,7 @@
  */
 import type { AgentToolSet } from '../../types/agent-run';
 import { notImplemented } from '../../internal/not-implemented';
+import { applyPatch, createSnapshot } from './patch';
 import type {
   ApplyWorkingMemoryPatchOptions,
   CreateWorkingMemoryInput,
@@ -21,8 +22,8 @@ export type * from './types';
  * `'host'`), the task list copy (`listRevision` 1) and its active task, empty
  * lists otherwise. Pure.
  */
-export function createWorkingMemory(_input: CreateWorkingMemoryInput): WorkingMemorySnapshot {
-  return notImplemented('createWorkingMemory');
+export function createWorkingMemory(input: CreateWorkingMemoryInput): WorkingMemorySnapshot {
+  return createSnapshot(input);
 }
 
 /**
@@ -41,11 +42,11 @@ export function createWorkingMemory(_input: CreateWorkingMemoryInput): WorkingMe
  * operation changes that status.
  */
 export function applyWorkingMemoryPatch(
-  _snapshot: WorkingMemorySnapshot,
-  _patch: WorkingMemoryPatch,
-  _options: ApplyWorkingMemoryPatchOptions,
+  snapshot: WorkingMemorySnapshot,
+  patch: WorkingMemoryPatch,
+  options: ApplyWorkingMemoryPatchOptions,
 ): WorkingMemoryPatchResult {
-  return notImplemented('applyWorkingMemoryPatch');
+  return applyPatch(snapshot, patch, options);
 }
 
 /**
