@@ -725,7 +725,15 @@ function revise(draft: Draft, command: Extract<GoalCommand, { type: 'revise' }>)
         ...addedFields(stored.get(criterion.id)),
       }));
       changed = true;
-      specChanged = true;
+      // The same criteria in another order are the same spec.
+      if (
+        criteria.length !== goal.criteria.length ||
+        criteria.some((criterion) => {
+          const before = stored.get(criterion.id);
+          return before === undefined || !sameCriterion(criterion, before);
+        })
+      )
+        specChanged = true;
     }
   }
   if (specChanged && (generations || command.nextSpecGeneration === true)) {

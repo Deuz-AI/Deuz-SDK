@@ -115,6 +115,11 @@ describe('a goal with a spec generation', () => {
     }).record;
     expect(removed.specGeneration).toBe(5);
     expect(verdicts(removed)).toEqual({ build: 'inconclusive' });
+    // The same criteria in another order are the same spec.
+    const reordered = run(judged, { type: 'revise', criteria: [...judged.criteria].reverse() });
+    expect(reordered.record.criteria.map((criterion) => criterion.id)).toEqual(['docs', 'build']);
+    expect(reordered.record.specGeneration).toBe(4);
+    expect(reordered.record.results).toEqual(judged.results);
   });
 
   it('starts the next generation when a host constraint or verifier changed', () => {
