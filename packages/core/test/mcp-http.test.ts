@@ -21,7 +21,9 @@
  *   turns the backoff into exact, assertable numbers. No `vi.useFakeTimers()` —
  *   it would freeze the HTTP round-trips too.
  * - Everything the server pushes (`tools/list_changed`) or that a rejected
- *   promise triggers is awaited with `waitFor` polling, never a fixed sleep.
+ *   promise triggers is awaited with `waitFor`, never a fixed sleep. A wait
+ *   ends on the event that satisfies it (a status change, a timer the client
+ *   arms), and its budget is a generous backstop, not a speed bound.
  *
  * Every listener and client is torn down in `afterEach`, in that order.
  *
@@ -103,18 +105,53 @@ async function connect(
   return client;
 }
 
-/** Poll until `pred` holds — the server pushes over SSE, so there is nothing to await. */
+/**
+ * The budget of one wait. It only names a wait that is truly stuck: waits end on
+ * the event that satisfies them, so a healthy run never comes near it. It used to
+ * be 5 s, and the 2.3.0 release job (the whole suite running while react built)
+ * took longer than that to land a reconnect, failing a run where nothing was
+ * wrong. 30 s is the timeout the suite gives its slow SQLite tests; a test that
+ * waits times out at 60 s, so a stuck wait fails with its label first.
+ */
+const WAIT_MS = 30_000;
+/** How often a wait re-checks state that no event reports (a tool cache refreshed in the background). */
+const POLL_MS = 20;
+
+/** The pending waits' wake-ups; see {@link changed}. */
+const wakers = new Set<() => void>();
+
+/**
+ * Something a pending `waitFor` may be waiting on just happened: re-check now.
+ * The status listener (`trackStatus`), the fake clock (a timer armed) and the
+ * tests' push callbacks call it.
+ */
+function changed(): void {
+  for (const wake of [...wakers]) wake();
+}
+
+/**
+ * Wait until `pred` holds — the server pushes over SSE, so there is nothing to
+ * await. It is re-checked on every {@link changed} and every `POLL_MS`.
+ */
 async function waitFor(
   pred: () => boolean | Promise<boolean>,
   label: string,
-  timeoutMs = 5_000,
+  timeoutMs = WAIT_MS,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await pred()) return;
-    await new Promise((resolve) => setTimeout(resolve, 5));
+  while (!(await pred())) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`Timed out after ${timeoutMs}ms waiting for ${label}.`);
+    await new Promise<void>((resolve) => {
+      const wake = (): void => {
+        clearTimeout(poll);
+        wakers.delete(wake);
+        resolve();
+      };
+      const poll = setTimeout(wake, Math.min(POLL_MS, left));
+      wakers.add(wake);
+    });
   }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for ${label}.`);
 }
 
 interface FakeTimer {
@@ -143,6 +180,7 @@ function makeFakeClock(): FakeClock {
       const id = ++seq;
       delays.push(ms);
       timers.push({ id, at: now + ms, fn });
+      changed();
       return () => {
         timers = timers.filter((t) => t.id !== id);
       };
@@ -166,7 +204,13 @@ function trackStatus(): {
   onStatusChange: NonNullable<McpClientOptions['onStatusChange']>;
 } {
   const seen: Array<[McpConnectionStatus, number | undefined]> = [];
-  return { seen, onStatusChange: (status, info) => seen.push([status, info?.attempt]) };
+  return {
+    seen,
+    onStatusChange: (status, info) => {
+      seen.push([status, info?.attempt]);
+      changed();
+    },
+  };
 }
 
 describe.each(SDK_LINES)('createMcpClient over HTTP [%s SDK]', (sdk) => {
@@ -349,9 +393,12 @@ describe.each(SDK_LINES)('createMcpClient over HTTP [%s SDK]', (sdk) => {
       const server = await startServer();
       const client = await connect(sdk, server.url);
       const changes: number[] = [];
-      const off = client.onToolListChanged(() => changes.push(changes.length + 1));
+      const off = client.onToolListChanged(() => {
+        changes.push(changes.length + 1);
+        changed();
+      });
       // Notifications ride the standalone GET SSE stream, which opens after connect().
-      await server.waitForClientStream();
+      await server.waitForClientStream(WAIT_MS);
 
       expect(Object.keys(await client.listTools())).toEqual(['echo', 'add', 'boom']);
 
@@ -376,7 +423,7 @@ describe.each(SDK_LINES)('createMcpClient over HTTP [%s SDK]', (sdk) => {
         'the cache to refresh after unsubscribing',
       );
       expect(changes).toHaveLength(2);
-    });
+    }, 60_000);
   });
 
   describe('createMcpClient over HTTP — reconnect', () => {
@@ -424,7 +471,7 @@ describe.each(SDK_LINES)('createMcpClient over HTTP [%s SDK]', (sdk) => {
       expect(await tools.echo!.execute!({ value: 'after' }, TOOL_CTX)).toBe('echo:after');
       expect(await client.callTool('add', { a: 20, b: 22 })).toEqual({ sum: 42 });
       expect(server.calls.at(-1)).toEqual({ name: 'add', args: { a: 20, b: 22 } });
-    }, 20_000);
+    }, 60_000);
 
     it('backs off on the injected clock (jitter: 0 ⇒ exact) and ends in error when attempts run out', async () => {
       const clock = makeFakeClock();
@@ -473,7 +520,7 @@ describe.each(SDK_LINES)('createMcpClient over HTTP [%s SDK]', (sdk) => {
       expect(clock.delays).toEqual([5_000, 100, 200, 400]);
       // Giving up leaves nothing armed.
       expect(clock.pending()).toBe(0);
-    }, 20_000);
+    }, 60_000);
 
     it('a healthy keepalive re-arms itself and never disturbs the status', async () => {
       const clock = makeFakeClock();
@@ -502,7 +549,7 @@ describe.each(SDK_LINES)('createMcpClient over HTTP [%s SDK]', (sdk) => {
       ]);
       expect(await client.callTool('echo', { value: 'alive' })).toBe('echo:alive');
       expect(server.sessionCount()).toBe(1);
-    }, 20_000);
+    }, 60_000);
 
     it('notices a dead session WITHOUT keepAliveMs, via the onerror liveness probe', async () => {
       const clock = makeFakeClock();
@@ -519,7 +566,7 @@ describe.each(SDK_LINES)('createMcpClient over HTTP [%s SDK]', (sdk) => {
       expect(clock.pending()).toBe(0);
       // The standalone GET stream is the socket the restart kills — wait for it,
       // or the restart lands before there is anything to notice.
-      await server.waitForClientStream();
+      await server.waitForClientStream(WAIT_MS);
 
       await server.restart();
 
@@ -546,7 +593,7 @@ describe.each(SDK_LINES)('createMcpClient over HTTP [%s SDK]', (sdk) => {
       expect(await client.callTool('echo', { value: 'alive again' })).toBe('echo:alive again');
       // Recovery is over: no keepalive was configured, so nothing stays armed.
       expect(clock.pending()).toBe(0);
-    }, 20_000);
+    }, 60_000);
 
     it('a first connect that never lands leaves no reconnect loop behind it', async () => {
       const clock = makeFakeClock();
