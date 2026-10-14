@@ -25,6 +25,7 @@ import type { TokenEstimator } from '../internal/estimate-tokens';
 import type { MemoryScope } from '../memory';
 import type { Dependencies } from '../types/deps';
 import type { Message } from '../types/message';
+import type { CallWarning } from '../types/methods';
 import type { MemoryOrigin, MemorySourceKind } from '../memory/versioned/types';
 import type { WorkingMemorySnapshot } from './working-memory/types';
 
@@ -303,6 +304,12 @@ export interface ContextPlacedEntry {
   recordId: string;
   revision?: number;
   digest: Sha256Digest;
+  /**
+   * The retrieval pass whose `'append'` block carries it. The stateful
+   * compiler forgets an entry once no message carries that block any more
+   * (a compaction removed it), so the entry can be placed again.
+   */
+  pass?: number;
 }
 
 // ===================================================================
@@ -352,6 +359,19 @@ export interface ContextStepInput {
   workingMemory?: WorkingMemorySnapshot;
   /** The host asked for a retrieval refresh at this step. */
   refresh?: boolean;
+  /**
+   * What the token counts rest on at this step, e.g. `calibrated: true` once
+   * the loop has fed real usage to the shared estimator. Default: the
+   * compiler's `estimatorKind`.
+   */
+  estimatorKind?: ContextEstimator;
+  /**
+   * The checkpointed package of this step was redacted by a `forget`: compile
+   * it again with a fresh retrieval (refresh `'redacted'`, the one documented
+   * exception to reusing a checkpointed package). It bypasses `minSteps` and
+   * `maxPasses`.
+   */
+  redacted?: boolean;
   signal?: AbortSignal;
 }
 
@@ -383,6 +403,12 @@ export interface ContextCompilerState {
   lastPackage?: ContextBlobRef;
   /** A refresh the host asked for that has not run yet. */
   refreshRequested?: boolean;
+  /**
+   * The previous request's message prefix (its messages and the `'append'`
+   * block placed after them): when the next request no longer starts with it,
+   * the manifest records `cachePrefixChanged: true`.
+   */
+  prefix?: { messages: number; digest: Sha256Digest };
 }
 
 /**
@@ -413,4 +439,9 @@ export interface CreateContextCompilerOptions {
   state?: ContextCompilerState;
   /** Clock, ids, logger, observer (`deuz.context.compile` spans). */
   deps?: Dependencies;
+  /**
+   * Receives a `context-source-failed` warning for each optional source that
+   * failed (the manifest records it too).
+   */
+  onWarning?: (warning: CallWarning) => void;
 }
