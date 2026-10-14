@@ -235,6 +235,11 @@ describe('createContextCompiler refresh policy', () => {
     expect(pkg.manifest.sources).toEqual([
       expect.objectContaining({ source: 'memory', status: 'skipped', selected: 0 }),
     ]);
+    expect(pkg.manifest).toMatchObject({ refresh: 'reused', pass: 0 });
+    // The first retrieval waits for something to ask, without spending a pass.
+    const next = await compiler.beforeModelCall(step(2, [system, { role: 'user', content: 'go' }]));
+    expect(next.manifest).toMatchObject({ refresh: 'initial', pass: 1 });
+    expect(memory.requests).toHaveLength(1);
   });
 
   it('rewrites the query only when the host configures it', async () => {

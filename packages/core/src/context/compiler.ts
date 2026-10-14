@@ -187,8 +187,9 @@ interface StepMemory {
  * - The query is the active task's title and the latest user text (the
  *   compiler's own blocks skipped), at most 2000 characters; it is rewritten
  *   only by `refresh.rewriteQuery`. With an empty query every source is
- *   `'skipped'`. Each source gets `scope`, `candidatesPerSource`, a token
- *   hint of its share and `recordedAsOf` (the clock at the pass).
+ *   `'skipped'` and the refresh stays due, spending no pass. Each source
+ *   gets `scope`, `candidatesPerSource`, a token hint of its share and
+ *   `recordedAsOf` (the clock at the pass).
  * - Automatic refreshes (an active-task change) wait `minSteps` model steps
  *   after the last retrieval; host requests (`requestRefresh()`,
  *   `input.refresh`) do not. A due refresh past `maxPasses` is consumed with
@@ -232,7 +233,7 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
   const estimator = options.estimator ?? createTokenEstimator();
   let state = initialState(options.state);
   /** Every candidate this instance retrieved, to place again what a compaction removed. */
-  const retrieved = new Map<
+  const known = new Map<
     string,
     { source: ContextSourceResult['source']; candidate: ContextCandidate }
   >();
@@ -268,21 +269,11 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     input: ContextStepInput,
     inputTokens: number,
     usedTokens: number,
-  ): Promise<ContextSourceResult[]> {
+  ): Promise<ContextSourceResult[] | undefined> {
     let query = buildQuery(input);
     if (query !== '' && options.refresh?.rewriteQuery)
       query = (await options.refresh.rewriteQuery(query, input.signal)).slice(0, QUERY_MAX_CHARS);
-    const describe = (source: ContextSource): ContextSourceResult['source'] => ({
-      id: source.id,
-      kind: source.kind,
-      ...(source.required ? { required: true } : {}),
-    });
-    if (query.trim() === '')
-      return sources.map((source) => ({
-        source: describe(source),
-        status: 'skipped',
-        candidates: [],
-      }));
+    if (query.trim() === '') return undefined;
     const hints = budgetHints(inputTokens, usedTokens);
     const recordedAsOf = deps.clock.now();
     const settled = await Promise.allSettled(
@@ -317,11 +308,15 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
     );
   }
 
+  function describe(source: ContextSource): ContextSourceResult['source'] {
+    return { id: source.id, kind: source.kind, ...(source.required ? { required: true } : {}) };
+  }
+
   /** The candidates to place again: those whose block a compaction removed. */
   function replacements(dropped: readonly ContextPlacedEntry[]): ContextSourceResult[] {
     const bySource = new Map<string, ContextSourceResult>();
     for (const entry of dropped) {
-      const found = retrieved.get(placedKey(entry));
+      const found = known.get(placedKey(entry));
       if (!found) continue;
       const result = bySource.get(found.source.id) ?? {
         source: found.source,
@@ -433,11 +428,24 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
       let pass: number;
       let refresh: ContextRefreshReason;
       let fallback: ContextManifest['fallback'];
-      if (due !== undefined && !limited) {
-        results = await querySources(input, inputTokens, usedTokens);
+      const answered =
+        due !== undefined && !limited
+          ? await querySources(input, inputTokens, usedTokens)
+          : undefined;
+      if (answered) {
+        results = answered;
         pass = state.passes + 1;
-        refresh = due;
+        refresh = due!;
         if (results.some((result) => result.status === 'failed')) fallback = 'source-failed';
+      } else if (due !== undefined && !limited) {
+        // Nothing to ask yet (no user text, no task): the refresh stays due.
+        results = sources.map((source) => ({
+          source: describe(source),
+          status: 'skipped' as const,
+          candidates: [],
+        }));
+        pass = state.passes;
+        refresh = 'reused';
       } else {
         results = replacements(dropped);
         pass = state.passes;
@@ -462,22 +470,22 @@ export function createContextCompiler(options: CreateContextCompilerOptions): Co
         estimatorKind: estimatorKind(input),
       });
 
-      if (due !== undefined) {
+      if (answered || limited) {
         // A due refresh is consumed even past the pass limit, so the limit is reported once.
         const next: ContextCompilerState = { ...state };
         delete next.refreshRequested;
         if (activeTaskId !== undefined) next.activeTaskId = activeTaskId;
         else delete next.activeTaskId;
-        if (!limited) {
+        if (answered) {
           next.passes = pass;
           next.lastRefreshStep = input.step;
         }
         state = next;
       }
-      if (due !== undefined && !limited)
+      if (answered)
         for (const result of results)
           for (const candidate of result.candidates)
-            retrieved.set(
+            known.set(
               placedKey({
                 source: result.source.id,
                 recordId: candidate.recordId,
