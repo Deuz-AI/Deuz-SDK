@@ -219,8 +219,9 @@ describe('/compute/docker skeleton (Node-only)', () => {
 
 describe('2.4 Node stores on their entries', () => {
   it('reach the existing /stores and /ops entries through appended exports', () => {
-    expectStub('createSqliteConditionalChatStore', () =>
-      storesSqlite.createSqliteConditionalChatStore(any),
+    // Implemented by L7a; it opens lazily, so building one opens nothing.
+    expect(storesSqlite.createSqliteConditionalChatStore({ path: ':memory:' }).conditional).toBe(
+      true,
     );
     expectStub('createSqliteDurableStreamStateStore', () =>
       storesSqlite.createSqliteDurableStreamStateStore(any),
